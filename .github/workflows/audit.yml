@@ -1,0 +1,12 @@
+name: Audit
+on:
+  schedule:
+    - cron: 0 9 * * 1
+  pull_request:
+    paths:
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+
+jobs:
+  rust:
+    uses: timada-org/.github/.github/workflows/rust-audit.yml@v1.2.1

@@ -1,0 +1,12 @@
+name: Release
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  rust:
+    uses: timada-org/.github/.github/workflows/rust-release.yml@v1.2.1
+    secrets:
+      GH_TOKEN: ${{ secrets.GH_TOKEN }}
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
