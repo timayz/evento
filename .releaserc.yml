@@ -5,9 +5,13 @@ plugins:
   - "@semantic-release/commit-analyzer"
   - "@semantic-release/release-notes-generator"
   - "@semantic-release/github"
-  - - "@semantic-release/exec"
-    - verifyConditionsCmd: "semantic-release-rust verify-conditions"
-      prepareCmd: "semantic-release-rust prepare ${nextRelease.version}"
-      publishCmd: "semantic-release-rust publish"
-  - - "@semantic-release/git"
-    - assets: Cargo.toml
+  - path: "@semantic-release/exec"
+    verifyConditionsCmd: "semantic-release-rust verify-conditions"
+    prepareCmd: "semantic-release-rust prepare ${nextRelease.version}"
+    publishCmd: "semantic-release-rust publish"
+  - path: "@semantic-release/exec"
+    prepareCmd: "cargo update"
+  - path: "@semantic-release/git"
+    assets:
+      - Cargo.toml
+      - Cargo.lock
