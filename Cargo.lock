@@ -4,8 +4,8 @@ version = 3
 
 [[package]]
 name = "evento"
-version = "1.0.2"
+version = "1.0.3"
 
 [[package]]
 name = "example"
-version = "0.1.0"
+version = "1.0.3"
