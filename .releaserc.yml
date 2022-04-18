@@ -10,8 +10,8 @@ plugins:
     prepareCmd: "semantic-release-rust prepare ${nextRelease.version}"
     publishCmd: "semantic-release-rust publish"
   - path: "@semantic-release/exec"
-    prepareCmd: "cargo update -p evento"
+    prepareCmd: "cargo update"
   - path: "@semantic-release/git"
     assets:
-      - Cargo.toml
+      - "**/Cargo.toml"
       - Cargo.lock
