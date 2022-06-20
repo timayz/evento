@@ -1,11 +1,10 @@
 [package]
-name = "example"
-version ="0.0.2"
+name = "evento"
+version = "0.0.2"
 edition = "2021"
-publish = false
 license = "Apache-2.0"
+description = "A collection of libraries and tools that help you build DDD, CQRS, and event sourcing."
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-actix-web = "4.1.0"

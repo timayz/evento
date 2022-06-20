@@ -1,16 +1,6 @@
-[package]
-name = "evento"
-version ="0.0.2"
-edition = "2021"
-license = "Apache-2.0"
-description = "A collection of libraries and tools that help you build DDD, CQRS, and event sourcing."
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
-[dependencies]
-
 [workspace]
 
 members = [
+    "./evento",
     "./example"
 ]
