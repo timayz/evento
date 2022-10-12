@@ -1,4 +1,4 @@
-use evento::{Aggregate, Engine, Event, MemoryStore};
+use evento::{Aggregate, Engine, Event, EventStore, MemoryStore};
 use parse_display::{Display, FromStr};
 use serde::{Deserialize, Serialize};
 
@@ -122,7 +122,6 @@ async fn memory_save() {
                 Event::new(UserEvent::Created)
                     .aggregate_id("1")
                     .aggregate_type("user")
-                    .aggregate_version(1)
                     .data(Created {
                         username: "john.doe".to_owned(),
                         password: "azerty".to_owned(),
@@ -130,8 +129,7 @@ async fn memory_save() {
                     .unwrap(),
                 Event::new(UserEvent::AccountDeleted)
                     .aggregate_id("1")
-                    .aggregate_type("user")
-                    .aggregate_version(2),
+                    .aggregate_type("user"),
             ],
             0,
         )
@@ -141,12 +139,66 @@ async fn memory_save() {
     assert_eq!(last_version, 2)
 }
 
-#[test]
-fn memory_load() {
-    assert_eq!(true, false)
+#[tokio::test]
+async fn memory_load_save() {
+    let store = create_memory_store().await;
+    let john = store.load::<User, _>("1").await.unwrap();
+
+    assert_eq!(john.username, "john.doe");
+    assert_eq!(john.password, "azerty");
 }
 
 #[test]
 fn memory_save_wrong_version() {
     assert_eq!(true, false)
+}
+
+async fn create_memory_store() -> EventStore<MemoryStore> {
+    let store = MemoryStore::new();
+    store
+        .save(
+            vec![
+                Event::new(UserEvent::Created)
+                    .aggregate_id("1")
+                    .aggregate_type("user")
+                    .data(Created {
+                        username: "john.doe".to_owned(),
+                        password: "azerty".to_owned(),
+                    })
+                    .unwrap(),
+                Event::new(UserEvent::AccountDeleted)
+                    .aggregate_id("1")
+                    .aggregate_type("user"),
+            ],
+            0,
+        )
+        .await
+        .unwrap();
+
+    store
+        .save(
+            vec![
+                Event::new(UserEvent::Created)
+                    .aggregate_id("2")
+                    .aggregate_type("user")
+                    .data(Created {
+                        username: "albert.dupont".to_owned(),
+                        password: "azerty".to_owned(),
+                    })
+                    .unwrap(),
+                Event::new(UserEvent::ProfileUpdated)
+                    .aggregate_id("2")
+                    .aggregate_type("user")
+                    .data(ProfileUpdated {
+                        first_name: "albert".to_owned(),
+                        last_name: "dupont".to_owned(),
+                    })
+                    .unwrap(),
+            ],
+            0,
+        )
+        .await
+        .unwrap();
+
+    store
 }

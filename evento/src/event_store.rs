@@ -66,8 +66,15 @@ pub trait Aggregate: Default {
 }
 
 pub trait Engine {
-    fn save(&self, events: Vec<Event>, original_version: u64) -> Pin<Box<dyn Future<Output = Result<u64, Error>>>>;
-    fn load<A: Aggregate>(&self, id: String) -> Pin<Box<dyn Future<Output = Result<A, Error>>>>;
+    fn save(
+        &self,
+        events: Vec<Event>,
+        original_version: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, Error>>>>;
+    fn load<A: Aggregate, I: Into<String>>(
+        &self,
+        id: I,
+    ) -> Pin<Box<dyn Future<Output = Result<A, Error>>>>;
 }
 
 pub struct MemoryStore;
@@ -79,11 +86,18 @@ impl MemoryStore {
 }
 
 impl Engine for MemoryStore {
-    fn save(&self, events: Vec<Event>, original_version: u64) -> Pin<Box<dyn Future<Output = Result<u64, Error>>>> {
+    fn save(
+        &self,
+        events: Vec<Event>,
+        original_version: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, Error>>>> {
         todo!()
     }
 
-    fn load<A: Aggregate>(&self, id: String) -> Pin<Box<dyn Future<Output = Result<A, Error>>>> {
+    fn load<A: Aggregate, I: Into<String>>(
+        &self,
+        id: I,
+    ) -> Pin<Box<dyn Future<Output = Result<A, Error>>>> {
         todo!()
     }
 }
@@ -97,11 +111,18 @@ impl PostgresStore {
 }
 
 impl Engine for PostgresStore {
-    fn save(&self, events: Vec<Event>, original_version: u64) -> Pin<Box<dyn Future<Output = Result<u64, Error>>>> {
+    fn save(
+        &self,
+        events: Vec<Event>,
+        original_version: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, Error>>>> {
         todo!()
     }
 
-    fn load<A: Aggregate>(&self, id: String) -> Pin<Box<dyn Future<Output = Result<A, Error>>>> {
+    fn load<A: Aggregate, I: Into<String>>(
+        &self,
+        id: I,
+    ) -> Pin<Box<dyn Future<Output = Result<A, Error>>>> {
         todo!()
     }
 }
@@ -109,11 +130,18 @@ impl Engine for PostgresStore {
 pub struct EventStore<E: Engine>(E);
 
 impl<E: Engine> Engine for EventStore<E> {
-    fn save(&self, events: Vec<Event>, original_version: u64) -> Pin<Box<dyn Future<Output = Result<u64, Error>>>> {
+    fn save(
+        &self,
+        events: Vec<Event>,
+        original_version: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, Error>>>> {
         todo!()
     }
 
-    fn load<A: Aggregate>(&self, id: String) -> Pin<Box<dyn Future<Output = Result<A, Error>>>> {
+    fn load<A: Aggregate, I: Into<String>>(
+        &self,
+        id: I,
+    ) -> Pin<Box<dyn Future<Output = Result<A, Error>>>> {
         todo!()
     }
 }
