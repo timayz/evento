@@ -1,8 +1,6 @@
-use chrono::Utc;
-use evento::{Aggregate, Event};
+use evento::{Aggregate, Engine, Event, MemoryStore};
 use parse_display::{Display, FromStr};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 #[derive(Display, FromStr)]
 #[display(style = "kebab-case")]
@@ -12,6 +10,12 @@ enum UserEvent {
     ProfileUpdated,
     PasswordUpdated,
     AccountDeleted,
+}
+
+impl Into<String> for UserEvent {
+    fn into(self) -> String {
+        self.to_string()
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -85,45 +89,64 @@ impl Aggregate for User {
 fn apply_events() {
     let mut user = User::default();
 
-    user.apply(Event {
-        id: Uuid::new_v4(),
-        name: UserEvent::Created.to_string(),
-        aggregate_id: "1".to_owned(),
-        aggregate_type: "user".to_owned(),
-        aggregate_version: 1,
-        data: Some(
-            serde_json::to_value(Created {
+    user.apply(
+        Event::new(UserEvent::Created)
+            .aggregate_id("1")
+            .aggregate_type("user")
+            .aggregate_version(1)
+            .data(Created {
                 username: "john.doe".to_owned(),
                 password: "azerty".to_owned(),
             })
             .unwrap(),
-        ),
-        metadata: None,
-        created_at: Utc::now(),
-    });
+    );
 
     assert_eq!(user.deleted, false);
 
-    user.apply(Event {
-        id: Uuid::new_v4(),
-        name: UserEvent::AccountDeleted.to_string(),
-        aggregate_id: "1".to_owned(),
-        aggregate_type: "user".to_owned(),
-        aggregate_version: 2,
-        data: None,
-        metadata: None,
-        created_at: Utc::now(),
-    });
+    user.apply(
+        Event::new(UserEvent::AccountDeleted)
+            .aggregate_id("1")
+            .aggregate_type("user")
+            .aggregate_version(2),
+    );
 
     assert_eq!(user.deleted, true)
 }
 
+#[tokio::test]
+async fn memory_save() {
+    let store = MemoryStore::new();
+    let last_version = store
+        .save(
+            vec![
+                Event::new(UserEvent::Created)
+                    .aggregate_id("1")
+                    .aggregate_type("user")
+                    .aggregate_version(1)
+                    .data(Created {
+                        username: "john.doe".to_owned(),
+                        password: "azerty".to_owned(),
+                    })
+                    .unwrap(),
+                Event::new(UserEvent::AccountDeleted)
+                    .aggregate_id("1")
+                    .aggregate_type("user")
+                    .aggregate_version(2),
+            ],
+            0,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(last_version, 2)
+}
+
 #[test]
-fn save() {
+fn memory_load() {
     assert_eq!(true, false)
 }
 
 #[test]
-fn load() {
+fn memory_save_wrong_version() {
     assert_eq!(true, false)
 }
