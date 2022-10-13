@@ -1,20 +1,21 @@
-use std::{future::Future, pin::Pin};
+use std::{collections::HashMap, future::Future, pin::Pin};
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
 use uuid::Uuid;
 
-#[derive(Debug)]
-pub enum Error {}
+#[derive(Debug, PartialEq)]
+pub enum Error {
+    UnexpectedOriginalVersion,
+}
 
 #[derive(Default)]
 pub struct Event {
     pub id: Uuid,
     pub name: String,
     pub aggregate_id: String,
-    pub aggregate_type: String,
-    pub aggregate_version: u64,
+    pub version: u64,
     pub data: Option<Value>,
     pub metadata: Option<Value>,
     pub created_at: DateTime<Utc>,
@@ -36,14 +37,8 @@ impl Event {
         self
     }
 
-    pub fn aggregate_type<V: Into<String>>(mut self, value: V) -> Self {
-        self.aggregate_type = value.into();
-
-        self
-    }
-
-    pub fn aggregate_version(mut self, value: u64) -> Self {
-        self.aggregate_version = value;
+    pub fn version(mut self, value: u64) -> Self {
+        self.version = value;
 
         self
     }
@@ -63,31 +58,35 @@ impl Event {
 
 pub trait Aggregate: Default {
     fn apply(&mut self, event: Event);
+    fn aggregate_id<I: Into<String>>(id: I) -> String;
 }
 
 pub trait Engine {
-    fn save(
+    fn save<A: Aggregate, I: Into<String>>(
         &self,
+        id: I,
         events: Vec<Event>,
         original_version: u64,
     ) -> Pin<Box<dyn Future<Output = Result<u64, Error>>>>;
+
     fn load<A: Aggregate, I: Into<String>>(
         &self,
         id: I,
-    ) -> Pin<Box<dyn Future<Output = Result<A, Error>>>>;
+    ) -> Pin<Box<dyn Future<Output = Result<Option<(A, Event)>, Error>>>>;
 }
 
-pub struct MemoryStore;
+pub struct MemoryStore(HashMap<String, Vec<Event>>);
 
 impl MemoryStore {
     pub fn new() -> EventStore<Self> {
-        todo!()
+        EventStore(Self(HashMap::new()))
     }
 }
 
 impl Engine for MemoryStore {
-    fn save(
+    fn save<A: Aggregate, I: Into<String>>(
         &self,
+        id: I,
         events: Vec<Event>,
         original_version: u64,
     ) -> Pin<Box<dyn Future<Output = Result<u64, Error>>>> {
@@ -97,7 +96,7 @@ impl Engine for MemoryStore {
     fn load<A: Aggregate, I: Into<String>>(
         &self,
         id: I,
-    ) -> Pin<Box<dyn Future<Output = Result<A, Error>>>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Option<(A, Event)>, Error>>>> {
         todo!()
     }
 }
@@ -111,8 +110,9 @@ impl PostgresStore {
 }
 
 impl Engine for PostgresStore {
-    fn save(
+    fn save<A: Aggregate, I: Into<String>>(
         &self,
+        id: I,
         events: Vec<Event>,
         original_version: u64,
     ) -> Pin<Box<dyn Future<Output = Result<u64, Error>>>> {
@@ -122,7 +122,7 @@ impl Engine for PostgresStore {
     fn load<A: Aggregate, I: Into<String>>(
         &self,
         id: I,
-    ) -> Pin<Box<dyn Future<Output = Result<A, Error>>>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Option<(A, Event)>, Error>>>> {
         todo!()
     }
 }
@@ -130,18 +130,19 @@ impl Engine for PostgresStore {
 pub struct EventStore<E: Engine>(E);
 
 impl<E: Engine> Engine for EventStore<E> {
-    fn save(
+    fn save<A: Aggregate, I: Into<String>>(
         &self,
+        id: I,
         events: Vec<Event>,
         original_version: u64,
     ) -> Pin<Box<dyn Future<Output = Result<u64, Error>>>> {
-        todo!()
+        self.0.save::<A, _>(id, events, original_version)
     }
 
     fn load<A: Aggregate, I: Into<String>>(
         &self,
         id: I,
-    ) -> Pin<Box<dyn Future<Output = Result<A, Error>>>> {
-        todo!()
+    ) -> Pin<Box<dyn Future<Output = Result<Option<(A, Event)>, Error>>>> {
+        self.0.load(id)
     }
 }
