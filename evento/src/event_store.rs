@@ -1,6 +1,7 @@
 use std::{collections::HashMap, future::Future, pin::Pin};
 
 use chrono::{DateTime, Utc};
+use parking_lot::RwLock;
 use serde::Serialize;
 use serde_json::Value;
 use uuid::Uuid;
@@ -10,7 +11,7 @@ pub enum Error {
     UnexpectedOriginalVersion,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Event {
     pub id: Uuid,
     pub name: String,
@@ -57,7 +58,7 @@ impl Event {
 }
 
 pub trait Aggregate: Default {
-    fn apply(&mut self, event: Event);
+    fn apply<'a>(&mut self, event: &'a Event);
     fn aggregate_id<I: Into<String>>(id: I) -> String;
 }
 
@@ -75,11 +76,11 @@ pub trait Engine {
     ) -> Pin<Box<dyn Future<Output = Result<Option<(A, Event)>, Error>>>>;
 }
 
-pub struct MemoryStore(HashMap<String, Vec<Event>>);
+pub struct MemoryStore(RwLock<HashMap<String, Vec<Event>>>);
 
 impl MemoryStore {
     pub fn new() -> EventStore<Self> {
-        EventStore(Self(HashMap::new()))
+        EventStore(Self(RwLock::new(HashMap::new())))
     }
 }
 
@@ -90,21 +91,64 @@ impl Engine for MemoryStore {
         events: Vec<Event>,
         original_version: u64,
     ) -> Pin<Box<dyn Future<Output = Result<u64, Error>>>> {
-        todo!()
+        let id: String = id.into();
+        let mut data = self.0.write();
+        let data_events = data.entry(id.to_owned()).or_insert_with(Vec::new);
+
+        let mut version = data_events.last().map(|e| e.version).unwrap_or(0);
+
+        if version != original_version {
+            drop(data);
+            return Box::pin(async { Err(Error::UnexpectedOriginalVersion) });
+        }
+
+        for event in events {
+            version += 1;
+            data_events.push(event.aggregate_id(id.to_owned()).version(version));
+        }
+
+        drop(data);
+        Box::pin(async move { Ok(version) })
     }
 
     fn load<A: Aggregate, I: Into<String>>(
         &self,
         id: I,
     ) -> Pin<Box<dyn Future<Output = Result<Option<(A, Event)>, Error>>>> {
-        todo!()
+        let id: String = id.into();
+
+        let events = {
+            let data = self.0.read();
+
+            data.get(&id)
+                .map_or(Vec::new(), |events| events.iter().cloned().collect())
+        };
+
+        Box::pin(async move {
+            if events.is_empty() {
+                return Ok(None);
+            }
+
+            let mut aggregate = A::default();
+
+            for event in events.iter() {
+                aggregate.apply(event);
+            }
+
+            let last_event = match events.last() {
+                Some(e) => e.clone(),
+                _ => return Ok(None),
+            };
+
+            Ok(Some((aggregate, last_event)))
+        })
     }
 }
 
 pub struct PostgresStore;
 
 impl PostgresStore {
-    pub fn new<C: Into<String>>(conn: C) -> EventStore<Self> {
+    pub fn new<C: Into<String>>(_conn: C) -> EventStore<Self> {
         todo!()
     }
 }
@@ -112,16 +156,16 @@ impl PostgresStore {
 impl Engine for PostgresStore {
     fn save<A: Aggregate, I: Into<String>>(
         &self,
-        id: I,
-        events: Vec<Event>,
-        original_version: u64,
+        _id: I,
+        _events: Vec<Event>,
+        _original_version: u64,
     ) -> Pin<Box<dyn Future<Output = Result<u64, Error>>>> {
         todo!()
     }
 
     fn load<A: Aggregate, I: Into<String>>(
         &self,
-        id: I,
+        _id: I,
     ) -> Pin<Box<dyn Future<Output = Result<Option<(A, Event)>, Error>>>> {
         todo!()
     }

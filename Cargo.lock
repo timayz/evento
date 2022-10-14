@@ -473,6 +473,7 @@ name = "evento"
 version = "0.0.2"
 dependencies = [
  "chrono",
+ "parking_lot",
  "parse-display",
  "serde",
  "serde_json",

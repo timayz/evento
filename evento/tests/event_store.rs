@@ -57,10 +57,10 @@ struct User {
 }
 
 impl Aggregate for User {
-    fn apply(&mut self, event: evento::Event) {
+    fn apply(&mut self, event: &evento::Event) {
         let user_event: UserEvent = event.name.parse().unwrap();
 
-        match (user_event, event.data) {
+        match (user_event, event.data.clone()) {
             (UserEvent::Created, Some(v)) => {
                 let data: Created = serde_json::from_value(v).unwrap();
                 self.username = data.username;
@@ -96,7 +96,7 @@ fn apply_events() {
     let mut user = User::default();
 
     user.apply(
-        Event::new(UserEvent::Created)
+        &Event::new(UserEvent::Created)
             .aggregate_id(User::aggregate_id("1"))
             .version(1)
             .data(Created {
@@ -109,7 +109,7 @@ fn apply_events() {
     assert_eq!(user.deleted, false);
 
     user.apply(
-        Event::new(UserEvent::AccountDeleted)
+        &Event::new(UserEvent::AccountDeleted)
             .aggregate_id(User::aggregate_id("1"))
             .version(2),
     );
@@ -208,9 +208,8 @@ async fn load_save<E: Engine>(store: EventStore<E>) {
     let (john, last_event) = store.load::<User, _>("1").await.unwrap().unwrap();
 
     assert_eq!(john.username, "john.doe");
-    assert_eq!(john.password, "azerty");
-    assert_eq!(john.first_name, None);
-    assert_eq!(john.last_name, None);
+    assert_eq!(john.first_name, Some("John".to_owned()));
+    assert_eq!(john.last_name, Some("Doe".to_owned()));
     assert_eq!(john.password, "securepwd");
     assert_eq!(john.display_name, Some("john007".to_owned()));
 
