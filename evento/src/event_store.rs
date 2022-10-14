@@ -6,7 +6,7 @@ use serde::Serialize;
 use serde_json::Value;
 use uuid::Uuid;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Error {
     UnexpectedOriginalVersion,
 }
@@ -23,7 +23,7 @@ pub struct Event {
 }
 
 impl Event {
-    pub fn new<'a, N: Into<String>>(name: N) -> Self {
+    pub fn new<N: Into<String>>(name: N) -> Self {
         Self {
             id: Uuid::new_v4(),
             name: name.into(),
@@ -58,9 +58,11 @@ impl Event {
 }
 
 pub trait Aggregate: Default {
-    fn apply<'a>(&mut self, event: &'a Event);
+    fn apply(&mut self, event: &'_ Event);
     fn aggregate_id<I: Into<String>>(id: I) -> String;
 }
+
+type EngineResult<A> = Result<Option<(A, Event)>, Error>;
 
 pub trait Engine {
     fn save<A: Aggregate, I: Into<String>>(
@@ -73,7 +75,7 @@ pub trait Engine {
     fn load<A: Aggregate, I: Into<String>>(
         &self,
         id: I,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<(A, Event)>, Error>>>>;
+    ) -> Pin<Box<dyn Future<Output = EngineResult<A>>>>;
 }
 
 pub struct MemoryStore(RwLock<HashMap<String, Vec<Event>>>);
@@ -114,14 +116,13 @@ impl Engine for MemoryStore {
     fn load<A: Aggregate, I: Into<String>>(
         &self,
         id: I,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<(A, Event)>, Error>>>> {
+    ) -> Pin<Box<dyn Future<Output = EngineResult<A>>>> {
         let id: String = id.into();
 
         let events = {
             let data = self.0.read();
 
-            data.get(&id)
-                .map_or(Vec::new(), |events| events.iter().cloned().collect())
+            data.get(&id).map_or(Vec::new(), |events| events.to_vec())
         };
 
         Box::pin(async move {
@@ -166,7 +167,7 @@ impl Engine for PostgresStore {
     fn load<A: Aggregate, I: Into<String>>(
         &self,
         _id: I,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<(A, Event)>, Error>>>> {
+    ) -> Pin<Box<dyn Future<Output = EngineResult<A>>>> {
         todo!()
     }
 }
@@ -186,7 +187,7 @@ impl<E: Engine> Engine for EventStore<E> {
     fn load<A: Aggregate, I: Into<String>>(
         &self,
         id: I,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<(A, Event)>, Error>>>> {
+    ) -> Pin<Box<dyn Future<Output = EngineResult<A>>>> {
         self.0.load(id)
     }
 }
