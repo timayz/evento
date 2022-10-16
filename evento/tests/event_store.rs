@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
-use evento::{Aggregate, Engine, Error, Event, EventStore, MemoryStore};
+use evento::{Aggregate, Engine, Error, Event, EventStore, MemoryStore, RbatisStore};
 use parse_display::{Display, FromStr};
+use rbatis::Rbatis;
 use serde::{Deserialize, Serialize};
 
 #[derive(Display, FromStr)]
@@ -60,26 +61,26 @@ impl Aggregate for User {
     fn apply(&mut self, event: &evento::Event) {
         let user_event: UserEvent = event.name.parse().unwrap();
 
-        match (user_event, event.data.clone()) {
-            (UserEvent::Created, Some(v)) => {
-                let data: Created = serde_json::from_value(v).unwrap();
+        match (user_event, &event.data.is_some()) {
+            (UserEvent::Created, true) => {
+                let data: Created = event.to_data().unwrap().unwrap();
                 self.username = data.username;
                 self.password = data.password;
             }
-            (UserEvent::DisplayNameUpdated, Some(v)) => {
-                let data: DisplayNameUpdated = serde_json::from_value(v).unwrap();
+            (UserEvent::DisplayNameUpdated, true) => {
+                let data: DisplayNameUpdated = event.to_data().unwrap().unwrap();
                 self.display_name = Some(data.display_name);
             }
-            (UserEvent::ProfileUpdated, Some(v)) => {
-                let data: ProfileUpdated = serde_json::from_value(v).unwrap();
+            (UserEvent::ProfileUpdated, true) => {
+                let data: ProfileUpdated = event.to_data().unwrap().unwrap();
                 self.first_name = Some(data.first_name);
                 self.last_name = Some(data.last_name);
             }
-            (UserEvent::PasswordUpdated, Some(v)) => {
-                let data: PasswordUpdated = serde_json::from_value(v).unwrap();
+            (UserEvent::PasswordUpdated, true) => {
+                let data: PasswordUpdated = event.to_data().unwrap().unwrap();
                 self.password = data.new_password;
             }
-            (UserEvent::AccountDeleted, None) => {
+            (UserEvent::AccountDeleted, false) => {
                 self.deleted = true;
             }
             (_, _) => todo!(),
@@ -132,6 +133,24 @@ async fn memory_load_save() {
 #[tokio::test]
 async fn memory_save_wrong_version() {
     let store = create_memory_store().await;
+    save_wrong_version(store).await;
+}
+
+#[tokio::test]
+async fn rbatis_save() {
+    let store = create_rbatis_store("save", false).await;
+    save(store).await
+}
+
+#[tokio::test]
+async fn rbatis_load_save() {
+    let store = create_rbatis_store("load_save", true).await;
+    load_save(store).await;
+}
+
+#[tokio::test]
+async fn rbatis_save_wrong_version() {
+    let store = create_rbatis_store("save_wrong_version", true).await;
     save_wrong_version(store).await;
 }
 
@@ -219,7 +238,7 @@ async fn load_save<E: Engine>(store: EventStore<E>) {
 async fn save_wrong_version<E: Engine>(store: EventStore<E>) {
     let (_, last_event) = store.load::<User, _>("1").await.unwrap().unwrap();
 
-    store
+    let ov = store
         .save::<User, _>(
             "1",
             vec![Event::new(UserEvent::ProfileUpdated)
@@ -254,12 +273,79 @@ async fn save_wrong_version<E: Engine>(store: EventStore<E>) {
         .await
         .unwrap_err();
 
-    assert_eq!(err, Error::UnexpectedOriginalVersion)
+    assert_eq!(err, Error::UnexpectedOriginalVersion);
+
+    let ovf = store
+        .save::<User, _>(
+            "1",
+            vec![
+                Event::new(UserEvent::ProfileUpdated)
+                    .data(ProfileUpdated {
+                        first_name: "Albert".to_owned(),
+                        last_name: "Dupont".to_owned(),
+                    })
+                    .unwrap(),
+                Event::new(UserEvent::DisplayNameUpdated)
+                    .data(DisplayNameUpdated {
+                        display_name: "callmedady".to_owned(),
+                    })
+                    .unwrap(),
+            ],
+            ov,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(ov + 2, ovf);
 }
 
 async fn create_memory_store() -> EventStore<MemoryStore> {
     let store = MemoryStore::new();
     init_store(&store).await;
+
+    store
+}
+
+async fn create_rbatis_store(db_name: &str, init: bool) -> EventStore<RbatisStore> {
+    let rb = Rbatis::new();
+    rb.init(
+        rbdc_pg::driver::PgDriver {},
+        "postgres://postgres:postgres@localhost:5432/postgres",
+    )
+    .unwrap();
+
+    let _ = rb
+        .exec(
+            &format!(
+                r#"
+    CREATE DATABASE evento_{};
+"#,
+                db_name
+            ),
+            vec![],
+        )
+        .await;
+
+    drop(rb);
+
+    let rb = Rbatis::new();
+    rb.init(
+        rbdc_pg::driver::PgDriver {},
+        &format!(
+            "postgres://postgres:postgres@localhost:5432/evento_{}",
+            db_name
+        ),
+    )
+    .unwrap();
+
+    let sql = std::fs::read_to_string("./postgres.sql").unwrap();
+    let _ = rb.exec(&sql, vec![]).await;
+
+    let store = RbatisStore::new(rb);
+
+    if init {
+        init_store(&store).await;
+    }
 
     store
 }
