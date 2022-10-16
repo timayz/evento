@@ -12,4 +12,3 @@ CREATE TABLE IF NOT EXISTS evento_events
 );
 
 CREATE INDEX idk_aggregate_id ON evento_events (aggregate_id);
--- CREATE UNIQUE INDEX idk_aggregate_id_version ON evento_events (aggregate_id, version);
