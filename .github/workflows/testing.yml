@@ -3,6 +3,7 @@ on: pull_request
 
 jobs:
   rust:
+    runs-on: ubuntu-latest
     services:
       postgres:
         image: postgres:15-alpine
@@ -14,4 +15,5 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
-    uses: timada-org/.github/.github/workflows/rust-testing.yml@v1.2.1
+    steps:
+      - uses: timada-org/.github/.github/workflows/rust-testing.yml@v1.2.1
