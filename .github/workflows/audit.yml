@@ -9,4 +9,4 @@ on:
 
 jobs:
   rust:
-    uses: timada-org/.github/.github/workflows/rust-audit.yml@v2.2.2
+    uses: timada-org/.github/.github/workflows/rust-audit.yml@v2.3.0

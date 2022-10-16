@@ -6,7 +6,7 @@ on:
 
 jobs:
   rust:
-    uses: timada-org/.github/.github/workflows/rust-release.yml@v2.2.2
+    uses: timada-org/.github/.github/workflows/rust-release.yml@v2.3.0
     secrets:
       GH_TOKEN: ${{ secrets.GH_TOKEN }}
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
