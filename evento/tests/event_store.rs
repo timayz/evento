@@ -310,7 +310,7 @@ async fn create_rbatis_store(db_name: &str, init: bool) -> EventStore<RbatisStor
     let rb = Rbatis::new();
     rb.init(
         rbdc_pg::driver::PgDriver {},
-        "postgres://postgres:postgres@postgres:5432/postgres",
+        "postgres://postgres:postgres@localhost:5432/postgres",
     )
     .unwrap();
 
@@ -332,7 +332,7 @@ async fn create_rbatis_store(db_name: &str, init: bool) -> EventStore<RbatisStor
     rb.init(
         rbdc_pg::driver::PgDriver {},
         &format!(
-            "postgres://postgres:postgres@postgres:5432/evento_{}",
+            "postgres://postgres:postgres@localhost:5432/evento_{}",
             db_name
         ),
     )
