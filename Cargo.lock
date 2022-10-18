@@ -577,7 +577,15 @@ name = "example"
 version = "0.1.0"
 dependencies = [
  "actix-web",
+ "evento",
+ "parse-display",
+ "rbatis",
+ "rbdc-pg",
+ "rbs",
  "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

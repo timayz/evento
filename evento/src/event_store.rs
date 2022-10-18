@@ -184,6 +184,7 @@ impl_insert!(Event {}, "evento_events");
 impl_select!(Event{select_by_aggregate_id_version(table_name:String,aggregate_id:&str,version:i32) -> Option => "`where aggregate_id = #{aggregate_id} and version = #{version}` limit 1"});
 impl_select!(Event{select_all_by_aggregate_id(table_name:String,aggregate_id:&str) => "`where aggregate_id = #{aggregate_id}` ORDER BY version"});
 
+#[derive(Clone)]
 pub struct RbatisStore(Rbatis);
 
 impl RbatisStore {
@@ -273,6 +274,7 @@ impl Engine for RbatisStore {
     }
 }
 
+#[derive(Clone)]
 pub struct EventStore<E: Engine>(E);
 
 impl<E: Engine> Engine for EventStore<E> {

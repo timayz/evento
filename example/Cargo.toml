@@ -10,3 +10,19 @@ license = "Apache-2.0"
 [dependencies]
 actix-web = "4.2.1"
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+parse-display = "0.6"
+rbdc-pg = "0.1"
+tokio = { version = "1.21", features = ["rt-multi-thread", "macros"] }
+rbatis = "4.0"
+rbs = { version = "0.1" }
+evento = { path = "../evento" }
+
+[dependencies.uuid]
+version = "1.2"
+features = [
+    "v4",                # Lets you generate random UUIDs
+    "fast-rng",          # Use a faster (but still sufficiently random) RNG
+    "macro-diagnostics", # Enable better diagnostics for compile-time UUIDs
+    "serde"
+]
