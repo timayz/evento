@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use evento::{Aggregate, Engine, Error, Event, EventStore, MemoryStore, RbatisStore};
+use evento::{Aggregate, Engine, Error, Event, EventStore, MemoryEngine, RbatisEngine};
 use parse_display::{Display, FromStr};
 use rbatis::Rbatis;
 use serde::{Deserialize, Serialize};
@@ -120,7 +120,7 @@ fn apply_events() {
 
 #[tokio::test]
 async fn memory_save() {
-    let store = MemoryStore::new();
+    let store = MemoryEngine::new();
     save(store).await
 }
 
@@ -299,14 +299,14 @@ async fn save_wrong_version<E: Engine>(store: EventStore<E>) {
     assert_eq!(ov + 2, ovf);
 }
 
-async fn create_memory_store() -> EventStore<MemoryStore> {
-    let store = MemoryStore::new();
+async fn create_memory_store() -> EventStore<MemoryEngine> {
+    let store = MemoryEngine::new();
     init_store(&store).await;
 
     store
 }
 
-async fn create_rbatis_store(db_name: &str, init: bool) -> EventStore<RbatisStore> {
+async fn create_rbatis_store(db_name: &str, init: bool) -> EventStore<RbatisEngine> {
     let rb = Rbatis::new();
     rb.init(
         rbdc_pg::driver::PgDriver {},
@@ -341,7 +341,7 @@ async fn create_rbatis_store(db_name: &str, init: bool) -> EventStore<RbatisStor
     let sql = std::fs::read_to_string("./postgres.sql").unwrap();
     let _ = rb.exec(&sql, vec![]).await;
 
-    let store = RbatisStore::new(rb);
+    let store = RbatisEngine::new(rb);
 
     if init {
         init_store(&store).await;

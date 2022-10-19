@@ -112,15 +112,15 @@ pub trait Engine {
     ) -> Pin<Box<dyn Future<Output = EngineResult<A>>>>;
 }
 
-pub struct MemoryStore(RwLock<HashMap<String, Vec<Event>>>);
+pub struct MemoryEngine(RwLock<HashMap<String, Vec<Event>>>);
 
-impl MemoryStore {
+impl MemoryEngine {
     pub fn new() -> EventStore<Self> {
         EventStore(Self(RwLock::new(HashMap::new())))
     }
 }
 
-impl Engine for MemoryStore {
+impl Engine for MemoryEngine {
     fn save<A: Aggregate, I: Into<String>>(
         &self,
         id: I,
@@ -185,15 +185,15 @@ impl_select!(Event{select_by_aggregate_id_version(table_name:String,aggregate_id
 impl_select!(Event{select_all_by_aggregate_id(table_name:String,aggregate_id:&str) => "`where aggregate_id = #{aggregate_id}` ORDER BY version"});
 
 #[derive(Clone)]
-pub struct RbatisStore(Rbatis);
+pub struct RbatisEngine(Rbatis);
 
-impl RbatisStore {
+impl RbatisEngine {
     pub fn new(rb: Rbatis) -> EventStore<Self> {
         EventStore(Self(rb))
     }
 }
 
-impl Engine for RbatisStore {
+impl Engine for RbatisEngine {
     fn save<A: Aggregate, I: Into<String>>(
         &self,
         id: I,

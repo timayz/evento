@@ -1,25 +1,27 @@
+mod command;
 mod order;
 mod product;
 mod shipping;
 
+use actix::{Actor, Addr};
 use actix_web::{web, App, HttpServer};
-use evento::{EventStore, RbatisStore};
+use command::Command;
 use rbatis::Rbatis;
 
 pub struct AppState {
-    pub store: EventStore<RbatisStore>,
+    pub cmd: Addr<Command>,
 }
 
 #[actix_web::main] // or #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let rb = init_db().await;
-    let store = RbatisStore::new(rb);
+    let cmd = Command::new(rb).start();
 
     HttpServer::new(move || {
-        let store = store.clone();
+        let cmd = cmd.clone();
 
         App::new()
-            .app_data(web::Data::<AppState>::new(AppState { store }))
+            .app_data(web::Data::<AppState>::new(AppState { cmd }))
             .service(order::scope())
             .service(product::scope())
     })
