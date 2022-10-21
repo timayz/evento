@@ -3,21 +3,21 @@ use serde::{Deserialize, Serialize};
 use super::event::OrderEvent;
 
 #[derive(Default, Serialize, Deserialize)]
-struct Order {
+pub struct Order {
     
 }
 
 impl Aggregate for Order {
     fn apply(&mut self, event: &evento::Event) {
-        let user_event: OrderEvent = event.name.parse().unwrap();
+        let order_event: OrderEvent = event.name.parse().unwrap();
 
-        match (user_event, &event.data.is_some()) {
-            // (OrderEvent::Created, true) => {
-            //     let data: Created = event.to_data().unwrap().unwrap();
+        match order_event {
+            // OrderEvent::Created, => {
+            //     let data: Created = event.to_data().unwrap();
             //     self.username = data.username;
             //     self.password = data.password;
             // }
-            (_, _) => todo!(),
+            _ => todo!(),
         }
     }
 

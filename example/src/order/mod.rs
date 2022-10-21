@@ -1,6 +1,6 @@
-mod api;
 mod aggregate;
-mod event;
+mod api;
 mod command;
+mod event;
 
 pub use api::scope;

@@ -45,7 +45,9 @@ struct PasswordUpdated {
 }
 
 #[derive(Serialize, Deserialize)]
-struct AccountDeleted;
+struct AccountDeleted {
+    deleted: bool,
+}
 
 #[derive(Default, Serialize, Deserialize)]
 struct User {
@@ -61,29 +63,29 @@ impl Aggregate for User {
     fn apply(&mut self, event: &evento::Event) {
         let user_event: UserEvent = event.name.parse().unwrap();
 
-        match (user_event, &event.data.is_some()) {
-            (UserEvent::Created, true) => {
-                let data: Created = event.to_data().unwrap().unwrap();
+        match user_event {
+            UserEvent::Created => {
+                let data: Created = event.to_data().unwrap();
                 self.username = data.username;
                 self.password = data.password;
             }
-            (UserEvent::DisplayNameUpdated, true) => {
-                let data: DisplayNameUpdated = event.to_data().unwrap().unwrap();
+            UserEvent::DisplayNameUpdated => {
+                let data: DisplayNameUpdated = event.to_data().unwrap();
                 self.display_name = Some(data.display_name);
             }
-            (UserEvent::ProfileUpdated, true) => {
-                let data: ProfileUpdated = event.to_data().unwrap().unwrap();
+            UserEvent::ProfileUpdated => {
+                let data: ProfileUpdated = event.to_data().unwrap();
                 self.first_name = Some(data.first_name);
                 self.last_name = Some(data.last_name);
             }
-            (UserEvent::PasswordUpdated, true) => {
-                let data: PasswordUpdated = event.to_data().unwrap().unwrap();
+            UserEvent::PasswordUpdated => {
+                let data: PasswordUpdated = event.to_data().unwrap();
                 self.password = data.new_password;
             }
-            (UserEvent::AccountDeleted, false) => {
-                self.deleted = true;
+            UserEvent::AccountDeleted => {
+                let data: AccountDeleted = event.to_data().unwrap();
+                self.deleted = data.deleted;
             }
-            (_, _) => todo!(),
         }
     }
 
@@ -112,6 +114,8 @@ fn apply_events() {
     user.apply(
         &Event::new(UserEvent::AccountDeleted)
             .aggregate_id(User::aggregate_id("1"))
+            .data(AccountDeleted { deleted: true })
+            .unwrap()
             .version(2),
     );
 
@@ -165,7 +169,9 @@ async fn save<E: Engine>(store: EventStore<E>) {
                         password: "azerty".to_owned(),
                     })
                     .unwrap(),
-                Event::new(UserEvent::AccountDeleted),
+                Event::new(UserEvent::AccountDeleted)
+                    .data(AccountDeleted { deleted: true })
+                    .unwrap(),
             ],
             0,
         )
@@ -361,7 +367,9 @@ async fn init_store<'a, E: Engine>(store: &'a E) {
                         password: "azerty".to_owned(),
                     })
                     .unwrap(),
-                Event::new(UserEvent::AccountDeleted),
+                Event::new(UserEvent::AccountDeleted)
+                    .data(AccountDeleted { deleted: true })
+                    .unwrap(),
             ],
             0,
         )

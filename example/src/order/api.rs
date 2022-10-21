@@ -1,16 +1,18 @@
 use actix_web::{delete, post, put, web, HttpResponse, Scope};
 
 use crate::command::CommandResponse;
-use crate::order::command::{
+use crate::AppState;
+
+use super::aggregate::Order;
+use super::command::{
     AddProductCommand, CancelCommand, PayCommand, PlaceCommand, RemoveProductCommand,
     UpdateProductQuantityCommand, UpdateShippingInfoCommand,
 };
-use crate::AppState;
 
 #[post("/place")]
 async fn place(data: web::Data<AppState>, input: web::Json<PlaceCommand>) -> HttpResponse {
     CommandResponse(data.cmd.send(input.0).await)
-        .into_http_response()
+        .into_http_response::<Order>(&data.store)
         .await
 }
 
@@ -20,7 +22,7 @@ async fn add_product(
     input: web::Json<AddProductCommand>,
 ) -> HttpResponse {
     CommandResponse(data.cmd.send(input.0).await)
-        .into_http_response()
+        .into_http_response::<Order>(&data.store)
         .await
 }
 
@@ -30,7 +32,7 @@ async fn remove_product(
     input: web::Json<RemoveProductCommand>,
 ) -> HttpResponse {
     CommandResponse(data.cmd.send(input.0).await)
-        .into_http_response()
+        .into_http_response::<Order>(&data.store)
         .await
 }
 
@@ -40,7 +42,7 @@ async fn update_product_quantity(
     input: web::Json<UpdateProductQuantityCommand>,
 ) -> HttpResponse {
     CommandResponse(data.cmd.send(input.0).await)
-        .into_http_response()
+        .into_http_response::<Order>(&data.store)
         .await
 }
 
@@ -50,21 +52,21 @@ async fn update_shipping_info(
     input: web::Json<UpdateShippingInfoCommand>,
 ) -> HttpResponse {
     CommandResponse(data.cmd.send(input.0).await)
-        .into_http_response()
+        .into_http_response::<Order>(&data.store)
         .await
 }
 
 #[post("/pay")]
 async fn pay(data: web::Data<AppState>) -> HttpResponse {
     CommandResponse(data.cmd.send(PayCommand).await)
-        .into_http_response()
+        .into_http_response::<Order>(&data.store)
         .await
 }
 
 #[delete("/cancel")]
 async fn cancel(data: web::Data<AppState>) -> HttpResponse {
     CommandResponse(data.cmd.send(CancelCommand).await)
-        .into_http_response()
+        .into_http_response::<Order>(&data.store)
         .await
 }
 

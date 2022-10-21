@@ -6,7 +6,7 @@ CREATE TABLE IF NOT EXISTS evento_events
     name varchar(255) NOT NULL,
     aggregate_id varchar(255) NOT NULL,
     version int NOT NULL,
-    data text DEFAULT NULL,
+    data text NOT NULL,
     metadata text DEFAULT NULL,
     created_at timestamp NOT NULL
 );

@@ -5,9 +5,11 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, future::Future, pin::Pin};
 use uuid::Uuid;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
+    #[error("Unexpected original version while saving event")]
     UnexpectedOriginalVersion,
+    #[error("Rbatis error `{0}`")]
     Rbatis(String),
 }
 
@@ -23,7 +25,7 @@ pub struct Event {
     pub name: String,
     pub aggregate_id: String,
     pub version: i32,
-    pub data: Option<String>,
+    pub data: String,
     pub metadata: Option<String>,
     pub created_at: FastDateTime,
 }
@@ -49,7 +51,7 @@ impl Event {
     }
 
     pub fn data<D: Serialize>(mut self, value: D) -> Result<Self, serde_json::Error> {
-        self.data = Some(serde_json::to_string(&value)?);
+        self.data = serde_json::to_string(&value)?;
 
         Ok(self)
     }
@@ -60,18 +62,15 @@ impl Event {
         Ok(self)
     }
 
-    pub fn to_data<'de, D: Deserialize<'de>>(&'de self) -> Result<Option<D>, serde_json::Error> {
-        match &self.data {
-            Some(data) => Ok(serde_json::from_str(data.as_str())?),
-            None => Ok(None),
-        }
+    pub fn to_data<'de, D: Deserialize<'de>>(&'de self) -> Result<D, serde_json::Error> {
+        serde_json::from_str(self.data.as_str())
     }
 
     pub fn to_metadata<'de, D: Deserialize<'de>>(
         &'de self,
     ) -> Result<Option<D>, serde_json::Error> {
         match &self.metadata {
-            Some(metadata) => Ok(serde_json::from_str(metadata.as_str())?),
+            Some(metadata) => serde_json::from_str(metadata.as_str()),
             None => Ok(None),
         }
     }
@@ -84,7 +83,7 @@ impl Default for Event {
             name: String::default(),
             aggregate_id: String::default(),
             version: i32::default(),
-            data: None,
+            data: String::default(),
             metadata: None,
             created_at: FastDateTime::utc(),
         }

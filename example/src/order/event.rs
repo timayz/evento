@@ -33,3 +33,6 @@ pub struct ShippingInfoUpdated {}
 
 #[derive(Serialize, Deserialize)]
 pub struct Paid {}
+
+#[derive(Serialize, Deserialize)]
+pub struct Canceled {}

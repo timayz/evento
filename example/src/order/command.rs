@@ -17,7 +17,7 @@ impl Handler<PlaceCommand> for Command {
     type Result = ResponseActFuture<Self, CommandResult>;
 
     fn handle(&mut self, msg: PlaceCommand, _ctx: &mut Context<Self>) -> Self::Result {
-        async { Ok(vec![]) }.into_actor(self).boxed_local()
+        async { Ok(todo!()) }.into_actor(self).boxed_local()
     }
 }
 
@@ -31,7 +31,7 @@ impl Handler<AddProductCommand> for Command {
     type Result = ResponseActFuture<Self, CommandResult>;
 
     fn handle(&mut self, msg: AddProductCommand, _ctx: &mut Context<Self>) -> Self::Result {
-        async { Ok(vec![]) }.into_actor(self).boxed_local()
+        async { Ok(todo!()) }.into_actor(self).boxed_local()
     }
 }
 
@@ -45,7 +45,7 @@ impl Handler<RemoveProductCommand> for Command {
     type Result = ResponseActFuture<Self, CommandResult>;
 
     fn handle(&mut self, msg: RemoveProductCommand, _ctx: &mut Context<Self>) -> Self::Result {
-        async { Ok(vec![]) }.into_actor(self).boxed_local()
+        async { Ok(todo!()) }.into_actor(self).boxed_local()
     }
 }
 
@@ -64,7 +64,7 @@ impl Handler<UpdateProductQuantityCommand> for Command {
         msg: UpdateProductQuantityCommand,
         _ctx: &mut Context<Self>,
     ) -> Self::Result {
-        async { Ok(vec![]) }.into_actor(self).boxed_local()
+        async { Ok(todo!()) }.into_actor(self).boxed_local()
     }
 }
 
@@ -78,7 +78,7 @@ impl Handler<UpdateShippingInfoCommand> for Command {
     type Result = ResponseActFuture<Self, CommandResult>;
 
     fn handle(&mut self, msg: UpdateShippingInfoCommand, _ctx: &mut Context<Self>) -> Self::Result {
-        async { Ok(vec![]) }.into_actor(self).boxed_local()
+        async { Ok(todo!()) }.into_actor(self).boxed_local()
     }
 }
 
@@ -90,7 +90,7 @@ impl Handler<PayCommand> for Command {
     type Result = ResponseActFuture<Self, CommandResult>;
 
     fn handle(&mut self, msg: PayCommand, _ctx: &mut Context<Self>) -> Self::Result {
-        async { Ok(vec![]) }.into_actor(self).boxed_local()
+        async { Ok(todo!()) }.into_actor(self).boxed_local()
     }
 }
 
@@ -102,6 +102,6 @@ impl Handler<CancelCommand> for Command {
     type Result = ResponseActFuture<Self, CommandResult>;
 
     fn handle(&mut self, msg: CancelCommand, _ctx: &mut Context<Self>) -> Self::Result {
-        async { Ok(vec![]) }.into_actor(self).boxed_local()
+        async { Ok(todo!()) }.into_actor(self).boxed_local()
     }
 }
