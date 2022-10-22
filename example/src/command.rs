@@ -78,10 +78,7 @@ impl Actor for Command {
 pub struct CommandResponse(pub Result<CommandResult, MailboxError>);
 
 impl CommandResponse {
-    pub async fn to_response<A: Aggregate>(
-        &self,
-        store: &EventStore<PgEngine>,
-    ) -> HttpResponse {
+    pub async fn to_response<A: Aggregate>(&self, store: &EventStore<PgEngine>) -> HttpResponse {
         let info = match &self.0 {
             Ok(res) => match res {
                 Ok(event) => event,
