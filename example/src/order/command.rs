@@ -1,5 +1,5 @@
 use actix::{ActorFutureExt, Context, Handler, Message, ResponseActFuture, WrapFuture};
-use evento::{Engine, Event, EventStore, RbatisEngine};
+use evento::{Engine, Event, EventStore, PgEngine};
 use nanoid::nanoid;
 use serde::Deserialize;
 use validator::Validate;
@@ -15,7 +15,7 @@ use super::{
 };
 
 pub async fn load_order(
-    store: &EventStore<RbatisEngine>,
+    store: &EventStore<PgEngine>,
     id: &str,
 ) -> Result<(Order, Event), Error> {
     let (order, e) = match store.load::<Order, _>(id).await? {
