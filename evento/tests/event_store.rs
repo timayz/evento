@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 
-use evento::{Aggregate, Engine, Error, Event, EventStore, MemoryEngine, RbatisEngine};
+use evento::{Aggregate, Engine, Error, Event, EventStore, MemoryEngine, PgEngine};
 use parse_display::{Display, FromStr};
-use rbatis::Rbatis;
 use serde::{Deserialize, Serialize};
+use sqlx::{Executor, PgPool};
 
 #[derive(Display, FromStr)]
 #[display(style = "kebab-case")]
@@ -141,20 +141,20 @@ async fn memory_save_wrong_version() {
 }
 
 #[tokio::test]
-async fn rbatis_save() {
-    let store = create_rbatis_store("save", false).await;
+async fn pg_save() {
+    let store = create_pg_store("save", false).await;
     save(store).await
 }
 
 #[tokio::test]
-async fn rbatis_load_save() {
-    let store = create_rbatis_store("load_save", true).await;
+async fn pg_load_save() {
+    let store = create_pg_store("load_save", true).await;
     load_save(store).await;
 }
 
 #[tokio::test]
-async fn rbatis_save_wrong_version() {
-    let store = create_rbatis_store("save_wrong_version", true).await;
+async fn pg_save_wrong_version() {
+    let store = create_pg_store("save_wrong_version", true).await;
     save_wrong_version(store).await;
 }
 
@@ -312,42 +312,33 @@ async fn create_memory_store() -> EventStore<MemoryEngine> {
     store
 }
 
-async fn create_rbatis_store(db_name: &str, init: bool) -> EventStore<RbatisEngine> {
-    let rb = Rbatis::new();
-    rb.init(
-        rbdc_pg::driver::PgDriver {},
-        "postgres://postgres:postgres@localhost:5432/postgres",
-    )
+async fn create_pg_store(db_name: &str, init: bool) -> EventStore<PgEngine> {
+    let pool = PgPool::connect("postgres://postgres:postgres@localhost:5432/postgres")
+        .await
+        .unwrap();
+
+    let mut conn = pool.acquire().await.unwrap();
+
+    conn.execute(&format!("drop database if exists evento_{};", db_name)[..])
+        .await
+        .unwrap();
+
+    conn.execute(&format!("create database evento_{};", db_name)[..])
+        .await
+        .unwrap();
+
+    drop(pool);
+
+    let pool = PgPool::connect(&format!(
+        "postgres://postgres:postgres@localhost:5432/evento_{}",
+        db_name
+    ))
+    .await
     .unwrap();
 
-    let _ = rb
-        .exec(
-            &format!(
-                r#"
-    CREATE DATABASE evento_{};
-"#,
-                db_name
-            ),
-            vec![],
-        )
-        .await;
+    sqlx::migrate!().run(&pool).await.unwrap();
 
-    drop(rb);
-
-    let rb = Rbatis::new();
-    rb.init(
-        rbdc_pg::driver::PgDriver {},
-        &format!(
-            "postgres://postgres:postgres@localhost:5432/evento_{}",
-            db_name
-        ),
-    )
-    .unwrap();
-
-    let sql = std::fs::read_to_string("./postgres.sql").unwrap();
-    let _ = rb.exec(&sql, vec![]).await;
-
-    let store = RbatisEngine::new(rb);
+    let store = PgEngine::new(pool);
 
     if init {
         init_store(&store).await;

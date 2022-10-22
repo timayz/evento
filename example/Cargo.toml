@@ -13,10 +13,8 @@ actix-web = "4.2.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 parse-display = "0.6"
-rbdc-pg = "0.1"
+sqlx = { version = "0.6", features = ["runtime-actix-rustls", "postgres", "chrono", "uuid", "json"] }
 tokio = { version = "1.21", features = ["rt-multi-thread", "macros"] }
-rbatis = "4.0"
-rbs = { version = "0.1" }
 nanoid = "0.4"
 thiserror = "1.0"
 validator = { version = "0.16", features = ["derive"] }

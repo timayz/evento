@@ -1,7 +1,8 @@
+use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
-use rbatis::rbdc::datetime::FastDateTime;
-use rbatis::{impl_insert, impl_select, Rbatis};
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde_json::Value;
+use sqlx::PgPool;
 use std::{collections::HashMap, future::Future, pin::Pin};
 use uuid::Uuid;
 
@@ -9,13 +10,13 @@ use uuid::Uuid;
 pub enum Error {
     #[error("Unexpected original version while saving event")]
     UnexpectedOriginalVersion,
-    #[error("Rbatis error `{0}`")]
-    Rbatis(String),
+    #[error("Sqlx error `{0}`")]
+    Sqlx(String),
 }
 
-impl From<rbatis::rbdc::Error> for Error {
-    fn from(e: rbatis::rbdc::Error) -> Self {
-        Error::Rbatis(e.to_string())
+impl From<sqlx::Error> for Error {
+    fn from(e: sqlx::Error) -> Self {
+        Error::Sqlx(e.to_string())
     }
 }
 
@@ -25,9 +26,9 @@ pub struct Event {
     pub name: String,
     pub aggregate_id: String,
     pub version: i32,
-    pub data: String,
-    pub metadata: Option<String>,
-    pub created_at: FastDateTime,
+    pub data: Value,
+    pub metadata: Option<Value>,
+    pub created_at: DateTime<Utc>,
 }
 
 impl Event {
@@ -51,26 +52,24 @@ impl Event {
     }
 
     pub fn data<D: Serialize>(mut self, value: D) -> Result<Self, serde_json::Error> {
-        self.data = serde_json::to_string(&value)?;
+        self.data = serde_json::to_value(&value)?;
 
         Ok(self)
     }
 
     pub fn metadata<M: Serialize>(mut self, value: M) -> Result<Self, serde_json::Error> {
-        self.metadata = Some(serde_json::to_string(&value)?);
+        self.metadata = Some(serde_json::to_value(&value)?);
 
         Ok(self)
     }
 
-    pub fn to_data<'de, D: Deserialize<'de>>(&'de self) -> Result<D, serde_json::Error> {
-        serde_json::from_str(self.data.as_str())
+    pub fn to_data<D: DeserializeOwned>(&self) -> Result<D, serde_json::Error> {
+        serde_json::from_value(self.data.clone())
     }
 
-    pub fn to_metadata<'de, D: Deserialize<'de>>(
-        &'de self,
-    ) -> Result<Option<D>, serde_json::Error> {
+    pub fn to_metadata<D: DeserializeOwned>(&self) -> Result<Option<D>, serde_json::Error> {
         match &self.metadata {
-            Some(metadata) => serde_json::from_str(metadata.as_str()),
+            Some(metadata) => serde_json::from_value(metadata.clone()),
             None => Ok(None),
         }
     }
@@ -83,9 +82,9 @@ impl Default for Event {
             name: String::default(),
             aggregate_id: String::default(),
             version: i32::default(),
-            data: String::default(),
+            data: Value::default(),
             metadata: None,
-            created_at: FastDateTime::utc(),
+            created_at: Utc::now(),
         }
     }
 }
@@ -179,20 +178,16 @@ impl Engine for MemoryEngine {
     }
 }
 
-impl_insert!(Event {}, "evento_events");
-impl_select!(Event{select_by_aggregate_id_version(table_name:String,aggregate_id:&str,version:i32) -> Option => "`where aggregate_id = #{aggregate_id} and version = #{version}` limit 1"});
-impl_select!(Event{select_all_by_aggregate_id(table_name:String,aggregate_id:&str) => "`where aggregate_id = #{aggregate_id}` ORDER BY version"});
-
 #[derive(Clone)]
-pub struct RbatisEngine(Rbatis);
+pub struct PgEngine(PgPool);
 
-impl RbatisEngine {
-    pub fn new(rb: Rbatis) -> EventStore<Self> {
-        EventStore(Self(rb))
+impl PgEngine {
+    pub fn new(pool: PgPool) -> EventStore<Self> {
+        EventStore(Self(pool))
     }
 }
 
-impl Engine for RbatisEngine {
+impl Engine for PgEngine {
     fn save<A: Aggregate, I: Into<String>>(
         &self,
         id: I,
@@ -200,35 +195,65 @@ impl Engine for RbatisEngine {
         original_version: i32,
     ) -> Pin<Box<dyn Future<Output = Result<i32, Error>>>> {
         let id: String = id.into();
-        let rb = self.0.clone();
+        let pool = self.0.clone();
 
         Box::pin(async move {
-            let mut tx = rb.acquire_begin().await?;
-
+            let mut tx = pool.begin().await?;
             let mut version = original_version;
-            let mut batch_size: u64 = 0;
-            let mut tables = Vec::new();
 
-            for event in events {
-                batch_size += 1;
-                version += 1;
+            for events in events.chunks(100).collect::<Vec<&[Event]>>() {
+                let mut v1: Vec<Uuid> = Vec::with_capacity(events.len());
+                let mut v2: Vec<&str> = Vec::with_capacity(events.len());
+                let mut v3: Vec<&str> = Vec::with_capacity(events.len());
+                let mut v4: Vec<i32> = Vec::with_capacity(events.len());
+                let mut v5: Vec<Value> = Vec::with_capacity(events.len());
+                let mut v6: Vec<Option<Value>> = Vec::with_capacity(events.len());
+                let mut v7: Vec<DateTime<Utc>> = Vec::with_capacity(events.len());
 
-                tables.push(event.aggregate_id(id.to_owned()).version(version));
+                events.iter().for_each(|event| {
+                    version += 1;
+
+                    v1.push(event.id);
+                    v2.push(&event.name);
+                    v3.push(&id);
+                    v4.push(version);
+                    v5.push(event.data.clone());
+                    v6.push(event.metadata.clone());
+                    v7.push(event.created_at);
+                });
+
+                sqlx::query(r#"
+                    INSERT INTO evento_events (id, name, aggregate_id, version, data, metadata, created_at)
+                    SELECT * FROM UNNEST ($1,$2,$3,$4,$5,$6,$7)"#
+                )
+                .bind(v1)
+                .bind(v2)
+                .bind(v3)
+                .bind(v4)
+                .bind(v5)
+                .bind(v6)
+                .bind(v7)
+                .execute(&mut *tx)
+                .await?;
             }
 
-            Event::insert_batch(&mut tx, &tables, batch_size).await?;
-
-            let next_id = Event::select_by_aggregate_id_version(
-                &mut tx,
-                "evento_events".to_owned(),
+            let next_event_id = sqlx::query_as!(
+                Event,
+                r#"
+        SELECT *
+        FROM evento_events
+        WHERE aggregate_id = $1 AND version = $2
+        LIMIT 1
+                "#,
                 &id,
-                original_version + 1,
+                original_version + 1
             )
+            .fetch_optional(&pool)
             .await?
             .map(|e| e.id)
-            .unwrap_or(tables[0].id);
+            .unwrap_or(events[0].id);
 
-            if next_id != tables[0].id {
+            if next_event_id != events[0].id {
                 tx.rollback().await?;
 
                 return Err(Error::UnexpectedOriginalVersion);
@@ -245,13 +270,21 @@ impl Engine for RbatisEngine {
         id: I,
     ) -> Pin<Box<dyn Future<Output = EngineResult<A>>>> {
         let id: String = id.into();
-        let rb = self.0.clone();
+        let pool = self.0.clone();
 
         Box::pin(async move {
-            let mut rb = rb.acquire_begin().await?;
-
-            let events =
-                Event::select_all_by_aggregate_id(&mut rb, "evento_events".to_owned(), &id).await?;
+            let events = sqlx::query_as!(
+                Event,
+                r#"
+        SELECT *
+        FROM evento_events
+        WHERE aggregate_id = $1
+        ORDER BY version
+                "#,
+                &id
+            )
+            .fetch_all(&pool)
+            .await?;
 
             if events.is_empty() {
                 return Ok(None);

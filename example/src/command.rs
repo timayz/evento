@@ -1,8 +1,8 @@
 use actix::prelude::*;
 use actix_web::HttpResponse;
-use evento::{Aggregate, Engine, Event, EventStore, RbatisEngine};
-use rbatis::Rbatis;
+use evento::{Aggregate, Engine, Event, EventStore, PgEngine};
 use serde_json::json;
+use sqlx::PgPool;
 use validator::ValidationErrors;
 
 #[derive(thiserror::Error, Debug)]
@@ -60,13 +60,13 @@ impl From<Event> for CommandInfo {
 pub type CommandResult = Result<CommandInfo, Error>;
 
 pub struct Command {
-    pub store: EventStore<RbatisEngine>,
+    pub store: EventStore<PgEngine>,
 }
 
 impl Command {
-    pub fn new(rb: Rbatis) -> Self {
+    pub fn new(pool: PgPool) -> Self {
         Self {
-            store: RbatisEngine::new(rb),
+            store: PgEngine::new(pool),
         }
     }
 }
@@ -78,10 +78,7 @@ impl Actor for Command {
 pub struct CommandResponse(pub Result<CommandResult, MailboxError>);
 
 impl CommandResponse {
-    pub async fn to_response<A: Aggregate>(
-        &self,
-        store: &EventStore<RbatisEngine>,
-    ) -> HttpResponse {
+    pub async fn to_response<A: Aggregate>(&self, store: &EventStore<PgEngine>) -> HttpResponse {
         let info = match &self.0 {
             Ok(res) => match res {
                 Ok(event) => event,
