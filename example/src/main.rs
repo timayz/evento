@@ -1,64 +1,58 @@
-use actix_web::{delete, get, post, put, web, App, HttpServer, Responder, Result};
-use serde::Serialize;
+mod command;
+mod order;
+mod product;
 
-#[derive(Serialize)]
-struct Todo {
-    id: u64,
-    text: String,
-    done: bool,
-}
+use actix::{Actor, Addr};
+use actix_web::{web, App, HttpServer};
+use command::Command;
+use evento::{EventStore, RbatisEngine};
+use rbatis::Rbatis;
 
-#[get("")]
-async fn list() -> Result<impl Responder> {
-    let todos: Vec<Todo> = Vec::new();
-    Ok(web::Json(todos))
-}
-
-#[post("")]
-async fn create() -> Result<impl Responder> {
-    let todo = Todo {
-        id: 1,
-        text: "Hello world".to_owned(),
-        done: false,
-    };
-
-    Ok(web::Json(todo))
-}
-
-#[put("/{id}")]
-async fn update(id: web::Path<u64>) -> Result<impl Responder> {
-    let todo = Todo {
-        id: id.to_owned(),
-        text: "Hello world".to_owned(),
-        done: false,
-    };
-
-    Ok(web::Json(todo))
-}
-
-#[delete("/{id}")]
-async fn del(id: web::Path<u64>) -> Result<impl Responder> {
-    let todo = Todo {
-        id: id.to_owned(),
-        text: "Hello world".to_owned(),
-        done: false,
-    };
-
-    Ok(web::Json(todo))
+pub struct AppState {
+    pub cmd: Addr<Command>,
+    pub store: EventStore<RbatisEngine>,
 }
 
 #[actix_web::main] // or #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    HttpServer::new(|| {
-        App::new().service(
-            web::scope("/todos")
-                .service(list)
-                .service(create)
-                .service(update)
-                .service(del),
-        )
+    let rb = init_db().await;
+    let cmd = Command::new(rb.clone()).start();
+
+    HttpServer::new(move || {
+        let cmd = cmd.clone();
+        let store = RbatisEngine::new(rb.clone());
+
+        App::new()
+            .app_data(web::Data::<AppState>::new(AppState { cmd, store }))
+            .service(order::scope())
+            .service(product::scope())
     })
     .bind(("127.0.0.1", 8080))?
     .run()
     .await
+}
+
+async fn init_db() -> Rbatis {
+    let rb = Rbatis::new();
+    rb.init(
+        rbdc_pg::driver::PgDriver {},
+        "postgres://postgres:postgres@localhost:5432/postgres",
+    )
+    .unwrap();
+
+    let _ = rb.exec(" CREATE DATABASE evento_example;", vec![]).await;
+
+    drop(rb);
+
+    let rb = Rbatis::new();
+    rb.init(
+        rbdc_pg::driver::PgDriver {},
+        "postgres://postgres:postgres@localhost:5432/evento_example",
+    )
+    .unwrap();
+
+    let sql = std::fs::read_to_string("./example/db.sql").unwrap();
+    let _ = rb.exec(&sql, vec![]).await;
+
+    rb
 }

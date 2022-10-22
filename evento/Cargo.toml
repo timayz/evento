@@ -13,6 +13,7 @@ serde_json = "1.0"
 parking_lot = "0.12"
 rbatis = "4.0"
 rbs = { version = "0.1" }
+thiserror = "1.0.28"
 
 [dependencies.uuid]
 version = "1.2"
