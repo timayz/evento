@@ -5,7 +5,7 @@ mod product;
 use actix::{Actor, Addr};
 use actix_web::{web, App, HttpServer};
 use command::Command;
-use evento::{RbatisEngine, EventStore};
+use evento::{EventStore, RbatisEngine};
 use rbatis::Rbatis;
 
 pub struct AppState {

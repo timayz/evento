@@ -9,8 +9,8 @@ use crate::command::{Command, CommandInfo, CommandResult, Error};
 use super::{
     aggregate::{Order, Product, Status},
     event::{
-        OrderEvent, Paid, Placed, ProductAdded, ProductQuantityUpdated, ProductRemoved,
-        ShippingInfoUpdated, Canceled, Deleted,
+        Canceled, Deleted, OrderEvent, Paid, Placed, ProductAdded, ProductQuantityUpdated,
+        ProductRemoved, ShippingInfoUpdated,
     },
 };
 
@@ -239,11 +239,15 @@ impl Handler<PayCommand> for Command {
             }
 
             if order.shipping_address.is_empty() {
-                return Err(Error::BadRequest("order shipping address must not be empty".to_owned()));
+                return Err(Error::BadRequest(
+                    "order shipping address must not be empty".to_owned(),
+                ));
             }
 
             if order.products.is_empty() {
-                return Err(Error::BadRequest("order products must not be empty".to_owned()));
+                return Err(Error::BadRequest(
+                    "order products must not be empty".to_owned(),
+                ));
             }
 
             Ok(Event::new(OrderEvent::Paid)
