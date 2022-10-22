@@ -12,9 +12,9 @@ pub enum ProductEvent {
     ReviewAdded,
 }
 
-impl Into<String> for ProductEvent {
-    fn into(self) -> String {
-        self.to_string()
+impl From<ProductEvent> for String {
+    fn from(p: ProductEvent) -> Self {
+        p.to_string()
     }
 }
 

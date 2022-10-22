@@ -49,7 +49,7 @@ impl Handler<CreateCommand> for Command {
             Ok(Event::new(ProductEvent::Created)
                 .aggregate_id(id)
                 .version(0)
-                .data(Created { name: msg.name })?)
+                .data(Created { name: msg.name })?.into())
         }
         .into_actor(self)
         .boxed_local()
@@ -74,7 +74,7 @@ impl Handler<DeleteCommand> for Command {
             Ok(Event::new(ProductEvent::Deleted)
                 .aggregate_id(&msg.id)
                 .version(e.version)
-                .data(Deleted { deleted: true })?)
+                .data(Deleted { deleted: true })?.into())
         }
         .into_actor(self)
         .boxed_local()
@@ -112,7 +112,7 @@ impl Handler<UpdateQuantityCommand> for Command {
                 .version(e.version)
                 .data(QuantityUpdated {
                     quantity: msg.quantity,
-                })?)
+                })?.into())
         }
         .into_actor(self)
         .boxed_local()
@@ -147,7 +147,7 @@ impl Handler<UpdateVisibilityCommand> for Command {
                 .version(e.version)
                 .data(VisibilityUpdated {
                     visible: msg.visible,
-                })?)
+                })?.into())
         }
         .into_actor(self)
         .boxed_local()
@@ -185,7 +185,7 @@ impl Handler<UpdateDescriptionCommand> for Command {
                 .version(e.version)
                 .data(DescriptionUpdated {
                     description: msg.description,
-                })?)
+                })?.into())
         }
         .into_actor(self)
         .boxed_local()
@@ -219,7 +219,7 @@ impl Handler<AddReviewCommand> for Command {
                 .data(ReviewAdded {
                     note: msg.note,
                     message: msg.message,
-                })?)
+                })?.into())
         }
         .into_actor(self)
         .boxed_local()

@@ -12,14 +12,14 @@ use super::command::{
 #[post("/create")]
 async fn create(data: web::Data<AppState>, input: web::Json<CreateCommand>) -> HttpResponse {
     CommandResponse(data.cmd.send(input.0).await)
-        .into_http_response::<Product>(&data.store)
+        .to_response::<Product>(&data.store)
         .await
 }
 
 #[delete("/delete")]
 async fn delete(data: web::Data<AppState>, input: web::Json<DeleteCommand>) -> HttpResponse {
     CommandResponse(data.cmd.send(input.0).await)
-        .into_http_response::<Product>(&data.store)
+        .to_response::<Product>(&data.store)
         .await
 }
 
@@ -29,7 +29,7 @@ async fn update_quantity(
     input: web::Json<UpdateQuantityCommand>,
 ) -> HttpResponse {
     CommandResponse(data.cmd.send(input.0).await)
-        .into_http_response::<Product>(&data.store)
+        .to_response::<Product>(&data.store)
         .await
 }
 
@@ -39,7 +39,7 @@ async fn update_visibility(
     input: web::Json<UpdateVisibilityCommand>,
 ) -> HttpResponse {
     CommandResponse(data.cmd.send(input.0).await)
-        .into_http_response::<Product>(&data.store)
+        .to_response::<Product>(&data.store)
         .await
 }
 
@@ -49,14 +49,14 @@ async fn update_description(
     input: web::Json<UpdateDescriptionCommand>,
 ) -> HttpResponse {
     CommandResponse(data.cmd.send(input.0).await)
-        .into_http_response::<Product>(&data.store)
+        .to_response::<Product>(&data.store)
         .await
 }
 
 #[post("/add-review")]
 async fn add_review(data: web::Data<AppState>, input: web::Json<AddReviewCommand>) -> HttpResponse {
     CommandResponse(data.cmd.send(input.0).await)
-        .into_http_response::<Product>(&data.store)
+        .to_response::<Product>(&data.store)
         .await
 }
 

@@ -41,7 +41,23 @@ impl From<evento::Error> for Error {
     }
 }
 
-pub type CommandResult = Result<Event, Error>;
+pub struct CommandInfo {
+    pub aggregate_id: String,
+    pub original_version: i32,
+    pub events: Vec<Event>,
+}
+
+impl From<Event> for CommandInfo {
+    fn from(e: Event) -> Self {
+        Self {
+            aggregate_id: e.aggregate_id.to_owned(),
+            original_version: e.version,
+            events: vec![e],
+        }
+    }
+}
+
+pub type CommandResult = Result<CommandInfo, Error>;
 
 pub struct Command {
     pub store: EventStore<RbatisEngine>,
@@ -62,11 +78,11 @@ impl Actor for Command {
 pub struct CommandResponse(pub Result<CommandResult, MailboxError>);
 
 impl CommandResponse {
-    pub async fn into_http_response<A: Aggregate>(
+    pub async fn to_response<A: Aggregate>(
         &self,
         store: &EventStore<RbatisEngine>,
     ) -> HttpResponse {
-        let event = match &self.0 {
+        let info = match &self.0 {
             Ok(res) => match res {
                 Ok(event) => event,
                 Err(e) => {
@@ -99,12 +115,16 @@ impl CommandResponse {
         };
 
         let res = store
-            .save::<A, _>(&event.aggregate_id, vec![event.clone()], event.version)
+            .save::<A, _>(
+                &info.aggregate_id,
+                info.events.clone(),
+                info.original_version,
+            )
             .await;
 
         match res {
             Ok(_) => HttpResponse::Ok().json(json!({
-                "id": event.aggregate_id
+                "id": info.aggregate_id
             })),
             Err(e) => HttpResponse::InternalServerError().json(json!({
                 "code": "internal_server_error",
