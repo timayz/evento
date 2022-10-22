@@ -178,10 +178,6 @@ impl Engine for MemoryEngine {
     }
 }
 
-// impl_insert!(Event {}, "evento_events");
-// impl_select!(Event{select_by_aggregate_id_version(table_name:String,aggregate_id:&str,version:i32) -> Option => "`where aggregate_id = #{aggregate_id} and version = #{version}` limit 1"});
-// impl_select!(Event{select_all_by_aggregate_id(table_name:String,aggregate_id:&str) => "`where aggregate_id = #{aggregate_id}` ORDER BY version"});
-
 #[derive(Clone)]
 pub struct PgEngine(PgPool);
 
@@ -203,15 +199,7 @@ impl Engine for PgEngine {
 
         Box::pin(async move {
             let mut tx = pool.begin().await?;
-
             let mut version = original_version;
-            // let mut tables = Vec::new();
-
-            // for event in events {
-            //     version += 1;
-
-            //     tables.push(event.aggregate_id(id.to_owned()).version(version));
-            // }
 
             for events in events.chunks(100).collect::<Vec<&[Event]>>() {
                 let mut v1: Vec<Uuid> = Vec::with_capacity(events.len());
