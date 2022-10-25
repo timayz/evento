@@ -1,6 +1,8 @@
 use actix::prelude::*;
 use actix_web::HttpResponse;
 use evento::{Aggregate, Engine, Event, EventStore, PgEngine};
+use pulsar::{producer, Producer, SerializeMessage, TokioExecutor};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::PgPool;
 use validator::ValidationErrors;
@@ -9,6 +11,9 @@ use validator::ValidationErrors;
 pub enum Error {
     #[error("internal server error")]
     SerdeJson(serde_json::Error),
+
+    #[error("internal server error")]
+    Pulsar(pulsar::Error),
 
     #[error("internal server error")]
     Evento(evento::Error),
@@ -29,6 +34,12 @@ impl From<serde_json::Error> for Error {
     }
 }
 
+impl From<pulsar::Error> for Error {
+    fn from(e: pulsar::Error) -> Self {
+        Error::Pulsar(e)
+    }
+}
+
 impl From<ValidationErrors> for Error {
     fn from(e: ValidationErrors) -> Self {
         Error::ValidationErrors(e)
@@ -41,6 +52,7 @@ impl From<evento::Error> for Error {
     }
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct CommandInfo {
     pub aggregate_id: String,
     pub original_version: i32,
@@ -54,6 +66,17 @@ impl From<Event> for CommandInfo {
             original_version: e.version,
             events: vec![e],
         }
+    }
+}
+
+impl<'a> SerializeMessage for &'a CommandInfo {
+    fn serialize_message(input: Self) -> Result<producer::Message, pulsar::Error> {
+        let payload =
+            serde_json::to_vec(input).map_err(|e| pulsar::Error::Custom(e.to_string()))?;
+        Ok(producer::Message {
+            payload,
+            ..Default::default()
+        })
     }
 }
 
@@ -78,7 +101,11 @@ impl Actor for Command {
 pub struct CommandResponse(pub Result<CommandResult, MailboxError>);
 
 impl CommandResponse {
-    pub async fn to_response<A: Aggregate>(&self, store: &EventStore<PgEngine>) -> HttpResponse {
+    pub async fn to_response<A: Aggregate>(
+        &self,
+        store: &EventStore<PgEngine>,
+        producer: &mut Producer<TokioExecutor>,
+    ) -> HttpResponse {
         let info = match &self.0 {
             Ok(res) => match res {
                 Ok(event) => event,
@@ -120,9 +147,18 @@ impl CommandResponse {
             .await;
 
         match res {
-            Ok(_) => HttpResponse::Ok().json(json!({
-                "id": info.aggregate_id
-            })),
+            Ok(_) => {
+                if let Err(e) = producer.send(info).await {
+                    return HttpResponse::InternalServerError().json(json!({
+                        "code": "internal_server_error",
+                        "reason": e.to_string()
+                    }));
+                }
+
+                HttpResponse::Ok().json(json!({
+                    "id": info.aggregate_id
+                }))
+            }
             Err(e) => HttpResponse::InternalServerError().json(json!({
                 "code": "internal_server_error",
                 "reason": e.to_string()

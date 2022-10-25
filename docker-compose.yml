@@ -7,3 +7,9 @@ services:
       - 5432:5432
     environment:
       POSTGRES_PASSWORD: postgres
+
+  pulsar:
+    image: apachepulsar/pulsar:2.10.2
+    command: bin/pulsar standalone
+    ports:
+      - 6650:6650
