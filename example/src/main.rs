@@ -1,4 +1,4 @@
-mod command;
+pub(crate) mod command;
 mod order;
 mod product;
 
@@ -8,6 +8,7 @@ use actix::{Actor, Addr};
 use actix_web::{web, App, HttpServer};
 use command::Command;
 use evento::{EventStore, PgEngine};
+use mongodb::{options::ClientOptions, Client};
 use pulsar::{Producer, Pulsar, TokioExecutor};
 use sqlx::{Executor, PgPool};
 use tokio::sync::Mutex;
@@ -23,8 +24,21 @@ pub struct AppState {
 async fn main() -> std::io::Result<()> {
     let pool = init_db().await;
     let cmd = Command::new(pool.clone()).start();
-    let addr = "pulsar://127.0.0.1:6650";
-    let pulsar: Pulsar<_> = Pulsar::builder(addr, TokioExecutor).build().await.unwrap();
+    let pulsar: Pulsar<_> = Pulsar::builder("pulsar://127.0.0.1:6650", TokioExecutor)
+        .build()
+        .await
+        .unwrap();
+
+    let client_options = ClientOptions::parse("mongodb://mongo:mongo@127.0.0.1:27017")
+        .await
+        .unwrap();
+
+    let read_db = Client::with_options(client_options)
+        .map(|client| client.database("evento_example"))
+        .unwrap();
+
+
+    order::start(&pulsar, &read_db).await;
 
     let order_producer = Arc::new(Mutex::new(
         pulsar

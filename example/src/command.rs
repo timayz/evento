@@ -1,7 +1,7 @@
 use actix::prelude::*;
 use actix_web::HttpResponse;
 use evento::{Aggregate, Engine, Event, EventStore, PgEngine};
-use pulsar::{producer, Producer, SerializeMessage, TokioExecutor};
+use pulsar::{producer, Producer, SerializeMessage, TokioExecutor, DeserializeMessage, Payload};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::PgPool;
@@ -52,7 +52,7 @@ impl From<evento::Error> for Error {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct CommandInfo {
     pub aggregate_id: String,
     pub original_version: i32,
@@ -77,6 +77,14 @@ impl<'a> SerializeMessage for &'a CommandInfo {
             payload,
             ..Default::default()
         })
+    }
+}
+
+impl DeserializeMessage for CommandInfo {
+    type Output = Result<CommandInfo, serde_json::Error>;
+
+    fn deserialize_message(payload: &Payload) -> Self::Output {
+        serde_json::from_slice(&payload.data)
     }
 }
 
