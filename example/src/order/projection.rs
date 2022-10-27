@@ -1,5 +1,10 @@
+use std::collections::HashMap;
+
 use futures::TryStreamExt;
-use mongodb::Database;
+use mongodb::{
+    bson::{doc, to_bson},
+    Database,
+};
 use pulsar::{Consumer, Pulsar, SubType, TokioExecutor};
 use serde::{Deserialize, Serialize};
 
@@ -7,20 +12,21 @@ use crate::{command::CommandInfo, order::event::OrderEvent};
 
 use super::{
     aggregate::Status,
-    event::{Canceled, Deleted, Paid, Placed, ProductAdded, ProductRemoved, ShippingInfoUpdated},
+    event::{Canceled, Paid, Placed, ProductAdded, ProductRemoved, ShippingInfoUpdated},
 };
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct OrderProduct {
     pub id: String,
     pub name: String,
+    pub quantity: u16,
 }
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct Order {
     pub id: String,
     pub shipping_address: String,
-    pub products: Vec<OrderProduct>,
+    pub products: HashMap<String, OrderProduct>,
     pub status: Status,
 }
 
@@ -70,33 +76,117 @@ pub async fn start(pulsar: &Pulsar<TokioExecutor>, read_db: &Database) {
                     }
                     OrderEvent::ProductAdded => {
                         let data: ProductAdded = event.to_data().unwrap();
-                        // let product = self.products.entry(data.id).or_default();
-                        // product.quantity += data.quantity;
+
+                        let collection = db.collection::<Order>("orders");
+                        let filter = doc! {"id":info.aggregate_id.to_owned() };
+                        let mut order =
+                            match collection.find_one(filter.clone(), None).await.unwrap() {
+                                Some(order) => order,
+                                None => return,
+                            };
+
+                        let mut product = order.products.entry(data.id).or_default();
+                        product.quantity += data.quantity;
+
+                        collection
+                            .update_one(
+                                filter,
+                                doc! {"$set": {"products": to_bson(&order.products).unwrap()}},
+                                None,
+                            )
+                            .await
+                            .unwrap();
                     }
                     OrderEvent::ProductRemoved => {
                         let data: ProductRemoved = event.to_data().unwrap();
-                        // self.products.remove(&data.id);
+                        let collection = db.collection::<Order>("orders");
+                        let filter = doc! {"id":info.aggregate_id.to_owned() };
+                        let mut order =
+                            match collection.find_one(filter.clone(), None).await.unwrap() {
+                                Some(order) => order,
+                                None => return,
+                            };
+
+                        order.products.remove(&data.id);
+
+                        collection
+                            .update_one(
+                                filter,
+                                doc! {"$set": {"products": to_bson(&order.products).unwrap()}},
+                                None,
+                            )
+                            .await
+                            .unwrap();
                     }
                     OrderEvent::ProductQuantityUpdated => {
                         let data: ProductAdded = event.to_data().unwrap();
-                        // let product = self.products.entry(data.id).or_default();
-                        // product.quantity = data.quantity;
+                        let collection = db.collection::<Order>("orders");
+                        let filter = doc! {"id":info.aggregate_id.to_owned() };
+                        let mut order =
+                            match collection.find_one(filter.clone(), None).await.unwrap() {
+                                Some(order) => order,
+                                None => return,
+                            };
+
+                        let mut product = order.products.entry(data.id).or_default();
+                        product.quantity = data.quantity;
+
+                        collection
+                            .update_one(
+                                filter,
+                                doc! {"$set": {"products": to_bson(&order.products).unwrap()}},
+                                None,
+                            )
+                            .await
+                            .unwrap();
                     }
                     OrderEvent::ShippingInfoUpdated => {
                         let data: ShippingInfoUpdated = event.to_data().unwrap();
-                        // self.shipping_address = data.shipping_address;
+                        let collection = db.collection::<Order>("orders");
+                        let filter = doc! {"id":info.aggregate_id.to_owned() };
+
+                        collection
+                            .update_one(
+                                filter,
+                                doc! {"$set": {"shipping_address": data.shipping_address}},
+                                None,
+                            )
+                            .await
+                            .unwrap();
                     }
                     OrderEvent::Paid => {
                         let data: Paid = event.to_data().unwrap();
-                        // self.status = data.status;
+                        let collection = db.collection::<Order>("orders");
+                        let filter = doc! {"id":info.aggregate_id.to_owned() };
+
+                        collection
+                            .update_one(
+                                filter,
+                                doc! {"$set": {"status": to_bson(&data.status).unwrap()}},
+                                None,
+                            )
+                            .await
+                            .unwrap();
                     }
                     OrderEvent::Deleted => {
-                        let data: Deleted = event.to_data().unwrap();
-                        // self.status = data.status;
+                        let collection = db.collection::<Order>("orders");
+                        let filter = doc! {"id":info.aggregate_id.to_owned() };
+
+                        collection.delete_one(filter, None).await.unwrap();
                     }
                     OrderEvent::Canceled => {
                         let data: Canceled = event.to_data().unwrap();
-                        // self.status = data.status;
+                        let collection = db.collection::<Order>("orders");
+                        let filter = doc! {"id":info.aggregate_id.to_owned() };
+
+                        collection
+                            .update_one(
+                                filter,
+                                doc! {"$set": {"status": to_bson(&data.status).unwrap()}},
+                                None,
+                            )
+                            .await
+                            .unwrap();
                     }
                 }
             }

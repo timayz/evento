@@ -39,6 +39,7 @@ async fn main() -> std::io::Result<()> {
 
 
     order::start(&pulsar, &read_db).await;
+    product::start(&pulsar, &read_db).await;
 
     let order_producer = Arc::new(Mutex::new(
         pulsar
