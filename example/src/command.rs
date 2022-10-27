@@ -1,7 +1,7 @@
 use actix::prelude::*;
 use actix_web::HttpResponse;
 use evento::{Aggregate, Engine, Event, EventStore, PgEngine};
-use pulsar::{producer, Producer, SerializeMessage, TokioExecutor, DeserializeMessage, Payload};
+use pulsar::{producer, DeserializeMessage, Payload, Producer, SerializeMessage, TokioExecutor};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::PgPool;

@@ -37,7 +37,6 @@ async fn main() -> std::io::Result<()> {
         .map(|client| client.database("evento_example"))
         .unwrap();
 
-
     order::start(&pulsar, &read_db).await;
     product::start(&pulsar, &read_db).await;
 
