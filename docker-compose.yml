@@ -7,3 +7,17 @@ services:
       - 5432:5432
     environment:
       POSTGRES_PASSWORD: postgres
+
+  mongo:
+    image: mongo:6.0
+    ports:
+      - 27017:27017
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: mongo
+      MONGO_INITDB_ROOT_PASSWORD: mongo
+
+  pulsar:
+    image: apachepulsar/pulsar:2.10.2
+    command: bin/pulsar standalone
+    ports:
+      - 6650:6650
