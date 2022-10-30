@@ -91,7 +91,17 @@ impl Default for Event {
 
 pub trait Aggregate: Default {
     fn apply(&mut self, event: &'_ Event);
-    fn aggregate_id<I: Into<String>>(id: I) -> String;
+    fn aggregate_type<'a>() -> &'a str;
+
+    fn aggregate_id<I: Into<String>>(id: I) -> String {
+        format!("{}_{}", Self::aggregate_type(), id.into())
+    }
+
+    fn to_id<I: Into<String>>(aggregate_id: I) -> String {
+        let id: String = aggregate_id.into();
+
+        id.replacen(&format!("{}_", Self::aggregate_type()), "", 1)
+    }
 }
 
 type EngineResult<A> = Result<Option<(A, Event)>, Error>;
@@ -102,7 +112,7 @@ pub trait Engine {
         id: I,
         events: Vec<Event>,
         original_version: i32,
-    ) -> Pin<Box<dyn Future<Output = Result<i32, Error>>>>;
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Event>, Error>>>>;
 
     fn load<A: Aggregate, I: Into<String>>(
         &self,
@@ -124,8 +134,8 @@ impl Engine for MemoryEngine {
         id: I,
         events: Vec<Event>,
         original_version: i32,
-    ) -> Pin<Box<dyn Future<Output = Result<i32, Error>>>> {
-        let id: String = id.into();
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Event>, Error>>>> {
+        let id: String = A::aggregate_id(id);
         let mut data = self.0.write();
         let data_events = data.entry(id.to_owned()).or_insert_with(Vec::new);
 
@@ -136,20 +146,24 @@ impl Engine for MemoryEngine {
             return Box::pin(async { Err(Error::UnexpectedOriginalVersion) });
         }
 
+        let mut events_with_info = Vec::new();
+
         for event in events {
             version += 1;
-            data_events.push(event.aggregate_id(id.to_owned()).version(version));
+            let event_with_info = event.aggregate_id(id.to_owned()).version(version);
+            data_events.push(event_with_info.clone());
+            events_with_info.push(event_with_info);
         }
 
         drop(data);
-        Box::pin(async move { Ok(version) })
+        Box::pin(async move { Ok(events_with_info) })
     }
 
     fn load<A: Aggregate, I: Into<String>>(
         &self,
         id: I,
     ) -> Pin<Box<dyn Future<Output = EngineResult<A>>>> {
-        let id: String = id.into();
+        let id: String = A::aggregate_id(id);
 
         let events = {
             let data = self.0.read();
@@ -193,18 +207,19 @@ impl Engine for PgEngine {
         id: I,
         events: Vec<Event>,
         original_version: i32,
-    ) -> Pin<Box<dyn Future<Output = Result<i32, Error>>>> {
-        let id: String = id.into();
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Event>, Error>>>> {
+        let id: String = A::aggregate_id(id);
         let pool = self.0.clone();
 
         Box::pin(async move {
             let mut tx = pool.begin().await?;
             let mut version = original_version;
+            let mut events_with_info = Vec::new();
 
             for events in events.chunks(100).collect::<Vec<&[Event]>>() {
                 let mut v1: Vec<Uuid> = Vec::with_capacity(events.len());
-                let mut v2: Vec<&str> = Vec::with_capacity(events.len());
-                let mut v3: Vec<&str> = Vec::with_capacity(events.len());
+                let mut v2: Vec<String> = Vec::with_capacity(events.len());
+                let mut v3: Vec<String> = Vec::with_capacity(events.len());
                 let mut v4: Vec<i32> = Vec::with_capacity(events.len());
                 let mut v5: Vec<Value> = Vec::with_capacity(events.len());
                 let mut v6: Vec<Option<Value>> = Vec::with_capacity(events.len());
@@ -213,13 +228,17 @@ impl Engine for PgEngine {
                 events.iter().for_each(|event| {
                     version += 1;
 
-                    v1.push(event.id);
-                    v2.push(&event.name);
-                    v3.push(&id);
-                    v4.push(version);
-                    v5.push(event.data.clone());
-                    v6.push(event.metadata.clone());
-                    v7.push(event.created_at);
+                    let event_with_info = event.clone().aggregate_id(&id).version(version);
+
+                    v1.push(event_with_info.id);
+                    v2.push(event_with_info.name.to_owned());
+                    v3.push(event_with_info.aggregate_id.to_owned());
+                    v4.push(event_with_info.version);
+                    v5.push(event_with_info.data.clone());
+                    v6.push(event_with_info.metadata.clone());
+                    v7.push(event_with_info.created_at);
+
+                    events_with_info.push(event_with_info);
                 });
 
                 sqlx::query(r#"
@@ -261,7 +280,7 @@ impl Engine for PgEngine {
 
             tx.commit().await?;
 
-            Ok(version)
+            Ok(events_with_info)
         })
     }
 
@@ -269,7 +288,7 @@ impl Engine for PgEngine {
         &self,
         id: I,
     ) -> Pin<Box<dyn Future<Output = EngineResult<A>>>> {
-        let id: String = id.into();
+        let id: String = A::aggregate_id(id);
         let pool = self.0.clone();
 
         Box::pin(async move {
@@ -315,7 +334,7 @@ impl<E: Engine> Engine for EventStore<E> {
         id: I,
         events: Vec<Event>,
         original_version: i32,
-    ) -> Pin<Box<dyn Future<Output = Result<i32, Error>>>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Event>, Error>>>> {
         self.0.save::<A, _>(id, events, original_version)
     }
 

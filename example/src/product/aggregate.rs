@@ -47,7 +47,7 @@ impl Aggregate for Product {
         }
     }
 
-    fn aggregate_id<I: Into<String>>(id: I) -> String {
-        format!("product_{}", id.into())
+    fn aggregate_type<'a>() -> &'a str {
+        "product"
     }
 }

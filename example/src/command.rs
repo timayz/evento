@@ -69,10 +69,16 @@ impl From<Event> for CommandInfo {
     }
 }
 
-impl<'a> SerializeMessage for &'a CommandInfo {
+#[derive(Serialize, Deserialize, Debug)]
+pub struct CommandMessage {
+    pub producer: String,
+    pub event: Event,
+}
+
+impl SerializeMessage for CommandMessage {
     fn serialize_message(input: Self) -> Result<producer::Message, pulsar::Error> {
         let payload =
-            serde_json::to_vec(input).map_err(|e| pulsar::Error::Custom(e.to_string()))?;
+            serde_json::to_vec(&input).map_err(|e| pulsar::Error::Custom(e.to_string()))?;
         Ok(producer::Message {
             payload,
             ..Default::default()
@@ -80,8 +86,8 @@ impl<'a> SerializeMessage for &'a CommandInfo {
     }
 }
 
-impl DeserializeMessage for CommandInfo {
-    type Output = Result<CommandInfo, serde_json::Error>;
+impl DeserializeMessage for CommandMessage {
+    type Output = Result<CommandMessage, serde_json::Error>;
 
     fn deserialize_message(payload: &Payload) -> Self::Output {
         serde_json::from_slice(&payload.data)
@@ -152,11 +158,20 @@ impl CommandResponse {
                 info.events.clone(),
                 info.original_version,
             )
-            .await;
+            .await
+            .map(|events| {
+                events
+                    .into_iter()
+                    .map(|e| CommandMessage {
+                        event: e,
+                        producer: "example.eu-west-3".to_owned(),
+                    })
+                    .collect::<Vec<CommandMessage>>()
+            });
 
         match res {
-            Ok(_) => {
-                if let Err(e) = producer.send(info).await {
+            Ok(events) => {
+                if let Err(e) = producer.send_all(events).await {
                     return HttpResponse::InternalServerError().json(json!({
                         "code": "internal_server_error",
                         "reason": e.to_string()

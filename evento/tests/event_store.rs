@@ -89,8 +89,8 @@ impl Aggregate for User {
         }
     }
 
-    fn aggregate_id<I: Into<String>>(id: I) -> String {
-        format!("user_{}", id.into())
+    fn aggregate_type<'a>() -> &'a str {
+        "user"
     }
 }
 
@@ -159,7 +159,7 @@ async fn pg_save_wrong_version() {
 }
 
 async fn save<E: Engine>(store: EventStore<E>) {
-    let last_version = store
+    let last_event = store
         .save::<User, _>(
             "1",
             vec![
@@ -176,9 +176,12 @@ async fn save<E: Engine>(store: EventStore<E>) {
             0,
         )
         .await
+        .map(|events| events.last().cloned())
+        .unwrap()
         .unwrap();
 
-    assert_eq!(last_version, 2)
+    assert_eq!(last_event.version, 2);
+    assert_eq!(last_event.aggregate_id, "user_1");
 }
 
 async fn load_save<E: Engine>(store: EventStore<E>) {
@@ -189,7 +192,7 @@ async fn load_save<E: Engine>(store: EventStore<E>) {
     assert_eq!(john.first_name, None);
     assert_eq!(john.last_name, None);
 
-    let last_version = store
+    let last_event = store
         .save::<User, _>(
             "1",
             vec![Event::new(UserEvent::ProfileUpdated)
@@ -201,11 +204,13 @@ async fn load_save<E: Engine>(store: EventStore<E>) {
             last_event.version,
         )
         .await
+        .map(|events| events.last().cloned())
+        .unwrap()
         .unwrap();
 
-    assert_eq!(last_version, 3);
+    assert_eq!(last_event.version, 3);
 
-    let last_version = store
+    let last_event = store
         .save::<User, _>(
             "1",
             vec![
@@ -223,12 +228,14 @@ async fn load_save<E: Engine>(store: EventStore<E>) {
                     })
                     .unwrap(),
             ],
-            last_version,
+            last_event.version,
         )
         .await
+        .map(|events| events.last().cloned())
+        .unwrap()
         .unwrap();
 
-    assert_eq!(last_version, 5);
+    assert_eq!(last_event.version, 5);
 
     let (john, last_event) = store.load::<User, _>("1").await.unwrap().unwrap();
 
@@ -256,6 +263,8 @@ async fn save_wrong_version<E: Engine>(store: EventStore<E>) {
             last_event.version,
         )
         .await
+        .map(|events| events.last().cloned())
+        .unwrap()
         .unwrap();
 
     let err = store
@@ -297,12 +306,14 @@ async fn save_wrong_version<E: Engine>(store: EventStore<E>) {
                     })
                     .unwrap(),
             ],
-            ov,
+            ov.version,
         )
         .await
+        .map(|events| events.last().cloned())
+        .unwrap()
         .unwrap();
 
-    assert_eq!(ov + 2, ovf);
+    assert_eq!(ov.version + 2, ovf.version);
 }
 
 async fn create_memory_store() -> EventStore<MemoryEngine> {
