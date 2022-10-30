@@ -91,7 +91,7 @@ impl Aggregate for Order {
         }
     }
 
-    fn aggregate_id<I: Into<String>>(id: I) -> String {
-        format!("order_{}", id.into())
+    fn aggregate_type<'a>() -> &'a str {
+        "order"
     }
 }
