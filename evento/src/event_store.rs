@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, QueryBuilder};
 use std::{collections::HashMap, future::Future, pin::Pin};
 use uuid::Uuid;
 
@@ -217,43 +217,27 @@ impl Engine for PgEngine {
             let mut events_with_info = Vec::new();
 
             for events in events.chunks(100).collect::<Vec<&[Event]>>() {
-                let mut v1: Vec<Uuid> = Vec::with_capacity(events.len());
-                let mut v2: Vec<String> = Vec::with_capacity(events.len());
-                let mut v3: Vec<String> = Vec::with_capacity(events.len());
-                let mut v4: Vec<i32> = Vec::with_capacity(events.len());
-                let mut v5: Vec<Value> = Vec::with_capacity(events.len());
-                let mut v6: Vec<Option<Value>> = Vec::with_capacity(events.len());
-                let mut v7: Vec<DateTime<Utc>> = Vec::with_capacity(events.len());
+                let mut query_builder: QueryBuilder<Postgres> = QueryBuilder::new(
+                    "INSERT INTO evento_events (id, name, aggregate_id, version, data, metadata, created_at) "
+                );
 
-                events.iter().for_each(|event| {
+                query_builder.push_values(events, |mut b, event| {
                     version += 1;
 
-                    let event_with_info = event.clone().aggregate_id(&id).version(version);
+                    let event = event.clone().aggregate_id(&id).version(version);
 
-                    v1.push(event_with_info.id);
-                    v2.push(event_with_info.name.to_owned());
-                    v3.push(event_with_info.aggregate_id.to_owned());
-                    v4.push(event_with_info.version);
-                    v5.push(event_with_info.data.clone());
-                    v6.push(event_with_info.metadata.clone());
-                    v7.push(event_with_info.created_at);
+                    b.push_bind(event.id)
+                        .push_bind(event.name.to_owned())
+                        .push_bind(event.aggregate_id.to_owned())
+                        .push_bind(event.version)
+                        .push_bind(event.data.clone())
+                        .push_bind(event.metadata.clone())
+                        .push_bind(event.created_at);
 
-                    events_with_info.push(event_with_info);
+                    events_with_info.push(event);
                 });
 
-                sqlx::query(r#"
-                    INSERT INTO evento_events (id, name, aggregate_id, version, data, metadata, created_at)
-                    SELECT * FROM UNNEST ($1,$2,$3,$4,$5,$6,$7)"#
-                )
-                .bind(v1)
-                .bind(v2)
-                .bind(v3)
-                .bind(v4)
-                .bind(v5)
-                .bind(v6)
-                .bind(v7)
-                .execute(&mut *tx)
-                .await?;
+                query_builder.build().execute(&mut *tx).await?;
             }
 
             let next_event_id = sqlx::query_as!(
@@ -267,7 +251,7 @@ impl Engine for PgEngine {
                 &id,
                 original_version + 1
             )
-            .fetch_optional(&pool)
+            .fetch_optional(&mut *tx)
             .await?
             .map(|e| e.id)
             .unwrap_or(events[0].id);
