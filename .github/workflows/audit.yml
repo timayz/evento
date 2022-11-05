@@ -5,4 +5,4 @@ on:
 
 jobs:
   rust:
-    uses: timada-org/.github/.github/workflows/rust-audit.yml@v2.4.2
+    uses: timada-org/.github/.github/workflows/rust-audit.yml@v2.5.0

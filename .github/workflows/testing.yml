@@ -3,4 +3,4 @@ on: pull_request
 
 jobs:
   rust:
-    uses: timada-org/.github/.github/workflows/rust-testing.yml@feat/add-protoc
+    uses: timada-org/.github/.github/workflows/rust-testing.yml@v2.5.0
