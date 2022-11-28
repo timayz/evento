@@ -1,6 +1,6 @@
 {
   "db": "PostgreSQL",
-  "3f46e2472a6ce6d0d5171385cf1fd436521f39949b779d009b930a7a16c00f0a": {
+  "d0de4a4043fc785f604e46f371eed1798317065e0995c933c90eda61afc33d69": {
     "describe": {
       "columns": [
         {
@@ -55,9 +55,9 @@
         ]
       }
     },
-    "query": "\n        SELECT *\n        FROM evento_events\n        WHERE aggregate_id = $1 AND version = $2\n        LIMIT 1\n                "
+    "query": "SELECT * FROM evento_events WHERE aggregate_id = $1 AND version = $2 LIMIT 1"
   },
-  "fd015a164281fae663ad512c13bb994fe6dbdf2dd8b107a5cd34daecc7328873": {
+  "da27751b8f696cb7e375c67f8a1d5e1fa2e7e038bad45a32a09fdb5275d96a8a": {
     "describe": {
       "columns": [
         {
@@ -111,6 +111,6 @@
         ]
       }
     },
-    "query": "\n        SELECT *\n        FROM evento_events\n        WHERE aggregate_id = $1\n        ORDER BY version\n                "
+    "query": "SELECT * FROM evento_events WHERE aggregate_id = $1 ORDER BY version"
   }
 }

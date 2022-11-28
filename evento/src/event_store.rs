@@ -242,12 +242,7 @@ impl Engine for PgEngine {
 
             let next_event_id = sqlx::query_as!(
                 Event,
-                r#"
-        SELECT *
-        FROM evento_events
-        WHERE aggregate_id = $1 AND version = $2
-        LIMIT 1
-                "#,
+                r#"SELECT * FROM evento_events WHERE aggregate_id = $1 AND version = $2 LIMIT 1"#,
                 &id,
                 original_version + 1
             )
@@ -278,12 +273,7 @@ impl Engine for PgEngine {
         Box::pin(async move {
             let events = sqlx::query_as!(
                 Event,
-                r#"
-        SELECT *
-        FROM evento_events
-        WHERE aggregate_id = $1
-        ORDER BY version
-                "#,
+                r#"SELECT * FROM evento_events WHERE aggregate_id = $1 ORDER BY version"#,
                 &id
             )
             .fetch_all(&pool)

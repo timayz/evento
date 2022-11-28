@@ -90,7 +90,7 @@ async fn init_db() -> PgPool {
         .await
         .unwrap();
 
-    sqlx::migrate!().run(&pool).await.unwrap();
+    sqlx::migrate!("../migrations").run(&pool).await.unwrap();
 
     pool
 }
