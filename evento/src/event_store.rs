@@ -218,7 +218,7 @@ impl Engine for PgEngine {
 
             for events in events.chunks(100).collect::<Vec<&[Event]>>() {
                 let mut query_builder: QueryBuilder<Postgres> = QueryBuilder::new(
-                    "INSERT INTO evento_events (id, name, aggregate_id, version, data, metadata, created_at) "
+                    "INSERT INTO _evento_events (id, name, aggregate_id, version, data, metadata, created_at) "
                 );
 
                 query_builder.push_values(events, |mut b, event| {
@@ -241,7 +241,7 @@ impl Engine for PgEngine {
             }
 
             let next_event_id = sqlx::query_as::<_, Event>(
-                "SELECT * FROM evento_events WHERE aggregate_id = $1 AND version = $2 LIMIT 1",
+                "SELECT * FROM _evento_events WHERE aggregate_id = $1 AND version = $2 LIMIT 1",
             )
             .bind(&id)
             .bind(original_version + 1)
@@ -271,7 +271,7 @@ impl Engine for PgEngine {
 
         Box::pin(async move {
             let events = sqlx::query_as::<_, Event>(
-                "SELECT * FROM evento_events WHERE aggregate_id = $1 ORDER BY version",
+                "SELECT * FROM _evento_events WHERE aggregate_id = $1 ORDER BY version",
             )
             .bind(&id)
             .fetch_all(&pool)
