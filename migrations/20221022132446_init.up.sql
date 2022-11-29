@@ -1,5 +1,5 @@
 -- Add up migration script here
-CREATE TABLE IF NOT EXISTS evento_events
+CREATE TABLE IF NOT EXISTS _evento_events
 (
     id uuid NOT NULL PRIMARY KEY,
     name varchar(255) NOT NULL,
@@ -10,4 +10,4 @@ CREATE TABLE IF NOT EXISTS evento_events
     created_at timestamptz NOT NULL
 );
 
-CREATE INDEX idk_aggregate_id ON evento_events (aggregate_id);
+CREATE INDEX idk_aggregate_id ON _evento_events (aggregate_id);
