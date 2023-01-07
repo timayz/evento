@@ -20,7 +20,7 @@ impl From<sqlx::Error> for Error {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize, Debug, sqlx::FromRow)]
 pub struct Event {
     pub id: Uuid,
     pub name: String,
@@ -240,12 +240,14 @@ impl Engine for PgEngine {
                 query_builder.build().execute(&mut *tx).await?;
             }
 
-            let next_event_id = sqlx::query_as!(
-                Event,
+            let next_event_id = sqlx::query_as::<_, Event>(
+                //Event,
                 "SELECT * FROM _evento_events WHERE aggregate_id = $1 AND version = $2 LIMIT 1",
-                &id,
-                original_version + 1,
+                // &id,
+                // original_version + 1,
             )
+            .bind(&id)
+            .bind(original_version + 1)
             .fetch_optional(&mut *tx)
             .await?
             .map(|e| e.id)
@@ -271,11 +273,10 @@ impl Engine for PgEngine {
         let pool = self.0.clone();
 
         Box::pin(async move {
-            let events = sqlx::query_as!(
-                Event,
+            let events = sqlx::query_as::<_, Event>(
                 "SELECT * FROM _evento_events WHERE aggregate_id = $1 ORDER BY version",
-                &id,
             )
+            .bind(&id)
             .fetch_all(&pool)
             .await?;
 
