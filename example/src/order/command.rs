@@ -1,5 +1,6 @@
 use actix::{ActorFutureExt, Context, Handler, Message, ResponseActFuture, WrapFuture};
-use evento::{Engine, Event, EventStore, PgEngine};
+use evento::store::{Engine, PgEngine};
+use evento::{Event, EventStore};
 use nanoid::nanoid;
 use serde::Deserialize;
 use validator::Validate;

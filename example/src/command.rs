@@ -1,6 +1,7 @@
 use actix::prelude::*;
 use actix_web::HttpResponse;
-use evento::{Aggregate, Engine, Event, EventStore, PgEngine};
+use evento::store::{Engine, PgEngine};
+use evento::{Aggregate, Event, EventStore};
 use pulsar::{producer, DeserializeMessage, Payload, Producer, SerializeMessage, TokioExecutor};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -16,7 +17,7 @@ pub enum Error {
     Pulsar(pulsar::Error),
 
     #[error("internal server error")]
-    Evento(evento::Error),
+    Evento(evento::StoreError),
 
     #[error("{0}")]
     ValidationErrors(ValidationErrors),
@@ -46,8 +47,8 @@ impl From<ValidationErrors> for Error {
     }
 }
 
-impl From<evento::Error> for Error {
-    fn from(e: evento::Error) -> Self {
+impl From<evento::StoreError> for Error {
+    fn from(e: evento::StoreError) -> Self {
         Error::Evento(e)
     }
 }

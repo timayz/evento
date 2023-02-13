@@ -7,7 +7,7 @@ use std::sync::Arc;
 use actix::{Actor, Addr};
 use actix_web::{web, App, HttpServer};
 use command::Command;
-use evento::{EventStore, PgEngine};
+use evento::{EventStore};
 use mongodb::{options::ClientOptions, Client};
 use pulsar::{Producer, Pulsar, TokioExecutor};
 use sqlx::{Executor, PgPool};
@@ -15,7 +15,7 @@ use tokio::sync::Mutex;
 
 pub struct AppState {
     pub cmd: Addr<Command>,
-    pub store: EventStore<PgEngine>,
+    pub store: EventStore<evento::store::PgEngine>,
     pub order_producer: Arc<Mutex<Producer<TokioExecutor>>>,
     pub product_producer: Arc<Mutex<Producer<TokioExecutor>>>,
 }
@@ -64,7 +64,7 @@ async fn main() -> std::io::Result<()> {
         App::new()
             .app_data(web::Data::<AppState>::new(AppState {
                 cmd: cmd.clone(),
-                store: PgEngine::new(pool.clone()),
+                store: evento::store::PgEngine::new(pool.clone()),
                 order_producer: order_producer.clone(),
                 product_producer: product_producer.clone(),
             }))

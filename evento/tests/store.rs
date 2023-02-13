@@ -1,98 +1,11 @@
 use std::collections::HashMap;
-
-use evento::{Aggregate, Engine, Error, Event, EventStore, MemoryEngine, PgEngine};
-use parse_display::{Display, FromStr};
-use serde::{Deserialize, Serialize};
+use evento::store::{Engine, MemoryEngine, PgEngine};
+use evento::{Aggregate, Event, EventStore, StoreError};
 use sqlx::{Executor, PgPool};
 
-#[derive(Display, FromStr)]
-#[display(style = "kebab-case")]
-enum UserEvent {
-    Created,
-    DisplayNameUpdated,
-    ProfileUpdated,
-    PasswordUpdated,
-    AccountDeleted,
-}
+mod common;
 
-impl Into<String> for UserEvent {
-    fn into(self) -> String {
-        self.to_string()
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-struct Created {
-    username: String,
-    password: String,
-}
-
-#[derive(Serialize, Deserialize)]
-struct DisplayNameUpdated {
-    display_name: String,
-}
-
-#[derive(Serialize, Deserialize)]
-struct ProfileUpdated {
-    first_name: String,
-    last_name: String,
-}
-
-#[derive(Serialize, Deserialize)]
-struct PasswordUpdated {
-    old_password: String,
-    new_password: String,
-}
-
-#[derive(Serialize, Deserialize)]
-struct AccountDeleted {
-    deleted: bool,
-}
-
-#[derive(Default, Serialize, Deserialize)]
-struct User {
-    first_name: Option<String>,
-    last_name: Option<String>,
-    display_name: Option<String>,
-    username: String,
-    password: String,
-    deleted: bool,
-}
-
-impl Aggregate for User {
-    fn apply(&mut self, event: &evento::Event) {
-        let user_event: UserEvent = event.name.parse().unwrap();
-
-        match user_event {
-            UserEvent::Created => {
-                let data: Created = event.to_data().unwrap();
-                self.username = data.username;
-                self.password = data.password;
-            }
-            UserEvent::DisplayNameUpdated => {
-                let data: DisplayNameUpdated = event.to_data().unwrap();
-                self.display_name = Some(data.display_name);
-            }
-            UserEvent::ProfileUpdated => {
-                let data: ProfileUpdated = event.to_data().unwrap();
-                self.first_name = Some(data.first_name);
-                self.last_name = Some(data.last_name);
-            }
-            UserEvent::PasswordUpdated => {
-                let data: PasswordUpdated = event.to_data().unwrap();
-                self.password = data.new_password;
-            }
-            UserEvent::AccountDeleted => {
-                let data: AccountDeleted = event.to_data().unwrap();
-                self.deleted = data.deleted;
-            }
-        }
-    }
-
-    fn aggregate_type<'a>() -> &'a str {
-        "user"
-    }
-}
+use crate::common::{AccountDeleted, Created, ProfileUpdated, User, UserEvent, PasswordUpdated, DisplayNameUpdated};
 
 #[test]
 fn apply_events() {
@@ -288,7 +201,7 @@ async fn save_wrong_version<E: Engine>(store: EventStore<E>) {
         .await
         .unwrap_err();
 
-    assert_eq!(err, Error::UnexpectedOriginalVersion);
+    assert_eq!(err, StoreError::UnexpectedOriginalVersion);
 
     let ovf = store
         .save::<User, _>(

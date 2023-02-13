@@ -28,3 +28,4 @@ features = [
 [dev-dependencies]
 parse-display = "0.8.0"
 tokio = { version = "1.25.0", features = ["rt-multi-thread", "macros"] }
+lazy_static = "1.4.0"

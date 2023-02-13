@@ -935,6 +935,7 @@ name = "evento"
 version = "0.2.7"
 dependencies = [
  "chrono",
+ "lazy_static",
  "parking_lot 0.12.1",
  "parse-display",
  "pikav",
