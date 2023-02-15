@@ -13,8 +13,10 @@ use pikav::topic::TopicFilter;
 use std::{collections::HashMap, future::Future, pin::Pin};
 use store::{Engine as StoreEngine, EngineResult as StoreEngineResult};
 
-type SubscirberHandler = fn(e: Event, ctx: Context) -> Result<(), String>;
+type SubscirberHandler =
+    fn(e: Event, ctx: &Context) -> Pin<Box<dyn Future<Output = Result<(), String>>>>;
 
+#[derive(Clone)]
 pub struct Subscriber {
     key: String,
     filters: Vec<TopicFilter>,
@@ -93,6 +95,7 @@ impl Engine for PgEngine {
 }
 
 pub struct Evento<E: Engine, S: StoreEngine> {
+    name: Option<String>,
     engine: E,
     store: EventStore<S>,
     ctx: Context,
@@ -106,7 +109,13 @@ impl<E: Engine, S: StoreEngine> Evento<E, S> {
             store,
             ctx: Context::new(),
             subscribers: HashMap::new(),
+            name: None,
         }
+    }
+
+    pub fn name<N: Into<String>>(mut self, name: N) -> Self {
+        self.name = Some(name.into());
+        self
     }
 
     pub fn data<U: 'static>(mut self, val: U) -> Self {

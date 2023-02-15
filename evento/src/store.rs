@@ -3,7 +3,7 @@ use parking_lot::RwLock;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, QueryBuilder};
-use std::{collections::HashMap, future::Future, pin::Pin};
+use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 use uuid::Uuid;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -120,11 +120,12 @@ pub trait Engine {
     ) -> Pin<Box<dyn Future<Output = EngineResult<A>>>>;
 }
 
-pub struct MemoryEngine(RwLock<HashMap<String, Vec<Event>>>);
+#[derive(Clone)]
+pub struct MemoryEngine(Arc<RwLock<HashMap<String, Vec<Event>>>>);
 
 impl MemoryEngine {
     pub fn new() -> EventStore<Self> {
-        EventStore(Self(RwLock::new(HashMap::new())))
+        EventStore(Self(Arc::new(RwLock::new(HashMap::new()))))
     }
 }
 

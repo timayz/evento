@@ -1,5 +1,5 @@
 use std::{
-    any::{Any, TypeId},
+    any::{Any, TypeId, type_name},
     collections::HashMap,
     fmt,
     hash::{BuildHasherDefault, Hasher},
@@ -74,6 +74,33 @@ impl Context {
     /// ```
     pub fn contains<T: 'static>(&self) -> bool {
         self.map.contains_key(&TypeId::of::<T>())
+    }
+
+    /// Get a reference to an item of a given type.
+    ///
+    /// ```
+    /// # use evento::Context;
+    /// let mut map = Context::new();
+    /// map.insert(1u32);
+    /// assert_eq!(map.get::<u32>(), &1u32);
+    /// ```
+    pub fn extract<T: 'static>(&self) -> &T {
+        match self.get::<T>() {
+            Some(_) => todo!(),
+            _ => {
+                tracing::debug!(
+                    "Failed to extract `Data<{}>` For the Data extractor to work \
+        correctly, wrap the data with `Data::new()` and pass it to `Evento::data()`. \
+        Ensure that types align in both the set and retrieve calls.",
+                    type_name::<T>()
+                );
+
+                panic!(
+                    "Requested application data is not configured correctly. \
+    View/enable debug logs for more details."
+                );
+            }
+        }
     }
 
     /// Get a reference to an item of a given type.
