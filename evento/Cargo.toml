@@ -16,6 +16,8 @@ thiserror = "1.0.38"
 pikav = "0.12.2"
 chrono = { version = "0.4.23", default-features = false, features = ["clock", "serde"] }
 tracing = "0.1.37"
+tokio = "1.25.0"
+futures-util = "0.3.26"
 
 [dependencies.uuid]
 version = "1.3.0"
@@ -29,4 +31,3 @@ features = [
 [dev-dependencies]
 parse-display = "0.8.0"
 tokio = { version = "1.25.0", features = ["rt-multi-thread", "macros"] }
-futures-util = "0.3.26"

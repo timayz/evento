@@ -10,8 +10,12 @@ use uuid::Uuid;
 pub enum Error {
     #[error("Unexpected original version while saving event")]
     UnexpectedOriginalVersion,
+
     #[error("Sqlx error `{0}`")]
     Sqlx(String),
+
+    #[error("{0}")]
+    Unknown(String),
 }
 
 impl From<sqlx::Error> for Error {

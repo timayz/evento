@@ -5,13 +5,28 @@ mod data;
 
 pub use context::Context;
 pub use data::Data;
-use parking_lot::RwLock;
-use sqlx::PgPool;
 pub use store::{Aggregate, Error as StoreError, Event, EventStore};
 
+use parking_lot::RwLock;
+// use sqlx::PgPool;
+use chrono::{DateTime, Utc};
+use futures_util::{future::join_all, FutureExt};
 use pikav::topic::TopicFilter;
-use std::{collections::HashMap, future::Future, pin::Pin};
+use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, future::Future, pin::Pin, time::Duration};
 use store::{Engine as StoreEngine, EngineResult as StoreEngineResult};
+use tokio::time::{interval_at, sleep, Instant};
+use uuid::Uuid;
+
+#[derive(Clone, Serialize, Deserialize, Debug, sqlx::FromRow)]
+pub struct Consumer {
+    pub id: Uuid,
+    pub key: String,
+    pub enabled: bool,
+    pub cursor: Option<Uuid>,
+    pub cursor_updated_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
 
 type SubscirberHandler =
     fn(e: Event, ctx: &Context) -> Pin<Box<dyn Future<Output = Result<(), String>>>>;
@@ -48,51 +63,104 @@ impl Subscriber {
 }
 
 pub trait Engine {
-    fn save<I: Into<String>>(
+    fn create_if_not_exists<K: Into<String>>(
         &self,
-        id: I,
-        events: Vec<Event>,
-        original_version: i32,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<Event>, StoreError>>>>;
+        key: K,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>>>>;
+
+    fn get_cursor<K: Into<String>>(
+        &self,
+        key: K,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Uuid>, StoreError>>>>;
+
+    fn update_cursor<K: Into<String>>(
+        &self,
+        key: K,
+        cursor: Uuid,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>>>>;
 }
 
-pub struct MemoryEngine(RwLock<HashMap<String, Vec<Event>>>);
+pub struct MemoryEngine(
+    RwLock<HashMap<String, Vec<Event>>>,
+    RwLock<HashMap<String, Consumer>>,
+);
 
 impl MemoryEngine {
     pub fn new<S: StoreEngine>(store: EventStore<S>) -> Evento<Self, S> {
-        Evento::new(Self(RwLock::new(HashMap::new())), store)
+        Evento::new(
+            Self(RwLock::new(HashMap::new()), RwLock::new(HashMap::new())),
+            store,
+        )
     }
 }
 
 impl Engine for MemoryEngine {
-    fn save<I: Into<String>>(
+    fn create_if_not_exists<K: Into<String>>(
         &self,
-        _id: I,
-        _events: Vec<Event>,
-        _original_version: i32,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<Event>, StoreError>>>> {
-        todo!()
+        key: K,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>>>> {
+        let mut consumers = self.1.write().clone();
+        let key = key.into();
+
+        async move {
+            consumers.entry(key.to_owned()).or_insert(Consumer {
+                id: Uuid::new_v4(),
+                key,
+                enabled: true,
+                cursor: None,
+                cursor_updated_at: None,
+                created_at: Utc::now(),
+            });
+
+            Ok(())
+        }
+        .boxed()
     }
-}
 
-pub struct PgEngine(PgPool);
-
-impl PgEngine {
-    pub fn new<S: StoreEngine>(pool: PgPool, store: EventStore<S>) -> Evento<Self, S> {
-        Evento::new(Self(pool), store)
-    }
-}
-
-impl Engine for PgEngine {
-    fn save<I: Into<String>>(
+    fn get_cursor<K: Into<String>>(
         &self,
-        _id: I,
-        _events: Vec<Event>,
-        _original_version: i32,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<Event>, StoreError>>>> {
-        todo!()
+        key: K,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Uuid>, StoreError>>>> {
+        let key = key.into();
+        let res = match self.1.read().get(&key) {
+            Some(c) => Ok(c.cursor.to_owned()),
+            _ => Err(StoreError::Unknown(format!("consumer {key} not found"))),
+        };
+
+        async move { res }.boxed()
+    }
+
+    fn update_cursor<K: Into<String>>(
+        &self,
+        key: K,
+        cursor: Uuid,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>>>> {
+        let key = key.into();
+        let res = match self.1.write().get_mut(&key) {
+            Some(consumer) => {
+                consumer.cursor = Some(cursor);
+                consumer.cursor_updated_at = Some(Utc::now());
+
+                Ok(())
+            }
+            _ => Err(StoreError::Unknown(format!("consumer {key} not found"))),
+        };
+
+        async move { res }.boxed()
     }
 }
+
+// pub struct PgEngine(PgPool);
+
+// impl PgEngine {
+//     pub fn new<S: StoreEngine>(pool: PgPool, store: EventStore<S>) -> Evento<Self, S> {
+//         Evento::new(Self(pool), store)
+//     }
+// }
+
+// impl Engine for PgEngine {
+
+// }
 
 pub struct Evento<E: Engine, S: StoreEngine> {
     name: Option<String>,
@@ -128,8 +196,41 @@ impl<E: Engine, S: StoreEngine> Evento<E, S> {
         self
     }
 
-    pub async fn run(&self) {
-        todo!()
+    pub async fn run(&self) -> Result<(), StoreError> {
+        self.run_with_delay(Duration::from_secs(30)).await
+    }
+
+    pub async fn run_with_delay(&self, delay: Duration) -> Result<(), StoreError> {
+        let futures = self
+            .subscribers
+            .iter()
+            .map(|(key, _)| self.engine.create_if_not_exists(key));
+
+        let fut_err = join_all(futures)
+            .await
+            .into_iter()
+            .find_map(|res| res.err());
+
+        if let Some(err) = fut_err {
+            return Err(err);
+        }
+
+        for (_, subscriber) in &self.subscribers {
+            let subscriber = subscriber.clone();
+
+            tokio::spawn(async move {
+                sleep(delay).await;
+
+                let mut interval = interval_at(Instant::now(), Duration::from_secs(1));
+
+                loop {
+                    interval.tick().await;
+                    println!("{}", subscriber.key);
+                }
+            });
+        }
+
+        Ok(())
     }
 
     pub fn publish<A: Aggregate, I: Into<String>>(

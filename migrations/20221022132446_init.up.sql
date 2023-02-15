@@ -29,8 +29,8 @@ CREATE TABLE IF NOT EXISTS _evento_consumers
     key varchar(255) NOT NULL,
     enabled BOOLEAN NOT NULL,
     cursor uuid NULL,
-    processing_ids json NULL,
+    cursor_updated_at timestamptz NULL,
     created_at timestamptz NOT NULL
 );
 
-CREATE INDEX idk_key ON _evento_consumers (key);
+CREATE UNIQUE INDEX idk_key ON _evento_consumers (key);
