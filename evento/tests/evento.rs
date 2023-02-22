@@ -47,7 +47,7 @@ async fn memory_filter() {
 //     save_wrong_version(store).await;
 // }
 
-async fn publish<E: Engine, S: StoreEngine>(
+async fn publish<E: Engine + Sync + Send + 'static, S: StoreEngine>(
     eu_west_3a: Evento<E, S>,
     eu_west_3b: Evento<E, S>,
     us_east_1a: Evento<E, S>,
@@ -91,20 +91,28 @@ async fn publish<E: Engine, S: StoreEngine>(
     let users: Arc<RwLock<HashMap<String, User>>> = Arc::new(RwLock::new(HashMap::new()));
     let eu_west_3a = eu_west_3a
         .name("eu-west-3a")
-        .data(users.clone())
-        .subscribe(subscriber.clone());
+        .subscribe(subscriber.clone())
+        .run_with_delay(Duration::from_secs(0), &|ctx| {
+            ctx.insert(users.clone());
+        })
+        .await
+        .unwrap();
     let eu_west_3b = eu_west_3b
         .name("eu-west-3b")
-        .data(users.clone())
-        .subscribe(subscriber.clone());
+        .subscribe(subscriber.clone())
+        .run_with_delay(Duration::from_secs(0), &|ctx| {
+            ctx.insert(users.clone());
+        })
+        .await
+        .unwrap();
     let us_east_1a = us_east_1a
         .name("us-east-1a")
-        .data(users.clone())
-        .subscribe(subscriber.clone());
-
-    eu_west_3a.run_with_delay(Duration::from_secs(0)).await.unwrap();
-    eu_west_3b.run_with_delay(Duration::from_secs(0)).await.unwrap();
-    us_east_1a.run_with_delay(Duration::from_secs(0)).await.unwrap();
+        .subscribe(subscriber.clone())
+        .run_with_delay(Duration::from_secs(0), &|ctx| {
+            ctx.insert(users.clone());
+        })
+        .await
+        .unwrap();
 
     eu_west_3a
         .publish::<User, _>(
@@ -116,7 +124,7 @@ async fn publish<E: Engine, S: StoreEngine>(
                         password: "azerty".to_owned(),
                     })
                     .unwrap(),
-                    Event::new(UserEvent::DisplayNameUpdated)
+                Event::new(UserEvent::DisplayNameUpdated)
                     .data(DisplayNameUpdated {
                         display_name: "John doe".to_owned(),
                     })
@@ -130,55 +138,56 @@ async fn publish<E: Engine, S: StoreEngine>(
     eu_west_3b
         .publish::<User, _>(
             "1",
-            vec![
-                Event::new(UserEvent::DisplayNameUpdated)
-                    .data(DisplayNameUpdated {
-                        display_name: "John Wick".to_owned(),
-                    })
-                    .unwrap(),
-            ],
+            vec![Event::new(UserEvent::DisplayNameUpdated)
+                .data(DisplayNameUpdated {
+                    display_name: "John Wick".to_owned(),
+                })
+                .unwrap()],
             2,
         )
         .await
         .unwrap();
 
-    sleep(Duration::from_secs(5)).await;
+    sleep(Duration::from_secs(2)).await;
 
     let r_users = users.read().await;
     let user1 = r_users.get("1").unwrap();
 
     assert_eq!(user1.username, "john.doe (eu-west-3a)");
-    assert_eq!(user1.display_name, Some("John Wick (eu-west-3a)".to_owned()));
+    assert_eq!(
+        user1.display_name,
+        Some("John Wick (eu-west-3a)".to_owned())
+    );
 
     us_east_1a
         .publish::<User, _>(
             "1",
-            vec![
-                Event::new(UserEvent::DisplayNameUpdated)
-                    .data(DisplayNameUpdated {
-                        display_name: "Nina Wick".to_owned(),
-                    })
-                    .unwrap(),
-            ],
+            vec![Event::new(UserEvent::DisplayNameUpdated)
+                .data(DisplayNameUpdated {
+                    display_name: "Nina Wick".to_owned(),
+                })
+                .unwrap()],
             2,
         )
         .await
         .unwrap();
 
-    sleep(Duration::from_secs(5)).await;
+    sleep(Duration::from_secs(2)).await;
 
     let r_users = users.read().await;
     let user1 = r_users.get("1").unwrap();
 
-    assert_eq!(user1.display_name, Some("Nina Wick (eu-west-3a)".to_owned()));
+    assert_eq!(
+        user1.display_name,
+        Some("Nina Wick (eu-west-3a)".to_owned())
+    );
 }
 
-async fn filter<E: Engine, S: StoreEngine>(eu_west_3a: Evento<E, S>) {
+async fn filter<E: Engine + Sync + Send + 'static, S: StoreEngine>(eu_west_3a: Evento<E, S>) {
     let users: Arc<RwLock<HashMap<String, User>>> = Arc::new(RwLock::new(HashMap::new()));
     let users_count: Arc<RwLock<i32>> = Arc::new(RwLock::new(0));
     let eu_west_3a = eu_west_3a
         .name("eu-west-3a")
-        .data(users.clone())
         .subscribe(
             Subscriber::new("users")
                 .filter("user/+")
@@ -238,9 +247,12 @@ async fn filter<E: Engine, S: StoreEngine>(eu_west_3a: Evento<E, S>) {
                     }
                     .boxed()
                 }),
-        );
-
-    eu_west_3a.run_with_delay(Duration::from_secs(0)).await.unwrap();
+        )
+        .run_with_delay(Duration::from_secs(0), &|ctx| {
+            ctx.insert(users.clone());
+        })
+        .await
+        .unwrap();
 
     eu_west_3a
         .publish::<User, _>(
@@ -305,7 +317,7 @@ async fn filter<E: Engine, S: StoreEngine>(eu_west_3a: Evento<E, S>) {
         .await
         .unwrap();
 
-    sleep(Duration::from_secs(5)).await;
+    sleep(Duration::from_secs(2)).await;
 
     let users = users.read().await;
     let user1 = users.get("1").unwrap();

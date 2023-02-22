@@ -13,5 +13,8 @@ create:
 migrate:
 	sqlx migrate run
 
+revert:
+	sqlx migrate revert
+
 prepare:
 	cargo sqlx prepare --merged

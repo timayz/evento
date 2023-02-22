@@ -23,9 +23,10 @@ CREATE TABLE IF NOT EXISTS _evento_deadletters
     created_at timestamptz NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS _evento_consumers
+CREATE TABLE IF NOT EXISTS _evento_subscriptions
 (
     id uuid NOT NULL PRIMARY KEY,
+    consumer_id uuid NOT NULL,
     key varchar(255) NOT NULL,
     enabled BOOLEAN NOT NULL,
     cursor uuid NULL,
@@ -33,4 +34,4 @@ CREATE TABLE IF NOT EXISTS _evento_consumers
     created_at timestamptz NOT NULL
 );
 
-CREATE UNIQUE INDEX idk_key ON _evento_consumers (key);
+CREATE UNIQUE INDEX idk_key ON _evento_subscriptions (key);

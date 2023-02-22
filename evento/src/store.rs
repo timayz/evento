@@ -110,7 +110,7 @@ pub trait Aggregate: Default {
 
 pub(crate) type EngineResult<A> = Result<Option<(A, Event)>, Error>;
 
-pub trait Engine {
+pub trait Engine: Clone {
     fn save<A: Aggregate, I: Into<String>>(
         &self,
         id: I,
@@ -246,10 +246,7 @@ impl Engine for PgEngine {
             }
 
             let next_event_id = sqlx::query_as::<_, Event>(
-                //Event,
                 "SELECT * FROM _evento_events WHERE aggregate_id = $1 AND version = $2 LIMIT 1",
-                // &id,
-                // original_version + 1,
             )
             .bind(&id)
             .bind(original_version + 1)
