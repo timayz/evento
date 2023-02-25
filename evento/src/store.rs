@@ -1,9 +1,10 @@
 use chrono::{DateTime, Utc};
+use futures_util::FutureExt;
 use parking_lot::RwLock;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, QueryBuilder};
-use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
+use std::{cmp::Ordering, collections::HashMap, future::Future, pin::Pin, sync::Arc};
 use uuid::Uuid;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -116,12 +117,18 @@ pub trait Engine: Clone {
         id: I,
         events: Vec<Event>,
         original_version: i32,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<Event>, Error>>>>;
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Event>, Error>> + Send + '_>>;
 
     fn load<A: Aggregate, I: Into<String>>(
         &self,
         id: I,
-    ) -> Pin<Box<dyn Future<Output = EngineResult<A>>>>;
+    ) -> Pin<Box<dyn Future<Output = EngineResult<A>> + Send + '_>>;
+
+    fn read_all(
+        &self,
+        first: usize,
+        after: Option<Uuid>,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Event>, Error>> + Send + '_>>;
 }
 
 #[derive(Clone)]
@@ -139,7 +146,7 @@ impl Engine for MemoryEngine {
         id: I,
         events: Vec<Event>,
         original_version: i32,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<Event>, Error>>>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Event>, Error>> + Send + '_>> {
         let id: String = A::aggregate_id(id);
         let mut data = self.0.write();
         let data_events = data.entry(id.to_owned()).or_insert_with(Vec::new);
@@ -167,7 +174,7 @@ impl Engine for MemoryEngine {
     fn load<A: Aggregate, I: Into<String>>(
         &self,
         id: I,
-    ) -> Pin<Box<dyn Future<Output = EngineResult<A>>>> {
+    ) -> Pin<Box<dyn Future<Output = EngineResult<A>> + Send + '_>> {
         let id: String = A::aggregate_id(id);
 
         let events = {
@@ -195,6 +202,52 @@ impl Engine for MemoryEngine {
             Ok(Some((aggregate, last_event)))
         })
     }
+
+    fn read_all(
+        &self,
+        first: usize,
+        after: Option<Uuid>,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Event>, Error>> + Send + '_>> {
+        let mut events = self
+            .0
+            .read()
+            .values()
+            .cloned()
+            .flat_map(|events| events)
+            .collect::<Vec<Event>>();
+
+        events.sort_by(|a, b| {
+            let cmp = a.created_at.partial_cmp(&b.created_at).unwrap();
+
+            match cmp {
+                Ordering::Equal => {}
+                _ => return cmp,
+            };
+
+            let cmp = a.version.partial_cmp(&b.version).unwrap();
+
+            match cmp {
+                Ordering::Equal => a.id.partial_cmp(&b.id).unwrap(),
+                _ => return cmp,
+            }
+        });
+
+        let start = (after
+            .map(|id| events.iter().position(|event| event.id == id).unwrap() as i32)
+            .unwrap_or(-1)
+            + 1) as usize;
+
+        async move {
+            if events.is_empty() || start == events.len() {
+                return Ok(events);
+            }
+
+            let end = std::cmp::min(events.len(), first) - 1;
+
+            Ok(events[start..end].to_vec())
+        }
+        .boxed()
+    }
 }
 
 #[derive(Clone)]
@@ -212,7 +265,7 @@ impl Engine for PgEngine {
         id: I,
         events: Vec<Event>,
         original_version: i32,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<Event>, Error>>>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Event>, Error>> + Send + '_>> {
         let id: String = A::aggregate_id(id);
         let pool = self.0.clone();
 
@@ -270,7 +323,7 @@ impl Engine for PgEngine {
     fn load<A: Aggregate, I: Into<String>>(
         &self,
         id: I,
-    ) -> Pin<Box<dyn Future<Output = EngineResult<A>>>> {
+    ) -> Pin<Box<dyn Future<Output = EngineResult<A>> + Send + '_>> {
         let id: String = A::aggregate_id(id);
         let pool = self.0.clone();
 
@@ -300,6 +353,14 @@ impl Engine for PgEngine {
             Ok(Some((aggregate, last_event)))
         })
     }
+
+    fn read_all(
+        &self,
+        _first: usize,
+        _after: Option<Uuid>,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Event>, Error>> + Send + '_>> {
+        todo!()
+    }
 }
 
 #[derive(Clone)]
@@ -311,14 +372,22 @@ impl<E: Engine> Engine for EventStore<E> {
         id: I,
         events: Vec<Event>,
         original_version: i32,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<Event>, Error>>>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Event>, Error>> + Send + '_>> {
         self.0.save::<A, _>(id, events, original_version)
     }
 
     fn load<A: Aggregate, I: Into<String>>(
         &self,
         id: I,
-    ) -> Pin<Box<dyn Future<Output = EngineResult<A>>>> {
+    ) -> Pin<Box<dyn Future<Output = EngineResult<A>> + Send + '_>> {
         self.0.load(id)
+    }
+
+    fn read_all(
+        &self,
+        first: usize,
+        after: Option<Uuid>,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Event>, Error>> + Send + '_>> {
+        self.0.read_all(first, after)
     }
 }

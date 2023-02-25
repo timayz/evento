@@ -30,7 +30,7 @@ pub struct Subscription {
 }
 
 type SubscirberHandler =
-    fn(e: Event, ctx: &Context) -> Pin<Box<dyn Future<Output = Result<(), String>>>>;
+    fn(e: Event, ctx: EventoContext) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
 
 #[derive(Clone)]
 pub struct Subscriber {
@@ -74,14 +74,14 @@ impl<S: StoreEngine> Publisher<S> {
         id: I,
         events: Vec<Event>,
         original_version: i32,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<Event>, StoreError>>>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Event>, StoreError>> + Send + '_>> {
         self.store.save::<A, _>(id, events, original_version)
     }
 
     pub fn load<A: Aggregate, I: Into<String>>(
         &self,
         id: I,
-    ) -> Pin<Box<dyn Future<Output = StoreEngineResult<A>>>> {
+    ) -> Pin<Box<dyn Future<Output = StoreEngineResult<A>> + Send + '_>> {
         self.store.load::<A, _>(id)
     }
 }
@@ -111,7 +111,7 @@ pub struct MemoryEngine(
 );
 
 impl MemoryEngine {
-    pub fn new<S: StoreEngine>(store: EventStore<S>) -> Evento<Self, S> {
+    pub fn new<S: StoreEngine + Sync + Send + 'static>(store: EventStore<S>) -> Evento<Self, S> {
         Evento::new(
             Self(
                 Arc::new(RwLock::new(HashMap::new())),
@@ -187,20 +187,33 @@ impl Engine for MemoryEngine {
 
 // }
 
-pub struct Evento<E: Engine + Sync + Send, S: StoreEngine> {
+struct EventoContextName(Option<String>);
+
+#[derive(Clone, Default)]
+pub struct EventoContext(pub Arc<RwLock<Context>>);
+
+impl EventoContext {
+    pub fn name(&self) -> Option<String> {
+        self.0.read().extract::<EventoContextName>().0.to_owned()
+    }
+}
+
+pub struct Evento<E: Engine + Sync + Send, S: StoreEngine + Sync + Send> {
     id: Uuid,
     name: Option<String>,
+    context: EventoContext,
     engine: E,
     store: EventStore<S>,
     subscribers: HashMap<String, Subscriber>,
 }
 
-impl<E: Engine + Sync + Send + 'static, S: StoreEngine> Evento<E, S> {
+impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> Evento<E, S> {
     pub fn new(engine: E, store: EventStore<S>) -> Self {
         Self {
             engine,
             store,
             subscribers: HashMap::new(),
+            context: EventoContext::default(),
             name: None,
             id: Uuid::new_v4(),
         }
@@ -208,6 +221,15 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine> Evento<E, S> {
 
     pub fn name<N: Into<String>>(mut self, name: N) -> Self {
         self.name = Some(name.into());
+        self.context
+            .0
+            .write()
+            .insert(EventoContextName(self.name.to_owned()));
+        self
+    }
+
+    pub fn data<V: Send + Sync + 'static>(self, v: V) -> Self {
+        self.context.0.write().insert(v);
         self
     }
 
@@ -216,19 +238,11 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine> Evento<E, S> {
         self
     }
 
-    pub async fn run(
-        &self,
-        create_ctx: &impl Fn(&mut Context),
-    ) -> Result<Publisher<S>, StoreError> {
-        self.run_with_delay(Duration::from_secs(30), create_ctx)
-            .await
+    pub async fn run(&self) -> Result<Publisher<S>, StoreError> {
+        self.run_with_delay(Duration::from_secs(30)).await
     }
 
-    pub async fn run_with_delay(
-        &self,
-        delay: Duration,
-        create_ctx: &impl Fn(&mut Context),
-    ) -> Result<Publisher<S>, StoreError> {
+    pub async fn run_with_delay(&self, delay: Duration) -> Result<Publisher<S>, StoreError> {
         let futures = self
             .subscribers
             .iter()
@@ -246,7 +260,7 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine> Evento<E, S> {
         let futures = self
             .subscribers
             .iter()
-            .map(|(_, sub)| self.spawn(sub.clone(), delay, create_ctx));
+            .map(|(_, sub)| self.spawn(sub.clone(), delay));
 
         join_all(futures).await;
 
@@ -256,11 +270,11 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine> Evento<E, S> {
         })
     }
 
-    async fn spawn(&self, sub: Subscriber, delay: Duration, create_ctx: impl Fn(&mut Context)) {
+    async fn spawn(&self, sub: Subscriber, delay: Duration) {
         let engine = self.engine.clone();
+        let store = self.store.clone();
         let consumer_id = self.id.clone();
-        let mut ctx = Context::new();
-        create_ctx(&mut ctx);
+        let ctx = self.context.clone();
 
         tokio::spawn(async move {
             sleep(delay).await;
@@ -270,7 +284,6 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine> Evento<E, S> {
             loop {
                 interval.tick().await;
 
-                println!("{}", sub.key);
                 let mut subscription = match engine.get_subscription(sub.key.to_owned()).await {
                     Ok(s) => s,
                     Err(e) => {
@@ -286,6 +299,35 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine> Evento<E, S> {
                         subscription.consumer_id
                     );
                     break;
+                }
+
+                let events = match store.read_all(100, subscription.cursor).await {
+                    Ok(events) => events,
+                    Err(e) => {
+                        tracing::error!("{e}");
+                        continue;
+                    }
+                };
+
+                for event in events.iter() {
+                    let futures = sub.handlers.iter().map(|h| h(event.clone(), ctx.clone()));
+
+                    join_all(futures).await;
+                }
+
+                let last_event = match events.last().map(|e| e.id) {
+                    Some(cursor) => cursor,
+                    None => {
+                        tracing::debug!("No events found after {:?}", subscription.cursor);
+                        continue;
+                    }
+                };
+
+                subscription.cursor = Some(last_event);
+                subscription.cursor_updated_at = Some(Utc::now());
+
+                if let Err(e) = engine.update_subscription(subscription).await {
+                    tracing::error!("{e}");
                 }
             }
         });

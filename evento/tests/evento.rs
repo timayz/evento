@@ -1,5 +1,5 @@
 use evento::store::{Engine as StoreEngine, MemoryEngine as StoreMemoryEngine};
-use evento::{Engine, Event, Evento, MemoryEngine, Subscriber};
+use evento::{Aggregate, Engine, Event, Evento, MemoryEngine, Subscriber};
 use futures_util::FutureExt;
 use tokio::sync::RwLock;
 // use sqlx::{Executor, PgPool};
@@ -47,7 +47,7 @@ async fn memory_filter() {
 //     save_wrong_version(store).await;
 // }
 
-async fn publish<E: Engine + Sync + Send + 'static, S: StoreEngine>(
+async fn publish<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static>(
     eu_west_3a: Evento<E, S>,
     eu_west_3b: Evento<E, S>,
     us_east_1a: Evento<E, S>,
@@ -55,7 +55,13 @@ async fn publish<E: Engine + Sync + Send + 'static, S: StoreEngine>(
     let subscriber = Subscriber::new("users")
         .filter("user/+")
         .handler(|event, ctx| {
-            let users = ctx.extract::<Arc<RwLock<HashMap<String, User>>>>().clone();
+            let users = ctx
+                .0
+                .read()
+                .extract::<Arc<RwLock<HashMap<String, User>>>>()
+                .clone();
+            let bus_name = ctx.name();
+
             async move {
                 let user_event: UserEvent = event.name.parse().unwrap();
 
@@ -64,9 +70,11 @@ async fn publish<E: Engine + Sync + Send + 'static, S: StoreEngine>(
                         let data: Created = event.to_data().unwrap();
                         let mut w_users = users.write().await;
                         w_users.insert(
-                            event.aggregate_id.to_owned(),
+                            User::to_id(event.aggregate_id),
                             User {
-                                username: data.username,
+                                username: bus_name
+                                    .map(|name| format!("{} ({name})", data.username))
+                                    .unwrap_or(data.username),
                                 password: data.password,
                                 ..Default::default()
                             },
@@ -76,8 +84,12 @@ async fn publish<E: Engine + Sync + Send + 'static, S: StoreEngine>(
                         let data: DisplayNameUpdated = event.to_data().unwrap();
                         let mut w_users = users.write().await;
 
-                        if let Some(user) = w_users.get_mut(&event.aggregate_id.to_owned()) {
-                            user.display_name = Some(data.display_name);
+                        if let Some(user) = w_users.get_mut(&User::to_id(event.aggregate_id)) {
+                            user.display_name = Some(
+                                bus_name
+                                    .map(|name| format!("{} ({name})", data.display_name))
+                                    .unwrap_or(data.display_name),
+                            );
                         }
                     }
                     _ => {}
@@ -91,26 +103,23 @@ async fn publish<E: Engine + Sync + Send + 'static, S: StoreEngine>(
     let users: Arc<RwLock<HashMap<String, User>>> = Arc::new(RwLock::new(HashMap::new()));
     let eu_west_3a = eu_west_3a
         .name("eu-west-3a")
+        .data(users.clone())
         .subscribe(subscriber.clone())
-        .run_with_delay(Duration::from_secs(0), &|ctx| {
-            ctx.insert(users.clone());
-        })
+        .run_with_delay(Duration::from_secs(0))
         .await
         .unwrap();
     let eu_west_3b = eu_west_3b
         .name("eu-west-3b")
+        .data(users.clone())
         .subscribe(subscriber.clone())
-        .run_with_delay(Duration::from_secs(0), &|ctx| {
-            ctx.insert(users.clone());
-        })
+        .run_with_delay(Duration::from_secs(0))
         .await
         .unwrap();
     let us_east_1a = us_east_1a
         .name("us-east-1a")
+        .data(users.clone())
         .subscribe(subscriber.clone())
-        .run_with_delay(Duration::from_secs(0), &|ctx| {
-            ctx.insert(users.clone());
-        })
+        .run_with_delay(Duration::from_secs(0))
         .await
         .unwrap();
 
@@ -183,16 +192,25 @@ async fn publish<E: Engine + Sync + Send + 'static, S: StoreEngine>(
     );
 }
 
-async fn filter<E: Engine + Sync + Send + 'static, S: StoreEngine>(eu_west_3a: Evento<E, S>) {
+async fn filter<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static>(
+    eu_west_3a: Evento<E, S>,
+) {
     let users: Arc<RwLock<HashMap<String, User>>> = Arc::new(RwLock::new(HashMap::new()));
     let users_count: Arc<RwLock<i32>> = Arc::new(RwLock::new(0));
     let eu_west_3a = eu_west_3a
         .name("eu-west-3a")
+        .data(users.clone())
+        .data(users_count.clone())
         .subscribe(
             Subscriber::new("users")
                 .filter("user/+")
                 .handler(|event, ctx| {
-                    let users = ctx.extract::<Arc<RwLock<HashMap<String, User>>>>().clone();
+                    let users = ctx
+                        .0
+                        .read()
+                        .extract::<Arc<RwLock<HashMap<String, User>>>>()
+                        .clone();
+
                     async move {
                         let user_event: UserEvent = event.name.parse().unwrap();
 
@@ -201,7 +219,7 @@ async fn filter<E: Engine + Sync + Send + 'static, S: StoreEngine>(eu_west_3a: E
                                 let data: Created = event.to_data().unwrap();
                                 let mut w_users = users.write().await;
                                 w_users.insert(
-                                    event.aggregate_id.to_owned(),
+                                    User::to_id(event.aggregate_id),
                                     User {
                                         username: data.username,
                                         password: data.password,
@@ -213,7 +231,8 @@ async fn filter<E: Engine + Sync + Send + 'static, S: StoreEngine>(eu_west_3a: E
                                 let data: DisplayNameUpdated = event.to_data().unwrap();
                                 let mut w_users = users.write().await;
 
-                                if let Some(user) = w_users.get_mut(&event.aggregate_id.to_owned())
+                                if let Some(user) =
+                                    w_users.get_mut(&User::to_id(event.aggregate_id))
                                 {
                                     user.display_name = Some(data.display_name);
                                 }
@@ -231,7 +250,7 @@ async fn filter<E: Engine + Sync + Send + 'static, S: StoreEngine>(eu_west_3a: E
                 .filter("user/1/+")
                 .filter("user/2/+")
                 .handler(|event, ctx| {
-                    let users_count = ctx.extract::<Arc<RwLock<i32>>>().clone();
+                    let users_count = ctx.0.read().extract::<Arc<RwLock<i32>>>().clone();
                     async move {
                         let user_event: UserEvent = event.name.parse().unwrap();
 
@@ -248,9 +267,7 @@ async fn filter<E: Engine + Sync + Send + 'static, S: StoreEngine>(eu_west_3a: E
                     .boxed()
                 }),
         )
-        .run_with_delay(Duration::from_secs(0), &|ctx| {
-            ctx.insert(users.clone());
-        })
+        .run_with_delay(Duration::from_secs(0))
         .await
         .unwrap();
 

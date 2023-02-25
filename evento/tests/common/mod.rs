@@ -46,7 +46,7 @@ pub struct AccountDeleted {
     pub deleted: bool,
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize, Debug)]
 pub struct User {
     pub first_name: Option<String>,
     pub last_name: Option<String>,

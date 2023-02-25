@@ -1,5 +1,5 @@
 use std::{
-    any::{Any, TypeId, type_name},
+    any::{type_name, Any, TypeId},
     collections::HashMap,
     fmt,
     hash::{BuildHasherDefault, Hasher},
@@ -32,7 +32,7 @@ impl Hasher for NoOpHasher {
 #[derive(Default)]
 pub struct Context {
     /// Use AHasher with a std HashMap with for faster lookups on the small `TypeId` keys.
-    map: HashMap<TypeId, Box<dyn Any>, BuildHasherDefault<NoOpHasher>>,
+    map: HashMap<TypeId, Box<dyn Any + Send + Sync>, BuildHasherDefault<NoOpHasher>>,
 }
 
 impl Context {
@@ -56,7 +56,7 @@ impl Context {
     /// assert_eq!(map.insert(2u32), Some(1u32));
     /// assert_eq!(*map.get::<u32>().unwrap(), 2u32);
     /// ```
-    pub fn insert<T: 'static>(&mut self, val: T) -> Option<T> {
+    pub fn insert<T: Send + Sync + 'static>(&mut self, val: T) -> Option<T> {
         self.map
             .insert(TypeId::of::<T>(), Box::new(val))
             .and_then(downcast_owned)
@@ -86,7 +86,7 @@ impl Context {
     /// ```
     pub fn extract<T: 'static>(&self) -> &T {
         match self.get::<T>() {
-            Some(_) => todo!(),
+            Some(v) => v,
             _ => {
                 tracing::debug!(
                     "Failed to extract `Data<{}>` For the Data extractor to work \
@@ -145,7 +145,7 @@ impl Context {
     /// assert_eq!(map.remove::<u32>(), Some(1u32));
     /// assert!(!map.contains::<u32>());
     /// ```
-    pub fn remove<T: 'static>(&mut self) -> Option<T> {
+    pub fn remove<T: Send + Sync + 'static>(&mut self) -> Option<T> {
         self.map.remove(&TypeId::of::<T>()).and_then(downcast_owned)
     }
 
@@ -178,6 +178,6 @@ impl fmt::Debug for Context {
     }
 }
 
-fn downcast_owned<T: 'static>(boxed: Box<dyn Any>) -> Option<T> {
+fn downcast_owned<T: Send + Sync + 'static>(boxed: Box<dyn Any + Send + Sync>) -> Option<T> {
     boxed.downcast().ok().map(|boxed| *boxed)
 }
