@@ -1,5 +1,5 @@
-use std::{ops::Deref, sync::Arc};
 use evento::Data;
+use std::{ops::Deref, sync::Arc};
 
 #[test]
 fn test_data_from_arc() {

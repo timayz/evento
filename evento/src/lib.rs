@@ -282,7 +282,9 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
 
     pub async fn run_with_delay(&self, delay: Duration) -> Result<Publisher<S>, StoreError> {
         let futures = self
-            .subscribers.keys().map(|key| self.engine.init(key, self.id));
+            .subscribers
+            .keys()
+            .map(|key| self.engine.init(key, self.id));
 
         let fut_err = join_all(futures)
             .await
@@ -294,7 +296,9 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
         }
 
         let futures = self
-            .subscribers.values().map(|sub| self.spawn(sub.clone(), delay));
+            .subscribers
+            .values()
+            .map(|sub| self.spawn(sub.clone(), delay));
 
         join_all(futures).await;
 

@@ -245,7 +245,8 @@ impl Engine for MemoryEngine {
             .0
             .read()
             .values()
-            .flatten().cloned()
+            .flatten()
+            .cloned()
             .collect::<Vec<Event>>();
 
         let mut filtered_events = Vec::new();
