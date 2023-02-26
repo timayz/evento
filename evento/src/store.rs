@@ -141,6 +141,11 @@ pub trait Engine: Clone {
         id: I,
     ) -> Pin<Box<dyn Future<Output = EngineResult<A>> + Send + '_>>;
 
+    fn get<A: Aggregate, I: Into<String>>(
+        &self,
+        id: I,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Event>, Error>> + Send + '_>>;
+
     fn read_all<F: Serialize>(
         &self,
         first: usize,
@@ -173,7 +178,7 @@ impl Engine for MemoryEngine {
 
         if version != original_version {
             drop(data);
-            return Box::pin(async { Err(Error::UnexpectedOriginalVersion) });
+            return async { Err(Error::UnexpectedOriginalVersion) }.boxed();
         }
 
         let mut events_with_info = Vec::new();
@@ -186,7 +191,7 @@ impl Engine for MemoryEngine {
         }
 
         drop(data);
-        Box::pin(async move { Ok(events_with_info) })
+        async move { Ok(events_with_info) }.boxed()
     }
 
     fn load<A: Aggregate, I: Into<String>>(
@@ -201,7 +206,7 @@ impl Engine for MemoryEngine {
             data.get(&id).map_or(Vec::new(), |events| events.to_vec())
         };
 
-        Box::pin(async move {
+        async move {
             if events.is_empty() {
                 return Ok(None);
             }
@@ -218,7 +223,8 @@ impl Engine for MemoryEngine {
             };
 
             Ok(Some((aggregate, last_event)))
-        })
+        }
+        .boxed()
     }
 
     fn read_all<F: Serialize>(
@@ -309,15 +315,31 @@ impl Engine for MemoryEngine {
             + 1) as usize;
 
         async move {
-            if filtered_events.is_empty() || start == filtered_events.len() {
+            if filtered_events.is_empty() {
                 return Ok(filtered_events);
             }
 
-            let end = std::cmp::min(filtered_events.len(), first) - 1;
+            let end = std::cmp::min(filtered_events.len(), first + 1);
 
             Ok(filtered_events[start..end].to_vec())
         }
         .boxed()
+    }
+
+    fn get<A: Aggregate, I: Into<String>>(
+        &self,
+        id: I,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Event>, Error>> + Send + '_>> {
+        let id: String = A::aggregate_id(id);
+
+        let event = {
+            self.0
+                .read()
+                .get(&id)
+                .and_then(|events| events.first().cloned())
+        };
+
+        async move { Ok(event) }.boxed()
     }
 }
 
@@ -340,7 +362,7 @@ impl Engine for PgEngine {
         let id: String = A::aggregate_id(id);
         let pool = self.0.clone();
 
-        Box::pin(async move {
+        async move {
             let mut tx = pool.begin().await?;
             let mut version = original_version;
             let mut events_with_info = Vec::new();
@@ -388,7 +410,7 @@ impl Engine for PgEngine {
             tx.commit().await?;
 
             Ok(events_with_info)
-        })
+        }.boxed()
     }
 
     fn load<A: Aggregate, I: Into<String>>(
@@ -398,7 +420,7 @@ impl Engine for PgEngine {
         let id: String = A::aggregate_id(id);
         let pool = self.0.clone();
 
-        Box::pin(async move {
+        async move {
             let events = sqlx::query_as::<_, Event>(
                 "SELECT * FROM _evento_events WHERE aggregate_id = $1 ORDER BY version",
             )
@@ -422,7 +444,8 @@ impl Engine for PgEngine {
             };
 
             Ok(Some((aggregate, last_event)))
-        })
+        }
+        .boxed()
     }
 
     fn read_all<F: Serialize>(
@@ -431,6 +454,13 @@ impl Engine for PgEngine {
         _after: Option<Uuid>,
         _filters: Option<Vec<F>>,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Event>, Error>> + Send + '_>> {
+        todo!()
+    }
+
+    fn get<A: Aggregate, I: Into<String>>(
+        &self,
+        _id: I,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Event>, Error>> + Send + '_>> {
         todo!()
     }
 }
@@ -462,5 +492,12 @@ impl<E: Engine> Engine for EventStore<E> {
         filters: Option<Vec<F>>,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Event>, Error>> + Send + '_>> {
         self.0.read_all(first, after, filters)
+    }
+
+    fn get<A: Aggregate, I: Into<String>>(
+        &self,
+        id: I,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Event>, Error>> + Send + '_>> {
+        self.0.get::<A, _>(id)
     }
 }

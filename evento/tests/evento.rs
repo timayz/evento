@@ -55,12 +55,12 @@ async fn publish<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send
     let subscriber = Subscriber::new("users")
         .filter("user/#")
         .handler(|event, ctx| {
+            let bus_name = ctx.name();
             let users = ctx
                 .0
                 .read()
                 .extract::<Arc<RwLock<HashMap<String, User>>>>()
                 .clone();
-            let bus_name = ctx.name();
 
             async move {
                 let user_event: UserEvent = event.name.parse().unwrap();
@@ -159,8 +159,10 @@ async fn publish<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send
 
     sleep(Duration::from_secs(2)).await;
 
-    let r_users = users.read().await;
-    let user1 = r_users.get("1").unwrap();
+    let user1 = {
+        let r_users = users.read().await;
+        r_users.get("1").cloned().unwrap()
+    };
 
     assert_eq!(user1.username, "john.doe (eu-west-3a)");
     assert_eq!(
@@ -176,15 +178,17 @@ async fn publish<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send
                     display_name: "Nina Wick".to_owned(),
                 })
                 .unwrap()],
-            2,
+            3,
         )
         .await
         .unwrap();
 
     sleep(Duration::from_secs(2)).await;
 
-    let r_users = users.read().await;
-    let user1 = r_users.get("1").unwrap();
+    let user1 = {
+        let r_users = users.read().await;
+        r_users.get("1").cloned().unwrap()
+    };
 
     assert_eq!(
         user1.display_name,

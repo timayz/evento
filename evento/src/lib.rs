@@ -64,48 +64,56 @@ impl Subscriber {
     }
 }
 
-pub struct Publisher<S: StoreEngine> {
+#[derive(Clone)]
+pub struct Publisher<S: StoreEngine + Send + Sync> {
     name: Option<String>,
     store: EventStore<S>,
 }
 
-impl<S: StoreEngine> Publisher<S> {
+impl<S: StoreEngine + Send + Sync> Publisher<S> {
     pub fn publish<A: Aggregate, I: Into<String>>(
         &self,
         id: I,
         events: Vec<Event>,
         original_version: i32,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Event>, StoreError>> + Send + '_>> {
-        let mut updated_events = Vec::new();
-        for event in events.iter() {
-            let res = event
-                .to_metadata::<HashMap<String, Value>>()
-                .map(|metadata| metadata.unwrap_or_default());
+        let store = self.store.clone();
+        let name = self.name.to_owned();
+        let id = id.into();
 
-            let mut metadata = match res {
-                Ok(metadata) => metadata,
-                Err(e) => return async move { Err(StoreError::SerdeJson(e.to_string())) }.boxed(),
+        async move {
+            let name = match store.get::<A, _>(&id).await? {
+                Some(event) => event
+                    .to_metadata::<HashMap<String, Value>>()?
+                    .and_then(|metadata| metadata.get("_evento_name").cloned()),
+                _ => name.map(|name| Value::String(name)),
             };
 
-            if let Some(name) = &self.name {
-                metadata.insert("_evento_name".to_owned(), Value::String(name.to_owned()));
+            let mut updated_events = Vec::new();
+            for event in events.iter() {
+                let mut metadata = event
+                    .to_metadata::<HashMap<String, Value>>()
+                    .map(|metadata| metadata.unwrap_or_default())?;
+
+                if let Some(name) = &name {
+                    metadata.insert("_evento_name".to_owned(), name.clone());
+                }
+
+                metadata.insert(
+                    "_evento_topic".to_owned(),
+                    Value::String(A::aggregate_type().to_owned()),
+                );
+
+                let event = event.clone().metadata(metadata)?;
+
+                updated_events.push(event);
             }
 
-            metadata.insert(
-                "_evento_topic".to_owned(),
-                Value::String(A::aggregate_type().to_owned()),
-            );
-
-            let event = match event.clone().metadata(metadata) {
-                Ok(metadata) => metadata,
-                Err(e) => return async move { Err(StoreError::SerdeJson(e.to_string())) }.boxed(),
-            };
-
-            updated_events.push(event);
+            store
+                .save::<A, _>(id, updated_events, original_version)
+                .await
         }
-
-        self.store
-            .save::<A, _>(id, updated_events, original_version)
+        .boxed()
     }
 
     pub fn load<A: Aggregate, I: Into<String>>(

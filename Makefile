@@ -18,3 +18,9 @@ revert:
 
 prepare:
 	cargo sqlx prepare --merged
+
+fmt:
+	cargo fmt -- --emit files
+
+clippy:
+	cargo clippy --all-features -- -D warnings
