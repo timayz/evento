@@ -53,7 +53,7 @@ async fn publish<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send
     us_east_1a: Evento<E, S>,
 ) {
     let subscriber = Subscriber::new("users")
-        .filter("user/+")
+        .filter("user/#")
         .handler(|event, ctx| {
             let users = ctx
                 .0
@@ -203,7 +203,7 @@ async fn filter<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send 
         .data(users_count.clone())
         .subscribe(
             Subscriber::new("users")
-                .filter("user/+")
+                .filter("user/#")
                 .handler(|event, ctx| {
                     let users = ctx
                         .0

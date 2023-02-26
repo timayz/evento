@@ -82,7 +82,7 @@ impl Context {
     /// # use evento::Context;
     /// let mut map = Context::new();
     /// map.insert(1u32);
-    /// assert_eq!(map.get::<u32>(), &1u32);
+    /// assert_eq!(map.get::<u32>(), Some(&1u32));
     /// ```
     pub fn extract<T: 'static>(&self) -> &T {
         match self.get::<T>() {

@@ -15,6 +15,9 @@ pub enum Error {
     #[error("Sqlx error `{0}`")]
     Sqlx(String),
 
+    #[error("serde_json error `{0}`")]
+    SerdeJson(String),
+
     #[error("{0}")]
     Unknown(String),
 }
@@ -22,6 +25,12 @@ pub enum Error {
 impl From<sqlx::Error> for Error {
     fn from(e: sqlx::Error) -> Self {
         Error::Sqlx(e.to_string())
+    }
+}
+
+impl From<serde_json::Error> for Error {
+    fn from(e: serde_json::Error) -> Self {
+        Error::SerdeJson(e.to_string())
     }
 }
 
@@ -50,6 +59,12 @@ impl Event {
         self
     }
 
+    pub fn aggregate_details(&self) -> Option<(String, String)> {
+        self.aggregate_id
+            .split_once("_")
+            .map(|(aggregate_type, id)| (aggregate_type.to_owned(), id.to_owned()))
+    }
+
     pub fn version(mut self, value: i32) -> Self {
         self.version = value;
 
@@ -62,7 +77,10 @@ impl Event {
         Ok(self)
     }
 
-    pub fn metadata<M: Serialize>(mut self, value: M) -> Result<Self, serde_json::Error> {
+    pub fn metadata<M: Serialize>(
+        mut self,
+        value: HashMap<String, M>,
+    ) -> Result<Self, serde_json::Error> {
         self.metadata = Some(serde_json::to_value(&value)?);
 
         Ok(self)
@@ -71,7 +89,6 @@ impl Event {
     pub fn to_data<D: DeserializeOwned>(&self) -> Result<D, serde_json::Error> {
         serde_json::from_value(self.data.clone())
     }
-
     pub fn to_metadata<D: DeserializeOwned>(&self) -> Result<Option<D>, serde_json::Error> {
         match &self.metadata {
             Some(metadata) => serde_json::from_value(metadata.clone()),
@@ -124,10 +141,11 @@ pub trait Engine: Clone {
         id: I,
     ) -> Pin<Box<dyn Future<Output = EngineResult<A>> + Send + '_>>;
 
-    fn read_all(
+    fn read_all<F: Serialize>(
         &self,
         first: usize,
         after: Option<Uuid>,
+        filters: Option<Vec<F>>,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Event>, Error>> + Send + '_>>;
 }
 
@@ -203,12 +221,21 @@ impl Engine for MemoryEngine {
         })
     }
 
-    fn read_all(
+    fn read_all<F: Serialize>(
         &self,
         first: usize,
         after: Option<Uuid>,
+        filters: Option<Vec<F>>,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Event>, Error>> + Send + '_>> {
-        let mut events = self
+        let filters = filters.and_then(|filters| {
+            if filters.is_empty() {
+                None
+            } else {
+                Some(filters)
+            }
+        });
+
+        let events = self
             .0
             .read()
             .values()
@@ -216,7 +243,46 @@ impl Engine for MemoryEngine {
             .flat_map(|events| events)
             .collect::<Vec<Event>>();
 
-        events.sort_by(|a, b| {
+        let mut filtered_events = Vec::new();
+
+        for event in events.iter() {
+            if let Some(filters) = &filters {
+                let metadata = match event.to_metadata::<HashMap<String, Value>>() {
+                    Ok(metadata) => match metadata {
+                        Some(metadata) => metadata,
+                        _ => continue,
+                    },
+                    Err(e) => return async move { Err(Error::SerdeJson(e.to_string())) }.boxed(),
+                };
+
+                let mut matched = false;
+
+                for filter in filters {
+                    let filter = match serde_json::to_value(filter)
+                        .and_then(|v| serde_json::from_value::<HashMap<String, Value>>(v))
+                    {
+                        Ok(filter) => filter,
+                        Err(e) => {
+                            return async move { Err(Error::SerdeJson(e.to_string())) }.boxed()
+                        }
+                    };
+
+                    matched = filter.iter().all(|(key, v)| metadata.get(key) == Some(v));
+
+                    if matched {
+                        break;
+                    }
+                }
+
+                if !matched {
+                    continue;
+                }
+            }
+
+            filtered_events.push(event.clone());
+        }
+
+        filtered_events.sort_by(|a, b| {
             let cmp = a.created_at.partial_cmp(&b.created_at).unwrap();
 
             match cmp {
@@ -233,18 +299,23 @@ impl Engine for MemoryEngine {
         });
 
         let start = (after
-            .map(|id| events.iter().position(|event| event.id == id).unwrap() as i32)
+            .map(|id| {
+                filtered_events
+                    .iter()
+                    .position(|event| event.id == id)
+                    .unwrap() as i32
+            })
             .unwrap_or(-1)
             + 1) as usize;
 
         async move {
-            if events.is_empty() || start == events.len() {
-                return Ok(events);
+            if filtered_events.is_empty() || start == filtered_events.len() {
+                return Ok(filtered_events);
             }
 
-            let end = std::cmp::min(events.len(), first) - 1;
+            let end = std::cmp::min(filtered_events.len(), first) - 1;
 
-            Ok(events[start..end].to_vec())
+            Ok(filtered_events[start..end].to_vec())
         }
         .boxed()
     }
@@ -354,10 +425,11 @@ impl Engine for PgEngine {
         })
     }
 
-    fn read_all(
+    fn read_all<F: Serialize>(
         &self,
         _first: usize,
         _after: Option<Uuid>,
+        _filters: Option<Vec<F>>,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Event>, Error>> + Send + '_>> {
         todo!()
     }
@@ -383,11 +455,12 @@ impl<E: Engine> Engine for EventStore<E> {
         self.0.load(id)
     }
 
-    fn read_all(
+    fn read_all<F: Serialize>(
         &self,
         first: usize,
         after: Option<Uuid>,
+        filters: Option<Vec<F>>,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Event>, Error>> + Send + '_>> {
-        self.0.read_all(first, after)
+        self.0.read_all(first, after, filters)
     }
 }

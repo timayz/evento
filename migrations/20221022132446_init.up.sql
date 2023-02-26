@@ -6,11 +6,12 @@ CREATE TABLE IF NOT EXISTS _evento_events
     aggregate_id varchar(255) NOT NULL,
     version int NOT NULL,
     data json NOT NULL,
-    metadata json DEFAULT NULL,
+    metadata jsonb DEFAULT NULL,
     created_at timestamptz NOT NULL
 );
 
 CREATE INDEX idk_aggregate_id ON _evento_events (aggregate_id);
+CREATE INDEX idk_metadata ON _evento_events USING gin (metadata jsonb_path_ops);
 
 CREATE TABLE IF NOT EXISTS _evento_deadletters
 (
@@ -19,7 +20,7 @@ CREATE TABLE IF NOT EXISTS _evento_deadletters
     aggregate_id varchar(255) NOT NULL,
     version int NOT NULL,
     data json NOT NULL,
-    metadata json DEFAULT NULL,
+    metadata jsonb DEFAULT NULL,
     created_at timestamptz NOT NULL
 );
 

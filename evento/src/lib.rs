@@ -5,13 +5,14 @@ mod data;
 
 pub use context::Context;
 pub use data::Data;
+use serde_json::Value;
 pub use store::{Aggregate, Error as StoreError, Event, EventStore};
 
 use parking_lot::RwLock;
 // use sqlx::PgPool;
 use chrono::{DateTime, Utc};
 use futures_util::{future::join_all, FutureExt};
-use pikav::topic::TopicFilter;
+use pikav::topic::{TopicFilter, TopicName};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc, time::Duration};
 use store::{Engine as StoreEngine, EngineResult as StoreEngineResult};
@@ -75,7 +76,36 @@ impl<S: StoreEngine> Publisher<S> {
         events: Vec<Event>,
         original_version: i32,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Event>, StoreError>> + Send + '_>> {
-        self.store.save::<A, _>(id, events, original_version)
+        let mut updated_events = Vec::new();
+        for event in events.iter() {
+            let res = event
+                .to_metadata::<HashMap<String, Value>>()
+                .map(|metadata| metadata.unwrap_or_default());
+
+            let mut metadata = match res {
+                Ok(metadata) => metadata,
+                Err(e) => return async move { Err(StoreError::SerdeJson(e.to_string())) }.boxed(),
+            };
+
+            if let Some(name) = &self.name {
+                metadata.insert("_evento_name".to_owned(), Value::String(name.to_owned()));
+            }
+
+            metadata.insert(
+                "_evento_topic".to_owned(),
+                Value::String(A::aggregate_type().to_owned()),
+            );
+
+            let event = match event.clone().metadata(metadata) {
+                Ok(metadata) => metadata,
+                Err(e) => return async move { Err(StoreError::SerdeJson(e.to_string())) }.boxed(),
+            };
+
+            updated_events.push(event);
+        }
+
+        self.store
+            .save::<A, _>(id, updated_events, original_version)
     }
 
     pub fn load<A: Aggregate, I: Into<String>>(
@@ -275,6 +305,7 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
         let store = self.store.clone();
         let consumer_id = self.id.clone();
         let ctx = self.context.clone();
+        let name = self.name.to_owned();
 
         tokio::spawn(async move {
             sleep(delay).await;
@@ -301,7 +332,32 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
                     break;
                 }
 
-                let events = match store.read_all(100, subscription.cursor).await {
+                let filters = sub
+                    .filters
+                    .iter()
+                    .filter_map(|filter| {
+                        let mut map = HashMap::new();
+
+                        if let Some((topic, _)) = filter.split_once("/") {
+                            map.insert("_evento_topic".to_owned(), topic.to_owned());
+                        }
+
+                        if let Some(name) = name.as_ref() {
+                            map.insert("_evento_name".to_owned(), name.to_owned());
+                        }
+
+                        if map.is_empty() {
+                            None
+                        } else {
+                            Some(map)
+                        }
+                    })
+                    .collect();
+
+                let events = match store
+                    .read_all(100, subscription.cursor, Some(filters))
+                    .await
+                {
                     Ok(events) => events,
                     Err(e) => {
                         tracing::error!("{e}");
@@ -310,6 +366,36 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
                 };
 
                 for event in events.iter() {
+                    let (aggregate_type, aggregate_id) = match event.aggregate_details() {
+                        Some(details) => details,
+                        _ => {
+                            tracing::error!(
+                                "faield to aggregate_details of {}",
+                                event.aggregate_id
+                            );
+                            continue;
+                        }
+                    };
+
+                    let topic_name = match TopicName::new(format!(
+                        "{}/{}/{}",
+                        aggregate_type, aggregate_id, event.name
+                    )) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            tracing::error!("{e}");
+                            continue;
+                        }
+                    };
+
+                    if !sub
+                        .filters
+                        .iter()
+                        .any(|filter| filter.get_matcher().is_match(&topic_name))
+                    {
+                        continue;
+                    }
+
                     let futures = sub.handlers.iter().map(|h| h(event.clone(), ctx.clone()));
 
                     join_all(futures).await;

@@ -133,7 +133,7 @@ async fn load_save<E: Engine>(store: EventStore<E>) {
                         new_password: "securepwd".to_owned(),
                     })
                     .unwrap()
-                    .metadata(HashMap::from([("algo", "RS256")]))
+                    .metadata(HashMap::from([("algo".to_owned(), "RS256".to_owned())]))
                     .unwrap(),
                 Event::new(UserEvent::DisplayNameUpdated)
                     .data(DisplayNameUpdated {
