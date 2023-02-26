@@ -61,7 +61,7 @@ impl Event {
 
     pub fn aggregate_details(&self) -> Option<(String, String)> {
         self.aggregate_id
-            .split_once("_")
+            .split_once('_')
             .map(|(aggregate_type, id)| (aggregate_type.to_owned(), id.to_owned()))
     }
 
@@ -245,8 +245,7 @@ impl Engine for MemoryEngine {
             .0
             .read()
             .values()
-            .cloned()
-            .flat_map(|events| events)
+            .flatten().cloned()
             .collect::<Vec<Event>>();
 
         let mut filtered_events = Vec::new();
@@ -265,7 +264,7 @@ impl Engine for MemoryEngine {
 
                 for filter in filters {
                     let filter = match serde_json::to_value(filter)
-                        .and_then(|v| serde_json::from_value::<HashMap<String, Value>>(v))
+                        .and_then(serde_json::from_value::<HashMap<String, Value>>)
                     {
                         Ok(filter) => filter,
                         Err(e) => {
@@ -300,7 +299,7 @@ impl Engine for MemoryEngine {
 
             match cmp {
                 Ordering::Equal => a.id.partial_cmp(&b.id).unwrap(),
-                _ => return cmp,
+                _ => cmp,
             }
         });
 

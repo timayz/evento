@@ -86,7 +86,7 @@ impl<S: StoreEngine + Send + Sync> Publisher<S> {
                 Some(event) => event
                     .to_metadata::<HashMap<String, Value>>()?
                     .and_then(|metadata| metadata.get("_evento_name").cloned()),
-                _ => name.map(|name| Value::String(name)),
+                _ => name.map(Value::String),
             };
 
             let mut updated_events = Vec::new();
@@ -282,9 +282,7 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
 
     pub async fn run_with_delay(&self, delay: Duration) -> Result<Publisher<S>, StoreError> {
         let futures = self
-            .subscribers
-            .iter()
-            .map(|(key, _)| self.engine.init(key, self.id));
+            .subscribers.keys().map(|key| self.engine.init(key, self.id));
 
         let fut_err = join_all(futures)
             .await
@@ -296,9 +294,7 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
         }
 
         let futures = self
-            .subscribers
-            .iter()
-            .map(|(_, sub)| self.spawn(sub.clone(), delay));
+            .subscribers.values().map(|sub| self.spawn(sub.clone(), delay));
 
         join_all(futures).await;
 
@@ -311,7 +307,7 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
     async fn spawn(&self, sub: Subscriber, delay: Duration) {
         let engine = self.engine.clone();
         let store = self.store.clone();
-        let consumer_id = self.id.clone();
+        let consumer_id = self.id;
         let ctx = self.context.clone();
         let name = self.name.to_owned();
 
@@ -346,7 +342,7 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
                     .filter_map(|filter| {
                         let mut map = HashMap::new();
 
-                        if let Some((topic, _)) = filter.split_once("/") {
+                        if let Some((topic, _)) = filter.split_once('/') {
                             map.insert("_evento_topic".to_owned(), topic.to_owned());
                         }
 

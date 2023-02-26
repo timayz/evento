@@ -51,7 +51,7 @@ pub async fn start(pulsar: &Pulsar<TokioExecutor>, read_db: &Database) {
             let event = match msg.deserialize() {
                 Ok(msg) => msg.event,
                 Err(e) => {
-                    println!("{:?}", e);
+                    println!("{e:?}");
                     break;
                 }
             };

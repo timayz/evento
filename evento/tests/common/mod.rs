@@ -12,9 +12,9 @@ pub enum UserEvent {
     AccountDeleted,
 }
 
-impl Into<String> for UserEvent {
-    fn into(self) -> String {
-        self.to_string()
+impl From<UserEvent> for String {
+    fn from(val: UserEvent) -> Self {
+        val.to_string()
     }
 }
 

@@ -245,19 +245,18 @@ async fn create_pg_store(db_name: &str, init: bool) -> EventStore<PgEngine> {
 
     let mut conn = pool.acquire().await.unwrap();
 
-    conn.execute(&format!("drop database if exists evento_{};", db_name)[..])
+    conn.execute(&format!("drop database if exists evento_{db_name};")[..])
         .await
         .unwrap();
 
-    conn.execute(&format!("create database evento_{};", db_name)[..])
+    conn.execute(&format!("create database evento_{db_name};")[..])
         .await
         .unwrap();
 
     drop(pool);
 
     let pool = PgPool::connect(&format!(
-        "postgres://postgres:postgres@localhost:5432/evento_{}",
-        db_name
+        "postgres://postgres:postgres@localhost:5432/evento_{db_name}"
     ))
     .await
     .unwrap();
