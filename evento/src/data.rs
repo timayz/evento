@@ -1,5 +1,5 @@
-use std::{ops::Deref, sync::Arc};
 use serde::Serialize;
+use std::{ops::Deref, sync::Arc};
 
 #[derive(Debug)]
 pub struct Data<T: ?Sized>(Arc<T>);

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use actix::{Actor, Addr};
 use actix_web::{web, App, HttpServer};
 use command::Command;
-use evento::{EventStore};
+use evento::EventStore;
 use mongodb::{options::ClientOptions, Client};
 use pulsar::{Producer, Pulsar, TokioExecutor};
 use sqlx::{Executor, PgPool};

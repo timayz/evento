@@ -1,5 +1,4 @@
-use std::{sync::Arc, ops::Deref};
-
+use std::{ops::Deref, sync::Arc};
 use evento::Data;
 
 #[test]

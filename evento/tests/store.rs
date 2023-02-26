@@ -1,11 +1,13 @@
-use std::collections::HashMap;
 use evento::store::{Engine, MemoryEngine, PgEngine};
 use evento::{Aggregate, Event, EventStore, StoreError};
 use sqlx::{Executor, PgPool};
+use std::collections::HashMap;
 
 mod common;
 
-use crate::common::{AccountDeleted, Created, ProfileUpdated, User, UserEvent, PasswordUpdated, DisplayNameUpdated};
+use crate::common::{
+    AccountDeleted, Created, DisplayNameUpdated, PasswordUpdated, ProfileUpdated, User, UserEvent,
+};
 
 #[test]
 fn apply_events() {

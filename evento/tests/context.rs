@@ -1,7 +1,5 @@
 use evento::Context;
 
-
-
 #[test]
 fn test_remove() {
     let mut map = Context::new();
