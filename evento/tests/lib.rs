@@ -1,12 +1,14 @@
 use evento::store::{Engine as StoreEngine, MemoryEngine as StoreMemoryEngine};
-use evento::{Aggregate, Engine, Event, Evento, MemoryEngine, SubscirberHandlerError, Subscriber};
+use evento::{
+    Aggregate, Engine, Event, Evento, MemoryEngine, PgEngine, SubscirberHandlerError, Subscriber,
+};
 use futures_util::FutureExt;
 use serde_json::json;
-use tokio::sync::RwLock;
-// use sqlx::{Executor, PgPool};
+use sqlx::{Executor, PgPool};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::RwLock;
 use tokio::time::sleep;
 
 use crate::common::{Created, DisplayNameUpdated, User, UserEvent};
@@ -37,23 +39,26 @@ async fn memory_deadletter() {
     deadletter(eu_west_3a).await
 }
 
-// #[tokio::test]
-// async fn pg_save() {
-//     let store = create_pg_store("save", false).await;
-//     save(store).await
-// }
+#[tokio::test]
+async fn pg_publish() {
+    let eu_west_3a = create_pg_store("lib_publish", true).await;
+    let eu_west_3b = create_pg_store("lib_publish", false).await;
+    let us_east_1a = create_pg_store("lib_publish", false).await;
 
-// #[tokio::test]
-// async fn pg_load_save() {
-//     let store = create_pg_store("load_save", true).await;
-//     load_save(store).await;
-// }
+    publish(eu_west_3a, eu_west_3b, us_east_1a).await
+}
 
-// #[tokio::test]
-// async fn pg_save_wrong_version() {
-//     let store = create_pg_store("save_wrong_version", true).await;
-//     save_wrong_version(store).await;
-// }
+#[tokio::test]
+async fn pg_filter() {
+    let eu_west_3a = create_pg_store("lib_filter", true).await;
+    filter(eu_west_3a).await
+}
+
+#[tokio::test]
+async fn pg_deadletter() {
+    let eu_west_3a = create_pg_store("lib_deadletter", true).await;
+    deadletter(eu_west_3a).await
+}
 
 async fn publish<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static>(
     eu_west_3a: Evento<E, S>,
@@ -515,37 +520,35 @@ async fn deadletter<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + S
     );
 }
 
-// async fn create_pg_store(db_name: &str, init: bool) -> EventStore<PgEngine> {
-//     let pool = PgPool::connect("postgres://postgres:postgres@localhost:5432/postgres")
-//         .await
-//         .unwrap();
+async fn create_pg_store(db_name: &str, reset: bool) -> Evento<PgEngine, evento::store::PgEngine> {
+    if reset {
+        let pool = PgPool::connect("postgres://postgres:postgres@localhost:5432/postgres")
+            .await
+            .unwrap();
 
-//     let mut conn = pool.acquire().await.unwrap();
+        let mut conn = pool.acquire().await.unwrap();
 
-//     conn.execute(&format!("drop database if exists evento_{};", db_name)[..])
-//         .await
-//         .unwrap();
+        conn.execute(&format!("drop database if exists evento_{};", db_name)[..])
+            .await
+            .unwrap();
 
-//     conn.execute(&format!("create database evento_{};", db_name)[..])
-//         .await
-//         .unwrap();
+        conn.execute(&format!("create database evento_{};", db_name)[..])
+            .await
+            .unwrap();
 
-//     drop(pool);
+        drop(pool);
+    }
 
-//     let pool = PgPool::connect(&format!(
-//         "postgres://postgres:postgres@localhost:5432/evento_{}",
-//         db_name
-//     ))
-//     .await
-//     .unwrap();
+    let pool = PgPool::connect(&format!(
+        "postgres://postgres:postgres@localhost:5432/evento_{}",
+        db_name
+    ))
+    .await
+    .unwrap();
 
-//     sqlx::migrate!("../migrations").run(&pool).await.unwrap();
+    sqlx::migrate!("../migrations").run(&pool).await.unwrap();
 
-//     let store = PgEngine::new(pool);
+    let store = evento::store::PgEngine::new(pool.clone());
 
-//     if init {
-//         init_store(&store).await;
-//     }
-
-//     store
-// }
+    PgEngine::new(pool, store)
+}

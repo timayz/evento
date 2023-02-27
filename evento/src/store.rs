@@ -450,16 +450,16 @@ impl Engine for PgEngine {
 
     fn read_all<F: Serialize>(
         &self,
-        _first: usize,
-        _after: Option<Uuid>,
-        _filters: Option<Vec<F>>,
+        first: usize,
+        after: Option<Uuid>,
+        filters: Option<Vec<F>>,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Event>, Error>> + Send + '_>> {
         todo!()
     }
 
     fn get<A: Aggregate, I: Into<String>>(
         &self,
-        _id: I,
+        id: I,
     ) -> Pin<Box<dyn Future<Output = Result<Option<Event>, Error>> + Send + '_>> {
         todo!()
     }

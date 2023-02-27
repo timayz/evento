@@ -5,11 +5,11 @@ mod data;
 
 pub use context::Context;
 pub use data::Data;
-use serde_json::Value;
 pub use store::{Aggregate, Error as StoreError, Event, EventStore};
 
+use serde_json::Value;
 use parking_lot::RwLock;
-// use sqlx::PgPool;
+use sqlx::PgPool;
 use chrono::{DateTime, Utc};
 use futures_util::{future::join_all, FutureExt};
 use pikav::topic::{TopicFilter, TopicName};
@@ -278,17 +278,53 @@ impl Engine for MemoryEngine {
     }
 }
 
-// pub struct PgEngine(PgPool);
+#[derive(Clone)]
+pub struct PgEngine(PgPool);
 
-// impl PgEngine {
-//     pub fn new<S: StoreEngine>(pool: PgPool, store: EventStore<S>) -> Evento<Self, S> {
-//         Evento::new(Self(pool), store)
-//     }
-// }
+impl PgEngine {
+    pub fn new<S: StoreEngine + Sync + Send + 'static>(pool: PgPool, store: EventStore<S>) -> Evento<Self, S> {
+        Evento::new(Self(pool), store)
+    }
+}
 
-// impl Engine for PgEngine {
+impl Engine for PgEngine {
+    fn init<K: Into<String>>(
+        &self,
+        key: K,
+        consumer_id: Uuid,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
+        todo!()
+    }
 
-// }
+    fn get_subscription<K: Into<String>>(
+        &self,
+        key: K,
+    ) -> Pin<Box<dyn Future<Output = Result<Subscription, StoreError>> + Send + '_>> {
+        todo!()
+    }
+
+    fn update_subscription(
+        &self,
+        subscription: Subscription,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
+        todo!()
+    }
+
+    fn add_deadletter(
+        &self,
+        events: Vec<Event>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
+        todo!()
+    }
+
+    fn read_deadletters(
+        &self,
+        first: usize,
+        after: Option<Uuid>,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Event>, StoreError>> + Send + '_>> {
+        todo!()
+    }
+}
 
 struct EventoContextName(Option<String>);
 
