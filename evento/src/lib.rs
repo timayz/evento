@@ -14,7 +14,9 @@ use chrono::{DateTime, Utc};
 use futures_util::{future::join_all, FutureExt};
 use pikav::topic::{TopicFilter, TopicName};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc, time::Duration, cmp::Ordering};
+use std::{
+    cmp::Ordering, collections::HashMap, future::Future, pin::Pin, sync::Arc, time::Duration,
+};
 use store::{Engine as StoreEngine, EngineResult as StoreEngineResult};
 use tokio::time::{interval_at, sleep, Instant};
 use uuid::Uuid;
@@ -259,12 +261,7 @@ impl Engine for MemoryEngine {
         });
 
         let start = (after
-            .map(|id| {
-                events
-                    .iter()
-                    .position(|event| event.id == id)
-                    .unwrap() as i32
-            })
+            .map(|id| events.iter().position(|event| event.id == id).unwrap() as i32)
             .unwrap_or(-1)
             + 1) as usize;
 
