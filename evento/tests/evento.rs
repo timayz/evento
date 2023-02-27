@@ -266,12 +266,9 @@ async fn filter<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send 
                     async move {
                         let user_event: UserEvent = event.name.parse().unwrap();
 
-                        match user_event {
-                            UserEvent::Created => {
-                                let mut users_count = users_count.write().await;
-                                *users_count += 1;
-                            }
-                            _ => {}
+                        if let UserEvent::Created = user_event {
+                            let mut users_count = users_count.write().await;
+                            *users_count += 1;
                         };
 
                         Ok(())
@@ -419,14 +416,11 @@ async fn deadletter<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + S
                     async move {
                         let user_event: UserEvent = event.name.parse().unwrap();
 
-                        match user_event {
-                            UserEvent::DisplayNameUpdated => {
-                                return Err(SubscirberHandlerError {
-                                    code: "send_email".to_owned(),
-                                    reason: "Connection refused.".to_owned(),
-                                })
-                            }
-                            _ => {}
+                        if let UserEvent::DisplayNameUpdated = user_event {
+                            return Err(SubscirberHandlerError {
+                                code: "send_email".to_owned(),
+                                reason: "Connection refused.".to_owned(),
+                            });
                         };
 
                         Ok(())

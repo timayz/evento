@@ -24,7 +24,7 @@ fn apply_events() {
             .unwrap(),
     );
 
-    assert_eq!(user.deleted, false);
+    assert!(!user.deleted);
 
     user.apply(
         &Event::new(UserEvent::AccountDeleted)
@@ -34,7 +34,7 @@ fn apply_events() {
             .version(2),
     );
 
-    assert_eq!(user.deleted, true)
+    assert!(user.deleted)
 }
 
 #[tokio::test]
