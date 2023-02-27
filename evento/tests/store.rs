@@ -272,7 +272,7 @@ async fn create_pg_store(db_name: &str, init: bool) -> EventStore<PgEngine> {
     store
 }
 
-async fn init_store<'a, E: Engine>(store: &'a E) {
+async fn init_store<E: Engine>(store: &E) {
     store
         .save::<User, _>(
             "1",
