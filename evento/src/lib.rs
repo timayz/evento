@@ -14,7 +14,7 @@ use chrono::{DateTime, Utc};
 use futures_util::{future::join_all, FutureExt};
 use pikav::topic::{TopicFilter, TopicName};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc, time::Duration, cmp::Ordering};
 use store::{Engine as StoreEngine, EngineResult as StoreEngineResult};
 use tokio::time::{interval_at, sleep, Instant};
 use uuid::Uuid;
@@ -30,8 +30,17 @@ pub struct Subscription {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Clone, Serialize, Debug)]
+pub struct SubscirberHandlerError {
+    pub code: String,
+    pub reason: String,
+}
+
 type SubscirberHandler =
-    fn(e: Event, ctx: EventoContext) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
+    fn(
+        e: Event,
+        ctx: EventoContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SubscirberHandlerError>> + Send>>;
 
 #[derive(Clone)]
 pub struct Subscriber {
@@ -140,23 +149,28 @@ pub trait Engine: Clone {
         &self,
         subscription: Subscription,
     ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>>;
+
+    fn add_deadletter(
+        &self,
+        events: Vec<Event>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>>;
+
+    fn read_deadletters(
+        &self,
+        first: usize,
+        after: Option<Uuid>,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Event>, StoreError>> + Send + '_>>;
 }
 
-#[derive(Clone)]
+#[derive(Default, Clone)]
 pub struct MemoryEngine(
-    Arc<RwLock<HashMap<String, Vec<Event>>>>,
+    Arc<RwLock<Vec<Event>>>,
     Arc<RwLock<HashMap<String, Subscription>>>,
 );
 
 impl MemoryEngine {
     pub fn new<S: StoreEngine + Sync + Send + 'static>(store: EventStore<S>) -> Evento<Self, S> {
-        Evento::new(
-            Self(
-                Arc::new(RwLock::new(HashMap::new())),
-                Arc::new(RwLock::new(HashMap::new())),
-            ),
-            store,
-        )
+        Evento::new(Self::default(), store)
     }
 }
 
@@ -211,6 +225,60 @@ impl Engine for MemoryEngine {
 
         async move { Ok(()) }.boxed()
     }
+
+    fn add_deadletter(
+        &self,
+        events: Vec<Event>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
+        self.0.write().extend(events);
+
+        async move { Ok(()) }.boxed()
+    }
+
+    fn read_deadletters(
+        &self,
+        first: usize,
+        after: Option<Uuid>,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Event>, StoreError>> + Send + '_>> {
+        let mut events = self.0.read().clone();
+
+        events.sort_by(|a, b| {
+            let cmp = a.created_at.partial_cmp(&b.created_at).unwrap();
+
+            match cmp {
+                Ordering::Equal => {}
+                _ => return cmp,
+            };
+
+            let cmp = a.version.partial_cmp(&b.version).unwrap();
+
+            match cmp {
+                Ordering::Equal => a.id.partial_cmp(&b.id).unwrap(),
+                _ => cmp,
+            }
+        });
+
+        let start = (after
+            .map(|id| {
+                events
+                    .iter()
+                    .position(|event| event.id == id)
+                    .unwrap() as i32
+            })
+            .unwrap_or(-1)
+            + 1) as usize;
+
+        async move {
+            if events.is_empty() {
+                return Ok(events);
+            }
+
+            let end = std::cmp::min(events.len(), first + 1);
+
+            Ok(events[start..end].to_vec())
+        }
+        .boxed()
+    }
 }
 
 // pub struct PgEngine(PgPool);
@@ -240,9 +308,9 @@ pub struct Evento<E: Engine + Sync + Send, S: StoreEngine + Sync + Send> {
     id: Uuid,
     name: Option<String>,
     context: EventoContext,
-    engine: E,
     store: EventStore<S>,
     subscribers: HashMap<String, Subscriber>,
+    pub engine: E,
 }
 
 impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> Evento<E, S> {
@@ -373,6 +441,8 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
                     }
                 };
 
+                let mut dead_events = Vec::new();
+
                 for event in events.iter() {
                     let (aggregate_type, aggregate_id) = match event.aggregate_details() {
                         Some(details) => details,
@@ -405,8 +475,52 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
                     }
 
                     let futures = sub.handlers.iter().map(|h| h(event.clone(), ctx.clone()));
+                    let results = join_all(futures).await;
+                    let event_errors = results
+                        .iter()
+                        .filter_map(|res| match res {
+                            Err(e) => Some(e),
+                            _ => None,
+                        })
+                        .collect::<Vec<&SubscirberHandlerError>>();
 
-                    join_all(futures).await;
+                    if !event_errors.is_empty() {
+                        let mut metadata = match event
+                            .to_metadata::<HashMap<String, Value>>()
+                            .map(|metadata| metadata.unwrap_or_default())
+                        {
+                            Ok(metadata) => metadata,
+                            Err(e) => {
+                                tracing::error!("{e}");
+
+                                HashMap::default()
+                            }
+                        };
+
+                        let event_errors = match serde_json::to_value(event_errors) {
+                            Ok(errors) => errors,
+                            Err(e) => {
+                                tracing::error!("{e}");
+
+                                Value::Null
+                            }
+                        };
+
+                        metadata.insert("_evento_errors".to_owned(), event_errors);
+
+                        match event.clone().metadata(metadata) {
+                            Ok(e) => dead_events.push(e),
+                            Err(e) => {
+                                tracing::error!("{e}");
+                            }
+                        };
+                    }
+                }
+
+                if !dead_events.is_empty() {
+                    if let Err(e) = engine.add_deadletter(dead_events).await {
+                        tracing::error!("{e}");
+                    }
                 }
 
                 let last_event = match events.last().map(|e| e.id) {
