@@ -58,12 +58,6 @@ impl From<Event> for CommandInfo {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-pub struct CommandMessage {
-    pub producer: String,
-    pub event: Event,
-}
-
 pub type CommandResult = Result<CommandInfo, Error>;
 
 pub struct Command {
