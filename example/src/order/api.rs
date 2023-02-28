@@ -1,5 +1,3 @@
-use std::ops::DerefMut;
-
 use actix_web::{delete, post, put, web, HttpResponse, Scope};
 
 use crate::command::CommandResponse;
@@ -13,10 +11,8 @@ use super::command::{
 
 #[post("/place")]
 async fn place(data: web::Data<AppState>, input: web::Json<PlaceCommand>) -> HttpResponse {
-    let mut producer = data.order_producer.lock().await;
-
     CommandResponse(data.cmd.send(input.0).await)
-        .to_response::<Order>(&data.store, producer.deref_mut())
+        .to_response::<Order>(&data.publisher)
         .await
 }
 
@@ -25,10 +21,8 @@ async fn add_product(
     data: web::Data<AppState>,
     input: web::Json<AddProductCommand>,
 ) -> HttpResponse {
-    let mut producer = data.order_producer.lock().await;
-
     CommandResponse(data.cmd.send(input.0).await)
-        .to_response::<Order>(&data.store, producer.deref_mut())
+        .to_response::<Order>(&data.publisher)
         .await
 }
 
@@ -37,10 +31,8 @@ async fn remove_product(
     data: web::Data<AppState>,
     input: web::Json<RemoveProductCommand>,
 ) -> HttpResponse {
-    let mut producer = data.order_producer.lock().await;
-
     CommandResponse(data.cmd.send(input.0).await)
-        .to_response::<Order>(&data.store, producer.deref_mut())
+        .to_response::<Order>(&data.publisher)
         .await
 }
 
@@ -49,10 +41,8 @@ async fn update_product_quantity(
     data: web::Data<AppState>,
     input: web::Json<UpdateProductQuantityCommand>,
 ) -> HttpResponse {
-    let mut producer = data.order_producer.lock().await;
-
     CommandResponse(data.cmd.send(input.0).await)
-        .to_response::<Order>(&data.store, producer.deref_mut())
+        .to_response::<Order>(&data.publisher)
         .await
 }
 
@@ -61,37 +51,29 @@ async fn update_shipping_info(
     data: web::Data<AppState>,
     input: web::Json<UpdateShippingInfoCommand>,
 ) -> HttpResponse {
-    let mut producer = data.order_producer.lock().await;
-
     CommandResponse(data.cmd.send(input.0).await)
-        .to_response::<Order>(&data.store, producer.deref_mut())
+        .to_response::<Order>(&data.publisher)
         .await
 }
 
 #[post("/pay")]
 async fn pay(data: web::Data<AppState>, input: web::Json<PayCommand>) -> HttpResponse {
-    let mut producer = data.order_producer.lock().await;
-
     CommandResponse(data.cmd.send(input.0).await)
-        .to_response::<Order>(&data.store, producer.deref_mut())
+        .to_response::<Order>(&data.publisher)
         .await
 }
 
 #[delete("/delete")]
 async fn delete(data: web::Data<AppState>, input: web::Json<DeleteCommand>) -> HttpResponse {
-    let mut producer = data.order_producer.lock().await;
-
     CommandResponse(data.cmd.send(input.0).await)
-        .to_response::<Order>(&data.store, producer.deref_mut())
+        .to_response::<Order>(&data.publisher)
         .await
 }
 
 #[delete("/cancel")]
 async fn cancel(data: web::Data<AppState>, input: web::Json<CancelCommand>) -> HttpResponse {
-    let mut producer = data.order_producer.lock().await;
-
     CommandResponse(data.cmd.send(input.0).await)
-        .to_response::<Order>(&data.store, producer.deref_mut())
+        .to_response::<Order>(&data.publisher)
         .await
 }
 

@@ -1,10 +1,8 @@
 use actix::prelude::*;
 use actix_web::HttpResponse;
-use evento::{Aggregate, Engine, Event, EventStore, PgEngine};
-use pulsar::{producer, DeserializeMessage, Payload, Producer, SerializeMessage, TokioExecutor};
+use evento::{Aggregate, Event, Evento, PgEngine, Publisher};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sqlx::PgPool;
 use validator::ValidationErrors;
 
 #[derive(thiserror::Error, Debug)]
@@ -13,10 +11,7 @@ pub enum Error {
     SerdeJson(serde_json::Error),
 
     #[error("internal server error")]
-    Pulsar(pulsar::Error),
-
-    #[error("internal server error")]
-    Evento(evento::Error),
+    Evento(evento::StoreError),
 
     #[error("{0}")]
     ValidationErrors(ValidationErrors),
@@ -34,20 +29,14 @@ impl From<serde_json::Error> for Error {
     }
 }
 
-impl From<pulsar::Error> for Error {
-    fn from(e: pulsar::Error) -> Self {
-        Error::Pulsar(e)
-    }
-}
-
 impl From<ValidationErrors> for Error {
     fn from(e: ValidationErrors) -> Self {
         Error::ValidationErrors(e)
     }
 }
 
-impl From<evento::Error> for Error {
-    fn from(e: evento::Error) -> Self {
+impl From<evento::StoreError> for Error {
+    fn from(e: evento::StoreError) -> Self {
         Error::Evento(e)
     }
 }
@@ -69,42 +58,15 @@ impl From<Event> for CommandInfo {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-pub struct CommandMessage {
-    pub producer: String,
-    pub event: Event,
-}
-
-impl SerializeMessage for CommandMessage {
-    fn serialize_message(input: Self) -> Result<producer::Message, pulsar::Error> {
-        let payload =
-            serde_json::to_vec(&input).map_err(|e| pulsar::Error::Custom(e.to_string()))?;
-        Ok(producer::Message {
-            payload,
-            ..Default::default()
-        })
-    }
-}
-
-impl DeserializeMessage for CommandMessage {
-    type Output = Result<CommandMessage, serde_json::Error>;
-
-    fn deserialize_message(payload: &Payload) -> Self::Output {
-        serde_json::from_slice(&payload.data)
-    }
-}
-
 pub type CommandResult = Result<CommandInfo, Error>;
 
 pub struct Command {
-    pub store: EventStore<PgEngine>,
+    pub store: Evento<PgEngine, evento::store::PgEngine>,
 }
 
 impl Command {
-    pub fn new(pool: PgPool) -> Self {
-        Self {
-            store: PgEngine::new(pool),
-        }
+    pub fn new(store: Evento<PgEngine, evento::store::PgEngine>) -> Self {
+        Self { store }
     }
 }
 
@@ -117,8 +79,7 @@ pub struct CommandResponse(pub Result<CommandResult, MailboxError>);
 impl CommandResponse {
     pub async fn to_response<A: Aggregate>(
         &self,
-        store: &EventStore<PgEngine>,
-        producer: &mut Producer<TokioExecutor>,
+        publisher: &Publisher<evento::store::PgEngine>,
     ) -> HttpResponse {
         let info = match &self.0 {
             Ok(res) => match res {
@@ -152,36 +113,18 @@ impl CommandResponse {
             }
         };
 
-        let res = store
-            .save::<A, _>(
+        let res = publisher
+            .publish::<A, _>(
                 &info.aggregate_id,
                 info.events.clone(),
                 info.original_version,
             )
-            .await
-            .map(|events| {
-                events
-                    .into_iter()
-                    .map(|e| CommandMessage {
-                        event: e,
-                        producer: "example.eu-west-3".to_owned(),
-                    })
-                    .collect::<Vec<CommandMessage>>()
-            });
+            .await;
 
         match res {
-            Ok(events) => {
-                if let Err(e) = producer.send_all(events).await {
-                    return HttpResponse::InternalServerError().json(json!({
-                        "code": "internal_server_error",
-                        "reason": e.to_string()
-                    }));
-                }
-
-                HttpResponse::Ok().json(json!({
-                    "id": info.aggregate_id
-                }))
-            }
+            Ok(_) => HttpResponse::Ok().json(json!({
+                "id": info.aggregate_id
+            })),
             Err(e) => HttpResponse::InternalServerError().json(json!({
                 "code": "internal_server_error",
                 "reason": e.to_string()

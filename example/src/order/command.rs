@@ -1,5 +1,5 @@
 use actix::{ActorFutureExt, Context, Handler, Message, ResponseActFuture, WrapFuture};
-use evento::{Engine, Event, EventStore, PgEngine};
+use evento::{Event, Evento};
 use nanoid::nanoid;
 use serde::Deserialize;
 use validator::Validate;
@@ -14,7 +14,10 @@ use super::{
     },
 };
 
-pub async fn load_order(store: &EventStore<PgEngine>, id: &str) -> Result<(Order, Event), Error> {
+pub async fn load_order(
+    store: &Evento<evento::PgEngine, evento::store::PgEngine>,
+    id: &str,
+) -> Result<(Order, Event), Error> {
     let (order, e) = match store.load::<Order, _>(id).await? {
         Some(order) => order,
         _ => return Err(Error::NotFound("order".to_owned(), id.to_owned())),

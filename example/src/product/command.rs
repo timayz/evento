@@ -1,5 +1,5 @@
 use actix::{ActorFutureExt, Context, Handler, Message, ResponseActFuture, WrapFuture};
-use evento::{Engine, Event, EventStore, PgEngine};
+use evento::{Event, Evento};
 use nanoid::nanoid;
 use serde::Deserialize;
 use validator::Validate;
@@ -15,7 +15,7 @@ use super::{
 };
 
 pub async fn load_product(
-    store: &EventStore<PgEngine>,
+    store: &Evento<evento::PgEngine, evento::store::PgEngine>,
     id: &str,
 ) -> Result<(Product, Event), Error> {
     let (product, e) = match store.load::<Product, _>(id).await? {

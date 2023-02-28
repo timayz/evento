@@ -1,98 +1,13 @@
+use evento::store::{Engine, MemoryEngine, PgEngine};
+use evento::{Aggregate, Event, EventStore, StoreError};
+use sqlx::{Executor, PgPool};
 use std::collections::HashMap;
 
-use evento::{Aggregate, Engine, Error, Event, EventStore, MemoryEngine, PgEngine};
-use parse_display::{Display, FromStr};
-use serde::{Deserialize, Serialize};
-use sqlx::{Executor, PgPool};
+mod common;
 
-#[derive(Display, FromStr)]
-#[display(style = "kebab-case")]
-enum UserEvent {
-    Created,
-    DisplayNameUpdated,
-    ProfileUpdated,
-    PasswordUpdated,
-    AccountDeleted,
-}
-
-impl Into<String> for UserEvent {
-    fn into(self) -> String {
-        self.to_string()
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-struct Created {
-    username: String,
-    password: String,
-}
-
-#[derive(Serialize, Deserialize)]
-struct DisplayNameUpdated {
-    display_name: String,
-}
-
-#[derive(Serialize, Deserialize)]
-struct ProfileUpdated {
-    first_name: String,
-    last_name: String,
-}
-
-#[derive(Serialize, Deserialize)]
-struct PasswordUpdated {
-    old_password: String,
-    new_password: String,
-}
-
-#[derive(Serialize, Deserialize)]
-struct AccountDeleted {
-    deleted: bool,
-}
-
-#[derive(Default, Serialize, Deserialize)]
-struct User {
-    first_name: Option<String>,
-    last_name: Option<String>,
-    display_name: Option<String>,
-    username: String,
-    password: String,
-    deleted: bool,
-}
-
-impl Aggregate for User {
-    fn apply(&mut self, event: &evento::Event) {
-        let user_event: UserEvent = event.name.parse().unwrap();
-
-        match user_event {
-            UserEvent::Created => {
-                let data: Created = event.to_data().unwrap();
-                self.username = data.username;
-                self.password = data.password;
-            }
-            UserEvent::DisplayNameUpdated => {
-                let data: DisplayNameUpdated = event.to_data().unwrap();
-                self.display_name = Some(data.display_name);
-            }
-            UserEvent::ProfileUpdated => {
-                let data: ProfileUpdated = event.to_data().unwrap();
-                self.first_name = Some(data.first_name);
-                self.last_name = Some(data.last_name);
-            }
-            UserEvent::PasswordUpdated => {
-                let data: PasswordUpdated = event.to_data().unwrap();
-                self.password = data.new_password;
-            }
-            UserEvent::AccountDeleted => {
-                let data: AccountDeleted = event.to_data().unwrap();
-                self.deleted = data.deleted;
-            }
-        }
-    }
-
-    fn aggregate_type<'a>() -> &'a str {
-        "user"
-    }
-}
+use crate::common::{
+    AccountDeleted, Created, DisplayNameUpdated, PasswordUpdated, ProfileUpdated, User, UserEvent,
+};
 
 #[test]
 fn apply_events() {
@@ -109,7 +24,7 @@ fn apply_events() {
             .unwrap(),
     );
 
-    assert_eq!(user.deleted, false);
+    assert!(!user.deleted);
 
     user.apply(
         &Event::new(UserEvent::AccountDeleted)
@@ -119,7 +34,7 @@ fn apply_events() {
             .version(2),
     );
 
-    assert_eq!(user.deleted, true)
+    assert!(user.deleted)
 }
 
 #[tokio::test]
@@ -220,7 +135,7 @@ async fn load_save<E: Engine>(store: EventStore<E>) {
                         new_password: "securepwd".to_owned(),
                     })
                     .unwrap()
-                    .metadata(HashMap::from([("algo", "RS256")]))
+                    .metadata(HashMap::from([("algo".to_owned(), "RS256".to_owned())]))
                     .unwrap(),
                 Event::new(UserEvent::DisplayNameUpdated)
                     .data(DisplayNameUpdated {
@@ -288,7 +203,7 @@ async fn save_wrong_version<E: Engine>(store: EventStore<E>) {
         .await
         .unwrap_err();
 
-    assert_eq!(err, Error::UnexpectedOriginalVersion);
+    assert_eq!(err, StoreError::UnexpectedOriginalVersion);
 
     let ovf = store
         .save::<User, _>(
@@ -330,19 +245,18 @@ async fn create_pg_store(db_name: &str, init: bool) -> EventStore<PgEngine> {
 
     let mut conn = pool.acquire().await.unwrap();
 
-    conn.execute(&format!("drop database if exists evento_{};", db_name)[..])
+    conn.execute(&format!("drop database if exists evento_{db_name};")[..])
         .await
         .unwrap();
 
-    conn.execute(&format!("create database evento_{};", db_name)[..])
+    conn.execute(&format!("create database evento_{db_name};")[..])
         .await
         .unwrap();
 
     drop(pool);
 
     let pool = PgPool::connect(&format!(
-        "postgres://postgres:postgres@localhost:5432/evento_{}",
-        db_name
+        "postgres://postgres:postgres@localhost:5432/evento_{db_name}"
     ))
     .await
     .unwrap();
@@ -358,7 +272,7 @@ async fn create_pg_store(db_name: &str, init: bool) -> EventStore<PgEngine> {
     store
 }
 
-async fn init_store<'a, E: Engine>(store: &'a E) {
+async fn init_store<E: Engine>(store: &E) {
     store
         .save::<User, _>(
             "1",

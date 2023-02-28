@@ -15,9 +15,3 @@ services:
     environment:
       MONGO_INITDB_ROOT_USERNAME: mongo
       MONGO_INITDB_ROOT_PASSWORD: mongo
-
-  pulsar:
-    image: apachepulsar/pulsar:2.10.2
-    command: bin/pulsar standalone
-    ports:
-      - 6650:6650
