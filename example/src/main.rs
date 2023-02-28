@@ -37,7 +37,6 @@ async fn main() -> std::io::Result<()> {
         .await
         .unwrap();
 
-
     HttpServer::new(move || {
         App::new()
             .app_data(web::Data::<AppState>::new(AppState {
