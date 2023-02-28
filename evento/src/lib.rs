@@ -309,11 +309,11 @@ impl Engine for PgEngine {
                 RETURNING id
                 "#,
             )
-            .bind(&Uuid::new_v4())
-            .bind(&consumer_id)
+            .bind(Uuid::new_v4())
+            .bind(consumer_id)
             .bind(&key)
-            .bind(&true)
-            .bind(&Utc::now())
+            .bind(true)
+            .bind(Utc::now())
             .fetch_one(&pool)
             .await?;
             Ok(())
@@ -356,8 +356,8 @@ impl Engine for PgEngine {
                 "#,
             )
             .bind(&subscription.key)
-            .bind(&subscription.cursor)
-            .bind(&subscription.updated_at)
+            .bind(subscription.cursor)
+            .bind(subscription.updated_at)
             .fetch_one(&pool)
             .await?;
             Ok(())
@@ -416,7 +416,7 @@ impl Engine for PgEngine {
                         LIMIT 1
                         "#,
                     )
-                    .bind(&id)
+                    .bind(id)
                     .fetch_one(&pool)
                     .await?,
                 ),
@@ -432,10 +432,10 @@ impl Engine for PgEngine {
                     LIMIT $3
                     "#,
                     )
-                    .bind(&cursor.created_at)
-                    .bind(&cursor.version)
-                    .bind(&cursor.id)
-                    .bind(&limit)
+                    .bind(cursor.created_at)
+                    .bind(cursor.version)
+                    .bind(cursor.id)
+                    .bind(limit)
                     .fetch_all(&pool)
                     .await?
                 }
@@ -447,7 +447,7 @@ impl Engine for PgEngine {
                     LIMIT $1
                     "#,
                     )
-                    .bind(&limit)
+                    .bind(limit)
                     .fetch_all(&pool)
                     .await?
                 }

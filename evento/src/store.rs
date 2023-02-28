@@ -496,7 +496,7 @@ impl Engine for PgEngine {
                         LIMIT 1
                         "#,
                     )
-                    .bind(&id)
+                    .bind(id)
                     .fetch_one(&pool)
                     .await?,
                 ),
@@ -511,7 +511,7 @@ impl Engine for PgEngine {
                 LIMIT $1
                 "#,
                     )
-                    .bind(&limit)
+                    .bind(limit)
                     .fetch_all(&pool)
                     .await?
                 }
@@ -524,10 +524,10 @@ impl Engine for PgEngine {
                 LIMIT $4
                 "#,
                     )
-                    .bind(&cursor.created_at)
-                    .bind(&cursor.version)
-                    .bind(&cursor.id)
-                    .bind(&limit)
+                    .bind(cursor.created_at)
+                    .bind(cursor.version)
+                    .bind(cursor.id)
+                    .bind(limit)
                     .fetch_all(&pool)
                     .await?
                 }
@@ -535,13 +535,12 @@ impl Engine for PgEngine {
                     sqlx::query_as::<_, Event>(&format!(
                         r#"
                     SELECT * from _evento_events
-                    WHERE ({})
+                    WHERE ({filters})
                     ORDER BY created_at ASC, version ASC, id ASC
                     LIMIT $1
-                    "#,
-                        filters
+                    "#
                     ))
-                    .bind(&limit)
+                    .bind(limit)
                     .fetch_all(&pool)
                     .await?
                 }
@@ -549,16 +548,15 @@ impl Engine for PgEngine {
                     sqlx::query_as::<_, Event>(&format!(
                         r#"
                         SELECT * from _evento_events
-                        WHERE ({}) AND created_at > $1 OR (created_at = $1 AND (version > $2 OR (version = $2 AND id > $3)))
+                        WHERE ({filters}) AND created_at > $1 OR (created_at = $1 AND (version > $2 OR (version = $2 AND id > $3)))
                         ORDER BY created_at ASC, version ASC, id ASC
                         LIMIT $4
-                        "#,
-                        filters
+                        "#
                     ))
-                    .bind(&cursor.created_at)
-                    .bind(&cursor.version)
-                    .bind(&cursor.id)
-                    .bind(&limit)
+                    .bind(cursor.created_at)
+                    .bind(cursor.version)
+                    .bind(cursor.id)
+                    .bind(limit)
                     .fetch_all(&pool)
                     .await?
                 }
