@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS _evento_subscriptions
     key varchar(255) NOT NULL,
     enabled BOOLEAN NOT NULL,
     cursor uuid NULL,
-    cursor_updated_at timestamptz NULL,
+    updated_at timestamptz NULL,
     created_at timestamptz NOT NULL
 );
 

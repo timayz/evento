@@ -4,7 +4,13 @@ use parking_lot::RwLock;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, QueryBuilder};
-use std::{cmp::Ordering, collections::HashMap, future::Future, pin::Pin, sync::Arc};
+use std::{
+    cmp::Ordering,
+    collections::{HashMap, HashSet},
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+};
 use uuid::Uuid;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -454,14 +460,135 @@ impl Engine for PgEngine {
         after: Option<Uuid>,
         filters: Option<Vec<F>>,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Event>, Error>> + Send + '_>> {
-        todo!()
+        let pool = self.0.clone();
+        let mut json_filters = HashSet::new();
+
+        if let Some(filters) = filters {
+            for filter in filters {
+                match serde_json::to_string(&filter) {
+                    Ok(json_filter) => {
+                        json_filters.insert(format!("metadata @> '{json_filter}'::jsonb"));
+                    }
+                    Err(e) => return async move { Err(Error::SerdeJson(e.to_string())) }.boxed(),
+                };
+            }
+        }
+
+        let filters = if json_filters.is_empty() {
+            None
+        } else {
+            Some(
+                json_filters
+                    .into_iter()
+                    .collect::<Vec<String>>()
+                    .join(" OR "),
+            )
+        };
+
+        async move {
+            let limit = first as i16;
+            let cursor = match after {
+                Some(id) => Some(
+                    sqlx::query_as::<_, Event>(
+                        r#"
+                        SELECT * from _evento_events
+                        WHERE id = $1
+                        LIMIT 1
+                        "#,
+                    )
+                    .bind(&id)
+                    .fetch_one(&pool)
+                    .await?,
+                ),
+                _ => None,
+            };
+            let events = match (cursor, filters) {
+                (None, None) => {
+                    sqlx::query_as::<_, Event>(
+                        r#"
+                SELECT * from _evento_events
+                ORDER BY created_at ASC, version ASC, id ASC
+                LIMIT $1
+                "#,
+                    )
+                    .bind(&limit)
+                    .fetch_all(&pool)
+                    .await?
+                }
+                (Some(cursor), None) => {
+                    sqlx::query_as::<_, Event>(
+                        r#"
+                SELECT * from _evento_events
+                WHERE created_at > $1 OR (created_at = $1 AND (version > $2 OR (version = $2 AND id > $3)))
+                ORDER BY created_at ASC, version ASC, id ASC
+                LIMIT $4
+                "#,
+                    )
+                    .bind(&cursor.created_at)
+                    .bind(&cursor.version)
+                    .bind(&cursor.id)
+                    .bind(&limit)
+                    .fetch_all(&pool)
+                    .await?
+                }
+                (None, Some(filters)) => {
+                    sqlx::query_as::<_, Event>(&format!(
+                        r#"
+                    SELECT * from _evento_events
+                    WHERE ({})
+                    ORDER BY created_at ASC, version ASC, id ASC
+                    LIMIT $1
+                    "#,
+                        filters
+                    ))
+                    .bind(&limit)
+                    .fetch_all(&pool)
+                    .await?
+                }
+                (Some(cursor), Some(filters)) => {
+                    sqlx::query_as::<_, Event>(&format!(
+                        r#"
+                        SELECT * from _evento_events
+                        WHERE ({}) AND created_at > $1 OR (created_at = $1 AND (version > $2 OR (version = $2 AND id > $3)))
+                        ORDER BY created_at ASC, version ASC, id ASC
+                        LIMIT $4
+                        "#,
+                        filters
+                    ))
+                    .bind(&cursor.created_at)
+                    .bind(&cursor.version)
+                    .bind(&cursor.id)
+                    .bind(&limit)
+                    .fetch_all(&pool)
+                    .await?
+                }
+            };
+
+            Ok(events)
+        }
+        .boxed()
     }
 
     fn get<A: Aggregate, I: Into<String>>(
         &self,
         id: I,
     ) -> Pin<Box<dyn Future<Output = Result<Option<Event>, Error>> + Send + '_>> {
-        todo!()
+        let pool = self.0.clone();
+        let id: String = A::aggregate_id(id);
+        async move {
+            let event = sqlx::query_as::<_, Event>(
+                r#"
+                SELECT * from _evento_events
+                WHERE aggregate_id = $1
+                LIMIT 1
+                "#,
+            )
+            .bind(&id)
+            .fetch_optional(&pool)
+            .await?;
+            Ok(event)
+        }
+        .boxed()
     }
 }
 

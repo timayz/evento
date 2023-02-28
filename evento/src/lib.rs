@@ -7,13 +7,13 @@ pub use context::Context;
 pub use data::Data;
 pub use store::{Aggregate, Error as StoreError, Event, EventStore};
 
-use serde_json::Value;
-use parking_lot::RwLock;
-use sqlx::PgPool;
 use chrono::{DateTime, Utc};
 use futures_util::{future::join_all, FutureExt};
+use parking_lot::RwLock;
 use pikav::topic::{TopicFilter, TopicName};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sqlx::{PgPool, Postgres, QueryBuilder};
 use std::{
     cmp::Ordering, collections::HashMap, future::Future, pin::Pin, sync::Arc, time::Duration,
 };
@@ -28,7 +28,7 @@ pub struct Subscription {
     pub key: String,
     pub enabled: bool,
     pub cursor: Option<Uuid>,
-    pub cursor_updated_at: Option<DateTime<Utc>>,
+    pub updated_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -193,7 +193,7 @@ impl Engine for MemoryEngine {
                 key,
                 enabled: true,
                 cursor: None,
-                cursor_updated_at: None,
+                updated_at: None,
                 created_at: Utc::now(),
             });
 
@@ -282,7 +282,10 @@ impl Engine for MemoryEngine {
 pub struct PgEngine(PgPool);
 
 impl PgEngine {
-    pub fn new<S: StoreEngine + Sync + Send + 'static>(pool: PgPool, store: EventStore<S>) -> Evento<Self, S> {
+    pub fn new<S: StoreEngine + Sync + Send + 'static>(
+        pool: PgPool,
+        store: EventStore<S>,
+    ) -> Evento<Self, S> {
         Evento::new(Self(pool), store)
     }
 }
@@ -293,28 +296,106 @@ impl Engine for PgEngine {
         key: K,
         consumer_id: Uuid,
     ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
-        todo!()
+        let pool = self.0.clone();
+        let key = key.into();
+        async move {
+            sqlx::query_as::<_, (Uuid,)>(
+                r#"
+                INSERT INTO _evento_subscriptions (id, consumer_id, key, enabled, created_at)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (key)
+                DO
+                    UPDATE SET consumer_id = $2
+                RETURNING id
+                "#,
+            )
+            .bind(&Uuid::new_v4())
+            .bind(&consumer_id)
+            .bind(&key)
+            .bind(&true)
+            .bind(&Utc::now())
+            .fetch_one(&pool)
+            .await?;
+            Ok(())
+        }
+        .boxed()
     }
 
     fn get_subscription<K: Into<String>>(
         &self,
         key: K,
     ) -> Pin<Box<dyn Future<Output = Result<Subscription, StoreError>> + Send + '_>> {
-        todo!()
+        let pool = self.0.clone();
+        let key = key.into();
+        async move {
+            let sub = sqlx::query_as::<_, Subscription>(
+                r#"
+                SELECT * from _evento_subscriptions WHERE key = $1
+                "#,
+            )
+            .bind(&key)
+            .fetch_one(&pool)
+            .await?;
+            Ok(sub)
+        }
+        .boxed()
     }
 
     fn update_subscription(
         &self,
         subscription: Subscription,
     ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
-        todo!()
+        let pool = self.0.clone();
+        async move {
+            sqlx::query_as::<_, (Uuid,)>(
+                r#"
+                UPDATE _evento_subscriptions
+                SET cursor = $2, updated_at = $3
+                WHERE key = $1
+                RETURNING id
+                "#,
+            )
+            .bind(&subscription.key)
+            .bind(&subscription.cursor)
+            .bind(&subscription.updated_at)
+            .fetch_one(&pool)
+            .await?;
+            Ok(())
+        }
+        .boxed()
     }
 
     fn add_deadletter(
         &self,
         events: Vec<Event>,
     ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
-        todo!()
+        let pool = self.0.clone();
+
+        async move {
+            let mut tx = pool.begin().await?;
+
+            for events in events.chunks(100).collect::<Vec<&[Event]>>() {
+                let mut query_builder: QueryBuilder<Postgres> = QueryBuilder::new(
+                    "INSERT INTO _evento_deadletters (id, name, aggregate_id, version, data, metadata, created_at) "
+                );
+
+                query_builder.push_values(events, |mut b, event| {
+                    b.push_bind(event.id)
+                        .push_bind(event.name.to_owned())
+                        .push_bind(event.aggregate_id.to_owned())
+                        .push_bind(event.version)
+                        .push_bind(event.data.clone())
+                        .push_bind(event.metadata.clone())
+                        .push_bind(event.created_at);
+                });
+
+                query_builder.build().execute(&mut *tx).await?;
+            }
+
+            tx.commit().await?;
+
+            Ok(())
+        }.boxed()
     }
 
     fn read_deadletters(
@@ -322,7 +403,59 @@ impl Engine for PgEngine {
         first: usize,
         after: Option<Uuid>,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Event>, StoreError>> + Send + '_>> {
-        todo!()
+        let pool = self.0.clone();
+
+        async move {
+            let limit = first as i16;
+            let cursor = match after {
+                Some(id) => Some(
+                    sqlx::query_as::<_, Event>(
+                        r#"
+                        SELECT * from _evento_events
+                        WHERE id = $1
+                        LIMIT 1
+                        "#,
+                    )
+                    .bind(&id)
+                    .fetch_one(&pool)
+                    .await?,
+                ),
+                _ => None,
+            };
+            let events = match cursor {
+                Some(cursor) => {
+                    sqlx::query_as::<_, Event>(
+                        r#"
+                    SELECT * from _evento_deadletters
+                    WHERE created_at > $1 OR (created_at = $1 AND (version > $2 OR (version = $2 AND id > $3)))
+                    ORDER BY created_at ASC, version ASC, id ASC
+                    LIMIT $3
+                    "#,
+                    )
+                    .bind(&cursor.created_at)
+                    .bind(&cursor.version)
+                    .bind(&cursor.id)
+                    .bind(&limit)
+                    .fetch_all(&pool)
+                    .await?
+                }
+                _ => {
+                    sqlx::query_as::<_, Event>(
+                        r#"
+                    SELECT * from _evento_deadletters
+                    ORDER BY created_at ASC, version ASC, id ASC
+                    LIMIT $1
+                    "#,
+                    )
+                    .bind(&limit)
+                    .fetch_all(&pool)
+                    .await?
+                }
+            };
+
+            Ok(events)
+        }
+        .boxed()
     }
 }
 
@@ -373,7 +506,11 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
     }
 
     pub fn subscribe(mut self, s: Subscriber) -> Self {
-        self.subscribers.insert(s.key.to_owned(), s);
+        let name = self.name.to_owned().unwrap_or("_".to_owned());
+        let mut sub = s.clone();
+        sub.key = format!("{}.{}", name, s.key);
+
+        self.subscribers.insert(sub.key.to_owned(), sub);
         self
     }
 
@@ -431,6 +568,11 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
                         continue;
                     }
                 };
+
+                if !subscription.enabled {
+                    tracing::info!("subscription {} is disabled, skip", sub.key,);
+                    break;
+                }
 
                 if subscription.consumer_id != consumer_id {
                     tracing::info!(
@@ -556,7 +698,7 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
                     }
                 }
 
-                let last_event = match events.last().map(|e| e.id) {
+                let last_event_id = match events.last().map(|e| e.id) {
                     Some(cursor) => cursor,
                     None => {
                         tracing::debug!("No events found after {:?}", subscription.cursor);
@@ -564,8 +706,8 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
                     }
                 };
 
-                subscription.cursor = Some(last_event);
-                subscription.cursor_updated_at = Some(Utc::now());
+                subscription.cursor = Some(last_event_id);
+                subscription.updated_at = Some(Utc::now());
 
                 if let Err(e) = engine.update_subscription(subscription).await {
                     tracing::error!("{e}");
