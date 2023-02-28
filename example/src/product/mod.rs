@@ -5,4 +5,4 @@ mod event;
 mod projection;
 
 pub use api::scope;
-pub use projection::start;
+pub use projection::subscribe;

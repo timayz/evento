@@ -547,7 +547,5 @@ async fn create_pg_store(db_name: &str, reset: bool) -> Evento<PgEngine, evento:
 
     sqlx::migrate!("../migrations").run(&pool).await.unwrap();
 
-    let store = evento::store::PgEngine::new(pool.clone());
-
-    PgEngine::new(pool, store)
+    PgEngine::new(pool)
 }

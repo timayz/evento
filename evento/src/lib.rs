@@ -282,11 +282,8 @@ impl Engine for MemoryEngine {
 pub struct PgEngine(PgPool);
 
 impl PgEngine {
-    pub fn new<S: StoreEngine + Sync + Send + 'static>(
-        pool: PgPool,
-        store: EventStore<S>,
-    ) -> Evento<Self, S> {
-        Evento::new(Self(pool), store)
+    pub fn new(pool: PgPool) -> Evento<Self, store::PgEngine> {
+        Evento::new(Self(pool.clone()), store::PgEngine::new(pool))
     }
 }
 
@@ -470,6 +467,7 @@ impl EventoContext {
     }
 }
 
+#[derive(Clone)]
 pub struct Evento<E: Engine + Sync + Send, S: StoreEngine + Sync + Send> {
     id: Uuid,
     name: Option<String>,
@@ -512,6 +510,13 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
 
         self.subscribers.insert(sub.key.to_owned(), sub);
         self
+    }
+
+    pub fn load<A: Aggregate, I: Into<String>>(
+        &self,
+        id: I,
+    ) -> Pin<Box<dyn Future<Output = StoreEngineResult<A>> + Send + '_>> {
+        self.store.load(id)
     }
 
     pub async fn run(&self) -> Result<Publisher<S>, StoreError> {
