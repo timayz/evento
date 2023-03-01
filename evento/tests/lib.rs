@@ -170,7 +170,7 @@ async fn publish<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send
         .await
         .unwrap();
 
-    sleep(Duration::from_secs(2)).await;
+    sleep(Duration::from_millis(300)).await;
 
     let user1 = {
         let r_users = users.read().await;
@@ -196,7 +196,7 @@ async fn publish<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send
         .await
         .unwrap();
 
-    sleep(Duration::from_secs(2)).await;
+    sleep(Duration::from_millis(300)).await;
 
     let user1 = {
         let r_users = users.read().await;
@@ -348,7 +348,7 @@ async fn filter<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send 
         .await
         .unwrap();
 
-    sleep(Duration::from_secs(2)).await;
+    sleep(Duration::from_millis(300)).await;
 
     let users = users.read().await;
     let user1 = users.get("1").unwrap();
