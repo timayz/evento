@@ -613,11 +613,11 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
         let name = self.name.to_owned();
 
         tokio::spawn(async move {
-            tracing::info!("{} is starting...", sub.key);
+            tracing::info!("Starting {} ...", sub.key);
 
             sleep(delay).await;
 
-            tracing::info!("{} is starting", sub.key);
+            tracing::info!("{} on !", sub.key);
 
             let mut interval = interval_at(Instant::now(), Duration::from_secs(1));
 
