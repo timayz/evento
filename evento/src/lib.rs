@@ -619,7 +619,7 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
 
             tracing::info!("{} on !", sub.key);
 
-            let mut interval = interval_at(Instant::now(), Duration::from_secs(1));
+            let mut interval = interval_at(Instant::now(), Duration::from_millis(100));
 
             loop {
                 interval.tick().await;
