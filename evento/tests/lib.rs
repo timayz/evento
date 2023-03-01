@@ -509,8 +509,11 @@ async fn deadletter<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + S
 
     let event = engine.read_deadletters(10, None).await.unwrap()[0].clone();
     let metadata = event.metadata.unwrap();
+
+    let subscription_key = metadata.get("_evento_subscription_key").unwrap();
     let errors = metadata.get("_evento_errors").unwrap();
 
+    assert_eq!(subscription_key.clone(), json!("eu-west-3a.users"));
     assert_eq!(
         errors.clone(),
         json!([{

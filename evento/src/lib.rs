@@ -42,6 +42,42 @@ pub struct SubscirberHandlerError {
     pub reason: String,
 }
 
+impl From<serde_json::Error> for SubscirberHandlerError {
+    fn from(e: serde_json::Error) -> Self {
+        SubscirberHandlerError {
+            code: "serde_json".to_owned(),
+            reason: e.to_string(),
+        }
+    }
+}
+
+impl From<StoreError> for SubscirberHandlerError {
+    fn from(e: StoreError) -> Self {
+        SubscirberHandlerError {
+            code: "store".to_owned(),
+            reason: e.to_string(),
+        }
+    }
+}
+
+impl From<sqlx::Error> for SubscirberHandlerError {
+    fn from(e: sqlx::Error) -> Self {
+        SubscirberHandlerError {
+            code: "sqlx".to_owned(),
+            reason: e.to_string(),
+        }
+    }
+}
+
+impl From<uuid::Error> for SubscirberHandlerError {
+    fn from(e: uuid::Error) -> Self {
+        SubscirberHandlerError {
+            code: "uuid".to_owned(),
+            reason: e.to_string(),
+        }
+    }
+}
+
 type SubscirberHandler =
     fn(
         e: Event,
@@ -690,6 +726,7 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
                             }
                         };
 
+                        metadata.insert("_evento_subscription_key".to_owned(), Value::String(sub.key.to_owned()));
                         metadata.insert("_evento_errors".to_owned(), event_errors);
 
                         match event.clone().metadata(metadata) {
