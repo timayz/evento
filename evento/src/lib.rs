@@ -726,7 +726,10 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
                             }
                         };
 
-                        metadata.insert("_evento_subscription_key".to_owned(), Value::String(sub.key.to_owned()));
+                        metadata.insert(
+                            "_evento_subscription_key".to_owned(),
+                            Value::String(sub.key.to_owned()),
+                        );
                         metadata.insert("_evento_errors".to_owned(), event_errors);
 
                         match event.clone().metadata(metadata) {
