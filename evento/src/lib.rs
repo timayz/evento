@@ -136,15 +136,14 @@ impl<S: StoreEngine + Send + Sync> Publisher<S> {
             let name = match store.get::<A, _>(&id).await? {
                 Some(event) => event
                     .to_metadata::<HashMap<String, Value>>()?
-                    .and_then(|metadata| metadata.get("_evento_name").cloned()),
+                    .get("_evento_name")
+                    .cloned(),
                 _ => name.map(Value::String),
             };
 
             let mut updated_events = Vec::new();
             for event in events.iter() {
-                let mut metadata = event
-                    .to_metadata::<HashMap<String, Value>>()
-                    .map(|metadata| metadata.unwrap_or_default())?;
+                let mut metadata = event.to_metadata::<HashMap<String, Value>>()?;
 
                 if let Some(name) = &name {
                     metadata.insert("_evento_name".to_owned(), name.clone());
@@ -705,10 +704,7 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
                         .collect::<Vec<&SubscirberHandlerError>>();
 
                     if !event_errors.is_empty() {
-                        let mut metadata = match event
-                            .to_metadata::<HashMap<String, Value>>()
-                            .map(|metadata| metadata.unwrap_or_default())
-                        {
+                        let mut metadata = match event.to_metadata::<HashMap<String, Value>>() {
                             Ok(metadata) => metadata,
                             Err(e) => {
                                 tracing::error!("{e}");

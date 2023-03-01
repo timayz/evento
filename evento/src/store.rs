@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use futures_util::FutureExt;
 use parking_lot::RwLock;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use sqlx::{PgPool, Postgres, QueryBuilder};
 use std::{
     cmp::Ordering,
@@ -95,11 +95,13 @@ impl Event {
     pub fn to_data<D: DeserializeOwned>(&self) -> Result<D, serde_json::Error> {
         serde_json::from_value(self.data.clone())
     }
-    pub fn to_metadata<D: DeserializeOwned>(&self) -> Result<Option<D>, serde_json::Error> {
-        match &self.metadata {
-            Some(metadata) => serde_json::from_value(metadata.clone()),
-            None => Ok(None),
-        }
+
+    pub fn to_metadata<D: DeserializeOwned>(&self) -> Result<D, serde_json::Error> {
+        serde_json::from_value(
+            self.metadata
+                .clone()
+                .unwrap_or(Value::Object(Map::default())),
+        )
     }
 }
 
@@ -260,10 +262,7 @@ impl Engine for MemoryEngine {
         for event in events.iter() {
             if let Some(filters) = &filters {
                 let metadata = match event.to_metadata::<HashMap<String, Value>>() {
-                    Ok(metadata) => match metadata {
-                        Some(metadata) => metadata,
-                        _ => continue,
-                    },
+                    Ok(m) => m,
                     Err(e) => return async move { Err(Error::SerdeJson(e.to_string())) }.boxed(),
                 };
 
