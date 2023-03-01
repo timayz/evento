@@ -13,7 +13,7 @@ use std::{
 };
 use uuid::Uuid;
 
-#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error, Clone)]
 pub enum Error {
     #[error("Unexpected original version while saving event")]
     UnexpectedOriginalVersion,
