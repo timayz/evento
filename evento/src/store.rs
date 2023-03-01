@@ -92,9 +92,9 @@ impl Event {
             return Ok(self);
         }
 
-        return Err(Error::Unknown(
+        Err(Error::Unknown(
             "Failed to serialize metadata, not an object".to_owned(),
-        ));
+        ))
     }
 
     pub fn to_data<D: DeserializeOwned>(&self) -> Result<D, serde_json::Error> {
