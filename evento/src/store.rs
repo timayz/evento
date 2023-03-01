@@ -83,13 +83,18 @@ impl Event {
         Ok(self)
     }
 
-    pub fn metadata<M: Serialize>(
-        mut self,
-        value: HashMap<String, M>,
-    ) -> Result<Self, serde_json::Error> {
-        self.metadata = Some(serde_json::to_value(&value)?);
+    pub fn metadata<M: Serialize>(mut self, value: M) -> Result<Self, Error> {
+        let metadata = serde_json::to_value(&value)?;
 
-        Ok(self)
+        if let Value::Object(_) = metadata {
+            self.metadata = Some(metadata);
+
+            return Ok(self);
+        }
+
+        Err(Error::Unknown(
+            "Failed to serialize metadata, not an object".to_owned(),
+        ))
     }
 
     pub fn to_data<D: DeserializeOwned>(&self) -> Result<D, serde_json::Error> {
