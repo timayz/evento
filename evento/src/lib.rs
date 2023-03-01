@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, QueryBuilder};
 use std::{
-    cmp::Ordering, collections::HashMap, future::Future, pin::Pin, sync::Arc, time::Duration,
+    cmp::Ordering, collections::HashMap, fmt, future::Future, pin::Pin, sync::Arc, time::Duration,
 };
 use store::{Engine as StoreEngine, EngineResult as StoreEngineResult};
 use tokio::time::{interval_at, sleep, Instant};
@@ -40,6 +40,12 @@ pub struct Subscription {
 pub struct SubscirberHandlerError {
     pub code: String,
     pub reason: String,
+}
+
+impl fmt::Display for SubscirberHandlerError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "code={},reason={}", self.code, self.reason)
+    }
 }
 
 impl From<serde_json::Error> for SubscirberHandlerError {
@@ -607,7 +613,11 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
         let name = self.name.to_owned();
 
         tokio::spawn(async move {
+            tracing::info!("{} is starting...", sub.key);
+
             sleep(delay).await;
+
+            tracing::info!("{} is starting", sub.key);
 
             let mut interval = interval_at(Instant::now(), Duration::from_secs(1));
 
@@ -699,6 +709,14 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
                         .iter()
                         .any(|filter| filter.get_matcher().is_match(&topic_name))
                     {
+                        tracing::debug!(
+                            "{:?} skiped event id={}, name={}, topic_name={}",
+                            &sub.key,
+                            &event.aggregate_id,
+                            &event.name,
+                            &topic_name.to_string()
+                        );
+
                         continue;
                     }
 
@@ -707,7 +725,16 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
                     let event_errors = results
                         .iter()
                         .filter_map(|res| match res {
-                            Err(e) => Some(e),
+                            Err(e) => {
+                                tracing::error!(
+                                    "{:?} failed to handle event id={}, name={}, error={}",
+                                    &sub.key,
+                                    &event.aggregate_id,
+                                    &event.name,
+                                    e
+                                );
+                                Some(e)
+                            }
                             _ => None,
                         })
                         .collect::<Vec<&SubscirberHandlerError>>();
@@ -744,6 +771,13 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
                             }
                         };
                     }
+
+                    tracing::debug!(
+                        "{:?} succeeded to handle event id={}, name={}",
+                        &sub.key,
+                        &event.aggregate_id,
+                        &event.name
+                    );
                 }
 
                 if !dead_events.is_empty() {
@@ -754,10 +788,7 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
 
                 let last_event_id = match events.last().map(|e| e.id) {
                     Some(cursor) => cursor,
-                    None => {
-                        tracing::debug!("No events found after {:?}", subscription.cursor);
-                        continue;
-                    }
+                    _ => continue,
                 };
 
                 subscription.cursor = Some(last_event_id);
