@@ -42,6 +42,51 @@ pub struct SubscirberHandlerError {
     pub reason: String,
 }
 
+impl From<serde_json::Error> for SubscirberHandlerError {
+    fn from(e: serde_json::Error) -> Self {
+        SubscirberHandlerError {
+            code: "serde_json".to_owned(),
+            reason: e.to_string(),
+        }
+    }
+}
+
+impl From<StoreError> for SubscirberHandlerError {
+    fn from(e: StoreError) -> Self {
+        SubscirberHandlerError {
+            code: "store".to_owned(),
+            reason: e.to_string(),
+        }
+    }
+}
+
+impl From<sqlx::Error> for SubscirberHandlerError {
+    fn from(e: sqlx::Error) -> Self {
+        SubscirberHandlerError {
+            code: "sqlx".to_owned(),
+            reason: e.to_string(),
+        }
+    }
+}
+
+impl From<uuid::Error> for SubscirberHandlerError {
+    fn from(e: uuid::Error) -> Self {
+        SubscirberHandlerError {
+            code: "uuid".to_owned(),
+            reason: e.to_string(),
+        }
+    }
+}
+
+impl From<parse_display::ParseError> for SubscirberHandlerError {
+    fn from(e: parse_display::ParseError) -> Self {
+        SubscirberHandlerError {
+            code: "uuid".to_owned(),
+            reason: e.to_string(),
+        }
+    }
+}
+
 type SubscirberHandler =
     fn(
         e: Event,
@@ -100,15 +145,14 @@ impl<S: StoreEngine + Send + Sync> Publisher<S> {
             let name = match store.get::<A, _>(&id).await? {
                 Some(event) => event
                     .to_metadata::<HashMap<String, Value>>()?
-                    .and_then(|metadata| metadata.get("_evento_name").cloned()),
+                    .get("_evento_name")
+                    .cloned(),
                 _ => name.map(Value::String),
             };
 
             let mut updated_events = Vec::new();
             for event in events.iter() {
-                let mut metadata = event
-                    .to_metadata::<HashMap<String, Value>>()
-                    .map(|metadata| metadata.unwrap_or_default())?;
+                let mut metadata = event.to_metadata::<HashMap<String, Value>>()?;
 
                 if let Some(name) = &name {
                     metadata.insert("_evento_name".to_owned(), name.clone());
@@ -669,10 +713,7 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
                         .collect::<Vec<&SubscirberHandlerError>>();
 
                     if !event_errors.is_empty() {
-                        let mut metadata = match event
-                            .to_metadata::<HashMap<String, Value>>()
-                            .map(|metadata| metadata.unwrap_or_default())
-                        {
+                        let mut metadata = match event.to_metadata::<HashMap<String, Value>>() {
                             Ok(metadata) => metadata,
                             Err(e) => {
                                 tracing::error!("{e}");
@@ -690,6 +731,10 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
                             }
                         };
 
+                        metadata.insert(
+                            "_evento_subscription_key".to_owned(),
+                            Value::String(sub.key.to_owned()),
+                        );
                         metadata.insert("_evento_errors".to_owned(), event_errors);
 
                         match event.clone().metadata(metadata) {

@@ -1,19 +1,13 @@
 use actix::prelude::*;
-use actix_web::HttpResponse;
+use actix_web::{http::StatusCode, HttpResponse, HttpResponseBuilder, ResponseError};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use validator::ValidationErrors;
 
 use crate::{Aggregate, Event, Publisher, StoreEngine, StoreError};
 
-#[derive(thiserror::Error, Debug)]
+#[derive(thiserror::Error, Debug, Clone)]
 pub enum CommandError {
-    #[error("internal server error")]
-    SerdeJson(serde_json::Error),
-
-    #[error("internal server error")]
-    Evento(StoreError),
-
     #[error("{0}")]
     ValidationErrors(ValidationErrors),
 
@@ -27,9 +21,38 @@ pub enum CommandError {
     InternalServerErr(String),
 }
 
+impl CommandError {
+    pub fn into_response(self) -> Result<HttpResponse, Self> {
+        Err(self)
+    }
+}
+
+impl ResponseError for CommandError {
+    fn status_code(&self) -> StatusCode {
+        match *self {
+            CommandError::InternalServerErr(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            CommandError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            CommandError::NotFound(_, _) => StatusCode::NOT_FOUND,
+            CommandError::ValidationErrors(_) => StatusCode::BAD_REQUEST,
+        }
+    }
+
+    fn error_response(&self) -> HttpResponse {
+        let mut res = HttpResponseBuilder::new(self.status_code());
+
+        if let CommandError::InternalServerErr(e) = self {
+            tracing::error!("{}", e);
+        }
+
+        res.json(
+            serde_json::json!({"code": self.status_code().as_u16(), "message": self.to_string()}),
+        )
+    }
+}
+
 impl From<serde_json::Error> for CommandError {
     fn from(e: serde_json::Error) -> Self {
-        CommandError::SerdeJson(e)
+        CommandError::InternalServerErr(e.to_string())
     }
 }
 
@@ -41,7 +64,7 @@ impl From<ValidationErrors> for CommandError {
 
 impl From<StoreError> for CommandError {
     fn from(e: StoreError) -> Self {
-        CommandError::Evento(e)
+        CommandError::InternalServerErr(e.to_string())
     }
 }
 
@@ -92,38 +115,10 @@ impl CommandResponse {
         let info = match &self.0 {
             Ok(res) => match res {
                 Ok(event) => event,
-                Err(e) => {
-                    return match e {
-                        CommandError::NotFound(_, _) => HttpResponse::NotFound().json(json!({
-                            "code": "not_found",
-                            "reason": e.to_string()
-                        })),
-                        CommandError::ValidationErrors(errors) => {
-                            HttpResponse::BadRequest().json(json!({
-                                "code": "validation_errors",
-                                "errors": errors
-                            }))
-                        }
-                        CommandError::BadRequest(_) => HttpResponse::BadRequest().json(json!({
-                            "code": "validation_errors",
-                            "reason": e.to_string()
-                        })),
-                        _ => {
-                            tracing::error!("{}", e);
-
-                            HttpResponse::InternalServerError().json(json!({
-                                "code": "internal_server_error",
-                                "reason": e.to_string()
-                            }))
-                        }
-                    }
-                }
+                Err(e) => return HttpResponse::from_error(e.clone()),
             },
             Err(e) => {
-                return HttpResponse::InternalServerError().json(json!({
-                    "code": "internal_server_error",
-                    "reason": e.to_string()
-                }))
+                return HttpResponse::from_error(CommandError::InternalServerErr(e.to_string()))
             }
         };
 
@@ -139,10 +134,7 @@ impl CommandResponse {
             Ok(_) => HttpResponse::Ok().json(json!({
                 "id": info.aggregate_id
             })),
-            Err(e) => HttpResponse::InternalServerError().json(json!({
-                "code": "internal_server_error",
-                "reason": e.to_string()
-            })),
+            Err(e) => HttpResponse::from_error(Into::<CommandError>::into(e)),
         }
     }
 }
