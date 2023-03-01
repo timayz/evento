@@ -22,6 +22,9 @@ pub enum CommandError {
 
     #[error("{0}")]
     BadRequest(String),
+
+    #[error("internal server error")]
+    InternalServerErr(String),
 }
 
 impl From<serde_json::Error> for CommandError {
@@ -39,6 +42,24 @@ impl From<ValidationErrors> for CommandError {
 impl From<StoreError> for CommandError {
     fn from(e: StoreError) -> Self {
         CommandError::Evento(e)
+    }
+}
+
+impl From<sqlx::Error> for CommandError {
+    fn from(e: sqlx::Error) -> Self {
+        CommandError::InternalServerErr(e.to_string())
+    }
+}
+
+impl From<uuid::Error> for CommandError {
+    fn from(e: uuid::Error) -> Self {
+        CommandError::InternalServerErr(e.to_string())
+    }
+}
+
+impl From<actix::MailboxError> for CommandError {
+    fn from(e: actix::MailboxError) -> Self {
+        CommandError::InternalServerErr(e.to_string())
     }
 }
 
@@ -87,10 +108,14 @@ impl CommandResponse {
                             "code": "validation_errors",
                             "reason": e.to_string()
                         })),
-                        _ => HttpResponse::InternalServerError().json(json!({
-                            "code": "internal_server_error",
-                            "reason": e.to_string()
-                        })),
+                        _ => {
+                            tracing::error!("{}", e);
+
+                            HttpResponse::InternalServerError().json(json!({
+                                "code": "internal_server_error",
+                                "reason": e.to_string()
+                            }))
+                        }
                     }
                 }
             },
