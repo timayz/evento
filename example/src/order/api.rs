@@ -1,6 +1,6 @@
 use actix_web::{delete, post, put, web, HttpResponse, Scope};
+use evento::CommandResponse;
 
-use crate::command::CommandResponse;
 use crate::AppState;
 
 use super::aggregate::Order;
@@ -12,7 +12,7 @@ use super::command::{
 #[post("/place")]
 async fn place(data: web::Data<AppState>, input: web::Json<PlaceCommand>) -> HttpResponse {
     CommandResponse(data.cmd.send(input.0).await)
-        .to_response::<Order>(&data.publisher)
+        .to_response::<Order, _>(&data.publisher)
         .await
 }
 
@@ -22,7 +22,7 @@ async fn add_product(
     input: web::Json<AddProductCommand>,
 ) -> HttpResponse {
     CommandResponse(data.cmd.send(input.0).await)
-        .to_response::<Order>(&data.publisher)
+        .to_response::<Order, _>(&data.publisher)
         .await
 }
 
@@ -32,7 +32,7 @@ async fn remove_product(
     input: web::Json<RemoveProductCommand>,
 ) -> HttpResponse {
     CommandResponse(data.cmd.send(input.0).await)
-        .to_response::<Order>(&data.publisher)
+        .to_response::<Order, _>(&data.publisher)
         .await
 }
 
@@ -42,7 +42,7 @@ async fn update_product_quantity(
     input: web::Json<UpdateProductQuantityCommand>,
 ) -> HttpResponse {
     CommandResponse(data.cmd.send(input.0).await)
-        .to_response::<Order>(&data.publisher)
+        .to_response::<Order, _>(&data.publisher)
         .await
 }
 
@@ -52,28 +52,28 @@ async fn update_shipping_info(
     input: web::Json<UpdateShippingInfoCommand>,
 ) -> HttpResponse {
     CommandResponse(data.cmd.send(input.0).await)
-        .to_response::<Order>(&data.publisher)
+        .to_response::<Order, _>(&data.publisher)
         .await
 }
 
 #[post("/pay")]
 async fn pay(data: web::Data<AppState>, input: web::Json<PayCommand>) -> HttpResponse {
     CommandResponse(data.cmd.send(input.0).await)
-        .to_response::<Order>(&data.publisher)
+        .to_response::<Order, _>(&data.publisher)
         .await
 }
 
 #[delete("/delete")]
 async fn delete(data: web::Data<AppState>, input: web::Json<DeleteCommand>) -> HttpResponse {
     CommandResponse(data.cmd.send(input.0).await)
-        .to_response::<Order>(&data.publisher)
+        .to_response::<Order, _>(&data.publisher)
         .await
 }
 
 #[delete("/cancel")]
 async fn cancel(data: web::Data<AppState>, input: web::Json<CancelCommand>) -> HttpResponse {
     CommandResponse(data.cmd.send(input.0).await)
-        .to_response::<Order>(&data.publisher)
+        .to_response::<Order, _>(&data.publisher)
         .await
 }
 

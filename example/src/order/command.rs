@@ -1,10 +1,10 @@
 use actix::{ActorFutureExt, Context, Handler, Message, ResponseActFuture, WrapFuture};
-use evento::{Event, Evento};
+use evento::{CommandInfo, CommandResult, CommandError, Event, Evento};
 use nanoid::nanoid;
 use serde::Deserialize;
 use validator::Validate;
 
-use crate::command::{Command, CommandInfo, CommandResult, Error};
+use crate::command::Command;
 
 use super::{
     aggregate::{Order, Product, Status},
@@ -17,14 +17,14 @@ use super::{
 pub async fn load_order(
     store: &Evento<evento::PgEngine, evento::store::PgEngine>,
     id: &str,
-) -> Result<(Order, Event), Error> {
+) -> Result<(Order, Event), CommandError> {
     let (order, e) = match store.load::<Order, _>(id).await? {
         Some(order) => order,
-        _ => return Err(Error::NotFound("order".to_owned(), id.to_owned())),
+        _ => return Err(CommandError::NotFound("order".to_owned(), id.to_owned())),
     };
 
     if order.status == Status::Canceled || order.status == Status::Deleted {
-        return Err(Error::NotFound("order".to_owned(), id.to_owned()));
+        return Err(CommandError::NotFound("order".to_owned(), id.to_owned()));
     }
 
     Ok((order, e))
@@ -81,7 +81,7 @@ impl Handler<AddProductCommand> for Command {
             let (order, e) = load_order(&store, &msg.id).await?;
 
             if order.status != Status::Draft {
-                return Err(Error::BadRequest("order status must be `draft`".to_owned()));
+                return Err(CommandError::BadRequest("order status must be `draft`".to_owned()));
             }
 
             msg.product.validate()?;
@@ -114,11 +114,11 @@ impl Handler<RemoveProductCommand> for Command {
             let (order, e) = load_order(&store, &msg.id).await?;
 
             if order.status != Status::Draft {
-                return Err(Error::BadRequest("order status must be `draft`".to_owned()));
+                return Err(CommandError::BadRequest("order status must be `draft`".to_owned()));
             }
 
             if !order.products.contains_key(&msg.product_id) {
-                return Err(Error::NotFound(
+                return Err(CommandError::NotFound(
                     "product".to_owned(),
                     msg.product_id.to_owned(),
                 ));
@@ -156,11 +156,11 @@ impl Handler<UpdateProductQuantityCommand> for Command {
             let (order, e) = load_order(&store, &msg.id).await?;
 
             if order.status != Status::Draft {
-                return Err(Error::BadRequest("order status must be `draft`".to_owned()));
+                return Err(CommandError::BadRequest("order status must be `draft`".to_owned()));
             }
 
             if !order.products.contains_key(&msg.product.id) {
-                return Err(Error::NotFound(
+                return Err(CommandError::NotFound(
                     "product".to_owned(),
                     msg.product.id.to_owned(),
                 ));
@@ -196,11 +196,11 @@ impl Handler<UpdateShippingInfoCommand> for Command {
             let (order, e) = load_order(&store, &msg.id).await?;
 
             if order.status != Status::Draft {
-                return Err(Error::BadRequest("order status must be `draft`".to_owned()));
+                return Err(CommandError::BadRequest("order status must be `draft`".to_owned()));
             }
 
             if order.shipping_address == msg.address {
-                return Err(Error::BadRequest(format!(
+                return Err(CommandError::BadRequest(format!(
                     "address `{}` not changed",
                     msg.address
                 )));
@@ -235,17 +235,17 @@ impl Handler<PayCommand> for Command {
             let (order, e) = load_order(&store, &msg.id).await?;
 
             if order.status != Status::Draft {
-                return Err(Error::BadRequest("order status must be `draft`".to_owned()));
+                return Err(CommandError::BadRequest("order status must be `draft`".to_owned()));
             }
 
             if order.shipping_address.is_empty() {
-                return Err(Error::BadRequest(
+                return Err(CommandError::BadRequest(
                     "order shipping address must not be empty".to_owned(),
                 ));
             }
 
             if order.products.is_empty() {
-                return Err(Error::BadRequest(
+                return Err(CommandError::BadRequest(
                     "order products must not be empty".to_owned(),
                 ));
             }
@@ -277,7 +277,7 @@ impl Handler<DeleteCommand> for Command {
             let (order, e) = load_order(&store, &msg.id).await?;
 
             if order.status != Status::Draft {
-                return Err(Error::BadRequest("order status must be `draft`".to_owned()));
+                return Err(CommandError::BadRequest("order status must be `draft`".to_owned()));
             }
 
             Ok(Event::new(OrderEvent::Deleted)
@@ -307,7 +307,7 @@ impl Handler<CancelCommand> for Command {
             let (order, e) = load_order(&store, &msg.id).await?;
 
             if order.status != Status::Pending {
-                return Err(Error::BadRequest(
+                return Err(CommandError::BadRequest(
                     "order status must be `pending`".to_owned(),
                 ));
             }
