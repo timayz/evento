@@ -1,5 +1,5 @@
 use actix::{ActorFutureExt, Context, Handler, Message, ResponseActFuture, WrapFuture};
-use evento::{CommandError, Event, Evento, CommandResult};
+use evento::{CommandError, CommandResult, Event, Evento};
 use nanoid::nanoid;
 use serde::Deserialize;
 use validator::Validate;
