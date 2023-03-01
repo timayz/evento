@@ -78,6 +78,15 @@ impl From<uuid::Error> for SubscirberHandlerError {
     }
 }
 
+impl From<parse_display::ParseError> for SubscirberHandlerError {
+    fn from(e: parse_display::ParseError) -> Self {
+        SubscirberHandlerError {
+            code: "uuid".to_owned(),
+            reason: e.to_string(),
+        }
+    }
+}
+
 type SubscirberHandler =
     fn(
         e: Event,
