@@ -18,7 +18,7 @@ nanoid = "0.4.0"
 thiserror = "1.0.38"
 futures = "0.3.26"
 validator = { version = "0.16.0", features = ["derive"] }
-evento = { path = "../evento" }
+evento = { path = "../evento", features = ["actix-web"] }
 
 [dependencies.uuid]
 version = "1.3.0"

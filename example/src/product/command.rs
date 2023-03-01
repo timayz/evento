@@ -1,10 +1,10 @@
 use actix::{ActorFutureExt, Context, Handler, Message, ResponseActFuture, WrapFuture};
-use evento::{Event, Evento};
+use evento::{CommandError, CommandResult, Event, Evento};
 use nanoid::nanoid;
 use serde::Deserialize;
 use validator::Validate;
 
-use crate::command::{Command, CommandResult, Error};
+use crate::command::Command;
 
 use super::{
     aggregate::Product,
@@ -17,14 +17,14 @@ use super::{
 pub async fn load_product(
     store: &Evento<evento::PgEngine, evento::store::PgEngine>,
     id: &str,
-) -> Result<(Product, Event), Error> {
+) -> Result<(Product, Event), CommandError> {
     let (product, e) = match store.load::<Product, _>(id).await? {
         Some(product) => product,
-        _ => return Err(Error::NotFound("product".to_owned(), id.to_owned())),
+        _ => return Err(CommandError::NotFound("product".to_owned(), id.to_owned())),
     };
 
     if product.deleted {
-        return Err(Error::NotFound("product".to_owned(), id.to_owned()));
+        return Err(CommandError::NotFound("product".to_owned(), id.to_owned()));
     }
 
     Ok((product, e))
@@ -103,7 +103,7 @@ impl Handler<UpdateQuantityCommand> for Command {
             let (product, e) = load_product(&store, &msg.id).await?;
 
             if product.quantity == msg.quantity {
-                return Err(Error::BadRequest(format!(
+                return Err(CommandError::BadRequest(format!(
                     "product.quantity already `{}`",
                     msg.quantity
                 )));
@@ -139,7 +139,7 @@ impl Handler<UpdateVisibilityCommand> for Command {
             let (product, e) = load_product(&store, &msg.id).await?;
 
             if product.visible == msg.visible {
-                return Err(Error::BadRequest(format!(
+                return Err(CommandError::BadRequest(format!(
                     "product.visible already `{}`",
                     msg.visible
                 )));
@@ -178,7 +178,7 @@ impl Handler<UpdateDescriptionCommand> for Command {
             let (product, e) = load_product(&store, &msg.id).await?;
 
             if product.description == msg.description {
-                return Err(Error::BadRequest(format!(
+                return Err(CommandError::BadRequest(format!(
                     "product.description already `{}`",
                     msg.description
                 )));

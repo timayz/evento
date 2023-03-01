@@ -1,8 +1,12 @@
 pub mod store;
 
+#[cfg(feature = "actix-web")]
+mod command;
 mod context;
 mod data;
 
+#[cfg(feature = "actix-web")]
+pub use command::{CommandError, CommandInfo, CommandResponse, CommandResult};
 pub use context::Context;
 pub use data::Data;
 pub use store::{Aggregate, Error as StoreError, Event, EventStore};
