@@ -7,20 +7,15 @@ use evento::Aggregate;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-#[derive(Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum Status {
+    #[default]
     Draft,
     Pending,
     Shipping,
     Delivered,
     Canceled,
     Deleted,
-}
-
-impl Default for Status {
-    fn default() -> Self {
-        Status::Draft
-    }
 }
 
 #[derive(Default, Serialize, Deserialize, Eq, Validate)]
