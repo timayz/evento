@@ -6,7 +6,7 @@ mod context;
 mod data;
 
 #[cfg(feature = "actix-web")]
-pub use command::{CommandError, CommandInfo, CommandResponse, CommandResult};
+pub use command::{CommandError, CommandResponse, CommandResult};
 pub use context::Context;
 pub use data::Data;
 pub use store::{Aggregate, Error as StoreError, Event, EventStore};
@@ -130,13 +130,15 @@ impl Subscriber {
     }
 }
 
+pub type PgProducer = Producer<crate::store::PgEngine>;
+
 #[derive(Clone)]
-pub struct Publisher<S: StoreEngine + Send + Sync> {
+pub struct Producer<S: StoreEngine + Send + Sync> {
     name: Option<String>,
     store: EventStore<S>,
 }
 
-impl<S: StoreEngine + Send + Sync> Publisher<S> {
+impl<S: StoreEngine + Send + Sync> Producer<S> {
     pub fn publish<A: Aggregate, I: Into<String>>(
         &self,
         id: I,
@@ -336,7 +338,7 @@ impl Engine for MemoryEngine {
 pub struct PgEngine(PgPool);
 
 impl PgEngine {
-    pub fn new(pool: PgPool) -> Evento<Self, store::PgEngine> {
+    pub fn new(pool: PgPool) -> PgEvento {
         Evento::new(Self(pool.clone()), store::PgEngine::new(pool))
     }
 }
@@ -510,6 +512,8 @@ impl Engine for PgEngine {
     }
 }
 
+pub type PgEvento = Evento<PgEngine, crate::store::PgEngine>;
+
 struct EventoContextName(Option<String>);
 
 #[derive(Clone, Default)]
@@ -573,11 +577,11 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
         self.store.load(id)
     }
 
-    pub async fn run(&self) -> Result<Publisher<S>, StoreError> {
+    pub async fn run(&self) -> Result<Producer<S>, StoreError> {
         self.run_with_delay(Duration::from_secs(30)).await
     }
 
-    pub async fn run_with_delay(&self, delay: Duration) -> Result<Publisher<S>, StoreError> {
+    pub async fn run_with_delay(&self, delay: Duration) -> Result<Producer<S>, StoreError> {
         let futures = self
             .subscribers
             .keys()
@@ -599,7 +603,7 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
 
         join_all(futures).await;
 
-        Ok(Publisher {
+        Ok(Producer {
             name: self.name.to_owned(),
             store: self.store.clone(),
         })

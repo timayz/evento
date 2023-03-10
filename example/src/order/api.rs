@@ -3,7 +3,6 @@ use evento::CommandResponse;
 
 use crate::AppState;
 
-use super::aggregate::Order;
 use super::command::{
     AddProductCommand, CancelCommand, DeleteCommand, PayCommand, PlaceCommand,
     RemoveProductCommand, UpdateProductQuantityCommand, UpdateShippingInfoCommand,
@@ -11,9 +10,7 @@ use super::command::{
 
 #[post("/place")]
 async fn place(data: web::Data<AppState>, input: web::Json<PlaceCommand>) -> HttpResponse {
-    CommandResponse(data.cmd.send(input.0).await)
-        .to_response::<Order, _>(&data.publisher)
-        .await
+    CommandResponse(data.cmd.send(input.0).await).into()
 }
 
 #[post("/add-product")]
@@ -21,9 +18,7 @@ async fn add_product(
     data: web::Data<AppState>,
     input: web::Json<AddProductCommand>,
 ) -> HttpResponse {
-    CommandResponse(data.cmd.send(input.0).await)
-        .to_response::<Order, _>(&data.publisher)
-        .await
+    CommandResponse(data.cmd.send(input.0).await).into()
 }
 
 #[delete("/remove-product")]
@@ -31,9 +26,7 @@ async fn remove_product(
     data: web::Data<AppState>,
     input: web::Json<RemoveProductCommand>,
 ) -> HttpResponse {
-    CommandResponse(data.cmd.send(input.0).await)
-        .to_response::<Order, _>(&data.publisher)
-        .await
+    CommandResponse(data.cmd.send(input.0).await).into()
 }
 
 #[put("/update-product-quantity")]
@@ -41,9 +34,7 @@ async fn update_product_quantity(
     data: web::Data<AppState>,
     input: web::Json<UpdateProductQuantityCommand>,
 ) -> HttpResponse {
-    CommandResponse(data.cmd.send(input.0).await)
-        .to_response::<Order, _>(&data.publisher)
-        .await
+    CommandResponse(data.cmd.send(input.0).await).into()
 }
 
 #[put("/update-shipping-info")]
@@ -51,30 +42,22 @@ async fn update_shipping_info(
     data: web::Data<AppState>,
     input: web::Json<UpdateShippingInfoCommand>,
 ) -> HttpResponse {
-    CommandResponse(data.cmd.send(input.0).await)
-        .to_response::<Order, _>(&data.publisher)
-        .await
+    CommandResponse(data.cmd.send(input.0).await).into()
 }
 
 #[post("/pay")]
 async fn pay(data: web::Data<AppState>, input: web::Json<PayCommand>) -> HttpResponse {
-    CommandResponse(data.cmd.send(input.0).await)
-        .to_response::<Order, _>(&data.publisher)
-        .await
+    CommandResponse(data.cmd.send(input.0).await).into()
 }
 
 #[delete("/delete")]
 async fn delete(data: web::Data<AppState>, input: web::Json<DeleteCommand>) -> HttpResponse {
-    CommandResponse(data.cmd.send(input.0).await)
-        .to_response::<Order, _>(&data.publisher)
-        .await
+    CommandResponse(data.cmd.send(input.0).await).into()
 }
 
 #[delete("/cancel")]
 async fn cancel(data: web::Data<AppState>, input: web::Json<CancelCommand>) -> HttpResponse {
-    CommandResponse(data.cmd.send(input.0).await)
-        .to_response::<Order, _>(&data.publisher)
-        .await
+    CommandResponse(data.cmd.send(input.0).await).into()
 }
 
 pub fn scope() -> Scope {

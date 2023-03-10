@@ -1,6 +1,7 @@
 use evento::store::{Engine as StoreEngine, MemoryEngine as StoreMemoryEngine};
 use evento::{
-    Aggregate, Engine, Event, Evento, MemoryEngine, PgEngine, SubscirberHandlerError, Subscriber,
+    Aggregate, Engine, Event, Evento, MemoryEngine, PgEngine, PgEvento, SubscirberHandlerError,
+    Subscriber,
 };
 use futures_util::FutureExt;
 use serde_json::json;
@@ -523,7 +524,7 @@ async fn deadletter<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + S
     );
 }
 
-async fn create_pg_store(db_name: &str, reset: bool) -> Evento<PgEngine, evento::store::PgEngine> {
+async fn create_pg_store(db_name: &str, reset: bool) -> PgEvento {
     if reset {
         let pool = PgPool::connect("postgres://postgres:postgres@localhost:5432/postgres")
             .await

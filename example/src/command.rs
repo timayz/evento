@@ -1,13 +1,14 @@
 use actix::{Actor, Context};
-use evento::{Evento, PgEngine};
+use evento::{PgEvento, PgProducer};
 
 pub struct Command {
-    pub store: Evento<PgEngine, evento::store::PgEngine>,
+    pub evento: PgEvento,
+    pub producer: PgProducer,
 }
 
 impl Command {
-    pub fn new(store: Evento<PgEngine, evento::store::PgEngine>) -> Self {
-        Self { store }
+    pub fn new(evento: PgEvento, producer: PgProducer) -> Self {
+        Self { evento, producer }
     }
 }
 

@@ -42,15 +42,21 @@ impl Handler<CreateCommand> for Command {
     type Result = ResponseActFuture<Self, CommandResult>;
 
     fn handle(&mut self, msg: CreateCommand, _ctx: &mut Context<Self>) -> Self::Result {
+        let producer = self.producer.clone();
+
         async move {
             msg.validate()?;
 
             let id = nanoid!();
-            Ok(Event::new(ProductEvent::Created)
-                .aggregate_id(id)
-                .version(0)
-                .data(Created { name: msg.name })?
-                .into())
+
+            producer
+                .publish::<Product, _>(
+                    &id,
+                    vec![Event::new(ProductEvent::Created).data(Created { name: msg.name })?],
+                    0,
+                )
+                .await?;
+            Ok(id)
         }
         .into_actor(self)
         .boxed_local()
@@ -67,16 +73,21 @@ impl Handler<DeleteCommand> for Command {
     type Result = ResponseActFuture<Self, CommandResult>;
 
     fn handle(&mut self, msg: DeleteCommand, _ctx: &mut Context<Self>) -> Self::Result {
-        let store = self.store.clone();
+        let evento = self.evento.clone();
+        let producer = self.producer.clone();
 
         async move {
-            let (_, e) = load_product(&store, &msg.id).await?;
+            let (_, e) = load_product(&evento, &msg.id).await?;
 
-            Ok(Event::new(ProductEvent::Deleted)
-                .aggregate_id(&msg.id)
-                .version(e.version)
-                .data(Deleted { deleted: true })?
-                .into())
+            producer
+                .publish::<Product, _>(
+                    &msg.id,
+                    vec![Event::new(ProductEvent::Deleted).data(Deleted { deleted: true })?],
+                    e.version,
+                )
+                .await?;
+
+            Ok(msg.id)
         }
         .into_actor(self)
         .boxed_local()
@@ -95,12 +106,13 @@ impl Handler<UpdateQuantityCommand> for Command {
     type Result = ResponseActFuture<Self, CommandResult>;
 
     fn handle(&mut self, msg: UpdateQuantityCommand, _ctx: &mut Context<Self>) -> Self::Result {
-        let store = self.store.clone();
+        let evento = self.evento.clone();
+        let producer = self.producer.clone();
 
         async move {
             msg.validate()?;
 
-            let (product, e) = load_product(&store, &msg.id).await?;
+            let (product, e) = load_product(&evento, &msg.id).await?;
 
             if product.quantity == msg.quantity {
                 return Err(CommandError::BadRequest(format!(
@@ -109,13 +121,19 @@ impl Handler<UpdateQuantityCommand> for Command {
                 )));
             }
 
-            Ok(Event::new(ProductEvent::QuantityUpdated)
-                .aggregate_id(&msg.id)
-                .version(e.version)
-                .data(QuantityUpdated {
-                    quantity: msg.quantity,
-                })?
-                .into())
+            producer
+                .publish::<Product, _>(
+                    &msg.id,
+                    vec![
+                        Event::new(ProductEvent::QuantityUpdated).data(QuantityUpdated {
+                            quantity: msg.quantity,
+                        })?,
+                    ],
+                    e.version,
+                )
+                .await?;
+
+            Ok(msg.id)
         }
         .into_actor(self)
         .boxed_local()
@@ -133,10 +151,11 @@ impl Handler<UpdateVisibilityCommand> for Command {
     type Result = ResponseActFuture<Self, CommandResult>;
 
     fn handle(&mut self, msg: UpdateVisibilityCommand, _ctx: &mut Context<Self>) -> Self::Result {
-        let store = self.store.clone();
+        let evento = self.evento.clone();
+        let producer = self.producer.clone();
 
         async move {
-            let (product, e) = load_product(&store, &msg.id).await?;
+            let (product, e) = load_product(&evento, &msg.id).await?;
 
             if product.visible == msg.visible {
                 return Err(CommandError::BadRequest(format!(
@@ -145,13 +164,19 @@ impl Handler<UpdateVisibilityCommand> for Command {
                 )));
             }
 
-            Ok(Event::new(ProductEvent::VisibilityUpdated)
-                .aggregate_id(&msg.id)
-                .version(e.version)
-                .data(VisibilityUpdated {
-                    visible: msg.visible,
-                })?
-                .into())
+            producer
+                .publish::<Product, _>(
+                    &msg.id,
+                    vec![
+                        Event::new(ProductEvent::VisibilityUpdated).data(VisibilityUpdated {
+                            visible: msg.visible,
+                        })?,
+                    ],
+                    e.version,
+                )
+                .await?;
+
+            Ok(msg.id)
         }
         .into_actor(self)
         .boxed_local()
@@ -170,12 +195,13 @@ impl Handler<UpdateDescriptionCommand> for Command {
     type Result = ResponseActFuture<Self, CommandResult>;
 
     fn handle(&mut self, msg: UpdateDescriptionCommand, _ctx: &mut Context<Self>) -> Self::Result {
-        let store = self.store.clone();
+        let evento = self.evento.clone();
+        let producer = self.producer.clone();
 
         async move {
             msg.validate()?;
 
-            let (product, e) = load_product(&store, &msg.id).await?;
+            let (product, e) = load_product(&evento, &msg.id).await?;
 
             if product.description == msg.description {
                 return Err(CommandError::BadRequest(format!(
@@ -184,13 +210,18 @@ impl Handler<UpdateDescriptionCommand> for Command {
                 )));
             }
 
-            Ok(Event::new(ProductEvent::DescriptionUpdated)
-                .aggregate_id(&msg.id)
-                .version(e.version)
-                .data(DescriptionUpdated {
-                    description: msg.description,
-                })?
-                .into())
+            producer
+                .publish::<Product, _>(
+                    &msg.id,
+                    vec![Event::new(ProductEvent::DescriptionUpdated).data(
+                        DescriptionUpdated {
+                            description: msg.description,
+                        },
+                    )?],
+                    e.version,
+                )
+                .await?;
+            Ok(msg.id)
         }
         .into_actor(self)
         .boxed_local()
@@ -211,21 +242,25 @@ impl Handler<AddReviewCommand> for Command {
     type Result = ResponseActFuture<Self, CommandResult>;
 
     fn handle(&mut self, msg: AddReviewCommand, _ctx: &mut Context<Self>) -> Self::Result {
-        let store = self.store.clone();
+        let evento = self.evento.clone();
+        let producer = self.producer.clone();
 
         async move {
             msg.validate()?;
 
-            let (_, e) = load_product(&store, &msg.id).await?;
+            let (_, e) = load_product(&evento, &msg.id).await?;
 
-            Ok(Event::new(ProductEvent::ReviewAdded)
-                .aggregate_id(&msg.id)
-                .version(e.version)
-                .data(ReviewAdded {
-                    note: msg.note,
-                    message: msg.message,
-                })?
-                .into())
+            producer
+                .publish::<Product, _>(
+                    &msg.id,
+                    vec![Event::new(ProductEvent::ReviewAdded).data(ReviewAdded {
+                        note: msg.note,
+                        message: msg.message,
+                    })?],
+                    e.version,
+                )
+                .await?;
+            Ok(msg.id)
         }
         .into_actor(self)
         .boxed_local()

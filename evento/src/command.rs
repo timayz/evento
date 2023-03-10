@@ -1,10 +1,9 @@
 use actix::prelude::*;
 use actix_web::{http::StatusCode, HttpResponse, HttpResponseBuilder, ResponseError};
-use serde::{Deserialize, Serialize};
 use serde_json::json;
 use validator::ValidationErrors;
 
-use crate::{Aggregate, Event, Publisher, StoreEngine, StoreError};
+use crate::StoreError;
 
 #[derive(thiserror::Error, Debug, Clone)]
 pub enum CommandError {
@@ -19,12 +18,6 @@ pub enum CommandError {
 
     #[error("internal server error")]
     InternalServerErr(String),
-}
-
-impl CommandError {
-    pub fn into_response(self) -> Result<HttpResponse, Self> {
-        Err(self)
-    }
 }
 
 impl ResponseError for CommandError {
@@ -86,55 +79,18 @@ impl From<actix::MailboxError> for CommandError {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-pub struct CommandInfo {
-    pub aggregate_id: String,
-    pub original_version: i32,
-    pub events: Vec<Event>,
-}
-
-impl From<Event> for CommandInfo {
-    fn from(e: Event) -> Self {
-        Self {
-            aggregate_id: e.aggregate_id.to_owned(),
-            original_version: e.version,
-            events: vec![e],
-        }
-    }
-}
-
-pub type CommandResult = Result<CommandInfo, CommandError>;
+pub type CommandResult = Result<String, CommandError>;
 
 pub struct CommandResponse(pub Result<CommandResult, MailboxError>);
 
-impl CommandResponse {
-    pub async fn to_response<A: Aggregate, S: StoreEngine + Send + Sync + 'static>(
-        &self,
-        publisher: &Publisher<S>,
-    ) -> HttpResponse {
-        let info = match &self.0 {
+impl From<CommandResponse> for HttpResponse {
+    fn from(value: CommandResponse) -> Self {
+        match &value.0 {
             Ok(res) => match res {
-                Ok(event) => event,
-                Err(e) => return HttpResponse::from_error(e.clone()),
+                Ok(aggregate_id) => HttpResponse::Ok().json(json!({ "id": aggregate_id })),
+                Err(e) => HttpResponse::from_error(e.clone()),
             },
-            Err(e) => {
-                return HttpResponse::from_error(CommandError::InternalServerErr(e.to_string()))
-            }
-        };
-
-        let res = publisher
-            .publish::<A, _>(
-                &info.aggregate_id,
-                info.events.clone(),
-                info.original_version,
-            )
-            .await;
-
-        match res {
-            Ok(_) => HttpResponse::Ok().json(json!({
-                "id": info.aggregate_id
-            })),
-            Err(e) => HttpResponse::from_error(Into::<CommandError>::into(e)),
+            Err(e) => HttpResponse::from_error(CommandError::InternalServerErr(e.to_string())),
         }
     }
 }

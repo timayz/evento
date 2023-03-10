@@ -5,13 +5,12 @@ mod product;
 use actix::{Actor, Addr};
 use actix_web::{web, App, HttpServer};
 use command::Command;
-use evento::{PgEngine, Publisher};
+use evento::PgEngine;
 use mongodb::{options::ClientOptions, Client};
 use sqlx::{Executor, PgPool};
 
 pub struct AppState {
     pub cmd: Addr<Command>,
-    pub publisher: Publisher<evento::store::PgEngine>,
 }
 
 #[actix_web::main] // or #[tokio::main]
@@ -26,23 +25,18 @@ async fn main() -> std::io::Result<()> {
         .map(|client| client.database("evento_example"))
         .unwrap();
 
-    let store = PgEngine::new(pool);
-    let cmd = Command::new(store.clone()).start();
-    let publisher = store
+    let evento = PgEngine::new(pool)
         .name("example")
         .data(read_db)
         .subscribe(order::subscribe())
-        .subscribe(product::subscribe())
-        .run()
-        .await
-        .unwrap();
+        .subscribe(product::subscribe());
+
+    let producer = evento.run().await.unwrap();
+    let cmd = Command::new(evento, producer).start();
 
     HttpServer::new(move || {
         App::new()
-            .app_data(web::Data::<AppState>::new(AppState {
-                cmd: cmd.clone(),
-                publisher: publisher.clone(),
-            }))
+            .app_data(web::Data::<AppState>::new(AppState { cmd: cmd.clone() }))
             .service(order::scope())
             .service(product::scope())
     })
