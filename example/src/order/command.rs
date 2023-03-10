@@ -1,5 +1,5 @@
 use actix::{ActorFutureExt, Context, Handler, Message, ResponseActFuture, WrapFuture};
-use evento::{CommandError, CommandInfo, CommandResult, Event, Evento};
+use evento::{CommandError, CommandResult, Event, PgEvento};
 use nanoid::nanoid;
 use serde::Deserialize;
 use validator::Validate;
@@ -14,11 +14,8 @@ use super::{
     },
 };
 
-pub async fn load_order(
-    store: &Evento<evento::PgEngine, evento::store::PgEngine>,
-    id: &str,
-) -> Result<(Order, Event), CommandError> {
-    let (order, e) = match store.load::<Order, _>(id).await? {
+pub async fn load_order(evento: &PgEvento, id: &str) -> Result<(Order, Event), CommandError> {
+    let (order, e) = match evento.load::<Order, _>(id).await? {
         Some(order) => order,
         _ => return Err(CommandError::NotFound("order".to_owned(), id.to_owned())),
     };
@@ -41,6 +38,8 @@ impl Handler<PlaceCommand> for Command {
     type Result = ResponseActFuture<Self, CommandResult>;
 
     fn handle(&mut self, msg: PlaceCommand, _ctx: &mut Context<Self>) -> Self::Result {
+        let producer = self.producer.clone();
+
         async move {
             let mut events = vec![Event::new(OrderEvent::Placed).data(Placed::default())?];
 
@@ -51,13 +50,11 @@ impl Handler<PlaceCommand> for Command {
                 )
             }
 
-            let aggregate_id = nanoid!();
+            let id = nanoid!();
 
-            Ok(CommandInfo {
-                aggregate_id,
-                original_version: 0,
-                events,
-            })
+            producer.publish::<Order, _>(&id, events, 0).await?;
+
+            Ok(id)
         }
         .into_actor(self)
         .boxed_local()
@@ -75,10 +72,11 @@ impl Handler<AddProductCommand> for Command {
     type Result = ResponseActFuture<Self, CommandResult>;
 
     fn handle(&mut self, msg: AddProductCommand, _ctx: &mut Context<Self>) -> Self::Result {
-        let store = self.store.clone();
+        let evento = self.evento.clone();
+        let producer = self.producer.clone();
 
         async move {
-            let (order, e) = load_order(&store, &msg.id).await?;
+            let (order, e) = load_order(&evento, &msg.id).await?;
 
             if order.status != Status::Draft {
                 return Err(CommandError::BadRequest(
@@ -88,11 +86,16 @@ impl Handler<AddProductCommand> for Command {
 
             msg.product.validate()?;
 
-            Ok(Event::new(OrderEvent::ProductAdded)
-                .aggregate_id(&msg.id)
-                .version(e.version)
-                .data::<ProductAdded>(msg.product.into())?
-                .into())
+            producer
+                .publish::<Order, _>(
+                    &msg.id,
+                    vec![Event::new(OrderEvent::ProductAdded)
+                        .data::<ProductAdded>(msg.product.into())?],
+                    e.version,
+                )
+                .await?;
+
+            Ok(msg.id)
         }
         .into_actor(self)
         .boxed_local()
@@ -110,10 +113,11 @@ impl Handler<RemoveProductCommand> for Command {
     type Result = ResponseActFuture<Self, CommandResult>;
 
     fn handle(&mut self, msg: RemoveProductCommand, _ctx: &mut Context<Self>) -> Self::Result {
-        let store = self.store.clone();
+        let evento = self.evento.clone();
+        let producer = self.producer.clone();
 
         async move {
-            let (order, e) = load_order(&store, &msg.id).await?;
+            let (order, e) = load_order(&evento, &msg.id).await?;
 
             if order.status != Status::Draft {
                 return Err(CommandError::BadRequest(
@@ -128,11 +132,16 @@ impl Handler<RemoveProductCommand> for Command {
                 ));
             }
 
-            Ok(Event::new(OrderEvent::ProductRemoved)
-                .aggregate_id(&msg.id)
-                .version(e.version)
-                .data(ProductRemoved { id: msg.product_id })?
-                .into())
+            producer
+                .publish::<Order, _>(
+                    &msg.id,
+                    vec![Event::new(OrderEvent::ProductRemoved)
+                        .data(ProductRemoved { id: msg.product_id })?],
+                    e.version,
+                )
+                .await?;
+
+            Ok(msg.id)
         }
         .into_actor(self)
         .boxed_local()
@@ -154,10 +163,11 @@ impl Handler<UpdateProductQuantityCommand> for Command {
         msg: UpdateProductQuantityCommand,
         _ctx: &mut Context<Self>,
     ) -> Self::Result {
-        let store = self.store.clone();
+        let evento = self.evento.clone();
+        let producer = self.producer.clone();
 
         async move {
-            let (order, e) = load_order(&store, &msg.id).await?;
+            let (order, e) = load_order(&evento, &msg.id).await?;
 
             if order.status != Status::Draft {
                 return Err(CommandError::BadRequest(
@@ -174,11 +184,16 @@ impl Handler<UpdateProductQuantityCommand> for Command {
 
             msg.product.validate()?;
 
-            Ok(Event::new(OrderEvent::ProductQuantityUpdated)
-                .aggregate_id(&msg.id)
-                .version(e.version)
-                .data::<ProductQuantityUpdated>(msg.product.into())?
-                .into())
+            producer
+                .publish::<Order, _>(
+                    &msg.id,
+                    vec![Event::new(OrderEvent::ProductQuantityUpdated)
+                        .data::<ProductQuantityUpdated>(msg.product.into())?],
+                    e.version,
+                )
+                .await?;
+
+            Ok(msg.id)
         }
         .into_actor(self)
         .boxed_local()
@@ -196,10 +211,11 @@ impl Handler<UpdateShippingInfoCommand> for Command {
     type Result = ResponseActFuture<Self, CommandResult>;
 
     fn handle(&mut self, msg: UpdateShippingInfoCommand, _ctx: &mut Context<Self>) -> Self::Result {
-        let store = self.store.clone();
+        let evento = self.evento.clone();
+        let producer = self.producer.clone();
 
         async move {
-            let (order, e) = load_order(&store, &msg.id).await?;
+            let (order, e) = load_order(&evento, &msg.id).await?;
 
             if order.status != Status::Draft {
                 return Err(CommandError::BadRequest(
@@ -214,13 +230,18 @@ impl Handler<UpdateShippingInfoCommand> for Command {
                 )));
             }
 
-            Ok(Event::new(OrderEvent::ShippingInfoUpdated)
-                .aggregate_id(&msg.id)
-                .version(e.version)
-                .data(ShippingInfoUpdated {
-                    shipping_address: msg.address,
-                })?
-                .into())
+            producer
+                .publish::<Order, _>(
+                    &msg.id,
+                    vec![Event::new(OrderEvent::ShippingInfoUpdated).data(
+                        ShippingInfoUpdated {
+                            shipping_address: msg.address,
+                        },
+                    )?],
+                    e.version,
+                )
+                .await?;
+            Ok(msg.id)
         }
         .into_actor(self)
         .boxed_local()
@@ -237,10 +258,11 @@ impl Handler<PayCommand> for Command {
     type Result = ResponseActFuture<Self, CommandResult>;
 
     fn handle(&mut self, msg: PayCommand, _ctx: &mut Context<Self>) -> Self::Result {
-        let store = self.store.clone();
+        let evento = self.evento.clone();
+        let producer = self.producer.clone();
 
         async move {
-            let (order, e) = load_order(&store, &msg.id).await?;
+            let (order, e) = load_order(&evento, &msg.id).await?;
 
             if order.status != Status::Draft {
                 return Err(CommandError::BadRequest(
@@ -260,11 +282,15 @@ impl Handler<PayCommand> for Command {
                 ));
             }
 
-            Ok(Event::new(OrderEvent::Paid)
-                .aggregate_id(&msg.id)
-                .version(e.version)
-                .data(Paid::default())?
-                .into())
+            producer
+                .publish::<Order, _>(
+                    &msg.id,
+                    vec![Event::new(OrderEvent::Paid).data(Paid::default())?],
+                    e.version,
+                )
+                .await?;
+
+            Ok(msg.id)
         }
         .into_actor(self)
         .boxed_local()
@@ -281,10 +307,11 @@ impl Handler<DeleteCommand> for Command {
     type Result = ResponseActFuture<Self, CommandResult>;
 
     fn handle(&mut self, msg: DeleteCommand, _ctx: &mut Context<Self>) -> Self::Result {
-        let store = self.store.clone();
+        let evento = self.evento.clone();
+        let producer = self.producer.clone();
 
         async move {
-            let (order, e) = load_order(&store, &msg.id).await?;
+            let (order, e) = load_order(&evento, &msg.id).await?;
 
             if order.status != Status::Draft {
                 return Err(CommandError::BadRequest(
@@ -292,11 +319,14 @@ impl Handler<DeleteCommand> for Command {
                 ));
             }
 
-            Ok(Event::new(OrderEvent::Deleted)
-                .aggregate_id(&msg.id)
-                .version(e.version)
-                .data(Deleted::default())?
-                .into())
+            producer
+                .publish::<Order, _>(
+                    &msg.id,
+                    vec![Event::new(OrderEvent::Deleted).data(Deleted::default())?],
+                    e.version,
+                )
+                .await?;
+            Ok(msg.id)
         }
         .into_actor(self)
         .boxed_local()
@@ -313,10 +343,11 @@ impl Handler<CancelCommand> for Command {
     type Result = ResponseActFuture<Self, CommandResult>;
 
     fn handle(&mut self, msg: CancelCommand, _ctx: &mut Context<Self>) -> Self::Result {
-        let store = self.store.clone();
+        let evento = self.evento.clone();
+        let producer = self.producer.clone();
 
         async move {
-            let (order, e) = load_order(&store, &msg.id).await?;
+            let (order, e) = load_order(&evento, &msg.id).await?;
 
             if order.status != Status::Pending {
                 return Err(CommandError::BadRequest(
@@ -324,11 +355,15 @@ impl Handler<CancelCommand> for Command {
                 ));
             }
 
-            Ok(Event::new(OrderEvent::Canceled)
-                .aggregate_id(&msg.id)
-                .version(e.version)
-                .data(Canceled::default())?
-                .into())
+            producer
+                .publish::<Order, _>(
+                    &msg.id,
+                    vec![Event::new(OrderEvent::Canceled).data(Canceled::default())?],
+                    e.version,
+                )
+                .await?;
+
+            Ok(msg.id)
         }
         .into_actor(self)
         .boxed_local()
