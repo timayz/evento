@@ -83,16 +83,14 @@ pub type CommandResult = Result<String, CommandError>;
 
 pub struct CommandResponse(pub Result<CommandResult, MailboxError>);
 
-impl Into<HttpResponse> for CommandResponse {
-    fn into(self) -> HttpResponse {
-        match &self.0 {
+impl From<CommandResponse> for HttpResponse {
+    fn from(value: CommandResponse) -> Self {
+        match &value.0 {
             Ok(res) => match res {
                 Ok(aggregate_id) => HttpResponse::Ok().json(json!({ "id": aggregate_id })),
-                Err(e) => return HttpResponse::from_error(e.clone()),
+                Err(e) => HttpResponse::from_error(e.clone()),
             },
-            Err(e) => {
-                return HttpResponse::from_error(CommandError::InternalServerErr(e.to_string()))
-            }
+            Err(e) => HttpResponse::from_error(CommandError::InternalServerErr(e.to_string())),
         }
     }
 }
