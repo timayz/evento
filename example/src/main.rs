@@ -31,7 +31,7 @@ async fn main() -> std::io::Result<()> {
         .subscribe(order::subscribe())
         .subscribe(product::subscribe());
 
-    let producer = evento.run().await.unwrap();
+    let producer = evento.run(0).await.unwrap();
     let cmd = Command::new(evento, producer).start();
 
     HttpServer::new(move || {

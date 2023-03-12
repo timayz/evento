@@ -577,11 +577,7 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
         self.store.load(id)
     }
 
-    pub async fn run(&self) -> Result<Producer<S>, StoreError> {
-        self.run_with_delay(Duration::from_secs(30)).await
-    }
-
-    pub async fn run_with_delay(&self, delay: Duration) -> Result<Producer<S>, StoreError> {
+    pub async fn run(&self, delay: u64) -> Result<Producer<S>, StoreError> {
         let futures = self
             .subscribers
             .keys()
@@ -609,7 +605,7 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
         })
     }
 
-    async fn spawn(&self, sub: Subscriber, delay: Duration) {
+    async fn spawn(&self, sub: Subscriber, delay: u64) {
         let engine = self.engine.clone();
         let store = self.store.clone();
         let consumer_id = self.id;
@@ -617,11 +613,11 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
         let name = self.name.to_owned();
 
         tokio::spawn(async move {
-            tracing::info!("Starting {} ...", sub.key);
+            tracing::info!("Starting consumer {} ...", sub.key);
 
-            sleep(delay).await;
+            sleep(Duration::from_secs(delay)).await;
 
-            tracing::info!("{} on !", sub.key);
+            tracing::info!("{} started.", sub.key);
 
             let mut interval = interval_at(Instant::now(), Duration::from_millis(100));
 
