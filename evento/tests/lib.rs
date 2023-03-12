@@ -119,21 +119,21 @@ async fn publish<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send
         .name("eu-west-3a")
         .data(users.clone())
         .subscribe(subscriber.clone())
-        .run_with_delay(Duration::from_secs(0))
+        .run(0)
         .await
         .unwrap();
     let eu_west_3b = eu_west_3b
         .name("eu-west-3b")
         .data(users.clone())
         .subscribe(subscriber.clone())
-        .run_with_delay(Duration::from_secs(0))
+        .run(0)
         .await
         .unwrap();
     let us_east_1a = us_east_1a
         .name("us-east-1a")
         .data(users.clone())
         .subscribe(subscriber.clone())
-        .run_with_delay(Duration::from_secs(0))
+        .run(0)
         .await
         .unwrap();
 
@@ -282,7 +282,7 @@ async fn filter<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send 
                     .boxed()
                 }),
         )
-        .run_with_delay(Duration::from_secs(0))
+        .run(0)
         .await
         .unwrap();
 
@@ -434,7 +434,7 @@ async fn deadletter<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + S
                     .boxed()
                 }),
         )
-        .run_with_delay(Duration::from_secs(0))
+        .run(0)
         .await
         .unwrap();
 
