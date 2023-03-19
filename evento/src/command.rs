@@ -5,7 +5,7 @@ use validator::ValidationErrors;
 
 use crate::StoreError;
 
-#[derive(thiserror::Error, Debug, Clone)]
+#[derive(thiserror::Error, Debug, Clone, PartialEq)]
 pub enum CommandError {
     #[error("{0}")]
     ValidationErrors(ValidationErrors),
