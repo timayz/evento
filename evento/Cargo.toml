@@ -1,6 +1,6 @@
 [package]
 name = "evento"
-version ="0.4.7"
+version ="0.4.8"
 edition = "2021"
 license = "Apache-2.0"
 description = "A collection of libraries and tools that help you build DDD, CQRS, and event sourcing."
