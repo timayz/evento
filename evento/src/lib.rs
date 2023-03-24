@@ -42,6 +42,15 @@ pub struct SubscirberHandlerError {
     pub reason: String,
 }
 
+impl SubscirberHandlerError {
+    pub fn new<C: Into<String>, R: Into<String>>(code: C, reason: R) -> Self {
+        Self {
+            code: code.into(),
+            reason: reason.into(),
+        }
+    }
+}
+
 impl fmt::Display for SubscirberHandlerError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "code={},reason={}", self.code, self.reason)
@@ -50,46 +59,31 @@ impl fmt::Display for SubscirberHandlerError {
 
 impl From<serde_json::Error> for SubscirberHandlerError {
     fn from(e: serde_json::Error) -> Self {
-        SubscirberHandlerError {
-            code: "serde_json".to_owned(),
-            reason: e.to_string(),
-        }
+        SubscirberHandlerError::new("serde_json", e.to_string())
     }
 }
 
 impl From<StoreError> for SubscirberHandlerError {
     fn from(e: StoreError) -> Self {
-        SubscirberHandlerError {
-            code: "store".to_owned(),
-            reason: e.to_string(),
-        }
+        SubscirberHandlerError::new("evento::store", e.to_string())
     }
 }
 
 impl From<sqlx::Error> for SubscirberHandlerError {
     fn from(e: sqlx::Error) -> Self {
-        SubscirberHandlerError {
-            code: "sqlx".to_owned(),
-            reason: e.to_string(),
-        }
+        SubscirberHandlerError::new("sqlx", e.to_string())
     }
 }
 
 impl From<uuid::Error> for SubscirberHandlerError {
     fn from(e: uuid::Error) -> Self {
-        SubscirberHandlerError {
-            code: "uuid".to_owned(),
-            reason: e.to_string(),
-        }
+        SubscirberHandlerError::new("uuid", e.to_string())
     }
 }
 
 impl From<parse_display::ParseError> for SubscirberHandlerError {
     fn from(e: parse_display::ParseError) -> Self {
-        SubscirberHandlerError {
-            code: "uuid".to_owned(),
-            reason: e.to_string(),
-        }
+        SubscirberHandlerError::new("parse_display", e.to_string())
     }
 }
 

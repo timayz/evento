@@ -423,10 +423,10 @@ async fn deadletter<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + S
                         let user_event: UserEvent = event.name.parse().unwrap();
 
                         if let UserEvent::DisplayNameUpdated = user_event {
-                            return Err(SubscirberHandlerError {
-                                code: "send_email".to_owned(),
-                                reason: "Connection refused.".to_owned(),
-                            });
+                            return Err(SubscirberHandlerError::new(
+                                "send_email",
+                                "Connection refused.",
+                            ));
                         };
 
                         Ok(())
