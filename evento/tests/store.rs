@@ -1,12 +1,12 @@
-use evento::store::{Engine, MemoryEngine, PgEngine};
+use evento::store::{Engine, MemoryEngine};
 use evento::{Aggregate, Event, EventStore, StoreError};
-use sqlx::{Executor, PgPool};
 use std::collections::HashMap;
 
 mod common;
 
 use crate::common::{
-    AccountDeleted, Created, DisplayNameUpdated, PasswordUpdated, ProfileUpdated, User, UserEvent,
+    create_pg_store, init_store, AccountDeleted, Created, DisplayNameUpdated, PasswordUpdated,
+    ProfileUpdated, User, UserEvent,
 };
 
 #[test]
@@ -57,19 +57,19 @@ async fn memory_save_wrong_version() {
 
 #[tokio::test]
 async fn pg_save() {
-    let store = create_pg_store("save", false).await;
+    let (store, _) = create_pg_store("save", false).await;
     save(store).await
 }
 
 #[tokio::test]
 async fn pg_load_save() {
-    let store = create_pg_store("load_save", true).await;
+    let (store, _) = create_pg_store("load_save", true).await;
     load_save(store).await;
 }
 
 #[tokio::test]
 async fn pg_save_wrong_version() {
-    let store = create_pg_store("save_wrong_version", true).await;
+    let (store, _) = create_pg_store("save_wrong_version", true).await;
     save_wrong_version(store).await;
 }
 
@@ -236,81 +236,4 @@ async fn create_memory_store() -> EventStore<MemoryEngine> {
     init_store(&store).await;
 
     store
-}
-
-async fn create_pg_store(db_name: &str, init: bool) -> EventStore<PgEngine> {
-    let pool = PgPool::connect("postgres://postgres:postgres@localhost:5432/postgres")
-        .await
-        .unwrap();
-
-    let mut conn = pool.acquire().await.unwrap();
-
-    conn.execute(&format!("drop database if exists evento_{db_name};")[..])
-        .await
-        .unwrap();
-
-    conn.execute(&format!("create database evento_{db_name};")[..])
-        .await
-        .unwrap();
-
-    drop(pool);
-
-    let pool = PgPool::connect(&format!(
-        "postgres://postgres:postgres@localhost:5432/evento_{db_name}"
-    ))
-    .await
-    .unwrap();
-
-    sqlx::migrate!("../migrations").run(&pool).await.unwrap();
-
-    let store = PgEngine::new(pool);
-
-    if init {
-        init_store(&store).await;
-    }
-
-    store
-}
-
-async fn init_store<E: Engine>(store: &E) {
-    store
-        .save::<User, _>(
-            "1",
-            vec![
-                Event::new(UserEvent::Created)
-                    .data(Created {
-                        username: "john.doe".to_owned(),
-                        password: "azerty".to_owned(),
-                    })
-                    .unwrap(),
-                Event::new(UserEvent::AccountDeleted)
-                    .data(AccountDeleted { deleted: true })
-                    .unwrap(),
-            ],
-            0,
-        )
-        .await
-        .unwrap();
-
-    store
-        .save::<User, _>(
-            "2",
-            vec![
-                Event::new(UserEvent::Created)
-                    .data(Created {
-                        username: "albert.dupont".to_owned(),
-                        password: "azerty".to_owned(),
-                    })
-                    .unwrap(),
-                Event::new(UserEvent::ProfileUpdated)
-                    .data(ProfileUpdated {
-                        first_name: "albert".to_owned(),
-                        last_name: "dupont".to_owned(),
-                    })
-                    .unwrap(),
-            ],
-            0,
-        )
-        .await
-        .unwrap();
 }
