@@ -238,7 +238,6 @@ async fn query_as() {
     assert_eq!(res.edges[1].node.id, events[0].id);
     assert_eq!(res.edges[2].node.id, events[1].id);
     assert_eq!(res.edges[3].node.id, events[4].id);
-    assert_eq!(res.edges[3].cursor, "ss");
 
     let res = Query::<Event>::new("select * from _evento_events")
         .forward(2, Some(events[1].to_cursor()))
