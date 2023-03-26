@@ -170,7 +170,7 @@ pub trait Cursor: Sized {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct Edge<N> {
     pub cursor: String,
     pub node: N,
@@ -185,7 +185,7 @@ impl<N: Cursor> From<N> for Edge<N> {
     }
 }
 
-#[derive(Default, Debug, PartialEq)]
+#[derive(Default, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PageInfo {
     pub has_previous_page: bool,
     pub has_next_page: bool,
@@ -193,7 +193,7 @@ pub struct PageInfo {
     pub end_cursor: Option<String>,
 }
 
-#[derive(Default, Debug, PartialEq)]
+#[derive(Default, Debug, PartialEq, Serialize, Deserialize)]
 pub struct QueryResult<N> {
     pub edges: Vec<Edge<N>>,
     pub page_info: PageInfo,
