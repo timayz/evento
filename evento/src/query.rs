@@ -4,6 +4,7 @@ use base64::{
     Engine,
 };
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use sqlx::{postgres::PgArguments, query::QueryAs, Executor, FromRow, Postgres, QueryBuilder};
 use std::{fmt::Debug, marker::PhantomData, str::FromStr};
 
@@ -174,7 +175,7 @@ pub struct QueryResult<N> {
     pub page_info: PageInfo,
 }
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct QueryArgs {
     pub first: Option<u16>,
     pub after: Option<String>,
