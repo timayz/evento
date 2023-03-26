@@ -753,6 +753,7 @@ dependencies = [
  "base64 0.21.0",
  "chrono",
  "futures-util",
+ "harsh",
  "parking_lot 0.12.1",
  "parse-display",
  "pikav",
@@ -955,6 +956,12 @@ dependencies = [
  "tokio-util",
  "tracing",
 ]
+
+[[package]]
+name = "harsh"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6fce2283849822530a18d7d8eeb1719ac65a27cfb6649c0dc8dfd2d2cc5edfb"
 
 [[package]]
 name = "hashbrown"

@@ -3,7 +3,8 @@ use base64::{
     engine::{general_purpose, GeneralPurpose},
     Engine,
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, Utc};
+use harsh::Harsh;
 use serde::{Deserialize, Serialize};
 use sqlx::{postgres::PgArguments, query::QueryAs, Executor, FromRow, Postgres, QueryBuilder};
 use std::{fmt::Debug, marker::PhantomData, str::FromStr};
@@ -20,6 +21,8 @@ pub enum CursorError {
     Base64(base64::DecodeError),
     #[error("str utf8: {0}")]
     StrUtf8(std::str::Utf8Error),
+    #[error("harsh: {0}")]
+    Harsh(harsh::Error),
     #[error("{0}")]
     Unknown(String, String, String),
 }
@@ -48,6 +51,12 @@ impl From<std::str::Utf8Error> for CursorError {
     }
 }
 
+impl From<harsh::Error> for CursorError {
+    fn from(value: harsh::Error) -> Self {
+        Self::Harsh(value)
+    }
+}
+
 pub trait Cursor: Sized {
     fn keys() -> Vec<&'static str>;
     fn bind<'q, O>(
@@ -61,6 +70,10 @@ pub trait Cursor: Sized {
         O: 'q + Cursor;
     fn serialize(&self) -> Vec<String>;
     fn deserialize(values: Vec<&str>) -> Result<Self, CursorError>;
+
+    fn serialize_utc(value: DateTime<Utc>) -> String {
+        Harsh::default().encode(&[value.timestamp_micros() as u64])
+    }
 
     fn deserialize_as<F: Into<String>, D: FromStr>(
         field: F,
@@ -85,11 +98,25 @@ pub trait Cursor: Sized {
         value: Option<&&str>,
     ) -> Result<DateTime<Utc>, CursorError> {
         let field = field.into();
-        value.ok_or(CursorError::MissingField(field)).and_then(|v| {
-            DateTime::parse_from_rfc3339(v)
-                .map(DateTime::<Utc>::from)
-                .map_err(CursorError::ChronoParseError)
-        })
+        value
+            .ok_or(CursorError::MissingField(field))
+            .and_then(|v| {
+                Harsh::default()
+                    .decode(v)
+                    .map(|v| v[0])
+                    .map_err(CursorError::Harsh)
+            })
+            .and_then(|timestamp| {
+                println!("{timestamp}");
+                NaiveDateTime::from_timestamp_micros(timestamp as i64).ok_or(
+                    CursorError::Unknown(
+                        "field".to_owned(),
+                        "NaiveDateTime::from_timestamp_opt".to_owned(),
+                        "none".to_owned(),
+                    ),
+                )
+            })
+            .and_then(|datetime| Ok(DateTime::<Utc>::from_utc(datetime, Utc)))
     }
 
     fn to_cursor(&self) -> String {
