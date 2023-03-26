@@ -3,7 +3,7 @@ use actix_web::{http::StatusCode, HttpResponse, HttpResponseBuilder, ResponseErr
 use serde_json::json;
 use validator::ValidationErrors;
 
-use crate::{StoreError, query::CursorError};
+use crate::{query::CursorError, StoreError};
 
 #[derive(thiserror::Error, Debug, Clone, PartialEq)]
 pub enum CommandError {
