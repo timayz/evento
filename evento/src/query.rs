@@ -238,9 +238,6 @@ impl QueryArgs {
     }
 }
 
-pub type QueryCallback<'q, O> =
-    fn(query: QueryAs<Postgres, O, PgArguments>) -> QueryAs<Postgres, O, PgArguments>;
-
 pub struct Query<'q, O>
 where
     O: for<'r> FromRow<'r, <sqlx::Postgres as sqlx::Database>::Row>,
