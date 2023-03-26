@@ -6,7 +6,10 @@ use base64::{
 use chrono::{DateTime, NaiveDateTime, Utc};
 use harsh::Harsh;
 use serde::{Deserialize, Serialize};
-use sqlx::{postgres::PgArguments, query::QueryAs, Executor, FromRow, Postgres, QueryBuilder};
+use sqlx::{
+    postgres::PgArguments, query::QueryAs, Arguments, Encode, Executor, FromRow, Postgres,
+    QueryBuilder, Type,
+};
 use std::{fmt::Debug, marker::PhantomData, str::FromStr};
 
 #[derive(thiserror::Error, Debug)]
@@ -136,6 +139,10 @@ pub trait Cursor: Sized {
         Self::to_pg_filter_opts(backward, None, None)
     }
 
+    fn to_pg_filter_with_pos(backward: bool, pos: usize) -> String {
+        Self::to_pg_filter_opts(backward, None, Some(pos))
+    }
+
     fn to_pg_filter_opts(backward: bool, keys: Option<Vec<&str>>, pos: Option<usize>) -> String {
         let pos = pos.unwrap_or(1);
         let with_braket = keys.is_some();
@@ -231,9 +238,6 @@ impl QueryArgs {
     }
 }
 
-pub type QueryCallback<'q, O> =
-    fn(query: QueryAs<Postgres, O, PgArguments>) -> QueryAs<Postgres, O, PgArguments>;
-
 pub struct Query<'q, O>
 where
     O: for<'r> FromRow<'r, <sqlx::Postgres as sqlx::Database>::Row>,
@@ -246,6 +250,8 @@ where
     cursor: Option<String>,
     is_backward: bool,
     limit: u16,
+    bind_pos: usize,
+    arguments: PgArguments,
 }
 
 impl<'q, O> Query<'q, O>
@@ -262,7 +268,15 @@ where
             cursor: None,
             is_backward: false,
             limit: 0,
+            bind_pos: 1,
+            arguments: PgArguments::default(),
         }
+    }
+
+    pub fn bind<T: 'q + Send + Encode<'q, Postgres> + Type<Postgres>>(mut self, value: T) -> Self {
+        self.arguments.add(value);
+        self.bind_pos += 1;
+        self
     }
 
     pub fn backward(self, last: u16, before: Option<impl Into<String>>) -> Self {
@@ -281,7 +295,7 @@ where
         };
 
         if cursor.is_some() {
-            let filter = O::to_pg_filter(args.is_backward());
+            let filter = O::to_pg_filter_with_pos(args.is_backward(), self.bind_pos);
 
             let filter = if self.builder.sql().contains(" WHERE ") {
                 format!(" AND ({filter})")
@@ -303,58 +317,33 @@ where
         self
     }
 
-    pub async fn fetch_all<E>(&mut self, executor: E) -> Result<QueryResult<O>, CursorError>
+    pub async fn fetch_all<E>(self, executor: E) -> Result<QueryResult<O>, CursorError>
     where
         E: 'q + Executor<'q, Database = Postgres>,
     {
-        self.fetch_all_with_opts(executor, None).await
-    }
-
-    pub async fn bind_fetch_all<E>(
-        &mut self,
-        executor: E,
-        callback: QueryCallback<'q, O>,
-    ) -> Result<QueryResult<O>, CursorError>
-    where
-        E: 'q + Executor<'q, Database = Postgres>,
-    {
-        self.fetch_all_with_opts(executor, Some(callback)).await
-    }
-
-    pub async fn fetch_all_with_opts<E>(
-        &mut self,
-        executor: E,
-        callback: Option<QueryCallback<'q, O>>,
-    ) -> Result<QueryResult<O>, CursorError>
-    where
-        E: 'q + Executor<'q, Database = Postgres>,
-    {
-        let mut query = self.builder.build_query_as::<O>();
+        let mut query = sqlx::query_as_with::<_, O, _>(self.builder.sql(), self.arguments);
 
         if let Some(cursor) = &self.cursor {
             let cursor = O::from_cursor(cursor)?;
             query = cursor.bind(query);
         }
 
-        if let Some(callback) = callback {
-            query = callback(query);
-        }
-        let edges = query.fetch_all(executor).await?.into_iter().map(|o| Edge {
-            cursor: o.to_cursor(),
-            node: o,
-        });
-        let mut edges: Vec<_> = if self.is_backward {
-            edges.rev().collect()
-        } else {
-            edges.collect()
-        };
-
-        let len = edges.len();
-        let has_more = len > self.limit as usize;
+        let mut rows = query.fetch_all(executor).await?;
+        let has_more = rows.len() > self.limit as usize;
 
         if has_more {
-            let remove_index = if self.is_backward { 0 } else { len - 1 };
-            edges.remove(remove_index);
+            rows.pop();
+        };
+
+        let edges_iter = rows.into_iter().map(|node| Edge {
+            cursor: node.to_cursor(),
+            node,
+        });
+
+        let edges: Vec<_> = if self.is_backward {
+            edges_iter.rev().collect()
+        } else {
+            edges_iter.collect()
         };
 
         let page_info = if self.is_backward {
