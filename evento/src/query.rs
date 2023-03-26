@@ -84,13 +84,11 @@ pub trait Cursor: Sized {
         value: Option<&&str>,
     ) -> Result<DateTime<Utc>, CursorError> {
         let field = field.into();
-        value
-            .ok_or(CursorError::MissingField(field))
-            .and_then(|v| {
-                DateTime::parse_from_rfc3339(v)
-                    .map(DateTime::<Utc>::from)
-                    .map_err(CursorError::ChronoParseError)
-            })
+        value.ok_or(CursorError::MissingField(field)).and_then(|v| {
+            DateTime::parse_from_rfc3339(v)
+                .map(DateTime::<Utc>::from)
+                .map_err(CursorError::ChronoParseError)
+        })
     }
 
     fn to_cursor(&self) -> String {
@@ -208,6 +206,9 @@ impl QueryArgs {
     }
 }
 
+pub type QueryCallback<'q, O> =
+    fn(query: QueryAs<Postgres, O, PgArguments>) -> QueryAs<Postgres, O, PgArguments>;
+
 pub struct Query<'q, O>
 where
     O: for<'r> FromRow<'r, <sqlx::Postgres as sqlx::Database>::Row>,
@@ -287,7 +288,7 @@ where
     pub async fn bind_fetch_all<E>(
         &mut self,
         executor: E,
-        callback: fn(query: QueryAs<Postgres, O, PgArguments>) -> QueryAs<Postgres, O, PgArguments>,
+        callback: QueryCallback<'q, O>,
     ) -> Result<QueryResult<O>, CursorError>
     where
         E: 'q + Executor<'q, Database = Postgres>,
@@ -298,9 +299,7 @@ where
     pub async fn fetch_all_with_opts<E>(
         &mut self,
         executor: E,
-        callback: Option<
-            fn(query: QueryAs<Postgres, O, PgArguments>) -> QueryAs<Postgres, O, PgArguments>,
-        >,
+        callback: Option<QueryCallback<'q, O>>,
     ) -> Result<QueryResult<O>, CursorError>
     where
         E: 'q + Executor<'q, Database = Postgres>,
