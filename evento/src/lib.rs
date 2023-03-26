@@ -1,3 +1,4 @@
+pub mod query;
 pub mod store;
 
 #[cfg(feature = "actix-web")]
