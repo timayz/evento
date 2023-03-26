@@ -85,7 +85,7 @@ pub trait Cursor: Sized {
     ) -> Result<DateTime<Utc>, CursorError> {
         let field = field.into();
         value
-            .ok_or(CursorError::MissingField(field.to_owned()))
+            .ok_or(CursorError::MissingField(field))
             .and_then(|v| {
                 DateTime::parse_from_rfc3339(v)
                     .map(DateTime::<Utc>::from)
@@ -106,7 +106,7 @@ pub trait Cursor: Sized {
         let decoded = engine.decode(cursor)?;
         let data = std::str::from_utf8(&decoded)?;
 
-        Self::deserialize(data.split("|").collect())
+        Self::deserialize(data.split('|').collect())
     }
 
     fn to_pg_filter(backward: bool) -> String {

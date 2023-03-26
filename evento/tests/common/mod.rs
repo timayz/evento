@@ -103,17 +103,17 @@ impl Aggregate for User {
 #[allow(dead_code)]
 pub async fn create_pg_store(db_name: &str, init: bool) -> (EventStore<PgEngine>, PgPool) {
     let dsn = &format!("postgres://postgres:postgres@localhost:5432/evento_{db_name}");
-    let exists = retry_connect_errors(&dsn, Any::database_exists)
+    let exists = retry_connect_errors(dsn, Any::database_exists)
         .await
         .unwrap();
 
     if exists {
-        Any::drop_database(&dsn).await.unwrap();
+        Any::drop_database(dsn).await.unwrap();
     }
 
-    Any::create_database(&dsn).await.unwrap();
+    Any::create_database(dsn).await.unwrap();
 
-    let pool = PgPool::connect(&dsn).await.unwrap();
+    let pool = PgPool::connect(dsn).await.unwrap();
 
     Migrator::new(Path::new("../migrations"))
         .await
