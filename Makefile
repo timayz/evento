@@ -23,7 +23,5 @@ fmt:
 	cargo fmt -- --emit files
 
 clippy:
-	cargo clippy --all-features -- -D warnings
-
-clippy.fix:
 	cargo clippy --fix --all-features -- -D warnings
+	cargo clippy --all-features -- -D warnings
