@@ -27,7 +27,7 @@ impl Cursor for Event {
 
     fn serialize(&self) -> Vec<String> {
         vec![
-            self.created_at.to_rfc3339(),
+            Self::serialize_utc(self.created_at),
             self.version.to_string(),
             self.id.to_string(),
         ]
@@ -125,7 +125,7 @@ async fn query_as() {
             id: Uuid::parse_str("7f2a35d7-6e20-40bf-9f35-91cb7ca7e8d6").unwrap(),
             name: "event-4".to_owned(),
             version: 3,
-            created_at: DateTime::parse_from_rfc3339("2020-01-02T00:00:00.010Z")
+            created_at: DateTime::parse_from_rfc3339("2020-01-02T00:00:00.956Z")
                 .map(DateTime::<Utc>::from)
                 .unwrap(),
             aggregate_id: "user-1".to_owned(),
@@ -135,7 +135,7 @@ async fn query_as() {
             id: Uuid::parse_str("0035b208-34fb-4548-ba20-cd9dcbe717fa").unwrap(),
             name: "event-3".to_owned(),
             version: 2,
-            created_at: DateTime::parse_from_rfc3339("2020-01-02T00:00:00.010Z")
+            created_at: DateTime::parse_from_rfc3339("2020-01-02T00:00:00.956Z")
                 .map(DateTime::<Utc>::from)
                 .unwrap(),
             aggregate_id: "user-1".to_owned(),
@@ -145,7 +145,7 @@ async fn query_as() {
             id: Uuid::parse_str("296e887e-86dc-46a6-a289-f3a19de12a53").unwrap(),
             name: "event-5".to_owned(),
             version: 4,
-            created_at: DateTime::parse_from_rfc3339("2020-01-03T00:00:00.010Z")
+            created_at: DateTime::parse_from_rfc3339("2020-01-03T00:00:00.453Z")
                 .map(DateTime::<Utc>::from)
                 .unwrap(),
             aggregate_id: "user-1".to_owned(),
@@ -155,7 +155,7 @@ async fn query_as() {
             id: Uuid::parse_str("a92b8098-2c05-4cd3-a633-10f2de26b1b9").unwrap(),
             name: "event-2".to_owned(),
             version: 1,
-            created_at: DateTime::parse_from_rfc3339("2020-01-04T00:00:00.010Z")
+            created_at: DateTime::parse_from_rfc3339("2020-01-04T00:00:00.658Z")
                 .map(DateTime::<Utc>::from)
                 .unwrap(),
             aggregate_id: "user-2".to_owned(),
