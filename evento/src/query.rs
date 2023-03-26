@@ -351,9 +351,9 @@ where
 
         let len = edges.len();
         let has_more = len > self.limit as usize;
-        let remove_index = if self.is_backward { 0 } else { len - 1 };
 
         if has_more {
+            let remove_index = if self.is_backward { 0 } else { len - 1 };
             edges.remove(remove_index);
         };
 
