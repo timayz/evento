@@ -107,14 +107,13 @@ pub trait Cursor: Sized {
                     .map_err(CursorError::Harsh)
             })
             .and_then(|timestamp| {
-                NaiveDateTime::from_timestamp_micros(timestamp as i64).ok_or(
-                    CursorError::Unknown(
-                        "field".to_owned(),
-                        "NaiveDateTime::from_timestamp_opt".to_owned(),
-                        "none".to_owned(),
-                    ),
-                )
-            }).map(|datetime| DateTime::<Utc>::from_utc(datetime, Utc))
+                NaiveDateTime::from_timestamp_micros(timestamp as i64).ok_or(CursorError::Unknown(
+                    "field".to_owned(),
+                    "NaiveDateTime::from_timestamp_opt".to_owned(),
+                    "none".to_owned(),
+                ))
+            })
+            .map(|datetime| DateTime::<Utc>::from_utc(datetime, Utc))
     }
 
     fn to_cursor(&self) -> String {
