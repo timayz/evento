@@ -60,31 +60,37 @@ impl fmt::Display for SubscirberHandlerError {
 
 impl From<serde_json::Error> for SubscirberHandlerError {
     fn from(e: serde_json::Error) -> Self {
-        SubscirberHandlerError::new("serde_json", e.to_string())
+        SubscirberHandlerError::new("serde_json::Error", e.to_string())
     }
 }
 
 impl From<StoreError> for SubscirberHandlerError {
     fn from(e: StoreError) -> Self {
-        SubscirberHandlerError::new("evento::store", e.to_string())
+        SubscirberHandlerError::new("evento::store::StoreError", e.to_string())
     }
 }
 
 impl From<sqlx::Error> for SubscirberHandlerError {
     fn from(e: sqlx::Error) -> Self {
-        SubscirberHandlerError::new("sqlx", e.to_string())
+        SubscirberHandlerError::new("sqlx::Error", e.to_string())
     }
 }
 
 impl From<uuid::Error> for SubscirberHandlerError {
     fn from(e: uuid::Error) -> Self {
-        SubscirberHandlerError::new("uuid", e.to_string())
+        SubscirberHandlerError::new("uuid::Error", e.to_string())
     }
 }
 
 impl From<parse_display::ParseError> for SubscirberHandlerError {
     fn from(e: parse_display::ParseError) -> Self {
-        SubscirberHandlerError::new("parse_display", e.to_string())
+        SubscirberHandlerError::new("parse_display::ParseError", e.to_string())
+    }
+}
+
+impl From<query::CursorError> for SubscirberHandlerError {
+    fn from(e: query::CursorError) -> Self {
+        SubscirberHandlerError::new("query::CursorError", e.to_string())
     }
 }
 
