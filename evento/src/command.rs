@@ -3,7 +3,7 @@ use actix_web::{http::StatusCode, HttpResponse, HttpResponseBuilder, ResponseErr
 use serde_json::json;
 use validator::ValidationErrors;
 
-use crate::StoreError;
+use crate::{query::CursorError, StoreError};
 
 #[derive(thiserror::Error, Debug, Clone, PartialEq)]
 pub enum CommandError {
@@ -75,6 +75,12 @@ impl From<uuid::Error> for CommandError {
 
 impl From<actix::MailboxError> for CommandError {
     fn from(e: actix::MailboxError) -> Self {
+        CommandError::InternalServerErr(e.to_string())
+    }
+}
+
+impl From<CursorError> for CommandError {
+    fn from(e: CursorError) -> Self {
         CommandError::InternalServerErr(e.to_string())
     }
 }
