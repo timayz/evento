@@ -259,6 +259,23 @@ async fn query_as() {
     assert_eq!(res.edges[1].node.id, events[3].id);
 
     let res = Query::<Event>::new("select * from _evento_events")
+        .forward(1, Some(events[6].to_cursor()))
+        .fetch_all(&db)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        res.page_info,
+        PageInfo {
+            has_next_page: false,
+            end_cursor: None,
+            ..Default::default()
+        }
+    );
+
+    assert_eq!(res.edges.len(), 0);
+
+    let res = Query::<Event>::new("select * from _evento_events")
         .backward(2, None::<String>)
         .fetch_all(&db)
         .await
