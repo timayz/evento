@@ -14,3 +14,4 @@ jobs:
     uses: timayz/.github/.github/workflows/rust-test.yml@feat/rust/add-postgres
     with:
       postgres: true
+#
