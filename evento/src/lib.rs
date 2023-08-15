@@ -1,21 +1,17 @@
 pub mod query;
 pub mod store;
 
-#[cfg(feature = "actix-web")]
-mod command;
 mod context;
 mod data;
 
-#[cfg(feature = "actix-web")]
-pub use command::{CommandError, CommandResponse, CommandResult};
 pub use context::Context;
 pub use data::Data;
 pub use store::{Aggregate, Error as StoreError, Event, EventStore};
 
 use chrono::{DateTime, Utc};
 use futures_util::{future::join_all, FutureExt};
+use glob_match::glob_match;
 use parking_lot::RwLock;
-use pikav::topic::{TopicFilter, TopicName};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, QueryBuilder};
@@ -82,12 +78,6 @@ impl From<uuid::Error> for SubscirberHandlerError {
     }
 }
 
-impl From<parse_display::ParseError> for SubscirberHandlerError {
-    fn from(e: parse_display::ParseError) -> Self {
-        SubscirberHandlerError::new("parse_display::ParseError", e.to_string())
-    }
-}
-
 impl From<query::CursorError> for SubscirberHandlerError {
     fn from(e: query::CursorError) -> Self {
         SubscirberHandlerError::new("query::CursorError", e.to_string())
@@ -103,7 +93,7 @@ type SubscirberHandler =
 #[derive(Clone)]
 pub struct Subscriber {
     key: String,
-    filters: Vec<TopicFilter>,
+    filters: Vec<String>,
     handlers: Vec<SubscirberHandler>,
 }
 
@@ -116,11 +106,8 @@ impl Subscriber {
         }
     }
 
-    pub fn filter<T: Into<String>>(mut self, topic: T) -> Self {
-        match TopicFilter::new(topic) {
-            Ok(filter) => self.filters.push(filter),
-            Err(e) => panic!("{e}"),
-        };
+    pub fn filter<T: Into<String>>(mut self, filter: T) -> Self {
+        self.filters.push(filter.into());
 
         self
     }
@@ -244,7 +231,7 @@ impl Engine for MemoryEngine {
 
         async move {
             let mut w_subs = subscriptions.write();
-            let mut subscription = w_subs.entry(key.to_owned()).or_insert(Subscription {
+            let subscription = w_subs.entry(key.to_owned()).or_insert(Subscription {
                 id: Uuid::new_v4(),
                 consumer_id,
                 key,
@@ -694,21 +681,12 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
                         }
                     };
 
-                    let topic_name = match TopicName::new(format!(
-                        "{}/{}/{}",
-                        aggregate_type, aggregate_id, event.name
-                    )) {
-                        Ok(n) => n,
-                        Err(e) => {
-                            tracing::error!("{e}");
-                            continue;
-                        }
-                    };
+                    let topic_name = format!("{}/{}/{}", aggregate_type, aggregate_id, event.name);
 
                     if !sub
                         .filters
                         .iter()
-                        .any(|filter| filter.get_matcher().is_match(&topic_name))
+                        .any(|filter| glob_match(filter, &topic_name))
                     {
                         tracing::debug!(
                             "{:?} skiped event id={}, name={}, topic_name={}",

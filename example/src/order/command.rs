@@ -1,5 +1,5 @@
-use actix::{ActorFutureExt, Context, Handler, Message, ResponseActFuture, WrapFuture};
-use evento::{CommandError, CommandResult, Event, PgEvento};
+use anyhow::{anyhow, Result};
+use evento::{Event, PgEvento};
 use nanoid::nanoid;
 use serde::Deserialize;
 use validator::Validate;
@@ -14,358 +14,257 @@ use super::{
     },
 };
 
-pub async fn load_order(evento: &PgEvento, id: &str) -> Result<(Order, Event), CommandError> {
+pub async fn load_order(evento: &PgEvento, id: &str) -> Result<(Order, Event)> {
     let (order, e) = match evento.load::<Order, _>(id).await? {
         Some(order) => order,
-        _ => return Err(CommandError::NotFound("order".to_owned(), id.to_owned())),
+        _ => return Err(anyhow!(format!("order {}", id.to_owned()))),
     };
 
     if order.status == Status::Canceled || order.status == Status::Deleted {
-        return Err(CommandError::NotFound("order".to_owned(), id.to_owned()));
+        // Should be not found
+        return Err(anyhow!(format!("order {} not found", id.to_owned())));
     }
 
     Ok((order, e))
 }
 
-#[derive(Message, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[rtype(result = "CommandResult")]
 pub struct PlaceCommand {
     pub products: Vec<Product>,
 }
 
-impl Handler<PlaceCommand> for Command {
-    type Result = ResponseActFuture<Self, CommandResult>;
-
-    fn handle(&mut self, msg: PlaceCommand, _ctx: &mut Context<Self>) -> Self::Result {
-        let producer = self.producer.clone();
-
-        async move {
-            let mut events = vec![Event::new(OrderEvent::Placed).data(Placed::default())?];
-
-            for product in msg.products {
-                product.validate()?;
-                events.push(
-                    Event::new(OrderEvent::ProductAdded).data::<ProductAdded>(product.into())?,
-                )
-            }
-
-            let id = nanoid!();
-
-            producer.publish::<Order, _>(&id, events, 0).await?;
-
-            Ok(id)
-        }
-        .into_actor(self)
-        .boxed_local()
-    }
-}
-
-#[derive(Message, Deserialize)]
-#[rtype(result = "CommandResult")]
+#[derive(Deserialize)]
 pub struct AddProductCommand {
     pub id: String,
     pub product: Product,
 }
 
-impl Handler<AddProductCommand> for Command {
-    type Result = ResponseActFuture<Self, CommandResult>;
-
-    fn handle(&mut self, msg: AddProductCommand, _ctx: &mut Context<Self>) -> Self::Result {
-        let evento = self.evento.clone();
-        let producer = self.producer.clone();
-
-        async move {
-            let (order, e) = load_order(&evento, &msg.id).await?;
-
-            if order.status != Status::Draft {
-                return Err(CommandError::BadRequest(
-                    "order status must be `draft`".to_owned(),
-                ));
-            }
-
-            msg.product.validate()?;
-
-            producer
-                .publish::<Order, _>(
-                    &msg.id,
-                    vec![Event::new(OrderEvent::ProductAdded)
-                        .data::<ProductAdded>(msg.product.into())?],
-                    e.version,
-                )
-                .await?;
-
-            Ok(msg.id)
-        }
-        .into_actor(self)
-        .boxed_local()
-    }
-}
-
-#[derive(Message, Deserialize)]
-#[rtype(result = "CommandResult")]
+#[derive(Deserialize)]
 pub struct RemoveProductCommand {
     pub id: String,
     pub product_id: String,
 }
 
-impl Handler<RemoveProductCommand> for Command {
-    type Result = ResponseActFuture<Self, CommandResult>;
-
-    fn handle(&mut self, msg: RemoveProductCommand, _ctx: &mut Context<Self>) -> Self::Result {
-        let evento = self.evento.clone();
-        let producer = self.producer.clone();
-
-        async move {
-            let (order, e) = load_order(&evento, &msg.id).await?;
-
-            if order.status != Status::Draft {
-                return Err(CommandError::BadRequest(
-                    "order status must be `draft`".to_owned(),
-                ));
-            }
-
-            if !order.products.contains_key(&msg.product_id) {
-                return Err(CommandError::NotFound(
-                    "product".to_owned(),
-                    msg.product_id.to_owned(),
-                ));
-            }
-
-            producer
-                .publish::<Order, _>(
-                    &msg.id,
-                    vec![Event::new(OrderEvent::ProductRemoved)
-                        .data(ProductRemoved { id: msg.product_id })?],
-                    e.version,
-                )
-                .await?;
-
-            Ok(msg.id)
-        }
-        .into_actor(self)
-        .boxed_local()
-    }
-}
-
-#[derive(Message, Deserialize)]
-#[rtype(result = "CommandResult")]
+#[derive(Deserialize)]
 pub struct UpdateProductQuantityCommand {
     pub id: String,
     pub product: Product,
 }
-
-impl Handler<UpdateProductQuantityCommand> for Command {
-    type Result = ResponseActFuture<Self, CommandResult>;
-
-    fn handle(
-        &mut self,
-        msg: UpdateProductQuantityCommand,
-        _ctx: &mut Context<Self>,
-    ) -> Self::Result {
-        let evento = self.evento.clone();
-        let producer = self.producer.clone();
-
-        async move {
-            let (order, e) = load_order(&evento, &msg.id).await?;
-
-            if order.status != Status::Draft {
-                return Err(CommandError::BadRequest(
-                    "order status must be `draft`".to_owned(),
-                ));
-            }
-
-            if !order.products.contains_key(&msg.product.id) {
-                return Err(CommandError::NotFound(
-                    "product".to_owned(),
-                    msg.product.id.to_owned(),
-                ));
-            }
-
-            msg.product.validate()?;
-
-            producer
-                .publish::<Order, _>(
-                    &msg.id,
-                    vec![Event::new(OrderEvent::ProductQuantityUpdated)
-                        .data::<ProductQuantityUpdated>(msg.product.into())?],
-                    e.version,
-                )
-                .await?;
-
-            Ok(msg.id)
-        }
-        .into_actor(self)
-        .boxed_local()
-    }
-}
-
-#[derive(Message, Deserialize)]
-#[rtype(result = "CommandResult")]
+#[derive(Deserialize)]
 pub struct UpdateShippingInfoCommand {
     pub id: String,
     pub address: String,
 }
 
-impl Handler<UpdateShippingInfoCommand> for Command {
-    type Result = ResponseActFuture<Self, CommandResult>;
-
-    fn handle(&mut self, msg: UpdateShippingInfoCommand, _ctx: &mut Context<Self>) -> Self::Result {
-        let evento = self.evento.clone();
-        let producer = self.producer.clone();
-
-        async move {
-            let (order, e) = load_order(&evento, &msg.id).await?;
-
-            if order.status != Status::Draft {
-                return Err(CommandError::BadRequest(
-                    "order status must be `draft`".to_owned(),
-                ));
-            }
-
-            if order.shipping_address == msg.address {
-                return Err(CommandError::BadRequest(format!(
-                    "address `{}` not changed",
-                    msg.address
-                )));
-            }
-
-            producer
-                .publish::<Order, _>(
-                    &msg.id,
-                    vec![Event::new(OrderEvent::ShippingInfoUpdated).data(
-                        ShippingInfoUpdated {
-                            shipping_address: msg.address,
-                        },
-                    )?],
-                    e.version,
-                )
-                .await?;
-            Ok(msg.id)
-        }
-        .into_actor(self)
-        .boxed_local()
-    }
-}
-
-#[derive(Message, Deserialize)]
-#[rtype(result = "CommandResult")]
+#[derive(Deserialize)]
 pub struct PayCommand {
     pub id: String,
 }
 
-impl Handler<PayCommand> for Command {
-    type Result = ResponseActFuture<Self, CommandResult>;
-
-    fn handle(&mut self, msg: PayCommand, _ctx: &mut Context<Self>) -> Self::Result {
-        let evento = self.evento.clone();
-        let producer = self.producer.clone();
-
-        async move {
-            let (order, e) = load_order(&evento, &msg.id).await?;
-
-            if order.status != Status::Draft {
-                return Err(CommandError::BadRequest(
-                    "order status must be `draft`".to_owned(),
-                ));
-            }
-
-            if order.shipping_address.is_empty() {
-                return Err(CommandError::BadRequest(
-                    "order shipping address must not be empty".to_owned(),
-                ));
-            }
-
-            if order.products.is_empty() {
-                return Err(CommandError::BadRequest(
-                    "order products must not be empty".to_owned(),
-                ));
-            }
-
-            producer
-                .publish::<Order, _>(
-                    &msg.id,
-                    vec![Event::new(OrderEvent::Paid).data(Paid::default())?],
-                    e.version,
-                )
-                .await?;
-
-            Ok(msg.id)
-        }
-        .into_actor(self)
-        .boxed_local()
-    }
-}
-
-#[derive(Message, Deserialize)]
-#[rtype(result = "CommandResult")]
+#[derive(Deserialize)]
 pub struct DeleteCommand {
     pub id: String,
 }
 
-impl Handler<DeleteCommand> for Command {
-    type Result = ResponseActFuture<Self, CommandResult>;
-
-    fn handle(&mut self, msg: DeleteCommand, _ctx: &mut Context<Self>) -> Self::Result {
-        let evento = self.evento.clone();
-        let producer = self.producer.clone();
-
-        async move {
-            let (order, e) = load_order(&evento, &msg.id).await?;
-
-            if order.status != Status::Draft {
-                return Err(CommandError::BadRequest(
-                    "order status must be `draft`".to_owned(),
-                ));
-            }
-
-            producer
-                .publish::<Order, _>(
-                    &msg.id,
-                    vec![Event::new(OrderEvent::Deleted).data(Deleted::default())?],
-                    e.version,
-                )
-                .await?;
-            Ok(msg.id)
-        }
-        .into_actor(self)
-        .boxed_local()
-    }
-}
-
-#[derive(Message, Deserialize)]
-#[rtype(result = "CommandResult")]
+#[derive(Deserialize)]
 pub struct CancelCommand {
     pub id: String,
 }
 
-impl Handler<CancelCommand> for Command {
-    type Result = ResponseActFuture<Self, CommandResult>;
+impl Command {
+    pub async fn place_order(&self, input: PlaceCommand) -> Result<String> {
+        let mut events = vec![Event::new(OrderEvent::Placed).data(Placed::default())?];
 
-    fn handle(&mut self, msg: CancelCommand, _ctx: &mut Context<Self>) -> Self::Result {
-        let evento = self.evento.clone();
-        let producer = self.producer.clone();
-
-        async move {
-            let (order, e) = load_order(&evento, &msg.id).await?;
-
-            if order.status != Status::Pending {
-                return Err(CommandError::BadRequest(
-                    "order status must be `pending`".to_owned(),
-                ));
-            }
-
-            producer
-                .publish::<Order, _>(
-                    &msg.id,
-                    vec![Event::new(OrderEvent::Canceled).data(Canceled::default())?],
-                    e.version,
-                )
-                .await?;
-
-            Ok(msg.id)
+        for product in input.products {
+            product.validate()?;
+            events.push(Event::new(OrderEvent::ProductAdded).data::<ProductAdded>(product.into())?)
         }
-        .into_actor(self)
-        .boxed_local()
+
+        let id = nanoid!();
+
+        self.producer.publish::<Order, _>(&id, events, 0).await?;
+
+        Ok(id)
+    }
+
+    pub async fn add_product_to_order(&self, input: AddProductCommand) -> Result<String> {
+        let (order, e) = load_order(&self.evento, &input.id).await?;
+
+        if order.status != Status::Draft {
+            // Should be bad request
+            return Err(anyhow!("order status must be `draft`"));
+        }
+
+        input.product.validate()?;
+
+        self.producer
+            .publish::<Order, _>(
+                &input.id,
+                vec![Event::new(OrderEvent::ProductAdded)
+                    .data::<ProductAdded>(input.product.into())?],
+                e.version,
+            )
+            .await?;
+
+        Ok(input.id)
+    }
+
+    pub async fn remove_product_from_order(&self, input: RemoveProductCommand) -> Result<String> {
+        let (order, e) = load_order(&self.evento, &input.id).await?;
+
+        if order.status != Status::Draft {
+            // bad request
+            return Err(anyhow!("order status must be `draft`"));
+        }
+
+        if !order.products.contains_key(&input.product_id) {
+            // not found
+            return Err(anyhow!(format!(
+                "product {} not found",
+                input.product_id.to_owned()
+            )));
+        }
+
+        self.producer
+            .publish::<Order, _>(
+                &input.id,
+                vec![Event::new(OrderEvent::ProductRemoved).data(ProductRemoved {
+                    id: input.product_id,
+                })?],
+                e.version,
+            )
+            .await?;
+
+        Ok(input.id)
+    }
+
+    pub async fn update_product_quantity_of_order(
+        &self,
+        input: UpdateProductQuantityCommand,
+    ) -> Result<String> {
+        let (order, e) = load_order(&self.evento, &input.id).await?;
+
+        if order.status != Status::Draft {
+            // bad request
+            return Err(anyhow!("order status must be `draft`"));
+        }
+
+        if !order.products.contains_key(&input.product.id) {
+            // not found
+            return Err(anyhow!(format!(
+                "product {} not found",
+                input.product.id.to_owned()
+            )));
+        }
+
+        input.product.validate()?;
+
+        self.producer
+            .publish::<Order, _>(
+                &input.id,
+                vec![Event::new(OrderEvent::ProductQuantityUpdated)
+                    .data::<ProductQuantityUpdated>(input.product.into())?],
+                e.version,
+            )
+            .await?;
+
+        Ok(input.id)
+    }
+
+    pub async fn update_shipping_info_of_order(
+        &self,
+        input: UpdateShippingInfoCommand,
+    ) -> Result<String> {
+        let (order, e) = load_order(&self.evento, &input.id).await?;
+
+        if order.status != Status::Draft {
+            //bad request
+            return Err(anyhow!("order status must be `draft`"));
+        }
+
+        if order.shipping_address == input.address {
+            // bad request
+            return Err(anyhow!(format!("address `{}` not changed", input.address)));
+        }
+
+        self.producer
+            .publish::<Order, _>(
+                &input.id,
+                vec![
+                    Event::new(OrderEvent::ShippingInfoUpdated).data(ShippingInfoUpdated {
+                        shipping_address: input.address,
+                    })?,
+                ],
+                e.version,
+            )
+            .await?;
+        Ok(input.id)
+    }
+
+    pub async fn pay_order(&self, input: PayCommand) -> Result<String> {
+        let (order, e) = load_order(&self.evento, &input.id).await?;
+
+        if order.status != Status::Draft {
+            //bad request
+            return Err(anyhow!("order status must be `draft`"));
+        }
+
+        if order.shipping_address.is_empty() {
+            //bad request
+            return Err(anyhow!("order shipping address must not be empty"));
+        }
+
+        if order.products.is_empty() {
+            //bad request
+            return Err(anyhow!("order products must not be empty"));
+        }
+
+        self.producer
+            .publish::<Order, _>(
+                &input.id,
+                vec![Event::new(OrderEvent::Paid).data(Paid::default())?],
+                e.version,
+            )
+            .await?;
+
+        Ok(input.id)
+    }
+
+    pub async fn delete_order(&self, input: DeleteCommand) -> Result<String> {
+        let (order, e) = load_order(&self.evento, &input.id).await?;
+
+        if order.status != Status::Draft {
+            // bad request
+            return Err(anyhow!("order status must be `draft`"));
+        }
+
+        self.producer
+            .publish::<Order, _>(
+                &input.id,
+                vec![Event::new(OrderEvent::Deleted).data(Deleted::default())?],
+                e.version,
+            )
+            .await?;
+        Ok(input.id)
+    }
+
+    pub async fn cancel_order(&self, input: CancelCommand) -> Result<String> {
+        let (order, e) = load_order(&self.evento, &input.id).await?;
+
+        if order.status != Status::Pending {
+            // bad request
+            return Err(anyhow!("order status must be `pending`"));
+        }
+
+        self.producer
+            .publish::<Order, _>(
+                &input.id,
+                vec![Event::new(OrderEvent::Canceled).data(Canceled::default())?],
+                e.version,
+            )
+            .await?;
+
+        Ok(input.id)
     }
 }

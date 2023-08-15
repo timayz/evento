@@ -67,7 +67,7 @@ async fn publish<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send
     us_east_1a: Evento<E, S>,
 ) {
     let subscriber = Subscriber::new("users")
-        .filter("user/#")
+        .filter("user/**")
         .handler(|event, ctx| {
             let bus_name = ctx.name();
             let users = ctx
@@ -221,7 +221,7 @@ async fn filter<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send 
         .data(users_count.clone())
         .subscribe(
             Subscriber::new("users")
-                .filter("user/#")
+                .filter("user/**")
                 .handler(|event, ctx| {
                     let users = ctx
                         .0
@@ -265,8 +265,8 @@ async fn filter<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send 
         )
         .subscribe(
             Subscriber::new("user-count")
-                .filter("user/1/+")
-                .filter("user/2/+")
+                .filter("user/1/*")
+                .filter("user/2/*")
                 .handler(|event, ctx| {
                     let users_count = ctx.0.read().extract::<Arc<RwLock<i32>>>().clone();
                     async move {
@@ -377,7 +377,7 @@ async fn deadletter<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + S
         .data(users.clone())
         .subscribe(
             Subscriber::new("users")
-                .filter("user/#")
+                .filter("user/**")
                 .handler(|event, ctx| {
                     let users = ctx
                         .0

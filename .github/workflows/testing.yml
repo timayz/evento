@@ -1,8 +1,0 @@
-name: Testing
-on: pull_request
-
-jobs:
-  rust:
-    uses: timada-org/.github/.github/workflows/rust-testing.yml@v2.14.1
-    secrets:
-      GH_TOKEN: ${{ secrets.GH_TOKEN }}

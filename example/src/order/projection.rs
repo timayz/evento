@@ -32,7 +32,7 @@ pub struct Order {
 
 pub fn subscribe() -> Subscriber {
     Subscriber::new("orders")
-        .filter("order/#")
+        .filter("order/**")
         .handler(|event, ctx| {
             let db = ctx.0.read().extract::<Database>().clone();
 
@@ -67,7 +67,7 @@ pub fn subscribe() -> Subscriber {
                                 None => return Ok(()),
                             };
 
-                        let mut product = order.products.entry(data.id).or_default();
+                        let product = order.products.entry(data.id).or_default();
                         product.quantity += data.quantity;
 
                         collection
@@ -110,7 +110,7 @@ pub fn subscribe() -> Subscriber {
                                 None => return Ok(()),
                             };
 
-                        let mut product = order.products.entry(data.id).or_default();
+                        let product = order.products.entry(data.id).or_default();
                         product.quantity = data.quantity;
 
                         collection

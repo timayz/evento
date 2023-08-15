@@ -19,9 +19,33 @@ revert:
 prepare:
 	cargo sqlx prepare --merged
 
+test:
+	cargo test
+
 fmt:
 	cargo fmt -- --emit files
 
 clippy:
 	cargo clippy --fix --all-features -- -D warnings
 	cargo clippy --all-features -- -D warnings
+
+deny:
+	cargo deny check
+
+udeps:
+	cargo udeps -p example -p evento
+
+udeps.leptos:
+	echo "No leptos"
+
+advisory.clean:
+	rm -rf ~/.cargo/advisory-db
+
+pants: advisory.clean
+	cargo pants
+
+audit: advisory.clean
+	cargo audit
+
+outdated:
+	cargo outdated

@@ -193,7 +193,7 @@ where
     F: FnMut(&'a str) -> Fut,
     Fut: Future<Output = sqlx::Result<T>> + 'a,
 {
-    // sqlx::any::install_default_drivers();
+    sqlx::any::install_default_drivers();
 
     backoff::future::retry(
         backoff::ExponentialBackoffBuilder::new()
