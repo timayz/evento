@@ -1,5 +1,5 @@
-use actix::{ActorFutureExt, Context, Handler, Message, ResponseActFuture, WrapFuture};
-use evento::{CommandError, CommandResult, Event, Evento};
+use anyhow::{anyhow, Result};
+use evento::{Event, Evento};
 use nanoid::nanoid;
 use serde::Deserialize;
 use validator::Validate;
@@ -17,219 +17,53 @@ use super::{
 pub async fn load_product(
     store: &Evento<evento::PgEngine, evento::store::PgEngine>,
     id: &str,
-) -> Result<(Product, Event), CommandError> {
+) -> Result<(Product, Event)> {
     let (product, e) = match store.load::<Product, _>(id).await? {
         Some(product) => product,
-        _ => return Err(CommandError::NotFound("product".to_owned(), id.to_owned())),
+        _ => return Err(anyhow!(format!("product {}", id.to_owned()))),
     };
 
     if product.deleted {
-        return Err(CommandError::NotFound("product".to_owned(), id.to_owned()));
+        // not found
+        return Err(anyhow!(format!("product {} not found", id.to_owned())));
     }
 
     Ok((product, e))
 }
 
-#[derive(Message, Deserialize, Validate)]
+#[derive(Deserialize, Validate)]
 #[serde(rename_all = "camelCase")]
-#[rtype(result = "CommandResult")]
 pub struct CreateCommand {
     #[validate(length(min = 3, max = 25))]
     pub name: String,
 }
 
-impl Handler<CreateCommand> for Command {
-    type Result = ResponseActFuture<Self, CommandResult>;
-
-    fn handle(&mut self, msg: CreateCommand, _ctx: &mut Context<Self>) -> Self::Result {
-        let producer = self.producer.clone();
-
-        async move {
-            msg.validate()?;
-
-            let id = nanoid!();
-
-            producer
-                .publish::<Product, _>(
-                    &id,
-                    vec![Event::new(ProductEvent::Created).data(Created { name: msg.name })?],
-                    0,
-                )
-                .await?;
-            Ok(id)
-        }
-        .into_actor(self)
-        .boxed_local()
-    }
-}
-
-#[derive(Message, Deserialize)]
-#[rtype(result = "CommandResult")]
+#[derive(Deserialize)]
 pub struct DeleteCommand {
     pub id: String,
 }
 
-impl Handler<DeleteCommand> for Command {
-    type Result = ResponseActFuture<Self, CommandResult>;
-
-    fn handle(&mut self, msg: DeleteCommand, _ctx: &mut Context<Self>) -> Self::Result {
-        let evento = self.evento.clone();
-        let producer = self.producer.clone();
-
-        async move {
-            let (_, e) = load_product(&evento, &msg.id).await?;
-
-            producer
-                .publish::<Product, _>(
-                    &msg.id,
-                    vec![Event::new(ProductEvent::Deleted).data(Deleted { deleted: true })?],
-                    e.version,
-                )
-                .await?;
-
-            Ok(msg.id)
-        }
-        .into_actor(self)
-        .boxed_local()
-    }
-}
-
-#[derive(Message, Deserialize, Validate)]
-#[rtype(result = "CommandResult")]
+#[derive(Deserialize, Validate)]
 pub struct UpdateQuantityCommand {
     pub id: String,
     #[validate(range(min = 0))]
     pub quantity: u16,
 }
 
-impl Handler<UpdateQuantityCommand> for Command {
-    type Result = ResponseActFuture<Self, CommandResult>;
-
-    fn handle(&mut self, msg: UpdateQuantityCommand, _ctx: &mut Context<Self>) -> Self::Result {
-        let evento = self.evento.clone();
-        let producer = self.producer.clone();
-
-        async move {
-            msg.validate()?;
-
-            let (product, e) = load_product(&evento, &msg.id).await?;
-
-            if product.quantity == msg.quantity {
-                return Err(CommandError::BadRequest(format!(
-                    "product.quantity already `{}`",
-                    msg.quantity
-                )));
-            }
-
-            producer
-                .publish::<Product, _>(
-                    &msg.id,
-                    vec![
-                        Event::new(ProductEvent::QuantityUpdated).data(QuantityUpdated {
-                            quantity: msg.quantity,
-                        })?,
-                    ],
-                    e.version,
-                )
-                .await?;
-
-            Ok(msg.id)
-        }
-        .into_actor(self)
-        .boxed_local()
-    }
-}
-
-#[derive(Message, Deserialize)]
-#[rtype(result = "CommandResult")]
+#[derive(Deserialize)]
 pub struct UpdateVisibilityCommand {
     pub id: String,
     pub visible: bool,
 }
 
-impl Handler<UpdateVisibilityCommand> for Command {
-    type Result = ResponseActFuture<Self, CommandResult>;
-
-    fn handle(&mut self, msg: UpdateVisibilityCommand, _ctx: &mut Context<Self>) -> Self::Result {
-        let evento = self.evento.clone();
-        let producer = self.producer.clone();
-
-        async move {
-            let (product, e) = load_product(&evento, &msg.id).await?;
-
-            if product.visible == msg.visible {
-                return Err(CommandError::BadRequest(format!(
-                    "product.visible already `{}`",
-                    msg.visible
-                )));
-            }
-
-            producer
-                .publish::<Product, _>(
-                    &msg.id,
-                    vec![
-                        Event::new(ProductEvent::VisibilityUpdated).data(VisibilityUpdated {
-                            visible: msg.visible,
-                        })?,
-                    ],
-                    e.version,
-                )
-                .await?;
-
-            Ok(msg.id)
-        }
-        .into_actor(self)
-        .boxed_local()
-    }
-}
-
-#[derive(Message, Deserialize, Validate)]
-#[rtype(result = "CommandResult")]
+#[derive(Deserialize, Validate)]
 pub struct UpdateDescriptionCommand {
     pub id: String,
     #[validate(length(min = 3, max = 255))]
     pub description: String,
 }
 
-impl Handler<UpdateDescriptionCommand> for Command {
-    type Result = ResponseActFuture<Self, CommandResult>;
-
-    fn handle(&mut self, msg: UpdateDescriptionCommand, _ctx: &mut Context<Self>) -> Self::Result {
-        let evento = self.evento.clone();
-        let producer = self.producer.clone();
-
-        async move {
-            msg.validate()?;
-
-            let (product, e) = load_product(&evento, &msg.id).await?;
-
-            if product.description == msg.description {
-                return Err(CommandError::BadRequest(format!(
-                    "product.description already `{}`",
-                    msg.description
-                )));
-            }
-
-            producer
-                .publish::<Product, _>(
-                    &msg.id,
-                    vec![Event::new(ProductEvent::DescriptionUpdated).data(
-                        DescriptionUpdated {
-                            description: msg.description,
-                        },
-                    )?],
-                    e.version,
-                )
-                .await?;
-            Ok(msg.id)
-        }
-        .into_actor(self)
-        .boxed_local()
-    }
-}
-
-#[derive(Message, Deserialize, Validate)]
-#[rtype(result = "CommandResult")]
+#[derive(Deserialize, Validate)]
 pub struct AddReviewCommand {
     pub id: String,
     #[validate(range(min = 0, max = 10))]
@@ -238,31 +72,135 @@ pub struct AddReviewCommand {
     pub message: String,
 }
 
-impl Handler<AddReviewCommand> for Command {
-    type Result = ResponseActFuture<Self, CommandResult>;
+impl Command {
+    pub async fn add_review_to_product(&self, input: AddReviewCommand) -> Result<String> {
+        input.validate()?;
 
-    fn handle(&mut self, msg: AddReviewCommand, _ctx: &mut Context<Self>) -> Self::Result {
-        let evento = self.evento.clone();
-        let producer = self.producer.clone();
+        let (_, e) = load_product(&self.evento, &input.id).await?;
 
-        async move {
-            msg.validate()?;
+        self.producer
+            .publish::<Product, _>(
+                &input.id,
+                vec![Event::new(ProductEvent::ReviewAdded).data(ReviewAdded {
+                    note: input.note,
+                    message: input.message,
+                })?],
+                e.version,
+            )
+            .await?;
+        Ok(input.id)
+    }
 
-            let (_, e) = load_product(&evento, &msg.id).await?;
+    pub async fn update_description_of_product(
+        &self,
+        input: UpdateDescriptionCommand,
+    ) -> Result<String> {
+        input.validate()?;
 
-            producer
-                .publish::<Product, _>(
-                    &msg.id,
-                    vec![Event::new(ProductEvent::ReviewAdded).data(ReviewAdded {
-                        note: msg.note,
-                        message: msg.message,
-                    })?],
-                    e.version,
-                )
-                .await?;
-            Ok(msg.id)
+        let (product, e) = load_product(&self.evento, &input.id).await?;
+
+        if product.description == input.description {
+            return Err(anyhow!(format!(
+                "product.description already `{}`",
+                input.description
+            )));
         }
-        .into_actor(self)
-        .boxed_local()
+
+        self.producer
+            .publish::<Product, _>(
+                &input.id,
+                vec![
+                    Event::new(ProductEvent::DescriptionUpdated).data(DescriptionUpdated {
+                        description: input.description,
+                    })?,
+                ],
+                e.version,
+            )
+            .await?;
+        Ok(input.id)
+    }
+
+    pub async fn update_visivility_of_product(
+        &self,
+        input: UpdateVisibilityCommand,
+    ) -> Result<String> {
+        let (product, e) = load_product(&self.evento, &input.id).await?;
+
+        if product.visible == input.visible {
+            return Err(anyhow!(format!(
+                "product.visible already `{}`",
+                input.visible
+            )));
+        }
+
+        self.producer
+            .publish::<Product, _>(
+                &input.id,
+                vec![
+                    Event::new(ProductEvent::VisibilityUpdated).data(VisibilityUpdated {
+                        visible: input.visible,
+                    })?,
+                ],
+                e.version,
+            )
+            .await?;
+
+        Ok(input.id)
+    }
+
+    pub async fn update_quantity_of_product(&self, input: UpdateQuantityCommand) -> Result<String> {
+        input.validate()?;
+
+        let (product, e) = load_product(&self.evento, &input.id).await?;
+
+        if product.quantity == input.quantity {
+            return Err(anyhow!(format!(
+                "product.quantity already `{}`",
+                input.quantity
+            )));
+        }
+
+        self.producer
+            .publish::<Product, _>(
+                &input.id,
+                vec![
+                    Event::new(ProductEvent::QuantityUpdated).data(QuantityUpdated {
+                        quantity: input.quantity,
+                    })?,
+                ],
+                e.version,
+            )
+            .await?;
+
+        Ok(input.id)
+    }
+
+    pub async fn delete_product(&self, input: DeleteCommand) -> Result<String> {
+        let (_, e) = load_product(&self.evento, &input.id).await?;
+
+        self.producer
+            .publish::<Product, _>(
+                &input.id,
+                vec![Event::new(ProductEvent::Deleted).data(Deleted { deleted: true })?],
+                e.version,
+            )
+            .await?;
+
+        Ok(input.id)
+    }
+
+    pub async fn create_product(&self, input: CreateCommand) -> Result<String> {
+        input.validate()?;
+
+        let id = nanoid!();
+
+        self.producer
+            .publish::<Product, _>(
+                &id,
+                vec![Event::new(ProductEvent::Created).data(Created { name: input.name })?],
+                0,
+            )
+            .await?;
+        Ok(id)
     }
 }

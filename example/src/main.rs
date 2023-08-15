@@ -2,19 +2,20 @@ pub(crate) mod command;
 mod order;
 mod product;
 
-use actix::{Actor, Addr};
-use actix_web::{web, App, HttpServer};
+use axum::Router;
 use command::Command;
 use evento::PgEngine;
 use mongodb::{options::ClientOptions, Client};
 use sqlx::{Executor, PgPool};
+use std::net::SocketAddr;
 
+#[derive(Clone)]
 pub struct AppState {
-    pub cmd: Addr<Command>,
+    pub cmd: Command,
 }
 
-#[actix_web::main] // or #[tokio::main]
-async fn main() -> std::io::Result<()> {
+#[tokio::main]
+async fn main() {
     let pool = init_db().await;
 
     let client_options = ClientOptions::parse("mongodb://mongo:mongo@127.0.0.1:27017")
@@ -32,17 +33,33 @@ async fn main() -> std::io::Result<()> {
         .subscribe(product::subscribe());
 
     let producer = evento.run(0).await.unwrap();
-    let cmd = Command::new(evento, producer).start();
+    let cmd = Command::new(evento, producer);
 
-    HttpServer::new(move || {
-        App::new()
-            .app_data(web::Data::<AppState>::new(AppState { cmd: cmd.clone() }))
-            .service(order::scope())
-            .service(product::scope())
-    })
-    .bind(("127.0.0.1", 8080))?
-    .run()
-    .await
+    let app = Router::new()
+        .nest("/orders", order::router())
+        .nest("/products", product::router())
+        .with_state(AppState { cmd });
+    // `GET /` goes to `root`
+    // .route("/", get(root))
+    // // `POST /users` goes to `create_user`
+    // .route("/users", post(create_user));
+
+    let addr = SocketAddr::from(([127, 0, 0, 1], 8080));
+
+    axum::Server::bind(&addr)
+        .serve(app.into_make_service())
+        .await
+        .unwrap();
+
+    // HttpServer::new(move || {
+    //     App::new()
+    //         .app_data(web::Data::<AppState>::new(AppState { cmd: cmd.clone() }))
+    //         .service(order::scope())
+    //         .service(product::scope())
+    // })
+    // .bind(("127.0.0.1", 8080))?
+    // .run()
+    // .await
 }
 
 async fn init_db() -> PgPool {

@@ -4,5 +4,5 @@ mod command;
 mod event;
 mod projection;
 
-pub use api::scope;
+pub use api::router;
 pub use projection::subscribe;

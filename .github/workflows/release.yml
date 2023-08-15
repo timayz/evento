@@ -4,6 +4,6 @@ on: workflow_dispatch
 
 jobs:
   release:
-    uses: timayz/.github/.github/workflows/service-release.yml@feat/rust/add-postgres
+    uses: timayz/.github/.github/workflows/service-release.yml@v3.0.0
     secrets:
       GH_TOKEN: ${{ secrets.GH_TOKEN }}

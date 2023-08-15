@@ -26,7 +26,7 @@ pub struct Product {
 
 pub fn subscribe() -> Subscriber {
     Subscriber::new("products")
-        .filter("product/#")
+        .filter("product/**")
         .handler(|event, ctx| {
             let db = ctx.0.read().extract::<Database>().clone();
 

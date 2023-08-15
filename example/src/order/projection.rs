@@ -32,7 +32,7 @@ pub struct Order {
 
 pub fn subscribe() -> Subscriber {
     Subscriber::new("orders")
-        .filter("order/#")
+        .filter("order/**")
         .handler(|event, ctx| {
             let db = ctx.0.read().extract::<Database>().clone();
 

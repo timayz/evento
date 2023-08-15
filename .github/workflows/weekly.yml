@@ -6,9 +6,9 @@ on:
 
 jobs:
   audit:
-    uses: timayz/.github/.github/workflows/service-audit.yml@feat/rust/add-postgres
+    uses: timayz/.github/.github/workflows/service-audit.yml@v3.0.0
 
   renovate:
-    uses: timayz/.github/.github/workflows/renovate.yml@feat/rust/add-postgres
+    uses: timayz/.github/.github/workflows/renovate.yml@v3.0.0
     secrets:
       GH_TOKEN: ${{ secrets.GH_TOKEN }}

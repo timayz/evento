@@ -1,58 +1,64 @@
-use actix_web::{delete, post, put, web, HttpResponse, Scope};
-use evento::CommandResponse;
+use axum::{body::Body, extract::State, routing, Json, Router};
+use serde_json::Value;
 
-use crate::AppState;
+use crate::{
+    command::{CommandResponse, CommandResult},
+    AppState,
+};
 
 use super::command::{
     AddReviewCommand, CreateCommand, DeleteCommand, UpdateDescriptionCommand,
     UpdateQuantityCommand, UpdateVisibilityCommand,
 };
 
-#[post("/create")]
-async fn create(data: web::Data<AppState>, input: web::Json<CreateCommand>) -> HttpResponse {
-    CommandResponse(data.cmd.send(input.0).await).into()
+async fn create(
+    State(state): State<AppState>,
+    Json(input): Json<CreateCommand>,
+) -> CommandResult<Json<Value>> {
+    CommandResponse(state.cmd.create_product(input).await).into()
 }
 
-#[delete("/delete")]
-async fn delete(data: web::Data<AppState>, input: web::Json<DeleteCommand>) -> HttpResponse {
-    CommandResponse(data.cmd.send(input.0).await).into()
+async fn delete(
+    State(state): State<AppState>,
+    Json(input): Json<DeleteCommand>,
+) -> CommandResult<Json<Value>> {
+    CommandResponse(state.cmd.delete_product(input).await).into()
 }
 
-#[put("/update-quantity")]
 async fn update_quantity(
-    data: web::Data<AppState>,
-    input: web::Json<UpdateQuantityCommand>,
-) -> HttpResponse {
-    CommandResponse(data.cmd.send(input.0).await).into()
+    State(state): State<AppState>,
+    Json(input): Json<UpdateQuantityCommand>,
+) -> CommandResult<Json<Value>> {
+    CommandResponse(state.cmd.update_quantity_of_product(input).await).into()
 }
 
-#[put("/update-visibility")]
 async fn update_visibility(
-    data: web::Data<AppState>,
-    input: web::Json<UpdateVisibilityCommand>,
-) -> HttpResponse {
-    CommandResponse(data.cmd.send(input.0).await).into()
+    State(state): State<AppState>,
+    Json(input): Json<UpdateVisibilityCommand>,
+) -> CommandResult<Json<Value>> {
+    CommandResponse(state.cmd.update_visivility_of_product(input).await).into()
 }
 
-#[put("/update-description")]
 async fn update_description(
-    data: web::Data<AppState>,
-    input: web::Json<UpdateDescriptionCommand>,
-) -> HttpResponse {
-    CommandResponse(data.cmd.send(input.0).await).into()
+    State(state): State<AppState>,
+    Json(input): Json<UpdateDescriptionCommand>,
+) -> CommandResult<Json<Value>> {
+    CommandResponse(state.cmd.update_description_of_product(input).await).into()
 }
 
-#[post("/add-review")]
-async fn add_review(data: web::Data<AppState>, input: web::Json<AddReviewCommand>) -> HttpResponse {
-    CommandResponse(data.cmd.send(input.0).await).into()
+async fn add_review(
+    State(state): State<AppState>,
+    Json(input): Json<AddReviewCommand>,
+) -> CommandResult<Json<Value>> {
+    CommandResponse(state.cmd.add_review_to_product(input).await).into()
 }
 
-pub fn scope() -> Scope {
-    web::scope("/products")
-        .service(create)
-        .service(delete)
-        .service(update_quantity)
-        .service(update_visibility)
-        .service(update_description)
-        .service(add_review)
+pub fn router() -> Router<AppState, Body> {
+    Router::new()
+        .route("/create", routing::post(create))
+        .route("/delete", routing::delete(delete))
+        .route("/update-quantity", routing::put(update_quantity))
+        .route("/update-visibility", routing::put(update_visibility))
+        .route("/update-description", routing::put(update_description))
+        .route("/add-review", routing::post(add_review))
 }

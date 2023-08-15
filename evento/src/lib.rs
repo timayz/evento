@@ -1,13 +1,9 @@
 pub mod query;
 pub mod store;
 
-#[cfg(feature = "actix-web")]
-mod command;
 mod context;
 mod data;
 
-#[cfg(feature = "actix-web")]
-pub use command::{CommandError, CommandResponse, CommandResult};
 pub use context::Context;
 pub use data::Data;
 pub use store::{Aggregate, Error as StoreError, Event, EventStore};
@@ -79,12 +75,6 @@ impl From<sqlx::Error> for SubscirberHandlerError {
 impl From<uuid::Error> for SubscirberHandlerError {
     fn from(e: uuid::Error) -> Self {
         SubscirberHandlerError::new("uuid::Error", e.to_string())
-    }
-}
-
-impl From<parse_display::ParseError> for SubscirberHandlerError {
-    fn from(e: parse_display::ParseError) -> Self {
-        SubscirberHandlerError::new("parse_display::ParseError", e.to_string())
     }
 }
 
