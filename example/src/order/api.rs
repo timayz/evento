@@ -1,7 +1,10 @@
-use axum::{extract::State, Json, Router, body::Body, routing};
+use axum::{body::Body, extract::State, routing, Json, Router};
 use serde_json::Value;
 
-use crate::{command::{CommandResponse, CommandResult}, AppState};
+use crate::{
+    command::{CommandResponse, CommandResult},
+    AppState,
+};
 
 use super::command::{
     AddProductCommand, CancelCommand, DeleteCommand, PayCommand, PlaceCommand,
@@ -49,7 +52,10 @@ async fn update_shipping_info(
 }
 
 // #[post("/pay")]
-async fn pay(State(state): State<AppState>, Json(input): Json<PayCommand>) -> CommandResult<Json<Value>> {
+async fn pay(
+    State(state): State<AppState>,
+    Json(input): Json<PayCommand>,
+) -> CommandResult<Json<Value>> {
     CommandResponse(state.cmd.pay_order(input).await).into()
 }
 
@@ -74,7 +80,10 @@ pub fn router() -> Router<AppState, Body> {
         .route("/place", routing::post(place))
         .route("/add-product", routing::post(add_product))
         .route("/remove-product", routing::delete(remove_product))
-        .route("/update-product-quantity", routing::put(update_product_quantity))
+        .route(
+            "/update-product-quantity",
+            routing::put(update_product_quantity),
+        )
         .route("/update-shipping-info", routing::put(update_shipping_info))
         .route("/pay", routing::post(pay))
         .route("/delete", routing::delete(delete))
