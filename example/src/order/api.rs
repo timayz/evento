@@ -11,7 +11,6 @@ use super::command::{
     RemoveProductCommand, UpdateProductQuantityCommand, UpdateShippingInfoCommand,
 };
 
-// #[post("/place")]
 async fn place(
     State(state): State<AppState>,
     Json(input): Json<PlaceCommand>,
@@ -19,7 +18,6 @@ async fn place(
     CommandResponse(state.cmd.place_order(input).await).into()
 }
 
-// #[post("/add-product")]
 async fn add_product(
     State(state): State<AppState>,
     Json(input): Json<AddProductCommand>,
@@ -27,7 +25,6 @@ async fn add_product(
     CommandResponse(state.cmd.add_product_to_order(input).await).into()
 }
 
-// #[delete("/remove-product")]
 async fn remove_product(
     State(state): State<AppState>,
     Json(input): Json<RemoveProductCommand>,
@@ -35,7 +32,6 @@ async fn remove_product(
     CommandResponse(state.cmd.remove_product_from_order(input).await).into()
 }
 
-// #[put("/update-product-quantity")]
 async fn update_product_quantity(
     State(state): State<AppState>,
     Json(input): Json<UpdateProductQuantityCommand>,
@@ -43,7 +39,6 @@ async fn update_product_quantity(
     CommandResponse(state.cmd.update_product_quantity_of_order(input).await).into()
 }
 
-// #[put("/update-shipping-info")]
 async fn update_shipping_info(
     State(state): State<AppState>,
     Json(input): Json<UpdateShippingInfoCommand>,
@@ -51,7 +46,6 @@ async fn update_shipping_info(
     CommandResponse(state.cmd.update_shipping_info_of_order(input).await).into()
 }
 
-// #[post("/pay")]
 async fn pay(
     State(state): State<AppState>,
     Json(input): Json<PayCommand>,
@@ -59,7 +53,6 @@ async fn pay(
     CommandResponse(state.cmd.pay_order(input).await).into()
 }
 
-// #[delete("/delete")]
 async fn delete(
     State(state): State<AppState>,
     Json(input): Json<DeleteCommand>,
@@ -67,7 +60,6 @@ async fn delete(
     CommandResponse(state.cmd.delete_order(input).await).into()
 }
 
-// #[delete("/cancel")]
 async fn cancel(
     State(state): State<AppState>,
     Json(input): Json<CancelCommand>,
