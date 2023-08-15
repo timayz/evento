@@ -1,12 +1,9 @@
 name: Release
-on:
-  push:
-    branches:
-      - main
+
+on: workflow_dispatch
 
 jobs:
-  rust:
-    uses: timada-org/.github/.github/workflows/rust-release.yml@v2.14.1
+  release:
+    uses: timayz/.github/.github/workflows/service-release.yml@feat/rust/add-postgres
     secrets:
       GH_TOKEN: ${{ secrets.GH_TOKEN }}
-      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

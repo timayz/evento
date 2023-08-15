@@ -1,8 +1,0 @@
-name: Audit
-on:
-  schedule:
-    - cron: 0 9 * * 1
-
-jobs:
-  rust:
-    uses: timada-org/.github/.github/workflows/rust-audit.yml@v2.14.1

@@ -12,10 +12,10 @@ pub use context::Context;
 pub use data::Data;
 pub use store::{Aggregate, Error as StoreError, Event, EventStore};
 
+use glob_match::glob_match;
 use chrono::{DateTime, Utc};
 use futures_util::{future::join_all, FutureExt};
 use parking_lot::RwLock;
-use pikav::topic::{TopicFilter, TopicName};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, QueryBuilder};
@@ -103,7 +103,7 @@ type SubscirberHandler =
 #[derive(Clone)]
 pub struct Subscriber {
     key: String,
-    filters: Vec<TopicFilter>,
+    filters: Vec<String>,
     handlers: Vec<SubscirberHandler>,
 }
 
@@ -116,11 +116,8 @@ impl Subscriber {
         }
     }
 
-    pub fn filter<T: Into<String>>(mut self, topic: T) -> Self {
-        match TopicFilter::new(topic) {
-            Ok(filter) => self.filters.push(filter),
-            Err(e) => panic!("{e}"),
-        };
+    pub fn filter<T: Into<String>>(mut self, filter: T) -> Self {
+        self.filters.push(filter.into());
 
         self
     }
@@ -244,7 +241,7 @@ impl Engine for MemoryEngine {
 
         async move {
             let mut w_subs = subscriptions.write();
-            let mut subscription = w_subs.entry(key.to_owned()).or_insert(Subscription {
+            let subscription = w_subs.entry(key.to_owned()).or_insert(Subscription {
                 id: Uuid::new_v4(),
                 consumer_id,
                 key,
@@ -694,21 +691,16 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
                         }
                     };
 
-                    let topic_name = match TopicName::new(format!(
+                    let topic_name = format!(
                         "{}/{}/{}",
                         aggregate_type, aggregate_id, event.name
-                    )) {
-                        Ok(n) => n,
-                        Err(e) => {
-                            tracing::error!("{e}");
-                            continue;
-                        }
-                    };
+                    );
 
                     if !sub
                         .filters
                         .iter()
-                        .any(|filter| filter.get_matcher().is_match(&topic_name))
+                        .any(|filter| glob_match(filter, &topic_name))
+                        // .any(|filter| filter.get_matcher().is_match(&topic_name))
                     {
                         tracing::debug!(
                             "{:?} skiped event id={}, name={}, topic_name={}",
