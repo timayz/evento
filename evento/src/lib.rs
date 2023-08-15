@@ -12,9 +12,9 @@ pub use context::Context;
 pub use data::Data;
 pub use store::{Aggregate, Error as StoreError, Event, EventStore};
 
-use glob_match::glob_match;
 use chrono::{DateTime, Utc};
 use futures_util::{future::join_all, FutureExt};
+use glob_match::glob_match;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -691,16 +691,12 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
                         }
                     };
 
-                    let topic_name = format!(
-                        "{}/{}/{}",
-                        aggregate_type, aggregate_id, event.name
-                    );
+                    let topic_name = format!("{}/{}/{}", aggregate_type, aggregate_id, event.name);
 
                     if !sub
                         .filters
                         .iter()
                         .any(|filter| glob_match(filter, &topic_name))
-                        // .any(|filter| filter.get_matcher().is_match(&topic_name))
                     {
                         tracing::debug!(
                             "{:?} skiped event id={}, name={}, topic_name={}",
