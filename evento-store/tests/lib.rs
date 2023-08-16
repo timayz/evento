@@ -1,4 +1,4 @@
-use evento_store::{Aggregate, Engine, Event, EventStore, MemoryEngine, Error};
+use evento_store::{Aggregate, Engine, Error, Event, EventStore, MemoryEngine};
 use std::collections::HashMap;
 
 mod common;

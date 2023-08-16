@@ -1,8 +1,8 @@
-use evento_store::{Engine as StoreEngine, MemoryEngine as StoreMemoryEngine};
 use evento::{
     Aggregate, Engine, Event, Evento, MemoryEngine, PgEngine, PgEvento, SubscirberHandlerError,
     Subscriber,
 };
+use evento_store::{Engine as StoreEngine, MemoryEngine as StoreMemoryEngine};
 use futures_util::FutureExt;
 use serde_json::json;
 use sqlx::{Executor, PgPool};
