@@ -4,6 +4,6 @@ on: workflow_dispatch
 
 jobs:
   release:
-    uses: timayz/.github/.github/workflows/rust-release.yml@v3.0.0
+    uses: timayz/.github/.github/workflows/rust-release.yml@fix/cargo/publish
     secrets:
       GH_TOKEN: ${{ secrets.GH_TOKEN }}

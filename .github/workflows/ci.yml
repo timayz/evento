@@ -11,6 +11,6 @@ on:
 
 jobs:
   test:
-    uses: timayz/.github/.github/workflows/rust-test.yml@v3.0.0
+    uses: timayz/.github/.github/workflows/rust-test.yml@fix/cargo/publish
     with:
       postgres: true
