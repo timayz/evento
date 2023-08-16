@@ -33,7 +33,7 @@ deny:
 	cargo deny check
 
 udeps:
-	cargo udeps -p example -p evento
+	cargo udeps -p example -p evento -p evento-axum -p evento-query -p evento-store
 
 udeps.leptos:
 	echo "No leptos"

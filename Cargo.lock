@@ -581,18 +581,15 @@ name = "evento"
 version = "0.5.7"
 dependencies = [
  "backoff",
- "base64 0.21.2",
  "chrono",
  "evento-store",
  "futures-util",
  "glob-match",
- "harsh",
  "parking_lot",
  "parse-display",
  "serde",
  "serde_json",
  "sqlx",
- "thiserror",
  "tokio",
  "tracing",
  "uuid",
@@ -605,22 +602,8 @@ version = "0.5.7"
 dependencies = [
  "anyhow",
  "axum",
- "backoff",
- "base64 0.21.2",
- "chrono",
- "futures-util",
- "glob-match",
- "harsh",
- "parking_lot",
- "parse-display",
  "serde",
  "serde_json",
- "sqlx",
- "thiserror",
- "tokio",
- "tracing",
- "uuid",
- "validator",
 ]
 
 [[package]]
@@ -652,11 +635,8 @@ name = "evento-store"
 version = "0.5.7"
 dependencies = [
  "backoff",
- "base64 0.21.2",
  "chrono",
  "futures-util",
- "glob-match",
- "harsh",
  "parking_lot",
  "parse-display",
  "serde",
@@ -664,9 +644,7 @@ dependencies = [
  "sqlx",
  "thiserror",
  "tokio",
- "tracing",
  "uuid",
- "validator",
 ]
 
 [[package]]
@@ -684,9 +662,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
- "thiserror",
  "tokio",
- "uuid",
  "validator",
 ]
 
