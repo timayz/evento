@@ -1,5 +1,4 @@
-use evento::{Aggregate, Event, EventStore};
-use evento_store::{Engine, PgEngine};
+use evento_store::{Aggregate, Engine, Event, EventStore, PgEngine};
 use futures_util::{Future, TryFutureExt};
 use parse_display::{Display, FromStr};
 use serde::{Deserialize, Serialize};

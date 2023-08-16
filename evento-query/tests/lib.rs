@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use evento::query::{Cursor, CursorError, PageInfo, Query};
+use evento_query::{Cursor, CursorError, PageInfo, Query};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{postgres::PgArguments, Postgres, QueryBuilder};

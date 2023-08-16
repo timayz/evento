@@ -19,6 +19,7 @@ anyhow = "1.0.74"
 axum = { version = "0.6.20"}
 tokio = { version = "1.31.0" }
 evento = { path = "../evento" }
+evento-axum = { path = "../evento-axum" }
 
 [dependencies.uuid]
 version = "1.4.1"

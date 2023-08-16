@@ -1,5 +1,4 @@
-use evento::store::{Engine, MemoryEngine};
-use evento::{Aggregate, Event, EventStore, StoreError};
+use evento_store::{Aggregate, Engine, Event, EventStore, MemoryEngine, Error};
 use std::collections::HashMap;
 
 mod common;
@@ -203,7 +202,7 @@ async fn save_wrong_version<E: Engine>(store: EventStore<E>) {
         .await
         .unwrap_err();
 
-    assert_eq!(err, StoreError::UnexpectedOriginalVersion);
+    assert_eq!(err, Error::UnexpectedOriginalVersion);
 
     let ovf = store
         .save::<User, _>(

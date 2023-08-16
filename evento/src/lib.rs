@@ -1,14 +1,12 @@
-pub mod query;
-pub mod store;
-
 mod context;
 mod data;
 
 pub use context::Context;
 pub use data::Data;
-pub use store::{Aggregate, Error as StoreError, Event, EventStore};
+pub use evento_store::{Aggregate, Error as StoreError, Event, EventStore};
 
 use chrono::{DateTime, Utc};
+use evento_store::{Engine as StoreEngine, EngineResult as StoreEngineResult};
 use futures_util::{future::join_all, FutureExt};
 use glob_match::glob_match;
 use parking_lot::RwLock;
@@ -18,7 +16,6 @@ use sqlx::{PgPool, Postgres, QueryBuilder};
 use std::{
     cmp::Ordering, collections::HashMap, fmt, future::Future, pin::Pin, sync::Arc, time::Duration,
 };
-use store::{Engine as StoreEngine, EngineResult as StoreEngineResult};
 use tokio::time::{interval_at, sleep, Instant};
 use uuid::Uuid;
 
@@ -78,12 +75,6 @@ impl From<uuid::Error> for SubscirberHandlerError {
     }
 }
 
-impl From<query::CursorError> for SubscirberHandlerError {
-    fn from(e: query::CursorError) -> Self {
-        SubscirberHandlerError::new("query::CursorError", e.to_string())
-    }
-}
-
 type SubscirberHandler =
     fn(
         e: Event,
@@ -118,7 +109,7 @@ impl Subscriber {
     }
 }
 
-pub type PgProducer = Producer<crate::store::PgEngine>;
+pub type PgProducer = Producer<evento_store::PgEngine>;
 
 #[derive(Clone)]
 pub struct Producer<S: StoreEngine + Send + Sync> {
@@ -327,7 +318,7 @@ pub struct PgEngine(PgPool);
 
 impl PgEngine {
     pub fn new(pool: PgPool) -> PgEvento {
-        Evento::new(Self(pool.clone()), store::PgEngine::new(pool))
+        Evento::new(Self(pool.clone()), evento_store::PgEngine::new(pool))
     }
 }
 
@@ -500,7 +491,7 @@ impl Engine for PgEngine {
     }
 }
 
-pub type PgEvento = Evento<PgEngine, crate::store::PgEngine>;
+pub type PgEvento = Evento<PgEngine, evento_store::PgEngine>;
 
 struct EventoContextName(Option<String>);
 

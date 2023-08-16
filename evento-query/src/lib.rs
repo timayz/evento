@@ -4,6 +4,7 @@ use base64::{
     Engine,
 };
 use chrono::{DateTime, NaiveDateTime, Utc};
+use evento::SubscirberHandlerError;
 use harsh::Harsh;
 use serde::{Deserialize, Serialize};
 use sqlx::{
@@ -367,5 +368,11 @@ where
         };
 
         Ok(QueryResult { edges, page_info })
+    }
+}
+
+impl From<CursorError> for SubscirberHandlerError {
+    fn from(e: CursorError) -> Self {
+        SubscirberHandlerError::new("query::CursorError", e.to_string())
     }
 }

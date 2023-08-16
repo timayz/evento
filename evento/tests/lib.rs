@@ -1,4 +1,4 @@
-use evento::store::{Engine as StoreEngine, MemoryEngine as StoreMemoryEngine};
+use evento_store::{Engine as StoreEngine, MemoryEngine as StoreMemoryEngine};
 use evento::{
     Aggregate, Engine, Event, Evento, MemoryEngine, PgEngine, PgEvento, SubscirberHandlerError,
     Subscriber,

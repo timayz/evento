@@ -139,7 +139,7 @@ pub trait Aggregate: Default {
     }
 }
 
-pub(crate) type EngineResult<A> = Result<Option<(A, Event)>, Error>;
+pub type EngineResult<A> = Result<Option<(A, Event)>, Error>;
 
 pub trait Engine: Clone {
     fn save<A: Aggregate, I: Into<String>>(
