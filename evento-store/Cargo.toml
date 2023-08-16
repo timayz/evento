@@ -1,14 +1,12 @@
 [package]
 name = "evento-store"
-version ="0.5.7"
+version = "0.6.0"
 edition = "2021"
 license = "Apache-2.0"
 publish = true
 description = "A collection of libraries and tools that help you build DDD, CQRS, and event sourcing."
 repository = "https://github.com/timayz/evento"
 documentation = "https://docs.rs/evento"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 serde = "1.0.183"
@@ -22,10 +20,10 @@ futures-util = "0.3.28"
 [dependencies.uuid]
 version = "1.4.1"
 features = [
-    "v4",                # Lets you generate random UUIDs
-    "fast-rng",          # Use a faster (but still sufficiently random) RNG
-    "macro-diagnostics", # Enable better diagnostics for compile-time UUIDs
-    "serde"
+	"v4",
+	"fast-rng",
+	"macro-diagnostics",
+	"serde",
 ]
 
 [dev-dependencies]

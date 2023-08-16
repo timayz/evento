@@ -1,10 +1,8 @@
 [package]
 name = "example"
-version ="0.5.7"
+version = "0.6.0"
 edition = "2021"
 license = "Apache-2.0"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 serde = { version = "1.0.183", features = ["derive"] }
@@ -15,10 +13,10 @@ nanoid = "0.4.0"
 futures = "0.3.28"
 validator = { version = "0.16.1", features = ["derive"] }
 anyhow = "1.0.74"
-axum = { version = "0.6.20"}
+axum = { version = "0.6.20" }
 tokio = { version = "1.31.0" }
-evento = { path = "../evento" }
-evento-axum = { path = "../evento-axum" }
+evento = { path = "../evento", version = "0.6.0" }
+evento-axum = { path = "../evento-axum", version = "0.6.0" }
 
 [dependencies.mongodb]
 version = "2.6.0"
