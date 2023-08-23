@@ -9,13 +9,13 @@ repository = "https://github.com/timayz/evento"
 documentation = "https://docs.rs/evento"
 
 [dependencies]
-serde = "1.0.183"
-serde_json = "1.0.104"
+serde = "1.0.185"
+serde_json = "1.0.105"
 parking_lot = "0.12.1"
 sqlx = { version = "0.7.1", features = ["runtime-tokio", "postgres", "chrono", "uuid", "json"] }
 chrono = { version = "0.4.26", default-features = false, features = ["clock", "serde"] }
 tracing = "0.1.37"
-tokio = "1.31.0"
+tokio = "1.32.0"
 futures-util = "0.3.28"
 validator = { version = "0.16.1", optional = true, features = ["derive"] }
 glob-match = "0.2.1"
@@ -31,7 +31,7 @@ features = [
 ]
 
 [dev-dependencies]
-tokio = { version = "1.31.0", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1.32.0", features = ["rt-multi-thread", "macros"] }
 backoff = { version = "0.4.0", features = ["futures", "tokio"] }
 sqlx = { version = "0.7.1", features = ["runtime-tokio", "postgres", "chrono", "uuid", "json", "any"] }
 parse-display = { version = "0.8.2" }
