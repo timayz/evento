@@ -39,10 +39,6 @@ async fn main() {
         .nest("/orders", order::router())
         .nest("/products", product::router())
         .with_state(AppState { cmd });
-    // `GET /` goes to `root`
-    // .route("/", get(root))
-    // // `POST /users` goes to `create_user`
-    // .route("/users", post(create_user));
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 8080));
 
@@ -50,16 +46,6 @@ async fn main() {
         .serve(app.into_make_service())
         .await
         .unwrap();
-
-    // HttpServer::new(move || {
-    //     App::new()
-    //         .app_data(web::Data::<AppState>::new(AppState { cmd: cmd.clone() }))
-    //         .service(order::scope())
-    //         .service(product::scope())
-    // })
-    // .bind(("127.0.0.1", 8080))?
-    // .run()
-    // .await
 }
 
 async fn init_db() -> PgPool {
