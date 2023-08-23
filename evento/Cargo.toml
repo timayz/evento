@@ -1,6 +1,6 @@
 [package]
 name = "evento"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2021"
 license = "Apache-2.0"
 publish = true
@@ -19,7 +19,7 @@ tokio = "1.32.0"
 futures-util = "0.3.28"
 validator = { version = "0.16.1", optional = true, features = ["derive"] }
 glob-match = "0.2.1"
-evento-store = { path = "../evento-store", version = "0.6.1" }
+evento-store = { path = "../evento-store", version = "0.6.2" }
 
 [dependencies.uuid]
 version = "1.4.1"
