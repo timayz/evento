@@ -9,7 +9,7 @@ repository = "https://github.com/timayz/evento"
 documentation = "https://docs.rs/evento"
 
 [dependencies]
-serde = "1.0.183"
-serde_json = "1.0.104"
+serde = "1.0.185"
+serde_json = "1.0.105"
 axum = { version = "0.6.20" }
-anyhow = "1.0.74"
+anyhow = "1.0.75"
