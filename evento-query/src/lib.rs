@@ -117,7 +117,7 @@ pub trait Cursor: Sized {
                     "none".to_owned(),
                 ))
             })
-            .map(|datetime| DateTime::<Utc>::from_utc(datetime, Utc))
+            .map(|datetime| DateTime::from_naive_utc_and_offset(datetime, Utc))
     }
 
     fn to_cursor(&self) -> String {
