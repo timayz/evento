@@ -6,7 +6,7 @@ license = "Apache-2.0"
 
 [dependencies]
 serde = { version = "1.0.188", features = ["derive"] }
-serde_json = "1.0.105"
+serde_json = "1.0.106"
 parse-display = "0.8.2"
 sqlx = { version = "0.7.1", features = ["runtime-tokio", "postgres", "chrono", "uuid", "json"] }
 nanoid = "0.4.0"
