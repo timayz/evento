@@ -333,7 +333,7 @@ impl Engine for PgEngine {
         async move {
             sqlx::query_as::<_, (Uuid,)>(
                 r#"
-                INSERT INTO _evento_subscriptions (id, consumer_id, key, enabled, created_at)
+                INSERT INTO evento_subscriptions (id, consumer_id, key, enabled, created_at)
                 VALUES ($1, $2, $3, $4, $5)
                 ON CONFLICT (key)
                 DO
@@ -362,7 +362,7 @@ impl Engine for PgEngine {
         async move {
             let sub = sqlx::query_as::<_, Subscription>(
                 r#"
-                SELECT * from _evento_subscriptions WHERE key = $1
+                SELECT * from evento_subscriptions WHERE key = $1
                 "#,
             )
             .bind(&key)
@@ -381,7 +381,7 @@ impl Engine for PgEngine {
         async move {
             sqlx::query_as::<_, (Uuid,)>(
                 r#"
-                UPDATE _evento_subscriptions
+                UPDATE evento_subscriptions
                 SET cursor = $2, updated_at = $3
                 WHERE key = $1
                 RETURNING id
@@ -408,7 +408,7 @@ impl Engine for PgEngine {
 
             for events in events.chunks(100).collect::<Vec<&[Event]>>() {
                 let mut query_builder: QueryBuilder<Postgres> = QueryBuilder::new(
-                    "INSERT INTO _evento_deadletters (id, name, aggregate_id, version, data, metadata, created_at) "
+                    "INSERT INTO evento_deadletters (id, name, aggregate_id, version, data, metadata, created_at) "
                 );
 
                 query_builder.push_values(events, |mut b, event| {
@@ -443,7 +443,7 @@ impl Engine for PgEngine {
                 Some(id) => Some(
                     sqlx::query_as::<_, Event>(
                         r#"
-                        SELECT * from _evento_events
+                        SELECT * from evento_events
                         WHERE id = $1
                         LIMIT 1
                         "#,
@@ -458,7 +458,7 @@ impl Engine for PgEngine {
                 Some(cursor) => {
                     sqlx::query_as::<_, Event>(
                         r#"
-                    SELECT * from _evento_deadletters
+                    SELECT * from evento_deadletters
                     WHERE created_at > $1 OR (created_at = $1 AND (version > $2 OR (version = $2 AND id > $3)))
                     ORDER BY created_at ASC, version ASC, id ASC
                     LIMIT $3
@@ -474,7 +474,7 @@ impl Engine for PgEngine {
                 _ => {
                     sqlx::query_as::<_, Event>(
                         r#"
-                    SELECT * from _evento_deadletters
+                    SELECT * from evento_deadletters
                     ORDER BY created_at ASC, version ASC, id ASC
                     LIMIT $1
                     "#,

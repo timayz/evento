@@ -87,7 +87,7 @@ async fn query_as() {
     let (_, db) = create_pg_store("query_as", false).await;
 
     let mut query_builder: QueryBuilder<Postgres> = QueryBuilder::new(
-        "INSERT INTO _evento_events (id, name, aggregate_id, version, data, metadata, created_at) ",
+        "INSERT INTO evento_events (id, name, aggregate_id, version, data, metadata, created_at) ",
     );
 
     let events = vec![
@@ -175,7 +175,7 @@ async fn query_as() {
 
     query_builder.build().execute(&db).await.unwrap();
 
-    let res = Query::<Event>::new("select * from _evento_events")
+    let res = Query::<Event>::new("select * from evento_events")
         .build(Default::default())
         .fetch_all(&db)
         .await
@@ -199,7 +199,7 @@ async fn query_as() {
     assert_eq!(res.edges[5].node.id, events[5].id);
     assert_eq!(res.edges[6].node.id, events[6].id);
 
-    let res = Query::<Event>::new("select * from _evento_events")
+    let res = Query::<Event>::new("select * from evento_events")
         .forward(2, None::<String>)
         .fetch_all(&db)
         .await
@@ -218,7 +218,7 @@ async fn query_as() {
     assert_eq!(res.edges[0].node.id, events[2].id);
     assert_eq!(res.edges[1].node.id, events[0].id);
 
-    let res = Query::<Event>::new("select * from _evento_events")
+    let res = Query::<Event>::new("select * from evento_events")
         .forward(4, None::<String>)
         .fetch_all(&db)
         .await
@@ -239,7 +239,7 @@ async fn query_as() {
     assert_eq!(res.edges[2].node.id, events[1].id);
     assert_eq!(res.edges[3].node.id, events[4].id);
 
-    let res = Query::<Event>::new("select * from _evento_events")
+    let res = Query::<Event>::new("select * from evento_events")
         .forward(2, Some(events[1].to_cursor()))
         .fetch_all(&db)
         .await
@@ -258,7 +258,7 @@ async fn query_as() {
     assert_eq!(res.edges[0].node.id, events[4].id);
     assert_eq!(res.edges[1].node.id, events[3].id);
 
-    let res = Query::<Event>::new("select * from _evento_events")
+    let res = Query::<Event>::new("select * from evento_events")
         .forward(1, Some(events[6].to_cursor()))
         .fetch_all(&db)
         .await
@@ -275,7 +275,7 @@ async fn query_as() {
 
     assert_eq!(res.edges.len(), 0);
 
-    let res = Query::<Event>::new("select * from _evento_events")
+    let res = Query::<Event>::new("select * from evento_events")
         .backward(2, None::<String>)
         .fetch_all(&db)
         .await
@@ -294,7 +294,7 @@ async fn query_as() {
     assert_eq!(res.edges[0].node.id, events[5].id);
     assert_eq!(res.edges[1].node.id, events[6].id);
 
-    let res = Query::<Event>::new("select * from _evento_events")
+    let res = Query::<Event>::new("select * from evento_events")
         .backward(4, None::<String>)
         .fetch_all(&db)
         .await
@@ -315,7 +315,7 @@ async fn query_as() {
     assert_eq!(res.edges[2].node.id, events[5].id);
     assert_eq!(res.edges[3].node.id, events[6].id);
 
-    let res = Query::<Event>::new("select * from _evento_events")
+    let res = Query::<Event>::new("select * from evento_events")
         .backward(3, Some(events[1].to_cursor()))
         .fetch_all(&db)
         .await
