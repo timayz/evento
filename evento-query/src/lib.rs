@@ -237,6 +237,10 @@ impl QueryArgs {
             && self.first.is_none()
             && self.after.is_none()
     }
+
+    pub fn is_none(&self) -> bool {
+        self.last.is_none() && self.before.is_none() && self.first.is_none() && self.after.is_none()
+    }
 }
 
 pub struct Query<'q, O>
