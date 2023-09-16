@@ -55,7 +55,7 @@
         ]
       }
     },
-    "query": "SELECT * FROM _evento_events WHERE aggregate_id = $1 AND version = $2 LIMIT 1"
+    "query": "SELECT * FROM evento_events WHERE aggregate_id = $1 AND version = $2 LIMIT 1"
   },
   "c86ca7bec07f3962165ef9ce3e6b5d7abd7d3e28305dd7ce5379825bbabd671d": {
     "describe": {
@@ -111,6 +111,6 @@
         ]
       }
     },
-    "query": "SELECT * FROM _evento_events WHERE aggregate_id = $1 ORDER BY version"
+    "query": "SELECT * FROM evento_events WHERE aggregate_id = $1 ORDER BY version"
   }
 }
