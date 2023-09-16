@@ -502,6 +502,10 @@ impl EventoContext {
     pub fn name(&self) -> Option<String> {
         self.0.read().extract::<EventoContextName>().0.to_owned()
     }
+
+    pub fn extract<T: Clone + 'static>(&self) -> T {
+        self.0.read().extract::<T>().clone()
+    }
 }
 
 #[derive(Clone)]
