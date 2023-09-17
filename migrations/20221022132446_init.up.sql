@@ -10,8 +10,8 @@ CREATE TABLE IF NOT EXISTS evento_events
     created_at timestamptz NOT NULL
 );
 
-CREATE INDEX idk_aggregate_id ON evento_events (aggregate_id);
-CREATE INDEX idk_metadata ON evento_events USING gin (metadata jsonb_path_ops);
+CREATE INDEX ON evento_events (aggregate_id);
+CREATE INDEX ON evento_events USING gin (metadata jsonb_path_ops);
 
 CREATE TABLE IF NOT EXISTS evento_deadletters
 (
@@ -35,4 +35,36 @@ CREATE TABLE IF NOT EXISTS evento_subscriptions
     created_at timestamptz NOT NULL
 );
 
-CREATE UNIQUE INDEX idk_key ON evento_subscriptions (key);
+CREATE UNIQUE INDEX ON evento_subscriptions (key);
+
+-- Test only
+
+DO
+$$
+DECLARE
+  table_prefixes  text[] = array['save','load_save', 'lib_publish', 'lib_filter', 'lib_deadletter'];
+  table_prefix     text;
+BEGIN
+  FOREACH table_prefix IN ARRAY table_prefixes LOOP
+    EXECUTE format('
+    CREATE TABLE IF NOT EXISTS evento_%1$s_events AS
+    TABLE evento_events
+    WITH NO DATA;
+
+    CREATE INDEX ON evento_%1$s_events (aggregate_id);
+    CREATE INDEX ON evento_%1$s_events USING gin (metadata jsonb_path_ops);
+
+    CREATE TABLE IF NOT EXISTS evento_%1$s_subscriptions AS
+    TABLE evento_subscriptions
+    WITH NO DATA;
+
+    CREATE UNIQUE INDEX ON evento_%1$s_subscriptions (key);
+
+    CREATE TABLE IF NOT EXISTS evento_%1$s_deadletters AS
+    TABLE evento_deadletters
+    WITH NO DATA;
+
+    ', table_prefix);
+  END LOOP;
+END;
+$$;

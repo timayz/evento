@@ -56,19 +56,19 @@ async fn memory_save_wrong_version() {
 
 #[tokio::test]
 async fn pg_save() {
-    let (store, _) = create_pg_store("save", false).await;
+    let (store, _) = create_pg_store(Some("save"), false).await;
     save(store).await
 }
 
 #[tokio::test]
 async fn pg_load_save() {
-    let (store, _) = create_pg_store("load_save", true).await;
+    let (store, _) = create_pg_store(Some("load_save"), true).await;
     load_save(store).await;
 }
 
 #[tokio::test]
 async fn pg_save_wrong_version() {
-    let (store, _) = create_pg_store("save_wrong_version", true).await;
+    let (store, _) = create_pg_store(None, true).await;
     save_wrong_version(store).await;
 }
 

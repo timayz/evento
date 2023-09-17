@@ -97,30 +97,38 @@ impl Aggregate for User {
     }
 }
 
-#[allow(dead_code)]
-pub async fn create_pg_store(db_name: &str, init: bool) -> (EventStore<PgEngine>, PgPool) {
-    let dsn = &format!("postgres://postgres:postgres@localhost:5432/evento_{db_name}");
+pub async fn create_pg_store(
+    table_prefix: Option<&str>,
+    init: bool,
+) -> (EventStore<PgEngine>, PgPool) {
+    let dsn = "postgres://postgres:postgres@localhost:5432/evento_test";
     let exists = retry_connect_errors(dsn, Any::database_exists)
         .await
         .unwrap();
 
-    if exists {
-        Any::drop_database(dsn).await.unwrap();
+    if !exists {
+        let _ = Any::create_database(dsn).await;
     }
-
-    Any::create_database(dsn).await.unwrap();
 
     let pool = PgPool::connect(dsn).await.unwrap();
 
     Migrator::new(Path::new("../migrations"))
         .await
         .unwrap()
-        .set_locking(false)
         .run(&pool)
         .await
         .unwrap();
 
-    let store = PgEngine::new(pool.clone());
+    let table_events = get_table_name(table_prefix, "events");
+
+    sqlx::query::<_>(format!("TRUNCATE {table_events};").as_str())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let store = table_prefix.map_or(PgEngine::new(pool.clone()), |table_prefix| {
+        PgEngine::new_prefix(pool.clone(), table_prefix)
+    });
 
     if init {
         init_store(&store).await;
@@ -129,7 +137,6 @@ pub async fn create_pg_store(db_name: &str, init: bool) -> (EventStore<PgEngine>
     (store, pool)
 }
 
-#[allow(dead_code)]
 pub async fn init_store<E: Engine>(store: &E) {
     store
         .save::<User, _>(
@@ -171,6 +178,13 @@ pub async fn init_store<E: Engine>(store: &E) {
         )
         .await
         .unwrap();
+}
+
+fn get_table_name(table_prefix: Option<&str>, name: impl Into<String>) -> String {
+    match table_prefix.as_ref() {
+        Some(prefix) => format!("evento_{prefix}_{}", name.into()),
+        _ => format!("evento_{}", name.into()),
+    }
 }
 
 /// Attempt to connect to the database server, retrying up to `ops.connect_timeout`.

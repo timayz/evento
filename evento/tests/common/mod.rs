@@ -1,5 +1,4 @@
-use evento::{Aggregate, Event, EventStore};
-use evento_store::{Engine, PgEngine};
+use evento::{Aggregate, Event, PgEngine, PgEvento};
 use futures_util::{Future, TryFutureExt};
 use parse_display::{Display, FromStr};
 use serde::{Deserialize, Serialize};
@@ -98,86 +97,38 @@ impl Aggregate for User {
     }
 }
 
-#[allow(dead_code)]
-pub async fn create_pg_store(db_name: &str, init: bool) -> (EventStore<PgEngine>, PgPool) {
-    let dsn = &format!("postgres://postgres:postgres@localhost:5432/evento_{db_name}");
+pub async fn create_pg_store(table_prefix: &str, reset: bool) -> PgEvento {
+    let dsn = "postgres://postgres:postgres@localhost:5432/evento_test";
     let exists = retry_connect_errors(dsn, Any::database_exists)
         .await
         .unwrap();
 
-    if exists {
-        Any::drop_database(dsn).await.unwrap();
+    if !exists {
+        let _ = Any::create_database(dsn).await;
     }
-
-    Any::create_database(dsn).await.unwrap();
 
     let pool = PgPool::connect(dsn).await.unwrap();
 
     Migrator::new(Path::new("../migrations"))
         .await
         .unwrap()
-        .set_locking(false)
         .run(&pool)
         .await
         .unwrap();
 
-    let store = PgEngine::new(pool.clone());
-
-    if init {
-        init_store(&store).await;
+    if !reset {
+        return PgEngine::new_prefix(pool, table_prefix);
     }
 
-    (store, pool)
+    for table in vec!["events", "subscriptions", "deadletters"] {
+        sqlx::query::<_>(format!("TRUNCATE evento_{table_prefix}_{table};").as_str())
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    PgEngine::new_prefix(pool, table_prefix)
 }
-
-#[allow(dead_code)]
-pub async fn init_store<E: Engine>(store: &E) {
-    store
-        .save::<User, _>(
-            "1",
-            vec![
-                Event::new(UserEvent::Created)
-                    .data(Created {
-                        username: "john.doe".to_owned(),
-                        password: "azerty".to_owned(),
-                    })
-                    .unwrap(),
-                Event::new(UserEvent::AccountDeleted)
-                    .data(AccountDeleted { deleted: true })
-                    .unwrap(),
-            ],
-            0,
-        )
-        .await
-        .unwrap();
-
-    store
-        .save::<User, _>(
-            "2",
-            vec![
-                Event::new(UserEvent::Created)
-                    .data(Created {
-                        username: "albert.dupont".to_owned(),
-                        password: "azerty".to_owned(),
-                    })
-                    .unwrap(),
-                Event::new(UserEvent::ProfileUpdated)
-                    .data(ProfileUpdated {
-                        first_name: "albert".to_owned(),
-                        last_name: "dupont".to_owned(),
-                    })
-                    .unwrap(),
-            ],
-            0,
-        )
-        .await
-        .unwrap();
-}
-
-/// Attempt to connect to the database server, retrying up to `ops.connect_timeout`.
-// async fn connect(database_url: &String) -> sqlx::Result<AnyConnection> {
-//     retry_connect_errors(database_url, AnyConnection::connect).await
-// }
 
 /// Attempt an operation that may return errors like `ConnectionRefused`,
 /// retrying up until `ops.connect_timeout`.
