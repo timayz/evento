@@ -343,7 +343,7 @@ impl Engine for MemoryEngine {
     }
 
     fn get_last(&self) -> Pin<Box<dyn Future<Output = Result<Option<Event>, Error>> + Send + '_>> {
-        let event = { self.0.read().values().flatten().cloned().last() };
+        let event = { self.0.read().values().flatten().last().cloned() };
 
         async move { Ok(event) }.boxed()
     }
