@@ -86,6 +86,7 @@ pub struct Subscriber {
     key: String,
     filters: Vec<String>,
     handlers: Vec<SubscirberHandler>,
+    from_start: bool,
 }
 
 impl Subscriber {
@@ -94,6 +95,7 @@ impl Subscriber {
             key: key.into(),
             filters: Vec::new(),
             handlers: Vec::new(),
+            from_start: true,
         }
     }
 
@@ -105,6 +107,13 @@ impl Subscriber {
 
     pub fn handler(mut self, handler: SubscirberHandler) -> Self {
         self.handlers.push(handler);
+
+        self
+    }
+
+    pub fn set_from_start(mut self, value: bool) -> Self {
+        self.from_start = value;
+
         self
     }
 }
@@ -620,12 +629,39 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
         })
     }
 
+    async fn set_last_event(
+        engine: &E,
+        store: &EventStore<S>,
+        key: String,
+    ) -> Result<(), StoreError> {
+        let Some(event) = store.get_last().await? else {
+            return Ok(());
+        };
+
+        let mut subscription = engine.get_subscription(key).await?;
+        subscription.cursor = Some(event.id);
+        subscription.updated_at = Some(Utc::now());
+
+        engine.update_subscription(subscription).await?;
+
+        Ok(())
+    }
+
     async fn spawn(&self, sub: Subscriber, delay: u64) {
         let engine = self.engine.clone();
         let store = self.store.clone();
         let consumer_id = self.id;
         let ctx = self.context.clone();
         let name = self.name.to_owned();
+
+        if !sub.from_start {
+            tracing::info!("{} set to last event.", sub.key);
+
+            if let Err(e) = Self::set_last_event(&engine, &store, sub.key.to_owned()).await {
+                tracing::error!("{e}");
+                return;
+            }
+        }
 
         tokio::spawn(async move {
             tracing::info!("Starting consumer {} ...", sub.key);

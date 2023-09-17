@@ -9,7 +9,7 @@ DROP TABLE IF EXISTS evento_subscriptions;
 DO
 $$
 DECLARE
-  table_prefixes  text[] = array['save','load_save', 'lib_publish', 'lib_filter', 'lib_deadletter'];
+  table_prefixes  text[] = array['save','load_save', 'lib_publish', 'lib_from_last', 'lib_filter', 'lib_deadletter'];
   table_prefix     text;
 BEGIN
   FOREACH table_prefix IN ARRAY table_prefixes LOOP

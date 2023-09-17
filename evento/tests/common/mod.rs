@@ -120,7 +120,7 @@ pub async fn create_pg_store(table_prefix: &str, reset: bool) -> PgEvento {
         return PgEngine::new_prefix(pool, table_prefix);
     }
 
-    for table in vec!["events", "subscriptions", "deadletters"] {
+    for table in ["events", "subscriptions", "deadletters"] {
         sqlx::query::<_>(format!("TRUNCATE evento_{table_prefix}_{table};").as_str())
             .execute(&pool)
             .await

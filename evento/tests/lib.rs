@@ -37,6 +37,13 @@ async fn memory_deadletter() {
 }
 
 #[tokio::test]
+async fn memory_from_last() {
+    let store = StoreMemoryEngine::new();
+    let eu_west_3a = MemoryEngine::new(store);
+    from_last(eu_west_3a).await
+}
+
+#[tokio::test]
 async fn pg_publish() {
     let eu_west_3a = create_pg_store("lib_publish", true).await;
     let eu_west_3b = create_pg_store("lib_publish", false).await;
@@ -55,6 +62,12 @@ async fn pg_filter() {
 async fn pg_deadletter() {
     let eu_west_3a = create_pg_store("lib_deadletter", true).await;
     deadletter(eu_west_3a).await
+}
+
+#[tokio::test]
+async fn pg_from_last() {
+    let eu_west_3a = create_pg_store("lib_from_last", true).await;
+    from_last(eu_west_3a).await
 }
 
 async fn publish<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static>(
@@ -204,6 +217,166 @@ async fn publish<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send
         user1.display_name,
         Some("Nina Wick (eu-west-3a)".to_owned())
     );
+}
+
+async fn from_last<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static>(
+    evento: Evento<E, S>,
+) {
+    let subscriber = Subscriber::new("users")
+        .filter("user/**")
+        .handler(|event, ctx| {
+            let bus_name = ctx.name();
+            let users = ctx
+                .0
+                .read()
+                .extract::<Arc<RwLock<HashMap<String, User>>>>()
+                .clone();
+
+            async move {
+                let user_event: UserEvent = event.name.parse().unwrap();
+
+                match user_event {
+                    UserEvent::Created => {
+                        let data: Created = event.to_data().unwrap();
+                        let mut w_users = users.write().await;
+                        w_users.insert(
+                            User::to_id(event.aggregate_id),
+                            User {
+                                username: bus_name
+                                    .map(|name| format!("{} ({name})", data.username))
+                                    .unwrap_or(data.username),
+                                password: data.password,
+                                ..Default::default()
+                            },
+                        );
+                    }
+                    UserEvent::DisplayNameUpdated => {
+                        let data: DisplayNameUpdated = event.to_data().unwrap();
+                        let mut w_users = users.write().await;
+
+                        if let Some(user) = w_users.get_mut(&User::to_id(event.aggregate_id)) {
+                            user.display_name = Some(
+                                bus_name
+                                    .map(|name| format!("{} ({name})", data.display_name))
+                                    .unwrap_or(data.display_name),
+                            );
+                        }
+                    }
+                    _ => {}
+                };
+
+                Ok(())
+            }
+            .boxed()
+        });
+
+    let users: Arc<RwLock<HashMap<String, User>>> = Arc::new(RwLock::new(HashMap::new()));
+    let eu_west_3a = evento
+        .clone()
+        .name("eu-west-3a")
+        .data(users.clone())
+        .subscribe(subscriber.clone())
+        .run(0)
+        .await
+        .unwrap();
+
+    eu_west_3a
+        .publish::<User, _>(
+            "1",
+            vec![
+                Event::new(UserEvent::Created)
+                    .data(Created {
+                        username: "john.doe".to_owned(),
+                        password: "azerty".to_owned(),
+                    })
+                    .unwrap(),
+                Event::new(UserEvent::DisplayNameUpdated)
+                    .data(DisplayNameUpdated {
+                        display_name: "John doe".to_owned(),
+                    })
+                    .unwrap(),
+            ],
+            0,
+        )
+        .await
+        .unwrap();
+
+    sleep(Duration::from_millis(300)).await;
+
+    let user1 = {
+        let r_users = users.read().await;
+        r_users.get("1").cloned().unwrap()
+    };
+
+    assert_eq!(user1.username, "john.doe (eu-west-3a)");
+    assert_eq!(user1.display_name, Some("John doe (eu-west-3a)".to_owned()));
+
+    let subscriber = Subscriber::new("users-last")
+        .set_from_start(false)
+        .filter("user/**")
+        .handler(|event, ctx| {
+            let bus_name = ctx.name();
+            let users = ctx
+                .0
+                .read()
+                .extract::<Arc<RwLock<HashMap<String, User>>>>()
+                .clone();
+
+            async move {
+                let user_event: UserEvent = event.name.parse().unwrap();
+
+                match user_event {
+                    UserEvent::Created => {
+                        let data: Created = event.to_data().unwrap();
+                        let mut w_users = users.write().await;
+                        w_users.insert(
+                            User::to_id(event.aggregate_id),
+                            User {
+                                username: bus_name
+                                    .map(|name| format!("{} ({name})", data.username))
+                                    .unwrap_or(data.username),
+                                password: data.password,
+                                ..Default::default()
+                            },
+                        );
+                    }
+                    UserEvent::DisplayNameUpdated => {
+                        let data: DisplayNameUpdated = event.to_data().unwrap();
+                        let mut w_users = users.write().await;
+
+                        if let Some(user) = w_users.get_mut(&User::to_id(event.aggregate_id)) {
+                            user.display_name = Some(
+                                bus_name
+                                    .map(|name| format!("{} ({name})", data.display_name))
+                                    .unwrap_or(data.display_name),
+                            );
+                        }
+                    }
+                    _ => {}
+                };
+
+                Ok(())
+            }
+            .boxed()
+        });
+
+    let users: Arc<RwLock<HashMap<String, User>>> = Arc::new(RwLock::new(HashMap::new()));
+    let _ = evento
+        .name("eu-west-3a")
+        .data(users.clone())
+        .subscribe(subscriber.clone())
+        .run(0)
+        .await
+        .unwrap();
+
+    sleep(Duration::from_millis(300)).await;
+
+    let user1 = {
+        let r_users = users.read().await;
+        r_users.get("1").cloned().is_none()
+    };
+
+    assert!(user1);
 }
 
 async fn filter<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static>(
