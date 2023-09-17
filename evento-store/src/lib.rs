@@ -159,6 +159,8 @@ pub trait Engine: Clone {
         id: I,
     ) -> Pin<Box<dyn Future<Output = Result<Option<Event>, Error>> + Send + '_>>;
 
+    fn get_last(&self) -> Pin<Box<dyn Future<Output = Result<Option<Event>, Error>> + Send + '_>>;
+
     fn read_all<F: Serialize>(
         &self,
         first: usize,
@@ -254,7 +256,7 @@ impl Engine for MemoryEngine {
             }
         });
 
-        let events = self
+        let mut events = self
             .0
             .read()
             .values()
@@ -262,6 +264,29 @@ impl Engine for MemoryEngine {
             .cloned()
             .collect::<Vec<Event>>();
 
+        events.sort_by(|a, b| {
+            let cmp = a.created_at.partial_cmp(&b.created_at).unwrap();
+
+            match cmp {
+                Ordering::Equal => {}
+                _ => return cmp,
+            };
+
+            let cmp = a.version.partial_cmp(&b.version).unwrap();
+
+            match cmp {
+                Ordering::Equal => a.id.partial_cmp(&b.id).unwrap(),
+                _ => cmp,
+            }
+        });
+
+        let start = (after
+            .map(|id| events.iter().position(|event| event.id == id).unwrap() as i32)
+            .unwrap_or(-1)
+            + 1) as usize;
+
+        let end = std::cmp::min(events.len(), first + 1);
+        let events = events[start..end].to_vec();
         let mut filtered_events = Vec::new();
 
         for event in events.iter() {
@@ -298,42 +323,7 @@ impl Engine for MemoryEngine {
             filtered_events.push(event.clone());
         }
 
-        filtered_events.sort_by(|a, b| {
-            let cmp = a.created_at.partial_cmp(&b.created_at).unwrap();
-
-            match cmp {
-                Ordering::Equal => {}
-                _ => return cmp,
-            };
-
-            let cmp = a.version.partial_cmp(&b.version).unwrap();
-
-            match cmp {
-                Ordering::Equal => a.id.partial_cmp(&b.id).unwrap(),
-                _ => cmp,
-            }
-        });
-
-        let start = (after
-            .map(|id| {
-                filtered_events
-                    .iter()
-                    .position(|event| event.id == id)
-                    .unwrap() as i32
-            })
-            .unwrap_or(-1)
-            + 1) as usize;
-
-        async move {
-            if filtered_events.is_empty() {
-                return Ok(filtered_events);
-            }
-
-            let end = std::cmp::min(filtered_events.len(), first + 1);
-
-            Ok(filtered_events[start..end].to_vec())
-        }
-        .boxed()
+        async move { Ok(filtered_events) }.boxed()
     }
 
     fn get<A: Aggregate, I: Into<String>>(
@@ -348,6 +338,12 @@ impl Engine for MemoryEngine {
                 .get(&id)
                 .and_then(|events| events.first().cloned())
         };
+
+        async move { Ok(event) }.boxed()
+    }
+
+    fn get_last(&self) -> Pin<Box<dyn Future<Output = Result<Option<Event>, Error>> + Send + '_>> {
+        let event = { self.0.read().values().flatten().cloned().last() };
 
         async move { Ok(event) }.boxed()
     }
@@ -611,6 +607,27 @@ impl Engine for PgEngine {
         }
         .boxed()
     }
+
+    fn get_last(&self) -> Pin<Box<dyn Future<Output = Result<Option<Event>, Error>> + Send + '_>> {
+        let pool = self.0.clone();
+        let table_events = self.get_table_name("events");
+        async move {
+            let event = sqlx::query_as::<_, Event>(
+                format!(
+                    r#"
+                    SELECT * from {table_events}
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                "#
+                )
+                .as_str(),
+            )
+            .fetch_optional(&pool)
+            .await?;
+            Ok(event)
+        }
+        .boxed()
+    }
 }
 
 #[derive(Clone)]
@@ -647,5 +664,9 @@ impl<E: Engine> Engine for EventStore<E> {
         id: I,
     ) -> Pin<Box<dyn Future<Output = Result<Option<Event>, Error>> + Send + '_>> {
         self.0.get::<A, _>(id)
+    }
+
+    fn get_last(&self) -> Pin<Box<dyn Future<Output = Result<Option<Event>, Error>> + Send + '_>> {
+        self.0.get_last()
     }
 }
