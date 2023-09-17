@@ -116,7 +116,6 @@ pub async fn create_pg_store(db_name: &str, init: bool) -> (EventStore<PgEngine>
     Migrator::new(Path::new("../migrations"))
         .await
         .unwrap()
-        .set_locking(false)
         .run(&pool)
         .await
         .unwrap();

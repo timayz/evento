@@ -7,6 +7,8 @@ stop:
 down:
 	docker compose down -v --remove-orphans
 
+reset: down up
+
 create:
 	sqlx database create
 

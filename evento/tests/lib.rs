@@ -1,18 +1,14 @@
-use evento::{
-    Aggregate, Engine, Event, Evento, MemoryEngine, PgEngine, PgEvento, SubscirberHandlerError,
-    Subscriber,
-};
+use evento::{Aggregate, Engine, Event, Evento, MemoryEngine, SubscirberHandlerError, Subscriber};
 use evento_store::{Engine as StoreEngine, MemoryEngine as StoreMemoryEngine};
 use futures_util::FutureExt;
 use serde_json::json;
-use sqlx::{Executor, PgPool};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 
-use crate::common::{Created, DisplayNameUpdated, User, UserEvent};
+use crate::common::{create_pg_store, Created, DisplayNameUpdated, User, UserEvent};
 
 mod common;
 
@@ -522,34 +518,4 @@ async fn deadletter<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + S
             "reason": "Connection refused."
         }])
     );
-}
-
-async fn create_pg_store(db_name: &str, reset: bool) -> PgEvento {
-    if reset {
-        let pool = PgPool::connect("postgres://postgres:postgres@localhost:5432/postgres")
-            .await
-            .unwrap();
-
-        let mut conn = pool.acquire().await.unwrap();
-
-        conn.execute(&format!("drop database if exists evento_{db_name};")[..])
-            .await
-            .unwrap();
-
-        conn.execute(&format!("create database evento_{db_name};")[..])
-            .await
-            .unwrap();
-
-        drop(pool);
-    }
-
-    let pool = PgPool::connect(&format!(
-        "postgres://postgres:postgres@localhost:5432/evento_{db_name}"
-    ))
-    .await
-    .unwrap();
-
-    sqlx::migrate!("../migrations").run(&pool).await.unwrap();
-
-    PgEngine::new(pool)
 }

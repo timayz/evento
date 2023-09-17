@@ -314,11 +314,27 @@ impl Engine for MemoryEngine {
 }
 
 #[derive(Clone)]
-pub struct PgEngine(PgPool);
+pub struct PgEngine(PgPool, Option<String>);
 
 impl PgEngine {
     pub fn new(pool: PgPool) -> PgEvento {
-        Evento::new(Self(pool.clone()), evento_store::PgEngine::new(pool))
+        Evento::new(Self(pool.clone(), None), evento_store::PgEngine::new(pool))
+    }
+
+    pub fn new_prefix(pool: PgPool, table_prefix: impl Into<String>) -> PgEvento {
+        let table_prefix = table_prefix.into();
+
+        Evento::new(
+            Self(pool.clone(), Some(table_prefix.to_owned())),
+            evento_store::PgEngine::new_prefix(pool, table_prefix),
+        )
+    }
+
+    fn get_table_name(&self, name: impl Into<String>) -> String {
+        match self.1.as_ref() {
+            Some(prefix) => format!("evento_{prefix}_{}", name.into()),
+            _ => format!("evento_{}", name.into()),
+        }
     }
 }
 
@@ -330,16 +346,21 @@ impl Engine for PgEngine {
     ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
         let pool = self.0.clone();
         let key = key.into();
+        let table_subscriptions = self.get_table_name("subscriptions");
+
         async move {
             sqlx::query_as::<_, (Uuid,)>(
-                r#"
-                INSERT INTO evento_subscriptions (id, consumer_id, key, enabled, created_at)
+                format!(
+                    r#"
+                INSERT INTO {table_subscriptions} (id, consumer_id, key, enabled, created_at)
                 VALUES ($1, $2, $3, $4, $5)
                 ON CONFLICT (key)
                 DO
                     UPDATE SET consumer_id = $2
                 RETURNING id
-                "#,
+                "#
+                )
+                .as_str(),
             )
             .bind(Uuid::new_v4())
             .bind(consumer_id)
@@ -359,11 +380,15 @@ impl Engine for PgEngine {
     ) -> Pin<Box<dyn Future<Output = Result<Subscription, StoreError>> + Send + '_>> {
         let pool = self.0.clone();
         let key = key.into();
+        let table_subscriptions = self.get_table_name("subscriptions");
         async move {
             let sub = sqlx::query_as::<_, Subscription>(
-                r#"
-                SELECT * from evento_subscriptions WHERE key = $1
-                "#,
+                format!(
+                    r#"
+                SELECT * from {table_subscriptions} WHERE key = $1
+                "#
+                )
+                .as_str(),
             )
             .bind(&key)
             .fetch_one(&pool)
@@ -378,14 +403,18 @@ impl Engine for PgEngine {
         subscription: Subscription,
     ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
         let pool = self.0.clone();
+        let table_subscriptions = self.get_table_name("subscriptions");
         async move {
             sqlx::query_as::<_, (Uuid,)>(
-                r#"
-                UPDATE evento_subscriptions
+                format!(
+                    r#"
+                UPDATE {table_subscriptions}
                 SET cursor = $2, updated_at = $3
                 WHERE key = $1
                 RETURNING id
-                "#,
+                "#
+                )
+                .as_str(),
             )
             .bind(&subscription.key)
             .bind(subscription.cursor)
@@ -402,13 +431,14 @@ impl Engine for PgEngine {
         events: Vec<Event>,
     ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
         let pool = self.0.clone();
+        let table_deadletters = self.get_table_name("deadletters");
 
         async move {
             let mut tx = pool.begin().await?;
 
             for events in events.chunks(100).collect::<Vec<&[Event]>>() {
                 let mut query_builder: QueryBuilder<Postgres> = QueryBuilder::new(
-                    "INSERT INTO evento_deadletters (id, name, aggregate_id, version, data, metadata, created_at) "
+                    format!("INSERT INTO {table_deadletters} (id, name, aggregate_id, version, data, metadata, created_at) ")
                 );
 
                 query_builder.push_values(events, |mut b, event| {
@@ -436,17 +466,19 @@ impl Engine for PgEngine {
         after: Option<Uuid>,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Event>, StoreError>> + Send + '_>> {
         let pool = self.0.clone();
+        let table_events = self.get_table_name("events");
+        let table_deadletters = self.get_table_name("deadletters");
 
         async move {
             let limit = first as i16;
             let cursor = match after {
                 Some(id) => Some(
                     sqlx::query_as::<_, Event>(
-                        r#"
-                        SELECT * from evento_events
+                        format!(r#"
+                        SELECT * from {table_events}
                         WHERE id = $1
                         LIMIT 1
-                        "#,
+                        "#).as_str(),
                     )
                     .bind(id)
                     .fetch_one(&pool)
@@ -457,12 +489,12 @@ impl Engine for PgEngine {
             let events = match cursor {
                 Some(cursor) => {
                     sqlx::query_as::<_, Event>(
-                        r#"
-                    SELECT * from evento_deadletters
-                    WHERE created_at > $1 OR (created_at = $1 AND (version > $2 OR (version = $2 AND id > $3)))
-                    ORDER BY created_at ASC, version ASC, id ASC
-                    LIMIT $3
-                    "#,
+                        format!(r#"
+                        SELECT * from {table_deadletters}
+                        WHERE created_at > $1 OR (created_at = $1 AND (version > $2 OR (version = $2 AND id > $3)))
+                        ORDER BY created_at ASC, version ASC, id ASC
+                        LIMIT $3
+                        "#).as_str(),
                     )
                     .bind(cursor.created_at)
                     .bind(cursor.version)
@@ -473,11 +505,11 @@ impl Engine for PgEngine {
                 }
                 _ => {
                     sqlx::query_as::<_, Event>(
-                        r#"
-                    SELECT * from evento_deadletters
-                    ORDER BY created_at ASC, version ASC, id ASC
-                    LIMIT $1
-                    "#,
+                        format!(r#"
+                        SELECT * from {table_deadletters}
+                        ORDER BY created_at ASC, version ASC, id ASC
+                        LIMIT $1
+                        "#).as_str(),
                     )
                     .bind(limit)
                     .fetch_all(&pool)
