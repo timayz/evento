@@ -327,7 +327,11 @@ pub struct PgEngine(PgPool, Option<String>);
 
 impl PgEngine {
     pub fn new(pool: PgPool) -> PgEvento {
-        Evento::new(Self(pool.clone(), None), evento_store::PgEngine::new(pool))
+        Evento::new(
+            Self(pool.clone(), None),
+            evento_store::PgEngine::new(pool.clone()),
+        )
+        .data(pool)
     }
 
     pub fn new_prefix(pool: PgPool, table_prefix: impl Into<String>) -> PgEvento {
@@ -335,8 +339,9 @@ impl PgEngine {
 
         Evento::new(
             Self(pool.clone(), Some(table_prefix.to_owned())),
-            evento_store::PgEngine::new_prefix(pool, table_prefix),
+            evento_store::PgEngine::new_prefix(pool.clone(), table_prefix),
         )
+        .data(pool)
     }
 
     fn get_table_name(&self, name: impl Into<String>) -> String {
