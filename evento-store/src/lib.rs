@@ -410,7 +410,7 @@ impl Engine for PgEngine {
             }
 
             let next_event_id = sqlx::query_as::<_, Event>(
-                format!("SELECT * FROM {table_events} WHERE aggregate_id = $1 AND version = $2 LIMIT 1").as_str(),
+                format!("SELECT * FROM {table_events} WHERE aggregate_id = $1 AND version = $2 ORDER BY created_at ASC LIMIT 1").as_str(),
             )
             .bind(&id)
             .bind(original_version + 1)
