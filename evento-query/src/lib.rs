@@ -13,6 +13,12 @@ use sqlx::{
 };
 use std::{fmt::Debug, marker::PhantomData, str::FromStr};
 
+#[derive(Debug, Clone)]
+pub enum QueryOrder {
+    Asc,
+    Desc,
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum CursorError {
     #[error("{0}")]
@@ -136,20 +142,21 @@ pub trait Cursor: Sized {
         Self::deserialize(data.split('|').collect())
     }
 
-    fn to_pg_filter(backward: bool) -> String {
-        Self::to_pg_filter_opts(backward, None, None)
-    }
-
-    fn to_pg_filter_with_pos(backward: bool, pos: usize) -> String {
-        Self::to_pg_filter_opts(backward, None, Some(pos))
-    }
-
-    fn to_pg_filter_opts(backward: bool, keys: Option<Vec<&str>>, pos: Option<usize>) -> String {
+    fn to_pg_filter_opts(
+        order: &QueryOrder,
+        backward: bool,
+        keys: Option<Vec<&str>>,
+        pos: Option<usize>,
+    ) -> String {
         let pos = pos.unwrap_or(1);
         let with_braket = keys.is_some();
         let mut keys = keys.unwrap_or(Self::keys());
         let key = keys.remove(0);
-        let sign = if backward { "<" } else { ">" };
+
+        let sign = match (order, backward) {
+            (QueryOrder::Asc, true) | (QueryOrder::Desc, false) => "<",
+            (QueryOrder::Asc, false) | (QueryOrder::Desc, true) => ">",
+        };
         let filter = format!("{key} {sign} ${pos}");
 
         if keys.is_empty() {
@@ -158,7 +165,7 @@ pub trait Cursor: Sized {
 
         let filter = format!(
             "{filter} OR ({key} = ${pos} AND {})",
-            Self::to_pg_filter_opts(backward, Some(keys), Some(pos + 1))
+            Self::to_pg_filter_opts(order, backward, Some(keys), Some(pos + 1))
         );
 
         if with_braket {
@@ -168,8 +175,12 @@ pub trait Cursor: Sized {
         }
     }
 
-    fn to_pg_order(backward: bool) -> String {
-        let order = if backward { "DESC" } else { "ASC" };
+    fn to_pg_order(order: &QueryOrder, backward: bool) -> String {
+        let order = match (order, backward) {
+            (QueryOrder::Asc, true) | (QueryOrder::Desc, false) => "DESC",
+            (QueryOrder::Asc, false) | (QueryOrder::Desc, true) => "ASC",
+        };
+
         Self::keys()
             .iter()
             .map(|key| format!("{key} {order}"))
@@ -257,6 +268,7 @@ where
     limit: u16,
     bind_pos: usize,
     arguments: PgArguments,
+    order: QueryOrder,
 }
 
 impl<'q, O> Query<'q, O>
@@ -275,12 +287,18 @@ where
             limit: 0,
             bind_pos: 1,
             arguments: PgArguments::default(),
+            order: QueryOrder::Asc,
         }
     }
 
     pub fn bind<T: 'q + Send + Encode<'q, Postgres> + Type<Postgres>>(mut self, value: T) -> Self {
         self.arguments.add(value);
         self.bind_pos += 1;
+        self
+    }
+
+    pub fn order(mut self, value: QueryOrder) -> Self {
+        self.order = value;
         self
     }
 
@@ -300,7 +318,8 @@ where
         };
 
         if cursor.is_some() {
-            let filter = O::to_pg_filter_with_pos(args.is_backward(), self.bind_pos);
+            let filter =
+                O::to_pg_filter_opts(&self.order, args.is_backward(), None, Some(self.bind_pos));
 
             let filter = if self.builder.sql().contains(" WHERE ") {
                 format!(" AND ({filter})")
@@ -311,7 +330,7 @@ where
             self.builder.push(format!(" {filter}"));
         }
 
-        let order = O::to_pg_order(args.is_backward());
+        let order = O::to_pg_order(&self.order, args.is_backward());
         self.builder
             .push(format!(" ORDER BY {order} LIMIT {}", limit + 1));
 
