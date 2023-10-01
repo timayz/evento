@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 mod context;
 mod data;
 
@@ -79,6 +81,12 @@ type SubscirberHandler =
     fn(
         e: Event,
         ctx: EventoContext,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Event>, SubscirberHandlerError>> + Send>>;
+
+type SubscirberPostHandler =
+    fn(
+        e: Event,
+        ctx: EventoContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), SubscirberHandlerError>> + Send>>;
 
 #[derive(Clone)]
@@ -86,6 +94,7 @@ pub struct Subscriber {
     key: String,
     filters: Vec<String>,
     handlers: Vec<SubscirberHandler>,
+    post_handlers: Vec<SubscirberPostHandler>,
     from_start: bool,
 }
 
@@ -95,6 +104,7 @@ impl Subscriber {
             key: key.into(),
             filters: Vec::new(),
             handlers: Vec::new(),
+            post_handlers: Vec::new(),
             from_start: true,
         }
     }
@@ -107,6 +117,12 @@ impl Subscriber {
 
     pub fn handler(mut self, handler: SubscirberHandler) -> Self {
         self.handlers.push(handler);
+
+        self
+    }
+
+    pub fn post_handler(mut self, handler: SubscirberPostHandler) -> Self {
+        self.post_handlers.push(handler);
 
         self
     }
@@ -769,12 +785,36 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
 
                     let futures = sub.handlers.iter().map(|h| h(event.clone(), ctx.clone()));
                     let results = join_all(futures).await;
-                    let event_errors = results
+                    let mut futures = vec![];
+                    let mut event_errors = vec![];
+
+                    for (i, res) in results.iter().enumerate() {
+                        if let Err(e) = res {
+                            tracing::error!(
+                                "{:?} failed to handle event id={}, name={}, error={}",
+                                &sub.key,
+                                &event.aggregate_id,
+                                &event.name,
+                                e
+                            );
+
+                            event_errors.push(e);
+
+                            continue;
+                        }
+
+                        if let (Ok(Some(event)), Some(handler)) = (res, sub.post_handlers.get(i)) {
+                            futures.push(handler(event.clone(), ctx.clone()));
+                        }
+                    }
+
+                    let results = join_all(futures).await;
+                    let post_event_errors = results
                         .iter()
                         .filter_map(|res| match res {
                             Err(e) => {
                                 tracing::error!(
-                                    "{:?} failed to handle event id={}, name={}, error={}",
+                                    "{:?} failed to post handle event id={}, name={}, error={}",
                                     &sub.key,
                                     &event.aggregate_id,
                                     &event.name,
@@ -785,6 +825,8 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
                             _ => None,
                         })
                         .collect::<Vec<&SubscirberHandlerError>>();
+
+                    event_errors.extend(post_event_errors);
 
                     if !event_errors.is_empty() {
                         let mut metadata = match event.to_metadata::<HashMap<String, Value>>() {

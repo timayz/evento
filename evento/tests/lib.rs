@@ -118,7 +118,7 @@ async fn publish<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send
                     _ => {}
                 };
 
-                Ok(())
+                Ok(None)
             }
             .boxed()
         });
@@ -265,7 +265,7 @@ async fn from_last<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Se
                     _ => {}
                 };
 
-                Ok(())
+                Ok(None)
             }
             .boxed()
         });
@@ -355,7 +355,7 @@ async fn from_last<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Se
                     _ => {}
                 };
 
-                Ok(())
+                Ok(None)
             }
             .boxed()
         });
@@ -427,7 +427,7 @@ async fn filter<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send 
                             _ => {}
                         };
 
-                        Ok(())
+                        Ok(None)
                     }
                     .boxed()
                 }),
@@ -446,7 +446,7 @@ async fn filter<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send 
                             *users_count += 1;
                         };
 
-                        Ok(())
+                        Ok(None)
                     }
                     .boxed()
                 }),
@@ -583,7 +583,7 @@ async fn deadletter<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + S
                             _ => {}
                         };
 
-                        Ok(())
+                        Ok(None)
                     }
                     .boxed()
                 })
@@ -598,7 +598,7 @@ async fn deadletter<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + S
                             ));
                         };
 
-                        Ok(())
+                        Ok(None)
                     }
                     .boxed()
                 }),
