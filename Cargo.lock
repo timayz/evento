@@ -528,7 +528,7 @@ checksum = "0206175f82b8d6bf6652ff7d71a1e27fd2e4efde587fd368662814d6ec1d9ce0"
 
 [[package]]
 name = "evento"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "backoff",
  "chrono",
@@ -548,7 +548,7 @@ dependencies = [
 
 [[package]]
 name = "evento-axum"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -558,7 +558,7 @@ dependencies = [
 
 [[package]]
 name = "evento-query"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "backoff",
  "base64 0.21.4",
@@ -582,7 +582,7 @@ dependencies = [
 
 [[package]]
 name = "evento-store"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "backoff",
  "chrono",
@@ -599,7 +599,7 @@ dependencies = [
 
 [[package]]
 name = "example"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1107,9 +1107,9 @@ checksum = "0717cef1bc8b636c6e1c1bbdefc09e6322da8a9321966e8928ef80d20f7f770f"
 
 [[package]]
 name = "linux-raw-sys"
-version = "0.4.7"
+version = "0.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a9bad9f94746442c783ca431b22403b519cd7fbeed0533fdd6328b2f2212128"
+checksum = "3852614a3bd9ca9804678ba6be5e3b8ce76dfc902cae004e3e0c44051b6e88db"
 
 [[package]]
 name = "lock_api"
@@ -1580,9 +1580,9 @@ dependencies = [
 
 [[package]]
 name = "regex"
-version = "1.9.5"
+version = "1.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "697061221ea1b4a94a624f67d0ae2bfe4e22b8a17b6a192afb11046542cc8c47"
+checksum = "ebee201405406dbf528b8b672104ae6d6d63e6d118cb10e4d51abbc7b58044ff"
 dependencies = [
  "aho-corasick",
  "memchr",
@@ -1592,9 +1592,9 @@ dependencies = [
 
 [[package]]
 name = "regex-automata"
-version = "0.3.8"
+version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2f401f4955220693b56f8ec66ee9c78abffd8d1c4f23dc41a23839eb88f0795"
+checksum = "59b23e92ee4318893fa3fe3e6fb365258efbfe6ac6ab30f090cdcbb7aa37efa9"
 dependencies = [
  "aho-corasick",
  "memchr",
@@ -1690,9 +1690,9 @@ dependencies = [
 
 [[package]]
 name = "rustix"
-version = "0.38.14"
+version = "0.38.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "747c788e9ce8e92b12cd485c49ddf90723550b654b32508f979b71a7b1ecda4f"
+checksum = "d2f9da0cbd88f9f09e7814e388301c8414c51c62aa6ce1e4b5c551d49d96e531"
 dependencies = [
  "bitflags 2.4.0",
  "errno",
