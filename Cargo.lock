@@ -528,7 +528,7 @@ checksum = "0206175f82b8d6bf6652ff7d71a1e27fd2e4efde587fd368662814d6ec1d9ce0"
 
 [[package]]
 name = "evento"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "backoff",
  "chrono",
@@ -548,7 +548,7 @@ dependencies = [
 
 [[package]]
 name = "evento-axum"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -558,7 +558,7 @@ dependencies = [
 
 [[package]]
 name = "evento-query"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "backoff",
  "base64 0.21.4",
@@ -582,7 +582,7 @@ dependencies = [
 
 [[package]]
 name = "evento-store"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "backoff",
  "chrono",
@@ -599,7 +599,7 @@ dependencies = [
 
 [[package]]
 name = "example"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "axum",
