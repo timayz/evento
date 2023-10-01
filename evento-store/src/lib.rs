@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use chrono::{DateTime, Utc};
 use futures_util::FutureExt;
 use parking_lot::RwLock;

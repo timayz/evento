@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use base64::{
     alphabet,
     engine::{general_purpose, GeneralPurpose},

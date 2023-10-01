@@ -110,7 +110,7 @@ pub fn subscribe() -> Subscriber {
                     }
                 };
 
-                Ok(())
+                Ok(None)
             }
             .boxed()
         })

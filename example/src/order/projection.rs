@@ -64,7 +64,7 @@ pub fn subscribe() -> Subscriber {
                         let mut order =
                             match collection.find_one(filter.clone(), None).await.unwrap() {
                                 Some(order) => order,
-                                None => return Ok(()),
+                                _ => return Ok(None),
                             };
 
                         let product = order.products.entry(data.id).or_default();
@@ -86,7 +86,7 @@ pub fn subscribe() -> Subscriber {
                         let mut order =
                             match collection.find_one(filter.clone(), None).await.unwrap() {
                                 Some(order) => order,
-                                None => return Ok(()),
+                                _ => return Ok(None),
                             };
 
                         order.products.remove(&data.id);
@@ -107,7 +107,7 @@ pub fn subscribe() -> Subscriber {
                         let mut order =
                             match collection.find_one(filter.clone(), None).await.unwrap() {
                                 Some(order) => order,
-                                None => return Ok(()),
+                                _ => return Ok(None),
                             };
 
                         let product = order.products.entry(data.id).or_default();
@@ -172,7 +172,7 @@ pub fn subscribe() -> Subscriber {
                     }
                 };
 
-                Ok(())
+                Ok(None)
             }
             .boxed()
         })
