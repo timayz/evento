@@ -491,7 +491,7 @@ async fn query_as_desc() {
     query_builder.build().execute(&db).await.unwrap();
 
     let res = Query::<Event>::new("select * from evento_events")
-        .order(QueryOrder::Desc)
+        .desc()
         .build(Default::default())
         .fetch_all(&db)
         .await

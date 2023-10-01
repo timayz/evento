@@ -304,6 +304,10 @@ where
         self
     }
 
+    pub fn desc(self) -> Self {
+        self.order(QueryOrder::Desc)
+    }
+
     pub fn backward(self, last: u16, before: Option<impl Into<String>>) -> Self {
         self.build(QueryArgs::backward(last, before))
     }
