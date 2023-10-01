@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, QueryBuilder};
 use std::{
-    cmp::Ordering, collections::HashMap, fmt, future::Future, pin::Pin, sync::Arc, time::Duration,
+    cmp::Ordering, collections::HashMap, future::Future, pin::Pin, sync::Arc, time::Duration,
 };
 use tokio::time::{interval_at, sleep, Instant};
 use uuid::Uuid;
@@ -32,62 +32,25 @@ pub struct Subscription {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Clone, Serialize, Debug)]
-pub struct SubscirberHandlerError {
-    pub code: String,
-    pub reason: String,
+#[derive(Debug, thiserror::Error)]
+pub enum SubscirberHandlerError {
+    #[error("[{0}] {1}")]
+    Reason(String, String),
 }
 
 impl SubscirberHandlerError {
     pub fn new<C: Into<String>, R: Into<String>>(code: C, reason: R) -> Self {
-        Self {
-            code: code.into(),
-            reason: reason.into(),
-        }
+        Self::Reason(code.into(), reason.into())
     }
 }
 
-impl fmt::Display for SubscirberHandlerError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "code={},reason={}", self.code, self.reason)
-    }
-}
-
-impl From<serde_json::Error> for SubscirberHandlerError {
-    fn from(e: serde_json::Error) -> Self {
-        SubscirberHandlerError::new("serde_json::Error", e.to_string())
-    }
-}
-
-impl From<StoreError> for SubscirberHandlerError {
-    fn from(e: StoreError) -> Self {
-        SubscirberHandlerError::new("evento::store::StoreError", e.to_string())
-    }
-}
-
-impl From<sqlx::Error> for SubscirberHandlerError {
-    fn from(e: sqlx::Error) -> Self {
-        SubscirberHandlerError::new("sqlx::Error", e.to_string())
-    }
-}
-
-impl From<uuid::Error> for SubscirberHandlerError {
-    fn from(e: uuid::Error) -> Self {
-        SubscirberHandlerError::new("uuid::Error", e.to_string())
-    }
-}
-
-type SubscirberHandler =
-    fn(
-        e: Event,
-        ctx: EventoContext,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<Event>, SubscirberHandlerError>> + Send>>;
+type SubscirberHandler = fn(
+    e: Event,
+    ctx: EventoContext,
+) -> Pin<Box<dyn Future<Output = anyhow::Result<Option<Event>>> + Send>>;
 
 type SubscirberPostHandler =
-    fn(
-        e: Event,
-        ctx: EventoContext,
-    ) -> Pin<Box<dyn Future<Output = Result<(), SubscirberHandlerError>> + Send>>;
+    fn(e: Event, ctx: EventoContext) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>;
 
 #[derive(Clone)]
 pub struct Subscriber {
@@ -798,7 +761,7 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
                                 e
                             );
 
-                            event_errors.push(e);
+                            event_errors.push(e.to_string());
 
                             continue;
                         }
@@ -820,11 +783,11 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
                                     &event.name,
                                     e
                                 );
-                                Some(e)
+                                Some(e.to_string())
                             }
                             _ => None,
                         })
-                        .collect::<Vec<&SubscirberHandlerError>>();
+                        .collect::<Vec<String>>();
 
                     event_errors.extend(post_event_errors);
 
