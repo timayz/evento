@@ -595,7 +595,8 @@ async fn deadletter<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + S
                             return Err(SubscirberHandlerError::new(
                                 "send_email",
                                 "Connection refused.",
-                            ));
+                            )
+                            .into());
                         };
 
                         Ok(None)
@@ -684,11 +685,5 @@ async fn deadletter<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + S
     let errors = metadata.get("_evento_errors").unwrap();
 
     assert_eq!(subscription_key.clone(), json!("eu-west-3a.users"));
-    assert_eq!(
-        errors.clone(),
-        json!([{
-            "code":"send_email",
-            "reason": "Connection refused."
-        }])
-    );
+    assert_eq!(errors.clone(), json!(["[send_email] Connection refused."]));
 }
