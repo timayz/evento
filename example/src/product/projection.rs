@@ -1,4 +1,4 @@
-use evento::{Aggregate, Subscriber, PgSubscriber};
+use evento::{Aggregate, PgSubscriber, Subscriber};
 use futures::FutureExt;
 use mongodb::{
     bson::{doc, to_bson},
