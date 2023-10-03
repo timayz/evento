@@ -75,53 +75,51 @@ async fn publish<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send
     eu_west_3b: Evento<E, S>,
     us_east_1a: Evento<E, S>,
 ) {
-    let subscriber = Subscriber::new("users")
-        .filter("user/**")
-        .handler(|event, ctx| {
-            let bus_name = ctx.name();
-            let users = ctx
-                .0
-                .read()
-                .extract::<Arc<RwLock<HashMap<String, User>>>>()
-                .clone();
+    let subscriber = Subscriber::new("users").handler("user/**", |event, ctx| {
+        let bus_name = ctx.name();
+        let users = ctx
+            .0
+            .read()
+            .extract::<Arc<RwLock<HashMap<String, User>>>>()
+            .clone();
 
-            async move {
-                let user_event: UserEvent = event.name.parse().unwrap();
+        async move {
+            let user_event: UserEvent = event.name.parse().unwrap();
 
-                match user_event {
-                    UserEvent::Created => {
-                        let data: Created = event.to_data().unwrap();
-                        let mut w_users = users.write().await;
-                        w_users.insert(
-                            User::to_id(event.aggregate_id),
-                            User {
-                                username: bus_name
-                                    .map(|name| format!("{} ({name})", data.username))
-                                    .unwrap_or(data.username),
-                                password: data.password,
-                                ..Default::default()
-                            },
+            match user_event {
+                UserEvent::Created => {
+                    let data: Created = event.to_data().unwrap();
+                    let mut w_users = users.write().await;
+                    w_users.insert(
+                        User::to_id(event.aggregate_id),
+                        User {
+                            username: bus_name
+                                .map(|name| format!("{} ({name})", data.username))
+                                .unwrap_or(data.username),
+                            password: data.password,
+                            ..Default::default()
+                        },
+                    );
+                }
+                UserEvent::DisplayNameUpdated => {
+                    let data: DisplayNameUpdated = event.to_data().unwrap();
+                    let mut w_users = users.write().await;
+
+                    if let Some(user) = w_users.get_mut(&User::to_id(event.aggregate_id)) {
+                        user.display_name = Some(
+                            bus_name
+                                .map(|name| format!("{} ({name})", data.display_name))
+                                .unwrap_or(data.display_name),
                         );
                     }
-                    UserEvent::DisplayNameUpdated => {
-                        let data: DisplayNameUpdated = event.to_data().unwrap();
-                        let mut w_users = users.write().await;
+                }
+                _ => {}
+            };
 
-                        if let Some(user) = w_users.get_mut(&User::to_id(event.aggregate_id)) {
-                            user.display_name = Some(
-                                bus_name
-                                    .map(|name| format!("{} ({name})", data.display_name))
-                                    .unwrap_or(data.display_name),
-                            );
-                        }
-                    }
-                    _ => {}
-                };
-
-                Ok(None)
-            }
-            .boxed()
-        });
+            Ok(None)
+        }
+        .boxed()
+    });
 
     let users: Arc<RwLock<HashMap<String, User>>> = Arc::new(RwLock::new(HashMap::new()));
     let eu_west_3a = eu_west_3a
@@ -222,53 +220,51 @@ async fn publish<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send
 async fn from_last<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static>(
     evento: Evento<E, S>,
 ) {
-    let subscriber = Subscriber::new("users")
-        .filter("user/**")
-        .handler(|event, ctx| {
-            let bus_name = ctx.name();
-            let users = ctx
-                .0
-                .read()
-                .extract::<Arc<RwLock<HashMap<String, User>>>>()
-                .clone();
+    let subscriber = Subscriber::new("users").handler("user/**", |event, ctx| {
+        let bus_name = ctx.name();
+        let users = ctx
+            .0
+            .read()
+            .extract::<Arc<RwLock<HashMap<String, User>>>>()
+            .clone();
 
-            async move {
-                let user_event: UserEvent = event.name.parse().unwrap();
+        async move {
+            let user_event: UserEvent = event.name.parse().unwrap();
 
-                match user_event {
-                    UserEvent::Created => {
-                        let data: Created = event.to_data().unwrap();
-                        let mut w_users = users.write().await;
-                        w_users.insert(
-                            User::to_id(event.aggregate_id),
-                            User {
-                                username: bus_name
-                                    .map(|name| format!("{} ({name})", data.username))
-                                    .unwrap_or(data.username),
-                                password: data.password,
-                                ..Default::default()
-                            },
+            match user_event {
+                UserEvent::Created => {
+                    let data: Created = event.to_data().unwrap();
+                    let mut w_users = users.write().await;
+                    w_users.insert(
+                        User::to_id(event.aggregate_id),
+                        User {
+                            username: bus_name
+                                .map(|name| format!("{} ({name})", data.username))
+                                .unwrap_or(data.username),
+                            password: data.password,
+                            ..Default::default()
+                        },
+                    );
+                }
+                UserEvent::DisplayNameUpdated => {
+                    let data: DisplayNameUpdated = event.to_data().unwrap();
+                    let mut w_users = users.write().await;
+
+                    if let Some(user) = w_users.get_mut(&User::to_id(event.aggregate_id)) {
+                        user.display_name = Some(
+                            bus_name
+                                .map(|name| format!("{} ({name})", data.display_name))
+                                .unwrap_or(data.display_name),
                         );
                     }
-                    UserEvent::DisplayNameUpdated => {
-                        let data: DisplayNameUpdated = event.to_data().unwrap();
-                        let mut w_users = users.write().await;
+                }
+                _ => {}
+            };
 
-                        if let Some(user) = w_users.get_mut(&User::to_id(event.aggregate_id)) {
-                            user.display_name = Some(
-                                bus_name
-                                    .map(|name| format!("{} ({name})", data.display_name))
-                                    .unwrap_or(data.display_name),
-                            );
-                        }
-                    }
-                    _ => {}
-                };
-
-                Ok(None)
-            }
-            .boxed()
-        });
+            Ok(None)
+        }
+        .boxed()
+    });
 
     let users: Arc<RwLock<HashMap<String, User>>> = Arc::new(RwLock::new(HashMap::new()));
     let eu_west_3a = evento
@@ -311,54 +307,54 @@ async fn from_last<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Se
     assert_eq!(user1.username, "john.doe (eu-west-3a)");
     assert_eq!(user1.display_name, Some("John doe (eu-west-3a)".to_owned()));
 
-    let subscriber = Subscriber::new("users-last")
-        .set_from_start(false)
-        .filter("user/**")
-        .handler(|event, ctx| {
-            let bus_name = ctx.name();
-            let users = ctx
-                .0
-                .read()
-                .extract::<Arc<RwLock<HashMap<String, User>>>>()
-                .clone();
+    let subscriber =
+        Subscriber::new("users-last")
+            .set_from_start(false)
+            .handler("user/**", |event, ctx| {
+                let bus_name = ctx.name();
+                let users = ctx
+                    .0
+                    .read()
+                    .extract::<Arc<RwLock<HashMap<String, User>>>>()
+                    .clone();
 
-            async move {
-                let user_event: UserEvent = event.name.parse().unwrap();
+                async move {
+                    let user_event: UserEvent = event.name.parse().unwrap();
 
-                match user_event {
-                    UserEvent::Created => {
-                        let data: Created = event.to_data().unwrap();
-                        let mut w_users = users.write().await;
-                        w_users.insert(
-                            User::to_id(event.aggregate_id),
-                            User {
-                                username: bus_name
-                                    .map(|name| format!("{} ({name})", data.username))
-                                    .unwrap_or(data.username),
-                                password: data.password,
-                                ..Default::default()
-                            },
-                        );
-                    }
-                    UserEvent::DisplayNameUpdated => {
-                        let data: DisplayNameUpdated = event.to_data().unwrap();
-                        let mut w_users = users.write().await;
-
-                        if let Some(user) = w_users.get_mut(&User::to_id(event.aggregate_id)) {
-                            user.display_name = Some(
-                                bus_name
-                                    .map(|name| format!("{} ({name})", data.display_name))
-                                    .unwrap_or(data.display_name),
+                    match user_event {
+                        UserEvent::Created => {
+                            let data: Created = event.to_data().unwrap();
+                            let mut w_users = users.write().await;
+                            w_users.insert(
+                                User::to_id(event.aggregate_id),
+                                User {
+                                    username: bus_name
+                                        .map(|name| format!("{} ({name})", data.username))
+                                        .unwrap_or(data.username),
+                                    password: data.password,
+                                    ..Default::default()
+                                },
                             );
                         }
-                    }
-                    _ => {}
-                };
+                        UserEvent::DisplayNameUpdated => {
+                            let data: DisplayNameUpdated = event.to_data().unwrap();
+                            let mut w_users = users.write().await;
 
-                Ok(None)
-            }
-            .boxed()
-        });
+                            if let Some(user) = w_users.get_mut(&User::to_id(event.aggregate_id)) {
+                                user.display_name = Some(
+                                    bus_name
+                                        .map(|name| format!("{} ({name})", data.display_name))
+                                        .unwrap_or(data.display_name),
+                                );
+                            }
+                        }
+                        _ => {}
+                    };
+
+                    Ok(None)
+                }
+                .boxed()
+            });
 
     let users: Arc<RwLock<HashMap<String, User>>> = Arc::new(RwLock::new(HashMap::new()));
     let _ = evento
@@ -388,68 +384,59 @@ async fn filter<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send 
         .name("eu-west-3a")
         .data(users.clone())
         .data(users_count.clone())
-        .subscribe(
-            Subscriber::new("users")
-                .filter("user/**")
-                .handler(|event, ctx| {
-                    let users = ctx
-                        .0
-                        .read()
-                        .extract::<Arc<RwLock<HashMap<String, User>>>>()
-                        .clone();
+        .subscribe(Subscriber::new("users").handler("user/**", |event, ctx| {
+            let users = ctx
+                .0
+                .read()
+                .extract::<Arc<RwLock<HashMap<String, User>>>>()
+                .clone();
 
-                    async move {
-                        let user_event: UserEvent = event.name.parse().unwrap();
+            async move {
+                let user_event: UserEvent = event.name.parse().unwrap();
 
-                        match user_event {
-                            UserEvent::Created => {
-                                let data: Created = event.to_data().unwrap();
-                                let mut w_users = users.write().await;
-                                w_users.insert(
-                                    User::to_id(event.aggregate_id),
-                                    User {
-                                        username: data.username,
-                                        password: data.password,
-                                        ..Default::default()
-                                    },
-                                );
-                            }
-                            UserEvent::DisplayNameUpdated => {
-                                let data: DisplayNameUpdated = event.to_data().unwrap();
-                                let mut w_users = users.write().await;
-
-                                if let Some(user) =
-                                    w_users.get_mut(&User::to_id(event.aggregate_id))
-                                {
-                                    user.display_name = Some(data.display_name);
-                                }
-                            }
-                            _ => {}
-                        };
-
-                        Ok(None)
+                match user_event {
+                    UserEvent::Created => {
+                        let data: Created = event.to_data().unwrap();
+                        let mut w_users = users.write().await;
+                        w_users.insert(
+                            User::to_id(event.aggregate_id),
+                            User {
+                                username: data.username,
+                                password: data.password,
+                                ..Default::default()
+                            },
+                        );
                     }
-                    .boxed()
-                }),
-        )
-        .subscribe(
-            Subscriber::new("user-count")
-                .filter("user/1/*")
-                .filter("user/2/*")
-                .handler(|event, ctx| {
-                    let users_count = ctx.0.read().extract::<Arc<RwLock<i32>>>().clone();
-                    async move {
-                        let user_event: UserEvent = event.name.parse().unwrap();
+                    UserEvent::DisplayNameUpdated => {
+                        let data: DisplayNameUpdated = event.to_data().unwrap();
+                        let mut w_users = users.write().await;
 
-                        if let UserEvent::Created = user_event {
-                            let mut users_count = users_count.write().await;
-                            *users_count += 1;
-                        };
-
-                        Ok(None)
+                        if let Some(user) = w_users.get_mut(&User::to_id(event.aggregate_id)) {
+                            user.display_name = Some(data.display_name);
+                        }
                     }
-                    .boxed()
-                }),
+                    _ => {}
+                };
+
+                Ok(None)
+            }
+            .boxed()
+        }))
+        .subscribe(
+            Subscriber::new("user-count").handler("user/{1,2}/*", |event, ctx| {
+                let users_count = ctx.0.read().extract::<Arc<RwLock<i32>>>().clone();
+                async move {
+                    let user_event: UserEvent = event.name.parse().unwrap();
+
+                    if let UserEvent::Created = user_event {
+                        let mut users_count = users_count.write().await;
+                        *users_count += 1;
+                    };
+
+                    Ok(None)
+                }
+                .boxed()
+            }),
         )
         .run(0)
         .await
@@ -546,8 +533,7 @@ async fn deadletter<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + S
         .data(users.clone())
         .subscribe(
             Subscriber::new("users")
-                .filter("user/**")
-                .handler(|event, ctx| {
+                .handler("user/**", |event, ctx| {
                     let users = ctx
                         .0
                         .read()
@@ -569,6 +555,12 @@ async fn deadletter<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + S
                                         ..Default::default()
                                     },
                                 );
+
+                                return Err(SubscirberHandlerError::new(
+                                    "send_email",
+                                    "Connection refused.",
+                                )
+                                .into());
                             }
                             UserEvent::DisplayNameUpdated => {
                                 let data: DisplayNameUpdated = event.to_data().unwrap();
@@ -587,7 +579,7 @@ async fn deadletter<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + S
                     }
                     .boxed()
                 })
-                .handler(|event, _ctx| {
+                .handler("user/**", |event, _ctx| {
                     async move {
                         let user_event: UserEvent = event.name.parse().unwrap();
 

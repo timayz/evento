@@ -3,6 +3,7 @@
 mod context;
 mod data;
 
+use anyhow::Error;
 pub use context::Context;
 pub use data::Data;
 pub use evento_store::{Aggregate, Error as StoreError, Event, EventStore};
@@ -16,7 +17,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, QueryBuilder};
 use std::{
-    cmp::Ordering, collections::HashMap, future::Future, pin::Pin, sync::Arc, time::Duration,
+    cmp::Ordering,
+    collections::{HashMap, HashSet},
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    time::Duration,
 };
 use tokio::time::{interval_at, sleep, Instant};
 use uuid::Uuid;
@@ -55,8 +61,8 @@ type SubscirberPostHandler =
 #[derive(Clone)]
 pub struct Subscriber {
     key: String,
-    filters: Vec<String>,
-    handlers: Vec<SubscirberHandler>,
+    filters: HashSet<String>,
+    handlers: Vec<(String, SubscirberHandler)>,
     post_handlers: Vec<SubscirberPostHandler>,
     from_start: bool,
 }
@@ -65,21 +71,17 @@ impl Subscriber {
     pub fn new<K: Into<String>>(key: K) -> Self {
         Self {
             key: key.into(),
-            filters: Vec::new(),
+            filters: HashSet::new(),
             handlers: Vec::new(),
             post_handlers: Vec::new(),
             from_start: true,
         }
     }
 
-    pub fn filter<T: Into<String>>(mut self, filter: T) -> Self {
-        self.filters.push(filter.into());
-
-        self
-    }
-
-    pub fn handler(mut self, handler: SubscirberHandler) -> Self {
-        self.handlers.push(handler);
+    pub fn handler(mut self, filter: impl Into<String>, handler: SubscirberHandler) -> Self {
+        let filter = filter.into();
+        self.filters.insert(filter.to_owned());
+        self.handlers.push((filter, handler));
 
         self
     }
@@ -730,11 +732,27 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
 
                     let topic_name = format!("{}/{}/{}", aggregate_type, aggregate_id, event.name);
 
-                    if !sub
-                        .filters
-                        .iter()
-                        .any(|filter| glob_match(filter, &topic_name))
-                    {
+                    let mut futures = Vec::new();
+                    for (i, (filter, handler)) in sub.handlers.iter().enumerate() {
+                        if !glob_match(filter.as_str(), &topic_name) {
+                            continue;
+                        }
+
+                        let post_handler = sub.post_handlers.get(i);
+                        let ctx = ctx.clone();
+
+                        futures.push(async move {
+                            let data = handler(event.clone(), ctx.clone()).await?;
+
+                            if let (Some(event), Some(post_handler)) = (data, post_handler) {
+                                return post_handler(event, ctx).await;
+                            }
+
+                            Ok::<_, Error>(())
+                        });
+                    }
+
+                    if futures.is_empty() {
                         tracing::debug!(
                             "{:?} skiped event id={}, name={}, topic_name={}",
                             &sub.key,
@@ -746,12 +764,10 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
                         continue;
                     }
 
-                    let futures = sub.handlers.iter().map(|h| h(event.clone(), ctx.clone()));
                     let results = join_all(futures).await;
-                    let mut futures = vec![];
-                    let mut event_errors = vec![];
+                    let mut event_errors: Vec<String> = vec![];
 
-                    for (i, res) in results.iter().enumerate() {
+                    for res in results.iter() {
                         if let Err(e) = res {
                             tracing::error!(
                                 "{:?} failed to handle event id={}, name={}, error={}",
@@ -762,34 +778,8 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
                             );
 
                             event_errors.push(e.to_string());
-
-                            continue;
-                        }
-
-                        if let (Ok(Some(event)), Some(handler)) = (res, sub.post_handlers.get(i)) {
-                            futures.push(handler(event.clone(), ctx.clone()));
                         }
                     }
-
-                    let results = join_all(futures).await;
-                    let post_event_errors = results
-                        .iter()
-                        .filter_map(|res| match res {
-                            Err(e) => {
-                                tracing::error!(
-                                    "{:?} failed to post handle event id={}, name={}, error={}",
-                                    &sub.key,
-                                    &event.aggregate_id,
-                                    &event.name,
-                                    e
-                                );
-                                Some(e.to_string())
-                            }
-                            _ => None,
-                        })
-                        .collect::<Vec<String>>();
-
-                    event_errors.extend(post_event_errors);
 
                     if !event_errors.is_empty() {
                         let mut metadata = match event.to_metadata::<HashMap<String, Value>>() {
