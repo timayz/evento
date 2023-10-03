@@ -59,18 +59,20 @@ type SubscirberPostHandler =
     fn(e: Event, ctx: EventoContext) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>;
 
 #[derive(Clone)]
-pub struct Subscriber {
+pub struct Subscriber<S: StoreEngine + Send + Sync> {
     key: String,
+    store: Option<EventStore<S>>,
     filters: HashSet<String>,
     handlers: Vec<(String, SubscirberHandler)>,
     post_handlers: Vec<SubscirberPostHandler>,
     from_start: bool,
 }
 
-impl Subscriber {
+impl<S: StoreEngine + Send + Sync> Subscriber<S> {
     pub fn new<K: Into<String>>(key: K) -> Self {
         Self {
             key: key.into(),
+            store: None,
             filters: HashSet::new(),
             handlers: Vec::new(),
             post_handlers: Vec::new(),
@@ -99,6 +101,7 @@ impl Subscriber {
     }
 }
 
+pub type PgSubscriber = Subscriber<evento_store::PgEngine>;
 pub type PgProducer = Producer<evento_store::PgEngine>;
 
 #[derive(Clone)]
@@ -541,7 +544,7 @@ pub struct Evento<E: Engine + Sync + Send, S: StoreEngine + Sync + Send> {
     name: Option<String>,
     context: EventoContext,
     store: EventStore<S>,
-    subscribers: HashMap<String, Subscriber>,
+    subscribers: HashMap<String, Subscriber<S>>,
     pub engine: E,
 }
 
@@ -571,7 +574,7 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
         self
     }
 
-    pub fn subscribe(mut self, s: Subscriber) -> Self {
+    pub fn subscribe(mut self, s: Subscriber<S>) -> Self {
         let name = self.name.to_owned().unwrap_or("_".to_owned());
         let mut sub = s.clone();
         sub.key = format!("{}.{}", name, s.key);
@@ -633,9 +636,10 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
         Ok(())
     }
 
-    async fn spawn(&self, sub: Subscriber, delay: u64) {
+    async fn spawn(&self, sub: Subscriber<S>, delay: u64) {
         let engine = self.engine.clone();
         let store = self.store.clone();
+        let read_store = sub.store.clone().unwrap_or(store.clone());
         let consumer_id = self.id;
         let ctx = self.context.clone();
         let name = self.name.to_owned();
@@ -705,7 +709,7 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
                     })
                     .collect();
 
-                let events = match store
+                let events = match read_store
                     .read_all(100, subscription.cursor, Some(filters))
                     .await
                 {

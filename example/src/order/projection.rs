@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use evento::{Aggregate, Subscriber};
+use evento::{Aggregate, Subscriber, PgSubscriber};
 use futures::FutureExt;
 use mongodb::{
     bson::{doc, to_bson},
@@ -30,7 +30,7 @@ pub struct Order {
     pub status: Status,
 }
 
-pub fn subscribe() -> Subscriber {
+pub fn subscribe() -> PgSubscriber {
     Subscriber::new("orders").handler("order/**", |event, ctx| {
         let db = ctx.0.read().extract::<Database>().clone();
 
