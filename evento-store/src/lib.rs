@@ -189,7 +189,7 @@ impl Engine for MemoryEngine {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Event>, Error>> + Send + '_>> {
         let id: String = A::aggregate_id(id);
         let mut data = self.0.write();
-        let data_events = data.entry(id.to_owned()).or_insert_with(Vec::new);
+        let data_events = data.entry(id.to_owned()).or_default();
 
         let mut version = data_events.last().map(|e| e.version).unwrap_or(0);
 
