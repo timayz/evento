@@ -1,4 +1,4 @@
-use evento::{Aggregate, Subscriber};
+use evento::{Aggregate, PgSubscriber, Subscriber};
 use futures::FutureExt;
 use mongodb::{
     bson::{doc, to_bson},
@@ -24,7 +24,7 @@ pub struct Product {
     pub reviews: Vec<(u8, String)>,
 }
 
-pub fn subscribe() -> Subscriber {
+pub fn subscribe() -> PgSubscriber {
     Subscriber::new("products")
         .handler("product/**", |event, ctx| {
             let db = ctx.0.read().extract::<Database>().clone();
