@@ -565,7 +565,6 @@ dependencies = [
  "backoff",
  "base64 0.21.4",
  "chrono",
- "evento",
  "evento-store",
  "futures-util",
  "glob-match",
