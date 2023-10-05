@@ -18,8 +18,9 @@ base64 = "0.21.4"
 harsh = "0.2.2"
 
 [dev-dependencies]
+evento-store = { path = "../evento-store" }
 tokio = { version = "1.32.0", features = ["rt-multi-thread", "macros"] }
 backoff = { version = "0.4.0", features = ["futures", "tokio"] }
 sqlx = { version = "0.7.2", features = ["runtime-tokio", "postgres", "chrono", "uuid", "json", "any"] }
+uuid = { version = "1.4.1", features = ["v4", "fast-rng", "macro-diagnostics" ]}
 parse-display = { version = "0.8.2" }
-evento-store = { path = "../evento-store" }

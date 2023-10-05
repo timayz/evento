@@ -7,10 +7,20 @@ use base64::{
 };
 use chrono::{DateTime, NaiveDateTime, Utc};
 use harsh::Harsh;
+use serde::{Deserialize, Serialize};
 use sqlx::{postgres::PgArguments, query::QueryAs, FromRow, Postgres};
 use std::{fmt::Debug, str::FromStr};
 
 use crate::error::QueryError;
+
+#[derive(Debug, PartialEq, Deserialize, Serialize, Clone)]
+pub struct CursorType(String);
+
+impl AsRef<[u8]> for CursorType {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum CursorOrder {
@@ -77,15 +87,14 @@ pub trait Cursor: Sized {
             .map(|datetime| DateTime::from_naive_utc_and_offset(datetime, Utc))
     }
 
-    fn to_cursor(&self) -> String {
+    fn to_cursor(&self) -> CursorType {
         let data = self.serialize().join("|");
         let engine = GeneralPurpose::new(&alphabet::URL_SAFE, general_purpose::PAD);
 
-        engine.encode(data)
+        CursorType(engine.encode(data))
     }
 
-    fn from_cursor<C: Into<String>>(cursor: C) -> Result<Self, QueryError> {
-        let cursor: String = cursor.into();
+    fn from_cursor(cursor: &CursorType) -> Result<Self, QueryError> {
         let engine = GeneralPurpose::new(&alphabet::URL_SAFE, general_purpose::PAD);
         let decoded = engine.decode(cursor)?;
         let data = std::str::from_utf8(&decoded)?;

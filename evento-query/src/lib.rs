@@ -2,6 +2,7 @@
 mod cursor;
 mod error;
 
+use cursor::CursorType;
 use serde::{Deserialize, Serialize};
 use sqlx::{
     postgres::PgArguments, Arguments, Encode, Executor, FromRow, Postgres, QueryBuilder, Type,
@@ -13,7 +14,7 @@ pub use error::QueryError;
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct Edge<N> {
-    pub cursor: String,
+    pub cursor: CursorType,
     pub node: N,
 }
 
@@ -30,8 +31,8 @@ impl<N: Cursor> From<N> for Edge<N> {
 pub struct PageInfo {
     pub has_previous_page: bool,
     pub has_next_page: bool,
-    pub start_cursor: Option<String>,
-    pub end_cursor: Option<String>,
+    pub start_cursor: Option<CursorType>,
+    pub end_cursor: Option<CursorType>,
 }
 
 #[derive(Default, Debug, PartialEq, Serialize, Deserialize)]
@@ -43,24 +44,24 @@ pub struct QueryResult<N> {
 #[derive(Default, Serialize, Deserialize)]
 pub struct QueryArgs {
     pub first: Option<u16>,
-    pub after: Option<String>,
+    pub after: Option<CursorType>,
     pub last: Option<u16>,
-    pub before: Option<String>,
+    pub before: Option<CursorType>,
 }
 
 impl QueryArgs {
-    pub fn backward<C: Into<String>>(last: u16, before: Option<C>) -> Self {
+    pub fn backward(last: u16, before: Option<CursorType>) -> Self {
         Self {
             last: Some(last),
-            before: before.map(|c| c.into()),
+            before,
             ..Default::default()
         }
     }
 
-    pub fn forward<C: Into<String>>(first: u16, after: Option<C>) -> Self {
+    pub fn forward(first: u16, after: Option<CursorType>) -> Self {
         Self {
             first: Some(first),
-            after: after.map(|c| c.into()),
+            after,
             ..Default::default()
         }
     }
@@ -85,7 +86,7 @@ where
 {
     builder: QueryBuilder<'q, Postgres>,
     phantom: PhantomData<&'q O>,
-    cursor: Option<String>,
+    cursor: Option<CursorType>,
     cursor_order: CursorOrder,
     is_backward: bool,
     limit: u16,
@@ -128,11 +129,11 @@ where
         self.cursor_order(CursorOrder::Desc)
     }
 
-    pub fn backward(self, last: u16, before: Option<impl Into<String>>) -> Self {
+    pub fn backward(self, last: u16, before: Option<CursorType>) -> Self {
         self.build(QueryArgs::backward(last, before))
     }
 
-    pub fn forward(self, first: u16, after: Option<impl Into<String>>) -> Self {
+    pub fn forward(self, first: u16, after: Option<CursorType>) -> Self {
         self.build(QueryArgs::forward(first, after))
     }
 
@@ -201,7 +202,7 @@ where
         };
 
         let page_info = if self.is_backward {
-            let start_cursor = edges.first().map(|edge| edge.cursor.to_owned());
+            let start_cursor = edges.first().map(|edge| edge.cursor.clone());
 
             PageInfo {
                 has_previous_page: has_more,
@@ -210,7 +211,7 @@ where
                 end_cursor: None,
             }
         } else {
-            let end_cursor = edges.last().map(|edge| edge.cursor.to_owned());
+            let end_cursor = edges.last().map(|edge| edge.cursor.clone());
 
             PageInfo {
                 has_previous_page: false,
