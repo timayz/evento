@@ -7,34 +7,28 @@ use sqlx::{
     Any, PgPool,
 };
 use std::{io, path::Path, time::Duration};
-use tokio::sync::OnceCell;
 use uuid::Uuid;
 
-static POOL: OnceCell<PgPool> = OnceCell::const_new();
+pub async fn get_pool() -> PgPool {
+    let dsn = "postgres://postgres:postgres@localhost:5432/evento_test_query";
+    let exists = retry_connect_errors(dsn, Any::database_exists)
+        .await
+        .unwrap();
 
-pub async fn get_pool() -> &'static PgPool {
-    POOL.get_or_init(|| async {
-        let dsn = "postgres://postgres:postgres@localhost:5432/evento_test_query";
-        let exists = retry_connect_errors(dsn, Any::database_exists)
-            .await
-            .unwrap();
+    if !exists {
+        Any::create_database(dsn).await.unwrap();
+    }
 
-        if !exists {
-            Any::create_database(dsn).await.unwrap();
-        }
+    let pool = PgPool::connect(dsn).await.unwrap();
 
-        let pool = PgPool::connect(dsn).await.unwrap();
+    Migrator::new(Path::new("./tests/fixtures/db"))
+        .await
+        .unwrap()
+        .run(&pool)
+        .await
+        .unwrap();
 
-        Migrator::new(Path::new("./tests/fixtures/db"))
-            .await
-            .unwrap()
-            .run(&pool)
-            .await
-            .unwrap();
-
-        pool
-    })
-    .await
+    pool
 }
 
 /// Attempt an operation that may return errors like `ConnectionRefused`,

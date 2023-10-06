@@ -11,7 +11,7 @@ async fn get_users() -> &'static Vec<User> {
     ONE.get_or_init(|| async {
         let db = get_pool().await;
         sqlx::query_as::<_, User>("SELECT * FROM users ORDER BY created_at ASC, age ASC, id ASC")
-            .fetch_all(db)
+            .fetch_all(&db)
             .await
             .unwrap()
     })
@@ -24,7 +24,7 @@ async fn query_first() {
     let users = get_users().await;
     let query = Query::<User>::new(SELECT_USERS)
         .build(Default::default())
-        .fetch_all(db)
+        .fetch_all(&db)
         .await
         .unwrap();
 
@@ -55,7 +55,7 @@ async fn query_first_3() {
     let users = get_users().await;
     let query = Query::<User>::new(SELECT_USERS)
         .forward(3, None)
-        .fetch_all(db)
+        .fetch_all(&db)
         .await
         .unwrap();
 
@@ -80,7 +80,7 @@ async fn query_first_2_after_3() {
 
     let query = Query::<User>::new(SELECT_USERS)
         .forward(2, Some(users[2].to_cursor()))
-        .fetch_all(db)
+        .fetch_all(&db)
         .await
         .unwrap();
 
@@ -97,28 +97,28 @@ async fn query_first_2_after_3() {
     assert_eq!(query.edges[1].node, users[4]);
 }
 
-// #[tokio::test]
-// async fn query_first_2_after_9() {
-//     let db = get_pool().await;
-//     let users = get_users().await;
+#[tokio::test]
+async fn query_first_2_after_9() {
+    let db = get_pool().await;
+    let users = get_users().await;
 
-//     let query = Query::<User>::new(SELECT_USERS)
-//         .forward(2, Some(users[8].to_cursor()))
-//         .fetch_all(db)
-//         .await
-//         .unwrap();
+    let query = Query::<User>::new(SELECT_USERS)
+        .forward(2, Some(users[8].to_cursor()))
+        .fetch_all(&db)
+        .await
+        .unwrap();
 
-//     assert_eq!(query.edges.len(), 1);
-//     assert_eq!(
-//         query.page_info,
-//         PageInfo {
-//             has_next_page: false,
-//             end_cursor: Some(query.edges[0].cursor.to_owned()),
-//             ..Default::default()
-//         }
-//     );
-//     assert_eq!(query.edges[0].node, users[9]);
-// }
+    assert_eq!(query.edges.len(), 1);
+    assert_eq!(
+        query.page_info,
+        PageInfo {
+            has_next_page: false,
+            end_cursor: Some(query.edges[0].cursor.to_owned()),
+            ..Default::default()
+        }
+    );
+    assert_eq!(query.edges[0].node, users[9]);
+}
 
 #[tokio::test]
 async fn query_first_3_after_5() {
@@ -127,7 +127,7 @@ async fn query_first_3_after_5() {
 
     let query = Query::<User>::new(SELECT_USERS)
         .forward(3, Some(users[4].to_cursor()))
-        .fetch_all(db)
+        .fetch_all(&db)
         .await
         .unwrap();
 
@@ -151,7 +151,7 @@ async fn query_last() {
     let users = get_users().await;
     let query = Query::<User>::new(SELECT_USERS)
         .backward(20, None)
-        .fetch_all(db)
+        .fetch_all(&db)
         .await
         .unwrap();
 
@@ -182,7 +182,7 @@ async fn query_last_3() {
     let users = get_users().await;
     let query = Query::<User>::new(SELECT_USERS)
         .backward(3, None)
-        .fetch_all(db)
+        .fetch_all(&db)
         .await
         .unwrap();
 
@@ -207,7 +207,7 @@ async fn query_last_2_before_4() {
 
     let query = Query::<User>::new(SELECT_USERS)
         .backward(2, Some(users[3].to_cursor()))
-        .fetch_all(db)
+        .fetch_all(&db)
         .await
         .unwrap();
 
@@ -231,7 +231,7 @@ async fn query_last_2_before_2() {
 
     let query = Query::<User>::new(SELECT_USERS)
         .backward(2, Some(users[1].to_cursor()))
-        .fetch_all(db)
+        .fetch_all(&db)
         .await
         .unwrap();
 
@@ -254,7 +254,7 @@ async fn query_last_3_before_8() {
 
     let query = Query::<User>::new(SELECT_USERS)
         .backward(3, Some(users[8].to_cursor()))
-        .fetch_all(db)
+        .fetch_all(&db)
         .await
         .unwrap();
 
