@@ -1,10 +1,9 @@
 mod common;
-use chrono::{DateTime, Utc};
+
 use common::get_pool;
+use common::User;
 use evento_query::{Cursor, PageInfo, Query};
-use serde::Deserialize;
 use tokio::sync::OnceCell;
-use uuid::Uuid;
 
 static POOL_PATH: &str = "./tests/fixtures/query";
 static SELECT_USERS: &str = "SELECT * FROM users";
@@ -273,53 +272,4 @@ async fn query_last_3_before_8() {
     assert_eq!(query.edges[0].node, users[5]);
     assert_eq!(query.edges[1].node, users[6]);
     assert_eq!(query.edges[2].node, users[7]);
-}
-
-#[derive(Clone, Deserialize, Debug, sqlx::FromRow, Default, PartialEq)]
-pub struct User {
-    pub id: Uuid,
-    pub name: String,
-    pub age: i32,
-    pub created_at: DateTime<Utc>,
-}
-
-impl Cursor for User {
-    fn keys() -> Vec<&'static str> {
-        vec!["created_at", "age", "id"]
-    }
-
-    fn bind<'q, O>(
-        self,
-        query: sqlx::query::QueryAs<sqlx::Postgres, O, sqlx::postgres::PgArguments>,
-    ) -> sqlx::query::QueryAs<sqlx::Postgres, O, sqlx::postgres::PgArguments>
-    where
-        O: for<'r> sqlx::FromRow<'r, <sqlx::Postgres as sqlx::Database>::Row>,
-        O: 'q + std::marker::Send,
-        O: 'q + Unpin,
-        O: 'q + Cursor,
-    {
-        query.bind(self.created_at).bind(self.age).bind(self.id)
-    }
-
-    fn serialize(&self) -> Vec<String> {
-        vec![
-            Self::serialize_utc(self.created_at),
-            self.age.to_string(),
-            self.id.to_string(),
-        ]
-    }
-
-    fn deserialize(values: Vec<&str>) -> Result<Self, evento_query::QueryError> {
-        let mut values = values.iter();
-        let created_at = Self::deserialize_as_utc("created_at", values.next())?;
-        let age = Self::deserialize_as("age", values.next())?;
-        let id = Self::deserialize_as("id", values.next())?;
-
-        Ok(User {
-            id,
-            age,
-            created_at,
-            ..Default::default()
-        })
-    }
 }
