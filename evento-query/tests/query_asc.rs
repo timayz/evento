@@ -6,8 +6,8 @@ use serde::Deserialize;
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 
-static POOL_PATH: &'static str = "./tests/fixtures/query";
-static SELECT_USERS: &'static str = "SELECT * FROM users";
+static POOL_PATH: &str = "./tests/fixtures/query";
+static SELECT_USERS: &str = "SELECT * FROM users";
 static ONE: OnceCell<Vec<User>> = OnceCell::const_new();
 
 async fn get_users() -> &'static Vec<User> {

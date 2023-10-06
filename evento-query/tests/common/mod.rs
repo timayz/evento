@@ -10,7 +10,7 @@ static POOL: OnceCell<PgPool> = OnceCell::const_new();
 
 pub async fn get_pool(path: &str) -> &'static PgPool {
     POOL.get_or_init(|| async {
-        let dsn = &format!("postgres://postgres:postgres@localhost:5432/evento_query_test");
+        let dsn = "postgres://postgres:postgres@localhost:5432/evento_query_test";
         let exists = retry_connect_errors(dsn, Any::database_exists)
             .await
             .unwrap();
