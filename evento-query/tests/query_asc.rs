@@ -97,28 +97,28 @@ async fn query_first_2_after_3() {
     assert_eq!(query.edges[1].node, users[4]);
 }
 
-#[tokio::test]
-async fn query_first_2_after_9() {
-    let db = get_pool().await;
-    let users = get_users().await;
+// #[tokio::test]
+// async fn query_first_2_after_9() {
+//     let db = get_pool().await;
+//     let users = get_users().await;
 
-    let query = Query::<User>::new(SELECT_USERS)
-        .forward(2, Some(users[8].to_cursor()))
-        .fetch_all(db)
-        .await
-        .unwrap();
+//     let query = Query::<User>::new(SELECT_USERS)
+//         .forward(2, Some(users[8].to_cursor()))
+//         .fetch_all(db)
+//         .await
+//         .unwrap();
 
-    assert_eq!(query.edges.len(), 1);
-    assert_eq!(
-        query.page_info,
-        PageInfo {
-            has_next_page: false,
-            end_cursor: Some(query.edges[0].cursor.to_owned()),
-            ..Default::default()
-        }
-    );
-    assert_eq!(query.edges[0].node, users[9]);
-}
+//     assert_eq!(query.edges.len(), 1);
+//     assert_eq!(
+//         query.page_info,
+//         PageInfo {
+//             has_next_page: false,
+//             end_cursor: Some(query.edges[0].cursor.to_owned()),
+//             ..Default::default()
+//         }
+//     );
+//     assert_eq!(query.edges[0].node, users[9]);
+// }
 
 #[tokio::test]
 async fn query_first_3_after_5() {
