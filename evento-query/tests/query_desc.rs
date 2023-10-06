@@ -9,7 +9,7 @@ static SELECT_USERS: &str = "SELECT * FROM users";
 static ONE: OnceCell<Vec<User>> = OnceCell::const_new();
 
 async fn get_pool() -> &'static PgPool {
-    common::get_pool("./tests/fixtures/query", "query_desc").await
+    common::get_pool("./tests/fixtures/query").await
 }
 
 async fn get_users() -> &'static Vec<User> {

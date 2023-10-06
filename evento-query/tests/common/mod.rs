@@ -12,18 +12,16 @@ use uuid::Uuid;
 
 static POOL: OnceCell<PgPool> = OnceCell::const_new();
 
-pub async fn get_pool(path: &str, db_name: &str) -> &'static PgPool {
+pub async fn get_pool(path: &str) -> &'static PgPool {
     POOL.get_or_init(|| async {
-        let dsn = &format!("postgres://postgres:postgres@localhost:5432/evento_test_{db_name}");
+        let dsn = "postgres://postgres:postgres@localhost:5432/evento_test_query";
         let exists = retry_connect_errors(dsn, Any::database_exists)
             .await
             .unwrap();
 
-        if exists {
-            Any::drop_database(dsn).await.unwrap();
+        if !exists {
+            Any::create_database(dsn).await.unwrap();
         }
-
-        Any::create_database(dsn).await.unwrap();
 
         let pool = PgPool::connect(dsn).await.unwrap();
 
