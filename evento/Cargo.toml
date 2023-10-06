@@ -19,7 +19,6 @@ chrono = { version = "0.4.31", default-features = false, features = ["clock", "s
 tracing = "0.1.37"
 tokio = "1.32.0"
 futures-util = "0.3.28"
-validator = { version = "0.16.1", optional = true, features = ["derive"] }
 glob-match = "0.2.1"
 evento-store = { path = "../evento-store", version = "0.9.1" }
 

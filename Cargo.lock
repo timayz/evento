@@ -545,7 +545,6 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
- "validator",
 ]
 
 [[package]]
@@ -554,7 +553,6 @@ version = "0.9.1"
 dependencies = [
  "anyhow",
  "axum",
- "serde",
  "serde_json",
 ]
 
@@ -565,21 +563,16 @@ dependencies = [
  "backoff",
  "base64 0.21.4",
  "chrono",
- "evento",
  "evento-store",
  "futures-util",
- "glob-match",
  "harsh",
- "parking_lot",
  "parse-display",
  "serde",
- "serde_json",
  "sqlx",
  "thiserror",
  "tokio",
- "tracing",
+ "tokio-shared-rt",
  "uuid",
- "validator",
 ]
 
 [[package]]
@@ -2393,6 +2386,28 @@ checksum = "c28327cf380ac148141087fbfb9de9d7bd4e84ab5d2c28fbc911d753de8a7081"
 dependencies = [
  "rustls",
  "tokio",
+]
+
+[[package]]
+name = "tokio-shared-rt"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a6bb03ec682a0bb16ce93d19301abc5b98a0d7936477175a156a213dcc47d85"
+dependencies = [
+ "once_cell",
+ "tokio",
+ "tokio-shared-rt-macro",
+]
+
+[[package]]
+name = "tokio-shared-rt-macro"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fe49a94e3a984b0d0ab97343dc3dcd52baae1ee13f005bfad39faea47d051dc"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.37",
 ]
 
 [[package]]
