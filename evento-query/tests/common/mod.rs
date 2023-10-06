@@ -25,6 +25,10 @@ pub async fn get_pool() -> PgPool {
 
     let pool = PgPool::connect(dsn).await.unwrap();
 
+    if exists {
+        return pool;
+    }
+
     Migrator::new(Path::new("./tests/fixtures/db"))
         .await
         .unwrap()
