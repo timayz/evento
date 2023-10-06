@@ -151,7 +151,7 @@ async fn query_first_3_after_5() {
         .fetch_all(db)
         .await
         .unwrap();
-
+println!("{query:?}");
     assert_eq!(query.edges.len(), 3);
     assert_eq!(
         query.page_info,
