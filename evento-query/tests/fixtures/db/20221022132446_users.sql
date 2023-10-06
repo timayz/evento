@@ -1,4 +1,3 @@
--- Add up migration script here
 CREATE TABLE IF NOT EXISTS users (
   id uuid NOT NULL PRIMARY KEY,
   name varchar(255) NOT NULL,

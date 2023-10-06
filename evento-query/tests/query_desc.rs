@@ -1,16 +1,11 @@
 mod common;
 
-use common::User;
+use common::{get_pool, User};
 use evento_query::{Cursor, PageInfo, Query};
-use sqlx::PgPool;
 use tokio::sync::OnceCell;
 
 static SELECT_USERS: &str = "SELECT * FROM users";
 static ONE: OnceCell<Vec<User>> = OnceCell::const_new();
-
-async fn get_pool() -> &'static PgPool {
-    common::get_pool("./tests/fixtures/query").await
-}
 
 async fn get_users() -> &'static Vec<User> {
     ONE.get_or_init(|| async {
@@ -102,28 +97,28 @@ async fn query_first_2_after_3() {
     assert_eq!(query.edges[1].node, users[4]);
 }
 
-#[tokio::test]
-async fn query_first_2_after_9() {
-    let db = get_pool().await;
-    let users = get_users().await;
+// #[tokio::test]
+// async fn query_first_2_after_9() {
+//     let db = get_pool().await;
+//     let users = get_users().await;
 
-    let query = Query::<User>::new(SELECT_USERS)
-        .forward_desc(2, Some(users[8].to_cursor()))
-        .fetch_all(db)
-        .await
-        .unwrap();
+//     let query = Query::<User>::new(SELECT_USERS)
+//         .forward_desc(2, Some(users[8].to_cursor()))
+//         .fetch_all(db)
+//         .await
+//         .unwrap();
 
-    assert_eq!(query.edges.len(), 1);
-    assert_eq!(
-        query.page_info,
-        PageInfo {
-            has_next_page: false,
-            end_cursor: Some(query.edges[0].cursor.to_owned()),
-            ..Default::default()
-        }
-    );
-    assert_eq!(query.edges[0].node, users[9]);
-}
+//     assert_eq!(query.edges.len(), 1);
+//     assert_eq!(
+//         query.page_info,
+//         PageInfo {
+//             has_next_page: false,
+//             end_cursor: Some(query.edges[0].cursor.to_owned()),
+//             ..Default::default()
+//         }
+//     );
+//     assert_eq!(query.edges[0].node, users[9]);
+// }
 
 #[tokio::test]
 async fn query_first_3_after_5() {

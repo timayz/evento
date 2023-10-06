@@ -1,16 +1,11 @@
 mod common;
 
-use common::User;
+use common::{get_pool, User};
 use evento_query::{Cursor, PageInfo, Query};
-use sqlx::PgPool;
 use tokio::sync::OnceCell;
 
 static SELECT_USERS: &str = "SELECT * FROM users";
 static ONE: OnceCell<Vec<User>> = OnceCell::const_new();
-
-async fn get_pool() -> &'static PgPool {
-    common::get_pool("./tests/fixtures/query").await
-}
 
 async fn get_users() -> &'static Vec<User> {
     ONE.get_or_init(|| async {
