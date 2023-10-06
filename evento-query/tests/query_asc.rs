@@ -1,17 +1,20 @@
 mod common;
 
-use common::get_pool;
 use common::User;
 use evento_query::{Cursor, PageInfo, Query};
+use sqlx::PgPool;
 use tokio::sync::OnceCell;
 
-static POOL_PATH: &str = "./tests/fixtures/query";
 static SELECT_USERS: &str = "SELECT * FROM users";
 static ONE: OnceCell<Vec<User>> = OnceCell::const_new();
 
+async fn get_pool() -> &'static PgPool {
+    common::get_pool("./tests/fixtures/query", "query_asc").await
+}
+
 async fn get_users() -> &'static Vec<User> {
     ONE.get_or_init(|| async {
-        let db = get_pool(POOL_PATH).await;
+        let db = get_pool().await;
         sqlx::query_as::<_, User>("SELECT * FROM users ORDER BY created_at ASC, age ASC, id ASC")
             .fetch_all(db)
             .await
@@ -22,7 +25,7 @@ async fn get_users() -> &'static Vec<User> {
 
 #[tokio::test]
 async fn query_first() {
-    let db = common::get_pool("./tests/fixtures/query").await;
+    let db = get_pool().await;
     let users = get_users().await;
     let query = Query::<User>::new(SELECT_USERS)
         .build(Default::default())
@@ -53,7 +56,7 @@ async fn query_first() {
 
 #[tokio::test]
 async fn query_first_3() {
-    let db = common::get_pool(POOL_PATH).await;
+    let db = get_pool().await;
     let users = get_users().await;
     let query = Query::<User>::new(SELECT_USERS)
         .forward(3, None)
@@ -77,7 +80,7 @@ async fn query_first_3() {
 
 #[tokio::test]
 async fn query_first_2_after_3() {
-    let db = common::get_pool(POOL_PATH).await;
+    let db = get_pool().await;
     let users = get_users().await;
 
     let query = Query::<User>::new(SELECT_USERS)
@@ -101,18 +104,14 @@ async fn query_first_2_after_3() {
 
 #[tokio::test]
 async fn query_first_2_after_9() {
-    let db = common::get_pool(POOL_PATH).await;
+    let db = get_pool().await;
     let users = get_users().await;
-
-    println!("{:?}", users[8]);
 
     let query = Query::<User>::new(SELECT_USERS)
         .forward(2, Some(users[8].to_cursor()))
         .fetch_all(db)
         .await
         .unwrap();
-
-    println!("{:?}", query);
 
     assert_eq!(query.edges.len(), 1);
     assert_eq!(
@@ -128,7 +127,7 @@ async fn query_first_2_after_9() {
 
 #[tokio::test]
 async fn query_first_3_after_5() {
-    let db = common::get_pool(POOL_PATH).await;
+    let db = get_pool().await;
     let users = get_users().await;
 
     let query = Query::<User>::new(SELECT_USERS)
@@ -153,7 +152,7 @@ async fn query_first_3_after_5() {
 
 #[tokio::test]
 async fn query_last() {
-    let db = common::get_pool("./tests/fixtures/query").await;
+    let db = get_pool().await;
     let users = get_users().await;
     let query = Query::<User>::new(SELECT_USERS)
         .backward(20, None)
@@ -184,7 +183,7 @@ async fn query_last() {
 
 #[tokio::test]
 async fn query_last_3() {
-    let db = common::get_pool(POOL_PATH).await;
+    let db = get_pool().await;
     let users = get_users().await;
     let query = Query::<User>::new(SELECT_USERS)
         .backward(3, None)
@@ -208,7 +207,7 @@ async fn query_last_3() {
 
 #[tokio::test]
 async fn query_last_2_before_4() {
-    let db = common::get_pool(POOL_PATH).await;
+    let db = get_pool().await;
     let users = get_users().await;
 
     let query = Query::<User>::new(SELECT_USERS)
@@ -232,7 +231,7 @@ async fn query_last_2_before_4() {
 
 #[tokio::test]
 async fn query_last_2_before_2() {
-    let db = common::get_pool(POOL_PATH).await;
+    let db = get_pool().await;
     let users = get_users().await;
 
     let query = Query::<User>::new(SELECT_USERS)
@@ -255,7 +254,7 @@ async fn query_last_2_before_2() {
 
 #[tokio::test]
 async fn query_last_3_before_8() {
-    let db = common::get_pool(POOL_PATH).await;
+    let db = get_pool().await;
     let users = get_users().await;
 
     let query = Query::<User>::new(SELECT_USERS)
