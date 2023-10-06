@@ -1,15 +1,19 @@
 use chrono::{DateTime, Utc};
 use evento_query::Cursor;
+use fd_lock::RwLock;
 use futures_util::{Future, TryFutureExt};
 use serde::Deserialize;
 use sqlx::{
     migrate::{MigrateDatabase, Migrator},
     Any, PgPool,
 };
+use std::fs::File;
 use std::{io, path::Path, time::Duration};
 use uuid::Uuid;
 
 pub async fn get_pool() -> PgPool {
+    let _ = RwLock::new(File::open("Cargo.toml").unwrap());
+
     let dsn = "postgres://postgres:postgres@localhost:5432/evento_test_query";
     let exists = retry_connect_errors(dsn, Any::database_exists)
         .await
