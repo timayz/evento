@@ -8,24 +8,20 @@ description = "A collection of libraries and tools that help you build DDD, CQRS
 repository = "https://github.com/timayz/evento"
 documentation = "https://docs.rs/evento"
 
-[features]
-default = []
-full = ["pg"]
-pg = ["dep:sqlx"]
-
 [dependencies]
-serde = { version = "1.0.215", features = ["derive"] }
-sqlx = { version = "0.8.2", features = ["runtime-tokio", "postgres", "chrono", "uuid", "json"], optional = true }
-thiserror = "1.0.69"
-chrono = { version = "0.4.38", default-features = false, features = ["clock", "serde"] }
-futures-util = "0.3.31"
-base64 = "0.22.1"
+serde = "1.0.188"
+sqlx = { version = "0.7.2", features = ["runtime-tokio", "postgres", "chrono", "uuid", "json"] }
+thiserror = "1.0.49"
+chrono = { version = "0.4.31", default-features = false, features = ["clock", "serde"] }
+futures-util = "0.3.28"
+base64 = "0.21.4"
 harsh = "0.2.2"
 
 [dev-dependencies]
-tokio = { version = "1.41.1", features = ["rt-multi-thread", "macros"] }
+evento-store = { path = "../evento-store" }
+tokio = { version = "1.32.0", features = ["rt-multi-thread", "macros"] }
 backoff = { version = "0.4.0", features = ["futures", "tokio"] }
-sqlx = { version = "0.8.2", features = ["runtime-tokio", "postgres", "chrono", "uuid", "json", "any"] }
-uuid = { version = "1.11.0", features = ["v4", "fast-rng", "macro-diagnostics", "serde"] }
-parse-display = "0.10.0"
+sqlx = { version = "0.7.2", features = ["runtime-tokio", "postgres", "chrono", "uuid", "json", "any"] }
+uuid = { version = "1.4.1", features = ["v4", "fast-rng", "macro-diagnostics" ]}
+parse-display = "0.8.2"
 tokio-shared-rt = "0.1.0"

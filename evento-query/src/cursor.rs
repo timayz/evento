@@ -5,23 +5,16 @@ use base64::{
     engine::{general_purpose, GeneralPurpose},
     Engine,
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use harsh::Harsh;
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "pg")]
 use sqlx::{postgres::PgArguments, query::QueryAs, FromRow, Postgres};
 use std::{fmt::Debug, str::FromStr};
 
 use crate::error::QueryError;
 
 #[derive(Debug, PartialEq, Deserialize, Serialize, Clone)]
-pub struct CursorType(pub String);
-
-impl From<String> for CursorType {
-    fn from(val: String) -> Self {
-        CursorType(val)
-    }
-}
+pub struct CursorType(String);
 
 impl AsRef<[u8]> for CursorType {
     fn as_ref(&self) -> &[u8] {
@@ -37,7 +30,6 @@ pub enum CursorOrder {
 
 pub trait Cursor: Sized {
     fn keys() -> Vec<&'static str>;
-    #[cfg(feature = "pg")]
     fn bind<'q, O>(
         self,
         query: QueryAs<Postgres, O, PgArguments>,
@@ -86,12 +78,13 @@ pub trait Cursor: Sized {
                     .map_err(QueryError::Harsh)
             })
             .and_then(|timestamp| {
-                DateTime::from_timestamp_micros(timestamp as i64).ok_or(QueryError::Unknown(
+                NaiveDateTime::from_timestamp_micros(timestamp as i64).ok_or(QueryError::Unknown(
                     "field".to_owned(),
                     "NaiveDateTime::from_timestamp_opt".to_owned(),
                     "none".to_owned(),
                 ))
             })
+            .map(|datetime| DateTime::from_naive_utc_and_offset(datetime, Utc))
     }
 
     fn to_cursor(&self) -> CursorType {

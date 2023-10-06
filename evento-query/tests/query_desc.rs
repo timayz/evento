@@ -2,21 +2,19 @@
 mod common;
 
 use common::{get_pool, User};
-use evento_query::{Cursor, PageInfo, PgQuery};
+use evento_query::{Cursor, PageInfo, Query};
 use tokio::sync::OnceCell;
 
-static SELECT_USERS: &str = "SELECT * FROM ev_user";
-static ONCE: OnceCell<Vec<User>> = OnceCell::const_new();
+static SELECT_USERS: &str = "SELECT * FROM users";
+static ONE: OnceCell<Vec<User>> = OnceCell::const_new();
 
 async fn get_users() -> &'static Vec<User> {
-    ONCE.get_or_init(|| async {
+    ONE.get_or_init(|| async {
         let db = get_pool().await;
-        sqlx::query_as::<_, User>(
-            "SELECT * FROM ev_user ORDER BY created_at DESC, age DESC, id DESC",
-        )
-        .fetch_all(db)
-        .await
-        .unwrap()
+        sqlx::query_as::<_, User>("SELECT * FROM users ORDER BY created_at DESC, age DESC, id DESC")
+            .fetch_all(db)
+            .await
+            .unwrap()
     })
     .await
 }
@@ -25,7 +23,7 @@ async fn get_users() -> &'static Vec<User> {
 async fn query_first() {
     let db = get_pool().await;
     let users = get_users().await;
-    let query = PgQuery::<User>::new(SELECT_USERS)
+    let query = Query::<User>::new(SELECT_USERS)
         .build_desc(Default::default())
         .fetch_all(db)
         .await
@@ -56,7 +54,7 @@ async fn query_first() {
 async fn query_first_3() {
     let db = get_pool().await;
     let users = get_users().await;
-    let query = PgQuery::<User>::new(SELECT_USERS)
+    let query = Query::<User>::new(SELECT_USERS)
         .forward_desc(3, None)
         .fetch_all(db)
         .await
@@ -81,7 +79,7 @@ async fn query_first_2_after_3() {
     let db = get_pool().await;
     let users = get_users().await;
 
-    let query = PgQuery::<User>::new(SELECT_USERS)
+    let query = Query::<User>::new(SELECT_USERS)
         .forward_desc(2, Some(users[2].to_cursor()))
         .fetch_all(db)
         .await
@@ -105,7 +103,7 @@ async fn query_first_2_after_9() {
     let db = get_pool().await;
     let users = get_users().await;
 
-    let query = PgQuery::<User>::new(SELECT_USERS)
+    let query = Query::<User>::new(SELECT_USERS)
         .forward_desc(2, Some(users[8].to_cursor()))
         .fetch_all(db)
         .await
@@ -128,7 +126,7 @@ async fn query_first_3_after_5() {
     let db = get_pool().await;
     let users = get_users().await;
 
-    let query = PgQuery::<User>::new(SELECT_USERS)
+    let query = Query::<User>::new(SELECT_USERS)
         .forward_desc(3, Some(users[4].to_cursor()))
         .fetch_all(db)
         .await
@@ -152,7 +150,7 @@ async fn query_first_3_after_5() {
 async fn query_last() {
     let db = get_pool().await;
     let users = get_users().await;
-    let query = PgQuery::<User>::new(SELECT_USERS)
+    let query = Query::<User>::new(SELECT_USERS)
         .backward_desc(20, None)
         .fetch_all(db)
         .await
@@ -183,7 +181,7 @@ async fn query_last() {
 async fn query_last_3() {
     let db = get_pool().await;
     let users = get_users().await;
-    let query = PgQuery::<User>::new(SELECT_USERS)
+    let query = Query::<User>::new(SELECT_USERS)
         .backward_desc(3, None)
         .fetch_all(db)
         .await
@@ -208,7 +206,7 @@ async fn query_last_2_before_4() {
     let db = get_pool().await;
     let users = get_users().await;
 
-    let query = PgQuery::<User>::new(SELECT_USERS)
+    let query = Query::<User>::new(SELECT_USERS)
         .backward_desc(2, Some(users[3].to_cursor()))
         .fetch_all(db)
         .await
@@ -232,7 +230,7 @@ async fn query_last_2_before_2() {
     let db = get_pool().await;
     let users = get_users().await;
 
-    let query = PgQuery::<User>::new(SELECT_USERS)
+    let query = Query::<User>::new(SELECT_USERS)
         .backward_desc(2, Some(users[1].to_cursor()))
         .fetch_all(db)
         .await
@@ -255,7 +253,7 @@ async fn query_last_3_before_8() {
     let db = get_pool().await;
     let users = get_users().await;
 
-    let query = PgQuery::<User>::new(SELECT_USERS)
+    let query = Query::<User>::new(SELECT_USERS)
         .backward_desc(3, Some(users[8].to_cursor()))
         .fetch_all(db)
         .await
