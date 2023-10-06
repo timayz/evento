@@ -104,11 +104,15 @@ async fn query_first_2_after_9() {
     let db = common::get_pool(POOL_PATH).await;
     let users = get_users().await;
 
+    println!("{:?}", users[8]);
+
     let query = Query::<User>::new(SELECT_USERS)
         .forward(2, Some(users[8].to_cursor()))
         .fetch_all(db)
         .await
         .unwrap();
+
+    println!("{:?}", query);
 
     assert_eq!(query.edges.len(), 1);
     assert_eq!(
