@@ -1,3 +1,4 @@
+#![allow(clippy::needless_return)]
 mod common;
 
 use common::{get_pool, User};

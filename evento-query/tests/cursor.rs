@@ -3,40 +3,40 @@ use evento_query::{Cursor, CursorOrder};
 use serde::Deserialize;
 use uuid::Uuid;
 
-#[tokio::test]
-async fn pg_filter_asc_forward() {
+#[test]
+fn pg_filter_asc_forward() {
     assert_eq!(
         Todo::to_pg_filter_opts(&CursorOrder::Asc, false, None, None),
         "created_at > $1 OR (created_at = $1 AND (text > $2 OR (text = $2 AND id > $3)))"
     );
 }
 
-#[tokio::test]
-async fn pg_filter_asc_backward() {
+#[test]
+fn pg_filter_asc_backward() {
     assert_eq!(
         Todo::to_pg_filter_opts(&CursorOrder::Asc, true, None, None),
         "created_at < $1 OR (created_at = $1 AND (text < $2 OR (text = $2 AND id < $3)))"
     );
 }
 
-#[tokio::test]
-async fn pg_filter_desc_forward() {
+#[test]
+fn pg_filter_desc_forward() {
     assert_eq!(
         Todo::to_pg_filter_opts(&CursorOrder::Desc, false, None, None),
         "created_at < $1 OR (created_at = $1 AND (text < $2 OR (text = $2 AND id < $3)))"
     );
 }
 
-#[tokio::test]
-async fn pg_filter_desc_backward() {
+#[test]
+fn pg_filter_desc_backward() {
     assert_eq!(
         Todo::to_pg_filter_opts(&CursorOrder::Desc, true, None, None),
         "created_at > $1 OR (created_at = $1 AND (text > $2 OR (text = $2 AND id > $3)))"
     );
 }
 
-#[tokio::test]
-async fn pg_filter_asc_forward_pos() {
+#[test]
+fn pg_filter_asc_forward_pos() {
     assert_eq!(
         Todo::to_pg_filter_opts(&CursorOrder::Asc, false, None, Some(2)),
         "created_at > $2 OR (created_at = $2 AND (text > $3 OR (text = $3 AND id > $4)))"
@@ -48,8 +48,8 @@ async fn pg_filter_asc_forward_pos() {
     );
 }
 
-#[tokio::test]
-async fn pg_filter_asc_backward_pos() {
+#[test]
+fn pg_filter_asc_backward_pos() {
     assert_eq!(
         Todo::to_pg_filter_opts(&CursorOrder::Asc, true, None, Some(2)),
         "created_at < $2 OR (created_at = $2 AND (text < $3 OR (text = $3 AND id < $4)))"
@@ -61,8 +61,8 @@ async fn pg_filter_asc_backward_pos() {
     );
 }
 
-#[tokio::test]
-async fn pg_filter_desc_forward_pos() {
+#[test]
+fn pg_filter_desc_forward_pos() {
     assert_eq!(
         Todo::to_pg_filter_opts(&CursorOrder::Desc, false, None, Some(2)),
         "created_at < $2 OR (created_at = $2 AND (text < $3 OR (text = $3 AND id < $4)))"
@@ -74,8 +74,8 @@ async fn pg_filter_desc_forward_pos() {
     );
 }
 
-#[tokio::test]
-async fn pg_filter_desc_backward_pos() {
+#[test]
+fn pg_filter_desc_backward_pos() {
     assert_eq!(
         Todo::to_pg_filter_opts(&CursorOrder::Desc, true, None, Some(2)),
         "created_at > $2 OR (created_at = $2 AND (text > $3 OR (text = $3 AND id > $4)))"
@@ -87,32 +87,32 @@ async fn pg_filter_desc_backward_pos() {
     );
 }
 
-#[tokio::test]
-async fn pg_order_asc_forward() {
+#[test]
+fn pg_order_asc_forward() {
     assert_eq!(
         Todo::to_pg_order(&CursorOrder::Asc, false),
         "created_at ASC, text ASC, id ASC"
     );
 }
 
-#[tokio::test]
-async fn pg_order_asc_backward() {
+#[test]
+fn pg_order_asc_backward() {
     assert_eq!(
         Todo::to_pg_order(&CursorOrder::Asc, true),
         "created_at DESC, text DESC, id DESC"
     );
 }
 
-#[tokio::test]
-async fn pg_order_desc_forward() {
+#[test]
+fn pg_order_desc_forward() {
     assert_eq!(
         Todo::to_pg_order(&CursorOrder::Desc, false),
         "created_at DESC, text DESC, id DESC"
     );
 }
 
-#[tokio::test]
-async fn pg_order_desc_backward() {
+#[test]
+fn pg_order_desc_backward() {
     assert_eq!(
         Todo::to_pg_order(&CursorOrder::Desc, true),
         "created_at ASC, text ASC, id ASC"
