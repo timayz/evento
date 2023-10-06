@@ -46,7 +46,7 @@ async fn query_first() {
     assert_eq!(query.edges[6].node, users[6]);
     assert_eq!(query.edges[7].node, users[7]);
     assert_eq!(query.edges[8].node, users[8]);
-    assert_eq!(query.edges[9].node, users[9]);
+    assert_eq!(query.edges[9].node, users[9])
 }
 
 #[tokio_shared_rt::test]
@@ -70,7 +70,7 @@ async fn query_first_3() {
     );
     assert_eq!(query.edges[0].node, users[0]);
     assert_eq!(query.edges[1].node, users[1]);
-    assert_eq!(query.edges[2].node, users[2]);
+    assert_eq!(query.edges[2].node, users[2])
 }
 
 #[tokio_shared_rt::test]
@@ -94,7 +94,7 @@ async fn query_first_2_after_3() {
         }
     );
     assert_eq!(query.edges[0].node, users[3]);
-    assert_eq!(query.edges[1].node, users[4]);
+    assert_eq!(query.edges[1].node, users[4])
 }
 
 #[tokio_shared_rt::test]
@@ -117,7 +117,7 @@ async fn query_first_2_after_9() {
             ..Default::default()
         }
     );
-    assert_eq!(query.edges[0].node, users[9]);
+    assert_eq!(query.edges[0].node, users[9])
 }
 
 #[tokio_shared_rt::test]
@@ -142,7 +142,7 @@ async fn query_first_3_after_5() {
     );
     assert_eq!(query.edges[0].node, users[5]);
     assert_eq!(query.edges[1].node, users[6]);
-    assert_eq!(query.edges[2].node, users[7]);
+    assert_eq!(query.edges[2].node, users[7])
 }
 
 #[tokio_shared_rt::test]
@@ -173,7 +173,7 @@ async fn query_last() {
     assert_eq!(query.edges[6].node, users[6]);
     assert_eq!(query.edges[7].node, users[7]);
     assert_eq!(query.edges[8].node, users[8]);
-    assert_eq!(query.edges[9].node, users[9]);
+    assert_eq!(query.edges[9].node, users[9])
 }
 
 #[tokio_shared_rt::test]
@@ -197,7 +197,7 @@ async fn query_last_3() {
     );
     assert_eq!(query.edges[0].node, users[7]);
     assert_eq!(query.edges[1].node, users[8]);
-    assert_eq!(query.edges[2].node, users[9]);
+    assert_eq!(query.edges[2].node, users[9])
 }
 
 #[tokio_shared_rt::test]
@@ -221,7 +221,7 @@ async fn query_last_2_before_4() {
         }
     );
     assert_eq!(query.edges[0].node, users[1]);
-    assert_eq!(query.edges[1].node, users[2]);
+    assert_eq!(query.edges[1].node, users[2])
 }
 
 #[tokio_shared_rt::test]
@@ -244,7 +244,7 @@ async fn query_last_2_before_2() {
             ..Default::default()
         }
     );
-    assert_eq!(query.edges[0].node, users[0]);
+    assert_eq!(query.edges[0].node, users[0])
 }
 
 #[tokio_shared_rt::test]
@@ -269,5 +269,5 @@ async fn query_last_3_before_8() {
     );
     assert_eq!(query.edges[0].node, users[5]);
     assert_eq!(query.edges[1].node, users[6]);
-    assert_eq!(query.edges[2].node, users[7]);
+    assert_eq!(query.edges[2].node, users[7])
 }

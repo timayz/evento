@@ -19,9 +19,11 @@ pub async fn get_pool() -> &'static PgPool {
             .await
             .unwrap();
 
-        if !exists {
-            Any::create_database(dsn).await.unwrap();
+        if exists {
+            Any::drop_database(dsn).await.unwrap();
         }
+
+        Any::create_database(dsn).await.unwrap();
 
         let pool = PgPool::connect(dsn).await.unwrap();
 
