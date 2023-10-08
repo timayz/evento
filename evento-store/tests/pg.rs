@@ -1,11 +1,14 @@
 #![allow(clippy::needless_return)]
 mod store;
 
-use std::{path::Path, time::Duration, io};
+use std::{io, path::Path, time::Duration};
 
 use evento_store::PgStore;
 use futures_util::{Future, TryFutureExt};
-use sqlx::{migrate::{Migrator, MigrateDatabase}, Any, PgPool};
+use sqlx::{
+    migrate::{MigrateDatabase, Migrator},
+    Any, PgPool,
+};
 use tokio::sync::OnceCell;
 
 static POOL: OnceCell<PgPool> = OnceCell::const_new();

@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use dyn_clone::DynClone;
-use evento_query::{QueryResult, CursorType};
+use evento_query::{CursorType, QueryResult};
 use serde_json::Value;
 
 use crate::{error::Result, event::Event, WriteEvent};

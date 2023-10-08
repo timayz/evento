@@ -4,7 +4,11 @@ use sqlx::{
     postgres::PgArguments, Arguments, Encode, Executor, FromRow, Postgres, QueryBuilder, Type,
 };
 
-use crate::{cursor::{Cursor, CursorOrder, CursorType}, QueryArgs, QueryResult, error::QueryError, Edge, PageInfo};
+use crate::{
+    cursor::{Cursor, CursorOrder, CursorType},
+    error::QueryError,
+    Edge, PageInfo, QueryArgs, QueryResult,
+};
 
 pub struct PgQuery<'q, O>
 where
