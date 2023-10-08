@@ -279,7 +279,6 @@ pub async fn test_save<E: Engine>(store: &Store<E>) -> anyhow::Result<()> {
             display_name: Some("john007".to_owned()),
             first_names: vec!["John".to_owned()],
             deleted: true,
-            ..Default::default()
         }
     );
 

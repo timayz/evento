@@ -13,12 +13,18 @@ use crate::{
 
 pub type MemoryStore = Store<Memory>;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Memory(Arc<RwLock<HashMap<String, Vec<Event>>>>);
 
 impl MemoryStore {
     pub fn new() -> Self {
-        Store(Memory(Arc::default()))
+        Store(Memory::default())
+    }
+}
+
+impl Default for MemoryStore {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
