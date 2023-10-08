@@ -7,20 +7,29 @@ use std::{cmp::Ordering, collections::HashMap, sync::Arc};
 use crate::{
     engine::Engine,
     error::{Result, StoreError},
-    store::{Event, Store, WriteEvent},
+    event::{Event, WriteEvent},
+    store::Store,
 };
 
+pub type MemoryStore = Store<Memory>;
+
 #[derive(Debug, Clone, Default)]
-pub struct MemoryStore(Arc<RwLock<HashMap<String, Vec<Event>>>>);
+pub struct Memory(Arc<RwLock<HashMap<String, Vec<Event>>>>);
 
 impl MemoryStore {
-    pub fn create() -> Store {
-        Store::new(Self::default())
+    pub fn new() -> Self {
+        Store(Memory::default())
+    }
+}
+
+impl Default for MemoryStore {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 #[async_trait]
-impl Engine for MemoryStore {
+impl Engine for Memory {
     async fn write(
         &self,
         aggregate_id: &'_ str,
@@ -49,21 +58,6 @@ impl Engine for MemoryStore {
         }
 
         Ok(events[start_at..events.len()].to_vec())
-    }
-
-    async fn insert(&self, events: Vec<Event>) -> Result<()> {
-        if events.is_empty() {
-            return Ok(());
-        }
-
-        let mut data = self.0.write();
-
-        for event in events {
-            let events = data.entry(event.aggregate_id.to_owned()).or_default();
-            events.push(event);
-        }
-
-        Ok(())
     }
 
     async fn read(
@@ -165,40 +159,7 @@ impl Engine for MemoryStore {
         Ok(QueryResult { edges, page_info })
     }
 
-    async fn upsert(&self, event: Event) -> Result<()> {
-        let mut rw = self.0.write();
-        let events = rw.entry(event.aggregate_id.to_owned()).or_default();
-        events.retain(|e| e.version != 0);
-        events.splice(0..0, vec![event]);
-
-        Ok(())
-    }
-
     async fn last(&self) -> Result<Option<Event>> {
-        let mut events = self
-            .0
-            .read()
-            .values()
-            .flatten()
-            .cloned()
-            .collect::<Vec<_>>();
-
-        events.sort_by(|a, b| {
-            let cmp = a.created_at.partial_cmp(&b.created_at).unwrap();
-
-            match cmp {
-                Ordering::Equal => {}
-                _ => return cmp,
-            };
-
-            let cmp = a.version.partial_cmp(&b.version).unwrap();
-
-            match cmp {
-                Ordering::Equal => a.id.partial_cmp(&b.id).unwrap(),
-                _ => cmp,
-            }
-        });
-
-        Ok(events.last().cloned())
+        Ok(self.0.read().values().flatten().last().cloned())
     }
 }

@@ -48,9 +48,8 @@ where
     }
 
     pub fn bind<T: 'q + Send + Encode<'q, Postgres> + Type<Postgres>>(mut self, value: T) -> Self {
-        if self.arguments.add(value).is_ok() {
-            self.bind_pos += 1;
-        }
+        self.arguments.add(value);
+        self.bind_pos += 1;
         self
     }
 

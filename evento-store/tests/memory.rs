@@ -1,14 +1,14 @@
 #![allow(clippy::needless_return)]
 mod store;
 
-use evento_store::{MemoryStore, Store};
+use evento_store::MemoryStore;
 use tokio::sync::OnceCell;
 
-static ONCE: OnceCell<Store> = OnceCell::const_new();
+static ONCE: OnceCell<MemoryStore> = OnceCell::const_new();
 
-async fn get_store() -> &'static Store {
+async fn get_store() -> &'static MemoryStore {
     ONCE.get_or_init(|| async {
-        let store = MemoryStore::create();
+        let store = MemoryStore::new();
         store::init(&store).await.unwrap();
         store
     })
@@ -31,11 +31,4 @@ async fn save() {
 async fn wrong_version() {
     let store = get_store().await;
     store::test_wrong_version(store).await.unwrap();
-}
-
-#[tokio_shared_rt::test]
-async fn insert() {
-    let store = MemoryStore::create();
-    store::init(&store).await.unwrap();
-    store::test_insert(&store).await.unwrap();
 }

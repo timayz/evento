@@ -1,4 +1,6 @@
 #![forbid(unsafe_code)]
+#[cfg(feature = "pg")]
+mod pg;
 
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
@@ -6,11 +8,9 @@ use std::fmt::Debug;
 use crate::cursor::{Cursor, CursorType};
 
 #[cfg(feature = "pg")]
-mod pg;
-#[cfg(feature = "pg")]
 pub use pg::*;
 
-#[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct Edge<N> {
     pub cursor: CursorType,
     pub node: N,

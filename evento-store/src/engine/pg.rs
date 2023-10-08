@@ -4,35 +4,37 @@ use async_trait::async_trait;
 use evento_query::{Cursor, CursorType, PgQuery, QueryResult};
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, QueryBuilder};
-use uuid::Uuid;
 
 use crate::{
     engine::Engine,
-    error::{Result, StoreError},
-    store::{Event, Store, WriteEvent},
+    error::Result,
+    event::{Event, WriteEvent},
+    Store, StoreError,
 };
 
-#[derive(Debug, Clone)]
-pub struct PgStore {
-    pool: PgPool,
-    prefix: Option<String>,
-}
+pub type PgStore = Store<Pg>;
 
 impl PgStore {
-    pub fn create(pool: &PgPool) -> Store {
-        Store::new(Self {
+    pub fn new(pool: &PgPool) -> Self {
+        Store(Pg {
             pool: pool.clone(),
             prefix: None,
         })
     }
 
-    pub fn with_prefix(pool: &PgPool, prefix: impl Into<String>) -> Store {
-        Store::new(Self {
-            pool: pool.clone(),
-            prefix: Some(prefix.into()),
-        })
+    pub fn prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.0.prefix = Some(prefix.into());
+        self
     }
+}
 
+#[derive(Debug, Clone)]
+pub struct Pg {
+    pool: PgPool,
+    prefix: Option<String>,
+}
+
+impl Pg {
     pub fn table(&self, name: impl Into<String>) -> String {
         format!(
             "{}_{}",
@@ -42,12 +44,12 @@ impl PgStore {
     }
 
     pub fn table_events(&self) -> String {
-        self.table("event")
+        self.table("events")
     }
 }
 
 #[async_trait]
-impl Engine for PgStore {
+impl Engine for Pg {
     async fn write(
         &self,
         aggregate_id: &'_ str,
@@ -56,7 +58,6 @@ impl Engine for PgStore {
     ) -> Result<Vec<Event>> {
         let table_events = self.table_events();
         let mut tx = self.pool.begin().await?;
-
         let mut version = original_version;
         let mut events = Vec::new();
 
@@ -81,28 +82,16 @@ impl Engine for PgStore {
                 events.push(event);
             });
 
-            query_builder
-                .push("ON CONFLICT (aggregate_id, version) DO NOTHING")
-                .build()
-                .execute(&mut *tx)
-                .await?;
+            query_builder.build().execute(&mut *tx).await?;
         }
 
         let next_event_id = sqlx::query_as::<_, Event>(
-            format!(
-                r#"
-                SELECT * FROM {table_events}
-                WHERE aggregate_id = $1 AND version = $2
-                ORDER BY created_at ASC
-                LIMIT 1
-                "#
+                format!("SELECT * FROM {table_events} WHERE aggregate_id = $1 AND version = $2 ORDER BY created_at ASC LIMIT 1").as_str(),
             )
-            .as_str(),
-        )
-        .bind(aggregate_id)
-        .bind(i32::from(original_version + 1))
-        .fetch_optional(&mut *tx)
-        .await?;
+            .bind(aggregate_id)
+            .bind(i32::from(original_version + 1))
+            .fetch_optional(&mut *tx)
+            .await?;
 
         let wrong_version = match (next_event_id, events.first()) {
             (Some(next), Some(current)) => next.id != current.id,
@@ -118,59 +107,6 @@ impl Engine for PgStore {
         tx.commit().await?;
 
         Ok(events)
-    }
-
-    async fn insert(&self, events: Vec<Event>) -> Result<()> {
-        let table_events = self.table_events();
-
-        for events in events.chunks(100).collect::<Vec<&[Event]>>() {
-            let mut query_builder: QueryBuilder<Postgres> = QueryBuilder::new(
-                    format!("INSERT INTO {table_events} (id, name, aggregate_id, version, data, metadata, created_at) ")
-                );
-
-            query_builder.push_values(events, |mut b, event| {
-                b.push_bind(event.id.to_owned())
-                    .push_bind(event.name.to_owned())
-                    .push_bind(event.aggregate_id.to_owned())
-                    .push_bind(event.version)
-                    .push_bind(event.data.clone())
-                    .push_bind(event.metadata.clone())
-                    .push_bind(event.created_at);
-            });
-
-            query_builder.build().execute(&self.pool).await?;
-        }
-
-        Ok(())
-    }
-
-    async fn upsert(&self, event: Event) -> Result<()> {
-        let table_events = self.table_events();
-
-        sqlx::query_as::<_, (Uuid,)>(
-            format!(
-                r#"
-            INSERT INTO {table_events} (id, name, aggregate_id, version, data, metadata, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-            ON CONFLICT (aggregate_id, version)
-            DO
-                UPDATE SET data = $5, metadata = $6
-            RETURNING id
-            "#
-            )
-            .as_str(),
-        )
-        .bind(event.id)
-        .bind(event.name)
-        .bind(&event.aggregate_id)
-        .bind(event.version)
-        .bind(event.data)
-        .bind(event.metadata)
-        .bind(event.created_at)
-        .fetch_one(&self.pool)
-        .await?;
-
-        Ok(())
     }
 
     async fn read(
