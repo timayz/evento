@@ -462,6 +462,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 
 [[package]]
+name = "dyn-clone"
+version = "1.0.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23d2f3407d9a573d666de4b5bdf10569d73ca9478087346697dcbae6244bfbcd"
+
+[[package]]
 name = "either"
 version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -533,7 +539,7 @@ dependencies = [
  "anyhow",
  "backoff",
  "chrono",
- "evento-store",
+ "evento-store 0.9.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "futures-util",
  "glob-match",
  "parking_lot",
@@ -563,7 +569,6 @@ dependencies = [
  "backoff",
  "base64 0.21.4",
  "chrono",
- "evento-store",
  "futures-util",
  "harsh",
  "parse-display",
@@ -579,8 +584,12 @@ dependencies = [
 name = "evento-store"
 version = "0.9.1"
 dependencies = [
+ "anyhow",
+ "async-trait",
  "backoff",
  "chrono",
+ "dyn-clone",
+ "evento-query",
  "futures-util",
  "parking_lot",
  "parse-display",
@@ -589,6 +598,23 @@ dependencies = [
  "sqlx",
  "thiserror",
  "tokio",
+ "tokio-shared-rt",
+ "uuid",
+]
+
+[[package]]
+name = "evento-store"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "60624cfe084867e2e815e22a0526cedf2e1c988425d5cdf5e5c3f56136a8690c"
+dependencies = [
+ "chrono",
+ "futures-util",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror",
  "uuid",
 ]
 

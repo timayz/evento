@@ -22,7 +22,7 @@ prepare:
 	cargo sqlx prepare --merged
 
 test:
-	cargo test
+	cargo test --features=full
 
 fmt:
 	cargo fmt -- --emit files

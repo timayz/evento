@@ -14,7 +14,7 @@ use std::{fmt::Debug, str::FromStr};
 use crate::error::QueryError;
 
 #[derive(Debug, PartialEq, Deserialize, Serialize, Clone)]
-pub struct CursorType(String);
+pub struct CursorType(pub String);
 
 impl AsRef<[u8]> for CursorType {
     fn as_ref(&self) -> &[u8] {
