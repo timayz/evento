@@ -7,11 +7,11 @@ use crate::{error::Result, event::Event, WriteEvent};
 
 #[cfg(feature = "memory")]
 mod memory;
-#[cfg(feature = "pg")]
-mod pg;
-
 #[cfg(feature = "memory")]
 pub use memory::*;
+
+#[cfg(feature = "pg")]
+mod pg;
 #[cfg(feature = "pg")]
 pub use pg::*;
 

@@ -3,7 +3,7 @@ use serde_json::Value;
 
 use crate::{engine::Engine, error::Result, event::Event, Aggregate, WriteEvent};
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Store<E: Engine>(pub(crate) E);
 
 impl<E: Engine> Store<E> {
