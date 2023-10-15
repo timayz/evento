@@ -581,6 +581,7 @@ dependencies = [
  "sqlx",
  "thiserror",
  "tokio",
+ "tokio-shared-rt",
  "tracing",
  "uuid",
 ]

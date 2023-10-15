@@ -32,7 +32,7 @@ CREATE UNIQUE INDEX ON ev_queue (key);
 DO
 $$
 DECLARE
-  table_prefixes  text[] = array['concurrency', 'save', 'wrong_version', 'insert'];
+  table_prefixes  text[] = array['cdc', 'no_cdc', 'external_store'];
   table_prefix     text;
 BEGIN
   FOREACH table_prefix IN ARRAY table_prefixes LOOP
