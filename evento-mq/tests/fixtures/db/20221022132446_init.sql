@@ -1,4 +1,3 @@
--- Add up migration script here
 CREATE TABLE IF NOT EXISTS ev_event
 (
     id uuid NOT NULL PRIMARY KEY,
@@ -29,3 +28,32 @@ CREATE TABLE IF NOT EXISTS ev_queue
 );
 
 CREATE UNIQUE INDEX ON ev_queue (key);
+
+DO
+$$
+DECLARE
+  table_prefixes  text[] = array['concurrency', 'save', 'wrong_version', 'insert'];
+  table_prefix     text;
+BEGIN
+  FOREACH table_prefix IN ARRAY table_prefixes LOOP
+    EXECUTE format('
+    CREATE TABLE IF NOT EXISTS %1$s_event AS
+    TABLE ev_event
+    WITH NO DATA;
+
+    CREATE INDEX ON %1$s_event (aggregate_id);
+    CREATE INDEX ON %1$s_event USING gin (metadata jsonb_path_ops);
+
+    CREATE TABLE IF NOT EXISTS %1$s_deadletter_event AS
+    TABLE ev_event
+    WITH NO DATA;
+
+    CREATE TABLE IF NOT EXISTS %1$s_queue AS
+    TABLE ev_queue
+    WITH NO DATA;
+  
+    CREATE UNIQUE INDEX ON %1$s_queue (key);
+    ', table_prefix);
+  END LOOP;
+END;
+$$;

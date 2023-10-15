@@ -110,12 +110,7 @@ impl<E: Engine> Store<E> {
         &self,
         aggregate_id: impl Into<String>,
     ) -> Result<Option<Event>> {
-        let aggregate_id = A::aggregate_id(aggregate_id);
-
-        let events = self
-            .0
-            .read(1, None, None, Some(aggregate_id.as_str()))
-            .await?;
+        let events = self.read_of::<A>(aggregate_id, 1, None).await?;
 
         Ok(events.edges.first().map(|e| e.node.clone()))
     }

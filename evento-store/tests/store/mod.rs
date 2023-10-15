@@ -132,53 +132,57 @@ pub async fn init<E: Engine>(store: &Store<E>) -> anyhow::Result<()> {
 }
 
 pub async fn test_concurrency<E: Engine>(store: &Store<E>) -> anyhow::Result<()> {
-    join_all(vec![
-        store.write_all::<User>(
-            "concurrency_save",
-            vec![
-                WriteEvent::new(UserEvent::Created).data(Created {
-                    username: "albert.dupont".to_owned(),
-                    password: "azerty".to_owned(),
-                })?,
-                WriteEvent::new(UserEvent::ProfileUpdated).data(ProfileUpdated {
-                    first_name: "albert".to_owned(),
-                    last_name: "dupont".to_owned(),
-                })?,
-            ],
-            0,
-        ),
-        store.write_all::<User>(
-            "concurrency_save",
-            vec![
-                WriteEvent::new(UserEvent::Created).data(Created {
-                    username: "john.doe".to_owned(),
-                    password: "azertypoiu".to_owned(),
-                })?,
-                WriteEvent::new(UserEvent::ProfileUpdated).data(ProfileUpdated {
-                    first_name: "john".to_owned(),
-                    last_name: "doe".to_owned(),
-                })?,
-            ],
-            0,
-        ),
-        store.write_all::<User>(
-            "concurrency_save",
-            vec![
-                WriteEvent::new(UserEvent::Created).data(Created {
-                    username: "nina.dupont".to_owned(),
-                    password: "azertyuiop".to_owned(),
-                })?,
-                WriteEvent::new(UserEvent::ProfileUpdated).data(ProfileUpdated {
-                    first_name: "nina".to_owned(),
-                    last_name: "dupont".to_owned(),
-                })?,
-            ],
-            0,
-        ),
-    ])
-    .await;
+    let mut futures = vec![];
+    for _ in 0..100 {
+        futures.extend(vec![
+            store.write_all::<User>(
+                "albert",
+                vec![
+                    WriteEvent::new(UserEvent::Created).data(Created {
+                        username: "albert.dupont".to_owned(),
+                        password: "azerty".to_owned(),
+                    })?,
+                    WriteEvent::new(UserEvent::ProfileUpdated).data(ProfileUpdated {
+                        first_name: "albert".to_owned(),
+                        last_name: "dupont".to_owned(),
+                    })?,
+                ],
+                0,
+            ),
+            store.write_all::<User>(
+                "john",
+                vec![
+                    WriteEvent::new(UserEvent::Created).data(Created {
+                        username: "john.doe".to_owned(),
+                        password: "azertypoiu".to_owned(),
+                    })?,
+                    WriteEvent::new(UserEvent::ProfileUpdated).data(ProfileUpdated {
+                        first_name: "john".to_owned(),
+                        last_name: "doe".to_owned(),
+                    })?,
+                ],
+                0,
+            ),
+            store.write_all::<User>(
+                "nina",
+                vec![
+                    WriteEvent::new(UserEvent::Created).data(Created {
+                        username: "nina.dupont".to_owned(),
+                        password: "azertyuiop".to_owned(),
+                    })?,
+                    WriteEvent::new(UserEvent::ProfileUpdated).data(ProfileUpdated {
+                        first_name: "nina".to_owned(),
+                        last_name: "dupont".to_owned(),
+                    })?,
+                ],
+                0,
+            ),
+        ]);
+    }
 
-    let events = store.read_of::<User>("concurrency_save", 10, None).await?;
+    join_all(futures).await;
+
+    let events = store.read_of::<User>("albert", 10, None).await?;
 
     assert_eq!(events.edges.len(), 2);
     assert_eq!(
@@ -197,7 +201,7 @@ pub async fn test_concurrency<E: Engine>(store: &Store<E>) -> anyhow::Result<()>
     );
 
     let (user, _) = store
-        .load_with::<User>("concurrency_save", 1)
+        .load_with::<User>("albert", 1)
         .await?
         .unwrap();
 

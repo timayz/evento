@@ -66,6 +66,12 @@ impl Engine for Pg {
     ) -> Result<Vec<Event>> {
         let table_events = self.table_events();
         let mut tx = self.pool.begin().await?;
+
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+            .bind(aggregate_id)
+            .execute(&mut *tx)
+            .await?;
+
         let mut version = original_version;
         let mut events = Vec::new();
 
@@ -94,12 +100,21 @@ impl Engine for Pg {
         }
 
         let next_event_id = sqlx::query_as::<_, Event>(
-                format!("SELECT * FROM {table_events} WHERE aggregate_id = $1 AND version = $2 ORDER BY created_at ASC LIMIT 1").as_str(),
+            format!(
+                r#"
+                SELECT * FROM {table_events}
+                WHERE aggregate_id = $1 AND version = $2
+                ORDER BY created_at ASC
+                LIMIT 1
+                FOR UPDATE
+                "#
             )
-            .bind(aggregate_id)
-            .bind(i32::from(original_version + 1))
-            .fetch_optional(&mut *tx)
-            .await?;
+            .as_str(),
+        )
+        .bind(aggregate_id)
+        .bind(i32::from(original_version + 1))
+        .fetch_optional(&mut *tx)
+        .await?;
 
         let wrong_version = match (next_event_id, events.first()) {
             (Some(next), Some(current)) => next.id != current.id,
