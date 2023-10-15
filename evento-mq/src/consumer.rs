@@ -133,7 +133,7 @@ impl<E: Engine + Clone + 'static, S: evento_store::Engine + Clone + 'static> Con
         }
 
         tokio::spawn(async move {
-            info!("wait {delay} seconds before to start {}", rule.key);
+            info!("wait {delay} seconds to start {}", rule.key);
             sleep(Duration::from_secs(delay)).await;
             info!("{} started.", rule.key);
 
