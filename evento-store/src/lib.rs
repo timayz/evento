@@ -3,11 +3,10 @@
 mod aggregate;
 mod engine;
 mod error;
-mod event;
 mod store;
 
 pub use aggregate::*;
 pub use engine::*;
 pub use error::*;
-pub use event::*;
+pub use evento_query::CursorType;
 pub use store::*;

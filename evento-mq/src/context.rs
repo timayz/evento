@@ -49,7 +49,7 @@ impl Context {
     /// If an item of this type was already stored, it will be replaced and returned.
     ///
     /// ```
-    /// # use evento::Context;
+    /// # use evento_mq::Context;
     /// let mut map = Context::new();
     /// assert_eq!(map.insert(""), None);
     /// assert_eq!(map.insert(1u32), None);
@@ -65,7 +65,7 @@ impl Context {
     /// Check if map contains an item of a given type.
     ///
     /// ```
-    /// # use evento::Context;
+    /// # use evento_mq::Context;
     /// let mut map = Context::new();
     /// assert!(!map.contains::<u32>());
     ///
@@ -79,7 +79,7 @@ impl Context {
     /// Get a reference to an item of a given type.
     ///
     /// ```
-    /// # use evento::Context;
+    /// # use evento_mq::Context;
     /// let mut map = Context::new();
     /// map.insert(1u32);
     /// assert_eq!(map.get::<u32>(), Some(&1u32));
@@ -106,7 +106,7 @@ impl Context {
     /// Get a reference to an item of a given type.
     ///
     /// ```
-    /// # use evento::Context;
+    /// # use evento_mq::Context;
     /// let mut map = Context::new();
     /// map.insert(1u32);
     /// assert_eq!(map.get::<u32>(), Some(&1u32));
@@ -120,7 +120,7 @@ impl Context {
     /// Get a mutable reference to an item of a given type.
     ///
     /// ```
-    /// # use evento::Context;
+    /// # use evento_mq::Context;
     /// let mut map = Context::new();
     /// map.insert(1u32);
     /// assert_eq!(map.get_mut::<u32>(), Some(&mut 1u32));
@@ -136,7 +136,7 @@ impl Context {
     /// If an item of this type was already stored, it will be returned.
     ///
     /// ```
-    /// # use evento::Context;
+    /// # use evento_mq::Context;
     /// let mut map = Context::new();
     ///
     /// map.insert(1u32);
@@ -152,7 +152,7 @@ impl Context {
     /// Clear the `Context` of all inserted extensions.
     ///
     /// ```
-    /// # use evento::Context;
+    /// # use evento_mq::Context;
     /// let mut map = Context::new();
     ///
     /// map.insert(1u32);

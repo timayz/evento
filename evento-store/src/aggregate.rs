@@ -1,4 +1,4 @@
-use crate::event::Event;
+use crate::store::Event;
 
 pub trait Aggregate: Default {
     fn apply(&mut self, event: &'_ Event);

@@ -5,11 +5,11 @@ mod context;
 mod data;
 mod engine;
 mod producer;
-mod subscriber;
+mod error;
 
 pub use consumer::*;
 pub use context::Context;
 pub use data::Data;
 pub use engine::*;
 pub use producer::*;
-pub use subscriber::*;
+pub use error::*;

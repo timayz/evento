@@ -32,3 +32,10 @@ async fn wrong_version() {
     let store = get_store().await;
     store::test_wrong_version(store).await.unwrap();
 }
+
+#[tokio_shared_rt::test]
+async fn insert() {
+    let store = MemoryStore::new();
+    store::init(&store).await.unwrap();
+    store::test_insert(&store).await.unwrap();
+}

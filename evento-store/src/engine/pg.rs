@@ -7,9 +7,8 @@ use sqlx::{PgPool, Postgres, QueryBuilder};
 
 use crate::{
     engine::Engine,
-    error::Result,
-    event::{Event, WriteEvent},
-    Store, StoreError,
+    error::{Result, StoreError},
+    store::{Event, Store, WriteEvent},
 };
 
 pub type PgStore = Store<Pg>;
@@ -24,6 +23,15 @@ impl PgStore {
 
     pub fn prefix(mut self, prefix: impl Into<String>) -> Self {
         self.0.prefix = Some(prefix.into());
+        self
+    }
+
+    pub fn extend_prefix(mut self, prefix: impl Into<String>) -> Self {
+        let prefix = prefix.into();
+        self.0.prefix = match self.0.prefix {
+            Some(prev) => Some(format!("{prefix}_{prev}")),
+            _ => Some(prefix),
+        };
         self
     }
 }
@@ -44,7 +52,7 @@ impl Pg {
     }
 
     pub fn table_events(&self) -> String {
-        self.table("events")
+        self.table("event")
     }
 }
 
@@ -107,6 +115,33 @@ impl Engine for Pg {
         tx.commit().await?;
 
         Ok(events)
+    }
+
+    async fn insert(&self, events: Vec<Event>) -> Result<()> {
+        let table_events = self.table_events();
+        let mut tx = self.pool.begin().await?;
+
+        for events in events.chunks(100).collect::<Vec<&[Event]>>() {
+            let mut query_builder: QueryBuilder<Postgres> = QueryBuilder::new(
+                    format!("INSERT INTO {table_events} (id, name, aggregate_id, version, data, metadata, created_at) ")
+                );
+
+            query_builder.push_values(events, |mut b, event| {
+                b.push_bind(event.id.to_owned())
+                    .push_bind(event.name.to_owned())
+                    .push_bind(event.aggregate_id.to_owned())
+                    .push_bind(event.version)
+                    .push_bind(event.data.clone())
+                    .push_bind(event.metadata.clone())
+                    .push_bind(event.created_at);
+            });
+
+            query_builder.build().execute(&mut *tx).await?;
+        }
+
+        tx.commit().await?;
+
+        Ok(())
     }
 
     async fn read(

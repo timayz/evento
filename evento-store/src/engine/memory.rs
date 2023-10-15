@@ -7,8 +7,7 @@ use std::{cmp::Ordering, collections::HashMap, sync::Arc};
 use crate::{
     engine::Engine,
     error::{Result, StoreError},
-    event::{Event, WriteEvent},
-    store::Store,
+    store::{Event, Store, WriteEvent},
 };
 
 pub type MemoryStore = Store<Memory>;
@@ -58,6 +57,21 @@ impl Engine for Memory {
         }
 
         Ok(events[start_at..events.len()].to_vec())
+    }
+
+    async fn insert(&self, events: Vec<Event>) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        let mut data = self.0.write();
+
+        for event in events {
+            let events = data.entry(event.aggregate_id.to_owned()).or_default();
+            events.push(event);
+        }
+
+        Ok(())
     }
 
     async fn read(

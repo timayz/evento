@@ -344,3 +344,97 @@ pub async fn test_wrong_version<E: Engine>(store: &Store<E>) -> anyhow::Result<(
 
     Ok(())
 }
+
+pub async fn test_insert<E: Engine>(store: &Store<E>) -> anyhow::Result<()> {
+    let query = store.read(10, None, None).await.unwrap();
+
+    assert_eq!(query.edges.len(), 4);
+    assert_eq!(
+        query.edges[0].node.data,
+        serde_json::to_value(Created {
+            username: "john.doe".to_owned(),
+            password: "azerty".to_owned(),
+        })?,
+    );
+    assert_eq!(
+        query.edges[1].node.data,
+        serde_json::to_value(AccountDeleted { deleted: true })?,
+    );
+
+    assert_eq!(
+        query.edges[2].node.data,
+        serde_json::to_value(Created {
+            username: "albert.dupont".to_owned(),
+            password: "azerty".to_owned(),
+        })?,
+    );
+    assert_eq!(
+        query.edges[3].node.data,
+        serde_json::to_value(ProfileUpdated {
+            first_name: "albert".to_owned(),
+            last_name: "dupont".to_owned(),
+        })?,
+    );
+
+    store
+        .insert(vec![
+            WriteEvent::new(UserEvent::Created)
+                .data(Created {
+                    username: "john.doe".to_owned(),
+                    password: "azerty".to_owned(),
+                })?
+                .to_event("user#3", 0),
+            WriteEvent::new(UserEvent::AccountDeleted)
+                .data(AccountDeleted { deleted: true })?
+                .to_event("user#3", 1),
+        ])
+        .await
+        .unwrap();
+
+    let query = store.read(10, None, None).await.unwrap();
+
+    assert_eq!(query.edges.len(), 6);
+    assert_eq!(
+        query.edges[0].node.data,
+        serde_json::to_value(Created {
+            username: "john.doe".to_owned(),
+            password: "azerty".to_owned(),
+        })?,
+    );
+
+    assert_eq!(
+        query.edges[1].node.data,
+        serde_json::to_value(AccountDeleted { deleted: true })?,
+    );
+
+    assert_eq!(
+        query.edges[2].node.data,
+        serde_json::to_value(Created {
+            username: "albert.dupont".to_owned(),
+            password: "azerty".to_owned(),
+        })?,
+    );
+
+    assert_eq!(
+        query.edges[3].node.data,
+        serde_json::to_value(ProfileUpdated {
+            first_name: "albert".to_owned(),
+            last_name: "dupont".to_owned(),
+        })?,
+    );
+
+    assert_eq!(
+        query.edges[4].node.data,
+        serde_json::to_value(Created {
+            username: "john.doe".to_owned(),
+            password: "azerty".to_owned(),
+        })?,
+    );
+
+    assert_eq!(
+        query.edges[5].node.data,
+        serde_json::to_value(AccountDeleted { deleted: true })?,
+    );
+
+    Ok(())
+}
