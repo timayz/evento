@@ -2,7 +2,7 @@ use anyhow::{Error, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use dyn_clone::DynClone;
-use evento_store::{Event, Store};
+use evento_store::{Cursor, Event, Store};
 use futures_util::future::join_all;
 use glob_match::glob_match;
 use parking_lot::RwLock;
@@ -122,6 +122,15 @@ impl<E: Engine + Clone + 'static, S: evento_store::Engine + Clone + 'static> Con
         let consumer_id = self.id;
         let ctx = self.context.clone();
         let name = self.name.to_owned();
+
+        if !rule.cdc {
+            tracing::info!("change data capture disabled for {}.", rule.key);
+
+            if let Err(e) = self.set_cursor_to_last(rule.key.to_owned()).await {
+                tracing::error!("{e}");
+                return;
+            }
+        }
 
         tokio::spawn(async move {
             info!("wait {delay} seconds before to start {}", rule.key);
@@ -305,6 +314,16 @@ impl<E: Engine + Clone + 'static, S: evento_store::Engine + Clone + 'static> Con
             }
         });
     }
+
+    async fn set_cursor_to_last(&self, key: String) -> Result<()> {
+        let Some(event) = self.store.last().await? else {
+            return Ok(());
+        };
+
+        self.engine.set_cursor(key, event.to_cursor()).await?;
+
+        Ok(())
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -340,7 +359,7 @@ pub struct Rule<E: evento_store::Engine> {
     pub(crate) handlers: Vec<(String, Box<dyn RuleHandler + 'static>)>,
     pub(crate) post_handlers: Vec<Box<dyn PostRuleHandler + 'static>>,
     pub(crate) filters: HashSet<String>,
-    pub(crate) with_cursor: bool,
+    pub(crate) cdc: bool,
 }
 
 impl<E: evento_store::Engine> Rule<E> {
@@ -351,7 +370,7 @@ impl<E: evento_store::Engine> Rule<E> {
             filters: HashSet::new(),
             handlers: Vec::new(),
             post_handlers: Vec::new(),
-            with_cursor: true,
+            cdc: true,
         }
     }
 
@@ -373,8 +392,8 @@ impl<E: evento_store::Engine> Rule<E> {
         self
     }
 
-    pub fn with_cursor(mut self, value: bool) -> Self {
-        self.with_cursor = value;
+    pub fn cdc(mut self, value: bool) -> Self {
+        self.cdc = value;
 
         self
     }
