@@ -130,19 +130,20 @@ impl<E: Engine + Clone + 'static, S: evento_store::Engine + Clone + 'static> Con
         let ctx = self.context.clone();
         let name = self.name.to_owned();
 
-        if !rule.cdc {
-            tracing::info!("change data capture disabled for {}.", rule.key);
-
-            if let Err(e) = self.set_cursor_to_last(rule.key.to_owned()).await {
-                tracing::error!("{e}");
-                return;
-            }
-        }
-
         tokio::spawn(async move {
             info!("wait {delay} seconds to start {}", rule.key);
             sleep(Duration::from_secs(delay)).await;
             info!("{} started.", rule.key);
+
+            if !rule.cdc {
+                tracing::info!("change data capture disabled for {}.", rule.key);
+
+                if let Err(e) = Self::set_cursor_to_last(&engine, &store, rule.key.to_owned()).await
+                {
+                    tracing::error!("{e}");
+                    return;
+                }
+            }
 
             let mut interval = interval_at(Instant::now(), Duration::from_millis(100));
 
@@ -322,12 +323,12 @@ impl<E: Engine + Clone + 'static, S: evento_store::Engine + Clone + 'static> Con
         });
     }
 
-    async fn set_cursor_to_last(&self, key: String) -> Result<()> {
-        let Some(event) = self.store.last().await? else {
+    async fn set_cursor_to_last(engine: &E, store: &Store<S>, key: String) -> Result<()> {
+        let Some(event) = store.last().await? else {
             return Ok(());
         };
 
-        self.engine.set_cursor(key, event.to_cursor()).await?;
+        engine.set_cursor(key, event.to_cursor()).await?;
 
         Ok(())
     }
