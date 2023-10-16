@@ -727,7 +727,7 @@ impl<E: Engine + Sync + Send + 'static, S: StoreEngine + Sync + Send + 'static> 
                         Some(details) => details,
                         _ => {
                             tracing::error!(
-                                "faield to aggregate_details of {}",
+                                "failed to aggregate_details of {}",
                                 event.aggregate_id
                             );
                             continue;

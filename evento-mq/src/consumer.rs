@@ -61,13 +61,20 @@ impl<E: Engine + Clone + 'static, S: evento_store::Engine + Clone + 'static> Con
         }
     }
 
-    pub fn name<N: Into<String>>(mut self, name: N) -> Self {
-        self.name = Some(name.into());
-        self.context
-            .0
-            .write()
-            .insert(ConsumerName(self.name.to_owned()));
-        self
+    pub fn name<N: Into<String>>(&self, name: N) -> Self {
+        let name: Option<_> = Some(name.into());
+        let context = ConsumerContext::default();
+        context.0.write().insert(ConsumerName(name.to_owned()));
+
+        Self {
+            engine: self.engine.clone(),
+            store: self.store.clone(),
+            deadletter_store: self.deadletter_store.clone(),
+            rules: self.rules.clone(),
+            context,
+            name,
+            id: Uuid::new_v4(),
+        }
     }
 
     pub fn data<V: Send + Sync + 'static>(self, v: V) -> Self {
@@ -202,7 +209,7 @@ impl<E: Engine + Clone + 'static, S: evento_store::Engine + Clone + 'static> Con
                     let (aggregate_type, aggregate_id) = match event.node.aggregate_details() {
                         Some(details) => details,
                         _ => {
-                            error!("faield to aggregate_details of {}", event.node.aggregate_id);
+                            error!("failed to aggregate_details of {}", event.node.aggregate_id);
                             continue;
                         }
                     };
@@ -346,18 +353,18 @@ pub trait RuleHandler: DynClone + Send + Sync {
 dyn_clone::clone_trait_object!(RuleHandler);
 
 #[async_trait]
-pub trait PostRuleHandler: DynClone + Send + Sync {
+pub trait RulePostHandler: DynClone + Send + Sync {
     async fn handle(&self, event: Event, ctx: ConsumerContext) -> Result<()>;
 }
 
-dyn_clone::clone_trait_object!(PostRuleHandler);
+dyn_clone::clone_trait_object!(RulePostHandler);
 
 #[derive(Clone)]
 pub struct Rule<E: evento_store::Engine> {
     pub(crate) key: String,
     pub(crate) store: Option<Store<E>>,
     pub(crate) handlers: Vec<(String, Box<dyn RuleHandler + 'static>)>,
-    pub(crate) post_handlers: Vec<Box<dyn PostRuleHandler + 'static>>,
+    pub(crate) post_handlers: Vec<Box<dyn RulePostHandler + 'static>>,
     pub(crate) filters: HashSet<String>,
     pub(crate) cdc: bool,
 }
@@ -386,7 +393,7 @@ impl<E: evento_store::Engine> Rule<E> {
         self
     }
 
-    pub fn post_handler<H: PostRuleHandler + 'static>(mut self, handler: H) -> Self {
+    pub fn post_handler<H: RulePostHandler + 'static>(mut self, handler: H) -> Self {
         self.post_handlers.push(Box::new(handler));
 
         self

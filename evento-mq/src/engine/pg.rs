@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use chrono::Utc;
 use evento_store::{CursorType, PgStore};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -53,24 +54,75 @@ impl Pg {
         )
     }
 
-    pub fn table_subscriptions(&self) -> String {
-        self.table("subscriptions")
-    }
-
-    pub fn table_deadletters(&self) -> String {
-        self.table("deadletters")
+    pub fn table_queue(&self) -> String {
+        self.table("queue")
     }
 }
 
 #[async_trait]
 impl Engine for Pg {
-    async fn upsert(&self, key: String, consumer: Uuid) -> Result<()> {
-        todo!()
+    async fn upsert(&self, key: String, consumer_id: Uuid) -> Result<()> {
+        let table_queue = self.table_queue();
+
+        sqlx::query_as::<_, (Uuid,)>(
+            format!(
+                r#"
+            INSERT INTO {table_queue} (id, consumer_id, rule, enabled, created_at)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (rule)
+            DO
+                UPDATE SET consumer_id = $2
+            RETURNING id
+            "#
+            )
+            .as_str(),
+        )
+        .bind(Uuid::new_v4())
+        .bind(consumer_id)
+        .bind(&key)
+        .bind(true)
+        .bind(Utc::now())
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(())
     }
     async fn get(&self, key: String) -> Result<Queue> {
-        todo!()
+        let table_queue = self.table_queue();
+
+        let queue = sqlx::query_as::<_, Queue>(
+            format!(
+                r#"
+            SELECT * from {table_queue} WHERE rule = $1
+            "#
+            )
+            .as_str(),
+        )
+        .bind(&key)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(queue)
     }
-    async fn set_cursor(&self, key: String, cursor: CursorType) -> Result<Queue> {
-        todo!()
+    async fn set_cursor(&self, key: String, cursor: CursorType) -> Result<()> {
+        let table_queue = self.table_queue();
+        sqlx::query_as::<_, (Uuid,)>(
+            format!(
+                r#"
+            UPDATE {table_queue}
+            SET cursor = $2, updated_at = $3
+            WHERE rule = $1
+            RETURNING id
+            "#
+            )
+            .as_str(),
+        )
+        .bind(&key)
+        .bind(cursor.0.to_owned())
+        .bind(Utc::now())
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(())
     }
 }

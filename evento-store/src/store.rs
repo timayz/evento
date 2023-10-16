@@ -190,6 +190,14 @@ impl Event {
         Ok(serde_json::from_value(self.data.clone())?)
     }
 
+    pub fn data<M: Serialize>(mut self, value: M) -> Result<Self> {
+        let data = serde_json::to_value(&value)?;
+
+        self.data = data;
+
+        Ok(self)
+    }
+
     pub fn to_metadata<D: DeserializeOwned>(&self) -> Result<Option<D>> {
         if let Some(metadata) = self.metadata.clone() {
             Ok(Some(serde_json::from_value(metadata)?))
@@ -212,7 +220,7 @@ impl Event {
 
     pub fn aggregate_details(&self) -> Option<(String, String)> {
         self.aggregate_id
-            .split_once('_')
+            .split_once('#')
             .map(|(aggregate_type, id)| (aggregate_type.to_owned(), id.to_owned()))
     }
 }

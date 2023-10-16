@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS ev_queue
     created_at timestamptz NOT NULL
 );
 
-CREATE UNIQUE INDEX ON ev_queue (key);
+CREATE UNIQUE INDEX ON ev_queue (rule);
 
 DO
 $$
@@ -52,7 +52,7 @@ BEGIN
     TABLE ev_queue
     WITH NO DATA;
   
-    CREATE UNIQUE INDEX ON %1$s_queue (key);
+    CREATE UNIQUE INDEX ON %1$s_queue (rule);
     ', table_prefix);
   END LOOP;
 END;

@@ -45,3 +45,4 @@ backoff = { version = "0.4.0", features = ["futures", "tokio"] }
 sqlx = { version = "0.7.2", features = ["runtime-tokio", "postgres", "chrono", "uuid", "json", "any"] }
 parse-display = { version = "0.8.2" }
 tokio-shared-rt = "0.1.0"
+tracing-test = { version = "0.2.4", features = ["no-env-filter"] }

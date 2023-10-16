@@ -13,6 +13,16 @@ impl<S: Engine + Send + Sync + Clone> Producer<S> {
     pub async fn publish<A: Aggregate, I: Into<String>>(
         &self,
         id: I,
+        event: WriteEvent,
+        original_version: u16,
+    ) -> Result<Vec<Event>> {
+        self.publish_all::<A, I>(id, vec![event], original_version)
+            .await
+    }
+
+    pub async fn publish_all<A: Aggregate, I: Into<String>>(
+        &self,
+        id: I,
         events: Vec<WriteEvent>,
         original_version: u16,
     ) -> Result<Vec<Event>> {

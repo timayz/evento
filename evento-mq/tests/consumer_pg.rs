@@ -11,6 +11,7 @@ use sqlx::{
     Any, PgPool,
 };
 use tokio::sync::OnceCell;
+use tracing_test::traced_test;
 
 static POOL: OnceCell<PgPool> = OnceCell::const_new();
 
@@ -42,6 +43,7 @@ pub async fn get_pool() -> &'static PgPool {
 }
 
 #[tokio_shared_rt::test]
+#[traced_test]
 async fn cdc() {
     let pool = get_pool().await;
     let consumer = PgConsumer::new(pool).prefix("cdc");
@@ -50,6 +52,7 @@ async fn cdc() {
 }
 
 #[tokio_shared_rt::test]
+#[traced_test]
 async fn no_cdc() {
     let pool = get_pool().await;
     let consumer = PgConsumer::new(pool).prefix("no_cdc");
@@ -58,6 +61,7 @@ async fn no_cdc() {
 }
 
 #[tokio_shared_rt::test]
+#[traced_test]
 async fn external_store() {
     let pool = get_pool().await;
     let consumer = PgConsumer::new(pool).prefix("external_store");
