@@ -107,10 +107,28 @@ async fn deadletter_with_name() {
 
 #[tokio_shared_rt::test]
 #[traced_test]
+async fn post_handler() {
+    let pool = get_pool().await;
+    let consumer = PgConsumer::new(pool).prefix("post_handler");
+
+    consumer::test_post_handler(&consumer, false).await.unwrap();
+}
+
+#[tokio_shared_rt::test]
+#[traced_test]
+async fn post_handler_with_name() {
+    let pool = get_pool().await;
+    let consumer = PgConsumer::new(pool).prefix("post_handler_with_name");
+
+    consumer::test_post_handler(&consumer, true).await.unwrap();
+}
+
+#[tokio_shared_rt::test]
+#[traced_test]
 async fn external_store() {
     let pool = get_pool().await;
     let consumer = PgConsumer::new(pool).prefix("external_store");
-    let store = PgStore::with_prefix(pool, "external_store_ext");
+    let store = PgStore::new(pool).prefix("external_store_ext");
 
     consumer::test_external_store(&consumer, &store, false)
         .await
@@ -122,7 +140,7 @@ async fn external_store() {
 async fn external_store_with_name() {
     let pool = get_pool().await;
     let consumer = PgConsumer::new(pool).prefix("external_store_with_name");
-    let store = PgStore::with_prefix(pool, "external_store_with_name_ext");
+    let store = PgStore::new(pool).prefix("external_store_with_name_ext");
 
     consumer::test_external_store(&consumer, &store, true)
         .await

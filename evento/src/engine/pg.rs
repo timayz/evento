@@ -10,23 +10,22 @@ use crate::{
     error::Result,
 };
 
-pub type PgConsumer = Consumer<Pg>;
+pub type PgConsumer = Consumer<Pg, evento_store::Pg>;
 
 impl PgConsumer {
     pub fn new(pool: &PgPool) -> Self {
         Self::create(
             Pg::new(pool),
-            PgStore::create(pool),
-            PgStore::with_prefix(pool, "ev_deadletter"),
+            PgStore::new(pool),
+            PgStore::new(pool).prefix("deadletter"),
         )
-        .data(pool.clone())
     }
 
     pub fn prefix(mut self, prefix: impl Into<String>) -> Self {
         let prefix = prefix.into();
 
-        self.store = PgStore::with_prefix(&self.engine.pool, &prefix);
-        self.deadletter = PgStore::with_prefix(&self.engine.pool, format!("{prefix}_deadletter"));
+        self.store = self.store.prefix(&prefix);
+        self.deadletter = self.deadletter.extend_prefix(&prefix);
         self.engine.prefix = Some(prefix);
 
         self

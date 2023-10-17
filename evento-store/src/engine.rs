@@ -3,15 +3,18 @@ use dyn_clone::DynClone;
 use evento_query::{CursorType, QueryResult};
 use serde_json::Value;
 
-use crate::{error::Result, event::Event, WriteEvent};
+use crate::{
+    error::Result,
+    store::{Event, WriteEvent},
+};
 
 #[cfg(feature = "memory")]
 mod memory;
-#[cfg(feature = "pg")]
-mod pg;
-
 #[cfg(feature = "memory")]
 pub use memory::*;
+
+#[cfg(feature = "pg")]
+mod pg;
 #[cfg(feature = "pg")]
 pub use pg::*;
 
@@ -23,6 +26,8 @@ pub trait Engine: DynClone + Send + Sync {
         events: Vec<WriteEvent>,
         original_version: u16,
     ) -> Result<Vec<Event>>;
+
+    async fn insert(&self, events: Vec<Event>) -> Result<()>;
 
     async fn read(
         &self,

@@ -1,4 +1,4 @@
-CREATE TABLE IF NOT EXISTS ev_events
+CREATE TABLE IF NOT EXISTS ev_event
 (
     id uuid NOT NULL PRIMARY KEY,
     name varchar(255) NOT NULL,
@@ -9,23 +9,23 @@ CREATE TABLE IF NOT EXISTS ev_events
     created_at timestamptz NOT NULL
 );
 
-CREATE INDEX ON ev_events (aggregate_id);
-CREATE INDEX ON ev_events USING gin (metadata jsonb_path_ops);
+CREATE INDEX ON ev_event (aggregate_id);
+CREATE INDEX ON ev_event USING gin (metadata jsonb_path_ops);
 
 DO
 $$
 DECLARE
-  table_prefixes  text[] = array['concurrency', 'save', 'wrong_version'];
+  table_prefixes  text[] = array['concurrency', 'save', 'wrong_version', 'insert'];
   table_prefix     text;
 BEGIN
   FOREACH table_prefix IN ARRAY table_prefixes LOOP
     EXECUTE format('
-    CREATE TABLE IF NOT EXISTS %1$s_events AS
-    TABLE ev_events
+    CREATE TABLE IF NOT EXISTS %1$s_event AS
+    TABLE ev_event
     WITH NO DATA;
 
-    CREATE INDEX ON %1$s_events (aggregate_id);
-    CREATE INDEX ON %1$s_events USING gin (metadata jsonb_path_ops);
+    CREATE INDEX ON %1$s_event (aggregate_id);
+    CREATE INDEX ON %1$s_event USING gin (metadata jsonb_path_ops);
 
     ', table_prefix);
   END LOOP;

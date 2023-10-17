@@ -13,15 +13,11 @@ use crate::{
     error::Result,
 };
 
-pub type MemoryConsumer = Consumer<Memory>;
+pub type MemoryConsumer = Consumer<Memory, evento_store::Memory>;
 
 impl MemoryConsumer {
     pub fn new() -> Self {
-        Self::create(
-            Memory::default(),
-            MemoryStore::create(),
-            MemoryStore::create(),
-        )
+        Self::create(Memory::default(), MemoryStore::new(), MemoryStore::new())
     }
 }
 

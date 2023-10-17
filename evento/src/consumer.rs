@@ -1,8 +1,8 @@
-use anyhow::Result;
+use anyhow::{Error, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use dyn_clone::DynClone;
-use evento_store::{Aggregate, Applier, Cursor, Event, Result as StoreResult, Store};
+use evento_store::{Cursor, Event, Store};
 use futures_util::future::join_all;
 use glob_match::glob_match;
 use parking_lot::RwLock;
@@ -16,64 +16,46 @@ use tokio::time::{interval_at, sleep, Duration, Instant};
 use tracing::{debug, error, info};
 use uuid::Uuid;
 
-use crate::{context::Context, engine::Engine, Producer, Publisher};
+use crate::{context::Context, engine::Engine, Producer};
 
-#[derive(Clone)]
-pub struct ConsumerContext {
-    pub name: Option<String>,
-    inner: Arc<RwLock<Context>>,
-    producer: Producer,
-}
+struct ConsumerName(String);
+
+#[derive(Debug, Clone, Default)]
+pub struct ConsumerContext(Arc<RwLock<Context>>);
 
 impl ConsumerContext {
+    pub fn name(&self) -> Option<String> {
+        self.0.read().get::<ConsumerName>().map(|c| c.0.to_owned())
+    }
+
     pub fn extract<T: Clone + 'static>(&self) -> T {
-        self.inner.read().extract::<T>().clone()
+        self.0.read().extract::<T>().clone()
     }
 
     pub fn get<T: Clone + 'static>(&self) -> Option<T> {
-        self.inner.read().get::<T>().cloned()
-    }
-
-    pub fn write(&self, value: impl Into<String>) -> Publisher<'_> {
-        self.producer.write(value)
-    }
-
-    pub async fn load<A: Aggregate + Applier, I: Into<String>>(
-        &self,
-        id: I,
-    ) -> StoreResult<Option<(A, u16)>> {
-        self.producer.load::<A, I>(id).await
+        self.0.read().get::<T>().cloned()
     }
 }
 
 #[derive(Clone)]
-pub struct Consumer<E: Engine + Clone> {
+pub struct Consumer<E: Engine + Clone, S: evento_store::Engine> {
     pub(super) engine: E,
-    pub(super) store: Store,
-    pub deadletter: Store,
-    rules: HashMap<String, Rule>,
+    pub(super) store: Store<S>,
+    pub deadletter: Store<S>,
+    rules: HashMap<String, Rule<S>>,
     id: Uuid,
     name: Option<String>,
     context: ConsumerContext,
 }
 
-impl<E: Engine + Clone + 'static> Consumer<E> {
-    pub(super) fn create(engine: E, store: Store, deadletter: Store) -> Self {
-        let context = ConsumerContext {
-            inner: Default::default(),
-            name: None,
-            producer: Producer {
-                name: None,
-                store: store.clone(),
-            },
-        };
-
+impl<E: Engine + Clone + 'static, S: evento_store::Engine + Clone + 'static> Consumer<E, S> {
+    pub(super) fn create(engine: E, store: Store<S>, deadletter: Store<S>) -> Self {
         Self {
             engine,
             store,
             deadletter,
             rules: HashMap::new(),
-            context,
+            context: ConsumerContext::default(),
             name: None,
             id: Uuid::new_v4(),
         }
@@ -81,12 +63,8 @@ impl<E: Engine + Clone + 'static> Consumer<E> {
 
     pub fn name<N: Into<String>>(&self, name: N) -> Self {
         let name = name.into();
-
-        let context = ConsumerContext {
-            inner: self.context.inner.clone(),
-            name: Some(name.to_owned()),
-            producer: self.context.producer.name(&name),
-        };
+        let context = ConsumerContext::default();
+        context.0.write().insert(ConsumerName(name.to_owned()));
 
         Self {
             engine: self.engine.clone(),
@@ -100,33 +78,22 @@ impl<E: Engine + Clone + 'static> Consumer<E> {
     }
 
     pub fn data<V: Send + Sync + 'static>(self, v: V) -> Self {
-        self.context.inner.write().insert(v);
+        self.context.0.write().insert(v);
         self
     }
 
-    pub fn rule(self, rule: Rule) -> Self {
-        self.rules(vec![rule])
-    }
+    pub fn rule(mut self, rule: Rule<S>) -> Self {
+        let mut rule = rule.clone();
 
-    pub fn rules(mut self, rules: Vec<Rule>) -> Self {
-        for rule in rules {
-            let mut rule = rule.clone();
-
-            if let Some(name) = self.name.as_ref() {
-                rule.key = format!("{}.{}", name, rule.key);
-            }
-
-            if let Some(r) = self.rules.get_mut(&rule.key) {
-                r.extend(rule);
-            } else {
-                self.rules.insert(rule.key.to_owned(), rule);
-            }
+        if let Some(name) = self.name.as_ref() {
+            rule.key = format!("{}.{}", name, rule.key);
         }
 
+        self.rules.insert(rule.key.to_owned(), rule);
         self
     }
 
-    pub async fn start(&self, delay: u64) -> crate::error::Result<Producer> {
+    pub async fn start(&self, delay: u64) -> crate::error::Result<Producer<S>> {
         let futures = self
             .rules
             .keys()
@@ -154,7 +121,7 @@ impl<E: Engine + Clone + 'static> Consumer<E> {
         })
     }
 
-    async fn start_queue(&self, rule: &Rule, delay: u64) {
+    async fn start_queue(&self, rule: &Rule<S>, delay: u64) {
         let rule = rule.clone();
         let engine = self.engine.clone();
         let store = rule.store.unwrap_or(self.store.clone());
@@ -164,15 +131,12 @@ impl<E: Engine + Clone + 'static> Consumer<E> {
         let name = self.name.to_owned();
 
         tokio::spawn(async move {
-            if delay > 0 {
-                info!("wait {delay} seconds to start {}", rule.key);
-                sleep(Duration::from_secs(delay)).await;
-            }
-
+            info!("wait {delay} seconds to start {}", rule.key);
+            sleep(Duration::from_secs(delay)).await;
             info!("{} started.", rule.key);
 
             if !rule.cdc {
-                tracing::debug!("change data capture disabled for {}.", rule.key);
+                tracing::info!("change data capture disabled for {}.", rule.key);
 
                 if let Err(e) = Self::set_cursor_to_last(&engine, &store, rule.key.to_owned()).await
                 {
@@ -195,8 +159,8 @@ impl<E: Engine + Clone + 'static> Consumer<E> {
                 };
 
                 if !queue.enabled {
-                    debug!("queue {} is disabled, skip", rule.key);
-                    continue;
+                    info!("queue {} is disabled, skip", rule.key);
+                    break;
                 }
 
                 if queue.consumer_id != consumer_id {
@@ -254,17 +218,27 @@ impl<E: Engine + Clone + 'static> Consumer<E> {
                     let topic_name =
                         format!("{}/{}/{}", aggregate_type, aggregate_id, event.node.name);
 
-                    let mut results = Vec::new();
-
-                    for (filter, handler) in rule.handlers.iter() {
+                    let mut futures = Vec::new();
+                    for (i, (filter, handler)) in rule.handlers.iter().enumerate() {
                         if !glob_match(filter.as_str(), &topic_name) {
                             continue;
                         }
 
-                        results.push(handler.handle(event.node.clone(), ctx.clone()).await);
+                        let post_handler = rule.post_handlers.get(i);
+                        let ctx = ctx.clone();
+
+                        futures.push(async move {
+                            let data = handler.handle(event.node.clone(), ctx.clone()).await?;
+
+                            if let (Some(event), Some(post_handler)) = (data, post_handler) {
+                                return post_handler.handle(event, ctx).await;
+                            }
+
+                            Ok::<_, Error>(())
+                        });
                     }
 
-                    if results.is_empty() {
+                    if futures.is_empty() {
                         debug!(
                             "{:?} skiped event id={}, name={}, topic_name={}",
                             &rule.key,
@@ -276,6 +250,7 @@ impl<E: Engine + Clone + 'static> Consumer<E> {
                         continue;
                     }
 
+                    let results = join_all(futures).await;
                     let mut event_errors: Vec<String> = vec![];
 
                     for res in results.iter() {
@@ -348,7 +323,7 @@ impl<E: Engine + Clone + 'static> Consumer<E> {
         });
     }
 
-    async fn set_cursor_to_last(engine: &E, store: &Store, key: String) -> Result<()> {
+    async fn set_cursor_to_last(engine: &E, store: &Store<S>, key: String) -> Result<()> {
         let Some(event) = store.last().await? else {
             return Ok(());
         };
@@ -373,27 +348,36 @@ pub struct Queue {
 
 #[async_trait]
 pub trait RuleHandler: DynClone + Send + Sync {
-    async fn handle(&self, event: Event, ctx: ConsumerContext) -> Result<()>;
+    async fn handle(&self, event: Event, ctx: ConsumerContext) -> Result<Option<Event>>;
 }
 
 dyn_clone::clone_trait_object!(RuleHandler);
 
+#[async_trait]
+pub trait RulePostHandler: DynClone + Send + Sync {
+    async fn handle(&self, event: Event, ctx: ConsumerContext) -> Result<()>;
+}
+
+dyn_clone::clone_trait_object!(RulePostHandler);
+
 #[derive(Clone)]
-pub struct Rule {
+pub struct Rule<E: evento_store::Engine> {
     pub(crate) key: String,
-    pub(crate) store: Option<Store>,
+    pub(crate) store: Option<Store<E>>,
     pub(crate) handlers: Vec<(String, Box<dyn RuleHandler + 'static>)>,
+    pub(crate) post_handlers: Vec<Box<dyn RulePostHandler + 'static>>,
     pub(crate) filters: HashSet<String>,
     pub(crate) cdc: bool,
 }
 
-impl Rule {
+impl<E: evento_store::Engine> Rule<E> {
     pub fn new<K: Into<String>>(key: K) -> Self {
         Self {
             key: key.into(),
             store: None,
             filters: HashSet::new(),
             handlers: Vec::new(),
+            post_handlers: Vec::new(),
             cdc: true,
         }
     }
@@ -410,20 +394,21 @@ impl Rule {
         self
     }
 
+    pub fn post_handler<H: RulePostHandler + 'static>(mut self, handler: H) -> Self {
+        self.post_handlers.push(Box::new(handler));
+
+        self
+    }
+
     pub fn cdc(mut self, value: bool) -> Self {
         self.cdc = value;
 
         self
     }
 
-    pub fn store(mut self, store: Store) -> Self {
+    pub fn store(mut self, store: Store<E>) -> Self {
         self.store = Some(store);
 
         self
-    }
-
-    pub fn extend(&mut self, rule: Rule) {
-        self.filters.extend(rule.filters);
-        self.handlers.extend(rule.handlers);
     }
 }

@@ -132,9 +132,10 @@ pub async fn init<E: Engine>(store: &Store<E>) -> anyhow::Result<()> {
 }
 
 pub async fn test_concurrency<E: Engine>(store: &Store<E>) -> anyhow::Result<()> {
-    join_all(vec![
-        store.write_all::<User>(
-            "concurrency_save",
+    let mut futures = vec![];
+    for _ in 0..100 {
+        futures.extend(vec![store.write_all::<User>(
+            "3",
             vec![
                 WriteEvent::new(UserEvent::Created).data(Created {
                     username: "albert.dupont".to_owned(),
@@ -146,39 +147,12 @@ pub async fn test_concurrency<E: Engine>(store: &Store<E>) -> anyhow::Result<()>
                 })?,
             ],
             0,
-        ),
-        store.write_all::<User>(
-            "concurrency_save",
-            vec![
-                WriteEvent::new(UserEvent::Created).data(Created {
-                    username: "john.doe".to_owned(),
-                    password: "azertypoiu".to_owned(),
-                })?,
-                WriteEvent::new(UserEvent::ProfileUpdated).data(ProfileUpdated {
-                    first_name: "john".to_owned(),
-                    last_name: "doe".to_owned(),
-                })?,
-            ],
-            0,
-        ),
-        store.write_all::<User>(
-            "concurrency_save",
-            vec![
-                WriteEvent::new(UserEvent::Created).data(Created {
-                    username: "nina.dupont".to_owned(),
-                    password: "azertyuiop".to_owned(),
-                })?,
-                WriteEvent::new(UserEvent::ProfileUpdated).data(ProfileUpdated {
-                    first_name: "nina".to_owned(),
-                    last_name: "dupont".to_owned(),
-                })?,
-            ],
-            0,
-        ),
-    ])
-    .await;
+        )]);
+    }
 
-    let events = store.read_of::<User>("concurrency_save", 10, None).await?;
+    join_all(futures).await;
+
+    let events = store.read_of::<User>("3", 10, None).await?;
 
     assert_eq!(events.edges.len(), 2);
     assert_eq!(
@@ -196,10 +170,7 @@ pub async fn test_concurrency<E: Engine>(store: &Store<E>) -> anyhow::Result<()>
         })?
     );
 
-    let (user, _) = store
-        .load_with::<User>("concurrency_save", 1)
-        .await?
-        .unwrap();
+    let (user, _) = store.load_with::<User>("3", 1).await?.unwrap();
 
     assert_eq!(
         user,
@@ -341,6 +312,100 @@ pub async fn test_wrong_version<E: Engine>(store: &Store<E>) -> anyhow::Result<(
         .unwrap();
 
     assert_eq!(ov.version + 2, ovf.version);
+
+    Ok(())
+}
+
+pub async fn test_insert<E: Engine>(store: &Store<E>) -> anyhow::Result<()> {
+    let query = store.read(10, None, None).await.unwrap();
+
+    assert_eq!(query.edges.len(), 4);
+    assert_eq!(
+        query.edges[0].node.data,
+        serde_json::to_value(Created {
+            username: "john.doe".to_owned(),
+            password: "azerty".to_owned(),
+        })?,
+    );
+    assert_eq!(
+        query.edges[1].node.data,
+        serde_json::to_value(AccountDeleted { deleted: true })?,
+    );
+
+    assert_eq!(
+        query.edges[2].node.data,
+        serde_json::to_value(Created {
+            username: "albert.dupont".to_owned(),
+            password: "azerty".to_owned(),
+        })?,
+    );
+    assert_eq!(
+        query.edges[3].node.data,
+        serde_json::to_value(ProfileUpdated {
+            first_name: "albert".to_owned(),
+            last_name: "dupont".to_owned(),
+        })?,
+    );
+
+    store
+        .insert(vec![
+            WriteEvent::new(UserEvent::Created)
+                .data(Created {
+                    username: "john.doe".to_owned(),
+                    password: "azerty".to_owned(),
+                })?
+                .to_event("user#3", 0),
+            WriteEvent::new(UserEvent::AccountDeleted)
+                .data(AccountDeleted { deleted: true })?
+                .to_event("user#3", 1),
+        ])
+        .await
+        .unwrap();
+
+    let query = store.read(10, None, None).await.unwrap();
+
+    assert_eq!(query.edges.len(), 6);
+    assert_eq!(
+        query.edges[0].node.data,
+        serde_json::to_value(Created {
+            username: "john.doe".to_owned(),
+            password: "azerty".to_owned(),
+        })?,
+    );
+
+    assert_eq!(
+        query.edges[1].node.data,
+        serde_json::to_value(AccountDeleted { deleted: true })?,
+    );
+
+    assert_eq!(
+        query.edges[2].node.data,
+        serde_json::to_value(Created {
+            username: "albert.dupont".to_owned(),
+            password: "azerty".to_owned(),
+        })?,
+    );
+
+    assert_eq!(
+        query.edges[3].node.data,
+        serde_json::to_value(ProfileUpdated {
+            first_name: "albert".to_owned(),
+            last_name: "dupont".to_owned(),
+        })?,
+    );
+
+    assert_eq!(
+        query.edges[4].node.data,
+        serde_json::to_value(Created {
+            username: "john.doe".to_owned(),
+            password: "azerty".to_owned(),
+        })?,
+    );
+
+    assert_eq!(
+        query.edges[5].node.data,
+        serde_json::to_value(AccountDeleted { deleted: true })?,
+    );
 
     Ok(())
 }

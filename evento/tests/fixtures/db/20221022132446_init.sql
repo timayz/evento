@@ -11,7 +11,6 @@ CREATE TABLE IF NOT EXISTS ev_event
 
 CREATE INDEX ON ev_event (aggregate_id);
 CREATE INDEX ON ev_event USING gin (metadata jsonb_path_ops);
-CREATE UNIQUE INDEX ON ev_event (aggregate_id, version);
 
 CREATE TABLE IF NOT EXISTS ev_deadletter AS
 TABLE ev_event
@@ -52,7 +51,6 @@ BEGIN
 
     CREATE INDEX ON %1$s_event (aggregate_id);
     CREATE INDEX ON %1$s_event USING gin (metadata jsonb_path_ops);
-    CREATE UNIQUE INDEX ON %1$s_event (aggregate_id, version);
 
     CREATE TABLE IF NOT EXISTS %1$s_deadletter_event AS
     TABLE ev_event
