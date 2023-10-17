@@ -203,11 +203,8 @@ impl RuleHandler for UsersCountHandler {
         let state = ctx.extract::<ConsumerState>();
         let user_event: UserEvent = event.name.parse().unwrap();
 
-        match user_event {
-            UserEvent::Created => {
-                state.users_count.fetch_add(1, Ordering::SeqCst);
-            }
-            _ => {}
+        if let UserEvent::Created = user_event {
+            state.users_count.fetch_add(1, Ordering::SeqCst);
         };
 
         Ok(None)

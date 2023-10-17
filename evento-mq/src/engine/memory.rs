@@ -21,6 +21,12 @@ impl MemoryConsumer {
     }
 }
 
+impl Default for MemoryConsumer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Memory(Arc<RwLock<HashMap<String, Queue>>>);
 
