@@ -7,10 +7,10 @@ mod engine;
 mod error;
 mod producer;
 
-pub use evento_store as store;
 pub use consumer::*;
 pub use context::Context;
 pub use data::Data;
 pub use engine::*;
 pub use error::*;
+pub use evento_store as store;
 pub use producer::*;
