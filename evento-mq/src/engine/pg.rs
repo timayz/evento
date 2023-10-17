@@ -25,7 +25,7 @@ impl PgConsumer {
         let prefix = prefix.into();
 
         self.store = self.store.prefix(&prefix);
-        self.deadletter_store = self.deadletter_store.extend_prefix(&prefix);
+        self.deadletter = self.deadletter.extend_prefix(&prefix);
         self.engine.prefix = Some(prefix);
 
         self

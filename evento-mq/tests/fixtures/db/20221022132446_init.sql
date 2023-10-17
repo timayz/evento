@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS ev_queue
     consumer_id uuid NOT NULL,
     rule varchar(255) NOT NULL,
     enabled BOOLEAN NOT NULL,
-    cursor uuid NULL,
+    cursor TEXT NULL,
     updated_at timestamptz NULL,
     created_at timestamptz NOT NULL
 );
@@ -32,7 +32,15 @@ CREATE UNIQUE INDEX ON ev_queue (rule);
 DO
 $$
 DECLARE
-  table_prefixes  text[] = array['cdc', 'no_cdc', 'external_store'];
+  table_prefixes  text[] = array[
+    'multiple_consumer',
+    'no_cdc', 'no_cdc_with_name',
+    'external_store', 'external_store_with_name',
+    'external_store_ext', 'external_store_with_name_ext',
+    'filter', 'filter_with_name',
+    'deadletter', 'deadletter_with_name',
+    'post_handler', 'post_handler_with_name'
+  ];
   table_prefix     text;
 BEGIN
   FOREACH table_prefix IN ARRAY table_prefixes LOOP

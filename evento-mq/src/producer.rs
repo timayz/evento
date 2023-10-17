@@ -5,8 +5,8 @@ use serde_json::Value;
 
 #[derive(Clone)]
 pub struct Producer<S: Engine> {
-    pub(crate) name: Option<String>,
-    pub(crate) store: Store<S>,
+    pub name: Option<String>,
+    pub store: Store<S>,
 }
 
 impl<S: Engine + Send + Sync + Clone> Producer<S> {
