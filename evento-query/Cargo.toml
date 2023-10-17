@@ -1,6 +1,6 @@
 [package]
 name = "evento-query"
-version = "0.10.2"
+version = "1.0.0-alpha.1"
 edition = "2021"
 license = "Apache-2.0"
 publish = true
@@ -26,6 +26,6 @@ harsh = "0.2.2"
 tokio = { version = "1.32.0", features = ["rt-multi-thread", "macros"] }
 backoff = { version = "0.4.0", features = ["futures", "tokio"] }
 sqlx = { version = "0.7.2", features = ["runtime-tokio", "postgres", "chrono", "uuid", "json", "any"] }
-uuid = { version = "1.4.1", features = ["v4", "fast-rng", "macro-diagnostics", "serde" ]}
+uuid = { version = "1.4.1", features = ["v4", "fast-rng", "macro-diagnostics", "serde"] }
 parse-display = "0.8.2"
 tokio-shared-rt = "0.1.0"

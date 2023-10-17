@@ -1,6 +1,6 @@
 [package]
 name = "evento-axum"
-version = "0.10.2"
+version = "1.0.0-alpha.1"
 edition = "2021"
 license = "Apache-2.0"
 publish = true
