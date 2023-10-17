@@ -174,6 +174,30 @@ impl Engine for Memory {
     }
 
     async fn last(&self) -> Result<Option<Event>> {
-        Ok(self.0.read().values().flatten().last().cloned())
+        let mut events = self
+            .0
+            .read()
+            .values()
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        events.sort_by(|a, b| {
+            let cmp = a.created_at.partial_cmp(&b.created_at).unwrap();
+
+            match cmp {
+                Ordering::Equal => {}
+                _ => return cmp,
+            };
+
+            let cmp = a.version.partial_cmp(&b.version).unwrap();
+
+            match cmp {
+                Ordering::Equal => a.id.partial_cmp(&b.id).unwrap(),
+                _ => cmp,
+            }
+        });
+
+        Ok(events.last().cloned())
     }
 }

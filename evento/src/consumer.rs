@@ -18,14 +18,14 @@ use uuid::Uuid;
 
 use crate::{context::Context, engine::Engine, Producer};
 
-struct ConsumerName(Option<String>);
+struct ConsumerName(String);
 
 #[derive(Debug, Clone, Default)]
 pub struct ConsumerContext(Arc<RwLock<Context>>);
 
 impl ConsumerContext {
     pub fn name(&self) -> Option<String> {
-        self.0.read().extract::<ConsumerName>().0.to_owned()
+        self.0.read().get::<ConsumerName>().map(|c| c.0.to_owned())
     }
 
     pub fn extract<T: Clone + 'static>(&self) -> T {
@@ -41,7 +41,7 @@ impl ConsumerContext {
 pub struct Consumer<E: Engine + Clone, S: evento_store::Engine> {
     pub(super) engine: E,
     pub(super) store: Store<S>,
-    pub(super) deadletter_store: Store<S>,
+    pub deadletter: Store<S>,
     rules: HashMap<String, Rule<S>>,
     id: Uuid,
     name: Option<String>,
@@ -49,11 +49,11 @@ pub struct Consumer<E: Engine + Clone, S: evento_store::Engine> {
 }
 
 impl<E: Engine + Clone + 'static, S: evento_store::Engine + Clone + 'static> Consumer<E, S> {
-    pub(super) fn create(engine: E, store: Store<S>, deadletter_store: Store<S>) -> Self {
+    pub(super) fn create(engine: E, store: Store<S>, deadletter: Store<S>) -> Self {
         Self {
             engine,
             store,
-            deadletter_store,
+            deadletter,
             rules: HashMap::new(),
             context: ConsumerContext::default(),
             name: None,
@@ -62,17 +62,17 @@ impl<E: Engine + Clone + 'static, S: evento_store::Engine + Clone + 'static> Con
     }
 
     pub fn name<N: Into<String>>(&self, name: N) -> Self {
-        let name: Option<_> = Some(name.into());
+        let name = name.into();
         let context = ConsumerContext::default();
         context.0.write().insert(ConsumerName(name.to_owned()));
 
         Self {
             engine: self.engine.clone(),
             store: self.store.clone(),
-            deadletter_store: self.deadletter_store.clone(),
+            deadletter: self.deadletter.clone(),
             rules: self.rules.clone(),
             context,
-            name,
+            name: Some(name),
             id: Uuid::new_v4(),
         }
     }
@@ -125,7 +125,7 @@ impl<E: Engine + Clone + 'static, S: evento_store::Engine + Clone + 'static> Con
         let rule = rule.clone();
         let engine = self.engine.clone();
         let store = rule.store.unwrap_or(self.store.clone());
-        let deadletter_store = self.deadletter_store.clone();
+        let deadletter = self.deadletter.clone();
         let consumer_id = self.id;
         let ctx = self.context.clone();
         let name = self.name.to_owned();
@@ -306,7 +306,7 @@ impl<E: Engine + Clone + 'static, S: evento_store::Engine + Clone + 'static> Con
                 }
 
                 if !dead_events.is_empty() {
-                    if let Err(e) = deadletter_store.insert(dead_events).await {
+                    if let Err(e) = deadletter.insert(dead_events).await {
                         error!("{e}");
                     }
                 }

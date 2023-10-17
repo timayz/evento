@@ -3,7 +3,7 @@ mod consumer;
 
 use std::{io, path::Path, time::Duration};
 
-use evento_mq::PgConsumer;
+use evento::PgConsumer;
 use evento_store::PgStore;
 use futures_util::{Future, TryFutureExt};
 use sqlx::{
@@ -17,7 +17,7 @@ static POOL: OnceCell<PgPool> = OnceCell::const_new();
 
 pub async fn get_pool() -> &'static PgPool {
     POOL.get_or_init(|| async {
-        let dsn = "postgres://postgres:postgres@localhost:5432/evento_test_mq";
+        let dsn = "postgres://postgres:postgres@localhost:5432/evento_test";
         let exists = retry_connect_errors(dsn, Any::database_exists)
             .await
             .unwrap();
@@ -44,11 +44,11 @@ pub async fn get_pool() -> &'static PgPool {
 
 #[tokio_shared_rt::test]
 #[traced_test]
-async fn cdc() {
+async fn multiple_consumer() {
     let pool = get_pool().await;
-    let consumer = PgConsumer::new(pool).prefix("cdc");
+    let consumer = PgConsumer::new(pool).prefix("multiple_consumer");
 
-    consumer::test_cdc(&consumer).await.unwrap();
+    consumer::test_multiple_consumer(&consumer).await.unwrap();
 }
 
 #[tokio_shared_rt::test]
@@ -57,7 +57,70 @@ async fn no_cdc() {
     let pool = get_pool().await;
     let consumer = PgConsumer::new(pool).prefix("no_cdc");
 
-    consumer::test_no_cdc(&consumer).await.unwrap();
+    consumer::test_no_cdc(&consumer, false).await.unwrap();
+}
+
+#[tokio_shared_rt::test]
+#[traced_test]
+async fn no_cdc_with_name() {
+    let pool = get_pool().await;
+    let consumer = PgConsumer::new(pool).prefix("no_cdc_with_name");
+
+    consumer::test_no_cdc(&consumer, true).await.unwrap();
+}
+
+#[tokio_shared_rt::test]
+#[traced_test]
+async fn filter() {
+    let pool = get_pool().await;
+    let consumer = PgConsumer::new(pool).prefix("filter");
+
+    consumer::test_filter(&consumer, false).await.unwrap();
+}
+
+#[tokio_shared_rt::test]
+#[traced_test]
+async fn filter_with_name() {
+    let pool = get_pool().await;
+    let consumer = PgConsumer::new(pool).prefix("filter_with_name");
+
+    consumer::test_filter(&consumer, true).await.unwrap();
+}
+
+#[tokio_shared_rt::test]
+#[traced_test]
+async fn deadletter() {
+    let pool = get_pool().await;
+    let consumer = PgConsumer::new(pool).prefix("deadletter");
+
+    consumer::test_deadletter(&consumer, false).await.unwrap();
+}
+
+#[tokio_shared_rt::test]
+#[traced_test]
+async fn deadletter_with_name() {
+    let pool = get_pool().await;
+    let consumer = PgConsumer::new(pool).prefix("deadletter_with_name");
+
+    consumer::test_deadletter(&consumer, true).await.unwrap();
+}
+
+#[tokio_shared_rt::test]
+#[traced_test]
+async fn post_handler() {
+    let pool = get_pool().await;
+    let consumer = PgConsumer::new(pool).prefix("post_handler");
+
+    consumer::test_post_handler(&consumer, false).await.unwrap();
+}
+
+#[tokio_shared_rt::test]
+#[traced_test]
+async fn post_handler_with_name() {
+    let pool = get_pool().await;
+    let consumer = PgConsumer::new(pool).prefix("post_handler_with_name");
+
+    consumer::test_post_handler(&consumer, true).await.unwrap();
 }
 
 #[tokio_shared_rt::test]
@@ -67,7 +130,21 @@ async fn external_store() {
     let consumer = PgConsumer::new(pool).prefix("external_store");
     let store = PgStore::new(pool).prefix("external_store_ext");
 
-    consumer::test_external_store(&consumer, &store).await.unwrap();
+    consumer::test_external_store(&consumer, &store, false)
+        .await
+        .unwrap();
+}
+
+#[tokio_shared_rt::test]
+#[traced_test]
+async fn external_store_with_name() {
+    let pool = get_pool().await;
+    let consumer = PgConsumer::new(pool).prefix("external_store_with_name");
+    let store = PgStore::new(pool).prefix("external_store_with_name_ext");
+
+    consumer::test_external_store(&consumer, &store, true)
+        .await
+        .unwrap();
 }
 
 /// Attempt an operation that may return errors like `ConnectionRefused`,

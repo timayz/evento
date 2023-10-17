@@ -16,9 +16,9 @@ use crate::error::QueryError;
 #[derive(Debug, PartialEq, Deserialize, Serialize, Clone)]
 pub struct CursorType(pub String);
 
-impl Into<CursorType> for String {
-    fn into(self) -> CursorType {
-        CursorType(self)
+impl From<String> for CursorType {
+    fn from(val: String) -> Self {
+        CursorType(val)
     }
 }
 

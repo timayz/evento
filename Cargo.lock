@@ -537,41 +537,11 @@ name = "evento"
 version = "0.9.1"
 dependencies = [
  "anyhow",
- "backoff",
- "chrono",
- "evento-store 0.9.1 (registry+https://github.com/rust-lang/crates.io-index)",
- "futures-util",
- "glob-match",
- "parking_lot",
- "parse-display",
- "serde",
- "serde_json",
- "sqlx",
- "thiserror",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "evento-axum"
-version = "0.9.1"
-dependencies = [
- "anyhow",
- "axum",
- "serde_json",
-]
-
-[[package]]
-name = "evento-mq"
-version = "0.9.1"
-dependencies = [
- "anyhow",
  "async-trait",
  "backoff",
  "chrono",
  "dyn-clone",
- "evento-store 0.9.1",
+ "evento-store",
  "futures-util",
  "glob-match",
  "parking_lot",
@@ -585,6 +555,15 @@ dependencies = [
  "tracing",
  "tracing-test",
  "uuid",
+]
+
+[[package]]
+name = "evento-axum"
+version = "0.9.1"
+dependencies = [
+ "anyhow",
+ "axum",
+ "serde_json",
 ]
 
 [[package]]
@@ -628,30 +607,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "evento-store"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "60624cfe084867e2e815e22a0526cedf2e1c988425d5cdf5e5c3f56136a8690c"
-dependencies = [
- "chrono",
- "futures-util",
- "parking_lot",
- "serde",
- "serde_json",
- "sqlx",
- "thiserror",
- "uuid",
-]
-
-[[package]]
 name = "example"
 version = "0.9.1"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "evento",
  "evento-axum",
- "futures",
  "mongodb",
  "nanoid",
  "parse-display",
@@ -705,21 +668,6 @@ name = "funty"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6d5a32815ae3f33302d95fdcb2ce17862f8c65363dcfd29360480ba1001fc9c"
-
-[[package]]
-name = "futures"
-version = "0.3.28"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23342abe12aba583913b2e62f22225ff9c950774065e4bfb61a19cd9770fec40"
-dependencies = [
- "futures-channel",
- "futures-core",
- "futures-executor",
- "futures-io",
- "futures-sink",
- "futures-task",
- "futures-util",
-]
 
 [[package]]
 name = "futures-channel"
@@ -794,7 +742,6 @@ version = "0.3.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "26b01e40b772d54cf6c6d721c1d1abd0647a0106a12ecaa1c186273392a69533"
 dependencies = [
- "futures-channel",
  "futures-core",
  "futures-io",
  "futures-macro",

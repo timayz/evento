@@ -4,7 +4,7 @@ mod product;
 
 use axum::Router;
 use command::Command;
-use evento::PgEngine;
+use evento::PgConsumer;
 use mongodb::{options::ClientOptions, Client};
 use sqlx::{Executor, PgPool};
 use std::net::SocketAddr;
@@ -26,14 +26,14 @@ async fn main() {
         .map(|client| client.database("evento_example"))
         .unwrap();
 
-    let evento = PgEngine::new(pool)
+    let evento = PgConsumer::new(&pool)
         .name("example")
         .data(read_db)
-        .subscribe(order::subscribe())
-        .subscribe(product::subscribe());
+        .rule(order::rule())
+        .rule(product::rule());
 
-    let producer = evento.run(0).await.unwrap();
-    let cmd = Command::new(evento, producer);
+    let producer = evento.start(0).await.unwrap();
+    let cmd = Command::new(producer);
 
     let app = Router::new()
         .nest("/orders", order::router())

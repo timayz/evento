@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use evento::{Event, PgEvento};
+use evento::{store::WriteEvent, PgProducer};
 use nanoid::nanoid;
 use serde::Deserialize;
 use validator::Validate;
@@ -14,8 +14,8 @@ use super::{
     },
 };
 
-pub async fn load_product(store: &PgEvento, id: &str) -> Result<(Product, Event)> {
-    let (product, e) = match store.load::<Product, _>(id).await? {
+pub async fn load_product(producer: &PgProducer, id: &str) -> Result<(Product, u16)> {
+    let (product, e) = match producer.load::<Product, _>(id).await? {
         Some(product) => product,
         _ => return Err(anyhow!(format!("product {}", id.to_owned()))),
     };
@@ -73,16 +73,16 @@ impl Command {
     pub async fn add_review_to_product(&self, input: AddReviewCommand) -> Result<String> {
         input.validate()?;
 
-        let (_, e) = load_product(&self.evento, &input.id).await?;
+        let (_, original_version) = load_product(&self.producer, &input.id).await?;
 
         self.producer
             .publish::<Product, _>(
                 &input.id,
-                vec![Event::new(ProductEvent::ReviewAdded).data(ReviewAdded {
+                WriteEvent::new(ProductEvent::ReviewAdded).data(ReviewAdded {
                     note: input.note,
                     message: input.message,
-                })?],
-                e.version,
+                })?,
+                original_version,
             )
             .await?;
         Ok(input.id)
@@ -94,7 +94,7 @@ impl Command {
     ) -> Result<String> {
         input.validate()?;
 
-        let (product, e) = load_product(&self.evento, &input.id).await?;
+        let (product, original_version) = load_product(&self.producer, &input.id).await?;
 
         if product.description == input.description {
             return Err(anyhow!(format!(
@@ -106,12 +106,10 @@ impl Command {
         self.producer
             .publish::<Product, _>(
                 &input.id,
-                vec![
-                    Event::new(ProductEvent::DescriptionUpdated).data(DescriptionUpdated {
-                        description: input.description,
-                    })?,
-                ],
-                e.version,
+                WriteEvent::new(ProductEvent::DescriptionUpdated).data(DescriptionUpdated {
+                    description: input.description,
+                })?,
+                original_version,
             )
             .await?;
         Ok(input.id)
@@ -121,7 +119,7 @@ impl Command {
         &self,
         input: UpdateVisibilityCommand,
     ) -> Result<String> {
-        let (product, e) = load_product(&self.evento, &input.id).await?;
+        let (product, original_version) = load_product(&self.producer, &input.id).await?;
 
         if product.visible == input.visible {
             return Err(anyhow!(format!(
@@ -133,12 +131,10 @@ impl Command {
         self.producer
             .publish::<Product, _>(
                 &input.id,
-                vec![
-                    Event::new(ProductEvent::VisibilityUpdated).data(VisibilityUpdated {
-                        visible: input.visible,
-                    })?,
-                ],
-                e.version,
+                WriteEvent::new(ProductEvent::VisibilityUpdated).data(VisibilityUpdated {
+                    visible: input.visible,
+                })?,
+                original_version,
             )
             .await?;
 
@@ -148,7 +144,7 @@ impl Command {
     pub async fn update_quantity_of_product(&self, input: UpdateQuantityCommand) -> Result<String> {
         input.validate()?;
 
-        let (product, e) = load_product(&self.evento, &input.id).await?;
+        let (product, original_version) = load_product(&self.producer, &input.id).await?;
 
         if product.quantity == input.quantity {
             return Err(anyhow!(format!(
@@ -160,12 +156,10 @@ impl Command {
         self.producer
             .publish::<Product, _>(
                 &input.id,
-                vec![
-                    Event::new(ProductEvent::QuantityUpdated).data(QuantityUpdated {
-                        quantity: input.quantity,
-                    })?,
-                ],
-                e.version,
+                WriteEvent::new(ProductEvent::QuantityUpdated).data(QuantityUpdated {
+                    quantity: input.quantity,
+                })?,
+                original_version,
             )
             .await?;
 
@@ -173,13 +167,13 @@ impl Command {
     }
 
     pub async fn delete_product(&self, input: DeleteCommand) -> Result<String> {
-        let (_, e) = load_product(&self.evento, &input.id).await?;
+        let (_, original_version) = load_product(&self.producer, &input.id).await?;
 
         self.producer
             .publish::<Product, _>(
                 &input.id,
-                vec![Event::new(ProductEvent::Deleted).data(Deleted { deleted: true })?],
-                e.version,
+                WriteEvent::new(ProductEvent::Deleted).data(Deleted { deleted: true })?,
+                original_version,
             )
             .await?;
 
@@ -194,7 +188,7 @@ impl Command {
         self.producer
             .publish::<Product, _>(
                 &id,
-                vec![Event::new(ProductEvent::Created).data(Created { name: input.name })?],
+                WriteEvent::new(ProductEvent::Created).data(Created { name: input.name })?,
                 0,
             )
             .await?;
