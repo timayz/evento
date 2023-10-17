@@ -5,4 +5,4 @@ mod event;
 mod projection;
 
 pub use api::router;
-pub use projection::subscribe;
+pub use projection::rule;

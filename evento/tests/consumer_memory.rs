@@ -1,7 +1,7 @@
 #![allow(clippy::needless_return)]
 mod consumer;
 
-use evento_mq::MemoryConsumer;
+use evento::MemoryConsumer;
 use evento_store::MemoryStore;
 use tracing_test::traced_test;
 

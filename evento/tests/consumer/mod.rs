@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use evento_mq::{Consumer, ConsumerContext, Engine, Producer, Rule, RuleHandler, RulePostHandler};
+use evento::{Consumer, ConsumerContext, Engine, Producer, Rule, RuleHandler, RulePostHandler};
 use evento_store::{Aggregate, Event, Store, WriteEvent};
 use parse_display::{Display, FromStr};
 use serde::{Deserialize, Serialize};

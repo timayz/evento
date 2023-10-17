@@ -15,8 +15,9 @@ validator = { version = "0.16.1", features = ["derive"] }
 anyhow = "1.0.75"
 axum = { version = "0.6.20" }
 tokio = { version = "1.32.0" }
-evento = { path = "../evento", version = "0.9.1" }
+evento = { path = "../evento", version = "0.9.1", features = ["pg"] }
 evento-axum = { path = "../evento-axum", version = "0.9.1" }
+async-trait = "0.1.73"
 
 [dependencies.mongodb]
 version = "2.7.0"

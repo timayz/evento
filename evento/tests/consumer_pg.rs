@@ -3,7 +3,7 @@ mod consumer;
 
 use std::{io, path::Path, time::Duration};
 
-use evento_mq::PgConsumer;
+use evento::PgConsumer;
 use evento_store::PgStore;
 use futures_util::{Future, TryFutureExt};
 use sqlx::{

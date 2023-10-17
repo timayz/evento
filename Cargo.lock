@@ -537,41 +537,11 @@ name = "evento"
 version = "0.9.1"
 dependencies = [
  "anyhow",
- "backoff",
- "chrono",
- "evento-store 0.9.1 (registry+https://github.com/rust-lang/crates.io-index)",
- "futures-util",
- "glob-match",
- "parking_lot",
- "parse-display",
- "serde",
- "serde_json",
- "sqlx",
- "thiserror",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "evento-axum"
-version = "0.9.1"
-dependencies = [
- "anyhow",
- "axum",
- "serde_json",
-]
-
-[[package]]
-name = "evento-mq"
-version = "0.9.1"
-dependencies = [
- "anyhow",
  "async-trait",
  "backoff",
  "chrono",
  "dyn-clone",
- "evento-store 0.9.1",
+ "evento-store",
  "futures-util",
  "glob-match",
  "parking_lot",
@@ -585,6 +555,15 @@ dependencies = [
  "tracing",
  "tracing-test",
  "uuid",
+]
+
+[[package]]
+name = "evento-axum"
+version = "0.9.1"
+dependencies = [
+ "anyhow",
+ "axum",
+ "serde_json",
 ]
 
 [[package]]
@@ -628,26 +607,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "evento-store"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "60624cfe084867e2e815e22a0526cedf2e1c988425d5cdf5e5c3f56136a8690c"
-dependencies = [
- "chrono",
- "futures-util",
- "parking_lot",
- "serde",
- "serde_json",
- "sqlx",
- "thiserror",
- "uuid",
-]
-
-[[package]]
 name = "example"
 version = "0.9.1"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "evento",
  "evento-axum",

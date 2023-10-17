@@ -3,6 +3,12 @@ use std::collections::HashMap;
 use evento_store::{Aggregate, Engine, Event, Result, Store, WriteEvent};
 use serde_json::Value;
 
+#[cfg(feature = "memory")]
+pub type MemoryProducer = Producer<evento_store::Memory>;
+
+#[cfg(feature = "pg")]
+pub type PgProducer = Producer<evento_store::Pg>;
+
 #[derive(Clone)]
 pub struct Producer<S: Engine> {
     pub name: Option<String>,

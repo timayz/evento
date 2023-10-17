@@ -6,6 +6,5 @@ members = [
     "./evento-store",
     "./evento-axum",
     "./evento-query",
-    "./evento-mq",
     "./example"
 ]
