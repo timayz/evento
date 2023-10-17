@@ -2,7 +2,7 @@ use super::event::{
     Created, Deleted, DescriptionUpdated, ProductEvent, QuantityUpdated, ReviewAdded,
     VisibilityUpdated,
 };
-use evento::Aggregate;
+use evento::store::{Aggregate, Event};
 use serde::{Deserialize, Serialize};
 
 #[derive(Default, Serialize, Deserialize)]
@@ -16,7 +16,7 @@ pub struct Product {
 }
 
 impl Aggregate for Product {
-    fn apply(&mut self, event: &evento::Event) {
+    fn apply(&mut self, event: &Event) {
         let product_event: ProductEvent = event.name.parse().unwrap();
 
         match product_event {

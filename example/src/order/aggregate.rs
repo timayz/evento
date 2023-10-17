@@ -3,7 +3,7 @@ use std::{collections::HashMap, hash::Hash};
 use super::event::{
     Canceled, Deleted, OrderEvent, Paid, Placed, ProductAdded, ProductRemoved, ShippingInfoUpdated,
 };
-use evento::Aggregate;
+use evento::store::{Aggregate, Event};
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
@@ -45,7 +45,7 @@ pub struct Order {
 }
 
 impl Aggregate for Order {
-    fn apply(&mut self, event: &evento::Event) {
+    fn apply(&mut self, event: &Event) {
         let order_event: OrderEvent = event.name.parse().unwrap();
 
         match order_event {

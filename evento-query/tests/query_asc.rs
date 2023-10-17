@@ -5,13 +5,13 @@ use common::{get_pool, User};
 use evento_query::{Cursor, PageInfo, PgQuery};
 use tokio::sync::OnceCell;
 
-static SELECT_USERS: &str = "SELECT * FROM users";
+static SELECT_USERS: &str = "SELECT * FROM ev_user";
 static ONCE: OnceCell<Vec<User>> = OnceCell::const_new();
 
 async fn get_users() -> &'static Vec<User> {
     ONCE.get_or_init(|| async {
         let db = get_pool().await;
-        sqlx::query_as::<_, User>("SELECT * FROM users ORDER BY created_at ASC, age ASC, id ASC")
+        sqlx::query_as::<_, User>("SELECT * FROM ev_user ORDER BY created_at ASC, age ASC, id ASC")
             .fetch_all(db)
             .await
             .unwrap()

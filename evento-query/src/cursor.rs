@@ -16,6 +16,12 @@ use crate::error::QueryError;
 #[derive(Debug, PartialEq, Deserialize, Serialize, Clone)]
 pub struct CursorType(pub String);
 
+impl From<String> for CursorType {
+    fn from(val: String) -> Self {
+        CursorType(val)
+    }
+}
+
 impl AsRef<[u8]> for CursorType {
     fn as_ref(&self) -> &[u8] {
         self.0.as_bytes()

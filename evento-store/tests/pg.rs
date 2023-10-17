@@ -64,6 +64,14 @@ async fn wrong_version() {
     store::test_wrong_version(&store).await.unwrap();
 }
 
+#[tokio_shared_rt::test]
+async fn insert() {
+    let pool = get_pool().await;
+    let store = PgStore::new(pool).prefix("insert");
+    store::init(&store).await.unwrap();
+    store::test_insert(&store).await.unwrap();
+}
+
 /// Attempt an operation that may return errors like `ConnectionRefused`,
 /// retrying up until `ops.connect_timeout`.
 ///

@@ -1,12 +1,12 @@
 #![forbid(unsafe_code)]
-#[cfg(feature = "pg")]
-mod pg;
 
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 
 use crate::cursor::{Cursor, CursorType};
 
+#[cfg(feature = "pg")]
+mod pg;
 #[cfg(feature = "pg")]
 pub use pg::*;
 

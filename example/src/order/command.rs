@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use evento::{Event, PgEvento};
+use evento::{store::WriteEvent, PgProducer};
 use nanoid::nanoid;
 use serde::Deserialize;
 use validator::Validate;
@@ -14,8 +14,8 @@ use super::{
     },
 };
 
-pub async fn load_order(evento: &PgEvento, id: &str) -> Result<(Order, Event)> {
-    let (order, e) = match evento.load::<Order, _>(id).await? {
+pub async fn load_order(producer: &PgProducer, id: &str) -> Result<(Order, u16)> {
+    let (order, e) = match producer.load::<Order, _>(id).await? {
         Some(order) => order,
         _ => return Err(anyhow!(format!("order {}", id.to_owned()))),
     };
@@ -74,22 +74,26 @@ pub struct CancelCommand {
 
 impl Command {
     pub async fn place_order(&self, input: PlaceCommand) -> Result<String> {
-        let mut events = vec![Event::new(OrderEvent::Placed).data(Placed::default())?];
+        let mut events = vec![WriteEvent::new(OrderEvent::Placed).data(Placed::default())?];
 
         for product in input.products {
             product.validate()?;
-            events.push(Event::new(OrderEvent::ProductAdded).data::<ProductAdded>(product.into())?)
+            events.push(
+                WriteEvent::new(OrderEvent::ProductAdded).data::<ProductAdded>(product.into())?,
+            )
         }
 
         let id = nanoid!();
 
-        self.producer.publish::<Order, _>(&id, events, 0).await?;
+        self.producer
+            .publish_all::<Order, _>(&id, events, 0)
+            .await?;
 
         Ok(id)
     }
 
     pub async fn add_product_to_order(&self, input: AddProductCommand) -> Result<String> {
-        let (order, e) = load_order(&self.evento, &input.id).await?;
+        let (order, original_version) = load_order(&self.producer, &input.id).await?;
 
         if order.status != Status::Draft {
             // Should be bad request
@@ -101,9 +105,9 @@ impl Command {
         self.producer
             .publish::<Order, _>(
                 &input.id,
-                vec![Event::new(OrderEvent::ProductAdded)
-                    .data::<ProductAdded>(input.product.into())?],
-                e.version,
+                WriteEvent::new(OrderEvent::ProductAdded)
+                    .data::<ProductAdded>(input.product.into())?,
+                original_version,
             )
             .await?;
 
@@ -111,7 +115,7 @@ impl Command {
     }
 
     pub async fn remove_product_from_order(&self, input: RemoveProductCommand) -> Result<String> {
-        let (order, e) = load_order(&self.evento, &input.id).await?;
+        let (order, original_version) = load_order(&self.producer, &input.id).await?;
 
         if order.status != Status::Draft {
             // bad request
@@ -129,10 +133,10 @@ impl Command {
         self.producer
             .publish::<Order, _>(
                 &input.id,
-                vec![Event::new(OrderEvent::ProductRemoved).data(ProductRemoved {
+                WriteEvent::new(OrderEvent::ProductRemoved).data(ProductRemoved {
                     id: input.product_id,
-                })?],
-                e.version,
+                })?,
+                original_version,
             )
             .await?;
 
@@ -143,7 +147,7 @@ impl Command {
         &self,
         input: UpdateProductQuantityCommand,
     ) -> Result<String> {
-        let (order, e) = load_order(&self.evento, &input.id).await?;
+        let (order, original_version) = load_order(&self.producer, &input.id).await?;
 
         if order.status != Status::Draft {
             // bad request
@@ -163,9 +167,9 @@ impl Command {
         self.producer
             .publish::<Order, _>(
                 &input.id,
-                vec![Event::new(OrderEvent::ProductQuantityUpdated)
-                    .data::<ProductQuantityUpdated>(input.product.into())?],
-                e.version,
+                WriteEvent::new(OrderEvent::ProductQuantityUpdated)
+                    .data::<ProductQuantityUpdated>(input.product.into())?,
+                original_version,
             )
             .await?;
 
@@ -176,7 +180,7 @@ impl Command {
         &self,
         input: UpdateShippingInfoCommand,
     ) -> Result<String> {
-        let (order, e) = load_order(&self.evento, &input.id).await?;
+        let (order, original_version) = load_order(&self.producer, &input.id).await?;
 
         if order.status != Status::Draft {
             //bad request
@@ -191,19 +195,17 @@ impl Command {
         self.producer
             .publish::<Order, _>(
                 &input.id,
-                vec![
-                    Event::new(OrderEvent::ShippingInfoUpdated).data(ShippingInfoUpdated {
-                        shipping_address: input.address,
-                    })?,
-                ],
-                e.version,
+                WriteEvent::new(OrderEvent::ShippingInfoUpdated).data(ShippingInfoUpdated {
+                    shipping_address: input.address,
+                })?,
+                original_version,
             )
             .await?;
         Ok(input.id)
     }
 
     pub async fn pay_order(&self, input: PayCommand) -> Result<String> {
-        let (order, e) = load_order(&self.evento, &input.id).await?;
+        let (order, original_version) = load_order(&self.producer, &input.id).await?;
 
         if order.status != Status::Draft {
             //bad request
@@ -223,8 +225,8 @@ impl Command {
         self.producer
             .publish::<Order, _>(
                 &input.id,
-                vec![Event::new(OrderEvent::Paid).data(Paid::default())?],
-                e.version,
+                WriteEvent::new(OrderEvent::Paid).data(Paid::default())?,
+                original_version,
             )
             .await?;
 
@@ -232,7 +234,7 @@ impl Command {
     }
 
     pub async fn delete_order(&self, input: DeleteCommand) -> Result<String> {
-        let (order, e) = load_order(&self.evento, &input.id).await?;
+        let (order, original_version) = load_order(&self.producer, &input.id).await?;
 
         if order.status != Status::Draft {
             // bad request
@@ -242,15 +244,15 @@ impl Command {
         self.producer
             .publish::<Order, _>(
                 &input.id,
-                vec![Event::new(OrderEvent::Deleted).data(Deleted::default())?],
-                e.version,
+                WriteEvent::new(OrderEvent::Deleted).data(Deleted::default())?,
+                original_version,
             )
             .await?;
         Ok(input.id)
     }
 
     pub async fn cancel_order(&self, input: CancelCommand) -> Result<String> {
-        let (order, e) = load_order(&self.evento, &input.id).await?;
+        let (order, original_version) = load_order(&self.producer, &input.id).await?;
 
         if order.status != Status::Pending {
             // bad request
@@ -260,8 +262,8 @@ impl Command {
         self.producer
             .publish::<Order, _>(
                 &input.id,
-                vec![Event::new(OrderEvent::Canceled).data(Canceled::default())?],
-                e.version,
+                WriteEvent::new(OrderEvent::Canceled).data(Canceled::default())?,
+                original_version,
             )
             .await?;
 
