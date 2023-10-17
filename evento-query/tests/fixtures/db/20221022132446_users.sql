@@ -1,4 +1,4 @@
-CREATE TABLE IF NOT EXISTS user (
+CREATE TABLE IF NOT EXISTS ev_user (
   id uuid NOT NULL PRIMARY KEY,
   name varchar(255) NOT NULL,
   age int NOT NULL,
@@ -6,7 +6,7 @@ CREATE TABLE IF NOT EXISTS user (
 );
 
 INSERT INTO
-  user (id, name, age, created_at)
+  ev_user (id, name, age, created_at)
 VALUES
   (
     '6dc14965-7a4c-47fa-899b-88a47935d47a',
