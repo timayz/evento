@@ -1,12 +1,12 @@
-use evento::PgProducer;
+use evento::Producer;
 
 #[derive(Clone)]
 pub struct Command {
-    pub producer: PgProducer,
+    pub producer: Producer,
 }
 
 impl Command {
-    pub fn new(producer: PgProducer) -> Self {
+    pub fn new(producer: Producer) -> Self {
         Self { producer }
     }
 }

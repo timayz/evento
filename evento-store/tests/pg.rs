@@ -43,7 +43,7 @@ pub async fn get_pool() -> &'static PgPool {
 #[tokio_shared_rt::test]
 async fn concurrency() {
     let pool = get_pool().await;
-    let store = PgStore::new(pool).prefix("concurrency");
+    let store = PgStore::with_prefix(pool, "concurrency");
     store::init(&store).await.unwrap();
     store::test_concurrency(&store).await.unwrap();
 }
@@ -51,7 +51,7 @@ async fn concurrency() {
 #[tokio_shared_rt::test]
 async fn save() {
     let pool = get_pool().await;
-    let store = PgStore::new(pool).prefix("save");
+    let store = PgStore::with_prefix(pool, "save");
     store::init(&store).await.unwrap();
     store::test_save(&store).await.unwrap();
 }
@@ -59,7 +59,7 @@ async fn save() {
 #[tokio_shared_rt::test]
 async fn wrong_version() {
     let pool = get_pool().await;
-    let store = PgStore::new(pool).prefix("wrong_version");
+    let store = PgStore::with_prefix(pool, "wrong_version");
     store::init(&store).await.unwrap();
     store::test_wrong_version(&store).await.unwrap();
 }
@@ -67,7 +67,7 @@ async fn wrong_version() {
 #[tokio_shared_rt::test]
 async fn insert() {
     let pool = get_pool().await;
-    let store = PgStore::new(pool).prefix("insert");
+    let store = PgStore::with_prefix(pool, "insert");
     store::init(&store).await.unwrap();
     store::test_insert(&store).await.unwrap();
 }

@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use evento::{store::WriteEvent, PgProducer};
+use evento::{store::WriteEvent, Producer};
 use nanoid::nanoid;
 use serde::Deserialize;
 use validator::Validate;
@@ -14,7 +14,7 @@ use super::{
     },
 };
 
-pub async fn load_product(producer: &PgProducer, id: &str) -> Result<(Product, u16)> {
+pub async fn load_product(producer: &Producer, id: &str) -> Result<(Product, u16)> {
     let (product, e) = match producer.load::<Product, _>(id).await? {
         Some(product) => product,
         _ => return Err(anyhow!(format!("product {}", id.to_owned()))),
