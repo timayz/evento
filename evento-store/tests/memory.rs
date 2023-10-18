@@ -1,12 +1,12 @@
 #![allow(clippy::needless_return)]
 mod store;
 
-use evento_store::MemoryStore;
+use evento_store::{MemoryStore, Store};
 use tokio::sync::OnceCell;
 
-static ONCE: OnceCell<MemoryStore> = OnceCell::const_new();
+static ONCE: OnceCell<Store> = OnceCell::const_new();
 
-async fn get_store() -> &'static MemoryStore {
+async fn get_store() -> &'static Store {
     ONCE.get_or_init(|| async {
         let store = MemoryStore::new();
         store::init(&store).await.unwrap();

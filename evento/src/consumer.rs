@@ -2,7 +2,7 @@ use anyhow::{Error, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use dyn_clone::DynClone;
-use evento_store::{Cursor, Event, Store};
+use evento_store::{Aggregate, Cursor, Event, Result as StoreResult, Store, WriteEvent};
 use futures_util::future::join_all;
 use glob_match::glob_match;
 use parking_lot::RwLock;
@@ -18,44 +18,79 @@ use uuid::Uuid;
 
 use crate::{context::Context, engine::Engine, Producer};
 
-struct ConsumerName(String);
-
-#[derive(Debug, Clone, Default)]
-pub struct ConsumerContext(Arc<RwLock<Context>>);
+#[derive(Clone)]
+pub struct ConsumerContext {
+    pub name: Option<String>,
+    inner: Arc<RwLock<Context>>,
+    producer: Producer,
+}
 
 impl ConsumerContext {
-    pub fn name(&self) -> Option<String> {
-        self.0.read().get::<ConsumerName>().map(|c| c.0.to_owned())
-    }
-
     pub fn extract<T: Clone + 'static>(&self) -> T {
-        self.0.read().extract::<T>().clone()
+        self.inner.read().extract::<T>().clone()
     }
 
     pub fn get<T: Clone + 'static>(&self) -> Option<T> {
-        self.0.read().get::<T>().cloned()
+        self.inner.read().get::<T>().cloned()
+    }
+
+    pub async fn publish<A: Aggregate, I: Into<String>>(
+        &self,
+        id: I,
+        event: WriteEvent,
+        original_version: u16,
+    ) -> StoreResult<Vec<Event>> {
+        self.publish_all::<A, I>(id, vec![event], original_version)
+            .await
+    }
+
+    pub async fn publish_all<A: Aggregate, I: Into<String>>(
+        &self,
+        id: I,
+        events: Vec<WriteEvent>,
+        original_version: u16,
+    ) -> StoreResult<Vec<Event>> {
+        self.producer
+            .publish_all::<A, I>(id, events, original_version)
+            .await
+    }
+
+    pub async fn load<A: Aggregate, I: Into<String>>(
+        &self,
+        id: I,
+    ) -> StoreResult<Option<(A, u16)>> {
+        self.producer.load::<A, I>(id).await
     }
 }
 
 #[derive(Clone)]
-pub struct Consumer<E: Engine + Clone, S: evento_store::Engine> {
+pub struct Consumer<E: Engine + Clone> {
     pub(super) engine: E,
-    pub(super) store: Store<S>,
-    pub deadletter: Store<S>,
-    rules: HashMap<String, Rule<S>>,
+    pub(super) store: Store,
+    pub deadletter: Store,
+    rules: HashMap<String, Rule>,
     id: Uuid,
     name: Option<String>,
     context: ConsumerContext,
 }
 
-impl<E: Engine + Clone + 'static, S: evento_store::Engine + Clone + 'static> Consumer<E, S> {
-    pub(super) fn create(engine: E, store: Store<S>, deadletter: Store<S>) -> Self {
+impl<E: Engine + Clone + 'static> Consumer<E> {
+    pub(super) fn create(engine: E, store: Store, deadletter: Store) -> Self {
+        let context = ConsumerContext {
+            inner: Default::default(),
+            name: None,
+            producer: Producer {
+                name: None,
+                store: store.clone(),
+            },
+        };
+
         Self {
             engine,
             store,
             deadletter,
             rules: HashMap::new(),
-            context: ConsumerContext::default(),
+            context,
             name: None,
             id: Uuid::new_v4(),
         }
@@ -63,8 +98,12 @@ impl<E: Engine + Clone + 'static, S: evento_store::Engine + Clone + 'static> Con
 
     pub fn name<N: Into<String>>(&self, name: N) -> Self {
         let name = name.into();
-        let context = ConsumerContext::default();
-        context.0.write().insert(ConsumerName(name.to_owned()));
+
+        let context = ConsumerContext {
+            inner: Default::default(),
+            name: Some(name.to_owned()),
+            producer: self.context.producer.clone(),
+        };
 
         Self {
             engine: self.engine.clone(),
@@ -78,11 +117,11 @@ impl<E: Engine + Clone + 'static, S: evento_store::Engine + Clone + 'static> Con
     }
 
     pub fn data<V: Send + Sync + 'static>(self, v: V) -> Self {
-        self.context.0.write().insert(v);
+        self.context.inner.write().insert(v);
         self
     }
 
-    pub fn rule(mut self, rule: Rule<S>) -> Self {
+    pub fn rule(mut self, rule: Rule) -> Self {
         let mut rule = rule.clone();
 
         if let Some(name) = self.name.as_ref() {
@@ -93,7 +132,7 @@ impl<E: Engine + Clone + 'static, S: evento_store::Engine + Clone + 'static> Con
         self
     }
 
-    pub async fn start(&self, delay: u64) -> crate::error::Result<Producer<S>> {
+    pub async fn start(&self, delay: u64) -> crate::error::Result<Producer> {
         let futures = self
             .rules
             .keys()
@@ -121,7 +160,7 @@ impl<E: Engine + Clone + 'static, S: evento_store::Engine + Clone + 'static> Con
         })
     }
 
-    async fn start_queue(&self, rule: &Rule<S>, delay: u64) {
+    async fn start_queue(&self, rule: &Rule, delay: u64) {
         let rule = rule.clone();
         let engine = self.engine.clone();
         let store = rule.store.unwrap_or(self.store.clone());
@@ -323,7 +362,7 @@ impl<E: Engine + Clone + 'static, S: evento_store::Engine + Clone + 'static> Con
         });
     }
 
-    async fn set_cursor_to_last(engine: &E, store: &Store<S>, key: String) -> Result<()> {
+    async fn set_cursor_to_last(engine: &E, store: &Store, key: String) -> Result<()> {
         let Some(event) = store.last().await? else {
             return Ok(());
         };
@@ -361,16 +400,16 @@ pub trait RulePostHandler: DynClone + Send + Sync {
 dyn_clone::clone_trait_object!(RulePostHandler);
 
 #[derive(Clone)]
-pub struct Rule<E: evento_store::Engine> {
+pub struct Rule {
     pub(crate) key: String,
-    pub(crate) store: Option<Store<E>>,
+    pub(crate) store: Option<Store>,
     pub(crate) handlers: Vec<(String, Box<dyn RuleHandler + 'static>)>,
     pub(crate) post_handlers: Vec<Box<dyn RulePostHandler + 'static>>,
     pub(crate) filters: HashSet<String>,
     pub(crate) cdc: bool,
 }
 
-impl<E: evento_store::Engine> Rule<E> {
+impl Rule {
     pub fn new<K: Into<String>>(key: K) -> Self {
         Self {
             key: key.into(),
@@ -406,7 +445,7 @@ impl<E: evento_store::Engine> Rule<E> {
         self
     }
 
-    pub fn store(mut self, store: Store<E>) -> Self {
+    pub fn store(mut self, store: Store) -> Self {
         self.store = Some(store);
 
         self

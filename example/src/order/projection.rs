@@ -1,9 +1,8 @@
 use std::collections::HashMap;
-
 use anyhow::Result;
 use async_trait::async_trait;
 use evento::{
-    store::{Aggregate, Event, Pg},
+    store::{Aggregate, Event},
     ConsumerContext, Rule, RuleHandler,
 };
 use mongodb::{
@@ -178,6 +177,6 @@ impl RuleHandler for OrdersHandler {
     }
 }
 
-pub fn rule() -> Rule<Pg> {
+pub fn rule() -> Rule {
     Rule::new("orders").handler("order/**", OrdersHandler)
 }

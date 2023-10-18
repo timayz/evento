@@ -1,7 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use evento::{
-    store::{Aggregate, Event, Pg},
+    store::{Aggregate, Event},
     ConsumerContext, Rule, RuleHandler,
 };
 use mongodb::{
@@ -118,6 +118,6 @@ impl RuleHandler for ProductsHandler {
     }
 }
 
-pub fn rule() -> Rule<Pg> {
+pub fn rule() -> Rule {
     Rule::new("products").handler("product/**", ProductsHandler)
 }

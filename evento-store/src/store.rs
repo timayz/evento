@@ -6,10 +6,18 @@ use uuid::Uuid;
 
 use crate::{engine::Engine, error::Result, Aggregate, StoreError};
 
-#[derive(Clone, Debug)]
-pub struct Store<E: Engine>(pub(crate) E);
+#[derive(Clone)]
+pub struct Store {
+    pub(crate) engine: Box<dyn Engine>,
+}
 
-impl<E: Engine> Store<E> {
+impl Store {
+    pub fn new<E: Engine + 'static>(engine: E) -> Self {
+        Self {
+            engine: Box::new(engine),
+        }
+    }
+
     pub async fn load<A: Aggregate>(
         &self,
         aggregate_id: impl Into<String>,
@@ -71,7 +79,7 @@ impl<E: Engine> Store<E> {
         events: Vec<WriteEvent>,
         original_version: u16,
     ) -> Result<Vec<Event>> {
-        self.0
+        self.engine
             .write(
                 A::aggregate_id(aggregate_id).as_str(),
                 events,
@@ -81,7 +89,7 @@ impl<E: Engine> Store<E> {
     }
 
     pub async fn insert(&self, events: Vec<Event>) -> Result<()> {
-        self.0.insert(events).await
+        self.engine.insert(events).await
     }
 
     pub async fn read(
@@ -90,7 +98,7 @@ impl<E: Engine> Store<E> {
         after: Option<CursorType>,
         filters: Option<Vec<Value>>,
     ) -> Result<QueryResult<Event>> {
-        self.0.read(first, after, filters, None).await
+        self.engine.read(first, after, filters, None).await
     }
 
     pub async fn read_of<A: Aggregate>(
@@ -101,7 +109,7 @@ impl<E: Engine> Store<E> {
     ) -> Result<QueryResult<Event>> {
         let aggregate_id = A::aggregate_id(aggregate_id);
 
-        self.0
+        self.engine
             .read(first, after, None, Some(aggregate_id.as_str()))
             .await
     }
@@ -116,7 +124,7 @@ impl<E: Engine> Store<E> {
     }
 
     pub async fn last(&self) -> Result<Option<Event>> {
-        self.0.last().await
+        self.engine.last().await
     }
 }
 

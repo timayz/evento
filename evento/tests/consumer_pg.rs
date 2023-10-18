@@ -128,7 +128,7 @@ async fn post_handler_with_name() {
 async fn external_store() {
     let pool = get_pool().await;
     let consumer = PgConsumer::new(pool).prefix("external_store");
-    let store = PgStore::new(pool).prefix("external_store_ext");
+    let store = PgStore::with_prefix(pool, "external_store_ext");
 
     consumer::test_external_store(&consumer, &store, false)
         .await
@@ -140,7 +140,7 @@ async fn external_store() {
 async fn external_store_with_name() {
     let pool = get_pool().await;
     let consumer = PgConsumer::new(pool).prefix("external_store_with_name");
-    let store = PgStore::new(pool).prefix("external_store_with_name_ext");
+    let store = PgStore::with_prefix(pool, "external_store_with_name_ext");
 
     consumer::test_external_store(&consumer, &store, true)
         .await

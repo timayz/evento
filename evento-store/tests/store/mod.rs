@@ -1,4 +1,4 @@
-use evento_store::{Aggregate, Engine, Event, Store, StoreError, WriteEvent};
+use evento_store::{Aggregate, Event, Store, StoreError, WriteEvent};
 use futures_util::future::join_all;
 use parse_display::{Display, FromStr};
 use serde::{Deserialize, Serialize};
@@ -95,7 +95,7 @@ impl Aggregate for User {
     }
 }
 
-pub async fn init<E: Engine>(store: &Store<E>) -> anyhow::Result<()> {
+pub async fn init(store: &Store) -> anyhow::Result<()> {
     store
         .write_all::<User>(
             "1",
@@ -131,7 +131,7 @@ pub async fn init<E: Engine>(store: &Store<E>) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn test_concurrency<E: Engine>(store: &Store<E>) -> anyhow::Result<()> {
+pub async fn test_concurrency(store: &Store) -> anyhow::Result<()> {
     let mut futures = vec![];
     for _ in 0..100 {
         futures.extend(vec![store.write_all::<User>(
@@ -187,7 +187,7 @@ pub async fn test_concurrency<E: Engine>(store: &Store<E>) -> anyhow::Result<()>
     Ok(())
 }
 
-pub async fn test_save<E: Engine>(store: &Store<E>) -> anyhow::Result<()> {
+pub async fn test_save(store: &Store) -> anyhow::Result<()> {
     let (john, version) = store.load::<User>("1").await?.unwrap();
 
     assert_eq!(
@@ -258,7 +258,7 @@ pub async fn test_save<E: Engine>(store: &Store<E>) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn test_wrong_version<E: Engine>(store: &Store<E>) -> anyhow::Result<()> {
+pub async fn test_wrong_version(store: &Store) -> anyhow::Result<()> {
     let ov = store
         .write::<User>(
             "wrong_version",
@@ -316,7 +316,7 @@ pub async fn test_wrong_version<E: Engine>(store: &Store<E>) -> anyhow::Result<(
     Ok(())
 }
 
-pub async fn test_insert<E: Engine>(store: &Store<E>) -> anyhow::Result<()> {
+pub async fn test_insert(store: &Store) -> anyhow::Result<()> {
     let query = store.read(10, None, None).await.unwrap();
 
     assert_eq!(query.edges.len(), 4);

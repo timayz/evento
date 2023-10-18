@@ -10,25 +10,17 @@ use crate::{
     store::{Event, Store, WriteEvent},
 };
 
-pub type MemoryStore = Store<Memory>;
-
 #[derive(Debug, Clone, Default)]
-pub struct Memory(Arc<RwLock<HashMap<String, Vec<Event>>>>);
+pub struct MemoryStore(Arc<RwLock<HashMap<String, Vec<Event>>>>);
 
 impl MemoryStore {
-    pub fn new() -> Self {
-        Store(Memory::default())
-    }
-}
-
-impl Default for MemoryStore {
-    fn default() -> Self {
-        Self::new()
+    pub fn new() -> Store {
+        Store::new(Self::default())
     }
 }
 
 #[async_trait]
-impl Engine for Memory {
+impl Engine for MemoryStore {
     async fn write(
         &self,
         aggregate_id: &'_ str,
