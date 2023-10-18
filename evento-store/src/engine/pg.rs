@@ -18,7 +18,7 @@ pub struct PgStore {
 }
 
 impl PgStore {
-    pub fn new(pool: &PgPool) -> Store {
+    pub fn create(pool: &PgPool) -> Store {
         Store::new(Self {
             pool: pool.clone(),
             prefix: None,

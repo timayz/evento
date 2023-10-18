@@ -14,7 +14,7 @@ use crate::{
 pub struct MemoryStore(Arc<RwLock<HashMap<String, Vec<Event>>>>);
 
 impl MemoryStore {
-    pub fn new() -> Store {
+    pub fn create() -> Store {
         Store::new(Self::default())
     }
 }

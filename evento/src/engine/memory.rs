@@ -17,7 +17,11 @@ pub type MemoryConsumer = Consumer<Memory>;
 
 impl MemoryConsumer {
     pub fn new() -> Self {
-        Self::create(Memory::default(), MemoryStore::new(), MemoryStore::new())
+        Self::create(
+            Memory::default(),
+            MemoryStore::create(),
+            MemoryStore::create(),
+        )
     }
 }
 

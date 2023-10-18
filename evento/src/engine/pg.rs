@@ -16,7 +16,7 @@ impl PgConsumer {
     pub fn new(pool: &PgPool) -> Self {
         Self::create(
             Pg::new(pool),
-            PgStore::new(pool),
+            PgStore::create(pool),
             PgStore::with_prefix(pool, "deadletter"),
         )
     }
