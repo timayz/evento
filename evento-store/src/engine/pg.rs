@@ -11,38 +11,27 @@ use crate::{
     store::{Event, Store, WriteEvent},
 };
 
-pub type PgStore = Store<Pg>;
+#[derive(Debug, Clone)]
+pub struct PgStore {
+    pool: PgPool,
+    prefix: Option<String>,
+}
 
 impl PgStore {
-    pub fn new(pool: &PgPool) -> Self {
-        Store(Pg {
+    pub fn create(pool: &PgPool) -> Store {
+        Store::new(Self {
             pool: pool.clone(),
             prefix: None,
         })
     }
 
-    pub fn prefix(mut self, prefix: impl Into<String>) -> Self {
-        self.0.prefix = Some(prefix.into());
-        self
+    pub fn with_prefix(pool: &PgPool, prefix: impl Into<String>) -> Store {
+        Store::new(Self {
+            pool: pool.clone(),
+            prefix: Some(prefix.into()),
+        })
     }
 
-    pub fn extend_prefix(mut self, prefix: impl Into<String>) -> Self {
-        let prefix = prefix.into();
-        self.0.prefix = match self.0.prefix {
-            Some(prev) => Some(format!("{prefix}_{prev}")),
-            _ => Some(prefix),
-        };
-        self
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct Pg {
-    pool: PgPool,
-    prefix: Option<String>,
-}
-
-impl Pg {
     pub fn table(&self, name: impl Into<String>) -> String {
         format!(
             "{}_{}",
@@ -57,7 +46,7 @@ impl Pg {
 }
 
 #[async_trait]
-impl Engine for Pg {
+impl Engine for PgStore {
     async fn write(
         &self,
         aggregate_id: &'_ str,

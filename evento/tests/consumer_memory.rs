@@ -72,7 +72,7 @@ async fn no_cdc_with_name() {
 #[traced_test]
 async fn external_store() {
     let consumer = MemoryConsumer::new();
-    let store = MemoryStore::new();
+    let store = MemoryStore::create();
 
     consumer::test_external_store(&consumer, &store, false)
         .await
@@ -83,7 +83,7 @@ async fn external_store() {
 #[traced_test]
 async fn external_store_with_name() {
     let consumer = MemoryConsumer::new();
-    let store = MemoryStore::new();
+    let store = MemoryStore::create();
 
     consumer::test_external_store(&consumer, &store, true)
         .await

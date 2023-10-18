@@ -110,7 +110,7 @@ impl RuleHandler for UsersHandler {
                     format!(
                         "{} owned by {}",
                         data.display_name,
-                        ctx.name().unwrap_or_default()
+                        ctx.name.unwrap_or_default()
                     )
                 } else {
                     data.display_name
@@ -218,11 +218,8 @@ struct ConsumerState {
     users_count: Arc<AtomicU8>,
 }
 
-pub async fn test_multiple_consumer<
-    E: Engine + Clone + 'static,
-    S: evento_store::Engine + Clone + 'static,
->(
-    consumer: &Consumer<E, S>,
+pub async fn test_multiple_consumer<E: Engine + Clone + 'static>(
+    consumer: &Consumer<E>,
 ) -> Result<()> {
     let state = ConsumerState::default();
     let users_rule = Rule::new("users")
@@ -348,11 +345,8 @@ pub async fn test_multiple_consumer<
     Ok(())
 }
 
-pub async fn test_post_handler<
-    E: Engine + Clone + 'static,
-    S: evento_store::Engine + Clone + 'static,
->(
-    consumer: &Consumer<E, S>,
+pub async fn test_post_handler<E: Engine + Clone + 'static>(
+    consumer: &Consumer<E>,
     with_name: bool,
 ) -> Result<()> {
     let state = ConsumerState::default();
@@ -408,8 +402,8 @@ pub async fn test_post_handler<
     Ok(())
 }
 
-pub async fn test_filter<E: Engine + Clone + 'static, S: evento_store::Engine + Clone + 'static>(
-    consumer: &Consumer<E, S>,
+pub async fn test_filter<E: Engine + Clone + 'static>(
+    consumer: &Consumer<E>,
     with_name: bool,
 ) -> Result<()> {
     let state = ConsumerState::default();
@@ -458,11 +452,8 @@ struct DeadletterMetadata {
     pub errors: Vec<String>,
 }
 
-pub async fn test_deadletter<
-    E: Engine + Clone + 'static,
-    S: evento_store::Engine + Clone + 'static,
->(
-    consumer: &Consumer<E, S>,
+pub async fn test_deadletter<E: Engine + Clone + 'static>(
+    consumer: &Consumer<E>,
     with_name: bool,
 ) -> Result<()> {
     let state = ConsumerState::default();
@@ -515,8 +506,8 @@ pub async fn test_deadletter<
     Ok(())
 }
 
-pub async fn test_no_cdc<E: Engine + Clone + 'static, S: evento_store::Engine + Clone + 'static>(
-    consumer: &Consumer<E, S>,
+pub async fn test_no_cdc<E: Engine + Clone + 'static>(
+    consumer: &Consumer<E>,
     with_name: bool,
 ) -> Result<()> {
     let state = ConsumerState::default();
@@ -585,12 +576,9 @@ pub async fn test_no_cdc<E: Engine + Clone + 'static, S: evento_store::Engine + 
     Ok(())
 }
 
-pub async fn test_external_store<
-    E: Engine + Clone + 'static,
-    S: evento_store::Engine + Clone + 'static,
->(
-    consumer: &Consumer<E, S>,
-    store: &Store<S>,
+pub async fn test_external_store<E: Engine + Clone + 'static>(
+    consumer: &Consumer<E>,
+    store: &Store,
     with_name: bool,
 ) -> Result<()> {
     let state = ConsumerState::default();
@@ -655,7 +643,7 @@ pub async fn test_external_store<
     Ok(())
 }
 
-async fn init<S: evento_store::Engine + Clone + 'static>(producer: &Producer<S>) -> Result<()> {
+async fn init(producer: &Producer) -> Result<()> {
     producer
         .publish::<User, _>(
             "1",
