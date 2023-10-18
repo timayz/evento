@@ -86,7 +86,6 @@ impl RuleHandler for UsersHandler {
     async fn handle(&self, event: Event, ctx: ConsumerContext) -> Result<Option<Event>> {
         let state = ctx.extract::<ConsumerState>();
         let user_event: UserEvent = event.name.parse().unwrap();
-        // let p = ctx.producer();
 
         match user_event {
             UserEvent::Created => {

@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use anyhow::Result;
 use async_trait::async_trait;
 use evento::{
@@ -10,6 +9,7 @@ use mongodb::{
     Database,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use crate::order::event::OrderEvent;
 
