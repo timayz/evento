@@ -56,11 +56,6 @@ impl Engine for PgStore {
         let table_events = self.table_events();
         let mut tx = self.pool.begin().await?;
 
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
-            .bind(aggregate_id)
-            .execute(&mut *tx)
-            .await?;
-
         let mut version = original_version;
         let mut events = Vec::new();
 
@@ -85,7 +80,11 @@ impl Engine for PgStore {
                 events.push(event);
             });
 
-            query_builder.build().execute(&mut *tx).await?;
+            query_builder
+                .push("ON CONFLICT (aggregate_id, version) DO NOTHING")
+                .build()
+                .execute(&mut *tx)
+                .await?;
         }
 
         let next_event_id = sqlx::query_as::<_, Event>(
@@ -95,7 +94,6 @@ impl Engine for PgStore {
                 WHERE aggregate_id = $1 AND version = $2
                 ORDER BY created_at ASC
                 LIMIT 1
-                FOR UPDATE
                 "#
             )
             .as_str(),
@@ -123,7 +121,6 @@ impl Engine for PgStore {
 
     async fn insert(&self, events: Vec<Event>) -> Result<()> {
         let table_events = self.table_events();
-        let mut tx = self.pool.begin().await?;
 
         for events in events.chunks(100).collect::<Vec<&[Event]>>() {
             let mut query_builder: QueryBuilder<Postgres> = QueryBuilder::new(
@@ -140,10 +137,8 @@ impl Engine for PgStore {
                     .push_bind(event.created_at);
             });
 
-            query_builder.build().execute(&mut *tx).await?;
+            query_builder.build().execute(&self.pool).await?;
         }
-
-        tx.commit().await?;
 
         Ok(())
     }
