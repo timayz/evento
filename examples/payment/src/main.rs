@@ -17,7 +17,7 @@ pub struct AppState {
 async fn main() -> Result<()> {
     sqlx::any::install_default_drivers();
 
-    let dsn = "postgres://postgres:postgres@localhost:5432/shop";
+    let dsn = "postgres://postgres:postgres@localhost:5432/payment";
     let _ = Any::create_database(dsn).await;
     let db = PgPool::connect(dsn).await?;
 
@@ -29,7 +29,7 @@ async fn main() -> Result<()> {
         .fallback(get(static_handler))
         .with_state(AppState { db, producer });
 
-    let addr = "0.0.0.0:3000".parse()?;
+    let addr = "0.0.0.0:3001".parse()?;
 
     axum::Server::bind(&addr)
         .serve(app.into_make_service())

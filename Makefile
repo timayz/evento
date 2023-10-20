@@ -49,12 +49,24 @@ outdated:
 	cargo outdated
 
 dev:
-	$(MAKE) _dev -j2
+	$(MAKE) _dev -j6
 
-_dev: dev.serve dev.shop.tailwind
+_dev: serve.shop serve.inventory serve.payment tailwind.shop tailwind.inventory tailwind.payment
 
-dev.serve:
+serve.shop:
 	cargo watch -x 'run -p shop'
 
-dev.shop.tailwind:
+serve.inventory:
+	cargo watch -x 'run -p inventory'
+
+serve.payment:
+	cargo watch -x 'run -p payment'
+
+tailwind.shop:
 	npx tailwindcss -i ./examples/shop/style/tailwind.css -o ./examples/shop/public/main.css --watch
+
+tailwind.inventory:
+	npx tailwindcss -i ./examples/inventory/style/tailwind.css -o ./examples/inventory/public/main.css --watch
+
+tailwind.payment:
+	npx tailwindcss -i ./examples/payment/style/tailwind.css -o ./examples/payment/public/main.css --watch
