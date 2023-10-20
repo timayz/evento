@@ -47,3 +47,14 @@ audit: advisory.clean
 
 outdated:
 	cargo outdated
+
+dev:
+	$(MAKE) _dev -j2
+
+_dev: dev.serve dev.shop.tailwind
+
+dev.serve:
+	cargo watch -x 'run -p shop'
+
+dev.shop.tailwind:
+	npx tailwindcss -i ./examples/shop/style/tailwind.css -o ./examples/shop/public/main.css --watch

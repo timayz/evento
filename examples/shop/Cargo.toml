@@ -1,0 +1,20 @@
+[package]
+name = "shop"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+askama = { version = "0.12.1", default-features = false, features = ["with-axum", "mime", "mime_guess"] }
+askama_axum = "0.3.0"
+axum = "0.6.20"
+tokio = { version = "1.33.0", features = ["rt-multi-thread", "macros"] }
+http = "0.2.9"
+sqlx = { version = "0.7.2", features = [ "runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid", "json", "any" ] }
+validator = { version = "0.16.1", features = ["derive"] }
+ulid = "1.1.0"
+chrono = { version = "0.4.31", features = ["unstable-locales"] }
+serde = "1.0.189"
+anyhow = "1.0.75"
+rust-embed = "8.0.0"
+mime_guess = "2.0.4"
+evento = { path = "../../evento", version = "1.0.0-alpha.1", features = ["pg"] }
