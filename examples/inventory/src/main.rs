@@ -1,4 +1,5 @@
 mod router;
+mod product;
 
 use anyhow::Result;
 use axum::{response::IntoResponse, routing::get};

@@ -9,6 +9,10 @@ repository = "https://github.com/timayz/evento"
 documentation = "https://docs.rs/evento"
 
 [dependencies]
-serde_json = "1.0.107"
+serde = "1.0.189"
 axum = { version = "0.6.20" }
 anyhow = "1.0.75"
+async-trait = "0.1.73"
+thiserror = "1.0.49"
+evento = { path = "../evento", version = "1.0.0-alpha.1" }
+evento-store = { path = "../evento-store", version = "1.0.0-alpha.1" }
