@@ -1,9 +1,9 @@
-mod router;
 mod product;
+mod router;
 
 use anyhow::Result;
-use axum::{response::IntoResponse, routing::get};
-use evento::{PgConsumer, Producer};
+use axum::{response::IntoResponse, routing::get, Extension};
+use evento::{CommandContext, PgConsumer, Producer};
 use http::{header, StatusCode, Uri};
 use rust_embed::RustEmbed;
 use sqlx::{migrate::MigrateDatabase, Any, PgPool};
@@ -25,8 +25,10 @@ async fn main() -> Result<()> {
     sqlx::migrate!().run(&db).await?;
 
     let producer = PgConsumer::new(&db).start(0).await?;
+    let command = CommandContext::new(&producer);
 
     let app = router::create()
+        .layer(Extension(command))
         .fallback(get(static_handler))
         .with_state(AppState { db, producer });
 

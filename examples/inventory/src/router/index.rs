@@ -7,5 +7,5 @@ pub struct IndexTemplate<'a> {
 }
 
 pub async fn index() -> IndexTemplate<'static> {
-    IndexTemplate { name: "" }
+    IndexTemplate { name: "yes" }
 }
