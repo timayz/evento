@@ -4,20 +4,21 @@ mod fr;
 use async_trait::async_trait;
 use evento_store::{Aggregate, Event, Result as StoreResult, WriteEvent};
 use parking_lot::RwLock;
+use std::collections::HashMap;
 use std::fmt::Write;
-use std::{marker::PhantomData, sync::Arc};
+use std::sync::Arc;
 use tracing::{error, warn};
 use validator::{Validate, ValidationError, ValidationErrors, ValidationErrorsKind};
 
 use crate::{context::Context, Producer};
 
 #[derive(Clone)]
-pub struct CommandContext {
+pub struct Command {
     inner: Arc<RwLock<Context>>,
     producer: Producer,
 }
 
-impl CommandContext {
+impl Command {
     pub fn new(producer: &Producer) -> Self {
         Self {
             inner: Arc::default(),
@@ -62,59 +63,45 @@ impl CommandContext {
     }
 }
 
-#[derive(Clone)]
-pub struct Command<I> {
-    pub events: Vec<Event>,
-    phantom_data: PhantomData<I>,
-}
+impl Command {
+    pub async fn execute<I, T>(&self, translater: T, input: &I) -> Result<Vec<Event>, CommandError>
+    where
+        T: Translater,
+        I: Validate,
+        I: CommandHandler,
+    {
+        if let Err(errs) = input.validate() {
+            let mut errors = HashMap::new();
 
-impl<I> Command<I>
-where
-    I: Validate,
-    I: CommandHandler,
-{
-    pub async fn execute(
-        translater: impl Translater,
-        ctx: CommandContext,
-        input: I,
-    ) -> Result<Self, CommandError> {
-        if let Err(errors) = input.validate() {
-            let errors = errors
-                .errors()
-                .iter()
-                .flat_map(|(path, err)| display_errors(&translater, err, path))
-                .collect::<Vec<_>>();
+            for (path, err) in errs.errors() {
+                errors.extend(display_errors(&translater, err, path));
+            }
 
-            return Err(CommandError::ValidationErrors(errors));
+            return Err(CommandError::Validation(errors));
         }
 
-        let events = input.handle(&ctx).await?;
-
-        Ok(Self {
-            events,
-            phantom_data: PhantomData,
-        })
+        input.handle(&self).await
     }
 }
 
-#[derive(thiserror::Error, Debug)]
+#[derive(Debug, Clone)]
 pub enum CommandError {
-    #[error("{0}")]
-    Any(#[from] anyhow::Error),
-
-    #[error("{0:?}")]
-    ValidationErrors(Vec<ErrorMessage>),
+    Server(String),
+    Validation(HashMap<String, Vec<String>>),
+    NotFound(String),
 }
+
+impl<E: std::error::Error + Send + Sync + 'static> From<E> for CommandError {
+    fn from(value: E) -> Self {
+        CommandError::Server(value.to_string())
+    }
+}
+
+pub type CommandOutput = Result<Vec<Event>, CommandError>;
 
 #[async_trait]
 pub trait CommandHandler {
-    async fn handle(&self, ctx: &CommandContext) -> anyhow::Result<Vec<Event>>;
-}
-
-#[derive(Debug)]
-pub struct ErrorMessage {
-    pub field: String,
-    pub message: String,
+    async fn handle(&self, ctx: &Command) -> CommandOutput;
 }
 
 fn display_error(translater: &impl Translater, err: &ValidationError) -> String {
@@ -156,7 +143,7 @@ fn display_struct(
     translater: &impl Translater,
     errs: &ValidationErrors,
     path: &str,
-) -> Vec<ErrorMessage> {
+) -> HashMap<String, Vec<String>> {
     let mut full_path = String::new();
 
     if let Err(e) = write!(&mut full_path, "{}.", path) {
@@ -164,33 +151,37 @@ fn display_struct(
     }
 
     let base_len = full_path.len();
-    let mut views = vec![];
+    let mut field_errors = HashMap::new();
 
     for (path, err) in errs.errors() {
         if let Err(e) = write!(&mut full_path, "{}", path) {
             error!("{e}");
         }
 
-        views.extend(display_errors(translater, err, &full_path));
+        field_errors.extend(display_errors(translater, err, &full_path));
         full_path.truncate(base_len);
     }
 
-    views
+    field_errors
 }
 
 fn display_errors(
     translater: &impl Translater,
     errs: &ValidationErrorsKind,
     path: &str,
-) -> Vec<ErrorMessage> {
+) -> HashMap<String, Vec<String>> {
     match errs {
-        ValidationErrorsKind::Field(errs) => errs
-            .iter()
-            .map(|err| ErrorMessage {
-                field: path.to_owned(),
-                message: display_error(translater, err),
-            })
-            .collect(),
+        ValidationErrorsKind::Field(errs) => {
+            let errors = errs
+                .iter()
+                .map(|err| display_error(translater, err))
+                .collect();
+
+            let mut field_errors = HashMap::new();
+            field_errors.insert(path.to_owned(), errors);
+
+            return field_errors;
+        }
         ValidationErrorsKind::Struct(errs) => display_struct(translater, errs, path),
         ValidationErrorsKind::List(errs) => {
             let mut full_path = String::new();
@@ -200,18 +191,18 @@ fn display_errors(
             }
 
             let base_len = full_path.len();
-            let mut views = vec![];
+            let mut field_errors = HashMap::new();
 
             for (idx, err) in errs.iter() {
                 if let Err(e) = write!(&mut full_path, "[{}]", idx) {
                     error!("{e}");
                 }
 
-                views.extend(display_struct(translater, err, &full_path));
+                field_errors.extend(display_struct(translater, err, &full_path));
                 full_path.truncate(base_len);
             }
 
-            views
+            field_errors
         }
     }
 }
@@ -227,7 +218,7 @@ pub enum TranslateType {
     LengthEqual(i64),
 }
 
-pub trait Translater {
+pub trait Translater: Sized {
     fn translate(&self, t: TranslateType) -> String;
 }
 

@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use evento::{
     store::{Aggregate, Event, WriteEvent},
-    CommandContext, CommandHandler,
+    Command, CommandError, CommandHandler, CommandOutput,
 };
 use nanoid::nanoid;
 use serde::{Deserialize, Serialize};
@@ -20,9 +20,10 @@ pub struct CreateProduct {
 
 #[async_trait]
 impl CommandHandler for CreateProduct {
-    async fn handle(&self, ctx: &CommandContext) -> anyhow::Result<Vec<Event>> {
+    async fn handle(&self, cmd: &Command) -> CommandOutput {
         let id = nanoid!(10);
-        let events = ctx
+
+        let events = cmd
             .publish::<Product, _>(
                 &id,
                 ProductEvent::Created.data(Created {
@@ -34,6 +35,153 @@ impl CommandHandler for CreateProduct {
 
         Ok(events)
     }
+}
+
+#[derive(Deserialize, Validate)]
+pub struct DeleteProduct {
+    #[validate(length(equal = 10))]
+    pub id: String,
+}
+
+#[async_trait]
+impl CommandHandler for DeleteProduct {
+    async fn handle(&self, cmd: &Command) -> CommandOutput {
+        let (_, original_version) = load_product(cmd, &self.id).await?;
+
+        let events = cmd
+            .publish::<Product, _>(
+                &self.id,
+                ProductEvent::Deleted.data(Deleted { deleted: true })?,
+                original_version,
+            )
+            .await?;
+
+        Ok(events)
+    }
+}
+
+#[derive(Deserialize, Validate)]
+pub struct UpdateProductQuantity {
+    #[validate(length(equal = 10))]
+    pub id: String,
+    #[validate(range(min = 0))]
+    pub quantity: u16,
+}
+
+#[async_trait]
+impl CommandHandler for UpdateProductQuantity {
+    async fn handle(&self, cmd: &Command) -> CommandOutput {
+        let (product, original_version) = load_product(cmd, &self.id).await?;
+
+        if product.quantity == self.quantity {
+            return Err(CommandError::Validation(
+                [(
+                    "quantity".to_owned(),
+                    vec!["Please enter a value other than the current one".to_owned()],
+                )]
+                .into_iter()
+                .collect(),
+            ));
+        }
+
+        let events = cmd
+            .publish::<Product, _>(
+                &self.id,
+                ProductEvent::Deleted.data(Deleted { deleted: true })?,
+                original_version,
+            )
+            .await?;
+
+        Ok(events)
+    }
+}
+
+#[derive(Deserialize, Validate)]
+pub struct UpdateProductVisibility {
+    #[validate(length(equal = 10))]
+    pub id: String,
+    pub visible: bool,
+}
+
+#[async_trait]
+impl CommandHandler for UpdateProductVisibility {
+    async fn handle(&self, cmd: &Command) -> CommandOutput {
+        let (_, original_version) = load_product(cmd, &self.id).await?;
+
+        let events = cmd
+            .publish::<Product, _>(
+                &self.id,
+                ProductEvent::Deleted.data(Deleted { deleted: true })?,
+                original_version,
+            )
+            .await?;
+
+        Ok(events)
+    }
+}
+
+#[derive(Deserialize, Validate)]
+pub struct UpdateProductDescription {
+    #[validate(length(equal = 10))]
+    pub id: String,
+    #[validate(length(min = 3, max = 255))]
+    pub description: String,
+}
+
+#[async_trait]
+impl CommandHandler for UpdateProductDescription {
+    async fn handle(&self, cmd: &Command) -> CommandOutput {
+        let (_, original_version) = load_product(cmd, &self.id).await?;
+
+        let events = cmd
+            .publish::<Product, _>(
+                &self.id,
+                ProductEvent::Deleted.data(Deleted { deleted: true })?,
+                original_version,
+            )
+            .await?;
+
+        Ok(events)
+    }
+}
+
+#[derive(Deserialize, Validate)]
+pub struct AddReviewToProduct {
+    #[validate(length(equal = 10))]
+    pub id: String,
+    #[validate(range(min = 0, max = 10))]
+    pub note: u8,
+    #[validate(length(min = 3, max = 255))]
+    pub message: String,
+}
+
+#[async_trait]
+impl CommandHandler for AddReviewToProduct {
+    async fn handle(&self, cmd: &Command) -> CommandOutput {
+        let (_, original_version) = load_product(cmd, &self.id).await?;
+
+        let events = cmd
+            .publish::<Product, _>(
+                &self.id,
+                ProductEvent::Deleted.data(Deleted { deleted: true })?,
+                original_version,
+            )
+            .await?;
+
+        Ok(events)
+    }
+}
+
+async fn load_product(ctx: &Command, id: &str) -> Result<(Product, u16), CommandError> {
+    let Some((product, e)) = ctx.load::<Product, _>(id).await? else {
+        return Err(CommandError::NotFound(format!("product {id} not found")));
+    };
+
+    if product.deleted {
+        return Err(CommandError::NotFound(format!("product {id} not found")));
+    }
+
+    Ok((product, e))
 }
 
 #[derive(Default, Serialize, Deserialize)]

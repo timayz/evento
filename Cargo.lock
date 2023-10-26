@@ -525,6 +525,7 @@ dependencies = [
  "axum",
  "evento",
  "evento-store",
+ "http",
  "i18n-embed",
  "i18n-embed-fl",
  "rust-embed",

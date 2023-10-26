@@ -21,3 +21,4 @@ i18n-embed-fl = "0.7.0"
 rust-embed = "8.0.0"
 evento = { path = "../evento", version = "1.0.0-alpha.1" }
 evento-store = { path = "../evento-store", version = "1.0.0-alpha.1" }
+http = "0.2.9"
