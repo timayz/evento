@@ -1,5 +1,30 @@
-{% extends "base.html" %} {% block content %}
-<form method="post" action="/create">
-  <input type="text" name="name" />
-</form>
+{% extends "base.html" %}
+
+{% block content %}
+<a href="/-/create" hx-boost="true">Add product</a>
+
+{% if create_modal %}
+<dialog class="modal" open>
+  <div class="modal-box">
+    <h3 class="font-bold text-lg mb-2">New product</h3>
+    <form hx-post="/-/create" hx-select="form">
+      <input
+        type="text"
+        name="name"
+        placeholder="Enter product name"
+        class="input input-bordered w-full max-w-xs"
+        autofocus
+      />
+      {% if let Some(errs) = errors.get("name") %}
+      <div class="text-error">{{ errs[0] }}</div>
+      {% endif %}
+      <div class="modal-action">
+        <button type="submit" class="btn btn-primary">Add</button>
+        <a href="/" hx-boost="true" class="btn" hx-target="body">Cancel</a>
+      </div>
+    </form>
+  </div>
+</dialog>
+{% endif %}
+
 {% endblock %}
