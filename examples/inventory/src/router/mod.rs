@@ -1,7 +1,10 @@
 mod create;
 mod index;
+mod render;
 
 use axum::{body::Body, routing::get, Router};
+
+pub use render::*;
 
 use crate::AppState;
 

@@ -2,6 +2,9 @@
 
 {% block content %}
 <h3 class="font-bold text-lg mb-2">New product</h3>
+<div class="text-error">
+  <div class="errors"></div>
+</div>
 <form method="post" action="/create" up-submit up-validate>
   <input
     type="text"

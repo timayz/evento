@@ -13,20 +13,21 @@ use axum::{
 use evento::{CommandError, CommandHandler};
 use evento_store::Event;
 use serde::de::DeserializeOwned;
-use std::marker::PhantomData;
+use std::{collections::HashMap, marker::PhantomData};
 use tracing::error;
 use validator::Validate;
 
 use crate::UserLanguage;
 
 #[derive(Clone, Debug)]
-pub struct Command<T> {
-    pub output: Result<Vec<Event>, CommandError>,
-    phantom_data: PhantomData<T>,
+pub struct Command<T, R> {
+    pub output: Result<Vec<Event>, HashMap<String, Vec<String>>>,
+    input: PhantomData<T>,
+    render: PhantomData<R>,
 }
 
 #[async_trait]
-impl<S, B, T> FromRequest<S, B> for Command<T>
+impl<S, B, T, R> FromRequest<S, B> for Command<T, R>
 where
     B: HttpBody + Send + 'static,
     B::Data: Send,
@@ -36,6 +37,7 @@ where
     T: DeserializeOwned,
     T: Validate,
     T: CommandHandler,
+    R: Render,
 {
     type Rejection = CommandRejection;
 
@@ -59,11 +61,30 @@ where
             )
             .await;
 
-        Ok(Self {
-            output,
-            phantom_data: PhantomData,
-        })
+        match output {
+            Ok(events) => Ok(Self {
+                output: Ok(events),
+                input: PhantomData,
+                render: PhantomData,
+            }),
+            Err(err) => match err {
+                CommandError::Server(msg) => Err(CommandRejection::Command(R::server(&cmd.0, msg))),
+                CommandError::Validation(errors) => Ok(Self {
+                    output: Err(errors),
+                    input: PhantomData,
+                    render: PhantomData,
+                }),
+                CommandError::NotFound(msg) => {
+                    Err(CommandRejection::Command(R::not_found(&cmd.0, msg)))
+                }
+            },
+        }
     }
+}
+
+pub trait Render {
+    fn not_found(cmd: &evento::Command, msg: String) -> Response;
+    fn server(cmd: &evento::Command, msg: String) -> Response;
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -74,6 +95,9 @@ pub enum CommandRejection {
     #[error("{0}")]
     Extension(#[from] ExtensionRejection),
 
+    #[error("cmmand")]
+    Command(Response),
+
     #[error("infallible")]
     Infallible,
 }
@@ -83,6 +107,7 @@ impl IntoResponse for CommandRejection {
         match self {
             CommandRejection::Form(rejection) => rejection.into_response(),
             CommandRejection::Extension(rejection) => rejection.into_response(),
+            CommandRejection::Command(res) => res,
             _ => unreachable!(),
         }
     }

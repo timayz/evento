@@ -21,6 +21,7 @@ pub struct CreateProduct {
 #[async_trait]
 impl CommandHandler for CreateProduct {
     async fn handle(&self, cmd: &Command) -> CommandOutput {
+        // Err(CommandError::NotFound("()".to_owned()))
         let id = nanoid!(10);
 
         let events = cmd
