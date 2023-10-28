@@ -18,7 +18,7 @@ impl evento_axum::Render for Render {
     fn not_found(_cmd: &evento::Command, _msg: String) -> Response {
         (
             StatusCode::NOT_FOUND,
-            [("X-Up-Fail-Target", ".errors")],
+            [("X-Up-Target", ".errors")],
             NotFoundTemplate,
         )
             .into_response()
@@ -27,7 +27,7 @@ impl evento_axum::Render for Render {
     fn server(_cmd: &evento::Command, _msg: String) -> Response {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            [("X-Up-Fail-Target", ".errors")],
+            [("X-Up-Target", ".errors")],
             ServerErrorTemplate,
         )
             .into_response()
