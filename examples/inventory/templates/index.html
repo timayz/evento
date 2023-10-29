@@ -3,4 +3,25 @@
 <a href="/create" class="btn btn-primary" up-layer="new" up-accept-location="/">
   Add product
 </a>
+<h1>Products</h1>
+<div>
+  {% for edge in data.edges %}
+  <div class="card w-96 bg-base-100 shadow-xl">
+    <figure>
+      <img src="https://source.unsplash.com/random/200x200" alt="Product" />
+    </figure>
+    <div class="card-body">
+      <h2 class="card-title">{{ edge.node.name|e }}</h2>
+      {% match edge.node.description %}
+        {% when Some with (val) %}
+          {{ val }}
+        {% when None %}
+      {% endmatch %}
+      <div class="card-actions justify-end">
+        <button class="btn btn-primary">Buy Now</button>
+      </div>
+    </div>
+  </div>
+  {% endfor %}
+</div>
 {% endblock %}

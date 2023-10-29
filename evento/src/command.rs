@@ -26,6 +26,11 @@ impl Command {
         }
     }
 
+    pub fn data<V: Send + Sync + 'static>(self, v: V) -> Self {
+        self.inner.write().insert(v);
+        self
+    }
+
     pub fn extract<T: Clone + 'static>(&self) -> T {
         self.inner.read().extract::<T>().clone()
     }

@@ -1,5 +1,4 @@
 use async_trait::async_trait;
-use evento_store::Event;
 use parking_lot::RwLock;
 use std::sync::Arc;
 
@@ -17,6 +16,11 @@ impl Query {
         }
     }
 
+    pub fn data<V: Send + Sync + 'static>(self, v: V) -> Self {
+        self.inner.write().insert(v);
+        self
+    }
+
     pub fn extract<T: Clone + 'static>(&self) -> T {
         self.inner.read().extract::<T>().clone()
     }
@@ -27,7 +31,7 @@ impl Query {
 }
 
 impl Query {
-    pub async fn execute<I, T>(&self, input: &I) -> Result<Vec<Event>, QueryError>
+    pub async fn execute<I, T>(&self, input: &I) -> Result<I::Output, QueryError>
     where
         I: QueryHandler,
     {
@@ -47,9 +51,10 @@ impl<E: std::error::Error + Send + Sync + 'static> From<E> for QueryError {
     }
 }
 
-pub type QueryOutput = Result<Vec<Event>, QueryError>;
+pub type QueryOutput<O> = Result<O, QueryError>;
 
 #[async_trait]
 pub trait QueryHandler {
-    async fn handle(&self, query: &Query) -> QueryOutput;
+    type Output;
+    async fn handle(&self, query: &Query) -> QueryOutput<Self::Output>;
 }

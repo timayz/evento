@@ -37,7 +37,7 @@ where
     T: DeserializeOwned,
     T: Validate,
     T: CommandHandler,
-    R: Render,
+    R: CommandRender,
 {
     type Rejection = CommandRejection;
 
@@ -82,7 +82,7 @@ where
     }
 }
 
-pub trait Render {
+pub trait CommandRender {
     fn not_found(cmd: &evento::Command, msg: String) -> Response;
     fn server(cmd: &evento::Command, msg: String) -> Response;
 }

@@ -1,12 +1,15 @@
 mod product;
 mod router;
 
+use std::str::FromStr;
+
 use anyhow::Result;
 use axum::{response::IntoResponse, routing::get, Extension};
-use evento::{Command, PgConsumer, Producer};
+use evento::{Command, PgConsumer, Producer, Query};
 use http::{header, StatusCode, Uri};
 use rust_embed::RustEmbed;
 use sqlx::{migrate::MigrateDatabase, Any, PgPool};
+use tracing_subscriber::{EnvFilter, prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -16,6 +19,13 @@ pub struct AppState {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let env_filter = EnvFilter::from_str("error,evento=debug")?;
+
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer())
+        .with(env_filter)
+        .init();
+
     sqlx::any::install_default_drivers();
 
     let dsn = "postgres://postgres:postgres@localhost:5432/inventory";
@@ -24,11 +34,16 @@ async fn main() -> Result<()> {
 
     sqlx::migrate!().run(&db).await?;
 
-    let producer = PgConsumer::new(&db).start(0).await?;
+    let producer = PgConsumer::new(&db)
+        .rule(product::product_details())
+        .start(0)
+        .await?;
     let command = Command::new(&producer);
+    let query = Query::new().data(db.clone());
 
     let app = router::create()
         .layer(Extension(command))
+        .layer(Extension(query))
         .fallback(get(static_handler))
         .with_state(AppState { db, producer });
 
