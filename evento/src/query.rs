@@ -35,7 +35,13 @@ impl Query {
     where
         I: QueryHandler,
     {
-        input.handle(&self).await
+        input.handle(self).await
+    }
+}
+
+impl Default for Query {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

@@ -85,7 +85,7 @@ impl Command {
             return Err(CommandError::Validation(errors));
         }
 
-        input.handle(&self).await
+        input.handle(self).await
     }
 }
 
@@ -185,7 +185,7 @@ fn display_errors(
             let mut field_errors = HashMap::new();
             field_errors.insert(path.to_owned(), errors);
 
-            return field_errors;
+            field_errors
         }
         ValidationErrorsKind::Struct(errs) => display_struct(translater, errs, path),
         ValidationErrorsKind::List(errs) => {

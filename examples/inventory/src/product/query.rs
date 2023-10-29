@@ -53,7 +53,7 @@ impl RuleHandler for ProductDetailsHandler {
                 .await?;
             }
             ProductEvent::QuantityUpdated => {
-                let data: QuantityUpdated = event.to_data().unwrap();
+                let _data: QuantityUpdated = event.to_data().unwrap();
                 // let collection = db.collection::<Product>("products");
                 // let filter = doc! {"id":aggregate::Product::to_id(event.aggregate_id) };
 
@@ -67,7 +67,7 @@ impl RuleHandler for ProductDetailsHandler {
                 //     .unwrap();
             }
             ProductEvent::VisibilityUpdated => {
-                let data: VisibilityUpdated = event.to_data().unwrap();
+                let _data: VisibilityUpdated = event.to_data().unwrap();
                 // let collection = db.collection::<Product>("products");
                 // let filter = doc! {"id":aggregate::Product::to_id(event.aggregate_id) };
 
@@ -77,7 +77,7 @@ impl RuleHandler for ProductDetailsHandler {
                 //     .unwrap();
             }
             ProductEvent::DescriptionUpdated => {
-                let data: DescriptionUpdated = event.to_data().unwrap();
+                let _data: DescriptionUpdated = event.to_data().unwrap();
                 // let collection = db.collection::<Product>("products");
                 // let filter = doc! {"id":aggregate::Product::to_id(event.aggregate_id) };
 
@@ -91,7 +91,7 @@ impl RuleHandler for ProductDetailsHandler {
                 //     .unwrap();
             }
             ProductEvent::ReviewAdded => {
-                let data: ReviewAdded = event.to_data().unwrap();
+                let _data: ReviewAdded = event.to_data().unwrap();
                 // let collection = db.collection::<Product>("products");
                 // let filter = doc! {"id":aggregate::Product::to_id(event.aggregate_id) };
 
