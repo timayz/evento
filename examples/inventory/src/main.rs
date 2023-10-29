@@ -9,7 +9,9 @@ use evento::{Command, PgConsumer, Producer, Query};
 use http::{header, StatusCode, Uri};
 use rust_embed::RustEmbed;
 use sqlx::{migrate::MigrateDatabase, Any, PgPool};
-use tracing_subscriber::{EnvFilter, prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{
+    prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt, EnvFilter,
+};
 
 #[derive(Clone)]
 pub struct AppState {
