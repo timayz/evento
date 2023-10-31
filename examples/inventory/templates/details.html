@@ -5,7 +5,12 @@
   <h3 class="font-bold text-lg mb-2">Details product</h3>
   <div class="card bg-base-100 shadow-xl">
     <figure>
-      <img src="https://source.unsplash.com/random/320x230" alt="Product" />
+      {% match thumbnail %}
+        {% when Some with (thumbnail) %}
+        <img height="320" width="320" src="{{ thumbnail }}" alt="Product" loading="lazy" />
+        {% when None %}
+        <img src="https://source.unsplash.com/random/320x230" alt="Product" loading="lazy" />
+        {% endmatch %}
     </figure>
     <div class="card-body">
       <h2 class="card-title">{{ name|e }}</h2>

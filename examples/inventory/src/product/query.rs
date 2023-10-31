@@ -10,7 +10,7 @@ use evento_query::{Cursor, CursorType, Edge, PgQuery, QueryArgs, QueryResult};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
-use super::{Created, Edited, Product, ProductEvent, VisibilityChanged};
+use super::{Created, Edited, Product, ProductEvent, ThumbnailChanged, VisibilityChanged};
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct ProductDetails {
@@ -18,6 +18,8 @@ pub struct ProductDetails {
     pub slug: String,
     pub name: String,
     pub description: Option<String>,
+    pub category: Option<String>,
+    pub thumbnail: Option<String>,
     pub stock: i32,
     pub price: Option<f32>,
     pub visible: bool,
@@ -55,13 +57,14 @@ impl RuleHandler for ProductDetailsHandler {
                 let id = Product::to_id(event.aggregate_id);
                 sqlx::query_as::<_, (String,)>(
                     r#"
-                    UPDATE iv_product SET name = $1, description = $2, stock = $3, price = $4, visible = $5, updated_at = $6
-                    WHERE id = $7
+                    UPDATE iv_product SET name = $1, description = $2, category = $3, stock = $4, price = $5, visible = $6, updated_at = $7
+                    WHERE id = $8
                     RETURNING id
                     "#,
                 )
                 .bind(data.name)
                 .bind(data.description)
+                .bind(data.category)
                 .bind(data.stock)
                 .bind(data.price)
                 .bind(data.visible)
@@ -86,6 +89,22 @@ impl RuleHandler for ProductDetailsHandler {
                 .fetch_one(&db)
                 .await?;
             }
+            ProductEvent::ThumbnailChanged => {
+                let data: ThumbnailChanged = event.to_data().unwrap();
+                let id = Product::to_id(event.aggregate_id);
+                sqlx::query_as::<_, (String,)>(
+                    r#"
+                    UPDATE iv_product SET thumbnail = $1, updated_at = $2
+                    WHERE id = $3
+                    RETURNING id
+                    "#,
+                )
+                .bind(data.thumbnail)
+                .bind(Utc::now())
+                .bind(&id)
+                .fetch_one(&db)
+                .await?;
+            }
             ProductEvent::Deleted => {
                 let id = Product::to_id(event.aggregate_id);
                 sqlx::query::<_>("DELETE FROM iv_product WHERE id = $1")
@@ -102,6 +121,7 @@ impl RuleHandler for ProductDetailsHandler {
 pub fn product_details() -> Rule {
     Rule::new("product-details").handler("product/**", ProductDetailsHandler)
 }
+
 #[derive(Deserialize)]
 pub struct GetProductDetails {
     pub id: String,

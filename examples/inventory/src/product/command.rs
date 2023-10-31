@@ -1,13 +1,16 @@
 use async_trait::async_trait;
 use evento::{
     store::{Aggregate, Event, WriteEvent},
-    Command, CommandError, CommandHandler, CommandOutput,
+    Command, CommandError, CommandHandler, CommandOutput, ConsumerContext, Rule, RuleHandler,
 };
 use nanoid::nanoid;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use super::{Created, Deleted, Edited, ProductEvent, VisibilityChanged};
+use super::{
+    Created, Deleted, Edited, GenerateProductsRequested, ProductEvent, ProductTaskEvent,
+    ThumbnailChanged, VisibilityChanged,
+};
 
 #[derive(Debug, Deserialize, Validate)]
 pub struct CreateProductInput {
@@ -91,6 +94,8 @@ pub struct EditProductInput {
     pub name: String,
     #[validate(length(min = 3, max = 255))]
     pub description: String,
+    #[validate(length(min = 3, max = 50))]
+    pub category: String,
     #[validate(length(equal = 2))]
     pub visible: Option<String>,
     #[validate(range(min = 0))]
@@ -110,6 +115,7 @@ impl CommandHandler for EditProductInput {
                 ProductEvent::Edited.data(Edited {
                     name: self.name.to_owned(),
                     description: self.description.to_owned(),
+                    category: self.category.to_owned(),
                     price: self.price,
                     stock: self.stock,
                     visible: self.visible.is_some(),
@@ -138,6 +144,8 @@ async fn load_product(ctx: &Command, id: &str) -> Result<(Product, u16), Command
 pub struct Product {
     pub name: String,
     pub description: String,
+    pub category: String,
+    pub thumbnail: String,
     pub visible: bool,
     pub stock: i32,
     pub price: f32,
@@ -169,6 +177,10 @@ impl Aggregate for Product {
                 let data: Deleted = event.to_data().unwrap();
                 self.deleted = data.deleted;
             }
+            ProductEvent::ThumbnailChanged => {
+                let data: ThumbnailChanged = event.to_data().unwrap();
+                self.thumbnail = data.thumbnail;
+            }
         }
     }
 
@@ -178,6 +190,120 @@ impl Aggregate for Product {
 }
 
 impl ProductEvent {
+    pub fn data<D: Serialize>(&self, value: D) -> evento::store::Result<WriteEvent> {
+        WriteEvent::new(self.to_string()).data(value)
+    }
+}
+
+#[derive(Deserialize, Validate)]
+pub struct GenerateProductsInput {
+    #[validate(range(min = 0))]
+    pub skip: u16,
+}
+
+#[async_trait]
+impl CommandHandler for GenerateProductsInput {
+    async fn handle(&self, cmd: &Command) -> CommandOutput {
+        let id = nanoid!(10);
+
+        let events = cmd
+            .publish::<ProductTask, _>(
+                &id,
+                ProductTaskEvent::GenerateProductsRequested.data(GenerateProductsRequested {
+                    skip: self.skip.to_owned(),
+                })?,
+                0,
+            )
+            .await?;
+
+        Ok(events)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DummyJsonProduct {
+    pub title: String,
+    pub description: String,
+    pub price: f32,
+    pub stock: i32,
+    pub category: String,
+    pub thumbnail: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DummyJsonPayload {
+    pub products: Vec<DummyJsonProduct>,
+}
+
+#[derive(Clone)]
+pub struct ProductTaskHandler;
+
+#[async_trait]
+impl RuleHandler for ProductTaskHandler {
+    async fn handle(&self, event: Event, ctx: ConsumerContext) -> anyhow::Result<Option<Event>> {
+        let event_name: ProductTaskEvent = event.name.parse()?;
+
+        match event_name {
+            ProductTaskEvent::GenerateProductsRequested => {
+                let data: GenerateProductsRequested = event.to_data().unwrap();
+
+                let payload: DummyJsonPayload = ureq::get(&format!(
+                    "https://dummyjson.com/products?skip={}",
+                    data.skip
+                ))
+                .call()?
+                .into_json()?;
+
+                for product in payload.products {
+                    let id = nanoid!(10);
+
+                    ctx.publish_all::<Product, _>(
+                        &id,
+                        vec![
+                            ProductEvent::Created.data(Created {
+                                name: product.title.to_owned(),
+                            })?,
+                            ProductEvent::Edited.data(Edited {
+                                name: product.title.to_owned(),
+                                description: product.description.to_owned(),
+                                price: product.price.to_owned(),
+                                category: product.category.to_owned(),
+                                stock: product.stock.to_owned(),
+                                visible: true,
+                            })?,
+                            ProductEvent::ThumbnailChanged.data(ThumbnailChanged {
+                                thumbnail: product.thumbnail.to_owned(),
+                            })?,
+                        ],
+                        0,
+                    )
+                    .await?;
+                }
+            }
+        };
+
+        Ok(None)
+    }
+}
+
+pub fn product_task() -> Rule {
+    Rule::new("product-task").handler("product-task/**", ProductTaskHandler)
+}
+
+#[derive(Default, Serialize, Deserialize)]
+pub struct ProductTask;
+
+impl Aggregate for ProductTask {
+    fn apply(&mut self, _event: &Event) {
+        unreachable!();
+    }
+
+    fn aggregate_type<'a>() -> &'a str {
+        "product-task"
+    }
+}
+
+impl ProductTaskEvent {
     pub fn data<D: Serialize>(&self, value: D) -> evento::store::Result<WriteEvent> {
         WriteEvent::new(self.to_string()).data(value)
     }

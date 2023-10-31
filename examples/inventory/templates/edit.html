@@ -25,13 +25,20 @@
       {% endif %}
     </div>
 
+    <div class="form-control">
+      <textarea class="textarea textarea-bordered" name="category"
+        placeholder="Category">{{ category }}</textarea>
+      {% if let Some(errs) = errors.get("category") %}
+      <div class="text-error">{{ errs[0] }}</div>
+      {% endif %}
+    </div>
+
     <div class="form-control"><input type="number" name="price" step="0.01" value="{{ price }}"
         class="input input-bordered w-full max-w-xs" />
       {% if let Some(errs) = errors.get("price") %}
       <div class="text-error">{{ errs[0] }}</div>
       {% endif %}
     </div>
-
 
     <div class="form-control">
       <input type="number" name="stock" step="0" class="input input-bordered w-full max-w-xs" value="{{ stock }}" />

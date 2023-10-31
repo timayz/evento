@@ -38,6 +38,7 @@ async fn main() -> Result<()> {
 
     let producer = PgConsumer::new(&db)
         .rule(product::product_details())
+        .rule(product::product_task())
         .start(0)
         .await?;
     let command = Command::new(&producer);

@@ -8,6 +8,7 @@ pub enum ProductEvent {
     Deleted,
     Edited,
     VisibilityChanged,
+    ThumbnailChanged,
 }
 
 impl From<ProductEvent> for String {
@@ -30,6 +31,7 @@ pub struct Deleted {
 pub struct Edited {
     pub name: String,
     pub description: String,
+    pub category: String,
     pub visible: bool,
     pub stock: i32,
     pub price: f32,
@@ -38,4 +40,26 @@ pub struct Edited {
 #[derive(Serialize, Deserialize)]
 pub struct VisibilityChanged {
     pub visible: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ThumbnailChanged {
+    pub thumbnail: String,
+}
+
+#[derive(Display, FromStr)]
+#[display(style = "kebab-case")]
+pub enum ProductTaskEvent {
+    GenerateProductsRequested,
+}
+
+impl From<ProductTaskEvent> for String {
+    fn from(p: ProductTaskEvent) -> Self {
+        p.to_string()
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct GenerateProductsRequested {
+    pub skip: u16,
 }

@@ -1,0 +1,25 @@
+{% extends "_base.html" %}
+
+{% block content %}
+<div class="container mx-auto max-w-2xl">
+  <h3 class="font-bold text-lg mb-2">Generate products</h3>
+  <form method="post" action="/generate" up-submit>
+    <div class="text-error">
+      <div class="errors"></div>
+    </div>
+
+    <div class="form-control">
+      <input type="number" name="skip" step="0" class="input input-bordered w-full max-w-xs"
+        value="{{ skip }}" />
+      {% if let Some(errs) = errors.get("skip") %}
+      <div class="text-error">{{ errs[0] }}</div>
+      {% endif %}
+    </div>
+
+    <div class="modal-action">
+      <button class="btn btn-primary">Start generate</button>
+      <a href="/" class="btn" up-follow>Cancel</a>
+    </div>
+  </form>
+</div>
+{% endblock %}
