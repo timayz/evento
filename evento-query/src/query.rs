@@ -10,7 +10,7 @@ mod pg;
 #[cfg(feature = "pg")]
 pub use pg::*;
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
 pub struct Edge<N> {
     pub cursor: CursorType,
     pub node: N,

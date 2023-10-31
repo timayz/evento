@@ -31,8 +31,9 @@ CREATE TABLE IF NOT EXISTS iv_product (
     slug VARCHAR(100) NOT NULL,
     name VARCHAR(50) NOT NULL,
     description TEXT NULL,
+    stock INT NOT NULL DEFAULT 0,
     price REAL NULL,
-    active BOOLEAN NOT NULL,
+    visible BOOLEAN NOT NULL,
     updated_at TIMESTAMPTZ NULL,
     created_at TIMESTAMPTZ NOT NULL
 );

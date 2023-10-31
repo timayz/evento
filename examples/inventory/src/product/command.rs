@@ -7,19 +7,16 @@ use nanoid::nanoid;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use super::{
-    Created, Deleted, DescriptionUpdated, ProductEvent, QuantityUpdated, ReviewAdded,
-    VisibilityUpdated,
-};
+use super::{Created, Deleted, Edited, ProductEvent, VisibilityChanged};
 
 #[derive(Debug, Deserialize, Validate)]
-pub struct CreateProduct {
+pub struct CreateProductInput {
     #[validate(length(min = 3, max = 25))]
     pub name: String,
 }
 
 #[async_trait]
-impl CommandHandler for CreateProduct {
+impl CommandHandler for CreateProductInput {
     async fn handle(&self, cmd: &Command) -> CommandOutput {
         let id = nanoid!(10);
 
@@ -38,13 +35,13 @@ impl CommandHandler for CreateProduct {
 }
 
 #[derive(Deserialize, Validate)]
-pub struct DeleteProduct {
+pub struct DeleteProductInput {
     #[validate(length(equal = 10))]
     pub id: String,
 }
 
 #[async_trait]
-impl CommandHandler for DeleteProduct {
+impl CommandHandler for DeleteProductInput {
     async fn handle(&self, cmd: &Command) -> CommandOutput {
         let (_, original_version) = load_product(cmd, &self.id).await?;
 
@@ -61,57 +58,23 @@ impl CommandHandler for DeleteProduct {
 }
 
 #[derive(Deserialize, Validate)]
-pub struct UpdateProductQuantity {
-    #[validate(length(equal = 10))]
-    pub id: String,
-    #[validate(range(min = 0))]
-    pub quantity: u16,
-}
-
-#[async_trait]
-impl CommandHandler for UpdateProductQuantity {
-    async fn handle(&self, cmd: &Command) -> CommandOutput {
-        let (product, original_version) = load_product(cmd, &self.id).await?;
-
-        if product.quantity == self.quantity {
-            return Err(CommandError::Validation(
-                [(
-                    "quantity".to_owned(),
-                    vec!["Please enter a value other than the current one".to_owned()],
-                )]
-                .into_iter()
-                .collect(),
-            ));
-        }
-
-        let events = cmd
-            .publish::<Product, _>(
-                &self.id,
-                ProductEvent::Deleted.data(Deleted { deleted: true })?,
-                original_version,
-            )
-            .await?;
-
-        Ok(events)
-    }
-}
-
-#[derive(Deserialize, Validate)]
-pub struct UpdateProductVisibility {
+pub struct ChangeProductVisibilityInput {
     #[validate(length(equal = 10))]
     pub id: String,
     pub visible: bool,
 }
 
 #[async_trait]
-impl CommandHandler for UpdateProductVisibility {
+impl CommandHandler for ChangeProductVisibilityInput {
     async fn handle(&self, cmd: &Command) -> CommandOutput {
         let (_, original_version) = load_product(cmd, &self.id).await?;
 
         let events = cmd
             .publish::<Product, _>(
                 &self.id,
-                ProductEvent::Deleted.data(Deleted { deleted: true })?,
+                ProductEvent::VisibilityChanged.data(VisibilityChanged {
+                    visible: self.visible,
+                })?,
                 original_version,
             )
             .await?;
@@ -121,49 +84,36 @@ impl CommandHandler for UpdateProductVisibility {
 }
 
 #[derive(Deserialize, Validate)]
-pub struct UpdateProductDescription {
+pub struct EditProductInput {
     #[validate(length(equal = 10))]
     pub id: String,
+    #[validate(length(min = 3, max = 25))]
+    pub name: String,
     #[validate(length(min = 3, max = 255))]
     pub description: String,
+    #[validate(length(equal = 2))]
+    pub visible: Option<String>,
+    #[validate(range(min = 0))]
+    pub stock: i32,
+    #[validate(range(min = 0))]
+    pub price: f32,
 }
 
 #[async_trait]
-impl CommandHandler for UpdateProductDescription {
+impl CommandHandler for EditProductInput {
     async fn handle(&self, cmd: &Command) -> CommandOutput {
         let (_, original_version) = load_product(cmd, &self.id).await?;
 
         let events = cmd
             .publish::<Product, _>(
                 &self.id,
-                ProductEvent::Deleted.data(Deleted { deleted: true })?,
-                original_version,
-            )
-            .await?;
-
-        Ok(events)
-    }
-}
-
-#[derive(Deserialize, Validate)]
-pub struct AddReviewToProduct {
-    #[validate(length(equal = 10))]
-    pub id: String,
-    #[validate(range(min = 0, max = 10))]
-    pub note: u8,
-    #[validate(length(min = 3, max = 255))]
-    pub message: String,
-}
-
-#[async_trait]
-impl CommandHandler for AddReviewToProduct {
-    async fn handle(&self, cmd: &Command) -> CommandOutput {
-        let (_, original_version) = load_product(cmd, &self.id).await?;
-
-        let events = cmd
-            .publish::<Product, _>(
-                &self.id,
-                ProductEvent::Deleted.data(Deleted { deleted: true })?,
+                ProductEvent::Edited.data(Edited {
+                    name: self.name.to_owned(),
+                    description: self.description.to_owned(),
+                    price: self.price,
+                    stock: self.stock,
+                    visible: self.visible.is_some(),
+                })?,
                 original_version,
             )
             .await?;
@@ -189,9 +139,9 @@ pub struct Product {
     pub name: String,
     pub description: String,
     pub visible: bool,
-    pub quantity: u16,
+    pub stock: i32,
+    pub price: f32,
     pub deleted: bool,
-    pub reviews: Vec<(u8, String)>,
 }
 
 impl Aggregate for Product {
@@ -203,21 +153,17 @@ impl Aggregate for Product {
                 let data: Created = event.to_data().unwrap();
                 self.name = data.name;
             }
-            ProductEvent::QuantityUpdated => {
-                let data: QuantityUpdated = event.to_data().unwrap();
-                self.quantity = data.quantity;
-            }
-            ProductEvent::VisibilityUpdated => {
-                let data: VisibilityUpdated = event.to_data().unwrap();
-                self.visible = data.visible;
-            }
-            ProductEvent::DescriptionUpdated => {
-                let data: DescriptionUpdated = event.to_data().unwrap();
+            ProductEvent::Edited => {
+                let data: Edited = event.to_data().unwrap();
+                self.name = data.name;
                 self.description = data.description;
+                self.stock = data.stock;
+                self.visible = data.visible;
+                self.price = data.price;
             }
-            ProductEvent::ReviewAdded => {
-                let data: ReviewAdded = event.to_data().unwrap();
-                self.reviews.push((data.note, data.message));
+            ProductEvent::VisibilityChanged => {
+                let data: VisibilityChanged = event.to_data().unwrap();
+                self.visible = data.visible;
             }
             ProductEvent::Deleted => {
                 let data: Deleted = event.to_data().unwrap();

@@ -6,10 +6,8 @@ use serde::{Deserialize, Serialize};
 pub enum ProductEvent {
     Created,
     Deleted,
-    QuantityUpdated,
-    VisibilityUpdated,
-    DescriptionUpdated,
-    ReviewAdded,
+    Edited,
+    VisibilityChanged,
 }
 
 impl From<ProductEvent> for String {
@@ -29,22 +27,15 @@ pub struct Deleted {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct QuantityUpdated {
-    pub quantity: u16,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct VisibilityUpdated {
-    pub visible: bool,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct DescriptionUpdated {
+pub struct Edited {
+    pub name: String,
     pub description: String,
+    pub visible: bool,
+    pub stock: i32,
+    pub price: f32,
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct ReviewAdded {
-    pub note: u8,
-    pub message: String,
+pub struct VisibilityChanged {
+    pub visible: bool,
 }

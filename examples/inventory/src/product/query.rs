@@ -4,16 +4,13 @@ use chrono::{DateTime, Utc};
 use convert_case::{Case, Casing};
 use evento::{
     store::{Aggregate, Event},
-    ConsumerContext, Query, QueryHandler, QueryOutput, Rule, RuleHandler,
+    ConsumerContext, Query, QueryError, QueryHandler, QueryOutput, Rule, RuleHandler,
 };
-use evento_query::{Cursor, CursorType, PgQuery, QueryArgs, QueryResult};
+use evento_query::{Cursor, CursorType, Edge, PgQuery, QueryArgs, QueryResult};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
-use super::{
-    Created, DescriptionUpdated, Product, ProductEvent, QuantityUpdated, ReviewAdded,
-    VisibilityUpdated,
-};
+use super::{Created, Edited, Product, ProductEvent, VisibilityChanged};
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct ProductDetails {
@@ -21,8 +18,9 @@ pub struct ProductDetails {
     pub slug: String,
     pub name: String,
     pub description: Option<String>,
+    pub stock: i32,
     pub price: Option<f32>,
-    pub active: bool,
+    pub visible: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: Option<DateTime<Utc>>,
 }
@@ -42,7 +40,7 @@ impl RuleHandler for ProductDetailsHandler {
                 let id = Product::to_id(event.aggregate_id);
 
                 sqlx::query_as::<_, (String,)>(
-                    "INSERT INTO iv_product (id, slug, name, created_at, active) VALUES ($1, $2, $3, $4, $5) RETURNING id",
+                    "INSERT INTO iv_product (id, slug, name, created_at, visible) VALUES ($1, $2, $3, $4, $5) RETURNING id",
                 )
                 .bind(&id)
                 .bind(data.name.to_case(Case::Kebab))
@@ -52,63 +50,48 @@ impl RuleHandler for ProductDetailsHandler {
                 .fetch_one(&db)
                 .await?;
             }
-            ProductEvent::QuantityUpdated => {
-                let _data: QuantityUpdated = event.to_data().unwrap();
-                // let collection = db.collection::<Product>("products");
-                // let filter = doc! {"id":aggregate::Product::to_id(event.aggregate_id) };
-
-                // collection
-                //     .update_one(
-                //         filter,
-                //         doc! {"$set": {"quantity": to_bson(&data.quantity).unwrap()}},
-                //         None,
-                //     )
-                //     .await
-                //     .unwrap();
+            ProductEvent::Edited => {
+                let data: Edited = event.to_data().unwrap();
+                let id = Product::to_id(event.aggregate_id);
+                sqlx::query_as::<_, (String,)>(
+                    r#"
+                    UPDATE iv_product SET name = $1, description = $2, stock = $3, price = $4, visible = $5, updated_at = $6
+                    WHERE id = $7
+                    RETURNING id
+                    "#,
+                )
+                .bind(data.name)
+                .bind(data.description)
+                .bind(data.stock)
+                .bind(data.price)
+                .bind(data.visible)
+                .bind(Utc::now())
+                .bind(&id)
+                .fetch_one(&db)
+                .await?;
             }
-            ProductEvent::VisibilityUpdated => {
-                let _data: VisibilityUpdated = event.to_data().unwrap();
-                // let collection = db.collection::<Product>("products");
-                // let filter = doc! {"id":aggregate::Product::to_id(event.aggregate_id) };
-
-                // collection
-                //     .update_one(filter, doc! {"$set": {"visible": data.visible}}, None)
-                //     .await
-                //     .unwrap();
-            }
-            ProductEvent::DescriptionUpdated => {
-                let _data: DescriptionUpdated = event.to_data().unwrap();
-                // let collection = db.collection::<Product>("products");
-                // let filter = doc! {"id":aggregate::Product::to_id(event.aggregate_id) };
-
-                // collection
-                //     .update_one(
-                //         filter,
-                //         doc! {"$set": {"description": data.description}},
-                //         None,
-                //     )
-                //     .await
-                //     .unwrap();
-            }
-            ProductEvent::ReviewAdded => {
-                let _data: ReviewAdded = event.to_data().unwrap();
-                // let collection = db.collection::<Product>("products");
-                // let filter = doc! {"id":aggregate::Product::to_id(event.aggregate_id) };
-
-                // collection
-                //     .update_one(
-                //         filter,
-                //         doc! {"$push": {"reviews": to_bson(&(data.note, data.message)).unwrap()}},
-                //         None,
-                //     )
-                //     .await
-                //     .unwrap();
+            ProductEvent::VisibilityChanged => {
+                let data: VisibilityChanged = event.to_data().unwrap();
+                let id = Product::to_id(event.aggregate_id);
+                sqlx::query_as::<_, (String,)>(
+                    r#"
+                    UPDATE iv_product SET visible = $1, updated_at = $2
+                    WHERE id = $3
+                    RETURNING id
+                    "#,
+                )
+                .bind(data.visible)
+                .bind(Utc::now())
+                .bind(&id)
+                .fetch_one(&db)
+                .await?;
             }
             ProductEvent::Deleted => {
-                // let filter = doc! {"id":aggregate::Product::to_id(event.aggregate_id) };
-
-                // let collection = db.collection::<Product>("products");
-                // collection.delete_one(filter, None).await.unwrap();
+                let id = Product::to_id(event.aggregate_id);
+                sqlx::query::<_>("DELETE FROM iv_product WHERE id = $1")
+                    .bind(&id)
+                    .execute(&db)
+                    .await?;
             }
         };
 
@@ -118,6 +101,28 @@ impl RuleHandler for ProductDetailsHandler {
 
 pub fn product_details() -> Rule {
     Rule::new("product-details").handler("product/**", ProductDetailsHandler)
+}
+#[derive(Deserialize)]
+pub struct GetProductDetails {
+    pub id: String,
+}
+
+#[async_trait]
+impl QueryHandler for GetProductDetails {
+    type Output = Edge<ProductDetails>;
+    async fn handle(&self, query: &Query) -> QueryOutput<Self::Output> {
+        let db: sqlx::Pool<sqlx::Postgres> = query.extract::<PgPool>();
+        let result = PgQuery::<ProductDetails>::new("SELECT * FROM iv_product WHERE id = $1")
+            .bind(&self.id)
+            .forward(1, None)
+            .fetch_all(&db)
+            .await?;
+
+        match result.edges.first().cloned() {
+            Some(edge) => Ok(edge),
+            _ => Err(QueryError::NotFound("".to_owned())),
+        }
+    }
 }
 
 #[derive(Deserialize)]

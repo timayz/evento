@@ -22,7 +22,7 @@ use crate::UserLanguage;
 #[derive(Clone, Debug)]
 pub struct Command<T, R> {
     pub output: Result<Vec<Event>, HashMap<String, Vec<String>>>,
-    input: PhantomData<T>,
+    pub input: T,
     render: PhantomData<R>,
 }
 
@@ -64,14 +64,14 @@ where
         match output {
             Ok(events) => Ok(Self {
                 output: Ok(events),
-                input: PhantomData,
+                input,
                 render: PhantomData,
             }),
             Err(err) => match err {
                 CommandError::Server(msg) => Err(CommandRejection::Command(R::server(&cmd.0, msg))),
                 CommandError::Validation(errors) => Ok(Self {
                     output: Err(errors),
-                    input: PhantomData,
+                    input,
                     render: PhantomData,
                 }),
                 CommandError::NotFound(msg) => {

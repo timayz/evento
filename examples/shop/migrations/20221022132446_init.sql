@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS sp_product (
     name VARCHAR(50) NOT NULL,
     description TEXT NOT NULL,
     price REAL NOT NULL,
-    active BOOLEAN NOT NULL
+    visible BOOLEAN NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS sp_cart_item (

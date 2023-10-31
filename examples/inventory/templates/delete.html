@@ -1,0 +1,18 @@
+{% extends "_base.html" %}
+
+{% block content %}
+<div class="container mx-auto max-w-2xl">
+  <h3 class="font-bold text-lg mb-2">Delete product</h3>
+  {% if let Some(name) = name %}<p>Are you sure you want to delete {{ name }}?</p>{% endif %}
+  <form method="post" action="/delete" up-submit>
+    <div class="text-error">
+      <div class="errors"></div>
+    </div>
+    <input type="hidden" name="id" value="{{ id }}" />
+    <div class="modal-action">
+      <button type="submit" class="btn btn-primary">Yes</button>
+      <a href="/" class="btn" up-follow>No</a>
+    </div>
+  </form>
+</div>
+{% endblock %}

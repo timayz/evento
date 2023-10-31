@@ -3,11 +3,11 @@
 {% block content %}
 <div class="container mx-auto max-w-2xl">
   <h3 class="font-bold text-lg mb-2">New product</h3>
-  <form method="post" action="/create" up-submit up-validate>
+  <form method="post" action="/create" up-submit>
     <div class="text-error">
       <div class="errors"></div>
     </div>
-    <input type="text" name="name" placeholder="Enter product name" class="input input-bordered w-full max-w-xs" />
+    <input type="text" name="name" placeholder="Enter product name" class="input input-bordered w-full max-w-xs" value="DefaultProduct1" />
     {% if let Some(errs) = errors.get("name") %}
     <div class="text-error">{{ errs[0] }}</div>
     {% endif %}

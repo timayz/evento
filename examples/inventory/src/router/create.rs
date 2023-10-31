@@ -3,7 +3,7 @@ use askama_axum::IntoResponse;
 use http::StatusCode;
 use std::collections::HashMap;
 
-use crate::product::CreateProduct;
+use crate::product::CreateProductInput;
 
 use super::Command;
 
@@ -19,7 +19,7 @@ pub async fn get() -> CreateTemplate {
     }
 }
 
-pub async fn post(cmd: Command<CreateProduct>) -> impl IntoResponse {
+pub async fn post(cmd: Command<CreateProductInput>) -> impl IntoResponse {
     if let Err(errors) = cmd.output {
         return (StatusCode::UNPROCESSABLE_ENTITY, CreateTemplate { errors }).into_response();
     }
