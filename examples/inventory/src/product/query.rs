@@ -5,10 +5,13 @@ use convert_case::{Case, Casing};
 use evento::{
     store::{Aggregate, Event},
     ConsumerContext, Query, QueryError, QueryHandler, QueryOutput, Rule, RuleHandler,
+    RulePostHandler,
 };
 use evento_query::{Cursor, CursorType, Edge, PgQuery, QueryArgs, QueryResult};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
+
+use crate::Publisher;
 
 use super::{Created, Edited, Product, ProductEvent, ThumbnailChanged, VisibilityChanged};
 
@@ -35,11 +38,11 @@ impl RuleHandler for ProductDetailsHandler {
     async fn handle(&self, event: Event, ctx: ConsumerContext) -> Result<Option<Event>> {
         let db = ctx.extract::<PgPool>();
         let event_name: ProductEvent = event.name.parse()?;
+        let id = Product::to_id(&event.aggregate_id);
 
         match event_name {
             ProductEvent::Created => {
-                let data: Created = event.to_data().unwrap();
-                let id = Product::to_id(event.aggregate_id);
+                let data: Created = event.to_data()?;
 
                 sqlx::query_as::<_, (String,)>(
                     "INSERT INTO iv_product (id, slug, name, created_at, visible) VALUES ($1, $2, $3, $4, $5) RETURNING id",
@@ -53,8 +56,7 @@ impl RuleHandler for ProductDetailsHandler {
                 .await?;
             }
             ProductEvent::Edited => {
-                let data: Edited = event.to_data().unwrap();
-                let id = Product::to_id(event.aggregate_id);
+                let data: Edited = event.to_data()?;
                 sqlx::query_as::<_, (String,)>(
                     r#"
                     UPDATE iv_product SET name = $1, description = $2, category = $3, stock = $4, price = $5, visible = $6, updated_at = $7
@@ -74,8 +76,7 @@ impl RuleHandler for ProductDetailsHandler {
                 .await?;
             }
             ProductEvent::VisibilityChanged => {
-                let data: VisibilityChanged = event.to_data().unwrap();
-                let id = Product::to_id(event.aggregate_id);
+                let data: VisibilityChanged = event.to_data()?;
                 sqlx::query_as::<_, (String,)>(
                     r#"
                     UPDATE iv_product SET visible = $1, updated_at = $2
@@ -90,8 +91,7 @@ impl RuleHandler for ProductDetailsHandler {
                 .await?;
             }
             ProductEvent::ThumbnailChanged => {
-                let data: ThumbnailChanged = event.to_data().unwrap();
-                let id = Product::to_id(event.aggregate_id);
+                let data: ThumbnailChanged = event.to_data()?;
                 sqlx::query_as::<_, (String,)>(
                     r#"
                     UPDATE iv_product SET thumbnail = $1, updated_at = $2
@@ -106,7 +106,6 @@ impl RuleHandler for ProductDetailsHandler {
                 .await?;
             }
             ProductEvent::Deleted => {
-                let id = Product::to_id(event.aggregate_id);
                 sqlx::query::<_>("DELETE FROM iv_product WHERE id = $1")
                     .bind(&id)
                     .execute(&db)
@@ -114,12 +113,47 @@ impl RuleHandler for ProductDetailsHandler {
             }
         };
 
-        Ok(None)
+        Ok(Some(event))
+    }
+}
+
+#[async_trait]
+impl RulePostHandler for ProductDetailsHandler {
+    async fn handle(&self, event: Event, ctx: ConsumerContext) -> Result<()> {
+        let publisher = ctx.extract::<Publisher>();
+        let id = Product::to_id(&event.aggregate_id);
+        let streams = vec!["index", "details"];
+
+        match event.name.parse::<ProductEvent>()? {
+            ProductEvent::Created | ProductEvent::Edited | ProductEvent::Deleted => {
+                publisher.send_all(&event.name, &id, streams).await;
+            }
+            ProductEvent::VisibilityChanged => {
+                let data: VisibilityChanged = event.to_data().unwrap();
+                publisher
+                    .send_all(
+                        format!("{}-{id}", event.name),
+                        &data.visible.to_string(),
+                        streams,
+                    )
+                    .await;
+            }
+            ProductEvent::ThumbnailChanged => {
+                let data: ThumbnailChanged = event.to_data().unwrap();
+                publisher
+                    .send_all(format!("{}-{id}", event.name), &data.thumbnail, streams)
+                    .await;
+            }
+        };
+
+        Ok(())
     }
 }
 
 pub fn product_details() -> Rule {
-    Rule::new("product-details").handler("product/**", ProductDetailsHandler)
+    Rule::new("product-details")
+        .handler("product/**", ProductDetailsHandler)
+        .post_handler(ProductDetailsHandler)
 }
 
 #[derive(Deserialize)]

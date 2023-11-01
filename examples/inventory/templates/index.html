@@ -4,7 +4,7 @@
 <div class="container mx-auto">
   <div class="grid grid-cols-2 gap-4">
     {% for edge in data.edges %}
-    <div class="card card-side bg-base-100 shadow-xl image-full h-96">
+    <div id="product-{{ edge.node.id }}" class="card card-side bg-base-100 shadow-xl image-full h-96">
       <figure>
         {% match edge.node.thumbnail %}
         {% when Some with (thumbnail) %}
@@ -39,4 +39,30 @@
     {% endfor %}
   </div>
 </div>
+{% endblock %}
+
+{% block footer %}
+<script>
+  const source = new EventSource("/events/index");
+  source.addEventListener("created", async function (event) {
+    //let req = up.request("/")
+    console.log("created")
+  })
+  source.addEventListener("edited", async function (event) {
+    console.log("edited")
+  })
+  source.addEventListener("deleted", async function (event) {
+    document.querySelector("#product-" + event.data)?.remove();
+  })
+
+  {% for edge in data.edges %}
+  source.addEventListener("visibility-changed-{{ edge.node.id }}", async function (event) {
+    //let req = up.request("/")
+    console.log("visibility")
+  })
+  source.addEventListener("thumbnail-changed-{{ edge.node.id }}", async function (event) {
+    console.log("thumbnail", event.data)
+  })
+  {% endfor %}
+</script>
 {% endblock %}
