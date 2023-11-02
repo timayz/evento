@@ -131,7 +131,11 @@ impl RulePostHandler for ProductDetailsHandler {
 
         let publisher = ctx.extract::<Publisher>();
         publisher
-            .send_all(event_name, &id, vec!["index", "details"])
+            .send_all(
+                event_name,
+                &id,
+                vec!["index", format!("details-{id}").as_str()],
+            )
             .await;
 
         Ok(())

@@ -261,7 +261,7 @@ impl RuleHandler for ProductTaskHandler {
                 for product in payload.products {
                     let id = nanoid!(10);
 
-                    let num = rand::thread_rng().gen_range(0..2000);
+                    let num = rand::thread_rng().gen_range(0..1000);
                     sleep(Duration::from_millis(num)).await;
 
                     ctx.publish_all::<Product, _>(
