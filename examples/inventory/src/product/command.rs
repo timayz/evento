@@ -1,10 +1,14 @@
+use std::time::Duration;
+
 use async_trait::async_trait;
 use evento::{
     store::{Aggregate, Event, WriteEvent},
     Command, CommandError, CommandHandler, CommandOutput, ConsumerContext, Rule, RuleHandler,
 };
 use nanoid::nanoid;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
+use tokio::time::sleep;
 use validator::Validate;
 
 use super::{
@@ -256,6 +260,9 @@ impl RuleHandler for ProductTaskHandler {
 
                 for product in payload.products {
                     let id = nanoid!(10);
+
+                    let num = rand::thread_rng().gen_range(0..2000);
+                    sleep(Duration::from_millis(num)).await;
 
                     ctx.publish_all::<Product, _>(
                         &id,

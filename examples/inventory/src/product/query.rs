@@ -120,31 +120,19 @@ impl RuleHandler for ProductDetailsHandler {
 #[async_trait]
 impl RulePostHandler for ProductDetailsHandler {
     async fn handle(&self, event: Event, ctx: ConsumerContext) -> Result<()> {
-        let publisher = ctx.extract::<Publisher>();
         let id = Product::to_id(&event.aggregate_id);
-        let streams = vec!["index", "details"];
-
-        match event.name.parse::<ProductEvent>()? {
-            ProductEvent::Created | ProductEvent::Edited | ProductEvent::Deleted => {
-                publisher.send_all(&event.name, &id, streams).await;
-            }
-            ProductEvent::VisibilityChanged => {
-                let data: VisibilityChanged = event.to_data().unwrap();
-                publisher
-                    .send_all(
-                        format!("{}-{id}", event.name),
-                        &data.visible.to_string(),
-                        streams,
-                    )
-                    .await;
-            }
-            ProductEvent::ThumbnailChanged => {
-                let data: ThumbnailChanged = event.to_data().unwrap();
-                publisher
-                    .send_all(format!("{}-{id}", event.name), &data.thumbnail, streams)
-                    .await;
-            }
+        let event_name = match event.name.parse::<ProductEvent>()? {
+            ProductEvent::Created => "created",
+            ProductEvent::Deleted => "deleted",
+            ProductEvent::Edited
+            | ProductEvent::VisibilityChanged
+            | ProductEvent::ThumbnailChanged => "updated",
         };
+
+        let publisher = ctx.extract::<Publisher>();
+        publisher
+            .send_all(event_name, &id, vec!["index", "details"])
+            .await;
 
         Ok(())
     }

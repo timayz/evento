@@ -1131,6 +1131,7 @@ dependencies = [
  "mime_guess",
  "nanoid",
  "parse-display",
+ "rand",
  "rust-embed",
  "serde",
  "sqlx",
