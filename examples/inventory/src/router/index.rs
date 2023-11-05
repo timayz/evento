@@ -9,10 +9,22 @@ use super::Query;
 #[template(path = "index.html")]
 pub struct IndexTemplate {
     pub data: QueryResult<ProductDetails>,
+    pub cursor: Option<String>,
 }
 
 pub async fn index(data: Query<ListProductDetails>) -> IndexTemplate {
-    IndexTemplate { data: data.output }
+    let cursor = match (
+        data.output.page_info.end_cursor.to_owned(),
+        data.output.page_info.has_next_page,
+    ) {
+        (Some(cursor), true) => Some(cursor.0),
+        _ => None,
+    };
+
+    IndexTemplate {
+        data: data.output,
+        cursor,
+    }
 }
 
 #[derive(Template)]

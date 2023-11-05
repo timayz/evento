@@ -1,4 +1,4 @@
-<div id="product-{{ edge.node.id }}" class="card card-side bg-base-100 shadow-xl image-full h-96">
+<div up-sse-item="{{ edge.node.id }}" class="card card-side bg-base-100 shadow-xl image-full h-96">
     <figure>
         {% match edge.node.thumbnail %}
         {% when Some with (thumbnail) %}

@@ -1,32 +1,24 @@
 {% extends "_base.html" %}
 
 {% block head %}
-<script src="/static/js/index.js"></script>
+<script src="/static/unpoly/infinite.js"></script>
+<script src="/static/unpoly/sse.js"></script>
 {% endblock %}
 
 {% block content %}
 <div class="container mx-auto">
-  <div id="products" class="grid grid-cols-2 gap-4" {% if let (Some(cursor),
-    true)=(data.page_info.end_cursor.to_owned(), data.page_info.has_next_page) %} data-cursor="{{ cursor.0 }}" {% endif
-    %}>
+  <div class="grid grid-cols-2 gap-4" up-infinite="products" up-infinite-url="/" up-sse="/events/index"
+    up-sse-fetch="/_product?id=[data]" {% if let Some(cursor)=cursor %} data-cursor="{{ cursor }}" {% endif %}>
     {% for edge in data.edges %}
     {% include "_product.html" %}
     {% endfor %}
   </div>
-  {% if let (Some(cursor), true) = (data.page_info.end_cursor.to_owned(), data.page_info.has_next_page) %}
+  {% if let Some(cursor)=cursor %}
   <noscript>
-    <a href="/?after={{ cursor.0 }}" class="btn btn-sm">
+    <a href="/?after={{ cursor }}" class="btn btn-sm">
       Next page
     </a>
   </noscript>
   {% endif %}
 </div>
-{% endblock %}
-
-{% block footer %}
-{% if data.page_info.has_next_page %}
-<script>
-  load_more_products();
-</script>
-{% endif %}
 {% endblock %}
