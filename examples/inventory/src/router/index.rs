@@ -1,7 +1,15 @@
 use askama::Template;
+use async_trait::async_trait;
+use evento::{
+    store::{Aggregate, Event},
+    ConsumerContext, RuleHandler,
+};
 use evento_query::{Edge, QueryResult};
 
-use crate::product::{GetProductDetails, ListProductDetails, ProductDetails};
+use crate::{
+    product::{GetProductDetails, ListProductDetails, Product, ProductDetails, ProductEvent},
+    Publisher,
+};
 
 use super::Query;
 
@@ -35,4 +43,26 @@ pub struct ProductTemplate {
 
 pub async fn product(data: Query<GetProductDetails>) -> ProductTemplate {
     ProductTemplate { edge: data.output }
+}
+
+#[derive(Clone)]
+pub struct IndexProductHandler;
+
+#[async_trait]
+impl RuleHandler for IndexProductHandler {
+    async fn handle(&self, event: Event, ctx: ConsumerContext) -> anyhow::Result<()> {
+        let id = Product::to_id(&event.aggregate_id);
+        let event_name = match event.name.parse::<ProductEvent>()? {
+            ProductEvent::Created => "created",
+            ProductEvent::Deleted => "deleted",
+            ProductEvent::Edited
+            | ProductEvent::VisibilityChanged
+            | ProductEvent::ThumbnailChanged => "updated",
+        };
+
+        let publisher = ctx.extract::<Publisher>();
+        publisher.send("index", event_name, &id).await;
+
+        Ok(())
+    }
 }

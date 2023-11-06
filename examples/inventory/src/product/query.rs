@@ -4,14 +4,11 @@ use chrono::{DateTime, Utc};
 use convert_case::{Case, Casing};
 use evento::{
     store::{Aggregate, Event},
-    ConsumerContext, Query, QueryError, QueryHandler, QueryOutput, Rule, RuleHandler,
-    RulePostHandler,
+    ConsumerContext, Query, QueryError, QueryHandler, QueryOutput, RuleHandler,
 };
 use evento_query::{Cursor, CursorType, Edge, PgQuery, QueryArgs, QueryResult};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-
-use crate::Publisher;
 
 use super::{Created, Edited, Product, ProductEvent, ThumbnailChanged, VisibilityChanged};
 
@@ -35,7 +32,7 @@ pub struct ProductDetailsHandler;
 
 #[async_trait]
 impl RuleHandler for ProductDetailsHandler {
-    async fn handle(&self, event: Event, ctx: ConsumerContext) -> Result<Option<Event>> {
+    async fn handle(&self, event: Event, ctx: ConsumerContext) -> Result<()> {
         let db = ctx.extract::<PgPool>();
         let event_name: ProductEvent = event.name.parse()?;
         let id = Product::to_id(&event.aggregate_id);
@@ -113,39 +110,8 @@ impl RuleHandler for ProductDetailsHandler {
             }
         };
 
-        Ok(Some(event))
-    }
-}
-
-#[async_trait]
-impl RulePostHandler for ProductDetailsHandler {
-    async fn handle(&self, event: Event, ctx: ConsumerContext) -> Result<()> {
-        let id = Product::to_id(&event.aggregate_id);
-        let event_name = match event.name.parse::<ProductEvent>()? {
-            ProductEvent::Created => "created",
-            ProductEvent::Deleted => "deleted",
-            ProductEvent::Edited
-            | ProductEvent::VisibilityChanged
-            | ProductEvent::ThumbnailChanged => "updated",
-        };
-
-        let publisher = ctx.extract::<Publisher>();
-        publisher
-            .send_all(
-                event_name,
-                &id,
-                vec!["index", format!("details-{id}").as_str()],
-            )
-            .await;
-
         Ok(())
     }
-}
-
-pub fn product_details() -> Rule {
-    Rule::new("product-details")
-        .handler("product/**", ProductDetailsHandler)
-        .post_handler(ProductDetailsHandler)
 }
 
 #[derive(Deserialize)]

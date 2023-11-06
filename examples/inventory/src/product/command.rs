@@ -3,7 +3,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use evento::{
     store::{Aggregate, Event, WriteEvent},
-    Command, CommandError, CommandHandler, CommandOutput, ConsumerContext, Rule, RuleHandler,
+    Command, CommandError, CommandHandler, CommandOutput, ConsumerContext, RuleHandler,
 };
 use nanoid::nanoid;
 use rand::Rng;
@@ -244,7 +244,7 @@ pub struct ProductTaskHandler;
 
 #[async_trait]
 impl RuleHandler for ProductTaskHandler {
-    async fn handle(&self, event: Event, ctx: ConsumerContext) -> anyhow::Result<Option<Event>> {
+    async fn handle(&self, event: Event, ctx: ConsumerContext) -> anyhow::Result<()> {
         let event_name: ProductTaskEvent = event.name.parse()?;
 
         match event_name {
@@ -289,12 +289,8 @@ impl RuleHandler for ProductTaskHandler {
             }
         };
 
-        Ok(None)
+        Ok(())
     }
-}
-
-pub fn product_task() -> Rule {
-    Rule::new("product-task").handler("product-task/**", ProductTaskHandler)
 }
 
 #[derive(Default, Serialize, Deserialize)]

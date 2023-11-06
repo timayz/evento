@@ -7,10 +7,11 @@ mod index;
 mod render;
 
 use axum::{body::Body, routing::get, Router};
+use evento::Rule;
 
 pub use render::*;
 
-use crate::AppState;
+use crate::{product::ProductRule, AppState};
 
 pub fn create() -> Router<AppState, Body> {
     Router::new()
@@ -21,4 +22,8 @@ pub fn create() -> Router<AppState, Body> {
         .route("/edit", get(edit::get).post(edit::post))
         .route("/generate", get(generate::get).post(generate::post))
         .route("/delete", get(delete::get).post(delete::post))
+}
+
+pub fn rules() -> Vec<Rule> {
+    vec![Rule::new(ProductRule::ProductDetails).handler("product/**", index::IndexProductHandler)]
 }

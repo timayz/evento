@@ -4,6 +4,10 @@ up.compiler("[up-infinite]", function (el) {
   url = url + (url.includes("?") ? "&" : "?");
 
   function fn() {
+    if (!el?.lastElementChild || !el?.dataset.cursor) {
+      return;
+    }
+
     new IntersectionObserver(async (entries, observer) => {
       const entry = entries.find((entry) => entry.isIntersecting);
       if (!entry) {

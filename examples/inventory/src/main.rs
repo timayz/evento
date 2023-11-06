@@ -54,8 +54,8 @@ async fn main() -> Result<()> {
 
     let producer = PgConsumer::new(&db)
         .data(publisher.clone())
-        .rule(product::product_details())
-        .rule(product::product_task())
+        .rules(product::rules())
+        .rules(router::rules())
         .start(0)
         .await?;
 
@@ -149,11 +149,10 @@ impl Publisher {
 
     pub async fn send_all(
         &self,
+        streams: Vec<impl AsRef<str>>,
         event: impl AsRef<str>,
         data: impl AsRef<str>,
-        streams: Vec<impl AsRef<str>>,
     ) {
-
         let fut = streams
             .iter()
             .map(|stream| self.send(stream, event.as_ref(), data.as_ref()))
