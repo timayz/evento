@@ -1,7 +1,7 @@
 mod command;
 mod event;
-mod rule;
 mod query;
+mod rule;
 
 pub use command::*;
 pub use event::*;
