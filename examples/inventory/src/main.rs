@@ -121,8 +121,10 @@ async fn sse_handler(
     )
 }
 
+pub type PublisherSender = Sender<Result<Event, Infallible>>;
+
 #[derive(Debug, Clone)]
-pub struct Publisher(Arc<RwLock<HashMap<String, Vec<Sender<Result<Event, Infallible>>>>>>);
+pub struct Publisher(Arc<RwLock<HashMap<String, Vec<PublisherSender>>>>);
 
 impl Publisher {
     pub async fn send(
