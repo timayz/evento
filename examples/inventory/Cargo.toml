@@ -6,7 +6,6 @@ edition = "2021"
 [dependencies]
 askama = { version = "0.12.1", default-features = false, features = ["with-axum", "mime", "mime_guess"] }
 askama_axum = "0.3.0"
-tracing = "0.1.39"
 tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
 axum = "0.6.20"
 tokio = { version = "1.33.0", features = ["rt-multi-thread", "macros"] }
