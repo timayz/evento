@@ -1,31 +1,33 @@
 <!DOCTYPE html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Evento Payment</title>
-    <link rel="stylesheet" href="/static/main.css" crossorigin="anonymous" />
-    <script
-      src="https://unpkg.com/htmx.org@1.9.6/dist/htmx.min.js"
-      crossorigin="anonymous"
-    ></script>
-    <script
-      src="https://unpkg.com/hyperscript.org@0.9.11/dist/_hyperscript.min.js"
-      crossorigin="anonymous"
-    ></script>
-    <script
-      src="https://unpkg.com/htmx.org@1.9.6/dist/ext/sse.js"
-      crossorigin="anonymous"
-    ></script>
-    <script>
-      htmx.on("beforeSwap", function (t) {
-        (422 === t.detail.xhr.status || 400 === t.detail.xhr.status) &&
-          ((t.detail.shouldSwap = !0), (t.detail.isError = !1));
-      });
-    </script>
-    {% block head %}{% endblock %}
-  </head>
-  <body>
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Evento Payment</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/unpoly@3.3.0/unpoly.min.css" />
+  <link rel="stylesheet" href="/static/main.css" crossorigin="anonymous" />
+
+  <script src="https://cdn.jsdelivr.net/npm/unpoly@3.3.0/unpoly.min.js"></script>
+  {% block head %}{% endblock %}
+</head>
+
+<body>
+  <div class="container mx-auto">
+    <div class="navbar">
+      <div class="navbar-start">
+        <a href="/" class="btn btn-ghost normal-case text-xl" up-follow>Payment</a>
+      </div>
+      <div class="navbar-end">
+        <a href="/orders" class="btn btn-primary btn-sm" up-layer="new" up-accept-location="/">
+          Orders
+        </a>
+      </div>
+    </div>
+  </div>
+  <main>
     {% block content %}{% endblock %}
-  </body>
+  </main>
+</body>
+
 </html>

@@ -1,4 +1,7 @@
 mod index;
+mod render;
+
+pub use render::*;
 
 use axum::{body::Body, routing::get, Router};
 

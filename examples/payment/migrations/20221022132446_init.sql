@@ -12,7 +12,7 @@ CREATE INDEX ON ev_event (aggregate_id);
 CREATE INDEX ON ev_event USING gin (metadata jsonb_path_ops);
 CREATE UNIQUE INDEX ON ev_event (aggregate_id, version);
 
-CREATE TABLE IF NOT EXISTS ev_deadletter AS TABLE ev_event WITH NO DATA;
+CREATE TABLE IF NOT EXISTS ev_deadletter_event AS TABLE ev_event WITH NO DATA;
 
 CREATE TABLE IF NOT EXISTS ev_queue (
     id UUID NOT NULL PRIMARY KEY,

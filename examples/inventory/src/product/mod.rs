@@ -1,5 +1,5 @@
 mod command;
-mod event;
+pub mod event;
 mod query;
 mod rule;
 
