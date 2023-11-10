@@ -11,7 +11,7 @@ pub struct NotFoundTemplate;
 #[template(path = "_500.html")]
 pub struct ServerErrorTemplate;
 
-pub type Command<T> = evento_axum::Command<T, Render>;
+// pub type Command<T> = evento_axum::Command<T, Render>;
 pub type Query<T> = evento_axum::Query<T, Render, <T as QueryHandler>::Output>;
 
 pub struct Render;
