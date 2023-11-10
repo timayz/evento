@@ -28,8 +28,10 @@ impl Query {
     pub fn get<T: Clone + 'static>(&self) -> Option<T> {
         self.inner.read().get::<T>().cloned()
     }
+}
 
-    pub async fn execute<I>(&self, input: &I) -> Result<I::Output, QueryError>
+impl Query {
+    pub async fn execute<I, T>(&self, input: &I) -> Result<I::Output, QueryError>
     where
         I: QueryHandler,
     {

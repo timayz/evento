@@ -1,6 +1,6 @@
 use askama::Template;
 use askama_axum::{IntoResponse, Response};
-// use evento::QueryHandler;
+use evento::QueryHandler;
 use http::StatusCode;
 
 #[derive(Template)]
@@ -12,7 +12,7 @@ pub struct NotFoundTemplate;
 pub struct ServerErrorTemplate;
 
 // pub type Command<T> = evento_axum::Command<T, Render>;
-// pub type Query<T> = evento_axum::Query<T, Render, <T as QueryHandler>::Output>;
+pub type Query<T> = evento_axum::Query<T, Render, <T as QueryHandler>::Output>;
 
 pub struct Render;
 

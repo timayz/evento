@@ -1,21 +1,17 @@
-mod extract;
-//mod lang;
 mod product;
 mod router;
 
 use std::{collections::HashMap, convert::Infallible, str::FromStr, sync::Arc, time::Duration};
 
 use anyhow::Result;
-use askama::Template;
-use askama_axum::IntoResponse;
 use axum::{
     extract::{Path, State},
-    http::{header, StatusCode, Uri},
-    response::{sse::Event, Sse},
+    response::{sse::Event, IntoResponse, Sse},
     routing::get,
     Extension,
 };
 use evento::{Command, PgConsumer, Producer, Query};
+use http::{header, StatusCode, Uri};
 use rust_embed::RustEmbed;
 use sqlx::{migrate::MigrateDatabase, Any, PgPool};
 use tokio::{
@@ -29,14 +25,6 @@ use tokio_stream::{wrappers::ReceiverStream, Stream};
 use tracing_subscriber::{
     prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt, EnvFilter,
 };
-
-#[derive(Template)]
-#[template(path = "_404.html")]
-pub struct NotFoundTemplate;
-
-#[derive(Template)]
-#[template(path = "_500.html")]
-pub struct ServerErrorTemplate;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -85,11 +73,11 @@ async fn main() -> Result<()> {
             publisher,
         });
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    let addr = "0.0.0.0:3000".parse()?;
 
-    axum::serve(listener, app.into_make_service())
-        .await
-        .unwrap();
+    axum::Server::bind(&addr)
+        .serve(app.into_make_service())
+        .await?;
 
     Ok(())
 }

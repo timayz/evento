@@ -1,10 +1,11 @@
 use askama::Template;
 use askama_axum::IntoResponse;
-use axum::{http::StatusCode, Extension, Form};
-use evento::{Command, CommandError};
+use http::StatusCode;
 use std::collections::HashMap;
 
-use crate::{lang::UserLanguage, product::GenerateProductsInput};
+use crate::product::GenerateProductsInput;
+
+use super::Command;
 
 #[derive(Template)]
 #[template(path = "generate.html")]
@@ -20,25 +21,17 @@ pub async fn get() -> GenerateTemplate {
     }
 }
 
-pub async fn post(
-    Extension(cmd): Extension<Command>,
-    UserLanguage(lang): UserLanguage,
-    Form(input): Form<GenerateProductsInput>,
-) -> impl IntoResponse {
-    let Err(err) = cmd.execute(lang, &input).await else {
-        return ([("Location", "/")], StatusCode::FOUND).into_response();
-    };
-
-    if let CommandError::Validation(errors) = err {
+pub async fn post(cmd: Command<GenerateProductsInput>) -> impl IntoResponse {
+    if let Err(errors) = cmd.output {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
             GenerateTemplate {
                 errors,
-                skip: input.skip,
+                skip: cmd.input.skip,
             },
         )
             .into_response();
     }
 
-    crate::extract::Error::Command(err).into_response()
+    ([("Location", "/")], StatusCode::FOUND).into_response()
 }

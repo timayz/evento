@@ -10,8 +10,5 @@ members = [
     "./examples/*"
 ]
 
-[profile.dev]
-opt-level = 1
-
-[profile.dev.package."*"]
+[profile.dev.package.askama_derive]
 opt-level = 3

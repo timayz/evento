@@ -17,8 +17,9 @@ impl PgConsumer {
         Self::create(
             Pg::new(pool),
             PgStore::create(pool),
-            PgStore::with_prefix(pool, "deadletter"),
+            PgStore::with_prefix(pool, "ev_deadletter"),
         )
+        .data(pool.clone())
     }
 
     pub fn prefix(mut self, prefix: impl Into<String>) -> Self {

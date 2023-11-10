@@ -1,12 +1,12 @@
 mod index;
-// mod render;
+mod render;
 
-// pub use render::*;
+pub use render::*;
 
-use axum::{routing::get, Router};
+use axum::{body::Body, routing::get, Router};
 
 use crate::AppState;
 
-pub fn create() -> Router<AppState> {
+pub fn create() -> Router<AppState, Body> {
     Router::new().route("/", get(index::index))
 }

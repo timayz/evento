@@ -2,9 +2,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use evento::{
-    store::{Applier, Event, WriteEvent},
-    Aggregate, Command, CommandError, CommandHandler, CommandOutput, ConsumerContext, Publisher,
-    RuleHandler,
+    store::{Aggregate, Event, WriteEvent},
+    Command, CommandError, CommandHandler, CommandOutput, ConsumerContext, RuleHandler,
 };
 use nanoid::nanoid;
 use rand::Rng;
@@ -29,11 +28,13 @@ impl CommandHandler for CreateProductInput {
         let id = nanoid!(10);
 
         let events = cmd
-            .write(&id)
-            .event(Created {
-                name: self.name.to_owned(),
-            })?
-            .commit::<Product>()
+            .publish::<Product, _>(
+                &id,
+                ProductEvent::Created.data(Created {
+                    name: self.name.to_owned(),
+                })?,
+                0,
+            )
             .await?;
 
         Ok(events)
@@ -49,11 +50,14 @@ pub struct DeleteProductInput {
 #[async_trait]
 impl CommandHandler for DeleteProductInput {
     async fn handle(&self, cmd: &Command) -> CommandOutput {
-        let (_, publisher) = load_product(cmd, &self.id).await?;
+        let (_, original_version) = load_product(cmd, &self.id).await?;
 
-        let events = publisher
-            .event(Deleted { deleted: true })?
-            .commit::<Product>()
+        let events = cmd
+            .publish::<Product, _>(
+                &self.id,
+                ProductEvent::Deleted.data(Deleted { deleted: true })?,
+                original_version,
+            )
             .await?;
 
         Ok(events)
@@ -70,13 +74,16 @@ pub struct ChangeProductVisibilityInput {
 #[async_trait]
 impl CommandHandler for ChangeProductVisibilityInput {
     async fn handle(&self, cmd: &Command) -> CommandOutput {
-        let (_, publisher) = load_product(cmd, &self.id).await?;
+        let (_, original_version) = load_product(cmd, &self.id).await?;
 
-        let events = publisher
-            .event(VisibilityChanged {
-                visible: self.visible,
-            })?
-            .commit::<Product>()
+        let events = cmd
+            .publish::<Product, _>(
+                &self.id,
+                ProductEvent::VisibilityChanged.data(VisibilityChanged {
+                    visible: self.visible,
+                })?,
+                original_version,
+            )
             .await?;
 
         Ok(events)
@@ -97,36 +104,36 @@ pub struct EditProductInput {
     pub visible: Option<String>,
     #[validate(range(min = 0))]
     pub stock: i32,
-    #[validate(range(min = 0.0))]
+    #[validate(range(min = 0))]
     pub price: f32,
 }
 
 #[async_trait]
 impl CommandHandler for EditProductInput {
     async fn handle(&self, cmd: &Command) -> CommandOutput {
-        let (_, publisher) = load_product(cmd, &self.id).await?;
+        let (_, original_version) = load_product(cmd, &self.id).await?;
 
-        let events = publisher
-            .event(Edited {
-                name: self.name.to_owned(),
-                description: self.description.to_owned(),
-                category: self.category.to_owned(),
-                price: self.price,
-                stock: self.stock,
-                visible: self.visible.is_some(),
-            })?
-            .commit::<Product>()
+        let events = cmd
+            .publish::<Product, _>(
+                &self.id,
+                ProductEvent::Edited.data(Edited {
+                    name: self.name.to_owned(),
+                    description: self.description.to_owned(),
+                    category: self.category.to_owned(),
+                    price: self.price,
+                    stock: self.stock,
+                    visible: self.visible.is_some(),
+                })?,
+                original_version,
+            )
             .await?;
 
         Ok(events)
     }
 }
 
-async fn load_product<'a>(
-    cmd: &'a Command,
-    id: &str,
-) -> Result<(Product, Publisher<'a>), CommandError> {
-    let Some((product, original_version)) = cmd.load::<Product, _>(id).await? else {
+async fn load_product(ctx: &Command, id: &str) -> Result<(Product, u16), CommandError> {
+    let Some((product, e)) = ctx.load::<Product, _>(id).await? else {
         return Err(CommandError::NotFound(format!("product {id} not found")));
     };
 
@@ -134,10 +141,10 @@ async fn load_product<'a>(
         return Err(CommandError::NotFound(format!("product {id} not found")));
     }
 
-    Ok((product, cmd.write(id).original_version(original_version)))
+    Ok((product, e))
 }
 
-#[derive(Default, Serialize, Deserialize, Aggregate)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct Product {
     pub name: String,
     pub description: String,
@@ -149,7 +156,7 @@ pub struct Product {
     pub deleted: bool,
 }
 
-impl Applier for Product {
+impl Aggregate for Product {
     fn apply(&mut self, event: &Event) {
         let product_event: ProductEvent = event.name.parse().unwrap();
 
@@ -180,6 +187,10 @@ impl Applier for Product {
             }
         }
     }
+
+    fn aggregate_type<'a>() -> &'a str {
+        "product"
+    }
 }
 
 impl ProductEvent {
@@ -200,11 +211,13 @@ impl CommandHandler for GenerateProductsInput {
         let id = nanoid!(10);
 
         let events = cmd
-            .write(&id)
-            .event(GenerateProductsRequested {
-                skip: self.skip.to_owned(),
-            })?
-            .commit::<ProductTask>()
+            .publish::<ProductTask, _>(
+                &id,
+                ProductTaskEvent::GenerateProductsRequested.data(GenerateProductsRequested {
+                    skip: self.skip.to_owned(),
+                })?,
+                0,
+            )
             .await?;
 
         Ok(events)
@@ -251,23 +264,27 @@ impl RuleHandler for ProductTaskHandler {
                     let num = rand::thread_rng().gen_range(0..1000);
                     sleep(Duration::from_millis(num)).await;
 
-                    ctx.write(&id)
-                        .event(Created {
-                            name: product.title.to_owned(),
-                        })?
-                        .event(Edited {
-                            name: product.title.to_owned(),
-                            description: product.description.to_owned(),
-                            price: product.price.to_owned(),
-                            category: product.category.to_owned(),
-                            stock: product.stock.to_owned(),
-                            visible: true,
-                        })?
-                        .event(ThumbnailChanged {
-                            thumbnail: product.thumbnail.to_owned(),
-                        })?
-                        .commit::<Product>()
-                        .await?;
+                    ctx.publish_all::<Product, _>(
+                        &id,
+                        vec![
+                            ProductEvent::Created.data(Created {
+                                name: product.title.to_owned(),
+                            })?,
+                            ProductEvent::Edited.data(Edited {
+                                name: product.title.to_owned(),
+                                description: product.description.to_owned(),
+                                price: product.price.to_owned(),
+                                category: product.category.to_owned(),
+                                stock: product.stock.to_owned(),
+                                visible: true,
+                            })?,
+                            ProductEvent::ThumbnailChanged.data(ThumbnailChanged {
+                                thumbnail: product.thumbnail.to_owned(),
+                            })?,
+                        ],
+                        0,
+                    )
+                    .await?;
                 }
             }
         };
@@ -276,12 +293,16 @@ impl RuleHandler for ProductTaskHandler {
     }
 }
 
-#[derive(Default, Serialize, Deserialize, Aggregate)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct ProductTask;
 
-impl Applier for ProductTask {
+impl Aggregate for ProductTask {
     fn apply(&mut self, _event: &Event) {
         unreachable!();
+    }
+
+    fn aggregate_type<'a>() -> &'a str {
+        "product-task"
     }
 }
 

@@ -1,5 +1,5 @@
 use crate::user_lang::UserLanguageSource;
-use axum::{async_trait, extract::Query, http::request::Parts, RequestPartsExt};
+use axum::{async_trait, extract::Query, RequestPartsExt};
 use std::collections::HashMap;
 
 /// TBD
@@ -18,7 +18,7 @@ impl QuerySource {
 
 #[async_trait]
 impl UserLanguageSource for QuerySource {
-    async fn languages_from_parts(&self, parts: &mut Parts) -> Vec<String> {
+    async fn languages_from_parts(&self, parts: &mut http::request::Parts) -> Vec<String> {
         let Ok(query) = parts.extract::<Query<HashMap<String, String>>>().await else {
             return vec![];
         };

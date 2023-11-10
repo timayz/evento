@@ -2,7 +2,7 @@ mod en;
 mod fr;
 
 use async_trait::async_trait;
-use evento_store::{Aggregate, Applier, Event, Result as StoreResult};
+use evento_store::{Aggregate, Event, Result as StoreResult, WriteEvent};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tracing::{error, warn};
 use validator::{Validate, ValidationError, ValidationErrors, ValidationErrorsKind};
 
-use crate::{context::Context, Producer, Publisher};
+use crate::{context::Context, Producer};
 
 #[derive(Clone)]
 pub struct Command {
@@ -39,11 +39,28 @@ impl Command {
         self.inner.read().get::<T>().cloned()
     }
 
-    pub fn write(&self, value: impl Into<String>) -> Publisher<'_> {
-        self.producer.write(value)
+    pub async fn publish<A: Aggregate, I: Into<String>>(
+        &self,
+        id: I,
+        event: WriteEvent,
+        original_version: u16,
+    ) -> StoreResult<Vec<Event>> {
+        self.publish_all::<A, I>(id, vec![event], original_version)
+            .await
     }
 
-    pub async fn load<A: Aggregate + Applier, I: Into<String>>(
+    pub async fn publish_all<A: Aggregate, I: Into<String>>(
+        &self,
+        id: I,
+        events: Vec<WriteEvent>,
+        original_version: u16,
+    ) -> StoreResult<Vec<Event>> {
+        self.producer
+            .publish_all::<A, I>(id, events, original_version)
+            .await
+    }
+
+    pub async fn load<A: Aggregate, I: Into<String>>(
         &self,
         id: I,
     ) -> StoreResult<Option<(A, u16)>> {
@@ -89,7 +106,7 @@ pub type CommandOutput = Result<Vec<Event>, CommandError>;
 
 #[async_trait]
 pub trait CommandHandler {
-    async fn handle(&self, cmd: &Command) -> CommandOutput;
+    async fn handle(&self, ctx: &Command) -> CommandOutput;
 }
 
 fn display_error(translater: &impl Translater, err: &ValidationError) -> String {

@@ -1,5 +1,5 @@
 use crate::user_lang::UserLanguageSource;
-use axum::{async_trait, http::request::Parts};
+use axum::async_trait;
 use std::cmp::Ordering;
 
 /// TBD
@@ -8,7 +8,7 @@ pub struct AcceptLanguageSource;
 
 #[async_trait]
 impl UserLanguageSource for AcceptLanguageSource {
-    async fn languages_from_parts(&self, parts: &mut Parts) -> Vec<String> {
+    async fn languages_from_parts(&self, parts: &mut http::request::Parts) -> Vec<String> {
         let Some(accept_language) = parts.headers.get("Accept-Language") else {
             return vec![];
         };

@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use evento::{Consumer, ConsumerContext, Engine, Producer, Rule, RuleHandler, RulePostHandler};
+use evento::{Consumer, ConsumerContext, Engine, Producer, Rule, RuleHandler};
 use evento_store::{Aggregate, Event, Store, WriteEvent};
 use parse_display::{Display, FromStr};
 use serde::{Deserialize, Serialize};
@@ -83,7 +83,7 @@ struct UsersHandler(bool);
 
 #[async_trait]
 impl RuleHandler for UsersHandler {
-    async fn handle(&self, event: Event, ctx: ConsumerContext) -> Result<Option<Event>> {
+    async fn handle(&self, event: Event, ctx: ConsumerContext) -> Result<()> {
         let state = ctx.extract::<ConsumerState>();
         let user_event: UserEvent = event.name.parse().unwrap();
 
@@ -96,14 +96,12 @@ impl RuleHandler for UsersHandler {
                     deleted: false,
                 };
                 users.insert(User::to_id(&event.aggregate_id), user.clone());
-
-                Ok(Some(event.data(user)?))
             }
             UserEvent::DisplayNameUpdated => {
                 let mut users = state.users.write().await;
                 let data: DisplayNameUpdated = event.to_data().unwrap();
                 let Some(user) = users.get_mut(User::to_id(&event.aggregate_id).as_str()) else {
-                    return Ok(None);
+                    return Ok(());
                 };
 
                 user.display_name = if self.0 {
@@ -115,33 +113,11 @@ impl RuleHandler for UsersHandler {
                 } else {
                     data.display_name
                 };
-
-                Ok(Some(event.data(user)?))
             }
             UserEvent::AccountDeleted => {
                 let mut users = state.users.write().await;
                 users.remove(User::to_id(&event.aggregate_id).as_str());
-
-                Ok(None)
             }
-        }
-    }
-}
-
-#[async_trait]
-impl RulePostHandler for UsersHandler {
-    async fn handle(&self, event: Event, ctx: ConsumerContext) -> Result<()> {
-        let state = ctx.extract::<ConsumerState>();
-        let user_event: UserEvent = event.name.parse().unwrap();
-
-        match user_event {
-            UserEvent::Created | UserEvent::DisplayNameUpdated => {
-                let mut users: tokio::sync::RwLockWriteGuard<'_, HashMap<String, User>> =
-                    state.post_users.write().await;
-                let data: User = event.to_data().unwrap();
-                users.insert(User::to_id(&event.aggregate_id), data);
-            }
-            _ => {}
         };
 
         Ok(())
@@ -153,7 +129,7 @@ struct UsersCheckDisplayNameHandler;
 
 #[async_trait]
 impl RuleHandler for UsersCheckDisplayNameHandler {
-    async fn handle(&self, event: Event, ctx: ConsumerContext) -> Result<Option<Event>> {
+    async fn handle(&self, event: Event, ctx: ConsumerContext) -> Result<()> {
         let state = ctx.extract::<ConsumerState>();
         let user_event: UserEvent = event.name.parse().unwrap();
 
@@ -166,14 +142,12 @@ impl RuleHandler for UsersCheckDisplayNameHandler {
                     deleted: false,
                 };
                 users.insert(User::to_id(&event.aggregate_id), user.clone());
-
-                Ok(Some(event.data(user)?))
             }
             UserEvent::DisplayNameUpdated => {
                 let mut users = state.users.write().await;
                 let data: DisplayNameUpdated = event.to_data().unwrap();
                 let Some(user) = users.get_mut(User::to_id(&event.aggregate_id).as_str()) else {
-                    return Ok(None);
+                    return Ok(());
                 };
 
                 if user.display_name == "Albert" {
@@ -181,16 +155,14 @@ impl RuleHandler for UsersCheckDisplayNameHandler {
                 }
 
                 user.display_name = data.display_name;
-
-                Ok(Some(event.data(user)?))
             }
             UserEvent::AccountDeleted => {
                 let mut users = state.users.write().await;
                 users.remove(User::to_id(&event.aggregate_id).as_str());
-
-                Ok(None)
             }
-        }
+        };
+
+        Ok(())
     }
 }
 
@@ -199,7 +171,7 @@ struct UsersCountHandler;
 
 #[async_trait]
 impl RuleHandler for UsersCountHandler {
-    async fn handle(&self, event: Event, ctx: ConsumerContext) -> Result<Option<Event>> {
+    async fn handle(&self, event: Event, ctx: ConsumerContext) -> Result<()> {
         let state = ctx.extract::<ConsumerState>();
         let user_event: UserEvent = event.name.parse().unwrap();
 
@@ -207,14 +179,13 @@ impl RuleHandler for UsersCountHandler {
             state.users_count.fetch_add(1, Ordering::SeqCst);
         };
 
-        Ok(None)
+        Ok(())
     }
 }
 
 #[derive(Default, Clone)]
 struct ConsumerState {
     users: Users,
-    post_users: Users,
     users_count: Arc<AtomicU8>,
 }
 
@@ -222,9 +193,7 @@ pub async fn test_multiple_consumer<E: Engine + Clone + 'static>(
     consumer: &Consumer<E>,
 ) -> Result<()> {
     let state = ConsumerState::default();
-    let users_rule = Rule::new("users")
-        .handler("user/**", UsersHandler(true))
-        .post_handler(UsersHandler(true));
+    let users_rule = Rule::new("users").handler("user/**", UsersHandler(true));
 
     let eu_west_3a = consumer
         .name("eu-west-3a")
@@ -341,63 +310,6 @@ pub async fn test_multiple_consumer<E: Engine + Clone + 'static>(
         user2.display_name,
         "Albert from us-east-1a owned by eu-west-3b".to_owned()
     );
-
-    Ok(())
-}
-
-pub async fn test_post_handler<E: Engine + Clone + 'static>(
-    consumer: &Consumer<E>,
-    with_name: bool,
-) -> Result<()> {
-    let state = ConsumerState::default();
-    let users_rule = Rule::new("users")
-        .handler("user/1/*", UsersHandler(false))
-        .handler("user/2/*", UsersHandler(false))
-        .handler("user/[!1-2]/*", UsersHandler(false))
-        .post_handler(UsersHandler(false))
-        .post_handler(UsersHandler(false));
-
-    let consumer = if with_name {
-        consumer.name("eu-west-3a")
-    } else {
-        consumer.clone()
-    };
-
-    let producer = consumer
-        .data(state.clone())
-        .rule(users_rule.clone())
-        .start(0)
-        .await?;
-
-    init(&producer).await?;
-
-    sleep(Duration::from_millis(300)).await;
-
-    let (john, albert, nina) = {
-        let users = state.users.read().await;
-        (
-            users.get("1").cloned().unwrap(),
-            users.get("2").cloned().unwrap(),
-            users.get("3").cloned().unwrap(),
-        )
-    };
-
-    assert_eq!(john.display_name, "John".to_owned());
-    assert_eq!(albert.display_name, "Albert Dupont".to_owned());
-    assert_eq!(nina.display_name, "Nina Doe".to_owned());
-
-    let (john, albert, nina) = {
-        let users = state.post_users.read().await;
-        (
-            users.get("1").cloned().unwrap(),
-            users.get("2").cloned().unwrap(),
-            users.get("3").cloned(),
-        )
-    };
-
-    assert_eq!(john.display_name, "John".to_owned());
-    assert_eq!(albert.display_name, "Albert Dupont".to_owned());
-    assert_eq!(nina, None);
 
     Ok(())
 }

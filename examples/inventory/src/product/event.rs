@@ -1,8 +1,7 @@
-use evento::PublisherEvent;
 use parse_display::{Display, FromStr};
 use serde::{Deserialize, Serialize};
 
-#[derive(Display, FromStr, PublisherEvent)]
+#[derive(Display, FromStr)]
 #[display(style = "kebab-case")]
 pub enum ProductEvent {
     Created,
@@ -10,6 +9,12 @@ pub enum ProductEvent {
     Edited,
     VisibilityChanged,
     ThumbnailChanged,
+}
+
+impl From<ProductEvent> for String {
+    fn from(p: ProductEvent) -> Self {
+        p.to_string()
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -42,10 +47,16 @@ pub struct ThumbnailChanged {
     pub thumbnail: String,
 }
 
-#[derive(Display, FromStr, PublisherEvent)]
+#[derive(Display, FromStr)]
 #[display(style = "kebab-case")]
 pub enum ProductTaskEvent {
     GenerateProductsRequested,
+}
+
+impl From<ProductTaskEvent> for String {
+    fn from(p: ProductTaskEvent) -> Self {
+        p.to_string()
+    }
 }
 
 #[derive(Serialize, Deserialize)]

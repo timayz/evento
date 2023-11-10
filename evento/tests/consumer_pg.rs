@@ -107,24 +107,6 @@ async fn deadletter_with_name() {
 
 #[tokio_shared_rt::test]
 #[traced_test]
-async fn post_handler() {
-    let pool = get_pool().await;
-    let consumer = PgConsumer::new(pool).prefix("post_handler");
-
-    consumer::test_post_handler(&consumer, false).await.unwrap();
-}
-
-#[tokio_shared_rt::test]
-#[traced_test]
-async fn post_handler_with_name() {
-    let pool = get_pool().await;
-    let consumer = PgConsumer::new(pool).prefix("post_handler_with_name");
-
-    consumer::test_post_handler(&consumer, true).await.unwrap();
-}
-
-#[tokio_shared_rt::test]
-#[traced_test]
 async fn external_store() {
     let pool = get_pool().await;
     let consumer = PgConsumer::new(pool).prefix("external_store");
