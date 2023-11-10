@@ -4,11 +4,11 @@ use evento::{
     store::{Aggregate, Event},
     ConsumerContext, RuleHandler,
 };
-use evento_query::{QueryResult, Edge};
+use evento_query::{Edge, QueryResult};
 use inventory::product::{Product, ProductEvent};
 
 use crate::{
-    product::{ListProductDetails, ProductDetails, GetProductDetails},
+    product::{GetProductDetails, ListProductDetails, ProductDetails},
     Publisher,
 };
 

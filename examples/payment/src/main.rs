@@ -1,12 +1,13 @@
 mod router;
 
-use std::{collections::HashMap, convert::Infallible, sync::Arc, time::Duration, str::FromStr};
+use std::{collections::HashMap, convert::Infallible, str::FromStr, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use axum::{
     extract::{Path, State},
     response::{sse::Event, IntoResponse, Sse},
-    routing::get, Extension,
+    routing::get,
+    Extension,
 };
 use evento::{Command, PgConsumer, Producer, Query};
 use http::{header, StatusCode, Uri};
@@ -20,7 +21,9 @@ use tokio::{
     time::{interval_at, Instant},
 };
 use tokio_stream::{wrappers::ReceiverStream, Stream};
-use tracing_subscriber::{EnvFilter, prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{
+    prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt, EnvFilter,
+};
 
 #[derive(Clone)]
 pub struct AppState {

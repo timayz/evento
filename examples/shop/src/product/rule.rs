@@ -1,7 +1,7 @@
 use evento::store::PgStore;
 use evento::Rule;
 use parse_display::{Display, FromStr};
-use sqlx::{PgPool, Any, migrate::MigrateDatabase};
+use sqlx::{migrate::MigrateDatabase, Any, PgPool};
 
 use crate::product::ProductDetailsHandler;
 
