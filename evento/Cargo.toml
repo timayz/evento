@@ -28,6 +28,7 @@ futures-util = "0.3.28"
 glob-match = "0.2.1"
 dyn-clone = "1.0.14"
 async-trait = "0.1.73"
+validator = "0.16.1"
 evento-store = { path = "../evento-store", version = "1.0.0-alpha.1" }
 
 [dependencies.uuid]

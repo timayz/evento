@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Evento Payment</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/unpoly@3.3.0/unpoly.min.css" />
+  <link rel="stylesheet" href="/static/main.css" crossorigin="anonymous" />
+
+  <script src="https://cdn.jsdelivr.net/npm/unpoly@3.3.0/unpoly.min.js"></script>
+  {% block head %}{% endblock %}
+</head>
+
+<body>
+  <div class="container mx-auto">
+    <div class="navbar">
+      <div class="navbar-start">
+        <a href="/" class="btn btn-ghost normal-case text-xl" up-follow>Payment</a>
+      </div>
+      <div class="navbar-center">
+        <ul class="menu menu-horizontal px-1">
+          <li><a href="http://localhost:3000">Shop</a></li>
+          <li><a href="http://localhost:3002">Inventory</a></li>
+        </ul>
+      </div>
+      <div class="navbar-end">
+        <a href="/orders" class="btn btn-primary btn-sm" up-layer="new" up-accept-location="/">
+          Orders
+        </a>
+      </div>
+    </div>
+  </div>
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+</body>
+
+</html>

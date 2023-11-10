@@ -1,0 +1,32 @@
+<div up-sse-item="{{ edge.node.id }}" class="card card-side bg-base-100 shadow-xl image-full h-96">
+    <figure>
+        {% match edge.node.thumbnail %}
+        {% when Some with (thumbnail) %}
+        <img height="320" width="320" src="{{ thumbnail }}" alt="Product" loading="lazy" />
+        {% when None %}
+        <img src="https://source.unsplash.com/random/320x230" alt="Product" loading="lazy" />
+        {% endmatch %}
+    </figure>
+    <div class="card-body">
+        <h2 class="card-title">{{ edge.node.name|e }}</h2>
+        <p>
+            {% if let Some(description) = edge.node.description %}
+            {{ description }}
+            {% endif %}
+        </p>
+        <div class="card-actions justify-end">
+            <a href="/details?id={{ edge.node.id }}" class="btn" up-layer="new drawer" up-position="right"
+                up-accept-location="/">
+                View
+            </a>
+            <a href="/edit?id={{ edge.node.id }}" class="btn btn-secondary" up-layer="new drawer" up-position="right"
+                up-accept-location="/">
+                Edit
+            </a>
+            <a href="/delete?id={{ edge.node.id }}" class="btn btn-error" up-layer="new drawer" up-position="right"
+                up-accept-location="/">
+                Delete
+            </a>
+        </div>
+    </div>
+</div>

@@ -47,3 +47,26 @@ audit: advisory.clean
 
 outdated:
 	cargo outdated
+
+dev:
+	$(MAKE) _dev -j6
+
+_dev: serve.shop serve.inventory serve.payment tailwind.shop tailwind.inventory tailwind.payment
+
+serve.shop:
+	cargo watch -x 'run -p shop'
+
+serve.inventory:
+	cargo watch -x 'run -p inventory'
+
+serve.payment:
+	cargo watch -x 'run -p payment'
+
+tailwind.shop:
+	npx tailwindcss -i ./examples/shop/style/tailwind.css -o ./examples/shop/public/main.css --watch
+
+tailwind.inventory:
+	npx tailwindcss -i ./examples/inventory/style/tailwind.css -o ./examples/inventory/public/main.css --watch
+
+tailwind.payment:
+	npx tailwindcss -i ./examples/payment/style/tailwind.css -o ./examples/payment/public/main.css --watch
