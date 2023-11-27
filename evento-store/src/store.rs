@@ -57,6 +57,21 @@ impl Store {
         Ok(Some((aggregate, version)))
     }
 
+    // @TODO: StoreWritter
+    // constructor aggregate id + original version
+    // trait to get event name from event data ? 
+    // func to add event to list
+    // func to set metadata
+    // func execute to bind metadata to events and write to store
+
+    // @TODO: snapshot load
+    // skip if snapshot version not match 
+
+    // @TODO: snapshot write
+    // store snapshot in event table at version 0 of aggregate ?
+    // with snapshot version in metadata ?
+    // load then create or replace snapshot of aggregate
+
     pub async fn write<A: Aggregate>(
         &self,
         aggregate_id: impl Into<String>,
