@@ -388,6 +388,7 @@ pub struct Queue {
     pub created_at: DateTime<Utc>,
 }
 
+// @TODO: macros for handler
 #[async_trait]
 pub trait RuleHandler: DynClone + Send + Sync {
     async fn handle(&self, event: Event, ctx: ConsumerContext) -> Result<()>;
