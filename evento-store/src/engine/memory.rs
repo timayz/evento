@@ -165,6 +165,15 @@ impl Engine for MemoryStore {
         Ok(QueryResult { edges, page_info })
     }
 
+    async fn upsert(&self, event: Event) -> Result<()> {
+        let mut rw = self.0.write();
+        let events = rw.entry(event.aggregate_id.to_owned()).or_default();
+        events.retain(|e| e.version != 0);
+        events.splice(0..0, vec![event]);
+
+        Ok(())
+    }
+
     async fn last(&self) -> Result<Option<Event>> {
         let mut events = self
             .0

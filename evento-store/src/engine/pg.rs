@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use evento_query::{Cursor, CursorType, PgQuery, QueryResult};
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, QueryBuilder};
+use uuid::Uuid;
 
 use crate::{
     engine::Engine,
@@ -139,6 +140,35 @@ impl Engine for PgStore {
 
             query_builder.build().execute(&self.pool).await?;
         }
+
+        Ok(())
+    }
+
+    async fn upsert(&self, event: Event) -> Result<()> {
+        let table_events = self.table_events();
+
+        sqlx::query_as::<_, (Uuid,)>(
+            format!(
+                r#"
+            INSERT INTO {table_events} (id, name, aggregate_id, version, data, metadata, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (aggregate_id, version)
+            DO
+                UPDATE SET data = $5, metadata = $6
+            RETURNING id
+            "#
+            )
+            .as_str(),
+        )
+        .bind(event.id)
+        .bind(event.name)
+        .bind(&event.aggregate_id)
+        .bind(event.version)
+        .bind(event.data)
+        .bind(event.metadata)
+        .bind(event.created_at)
+        .fetch_one(&self.pool)
+        .await?;
 
         Ok(())
     }

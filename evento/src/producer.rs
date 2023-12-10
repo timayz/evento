@@ -66,3 +66,10 @@ impl Producer {
         self.store.load::<A>(id).await
     }
 }
+
+// @TODO: StoreWritter
+// constructor aggregate id + original version
+// trait to get event name from event data ?
+// func to add event to list
+// func to set metadata
+// func execute to bind metadata to events and write to store

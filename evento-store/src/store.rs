@@ -6,6 +6,14 @@ use uuid::Uuid;
 
 use crate::{engine::Engine, error::Result, Aggregate, StoreError};
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SnapshotMetadata {
+    pub cursor: Option<CursorType>,
+    pub version: u16,
+    pub snapshot_version: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Clone)]
 pub struct Store {
     pub(crate) engine: Box<dyn Engine>,
@@ -31,9 +39,22 @@ impl Store {
         first: u16,
     ) -> Result<Option<(A, u16)>> {
         let aggregate_id = aggregate_id.into();
-        let mut aggregate = A::default();
-        let mut cursor = None;
-        let mut version = 0;
+        let snapshot_id = format!("snapshot-{aggregate_id}");
+
+        let (mut aggregate, mut cursor, mut version) =
+            match self.first_of::<A>(&snapshot_id).await? {
+                Some(e) => match (e.version, e.to_metadata::<SnapshotMetadata>()?) {
+                    (0, Some(metadata)) => {
+                        if A::version() == metadata.snapshot_version {
+                            (e.to_data::<A>()?, metadata.cursor, metadata.version)
+                        } else {
+                            (A::default(), None, 0)
+                        }
+                    }
+                    _ => (A::default(), None, 0),
+                },
+                _ => (A::default(), None, 0),
+            };
 
         loop {
             let events = self.read_of::<A>(&aggregate_id, first, cursor).await?;
@@ -47,6 +68,20 @@ impl Store {
                 version = u16::try_from(event.node.version)?;
             }
 
+            let mut snapshot = Event::default();
+            snapshot.aggregate_id = A::aggregate_id(&snapshot_id);
+            snapshot.name = "_snapshot".to_owned();
+            snapshot.version = 0;
+            snapshot.data = serde_json::to_value(&aggregate)?;
+            snapshot.metadata = Some(serde_json::to_value(SnapshotMetadata {
+                cursor: events.page_info.end_cursor.clone(),
+                version,
+                snapshot_version: A::version(),
+                created_at: Utc::now(),
+            })?);
+
+            self.engine.upsert(snapshot).await?;
+
             if !events.page_info.has_next_page {
                 break;
             }
@@ -56,21 +91,6 @@ impl Store {
 
         Ok(Some((aggregate, version)))
     }
-
-    // @TODO: StoreWritter
-    // constructor aggregate id + original version
-    // trait to get event name from event data ? 
-    // func to add event to list
-    // func to set metadata
-    // func execute to bind metadata to events and write to store
-
-    // @TODO: snapshot load
-    // skip if snapshot version not match 
-
-    // @TODO: snapshot write
-    // store snapshot in event table at version 0 of aggregate ?
-    // with snapshot version in metadata ?
-    // load then create or replace snapshot of aggregate
 
     pub async fn write<A: Aggregate>(
         &self,
