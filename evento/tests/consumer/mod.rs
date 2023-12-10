@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use evento::{Consumer, ConsumerContext, Engine, Producer, Rule, RuleHandler};
+use evento::{Consumer, ConsumerContext, Engine, Producer, PublisherEvent, Rule, RuleHandler};
 use evento_store::{Aggregate, Event, Store, WriteEvent};
 use parse_display::{Display, FromStr};
 use serde::{Deserialize, Serialize};
@@ -35,9 +35,25 @@ pub struct Created {
     pub display_name: String,
 }
 
+impl PublisherEvent for Created {
+    type Output = UserEvent;
+
+    fn event_name() -> Self::Output {
+        UserEvent::Created
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct DisplayNameUpdated {
     pub display_name: String,
+}
+
+impl PublisherEvent for DisplayNameUpdated {
+    type Output = UserEvent;
+
+    fn event_name() -> Self::Output {
+        UserEvent::DisplayNameUpdated
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -217,13 +233,11 @@ pub async fn test_multiple_consumer<E: Engine + Clone + 'static>(
         .await?;
 
     eu_west_3a
-        .publish::<User, _>(
-            "1",
-            WriteEvent::new(UserEvent::Created).data(Created {
-                display_name: "John Wick".to_owned(),
-            })?,
-            0,
-        )
+        .aggregate::<User>("1")
+        .event(Created {
+            display_name: "John Wick".to_owned(),
+        })?
+        .publish()
         .await?;
 
     sleep(Duration::from_millis(300)).await;
@@ -454,21 +468,17 @@ pub async fn test_no_cdc<E: Engine + Clone + 'static>(
         .await?;
 
     producer
-        .publish_all::<User, _>(
-            "4",
-            vec![
-                WriteEvent::new(UserEvent::Created).data(Created {
-                    display_name: "Luffy".to_owned(),
-                })?,
-                WriteEvent::new(UserEvent::DisplayNameUpdated).data(DisplayNameUpdated {
-                    display_name: "Monkey D. Luffy".to_owned(),
-                })?,
-            ],
-            0,
-        )
+        .aggregate::<User>("4")
+        .event(Created {
+            display_name: "Luffy".to_owned(),
+        })?
+        .event(DisplayNameUpdated {
+            display_name: "Monkey D. Luffy".to_owned(),
+        })?
+        .publish()
         .await?;
 
-    sleep(Duration::from_millis(300)).await;
+    sleep(Duration::from_millis(301)).await;
 
     let (john, albert, nina, luffy) = {
         let users = state.users.read().await;

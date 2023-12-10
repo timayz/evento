@@ -1,6 +1,8 @@
+use serde::{de::DeserializeOwned, Serialize};
+
 use crate::store::Event;
 
-pub trait Aggregate: Default {
+pub trait Aggregate: Default + Serialize + DeserializeOwned {
     fn apply(&mut self, event: &'_ Event);
     fn aggregate_type<'a>() -> &'a str;
 
@@ -12,5 +14,9 @@ pub trait Aggregate: Default {
         let id: String = aggregate_id.into();
 
         id.replacen(&format!("{}#", Self::aggregate_type()), "", 1)
+    }
+
+    fn version() -> Option<String> {
+        None
     }
 }

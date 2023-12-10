@@ -29,6 +29,8 @@ pub trait Engine: DynClone + Send + Sync {
 
     async fn insert(&self, events: Vec<Event>) -> Result<()>;
 
+    async fn upsert(&self, event: Event) -> Result<()>;
+
     async fn read(
         &self,
         first: u16,
