@@ -80,16 +80,6 @@ impl Store {
                 })?),
                 ..Event::default()
             };
-            // snapshot.aggregate_id = A::aggregate_id(&snapshot_id);
-            // snapshot.name = "_snapshot".to_owned();
-            // snapshot.version = 0;
-            // snapshot.data = serde_json::to_value(&aggregate)?;
-            // snapshot.metadata = Some(serde_json::to_value(SnapshotMetadata {
-            //     cursor: events.page_info.end_cursor.clone(),
-            //     version,
-            //     snapshot_version: A::version(),
-            //     created_at: Utc::now(),
-            // })?);
 
             self.engine.upsert(snapshot).await?;
 
