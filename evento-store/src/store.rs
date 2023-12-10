@@ -208,6 +208,12 @@ impl WriteEvent {
         Ok(self)
     }
 
+    pub fn raw_metadata(mut self, value: Option<Value>) -> Self {
+        self.metadata = value;
+
+        self
+    }
+
     pub fn to_metadata<D: DeserializeOwned>(&self) -> Result<Option<D>> {
         if let Some(metadata) = self.metadata.clone() {
             Ok(Some(serde_json::from_value(metadata)?))
