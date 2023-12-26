@@ -15,7 +15,7 @@ http = "0.2.9"
 sqlx = { version = "0.7.2", features = [ "runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid", "json", "any" ] }
 parse-display = "0.8.2"
 chrono = { version = "0.4.20", features = ["unstable-locales"] }
-serde = "1.0.189"
+serde = "1.0.193"
 anyhow = "1.0.75"
 rust-embed = "8.0.0"
 mime_guess = "2.0.4"

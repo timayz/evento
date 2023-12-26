@@ -10,7 +10,7 @@ use crate::{engine::Engine, error::Result, Aggregate, StoreError};
 pub struct SnapshotMetadata {
     pub cursor: Option<CursorType>,
     pub version: u16,
-    pub snapshot_version: Option<String>,
+    pub snapshot_version: String,
     pub created_at: DateTime<Utc>,
 }
 
@@ -45,7 +45,7 @@ impl Store {
             match self.first_of::<A>(&snapshot_id).await? {
                 Some(e) => match (e.version, e.to_metadata::<SnapshotMetadata>()?) {
                     (0, Some(metadata)) => {
-                        if A::version() == metadata.snapshot_version {
+                        if A::aggregate_version() == metadata.snapshot_version {
                             (e.to_data::<A>()?, metadata.cursor, metadata.version)
                         } else {
                             (A::default(), None, 0)
@@ -70,12 +70,12 @@ impl Store {
 
             let snapshot = Event {
                 name: "_snapshot".to_owned(),
-                aggregate_id: A::aggregate_id(&snapshot_id),
+                aggregate_id: A::to_aggregate_id(&snapshot_id),
                 data: serde_json::to_value(&aggregate)?,
                 metadata: Some(serde_json::to_value(SnapshotMetadata {
                     cursor: events.page_info.end_cursor.clone(),
                     version,
-                    snapshot_version: A::version(),
+                    snapshot_version: A::aggregate_version().to_owned(),
                     created_at: Utc::now(),
                 })?),
                 ..Event::default()
@@ -117,7 +117,7 @@ impl Store {
     ) -> Result<Vec<Event>> {
         self.engine
             .write(
-                A::aggregate_id(aggregate_id).as_str(),
+                A::to_aggregate_id(aggregate_id).as_str(),
                 events,
                 original_version,
             )
@@ -143,7 +143,7 @@ impl Store {
         first: u16,
         after: Option<CursorType>,
     ) -> Result<QueryResult<Event>> {
-        let aggregate_id = A::aggregate_id(aggregate_id);
+        let aggregate_id = A::to_aggregate_id(aggregate_id);
 
         self.engine
             .read(first, after, None, Some(aggregate_id.as_str()))

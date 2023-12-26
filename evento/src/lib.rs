@@ -18,3 +18,8 @@ pub use error::*;
 pub use evento_store as store;
 pub use producer::*;
 pub use query::*;
+
+pub mod macros {
+    pub use evento_macro::*;
+    pub use evento_store::AggregateInfo;
+}

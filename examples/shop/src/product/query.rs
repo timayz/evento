@@ -2,7 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use evento::{
-    store::{Aggregate, Event},
+    store::{AggregateInfo, Event},
     ConsumerContext, Query, QueryError, QueryHandler, QueryOutput, RuleHandler,
 };
 use evento_query::{Cursor, CursorType, Edge, PgQuery, QueryArgs, QueryResult};
@@ -39,7 +39,7 @@ impl RuleHandler for ProductDetailsHandler {
     async fn handle(&self, event: Event, ctx: ConsumerContext) -> Result<()> {
         let db = ctx.extract::<PgPool>();
         let event_name: ProductEvent = event.name.parse()?;
-        let id = Product::to_id(&event.aggregate_id);
+        let id = Product::from_aggregate_id(&event.aggregate_id);
 
         match event_name {
             ProductEvent::Created => {
