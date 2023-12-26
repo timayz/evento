@@ -4,6 +4,7 @@ resolver = "2"
 members = [
     "./evento",
     "./evento-store",
+    "./evento-macro",
     "./evento-axum",
     "./evento-query",
     "./examples/*"

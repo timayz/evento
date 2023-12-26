@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use evento::{
-    store::{Aggregate, Event, WriteEvent},
-    Command, CommandError, CommandHandler, CommandOutput, ConsumerContext, RuleHandler,
+    store::{Aggregate, AggregateInfo, Event, WriteEvent},
+    Aggregate, Command, CommandError, CommandHandler, CommandOutput, ConsumerContext, RuleHandler,
 };
 use nanoid::nanoid;
 use rand::Rng;
@@ -144,7 +144,7 @@ async fn load_product(ctx: &Command, id: &str) -> Result<(Product, u16), Command
     Ok((product, e))
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize, Aggregate)]
 pub struct Product {
     pub name: String,
     pub description: String,
@@ -186,10 +186,6 @@ impl Aggregate for Product {
                 self.thumbnail = data.thumbnail;
             }
         }
-    }
-
-    fn aggregate_type<'a>() -> &'a str {
-        "product"
     }
 }
 
@@ -293,16 +289,12 @@ impl RuleHandler for ProductTaskHandler {
     }
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize, Aggregate)]
 pub struct ProductTask;
 
 impl Aggregate for ProductTask {
     fn apply(&mut self, _event: &Event) {
         unreachable!();
-    }
-
-    fn aggregate_type<'a>() -> &'a str {
-        "product-task"
     }
 }
 

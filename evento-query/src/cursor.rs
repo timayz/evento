@@ -8,6 +8,7 @@ use base64::{
 use chrono::{DateTime, NaiveDateTime, Utc};
 use harsh::Harsh;
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "pg")]
 use sqlx::{postgres::PgArguments, query::QueryAs, FromRow, Postgres};
 use std::{fmt::Debug, str::FromStr};
 
@@ -36,6 +37,7 @@ pub enum CursorOrder {
 
 pub trait Cursor: Sized {
     fn keys() -> Vec<&'static str>;
+    #[cfg(feature = "pg")]
     fn bind<'q, O>(
         self,
         query: QueryAs<Postgres, O, PgArguments>,

@@ -1,7 +1,8 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use evento::{Consumer, ConsumerContext, Engine, Producer, PublisherEvent, Rule, RuleHandler};
-use evento_store::{Aggregate, Event, Store, WriteEvent};
+use evento_macro::Aggregate;
+use evento_store::{Aggregate, AggregateInfo, Event, Store, WriteEvent};
 use parse_display::{Display, FromStr};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -61,7 +62,7 @@ pub struct AccountDeleted {
     pub deleted: bool,
 }
 
-#[derive(Default, Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Default, Serialize, Deserialize, Debug, Clone, PartialEq, Aggregate)]
 pub struct User {
     pub display_name: String,
     pub deleted: bool,
@@ -86,10 +87,6 @@ impl Aggregate for User {
             }
         }
     }
-
-    fn aggregate_type<'a>() -> &'a str {
-        "user"
-    }
 }
 
 type Users = Arc<RwLock<HashMap<String, User>>>;
@@ -111,12 +108,14 @@ impl RuleHandler for UsersHandler {
                     display_name: data.display_name,
                     deleted: false,
                 };
-                users.insert(User::to_id(&event.aggregate_id), user.clone());
+                users.insert(User::from_aggregate_id(&event.aggregate_id), user.clone());
             }
             UserEvent::DisplayNameUpdated => {
                 let mut users = state.users.write().await;
                 let data: DisplayNameUpdated = event.to_data().unwrap();
-                let Some(user) = users.get_mut(User::to_id(&event.aggregate_id).as_str()) else {
+                let Some(user) =
+                    users.get_mut(User::from_aggregate_id(&event.aggregate_id).as_str())
+                else {
                     return Ok(());
                 };
 
@@ -132,7 +131,7 @@ impl RuleHandler for UsersHandler {
             }
             UserEvent::AccountDeleted => {
                 let mut users = state.users.write().await;
-                users.remove(User::to_id(&event.aggregate_id).as_str());
+                users.remove(User::from_aggregate_id(&event.aggregate_id).as_str());
             }
         };
 
@@ -157,12 +156,14 @@ impl RuleHandler for UsersCheckDisplayNameHandler {
                     display_name: data.display_name,
                     deleted: false,
                 };
-                users.insert(User::to_id(&event.aggregate_id), user.clone());
+                users.insert(User::from_aggregate_id(&event.aggregate_id), user.clone());
             }
             UserEvent::DisplayNameUpdated => {
                 let mut users = state.users.write().await;
                 let data: DisplayNameUpdated = event.to_data().unwrap();
-                let Some(user) = users.get_mut(User::to_id(&event.aggregate_id).as_str()) else {
+                let Some(user) =
+                    users.get_mut(User::from_aggregate_id(&event.aggregate_id).as_str())
+                else {
                     return Ok(());
                 };
 
@@ -174,7 +175,7 @@ impl RuleHandler for UsersCheckDisplayNameHandler {
             }
             UserEvent::AccountDeleted => {
                 let mut users = state.users.write().await;
-                users.remove(User::to_id(&event.aggregate_id).as_str());
+                users.remove(User::from_aggregate_id(&event.aggregate_id).as_str());
             }
         };
 
