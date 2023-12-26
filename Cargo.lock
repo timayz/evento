@@ -571,7 +571,6 @@ dependencies = [
  "backoff",
  "chrono",
  "dyn-clone",
- "evento-macro",
  "evento-query",
  "futures-util",
  "parking_lot",
