@@ -35,7 +35,6 @@ pub fn aggregate_derive(input: TokenStream) -> TokenStream {
                         .path
                         .segments
                         .iter()
-                        .into_iter()
                         .fold(String::new(), |mut acc, v| {
                             acc.push_str(&v.ident.to_string());
                             acc
@@ -46,7 +45,7 @@ pub fn aggregate_derive(input: TokenStream) -> TokenStream {
         }
     };
 
-    let name = format!("{}", ident.to_string().to_case(Case::Kebab));
+    let name = ident.to_string().to_case(Case::Kebab).to_string();
     let version = format!("{:x}", hasher.finalize());
 
     quote! {
