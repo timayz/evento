@@ -2,8 +2,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use evento::{
-    store::{Aggregate, AggregateInfo, Event, WriteEvent},
-    Aggregate, Command, CommandError, CommandHandler, CommandOutput, ConsumerContext, RuleHandler,
+    macros::*,
+    store::{Aggregate, Event, WriteEvent},
+    Command, CommandError, CommandHandler, CommandOutput, ConsumerContext, RuleHandler,
 };
 use nanoid::nanoid;
 use rand::Rng;
