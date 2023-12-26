@@ -1,6 +1,6 @@
 [package]
 name = "payment"
-version = "1.0.0-alpha.3"
+version = "1.0.0-alpha.4"
 edition = "2021"
 
 [dependencies]
@@ -16,5 +16,5 @@ sqlx = { version = "0.7.2", features = [ "runtime-tokio", "tls-rustls", "postgre
 anyhow = "1.0.75"
 rust-embed = "8.0.0"
 mime_guess = "2.0.4"
-evento = { path = "../../evento", version = "1.0.0-alpha.3", features = ["pg"] }
-evento-axum = { path = "../../evento-axum", version = "1.0.0-alpha.3" }
+evento = { path = "../../evento", version = "1.0.0-alpha.4", features = ["pg"] }
+evento-axum = { path = "../../evento-axum", version = "1.0.0-alpha.4" }
