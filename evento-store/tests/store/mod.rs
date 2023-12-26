@@ -1,4 +1,5 @@
-use evento_store::{Aggregate, Event, Store, StoreError, WriteEvent};
+use evento_macro::Aggregate;
+use evento_store::{Aggregate, AggregateInfo, Event, Store, StoreError, WriteEvent};
 use futures_util::future::join_all;
 use parse_display::{Display, FromStr};
 use serde::{Deserialize, Serialize};
@@ -48,7 +49,7 @@ pub struct AccountDeleted {
     pub deleted: bool,
 }
 
-#[derive(Default, Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Default, Serialize, Deserialize, Debug, Clone, PartialEq, Aggregate)]
 pub struct User {
     pub first_name: Option<String>,
     pub last_name: Option<String>,
@@ -88,10 +89,6 @@ impl Aggregate for User {
                 self.deleted = data.deleted;
             }
         }
-    }
-
-    fn aggregate_type<'a>() -> &'a str {
-        "user"
     }
 }
 

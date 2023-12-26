@@ -1,15 +1,13 @@
 #![forbid(unsafe_code)]
 
 extern crate proc_macro;
-extern crate proc_macro2;
 
 #[macro_use]
 extern crate proc_macro_error;
 
 use convert_case::{Case, Casing};
 use proc_macro::TokenStream;
-use proc_macro2::TokenStream as TokenStream2;
-use quote::{format_ident, quote};
+use quote::quote;
 use sha3::{Digest, Sha3_256};
 use syn::{parse_macro_input, DeriveInput, FieldsNamed};
 
@@ -51,7 +49,7 @@ pub fn aggregate_derive(input: TokenStream) -> TokenStream {
     let version = format!("{:x}", hasher.finalize());
 
     quote! {
-        impl Aggregate for #ident {
+        impl AggregateInfo for #ident {
             fn aggregate_type() -> &'static str {
                 #name
             }
@@ -60,42 +58,6 @@ pub fn aggregate_derive(input: TokenStream) -> TokenStream {
                 #version
             }
         }
-    }
-    .into()
-}
-
-#[proc_macro_error]
-#[proc_macro_derive(PublisherEvent)]
-pub fn publisher_event_derive(input: TokenStream) -> TokenStream {
-    let DeriveInput { ident, data, .. } = parse_macro_input!(input);
-
-    let syn::Data::Enum(s) = data else {
-        abort!(ident, "Derive PublisherEvent only available on Enum");
-    };
-
-    let mut variants = TokenStream2::default();
-
-    for variant in s.variants {
-        let v_ident = format_ident!("{}", variant.ident);
-        variants.extend::<TokenStream2>(quote! {
-            impl PublisherEvent for #v_ident {
-                type Output = #ident;
-
-                fn event_name() -> Self::Output {
-                    #ident::#v_ident
-                }
-            }
-        })
-    }
-
-    quote! {
-        impl From<#ident> for String {
-            fn from(e: #ident) -> Self {
-                e.to_string()
-            }
-        }
-
-        #variants
     }
     .into()
 }

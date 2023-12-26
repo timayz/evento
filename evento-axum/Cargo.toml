@@ -9,7 +9,7 @@ repository = "https://github.com/timayz/evento"
 documentation = "https://docs.rs/evento"
 
 [dependencies]
-serde = "1.0.189"
+serde = "1.0.193"
 axum = { version = "0.6.20" }
 async-trait = "0.1.73"
 thiserror = "1.0.49"

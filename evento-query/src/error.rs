@@ -4,6 +4,7 @@ pub enum QueryError {
     MissingField(String),
     #[error("chrono: {0}")]
     ChronoParseError(#[from] chrono::ParseError),
+    #[cfg(feature = "pg")]
     #[error("sqlx: {0}")]
     Sqlx(#[from] sqlx::Error),
     #[error("base64: {0}")]
