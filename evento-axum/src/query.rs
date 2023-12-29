@@ -1,14 +1,12 @@
 use async_trait::async_trait;
 use axum::{
-    body::HttpBody,
     extract::{
         rejection::{ExtensionRejection, QueryRejection as AxumQueryRejection},
-        FromRequest, Query as AxumQuery,
+        FromRequest, Query as AxumQuery, Request,
     },
-    http::Request,
     response::IntoResponse,
     response::Response,
-    BoxError, Extension, RequestPartsExt,
+    Extension, RequestPartsExt,
 };
 use evento::{QueryError, QueryHandler};
 use serde::de::DeserializeOwned;
@@ -26,11 +24,8 @@ where
 }
 
 #[async_trait]
-impl<S, B, T, R, O> FromRequest<S, B> for Query<T, R, O>
+impl<S, T, R, O> FromRequest<S> for Query<T, R, O>
 where
-    B: HttpBody + Send + 'static,
-    B::Data: Send,
-    B::Error: Into<BoxError>,
     S: Send + Sync,
     T: Send + Sync,
     T: DeserializeOwned,
@@ -39,7 +34,7 @@ where
 {
     type Rejection = QueryRejection;
 
-    async fn from_request(req: Request<B>, state: &S) -> Result<Self, Self::Rejection> {
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
         let (mut parts, body) = req.into_parts();
         let query = parts.extract::<Extension<evento::Query>>().await?;
         let req = Request::from_parts(parts, body);

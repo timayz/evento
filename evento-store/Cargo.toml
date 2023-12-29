@@ -18,17 +18,17 @@ pg = ["dep:sqlx", "evento-query/pg"]
 serde = "1.0.193"
 serde_json = "1.0.108"
 parking_lot = { version = "0.12.1", optional = true }
-sqlx = { version = "0.7.2", features = ["runtime-tokio", "postgres", "chrono", "json"], optional = true }
-thiserror = "1.0.49"
+sqlx = { version = "0.7.3", features = ["runtime-tokio", "postgres", "chrono", "json"], optional = true }
+thiserror = "1.0.52"
 chrono = { version = "0.4.31", default-features = false, features = ["clock", "serde"] }
-futures-util = "0.3.28"
-dyn-clone = "1.0.14"
-async-trait = "0.1.73"
-anyhow = "1.0.75"
+futures-util = "0.3.30"
+dyn-clone = "1.0.16"
+async-trait = "0.1.75"
+anyhow = "1.0.77"
 evento-query = { path = "../evento-query", version = "1.0.0-alpha.4" }
 
 [dependencies.uuid]
-version = "1.4.1"
+version = "1.6.1"
 features = [
 	"v4",
 	"fast-rng",
@@ -37,8 +37,8 @@ features = [
 ]
 
 [dev-dependencies]
-tokio = { version = "1.33.0", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1.35.1", features = ["rt-multi-thread", "macros"] }
 backoff = { version = "0.4.0", features = ["futures", "tokio"] }
-sqlx = { version = "0.7.2", features = ["runtime-tokio", "postgres", "chrono", "uuid", "json", "any"] }
+sqlx = { version = "0.7.3", features = ["runtime-tokio", "postgres", "chrono", "uuid", "json", "any"] }
 parse-display = { version = "0.8.2" }
 tokio-shared-rt = "0.1.0"

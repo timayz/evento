@@ -6,14 +6,14 @@ mod generate;
 mod index;
 mod render;
 
-use axum::{body::Body, routing::get, Router};
+use axum::{routing::get, Router};
 use evento::Rule;
 
 pub use render::*;
 
 use crate::{product::ProductRule, AppState};
 
-pub fn create() -> Router<AppState, Body> {
+pub fn create() -> Router<AppState> {
     Router::new()
         .route("/", get(index::index))
         .route("/_product", get(index::product))

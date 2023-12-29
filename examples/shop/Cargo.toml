@@ -5,21 +5,21 @@ edition = "2021"
 
 [dependencies]
 askama = { version = "0.12.1", default-features = false, features = ["with-axum", "mime", "mime_guess"] }
-askama_axum = "0.3.0"
-tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
-axum = "0.6.20"
-tokio = { version = "1.33.0", features = ["rt-multi-thread", "macros"] }
+askama_axum = "0.4.0"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+axum = "0.7.3"
+tokio = { version = "1.35.1", features = ["rt-multi-thread", "macros"] }
 tokio-stream = "0.1.14"
-futures = "0.3.29"
-http = "0.2.9"
-sqlx = { version = "0.7.2", features = [ "runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid", "json", "any" ] }
+futures = "0.3.30"
+http = "0.2.11"
+sqlx = { version = "0.7.3", features = [ "runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid", "json", "any" ] }
 parse-display = "0.8.2"
-chrono = { version = "0.4.20", features = ["unstable-locales"] }
+chrono = { version = "0.4.31", features = ["unstable-locales"] }
 serde = "1.0.193"
-anyhow = "1.0.75"
-rust-embed = "8.0.0"
+anyhow = "1.0.77"
+rust-embed = "8.2.0"
 mime_guess = "2.0.4"
-async-trait = "0.1.73"
+async-trait = "0.1.75"
 evento = { path = "../../evento", version = "1.0.0-alpha.4", features = ["pg"] }
 inventory = { path = "../inventory", version = "1.0.0-alpha.4" }
 evento-axum = { path = "../../evento-axum", version = "1.0.0-alpha.4" }

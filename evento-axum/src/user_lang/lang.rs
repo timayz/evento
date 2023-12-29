@@ -2,8 +2,9 @@ use super::{
     sources::{AcceptLanguageSource, PathSource, QuerySource},
     UserLanguageConfig, UserLanguageSource,
 };
-use axum::{async_trait, extract::FromRequestParts, Extension, RequestPartsExt};
-use http::request::Parts;
+use axum::{
+    async_trait, extract::FromRequestParts, http::request::Parts, Extension, RequestPartsExt,
+};
 use std::{
     convert::Infallible,
     sync::{Arc, OnceLock},

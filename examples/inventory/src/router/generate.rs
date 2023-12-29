@@ -1,6 +1,6 @@
 use askama::Template;
 use askama_axum::IntoResponse;
-use http::StatusCode;
+use axum::http::StatusCode;
 use std::collections::HashMap;
 
 use crate::product::GenerateProductsInput;
