@@ -1,7 +1,7 @@
 mod index;
-mod render;
+// mod render;
 
-pub use render::*;
+// pub use render::*;
 
 use axum::{routing::get, Router};
 
