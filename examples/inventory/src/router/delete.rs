@@ -1,6 +1,6 @@
 use askama::Template;
 use askama_axum::IntoResponse;
-use http::StatusCode;
+use axum::http::StatusCode;
 
 use crate::product::{DeleteProductInput, GetProductDetails};
 

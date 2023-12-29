@@ -1,14 +1,12 @@
 use async_trait::async_trait;
 use axum::{
-    body::HttpBody,
     extract::{
         rejection::{ExtensionRejection, FormRejection},
-        Form, FromRequest, FromRequestParts,
+        Form, FromRequest, FromRequestParts, Request,
     },
-    http::Request,
     response::IntoResponse,
     response::Response,
-    BoxError, Extension, RequestPartsExt,
+    Extension, RequestPartsExt,
 };
 use evento::{CommandError, CommandHandler};
 use evento_store::Event;
@@ -27,11 +25,8 @@ pub struct Command<T, R> {
 }
 
 #[async_trait]
-impl<S, B, T, R> FromRequest<S, B> for Command<T, R>
+impl<S, T, R> FromRequest<S> for Command<T, R>
 where
-    B: HttpBody + Send + 'static,
-    B::Data: Send,
-    B::Error: Into<BoxError>,
     S: Send + Sync,
     T: Send + Sync,
     T: DeserializeOwned,
@@ -41,7 +36,7 @@ where
 {
     type Rejection = CommandRejection;
 
-    async fn from_request(req: Request<B>, state: &S) -> Result<Self, Self::Rejection> {
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
         let (mut parts, body) = req.into_parts();
         let cmd = parts.extract::<Extension<evento::Command>>().await?;
         let lang = UserLanguage::from_request_parts(&mut parts, state)

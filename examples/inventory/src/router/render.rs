@@ -1,7 +1,7 @@
 use askama::Template;
 use askama_axum::{IntoResponse, Response};
+use axum::http::StatusCode;
 use evento::QueryHandler;
-use http::StatusCode;
 
 #[derive(Template)]
 #[template(path = "_404.html")]
