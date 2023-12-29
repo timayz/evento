@@ -17,4 +17,3 @@ validator = "0.16.1"
 tracing = "0.1.40"
 evento = { path = "../evento", version = "1.0.0-alpha.4" }
 evento-store = { path = "../evento-store", version = "1.0.0-alpha.4" }
-http = "0.2.11"

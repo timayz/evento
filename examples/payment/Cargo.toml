@@ -11,7 +11,6 @@ axum = "0.7.3"
 tokio = { version = "1.35.1", features = ["rt-multi-thread", "macros"] }
 tokio-stream = "0.1.14"
 futures = "0.3.30"
-http = "0.2.11"
 sqlx = { version = "0.7.3", features = [ "runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid", "json", "any" ] }
 anyhow = "1.0.77"
 rust-embed = "8.2.0"
