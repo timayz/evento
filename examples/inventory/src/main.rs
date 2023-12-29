@@ -6,12 +6,12 @@ use std::{collections::HashMap, convert::Infallible, str::FromStr, sync::Arc, ti
 use anyhow::Result;
 use axum::{
     extract::{Path, State},
+    http::{header, StatusCode, Uri},
     response::{sse::Event, IntoResponse, Sse},
     routing::get,
     Extension,
 };
 use evento::{Command, PgConsumer, Producer, Query};
-use http::{header, StatusCode, Uri};
 use rust_embed::RustEmbed;
 use sqlx::{migrate::MigrateDatabase, Any, PgPool};
 use tokio::{
@@ -73,11 +73,11 @@ async fn main() -> Result<()> {
             publisher,
         });
 
-    let addr = "0.0.0.0:3002".parse()?;
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3002").await?;
 
-    axum::Server::bind(&addr)
-        .serve(app.into_make_service())
-        .await?;
+    axum::serve(listener, app.into_make_service())
+        .await
+        .unwrap();
 
     Ok(())
 }
