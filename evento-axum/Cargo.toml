@@ -1,6 +1,6 @@
 [package]
 name = "evento-axum"
-version = "1.0.0-alpha.4"
+version = "1.0.0-alpha.5"
 edition = "2021"
 license = "Apache-2.0"
 publish = true
@@ -15,5 +15,5 @@ async-trait = "0.1.75"
 thiserror = "1.0.52"
 validator = "0.16.1"
 tracing = "0.1.40"
-evento = { path = "../evento", version = "1.0.0-alpha.4" }
-evento-store = { path = "../evento-store", version = "1.0.0-alpha.4" }
+evento = { path = "../evento", version = "1.0.0-alpha.5" }
+evento-store = { path = "../evento-store", version = "1.0.0-alpha.5" }
