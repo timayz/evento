@@ -1,7 +1,7 @@
 use askama::Template;
 use async_trait::async_trait;
 use evento::{
-    store::{AggregateInfo, Event},
+    store::{Aggregate, Event},
     ConsumerContext, RuleHandler,
 };
 use evento_query::{Edge, QueryResult};

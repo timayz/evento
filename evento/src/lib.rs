@@ -15,11 +15,8 @@ pub use context::Context;
 pub use data::Data;
 pub use engine::*;
 pub use error::*;
+pub use evento_macro::*;
 pub use evento_store as store;
+pub use evento_store::Aggregate;
 pub use producer::*;
 pub use query::*;
-
-pub mod macros {
-    pub use evento_macro::*;
-    pub use evento_store::AggregateInfo;
-}

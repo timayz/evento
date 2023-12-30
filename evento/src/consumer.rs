@@ -2,7 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use dyn_clone::DynClone;
-use evento_store::{Aggregate, Cursor, Event, Result as StoreResult, Store, WriteEvent};
+use evento_store::{Aggregate, Applier, Cursor, Event, Result as StoreResult, Store, WriteEvent};
 use futures_util::future::join_all;
 use glob_match::glob_match;
 use parking_lot::RwLock;
@@ -55,7 +55,7 @@ impl ConsumerContext {
             .await
     }
 
-    pub async fn load<A: Aggregate, I: Into<String>>(
+    pub async fn load<A: Aggregate + Applier, I: Into<String>>(
         &self,
         id: I,
     ) -> StoreResult<Option<(A, u16)>> {

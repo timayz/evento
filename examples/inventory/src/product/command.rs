@@ -2,9 +2,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use evento::{
-    macros::*,
-    store::{Aggregate, Event, WriteEvent},
-    Command, CommandError, CommandHandler, CommandOutput, ConsumerContext, RuleHandler,
+    store::{Applier, Event, WriteEvent},
+    Aggregate, Command, CommandError, CommandHandler, CommandOutput, ConsumerContext, RuleHandler,
 };
 use nanoid::nanoid;
 use rand::Rng;
@@ -157,7 +156,7 @@ pub struct Product {
     pub deleted: bool,
 }
 
-impl Aggregate for Product {
+impl Applier for Product {
     fn apply(&mut self, event: &Event) {
         let product_event: ProductEvent = event.name.parse().unwrap();
 
@@ -293,7 +292,7 @@ impl RuleHandler for ProductTaskHandler {
 #[derive(Default, Serialize, Deserialize, Aggregate)]
 pub struct ProductTask;
 
-impl Aggregate for ProductTask {
+impl Applier for ProductTask {
     fn apply(&mut self, _event: &Event) {
         unreachable!();
     }

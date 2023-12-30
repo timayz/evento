@@ -4,7 +4,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::{engine::Engine, error::Result, Aggregate, StoreError};
+use crate::{engine::Engine, error::Result, Aggregate, Applier, StoreError};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SnapshotMetadata {
@@ -26,14 +26,14 @@ impl Store {
         }
     }
 
-    pub async fn load<A: Aggregate>(
+    pub async fn load<A: Aggregate + Applier>(
         &self,
         aggregate_id: impl Into<String>,
     ) -> Result<Option<(A, u16)>> {
         self.load_with(aggregate_id, 100).await
     }
 
-    pub async fn load_with<A: Aggregate>(
+    pub async fn load_with<A: Aggregate + Applier>(
         &self,
         aggregate_id: impl Into<String>,
         first: u16,
