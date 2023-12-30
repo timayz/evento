@@ -555,6 +555,7 @@ dependencies = [
  "evento-store",
  "parse-display",
  "proc-macro-error",
+ "proc-macro2",
  "quote",
  "sha3",
  "syn 2.0.43",
