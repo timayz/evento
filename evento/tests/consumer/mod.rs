@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use evento::{Consumer, ConsumerContext, Engine, Producer, PublisherEvent, Rule, RuleHandler};
 use evento_macro::Aggregate;
-use evento_store::{Aggregate, AggregateInfo, Event, Store, WriteEvent};
+use evento_store::{Aggregate, Applier, Event, Store, WriteEvent};
 use parse_display::{Display, FromStr};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -17,7 +17,7 @@ use tokio::{
     time::{sleep, Duration},
 };
 
-#[derive(Display, FromStr)]
+#[derive(Display, FromStr, PublisherEvent)]
 #[display(style = "kebab-case")]
 pub enum UserEvent {
     Created,
@@ -25,36 +25,14 @@ pub enum UserEvent {
     AccountDeleted,
 }
 
-impl From<UserEvent> for String {
-    fn from(val: UserEvent) -> Self {
-        val.to_string()
-    }
-}
-
 #[derive(Serialize, Deserialize)]
 pub struct Created {
     pub display_name: String,
 }
 
-impl PublisherEvent for Created {
-    type Output = UserEvent;
-
-    fn event_name() -> Self::Output {
-        UserEvent::Created
-    }
-}
-
 #[derive(Serialize, Deserialize)]
 pub struct DisplayNameUpdated {
     pub display_name: String,
-}
-
-impl PublisherEvent for DisplayNameUpdated {
-    type Output = UserEvent;
-
-    fn event_name() -> Self::Output {
-        UserEvent::DisplayNameUpdated
-    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -68,7 +46,7 @@ pub struct User {
     pub deleted: bool,
 }
 
-impl Aggregate for User {
+impl Applier for User {
     fn apply(&mut self, event: &Event) {
         let user_event: UserEvent = event.name.parse().unwrap();
 

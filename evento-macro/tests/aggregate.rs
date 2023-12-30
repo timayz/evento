@@ -1,5 +1,5 @@
 use evento_macro::Aggregate;
-use evento_store::AggregateInfo;
+use evento_store::Aggregate;
 
 #[test]
 fn aggregate() {

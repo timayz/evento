@@ -1,4 +1,4 @@
-use evento_store::{Aggregate, AggregateInfo, Event, Store, StoreError, WriteEvent};
+use evento_store::{Aggregate, Applier, Event, Store, StoreError, WriteEvent};
 use futures_util::future::join_all;
 use parse_display::{Display, FromStr};
 use serde::{Deserialize, Serialize};
@@ -59,7 +59,7 @@ pub struct User {
     pub first_names: Vec<String>,
 }
 
-impl AggregateInfo for User {
+impl Aggregate for User {
     fn aggregate_type() -> &'static str {
         "user"
     }
@@ -69,7 +69,7 @@ impl AggregateInfo for User {
     }
 }
 
-impl Aggregate for User {
+impl Applier for User {
     fn apply(&mut self, event: &Event) {
         let user_event: UserEvent = event.name.parse().unwrap();
 

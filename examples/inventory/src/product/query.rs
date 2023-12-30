@@ -3,8 +3,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use convert_case::{Case, Casing};
 use evento::{
-    store::{AggregateInfo, Event},
-    ConsumerContext, Query, QueryError, QueryHandler, QueryOutput, RuleHandler,
+    store::Event, Aggregate, ConsumerContext, Query, QueryError, QueryHandler, QueryOutput,
+    RuleHandler,
 };
 use evento_query::{Cursor, CursorType, Edge, PgQuery, QueryArgs, QueryResult};
 use serde::{Deserialize, Serialize};

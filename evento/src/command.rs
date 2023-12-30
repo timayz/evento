@@ -2,7 +2,7 @@ mod en;
 mod fr;
 
 use async_trait::async_trait;
-use evento_store::{Aggregate, Event, Result as StoreResult, WriteEvent};
+use evento_store::{Aggregate, Applier, Event, Result as StoreResult, WriteEvent};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -60,7 +60,7 @@ impl Command {
             .await
     }
 
-    pub async fn load<A: Aggregate, I: Into<String>>(
+    pub async fn load<A: Aggregate + Applier, I: Into<String>>(
         &self,
         id: I,
     ) -> StoreResult<Option<(A, u16)>> {

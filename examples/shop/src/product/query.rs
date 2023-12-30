@@ -2,7 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use evento::{
-    store::{AggregateInfo, Event},
+    store::{Aggregate, Event},
     ConsumerContext, Query, QueryError, QueryHandler, QueryOutput, RuleHandler,
 };
 use evento_query::{Cursor, CursorType, Edge, PgQuery, QueryArgs, QueryResult};

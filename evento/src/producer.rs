@@ -1,4 +1,4 @@
-use evento_store::{Aggregate, Event, Result, Store, WriteEvent};
+use evento_store::{Aggregate, Applier, Event, Result, Store, WriteEvent};
 use serde::Serialize;
 use serde_json::Value;
 use std::{collections::HashMap, marker::PhantomData};
@@ -62,7 +62,10 @@ impl Producer {
             .await
     }
 
-    pub async fn load<A: Aggregate, I: Into<String>>(&self, id: I) -> Result<Option<(A, u16)>> {
+    pub async fn load<A: Aggregate + Applier, I: Into<String>>(
+        &self,
+        id: I,
+    ) -> Result<Option<(A, u16)>> {
         self.store.load::<A>(id).await
     }
 
