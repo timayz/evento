@@ -150,7 +150,7 @@ impl QueryHandler for ListProductDetails {
     async fn handle(&self, query: &Query) -> QueryOutput<Self::Output> {
         let db: sqlx::Pool<sqlx::Postgres> = query.extract::<PgPool>();
         let result = PgQuery::<ProductDetails>::new("SELECT * FROM sp_product")
-            .build(QueryArgs {
+            .build(&QueryArgs {
                 first: self.first.to_owned(),
                 after: self.after.to_owned(),
                 last: self.last.to_owned(),

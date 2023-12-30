@@ -26,7 +26,7 @@ async fn query_first() {
     let db = get_pool().await;
     let users = get_users().await;
     let query = PgQuery::<User>::new(SELECT_USERS)
-        .build_desc(Default::default())
+        .build_desc(&Default::default())
         .fetch_all(db)
         .await
         .unwrap();

@@ -59,28 +59,28 @@ where
     }
 
     pub fn backward(self, last: u16, before: Option<CursorType>) -> Self {
-        self.build(QueryArgs::backward(last, before))
+        self.build(&QueryArgs::backward(last, before))
     }
 
     pub fn backward_desc(self, last: u16, before: Option<CursorType>) -> Self {
         self.cursor_order(CursorOrder::Desc)
-            .build(QueryArgs::backward(last, before))
+            .build(&QueryArgs::backward(last, before))
     }
 
     pub fn forward(self, first: u16, after: Option<CursorType>) -> Self {
-        self.build(QueryArgs::forward(first, after))
+        self.build(&QueryArgs::forward(first, after))
     }
 
     pub fn forward_desc(self, first: u16, after: Option<CursorType>) -> Self {
         self.cursor_order(CursorOrder::Desc)
-            .build(QueryArgs::forward(first, after))
+            .build(&QueryArgs::forward(first, after))
     }
 
-    pub fn build_desc(self, args: QueryArgs) -> Self {
+    pub fn build_desc(self, args: &QueryArgs) -> Self {
         self.cursor_order(CursorOrder::Desc).build(args)
     }
 
-    pub fn build(mut self, args: QueryArgs) -> Self {
+    pub fn build(mut self, args: &QueryArgs) -> Self {
         let (limit, cursor) = if args.is_backward() {
             (args.last.unwrap_or(40), args.before.as_ref())
         } else {
