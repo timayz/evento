@@ -86,8 +86,7 @@ pub fn publisher_event_derive(input: TokenStream) -> TokenStream {
                         #ident::#v_ident
                     }
                 }
-            }
-            .into(),
+            },
         )
     }
 
