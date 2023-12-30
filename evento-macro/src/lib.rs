@@ -77,17 +77,15 @@ pub fn publisher_event_derive(input: TokenStream) -> TokenStream {
 
     for variant in s.variants {
         let v_ident = format_ident!("{}", variant.ident);
-        variants.extend::<TokenStream2>(
-            quote! {
-                impl PublisherEvent for #v_ident {
-                    type Output = #ident;
+        variants.extend::<TokenStream2>(quote! {
+            impl PublisherEvent for #v_ident {
+                type Output = #ident;
 
-                    fn event_name() -> Self::Output {
-                        #ident::#v_ident
-                    }
+                fn event_name() -> Self::Output {
+                    #ident::#v_ident
                 }
-            },
-        )
+            }
+        })
     }
 
     quote! {
