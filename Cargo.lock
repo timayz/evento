@@ -526,14 +526,7 @@ dependencies = [
 name = "evento-axum"
 version = "1.0.0-alpha.6"
 dependencies = [
- "async-trait",
  "axum",
- "evento",
- "evento-store",
- "serde",
- "thiserror",
- "tracing",
- "validator",
 ]
 
 [[package]]
@@ -1045,7 +1038,6 @@ dependencies = [
  "rust-embed",
  "serde",
  "sqlx",
- "thiserror",
  "tokio",
  "tokio-stream",
  "tracing-subscriber",
@@ -1879,7 +1871,6 @@ version = "1.0.0-alpha.6"
 dependencies = [
  "anyhow",
  "askama",
- "askama_axum",
  "async-trait",
  "axum",
  "chrono",
