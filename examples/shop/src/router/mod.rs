@@ -1,10 +1,7 @@
 mod index;
-mod render;
-
-use evento::Rule;
-pub use render::*;
 
 use axum::{routing::get, Router};
+use evento::Rule;
 
 use crate::{product::ProductRule, AppState};
 
