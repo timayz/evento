@@ -1,7 +1,7 @@
 mod index;
 
-use evento::Rule;
 use axum::{routing::get, Router};
+use evento::Rule;
 
 use crate::{product::ProductRule, AppState};
 
