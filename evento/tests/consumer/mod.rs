@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use evento::{Consumer, ConsumerContext, Engine, Producer, PublisherEvent, Rule, RuleHandler};
 use evento_macro::Aggregate;
-use evento_store::{Aggregate, Applier, Event, Store, WriteEvent};
+use evento_store::{Aggregate, Applier, Event, Store};
 use parse_display::{Display, FromStr};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -76,9 +76,8 @@ struct UsersHandler(bool);
 impl RuleHandler for UsersHandler {
     async fn handle(&self, event: Event, ctx: ConsumerContext) -> Result<()> {
         let state = ctx.extract::<ConsumerState>();
-        let user_event: UserEvent = event.name.parse().unwrap();
 
-        match user_event {
+        match event.name.parse()? {
             UserEvent::Created => {
                 let mut users = state.users.write().await;
                 let data: Created = event.to_data().unwrap();
@@ -94,6 +93,11 @@ impl RuleHandler for UsersHandler {
                 let Some(user) =
                     users.get_mut(User::from_aggregate_id(&event.aggregate_id).as_str())
                 else {
+                    let user = User {
+                        display_name: data.display_name,
+                        deleted: false,
+                    };
+                    users.insert(User::from_aggregate_id(&event.aggregate_id), user.clone());
                     return Ok(());
                 };
 
@@ -212,11 +216,11 @@ pub async fn test_multiple_consumer<E: Engine + Clone + 'static>(
         .await?;
 
     eu_west_3a
-        .aggregate::<User>("1")
+        .write("1")
         .event(Created {
             display_name: "John Wick".to_owned(),
         })?
-        .publish()
+        .commit::<User>()
         .await?;
 
     sleep(Duration::from_millis(300)).await;
@@ -229,23 +233,20 @@ pub async fn test_multiple_consumer<E: Engine + Clone + 'static>(
     assert_eq!(user1.display_name, "John Wick".to_owned());
 
     eu_west_3b
-        .publish::<User, _>(
-            "2",
-            WriteEvent::new(UserEvent::Created).data(Created {
-                display_name: "Albert".to_owned(),
-            })?,
-            0,
-        )
+        .write("2")
+        .event(Created {
+            display_name: "Albert".to_owned(),
+        })?
+        .commit::<User>()
         .await?;
 
     eu_west_3b
-        .publish::<User, _>(
-            "1",
-            WriteEvent::new(UserEvent::DisplayNameUpdated).data(DisplayNameUpdated {
-                display_name: "John Wick from eu-west-3b".to_owned(),
-            })?,
-            1,
-        )
+        .write("1")
+        .original_version(1)
+        .event(DisplayNameUpdated {
+            display_name: "John Wick from eu-west-3b".to_owned(),
+        })?
+        .commit::<User>()
         .await?;
 
     sleep(Duration::from_millis(300)).await;
@@ -265,23 +266,21 @@ pub async fn test_multiple_consumer<E: Engine + Clone + 'static>(
     assert_eq!(user2.display_name, "Albert".to_owned());
 
     us_east_1a
-        .publish::<User, _>(
-            "2",
-            WriteEvent::new(UserEvent::DisplayNameUpdated).data(DisplayNameUpdated {
-                display_name: "Albert from us-east-1a".to_owned(),
-            })?,
-            1,
-        )
+        .write("2")
+        .original_version(1)
+        .event(DisplayNameUpdated {
+            display_name: "Albert from us-east-1a".to_owned(),
+        })?
+        .commit::<User>()
         .await?;
 
     us_east_1a
-        .publish::<User, _>(
-            "1",
-            WriteEvent::new(UserEvent::DisplayNameUpdated).data(DisplayNameUpdated {
-                display_name: "John Wick from us-east-1a".to_owned(),
-            })?,
-            2,
-        )
+        .write("1")
+        .original_version(2)
+        .event(DisplayNameUpdated {
+            display_name: "John Wick from us-east-1a".to_owned(),
+        })?
+        .commit::<User>()
         .await?;
 
     sleep(Duration::from_millis(300)).await;
@@ -437,24 +436,23 @@ pub async fn test_no_cdc<E: Engine + Clone + 'static>(
     sleep(Duration::from_millis(1500)).await;
 
     producer
-        .publish::<User, _>(
-            "1",
-            WriteEvent::new(UserEvent::Created).data(DisplayNameUpdated {
-                display_name: "John Doe".to_owned(),
-            })?,
-            1,
-        )
+        .write("1")
+        .original_version(1)
+        .event(DisplayNameUpdated {
+            display_name: "John Doe".to_owned(),
+        })?
+        .commit::<User>()
         .await?;
 
     producer
-        .aggregate::<User>("4")
+        .write("4")
         .event(Created {
             display_name: "Luffy".to_owned(),
         })?
         .event(DisplayNameUpdated {
             display_name: "Monkey D. Luffy".to_owned(),
         })?
-        .publish()
+        .commit::<User>()
         .await?;
 
     sleep(Duration::from_millis(301)).await;
@@ -510,18 +508,14 @@ pub async fn test_external_store<E: Engine + Clone + 'static>(
     init(&producer_ext).await?;
 
     producer
-        .publish_all::<User, _>(
-            "1",
-            vec![
-                WriteEvent::new(UserEvent::Created).data(Created {
-                    display_name: "Nami".to_owned(),
-                })?,
-                WriteEvent::new(UserEvent::DisplayNameUpdated).data(DisplayNameUpdated {
-                    display_name: "Vegapunk D. Nami".to_owned(),
-                })?,
-            ],
-            0,
-        )
+        .write("1")
+        .event(Created {
+            display_name: "Nami".to_owned(),
+        })?
+        .event(DisplayNameUpdated {
+            display_name: "Vegapunk D. Nami".to_owned(),
+        })?
+        .commit::<User>()
         .await?;
 
     sleep(Duration::from_millis(300)).await;
@@ -546,38 +540,30 @@ pub async fn test_external_store<E: Engine + Clone + 'static>(
 
 async fn init(producer: &Producer) -> Result<()> {
     producer
-        .publish::<User, _>(
-            "1",
-            WriteEvent::new(UserEvent::Created).data(Created {
-                display_name: "John".to_owned(),
-            })?,
-            0,
-        )
+        .write("1")
+        .event(Created {
+            display_name: "John".to_owned(),
+        })?
+        .commit::<User>()
         .await?;
 
     producer
-        .publish_all::<User, _>(
-            "2",
-            vec![
-                WriteEvent::new(UserEvent::Created).data(Created {
-                    display_name: "Albert".to_owned(),
-                })?,
-                WriteEvent::new(UserEvent::DisplayNameUpdated).data(DisplayNameUpdated {
-                    display_name: "Albert Dupont".to_owned(),
-                })?,
-            ],
-            0,
-        )
+        .write("2")
+        .event(Created {
+            display_name: "Albert".to_owned(),
+        })?
+        .event(DisplayNameUpdated {
+            display_name: "Albert Dupont".to_owned(),
+        })?
+        .commit::<User>()
         .await?;
 
     producer
-        .publish::<User, _>(
-            "3",
-            WriteEvent::new(UserEvent::Created).data(Created {
-                display_name: "Nina Doe".to_owned(),
-            })?,
-            0,
-        )
+        .write("3")
+        .event(Created {
+            display_name: "Nina Doe".to_owned(),
+        })?
+        .commit::<User>()
         .await?;
 
     Ok(())

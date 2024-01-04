@@ -1,11 +1,13 @@
 use askama::Template;
 use askama_axum::IntoResponse;
-use axum::http::StatusCode;
+use axum::{extract::Query, http::StatusCode, Extension, Form};
+use evento::{Command, CommandError};
 use std::collections::HashMap;
 
-use crate::product::{EditProductInput, GetProductDetails};
-
-use super::{Command, Query};
+use crate::{
+    lang::UserLanguage,
+    product::{EditProductInput, GetProductDetails},
+};
 
 #[derive(Template)]
 #[template(path = "edit.html")]
@@ -20,36 +22,49 @@ pub struct EditTemplate {
     visible: bool,
 }
 
-pub async fn get(query: Query<GetProductDetails>) -> EditTemplate {
-    EditTemplate {
+pub async fn get(
+    Query(input): Query<GetProductDetails>,
+    Extension(query): Extension<evento::Query>,
+) -> Result<EditTemplate, crate::extract::Error> {
+    let edge = query.execute(&input).await?;
+
+    Ok(EditTemplate {
         errors: HashMap::default(),
-        id: query.output.node.id,
-        name: query.output.node.name,
-        description: query.output.node.description.unwrap_or_default(),
-        category: query.output.node.category.unwrap_or_default(),
-        price: query.output.node.price.unwrap_or_default(),
-        stock: query.output.node.stock,
-        visible: query.output.node.visible,
-    }
+        id: edge.node.id,
+        name: edge.node.name,
+        description: edge.node.description.unwrap_or_default(),
+        category: edge.node.category.unwrap_or_default(),
+        price: edge.node.price.unwrap_or_default(),
+        stock: edge.node.stock,
+        visible: edge.node.visible,
+    })
 }
 
-pub async fn post(cmd: Command<EditProductInput>) -> impl IntoResponse {
-    if let Err(errors) = cmd.output {
+pub async fn post(
+    Extension(cmd): Extension<Command>,
+    UserLanguage(lang): UserLanguage,
+    Form(input): Form<EditProductInput>,
+) -> impl IntoResponse {
+    let Err(err) = cmd.execute(lang, &input).await else {
+        return ([("Location", "/")], StatusCode::FOUND).into_response();
+    };
+
+    if let CommandError::Validation(errors) = err {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
             EditTemplate {
                 errors,
-                id: cmd.input.id,
-                name: cmd.input.name,
-                description: cmd.input.description,
-                category: cmd.input.category,
-                price: cmd.input.price,
-                stock: cmd.input.stock,
-                visible: cmd.input.visible.is_some(),
+                id: input.id,
+                name: input.name,
+                description: input.description,
+                category: input.category,
+                price: input.price,
+                stock: input.stock,
+                visible: input.visible.is_some(),
             },
         )
             .into_response();
     }
 
-    ([("Location", "/")], StatusCode::FOUND).into_response()
+    crate::extract::Error::Command(err).into_response()
 }

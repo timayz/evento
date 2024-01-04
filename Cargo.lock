@@ -526,14 +526,7 @@ dependencies = [
 name = "evento-axum"
 version = "1.0.0-alpha.6"
 dependencies = [
- "async-trait",
  "axum",
- "evento",
- "evento-store",
- "serde",
- "thiserror",
- "tracing",
- "validator",
 ]
 
 [[package]]
@@ -1393,6 +1386,7 @@ dependencies = [
  "anyhow",
  "askama",
  "askama_axum",
+ "async-trait",
  "axum",
  "evento",
  "evento-axum",

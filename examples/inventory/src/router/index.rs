@@ -1,5 +1,6 @@
 use askama::Template;
 use async_trait::async_trait;
+use axum::{extract::Query, Extension};
 use evento::{
     store::{Aggregate, Event},
     ConsumerContext, RuleHandler,
@@ -11,8 +12,6 @@ use crate::{
     Publisher,
 };
 
-use super::Query;
-
 #[derive(Template)]
 #[template(path = "index.html")]
 pub struct IndexTemplate {
@@ -20,19 +19,21 @@ pub struct IndexTemplate {
     pub cursor: Option<String>,
 }
 
-pub async fn index(data: Query<ListProductDetails>) -> IndexTemplate {
+pub async fn index(
+    Query(input): Query<ListProductDetails>,
+    Extension(query): Extension<evento::Query>,
+) -> Result<IndexTemplate, crate::extract::Error> {
+    let data = query.execute(&input).await?;
+
     let cursor = match (
-        data.output.page_info.end_cursor.to_owned(),
-        data.output.page_info.has_next_page,
+        data.page_info.end_cursor.to_owned(),
+        data.page_info.has_next_page,
     ) {
         (Some(cursor), true) => Some(cursor.0),
         _ => None,
     };
 
-    IndexTemplate {
-        data: data.output,
-        cursor,
-    }
+    Ok(IndexTemplate { data, cursor })
 }
 
 #[derive(Template)]
@@ -41,8 +42,13 @@ pub struct ProductTemplate {
     pub edge: Edge<ProductDetails>,
 }
 
-pub async fn product(data: Query<GetProductDetails>) -> ProductTemplate {
-    ProductTemplate { edge: data.output }
+pub async fn product(
+    Query(input): Query<GetProductDetails>,
+    Extension(query): Extension<evento::Query>,
+) -> Result<ProductTemplate, crate::extract::Error> {
+    let edge = query.execute(&input).await?;
+
+    Ok(ProductTemplate { edge })
 }
 
 #[derive(Clone)]

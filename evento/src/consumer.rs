@@ -2,7 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use dyn_clone::DynClone;
-use evento_store::{Aggregate, Applier, Cursor, Event, Result as StoreResult, Store, WriteEvent};
+use evento_store::{Aggregate, Applier, Cursor, Event, Result as StoreResult, Store};
 use futures_util::future::join_all;
 use glob_match::glob_match;
 use parking_lot::RwLock;
@@ -16,7 +16,7 @@ use tokio::time::{interval_at, sleep, Duration, Instant};
 use tracing::{debug, error, info};
 use uuid::Uuid;
 
-use crate::{context::Context, engine::Engine, Producer};
+use crate::{context::Context, engine::Engine, Producer, Publisher};
 
 #[derive(Clone)]
 pub struct ConsumerContext {
@@ -34,25 +34,8 @@ impl ConsumerContext {
         self.inner.read().get::<T>().cloned()
     }
 
-    pub async fn publish<A: Aggregate, I: Into<String>>(
-        &self,
-        id: I,
-        event: WriteEvent,
-        original_version: u16,
-    ) -> StoreResult<Vec<Event>> {
-        self.publish_all::<A, I>(id, vec![event], original_version)
-            .await
-    }
-
-    pub async fn publish_all<A: Aggregate, I: Into<String>>(
-        &self,
-        id: I,
-        events: Vec<WriteEvent>,
-        original_version: u16,
-    ) -> StoreResult<Vec<Event>> {
-        self.producer
-            .publish_all::<A, I>(id, events, original_version)
-            .await
+    pub fn write(&self, value: impl Into<String>) -> Publisher<'_> {
+        self.producer.write(value)
     }
 
     pub async fn load<A: Aggregate + Applier, I: Into<String>>(
