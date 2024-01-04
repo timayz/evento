@@ -1,9 +1,12 @@
+mod extract;
+mod lang;
 mod product;
 mod router;
 
 use std::{collections::HashMap, convert::Infallible, str::FromStr, sync::Arc, time::Duration};
 
 use anyhow::Result;
+use askama::Template;
 use axum::{
     extract::{Path, State},
     http::{header, StatusCode, Uri},
@@ -25,6 +28,14 @@ use tokio_stream::{wrappers::ReceiverStream, Stream};
 use tracing_subscriber::{
     prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt, EnvFilter,
 };
+
+#[derive(Template)]
+#[template(path = "_404.html")]
+pub struct NotFoundTemplate;
+
+#[derive(Template)]
+#[template(path = "_500.html")]
+pub struct ServerErrorTemplate;
 
 #[derive(Clone)]
 pub struct AppState {

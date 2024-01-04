@@ -24,6 +24,7 @@ rust-embed = "8.2.0"
 mime_guess = "2.0.4"
 async-trait = "0.1.75"
 rand = "0.8.5"
+thiserror = "1.0.52"
 evento = { path = "../../evento", version = "1.0.0-alpha.6", features = ["pg"] }
 evento-axum = { path = "../../evento-axum", version = "1.0.0-alpha.6" }
 evento-query = { path = "../../evento-query", version = "1.0.0-alpha.6", features = ["pg"] }

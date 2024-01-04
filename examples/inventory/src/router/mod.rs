@@ -4,12 +4,9 @@ mod details;
 mod edit;
 mod generate;
 mod index;
-mod render;
 
 use axum::{routing::get, Router};
 use evento::Rule;
-
-pub use render::*;
 
 use crate::{product::ProductRule, AppState};
 
