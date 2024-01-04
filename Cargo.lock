@@ -1871,6 +1871,7 @@ version = "1.0.0-alpha.6"
 dependencies = [
  "anyhow",
  "askama",
+ "askama_axum",
  "async-trait",
  "axum",
  "chrono",
