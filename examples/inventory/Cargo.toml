@@ -1,6 +1,6 @@
 [package]
 name = "inventory"
-version = "1.0.0-alpha.7"
+version = "1.0.0-alpha.8"
 edition = "2021"
 
 [dependencies]
@@ -24,6 +24,6 @@ rust-embed = "8.2.0"
 mime_guess = "2.0.4"
 async-trait = "0.1.75"
 rand = "0.8.5"
-evento = { path = "../../evento", version = "1.0.0-alpha.7", features = ["pg"] }
-evento-axum = { path = "../../evento-axum", version = "1.0.0-alpha.7" }
-evento-query = { path = "../../evento-query", version = "1.0.0-alpha.7", features = ["pg"] }
+evento = { path = "../../evento", version = "1.0.0-alpha.8", features = ["pg"] }
+evento-axum = { path = "../../evento-axum", version = "1.0.0-alpha.8" }
+evento-query = { path = "../../evento-query", version = "1.0.0-alpha.8", features = ["pg"] }
