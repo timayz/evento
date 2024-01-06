@@ -83,9 +83,9 @@ impl<E: Engine + Clone + 'static> Consumer<E> {
         let name = name.into();
 
         let context = ConsumerContext {
-            inner: Default::default(),
+            inner: self.context.inner.clone(),
             name: Some(name.to_owned()),
-            producer: self.context.producer.clone(),
+            producer: self.context.producer.name(&name),
         };
 
         Self {
