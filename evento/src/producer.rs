@@ -10,6 +10,13 @@ pub struct Producer {
 }
 
 impl Producer {
+    pub fn name<N: Into<String>>(&self, value: N) -> Self {
+        Self {
+            name: Some(value.into()),
+            store: self.store.clone(),
+        }
+    }
+
     pub async fn load<A: Aggregate + Applier, I: Into<String>>(
         &self,
         id: I,
