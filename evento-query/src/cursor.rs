@@ -8,8 +8,12 @@ use base64::{
 use chrono::{DateTime, NaiveDateTime, Utc};
 use harsh::Harsh;
 use serde::{Deserialize, Serialize};
+#[cfg(any(feature = "pg", feature = "sqlite"))]
+use sqlx::{query::QueryAs, FromRow};
 #[cfg(feature = "pg")]
-use sqlx::{postgres::PgArguments, query::QueryAs, FromRow, Postgres};
+use sqlx::{postgres::PgArguments, Postgres};
+#[cfg(feature = "sqlite")]
+use sqlx::{sqlite::SqliteArguments, Sqlite};
 use std::{fmt::Debug, str::FromStr};
 
 use crate::error::QueryError;
@@ -47,6 +51,16 @@ pub trait Cursor: Sized {
         O: 'q + std::marker::Send,
         O: 'q + Unpin,
         O: 'q + Cursor;
+    #[cfg(feature = "sqlite")]
+        fn bind_sqlite<'q, O>(
+            self,
+            query: QueryAs<Sqlite, O, SqliteArguments>,
+        ) -> QueryAs<'q, Sqlite, O, SqliteArguments<'q>>
+        where
+            O: for<'r> FromRow<'r, <sqlx::Sqlite as sqlx::Database>::Row>,
+            O: 'q + std::marker::Send,
+            O: 'q + Unpin,
+            O: 'q + Cursor;
     fn serialize(&self) -> Vec<String>;
     fn deserialize(values: Vec<&str>) -> Result<Self, QueryError>;
 

@@ -27,7 +27,7 @@ pub async fn get_pool() -> &'static PgPool {
 
         let pool = PgPool::connect(dsn).await.unwrap();
 
-        Migrator::new(Path::new("./tests/fixtures/db"))
+        Migrator::new(Path::new("./tests/fixtures/pg"))
             .await
             .unwrap()
             .run(&pool)
@@ -123,5 +123,18 @@ impl Cursor for User {
             created_at,
             ..Default::default()
         })
+    }
+
+    fn bind_sqlite<'q, O>(
+        self,
+        query: sqlx::query::QueryAs<sqlx::Sqlite, O, sqlx::sqlite::SqliteArguments>,
+    ) -> sqlx::query::QueryAs<'q, sqlx::Sqlite, O, sqlx::sqlite::SqliteArguments<'q>>
+    where
+        O: for<'r> sqlx::prelude::FromRow<'r, <sqlx::Sqlite as sqlx::Database>::Row>,
+        O: 'q + std::marker::Send,
+        O: 'q + Unpin,
+        O: 'q + Cursor,
+    {
+        query.bind(self.created_at).bind(self.age).bind(self.id)
     }
 }

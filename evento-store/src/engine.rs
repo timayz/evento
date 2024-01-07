@@ -13,6 +13,11 @@ mod memory;
 #[cfg(feature = "memory")]
 pub use memory::*;
 
+#[cfg(feature = "sqlite")]
+mod sqlite;
+#[cfg(feature = "sqlite")]
+pub use sqlite::*;
+
 #[cfg(feature = "pg")]
 mod pg;
 #[cfg(feature = "pg")]
