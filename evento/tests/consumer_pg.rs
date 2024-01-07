@@ -30,7 +30,7 @@ pub async fn get_pool() -> &'static PgPool {
 
         let pool = PgPool::connect(dsn).await.unwrap();
 
-        Migrator::new(Path::new("./tests/fixtures/db"))
+        Migrator::new(Path::new("./tests/fixtures/pg"))
             .await
             .unwrap()
             .run(&pool)

@@ -3,19 +3,19 @@ mod store;
 
 use std::{io, path::Path, time::Duration};
 
-use evento_store::PgStore;
+use evento_store::SqliteStore;
 use futures_util::{Future, TryFutureExt};
 use sqlx::{
     migrate::{MigrateDatabase, Migrator},
-    Any, PgPool,
+    Any, SqlitePool,
 };
 use tokio::sync::OnceCell;
 
-static POOL: OnceCell<PgPool> = OnceCell::const_new();
+static POOL: OnceCell<SqlitePool> = OnceCell::const_new();
 
-pub async fn get_pool() -> &'static PgPool {
+pub async fn get_pool() -> &'static SqlitePool {
     POOL.get_or_init(|| async {
-        let dsn = "postgres://postgres:postgres@localhost:5432/evento_test_store";
+        let dsn = "sqlite:tests/fixtures/evento_test_store.db";
         let exists = retry_connect_errors(dsn, Any::database_exists)
             .await
             .unwrap();
@@ -26,9 +26,9 @@ pub async fn get_pool() -> &'static PgPool {
 
         Any::create_database(dsn).await.unwrap();
 
-        let pool = PgPool::connect(dsn).await.unwrap();
+        let pool = SqlitePool::connect(dsn).await.unwrap();
 
-        Migrator::new(Path::new("./tests/fixtures/pg"))
+        Migrator::new(Path::new("./tests/fixtures/sqlite"))
             .await
             .unwrap()
             .run(&pool)
@@ -43,7 +43,7 @@ pub async fn get_pool() -> &'static PgPool {
 #[tokio_shared_rt::test]
 async fn concurrency() {
     let pool = get_pool().await;
-    let store = PgStore::with_prefix(pool, "concurrency");
+    let store = SqliteStore::with_prefix(pool, "concurrency");
     store::init(&store).await.unwrap();
     store::test_concurrency(&store).await.unwrap();
 }
@@ -51,7 +51,7 @@ async fn concurrency() {
 #[tokio_shared_rt::test]
 async fn save() {
     let pool = get_pool().await;
-    let store = PgStore::with_prefix(pool, "save");
+    let store = SqliteStore::with_prefix(pool, "save");
     store::init(&store).await.unwrap();
     store::test_save(&store).await.unwrap();
 }
@@ -59,7 +59,7 @@ async fn save() {
 #[tokio_shared_rt::test]
 async fn wrong_version() {
     let pool = get_pool().await;
-    let store = PgStore::with_prefix(pool, "wrong_version");
+    let store = SqliteStore::with_prefix(pool, "wrong_version");
     store::init(&store).await.unwrap();
     store::test_wrong_version(&store).await.unwrap();
 }
@@ -67,7 +67,7 @@ async fn wrong_version() {
 #[tokio_shared_rt::test]
 async fn insert() {
     let pool = get_pool().await;
-    let store = PgStore::with_prefix(pool, "insert");
+    let store = SqliteStore::with_prefix(pool, "insert");
     store::init(&store).await.unwrap();
     store::test_insert(&store).await.unwrap();
 }
