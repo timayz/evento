@@ -1,6 +1,6 @@
 [package]
 name = "evento-store"
-version = "1.0.0-alpha.8"
+version = "0.10.0"
 edition = "2021"
 license = "Apache-2.0"
 publish = true
@@ -25,7 +25,7 @@ futures-util = "0.3.30"
 dyn-clone = "1.0.16"
 async-trait = "0.1.75"
 anyhow = "1.0.77"
-evento-query = { path = "../evento-query", version = "1.0.0-alpha.8" }
+evento-query = { path = "../evento-query", version = "0.10.0" }
 
 [dependencies.uuid]
 version = "1.6.1"
