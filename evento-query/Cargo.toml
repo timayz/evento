@@ -14,18 +14,18 @@ full = ["pg"]
 pg = ["dep:sqlx"]
 
 [dependencies]
-serde = { version = "1.0.193", features = ["derive"] }
+serde = { version = "1.0.196", features = ["derive"] }
 sqlx = { version = "0.7.3", features = ["runtime-tokio", "postgres", "chrono", "uuid", "json"], optional = true }
-thiserror = "1.0.52"
-chrono = { version = "0.4.31", default-features = false, features = ["clock", "serde"] }
+thiserror = "1.0.57"
+chrono = { version = "0.4.34", default-features = false, features = ["clock", "serde"] }
 futures-util = "0.3.30"
-base64 = "0.21.5"
+base64 = "0.21.7"
 harsh = "0.2.2"
 
 [dev-dependencies]
-tokio = { version = "1.35.1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1.36.0", features = ["rt-multi-thread", "macros"] }
 backoff = { version = "0.4.0", features = ["futures", "tokio"] }
 sqlx = { version = "0.7.3", features = ["runtime-tokio", "postgres", "chrono", "uuid", "json", "any"] }
-uuid = { version = "1.6.1", features = ["v4", "fast-rng", "macro-diagnostics", "serde"] }
-parse-display = "0.8.2"
+uuid = { version = "1.7.0", features = ["v4", "fast-rng", "macro-diagnostics", "serde"] }
+parse-display = "0.9.0"
 tokio-shared-rt = "0.1.0"
