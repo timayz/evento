@@ -1,182 +1,43 @@
-use evento::{Aggregate, Event, EventStore};
-use evento_store::{Engine, PgEngine};
+use chrono::{DateTime, Utc};
+use evento_query::Cursor;
 use futures_util::{Future, TryFutureExt};
-use parse_display::{Display, FromStr};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sqlx::{
     migrate::{MigrateDatabase, Migrator},
     Any, PgPool,
 };
 use std::{io, path::Path, time::Duration};
+use tokio::sync::OnceCell;
+use uuid::Uuid;
 
-#[derive(Display, FromStr)]
-#[display(style = "kebab-case")]
-pub enum UserEvent {
-    Created,
-    DisplayNameUpdated,
-    ProfileUpdated,
-    PasswordUpdated,
-    AccountDeleted,
-}
+static POOL: OnceCell<PgPool> = OnceCell::const_new();
 
-impl From<UserEvent> for String {
-    fn from(val: UserEvent) -> Self {
-        val.to_string()
-    }
-}
+pub async fn get_pool() -> &'static PgPool {
+    POOL.get_or_init(|| async {
+        let dsn = "postgres://postgres:postgres@localhost:5432/evento_test_query";
+        let exists = retry_connect_errors(dsn, Any::database_exists)
+            .await
+            .unwrap();
 
-#[derive(Serialize, Deserialize)]
-pub struct Created {
-    pub username: String,
-    pub password: String,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct DisplayNameUpdated {
-    pub display_name: String,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct ProfileUpdated {
-    pub first_name: String,
-    pub last_name: String,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct PasswordUpdated {
-    pub old_password: String,
-    pub new_password: String,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct AccountDeleted {
-    pub deleted: bool,
-}
-
-#[derive(Default, Serialize, Deserialize, Debug, Clone)]
-pub struct User {
-    pub first_name: Option<String>,
-    pub last_name: Option<String>,
-    pub display_name: Option<String>,
-    pub username: String,
-    pub password: String,
-    pub deleted: bool,
-}
-
-impl Aggregate for User {
-    fn apply(&mut self, event: &Event) {
-        let user_event: UserEvent = event.name.parse().unwrap();
-
-        match user_event {
-            UserEvent::Created => {
-                let data: Created = event.to_data().unwrap();
-                self.username = data.username;
-                self.password = data.password;
-            }
-            UserEvent::DisplayNameUpdated => {
-                let data: DisplayNameUpdated = event.to_data().unwrap();
-                self.display_name = Some(data.display_name);
-            }
-            UserEvent::ProfileUpdated => {
-                let data: ProfileUpdated = event.to_data().unwrap();
-                self.first_name = Some(data.first_name);
-                self.last_name = Some(data.last_name);
-            }
-            UserEvent::PasswordUpdated => {
-                let data: PasswordUpdated = event.to_data().unwrap();
-                self.password = data.new_password;
-            }
-            UserEvent::AccountDeleted => {
-                let data: AccountDeleted = event.to_data().unwrap();
-                self.deleted = data.deleted;
-            }
+        if exists {
+            Any::drop_database(dsn).await.unwrap();
         }
-    }
 
-    fn aggregate_type<'a>() -> &'a str {
-        "user"
-    }
+        Any::create_database(dsn).await.unwrap();
+
+        let pool = PgPool::connect(dsn).await.unwrap();
+
+        Migrator::new(Path::new("./tests/fixtures/db"))
+            .await
+            .unwrap()
+            .run(&pool)
+            .await
+            .unwrap();
+
+        pool
+    })
+    .await
 }
-
-#[allow(dead_code)]
-pub async fn create_pg_store(db_name: &str, init: bool) -> (EventStore<PgEngine>, PgPool) {
-    let dsn = &format!("postgres://postgres:postgres@localhost:5432/evento_{db_name}");
-    let exists = retry_connect_errors(dsn, Any::database_exists)
-        .await
-        .unwrap();
-
-    if exists {
-        Any::drop_database(dsn).await.unwrap();
-    }
-
-    Any::create_database(dsn).await.unwrap();
-
-    let pool = PgPool::connect(dsn).await.unwrap();
-
-    Migrator::new(Path::new("../migrations"))
-        .await
-        .unwrap()
-        .run(&pool)
-        .await
-        .unwrap();
-
-    let store = PgEngine::new(pool.clone());
-
-    if init {
-        init_store(&store).await;
-    }
-
-    (store, pool)
-}
-
-#[allow(dead_code)]
-pub async fn init_store<E: Engine>(store: &E) {
-    store
-        .save::<User, _>(
-            "1",
-            vec![
-                Event::new(UserEvent::Created)
-                    .data(Created {
-                        username: "john.doe".to_owned(),
-                        password: "azerty".to_owned(),
-                    })
-                    .unwrap(),
-                Event::new(UserEvent::AccountDeleted)
-                    .data(AccountDeleted { deleted: true })
-                    .unwrap(),
-            ],
-            0,
-        )
-        .await
-        .unwrap();
-
-    store
-        .save::<User, _>(
-            "2",
-            vec![
-                Event::new(UserEvent::Created)
-                    .data(Created {
-                        username: "albert.dupont".to_owned(),
-                        password: "azerty".to_owned(),
-                    })
-                    .unwrap(),
-                Event::new(UserEvent::ProfileUpdated)
-                    .data(ProfileUpdated {
-                        first_name: "albert".to_owned(),
-                        last_name: "dupont".to_owned(),
-                    })
-                    .unwrap(),
-            ],
-            0,
-        )
-        .await
-        .unwrap();
-}
-
-/// Attempt to connect to the database server, retrying up to `ops.connect_timeout`.
-// async fn connect(database_url: &String) -> sqlx::Result<AnyConnection> {
-//     retry_connect_errors(database_url, AnyConnection::connect).await
-// }
 
 /// Attempt an operation that may return errors like `ConnectionRefused`,
 /// retrying up until `ops.connect_timeout`.
@@ -214,4 +75,53 @@ where
         },
     )
     .await
+}
+
+#[derive(Clone, Deserialize, Debug, sqlx::FromRow, Default, PartialEq)]
+pub struct User {
+    pub id: Uuid,
+    pub name: String,
+    pub age: i32,
+    pub created_at: DateTime<Utc>,
+}
+
+impl Cursor for User {
+    fn keys() -> Vec<&'static str> {
+        vec!["created_at", "age", "id"]
+    }
+
+    fn bind<'q, O>(
+        self,
+        query: sqlx::query::QueryAs<sqlx::Postgres, O, sqlx::postgres::PgArguments>,
+    ) -> sqlx::query::QueryAs<sqlx::Postgres, O, sqlx::postgres::PgArguments>
+    where
+        O: for<'r> sqlx::FromRow<'r, <sqlx::Postgres as sqlx::Database>::Row>,
+        O: 'q + std::marker::Send,
+        O: 'q + Unpin,
+        O: 'q + Cursor,
+    {
+        query.bind(self.created_at).bind(self.age).bind(self.id)
+    }
+
+    fn serialize(&self) -> Vec<String> {
+        vec![
+            Self::serialize_utc(self.created_at),
+            self.age.to_string(),
+            self.id.to_string(),
+        ]
+    }
+
+    fn deserialize(values: Vec<&str>) -> Result<Self, evento_query::QueryError> {
+        let mut values = values.iter();
+        let created_at = Self::deserialize_as_utc("created_at", values.next())?;
+        let age = Self::deserialize_as("age", values.next())?;
+        let id = Self::deserialize_as("id", values.next())?;
+
+        Ok(User {
+            id,
+            age,
+            created_at,
+            ..Default::default()
+        })
+    }
 }
