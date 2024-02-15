@@ -1,6 +1,6 @@
 [package]
 name = "payment"
-version = "0.10.0"
+version = "0.10.1"
 edition = "2021"
 
 [dependencies]
@@ -16,5 +16,5 @@ anyhow = "1.0.79"
 rust-embed = "8.2.0"
 mime_guess = "2.0.4"
 async-trait = "0.1.77"
-evento = { path = "../../evento", version = "0.10.0", features = ["pg"] }
-evento-axum = { path = "../../evento-axum", version = "0.10.0" }
+evento = { path = "../../evento", version = "0.10.1", features = ["pg"] }
+evento-axum = { path = "../../evento-axum", version = "0.10.1" }

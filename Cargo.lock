@@ -493,7 +493,7 @@ checksum = "0206175f82b8d6bf6652ff7d71a1e27fd2e4efde587fd368662814d6ec1d9ce0"
 
 [[package]]
 name = "evento"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -520,14 +520,14 @@ dependencies = [
 
 [[package]]
 name = "evento-axum"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "axum",
 ]
 
 [[package]]
 name = "evento-macro"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "convert_case",
  "evento-store",
@@ -541,7 +541,7 @@ dependencies = [
 
 [[package]]
 name = "evento-query"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "backoff",
  "base64",
@@ -559,7 +559,7 @@ dependencies = [
 
 [[package]]
 name = "evento-store"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1035,7 +1035,7 @@ dependencies = [
 
 [[package]]
 name = "inventory"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "anyhow",
  "askama",
@@ -1396,7 +1396,7 @@ checksum = "de3145af08024dea9fa9914f381a17b8fc6034dfb00f3a84013f7ff43f29ed4c"
 
 [[package]]
 name = "payment"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "anyhow",
  "askama",
@@ -1906,7 +1906,7 @@ dependencies = [
 
 [[package]]
 name = "shop"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "anyhow",
  "askama",
