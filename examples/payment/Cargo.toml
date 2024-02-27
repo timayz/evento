@@ -12,7 +12,7 @@ tokio = { version = "1.36.0", features = ["rt-multi-thread", "macros"] }
 tokio-stream = "0.1.14"
 futures = "0.3.30"
 sqlx = { version = "0.7.3", features = [ "runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid", "json", "any" ] }
-anyhow = "1.0.79"
+anyhow = "1.0.80"
 rust-embed = "8.2.0"
 mime_guess = "2.0.4"
 async-trait = "0.1.77"

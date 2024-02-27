@@ -14,8 +14,8 @@ futures = "0.3.30"
 sqlx = { version = "0.7.3", features = [ "runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid", "json", "any" ] }
 parse-display = "0.9.0"
 chrono = { version = "0.4.34", features = ["unstable-locales"] }
-serde = "1.0.196"
-anyhow = "1.0.79"
+serde = "1.0.197"
+anyhow = "1.0.80"
 rust-embed = "8.2.0"
 mime_guess = "2.0.4"
 async-trait = "0.1.77"
