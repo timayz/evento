@@ -1,6 +1,6 @@
 [package]
 name = "evento-macro"
-version = "0.10.1"
+version = "0.10.2"
 edition = "2021"
 license = "Apache-2.0"
 publish = true
@@ -21,4 +21,4 @@ proc-macro2 = "1.0.78"
 
 [dev-dependencies]
 parse-display = { version = "0.9.0" }
-evento-store = { path = "../evento-store", version = "0.10.1" }
+evento-store = { path = "../evento-store", version = "0.10.2" }
