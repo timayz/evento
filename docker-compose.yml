@@ -1,13 +1,6 @@
 version: '3.9'
 
 services:
-  postgres:
-    image: postgres:16.2-alpine
-    ports:
-      - 5432:5432
-    environment:
-      POSTGRES_PASSWORD: postgres
-
   mongo:
     image: mongo:7.0
     ports:
