@@ -4,12 +4,20 @@ resolver = "2"
 members = [
     "./evento",
     "./evento-macro",
-    "./evento-query",
-    "./examples/*"
+    "./evento-query"
+    # "./examples/*"
 ]
 
 [profile.dev]
-opt-level = 1
+opt-level = 0
+debug = 0
 
 [profile.dev.package."*"]
 opt-level = 3
+
+[profile.release]
+opt-level = "z"
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"

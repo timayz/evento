@@ -7,9 +7,6 @@ fmt:
 clippy:
 	cargo clippy --fix --all-features -- -D warnings
 
-deny:
-	cargo deny check
-
 machete:
 	cargo machete
 
