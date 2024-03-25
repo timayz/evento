@@ -7,14 +7,14 @@ edition = "2021"
 askama = { version = "0.12.1", default-features = false, features = ["with-axum", "mime", "mime_guess"] }
 askama_axum = "0.4.0"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
-axum = "0.7.4"
+axum = "0.7.5"
 tokio = { version = "1.36.0", features = ["rt-multi-thread", "macros"] }
-tokio-stream = "0.1.14"
+tokio-stream = "0.1.15"
 futures = "0.3.30"
-sqlx = { version = "0.7.3", features = [ "runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid", "json", "any" ] }
-anyhow = "1.0.80"
-rust-embed = "8.2.0"
+sqlx = { version = "0.7.4", features = [ "runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid", "json", "any" ] }
+anyhow = "1.0.81"
+rust-embed = "8.3.0"
 mime_guess = "2.0.4"
-async-trait = "0.1.77"
+async-trait = "0.1.79"
 evento = { path = "../../evento", version = "0.10.2", features = ["pg"] }
 evento-axum = { path = "../../evento-axum", version = "0.10.2" }
