@@ -97,7 +97,7 @@ pub struct EditProductInput {
     pub visible: Option<String>,
     #[validate(range(min = 0))]
     pub stock: i32,
-    #[validate(range(min = 0))]
+    #[validate(range(min = 0.0))]
     pub price: f32,
 }
 
