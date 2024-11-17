@@ -16,7 +16,7 @@ pg = ["dep:sqlx"]
 [dependencies]
 serde = { version = "1.0.215", features = ["derive"] }
 sqlx = { version = "0.8.2", features = ["runtime-tokio", "postgres", "chrono", "uuid", "json"], optional = true }
-thiserror = "1.0.69"
+thiserror = "2.0.3"
 chrono = { version = "0.4.38", default-features = false, features = ["clock", "serde"] }
 futures-util = "0.3.31"
 base64 = "0.22.1"

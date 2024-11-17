@@ -15,7 +15,7 @@ memory = ["evento-store/memory"]
 pg = ["dep:sqlx", "evento-store/pg"]
 
 [dependencies]
-thiserror = "1.0.69"
+thiserror = "2.0.3"
 anyhow = "1.0.93"
 serde = "1.0.215"
 parking_lot = "0.12.3"
