@@ -5,7 +5,7 @@ use base64::{
     engine::{general_purpose, GeneralPurpose},
     Engine,
 };
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, Utc};
 use harsh::Harsh;
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "pg")]
@@ -86,13 +86,12 @@ pub trait Cursor: Sized {
                     .map_err(QueryError::Harsh)
             })
             .and_then(|timestamp| {
-                NaiveDateTime::from_timestamp_micros(timestamp as i64).ok_or(QueryError::Unknown(
+                DateTime::from_timestamp_micros(timestamp as i64).ok_or(QueryError::Unknown(
                     "field".to_owned(),
                     "NaiveDateTime::from_timestamp_opt".to_owned(),
                     "none".to_owned(),
                 ))
             })
-            .map(|datetime| DateTime::from_naive_utc_and_offset(datetime, Utc))
     }
 
     fn to_cursor(&self) -> CursorType {
