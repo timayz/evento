@@ -1,15 +1,15 @@
-# name: Weekly
+name: Weekly
 
-# on:
-#   workflow_dispatch:
-#   schedule:
-#     - cron: 0 9 * * 1
+on:
+   workflow_dispatch:
+   schedule:
+     - cron: 0 9 * * 1
 
-# jobs:
-#   audit:
-#     uses: timayz/.github/.github/workflows/rust-audit.yml@v3
+jobs:
+   audit:
+     uses: timayz/.github/.github/workflows/rust-audit.yml@v3
 
-#   renovate:
-#     uses: timayz/.github/.github/workflows/renovate.yml@v3
-#     secrets:
-#       GH_TOKEN: ${{ secrets.GH_TOKEN }}
+   renovate:
+     uses: timayz/.github/.github/workflows/renovate.yml@v3
+     secrets:
+       GH_TOKEN: ${{ secrets.GH_TOKEN }}
