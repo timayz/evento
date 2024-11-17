@@ -9,4 +9,4 @@ repository = "https://github.com/timayz/evento"
 documentation = "https://docs.rs/evento"
 
 [dependencies]
-axum = { version = "0.7.4" }
+axum = { version = "0.7.9" }
