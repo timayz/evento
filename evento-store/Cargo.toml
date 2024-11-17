@@ -19,7 +19,7 @@ serde = "1.0.215"
 serde_json = "1.0.133"
 parking_lot = { version = "0.12.3", optional = true }
 sqlx = { version = "0.8.2", features = ["runtime-tokio", "postgres", "chrono", "json"], optional = true }
-thiserror = "1.0.69"
+thiserror = "2.0.3"
 chrono = { version = "0.4.38", default-features = false, features = ["clock", "serde"] }
 futures-util = "0.3.31"
 dyn-clone = "1.0.17"
