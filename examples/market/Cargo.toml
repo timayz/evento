@@ -1,5 +1,5 @@
 [package]
-name = "shop"
+name = "market"
 version = "1.0.0-alpha.8"
 edition = "2021"
 

@@ -9,29 +9,14 @@ down:
 
 reset: down up
 
-create:
-	sqlx database create
-
-migrate:
-	sqlx migrate run
-
-revert:
-	sqlx migrate revert
-
-prepare:
-	cargo sqlx prepare --merged
-
 test:
-	cargo test --features=full
+	cargo test --all-features
 
 fmt:
 	cargo fmt -- --emit files
 
 clippy:
 	cargo clippy --fix --all-features -- -D warnings
-
-deny:
-	cargo deny check
 
 machete:
 	cargo machete
@@ -49,24 +34,13 @@ outdated:
 	cargo outdated
 
 dev:
-	$(MAKE) _dev -j6
+	$(MAKE) _dev -j2
 
-_dev: serve.shop serve.inventory serve.payment tailwind.shop tailwind.inventory tailwind.payment
+_dev: serve.shop serve.market
 
 serve.shop:
 	cargo watch -x 'run -p shop'
 
-serve.inventory:
-	cargo watch -x 'run -p inventory'
+serve.market:
+	cargo watch -x 'run -p market'
 
-serve.payment:
-	cargo watch -x 'run -p payment'
-
-tailwind.shop:
-	npx tailwindcss -i ./examples/shop/style/tailwind.css -o ./examples/shop/public/main.css --watch
-
-tailwind.inventory:
-	npx tailwindcss -i ./examples/inventory/style/tailwind.css -o ./examples/inventory/public/main.css --watch
-
-tailwind.payment:
-	npx tailwindcss -i ./examples/payment/style/tailwind.css -o ./examples/payment/public/main.css --watch
