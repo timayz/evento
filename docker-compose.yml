@@ -1,17 +1,15 @@
-version: '3.9'
-
 services:
   postgres:
-    image: postgres:17.1-alpine
+    image: postgres:17.5-alpine
     ports:
       - 5432:5432
     environment:
-      POSTGRES_PASSWORD: postgres
-
-  mongo:
-    image: mongo:8.0
+      POSTGRES_PASSWORD: root
+      
+  mysql:
+    image: mysql:8.0-debian
     ports:
-      - 27017:27017
+      - 3306:3306
     environment:
-      MONGO_INITDB_ROOT_USERNAME: mongo
-      MONGO_INITDB_ROOT_PASSWORD: mongo
+      MYSQL_ROOT_PASSWORD: root
+
