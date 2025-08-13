@@ -4,7 +4,7 @@ services:
     ports:
       - 5432:5432
     environment:
-      POSTGRES_PASSWORD: root
+      POSTGRES_PASSWORD: postgres
       
   mysql:
     image: mysql:8.0-debian
