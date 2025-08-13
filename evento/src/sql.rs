@@ -14,8 +14,8 @@ use sqlx::{Database, Pool};
 use ulid::Ulid;
 
 use crate::{
-    AcknowledgeError, Aggregator, Executor, ReadError, SubscribeError, WriteError,
     cursor::{self, Args, Cursor, Edge, PageInfo, ReadResult, Value},
+    AcknowledgeError, Aggregator, Executor, ReadError, SubscribeError, WriteError,
 };
 
 #[derive(Iden, Clone)]

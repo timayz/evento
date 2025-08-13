@@ -1,8 +1,9 @@
 use base64::{
-    Engine, alphabet,
-    engine::{GeneralPurpose, general_purpose},
+    alphabet,
+    engine::{general_purpose, GeneralPurpose},
+    Engine,
 };
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::ops::{Deref, DerefMut};
 use thiserror::Error;
 
