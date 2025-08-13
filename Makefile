@@ -10,7 +10,7 @@ down:
 reset: down up
 
 test:
-	cargo test --features=full
+	cargo test --all-features
 
 fmt:
 	cargo fmt -- --emit files
@@ -36,11 +36,11 @@ outdated:
 dev:
 	$(MAKE) _dev -j2
 
-_dev: serve.shop serve.product 
+_dev: serve.shop serve.market
 
 serve.shop:
 	cargo watch -x 'run -p shop'
 
-serve.product:
-	cargo watch -x 'run -p product'
+serve.market:
+	cargo watch -x 'run -p market'
 
