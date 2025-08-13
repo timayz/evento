@@ -12,13 +12,5 @@ documentation = "https://docs.rs/evento"
 proc-macro = true
 
 [dependencies]
-syn = "2.0.43"
-quote = "1.0.33"
-proc-macro-error = "1.0.4"
-convert_case = "0.6.0"
-sha3 = "0.10.8"
-proc-macro2 = "1.0.71"
 
 [dev-dependencies]
-parse-display = { version = "0.8.2" }
-evento-store = { path = "../evento-store", version = "1.0.0-alpha.8" }
