@@ -13,4 +13,4 @@ jobs:
   test:
     uses: timayz/.github/.github/workflows/rust-test.yml@v3
     with:
-      postgres: true
+      mysql: true
