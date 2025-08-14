@@ -21,8 +21,9 @@ thiserror = "2.0"
 async-trait = "0.1"
 tracing = "0.1"
 base64 = "0.22"
-sea-query = { version = "1.0.0-rc.1", default-features = false, features = ["derive", "audit"], optional = true }
-sea-query-binder = { version = "0.8.0-rc.1", features = ["runtime-tokio"], optional = true }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+sea-query = { version = "1.0.0-rc.1", default-features = false, features = ["derive", "audit", "with-chrono"], optional = true }
+sea-query-binder = { version = "0.8.0-rc.1", features = ["runtime-tokio", "with-chrono"], optional = true }
 futures-util = { version = "0.3", optional = true }
 backon = { version =  "1.5", optional = true }
 
@@ -37,4 +38,5 @@ stream = ["futures-util", "tokio-stream"]
 handler = ["backon"]
 sqlite = ["sea-query/backend-sqlite", "sea-query-binder/sqlx-sqlite", "sqlx/sqlite"]
 mysql = ["sea-query/backend-mysql", "sea-query-binder/sqlx-mysql", "sqlx/mysql"]
+postgres = ["sea-query/backend-postgres", "sea-query-binder/sqlx-postgres", "sqlx/postgres"]
 

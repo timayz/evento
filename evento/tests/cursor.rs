@@ -1,3 +1,4 @@
+use chrono::{TimeZone, Utc};
 use evento::{
     cursor::{self, Args, Cursor, Edge, Order, PageInfo, ReadResult, Reader},
     Event,
@@ -545,7 +546,7 @@ pub fn get_data() -> Vec<Event> {
         None,
     ];
 
-    let timestamps: Vec<u32> = vec![rand::random(), rand::random(), rand::random()];
+    let timestamps: Vec<u16> = vec![rand::random(), rand::random(), rand::random()];
     let mut versions: HashMap<String, u16> = HashMap::new();
     let mut data = vec![];
 
@@ -574,9 +575,9 @@ pub fn get_data() -> Vec<Event> {
             name: "MessageSent".to_owned(),
             aggregator_id,
             aggregator_type: aggregator_type.to_owned(),
-            version: version.to_owned(),
+            version: version.to_owned() as i32,
             routing_key,
-            timestamp,
+            timestamp: Utc.timestamp_opt(timestamp as i64, 0).unwrap(),
             data: Default::default(),
             metadata: Default::default(),
         };
@@ -610,9 +611,9 @@ fn create_event(id: &str, version: u16, timestamp: u64) -> Event {
         name: "MessageSent".to_owned(),
         aggregator_id: Ulid::new().to_string(),
         aggregator_type: "Message".to_owned(),
-        version,
+        version: version as i32,
         routing_key: None,
-        timestamp,
+        timestamp: Utc.timestamp_opt(timestamp as i64, 0).unwrap(),
         data: Default::default(),
         metadata: Default::default(),
     }

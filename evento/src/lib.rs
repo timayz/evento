@@ -3,6 +3,7 @@ pub mod cursor;
 #[cfg(feature = "sqlite")]
 pub mod sql;
 
+use chrono::{DateTime, Utc};
 #[cfg(feature = "macro")]
 pub use evento_macro::*;
 
@@ -15,7 +16,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt::Debug,
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 use thiserror::Error;
 #[cfg(any(feature = "stream", feature = "handler"))]
@@ -38,8 +39,8 @@ pub struct EventData<D, M> {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EventCursor {
     pub i: Ulid,
-    pub v: u16,
-    pub t: u64,
+    pub v: i32,
+    pub t: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -47,12 +48,12 @@ pub struct Event {
     pub id: Ulid,
     pub aggregator_id: String,
     pub aggregator_type: String,
-    pub version: u16,
+    pub version: i32,
     pub name: String,
     pub routing_key: Option<String>,
     pub data: Vec<u8>,
     pub metadata: Vec<u8>,
-    pub timestamp: u64,
+    pub timestamp: DateTime<Utc>,
 }
 
 impl Event {
@@ -87,7 +88,7 @@ impl Cursor for Event {
 }
 
 pub trait Aggregator:
-    Default + Send + Sync + Serialize + DeserializeOwned + Clone + AggregatorName
+    Default + Send + Sync + Serialize + DeserializeOwned + Clone + AggregatorName + Debug
 {
     fn aggregate<'async_trait>(
         &'async_trait mut self,
@@ -155,7 +156,7 @@ pub trait Executor: Send + Sync + 'static {
         &self,
         key: String,
         cursor: Value,
-        lag: u64,
+        lag: i64,
     ) -> Result<(), AcknowledgeError>;
 }
 
@@ -274,7 +275,7 @@ pub struct SaveBuilder<A: Aggregator> {
     aggregator: A,
     routing_key: Option<String>,
     routing_key_locked: bool,
-    original_version: u16,
+    original_version: i32,
     data: Vec<(&'static str, Vec<u8>)>,
     metadata: Option<Vec<u8>>,
 }
@@ -294,7 +295,7 @@ impl<A: Aggregator> SaveBuilder<A> {
     }
 
     pub fn original_version(mut self, v: u16) -> Self {
-        self.original_version = v;
+        self.original_version = v as i32;
 
         self
     }
@@ -343,7 +344,7 @@ impl<A: Aggregator> SaveBuilder<A> {
         };
 
         let mut events = vec![];
-        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let timestamp = Utc::now();
 
         for (name, data) in &self.data {
             version += 1;
@@ -388,7 +389,7 @@ pub fn create<A: Aggregator>() -> SaveBuilder<A> {
 
 pub fn save<A: Aggregator>(aggregator: LoadResult<A>) -> SaveBuilder<A> {
     SaveBuilder::new(aggregator.item, aggregator.event.aggregator_id)
-        .original_version(aggregator.event.version)
+        .original_version(aggregator.event.version as u16)
         .routing_key_opt(aggregator.event.routing_key)
 }
 
@@ -415,7 +416,7 @@ pub struct Context<'a, E: Executor> {
     inner: Arc<Mutex<context::Context>>,
     key: String,
     cursor: Value,
-    lag: u64,
+    lag: i64,
     pub event: Event,
     pub executor: &'a E,
 }
@@ -571,7 +572,7 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
                 inner: self.context.clone(),
                 key: self.key.to_owned(),
                 executor,
-                lag: timestamp - edge.node.timestamp,
+                lag: (timestamp - edge.node.timestamp).num_seconds(),
                 cursor: edge.cursor.to_owned(),
                 event: edge.node.clone(),
             })
