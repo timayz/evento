@@ -1,6 +1,6 @@
 [package]
 name = "evento"
-version = "1.0.0-alpha.9"
+version = "1.0.0-alpha.10"
 edition = "2021"
 license = "Apache-2.0"
 publish = true
@@ -13,7 +13,7 @@ serde = { version = "1.0", features = ["derive"] }
 ulid = { version = "1.2", features = ["serde"] }
 tokio = { version = "1.45", features = ["full"] }
 tokio-stream = { version = "0.1", optional = true }
-evento-macro = { path = "../evento-macro", optional = true, version = "1.0.0-alpha.9" }
+evento-macro = { path = "../evento-macro", optional = true, version = "1.0.0-alpha.10" }
 anyhow = "1.0"
 ciborium = "0.2"
 sqlx = { version = "0.8", optional = true }
