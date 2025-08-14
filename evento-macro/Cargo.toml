@@ -1,6 +1,6 @@
 [package]
 name = "evento-macro"
-version = "1.0.0-alpha.8"
+version = "1.0.0-alpha.9"
 edition = "2021"
 license = "Apache-2.0"
 publish = true
@@ -17,9 +17,7 @@ quote = "1.0"
 sha3 = "0.10"
 convert_case = "0.8"
 syn = { version = "2.0", features = [
-    "full",
-    "parsing",
-    # needed for `Hash` impls
-    "extra-traits",
+	"full",
+	"parsing",
+	"extra-traits",
 ] }
-
