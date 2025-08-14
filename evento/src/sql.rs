@@ -94,11 +94,7 @@ impl<DB: Database> Sql<DB> {
             .col(ColumnDef::new(Event::Data).blob().not_null())
             .col(ColumnDef::new(Event::Metadata).blob().not_null())
             .col(ColumnDef::new(Event::RoutingKey).string().string_len(50))
-            .col(
-                ColumnDef::new(Event::Timestamp)
-                    .timestamp_with_time_zone()
-                    .not_null(),
-            )
+            .col(ColumnDef::new(Event::Timestamp).big_integer().not_null())
             .to_owned();
 
         let idx_event_type = Index::create()
@@ -817,7 +813,7 @@ where
     i32: sqlx::Type<R::Database> + for<'r> sqlx::Decode<'r, R::Database>,
     Vec<u8>: sqlx::Type<R::Database> + for<'r> sqlx::Decode<'r, R::Database>,
     String: sqlx::Type<R::Database> + for<'r> sqlx::Decode<'r, R::Database>,
-    chrono::DateTime<chrono::Utc>: sqlx::Type<R::Database> + for<'r> sqlx::Decode<'r, R::Database>,
+    i64: sqlx::Type<R::Database> + for<'r> sqlx::Decode<'r, R::Database>,
     for<'r> &'r str: sqlx::Type<R::Database> + sqlx::Decode<'r, R::Database>,
     for<'r> &'r str: sqlx::ColumnIndex<R>,
 {

@@ -1,4 +1,3 @@
-use chrono::{TimeZone, Utc};
 use evento::{
     cursor::{self, Args, Cursor, Edge, Order, PageInfo, ReadResult, Reader},
     Event,
@@ -577,7 +576,7 @@ pub fn get_data() -> Vec<Event> {
             aggregator_type: aggregator_type.to_owned(),
             version: version.to_owned() as i32,
             routing_key,
-            timestamp: Utc.timestamp_opt(timestamp as i64, 0).unwrap(),
+            timestamp: timestamp as i64,
             data: Default::default(),
             metadata: Default::default(),
         };
@@ -605,7 +604,7 @@ fn get_events() -> Vec<Event> {
     ]
 }
 
-fn create_event(id: &str, version: u16, timestamp: u64) -> Event {
+fn create_event(id: &str, version: u16, timestamp: u32) -> Event {
     Event {
         id: Ulid::from_string(id).unwrap(),
         name: "MessageSent".to_owned(),
@@ -613,7 +612,7 @@ fn create_event(id: &str, version: u16, timestamp: u64) -> Event {
         aggregator_type: "Message".to_owned(),
         version: version as i32,
         routing_key: None,
-        timestamp: Utc.timestamp_opt(timestamp as i64, 0).unwrap(),
+        timestamp: timestamp as i64,
         data: Default::default(),
         metadata: Default::default(),
     }

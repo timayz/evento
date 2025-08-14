@@ -3,7 +3,6 @@ pub mod cursor;
 #[cfg(feature = "sqlite")]
 pub mod sql;
 
-use chrono::{DateTime, Utc};
 #[cfg(feature = "macro")]
 pub use evento_macro::*;
 
@@ -16,7 +15,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt::Debug,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
 #[cfg(any(feature = "stream", feature = "handler"))]
@@ -40,7 +39,7 @@ pub struct EventData<D, M> {
 pub struct EventCursor {
     pub i: Ulid,
     pub v: i32,
-    pub t: DateTime<Utc>,
+    pub t: i64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -53,7 +52,7 @@ pub struct Event {
     pub routing_key: Option<String>,
     pub data: Vec<u8>,
     pub metadata: Vec<u8>,
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: i64,
 }
 
 impl Event {
@@ -344,7 +343,7 @@ impl<A: Aggregator> SaveBuilder<A> {
         };
 
         let mut events = vec![];
-        let timestamp = Utc::now();
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
 
         for (name, data) in &self.data {
             version += 1;
@@ -572,7 +571,7 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
                 inner: self.context.clone(),
                 key: self.key.to_owned(),
                 executor,
-                lag: (timestamp - edge.node.timestamp).num_seconds(),
+                lag: (timestamp - edge.node.timestamp),
                 cursor: edge.cursor.to_owned(),
                 event: edge.node.clone(),
             })
