@@ -3,13 +3,15 @@ use std::{
     ops::{Deref, DerefMut},
 };
 
+#[cfg(feature = "mysql")]
+use sea_query::MysqlQueryBuilder;
 #[cfg(feature = "postgres")]
 use sea_query::PostgresQueryBuilder;
 #[cfg(feature = "sqlite")]
 use sea_query::SqliteQueryBuilder;
 use sea_query::{
-    ColumnDef, Expr, ExprTrait, Iden, Index, IntoColumnRef, MysqlQueryBuilder, OnConflict, Query,
-    SelectStatement, Table,
+    ColumnDef, Expr, ExprTrait, Iden, Index, IntoColumnRef, OnConflict, Query, SelectStatement,
+    Table,
 };
 use sea_query_binder::SqlxBinder;
 use sqlx::{Database, Pool};
