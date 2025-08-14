@@ -6,8 +6,8 @@ use std::{
 #[cfg(feature = "sqlite")]
 use sea_query::SqliteQueryBuilder;
 use sea_query::{
-    ColumnDef, Expr, ExprTrait, Iden, Index, IntoColumnRef, OnConflict, Query, SelectStatement,
-    Table,
+    ColumnDef, Expr, ExprTrait, Iden, Index, IntoColumnRef, MysqlQueryBuilder, OnConflict, Query,
+    SelectStatement, Table,
 };
 use sea_query_binder::SqlxBinder;
 use sqlx::{Database, Pool};
@@ -45,7 +45,7 @@ enum Snapshot {
 }
 
 #[derive(Iden)]
-enum Subsriber {
+enum Subscriber {
     Table,
     Key,
     WorkerId,
@@ -59,7 +59,7 @@ enum Subsriber {
 pub struct Sql<DB: Database>(Pool<DB>);
 
 impl<DB: Database> Sql<DB> {
-    pub fn get_schema() -> String {
+    pub fn get_schema() -> Vec<String> {
         let event_table = Table::create()
             .table(Event::Table)
             .if_not_exists()
@@ -88,11 +88,11 @@ impl<DB: Database> Sql<DB> {
                     .string_len(26)
                     .not_null(),
             )
-            .col(ColumnDef::new(Event::Version).integer().not_null())
+            .col(ColumnDef::new(Event::Version).small_unsigned().not_null())
             .col(ColumnDef::new(Event::Data).blob().not_null())
             .col(ColumnDef::new(Event::Metadata).blob().not_null())
             .col(ColumnDef::new(Event::RoutingKey).string().string_len(50))
-            .col(ColumnDef::new(Event::Timestamp).integer().not_null())
+            .col(ColumnDef::new(Event::Timestamp).big_unsigned().not_null())
             .to_owned();
 
         let idx_event_type = Index::create()
@@ -148,50 +148,58 @@ impl<DB: Database> Sql<DB> {
             .col(ColumnDef::new(Snapshot::Data).blob().not_null())
             .col(
                 ColumnDef::new(Snapshot::CreatedAt)
-                    .integer()
+                    .timestamp_with_time_zone()
                     .not_null()
                     .default(Expr::current_timestamp()),
             )
-            .col(ColumnDef::new(Snapshot::UpdatedAt).integer().null())
+            .col(
+                ColumnDef::new(Snapshot::UpdatedAt)
+                    .timestamp_with_time_zone()
+                    .null(),
+            )
             .primary_key(Index::create().col(Snapshot::Type).col(Snapshot::Id))
             .to_owned();
 
         let subsriber_table = Table::create()
-            .table(Subsriber::Table)
+            .table(Subscriber::Table)
             .if_not_exists()
             .col(
-                ColumnDef::new(Subsriber::Key)
+                ColumnDef::new(Subscriber::Key)
                     .string()
                     .string_len(50)
                     .not_null()
                     .primary_key(),
             )
             .col(
-                ColumnDef::new(Subsriber::WorkerId)
+                ColumnDef::new(Subscriber::WorkerId)
                     .string()
                     .not_null()
                     .string_len(26),
             )
-            .col(ColumnDef::new(Subsriber::Cursor).string())
-            .col(ColumnDef::new(Subsriber::Lag).integer().not_null())
+            .col(ColumnDef::new(Subscriber::Cursor).string())
+            .col(ColumnDef::new(Subscriber::Lag).big_unsigned().not_null())
             .col(
-                ColumnDef::new(Subsriber::Enabled)
+                ColumnDef::new(Subscriber::Enabled)
                     .boolean()
                     .not_null()
                     .default(true),
             )
             .col(
-                ColumnDef::new(Subsriber::CreatedAt)
-                    .integer()
+                ColumnDef::new(Subscriber::CreatedAt)
+                    .timestamp_with_time_zone()
                     .not_null()
                     .default(Expr::current_timestamp()),
             )
-            .col(ColumnDef::new(Subsriber::UpdatedAt).integer().null())
+            .col(
+                ColumnDef::new(Subscriber::UpdatedAt)
+                    .timestamp_with_time_zone()
+                    .null(),
+            )
             .to_owned();
 
         match DB::NAME {
             #[cfg(feature = "sqlite")]
-            "SQLite" => [
+            "SQLite" => vec![
                 event_table.to_string(SqliteQueryBuilder),
                 idx_event_type.to_string(SqliteQueryBuilder),
                 idx_event_type_id.to_string(SqliteQueryBuilder),
@@ -199,9 +207,18 @@ impl<DB: Database> Sql<DB> {
                 idx_event_type_id_version.to_string(SqliteQueryBuilder),
                 snapshot_table.to_string(SqliteQueryBuilder),
                 subsriber_table.to_string(SqliteQueryBuilder),
-            ]
-            .join(";\n"),
-            name => panic!("'{name}' not supported, consider using SQLite"),
+            ],
+            #[cfg(feature = "mysql")]
+            "MySQL" => vec![
+                event_table.to_string(MysqlQueryBuilder),
+                idx_event_type.to_string(MysqlQueryBuilder),
+                idx_event_type_id.to_string(MysqlQueryBuilder),
+                idx_event_routing_key_type.to_string(MysqlQueryBuilder),
+                idx_event_type_id_version.to_string(MysqlQueryBuilder),
+                snapshot_table.to_string(MysqlQueryBuilder),
+                subsriber_table.to_string(MysqlQueryBuilder),
+            ],
+            name => panic!("'{name}' not supported, consider using SQLite or MySQL"),
         }
     }
 
@@ -209,7 +226,9 @@ impl<DB: Database> Sql<DB> {
         match DB::NAME {
             #[cfg(feature = "sqlite")]
             "SQLite" => statement.build_sqlx(SqliteQueryBuilder),
-            name => panic!("'{name}' not supported, consider using SQLite"),
+            #[cfg(feature = "mysql")]
+            "MySQL" => statement.build_sqlx(MysqlQueryBuilder),
+            name => panic!("'{name}' not supported, consider using SQLite or MySQL"),
         }
     }
 }
@@ -324,9 +343,9 @@ where
 
     async fn get_subscriber_cursor(&self, key: String) -> Result<Option<Value>, SubscribeError> {
         let statement = Query::select()
-            .columns([Subsriber::Cursor])
-            .from(Subsriber::Table)
-            .and_where(Expr::col(Subsriber::Key).eq(Expr::value(key)))
+            .columns([Subscriber::Cursor])
+            .from(Subscriber::Table)
+            .and_where(Expr::col(Subscriber::Key).eq(Expr::value(key)))
             .limit(1)
             .to_owned();
 
@@ -349,9 +368,9 @@ where
         worker_id: Ulid,
     ) -> Result<bool, SubscribeError> {
         let statement = Query::select()
-            .columns([Subsriber::WorkerId, Subsriber::Enabled])
-            .from(Subsriber::Table)
-            .and_where(Expr::col(Subsriber::Key).eq(Expr::value(key)))
+            .columns([Subscriber::WorkerId, Subscriber::Enabled])
+            .from(Subscriber::Table)
+            .and_where(Expr::col(Subscriber::Key).eq(Expr::value(key)))
             .limit(1)
             .to_owned();
 
@@ -367,13 +386,13 @@ where
 
     async fn upsert_subscriber(&self, key: String, worker_id: Ulid) -> Result<(), SubscribeError> {
         let statement = Query::insert()
-            .into_table(Subsriber::Table)
-            .columns([Subsriber::Key, Subsriber::WorkerId, Subsriber::Lag])
+            .into_table(Subscriber::Table)
+            .columns([Subscriber::Key, Subscriber::WorkerId, Subscriber::Lag])
             .values_panic([key.into(), worker_id.to_string().into(), 0.into()])
             .on_conflict(
-                OnConflict::column(Subsriber::Key)
-                    .update_columns([Subsriber::WorkerId])
-                    .value(Subsriber::UpdatedAt, Expr::current_timestamp())
+                OnConflict::column(Subscriber::Key)
+                    .update_columns([Subscriber::WorkerId])
+                    .value(Subscriber::UpdatedAt, Expr::current_timestamp())
                     .to_owned(),
             )
             .to_owned();
@@ -446,11 +465,14 @@ where
             .execute(&self.0)
             .await
             .map_err(|err| {
-                if err.to_string().contains("(code: 2067)") {
-                    WriteError::InvalidOriginalVersion
-                } else {
-                    WriteError::Unknown(err.into())
+                let err_str = err.to_string();
+                if err_str.contains("(code: 2067)") {
+                    return WriteError::InvalidOriginalVersion;
                 }
+                if err_str.contains("1062 (23000): Duplicate entry") {
+                    return WriteError::InvalidOriginalVersion;
+                }
+                WriteError::Unknown(err.into())
             })?;
 
         Ok(())
@@ -503,13 +525,13 @@ where
         lag: u64,
     ) -> Result<(), AcknowledgeError> {
         let statement = Query::update()
-            .table(Subsriber::Table)
+            .table(Subscriber::Table)
             .values([
-                (Subsriber::Cursor, cursor.to_string().into()),
-                (Subsriber::Lag, lag.into()),
-                (Subsriber::UpdatedAt, Expr::current_timestamp()),
+                (Subscriber::Cursor, cursor.to_string().into()),
+                (Subscriber::Lag, lag.into()),
+                (Subscriber::UpdatedAt, Expr::current_timestamp()),
             ])
-            .and_where(Expr::col(Subsriber::Key).eq(key))
+            .and_where(Expr::col(Subscriber::Key).eq(key))
             .to_owned();
 
         let (sql, values) = Self::build_sqlx(statement);
@@ -602,7 +624,9 @@ impl Reader {
         let (sql, values) = match DB::NAME {
             #[cfg(feature = "sqlite")]
             "SQLite" => self.statement.build_sqlx(SqliteQueryBuilder),
-            name => panic!("'{name}' not supported, consider using SQLite"),
+            #[cfg(feature = "mysql")]
+            "MySQL" => self.build_sqlx(MysqlQueryBuilder),
+            name => panic!("'{name}' not supported, consider using SQLite or MySQL"),
         };
 
         let mut rows = sqlx::query_as_with::<DB, O, _>(&sql, values)
