@@ -545,7 +545,7 @@ pub fn get_data() -> Vec<Event> {
         None,
     ];
 
-    let timestamps: Vec<u32> = vec![rand::random(), rand::random(), rand::random()];
+    let timestamps: Vec<u16> = vec![rand::random(), rand::random(), rand::random()];
     let mut versions: HashMap<String, u16> = HashMap::new();
     let mut data = vec![];
 
@@ -574,9 +574,9 @@ pub fn get_data() -> Vec<Event> {
             name: "MessageSent".to_owned(),
             aggregator_id,
             aggregator_type: aggregator_type.to_owned(),
-            version: version.to_owned(),
+            version: version.to_owned() as i32,
             routing_key,
-            timestamp,
+            timestamp: timestamp as i64,
             data: Default::default(),
             metadata: Default::default(),
         };
@@ -604,15 +604,15 @@ fn get_events() -> Vec<Event> {
     ]
 }
 
-fn create_event(id: &str, version: u16, timestamp: u64) -> Event {
+fn create_event(id: &str, version: u16, timestamp: u32) -> Event {
     Event {
         id: Ulid::from_string(id).unwrap(),
         name: "MessageSent".to_owned(),
         aggregator_id: Ulid::new().to_string(),
         aggregator_type: "Message".to_owned(),
-        version,
+        version: version as i32,
         routing_key: None,
-        timestamp,
+        timestamp: timestamp as i64,
         data: Default::default(),
         metadata: Default::default(),
     }
