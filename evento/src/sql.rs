@@ -467,12 +467,12 @@ where
             .map_err(|err| {
                 let err_str = err.to_string();
                 if err_str.contains("(code: 2067)") {
-                    WriteError::InvalidOriginalVersion
-                } else if err_str.contains("1062 (23000): Duplicate entry") {
-                    WriteError::InvalidOriginalVersion
-                } else {
-                    WriteError::Unknown(err.into())
+                    return WriteError::InvalidOriginalVersion;
                 }
+                if err_str.contains("1062 (23000): Duplicate entry") {
+                    return WriteError::InvalidOriginalVersion;
+                }
+                WriteError::Unknown(err.into())
             })?;
 
         Ok(())
