@@ -9,10 +9,10 @@ use evento::{
     sql::{Reader, Sql},
     Event,
 };
-use sea_query::{MysqlQueryBuilder, Query, SqliteQueryBuilder};
+use sea_query::{MysqlQueryBuilder, PostgresQueryBuilder, Query, SqliteQueryBuilder};
 use sea_query_binder::SqlxBinder;
 use sqlx::{
-    any::install_default_drivers, migrate::MigrateDatabase, Any, Database, MySqlPool, Pool,
+    any::install_default_drivers, migrate::MigrateDatabase, Any, Database, MySqlPool, PgPool, Pool,
     SqlitePool,
 };
 
@@ -188,6 +188,94 @@ async fn mysql_subscribe_default_multiple_aggregator() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn postgres_version() -> anyhow::Result<()> {
+    let executor = create_postgres_executor("version").await?;
+
+    evento_test::version(&executor).await
+}
+
+#[tokio::test]
+async fn postgres_routing_key() -> anyhow::Result<()> {
+    let executor = create_postgres_executor("routing_key").await?;
+
+    evento_test::routing_key(&executor).await
+}
+
+#[tokio::test]
+async fn postgres_load() -> anyhow::Result<()> {
+    let executor = create_postgres_executor("load").await?;
+
+    evento_test::load(&executor).await
+}
+
+#[tokio::test]
+async fn postgres_invalid_original_version() -> anyhow::Result<()> {
+    let executor = create_postgres_executor("invalid_original_version").await?;
+
+    evento_test::invalid_original_version(&executor).await
+}
+
+#[tokio::test]
+async fn postgres_subscriber_running() -> anyhow::Result<()> {
+    let pool = create_postgres_pool("subscriber_running").await?;
+
+    evento_test::subscriber_running::<Sql<sqlx::Postgres>>(&pool.into()).await
+}
+
+#[tokio::test]
+async fn postgres_subscribe() -> anyhow::Result<()> {
+    let pool = create_postgres_pool("subscribe").await?;
+    let data = get_data(&pool).await?;
+
+    evento_test::subscribe::<Sql<sqlx::Postgres>>(&pool.into(), data).await
+}
+
+#[tokio::test]
+async fn postgres_subscribe_routing_key() -> anyhow::Result<()> {
+    let pool = create_postgres_pool("subscribe_routing_key").await?;
+    let data = get_data(&pool).await?;
+
+    evento_test::subscribe_routing_key::<Sql<sqlx::Postgres>>(&pool.into(), data).await
+}
+
+#[tokio::test]
+async fn postgres_subscribe_default() -> anyhow::Result<()> {
+    let pool = create_postgres_pool("subscribe_default").await?;
+    let data = get_data(&pool).await?;
+
+    evento_test::subscribe_default::<Sql<sqlx::Postgres>>(&pool.into(), data).await
+}
+
+#[tokio::test]
+async fn postgres_subscribe_multiple_aggregator() -> anyhow::Result<()> {
+    let pool = create_postgres_pool("subscribe_multiple_aggregator").await?;
+    let data = get_data(&pool).await?;
+
+    evento_test::subscribe_multiple_aggregator::<Sql<sqlx::Postgres>>(&pool.into(), data).await
+}
+
+#[tokio::test]
+async fn postgres_subscribe_routing_key_multiple_aggregator() -> anyhow::Result<()> {
+    let pool = create_postgres_pool("subscribe_routing_key_multiple_aggregator").await?;
+    let data = get_data(&pool).await?;
+
+    evento_test::subscribe_routing_key_multiple_aggregator::<Sql<sqlx::Postgres>>(
+        &pool.into(),
+        data,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn postgres_subscribe_default_multiple_aggregator() -> anyhow::Result<()> {
+    let pool = create_postgres_pool("subscribe_default_multiple_aggregator").await?;
+    let data = get_data(&pool).await?;
+
+    evento_test::subscribe_default_multiple_aggregator::<Sql<sqlx::Postgres>>(&pool.into(), data)
+        .await
+}
+
+#[tokio::test]
 async fn sqlite_forward_asc() -> anyhow::Result<()> {
     let pool = create_sqlite_pool("forward_asc").await?;
 
@@ -239,6 +327,34 @@ async fn mysql_backward_asc() -> anyhow::Result<()> {
 #[tokio::test]
 async fn mysql_backward_desc() -> anyhow::Result<()> {
     let pool = create_mysql_pool("backward_desc").await?;
+
+    backward_desc(pool).await
+}
+
+#[tokio::test]
+async fn postgres_forward_asc() -> anyhow::Result<()> {
+    let pool = create_postgres_pool("forward_asc").await?;
+
+    forward_asc(pool).await
+}
+
+#[tokio::test]
+async fn postgres_forward_desc() -> anyhow::Result<()> {
+    let pool = create_postgres_pool("forward_desc").await?;
+
+    forward_desc(pool).await
+}
+
+#[tokio::test]
+async fn postgres_backward_asc() -> anyhow::Result<()> {
+    let pool = create_postgres_pool("backward_asc").await?;
+
+    backward_asc(pool).await
+}
+
+#[tokio::test]
+async fn postgres_backward_desc() -> anyhow::Result<()> {
+    let pool = create_postgres_pool("backward_desc").await?;
 
     backward_desc(pool).await
 }
@@ -432,7 +548,8 @@ where
     let (sql, values) = match DB::NAME {
         "SQLite" => statement.build_sqlx(SqliteQueryBuilder),
         "MySQL" => statement.build_sqlx(MysqlQueryBuilder),
-        name => panic!("'{name}' not supported, consider using SQLite or MySQL"),
+        "PostgreSQL" => statement.build_sqlx(PostgresQueryBuilder),
+        name => panic!("'{name}' not supported, consider using SQLite, PostgreSQL or MySQL"),
     };
 
     sqlx::query_with::<DB, _>(&sql, values)
@@ -442,12 +559,23 @@ where
     Ok(data)
 }
 
+async fn create_postgres_executor(key: impl Into<String>) -> anyhow::Result<Sql<sqlx::Postgres>> {
+    Ok(create_postgres_pool(key).await?.into())
+}
+
 async fn create_mysql_executor(key: impl Into<String>) -> anyhow::Result<Sql<sqlx::MySql>> {
     Ok(create_mysql_pool(key).await?.into())
 }
 
 async fn create_sqlite_executor(key: impl Into<String>) -> anyhow::Result<Sql<sqlx::Sqlite>> {
     Ok(create_sqlite_pool(key).await?.into())
+}
+
+async fn create_postgres_pool(key: impl Into<String>) -> anyhow::Result<PgPool> {
+    let key = key.into();
+    let url = format!("postgres://postgres:postgres@localhost:5432/{key}");
+
+    create_pool(url).await
 }
 
 async fn create_mysql_pool(key: impl Into<String>) -> anyhow::Result<MySqlPool> {

@@ -32,9 +32,11 @@ rand = "0.9.2"
 
 [features]
 default = ["macro"]
+# default = ["macro", "postgres", "sqlite", "mysql"]
 macro = ["evento-macro"]
 stream = ["futures-util", "tokio-stream"]
 handler = ["backon"]
 sqlite = ["sea-query/backend-sqlite", "sea-query-binder/sqlx-sqlite", "sqlx/sqlite"]
 mysql = ["sea-query/backend-mysql", "sea-query-binder/sqlx-mysql", "sqlx/mysql"]
+postgres = ["sea-query/backend-postgres", "sea-query-binder/sqlx-postgres", "sqlx/postgres"]
 

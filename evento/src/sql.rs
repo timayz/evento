@@ -3,6 +3,8 @@ use std::{
     ops::{Deref, DerefMut},
 };
 
+#[cfg(feature = "postgres")]
+use sea_query::PostgresQueryBuilder;
 #[cfg(feature = "sqlite")]
 use sea_query::SqliteQueryBuilder;
 use sea_query::{
@@ -88,11 +90,11 @@ impl<DB: Database> Sql<DB> {
                     .string_len(26)
                     .not_null(),
             )
-            .col(ColumnDef::new(Event::Version).small_unsigned().not_null())
+            .col(ColumnDef::new(Event::Version).integer().not_null())
             .col(ColumnDef::new(Event::Data).blob().not_null())
             .col(ColumnDef::new(Event::Metadata).blob().not_null())
             .col(ColumnDef::new(Event::RoutingKey).string().string_len(50))
-            .col(ColumnDef::new(Event::Timestamp).big_unsigned().not_null())
+            .col(ColumnDef::new(Event::Timestamp).big_integer().not_null())
             .to_owned();
 
         let idx_event_type = Index::create()
@@ -177,7 +179,7 @@ impl<DB: Database> Sql<DB> {
                     .string_len(26),
             )
             .col(ColumnDef::new(Subscriber::Cursor).string())
-            .col(ColumnDef::new(Subscriber::Lag).big_unsigned().not_null())
+            .col(ColumnDef::new(Subscriber::Lag).integer().not_null())
             .col(
                 ColumnDef::new(Subscriber::Enabled)
                     .boolean()
@@ -218,7 +220,17 @@ impl<DB: Database> Sql<DB> {
                 snapshot_table.to_string(MysqlQueryBuilder),
                 subsriber_table.to_string(MysqlQueryBuilder),
             ],
-            name => panic!("'{name}' not supported, consider using SQLite or MySQL"),
+            #[cfg(feature = "postgres")]
+            "PostgreSQL" => vec![
+                event_table.to_string(PostgresQueryBuilder),
+                idx_event_type.to_string(PostgresQueryBuilder),
+                idx_event_type_id.to_string(PostgresQueryBuilder),
+                idx_event_routing_key_type.to_string(PostgresQueryBuilder),
+                idx_event_type_id_version.to_string(PostgresQueryBuilder),
+                snapshot_table.to_string(PostgresQueryBuilder),
+                subsriber_table.to_string(PostgresQueryBuilder),
+            ],
+            name => panic!("'{name}' not supported, consider using SQLite, PostgreSQL or MySQL"),
         }
     }
 
@@ -228,7 +240,9 @@ impl<DB: Database> Sql<DB> {
             "SQLite" => statement.build_sqlx(SqliteQueryBuilder),
             #[cfg(feature = "mysql")]
             "MySQL" => statement.build_sqlx(MysqlQueryBuilder),
-            name => panic!("'{name}' not supported, consider using SQLite or MySQL"),
+            #[cfg(feature = "postgres")]
+            "PostgreSQL" => statement.build_sqlx(PostgresQueryBuilder),
+            name => panic!("'{name}' not supported, consider using SQLite, PostgreSQL or MySQL"),
         }
     }
 }
@@ -472,6 +486,9 @@ where
                 if err_str.contains("1062 (23000): Duplicate entry") {
                     return WriteError::InvalidOriginalVersion;
                 }
+                if err_str.contains("duplicate key value violates unique constraint") {
+                    return WriteError::InvalidOriginalVersion;
+                }
                 WriteError::Unknown(err.into())
             })?;
 
@@ -522,7 +539,7 @@ where
         &self,
         key: String,
         cursor: Value,
-        lag: u64,
+        lag: i64,
     ) -> Result<(), AcknowledgeError> {
         let statement = Query::update()
             .table(Subscriber::Table)
@@ -626,7 +643,9 @@ impl Reader {
             "SQLite" => self.statement.build_sqlx(SqliteQueryBuilder),
             #[cfg(feature = "mysql")]
             "MySQL" => self.build_sqlx(MysqlQueryBuilder),
-            name => panic!("'{name}' not supported, consider using SQLite or MySQL"),
+            #[cfg(feature = "postgres")]
+            "PostgreSQL" => self.build_sqlx(PostgresQueryBuilder),
+            name => panic!("'{name}' not supported, consider using SQLite, PostgreSQL or MySQL"),
         };
 
         let mut rows = sqlx::query_as_with::<DB, O, _>(&sql, values)
@@ -791,10 +810,10 @@ impl Bind for crate::Event {
 
 impl<R: sqlx::Row> sqlx::FromRow<'_, R> for crate::Event
 where
-    u64: sqlx::Type<R::Database> + for<'r> sqlx::Decode<'r, R::Database>,
-    u16: sqlx::Type<R::Database> + for<'r> sqlx::Decode<'r, R::Database>,
+    i32: sqlx::Type<R::Database> + for<'r> sqlx::Decode<'r, R::Database>,
     Vec<u8>: sqlx::Type<R::Database> + for<'r> sqlx::Decode<'r, R::Database>,
     String: sqlx::Type<R::Database> + for<'r> sqlx::Decode<'r, R::Database>,
+    i64: sqlx::Type<R::Database> + for<'r> sqlx::Decode<'r, R::Database>,
     for<'r> &'r str: sqlx::Type<R::Database> + sqlx::Decode<'r, R::Database>,
     for<'r> &'r str: sqlx::ColumnIndex<R>,
 {
