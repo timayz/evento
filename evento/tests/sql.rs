@@ -7,6 +7,7 @@ mod cursor_test;
 use evento::{
     cursor::{Args, Order, ReadResult},
     sql::{Reader, Sql},
+    sql_migrator::InitMigration,
     Event,
 };
 use sea_query::{MysqlQueryBuilder, PostgresQueryBuilder, Query, SqliteQueryBuilder};
@@ -15,6 +16,7 @@ use sqlx::{
     any::install_default_drivers, migrate::MigrateDatabase, Any, Database, MySqlPool, PgPool, Pool,
     SqlitePool,
 };
+use sqlx_migrator::{Migrate, Plan};
 
 use crate::cursor_test::assert_read_result;
 
@@ -596,6 +598,8 @@ async fn create_pool<DB: Database>(url: impl Into<String>) -> anyhow::Result<Poo
 where
     for<'q> DB::Arguments<'q>: sqlx::IntoArguments<'q, DB>,
     for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
+    InitMigration: sqlx_migrator::Migration<DB>,
+    sqlx_migrator::Migrator<DB>: sqlx_migrator::migrator::DatabaseOperation<DB>,
 {
     install_default_drivers();
 
@@ -605,11 +609,9 @@ where
     Any::create_database(&url).await?;
 
     let pool = Pool::<DB>::connect(&url).await?;
-    let schema = Sql::<DB>::get_schema();
-
-    for statement in schema {
-        sqlx::query(&statement).execute(&pool).await?;
-    }
+    let mut conn = pool.acquire().await?;
+    let migrator = evento::sql_migrator::new_migrator::<DB>()?;
+    migrator.run(&mut *conn, &Plan::apply_all()).await?;
 
     Ok(pool)
 }
