@@ -181,9 +181,9 @@ checksum = "d71b6127be86fdcfddb610f7182ac57211d4b18a3e9c82eb2d17662f2227ad6a"
 
 [[package]]
 name = "cc"
-version = "1.2.32"
+version = "1.2.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2352e5597e9c544d5e6d9c95190d5d27738ade584fa8db0a16e130e5c2b5296e"
+checksum = "3ee0f8803222ba5a7e2777dd72ca451868909b1ac410621b676adf07280e9b5f"
 dependencies = [
  "shlex",
 ]
@@ -468,7 +468,7 @@ dependencies = [
 
 [[package]]
 name = "evento"
-version = "1.0.0-alpha.12"
+version = "1.0.0-alpha.13"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -492,7 +492,7 @@ dependencies = [
 
 [[package]]
 name = "evento-macro"
-version = "1.0.0-alpha.12"
+version = "1.0.0-alpha.13"
 dependencies = [
  "convert_case",
  "proc-macro2",
@@ -992,7 +992,7 @@ checksum = "13dc2df351e3202783a1fe0d44375f7295ffb4049267b0f3018346dc122a1d94"
 
 [[package]]
 name = "market"
-version = "1.0.0-alpha.12"
+version = "1.0.0-alpha.13"
 
 [[package]]
 name = "md-5"
@@ -1453,7 +1453,7 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
 name = "shop"
-version = "1.0.0-alpha.12"
+version = "1.0.0-alpha.13"
 
 [[package]]
 name = "signal-hook-registry"
