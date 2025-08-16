@@ -32,7 +32,7 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "any"] }
 rand = "0.9.2"
 
 [features]
-default = ["macro", "handler", "sqlite-migrator", "mysql-migrator", "postgres-migrator"]
+default = ["macro", "handler"]
 macro = ["evento-macro"]
 stream = ["futures-util", "tokio-stream"]
 handler = ["backon"]
