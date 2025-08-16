@@ -2,6 +2,12 @@ pub mod context;
 pub mod cursor;
 #[cfg(any(feature = "sqlite", feature = "mysql", feature = "postgres"))]
 pub mod sql;
+#[cfg(any(
+    feature = "sqlite-migrator",
+    feature = "mysql-migrator",
+    feature = "postgres-migrator"
+))]
+pub mod sql_migrator;
 
 #[cfg(feature = "macro")]
 pub use evento_macro::*;

@@ -9,10 +9,7 @@ use sea_query::MysqlQueryBuilder;
 use sea_query::PostgresQueryBuilder;
 #[cfg(feature = "sqlite")]
 use sea_query::SqliteQueryBuilder;
-use sea_query::{
-    ColumnDef, Expr, ExprTrait, Iden, Index, IntoColumnRef, OnConflict, Query, SelectStatement,
-    Table,
-};
+use sea_query::{Expr, ExprTrait, Iden, IntoColumnRef, OnConflict, Query, SelectStatement};
 use sea_query_binder::SqlxBinder;
 use sqlx::{Database, Pool};
 use ulid::Ulid;
@@ -37,7 +34,7 @@ pub enum Event {
 }
 
 #[derive(Iden)]
-enum Snapshot {
+pub enum Snapshot {
     Table,
     Id,
     Type,
@@ -49,7 +46,7 @@ enum Snapshot {
 }
 
 #[derive(Iden)]
-enum Subscriber {
+pub enum Subscriber {
     Table,
     Key,
     WorkerId,
@@ -72,179 +69,6 @@ pub type Sqlite = Sql<sqlx::Sqlite>;
 pub struct Sql<DB: Database>(Pool<DB>);
 
 impl<DB: Database> Sql<DB> {
-    pub fn get_schema() -> Vec<String> {
-        let event_table = Table::create()
-            .table(Event::Table)
-            .if_not_exists()
-            .col(
-                ColumnDef::new(Event::Id)
-                    .string()
-                    .not_null()
-                    .string_len(26)
-                    .primary_key(),
-            )
-            .col(
-                ColumnDef::new(Event::Name)
-                    .string()
-                    .string_len(20)
-                    .not_null(),
-            )
-            .col(
-                ColumnDef::new(Event::AggregatorType)
-                    .string()
-                    .string_len(50)
-                    .not_null(),
-            )
-            .col(
-                ColumnDef::new(Event::AggregatorId)
-                    .string()
-                    .string_len(26)
-                    .not_null(),
-            )
-            .col(ColumnDef::new(Event::Version).integer().not_null())
-            .col(ColumnDef::new(Event::Data).blob().not_null())
-            .col(ColumnDef::new(Event::Metadata).blob().not_null())
-            .col(ColumnDef::new(Event::RoutingKey).string().string_len(50))
-            .col(ColumnDef::new(Event::Timestamp).big_integer().not_null())
-            .to_owned();
-
-        let idx_event_type = Index::create()
-            .if_not_exists()
-            .name("idx_event_type")
-            .table(Event::Table)
-            .col(Event::AggregatorType)
-            .to_owned();
-
-        let idx_event_type_id = Index::create()
-            .if_not_exists()
-            .name("idx_event_type_id")
-            .table(Event::Table)
-            .col(Event::AggregatorType)
-            .col(Event::AggregatorId)
-            .to_owned();
-
-        let idx_event_routing_key_type = Index::create()
-            .if_not_exists()
-            .name("idx_event_routing_key_type")
-            .table(Event::Table)
-            .col(Event::RoutingKey)
-            .col(Event::AggregatorType)
-            .to_owned();
-
-        let idx_event_type_id_version = Index::create()
-            .if_not_exists()
-            .name("idx_event_type_id_version")
-            .table(Event::Table)
-            .unique()
-            .col(Event::AggregatorType)
-            .col(Event::AggregatorId)
-            .col(Event::Version)
-            .to_owned();
-
-        let snapshot_table = Table::create()
-            .table(Snapshot::Table)
-            .if_not_exists()
-            .col(
-                ColumnDef::new(Snapshot::Id)
-                    .string()
-                    .not_null()
-                    .string_len(26),
-            )
-            .col(
-                ColumnDef::new(Snapshot::Type)
-                    .string()
-                    .string_len(50)
-                    .not_null(),
-            )
-            .col(ColumnDef::new(Snapshot::Cursor).string().not_null())
-            .col(ColumnDef::new(Snapshot::Revision).string().not_null())
-            .col(ColumnDef::new(Snapshot::Data).blob().not_null())
-            .col(
-                ColumnDef::new(Snapshot::CreatedAt)
-                    .timestamp_with_time_zone()
-                    .not_null()
-                    .default(Expr::current_timestamp()),
-            )
-            .col(
-                ColumnDef::new(Snapshot::UpdatedAt)
-                    .timestamp_with_time_zone()
-                    .null(),
-            )
-            .primary_key(Index::create().col(Snapshot::Type).col(Snapshot::Id))
-            .to_owned();
-
-        let subsriber_table = Table::create()
-            .table(Subscriber::Table)
-            .if_not_exists()
-            .col(
-                ColumnDef::new(Subscriber::Key)
-                    .string()
-                    .string_len(50)
-                    .not_null()
-                    .primary_key(),
-            )
-            .col(
-                ColumnDef::new(Subscriber::WorkerId)
-                    .string()
-                    .not_null()
-                    .string_len(26),
-            )
-            .col(ColumnDef::new(Subscriber::Cursor).string())
-            .col(ColumnDef::new(Subscriber::Lag).integer().not_null())
-            .col(
-                ColumnDef::new(Subscriber::Enabled)
-                    .boolean()
-                    .not_null()
-                    .default(true),
-            )
-            .col(
-                ColumnDef::new(Subscriber::CreatedAt)
-                    .timestamp_with_time_zone()
-                    .not_null()
-                    .default(Expr::current_timestamp()),
-            )
-            .col(
-                ColumnDef::new(Subscriber::UpdatedAt)
-                    .timestamp_with_time_zone()
-                    .null(),
-            )
-            .to_owned();
-
-        match DB::NAME {
-            #[cfg(feature = "sqlite")]
-            "SQLite" => vec![
-                event_table.to_string(SqliteQueryBuilder),
-                idx_event_type.to_string(SqliteQueryBuilder),
-                idx_event_type_id.to_string(SqliteQueryBuilder),
-                idx_event_routing_key_type.to_string(SqliteQueryBuilder),
-                idx_event_type_id_version.to_string(SqliteQueryBuilder),
-                snapshot_table.to_string(SqliteQueryBuilder),
-                subsriber_table.to_string(SqliteQueryBuilder),
-            ],
-            #[cfg(feature = "mysql")]
-            "MySQL" => vec![
-                event_table.to_string(MysqlQueryBuilder),
-                idx_event_type.to_string(MysqlQueryBuilder),
-                idx_event_type_id.to_string(MysqlQueryBuilder),
-                idx_event_routing_key_type.to_string(MysqlQueryBuilder),
-                idx_event_type_id_version.to_string(MysqlQueryBuilder),
-                snapshot_table.to_string(MysqlQueryBuilder),
-                subsriber_table.to_string(MysqlQueryBuilder),
-            ],
-            #[cfg(feature = "postgres")]
-            "PostgreSQL" => vec![
-                event_table.to_string(PostgresQueryBuilder),
-                idx_event_type.to_string(PostgresQueryBuilder),
-                idx_event_type_id.to_string(PostgresQueryBuilder),
-                idx_event_routing_key_type.to_string(PostgresQueryBuilder),
-                idx_event_type_id_version.to_string(PostgresQueryBuilder),
-                snapshot_table.to_string(PostgresQueryBuilder),
-                subsriber_table.to_string(PostgresQueryBuilder),
-            ],
-            name => panic!("'{name}' not supported, consider using SQLite, PostgreSQL or MySQL"),
-        }
-    }
-
     fn build_sqlx<S: SqlxBinder>(statement: S) -> (String, sea_query_binder::SqlxValues) {
         match DB::NAME {
             #[cfg(feature = "sqlite")]
