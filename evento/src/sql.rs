@@ -60,6 +60,15 @@ enum Subscriber {
     UpdatedAt,
 }
 
+#[cfg(feature = "mysql")]
+pub type MySql = Sql<sqlx::MySql>;
+
+#[cfg(feature = "postgres")]
+pub type Postgres = Sql<sqlx::Postgres>;
+
+#[cfg(feature = "sqlite")]
+pub type Sqlite = Sql<sqlx::Sqlite>;
+
 pub struct Sql<DB: Database>(Pool<DB>);
 
 impl<DB: Database> Sql<DB> {
