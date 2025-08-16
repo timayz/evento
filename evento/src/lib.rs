@@ -1,6 +1,6 @@
 pub mod context;
 pub mod cursor;
-#[cfg(feature = "sqlite")]
+#[cfg(any(feature = "sqlite", feature = "mysql", feature = "postgres"))]
 pub mod sql;
 
 #[cfg(feature = "macro")]
@@ -34,6 +34,15 @@ pub struct EventData<D, M> {
     pub data: D,
     pub metadata: M,
 }
+
+#[cfg(feature = "mysql")]
+pub use sql::MySql;
+
+#[cfg(feature = "postgres")]
+pub use sql::Postgres;
+
+#[cfg(feature = "sqlite")]
+pub use sql::Sqlite;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EventCursor {
