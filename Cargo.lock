@@ -468,7 +468,7 @@ dependencies = [
 
 [[package]]
 name = "evento"
-version = "1.0.0-alpha.13"
+version = "1.0.0-alpha.14"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -492,7 +492,7 @@ dependencies = [
 
 [[package]]
 name = "evento-macro"
-version = "1.0.0-alpha.13"
+version = "1.0.0-alpha.14"
 dependencies = [
  "convert_case",
  "proc-macro2",
@@ -992,7 +992,7 @@ checksum = "13dc2df351e3202783a1fe0d44375f7295ffb4049267b0f3018346dc122a1d94"
 
 [[package]]
 name = "market"
-version = "1.0.0-alpha.13"
+version = "1.0.0-alpha.14"
 
 [[package]]
 name = "md-5"
@@ -1453,7 +1453,7 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
 name = "shop"
-version = "1.0.0-alpha.13"
+version = "1.0.0-alpha.14"
 
 [[package]]
 name = "signal-hook-registry"
