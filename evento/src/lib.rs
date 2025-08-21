@@ -21,7 +21,7 @@ pub use save::*;
 pub use subscribe::*;
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::{collections::HashSet, fmt::Debug};
+use std::{collections::HashSet, fmt::Debug, ops::Deref};
 use ulid::Ulid;
 
 use crate::cursor::{Args, Cursor, ReadResult, Value};
@@ -31,10 +31,18 @@ pub mod prelude {
     pub use tokio_stream::StreamExt;
 }
 
-pub struct EventData<D, M> {
-    pub details: Event,
+pub struct EventDetails<D, M> {
+    inner: Event,
     pub data: D,
     pub metadata: M,
+}
+
+impl<D, M> Deref for EventDetails<D, M> {
+    type Target = Event;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
 }
 
 #[cfg(feature = "mysql")]
@@ -67,9 +75,9 @@ pub struct Event {
 }
 
 impl Event {
-    pub fn to_data<D: AggregatorName + DeserializeOwned, M: DeserializeOwned>(
+    pub fn to_details<D: AggregatorName + DeserializeOwned, M: DeserializeOwned>(
         &self,
-    ) -> Result<Option<EventData<D, M>>, ciborium::de::Error<std::io::Error>> {
+    ) -> Result<Option<EventDetails<D, M>>, ciborium::de::Error<std::io::Error>> {
         if D::name() != self.name {
             return Ok(None);
         }
@@ -77,10 +85,10 @@ impl Event {
         let data = ciborium::from_reader(&self.data[..])?;
         let metadata = ciborium::from_reader(&self.metadata[..])?;
 
-        Ok(Some(EventData {
+        Ok(Some(EventDetails {
             data,
             metadata,
-            details: self.clone(),
+            inner: self.clone(),
         }))
     }
 }
