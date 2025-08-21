@@ -43,8 +43,8 @@ pub fn handler(attr: TokenStream, item: TokenStream) -> TokenStream {
                 Self: Sync + 'async_trait
             {
                 Box::pin(async move {
-                    if let Some(data) = context.event.to_data()? {
-                        return Self::#fn_ident(context, data.data, data.metadata).await;
+                    if let Some(data) = context.event.to_details()? {
+                        return Self::#fn_ident(context, data).await;
                     }
 
                     Ok(())
@@ -90,7 +90,7 @@ pub fn aggregator(_attr: TokenStream, item: TokenStream) -> TokenStream {
             let ident = item_fn.sig.ident.clone();
 
             Some(quote! {
-                if let Some(data) = event.to_data()? {
+                if let Some(data) = event.to_details()? {
                     self.#ident(data).await?;
                     return Ok(());
                 }
