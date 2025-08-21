@@ -14,7 +14,7 @@ pub async fn load<E: Executor>(executor: &E) -> anyhow::Result<()> {
     let calcul = evento::load::<Calcul, _>(executor, id.to_owned()).await?;
     assert_eq!(calcul.item.value, 3);
 
-    evento::save(calcul)
+    evento::save_with(calcul)
         .metadata(&true)?
         .data(&Added { value: 9 })?
         .commit(executor)
@@ -35,7 +35,7 @@ pub async fn version<E: Executor>(executor: &E) -> anyhow::Result<()> {
     let calcul = evento::load::<Calcul, _>(executor, id.to_owned()).await?;
     assert_eq!(calcul.event.version, 1);
 
-    evento::save(calcul.clone())
+    evento::save::<Calcul>(&id)
         .metadata(&true)?
         .data(&Added { value: 9 })?
         .data(&Added { value: 3 })?
@@ -55,7 +55,7 @@ pub async fn version<E: Executor>(executor: &E) -> anyhow::Result<()> {
     let calcul = evento::load::<Calcul, _>(executor, id.to_owned()).await?;
     assert_eq!(calcul.event.version, 2);
 
-    evento::save(calcul.clone())
+    evento::save_with(calcul.clone())
         .metadata(&true)?
         .data(&Added { value: 9 })?
         .commit(executor)
@@ -77,7 +77,7 @@ pub async fn routing_key<E: Executor>(executor: &E) -> anyhow::Result<()> {
     let calcul = evento::load::<Calcul, _>(executor, id.to_owned()).await?;
     assert_eq!(calcul.event.routing_key, None);
 
-    evento::save(calcul.clone())
+    evento::save_with(calcul.clone())
         .routing_key("routing1")
         .metadata(&true)?
         .data(&Added { value: 9 })?
@@ -97,7 +97,7 @@ pub async fn routing_key<E: Executor>(executor: &E) -> anyhow::Result<()> {
     let calcul = evento::load::<Calcul, _>(executor, id.to_owned()).await?;
     assert_eq!(calcul.event.routing_key, Some("routing1".to_owned()));
 
-    evento::save(calcul.clone())
+    evento::save::<Calcul>(&id)
         .metadata(&true)?
         .data(&Added { value: 9 })?
         .commit(executor)
@@ -117,13 +117,13 @@ pub async fn invalid_original_version<E: Executor>(executor: &E) -> anyhow::Resu
         .await?;
 
     let calcul = evento::load::<Calcul, _>(executor, id.to_owned()).await?;
-    evento::save(calcul.clone())
+    evento::save::<Calcul>(&id)
         .metadata(&true)?
         .data(&Added { value: 9 })?
         .commit(executor)
         .await?;
 
-    let res = evento::save(calcul)
+    let res = evento::save_with(calcul)
         .metadata(&true)?
         .data(&Multiplied { value: 3 })?
         .commit(executor)
@@ -135,7 +135,7 @@ pub async fn invalid_original_version<E: Executor>(executor: &E) -> anyhow::Resu
     );
 
     let calcul = evento::load::<Calcul, _>(executor, id).await?;
-    evento::save(calcul)
+    evento::save_with(calcul)
         .metadata(&true)?
         .data(&Subtracted { value: 39 })?
         .commit(executor)
