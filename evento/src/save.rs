@@ -30,7 +30,7 @@ pub enum WriteError {
 pub struct SaveBuilder<A: Aggregator> {
     aggregator_id: String,
     aggregator_type: String,
-    aggregator: A,
+    aggregator: Option<A>,
     routing_key: Option<String>,
     routing_key_locked: bool,
     original_version: i32,
@@ -39,7 +39,7 @@ pub struct SaveBuilder<A: Aggregator> {
 }
 
 impl<A: Aggregator> SaveBuilder<A> {
-    pub fn new(aggregator: A, aggregator_id: impl Into<String>) -> SaveBuilder<A> {
+    pub fn new(aggregator: Option<A>, aggregator_id: impl Into<String>) -> SaveBuilder<A> {
         SaveBuilder {
             aggregator_id: aggregator_id.into(),
             aggregator,
@@ -94,8 +94,24 @@ impl<A: Aggregator> SaveBuilder<A> {
     }
 
     pub async fn commit<E: Executor>(&self, executor: &E) -> Result<String, WriteError> {
-        let mut aggregator = self.aggregator.clone();
-        let mut version = self.original_version;
+        let (mut aggregator, mut version, routing_key) = match &self.aggregator {
+            Some(aggregator) => (
+                aggregator.clone(),
+                self.original_version,
+                self.routing_key.to_owned(),
+            ),
+            _ => {
+                let aggregator = crate::load::<A, _>(executor, &self.aggregator_id)
+                    .await
+                    .map_err(|err| WriteError::Unknown(err.into()))?;
+
+                (
+                    aggregator.item,
+                    aggregator.event.version,
+                    aggregator.event.routing_key,
+                )
+            }
+        };
 
         let Some(metadata) = &self.metadata else {
             return Err(WriteError::MissingMetadata);
@@ -116,7 +132,7 @@ impl<A: Aggregator> SaveBuilder<A> {
                 aggregator_id: self.aggregator_id.to_owned(),
                 aggregator_type: self.aggregator_type.to_owned(),
                 version,
-                routing_key: self.routing_key.to_owned(),
+                routing_key: routing_key.to_owned(),
             };
 
             aggregator.aggregate(&event).await?;
@@ -142,11 +158,15 @@ impl<A: Aggregator> SaveBuilder<A> {
 }
 
 pub fn create<A: Aggregator>() -> SaveBuilder<A> {
-    SaveBuilder::new(A::default(), Ulid::new())
+    SaveBuilder::new(Some(A::default()), Ulid::new())
 }
 
-pub fn save<A: Aggregator>(aggregator: LoadResult<A>) -> SaveBuilder<A> {
-    SaveBuilder::new(aggregator.item, aggregator.event.aggregator_id)
+pub fn save<A: Aggregator>(id: impl Into<String>) -> SaveBuilder<A> {
+    SaveBuilder::new(None, id)
+}
+
+pub fn save_with<A: Aggregator>(aggregator: LoadResult<A>) -> SaveBuilder<A> {
+    SaveBuilder::new(Some(aggregator.item), aggregator.event.aggregator_id)
         .original_version(aggregator.event.version as u16)
         .routing_key_opt(aggregator.event.routing_key)
 }
