@@ -1,4 +1,4 @@
-use evento::{AggregatorName, Event, EventData, Executor, WriteError};
+use evento::{AggregatorName, Event, EventDetails, Executor, WriteError};
 use serde::{Deserialize, Serialize};
 
 pub async fn load<E: Executor>(executor: &E) -> anyhow::Result<()> {
@@ -416,7 +416,7 @@ struct Divided {
     pub value: i16,
 }
 
-type CalculEvent<D> = EventData<D, bool>;
+type CalculEvent<D> = EventDetails<D, bool>;
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 struct Calcul {
