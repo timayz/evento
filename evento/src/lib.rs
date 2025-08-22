@@ -31,9 +31,16 @@ use crate::cursor::Cursor;
 pub mod prelude {
     #[cfg(feature = "stream")]
     pub use tokio_stream::StreamExt;
+
+    #[cfg(any(
+        feature = "sqlite-migrator",
+        feature = "postgres-migrator",
+        feature = "mysql-migrator"
+    ))]
+    pub use sqlx_migrator::{Migrate, Plan};
 }
 
-pub struct EventDetails<D, M> {
+pub struct EventDetails<D, M = bool> {
     inner: Event,
     pub data: D,
     pub metadata: M,

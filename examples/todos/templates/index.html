@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Todos</title>
+  <script src="https://cdn.jsdelivr.net/gh/piranha/twinspark-js@main/dist/twinspark.min.js"></script>
+</head>
+
+<body>
+  <form method="post" action="/create" ts-req="" ts-req-selector="#log" ts-target="#log">
+    <input type="text" name="content" value="">
+  </form>
+  {% if let Some(LogMsg::Checking(id)) = log_msg %}
+  <div id="log" ts-trigger="load delay 1s" ts-req="/status/{{ id }}" ts-req-selector="#log" ts-target="#log">
+    Checking todo
+  </div>
+  {% else if let Some(LogMsg::Ready) = log_msg %}
+  <div id="log">
+  </div>
+  {% else if let Some(LogMsg::Failed(reason)) = log_msg %}
+  <div id="log">
+    Failed: "{{ reason }}"
+  </div>
+  {% else %}
+  <div id="log">
+
+  </div>
+  {% endif %}
+
+  <div class="todos" ts-req="/" ts-req-selector=".todos" ts-target=".todos" ts-trigger="load delay 1s">
+    {% for todo in todos %}
+    <div>
+      ({{ todo.state }}) {{ todo.content }}
+    </div>
+    {% endfor %}
+  </div>
+
+</body>
+
+</html>
