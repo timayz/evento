@@ -4,3 +4,12 @@ version = "1.0.0-alpha.15"
 edition = "2021"
 
 [dependencies]
+tokio = { version = "1.47", features = ["full"] }
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+heed = "0.22"
+tempdir = "0.3.7"
+axum = { version = "0.8", features = ["macros"] }
+askama = "0.14"
+evento = { path = "../../evento", version = "1.0.0-alpha.15", features = ["sqlite-migrator"] }

@@ -10,7 +10,7 @@ down:
 reset: down up
 
 test:
-	cargo test --all-features
+	cargo test --all-features -p evento
 
 fmt:
 	cargo fmt -- --emit files

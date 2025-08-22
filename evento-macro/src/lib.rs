@@ -18,19 +18,37 @@ pub fn handler(attr: TokenStream, item: TokenStream) -> TokenStream {
             .into();
     };
 
-    let syn::Type::Path(event_arg_path) = *event_arg.ty.clone() else {
+    let syn::Type::Path(ty) = *event_arg.ty.clone() else {
         return syn::Error::new_spanned(item, "Unable to find event input type")
             .into_compile_error()
             .into();
     };
 
-    let Some(event_arg_segment) = event_arg_path.path.segments.first() else {
+    let Some(event_arg_segment) = ty.path.segments.first() else {
         return syn::Error::new_spanned(item, "Unable to find event input type iden")
             .into_compile_error()
             .into();
     };
 
-    let event_ident = event_arg_segment.ident.to_owned();
+    let syn::PathArguments::AngleBracketed(ref arguments) = event_arg_segment.arguments else {
+        return syn::Error::new_spanned(item, "Unable to find event input type iden")
+            .into_compile_error()
+            .into();
+    };
+
+    let Some(syn::GenericArgument::Type(syn::Type::Path(ty))) = arguments.args.first() else {
+        return syn::Error::new_spanned(item, "Unable to find event input type iden")
+            .into_compile_error()
+            .into();
+    };
+
+    let Some(segment) = ty.path.segments.first() else {
+        return syn::Error::new_spanned(item, "Unable to find event input type iden")
+            .into_compile_error()
+            .into();
+    };
+
+    let event_ident = segment.ident.to_owned();
 
     quote! {
         struct #struct_ident;
