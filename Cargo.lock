@@ -2257,7 +2257,6 @@ dependencies = [
  "sqlx",
  "tempdir",
  "tokio",
- "tower-layer",
 ]
 
 [[package]]
