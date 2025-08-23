@@ -141,7 +141,11 @@ pub fn aggregator(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
         impl evento::AggregatorName for #ident {
             fn name() -> &'static str {
-                #name
+                static NAME: std::sync::LazyLock<String> = std::sync::LazyLock::new(||{
+                    format!("{}/{}", env!("CARGO_PKG_NAME"), #name)
+                });
+
+                &NAME
             }
         }
     }
