@@ -212,6 +212,13 @@ impl From<crate::Sqlite> for Evento {
     }
 }
 
+#[cfg(feature = "sqlite")]
+impl From<&crate::Sqlite> for Evento {
+    fn from(value: &crate::Sqlite) -> Self {
+        Self::Sqlite(value.clone())
+    }
+}
+
 #[cfg(feature = "mysql")]
 impl From<crate::MySql> for Evento {
     fn from(value: crate::MySql) -> Self {
@@ -219,10 +226,24 @@ impl From<crate::MySql> for Evento {
     }
 }
 
+#[cfg(feature = "mysql")]
+impl From<&crate::MySql> for Evento {
+    fn from(value: &crate::MySql) -> Self {
+        Self::MySql(value.clone())
+    }
+}
+
 #[cfg(feature = "postgres")]
 impl From<crate::Postgres> for Evento {
     fn from(value: crate::Postgres) -> Self {
         Self::Postgres(value)
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl From<&crate::Postgres> for Evento {
+    fn from(value: &crate::Postgres) -> Self {
+        Self::Postgres(value.clone())
     }
 }
 
@@ -234,8 +255,8 @@ pub struct EventoGroup {
 
 #[cfg(feature = "group")]
 impl EventoGroup {
-    pub fn executor(mut self, executor: &Evento) -> Self {
-        self.executors.push(executor.clone());
+    pub fn executor(mut self, executor: impl Into<Evento>) -> Self {
+        self.executors.push(executor.into());
 
         self
     }
