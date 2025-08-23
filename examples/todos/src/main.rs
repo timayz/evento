@@ -179,12 +179,12 @@ struct CreationRequested {
     pub state: TodoState,
 }
 
-#[derive(AggregatorName, Serialize, Deserialize, Default)]
+#[derive(AggregatorName, Serialize, Deserialize)]
 struct CreationFailed {
     pub state: TodoState,
 }
 
-#[derive(AggregatorName, Serialize, Deserialize, Default)]
+#[derive(AggregatorName, Serialize, Deserialize)]
 struct CreationSucceeded {
     pub state: TodoState,
 }
