@@ -261,10 +261,9 @@ impl Executor for EventoGroup {
             .map(|e| e.get_event::<A>(cursor.to_owned()));
 
         let results = futures_util::future::join_all(futures).await;
-        for res in results.iter() {
-            if let Ok(result) = res {
-                return Ok(result.clone());
-            }
+
+        if let Some(Ok(result)) = results.iter().find(|res| res.is_ok()) {
+            return Ok(result.clone());
         }
 
         if let Err(err) = results
