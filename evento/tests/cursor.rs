@@ -537,7 +537,7 @@ pub fn get_data() -> Vec<Event> {
         Ulid::new().to_string(),
     ];
 
-    let aggregator_types = ["Calcul", "MyCalcul"];
+    let aggregator_types = ["evento/Calcul", "evento/MyCalcul"];
 
     let routing_keys = [
         Some("us-east-1".to_owned()),

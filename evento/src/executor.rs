@@ -212,10 +212,24 @@ impl From<crate::Sqlite> for Evento {
     }
 }
 
+#[cfg(feature = "sqlite")]
+impl From<&crate::Sqlite> for Evento {
+    fn from(value: &crate::Sqlite) -> Self {
+        Self::Sqlite(value.clone())
+    }
+}
+
 #[cfg(feature = "mysql")]
 impl From<crate::MySql> for Evento {
     fn from(value: crate::MySql) -> Self {
         Self::MySql(value)
+    }
+}
+
+#[cfg(feature = "mysql")]
+impl From<&crate::MySql> for Evento {
+    fn from(value: &crate::MySql) -> Self {
+        Self::MySql(value.clone())
     }
 }
 
@@ -226,26 +240,61 @@ impl From<crate::Postgres> for Evento {
     }
 }
 
-#[derive(Clone)]
-pub struct External<S: Executor, I: Executor> {
-    source: S,
-    inner: I,
-}
-
-impl<S: Executor, I: Executor> External<S, I> {
-    pub fn new(source: S, inner: I) -> Self {
-        Self { source, inner }
+#[cfg(feature = "postgres")]
+impl From<&crate::Postgres> for Evento {
+    fn from(value: &crate::Postgres) -> Self {
+        Self::Postgres(value.clone())
     }
 }
 
+#[cfg(feature = "group")]
+#[derive(Clone, Default)]
+pub struct EventoGroup {
+    executors: Vec<Evento>,
+}
+
+#[cfg(feature = "group")]
+impl EventoGroup {
+    pub fn executor(mut self, executor: impl Into<Evento>) -> Self {
+        self.executors.push(executor.into());
+
+        self
+    }
+
+    pub fn first(&self) -> &Evento {
+        self.executors
+            .first()
+            .expect("EventoGroup must have at least one executor")
+    }
+}
+
+#[cfg(feature = "group")]
 #[async_trait::async_trait]
-impl<S: Executor, I: Executor> Executor for External<S, I> {
-    async fn write(&self, _events: Vec<Event>) -> Result<(), WriteError> {
-        todo!()
+impl Executor for EventoGroup {
+    async fn write(&self, events: Vec<Event>) -> Result<(), WriteError> {
+        self.first().write(events).await
     }
 
     async fn get_event<A: Aggregator>(&self, cursor: Value) -> Result<Event, ReadError> {
-        self.source.get_event::<A>(cursor).await
+        let futures = self
+            .executors
+            .iter()
+            .map(|e| e.get_event::<A>(cursor.to_owned()));
+
+        let results = futures_util::future::join_all(futures).await;
+
+        if let Some(Ok(result)) = results.iter().find(|res| res.is_ok()) {
+            return Ok(result.clone());
+        }
+
+        if let Err(err) = results
+            .first()
+            .expect("EventoGroup must have at least one executor")
+        {
+            return Err(ReadError::Unknown(anyhow::anyhow!("{err:?}")));
+        }
+
+        unreachable!()
     }
 
     async fn read_by_aggregator<A: Aggregator>(
@@ -253,7 +302,24 @@ impl<S: Executor, I: Executor> Executor for External<S, I> {
         id: String,
         args: Args,
     ) -> Result<ReadResult<Event>, ReadError> {
-        self.source.read_by_aggregator::<A>(id, args).await
+        use crate::cursor;
+        let futures = self
+            .executors
+            .iter()
+            .map(|e| e.read_by_aggregator::<A>(id.to_owned(), args.clone()));
+
+        let results = futures_util::future::join_all(futures).await;
+        let mut events = vec![];
+        for res in results {
+            for edge in res?.edges {
+                events.push(edge.node);
+            }
+        }
+
+        Ok(cursor::Reader::new(events)
+            .args(args)
+            .execute()
+            .map_err(|err| ReadError::Unknown(err.into()))?)
     }
 
     async fn read(
@@ -262,11 +328,31 @@ impl<S: Executor, I: Executor> Executor for External<S, I> {
         routing_key: RoutingKey,
         args: Args,
     ) -> Result<ReadResult<Event>, ReadError> {
-        self.source.read(aggregator_types, routing_key, args).await
+        use crate::cursor;
+        let futures = self.executors.iter().map(|e| {
+            e.read(
+                aggregator_types.to_owned(),
+                routing_key.to_owned(),
+                args.clone(),
+            )
+        });
+
+        let results = futures_util::future::join_all(futures).await;
+        let mut events = vec![];
+        for res in results {
+            for edge in res?.edges {
+                events.push(edge.node);
+            }
+        }
+
+        Ok(cursor::Reader::new(events)
+            .args(args)
+            .execute()
+            .map_err(|err| ReadError::Unknown(err.into()))?)
     }
 
     async fn get_subscriber_cursor(&self, key: String) -> Result<Option<Value>, SubscribeError> {
-        self.inner.get_subscriber_cursor(key).await
+        self.first().get_subscriber_cursor(key).await
     }
 
     async fn is_subscriber_running(
@@ -274,27 +360,27 @@ impl<S: Executor, I: Executor> Executor for External<S, I> {
         key: String,
         worker_id: Ulid,
     ) -> Result<bool, SubscribeError> {
-        self.inner.is_subscriber_running(key, worker_id).await
+        self.first().is_subscriber_running(key, worker_id).await
     }
 
     async fn upsert_subscriber(&self, key: String, worker_id: Ulid) -> Result<(), SubscribeError> {
-        self.inner.upsert_subscriber(key, worker_id).await
+        self.first().upsert_subscriber(key, worker_id).await
     }
 
     async fn get_snapshot<A: Aggregator>(
         &self,
         id: String,
     ) -> Result<Option<(Vec<u8>, Value)>, ReadError> {
-        self.source.get_snapshot::<A>(id).await
+        self.first().get_snapshot::<A>(id).await
     }
 
     async fn save_snapshot<A: Aggregator>(
         &self,
-        _id: String,
-        _data: Vec<u8>,
-        _cursor: Value,
+        id: String,
+        data: Vec<u8>,
+        cursor: Value,
     ) -> Result<(), WriteError> {
-        todo!()
+        self.first().save_snapshot::<A>(id, data, cursor).await
     }
 
     async fn acknowledge(
@@ -303,6 +389,6 @@ impl<S: Executor, I: Executor> Executor for External<S, I> {
         cursor: Value,
         lag: i64,
     ) -> Result<(), AcknowledgeError> {
-        self.inner.acknowledge(key, cursor, lag).await
+        self.first().acknowledge(key, cursor, lag).await
     }
 }
