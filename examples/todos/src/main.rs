@@ -129,8 +129,8 @@ async fn main() -> anyhow::Result<()> {
 
     evento::subscribe("todo-command")
         .aggregator::<Todo>()
-        .handler(evento::SkipHandler::<Todo, CreationSucceeded>::default())
-        .handler(evento::SkipHandler::<Todo, CreationFailed>::default())
+        .skip::<Todo, CreationSucceeded>()
+        .skip::<Todo, CreationFailed>()
         .handler(command_creation_requested())
         .run(&executor)
         .await?;
@@ -179,12 +179,12 @@ struct CreationRequested {
     pub state: TodoState,
 }
 
-#[derive(AggregatorName, Serialize, Deserialize, Default)]
+#[derive(AggregatorName, Serialize, Deserialize)]
 struct CreationFailed {
     pub state: TodoState,
 }
 
-#[derive(AggregatorName, Serialize, Deserialize, Default)]
+#[derive(AggregatorName, Serialize, Deserialize)]
 struct CreationSucceeded {
     pub state: TodoState,
 }
