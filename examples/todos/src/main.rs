@@ -129,8 +129,8 @@ async fn main() -> anyhow::Result<()> {
 
     evento::subscribe("todo-command")
         .aggregator::<Todo>()
-        .handler(evento::SkipHandler::<Todo, CreationSucceeded>::default())
-        .handler(evento::SkipHandler::<Todo, CreationFailed>::default())
+        .skip::<Todo, CreationSucceeded>()
+        .skip::<Todo, CreationFailed>()
         .handler(command_creation_requested())
         .run(&executor)
         .await?;
