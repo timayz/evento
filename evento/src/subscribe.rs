@@ -164,6 +164,11 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
         self
     }
 
+    #[cfg(feature = "handler")]
+    pub fn skip<A: Aggregator + 'static, N: AggregatorName + Send + Sync + 'static>(self) -> Self {
+        self.handler(SkipHandler::<A, N>(PhantomData, PhantomData))
+    }
+
     pub async fn init(&self, executor: &E) -> Result<(), SubscribeError> {
         executor
             .upsert_subscriber(self.key.to_owned(), self.id)
@@ -355,7 +360,6 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
     }
 }
 
-#[derive(Default)]
 pub struct SkipHandler<A: Aggregator, N: AggregatorName>(PhantomData<A>, PhantomData<N>);
 
 impl<E: Executor, A: Aggregator, N: AggregatorName + Send + Sync> SubscribeHandler<E>
