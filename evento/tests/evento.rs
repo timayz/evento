@@ -1,5 +1,5 @@
+use bincode::{Decode, Encode};
 use evento::{AggregatorName, Event, EventDetails, Executor, WriteError};
-use serde::{Deserialize, Serialize};
 
 pub async fn load<E: Executor>(executor: &E) -> anyhow::Result<()> {
     let id = evento::create::<Calcul>()
@@ -396,29 +396,29 @@ pub async fn subscribe_default_multiple_aggregator<E: Executor + Clone>(
     Ok(())
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, AggregatorName)]
+#[derive(Debug, Encode, Decode, PartialEq, AggregatorName)]
 struct Added {
     pub value: i16,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, AggregatorName)]
+#[derive(Debug, Encode, Decode, PartialEq, AggregatorName)]
 struct Subtracted {
     pub value: i16,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, AggregatorName)]
+#[derive(Debug, Encode, Decode, PartialEq, AggregatorName)]
 struct Multiplied {
     pub value: i16,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, AggregatorName)]
+#[derive(Debug, Encode, Decode, PartialEq, AggregatorName)]
 struct Divided {
     pub value: i16,
 }
 
 type CalculEvent<D> = EventDetails<D, bool>;
 
-#[derive(Debug, Default, Serialize, Deserialize, Clone)]
+#[derive(Debug, Default, Encode, Decode, Clone)]
 struct Calcul {
     pub value: i64,
 }
@@ -450,7 +450,7 @@ impl Calcul {
     }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize, Clone)]
+#[derive(Debug, Default, Encode, Decode, Clone)]
 struct MyCalcul {
     pub value: i64,
 }

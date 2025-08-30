@@ -7,6 +7,7 @@ use axum::{
     routing::{get, post},
     Form, Router,
 };
+use bincode::{Decode, Encode};
 use evento::{
     prelude::{Migrate, Plan},
     AggregatorName, EventDetails,
@@ -159,7 +160,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[derive(Serialize, Deserialize, Default, Clone, Debug)]
+#[derive(Serialize, Deserialize, Encode, Decode, Default, Clone, Debug)]
 enum TodoState {
     #[default]
     Ready,
@@ -173,23 +174,23 @@ impl fmt::Display for TodoState {
     }
 }
 
-#[derive(AggregatorName, Serialize, Deserialize)]
+#[derive(AggregatorName, Encode, Decode)]
 struct CreationRequested {
     pub content: String,
     pub state: TodoState,
 }
 
-#[derive(AggregatorName, Serialize, Deserialize)]
+#[derive(AggregatorName, Encode, Decode)]
 struct CreationFailed {
     pub state: TodoState,
 }
 
-#[derive(AggregatorName, Serialize, Deserialize)]
+#[derive(AggregatorName, Encode, Decode)]
 struct CreationSucceeded {
     pub state: TodoState,
 }
 
-#[derive(Default, Serialize, Deserialize, Clone, Debug)]
+#[derive(Default, Serialize, Deserialize, Encode, Decode, Clone, Debug)]
 struct Todo {
     pub content: String,
     pub state: TodoState,

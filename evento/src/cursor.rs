@@ -3,7 +3,7 @@ use base64::{
     engine::{general_purpose, GeneralPurpose},
     Engine,
 };
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use std::ops::{Deref, DerefMut};
 use thiserror::Error;
 
@@ -56,28 +56,29 @@ impl AsRef<[u8]> for Value {
 }
 
 pub trait Cursor {
-    type T: Serialize + DeserializeOwned;
+    type T: bincode::Encode + bincode::Decode<()>;
 
     fn serialize(&self) -> Self::T;
 
-    fn serialize_cursor(&self) -> Result<Value, ciborium::ser::Error<std::io::Error>> {
+    fn serialize_cursor(&self) -> Result<Value, bincode::error::EncodeError> {
         let cursor = self.serialize();
 
-        let mut cbor_encoded = vec![];
-        ciborium::into_writer(&cursor, &mut cbor_encoded)?;
+        let config = bincode::config::standard();
+        let encoded = bincode::encode_to_vec(cursor, config)?;
 
         let engine = GeneralPurpose::new(&alphabet::URL_SAFE, general_purpose::PAD);
 
-        Ok(Value(engine.encode(cbor_encoded)))
+        Ok(Value(engine.encode(encoded)))
     }
 
-    fn deserialize_cursor(value: &Value) -> Result<Self::T, ciborium::de::Error<std::io::Error>> {
+    fn deserialize_cursor(value: &Value) -> Result<Self::T, bincode::error::DecodeError> {
         let engine = GeneralPurpose::new(&alphabet::URL_SAFE, general_purpose::PAD);
         let decoded = engine
             .decode(value)
-            .map_err(|e| ciborium::de::Error::Semantic(None, e.to_string()))?;
+            .map_err(|e| bincode::error::DecodeError::OtherString(e.to_string()))?;
+        let config = bincode::config::standard();
 
-        ciborium::from_reader(&decoded[..])
+        bincode::decode_from_slice(&decoded[..], config).map(|(decoded, _)| decoded)
     }
 }
 
@@ -128,11 +129,11 @@ pub enum ReadError {
     #[error("{0}")]
     Unknown(#[from] anyhow::Error),
 
-    #[error("ciborium.ser >> {0}")]
-    CiboriumSer(#[from] ciborium::ser::Error<std::io::Error>),
+    #[error("bincode.encode >> {0}")]
+    BincodeEncode(#[from] bincode::error::EncodeError),
 
-    #[error("ciborium.de >> {0}")]
-    CiboriumDe(#[from] ciborium::de::Error<std::io::Error>),
+    #[error("bincode.decode >> {0}")]
+    BincodeDecode(#[from] bincode::error::DecodeError),
 
     #[error("base64 decode: {0}")]
     Base64Decode(#[from] base64::DecodeError),
@@ -311,12 +312,12 @@ impl Bind for crate::Event {
                 event.timestamp < cursor.t
                     || (event.timestamp == cursor.t
                         && (event.version < cursor.v
-                            || (event.version == cursor.v && event.id < cursor.i)))
+                            || (event.version == cursor.v && event.id.to_string() < cursor.i)))
             } else {
                 event.timestamp > cursor.t
                     || (event.timestamp == cursor.t
                         && (event.version > cursor.v
-                            || (event.version == cursor.v && event.id > cursor.i)))
+                            || (event.version == cursor.v && event.id.to_string() > cursor.i)))
             }
         });
     }
