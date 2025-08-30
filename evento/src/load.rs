@@ -15,11 +15,11 @@ pub enum ReadError {
     #[error("{0}")]
     Unknown(#[from] anyhow::Error),
 
-    #[error("ciborium.ser >> {0}")]
-    CiboriumSer(#[from] ciborium::ser::Error<std::io::Error>),
+    #[error("bincode.encode >> {0}")]
+    BincodeEncode(#[from] bincode::error::EncodeError),
 
-    #[error("ciborium.de >> {0}")]
-    CiboriumDe(#[from] ciborium::de::Error<std::io::Error>),
+    #[error("bincode.decode >> {0}")]
+    BincodeDecode(#[from] bincode::error::DecodeError),
 
     #[error("base64 decode: {0}")]
     Base64Decode(#[from] base64::DecodeError),
@@ -41,7 +41,8 @@ pub async fn load<A: Aggregator, E: Executor>(
     let id = id.into();
     let (mut aggregator, mut cursor) = match executor.get_snapshot::<A>(id.to_owned()).await? {
         Some((data, cursor)) => {
-            let aggregator: A = ciborium::from_reader(&data[..])?;
+            let config = bincode::config::standard();
+            let (aggregator, _): (A, _) = bincode::decode_from_slice(&data[..], config)?;
             (aggregator, Some(cursor))
         }
         _ => (A::default(), None),
@@ -60,8 +61,8 @@ pub async fn load<A: Aggregator, E: Executor>(
         }
 
         if let (Some(event), Some(cursor)) = (events.edges.last().cloned(), cursor.clone()) {
-            let mut data = vec![];
-            ciborium::into_writer(&aggregator, &mut data)?;
+            let config = bincode::config::standard();
+            let data = bincode::encode_to_vec(&aggregator, config)?;
 
             executor
                 .save_snapshot::<A>(event.node.aggregator_id, data, cursor)

@@ -22,7 +22,6 @@ pub use load::*;
 pub use save::*;
 pub use subscribe::*;
 
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{fmt::Debug, ops::Deref};
 use ulid::Ulid;
 
@@ -63,9 +62,9 @@ pub use sql::Postgres;
 #[cfg(feature = "sqlite")]
 pub use sql::Sqlite;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, bincode::Encode, bincode::Decode)]
 pub struct EventCursor {
-    pub i: Ulid,
+    pub i: String,
     pub v: i32,
     pub t: i64,
 }
@@ -84,15 +83,17 @@ pub struct Event {
 }
 
 impl Event {
-    pub fn to_details<D: AggregatorName + DeserializeOwned, M: DeserializeOwned>(
+    pub fn to_details<D: AggregatorName + bincode::Decode<()>, M: bincode::Decode<()>>(
         &self,
-    ) -> Result<Option<EventDetails<D, M>>, ciborium::de::Error<std::io::Error>> {
+    ) -> Result<Option<EventDetails<D, M>>, bincode::error::DecodeError> {
         if D::name() != self.name {
             return Ok(None);
         }
 
-        let data = ciborium::from_reader(&self.data[..])?;
-        let metadata = ciborium::from_reader(&self.metadata[..])?;
+        let config = bincode::config::standard();
+
+        let (data, _) = bincode::decode_from_slice(&self.data[..], config)?;
+        let (metadata, _) = bincode::decode_from_slice(&self.metadata[..], config)?;
 
         Ok(Some(EventDetails {
             data,
@@ -107,7 +108,7 @@ impl Cursor for Event {
 
     fn serialize(&self) -> Self::T {
         EventCursor {
-            i: self.id,
+            i: self.id.to_string(),
             v: self.version,
             t: self.timestamp,
         }
@@ -115,7 +116,7 @@ impl Cursor for Event {
 }
 
 pub trait Aggregator:
-    Default + Send + Sync + Serialize + DeserializeOwned + Clone + AggregatorName + Debug
+    Default + Send + Sync + bincode::Encode + bincode::Decode<()> + Clone + AggregatorName + Debug
 {
     fn aggregate<'async_trait>(
         &'async_trait mut self,
