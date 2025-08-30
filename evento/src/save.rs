@@ -1,6 +1,5 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -20,8 +19,8 @@ pub enum WriteError {
     #[error("{0}")]
     Unknown(#[from] anyhow::Error),
 
-    #[error("ciborium.ser >> {0}")]
-    CiboriumSer(#[from] ciborium::ser::Error<std::io::Error>),
+    #[error("bincode.encode >> {0}")]
+    BincodeEncode(#[from] bincode::error::EncodeError),
 
     #[error("systemtime >> {0}")]
     SystemTime(#[from] std::time::SystemTimeError),
@@ -71,23 +70,23 @@ impl<A: Aggregator> SaveBuilder<A> {
         self
     }
 
-    pub fn metadata<M: Serialize>(
+    pub fn metadata<M: bincode::Encode>(
         mut self,
         v: &M,
-    ) -> Result<Self, ciborium::ser::Error<std::io::Error>> {
-        let mut metadata = Vec::new();
-        ciborium::into_writer(v, &mut metadata)?;
+    ) -> Result<Self, bincode::error::EncodeError> {
+        let config = bincode::config::standard();
+        let metadata = bincode::encode_to_vec(v, config)?;
         self.metadata = Some(metadata);
 
         Ok(self)
     }
 
-    pub fn data<D: Serialize + AggregatorName>(
+    pub fn data<D: bincode::Encode + AggregatorName>(
         mut self,
         v: &D,
-    ) -> Result<Self, ciborium::ser::Error<std::io::Error>> {
-        let mut data = Vec::new();
-        ciborium::into_writer(v, &mut data)?;
+    ) -> Result<Self, bincode::error::EncodeError> {
+        let config = bincode::config::standard();
+        let data = bincode::encode_to_vec(v, config)?;
         self.data.push((D::name(), data));
 
         Ok(self)
@@ -145,8 +144,8 @@ impl<A: Aggregator> SaveBuilder<A> {
 
         executor.write(events).await?;
 
-        let mut data = vec![];
-        ciborium::into_writer(&aggregator, &mut data)?;
+        let config = bincode::config::standard();
+        let data = bincode::encode_to_vec(&aggregator, config)?;
         let cursor = last_event.serialize_cursor()?;
 
         executor
