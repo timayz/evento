@@ -66,7 +66,7 @@ use syn::{parse_macro_input, spanned::Spanned, Ident, ItemFn, ItemImpl, ItemStru
 /// ```no_run
 /// use evento::{Context, EventDetails, Executor};
 /// use bincode::{Encode, Decode};
-/// 
+///
 /// # use evento::AggregatorName;
 /// # #[derive(AggregatorName, Encode, Decode)]
 /// # struct UserCreated { name: String }
