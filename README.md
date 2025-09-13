@@ -17,14 +17,14 @@ Add Evento to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-evento = "1.0.0-alpha.18"
+evento = "1.0"
 ```
 
 For SQL database support, enable the appropriate features:
 
 ```toml
 [dependencies]
-evento = { version = "1.0.0-alpha.18", features = ["sqlite", "sqlite-migrator"] }
+evento = { version = "1.0", features = ["sqlite", "sqlite-migrator"] }
 ```
 
 ## Basic Usage
