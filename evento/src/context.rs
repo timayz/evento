@@ -1,8 +1,11 @@
+use serde::Serialize;
 use std::{
     any::{type_name, Any, TypeId},
     collections::HashMap,
     fmt,
     hash::{BuildHasherDefault, Hasher},
+    ops::Deref,
+    sync::Arc,
 };
 
 /// A hasher for `TypeId`s that takes advantage of its known characteristics.
@@ -49,7 +52,7 @@ impl Context {
     /// If an item of this type was already stored, it will be replaced and returned.
     ///
     /// ```
-    /// # use evento::Context;
+    /// # use evento::context::Context;
     /// let mut map = Context::new();
     /// assert_eq!(map.insert(""), None);
     /// assert_eq!(map.insert(1u32), None);
@@ -65,7 +68,7 @@ impl Context {
     /// Check if map contains an item of a given type.
     ///
     /// ```
-    /// # use evento::Context;
+    /// # use evento::context::Context;
     /// let mut map = Context::new();
     /// assert!(!map.contains::<u32>());
     ///
@@ -79,7 +82,7 @@ impl Context {
     /// Get a reference to an item of a given type.
     ///
     /// ```
-    /// # use evento::Context;
+    /// # use evento::context::Context;
     /// let mut map = Context::new();
     /// map.insert(1u32);
     /// assert_eq!(map.get::<u32>(), Some(&1u32));
@@ -90,7 +93,7 @@ impl Context {
             _ => {
                 tracing::debug!(
                     "Failed to extract `Data<{}>` For the Data extractor to work \
-        correctly, wrap the data with `Data::new()` and pass it to `Evento::data()`. \
+        correctly, wrap the data with `Data::new()` and pass it to `evento::data()`. \
         Ensure that types align in both the set and retrieve calls.",
                     type_name::<T>()
                 );
@@ -106,7 +109,7 @@ impl Context {
     /// Get a reference to an item of a given type.
     ///
     /// ```
-    /// # use evento::Context;
+    /// # use evento::context::Context;
     /// let mut map = Context::new();
     /// map.insert(1u32);
     /// assert_eq!(map.get::<u32>(), Some(&1u32));
@@ -120,7 +123,7 @@ impl Context {
     /// Get a mutable reference to an item of a given type.
     ///
     /// ```
-    /// # use evento::Context;
+    /// # use evento::context::Context;
     /// let mut map = Context::new();
     /// map.insert(1u32);
     /// assert_eq!(map.get_mut::<u32>(), Some(&mut 1u32));
@@ -136,7 +139,7 @@ impl Context {
     /// If an item of this type was already stored, it will be returned.
     ///
     /// ```
-    /// # use evento::Context;
+    /// # use evento::context::Context;
     /// let mut map = Context::new();
     ///
     /// map.insert(1u32);
@@ -152,7 +155,7 @@ impl Context {
     /// Clear the `Context` of all inserted extensions.
     ///
     /// ```
-    /// # use evento::Context;
+    /// # use evento::context::Context;
     /// let mut map = Context::new();
     ///
     /// map.insert(1u32);
@@ -180,4 +183,58 @@ impl fmt::Debug for Context {
 
 fn downcast_owned<T: Send + Sync + 'static>(boxed: Box<dyn Any + Send + Sync>) -> Option<T> {
     boxed.downcast().ok().map(|boxed| *boxed)
+}
+
+#[derive(Debug)]
+pub struct Data<T: ?Sized>(Arc<T>);
+
+impl<T> Data<T> {
+    /// Create new `Data` instance.
+    pub fn new(state: T) -> Data<T> {
+        Data(Arc::new(state))
+    }
+}
+
+impl<T: ?Sized> Data<T> {
+    /// Returns reference to inner `T`.
+    pub fn get_ref(&self) -> &T {
+        self.0.as_ref()
+    }
+
+    /// Unwraps to the internal `Arc<T>`
+    pub fn into_inner(self) -> Arc<T> {
+        self.0
+    }
+}
+
+impl<T: ?Sized> Deref for Data<T> {
+    type Target = Arc<T>;
+
+    fn deref(&self) -> &Arc<T> {
+        &self.0
+    }
+}
+
+impl<T: ?Sized> Clone for Data<T> {
+    fn clone(&self) -> Data<T> {
+        Data(Arc::clone(&self.0))
+    }
+}
+
+impl<T: ?Sized> From<Arc<T>> for Data<T> {
+    fn from(arc: Arc<T>) -> Self {
+        Data(arc)
+    }
+}
+
+impl<T> Serialize for Data<T>
+where
+    T: Serialize,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.0.serialize(serializer)
+    }
 }
