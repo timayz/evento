@@ -96,6 +96,43 @@ pub struct SubscribeBuilder<E: Executor> {
     context: Arc<Mutex<context::Context>>,
 }
 
+/// Create a new event subscription builder
+///
+/// Creates a builder for setting up continuous event processing. Subscriptions
+/// listen to events from specified aggregates and process them with registered handlers.
+///
+/// # Parameters
+///
+/// - `key`: A unique identifier for this subscription (used for tracking progress)
+///
+/// # Examples
+///
+/// ```no_run
+/// use evento::subscribe;
+/// # use evento::*;
+/// # use bincode::{Encode, Decode};
+/// # #[derive(AggregatorName, Encode, Decode)]
+/// # struct UserCreated { name: String }
+/// # #[derive(Default, Encode, Decode, Clone, Debug)]
+/// # struct User;
+/// # #[evento::aggregator]
+/// # impl User {}
+/// # #[evento::handler(User)]
+/// # async fn on_user_created<E: Executor>(
+/// #     context: &Context<'_, E>,
+/// #     event: EventDetails<UserCreated>,
+/// # ) -> anyhow::Result<()> { Ok(()) }
+///
+/// async fn setup_subscription(executor: evento::Sqlite) -> anyhow::Result<()> {
+///     subscribe("user-handlers")
+///         .aggregator::<User>()
+///         .handler(on_user_created())
+///         .run(&executor)
+///         .await?;
+///     
+///     Ok(())
+/// }
+/// ```
 pub fn subscribe<E: Executor>(key: impl Into<String>) -> SubscribeBuilder<E> {
     SubscribeBuilder {
         id: Ulid::new(),

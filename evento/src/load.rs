@@ -34,6 +34,57 @@ pub struct LoadResult<A: Aggregator> {
     pub event: Event,
 }
 
+/// Load an aggregate by replaying its events from the event store
+///
+/// Reconstructs an aggregate's current state by loading and replaying all events
+/// for the specified aggregate ID. This function handles snapshots automatically
+/// to optimize performance - it loads the latest snapshot and replays only events
+/// that occurred after the snapshot.
+///
+/// # Parameters
+///
+/// - `executor`: The event store executor (database connection)
+/// - `id`: The aggregate ID to load
+///
+/// # Returns
+///
+/// Returns a [`LoadResult`] containing:
+/// - `item`: The reconstructed aggregate with its current state
+/// - `event`: The last event that was applied to the aggregate
+///
+/// # Errors
+///
+/// - [`ReadError::NotFound`] if no events exist for the given aggregate ID
+/// - [`ReadError::TooManyEvents`] if there are too many events to process (>10 batches)
+/// - [`ReadError::BincodeDecode`] if event deserialization fails
+/// - [`ReadError::Unknown`] for other database or system errors
+///
+/// # Examples
+///
+/// ```no_run
+/// use evento::load;
+/// # use evento::*;
+/// # use bincode::{Encode, Decode};
+/// # #[derive(Default, Encode, Decode, Clone, Debug)]
+/// # struct User { name: String }
+/// # #[evento::aggregator]
+/// # impl User {}
+///
+/// async fn get_user(executor: &evento::Sqlite, user_id: &str) -> anyhow::Result<User> {
+///     let result = load::<User, _>(executor, user_id).await?;
+///     
+///     println!("Loaded user at version {}", result.event.version);
+///     println!("Last event timestamp: {}", result.event.timestamp);
+///     
+///     Ok(result.item)
+/// }
+/// ```
+///
+/// # Performance
+///
+/// The function automatically creates snapshots during loading to speed up future loads.
+/// For aggregates with many events, consider the performance implications and ensure
+/// your event handlers are efficient.
 pub async fn load<A: Aggregator, E: Executor>(
     executor: &E,
     id: impl Into<String>,
