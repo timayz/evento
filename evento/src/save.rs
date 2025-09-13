@@ -156,14 +156,129 @@ impl<A: Aggregator> SaveBuilder<A> {
     }
 }
 
+/// Create a new aggregate with initial events
+///
+/// Creates a builder for generating events that will create a new aggregate instance.
+/// The aggregate starts in its default state and the generated ID is a new ULID.
+///
+/// # Examples
+///
+/// ```no_run
+/// use evento::create;
+/// # use evento::*;
+/// # use bincode::{Encode, Decode};
+/// # #[derive(AggregatorName, Encode, Decode)]
+/// # struct UserCreated { name: String }
+/// # #[derive(Default, Encode, Decode, Clone, Debug)]
+/// # struct User;
+/// # #[evento::aggregator]
+/// # impl User {}
+///
+/// async fn create_user(executor: &evento::Sqlite) -> anyhow::Result<String> {
+///     let user_id = create::<User>()
+///         .data(&UserCreated {
+///             name: "John Doe".to_string(),
+///         })?
+///         .metadata(&true)?
+///         .commit(executor)
+///         .await?;
+///     
+///     println!("Created user with ID: {}", user_id);
+///     Ok(user_id)
+/// }
+/// ```
 pub fn create<A: Aggregator>() -> SaveBuilder<A> {
     SaveBuilder::new(Some(A::default()), Ulid::new())
 }
 
+/// Add events to an existing aggregate
+///
+/// Creates a builder for adding events to an aggregate with the specified ID.
+/// The current state will be loaded from the event store before applying new events.
+///
+/// # Parameters
+///
+/// - `id`: The ID of the aggregate to modify
+///
+/// # Examples
+///
+/// ```no_run
+/// use evento::save;
+/// # use evento::*;
+/// # use bincode::{Encode, Decode};
+/// # #[derive(AggregatorName, Encode, Decode)]
+/// # struct UserEmailChanged { email: String }
+/// # #[derive(Default, Encode, Decode, Clone, Debug)]
+/// # struct User;
+/// # #[evento::aggregator]
+/// # impl User {}
+///
+/// async fn update_user_email(
+///     executor: &evento::Sqlite,
+///     user_id: &str,
+///     new_email: &str,
+/// ) -> anyhow::Result<String> {
+///     let result_id = save::<User>(user_id)
+///         .data(&UserEmailChanged {
+///             email: new_email.to_string(),
+///         })?
+///         .metadata(&false)?
+///         .commit(executor)
+///         .await?;
+///     
+///     println!("Updated user {} with new email", result_id);
+///     Ok(result_id)
+/// }
+/// ```
 pub fn save<A: Aggregator>(id: impl Into<String>) -> SaveBuilder<A> {
     SaveBuilder::new(None, id)
 }
 
+/// Save events to an aggregate using a loaded aggregate state
+///
+/// Creates a builder for adding events to an aggregate using a previously loaded
+/// [`LoadResult`]. This is more efficient than [`save`] because it avoids loading
+/// the aggregate from the event store again.
+///
+/// The builder is pre-configured with the aggregate's current state, version, and routing key.
+///
+/// # Parameters
+///
+/// - `aggregator`: A [`LoadResult`] from [`load`] containing the aggregate state
+///
+/// # Examples
+///
+/// ```no_run
+/// use evento::{load, save_with};
+/// # use evento::*;
+/// # use bincode::{Encode, Decode};
+/// # #[derive(AggregatorName, Encode, Decode)]
+/// # struct UserEmailChanged { email: String }
+/// # #[derive(Default, Encode, Decode, Clone, Debug)]
+/// # struct User;
+/// # #[evento::aggregator]
+/// # impl User {}
+///
+/// async fn update_user_efficiently(
+///     executor: &evento::Sqlite,
+///     user_id: &str,
+///     new_email: &str,
+/// ) -> anyhow::Result<String> {
+///     // Load the current state
+///     let user = load::<User, _>(executor, user_id).await?;
+///     
+///     // Save using the loaded state (more efficient)
+///     let result_id = save_with(user)
+///         .data(&UserEmailChanged {
+///             email: new_email.to_string(),
+///         })?
+///         .metadata(&false)?
+///         .commit(executor)
+///         .await?;
+///     
+///     Ok(result_id)
+/// }
+/// ```
 pub fn save_with<A: Aggregator>(aggregator: LoadResult<A>) -> SaveBuilder<A> {
     SaveBuilder::new(Some(aggregator.item), aggregator.event.aggregator_id)
         .original_version(aggregator.event.version as u16)
