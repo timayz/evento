@@ -22,7 +22,7 @@ thiserror = "2.0"
 async-trait = "0.1"
 tracing = "0.1"
 base64 = "0.22"
-sea-query = { version = "1.0.0-rc.12", default-features = false, features = ["derive", "audit"], optional = true }
+sea-query = { version = "1.0.0-rc.14", default-features = false, features = ["derive", "audit"], optional = true }
 sea-query-binder = { version = "0.8.0-rc.7", features = ["runtime-tokio"], optional = true }
 futures-util = { version = "0.3", optional = true }
 backon = { version = "1.5", optional = true }
