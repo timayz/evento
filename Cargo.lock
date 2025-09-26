@@ -608,7 +608,7 @@ dependencies = [
  "futures-util",
  "rand 0.9.2",
  "sea-query",
- "sea-query-binder",
+ "sea-query-sqlx",
  "serde",
  "sqlx",
  "sqlx_migrator",
@@ -1712,22 +1712,12 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "sea-query"
-version = "1.0.0-rc.12"
+version = "1.0.0-rc.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab621a8d8b03a3e513ea075f71aa26830a55c977d7b40f09e825bb91910db823"
+checksum = "fdeac8832b5b36a57b38ef6d2956cd6244c04508669f2a932439c8ca25dbad0f"
 dependencies = [
  "inherent",
  "sea-query-derive",
-]
-
-[[package]]
-name = "sea-query-binder"
-version = "0.8.0-rc.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04db61539fefbddb68409949d73d51f73e62eb7306fe1d8478a867ff3be8c9dd"
-dependencies = [
- "sea-query",
- "sqlx",
 ]
 
 [[package]]
@@ -1742,6 +1732,16 @@ dependencies = [
  "quote",
  "syn",
  "thiserror",
+]
+
+[[package]]
+name = "sea-query-sqlx"
+version = "0.8.0-rc.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68873fa1776b4c25a26e7679f8ee22332978c721168ec1b0b32b6583d5a9381d"
+dependencies = [
+ "sea-query",
+ "sqlx",
 ]
 
 [[package]]
