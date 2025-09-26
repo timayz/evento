@@ -23,7 +23,7 @@ async-trait = "0.1"
 tracing = "0.1"
 base64 = "0.22"
 sea-query = { version = "1.0.0-rc.14", default-features = false, features = ["derive", "audit"], optional = true }
-sea-query-binder = { version = "0.8.0-rc.7", features = ["runtime-tokio"], optional = true }
+sea-query-sqlx = { version = "0.8.0-rc.9", features = ["runtime-tokio"], optional = true }
 futures-util = { version = "0.3", optional = true }
 backon = { version = "1.5", optional = true }
 
@@ -42,6 +42,6 @@ sqlite-migrator = ["sqlite", "sqlx_migrator/sqlite"]
 mysql-migrator = ["mysql", "sqlx_migrator/mysql"]
 postgres-migrator = ["postgres", "sqlx_migrator/postgres"]
 sql = ["sqlite", "mysql", "postgres"]
-sqlite = ["sea-query/backend-sqlite", "sea-query-binder/sqlx-sqlite", "sqlx/sqlite"]
-mysql = ["sea-query/backend-mysql", "sea-query-binder/sqlx-mysql", "sqlx/mysql"]
-postgres = ["sea-query/backend-postgres", "sea-query-binder/sqlx-postgres", "sqlx/postgres"]
+sqlite = ["sea-query/backend-sqlite", "sea-query-sqlx/sqlx-sqlite", "sqlx/sqlite"]
+mysql = ["sea-query/backend-mysql", "sea-query-sqlx/sqlx-mysql", "sqlx/mysql"]
+postgres = ["sea-query/backend-postgres", "sea-query-sqlx/sqlx-postgres", "sqlx/postgres"]

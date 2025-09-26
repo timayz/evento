@@ -10,7 +10,7 @@ use sea_query::PostgresQueryBuilder;
 #[cfg(feature = "sqlite")]
 use sea_query::SqliteQueryBuilder;
 use sea_query::{Expr, ExprTrait, Iden, IntoColumnRef, OnConflict, Query, SelectStatement};
-use sea_query_binder::SqlxBinder;
+use sea_query_sqlx::SqlxBinder;
 use sqlx::{Database, Pool};
 use ulid::Ulid;
 
@@ -69,7 +69,7 @@ pub type Sqlite = Sql<sqlx::Sqlite>;
 pub struct Sql<DB: Database>(Pool<DB>);
 
 impl<DB: Database> Sql<DB> {
-    fn build_sqlx<S: SqlxBinder>(statement: S) -> (String, sea_query_binder::SqlxValues) {
+    fn build_sqlx<S: SqlxBinder>(statement: S) -> (String, sea_query_sqlx::SqlxValues) {
         match DB::NAME {
             #[cfg(feature = "sqlite")]
             "SQLite" => statement.build_sqlx(SqliteQueryBuilder),
@@ -87,7 +87,7 @@ impl<DB> Executor for Sql<DB>
 where
     DB: Database,
     for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
-    sea_query_binder::SqlxValues: for<'q> sqlx::IntoArguments<'q, DB>,
+    sea_query_sqlx::SqlxValues: for<'q> sqlx::IntoArguments<'q, DB>,
     String: for<'r> sqlx::Decode<'r, DB> + sqlx::Type<DB>,
     bool: for<'r> sqlx::Decode<'r, DB> + sqlx::Type<DB>,
     Vec<u8>: for<'r> sqlx::Decode<'r, DB> + sqlx::Type<DB>,
@@ -469,7 +469,7 @@ impl Reader {
         O: Bind<Cursor = O>,
         <<O as Bind>::I as IntoIterator>::IntoIter: DoubleEndedIterator,
         <<O as Bind>::V as IntoIterator>::IntoIter: DoubleEndedIterator,
-        sea_query_binder::SqlxValues: for<'q> sqlx::IntoArguments<'q, DB>,
+        sea_query_sqlx::SqlxValues: for<'q> sqlx::IntoArguments<'q, DB>,
     {
         let limit = self.build_reader::<O, O>()?;
 

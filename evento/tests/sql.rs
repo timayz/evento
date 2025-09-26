@@ -11,7 +11,7 @@ use evento::{
     Event,
 };
 use sea_query::{MysqlQueryBuilder, PostgresQueryBuilder, Query, SqliteQueryBuilder};
-use sea_query_binder::SqlxBinder;
+use sea_query_sqlx::SqlxBinder;
 use sqlx::{
     any::install_default_drivers, migrate::MigrateDatabase, Any, Database, MySqlPool, PgPool, Pool,
     SqlitePool,
@@ -365,7 +365,7 @@ async fn forward_asc<DB>(pool: Pool<DB>) -> anyhow::Result<()>
 where
     DB: Database,
     for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
-    sea_query_binder::SqlxValues: for<'q> sqlx::IntoArguments<'q, DB>,
+    sea_query_sqlx::SqlxValues: for<'q> sqlx::IntoArguments<'q, DB>,
     usize: sqlx::ColumnIndex<DB::Row>,
     Event: for<'r> sqlx::FromRow<'r, DB::Row>,
 {
@@ -395,7 +395,7 @@ async fn forward_desc<DB>(pool: Pool<DB>) -> anyhow::Result<()>
 where
     DB: Database,
     for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
-    sea_query_binder::SqlxValues: for<'q> sqlx::IntoArguments<'q, DB>,
+    sea_query_sqlx::SqlxValues: for<'q> sqlx::IntoArguments<'q, DB>,
     usize: sqlx::ColumnIndex<DB::Row>,
     Event: for<'r> sqlx::FromRow<'r, DB::Row>,
 {
@@ -425,7 +425,7 @@ async fn backward_asc<DB>(pool: Pool<DB>) -> anyhow::Result<()>
 where
     DB: Database,
     for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
-    sea_query_binder::SqlxValues: for<'q> sqlx::IntoArguments<'q, DB>,
+    sea_query_sqlx::SqlxValues: for<'q> sqlx::IntoArguments<'q, DB>,
     usize: sqlx::ColumnIndex<DB::Row>,
     Event: for<'r> sqlx::FromRow<'r, DB::Row>,
 {
@@ -455,7 +455,7 @@ async fn backward_desc<DB>(pool: Pool<DB>) -> anyhow::Result<()>
 where
     DB: Database,
     for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
-    sea_query_binder::SqlxValues: for<'q> sqlx::IntoArguments<'q, DB>,
+    sea_query_sqlx::SqlxValues: for<'q> sqlx::IntoArguments<'q, DB>,
     usize: sqlx::ColumnIndex<DB::Row>,
     Event: for<'r> sqlx::FromRow<'r, DB::Row>,
 {
@@ -485,7 +485,7 @@ async fn read<DB>(pool: &Pool<DB>, args: Args, order: Order) -> anyhow::Result<R
 where
     DB: Database,
     for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
-    sea_query_binder::SqlxValues: for<'q> sqlx::IntoArguments<'q, DB>,
+    sea_query_sqlx::SqlxValues: for<'q> sqlx::IntoArguments<'q, DB>,
     usize: sqlx::ColumnIndex<DB::Row>,
     Event: for<'r> sqlx::FromRow<'r, DB::Row>,
 {
@@ -515,7 +515,7 @@ async fn get_data<DB>(pool: &Pool<DB>) -> anyhow::Result<Vec<Event>>
 where
     DB: Database,
     for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
-    sea_query_binder::SqlxValues: for<'q> sqlx::IntoArguments<'q, DB>,
+    sea_query_sqlx::SqlxValues: for<'q> sqlx::IntoArguments<'q, DB>,
 {
     let data = cursor_test::get_data();
     let mut statement = Query::insert()
