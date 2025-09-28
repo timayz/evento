@@ -569,10 +569,10 @@ async fn create_mysql_executor(key: impl Into<String>) -> anyhow::Result<Sql<sql
     Ok(create_mysql_pool(key).await?.into())
 }
 
-async fn create_sqlite_executor(key: impl Into<String>) -> anyhow::Result<evento::Evento> {
+async fn create_sqlite_executor(key: impl Into<String>) -> anyhow::Result<evento::Sqlite> {
     let executor: evento::Sqlite = create_sqlite_pool(key).await?.into();
 
-    Ok(executor.into())
+    Ok(executor)
 }
 
 async fn create_postgres_pool(key: impl Into<String>) -> anyhow::Result<PgPool> {

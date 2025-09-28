@@ -97,11 +97,14 @@
 //! - `mysql` - MySQL support
 //! - `sql-migrator` - Enable database migrations
 
+pub mod config;
 pub mod context;
 pub mod cursor;
+pub mod error;
 mod executor;
 mod load;
 mod save;
+mod save_builder;
 mod subscribe;
 
 #[cfg(any(feature = "sqlite", feature = "mysql", feature = "postgres"))]
@@ -116,10 +119,15 @@ pub mod sql_migrator;
 #[cfg(feature = "macro")]
 pub use evento_macro::*;
 
+pub use config::*;
 pub use executor::*;
 pub use load::*;
 pub use save::*;
+pub use save_builder::*;
 pub use subscribe::*;
+
+// Re-export the unified error type for new code
+pub use error::EventoError;
 
 use std::{fmt::Debug, ops::Deref};
 use ulid::Ulid;
