@@ -18,7 +18,6 @@ use heed::{
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{migrate::MigrateDatabase, SqlitePool};
-use tempdir::TempDir;
 
 #[derive(Debug)]
 enum LogMsg {
@@ -109,7 +108,7 @@ struct AppState {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let dir = TempDir::new("todos")?;
+    let dir = tempfile::TempDir::with_prefix("todos")?;
 
     let env = unsafe { EnvOpenOptions::new().max_dbs(10).open(&dir)? };
 
