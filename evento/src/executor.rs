@@ -1,20 +1,21 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::Arc};
 
 use ulid::Ulid;
 
 use crate::{
     cursor::{Args, ReadResult, Value},
-    AcknowledgeError, Aggregator, Event, ReadError, RoutingKey, SubscribeError, WriteError,
+    AcknowledgeError, Event, ReadError, RoutingKey, SubscribeError, WriteError,
 };
 
 #[async_trait::async_trait]
 pub trait Executor: Send + Sync + 'static {
     async fn write(&self, events: Vec<Event>) -> Result<(), WriteError>;
 
-    async fn get_event<A: Aggregator>(&self, cursor: Value) -> Result<Event, ReadError>;
+    async fn get_event(&self, cursor: Value) -> Result<Event, ReadError>;
 
-    async fn read_by_aggregator<A: Aggregator>(
+    async fn read_by_aggregator(
         &self,
+        aggregator_type: String,
         id: String,
         args: Args,
     ) -> Result<ReadResult<Event>, ReadError>;
@@ -36,13 +37,17 @@ pub trait Executor: Send + Sync + 'static {
 
     async fn upsert_subscriber(&self, key: String, worker_id: Ulid) -> Result<(), SubscribeError>;
 
-    async fn get_snapshot<A: Aggregator>(
+    async fn get_snapshot(
         &self,
+        aggregator_type: String,
+        aggregator_revision: String,
         id: String,
     ) -> Result<Option<(Vec<u8>, Value)>, ReadError>;
 
-    async fn save_snapshot<A: Aggregator>(
+    async fn save_snapshot(
         &self,
+        aggregator_type: String,
+        aggregator_revision: String,
         id: String,
         data: Vec<u8>,
         cursor: Value,
@@ -56,53 +61,31 @@ pub trait Executor: Send + Sync + 'static {
     ) -> Result<(), AcknowledgeError>;
 }
 
-#[derive(Clone)]
-pub enum Evento {
-    #[cfg(feature = "sqlite")]
-    Sqlite(crate::Sqlite),
-    #[cfg(feature = "mysql")]
-    MySql(crate::MySql),
-    #[cfg(feature = "postgres")]
-    Postgres(crate::Postgres),
+pub struct Evento(Arc<Box<dyn Executor>>);
+
+impl Clone for Evento {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
 }
 
 #[async_trait::async_trait]
 impl Executor for Evento {
     async fn write(&self, events: Vec<Event>) -> Result<(), WriteError> {
-        match self {
-            #[cfg(feature = "sqlite")]
-            Self::Sqlite(executor) => executor.write(events).await,
-            #[cfg(feature = "mysql")]
-            Self::MySql(executor) => executor.write(events).await,
-            #[cfg(feature = "postgres")]
-            Self::Postgres(executor) => executor.write(events).await,
-        }
+        self.0.write(events).await
     }
 
-    async fn get_event<A: Aggregator>(&self, cursor: Value) -> Result<Event, ReadError> {
-        match self {
-            #[cfg(feature = "sqlite")]
-            Self::Sqlite(executor) => executor.get_event::<A>(cursor).await,
-            #[cfg(feature = "mysql")]
-            Self::MySql(executor) => executor.get_event::<A>(cursor).await,
-            #[cfg(feature = "postgres")]
-            Self::Postgres(executor) => executor.get_event::<A>(cursor).await,
-        }
+    async fn get_event(&self, cursor: Value) -> Result<Event, ReadError> {
+        self.0.get_event(cursor).await
     }
 
-    async fn read_by_aggregator<A: Aggregator>(
+    async fn read_by_aggregator(
         &self,
+        aggregator_type: String,
         id: String,
         args: Args,
     ) -> Result<ReadResult<Event>, ReadError> {
-        match self {
-            #[cfg(feature = "sqlite")]
-            Self::Sqlite(executor) => executor.read_by_aggregator::<A>(id, args).await,
-            #[cfg(feature = "mysql")]
-            Self::MySql(executor) => executor.read_by_aggregator::<A>(id, args).await,
-            #[cfg(feature = "postgres")]
-            Self::Postgres(executor) => executor.read_by_aggregator::<A>(id, args).await,
-        }
+        self.0.read_by_aggregator(aggregator_type, id, args).await
     }
 
     async fn read(
@@ -111,25 +94,11 @@ impl Executor for Evento {
         routing_key: RoutingKey,
         args: Args,
     ) -> Result<ReadResult<Event>, ReadError> {
-        match self {
-            #[cfg(feature = "sqlite")]
-            Self::Sqlite(executor) => executor.read(aggregator_types, routing_key, args).await,
-            #[cfg(feature = "mysql")]
-            Self::MySql(executor) => executor.read(aggregator_types, routing_key, args).await,
-            #[cfg(feature = "postgres")]
-            Self::Postgres(executor) => executor.read(aggregator_types, routing_key, args).await,
-        }
+        self.0.read(aggregator_types, routing_key, args).await
     }
 
     async fn get_subscriber_cursor(&self, key: String) -> Result<Option<Value>, SubscribeError> {
-        match self {
-            #[cfg(feature = "sqlite")]
-            Self::Sqlite(executor) => executor.get_subscriber_cursor(key).await,
-            #[cfg(feature = "mysql")]
-            Self::MySql(executor) => executor.get_subscriber_cursor(key).await,
-            #[cfg(feature = "postgres")]
-            Self::Postgres(executor) => executor.get_subscriber_cursor(key).await,
-        }
+        self.0.get_subscriber_cursor(key).await
     }
 
     async fn is_subscriber_running(
@@ -137,55 +106,35 @@ impl Executor for Evento {
         key: String,
         worker_id: Ulid,
     ) -> Result<bool, SubscribeError> {
-        match self {
-            #[cfg(feature = "sqlite")]
-            Self::Sqlite(executor) => executor.is_subscriber_running(key, worker_id).await,
-            #[cfg(feature = "mysql")]
-            Self::MySql(executor) => executor.is_subscriber_running(key, worker_id).await,
-            #[cfg(feature = "postgres")]
-            Self::Postgres(executor) => executor.is_subscriber_running(key, worker_id).await,
-        }
+        self.0.is_subscriber_running(key, worker_id).await
     }
 
     async fn upsert_subscriber(&self, key: String, worker_id: Ulid) -> Result<(), SubscribeError> {
-        match self {
-            #[cfg(feature = "sqlite")]
-            Self::Sqlite(executor) => executor.upsert_subscriber(key, worker_id).await,
-            #[cfg(feature = "mysql")]
-            Self::MySql(executor) => executor.upsert_subscriber(key, worker_id).await,
-            #[cfg(feature = "postgres")]
-            Self::Postgres(executor) => executor.upsert_subscriber(key, worker_id).await,
-        }
+        self.0.upsert_subscriber(key, worker_id).await
     }
 
-    async fn get_snapshot<A: Aggregator>(
+    async fn get_snapshot(
         &self,
+        aggregator_type: String,
+        aggregator_revision: String,
         id: String,
     ) -> Result<Option<(Vec<u8>, Value)>, ReadError> {
-        match self {
-            #[cfg(feature = "sqlite")]
-            Self::Sqlite(executor) => executor.get_snapshot::<A>(id).await,
-            #[cfg(feature = "mysql")]
-            Self::MySql(executor) => executor.get_snapshot::<A>(id).await,
-            #[cfg(feature = "postgres")]
-            Self::Postgres(executor) => executor.get_snapshot::<A>(id).await,
-        }
+        self.0
+            .get_snapshot(aggregator_type, aggregator_revision, id)
+            .await
     }
 
-    async fn save_snapshot<A: Aggregator>(
+    async fn save_snapshot(
         &self,
+        aggregator_type: String,
+        aggregator_revision: String,
         id: String,
         data: Vec<u8>,
         cursor: Value,
     ) -> Result<(), WriteError> {
-        match self {
-            #[cfg(feature = "sqlite")]
-            Self::Sqlite(executor) => executor.save_snapshot::<A>(id, data, cursor).await,
-            #[cfg(feature = "mysql")]
-            Self::MySql(executor) => executor.save_snapshot::<A>(id, data, cursor).await,
-            #[cfg(feature = "postgres")]
-            Self::Postgres(executor) => executor.save_snapshot::<A>(id, data, cursor).await,
-        }
+        self.0
+            .save_snapshot(aggregator_type, aggregator_revision, id, data, cursor)
+            .await
     }
 
     async fn acknowledge(
@@ -194,56 +143,49 @@ impl Executor for Evento {
         cursor: Value,
         lag: i64,
     ) -> Result<(), AcknowledgeError> {
-        match self {
-            #[cfg(feature = "sqlite")]
-            Self::Sqlite(executor) => executor.acknowledge(key, cursor, lag).await,
-            #[cfg(feature = "mysql")]
-            Self::MySql(executor) => executor.acknowledge(key, cursor, lag).await,
-            #[cfg(feature = "postgres")]
-            Self::Postgres(executor) => executor.acknowledge(key, cursor, lag).await,
-        }
+        self.0.acknowledge(key, cursor, lag).await
     }
 }
 
 #[cfg(feature = "sqlite")]
 impl From<crate::Sqlite> for Evento {
     fn from(value: crate::Sqlite) -> Self {
-        Self::Sqlite(value)
+        Self(Arc::new(Box::new(value)))
     }
 }
 
 #[cfg(feature = "sqlite")]
 impl From<&crate::Sqlite> for Evento {
     fn from(value: &crate::Sqlite) -> Self {
-        Self::Sqlite(value.clone())
+        Self(Arc::new(Box::new(value.clone())))
     }
 }
 
 #[cfg(feature = "mysql")]
 impl From<crate::MySql> for Evento {
     fn from(value: crate::MySql) -> Self {
-        Self::MySql(value)
+        Self(Arc::new(Box::new(value)))
     }
 }
 
 #[cfg(feature = "mysql")]
 impl From<&crate::MySql> for Evento {
     fn from(value: &crate::MySql) -> Self {
-        Self::MySql(value.clone())
+        Self(Arc::new(Box::new(value.clone())))
     }
 }
 
 #[cfg(feature = "postgres")]
 impl From<crate::Postgres> for Evento {
     fn from(value: crate::Postgres) -> Self {
-        Self::Postgres(value)
+        Self(Arc::new(Box::new(value)))
     }
 }
 
 #[cfg(feature = "postgres")]
 impl From<&crate::Postgres> for Evento {
     fn from(value: &crate::Postgres) -> Self {
-        Self::Postgres(value.clone())
+        Self(Arc::new(Box::new(value.clone())))
     }
 }
 
@@ -275,11 +217,11 @@ impl Executor for EventoGroup {
         self.first().write(events).await
     }
 
-    async fn get_event<A: Aggregator>(&self, cursor: Value) -> Result<Event, ReadError> {
+    async fn get_event(&self, cursor: Value) -> Result<Event, ReadError> {
         let futures = self
             .executors
             .iter()
-            .map(|e| e.get_event::<A>(cursor.to_owned()));
+            .map(|e| e.get_event(cursor.to_owned()));
 
         let results = futures_util::future::join_all(futures).await;
 
@@ -297,8 +239,9 @@ impl Executor for EventoGroup {
         unreachable!()
     }
 
-    async fn read_by_aggregator<A: Aggregator>(
+    async fn read_by_aggregator(
         &self,
+        aggregator_type: String,
         id: String,
         args: Args,
     ) -> Result<ReadResult<Event>, ReadError> {
@@ -306,7 +249,7 @@ impl Executor for EventoGroup {
         let futures = self
             .executors
             .iter()
-            .map(|e| e.read_by_aggregator::<A>(id.to_owned(), args.clone()));
+            .map(|e| e.read_by_aggregator(aggregator_type.to_owned(), id.to_owned(), args.clone()));
 
         let results = futures_util::future::join_all(futures).await;
         let mut events = vec![];
@@ -367,20 +310,28 @@ impl Executor for EventoGroup {
         self.first().upsert_subscriber(key, worker_id).await
     }
 
-    async fn get_snapshot<A: Aggregator>(
+    async fn get_snapshot(
         &self,
+        aggregator_type: String,
+        aggregator_revision: String,
         id: String,
     ) -> Result<Option<(Vec<u8>, Value)>, ReadError> {
-        self.first().get_snapshot::<A>(id).await
+        self.first()
+            .get_snapshot(aggregator_type, aggregator_revision, id)
+            .await
     }
 
-    async fn save_snapshot<A: Aggregator>(
+    async fn save_snapshot(
         &self,
+        aggregator_type: String,
+        aggregator_revision: String,
         id: String,
         data: Vec<u8>,
         cursor: Value,
     ) -> Result<(), WriteError> {
-        self.first().save_snapshot::<A>(id, data, cursor).await
+        self.first()
+            .save_snapshot(aggregator_type, aggregator_revision, id, data, cursor)
+            .await
     }
 
     async fn acknowledge(

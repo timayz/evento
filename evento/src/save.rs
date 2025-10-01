@@ -149,7 +149,13 @@ impl<A: Aggregator> SaveBuilder<A> {
         let cursor = last_event.serialize_cursor()?;
 
         executor
-            .save_snapshot::<A>(last_event.aggregator_id, data, cursor)
+            .save_snapshot(
+                A::name().to_owned(),
+                A::revision().to_owned(),
+                last_event.aggregator_id,
+                data,
+                cursor,
+            )
             .await?;
 
         Ok(self.aggregator_id.to_owned())
