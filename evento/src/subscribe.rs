@@ -66,7 +66,7 @@ impl SubscriptionHandle {
     ///
     /// This sends a shutdown signal to the subscription. The subscription will finish
     /// processing the current event and then stop.
-    pub fn shutdown(self) -> Result<tokio::task::JoinHandle<()>, ()> {
+    pub fn shutdown(self) -> Result<tokio::task::JoinHandle<()>, String> {
         // Send shutdown signal (ignore error if receiver is already dropped)
         let _ = self.shutdown_tx.send(());
         Ok(self.task_handle)
