@@ -47,6 +47,51 @@ pub enum RoutingKey {
     Value(Option<String>),
 }
 
+/// Handle for managing a running subscription
+///
+/// This handle allows you to gracefully shutdown the subscription and wait for it to complete.
+/// Useful for implementing graceful shutdown in web servers and other applications.
+#[cfg(feature = "handler")]
+#[derive(Debug)]
+pub struct SubscriptionHandle {
+    /// Handle to the spawned subscription task
+    task_handle: tokio::task::JoinHandle<()>,
+    /// Shutdown signal sender
+    shutdown_tx: tokio::sync::oneshot::Sender<()>,
+}
+
+#[cfg(feature = "handler")]
+impl SubscriptionHandle {
+    /// Signal the subscription to shutdown gracefully
+    ///
+    /// This sends a shutdown signal to the subscription. The subscription will finish
+    /// processing the current event and then stop.
+    pub fn shutdown(self) -> Result<tokio::task::JoinHandle<()>, ()> {
+        // Send shutdown signal (ignore error if receiver is already dropped)
+        let _ = self.shutdown_tx.send(());
+        Ok(self.task_handle)
+    }
+
+    /// Wait for the subscription to complete
+    ///
+    /// This waits for the subscription task to finish execution.
+    pub async fn wait(self) -> Result<(), tokio::task::JoinError> {
+        self.task_handle.await
+    }
+
+    /// Signal shutdown and wait for completion
+    ///
+    /// This is a convenience method that calls shutdown() and then wait().
+    pub async fn shutdown_and_wait(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let handle = self
+            .shutdown()
+            .map_err(|_| "Failed to send shutdown signal")?;
+        handle
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+    }
+}
+
 #[derive(Clone)]
 pub struct Context<'a, E: Executor> {
     inner: Arc<Mutex<context::Context>>,
@@ -258,7 +303,7 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
     }
 
     #[cfg(feature = "handler")]
-    pub async fn run(self, executor: &E) -> Result<(), SubscribeError> {
+    pub async fn run(self, executor: &E) -> Result<SubscriptionHandle, SubscribeError> {
         self.init(executor).await?;
 
         let executor = executor.clone();
@@ -267,9 +312,15 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
             .map(|d| Instant::now() + d)
             .unwrap_or_else(Instant::now);
 
-        tokio::spawn(async move {
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
+
+        let task_handle = tokio::spawn(async move {
             let mut interval = interval_at(start, Duration::from_millis(300));
             loop {
+                if shutdown_rx.try_recv().is_ok() {
+                    tracing::info!("Subscription received shutdown signal, stopping gracefull");
+                    break;
+                }
                 interval.tick().await;
 
                 let Ok(data) = (|| async { self.read(&executor).await })
@@ -348,10 +399,10 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
             }
         });
 
-        // @TODO: return struct to wait end of using mcsp that will send something when !running
-        // can be use in gracefull shutdow axum fn for example
-
-        Ok(())
+        Ok(SubscriptionHandle {
+            task_handle,
+            shutdown_tx,
+        })
     }
 
     #[cfg(feature = "stream")]
