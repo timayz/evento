@@ -16,7 +16,7 @@ use ulid::Ulid;
 
 use crate::{
     cursor::{self, Args, Cursor, Edge, PageInfo, ReadResult, Value},
-    AcknowledgeError, Aggregator, Executor, ReadError, SubscribeError, WriteError,
+    AcknowledgeError, Executor, ReadError, SubscribeError, WriteError,
 };
 
 #[derive(Iden, Clone)]
@@ -94,7 +94,7 @@ where
     usize: sqlx::ColumnIndex<DB::Row>,
     crate::Event: for<'r> sqlx::FromRow<'r, DB::Row>,
 {
-    async fn get_event<A: Aggregator>(&self, cursor: Value) -> Result<crate::Event, ReadError> {
+    async fn get_event(&self, cursor: Value) -> Result<crate::Event, ReadError> {
         let cursor = crate::Event::deserialize_cursor(&cursor)?;
         let statement = Query::select()
             .columns([
@@ -121,8 +121,9 @@ where
             .map_err(|err| ReadError::Unknown(err.into()))
     }
 
-    async fn read_by_aggregator<A: Aggregator>(
+    async fn read_by_aggregator(
         &self,
+        aggregator_type: String,
         id: String,
         args: Args,
     ) -> Result<ReadResult<crate::Event>, ReadError> {
@@ -139,7 +140,7 @@ where
                 Event::Timestamp,
             ])
             .from(Event::Table)
-            .and_where(Expr::col(Event::AggregatorType).eq(Expr::value(A::name())))
+            .and_where(Expr::col(Event::AggregatorType).eq(Expr::value(aggregator_type)))
             .and_where(Expr::col(Event::AggregatorId).eq(Expr::value(id)))
             .to_owned();
 
@@ -256,16 +257,18 @@ where
         Ok(())
     }
 
-    async fn get_snapshot<A: Aggregator>(
+    async fn get_snapshot(
         &self,
+        aggregator_type: String,
+        aggregator_revision: String,
         id: String,
     ) -> Result<Option<(Vec<u8>, Value)>, ReadError> {
         let statement = Query::select()
             .columns([Snapshot::Data, Snapshot::Cursor])
             .from(Snapshot::Table)
-            .and_where(Expr::col(Snapshot::Type).eq(Expr::value(A::name())))
+            .and_where(Expr::col(Snapshot::Type).eq(Expr::value(aggregator_type)))
             .and_where(Expr::col(Snapshot::Id).eq(Expr::value(id)))
-            .and_where(Expr::col(Snapshot::Revision).eq(Expr::value(A::revision())))
+            .and_where(Expr::col(Snapshot::Revision).eq(Expr::value(aggregator_revision)))
             .limit(1)
             .to_owned();
 
@@ -330,8 +333,10 @@ where
         Ok(())
     }
 
-    async fn save_snapshot<A: Aggregator>(
+    async fn save_snapshot(
         &self,
+        aggregator_type: String,
+        aggregator_revision: String,
         id: String,
         data: Vec<u8>,
         cursor: Value,
@@ -346,10 +351,10 @@ where
                 Snapshot::Data,
             ])
             .values_panic([
-                A::name().into(),
+                aggregator_type.into(),
                 id.to_string().into(),
                 cursor.to_string().into(),
-                A::revision().into(),
+                aggregator_revision.into(),
                 data.into(),
             ])
             .on_conflict(

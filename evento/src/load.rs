@@ -90,7 +90,14 @@ pub async fn load<A: Aggregator, E: Executor>(
     id: impl Into<String>,
 ) -> Result<LoadResult<A>, ReadError> {
     let id = id.into();
-    let (mut aggregator, mut cursor) = match executor.get_snapshot::<A>(id.to_owned()).await? {
+    let (mut aggregator, mut cursor) = match executor
+        .get_snapshot(
+            A::name().to_owned(),
+            A::revision().to_owned(),
+            id.to_owned(),
+        )
+        .await?
+    {
         Some((data, cursor)) => {
             let config = bincode::config::standard();
             let (aggregator, _): (A, _) = bincode::decode_from_slice(&data[..], config)?;
@@ -104,7 +111,11 @@ pub async fn load<A: Aggregator, E: Executor>(
 
     loop {
         let events = executor
-            .read_by_aggregator::<A>(id.to_owned(), Args::forward(1000, cursor.clone()))
+            .read_by_aggregator(
+                A::name().to_owned(),
+                id.to_owned(),
+                Args::forward(1000, cursor.clone()),
+            )
             .await?;
 
         for event in events.edges.iter() {
@@ -116,14 +127,20 @@ pub async fn load<A: Aggregator, E: Executor>(
             let data = bincode::encode_to_vec(&aggregator, config)?;
 
             executor
-                .save_snapshot::<A>(event.node.aggregator_id, data, cursor)
+                .save_snapshot(
+                    A::name().to_owned(),
+                    A::revision().to_owned(),
+                    event.node.aggregator_id,
+                    data,
+                    cursor,
+                )
                 .await?;
         }
 
         if !events.page_info.has_next_page {
             let event = match (cursor, events.edges.last()) {
                 (_, Some(event)) => event.node.clone(),
-                (Some(cursor), None) => executor.get_event::<A>(cursor).await?,
+                (Some(cursor), None) => executor.get_event(cursor).await?,
                 _ => return Err(ReadError::NotFound),
             };
 
