@@ -85,6 +85,7 @@ async fn create(
 
     Html(template.render().unwrap())
 }
+
 async fn status(Path((id,)): Path<(String,)>, State(state): State<AppState>) -> impl IntoResponse {
     let todo = evento::load::<Todo, _>(&state.evento, &id).await.unwrap();
     let log_msg = match todo.item.state {
