@@ -17,14 +17,14 @@ Add Evento to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-evento = "1.0"
+evento = "1"
 ```
 
 For SQL database support, enable the appropriate features:
 
 ```toml
 [dependencies]
-evento = { version = "1.0", features = ["sqlite", "sqlite-migrator"] }
+evento = { version = "1", features = ["sqlite", "sqlite-migrator"] }
 ```
 
 ## Basic Usage
@@ -213,17 +213,17 @@ async fn main() -> anyhow::Result<()> {
 
 ### SQLite
 ```toml
-evento = { version = "1.0.0-alpha.18", features = ["sqlite", "sqlite-migrator"] }
+evento = { version = "1", features = ["sqlite", "sqlite-migrator"] }
 ```
 
 ### PostgreSQL
 ```toml
-evento = { version = "1.0.0-alpha.18", features = ["postgres", "postgres-migrator"] }
+evento = { version = "1", features = ["postgres", "postgres-migrator"] }
 ```
 
 ### MySQL
 ```toml
-evento = { version = "1.0.0-alpha.18", features = ["mysql", "mysql-migrator"] }
+evento = { version = "1", features = ["mysql", "mysql-migrator"] }
 ```
 
 ## Key Concepts

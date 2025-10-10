@@ -405,6 +405,100 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
         })
     }
 
+    #[cfg(feature = "handler")]
+    pub async fn run_once(self, executor: &E) -> Result<(), SubscribeError> {
+        self.init(executor).await?;
+
+        let executor = executor.clone();
+
+        let mut interval = interval_at(Instant::now(), Duration::from_millis(300));
+        loop {
+            interval.tick().await;
+
+            let Ok(data) = (|| async { self.read(&executor).await })
+                .retry(ExponentialBuilder::default())
+                .sleep(tokio::time::sleep)
+                .notify(|err, dur| {
+                    tracing::error!(
+                        "SubscribeBuilder.run().self.read() '{err}' sleeping='{dur:?}'"
+                    );
+                })
+                .await
+            else {
+                continue;
+            };
+
+            if data.is_empty() {
+                break;
+            }
+
+            for item in data {
+                let key = format!("{}-{}", item.event.aggregator_type, item.event.name);
+                let Some(handler) = self.handlers.get(&key) else {
+                    tracing::error!(
+                        "subscriber='{}' id='{}' type='{}' event_name='{}' error='Not handled'",
+                        item.key,
+                        item.event.id,
+                        item.event.aggregator_type,
+                        item.event.name,
+                    );
+
+                    return Err(SubscribeError::Unknown(anyhow::anyhow!(
+                        "Handler not found"
+                    )));
+                };
+
+                let Ok(running) = (|| async {self.is_subscriber_running(&executor).await})
+                        .retry(ExponentialBuilder::default())
+                        .sleep(tokio::time::sleep)
+                        .notify(|err, dur| {
+                            tracing::error!(
+                                "SubscribeBuilder.run_once().self.is_subscriber_running '{err}' sleeping='{dur:?}'"
+                            );
+                        }).await
+                    else {
+                        break;
+                    };
+
+                if !running {
+                    break;
+                }
+
+                let Ok(_) = (|| async { handler.handle(&item).await })
+                        .retry(ExponentialBuilder::default())
+                        .sleep(tokio::time::sleep)
+                        .notify(|err, dur| {
+                            tracing::error!(
+                                "subscriber='{}' id='{}' type='{}' event_name='{}' error='{err}' sleeping='{dur:?}'",
+                                item.key,
+                                item.event.id,
+                                item.event.aggregator_type,
+                                item.event.name,
+                            );
+                        })
+                        .await
+                    else {
+                        break;
+                    };
+
+                if let Err(err) = item.acknowledge().await {
+                    tracing::error!("acknowledge '{err}'");
+                    break;
+                }
+
+                tracing::debug!(
+                    "subscriber='{}' id='{}' type='{}' event_name='{}'",
+                    item.key,
+                    item.event.id,
+                    item.event.aggregator_type,
+                    item.event.name,
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     #[cfg(feature = "stream")]
     pub async fn stream<'a>(
         &self,
