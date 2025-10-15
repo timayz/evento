@@ -9,13 +9,18 @@ down:
 
 reset: down up
 
+check: test fmt lint machete
+
 test:
 	cargo test --all-features -p evento
 
 fmt:
 	cargo fmt -- --emit files
 
-clippy:
+lint:
+	cargo clippy --all-features -- -D warnings
+
+lint.fix:
 	cargo clippy --fix --all-features -- -D warnings
 
 machete:

@@ -138,6 +138,7 @@ pub struct SubscribeBuilder<E: Executor> {
     handlers: HashMap<String, Box<dyn SubscribeHandler<E>>>,
     aggregator_types: HashSet<String>,
     chunk_size: u16,
+    backon: bool,
     context: Arc<Mutex<context::Context>>,
 }
 
@@ -188,6 +189,7 @@ pub fn subscribe<E: Executor>(key: impl Into<String>) -> SubscribeBuilder<E> {
         aggregator_types: HashSet::new(),
         chunk_size: 300,
         context: Arc::default(),
+        backon: true,
     }
 }
 
@@ -219,6 +221,12 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
 
     pub fn routing_key(mut self, v: impl Into<String>) -> Self {
         self.routing_key = RoutingKey::Value(Some(v.into()));
+
+        self
+    }
+
+    fn backoff(mut self) -> Self {
+        self.backon = false;
 
         self
     }
@@ -406,7 +414,18 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
     }
 
     #[cfg(feature = "handler")]
+    pub async fn unsafe_oneshot(self, executor: &E) -> Result<(), SubscribeError> {
+        self.backoff().oneshot(executor).await
+    }
+
+    #[cfg(feature = "handler")]
+    #[deprecated(since = "1.4.0", note = "use oneshot instead")]
     pub async fn run_once(self, executor: &E) -> Result<(), SubscribeError> {
+        self.oneshot(executor).await
+    }
+
+    #[cfg(feature = "handler")]
+    pub async fn oneshot(self, executor: &E) -> Result<(), SubscribeError> {
         self.init(executor).await?;
 
         let executor = executor.clone();
@@ -418,6 +437,7 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
             let Ok(data) = (|| async { self.read(&executor).await })
                 .retry(ExponentialBuilder::default())
                 .sleep(tokio::time::sleep)
+                .when(|_| self.backon)
                 .notify(|err, dur| {
                     tracing::error!(
                         "SubscribeBuilder.run().self.read() '{err}' sleeping='{dur:?}'"
@@ -451,6 +471,7 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
                 let Ok(running) = (|| async {self.is_subscriber_running(&executor).await})
                         .retry(ExponentialBuilder::default())
                         .sleep(tokio::time::sleep)
+                        .when(|_| self.backon)
                         .notify(|err, dur| {
                             tracing::error!(
                                 "SubscribeBuilder.run_once().self.is_subscriber_running '{err}' sleeping='{dur:?}'"
@@ -467,6 +488,7 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
                 let Ok(_) = (|| async { handler.handle(&item).await })
                         .retry(ExponentialBuilder::default())
                         .sleep(tokio::time::sleep)
+                        .when(|_| self.backon)
                         .notify(|err, dur| {
                             tracing::error!(
                                 "subscriber='{}' id='{}' type='{}' event_name='{}' error='{err}' sleeping='{dur:?}'",
