@@ -33,6 +33,9 @@ pub enum SubscribeError {
 
     #[error("ulid.decode >> {0}")]
     UlidDecode(#[from] ulid::DecodeError),
+
+    #[error("ulid.decode >> {0}")]
+    Acknowledge(#[from] AcknowledgeError),
 }
 
 #[derive(Debug, Error)]
@@ -331,26 +334,28 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
                 }
                 interval.tick().await;
 
-                let Ok(data) = (|| async { self.read(&executor).await })
+                let data = (|| async { self.read(&executor).await })
                     .retry(ExponentialBuilder::default())
                     .sleep(tokio::time::sleep)
                     .notify(|err, dur| {
-                        tracing::error!(
-                            "SubscribeBuilder.run().self.read() '{err}' sleeping='{dur:?}'"
-                        );
+                        tracing::error!("@read '{err}' sleeping='{dur:?}'");
                     })
-                    .await
-                else {
-                    continue;
+                    .await;
+
+                let data = match data {
+                    Ok(data) => data,
+                    Err(e) => {
+                        tracing::error!("@read {e}");
+                        return;
+                    }
                 };
 
                 for item in data {
                     let key = format!("{}-{}", item.event.aggregator_type, item.event.name);
                     let Some(handler) = self.handlers.get(&key) else {
                         tracing::error!(
-                            "subscriber='{}' id='{}' type='{}' event_name='{}' error='Not handled'",
+                            "@get_handler '{}','{}','{}','Not handled'",
                             item.key,
-                            item.event.id,
                             item.event.aggregator_type,
                             item.event.name,
                         );
@@ -358,48 +363,58 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
                         return;
                     };
 
-                    let Ok(running) = (|| async {self.is_subscriber_running(&executor).await})
+                    let running = (|| async { self.is_subscriber_running(&executor).await })
                         .retry(ExponentialBuilder::default())
                         .sleep(tokio::time::sleep)
                         .notify(|err, dur| {
-                            tracing::error!(
-                                "SubscribeBuilder.run().self.is_subscriber_running '{err}' sleeping='{dur:?}'"
-                            );
-                        }).await
-                    else {
-                        break;
+                            tracing::error!("@is_subscriber_running '{err}' sleeping='{dur:?}'");
+                        })
+                        .await;
+
+                    let running = match running {
+                        Ok(data) => data,
+                        Err(e) => {
+                            tracing::error!("@running {e}");
+                            return;
+                        }
                     };
 
                     if !running {
                         break;
                     }
 
-                    let Ok(_) = (|| async { handler.handle(&item).await })
+                    if let Err(e) = (|| async { handler.handle(&item).await })
                         .retry(ExponentialBuilder::default())
                         .sleep(tokio::time::sleep)
                         .notify(|err, dur| {
                             tracing::error!(
-                                "subscriber='{}' id='{}' type='{}' event_name='{}' error='{err}' sleeping='{dur:?}'",
+                                "@handle '{}','{}','{}','{err}','{dur:?}'",
                                 item.key,
-                                item.event.id,
                                 item.event.aggregator_type,
                                 item.event.name,
                             );
                         })
                         .await
-                    else {
-                        break;
-                    };
+                    {
+                        tracing::error!("{e:?}");
+                        return;
+                    }
 
-                    if let Err(err) = item.acknowledge().await {
-                        tracing::error!("acknowledge '{err}'");
+                    if let Err(err) = (async || item.acknowledge().await)
+                        .retry(ExponentialBuilder::default())
+                        .sleep(tokio::time::sleep)
+                        .notify(|err, dur| {
+                            tracing::error!("@acknowledge '{err}' sleeping='{dur:?}'",);
+                        })
+                        .await
+                    {
+                        tracing::error!("@acknowledge '{err}'");
                         break;
                     }
 
                     tracing::debug!(
-                        "subscriber='{}' id='{}' type='{}' event_name='{}'",
+                        "@handled '{}','{}','{}'",
                         item.key,
-                        item.event.id,
                         item.event.aggregator_type,
                         item.event.name,
                     );
@@ -434,19 +449,14 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
         loop {
             interval.tick().await;
 
-            let Ok(data) = (|| async { self.read(&executor).await })
+            let data = (|| async { self.read(&executor).await })
                 .retry(ExponentialBuilder::default())
                 .sleep(tokio::time::sleep)
                 .when(|_| self.backon)
                 .notify(|err, dur| {
-                    tracing::error!(
-                        "SubscribeBuilder.run().self.read() '{err}' sleeping='{dur:?}'"
-                    );
+                    tracing::error!("@read '{err}','{dur:?}'");
                 })
-                .await
-            else {
-                continue;
-            };
+                .await?;
 
             if data.is_empty() {
                 break;
@@ -456,9 +466,8 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
                 let key = format!("{}-{}", item.event.aggregator_type, item.event.name);
                 let Some(handler) = self.handlers.get(&key) else {
                     tracing::error!(
-                        "subscriber='{}' id='{}' type='{}' event_name='{}' error='Not handled'",
+                        "@get_handler '{}','{}','{}','Not handled'",
                         item.key,
-                        item.event.id,
                         item.event.aggregator_type,
                         item.event.name,
                     );
@@ -468,50 +477,45 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
                     )));
                 };
 
-                let Ok(running) = (|| async {self.is_subscriber_running(&executor).await})
-                        .retry(ExponentialBuilder::default())
-                        .sleep(tokio::time::sleep)
-                        .when(|_| self.backon)
-                        .notify(|err, dur| {
-                            tracing::error!(
-                                "SubscribeBuilder.run_once().self.is_subscriber_running '{err}' sleeping='{dur:?}'"
-                            );
-                        }).await
-                    else {
-                        break;
-                    };
+                let running = (|| async { self.is_subscriber_running(&executor).await })
+                    .retry(ExponentialBuilder::default())
+                    .sleep(tokio::time::sleep)
+                    .when(|_| self.backon)
+                    .notify(|err, dur| {
+                        tracing::error!("@is_subscriber_running '{err}','{dur:?}'");
+                    })
+                    .await?;
 
                 if !running {
                     break;
                 }
 
-                let Ok(_) = (|| async { handler.handle(&item).await })
-                        .retry(ExponentialBuilder::default())
-                        .sleep(tokio::time::sleep)
-                        .when(|_| self.backon)
-                        .notify(|err, dur| {
-                            tracing::error!(
-                                "subscriber='{}' id='{}' type='{}' event_name='{}' error='{err}' sleeping='{dur:?}'",
-                                item.key,
-                                item.event.id,
-                                item.event.aggregator_type,
-                                item.event.name,
-                            );
-                        })
-                        .await
-                    else {
-                        break;
-                    };
+                (|| async { handler.handle(&item).await })
+                    .retry(ExponentialBuilder::default())
+                    .sleep(tokio::time::sleep)
+                    .when(|_| self.backon)
+                    .notify(|err, dur| {
+                        tracing::error!(
+                            "@handle '{}','{}','{}','{err}','{dur:?}'",
+                            item.key,
+                            item.event.aggregator_type,
+                            item.event.name,
+                        );
+                    })
+                    .await?;
 
-                if let Err(err) = item.acknowledge().await {
-                    tracing::error!("acknowledge '{err}'");
-                    break;
-                }
+                (async || item.acknowledge().await)
+                    .retry(ExponentialBuilder::default())
+                    .sleep(tokio::time::sleep)
+                    .when(|_| self.backon)
+                    .notify(|err, dur| {
+                        tracing::error!("@acknowledge '{err}','{dur:?}'");
+                    })
+                    .await?;
 
-                tracing::debug!(
-                    "subscriber='{}' id='{}' type='{}' event_name='{}'",
+                tracing::info!(
+                    "@handled '{}','{}','{}'",
                     item.key,
-                    item.event.id,
                     item.event.aggregator_type,
                     item.event.name,
                 );
@@ -548,9 +552,7 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
                         .retry(ExponentialBuilder::default())
                         .sleep(tokio::time::sleep)
                         .notify(|err, dur| {
-                            tracing::error!(
-                                "SubscribeBuilder.stream().self.read() '{err}' sleeping='{dur:?}'"
-                            );
+                            tracing::error!("@read '{err}' sleeping='{dur:?}'");
                         })
                         .await
                     else {
