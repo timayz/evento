@@ -32,7 +32,7 @@ evento = { version = "1", features = ["sqlite"] }
 ### 1. Define Events and Aggregators
 
 ```rust
-use evento::prelude::*;
+use evento::{EventDetails, AggregatorName};
 use serde::{Deserialize, Serialize};
 use bincode::{Decode, Encode};
 
@@ -74,7 +74,7 @@ impl User {
 ### 2. Create Events
 
 ```rust
-use evento::create;
+use evento::{create, save, load};
 
 async fn create_user(executor: &evento::Sqlite) -> anyhow::Result<String> {
     let user_id = create::<User>()
@@ -93,7 +93,6 @@ async fn create_user(executor: &evento::Sqlite) -> anyhow::Result<String> {
 ### 3. Save Events to Existing Aggregates
 
 ```rust
-use evento::save;
 
 async fn change_user_email(
     executor: &evento::Sqlite, 
@@ -115,7 +114,6 @@ async fn change_user_email(
 ### 4. Load Aggregates
 
 ```rust
-use evento::load;
 
 async fn get_user(executor: &evento::Sqlite, user_id: &str) -> anyhow::Result<User> {
     let result = load::<User, _>(executor, user_id).await?;
@@ -158,7 +156,7 @@ async fn setup_subscriptions(executor: evento::Sqlite) -> anyhow::Result<()> {
 ### 6. Complete Example with SQLite
 
 ```rust
-use evento::prelude::*;
+use evento::{create, save, load, subscribe, migrator::{Migrate, Plan}};
 use sqlx::SqlitePool;
 
 #[tokio::main]
@@ -236,11 +234,29 @@ evento = { version = "1", features = ["mysql"] }
 
 - `macro` - Enable procedural macros for aggregators and handlers (default)
 - `handler` - Enable event handler functionality (default)
-- `stream` - Enable stream processing capabilities
+- `stream` - Enable stream processing capabilities and aggregator subscriptions
 - `sql` - Enable all SQL database backends
-- `sqlite` - SQLite support
-- `postgres` - PostgreSQL support
-- `mysql` - MySQL support
+- `sqlite` - SQLite support with automatic migrations
+- `postgres` - PostgreSQL support with automatic migrations
+- `mysql` - MySQL support with automatic migrations
+
+### Stream Feature
+
+The `stream` feature enables advanced streaming capabilities and the `aggregator()` method for subscriptions:
+
+```toml
+evento = { version = "1", features = ["sqlite", "stream"] }
+```
+
+```rust
+use evento::{subscribe, stream::StreamExt};
+
+// Subscribe to all events for an aggregator type
+evento::subscribe("user-stream")
+    .aggregator::<User>()
+    .run(&executor)
+    .await?;
+```
 
 ## Examples
 

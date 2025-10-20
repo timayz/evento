@@ -240,6 +240,28 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
         self
     }
 
+    /// Subscribe to events for a specific aggregator type
+    ///
+    /// This method allows subscribing to all events for a given aggregator without
+    /// specifying individual handlers. Requires the `stream` feature to be enabled.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use evento::subscribe;
+    /// # struct User;
+    /// # impl evento::Aggregator for User {
+    /// #     fn name() -> &'static str { "User" }
+    /// #     async fn apply(&mut self, event: evento::Event) -> anyhow::Result<()> { Ok(()) }
+    /// # }
+    /// # async fn example(executor: &evento::Sqlite) -> anyhow::Result<()> {
+    /// subscribe("user-stream")
+    ///     .aggregator::<User>()
+    ///     .run(executor)
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     #[cfg(feature = "stream")]
     pub fn aggregator<A: Aggregator>(mut self) -> Self {
         self.aggregator_types.insert(A::name().to_owned());
