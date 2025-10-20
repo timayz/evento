@@ -248,12 +248,28 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
     /// # Examples
     ///
     /// ```no_run
-    /// # use evento::subscribe;
-    /// # struct User;
-    /// # impl evento::Aggregator for User {
-    /// #     fn name() -> &'static str { "User" }
-    /// #     async fn apply(&mut self, event: evento::Event) -> anyhow::Result<()> { Ok(()) }
+    /// # use evento::{subscribe, EventDetails, AggregatorName};
+    /// # use serde::{Serialize, Deserialize};
+    /// # use bincode::{Encode, Decode};
+    /// #
+    /// # #[derive(Default, Serialize, Deserialize, Encode, Decode, Clone, Debug)]
+    /// # struct User {
+    /// #     name: String,
     /// # }
+    /// #
+    /// # #[derive(AggregatorName, Encode, Decode)]
+    /// # struct UserCreated {
+    /// #     name: String,
+    /// # }
+    /// #
+    /// # #[evento::aggregator]
+    /// # impl User {
+    /// #     async fn user_created(&mut self, event: EventDetails<UserCreated>) -> anyhow::Result<()> {
+    /// #         self.name = event.data.name;
+    /// #         Ok(())
+    /// #     }
+    /// # }
+    /// #
     /// # async fn example(executor: &evento::Sqlite) -> anyhow::Result<()> {
     /// subscribe("user-stream")
     ///     .aggregator::<User>()
