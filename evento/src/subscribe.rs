@@ -240,6 +240,7 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
         self
     }
 
+    #[cfg(feature = "stream")]
     pub fn aggregator<A: Aggregator>(mut self) -> Self {
         self.aggregator_types.insert(A::name().to_owned());
 

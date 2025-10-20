@@ -24,7 +24,7 @@ For SQL database support, enable the appropriate features:
 
 ```toml
 [dependencies]
-evento = { version = "1", features = ["sqlite", "sqlite-migrator"] }
+evento = { version = "1", features = ["sqlite"] }
 ```
 
 ## Basic Usage
@@ -147,7 +147,6 @@ async fn on_user_created<E: evento::Executor>(
 
 async fn setup_subscriptions(executor: evento::Sqlite) -> anyhow::Result<()> {
     evento::subscribe("user-handlers")
-        .aggregator::<User>()
         .handler(on_user_created())
         .run(&executor)
         .await?;
@@ -177,7 +176,6 @@ async fn main() -> anyhow::Result<()> {
     
     // Setup event subscriptions
     evento::subscribe("user-service")
-        .aggregator::<User>()
         .handler(on_user_created())
         .run(&executor)
         .await?;
@@ -213,17 +211,17 @@ async fn main() -> anyhow::Result<()> {
 
 ### SQLite
 ```toml
-evento = { version = "1", features = ["sqlite", "sqlite-migrator"] }
+evento = { version = "1", features = ["sqlite"] }
 ```
 
 ### PostgreSQL
 ```toml
-evento = { version = "1", features = ["postgres", "postgres-migrator"] }
+evento = { version = "1", features = ["postgres"] }
 ```
 
 ### MySQL
 ```toml
-evento = { version = "1", features = ["mysql", "mysql-migrator"] }
+evento = { version = "1", features = ["mysql"] }
 ```
 
 ## Key Concepts
@@ -243,10 +241,6 @@ evento = { version = "1", features = ["mysql", "mysql-migrator"] }
 - `sqlite` - SQLite support
 - `postgres` - PostgreSQL support
 - `mysql` - MySQL support
-- `sql-migrator` - Enable all SQL migrations
-- `sqlite-migrator` - SQLite migrations
-- `postgres-migrator` - PostgreSQL migrations
-- `mysql-migrator` - MySQL migrations
 
 ## Examples
 

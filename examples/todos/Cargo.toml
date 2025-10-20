@@ -13,4 +13,4 @@ heed = "0.22"
 tempfile = "3.23"
 axum = { version = "0.8", features = ["macros"] }
 askama = "0.14"
-evento = { path = "../../evento", version = "1.4.1", features = ["sqlite-migrator"] }
+evento = { path = "../../evento", version = "1.4.1", features = ["sqlite"] }

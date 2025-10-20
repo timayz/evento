@@ -95,7 +95,6 @@
 //! - `sqlite` - SQLite support
 //! - `postgres` - PostgreSQL support
 //! - `mysql` - MySQL support
-//! - `sql-migrator` - Enable database migrations
 
 pub mod context;
 pub mod cursor;
@@ -106,11 +105,7 @@ mod subscribe;
 
 #[cfg(any(feature = "sqlite", feature = "mysql", feature = "postgres"))]
 pub mod sql;
-#[cfg(any(
-    feature = "sqlite-migrator",
-    feature = "mysql-migrator",
-    feature = "postgres-migrator"
-))]
+#[cfg(any(feature = "sqlite", feature = "mysql", feature = "postgres"))]
 pub mod sql_migrator;
 
 #[cfg(feature = "macro")]
@@ -133,15 +128,13 @@ use crate::cursor::Cursor;
 /// ```no_run
 /// use evento::prelude::*;
 /// ```
-pub mod prelude {
-    #[cfg(feature = "stream")]
+#[cfg(feature = "stream")]
+pub mod stream {
     pub use tokio_stream::StreamExt;
+}
 
-    #[cfg(any(
-        feature = "sqlite-migrator",
-        feature = "postgres-migrator",
-        feature = "mysql-migrator"
-    ))]
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
+pub mod migrator {
     pub use sqlx_migrator::{Migrate, Plan};
 }
 
