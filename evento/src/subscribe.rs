@@ -240,6 +240,45 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
         self
     }
 
+    /// Subscribe to events for a specific aggregator type
+    ///
+    /// This method allows subscribing to all events for a given aggregator without
+    /// specifying individual handlers. Requires the `stream` feature to be enabled.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use evento::{subscribe, EventDetails, AggregatorName};
+    /// # use serde::{Serialize, Deserialize};
+    /// # use bincode::{Encode, Decode};
+    /// #
+    /// # #[derive(Default, Serialize, Deserialize, Encode, Decode, Clone, Debug)]
+    /// # struct User {
+    /// #     name: String,
+    /// # }
+    /// #
+    /// # #[derive(AggregatorName, Encode, Decode)]
+    /// # struct UserCreated {
+    /// #     name: String,
+    /// # }
+    /// #
+    /// # #[evento::aggregator]
+    /// # impl User {
+    /// #     async fn user_created(&mut self, event: EventDetails<UserCreated>) -> anyhow::Result<()> {
+    /// #         self.name = event.data.name;
+    /// #         Ok(())
+    /// #     }
+    /// # }
+    /// #
+    /// # async fn example(executor: &evento::Sqlite) -> anyhow::Result<()> {
+    /// subscribe("user-stream")
+    ///     .aggregator::<User>()
+    ///     .run(executor)
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "stream")]
     pub fn aggregator<A: Aggregator>(mut self) -> Self {
         self.aggregator_types.insert(A::name().to_owned());
 

@@ -48,7 +48,7 @@ fn drop_event_table_statement() -> TableDropStatement {
     Table::drop().table(Event::Table).to_owned()
 }
 
-#[cfg(feature = "sqlite-migrator")]
+#[cfg(feature = "sqlite")]
 #[async_trait::async_trait]
 impl Operation<sqlx::Sqlite> for CreateEventTable {
     async fn up(
@@ -72,7 +72,7 @@ impl Operation<sqlx::Sqlite> for CreateEventTable {
     }
 }
 
-#[cfg(feature = "mysql-migrator")]
+#[cfg(feature = "mysql")]
 #[async_trait::async_trait]
 impl Operation<sqlx::MySql> for CreateEventTable {
     async fn up(&self, connection: &mut sqlx::MySqlConnection) -> Result<(), sqlx_migrator::Error> {
@@ -93,7 +93,7 @@ impl Operation<sqlx::MySql> for CreateEventTable {
     }
 }
 
-#[cfg(feature = "postgres-migrator")]
+#[cfg(feature = "postgres")]
 #[async_trait::async_trait]
 impl Operation<sqlx::Postgres> for CreateEventTable {
     async fn up(&self, connection: &mut sqlx::PgConnection) -> Result<(), sqlx_migrator::Error> {
@@ -128,7 +128,7 @@ fn drop_event_type_idx_statement() -> IndexDropStatement {
         .to_owned()
 }
 
-#[cfg(feature = "sqlite-migrator")]
+#[cfg(feature = "sqlite")]
 #[async_trait::async_trait]
 impl Operation<sqlx::Sqlite> for CreateEventTypeIdx {
     async fn up(
@@ -152,7 +152,7 @@ impl Operation<sqlx::Sqlite> for CreateEventTypeIdx {
     }
 }
 
-#[cfg(feature = "mysql-migrator")]
+#[cfg(feature = "mysql")]
 #[async_trait::async_trait]
 impl Operation<sqlx::MySql> for CreateEventTypeIdx {
     async fn up(&self, connection: &mut sqlx::MySqlConnection) -> Result<(), sqlx_migrator::Error> {
@@ -173,7 +173,7 @@ impl Operation<sqlx::MySql> for CreateEventTypeIdx {
     }
 }
 
-#[cfg(feature = "postgres-migrator")]
+#[cfg(feature = "postgres")]
 #[async_trait::async_trait]
 impl Operation<sqlx::Postgres> for CreateEventTypeIdx {
     async fn up(&self, connection: &mut sqlx::PgConnection) -> Result<(), sqlx_migrator::Error> {
@@ -209,7 +209,7 @@ fn drop_event_type_id_idx_statement() -> IndexDropStatement {
         .to_owned()
 }
 
-#[cfg(feature = "sqlite-migrator")]
+#[cfg(feature = "sqlite")]
 #[async_trait::async_trait]
 impl Operation<sqlx::Sqlite> for CreateEventTypeIdIdx {
     async fn up(
@@ -234,7 +234,7 @@ impl Operation<sqlx::Sqlite> for CreateEventTypeIdIdx {
     }
 }
 
-#[cfg(feature = "mysql-migrator")]
+#[cfg(feature = "mysql")]
 #[async_trait::async_trait]
 impl Operation<sqlx::MySql> for CreateEventTypeIdIdx {
     async fn up(&self, connection: &mut sqlx::MySqlConnection) -> Result<(), sqlx_migrator::Error> {
@@ -255,7 +255,7 @@ impl Operation<sqlx::MySql> for CreateEventTypeIdIdx {
     }
 }
 
-#[cfg(feature = "postgres-migrator")]
+#[cfg(feature = "postgres")]
 #[async_trait::async_trait]
 impl Operation<sqlx::Postgres> for CreateEventTypeIdIdx {
     async fn up(&self, connection: &mut sqlx::PgConnection) -> Result<(), sqlx_migrator::Error> {
@@ -293,7 +293,7 @@ fn drop_event_routing_key_type_idx_statement() -> IndexDropStatement {
         .to_owned()
 }
 
-#[cfg(feature = "sqlite-migrator")]
+#[cfg(feature = "sqlite")]
 #[async_trait::async_trait]
 impl Operation<sqlx::Sqlite> for CreateEventRoutingKeyTypeIdx {
     async fn up(
@@ -319,7 +319,7 @@ impl Operation<sqlx::Sqlite> for CreateEventRoutingKeyTypeIdx {
     }
 }
 
-#[cfg(feature = "mysql-migrator")]
+#[cfg(feature = "mysql")]
 #[async_trait::async_trait]
 impl Operation<sqlx::MySql> for CreateEventRoutingKeyTypeIdx {
     async fn up(&self, connection: &mut sqlx::MySqlConnection) -> Result<(), sqlx_migrator::Error> {
@@ -342,7 +342,7 @@ impl Operation<sqlx::MySql> for CreateEventRoutingKeyTypeIdx {
     }
 }
 
-#[cfg(feature = "postgres-migrator")]
+#[cfg(feature = "postgres")]
 #[async_trait::async_trait]
 impl Operation<sqlx::Postgres> for CreateEventRoutingKeyTypeIdx {
     async fn up(&self, connection: &mut sqlx::PgConnection) -> Result<(), sqlx_migrator::Error> {
@@ -382,7 +382,7 @@ fn drop_event_type_id_verison_idx_statement() -> IndexDropStatement {
         .to_owned()
 }
 
-#[cfg(feature = "sqlite-migrator")]
+#[cfg(feature = "sqlite")]
 #[async_trait::async_trait]
 impl Operation<sqlx::Sqlite> for CreateEventTypeIdVersionIdx {
     async fn up(
@@ -408,7 +408,7 @@ impl Operation<sqlx::Sqlite> for CreateEventTypeIdVersionIdx {
     }
 }
 
-#[cfg(feature = "mysql-migrator")]
+#[cfg(feature = "mysql")]
 #[async_trait::async_trait]
 impl Operation<sqlx::MySql> for CreateEventTypeIdVersionIdx {
     async fn up(&self, connection: &mut sqlx::MySqlConnection) -> Result<(), sqlx_migrator::Error> {
@@ -431,7 +431,7 @@ impl Operation<sqlx::MySql> for CreateEventTypeIdVersionIdx {
     }
 }
 
-#[cfg(feature = "postgres-migrator")]
+#[cfg(feature = "postgres")]
 #[async_trait::async_trait]
 impl Operation<sqlx::Postgres> for CreateEventTypeIdVersionIdx {
     async fn up(&self, connection: &mut sqlx::PgConnection) -> Result<(), sqlx_migrator::Error> {
@@ -491,7 +491,7 @@ fn drop_snapshot_table_statement() -> TableDropStatement {
     Table::drop().table(Snapshot::Table).to_owned()
 }
 
-#[cfg(feature = "sqlite-migrator")]
+#[cfg(feature = "sqlite")]
 #[async_trait::async_trait]
 impl Operation<sqlx::Sqlite> for CreateSnapshotTable {
     async fn up(
@@ -515,7 +515,7 @@ impl Operation<sqlx::Sqlite> for CreateSnapshotTable {
     }
 }
 
-#[cfg(feature = "mysql-migrator")]
+#[cfg(feature = "mysql")]
 #[async_trait::async_trait]
 impl Operation<sqlx::MySql> for CreateSnapshotTable {
     async fn up(&self, connection: &mut sqlx::MySqlConnection) -> Result<(), sqlx_migrator::Error> {
@@ -536,7 +536,7 @@ impl Operation<sqlx::MySql> for CreateSnapshotTable {
     }
 }
 
-#[cfg(feature = "postgres-migrator")]
+#[cfg(feature = "postgres")]
 #[async_trait::async_trait]
 impl Operation<sqlx::Postgres> for CreateSnapshotTable {
     async fn up(&self, connection: &mut sqlx::PgConnection) -> Result<(), sqlx_migrator::Error> {
@@ -599,7 +599,7 @@ fn drop_subscriber_table_statement() -> TableDropStatement {
     Table::drop().table(Subscriber::Table).to_owned()
 }
 
-#[cfg(feature = "sqlite-migrator")]
+#[cfg(feature = "sqlite")]
 #[async_trait::async_trait]
 impl Operation<sqlx::Sqlite> for CreateSubscriberTable {
     async fn up(
@@ -623,7 +623,7 @@ impl Operation<sqlx::Sqlite> for CreateSubscriberTable {
     }
 }
 
-#[cfg(feature = "mysql-migrator")]
+#[cfg(feature = "mysql")]
 #[async_trait::async_trait]
 impl Operation<sqlx::MySql> for CreateSubscriberTable {
     async fn up(&self, connection: &mut sqlx::MySqlConnection) -> Result<(), sqlx_migrator::Error> {
@@ -644,7 +644,7 @@ impl Operation<sqlx::MySql> for CreateSubscriberTable {
     }
 }
 
-#[cfg(feature = "postgres-migrator")]
+#[cfg(feature = "postgres")]
 #[async_trait::async_trait]
 impl Operation<sqlx::Postgres> for CreateSubscriberTable {
     async fn up(&self, connection: &mut sqlx::PgConnection) -> Result<(), sqlx_migrator::Error> {
@@ -665,7 +665,7 @@ impl Operation<sqlx::Postgres> for CreateSubscriberTable {
 
 pub struct InitMigration;
 
-#[cfg(feature = "sqlite-migrator")]
+#[cfg(feature = "sqlite")]
 sqlx_migrator::sqlite_migration!(
     InitMigration,
     "main",
@@ -682,7 +682,7 @@ sqlx_migrator::sqlite_migration!(
     ]
 );
 
-#[cfg(feature = "mysql-migrator")]
+#[cfg(feature = "mysql")]
 sqlx_migrator::mysql_migration!(
     InitMigration,
     "main",
@@ -699,7 +699,7 @@ sqlx_migrator::mysql_migration!(
     ]
 );
 
-#[cfg(feature = "postgres-migrator")]
+#[cfg(feature = "postgres")]
 sqlx_migrator::postgres_migration!(
     InitMigration,
     "main",

@@ -9,7 +9,7 @@ use axum::{
 };
 use bincode::{Decode, Encode};
 use evento::{
-    prelude::{Migrate, Plan},
+    migrator::{Migrate, Plan},
     AggregatorName, EventDetails,
 };
 use heed::{
@@ -129,7 +129,6 @@ async fn main() -> anyhow::Result<()> {
     let executor: evento::Sqlite = pool.into();
 
     evento::subscribe("todo-command")
-        .aggregator::<Todo>()
         .skip::<Todo, CreationSucceeded>()
         .skip::<Todo, CreationFailed>()
         .handler(command_creation_requested())
@@ -138,7 +137,6 @@ async fn main() -> anyhow::Result<()> {
 
     evento::subscribe("todo-query")
         .data(env.clone())
-        .aggregator::<Todo>()
         .handler(query_creation_failed())
         .handler(query_creation_requested())
         .handler(query_creation_succeeded())

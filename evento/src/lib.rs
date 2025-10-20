@@ -24,7 +24,6 @@
 //! ## Quick Start
 //!
 //! ```no_run
-//! use evento::prelude::*;
 //! use evento::{EventDetails, AggregatorName};
 //! use serde::{Deserialize, Serialize};
 //! use bincode::{Decode, Encode};
@@ -95,7 +94,6 @@
 //! - `sqlite` - SQLite support
 //! - `postgres` - PostgreSQL support
 //! - `mysql` - MySQL support
-//! - `sql-migrator` - Enable database migrations
 
 pub mod context;
 pub mod cursor;
@@ -106,11 +104,7 @@ mod subscribe;
 
 #[cfg(any(feature = "sqlite", feature = "mysql", feature = "postgres"))]
 pub mod sql;
-#[cfg(any(
-    feature = "sqlite-migrator",
-    feature = "mysql-migrator",
-    feature = "postgres-migrator"
-))]
+#[cfg(any(feature = "sqlite", feature = "mysql", feature = "postgres"))]
 pub mod sql_migrator;
 
 #[cfg(feature = "macro")]
@@ -126,22 +120,28 @@ use ulid::Ulid;
 
 use crate::cursor::Cursor;
 
-/// Common imports for working with Evento
+/// Stream utilities for working with event streams
 ///
-/// This module provides convenient re-exports of commonly used types and traits.
+/// This module provides stream processing capabilities when the `stream` feature is enabled.
 ///
 /// ```no_run
-/// use evento::prelude::*;
+/// use evento::stream::StreamExt;
 /// ```
-pub mod prelude {
-    #[cfg(feature = "stream")]
+#[cfg(feature = "stream")]
+pub mod stream {
     pub use tokio_stream::StreamExt;
+}
 
-    #[cfg(any(
-        feature = "sqlite-migrator",
-        feature = "postgres-migrator",
-        feature = "mysql-migrator"
-    ))]
+/// Database migration utilities
+///
+/// This module provides migration support for SQL databases. Migrations are automatically
+/// included when using any SQL database feature (sqlite, postgres, mysql).
+///
+/// ```no_run
+/// use evento::migrator::{Migrate, Plan};
+/// ```
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
+pub mod migrator {
     pub use sqlx_migrator::{Migrate, Plan};
 }
 

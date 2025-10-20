@@ -24,7 +24,7 @@ For SQL database support, enable the appropriate features:
 
 ```toml
 [dependencies]
-evento = { version = "1", features = ["sqlite", "sqlite-migrator"] }
+evento = { version = "1", features = ["sqlite"] }
 ```
 
 ## Basic Usage
@@ -32,7 +32,7 @@ evento = { version = "1", features = ["sqlite", "sqlite-migrator"] }
 ### 1. Define Events and Aggregators
 
 ```rust
-use evento::prelude::*;
+use evento::{EventDetails, AggregatorName};
 use serde::{Deserialize, Serialize};
 use bincode::{Decode, Encode};
 
@@ -74,7 +74,7 @@ impl User {
 ### 2. Create Events
 
 ```rust
-use evento::create;
+use evento::{create, save, load};
 
 async fn create_user(executor: &evento::Sqlite) -> anyhow::Result<String> {
     let user_id = create::<User>()
@@ -93,7 +93,6 @@ async fn create_user(executor: &evento::Sqlite) -> anyhow::Result<String> {
 ### 3. Save Events to Existing Aggregates
 
 ```rust
-use evento::save;
 
 async fn change_user_email(
     executor: &evento::Sqlite, 
@@ -115,7 +114,6 @@ async fn change_user_email(
 ### 4. Load Aggregates
 
 ```rust
-use evento::load;
 
 async fn get_user(executor: &evento::Sqlite, user_id: &str) -> anyhow::Result<User> {
     let result = load::<User, _>(executor, user_id).await?;
@@ -147,7 +145,6 @@ async fn on_user_created<E: evento::Executor>(
 
 async fn setup_subscriptions(executor: evento::Sqlite) -> anyhow::Result<()> {
     evento::subscribe("user-handlers")
-        .aggregator::<User>()
         .handler(on_user_created())
         .run(&executor)
         .await?;
@@ -159,7 +156,7 @@ async fn setup_subscriptions(executor: evento::Sqlite) -> anyhow::Result<()> {
 ### 6. Complete Example with SQLite
 
 ```rust
-use evento::prelude::*;
+use evento::{create, save, load, subscribe, migrator::{Migrate, Plan}};
 use sqlx::SqlitePool;
 
 #[tokio::main]
@@ -177,7 +174,6 @@ async fn main() -> anyhow::Result<()> {
     
     // Setup event subscriptions
     evento::subscribe("user-service")
-        .aggregator::<User>()
         .handler(on_user_created())
         .run(&executor)
         .await?;
@@ -213,17 +209,17 @@ async fn main() -> anyhow::Result<()> {
 
 ### SQLite
 ```toml
-evento = { version = "1", features = ["sqlite", "sqlite-migrator"] }
+evento = { version = "1", features = ["sqlite"] }
 ```
 
 ### PostgreSQL
 ```toml
-evento = { version = "1", features = ["postgres", "postgres-migrator"] }
+evento = { version = "1", features = ["postgres"] }
 ```
 
 ### MySQL
 ```toml
-evento = { version = "1", features = ["mysql", "mysql-migrator"] }
+evento = { version = "1", features = ["mysql"] }
 ```
 
 ## Key Concepts
@@ -238,15 +234,29 @@ evento = { version = "1", features = ["mysql", "mysql-migrator"] }
 
 - `macro` - Enable procedural macros for aggregators and handlers (default)
 - `handler` - Enable event handler functionality (default)
-- `stream` - Enable stream processing capabilities
+- `stream` - Enable stream processing capabilities and aggregator subscriptions
 - `sql` - Enable all SQL database backends
-- `sqlite` - SQLite support
-- `postgres` - PostgreSQL support
-- `mysql` - MySQL support
-- `sql-migrator` - Enable all SQL migrations
-- `sqlite-migrator` - SQLite migrations
-- `postgres-migrator` - PostgreSQL migrations
-- `mysql-migrator` - MySQL migrations
+- `sqlite` - SQLite support with automatic migrations
+- `postgres` - PostgreSQL support with automatic migrations
+- `mysql` - MySQL support with automatic migrations
+
+### Stream Feature
+
+The `stream` feature enables advanced streaming capabilities and the `aggregator()` method for subscriptions:
+
+```toml
+evento = { version = "1", features = ["sqlite", "stream"] }
+```
+
+```rust
+use evento::{subscribe, stream::StreamExt};
+
+// Subscribe to all events for an aggregator type
+evento::subscribe("user-stream")
+    .aggregator::<User>()
+    .run(&executor)
+    .await?;
+```
 
 ## Examples
 
