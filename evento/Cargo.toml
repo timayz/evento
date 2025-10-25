@@ -1,6 +1,6 @@
 [package]
 name = "evento"
-version = "1.4.1"
+version = "1.5.0"
 edition = "2021"
 license = "Apache-2.0"
 publish = true
@@ -13,7 +13,7 @@ serde = { version = "1.0", features = ["derive"] }
 ulid = { version = "1.2", features = ["serde"] }
 tokio = { version = "1.47", features = ["full"] }
 tokio-stream = { version = "0.1", optional = true }
-evento-macro = { path = "../evento-macro", optional = true, version = "1.4.1" }
+evento-macro = { path = "../evento-macro", optional = true, version = "1.5.0" }
 anyhow = "1.0"
 bincode = "2.0"
 sqlx = { version = "0.8", optional = true }
@@ -38,6 +38,6 @@ stream = ["futures-util", "tokio-stream"]
 group = ["futures-util"]
 handler = ["backon"]
 sql = ["sqlite", "mysql", "postgres"]
-sqlite = ["sea-query/backend-sqlite", "sea-query-sqlx/sqlx-sqlite", "sqlx/sqlite","sqlx_migrator/sqlite"]
-mysql = ["sea-query/backend-mysql", "sea-query-sqlx/sqlx-mysql", "sqlx/mysql","sqlx_migrator/mysql"]
-postgres = ["sea-query/backend-postgres", "sea-query-sqlx/sqlx-postgres", "sqlx/postgres","sqlx_migrator/postgres"]
+sqlite = ["sea-query/backend-sqlite", "sea-query-sqlx/sqlx-sqlite", "sqlx/sqlite", "sqlx_migrator/sqlite"]
+mysql = ["sea-query/backend-mysql", "sea-query-sqlx/sqlx-mysql", "sqlx/mysql", "sqlx_migrator/mysql"]
+postgres = ["sea-query/backend-postgres", "sea-query-sqlx/sqlx-postgres", "sqlx/postgres", "sqlx_migrator/postgres"]
