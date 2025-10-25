@@ -25,6 +25,9 @@ use crate::{
 
 #[derive(Debug, Error)]
 pub enum SubscribeError {
+    #[error("duplicate handler {0:?}")]
+    DuplicateHandler(HashSet<String>),
+
     #[error("read >> {0}")]
     ReadError(#[from] super::ReadError),
 
@@ -139,6 +142,7 @@ pub struct SubscribeBuilder<E: Executor> {
     delay: Option<Duration>,
     #[allow(dead_code)]
     handlers: HashMap<String, Box<dyn SubscribeHandler<E>>>,
+    duplicate_handlers: HashSet<String>,
     aggregator_types: HashSet<String>,
     chunk_size: u16,
     backon: bool,
@@ -189,6 +193,7 @@ pub fn subscribe<E: Executor>(key: impl Into<String>) -> SubscribeBuilder<E> {
         delay: None,
         routing_key: RoutingKey::Value(None),
         handlers: HashMap::new(),
+        duplicate_handlers: HashSet::new(),
         aggregator_types: HashSet::new(),
         chunk_size: 300,
         context: Arc::default(),
@@ -291,7 +296,13 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
             .insert(handler.aggregator_type().to_owned());
 
         let key = format!("{}-{}", handler.aggregator_type(), handler.event_name());
-        self.handlers.insert(key, Box::new(handler));
+        if self
+            .handlers
+            .insert(key.to_owned(), Box::new(handler))
+            .is_some()
+        {
+            self.duplicate_handlers.insert(key);
+        };
 
         self
     }
@@ -302,6 +313,11 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
     }
 
     pub async fn init(&self, executor: &E) -> Result<(), SubscribeError> {
+        if !self.duplicate_handlers.is_empty() {
+            let values = self.duplicate_handlers.iter().cloned().collect();
+            return Err(SubscribeError::DuplicateHandler(values));
+        }
+
         executor
             .upsert_subscriber(self.key.to_owned(), self.id)
             .await?;
