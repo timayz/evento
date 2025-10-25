@@ -451,7 +451,7 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
                         break;
                     }
 
-                    tracing::debug!(
+                    tracing::info!(
                         "@handled '{}','{}','{}'",
                         item.key,
                         item.event.aggregator_type,
