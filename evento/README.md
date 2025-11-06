@@ -66,6 +66,13 @@ impl User {
 async fn main() -> anyhow::Result<()> {
     // Setup SQLite executor
     let pool = sqlx::SqlitePool::connect("sqlite:events.db").await?;
+    let mut conn = pool.acquire().await?;
+
+    // Run migrations
+    evento::sql_migrator::new_migrator::<sqlx::Sqlite>()?
+        .run(&mut *conn, &evento::migrator::Plan::apply_all())
+        .await?;
+
     let executor: evento::Sqlite = pool.into();
 
     // Create and save events
