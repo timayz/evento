@@ -15,4 +15,4 @@ jobs:
     with:
       mysql: true
       postgres: true
-      tests: '["--all-features -p evento"]'
+      tests: '["cargo test --all-features -p evento"]'

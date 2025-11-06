@@ -197,6 +197,48 @@ pub fn create<A: Aggregator>() -> SaveBuilder<A> {
     SaveBuilder::new(Some(A::default()), Ulid::new())
 }
 
+/// Create a new aggregate with a specific ID
+///
+/// Creates a builder for generating events that will create a new aggregate instance
+/// with a user-specified ID instead of an automatically generated ULID.
+///
+/// This is useful when you need to use a deterministic or externally provided ID
+/// for the aggregate, such as when integrating with external systems.
+///
+/// # Parameters
+///
+/// - `id`: The ID to use for the new aggregate
+///
+/// # Examples
+///
+/// ```no_run
+/// use evento::create_with;
+/// # use evento::*;
+/// # use bincode::{Encode, Decode};
+/// # #[derive(AggregatorName, Encode, Decode)]
+/// # struct UserCreated { name: String }
+/// # #[derive(Default, Encode, Decode, Clone, Debug)]
+/// # struct User;
+/// # #[evento::aggregator]
+/// # impl User {}
+///
+/// async fn create_user_with_id(executor: &evento::Sqlite) -> anyhow::Result<String> {
+///     let user_id = create_with::<User>("user-123")
+///         .data(&UserCreated {
+///             name: "John Doe".to_string(),
+///         })?
+///         .metadata(&true)?
+///         .commit(executor)
+///         .await?;
+///
+///     println!("Created user with ID: {}", user_id);
+///     Ok(user_id)
+/// }
+/// ```
+pub fn create_with<A: Aggregator>(id: impl Into<String>) -> SaveBuilder<A> {
+    SaveBuilder::new(Some(A::default()), id)
+}
+
 /// Add events to an existing aggregate
 ///
 /// Creates a builder for adding events to an aggregate with the specified ID.

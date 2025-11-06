@@ -164,12 +164,12 @@ async fn main() -> anyhow::Result<()> {
     // Setup database
     let pool = SqlitePool::connect("sqlite:events.db").await?;
     let mut conn = pool.acquire().await?;
-    
+
     // Run migrations
     evento::sql_migrator::new_migrator::<sqlx::Sqlite>()?
         .run(&mut *conn, &Plan::apply_all())
         .await?;
-    
+
     let executor: evento::Sqlite = pool.into();
     
     // Setup event subscriptions
