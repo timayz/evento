@@ -57,7 +57,7 @@ pub trait Executor: Send + Sync + 'static {
         &self,
         key: String,
         cursor: Value,
-        lag: i64,
+        lag: u32,
     ) -> Result<(), AcknowledgeError>;
 }
 
@@ -141,7 +141,7 @@ impl Executor for Evento {
         &self,
         key: String,
         cursor: Value,
-        lag: i64,
+        lag: u32,
     ) -> Result<(), AcknowledgeError> {
         self.0.acknowledge(key, cursor, lag).await
     }
@@ -338,7 +338,7 @@ impl Executor for EventoGroup {
         &self,
         key: String,
         cursor: Value,
-        lag: i64,
+        lag: u32,
     ) -> Result<(), AcknowledgeError> {
         self.first().acknowledge(key, cursor, lag).await
     }

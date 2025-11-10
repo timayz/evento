@@ -122,7 +122,7 @@ impl<A: Aggregator> SaveBuilder<A> {
         });
 
         let mut events = vec![];
-        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
 
         for (name, data) in &self.data {
             version += 1;
@@ -132,7 +132,8 @@ impl<A: Aggregator> SaveBuilder<A> {
                 name: name.to_string(),
                 data: data.to_vec(),
                 metadata: metadata.to_vec(),
-                timestamp,
+                timestamp: now.as_secs(),
+                timestamp_subsec: now.subsec_millis(),
                 aggregator_id: self.aggregator_id.to_owned(),
                 aggregator_type: self.aggregator_type.to_owned(),
                 version,

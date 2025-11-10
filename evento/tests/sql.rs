@@ -7,7 +7,7 @@ mod cursor_test;
 use evento::{
     cursor::{Args, Order, ReadResult},
     sql::{Reader, Sql},
-    sql_migrator::InitMigration,
+    sql_migrator::{InitMigration, M0002},
     Event,
 };
 use sea_query::{MysqlQueryBuilder, PostgresQueryBuilder, Query, SqliteQueryBuilder};
@@ -500,6 +500,7 @@ where
             evento::sql::Event::Metadata,
             evento::sql::Event::RoutingKey,
             evento::sql::Event::Timestamp,
+            evento::sql::Event::TimestampSubsec,
         ])
         .from(evento::sql::Event::Table)
         .to_owned();
@@ -530,6 +531,7 @@ where
             evento::sql::Event::Version,
             evento::sql::Event::RoutingKey,
             evento::sql::Event::Timestamp,
+            evento::sql::Event::TimestampSubsec,
         ])
         .to_owned();
 
@@ -544,6 +546,7 @@ where
             event.version.into(),
             event.routing_key.into(),
             event.timestamp.into(),
+            event.timestamp_subsec.into(),
         ]);
     }
 
@@ -601,6 +604,7 @@ where
     for<'q> DB::Arguments<'q>: sqlx::IntoArguments<'q, DB>,
     for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
     InitMigration: sqlx_migrator::Migration<DB>,
+    M0002: sqlx_migrator::Migration<DB>,
     sqlx_migrator::Migrator<DB>: sqlx_migrator::migrator::DatabaseOperation<DB>,
 {
     install_default_drivers();
@@ -612,7 +616,7 @@ where
 
     let pool = Pool::<DB>::connect(&url).await?;
     let mut conn = pool.acquire().await?;
-    let migrator = evento::sql_migrator::new_migrator::<DB>()?;
+    let migrator = evento::sql_migrator::new::<DB>()?;
     migrator.run(&mut *conn, &Plan::apply_all()).await?;
 
     Ok(pool)

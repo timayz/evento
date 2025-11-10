@@ -607,7 +607,8 @@ pub fn get_data() -> Vec<Event> {
             aggregator_type: aggregator_type.to_owned(),
             version: version.to_owned() as i32,
             routing_key,
-            timestamp: timestamp as i64,
+            timestamp: timestamp as u64,
+            timestamp_subsec: 0,
             data: Default::default(),
             metadata: Default::default(),
         };
@@ -643,7 +644,8 @@ fn create_event(id: &str, version: u16, timestamp: u32) -> Event {
         aggregator_type: "Message".to_owned(),
         version: version as i32,
         routing_key: None,
-        timestamp: timestamp as i64,
+        timestamp: timestamp as u64,
+        timestamp_subsec: 0,
         data: Default::default(),
         metadata: Default::default(),
     }

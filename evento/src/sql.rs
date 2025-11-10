@@ -31,6 +31,7 @@ pub enum Event {
     Metadata,
     RoutingKey,
     Timestamp,
+    TimestampSubsec,
 }
 
 #[derive(Iden)]
@@ -107,6 +108,7 @@ where
                 Event::Metadata,
                 Event::RoutingKey,
                 Event::Timestamp,
+                Event::TimestampSubsec,
             ])
             .from(Event::Table)
             .and_where(Expr::col(Event::Id).eq(Expr::value(cursor.i.to_string())))
@@ -138,6 +140,7 @@ where
                 Event::Metadata,
                 Event::RoutingKey,
                 Event::Timestamp,
+                Event::TimestampSubsec,
             ])
             .from(Event::Table)
             .and_where(Expr::col(Event::AggregatorType).eq(Expr::value(aggregator_type)))
@@ -167,6 +170,7 @@ where
                 Event::Metadata,
                 Event::RoutingKey,
                 Event::Timestamp,
+                Event::TimestampSubsec,
             ])
             .from(Event::Table)
             .and_where(Expr::col(Event::AggregatorType).in_tuples(aggregator_types))
@@ -294,6 +298,7 @@ where
                 Event::Version,
                 Event::RoutingKey,
                 Event::Timestamp,
+                Event::TimestampSubsec,
             ])
             .to_owned();
 
@@ -308,6 +313,7 @@ where
                 event.version.into(),
                 event.routing_key.into(),
                 event.timestamp.into(),
+                event.timestamp_subsec.into(),
             ]);
         }
 
@@ -379,7 +385,7 @@ where
         &self,
         key: String,
         cursor: Value,
-        lag: i64,
+        lag: u32,
     ) -> Result<(), AcknowledgeError> {
         let statement = Query::update()
             .table(Subscriber::Table)
@@ -631,16 +637,22 @@ pub trait Bind {
 
 impl Bind for crate::Event {
     type T = Event;
-    type I = [Self::T; 3];
-    type V = [Expr; 3];
+    type I = [Self::T; 4];
+    type V = [Expr; 4];
     type Cursor = Self;
 
     fn columns() -> Self::I {
-        [Event::Timestamp, Event::Version, Event::Id]
+        [
+            Event::TimestampSubsec,
+            Event::Timestamp,
+            Event::Version,
+            Event::Id,
+        ]
     }
 
     fn values(cursor: <<Self as Bind>::Cursor as Cursor>::T) -> Self::V {
         [
+            cursor.s.into(),
             cursor.t.into(),
             cursor.v.into(),
             cursor.i.to_string().into(),
@@ -658,6 +670,9 @@ where
     for<'r> &'r str: sqlx::ColumnIndex<R>,
 {
     fn from_row(row: &R) -> Result<Self, sqlx::Error> {
+        let timestamp: i64 = row.try_get("timestamp")?;
+        let timestamp_subsec: i64 = row.try_get("timestamp_subsec")?;
+
         Ok(crate::Event {
             id: Ulid::from_string(row.try_get("id")?)
                 .map_err(|err| sqlx::Error::InvalidArgument(err.to_string()))?,
@@ -668,7 +683,8 @@ where
             routing_key: row.try_get("routing_key")?,
             data: row.try_get("data")?,
             metadata: row.try_get("metadata")?,
-            timestamp: row.try_get("timestamp")?,
+            timestamp: timestamp as u64,
+            timestamp_subsec: timestamp_subsec as u32,
         })
     }
 }

@@ -305,6 +305,10 @@ impl Bind for crate::Event {
     fn sort_by(data: &mut Vec<Self::T>, is_order_desc: bool) {
         if !is_order_desc {
             data.sort_by(|a, b| {
+                if a.timestamp_subsec != b.timestamp_subsec {
+                    return a.timestamp_subsec.cmp(&b.timestamp_subsec);
+                }
+
                 if a.timestamp != b.timestamp {
                     return a.timestamp.cmp(&b.timestamp);
                 }
@@ -317,6 +321,10 @@ impl Bind for crate::Event {
             });
         } else {
             data.sort_by(|a, b| {
+                if a.timestamp_subsec != b.timestamp_subsec {
+                    return b.timestamp_subsec.cmp(&a.timestamp_subsec);
+                }
+
                 if a.timestamp != b.timestamp {
                     return b.timestamp.cmp(&a.timestamp);
                 }
@@ -337,15 +345,17 @@ impl Bind for crate::Event {
     ) {
         data.retain(|event| {
             if is_order_desc {
-                event.timestamp < cursor.t
-                    || (event.timestamp == cursor.t
-                        && (event.version < cursor.v
-                            || (event.version == cursor.v && event.id.to_string() < cursor.i)))
+                event.timestamp_subsec < cursor.s
+                    || (event.timestamp < cursor.t
+                        || (event.timestamp == cursor.t
+                            && (event.version < cursor.v
+                                || (event.version == cursor.v && event.id.to_string() < cursor.i))))
             } else {
-                event.timestamp > cursor.t
-                    || (event.timestamp == cursor.t
-                        && (event.version > cursor.v
-                            || (event.version == cursor.v && event.id.to_string() > cursor.i)))
+                event.timestamp_subsec > cursor.s
+                    || (event.timestamp > cursor.t
+                        || (event.timestamp == cursor.t
+                            && (event.version > cursor.v
+                                || (event.version == cursor.v && event.id.to_string() > cursor.i))))
             }
         });
     }
