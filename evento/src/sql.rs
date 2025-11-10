@@ -385,7 +385,7 @@ where
         &self,
         key: String,
         cursor: Value,
-        lag: u32,
+        lag: u64,
     ) -> Result<(), AcknowledgeError> {
         let statement = Query::update()
             .table(Subscriber::Table)
