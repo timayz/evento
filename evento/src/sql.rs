@@ -108,6 +108,7 @@ where
                 Event::Metadata,
                 Event::RoutingKey,
                 Event::Timestamp,
+                Event::TimestampSubsec,
             ])
             .from(Event::Table)
             .and_where(Expr::col(Event::Id).eq(Expr::value(cursor.i.to_string())))
@@ -139,6 +140,7 @@ where
                 Event::Metadata,
                 Event::RoutingKey,
                 Event::Timestamp,
+                Event::TimestampSubsec,
             ])
             .from(Event::Table)
             .and_where(Expr::col(Event::AggregatorType).eq(Expr::value(aggregator_type)))
@@ -168,6 +170,7 @@ where
                 Event::Metadata,
                 Event::RoutingKey,
                 Event::Timestamp,
+                Event::TimestampSubsec,
             ])
             .from(Event::Table)
             .and_where(Expr::col(Event::AggregatorType).in_tuples(aggregator_types))
@@ -295,6 +298,7 @@ where
                 Event::Version,
                 Event::RoutingKey,
                 Event::Timestamp,
+                Event::TimestampSubsec,
             ])
             .to_owned();
 
@@ -309,6 +313,7 @@ where
                 event.version.into(),
                 event.routing_key.into(),
                 event.timestamp.into(),
+                event.timestamp_subsec.into(),
             ]);
         }
 
@@ -632,16 +637,22 @@ pub trait Bind {
 
 impl Bind for crate::Event {
     type T = Event;
-    type I = [Self::T; 3];
-    type V = [Expr; 3];
+    type I = [Self::T; 4];
+    type V = [Expr; 4];
     type Cursor = Self;
 
     fn columns() -> Self::I {
-        [Event::Timestamp, Event::Version, Event::Id]
+        [
+            Event::TimestampSubsec,
+            Event::Timestamp,
+            Event::Version,
+            Event::Id,
+        ]
     }
 
     fn values(cursor: <<Self as Bind>::Cursor as Cursor>::T) -> Self::V {
         [
+            cursor.s.into(),
             cursor.t.into(),
             cursor.v.into(),
             cursor.i.to_string().into(),

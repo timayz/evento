@@ -7,7 +7,12 @@ pub struct Operation;
 fn up_statement() -> TableAlterStatement {
     Table::alter()
         .table(Event::Table)
-        .add_column(ColumnDef::new(Event::TimestampSubsec))
+        .add_column(
+            ColumnDef::new(Event::TimestampSubsec)
+                .big_integer()
+                .not_null()
+                .default(0),
+        )
         .to_owned()
 }
 

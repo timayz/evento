@@ -500,6 +500,7 @@ where
             evento::sql::Event::Metadata,
             evento::sql::Event::RoutingKey,
             evento::sql::Event::Timestamp,
+            evento::sql::Event::TimestampSubsec,
         ])
         .from(evento::sql::Event::Table)
         .to_owned();
@@ -530,6 +531,7 @@ where
             evento::sql::Event::Version,
             evento::sql::Event::RoutingKey,
             evento::sql::Event::Timestamp,
+            evento::sql::Event::TimestampSubsec,
         ])
         .to_owned();
 
@@ -544,6 +546,7 @@ where
             event.version.into(),
             event.routing_key.into(),
             event.timestamp.into(),
+            event.timestamp_subsec.into(),
         ]);
     }
 

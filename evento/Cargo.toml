@@ -33,7 +33,7 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "any"] }
 rand = "0.9"
 
 [features]
-default = ["macro", "handler", "sql", "stream"]
+default = ["macro", "handler"]
 macro = ["evento-macro"]
 stream = ["futures-util", "tokio-stream"]
 group = ["futures-util"]
