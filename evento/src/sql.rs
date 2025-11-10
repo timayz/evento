@@ -31,6 +31,7 @@ pub enum Event {
     Metadata,
     RoutingKey,
     Timestamp,
+    TimestampSubsec,
 }
 
 #[derive(Iden)]
@@ -379,7 +380,7 @@ where
         &self,
         key: String,
         cursor: Value,
-        lag: i64,
+        lag: u32,
     ) -> Result<(), AcknowledgeError> {
         let statement = Query::update()
             .table(Subscriber::Table)
@@ -658,6 +659,9 @@ where
     for<'r> &'r str: sqlx::ColumnIndex<R>,
 {
     fn from_row(row: &R) -> Result<Self, sqlx::Error> {
+        let timestamp: i64 = row.try_get("timestamp")?;
+        let timestamp_subsec: i64 = row.try_get("timestamp_subsec")?;
+
         Ok(crate::Event {
             id: Ulid::from_string(row.try_get("id")?)
                 .map_err(|err| sqlx::Error::InvalidArgument(err.to_string()))?,
@@ -668,7 +672,8 @@ where
             routing_key: row.try_get("routing_key")?,
             data: row.try_get("data")?,
             metadata: row.try_get("metadata")?,
-            timestamp: row.try_get("timestamp")?,
+            timestamp: timestamp as u64,
+            timestamp_subsec: timestamp_subsec as u32,
         })
     }
 }

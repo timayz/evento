@@ -212,7 +212,8 @@ pub struct EventCursor {
     /// Event version
     pub v: i32,
     /// Event timestamp (Unix timestamp in seconds)
-    pub t: i64,
+    pub t: u64,
+    pub s: u32,
 }
 
 /// Raw event stored in the event store
@@ -279,7 +280,9 @@ pub struct Event {
     /// Serialized event metadata (bincode format)
     pub metadata: Vec<u8>,
     /// Unix timestamp when the event occurred (seconds)
-    pub timestamp: i64,
+    pub timestamp: u64,
+    /// Unix timestamp when the event occurred (seconds)
+    pub timestamp_subsec: u32,
 }
 
 impl Event {
@@ -341,6 +344,7 @@ impl Cursor for Event {
             i: self.id.to_string(),
             v: self.version,
             t: self.timestamp,
+            s: self.timestamp_subsec,
         }
     }
 }

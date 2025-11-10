@@ -120,7 +120,7 @@ async fn main() -> anyhow::Result<()> {
 
     let pool = SqlitePool::connect(&dsn).await?;
     let mut conn = pool.acquire().await.unwrap();
-    evento::sql_migrator::new_migrator::<sqlx::Sqlite>()
+    evento::sql_migrator::new::<sqlx::Sqlite>()
         .unwrap()
         .run(&mut *conn, &Plan::apply_all())
         .await
