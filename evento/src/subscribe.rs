@@ -241,7 +241,7 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
         self
     }
 
-    pub fn no_handler_check(mut self) -> Self {
+    fn no_handler_check(mut self) -> Self {
         self.enforce_handler = false;
 
         self
@@ -508,18 +508,8 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
     }
 
     #[cfg(feature = "handler")]
-    pub async fn unsafe_run(self, executor: &E) -> Result<(), SubscribeError> {
-        self.no_handler_check().oneshot(executor).await
-    }
-
-    #[cfg(feature = "handler")]
     pub async fn unretry_oneshot(self, executor: &E) -> Result<(), SubscribeError> {
         self.backoff().oneshot(executor).await
-    }
-
-    #[cfg(feature = "handler")]
-    pub async fn unsafe_oneshot(self, executor: &E) -> Result<(), SubscribeError> {
-        self.no_handler_check().oneshot(executor).await
     }
 
     #[cfg(feature = "handler")]
