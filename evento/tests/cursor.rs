@@ -36,6 +36,23 @@ fn forward() -> anyhow::Result<()> {
 }
 
 #[test]
+fn forward_custom_limit() -> anyhow::Result<()> {
+    let events = get_events();
+    let args = Args::forward(10, None).limit(5);
+    let res = Reader::new(events.clone()).args(args).execute()?;
+
+    assert_eq!(res.edges.len(), 5);
+
+    assert_eq!(events[3], res.edges[0].node); // 01K14C428V3TNC2K7DCFEJ4HV4 1 1753567001
+    assert_eq!(events[2], res.edges[1].node); // 01K14C49SHZGXFVAKJJTJYQS70 2 1753567361
+    assert_eq!(events[7], res.edges[2].node); // 01K14CA43DENK9KM08REE27EE7 3 1753567361
+    assert_eq!(events[5], res.edges[3].node); // 01K14CAERY65HK16EWV7B0X9V6 5 1753567482
+    assert_eq!(events[9], res.edges[4].node); // 01K14CAPNNDMVZH4RCDCW3WWPS 5 1753567482
+
+    Ok(())
+}
+
+#[test]
 fn forward_3() -> anyhow::Result<()> {
     let events = get_events();
     let res = Reader::new(events.clone()).forward(3, None).execute()?;
@@ -278,6 +295,20 @@ fn backward_20() -> anyhow::Result<()> {
     assert_eq!(events[6], res.edges[7].node); // 01K14CFJR0GZ18SD2F4J5DXEDD 19 1753567670
     assert_eq!(events[8], res.edges[8].node); // 01K14CFW3GNN366VM32YEGBT13 88 1753567680
     assert_eq!(events[4], res.edges[9].node); // 01K14CFZJ0T1KJHBK5084C30BK 52 1753567690
+
+    Ok(())
+}
+
+#[test]
+fn backward_custom_litmit() -> anyhow::Result<()> {
+    let events = get_events();
+    let args = Args::backward(20, None).limit(3);
+    let res = Reader::new(events.clone()).args(args).execute()?;
+
+    assert_eq!(res.edges.len(), 3);
+    assert_eq!(events[6], res.edges[0].node); // 01K14CFJR0GZ18SD2F4J5DXEDD 19 1753567670
+    assert_eq!(events[8], res.edges[1].node); // 01K14CFW3GNN366VM32YEGBT13 88 1753567680
+    assert_eq!(events[4], res.edges[2].node); // 01K14CFZJ0T1KJHBK5084C30BK 52 1753567690
 
     Ok(())
 }
