@@ -261,7 +261,7 @@ pub struct EventCursor {
 ///     Ok(user_id)
 /// }
 /// ```
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Event {
     /// Unique event identifier (ULID)
     pub id: Ulid,

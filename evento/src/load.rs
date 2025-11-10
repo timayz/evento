@@ -28,7 +28,7 @@ pub enum ReadError {
     Write(#[from] super::WriteError),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct LoadResult<A: Aggregator> {
     pub item: A,
     pub event: Event,
