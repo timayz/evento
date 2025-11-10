@@ -1,6 +1,6 @@
 [package]
 name = "todos"
-version = "1.6.0"
+version = "1.7.0"
 edition = "2021"
 
 [dependencies]
@@ -13,4 +13,4 @@ heed = "0.22"
 tempfile = "3.23"
 axum = { version = "0.8", features = ["macros"] }
 askama = "0.14"
-evento = { path = "../../evento", version = "1.6.0", features = ["sqlite"] }
+evento = { path = "../../evento", version = "1.7.0", features = ["sqlite"] }
