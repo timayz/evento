@@ -146,6 +146,7 @@ pub struct SubscribeBuilder<E: Executor> {
     aggregator_types: HashSet<String>,
     chunk_size: u16,
     backon: bool,
+    enforce_handler: bool,
     context: Arc<Mutex<context::Context>>,
 }
 
@@ -198,6 +199,7 @@ pub fn subscribe<E: Executor>(key: impl Into<String>) -> SubscribeBuilder<E> {
         chunk_size: 300,
         context: Arc::default(),
         backon: true,
+        enforce_handler: true,
     }
 }
 
@@ -233,8 +235,14 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
         self
     }
 
-    fn backoff(mut self) -> Self {
+    pub fn backoff(mut self) -> Self {
         self.backon = false;
+
+        self
+    }
+
+    fn no_handler_check(mut self) -> Self {
+        self.enforce_handler = false;
 
         self
     }
@@ -394,6 +402,7 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
 
                 let data = (|| async { self.read(&executor).await })
                     .retry(ExponentialBuilder::default())
+                    .when(|_| self.backon)
                     .sleep(tokio::time::sleep)
                     .notify(|err, dur| {
                         tracing::error!("@read '{err}' sleeping='{dur:?}'");
@@ -418,12 +427,17 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
                             item.event.name,
                         );
 
-                        return;
+                        if self.enforce_handler {
+                            return;
+                        }
+
+                        continue;
                     };
 
                     let running = (|| async { self.is_subscriber_running(&executor).await })
                         .retry(ExponentialBuilder::default())
                         .sleep(tokio::time::sleep)
+                        .when(|_| self.backon)
                         .notify(|err, dur| {
                             tracing::error!("@is_subscriber_running '{err}' sleeping='{dur:?}'");
                         })
@@ -444,6 +458,7 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
                     if let Err(e) = (|| async { handler.handle(&item).await })
                         .retry(ExponentialBuilder::default())
                         .sleep(tokio::time::sleep)
+                        .when(|_| self.backon)
                         .notify(|err, dur| {
                             tracing::error!(
                                 "@handle '{}','{}','{}','{err}','{dur:?}'",
@@ -460,6 +475,7 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
 
                     if let Err(err) = (async || item.acknowledge().await)
                         .retry(ExponentialBuilder::default())
+                        .when(|_| self.backon)
                         .sleep(tokio::time::sleep)
                         .notify(|err, dur| {
                             tracing::error!("@acknowledge '{err}' sleeping='{dur:?}'",);
@@ -487,8 +503,23 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
     }
 
     #[cfg(feature = "handler")]
-    pub async fn unsafe_oneshot(self, executor: &E) -> Result<(), SubscribeError> {
+    pub async fn unretry_run(self, executor: &E) -> Result<(), SubscribeError> {
         self.backoff().oneshot(executor).await
+    }
+
+    #[cfg(feature = "handler")]
+    pub async fn unsafe_run(self, executor: &E) -> Result<(), SubscribeError> {
+        self.no_handler_check().oneshot(executor).await
+    }
+
+    #[cfg(feature = "handler")]
+    pub async fn unretry_oneshot(self, executor: &E) -> Result<(), SubscribeError> {
+        self.backoff().oneshot(executor).await
+    }
+
+    #[cfg(feature = "handler")]
+    pub async fn unsafe_oneshot(self, executor: &E) -> Result<(), SubscribeError> {
+        self.no_handler_check().oneshot(executor).await
     }
 
     #[cfg(feature = "handler")]
@@ -615,6 +646,7 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
                     let Ok(r_data) = (|| async { self.read(executor).await })
                         .retry(ExponentialBuilder::default())
                         .sleep(tokio::time::sleep)
+                        .when(|_| self.backon)
                         .notify(|err, dur| {
                             tracing::error!("@read '{err}' sleeping='{dur:?}'");
                         })
