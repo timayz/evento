@@ -564,6 +564,10 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
                         item.event.name,
                     );
 
+                    if !self.enforce_handler {
+                        continue;
+                    }
+
                     return Err(SubscribeError::Unknown(anyhow::anyhow!(
                         "Handler not found"
                     )));
