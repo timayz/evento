@@ -33,6 +33,26 @@ pub struct ReadResult<N> {
     pub page_info: PageInfo,
 }
 
+impl<N> ReadResult<N> {
+    pub fn map<B, F>(self, f: F) -> ReadResult<B>
+    where
+        Self: Sized,
+        F: Fn(N) -> B,
+    {
+        ReadResult {
+            page_info: self.page_info,
+            edges: self
+                .edges
+                .into_iter()
+                .map(|e| Edge {
+                    cursor: e.cursor.to_owned(),
+                    node: f(e.node),
+                })
+                .collect(),
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
 pub struct Value(String);
 
