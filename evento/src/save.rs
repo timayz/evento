@@ -10,11 +10,8 @@ pub enum WriteError {
     #[error("invalid original version")]
     InvalidOriginalVersion,
 
-    #[error("missing data")]
+    #[error("trying to commit event without data")]
     MissingData,
-
-    #[error("missing metadata")]
-    MissingMetadata,
 
     #[error("{0}")]
     Unknown(#[from] anyhow::Error),
@@ -119,9 +116,10 @@ impl<A: Aggregator> SaveBuilder<A> {
             }
         };
 
-        let Some(metadata) = &self.metadata else {
-            return Err(WriteError::MissingMetadata);
-        };
+        let metadata = self.metadata.to_owned().unwrap_or_else(|| {
+            let config = bincode::config::standard();
+            bincode::encode_to_vec(true, config).expect("Should never failed")
+        });
 
         let mut events = vec![];
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;

@@ -398,7 +398,10 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
             );
             loop {
                 if shutdown_rx.try_recv().is_ok() {
-                    tracing::info!("Subscription received shutdown signal, stopping gracefull");
+                    tracing::info!(
+                        key = self.key,
+                        "Subscription received shutdown signal, stopping gracefull"
+                    );
                     break;
                 }
                 interval.tick().await;
@@ -408,14 +411,21 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
                     .when(|_| self.backon)
                     .sleep(tokio::time::sleep)
                     .notify(|err, dur| {
-                        tracing::error!("@read '{err}' sleeping='{dur:?}'");
+                        tracing::error!(
+                            error_message = %err,
+                            duration = ?dur,
+                            "Failed to read events"
+                        );
                     })
                     .await;
 
                 let data = match data {
                     Ok(data) => data,
                     Err(e) => {
-                        tracing::error!("@read {e}");
+                        tracing::error!(
+                            error_message = %e,
+                            "Failed to read events"
+                        );
                         return;
                     }
                 };
@@ -423,16 +433,22 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
                 for item in data {
                     let key = format!("{}-{}", item.event.aggregator_type, item.event.name);
                     let Some(handler) = self.handlers.get(&key) else {
-                        tracing::error!(
-                            "@get_handler '{}','{}','{}','Not handled'",
-                            item.key,
-                            item.event.aggregator_type,
-                            item.event.name,
-                        );
-
                         if self.enforce_handler {
+                            tracing::error!(
+                                key = item.key,
+                                aggregator = item.event.aggregator_type,
+                                event = item.event.name,
+                                "No event handler define",
+                            );
                             return;
                         }
+
+                        tracing::warn!(
+                            key = item.key,
+                            aggregator = item.event.aggregator_type,
+                            event = item.event.name,
+                            "No event handler define",
+                        );
 
                         continue;
                     };
@@ -442,14 +458,21 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
                         .sleep(tokio::time::sleep)
                         .when(|_| self.backon)
                         .notify(|err, dur| {
-                            tracing::error!("@is_subscriber_running '{err}' sleeping='{dur:?}'");
+                            tracing::error!(
+                                error_message = %err,
+                                duration = ?dur,
+                                "Failed to check if subscriber is running"
+                            )
                         })
                         .await;
 
                     let running = match running {
                         Ok(data) => data,
                         Err(e) => {
-                            tracing::error!("@running {e}");
+                            tracing::error!(
+                                error_message = %e,
+                                "Failed to check if subscriber is running"
+                            );
                             return;
                         }
                     };
@@ -464,15 +487,17 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
                         .when(|_| self.backon)
                         .notify(|err, dur| {
                             tracing::error!(
-                                "@handle '{}','{}','{}','{err}','{dur:?}'",
-                                item.key,
-                                item.event.aggregator_type,
-                                item.event.name,
+                                key = item.key,
+                                aggregator = item.event.aggregator_type,
+                                event = item.event.name,
+                                error_message = %err,
+                                duration = ?dur,
+                                "Failed to handle event"
                             );
                         })
                         .await
                     {
-                        tracing::error!("{e:?}");
+                        tracing::error!(error_message = %e, "Failed to handle event");
                         return;
                     }
 
@@ -481,19 +506,19 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
                         .when(|_| self.backon)
                         .sleep(tokio::time::sleep)
                         .notify(|err, dur| {
-                            tracing::error!("@acknowledge '{err}' sleeping='{dur:?}'",);
+                            tracing::error!(error_message = %err, duration = ?dur, "Failed to acknowledge event");
                         })
                         .await
                     {
-                        tracing::error!("@acknowledge '{err}'");
+                        tracing::error!(error_message = %err, "Failed to acknowledge event");
                         break;
                     }
 
                     tracing::info!(
-                        "@handled '{}','{}','{}'",
-                        item.key,
-                        item.event.aggregator_type,
-                        item.event.name,
+                        key = item.key,
+                        aggregator = item.event.aggregator_type,
+                        event = item.event.name,
+                        "Event is handled"
                     );
                 }
             }
@@ -539,7 +564,11 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
                 .sleep(tokio::time::sleep)
                 .when(|_| self.backon)
                 .notify(|err, dur| {
-                    tracing::error!("@read '{err}','{dur:?}'");
+                    tracing::error!(
+                        error_message = %err,
+                        duration = ?dur,
+                        "Failed to read events"
+                    );
                 })
                 .await?;
 
@@ -550,19 +579,20 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
             for item in data {
                 let key = format!("{}-{}", item.event.aggregator_type, item.event.name);
                 let Some(handler) = self.handlers.get(&key) else {
-                    tracing::error!(
-                        "@get_handler '{}','{}','{}','Not handled'",
-                        item.key,
-                        item.event.aggregator_type,
-                        item.event.name,
-                    );
-
                     if !self.enforce_handler {
+                        tracing::warn!(
+                            key = item.key,
+                            aggregator = item.event.aggregator_type,
+                            event = item.event.name,
+                            "No event handler define",
+                        );
                         continue;
                     }
 
                     return Err(SubscribeError::Unknown(anyhow::anyhow!(
-                        "Handler not found"
+                        "No event handler define for {} {}",
+                        item.event.aggregator_type,
+                        item.event.name
                     )));
                 };
 
@@ -571,7 +601,10 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
                     .sleep(tokio::time::sleep)
                     .when(|_| self.backon)
                     .notify(|err, dur| {
-                        tracing::error!("@is_subscriber_running '{err}','{dur:?}'");
+                        tracing::error!(
+                        error_message = %err,
+                        duration = ?dur,
+                        "Failed to check if subscriber running");
                     })
                     .await?;
 
@@ -585,10 +618,12 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
                     .when(|_| self.backon)
                     .notify(|err, dur| {
                         tracing::error!(
-                            "@handle '{}','{}','{}','{err}','{dur:?}'",
-                            item.key,
-                            item.event.aggregator_type,
-                            item.event.name,
+                            key = item.key,
+                            aggregator = item.event.aggregator_type,
+                            event = item.event.name,
+                            error_message = %err,
+                            duration = ?dur,
+                            "Failed to handle event",
                         );
                     })
                     .await?;
@@ -598,15 +633,18 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
                     .sleep(tokio::time::sleep)
                     .when(|_| self.backon)
                     .notify(|err, dur| {
-                        tracing::error!("@acknowledge '{err}','{dur:?}'");
+                        tracing::error!(
+                        error_message = %err,
+                        duration = ?dur,
+                        "Failed to acknowledge event");
                     })
                     .await?;
 
                 tracing::info!(
-                    "@handled '{}','{}','{}'",
-                    item.key,
-                    item.event.aggregator_type,
-                    item.event.name,
+                    key = item.key,
+                    aggregator = item.event.aggregator_type,
+                    event = item.event.name,
+                    "Event is handled"
                 );
             }
         }
@@ -645,7 +683,7 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
                         .sleep(tokio::time::sleep)
                         .when(|_| self.backon)
                         .notify(|err, dur| {
-                            tracing::error!("@read '{err}' sleeping='{dur:?}'");
+                            tracing::error!(error_message = %err, duration = ?dur, "Failed to read events");
                         })
                         .await
                     else {
