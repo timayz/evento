@@ -100,15 +100,22 @@ impl<A: Aggregator> SaveBuilder<A> {
                 self.routing_key.to_owned(),
             ),
             _ => {
-                let aggregator = crate::load::<A, _>(executor, &self.aggregator_id)
+                let aggregator = crate::load_optional::<A, _>(executor, &self.aggregator_id)
                     .await
                     .map_err(|err| WriteError::Unknown(err.into()))?;
 
-                (
-                    aggregator.item,
-                    aggregator.event.version,
-                    aggregator.event.routing_key,
-                )
+                match aggregator {
+                    Some(aggregator) => (
+                        aggregator.item,
+                        aggregator.event.version,
+                        aggregator.event.routing_key,
+                    ),
+                    _ => (
+                        A::default(),
+                        self.original_version,
+                        self.routing_key.to_owned(),
+                    ),
+                }
             }
         };
 
