@@ -241,7 +241,7 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
         self
     }
 
-    fn no_handler_check(mut self) -> Self {
+    pub fn no_handler_check(mut self) -> Self {
         self.enforce_handler = false;
 
         self
