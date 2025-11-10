@@ -3,7 +3,6 @@ use evento::{AggregatorName, Event, EventDetails, Executor, WriteError};
 
 pub async fn load<E: Executor>(executor: &E) -> anyhow::Result<()> {
     let id = evento::create::<Calcul>()
-        .metadata(&true)?
         .data(&Added { value: 13 })?
         .data(&Subtracted { value: 3 })?
         .data(&Multiplied { value: 3 })?

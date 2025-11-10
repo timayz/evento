@@ -6,8 +6,8 @@ use crate::{cursor::Args, Aggregator, Event, Executor};
 
 #[derive(Debug, Error)]
 pub enum ReadError {
-    #[error("not found")]
-    NotFound,
+    #[error("{0} {1} not found")]
+    NotFound(String, String),
 
     #[error("too many events to aggregate")]
     TooManyEvents,
@@ -141,7 +141,7 @@ pub async fn load<A: Aggregator, E: Executor>(
             let event = match (cursor, events.edges.last()) {
                 (_, Some(event)) => event.node.clone(),
                 (Some(cursor), None) => executor.get_event(cursor).await?,
-                _ => return Err(ReadError::NotFound),
+                _ => return Err(ReadError::NotFound(A::name().to_owned(), id)),
             };
 
             return Ok(LoadResult {
@@ -215,7 +215,7 @@ pub async fn load_optional<A: Aggregator, E: Executor>(
 ) -> Result<Option<LoadResult<A>>, ReadError> {
     match load(executor, id).await {
         Ok(loaded) => Ok(Some(loaded)),
-        Err(ReadError::NotFound) => Ok(None),
+        Err(ReadError::NotFound(_, _)) => Ok(None),
         Err(e) => Err(e),
     }
 }
