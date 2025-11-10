@@ -122,6 +122,14 @@ impl Args {
             (self.first.unwrap_or(40), self.after.clone())
         }
     }
+
+    pub fn limit(self, v: u16) -> Self {
+        if self.is_backward() {
+            Args::backward(self.last.unwrap_or(v).min(v), self.before)
+        } else {
+            Args::forward(self.first.unwrap_or(v).min(v), self.after)
+        }
+    }
 }
 
 #[derive(Debug, Error)]
