@@ -160,3 +160,62 @@ pub async fn load<A: Aggregator, E: Executor>(
         }
     }
 }
+
+/// Load an aggregate by replaying its events, returning `None` if not found
+///
+/// This is a convenience wrapper around [`load`] that returns `None` instead of
+/// [`ReadError::NotFound`] when the aggregate doesn't exist. This is useful when
+/// you want to handle missing aggregates as a normal case rather than an error.
+///
+/// # Parameters
+///
+/// - `executor`: The event store executor (database connection)
+/// - `id`: The aggregate ID to load
+///
+/// # Returns
+///
+/// Returns `Ok(Some(LoadResult))` if the aggregate exists, `Ok(None)` if not found,
+/// or an error for other failure cases.
+///
+/// # Errors
+///
+/// - [`ReadError::TooManyEvents`] if there are too many events to process (>10 batches)
+/// - [`ReadError::BincodeDecode`] if event deserialization fails
+/// - [`ReadError::Unknown`] for other database or system errors
+///
+/// Note: Unlike [`load`], this function does NOT return [`ReadError::NotFound`].
+///
+/// # Examples
+///
+/// ```no_run
+/// use evento::load_optional;
+/// # use evento::*;
+/// # use bincode::{Encode, Decode};
+/// # #[derive(Default, Encode, Decode, Clone, Debug)]
+/// # struct User { name: String }
+/// # #[evento::aggregator]
+/// # impl User {}
+///
+/// async fn get_user_if_exists(executor: &evento::Sqlite, user_id: &str) -> anyhow::Result<Option<User>> {
+///     match load_optional::<User, _>(executor, user_id).await? {
+///         Some(result) => {
+///             println!("Found user at version {}", result.event.version);
+///             Ok(Some(result.item))
+///         }
+///         None => {
+///             println!("User not found");
+///             Ok(None)
+///         }
+///     }
+/// }
+/// ```
+pub async fn load_optional<A: Aggregator, E: Executor>(
+    executor: &E,
+    id: impl Into<String>,
+) -> Result<Option<LoadResult<A>>, ReadError> {
+    match load(executor, id).await {
+        Ok(loaded) => Ok(Some(loaded)),
+        Err(ReadError::NotFound) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
