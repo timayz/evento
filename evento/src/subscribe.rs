@@ -381,7 +381,10 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
 
         let task_handle = tokio::spawn(async move {
-            let mut interval = interval_at(start, Duration::from_millis(300));
+            let mut interval = interval_at(
+                start - Duration::from_millis(400),
+                Duration::from_millis(300),
+            );
             loop {
                 if shutdown_rx.try_recv().is_ok() {
                     tracing::info!("Subscription received shutdown signal, stopping gracefull");
@@ -500,7 +503,10 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
 
         let executor = executor.clone();
 
-        let mut interval = interval_at(Instant::now(), Duration::from_millis(300));
+        let mut interval = interval_at(
+            Instant::now() - Duration::from_millis(400),
+            Duration::from_millis(300),
+        );
         loop {
             interval.tick().await;
 
@@ -594,7 +600,10 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
                     .map(|d| Instant::now() + d)
                     .unwrap_or_else(Instant::now);
 
-                let mut interval = interval_at(start, Duration::from_millis(300));
+                let mut interval = interval_at(
+                    start - Duration::from_millis(400),
+                    Duration::from_millis(300),
+                );
 
                 loop {
                     if let Some(item) = data.next() {

@@ -39,13 +39,16 @@ outdated:
 	cargo outdated
 
 dev:
-	$(MAKE) _dev -j2
+	cargo watch -x "run -p todos"
 
-_dev: serve.shop serve.market
-
-serve.shop:
-	cargo watch -x 'run -p shop'
-
-serve.market:
-	cargo watch -x 'run -p market'
+# dev:
+# 	$(MAKE) _dev -j2
+#
+# _dev: serve.shop serve.market
+#
+# serve.shop:
+# 	cargo watch -x 'run -p shop'
+#
+# serve.market:
+# 	cargo watch -x 'run -p market'
 
