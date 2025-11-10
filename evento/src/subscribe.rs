@@ -146,6 +146,7 @@ pub struct SubscribeBuilder<E: Executor> {
     aggregator_types: HashSet<String>,
     chunk_size: u16,
     backon: bool,
+    #[cfg(feature = "handler")]
     enforce_handler: bool,
     context: Arc<Mutex<context::Context>>,
 }
@@ -199,6 +200,7 @@ pub fn subscribe<E: Executor>(key: impl Into<String>) -> SubscribeBuilder<E> {
         chunk_size: 300,
         context: Arc::default(),
         backon: true,
+        #[cfg(feature = "handler")]
         enforce_handler: true,
     }
 }
@@ -235,13 +237,14 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
         self
     }
 
-    pub fn backoff(mut self) -> Self {
+    fn backoff(mut self) -> Self {
         self.backon = false;
 
         self
     }
 
-    fn no_handler_check(mut self) -> Self {
+    #[cfg(feature = "handler")]
+    pub fn handler_check_off(mut self) -> Self {
         self.enforce_handler = false;
 
         self
