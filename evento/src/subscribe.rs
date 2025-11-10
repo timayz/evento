@@ -531,12 +531,18 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
     }
 
     #[cfg(feature = "handler")]
-    pub async fn unretry_run(self, executor: &E) -> Result<(), SubscribeError> {
-        self.backoff().oneshot(executor).await
+    pub async fn unretry_run(self, executor: &E) -> Result<SubscriptionHandle, SubscribeError> {
+        self.backoff().run(executor).await
     }
 
     #[cfg(feature = "handler")]
     pub async fn unretry_oneshot(self, executor: &E) -> Result<(), SubscribeError> {
+        self.backoff().oneshot(executor).await
+    }
+
+    #[cfg(feature = "handler")]
+    #[deprecated(since = "1.7.0", note = "use unretry_oneshot instead")]
+    pub async fn unsafe_oneshot(self, executor: &E) -> Result<(), SubscribeError> {
         self.backoff().oneshot(executor).await
     }
 
