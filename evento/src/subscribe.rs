@@ -368,13 +368,16 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
         Ok(res
             .edges
             .iter()
-            .map(|edge| Context {
-                inner: self.context.clone(),
-                key: self.key.to_owned(),
-                executor,
-                lag: (timestamp - edge.node.timestamp),
-                cursor: edge.cursor.to_owned(),
-                event: edge.node.clone(),
+            .map(|edge| {
+                println!("{} {}", timestamp, edge.node.timestamp);
+                Context {
+                    inner: self.context.clone(),
+                    key: self.key.to_owned(),
+                    executor,
+                    lag: (timestamp - edge.node.timestamp),
+                    cursor: edge.cursor.to_owned(),
+                    event: edge.node.clone(),
+                }
             })
             .collect())
     }
