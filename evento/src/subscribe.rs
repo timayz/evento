@@ -431,28 +431,6 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
                 };
 
                 for item in data {
-                    let key = format!("{}-{}", item.event.aggregator_type, item.event.name);
-                    let Some(handler) = self.handlers.get(&key) else {
-                        if self.enforce_handler {
-                            tracing::error!(
-                                key = item.key,
-                                aggregator = item.event.aggregator_type,
-                                event = item.event.name,
-                                "No event handler define",
-                            );
-                            return;
-                        }
-
-                        tracing::warn!(
-                            key = item.key,
-                            aggregator = item.event.aggregator_type,
-                            event = item.event.name,
-                            "No event handler define",
-                        );
-
-                        continue;
-                    };
-
                     let running = (|| async { self.is_subscriber_running(&executor).await })
                         .retry(ExponentialBuilder::default())
                         .sleep(tokio::time::sleep)
@@ -481,25 +459,49 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
                         break;
                     }
 
-                    if let Err(e) = (|| async { handler.handle(&item).await })
-                        .retry(ExponentialBuilder::default())
-                        .sleep(tokio::time::sleep)
-                        .when(|_| self.backon)
-                        .notify(|err, dur| {
-                            tracing::error!(
+                    let key = format!("{}-{}", item.event.aggregator_type, item.event.name);
+
+                    match self.handlers.get(&key) {
+                        Some(handler) => {
+                            if let Err(e) = (|| async { handler.handle(&item).await })
+                                .retry(ExponentialBuilder::default())
+                                .sleep(tokio::time::sleep)
+                                .when(|_| self.backon)
+                                .notify(|err, dur| {
+                                    tracing::error!(
+                                        key = item.key,
+                                        aggregator = item.event.aggregator_type,
+                                        event = item.event.name,
+                                        error_message = %err,
+                                        duration = ?dur,
+                                        "Failed to handle event"
+                                    );
+                                })
+                                .await
+                            {
+                                tracing::error!(error_message = %e, "Failed to handle event");
+                                return;
+                            }
+                        }
+                        _ => {
+                            if self.enforce_handler {
+                                tracing::error!(
+                                    key = item.key,
+                                    aggregator = item.event.aggregator_type,
+                                    event = item.event.name,
+                                    "No event handler define, stop subscriber",
+                                );
+                                return;
+                            }
+
+                            tracing::debug!(
                                 key = item.key,
                                 aggregator = item.event.aggregator_type,
                                 event = item.event.name,
-                                error_message = %err,
-                                duration = ?dur,
-                                "Failed to handle event"
+                                "No event handler define",
                             );
-                        })
-                        .await
-                    {
-                        tracing::error!(error_message = %e, "Failed to handle event");
-                        return;
-                    }
+                        }
+                    };
 
                     if let Err(err) = (async || item.acknowledge().await)
                         .retry(ExponentialBuilder::default())
@@ -583,25 +585,6 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
             }
 
             for item in data {
-                let key = format!("{}-{}", item.event.aggregator_type, item.event.name);
-                let Some(handler) = self.handlers.get(&key) else {
-                    if !self.enforce_handler {
-                        tracing::warn!(
-                            key = item.key,
-                            aggregator = item.event.aggregator_type,
-                            event = item.event.name,
-                            "No event handler define",
-                        );
-                        continue;
-                    }
-
-                    return Err(SubscribeError::Unknown(anyhow::anyhow!(
-                        "No event handler define for {} {}",
-                        item.event.aggregator_type,
-                        item.event.name
-                    )));
-                };
-
                 let running = (|| async { self.is_subscriber_running(&executor).await })
                     .retry(ExponentialBuilder::default())
                     .sleep(tokio::time::sleep)
@@ -618,21 +601,43 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
                     break;
                 }
 
-                (|| async { handler.handle(&item).await })
-                    .retry(ExponentialBuilder::default())
-                    .sleep(tokio::time::sleep)
-                    .when(|_| self.backon)
-                    .notify(|err, dur| {
-                        tracing::error!(
+                let key = format!("{}-{}", item.event.aggregator_type, item.event.name);
+
+                match self.handlers.get(&key) {
+                    Some(handler) => {
+                        (|| async { handler.handle(&item).await })
+                            .retry(ExponentialBuilder::default())
+                            .sleep(tokio::time::sleep)
+                            .when(|_| self.backon)
+                            .notify(|err, dur| {
+                                tracing::error!(
+                                    key = item.key,
+                                    aggregator = item.event.aggregator_type,
+                                    event = item.event.name,
+                                    error_message = %err,
+                                    duration = ?dur,
+                                    "Failed to handle event",
+                                );
+                            })
+                            .await?;
+                    }
+                    _ => {
+                        if self.enforce_handler {
+                            return Err(SubscribeError::Unknown(anyhow::anyhow!(
+                                "No event handler define for {} {}",
+                                item.event.aggregator_type,
+                                item.event.name
+                            )));
+                        }
+
+                        tracing::debug!(
                             key = item.key,
                             aggregator = item.event.aggregator_type,
                             event = item.event.name,
-                            error_message = %err,
-                            duration = ?dur,
-                            "Failed to handle event",
+                            "No event handler define",
                         );
-                    })
-                    .await?;
+                    }
+                };
 
                 (async || item.acknowledge().await)
                     .retry(ExponentialBuilder::default())
