@@ -103,7 +103,7 @@ pub struct Context<'a, E: Executor> {
     inner: Arc<Mutex<context::Context>>,
     key: String,
     cursor: Value,
-    lag: u32,
+    lag: u64,
     pub event: Event,
     pub executor: &'a E,
 }
@@ -372,7 +372,7 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
                 inner: self.context.clone(),
                 key: self.key.to_owned(),
                 executor,
-                lag: (timestamp - edge.node.timestamp) as u32,
+                lag: (timestamp - edge.node.timestamp),
                 cursor: edge.cursor.to_owned(),
                 event: edge.node.clone(),
             })

@@ -385,7 +385,7 @@ where
         &self,
         key: String,
         cursor: Value,
-        lag: u32,
+        lag: u64,
     ) -> Result<(), AcknowledgeError> {
         let statement = Query::update()
             .table(Subscriber::Table)
@@ -643,8 +643,8 @@ impl Bind for crate::Event {
 
     fn columns() -> Self::I {
         [
-            Event::TimestampSubsec,
             Event::Timestamp,
+            Event::TimestampSubsec,
             Event::Version,
             Event::Id,
         ]
@@ -652,8 +652,8 @@ impl Bind for crate::Event {
 
     fn values(cursor: <<Self as Bind>::Cursor as Cursor>::T) -> Self::V {
         [
-            cursor.s.into(),
             cursor.t.into(),
+            cursor.s.into(),
             cursor.v.into(),
             cursor.i.to_string().into(),
         ]
