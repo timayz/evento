@@ -637,13 +637,13 @@ pub trait Bind {
 
 impl Bind for crate::Event {
     type T = Event;
-    type I = [Self::T; 4];
-    type V = [Expr; 4];
+    type I = [Self::T; 3];
+    type V = [Expr; 3];
     type Cursor = Self;
 
     fn columns() -> Self::I {
         [
-            Event::TimestampSubsec,
+            // Event::TimestampSubsec,
             Event::Timestamp,
             Event::Version,
             Event::Id,
@@ -652,7 +652,7 @@ impl Bind for crate::Event {
 
     fn values(cursor: <<Self as Bind>::Cursor as Cursor>::T) -> Self::V {
         [
-            cursor.s.into(),
+            // cursor.s.into(),
             cursor.t.into(),
             cursor.v.into(),
             cursor.i.to_string().into(),
