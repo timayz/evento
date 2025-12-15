@@ -61,11 +61,20 @@ pub enum Subscriber {
 #[cfg(feature = "mysql")]
 pub type MySql = Sql<sqlx::MySql>;
 
+#[cfg(all(feature = "mysql", feature = "rw"))]
+pub type RwMySql = crate::Rw<MySql, MySql>;
+
 #[cfg(feature = "postgres")]
 pub type Postgres = Sql<sqlx::Postgres>;
 
+#[cfg(all(feature = "postgres", feature = "rw"))]
+pub type RwPostgres = crate::Rw<Postgres, Postgres>;
+
 #[cfg(feature = "sqlite")]
 pub type Sqlite = Sql<sqlx::Sqlite>;
+
+#[cfg(all(feature = "sqlite", feature = "rw"))]
+pub type RwSqlite = crate::Rw<Sqlite, Sqlite>;
 
 pub struct Sql<DB: Database>(Pool<DB>);
 
