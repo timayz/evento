@@ -99,6 +99,7 @@ pub mod context;
 pub mod cursor;
 mod executor;
 mod load;
+pub mod metadata;
 mod save;
 mod subscribe;
 
