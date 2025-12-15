@@ -189,6 +189,20 @@ impl From<&crate::Postgres> for Evento {
     }
 }
 
+#[cfg(feature = "rw")]
+impl<R: Executor + Clone, W: Executor + Clone> From<crate::Rw<R, W>> for Evento {
+    fn from(value: crate::Rw<R, W>) -> Self {
+        Self(Arc::new(Box::new(value)))
+    }
+}
+
+#[cfg(feature = "rw")]
+impl<R: Executor + Clone, W: Executor + Clone> From<&crate::Rw<R, W>> for Evento {
+    fn from(value: &crate::Rw<R, W>) -> Self {
+        Self(Arc::new(Box::new(value.clone())))
+    }
+}
+
 #[cfg(feature = "group")]
 #[derive(Clone, Default)]
 pub struct EventoGroup {
@@ -341,5 +355,100 @@ impl Executor for EventoGroup {
         lag: u64,
     ) -> Result<(), AcknowledgeError> {
         self.first().acknowledge(key, cursor, lag).await
+    }
+}
+
+#[cfg(feature = "rw")]
+pub struct Rw<R: Executor, W: Executor> {
+    r: R,
+    w: W,
+}
+
+#[cfg(feature = "rw")]
+impl<R: Executor + Clone, W: Executor + Clone> Clone for Rw<R, W> {
+    fn clone(&self) -> Self {
+        Self {
+            r: self.r.clone(),
+            w: self.w.clone(),
+        }
+    }
+}
+
+#[cfg(feature = "rw")]
+#[async_trait::async_trait]
+impl<R: Executor, W: Executor> Executor for Rw<R, W> {
+    async fn write(&self, events: Vec<Event>) -> Result<(), WriteError> {
+        self.w.write(events).await
+    }
+
+    async fn get_event(&self, cursor: Value) -> Result<Event, ReadError> {
+        self.r.get_event(cursor).await
+    }
+
+    async fn read_by_aggregator(
+        &self,
+        aggregator_type: String,
+        id: String,
+        args: Args,
+    ) -> Result<ReadResult<Event>, ReadError> {
+        self.r.read_by_aggregator(aggregator_type, id, args).await
+    }
+
+    async fn read(
+        &self,
+        aggregator_types: HashSet<String>,
+        routing_key: RoutingKey,
+        args: Args,
+    ) -> Result<ReadResult<Event>, ReadError> {
+        self.r.read(aggregator_types, routing_key, args).await
+    }
+
+    async fn get_subscriber_cursor(&self, key: String) -> Result<Option<Value>, SubscribeError> {
+        self.r.get_subscriber_cursor(key).await
+    }
+
+    async fn is_subscriber_running(
+        &self,
+        key: String,
+        worker_id: Ulid,
+    ) -> Result<bool, SubscribeError> {
+        self.r.is_subscriber_running(key, worker_id).await
+    }
+
+    async fn upsert_subscriber(&self, key: String, worker_id: Ulid) -> Result<(), SubscribeError> {
+        self.w.upsert_subscriber(key, worker_id).await
+    }
+
+    async fn get_snapshot(
+        &self,
+        aggregator_type: String,
+        aggregator_revision: String,
+        id: String,
+    ) -> Result<Option<(Vec<u8>, Value)>, ReadError> {
+        self.r
+            .get_snapshot(aggregator_type, aggregator_revision, id)
+            .await
+    }
+
+    async fn save_snapshot(
+        &self,
+        aggregator_type: String,
+        aggregator_revision: String,
+        id: String,
+        data: Vec<u8>,
+        cursor: Value,
+    ) -> Result<(), WriteError> {
+        self.w
+            .save_snapshot(aggregator_type, aggregator_revision, id, data, cursor)
+            .await
+    }
+
+    async fn acknowledge(
+        &self,
+        key: String,
+        cursor: Value,
+        lag: u64,
+    ) -> Result<(), AcknowledgeError> {
+        self.w.acknowledge(key, cursor, lag).await
     }
 }
