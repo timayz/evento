@@ -106,6 +106,8 @@ mod subscribe;
 pub mod sql;
 #[cfg(any(feature = "sqlite", feature = "mysql", feature = "postgres"))]
 pub mod sql_migrator;
+#[cfg(any(feature = "sqlite", feature = "mysql", feature = "postgres"))]
+pub mod sql_types;
 
 #[cfg(feature = "macro")]
 pub use evento_macro::*;
