@@ -543,18 +543,6 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
     }
 
     #[cfg(feature = "handler")]
-    #[deprecated(since = "1.7.0", note = "use unretry_oneshot instead")]
-    pub async fn unsafe_oneshot(self, executor: &E) -> Result<(), SubscribeError> {
-        self.backoff().oneshot(executor).await
-    }
-
-    #[cfg(feature = "handler")]
-    #[deprecated(since = "1.4.0", note = "use oneshot instead")]
-    pub async fn run_once(self, executor: &E) -> Result<(), SubscribeError> {
-        self.oneshot(executor).await
-    }
-
-    #[cfg(feature = "handler")]
     pub async fn oneshot(self, executor: &E) -> Result<(), SubscribeError> {
         self.init(executor).await?;
 
