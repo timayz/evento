@@ -1,0 +1,92 @@
+enum User {
+    Registered {
+        email: String,
+        password_hash: String,
+    },
+    LoggedIn {
+        lang: String,
+    },
+}
+
+trait AggregatorEvent {
+    fn aggregate_type() -> &'static str;
+    fn event_name() -> &'static str;
+}
+
+// macro generate
+//
+// #[derive(bincode::Encode, bincode::Decode)]
+// pub struct UserRegistered {
+//  pub email: String,
+//  pub password_hash: String,
+// }
+//
+// impl AggregatorEvent for UserRegistered {
+//  fn aggregate_type() => &'static str {
+//      "crate_name/User"
+//  }
+//
+//  fn event_name() => &'static str {
+//      "Registered"
+//  }
+// }
+//
+// for each enum field...
+//
+
+trait Handler: AggregatorEvent {}
+
+struct Context;
+struct Event<T>(T);
+struct UserRegistered;
+
+fn handle_registered(_ctx: Context, _event: Event<UserRegistered>) -> Result<(), ()> {
+    todo!()
+}
+
+// macro generate
+//
+// fn handle_registered() -> impl Handler {
+//  EventoHanslerHandleRegistered
+// }
+//
+// fn evento_handler_handle_registered(_ctx: &Context, _event: Event<UserRegistered>) -> anyhow::Result<()> {
+//     todo!()
+// }
+//
+// struct EventoHanslerHandleRegistered;
+//
+// impl Handler for EventoHanslerHandleRegistered {
+//  type Event = UserRegistered;
+//
+//  fn handle(ctx: &Context, event: Event<Self::Event>) -> anyhow::Result<()> {
+//      evento_handler_handle_registered(ctx, event)
+//  }
+// }
+//
+// impl AggregatorEvent for EventoHanslerHandleRegistered {
+//  fn aggregate_type() => &'static str {
+//      UserRegistered::aggregate_type()
+//  }
+//
+//  fn event_name() => &'static str {
+//      UserRegistered::event_name()
+//  }
+// }
+//
+// aggregate: load from subscribe snapshot + apply new event if exist. subscribe snapshot update
+// snapshot in database. allow load with multiple Aggregator
+//
+// allow subscribe with aggregate_id
+// try to use same method (stream?) for load/subscribe
+// remove snapshot write from save
+// allow to save_with in LoadResult
+// struct to easy set app key (us-east-1,...) for all evento::save/subscribe ?
+// split evento into multi create like evento-core, evento-sqlx, evento-cursor ... ?
+// create multi examples like bank (buisness logic), axum-htmx-sse
+// projection (load + new event, subscribe for update in backgroung) ?
+// is Boxed data/metadata works for evento::save ?
+
+fn main() {
+    todo!();
+}
