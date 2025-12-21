@@ -1,91 +1,74 @@
+#[derive(Aggregator)]
 enum User {
     Registered {
         email: String,
         password_hash: String,
     },
-    LoggedIn {
-        lang: String,
+    Deleted {
+        reason: Option<String>,
+    },
+    UsernameChanged {
+      value: String,
+    }
+}
+
+#[derive(Aggregator)]
+enum Recipe {
+    Created {
+        name: String,
     },
 }
 
-trait AggregatorEvent {
-    fn aggregate_type() -> &'static str;
-    fn event_name() -> &'static str;
+#[evento::handler]
+fn handle(ctx: Context, event: Event<RecipeCreated>, row: Option<&mut RecipeRow>) -> anyhow::Result<()> {
+    if let Some(row) = row {
+      row.name = event.data.name;
+    } else {
+      // save in storage
+    }
+
+    Ok(())
 }
 
-// macro generate
-//
-// #[derive(bincode::Encode, bincode::Decode)]
-// pub struct UserRegistered {
-//  pub email: String,
-//  pub password_hash: String,
-// }
-//
-// impl AggregatorEvent for UserRegistered {
-//  fn aggregate_type() => &'static str {
-//      "crate_name/User"
-//  }
-//
-//  fn event_name() => &'static str {
-//      "Registered"
-//  }
-// }
-//
-// for each enum field...
-//
+#[evento::handler]
+fn handle(ctx: Context, event: Event<UserUsernameChanged>, row: Option<&mut RecipeRow>) -> anyhow::Result<()> {
+    if let Some(row) = row {
+      row.owner_name = event.data.value;
+    } else {
+      // save data in storage
+    }
 
-trait Handler: AggregatorEvent {}
-
-struct Context;
-struct Event<T>(T);
-struct UserRegistered;
-
-fn handle_registered(_ctx: Context, _event: Event<UserRegistered>) -> Result<(), ()> {
-    todo!()
+    Ok(())
 }
 
-// macro generate
-//
-// fn handle_registered() -> impl Handler {
-//  EventoHanslerHandleRegistered
-// }
-//
-// fn evento_handler_handle_registered(_ctx: &Context, _event: Event<UserRegistered>) -> anyhow::Result<()> {
-//     todo!()
-// }
-//
-// struct EventoHanslerHandleRegistered;
-//
-// impl Handler for EventoHanslerHandleRegistered {
-//  type Event = UserRegistered;
-//
-//  fn handle(ctx: &Context, event: Event<Self::Event>) -> anyhow::Result<()> {
-//      evento_handler_handle_registered(ctx, event)
-//  }
-// }
-//
-// impl AggregatorEvent for EventoHanslerHandleRegistered {
-//  fn aggregate_type() => &'static str {
-//      UserRegistered::aggregate_type()
-//  }
-//
-//  fn event_name() => &'static str {
-//      UserRegistered::event_name()
-//  }
-// }
-//
-// aggregate: load from subscribe snapshot + apply new event if exist. subscribe snapshot update
-// snapshot in database. allow load with multiple Aggregator
+#[evento::handler]
+fn handle(ctx: Context, event: Event<UserDeleted>, row: Option<&mut RecipeRow>) -> anyhow::Result<()> {
+    if let Some(row) = row {
+      row.deleted = true;
+    } else {
+      // delete data in storage
+    }
+
+    Ok(())
+}
+
+let projection = Projection::new("recipe")
+                    .handler(user_registered_handler())
+                    .handler(user_logged_in_handler())
+                    .to_owned();
+
+let row = projection.load::<Recipe, RecipeRow>("my-recipe-id")
+                .aggregator::<User>("my-id")
+                .execute();
+
+let sub = projection.subscribe().run()
+
 //
 // allow subscribe with aggregate_id
 // try to use same method (stream?) for load/subscribe
 // allow to save_with in LoadResult
 // struct to easy set app key (us-east-1,...) for all evento::save/subscribe ?
-// split evento into multi create like evento-core, evento-sqlx, evento-cursor ... ?
+// split evento into multi create like evento-core, evento-sqlx, evento-macro, evento. workspace deps
 // create multi examples like bank (buisness logic), axum-htmx-sse
-// projection (load + new event, subscribe for update in backgroung) ?
-// is Boxed data/metadata works for evento::save ?
+// projection (load + new event, subscribe for update in backgroung), create projection (add handler etc...) then allow to load or subscribe, optional load with AggregateId 
 
-fn main() {
-    todo!();
-}
