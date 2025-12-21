@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::{cursor::Cursor, Aggregator, AggregatorName, Event, Executor, LoadResult};
+use crate::{cursor::Args, Aggregator, AggregatorName, Event, Executor, LoadResult};
 
 #[derive(Debug, Error)]
 pub enum WriteError {
@@ -23,10 +23,9 @@ pub enum WriteError {
     SystemTime(#[from] std::time::SystemTimeError),
 }
 
-pub struct SaveBuilder<A: Aggregator> {
+pub struct SaveBuilder {
     aggregator_id: String,
     aggregator_type: String,
-    aggregator: Option<A>,
     routing_key: Option<String>,
     routing_key_locked: bool,
     original_version: i32,
@@ -34,11 +33,10 @@ pub struct SaveBuilder<A: Aggregator> {
     metadata: Option<Vec<u8>>,
 }
 
-impl<A: Aggregator> SaveBuilder<A> {
-    pub fn new(aggregator: Option<A>, aggregator_id: impl Into<String>) -> SaveBuilder<A> {
+impl SaveBuilder {
+    pub fn new<A: Aggregator>(aggregator_id: impl Into<String>) -> SaveBuilder {
         SaveBuilder {
             aggregator_id: aggregator_id.into(),
-            aggregator,
             aggregator_type: A::name().to_owned(),
             routing_key: None,
             routing_key_locked: false,
@@ -90,30 +88,22 @@ impl<A: Aggregator> SaveBuilder<A> {
     }
 
     pub async fn commit<E: Executor>(&self, executor: &E) -> Result<String, WriteError> {
-        let (mut aggregator, mut version, routing_key) = match &self.aggregator {
-            Some(aggregator) => (
-                aggregator.clone(),
-                self.original_version,
-                self.routing_key.to_owned(),
-            ),
-            _ => {
-                let aggregator = crate::load_optional::<A, _>(executor, &self.aggregator_id)
-                    .await
-                    .map_err(|err| WriteError::Unknown(err.into()))?;
+        let (mut version, routing_key) = if self.original_version == 0 {
+            let events = executor
+                .read_by_aggregator(
+                    self.aggregator_type.to_owned(),
+                    self.aggregator_id.to_owned(),
+                    Args::backward(1, None),
+                )
+                .await
+                .map_err(|e| WriteError::Unknown(e.into()))?;
 
-                match aggregator {
-                    Some(aggregator) => (
-                        aggregator.item,
-                        aggregator.event.version,
-                        aggregator.event.routing_key,
-                    ),
-                    _ => (
-                        A::default(),
-                        self.original_version,
-                        self.routing_key.to_owned(),
-                    ),
-                }
+            match events.edges.first() {
+                Some(event) => (event.node.version, event.node.routing_key.to_owned()),
+                _ => (self.original_version, self.routing_key.to_owned()),
             }
+        } else {
+            (self.original_version, self.routing_key.to_owned())
         };
 
         let metadata = self.metadata.to_owned().unwrap_or_else(|| {
@@ -140,29 +130,14 @@ impl<A: Aggregator> SaveBuilder<A> {
                 routing_key: routing_key.to_owned(),
             };
 
-            aggregator.aggregate(&event).await?;
             events.push(event);
         }
 
-        let Some(last_event) = events.last().cloned() else {
+        if events.is_empty() {
             return Err(WriteError::MissingData);
-        };
+        }
 
         executor.write(events).await?;
-
-        let config = bincode::config::standard();
-        let data = bincode::encode_to_vec(&aggregator, config)?;
-        let cursor = last_event.serialize_cursor()?;
-
-        executor
-            .save_snapshot(
-                A::name().to_owned(),
-                A::revision().to_owned(),
-                last_event.aggregator_id,
-                data,
-                cursor,
-            )
-            .await?;
 
         Ok(self.aggregator_id.to_owned())
     }
@@ -199,8 +174,8 @@ impl<A: Aggregator> SaveBuilder<A> {
 ///     Ok(user_id)
 /// }
 /// ```
-pub fn create<A: Aggregator>() -> SaveBuilder<A> {
-    SaveBuilder::new(Some(A::default()), Ulid::new())
+pub fn create<A: Aggregator>() -> SaveBuilder {
+    SaveBuilder::new::<A>(Ulid::new())
 }
 
 /// Create a new aggregate with a specific ID
@@ -241,8 +216,8 @@ pub fn create<A: Aggregator>() -> SaveBuilder<A> {
 ///     Ok(user_id)
 /// }
 /// ```
-pub fn create_with<A: Aggregator>(id: impl Into<String>) -> SaveBuilder<A> {
-    SaveBuilder::new(Some(A::default()), id)
+pub fn create_with<A: Aggregator>(id: impl Into<String>) -> SaveBuilder {
+    SaveBuilder::new::<A>(id)
 }
 
 /// Add events to an existing aggregate
@@ -284,8 +259,8 @@ pub fn create_with<A: Aggregator>(id: impl Into<String>) -> SaveBuilder<A> {
 ///     Ok(result_id)
 /// }
 /// ```
-pub fn save<A: Aggregator>(id: impl Into<String>) -> SaveBuilder<A> {
-    SaveBuilder::new(None, id)
+pub fn save<A: Aggregator>(id: impl Into<String>) -> SaveBuilder {
+    SaveBuilder::new::<A>(id)
 }
 
 /// Save events to an aggregate using a loaded aggregate state
@@ -333,8 +308,8 @@ pub fn save<A: Aggregator>(id: impl Into<String>) -> SaveBuilder<A> {
 ///     Ok(result_id)
 /// }
 /// ```
-pub fn save_with<A: Aggregator>(aggregator: LoadResult<A>) -> SaveBuilder<A> {
-    SaveBuilder::new(Some(aggregator.item), aggregator.event.aggregator_id)
+pub fn save_with<A: Aggregator>(aggregator: LoadResult<A>) -> SaveBuilder {
+    SaveBuilder::new::<A>(aggregator.event.aggregator_id)
         .original_version(aggregator.event.version as u16)
         .routing_key_opt(aggregator.event.routing_key)
 }

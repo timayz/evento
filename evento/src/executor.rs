@@ -37,22 +37,6 @@ pub trait Executor: Send + Sync + 'static {
 
     async fn upsert_subscriber(&self, key: String, worker_id: Ulid) -> Result<(), SubscribeError>;
 
-    async fn get_snapshot(
-        &self,
-        aggregator_type: String,
-        aggregator_revision: String,
-        id: String,
-    ) -> Result<Option<(Vec<u8>, Value)>, ReadError>;
-
-    async fn save_snapshot(
-        &self,
-        aggregator_type: String,
-        aggregator_revision: String,
-        id: String,
-        data: Vec<u8>,
-        cursor: Value,
-    ) -> Result<(), WriteError>;
-
     async fn acknowledge(
         &self,
         key: String,
@@ -111,30 +95,6 @@ impl Executor for Evento {
 
     async fn upsert_subscriber(&self, key: String, worker_id: Ulid) -> Result<(), SubscribeError> {
         self.0.upsert_subscriber(key, worker_id).await
-    }
-
-    async fn get_snapshot(
-        &self,
-        aggregator_type: String,
-        aggregator_revision: String,
-        id: String,
-    ) -> Result<Option<(Vec<u8>, Value)>, ReadError> {
-        self.0
-            .get_snapshot(aggregator_type, aggregator_revision, id)
-            .await
-    }
-
-    async fn save_snapshot(
-        &self,
-        aggregator_type: String,
-        aggregator_revision: String,
-        id: String,
-        data: Vec<u8>,
-        cursor: Value,
-    ) -> Result<(), WriteError> {
-        self.0
-            .save_snapshot(aggregator_type, aggregator_revision, id, data, cursor)
-            .await
     }
 
     async fn acknowledge(
@@ -324,30 +284,6 @@ impl Executor for EventoGroup {
         self.first().upsert_subscriber(key, worker_id).await
     }
 
-    async fn get_snapshot(
-        &self,
-        aggregator_type: String,
-        aggregator_revision: String,
-        id: String,
-    ) -> Result<Option<(Vec<u8>, Value)>, ReadError> {
-        self.first()
-            .get_snapshot(aggregator_type, aggregator_revision, id)
-            .await
-    }
-
-    async fn save_snapshot(
-        &self,
-        aggregator_type: String,
-        aggregator_revision: String,
-        id: String,
-        data: Vec<u8>,
-        cursor: Value,
-    ) -> Result<(), WriteError> {
-        self.first()
-            .save_snapshot(aggregator_type, aggregator_revision, id, data, cursor)
-            .await
-    }
-
     async fn acknowledge(
         &self,
         key: String,
@@ -417,30 +353,6 @@ impl<R: Executor, W: Executor> Executor for Rw<R, W> {
 
     async fn upsert_subscriber(&self, key: String, worker_id: Ulid) -> Result<(), SubscribeError> {
         self.w.upsert_subscriber(key, worker_id).await
-    }
-
-    async fn get_snapshot(
-        &self,
-        aggregator_type: String,
-        aggregator_revision: String,
-        id: String,
-    ) -> Result<Option<(Vec<u8>, Value)>, ReadError> {
-        self.r
-            .get_snapshot(aggregator_type, aggregator_revision, id)
-            .await
-    }
-
-    async fn save_snapshot(
-        &self,
-        aggregator_type: String,
-        aggregator_revision: String,
-        id: String,
-        data: Vec<u8>,
-        cursor: Value,
-    ) -> Result<(), WriteError> {
-        self.w
-            .save_snapshot(aggregator_type, aggregator_revision, id, data, cursor)
-            .await
     }
 
     async fn acknowledge(

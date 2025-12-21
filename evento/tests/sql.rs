@@ -665,7 +665,7 @@ async fn create_rw_sqlite_executor(
     let executor: evento::Rw<evento::Sqlite, evento::Sqlite> =
         create_rw_sqlite_pool(key).await?.into();
 
-    Ok(executor.into())
+    Ok(executor)
 }
 
 async fn create_sqlite_executor(key: impl Into<String>) -> anyhow::Result<evento::Evento> {

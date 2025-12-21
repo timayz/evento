@@ -90,21 +90,8 @@ pub async fn load<A: Aggregator, E: Executor>(
     id: impl Into<String>,
 ) -> Result<LoadResult<A>, ReadError> {
     let id = id.into();
-    let (mut aggregator, mut cursor) = match executor
-        .get_snapshot(
-            A::name().to_owned(),
-            A::revision().to_owned(),
-            id.to_owned(),
-        )
-        .await?
-    {
-        Some((data, cursor)) => {
-            let config = bincode::config::standard();
-            let (aggregator, _): (A, _) = bincode::decode_from_slice(&data[..], config)?;
-            (aggregator, Some(cursor))
-        }
-        _ => (A::default(), None),
-    };
+    let mut aggregator = A::default();
+    let mut cursor = None;
 
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     let mut loop_count = 0;
@@ -120,21 +107,6 @@ pub async fn load<A: Aggregator, E: Executor>(
 
         for event in events.edges.iter() {
             aggregator.aggregate(&event.node).await?;
-        }
-
-        if let (Some(event), Some(cursor)) = (events.edges.last().cloned(), cursor.clone()) {
-            let config = bincode::config::standard();
-            let data = bincode::encode_to_vec(&aggregator, config)?;
-
-            executor
-                .save_snapshot(
-                    A::name().to_owned(),
-                    A::revision().to_owned(),
-                    event.node.aggregator_id,
-                    data,
-                    cursor,
-                )
-                .await?;
         }
 
         if !events.page_info.has_next_page {
