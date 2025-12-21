@@ -1,5 +1,4 @@
-use std::{collections::HashSet, sync::Arc};
-
+use std::sync::Arc;
 use ulid::Ulid;
 
 use crate::{
@@ -13,17 +12,10 @@ pub trait Executor: Send + Sync + 'static {
 
     async fn get_event(&self, cursor: Value) -> Result<Event, ReadError>;
 
-    async fn read_by_aggregator(
-        &self,
-        aggregator_type: String,
-        id: String,
-        args: Args,
-    ) -> Result<ReadResult<Event>, ReadError>;
-
     async fn read(
         &self,
-        aggregator_types: HashSet<String>,
-        routing_key: RoutingKey,
+        aggregators: Option<Vec<(String, Option<String>)>>,
+        routing_key: Option<RoutingKey>,
         args: Args,
     ) -> Result<ReadResult<Event>, ReadError>;
 
@@ -63,22 +55,13 @@ impl Executor for Evento {
         self.0.get_event(cursor).await
     }
 
-    async fn read_by_aggregator(
-        &self,
-        aggregator_type: String,
-        id: String,
-        args: Args,
-    ) -> Result<ReadResult<Event>, ReadError> {
-        self.0.read_by_aggregator(aggregator_type, id, args).await
-    }
-
     async fn read(
         &self,
-        aggregator_types: HashSet<String>,
-        routing_key: RoutingKey,
+        aggregators: Option<Vec<(String, Option<String>)>>,
+        routing_key: Option<RoutingKey>,
         args: Args,
     ) -> Result<ReadResult<Event>, ReadError> {
-        self.0.read(aggregator_types, routing_key, args).await
+        self.0.read(aggregators, routing_key, args).await
     }
 
     async fn get_subscriber_cursor(&self, key: String) -> Result<Option<Value>, SubscribeError> {
@@ -213,46 +196,17 @@ impl Executor for EventoGroup {
         unreachable!()
     }
 
-    async fn read_by_aggregator(
+    async fn read(
         &self,
-        aggregator_type: String,
-        id: String,
+        aggregators: Option<Vec<(String, Option<String>)>>,
+        routing_key: Option<RoutingKey>,
         args: Args,
     ) -> Result<ReadResult<Event>, ReadError> {
         use crate::cursor;
         let futures = self
             .executors
             .iter()
-            .map(|e| e.read_by_aggregator(aggregator_type.to_owned(), id.to_owned(), args.clone()));
-
-        let results = futures_util::future::join_all(futures).await;
-        let mut events = vec![];
-        for res in results {
-            for edge in res?.edges {
-                events.push(edge.node);
-            }
-        }
-
-        Ok(cursor::Reader::new(events)
-            .args(args)
-            .execute()
-            .map_err(|err| ReadError::Unknown(err.into()))?)
-    }
-
-    async fn read(
-        &self,
-        aggregator_types: HashSet<String>,
-        routing_key: RoutingKey,
-        args: Args,
-    ) -> Result<ReadResult<Event>, ReadError> {
-        use crate::cursor;
-        let futures = self.executors.iter().map(|e| {
-            e.read(
-                aggregator_types.to_owned(),
-                routing_key.to_owned(),
-                args.clone(),
-            )
-        });
+            .map(|e| e.read(aggregators.to_owned(), routing_key.to_owned(), args.clone()));
 
         let results = futures_util::future::join_all(futures).await;
         let mut events = vec![];
@@ -321,22 +275,13 @@ impl<R: Executor, W: Executor> Executor for Rw<R, W> {
         self.r.get_event(cursor).await
     }
 
-    async fn read_by_aggregator(
-        &self,
-        aggregator_type: String,
-        id: String,
-        args: Args,
-    ) -> Result<ReadResult<Event>, ReadError> {
-        self.r.read_by_aggregator(aggregator_type, id, args).await
-    }
-
     async fn read(
         &self,
-        aggregator_types: HashSet<String>,
-        routing_key: RoutingKey,
+        aggregators: Option<Vec<(String, Option<String>)>>,
+        routing_key: Option<RoutingKey>,
         args: Args,
     ) -> Result<ReadResult<Event>, ReadError> {
-        self.r.read(aggregator_types, routing_key, args).await
+        self.r.read(aggregators, routing_key, args).await
     }
 
     async fn get_subscriber_cursor(&self, key: String) -> Result<Option<Value>, SubscribeError> {

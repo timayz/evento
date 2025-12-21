@@ -90,9 +90,12 @@ impl SaveBuilder {
     pub async fn commit<E: Executor>(&self, executor: &E) -> Result<String, WriteError> {
         let (mut version, routing_key) = if self.original_version == 0 {
             let events = executor
-                .read_by_aggregator(
-                    self.aggregator_type.to_owned(),
-                    self.aggregator_id.to_owned(),
+                .read(
+                    Some(vec![(
+                        self.aggregator_type.to_owned(),
+                        Some(self.aggregator_id.to_owned()),
+                    )]),
+                    None,
                     Args::backward(1, None),
                 )
                 .await

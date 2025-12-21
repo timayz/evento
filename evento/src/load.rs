@@ -98,9 +98,9 @@ pub async fn load<A: Aggregator, E: Executor>(
 
     loop {
         let events = executor
-            .read_by_aggregator(
-                A::name().to_owned(),
-                id.to_owned(),
+            .read(
+                Some(vec![(A::name().to_owned(), Some(id.to_owned()))]),
+                None,
                 Args::forward(1000, cursor.clone()),
             )
             .await?;

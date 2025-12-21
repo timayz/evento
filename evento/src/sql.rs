@@ -1,7 +1,4 @@
-use std::{
-    collections::HashSet,
-    ops::{Deref, DerefMut},
-};
+use std::ops::{Deref, DerefMut};
 
 #[cfg(feature = "mysql")]
 use sea_query::MysqlQueryBuilder;
@@ -9,7 +6,7 @@ use sea_query::MysqlQueryBuilder;
 use sea_query::PostgresQueryBuilder;
 #[cfg(feature = "sqlite")]
 use sea_query::SqliteQueryBuilder;
-use sea_query::{Expr, ExprTrait, Iden, IntoColumnRef, OnConflict, Query, SelectStatement};
+use sea_query::{Cond, Expr, ExprTrait, Iden, IntoColumnRef, OnConflict, Query, SelectStatement};
 use sea_query_sqlx::SqlxBinder;
 use sqlx::{Database, Pool};
 use ulid::Ulid;
@@ -132,40 +129,10 @@ where
             .map_err(|err| ReadError::Unknown(err.into()))
     }
 
-    async fn read_by_aggregator(
-        &self,
-        aggregator_type: String,
-        id: String,
-        args: Args,
-    ) -> Result<ReadResult<crate::Event>, ReadError> {
-        let statement = Query::select()
-            .columns([
-                Event::Id,
-                Event::Name,
-                Event::AggregatorType,
-                Event::AggregatorId,
-                Event::Version,
-                Event::Data,
-                Event::Metadata,
-                Event::RoutingKey,
-                Event::Timestamp,
-                Event::TimestampSubsec,
-            ])
-            .from(Event::Table)
-            .and_where(Expr::col(Event::AggregatorType).eq(Expr::value(aggregator_type)))
-            .and_where(Expr::col(Event::AggregatorId).eq(Expr::value(id)))
-            .to_owned();
-
-        Reader::new(statement)
-            .args(args)
-            .execute::<_, crate::Event, _>(&self.0)
-            .await
-    }
-
     async fn read(
         &self,
-        aggregator_types: HashSet<String>,
-        routing_key: crate::RoutingKey,
+        aggregators: Option<Vec<(String, Option<String>)>>,
+        routing_key: Option<crate::RoutingKey>,
         args: Args,
     ) -> Result<ReadResult<crate::Event>, ReadError> {
         let statement = Query::select()
@@ -182,15 +149,39 @@ where
                 Event::TimestampSubsec,
             ])
             .from(Event::Table)
-            .and_where(Expr::col(Event::AggregatorType).in_tuples(aggregator_types))
             .conditions(
-                matches!(routing_key, crate::RoutingKey::Value(_)),
+                aggregators.is_some(),
                 |q| {
-                    if let crate::RoutingKey::Value(Some(ref routing_key)) = routing_key {
+                    let Some(aggregators) = aggregators else {
+                        return;
+                    };
+
+                    let mut cond = Cond::any();
+
+                    for aggregator in aggregators {
+                        let mut aggregator_cond =
+                            Cond::all().add(Expr::col(Event::AggregatorType).eq(aggregator.0));
+
+                        if let Some(id) = aggregator.1 {
+                            aggregator_cond =
+                                aggregator_cond.add(Expr::col(Event::AggregatorId).eq(id));
+                        }
+
+                        cond = cond.add(aggregator_cond);
+                    }
+
+                    q.and_where(cond.into());
+                },
+                |_| {},
+            )
+            .conditions(
+                matches!(routing_key, Some(crate::RoutingKey::Value(_))),
+                |q| {
+                    if let Some(crate::RoutingKey::Value(Some(ref routing_key))) = routing_key {
                         q.and_where(Expr::col(Event::RoutingKey).eq(routing_key));
                     }
 
-                    if let crate::RoutingKey::Value(None) = routing_key {
+                    if let Some(crate::RoutingKey::Value(None)) = routing_key {
                         q.and_where(Expr::col(Event::RoutingKey).is_null());
                     }
                 },
