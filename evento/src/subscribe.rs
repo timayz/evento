@@ -143,7 +143,7 @@ pub struct SubscribeBuilder<E: Executor> {
     #[allow(dead_code)]
     handlers: HashMap<String, Box<dyn SubscribeHandler<E>>>,
     duplicate_handlers: HashSet<String>,
-    aggregator_types: HashSet<String>,
+    aggregators: HashMap<String, Option<String>>,
     chunk_size: u16,
     backon: bool,
     #[cfg(feature = "handler")]
@@ -196,7 +196,7 @@ pub fn subscribe<E: Executor>(key: impl Into<String>) -> SubscribeBuilder<E> {
         routing_key: RoutingKey::Value(None),
         handlers: HashMap::new(),
         duplicate_handlers: HashSet::new(),
-        aggregator_types: HashSet::new(),
+        aggregators: HashMap::default(),
         chunk_size: 300,
         context: Arc::default(),
         backon: true,
@@ -296,15 +296,15 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
     /// ```
     #[cfg(feature = "stream")]
     pub fn aggregator<A: Aggregator>(mut self) -> Self {
-        self.aggregator_types.insert(A::name().to_owned());
+        self.aggregators.insert(A::name().to_owned(), None);
 
         self
     }
 
     #[cfg(feature = "handler")]
     pub fn handler<H: SubscribeHandler<E> + 'static>(mut self, handler: H) -> Self {
-        self.aggregator_types
-            .insert(handler.aggregator_type().to_owned());
+        self.aggregators
+            .insert(handler.aggregator_type().to_owned(), None);
 
         let key = format!("{}-{}", handler.aggregator_type(), handler.event_name());
         if self
@@ -344,11 +344,12 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
 
     pub async fn read<'a>(&self, executor: &'a E) -> Result<Vec<Context<'a, E>>, SubscribeError> {
         let cursor = executor.get_subscriber_cursor(self.key.to_owned()).await?;
+        let aggregators = self.aggregators.clone().into_iter().collect::<Vec<_>>();
 
         let timestamp = executor
             .read(
-                self.aggregator_types.to_owned(),
-                self.routing_key.clone(),
+                Some(aggregators.to_vec()),
+                Some(self.routing_key.to_owned()),
                 Args::backward(1, None),
             )
             .await?
@@ -359,8 +360,8 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
 
         let res = executor
             .read(
-                self.aggregator_types.to_owned(),
-                self.routing_key.clone(),
+                Some(aggregators),
+                Some(self.routing_key.to_owned()),
                 Args::forward(self.chunk_size, cursor),
             )
             .await?;

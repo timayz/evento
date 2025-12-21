@@ -79,7 +79,6 @@ fn handle_registered(_ctx: Context, _event: Event<UserRegistered>) -> Result<(),
 //
 // allow subscribe with aggregate_id
 // try to use same method (stream?) for load/subscribe
-// remove snapshot write from save
 // allow to save_with in LoadResult
 // struct to easy set app key (us-east-1,...) for all evento::save/subscribe ?
 // split evento into multi create like evento-core, evento-sqlx, evento-cursor ... ?
