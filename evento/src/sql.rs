@@ -270,30 +270,6 @@ where
         Ok(())
     }
 
-    async fn get_snapshot(
-        &self,
-        aggregator_type: String,
-        aggregator_revision: String,
-        id: String,
-    ) -> Result<Option<(Vec<u8>, Value)>, ReadError> {
-        let statement = Query::select()
-            .columns([Snapshot::Data, Snapshot::Cursor])
-            .from(Snapshot::Table)
-            .and_where(Expr::col(Snapshot::Type).eq(Expr::value(aggregator_type)))
-            .and_where(Expr::col(Snapshot::Id).eq(Expr::value(id)))
-            .and_where(Expr::col(Snapshot::Revision).eq(Expr::value(aggregator_revision)))
-            .limit(1)
-            .to_owned();
-
-        let (sql, values) = Self::build_sqlx(statement);
-
-        sqlx::query_as_with::<DB, (Vec<u8>, String), _>(&sql, values)
-            .fetch_optional(&self.0)
-            .await
-            .map(|res| res.map(|(data, cursor)| (data, cursor.into())))
-            .map_err(|err| ReadError::Unknown(err.into()))
-    }
-
     async fn write(&self, events: Vec<crate::Event>) -> Result<(), WriteError> {
         let mut statement = Query::insert()
             .into_table(Event::Table)
@@ -344,48 +320,6 @@ where
                 }
                 WriteError::Unknown(err.into())
             })?;
-
-        Ok(())
-    }
-
-    async fn save_snapshot(
-        &self,
-        aggregator_type: String,
-        aggregator_revision: String,
-        id: String,
-        data: Vec<u8>,
-        cursor: Value,
-    ) -> Result<(), WriteError> {
-        let statement = Query::insert()
-            .into_table(Snapshot::Table)
-            .columns([
-                Snapshot::Type,
-                Snapshot::Id,
-                Snapshot::Cursor,
-                Snapshot::Revision,
-                Snapshot::Data,
-            ])
-            .values_panic([
-                aggregator_type.into(),
-                id.to_string().into(),
-                cursor.to_string().into(),
-                aggregator_revision.into(),
-                data.into(),
-            ])
-            .on_conflict(
-                OnConflict::columns([Snapshot::Type, Snapshot::Id])
-                    .update_columns([Snapshot::Data, Snapshot::Cursor, Snapshot::Revision])
-                    .value(Snapshot::UpdatedAt, Expr::current_timestamp())
-                    .to_owned(),
-            )
-            .to_owned();
-
-        let (sql, values) = Self::build_sqlx(statement);
-
-        sqlx::query_with::<DB, _>(&sql, values)
-            .execute(&self.0)
-            .await
-            .map_err(|err| WriteError::Unknown(err.into()))?;
 
         Ok(())
     }

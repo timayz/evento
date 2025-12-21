@@ -403,9 +403,7 @@ impl Cursor for Event {
 ///     }
 /// }
 /// ```
-pub trait Aggregator:
-    Default + Send + Sync + bincode::Encode + bincode::Decode<()> + Clone + AggregatorName + Debug
-{
+pub trait Aggregator: Default + Send + Sync + Clone + AggregatorName + Debug {
     /// Process an event and update the aggregate's state
     ///
     /// This method is called for each event when rebuilding the aggregate from the event store.
