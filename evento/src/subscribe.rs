@@ -20,7 +20,7 @@ use thiserror::Error;
 use crate::{
     context,
     cursor::{Args, Value},
-    Aggregator, AggregatorName, Event, Executor,
+    Aggregator, AggregatorName, Event, Executor, ReadAggregator,
 };
 
 #[derive(Debug, Error)]
@@ -143,7 +143,7 @@ pub struct SubscribeBuilder<E: Executor> {
     #[allow(dead_code)]
     handlers: HashMap<String, Box<dyn SubscribeHandler<E>>>,
     duplicate_handlers: HashSet<String>,
-    aggregators: HashMap<String, Option<String>>,
+    aggregators: HashSet<ReadAggregator>,
     chunk_size: u16,
     backon: bool,
     #[cfg(feature = "handler")]
@@ -196,7 +196,7 @@ pub fn subscribe<E: Executor>(key: impl Into<String>) -> SubscribeBuilder<E> {
         routing_key: RoutingKey::Value(None),
         handlers: HashMap::new(),
         duplicate_handlers: HashSet::new(),
-        aggregators: HashMap::default(),
+        aggregators: HashSet::default(),
         chunk_size: 300,
         context: Arc::default(),
         backon: true,
@@ -296,7 +296,8 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
     /// ```
     #[cfg(feature = "stream")]
     pub fn aggregator<A: Aggregator>(mut self) -> Self {
-        self.aggregators.insert(A::name().to_owned(), None);
+        self.aggregators
+            .insert(ReadAggregator::aggregator(A::name()));
 
         self
     }
@@ -304,7 +305,7 @@ impl<E: Executor + Clone> SubscribeBuilder<E> {
     #[cfg(feature = "handler")]
     pub fn handler<H: SubscribeHandler<E> + 'static>(mut self, handler: H) -> Self {
         self.aggregators
-            .insert(handler.aggregator_type().to_owned(), None);
+            .insert(ReadAggregator::aggregator(handler.aggregator_type()));
 
         let key = format!("{}-{}", handler.aggregator_type(), handler.event_name());
         if self

@@ -3,7 +3,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::{cursor::Args, Aggregator, AggregatorName, Event, Executor, LoadResult};
+use crate::{
+    cursor::Args, Aggregator, AggregatorName, Event, Executor, LoadResult, ReadAggregator,
+};
 
 #[derive(Debug, Error)]
 pub enum WriteError {
@@ -91,9 +93,9 @@ impl SaveBuilder {
         let (mut version, routing_key) = if self.original_version == 0 {
             let events = executor
                 .read(
-                    Some(vec![(
-                        self.aggregator_type.to_owned(),
-                        Some(self.aggregator_id.to_owned()),
+                    Some(vec![ReadAggregator::id(
+                        &self.aggregator_type,
+                        &self.aggregator_id,
                     )]),
                     None,
                     Args::backward(1, None),

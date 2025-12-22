@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-use crate::{cursor::Args, Aggregator, Event, Executor};
+use crate::{cursor::Args, Aggregator, Event, Executor, ReadAggregator};
 
 #[derive(Debug, Error)]
 pub enum ReadError {
@@ -99,7 +99,7 @@ pub async fn load<A: Aggregator, E: Executor>(
     loop {
         let events = executor
             .read(
-                Some(vec![(A::name().to_owned(), Some(id.to_owned()))]),
+                Some(vec![ReadAggregator::id(A::name(), &id)]),
                 None,
                 Args::forward(1000, cursor.clone()),
             )

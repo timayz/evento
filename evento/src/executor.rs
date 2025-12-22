@@ -1,10 +1,63 @@
-use std::sync::Arc;
+use std::{hash::Hash, sync::Arc};
 use ulid::Ulid;
 
 use crate::{
     cursor::{Args, ReadResult, Value},
     AcknowledgeError, Event, ReadError, RoutingKey, SubscribeError, WriteError,
 };
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ReadAggregator {
+    pub aggregator_type: String,
+    pub aggregator_id: Option<String>,
+    pub name: Option<String>,
+}
+
+impl ReadAggregator {
+    pub fn new(
+        aggregator_type: impl Into<String>,
+        id: impl Into<String>,
+        name: impl Into<String>,
+    ) -> Self {
+        Self {
+            aggregator_type: aggregator_type.into(),
+            aggregator_id: Some(id.into()),
+            name: Some(name.into()),
+        }
+    }
+
+    pub fn aggregator(value: impl Into<String>) -> Self {
+        Self {
+            aggregator_type: value.into(),
+            aggregator_id: None,
+            name: None,
+        }
+    }
+
+    pub fn id(aggregator_type: impl Into<String>, id: impl Into<String>) -> Self {
+        Self {
+            aggregator_type: aggregator_type.into(),
+            aggregator_id: Some(id.into()),
+            name: None,
+        }
+    }
+
+    pub fn event(aggregator_type: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            aggregator_type: aggregator_type.into(),
+            aggregator_id: None,
+            name: Some(name.into()),
+        }
+    }
+}
+
+impl Hash for ReadAggregator {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.aggregator_type.hash(state);
+        self.aggregator_id.hash(state);
+        self.name.hash(state);
+    }
+}
 
 #[async_trait::async_trait]
 pub trait Executor: Send + Sync + 'static {
@@ -14,7 +67,7 @@ pub trait Executor: Send + Sync + 'static {
 
     async fn read(
         &self,
-        aggregators: Option<Vec<(String, Option<String>)>>,
+        aggregators: Option<Vec<ReadAggregator>>,
         routing_key: Option<RoutingKey>,
         args: Args,
     ) -> Result<ReadResult<Event>, ReadError>;
@@ -57,7 +110,7 @@ impl Executor for Evento {
 
     async fn read(
         &self,
-        aggregators: Option<Vec<(String, Option<String>)>>,
+        aggregators: Option<Vec<ReadAggregator>>,
         routing_key: Option<RoutingKey>,
         args: Args,
     ) -> Result<ReadResult<Event>, ReadError> {
@@ -198,7 +251,7 @@ impl Executor for EventoGroup {
 
     async fn read(
         &self,
-        aggregators: Option<Vec<(String, Option<String>)>>,
+        aggregators: Option<Vec<ReadAggregator>>,
         routing_key: Option<RoutingKey>,
         args: Args,
     ) -> Result<ReadResult<Event>, ReadError> {
@@ -277,7 +330,7 @@ impl<R: Executor, W: Executor> Executor for Rw<R, W> {
 
     async fn read(
         &self,
-        aggregators: Option<Vec<(String, Option<String>)>>,
+        aggregators: Option<Vec<ReadAggregator>>,
         routing_key: Option<RoutingKey>,
         args: Args,
     ) -> Result<ReadResult<Event>, ReadError> {

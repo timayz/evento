@@ -13,7 +13,7 @@ use ulid::Ulid;
 
 use crate::{
     cursor::{self, Args, Cursor, Edge, PageInfo, ReadResult, Value},
-    AcknowledgeError, Executor, ReadError, SubscribeError, WriteError,
+    AcknowledgeError, Executor, ReadAggregator, ReadError, SubscribeError, WriteError,
 };
 
 #[derive(Iden, Clone)]
@@ -131,7 +131,7 @@ where
 
     async fn read(
         &self,
-        aggregators: Option<Vec<(String, Option<String>)>>,
+        aggregators: Option<Vec<ReadAggregator>>,
         routing_key: Option<crate::RoutingKey>,
         args: Args,
     ) -> Result<ReadResult<crate::Event>, ReadError> {
@@ -159,12 +159,16 @@ where
                     let mut cond = Cond::any();
 
                     for aggregator in aggregators {
-                        let mut aggregator_cond =
-                            Cond::all().add(Expr::col(Event::AggregatorType).eq(aggregator.0));
+                        let mut aggregator_cond = Cond::all()
+                            .add(Expr::col(Event::AggregatorType).eq(aggregator.aggregator_type));
 
-                        if let Some(id) = aggregator.1 {
+                        if let Some(id) = aggregator.aggregator_id {
                             aggregator_cond =
                                 aggregator_cond.add(Expr::col(Event::AggregatorId).eq(id));
+                        }
+
+                        if let Some(name) = aggregator.name {
+                            aggregator_cond = aggregator_cond.add(Expr::col(Event::Name).eq(name));
                         }
 
                         cond = cond.add(aggregator_cond);

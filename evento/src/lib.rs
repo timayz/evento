@@ -100,6 +100,7 @@ pub mod cursor;
 mod executor;
 mod load;
 pub mod metadata;
+mod projection;
 mod save;
 mod subscribe;
 
