@@ -1,5 +1,5 @@
 use evento::{
-    Executor,
+    Executor, LoadResult,
     metadata::Event,
     projection::{Action, Projection},
 };
@@ -27,15 +27,15 @@ pub struct AccountStatusView {
 
 #[evento::snapshot]
 async fn restore(
-    context: &evento::context::RwContext,
-    id: String,
-) -> anyhow::Result<Option<AccountStatusView>> {
+    _context: &evento::context::RwContext,
+    _id: String,
+) -> anyhow::Result<Option<LoadResult<AccountStatusView>>> {
     Ok(None)
 }
 
 #[evento::handler]
 async fn handle_account_opened<E: Executor>(
-    event: Event<AccountOpened>,
+    _event: Event<AccountOpened>,
     action: Action<'_, AccountStatusView, E>,
 ) -> anyhow::Result<()> {
     match action {
@@ -45,7 +45,7 @@ async fn handle_account_opened<E: Executor>(
             row.is_active = true;
             row.is_frozen = false;
         }
-        Action::Handle(context) => {}
+        Action::Handle(_context) => {}
     };
 
     Ok(())
@@ -53,7 +53,7 @@ async fn handle_account_opened<E: Executor>(
 
 #[evento::handler]
 async fn handle_account_frozen<E: Executor>(
-    event: Event<AccountFrozen>,
+    _event: Event<AccountFrozen>,
     action: Action<'_, AccountStatusView, E>,
 ) -> anyhow::Result<()> {
     match action {
@@ -63,7 +63,7 @@ async fn handle_account_frozen<E: Executor>(
             row.is_active = false;
             row.is_frozen = true;
         }
-        Action::Handle(context) => {}
+        Action::Handle(_context) => {}
     };
 
     Ok(())
@@ -71,7 +71,7 @@ async fn handle_account_frozen<E: Executor>(
 
 #[evento::handler]
 async fn handle_account_unfrozen<E: Executor>(
-    event: Event<AccountUnfrozen>,
+    _event: Event<AccountUnfrozen>,
     action: Action<'_, AccountStatusView, E>,
 ) -> anyhow::Result<()> {
     match action {
@@ -81,7 +81,7 @@ async fn handle_account_unfrozen<E: Executor>(
             row.is_active = true;
             row.is_frozen = false;
         }
-        Action::Handle(context) => {}
+        Action::Handle(_context) => {}
     };
 
     Ok(())
@@ -89,7 +89,7 @@ async fn handle_account_unfrozen<E: Executor>(
 
 #[evento::handler]
 async fn handle_account_closed<E: Executor>(
-    event: Event<AccountClosed>,
+    _event: Event<AccountClosed>,
     action: Action<'_, AccountStatusView, E>,
 ) -> anyhow::Result<()> {
     match action {
@@ -99,7 +99,7 @@ async fn handle_account_closed<E: Executor>(
             row.is_active = false;
             row.is_frozen = false;
         }
-        Action::Handle(context) => {}
+        Action::Handle(_context) => {}
     };
 
     Ok(())

@@ -7,3 +7,4 @@ edition = "2024"
 evento = { path = "../../evento" }
 bincode = "2"
 anyhow = "1"
+once_cell = "1"

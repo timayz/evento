@@ -59,3 +59,9 @@ pub enum BankAccount {
     /// Event raised when the account is closed
     AccountClosed { reason: String, final_balance: i64 },
 }
+
+#[evento::aggregator]
+pub enum Owner {
+    Created { pub name: String },
+    NameChanged { pub value: String },
+}

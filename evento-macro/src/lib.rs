@@ -25,8 +25,7 @@
 
 use convert_case::{Case, Casing};
 use proc_macro::TokenStream;
-use proc_macro2::TokenStream as TokenStream2;
-use quote::{format_ident, quote, ToTokens};
+use quote::{format_ident, quote};
 use syn::{
     parse_macro_input, punctuated::Punctuated, Error, Fields, FnArg, GenericArgument, ItemEnum,
     ItemFn, Meta, PatType, PathArguments, ReturnType, Token, Type, TypePath,
@@ -64,7 +63,11 @@ pub fn aggregator(attr: TokenStream, item: TokenStream) -> TokenStream {
         let impl_event = quote! {
             impl evento::projection::Aggregator for #variant_name {
                 fn aggregator_type() -> &'static str {
-                    #enum_name_str
+                    static NAME: std::sync::LazyLock<String> = std::sync::LazyLock::new(||{
+                        format!("{}/{}", env!("CARGO_PKG_NAME"), #enum_name_str)
+                    });
+
+                    &NAME
                 }
             }
 
@@ -124,8 +127,18 @@ pub fn aggregator(attr: TokenStream, item: TokenStream) -> TokenStream {
     quote! {
         #(#structs)*
 
-        // If you want to also keep the enum, add:
-        // #input
+        #[derive(Default)]
+        #vis struct #enum_name;
+
+        impl evento::projection::Aggregator for #enum_name {
+            fn aggregator_type() -> &'static str {
+                static NAME: std::sync::LazyLock<String> = std::sync::LazyLock::new(||{
+                    format!("{}/{}", env!("CARGO_PKG_NAME"), #enum_name_str)
+                });
+
+                &NAME
+            }
+        }
     }
     .into()
 }
@@ -355,8 +368,6 @@ pub fn debug_snapshot(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
 fn snapshot_impl(input: &ItemFn, debug: bool) -> syn::Result<TokenStream> {
     let fn_name = &input.sig.ident;
-    let fn_vis = &input.vis;
-    let fn_stmts = &input.block.stmts;
 
     // Extract return type: anyhow::Result<Option<AccountBalanceView>>
     let return_type = match &input.sig.output {
@@ -370,21 +381,25 @@ fn snapshot_impl(input: &ItemFn, debug: bool) -> syn::Result<TokenStream> {
     };
 
     // Extract the inner type (AccountBalanceView) from Result<Option<T>>
-    let projection_type = extract_result_option_inner(return_type)?;
+    // let projection_type = extract_result_option_inner(return_type)?;
+
+    // Level 1: Result<...>
+    let option_type = extract_generic_inner(return_type, "Result")?;
+
+    // Level 2: Option<...>
+    let load_result_type = extract_generic_inner(option_type, "Option")?;
+
+    // Level 3: LoadResult<T>
+    let projection_type = extract_generic_inner(load_result_type, "LoadResult")?;
 
     let output = quote! {
-        #fn_vis async fn #fn_name(
-            context: &::evento::context::RwContext,
-            id: String,
-        ) -> ::anyhow::Result<Option<#projection_type>> {
-            #(#fn_stmts)*
-        }
+        #input
 
         impl ::evento::projection::Snapshot for #projection_type {
             fn restore<'a>(
                 context: &'a ::evento::context::RwContext,
                 id: String,
-            ) -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = ::anyhow::Result<Option<Self>>> + Send + 'a>> {
+            ) -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = ::anyhow::Result<Option<evento::LoadResult<Self>>>> + Send + 'a>> {
                 Box::pin(async move { #fn_name(context, id).await })
             }
         }
@@ -412,10 +427,10 @@ fn snapshot_impl(input: &ItemFn, debug: bool) -> syn::Result<TokenStream> {
     .into())
 }
 
-// Extract T from Result<Option<T>> or anyhow::Result<Option<T>>
-fn extract_result_option_inner(ty: &Type) -> syn::Result<TokenStream2> {
+// Extract inner type from Wrapper<T>
+fn extract_generic_inner<'a>(ty: &'a Type, expected: &str) -> syn::Result<&'a Type> {
     let Type::Path(type_path) = ty else {
-        return Err(Error::new_spanned(ty, "expected Result<Option<T>>"));
+        return Err(Error::new_spanned(ty, format!("expected {}<T>", expected)));
     };
 
     let segment = type_path
@@ -424,57 +439,25 @@ fn extract_result_option_inner(ty: &Type) -> syn::Result<TokenStream2> {
         .last()
         .ok_or_else(|| Error::new_spanned(type_path, "empty type path"))?;
 
-    if segment.ident != "Result" {
+    if segment.ident != expected {
         return Err(Error::new_spanned(
             segment,
-            format!("expected Result, found {}", segment.ident),
+            format!("expected {}, found {}", expected, segment.ident),
         ));
     }
 
     let PathArguments::AngleBracketed(args) = &segment.arguments else {
-        return Err(Error::new_spanned(segment, "expected Result<Option<T>>"));
-    };
-
-    // Get first type arg (Option<T>)
-    let option_type = args
-        .args
-        .iter()
-        .find_map(|arg| match arg {
-            GenericArgument::Type(t) => Some(t),
-            _ => None,
-        })
-        .ok_or_else(|| Error::new_spanned(args, "expected type argument"))?;
-
-    // Extract T from Option<T>
-    let Type::Path(option_path) = option_type else {
-        return Err(Error::new_spanned(option_type, "expected Option<T>"));
-    };
-
-    let option_segment = option_path
-        .path
-        .segments
-        .last()
-        .ok_or_else(|| Error::new_spanned(option_path, "empty type path"))?;
-
-    if option_segment.ident != "Option" {
         return Err(Error::new_spanned(
-            option_segment,
-            format!("expected Option, found {}", option_segment.ident),
+            segment,
+            format!("expected {}<T>", expected),
         ));
-    }
-
-    let PathArguments::AngleBracketed(option_args) = &option_segment.arguments else {
-        return Err(Error::new_spanned(option_segment, "expected Option<T>"));
     };
 
-    let inner = option_args
-        .args
+    args.args
         .iter()
         .find_map(|arg| match arg {
             GenericArgument::Type(t) => Some(t),
             _ => None,
         })
-        .ok_or_else(|| Error::new_spanned(option_args, "expected type in Option<T>"))?;
-
-    Ok(inner.to_token_stream())
+        .ok_or_else(|| Error::new_spanned(args, format!("expected type in {}<T>", expected)))
 }

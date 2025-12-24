@@ -1,5 +1,11 @@
 use backon::{ExponentialBuilder, Retryable};
-use std::{collections::HashMap, future::Future, ops::Deref, pin::Pin, time::Duration};
+use std::{
+    collections::HashMap,
+    future::Future,
+    ops::{Deref, DerefMut},
+    pin::Pin,
+    time::Duration,
+};
 use tokio::time::{interval_at, Instant};
 use ulid::Ulid;
 
@@ -108,21 +114,18 @@ impl<P: 'static, E: Executor> Projection<P, E> {
         self
     }
 
-    pub async fn load(self, executor: &E, id: impl Into<String>) -> Result<Option<P>, anyhow::Error>
+    pub fn load<A: Aggregator>(self, id: impl Into<String>) -> LoadBuilder<P, E>
     where
         P: Snapshot + Default,
     {
-        self.load_with_opts(id).execute(executor).await
-    }
+        let id = id.into();
+        let mut aggregators = HashMap::new();
+        aggregators.insert(A::aggregator_type().to_owned(), id.to_owned());
 
-    pub fn load_with_opts(self, id: impl Into<String>) -> LoadBuilder<P, E>
-    where
-        P: Snapshot + Default,
-    {
         LoadBuilder {
             key: self.key.to_owned(),
-            id: id.into(),
-            aggregators: HashMap::new(),
+            id,
+            aggregators,
             handlers: self.handlers,
             context: Default::default(),
         }
@@ -143,19 +146,34 @@ impl<P: 'static, E: Executor> Projection<P, E> {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct LoadResult<A> {
+    pub item: A,
+    pub version: i32,
+    pub routing_key: Option<String>,
+}
+
+impl<A> Deref for LoadResult<A> {
+    type Target = A;
+    fn deref(&self) -> &Self::Target {
+        &self.item
+    }
+}
+
+impl<A> DerefMut for LoadResult<A> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.item
+    }
+}
+
+pub type OptionLoadResult<A> = Option<LoadResult<A>>;
+
 pub trait Snapshot: Sized {
     fn restore<'a>(
         context: &'a context::RwContext,
         id: String,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Option<Self>>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<OptionLoadResult<Self>>> + Send + 'a>>;
 }
-//
-// #[derive(Debug, Clone, Default)]
-// pub struct LoadResult<A> {
-//     pub item: A,
-//     pub version: i32,
-//     pub routing_key: Option<String>,
-// }
 
 pub struct LoadBuilder<P: Snapshot + Default + 'static, E: Executor> {
     key: String,
@@ -179,7 +197,7 @@ impl<P: Snapshot + Default + 'static, E: Executor> LoadBuilder<P, E> {
         self
     }
 
-    pub async fn execute(&self, executor: &E) -> anyhow::Result<Option<P>> {
+    pub async fn execute(&self, executor: &E) -> anyhow::Result<Option<LoadResult<P>>> {
         let context = Context {
             context: self.context.clone(),
             executor,
@@ -188,7 +206,7 @@ impl<P: Snapshot + Default + 'static, E: Executor> LoadBuilder<P, E> {
         let cursor = executor.get_subscriber_cursor(self.key.to_owned()).await?;
         let loaded = P::restore(&context, self.id.to_owned()).await?;
         let has_loaded = loaded.is_some();
-        let mut projection = loaded.unwrap_or_default();
+        let mut snapshot = loaded.unwrap_or_default();
 
         let read_aggregators = self
             .handlers
@@ -197,7 +215,7 @@ impl<P: Snapshot + Default + 'static, E: Executor> LoadBuilder<P, E> {
                 Some(id) => ReadAggregator {
                     aggregator_type: h.aggregator_type().to_owned(),
                     aggregator_id: Some(id.to_owned()),
-                    name: Some(h.event_name().to_owned()),
+                    name: None,
                 },
                 _ => ReadAggregator::event(h.aggregator_type(), h.event_name()),
             })
@@ -214,10 +232,11 @@ impl<P: Snapshot + Default + 'static, E: Executor> LoadBuilder<P, E> {
         for event in events.edges.iter() {
             let key = format!("{}_{}", event.node.aggregator_type, event.node.name);
             let Some(handler) = self.handlers.get(&key) else {
-                panic!("No handler found for {}/{key}", self.key);
+                tracing::debug!("No handler found for {}/{key}", self.key);
+                continue;
             };
 
-            handler.apply(&mut projection, &event.node).await?;
+            handler.apply(&mut snapshot, &event.node).await?;
         }
 
         if events.page_info.has_next_page {
@@ -225,12 +244,10 @@ impl<P: Snapshot + Default + 'static, E: Executor> LoadBuilder<P, E> {
         }
 
         if let Some(event) = events.edges.last() {
-            return Ok(Some(projection));
-            // return Ok(Some(LoadResult {
-            //     item: projection,
-            //     version: event.node.version,
-            //     routing_key: event.node.routing_key.to_owned(),
-            // }));
+            snapshot.version = event.node.version;
+            snapshot.routing_key = event.node.routing_key.to_owned();
+
+            return Ok(Some(snapshot));
         }
 
         if !has_loaded {
@@ -245,13 +262,11 @@ impl<P: Snapshot + Default + 'static, E: Executor> LoadBuilder<P, E> {
             )
             .await?;
 
-        if let Some(_event) = events.edges.first() {
-            return Ok(Some(projection));
-            // return Ok(Some(LoadResult {
-            //     item: projection,
-            //     version: event.node.version,
-            //     routing_key: event.node.routing_key.to_owned(),
-            // }));
+        if let Some(event) = events.edges.first() {
+            snapshot.version = event.node.version;
+            snapshot.routing_key = event.node.routing_key.to_owned();
+
+            return Ok(Some(snapshot));
         }
 
         Ok(None)
@@ -271,31 +286,31 @@ pub struct SubscriptionBuilder<P: 'static, E: Executor> {
 }
 
 impl<P, E: Executor + 'static> SubscriptionBuilder<P, E> {
-    pub fn accept_failure(&mut self) -> &mut Self {
+    pub fn accept_failure(mut self) -> Self {
         self.is_accept_failure = true;
 
         self
     }
 
-    pub fn chunk_size(&mut self, v: u16) -> &mut Self {
+    pub fn chunk_size(mut self, v: u16) -> Self {
         self.chunk_size = v;
 
         self
     }
 
-    pub fn delay(&mut self, v: Duration) -> &mut Self {
+    pub fn delay(mut self, v: Duration) -> Self {
         self.delay = Some(v);
 
         self
     }
 
-    pub fn routing_key(&mut self, v: impl Into<String>) -> &mut Self {
+    pub fn routing_key(mut self, v: impl Into<String>) -> Self {
         self.routing_key = RoutingKey::Value(Some(v.into()));
 
         self
     }
 
-    pub fn retry(&mut self, v: u8) -> &mut Self {
+    pub fn retry(mut self, v: u8) -> Self {
         self.retry = Some(v);
 
         self
@@ -307,13 +322,13 @@ impl<P, E: Executor + 'static> SubscriptionBuilder<P, E> {
         self
     }
 
-    pub fn all(&mut self) -> &mut Self {
+    pub fn all(mut self) -> Self {
         self.routing_key = RoutingKey::All;
 
         self
     }
 
-    pub fn aggregator<A: Aggregator>(&mut self, id: impl Into<String>) -> &mut Self {
+    pub fn aggregator<A: Aggregator>(mut self, id: impl Into<String>) -> Self {
         self.aggregators
             .insert(A::aggregator_type().to_owned(), id.into());
 
@@ -435,6 +450,7 @@ impl<P, E: Executor + 'static> SubscriptionBuilder<P, E> {
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
         let executor = executor.clone();
         let id = Ulid::new();
+        let subscription_id = id;
 
         executor
             .upsert_subscriber(self.key.to_owned(), id.to_owned())
@@ -503,6 +519,7 @@ impl<P, E: Executor + 'static> SubscriptionBuilder<P, E> {
         });
 
         Ok(Subscription {
+            id: subscription_id,
             task_handle,
             shutdown_tx,
         })
@@ -551,6 +568,7 @@ impl<P, E: Executor + 'static> SubscriptionBuilder<P, E> {
 
 #[derive(Debug)]
 pub struct Subscription {
+    pub id: Ulid,
     task_handle: tokio::task::JoinHandle<()>,
     shutdown_tx: tokio::sync::oneshot::Sender<()>,
 }

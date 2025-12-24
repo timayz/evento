@@ -100,7 +100,7 @@ impl AggregatorBuilder {
                     Args::backward(1, None),
                 )
                 .await
-                .map_err(|e| WriteError::Unknown(e.into()))?;
+                .map_err(WriteError::Unknown)?;
 
             match events.edges.first() {
                 Some(event) => (event.node.version, event.node.routing_key.to_owned()),

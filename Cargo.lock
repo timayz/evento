@@ -108,6 +108,7 @@ dependencies = [
  "anyhow",
  "bincode",
  "evento",
+ "once_cell",
 ]
 
 [[package]]

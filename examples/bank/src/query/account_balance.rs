@@ -1,5 +1,5 @@
 use evento::{
-    Executor,
+    Executor, LoadResult,
     metadata::Event,
     projection::{Action, Projection},
 };
@@ -28,9 +28,9 @@ pub struct AccountBalanceView {
 
 #[evento::snapshot]
 async fn restore(
-    context: &evento::context::RwContext,
-    id: String,
-) -> anyhow::Result<Option<AccountBalanceView>> {
+    _context: &evento::context::RwContext,
+    _id: String,
+) -> anyhow::Result<Option<LoadResult<AccountBalanceView>>> {
     Ok(None)
 }
 
@@ -45,7 +45,7 @@ async fn handle_account_opened<E: Executor>(
             row.currency = event.data.currency;
             row.available_balance = event.data.initial_balance;
         }
-        Action::Handle(context) => {}
+        Action::Handle(_context) => {}
     };
 
     Ok(())
@@ -61,7 +61,7 @@ async fn handle_money_deposit<E: Executor>(
             row.balance += event.data.amount;
             row.available_balance += event.data.amount;
         }
-        Action::Handle(context) => {}
+        Action::Handle(_context) => {}
     };
 
     Ok(())
@@ -77,7 +77,7 @@ async fn handle_money_withdrawn<E: Executor>(
             row.balance -= event.data.amount;
             row.available_balance -= event.data.amount;
         }
-        Action::Handle(context) => {}
+        Action::Handle(_context) => {}
     };
 
     Ok(())
@@ -93,7 +93,7 @@ async fn handle_money_transferred<E: Executor>(
             row.balance -= event.data.amount;
             row.available_balance -= event.data.amount;
         }
-        Action::Handle(context) => {}
+        Action::Handle(_context) => {}
     };
 
     Ok(())
@@ -109,7 +109,7 @@ async fn handle_money_received<E: Executor>(
             row.balance += event.data.amount;
             row.available_balance += event.data.amount;
         }
-        Action::Handle(context) => {}
+        Action::Handle(_context) => {}
     };
 
     Ok(())
@@ -124,7 +124,7 @@ async fn handle_overdraf_limit_changed<E: Executor>(
         Action::Apply(row) => {
             row.available_balance = row.balance + event.data.new_limit;
         }
-        Action::Handle(context) => {}
+        Action::Handle(_context) => {}
     };
 
     Ok(())

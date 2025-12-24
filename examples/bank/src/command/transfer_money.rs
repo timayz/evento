@@ -49,4 +49,44 @@ impl super::Command {
 
         Ok(())
     }
+
+    /// Handle TransferMoney command
+    pub async fn transfer_money_with_routing<E: Executor>(
+        &self,
+        cmd: TransferMoney,
+        executor: &E,
+        key: impl Into<String>,
+    ) -> Result<(), BankAccountError> {
+        if matches!(self.status, AccountStatus::Closed) {
+            return Err(BankAccountError::AccountClosed);
+        }
+        if matches!(self.status, AccountStatus::Frozen) {
+            return Err(BankAccountError::AccountFrozen);
+        }
+        if cmd.amount <= 0 {
+            return Err(BankAccountError::InvalidAmount);
+        }
+
+        let available = self.balance + self.overdraft_limit;
+        if cmd.amount > available {
+            return Err(BankAccountError::InsufficientFunds {
+                available,
+                requested: cmd.amount,
+            });
+        }
+
+        self.aggregator()
+            .routing_key(key)
+            .event(&MoneyTransferred {
+                amount: cmd.amount,
+                to_account_id: cmd.to_account_id,
+                transaction_id: cmd.transaction_id,
+                description: cmd.description,
+            })?
+            .metadata(&Metadata::default())?
+            .commit(executor)
+            .await?;
+
+        Ok(())
+    }
 }

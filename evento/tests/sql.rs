@@ -25,13 +25,6 @@ use sqlx_migrator::{Migrate, Plan};
 use crate::cursor_test::assert_read_result;
 
 #[tokio::test]
-async fn sqlite_version() -> anyhow::Result<()> {
-    let executor = create_sqlite_executor("version").await?;
-
-    evento_test::version(&executor).await
-}
-
-#[tokio::test]
 async fn sqlite_routing_key() -> anyhow::Result<()> {
     let executor = create_sqlite_executor("routing_key").await?;
 
@@ -107,13 +100,6 @@ async fn sqlite_subscribe_default_multiple_aggregator() -> anyhow::Result<()> {
 
     evento_test::subscribe_default_multiple_aggregator::<Sql<sqlx::Sqlite>>(&pool.into(), data)
         .await
-}
-
-#[tokio::test]
-async fn rw_sqlite_version() -> anyhow::Result<()> {
-    let executor = create_rw_sqlite_executor("version").await?;
-
-    evento_test::version(&executor).await
 }
 
 #[tokio::test]
@@ -193,13 +179,6 @@ async fn rw_sqlite_subscribe_default_multiple_aggregator() -> anyhow::Result<()>
 }
 
 #[tokio::test]
-async fn mysql_version() -> anyhow::Result<()> {
-    let executor = create_sqlite_executor("version").await?;
-
-    evento_test::version(&executor).await
-}
-
-#[tokio::test]
 async fn mysql_routing_key() -> anyhow::Result<()> {
     let executor = create_mysql_executor("routing_key").await?;
 
@@ -274,13 +253,6 @@ async fn mysql_subscribe_default_multiple_aggregator() -> anyhow::Result<()> {
     let data = get_data(&pool).await?;
 
     evento_test::subscribe_default_multiple_aggregator::<Sql<sqlx::MySql>>(&pool.into(), data).await
-}
-
-#[tokio::test]
-async fn postgres_version() -> anyhow::Result<()> {
-    let executor = create_postgres_executor("version").await?;
-
-    evento_test::version(&executor).await
 }
 
 #[tokio::test]
@@ -592,11 +564,11 @@ where
         .from(evento::sql::Event::Table)
         .to_owned();
 
-    Ok(Reader::new(statement)
+    Reader::new(statement)
         .args(args)
         .order(order)
         .execute::<_, crate::Event, _>(pool)
-        .await?)
+        .await
 }
 
 async fn get_data<DB>(pool: &Pool<DB>) -> anyhow::Result<Vec<Event>>
