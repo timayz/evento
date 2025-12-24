@@ -29,7 +29,7 @@ pub enum ReadError {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct LoadResult<A: Aggregator> {
+pub struct LoadResult<A: crate::projection::Aggregator> {
     pub item: A,
     pub event: Event,
 }
@@ -85,7 +85,7 @@ pub struct LoadResult<A: Aggregator> {
 /// The function automatically creates snapshots during loading to speed up future loads.
 /// For aggregates with many events, consider the performance implications and ensure
 /// your event handlers are efficient.
-pub async fn load<A: Aggregator, E: Executor>(
+pub async fn load<A: crate::projection::Aggregator + Default, E: Executor>(
     executor: &E,
     id: impl Into<String>,
 ) -> Result<LoadResult<A>, ReadError> {
@@ -99,21 +99,21 @@ pub async fn load<A: Aggregator, E: Executor>(
     loop {
         let events = executor
             .read(
-                Some(vec![ReadAggregator::id(A::name(), &id)]),
+                Some(vec![ReadAggregator::id(A::aggregator_type(), &id)]),
                 None,
                 Args::forward(1000, cursor.clone()),
             )
             .await?;
 
         for event in events.edges.iter() {
-            aggregator.aggregate(&event.node).await?;
+            // aggregator.aggregate(&event.node).await?;
         }
 
         if !events.page_info.has_next_page {
             let event = match (cursor, events.edges.last()) {
                 (_, Some(event)) => event.node.clone(),
                 (Some(cursor), None) => executor.get_event(cursor).await?,
-                _ => return Err(ReadError::NotFound(A::name().to_owned(), id)),
+                _ => return Err(ReadError::NotFound(A::aggregator_type().to_owned(), id)),
             };
 
             return Ok(LoadResult {
@@ -181,7 +181,7 @@ pub async fn load<A: Aggregator, E: Executor>(
 ///     }
 /// }
 /// ```
-pub async fn load_optional<A: Aggregator, E: Executor>(
+pub async fn load_optional<A: crate::projection::Aggregator, E: Executor>(
     executor: &E,
     id: impl Into<String>,
 ) -> Result<Option<LoadResult<A>>, ReadError> {

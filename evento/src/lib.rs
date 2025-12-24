@@ -95,14 +95,14 @@
 //! - `postgres` - PostgreSQL support
 //! - `mysql` - MySQL support
 
+mod aggregator;
 pub mod context;
 pub mod cursor;
 mod executor;
-mod load;
+// mod load;
 pub mod metadata;
-mod projection;
-mod save;
-mod subscribe;
+pub mod projection;
+// mod subscription;
 
 #[cfg(any(feature = "sqlite", feature = "mysql", feature = "postgres"))]
 pub mod sql;
@@ -114,10 +114,11 @@ pub mod sql_types;
 #[cfg(feature = "macro")]
 pub use evento_macro::*;
 
+pub use aggregator::*;
 pub use executor::*;
-pub use load::*;
-pub use save::*;
-pub use subscribe::*;
+pub use projection::*;
+// pub use load::*;
+// pub use subscription::*;
 
 use std::{fmt::Debug, ops::Deref};
 use ulid::Ulid;
@@ -147,51 +148,6 @@ pub mod stream {
 #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
 pub mod migrator {
     pub use sqlx_migrator::{Migrate, Plan};
-}
-
-/// Event with typed data and metadata
-///
-/// `EventDetails` wraps a raw [`Event`] with typed data and metadata. This provides
-/// type-safe access to event payloads in event handlers and aggregators.
-///
-/// # Type Parameters
-///
-/// - `D`: The type of the event data (must implement [`AggregatorName`] and be decodable)
-/// - `M`: The type of the metadata (defaults to `bool`, must be decodable)
-///
-/// # Examples
-///
-/// ```no_run
-/// use evento::{EventDetails, AggregatorName};
-/// use bincode::{Encode, Decode};
-///
-/// #[derive(AggregatorName, Encode, Decode)]
-/// struct UserCreated {
-///     name: String,
-///     email: String,
-/// }
-///
-/// // In an event handler
-/// async fn handle_user_created(event: EventDetails<UserCreated>) -> anyhow::Result<()> {
-///     println!("User created: {} ({})", event.data.name, event.data.email);
-///     println!("Event ID: {}", event.id);
-///     Ok(())
-/// }
-/// ```
-pub struct EventDetails<D, M = bool> {
-    inner: Event,
-    /// The typed event data
-    pub data: D,
-    /// The typed event metadata
-    pub metadata: M,
-}
-
-impl<D, M> Deref for EventDetails<D, M> {
-    type Target = Event;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
 }
 
 #[cfg(feature = "mysql")]
@@ -289,57 +245,6 @@ pub struct Event {
     pub timestamp_subsec: u32,
 }
 
-impl Event {
-    /// Convert this raw event to typed [`EventDetails`]
-    ///
-    /// This method attempts to deserialize the event data and metadata into the specified types.
-    /// Returns `None` if the event name doesn't match the expected type `D`.
-    ///
-    /// # Type Parameters
-    ///
-    /// - `D`: The expected event data type (must implement [`AggregatorName`])
-    /// - `M`: The expected metadata type
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`bincode::error::DecodeError`] if deserialization fails.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use evento::{Event, EventDetails};
-    /// # use evento::*;
-    /// # use bincode::{Encode, Decode};
-    /// # #[derive(AggregatorName, Encode, Decode)]
-    /// # struct UserCreated { name: String }
-    ///
-    /// fn handle_event(event: &Event) -> anyhow::Result<()> {
-    ///     if let Some(details) = event.to_details::<UserCreated, bool>()? {
-    ///         println!("User created: {}", details.data.name);
-    ///     }
-    ///     Ok(())
-    /// }
-    /// ```
-    pub fn to_details<D: AggregatorName + bincode::Decode<()>, M: bincode::Decode<()>>(
-        &self,
-    ) -> Result<Option<EventDetails<D, M>>, bincode::error::DecodeError> {
-        if D::name() != self.name {
-            return Ok(None);
-        }
-
-        let config = bincode::config::standard();
-
-        let (data, _) = bincode::decode_from_slice(&self.data[..], config)?;
-        let (metadata, _) = bincode::decode_from_slice(&self.metadata[..], config)?;
-
-        Ok(Some(EventDetails {
-            data,
-            metadata,
-            inner: self.clone(),
-        }))
-    }
-}
-
 impl Cursor for Event {
     type T = EventCursor;
 
@@ -351,107 +256,4 @@ impl Cursor for Event {
             s: self.timestamp_subsec,
         }
     }
-}
-
-/// Trait for domain aggregates that process events
-///
-/// `Aggregator` defines the contract for objects that maintain state by processing events.
-/// Aggregates are the core building blocks in event sourcing - they represent domain entities
-/// that rebuild their state by replaying events from the event store.
-///
-/// # Implementation
-///
-/// Instead of implementing this trait manually, use the `#[evento::aggregator]` attribute macro
-/// which generates the implementation automatically based on your event handler methods.
-///
-/// # Requirements
-///
-/// Aggregators must:
-/// - Implement `Default` (initial empty state)
-/// - Be `Send + Sync` for async processing
-/// - Be serializable with `bincode::Encode + bincode::Decode`
-/// - Be `Clone`able for snapshots
-/// - Implement [`AggregatorName`] for type identification
-/// - Be `Debug`gable for diagnostics
-///
-/// # Examples
-///
-/// ```no_run
-/// use evento::{Aggregator, AggregatorName, EventDetails};
-/// use serde::{Deserialize, Serialize};
-/// use bincode::{Encode, Decode};
-///
-/// #[derive(AggregatorName, Encode, Decode)]
-/// struct UserCreated {
-///     name: String,
-///     email: String,
-/// }
-///
-/// #[derive(Default, Serialize, Deserialize, Encode, Decode, Clone, Debug)]
-/// struct User {
-///     name: String,
-///     email: String,
-///     is_active: bool,
-/// }
-///
-/// #[evento::aggregator]
-/// impl User {
-///     async fn user_created(&mut self, event: EventDetails<UserCreated>) -> anyhow::Result<()> {
-///         self.name = event.data.name;
-///         self.email = event.data.email;
-///         self.is_active = true;
-///         Ok(())
-///     }
-/// }
-/// ```
-pub trait Aggregator: Default + Send + Sync + Clone + AggregatorName + Debug {
-    /// Process an event and update the aggregate's state
-    ///
-    /// This method is called for each event when rebuilding the aggregate from the event store.
-    /// The implementation should update the aggregate's state based on the event.
-    ///
-    /// Typically, this method is generated automatically by the `#[evento::aggregator]` macro
-    /// and dispatches to specific handler methods based on the event type.
-    fn aggregate<'async_trait>(
-        &'async_trait mut self,
-        event: &'async_trait Event,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'async_trait>,
-    >
-    where
-        Self: Sync + 'async_trait;
-
-    /// Get the revision hash for this aggregate implementation
-    ///
-    /// The revision changes when the aggregate's event handling logic changes.
-    /// This is used for versioning and ensuring compatibility.
-    fn revision() -> &'static str;
-}
-
-/// Trait for types that have a name identifier
-///
-/// `AggregatorName` provides a way to get the name of a type at runtime.
-/// This is used to identify event types and aggregate types in the event store.
-///
-/// # Implementation
-///
-/// For events, derive this trait using `#[derive(AggregatorName)]`.
-/// For aggregates, this is automatically implemented by the `#[evento::aggregator]` macro.
-///
-/// # Examples
-///
-/// ```no_run
-/// use evento::AggregatorName;
-/// use bincode::{Encode, Decode};
-///
-/// #[derive(AggregatorName, Encode, Decode)]
-/// struct UserCreated {
-///     name: String,
-/// }
-///
-/// assert_eq!(UserCreated::name(), "UserCreated");
-/// ```
-pub trait AggregatorName {
-    /// Get the name of this type
-    fn name() -> &'static str;
 }

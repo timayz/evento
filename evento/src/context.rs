@@ -5,7 +5,7 @@ use std::{
     fmt,
     hash::{BuildHasherDefault, Hasher},
     ops::Deref,
-    sync::Arc,
+    sync::{Arc, RwLock},
 };
 
 /// A hasher for `TypeId`s that takes advantage of its known characteristics.
@@ -236,5 +236,84 @@ where
         S: serde::Serializer,
     {
         self.0.serialize(serializer)
+    }
+}
+
+pub struct RwContext(Arc<RwLock<Context>>);
+
+impl Default for RwContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RwContext {
+    /// Creates an empty `RwContext`.
+    #[inline]
+    pub fn new() -> Self {
+        RwContext(Arc::new(RwLock::new(Context::new())))
+    }
+
+    /// Insert an item into the map.
+    ///
+    /// If an item of this type was already stored, it will be replaced and returned.
+    pub fn insert<T: Send + Sync + 'static>(&self, val: T) -> Option<T> {
+        self.0.write().expect("RwContext lock poisoned").insert(val)
+    }
+
+    /// Check if map contains an item of a given type.
+    pub fn contains<T: 'static>(&self) -> bool {
+        self.0
+            .read()
+            .expect("RwContext lock poisoned")
+            .contains::<T>()
+    }
+
+    /// Get a clone of an item of a given type, panics if not found.
+    pub fn extract<T: Clone + 'static>(&self) -> T {
+        self.0
+            .read()
+            .expect("RwContext lock poisoned")
+            .extract::<T>()
+            .clone()
+    }
+
+    /// Get a clone of an item of a given type.
+    pub fn get<T: Clone + 'static>(&self) -> Option<T> {
+        self.0
+            .read()
+            .expect("RwContext lock poisoned")
+            .get::<T>()
+            .cloned()
+    }
+
+    /// Remove an item from the map of a given type.
+    ///
+    /// If an item of this type was already stored, it will be returned.
+    pub fn remove<T: Send + Sync + 'static>(&self) -> Option<T> {
+        self.0
+            .write()
+            .expect("RwContext lock poisoned")
+            .remove::<T>()
+    }
+
+    /// Clear the `RwContext` of all inserted extensions.
+    #[inline]
+    pub fn clear(&self) {
+        self.0.write().expect("RwContext lock poisoned").clear();
+    }
+
+    /// Extends self with the items from another `Context`.
+    pub fn extend(&self, other: Context) {
+        self.0
+            .write()
+            .expect("RwContext lock poisoned")
+            .extend(other);
+    }
+}
+
+impl Clone for RwContext {
+    fn clone(&self) -> Self {
+        RwContext(Arc::clone(&self.0))
     }
 }

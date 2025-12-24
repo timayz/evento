@@ -2,20 +2,20 @@ use bincode::{Decode, Encode};
 use evento::{AggregatorName, Event, EventDetails, Executor, WriteError};
 
 pub async fn load<E: Executor>(executor: &E) -> anyhow::Result<()> {
-    let id = evento::create::<Calcul>()
-        .data(&Added { value: 13 })?
-        .data(&Subtracted { value: 3 })?
-        .data(&Multiplied { value: 3 })?
-        .data(&Divided { value: 10 })?
+    let id = evento::create()
+        .event(&Added { value: 13 })?
+        .event(&Subtracted { value: 3 })?
+        .event(&Multiplied { value: 3 })?
+        .event(&Divided { value: 10 })?
         .commit(executor)
         .await?;
 
     let calcul = evento::load::<Calcul, _>(executor, id.to_owned()).await?;
     assert_eq!(calcul.item.value, 3);
 
-    evento::save_with(calcul)
+    evento::aggregator_from(calcul)
         .metadata(&true)?
-        .data(&Added { value: 9 })?
+        .event(&Added { value: 9 })?
         .commit(executor)
         .await?;
 
@@ -25,38 +25,38 @@ pub async fn load<E: Executor>(executor: &E) -> anyhow::Result<()> {
 }
 
 pub async fn version<E: Executor>(executor: &E) -> anyhow::Result<()> {
-    let id = evento::create::<Calcul>()
+    let id = evento::create()
         .metadata(&true)?
-        .data(&Added { value: 2 })?
+        .event(&Added { value: 2 })?
         .commit(executor)
         .await?;
 
     let calcul = evento::load::<Calcul, _>(executor, id.to_owned()).await?;
     assert_eq!(calcul.event.version, 1);
 
-    evento::save::<Calcul>(&id)
+    evento::aggregator(&id)
         .metadata(&true)?
-        .data(&Added { value: 9 })?
-        .data(&Added { value: 3 })?
+        .event(&Added { value: 9 })?
+        .event(&Added { value: 3 })?
         .commit(executor)
         .await?;
 
     let calcul = evento::load::<Calcul, _>(executor, id).await?;
     assert_eq!(calcul.event.version, 3);
 
-    let id = evento::create::<Calcul>()
+    let id = evento::create()
         .metadata(&true)?
-        .data(&Added { value: 2 })?
-        .data(&Added { value: 32 })?
+        .event(&Added { value: 2 })?
+        .event(&Added { value: 32 })?
         .commit(executor)
         .await?;
 
     let calcul = evento::load::<Calcul, _>(executor, id.to_owned()).await?;
     assert_eq!(calcul.event.version, 2);
 
-    evento::save_with(calcul.clone())
+    evento::aggregator_from(calcul.clone())
         .metadata(&true)?
-        .data(&Added { value: 9 })?
+        .event(&Added { value: 9 })?
         .commit(executor)
         .await?;
 
@@ -67,38 +67,38 @@ pub async fn version<E: Executor>(executor: &E) -> anyhow::Result<()> {
 }
 
 pub async fn routing_key<E: Executor>(executor: &E) -> anyhow::Result<()> {
-    let id = evento::create::<Calcul>()
+    let id = evento::create()
         .metadata(&true)?
-        .data(&Added { value: 2 })?
+        .event(&Added { value: 2 })?
         .commit(executor)
         .await?;
 
     let calcul = evento::load::<Calcul, _>(executor, id.to_owned()).await?;
     assert_eq!(calcul.event.routing_key, None);
 
-    evento::save_with(calcul.clone())
+    evento::aggregator_from(calcul.clone())
         .routing_key("routing1")
         .metadata(&true)?
-        .data(&Added { value: 9 })?
+        .event(&Added { value: 9 })?
         .commit(executor)
         .await?;
 
     let calcul = evento::load::<Calcul, _>(executor, id).await?;
     assert_eq!(calcul.event.routing_key, None);
 
-    let id = evento::create::<Calcul>()
+    let id = evento::create()
         .routing_key("routing1")
         .metadata(&true)?
-        .data(&Added { value: 2 })?
+        .event(&Added { value: 2 })?
         .commit(executor)
         .await?;
 
     let calcul = evento::load::<Calcul, _>(executor, id.to_owned()).await?;
     assert_eq!(calcul.event.routing_key, Some("routing1".to_owned()));
 
-    evento::save::<Calcul>(&id)
+    evento::aggregator(&id)
         .metadata(&true)?
-        .data(&Added { value: 9 })?
+        .event(&Added { value: 9 })?
         .commit(executor)
         .await?;
 
@@ -109,22 +109,22 @@ pub async fn routing_key<E: Executor>(executor: &E) -> anyhow::Result<()> {
 }
 
 pub async fn invalid_original_version<E: Executor>(executor: &E) -> anyhow::Result<()> {
-    let id = evento::create::<Calcul>()
+    let id = evento::create()
         .metadata(&true)?
-        .data(&Added { value: 2 })?
+        .event(&Added { value: 2 })?
         .commit(executor)
         .await?;
 
     let calcul = evento::load::<Calcul, _>(executor, id.to_owned()).await?;
-    evento::save::<Calcul>(&id)
+    evento::aggregator(&id)
         .metadata(&true)?
-        .data(&Added { value: 9 })?
+        .event(&Added { value: 9 })?
         .commit(executor)
         .await?;
 
-    let res = evento::save_with(calcul)
+    let res = evento::aggregator_from(calcul)
         .metadata(&true)?
-        .data(&Multiplied { value: 3 })?
+        .event(&Multiplied { value: 3 })?
         .commit(executor)
         .await;
 
@@ -134,9 +134,9 @@ pub async fn invalid_original_version<E: Executor>(executor: &E) -> anyhow::Resu
     );
 
     let calcul = evento::load::<Calcul, _>(executor, id).await?;
-    evento::save_with(calcul)
+    evento::aggregator_from(calcul)
         .metadata(&true)?
-        .data(&Subtracted { value: 39 })?
+        .event(&Subtracted { value: 39 })?
         .commit(executor)
         .await?;
 
@@ -395,24 +395,15 @@ pub async fn subscribe_default_multiple_aggregator<E: Executor + Clone>(
     Ok(())
 }
 
-#[derive(Debug, Encode, Decode, PartialEq, AggregatorName)]
-struct Added {
-    pub value: i16,
-}
+#[evento::aggregator_next(AggregatorName)]
+pub enum Calcul {
+    Added { value: i16 },
 
-#[derive(Debug, Encode, Decode, PartialEq, AggregatorName)]
-struct Subtracted {
-    pub value: i16,
-}
+    Subtracted { value: i16 },
 
-#[derive(Debug, Encode, Decode, PartialEq, AggregatorName)]
-struct Multiplied {
-    pub value: i16,
-}
+    Multiplied { value: i16 },
 
-#[derive(Debug, Encode, Decode, PartialEq, AggregatorName)]
-struct Divided {
-    pub value: i16,
+    Divided { value: i16 },
 }
 
 type CalculEvent<D> = EventDetails<D, bool>;
@@ -420,6 +411,12 @@ type CalculEvent<D> = EventDetails<D, bool>;
 #[derive(Debug, Default, Encode, Decode, Clone)]
 struct Calcul {
     pub value: i64,
+}
+
+impl evento::projection::Aggregator for Calcul {
+    fn aggregator_type() -> &'static str {
+        "Calcul"
+    }
 }
 
 #[evento::aggregator]

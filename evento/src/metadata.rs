@@ -1,4 +1,5 @@
-use super::EventDetails;
+use crate::projection::EventData;
+
 use bincode::{Decode, Encode};
 use thiserror::Error;
 use ulid::Ulid;
@@ -59,4 +60,4 @@ impl Default for Metadata {
     }
 }
 
-pub type Event<D> = EventDetails<D, Metadata>;
+pub type Event<D> = EventData<D, Metadata>;

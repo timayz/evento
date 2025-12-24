@@ -3,9 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::{
-    cursor::Args, Aggregator, AggregatorName, Event, Executor, LoadResult, ReadAggregator,
-};
+use crate::{cursor::Args, Event, Executor, ReadAggregator};
 
 #[derive(Debug, Error)]
 pub enum WriteError {
@@ -25,7 +23,7 @@ pub enum WriteError {
     SystemTime(#[from] std::time::SystemTimeError),
 }
 
-pub struct SaveBuilder {
+pub struct AggregatorBuilder {
     aggregator_id: String,
     aggregator_type: String,
     routing_key: Option<String>,
@@ -35,11 +33,11 @@ pub struct SaveBuilder {
     metadata: Option<Vec<u8>>,
 }
 
-impl SaveBuilder {
-    pub fn new<A: Aggregator>(aggregator_id: impl Into<String>) -> SaveBuilder {
-        SaveBuilder {
+impl AggregatorBuilder {
+    pub fn new(aggregator_id: impl Into<String>) -> AggregatorBuilder {
+        AggregatorBuilder {
             aggregator_id: aggregator_id.into(),
-            aggregator_type: A::name().to_owned(),
+            aggregator_type: "".to_owned(),
             routing_key: None,
             routing_key_locked: false,
             original_version: 0,
@@ -78,13 +76,14 @@ impl SaveBuilder {
         Ok(self)
     }
 
-    pub fn data<D: bincode::Encode + AggregatorName>(
+    pub fn event<D: bincode::Encode + crate::projection::Event>(
         mut self,
         v: &D,
     ) -> Result<Self, bincode::error::EncodeError> {
         let config = bincode::config::standard();
         let data = bincode::encode_to_vec(v, config)?;
-        self.data.push((D::name(), data));
+        self.data.push((D::event_name(), data));
+        self.aggregator_type = D::aggregator_type().to_owned();
 
         Ok(self)
     }
@@ -179,50 +178,8 @@ impl SaveBuilder {
 ///     Ok(user_id)
 /// }
 /// ```
-pub fn create<A: Aggregator>() -> SaveBuilder {
-    SaveBuilder::new::<A>(Ulid::new())
-}
-
-/// Create a new aggregate with a specific ID
-///
-/// Creates a builder for generating events that will create a new aggregate instance
-/// with a user-specified ID instead of an automatically generated ULID.
-///
-/// This is useful when you need to use a deterministic or externally provided ID
-/// for the aggregate, such as when integrating with external systems.
-///
-/// # Parameters
-///
-/// - `id`: The ID to use for the new aggregate
-///
-/// # Examples
-///
-/// ```no_run
-/// use evento::create_with;
-/// # use evento::*;
-/// # use bincode::{Encode, Decode};
-/// # #[derive(AggregatorName, Encode, Decode)]
-/// # struct UserCreated { name: String }
-/// # #[derive(Default, Encode, Decode, Clone, Debug)]
-/// # struct User;
-/// # #[evento::aggregator]
-/// # impl User {}
-///
-/// async fn create_user_with_id(executor: &evento::Sqlite) -> anyhow::Result<String> {
-///     let user_id = create_with::<User>("user-123")
-///         .data(&UserCreated {
-///             name: "John Doe".to_string(),
-///         })?
-///         .metadata(&true)?
-///         .commit(executor)
-///         .await?;
-///
-///     println!("Created user with ID: {}", user_id);
-///     Ok(user_id)
-/// }
-/// ```
-pub fn create_with<A: Aggregator>(id: impl Into<String>) -> SaveBuilder {
-    SaveBuilder::new::<A>(id)
+pub fn create() -> AggregatorBuilder {
+    AggregatorBuilder::new(Ulid::new())
 }
 
 /// Add events to an existing aggregate
@@ -264,57 +221,6 @@ pub fn create_with<A: Aggregator>(id: impl Into<String>) -> SaveBuilder {
 ///     Ok(result_id)
 /// }
 /// ```
-pub fn save<A: Aggregator>(id: impl Into<String>) -> SaveBuilder {
-    SaveBuilder::new::<A>(id)
-}
-
-/// Save events to an aggregate using a loaded aggregate state
-///
-/// Creates a builder for adding events to an aggregate using a previously loaded
-/// [`LoadResult`]. This is more efficient than [`save`] because it avoids loading
-/// the aggregate from the event store again.
-///
-/// The builder is pre-configured with the aggregate's current state, version, and routing key.
-///
-/// # Parameters
-///
-/// - `aggregator`: A [`LoadResult`] from [`load`] containing the aggregate state
-///
-/// # Examples
-///
-/// ```no_run
-/// use evento::{load, save_with};
-/// # use evento::*;
-/// # use bincode::{Encode, Decode};
-/// # #[derive(AggregatorName, Encode, Decode)]
-/// # struct UserEmailChanged { email: String }
-/// # #[derive(Default, Encode, Decode, Clone, Debug)]
-/// # struct User;
-/// # #[evento::aggregator]
-/// # impl User {}
-///
-/// async fn update_user_efficiently(
-///     executor: &evento::Sqlite,
-///     user_id: &str,
-///     new_email: &str,
-/// ) -> anyhow::Result<String> {
-///     // Load the current state
-///     let user = load::<User, _>(executor, user_id).await?;
-///     
-///     // Save using the loaded state (more efficient)
-///     let result_id = save_with(user)
-///         .data(&UserEmailChanged {
-///             email: new_email.to_string(),
-///         })?
-///         .metadata(&false)?
-///         .commit(executor)
-///         .await?;
-///     
-///     Ok(result_id)
-/// }
-/// ```
-pub fn save_with<A: Aggregator>(aggregator: LoadResult<A>) -> SaveBuilder {
-    SaveBuilder::new::<A>(aggregator.event.aggregator_id)
-        .original_version(aggregator.event.version as u16)
-        .routing_key_opt(aggregator.event.routing_key)
+pub fn aggregator(id: impl Into<String>) -> AggregatorBuilder {
+    AggregatorBuilder::new(id)
 }

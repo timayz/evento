@@ -1,0 +1,9 @@
+[package]
+name = "bank"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+evento = { path = "../../evento" }
+bincode = "2"
+anyhow = "1"

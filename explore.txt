@@ -1,74 +1,8 @@
-#[derive(Aggregator)]
-enum User {
-    Registered {
-        email: String,
-        password_hash: String,
-    },
-    Deleted {
-        reason: Option<String>,
-    },
-    UsernameChanged {
-      value: String,
-    }
-}
-
-#[derive(Aggregator)]
-enum Recipe {
-    Created {
-        name: String,
-    },
-}
-
-#[evento::handler]
-fn handle(ctx: Context, event: Event<RecipeCreated>, row: Option<&mut RecipeRow>) -> anyhow::Result<()> {
-    if let Some(row) = row {
-      row.name = event.data.name;
-    } else {
-      // save in storage
-    }
-
-    Ok(())
-}
-
-#[evento::handler]
-fn handle(ctx: Context, event: Event<UserUsernameChanged>, row: Option<&mut RecipeRow>) -> anyhow::Result<()> {
-    if let Some(row) = row {
-      row.owner_name = event.data.value;
-    } else {
-      // save data in storage
-    }
-
-    Ok(())
-}
-
-#[evento::handler]
-fn handle(ctx: Context, event: Event<UserDeleted>, row: Option<&mut RecipeRow>) -> anyhow::Result<()> {
-    if let Some(row) = row {
-      row.deleted = true;
-    } else {
-      // delete data in storage
-    }
-
-    Ok(())
-}
-
-let projection = Projection::new("recipe")
-                    .handler(user_registered_handler())
-                    .handler(user_logged_in_handler())
-                    .to_owned();
-
-let row = projection.load::<Recipe, RecipeRow>("my-recipe-id")
-                .aggregator::<User>("my-id")
-                .execute();
-
-let sub = projection.subscribe().run()
 
 //
-// allow subscribe with aggregate_id
-// try to use same method (stream?) for load/subscribe
-// allow to save_with in LoadResult
+// remove LoadResult
 // struct to easy set app key (us-east-1,...) for all evento::save/subscribe ?
 // split evento into multi create like evento-core, evento-sqlx, evento-macro, evento. workspace deps
 // create multi examples like bank (buisness logic), axum-htmx-sse
-// projection (load + new event, subscribe for update in backgroung), create projection (add handler etc...) then allow to load or subscribe, optional load with AggregateId 
-
+// replace bincode by rkyv
+// internal pub sub for projection with mpsc chanel that send message if handler return Some(mesaage)
