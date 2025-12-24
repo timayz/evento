@@ -108,7 +108,14 @@ impl<P: 'static, E: Executor> Projection<P, E> {
         self
     }
 
-    pub fn load(self, id: impl Into<String>) -> LoadBuilder<P, E>
+    pub async fn load(self, executor: &E, id: impl Into<String>) -> Result<Option<P>, anyhow::Error>
+    where
+        P: Snapshot + Default,
+    {
+        self.load_with_opts(id).execute(executor).await
+    }
+
+    pub fn load_with_opts(self, id: impl Into<String>) -> LoadBuilder<P, E>
     where
         P: Snapshot + Default,
     {
@@ -142,6 +149,13 @@ pub trait Snapshot: Sized {
         id: String,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<Option<Self>>> + Send + 'a>>;
 }
+//
+// #[derive(Debug, Clone, Default)]
+// pub struct LoadResult<A> {
+//     pub item: A,
+//     pub version: i32,
+//     pub routing_key: Option<String>,
+// }
 
 pub struct LoadBuilder<P: Snapshot + Default + 'static, E: Executor> {
     key: String,
@@ -212,6 +226,11 @@ impl<P: Snapshot + Default + 'static, E: Executor> LoadBuilder<P, E> {
 
         if let Some(event) = events.edges.last() {
             return Ok(Some(projection));
+            // return Ok(Some(LoadResult {
+            //     item: projection,
+            //     version: event.node.version,
+            //     routing_key: event.node.routing_key.to_owned(),
+            // }));
         }
 
         if !has_loaded {
@@ -226,8 +245,13 @@ impl<P: Snapshot + Default + 'static, E: Executor> LoadBuilder<P, E> {
             )
             .await?;
 
-        if !events.edges.is_empty() {
+        if let Some(_event) = events.edges.first() {
             return Ok(Some(projection));
+            // return Ok(Some(LoadResult {
+            //     item: projection,
+            //     version: event.node.version,
+            //     routing_key: event.node.routing_key.to_owned(),
+            // }));
         }
 
         Ok(None)

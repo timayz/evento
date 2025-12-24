@@ -12,7 +12,7 @@ use crate::{
     value_object::{AccountStatus, AccountType},
 };
 
-fn create_projection<E: Executor>() -> Projection<AccountDetailsView, E> {
+pub fn create_projection<E: Executor>() -> Projection<AccountDetailsView, E> {
     Projection::new("account-details-view")
         .handler(handle_money_deposit())
         .handler(handle_account_opened())

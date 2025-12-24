@@ -9,7 +9,7 @@ use crate::{
     value_object::AccountStatus,
 };
 
-fn create_projection<E: Executor>() -> Projection<AccountStatusView, E> {
+pub fn create_projection<E: Executor>() -> Projection<AccountStatusView, E> {
     Projection::new("account-status-view")
         .handler(handle_account_opened())
         .handler(handle_account_closed())

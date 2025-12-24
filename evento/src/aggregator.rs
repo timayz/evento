@@ -147,80 +147,10 @@ impl AggregatorBuilder {
     }
 }
 
-/// Create a new aggregate with initial events
-///
-/// Creates a builder for generating events that will create a new aggregate instance.
-/// The aggregate starts in its default state and the generated ID is a new ULID.
-///
-/// # Examples
-///
-/// ```no_run
-/// use evento::create;
-/// # use evento::*;
-/// # use bincode::{Encode, Decode};
-/// # #[derive(AggregatorName, Encode, Decode)]
-/// # struct UserCreated { name: String }
-/// # #[derive(Default, Encode, Decode, Clone, Debug)]
-/// # struct User;
-/// # #[evento::aggregator]
-/// # impl User {}
-///
-/// async fn create_user(executor: &evento::Sqlite) -> anyhow::Result<String> {
-///     let user_id = create::<User>()
-///         .data(&UserCreated {
-///             name: "John Doe".to_string(),
-///         })?
-///         .metadata(&true)?
-///         .commit(executor)
-///         .await?;
-///     
-///     println!("Created user with ID: {}", user_id);
-///     Ok(user_id)
-/// }
-/// ```
 pub fn create() -> AggregatorBuilder {
     AggregatorBuilder::new(Ulid::new())
 }
 
-/// Add events to an existing aggregate
-///
-/// Creates a builder for adding events to an aggregate with the specified ID.
-/// The current state will be loaded from the event store before applying new events.
-///
-/// # Parameters
-///
-/// - `id`: The ID of the aggregate to modify
-///
-/// # Examples
-///
-/// ```no_run
-/// use evento::save;
-/// # use evento::*;
-/// # use bincode::{Encode, Decode};
-/// # #[derive(AggregatorName, Encode, Decode)]
-/// # struct UserEmailChanged { email: String }
-/// # #[derive(Default, Encode, Decode, Clone, Debug)]
-/// # struct User;
-/// # #[evento::aggregator]
-/// # impl User {}
-///
-/// async fn update_user_email(
-///     executor: &evento::Sqlite,
-///     user_id: &str,
-///     new_email: &str,
-/// ) -> anyhow::Result<String> {
-///     let result_id = save::<User>(user_id)
-///         .data(&UserEmailChanged {
-///             email: new_email.to_string(),
-///         })?
-///         .metadata(&false)?
-///         .commit(executor)
-///         .await?;
-///     
-///     println!("Updated user {} with new email", result_id);
-///     Ok(result_id)
-/// }
-/// ```
 pub fn aggregator(id: impl Into<String>) -> AggregatorBuilder {
     AggregatorBuilder::new(id)
 }

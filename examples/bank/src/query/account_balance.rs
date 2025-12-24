@@ -9,7 +9,7 @@ use crate::aggregator::{
     OverdraftLimitChanged,
 };
 
-fn create_projection<E: Executor>() -> Projection<AccountBalanceView, E> {
+pub fn create_projection<E: Executor>() -> Projection<AccountBalanceView, E> {
     Projection::new("account-balance-view")
         .handler(handle_money_deposit())
         .handler(handle_account_opened())
