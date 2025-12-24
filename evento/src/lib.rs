@@ -99,10 +99,8 @@ mod aggregator;
 pub mod context;
 pub mod cursor;
 mod executor;
-// mod load;
 pub mod metadata;
 pub mod projection;
-// mod subscription;
 
 #[cfg(any(feature = "sqlite", feature = "mysql", feature = "postgres"))]
 pub mod sql;
@@ -117,10 +115,8 @@ pub use evento_macro::*;
 pub use aggregator::*;
 pub use executor::*;
 pub use projection::*;
-// pub use load::*;
-// pub use subscription::*;
 
-use std::{fmt::Debug, ops::Deref};
+use std::fmt::Debug;
 use ulid::Ulid;
 
 use crate::cursor::Cursor;

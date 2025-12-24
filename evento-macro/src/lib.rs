@@ -27,12 +27,9 @@ use convert_case::{Case, Casing};
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote, ToTokens};
-use sha3::{Digest, Sha3_256};
-use std::ops::Deref;
 use syn::{
-    parse_macro_input, punctuated::Punctuated, spanned::Spanned, Error, Fields, FnArg,
-    GenericArgument, Ident, ItemEnum, ItemFn, ItemImpl, ItemStruct, Meta, PatType, PathArguments,
-    ReturnType, Token, Type, TypePath,
+    parse_macro_input, punctuated::Punctuated, Error, Fields, FnArg, GenericArgument, ItemEnum,
+    ItemFn, Meta, PatType, PathArguments, ReturnType, Token, Type, TypePath,
 };
 
 #[proc_macro_attribute]

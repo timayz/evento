@@ -1,8 +1,7 @@
 
 //
-// remove LoadResult
 // struct to easy set app key (us-east-1,...) for all evento::save/subscribe ?
 // split evento into multi create like evento-core, evento-sqlx, evento-macro, evento. workspace deps
-// create multi examples like bank (buisness logic), axum-htmx-sse
+// create multi examples axum-htmx-sse
 // replace bincode by rkyv
 // internal pub sub for projection with mpsc chanel that send message if handler return Some(mesaage)
