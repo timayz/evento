@@ -9,8 +9,8 @@
 //!
 //! // Create a new aggregate with auto-generated ID
 //! let id = create()
-//!     .event(&AccountOpened { owner: "John".into() })?
-//!     .metadata(&metadata)?
+//!     .event(&AccountOpened { owner: "John".into() })
+//!     .metadata(&metadata)
 //!     .routing_key("accounts")
 //!     .commit(&executor)
 //!     .await?;
@@ -18,7 +18,7 @@
 //! // Add events to existing aggregate
 //! aggregator(&existing_id)
 //!     .original_version(current_version)
-//!     .event(&MoneyDeposited { amount: 100 })?
+//!     .event(&MoneyDeposited { amount: 100 })
 //!     .commit(&executor)
 //!     .await?;
 //! ```
@@ -45,10 +45,6 @@ pub enum WriteError {
     #[error("{0}")]
     Unknown(#[from] anyhow::Error),
 
-    /// Failed to serialize event data with rkyv
-    #[error("rkyv.encode >> {0}")]
-    RkyvEncode(String),
-
     /// System time error
     #[error("systemtime >> {0}")]
     SystemTime(#[from] std::time::SystemTimeError),
@@ -70,14 +66,14 @@ pub enum WriteError {
 /// ```rust,ignore
 /// // New aggregate
 /// let id = create()
-///     .event(&MyEvent { ... })?
+///     .event(&MyEvent { ... })
 ///     .commit(&executor)
 ///     .await?;
 ///
 /// // Existing aggregate with version check
 /// aggregator(&id)
 ///     .original_version(5)
-///     .event(&AnotherEvent { ... })?
+///     .event(&AnotherEvent { ... })
 ///     .commit(&executor)
 ///     .await?;
 /// ```
@@ -123,46 +119,21 @@ impl AggregatorBuilder {
         self
     }
 
-    pub fn metadata<M>(mut self, v: &M) -> Result<Self, WriteError>
+    pub fn metadata<M>(mut self, v: &M) -> Self
     where
-        M: for<'a> rkyv::Serialize<
-            rkyv::rancor::Strategy<
-                rkyv::ser::Serializer<
-                    rkyv::util::AlignedVec,
-                    rkyv::ser::allocator::ArenaHandle<'a>,
-                    rkyv::ser::sharing::Share,
-                >,
-                rkyv::rancor::Error,
-            >,
-        >,
+        M: bitcode::Encode,
     {
-        let metadata = rkyv::to_bytes::<rkyv::rancor::Error>(v)
-            .map_err(|e| WriteError::RkyvEncode(e.to_string()))?;
-        self.metadata = Some(metadata.to_vec());
-
-        Ok(self)
+        self.metadata = Some(bitcode::encode(v));
+        self
     }
 
-    pub fn event<D>(mut self, v: &D) -> Result<Self, WriteError>
+    pub fn event<D>(mut self, v: &D) -> Self
     where
-        D: crate::projection::Event
-            + for<'a> rkyv::Serialize<
-                rkyv::rancor::Strategy<
-                    rkyv::ser::Serializer<
-                        rkyv::util::AlignedVec,
-                        rkyv::ser::allocator::ArenaHandle<'a>,
-                        rkyv::ser::sharing::Share,
-                    >,
-                    rkyv::rancor::Error,
-                >,
-            >,
+        D: crate::projection::Event + bitcode::Encode,
     {
-        let data = rkyv::to_bytes::<rkyv::rancor::Error>(v)
-            .map_err(|e| WriteError::RkyvEncode(e.to_string()))?;
-        self.data.push((D::event_name(), data.to_vec()));
+        self.data.push((D::event_name(), bitcode::encode(v)));
         self.aggregator_type = D::aggregator_type().to_owned();
-
-        Ok(self)
+        self
     }
 
     pub async fn commit<E: Executor>(&self, executor: &E) -> Result<String, WriteError> {
@@ -187,11 +158,10 @@ impl AggregatorBuilder {
             (self.original_version, self.routing_key.to_owned())
         };
 
-        let metadata = self.metadata.to_owned().unwrap_or_else(|| {
-            rkyv::to_bytes::<rkyv::rancor::Error>(&true)
-                .expect("Should never fail")
-                .to_vec()
-        });
+        let metadata = self
+            .metadata
+            .to_owned()
+            .unwrap_or_else(|| bitcode::encode(&true));
 
         let mut events = vec![];
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
@@ -231,7 +201,7 @@ impl AggregatorBuilder {
 ///
 /// ```rust,ignore
 /// let id = create()
-///     .event(&AccountOpened { ... })?
+///     .event(&AccountOpened { ... })
 ///     .commit(&executor)
 ///     .await?;
 /// ```
@@ -246,7 +216,7 @@ pub fn create() -> AggregatorBuilder {
 /// ```rust,ignore
 /// aggregator(&existing_id)
 ///     .original_version(current_version)
-///     .event(&MoneyDeposited { amount: 100 })?
+///     .event(&MoneyDeposited { amount: 100 })
 ///     .commit(&executor)
 ///     .await?;
 /// ```

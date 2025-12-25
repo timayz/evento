@@ -42,8 +42,8 @@ impl super::Command {
                 to_account_id: cmd.to_account_id,
                 transaction_id: cmd.transaction_id,
                 description: cmd.description,
-            })?
-            .metadata(&Metadata::default())?
+            })
+            .metadata(&Metadata::default())
             .commit(executor)
             .await?;
 
@@ -82,8 +82,8 @@ impl super::Command {
                 to_account_id: cmd.to_account_id,
                 transaction_id: cmd.transaction_id,
                 description: cmd.description,
-            })?
-            .metadata(&Metadata::default())?
+            })
+            .metadata(&Metadata::default())
             .commit(executor)
             .await?;
 

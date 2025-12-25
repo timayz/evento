@@ -22,8 +22,8 @@
 //!
 //! // Use with event creation
 //! create()
-//!     .event(&my_event)?
-//!     .metadata(&metadata)?
+//!     .event(&my_event)
+//!     .metadata(&metadata)
 //!     .commit(&executor)
 //!     .await?;
 //! ```
@@ -42,7 +42,7 @@ pub enum MetadataError {
 }
 
 /// User identification for event metadata.
-#[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(Clone, bitcode::Encode, bitcode::Decode)]
 pub enum MetadataUser {
     /// Anonymous/system action
     Anonyme,
@@ -56,7 +56,7 @@ pub enum MetadataUser {
 ///
 /// Contains a unique ID and user identification. Default creates
 /// anonymous metadata with an auto-generated ULID.
-#[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(Clone, bitcode::Encode, bitcode::Decode)]
 pub struct Metadata {
     /// Unique metadata ID (ULID)
     pub id: String,

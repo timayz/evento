@@ -40,8 +40,8 @@
 //! use evento::metadata::Metadata;
 //!
 //! let id = evento::create()
-//!     .event(&AccountOpened { owner_id: "user1".into(), initial_balance: 1000 })?
-//!     .metadata(&Metadata::default())?
+//!     .event(&AccountOpened { owner_id: "user1".into(), initial_balance: 1000 })
+//!     .metadata(&Metadata::default())
 //!     .commit(&executor)
 //!     .await?;
 //! ```
@@ -68,8 +68,8 @@
 //!
 //! // Create and persist an event
 //! let id = evento::create()
-//!     .event(&AccountOpened { owner_id: "user1".into(), initial_balance: 1000 })?
-//!     .metadata(&Metadata::default())?
+//!     .event(&AccountOpened { owner_id: "user1".into(), initial_balance: 1000 })
+//!     .metadata(&Metadata::default())
 //!     .commit(&executor)
 //!     .await?;
 //!
@@ -104,7 +104,7 @@ use crate::cursor::Cursor;
 ///
 /// Used internally for base64-encoded cursor values in paginated queries.
 /// Contains the essential fields needed to uniquely identify an event's position.
-#[derive(Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(Debug, bitcode::Encode, bitcode::Decode)]
 pub struct EventCursor {
     /// Event ID (ULID string)
     pub i: String,
@@ -130,15 +130,15 @@ pub struct EventCursor {
 /// - `version` - Sequence number within the aggregate (for optimistic concurrency)
 /// - `name` - Event type name like `"AccountOpened"`
 /// - `routing_key` - Optional key for event distribution/partitioning
-/// - `data` - Serialized event payload (rkyv format)
-/// - `metadata` - Serialized metadata (rkyv format)
+/// - `data` - Serialized event payload (bitcode format)
+/// - `metadata` - Serialized metadata (bitcode format)
 /// - `timestamp` - When the event occurred (Unix seconds)
 /// - `timestamp_subsec` - Sub-second precision (milliseconds)
 ///
 /// # Serialization
 ///
-/// Event data and metadata are serialized using [rkyv](https://rkyv.org/) for
-/// zero-copy deserialization. Use [`projection::EventData`] to deserialize.
+/// Event data and metadata are serialized using [bitcode](https://crates.io/crates/bitcode)
+/// for compact binary representation. Use [`projection::EventData`] to deserialize.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Event {
     /// Unique event identifier (ULID)
@@ -153,9 +153,9 @@ pub struct Event {
     pub name: String,
     /// Optional routing key for event distribution
     pub routing_key: Option<String>,
-    /// Serialized event data (rkyv format)
+    /// Serialized event data (bitcode format)
     pub data: Vec<u8>,
-    /// Serialized event metadata (rkyv format)
+    /// Serialized event metadata (bitcode format)
     pub metadata: Vec<u8>,
     /// Unix timestamp when the event occurred (seconds)
     pub timestamp: u64,
@@ -179,8 +179,7 @@ impl Cursor for Event {
         use base64::{alphabet, engine::general_purpose, engine::GeneralPurpose, Engine};
 
         let cursor = self.serialize();
-        let encoded = rkyv::to_bytes::<rkyv::rancor::Error>(&cursor)
-            .map_err(|e| cursor::CursorError::Rkyv(e.to_string()))?;
+        let encoded = bitcode::encode(&cursor);
 
         let engine = GeneralPurpose::new(&alphabet::URL_SAFE, general_purpose::PAD);
 
@@ -193,8 +192,8 @@ impl Cursor for Event {
         let engine = GeneralPurpose::new(&alphabet::URL_SAFE, general_purpose::PAD);
         let decoded = engine.decode(value)?;
 
-        let result = rkyv::from_bytes::<Self::T, rkyv::rancor::Error>(&decoded)
-            .map_err(|e| cursor::CursorError::Rkyv(e.to_string()))?;
+        let result = bitcode::decode::<Self::T>(&decoded)
+            .map_err(|e| cursor::CursorError::Bitcode(e.to_string()))?;
 
         Ok(result)
     }

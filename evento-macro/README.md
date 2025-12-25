@@ -12,14 +12,14 @@ This crate is typically used through the main `evento` crate with the `macro` fe
 
 ```toml
 [dependencies]
-evento = "1.8"
+evento = "2"
 ```
 
 Or use this crate directly:
 
 ```toml
 [dependencies]
-evento-macro = "1.8"
+evento-macro = "2"
 ```
 
 ## Macros
@@ -72,7 +72,7 @@ This generates:
 - Individual structs: `AccountOpened`, `MoneyDeposited`, `MoneyWithdrawn`, `AccountClosed`
 - `Aggregator` trait implementation (provides `aggregator_type()`)
 - `Event` trait implementation (provides `event_name()`)
-- Automatic derives: `Debug`, `Clone`, `PartialEq`, `Default`, and rkyv serialization
+- Automatic derives: `Debug`, `Clone`, `PartialEq`, `Default`, and bitcode serialization
 
 The aggregator type is formatted as `"{package_name}/{enum_name}"`, e.g., `"bank/BankAccount"`.
 
@@ -169,11 +169,10 @@ When using these macros, your types must meet certain requirements:
 
 ## Serialization
 
-Events are serialized using [rkyv](https://rkyv.org/) for zero-copy deserialization. The `#[aggregator]` macro automatically adds the required rkyv derives:
+Events are serialized using [bitcode](https://crates.io/crates/bitcode) for compact binary representation. The `#[aggregator]` macro automatically adds the required bitcode derives:
 
-- `rkyv::Archive`
-- `rkyv::Serialize`
-- `rkyv::Deserialize`
+- `bitcode::Encode`
+- `bitcode::Decode`
 
 ## Minimum Supported Rust Version
 

@@ -29,8 +29,8 @@ use evento_core::{
 /// - `AggregatorType` - Aggregate root type (VARCHAR(50))
 /// - `AggregatorId` - Aggregate root instance ID (VARCHAR(26))
 /// - `Version` - Event sequence number within the aggregate
-/// - `Data` - Serialized event payload (BLOB, rkyv format)
-/// - `Metadata` - Serialized event metadata (BLOB, rkyv format)
+/// - `Data` - Serialized event payload (BLOB, bitcode format)
+/// - `Metadata` - Serialized event metadata (BLOB, bitcode format)
 /// - `RoutingKey` - Optional routing key for partitioning (VARCHAR(50))
 /// - `Timestamp` - Event timestamp in seconds (BIGINT)
 /// - `TimestampSubsec` - Sub-second precision (BIGINT)

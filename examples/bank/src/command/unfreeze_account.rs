@@ -23,8 +23,8 @@ impl super::Command {
         }
 
         self.aggregator()
-            .event(&AccountUnfrozen { reason: cmd.reason })?
-            .metadata(&Metadata::default())?
+            .event(&AccountUnfrozen { reason: cmd.reason })
+            .metadata(&Metadata::default())
             .commit(executor)
             .await?;
 

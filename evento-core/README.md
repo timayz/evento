@@ -28,8 +28,8 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-evento-core = "1.8"
-rkyv = "0.8"
+evento-core = "2"
+bitcode = "0.6"
 ```
 
 ## Usage
@@ -60,8 +60,8 @@ use evento::{create, aggregator, metadata::Metadata};
 
 // Create a new aggregate with events
 let account_id = evento::create()
-    .event(&AccountOpened { owner: "Alice".into(), initial_balance: 100 })?
-    .metadata(&Metadata::default())?
+    .event(&AccountOpened { owner: "Alice".into(), initial_balance: 100 })
+    .metadata(&Metadata::default())
     .routing_key("accounts")
     .commit(&executor)
     .await?;
@@ -69,8 +69,8 @@ let account_id = evento::create()
 // Add events to existing aggregate
 evento::aggregator(&account_id)
     .original_version(1)
-    .event(&MoneyDeposited { amount: 100 })?
-    .metadata(&Metadata::default())?
+    .event(&MoneyDeposited { amount: 100 })
+    .metadata(&Metadata::default())
     .commit(&executor)
     .await?;
 ```
@@ -171,8 +171,8 @@ pub struct Event {
     pub aggregator_id: String,
     pub aggregator_type: String,
     pub version: u16,
-    pub data: Vec<u8>,          // rkyv-serialized event data
-    pub metadata: Vec<u8>,      // rkyv-serialized metadata
+    pub data: Vec<u8>,          // bitcode-serialized event data
+    pub metadata: Vec<u8>,      // bitcode-serialized metadata
     pub timestamp: u64,
     pub timestamp_subsec: u32,
     pub routing_key: Option<String>,
