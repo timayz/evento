@@ -1,0 +1,23 @@
+[package]
+name = "evento-sql-migrator"
+version = "1.8.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = true
+description = "SQL migrations for evento event sourcing library."
+documentation = "https://docs.rs/evento-sql-migrator"
+readme = "README.md"
+
+[dependencies]
+evento-sql = { workspace = true, default-features = false }
+sqlx.workspace = true
+sqlx_migrator.workspace = true
+sea-query.workspace = true
+async-trait.workspace = true
+
+[features]
+default = ["sqlite", "mysql", "postgres"]
+sqlite = ["evento-sql/sqlite", "sea-query/backend-sqlite", "sqlx/sqlite", "sqlx_migrator/sqlite"]
+mysql = ["evento-sql/mysql", "sea-query/backend-mysql", "sqlx/mysql", "sqlx_migrator/mysql"]
+postgres = ["evento-sql/postgres", "sea-query/backend-postgres", "sqlx/postgres", "sqlx_migrator/postgres"]

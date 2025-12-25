@@ -24,6 +24,11 @@ use sqlx_migrator::{Migrate, Plan};
 
 use crate::cursor_test::assert_read_result;
 
+fn rw_from_pools(pools: (SqlitePool, SqlitePool)) -> RwSqlite {
+    let (r, w) = pools;
+    (evento::Sqlite::from(r), evento::Sqlite::from(w)).into()
+}
+
 #[tokio::test]
 async fn sqlite_routing_key() -> anyhow::Result<()> {
     let executor = create_sqlite_executor("routing_key").await?;
@@ -155,7 +160,7 @@ async fn rw_sqlite_invalid_original_version() -> anyhow::Result<()> {
 async fn rw_sqlite_subscriber_running() -> anyhow::Result<()> {
     let pool = create_rw_sqlite_pool("subscriber_running").await?;
 
-    evento_test::subscriber_running::<RwSqlite>(&pool.into()).await
+    evento_test::subscriber_running::<RwSqlite>(&rw_from_pools(pool)).await
 }
 
 #[tokio::test]
@@ -163,7 +168,7 @@ async fn rw_sqlite_subscribe() -> anyhow::Result<()> {
     let pool = create_rw_sqlite_pool("subscribe").await?;
     let data = get_data(&pool.1).await?;
 
-    evento_test::subscribe::<RwSqlite>(&pool.into(), data).await
+    evento_test::subscribe::<RwSqlite>(&rw_from_pools(pool), data).await
 }
 
 #[tokio::test]
@@ -171,7 +176,7 @@ async fn rw_sqlite_subscribe_routing_key() -> anyhow::Result<()> {
     let pool = create_rw_sqlite_pool("subscribe_routing_key").await?;
     let data = get_data(&pool.1).await?;
 
-    evento_test::subscribe_routing_key::<RwSqlite>(&pool.into(), data).await
+    evento_test::subscribe_routing_key::<RwSqlite>(&rw_from_pools(pool), data).await
 }
 
 #[tokio::test]
@@ -179,7 +184,7 @@ async fn rw_sqlite_subscribe_default() -> anyhow::Result<()> {
     let pool = create_rw_sqlite_pool("subscribe_default").await?;
     let data = get_data(&pool.1).await?;
 
-    evento_test::subscribe_default::<RwSqlite>(&pool.into(), data).await
+    evento_test::subscribe_default::<RwSqlite>(&rw_from_pools(pool), data).await
 }
 
 #[tokio::test]
@@ -187,7 +192,7 @@ async fn rw_sqlite_subscribe_multiple_aggregator() -> anyhow::Result<()> {
     let pool = create_rw_sqlite_pool("subscribe_multiple_aggregator").await?;
     let data = get_data(&pool.1).await?;
 
-    evento_test::subscribe_multiple_aggregator::<RwSqlite>(&pool.into(), data).await
+    evento_test::subscribe_multiple_aggregator::<RwSqlite>(&rw_from_pools(pool), data).await
 }
 
 #[tokio::test]
@@ -195,7 +200,8 @@ async fn rw_sqlite_subscribe_routing_key_multiple_aggregator() -> anyhow::Result
     let pool = create_rw_sqlite_pool("subscribe_routing_key_multiple_aggregator").await?;
     let data = get_data(&pool.1).await?;
 
-    evento_test::subscribe_routing_key_multiple_aggregator::<RwSqlite>(&pool.into(), data).await
+    evento_test::subscribe_routing_key_multiple_aggregator::<RwSqlite>(&rw_from_pools(pool), data)
+        .await
 }
 
 #[tokio::test]
@@ -203,7 +209,7 @@ async fn rw_sqlite_subscribe_default_multiple_aggregator() -> anyhow::Result<()>
     let pool = create_rw_sqlite_pool("subscribe_default_multiple_aggregator").await?;
     let data = get_data(&pool.1).await?;
 
-    evento_test::subscribe_default_multiple_aggregator::<RwSqlite>(&pool.into(), data).await
+    evento_test::subscribe_default_multiple_aggregator::<RwSqlite>(&rw_from_pools(pool), data).await
 }
 
 #[tokio::test]
@@ -690,10 +696,8 @@ async fn create_mysql_executor(key: impl Into<String>) -> anyhow::Result<Sql<sql
 async fn create_rw_sqlite_executor(
     key: impl Into<String>,
 ) -> anyhow::Result<evento::Rw<evento::Sqlite, evento::Sqlite>> {
-    let executor: evento::Rw<evento::Sqlite, evento::Sqlite> =
-        create_rw_sqlite_pool(key).await?.into();
-
-    Ok(executor)
+    let (r, w) = create_rw_sqlite_pool(key).await?;
+    Ok((evento::Sqlite::from(r), evento::Sqlite::from(w)).into())
 }
 
 async fn create_sqlite_executor(key: impl Into<String>) -> anyhow::Result<evento::Evento> {

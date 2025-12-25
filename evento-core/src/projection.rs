@@ -1,4 +1,3 @@
-use backon::{ExponentialBuilder, Retryable};
 use std::{
     collections::HashMap,
     future::Future,
@@ -8,6 +7,8 @@ use std::{
 };
 use tokio::time::{interval_at, Instant};
 use ulid::Ulid;
+
+use backon::{ExponentialBuilder, Retryable};
 
 use crate::{context, cursor::Args, Executor, ReadAggregator};
 

@@ -1,6 +1,6 @@
 use sea_query::{ColumnDef, Expr, Index, Table, TableCreateStatement, TableDropStatement};
 
-use crate::sql::Snapshot;
+use evento_sql::Snapshot;
 
 pub struct Operation;
 

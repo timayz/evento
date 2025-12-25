@@ -1,21 +1,20 @@
 use sea_query::{Index, IndexCreateStatement, IndexDropStatement};
 
-use crate::sql::Event;
+use evento_sql::Event;
 
 pub struct Operation;
 
 fn up_statement() -> IndexCreateStatement {
     Index::create()
-        .name("idx_event_routing_key_type")
+        .name("idx_event_type")
         .table(Event::Table)
-        .col(Event::RoutingKey)
         .col(Event::AggregatorType)
         .to_owned()
 }
 
-fn drop_statement() -> IndexDropStatement {
+fn down_statement() -> IndexDropStatement {
     Index::drop()
-        .name("idx_event_routing_key_type")
+        .name("idx_event_type")
         .table(Event::Table)
         .to_owned()
 }
@@ -37,7 +36,7 @@ impl sqlx_migrator::Operation<sqlx::Sqlite> for Operation {
         &self,
         connection: &mut sqlx::SqliteConnection,
     ) -> Result<(), sqlx_migrator::Error> {
-        let statment = drop_statement().to_string(sea_query::SqliteQueryBuilder);
+        let statment = down_statement().to_string(sea_query::SqliteQueryBuilder);
         sqlx::query(&statment).execute(connection).await?;
 
         Ok(())
@@ -58,7 +57,7 @@ impl sqlx_migrator::Operation<sqlx::MySql> for Operation {
         &self,
         connection: &mut sqlx::MySqlConnection,
     ) -> Result<(), sqlx_migrator::Error> {
-        let statment = drop_statement().to_string(sea_query::MysqlQueryBuilder);
+        let statment = down_statement().to_string(sea_query::MysqlQueryBuilder);
         sqlx::query(&statment).execute(connection).await?;
 
         Ok(())
@@ -76,7 +75,7 @@ impl sqlx_migrator::Operation<sqlx::Postgres> for Operation {
     }
 
     async fn down(&self, connection: &mut sqlx::PgConnection) -> Result<(), sqlx_migrator::Error> {
-        let statment = drop_statement().to_string(sea_query::PostgresQueryBuilder);
+        let statment = down_statement().to_string(sea_query::PostgresQueryBuilder);
         sqlx::query(&statment).execute(connection).await?;
 
         Ok(())

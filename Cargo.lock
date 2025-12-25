@@ -574,22 +574,34 @@ name = "evento"
 version = "1.8.0"
 dependencies = [
  "anyhow",
+ "bank",
+ "evento-core",
+ "evento-sql",
+ "evento-sql-migrator",
+ "rand 0.9.2",
+ "sea-query",
+ "sea-query-sqlx",
+ "sqlx",
+ "sqlx_migrator",
+ "tokio",
+ "ulid",
+]
+
+[[package]]
+name = "evento-core"
+version = "1.8.0"
+dependencies = [
+ "anyhow",
  "async-trait",
  "backon",
- "bank",
  "base64",
  "bincode",
  "evento-macro",
  "futures-util",
- "rand 0.9.2",
- "sea-query",
- "sea-query-sqlx",
  "serde",
  "sqlx",
- "sqlx_migrator",
  "thiserror",
  "tokio",
- "tokio-stream",
  "tracing",
  "ulid",
 ]
@@ -601,6 +613,31 @@ dependencies = [
  "convert_case",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "evento-sql"
+version = "1.8.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bincode",
+ "evento-core",
+ "sea-query",
+ "sea-query-sqlx",
+ "sqlx",
+ "ulid",
+]
+
+[[package]]
+name = "evento-sql-migrator"
+version = "1.8.0"
+dependencies = [
+ "async-trait",
+ "evento-sql",
+ "sea-query",
+ "sqlx",
+ "sqlx_migrator",
 ]
 
 [[package]]

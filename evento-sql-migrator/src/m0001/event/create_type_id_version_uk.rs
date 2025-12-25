@@ -1,21 +1,23 @@
 use sea_query::{Index, IndexCreateStatement, IndexDropStatement};
 
-use crate::sql::Event;
+use evento_sql::Event;
 
 pub struct Operation;
 
 fn up_statement() -> IndexCreateStatement {
     Index::create()
-        .name("idx_event_type_id")
+        .name("idx_event_type_id_version")
         .table(Event::Table)
+        .unique()
         .col(Event::AggregatorType)
         .col(Event::AggregatorId)
+        .col(Event::Version)
         .to_owned()
 }
 
 fn down_statement() -> IndexDropStatement {
     Index::drop()
-        .name("idx_event_type_id")
+        .name("idx_event_type_id_version")
         .table(Event::Table)
         .to_owned()
 }

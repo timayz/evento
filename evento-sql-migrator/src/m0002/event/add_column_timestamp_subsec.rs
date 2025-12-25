@@ -1,47 +1,26 @@
-use sea_query::{ColumnDef, Table, TableCreateStatement, TableDropStatement};
+use sea_query::{ColumnDef, Table, TableAlterStatement};
 
-use crate::sql::Event;
+use evento_sql::Event;
 
 pub struct Operation;
 
-fn up_statement() -> TableCreateStatement {
-    Table::create()
+fn up_statement() -> TableAlterStatement {
+    Table::alter()
         .table(Event::Table)
-        .col(
-            ColumnDef::new(Event::Id)
-                .string()
+        .add_column(
+            ColumnDef::new(Event::TimestampSubsec)
+                .big_integer()
                 .not_null()
-                .string_len(26)
-                .primary_key(),
+                .default(0),
         )
-        .col(
-            ColumnDef::new(Event::Name)
-                .string()
-                .string_len(50)
-                .not_null(),
-        )
-        .col(
-            ColumnDef::new(Event::AggregatorType)
-                .string()
-                .string_len(50)
-                .not_null(),
-        )
-        .col(
-            ColumnDef::new(Event::AggregatorId)
-                .string()
-                .string_len(26)
-                .not_null(),
-        )
-        .col(ColumnDef::new(Event::Version).integer().not_null())
-        .col(ColumnDef::new(Event::Data).blob().not_null())
-        .col(ColumnDef::new(Event::Metadata).blob().not_null())
-        .col(ColumnDef::new(Event::RoutingKey).string().string_len(50))
-        .col(ColumnDef::new(Event::Timestamp).big_integer().not_null())
         .to_owned()
 }
 
-fn down_statement() -> TableDropStatement {
-    Table::drop().table(Event::Table).to_owned()
+fn down_statement() -> TableAlterStatement {
+    Table::alter()
+        .table(Event::Table)
+        .drop_column(Event::TimestampSubsec)
+        .to_owned()
 }
 
 #[cfg(feature = "sqlite")]

@@ -54,7 +54,7 @@ impl<N> ReadResult<N> {
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
-pub struct Value(pub(crate) String);
+pub struct Value(pub String);
 
 impl Deref for Value {
     type Target = String;
@@ -297,70 +297,4 @@ pub trait Bind {
         cursor: <<Self as Bind>::T as Cursor>::T,
         is_order_desc: bool,
     );
-}
-
-impl Bind for crate::Event {
-    type T = Self;
-
-    fn sort_by(data: &mut Vec<Self::T>, is_order_desc: bool) {
-        if !is_order_desc {
-            data.sort_by(|a, b| {
-                if a.timestamp_subsec != b.timestamp_subsec {
-                    return a.timestamp_subsec.cmp(&b.timestamp_subsec);
-                }
-
-                if a.timestamp != b.timestamp {
-                    return a.timestamp.cmp(&b.timestamp);
-                }
-
-                if a.version != b.version {
-                    return a.version.cmp(&b.version);
-                }
-
-                a.id.cmp(&b.id)
-            });
-        } else {
-            data.sort_by(|a, b| {
-                if a.timestamp_subsec != b.timestamp_subsec {
-                    return b.timestamp_subsec.cmp(&a.timestamp_subsec);
-                }
-
-                if a.timestamp != b.timestamp {
-                    return b.timestamp.cmp(&a.timestamp);
-                }
-
-                if a.version != b.version {
-                    return b.version.cmp(&a.version);
-                }
-
-                b.id.cmp(&a.id)
-            });
-        }
-    }
-
-    fn retain(
-        data: &mut Vec<Self::T>,
-        cursor: <<Self as Bind>::T as Cursor>::T,
-        is_order_desc: bool,
-    ) {
-        data.retain(|event| {
-            if is_order_desc {
-                event.timestamp < cursor.t
-                    || (event.timestamp == cursor.t
-                        && (event.timestamp_subsec < cursor.s
-                            || (event.timestamp_subsec == cursor.s
-                                && (event.version < cursor.v
-                                    || (event.version == cursor.v
-                                        && event.id.to_string() < cursor.i)))))
-            } else {
-                event.timestamp > cursor.t
-                    || (event.timestamp == cursor.t
-                        && (event.timestamp_subsec > cursor.s
-                            || (event.timestamp_subsec == cursor.s
-                                && (event.version > cursor.v
-                                    || (event.version == cursor.v
-                                        && event.id.to_string() > cursor.i)))))
-            }
-        });
-    }
 }

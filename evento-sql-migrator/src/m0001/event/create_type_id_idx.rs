@@ -1,25 +1,22 @@
-use sea_query::{ColumnDef, Table, TableAlterStatement};
+use sea_query::{Index, IndexCreateStatement, IndexDropStatement};
 
-use crate::sql::Event;
+use evento_sql::Event;
 
 pub struct Operation;
 
-fn up_statement() -> TableAlterStatement {
-    Table::alter()
+fn up_statement() -> IndexCreateStatement {
+    Index::create()
+        .name("idx_event_type_id")
         .table(Event::Table)
-        .add_column(
-            ColumnDef::new(Event::TimestampSubsec)
-                .big_integer()
-                .not_null()
-                .default(0),
-        )
+        .col(Event::AggregatorType)
+        .col(Event::AggregatorId)
         .to_owned()
 }
 
-fn down_statement() -> TableAlterStatement {
-    Table::alter()
+fn down_statement() -> IndexDropStatement {
+    Index::drop()
+        .name("idx_event_type_id")
         .table(Event::Table)
-        .drop_column(Event::TimestampSubsec)
         .to_owned()
 }
 

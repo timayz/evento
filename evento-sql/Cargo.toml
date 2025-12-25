@@ -1,0 +1,26 @@
+[package]
+name = "evento-sql"
+version = "1.8.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = true
+description = "SQL database implementations for evento event sourcing library."
+documentation = "https://docs.rs/evento-sql"
+readme = "README.md"
+
+[dependencies]
+evento-core = { workspace = true, default-features = false }
+anyhow.workspace = true
+bincode.workspace = true
+async-trait.workspace = true
+ulid.workspace = true
+sqlx.workspace = true
+sea-query.workspace = true
+sea-query-sqlx.workspace = true
+
+[features]
+default = ["sqlite", "mysql", "postgres"]
+sqlite = ["evento-core/rw", "evento-core/sqlite", "sea-query/backend-sqlite", "sea-query-sqlx/sqlx-sqlite", "sqlx/sqlite"]
+mysql = ["evento-core/rw", "evento-core/mysql", "sea-query/backend-mysql", "sea-query-sqlx/sqlx-mysql", "sqlx/mysql"]
+postgres = ["evento-core/rw", "evento-core/postgres", "sea-query/backend-postgres", "sea-query-sqlx/sqlx-postgres", "sqlx/postgres"]
