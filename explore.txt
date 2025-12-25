@@ -1,3 +1,2 @@
 
-// replace bincode by rkyv
 // internal pub sub for projection with mpsc chanel that send message if handler return Some(mesaage)

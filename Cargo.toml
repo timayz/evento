@@ -27,7 +27,7 @@ bank = { path = "./examples/bank" }
 # Core dependencies
 anyhow = "1.0"
 async-trait = "0.1"
-bincode = "2.0"
+rkyv = { version = "0.8", features = ["bytecheck"] }
 thiserror = "2.0"
 tracing = "0.1"
 base64 = "0.22"

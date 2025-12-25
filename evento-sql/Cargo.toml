@@ -12,7 +12,7 @@ readme = "README.md"
 [dependencies]
 evento-core = { workspace = true, default-features = false }
 anyhow.workspace = true
-bincode.workspace = true
+rkyv.workspace = true
 async-trait.workspace = true
 ulid.workspace = true
 sqlx.workspace = true

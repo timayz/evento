@@ -435,9 +435,7 @@ impl Reader {
         Ok(ReadResult { edges, page_info })
     }
 
-    fn build_reader<O: Cursor, B: Bind<Cursor = O>>(
-        &mut self,
-    ) -> Result<u16, bincode::error::DecodeError>
+    fn build_reader<O: Cursor, B: Bind<Cursor = O>>(&mut self) -> Result<u16, cursor::CursorError>
     where
         B::T: Clone,
         <<B as Bind>::I as IntoIterator>::IntoIter: DoubleEndedIterator,
@@ -455,10 +453,7 @@ impl Reader {
         Ok(limit)
     }
 
-    fn build_reader_where<O, B>(
-        &mut self,
-        cursor: &Value,
-    ) -> Result<(), bincode::error::DecodeError>
+    fn build_reader_where<O, B>(&mut self, cursor: &Value) -> Result<(), cursor::CursorError>
     where
         O: Cursor,
         B: Bind<Cursor = O>,

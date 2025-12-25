@@ -18,7 +18,7 @@ use ulid::Ulid;
 use crate::cursor::Cursor;
 
 /// Cursor for event pagination and positioning
-#[derive(Debug, bincode::Encode, bincode::Decode)]
+#[derive(Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct EventCursor {
     /// Event ID (ULID string)
     pub i: String,
@@ -43,9 +43,9 @@ pub struct Event {
     pub name: String,
     /// Optional routing key for event distribution
     pub routing_key: Option<String>,
-    /// Serialized event data (bincode format)
+    /// Serialized event data (rkyv format)
     pub data: Vec<u8>,
-    /// Serialized event metadata (bincode format)
+    /// Serialized event metadata (rkyv format)
     pub metadata: Vec<u8>,
     /// Unix timestamp when the event occurred (seconds)
     pub timestamp: u64,
@@ -63,6 +63,30 @@ impl Cursor for Event {
             t: self.timestamp,
             s: self.timestamp_subsec,
         }
+    }
+
+    fn serialize_cursor(&self) -> Result<cursor::Value, cursor::CursorError> {
+        use base64::{alphabet, engine::general_purpose, engine::GeneralPurpose, Engine};
+
+        let cursor = self.serialize();
+        let encoded = rkyv::to_bytes::<rkyv::rancor::Error>(&cursor)
+            .map_err(|e| cursor::CursorError::Rkyv(e.to_string()))?;
+
+        let engine = GeneralPurpose::new(&alphabet::URL_SAFE, general_purpose::PAD);
+
+        Ok(cursor::Value(engine.encode(&encoded)))
+    }
+
+    fn deserialize_cursor(value: &cursor::Value) -> Result<Self::T, cursor::CursorError> {
+        use base64::{alphabet, engine::general_purpose, engine::GeneralPurpose, Engine};
+
+        let engine = GeneralPurpose::new(&alphabet::URL_SAFE, general_purpose::PAD);
+        let decoded = engine.decode(value)?;
+
+        let result = rkyv::from_bytes::<Self::T, rkyv::rancor::Error>(&decoded)
+            .map_err(|e| cursor::CursorError::Rkyv(e.to_string()))?;
+
+        Ok(result)
     }
 }
 

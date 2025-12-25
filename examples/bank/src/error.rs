@@ -47,12 +47,6 @@ impl fmt::Display for BankAccountError {
 
 impl std::error::Error for BankAccountError {}
 
-impl From<bincode::error::EncodeError> for BankAccountError {
-    fn from(value: bincode::error::EncodeError) -> Self {
-        Self::Server(value.to_string())
-    }
-}
-
 impl From<evento::WriteError> for BankAccountError {
     fn from(value: evento::WriteError) -> Self {
         Self::Server(value.to_string())

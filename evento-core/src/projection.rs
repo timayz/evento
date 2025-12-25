@@ -78,14 +78,34 @@ impl<D, M> Deref for EventData<D, M> {
     }
 }
 
-impl<D: bincode::Decode<()>, M: bincode::Decode<()>> TryFrom<&crate::Event> for EventData<D, M> {
-    type Error = bincode::error::DecodeError;
+impl<D, M> TryFrom<&crate::Event> for EventData<D, M>
+where
+    D: rkyv::Archive,
+    M: rkyv::Archive,
+    <D as rkyv::Archive>::Archived: for<'a> rkyv::bytecheck::CheckBytes<
+            rkyv::rancor::Strategy<
+                rkyv::validation::Validator<
+                    rkyv::validation::archive::ArchiveValidator<'a>,
+                    rkyv::validation::shared::SharedValidator,
+                >,
+                rkyv::rancor::Error,
+            >,
+        > + rkyv::Deserialize<D, rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>>,
+    <M as rkyv::Archive>::Archived: for<'a> rkyv::bytecheck::CheckBytes<
+            rkyv::rancor::Strategy<
+                rkyv::validation::Validator<
+                    rkyv::validation::archive::ArchiveValidator<'a>,
+                    rkyv::validation::shared::SharedValidator,
+                >,
+                rkyv::rancor::Error,
+            >,
+        > + rkyv::Deserialize<M, rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>>,
+{
+    type Error = rkyv::rancor::Error;
 
     fn try_from(value: &crate::Event) -> Result<Self, Self::Error> {
-        let config = bincode::config::standard();
-
-        let (data, _) = bincode::decode_from_slice(&value.data[..], config)?;
-        let (metadata, _) = bincode::decode_from_slice(&value.metadata[..], config)?;
+        let data = rkyv::from_bytes::<D, rkyv::rancor::Error>(&value.data)?;
+        let metadata = rkyv::from_bytes::<M, rkyv::rancor::Error>(&value.metadata)?;
         Ok(EventData {
             data,
             metadata,

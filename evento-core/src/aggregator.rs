@@ -16,8 +16,8 @@ pub enum WriteError {
     #[error("{0}")]
     Unknown(#[from] anyhow::Error),
 
-    #[error("bincode.encode >> {0}")]
-    BincodeEncode(#[from] bincode::error::EncodeError),
+    #[error("rkyv.encode >> {0}")]
+    RkyvEncode(String),
 
     #[error("systemtime >> {0}")]
     SystemTime(#[from] std::time::SystemTimeError),
@@ -65,24 +65,43 @@ impl AggregatorBuilder {
         self
     }
 
-    pub fn metadata<M: bincode::Encode>(
-        mut self,
-        v: &M,
-    ) -> Result<Self, bincode::error::EncodeError> {
-        let config = bincode::config::standard();
-        let metadata = bincode::encode_to_vec(v, config)?;
-        self.metadata = Some(metadata);
+    pub fn metadata<M>(mut self, v: &M) -> Result<Self, WriteError>
+    where
+        M: for<'a> rkyv::Serialize<
+            rkyv::rancor::Strategy<
+                rkyv::ser::Serializer<
+                    rkyv::util::AlignedVec,
+                    rkyv::ser::allocator::ArenaHandle<'a>,
+                    rkyv::ser::sharing::Share,
+                >,
+                rkyv::rancor::Error,
+            >,
+        >,
+    {
+        let metadata = rkyv::to_bytes::<rkyv::rancor::Error>(v)
+            .map_err(|e| WriteError::RkyvEncode(e.to_string()))?;
+        self.metadata = Some(metadata.to_vec());
 
         Ok(self)
     }
 
-    pub fn event<D: bincode::Encode + crate::projection::Event>(
-        mut self,
-        v: &D,
-    ) -> Result<Self, bincode::error::EncodeError> {
-        let config = bincode::config::standard();
-        let data = bincode::encode_to_vec(v, config)?;
-        self.data.push((D::event_name(), data));
+    pub fn event<D>(mut self, v: &D) -> Result<Self, WriteError>
+    where
+        D: crate::projection::Event
+            + for<'a> rkyv::Serialize<
+                rkyv::rancor::Strategy<
+                    rkyv::ser::Serializer<
+                        rkyv::util::AlignedVec,
+                        rkyv::ser::allocator::ArenaHandle<'a>,
+                        rkyv::ser::sharing::Share,
+                    >,
+                    rkyv::rancor::Error,
+                >,
+            >,
+    {
+        let data = rkyv::to_bytes::<rkyv::rancor::Error>(v)
+            .map_err(|e| WriteError::RkyvEncode(e.to_string()))?;
+        self.data.push((D::event_name(), data.to_vec()));
         self.aggregator_type = D::aggregator_type().to_owned();
 
         Ok(self)
@@ -111,8 +130,9 @@ impl AggregatorBuilder {
         };
 
         let metadata = self.metadata.to_owned().unwrap_or_else(|| {
-            let config = bincode::config::standard();
-            bincode::encode_to_vec(true, config).expect("Should never failed")
+            rkyv::to_bytes::<rkyv::rancor::Error>(&true)
+                .expect("Should never fail")
+                .to_vec()
         });
 
         let mut events = vec![];
