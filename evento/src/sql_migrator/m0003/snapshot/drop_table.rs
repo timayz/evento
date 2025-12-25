@@ -1,47 +1,45 @@
-use sea_query::{ColumnDef, Table, TableCreateStatement, TableDropStatement};
+use sea_query::{ColumnDef, Expr, Index, Table, TableCreateStatement, TableDropStatement};
 
-use crate::sql::Event;
+use crate::sql::Snapshot;
 
 pub struct Operation;
 
-fn up_statement() -> TableCreateStatement {
-    Table::create()
-        .table(Event::Table)
-        .col(
-            ColumnDef::new(Event::Id)
-                .string()
-                .not_null()
-                .string_len(26)
-                .primary_key(),
-        )
-        .col(
-            ColumnDef::new(Event::Name)
-                .string()
-                .string_len(50)
-                .not_null(),
-        )
-        .col(
-            ColumnDef::new(Event::AggregatorType)
-                .string()
-                .string_len(50)
-                .not_null(),
-        )
-        .col(
-            ColumnDef::new(Event::AggregatorId)
-                .string()
-                .string_len(26)
-                .not_null(),
-        )
-        .col(ColumnDef::new(Event::Version).integer().not_null())
-        .col(ColumnDef::new(Event::Data).blob().not_null())
-        .col(ColumnDef::new(Event::Metadata).blob().not_null())
-        .col(ColumnDef::new(Event::RoutingKey).string().string_len(50))
-        .col(ColumnDef::new(Event::Timestamp).big_integer().not_null())
-        .to_owned()
+fn up_statement() -> TableDropStatement {
+    Table::drop().table(Snapshot::Table).to_owned()
 }
 
-fn down_statement() -> TableDropStatement {
-    Table::drop().table(Event::Table).to_owned()
+fn down_statement() -> TableCreateStatement {
+    Table::create()
+        .table(Snapshot::Table)
+        .if_not_exists()
+        .col(
+            ColumnDef::new(Snapshot::Id)
+                .string()
+                .not_null()
+                .string_len(26),
+        )
+        .col(
+            ColumnDef::new(Snapshot::Type)
+                .string()
+                .string_len(50)
+                .not_null(),
+        )
+        .col(ColumnDef::new(Snapshot::Cursor).string().not_null())
+        .col(ColumnDef::new(Snapshot::Revision).string().not_null())
+        .col(ColumnDef::new(Snapshot::Data).blob().not_null())
+        .col(
+            ColumnDef::new(Snapshot::CreatedAt)
+                .timestamp_with_time_zone()
+                .not_null()
+                .default(Expr::current_timestamp()),
+        )
+        .col(
+            ColumnDef::new(Snapshot::UpdatedAt)
+                .timestamp_with_time_zone()
+                .null(),
+        )
+        .primary_key(Index::create().col(Snapshot::Type).col(Snapshot::Id))
+        .to_owned()
 }
 
 #[cfg(feature = "sqlite")]
