@@ -602,7 +602,6 @@ dependencies = [
  "sqlx",
  "thiserror",
  "tokio",
- "tokio-stream",
  "tracing",
  "ulid",
 ]
@@ -1572,7 +1571,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8edd21d591f27a3b6dda2093cc27b324eda2f8b34906bcbe534621188b60e96a"
 dependencies = [
  "inherent",
- "itoa",
  "sea-query-derive",
 ]
 

@@ -1,11 +1,11 @@
 [package]
 name = "evento-macro"
 version = "1.8.0"
-edition = "2021"
-license = "Apache-2.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 publish = true
 description = "A collection of libraries and tools that help you build DDD, CQRS, and event sourcing."
-repository = "https://github.com/timayz/evento"
 documentation = "https://docs.rs/evento"
 readme = "README.md"
 
@@ -13,10 +13,6 @@ readme = "README.md"
 proc-macro = true
 
 [dependencies]
-quote = "1.0"
-convert_case = "0.10"
-syn = { version = "2.0", features = [
-	"full",
-	"parsing",
-	"extra-traits",
-] }
+quote.workspace = true
+convert_case.workspace = true
+syn.workspace = true

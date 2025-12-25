@@ -4,14 +4,13 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-bank = { path = "../bank" }
-evento = { path = "../../evento", features = ["sqlite"] }
-
-axum = "0.8"
-askama = "0.15"
-tokio = { version = "1", features = ["full"] }
-serde = { version = "1", features = ["derive"] }
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
-sqlx_migrator = "0.18"
-ulid = "1"
-anyhow = "1"
+bank.workspace = true
+evento = { workspace = true, features = ["sqlite"] }
+axum.workspace = true
+askama.workspace = true
+tokio.workspace = true
+serde.workspace = true
+sqlx = { workspace = true, features = ["runtime-tokio", "sqlite"] }
+sqlx_migrator.workspace = true
+ulid.workspace = true
+anyhow.workspace = true

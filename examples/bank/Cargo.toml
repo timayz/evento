@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-evento = { path = "../../evento" }
-bincode = "2"
-anyhow = "1"
-once_cell = "1"
+evento = { workspace = true, default-features = true }
+bincode.workspace = true
+anyhow.workspace = true
+once_cell.workspace = true

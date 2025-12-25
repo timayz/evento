@@ -17,12 +17,6 @@ use ulid::Ulid;
 
 use crate::cursor::Cursor;
 
-/// Stream utilities for working with event streams
-#[cfg(feature = "stream")]
-pub mod stream {
-    pub use tokio_stream::StreamExt;
-}
-
 /// Cursor for event pagination and positioning
 #[derive(Debug, bincode::Encode, bincode::Decode)]
 pub struct EventCursor {

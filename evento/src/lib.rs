@@ -4,11 +4,8 @@ pub use evento_core::*;
 // Re-export projection types at root level for backwards compatibility
 pub use evento_core::projection::{
     Action, Aggregator, Event as EventTrait, EventData, Handler, LoadResult, OptionLoadResult,
-    Projection, Snapshot, SubscriptionBuilder,
+    Projection, Snapshot, Subscription, SubscriptionBuilder,
 };
-
-#[cfg(feature = "handler")]
-pub use evento_core::projection::Subscription;
 
 // Re-export SQL types when SQL features are enabled
 #[cfg(any(feature = "sqlite", feature = "mysql", feature = "postgres"))]
