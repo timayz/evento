@@ -1,6 +1,6 @@
 [package]
 name = "evento-core"
-version = "1.8.0"
+version = "2.0.0-alpha.1"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -13,7 +13,7 @@ readme = "README.md"
 serde.workspace = true
 ulid.workspace = true
 tokio.workspace = true
-evento-macro = { path = "../evento-macro", optional = true }
+evento-macro = { path = "../evento-macro", optional = true, version = "2.0.0-alpha.1" }
 anyhow.workspace = true
 rkyv.workspace = true
 thiserror.workspace = true
