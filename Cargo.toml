@@ -8,6 +8,7 @@ members = [
     "./evento-sql-migrator",
     "./evento-macro",
     "./evento-fjall",
+    "./evento-rocksdb",
     "./examples/*"
 ]
 
@@ -24,6 +25,7 @@ evento-sql = { path = "./evento-sql", version = "1.8.0" }
 evento-sql-migrator = { path = "./evento-sql-migrator", version = "1.8.0" }
 evento-macro = { path = "./evento-macro", version = "1.8.0" }
 evento-fjall = { path = "./evento-fjall", version = "1.8.0" }
+evento-rocksdb = { path = "./evento-rocksdb", version = "1.8.0" }
 bank = { path = "./examples/bank" }
 
 # Core dependencies
@@ -50,6 +52,7 @@ sqlx_migrator = "0.18"
 sea-query = { version = "1.0.0-rc.23", default-features = false, features = ["derive", "audit"] }
 sea-query-sqlx = { version = "0.8.0-rc.10", features = ["runtime-tokio"] }
 fjall = "2.11"
+rocksdb = "0.24"
 
 # Proc macro
 quote = "1.0"
