@@ -20,6 +20,7 @@ This crate provides the foundational types for building event-sourced applicatio
 - `sqlite` - SQLite database support
 - `mysql` - MySQL database support
 - `postgres` - PostgreSQL database support
+- `fjall` - Embedded key-value storage with Fjall
 
 ## Installation
 
@@ -28,6 +29,7 @@ Add to your `Cargo.toml`:
 ```toml
 [dependencies]
 evento-core = "1.8"
+rkyv = "0.8"
 ```
 
 ## Usage
@@ -35,25 +37,19 @@ evento-core = "1.8"
 ### Defining Aggregates and Events
 
 ```rust
-use evento::aggregator;
-
-#[aggregator("myapp/Account")]
-#[derive(Default)]
-pub struct Account {
-    pub balance: i64,
-    pub owner: String,
-}
-
-#[aggregator("myapp/Account")]
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-pub struct AccountOpened {
-    pub owner: String,
-}
-
-#[aggregator("myapp/Account")]
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-pub struct MoneyDeposited {
-    pub amount: i64,
+// Define events using an enum
+#[evento::aggregator]
+pub enum Account {
+    AccountOpened {
+        owner: String,
+        initial_balance: i64,
+    },
+    MoneyDeposited {
+        amount: i64,
+    },
+    MoneyWithdrawn {
+        amount: i64,
+    },
 }
 ```
 
@@ -63,18 +59,18 @@ pub struct MoneyDeposited {
 use evento::{create, aggregator, metadata::Metadata};
 
 // Create a new aggregate with events
-let account_id = create()
-    .event(&AccountOpened { owner: "Alice".into() })?
-    .metadata(&Metadata::new("user-123"))?
+let account_id = evento::create()
+    .event(&AccountOpened { owner: "Alice".into(), initial_balance: 100 })?
+    .metadata(&Metadata::default())?
     .routing_key("accounts")
     .commit(&executor)
     .await?;
 
 // Add events to existing aggregate
-aggregator(&account_id)
+evento::aggregator(&account_id)
     .original_version(1)
     .event(&MoneyDeposited { amount: 100 })?
-    .metadata(&Metadata::new("user-123"))?
+    .metadata(&Metadata::default())?
     .commit(&executor)
     .await?;
 ```
@@ -82,7 +78,7 @@ aggregator(&account_id)
 ### Building Projections
 
 ```rust
-use evento::{projection::Projection, handler, metadata::Event};
+use evento::{Executor, metadata::Event, projection::{Action, Projection}};
 
 #[derive(Default)]
 pub struct AccountView {
@@ -90,18 +86,19 @@ pub struct AccountView {
     pub owner: String,
 }
 
-#[handler]
+#[evento::handler]
 async fn on_account_opened<E: Executor>(
     event: Event<AccountOpened>,
     action: Action<'_, AccountView, E>,
 ) -> anyhow::Result<()> {
     if let Action::Apply(view) = action {
         view.owner = event.data.owner.clone();
+        view.balance = event.data.initial_balance;
     }
     Ok(())
 }
 
-#[handler]
+#[evento::handler]
 async fn on_money_deposited<E: Executor>(
     event: Event<MoneyDeposited>,
     action: Action<'_, AccountView, E>,
@@ -114,8 +111,8 @@ async fn on_money_deposited<E: Executor>(
 
 // Load aggregate state
 let projection = Projection::<AccountView, _>::new("accounts")
-    .handler(on_account_opened)
-    .handler(on_money_deposited);
+    .handler(on_account_opened())
+    .handler(on_money_deposited());
 
 let result = projection
     .load::<Account>("account-123")
@@ -129,8 +126,8 @@ let result = projection
 use std::time::Duration;
 
 let subscription = Projection::<AccountView, _>::new("account-processor")
-    .handler(on_account_opened)
-    .handler(on_money_deposited)
+    .handler(on_account_opened())
+    .handler(on_money_deposited())
     .subscription()
     .routing_key("accounts")
     .chunk_size(100)

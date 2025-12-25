@@ -13,10 +13,10 @@ More information about this crate can be found in the [crate documentation][docs
 - **Event Sourcing**: Store state changes as immutable events with complete audit trail
 - **CQRS Pattern**: Separate read and write models for scalable architectures
 - **SQL Database Support**: Built-in support for SQLite, PostgreSQL, and MySQL
+- **Embedded Storage**: Fjall key-value store for embedded applications
 - **Event Handlers**: Async event processing with automatic retries
 - **Event Subscriptions**: Continuous event stream processing with cursor tracking
 - **Projections**: Build read models by replaying events
-- **Snapshots**: Periodic state captures to optimize aggregate loading
 - **Database Migrations**: Automated schema management
 - **Zero-Copy Serialization**: Fast serialization with rkyv
 - **Type Safety**: Fully typed events and aggregates with compile-time guarantees
@@ -34,28 +34,54 @@ rkyv = "0.8"
 ## Usage Example
 
 ```rust
-use evento::aggregator;
+use evento::{Executor, metadata::{Event, Metadata}, projection::{Action, Projection}};
 
-// Define aggregate
-#[aggregator("myapp/User")]
+// Define events using an enum
+#[evento::aggregator]
+pub enum User {
+    UserCreated {
+        name: String,
+        email: String,
+    },
+    UserEmailChanged {
+        email: String,
+    },
+}
+
+// Define a view/projection
 #[derive(Default)]
-struct User {
-    name: String,
-    email: String,
+pub struct UserView {
+    pub name: String,
+    pub email: String,
 }
 
-// Define events
-#[aggregator("myapp/User")]
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-struct UserCreated {
-    name: String,
-    email: String,
+// Define handler functions
+#[evento::handler]
+async fn on_user_created<E: Executor>(
+    event: Event<UserCreated>,
+    action: Action<'_, UserView, E>,
+) -> anyhow::Result<()> {
+    match action {
+        Action::Apply(view) => {
+            view.name = event.data.name.clone();
+            view.email = event.data.email.clone();
+        }
+        Action::Handle(_context) => {
+            // In Action::Handle, perform side effects like sending emails
+        }
+    };
+    Ok(())
 }
 
-#[aggregator("myapp/User")]
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-struct UserEmailChanged {
-    email: String,
+#[evento::handler]
+async fn on_email_changed<E: Executor>(
+    event: Event<UserEmailChanged>,
+    action: Action<'_, UserView, E>,
+) -> anyhow::Result<()> {
+    if let Action::Apply(view) = action {
+        view.email = event.data.email.clone();
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -77,7 +103,7 @@ async fn main() -> anyhow::Result<()> {
             name: "John Doe".to_string(),
             email: "john@example.com".to_string(),
         })?
-        .metadata(&true)?
+        .metadata(&Metadata::default())?
         .commit(&executor)
         .await?;
 
@@ -87,63 +113,25 @@ async fn main() -> anyhow::Result<()> {
         .event(&UserEmailChanged {
             email: "newemail@example.com".to_string(),
         })?
-        .metadata(&true)?
+        .metadata(&Metadata::default())?
         .commit(&executor)
         .await?;
 
-    Ok(())
-}
-```
+    // Build projection and load state
+    let projection = Projection::<UserView, _>::new("users")
+        .handler(on_user_created())
+        .handler(on_email_changed());
 
-## Event Handlers and Projections
+    let result = projection
+        .load::<User>(&user_id)
+        .execute(&executor)
+        .await?;
 
-```rust
-use evento::{handler, Projection, Action, metadata::Event, Executor};
-
-// Define a view/projection
-#[derive(Default)]
-pub struct UserView {
-    pub name: String,
-    pub email: String,
-}
-
-// Define handler functions
-#[handler]
-async fn on_user_created<E: Executor>(
-    event: Event<UserCreated>,
-    action: Action<'_, UserView, E>,
-) -> anyhow::Result<()> {
-    if let Action::Apply(view) = action {
-        view.name = event.data.name.clone();
-        view.email = event.data.email.clone();
+    if let Some(user) = result {
+        println!("User: {} ({})", user.name, user.email);
     }
-    // In Action::Handle, perform side effects like sending emails
+
     Ok(())
-}
-
-#[handler]
-async fn on_email_changed<E: Executor>(
-    event: Event<UserEmailChanged>,
-    action: Action<'_, UserView, E>,
-) -> anyhow::Result<()> {
-    if let Action::Apply(view) = action {
-        view.email = event.data.email.clone();
-    }
-    Ok(())
-}
-
-// Build projection and load state
-let projection = Projection::<UserView, _>::new("users")
-    .handler(on_user_created)
-    .handler(on_email_changed);
-
-let result = projection
-    .load::<User>(&user_id)
-    .execute(&executor)
-    .await?;
-
-if let Some(user) = result {
-    println!("User: {} ({})", user.name, user.email);
 }
 ```
 
@@ -154,8 +142,8 @@ use std::time::Duration;
 
 // Start a subscription that continuously processes events
 let subscription = Projection::<UserView, _>::new("user-processor")
-    .handler(on_user_created)
-    .handler(on_email_changed)
+    .handler(on_user_created())
+    .handler(on_email_changed())
     .subscription()
     .routing_key("users")
     .chunk_size(100)
@@ -177,6 +165,7 @@ subscription.shutdown().await?;
 - **`sqlite`** - SQLite support via sqlx
 - **`mysql`** - MySQL support via sqlx
 - **`postgres`** - PostgreSQL support via sqlx
+- **`fjall`** - Embedded key-value storage with Fjall
 
 ## Minimum Supported Rust Version
 
@@ -190,7 +179,8 @@ This crate uses `#![forbid(unsafe_code)]` to ensure everything is implemented in
 
 The [examples] directory contains sample applications demonstrating various features:
 
-- **axum-sqlite** - Integration with Axum web framework and SQLite
+- **bank** - Bank account domain model with commands, queries, and projections
+- **bank-axum-sqlite** - Integration with Axum web framework and SQLite
 
 ## Getting Help
 

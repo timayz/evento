@@ -1,6 +1,7 @@
 use bank::{
-    account_details_subscription, load_account_details, AccountType, Command, Created,
-    DepositMoney, NameChanged, OpenAccount, ReceiveMoney, TransferMoney, ACCOUNT_DETAILS_ROWS,
+    account_details_subscription, load_account_details, AccountStatus, AccountType,
+    ChangeOverdraftLimit, CloseAccount, Command, Created, DepositMoney, FreezeAccount, NameChanged,
+    OpenAccount, ReceiveMoney, TransferMoney, UnfreezeAccount, WithdrawMoney, ACCOUNT_DETAILS_ROWS,
     COMMAND_ROWS,
 };
 use evento::{metadata::Metadata, Event, Executor};
@@ -1173,6 +1174,316 @@ pub async fn subscribe_default_multiple_aggregator<E: Executor + Clone>(
         assert_eq!(routed_row.0.owner_id, routed_owner_id);
         assert_eq!(routed_row.0.owner_name, "Routed Owner Updated"); // NameChanged was processed
         assert_eq!(routed_row.2, Some("eu-west-1".to_owned()));
+    }
+
+    Ok(())
+}
+
+/// Comprehensive test that exercises all Command operations, loads state, and runs subscription.
+///
+/// This test covers:
+/// - OpenAccount (with and without routing key)
+/// - DepositMoney
+/// - WithdrawMoney
+/// - TransferMoney / ReceiveMoney
+/// - ChangeOverdraftLimit
+/// - FreezeAccount / UnfreezeAccount
+/// - CloseAccount
+pub async fn all_commands<E: Executor + Clone>(
+    executor: &E,
+    _events: Vec<Event>,
+) -> anyhow::Result<()> {
+    // =========================================================================
+    // 1. Open two accounts
+    // =========================================================================
+
+    // Account A: Primary test account
+    let account_a_id = Command::open_account(
+        OpenAccount {
+            owner_id: "owner_a".to_owned(),
+            owner_name: "Alice".to_owned(),
+            account_type: AccountType::Checking,
+            currency: "USD".to_owned(),
+            initial_balance: 5000,
+        },
+        executor,
+    )
+    .await?;
+
+    // Account B: Secondary account for transfers (with routing key)
+    let account_b_id = Command::open_account_with_routing(
+        OpenAccount {
+            owner_id: "owner_b".to_owned(),
+            owner_name: "Bob".to_owned(),
+            account_type: AccountType::Savings,
+            currency: "USD".to_owned(),
+            initial_balance: 1000,
+        },
+        executor,
+        "region-1",
+    )
+    .await?;
+
+    // Verify initial state
+    let account_a = bank::load(executor, &account_a_id)
+        .await?
+        .expect("Account A should exist");
+    assert_eq!(account_a.balance, 5000);
+    assert_eq!(account_a.0.version, 1);
+    assert!(account_a.is_active());
+
+    let account_b = bank::load(executor, &account_b_id)
+        .await?
+        .expect("Account B should exist");
+    assert_eq!(account_b.balance, 1000);
+    assert_eq!(account_b.0.routing_key, Some("region-1".to_owned()));
+
+    // =========================================================================
+    // 2. DepositMoney
+    // =========================================================================
+
+    account_a
+        .deposit_money(
+            DepositMoney {
+                amount: 2500,
+                transaction_id: Ulid::new().to_string(),
+                description: "Salary deposit".to_owned(),
+            },
+            executor,
+        )
+        .await?;
+
+    let account_a = bank::load(executor, &account_a_id)
+        .await?
+        .expect("Account A should exist");
+    assert_eq!(account_a.balance, 7500); // 5000 + 2500
+    assert_eq!(account_a.0.version, 2);
+
+    // =========================================================================
+    // 3. WithdrawMoney
+    // =========================================================================
+
+    account_a
+        .withdraw_money(
+            WithdrawMoney {
+                amount: 500,
+                transaction_id: Ulid::new().to_string(),
+                description: "ATM withdrawal".to_owned(),
+            },
+            executor,
+        )
+        .await?;
+
+    let account_a = bank::load(executor, &account_a_id)
+        .await?
+        .expect("Account A should exist");
+    assert_eq!(account_a.balance, 7000); // 7500 - 500
+    assert_eq!(account_a.0.version, 3);
+
+    // =========================================================================
+    // 4. ChangeOverdraftLimit
+    // =========================================================================
+
+    account_a
+        .change_overdraft_limit(ChangeOverdraftLimit { new_limit: 1000 }, executor)
+        .await?;
+
+    let account_a = bank::load(executor, &account_a_id)
+        .await?
+        .expect("Account A should exist");
+    assert_eq!(account_a.overdraft_limit, 1000);
+    assert_eq!(account_a.0.version, 4);
+
+    // =========================================================================
+    // 5. TransferMoney / ReceiveMoney
+    // =========================================================================
+
+    let transfer_tx_id = Ulid::new().to_string();
+
+    // Alice transfers to Bob
+    account_a
+        .transfer_money(
+            TransferMoney {
+                amount: 2000,
+                to_account_id: account_b_id.clone(),
+                transaction_id: transfer_tx_id.clone(),
+                description: "Payment to Bob".to_owned(),
+            },
+            executor,
+        )
+        .await?;
+
+    // Bob receives from Alice
+    let account_b = bank::load(executor, &account_b_id)
+        .await?
+        .expect("Account B should exist");
+    account_b
+        .receive_money(
+            ReceiveMoney {
+                amount: 2000,
+                from_account_id: account_a_id.clone(),
+                transaction_id: transfer_tx_id,
+                description: "Payment from Alice".to_owned(),
+            },
+            executor,
+        )
+        .await?;
+
+    // Verify balances after transfer
+    let account_a = bank::load(executor, &account_a_id)
+        .await?
+        .expect("Account A should exist");
+    let account_b = bank::load(executor, &account_b_id)
+        .await?
+        .expect("Account B should exist");
+
+    assert_eq!(account_a.balance, 5000); // 7000 - 2000
+    assert_eq!(account_a.0.version, 5);
+    assert_eq!(account_b.balance, 3000); // 1000 + 2000
+    assert_eq!(account_b.0.version, 2);
+
+    // =========================================================================
+    // 6. FreezeAccount / UnfreezeAccount
+    // =========================================================================
+
+    account_a
+        .freeze_account(
+            FreezeAccount {
+                reason: "Suspicious activity detected".to_owned(),
+            },
+            executor,
+        )
+        .await?;
+
+    let account_a = bank::load(executor, &account_a_id)
+        .await?
+        .expect("Account A should exist");
+    assert!(account_a.is_frozen());
+    assert_eq!(account_a.0.version, 6);
+
+    // Try to withdraw while frozen - should fail
+    let withdraw_result = account_a
+        .withdraw_money(
+            WithdrawMoney {
+                amount: 100,
+                transaction_id: Ulid::new().to_string(),
+                description: "Should fail".to_owned(),
+            },
+            executor,
+        )
+        .await;
+    assert!(withdraw_result.is_err());
+
+    // Unfreeze the account
+    account_a
+        .unfreeze_account(
+            UnfreezeAccount {
+                reason: "Investigation complete".to_owned(),
+            },
+            executor,
+        )
+        .await?;
+
+    let account_a = bank::load(executor, &account_a_id)
+        .await?
+        .expect("Account A should exist");
+    assert!(account_a.is_active());
+    assert_eq!(account_a.0.version, 7);
+
+    // =========================================================================
+    // 7. CloseAccount
+    // =========================================================================
+
+    // First, withdraw remaining balance to prepare for closure
+    account_a
+        .withdraw_money(
+            WithdrawMoney {
+                amount: 5000,
+                transaction_id: Ulid::new().to_string(),
+                description: "Final withdrawal before closure".to_owned(),
+            },
+            executor,
+        )
+        .await?;
+
+    let account_a = bank::load(executor, &account_a_id)
+        .await?
+        .expect("Account A should exist");
+    assert_eq!(account_a.balance, 0);
+    assert_eq!(account_a.0.version, 8);
+
+    // Close the account
+    account_a
+        .close_account(
+            CloseAccount {
+                reason: "Customer request".to_owned(),
+            },
+            executor,
+        )
+        .await?;
+
+    let account_a = bank::load(executor, &account_a_id)
+        .await?
+        .expect("Account A should exist");
+    assert!(account_a.is_closed());
+    assert_eq!(account_a.0.version, 9);
+
+    // Try operations on closed account - should fail
+    let deposit_result = account_a
+        .deposit_money(
+            DepositMoney {
+                amount: 100,
+                transaction_id: Ulid::new().to_string(),
+                description: "Should fail".to_owned(),
+            },
+            executor,
+        )
+        .await;
+    assert!(deposit_result.is_err());
+
+    // =========================================================================
+    // 8. Verify final state via subscription
+    // =========================================================================
+
+    // Clear projection state for our test accounts
+    {
+        let mut rows = COMMAND_ROWS.write().unwrap();
+        rows.remove(&account_a_id);
+        rows.remove(&account_b_id);
+    }
+
+    // Run subscription to rebuild projection from events
+    bank::subscription().execute(executor).await?;
+
+    // Verify Account A projection
+    {
+        let rows = COMMAND_ROWS.read().unwrap();
+
+        let account_a_row = rows
+            .get(&account_a_id)
+            .expect("Account A should exist in projection");
+        assert_eq!(account_a_row.0.balance, 0);
+        assert_eq!(account_a_row.0.status, AccountStatus::Closed);
+        assert_eq!(account_a_row.1, 9); // version
+    }
+
+    // Run subscription with routing key for Account B
+    bank::subscription()
+        .routing_key("region-1")
+        .execute(executor)
+        .await?;
+
+    // Verify Account B projection
+    {
+        let rows = COMMAND_ROWS.read().unwrap();
+
+        let account_b_row = rows
+            .get(&account_b_id)
+            .expect("Account B should exist in projection");
+        assert_eq!(account_b_row.0.balance, 3000);
+        assert_eq!(account_b_row.0.status, AccountStatus::Active);
+        assert_eq!(account_b_row.1, 2); // version
+        assert_eq!(account_b_row.2, Some("region-1".to_owned()));
     }
 
     Ok(())

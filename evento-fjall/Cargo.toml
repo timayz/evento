@@ -1,0 +1,22 @@
+[package]
+name = "evento-fjall"
+version = "1.8.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = true
+description = "Fjall embedded key-value store implementation for evento event sourcing library"
+documentation = "https://docs.rs/evento-fjall"
+readme = "README.md"
+
+[dependencies]
+evento-core.workspace = true
+anyhow.workspace = true
+rkyv.workspace = true
+async-trait.workspace = true
+ulid.workspace = true
+tokio.workspace = true
+fjall.workspace = true
+
+[dev-dependencies]
+tempfile = "3.24"

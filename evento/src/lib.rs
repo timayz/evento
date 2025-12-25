@@ -1,17 +1,17 @@
 //! Event sourcing and CQRS toolkit with SQL persistence, projections, and subscriptions.
 //!
 //! Evento provides a complete toolkit for implementing event sourcing patterns in Rust,
-//! with support for SQLite, PostgreSQL, and MySQL databases.
+//! with support for SQLite, PostgreSQL, MySQL databases, and embedded storage via Fjall.
 //!
 //! # Features
 //!
 //! - **Event Sourcing** - Store state changes as immutable events with complete audit trail
 //! - **CQRS Pattern** - Separate read and write models for scalable architectures
 //! - **SQL Database Support** - Built-in support for SQLite, PostgreSQL, and MySQL
+//! - **Embedded Storage** - Fjall key-value store for embedded applications
 //! - **Event Handlers** - Async event processing with automatic retries
 //! - **Event Subscriptions** - Continuous event stream processing with cursor tracking
 //! - **Projections** - Build read models by replaying events
-//! - **Snapshots** - Periodic state captures to optimize aggregate loading
 //! - **Database Migrations** - Automated schema management
 //! - **Zero-Copy Serialization** - Fast serialization with rkyv
 //!
@@ -24,40 +24,33 @@
 //! - `sqlite` - SQLite support via sqlx
 //! - `mysql` - MySQL support via sqlx
 //! - `postgres` - PostgreSQL support via sqlx
+//! - `fjall` - Embedded key-value storage with Fjall
 //!
 //! # Quick Start
 //!
-//! ## Define Events and Aggregates
+//! ## Define Events Using an Enum
 //!
 //! ```rust,ignore
-//! use evento::aggregator;
-//!
-//! // Define your aggregate with the aggregator macro
-//! #[aggregator("myapp/Account")]
-//! #[derive(Default)]
-//! pub struct Account {
-//!     pub balance: i64,
-//!     pub owner: String,
-//! }
-//!
-//! // Define events for the aggregate
-//! #[aggregator("myapp/Account")]
-//! #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-//! pub struct AccountOpened {
-//!     pub owner: String,
-//! }
-//!
-//! #[aggregator("myapp/Account")]
-//! #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-//! pub struct MoneyDeposited {
-//!     pub amount: i64,
+//! // Define events using an enum - the macro generates individual structs
+//! #[evento::aggregator]
+//! pub enum Account {
+//!     AccountOpened {
+//!         owner: String,
+//!         initial_balance: i64,
+//!     },
+//!     MoneyDeposited {
+//!         amount: i64,
+//!     },
+//!     MoneyWithdrawn {
+//!         amount: i64,
+//!     },
 //! }
 //! ```
 //!
 //! ## Create and Store Events
 //!
 //! ```rust,ignore
-//! use evento::{create, aggregator, metadata::Metadata};
+//! use evento::metadata::Metadata;
 //!
 //! // Setup database and run migrations
 //! let pool = sqlx::SqlitePool::connect("sqlite:events.db").await?;
@@ -69,18 +62,18 @@
 //! let executor: evento::Sqlite = pool.into();
 //!
 //! // Create a new aggregate with an event
-//! let account_id = create()
-//!     .event(&AccountOpened { owner: "Alice".into() })?
-//!     .metadata(&Metadata::new("user-123"))?
+//! let account_id = evento::create()
+//!     .event(&AccountOpened { owner: "Alice".into(), initial_balance: 1000 })?
+//!     .metadata(&Metadata::default())?
 //!     .routing_key("accounts")
 //!     .commit(&executor)
 //!     .await?;
 //!
 //! // Add more events to the aggregate
-//! aggregator(&account_id)
+//! evento::aggregator(&account_id)
 //!     .original_version(1)
 //!     .event(&MoneyDeposited { amount: 100 })?
-//!     .metadata(&Metadata::new("user-123"))?
+//!     .metadata(&Metadata::default())?
 //!     .commit(&executor)
 //!     .await?;
 //! ```
@@ -88,7 +81,7 @@
 //! ## Build Projections and Handle Events
 //!
 //! ```rust,ignore
-//! use evento::{handler, Projection, Action, metadata::Event, Executor};
+//! use evento::{Executor, metadata::Event, projection::{Action, Projection}};
 //!
 //! #[derive(Default)]
 //! pub struct AccountView {
@@ -96,18 +89,24 @@
 //!     pub owner: String,
 //! }
 //!
-//! #[handler]
+//! #[evento::handler]
 //! async fn on_account_opened<E: Executor>(
 //!     event: Event<AccountOpened>,
 //!     action: Action<'_, AccountView, E>,
 //! ) -> anyhow::Result<()> {
-//!     if let Action::Apply(view) = action {
-//!         view.owner = event.data.owner.clone();
-//!     }
+//!     match action {
+//!         Action::Apply(view) => {
+//!             view.owner = event.data.owner.clone();
+//!             view.balance = event.data.initial_balance;
+//!         }
+//!         Action::Handle(_context) => {
+//!             // Handle side effects here
+//!         }
+//!     };
 //!     Ok(())
 //! }
 //!
-//! #[handler]
+//! #[evento::handler]
 //! async fn on_money_deposited<E: Executor>(
 //!     event: Event<MoneyDeposited>,
 //!     action: Action<'_, AccountView, E>,
@@ -120,8 +119,8 @@
 //!
 //! // Load aggregate state via projection
 //! let projection = Projection::<AccountView, _>::new("accounts")
-//!     .handler(on_account_opened)
-//!     .handler(on_money_deposited);
+//!     .handler(on_account_opened())
+//!     .handler(on_money_deposited());
 //!
 //! let result = projection
 //!     .load::<Account>(&account_id)
@@ -135,12 +134,13 @@
 //! use std::time::Duration;
 //!
 //! let subscription = Projection::<AccountView, _>::new("account-processor")
-//!     .handler(on_account_opened)
-//!     .handler(on_money_deposited)
+//!     .handler(on_account_opened())
+//!     .handler(on_money_deposited())
 //!     .subscription()
 //!     .routing_key("accounts")
 //!     .chunk_size(100)
 //!     .retry(5)
+//!     .delay(Duration::from_secs(10))
 //!     .start(&executor)
 //!     .await?;
 //!

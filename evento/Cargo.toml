@@ -24,6 +24,8 @@ tokio.workspace = true
 sea-query = { workspace = true, features = ["backend-sqlite", "backend-mysql", "backend-postgres"] }
 sea-query-sqlx = { workspace = true, features = ["sqlx-sqlite", "sqlx-mysql", "sqlx-postgres"] }
 anyhow.workspace = true
+evento-fjall.workspace = true
+tempfile = "3.24"
 
 [features]
 default = ["macro"]
