@@ -85,3 +85,9 @@ async fn fjall_subscribe_default_multiple_aggregator() -> anyhow::Result<()> {
     let (executor, _temp_dir) = create_fjall_executor("subscribe_default_multiple_aggregator")?;
     evento_test::subscribe_default_multiple_aggregator(&executor, vec![]).await
 }
+
+#[tokio::test]
+async fn fjall_all_commands() -> anyhow::Result<()> {
+    let (executor, _temp_dir) = create_fjall_executor("all_commands")?;
+    evento_test::all_commands(&executor, vec![]).await
+}

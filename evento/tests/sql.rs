@@ -122,6 +122,14 @@ async fn sqlite_subscribe_default_multiple_aggregator() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn sqlite_all_commands() -> anyhow::Result<()> {
+    let pool = create_sqlite_pool("all_commands").await?;
+    let data = get_data(&pool).await?;
+
+    evento_test::all_commands::<Sql<sqlx::Sqlite>>(&pool.into(), data).await
+}
+
+#[tokio::test]
 async fn rw_sqlite_routing_key() -> anyhow::Result<()> {
     let executor = create_rw_sqlite_executor("routing_key").await?;
 
@@ -213,6 +221,14 @@ async fn rw_sqlite_subscribe_default_multiple_aggregator() -> anyhow::Result<()>
 }
 
 #[tokio::test]
+async fn rw_sqlite_all_commands() -> anyhow::Result<()> {
+    let pool = create_rw_sqlite_pool("all_commands").await?;
+    let data = get_data(&pool.1).await?;
+
+    evento_test::all_commands::<RwSqlite>(&rw_from_pools(pool), data).await
+}
+
+#[tokio::test]
 async fn mysql_routing_key() -> anyhow::Result<()> {
     let executor = create_mysql_executor("routing_key").await?;
 
@@ -301,6 +317,14 @@ async fn mysql_subscribe_default_multiple_aggregator() -> anyhow::Result<()> {
     let data = get_data(&pool).await?;
 
     evento_test::subscribe_default_multiple_aggregator::<Sql<sqlx::MySql>>(&pool.into(), data).await
+}
+
+#[tokio::test]
+async fn mysql_all_commands() -> anyhow::Result<()> {
+    let pool = create_mysql_pool("all_commands").await?;
+    let data = get_data(&pool).await?;
+
+    evento_test::all_commands::<Sql<sqlx::MySql>>(&pool.into(), data).await
 }
 
 #[tokio::test]
@@ -396,6 +420,14 @@ async fn postgres_subscribe_default_multiple_aggregator() -> anyhow::Result<()> 
 
     evento_test::subscribe_default_multiple_aggregator::<Sql<sqlx::Postgres>>(&pool.into(), data)
         .await
+}
+
+#[tokio::test]
+async fn postgres_all_commands() -> anyhow::Result<()> {
+    let pool = create_postgres_pool("all_commands").await?;
+    let data = get_data(&pool).await?;
+
+    evento_test::all_commands::<Sql<sqlx::Postgres>>(&pool.into(), data).await
 }
 
 #[tokio::test]
