@@ -14,21 +14,27 @@
 //!
 //! ```rust,ignore
 //! use evento_fjall::Fjall;
-//! use evento_core::{create, Executor};
+//! use evento_core::{Executor, metadata::Metadata, cursor::Args, ReadAggregator};
+//!
+//! // Define events using an enum
+//! #[evento::aggregator]
+//! pub enum User {
+//!     UserCreated { name: String },
+//! }
 //!
 //! // Open the database
 //! let executor = Fjall::open("./my-events")?;
 //!
 //! // Create events
-//! let id = create()
-//!     .event(&MyEvent { ... })?
-//!     .metadata(&true)?
+//! let id = evento::create()
+//!     .event(&UserCreated { name: "Alice".into() })?
+//!     .metadata(&Metadata::default())?
 //!     .commit(&executor)
 //!     .await?;
 //!
 //! // Query events
 //! let events = executor.read(
-//!     Some(vec![ReadAggregator::id("myapp/User", &id)]),
+//!     Some(vec![ReadAggregator::id("user/User", &id)]),
 //!     None,
 //!     Args::forward(10, None),
 //! ).await?;

@@ -20,6 +20,7 @@ Add to your `Cargo.toml`:
 [dependencies]
 evento-fjall = "1.8"
 evento-core = "1.8"
+rkyv = "0.8"
 ```
 
 ## Usage
@@ -28,7 +29,14 @@ evento-core = "1.8"
 
 ```rust
 use evento_fjall::Fjall;
-use evento_core::{create, aggregator, Executor, ReadAggregator, cursor::Args};
+use evento::{Executor, metadata::Metadata, cursor::Args, ReadAggregator};
+
+// Define events using an enum
+#[evento::aggregator]
+pub enum User {
+    UserCreated { name: String },
+    NameChanged { name: String },
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -36,15 +44,15 @@ async fn main() -> anyhow::Result<()> {
     let executor = Fjall::open("./my-events")?;
 
     // Create an event
-    let id = create()
-        .event(&MyEvent { name: "test".into() })?
-        .metadata(&true)?
+    let id = evento::create()
+        .event(&UserCreated { name: "test".into() })?
+        .metadata(&Metadata::default())?
         .commit(&executor)
         .await?;
 
     // Query events
     let result = executor.read(
-        Some(vec![ReadAggregator::id("myapp/User", &id)]),
+        Some(vec![ReadAggregator::id("user/User", &id)]),
         None,
         Args::forward(10, None),
     ).await?;
@@ -72,14 +80,20 @@ let executor = Fjall::from_keyspace(keyspace)?;
 
 ```rust
 use evento_fjall::Fjall;
-use evento_core::{Projection, handler, Action, metadata::Event, Executor};
+use evento::{Executor, metadata::Event, projection::{Action, Projection}};
+
+// Define events
+#[evento::aggregator]
+pub enum User {
+    UserCreated { name: String },
+}
 
 #[derive(Default)]
 struct UserView {
     name: String,
 }
 
-#[handler]
+#[evento::handler]
 async fn on_user_created<E: Executor>(
     event: Event<UserCreated>,
     action: Action<'_, UserView, E>,
@@ -93,7 +107,7 @@ async fn on_user_created<E: Executor>(
 let executor = Fjall::open("./events")?;
 
 let projection = Projection::<UserView, _>::new("users")
-    .handler(on_user_created);
+    .handler(on_user_created());
 
 let result = projection
     .load::<User>(&user_id)

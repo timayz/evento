@@ -9,6 +9,7 @@
 //! - **`group`** - Multi-executor support via `EventoGroup`
 //! - **`rw`** - Read-write split executor pattern via `Rw`
 //! - **`sqlite`**, **`mysql`**, **`postgres`** - Database support via sqlx
+//! - **`fjall`** - Embedded key-value storage with Fjall
 //!
 //! # Core Concepts
 //!
@@ -36,9 +37,11 @@
 //! Use [`create()`] or [`aggregator()`] to build and commit events:
 //!
 //! ```rust,ignore
+//! use evento::metadata::Metadata;
+//!
 //! let id = evento::create()
 //!     .event(&AccountOpened { owner_id: "user1".into(), initial_balance: 1000 })?
-//!     .metadata(&metadata)?
+//!     .metadata(&Metadata::default())?
 //!     .commit(&executor)
 //!     .await?;
 //! ```
@@ -61,17 +64,18 @@
 //! # Example
 //!
 //! ```rust,ignore
-//! use evento::{create, Executor};
+//! use evento::{Executor, metadata::Metadata, cursor::Args, ReadAggregator};
 //!
 //! // Create and persist an event
-//! let id = create()
-//!     .event(&MyEvent { ... })?
+//! let id = evento::create()
+//!     .event(&AccountOpened { owner_id: "user1".into(), initial_balance: 1000 })?
+//!     .metadata(&Metadata::default())?
 //!     .commit(&executor)
 //!     .await?;
 //!
 //! // Query events with pagination
 //! let events = executor.read(
-//!     Some(vec![ReadAggregator::id("myapp/User", &user_id)]),
+//!     Some(vec![ReadAggregator::id("myapp/Account", &id)]),
 //!     None,
 //!     Args::forward(10, None),
 //! ).await?;
