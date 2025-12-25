@@ -1,202 +1,516 @@
 use bank::{
-    ChangeDailyWithdrawalLimit, Command, Created, DepositMoney, MoneyReceived, MoneyTransferred,
+    account_details_subscription, load_account_details, AccountType, Command, Created,
+    DepositMoney, NameChanged, OpenAccount, ReceiveMoney, TransferMoney, ACCOUNT_DETAILS_ROWS,
     COMMAND_ROWS,
 };
-use evento::{metadata::Metadata, Event, Executor, WriteError};
+use evento::{metadata::Metadata, Event, Executor};
 use ulid::Ulid;
 
 pub async fn load<E: Executor>(executor: &E) -> anyhow::Result<()> {
-    let john_id = bank::Command::open_account(
-        bank::OpenAccount {
-            owner_id: Ulid::new().to_string(),
-            owner_name: "john".to_owned(),
-            account_type: bank::AccountType::Business,
-            currency: "EUR".to_owned(),
+    // Create first account (John) with initial balance
+    let john_id = Command::open_account(
+        OpenAccount {
+            owner_id: "owner_john".to_owned(),
+            owner_name: "John Doe".to_owned(),
+            account_type: AccountType::Checking,
+            currency: "USD".to_owned(),
             initial_balance: 1000,
         },
         executor,
     )
     .await?;
 
-    let cmd = bank::load(executor, &john_id).await?.unwrap();
-    cmd.transfer_money(
-        bank::TransferMoney {
-            amount: 350,
-            to_account_id: Ulid::new().to_string(),
-            transaction_id: Ulid::new().to_string(),
-            description: "".to_owned(),
+    // Create second account (Jane) with different balance
+    let jane_id = Command::open_account(
+        OpenAccount {
+            owner_id: "owner_jane".to_owned(),
+            owner_name: "Jane Smith".to_owned(),
+            account_type: AccountType::Savings,
+            currency: "EUR".to_owned(),
+            initial_balance: 500,
         },
         executor,
     )
     .await?;
 
-    assert_eq!(cmd.0.version, 1);
+    // Load John's account and verify initial state
+    let john = bank::load(executor, &john_id)
+        .await?
+        .expect("john account should exist");
 
-    let cmd = bank::load(executor, &john_id).await?.unwrap();
-    cmd.change_daily_withdrawal_limit(ChangeDailyWithdrawalLimit { new_limit: 233 }, executor)
-        .await?;
+    assert_eq!(john.balance, 1000);
+    assert_eq!(john.account_id, john_id);
+    assert_eq!(john.0.version, 1);
+    assert!(john.is_active());
 
-    let cmd = bank::load(executor, &john_id).await?.unwrap();
+    // Load Jane's account and verify initial state
+    let jane = bank::load(executor, &jane_id)
+        .await?
+        .expect("jane account should exist");
 
-    assert_eq!(cmd.balance, 650);
-    assert_eq!(cmd.0.version, 3);
+    assert_eq!(jane.balance, 500);
+    assert_eq!(jane.account_id, jane_id);
+    assert_eq!(jane.0.version, 1);
+    assert!(jane.is_active());
 
-    cmd.transfer_money(
-        bank::TransferMoney {
-            amount: 150,
-            to_account_id: Ulid::new().to_string(),
-            transaction_id: Ulid::new().to_string(),
-            description: "".to_owned(),
-        },
-        executor,
-    )
-    .await?;
-
-    let cmd = bank::load(executor, &john_id).await?.unwrap();
-
-    assert_eq!(cmd.balance, 500);
-    assert_eq!(cmd.0.version, 4);
-
-    cmd.deposit_money(
+    // Deposit money to John's account
+    john.deposit_money(
         DepositMoney {
-            amount: 10_000,
-            description: "".to_owned(),
+            amount: 250,
             transaction_id: Ulid::new().to_string(),
+            description: "Salary deposit".to_owned(),
         },
         executor,
     )
     .await?;
 
-    let cmd = bank::load(executor, &john_id).await?.unwrap();
-    assert_eq!(cmd.balance, 10500);
-    assert_eq!(cmd.0.version, 5);
+    // Reload John and verify updated balance and version
+    let john = bank::load(executor, &john_id)
+        .await?
+        .expect("john account should exist");
+
+    assert_eq!(john.balance, 1250);
+    assert_eq!(john.0.version, 2);
+
+    // Transfer money from John to Jane
+    let transaction_id = Ulid::new().to_string();
+
+    john.transfer_money(
+        TransferMoney {
+            amount: 300,
+            to_account_id: jane_id.clone(),
+            transaction_id: transaction_id.clone(),
+            description: "Payment to Jane".to_owned(),
+        },
+        executor,
+    )
+    .await?;
+
+    // Jane receives the money
+    let jane = bank::load(executor, &jane_id)
+        .await?
+        .expect("jane account should exist");
+
+    jane.receive_money(
+        ReceiveMoney {
+            amount: 300,
+            from_account_id: john_id.clone(),
+            transaction_id,
+            description: "Payment from John".to_owned(),
+        },
+        executor,
+    )
+    .await?;
+
+    // Verify final balances and versions
+    let john = bank::load(executor, &john_id)
+        .await?
+        .expect("john account should exist");
+    let jane = bank::load(executor, &jane_id)
+        .await?
+        .expect("jane account should exist");
+
+    assert_eq!(john.balance, 950); // 1250 - 300
+    assert_eq!(john.0.version, 3); // AccountOpened + MoneyDeposited + MoneyTransferred
+    assert_eq!(jane.balance, 800); // 500 + 300
+    assert_eq!(jane.0.version, 2); // AccountOpened + MoneyReceived
+
+    // Verify non-existent account returns None
+    let non_existent = bank::load(executor, "non_existent_id").await?;
+    assert!(non_existent.is_none());
 
     Ok(())
 }
 
 pub async fn routing_key<E: Executor>(executor: &E) -> anyhow::Result<()> {
-    let john_id = bank::Command::open_account(
-        bank::OpenAccount {
-            owner_id: Ulid::new().to_string(),
-            owner_name: "john".to_owned(),
-            account_type: bank::AccountType::Business,
+    // Create account WITH routing key "us-east-1"
+    let account_id = Command::open_account_with_routing(
+        OpenAccount {
+            owner_id: "owner1".to_owned(),
+            owner_name: "Alice".to_owned(),
+            account_type: AccountType::Checking,
+            currency: "USD".to_owned(),
+            initial_balance: 1000,
+        },
+        executor,
+        "us-east-1",
+    )
+    .await?;
+
+    // Load and verify routing key and version
+    let account = bank::load(executor, &account_id)
+        .await?
+        .expect("account should exist");
+
+    assert_eq!(account.0.routing_key, Some("us-east-1".to_owned()));
+    assert_eq!(account.0.version, 1);
+    assert_eq!(account.balance, 1000);
+
+    // Deposit money - routing key should be preserved from first event
+    account
+        .deposit_money(
+            DepositMoney {
+                amount: 500,
+                transaction_id: Ulid::new().to_string(),
+                description: "Deposit".to_owned(),
+            },
+            executor,
+        )
+        .await?;
+
+    // Reload and verify routing key is preserved and version incremented
+    let account = bank::load(executor, &account_id)
+        .await?
+        .expect("account should exist");
+
+    assert_eq!(account.0.routing_key, Some("us-east-1".to_owned()));
+    assert_eq!(account.0.version, 2);
+    assert_eq!(account.balance, 1500);
+
+    // Create another account with different routing key "eu-west-1"
+    let account2_id = Command::open_account_with_routing(
+        OpenAccount {
+            owner_id: "owner2".to_owned(),
+            owner_name: "Bob".to_owned(),
+            account_type: AccountType::Savings,
             currency: "EUR".to_owned(),
+            initial_balance: 2000,
+        },
+        executor,
+        "eu-west-1",
+    )
+    .await?;
+
+    let account2 = bank::load(executor, &account2_id)
+        .await?
+        .expect("account2 should exist");
+
+    assert_eq!(account2.0.routing_key, Some("eu-west-1".to_owned()));
+    assert_eq!(account2.0.version, 1);
+
+    // Create account WITHOUT routing key
+    let account3_id = Command::open_account(
+        OpenAccount {
+            owner_id: "owner3".to_owned(),
+            owner_name: "Charlie".to_owned(),
+            account_type: AccountType::Business,
+            currency: "GBP".to_owned(),
+            initial_balance: 3000,
+        },
+        executor,
+    )
+    .await?;
+
+    let account3 = bank::load(executor, &account3_id)
+        .await?
+        .expect("account3 should exist");
+
+    assert_eq!(account3.0.routing_key, None);
+    assert_eq!(account3.0.version, 1);
+
+    // Deposit to account without routing key - should remain None
+    account3
+        .deposit_money(
+            DepositMoney {
+                amount: 100,
+                transaction_id: Ulid::new().to_string(),
+                description: "Small deposit".to_owned(),
+            },
+            executor,
+        )
+        .await?;
+
+    let account3 = bank::load(executor, &account3_id)
+        .await?
+        .expect("account3 should exist");
+
+    assert_eq!(account3.0.routing_key, None);
+    assert_eq!(account3.0.version, 2);
+    assert_eq!(account3.balance, 3100);
+
+    Ok(())
+}
+
+pub async fn load_multiple_aggregator<E: Executor>(executor: &E) -> anyhow::Result<()> {
+    // Create an Owner aggregate
+    let owner_id = evento::create()
+        .event(&Created {
+            name: "John Doe".to_owned(),
+        })?
+        .metadata(&Metadata::default())?
+        .commit(executor)
+        .await?;
+
+    // Create a bank account with this owner
+    let account_id = Command::open_account(
+        OpenAccount {
+            owner_id: owner_id.clone(),
+            owner_name: "John Doe".to_owned(),
+            account_type: AccountType::Checking,
+            currency: "USD".to_owned(),
             initial_balance: 1000,
         },
         executor,
     )
     .await?;
-    let cmd = bank::load(executor, &john_id).await?.unwrap();
-    assert_eq!(cmd.0.routing_key, None);
 
-    cmd.transfer_money_with_routing(
-        bank::TransferMoney {
-            amount: 350,
-            to_account_id: Ulid::new().to_string(),
-            transaction_id: Ulid::new().to_string(),
-            description: "".to_owned(),
-        },
-        executor,
-        "routing1",
-    )
-    .await?;
-    let cmd = bank::load(executor, &john_id).await?.unwrap();
-    assert_eq!(cmd.0.routing_key, None);
+    // Load account details (should include owner info)
+    let account = load_account_details(executor, &account_id, &owner_id)
+        .await?
+        .expect("account should exist");
 
-    let albert_id = bank::Command::open_account_with_routing(
-        bank::OpenAccount {
-            owner_id: Ulid::new().to_string(),
-            owner_name: "albert".to_owned(),
-            account_type: bank::AccountType::Savings,
-            currency: "EUR".to_owned(),
+    assert_eq!(account.item.balance, 1000);
+    assert_eq!(account.item.owner_id, owner_id);
+    assert_eq!(account.item.owner_name, "John Doe");
+    assert_eq!(account.version, 1);
+
+    // Deposit money
+    let bank_account = bank::load(executor, &account_id).await?.unwrap();
+    bank_account
+        .deposit_money(
+            DepositMoney {
+                amount: 500,
+                transaction_id: Ulid::new().to_string(),
+                description: "Deposit".to_owned(),
+            },
+            executor,
+        )
+        .await?;
+
+    // Update owner name
+    evento::aggregator(&owner_id)
+        .original_version(1)
+        .event(&NameChanged {
+            value: "John Smith".to_owned(),
+        })?
+        .metadata(&Metadata::default())?
+        .commit(executor)
+        .await?;
+
+    // Load account details again - should reflect both changes
+    let account = load_account_details(executor, &account_id, &owner_id)
+        .await?
+        .expect("account should exist");
+
+    // Verify BankAccount events were applied
+    assert_eq!(account.item.balance, 1500); // 1000 + 500
+    assert_eq!(account.item.available_balance, 1500);
+
+    // Verify Owner::NameChanged was applied
+    assert_eq!(account.item.owner_name, "John Smith");
+
+    // Version should be max of both aggregators' versions seen
+    // BankAccount: AccountOpened(1) + MoneyDeposited(2) = version 2
+    // Owner: Created(1) + NameChanged(2) = version 2
+    // The projection tracks the last event's version it processed
+    assert_eq!(account.version, 2);
+
+    Ok(())
+}
+
+pub async fn load_with_snapshot<E: Executor>(executor: &E) -> anyhow::Result<()> {
+    use bank::{AccountStatus, CommandRow};
+
+    // Create an account
+    let account_id = Command::open_account(
+        OpenAccount {
+            owner_id: "owner1".to_owned(),
+            owner_name: "John".to_owned(),
+            account_type: AccountType::Checking,
+            currency: "USD".to_owned(),
             initial_balance: 1000,
         },
         executor,
-        "routing1",
     )
     .await?;
 
-    let cmd = bank::load(executor, &albert_id).await?.unwrap();
-    assert_eq!(cmd.0.routing_key, Some("routing1".to_owned()));
+    // Deposit money twice (version 2 and 3)
+    let account = bank::load(executor, &account_id).await?.unwrap();
+    account
+        .deposit_money(
+            DepositMoney {
+                amount: 200,
+                transaction_id: Ulid::new().to_string(),
+                description: "Deposit 1".to_owned(),
+            },
+            executor,
+        )
+        .await?;
 
-    cmd.transfer_money(
-        bank::TransferMoney {
-            amount: 350,
-            to_account_id: Ulid::new().to_string(),
-            transaction_id: Ulid::new().to_string(),
-            description: "".to_owned(),
-        },
-        executor,
-    )
-    .await?;
+    let account = bank::load(executor, &account_id).await?.unwrap();
+    account
+        .deposit_money(
+            DepositMoney {
+                amount: 300,
+                transaction_id: Ulid::new().to_string(),
+                description: "Deposit 2".to_owned(),
+            },
+            executor,
+        )
+        .await?;
 
-    let cmd = bank::load(executor, &albert_id).await?.unwrap();
-    assert_eq!(cmd.0.routing_key, Some("routing1".to_owned()));
+    // Now we have events: AccountOpened(v1), MoneyDeposited(v2), MoneyDeposited(v3)
+    // Real balance should be: 1000 + 200 + 300 = 1500
+
+    // Manually insert a "snapshot" at version 1 with balance 1000
+    // This simulates a snapshot taken after AccountOpened
+    {
+        let mut rows = COMMAND_ROWS.write().unwrap();
+        rows.insert(
+            account_id.clone(),
+            (
+                CommandRow {
+                    account_id: account_id.clone(),
+                    balance: 1000, // snapshot at version 1
+                    status: AccountStatus::Active,
+                    overdraft_limit: 0,
+                },
+                1,    // version 1
+                None, // no routing key
+            ),
+        );
+    }
+
+    // Load - should restore from snapshot (version 1, balance 1000)
+    // and apply events v2 and v3 (+200 +300)
+    let account = bank::load(executor, &account_id).await?.unwrap();
+
+    assert_eq!(account.balance, 1500); // 1000 (snapshot) + 200 + 300
+    assert_eq!(account.0.version, 3);
+
+    // Test with a snapshot at version 2
+    {
+        let mut rows = COMMAND_ROWS.write().unwrap();
+        rows.insert(
+            account_id.clone(),
+            (
+                CommandRow {
+                    account_id: account_id.clone(),
+                    balance: 1200, // snapshot at version 2 (1000 + 200)
+                    status: AccountStatus::Active,
+                    overdraft_limit: 0,
+                },
+                2,    // version 2
+                None, // no routing key
+            ),
+        );
+    }
+
+    // Load - should restore from snapshot (version 2, balance 1200)
+    // and apply only event v3 (+300)
+    let account = bank::load(executor, &account_id).await?.unwrap();
+
+    assert_eq!(account.balance, 1500); // 1200 (snapshot) + 300
+    assert_eq!(account.0.version, 3);
+
+    // Test with snapshot at latest version (no events to apply)
+    {
+        let mut rows = COMMAND_ROWS.write().unwrap();
+        rows.insert(
+            account_id.clone(),
+            (
+                CommandRow {
+                    account_id: account_id.clone(),
+                    balance: 1500, // snapshot at version 3 (full state)
+                    status: AccountStatus::Active,
+                    overdraft_limit: 0,
+                },
+                3,    // version 3
+                None, // no routing key
+            ),
+        );
+    }
+
+    // Load - should restore from snapshot (version 3), no events to apply
+    let account = bank::load(executor, &account_id).await?.unwrap();
+
+    assert_eq!(account.balance, 1500);
+    assert_eq!(account.0.version, 3);
 
     Ok(())
 }
 
 pub async fn invalid_original_version<E: Executor>(executor: &E) -> anyhow::Result<()> {
-    let john_id = bank::Command::open_account(
-        bank::OpenAccount {
-            owner_id: Ulid::new().to_string(),
-            owner_name: "john".to_owned(),
-            account_type: bank::AccountType::Business,
-            currency: "EUR".to_owned(),
+    // Create an account
+    let account_id = Command::open_account(
+        OpenAccount {
+            owner_id: "owner1".to_owned(),
+            owner_name: "Alice".to_owned(),
+            account_type: AccountType::Checking,
+            currency: "USD".to_owned(),
             initial_balance: 1000,
         },
         executor,
     )
     .await?;
-    let cmd = bank::load(executor, &john_id).await?.unwrap();
-    let cmd2 = bank::load(executor, &john_id).await?.unwrap();
-    cmd.transfer_money(
-        bank::TransferMoney {
-            amount: 350,
-            to_account_id: Ulid::new().to_string(),
-            transaction_id: Ulid::new().to_string(),
-            description: "".to_owned(),
-        },
-        executor,
-    )
-    .await?;
 
-    assert_eq!(cmd.0.version, 1);
+    // Load the account twice (simulating concurrent access)
+    let account_v1_first = bank::load(executor, &account_id)
+        .await?
+        .expect("account should exist");
 
-    let res = cmd2
-        .transfer_money(
-            bank::TransferMoney {
-                amount: 350,
-                to_account_id: Ulid::new().to_string(),
+    let account_v1_second = bank::load(executor, &account_id)
+        .await?
+        .expect("account should exist");
+
+    // Both have version 1
+    assert_eq!(account_v1_first.0.version, 1);
+    assert_eq!(account_v1_second.0.version, 1);
+
+    // First load commits successfully (version 1 -> 2)
+    account_v1_first
+        .deposit_money(
+            DepositMoney {
+                amount: 100,
                 transaction_id: Ulid::new().to_string(),
-                description: "".to_owned(),
+                description: "First deposit".to_owned(),
+            },
+            executor,
+        )
+        .await?;
+
+    // Verify first commit succeeded
+    let account_after_first = bank::load(executor, &account_id)
+        .await?
+        .expect("account should exist");
+    assert_eq!(account_after_first.0.version, 2);
+    assert_eq!(account_after_first.balance, 1100);
+
+    // Second load tries to commit with stale version 1
+    // This should fail because version is now 2
+    let result = account_v1_second
+        .deposit_money(
+            DepositMoney {
+                amount: 200,
+                transaction_id: Ulid::new().to_string(),
+                description: "Second deposit (should fail)".to_owned(),
             },
             executor,
         )
         .await;
 
-    assert_eq!(
-        res.map_err(|e| e.to_string()),
-        Err(WriteError::InvalidOriginalVersion.to_string())
+    // Should get InvalidOriginalVersion error
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(
+        err.to_string().contains("invalid original version"),
+        "Expected InvalidOriginalVersion error, got: {:?}",
+        err
     );
-    let cmd2 = bank::load(executor, &john_id).await?.unwrap();
-    cmd2.transfer_money(
-        bank::TransferMoney {
-            amount: 350,
-            to_account_id: Ulid::new().to_string(),
-            transaction_id: Ulid::new().to_string(),
-            description: "".to_owned(),
-        },
-        executor,
-    )
-    .await?;
+
+    // Verify the second commit didn't go through - balance unchanged
+    let account_final = bank::load(executor, &account_id)
+        .await?
+        .expect("account should exist");
+    assert_eq!(account_final.0.version, 2);
+    assert_eq!(account_final.balance, 1100); // Only first deposit counted
 
     Ok(())
 }
 
 pub async fn subscriber_running<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
-    let sub1 = bank::subscription().all().start(executor).await?;
-    let sub2 = bank::subscription().all().start(executor).await?;
+    let sub1 = bank::subscription().start(executor).await?;
+    let sub2 = bank::subscription().start(executor).await?;
 
     assert!(
         !executor
@@ -214,370 +528,652 @@ pub async fn subscriber_running<E: Executor + Clone>(executor: &E) -> anyhow::Re
 
 pub async fn subscribe<E: Executor + Clone>(
     executor: &E,
-    events: Vec<Event>,
+    _events: Vec<Event>,
 ) -> anyhow::Result<()> {
-    let john_id = bank::Command::open_account(
-        bank::OpenAccount {
-            owner_id: Ulid::new().to_string(),
-            owner_name: "john".to_owned(),
-            account_type: bank::AccountType::Business,
-            currency: "EUR".to_owned(),
+    // Create first account (Alice)
+    let alice_id = Command::open_account(
+        OpenAccount {
+            owner_id: "owner_alice".to_owned(),
+            owner_name: "Alice".to_owned(),
+            account_type: AccountType::Checking,
+            currency: "USD".to_owned(),
             initial_balance: 1000,
         },
         executor,
     )
     .await?;
-    let cmd = bank::load(executor, &john_id).await?.unwrap();
-    cmd.transfer_money(
-        bank::TransferMoney {
-            amount: 350,
-            to_account_id: Ulid::new().to_string(),
-            transaction_id: Ulid::new().to_string(),
-            description: "".to_owned(),
+
+    // Create second account (Bob)
+    let bob_id = Command::open_account(
+        OpenAccount {
+            owner_id: "owner_bob".to_owned(),
+            owner_name: "Bob".to_owned(),
+            account_type: AccountType::Savings,
+            currency: "EUR".to_owned(),
+            initial_balance: 500,
         },
         executor,
     )
     .await?;
-    bank::subscription().execute(executor).await?;
 
-    let views = COMMAND_ROWS.read().unwrap();
-    for v in views.values() {
-        println!("{}", v.0.balance);
+    // Perform some operations
+    let alice = bank::load(executor, &alice_id).await?.unwrap();
+    alice
+        .deposit_money(
+            DepositMoney {
+                amount: 200,
+                transaction_id: Ulid::new().to_string(),
+                description: "Deposit".to_owned(),
+            },
+            executor,
+        )
+        .await?;
+
+    let alice = bank::load(executor, &alice_id).await?.unwrap();
+    let transaction_id = Ulid::new().to_string();
+    alice
+        .transfer_money(
+            TransferMoney {
+                amount: 300,
+                to_account_id: bob_id.clone(),
+                transaction_id: transaction_id.clone(),
+                description: "Transfer to Bob".to_owned(),
+            },
+            executor,
+        )
+        .await?;
+
+    let bob = bank::load(executor, &bob_id).await?.unwrap();
+    bob.receive_money(
+        ReceiveMoney {
+            amount: 300,
+            from_account_id: alice_id.clone(),
+            transaction_id,
+            description: "From Alice".to_owned(),
+        },
+        executor,
+    )
+    .await?;
+
+    // Remove only this test's accounts to simulate fresh projection state
+    {
+        let mut rows = COMMAND_ROWS.write().unwrap();
+        rows.remove(&alice_id);
+        rows.remove(&bob_id);
     }
 
-    let john = views.get(&john_id);
+    // Verify our accounts are not in projection
+    {
+        let rows = COMMAND_ROWS.read().unwrap();
+        assert!(!rows.contains_key(&alice_id));
+        assert!(!rows.contains_key(&bob_id));
+    }
 
-    assert_eq!(views.len(), 1);
-    assert!(john.is_some());
+    // Run subscription to rebuild projection from events
+    bank::subscription().execute(executor).await?;
 
-    let john = john.unwrap();
+    // Verify projection was rebuilt correctly
+    let rows = COMMAND_ROWS.read().unwrap();
 
-    assert_eq!(john.0.balance, 650);
-    // let events = events
-    //     .into_iter()
-    //     .filter(|e| e.aggregator_type == Calcul::name())
-    //     .collect::<Vec<_>>();
-    //
-    // let events = evento::cursor::Reader::new(events)
-    //     .forward(1000, None)
-    //     .execute()?;
-    //
-    // let sub1 = evento::subscribe("sub1").all().aggregator::<Calcul>();
-    //
-    // sub1.init(executor).await?;
-    //
-    // let sub2 = evento::subscribe("sub2")
-    //     .chunk_size(5)
-    //     .all()
-    //     .aggregator::<Calcul>();
-    //
-    // sub2.init(executor).await?;
-    //
-    // let sub1_events = sub1.read(executor).await?;
-    // for (index, edge) in events.edges.iter().enumerate() {
-    //     let sub1_event = sub1_events.get(index).map(|c| &c.event);
-    //     assert_eq!(sub1_event, Some(&edge.node));
-    //     sub1_events.get(index).unwrap().acknowledge().await?;
-    // }
-    //
-    // let sub1_events = sub1.read(executor).await?;
-    // assert!(sub1_events.is_empty());
-    //
-    // let sub2_events = sub2.read(executor).await?;
-    // for (index, edge) in events.edges.iter().take(5).enumerate() {
-    //     let sub2_event = sub2_events.get(index).map(|c| &c.event);
-    //     assert_eq!(sub2_event, Some(&edge.node));
-    //     sub2_events.get(index).unwrap().acknowledge().await?;
-    // }
-    //
-    // let sub2_events = sub2.read(executor).await?;
-    // for (index, edge) in events.edges.iter().skip(5).enumerate() {
-    //     let sub2_event = sub2_events.get(index).map(|c| &c.event);
-    //     assert_eq!(sub2_event, Some(&edge.node));
-    //     sub2_events.get(index).unwrap().acknowledge().await?;
-    // }
-    //
-    // let sub2_events = sub2.read(executor).await?;
-    // assert!(sub2_events.is_empty());
+    // Check Alice's account
+    let alice_row = rows
+        .get(&alice_id)
+        .expect("Alice should exist in projection");
+    assert_eq!(alice_row.0.account_id, alice_id);
+    assert_eq!(alice_row.0.balance, 900); // 1000 + 200 - 300
+    assert_eq!(alice_row.1, 3); // version: AccountOpened + MoneyDeposited + MoneyTransferred
+
+    // Check Bob's account
+    let bob_row = rows.get(&bob_id).expect("Bob should exist in projection");
+    assert_eq!(bob_row.0.account_id, bob_id);
+    assert_eq!(bob_row.0.balance, 800); // 500 + 300
+    assert_eq!(bob_row.1, 2); // version: AccountOpened + MoneyReceived
 
     Ok(())
 }
 
 pub async fn subscribe_routing_key<E: Executor + Clone>(
     executor: &E,
-    events: Vec<Event>,
+    _events: Vec<Event>,
 ) -> anyhow::Result<()> {
-    // let events = events
-    //     .into_iter()
-    //     .filter(|e| {
-    //         e.aggregator_type == Calcul::name() && e.routing_key == Some("eu-west-3".to_owned())
-    //     })
-    //     .collect::<Vec<_>>();
-    //
-    // let events = evento::cursor::Reader::new(events)
-    //     .forward(1000, None)
-    //     .execute()?;
-    //
-    // let sub1 = evento::subscribe("sub1")
-    //     .all()
-    //     .routing_key("eu-west-3")
-    //     .aggregator::<Calcul>();
-    //
-    // sub1.init(executor).await?;
-    //
-    // let sub1_events = sub1.read(executor).await?;
-    // for (index, edge) in events.edges.iter().enumerate() {
-    //     let sub1_event = sub1_events.get(index).map(|c| &c.event);
-    //     assert_eq!(sub1_event, Some(&edge.node));
-    //     sub1_events.get(index).unwrap().acknowledge().await?;
-    // }
-    //
-    // let sub1_events = sub1.read(executor).await?;
-    // assert!(sub1_events.is_empty());
+    // Create account with routing key "us-east-1"
+    let us_account_id = Command::open_account_with_routing(
+        OpenAccount {
+            owner_id: "owner_us".to_owned(),
+            owner_name: "US User".to_owned(),
+            account_type: AccountType::Checking,
+            currency: "USD".to_owned(),
+            initial_balance: 1000,
+        },
+        executor,
+        "us-east-1",
+    )
+    .await?;
+
+    // Create account with routing key "eu-west-1"
+    let eu_account_id = Command::open_account_with_routing(
+        OpenAccount {
+            owner_id: "owner_eu".to_owned(),
+            owner_name: "EU User".to_owned(),
+            account_type: AccountType::Checking,
+            currency: "EUR".to_owned(),
+            initial_balance: 2000,
+        },
+        executor,
+        "eu-west-1",
+    )
+    .await?;
+
+    // Deposit to both accounts
+    let us_account = bank::load(executor, &us_account_id).await?.unwrap();
+    us_account
+        .deposit_money(
+            DepositMoney {
+                amount: 500,
+                transaction_id: Ulid::new().to_string(),
+                description: "US deposit".to_owned(),
+            },
+            executor,
+        )
+        .await?;
+
+    let eu_account = bank::load(executor, &eu_account_id).await?.unwrap();
+    eu_account
+        .deposit_money(
+            DepositMoney {
+                amount: 300,
+                transaction_id: Ulid::new().to_string(),
+                description: "EU deposit".to_owned(),
+            },
+            executor,
+        )
+        .await?;
+
+    // Remove only this test's accounts from projection
+    {
+        let mut rows = COMMAND_ROWS.write().unwrap();
+        rows.remove(&us_account_id);
+        rows.remove(&eu_account_id);
+    }
+
+    // Run subscription filtered by "us-east-1" routing key
+    bank::subscription()
+        .routing_key("us-east-1")
+        .execute(executor)
+        .await?;
+
+    // Verify only US account was processed
+    {
+        let rows = COMMAND_ROWS.read().unwrap();
+
+        // US account should exist with correct balance
+        let us_row = rows
+            .get(&us_account_id)
+            .expect("US account should exist in projection");
+        assert_eq!(us_row.0.balance, 1500); // 1000 + 500
+        assert_eq!(us_row.1, 2); // version: AccountOpened + MoneyDeposited
+        assert_eq!(us_row.2, Some("us-east-1".to_owned()));
+
+        // EU account should NOT exist (not processed by this subscription)
+        assert!(
+            !rows.contains_key(&eu_account_id),
+            "EU account should NOT be in projection (different routing key)"
+        );
+    }
+
+    // Now run subscription filtered by "eu-west-1" routing key
+    bank::subscription()
+        .routing_key("eu-west-1")
+        .execute(executor)
+        .await?;
+
+    // Verify EU account was now processed
+    {
+        let rows = COMMAND_ROWS.read().unwrap();
+
+        // EU account should now exist
+        let eu_row = rows
+            .get(&eu_account_id)
+            .expect("EU account should exist in projection");
+        assert_eq!(eu_row.0.balance, 2300); // 2000 + 300
+        assert_eq!(eu_row.1, 2); // version: AccountOpened + MoneyDeposited
+        assert_eq!(eu_row.2, Some("eu-west-1".to_owned()));
+    }
 
     Ok(())
 }
 
 pub async fn subscribe_default<E: Executor + Clone>(
     executor: &E,
-    events: Vec<Event>,
+    _events: Vec<Event>,
 ) -> anyhow::Result<()> {
-    // let events = events
-    //     .into_iter()
-    //     .filter(|e| e.aggregator_type == Calcul::name() && e.routing_key.is_none())
-    //     .collect::<Vec<_>>();
-    //
-    // let events = evento::cursor::Reader::new(events)
-    //     .forward(1000, None)
-    //     .execute()?;
-    //
-    // let sub1 = evento::subscribe("sub1").aggregator::<Calcul>();
-    //
-    // sub1.init(executor).await?;
-    //
-    // let sub1_events = sub1.read(executor).await?;
-    // for (index, edge) in events.edges.iter().enumerate() {
-    //     let sub1_event = sub1_events.get(index).map(|c| &c.event);
-    //     assert_eq!(sub1_event, Some(&edge.node));
-    //     sub1_events.get(index).unwrap().acknowledge().await?;
-    // }
-    //
-    // let sub1_events = sub1.read(executor).await?;
-    // assert!(sub1_events.is_empty());
+    // Create account WITHOUT routing key (default/None)
+    let default_account_id = Command::open_account(
+        OpenAccount {
+            owner_id: "owner_default".to_owned(),
+            owner_name: "Default User".to_owned(),
+            account_type: AccountType::Checking,
+            currency: "USD".to_owned(),
+            initial_balance: 1000,
+        },
+        executor,
+    )
+    .await?;
+
+    // Create account WITH routing key
+    let routed_account_id = Command::open_account_with_routing(
+        OpenAccount {
+            owner_id: "owner_routed".to_owned(),
+            owner_name: "Routed User".to_owned(),
+            account_type: AccountType::Checking,
+            currency: "EUR".to_owned(),
+            initial_balance: 2000,
+        },
+        executor,
+        "eu-west-1",
+    )
+    .await?;
+
+    // Deposit to both accounts
+    let default_account = bank::load(executor, &default_account_id).await?.unwrap();
+    default_account
+        .deposit_money(
+            DepositMoney {
+                amount: 500,
+                transaction_id: Ulid::new().to_string(),
+                description: "Default deposit".to_owned(),
+            },
+            executor,
+        )
+        .await?;
+
+    let routed_account = bank::load(executor, &routed_account_id).await?.unwrap();
+    routed_account
+        .deposit_money(
+            DepositMoney {
+                amount: 300,
+                transaction_id: Ulid::new().to_string(),
+                description: "Routed deposit".to_owned(),
+            },
+            executor,
+        )
+        .await?;
+
+    // Remove only this test's accounts from projection
+    {
+        let mut rows = COMMAND_ROWS.write().unwrap();
+        rows.remove(&default_account_id);
+        rows.remove(&routed_account_id);
+    }
+
+    // Run default subscription (no routing key = processes events with routing_key IS NULL)
+    bank::subscription().execute(executor).await?;
+
+    // Verify only default (no routing key) account was processed
+    {
+        let rows = COMMAND_ROWS.read().unwrap();
+
+        // Default account should exist with correct balance
+        let default_row = rows
+            .get(&default_account_id)
+            .expect("Default account should exist in projection");
+        assert_eq!(default_row.0.balance, 1500); // 1000 + 500
+        assert_eq!(default_row.1, 2); // version: AccountOpened + MoneyDeposited
+        assert_eq!(default_row.2, None); // no routing key
+
+        // Routed account should NOT exist (has routing key, not processed by default subscription)
+        assert!(
+            !rows.contains_key(&routed_account_id),
+            "Routed account should NOT be in projection (has routing key)"
+        );
+    }
+
+    // Now run subscription with specific routing key
+    bank::subscription()
+        .routing_key("eu-west-1")
+        .execute(executor)
+        .await?;
+
+    // Verify routed account was now processed
+    {
+        let rows = COMMAND_ROWS.read().unwrap();
+
+        // Routed account should now exist
+        let routed_row = rows
+            .get(&routed_account_id)
+            .expect("Routed account should exist in projection");
+        assert_eq!(routed_row.0.balance, 2300); // 2000 + 300
+        assert_eq!(routed_row.1, 2); // version: AccountOpened + MoneyDeposited
+        assert_eq!(routed_row.2, Some("eu-west-1".to_owned()));
+    }
 
     Ok(())
 }
 
 pub async fn subscribe_multiple_aggregator<E: Executor + Clone>(
     executor: &E,
-    events: Vec<Event>,
+    _events: Vec<Event>,
 ) -> anyhow::Result<()> {
-    // let events = evento::cursor::Reader::new(events)
-    //     .forward(1000, None)
-    //     .execute()?;
-    //
-    // let sub1 = evento::subscribe("sub1")
-    //     .all()
-    //     .aggregator::<Calcul>()
-    //     .aggregator::<MyCalcul>();
-    //
-    // sub1.init(executor).await?;
-    //
-    // let sub2 = evento::subscribe("sub2")
-    //     .chunk_size(5)
-    //     .all()
-    //     .aggregator::<Calcul>()
-    //     .aggregator::<MyCalcul>();
-    //
-    // sub2.init(executor).await?;
-    //
-    // let sub1_events = sub1.read(executor).await?;
-    // for (index, edge) in events.edges.iter().enumerate() {
-    //     let sub1_event = sub1_events.get(index).map(|c| &c.event);
-    //     assert_eq!(sub1_event, Some(&edge.node));
-    //     sub1_events.get(index).unwrap().acknowledge().await?;
-    // }
-    //
-    // let sub1_events = sub1.read(executor).await?;
-    // assert!(sub1_events.is_empty());
-    //
-    // let sub2_events = sub2.read(executor).await?;
-    // for (index, edge) in events.edges.iter().take(5).enumerate() {
-    //     let sub2_event = sub2_events.get(index).map(|c| &c.event);
-    //     assert_eq!(sub2_event, Some(&edge.node));
-    //     sub2_events.get(index).unwrap().acknowledge().await?;
-    // }
-    //
-    // let sub2_events = sub2.read(executor).await?;
-    // for (index, edge) in events.edges.iter().skip(5).enumerate() {
-    //     let sub2_event = sub2_events.get(index).map(|c| &c.event);
-    //     assert_eq!(sub2_event, Some(&edge.node));
-    //     sub2_events.get(index).unwrap().acknowledge().await?;
-    // }
-    //
-    // let sub2_events = sub2.read(executor).await?;
-    // assert!(sub2_events.is_empty());
+    // Create an Owner aggregate using evento::create()
+    let owner_id = evento::create()
+        .event(&Created {
+            name: "John Doe".to_owned(),
+        })?
+        .metadata(&Metadata::default())?
+        .commit(executor)
+        .await?;
+
+    // Create a bank account with this owner
+    let account_id = Command::open_account(
+        OpenAccount {
+            owner_id: owner_id.clone(),
+            owner_name: "John Doe".to_owned(),
+            account_type: AccountType::Checking,
+            currency: "USD".to_owned(),
+            initial_balance: 1000,
+        },
+        executor,
+    )
+    .await?;
+
+    // Deposit some money
+    let account = bank::load(executor, &account_id).await?.unwrap();
+    account
+        .deposit_money(
+            DepositMoney {
+                amount: 500,
+                transaction_id: Ulid::new().to_string(),
+                description: "Deposit".to_owned(),
+            },
+            executor,
+        )
+        .await?;
+
+    // Update owner name using evento::aggregator()
+    evento::aggregator(&owner_id)
+        .original_version(1)
+        .event(&NameChanged {
+            value: "John Smith".to_owned(),
+        })?
+        .metadata(&Metadata::default())?
+        .commit(executor)
+        .await?;
+
+    // Remove this test's account from projection
+    {
+        let mut rows = ACCOUNT_DETAILS_ROWS.write().unwrap();
+        rows.remove(&account_id);
+    }
+
+    // Run account_details subscription (handles both BankAccount and Owner events)
+    account_details_subscription().execute(executor).await?;
+
+    // Verify projection was rebuilt correctly with both aggregator types processed
+    let rows = ACCOUNT_DETAILS_ROWS.read().unwrap();
+
+    let account_row = rows
+        .get(&account_id)
+        .expect("Account should exist in projection");
+
+    // Verify BankAccount events were processed
+    assert_eq!(account_row.0.balance, 1500); // 1000 + 500
+    assert_eq!(account_row.0.available_balance, 1500);
+    assert_eq!(account_row.0.owner_id, owner_id);
+
+    // Verify Owner::NameChanged event was processed (updates owner_name)
+    assert_eq!(account_row.0.owner_name, "John Smith");
 
     Ok(())
 }
 
 pub async fn subscribe_routing_key_multiple_aggregator<E: Executor + Clone>(
     executor: &E,
-    events: Vec<Event>,
+    _events: Vec<Event>,
 ) -> anyhow::Result<()> {
-    // let events = events
-    //     .into_iter()
-    //     .filter(|e| e.routing_key == Some("eu-west-3".to_owned()))
-    //     .collect::<Vec<_>>();
-    //
-    // let events = evento::cursor::Reader::new(events)
-    //     .forward(1000, None)
-    //     .execute()?;
-    //
-    // let sub1 = evento::subscribe("sub1")
-    //     .all()
-    //     .routing_key("eu-west-3")
-    //     .aggregator::<Calcul>()
-    //     .aggregator::<MyCalcul>();
-    //
-    // sub1.init(executor).await?;
-    //
-    // let sub1_events = sub1.read(executor).await?;
-    // for (index, edge) in events.edges.iter().enumerate() {
-    //     let sub1_event = sub1_events.get(index).map(|c| &c.event);
-    //     assert_eq!(sub1_event, Some(&edge.node));
-    //     sub1_events.get(index).unwrap().acknowledge().await?;
-    // }
-    //
-    // let sub1_events = sub1.read(executor).await?;
-    // assert!(sub1_events.is_empty());
+    // Create Owner with routing key "us-east-1"
+    let us_owner_id = evento::create()
+        .routing_key("us-east-1")
+        .event(&Created {
+            name: "US Owner".to_owned(),
+        })?
+        .metadata(&Metadata::default())?
+        .commit(executor)
+        .await?;
+
+    // Create Owner with routing key "eu-west-1"
+    let eu_owner_id = evento::create()
+        .routing_key("eu-west-1")
+        .event(&Created {
+            name: "EU Owner".to_owned(),
+        })?
+        .metadata(&Metadata::default())?
+        .commit(executor)
+        .await?;
+
+    // Create bank account with routing key "us-east-1"
+    let us_account_id = Command::open_account_with_routing(
+        OpenAccount {
+            owner_id: us_owner_id.clone(),
+            owner_name: "US Owner".to_owned(),
+            account_type: AccountType::Checking,
+            currency: "USD".to_owned(),
+            initial_balance: 1000,
+        },
+        executor,
+        "us-east-1",
+    )
+    .await?;
+
+    // Create bank account with routing key "eu-west-1"
+    let eu_account_id = Command::open_account_with_routing(
+        OpenAccount {
+            owner_id: eu_owner_id.clone(),
+            owner_name: "EU Owner".to_owned(),
+            account_type: AccountType::Checking,
+            currency: "EUR".to_owned(),
+            initial_balance: 2000,
+        },
+        executor,
+        "eu-west-1",
+    )
+    .await?;
+
+    // Update US owner name
+    evento::aggregator(&us_owner_id)
+        .original_version(1)
+        .routing_key("us-east-1")
+        .event(&NameChanged {
+            value: "US Owner Updated".to_owned(),
+        })?
+        .metadata(&Metadata::default())?
+        .commit(executor)
+        .await?;
+
+    // Update EU owner name
+    evento::aggregator(&eu_owner_id)
+        .original_version(1)
+        .routing_key("eu-west-1")
+        .event(&NameChanged {
+            value: "EU Owner Updated".to_owned(),
+        })?
+        .metadata(&Metadata::default())?
+        .commit(executor)
+        .await?;
+
+    // Remove this test's accounts from projection
+    {
+        let mut rows = ACCOUNT_DETAILS_ROWS.write().unwrap();
+        rows.remove(&us_account_id);
+        rows.remove(&eu_account_id);
+    }
+
+    // Run subscription filtered by "us-east-1" routing key
+    account_details_subscription()
+        .routing_key("us-east-1")
+        .execute(executor)
+        .await?;
+
+    // Verify only US account was processed
+    {
+        let rows = ACCOUNT_DETAILS_ROWS.read().unwrap();
+
+        // US account should exist with updated owner name
+        let us_row = rows
+            .get(&us_account_id)
+            .expect("US account should exist in projection");
+        assert_eq!(us_row.0.balance, 1000);
+        assert_eq!(us_row.0.owner_id, us_owner_id);
+        assert_eq!(us_row.0.owner_name, "US Owner Updated"); // NameChanged was processed
+        assert_eq!(us_row.2, Some("us-east-1".to_owned()));
+
+        // EU account should NOT exist (different routing key)
+        assert!(
+            !rows.contains_key(&eu_account_id),
+            "EU account should NOT be in projection (different routing key)"
+        );
+    }
+
+    // Now run subscription filtered by "eu-west-1" routing key
+    account_details_subscription()
+        .routing_key("eu-west-1")
+        .execute(executor)
+        .await?;
+
+    // Verify EU account was now processed
+    {
+        let rows = ACCOUNT_DETAILS_ROWS.read().unwrap();
+
+        let eu_row = rows
+            .get(&eu_account_id)
+            .expect("EU account should exist in projection");
+        assert_eq!(eu_row.0.balance, 2000);
+        assert_eq!(eu_row.0.owner_id, eu_owner_id);
+        assert_eq!(eu_row.0.owner_name, "EU Owner Updated"); // NameChanged was processed
+        assert_eq!(eu_row.2, Some("eu-west-1".to_owned()));
+    }
 
     Ok(())
 }
 
 pub async fn subscribe_default_multiple_aggregator<E: Executor + Clone>(
     executor: &E,
-    events: Vec<Event>,
+    _events: Vec<Event>,
 ) -> anyhow::Result<()> {
-    // let events = events
-    //     .into_iter()
-    //     .filter(|e| e.routing_key.is_none())
-    //     .collect::<Vec<_>>();
-    //
-    // let events = evento::cursor::Reader::new(events)
-    //     .forward(1000, None)
-    //     .execute()?;
-    //
-    // let sub1 = evento::subscribe("sub1")
-    //     .aggregator::<Calcul>()
-    //     .aggregator::<MyCalcul>();
-    //
-    // sub1.init(executor).await?;
-    //
-    // let sub1_events = sub1.read(executor).await?;
-    // for (index, edge) in events.edges.iter().enumerate() {
-    //     let sub1_event = sub1_events.get(index).map(|c| &c.event);
-    //     assert_eq!(sub1_event, Some(&edge.node));
-    //     sub1_events.get(index).unwrap().acknowledge().await?;
-    // }
-    //
-    // let sub1_events = sub1.read(executor).await?;
-    // assert!(sub1_events.is_empty());
+    // Create Owner WITHOUT routing key (default)
+    let default_owner_id = evento::create()
+        .event(&Created {
+            name: "Default Owner".to_owned(),
+        })?
+        .metadata(&Metadata::default())?
+        .commit(executor)
+        .await?;
+
+    // Create Owner WITH routing key
+    let routed_owner_id = evento::create()
+        .routing_key("eu-west-1")
+        .event(&Created {
+            name: "Routed Owner".to_owned(),
+        })?
+        .metadata(&Metadata::default())?
+        .commit(executor)
+        .await?;
+
+    // Create bank account WITHOUT routing key (default)
+    let default_account_id = Command::open_account(
+        OpenAccount {
+            owner_id: default_owner_id.clone(),
+            owner_name: "Default Owner".to_owned(),
+            account_type: AccountType::Checking,
+            currency: "USD".to_owned(),
+            initial_balance: 1000,
+        },
+        executor,
+    )
+    .await?;
+
+    // Create bank account WITH routing key
+    let routed_account_id = Command::open_account_with_routing(
+        OpenAccount {
+            owner_id: routed_owner_id.clone(),
+            owner_name: "Routed Owner".to_owned(),
+            account_type: AccountType::Checking,
+            currency: "EUR".to_owned(),
+            initial_balance: 2000,
+        },
+        executor,
+        "eu-west-1",
+    )
+    .await?;
+
+    // Update default owner name (no routing key)
+    evento::aggregator(&default_owner_id)
+        .original_version(1)
+        .event(&NameChanged {
+            value: "Default Owner Updated".to_owned(),
+        })?
+        .metadata(&Metadata::default())?
+        .commit(executor)
+        .await?;
+
+    // Update routed owner name (with routing key)
+    evento::aggregator(&routed_owner_id)
+        .original_version(1)
+        .routing_key("eu-west-1")
+        .event(&NameChanged {
+            value: "Routed Owner Updated".to_owned(),
+        })?
+        .metadata(&Metadata::default())?
+        .commit(executor)
+        .await?;
+
+    // Remove this test's accounts from projection
+    {
+        let mut rows = ACCOUNT_DETAILS_ROWS.write().unwrap();
+        rows.remove(&default_account_id);
+        rows.remove(&routed_account_id);
+    }
+
+    // Run default subscription (no routing key = processes events with routing_key IS NULL)
+    account_details_subscription().execute(executor).await?;
+
+    // Verify only default (no routing key) account was processed
+    {
+        let rows = ACCOUNT_DETAILS_ROWS.read().unwrap();
+
+        // Default account should exist with updated owner name
+        let default_row = rows
+            .get(&default_account_id)
+            .expect("Default account should exist in projection");
+        assert_eq!(default_row.0.balance, 1000);
+        assert_eq!(default_row.0.owner_id, default_owner_id);
+        assert_eq!(default_row.0.owner_name, "Default Owner Updated"); // NameChanged was processed
+        assert_eq!(default_row.2, None); // no routing key
+
+        // Routed account should NOT exist (has routing key)
+        assert!(
+            !rows.contains_key(&routed_account_id),
+            "Routed account should NOT be in projection (has routing key)"
+        );
+    }
+
+    // Now run subscription with specific routing key
+    account_details_subscription()
+        .routing_key("eu-west-1")
+        .execute(executor)
+        .await?;
+
+    // Verify routed account was now processed
+    {
+        let rows = ACCOUNT_DETAILS_ROWS.read().unwrap();
+
+        let routed_row = rows
+            .get(&routed_account_id)
+            .expect("Routed account should exist in projection");
+        assert_eq!(routed_row.0.balance, 2000);
+        assert_eq!(routed_row.0.owner_id, routed_owner_id);
+        assert_eq!(routed_row.0.owner_name, "Routed Owner Updated"); // NameChanged was processed
+        assert_eq!(routed_row.2, Some("eu-west-1".to_owned()));
+    }
 
     Ok(())
-}
-
-struct TestEngine<'a, E: Executor> {
-    pub john: String,
-    pub albert: String,
-    pub executor: &'a E,
-}
-
-impl<'a, E: Executor> TestEngine<'a, E> {
-    async fn create(executor: &'a E) -> anyhow::Result<Self> {
-        let john = evento::create()
-            .event(&Created {
-                name: "john".to_owned(),
-            })?
-            .metadata(&Metadata::default())?
-            .commit(executor)
-            .await?;
-
-        let albert = evento::create()
-            .event(&Created {
-                name: "albert".to_owned(),
-            })?
-            .metadata(&Metadata::default())?
-            .commit(executor)
-            .await?;
-
-        Ok(Self {
-            john,
-            albert,
-            executor,
-        })
-    }
-
-    pub async fn transfer_money(
-        &self,
-        from: impl Into<String>,
-        to: impl Into<String>,
-        amount: i64,
-    ) -> anyhow::Result<()> {
-        let from = self.load(from).await?;
-
-        if !from.can_transfer(amount) {
-            anyhow::bail!("cannot transfer {amount}");
-        }
-
-        let to = self.load(to).await?;
-
-        if !to.is_active() {
-            anyhow::bail!("to not active");
-        }
-
-        evento::aggregator(&from.account_id)
-            .original_version(from.0.version as u16)
-            .routing_key_opt(from.0.routing_key.to_owned())
-            .event(&MoneyTransferred {
-                amount,
-                description: "".to_owned(),
-                to_account_id: to.account_id.to_owned(),
-                transaction_id: Ulid::new().to_string(),
-            })?
-            .metadata(&Metadata::default())?
-            .commit(self.executor)
-            .await?;
-
-        evento::aggregator(&to.account_id)
-            .original_version(to.0.version as u16)
-            .routing_key_opt(to.0.routing_key)
-            .event(&MoneyReceived {
-                amount,
-                description: "".to_owned(),
-                from_account_id: from.account_id.to_owned(),
-                transaction_id: Ulid::new().to_string(),
-            })?
-            .metadata(&Metadata::default())?
-            .commit(self.executor)
-            .await?;
-
-        Ok(())
-    }
-
-    pub async fn load(&self, id: impl Into<String>) -> anyhow::Result<Command> {
-        let Some(bank_account) = bank::load(self.executor, id).await? else {
-            anyhow::bail!("account not found");
-        };
-
-        Ok(bank_account)
-    }
-
-    pub async fn john(&self, id: impl Into<String>) -> anyhow::Result<Command> {
-        self.load(&self.john).await
-    }
-
-    pub async fn albert(&self, id: impl Into<String>) -> anyhow::Result<Command> {
-        self.load(&self.albert).await
-    }
 }

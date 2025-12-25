@@ -349,6 +349,14 @@ impl<P, E: Executor + 'static> SubscriptionBuilder<P, E> {
             .collect()
     }
 
+    fn key(&self) -> String {
+        if let RoutingKey::Value(Some(ref key)) = self.routing_key {
+            return format!("{key}.{}", self.key);
+        }
+
+        self.key.to_owned()
+    }
+
     async fn process(
         &self,
         executor: &E,
@@ -364,14 +372,11 @@ impl<P, E: Executor + 'static> SubscriptionBuilder<P, E> {
         loop {
             interval.tick().await;
 
-            if !executor
-                .is_subscriber_running(self.key.to_owned(), *id)
-                .await?
-            {
+            if !executor.is_subscriber_running(self.key(), *id).await? {
                 return Ok(());
             }
 
-            let cursor = executor.get_subscriber_cursor(self.key.to_owned()).await?;
+            let cursor = executor.get_subscriber_cursor(self.key()).await?;
 
             let timestamp = executor
                 .read(
@@ -406,7 +411,7 @@ impl<P, E: Executor + 'static> SubscriptionBuilder<P, E> {
                 if let Some(rx) = rx.as_mut() {
                     if rx.try_recv().is_ok() {
                         tracing::info!(
-                            key = self.key,
+                            key = self.key(),
                             "Subscription received shutdown signal, stopping gracefull"
                         );
 
@@ -420,14 +425,14 @@ impl<P, E: Executor + 'static> SubscriptionBuilder<P, E> {
 
                 let key = format!("{}_{}", event.node.aggregator_type, event.node.name);
                 let Some(handler) = self.handlers.get(&key) else {
-                    panic!("No handler found for {}/{key}", self.key);
+                    panic!("No handler found for {}/{key}", self.key());
                 };
 
                 handler.handle(&context, &event.node).await?;
 
                 executor
                     .acknowledge(
-                        self.key.to_owned(),
+                        self.key(),
                         event.cursor.to_owned(),
                         timestamp - event.node.timestamp,
                     )
@@ -453,7 +458,7 @@ impl<P, E: Executor + 'static> SubscriptionBuilder<P, E> {
         let subscription_id = id;
 
         executor
-            .upsert_subscriber(self.key.to_owned(), id.to_owned())
+            .upsert_subscriber(self.key(), id.to_owned())
             .await?;
 
         let task_handle = tokio::spawn(async move {
@@ -471,7 +476,7 @@ impl<P, E: Executor + 'static> SubscriptionBuilder<P, E> {
             loop {
                 if shutdown_rx.try_recv().is_ok() {
                     tracing::info!(
-                        key = self.key,
+                        key = self.key(),
                         "Subscription received shutdown signal, stopping gracefull"
                     );
 
@@ -482,7 +487,7 @@ impl<P, E: Executor + 'static> SubscriptionBuilder<P, E> {
 
                 let _ = tracing::error_span!(
                     "start",
-                    key = self.key,
+                    key = self.key(),
                     aggregator_type = tracing::field::Empty,
                     aggregator_id = tracing::field::Empty,
                     event = tracing::field::Empty,
@@ -533,14 +538,14 @@ impl<P, E: Executor + 'static> SubscriptionBuilder<P, E> {
         let id = Ulid::new();
 
         executor
-            .upsert_subscriber(self.key.to_owned(), id.to_owned())
+            .upsert_subscriber(self.key(), id.to_owned())
             .await?;
 
         let read_aggregators = self.read_aggregators();
 
         let _ = tracing::error_span!(
             "execute",
-            key = self.key,
+            key = self.key(),
             aggregator_type = tracing::field::Empty,
             aggregator_id = tracing::field::Empty,
             event = tracing::field::Empty,

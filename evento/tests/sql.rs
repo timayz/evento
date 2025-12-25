@@ -39,6 +39,20 @@ async fn sqlite_load() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn sqlite_load_multiple_aggregator() -> anyhow::Result<()> {
+    let executor = create_sqlite_executor("load_multiple_aggregator").await?;
+
+    evento_test::load_multiple_aggregator(&executor).await
+}
+
+#[tokio::test]
+async fn sqlite_load_with_snapshot() -> anyhow::Result<()> {
+    let executor = create_sqlite_executor("load_with_snapshot").await?;
+
+    evento_test::load_with_snapshot(&executor).await
+}
+
+#[tokio::test]
 async fn sqlite_invalid_original_version() -> anyhow::Result<()> {
     let executor = create_sqlite_executor("invalid_original_version").await?;
 
@@ -114,6 +128,20 @@ async fn rw_sqlite_load() -> anyhow::Result<()> {
     let executor = create_rw_sqlite_executor("load").await?;
 
     evento_test::load(&executor).await
+}
+
+#[tokio::test]
+async fn rw_sqlite_load_multiple_aggregator() -> anyhow::Result<()> {
+    let executor = create_rw_sqlite_executor("load_multiple_aggregator").await?;
+
+    evento_test::load_multiple_aggregator(&executor).await
+}
+
+#[tokio::test]
+async fn rw_sqlite_load_with_snapshot() -> anyhow::Result<()> {
+    let executor = create_rw_sqlite_executor("load_with_snapshot").await?;
+
+    evento_test::load_with_snapshot(&executor).await
 }
 
 #[tokio::test]
@@ -193,6 +221,20 @@ async fn mysql_load() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn mysql_load_multiple_aggregator() -> anyhow::Result<()> {
+    let executor = create_mysql_executor("load_multiple_aggregator").await?;
+
+    evento_test::load_multiple_aggregator(&executor).await
+}
+
+#[tokio::test]
+async fn mysql_load_with_snapshot() -> anyhow::Result<()> {
+    let executor = create_mysql_executor("load_with_snapshot").await?;
+
+    evento_test::load_with_snapshot(&executor).await
+}
+
+#[tokio::test]
 async fn mysql_invalid_original_version() -> anyhow::Result<()> {
     let executor = create_mysql_executor("invalid_original_version").await?;
 
@@ -267,6 +309,20 @@ async fn postgres_load() -> anyhow::Result<()> {
     let executor = create_postgres_executor("load").await?;
 
     evento_test::load(&executor).await
+}
+
+#[tokio::test]
+async fn postgres_load_multiple_aggregator() -> anyhow::Result<()> {
+    let executor = create_postgres_executor("load_multiple_aggregator").await?;
+
+    evento_test::load_multiple_aggregator(&executor).await
+}
+
+#[tokio::test]
+async fn postgres_load_with_snapshot() -> anyhow::Result<()> {
+    let executor = create_postgres_executor("load_with_snapshot").await?;
+
+    evento_test::load_with_snapshot(&executor).await
 }
 
 #[tokio::test]
