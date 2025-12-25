@@ -27,8 +27,8 @@
 //!
 //! // Create events
 //! let id = evento::create()
-//!     .event(&UserCreated { name: "Alice".into() })?
-//!     .metadata(&Metadata::default())?
+//!     .event(&UserCreated { name: "Alice".into() })
+//!     .metadata(&Metadata::default())
 //!     .commit(&executor)
 //!     .await?;
 //!
@@ -61,7 +61,7 @@ use fjall::{Config, Keyspace, Partition, PartitionCreateOptions, PersistMode};
 use ulid::Ulid;
 
 /// Subscriber state stored in the database.
-#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(Debug, Clone, bitcode::Encode, bitcode::Decode)]
 struct SubscriberState {
     worker_id: String,
     cursor: Option<String>,
@@ -69,7 +69,7 @@ struct SubscriberState {
 }
 
 /// Stored event in fjall format.
-#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(Debug, Clone, bitcode::Encode, bitcode::Decode)]
 struct StoredEvent {
     id: String,
     aggregator_id: String,
@@ -275,9 +275,8 @@ impl Fjall {
     fn load_event(&self, id: &Ulid) -> anyhow::Result<Option<Event>> {
         match self.events.get(id.to_bytes())? {
             Some(bytes) => {
-                let stored: StoredEvent =
-                    rkyv::from_bytes::<StoredEvent, rkyv::rancor::Error>(&bytes)
-                        .map_err(|e| anyhow::anyhow!("Failed to deserialize event: {}", e))?;
+                let stored: StoredEvent = bitcode::decode(&bytes)
+                    .map_err(|e| anyhow::anyhow!("Failed to deserialize event: {}", e))?;
                 Ok(Some(stored.try_into()?))
             }
             None => Ok(None),
@@ -413,8 +412,7 @@ impl Executor for Fjall {
             for event in &events {
                 let id_bytes = event.id.to_bytes();
                 let stored = StoredEvent::from(event);
-                let event_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&stored)
-                    .map_err(|e| WriteError::RkyvEncode(e.to_string()))?;
+                let event_bytes = bitcode::encode(&stored);
 
                 // Primary: ULID -> Event
                 batch.insert(&executor.events, id_bytes, event_bytes.as_slice());
@@ -521,9 +519,8 @@ impl Executor for Fjall {
 
         tokio::task::spawn_blocking(move || match executor.subscribers.get(&key)? {
             Some(bytes) => {
-                let state: SubscriberState =
-                    rkyv::from_bytes::<SubscriberState, rkyv::rancor::Error>(&bytes)
-                        .map_err(|e| anyhow::anyhow!("Failed to deserialize subscriber: {}", e))?;
+                let state: SubscriberState = bitcode::decode(&bytes)
+                    .map_err(|e| anyhow::anyhow!("Failed to deserialize subscriber: {}", e))?;
                 Ok(state.cursor.map(Value))
             }
             None => Ok(None),
@@ -536,9 +533,8 @@ impl Executor for Fjall {
 
         tokio::task::spawn_blocking(move || match executor.subscribers.get(&key)? {
             Some(bytes) => {
-                let state: SubscriberState =
-                    rkyv::from_bytes::<SubscriberState, rkyv::rancor::Error>(&bytes)
-                        .map_err(|e| anyhow::anyhow!("Failed to deserialize subscriber: {}", e))?;
+                let state: SubscriberState = bitcode::decode(&bytes)
+                    .map_err(|e| anyhow::anyhow!("Failed to deserialize subscriber: {}", e))?;
                 Ok(state.worker_id == worker_id.to_string())
             }
             None => Ok(false),
@@ -553,10 +549,8 @@ impl Executor for Fjall {
             // Try to preserve existing cursor if subscriber exists
             let cursor = match executor.subscribers.get(&key)? {
                 Some(bytes) => {
-                    let state: SubscriberState =
-                        rkyv::from_bytes::<SubscriberState, rkyv::rancor::Error>(&bytes).map_err(
-                            |e| anyhow::anyhow!("Failed to deserialize subscriber: {}", e),
-                        )?;
+                    let state: SubscriberState = bitcode::decode(&bytes)
+                        .map_err(|e| anyhow::anyhow!("Failed to deserialize subscriber: {}", e))?;
                     state.cursor
                 }
                 None => None,
@@ -568,10 +562,7 @@ impl Executor for Fjall {
                 lag: 0,
             };
 
-            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&state)
-                .map_err(|e| anyhow::anyhow!("Failed to serialize subscriber: {}", e))?;
-
-            executor.subscribers.insert(&key, bytes.as_slice())?;
+            executor.subscribers.insert(&key, bitcode::encode(&state))?;
             Ok(())
         })
         .await?
@@ -583,10 +574,8 @@ impl Executor for Fjall {
         tokio::task::spawn_blocking(move || {
             let state = match executor.subscribers.get(&key)? {
                 Some(bytes) => {
-                    let mut state: SubscriberState =
-                        rkyv::from_bytes::<SubscriberState, rkyv::rancor::Error>(&bytes).map_err(
-                            |e| anyhow::anyhow!("Failed to deserialize subscriber: {}", e),
-                        )?;
+                    let mut state: SubscriberState = bitcode::decode(&bytes)
+                        .map_err(|e| anyhow::anyhow!("Failed to deserialize subscriber: {}", e))?;
                     state.cursor = Some(cursor.0);
                     state.lag = lag;
                     state
@@ -594,10 +583,7 @@ impl Executor for Fjall {
                 None => anyhow::bail!("Subscriber not found: {}", key),
             };
 
-            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&state)
-                .map_err(|e| anyhow::anyhow!("Failed to serialize subscriber: {}", e))?;
-
-            executor.subscribers.insert(&key, bytes.as_slice())?;
+            executor.subscribers.insert(&key, bitcode::encode(&state))?;
             Ok(())
         })
         .await?

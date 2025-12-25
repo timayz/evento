@@ -13,7 +13,7 @@
 //! - **Event Subscriptions** - Continuous event stream processing with cursor tracking
 //! - **Projections** - Build read models by replaying events
 //! - **Database Migrations** - Automated schema management
-//! - **Zero-Copy Serialization** - Fast serialization with rkyv
+//! - **Compact Serialization** - Fast binary serialization with bitcode
 //!
 //! # Feature Flags
 //!
@@ -63,8 +63,8 @@
 //!
 //! // Create a new aggregate with an event
 //! let account_id = evento::create()
-//!     .event(&AccountOpened { owner: "Alice".into(), initial_balance: 1000 })?
-//!     .metadata(&Metadata::default())?
+//!     .event(&AccountOpened { owner: "Alice".into(), initial_balance: 1000 })
+//!     .metadata(&Metadata::default())
 //!     .routing_key("accounts")
 //!     .commit(&executor)
 //!     .await?;
@@ -72,8 +72,8 @@
 //! // Add more events to the aggregate
 //! evento::aggregator(&account_id)
 //!     .original_version(1)
-//!     .event(&MoneyDeposited { amount: 100 })?
-//!     .metadata(&Metadata::default())?
+//!     .event(&MoneyDeposited { amount: 100 })
+//!     .metadata(&Metadata::default())
 //!     .commit(&executor)
 //!     .await?;
 //! ```
@@ -167,7 +167,7 @@ pub use evento_core::projection::{
 #[cfg(any(feature = "sqlite", feature = "mysql", feature = "postgres"))]
 pub use evento_sql as sql;
 
-/// SQL type wrappers for rkyv serialization.
+/// SQL type wrappers for bitcode serialization.
 #[cfg(any(feature = "sqlite", feature = "mysql", feature = "postgres"))]
 pub use evento_sql::sql_types;
 

@@ -237,8 +237,8 @@ pub async fn load_multiple_aggregator<E: Executor>(executor: &E) -> anyhow::Resu
     let owner_id = evento::create()
         .event(&Created {
             name: "John Doe".to_owned(),
-        })?
-        .metadata(&Metadata::default())?
+        })
+        .metadata(&Metadata::default())
         .commit(executor)
         .await?;
 
@@ -283,8 +283,8 @@ pub async fn load_multiple_aggregator<E: Executor>(executor: &E) -> anyhow::Resu
         .original_version(1)
         .event(&NameChanged {
             value: "John Smith".to_owned(),
-        })?
-        .metadata(&Metadata::default())?
+        })
+        .metadata(&Metadata::default())
         .commit(executor)
         .await?;
 
@@ -859,8 +859,8 @@ pub async fn subscribe_multiple_aggregator<E: Executor + Clone>(
     let owner_id = evento::create()
         .event(&Created {
             name: "John Doe".to_owned(),
-        })?
-        .metadata(&Metadata::default())?
+        })
+        .metadata(&Metadata::default())
         .commit(executor)
         .await?;
 
@@ -895,8 +895,8 @@ pub async fn subscribe_multiple_aggregator<E: Executor + Clone>(
         .original_version(1)
         .event(&NameChanged {
             value: "John Smith".to_owned(),
-        })?
-        .metadata(&Metadata::default())?
+        })
+        .metadata(&Metadata::default())
         .commit(executor)
         .await?;
 
@@ -936,8 +936,8 @@ pub async fn subscribe_routing_key_multiple_aggregator<E: Executor + Clone>(
         .routing_key("us-east-1")
         .event(&Created {
             name: "US Owner".to_owned(),
-        })?
-        .metadata(&Metadata::default())?
+        })
+        .metadata(&Metadata::default())
         .commit(executor)
         .await?;
 
@@ -946,8 +946,8 @@ pub async fn subscribe_routing_key_multiple_aggregator<E: Executor + Clone>(
         .routing_key("eu-west-1")
         .event(&Created {
             name: "EU Owner".to_owned(),
-        })?
-        .metadata(&Metadata::default())?
+        })
+        .metadata(&Metadata::default())
         .commit(executor)
         .await?;
 
@@ -985,8 +985,8 @@ pub async fn subscribe_routing_key_multiple_aggregator<E: Executor + Clone>(
         .routing_key("us-east-1")
         .event(&NameChanged {
             value: "US Owner Updated".to_owned(),
-        })?
-        .metadata(&Metadata::default())?
+        })
+        .metadata(&Metadata::default())
         .commit(executor)
         .await?;
 
@@ -996,8 +996,8 @@ pub async fn subscribe_routing_key_multiple_aggregator<E: Executor + Clone>(
         .routing_key("eu-west-1")
         .event(&NameChanged {
             value: "EU Owner Updated".to_owned(),
-        })?
-        .metadata(&Metadata::default())?
+        })
+        .metadata(&Metadata::default())
         .commit(executor)
         .await?;
 
@@ -1064,8 +1064,8 @@ pub async fn subscribe_default_multiple_aggregator<E: Executor + Clone>(
     let default_owner_id = evento::create()
         .event(&Created {
             name: "Default Owner".to_owned(),
-        })?
-        .metadata(&Metadata::default())?
+        })
+        .metadata(&Metadata::default())
         .commit(executor)
         .await?;
 
@@ -1074,8 +1074,8 @@ pub async fn subscribe_default_multiple_aggregator<E: Executor + Clone>(
         .routing_key("eu-west-1")
         .event(&Created {
             name: "Routed Owner".to_owned(),
-        })?
-        .metadata(&Metadata::default())?
+        })
+        .metadata(&Metadata::default())
         .commit(executor)
         .await?;
 
@@ -1111,8 +1111,8 @@ pub async fn subscribe_default_multiple_aggregator<E: Executor + Clone>(
         .original_version(1)
         .event(&NameChanged {
             value: "Default Owner Updated".to_owned(),
-        })?
-        .metadata(&Metadata::default())?
+        })
+        .metadata(&Metadata::default())
         .commit(executor)
         .await?;
 
@@ -1122,8 +1122,8 @@ pub async fn subscribe_default_multiple_aggregator<E: Executor + Clone>(
         .routing_key("eu-west-1")
         .event(&NameChanged {
             value: "Routed Owner Updated".to_owned(),
-        })?
-        .metadata(&Metadata::default())?
+        })
+        .metadata(&Metadata::default())
         .commit(executor)
         .await?;
 

@@ -1,6 +1,6 @@
-use rkyv::{Archive, Deserialize, Serialize};
+use bitcode::{Decode, Encode};
 
-#[derive(Debug, Clone, PartialEq, Default, Archive, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Encode, Decode)]
 pub enum AccountType {
     #[default]
     Checking,
@@ -8,7 +8,7 @@ pub enum AccountType {
     Business,
 }
 
-#[derive(Debug, Clone, PartialEq, Default, Archive, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Encode, Decode)]
 pub enum AccountStatus {
     #[default]
     Active,

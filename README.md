@@ -10,7 +10,7 @@ A collection of libraries and tools that help you build DDD, CQRS, and event sou
 - Event handlers and subscriptions
 - Built-in migrations
 - Macro support for easy aggregator implementation
-- Zero-copy serialization with rkyv
+- Compact binary serialization with bitcode
 
 ## Quick Start
 
@@ -18,16 +18,16 @@ Add Evento to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-evento = "1"
-rkyv = "0.8"
+evento = "2"
+bitcode = "0.6"
 ```
 
 For SQL database support, enable the appropriate features:
 
 ```toml
 [dependencies]
-evento = { version = "1", features = ["sqlite"] }
-rkyv = "0.8"
+evento = { version = "2", features = ["sqlite"] }
+bitcode = "0.6"
 ```
 
 ## Basic Usage
@@ -63,8 +63,8 @@ async fn create_user(executor: &evento::Sqlite) -> anyhow::Result<String> {
         .event(&UserCreated {
             name: "John Doe".to_string(),
             email: "john@example.com".to_string(),
-        })?
-        .metadata(&Metadata::default())?
+        })
+        .metadata(&Metadata::default())
         .commit(executor)
         .await?;
 
@@ -87,8 +87,8 @@ async fn change_user_email(
         .original_version(original_version)
         .event(&UserEmailChanged {
             email: new_email.to_string(),
-        })?
-        .metadata(&Metadata::default())?
+        })
+        .metadata(&Metadata::default())
         .commit(executor)
         .await?;
 
@@ -232,8 +232,8 @@ async fn main() -> anyhow::Result<()> {
         .event(&UserCreated {
             name: "Alice".to_string(),
             email: "alice@example.com".to_string(),
-        })?
-        .metadata(&Metadata::default())?
+        })
+        .metadata(&Metadata::default())
         .commit(&executor)
         .await?;
 
@@ -256,8 +256,8 @@ async fn main() -> anyhow::Result<()> {
         .original_version(1)
         .event(&UserEmailChanged {
             email: "alice.doe@example.com".to_string(),
-        })?
-        .metadata(&Metadata::default())?
+        })
+        .metadata(&Metadata::default())
         .commit(&executor)
         .await?;
 
@@ -269,22 +269,22 @@ async fn main() -> anyhow::Result<()> {
 
 ### SQLite
 ```toml
-evento = { version = "1", features = ["sqlite"] }
+evento = { version = "2", features = ["sqlite"] }
 ```
 
 ### PostgreSQL
 ```toml
-evento = { version = "1", features = ["postgres"] }
+evento = { version = "2", features = ["postgres"] }
 ```
 
 ### MySQL
 ```toml
-evento = { version = "1", features = ["mysql"] }
+evento = { version = "2", features = ["mysql"] }
 ```
 
 ### Fjall (Embedded)
 ```toml
-evento = { version = "1", features = ["fjall"] }
+evento = { version = "2", features = ["fjall"] }
 ```
 
 ## Key Concepts

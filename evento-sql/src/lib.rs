@@ -61,8 +61,8 @@
 //!
 //! # Serialization
 //!
-//! The [`sql_types`] module provides the [`Rkyv`](sql_types::Rkyv) wrapper for zero-copy
-//! serialization of event data using the rkyv format.
+//! The [`sql_types`] module provides the [`Bitcode`](sql_types::Bitcode) wrapper for compact
+//! binary serialization of event data using the bitcode format.
 
 mod sql;
 pub mod sql_types;

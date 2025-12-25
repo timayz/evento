@@ -27,8 +27,8 @@ impl super::Command {
         self.aggregator()
             .event(&DailyWithdrawalLimitChanged {
                 new_limit: cmd.new_limit,
-            })?
-            .metadata(&Metadata::default())?
+            })
+            .metadata(&Metadata::default())
             .commit(executor)
             .await?;
 

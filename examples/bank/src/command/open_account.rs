@@ -38,8 +38,8 @@ impl super::Command {
                 account_type: cmd.account_type,
                 currency: cmd.currency,
                 initial_balance: cmd.initial_balance,
-            })?
-            .metadata(&Metadata::default())?
+            })
+            .metadata(&Metadata::default())
             .commit(executor)
             .await?)
     }
@@ -70,8 +70,8 @@ impl super::Command {
                 account_type: cmd.account_type,
                 currency: cmd.currency,
                 initial_balance: cmd.initial_balance,
-            })?
-            .metadata(&Metadata::default())?
+            })
+            .metadata(&Metadata::default())
             .commit(executor)
             .await?)
     }

@@ -102,7 +102,7 @@ impl<N> ReadResult<N> {
 /// A base64-encoded cursor value for pagination.
 ///
 /// Cursors are opaque strings that identify a position in a result set.
-/// They are serialized using rkyv and base64-encoded for URL safety.
+/// They are serialized using bitcode and base64-encoded for URL safety.
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
 pub struct Value(pub String);
 
@@ -146,8 +146,8 @@ pub enum CursorError {
     #[error("base64 decode: {0}")]
     Base64Decode(#[from] base64::DecodeError),
 
-    #[error("rkyv: {0}")]
-    Rkyv(String),
+    #[error("bitcode: {0}")]
+    Bitcode(String),
 }
 
 /// Pagination arguments for querying events.

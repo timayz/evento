@@ -18,9 +18,9 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-evento-fjall = "1.8"
-evento-core = "1.8"
-rkyv = "0.8"
+evento-fjall = "2"
+evento-core = "2"
+bitcode = "0.6"
 ```
 
 ## Usage
@@ -45,8 +45,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Create an event
     let id = evento::create()
-        .event(&UserCreated { name: "test".into() })?
-        .metadata(&Metadata::default())?
+        .event(&UserCreated { name: "test".into() })
+        .metadata(&Metadata::default())
         .commit(&executor)
         .await?;
 

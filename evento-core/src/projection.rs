@@ -134,7 +134,7 @@ pub trait Aggregator: Default {
 ///
 /// ```rust,ignore
 /// #[evento::aggregator("myapp/Account")]
-/// #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+/// #[derive(bitcode::Encode, bitcode::Decode)]
 /// pub struct AccountOpened {
 ///     pub owner: String,
 /// }
@@ -243,32 +243,14 @@ impl<D, M> Deref for EventData<D, M> {
 
 impl<D, M> TryFrom<&crate::Event> for EventData<D, M>
 where
-    D: rkyv::Archive,
-    M: rkyv::Archive,
-    <D as rkyv::Archive>::Archived: for<'a> rkyv::bytecheck::CheckBytes<
-            rkyv::rancor::Strategy<
-                rkyv::validation::Validator<
-                    rkyv::validation::archive::ArchiveValidator<'a>,
-                    rkyv::validation::shared::SharedValidator,
-                >,
-                rkyv::rancor::Error,
-            >,
-        > + rkyv::Deserialize<D, rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>>,
-    <M as rkyv::Archive>::Archived: for<'a> rkyv::bytecheck::CheckBytes<
-            rkyv::rancor::Strategy<
-                rkyv::validation::Validator<
-                    rkyv::validation::archive::ArchiveValidator<'a>,
-                    rkyv::validation::shared::SharedValidator,
-                >,
-                rkyv::rancor::Error,
-            >,
-        > + rkyv::Deserialize<M, rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>>,
+    D: bitcode::DecodeOwned,
+    M: bitcode::DecodeOwned,
 {
-    type Error = rkyv::rancor::Error;
+    type Error = bitcode::Error;
 
     fn try_from(value: &crate::Event) -> Result<Self, Self::Error> {
-        let data = rkyv::from_bytes::<D, rkyv::rancor::Error>(&value.data)?;
-        let metadata = rkyv::from_bytes::<M, rkyv::rancor::Error>(&value.metadata)?;
+        let data = bitcode::decode::<D>(&value.data)?;
+        let metadata = bitcode::decode::<M>(&value.metadata)?;
         Ok(EventData {
             data,
             metadata,

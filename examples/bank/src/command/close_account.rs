@@ -26,8 +26,8 @@ impl super::Command {
             .event(&AccountClosed {
                 reason: cmd.reason,
                 final_balance: self.balance,
-            })?
-            .metadata(&Metadata::default())?
+            })
+            .metadata(&Metadata::default())
             .commit(executor)
             .await?;
 

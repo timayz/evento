@@ -18,7 +18,7 @@ More information about this crate can be found in the [crate documentation][docs
 - **Event Subscriptions**: Continuous event stream processing with cursor tracking
 - **Projections**: Build read models by replaying events
 - **Database Migrations**: Automated schema management
-- **Zero-Copy Serialization**: Fast serialization with rkyv
+- **Compact Serialization**: Fast binary serialization with bitcode
 - **Type Safety**: Fully typed events and aggregates with compile-time guarantees
 
 ## Installation
@@ -27,8 +27,8 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-evento = { version = "1.8", features = ["sqlite"] }
-rkyv = "0.8"
+evento = { version = "2", features = ["sqlite"] }
+bitcode = "0.6"
 ```
 
 ## Usage Example
@@ -102,8 +102,8 @@ async fn main() -> anyhow::Result<()> {
         .event(&UserCreated {
             name: "John Doe".to_string(),
             email: "john@example.com".to_string(),
-        })?
-        .metadata(&Metadata::default())?
+        })
+        .metadata(&Metadata::default())
         .commit(&executor)
         .await?;
 
@@ -112,8 +112,8 @@ async fn main() -> anyhow::Result<()> {
         .original_version(1)
         .event(&UserEmailChanged {
             email: "newemail@example.com".to_string(),
-        })?
-        .metadata(&Metadata::default())?
+        })
+        .metadata(&Metadata::default())
         .commit(&executor)
         .await?;
 

@@ -12,14 +12,14 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-evento-sql = "1.8"
+evento-sql = "2"
 ```
 
 By default, all database backends are enabled. To use only specific databases:
 
 ```toml
 [dependencies]
-evento-sql = { version = "1.8", default-features = false, features = ["postgres"] }
+evento-sql = { version = "2", default-features = false, features = ["postgres"] }
 ```
 
 ## Features
@@ -128,19 +128,19 @@ Sea-query column identifiers for type-safe query building:
 
 ## Serialization
 
-Event data is serialized using [rkyv](https://rkyv.org/) for zero-copy deserialization. The `sql_types::Rkyv<T>` wrapper provides SQLx integration:
+Event data is serialized using [bitcode](https://crates.io/crates/bitcode) for compact binary representation. The `sql_types::Bitcode<T>` wrapper provides SQLx integration:
 
 ```rust
-use evento_sql::sql_types::Rkyv;
+use evento_sql::sql_types::Bitcode;
 
 // Wrap data for storage
-let data = Rkyv(my_event_data);
+let data = Bitcode(my_event_data);
 
 // Encode to bytes
-let bytes = data.encode_to()?;
+let bytes = data.encode_to();
 
 // Decode from bytes
-let decoded = Rkyv::<MyData>::decode_from_bytes(&bytes)?;
+let decoded = Bitcode::<MyData>::decode_from_bytes(&bytes)?;
 ```
 
 ## Database Schema
@@ -156,8 +156,8 @@ This crate expects the database schema created by `evento-sql-migrator`. See tha
 | `aggregator_type` | VARCHAR(50) | Aggregate root type |
 | `aggregator_id` | VARCHAR(26) | Aggregate root instance ID |
 | `version` | INTEGER | Event sequence number |
-| `data` | BLOB | Serialized event data (rkyv) |
-| `metadata` | BLOB | Serialized metadata (rkyv) |
+| `data` | BLOB | Serialized event data (bitcode) |
+| `metadata` | BLOB | Serialized metadata (bitcode) |
 | `routing_key` | VARCHAR(50) | Optional routing key |
 | `timestamp` | BIGINT | Timestamp (seconds) |
 | `timestamp_subsec` | BIGINT | Sub-second precision |

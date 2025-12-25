@@ -55,7 +55,7 @@
 //! This generates:
 //! - `AccountOpened`, `MoneyDeposited`, `MoneyWithdrawn` structs
 //! - `Aggregator` and `Event` trait implementations for each
-//! - Automatic derives: `Debug`, `Clone`, `PartialEq`, `Default`, and rkyv serialization
+//! - Automatic derives: `Debug`, `Clone`, `PartialEq`, `Default`, and bitcode serialization
 //!
 //! ## Creating Handlers with `#[evento::handler]`
 //!
@@ -102,8 +102,9 @@
 //!
 //! # Serialization
 //!
-//! Events are serialized using [rkyv](https://rkyv.org/) for zero-copy deserialization.
-//! The `#[aggregator]` macro automatically adds the required rkyv derives.
+//! Events are serialized using [bitcode](https://crates.io/crates/bitcode) for compact
+//! binary representation. The `#[aggregator]` macro automatically adds the required
+//! bitcode derives.
 
 use convert_case::{Case, Casing};
 use proc_macro::TokenStream;
@@ -119,7 +120,7 @@ use syn::{
 /// - Individual public structs for each variant
 /// - `Aggregator` trait implementation (provides `aggregator_type()`)
 /// - `Event` trait implementation (provides `event_name()`)
-/// - Automatic derives: `Debug`, `Clone`, `PartialEq`, `Default`, and rkyv serialization
+/// - Automatic derives: `Debug`, `Clone`, `PartialEq`, `Default`, and bitcode serialization
 ///
 /// # Aggregator Type Format
 ///
@@ -192,9 +193,9 @@ pub fn aggregator(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         // Mandatory + user derives
         let derives = if user_derives.is_empty() {
-            quote! { #[derive(Debug, Clone, PartialEq, Default, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)] }
+            quote! { #[derive(Debug, Clone, PartialEq, Default, bitcode::Encode, bitcode::Decode)] }
         } else {
-            quote! { #[derive(Debug, Clone, PartialEq, Default, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, #(#user_derives),*)] }
+            quote! { #[derive(Debug, Clone, PartialEq, Default, bitcode::Encode, bitcode::Decode, #(#user_derives),*)] }
         };
 
         let impl_event = quote! {
