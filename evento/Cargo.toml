@@ -10,37 +10,29 @@ documentation = "https://docs.rs/evento"
 readme = "README.md"
 
 [dependencies]
-serde = { version = "1.0", features = ["derive"] }
-ulid = { version = "1.2", features = ["serde"] }
-tokio = { version = "1.47", features = ["full"] }
-tokio-stream = { version = "0.1", optional = true }
-evento-macro = { path = "../evento-macro", optional = true, version = "1.8.0" }
-anyhow = "1.0"
-bincode = "2.0"
-sqlx = { version = "0.8", optional = true }
+evento-core = { path = "../evento-core", version = "1.8.0" }
+evento-sql = { path = "../evento-sql", version = "1.8.0", optional = true }
+evento-sql-migrator = { path = "../evento-sql-migrator", version = "1.8.0", optional = true }
 sqlx_migrator = { version = "0.18", optional = true }
-thiserror = "2.0"
-async-trait = "0.1"
-tracing = "0.1.44"
-base64 = "0.22"
-sea-query = { version = "1.0.0-rc.23", default-features = false, features = ["derive", "audit"], optional = true }
-sea-query-sqlx = { version = "0.8.0-rc.10", features = ["runtime-tokio"], optional = true }
-futures-util = { version = "0.3", optional = true }
-backon = { version = "1.5", optional = true }
 
 [dev-dependencies]
-sqlx = { version = "0.8", features = ["runtime-tokio", "any"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "any", "sqlite", "mysql", "postgres"] }
 rand = "0.9"
 bank = { path = "../examples/bank" }
+ulid = { version = "1.2", features = ["serde"] }
+tokio = { version = "1.47", features = ["full"] }
+sea-query = { version = "1.0.0-rc.23", features = ["backend-sqlite", "backend-mysql", "backend-postgres"] }
+sea-query-sqlx = { version = "0.8.0-rc.10", features = ["runtime-tokio", "sqlx-sqlite", "sqlx-mysql", "sqlx-postgres"] }
+anyhow = "1.0"
 
 [features]
 default = ["macro", "handler", "stream", "group", "rw", "sql"]
-macro = ["evento-macro"]
-stream = ["futures-util", "tokio-stream"]
-group = ["futures-util"]
-handler = ["backon"]
-rw = []
+macro = ["evento-core/macro"]
+stream = ["evento-core/stream"]
+group = ["evento-core/group"]
+handler = ["evento-core/handler"]
+rw = ["evento-core/rw"]
 sql = ["sqlite", "mysql", "postgres"]
-sqlite = ["sea-query/backend-sqlite", "sea-query-sqlx/sqlx-sqlite", "sqlx/sqlite", "sqlx_migrator/sqlite"]
-mysql = ["sea-query/backend-mysql", "sea-query-sqlx/sqlx-mysql", "sqlx/mysql", "sqlx_migrator/mysql"]
-postgres = ["sea-query/backend-postgres", "sea-query-sqlx/sqlx-postgres", "sqlx/postgres", "sqlx_migrator/postgres"]
+sqlite = ["evento-sql/sqlite", "evento-sql-migrator/sqlite", "sqlx_migrator/sqlite"]
+mysql = ["evento-sql/mysql", "evento-sql-migrator/mysql", "sqlx_migrator/mysql"]
+postgres = ["evento-sql/postgres", "evento-sql-migrator/postgres", "sqlx_migrator/postgres"]

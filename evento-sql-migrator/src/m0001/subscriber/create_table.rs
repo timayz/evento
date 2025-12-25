@@ -1,22 +1,50 @@
-use sea_query::{Index, IndexCreateStatement, IndexDropStatement};
+use sea_query::{ColumnDef, Expr, Table, TableCreateStatement, TableDropStatement};
 
-use crate::sql::Event;
+use evento_sql::Subscriber;
 
 pub struct Operation;
 
-fn up_statement() -> IndexCreateStatement {
-    Index::create()
-        .name("idx_event_type")
-        .table(Event::Table)
-        .col(Event::AggregatorType)
+fn up_statement() -> TableCreateStatement {
+    Table::create()
+        .table(Subscriber::Table)
+        .if_not_exists()
+        .col(
+            ColumnDef::new(Subscriber::Key)
+                .string()
+                .string_len(50)
+                .not_null()
+                .primary_key(),
+        )
+        .col(
+            ColumnDef::new(Subscriber::WorkerId)
+                .string()
+                .not_null()
+                .string_len(26),
+        )
+        .col(ColumnDef::new(Subscriber::Cursor).string())
+        .col(ColumnDef::new(Subscriber::Lag).integer().not_null())
+        .col(
+            ColumnDef::new(Subscriber::Enabled)
+                .boolean()
+                .not_null()
+                .default(true),
+        )
+        .col(
+            ColumnDef::new(Subscriber::CreatedAt)
+                .timestamp_with_time_zone()
+                .not_null()
+                .default(Expr::current_timestamp()),
+        )
+        .col(
+            ColumnDef::new(Subscriber::UpdatedAt)
+                .timestamp_with_time_zone()
+                .null(),
+        )
         .to_owned()
 }
 
-fn down_statement() -> IndexDropStatement {
-    Index::drop()
-        .name("idx_event_type")
-        .table(Event::Table)
-        .to_owned()
+fn down_statement() -> TableDropStatement {
+    Table::drop().table(Subscriber::Table).to_owned()
 }
 
 #[cfg(feature = "sqlite")]

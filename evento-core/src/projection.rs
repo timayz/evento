@@ -1,4 +1,3 @@
-use backon::{ExponentialBuilder, Retryable};
 use std::{
     collections::HashMap,
     future::Future,
@@ -10,6 +9,9 @@ use tokio::time::{interval_at, Instant};
 use ulid::Ulid;
 
 use crate::{context, cursor::Args, Executor, ReadAggregator};
+
+#[cfg(feature = "handler")]
+use backon::{ExponentialBuilder, Retryable};
 
 #[derive(Clone)]
 pub enum RoutingKey {
@@ -441,6 +443,7 @@ impl<P, E: Executor + 'static> SubscriptionBuilder<P, E> {
         }
     }
 
+    #[cfg(feature = "handler")]
     pub async fn unretry_start(self, executor: &E) -> anyhow::Result<Subscription>
     where
         E: Clone,
@@ -448,6 +451,7 @@ impl<P, E: Executor + 'static> SubscriptionBuilder<P, E> {
         self.without_retry().start(executor).await
     }
 
+    #[cfg(feature = "handler")]
     pub async fn start(self, executor: &E) -> anyhow::Result<Subscription>
     where
         E: Clone,
@@ -530,10 +534,12 @@ impl<P, E: Executor + 'static> SubscriptionBuilder<P, E> {
         })
     }
 
+    #[cfg(feature = "handler")]
     pub async fn unretry_execute(self, executor: &E) -> anyhow::Result<()> {
         self.without_retry().execute(executor).await
     }
 
+    #[cfg(feature = "handler")]
     pub async fn execute(&self, executor: &E) -> anyhow::Result<()> {
         let id = Ulid::new();
 
@@ -571,6 +577,7 @@ impl<P, E: Executor + 'static> SubscriptionBuilder<P, E> {
     }
 }
 
+#[cfg(feature = "handler")]
 #[derive(Debug)]
 pub struct Subscription {
     pub id: Ulid,
@@ -578,6 +585,7 @@ pub struct Subscription {
     shutdown_tx: tokio::sync::oneshot::Sender<()>,
 }
 
+#[cfg(feature = "handler")]
 impl Subscription {
     pub async fn shutdown(self) -> Result<(), tokio::task::JoinError> {
         let _ = self.shutdown_tx.send(());

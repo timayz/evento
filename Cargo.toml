@@ -3,6 +3,9 @@ resolver = "2"
 
 members = [
     "./evento",
+    "./evento-core",
+    "./evento-sql",
+    "./evento-sql-migrator",
     "./evento-macro",
     "./examples/*"
 ]

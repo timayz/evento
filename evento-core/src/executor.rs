@@ -115,59 +115,9 @@ impl Executor for Evento {
     }
 }
 
-#[cfg(feature = "sqlite")]
-impl From<crate::Sqlite> for Evento {
-    fn from(value: crate::Sqlite) -> Self {
-        Self(Arc::new(Box::new(value)))
-    }
-}
-
-#[cfg(feature = "sqlite")]
-impl From<&crate::Sqlite> for Evento {
-    fn from(value: &crate::Sqlite) -> Self {
-        Self(Arc::new(Box::new(value.clone())))
-    }
-}
-
-#[cfg(feature = "mysql")]
-impl From<crate::MySql> for Evento {
-    fn from(value: crate::MySql) -> Self {
-        Self(Arc::new(Box::new(value)))
-    }
-}
-
-#[cfg(feature = "mysql")]
-impl From<&crate::MySql> for Evento {
-    fn from(value: &crate::MySql) -> Self {
-        Self(Arc::new(Box::new(value.clone())))
-    }
-}
-
-#[cfg(feature = "postgres")]
-impl From<crate::Postgres> for Evento {
-    fn from(value: crate::Postgres) -> Self {
-        Self(Arc::new(Box::new(value)))
-    }
-}
-
-#[cfg(feature = "postgres")]
-impl From<&crate::Postgres> for Evento {
-    fn from(value: &crate::Postgres) -> Self {
-        Self(Arc::new(Box::new(value.clone())))
-    }
-}
-
-#[cfg(feature = "rw")]
-impl<R: Executor + Clone, W: Executor + Clone> From<crate::Rw<R, W>> for Evento {
-    fn from(value: crate::Rw<R, W>) -> Self {
-        Self(Arc::new(Box::new(value)))
-    }
-}
-
-#[cfg(feature = "rw")]
-impl<R: Executor + Clone, W: Executor + Clone> From<&crate::Rw<R, W>> for Evento {
-    fn from(value: &crate::Rw<R, W>) -> Self {
-        Self(Arc::new(Box::new(value.clone())))
+impl Evento {
+    pub fn new<E: Executor>(executor: E) -> Self {
+        Self(Arc::new(Box::new(executor)))
     }
 }
 
@@ -292,37 +242,5 @@ impl<R: Executor, W: Executor> Executor for Rw<R, W> {
 impl<R: Executor, W: Executor> From<(R, W)> for Rw<R, W> {
     fn from((r, w): (R, W)) -> Self {
         Self { r, w }
-    }
-}
-
-#[cfg(all(
-    feature = "rw",
-    any(feature = "sqlite", feature = "postgres", feature = "mysql")
-))]
-impl<R: sqlx::Database, W: sqlx::Database> From<(sqlx::Pool<R>, sqlx::Pool<W>)>
-    for Rw<crate::sql::Sql<R>, crate::sql::Sql<W>>
-where
-    str: sqlx::Type<W>,
-    str: sqlx::Type<R>,
-    for<'r> String: sqlx::Decode<'r, W> + sqlx::Type<W>,
-    for<'r> String: sqlx::Decode<'r, R> + sqlx::Type<R>,
-    for<'r> bool: sqlx::Decode<'r, W> + sqlx::Type<W>,
-    for<'r> bool: sqlx::Decode<'r, R> + sqlx::Type<R>,
-    for<'r> Vec<u8>: sqlx::Decode<'r, W> + sqlx::Type<W>,
-    for<'r> Vec<u8>: sqlx::Decode<'r, R> + sqlx::Type<R>,
-    crate::Event: for<'r> sqlx::FromRow<'r, <W as sqlx::Database>::Row>,
-    crate::Event: for<'r> sqlx::FromRow<'r, <R as sqlx::Database>::Row>,
-    usize: sqlx::ColumnIndex<<W as sqlx::Database>::Row>,
-    usize: sqlx::ColumnIndex<<R as sqlx::Database>::Row>,
-    for<'q> sea_query_sqlx::SqlxValues: sqlx::IntoArguments<'q, W>,
-    for<'q> sea_query_sqlx::SqlxValues: sqlx::IntoArguments<'q, R>,
-    for<'c> &'c mut <W as sqlx::Database>::Connection: sqlx::Executor<'c, Database = W>,
-    for<'c> &'c mut <R as sqlx::Database>::Connection: sqlx::Executor<'c, Database = R>,
-{
-    fn from((r, w): (sqlx::Pool<R>, sqlx::Pool<W>)) -> Self {
-        Self {
-            r: r.into(),
-            w: w.into(),
-        }
     }
 }

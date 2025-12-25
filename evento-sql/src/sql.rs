@@ -11,7 +11,7 @@ use sea_query_sqlx::SqlxBinder;
 use sqlx::{Database, Pool};
 use ulid::Ulid;
 
-use crate::{
+use evento_core::{
     cursor::{self, Args, Cursor, Edge, PageInfo, ReadResult, Value},
     Executor, ReadAggregator, WriteError,
 };
@@ -58,20 +58,20 @@ pub enum Subscriber {
 #[cfg(feature = "mysql")]
 pub type MySql = Sql<sqlx::MySql>;
 
-#[cfg(all(feature = "mysql", feature = "rw"))]
-pub type RwMySql = crate::Rw<MySql, MySql>;
+#[cfg(feature = "mysql")]
+pub type RwMySql = evento_core::Rw<MySql, MySql>;
 
 #[cfg(feature = "postgres")]
 pub type Postgres = Sql<sqlx::Postgres>;
 
-#[cfg(all(feature = "postgres", feature = "rw"))]
-pub type RwPostgres = crate::Rw<Postgres, Postgres>;
+#[cfg(feature = "postgres")]
+pub type RwPostgres = evento_core::Rw<Postgres, Postgres>;
 
 #[cfg(feature = "sqlite")]
 pub type Sqlite = Sql<sqlx::Sqlite>;
 
-#[cfg(all(feature = "sqlite", feature = "rw"))]
-pub type RwSqlite = crate::Rw<Sqlite, Sqlite>;
+#[cfg(feature = "sqlite")]
+pub type RwSqlite = evento_core::Rw<Sqlite, Sqlite>;
 
 pub struct Sql<DB: Database>(Pool<DB>);
 
@@ -99,14 +99,14 @@ where
     bool: for<'r> sqlx::Decode<'r, DB> + sqlx::Type<DB>,
     Vec<u8>: for<'r> sqlx::Decode<'r, DB> + sqlx::Type<DB>,
     usize: sqlx::ColumnIndex<DB::Row>,
-    crate::Event: for<'r> sqlx::FromRow<'r, DB::Row>,
+    evento_core::Event: for<'r> sqlx::FromRow<'r, DB::Row>,
 {
     async fn read(
         &self,
         aggregators: Option<Vec<ReadAggregator>>,
-        routing_key: Option<crate::RoutingKey>,
+        routing_key: Option<evento_core::RoutingKey>,
         args: Args,
-    ) -> anyhow::Result<ReadResult<crate::Event>> {
+    ) -> anyhow::Result<ReadResult<evento_core::Event>> {
         let statement = Query::select()
             .columns([
                 Event::Id,
@@ -151,13 +151,14 @@ where
                 |_| {},
             )
             .conditions(
-                matches!(routing_key, Some(crate::RoutingKey::Value(_))),
+                matches!(routing_key, Some(evento_core::RoutingKey::Value(_))),
                 |q| {
-                    if let Some(crate::RoutingKey::Value(Some(ref routing_key))) = routing_key {
+                    if let Some(evento_core::RoutingKey::Value(Some(ref routing_key))) = routing_key
+                    {
                         q.and_where(Expr::col(Event::RoutingKey).eq(routing_key));
                     }
 
-                    if let Some(crate::RoutingKey::Value(None)) = routing_key {
+                    if let Some(evento_core::RoutingKey::Value(None)) = routing_key {
                         q.and_where(Expr::col(Event::RoutingKey).is_null());
                     }
                 },
@@ -167,7 +168,7 @@ where
 
         Ok(Reader::new(statement)
             .args(args)
-            .execute::<_, crate::Event, _>(&self.0)
+            .execute::<_, evento_core::Event, _>(&self.0)
             .await?)
     }
 
@@ -230,7 +231,7 @@ where
         Ok(())
     }
 
-    async fn write(&self, events: Vec<crate::Event>) -> Result<(), WriteError> {
+    async fn write(&self, events: Vec<evento_core::Event>) -> Result<(), WriteError> {
         let mut statement = Query::insert()
             .into_table(Event::Table)
             .columns([
@@ -536,7 +537,7 @@ pub trait Bind {
     fn values(cursor: <<Self as Bind>::Cursor as Cursor>::T) -> Self::V;
 }
 
-impl Bind for crate::Event {
+impl Bind for evento_core::Event {
     type T = Event;
     type I = [Self::T; 4];
     type V = [Expr; 4];
@@ -561,31 +562,44 @@ impl Bind for crate::Event {
     }
 }
 
-impl<R: sqlx::Row> sqlx::FromRow<'_, R> for crate::Event
-where
-    i32: sqlx::Type<R::Database> + for<'r> sqlx::Decode<'r, R::Database>,
-    Vec<u8>: sqlx::Type<R::Database> + for<'r> sqlx::Decode<'r, R::Database>,
-    String: sqlx::Type<R::Database> + for<'r> sqlx::Decode<'r, R::Database>,
-    i64: sqlx::Type<R::Database> + for<'r> sqlx::Decode<'r, R::Database>,
-    for<'r> &'r str: sqlx::Type<R::Database> + sqlx::Decode<'r, R::Database>,
-    for<'r> &'r str: sqlx::ColumnIndex<R>,
-{
-    fn from_row(row: &R) -> Result<Self, sqlx::Error> {
-        let timestamp: i64 = row.try_get("timestamp")?;
-        let timestamp_subsec: i64 = row.try_get("timestamp_subsec")?;
+#[cfg(feature = "sqlite")]
+impl From<Sqlite> for evento_core::Evento {
+    fn from(value: Sqlite) -> Self {
+        evento_core::Evento::new(value)
+    }
+}
 
-        Ok(crate::Event {
-            id: Ulid::from_string(row.try_get("id")?)
-                .map_err(|err| sqlx::Error::InvalidArgument(err.to_string()))?,
-            aggregator_id: row.try_get("aggregator_id")?,
-            aggregator_type: row.try_get("aggregator_type")?,
-            version: row.try_get("version")?,
-            name: row.try_get("name")?,
-            routing_key: row.try_get("routing_key")?,
-            data: row.try_get("data")?,
-            metadata: row.try_get("metadata")?,
-            timestamp: timestamp as u64,
-            timestamp_subsec: timestamp_subsec as u32,
-        })
+#[cfg(feature = "sqlite")]
+impl From<&Sqlite> for evento_core::Evento {
+    fn from(value: &Sqlite) -> Self {
+        evento_core::Evento::new(value.clone())
+    }
+}
+
+#[cfg(feature = "mysql")]
+impl From<MySql> for evento_core::Evento {
+    fn from(value: MySql) -> Self {
+        evento_core::Evento::new(value)
+    }
+}
+
+#[cfg(feature = "mysql")]
+impl From<&MySql> for evento_core::Evento {
+    fn from(value: &MySql) -> Self {
+        evento_core::Evento::new(value.clone())
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl From<Postgres> for evento_core::Evento {
+    fn from(value: Postgres) -> Self {
+        evento_core::Evento::new(value)
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl From<&Postgres> for evento_core::Evento {
+    fn from(value: &Postgres) -> Self {
+        evento_core::Evento::new(value.clone())
     }
 }

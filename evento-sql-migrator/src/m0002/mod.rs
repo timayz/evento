@@ -9,7 +9,7 @@ sqlx_migrator::sqlite_migration!(
     M0002,
     "main",
     "m0002",
-    vec_box![crate::sql_migrator::InitMigration],
+    vec_box![crate::InitMigration],
     vec_box![event::add_column_timestamp_subsec::Operation]
 );
 
@@ -18,7 +18,7 @@ sqlx_migrator::mysql_migration!(
     M0002,
     "main",
     "m0002",
-    vec_box![crate::sql_migrator::InitMigration],
+    vec_box![crate::InitMigration],
     vec_box![event::add_column_timestamp_subsec::Operation]
 );
 
@@ -27,6 +27,6 @@ sqlx_migrator::postgres_migration!(
     M0002,
     "main",
     "m0002",
-    vec_box![crate::sql_migrator::InitMigration],
+    vec_box![crate::InitMigration],
     vec_box![event::add_column_timestamp_subsec::Operation]
 );

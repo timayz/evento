@@ -10,7 +10,7 @@ sqlx_migrator::sqlite_migration!(
     M0003,
     "main",
     "m0003",
-    vec_box![crate::sql_migrator::M0002],
+    vec_box![crate::M0002],
     vec_box![
         snapshot::drop_table::Operation,
         event::alter_name_column::Operation,
@@ -22,7 +22,7 @@ sqlx_migrator::mysql_migration!(
     M0003,
     "main",
     "m0003",
-    vec_box![crate::sql_migrator::M0002],
+    vec_box![crate::M0002],
     vec_box![
         snapshot::drop_table::Operation,
         event::alter_name_column::Operation,
@@ -34,7 +34,7 @@ sqlx_migrator::postgres_migration!(
     M0003,
     "main",
     "m0003",
-    vec_box![crate::sql_migrator::M0002],
+    vec_box![crate::M0002],
     vec_box![
         snapshot::drop_table::Operation,
         event::alter_name_column::Operation,

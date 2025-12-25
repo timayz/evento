@@ -1,50 +1,47 @@
-use sea_query::{ColumnDef, Expr, Table, TableCreateStatement, TableDropStatement};
+use sea_query::{ColumnDef, Table, TableCreateStatement, TableDropStatement};
 
-use crate::sql::Subscriber;
+use evento_sql::Event;
 
 pub struct Operation;
 
 fn up_statement() -> TableCreateStatement {
     Table::create()
-        .table(Subscriber::Table)
-        .if_not_exists()
+        .table(Event::Table)
         .col(
-            ColumnDef::new(Subscriber::Key)
+            ColumnDef::new(Event::Id)
                 .string()
-                .string_len(50)
                 .not_null()
+                .string_len(26)
                 .primary_key(),
         )
         .col(
-            ColumnDef::new(Subscriber::WorkerId)
+            ColumnDef::new(Event::Name)
                 .string()
-                .not_null()
-                .string_len(26),
-        )
-        .col(ColumnDef::new(Subscriber::Cursor).string())
-        .col(ColumnDef::new(Subscriber::Lag).integer().not_null())
-        .col(
-            ColumnDef::new(Subscriber::Enabled)
-                .boolean()
-                .not_null()
-                .default(true),
+                .string_len(50)
+                .not_null(),
         )
         .col(
-            ColumnDef::new(Subscriber::CreatedAt)
-                .timestamp_with_time_zone()
-                .not_null()
-                .default(Expr::current_timestamp()),
+            ColumnDef::new(Event::AggregatorType)
+                .string()
+                .string_len(50)
+                .not_null(),
         )
         .col(
-            ColumnDef::new(Subscriber::UpdatedAt)
-                .timestamp_with_time_zone()
-                .null(),
+            ColumnDef::new(Event::AggregatorId)
+                .string()
+                .string_len(26)
+                .not_null(),
         )
+        .col(ColumnDef::new(Event::Version).integer().not_null())
+        .col(ColumnDef::new(Event::Data).blob().not_null())
+        .col(ColumnDef::new(Event::Metadata).blob().not_null())
+        .col(ColumnDef::new(Event::RoutingKey).string().string_len(50))
+        .col(ColumnDef::new(Event::Timestamp).big_integer().not_null())
         .to_owned()
 }
 
 fn down_statement() -> TableDropStatement {
-    Table::drop().table(Subscriber::Table).to_owned()
+    Table::drop().table(Event::Table).to_owned()
 }
 
 #[cfg(feature = "sqlite")]

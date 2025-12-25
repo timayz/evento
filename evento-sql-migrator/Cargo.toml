@@ -1,0 +1,23 @@
+[package]
+name = "evento-sql-migrator"
+version = "1.8.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = true
+description = "SQL migrations for evento event sourcing library."
+repository = "https://github.com/timayz/evento"
+documentation = "https://docs.rs/evento-sql-migrator"
+readme = "README.md"
+
+[dependencies]
+evento-sql = { path = "../evento-sql", version = "1.8.0", default-features = false }
+sqlx = { version = "0.8" }
+sqlx_migrator = { version = "0.18" }
+sea-query = { version = "1.0.0-rc.23", default-features = false, features = ["derive", "audit"] }
+async-trait = "0.1"
+
+[features]
+default = ["sqlite", "mysql", "postgres"]
+sqlite = ["evento-sql/sqlite", "sea-query/backend-sqlite", "sqlx/sqlite", "sqlx_migrator/sqlite"]
+mysql = ["evento-sql/mysql", "sea-query/backend-mysql", "sqlx/mysql", "sqlx_migrator/mysql"]
+postgres = ["evento-sql/postgres", "sea-query/backend-postgres", "sqlx/postgres", "sqlx_migrator/postgres"]

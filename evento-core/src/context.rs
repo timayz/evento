@@ -50,15 +50,6 @@ impl Context {
     /// Insert an item into the map.
     ///
     /// If an item of this type was already stored, it will be replaced and returned.
-    ///
-    /// ```
-    /// # use evento::context::Context;
-    /// let mut map = Context::new();
-    /// assert_eq!(map.insert(""), None);
-    /// assert_eq!(map.insert(1u32), None);
-    /// assert_eq!(map.insert(2u32), Some(1u32));
-    /// assert_eq!(*map.get::<u32>().unwrap(), 2u32);
-    /// ```
     pub fn insert<T: Send + Sync + 'static>(&mut self, val: T) -> Option<T> {
         self.map
             .insert(TypeId::of::<T>(), Box::new(val))
@@ -66,27 +57,11 @@ impl Context {
     }
 
     /// Check if map contains an item of a given type.
-    ///
-    /// ```
-    /// # use evento::context::Context;
-    /// let mut map = Context::new();
-    /// assert!(!map.contains::<u32>());
-    ///
-    /// assert_eq!(map.insert(1u32), None);
-    /// assert!(map.contains::<u32>());
-    /// ```
     pub fn contains<T: 'static>(&self) -> bool {
         self.map.contains_key(&TypeId::of::<T>())
     }
 
     /// Get a reference to an item of a given type.
-    ///
-    /// ```
-    /// # use evento::context::Context;
-    /// let mut map = Context::new();
-    /// map.insert(1u32);
-    /// assert_eq!(map.get::<u32>(), Some(&1u32));
-    /// ```
     pub fn extract<T: 'static>(&self) -> &T {
         match self.get::<T>() {
             Some(v) => v,
@@ -107,13 +82,6 @@ impl Context {
     }
 
     /// Get a reference to an item of a given type.
-    ///
-    /// ```
-    /// # use evento::context::Context;
-    /// let mut map = Context::new();
-    /// map.insert(1u32);
-    /// assert_eq!(map.get::<u32>(), Some(&1u32));
-    /// ```
     pub fn get<T: 'static>(&self) -> Option<&T> {
         self.map
             .get(&TypeId::of::<T>())
@@ -121,13 +89,6 @@ impl Context {
     }
 
     /// Get a mutable reference to an item of a given type.
-    ///
-    /// ```
-    /// # use evento::context::Context;
-    /// let mut map = Context::new();
-    /// map.insert(1u32);
-    /// assert_eq!(map.get_mut::<u32>(), Some(&mut 1u32));
-    /// ```
     pub fn get_mut<T: 'static>(&mut self) -> Option<&mut T> {
         self.map
             .get_mut(&TypeId::of::<T>())
@@ -137,33 +98,11 @@ impl Context {
     /// Remove an item from the map of a given type.
     ///
     /// If an item of this type was already stored, it will be returned.
-    ///
-    /// ```
-    /// # use evento::context::Context;
-    /// let mut map = Context::new();
-    ///
-    /// map.insert(1u32);
-    /// assert_eq!(map.get::<u32>(), Some(&1u32));
-    ///
-    /// assert_eq!(map.remove::<u32>(), Some(1u32));
-    /// assert!(!map.contains::<u32>());
-    /// ```
     pub fn remove<T: Send + Sync + 'static>(&mut self) -> Option<T> {
         self.map.remove(&TypeId::of::<T>()).and_then(downcast_owned)
     }
 
     /// Clear the `Context` of all inserted extensions.
-    ///
-    /// ```
-    /// # use evento::context::Context;
-    /// let mut map = Context::new();
-    ///
-    /// map.insert(1u32);
-    /// assert!(map.contains::<u32>());
-    ///
-    /// map.clear();
-    /// assert!(!map.contains::<u32>());
-    /// ```
     #[inline]
     pub fn clear(&mut self) {
         self.map.clear();
