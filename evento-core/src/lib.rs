@@ -23,7 +23,7 @@ pub struct EventCursor {
     /// Event ID (ULID string)
     pub i: String,
     /// Event version
-    pub v: i32,
+    pub v: u16,
     /// Event timestamp (Unix timestamp in seconds)
     pub t: u64,
     pub s: u32,
@@ -38,7 +38,7 @@ pub struct Event {
     /// Type name of the aggregate (e.g., "myapp/User")
     pub aggregator_type: String,
     /// Version number of the aggregate after this event
-    pub version: i32,
+    pub version: u16,
     /// Event type name
     pub name: String,
     /// Optional routing key for event distribution
@@ -169,13 +169,14 @@ where
     fn from_row(row: &R) -> Result<Self, sqlx::Error> {
         let timestamp: i64 = sqlx::Row::try_get(row, "timestamp")?;
         let timestamp_subsec: i64 = sqlx::Row::try_get(row, "timestamp_subsec")?;
+        let version: i32 = sqlx::Row::try_get(row, "version")?;
 
         Ok(Event {
             id: Ulid::from_string(sqlx::Row::try_get(row, "id")?)
                 .map_err(|err| sqlx::Error::InvalidArgument(err.to_string()))?,
             aggregator_id: sqlx::Row::try_get(row, "aggregator_id")?,
             aggregator_type: sqlx::Row::try_get(row, "aggregator_type")?,
-            version: sqlx::Row::try_get(row, "version")?,
+            version: version as u16,
             name: sqlx::Row::try_get(row, "name")?,
             routing_key: sqlx::Row::try_get(row, "routing_key")?,
             data: sqlx::Row::try_get(row, "data")?,

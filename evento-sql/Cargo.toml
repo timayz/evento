@@ -10,7 +10,7 @@ documentation = "https://docs.rs/evento-sql"
 readme = "README.md"
 
 [dependencies]
-evento-core = { workspace = true, default-features = false }
+evento-core.workspace = true
 anyhow.workspace = true
 rkyv.workspace = true
 async-trait.workspace = true

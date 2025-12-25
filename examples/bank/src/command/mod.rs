@@ -39,7 +39,7 @@ use crate::{
 
 use once_cell::sync::Lazy;
 
-pub type LazyCommandrow = (CommandRow, i32, Option<String>);
+pub type LazyCommandrow = (CommandRow, u16, Option<String>);
 
 pub static COMMAND_ROWS: Lazy<RwLock<HashMap<String, LazyCommandrow>>> =
     Lazy::new(Default::default);
@@ -77,7 +77,7 @@ impl From<LoadResult<CommandRow>> for Command {
 impl Command {
     fn aggregator(&self) -> AggregatorBuilder {
         evento::aggregator(&self.account_id)
-            .original_version(self.0.version as u16)
+            .original_version(self.0.version)
             .routing_key_opt(self.0.routing_key.to_owned())
     }
 

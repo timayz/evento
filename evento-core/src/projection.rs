@@ -170,7 +170,7 @@ impl<P: 'static, E: Executor> Projection<P, E> {
 #[derive(Debug, Clone, Default)]
 pub struct LoadResult<A> {
     pub item: A,
-    pub version: i32,
+    pub version: u16,
     pub routing_key: Option<String>,
 }
 

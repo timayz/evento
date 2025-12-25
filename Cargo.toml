@@ -17,10 +17,10 @@ repository = "https://github.com/timayz/evento"
 
 [workspace.dependencies]
 # Internal crates
-evento = { path = "./evento", version = "1.8.0", default-features = false }
-evento-core = { path = "./evento-core", version = "1.8.0", default-features = false }
-evento-sql = { path = "./evento-sql", version = "1.8.0", default-features = false }
-evento-sql-migrator = { path = "./evento-sql-migrator", version = "1.8.0", default-features = false }
+evento = { path = "./evento", version = "1.8.0" }
+evento-core = { path = "./evento-core", version = "1.8.0" }
+evento-sql = { path = "./evento-sql", version = "1.8.0" }
+evento-sql-migrator = { path = "./evento-sql-migrator", version = "1.8.0" }
 evento-macro = { path = "./evento-macro", version = "1.8.0" }
 bank = { path = "./examples/bank" }
 

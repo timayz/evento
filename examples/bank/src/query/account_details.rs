@@ -16,7 +16,7 @@ use crate::{
     value_object::{AccountStatus, AccountType},
 };
 
-pub type LazyAccountDetailsRow = (AccountDetailsView, i32, Option<String>);
+pub type LazyAccountDetailsRow = (AccountDetailsView, u16, Option<String>);
 
 pub static ACCOUNT_DETAILS_ROWS: Lazy<RwLock<HashMap<String, LazyAccountDetailsRow>>> =
     Lazy::new(Default::default);

@@ -28,7 +28,7 @@ pub struct AggregatorBuilder {
     aggregator_type: String,
     routing_key: Option<String>,
     routing_key_locked: bool,
-    original_version: i32,
+    original_version: u16,
     data: Vec<(&'static str, Vec<u8>)>,
     metadata: Option<Vec<u8>>,
 }
@@ -47,7 +47,7 @@ impl AggregatorBuilder {
     }
 
     pub fn original_version(mut self, v: u16) -> Self {
-        self.original_version = v as i32;
+        self.original_version = v;
 
         self
     }
