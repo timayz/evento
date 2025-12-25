@@ -288,7 +288,7 @@ where
         let statement = Query::update()
             .table(Subscriber::Table)
             .values([
-                (Subscriber::Cursor, cursor.to_string().into()),
+                (Subscriber::Cursor, cursor.0.into()),
                 (Subscriber::Lag, lag.into()),
                 (Subscriber::UpdatedAt, Expr::current_timestamp()),
             ])
@@ -556,7 +556,7 @@ impl Bind for crate::Event {
             cursor.t.into(),
             cursor.s.into(),
             cursor.v.into(),
-            cursor.i.to_string().into(),
+            cursor.i.into(),
         ]
     }
 }

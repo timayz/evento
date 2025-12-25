@@ -21,10 +21,10 @@ sqlx = { version = "0.8", optional = true }
 sqlx_migrator = { version = "0.18", optional = true }
 thiserror = "2.0"
 async-trait = "0.1"
-tracing = "0.1"
+tracing = "0.1.44"
 base64 = "0.22"
-sea-query = { version = "1.0.0-rc.14", default-features = false, features = ["derive", "audit"], optional = true }
-sea-query-sqlx = { version = "0.8.0-rc.9", features = ["runtime-tokio"], optional = true }
+sea-query = { version = "1.0.0-rc.23", default-features = false, features = ["derive", "audit"], optional = true }
+sea-query-sqlx = { version = "0.8.0-rc.10", features = ["runtime-tokio"], optional = true }
 futures-util = { version = "0.3", optional = true }
 backon = { version = "1.5", optional = true }
 

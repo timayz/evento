@@ -1,5 +1,6 @@
 
-//
+// add sql migration to remove snapshot table
+// refactor migration file path like table_name/statement
 // split evento into multi create like evento-core, evento-sqlx, evento-macro, evento. workspace deps
 // create multi examples axum-htmx-sse
 // replace bincode by rkyv
