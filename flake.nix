@@ -19,16 +19,20 @@
         devShells.default = with pkgs; mkShell {
           buildInputs = [
             gcc
+            clang
             glib
             openssl
             pkg-config
             cargo-watch
             cargo-machete
             tailwindcss
+            llvmPackages.libclang
             (rust-bin.stable.latest.default.override {
               extensions = [ "rust-src" "rust-analyzer" ];
             })
           ];
+
+          LIBCLANG_PATH = "${llvmPackages.libclang.lib}/lib";
         };
       }
     );
