@@ -1,40 +1,78 @@
-use std::sync::Arc;
+use std::{hash::Hash, sync::Arc};
 use ulid::Ulid;
 
 use crate::{
     cursor::{Args, ReadResult, Value},
-    AcknowledgeError, Event, ReadError, RoutingKey, SubscribeError, WriteError,
+    Event, RoutingKey, WriteError,
 };
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ReadAggregator {
+    pub aggregator_type: String,
+    pub aggregator_id: Option<String>,
+    pub name: Option<String>,
+}
+
+impl ReadAggregator {
+    pub fn new(
+        aggregator_type: impl Into<String>,
+        id: impl Into<String>,
+        name: impl Into<String>,
+    ) -> Self {
+        Self {
+            aggregator_type: aggregator_type.into(),
+            aggregator_id: Some(id.into()),
+            name: Some(name.into()),
+        }
+    }
+
+    pub fn aggregator(value: impl Into<String>) -> Self {
+        Self {
+            aggregator_type: value.into(),
+            aggregator_id: None,
+            name: None,
+        }
+    }
+
+    pub fn id(aggregator_type: impl Into<String>, id: impl Into<String>) -> Self {
+        Self {
+            aggregator_type: aggregator_type.into(),
+            aggregator_id: Some(id.into()),
+            name: None,
+        }
+    }
+
+    pub fn event(aggregator_type: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            aggregator_type: aggregator_type.into(),
+            aggregator_id: None,
+            name: Some(name.into()),
+        }
+    }
+}
+
+impl Hash for ReadAggregator {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.aggregator_type.hash(state);
+        self.aggregator_id.hash(state);
+        self.name.hash(state);
+    }
+}
 
 #[async_trait::async_trait]
 pub trait Executor: Send + Sync + 'static {
     async fn write(&self, events: Vec<Event>) -> Result<(), WriteError>;
-
-    async fn get_event(&self, cursor: Value) -> Result<Event, ReadError>;
+    async fn get_subscriber_cursor(&self, key: String) -> anyhow::Result<Option<Value>>;
+    async fn is_subscriber_running(&self, key: String, worker_id: Ulid) -> anyhow::Result<bool>;
+    async fn upsert_subscriber(&self, key: String, worker_id: Ulid) -> anyhow::Result<()>;
+    async fn acknowledge(&self, key: String, cursor: Value, lag: u64) -> anyhow::Result<()>;
 
     async fn read(
         &self,
-        aggregators: Option<Vec<(String, Option<String>)>>,
+        aggregators: Option<Vec<ReadAggregator>>,
         routing_key: Option<RoutingKey>,
         args: Args,
-    ) -> Result<ReadResult<Event>, ReadError>;
-
-    async fn get_subscriber_cursor(&self, key: String) -> Result<Option<Value>, SubscribeError>;
-
-    async fn is_subscriber_running(
-        &self,
-        key: String,
-        worker_id: Ulid,
-    ) -> Result<bool, SubscribeError>;
-
-    async fn upsert_subscriber(&self, key: String, worker_id: Ulid) -> Result<(), SubscribeError>;
-
-    async fn acknowledge(
-        &self,
-        key: String,
-        cursor: Value,
-        lag: u64,
-    ) -> Result<(), AcknowledgeError>;
+    ) -> anyhow::Result<ReadResult<Event>>;
 }
 
 pub struct Evento(Arc<Box<dyn Executor>>);
@@ -51,41 +89,28 @@ impl Executor for Evento {
         self.0.write(events).await
     }
 
-    async fn get_event(&self, cursor: Value) -> Result<Event, ReadError> {
-        self.0.get_event(cursor).await
-    }
-
     async fn read(
         &self,
-        aggregators: Option<Vec<(String, Option<String>)>>,
+        aggregators: Option<Vec<ReadAggregator>>,
         routing_key: Option<RoutingKey>,
         args: Args,
-    ) -> Result<ReadResult<Event>, ReadError> {
+    ) -> anyhow::Result<ReadResult<Event>> {
         self.0.read(aggregators, routing_key, args).await
     }
 
-    async fn get_subscriber_cursor(&self, key: String) -> Result<Option<Value>, SubscribeError> {
+    async fn get_subscriber_cursor(&self, key: String) -> anyhow::Result<Option<Value>> {
         self.0.get_subscriber_cursor(key).await
     }
 
-    async fn is_subscriber_running(
-        &self,
-        key: String,
-        worker_id: Ulid,
-    ) -> Result<bool, SubscribeError> {
+    async fn is_subscriber_running(&self, key: String, worker_id: Ulid) -> anyhow::Result<bool> {
         self.0.is_subscriber_running(key, worker_id).await
     }
 
-    async fn upsert_subscriber(&self, key: String, worker_id: Ulid) -> Result<(), SubscribeError> {
+    async fn upsert_subscriber(&self, key: String, worker_id: Ulid) -> anyhow::Result<()> {
         self.0.upsert_subscriber(key, worker_id).await
     }
 
-    async fn acknowledge(
-        &self,
-        key: String,
-        cursor: Value,
-        lag: u64,
-    ) -> Result<(), AcknowledgeError> {
+    async fn acknowledge(&self, key: String, cursor: Value, lag: u64) -> anyhow::Result<()> {
         self.0.acknowledge(key, cursor, lag).await
     }
 }
@@ -174,34 +199,12 @@ impl Executor for EventoGroup {
         self.first().write(events).await
     }
 
-    async fn get_event(&self, cursor: Value) -> Result<Event, ReadError> {
-        let futures = self
-            .executors
-            .iter()
-            .map(|e| e.get_event(cursor.to_owned()));
-
-        let results = futures_util::future::join_all(futures).await;
-
-        if let Some(Ok(result)) = results.iter().find(|res| res.is_ok()) {
-            return Ok(result.clone());
-        }
-
-        if let Err(err) = results
-            .first()
-            .expect("EventoGroup must have at least one executor")
-        {
-            return Err(ReadError::Unknown(anyhow::anyhow!("{err:?}")));
-        }
-
-        unreachable!()
-    }
-
     async fn read(
         &self,
-        aggregators: Option<Vec<(String, Option<String>)>>,
+        aggregators: Option<Vec<ReadAggregator>>,
         routing_key: Option<RoutingKey>,
         args: Args,
-    ) -> Result<ReadResult<Event>, ReadError> {
+    ) -> anyhow::Result<ReadResult<Event>> {
         use crate::cursor;
         let futures = self
             .executors
@@ -216,34 +219,22 @@ impl Executor for EventoGroup {
             }
         }
 
-        Ok(cursor::Reader::new(events)
-            .args(args)
-            .execute()
-            .map_err(|err| ReadError::Unknown(err.into()))?)
+        Ok(cursor::Reader::new(events).args(args).execute()?)
     }
 
-    async fn get_subscriber_cursor(&self, key: String) -> Result<Option<Value>, SubscribeError> {
+    async fn get_subscriber_cursor(&self, key: String) -> anyhow::Result<Option<Value>> {
         self.first().get_subscriber_cursor(key).await
     }
 
-    async fn is_subscriber_running(
-        &self,
-        key: String,
-        worker_id: Ulid,
-    ) -> Result<bool, SubscribeError> {
+    async fn is_subscriber_running(&self, key: String, worker_id: Ulid) -> anyhow::Result<bool> {
         self.first().is_subscriber_running(key, worker_id).await
     }
 
-    async fn upsert_subscriber(&self, key: String, worker_id: Ulid) -> Result<(), SubscribeError> {
+    async fn upsert_subscriber(&self, key: String, worker_id: Ulid) -> anyhow::Result<()> {
         self.first().upsert_subscriber(key, worker_id).await
     }
 
-    async fn acknowledge(
-        &self,
-        key: String,
-        cursor: Value,
-        lag: u64,
-    ) -> Result<(), AcknowledgeError> {
+    async fn acknowledge(&self, key: String, cursor: Value, lag: u64) -> anyhow::Result<()> {
         self.first().acknowledge(key, cursor, lag).await
     }
 }
@@ -271,41 +262,28 @@ impl<R: Executor, W: Executor> Executor for Rw<R, W> {
         self.w.write(events).await
     }
 
-    async fn get_event(&self, cursor: Value) -> Result<Event, ReadError> {
-        self.r.get_event(cursor).await
-    }
-
     async fn read(
         &self,
-        aggregators: Option<Vec<(String, Option<String>)>>,
+        aggregators: Option<Vec<ReadAggregator>>,
         routing_key: Option<RoutingKey>,
         args: Args,
-    ) -> Result<ReadResult<Event>, ReadError> {
+    ) -> anyhow::Result<ReadResult<Event>> {
         self.r.read(aggregators, routing_key, args).await
     }
 
-    async fn get_subscriber_cursor(&self, key: String) -> Result<Option<Value>, SubscribeError> {
+    async fn get_subscriber_cursor(&self, key: String) -> anyhow::Result<Option<Value>> {
         self.r.get_subscriber_cursor(key).await
     }
 
-    async fn is_subscriber_running(
-        &self,
-        key: String,
-        worker_id: Ulid,
-    ) -> Result<bool, SubscribeError> {
+    async fn is_subscriber_running(&self, key: String, worker_id: Ulid) -> anyhow::Result<bool> {
         self.r.is_subscriber_running(key, worker_id).await
     }
 
-    async fn upsert_subscriber(&self, key: String, worker_id: Ulid) -> Result<(), SubscribeError> {
+    async fn upsert_subscriber(&self, key: String, worker_id: Ulid) -> anyhow::Result<()> {
         self.w.upsert_subscriber(key, worker_id).await
     }
 
-    async fn acknowledge(
-        &self,
-        key: String,
-        cursor: Value,
-        lag: u64,
-    ) -> Result<(), AcknowledgeError> {
+    async fn acknowledge(&self, key: String, cursor: Value, lag: u64) -> anyhow::Result<()> {
         self.w.acknowledge(key, cursor, lag).await
     }
 }

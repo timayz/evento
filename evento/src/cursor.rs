@@ -54,7 +54,7 @@ impl<N> ReadResult<N> {
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
-pub struct Value(String);
+pub struct Value(pub(crate) String);
 
 impl Deref for Value {
     type Target = String;

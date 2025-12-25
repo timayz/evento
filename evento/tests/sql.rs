@@ -25,13 +25,6 @@ use sqlx_migrator::{Migrate, Plan};
 use crate::cursor_test::assert_read_result;
 
 #[tokio::test]
-async fn sqlite_version() -> anyhow::Result<()> {
-    let executor = create_sqlite_executor("version").await?;
-
-    evento_test::version(&executor).await
-}
-
-#[tokio::test]
 async fn sqlite_routing_key() -> anyhow::Result<()> {
     let executor = create_sqlite_executor("routing_key").await?;
 
@@ -43,6 +36,20 @@ async fn sqlite_load() -> anyhow::Result<()> {
     let executor = create_sqlite_executor("load").await?;
 
     evento_test::load(&executor).await
+}
+
+#[tokio::test]
+async fn sqlite_load_multiple_aggregator() -> anyhow::Result<()> {
+    let executor = create_sqlite_executor("load_multiple_aggregator").await?;
+
+    evento_test::load_multiple_aggregator(&executor).await
+}
+
+#[tokio::test]
+async fn sqlite_load_with_snapshot() -> anyhow::Result<()> {
+    let executor = create_sqlite_executor("load_with_snapshot").await?;
+
+    evento_test::load_with_snapshot(&executor).await
 }
 
 #[tokio::test]
@@ -110,13 +117,6 @@ async fn sqlite_subscribe_default_multiple_aggregator() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn rw_sqlite_version() -> anyhow::Result<()> {
-    let executor = create_rw_sqlite_executor("version").await?;
-
-    evento_test::version(&executor).await
-}
-
-#[tokio::test]
 async fn rw_sqlite_routing_key() -> anyhow::Result<()> {
     let executor = create_rw_sqlite_executor("routing_key").await?;
 
@@ -128,6 +128,20 @@ async fn rw_sqlite_load() -> anyhow::Result<()> {
     let executor = create_rw_sqlite_executor("load").await?;
 
     evento_test::load(&executor).await
+}
+
+#[tokio::test]
+async fn rw_sqlite_load_multiple_aggregator() -> anyhow::Result<()> {
+    let executor = create_rw_sqlite_executor("load_multiple_aggregator").await?;
+
+    evento_test::load_multiple_aggregator(&executor).await
+}
+
+#[tokio::test]
+async fn rw_sqlite_load_with_snapshot() -> anyhow::Result<()> {
+    let executor = create_rw_sqlite_executor("load_with_snapshot").await?;
+
+    evento_test::load_with_snapshot(&executor).await
 }
 
 #[tokio::test]
@@ -193,13 +207,6 @@ async fn rw_sqlite_subscribe_default_multiple_aggregator() -> anyhow::Result<()>
 }
 
 #[tokio::test]
-async fn mysql_version() -> anyhow::Result<()> {
-    let executor = create_sqlite_executor("version").await?;
-
-    evento_test::version(&executor).await
-}
-
-#[tokio::test]
 async fn mysql_routing_key() -> anyhow::Result<()> {
     let executor = create_mysql_executor("routing_key").await?;
 
@@ -211,6 +218,20 @@ async fn mysql_load() -> anyhow::Result<()> {
     let executor = create_mysql_executor("load").await?;
 
     evento_test::load(&executor).await
+}
+
+#[tokio::test]
+async fn mysql_load_multiple_aggregator() -> anyhow::Result<()> {
+    let executor = create_mysql_executor("load_multiple_aggregator").await?;
+
+    evento_test::load_multiple_aggregator(&executor).await
+}
+
+#[tokio::test]
+async fn mysql_load_with_snapshot() -> anyhow::Result<()> {
+    let executor = create_mysql_executor("load_with_snapshot").await?;
+
+    evento_test::load_with_snapshot(&executor).await
 }
 
 #[tokio::test]
@@ -277,13 +298,6 @@ async fn mysql_subscribe_default_multiple_aggregator() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn postgres_version() -> anyhow::Result<()> {
-    let executor = create_postgres_executor("version").await?;
-
-    evento_test::version(&executor).await
-}
-
-#[tokio::test]
 async fn postgres_routing_key() -> anyhow::Result<()> {
     let executor = create_postgres_executor("routing_key").await?;
 
@@ -295,6 +309,20 @@ async fn postgres_load() -> anyhow::Result<()> {
     let executor = create_postgres_executor("load").await?;
 
     evento_test::load(&executor).await
+}
+
+#[tokio::test]
+async fn postgres_load_multiple_aggregator() -> anyhow::Result<()> {
+    let executor = create_postgres_executor("load_multiple_aggregator").await?;
+
+    evento_test::load_multiple_aggregator(&executor).await
+}
+
+#[tokio::test]
+async fn postgres_load_with_snapshot() -> anyhow::Result<()> {
+    let executor = create_postgres_executor("load_with_snapshot").await?;
+
+    evento_test::load_with_snapshot(&executor).await
 }
 
 #[tokio::test]
@@ -592,11 +620,11 @@ where
         .from(evento::sql::Event::Table)
         .to_owned();
 
-    Ok(Reader::new(statement)
+    Reader::new(statement)
         .args(args)
         .order(order)
         .execute::<_, crate::Event, _>(pool)
-        .await?)
+        .await
 }
 
 async fn get_data<DB>(pool: &Pool<DB>) -> anyhow::Result<Vec<Event>>

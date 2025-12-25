@@ -17,7 +17,7 @@ fn up_statement() -> TableCreateStatement {
         .col(
             ColumnDef::new(Event::Name)
                 .string()
-                .string_len(20)
+                .string_len(50)
                 .not_null(),
         )
         .col(

@@ -13,7 +13,7 @@ use ulid::Ulid;
 
 use crate::{
     cursor::{self, Args, Cursor, Edge, PageInfo, ReadResult, Value},
-    AcknowledgeError, Executor, ReadError, SubscribeError, WriteError,
+    Executor, ReadAggregator, WriteError,
 };
 
 #[derive(Iden, Clone)]
@@ -101,40 +101,12 @@ where
     usize: sqlx::ColumnIndex<DB::Row>,
     crate::Event: for<'r> sqlx::FromRow<'r, DB::Row>,
 {
-    async fn get_event(&self, cursor: Value) -> Result<crate::Event, ReadError> {
-        let cursor = crate::Event::deserialize_cursor(&cursor)?;
-        let statement = Query::select()
-            .columns([
-                Event::Id,
-                Event::Name,
-                Event::AggregatorType,
-                Event::AggregatorId,
-                Event::Version,
-                Event::Data,
-                Event::Metadata,
-                Event::RoutingKey,
-                Event::Timestamp,
-                Event::TimestampSubsec,
-            ])
-            .from(Event::Table)
-            .and_where(Expr::col(Event::Id).eq(Expr::value(cursor.i.to_string())))
-            .limit(1)
-            .to_owned();
-
-        let (sql, values) = Self::build_sqlx(statement);
-
-        sqlx::query_as_with::<DB, crate::Event, _>(&sql, values)
-            .fetch_one(&self.0)
-            .await
-            .map_err(|err| ReadError::Unknown(err.into()))
-    }
-
     async fn read(
         &self,
-        aggregators: Option<Vec<(String, Option<String>)>>,
+        aggregators: Option<Vec<ReadAggregator>>,
         routing_key: Option<crate::RoutingKey>,
         args: Args,
-    ) -> Result<ReadResult<crate::Event>, ReadError> {
+    ) -> anyhow::Result<ReadResult<crate::Event>> {
         let statement = Query::select()
             .columns([
                 Event::Id,
@@ -159,12 +131,16 @@ where
                     let mut cond = Cond::any();
 
                     for aggregator in aggregators {
-                        let mut aggregator_cond =
-                            Cond::all().add(Expr::col(Event::AggregatorType).eq(aggregator.0));
+                        let mut aggregator_cond = Cond::all()
+                            .add(Expr::col(Event::AggregatorType).eq(aggregator.aggregator_type));
 
-                        if let Some(id) = aggregator.1 {
+                        if let Some(id) = aggregator.aggregator_id {
                             aggregator_cond =
                                 aggregator_cond.add(Expr::col(Event::AggregatorId).eq(id));
+                        }
+
+                        if let Some(name) = aggregator.name {
+                            aggregator_cond = aggregator_cond.add(Expr::col(Event::Name).eq(name));
                         }
 
                         cond = cond.add(aggregator_cond);
@@ -189,13 +165,13 @@ where
             )
             .to_owned();
 
-        Reader::new(statement)
+        Ok(Reader::new(statement)
             .args(args)
             .execute::<_, crate::Event, _>(&self.0)
-            .await
+            .await?)
     }
 
-    async fn get_subscriber_cursor(&self, key: String) -> Result<Option<Value>, SubscribeError> {
+    async fn get_subscriber_cursor(&self, key: String) -> anyhow::Result<Option<Value>> {
         let statement = Query::select()
             .columns([Subscriber::Cursor])
             .from(Subscriber::Table)
@@ -207,8 +183,7 @@ where
 
         let Some((cursor,)) = sqlx::query_as_with::<DB, (Option<String>,), _>(&sql, values)
             .fetch_optional(&self.0)
-            .await
-            .map_err(|err| SubscribeError::Unknown(err.into()))?
+            .await?
         else {
             return Ok(None);
         };
@@ -216,11 +191,7 @@ where
         Ok(cursor.map(|c| c.into()))
     }
 
-    async fn is_subscriber_running(
-        &self,
-        key: String,
-        worker_id: Ulid,
-    ) -> Result<bool, SubscribeError> {
+    async fn is_subscriber_running(&self, key: String, worker_id: Ulid) -> anyhow::Result<bool> {
         let statement = Query::select()
             .columns([Subscriber::WorkerId, Subscriber::Enabled])
             .from(Subscriber::Table)
@@ -232,13 +203,12 @@ where
 
         let (id, enabled) = sqlx::query_as_with::<DB, (String, bool), _>(&sql, values)
             .fetch_one(&self.0)
-            .await
-            .map_err(|err| SubscribeError::Unknown(err.into()))?;
+            .await?;
 
         Ok(worker_id.to_string() == id && enabled)
     }
 
-    async fn upsert_subscriber(&self, key: String, worker_id: Ulid) -> Result<(), SubscribeError> {
+    async fn upsert_subscriber(&self, key: String, worker_id: Ulid) -> anyhow::Result<()> {
         let statement = Query::insert()
             .into_table(Subscriber::Table)
             .columns([Subscriber::Key, Subscriber::WorkerId, Subscriber::Lag])
@@ -255,8 +225,7 @@ where
 
         sqlx::query_with::<DB, _>(&sql, values)
             .execute(&self.0)
-            .await
-            .map_err(|err| SubscribeError::Unknown(err.into()))?;
+            .await?;
 
         Ok(())
     }
@@ -315,16 +284,11 @@ where
         Ok(())
     }
 
-    async fn acknowledge(
-        &self,
-        key: String,
-        cursor: Value,
-        lag: u64,
-    ) -> Result<(), AcknowledgeError> {
+    async fn acknowledge(&self, key: String, cursor: Value, lag: u64) -> anyhow::Result<()> {
         let statement = Query::update()
             .table(Subscriber::Table)
             .values([
-                (Subscriber::Cursor, cursor.to_string().into()),
+                (Subscriber::Cursor, cursor.0.into()),
                 (Subscriber::Lag, lag.into()),
                 (Subscriber::UpdatedAt, Expr::current_timestamp()),
             ])
@@ -335,8 +299,7 @@ where
 
         sqlx::query_with::<DB, _>(&sql, values)
             .execute(&self.0)
-            .await
-            .map_err(|err| AcknowledgeError::Unknown(err.into()))?;
+            .await?;
 
         Ok(())
     }
@@ -404,7 +367,7 @@ impl Reader {
     pub async fn execute<'e, 'c: 'e, DB, O, E>(
         &mut self,
         executor: E,
-    ) -> Result<ReadResult<O>, ReadError>
+    ) -> anyhow::Result<ReadResult<O>>
     where
         DB: Database,
         E: 'e + sqlx::Executor<'c, Database = DB>,
@@ -430,8 +393,7 @@ impl Reader {
 
         let mut rows = sqlx::query_as_with::<DB, O, _>(&sql, values)
             .fetch_all(executor)
-            .await
-            .map_err(|err| ReadError::Unknown(err.into()))?;
+            .await?;
 
         let has_more = rows.len() > limit as usize;
         if has_more {
@@ -472,7 +434,9 @@ impl Reader {
         Ok(ReadResult { edges, page_info })
     }
 
-    fn build_reader<O: Cursor, B: Bind<Cursor = O>>(&mut self) -> Result<u16, ReadError>
+    fn build_reader<O: Cursor, B: Bind<Cursor = O>>(
+        &mut self,
+    ) -> Result<u16, bincode::error::DecodeError>
     where
         B::T: Clone,
         <<B as Bind>::I as IntoIterator>::IntoIter: DoubleEndedIterator,
@@ -490,7 +454,10 @@ impl Reader {
         Ok(limit)
     }
 
-    fn build_reader_where<O, B>(&mut self, cursor: &Value) -> Result<(), ReadError>
+    fn build_reader_where<O, B>(
+        &mut self,
+        cursor: &Value,
+    ) -> Result<(), bincode::error::DecodeError>
     where
         O: Cursor,
         B: Bind<Cursor = O>,
@@ -589,7 +556,7 @@ impl Bind for crate::Event {
             cursor.t.into(),
             cursor.s.into(),
             cursor.v.into(),
-            cursor.i.to_string().into(),
+            cursor.i.into(),
         ]
     }
 }
