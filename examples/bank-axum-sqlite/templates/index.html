@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+
+{% block title %}Home - Evento Bank{% endblock %}
+
+{% block content %}
+<div class="card">
+    <h2>Welcome to Evento Bank</h2>
+    <p>A demo application showcasing:</p>
+    <ul style="margin: 1rem 0; padding-left: 1.5rem;">
+        <li><strong>Evento</strong> - Event sourcing library</li>
+        <li><strong>Axum</strong> - Web framework</li>
+        <li><strong>Askama</strong> - Type-safe templates</li>
+        <li><strong>SQLite</strong> - In-memory database</li>
+    </ul>
+    <p style="margin-top: 1rem;">
+        <a href="/accounts/new" class="btn">Create Your First Account</a>
+        <a href="/accounts" class="btn" style="background: #6b7280;">View Accounts</a>
+    </p>
+</div>
+
+<div class="card">
+    <h2>How It Works</h2>
+    <p>This application uses event sourcing to track all changes to bank accounts:</p>
+    <ol style="margin: 1rem 0; padding-left: 1.5rem;">
+        <li>Every action (deposit, withdrawal, transfer) creates an event</li>
+        <li>Events are stored in SQLite and never deleted</li>
+        <li>Account state is rebuilt by replaying events</li>
+        <li>Full audit trail is maintained automatically</li>
+    </ol>
+</div>
+{% endblock %}
