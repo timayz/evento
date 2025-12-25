@@ -1,3 +1,82 @@
+//! Core types and traits for the Evento event sourcing library.
+//!
+//! This crate provides the foundational abstractions for building event-sourced applications
+//! with Evento. It defines the core traits, types, and builders used throughout the framework.
+//!
+//! # Features
+//!
+//! - **`macro`** (default) - Procedural macros from `evento-macro`
+//! - **`group`** - Multi-executor support via `EventoGroup`
+//! - **`rw`** - Read-write split executor pattern via `Rw`
+//! - **`sqlite`**, **`mysql`**, **`postgres`** - Database support via sqlx
+//!
+//! # Core Concepts
+//!
+//! ## Events
+//!
+//! Events are immutable facts that represent something that happened in your domain.
+//! The [`Event`] struct stores serialized event data with metadata:
+//!
+//! ```rust,ignore
+//! // Define events using the aggregator macro
+//! #[evento::aggregator]
+//! pub enum BankAccount {
+//!     AccountOpened { owner_id: String, initial_balance: i64 },
+//!     MoneyDeposited { amount: i64 },
+//! }
+//! ```
+//!
+//! ## Executor
+//!
+//! The [`Executor`] trait abstracts event storage and retrieval. Implementations
+//! handle persisting events, querying, and managing subscriptions.
+//!
+//! ## Aggregator Builder
+//!
+//! Use [`create()`] or [`aggregator()`] to build and commit events:
+//!
+//! ```rust,ignore
+//! let id = evento::create()
+//!     .event(&AccountOpened { owner_id: "user1".into(), initial_balance: 1000 })?
+//!     .metadata(&metadata)?
+//!     .commit(&executor)
+//!     .await?;
+//! ```
+//!
+//! ## Projections
+//!
+//! Build read models by subscribing to events. See the [`projection`] module.
+//!
+//! ## Cursor-based Pagination
+//!
+//! GraphQL-style pagination for querying events. See the [`cursor`] module.
+//!
+//! # Modules
+//!
+//! - [`context`] - Type-safe request context for storing arbitrary data
+//! - [`cursor`] - Cursor-based pagination types and traits
+//! - [`metadata`] - Standard event metadata types
+//! - [`projection`] - Projections, subscriptions, and event handlers
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! use evento::{create, Executor};
+//!
+//! // Create and persist an event
+//! let id = create()
+//!     .event(&MyEvent { ... })?
+//!     .commit(&executor)
+//!     .await?;
+//!
+//! // Query events with pagination
+//! let events = executor.read(
+//!     Some(vec![ReadAggregator::id("myapp/User", &user_id)]),
+//!     None,
+//!     Args::forward(10, None),
+//! ).await?;
+//! ```
+
 mod aggregator;
 pub mod context;
 pub mod cursor;
@@ -17,7 +96,10 @@ use ulid::Ulid;
 
 use crate::cursor::Cursor;
 
-/// Cursor for event pagination and positioning
+/// Cursor data for event pagination.
+///
+/// Used internally for base64-encoded cursor values in paginated queries.
+/// Contains the essential fields needed to uniquely identify an event's position.
 #[derive(Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct EventCursor {
     /// Event ID (ULID string)
@@ -26,9 +108,33 @@ pub struct EventCursor {
     pub v: u16,
     /// Event timestamp (Unix timestamp in seconds)
     pub t: u64,
+    /// Sub-second precision (milliseconds)
     pub s: u32,
 }
 
+/// A stored event in the event store.
+///
+/// Events are immutable records of facts that occurred in your domain.
+/// They contain serialized data and metadata, along with positioning
+/// information for the aggregate they belong to.
+///
+/// # Fields
+///
+/// - `id` - Unique event identifier (ULID format for time-ordering)
+/// - `aggregator_id` - The aggregate instance this event belongs to
+/// - `aggregator_type` - Type name like `"myapp/BankAccount"`
+/// - `version` - Sequence number within the aggregate (for optimistic concurrency)
+/// - `name` - Event type name like `"AccountOpened"`
+/// - `routing_key` - Optional key for event distribution/partitioning
+/// - `data` - Serialized event payload (rkyv format)
+/// - `metadata` - Serialized metadata (rkyv format)
+/// - `timestamp` - When the event occurred (Unix seconds)
+/// - `timestamp_subsec` - Sub-second precision (milliseconds)
+///
+/// # Serialization
+///
+/// Event data and metadata are serialized using [rkyv](https://rkyv.org/) for
+/// zero-copy deserialization. Use [`projection::EventData`] to deserialize.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Event {
     /// Unique event identifier (ULID)
@@ -49,7 +155,7 @@ pub struct Event {
     pub metadata: Vec<u8>,
     /// Unix timestamp when the event occurred (seconds)
     pub timestamp: u64,
-    /// Unix timestamp when the event occurred (subsec millis)
+    /// Sub-second precision (milliseconds)
     pub timestamp_subsec: u32,
 }
 

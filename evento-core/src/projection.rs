@@ -1,3 +1,42 @@
+//! Projections and event subscriptions.
+//!
+//! This module provides the core building blocks for event sourcing:
+//! - Projections that build read models from events
+//! - Subscriptions that continuously process events
+//! - Loading aggregate state from event streams
+//!
+//! # Key Types
+//!
+//! - [`Projection`] - Defines handlers for building projections
+//! - [`LoadBuilder`] - Loads aggregate state from events
+//! - [`SubscriptionBuilder`] - Builds continuous event subscriptions
+//! - [`Subscription`] - Handle to a running subscription
+//! - [`EventData`] - Typed event with deserialized data and metadata
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! use evento::projection::Projection;
+//!
+//! // Define a projection with event handlers
+//! let projection = Projection::<AccountView, _>::new("accounts")
+//!     .handler(account_opened)
+//!     .handler(money_deposited);
+//!
+//! // Load aggregate state
+//! let result = projection
+//!     .load::<Account>("account-123")
+//!     .execute(&executor)
+//!     .await?;
+//!
+//! // Or start a subscription
+//! let subscription = projection
+//!     .subscription()
+//!     .routing_key("accounts")
+//!     .start(&executor)
+//!     .await?;
+//! ```
+
 use std::{
     collections::HashMap,
     future::Future,
@@ -12,15 +51,45 @@ use backon::{ExponentialBuilder, Retryable};
 
 use crate::{context, cursor::Args, Executor, ReadAggregator};
 
+/// Filter for events by routing key.
+///
+/// Routing keys allow partitioning events for parallel processing
+/// or filtering subscriptions to specific event streams.
 #[derive(Clone)]
 pub enum RoutingKey {
+    /// Match all events regardless of routing key
     All,
+    /// Match events with a specific routing key (or no key if `None`)
     Value(Option<String>),
 }
 
+/// Handler context providing access to executor and shared data.
+///
+/// `Context` wraps an [`RwContext`](crate::context::RwContext) for type-safe
+/// data storage and provides access to the executor for database operations.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// #[evento::handler]
+/// async fn my_handler<E: Executor>(
+///     event: Event<MyEventData>,
+///     action: Action<'_, MyView, E>,
+/// ) -> anyhow::Result<()> {
+///     if let Action::Handle(ctx) = action {
+///         // Access shared data
+///         let config: Data<AppConfig> = ctx.extract();
+///
+///         // Use executor for queries
+///         let events = ctx.executor.read(...).await?;
+///     }
+///     Ok(())
+/// }
+/// ```
 #[derive(Clone)]
 pub struct Context<'a, E: Executor> {
     context: context::RwContext,
+    /// Reference to the executor for database operations
     pub executor: &'a E,
 }
 
@@ -32,36 +101,130 @@ impl<'a, E: Executor> Deref for Context<'a, E> {
     }
 }
 
+/// Trait for aggregate types.
+///
+/// Aggregates are the root entities in event sourcing. Each aggregate
+/// type has a unique identifier string used for event storage and routing.
+///
+/// This trait is typically derived using the `#[evento::aggregator]` macro.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// #[evento::aggregator("myapp/Account")]
+/// #[derive(Default)]
+/// pub struct Account {
+///     pub balance: i64,
+///     pub owner: String,
+/// }
+/// ```
 pub trait Aggregator: Default {
+    /// Returns the unique type identifier for this aggregate (e.g., "myapp/Account")
     fn aggregator_type() -> &'static str;
 }
 
+/// Trait for event types.
+///
+/// Events represent state changes that have occurred. Each event type
+/// has a name and belongs to an aggregator type.
+///
+/// This trait is typically derived using the `#[evento::aggregator]` macro.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// #[evento::aggregator("myapp/Account")]
+/// #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+/// pub struct AccountOpened {
+///     pub owner: String,
+/// }
+/// ```
 pub trait Event: Aggregator {
+    /// Returns the event name (e.g., "AccountOpened")
     fn event_name() -> &'static str;
 }
 
+/// Trait for event handlers.
+///
+/// Handlers process events in two modes:
+/// - `handle`: For subscriptions that perform side effects (send emails, update read models)
+/// - `apply`: For loading aggregate state by replaying events
+///
+/// This trait is typically implemented via the `#[evento::handler]` macro.
 pub trait Handler<P: 'static, E: Executor>: Sync + Send {
+    /// Handles an event during subscription processing.
+    ///
+    /// This is called when processing events in a subscription context,
+    /// where side effects like database updates or API calls are appropriate.
     fn handle<'a>(
         &'a self,
         context: &'a Context<'a, E>,
         event: &'a crate::Event,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>>;
 
+    /// Applies an event to build projection state.
+    ///
+    /// This is called when loading aggregate state by replaying events.
+    /// It should be a pure function that modifies the projection without side effects.
     fn apply<'a>(
         &'a self,
         projection: &'a mut P,
         event: &'a crate::Event,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>>;
 
+    /// Returns the aggregator type this handler processes.
     fn aggregator_type(&self) -> &'static str;
+    /// Returns the event name this handler processes.
     fn event_name(&self) -> &'static str;
 }
 
+/// Action passed to event handlers.
+///
+/// Determines whether the handler should apply state changes or
+/// handle the event with side effects.
 pub enum Action<'a, P: 'static, E: Executor> {
+    /// Apply event to projection state (for loading)
     Apply(&'a mut P),
+    /// Handle event with context (for subscriptions)
     Handle(&'a Context<'a, E>),
 }
 
+/// Typed event with deserialized data and metadata.
+///
+/// `EventData` wraps a raw [`Event`](crate::Event) and provides typed access
+/// to the deserialized event data and metadata. It implements `Deref` to
+/// provide access to the underlying event fields (id, timestamp, version, etc.).
+///
+/// # Type Parameters
+///
+/// - `D`: The event data type (e.g., `AccountOpened`)
+/// - `M`: The metadata type (defaults to `bool` for no metadata)
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use evento::metadata::Event;
+///
+/// #[evento::handler]
+/// async fn handle_deposit<E: Executor>(
+///     event: Event<MoneyDeposited>,
+///     action: Action<'_, AccountView, E>,
+/// ) -> anyhow::Result<()> {
+///     // Access typed data
+///     println!("Amount: {}", event.data.amount);
+///
+///     // Access metadata
+///     if let Ok(user) = event.metadata.user() {
+///         println!("By user: {}", user);
+///     }
+///
+///     // Access underlying event fields via Deref
+///     println!("Event ID: {}", event.id);
+///     println!("Version: {}", event.version);
+///
+///     Ok(())
+/// }
+/// ```
 pub struct EventData<D, M = bool> {
     event: crate::Event,
     /// The typed event data
@@ -114,12 +277,45 @@ where
     }
 }
 
+/// Container for event handlers that build a projection.
+///
+/// A `Projection` groups related event handlers together and provides
+/// methods to load aggregate state or create subscriptions.
+///
+/// # Type Parameters
+///
+/// - `P`: The projection/view type being built
+/// - `E`: The executor type for database operations
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let projection = Projection::<AccountView, _>::new("accounts")
+///     .handler(account_opened)
+///     .handler(money_deposited)
+///     .handler(money_withdrawn);
+///
+/// // Use for loading state
+/// let state = projection.clone()
+///     .load::<Account>("account-123")
+///     .execute(&executor)
+///     .await?;
+///
+/// // Or create a subscription
+/// let sub = projection
+///     .subscription()
+///     .start(&executor)
+///     .await?;
+/// ```
 pub struct Projection<P: 'static, E: Executor> {
     key: String,
     handlers: HashMap<String, Box<dyn Handler<P, E>>>,
 }
 
 impl<P: 'static, E: Executor> Projection<P, E> {
+    /// Creates a new projection with the given key.
+    ///
+    /// The key is used as the subscription identifier for cursor tracking.
     pub fn new(key: impl Into<String>) -> Self {
         Self {
             key: key.into(),
@@ -127,6 +323,11 @@ impl<P: 'static, E: Executor> Projection<P, E> {
         }
     }
 
+    /// Registers an event handler with this projection.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a handler for the same event type is already registered.
     pub fn handler<H: Handler<P, E> + 'static>(mut self, h: H) -> Self {
         let key = format!("{}_{}", h.aggregator_type(), h.event_name());
         if self.handlers.insert(key.to_owned(), Box::new(h)).is_some() {
@@ -135,6 +336,14 @@ impl<P: 'static, E: Executor> Projection<P, E> {
         self
     }
 
+    /// Creates a builder for loading aggregate state.
+    ///
+    /// This consumes the projection and returns a [`LoadBuilder`] configured
+    /// to load the state for the specified aggregate.
+    ///
+    /// # Type Parameters
+    ///
+    /// - `A`: The aggregate type to load
     pub fn load<A: Aggregator>(self, id: impl Into<String>) -> LoadBuilder<P, E>
     where
         P: Snapshot + Default,
@@ -152,6 +361,10 @@ impl<P: 'static, E: Executor> Projection<P, E> {
         }
     }
 
+    /// Creates a builder for a continuous event subscription.
+    ///
+    /// This consumes the projection and returns a [`SubscriptionBuilder`]
+    /// that can be configured and started.
     pub fn subscription(self) -> SubscriptionBuilder<P, E> {
         SubscriptionBuilder {
             key: self.key.to_owned(),
@@ -167,10 +380,35 @@ impl<P: 'static, E: Executor> Projection<P, E> {
     }
 }
 
+/// Result of loading an aggregate's state.
+///
+/// Contains the rebuilt projection state along with the current version
+/// and routing key. Implements `Deref` and `DerefMut` for transparent
+/// access to the inner item.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let result: LoadResult<AccountView> = projection
+///     .load::<Account>("account-123")
+///     .execute(&executor)
+///     .await?
+///     .expect("Account not found");
+///
+/// // Access inner item via Deref
+/// println!("Balance: {}", result.balance);
+///
+/// // Access metadata
+/// println!("Version: {}", result.version);
+/// println!("Routing key: {:?}", result.routing_key);
+/// ```
 #[derive(Debug, Clone, Default)]
 pub struct LoadResult<A> {
+    /// The loaded projection/view state
     pub item: A,
+    /// Current version of the aggregate
     pub version: u16,
+    /// Routing key for the aggregate (if set)
     pub routing_key: Option<String>,
 }
 
@@ -187,15 +425,54 @@ impl<A> DerefMut for LoadResult<A> {
     }
 }
 
+/// Type alias for an optional load result.
 pub type OptionLoadResult<A> = Option<LoadResult<A>>;
 
+/// Trait for types that can be restored from snapshots.
+///
+/// Snapshots provide a performance optimization by storing pre-computed
+/// state, avoiding the need to replay all events from the beginning.
+///
+/// This trait is typically implemented via the `#[evento::snapshot]` macro.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// #[evento::snapshot]
+/// #[derive(Default)]
+/// pub struct AccountView {
+///     pub balance: i64,
+///     pub owner: String,
+/// }
+///
+/// // The macro generates the restore implementation that loads
+/// // from a snapshot table if available
+/// ```
 pub trait Snapshot: Sized {
+    /// Restores state from a snapshot if available.
+    ///
+    /// Returns `None` if no snapshot exists for the given ID.
     fn restore<'a>(
         context: &'a context::RwContext,
         id: String,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<OptionLoadResult<Self>>> + Send + 'a>>;
 }
 
+/// Builder for loading aggregate state from events.
+///
+/// Created via [`Projection::load`], this builder configures how to
+/// load an aggregate's state by replaying events.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let result = projection
+///     .load::<Account>("account-123")
+///     .data(app_config)  // Add shared data
+///     .aggregator::<User>("user-456")  // Add related aggregate
+///     .execute(&executor)
+///     .await?;
+/// ```
 pub struct LoadBuilder<P: Snapshot + Default + 'static, E: Executor> {
     key: String,
     id: String,
@@ -205,12 +482,18 @@ pub struct LoadBuilder<P: Snapshot + Default + 'static, E: Executor> {
 }
 
 impl<P: Snapshot + Default + 'static, E: Executor> LoadBuilder<P, E> {
+    /// Adds shared data to the load context.
+    ///
+    /// Data added here is accessible in handlers via the context.
     pub fn data<D: Send + Sync + 'static>(&mut self, v: D) -> &mut Self {
         self.context.insert(v);
 
         self
     }
 
+    /// Adds a related aggregate to load events from.
+    ///
+    /// Use this when the projection needs events from multiple aggregates.
     pub fn aggregator<A: Aggregator>(&mut self, id: impl Into<String>) -> &mut Self {
         self.aggregators
             .insert(A::aggregator_type().to_owned(), id.into());
@@ -218,6 +501,10 @@ impl<P: Snapshot + Default + 'static, E: Executor> LoadBuilder<P, E> {
         self
     }
 
+    /// Executes the load operation, returning the rebuilt state.
+    ///
+    /// Returns `None` if no events exist for the aggregate.
+    /// Returns `Err` if there are too many events to process in one batch.
     pub async fn execute(&self, executor: &E) -> anyhow::Result<Option<LoadResult<P>>> {
         let context = Context {
             context: self.context.clone(),
@@ -294,6 +581,27 @@ impl<P: Snapshot + Default + 'static, E: Executor> LoadBuilder<P, E> {
     }
 }
 
+/// Builder for creating event subscriptions.
+///
+/// Created via [`Projection::subscription`], this builder configures
+/// a continuous event processing subscription with retry logic,
+/// routing key filtering, and graceful shutdown support.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let subscription = projection
+///     .subscription()
+///     .routing_key("accounts")
+///     .chunk_size(100)
+///     .retry(5)
+///     .delay(Duration::from_secs(10))
+///     .start(&executor)
+///     .await?;
+///
+/// // Later, gracefully shutdown
+/// subscription.shutdown().await?;
+/// ```
 pub struct SubscriptionBuilder<P: 'static, E: Executor> {
     key: String,
     handlers: HashMap<String, Box<dyn Handler<P, E>>>,
@@ -307,30 +615,46 @@ pub struct SubscriptionBuilder<P: 'static, E: Executor> {
 }
 
 impl<P, E: Executor + 'static> SubscriptionBuilder<P, E> {
+    /// Allows the subscription to continue after handler failures.
+    ///
+    /// By default, subscriptions stop on the first error. With this flag,
+    /// errors are logged but processing continues.
     pub fn accept_failure(mut self) -> Self {
         self.is_accept_failure = true;
 
         self
     }
 
+    /// Sets the number of events to process per batch.
+    ///
+    /// Default is 300.
     pub fn chunk_size(mut self, v: u16) -> Self {
         self.chunk_size = v;
 
         self
     }
 
+    /// Sets a delay before starting the subscription.
+    ///
+    /// Useful for staggering subscription starts in multi-node deployments.
     pub fn delay(mut self, v: Duration) -> Self {
         self.delay = Some(v);
 
         self
     }
 
+    /// Filters events by routing key.
+    ///
+    /// Only events with the matching routing key will be processed.
     pub fn routing_key(mut self, v: impl Into<String>) -> Self {
         self.routing_key = RoutingKey::Value(Some(v.into()));
 
         self
     }
 
+    /// Sets the maximum number of retries on failure.
+    ///
+    /// Uses exponential backoff. Default is 30.
     pub fn retry(mut self, v: u8) -> Self {
         self.retry = Some(v);
 
@@ -343,12 +667,14 @@ impl<P, E: Executor + 'static> SubscriptionBuilder<P, E> {
         self
     }
 
+    /// Processes all events regardless of routing key.
     pub fn all(mut self) -> Self {
         self.routing_key = RoutingKey::All;
 
         self
     }
 
+    /// Adds a related aggregate to process events from.
     pub fn aggregator<A: Aggregator>(mut self, id: impl Into<String>) -> Self {
         self.aggregators
             .insert(A::aggregator_type().to_owned(), id.into());
@@ -462,6 +788,9 @@ impl<P, E: Executor + 'static> SubscriptionBuilder<P, E> {
         }
     }
 
+    /// Starts the subscription without retry logic.
+    ///
+    /// Equivalent to calling `start()` with retries disabled.
     pub async fn unretry_start(self, executor: &E) -> anyhow::Result<Subscription>
     where
         E: Clone,
@@ -469,6 +798,10 @@ impl<P, E: Executor + 'static> SubscriptionBuilder<P, E> {
         self.without_retry().start(executor).await
     }
 
+    /// Starts a continuous background subscription.
+    ///
+    /// Returns a [`Subscription`] handle that can be used for graceful shutdown.
+    /// The subscription runs in a spawned tokio task and polls for new events.
     pub async fn start(self, executor: &E) -> anyhow::Result<Subscription>
     where
         E: Clone,
@@ -551,10 +884,17 @@ impl<P, E: Executor + 'static> SubscriptionBuilder<P, E> {
         })
     }
 
+    /// Executes the subscription once without retry logic.
+    ///
+    /// Processes all pending events and returns. Does not poll for new events.
     pub async fn unretry_execute(self, executor: &E) -> anyhow::Result<()> {
         self.without_retry().execute(executor).await
     }
 
+    /// Executes the subscription once, processing all pending events.
+    ///
+    /// Unlike `start()`, this does not run continuously. It processes
+    /// all currently pending events and returns.
     pub async fn execute(&self, executor: &E) -> anyhow::Result<()> {
         let id = Ulid::new();
 
@@ -592,14 +932,37 @@ impl<P, E: Executor + 'static> SubscriptionBuilder<P, E> {
     }
 }
 
+/// Handle to a running event subscription.
+///
+/// Returned by [`SubscriptionBuilder::start`], this handle provides
+/// the subscription ID and a method for graceful shutdown.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let subscription = projection
+///     .subscription()
+///     .start(&executor)
+///     .await?;
+///
+/// println!("Started subscription: {}", subscription.id);
+///
+/// // On application shutdown
+/// subscription.shutdown().await?;
+/// ```
 #[derive(Debug)]
 pub struct Subscription {
+    /// Unique ID for this subscription instance
     pub id: Ulid,
     task_handle: tokio::task::JoinHandle<()>,
     shutdown_tx: tokio::sync::oneshot::Sender<()>,
 }
 
 impl Subscription {
+    /// Gracefully shuts down the subscription.
+    ///
+    /// Signals the subscription to stop and waits for it to finish
+    /// processing the current event before returning.
     pub async fn shutdown(self) -> Result<(), tokio::task::JoinError> {
         let _ = self.shutdown_tx.send(());
 

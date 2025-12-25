@@ -1,3 +1,31 @@
+//! Type-safe context for storing request-scoped data.
+//!
+//! This module provides type-erased containers for storing arbitrary data
+//! during event processing. Values are stored and retrieved by their Rust type.
+//!
+//! # Types
+//!
+//! - [`Context`] - Single-threaded type map (not `Send`/`Sync`)
+//! - [`RwContext`] - Thread-safe version wrapped in `Arc<RwLock<_>>`
+//! - [`Data`] - Arc-wrapped shared data for cloneable access
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! use evento::context::{RwContext, Data};
+//!
+//! // Create a context
+//! let ctx = RwContext::new();
+//!
+//! // Store data by type
+//! ctx.insert(Data::new(MyAppState { ... }));
+//! ctx.insert(42u32);
+//!
+//! // Retrieve data by type
+//! let state: Data<MyAppState> = ctx.extract();
+//! let number: u32 = ctx.get().unwrap();
+//! ```
+
 use serde::Serialize;
 use std::{
     any::{type_name, Any, TypeId},
@@ -29,12 +57,25 @@ impl Hasher for NoOpHasher {
     }
 }
 
-/// A type map for request extensions.
+/// A type map for storing request-scoped data.
 ///
-/// All entries into this map must be owned types (or static references).
+/// `Context` stores values by their Rust type, allowing type-safe retrieval.
+/// All entries must be owned types that are `Send + Sync + 'static`.
+///
+/// For thread-safe access, use [`RwContext`] instead.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let mut ctx = Context::new();
+/// ctx.insert(42u32);
+/// ctx.insert("hello".to_string());
+///
+/// assert_eq!(ctx.get::<u32>(), Some(&42));
+/// assert_eq!(ctx.get::<String>(), Some(&"hello".to_string()));
+/// ```
 #[derive(Default)]
 pub struct Context {
-    /// Use AHasher with a std HashMap with for faster lookups on the small `TypeId` keys.
     map: HashMap<TypeId, Box<dyn Any + Send + Sync>, BuildHasherDefault<NoOpHasher>>,
 }
 
@@ -124,11 +165,35 @@ fn downcast_owned<T: Send + Sync + 'static>(boxed: Box<dyn Any + Send + Sync>) -
     boxed.downcast().ok().map(|boxed| *boxed)
 }
 
+/// Arc-wrapped shared data for use in contexts.
+///
+/// `Data<T>` wraps a value in an `Arc` for cheap cloning and sharing
+/// across async tasks. It implements `Deref` for transparent access.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use evento::context::Data;
+///
+/// struct AppConfig {
+///     database_url: String,
+/// }
+///
+/// let config = Data::new(AppConfig {
+///     database_url: "postgres://...".into(),
+/// });
+///
+/// // Clone is cheap (just Arc clone)
+/// let config2 = config.clone();
+///
+/// // Access inner value via Deref
+/// println!("{}", config.database_url);
+/// ```
 #[derive(Debug)]
 pub struct Data<T: ?Sized>(Arc<T>);
 
 impl<T> Data<T> {
-    /// Create new `Data` instance.
+    /// Create new `Data` instance wrapping the value in an `Arc`.
     pub fn new(state: T) -> Data<T> {
         Data(Arc::new(state))
     }
@@ -178,6 +243,31 @@ where
     }
 }
 
+/// Thread-safe context for storing request-scoped data.
+///
+/// `RwContext` wraps a [`Context`] in `Arc<RwLock<_>>` for safe concurrent access.
+/// It can be cloned cheaply and shared across async tasks.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use evento::context::RwContext;
+///
+/// let ctx = RwContext::new();
+///
+/// // Insert data (acquires write lock)
+/// ctx.insert(42u32);
+///
+/// // Get data (acquires read lock, clones the value)
+/// let value: Option<u32> = ctx.get();
+///
+/// // Extract panics if not found (useful for required dependencies)
+/// let value: u32 = ctx.extract();
+/// ```
+///
+/// # Panics
+///
+/// Methods will panic if the internal `RwLock` is poisoned.
 pub struct RwContext(Arc<RwLock<Context>>);
 
 impl Default for RwContext {

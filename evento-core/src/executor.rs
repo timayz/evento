@@ -1,3 +1,17 @@
+//! Event storage and retrieval abstraction.
+//!
+//! This module defines the [`Executor`] trait, the core abstraction for event
+//! persistence. Implementations handle storing events, querying, and managing
+//! subscriptions.
+//!
+//! # Types
+//!
+//! - [`Executor`] - Core trait for event storage backends
+//! - [`Evento`] - Type-erased wrapper around any executor
+//! - [`EventoGroup`] - Multi-executor aggregation (feature: `group`)
+//! - [`Rw`] - Read-write split executor (feature: `rw`)
+//! - [`ReadAggregator`] - Query filter for reading events
+
 use std::{hash::Hash, sync::Arc};
 use ulid::Ulid;
 
@@ -6,10 +20,29 @@ use crate::{
     Event, RoutingKey, WriteError,
 };
 
+/// Filter for querying events by aggregator.
+///
+/// Use the constructor methods to create filters:
+///
+/// # Example
+///
+/// ```rust,ignore
+/// // All events for an aggregator type
+/// let filter = ReadAggregator::aggregator("myapp/User");
+///
+/// // Events for a specific aggregate instance
+/// let filter = ReadAggregator::id("myapp/User", "user-123");
+///
+/// // Events of a specific type
+/// let filter = ReadAggregator::event("myapp/User", "UserCreated");
+/// ```
 #[derive(Clone, PartialEq, Eq)]
 pub struct ReadAggregator {
+    /// Aggregator type (e.g., "myapp/User")
     pub aggregator_type: String,
+    /// Optional specific aggregate ID
     pub aggregator_id: Option<String>,
+    /// Optional event name filter
     pub name: Option<String>,
 }
 
@@ -59,14 +92,39 @@ impl Hash for ReadAggregator {
     }
 }
 
+/// Core trait for event storage backends.
+///
+/// Implementations handle persisting events, querying, and managing subscriptions.
+/// The main implementation is [`evento_sql::Sql`](../evento_sql/struct.Sql.html).
+///
+/// # Methods
+///
+/// - `write` - Persist events atomically
+/// - `read` - Query events with filtering and pagination
+/// - `get_subscriber_cursor` - Get subscription position
+/// - `is_subscriber_running` - Check if subscription is active
+/// - `upsert_subscriber` - Create/update subscription
+/// - `acknowledge` - Update subscription cursor
 #[async_trait::async_trait]
 pub trait Executor: Send + Sync + 'static {
+    /// Persists events atomically.
+    ///
+    /// Returns `WriteError::InvalidOriginalVersion` if version conflicts occur.
     async fn write(&self, events: Vec<Event>) -> Result<(), WriteError>;
+
+    /// Gets the current cursor position for a subscription.
     async fn get_subscriber_cursor(&self, key: String) -> anyhow::Result<Option<Value>>;
+
+    /// Checks if a subscription is running with the given worker ID.
     async fn is_subscriber_running(&self, key: String, worker_id: Ulid) -> anyhow::Result<bool>;
+
+    /// Creates or updates a subscription record.
     async fn upsert_subscriber(&self, key: String, worker_id: Ulid) -> anyhow::Result<()>;
+
+    /// Updates subscription cursor after processing events.
     async fn acknowledge(&self, key: String, cursor: Value, lag: u64) -> anyhow::Result<()>;
 
+    /// Queries events with filtering and pagination.
     async fn read(
         &self,
         aggregators: Option<Vec<ReadAggregator>>,
@@ -75,6 +133,20 @@ pub trait Executor: Send + Sync + 'static {
     ) -> anyhow::Result<ReadResult<Event>>;
 }
 
+/// Type-erased wrapper around any [`Executor`] implementation.
+///
+/// `Evento` wraps an executor in `Arc<Box<dyn Executor>>` for dynamic dispatch.
+/// This allows storing different executor implementations in the same collection.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let sql_executor: Sql<sqlx::Sqlite> = pool.into();
+/// let evento = Evento::new(sql_executor);
+///
+/// // Use like any executor
+/// evento.write(events).await?;
+/// ```
 pub struct Evento(Arc<Box<dyn Executor>>);
 
 impl Clone for Evento {
@@ -121,6 +193,12 @@ impl Evento {
     }
 }
 
+/// Multi-executor aggregation (requires `group` feature).
+///
+/// `EventoGroup` combines multiple executors into one. Reads query all executors
+/// and merge results; writes go only to the first executor.
+///
+/// Useful for aggregating events from multiple sources.
 #[cfg(feature = "group")]
 #[derive(Clone, Default)]
 pub struct EventoGroup {
@@ -189,6 +267,16 @@ impl Executor for EventoGroup {
     }
 }
 
+/// Read-write split executor (requires `rw` feature).
+///
+/// Separates read and write operations to different executors.
+/// Useful for CQRS patterns where read and write databases differ.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let rw: Rw<ReadReplica, Primary> = (read_executor, write_executor).into();
+/// ```
 #[cfg(feature = "rw")]
 pub struct Rw<R: Executor, W: Executor> {
     r: R,
