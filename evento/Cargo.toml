@@ -10,7 +10,7 @@ documentation = "https://docs.rs/evento"
 readme = "README.md"
 
 [dependencies]
-evento-core = { workspace = true, default-features = true }
+evento-core.workspace = true
 evento-sql = { workspace = true, optional = true }
 evento-sql-migrator = { workspace = true, optional = true }
 sqlx_migrator = { workspace = true, optional = true }

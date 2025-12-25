@@ -1,4 +1,3 @@
 
-// split evento into multi create like evento-core, evento-sqlx, evento-macro, evento. workspace deps
 // replace bincode by rkyv
 // internal pub sub for projection with mpsc chanel that send message if handler return Some(mesaage)
