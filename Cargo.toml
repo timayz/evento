@@ -18,11 +18,11 @@ repository = "https://github.com/timayz/evento"
 
 [workspace.dependencies]
 # Internal crates
-evento = { path = "./evento", version = "1.8.0" }
+evento = { path = "./evento" }
 evento-core = { path = "./evento-core" }
 evento-sql = { path = "./evento-sql" }
 evento-sql-migrator = { path = "./evento-sql-migrator" }
-evento-macro = { path = "./evento-macro", version = "1.8.0" }
+evento-macro = { path = "./evento-macro" }
 evento-fjall = { path = "./evento-fjall" }
 bank = { path = "./examples/bank" }
 

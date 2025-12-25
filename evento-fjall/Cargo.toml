@@ -10,7 +10,7 @@ documentation = "https://docs.rs/evento-fjall"
 readme = "README.md"
 
 [dependencies]
-evento-core.workspace = true
+evento-core = { path = "../evento-core" }
 anyhow.workspace = true
 rkyv.workspace = true
 async-trait.workspace = true

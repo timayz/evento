@@ -13,7 +13,7 @@ readme = "README.md"
 serde.workspace = true
 ulid.workspace = true
 tokio.workspace = true
-evento-macro = { workspace = true, optional = true }
+evento-macro = { path = "../evento-macro", optional = true }
 anyhow.workspace = true
 rkyv.workspace = true
 thiserror.workspace = true
