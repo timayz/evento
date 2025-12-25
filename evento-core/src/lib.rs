@@ -18,12 +18,12 @@ use ulid::Ulid;
 use crate::cursor::Cursor;
 
 /// Cursor for event pagination and positioning
-#[derive(Debug, bincode::Encode, bincode::Decode)]
+#[derive(Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct EventCursor {
     /// Event ID (ULID string)
     pub i: String,
     /// Event version
-    pub v: i32,
+    pub v: u16,
     /// Event timestamp (Unix timestamp in seconds)
     pub t: u64,
     pub s: u32,
@@ -38,14 +38,14 @@ pub struct Event {
     /// Type name of the aggregate (e.g., "myapp/User")
     pub aggregator_type: String,
     /// Version number of the aggregate after this event
-    pub version: i32,
+    pub version: u16,
     /// Event type name
     pub name: String,
     /// Optional routing key for event distribution
     pub routing_key: Option<String>,
-    /// Serialized event data (bincode format)
+    /// Serialized event data (rkyv format)
     pub data: Vec<u8>,
-    /// Serialized event metadata (bincode format)
+    /// Serialized event metadata (rkyv format)
     pub metadata: Vec<u8>,
     /// Unix timestamp when the event occurred (seconds)
     pub timestamp: u64,
@@ -63,6 +63,30 @@ impl Cursor for Event {
             t: self.timestamp,
             s: self.timestamp_subsec,
         }
+    }
+
+    fn serialize_cursor(&self) -> Result<cursor::Value, cursor::CursorError> {
+        use base64::{alphabet, engine::general_purpose, engine::GeneralPurpose, Engine};
+
+        let cursor = self.serialize();
+        let encoded = rkyv::to_bytes::<rkyv::rancor::Error>(&cursor)
+            .map_err(|e| cursor::CursorError::Rkyv(e.to_string()))?;
+
+        let engine = GeneralPurpose::new(&alphabet::URL_SAFE, general_purpose::PAD);
+
+        Ok(cursor::Value(engine.encode(&encoded)))
+    }
+
+    fn deserialize_cursor(value: &cursor::Value) -> Result<Self::T, cursor::CursorError> {
+        use base64::{alphabet, engine::general_purpose, engine::GeneralPurpose, Engine};
+
+        let engine = GeneralPurpose::new(&alphabet::URL_SAFE, general_purpose::PAD);
+        let decoded = engine.decode(value)?;
+
+        let result = rkyv::from_bytes::<Self::T, rkyv::rancor::Error>(&decoded)
+            .map_err(|e| cursor::CursorError::Rkyv(e.to_string()))?;
+
+        Ok(result)
     }
 }
 
@@ -145,13 +169,14 @@ where
     fn from_row(row: &R) -> Result<Self, sqlx::Error> {
         let timestamp: i64 = sqlx::Row::try_get(row, "timestamp")?;
         let timestamp_subsec: i64 = sqlx::Row::try_get(row, "timestamp_subsec")?;
+        let version: i32 = sqlx::Row::try_get(row, "version")?;
 
         Ok(Event {
             id: Ulid::from_string(sqlx::Row::try_get(row, "id")?)
                 .map_err(|err| sqlx::Error::InvalidArgument(err.to_string()))?,
             aggregator_id: sqlx::Row::try_get(row, "aggregator_id")?,
             aggregator_type: sqlx::Row::try_get(row, "aggregator_type")?,
-            version: sqlx::Row::try_get(row, "version")?,
+            version: version as u16,
             name: sqlx::Row::try_get(row, "name")?,
             routing_key: sqlx::Row::try_get(row, "routing_key")?,
             data: sqlx::Row::try_get(row, "data")?,

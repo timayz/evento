@@ -1,6 +1,5 @@
 use crate::projection::EventData;
 
-use bincode::{Decode, Encode};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -10,14 +9,14 @@ pub enum MetadataError {
     NotFound,
 }
 
-#[derive(Encode, Decode, Clone)]
+#[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum MetadataUser {
     Anonyme,
     User(String),
     Root(String, String),
 }
 
-#[derive(Encode, Decode, Clone)]
+#[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct Metadata {
     pub id: String,
     pub user: MetadataUser,

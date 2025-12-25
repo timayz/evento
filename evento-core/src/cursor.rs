@@ -1,8 +1,3 @@
-use base64::{
-    alphabet,
-    engine::{general_purpose, GeneralPurpose},
-    Engine,
-};
 use serde::{Deserialize, Serialize};
 use std::ops::{Deref, DerefMut};
 use thiserror::Error;
@@ -76,30 +71,20 @@ impl AsRef<[u8]> for Value {
 }
 
 pub trait Cursor {
-    type T: bincode::Encode + bincode::Decode<()>;
+    type T;
 
     fn serialize(&self) -> Self::T;
+    fn serialize_cursor(&self) -> Result<Value, CursorError>;
+    fn deserialize_cursor(value: &Value) -> Result<Self::T, CursorError>;
+}
 
-    fn serialize_cursor(&self) -> Result<Value, bincode::error::EncodeError> {
-        let cursor = self.serialize();
+#[derive(Debug, Error)]
+pub enum CursorError {
+    #[error("base64 decode: {0}")]
+    Base64Decode(#[from] base64::DecodeError),
 
-        let config = bincode::config::standard();
-        let encoded = bincode::encode_to_vec(cursor, config)?;
-
-        let engine = GeneralPurpose::new(&alphabet::URL_SAFE, general_purpose::PAD);
-
-        Ok(Value(engine.encode(encoded)))
-    }
-
-    fn deserialize_cursor(value: &Value) -> Result<Self::T, bincode::error::DecodeError> {
-        let engine = GeneralPurpose::new(&alphabet::URL_SAFE, general_purpose::PAD);
-        let decoded = engine
-            .decode(value)
-            .map_err(|e| bincode::error::DecodeError::OtherString(e.to_string()))?;
-        let config = bincode::config::standard();
-
-        bincode::decode_from_slice(&decoded[..], config).map(|(decoded, _)| decoded)
-    }
+    #[error("rkyv: {0}")]
+    Rkyv(String),
 }
 
 #[derive(Default, Serialize, Deserialize, Clone)]
@@ -157,14 +142,8 @@ pub enum ReadError {
     #[error("{0}")]
     Unknown(#[from] anyhow::Error),
 
-    #[error("bincode.encode >> {0}")]
-    BincodeEncode(#[from] bincode::error::EncodeError),
-
-    #[error("bincode.decode >> {0}")]
-    BincodeDecode(#[from] bincode::error::DecodeError),
-
-    #[error("base64 decode: {0}")]
-    Base64Decode(#[from] base64::DecodeError),
+    #[error("cursor: {0}")]
+    Cursor(#[from] CursorError),
 }
 
 pub struct Reader<T> {

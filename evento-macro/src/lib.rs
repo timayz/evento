@@ -55,9 +55,9 @@ pub fn aggregator(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         // Mandatory + user derives
         let derives = if user_derives.is_empty() {
-            quote! { #[derive(Debug, Clone, PartialEq, Default, bincode::Encode, bincode::Decode)] }
+            quote! { #[derive(Debug, Clone, PartialEq, Default, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)] }
         } else {
-            quote! { #[derive(Debug, Clone, PartialEq, Default, bincode::Encode, bincode::Decode, #(#user_derives),*)] }
+            quote! { #[derive(Debug, Clone, PartialEq, Default, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, #(#user_derives),*)] }
         };
 
         let impl_event = quote! {
