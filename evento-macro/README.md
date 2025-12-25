@@ -1,142 +1,188 @@
-# Evento Macros
+# evento-macro
 
-[![Crates.io](https://img.shields.io/crates/v/evento-macro.svg)](https://crates.io/crates/evento-macro)
-[![Documentation](https://docs.rs/evento-macro/badge.svg)](https://docs.rs/evento-macro)
-[![License](https://img.shields.io/crates/l/evento-macro.svg)](https://github.com/timayz/evento/blob/main/LICENSE)
+Procedural macros for the [Evento](https://github.com/timayz/evento) event sourcing framework.
 
-Procedural macros for the [Evento](https://crates.io/crates/evento) event sourcing framework.
+## Overview
 
-This crate provides macros that simplify building event-sourced applications by automatically generating boilerplate code for aggregators and event handlers.
+This crate provides macros that eliminate boilerplate when building event-sourced applications. It generates trait implementations, handler structs, and serialization code automatically.
 
-More information about this crate can be found in the [crate documentation][docs].
+## Installation
+
+This crate is typically used through the main `evento` crate with the `macro` feature enabled (on by default):
+
+```toml
+[dependencies]
+evento = "1.8"
+```
+
+Or use this crate directly:
+
+```toml
+[dependencies]
+evento-macro = "1.8"
+```
+
+## Macros
+
+| Macro | Type | Purpose |
+|-------|------|---------|
+| `#[evento::aggregator]` | Attribute | Transform enum into event structs |
+| `#[evento::handler]` | Attribute | Create event handler from async function |
+| `#[evento::snapshot]` | Attribute | Implement snapshot restoration |
+| `#[evento::debug_handler]` | Attribute | Like `handler` with debug output |
+| `#[evento::debug_snapshot]` | Attribute | Like `snapshot` with debug output |
 
 ## Usage
 
-This crate is typically used through the main `evento` crate with the `macro` feature enabled (which is on by default):
+### Defining Events with `#[evento::aggregator]`
 
-```toml
-[dependencies]
-evento = "1.5"
-```
-
-Or explicitly:
-
-```toml
-[dependencies]
-evento = { version = "1.5", features = ["macro"] }
-```
-
-## Provided Macros
-
-### `#[evento::aggregator]`
-
-Automatically implements the `Aggregator` trait by generating event dispatching logic based on your handler methods.
+Transform an enum into individual event structs with all required trait implementations:
 
 ```rust
-use evento::{EventDetails, AggregatorName};
-use serde::{Deserialize, Serialize};
-use bincode::{Encode, Decode};
-
-#[derive(AggregatorName, Encode, Decode)]
-struct UserCreated {
-    name: String,
-    email: String,
-}
-
-#[derive(Default, Serialize, Deserialize, Encode, Decode, Clone, Debug)]
-struct User {
-    name: String,
-    email: String,
-}
-
 #[evento::aggregator]
-impl User {
-    async fn user_created(&mut self, event: EventDetails<UserCreated>) -> anyhow::Result<()> {
-        self.name = event.data.name;
-        self.email = event.data.email;
-        Ok(())
-    }
+pub enum BankAccount {
+    /// Event raised when a new bank account is opened
+    AccountOpened {
+        owner_id: String,
+        owner_name: String,
+        initial_balance: i64,
+    },
+
+    MoneyDeposited {
+        amount: i64,
+        transaction_id: String,
+        description: String,
+    },
+
+    MoneyWithdrawn {
+        amount: i64,
+        transaction_id: String,
+        description: String,
+    },
+
+    AccountClosed {
+        reason: String,
+        final_balance: i64,
+    },
 }
 ```
 
-The macro generates:
-- Implementation of `evento::Aggregator::aggregate` with event dispatching
-- Implementation of `evento::Aggregator::revision` based on a hash of handler methods
-- Implementation of `evento::AggregatorName` using the package name and struct name
+This generates:
 
-### `#[evento::handler(AggregateType)]`
+- Individual structs: `AccountOpened`, `MoneyDeposited`, `MoneyWithdrawn`, `AccountClosed`
+- `Aggregator` trait implementation (provides `aggregator_type()`)
+- `Event` trait implementation (provides `event_name()`)
+- Automatic derives: `Debug`, `Clone`, `PartialEq`, `Default`, and rkyv serialization
 
-Creates an event handler for use with event subscriptions.
+The aggregator type is formatted as `"{package_name}/{enum_name}"`, e.g., `"bank/BankAccount"`.
+
+#### Additional Derives
+
+Pass additional derives as arguments:
 
 ```rust
-use evento::{Context, EventDetails, Executor};
+#[evento::aggregator(serde::Serialize, serde::Deserialize)]
+pub enum MyEvents {
+    // variants...
+}
+```
 
-#[evento::handler(User)]
-async fn on_user_created<E: Executor>(
-    context: &Context<'_, E>,
-    event: EventDetails<UserCreated>,
+### Creating Handlers with `#[evento::handler]`
+
+Create event handlers for projections:
+
+```rust
+use evento::{Event, Executor};
+use evento::projection::Action;
+
+#[evento::handler]
+async fn handle_money_deposited<E: Executor>(
+    event: Event<MoneyDeposited>,
+    action: Action<'_, AccountBalanceView, E>,
 ) -> anyhow::Result<()> {
-    println!("User created: {}", event.data.name);
-    // Trigger side effects, send notifications, update read models, etc.
+    match action {
+        Action::Apply(row) => {
+            // Mutate projection state
+            row.balance += event.data.amount;
+        }
+        Action::Handle(_context) => {
+            // Handle side effects (notifications, external calls, etc.)
+        }
+    };
     Ok(())
 }
 
-// Use with subscription
-evento::subscribe("user-handlers")
-    .handler(on_user_created())
-    .run(&executor)
-    .await?;
+// Register with a projection
+let projection = Projection::new("account-balance")
+    .handler(handle_money_deposited())
+    .handler(handle_money_withdrawn())
+    .handler(handle_account_opened());
 ```
 
 The macro generates:
-- A struct implementing `evento::SubscribeHandler`
-- A constructor function returning an instance of that struct
-- Type-safe event filtering based on the event type
 
-### `#[derive(AggregatorName)]`
+- `HandleMoneyDepositedHandler` struct
+- `handle_money_deposited()` constructor function
+- `Handler<AccountBalanceView, E>` trait implementation
 
-Derives the `AggregatorName` trait which provides a name identifier for event types.
+### Snapshot Restoration with `#[evento::snapshot]`
+
+Implement snapshot restoration for projections:
 
 ```rust
-use evento::AggregatorName;
-use bincode::{Encode, Decode};
+use evento::LoadResult;
+use evento::context::RwContext;
 
-#[derive(AggregatorName, Encode, Decode)]
-struct UserCreated {
-    name: String,
-    email: String,
+#[evento::snapshot]
+async fn restore(
+    context: &RwContext,
+    id: String,
+) -> anyhow::Result<Option<LoadResult<AccountBalanceView>>> {
+    // Query snapshot from your storage
+    // Return None to rebuild from events
+    Ok(None)
 }
+```
 
-assert_eq!(UserCreated::name(), "UserCreated");
+### Debug Macros
+
+Use `#[evento::debug_handler]` or `#[evento::debug_snapshot]` to output the generated code to a file for inspection:
+
+```rust
+#[evento::debug_handler]
+async fn handle_event<E: Executor>(
+    event: Event<MyEvent>,
+    action: Action<'_, MyView, E>,
+) -> anyhow::Result<()> {
+    // ...
+}
+// Generated code written to: target/evento_debug_handler_macro.rs
 ```
 
 ## Requirements
 
-When using these macros, your types must implement the necessary traits:
+When using these macros, your types must meet certain requirements:
 
-- **Aggregates** must implement: `Default`, `Send`, `Sync`, `Clone`, `Debug`, `bincode::Encode`, `bincode::Decode`
-- **Events** must implement: `bincode::Encode`, `bincode::Decode`
-- **Handler functions** must be `async` and return `anyhow::Result<()>`
+- **Events** (from `#[aggregator]`): Traits are automatically derived
+- **Projections**: Must implement `Default`, `Send`, `Sync`, `Clone`
+- **Handler functions**: Must be `async` and return `anyhow::Result<()>`
+
+## Serialization
+
+Events are serialized using [rkyv](https://rkyv.org/) for zero-copy deserialization. The `#[aggregator]` macro automatically adds the required rkyv derives:
+
+- `rkyv::Archive`
+- `rkyv::Serialize`
+- `rkyv::Deserialize`
 
 ## Minimum Supported Rust Version
 
-Evento-macro's MSRV is 1.75.
+Rust 1.75 or later.
 
 ## Safety
 
 This crate uses `#![forbid(unsafe_code)]` to ensure everything is implemented in 100% safe Rust.
 
-## Getting Help
-
-If you have questions or need help, please:
-
-- Check the [documentation][docs]
-- Look at the [examples] in the main evento repository
-- Open an issue on [GitHub](https://github.com/timayz/evento/issues)
-
 ## License
 
-This project is licensed under the [Apache-2.0 license](LICENSE).
-
-[docs]: https://docs.rs/evento-macro
-[examples]: https://github.com/timayz/evento/tree/main/examples
+See the [LICENSE](../LICENSE) file in the repository root.

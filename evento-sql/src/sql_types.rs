@@ -1,3 +1,8 @@
+//! SQL type wrappers for serialization.
+//!
+//! This module provides the [`Rkyv`] wrapper type for zero-copy serialization
+//! of Rust types to/from SQL BLOB columns using the rkyv format.
+
 use std::ops::{Deref, DerefMut};
 
 use sqlx::database::Database;
@@ -7,6 +12,49 @@ use sqlx::error::BoxDynError;
 use sqlx::sqlite::{SqliteArgumentValue, SqliteTypeInfo};
 use sqlx::types::Type;
 
+/// A wrapper type for rkyv-serialized data in SQL databases.
+///
+/// `Rkyv<T>` wraps a value of type `T` and provides automatic serialization/deserialization
+/// using the [rkyv](https://rkyv.org/) zero-copy framework when storing to or reading from
+/// SQL databases.
+///
+/// # Features
+///
+/// - **Zero-copy deserialization** - Data can be accessed directly from the buffer without copying
+/// - **Compact binary format** - Efficient storage compared to JSON or other text formats
+/// - **Type-safe** - Compile-time checking of serialization capabilities
+///
+/// # Database Support
+///
+/// Currently implements SQLx traits for SQLite. Data is stored as BLOB.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use evento_sql::sql_types::Rkyv;
+/// use rkyv::{Archive, Serialize, Deserialize};
+///
+/// #[derive(Archive, Serialize, Deserialize)]
+/// struct MyData {
+///     value: i32,
+///     name: String,
+/// }
+///
+/// // Wrap data for storage
+/// let data = Rkyv(MyData { value: 42, name: "test".into() });
+///
+/// // Encode to bytes
+/// let bytes = data.encode_to()?;
+///
+/// // Decode from bytes
+/// let decoded = Rkyv::<MyData>::decode_from_bytes(&bytes)?;
+/// assert_eq!(decoded.value, 42);
+/// ```
+///
+/// # Deref
+///
+/// `Rkyv<T>` implements `Deref` and `DerefMut` to `T`, allowing transparent access
+/// to the inner value.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Rkyv<T: ?Sized>(pub T);
 
@@ -42,8 +90,6 @@ impl<T> AsMut<T> for Rkyv<T> {
     }
 }
 
-// UNSTABLE: for driver use only!
-#[doc(hidden)]
 impl<T> Rkyv<T>
 where
     T: for<'a> rkyv::Serialize<
@@ -57,14 +103,17 @@ where
         >,
     >,
 {
+    /// Serializes the wrapped value to a byte vector using rkyv.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization fails.
     pub fn encode_to(&self) -> Result<Vec<u8>, rkyv::rancor::Error> {
         let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&self.0)?;
         Ok(bytes.to_vec())
     }
 }
 
-// UNSTABLE: for driver use only!
-#[doc(hidden)]
 impl<T> Rkyv<T>
 where
     T: rkyv::Archive,
@@ -78,6 +127,11 @@ where
             >,
         > + rkyv::Deserialize<T, rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>>,
 {
+    /// Deserializes a value from a byte slice using rkyv.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if deserialization fails or the data is invalid.
     pub fn decode_from_bytes(bytes: &[u8]) -> Result<Self, rkyv::rancor::Error> {
         let data = rkyv::from_bytes::<T, rkyv::rancor::Error>(bytes)?;
         Ok(Self(data))

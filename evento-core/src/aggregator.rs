@@ -1,3 +1,28 @@
+//! Event creation and committing.
+//!
+//! This module provides the [`AggregatorBuilder`] for creating and persisting events.
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! use evento::{create, aggregator};
+//!
+//! // Create a new aggregate with auto-generated ID
+//! let id = create()
+//!     .event(&AccountOpened { owner: "John".into() })?
+//!     .metadata(&metadata)?
+//!     .routing_key("accounts")
+//!     .commit(&executor)
+//!     .await?;
+//!
+//! // Add events to existing aggregate
+//! aggregator(&existing_id)
+//!     .original_version(current_version)
+//!     .event(&MoneyDeposited { amount: 100 })?
+//!     .commit(&executor)
+//!     .await?;
+//! ```
+
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
@@ -5,24 +30,57 @@ use ulid::Ulid;
 
 use crate::{cursor::Args, Event, Executor, ReadAggregator};
 
+/// Errors that can occur when writing events.
 #[derive(Debug, Error)]
 pub enum WriteError {
+    /// Version conflict - another event was written concurrently
     #[error("invalid original version")]
     InvalidOriginalVersion,
 
+    /// Attempted to commit without adding any events
     #[error("trying to commit event without data")]
     MissingData,
 
+    /// Unknown error from the executor
     #[error("{0}")]
     Unknown(#[from] anyhow::Error),
 
+    /// Failed to serialize event data with rkyv
     #[error("rkyv.encode >> {0}")]
     RkyvEncode(String),
 
+    /// System time error
     #[error("systemtime >> {0}")]
     SystemTime(#[from] std::time::SystemTimeError),
 }
 
+/// Builder for creating and committing events.
+///
+/// Use [`create()`] or [`aggregator()`] to create an instance, then chain
+/// method calls to add events and metadata before committing.
+///
+/// # Optimistic Concurrency
+///
+/// If `original_version` is 0 (default for new aggregates), the builder
+/// queries the current version before writing. Otherwise, it uses the
+/// provided version for optimistic concurrency control.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// // New aggregate
+/// let id = create()
+///     .event(&MyEvent { ... })?
+///     .commit(&executor)
+///     .await?;
+///
+/// // Existing aggregate with version check
+/// aggregator(&id)
+///     .original_version(5)
+///     .event(&AnotherEvent { ... })?
+///     .commit(&executor)
+///     .await?;
+/// ```
 pub struct AggregatorBuilder {
     aggregator_id: String,
     aggregator_type: String,
@@ -167,10 +225,31 @@ impl AggregatorBuilder {
     }
 }
 
+/// Creates a new aggregate with an auto-generated ULID.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let id = create()
+///     .event(&AccountOpened { ... })?
+///     .commit(&executor)
+///     .await?;
+/// ```
 pub fn create() -> AggregatorBuilder {
     AggregatorBuilder::new(Ulid::new())
 }
 
+/// Creates a builder for an existing aggregate.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// aggregator(&existing_id)
+///     .original_version(current_version)
+///     .event(&MoneyDeposited { amount: 100 })?
+///     .commit(&executor)
+///     .await?;
+/// ```
 pub fn aggregator(id: impl Into<String>) -> AggregatorBuilder {
     AggregatorBuilder::new(id)
 }

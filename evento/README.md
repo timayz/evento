@@ -4,7 +4,7 @@
 [![Documentation](https://docs.rs/evento/badge.svg)](https://docs.rs/evento)
 [![License](https://img.shields.io/crates/l/evento.svg)](https://github.com/timayz/evento/blob/main/LICENSE)
 
-A collection of libraries and tools that help you build DDD, CQRS, and event sourcing applications in Rust.
+Event sourcing and CQRS toolkit with SQL persistence, projections, and subscriptions.
 
 More information about this crate can be found in the [crate documentation][docs].
 
@@ -14,52 +14,48 @@ More information about this crate can be found in the [crate documentation][docs
 - **CQRS Pattern**: Separate read and write models for scalable architectures
 - **SQL Database Support**: Built-in support for SQLite, PostgreSQL, and MySQL
 - **Event Handlers**: Async event processing with automatic retries
-- **Event Subscriptions**: Continuous event stream processing
-- **Event Streaming**: Real-time event streams (with `stream` feature)
+- **Event Subscriptions**: Continuous event stream processing with cursor tracking
+- **Projections**: Build read models by replaying events
 - **Snapshots**: Periodic state captures to optimize aggregate loading
 - **Database Migrations**: Automated schema management
-- **Macro Free API**: Clean, macro-free API (macros available optionally)
+- **Zero-Copy Serialization**: Fast serialization with rkyv
 - **Type Safety**: Fully typed events and aggregates with compile-time guarantees
+
+## Installation
+
+Add to your `Cargo.toml`:
+
+```toml
+[dependencies]
+evento = { version = "1.8", features = ["sqlite"] }
+rkyv = "0.8"
+```
 
 ## Usage Example
 
 ```rust
-use evento::{EventDetails, AggregatorName};
-use serde::{Deserialize, Serialize};
-use bincode::{Decode, Encode};
-
-// Define events
-#[derive(AggregatorName, Encode, Decode)]
-struct UserCreated {
-    name: String,
-    email: String,
-}
-
-#[derive(AggregatorName, Encode, Decode)]
-struct UserEmailChanged {
-    email: String,
-}
+use evento::aggregator;
 
 // Define aggregate
-#[derive(Default, Serialize, Deserialize, Encode, Decode, Clone, Debug)]
+#[aggregator("myapp/User")]
+#[derive(Default)]
 struct User {
     name: String,
     email: String,
 }
 
-// Implement event handlers on the aggregate
-#[evento::aggregator]
-impl User {
-    async fn user_created(&mut self, event: EventDetails<UserCreated>) -> anyhow::Result<()> {
-        self.name = event.data.name;
-        self.email = event.data.email;
-        Ok(())
-    }
+// Define events
+#[aggregator("myapp/User")]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+struct UserCreated {
+    name: String,
+    email: String,
+}
 
-    async fn user_email_changed(&mut self, event: EventDetails<UserEmailChanged>) -> anyhow::Result<()> {
-        self.email = event.data.email;
-        Ok(())
-    }
+#[aggregator("myapp/User")]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+struct UserEmailChanged {
+    email: String,
 }
 
 #[tokio::main]
@@ -69,15 +65,15 @@ async fn main() -> anyhow::Result<()> {
     let mut conn = pool.acquire().await?;
 
     // Run migrations
-    evento::sql_migrator::new_migrator::<sqlx::Sqlite>()?
+    evento::sql_migrator::new()?
         .run(&mut *conn, &evento::migrator::Plan::apply_all())
         .await?;
 
     let executor: evento::Sqlite = pool.into();
 
     // Create and save events
-    let user_id = evento::create::<User>()
-        .data(&UserCreated {
+    let user_id = evento::create()
+        .event(&UserCreated {
             name: "John Doe".to_string(),
             email: "john@example.com".to_string(),
         })?
@@ -86,55 +82,101 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     // Update user
-    evento::save::<User>(&user_id)
-        .data(&UserEmailChanged {
+    evento::aggregator(&user_id)
+        .original_version(1)
+        .event(&UserEmailChanged {
             email: "newemail@example.com".to_string(),
         })?
         .metadata(&true)?
         .commit(&executor)
         .await?;
 
-    // Load aggregate from events
-    let user = evento::load::<User, _>(&executor, &user_id).await?;
-    println!("User: {:?}", user.item);
-
     Ok(())
 }
 ```
 
-## Event Handlers and Subscriptions
+## Event Handlers and Projections
 
 ```rust
-use evento::{Context, EventDetails, Executor};
+use evento::{handler, Projection, Action, metadata::Event, Executor};
 
-// Define a handler function
-#[evento::handler(User)]
+// Define a view/projection
+#[derive(Default)]
+pub struct UserView {
+    pub name: String,
+    pub email: String,
+}
+
+// Define handler functions
+#[handler]
 async fn on_user_created<E: Executor>(
-    context: &Context<'_, E>,
-    event: EventDetails<UserCreated>,
+    event: Event<UserCreated>,
+    action: Action<'_, UserView, E>,
 ) -> anyhow::Result<()> {
-    println!("User created: {} ({})", event.data.name, event.data.email);
-    // Trigger side effects, send emails, update read models, etc.
+    if let Action::Apply(view) = action {
+        view.name = event.data.name.clone();
+        view.email = event.data.email.clone();
+    }
+    // In Action::Handle, perform side effects like sending emails
     Ok(())
 }
 
-// Subscribe to events
-evento::subscribe("user-handlers")
-    .handler(on_user_created())
-    .run(&executor)
+#[handler]
+async fn on_email_changed<E: Executor>(
+    event: Event<UserEmailChanged>,
+    action: Action<'_, UserView, E>,
+) -> anyhow::Result<()> {
+    if let Action::Apply(view) = action {
+        view.email = event.data.email.clone();
+    }
+    Ok(())
+}
+
+// Build projection and load state
+let projection = Projection::<UserView, _>::new("users")
+    .handler(on_user_created)
+    .handler(on_email_changed);
+
+let result = projection
+    .load::<User>(&user_id)
+    .execute(&executor)
     .await?;
+
+if let Some(user) = result {
+    println!("User: {} ({})", user.name, user.email);
+}
+```
+
+## Continuous Subscriptions
+
+```rust
+use std::time::Duration;
+
+// Start a subscription that continuously processes events
+let subscription = Projection::<UserView, _>::new("user-processor")
+    .handler(on_user_created)
+    .handler(on_email_changed)
+    .subscription()
+    .routing_key("users")
+    .chunk_size(100)
+    .retry(5)
+    .delay(Duration::from_secs(10))
+    .start(&executor)
+    .await?;
+
+// On application shutdown
+subscription.shutdown().await?;
 ```
 
 ## Feature Flags
 
-- **`macro`** _(enabled by default)_  Enable procedural macros for cleaner code
-- **`handler`** _(enabled by default)_  Enable event handlers with retry support
-- **`stream`**  Enable streaming support with `tokio-stream`
-- **`group`**  Enable event grouping functionality
-- **`sql`**  Enable all SQL database backends (SQLite, MySQL, PostgreSQL)
-- **`sqlite`**  SQLite support via sqlx
-- **`mysql`**  MySQL support via sqlx
-- **`postgres`**  PostgreSQL support via sqlx
+- **`macro`** _(enabled by default)_ - Procedural macros for cleaner code
+- **`group`** - Multi-executor support for querying across databases
+- **`rw`** - Read-write split executor for CQRS patterns
+- **`sql`** - Enable all SQL database backends (SQLite, MySQL, PostgreSQL)
+- **`sqlite`** - SQLite support via sqlx
+- **`mysql`** - MySQL support via sqlx
+- **`postgres`** - PostgreSQL support via sqlx
 
 ## Minimum Supported Rust Version
 
@@ -148,7 +190,7 @@ This crate uses `#![forbid(unsafe_code)]` to ensure everything is implemented in
 
 The [examples] directory contains sample applications demonstrating various features:
 
-- **todos** - A complete todo application with CQRS, demonstrating command/query separation and event handlers
+- **axum-sqlite** - Integration with Axum web framework and SQLite
 
 ## Getting Help
 

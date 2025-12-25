@@ -1,30 +1,81 @@
+//! Cursor-based pagination for event queries.
+//!
+//! This module provides GraphQL-style cursor pagination for efficiently querying
+//! large sets of events. It uses keyset pagination for stable, efficient results.
+//!
+//! # Key Types
+//!
+//! - [`Value`] - Base64-encoded cursor string
+//! - [`Args`] - Pagination arguments (first/after, last/before)
+//! - [`ReadResult`] - Paginated result with edges and page info
+//! - [`Reader`] - In-memory pagination executor
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! use evento::cursor::{Args, Reader};
+//!
+//! // Forward pagination: first 10 events
+//! let args = Args::forward(10, None);
+//!
+//! // Continue from cursor
+//! let args = Args::forward(10, Some(page_info.end_cursor));
+//!
+//! // Backward pagination: last 10 events before cursor
+//! let args = Args::backward(10, Some(cursor));
+//!
+//! // In-memory pagination
+//! let result = Reader::new(events)
+//!     .forward(10, None)
+//!     .execute()?;
+//! ```
+
 use serde::{Deserialize, Serialize};
 use std::ops::{Deref, DerefMut};
 use thiserror::Error;
 
+/// Sort order for pagination.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Order {
+    /// Ascending order (oldest first)
     Asc,
+    /// Descending order (newest first)
     Desc,
 }
 
+/// A paginated item with its cursor.
+///
+/// Each edge contains a node (the actual data) and its cursor
+/// for use in subsequent pagination requests.
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
 pub struct Edge<N> {
+    /// Cursor for this item's position
     pub cursor: Value,
+    /// The actual data item
     pub node: N,
 }
 
+/// Pagination metadata for a result set.
 #[derive(Default, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PageInfo {
+    /// Whether there are more items before the first edge
     pub has_previous_page: bool,
+    /// Whether there are more items after the last edge
     pub has_next_page: bool,
+    /// Cursor of the first edge (for backward pagination)
     pub start_cursor: Option<Value>,
+    /// Cursor of the last edge (for forward pagination)
     pub end_cursor: Option<Value>,
 }
 
+/// Result of a paginated query.
+///
+/// Contains the requested edges and pagination metadata.
 #[derive(Default, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ReadResult<N> {
+    /// The paginated items with their cursors
     pub edges: Vec<Edge<N>>,
+    /// Pagination metadata
     pub page_info: PageInfo,
 }
 
@@ -48,6 +99,10 @@ impl<N> ReadResult<N> {
     }
 }
 
+/// A base64-encoded cursor value for pagination.
+///
+/// Cursors are opaque strings that identify a position in a result set.
+/// They are serialized using rkyv and base64-encoded for URL safety.
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
 pub struct Value(pub String);
 
@@ -70,11 +125,19 @@ impl AsRef<[u8]> for Value {
     }
 }
 
+/// Trait for types that can be used as pagination cursors.
+///
+/// Implementors define how to serialize their position data to/from
+/// base64-encoded cursor values.
 pub trait Cursor {
+    /// The cursor data type (e.g., `EventCursor`)
     type T;
 
+    /// Extracts cursor data from this item.
     fn serialize(&self) -> Self::T;
+    /// Serializes cursor data to a base64 [`Value`].
     fn serialize_cursor(&self) -> Result<Value, CursorError>;
+    /// Deserializes cursor data from a base64 [`Value`].
     fn deserialize_cursor(value: &Value) -> Result<Self::T, CursorError>;
 }
 
@@ -87,11 +150,31 @@ pub enum CursorError {
     Rkyv(String),
 }
 
+/// Pagination arguments for querying events.
+///
+/// Supports both forward (first/after) and backward (last/before) pagination.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// // Forward: first 20 items
+/// let args = Args::forward(20, None);
+///
+/// // Forward: next 20 items after cursor
+/// let args = Args::forward(20, Some(end_cursor));
+///
+/// // Backward: last 20 items before cursor
+/// let args = Args::backward(20, Some(start_cursor));
+/// ```
 #[derive(Default, Serialize, Deserialize, Clone)]
 pub struct Args {
+    /// Number of items for forward pagination
     pub first: Option<u16>,
+    /// Cursor to start after (forward pagination)
     pub after: Option<Value>,
+    /// Number of items for backward pagination
     pub last: Option<u16>,
+    /// Cursor to end before (backward pagination)
     pub before: Option<Value>,
 }
 
@@ -146,6 +229,23 @@ pub enum ReadError {
     Cursor(#[from] CursorError),
 }
 
+/// In-memory pagination executor.
+///
+/// `Reader` performs cursor-based pagination on an in-memory vector of items.
+/// It's useful for testing or when data is already loaded.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let events = vec![event1, event2, event3];
+///
+/// let result = Reader::new(events)
+///     .forward(2, None)
+///     .execute()?;
+///
+/// assert_eq!(result.edges.len(), 2);
+/// assert!(result.page_info.has_next_page);
+/// ```
 pub struct Reader<T> {
     data: Vec<T>,
     args: Args,
@@ -267,10 +367,16 @@ impl<T> DerefMut for Reader<T> {
     }
 }
 
+/// Trait for sorting and filtering data for pagination.
+///
+/// Implementors define how to sort items and filter by cursor position.
 pub trait Bind {
+    /// The item type being paginated
     type T: Cursor + Clone;
 
+    /// Sorts items in ascending or descending order.
     fn sort_by(data: &mut Vec<Self::T>, is_order_desc: bool);
+    /// Retains only items after/before the cursor position.
     fn retain(
         data: &mut Vec<Self::T>,
         cursor: <<Self as Bind>::T as Cursor>::T,

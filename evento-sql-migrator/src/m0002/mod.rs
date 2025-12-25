@@ -1,7 +1,25 @@
+//! Migration adding sub-second timestamp precision.
+//!
+//! This module adds the `timestamp_subsec` column to support microsecond/nanosecond
+//! precision for event timestamps.
+
 mod event;
 
 use sqlx_migrator::vec_box;
 
+/// Migration that adds sub-second precision to event timestamps.
+///
+/// This migration adds the `timestamp_subsec` column to the event table, allowing
+/// events to be stored with microsecond or nanosecond precision instead of just
+/// second-level precision.
+///
+/// ## Changes
+///
+/// - Adds `timestamp_subsec` column (BIGINT, NOT NULL, DEFAULT 0) to the event table
+///
+/// ## Dependencies
+///
+/// This migration depends on [`InitMigration`](crate::InitMigration).
 pub struct M0002;
 
 #[cfg(feature = "sqlite")]

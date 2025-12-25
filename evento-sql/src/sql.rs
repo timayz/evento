@@ -1,3 +1,5 @@
+//! Core SQL implementation for event sourcing.
+
 use std::ops::{Deref, DerefMut};
 
 #[cfg(feature = "mysql")]
@@ -16,63 +18,178 @@ use evento_core::{
     Executor, ReadAggregator, WriteError,
 };
 
+/// Column identifiers for the `event` table.
+///
+/// Used with sea-query for type-safe SQL query construction.
+///
+/// # Columns
+///
+/// - `Id` - Event identifier (ULID format, VARCHAR(26))
+/// - `Name` - Event type name (VARCHAR(50))
+/// - `AggregatorType` - Aggregate root type (VARCHAR(50))
+/// - `AggregatorId` - Aggregate root instance ID (VARCHAR(26))
+/// - `Version` - Event sequence number within the aggregate
+/// - `Data` - Serialized event payload (BLOB, rkyv format)
+/// - `Metadata` - Serialized event metadata (BLOB, rkyv format)
+/// - `RoutingKey` - Optional routing key for partitioning (VARCHAR(50))
+/// - `Timestamp` - Event timestamp in seconds (BIGINT)
+/// - `TimestampSubsec` - Sub-second precision (BIGINT)
 #[derive(Iden, Clone)]
 pub enum Event {
+    /// The table name: `event`
     Table,
+    /// Event ID column (ULID)
     Id,
+    /// Event type name
     Name,
+    /// Aggregate root type
     AggregatorType,
+    /// Aggregate root instance ID
     AggregatorId,
+    /// Event version/sequence number
     Version,
+    /// Serialized event data
     Data,
+    /// Serialized event metadata
     Metadata,
+    /// Optional routing key
     RoutingKey,
+    /// Timestamp in seconds
     Timestamp,
+    /// Sub-second precision
     TimestampSubsec,
 }
 
+/// Column identifiers for the `snapshot` table.
+///
+/// Used with sea-query for type-safe SQL query construction.
+///
+/// **Note:** The snapshot table is dropped in migration M0003 and is no longer used.
 #[derive(Iden)]
 pub enum Snapshot {
+    /// The table name: `snapshot`
     Table,
+    /// Snapshot ID
     Id,
+    /// Snapshot type
     Type,
+    /// Event stream cursor position
     Cursor,
+    /// Revision identifier
     Revision,
+    /// Serialized snapshot data
     Data,
+    /// Creation timestamp
     CreatedAt,
+    /// Last update timestamp
     UpdatedAt,
 }
 
+/// Column identifiers for the `subscriber` table.
+///
+/// Used with sea-query for type-safe SQL query construction.
+///
+/// # Columns
+///
+/// - `Key` - Subscriber identifier (primary key)
+/// - `WorkerId` - ULID of the current worker processing events
+/// - `Cursor` - Current position in the event stream
+/// - `Lag` - Number of events behind the latest
+/// - `Enabled` - Whether the subscription is active
+/// - `CreatedAt` / `UpdatedAt` - Timestamps
 #[derive(Iden)]
 pub enum Subscriber {
+    /// The table name: `subscriber`
     Table,
+    /// Subscriber key (primary key)
     Key,
+    /// Current worker ID (ULID)
     WorkerId,
+    /// Current cursor position
     Cursor,
+    /// Event lag counter
     Lag,
+    /// Whether subscription is enabled
     Enabled,
+    /// Creation timestamp
     CreatedAt,
+    /// Last update timestamp
     UpdatedAt,
 }
 
+/// Type alias for MySQL executor.
+///
+/// Equivalent to `Sql<sqlx::MySql>`.
 #[cfg(feature = "mysql")]
 pub type MySql = Sql<sqlx::MySql>;
 
+/// Read-write executor pair for MySQL.
+///
+/// Used in CQRS patterns where you may have separate read and write connections.
 #[cfg(feature = "mysql")]
 pub type RwMySql = evento_core::Rw<MySql, MySql>;
 
+/// Type alias for PostgreSQL executor.
+///
+/// Equivalent to `Sql<sqlx::Postgres>`.
 #[cfg(feature = "postgres")]
 pub type Postgres = Sql<sqlx::Postgres>;
 
+/// Read-write executor pair for PostgreSQL.
+///
+/// Used in CQRS patterns where you may have separate read and write connections.
 #[cfg(feature = "postgres")]
 pub type RwPostgres = evento_core::Rw<Postgres, Postgres>;
 
+/// Type alias for SQLite executor.
+///
+/// Equivalent to `Sql<sqlx::Sqlite>`.
 #[cfg(feature = "sqlite")]
 pub type Sqlite = Sql<sqlx::Sqlite>;
 
+/// Read-write executor pair for SQLite.
+///
+/// Used in CQRS patterns where you may have separate read and write connections.
 #[cfg(feature = "sqlite")]
 pub type RwSqlite = evento_core::Rw<Sqlite, Sqlite>;
 
+/// SQL database executor for event sourcing operations.
+///
+/// A generic wrapper around a SQLx connection pool that implements the
+/// [`Executor`](evento_core::Executor) trait for storing and querying events.
+///
+/// # Type Parameters
+///
+/// - `DB` - The SQLx database type (e.g., `sqlx::Sqlite`, `sqlx::MySql`, `sqlx::Postgres`)
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use evento_sql::Sql;
+/// use sqlx::sqlite::SqlitePoolOptions;
+///
+/// // Create a connection pool
+/// let pool = SqlitePoolOptions::new()
+///     .connect(":memory:")
+///     .await?;
+///
+/// // Convert to Sql executor
+/// let executor: Sql<sqlx::Sqlite> = pool.into();
+///
+/// // Or use the type alias
+/// let executor: evento_sql::Sqlite = pool.into();
+/// ```
+///
+/// # Executor Implementation
+///
+/// The `Sql` type implements [`Executor`](evento_core::Executor) with the following operations:
+///
+/// - **`read`** - Query events with filtering and cursor-based pagination
+/// - **`write`** - Persist events with optimistic concurrency control
+/// - **`get_subscriber_cursor`** - Get the current cursor position for a subscriber
+/// - **`is_subscriber_running`** - Check if a subscriber is active with a specific worker
+/// - **`upsert_subscriber`** - Create or update a subscriber record
+/// - **`acknowledge`** - Update subscriber cursor after processing events
 pub struct Sql<DB: Database>(Pool<DB>);
 
 impl<DB: Database> Sql<DB> {
@@ -318,6 +435,46 @@ impl<D: Database> From<Pool<D>> for Sql<D> {
     }
 }
 
+/// Query builder for reading events with cursor-based pagination.
+///
+/// `Reader` wraps a sea-query [`SelectStatement`] and adds support for:
+/// - Forward pagination (first N after cursor)
+/// - Backward pagination (last N before cursor)
+/// - Ascending/descending order
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use evento_sql::{Reader, Event};
+/// use sea_query::Query;
+///
+/// let statement = Query::select()
+///     .columns([Event::Id, Event::Name, Event::Data])
+///     .from(Event::Table)
+///     .to_owned();
+///
+/// let result = Reader::new(statement)
+///     .forward(10, None)  // First 10 events
+///     .execute::<_, MyEvent, _>(&pool)
+///     .await?;
+///
+/// for edge in result.edges {
+///     println!("Event: {:?}, Cursor: {:?}", edge.node, edge.cursor);
+/// }
+///
+/// // Continue with next page
+/// if result.page_info.has_next_page {
+///     let next_result = Reader::new(statement)
+///         .forward(10, result.page_info.end_cursor)
+///         .execute::<_, MyEvent, _>(&pool)
+///         .await?;
+/// }
+/// ```
+///
+/// # Deref
+///
+/// `Reader` implements `Deref` and `DerefMut` to the underlying `SelectStatement`,
+/// allowing direct access to sea-query builder methods.
 pub struct Reader {
     statement: SelectStatement,
     args: Args,
@@ -325,6 +482,7 @@ pub struct Reader {
 }
 
 impl Reader {
+    /// Creates a new reader from a sea-query select statement.
     pub fn new(statement: SelectStatement) -> Self {
         Self {
             statement,
@@ -333,22 +491,31 @@ impl Reader {
         }
     }
 
+    /// Sets the sort order for results.
     pub fn order(&mut self, order: cursor::Order) -> &mut Self {
         self.order = order;
 
         self
     }
 
+    /// Sets descending sort order.
     pub fn desc(&mut self) -> &mut Self {
         self.order(cursor::Order::Desc)
     }
 
+    /// Sets pagination arguments directly.
     pub fn args(&mut self, args: Args) -> &mut Self {
         self.args = args;
 
         self
     }
 
+    /// Configures backward pagination (last N before cursor).
+    ///
+    /// # Arguments
+    ///
+    /// - `last` - Number of items to return
+    /// - `before` - Optional cursor to paginate before
     pub fn backward(&mut self, last: u16, before: Option<Value>) -> &mut Self {
         self.args(Args {
             last: Some(last),
@@ -357,6 +524,12 @@ impl Reader {
         })
     }
 
+    /// Configures forward pagination (first N after cursor).
+    ///
+    /// # Arguments
+    ///
+    /// - `first` - Number of items to return
+    /// - `after` - Optional cursor to paginate after
     pub fn forward(&mut self, first: u16, after: Option<Value>) -> &mut Self {
         self.args(Args {
             first: Some(first),
@@ -365,6 +538,18 @@ impl Reader {
         })
     }
 
+    /// Executes the query and returns paginated results.
+    ///
+    /// # Type Parameters
+    ///
+    /// - `DB` - The SQLx database type
+    /// - `O` - The output row type (must implement `FromRow`, `Cursor`, and `Bind`)
+    /// - `E` - The executor type
+    ///
+    /// # Returns
+    ///
+    /// A [`ReadResult`](evento_core::cursor::ReadResult) containing edges with nodes and cursors,
+    /// plus pagination info.
     pub async fn execute<'e, 'c: 'e, DB, O, E>(
         &mut self,
         executor: E,
@@ -522,13 +707,36 @@ impl DerefMut for Reader {
     }
 }
 
+/// Trait for binding cursor values in paginated queries.
+///
+/// This trait defines how to serialize cursor data for keyset pagination.
+/// It specifies which columns are used for ordering and how to extract
+/// their values from a cursor.
+///
+/// # Implementation
+///
+/// The trait is implemented for [`evento_core::Event`] to enable pagination
+/// over the event table using timestamp, version, and ID columns.
+///
+/// # Associated Types
+///
+/// - `T` - Column reference type
+/// - `I` - Iterator over column references
+/// - `V` - Iterator over value expressions
+/// - `Cursor` - The cursor type that provides pagination data
 pub trait Bind {
+    /// Column reference type (e.g., `Event` enum variant).
     type T: IntoColumnRef + Clone;
+    /// Iterator type for columns.
     type I: IntoIterator<Item = Self::T>;
+    /// Iterator type for values.
     type V: IntoIterator<Item = Expr>;
+    /// The cursor type used for pagination.
     type Cursor: Cursor;
 
+    /// Returns the columns used for cursor-based ordering.
     fn columns() -> Self::I;
+    /// Extracts values from a cursor for WHERE clause construction.
     fn values(cursor: <<Self as Bind>::Cursor as Cursor>::T) -> Self::V;
 }
 
