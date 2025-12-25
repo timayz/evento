@@ -213,7 +213,7 @@ dependencies = [
 
 [[package]]
 name = "bank"
-version = "2.0.0-alpha.1"
+version = "2.0.0-alpha.2"
 dependencies = [
  "anyhow",
  "evento",
@@ -223,7 +223,7 @@ dependencies = [
 
 [[package]]
 name = "bank-axum-sqlite"
-version = "2.0.0-alpha.1"
+version = "2.0.0-alpha.2"
 dependencies = [
  "anyhow",
  "askama",
@@ -647,7 +647,7 @@ dependencies = [
 
 [[package]]
 name = "evento"
-version = "2.0.0-alpha.1"
+version = "2.0.0-alpha.2"
 dependencies = [
  "anyhow",
  "bank",
@@ -667,7 +667,7 @@ dependencies = [
 
 [[package]]
 name = "evento-core"
-version = "2.0.0-alpha.1"
+version = "2.0.0-alpha.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -686,7 +686,7 @@ dependencies = [
 
 [[package]]
 name = "evento-fjall"
-version = "2.0.0-alpha.1"
+version = "2.0.0-alpha.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -700,7 +700,7 @@ dependencies = [
 
 [[package]]
 name = "evento-macro"
-version = "2.0.0-alpha.1"
+version = "2.0.0-alpha.2"
 dependencies = [
  "convert_case",
  "quote",
@@ -709,7 +709,7 @@ dependencies = [
 
 [[package]]
 name = "evento-sql"
-version = "2.0.0-alpha.1"
+version = "2.0.0-alpha.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -723,7 +723,7 @@ dependencies = [
 
 [[package]]
 name = "evento-sql-migrator"
-version = "2.0.0-alpha.1"
+version = "2.0.0-alpha.2"
 dependencies = [
  "async-trait",
  "evento-sql",

@@ -1,6 +1,6 @@
 [package]
 name = "evento-sql-migrator"
-version = "2.0.0-alpha.1"
+version = "2.0.0-alpha.2"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -10,7 +10,7 @@ documentation = "https://docs.rs/evento-sql-migrator"
 readme = "README.md"
 
 [dependencies]
-evento-sql = { path = "../evento-sql", version = "2.0.0-alpha.1" }
+evento-sql = { path = "../evento-sql", version = "2.0.0-alpha.2" }
 sqlx.workspace = true
 sqlx_migrator.workspace = true
 sea-query.workspace = true
