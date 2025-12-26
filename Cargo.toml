@@ -8,6 +8,7 @@ members = [
     "./evento-sql-migrator",
     "./evento-macro",
     "./evento-fjall",
+    "./evento-accord",
     "./examples/*"
 ]
 
@@ -24,6 +25,7 @@ evento-sql = { path = "./evento-sql" }
 evento-sql-migrator = { path = "./evento-sql-migrator" }
 evento-macro = { path = "./evento-macro" }
 evento-fjall = { path = "./evento-fjall" }
+evento-accord = { path = "./evento-accord" }
 bank = { path = "./examples/bank" }
 
 # Core dependencies

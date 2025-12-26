@@ -1,1 +1,7 @@
 // internal pub sub for projection with mpsc chanel that send message if handler return Some(mesaage)
+
+
+proc macro to generate comman deref, load, struct...
+add missing data() on subscription
+add no_event_filter to LoadBuilder to disable filter by event name since we need all events for load (event sourcing) but not for subscription
+maybe load_view to enable event filter ?
