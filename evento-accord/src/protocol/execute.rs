@@ -122,7 +122,7 @@ pub async fn execute_raw<E: Executor>(
     Ok(())
 }
 
-/// Wait for a transaction to be executed.
+/// Wait for a transaction to be executed (or fail).
 async fn wait_for_execution(
     state: &ConsensusState,
     txn_id: TxnId,
@@ -132,6 +132,11 @@ async fn wait_for_execution(
         loop {
             match state.get_status(&txn_id).await {
                 Some(TxnStatus::Executed) => return Ok(()),
+                Some(TxnStatus::ExecutionFailed) => {
+                    // Dependency failed - we can still proceed
+                    // (the failure was already recorded, we just need to know it's "done")
+                    return Ok(());
+                }
                 Some(_) => {
                     // Still waiting
                     tokio::time::sleep(config.poll_interval).await;

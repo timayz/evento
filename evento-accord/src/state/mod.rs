@@ -16,7 +16,7 @@ pub use waiting::ExecutionQueue;
 use crate::error::{AccordError, Result};
 use crate::timestamp::Timestamp;
 use crate::txn::{Ballot, Transaction, TxnId, TxnStatus};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use tokio::sync::RwLock;
 
 /// Thread-safe consensus state for the ACCORD protocol.
@@ -30,6 +30,8 @@ pub struct ConsensusState {
     store: RwLock<TxnStore>,
     deps: RwLock<DependencyGraph>,
     queue: RwLock<ExecutionQueue>,
+    /// Stores execution error messages for failed transactions
+    execution_errors: RwLock<HashMap<TxnId, String>>,
 }
 
 impl ConsensusState {
@@ -39,6 +41,7 @@ impl ConsensusState {
             store: RwLock::new(TxnStore::new()),
             deps: RwLock::new(DependencyGraph::new()),
             queue: RwLock::new(ExecutionQueue::new()),
+            execution_errors: RwLock::new(HashMap::new()),
         }
     }
 
@@ -242,9 +245,10 @@ impl ConsensusState {
     /// Returns None if no transactions are ready.
     pub async fn next_executable(&self) -> Option<Transaction> {
         let store = self.store.read().await;
-        let queue = self.queue.read().await;
+        let mut queue = self.queue.write().await;
 
-        let (txn_id, _) = queue.peek_next()?;
+        // Claim the transaction so other workers don't try to execute it
+        let (txn_id, _) = queue.claim_next()?;
         store.get(&txn_id).cloned()
     }
 
@@ -274,6 +278,47 @@ impl ConsensusState {
         }
 
         Ok(())
+    }
+
+    /// Mark a transaction as failed during execution.
+    ///
+    /// Stores the error message and updates the transaction status.
+    /// This unblocks dependent transactions (they may also fail or succeed
+    /// depending on application semantics).
+    pub async fn mark_execution_failed(&self, txn_id: TxnId, error: String) -> Result<()> {
+        let mut store = self.store.write().await;
+        let mut deps_graph = self.deps.write().await;
+        let mut queue = self.queue.write().await;
+        let mut errors = self.execution_errors.write().await;
+
+        let txn = store.get(&txn_id).ok_or(AccordError::TxnNotFound(txn_id))?;
+        let execute_at = txn.execute_at;
+
+        // Store the error message
+        errors.insert(txn_id, error);
+
+        // Update status to failed
+        store.set_status(&txn_id, TxnStatus::ExecutionFailed)?;
+
+        // Remove from queue
+        queue.remove(&txn_id, &execute_at);
+
+        // Update dependency graph - this may unblock other transactions
+        // (failed transactions are still considered "done" for dependency purposes)
+        let newly_ready = deps_graph.mark_executed(txn_id);
+
+        // Mark newly ready transactions in the queue
+        for ready_id in newly_ready {
+            queue.mark_ready(ready_id);
+        }
+
+        Ok(())
+    }
+
+    /// Get the execution error for a failed transaction.
+    pub async fn get_execution_error(&self, txn_id: &TxnId) -> Option<String> {
+        let errors = self.execution_errors.read().await;
+        errors.get(txn_id).cloned()
     }
 
     // ========== Queries ==========

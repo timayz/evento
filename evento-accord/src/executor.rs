@@ -238,6 +238,10 @@ impl<E: Executor + Clone + Send + Sync + 'static> AccordExecutor<E> {
 
                                 if let Err(e) = execute_raw(&state, &executor, events, txn.id, &config).await {
                                     tracing::error!("Execution failed for {}: {}", txn.id, e);
+                                    // Mark the transaction as failed so callers know
+                                    if let Err(mark_err) = state.mark_execution_failed(txn.id, e.to_string()).await {
+                                        tracing::error!("Failed to mark {} as failed: {}", txn.id, mark_err);
+                                    }
                                 }
                             } else {
                                 // No work available, sleep briefly
@@ -286,9 +290,6 @@ impl<E: Executor + Clone + Send + Sync + 'static> AccordExecutor<E> {
         };
 
         let txn_id = txn.id;
-
-        // PreAccept locally first
-        self.state.preaccept(txn.clone()).await?;
 
         // Create PreAccept request
         let preaccept_msg = crate::protocol::messages::PreAcceptRequest {
@@ -341,6 +342,18 @@ impl<E: Executor + Clone + Send + Sync + 'static> AccordExecutor<E> {
         loop {
             match self.state.get_status(&txn_id).await {
                 Some(TxnStatus::Executed) => return Ok(()),
+                Some(TxnStatus::ExecutionFailed) => {
+                    // Retrieve the error message
+                    let error_msg = self
+                        .state
+                        .get_execution_error(&txn_id)
+                        .await
+                        .unwrap_or_else(|| "unknown execution error".to_string());
+                    return Err(crate::error::AccordError::ExecutionFailed {
+                        txn_id,
+                        error: error_msg,
+                    });
+                }
                 Some(_) => {
                     if tokio::time::Instant::now() > deadline {
                         return Err(crate::error::AccordError::Timeout(format!(

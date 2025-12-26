@@ -829,6 +829,10 @@ impl Simulation {
                                 // Already executed - events were already written, don't write again
                                 false
                             }
+                            Some(TxnStatus::ExecutionFailed) => {
+                                // Execution failed - don't retry
+                                false
+                            }
                         };
 
                         updates.push((txn.clone(), needs_events));

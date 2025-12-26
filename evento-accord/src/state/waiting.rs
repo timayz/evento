@@ -22,6 +22,9 @@ pub struct ExecutionQueue {
 
     /// Transactions that are ready to execute
     ready: HashSet<TxnId>,
+
+    /// Transactions currently being executed (claimed by a worker)
+    in_progress: HashSet<TxnId>,
 }
 
 impl ExecutionQueue {
@@ -49,14 +52,32 @@ impl ExecutionQueue {
         }
     }
 
-    /// Get the next transaction to execute.
+    /// Get the next transaction to execute (peek only).
     ///
     /// Returns the transaction with the lowest execute_at that is ready.
     /// Does NOT remove it from the queue - call `remove` after execution.
+    /// Note: Use `claim_next` for execution workers to avoid races.
     pub fn peek_next(&self) -> Option<(TxnId, Timestamp)> {
         for (execute_at, ids) in &self.queue {
             for id in ids {
-                if self.ready.contains(id) {
+                if self.ready.contains(id) && !self.in_progress.contains(id) {
+                    return Some((*id, *execute_at));
+                }
+            }
+        }
+        None
+    }
+
+    /// Claim the next transaction for execution.
+    ///
+    /// Returns the transaction with the lowest execute_at that is ready
+    /// and not already being executed. Marks it as in-progress so other
+    /// workers won't try to execute it.
+    pub fn claim_next(&mut self) -> Option<(TxnId, Timestamp)> {
+        for (execute_at, ids) in &self.queue {
+            for id in ids {
+                if self.ready.contains(id) && !self.in_progress.contains(id) {
+                    self.in_progress.insert(*id);
                     return Some((*id, *execute_at));
                 }
             }
@@ -87,6 +108,7 @@ impl ExecutionQueue {
         }
         self.all_ids.remove(txn_id);
         self.ready.remove(txn_id);
+        self.in_progress.remove(txn_id);
     }
 
     /// Update the execute_at timestamp for a transaction.

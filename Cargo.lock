@@ -791,6 +791,7 @@ version = "2.0.0-alpha.3"
 dependencies = [
  "anyhow",
  "bank",
+ "evento-accord",
  "evento-core",
  "evento-fjall",
  "evento-sql",

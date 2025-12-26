@@ -60,6 +60,10 @@ pub enum AccordError {
     /// Configuration error
     #[error("configuration error: {0}")]
     Config(String),
+
+    /// Execution failed (e.g., version conflict, constraint violation)
+    #[error("execution failed for {txn_id}: {error}")]
+    ExecutionFailed { txn_id: TxnId, error: String },
 }
 
 impl AccordError {

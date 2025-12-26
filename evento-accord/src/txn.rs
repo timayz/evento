@@ -45,6 +45,8 @@ impl std::fmt::Display for TxnId {
 ///
 /// Transactions progress through these states:
 /// PreAccepted -> Accepted -> Committed -> Executed
+///
+/// If execution fails, the status becomes ExecutionFailed.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, bitcode::Encode, bitcode::Decode,
 )]
@@ -58,6 +60,8 @@ pub enum TxnStatus {
     Committed = 2,
     /// Transaction has been executed (phase 4)
     Executed = 3,
+    /// Transaction execution failed (e.g., version conflict)
+    ExecutionFailed = 4,
 }
 
 impl TxnStatus {
@@ -68,12 +72,25 @@ impl TxnStatus {
 
     /// Check if the transaction decision is final
     pub fn is_decided(&self) -> bool {
-        matches!(self, Self::Committed | Self::Executed)
+        matches!(
+            self,
+            Self::Committed | Self::Executed | Self::ExecutionFailed
+        )
     }
 
     /// Check if the transaction has been applied
     pub fn is_applied(&self) -> bool {
         matches!(self, Self::Executed)
+    }
+
+    /// Check if the transaction execution failed
+    pub fn is_failed(&self) -> bool {
+        matches!(self, Self::ExecutionFailed)
+    }
+
+    /// Check if the transaction is terminal (executed or failed)
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Executed | Self::ExecutionFailed)
     }
 }
 
@@ -84,6 +101,7 @@ impl std::fmt::Display for TxnStatus {
             Self::Accepted => write!(f, "accepted"),
             Self::Committed => write!(f, "committed"),
             Self::Executed => write!(f, "executed"),
+            Self::ExecutionFailed => write!(f, "execution-failed"),
         }
     }
 }
