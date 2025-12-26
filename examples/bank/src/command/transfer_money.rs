@@ -11,13 +11,9 @@ pub struct TransferMoney {
     pub description: String,
 }
 
-impl super::Command {
+impl<'a, E: Executor> super::Command<'a, E> {
     /// Handle TransferMoney command
-    pub async fn transfer_money<E: Executor>(
-        &self,
-        cmd: TransferMoney,
-        executor: &E,
-    ) -> Result<(), BankAccountError> {
+    pub async fn transfer_money(&self, cmd: TransferMoney) -> Result<(), BankAccountError> {
         if matches!(self.status, AccountStatus::Closed) {
             return Err(BankAccountError::AccountClosed);
         }
@@ -44,17 +40,16 @@ impl super::Command {
                 description: cmd.description,
             })
             .metadata(&Metadata::default())
-            .commit(executor)
+            .commit(self.executor)
             .await?;
 
         Ok(())
     }
 
     /// Handle TransferMoney command
-    pub async fn transfer_money_with_routing<E: Executor>(
+    pub async fn transfer_money_with_routing(
         &self,
         cmd: TransferMoney,
-        executor: &E,
         key: impl Into<String>,
     ) -> Result<(), BankAccountError> {
         if matches!(self.status, AccountStatus::Closed) {
@@ -84,7 +79,7 @@ impl super::Command {
                 description: cmd.description,
             })
             .metadata(&Metadata::default())
-            .commit(executor)
+            .commit(self.executor)
             .await?;
 
         Ok(())

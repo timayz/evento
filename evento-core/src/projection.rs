@@ -340,6 +340,7 @@ impl<P: 'static, E: Executor> Projection<P, E> {
             aggregators,
             handlers: self.handlers,
             context: Default::default(),
+            filter_events_by_name: true,
         }
     }
 
@@ -461,6 +462,7 @@ pub struct LoadBuilder<P: Snapshot + Default + 'static, E: Executor> {
     aggregators: HashMap<String, String>,
     handlers: HashMap<String, Box<dyn Handler<P, E>>>,
     context: context::RwContext,
+    filter_events_by_name: bool,
 }
 
 impl<P: Snapshot + Default + 'static, E: Executor> LoadBuilder<P, E> {
@@ -483,6 +485,12 @@ impl<P: Snapshot + Default + 'static, E: Executor> LoadBuilder<P, E> {
         self
     }
 
+    pub fn filter_events_by_name(&mut self, v: bool) -> &mut Self {
+        self.filter_events_by_name = v;
+
+        self
+    }
+
     /// Executes the load operation, returning the rebuilt state.
     ///
     /// Returns `None` if no events exist for the aggregate.
@@ -498,18 +506,26 @@ impl<P: Snapshot + Default + 'static, E: Executor> LoadBuilder<P, E> {
         let has_loaded = loaded.is_some();
         let mut snapshot = loaded.unwrap_or_default();
 
-        let read_aggregators = self
-            .handlers
-            .values()
-            .map(|h| match self.aggregators.get(h.aggregator_type()) {
-                Some(id) => ReadAggregator {
-                    aggregator_type: h.aggregator_type().to_owned(),
-                    aggregator_id: Some(id.to_owned()),
-                    name: None,
+        let mut read_aggregators = vec![];
+        for handler in self.handlers.values() {
+            let Some(id) = self.aggregators.get(handler.aggregator_type()) else {
+                anyhow::bail!(
+                    "Failed to load projection {}/{}: id not found",
+                    handler.aggregator_type(),
+                    handler.event_name()
+                );
+            };
+
+            read_aggregators.push(ReadAggregator {
+                aggregator_type: handler.aggregator_type().to_owned(),
+                aggregator_id: Some(id.to_owned()),
+                name: if self.filter_events_by_name {
+                    Some(handler.event_name().to_owned())
+                } else {
+                    None
                 },
-                _ => ReadAggregator::event(h.aggregator_type(), h.event_name()),
-            })
-            .collect::<Vec<_>>();
+            });
+        }
 
         let events = executor
             .read(
@@ -597,6 +613,15 @@ pub struct SubscriptionBuilder<P: 'static, E: Executor> {
 }
 
 impl<P, E: Executor + 'static> SubscriptionBuilder<P, E> {
+    /// Adds shared data to the load context.
+    ///
+    /// Data added here is accessible in handlers via the context.
+    pub fn data<D: Send + Sync + 'static>(self, v: D) -> Self {
+        self.context.insert(v);
+
+        self
+    }
+
     /// Allows the subscription to continue after handler failures.
     ///
     /// By default, subscriptions stop on the first error. With this flag,

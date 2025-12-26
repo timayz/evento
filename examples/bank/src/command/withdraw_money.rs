@@ -10,13 +10,9 @@ pub struct WithdrawMoney {
     pub description: String,
 }
 
-impl super::Command {
+impl<'a, E: Executor> super::Command<'a, E> {
     /// Handle WithdrawMoney command
-    pub async fn withdraw_money<E: Executor>(
-        &self,
-        cmd: WithdrawMoney,
-        executor: &E,
-    ) -> Result<(), BankAccountError> {
+    pub async fn withdraw_money(&self, cmd: WithdrawMoney) -> Result<(), BankAccountError> {
         if matches!(self.status, AccountStatus::Closed) {
             return Err(BankAccountError::AccountClosed);
         }
@@ -42,7 +38,7 @@ impl super::Command {
                 description: cmd.description,
             })
             .metadata(&Metadata::default())
-            .commit(executor)
+            .commit(self.executor)
             .await?;
 
         Ok(())

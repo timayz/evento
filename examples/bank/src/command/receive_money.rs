@@ -11,13 +11,9 @@ pub struct ReceiveMoney {
     pub description: String,
 }
 
-impl super::Command {
+impl<'a, E: Executor> super::Command<'a, E> {
     /// Handle ReceiveMoney command
-    pub async fn receive_money<E: Executor>(
-        &self,
-        cmd: ReceiveMoney,
-        executor: &E,
-    ) -> Result<(), BankAccountError> {
+    pub async fn receive_money(&self, cmd: ReceiveMoney) -> Result<(), BankAccountError> {
         if matches!(self.status, AccountStatus::Closed) {
             return Err(BankAccountError::AccountClosed);
         }
@@ -34,7 +30,7 @@ impl super::Command {
                 description: cmd.description,
             })
             .metadata(&Metadata::default())
-            .commit(executor)
+            .commit(self.executor)
             .await?;
 
         Ok(())

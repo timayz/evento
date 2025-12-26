@@ -9,11 +9,7 @@ mod transfer_money;
 mod unfreeze_account;
 mod withdraw_money;
 
-use std::{
-    collections::HashMap,
-    ops::{Deref, DerefMut},
-    sync::RwLock,
-};
+use std::{collections::HashMap, sync::RwLock};
 
 pub use change_daily_withdrawal_limit::*;
 pub use change_overdraft_limit::*;
@@ -26,10 +22,7 @@ pub use transfer_money::*;
 pub use unfreeze_account::*;
 pub use withdraw_money::*;
 
-use evento::{
-    Action, AggregatorBuilder, Executor, LoadResult, Projection, SubscriptionBuilder,
-    metadata::Event,
-};
+use evento::{Action, Executor, LoadResult, Projection, SubscriptionBuilder, metadata::Event};
 
 use crate::{
     AccountClosed, AccountFrozen, AccountOpened, AccountUnfrozen, BankAccount, MoneyDeposited,
@@ -39,48 +32,19 @@ use crate::{
 
 use once_cell::sync::Lazy;
 
-pub type LazyCommandrow = (CommandRow, u16, Option<String>);
+pub type LazyCommandrow = (CommandData, u16, Option<String>);
 
 pub static COMMAND_ROWS: Lazy<RwLock<HashMap<String, LazyCommandrow>>> =
     Lazy::new(Default::default);
 
-#[derive(Default, Clone)]
-pub struct CommandRow {
-    pub account_id: String,
+#[evento::command]
+pub struct Command {
     pub balance: i64,
     pub status: AccountStatus,
     pub overdraft_limit: i64,
 }
 
-#[derive(Default)]
-pub struct Command(pub LoadResult<CommandRow>);
-
-impl Deref for Command {
-    type Target = CommandRow;
-    fn deref(&self) -> &Self::Target {
-        self.0.deref()
-    }
-}
-
-impl DerefMut for Command {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.0.deref_mut()
-    }
-}
-
-impl From<LoadResult<CommandRow>> for Command {
-    fn from(value: LoadResult<CommandRow>) -> Self {
-        Self(value)
-    }
-}
-
-impl Command {
-    fn aggregator(&self) -> AggregatorBuilder {
-        evento::aggregator(&self.account_id)
-            .original_version(self.0.version)
-            .routing_key_opt(self.0.routing_key.to_owned())
-    }
-
+impl<'a, E: Executor> Command<'a, E> {
     pub fn can_withdraw(&self, amount: i64) -> bool {
         matches!(self.status, AccountStatus::Active)
             && amount > 0
@@ -112,7 +76,7 @@ impl Command {
     }
 }
 
-fn create_projection<E: Executor>() -> Projection<CommandRow, E> {
+fn create_projection<E: Executor>() -> Projection<CommandData, E> {
     Projection::new("command")
         .handler(handle_money_deposit())
         .handler(handle_account_opened())
@@ -128,15 +92,18 @@ fn create_projection<E: Executor>() -> Projection<CommandRow, E> {
 pub async fn load<E: Executor>(
     executor: &E,
     id: impl Into<String>,
-) -> Result<Option<Command>, anyhow::Error> {
+) -> Result<Option<Command<'_, E>>, anyhow::Error> {
+    let id = id.into();
+
     Ok(create_projection()
-        .load::<BankAccount>(id)
+        .load::<BankAccount>(&id)
+        .filter_events_by_name(false)
         .execute(executor)
         .await?
-        .map(|loaded| loaded.into()))
+        .map(|loaded| Command::new(id, loaded, executor)))
 }
 
-pub fn subscription<E: Executor>() -> SubscriptionBuilder<CommandRow, E> {
+pub fn subscription<E: Executor>() -> SubscriptionBuilder<CommandData, E> {
     create_projection().subscription()
 }
 
@@ -144,7 +111,7 @@ pub fn subscription<E: Executor>() -> SubscriptionBuilder<CommandRow, E> {
 async fn restore(
     _context: &evento::context::RwContext,
     id: String,
-) -> anyhow::Result<Option<LoadResult<CommandRow>>> {
+) -> anyhow::Result<Option<LoadResult<CommandData>>> {
     let rows = COMMAND_ROWS.read().unwrap();
 
     Ok(rows
@@ -160,22 +127,20 @@ async fn restore(
 #[evento::handler]
 async fn handle_account_opened<E: Executor>(
     event: Event<AccountOpened>,
-    action: Action<'_, CommandRow, E>,
+    action: Action<'_, CommandData, E>,
 ) -> anyhow::Result<()> {
     match action {
         Action::Apply(row) => {
             row.balance = event.data.initial_balance;
             row.status = AccountStatus::Active;
             row.overdraft_limit = 0;
-            row.account_id = event.aggregator_id.to_owned();
         }
         Action::Handle(_context) => {
             let mut rows = COMMAND_ROWS.write().unwrap();
             rows.insert(
                 event.aggregator_id.to_owned(),
                 (
-                    CommandRow {
-                        account_id: event.aggregator_id.to_owned(),
+                    CommandData {
                         balance: event.data.initial_balance,
                         status: AccountStatus::Active,
                         overdraft_limit: 0,
@@ -189,10 +154,11 @@ async fn handle_account_opened<E: Executor>(
 
     Ok(())
 }
+
 #[evento::handler]
 async fn handle_money_deposit<E: Executor>(
     event: Event<MoneyDeposited>,
-    action: Action<'_, CommandRow, E>,
+    action: Action<'_, CommandData, E>,
 ) -> anyhow::Result<()> {
     match action {
         Action::Apply(row) => {
@@ -214,7 +180,7 @@ async fn handle_money_deposit<E: Executor>(
 #[evento::handler]
 async fn handle_money_withdrawn<E: Executor>(
     event: Event<MoneyWithdrawn>,
-    action: Action<'_, CommandRow, E>,
+    action: Action<'_, CommandData, E>,
 ) -> anyhow::Result<()> {
     match action {
         Action::Apply(row) => {
@@ -236,7 +202,7 @@ async fn handle_money_withdrawn<E: Executor>(
 #[evento::handler]
 async fn handle_money_transferred<E: Executor>(
     event: Event<MoneyTransferred>,
-    action: Action<'_, CommandRow, E>,
+    action: Action<'_, CommandData, E>,
 ) -> anyhow::Result<()> {
     match action {
         Action::Apply(row) => {
@@ -258,7 +224,7 @@ async fn handle_money_transferred<E: Executor>(
 #[evento::handler]
 async fn handle_money_received<E: Executor>(
     event: Event<MoneyReceived>,
-    action: Action<'_, CommandRow, E>,
+    action: Action<'_, CommandData, E>,
 ) -> anyhow::Result<()> {
     match action {
         Action::Apply(row) => {
@@ -280,7 +246,7 @@ async fn handle_money_received<E: Executor>(
 #[evento::handler]
 async fn handle_overdraf_limit_changed<E: Executor>(
     event: Event<OverdraftLimitChanged>,
-    action: Action<'_, CommandRow, E>,
+    action: Action<'_, CommandData, E>,
 ) -> anyhow::Result<()> {
     match action {
         Action::Apply(row) => {
@@ -302,7 +268,7 @@ async fn handle_overdraf_limit_changed<E: Executor>(
 #[evento::handler]
 async fn handle_account_frozen<E: Executor>(
     event: Event<AccountFrozen>,
-    action: Action<'_, CommandRow, E>,
+    action: Action<'_, CommandData, E>,
 ) -> anyhow::Result<()> {
     match action {
         Action::Apply(row) => {
@@ -324,7 +290,7 @@ async fn handle_account_frozen<E: Executor>(
 #[evento::handler]
 async fn handle_account_unfrozen<E: Executor>(
     event: Event<AccountUnfrozen>,
-    action: Action<'_, CommandRow, E>,
+    action: Action<'_, CommandData, E>,
 ) -> anyhow::Result<()> {
     match action {
         Action::Apply(row) => {
@@ -346,7 +312,7 @@ async fn handle_account_unfrozen<E: Executor>(
 #[evento::handler]
 async fn handle_account_closed<E: Executor>(
     event: Event<AccountClosed>,
-    action: Action<'_, CommandRow, E>,
+    action: Action<'_, CommandData, E>,
 ) -> anyhow::Result<()> {
     match action {
         Action::Apply(row) => {
