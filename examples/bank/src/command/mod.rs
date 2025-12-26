@@ -199,6 +199,7 @@ async fn handle_money_deposit<E: Executor>(
             row.balance += event.data.amount;
         }
         Action::Handle(_context) => {
+            println!("test 1");
             let mut rows = COMMAND_ROWS.write().unwrap();
             if let Some(row) = rows.get_mut(&event.aggregator_id) {
                 row.0.balance += event.data.amount;

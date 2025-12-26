@@ -9,7 +9,7 @@ use std::str::FromStr;
 use evento::{
     cursor::{Args, Order, ReadResult},
     sql::{Reader, RwSqlite, Sql},
-    sql_migrator::{InitMigration, M0002, M0003},
+    sql_migrator::{InitMigration, M0002, M0003, M0004},
     Event,
 };
 use sea_query::{MysqlQueryBuilder, PostgresQueryBuilder, Query, SqliteQueryBuilder};
@@ -812,6 +812,7 @@ where
     InitMigration: sqlx_migrator::Migration<DB>,
     M0002: sqlx_migrator::Migration<DB>,
     M0003: sqlx_migrator::Migration<DB>,
+    M0004: sqlx_migrator::Migration<DB>,
     sqlx_migrator::Migrator<DB>: sqlx_migrator::migrator::DatabaseOperation<DB>,
 {
     install_default_drivers();

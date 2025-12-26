@@ -763,7 +763,7 @@ impl<P, E: Executor + 'static> SubscriptionBuilder<P, E> {
                     .acknowledge(
                         self.key(),
                         event.cursor.to_owned(),
-                        timestamp - event.node.timestamp,
+                        timestamp.saturating_sub(event.node.timestamp),
                     )
                     .await?;
             }
