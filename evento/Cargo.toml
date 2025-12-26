@@ -1,6 +1,6 @@
 [package]
 name = "evento"
-version = "2.0.0-alpha.3"
+version = "2.0.0-alpha.4"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -10,9 +10,9 @@ documentation = "https://docs.rs/evento"
 readme = "README.md"
 
 [dependencies]
-evento-core = { path = "../evento-core", version = "2.0.0-alpha.3" }
-evento-sql = { path = "../evento-sql", optional = true, version = "2.0.0-alpha.3" }
-evento-sql-migrator = { path = "../evento-sql-migrator", optional = true, version = "2.0.0-alpha.3" }
+evento-core = { path = "../evento-core", version = "2.0.0-alpha.4" }
+evento-sql = { path = "../evento-sql", optional = true, version = "2.0.0-alpha.4" }
+evento-sql-migrator = { path = "../evento-sql-migrator", optional = true, version = "2.0.0-alpha.4" }
 sqlx_migrator = { workspace = true, optional = true }
 
 [dev-dependencies]
