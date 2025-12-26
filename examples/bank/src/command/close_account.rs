@@ -8,13 +8,9 @@ pub struct CloseAccount {
     pub reason: String,
 }
 
-impl super::Command {
+impl<'a, E: Executor> super::Command<'a, E> {
     /// Handle CloseAccount command
-    pub async fn close_account<E: Executor>(
-        &self,
-        cmd: CloseAccount,
-        executor: &E,
-    ) -> Result<(), BankAccountError> {
+    pub async fn close_account(&self, cmd: CloseAccount) -> Result<(), BankAccountError> {
         if matches!(self.status, AccountStatus::Closed) {
             return Err(BankAccountError::AccountClosed);
         }
@@ -28,7 +24,7 @@ impl super::Command {
                 final_balance: self.balance,
             })
             .metadata(&Metadata::default())
-            .commit(executor)
+            .commit(self.executor)
             .await?;
 
         Ok(())

@@ -12,12 +12,9 @@ pub struct OpenAccount {
     pub initial_balance: i64,
 }
 
-impl super::Command {
+impl<'a, E: Executor> super::Command<'a, E> {
     /// Handle OpenAccount command - creates a new account
-    pub async fn open_account<E: Executor>(
-        cmd: OpenAccount,
-        executor: &E,
-    ) -> Result<String, BankAccountError> {
+    pub async fn open_account(cmd: OpenAccount, executor: &E) -> Result<String, BankAccountError> {
         if cmd.owner_id.is_empty() {
             return Err(BankAccountError::OwnerIdRequired);
         }
@@ -44,7 +41,7 @@ impl super::Command {
             .await?)
     }
 
-    pub async fn open_account_with_routing<E: Executor>(
+    pub async fn open_account_with_routing(
         cmd: OpenAccount,
         executor: &E,
         key: impl Into<String>,

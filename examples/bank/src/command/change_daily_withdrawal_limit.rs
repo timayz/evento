@@ -10,12 +10,11 @@ pub struct ChangeDailyWithdrawalLimit {
     pub new_limit: i64,
 }
 
-impl super::Command {
+impl<'a, E: Executor> super::Command<'a, E> {
     /// Handle ChangeDailyWithdrawalLimit command
-    pub async fn change_daily_withdrawal_limit<E: Executor>(
+    pub async fn change_daily_withdrawal_limit(
         &self,
         cmd: ChangeDailyWithdrawalLimit,
-        executor: &E,
     ) -> Result<(), BankAccountError> {
         if matches!(self.status, AccountStatus::Closed) {
             return Err(BankAccountError::AccountClosed);
@@ -29,7 +28,7 @@ impl super::Command {
                 new_limit: cmd.new_limit,
             })
             .metadata(&Metadata::default())
-            .commit(executor)
+            .commit(self.executor)
             .await?;
 
         Ok(())

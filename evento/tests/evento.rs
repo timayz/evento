@@ -40,8 +40,7 @@ pub async fn load<E: Executor>(executor: &E) -> anyhow::Result<()> {
         .expect("john account should exist");
 
     assert_eq!(john.balance, 1000);
-    assert_eq!(john.account_id, john_id);
-    assert_eq!(john.0.version, 1);
+    assert_eq!(john.event_version, 1);
     assert!(john.is_active());
 
     // Load Jane's account and verify initial state
@@ -50,19 +49,15 @@ pub async fn load<E: Executor>(executor: &E) -> anyhow::Result<()> {
         .expect("jane account should exist");
 
     assert_eq!(jane.balance, 500);
-    assert_eq!(jane.account_id, jane_id);
-    assert_eq!(jane.0.version, 1);
+    assert_eq!(jane.event_version, 1);
     assert!(jane.is_active());
 
     // Deposit money to John's account
-    john.deposit_money(
-        DepositMoney {
-            amount: 250,
-            transaction_id: Ulid::new().to_string(),
-            description: "Salary deposit".to_owned(),
-        },
-        executor,
-    )
+    john.deposit_money(DepositMoney {
+        amount: 250,
+        transaction_id: Ulid::new().to_string(),
+        description: "Salary deposit".to_owned(),
+    })
     .await?;
 
     // Reload John and verify updated balance and version
@@ -71,20 +66,17 @@ pub async fn load<E: Executor>(executor: &E) -> anyhow::Result<()> {
         .expect("john account should exist");
 
     assert_eq!(john.balance, 1250);
-    assert_eq!(john.0.version, 2);
+    assert_eq!(john.event_version, 2);
 
     // Transfer money from John to Jane
     let transaction_id = Ulid::new().to_string();
 
-    john.transfer_money(
-        TransferMoney {
-            amount: 300,
-            to_account_id: jane_id.clone(),
-            transaction_id: transaction_id.clone(),
-            description: "Payment to Jane".to_owned(),
-        },
-        executor,
-    )
+    john.transfer_money(TransferMoney {
+        amount: 300,
+        to_account_id: jane_id.clone(),
+        transaction_id: transaction_id.clone(),
+        description: "Payment to Jane".to_owned(),
+    })
     .await?;
 
     // Jane receives the money
@@ -92,15 +84,12 @@ pub async fn load<E: Executor>(executor: &E) -> anyhow::Result<()> {
         .await?
         .expect("jane account should exist");
 
-    jane.receive_money(
-        ReceiveMoney {
-            amount: 300,
-            from_account_id: john_id.clone(),
-            transaction_id,
-            description: "Payment from John".to_owned(),
-        },
-        executor,
-    )
+    jane.receive_money(ReceiveMoney {
+        amount: 300,
+        from_account_id: john_id.clone(),
+        transaction_id,
+        description: "Payment from John".to_owned(),
+    })
     .await?;
 
     // Verify final balances and versions
@@ -112,9 +101,9 @@ pub async fn load<E: Executor>(executor: &E) -> anyhow::Result<()> {
         .expect("jane account should exist");
 
     assert_eq!(john.balance, 950); // 1250 - 300
-    assert_eq!(john.0.version, 3); // AccountOpened + MoneyDeposited + MoneyTransferred
+    assert_eq!(john.event_version, 3); // AccountOpened + MoneyDeposited + MoneyTransferred
     assert_eq!(jane.balance, 800); // 500 + 300
-    assert_eq!(jane.0.version, 2); // AccountOpened + MoneyReceived
+    assert_eq!(jane.event_version, 2); // AccountOpened + MoneyReceived
 
     // Verify non-existent account returns None
     let non_existent = bank::load(executor, "non_existent_id").await?;
@@ -143,20 +132,17 @@ pub async fn routing_key<E: Executor>(executor: &E) -> anyhow::Result<()> {
         .await?
         .expect("account should exist");
 
-    assert_eq!(account.0.routing_key, Some("us-east-1".to_owned()));
-    assert_eq!(account.0.version, 1);
+    assert_eq!(account.event_routing_key, Some("us-east-1".to_owned()));
+    assert_eq!(account.event_version, 1);
     assert_eq!(account.balance, 1000);
 
     // Deposit money - routing key should be preserved from first event
     account
-        .deposit_money(
-            DepositMoney {
-                amount: 500,
-                transaction_id: Ulid::new().to_string(),
-                description: "Deposit".to_owned(),
-            },
-            executor,
-        )
+        .deposit_money(DepositMoney {
+            amount: 500,
+            transaction_id: Ulid::new().to_string(),
+            description: "Deposit".to_owned(),
+        })
         .await?;
 
     // Reload and verify routing key is preserved and version incremented
@@ -164,8 +150,8 @@ pub async fn routing_key<E: Executor>(executor: &E) -> anyhow::Result<()> {
         .await?
         .expect("account should exist");
 
-    assert_eq!(account.0.routing_key, Some("us-east-1".to_owned()));
-    assert_eq!(account.0.version, 2);
+    assert_eq!(account.event_routing_key, Some("us-east-1".to_owned()));
+    assert_eq!(account.event_version, 2);
     assert_eq!(account.balance, 1500);
 
     // Create another account with different routing key "eu-west-1"
@@ -186,8 +172,8 @@ pub async fn routing_key<E: Executor>(executor: &E) -> anyhow::Result<()> {
         .await?
         .expect("account2 should exist");
 
-    assert_eq!(account2.0.routing_key, Some("eu-west-1".to_owned()));
-    assert_eq!(account2.0.version, 1);
+    assert_eq!(account2.event_routing_key, Some("eu-west-1".to_owned()));
+    assert_eq!(account2.event_version, 1);
 
     // Create account WITHOUT routing key
     let account3_id = Command::open_account(
@@ -206,27 +192,24 @@ pub async fn routing_key<E: Executor>(executor: &E) -> anyhow::Result<()> {
         .await?
         .expect("account3 should exist");
 
-    assert_eq!(account3.0.routing_key, None);
-    assert_eq!(account3.0.version, 1);
+    assert_eq!(account3.event_routing_key, None);
+    assert_eq!(account3.event_version, 1);
 
     // Deposit to account without routing key - should remain None
     account3
-        .deposit_money(
-            DepositMoney {
-                amount: 100,
-                transaction_id: Ulid::new().to_string(),
-                description: "Small deposit".to_owned(),
-            },
-            executor,
-        )
+        .deposit_money(DepositMoney {
+            amount: 100,
+            transaction_id: Ulid::new().to_string(),
+            description: "Small deposit".to_owned(),
+        })
         .await?;
 
     let account3 = bank::load(executor, &account3_id)
         .await?
         .expect("account3 should exist");
 
-    assert_eq!(account3.0.routing_key, None);
-    assert_eq!(account3.0.version, 2);
+    assert_eq!(account3.event_routing_key, None);
+    assert_eq!(account3.event_version, 2);
     assert_eq!(account3.balance, 3100);
 
     Ok(())
@@ -268,14 +251,11 @@ pub async fn load_multiple_aggregator<E: Executor>(executor: &E) -> anyhow::Resu
     // Deposit money
     let bank_account = bank::load(executor, &account_id).await?.unwrap();
     bank_account
-        .deposit_money(
-            DepositMoney {
-                amount: 500,
-                transaction_id: Ulid::new().to_string(),
-                description: "Deposit".to_owned(),
-            },
-            executor,
-        )
+        .deposit_money(DepositMoney {
+            amount: 500,
+            transaction_id: Ulid::new().to_string(),
+            description: "Deposit".to_owned(),
+        })
         .await?;
 
     // Update owner name
@@ -310,7 +290,7 @@ pub async fn load_multiple_aggregator<E: Executor>(executor: &E) -> anyhow::Resu
 }
 
 pub async fn load_with_snapshot<E: Executor>(executor: &E) -> anyhow::Result<()> {
-    use bank::{AccountStatus, CommandRow};
+    use bank::{AccountStatus, CommandData};
 
     // Create an account
     let account_id = Command::open_account(
@@ -328,26 +308,20 @@ pub async fn load_with_snapshot<E: Executor>(executor: &E) -> anyhow::Result<()>
     // Deposit money twice (version 2 and 3)
     let account = bank::load(executor, &account_id).await?.unwrap();
     account
-        .deposit_money(
-            DepositMoney {
-                amount: 200,
-                transaction_id: Ulid::new().to_string(),
-                description: "Deposit 1".to_owned(),
-            },
-            executor,
-        )
+        .deposit_money(DepositMoney {
+            amount: 200,
+            transaction_id: Ulid::new().to_string(),
+            description: "Deposit 1".to_owned(),
+        })
         .await?;
 
     let account = bank::load(executor, &account_id).await?.unwrap();
     account
-        .deposit_money(
-            DepositMoney {
-                amount: 300,
-                transaction_id: Ulid::new().to_string(),
-                description: "Deposit 2".to_owned(),
-            },
-            executor,
-        )
+        .deposit_money(DepositMoney {
+            amount: 300,
+            transaction_id: Ulid::new().to_string(),
+            description: "Deposit 2".to_owned(),
+        })
         .await?;
 
     // Now we have events: AccountOpened(v1), MoneyDeposited(v2), MoneyDeposited(v3)
@@ -360,8 +334,7 @@ pub async fn load_with_snapshot<E: Executor>(executor: &E) -> anyhow::Result<()>
         rows.insert(
             account_id.clone(),
             (
-                CommandRow {
-                    account_id: account_id.clone(),
+                CommandData {
                     balance: 1000, // snapshot at version 1
                     status: AccountStatus::Active,
                     overdraft_limit: 0,
@@ -377,7 +350,7 @@ pub async fn load_with_snapshot<E: Executor>(executor: &E) -> anyhow::Result<()>
     let account = bank::load(executor, &account_id).await?.unwrap();
 
     assert_eq!(account.balance, 1500); // 1000 (snapshot) + 200 + 300
-    assert_eq!(account.0.version, 3);
+    assert_eq!(account.event_version, 3);
 
     // Test with a snapshot at version 2
     {
@@ -385,8 +358,7 @@ pub async fn load_with_snapshot<E: Executor>(executor: &E) -> anyhow::Result<()>
         rows.insert(
             account_id.clone(),
             (
-                CommandRow {
-                    account_id: account_id.clone(),
+                CommandData {
                     balance: 1200, // snapshot at version 2 (1000 + 200)
                     status: AccountStatus::Active,
                     overdraft_limit: 0,
@@ -402,7 +374,7 @@ pub async fn load_with_snapshot<E: Executor>(executor: &E) -> anyhow::Result<()>
     let account = bank::load(executor, &account_id).await?.unwrap();
 
     assert_eq!(account.balance, 1500); // 1200 (snapshot) + 300
-    assert_eq!(account.0.version, 3);
+    assert_eq!(account.event_version, 3);
 
     // Test with snapshot at latest version (no events to apply)
     {
@@ -410,8 +382,7 @@ pub async fn load_with_snapshot<E: Executor>(executor: &E) -> anyhow::Result<()>
         rows.insert(
             account_id.clone(),
             (
-                CommandRow {
-                    account_id: account_id.clone(),
+                CommandData {
                     balance: 1500, // snapshot at version 3 (full state)
                     status: AccountStatus::Active,
                     overdraft_limit: 0,
@@ -426,7 +397,7 @@ pub async fn load_with_snapshot<E: Executor>(executor: &E) -> anyhow::Result<()>
     let account = bank::load(executor, &account_id).await?.unwrap();
 
     assert_eq!(account.balance, 1500);
-    assert_eq!(account.0.version, 3);
+    assert_eq!(account.event_version, 3);
 
     Ok(())
 }
@@ -455,39 +426,33 @@ pub async fn invalid_original_version<E: Executor>(executor: &E) -> anyhow::Resu
         .expect("account should exist");
 
     // Both have version 1
-    assert_eq!(account_v1_first.0.version, 1);
-    assert_eq!(account_v1_second.0.version, 1);
+    assert_eq!(account_v1_first.event_version, 1);
+    assert_eq!(account_v1_second.event_version, 1);
 
     // First load commits successfully (version 1 -> 2)
     account_v1_first
-        .deposit_money(
-            DepositMoney {
-                amount: 100,
-                transaction_id: Ulid::new().to_string(),
-                description: "First deposit".to_owned(),
-            },
-            executor,
-        )
+        .deposit_money(DepositMoney {
+            amount: 100,
+            transaction_id: Ulid::new().to_string(),
+            description: "First deposit".to_owned(),
+        })
         .await?;
 
     // Verify first commit succeeded
     let account_after_first = bank::load(executor, &account_id)
         .await?
         .expect("account should exist");
-    assert_eq!(account_after_first.0.version, 2);
+    assert_eq!(account_after_first.event_version, 2);
     assert_eq!(account_after_first.balance, 1100);
 
     // Second load tries to commit with stale version 1
     // This should fail because version is now 2
     let result = account_v1_second
-        .deposit_money(
-            DepositMoney {
-                amount: 200,
-                transaction_id: Ulid::new().to_string(),
-                description: "Second deposit (should fail)".to_owned(),
-            },
-            executor,
-        )
+        .deposit_money(DepositMoney {
+            amount: 200,
+            transaction_id: Ulid::new().to_string(),
+            description: "Second deposit (should fail)".to_owned(),
+        })
         .await;
 
     // Should get InvalidOriginalVersion error
@@ -503,7 +468,7 @@ pub async fn invalid_original_version<E: Executor>(executor: &E) -> anyhow::Resu
     let account_final = bank::load(executor, &account_id)
         .await?
         .expect("account should exist");
-    assert_eq!(account_final.0.version, 2);
+    assert_eq!(account_final.event_version, 2);
     assert_eq!(account_final.balance, 1100); // Only first deposit counted
 
     Ok(())
@@ -560,40 +525,31 @@ pub async fn subscribe<E: Executor + Clone>(
     // Perform some operations
     let alice = bank::load(executor, &alice_id).await?.unwrap();
     alice
-        .deposit_money(
-            DepositMoney {
-                amount: 200,
-                transaction_id: Ulid::new().to_string(),
-                description: "Deposit".to_owned(),
-            },
-            executor,
-        )
+        .deposit_money(DepositMoney {
+            amount: 200,
+            transaction_id: Ulid::new().to_string(),
+            description: "Deposit".to_owned(),
+        })
         .await?;
 
     let alice = bank::load(executor, &alice_id).await?.unwrap();
     let transaction_id = Ulid::new().to_string();
     alice
-        .transfer_money(
-            TransferMoney {
-                amount: 300,
-                to_account_id: bob_id.clone(),
-                transaction_id: transaction_id.clone(),
-                description: "Transfer to Bob".to_owned(),
-            },
-            executor,
-        )
+        .transfer_money(TransferMoney {
+            amount: 300,
+            to_account_id: bob_id.clone(),
+            transaction_id: transaction_id.clone(),
+            description: "Transfer to Bob".to_owned(),
+        })
         .await?;
 
     let bob = bank::load(executor, &bob_id).await?.unwrap();
-    bob.receive_money(
-        ReceiveMoney {
-            amount: 300,
-            from_account_id: alice_id.clone(),
-            transaction_id,
-            description: "From Alice".to_owned(),
-        },
-        executor,
-    )
+    bob.receive_money(ReceiveMoney {
+        amount: 300,
+        from_account_id: alice_id.clone(),
+        transaction_id,
+        description: "From Alice".to_owned(),
+    })
     .await?;
 
     // Remove only this test's accounts to simulate fresh projection state
@@ -620,13 +576,11 @@ pub async fn subscribe<E: Executor + Clone>(
     let alice_row = rows
         .get(&alice_id)
         .expect("Alice should exist in projection");
-    assert_eq!(alice_row.0.account_id, alice_id);
     assert_eq!(alice_row.0.balance, 900); // 1000 + 200 - 300
     assert_eq!(alice_row.1, 3); // version: AccountOpened + MoneyDeposited + MoneyTransferred
 
     // Check Bob's account
     let bob_row = rows.get(&bob_id).expect("Bob should exist in projection");
-    assert_eq!(bob_row.0.account_id, bob_id);
     assert_eq!(bob_row.0.balance, 800); // 500 + 300
     assert_eq!(bob_row.1, 2); // version: AccountOpened + MoneyReceived
 
@@ -668,26 +622,20 @@ pub async fn subscribe_routing_key<E: Executor + Clone>(
     // Deposit to both accounts
     let us_account = bank::load(executor, &us_account_id).await?.unwrap();
     us_account
-        .deposit_money(
-            DepositMoney {
-                amount: 500,
-                transaction_id: Ulid::new().to_string(),
-                description: "US deposit".to_owned(),
-            },
-            executor,
-        )
+        .deposit_money(DepositMoney {
+            amount: 500,
+            transaction_id: Ulid::new().to_string(),
+            description: "US deposit".to_owned(),
+        })
         .await?;
 
     let eu_account = bank::load(executor, &eu_account_id).await?.unwrap();
     eu_account
-        .deposit_money(
-            DepositMoney {
-                amount: 300,
-                transaction_id: Ulid::new().to_string(),
-                description: "EU deposit".to_owned(),
-            },
-            executor,
-        )
+        .deposit_money(DepositMoney {
+            amount: 300,
+            transaction_id: Ulid::new().to_string(),
+            description: "EU deposit".to_owned(),
+        })
         .await?;
 
     // Remove only this test's accounts from projection
@@ -778,26 +726,20 @@ pub async fn subscribe_default<E: Executor + Clone>(
     // Deposit to both accounts
     let default_account = bank::load(executor, &default_account_id).await?.unwrap();
     default_account
-        .deposit_money(
-            DepositMoney {
-                amount: 500,
-                transaction_id: Ulid::new().to_string(),
-                description: "Default deposit".to_owned(),
-            },
-            executor,
-        )
+        .deposit_money(DepositMoney {
+            amount: 500,
+            transaction_id: Ulid::new().to_string(),
+            description: "Default deposit".to_owned(),
+        })
         .await?;
 
     let routed_account = bank::load(executor, &routed_account_id).await?.unwrap();
     routed_account
-        .deposit_money(
-            DepositMoney {
-                amount: 300,
-                transaction_id: Ulid::new().to_string(),
-                description: "Routed deposit".to_owned(),
-            },
-            executor,
-        )
+        .deposit_money(DepositMoney {
+            amount: 300,
+            transaction_id: Ulid::new().to_string(),
+            description: "Routed deposit".to_owned(),
+        })
         .await?;
 
     // Remove only this test's accounts from projection
@@ -880,14 +822,11 @@ pub async fn subscribe_multiple_aggregator<E: Executor + Clone>(
     // Deposit some money
     let account = bank::load(executor, &account_id).await?.unwrap();
     account
-        .deposit_money(
-            DepositMoney {
-                amount: 500,
-                transaction_id: Ulid::new().to_string(),
-                description: "Deposit".to_owned(),
-            },
-            executor,
-        )
+        .deposit_money(DepositMoney {
+            amount: 500,
+            transaction_id: Ulid::new().to_string(),
+            description: "Deposit".to_owned(),
+        })
         .await?;
 
     // Update owner name using evento::aggregator()
@@ -1229,70 +1168,64 @@ pub async fn all_commands<E: Executor + Clone>(
         .await?
         .expect("Account A should exist");
     assert_eq!(account_a.balance, 5000);
-    assert_eq!(account_a.0.version, 1);
+    assert_eq!(account_a.event_version, 1);
     assert!(account_a.is_active());
 
     let account_b = bank::load(executor, &account_b_id)
         .await?
         .expect("Account B should exist");
     assert_eq!(account_b.balance, 1000);
-    assert_eq!(account_b.0.routing_key, Some("region-1".to_owned()));
+    assert_eq!(account_b.event_routing_key, Some("region-1".to_owned()));
 
     // =========================================================================
     // 2. DepositMoney
     // =========================================================================
 
     account_a
-        .deposit_money(
-            DepositMoney {
-                amount: 2500,
-                transaction_id: Ulid::new().to_string(),
-                description: "Salary deposit".to_owned(),
-            },
-            executor,
-        )
+        .deposit_money(DepositMoney {
+            amount: 2500,
+            transaction_id: Ulid::new().to_string(),
+            description: "Salary deposit".to_owned(),
+        })
         .await?;
 
     let account_a = bank::load(executor, &account_a_id)
         .await?
         .expect("Account A should exist");
     assert_eq!(account_a.balance, 7500); // 5000 + 2500
-    assert_eq!(account_a.0.version, 2);
+    assert_eq!(account_a.event_version, 2);
 
     // =========================================================================
     // 3. WithdrawMoney
     // =========================================================================
 
     account_a
-        .withdraw_money(
-            WithdrawMoney {
-                amount: 500,
-                transaction_id: Ulid::new().to_string(),
-                description: "ATM withdrawal".to_owned(),
-            },
-            executor,
-        )
+        .withdraw_money(WithdrawMoney {
+            amount: 500,
+            transaction_id: Ulid::new().to_string(),
+            description: "ATM withdrawal".to_owned(),
+        })
         .await?;
 
     let account_a = bank::load(executor, &account_a_id)
         .await?
         .expect("Account A should exist");
     assert_eq!(account_a.balance, 7000); // 7500 - 500
-    assert_eq!(account_a.0.version, 3);
+    assert_eq!(account_a.event_version, 3);
 
     // =========================================================================
     // 4. ChangeOverdraftLimit
     // =========================================================================
 
     account_a
-        .change_overdraft_limit(ChangeOverdraftLimit { new_limit: 1000 }, executor)
+        .change_overdraft_limit(ChangeOverdraftLimit { new_limit: 1000 })
         .await?;
 
     let account_a = bank::load(executor, &account_a_id)
         .await?
         .expect("Account A should exist");
     assert_eq!(account_a.overdraft_limit, 1000);
-    assert_eq!(account_a.0.version, 4);
+    assert_eq!(account_a.event_version, 4);
 
     // =========================================================================
     // 5. TransferMoney / ReceiveMoney
@@ -1302,15 +1235,12 @@ pub async fn all_commands<E: Executor + Clone>(
 
     // Alice transfers to Bob
     account_a
-        .transfer_money(
-            TransferMoney {
-                amount: 2000,
-                to_account_id: account_b_id.clone(),
-                transaction_id: transfer_tx_id.clone(),
-                description: "Payment to Bob".to_owned(),
-            },
-            executor,
-        )
+        .transfer_money(TransferMoney {
+            amount: 2000,
+            to_account_id: account_b_id.clone(),
+            transaction_id: transfer_tx_id.clone(),
+            description: "Payment to Bob".to_owned(),
+        })
         .await?;
 
     // Bob receives from Alice
@@ -1318,15 +1248,12 @@ pub async fn all_commands<E: Executor + Clone>(
         .await?
         .expect("Account B should exist");
     account_b
-        .receive_money(
-            ReceiveMoney {
-                amount: 2000,
-                from_account_id: account_a_id.clone(),
-                transaction_id: transfer_tx_id,
-                description: "Payment from Alice".to_owned(),
-            },
-            executor,
-        )
+        .receive_money(ReceiveMoney {
+            amount: 2000,
+            from_account_id: account_a_id.clone(),
+            transaction_id: transfer_tx_id,
+            description: "Payment from Alice".to_owned(),
+        })
         .await?;
 
     // Verify balances after transfer
@@ -1338,57 +1265,48 @@ pub async fn all_commands<E: Executor + Clone>(
         .expect("Account B should exist");
 
     assert_eq!(account_a.balance, 5000); // 7000 - 2000
-    assert_eq!(account_a.0.version, 5);
+    assert_eq!(account_a.event_version, 5);
     assert_eq!(account_b.balance, 3000); // 1000 + 2000
-    assert_eq!(account_b.0.version, 2);
+    assert_eq!(account_b.event_version, 2);
 
     // =========================================================================
     // 6. FreezeAccount / UnfreezeAccount
     // =========================================================================
 
     account_a
-        .freeze_account(
-            FreezeAccount {
-                reason: "Suspicious activity detected".to_owned(),
-            },
-            executor,
-        )
+        .freeze_account(FreezeAccount {
+            reason: "Suspicious activity detected".to_owned(),
+        })
         .await?;
 
     let account_a = bank::load(executor, &account_a_id)
         .await?
         .expect("Account A should exist");
     assert!(account_a.is_frozen());
-    assert_eq!(account_a.0.version, 6);
+    assert_eq!(account_a.event_version, 6);
 
     // Try to withdraw while frozen - should fail
     let withdraw_result = account_a
-        .withdraw_money(
-            WithdrawMoney {
-                amount: 100,
-                transaction_id: Ulid::new().to_string(),
-                description: "Should fail".to_owned(),
-            },
-            executor,
-        )
+        .withdraw_money(WithdrawMoney {
+            amount: 100,
+            transaction_id: Ulid::new().to_string(),
+            description: "Should fail".to_owned(),
+        })
         .await;
     assert!(withdraw_result.is_err());
 
     // Unfreeze the account
     account_a
-        .unfreeze_account(
-            UnfreezeAccount {
-                reason: "Investigation complete".to_owned(),
-            },
-            executor,
-        )
+        .unfreeze_account(UnfreezeAccount {
+            reason: "Investigation complete".to_owned(),
+        })
         .await?;
 
     let account_a = bank::load(executor, &account_a_id)
         .await?
         .expect("Account A should exist");
     assert!(account_a.is_active());
-    assert_eq!(account_a.0.version, 7);
+    assert_eq!(account_a.event_version, 7);
 
     // =========================================================================
     // 7. CloseAccount
@@ -1396,48 +1314,39 @@ pub async fn all_commands<E: Executor + Clone>(
 
     // First, withdraw remaining balance to prepare for closure
     account_a
-        .withdraw_money(
-            WithdrawMoney {
-                amount: 5000,
-                transaction_id: Ulid::new().to_string(),
-                description: "Final withdrawal before closure".to_owned(),
-            },
-            executor,
-        )
+        .withdraw_money(WithdrawMoney {
+            amount: 5000,
+            transaction_id: Ulid::new().to_string(),
+            description: "Final withdrawal before closure".to_owned(),
+        })
         .await?;
 
     let account_a = bank::load(executor, &account_a_id)
         .await?
         .expect("Account A should exist");
     assert_eq!(account_a.balance, 0);
-    assert_eq!(account_a.0.version, 8);
+    assert_eq!(account_a.event_version, 8);
 
     // Close the account
     account_a
-        .close_account(
-            CloseAccount {
-                reason: "Customer request".to_owned(),
-            },
-            executor,
-        )
+        .close_account(CloseAccount {
+            reason: "Customer request".to_owned(),
+        })
         .await?;
 
     let account_a = bank::load(executor, &account_a_id)
         .await?
         .expect("Account A should exist");
     assert!(account_a.is_closed());
-    assert_eq!(account_a.0.version, 9);
+    assert_eq!(account_a.event_version, 9);
 
     // Try operations on closed account - should fail
     let deposit_result = account_a
-        .deposit_money(
-            DepositMoney {
-                amount: 100,
-                transaction_id: Ulid::new().to_string(),
-                description: "Should fail".to_owned(),
-            },
-            executor,
-        )
+        .deposit_money(DepositMoney {
+            amount: 100,
+            transaction_id: Ulid::new().to_string(),
+            description: "Should fail".to_owned(),
+        })
         .await;
     assert!(deposit_result.is_err());
 

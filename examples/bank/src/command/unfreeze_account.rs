@@ -8,13 +8,9 @@ pub struct UnfreezeAccount {
     pub reason: String,
 }
 
-impl super::Command {
+impl<'a, E: Executor> super::Command<'a, E> {
     /// Handle UnfreezeAccount command
-    pub async fn unfreeze_account<E: Executor>(
-        &self,
-        cmd: UnfreezeAccount,
-        executor: &E,
-    ) -> Result<(), BankAccountError> {
+    pub async fn unfreeze_account(&self, cmd: UnfreezeAccount) -> Result<(), BankAccountError> {
         if matches!(self.status, AccountStatus::Closed) {
             return Err(BankAccountError::AccountClosed);
         }
@@ -25,7 +21,7 @@ impl super::Command {
         self.aggregator()
             .event(&AccountUnfrozen { reason: cmd.reason })
             .metadata(&Metadata::default())
-            .commit(executor)
+            .commit(self.executor)
             .await?;
 
         Ok(())

@@ -187,14 +187,11 @@ async fn deposit(
         .flatten()
     {
         let _ = account
-            .deposit_money(
-                DepositMoney {
-                    amount: form.amount,
-                    transaction_id: Ulid::new().to_string(),
-                    description: "Web deposit".to_string(),
-                },
-                state.executor.as_ref(),
-            )
+            .deposit_money(DepositMoney {
+                amount: form.amount,
+                transaction_id: Ulid::new().to_string(),
+                description: "Web deposit".to_string(),
+            })
             .await;
     }
 
@@ -217,14 +214,11 @@ async fn withdraw(
         .flatten()
     {
         let _ = account
-            .withdraw_money(
-                WithdrawMoney {
-                    amount: form.amount,
-                    transaction_id: Ulid::new().to_string(),
-                    description: "Web withdrawal".to_string(),
-                },
-                state.executor.as_ref(),
-            )
+            .withdraw_money(WithdrawMoney {
+                amount: form.amount,
+                transaction_id: Ulid::new().to_string(),
+                description: "Web withdrawal".to_string(),
+            })
             .await;
     }
 
@@ -248,15 +242,12 @@ async fn transfer(
         .flatten()
     {
         let _ = account
-            .transfer_money(
-                TransferMoney {
-                    amount: form.amount,
-                    to_account_id: form.to_account_id,
-                    transaction_id: Ulid::new().to_string(),
-                    description: "Web transfer".to_string(),
-                },
-                state.executor.as_ref(),
-            )
+            .transfer_money(TransferMoney {
+                amount: form.amount,
+                to_account_id: form.to_account_id,
+                transaction_id: Ulid::new().to_string(),
+                description: "Web transfer".to_string(),
+            })
             .await;
     }
 

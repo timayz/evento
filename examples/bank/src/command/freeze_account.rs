@@ -8,13 +8,9 @@ pub struct FreezeAccount {
     pub reason: String,
 }
 
-impl super::Command {
+impl<'a, E: Executor> super::Command<'a, E> {
     /// Handle FreezeAccount command
-    pub async fn freeze_account<E: Executor>(
-        &self,
-        cmd: FreezeAccount,
-        executor: &E,
-    ) -> Result<(), BankAccountError> {
+    pub async fn freeze_account(&self, cmd: FreezeAccount) -> Result<(), BankAccountError> {
         if matches!(self.status, AccountStatus::Closed) {
             return Err(BankAccountError::AccountClosed);
         }
@@ -25,7 +21,7 @@ impl super::Command {
         self.aggregator()
             .event(&AccountFrozen { reason: cmd.reason })
             .metadata(&Metadata::default())
-            .commit(executor)
+            .commit(self.executor)
             .await?;
 
         Ok(())
