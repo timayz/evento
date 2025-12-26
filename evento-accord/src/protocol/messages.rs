@@ -52,10 +52,15 @@ impl Message {
     }
 
     /// Get the transaction ID this message is about.
-    /// Panics for sync messages - use txn_id_opt() instead.
+    /// For SyncRequest, returns the request_id.
+    /// For SyncResponse, returns the request_id if present, otherwise panics.
     pub fn txn_id(&self) -> TxnId {
-        self.txn_id_opt()
-            .expect("Sync messages don't have a single txn_id")
+        match self {
+            Message::SyncRequest(req) => req.request_id,
+            _ => self
+                .txn_id_opt()
+                .expect("Message should have a txn_id"),
+        }
     }
 
     /// Get the message type name for logging.

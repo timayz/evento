@@ -1,0 +1,20 @@
+[package]
+name = "bank-axum-cluster"
+version = "2.0.0-alpha.3"
+edition = "2021"
+
+[dependencies]
+bank.workspace = true
+evento = { workspace = true, features = ["sqlite"] }
+evento-accord = { workspace = true, features = ["sqlite"] }
+axum.workspace = true
+askama.workspace = true
+tokio.workspace = true
+serde.workspace = true
+sqlx = { workspace = true, features = ["runtime-tokio", "sqlite"] }
+sqlx_migrator.workspace = true
+ulid.workspace = true
+anyhow.workspace = true
+clap = { version = "4", features = ["derive"] }
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

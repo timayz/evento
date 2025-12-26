@@ -89,6 +89,23 @@ impl std::fmt::Display for Timestamp {
     }
 }
 
+impl std::str::FromStr for Timestamp {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let parts: Vec<&str> = s.split('.').collect();
+        if parts.len() != 3 {
+            return Err(format!("invalid timestamp format: expected 'time.seq.node_id', got '{}'", s));
+        }
+
+        let time = parts[0].parse::<u64>().map_err(|e| format!("invalid time: {}", e))?;
+        let seq = parts[1].parse::<u32>().map_err(|e| format!("invalid seq: {}", e))?;
+        let node_id = parts[2].parse::<u16>().map_err(|e| format!("invalid node_id: {}", e))?;
+
+        Ok(Timestamp::new(time, seq, node_id))
+    }
+}
+
 /// State for the hybrid clock
 #[derive(Clone, Copy, Default)]
 struct ClockState {

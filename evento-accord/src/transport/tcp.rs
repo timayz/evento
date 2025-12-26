@@ -189,6 +189,14 @@ impl TcpTransport {
         self.connect_with_retry(node).await
     }
 
+    /// Mark a connection as unhealthy, forcing reconnection on next use.
+    async fn mark_connection_unhealthy(&self, node: NodeId) {
+        let conns = self.connections.read().await;
+        if let Some(handle) = conns.get(&node) {
+            handle.healthy.store(false, Ordering::Relaxed);
+        }
+    }
+
     /// Connect to a peer with exponential backoff retry.
     async fn connect_with_retry(
         &self,
@@ -302,8 +310,14 @@ impl TcpTransport {
                         }
                     }
                     Err(e) => {
-                        tracing::debug!("Connection to node {} read error: {}", node_id, e);
+                        tracing::warn!("Connection to node {} read error: {} - marking unhealthy", node_id, e);
                         healthy_clone.store(false, Ordering::Relaxed);
+                        // Notify all pending requests about the connection failure
+                        let mut pending = pending_clone.write().await;
+                        for (txn_id, reply_tx) in pending.drain() {
+                            tracing::debug!("Notifying pending request {} of connection failure to node {}", txn_id, node_id);
+                            let _ = reply_tx.send(Err(AccordError::NodeUnreachable(node_id)));
+                        }
                         break;
                     }
                 }
@@ -352,10 +366,27 @@ impl Transport for TcpTransport {
             .await
             .map_err(|_| AccordError::NodeUnreachable(node))?;
 
-        let result = timeout(self.request_timeout, reply_rx)
-            .await
-            .map_err(|_| AccordError::Timeout(format!("request to node {}", node)))?
-            .map_err(|_| AccordError::NodeUnreachable(node))?;
+        let result = match timeout(self.request_timeout, reply_rx).await {
+            Ok(Ok(msg)) => Ok(msg),
+            Ok(Err(_)) => {
+                // Channel closed - connection is dead
+                self.mark_connection_unhealthy(node).await;
+                Err(AccordError::NodeUnreachable(node))
+            }
+            Err(_) => {
+                // Timeout - connection is likely dead, mark as unhealthy for reconnection
+                tracing::debug!(
+                    "Timeout: node {} waiting for response from node {}, marking connection unhealthy",
+                    self.local_id,
+                    node
+                );
+                self.mark_connection_unhealthy(node).await;
+                Err(AccordError::Timeout(format!(
+                    "node {} waiting for response from node {}",
+                    self.local_id, node
+                )))
+            }
+        }?;
 
         // Update last activity on successful response
         if result.is_ok() {

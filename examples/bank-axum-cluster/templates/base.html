@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Bank{% endblock %}</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            line-height: 1.6;
+            background: #f5f5f5;
+            color: #333;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        header {
+            background: #2563eb;
+            color: white;
+            padding: 1rem;
+            margin-bottom: 2rem;
+        }
+        header h1 {
+            font-size: 1.5rem;
+        }
+        header .node-badge {
+            display: inline-block;
+            background: rgba(255,255,255,0.2);
+            padding: 0.25rem 0.5rem;
+            border-radius: 4px;
+            font-size: 0.875rem;
+            margin-left: 1rem;
+        }
+        header nav {
+            margin-top: 0.5rem;
+        }
+        header a {
+            color: white;
+            text-decoration: none;
+            margin-right: 1rem;
+        }
+        header a:hover {
+            text-decoration: underline;
+        }
+        .cluster-info {
+            background: #fef3c7;
+            border: 1px solid #fbbf24;
+            border-radius: 4px;
+            padding: 0.75rem;
+            margin-bottom: 1rem;
+            font-size: 0.875rem;
+        }
+        .cluster-info a {
+            color: #2563eb;
+        }
+        .card {
+            background: white;
+            border-radius: 8px;
+            padding: 1.5rem;
+            margin-bottom: 1rem;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+        .card h2 {
+            margin-bottom: 1rem;
+            color: #1f2937;
+        }
+        .btn {
+            display: inline-block;
+            padding: 0.5rem 1rem;
+            background: #2563eb;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            text-decoration: none;
+            font-size: 0.875rem;
+        }
+        .btn:hover {
+            background: #1d4ed8;
+        }
+        .btn-success {
+            background: #16a34a;
+        }
+        .btn-success:hover {
+            background: #15803d;
+        }
+        .btn-danger {
+            background: #dc2626;
+        }
+        .btn-danger:hover {
+            background: #b91c1c;
+        }
+        .form-group {
+            margin-bottom: 1rem;
+        }
+        .form-group label {
+            display: block;
+            margin-bottom: 0.25rem;
+            font-weight: 500;
+        }
+        .form-group input, .form-group select {
+            width: 100%;
+            padding: 0.5rem;
+            border: 1px solid #d1d5db;
+            border-radius: 4px;
+            font-size: 1rem;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        th, td {
+            padding: 0.75rem;
+            text-align: left;
+            border-bottom: 1px solid #e5e7eb;
+        }
+        th {
+            background: #f9fafb;
+            font-weight: 600;
+        }
+        .balance {
+            font-size: 2rem;
+            font-weight: bold;
+            color: #16a34a;
+        }
+        .balance.negative {
+            color: #dc2626;
+        }
+        .inline-form {
+            display: flex;
+            gap: 0.5rem;
+            align-items: end;
+        }
+        .inline-form .form-group {
+            margin-bottom: 0;
+            flex: 1;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="container">
+            <h1>Evento Bank <span class="node-badge">Node {{ node_id }}</span></h1>
+            <nav>
+                <a href="/">Home</a>
+                <a href="/accounts">Accounts</a>
+                <a href="/accounts/new">New Account</a>
+            </nav>
+        </div>
+    </header>
+    <main class="container">
+        <div class="cluster-info">
+            <strong>ACCORD Cluster:</strong>
+            <a href="http://127.0.0.1:3000">Node 0</a> |
+            <a href="http://127.0.0.1:3001">Node 1</a> |
+            <a href="http://127.0.0.1:3002">Node 2</a>
+            (You are on Node {{ node_id }})
+        </div>
+        {% block content %}{% endblock %}
+    </main>
+</body>
+</html>

@@ -18,6 +18,12 @@ anyhow = { workspace = true }
 ulid = { workspace = true }
 futures = "0.3"
 
+# SQL support (optional)
+sqlx = { workspace = true, optional = true }
+evento-sql = { workspace = true, optional = true }
+sea-query = { workspace = true, optional = true }
+sea-query-sqlx = { workspace = true, optional = true }
+
 # Observability
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", optional = true }
@@ -28,6 +34,9 @@ opentelemetry_sdk = { version = "0.27", optional = true }
 
 [features]
 default = []
+sqlite = ["sqlx/sqlite", "evento-sql/sqlite", "dep:sea-query", "dep:sea-query-sqlx"]
+mysql = ["sqlx/mysql", "evento-sql/mysql", "dep:sea-query", "dep:sea-query-sqlx"]
+postgres = ["sqlx/postgres", "evento-sql/postgres", "dep:sea-query", "dep:sea-query-sqlx"]
 prometheus = ["metrics-exporter-prometheus"]
 opentelemetry = ["dep:tracing-opentelemetry", "dep:tracing-subscriber", "dep:opentelemetry", "dep:opentelemetry_sdk"]
 

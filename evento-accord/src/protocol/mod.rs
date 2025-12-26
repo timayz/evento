@@ -11,11 +11,13 @@ pub mod commit;
 pub mod execute;
 pub mod messages;
 pub mod preaccept;
+pub mod recover;
 pub mod sync;
 
 pub use execute::{BackgroundExecutor, ExecuteConfig};
 pub use messages::Message;
 pub use preaccept::PreAcceptResult;
+pub use recover::RecoveryResult;
 
 use crate::error::{AccordError, Result};
 use crate::metrics::{self, status, Timer};
@@ -50,10 +52,10 @@ pub struct ProtocolResult {
 /// * `state` - The consensus state
 /// * `txn` - The transaction to commit
 /// * `preaccept_responses` - Responses from PreAccept broadcast
-/// * `accept_broadcast` - Function to broadcast Accept messages (returns responses)
+/// * `accept_broadcast` - Async function to broadcast Accept messages (returns responses)
 /// * `commit_broadcast` - Function to broadcast Commit messages (fire and forget)
 /// * `quorum_size` - Number of nodes needed for quorum
-pub async fn run_protocol<F, G>(
+pub async fn run_protocol<F, Fut, G>(
     state: &ConsensusState,
     txn: Transaction,
     preaccept_responses: Vec<Result<Message>>,
@@ -62,7 +64,8 @@ pub async fn run_protocol<F, G>(
     quorum_size: usize,
 ) -> Result<ProtocolResult>
 where
-    F: FnOnce(Message) -> Vec<Result<Message>>,
+    F: FnOnce(Message) -> Fut,
+    Fut: std::future::Future<Output = Vec<Result<Message>>>,
     G: FnOnce(Message),
 {
     // Start timing the entire protocol
@@ -103,7 +106,7 @@ where
                 Timestamp::ZERO, // Will be computed
                 ballot,
             );
-            let accept_responses = accept_broadcast(accept_msg);
+            let accept_responses = accept_broadcast(accept_msg).await;
 
             let execute_at = accept::coordinate(
                 state,
@@ -150,6 +153,7 @@ pub async fn handle_message(state: &ConsensusState, msg: Message) -> Result<Mess
         Message::PreAccept(req) => preaccept::handle(state, req).await,
         Message::Accept(req) => accept::handle(state, req).await,
         Message::Commit(req) => commit::handle(state, req).await,
+        Message::Recover(req) => recover::handle(state, req).await,
         Message::SyncRequest(req) => sync::handle(state, req).await,
         _ => Err(AccordError::Internal(anyhow::anyhow!(
             "Unexpected message type: {}",
@@ -221,8 +225,8 @@ mod tests {
             &state,
             txn,
             preaccept_responses,
-            |_| vec![], // Accept not called
-            |_| {},     // Commit broadcast
+            |_| async { vec![] }, // Accept not called
+            |_| {},               // Commit broadcast
             2,
         )
         .await
@@ -272,7 +276,7 @@ mod tests {
             &state,
             txn,
             preaccept_responses,
-            |_| accept_responses,
+            |_| async { accept_responses },
             |_| {},
             2,
         )

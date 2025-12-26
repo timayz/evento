@@ -166,6 +166,45 @@ impl DependencyGraph {
             executed_count: self.executed.len(),
         }
     }
+
+    /// Get all transactions that have unsatisfied dependencies.
+    ///
+    /// Returns tuples of (txn_id, unsatisfied_deps).
+    pub fn get_blocked_transactions(&self) -> Vec<(TxnId, Vec<TxnId>)> {
+        self.deps
+            .iter()
+            .filter(|(id, deps)| {
+                !deps.is_empty() && !self.ready.contains(id) && !self.executed.contains(id)
+            })
+            .map(|(id, deps)| (*id, deps.iter().copied().collect()))
+            .collect()
+    }
+
+    /// Mark a dependency as satisfied (even if we don't have the transaction).
+    ///
+    /// Used during recovery when we determine a dependency will never be satisfied
+    /// (e.g., the transaction was never committed anywhere).
+    pub fn mark_dep_satisfied(&mut self, dep_id: TxnId) -> Vec<TxnId> {
+        self.executed.insert(dep_id);
+
+        let mut newly_ready = Vec::new();
+
+        // Update all transactions that were waiting on this dependency
+        if let Some(waiting) = self.reverse_deps.remove(&dep_id) {
+            for waiting_id in waiting {
+                if let Some(deps) = self.deps.get_mut(&waiting_id) {
+                    deps.remove(&dep_id);
+
+                    if deps.is_empty() && !self.executed.contains(&waiting_id) {
+                        self.ready.insert(waiting_id);
+                        newly_ready.push(waiting_id);
+                    }
+                }
+            }
+        }
+
+        newly_ready
+    }
 }
 
 /// Statistics about the dependency graph.

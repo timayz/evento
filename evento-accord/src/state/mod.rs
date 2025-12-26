@@ -8,10 +8,16 @@ mod durable;
 mod store;
 mod waiting;
 
+#[cfg(any(feature = "sqlite", feature = "mysql", feature = "postgres"))]
+mod sql_durable;
+
 pub use deps::{DependencyGraph, DependencyGraphStats};
 pub use durable::{DurableStore, MemoryDurableStore};
 pub use store::TxnStore;
 pub use waiting::ExecutionQueue;
+
+#[cfg(any(feature = "sqlite", feature = "mysql", feature = "postgres"))]
+pub use sql_durable::{load_executed_txn_ids, SqlDurableStore};
 
 use crate::error::{AccordError, Result};
 use crate::timestamp::Timestamp;
@@ -321,6 +327,16 @@ impl ConsensusState {
         errors.get(txn_id).cloned()
     }
 
+    /// Re-queue a transaction for execution.
+    ///
+    /// This releases the claim on a transaction that was being executed,
+    /// allowing it to be picked up again by an execution worker.
+    /// Used when execution fails due to a recoverable error (e.g., missing dependency).
+    pub async fn requeue_transaction(&self, txn_id: TxnId) {
+        let mut queue = self.queue.write().await;
+        queue.release_claim(&txn_id);
+    }
+
     // ========== Queries ==========
 
     /// Get a transaction by ID.
@@ -372,6 +388,43 @@ impl ConsensusState {
         }
     }
 
+    // ========== Recovery ==========
+
+    /// Restore executed transaction IDs from durable storage.
+    ///
+    /// Call this during node startup to skip re-executing transactions
+    /// that were already executed before the crash/restart.
+    pub async fn restore_executed(&self, txn_ids: Vec<TxnId>) -> usize {
+        let mut store = self.store.write().await;
+        let mut deps_graph = self.deps.write().await;
+
+        let mut restored = 0;
+        for txn_id in txn_ids {
+            // Create a minimal transaction record
+            let txn = Transaction {
+                id: txn_id,
+                events_data: vec![],
+                keys: vec![],
+                deps: vec![],
+                status: TxnStatus::Executed,
+                execute_at: txn_id.timestamp,
+                ballot: Ballot::default(),
+            };
+
+            // Only insert if not already present
+            if store.get(&txn_id).is_none() {
+                store.upsert(txn);
+                // Mark as executed in dependency graph so other transactions
+                // don't wait on this one
+                deps_graph.mark_executed(txn_id);
+                restored += 1;
+            }
+        }
+
+        tracing::info!("Restored {} executed transactions from durable storage", restored);
+        restored
+    }
+
     // ========== State Sync ==========
 
     /// Get committed transactions for sync.
@@ -413,6 +466,9 @@ impl ConsensusState {
 
             if should_apply {
                 // Create from commit to properly register dependencies
+                // NOTE: We always create as Committed, even if the peer has already
+                // executed the transaction. This ensures our local execution workers
+                // will actually execute it and write the events to our database.
                 self.create_from_commit(
                     txn.id,
                     txn.deps.clone(),
@@ -422,16 +478,95 @@ impl ConsensusState {
                 )
                 .await?;
 
-                // If it was executed, mark as executed
-                if txn.status == TxnStatus::Executed {
-                    self.mark_executed(txn.id).await?;
-                }
-
                 applied += 1;
             }
         }
 
         Ok(applied)
+    }
+
+    // ========== Recovery ==========
+
+    /// Get all transactions that are blocked on unsatisfied dependencies.
+    ///
+    /// Returns tuples of (txn_id, list of missing dependency IDs).
+    pub async fn get_blocked_transactions(&self) -> Vec<(TxnId, Vec<TxnId>)> {
+        let deps = self.deps.read().await;
+        deps.get_blocked_transactions()
+    }
+
+    /// Get all unique missing dependencies across all blocked transactions.
+    pub async fn get_missing_dependencies(&self) -> Vec<TxnId> {
+        let deps = self.deps.read().await;
+        let store = self.store.read().await;
+
+        let blocked = deps.get_blocked_transactions();
+        let mut missing: HashSet<TxnId> = HashSet::new();
+
+        for (_, dep_ids) in blocked {
+            for dep_id in dep_ids {
+                // A dependency is "missing" if we don't have it in our store
+                if store.get(&dep_id).is_none() {
+                    missing.insert(dep_id);
+                }
+            }
+        }
+
+        missing.into_iter().collect()
+    }
+
+    /// Apply a recovered transaction from a peer.
+    ///
+    /// If the transaction is committed/executed on a peer, we apply it locally
+    /// so our blocked transactions can make progress.
+    pub async fn apply_recovered_transaction(
+        &self,
+        txn_id: TxnId,
+        deps: Vec<TxnId>,
+        execute_at: Timestamp,
+        events_data: Vec<u8>,
+        keys: Vec<String>,
+    ) -> Result<()> {
+        self.create_from_commit(txn_id, deps, execute_at, events_data, keys)
+            .await
+    }
+
+    /// Mark a dependency as permanently unsatisfiable.
+    ///
+    /// This is used when recovery determines that a dependency transaction
+    /// was never committed on any peer and will never exist.
+    /// Blocked transactions waiting on this dependency will become unblocked.
+    ///
+    /// Also creates a minimal transaction entry with ExecutionFailed status
+    /// so that `wait_for_execution` will accept it and not loop infinitely.
+    pub async fn mark_dependency_abandoned(&self, dep_id: TxnId) -> Vec<TxnId> {
+        let mut store = self.store.write().await;
+        let mut deps = self.deps.write().await;
+        let mut queue = self.queue.write().await;
+
+        // Create a minimal transaction entry with ExecutionFailed status
+        // so that wait_for_execution will find it and proceed
+        if store.get(&dep_id).is_none() {
+            let abandoned_txn = Transaction {
+                id: dep_id,
+                events_data: vec![],
+                keys: vec![],
+                deps: vec![],
+                status: TxnStatus::ExecutionFailed,
+                execute_at: dep_id.timestamp,
+                ballot: Ballot::default(),
+            };
+            store.upsert(abandoned_txn);
+        }
+
+        let newly_ready = deps.mark_dep_satisfied(dep_id);
+
+        // Mark newly ready transactions in the queue
+        for txn_id in &newly_ready {
+            queue.mark_ready(*txn_id);
+        }
+
+        newly_ready
     }
 }
 

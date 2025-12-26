@@ -117,6 +117,28 @@ pub enum Subscriber {
     UpdatedAt,
 }
 
+/// Column identifiers for the `accord_txn` table.
+///
+/// Used with sea-query for type-safe SQL query construction.
+/// This table tracks executed ACCORD consensus transactions for crash recovery.
+///
+/// # Columns
+///
+/// - `TxnId` - Transaction identifier (primary key)
+/// - `Status` - Transaction status (3 = Executed, 4 = ExecutionFailed)
+/// - `ExecutedAt` - When the transaction was executed
+#[derive(Iden)]
+pub enum AccordTxn {
+    /// The table name: `accord_txn`
+    Table,
+    /// Transaction ID (format: timestamp.counter.node_id)
+    TxnId,
+    /// Transaction status
+    Status,
+    /// Execution timestamp
+    ExecutedAt,
+}
+
 /// Type alias for MySQL executor.
 ///
 /// Equivalent to `Sql<sqlx::MySql>`.
@@ -349,6 +371,11 @@ where
     }
 
     async fn write(&self, events: Vec<evento_core::Event>) -> Result<(), WriteError> {
+        // Nothing to write
+        if events.is_empty() {
+            return Ok(());
+        }
+
         let mut statement = Query::insert()
             .into_table(Event::Table)
             .columns([

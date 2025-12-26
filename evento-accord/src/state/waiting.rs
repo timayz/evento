@@ -111,6 +111,14 @@ impl ExecutionQueue {
         self.in_progress.remove(txn_id);
     }
 
+    /// Release a claimed transaction back to the queue.
+    ///
+    /// This removes the transaction from in_progress so it can be claimed again.
+    /// Used when execution fails but we want to retry later.
+    pub fn release_claim(&mut self, txn_id: &TxnId) {
+        self.in_progress.remove(txn_id);
+    }
+
     /// Update the execute_at timestamp for a transaction.
     pub fn update_execute_at(
         &mut self,

@@ -41,6 +41,16 @@ impl std::fmt::Display for TxnId {
     }
 }
 
+impl std::str::FromStr for TxnId {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let s = s.strip_prefix("txn:").unwrap_or(s);
+        let timestamp = s.parse::<Timestamp>().map_err(|e| e.to_string())?;
+        Ok(TxnId::new(timestamp))
+    }
+}
+
 /// Transaction status in the ACCORD protocol.
 ///
 /// Transactions progress through these states:

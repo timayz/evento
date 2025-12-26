@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+
+{% block title %}Home - Evento Bank (Node {{ node_id }}){% endblock %}
+
+{% block content %}
+<div class="card">
+    <h2>Welcome to Evento Bank (ACCORD Cluster)</h2>
+    <p>A demo application showcasing:</p>
+    <ul style="margin: 1rem 0; padding-left: 1.5rem;">
+        <li><strong>Evento</strong> - Event sourcing library</li>
+        <li><strong>Evento-ACCORD</strong> - Distributed consensus protocol</li>
+        <li><strong>Axum</strong> - Web framework</li>
+        <li><strong>SQLite</strong> - Per-node database</li>
+    </ul>
+    <p style="margin-top: 1rem;">
+        <a href="/accounts/new" class="btn">Create Your First Account</a>
+        <a href="/accounts" class="btn" style="background: #6b7280;">View Accounts</a>
+    </p>
+</div>
+
+<div class="card">
+    <h2>How It Works</h2>
+    <p>This application runs on a 3-node ACCORD cluster:</p>
+    <ol style="margin: 1rem 0; padding-left: 1.5rem;">
+        <li>Each node has its own SQLite database</li>
+        <li>All writes go through ACCORD consensus</li>
+        <li>Transactions are replicated to all nodes</li>
+        <li>You can write to any node and read from any node</li>
+    </ol>
+    <p style="margin-top: 1rem;">
+        Try creating an account on one node and viewing it on another!
+    </p>
+</div>
+{% endblock %}

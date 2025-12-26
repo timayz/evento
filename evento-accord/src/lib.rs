@@ -98,9 +98,15 @@ pub use executor::{AccordExecutor, ShutdownHandle};
 pub use keys::Key;
 pub use protocol::{BackgroundExecutor, ExecuteConfig, Message, PreAcceptResult, ProtocolResult};
 pub use state::{ConsensusState, ConsensusStateStats, DurableStore, MemoryDurableStore};
+
+#[cfg(any(feature = "sqlite", feature = "mysql", feature = "postgres"))]
+pub use state::{load_executed_txn_ids, SqlDurableStore};
 pub use timestamp::{HybridClock, Timestamp};
 pub use transport::{ChannelTransport, NodeAddr, NodeId, TcpServer, TcpTransport, Transport};
 pub use txn::{Ballot, SerializableEvent, Transaction, TxnId, TxnStatus};
 
 // Re-export evento-core types for convenience
 pub use evento_core::{Event, Executor, WriteError};
+
+// Re-export tokio_util types for background task management
+pub use tokio_util::sync::CancellationToken;

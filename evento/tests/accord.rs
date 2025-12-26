@@ -1,7 +1,7 @@
 #[path = "evento.rs"]
 mod evento_test;
 
-use evento::sql_migrator::{InitMigration, M0002, M0003};
+use evento::sql_migrator::{InitMigration, M0002, M0003, M0004};
 use evento_accord::{AccordConfig, AccordExecutor, NodeAddr, ShutdownHandle};
 use sqlx::{
     any::install_default_drivers, migrate::MigrateDatabase, Any, Database, Pool, SqlitePool,
@@ -121,6 +121,7 @@ where
     InitMigration: sqlx_migrator::Migration<DB>,
     M0002: sqlx_migrator::Migration<DB>,
     M0003: sqlx_migrator::Migration<DB>,
+    M0004: sqlx_migrator::Migration<DB>,
     sqlx_migrator::Migrator<DB>: sqlx_migrator::migrator::DatabaseOperation<DB>,
 {
     install_default_drivers();
