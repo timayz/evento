@@ -518,26 +518,22 @@ impl<P: Snapshot + Default + 'static, E: Executor> LoadBuilder<P, E> {
             cursor = None;
         }
 
-        let mut read_aggregators = vec![];
-        for handler in self.handlers.values() {
-            let Some(id) = self.aggregators.get(handler.aggregator_type()) else {
-                anyhow::bail!(
-                    "Failed to load projection {}/{}: id not found",
-                    handler.aggregator_type(),
-                    handler.event_name()
-                );
-            };
-
-            read_aggregators.push(ReadAggregator {
-                aggregator_type: handler.aggregator_type().to_owned(),
-                aggregator_id: Some(id.to_owned()),
-                name: if self.filter_events_by_name {
-                    Some(handler.event_name().to_owned())
-                } else {
-                    None
+        let read_aggregators = self
+            .handlers
+            .values()
+            .map(|h| match self.aggregators.get(h.aggregator_type()) {
+                Some(id) => ReadAggregator {
+                    aggregator_type: h.aggregator_type().to_owned(),
+                    aggregator_id: Some(id.to_owned()),
+                    name: if self.filter_events_by_name {
+                        Some(h.event_name().to_owned())
+                    } else {
+                        None
+                    },
                 },
-            });
-        }
+                _ => ReadAggregator::event(h.aggregator_type(), h.event_name()),
+            })
+            .collect::<Vec<_>>();
 
         let events = executor
             .read(
