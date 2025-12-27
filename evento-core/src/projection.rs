@@ -502,7 +502,7 @@ impl<P: Snapshot + Default + 'static, E: Executor> LoadBuilder<P, E> {
             executor,
         };
 
-        let cursor = executor.get_subscriber_cursor(self.key.to_owned()).await?;
+        let mut cursor = executor.get_subscriber_cursor(self.key.to_owned()).await?;
         let (mut version, mut routing_key) = match cursor {
             Some(ref cursor) => {
                 let cursor = crate::Event::deserialize_cursor(cursor)?;
@@ -512,6 +512,9 @@ impl<P: Snapshot + Default + 'static, E: Executor> LoadBuilder<P, E> {
             _ => (0, None),
         };
         let loaded = P::restore(&context, self.id.to_owned()).await?;
+        if loaded.is_none() {
+            cursor = None;
+        }
 
         let mut read_aggregators = vec![];
         for handler in self.handlers.values() {
