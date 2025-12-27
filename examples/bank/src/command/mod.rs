@@ -22,7 +22,7 @@ pub use transfer_money::*;
 pub use unfreeze_account::*;
 pub use withdraw_money::*;
 
-use evento::{Action, Executor, LoadResult, Projection, SubscriptionBuilder, metadata::Event};
+use evento::{Action, Executor, Projection, SubscriptionBuilder, metadata::Event};
 
 use crate::{
     AccountClosed, AccountFrozen, AccountOpened, AccountUnfrozen, BankAccount, MoneyDeposited,
@@ -111,17 +111,10 @@ pub fn subscription<E: Executor>() -> SubscriptionBuilder<CommandData, E> {
 async fn restore(
     _context: &evento::context::RwContext,
     id: String,
-) -> anyhow::Result<Option<LoadResult<CommandData>>> {
+) -> anyhow::Result<Option<CommandData>> {
     let rows = COMMAND_ROWS.read().unwrap();
 
-    Ok(rows
-        .get(&id)
-        .cloned()
-        .map(|(item, version, routing_key)| LoadResult {
-            item,
-            version,
-            routing_key,
-        }))
+    Ok(rows.get(&id).cloned().map(|(item, _, _)| item))
 }
 
 #[evento::handler]

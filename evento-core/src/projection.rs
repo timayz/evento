@@ -49,7 +49,11 @@ use ulid::Ulid;
 
 use backon::{ExponentialBuilder, Retryable};
 
-use crate::{context, cursor::Args, Executor, ReadAggregator};
+use crate::{
+    context,
+    cursor::{Args, Cursor},
+    Executor, ReadAggregator,
+};
 
 /// Filter for events by routing key.
 ///
@@ -408,9 +412,6 @@ impl<A> DerefMut for LoadResult<A> {
     }
 }
 
-/// Type alias for an optional load result.
-pub type OptionLoadResult<A> = Option<LoadResult<A>>;
-
 /// Trait for types that can be restored from snapshots.
 ///
 /// Snapshots provide a performance optimization by storing pre-computed
@@ -438,7 +439,7 @@ pub trait Snapshot: Sized {
     fn restore<'a>(
         context: &'a context::RwContext,
         id: String,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<OptionLoadResult<Self>>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Option<Self>>> + Send + 'a>>;
 }
 
 /// Builder for loading aggregate state from events.
@@ -502,9 +503,15 @@ impl<P: Snapshot + Default + 'static, E: Executor> LoadBuilder<P, E> {
         };
 
         let cursor = executor.get_subscriber_cursor(self.key.to_owned()).await?;
+        let (mut version, mut routing_key) = match cursor {
+            Some(ref cursor) => {
+                let cursor = crate::Event::deserialize_cursor(cursor)?;
+
+                (cursor.v, cursor.r)
+            }
+            _ => (0, None),
+        };
         let loaded = P::restore(&context, self.id.to_owned()).await?;
-        let has_loaded = loaded.is_some();
-        let mut snapshot = loaded.unwrap_or_default();
 
         let mut read_aggregators = vec![];
         for handler in self.handlers.values() {
@@ -535,6 +542,12 @@ impl<P: Snapshot + Default + 'static, E: Executor> LoadBuilder<P, E> {
             )
             .await?;
 
+        if events.edges.is_empty() && loaded.is_none() {
+            return Ok(None);
+        }
+
+        let mut snapshot = loaded.unwrap_or_default();
+
         for event in events.edges.iter() {
             let key = format!("{}_{}", event.node.aggregator_type, event.node.name);
             let Some(handler) = self.handlers.get(&key) else {
@@ -550,32 +563,15 @@ impl<P: Snapshot + Default + 'static, E: Executor> LoadBuilder<P, E> {
         }
 
         if let Some(event) = events.edges.last() {
-            snapshot.version = event.node.version;
-            snapshot.routing_key = event.node.routing_key.to_owned();
-
-            return Ok(Some(snapshot));
+            version = event.node.version;
+            routing_key = event.node.routing_key.to_owned();
         }
 
-        if !has_loaded {
-            return Ok(None);
-        }
-
-        let events = executor
-            .read(
-                Some(read_aggregators.to_vec()),
-                None,
-                Args::backward(1, None),
-            )
-            .await?;
-
-        if let Some(event) = events.edges.first() {
-            snapshot.version = event.node.version;
-            snapshot.routing_key = event.node.routing_key.to_owned();
-
-            return Ok(Some(snapshot));
-        }
-
-        Ok(None)
+        Ok(Some(LoadResult {
+            item: snapshot,
+            version,
+            routing_key,
+        }))
     }
 }
 

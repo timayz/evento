@@ -1,5 +1,5 @@
 use evento::{
-    Executor, LoadResult,
+    Executor,
     metadata::Event,
     projection::{Action, Projection},
 };
@@ -30,7 +30,7 @@ pub struct AccountBalanceView {
 async fn restore(
     _context: &evento::context::RwContext,
     _id: String,
-) -> anyhow::Result<Option<LoadResult<AccountBalanceView>>> {
+) -> anyhow::Result<Option<AccountBalanceView>> {
     Ok(None)
 }
 

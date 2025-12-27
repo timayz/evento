@@ -23,10 +23,7 @@ pub fn snapshot_impl(input: &ItemFn, debug: bool) -> syn::Result<TokenStream> {
     let option_type = extract_generic_inner(return_type, "Result")?;
 
     // Level 2: Option<...>
-    let load_result_type = extract_generic_inner(option_type, "Option")?;
-
-    // Level 3: LoadResult<T>
-    let projection_type = extract_generic_inner(load_result_type, "LoadResult")?;
+    let projection_type = extract_generic_inner(option_type, "Option")?;
 
     let output = quote! {
         #input
@@ -35,7 +32,7 @@ pub fn snapshot_impl(input: &ItemFn, debug: bool) -> syn::Result<TokenStream> {
             fn restore<'a>(
                 context: &'a ::evento::context::RwContext,
                 id: String,
-            ) -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = ::anyhow::Result<Option<evento::LoadResult<Self>>>> + Send + 'a>> {
+            ) -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = ::anyhow::Result<Option<Self>>> + Send + 'a>> {
                 Box::pin(async move { #fn_name(context, id).await })
             }
         }
