@@ -70,7 +70,7 @@ pub struct AccountDetailsView {
 async fn restore(
     _context: &evento::context::RwContext,
     _id: String,
-) -> anyhow::Result<Option<LoadResult<AccountDetailsView>>> {
+) -> anyhow::Result<Option<AccountDetailsView>> {
     Ok(None)
 }
 
