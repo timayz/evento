@@ -177,29 +177,6 @@ impl Cursor for Event {
             r: self.routing_key.to_owned(),
         }
     }
-
-    fn serialize_cursor(&self) -> Result<cursor::Value, cursor::CursorError> {
-        use base64::{alphabet, engine::general_purpose, engine::GeneralPurpose, Engine};
-
-        let cursor = self.serialize();
-        let encoded = bitcode::encode(&cursor);
-
-        let engine = GeneralPurpose::new(&alphabet::URL_SAFE, general_purpose::PAD);
-
-        Ok(cursor::Value(engine.encode(&encoded)))
-    }
-
-    fn deserialize_cursor(value: &cursor::Value) -> Result<Self::T, cursor::CursorError> {
-        use base64::{alphabet, engine::general_purpose, engine::GeneralPurpose, Engine};
-
-        let engine = GeneralPurpose::new(&alphabet::URL_SAFE, general_purpose::PAD);
-        let decoded = engine.decode(value)?;
-
-        let result = bitcode::decode::<Self::T>(&decoded)
-            .map_err(|e| cursor::CursorError::Bitcode(e.to_string()))?;
-
-        Ok(result)
-    }
 }
 
 impl cursor::Bind for Event {

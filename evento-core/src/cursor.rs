@@ -125,20 +125,56 @@ impl AsRef<[u8]> for Value {
     }
 }
 
+// Your encoding traits
+pub trait Encode {
+    fn encode(&self) -> Result<Vec<u8>, CursorError>;
+}
+
+pub trait Decode: Sized {
+    fn decode(bytes: &[u8]) -> Result<Self, CursorError>;
+}
+
+// Blanket impl: anything with bitcode gets it for free
+impl<T: bitcode::Encode> Encode for T {
+    fn encode(&self) -> Result<Vec<u8>, CursorError> {
+        Ok(bitcode::encode(self))
+    }
+}
+
+impl<T: bitcode::DecodeOwned> Decode for T {
+    fn decode(bytes: &[u8]) -> Result<Self, CursorError> {
+        bitcode::decode(bytes).map_err(|e| CursorError::Bitcode(e.to_string()))
+    }
+}
+
 /// Trait for types that can be used as pagination cursors.
 ///
 /// Implementors define how to serialize their position data to/from
 /// base64-encoded cursor values.
 pub trait Cursor {
     /// The cursor data type (e.g., `EventCursor`)
-    type T;
+    type T: Encode + Decode;
 
     /// Extracts cursor data from this item.
     fn serialize(&self) -> Self::T;
     /// Serializes cursor data to a base64 [`Value`].
-    fn serialize_cursor(&self) -> Result<Value, CursorError>;
+    fn serialize_cursor(&self) -> Result<Value, CursorError> {
+        use base64::{alphabet, engine::general_purpose, engine::GeneralPurpose, Engine};
+
+        let bytes = self.serialize().encode()?;
+        let engine = GeneralPurpose::new(&alphabet::URL_SAFE, general_purpose::PAD);
+
+        Ok(Value(engine.encode(&bytes)))
+    }
     /// Deserializes cursor data from a base64 [`Value`].
-    fn deserialize_cursor(value: &Value) -> Result<Self::T, CursorError>;
+    fn deserialize_cursor(value: &Value) -> Result<Self::T, CursorError> {
+        use base64::{alphabet, engine::general_purpose, engine::GeneralPurpose, Engine};
+
+        let engine = GeneralPurpose::new(&alphabet::URL_SAFE, general_purpose::PAD);
+        let bytes = engine.decode(value)?;
+
+        Self::T::decode(&bytes)
+    }
 }
 
 #[derive(Debug, Error)]
