@@ -25,13 +25,7 @@ pub struct AccountStatusView {
     pub is_closed: bool,
 }
 
-#[evento::snapshot]
-async fn restore(
-    _context: &evento::context::RwContext,
-    _id: String,
-) -> anyhow::Result<Option<AccountStatusView>> {
-    Ok(None)
-}
+impl evento::Snapshot for AccountStatusView {}
 
 #[evento::handler]
 async fn handle_account_opened<E: Executor>(
