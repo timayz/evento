@@ -66,13 +66,7 @@ pub struct AccountDetailsView {
     pub overdraft_limit: i64,
 }
 
-#[evento::snapshot]
-async fn restore(
-    _context: &evento::context::RwContext,
-    _id: String,
-) -> anyhow::Result<Option<AccountDetailsView>> {
-    Ok(None)
-}
+impl evento::Snapshot for AccountDetailsView {}
 
 #[evento::handler]
 async fn handle_account_opened<E: Executor>(

@@ -26,13 +26,7 @@ pub struct AccountBalanceView {
     pub available_balance: i64,
 }
 
-#[evento::snapshot]
-async fn restore(
-    _context: &evento::context::RwContext,
-    _id: String,
-) -> anyhow::Result<Option<AccountBalanceView>> {
-    Ok(None)
-}
+impl evento::Snapshot for AccountBalanceView {}
 
 #[evento::handler]
 async fn handle_account_opened<E: Executor>(
