@@ -1,6 +1,6 @@
 [package]
 name = "evento-sql"
-version = "2.0.0-alpha.8"
+version = "2.0.0-alpha.9"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -10,7 +10,7 @@ documentation = "https://docs.rs/evento-sql"
 readme = "README.md"
 
 [dependencies]
-evento-core = { path = "../evento-core", version = "2.0.0-alpha.8" }
+evento-core = { path = "../evento-core", version = "2.0.0-alpha.9" }
 anyhow.workspace = true
 bitcode.workspace = true
 async-trait.workspace = true
