@@ -1,7 +1,2 @@
 // internal pub sub for projection with mpsc chanel that send message if handler return Some(mesaage)
 
-snapshot | Events
-OK 1. 0 | 0 => None
-OK 2. 1 | 0 => Snapshot, v/k from snapshot
-OK 2. 0 | 1 => Snapshot default + apply, v/k from events
-4. 1 | 1 => Snapshot + apply / v/key from events

@@ -86,7 +86,7 @@
 //! async fn restore(
 //!     context: &evento::context::RwContext,
 //!     id: String,
-//! ) -> anyhow::Result<Option<LoadResult<AccountBalanceView>>> {
+//! ) -> anyhow::Result<Option<AccountBalanceView>> {
 //!     // Load snapshot from database or return None
 //!     Ok(None)
 //! }
@@ -274,12 +274,12 @@ pub fn debug_handler(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// async fn restore(
 ///     context: &evento::context::RwContext,
 ///     id: String,
-/// ) -> anyhow::Result<Option<LoadResult<ProjectionType>>>
+/// ) -> anyhow::Result<Option<ProjectionType>>
 /// ```
 ///
 /// # Return Value
 ///
-/// - `Ok(Some(LoadResult { ... }))` - Snapshot found, restore from this state
+/// - `Ok(Some( ... ))` - Snapshot found, restore from this state
 /// - `Ok(None)` - No snapshot, rebuild from events
 /// - `Err(...)` - Error during restoration
 ///
@@ -290,7 +290,7 @@ pub fn debug_handler(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// async fn restore(
 ///     context: &evento::context::RwContext,
 ///     id: String,
-/// ) -> anyhow::Result<Option<LoadResult<AccountBalanceView>>> {
+/// ) -> anyhow::Result<Option<AccountBalanceView>> {
 ///     // Query snapshot from database
 ///     let snapshot = context.read()
 ///         .query_snapshot::<AccountBalanceView>(&id)
@@ -303,7 +303,7 @@ pub fn debug_handler(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// # Generated Code
 ///
 /// The macro generates a `Snapshot` trait implementation for the projection type
-/// extracted from the return type's `LoadResult<T>`.
+/// extracted from the return type's `T`.
 #[proc_macro_attribute]
 pub fn snapshot(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemFn);
@@ -326,7 +326,7 @@ pub fn snapshot(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// async fn restore(
 ///     context: &evento::context::RwContext,
 ///     id: String,
-/// ) -> anyhow::Result<Option<LoadResult<MyView>>> {
+/// ) -> anyhow::Result<OptionMyView>> {
 ///     Ok(None)
 /// }
 /// ```
