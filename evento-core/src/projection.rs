@@ -770,6 +770,7 @@ impl<P, E: Executor + 'static> SubscriptionBuilder<P, E> {
                     }
                 }
 
+                tracing::Span::current().record("subscription", self.key());
                 tracing::Span::current().record("aggregator_type", &event.node.aggregator_type);
                 tracing::Span::current().record("aggregator_id", &event.node.aggregator_id);
                 tracing::Span::current().record("event", &event.node.name);
@@ -780,6 +781,8 @@ impl<P, E: Executor + 'static> SubscriptionBuilder<P, E> {
                 };
 
                 handler.handle(&context, &event.node).await?;
+
+                tracing::info!("handle completed");
 
                 executor
                     .acknowledge(
