@@ -782,7 +782,7 @@ impl<P, E: Executor + 'static> SubscriptionBuilder<P, E> {
 
                 handler.handle(&context, &event.node).await?;
 
-                tracing::info!("handle completed");
+                tracing::debug!("handle completed");
 
                 executor
                     .acknowledge(
