@@ -437,9 +437,11 @@ pub trait Snapshot: Sized {
     ///
     /// Returns `None` if no snapshot exists for the given ID.
     fn restore<'a>(
-        context: &'a context::RwContext,
-        id: String,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Option<Self>>> + Send + 'a>>;
+        _context: &'a context::RwContext,
+        _id: String,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Option<Self>>> + Send + 'a>> {
+        Box::pin(async { Ok(None) })
+    }
 }
 
 /// Builder for loading aggregate state from events.
