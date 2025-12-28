@@ -180,6 +180,11 @@ pub use evento_sql_migrator as sql_migrator;
 pub mod migrator {
     pub use sqlx_migrator::{Migrate, Plan};
 }
+#[cfg(all(
+    feature = "macro",
+    any(feature = "sqlite", feature = "postgres", feature = "mysql")
+))]
+mod sort_by;
 
 /// MySQL executor type alias.
 #[cfg(feature = "mysql")]
