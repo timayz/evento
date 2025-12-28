@@ -87,6 +87,11 @@ pub mod cursor;
 mod executor;
 pub mod metadata;
 pub mod projection;
+#[cfg(all(
+    feature = "macro",
+    any(feature = "sqlite", feature = "postgres", feature = "mysql")
+))]
+mod sort_by;
 
 #[cfg(feature = "macro")]
 pub use evento_macro::*;
