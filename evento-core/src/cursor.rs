@@ -419,3 +419,31 @@ pub trait Bind {
         is_order_desc: bool,
     );
 }
+
+/// Cursor with i64 value for numeric sorts (dates, counts, etc.)
+#[derive(Debug, Clone, bitcode::Encode, bitcode::Decode)]
+pub struct CursorInt {
+    pub i: String,
+    pub v: i64,
+}
+
+/// Cursor with String value for text sorts (names, titles, etc.)
+#[derive(Debug, Clone, bitcode::Encode, bitcode::Decode)]
+pub struct CursorString {
+    pub i: String,
+    pub v: String,
+}
+
+/// Cursor with bool value for boolean sorts
+#[derive(Debug, Clone, bitcode::Encode, bitcode::Decode)]
+pub struct CursorBool {
+    pub i: String,
+    pub v: bool,
+}
+
+/// Cursor with f64 value for floating point sorts (ratings, scores, etc.)
+#[derive(Debug, Clone, bitcode::Encode, bitcode::Decode)]
+pub struct CursorFloat {
+    pub i: String,
+    pub v: f64,
+}
