@@ -245,34 +245,5 @@ macro_rules! define_sort_impl {
         $crate::__impl_sqlite!($name, $row, $table, $id_column, $column);
         $crate::__impl_postgres!($name, $row, $table, $id_column, $column);
         $crate::__impl_mysql!($name, $row, $table, $id_column, $column);
-
-        impl std::fmt::Debug for $name
-        where
-            $row: std::fmt::Debug,
-        {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.debug_tuple(stringify!($name)).field(&self.0).finish()
-            }
-        }
-
-        impl Clone for $name
-        where
-            $row: Clone,
-        {
-            fn clone(&self) -> Self {
-                Self(self.0.clone())
-            }
-        }
-
-        impl PartialEq for $name
-        where
-            $row: PartialEq,
-        {
-            fn eq(&self, other: &Self) -> bool {
-                self.0 == other.0
-            }
-        }
-
-        impl Eq for $name where $row: Eq {}
     };
 }
