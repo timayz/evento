@@ -518,7 +518,7 @@ impl<P: Snapshot + Default + 'static, E: Executor> LoadBuilder<P, E> {
     /// Returns `None` if no events exist for the aggregate.
     /// Returns `Err` if there are too many events to process in one batch.
     pub async fn execute_all(&mut self, executor: &E) -> anyhow::Result<Option<LoadResult<P>>> {
-        self.filter_events_by_name = true;
+        self.filter_events_by_name = false;
 
         self.execute(executor).await
     }
