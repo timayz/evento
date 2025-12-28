@@ -97,7 +97,7 @@ pub async fn load<E: Executor>(
 
     Ok(create_projection()
         .load::<BankAccount>(&id)
-        .safe_execute(executor)
+        .execute_all(executor)
         .await?
         .map(|loaded| Command::new(id, loaded, executor)))
 }
