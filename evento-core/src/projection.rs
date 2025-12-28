@@ -37,6 +37,7 @@
 //!     .await?;
 //! ```
 
+use backon::{ExponentialBuilder, Retryable};
 use std::{
     collections::HashMap,
     future::Future,
@@ -45,9 +46,8 @@ use std::{
     time::Duration,
 };
 use tokio::time::{interval_at, Instant};
+use tracing::field::Empty;
 use ulid::Ulid;
-
-use backon::{ExponentialBuilder, Retryable};
 
 use crate::{
     context,
@@ -708,6 +708,15 @@ impl<P, E: Executor + 'static> SubscriptionBuilder<P, E> {
         self.key.to_owned()
     }
 
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            subscription = Empty,
+            aggregator_type = Empty,
+            aggregator_id = Empty,
+            event = Empty,
+        )
+    )]
     async fn process(
         &self,
         executor: &E,
@@ -719,6 +728,8 @@ impl<P, E: Executor + 'static> SubscriptionBuilder<P, E> {
             Instant::now() - Duration::from_millis(400),
             Duration::from_millis(300),
         );
+
+        tracing::Span::current().record("subscription", self.key());
 
         loop {
             interval.tick().await;
@@ -770,7 +781,6 @@ impl<P, E: Executor + 'static> SubscriptionBuilder<P, E> {
                     }
                 }
 
-                tracing::Span::current().record("subscription", self.key());
                 tracing::Span::current().record("aggregator_type", &event.node.aggregator_type);
                 tracing::Span::current().record("aggregator_id", &event.node.aggregator_id);
                 tracing::Span::current().record("event", &event.node.name);
@@ -809,6 +819,12 @@ impl<P, E: Executor + 'static> SubscriptionBuilder<P, E> {
     ///
     /// Returns a [`Subscription`] handle that can be used for graceful shutdown.
     /// The subscription runs in a spawned tokio task and polls for new events.
+    #[tracing::instrument(skip_all, fields(
+        subscription = self.key(),
+        aggregator_type = tracing::field::Empty,
+        aggregator_id = tracing::field::Empty,
+        event = tracing::field::Empty,
+    ))]
     pub async fn start(self, executor: &E) -> anyhow::Result<Subscription>
     where
         E: Clone,
@@ -845,15 +861,6 @@ impl<P, E: Executor + 'static> SubscriptionBuilder<P, E> {
                 }
 
                 interval.tick().await;
-
-                let _ = tracing::error_span!(
-                    "start",
-                    key = self.key(),
-                    aggregator_type = tracing::field::Empty,
-                    aggregator_id = tracing::field::Empty,
-                    event = tracing::field::Empty,
-                )
-                .entered();
 
                 let result = match self.retry {
                     Some(retry) => {
