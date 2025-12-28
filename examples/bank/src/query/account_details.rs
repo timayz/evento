@@ -8,7 +8,7 @@ use evento::{
 use once_cell::sync::Lazy;
 
 use crate::{
-    NameChanged, Owner,
+    Created, NameChanged, Owner,
     aggregator::{
         AccountClosed, AccountFrozen, AccountOpened, AccountUnfrozen, DailyWithdrawalLimitChanged,
         MoneyDeposited, MoneyReceived, MoneyTransferred, MoneyWithdrawn, OverdraftLimitChanged,
@@ -34,6 +34,7 @@ pub fn create_projection<E: Executor>() -> Projection<AccountDetailsView, E> {
         .handler(handle_account_frozen())
         .handler(handle_account_unfrozen())
         .handler(handle_owned_name_chaged())
+        .skip::<Created>()
 }
 
 pub fn subscription<E: Executor>() -> evento::SubscriptionBuilder<AccountDetailsView, E> {

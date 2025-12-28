@@ -567,7 +567,7 @@ pub async fn subscribe<E: Executor + Clone>(
     }
 
     // Run subscription to rebuild projection from events
-    bank::subscription().execute(executor).await?;
+    bank::subscription().unretry_execute(executor).await?;
 
     // Verify projection was rebuilt correctly
     let rows = COMMAND_ROWS.read().unwrap();
@@ -648,7 +648,7 @@ pub async fn subscribe_routing_key<E: Executor + Clone>(
     // Run subscription filtered by "us-east-1" routing key
     bank::subscription()
         .routing_key("us-east-1")
-        .execute(executor)
+        .unretry_execute(executor)
         .await?;
 
     // Verify only US account was processed
@@ -673,7 +673,7 @@ pub async fn subscribe_routing_key<E: Executor + Clone>(
     // Now run subscription filtered by "eu-west-1" routing key
     bank::subscription()
         .routing_key("eu-west-1")
-        .execute(executor)
+        .unretry_execute(executor)
         .await?;
 
     // Verify EU account was now processed
@@ -750,7 +750,7 @@ pub async fn subscribe_default<E: Executor + Clone>(
     }
 
     // Run default subscription (no routing key = processes events with routing_key IS NULL)
-    bank::subscription().execute(executor).await?;
+    bank::subscription().unretry_execute(executor).await?;
 
     // Verify only default (no routing key) account was processed
     {
@@ -774,7 +774,7 @@ pub async fn subscribe_default<E: Executor + Clone>(
     // Now run subscription with specific routing key
     bank::subscription()
         .routing_key("eu-west-1")
-        .execute(executor)
+        .unretry_execute(executor)
         .await?;
 
     // Verify routed account was now processed
@@ -846,7 +846,9 @@ pub async fn subscribe_multiple_aggregator<E: Executor + Clone>(
     }
 
     // Run account_details subscription (handles both BankAccount and Owner events)
-    account_details_subscription().execute(executor).await?;
+    account_details_subscription()
+        .unretry_execute(executor)
+        .await?;
 
     // Verify projection was rebuilt correctly with both aggregator types processed
     let rows = ACCOUNT_DETAILS_ROWS.read().unwrap();
@@ -950,7 +952,7 @@ pub async fn subscribe_routing_key_multiple_aggregator<E: Executor + Clone>(
     // Run subscription filtered by "us-east-1" routing key
     account_details_subscription()
         .routing_key("us-east-1")
-        .execute(executor)
+        .unretry_execute(executor)
         .await?;
 
     // Verify only US account was processed
@@ -976,7 +978,7 @@ pub async fn subscribe_routing_key_multiple_aggregator<E: Executor + Clone>(
     // Now run subscription filtered by "eu-west-1" routing key
     account_details_subscription()
         .routing_key("eu-west-1")
-        .execute(executor)
+        .unretry_execute(executor)
         .await?;
 
     // Verify EU account was now processed
@@ -1074,7 +1076,9 @@ pub async fn subscribe_default_multiple_aggregator<E: Executor + Clone>(
     }
 
     // Run default subscription (no routing key = processes events with routing_key IS NULL)
-    account_details_subscription().execute(executor).await?;
+    account_details_subscription()
+        .unretry_execute(executor)
+        .await?;
 
     // Verify only default (no routing key) account was processed
     {
@@ -1099,7 +1103,7 @@ pub async fn subscribe_default_multiple_aggregator<E: Executor + Clone>(
     // Now run subscription with specific routing key
     account_details_subscription()
         .routing_key("eu-west-1")
-        .execute(executor)
+        .unretry_execute(executor)
         .await?;
 
     // Verify routed account was now processed
@@ -1362,7 +1366,7 @@ pub async fn all_commands<E: Executor + Clone>(
     }
 
     // Run subscription to rebuild projection from events
-    bank::subscription().execute(executor).await?;
+    bank::subscription().unretry_execute(executor).await?;
 
     // Verify Account A projection
     {
@@ -1379,7 +1383,7 @@ pub async fn all_commands<E: Executor + Clone>(
     // Run subscription with routing key for Account B
     bank::subscription()
         .routing_key("region-1")
-        .execute(executor)
+        .unretry_execute(executor)
         .await?;
 
     // Verify Account B projection
