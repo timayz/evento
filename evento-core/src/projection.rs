@@ -513,10 +513,14 @@ impl<P: Snapshot + Default + 'static, E: Executor> LoadBuilder<P, E> {
         self
     }
 
-    pub fn filter_events_by_name(&mut self, v: bool) -> &mut Self {
-        self.filter_events_by_name = v;
+    /// Executes the load operation, returning the rebuilt state without uneeded events.
+    ///
+    /// Returns `None` if no events exist for the aggregate.
+    /// Returns `Err` if there are too many events to process in one batch.
+    pub async fn fast_execute(&mut self, executor: &E) -> anyhow::Result<Option<LoadResult<P>>> {
+        self.filter_events_by_name = true;
 
-        self
+        self.execute(executor).await
     }
 
     /// Executes the load operation, returning the rebuilt state.
