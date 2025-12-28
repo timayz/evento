@@ -29,7 +29,7 @@ macro_rules! __impl_sqlite {
         impl $crate::sql::Bind for $name {
             type T = $table;
             type I = [Self::T; 2];
-            type V = [$crate::sql::Expr; 2];
+            type V = [::sea_query::Expr; 2];
             type Cursor = Self;
 
             fn columns() -> Self::I {
@@ -117,7 +117,7 @@ macro_rules! __impl_mysql {
         impl $crate::sql::Bind for $name {
             type T = $table;
             type I = [Self::T; 2];
-            type V = [$crate::sql::Expr; 2];
+            type V = [::sea_query::Expr; 2];
             type Cursor = Self;
 
             fn columns() -> Self::I {
