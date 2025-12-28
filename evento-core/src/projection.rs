@@ -554,14 +554,14 @@ impl<P: Snapshot + Default + 'static, E: Executor> LoadBuilder<P, E> {
                 Some(id) => ReadAggregator {
                     aggregator_type: h.aggregator_type().to_owned(),
                     aggregator_id: Some(id.to_owned()),
-                    name: if self.filter_events_by_name || self.safety_disabled {
+                    name: if self.filter_events_by_name && self.safety_disabled {
                         Some(h.event_name().to_owned())
                     } else {
                         None
                     },
                 },
                 _ => {
-                    if self.safety_disabled {
+                    if self.filter_events_by_name && self.safety_disabled {
                         ReadAggregator::event(h.aggregator_type(), h.event_name())
                     } else {
                         ReadAggregator::aggregator(h.aggregator_type())
