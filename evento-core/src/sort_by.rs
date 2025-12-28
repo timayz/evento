@@ -1,9 +1,26 @@
-// src/sort_by.rs
+//!
+//! #[derive(Debug, Clone, Copy)]
+//! pub enum UserList {
+//!     Id,
+//!     Email,
+//!     Name,
+//!     CreatedAt,
+//! }
+//!
+//! define_sort_for!(UserListRow, UserList, UserList::Id => {
+//!     UserSortByName:    string, UserList::Name,      |s| s.name.clone();
+//!     UserSortByCreated: int,    UserList::CreatedAt, |s| s.created_at;
+//! });
+//! ```
 
 // ============================================================================
-// SQLite - conditionally defined based on evento's features
+// SQLite Implementation
 // ============================================================================
 
+/// Internal macro for SQLite implementations.
+///
+/// This macro is conditionally compiled when the `sqlite` feature is enabled.
+/// It generates the [`sql::Bind`] and [`sqlx::FromRow`] implementations for SQLite.
 #[cfg(feature = "sqlite")]
 #[macro_export]
 #[doc(hidden)]

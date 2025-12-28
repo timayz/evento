@@ -420,28 +420,111 @@ pub trait Bind {
     );
 }
 
-/// Cursor with i64 value for numeric sorts (dates, counts, etc.)
+/// Cursor with an `i64` value for numeric sorts.
+///
+/// Use this cursor type for sorting by:
+/// - Timestamps (`created_at`, `updated_at`)
+/// - Counts (`total_count`, `view_count`)
+/// - Any other integer-based sort field
+///
+/// # Fields
+///
+/// * `i` - The unique identifier of the record
+/// * `v` - The sort value (i64)
+///
+/// # Example
+///
+/// ```rust
+/// use evento::cursor::CursorInt;
+///
+/// let cursor = CursorInt {
+///     i: "user_123".to_string(),
+///     v: 1703980800, // Unix timestamp
+/// };
+/// ```
 #[derive(Debug, Clone, bitcode::Encode, bitcode::Decode)]
 pub struct CursorInt {
     pub i: String,
     pub v: i64,
 }
 
-/// Cursor with String value for text sorts (names, titles, etc.)
+/// Cursor with a `String` value for text sorts.
+///
+/// Use this cursor type for sorting by:
+/// - Names (`name`, `title`)
+/// - Emails (`email`)
+/// - Any other string-based sort field
+///
+/// # Fields
+///
+/// * `i` - The unique identifier of the record
+/// * `v` - The sort value (String)
+///
+/// # Example
+///
+/// ```rust
+/// use evento::cursor::CursorString;
+///
+/// let cursor = CursorString {
+///     i: "user_123".to_string(),
+///     v: "alice@example.com".to_string(),
+/// };
+/// ```
 #[derive(Debug, Clone, bitcode::Encode, bitcode::Decode)]
 pub struct CursorString {
     pub i: String,
     pub v: String,
 }
 
-/// Cursor with bool value for boolean sorts
+/// Cursor with a `bool` value for boolean sorts.
+///
+/// Use this cursor type for sorting by:
+/// - Status flags (`is_active`, `is_verified`)
+/// - Boolean attributes (`has_subscription`)
+///
+/// # Fields
+///
+/// * `i` - The unique identifier of the record
+/// * `v` - The sort value (bool)
+///
+/// # Example
+///
+/// ```rust
+/// use evento::cursor::CursorBool;
+///
+/// let cursor = CursorBool {
+///     i: "user_123".to_string(),
+///     v: true,
+/// };
+/// ```
 #[derive(Debug, Clone, bitcode::Encode, bitcode::Decode)]
 pub struct CursorBool {
     pub i: String,
     pub v: bool,
 }
 
-/// Cursor with f64 value for floating point sorts (ratings, scores, etc.)
+/// Cursor with an `f64` value for floating-point sorts.
+///
+/// Use this cursor type for sorting by:
+/// - Ratings (`rating`, `score`)
+/// - Prices (`price`, `amount`)
+/// - Any other floating-point sort field
+///
+/// # Fields
+///
+/// * `i` - The unique identifier of the record
+/// * `v` - The sort value (f64)
+///
+/// # Example
+///
+/// ```rust
+/// use evento::cursor::CursorFloat;
+///
+/// let cursor = CursorFloat {
+///     i: "product_456".to_string(),
+///     v: 4.5,
+/// };
+/// ```
 #[derive(Debug, Clone, bitcode::Encode, bitcode::Decode)]
 pub struct CursorFloat {
     pub i: String,
