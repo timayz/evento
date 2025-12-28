@@ -583,7 +583,10 @@ impl<P: Snapshot + Default + 'static, E: Executor> LoadBuilder<P, E> {
         for event in events.edges.iter() {
             let key = format!("{}_{}", event.node.aggregator_type, event.node.name);
             let Some(handler) = self.handlers.get(&key) else {
-                tracing::trace!("No handler found for {}/{key}", self.key);
+                if !self.safety_disabled {
+                    anyhow::bail!("no handler s={} k={key}", self.key);
+                }
+
                 continue;
             };
 
