@@ -448,6 +448,34 @@ pub struct CursorInt {
     pub v: i64,
 }
 
+/// Cursor with an `u64` value for numeric sorts.
+///
+/// Use this cursor type for sorting by:
+/// - Timestamps (`created_at`, `updated_at`)
+/// - Counts (`total_count`, `view_count`)
+/// - Any other integer-based sort field
+///
+/// # Fields
+///
+/// * `i` - The unique identifier of the record
+/// * `v` - The sort value (u64)
+///
+/// # Example
+///
+/// ```rust
+/// use evento::cursor::CursorUInt;
+///
+/// let cursor = CursorUInt {
+///     i: "user_123".to_string(),
+///     v: 1703980800, // Unix timestamp
+/// };
+/// ```
+#[derive(Debug, Clone, bitcode::Encode, bitcode::Decode)]
+pub struct CursorUInt {
+    pub i: String,
+    pub v: u64,
+}
+
 /// Cursor with a `String` value for text sorts.
 ///
 /// Use this cursor type for sorting by:
