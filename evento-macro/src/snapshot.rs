@@ -32,7 +32,7 @@ pub fn snapshot_impl(input: &ItemFn, debug: bool) -> syn::Result<TokenStream> {
             fn restore<'a>(
                 context: &'a ::evento::context::RwContext,
                 id: String,
-                aggregators: &'a HashMap<String, String>,
+                aggregators: &'a ::std::collections::HashMap<String, String>,
             ) -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = ::anyhow::Result<Option<Self>>> + Send + 'a>> {
                 Box::pin(async move { #fn_name(context, id, aggregators).await })
             }
