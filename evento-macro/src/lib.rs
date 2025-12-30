@@ -108,6 +108,7 @@
 
 mod aggregator;
 mod command;
+mod cursor;
 mod handler;
 mod snapshot;
 
@@ -375,5 +376,32 @@ pub fn debug_command(_attr: TokenStream, item: TokenStream) -> TokenStream {
     match command::command_impl(input, true) {
         Ok(tokens) => tokens,
         Err(err) => err.to_compile_error().into(),
+    }
+}
+
+/// Derive macro for generating cursor structs and trait implementations.
+///
+/// # Example
+///
+/// ```ignore
+/// #[derive(Cursor)]
+/// pub struct AdminView {
+///     #[cursor(ContactAdmin::Id, 1)]
+///     pub id: String,
+///     #[cursor(ContactAdmin::CreatedAt, 2)]
+///     pub created_at: u64,
+/// }
+/// ```
+///
+/// This generates:
+/// - `AdminViewCursor` struct with shortened field names
+/// - `impl evento::cursor::Cursor for AdminView`
+/// - `impl evento::sql::Bind for AdminView`
+#[proc_macro_derive(Cursor, attributes(cursor))]
+pub fn derive_cursor(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    match cursor::cursor_impl(&input) {
+        Ok(tokens) => tokens,
+        Err(e) => e.to_compile_error().into(),
     }
 }

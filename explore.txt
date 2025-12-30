@@ -1,2 +1,54 @@
 // internal pub sub for projection with mpsc chanel that send message if handler return Some(mesaage)
 
+#[derive(Debug, Default, FromRow, Cursor)]
+pub struct AdminView {
+    // column, order
+    #[cursor(ContactAdmin::Id, 1)]
+    pub id: String,
+    pub email: String,
+    pub name: String,
+    pub subject: sqlx::types::Text<Subject>,
+    pub message: String,
+    pub status: sqlx::types::Text<Status>,
+    #[cursor(ContactAdmin::CreatedAt, 2)]
+    pub created_at: u64,
+}
+
+#[derive(Debug, Clone, bitcode::Encode, bitcode::Decode)]
+pub struct AdminViewCursor {
+    // id
+    pub i: String,
+    // created_at
+    pub c: u64,
+    // in case of duplicate, for example creating 
+    // pub cr: ...
+}
+
+impl evento::cursor::Cursor for AdminView {
+    type T = CursorUInt;
+
+    fn serialize(&self) -> Self::T {
+        Self::T {
+            i: self.id.to_owned(),
+            c: self.created_at,
+        }
+    }
+}
+
+impl evento::sql::Bind for AdminView {
+    type T = ContactAdmin;
+    type I = [Self::T; 2];
+    type V = [Expr; 2];
+    type Cursor = Self;
+
+    fn columns() -> Self::I {
+        [ContactAdmin::CreatedAt, ContactAdmin::Id]
+    }
+
+    fn values(
+        cursor: <<Self as evento::sql::Bind>::Cursor as evento::cursor::Cursor>::T,
+    ) -> Self::V {
+        [cursor.c.into(), cursor.i.into()]
+    }
+}
+
