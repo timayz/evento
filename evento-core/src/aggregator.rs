@@ -77,6 +77,7 @@ pub enum WriteError {
 ///     .commit(&executor)
 ///     .await?;
 /// ```
+#[derive(Clone)]
 pub struct AggregatorBuilder {
     aggregator_id: String,
     aggregator_type: String,
@@ -100,17 +101,17 @@ impl AggregatorBuilder {
         }
     }
 
-    pub fn original_version(mut self, v: u16) -> Self {
+    pub fn original_version(&mut self, v: u16) -> &mut Self {
         self.original_version = v;
 
         self
     }
 
-    pub fn routing_key(self, v: impl Into<String>) -> Self {
+    pub fn routing_key(&mut self, v: impl Into<String>) -> &mut Self {
         self.routing_key_opt(Some(v.into()))
     }
 
-    pub fn routing_key_opt(mut self, v: Option<String>) -> Self {
+    pub fn routing_key_opt(&mut self, v: Option<String>) -> &mut Self {
         if !self.routing_key_locked {
             self.routing_key = v;
             self.routing_key_locked = true;
@@ -119,7 +120,7 @@ impl AggregatorBuilder {
         self
     }
 
-    pub fn metadata<M>(mut self, v: &M) -> Self
+    pub fn metadata<M>(&mut self, v: &M) -> &mut Self
     where
         M: bitcode::Encode,
     {
@@ -127,7 +128,7 @@ impl AggregatorBuilder {
         self
     }
 
-    pub fn event<D>(mut self, v: &D) -> Self
+    pub fn event<D>(&mut self, v: &D) -> &mut Self
     where
         D: crate::projection::Event + bitcode::Encode,
     {

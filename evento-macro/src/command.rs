@@ -74,6 +74,7 @@ pub fn command_impl(input: DeriveInput, debug: bool) -> syn::Result<TokenStream>
                 evento::aggregator(&self.aggregator_id)
                     .original_version(self.event_version)
                     .routing_key_opt(self.event_routing_key.to_owned())
+                    .to_owned()
             }
         }
     };
