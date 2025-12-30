@@ -64,14 +64,19 @@ fn generate_short_name(field_name: &str, used: &HashSet<String>) -> String {
 
 /// Extract the enum type from the column path (e.g., ContactAdmin::Id -> ContactAdmin)
 fn extract_enum_type(path: &syn::Path) -> Result<syn::Path> {
-    let mut segments = path.segments.clone();
-    if segments.len() < 2 {
+    if path.segments.len() < 2 {
         return Err(syn::Error::new_spanned(
             path,
             "Expected path with at least two segments (e.g., Column::Variant)",
         ));
     }
-    segments.pop(); // Remove the variant (e.g., "Id")
+    let segments: syn::punctuated::Punctuated<syn::PathSegment, syn::Token![::]> = path
+        .segments
+        .iter()
+        .take(path.segments.len() - 1)
+        .cloned()
+        .collect();
+
     Ok(syn::Path {
         leading_colon: path.leading_colon,
         segments,
@@ -220,7 +225,7 @@ pub fn cursor_impl(input: &DeriveInput) -> Result<TokenStream> {
         quote! { cursor.#short.into() }
     });
 
-    Ok(quote! {
+    let output = quote! {
         #[derive(Debug, Clone, bitcode::Encode, bitcode::Decode)]
         pub struct #cursor_struct_name {
             #(#cursor_struct_fields),*
@@ -239,7 +244,7 @@ pub fn cursor_impl(input: &DeriveInput) -> Result<TokenStream> {
         impl evento::sql::Bind for #struct_name {
             type T = #column_enum_type;
             type I = [Self::T; #field_count];
-            type V = [sea_query::SimpleExpr; #field_count];
+            type V = [::sea_query::Expr; #field_count];
             type Cursor = Self;
 
             fn columns() -> Self::I {
@@ -252,6 +257,9 @@ pub fn cursor_impl(input: &DeriveInput) -> Result<TokenStream> {
                 [#(#values),*]
             }
         }
-    }
-    .into())
+    };
+
+    eprintln!("{output}");
+
+    Ok(output.into())
 }
