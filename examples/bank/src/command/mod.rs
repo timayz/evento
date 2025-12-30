@@ -110,6 +110,7 @@ pub fn subscription<E: Executor>() -> SubscriptionBuilder<CommandData, E> {
 async fn restore(
     _context: &evento::context::RwContext,
     id: String,
+    _aggregators: &HashMap<String, String>,
 ) -> anyhow::Result<Option<CommandData>> {
     let rows = COMMAND_ROWS.read().unwrap();
 

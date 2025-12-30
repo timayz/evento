@@ -463,6 +463,7 @@ pub trait Snapshot: Sized {
     fn restore<'a>(
         _context: &'a context::RwContext,
         _id: String,
+        _aggregators: &'a HashMap<String, String>,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<Option<Self>>> + Send + 'a>> {
         Box::pin(async { Ok(None) })
     }
@@ -542,7 +543,7 @@ impl<P: Snapshot + Default + 'static, E: Executor> LoadBuilder<P, E> {
             }
             _ => (0, None),
         };
-        let loaded = P::restore(&context, self.id.to_owned()).await?;
+        let loaded = P::restore(&context, self.id.to_owned(), &self.aggregators).await?;
         if loaded.is_none() {
             cursor = None;
         }
