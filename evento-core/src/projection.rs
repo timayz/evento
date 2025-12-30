@@ -508,8 +508,18 @@ impl<P: Snapshot + Default + 'static, E: Executor> LoadBuilder<P, E> {
     ///
     /// Use this when the projection needs events from multiple aggregates.
     pub fn aggregator<A: Aggregator>(&mut self, id: impl Into<String>) -> &mut Self {
-        self.aggregators
-            .insert(A::aggregator_type().to_owned(), id.into());
+        self.aggregator_raw(A::aggregator_type().to_owned(), id)
+    }
+
+    /// Adds a related aggregate to load events from.
+    ///
+    /// Use this when the projection needs events from multiple aggregates.
+    pub fn aggregator_raw(
+        &mut self,
+        aggregator_type: impl Into<String>,
+        id: impl Into<String>,
+    ) -> &mut Self {
+        self.aggregators.insert(aggregator_type.into(), id.into());
 
         self
     }
