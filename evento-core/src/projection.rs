@@ -608,7 +608,7 @@ impl<P: Snapshot + Default + 'static, E: Executor> LoadBuilder<P, E> {
             handler.apply(&mut snapshot, &event.node).await?;
         }
 
-        if events.page_info.has_next_page {
+        if events.page_info.has_next_page && !self.filter_events_by_name {
             anyhow::bail!("Too busy");
         }
 
@@ -850,9 +850,11 @@ impl<P, E: Executor + 'static> SubscriptionBuilder<P, E> {
                     continue;
                 };
 
+                tracing::debug!("handle started");
+
                 handler.handle(&context, &event.node).await?;
 
-                tracing::debug!("completed");
+                tracing::debug!("handle completed");
 
                 executor
                     .acknowledge(
