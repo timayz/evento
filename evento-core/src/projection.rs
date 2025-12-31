@@ -53,11 +53,7 @@ use tokio::{
 use tracing::field::Empty;
 use ulid::Ulid;
 
-use crate::{
-    context,
-    cursor::{Args, Cursor},
-    Executor, ReadAggregator,
-};
+use crate::{context, cursor::Args, Executor, ReadAggregator};
 
 /// Filter for events by routing key.
 ///
@@ -468,6 +464,18 @@ pub trait Snapshot: Sized {
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<Option<Self>>> + Send + 'a>> {
         Box::pin(async { Ok(None) })
     }
+
+    /// Restores version from a snapshot.
+    fn restore_version(&self) -> u16 {
+        0
+    }
+
+    /// Restores routing_key from a snapshot if available.
+    ///
+    /// Returns `None` if no routing_key exists.
+    fn restore_routing_key(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Builder for loading aggregate state from events.
@@ -546,19 +554,14 @@ impl<P: Snapshot + Default + 'static, E: Executor> LoadBuilder<P, E> {
             executor,
         };
 
-        let mut cursor = executor.get_subscriber_cursor(self.key.to_owned()).await?;
-        let (mut version, mut routing_key) = match cursor {
-            Some(ref cursor) => {
-                let cursor = crate::Event::deserialize_cursor(cursor)?;
-
-                (cursor.v, cursor.r)
-            }
-            _ => (0, None),
-        };
-        let loaded = P::restore(&context, self.id.to_owned(), &self.aggregators).await?;
-        if loaded.is_none() {
-            cursor = None;
-        }
+        let cursor = executor.get_subscriber_cursor(self.key.to_owned()).await?;
+        let snapshot = P::restore(&context, self.id.to_owned(), &self.aggregators)
+            .await?
+            .map(|item| LoadResult {
+                version: item.restore_version(),
+                routing_key: item.restore_routing_key(),
+                item,
+            });
 
         let read_aggregators = self
             .handlers
@@ -591,16 +594,16 @@ impl<P: Snapshot + Default + 'static, E: Executor> LoadBuilder<P, E> {
             )
             .await?;
 
-        if events.edges.is_empty() && loaded.is_none() {
+        if events.edges.is_empty() && snapshot.is_none() {
             return Ok(None);
         }
 
-        let mut snapshot = loaded.unwrap_or_default();
+        let mut snapshot = snapshot.unwrap_or_default();
 
         for event in events.edges.iter() {
             if event.node.aggregator_type == self.aggregator_type {
-                version = event.node.version;
-                routing_key = event.node.routing_key.to_owned();
+                snapshot.version = event.node.version;
+                snapshot.routing_key = event.node.routing_key.to_owned();
             }
             let key = format!("{}_{}", event.node.aggregator_type, event.node.name);
             let Some(handler) = self.handlers.get(&key) else {
@@ -618,11 +621,7 @@ impl<P: Snapshot + Default + 'static, E: Executor> LoadBuilder<P, E> {
             anyhow::bail!("Too busy");
         }
 
-        Ok(Some(LoadResult {
-            item: snapshot,
-            version,
-            routing_key,
-        }))
+        Ok(Some(snapshot))
     }
 }
 

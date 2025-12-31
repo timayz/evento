@@ -114,8 +114,6 @@ pub struct EventCursor {
     pub t: u64,
     /// Sub-second precision (milliseconds)
     pub s: u32,
-    /// Event routing_key
-    pub r: Option<String>,
 }
 
 /// A stored event in the event store.
@@ -174,7 +172,6 @@ impl Cursor for Event {
             v: self.version,
             t: self.timestamp,
             s: self.timestamp_subsec,
-            r: self.routing_key.to_owned(),
         }
     }
 }
