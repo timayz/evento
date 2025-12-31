@@ -850,11 +850,13 @@ impl<P, E: Executor + 'static> SubscriptionBuilder<P, E> {
                     continue;
                 };
 
-                tracing::debug!("handle started");
+                if let Err(err) = handler.handle(&context, &event.node).await {
+                    tracing::error!("failed");
 
-                handler.handle(&context, &event.node).await?;
+                    return Err(err);
+                }
 
-                tracing::debug!("handle completed");
+                tracing::debug!("completed");
 
                 executor
                     .acknowledge(
