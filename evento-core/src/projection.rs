@@ -362,6 +362,7 @@ impl<P: 'static, E: Executor> Projection<P, E> {
         LoadBuilder {
             key: self.key.to_owned(),
             id,
+            aggregator_type: A::aggregator_type().to_owned(),
             aggregators,
             handlers: self.handlers,
             context: Default::default(),
@@ -487,6 +488,7 @@ pub trait Snapshot: Sized {
 pub struct LoadBuilder<P: Snapshot + Default + 'static, E: Executor> {
     key: String,
     id: String,
+    aggregator_type: String,
     aggregators: HashMap<String, String>,
     handlers: HashMap<String, Box<dyn Handler<P, E>>>,
     context: context::RwContext,
@@ -606,15 +608,15 @@ impl<P: Snapshot + Default + 'static, E: Executor> LoadBuilder<P, E> {
             };
 
             handler.apply(&mut snapshot, &event.node).await?;
+
+            if event.node.aggregator_type == self.aggregator_type {
+                version = event.node.version;
+                routing_key = event.node.routing_key.to_owned();
+            }
         }
 
         if events.page_info.has_next_page && !self.filter_events_by_name {
             anyhow::bail!("Too busy");
-        }
-
-        if let Some(event) = events.edges.last() {
-            version = event.node.version;
-            routing_key = event.node.routing_key.to_owned();
         }
 
         Ok(Some(LoadResult {
