@@ -598,6 +598,10 @@ impl<P: Snapshot + Default + 'static, E: Executor> LoadBuilder<P, E> {
         let mut snapshot = loaded.unwrap_or_default();
 
         for event in events.edges.iter() {
+            if event.node.aggregator_type == self.aggregator_type {
+                version = event.node.version;
+                routing_key = event.node.routing_key.to_owned();
+            }
             let key = format!("{}_{}", event.node.aggregator_type, event.node.name);
             let Some(handler) = self.handlers.get(&key) else {
                 if !self.safety_disabled {
@@ -608,11 +612,6 @@ impl<P: Snapshot + Default + 'static, E: Executor> LoadBuilder<P, E> {
             };
 
             handler.apply(&mut snapshot, &event.node).await?;
-
-            if event.node.aggregator_type == self.aggregator_type {
-                version = event.node.version;
-                routing_key = event.node.routing_key.to_owned();
-            }
         }
 
         if events.page_info.has_next_page && !self.filter_events_by_name {
