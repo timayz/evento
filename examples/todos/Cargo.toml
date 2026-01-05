@@ -12,5 +12,5 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
 heed = "0.22"
 tempfile = "3.23"
 axum = { version = "0.8", features = ["macros"] }
-askama = "0.14"
+askama = "0.15"
 evento = { path = "../../evento", version = "1.8.0", features = ["sqlite"] }
