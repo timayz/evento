@@ -96,6 +96,7 @@ pub trait Snapshot: Sized {
     fn restore(
         _context: &context::RwContext,
         _id: String,
+        _aggregators: &HashMap<String, String>,
     ) -> impl Future<Output = anyhow::Result<Option<Self>>> + Send {
         Box::pin(async { Ok(None) })
     }
@@ -233,7 +234,7 @@ impl<P: Snapshot + Default + 'static> Projection<P> {
     /// Returns `Err` if there are too many events to process in one batch.
     pub async fn execute<E: Executor>(&self, executor: &E) -> anyhow::Result<Option<P>> {
         let context = self.context.clone();
-        let snapshot = P::restore(&context, self.id.to_owned()).await?;
+        let snapshot = P::restore(&context, self.id.to_owned(), &self.aggregators).await?;
         let cursor = snapshot.as_ref().map(|s| s.get_cursor());
 
         let read_aggregators = self

@@ -120,6 +120,7 @@ impl Snapshot for CommandData {
     async fn restore(
         _context: &evento::context::RwContext,
         id: String,
+        _aggregators: &HashMap<String, String>,
     ) -> anyhow::Result<Option<Self>> {
         let rows = COMMAND_ROWS.read().unwrap();
 

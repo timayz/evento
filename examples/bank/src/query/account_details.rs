@@ -68,6 +68,7 @@ impl evento::Snapshot for AccountDetailsView {
     async fn restore(
         _context: &evento::context::RwContext,
         id: String,
+        _aggregators: &HashMap<String, String>,
     ) -> anyhow::Result<Option<Self>> {
         let rows = ACCOUNT_DETAILS_ROWS.read().unwrap();
 
