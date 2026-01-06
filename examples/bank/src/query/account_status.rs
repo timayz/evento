@@ -1,16 +1,13 @@
-use evento::{
-    Executor,
-    metadata::Event,
-    projection::{Action, Projection},
-};
+use evento::{metadata::Event, projection::Projection};
 
 use crate::{
+    BankAccount,
     aggregator::{AccountClosed, AccountFrozen, AccountOpened, AccountUnfrozen},
     value_object::AccountStatus,
 };
 
-pub fn create_projection<E: Executor>() -> Projection<AccountStatusView, E> {
-    Projection::new("account-status-view")
+pub fn create_projection(id: impl Into<String>) -> Projection<AccountStatusView> {
+    Projection::new::<BankAccount>(id)
         .handler(handle_account_opened())
         .handler(handle_account_closed())
         .handler(handle_account_frozen())
@@ -28,73 +25,53 @@ pub struct AccountStatusView {
 impl evento::Snapshot for AccountStatusView {}
 
 #[evento::handler]
-async fn handle_account_opened<E: Executor>(
+async fn handle_account_opened(
     _event: Event<AccountOpened>,
-    action: Action<'_, AccountStatusView, E>,
+    row: &mut AccountStatusView,
 ) -> anyhow::Result<()> {
-    match action {
-        Action::Apply(row) => {
-            row.status = AccountStatus::Active;
-            row.is_closed = false;
-            row.is_active = true;
-            row.is_frozen = false;
-        }
-        Action::Handle(_context) => {}
-    };
+    row.status = AccountStatus::Active;
+    row.is_closed = false;
+    row.is_active = true;
+    row.is_frozen = false;
 
     Ok(())
 }
 
 #[evento::handler]
-async fn handle_account_frozen<E: Executor>(
+async fn handle_account_frozen(
     _event: Event<AccountFrozen>,
-    action: Action<'_, AccountStatusView, E>,
+    row: &mut AccountStatusView,
 ) -> anyhow::Result<()> {
-    match action {
-        Action::Apply(row) => {
-            row.status = AccountStatus::Frozen;
-            row.is_closed = false;
-            row.is_active = false;
-            row.is_frozen = true;
-        }
-        Action::Handle(_context) => {}
-    };
+    row.status = AccountStatus::Frozen;
+    row.is_closed = false;
+    row.is_active = false;
+    row.is_frozen = true;
 
     Ok(())
 }
 
 #[evento::handler]
-async fn handle_account_unfrozen<E: Executor>(
+async fn handle_account_unfrozen(
     _event: Event<AccountUnfrozen>,
-    action: Action<'_, AccountStatusView, E>,
+    row: &mut AccountStatusView,
 ) -> anyhow::Result<()> {
-    match action {
-        Action::Apply(row) => {
-            row.status = AccountStatus::Active;
-            row.is_closed = false;
-            row.is_active = true;
-            row.is_frozen = false;
-        }
-        Action::Handle(_context) => {}
-    };
+    row.status = AccountStatus::Active;
+    row.is_closed = false;
+    row.is_active = true;
+    row.is_frozen = false;
 
     Ok(())
 }
 
 #[evento::handler]
-async fn handle_account_closed<E: Executor>(
+async fn handle_account_closed(
     _event: Event<AccountClosed>,
-    action: Action<'_, AccountStatusView, E>,
+    row: &mut AccountStatusView,
 ) -> anyhow::Result<()> {
-    match action {
-        Action::Apply(row) => {
-            row.status = AccountStatus::Closed;
-            row.is_closed = true;
-            row.is_active = false;
-            row.is_frozen = false;
-        }
-        Action::Handle(_context) => {}
-    };
+    row.status = AccountStatus::Closed;
+    row.is_closed = true;
+    row.is_active = false;
+    row.is_frozen = false;
 
     Ok(())
 }

@@ -111,6 +111,7 @@ mod command;
 mod cursor;
 mod handler;
 mod snapshot;
+mod sub_handler;
 
 use proc_macro::TokenStream;
 use syn::{parse_macro_input, DeriveInput, ItemFn};
@@ -257,6 +258,16 @@ pub fn debug_handler(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemFn);
 
     match handler::handler_next_impl(&input, true) {
+        Ok(tokens) => tokens,
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+#[proc_macro_attribute]
+pub fn sub_handler(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(item as ItemFn);
+
+    match sub_handler::handler_next_impl(&input, false) {
         Ok(tokens) => tokens,
         Err(e) => e.to_compile_error().into(),
     }

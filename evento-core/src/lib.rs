@@ -87,15 +87,16 @@ pub mod cursor;
 mod executor;
 pub mod metadata;
 pub mod projection;
+pub mod subscription;
 
 #[cfg(feature = "macro")]
 pub use evento_macro::*;
 
 pub use aggregator::*;
 pub use executor::*;
-pub use projection::RoutingKey;
+pub use subscription::RoutingKey;
 
-use std::fmt::Debug;
+use std::{fmt::Debug, ops::Deref};
 use ulid::Ulid;
 
 use crate::cursor::Cursor;
@@ -269,6 +270,76 @@ where
             metadata: sqlx::Row::try_get(row, "metadata")?,
             timestamp: timestamp as u64,
             timestamp_subsec: timestamp_subsec as u32,
+        })
+    }
+}
+
+/// Typed event with deserialized data and metadata.
+///
+/// `EventData` wraps a raw [`Event`](crate::Event) and provides typed access
+/// to the deserialized event data and metadata. It implements `Deref` to
+/// provide access to the underlying event fields (id, timestamp, version, etc.).
+///
+/// # Type Parameters
+///
+/// - `D`: The event data type (e.g., `AccountOpened`)
+/// - `M`: The metadata type (defaults to `bool` for no metadata)
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use evento::metadata::Event;
+///
+/// #[evento::handler]
+/// async fn handle_deposit<E: Executor>(
+///     event: Event<MoneyDeposited>,
+///     action: Action<'_, AccountView, E>,
+/// ) -> anyhow::Result<()> {
+///     // Access typed data
+///     println!("Amount: {}", event.data.amount);
+///
+///     // Access metadata
+///     if let Ok(user) = event.metadata.user() {
+///         println!("By user: {}", user);
+///     }
+///
+///     // Access underlying event fields via Deref
+///     println!("Event ID: {}", event.id);
+///     println!("Version: {}", event.version);
+///
+///     Ok(())
+/// }
+/// ```
+pub struct EventData<D, M = bool> {
+    event: Event,
+    /// The typed event data
+    pub data: D,
+    /// The typed event metadata
+    pub metadata: M,
+}
+
+impl<D, M> Deref for EventData<D, M> {
+    type Target = Event;
+
+    fn deref(&self) -> &Self::Target {
+        &self.event
+    }
+}
+
+impl<D, M> TryFrom<&Event> for EventData<D, M>
+where
+    D: bitcode::DecodeOwned,
+    M: bitcode::DecodeOwned,
+{
+    type Error = bitcode::Error;
+
+    fn try_from(value: &Event) -> Result<Self, Self::Error> {
+        let data = bitcode::decode::<D>(&value.data)?;
+        let metadata = bitcode::decode::<M>(&value.metadata)?;
+        Ok(EventData {
+            data,
+            metadata,
+            event: value.clone(),
         })
     }
 }

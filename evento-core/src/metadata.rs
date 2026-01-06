@@ -28,7 +28,7 @@
 //!     .await?;
 //! ```
 
-use crate::projection::EventData;
+use crate::EventData;
 
 use thiserror::Error;
 use ulid::Ulid;

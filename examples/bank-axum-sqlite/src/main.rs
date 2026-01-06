@@ -9,8 +9,8 @@ use axum::{
     Form, Router,
 };
 use bank::{
-    account_details_subscription, AccountType, Command, DepositMoney, OpenAccount, TransferMoney,
-    WithdrawMoney, ACCOUNT_DETAILS_ROWS,
+    account_details, AccountType, Command, DepositMoney, OpenAccount, TransferMoney, WithdrawMoney,
+    ACCOUNT_DETAILS_ROWS,
 };
 use evento::sql::Sql;
 use serde::Deserialize;
@@ -44,9 +44,6 @@ async fn main() -> anyhow::Result<()> {
     drop(conn);
 
     let executor: Executor = pool.into();
-
-    // Start subscription in background to populate ACCOUNT_DETAILS_ROWS
-    account_details_subscription().start(&executor).await?;
 
     let state = AppState {
         executor: Arc::new(executor),
@@ -134,7 +131,7 @@ async fn create_account(
 ) -> impl IntoResponse {
     let owner_id = Ulid::new().to_string();
 
-    let _ = Command::open_account(
+    let id = Command::open_account(
         OpenAccount {
             owner_id,
             owner_name: form.owner_name,
@@ -144,30 +141,32 @@ async fn create_account(
         },
         state.executor.as_ref(),
     )
-    .await;
+    .await
+    .unwrap();
 
-    Redirect::to("/accounts")
+    Redirect::to(&format!("/accounts/{id}"))
 }
 
-async fn view_account(axum::extract::Path(id): axum::extract::Path<String>) -> Response {
+async fn view_account(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    let row = account_details::load(state.executor.as_ref(), &id, "")
+        .await
+        .unwrap();
     let accounts = get_all_accounts();
-    let rows = ACCOUNT_DETAILS_ROWS.read().unwrap();
 
-    match rows.get(&id) {
-        Some((view, _, _)) => {
+    match row {
+        Some(view) => {
             let account = AccountView {
                 id: id.to_owned(),
                 balance: view.balance,
                 currency: view.currency.to_owned(),
                 status: format!("{:?}", view.status),
             };
-            drop(rows);
             render(ViewAccountTemplate { account, accounts })
         }
-        None => {
-            drop(rows);
-            Html("<h1>Account not found</h1>".to_owned()).into_response()
-        }
+        None => Html("<h1>Account not found</h1>".to_owned()).into_response(),
     }
 }
 
@@ -259,7 +258,7 @@ async fn transfer(
 fn get_all_accounts() -> Vec<AccountView> {
     let rows = ACCOUNT_DETAILS_ROWS.read().unwrap();
     rows.iter()
-        .map(|(id, (view, _version, _routing_key))| AccountView {
+        .map(|(id, view)| AccountView {
             id: id.to_owned(),
             balance: view.balance,
             currency: view.currency.to_owned(),

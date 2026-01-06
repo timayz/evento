@@ -39,8 +39,7 @@ pub fn command_impl(input: DeriveInput, debug: bool) -> syn::Result<TokenStream>
             data: #data_struct_name,
             aggregator_id: String,
             executor: &'a E,
-            pub event_version: u16,
-            pub event_routing_key: Option<String>,
+            pub version: u16,
         }
 
         impl<'a, E: ::evento::Executor> ::core::ops::Deref for #struct_name<'a, E> {
@@ -58,22 +57,20 @@ pub fn command_impl(input: DeriveInput, debug: bool) -> syn::Result<TokenStream>
         }
 
         impl<'a, E: ::evento::Executor> #struct_name<'a, E> {
-            pub fn new(aggregator_id: impl Into<String>, loaded: ::evento::LoadResult<#data_struct_name>, executor: &'a E) -> Self {
+            pub fn new(aggregator_id: impl Into<String>, version: u16, data: #data_struct_name, executor: &'a E) -> Self {
                 let aggregator_id = aggregator_id.into();
 
                 Self {
                     aggregator_id,
-                    data: loaded.item,
-                    event_version: loaded.version,
-                    event_routing_key: loaded.routing_key,
+                    data,
+                    version,
                     executor,
                 }
             }
 
             fn aggregator(&self) -> ::evento::AggregatorBuilder {
                 evento::aggregator(&self.aggregator_id)
-                    .original_version(self.event_version)
-                    .routing_key_opt(self.event_routing_key.to_owned())
+                    .original_version(self.version)
                     .to_owned()
             }
         }

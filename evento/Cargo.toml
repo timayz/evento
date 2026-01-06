@@ -26,6 +26,7 @@ sea-query-sqlx = { workspace = true, features = ["sqlx-sqlite", "sqlx-mysql", "s
 anyhow.workspace = true
 evento-fjall = { path = "../evento-fjall" }
 tempfile = "3.24"
+once_cell.workspace = true
 
 [features]
 default = ["macro"]
