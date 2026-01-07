@@ -202,7 +202,7 @@ impl<P: Snapshot + Default + 'static> Projection<P> {
     /// Adds shared data to the load context.
     ///
     /// Data added here is accessible in handlers via the context.
-    pub fn data<D: Send + Sync + 'static>(&mut self, v: D) -> &mut Self {
+    pub fn data<D: Send + Sync + 'static>(self, v: D) -> Self {
         self.context.insert(v);
 
         self
@@ -211,7 +211,7 @@ impl<P: Snapshot + Default + 'static> Projection<P> {
     /// Adds a related aggregate to load events from.
     ///
     /// Use this when the projection needs events from multiple aggregates.
-    pub fn aggregator<A: Aggregator>(&mut self, id: impl Into<String>) -> &mut Self {
+    pub fn aggregator<A: Aggregator>(self, id: impl Into<String>) -> Self {
         self.aggregator_raw(A::aggregator_type().to_owned(), id)
     }
 
@@ -219,10 +219,10 @@ impl<P: Snapshot + Default + 'static> Projection<P> {
     ///
     /// Use this when the projection needs events from multiple aggregates.
     pub fn aggregator_raw(
-        &mut self,
+        mut self,
         aggregator_type: impl Into<String>,
         id: impl Into<String>,
-    ) -> &mut Self {
+    ) -> Self {
         self.aggregators.insert(aggregator_type.into(), id.into());
 
         self
