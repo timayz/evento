@@ -293,6 +293,10 @@ impl<P: Snapshot + Default + 'static> Projection<P> {
             snapshot.take_snapshot(&context).await?;
         }
 
+        if events.page_info.has_next_page {
+            anyhow::bail!("Too busy");
+        }
+
         Ok(Some(snapshot))
     }
 }
