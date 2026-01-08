@@ -57,7 +57,7 @@ pub async fn load<E: Executor>(executor: &E) -> anyhow::Result<()> {
         .expect("john account should exist");
 
     assert_eq!(john.balance, 1000);
-    assert_eq!(john.get_cursor_version()?, 1);
+    assert_eq!(john.aggregator_version()?, 1);
     assert!(john.is_active());
 
     // Load Jane's account and verify initial state
@@ -66,7 +66,7 @@ pub async fn load<E: Executor>(executor: &E) -> anyhow::Result<()> {
         .expect("jane account should exist");
 
     assert_eq!(jane.balance, 500);
-    assert_eq!(jane.get_cursor_version()?, 1);
+    assert_eq!(jane.aggregator_version()?, 1);
     assert!(jane.is_active());
 
     // Deposit money to John's account
@@ -83,7 +83,7 @@ pub async fn load<E: Executor>(executor: &E) -> anyhow::Result<()> {
         .expect("john account should exist");
 
     assert_eq!(john.balance, 1250);
-    assert_eq!(john.get_cursor_version()?, 2);
+    assert_eq!(john.aggregator_version()?, 2);
 
     // Transfer money from John to Jane
     let transaction_id = Ulid::new().to_string();
@@ -118,9 +118,9 @@ pub async fn load<E: Executor>(executor: &E) -> anyhow::Result<()> {
         .expect("jane account should exist");
 
     assert_eq!(john.balance, 950); // 1250 - 300
-    assert_eq!(john.get_cursor_version()?, 3); // AccountOpened + MoneyDeposited + MoneyTransferred
+    assert_eq!(john.aggregator_version()?, 3); // AccountOpened + MoneyDeposited + MoneyTransferred
     assert_eq!(jane.balance, 800); // 500 + 300
-    assert_eq!(jane.get_cursor_version()?, 2); // AccountOpened + MoneyReceived
+    assert_eq!(jane.aggregator_version()?, 2); // AccountOpened + MoneyReceived
 
     // Verify non-existent account returns None
     let non_existent = bank::load(executor, "non_existent_id").await?;
@@ -152,7 +152,7 @@ pub async fn routing_key<E: Executor>(executor: &E) -> anyhow::Result<()> {
     let routing_key = last_routing_key(executor, &account_id).await?;
 
     assert_eq!(routing_key, Some("us-east-1".to_owned()));
-    assert_eq!(account.get_cursor_version()?, 1);
+    assert_eq!(account.aggregator_version()?, 1);
     assert_eq!(account.balance, 1000);
 
     // Deposit money - routing key should be preserved from first event
@@ -172,7 +172,7 @@ pub async fn routing_key<E: Executor>(executor: &E) -> anyhow::Result<()> {
     let routing_key = last_routing_key(executor, &account_id).await?;
 
     assert_eq!(routing_key, Some("us-east-1".to_owned()));
-    assert_eq!(account.get_cursor_version()?, 2);
+    assert_eq!(account.aggregator_version()?, 2);
     assert_eq!(account.balance, 1500);
 
     // Create another account with different routing key "eu-west-1"
@@ -195,7 +195,7 @@ pub async fn routing_key<E: Executor>(executor: &E) -> anyhow::Result<()> {
 
     let routing_key = last_routing_key(executor, &account2_id).await?;
     assert_eq!(routing_key, Some("eu-west-1".to_owned()));
-    assert_eq!(account2.get_cursor_version()?, 1);
+    assert_eq!(account2.aggregator_version()?, 1);
 
     // Create account WITHOUT routing key
     let account3_id = Command::open_account(
@@ -216,7 +216,7 @@ pub async fn routing_key<E: Executor>(executor: &E) -> anyhow::Result<()> {
 
     let routing_key = last_routing_key(executor, &account3_id).await?;
     assert_eq!(routing_key, None);
-    assert_eq!(account3.get_cursor_version()?, 1);
+    assert_eq!(account3.aggregator_version()?, 1);
 
     // Deposit to account without routing key - should remain None
     account3
@@ -233,7 +233,7 @@ pub async fn routing_key<E: Executor>(executor: &E) -> anyhow::Result<()> {
 
     let routing_key = last_routing_key(executor, &account3_id).await?;
     assert_eq!(routing_key, None);
-    assert_eq!(account3.get_cursor_version()?, 2);
+    assert_eq!(account3.aggregator_version()?, 2);
     assert_eq!(account3.balance, 3100);
 
     Ok(())
@@ -358,7 +358,7 @@ pub async fn load_with_snapshot<E: Executor>(executor: &E) -> anyhow::Result<()>
     let account = bank::load(executor, &account_id).await?.unwrap();
 
     assert_eq!(account.balance, 1500); // 1000 (snapshot) + 200 + 300
-    assert_eq!(account.get_cursor_version()?, 3);
+    assert_eq!(account.aggregator_version()?, 3);
 
     // Test with a snapshot at version 2
     {
@@ -371,7 +371,7 @@ pub async fn load_with_snapshot<E: Executor>(executor: &E) -> anyhow::Result<()>
     let account = bank::load(executor, &account_id).await?.unwrap();
 
     assert_eq!(account.balance, 1500); // 1200 (snapshot) + 300
-    assert_eq!(account.get_cursor_version()?, 3);
+    assert_eq!(account.aggregator_version()?, 3);
 
     // Test with snapshot at latest version (no events to apply)
     {
@@ -383,7 +383,7 @@ pub async fn load_with_snapshot<E: Executor>(executor: &E) -> anyhow::Result<()>
     let account = bank::load(executor, &account_id).await?.unwrap();
 
     assert_eq!(account.balance, 1500);
-    assert_eq!(account.get_cursor_version()?, 3);
+    assert_eq!(account.aggregator_version()?, 3);
 
     Ok(())
 }
@@ -412,8 +412,8 @@ pub async fn invalid_original_version<E: Executor>(executor: &E) -> anyhow::Resu
         .expect("account should exist");
 
     // Both have version 1
-    assert_eq!(account_v1_first.get_cursor_version()?, 1);
-    assert_eq!(account_v1_second.get_cursor_version()?, 1);
+    assert_eq!(account_v1_first.aggregator_version()?, 1);
+    assert_eq!(account_v1_second.aggregator_version()?, 1);
 
     // First load commits successfully (version 1 -> 2)
     account_v1_first
@@ -428,7 +428,7 @@ pub async fn invalid_original_version<E: Executor>(executor: &E) -> anyhow::Resu
     let account_after_first = bank::load(executor, &account_id)
         .await?
         .expect("account should exist");
-    assert_eq!(account_after_first.get_cursor_version()?, 2);
+    assert_eq!(account_after_first.aggregator_version()?, 2);
     assert_eq!(account_after_first.balance, 1100);
 
     // Second load tries to commit with stale version 1
@@ -454,7 +454,7 @@ pub async fn invalid_original_version<E: Executor>(executor: &E) -> anyhow::Resu
     let account_final = bank::load(executor, &account_id)
         .await?
         .expect("account should exist");
-    assert_eq!(account_final.get_cursor_version()?, 2);
+    assert_eq!(account_final.aggregator_version()?, 2);
     assert_eq!(account_final.balance, 1100); // Only first deposit counted
 
     Ok(())
@@ -1127,7 +1127,7 @@ pub async fn all_commands<E: Executor + Clone>(
         .await?
         .expect("Account A should exist");
     assert_eq!(account_a.balance, 5000);
-    assert_eq!(account_a.get_cursor_version()?, 1);
+    assert_eq!(account_a.aggregator_version()?, 1);
     assert!(account_a.is_active());
 
     let account_b = bank::load(executor, &account_b_id)
@@ -1151,7 +1151,7 @@ pub async fn all_commands<E: Executor + Clone>(
         .await?
         .expect("Account A should exist");
     assert_eq!(account_a.balance, 7500); // 5000 + 2500
-    assert_eq!(account_a.get_cursor_version()?, 2);
+    assert_eq!(account_a.aggregator_version()?, 2);
 
     // =========================================================================
     // 3. WithdrawMoney
@@ -1169,7 +1169,7 @@ pub async fn all_commands<E: Executor + Clone>(
         .await?
         .expect("Account A should exist");
     assert_eq!(account_a.balance, 7000); // 7500 - 500
-    assert_eq!(account_a.get_cursor_version()?, 3);
+    assert_eq!(account_a.aggregator_version()?, 3);
 
     // =========================================================================
     // 4. ChangeOverdraftLimit
@@ -1183,7 +1183,7 @@ pub async fn all_commands<E: Executor + Clone>(
         .await?
         .expect("Account A should exist");
     assert_eq!(account_a.overdraft_limit, 1000);
-    assert_eq!(account_a.get_cursor_version()?, 4);
+    assert_eq!(account_a.aggregator_version()?, 4);
 
     // =========================================================================
     // 5. TransferMoney / ReceiveMoney
@@ -1223,9 +1223,9 @@ pub async fn all_commands<E: Executor + Clone>(
         .expect("Account B should exist");
 
     assert_eq!(account_a.balance, 5000); // 7000 - 2000
-    assert_eq!(account_a.get_cursor_version()?, 5);
+    assert_eq!(account_a.aggregator_version()?, 5);
     assert_eq!(account_b.balance, 3000); // 1000 + 2000
-    assert_eq!(account_b.get_cursor_version()?, 2);
+    assert_eq!(account_b.aggregator_version()?, 2);
 
     // =========================================================================
     // 6. FreezeAccount / UnfreezeAccount
@@ -1241,7 +1241,7 @@ pub async fn all_commands<E: Executor + Clone>(
         .await?
         .expect("Account A should exist");
     assert!(account_a.is_frozen());
-    assert_eq!(account_a.get_cursor_version()?, 6);
+    assert_eq!(account_a.aggregator_version()?, 6);
 
     // Try to withdraw while frozen - should fail
     let withdraw_result = account_a
@@ -1264,7 +1264,7 @@ pub async fn all_commands<E: Executor + Clone>(
         .await?
         .expect("Account A should exist");
     assert!(account_a.is_active());
-    assert_eq!(account_a.get_cursor_version()?, 7);
+    assert_eq!(account_a.aggregator_version()?, 7);
 
     // =========================================================================
     // 7. CloseAccount
@@ -1283,7 +1283,7 @@ pub async fn all_commands<E: Executor + Clone>(
         .await?
         .expect("Account A should exist");
     assert_eq!(account_a.balance, 0);
-    assert_eq!(account_a.get_cursor_version()?, 8);
+    assert_eq!(account_a.aggregator_version()?, 8);
 
     // Close the account
     account_a
@@ -1296,7 +1296,7 @@ pub async fn all_commands<E: Executor + Clone>(
         .await?
         .expect("Account A should exist");
     assert!(account_a.is_closed());
-    assert_eq!(account_a.get_cursor_version()?, 9);
+    assert_eq!(account_a.aggregator_version()?, 9);
 
     // Try operations on closed account - should fail
     let deposit_result = account_a

@@ -42,7 +42,7 @@ use std::{collections::HashMap, future::Future, marker::PhantomData, pin::Pin};
 use crate::{
     context,
     cursor::{self, Args, Cursor},
-    Aggregator, AggregatorEvent, Executor, ReadAggregator,
+    Aggregator, AggregatorBuilder, AggregatorEvent, Executor, ReadAggregator,
 };
 
 /// Trait for event handlers.
@@ -107,11 +107,21 @@ pub trait Snapshot: Sized {
 
     fn set_cursor(&mut self, _v: &cursor::Value) {}
 
-    fn get_cursor_version(&self) -> anyhow::Result<u16> {
+    fn aggregator_version(&self) -> anyhow::Result<u16> {
         let value = self.get_cursor();
         let cursor = crate::Event::deserialize_cursor(&value)?;
 
         Ok(cursor.v)
+    }
+
+    fn aggregator_id(&self) -> String {
+        todo!("Snapshot.aggregator_id")
+    }
+
+    fn aggregator(&self) -> anyhow::Result<AggregatorBuilder> {
+        Ok(AggregatorBuilder::new(self.aggregator_id())
+            .original_version(self.aggregator_version()?)
+            .to_owned())
     }
 
     fn take_snapshot(
