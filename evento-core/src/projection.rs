@@ -71,7 +71,7 @@ pub trait Handler<P: 'static>: Sync + Send {
 
 pub trait ProjectionCursor {
     fn get_cursor(&self) -> cursor::Value;
-    fn set_cursor(&mut self, _v: &cursor::Value);
+    fn set_cursor(&mut self, v: &cursor::Value);
 
     fn aggregator_id(&self) -> String {
         todo!("ProjectionCursor.aggregator_id must be implemented for ProjectionCursor.aggregator")
