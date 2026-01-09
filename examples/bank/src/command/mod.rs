@@ -9,7 +9,7 @@ mod transfer_money;
 mod unfreeze_account;
 mod withdraw_money;
 
-use std::{collections::HashMap, sync::RwLock};
+use std::{collections::HashMap, ops::Deref, sync::RwLock};
 
 pub use change_daily_withdrawal_limit::*;
 pub use change_overdraft_limit::*;
@@ -22,20 +22,40 @@ pub use transfer_money::*;
 pub use unfreeze_account::*;
 pub use withdraw_money::*;
 
-use evento::{Executor, Projection, Snapshot, cursor, metadata::Event};
-
-use crate::{
-    AccountClosed, AccountFrozen, AccountOpened, AccountUnfrozen, BankAccount, MoneyDeposited,
-    MoneyReceived, MoneyTransferred, MoneyWithdrawn, OverdraftLimitChanged,
-    value_object::AccountStatus,
+use evento::{
+    Executor, Projection, Snapshot, cursor, metadata::Event, projection::ProjectionCursor,
 };
+
+use crate::aggregator::{
+    AccountClosed, AccountFrozen, AccountOpened, AccountUnfrozen, MoneyDeposited, MoneyReceived,
+    MoneyTransferred, MoneyWithdrawn, OverdraftLimitChanged,
+};
+use crate::value_object::AccountStatus;
 
 use once_cell::sync::Lazy;
 
-pub static COMMAND_ROWS: Lazy<RwLock<HashMap<String, CommandData>>> = Lazy::new(Default::default);
+pub static COMMAND_ROWS: Lazy<RwLock<HashMap<String, BankAccount>>> = Lazy::new(Default::default);
 
-#[evento::command]
-pub struct Command {
+pub struct Command<E: Executor>(pub E);
+
+impl<E: Executor> Deref for Command<E> {
+    type Target = E;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<E: Executor> Command<E> {
+    pub async fn load(&self, id: impl Into<String>) -> anyhow::Result<Option<BankAccount>> {
+        let id = id.into();
+
+        create_projection(&id).execute(&self.0).await
+    }
+}
+
+#[derive(Default, Clone)]
+pub struct BankAccount {
     pub id: String,
     pub balance: i64,
     pub status: AccountStatus,
@@ -43,7 +63,7 @@ pub struct Command {
     pub cursor: cursor::Value,
 }
 
-impl<'a, E: Executor> Command<'a, E> {
+impl BankAccount {
     pub fn can_withdraw(&self, amount: i64) -> bool {
         matches!(self.status, AccountStatus::Active)
             && amount > 0
@@ -75,8 +95,8 @@ impl<'a, E: Executor> Command<'a, E> {
     }
 }
 
-fn create_projection(id: impl Into<String>) -> Projection<CommandData> {
-    Projection::new::<BankAccount>(id)
+fn create_projection(id: impl Into<String>) -> Projection<BankAccount> {
+    Projection::new::<crate::aggregator::BankAccount>(id)
         .handler(handle_money_deposit())
         .handler(handle_account_opened())
         .handler(handle_money_received())
@@ -89,26 +109,7 @@ fn create_projection(id: impl Into<String>) -> Projection<CommandData> {
         .safety_check()
 }
 
-pub async fn load<E: Executor>(
-    executor: &E,
-    id: impl Into<String>,
-) -> Result<Option<Command<'_, E>>, anyhow::Error> {
-    let id = id.into();
-
-    let result = create_projection(&id).execute(executor).await?;
-
-    match result {
-        Some(data) => Ok(Some(Command::new(
-            id,
-            data.aggregator_version()?,
-            data,
-            executor,
-        ))),
-        _ => Ok(None),
-    }
-}
-
-impl Snapshot for CommandData {
+impl ProjectionCursor for BankAccount {
     fn get_cursor(&self) -> cursor::Value {
         self.cursor.clone()
     }
@@ -117,6 +118,12 @@ impl Snapshot for CommandData {
         self.cursor = v.clone();
     }
 
+    fn aggregator_id(&self) -> String {
+        self.id.to_owned()
+    }
+}
+
+impl Snapshot for BankAccount {
     async fn restore(
         _context: &evento::context::RwContext,
         id: String,
@@ -135,11 +142,12 @@ impl Snapshot for CommandData {
     }
 }
 
-#[evento::debug_handler]
+#[evento::handler]
 async fn handle_account_opened(
     event: Event<AccountOpened>,
-    row: &mut CommandData,
+    row: &mut BankAccount,
 ) -> anyhow::Result<()> {
+    row.id = event.aggregator_id.to_owned();
     row.balance = event.data.initial_balance;
     row.status = AccountStatus::Active;
     row.overdraft_limit = 0;
@@ -150,7 +158,7 @@ async fn handle_account_opened(
 #[evento::handler]
 async fn handle_money_deposit(
     event: Event<MoneyDeposited>,
-    row: &mut CommandData,
+    row: &mut BankAccount,
 ) -> anyhow::Result<()> {
     row.balance += event.data.amount;
 
@@ -160,7 +168,7 @@ async fn handle_money_deposit(
 #[evento::handler]
 async fn handle_money_withdrawn(
     event: Event<MoneyWithdrawn>,
-    row: &mut CommandData,
+    row: &mut BankAccount,
 ) -> anyhow::Result<()> {
     row.balance -= event.data.amount;
 
@@ -170,7 +178,7 @@ async fn handle_money_withdrawn(
 #[evento::handler]
 async fn handle_money_transferred(
     event: Event<MoneyTransferred>,
-    row: &mut CommandData,
+    row: &mut BankAccount,
 ) -> anyhow::Result<()> {
     row.balance -= event.data.amount;
 
@@ -180,7 +188,7 @@ async fn handle_money_transferred(
 #[evento::handler]
 async fn handle_money_received(
     event: Event<MoneyReceived>,
-    row: &mut CommandData,
+    row: &mut BankAccount,
 ) -> anyhow::Result<()> {
     row.balance += event.data.amount;
 
@@ -190,7 +198,7 @@ async fn handle_money_received(
 #[evento::handler]
 async fn handle_overdraf_limit_changed(
     event: Event<OverdraftLimitChanged>,
-    row: &mut CommandData,
+    row: &mut BankAccount,
 ) -> anyhow::Result<()> {
     row.overdraft_limit = event.data.new_limit;
 
@@ -200,7 +208,7 @@ async fn handle_overdraf_limit_changed(
 #[evento::handler]
 async fn handle_account_frozen(
     _event: Event<AccountFrozen>,
-    row: &mut CommandData,
+    row: &mut BankAccount,
 ) -> anyhow::Result<()> {
     row.status = AccountStatus::Frozen;
 
@@ -210,7 +218,7 @@ async fn handle_account_frozen(
 #[evento::handler]
 async fn handle_account_unfrozen(
     _event: Event<AccountUnfrozen>,
-    row: &mut CommandData,
+    row: &mut BankAccount,
 ) -> anyhow::Result<()> {
     row.status = AccountStatus::Active;
 
@@ -220,7 +228,7 @@ async fn handle_account_unfrozen(
 #[evento::handler]
 async fn handle_account_closed(
     _event: Event<AccountClosed>,
-    row: &mut CommandData,
+    row: &mut BankAccount,
 ) -> anyhow::Result<()> {
     row.status = AccountStatus::Closed;
 

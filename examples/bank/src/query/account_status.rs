@@ -1,8 +1,7 @@
-use evento::{metadata::Event, projection::Projection};
+use evento::{cursor, metadata::Event, projection::Projection};
 
 use crate::{
-    BankAccount,
-    aggregator::{AccountClosed, AccountFrozen, AccountOpened, AccountUnfrozen},
+    aggregator::{AccountClosed, AccountFrozen, AccountOpened, AccountUnfrozen, BankAccount},
     value_object::AccountStatus,
 };
 
@@ -20,8 +19,18 @@ pub struct AccountStatusView {
     pub is_active: bool,
     pub is_frozen: bool,
     pub is_closed: bool,
+    pub cursor: cursor::Value,
 }
 
+impl evento::ProjectionCursor for AccountStatusView {
+    fn get_cursor(&self) -> evento::cursor::Value {
+        self.cursor.to_owned()
+    }
+
+    fn set_cursor(&mut self, v: &cursor::Value) {
+        self.cursor = v.to_owned();
+    }
+}
 impl evento::Snapshot for AccountStatusView {}
 
 #[evento::handler]

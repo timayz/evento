@@ -4,10 +4,10 @@ use evento::{Executor, cursor, metadata::Event, projection::Projection};
 use once_cell::sync::Lazy;
 
 use crate::{
-    BankAccount, NameChanged, Owner,
     aggregator::{
-        AccountClosed, AccountFrozen, AccountOpened, AccountUnfrozen, DailyWithdrawalLimitChanged,
-        MoneyDeposited, MoneyReceived, MoneyTransferred, MoneyWithdrawn, OverdraftLimitChanged,
+        AccountClosed, AccountFrozen, AccountOpened, AccountUnfrozen, BankAccount,
+        DailyWithdrawalLimitChanged, MoneyDeposited, MoneyReceived, MoneyTransferred,
+        MoneyWithdrawn, NameChanged, OverdraftLimitChanged, Owner,
     },
     value_object::{AccountStatus, AccountType},
 };
@@ -56,7 +56,7 @@ pub struct AccountDetailsView {
     pub cursor: cursor::Value,
 }
 
-impl evento::Snapshot for AccountDetailsView {
+impl evento::ProjectionCursor for AccountDetailsView {
     fn set_cursor(&mut self, v: &cursor::Value) {
         self.cursor = v.clone();
     }
@@ -64,7 +64,9 @@ impl evento::Snapshot for AccountDetailsView {
     fn get_cursor(&self) -> cursor::Value {
         self.cursor.clone()
     }
+}
 
+impl evento::Snapshot for AccountDetailsView {
     async fn restore(
         _context: &evento::context::RwContext,
         id: String,

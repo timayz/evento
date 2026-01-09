@@ -69,6 +69,32 @@ pub trait Handler<P: 'static>: Sync + Send {
     fn event_name(&self) -> &'static str;
 }
 
+pub trait ProjectionCursor {
+    fn get_cursor(&self) -> cursor::Value;
+    fn set_cursor(&mut self, _v: &cursor::Value);
+
+    fn aggregator_id(&self) -> String {
+        todo!("ProjectionCursor.aggregator_id must be implemented for ProjectionCursor.aggregator")
+    }
+
+    fn aggregator_version(&self) -> anyhow::Result<u16> {
+        let value = self.get_cursor();
+        if value == Default::default() {
+            return Ok(0);
+        }
+
+        let cursor = crate::Event::deserialize_cursor(&value)?;
+
+        Ok(cursor.v)
+    }
+
+    fn aggregator(&self) -> anyhow::Result<AggregatorBuilder> {
+        Ok(AggregatorBuilder::new(self.aggregator_id())
+            .original_version(self.aggregator_version()?)
+            .to_owned())
+    }
+}
+
 /// Trait for types that can be restored from snapshots.
 ///
 /// Snapshots provide a performance optimization by storing pre-computed
@@ -89,7 +115,7 @@ pub trait Handler<P: 'static>: Sync + Send {
 /// // The macro generates the restore implementation that loads
 /// // from a snapshot table if available
 /// ```
-pub trait Snapshot: Sized {
+pub trait Snapshot: ProjectionCursor + Sized {
     /// Restores state from a snapshot if available.
     ///
     /// Returns `None` if no snapshot exists for the given ID.
@@ -99,29 +125,6 @@ pub trait Snapshot: Sized {
         _aggregators: &HashMap<String, String>,
     ) -> impl Future<Output = anyhow::Result<Option<Self>>> + Send {
         Box::pin(async { Ok(None) })
-    }
-
-    fn get_cursor(&self) -> cursor::Value {
-        todo!("Snapshot.get_cursor")
-    }
-
-    fn set_cursor(&mut self, _v: &cursor::Value) {}
-
-    fn aggregator_version(&self) -> anyhow::Result<u16> {
-        let value = self.get_cursor();
-        let cursor = crate::Event::deserialize_cursor(&value)?;
-
-        Ok(cursor.v)
-    }
-
-    fn aggregator_id(&self) -> String {
-        todo!("Snapshot.aggregator_id")
-    }
-
-    fn aggregator(&self) -> anyhow::Result<AggregatorBuilder> {
-        Ok(AggregatorBuilder::new(self.aggregator_id())
-            .original_version(self.aggregator_version()?)
-            .to_owned())
     }
 
     fn take_snapshot(

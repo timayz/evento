@@ -1,4 +1,4 @@
-use evento::{Executor, metadata::Metadata};
+use evento::{Executor, metadata::Metadata, projection::ProjectionCursor};
 
 use crate::{aggregator::AccountUnfrozen, error::BankAccountError, value_object::AccountStatus};
 
@@ -8,20 +8,29 @@ pub struct UnfreezeAccount {
     pub reason: String,
 }
 
-impl<'a, E: Executor> super::Command<'a, E> {
+impl<E: Executor> super::Command<E> {
     /// Handle UnfreezeAccount command
-    pub async fn unfreeze_account(&self, cmd: UnfreezeAccount) -> Result<(), BankAccountError> {
-        if matches!(self.status, AccountStatus::Closed) {
+    pub async fn unfreeze_account(
+        &self,
+        id: impl Into<String>,
+        cmd: UnfreezeAccount,
+    ) -> Result<(), BankAccountError> {
+        let Some(account) = self.load(id).await.unwrap() else {
+            return Err(BankAccountError::Server("not found".to_owned()));
+        };
+        if matches!(account.status, AccountStatus::Closed) {
             return Err(BankAccountError::AccountClosed);
         }
-        if !matches!(self.status, AccountStatus::Frozen) {
+        if !matches!(account.status, AccountStatus::Frozen) {
             return Err(BankAccountError::AccountNotFrozen);
         }
 
-        self.aggregator()
+        account
+            .aggregator()
+            .unwrap()
             .event(&AccountUnfrozen { reason: cmd.reason })
             .metadata(&Metadata::default())
-            .commit(self.executor)
+            .commit(&self.0)
             .await?;
 
         Ok(())

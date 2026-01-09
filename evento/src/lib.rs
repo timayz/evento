@@ -157,7 +157,7 @@
 pub use evento_core::*;
 
 // Re-export projection types at root level for convenience
-pub use evento_core::projection::{Handler, Projection, Snapshot};
+pub use evento_core::projection::{Handler, Projection, ProjectionCursor, Snapshot};
 
 // Re-export SQL types when SQL features are enabled
 /// SQL executor and types (requires `sqlite`, `mysql`, or `postgres` feature).

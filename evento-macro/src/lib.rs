@@ -107,7 +107,6 @@
 //! bitcode derives.
 
 mod aggregator;
-mod command;
 mod cursor;
 mod handler;
 mod snapshot;
@@ -349,44 +348,6 @@ pub fn debug_snapshot(_attr: TokenStream, item: TokenStream) -> TokenStream {
     match snapshot::snapshot_impl(&input, true) {
         Ok(tokens) => tokens,
         Err(e) => e.to_compile_error().into(),
-    }
-}
-
-/// The main macro that transforms a struct into the Data + wrapper pattern
-///
-/// # Usage
-/// ```rust
-/// #[evento::my_macro]
-/// pub struct Command {
-///     pub id: String,
-/// }
-/// ```
-#[proc_macro_attribute]
-pub fn command(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(item as DeriveInput);
-
-    match command::command_impl(input, false) {
-        Ok(tokens) => tokens,
-        Err(err) => err.to_compile_error().into(),
-    }
-}
-
-/// The main macro that transforms a struct into the Data + wrapper pattern
-///
-/// # Usage
-/// ```rust
-/// #[evento::my_macro]
-/// pub struct Command {
-///     pub id: String,
-/// }
-/// ```
-#[proc_macro_attribute]
-pub fn debug_command(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(item as DeriveInput);
-
-    match command::command_impl(input, true) {
-        Ok(tokens) => tokens,
-        Err(err) => err.to_compile_error().into(),
     }
 }
 

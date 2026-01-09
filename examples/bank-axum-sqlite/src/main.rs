@@ -129,20 +129,19 @@ async fn create_account(
     State(state): State<AppState>,
     Form(form): Form<CreateAccountForm>,
 ) -> impl IntoResponse {
+    let cmd = Command(state.executor.as_ref().clone());
     let owner_id = Ulid::new().to_string();
 
-    let id = Command::open_account(
-        OpenAccount {
+    let id = cmd
+        .open_account(OpenAccount {
             owner_id,
             owner_name: form.owner_name,
             account_type: AccountType::Checking,
             currency: form.currency,
             initial_balance: form.initial_balance,
-        },
-        state.executor.as_ref(),
-    )
-    .await
-    .unwrap();
+        })
+        .await
+        .unwrap();
 
     Redirect::to(&format!("/accounts/{id}"))
 }
@@ -180,19 +179,17 @@ async fn deposit(
     axum::extract::Path(id): axum::extract::Path<String>,
     Form(form): Form<DepositForm>,
 ) -> impl IntoResponse {
-    if let Some(account) = bank::load(state.executor.as_ref(), &id)
-        .await
-        .ok()
-        .flatten()
-    {
-        let _ = account
-            .deposit_money(DepositMoney {
+    let cmd = Command(state.executor.as_ref().clone());
+    let _ = cmd
+        .deposit_money(
+            &id,
+            DepositMoney {
                 amount: form.amount,
                 transaction_id: Ulid::new().to_string(),
                 description: "Web deposit".to_string(),
-            })
-            .await;
-    }
+            },
+        )
+        .await;
 
     Redirect::to(&format!("/accounts/{}", id))
 }
@@ -207,19 +204,17 @@ async fn withdraw(
     axum::extract::Path(id): axum::extract::Path<String>,
     Form(form): Form<WithdrawForm>,
 ) -> impl IntoResponse {
-    if let Some(account) = bank::load(state.executor.as_ref(), &id)
-        .await
-        .ok()
-        .flatten()
-    {
-        let _ = account
-            .withdraw_money(WithdrawMoney {
+    let cmd = Command(state.executor.as_ref().clone());
+    let _ = cmd
+        .withdraw_money(
+            &id,
+            WithdrawMoney {
                 amount: form.amount,
                 transaction_id: Ulid::new().to_string(),
                 description: "Web withdrawal".to_string(),
-            })
-            .await;
-    }
+            },
+        )
+        .await;
 
     Redirect::to(&format!("/accounts/{}", id))
 }
@@ -235,20 +230,18 @@ async fn transfer(
     axum::extract::Path(id): axum::extract::Path<String>,
     Form(form): Form<TransferForm>,
 ) -> impl IntoResponse {
-    if let Some(account) = bank::load(state.executor.as_ref(), &id)
-        .await
-        .ok()
-        .flatten()
-    {
-        let _ = account
-            .transfer_money(TransferMoney {
+    let cmd = Command(state.executor.as_ref().clone());
+    let _ = cmd
+        .transfer_money(
+            &id,
+            TransferMoney {
                 amount: form.amount,
                 to_account_id: form.to_account_id,
                 transaction_id: Ulid::new().to_string(),
                 description: "Web transfer".to_string(),
-            })
-            .await;
-    }
+            },
+        )
+        .await;
 
     Redirect::to(&format!("/accounts/{}", id))
 }
