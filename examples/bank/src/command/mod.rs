@@ -22,9 +22,7 @@ pub use transfer_money::*;
 pub use unfreeze_account::*;
 pub use withdraw_money::*;
 
-use evento::{
-    Executor, Projection, Snapshot, cursor, metadata::Event, projection::ProjectionCursor,
-};
+use evento::{Executor, Projection, Snapshot, metadata::Event, projection::ProjectionAggregator};
 
 use crate::aggregator::{
     AccountClosed, AccountFrozen, AccountOpened, AccountUnfrozen, MoneyDeposited, MoneyReceived,
@@ -54,13 +52,12 @@ impl<E: Executor> Command<E> {
     }
 }
 
-#[derive(Default, Clone)]
+#[evento::projection]
 pub struct BankAccount {
     pub id: String,
     pub balance: i64,
     pub status: AccountStatus,
     pub overdraft_limit: i64,
-    pub cursor: cursor::Value,
 }
 
 impl BankAccount {
@@ -109,15 +106,7 @@ fn create_projection(id: impl Into<String>) -> Projection<BankAccount> {
         .safety_check()
 }
 
-impl ProjectionCursor for BankAccount {
-    fn get_cursor(&self) -> cursor::Value {
-        self.cursor.clone()
-    }
-
-    fn set_cursor(&mut self, v: &cursor::Value) {
-        self.cursor = v.clone();
-    }
-
+impl ProjectionAggregator for BankAccount {
     fn aggregator_id(&self) -> String {
         self.id.to_owned()
     }

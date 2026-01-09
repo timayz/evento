@@ -109,6 +109,7 @@
 mod aggregator;
 mod cursor;
 mod handler;
+mod projection;
 mod snapshot;
 mod sub_handler;
 
@@ -373,6 +374,46 @@ pub fn debug_snapshot(_attr: TokenStream, item: TokenStream) -> TokenStream {
 pub fn derive_cursor(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     match cursor::cursor_impl(&input) {
+        Ok(tokens) => tokens,
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+/// Attribute macro that adds a `cursor: String` field and implements `ProjectionCursor`.
+///
+/// # Example
+///
+/// ```ignore
+/// #[projection_cursor]
+/// #[derive(Debug, Default)]
+/// pub struct MyStruct {
+///     pub id: String,
+///     pub name: String,
+/// }
+/// ```
+///
+/// This generates:
+/// ```ignore
+/// #[derive(Debug, Default)]
+/// pub struct MyStruct {
+///     pub id: String,
+///     pub name: String,
+///     pub cursor: String,
+/// }
+///
+/// impl evento::ProjectionCursor for MyStruct {
+///     fn set_cursor(&mut self, v: &evento::cursor::Value) {
+///         self.cursor = v.to_string();
+///     }
+///     fn get_cursor(&self) -> evento::cursor::Value {
+///         self.cursor.to_owned().into()
+///     }
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn projection(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(item as DeriveInput);
+    match projection::projection_cursor_impl(attr, &input) {
         Ok(tokens) => tokens,
         Err(e) => e.to_compile_error().into(),
     }

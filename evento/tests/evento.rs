@@ -5,7 +5,8 @@ use bank::{
     WithdrawMoney, ACCOUNT_DETAILS_ROWS, COMMAND_ROWS,
 };
 use evento::{
-    cursor::Args, metadata::Metadata, Aggregator, Event, Executor, ProjectionCursor, ReadAggregator,
+    cursor::Args, metadata::Metadata, Aggregator, Event, Executor, ProjectionAggregator,
+    ReadAggregator,
 };
 use ulid::Ulid;
 

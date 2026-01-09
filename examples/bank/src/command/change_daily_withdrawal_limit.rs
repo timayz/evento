@@ -1,4 +1,4 @@
-use evento::{Executor, metadata::Metadata, projection::ProjectionCursor};
+use evento::{Executor, metadata::Metadata, projection::ProjectionAggregator};
 
 use crate::{
     aggregator::DailyWithdrawalLimitChanged, error::BankAccountError, value_object::AccountStatus,
