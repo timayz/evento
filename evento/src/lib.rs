@@ -9,9 +9,8 @@
 //! - **CQRS Pattern** - Separate read and write models for scalable architectures
 //! - **SQL Database Support** - Built-in support for SQLite, PostgreSQL, and MySQL
 //! - **Embedded Storage** - Fjall key-value store for embedded applications
-//! - **Event Handlers** - Async event processing with automatic retries
-//! - **Event Subscriptions** - Continuous event stream processing with cursor tracking
 //! - **Projections** - Build read models by replaying events
+//! - **Subscriptions** - Continuous event stream processing with cursor tracking
 //! - **Database Migrations** - Automated schema management
 //! - **Compact Serialization** - Fast binary serialization with bitcode
 //!
@@ -78,65 +77,70 @@
 //!     .await?;
 //! ```
 //!
-//! ## Build Projections and Handle Events
+//! ## Build Projections
+//!
+//! Projections are used to load aggregate state by replaying events:
 //!
 //! ```rust,ignore
-//! use evento::{Executor, metadata::Event, projection::{Action, Projection}};
+//! use evento::{Executor, metadata::Event, projection::Projection};
 //!
-//! #[derive(Default)]
+//! // Define projection state with cursor tracking
+//! #[evento::projection]
+//! #[derive(Debug)]
 //! pub struct AccountView {
 //!     pub balance: i64,
 //!     pub owner: String,
 //! }
 //!
+//! // Projection handlers update state from events
 //! #[evento::handler]
-//! async fn on_account_opened<E: Executor>(
+//! async fn on_account_opened(
 //!     event: Event<AccountOpened>,
-//!     action: Action<'_, AccountView, E>,
+//!     view: &mut AccountView,
 //! ) -> anyhow::Result<()> {
-//!     match action {
-//!         Action::Apply(view) => {
-//!             view.owner = event.data.owner.clone();
-//!             view.balance = event.data.initial_balance;
-//!         }
-//!         Action::Handle(_context) => {
-//!             // Handle side effects here
-//!         }
-//!     };
+//!     view.owner = event.data.owner.clone();
+//!     view.balance = event.data.initial_balance;
 //!     Ok(())
 //! }
 //!
 //! #[evento::handler]
-//! async fn on_money_deposited<E: Executor>(
+//! async fn on_money_deposited(
 //!     event: Event<MoneyDeposited>,
-//!     action: Action<'_, AccountView, E>,
+//!     view: &mut AccountView,
 //! ) -> anyhow::Result<()> {
-//!     if let Action::Apply(view) = action {
-//!         view.balance += event.data.amount;
-//!     }
+//!     view.balance += event.data.amount;
 //!     Ok(())
 //! }
 //!
 //! // Load aggregate state via projection
-//! let projection = Projection::<AccountView, _>::new("accounts")
+//! let result = Projection::<AccountView, _>::new::<Account>(&account_id)
 //!     .handler(on_account_opened())
-//!     .handler(on_money_deposited());
-//!
-//! let result = projection
-//!     .load::<Account>(&account_id)
+//!     .handler(on_money_deposited())
 //!     .execute(&executor)
 //!     .await?;
 //! ```
 //!
 //! ## Run Continuous Subscriptions
 //!
+//! Subscriptions process events in real-time with side effects:
+//!
 //! ```rust,ignore
 //! use std::time::Duration;
+//! use evento::{Executor, metadata::Event, subscription::{Context, SubscriptionBuilder}};
 //!
-//! let subscription = Projection::<AccountView, _>::new("account-processor")
-//!     .handler(on_account_opened())
-//!     .handler(on_money_deposited())
-//!     .subscription()
+//! // Subscription handlers receive context and can perform side effects
+//! #[evento::sub_handler]
+//! async fn notify_on_deposit<E: Executor>(
+//!     context: &Context<'_, E>,
+//!     event: Event<MoneyDeposited>,
+//! ) -> anyhow::Result<()> {
+//!     println!("Deposit of {} received", event.data.amount);
+//!     // Send notifications, update read models, etc.
+//!     Ok(())
+//! }
+//!
+//! let subscription = SubscriptionBuilder::<evento::Sqlite>::new("deposit-notifier")
+//!     .handler(notify_on_deposit())
 //!     .routing_key("accounts")
 //!     .chunk_size(100)
 //!     .retry(5)
@@ -146,6 +150,23 @@
 //!
 //! // On shutdown
 //! subscription.shutdown().await?;
+//! ```
+//!
+//! ## Handle All Events from an Aggregate
+//!
+//! Use `sub_all_handler` to process all events without deserializing:
+//!
+//! ```rust,ignore
+//! use evento::{Executor, SkipEventData, subscription::Context};
+//!
+//! #[evento::sub_all_handler]
+//! async fn audit_all_events<E: Executor>(
+//!     context: &Context<'_, E>,
+//!     event: SkipEventData<Account>,
+//! ) -> anyhow::Result<()> {
+//!     println!("Event {} on account {}", event.name, event.aggregator_id);
+//!     Ok(())
+//! }
 //! ```
 //!
 //! # Re-exports

@@ -48,7 +48,55 @@
 //!
 //! ## Projections
 //!
-//! Build read models by subscribing to events. See the [`projection`] module.
+//! Build read models by replaying events. Use the [`projection`] module for loading
+//! aggregate state:
+//!
+//! ```rust,ignore
+//! use evento::projection::Projection;
+//!
+//! #[evento::projection]
+//! #[derive(Debug)]
+//! pub struct AccountView {
+//!     pub balance: i64,
+//! }
+//!
+//! #[evento::handler]
+//! async fn on_deposited(
+//!     event: Event<MoneyDeposited>,
+//!     projection: &mut AccountView,
+//! ) -> anyhow::Result<()> {
+//!     projection.balance += event.data.amount;
+//!     Ok(())
+//! }
+//!
+//! let result = Projection::<AccountView, _>::new::<BankAccount>("account-123")
+//!     .handler(on_deposited())
+//!     .execute(&executor)
+//!     .await?;
+//! ```
+//!
+//! ## Subscriptions
+//!
+//! Process events continuously in real-time. See the [`subscription`] module:
+//!
+//! ```rust,ignore
+//! use evento::subscription::SubscriptionBuilder;
+//!
+//! #[evento::sub_handler]
+//! async fn on_deposited<E: Executor>(
+//!     context: &Context<'_, E>,
+//!     event: Event<MoneyDeposited>,
+//! ) -> anyhow::Result<()> {
+//!     // Perform side effects
+//!     Ok(())
+//! }
+//!
+//! let subscription = SubscriptionBuilder::<Sqlite>::new("deposit-processor")
+//!     .handler(on_deposited())
+//!     .routing_key("accounts")
+//!     .start(&executor)
+//!     .await?;
+//! ```
 //!
 //! ## Cursor-based Pagination
 //!
@@ -59,7 +107,8 @@
 //! - [`context`] - Type-safe request context for storing arbitrary data
 //! - [`cursor`] - Cursor-based pagination types and traits
 //! - [`metadata`] - Standard event metadata types
-//! - [`projection`] - Projections, subscriptions, and event handlers
+//! - [`projection`] - Projections for loading aggregate state
+//! - [`subscription`] - Continuous event processing with subscriptions
 //!
 //! # Example
 //!

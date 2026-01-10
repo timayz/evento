@@ -77,58 +77,67 @@ evento::aggregator(&account_id)
 
 ### Building Projections
 
-```rust
-use evento::{Executor, metadata::Event, projection::{Action, Projection}};
+Projections are used to load aggregate state by replaying events:
 
-#[derive(Default)]
+```rust
+use evento::{Executor, metadata::Event, projection::Projection};
+
+// Define projection state with cursor tracking
+#[evento::projection]
+#[derive(Debug)]
 pub struct AccountView {
     pub balance: i64,
     pub owner: String,
 }
 
+// Projection handlers update state from events
 #[evento::handler]
-async fn on_account_opened<E: Executor>(
+async fn on_account_opened(
     event: Event<AccountOpened>,
-    action: Action<'_, AccountView, E>,
+    view: &mut AccountView,
 ) -> anyhow::Result<()> {
-    if let Action::Apply(view) = action {
-        view.owner = event.data.owner.clone();
-        view.balance = event.data.initial_balance;
-    }
+    view.owner = event.data.owner.clone();
+    view.balance = event.data.initial_balance;
     Ok(())
 }
 
 #[evento::handler]
-async fn on_money_deposited<E: Executor>(
+async fn on_money_deposited(
     event: Event<MoneyDeposited>,
-    action: Action<'_, AccountView, E>,
+    view: &mut AccountView,
 ) -> anyhow::Result<()> {
-    if let Action::Apply(view) = action {
-        view.balance += event.data.amount;
-    }
+    view.balance += event.data.amount;
     Ok(())
 }
 
 // Load aggregate state
-let projection = Projection::<AccountView, _>::new("accounts")
+let result = Projection::<AccountView, _>::new::<Account>("account-123")
     .handler(on_account_opened())
-    .handler(on_money_deposited());
-
-let result = projection
-    .load::<Account>("account-123")
+    .handler(on_money_deposited())
     .execute(&executor)
     .await?;
 ```
 
 ### Running Subscriptions
 
+Subscriptions process events in real-time with side effects:
+
 ```rust
 use std::time::Duration;
+use evento::{Executor, metadata::Event, subscription::{Context, SubscriptionBuilder}};
 
-let subscription = Projection::<AccountView, _>::new("account-processor")
+// Subscription handlers receive context and can perform side effects
+#[evento::sub_handler]
+async fn on_account_opened<E: Executor>(
+    context: &Context<'_, E>,
+    event: Event<AccountOpened>,
+) -> anyhow::Result<()> {
+    println!("Account opened for {}", event.data.owner);
+    Ok(())
+}
+
+let subscription = SubscriptionBuilder::<Sqlite>::new("account-processor")
     .handler(on_account_opened())
-    .handler(on_money_deposited())
-    .subscription()
     .routing_key("accounts")
     .chunk_size(100)
     .retry(5)
