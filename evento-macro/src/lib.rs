@@ -111,6 +111,7 @@ mod cursor;
 mod handler;
 mod projection;
 mod snapshot;
+mod sub_all_handler;
 mod sub_handler;
 
 use proc_macro::TokenStream;
@@ -268,6 +269,16 @@ pub fn sub_handler(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemFn);
 
     match sub_handler::handler_next_impl(&input, false) {
+        Ok(tokens) => tokens,
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+#[proc_macro_attribute]
+pub fn sub_all_handler(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(item as ItemFn);
+
+    match sub_all_handler::handler_next_impl(&input, false) {
         Ok(tokens) => tokens,
         Err(e) => e.to_compile_error().into(),
     }
