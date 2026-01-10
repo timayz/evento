@@ -198,6 +198,15 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
         self
     }
 
+    /// Registers an event handler with this projection.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a handler for the same event type is already registered.
+    pub fn all_handler<H: Handler<E> + 'static>(self, h: H) -> Self {
+        self.handler(AllHandler(h, PhantomData))
+    }
+
     /// Registers a skip handler with this projection.
     ///
     /// # Panics
@@ -387,8 +396,9 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                 tracing::Span::current().record("aggregator_id", &event.node.aggregator_id);
                 tracing::Span::current().record("event", &event.node.name);
 
+                let all_key = format!("{}_all", event.node.aggregator_type);
                 let key = format!("{}_{}", event.node.aggregator_type, event.node.name);
-                let Some(handler) = self.handlers.get(&key) else {
+                let Some(handler) = self.handlers.get(&all_key).or(self.handlers.get(&key)) else {
                     if !self.safety_disabled {
                         anyhow::bail!("no handler s={} k={key}", self.key());
                     }
@@ -622,5 +632,25 @@ impl<E: Executor, EV: AggregatorEvent + Send + Sync> Handler<E> for SkipHandler<
 
     fn event_name(&self) -> &'static str {
         EV::event_name()
+    }
+}
+
+struct AllHandler<E: Executor, H: Handler<E>>(H, PhantomData<E>);
+
+impl<E: Executor, H: Handler<E>> Handler<E> for AllHandler<E, H> {
+    fn handle<'a>(
+        &'a self,
+        context: &'a Context<'a, E>,
+        event: &'a crate::Event,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>> {
+        self.0.handle(context, event)
+    }
+
+    fn aggregator_type(&self) -> &'static str {
+        self.0.aggregator_type()
+    }
+
+    fn event_name(&self) -> &'static str {
+        "all"
     }
 }
