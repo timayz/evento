@@ -96,7 +96,7 @@ pub use aggregator::*;
 pub use executor::*;
 pub use subscription::RoutingKey;
 
-use std::{fmt::Debug, ops::Deref};
+use std::{fmt::Debug, marker::PhantomData, ops::Deref};
 use ulid::Ulid;
 
 use crate::cursor::Cursor;
@@ -341,5 +341,15 @@ where
             metadata,
             event: value.clone(),
         })
+    }
+}
+
+pub struct SkipEventData<D>(pub Event, pub PhantomData<D>);
+
+impl<D> Deref for SkipEventData<D> {
+    type Target = Event;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
