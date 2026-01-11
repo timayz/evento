@@ -47,6 +47,9 @@ pub struct ReadAggregator {
 }
 
 impl ReadAggregator {
+    /// Creates a filter with all fields specified.
+    ///
+    /// Filters events by aggregator type, specific aggregate ID, and event name.
     pub fn new(
         aggregator_type: impl Into<String>,
         id: impl Into<String>,
@@ -59,6 +62,9 @@ impl ReadAggregator {
         }
     }
 
+    /// Creates a filter for all events of an aggregator type.
+    ///
+    /// Returns all events regardless of aggregate ID or event name.
     pub fn aggregator(value: impl Into<String>) -> Self {
         Self {
             aggregator_type: value.into(),
@@ -67,6 +73,9 @@ impl ReadAggregator {
         }
     }
 
+    /// Creates a filter for a specific aggregate instance.
+    ///
+    /// Returns all events for the given aggregator type and ID.
     pub fn id(aggregator_type: impl Into<String>, id: impl Into<String>) -> Self {
         Self {
             aggregator_type: aggregator_type.into(),
@@ -75,6 +84,9 @@ impl ReadAggregator {
         }
     }
 
+    /// Creates a filter for a specific event type.
+    ///
+    /// Returns all events of the given name for an aggregator type.
     pub fn event(aggregator_type: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
             aggregator_type: aggregator_type.into(),
@@ -132,6 +144,10 @@ pub trait Executor: Send + Sync + 'static {
         args: Args,
     ) -> anyhow::Result<ReadResult<Event>>;
 
+    /// Retrieves a stored snapshot for an aggregate.
+    ///
+    /// Returns the serialized snapshot data and cursor position, or `None`
+    /// if no snapshot exists for the given aggregate.
     async fn get_snapshot(
         &self,
         aggregator_type: String,
@@ -139,6 +155,10 @@ pub trait Executor: Send + Sync + 'static {
         id: String,
     ) -> anyhow::Result<Option<(Vec<u8>, Value)>>;
 
+    /// Stores a snapshot for an aggregate.
+    ///
+    /// Snapshots cache aggregate state to avoid replaying all events.
+    /// The `cursor` indicates the event position up to which the snapshot is valid.
     async fn save_snapshot(
         &self,
         aggregator_type: String,
@@ -228,6 +248,7 @@ impl Executor for Evento {
 }
 
 impl Evento {
+    /// Creates a new type-erased executor wrapper.
     pub fn new<E: Executor>(executor: E) -> Self {
         Self(Arc::new(Box::new(executor)))
     }
@@ -247,12 +268,20 @@ pub struct EventoGroup {
 
 #[cfg(feature = "group")]
 impl EventoGroup {
+    /// Adds an executor to the group.
+    ///
+    /// Returns `self` for method chaining.
     pub fn executor(mut self, executor: impl Into<Evento>) -> Self {
         self.executors.push(executor.into());
 
         self
     }
 
+    /// Returns a reference to the first executor in the group.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the group has no executors.
     pub fn first(&self) -> &Evento {
         self.executors
             .first()

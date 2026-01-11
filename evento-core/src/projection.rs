@@ -80,6 +80,9 @@ pub struct Context<'a, E: Executor> {
 }
 
 impl<'a, E: Executor> Context<'a, E> {
+    /// Retrieves a stored snapshot for the given ID.
+    ///
+    /// Returns `None` if no snapshot exists.
     pub async fn get_snapshot<D: bitcode::DecodeOwned + ProjectionCursor>(
         &self,
         id: impl Into<String>,
@@ -104,6 +107,9 @@ impl<'a, E: Executor> Context<'a, E> {
         Ok(Some(data))
     }
 
+    /// Stores a snapshot for the given ID.
+    ///
+    /// The snapshot cursor is extracted from the data to track the event position.
     pub async fn take_snapshot<D: bitcode::Encode + ProjectionCursor>(
         &self,
         id: impl Into<String>,
@@ -124,6 +130,11 @@ impl<'a, E: Executor> Context<'a, E> {
             .await
     }
 
+    /// Returns the aggregate ID for a registered aggregator type.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the aggregator type was not registered via [`Projection::aggregator`].
     pub async fn aggregator<A: Aggregator>(&self) -> String {
         tracing::debug!(
             "Failed to get `Aggregator id <{}>` For the Aggregator id extractor to work \
@@ -171,16 +182,33 @@ pub trait Handler<P: 'static>: Sync + Send {
     fn event_name(&self) -> &'static str;
 }
 
+/// Trait for types that track their cursor position in the event stream.
+///
+/// This trait is typically derived using the `#[evento::projection]` macro.
 pub trait ProjectionCursor {
+    /// Returns the current cursor position.
     fn get_cursor(&self) -> cursor::Value;
+    /// Sets the cursor position.
     fn set_cursor(&mut self, v: &cursor::Value);
 }
 
+/// Trait for projections that can create an [`AggregatorBuilder`].
+///
+/// Extends [`ProjectionCursor`] to provide aggregate identity and versioning,
+/// enabling projections to emit new events.
 pub trait ProjectionAggregator: ProjectionCursor {
+    /// Returns the aggregate ID for this projection.
+    ///
+    /// # Panics
+    ///
+    /// Default implementation panics; must be overridden.
     fn aggregator_id(&self) -> String {
         todo!("ProjectionCursor.aggregator_id must be implemented for ProjectionCursor.aggregator")
     }
 
+    /// Returns the current aggregate version from the cursor.
+    ///
+    /// Returns `0` if no cursor is set.
     fn aggregator_version(&self) -> anyhow::Result<u16> {
         let value = self.get_cursor();
         if value == Default::default() {
@@ -192,6 +220,9 @@ pub trait ProjectionAggregator: ProjectionCursor {
         Ok(cursor.v)
     }
 
+    /// Creates an [`AggregatorBuilder`] pre-configured with ID and version.
+    ///
+    /// Use this to emit new events from a projection.
     fn aggregator(&self) -> anyhow::Result<AggregatorBuilder> {
         Ok(AggregatorBuilder::new(self.aggregator_id())
             .original_version(self.aggregator_version()?)
@@ -229,6 +260,9 @@ pub trait Snapshot<E: Executor>: ProjectionCursor + Sized {
         Box::pin(async { Ok(None) })
     }
 
+    /// Stores the current state as a snapshot.
+    ///
+    /// Default implementation does nothing.
     fn take_snapshot(
         &self,
         _context: &Context<'_, E>,
@@ -249,18 +283,18 @@ impl<T: bitcode::Encode + bitcode::DecodeOwned + ProjectionCursor + Send + Sync,
     }
 }
 
-/// Builder for loading aggregate state from events.
+/// Projection for loading aggregate state from events.
 ///
-/// Created via [`Projection::load`], this builder configures how to
-/// load an aggregate's state by replaying events.
+/// Combines event handlers to rebuild aggregate state by replaying events.
+/// Supports snapshots for performance optimization.
 ///
 /// # Example
 ///
 /// ```rust,ignore
-/// let result = projection
-///     .load::<Account>("account-123")
-///     .data(app_config)  // Add shared data
-///     .aggregator::<User>("user-456")  // Add related aggregate
+/// let result = Projection::<_, AccountView>::new::<Account>("account-123")
+///     .handler(account_opened)
+///     .handler(money_deposited)
+///     .data(app_config)
 ///     .execute(&executor)
 ///     .await?;
 /// ```
@@ -304,12 +338,18 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
         }
     }
 
+    /// Sets the snapshot revision.
+    ///
+    /// Changing the revision invalidates existing snapshots, forcing a full rebuild.
     pub fn revision(mut self, value: u16) -> Self {
         self.revision = value;
 
         self
     }
 
+    /// Enables safety checks for unhandled events.
+    ///
+    /// When enabled, execution fails if an event is encountered without a handler.
     pub fn safety_check(mut self) -> Self {
         self.safety_disabled = false;
 

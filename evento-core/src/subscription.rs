@@ -1,40 +1,34 @@
-//! Projections and event subscriptions.
+//! Continuous event subscriptions.
 //!
-//! This module provides the core building blocks for event sourcing:
-//! - Projections that build read models from events
-//! - Subscriptions that continuously process events
-//! - Loading aggregate state from event streams
+//! This module provides infrastructure for processing events continuously
+//! in the background with retry logic, routing key filtering, and graceful
+//! shutdown support.
 //!
 //! # Key Types
 //!
-//! - [`Projection`] - Defines handlers for building projections
-//! - [`LoadBuilder`] - Loads aggregate state from events
-//! - [`SubscriptionBuilder`] - Builds continuous event subscriptions
+//! - [`SubscriptionBuilder`] - Builds and configures event subscriptions
 //! - [`Subscription`] - Handle to a running subscription
-//! - [`EventData`] - Typed event with deserialized data and metadata
+//! - [`Handler`] - Trait for event handlers
+//! - [`Context`] - Handler context with executor access
+//! - [`RoutingKey`] - Filter for event routing
 //!
 //! # Example
 //!
 //! ```rust,ignore
-//! use evento::projection::Projection;
+//! use evento::subscription::SubscriptionBuilder;
 //!
-//! // Define a projection with event handlers
-//! let projection = Projection::<AccountView, _>::new("accounts")
-//!     .handler(account_opened)
-//!     .handler(money_deposited);
-//!
-//! // Load aggregate state
-//! let result = projection
-//!     .load::<Account>("account-123")
-//!     .execute(&executor)
-//!     .await?;
-//!
-//! // Or start a subscription
-//! let subscription = projection
-//!     .subscription()
+//! // Build a subscription with handlers
+//! let subscription = SubscriptionBuilder::new("my-subscription")
+//!     .handler(account_opened_handler)
+//!     .handler(money_deposited_handler)
 //!     .routing_key("accounts")
+//!     .chunk_size(100)
+//!     .retry(5)
 //!     .start(&executor)
 //!     .await?;
+//!
+//! // Later, gracefully shutdown
+//! subscription.shutdown().await?;
 //! ```
 
 use backon::{ExponentialBuilder, Retryable};
@@ -179,13 +173,16 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
         }
     }
 
+    /// Enables safety checks for unhandled events.
+    ///
+    /// When enabled, processing fails if an event is encountered without a handler.
     pub fn safety_check(mut self) -> Self {
         self.safety_disabled = false;
 
         self
     }
 
-    /// Registers an event handler with this projection.
+    /// Registers an event handler with this subscription.
     ///
     /// # Panics
     ///
@@ -198,7 +195,9 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
         self
     }
 
-    /// Registers a skip handler with this projection.
+    /// Registers a skip handler for an event type.
+    ///
+    /// Events of this type will be acknowledged but not processed.
     ///
     /// # Panics
     ///
@@ -207,7 +206,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
         self.handler(SkipHandler::<EV>(PhantomData))
     }
 
-    /// Adds shared data to the load context.
+    /// Adds shared data to the subscription context.
     ///
     /// Data added here is accessible in handlers via the context.
     pub fn data<D: Send + Sync + 'static>(self, v: D) -> Self {

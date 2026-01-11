@@ -132,6 +132,7 @@ pub struct AggregatorBuilder {
 }
 
 impl AggregatorBuilder {
+    /// Creates a new builder for the given aggregate ID.
     pub fn new(aggregator_id: impl Into<String>) -> AggregatorBuilder {
         AggregatorBuilder {
             aggregator_id: aggregator_id.into(),
@@ -144,16 +145,28 @@ impl AggregatorBuilder {
         }
     }
 
+    /// Sets the expected version for optimistic concurrency control.
+    ///
+    /// If the aggregate's current version doesn't match, the commit will fail
+    /// with [`WriteError::InvalidOriginalVersion`].
     pub fn original_version(&mut self, v: u16) -> &mut Self {
         self.original_version = v;
 
         self
     }
 
+    /// Sets the routing key for event distribution.
+    ///
+    /// The routing key is used for partitioning events across consumers.
+    /// Once set, subsequent calls are ignored (locked behavior).
     pub fn routing_key(&mut self, v: impl Into<String>) -> &mut Self {
         self.routing_key_opt(Some(v.into()))
     }
 
+    /// Sets an optional routing key for event distribution.
+    ///
+    /// Pass `None` to explicitly clear the routing key.
+    /// Once set, subsequent calls are ignored (locked behavior).
     pub fn routing_key_opt(&mut self, v: Option<String>) -> &mut Self {
         if !self.routing_key_locked {
             self.routing_key = v;
@@ -163,6 +176,9 @@ impl AggregatorBuilder {
         self
     }
 
+    /// Sets the metadata to attach to all events.
+    ///
+    /// Metadata is serialized using bitcode and stored alongside each event.
     pub fn metadata<M>(&mut self, v: &M) -> &mut Self
     where
         M: bitcode::Encode,
@@ -171,6 +187,10 @@ impl AggregatorBuilder {
         self
     }
 
+    /// Adds an event to be committed.
+    ///
+    /// Multiple events can be added and will be committed atomically.
+    /// The event data is serialized using bitcode.
     pub fn event<D>(&mut self, v: &D) -> &mut Self
     where
         D: AggregatorEvent + bitcode::Encode,
@@ -180,6 +200,15 @@ impl AggregatorBuilder {
         self
     }
 
+    /// Commits all added events to the executor.
+    ///
+    /// Returns the aggregate ID on success.
+    ///
+    /// # Errors
+    ///
+    /// - [`WriteError::MissingData`] - No events were added
+    /// - [`WriteError::InvalidOriginalVersion`] - Version conflict occurred
+    /// - [`WriteError::Unknown`] - Executor error
     pub async fn commit<E: Executor>(&self, executor: &E) -> Result<String, WriteError> {
         let first_event = executor
             .read(

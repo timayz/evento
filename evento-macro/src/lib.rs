@@ -12,11 +12,9 @@
 //! | [`handler`] | Attribute | Create projection handler from async function |
 //! | [`sub_handler`] | Attribute | Create subscription handler for specific events |
 //! | [`sub_all_handler`] | Attribute | Create subscription handler for all events of an aggregate |
-//! | [`snapshot`] | Attribute | Implement snapshot restoration for projections |
 //! | [`projection`] | Attribute | Add cursor field and implement `ProjectionCursor` |
 //! | [`Cursor`] | Derive | Generate cursor struct and trait implementations |
 //! | [`debug_handler`] | Attribute | Like `handler` but outputs generated code for debugging |
-//! | [`debug_snapshot`] | Attribute | Like `snapshot` but outputs generated code for debugging |
 //!
 //! # Usage
 //!
@@ -142,20 +140,6 @@
 //! // - Adds `Default` and `Clone` derives
 //! ```
 //!
-//! ## Snapshot Restoration with `#[evento::snapshot]`
-//!
-//! ```rust,ignore
-//! #[evento::snapshot]
-//! async fn restore(
-//!     context: &evento::context::RwContext,
-//!     id: String,
-//!     aggregators: &std::collections::HashMap<String, String>,
-//! ) -> anyhow::Result<Option<AccountBalanceView>> {
-//!     // Load snapshot from database or return None
-//!     Ok(None)
-//! }
-//! ```
-//!
 //! # Requirements
 //!
 //! When using these macros, your types must meet certain requirements:
@@ -175,7 +159,6 @@ mod aggregator;
 mod cursor;
 mod handler;
 mod projection;
-mod snapshot;
 mod sub_all_handler;
 mod sub_handler;
 
@@ -187,7 +170,8 @@ use syn::{parse_macro_input, DeriveInput, ItemFn};
 /// This macro takes an enum where each variant represents an event type and generates:
 /// - Individual public structs for each variant
 /// - `Aggregator` trait implementation (provides `aggregator_type()`)
-/// - `Event` trait implementation (provides `event_name()`)
+/// - `AggregatorEvent` trait implementation (provides `event_name()`)
+/// - A unit struct with the enum name implementing `Aggregator`
 /// - Automatic derives: `Debug`, `Clone`, `PartialEq`, `Default`, and bitcode serialization
 ///
 /// # Aggregator Type Format
@@ -389,7 +373,7 @@ pub fn sub_handler(_attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// This macro is similar to [`sub_handler`] but handles all events from an aggregate
 /// without requiring the event data to be deserialized. The event is wrapped in
-/// [`SkipEventData`] which provides access to event metadata (name, id, timestamp, etc.)
+/// `SkipEventData` which provides access to event metadata (name, id, timestamp, etc.)
 /// without deserializing the payload.
 ///
 /// # Function Signature
@@ -445,85 +429,6 @@ pub fn sub_all_handler(_attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
-/// Implements the `Snapshot` trait for projection state restoration.
-///
-/// This macro takes an async function that restores a projection from a snapshot
-/// and generates the `Snapshot` trait implementation.
-///
-/// # Function Signature
-///
-/// The function must have this signature:
-///
-/// ```rust,ignore
-/// async fn restore(
-///     context: &evento::context::RwContext,
-///     id: String,
-/// ) -> anyhow::Result<Option<ProjectionType>>
-/// ```
-///
-/// # Return Value
-///
-/// - `Ok(Some( ... ))` - Snapshot found, restore from this state
-/// - `Ok(None)` - No snapshot, rebuild from events
-/// - `Err(...)` - Error during restoration
-///
-/// # Example
-///
-/// ```rust,ignore
-/// #[evento::snapshot]
-/// async fn restore(
-///     context: &evento::context::RwContext,
-///     id: String,
-/// ) -> anyhow::Result<Option<AccountBalanceView>> {
-///     // Query snapshot from database
-///     let snapshot = context.read()
-///         .query_snapshot::<AccountBalanceView>(&id)
-///         .await?;
-///
-///     Ok(snapshot)
-/// }
-/// ```
-///
-/// # Generated Code
-///
-/// The macro generates a `Snapshot` trait implementation for the projection type
-/// extracted from the return type's `T`.
-#[proc_macro_attribute]
-pub fn snapshot(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(item as ItemFn);
-
-    match snapshot::snapshot_impl(&input, false) {
-        Ok(tokens) => tokens,
-        Err(e) => e.to_compile_error().into(),
-    }
-}
-
-/// Debug variant of [`snapshot`] that writes generated code to a file.
-///
-/// The generated code is written to `target/evento_debug_snapshot_macro.rs`
-/// for inspection. Useful for understanding what the macro produces.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// #[evento::debug_snapshot]
-/// async fn restore(
-///     context: &evento::context::RwContext,
-///     id: String,
-/// ) -> anyhow::Result<OptionMyView>> {
-///     Ok(None)
-/// }
-/// ```
-#[proc_macro_attribute]
-pub fn debug_snapshot(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(item as ItemFn);
-
-    match snapshot::snapshot_impl(&input, true) {
-        Ok(tokens) => tokens,
-        Err(e) => e.to_compile_error().into(),
-    }
-}
-
 /// Derive macro for generating cursor structs and trait implementations.
 ///
 /// # Example
@@ -551,36 +456,45 @@ pub fn derive_cursor(input: TokenStream) -> TokenStream {
     }
 }
 
-/// Attribute macro that adds a `cursor: String` field and implements `ProjectionCursor`.
+/// Adds a `cursor: String` field and implements `ProjectionCursor`.
+///
+/// This attribute macro transforms a struct to track its position in the event stream.
+/// It automatically adds a `cursor` field and implements the `ProjectionCursor` trait.
+///
+/// # Generated Code
+///
+/// - Adds `pub cursor: String` field
+/// - Adds `Default` and `Clone` derives (preserves existing derives)
+/// - Implements `ProjectionCursor` trait
+///
+/// # Additional Derives
+///
+/// Pass additional derives as arguments:
+///
+/// ```ignore
+/// #[evento::projection(serde::Serialize)]
+/// pub struct MyView { ... }
+/// ```
 ///
 /// # Example
 ///
 /// ```ignore
-/// #[projection_cursor]
-/// #[derive(Debug, Default)]
+/// #[evento::projection]
+/// #[derive(Debug)]
 /// pub struct MyStruct {
 ///     pub id: String,
 ///     pub name: String,
 /// }
-/// ```
 ///
-/// This generates:
-/// ```ignore
-/// #[derive(Debug, Default)]
-/// pub struct MyStruct {
-///     pub id: String,
-///     pub name: String,
-///     pub cursor: String,
-/// }
-///
-/// impl evento::ProjectionCursor for MyStruct {
-///     fn set_cursor(&mut self, v: &evento::cursor::Value) {
-///         self.cursor = v.to_string();
-///     }
-///     fn get_cursor(&self) -> evento::cursor::Value {
-///         self.cursor.to_owned().into()
-///     }
-/// }
+/// // Generates:
+/// // #[derive(Default, Clone, Debug)]
+/// // pub struct MyStruct {
+/// //     pub id: String,
+/// //     pub name: String,
+/// //     pub cursor: String,
+/// // }
+/// //
+/// // impl evento::ProjectionCursor for MyStruct { ... }
 /// ```
 #[proc_macro_attribute]
 pub fn projection(attr: TokenStream, item: TokenStream) -> TokenStream {

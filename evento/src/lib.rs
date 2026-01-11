@@ -177,7 +177,14 @@
 // Re-export everything from evento-core
 pub use evento_core::*;
 
-// Re-export projection types at root level for convenience
+/// Projection types re-exported at root level for convenience.
+///
+/// These are the most commonly used types for building read models:
+/// - [`Handler`] - Trait for projection event handlers
+/// - [`Projection`] - Builder for loading aggregate state
+/// - [`ProjectionAggregator`] - Trait for projections that emit events
+/// - [`ProjectionCursor`] - Trait for cursor position tracking
+/// - [`Snapshot`] - Trait for snapshot restoration
 pub use evento_core::projection::{
     Handler, Projection, ProjectionAggregator, ProjectionCursor, Snapshot,
 };
