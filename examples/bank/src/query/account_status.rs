@@ -1,11 +1,11 @@
-use evento::{cursor, metadata::Event, projection::Projection};
+use evento::{Executor, cursor, metadata::Event, projection::Projection};
 
 use crate::{
     aggregator::{AccountClosed, AccountFrozen, AccountOpened, AccountUnfrozen, BankAccount},
     value_object::AccountStatus,
 };
 
-pub fn create_projection(id: impl Into<String>) -> Projection<AccountStatusView> {
+pub fn create_projection<E: Executor>(id: impl Into<String>) -> Projection<E, AccountStatusView> {
     Projection::new::<BankAccount>(id)
         .handler(handle_account_opened())
         .handler(handle_account_closed())
@@ -31,7 +31,7 @@ impl evento::ProjectionCursor for AccountStatusView {
         self.cursor = v.to_owned();
     }
 }
-impl evento::Snapshot for AccountStatusView {}
+impl<E: Executor> evento::Snapshot<E> for AccountStatusView {}
 
 #[evento::handler]
 async fn handle_account_opened(

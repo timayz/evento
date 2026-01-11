@@ -4,7 +4,6 @@
 //! name column for longer event type names.
 
 mod event;
-mod snapshot;
 
 use sqlx_migrator::vec_box;
 
@@ -38,10 +37,7 @@ sqlx_migrator::sqlite_migration!(
     "main",
     "m0003",
     vec_box![crate::M0002],
-    vec_box![
-        snapshot::drop_table::Operation,
-        event::alter_name_column::Operation,
-    ]
+    vec_box![event::alter_name_column::Operation,]
 );
 
 #[cfg(feature = "mysql")]
@@ -50,10 +46,7 @@ sqlx_migrator::mysql_migration!(
     "main",
     "m0003",
     vec_box![crate::M0002],
-    vec_box![
-        snapshot::drop_table::Operation,
-        event::alter_name_column::Operation,
-    ]
+    vec_box![event::alter_name_column::Operation,]
 );
 
 #[cfg(feature = "postgres")]
@@ -62,8 +55,5 @@ sqlx_migrator::postgres_migration!(
     "main",
     "m0003",
     vec_box![crate::M0002],
-    vec_box![
-        snapshot::drop_table::Operation,
-        event::alter_name_column::Operation,
-    ]
+    vec_box![event::alter_name_column::Operation,]
 );

@@ -587,6 +587,26 @@ impl Executor for Fjall {
         })
         .await?
     }
+
+    async fn get_snapshot(
+        &self,
+        _aggregator_type: String,
+        _aggregator_revision: String,
+        _id: String,
+    ) -> anyhow::Result<Option<(Vec<u8>, Value)>> {
+        todo!()
+    }
+
+    async fn save_snapshot(
+        &self,
+        _aggregator_type: String,
+        _aggregator_revision: String,
+        _id: String,
+        _data: Vec<u8>,
+        _cursor: Value,
+    ) -> anyhow::Result<()> {
+        todo!()
+    }
 }
 
 impl From<Keyspace> for Fjall {

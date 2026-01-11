@@ -1,11 +1,15 @@
-use evento::{cursor, metadata::Event, projection::Projection};
+use evento::{
+    Executor,
+    metadata::Event,
+    projection::{Context, Projection},
+};
 
 use crate::aggregator::{
     AccountOpened, BankAccount, MoneyDeposited, MoneyReceived, MoneyTransferred, MoneyWithdrawn,
     OverdraftLimitChanged,
 };
 
-pub fn create_projection(id: impl Into<String>) -> Projection<AccountBalanceView> {
+pub fn create_projection<E: Executor>(id: impl Into<String>) -> Projection<E, AccountBalanceView> {
     Projection::new::<BankAccount>(id)
         .handler(handle_money_deposit())
         .handler(handle_account_opened())
@@ -15,25 +19,24 @@ pub fn create_projection(id: impl Into<String>) -> Projection<AccountBalanceView
         .handler(handle_overdraf_limit_changed())
 }
 
-#[derive(Default)]
+#[evento::projection(bitcode::Encode, bitcode::Decode)]
 pub struct AccountBalanceView {
     pub balance: i64,
     pub currency: String,
     pub available_balance: i64,
-    pub cursor: cursor::Value,
 }
 
-impl evento::ProjectionCursor for AccountBalanceView {
-    fn get_cursor(&self) -> cursor::Value {
-        self.cursor.to_owned()
+impl<E: Executor> evento::Snapshot<E> for AccountBalanceView {
+    async fn restore(context: &Context<'_, E>) -> anyhow::Result<Option<Self>> {
+        context.get_snapshot::<BankAccount, _>(&context.id, 0).await
     }
 
-    fn set_cursor(&mut self, v: &cursor::Value) {
-        self.cursor = v.to_owned();
+    async fn take_snapshot(&self, context: &Context<'_, E>) -> anyhow::Result<()> {
+        context
+            .take_snapshot::<BankAccount, _>(&context.id, 0, self)
+            .await
     }
 }
-
-impl evento::Snapshot for AccountBalanceView {}
 
 #[evento::handler]
 async fn handle_account_opened(
