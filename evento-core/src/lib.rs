@@ -48,7 +48,55 @@
 //!
 //! ## Projections
 //!
-//! Build read models by subscribing to events. See the [`projection`] module.
+//! Build read models by replaying events. Use the [`projection`] module for loading
+//! aggregate state:
+//!
+//! ```rust,ignore
+//! use evento::projection::Projection;
+//!
+//! #[evento::projection]
+//! #[derive(Debug)]
+//! pub struct AccountView {
+//!     pub balance: i64,
+//! }
+//!
+//! #[evento::handler]
+//! async fn on_deposited(
+//!     event: Event<MoneyDeposited>,
+//!     projection: &mut AccountView,
+//! ) -> anyhow::Result<()> {
+//!     projection.balance += event.data.amount;
+//!     Ok(())
+//! }
+//!
+//! let result = Projection::<AccountView, _>::new::<BankAccount>("account-123")
+//!     .handler(on_deposited())
+//!     .execute(&executor)
+//!     .await?;
+//! ```
+//!
+//! ## Subscriptions
+//!
+//! Process events continuously in real-time. See the [`subscription`] module:
+//!
+//! ```rust,ignore
+//! use evento::subscription::SubscriptionBuilder;
+//!
+//! #[evento::sub_handler]
+//! async fn on_deposited<E: Executor>(
+//!     context: &Context<'_, E>,
+//!     event: Event<MoneyDeposited>,
+//! ) -> anyhow::Result<()> {
+//!     // Perform side effects
+//!     Ok(())
+//! }
+//!
+//! let subscription = SubscriptionBuilder::<Sqlite>::new("deposit-processor")
+//!     .handler(on_deposited())
+//!     .routing_key("accounts")
+//!     .start(&executor)
+//!     .await?;
+//! ```
 //!
 //! ## Cursor-based Pagination
 //!
@@ -59,7 +107,8 @@
 //! - [`context`] - Type-safe request context for storing arbitrary data
 //! - [`cursor`] - Cursor-based pagination types and traits
 //! - [`metadata`] - Standard event metadata types
-//! - [`projection`] - Projections, subscriptions, and event handlers
+//! - [`projection`] - Projections for loading aggregate state
+//! - [`subscription`] - Continuous event processing with subscriptions
 //!
 //! # Example
 //!
@@ -87,15 +136,16 @@ pub mod cursor;
 mod executor;
 pub mod metadata;
 pub mod projection;
+pub mod subscription;
 
 #[cfg(feature = "macro")]
 pub use evento_macro::*;
 
 pub use aggregator::*;
 pub use executor::*;
-pub use projection::RoutingKey;
+pub use subscription::RoutingKey;
 
-use std::fmt::Debug;
+use std::{fmt::Debug, marker::PhantomData, ops::Deref};
 use ulid::Ulid;
 
 use crate::cursor::Cursor;
@@ -270,5 +320,85 @@ where
             timestamp: timestamp as u64,
             timestamp_subsec: timestamp_subsec as u32,
         })
+    }
+}
+
+/// Typed event with deserialized data and metadata.
+///
+/// `EventData` wraps a raw [`Event`](crate::Event) and provides typed access
+/// to the deserialized event data and metadata. It implements `Deref` to
+/// provide access to the underlying event fields (id, timestamp, version, etc.).
+///
+/// # Type Parameters
+///
+/// - `D`: The event data type (e.g., `AccountOpened`)
+/// - `M`: The metadata type (defaults to `bool` for no metadata)
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use evento::metadata::Event;
+///
+/// #[evento::handler]
+/// async fn handle_deposit<E: Executor>(
+///     event: Event<MoneyDeposited>,
+///     action: Action<'_, AccountView, E>,
+/// ) -> anyhow::Result<()> {
+///     // Access typed data
+///     println!("Amount: {}", event.data.amount);
+///
+///     // Access metadata
+///     if let Ok(user) = event.metadata.user() {
+///         println!("By user: {}", user);
+///     }
+///
+///     // Access underlying event fields via Deref
+///     println!("Event ID: {}", event.id);
+///     println!("Version: {}", event.version);
+///
+///     Ok(())
+/// }
+/// ```
+pub struct EventData<D, M = bool> {
+    event: Event,
+    /// The typed event data
+    pub data: D,
+    /// The typed event metadata
+    pub metadata: M,
+}
+
+impl<D, M> Deref for EventData<D, M> {
+    type Target = Event;
+
+    fn deref(&self) -> &Self::Target {
+        &self.event
+    }
+}
+
+impl<D, M> TryFrom<&Event> for EventData<D, M>
+where
+    D: bitcode::DecodeOwned,
+    M: bitcode::DecodeOwned,
+{
+    type Error = bitcode::Error;
+
+    fn try_from(value: &Event) -> Result<Self, Self::Error> {
+        let data = bitcode::decode::<D>(&value.data)?;
+        let metadata = bitcode::decode::<M>(&value.metadata)?;
+        Ok(EventData {
+            data,
+            metadata,
+            event: value.clone(),
+        })
+    }
+}
+
+pub struct SkipEventData<D>(pub Event, pub PhantomData<D>);
+
+impl<D> Deref for SkipEventData<D> {
+    type Target = Event;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }

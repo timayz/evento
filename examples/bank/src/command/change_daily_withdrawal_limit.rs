@@ -1,4 +1,4 @@
-use evento::{Executor, metadata::Metadata};
+use evento::{Executor, metadata::Metadata, projection::ProjectionAggregator};
 
 use crate::{
     aggregator::DailyWithdrawalLimitChanged, error::BankAccountError, value_object::AccountStatus,
@@ -10,25 +10,31 @@ pub struct ChangeDailyWithdrawalLimit {
     pub new_limit: i64,
 }
 
-impl<'a, E: Executor> super::Command<'a, E> {
+impl<E: Executor> super::Command<E> {
     /// Handle ChangeDailyWithdrawalLimit command
     pub async fn change_daily_withdrawal_limit(
         &self,
+        id: impl Into<String>,
         cmd: ChangeDailyWithdrawalLimit,
     ) -> Result<(), BankAccountError> {
-        if matches!(self.status, AccountStatus::Closed) {
+        let Some(account) = self.load(id).await.unwrap() else {
+            return Err(BankAccountError::Server("not found".to_owned()));
+        };
+        if matches!(account.status, AccountStatus::Closed) {
             return Err(BankAccountError::AccountClosed);
         }
         if cmd.new_limit < 0 {
             return Err(BankAccountError::InvalidLimit);
         }
 
-        self.aggregator()
+        account
+            .aggregator()
+            .unwrap()
             .event(&DailyWithdrawalLimitChanged {
                 new_limit: cmd.new_limit,
             })
             .metadata(&Metadata::default())
-            .commit(self.executor)
+            .commit(&self.0)
             .await?;
 
         Ok(())

@@ -27,8 +27,12 @@ evento-macro = "2"
 | Macro | Type | Purpose |
 |-------|------|---------|
 | `#[evento::aggregator]` | Attribute | Transform enum into event structs |
-| `#[evento::handler]` | Attribute | Create event handler from async function |
+| `#[evento::handler]` | Attribute | Create projection handler from async function |
+| `#[evento::sub_handler]` | Attribute | Create subscription handler for specific events |
+| `#[evento::sub_all_handler]` | Attribute | Create subscription handler for all events |
+| `#[evento::projection]` | Attribute | Add cursor field and implement `ProjectionCursor` |
 | `#[evento::snapshot]` | Attribute | Implement snapshot restoration |
+| `#[derive(Cursor)]` | Derive | Generate cursor struct and trait implementations |
 | `#[evento::debug_handler]` | Attribute | Like `handler` with debug output |
 | `#[evento::debug_snapshot]` | Attribute | Like `snapshot` with debug output |
 
@@ -51,25 +55,18 @@ pub enum BankAccount {
     MoneyDeposited {
         amount: i64,
         transaction_id: String,
-        description: String,
     },
 
     MoneyWithdrawn {
         amount: i64,
         transaction_id: String,
-        description: String,
-    },
-
-    AccountClosed {
-        reason: String,
-        final_balance: i64,
     },
 }
 ```
 
 This generates:
 
-- Individual structs: `AccountOpened`, `MoneyDeposited`, `MoneyWithdrawn`, `AccountClosed`
+- Individual structs: `AccountOpened`, `MoneyDeposited`, `MoneyWithdrawn`
 - `Aggregator` trait implementation (provides `aggregator_type()`)
 - `Event` trait implementation (provides `event_name()`)
 - Automatic derives: `Debug`, `Clone`, `PartialEq`, `Default`, and bitcode serialization
@@ -87,57 +84,109 @@ pub enum MyEvents {
 }
 ```
 
-### Creating Handlers with `#[evento::handler]`
+### Projection State with `#[evento::projection]`
 
-Create event handlers for projections:
+Automatically add cursor tracking to projection structs:
 
 ```rust
-use evento::{Event, Executor};
-use evento::projection::Action;
+#[evento::projection]
+#[derive(Debug)]
+pub struct AccountBalanceView {
+    pub balance: i64,
+    pub owner: String,
+}
+
+// Generates:
+// - Adds `pub cursor: String` field
+// - Implements `ProjectionCursor` trait
+// - Adds `Default` and `Clone` derives
+```
+
+### Creating Projection Handlers with `#[evento::handler]`
+
+Projection handlers are used to build read models by replaying events:
+
+```rust
+use evento::metadata::Event;
 
 #[evento::handler]
-async fn handle_money_deposited<E: Executor>(
+async fn handle_money_deposited(
     event: Event<MoneyDeposited>,
-    action: Action<'_, AccountBalanceView, E>,
+    projection: &mut AccountBalanceView,
 ) -> anyhow::Result<()> {
-    match action {
-        Action::Apply(row) => {
-            // Mutate projection state
-            row.balance += event.data.amount;
-        }
-        Action::Handle(_context) => {
-            // Handle side effects (notifications, external calls, etc.)
-        }
-    };
+    projection.balance += event.data.amount;
     Ok(())
 }
 
 // Register with a projection
-let projection = Projection::new("account-balance")
+let result = Projection::<AccountBalanceView, _>::new::<BankAccount>("account-123")
     .handler(handle_money_deposited())
-    .handler(handle_money_withdrawn())
-    .handler(handle_account_opened());
+    .execute(&executor)
+    .await?;
 ```
 
 The macro generates:
 
 - `HandleMoneyDepositedHandler` struct
 - `handle_money_deposited()` constructor function
-- `Handler<AccountBalanceView, E>` trait implementation
+- `projection::Handler<AccountBalanceView>` trait implementation
+
+### Creating Subscription Handlers with `#[evento::sub_handler]`
+
+Subscription handlers process events in real-time with side effects:
+
+```rust
+use evento::{Executor, metadata::Event, subscription::Context};
+
+#[evento::sub_handler]
+async fn on_money_deposited<E: Executor>(
+    context: &Context<'_, E>,
+    event: Event<MoneyDeposited>,
+) -> anyhow::Result<()> {
+    // Perform side effects: send notifications, update read models, etc.
+    println!("Deposited: {}", event.data.amount);
+    Ok(())
+}
+
+// Register with a subscription
+let subscription = SubscriptionBuilder::<Sqlite>::new("deposit-notifier")
+    .handler(on_money_deposited())
+    .routing_key("accounts")
+    .start(&executor)
+    .await?;
+```
+
+### Handling All Events with `#[evento::sub_all_handler]`
+
+Handle all events from an aggregate type without deserializing:
+
+```rust
+use evento::{Executor, SkipEventData, subscription::Context};
+
+#[evento::sub_all_handler]
+async fn on_any_account_event<E: Executor>(
+    context: &Context<'_, E>,
+    event: SkipEventData<BankAccount>,
+) -> anyhow::Result<()> {
+    println!("Event {} on account {}", event.name, event.aggregator_id);
+    Ok(())
+}
+```
 
 ### Snapshot Restoration with `#[evento::snapshot]`
 
 Implement snapshot restoration for projections:
 
 ```rust
-use evento::LoadResult;
 use evento::context::RwContext;
+use std::collections::HashMap;
 
 #[evento::snapshot]
 async fn restore(
     context: &RwContext,
     id: String,
-) -> anyhow::Result<Option<LoadResult<AccountBalanceView>>> {
+    aggregators: &HashMap<String, String>,
+) -> anyhow::Result<Option<AccountBalanceView>> {
     // Query snapshot from your storage
     // Return None to rebuild from events
     Ok(None)
@@ -150,9 +199,9 @@ Use `#[evento::debug_handler]` or `#[evento::debug_snapshot]` to output the gene
 
 ```rust
 #[evento::debug_handler]
-async fn handle_event<E: Executor>(
+async fn handle_event(
     event: Event<MyEvent>,
-    action: Action<'_, MyView, E>,
+    projection: &mut MyView,
 ) -> anyhow::Result<()> {
     // ...
 }
@@ -165,7 +214,8 @@ When using these macros, your types must meet certain requirements:
 
 - **Events** (from `#[aggregator]`): Traits are automatically derived
 - **Projections**: Must implement `Default`, `Send`, `Sync`, `Clone`
-- **Handler functions**: Must be `async` and return `anyhow::Result<()>`
+- **Projection handlers**: Must be `async` and return `anyhow::Result<()>`
+- **Subscription handlers**: Must be `async`, take `Context` first, and return `anyhow::Result<()>`
 
 ## Serialization
 

@@ -9,20 +9,12 @@ pub fn handler_next_impl(input: &ItemFn, debug: bool) -> syn::Result<TokenStream
     // Extract parameters
     let mut params = input.sig.inputs.iter();
 
+    let _ = params.next();
     // First param: Event<AccountOpened>
     let event_arg = params.next().ok_or_else(|| {
         Error::new_spanned(&input.sig, "expected first parameter: event: Event<T>")
     })?;
-    let (event_full_type, event_inner_type) = extract_type_with_first_generic(event_arg)?;
-
-    // Second param: Action<'_, AccountBalanceView, E>
-    let action_arg = params.next().ok_or_else(|| {
-        Error::new_spanned(
-            &input.sig,
-            "expected second parameter: action: Action<'_, P, E>",
-        )
-    })?;
-    let projection_type = extract_projection_type(action_arg)?;
+    let (_event_full_type, event_inner_type) = extract_type_with_first_generic(event_arg)?;
 
     // Generate struct name: AccountOpened -> AccountOpenedHandler
     let handler_struct = format_ident!("{}Handler", fn_name.to_string().to_case(Case::UpperCamel));
@@ -36,25 +28,20 @@ pub fn handler_next_impl(input: &ItemFn, debug: bool) -> syn::Result<TokenStream
             #input
         }
 
-        impl ::evento::projection::Handler<#projection_type> for #handler_struct {
+        impl<E: ::evento::Executor> ::evento::subscription::Handler<E> for #handler_struct {
             fn handle<'a>(
                 &'a self,
-                projection: &'a mut #projection_type,
+                context: &'a ::evento::subscription::Context<'a, E>,
                 event: &'a ::evento::Event,
             ) -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = ::anyhow::Result<()>> + Send + 'a>> {
                 Box::pin(async move {
-                    let event: #event_full_type = match event.try_into() {
-                        Ok(data) => data,
-                        Err(e) => return Err(e.into()),
-                    };
-
-                    Self::#fn_name(event, projection).await
+                    let event = ::evento::SkipEventData(event.clone(), ::std::marker::PhantomData);
+                    Self::#fn_name(context, event).await
                 })
             }
 
             fn event_name(&self) -> &'static str {
-                use ::evento::AggregatorEvent as _;
-                #event_inner_type::event_name()
+                "all"
             }
 
             fn aggregator_type(&self) -> &'static str {
@@ -121,20 +108,4 @@ fn extract_type_with_first_generic(arg: &FnArg) -> syn::Result<(&Type, &TypePath
         .ok_or_else(|| Error::new_spanned(args, "expected type argument"))?;
 
     Ok((ty.as_ref(), inner))
-}
-
-// Extract `AccountBalanceView` from `Action<'_, AccountBalanceView, E>`
-fn extract_projection_type(arg: &FnArg) -> syn::Result<&Type> {
-    let FnArg::Typed(PatType { ty, .. }) = arg else {
-        return Err(Error::new_spanned(arg, "expected typed argument"));
-    };
-
-    let Type::Reference(type_path) = ty.as_ref() else {
-        return Err(Error::new_spanned(
-            ty,
-            "expected path type like Action<'_, P, E>",
-        ));
-    };
-
-    Ok(type_path.elem.as_ref())
 }

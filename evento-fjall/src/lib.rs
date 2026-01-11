@@ -54,8 +54,7 @@ use std::path::Path;
 
 use evento_core::{
     cursor::{Args, Cursor, ReadResult, Value},
-    projection::RoutingKey,
-    Event, Executor, ReadAggregator, WriteError,
+    Event, Executor, ReadAggregator, RoutingKey, WriteError,
 };
 use fjall::{Config, Keyspace, Partition, PartitionCreateOptions, PersistMode};
 use ulid::Ulid;

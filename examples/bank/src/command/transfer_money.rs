@@ -1,4 +1,4 @@
-use evento::{Executor, metadata::Metadata};
+use evento::{Executor, metadata::Metadata, projection::ProjectionAggregator};
 
 use crate::{aggregator::MoneyTransferred, error::BankAccountError, value_object::AccountStatus};
 
@@ -11,20 +11,27 @@ pub struct TransferMoney {
     pub description: String,
 }
 
-impl<'a, E: Executor> super::Command<'a, E> {
+impl<E: Executor> super::Command<E> {
     /// Handle TransferMoney command
-    pub async fn transfer_money(&self, cmd: TransferMoney) -> Result<(), BankAccountError> {
-        if matches!(self.status, AccountStatus::Closed) {
+    pub async fn transfer_money(
+        &self,
+        id: impl Into<String>,
+        cmd: TransferMoney,
+    ) -> Result<(), BankAccountError> {
+        let Some(account) = self.load(id).await.unwrap() else {
+            return Err(BankAccountError::Server("not found".to_owned()));
+        };
+        if matches!(account.status, AccountStatus::Closed) {
             return Err(BankAccountError::AccountClosed);
         }
-        if matches!(self.status, AccountStatus::Frozen) {
+        if matches!(account.status, AccountStatus::Frozen) {
             return Err(BankAccountError::AccountFrozen);
         }
         if cmd.amount <= 0 {
             return Err(BankAccountError::InvalidAmount);
         }
 
-        let available = self.balance + self.overdraft_limit;
+        let available = account.balance + account.overdraft_limit;
         if cmd.amount > available {
             return Err(BankAccountError::InsufficientFunds {
                 available,
@@ -32,7 +39,9 @@ impl<'a, E: Executor> super::Command<'a, E> {
             });
         }
 
-        self.aggregator()
+        account
+            .aggregator()
+            .unwrap()
             .event(&MoneyTransferred {
                 amount: cmd.amount,
                 to_account_id: cmd.to_account_id,
@@ -40,7 +49,7 @@ impl<'a, E: Executor> super::Command<'a, E> {
                 description: cmd.description,
             })
             .metadata(&Metadata::default())
-            .commit(self.executor)
+            .commit(&self.0)
             .await?;
 
         Ok(())
@@ -49,20 +58,24 @@ impl<'a, E: Executor> super::Command<'a, E> {
     /// Handle TransferMoney command
     pub async fn transfer_money_with_routing(
         &self,
+        id: impl Into<String>,
         cmd: TransferMoney,
         key: impl Into<String>,
     ) -> Result<(), BankAccountError> {
-        if matches!(self.status, AccountStatus::Closed) {
+        let Some(account) = self.load(id).await.unwrap() else {
+            return Err(BankAccountError::Server("not found".to_owned()));
+        };
+        if matches!(account.status, AccountStatus::Closed) {
             return Err(BankAccountError::AccountClosed);
         }
-        if matches!(self.status, AccountStatus::Frozen) {
+        if matches!(account.status, AccountStatus::Frozen) {
             return Err(BankAccountError::AccountFrozen);
         }
         if cmd.amount <= 0 {
             return Err(BankAccountError::InvalidAmount);
         }
 
-        let available = self.balance + self.overdraft_limit;
+        let available = account.balance + account.overdraft_limit;
         if cmd.amount > available {
             return Err(BankAccountError::InsufficientFunds {
                 available,
@@ -70,7 +83,9 @@ impl<'a, E: Executor> super::Command<'a, E> {
             });
         }
 
-        self.aggregator()
+        account
+            .aggregator()
+            .unwrap()
             .routing_key(key)
             .event(&MoneyTransferred {
                 amount: cmd.amount,
@@ -79,7 +94,7 @@ impl<'a, E: Executor> super::Command<'a, E> {
                 description: cmd.description,
             })
             .metadata(&Metadata::default())
-            .commit(self.executor)
+            .commit(&self.0)
             .await?;
 
         Ok(())

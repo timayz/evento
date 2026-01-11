@@ -1,4 +1,4 @@
-use evento::{Executor, metadata::Metadata};
+use evento::{Executor, metadata::Metadata, projection::ProjectionAggregator};
 
 use crate::{aggregator::AccountClosed, error::BankAccountError, value_object::AccountStatus};
 
@@ -8,23 +8,32 @@ pub struct CloseAccount {
     pub reason: String,
 }
 
-impl<'a, E: Executor> super::Command<'a, E> {
+impl<E: Executor> super::Command<E> {
     /// Handle CloseAccount command
-    pub async fn close_account(&self, cmd: CloseAccount) -> Result<(), BankAccountError> {
-        if matches!(self.status, AccountStatus::Closed) {
+    pub async fn close_account(
+        &self,
+        id: impl Into<String>,
+        cmd: CloseAccount,
+    ) -> Result<(), BankAccountError> {
+        let Some(account) = self.load(id).await.unwrap() else {
+            return Err(BankAccountError::Server("not found".to_owned()));
+        };
+        if matches!(account.status, AccountStatus::Closed) {
             return Err(BankAccountError::AccountClosed);
         }
-        if self.balance < 0 {
+        if account.balance < 0 {
             return Err(BankAccountError::NegativeBalance);
         }
 
-        self.aggregator()
+        account
+            .aggregator()
+            .unwrap()
             .event(&AccountClosed {
                 reason: cmd.reason,
-                final_balance: self.balance,
+                final_balance: account.balance,
             })
             .metadata(&Metadata::default())
-            .commit(self.executor)
+            .commit(&self.0)
             .await?;
 
         Ok(())

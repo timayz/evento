@@ -103,7 +103,7 @@ impl<N> ReadResult<N> {
 ///
 /// Cursors are opaque strings that identify a position in a result set.
 /// They are serialized using bitcode and base64-encoded for URL safety.
-#[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
+#[derive(Debug, PartialEq, Serialize, Deserialize, Clone, Default)]
 pub struct Value(pub String);
 
 impl Deref for Value {

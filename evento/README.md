@@ -14,9 +14,8 @@ More information about this crate can be found in the [crate documentation][docs
 - **CQRS Pattern**: Separate read and write models for scalable architectures
 - **SQL Database Support**: Built-in support for SQLite, PostgreSQL, and MySQL
 - **Embedded Storage**: Fjall key-value store for embedded applications
-- **Event Handlers**: Async event processing with automatic retries
-- **Event Subscriptions**: Continuous event stream processing with cursor tracking
 - **Projections**: Build read models by replaying events
+- **Subscriptions**: Continuous event stream processing with cursor tracking
 - **Database Migrations**: Automated schema management
 - **Compact Serialization**: Fast binary serialization with bitcode
 - **Type Safety**: Fully typed events and aggregates with compile-time guarantees
@@ -34,7 +33,7 @@ bitcode = "0.6"
 ## Usage Example
 
 ```rust
-use evento::{Executor, metadata::{Event, Metadata}, projection::{Action, Projection}};
+use evento::{Executor, metadata::{Event, Metadata}, projection::Projection};
 
 // Define events using an enum
 #[evento::aggregator]
@@ -48,39 +47,31 @@ pub enum User {
     },
 }
 
-// Define a view/projection
-#[derive(Default)]
+// Define a view/projection with cursor tracking
+#[evento::projection]
+#[derive(Debug)]
 pub struct UserView {
     pub name: String,
     pub email: String,
 }
 
-// Define handler functions
+// Define projection handlers - they update state from events
 #[evento::handler]
-async fn on_user_created<E: Executor>(
+async fn on_user_created(
     event: Event<UserCreated>,
-    action: Action<'_, UserView, E>,
+    view: &mut UserView,
 ) -> anyhow::Result<()> {
-    match action {
-        Action::Apply(view) => {
-            view.name = event.data.name.clone();
-            view.email = event.data.email.clone();
-        }
-        Action::Handle(_context) => {
-            // In Action::Handle, perform side effects like sending emails
-        }
-    };
+    view.name = event.data.name.clone();
+    view.email = event.data.email.clone();
     Ok(())
 }
 
 #[evento::handler]
-async fn on_email_changed<E: Executor>(
+async fn on_email_changed(
     event: Event<UserEmailChanged>,
-    action: Action<'_, UserView, E>,
+    view: &mut UserView,
 ) -> anyhow::Result<()> {
-    if let Action::Apply(view) = action {
-        view.email = event.data.email.clone();
-    }
+    view.email = event.data.email.clone();
     Ok(())
 }
 
@@ -118,12 +109,9 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     // Build projection and load state
-    let projection = Projection::<UserView, _>::new("users")
+    let result = Projection::<UserView, _>::new::<User>(&user_id)
         .handler(on_user_created())
-        .handler(on_email_changed());
-
-    let result = projection
-        .load::<User>(&user_id)
+        .handler(on_email_changed())
         .execute(&executor)
         .await?;
 
@@ -137,14 +125,26 @@ async fn main() -> anyhow::Result<()> {
 
 ## Continuous Subscriptions
 
+Subscriptions process events in real-time with side effects:
+
 ```rust
 use std::time::Duration;
+use evento::{Executor, metadata::Event, subscription::{Context, SubscriptionBuilder}};
+
+// Subscription handlers receive context and can perform side effects
+#[evento::sub_handler]
+async fn notify_user_created<E: Executor>(
+    context: &Context<'_, E>,
+    event: Event<UserCreated>,
+) -> anyhow::Result<()> {
+    println!("New user: {}", event.data.name);
+    // Send welcome email, update external systems, etc.
+    Ok(())
+}
 
 // Start a subscription that continuously processes events
-let subscription = Projection::<UserView, _>::new("user-processor")
-    .handler(on_user_created())
-    .handler(on_email_changed())
-    .subscription()
+let subscription = SubscriptionBuilder::<evento::Sqlite>::new("user-notifier")
+    .handler(notify_user_created())
     .routing_key("users")
     .chunk_size(100)
     .retry(5)
@@ -154,6 +154,23 @@ let subscription = Projection::<UserView, _>::new("user-processor")
 
 // On application shutdown
 subscription.shutdown().await?;
+```
+
+## Handle All Events
+
+Use `sub_all_handler` to process all events from an aggregate without deserializing:
+
+```rust
+use evento::{Executor, SkipEventData, subscription::Context};
+
+#[evento::sub_all_handler]
+async fn audit_user_events<E: Executor>(
+    context: &Context<'_, E>,
+    event: SkipEventData<User>,
+) -> anyhow::Result<()> {
+    println!("Event {} on user {}", event.name, event.aggregator_id);
+    Ok(())
+}
 ```
 
 ## Feature Flags

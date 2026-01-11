@@ -1,4 +1,4 @@
-use evento::{Executor, metadata::Metadata};
+use evento::{Executor, metadata::Metadata, projection::ProjectionAggregator};
 
 use crate::{aggregator::MoneyReceived, error::BankAccountError, value_object::AccountStatus};
 
@@ -11,10 +11,17 @@ pub struct ReceiveMoney {
     pub description: String,
 }
 
-impl<'a, E: Executor> super::Command<'a, E> {
+impl<E: Executor> super::Command<E> {
     /// Handle ReceiveMoney command
-    pub async fn receive_money(&self, cmd: ReceiveMoney) -> Result<(), BankAccountError> {
-        if matches!(self.status, AccountStatus::Closed) {
+    pub async fn receive_money(
+        &self,
+        id: impl Into<String>,
+        cmd: ReceiveMoney,
+    ) -> Result<(), BankAccountError> {
+        let Some(account) = self.load(id).await.unwrap() else {
+            return Err(BankAccountError::Server("not found".to_owned()));
+        };
+        if matches!(account.status, AccountStatus::Closed) {
             return Err(BankAccountError::AccountClosed);
         }
         // Note: Frozen accounts can still receive money
@@ -22,7 +29,9 @@ impl<'a, E: Executor> super::Command<'a, E> {
             return Err(BankAccountError::InvalidAmount);
         }
 
-        self.aggregator()
+        account
+            .aggregator()
+            .unwrap()
             .event(&MoneyReceived {
                 amount: cmd.amount,
                 from_account_id: cmd.from_account_id,
@@ -30,7 +39,7 @@ impl<'a, E: Executor> super::Command<'a, E> {
                 description: cmd.description,
             })
             .metadata(&Metadata::default())
-            .commit(self.executor)
+            .commit(&self.0)
             .await?;
 
         Ok(())

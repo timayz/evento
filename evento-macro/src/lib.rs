@@ -9,8 +9,12 @@
 //! | Macro | Type | Purpose |
 //! |-------|------|---------|
 //! | [`aggregator`] | Attribute | Transform enum into event structs with trait impls |
-//! | [`handler`] | Attribute | Create event handler from async function |
+//! | [`handler`] | Attribute | Create projection handler from async function |
+//! | [`sub_handler`] | Attribute | Create subscription handler for specific events |
+//! | [`sub_all_handler`] | Attribute | Create subscription handler for all events of an aggregate |
 //! | [`snapshot`] | Attribute | Implement snapshot restoration for projections |
+//! | [`projection`] | Attribute | Add cursor field and implement `ProjectionCursor` |
+//! | [`Cursor`] | Derive | Generate cursor struct and trait implementations |
 //! | [`debug_handler`] | Attribute | Like `handler` but outputs generated code for debugging |
 //! | [`debug_snapshot`] | Attribute | Like `snapshot` but outputs generated code for debugging |
 //!
@@ -57,26 +61,85 @@
 //! - `Aggregator` and `Event` trait implementations for each
 //! - Automatic derives: `Debug`, `Clone`, `PartialEq`, `Default`, and bitcode serialization
 //!
-//! ## Creating Handlers with `#[evento::handler]`
+//! ## Creating Projection Handlers with `#[evento::handler]`
+//!
+//! Projection handlers are used to build read models by replaying events:
 //!
 //! ```rust,ignore
+//! use evento::metadata::Event;
+//!
 //! #[evento::handler]
-//! async fn handle_money_deposited<E: Executor>(
+//! async fn handle_money_deposited(
 //!     event: Event<MoneyDeposited>,
-//!     action: Action<'_, AccountBalanceView, E>,
+//!     projection: &mut AccountBalanceView,
 //! ) -> anyhow::Result<()> {
-//!     match action {
-//!         Action::Apply(row) => {
-//!             row.balance += event.data.amount;
-//!         }
-//!         Action::Handle(_context) => {}
-//!     };
+//!     projection.balance += event.data.amount;
 //!     Ok(())
 //! }
 //!
 //! // Use in a projection
-//! let projection = Projection::new("account-balance")
+//! let projection = Projection::<AccountBalanceView, _>::new::<BankAccount>("account-123")
 //!     .handler(handle_money_deposited());
+//! ```
+//!
+//! ## Creating Subscription Handlers with `#[evento::sub_handler]`
+//!
+//! Subscription handlers process events in real-time with side effects:
+//!
+//! ```rust,ignore
+//! use evento::{Executor, metadata::Event, subscription::Context};
+//!
+//! #[evento::sub_handler]
+//! async fn on_money_deposited<E: Executor>(
+//!     context: &Context<'_, E>,
+//!     event: Event<MoneyDeposited>,
+//! ) -> anyhow::Result<()> {
+//!     // Perform side effects: send notifications, update read models, etc.
+//!     println!("Deposited: {}", event.data.amount);
+//!     Ok(())
+//! }
+//!
+//! // Use in a subscription
+//! let subscription = SubscriptionBuilder::<Sqlite>::new("deposit-notifier")
+//!     .handler(on_money_deposited())
+//!     .routing_key("accounts")
+//!     .start(&executor)
+//!     .await?;
+//! ```
+//!
+//! ## Handling All Events with `#[evento::sub_all_handler]`
+//!
+//! Handle all events from an aggregate type without deserializing:
+//!
+//! ```rust,ignore
+//! use evento::{Executor, SkipEventData, subscription::Context};
+//!
+//! #[evento::sub_all_handler]
+//! async fn on_any_account_event<E: Executor>(
+//!     context: &Context<'_, E>,
+//!     event: SkipEventData<BankAccount>,
+//! ) -> anyhow::Result<()> {
+//!     println!("Event {} on account {}", event.name, event.aggregator_id);
+//!     Ok(())
+//! }
+//! ```
+//!
+//! ## Projection State with `#[evento::projection]`
+//!
+//! Automatically add cursor tracking to projection structs:
+//!
+//! ```rust,ignore
+//! #[evento::projection]
+//! #[derive(Debug)]
+//! pub struct AccountBalanceView {
+//!     pub balance: i64,
+//!     pub owner: String,
+//! }
+//!
+//! // Generates:
+//! // - Adds `pub cursor: String` field
+//! // - Implements `ProjectionCursor` trait
+//! // - Adds `Default` and `Clone` derives
 //! ```
 //!
 //! ## Snapshot Restoration with `#[evento::snapshot]`
@@ -86,6 +149,7 @@
 //! async fn restore(
 //!     context: &evento::context::RwContext,
 //!     id: String,
+//!     aggregators: &std::collections::HashMap<String, String>,
 //! ) -> anyhow::Result<Option<AccountBalanceView>> {
 //!     // Load snapshot from database or return None
 //!     Ok(None)
@@ -98,7 +162,8 @@
 //!
 //! - **Events** (from `#[aggregator]`): Automatically derive required traits
 //! - **Projections**: Must implement `Default`, `Send`, `Sync`, `Clone`
-//! - **Handler functions**: Must be `async` and return `anyhow::Result<()>`
+//! - **Projection handlers**: Must be `async` and return `anyhow::Result<()>`
+//! - **Subscription handlers**: Must be `async`, take `Context` first, and return `anyhow::Result<()>`
 //!
 //! # Serialization
 //!
@@ -107,10 +172,12 @@
 //! bitcode derives.
 
 mod aggregator;
-mod command;
 mod cursor;
 mod handler;
+mod projection;
 mod snapshot;
+mod sub_all_handler;
+mod sub_handler;
 
 use proc_macro::TokenStream;
 use syn::{parse_macro_input, DeriveInput, ItemFn};
@@ -175,19 +242,19 @@ pub fn aggregator(attr: TokenStream, item: TokenStream) -> TokenStream {
     aggregator::aggregator(attr, item)
 }
 
-/// Creates an event handler from an async function.
+/// Creates a projection handler from an async function.
 ///
 /// This macro transforms an async function into a handler struct that implements
-/// the `Handler<P, E>` trait for use with projections.
+/// the `projection::Handler<P>` trait for use with projections to build read models.
 ///
 /// # Function Signature
 ///
 /// The function must have this signature:
 ///
 /// ```rust,ignore
-/// async fn handler_name<E: Executor>(
+/// async fn handler_name(
 ///     event: Event<EventType>,
-///     action: Action<'_, ProjectionType, E>,
+///     projection: &mut ProjectionType,
 /// ) -> anyhow::Result<()>
 /// ```
 ///
@@ -196,36 +263,29 @@ pub fn aggregator(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// For a function `handle_money_deposited`, the macro generates:
 /// - `HandleMoneyDepositedHandler` struct
 /// - `handle_money_deposited()` constructor function
-/// - `Handler<ProjectionType, E>` trait implementation
+/// - `projection::Handler<ProjectionType>` trait implementation
 ///
 /// # Example
 ///
 /// ```rust,ignore
+/// use evento::metadata::Event;
+///
 /// #[evento::handler]
-/// async fn handle_money_deposited<E: Executor>(
+/// async fn handle_money_deposited(
 ///     event: Event<MoneyDeposited>,
-///     action: Action<'_, AccountBalanceView, E>,
+///     projection: &mut AccountBalanceView,
 /// ) -> anyhow::Result<()> {
-///     match action {
-///         Action::Apply(row) => {
-///             row.balance += event.data.amount;
-///         }
-///         Action::Handle(_context) => {
-///             // Side effects, notifications, etc.
-///         }
-///     };
+///     projection.balance += event.data.amount;
 ///     Ok(())
 /// }
 ///
 /// // Register with projection
-/// let projection = Projection::new("account-balance")
+/// let projection = Projection::<AccountBalanceView, _>::new::<BankAccount>("account-123")
 ///     .handler(handle_money_deposited());
+///
+/// // Execute projection to get current state
+/// let result = projection.execute(&executor).await?;
 /// ```
-///
-/// # Action Variants
-///
-/// - `Action::Apply(row)` - Mutate projection state (for rebuilding from events)
-/// - `Action::Handle(context)` - Handle side effects during live processing
 #[proc_macro_attribute]
 pub fn handler(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemFn);
@@ -257,6 +317,129 @@ pub fn debug_handler(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemFn);
 
     match handler::handler_next_impl(&input, true) {
+        Ok(tokens) => tokens,
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+/// Creates a subscription handler for specific events.
+///
+/// This macro transforms an async function into a handler struct that implements
+/// the `subscription::Handler<E>` trait for processing events in real-time subscriptions.
+///
+/// Unlike projection handlers, subscription handlers receive a context with access
+/// to the executor and can perform side effects like database updates, notifications,
+/// or external API calls.
+///
+/// # Function Signature
+///
+/// The function must have this signature:
+///
+/// ```rust,ignore
+/// async fn handler_name<E: Executor>(
+///     context: &Context<'_, E>,
+///     event: Event<EventType>,
+/// ) -> anyhow::Result<()>
+/// ```
+///
+/// # Generated Code
+///
+/// For a function `on_money_deposited`, the macro generates:
+/// - `OnMoneyDepositedHandler` struct
+/// - `on_money_deposited()` constructor function
+/// - `subscription::Handler<E>` trait implementation
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use evento::{Executor, metadata::Event, subscription::Context};
+///
+/// #[evento::sub_handler]
+/// async fn on_money_deposited<E: Executor>(
+///     context: &Context<'_, E>,
+///     event: Event<MoneyDeposited>,
+/// ) -> anyhow::Result<()> {
+///     // Access shared data from context
+///     let config: Data<AppConfig> = context.extract();
+///
+///     // Perform side effects
+///     send_notification(&event.data).await?;
+///
+///     Ok(())
+/// }
+///
+/// // Register with subscription
+/// let subscription = SubscriptionBuilder::<Sqlite>::new("deposit-notifier")
+///     .handler(on_money_deposited())
+///     .routing_key("accounts")
+///     .start(&executor)
+///     .await?;
+/// ```
+#[proc_macro_attribute]
+pub fn sub_handler(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(item as ItemFn);
+
+    match sub_handler::handler_next_impl(&input, false) {
+        Ok(tokens) => tokens,
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+/// Creates a subscription handler that processes all events of an aggregate type.
+///
+/// This macro is similar to [`sub_handler`] but handles all events from an aggregate
+/// without requiring the event data to be deserialized. The event is wrapped in
+/// [`SkipEventData`] which provides access to event metadata (name, id, timestamp, etc.)
+/// without deserializing the payload.
+///
+/// # Function Signature
+///
+/// The function must have this signature:
+///
+/// ```rust,ignore
+/// async fn handler_name<E: Executor>(
+///     context: &Context<'_, E>,
+///     event: SkipEventData<AggregateType>,
+/// ) -> anyhow::Result<()>
+/// ```
+///
+/// # Generated Code
+///
+/// For a function `on_any_account_event`, the macro generates:
+/// - `OnAnyAccountEventHandler` struct
+/// - `on_any_account_event()` constructor function
+/// - `subscription::Handler<E>` trait implementation with `event_name()` returning `"all"`
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use evento::{Executor, SkipEventData, subscription::Context};
+///
+/// #[evento::sub_all_handler]
+/// async fn on_any_account_event<E: Executor>(
+///     context: &Context<'_, E>,
+///     event: SkipEventData<BankAccount>,
+/// ) -> anyhow::Result<()> {
+///     // Access event metadata without deserializing
+///     println!("Event: {} on {}", event.name, event.aggregator_id);
+///     println!("Version: {}", event.version);
+///     println!("Timestamp: {}", event.timestamp);
+///
+///     // Useful for logging, auditing, or forwarding events
+///     Ok(())
+/// }
+///
+/// // Register with subscription - handles all BankAccount events
+/// let subscription = SubscriptionBuilder::<Sqlite>::new("account-auditor")
+///     .handler(on_any_account_event())
+///     .start(&executor)
+///     .await?;
+/// ```
+#[proc_macro_attribute]
+pub fn sub_all_handler(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(item as ItemFn);
+
+    match sub_all_handler::handler_next_impl(&input, false) {
         Ok(tokens) => tokens,
         Err(e) => e.to_compile_error().into(),
     }
@@ -341,44 +524,6 @@ pub fn debug_snapshot(_attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
-/// The main macro that transforms a struct into the Data + wrapper pattern
-///
-/// # Usage
-/// ```rust
-/// #[evento::my_macro]
-/// pub struct Command {
-///     pub id: String,
-/// }
-/// ```
-#[proc_macro_attribute]
-pub fn command(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(item as DeriveInput);
-
-    match command::command_impl(input, false) {
-        Ok(tokens) => tokens,
-        Err(err) => err.to_compile_error().into(),
-    }
-}
-
-/// The main macro that transforms a struct into the Data + wrapper pattern
-///
-/// # Usage
-/// ```rust
-/// #[evento::my_macro]
-/// pub struct Command {
-///     pub id: String,
-/// }
-/// ```
-#[proc_macro_attribute]
-pub fn debug_command(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(item as DeriveInput);
-
-    match command::command_impl(input, true) {
-        Ok(tokens) => tokens,
-        Err(err) => err.to_compile_error().into(),
-    }
-}
-
 /// Derive macro for generating cursor structs and trait implementations.
 ///
 /// # Example
@@ -401,6 +546,46 @@ pub fn debug_command(_attr: TokenStream, item: TokenStream) -> TokenStream {
 pub fn derive_cursor(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     match cursor::cursor_impl(&input) {
+        Ok(tokens) => tokens,
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+/// Attribute macro that adds a `cursor: String` field and implements `ProjectionCursor`.
+///
+/// # Example
+///
+/// ```ignore
+/// #[projection_cursor]
+/// #[derive(Debug, Default)]
+/// pub struct MyStruct {
+///     pub id: String,
+///     pub name: String,
+/// }
+/// ```
+///
+/// This generates:
+/// ```ignore
+/// #[derive(Debug, Default)]
+/// pub struct MyStruct {
+///     pub id: String,
+///     pub name: String,
+///     pub cursor: String,
+/// }
+///
+/// impl evento::ProjectionCursor for MyStruct {
+///     fn set_cursor(&mut self, v: &evento::cursor::Value) {
+///         self.cursor = v.to_string();
+///     }
+///     fn get_cursor(&self) -> evento::cursor::Value {
+///         self.cursor.to_owned().into()
+///     }
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn projection(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(item as DeriveInput);
+    match projection::projection_cursor_impl(attr, &input) {
         Ok(tokens) => tokens,
         Err(e) => e.to_compile_error().into(),
     }

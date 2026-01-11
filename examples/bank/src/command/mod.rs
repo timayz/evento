@@ -9,7 +9,7 @@ mod transfer_money;
 mod unfreeze_account;
 mod withdraw_money;
 
-use std::{collections::HashMap, sync::RwLock};
+use std::{collections::HashMap, ops::Deref, sync::RwLock};
 
 pub use change_daily_withdrawal_limit::*;
 pub use change_overdraft_limit::*;
@@ -22,29 +22,45 @@ pub use transfer_money::*;
 pub use unfreeze_account::*;
 pub use withdraw_money::*;
 
-use evento::{Action, Executor, Projection, SubscriptionBuilder, metadata::Event};
+use evento::{Executor, Projection, Snapshot, metadata::Event, projection::ProjectionAggregator};
 
-use crate::{
-    AccountClosed, AccountFrozen, AccountOpened, AccountUnfrozen, BankAccount, MoneyDeposited,
-    MoneyReceived, MoneyTransferred, MoneyWithdrawn, OverdraftLimitChanged,
-    value_object::AccountStatus,
+use crate::aggregator::{
+    AccountClosed, AccountFrozen, AccountOpened, AccountUnfrozen, MoneyDeposited, MoneyReceived,
+    MoneyTransferred, MoneyWithdrawn, OverdraftLimitChanged,
 };
+use crate::value_object::AccountStatus;
 
 use once_cell::sync::Lazy;
 
-pub type LazyCommandrow = (CommandData, u16, Option<String>);
+pub static COMMAND_ROWS: Lazy<RwLock<HashMap<String, BankAccount>>> = Lazy::new(Default::default);
 
-pub static COMMAND_ROWS: Lazy<RwLock<HashMap<String, LazyCommandrow>>> =
-    Lazy::new(Default::default);
+pub struct Command<E: Executor>(pub E);
 
-#[evento::command]
-pub struct Command {
+impl<E: Executor> Deref for Command<E> {
+    type Target = E;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<E: Executor> Command<E> {
+    pub async fn load(&self, id: impl Into<String>) -> anyhow::Result<Option<BankAccount>> {
+        let id = id.into();
+
+        create_projection(&id).execute(&self.0).await
+    }
+}
+
+#[evento::projection]
+pub struct BankAccount {
+    pub id: String,
     pub balance: i64,
     pub status: AccountStatus,
     pub overdraft_limit: i64,
 }
 
-impl<'a, E: Executor> Command<'a, E> {
+impl BankAccount {
     pub fn can_withdraw(&self, amount: i64) -> bool {
         matches!(self.status, AccountStatus::Active)
             && amount > 0
@@ -76,8 +92,8 @@ impl<'a, E: Executor> Command<'a, E> {
     }
 }
 
-fn create_projection<E: Executor>() -> Projection<CommandData, E> {
-    Projection::new("command")
+fn create_projection(id: impl Into<String>) -> Projection<BankAccount> {
+    Projection::new::<crate::aggregator::BankAccount>(id)
         .handler(handle_money_deposit())
         .handler(handle_account_opened())
         .handler(handle_money_received())
@@ -87,239 +103,123 @@ fn create_projection<E: Executor>() -> Projection<CommandData, E> {
         .handler(handle_account_closed())
         .handler(handle_account_frozen())
         .handler(handle_account_unfrozen())
+        .safety_check()
 }
 
-pub async fn load<E: Executor>(
-    executor: &E,
-    id: impl Into<String>,
-) -> Result<Option<Command<'_, E>>, anyhow::Error> {
-    let id = id.into();
-
-    Ok(create_projection()
-        .load::<BankAccount>(&id)
-        .execute_all(executor)
-        .await?
-        .map(|loaded| Command::new(id, loaded, executor)))
+impl ProjectionAggregator for BankAccount {
+    fn aggregator_id(&self) -> String {
+        self.id.to_owned()
+    }
 }
 
-pub fn subscription<E: Executor>() -> SubscriptionBuilder<CommandData, E> {
-    create_projection().subscription()
-}
+impl Snapshot for BankAccount {
+    async fn restore(
+        _context: &evento::context::RwContext,
+        id: String,
+        _aggregators: &HashMap<String, String>,
+    ) -> anyhow::Result<Option<Self>> {
+        let rows = COMMAND_ROWS.read().unwrap();
 
-#[evento::snapshot]
-async fn restore(
-    _context: &evento::context::RwContext,
-    id: String,
-    _aggregators: &HashMap<String, String>,
-) -> anyhow::Result<Option<CommandData>> {
-    let rows = COMMAND_ROWS.read().unwrap();
+        Ok(rows.get(&id).cloned())
+    }
 
-    Ok(rows.get(&id).cloned().map(|(item, _, _)| item))
+    async fn take_snapshot(&self, _context: &evento::context::RwContext) -> anyhow::Result<()> {
+        let mut rows = COMMAND_ROWS.write().unwrap();
+        rows.insert(self.id.to_owned(), self.clone());
+
+        Ok(())
+    }
 }
 
 #[evento::handler]
-async fn handle_account_opened<E: Executor>(
+async fn handle_account_opened(
     event: Event<AccountOpened>,
-    action: Action<'_, CommandData, E>,
+    row: &mut BankAccount,
 ) -> anyhow::Result<()> {
-    match action {
-        Action::Apply(row) => {
-            row.balance = event.data.initial_balance;
-            row.status = AccountStatus::Active;
-            row.overdraft_limit = 0;
-        }
-        Action::Handle(_context) => {
-            let mut rows = COMMAND_ROWS.write().unwrap();
-            rows.insert(
-                event.aggregator_id.to_owned(),
-                (
-                    CommandData {
-                        balance: event.data.initial_balance,
-                        status: AccountStatus::Active,
-                        overdraft_limit: 0,
-                    },
-                    event.version,
-                    event.routing_key.to_owned(),
-                ),
-            );
-        }
-    };
+    row.id = event.aggregator_id.to_owned();
+    row.balance = event.data.initial_balance;
+    row.status = AccountStatus::Active;
+    row.overdraft_limit = 0;
 
     Ok(())
 }
 
 #[evento::handler]
-async fn handle_money_deposit<E: Executor>(
+async fn handle_money_deposit(
     event: Event<MoneyDeposited>,
-    action: Action<'_, CommandData, E>,
+    row: &mut BankAccount,
 ) -> anyhow::Result<()> {
-    match action {
-        Action::Apply(row) => {
-            row.balance += event.data.amount;
-        }
-        Action::Handle(_context) => {
-            let mut rows = COMMAND_ROWS.write().unwrap();
-            if let Some(row) = rows.get_mut(&event.aggregator_id) {
-                row.0.balance += event.data.amount;
-                row.1 = event.version;
-                row.2 = event.routing_key.to_owned();
-            }
-        }
-    };
+    row.balance += event.data.amount;
 
     Ok(())
 }
 
 #[evento::handler]
-async fn handle_money_withdrawn<E: Executor>(
+async fn handle_money_withdrawn(
     event: Event<MoneyWithdrawn>,
-    action: Action<'_, CommandData, E>,
+    row: &mut BankAccount,
 ) -> anyhow::Result<()> {
-    match action {
-        Action::Apply(row) => {
-            row.balance -= event.data.amount;
-        }
-        Action::Handle(_context) => {
-            let mut rows = COMMAND_ROWS.write().unwrap();
-            if let Some(row) = rows.get_mut(&event.aggregator_id) {
-                row.0.balance -= event.data.amount;
-                row.1 = event.version;
-                row.2 = event.routing_key.to_owned();
-            }
-        }
-    };
+    row.balance -= event.data.amount;
 
     Ok(())
 }
 
 #[evento::handler]
-async fn handle_money_transferred<E: Executor>(
+async fn handle_money_transferred(
     event: Event<MoneyTransferred>,
-    action: Action<'_, CommandData, E>,
+    row: &mut BankAccount,
 ) -> anyhow::Result<()> {
-    match action {
-        Action::Apply(row) => {
-            row.balance -= event.data.amount;
-        }
-        Action::Handle(_context) => {
-            let mut rows = COMMAND_ROWS.write().unwrap();
-            if let Some(row) = rows.get_mut(&event.aggregator_id) {
-                row.0.balance -= event.data.amount;
-                row.1 = event.version;
-                row.2 = event.routing_key.to_owned();
-            }
-        }
-    };
+    row.balance -= event.data.amount;
 
     Ok(())
 }
 
 #[evento::handler]
-async fn handle_money_received<E: Executor>(
+async fn handle_money_received(
     event: Event<MoneyReceived>,
-    action: Action<'_, CommandData, E>,
+    row: &mut BankAccount,
 ) -> anyhow::Result<()> {
-    match action {
-        Action::Apply(row) => {
-            row.balance += event.data.amount;
-        }
-        Action::Handle(_context) => {
-            let mut rows = COMMAND_ROWS.write().unwrap();
-            if let Some(row) = rows.get_mut(&event.aggregator_id) {
-                row.0.balance += event.data.amount;
-                row.1 = event.version;
-                row.2 = event.routing_key.to_owned();
-            }
-        }
-    };
+    row.balance += event.data.amount;
 
     Ok(())
 }
 
 #[evento::handler]
-async fn handle_overdraf_limit_changed<E: Executor>(
+async fn handle_overdraf_limit_changed(
     event: Event<OverdraftLimitChanged>,
-    action: Action<'_, CommandData, E>,
+    row: &mut BankAccount,
 ) -> anyhow::Result<()> {
-    match action {
-        Action::Apply(row) => {
-            row.overdraft_limit = event.data.new_limit;
-        }
-        Action::Handle(_context) => {
-            let mut rows = COMMAND_ROWS.write().unwrap();
-            if let Some(row) = rows.get_mut(&event.aggregator_id) {
-                row.0.overdraft_limit += event.data.new_limit;
-                row.1 = event.version;
-                row.2 = event.routing_key.to_owned();
-            }
-        }
-    };
+    row.overdraft_limit = event.data.new_limit;
 
     Ok(())
 }
 
 #[evento::handler]
-async fn handle_account_frozen<E: Executor>(
-    event: Event<AccountFrozen>,
-    action: Action<'_, CommandData, E>,
+async fn handle_account_frozen(
+    _event: Event<AccountFrozen>,
+    row: &mut BankAccount,
 ) -> anyhow::Result<()> {
-    match action {
-        Action::Apply(row) => {
-            row.status = AccountStatus::Frozen;
-        }
-        Action::Handle(_context) => {
-            let mut rows = COMMAND_ROWS.write().unwrap();
-            if let Some(row) = rows.get_mut(&event.aggregator_id) {
-                row.0.status = AccountStatus::Frozen;
-                row.1 = event.version;
-                row.2 = event.routing_key.to_owned();
-            }
-        }
-    };
+    row.status = AccountStatus::Frozen;
 
     Ok(())
 }
 
 #[evento::handler]
-async fn handle_account_unfrozen<E: Executor>(
-    event: Event<AccountUnfrozen>,
-    action: Action<'_, CommandData, E>,
+async fn handle_account_unfrozen(
+    _event: Event<AccountUnfrozen>,
+    row: &mut BankAccount,
 ) -> anyhow::Result<()> {
-    match action {
-        Action::Apply(row) => {
-            row.status = AccountStatus::Active;
-        }
-        Action::Handle(_context) => {
-            let mut rows = COMMAND_ROWS.write().unwrap();
-            if let Some(row) = rows.get_mut(&event.aggregator_id) {
-                row.0.status = AccountStatus::Active;
-                row.1 = event.version;
-                row.2 = event.routing_key.to_owned();
-            }
-        }
-    };
+    row.status = AccountStatus::Active;
 
     Ok(())
 }
 
 #[evento::handler]
-async fn handle_account_closed<E: Executor>(
-    event: Event<AccountClosed>,
-    action: Action<'_, CommandData, E>,
+async fn handle_account_closed(
+    _event: Event<AccountClosed>,
+    row: &mut BankAccount,
 ) -> anyhow::Result<()> {
-    match action {
-        Action::Apply(row) => {
-            row.status = AccountStatus::Closed;
-        }
-        Action::Handle(_context) => {
-            let mut rows = COMMAND_ROWS.write().unwrap();
-            if let Some(row) = rows.get_mut(&event.aggregator_id) {
-                row.0.status = AccountStatus::Closed;
-                row.1 = event.version;
-                row.2 = event.routing_key.to_owned();
-            }
-        }
-    };
+    row.status = AccountStatus::Closed;
 
     Ok(())
 }

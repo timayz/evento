@@ -31,7 +31,7 @@ pub fn aggregator(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
 
         let impl_event = quote! {
-            impl evento::projection::Aggregator for #variant_name {
+            impl evento::Aggregator for #variant_name {
                 fn aggregator_type() -> &'static str {
                     static NAME: std::sync::LazyLock<String> = std::sync::LazyLock::new(||{
                         format!("{}/{}", env!("CARGO_PKG_NAME"), #enum_name_str)
@@ -41,7 +41,7 @@ pub fn aggregator(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             }
 
-            impl evento::projection::Event for #variant_name {
+            impl evento::AggregatorEvent for #variant_name {
                 fn event_name() -> &'static str {
                     #variant_name_str
                 }
@@ -100,7 +100,7 @@ pub fn aggregator(attr: TokenStream, item: TokenStream) -> TokenStream {
         #[derive(Default)]
         #vis struct #enum_name;
 
-        impl evento::projection::Aggregator for #enum_name {
+        impl evento::Aggregator for #enum_name {
             fn aggregator_type() -> &'static str {
                 static NAME: std::sync::LazyLock<String> = std::sync::LazyLock::new(||{
                     format!("{}/{}", env!("CARGO_PKG_NAME"), #enum_name_str)

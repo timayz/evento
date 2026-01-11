@@ -50,6 +50,49 @@ pub enum WriteError {
     SystemTime(#[from] std::time::SystemTimeError),
 }
 
+/// Trait for aggregate types.
+///
+/// Aggregates are the root entities in event sourcing. Each aggregate
+/// type has a unique identifier string used for event storage and routing.
+///
+/// This trait is typically derived using the `#[evento::aggregator]` macro.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// #[evento::aggregator("myapp/Account")]
+/// #[derive(Default)]
+/// pub struct Account {
+///     pub balance: i64,
+///     pub owner: String,
+/// }
+/// ```
+pub trait Aggregator: Default {
+    /// Returns the unique type identifier for this aggregate (e.g., "myapp/Account")
+    fn aggregator_type() -> &'static str;
+}
+
+/// Trait for event types.
+///
+/// Events represent state changes that have occurred. Each event type
+/// has a name and belongs to an aggregator type.
+///
+/// This trait is typically derived using the `#[evento::aggregator]` macro.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// #[evento::aggregator("myapp/Account")]
+/// #[derive(bitcode::Encode, bitcode::Decode)]
+/// pub struct AccountOpened {
+///     pub owner: String,
+/// }
+/// ```
+pub trait AggregatorEvent: Aggregator {
+    /// Returns the event name (e.g., "AccountOpened")
+    fn event_name() -> &'static str;
+}
+
 /// Builder for creating and committing events.
 ///
 /// Use [`create()`] or [`aggregator()`] to create an instance, then chain
@@ -130,7 +173,7 @@ impl AggregatorBuilder {
 
     pub fn event<D>(&mut self, v: &D) -> &mut Self
     where
-        D: crate::projection::Event + bitcode::Encode,
+        D: AggregatorEvent + bitcode::Encode,
     {
         self.data.push((D::event_name(), bitcode::encode(v)));
         self.aggregator_type = D::aggregator_type().to_owned();
@@ -138,26 +181,24 @@ impl AggregatorBuilder {
     }
 
     pub async fn commit<E: Executor>(&self, executor: &E) -> Result<String, WriteError> {
-        let (mut version, routing_key) = if self.original_version == 0 {
-            let events = executor
-                .read(
-                    Some(vec![ReadAggregator::id(
-                        &self.aggregator_type,
-                        &self.aggregator_id,
-                    )]),
-                    None,
-                    Args::backward(1, None),
-                )
-                .await
-                .map_err(WriteError::Unknown)?;
+        let first_event = executor
+            .read(
+                Some(vec![ReadAggregator::id(
+                    &self.aggregator_type,
+                    &self.aggregator_id,
+                )]),
+                None,
+                Args::forward(1, None),
+            )
+            .await
+            .map_err(WriteError::Unknown)?;
 
-            match events.edges.first() {
-                Some(event) => (event.node.version, event.node.routing_key.to_owned()),
-                _ => (self.original_version, self.routing_key.to_owned()),
-            }
-        } else {
-            (self.original_version, self.routing_key.to_owned())
+        let routing_key = match first_event.edges.first() {
+            Some(event) => event.node.routing_key.to_owned(),
+            _ => self.routing_key.to_owned(),
         };
+
+        let mut version = self.original_version;
 
         let metadata = self
             .metadata
