@@ -119,7 +119,7 @@ async fn handle_money_deposited(
 }
 
 // Register with a projection
-let result = Projection::<AccountBalanceView, _>::new::<BankAccount>("account-123")
+let result = Projection::<_, AccountBalanceView>::new::<BankAccount>("account-123")
     .handler(handle_money_deposited())
     .execute(&executor)
     .await?;

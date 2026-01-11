@@ -99,49 +99,37 @@ async fn change_user_email(
 ### 4. Build Projections to Load State
 
 ```rust
-use evento::{Executor, metadata::Event, projection::{Action, Projection}};
+use evento::{metadata::Event, projection::Projection};
 
-#[derive(Default)]
+#[evento::projection]
 pub struct UserView {
     pub name: String,
     pub email: String,
 }
 
 #[evento::handler]
-async fn on_user_created<E: Executor>(
+async fn on_user_created(
     event: Event<UserCreated>,
-    action: Action<'_, UserView, E>,
+    view: &mut UserView,
 ) -> anyhow::Result<()> {
-    match action {
-        Action::Apply(view) => {
-            view.name = event.data.name.clone();
-            view.email = event.data.email.clone();
-        }
-        Action::Handle(_context) => {
-            // Handle side effects here
-        }
-    };
+    view.name = event.data.name.clone();
+    view.email = event.data.email.clone();
     Ok(())
 }
 
 #[evento::handler]
-async fn on_email_changed<E: Executor>(
+async fn on_email_changed(
     event: Event<UserEmailChanged>,
-    action: Action<'_, UserView, E>,
+    view: &mut UserView,
 ) -> anyhow::Result<()> {
-    if let Action::Apply(view) = action {
-        view.email = event.data.email.clone();
-    }
+    view.email = event.data.email.clone();
     Ok(())
 }
 
 async fn get_user(executor: &evento::Sqlite, user_id: &str) -> anyhow::Result<Option<UserView>> {
-    let projection = Projection::<UserView, _>::new("users")
+    let result = Projection::<_, UserView>::new::<User>(user_id)
         .handler(on_user_created())
-        .handler(on_email_changed());
-
-    let result = projection
-        .load::<User>(user_id)
+        .handler(on_email_changed())
         .execute(executor)
         .await?;
 
@@ -153,12 +141,21 @@ async fn get_user(executor: &evento::Sqlite, user_id: &str) -> anyhow::Result<Op
 
 ```rust
 use std::time::Duration;
+use evento::{Executor, metadata::Event, subscription::{Context, SubscriptionBuilder}};
+
+#[evento::sub_handler]
+async fn on_user_created_subscription<E: Executor>(
+    _context: &Context<'_, E>,
+    event: Event<UserCreated>,
+) -> anyhow::Result<()> {
+    println!("User created: {}", event.data.name);
+    // Perform side effects: send emails, update read models, etc.
+    Ok(())
+}
 
 async fn setup_subscriptions(executor: evento::Sqlite) -> anyhow::Result<()> {
-    let subscription = Projection::<UserView, _>::new("user-processor")
-        .handler(on_user_created())
-        .handler(on_email_changed())
-        .subscription()
+    let subscription = SubscriptionBuilder::new("user-processor")
+        .handler(on_user_created_subscription())
         .routing_key("users")
         .chunk_size(100)
         .retry(5)
@@ -176,7 +173,7 @@ async fn setup_subscriptions(executor: evento::Sqlite) -> anyhow::Result<()> {
 ### 6. Complete Example with SQLite
 
 ```rust
-use evento::{Executor, metadata::{Event, Metadata}, projection::{Action, Projection}};
+use evento::{metadata::{Event, Metadata}, projection::Projection};
 use sqlx::SqlitePool;
 
 #[evento::aggregator]
@@ -185,32 +182,28 @@ pub enum User {
     UserEmailChanged { email: String },
 }
 
-#[derive(Default)]
+#[evento::projection]
 pub struct UserView {
     pub name: String,
     pub email: String,
 }
 
 #[evento::handler]
-async fn on_user_created<E: Executor>(
+async fn on_user_created(
     event: Event<UserCreated>,
-    action: Action<'_, UserView, E>,
+    view: &mut UserView,
 ) -> anyhow::Result<()> {
-    if let Action::Apply(view) = action {
-        view.name = event.data.name.clone();
-        view.email = event.data.email.clone();
-    }
+    view.name = event.data.name.clone();
+    view.email = event.data.email.clone();
     Ok(())
 }
 
 #[evento::handler]
-async fn on_email_changed<E: Executor>(
+async fn on_email_changed(
     event: Event<UserEmailChanged>,
-    action: Action<'_, UserView, E>,
+    view: &mut UserView,
 ) -> anyhow::Result<()> {
-    if let Action::Apply(view) = action {
-        view.email = event.data.email.clone();
-    }
+    view.email = event.data.email.clone();
     Ok(())
 }
 
@@ -238,12 +231,9 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     // Load the user via projection
-    let projection = Projection::<UserView, _>::new("users")
+    let user = Projection::<_, UserView>::new::<User>(&user_id)
         .handler(on_user_created())
-        .handler(on_email_changed());
-
-    let user = projection
-        .load::<User>(&user_id)
+        .handler(on_email_changed())
         .execute(&executor)
         .await?;
 

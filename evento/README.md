@@ -109,7 +109,7 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     // Build projection and load state
-    let result = Projection::<UserView, _>::new::<User>(&user_id)
+    let result = Projection::<_, UserView>::new::<User>(&user_id)
         .handler(on_user_created())
         .handler(on_email_changed())
         .execute(&executor)

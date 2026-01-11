@@ -80,7 +80,7 @@ let executor = Fjall::from_keyspace(keyspace)?;
 
 ```rust
 use evento_fjall::Fjall;
-use evento::{Executor, metadata::Event, projection::{Action, Projection}};
+use evento::{metadata::Event, projection::Projection};
 
 // Define events
 #[evento::aggregator]
@@ -88,29 +88,24 @@ pub enum User {
     UserCreated { name: String },
 }
 
-#[derive(Default)]
+#[evento::projection]
 struct UserView {
     name: String,
 }
 
 #[evento::handler]
-async fn on_user_created<E: Executor>(
+async fn on_user_created(
     event: Event<UserCreated>,
-    action: Action<'_, UserView, E>,
+    view: &mut UserView,
 ) -> anyhow::Result<()> {
-    if let Action::Apply(view) = action {
-        view.name = event.data.name.clone();
-    }
+    view.name = event.data.name.clone();
     Ok(())
 }
 
 let executor = Fjall::open("./events")?;
 
-let projection = Projection::<UserView, _>::new("users")
-    .handler(on_user_created());
-
-let result = projection
-    .load::<User>(&user_id)
+let result = Projection::<_, UserView>::new::<User>(&user_id)
+    .handler(on_user_created())
     .execute(&executor)
     .await?;
 ```

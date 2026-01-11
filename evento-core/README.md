@@ -111,7 +111,7 @@ async fn on_money_deposited(
 }
 
 // Load aggregate state
-let result = Projection::<AccountView, _>::new::<Account>("account-123")
+let result = Projection::<_, AccountView>::new::<Account>("account-123")
     .handler(on_account_opened())
     .handler(on_money_deposited())
     .execute(&executor)
