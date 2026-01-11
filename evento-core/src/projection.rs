@@ -74,20 +74,25 @@ pub struct Context<'a, E: Executor> {
     /// Reference to the executor for database operations
     pub executor: &'a E,
     pub id: String,
-    pub aggregators: &'a HashMap<String, String>,
+    revision: u16,
+    aggregator_type: String,
+    aggregators: &'a HashMap<String, String>,
 }
 
 impl<'a, E: Executor> Context<'a, E> {
-    pub async fn get_snapshot<A: Aggregator, D: bitcode::DecodeOwned + ProjectionCursor>(
+    pub async fn get_snapshot<D: bitcode::DecodeOwned + ProjectionCursor>(
         &self,
         id: impl Into<String>,
-        revision: u16,
     ) -> anyhow::Result<Option<D>> {
         let id = id.into();
 
         let Some((data, cursor)) = self
             .executor
-            .get_snapshot(A::aggregator_type().to_owned(), revision.to_string(), id)
+            .get_snapshot(
+                self.aggregator_type.to_owned(),
+                self.revision.to_string(),
+                id,
+            )
             .await?
         else {
             return Ok(None);
@@ -99,10 +104,9 @@ impl<'a, E: Executor> Context<'a, E> {
         Ok(Some(data))
     }
 
-    pub async fn take_snapshot<A: Aggregator, D: bitcode::Encode + ProjectionCursor>(
+    pub async fn take_snapshot<D: bitcode::Encode + ProjectionCursor>(
         &self,
         id: impl Into<String>,
-        revision: u16,
         data: &D,
     ) -> anyhow::Result<()> {
         let id = id.into();
@@ -111,13 +115,27 @@ impl<'a, E: Executor> Context<'a, E> {
 
         self.executor
             .save_snapshot(
-                A::aggregator_type().to_owned(),
-                revision.to_string(),
+                self.aggregator_type.to_owned(),
+                self.revision.to_string(),
                 id,
                 data,
                 cursor,
             )
             .await
+    }
+
+    pub async fn aggregator<A: Aggregator>(&self) -> String {
+        tracing::debug!(
+            "Failed to get `Aggregator id <{}>` For the Aggregator id extractor to work \
+        correctly, wrap the data with `Projection::new().aggregator::<MyAggregator>(id)`. \
+        Ensure that types align in both the set and retrieve calls.",
+            A::aggregator_type()
+        );
+
+        self.aggregators
+            .get(A::aggregator_type())
+            .expect("Projection Aggregator not configured correctly. View/enable debug logs for more details.")
+            .to_owned()
     }
 }
 
@@ -219,6 +237,18 @@ pub trait Snapshot<E: Executor>: ProjectionCursor + Sized {
     }
 }
 
+impl<T: bitcode::Encode + bitcode::DecodeOwned + ProjectionCursor + Send + Sync, E: Executor>
+    Snapshot<E> for T
+{
+    async fn restore(context: &Context<'_, E>) -> anyhow::Result<Option<Self>> {
+        context.get_snapshot(&context.id).await
+    }
+
+    async fn take_snapshot(&self, context: &Context<'_, E>) -> anyhow::Result<()> {
+        context.take_snapshot(&context.id, self).await
+    }
+}
+
 /// Builder for loading aggregate state from events.
 ///
 /// Created via [`Projection::load`], this builder configures how to
@@ -236,6 +266,8 @@ pub trait Snapshot<E: Executor>: ProjectionCursor + Sized {
 /// ```
 pub struct Projection<E: Executor, P: Default + 'static> {
     id: String,
+    aggregator_type: String,
+    revision: u16,
     aggregators: HashMap<String, String>,
     handlers: HashMap<String, Box<dyn Handler<P>>>,
     context: context::RwContext,
@@ -262,12 +294,20 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
 
         Projection {
             id,
+            aggregator_type: A::aggregator_type().to_owned(),
             aggregators,
             context: Default::default(),
             handlers: HashMap::new(),
             safety_disabled: true,
             executor: PhantomData,
+            revision: 0,
         }
+    }
+
+    pub fn revision(mut self, value: u16) -> Self {
+        self.revision = value;
+
+        self
     }
 
     pub fn safety_check(mut self) -> Self {
@@ -336,7 +376,9 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
             context: self.context.clone(),
             executor,
             id: self.id.to_owned(),
+            aggregator_type: self.aggregator_type.to_owned(),
             aggregators: &self.aggregators,
+            revision: self.revision,
         };
         let snapshot = P::restore(&context).await?;
         let cursor = snapshot.as_ref().map(|s| s.get_cursor());

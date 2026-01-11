@@ -1,8 +1,4 @@
-use evento::{
-    Executor,
-    metadata::Event,
-    projection::{Context, Projection},
-};
+use evento::{Executor, metadata::Event, projection::Projection};
 
 use crate::aggregator::{
     AccountOpened, BankAccount, MoneyDeposited, MoneyReceived, MoneyTransferred, MoneyWithdrawn,
@@ -24,18 +20,6 @@ pub struct AccountBalanceView {
     pub balance: i64,
     pub currency: String,
     pub available_balance: i64,
-}
-
-impl<E: Executor> evento::Snapshot<E> for AccountBalanceView {
-    async fn restore(context: &Context<'_, E>) -> anyhow::Result<Option<Self>> {
-        context.get_snapshot::<BankAccount, _>(&context.id, 0).await
-    }
-
-    async fn take_snapshot(&self, context: &Context<'_, E>) -> anyhow::Result<()> {
-        context
-            .take_snapshot::<BankAccount, _>(&context.id, 0, self)
-            .await
-    }
 }
 
 #[evento::handler]
