@@ -1,6 +1,10 @@
 use std::{collections::HashMap, sync::RwLock};
 
-use evento::{Executor, cursor, metadata::Event, projection::Projection};
+use evento::{
+    Executor, cursor,
+    metadata::Event,
+    projection::{Context, Projection},
+};
 use once_cell::sync::Lazy;
 
 use crate::{
@@ -15,7 +19,7 @@ use crate::{
 pub static ACCOUNT_DETAILS_ROWS: Lazy<RwLock<HashMap<String, AccountDetailsView>>> =
     Lazy::new(Default::default);
 
-pub fn create_projection(id: impl Into<String>) -> Projection<AccountDetailsView> {
+pub fn create_projection<E: Executor>(id: impl Into<String>) -> Projection<E, AccountDetailsView> {
     Projection::new::<BankAccount>(id)
         .handler(handle_money_deposit())
         .handler(handle_account_opened())
@@ -66,18 +70,14 @@ impl evento::ProjectionCursor for AccountDetailsView {
     }
 }
 
-impl evento::Snapshot for AccountDetailsView {
-    async fn restore(
-        _context: &evento::context::RwContext,
-        id: String,
-        _aggregators: &HashMap<String, String>,
-    ) -> anyhow::Result<Option<Self>> {
+impl<E: Executor> evento::Snapshot<E> for AccountDetailsView {
+    async fn restore(context: &Context<'_, E>) -> anyhow::Result<Option<Self>> {
         let rows = ACCOUNT_DETAILS_ROWS.read().unwrap();
 
-        Ok(rows.get(&id).cloned())
+        Ok(rows.get(&context.id).cloned())
     }
 
-    async fn take_snapshot(&self, _context: &evento::context::RwContext) -> anyhow::Result<()> {
+    async fn take_snapshot(&self, _context: &Context<'_, E>) -> anyhow::Result<()> {
         let mut rows = ACCOUNT_DETAILS_ROWS.write().unwrap();
         rows.insert(self.id.to_owned(), self.clone());
 

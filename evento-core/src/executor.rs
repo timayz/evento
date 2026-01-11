@@ -131,6 +131,22 @@ pub trait Executor: Send + Sync + 'static {
         routing_key: Option<RoutingKey>,
         args: Args,
     ) -> anyhow::Result<ReadResult<Event>>;
+
+    async fn get_snapshot(
+        &self,
+        aggregator_type: String,
+        aggregator_revision: String,
+        id: String,
+    ) -> anyhow::Result<Option<(Vec<u8>, Value)>>;
+
+    async fn save_snapshot(
+        &self,
+        aggregator_type: String,
+        aggregator_revision: String,
+        id: String,
+        data: Vec<u8>,
+        cursor: Value,
+    ) -> anyhow::Result<()>;
 }
 
 /// Type-erased wrapper around any [`Executor`] implementation.
@@ -184,6 +200,30 @@ impl Executor for Evento {
 
     async fn acknowledge(&self, key: String, cursor: Value, lag: u64) -> anyhow::Result<()> {
         self.0.acknowledge(key, cursor, lag).await
+    }
+
+    async fn get_snapshot(
+        &self,
+        aggregator_type: String,
+        aggregator_revision: String,
+        id: String,
+    ) -> anyhow::Result<Option<(Vec<u8>, Value)>> {
+        self.0
+            .get_snapshot(aggregator_type, aggregator_revision, id)
+            .await
+    }
+
+    async fn save_snapshot(
+        &self,
+        aggregator_type: String,
+        aggregator_revision: String,
+        id: String,
+        data: Vec<u8>,
+        cursor: Value,
+    ) -> anyhow::Result<()> {
+        self.0
+            .save_snapshot(aggregator_type, aggregator_revision, id, data, cursor)
+            .await
     }
 }
 
@@ -265,6 +305,30 @@ impl Executor for EventoGroup {
     async fn acknowledge(&self, key: String, cursor: Value, lag: u64) -> anyhow::Result<()> {
         self.first().acknowledge(key, cursor, lag).await
     }
+
+    async fn get_snapshot(
+        &self,
+        aggregator_type: String,
+        aggregator_revision: String,
+        id: String,
+    ) -> anyhow::Result<Option<(Vec<u8>, Value)>> {
+        self.first()
+            .get_snapshot(aggregator_type, aggregator_revision, id)
+            .await
+    }
+
+    async fn save_snapshot(
+        &self,
+        aggregator_type: String,
+        aggregator_revision: String,
+        id: String,
+        data: Vec<u8>,
+        cursor: Value,
+    ) -> anyhow::Result<()> {
+        self.first()
+            .save_snapshot(aggregator_type, aggregator_revision, id, data, cursor)
+            .await
+    }
 }
 
 /// Read-write split executor (requires `rw` feature).
@@ -323,6 +387,30 @@ impl<R: Executor, W: Executor> Executor for Rw<R, W> {
 
     async fn acknowledge(&self, key: String, cursor: Value, lag: u64) -> anyhow::Result<()> {
         self.w.acknowledge(key, cursor, lag).await
+    }
+
+    async fn get_snapshot(
+        &self,
+        aggregator_type: String,
+        aggregator_revision: String,
+        id: String,
+    ) -> anyhow::Result<Option<(Vec<u8>, Value)>> {
+        self.r
+            .get_snapshot(aggregator_type, aggregator_revision, id)
+            .await
+    }
+
+    async fn save_snapshot(
+        &self,
+        aggregator_type: String,
+        aggregator_revision: String,
+        id: String,
+        data: Vec<u8>,
+        cursor: Value,
+    ) -> anyhow::Result<()> {
+        self.w
+            .save_snapshot(aggregator_type, aggregator_revision, id, data, cursor)
+            .await
     }
 }
 

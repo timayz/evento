@@ -15,6 +15,7 @@ pub use change_daily_withdrawal_limit::*;
 pub use change_overdraft_limit::*;
 pub use close_account::*;
 pub use deposit_money::*;
+use evento::projection::Context;
 pub use freeze_account::*;
 pub use open_account::*;
 pub use receive_money::*;
@@ -92,7 +93,7 @@ impl BankAccount {
     }
 }
 
-fn create_projection(id: impl Into<String>) -> Projection<BankAccount> {
+fn create_projection<E: Executor>(id: impl Into<String>) -> Projection<E, BankAccount> {
     Projection::new::<crate::aggregator::BankAccount>(id)
         .handler(handle_money_deposit())
         .handler(handle_account_opened())
@@ -112,18 +113,14 @@ impl ProjectionAggregator for BankAccount {
     }
 }
 
-impl Snapshot for BankAccount {
-    async fn restore(
-        _context: &evento::context::RwContext,
-        id: String,
-        _aggregators: &HashMap<String, String>,
-    ) -> anyhow::Result<Option<Self>> {
+impl<E: Executor> Snapshot<E> for BankAccount {
+    async fn restore(context: &Context<'_, E>) -> anyhow::Result<Option<Self>> {
         let rows = COMMAND_ROWS.read().unwrap();
 
-        Ok(rows.get(&id).cloned())
+        Ok(rows.get(&context.id).cloned())
     }
 
-    async fn take_snapshot(&self, _context: &evento::context::RwContext) -> anyhow::Result<()> {
+    async fn take_snapshot(&self, _context: &Context<'_, E>) -> anyhow::Result<()> {
         let mut rows = COMMAND_ROWS.write().unwrap();
         rows.insert(self.id.to_owned(), self.clone());
 

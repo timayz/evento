@@ -37,13 +37,115 @@
 //!     .await?;
 //! ```
 
-use std::{collections::HashMap, future::Future, marker::PhantomData, pin::Pin};
+use std::{collections::HashMap, future::Future, marker::PhantomData, ops::Deref, pin::Pin};
 
 use crate::{
     context,
     cursor::{self, Args, Cursor},
     Aggregator, AggregatorBuilder, AggregatorEvent, Executor, ReadAggregator,
 };
+
+/// Handler context providing access to executor and shared data.
+///
+/// `Context` wraps an [`RwContext`](crate::context::RwContext) for type-safe
+/// data storage and provides access to the executor for database operations.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// #[evento::handler]
+/// async fn my_handler<E: Executor>(
+///     event: Event<MyEventData>,
+///     action: Action<'_, MyView, E>,
+/// ) -> anyhow::Result<()> {
+///     if let Action::Handle(ctx) = action {
+///         // Access shared data
+///         let config: Data<AppConfig> = ctx.extract();
+///
+///         // Use executor for queries
+///         let events = ctx.executor.read(...).await?;
+///     }
+///     Ok(())
+/// }
+/// ```
+#[derive(Clone)]
+pub struct Context<'a, E: Executor> {
+    context: context::RwContext,
+    /// Reference to the executor for database operations
+    pub executor: &'a E,
+    pub id: String,
+    revision: u16,
+    aggregator_type: String,
+    aggregators: &'a HashMap<String, String>,
+}
+
+impl<'a, E: Executor> Context<'a, E> {
+    pub async fn get_snapshot<D: bitcode::DecodeOwned + ProjectionCursor>(
+        &self,
+        id: impl Into<String>,
+    ) -> anyhow::Result<Option<D>> {
+        let id = id.into();
+
+        let Some((data, cursor)) = self
+            .executor
+            .get_snapshot(
+                self.aggregator_type.to_owned(),
+                self.revision.to_string(),
+                id,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        let mut data: D = bitcode::decode(&data)?;
+        data.set_cursor(&cursor);
+
+        Ok(Some(data))
+    }
+
+    pub async fn take_snapshot<D: bitcode::Encode + ProjectionCursor>(
+        &self,
+        id: impl Into<String>,
+        data: &D,
+    ) -> anyhow::Result<()> {
+        let id = id.into();
+        let cursor = data.get_cursor();
+        let data = bitcode::encode(data);
+
+        self.executor
+            .save_snapshot(
+                self.aggregator_type.to_owned(),
+                self.revision.to_string(),
+                id,
+                data,
+                cursor,
+            )
+            .await
+    }
+
+    pub async fn aggregator<A: Aggregator>(&self) -> String {
+        tracing::debug!(
+            "Failed to get `Aggregator id <{}>` For the Aggregator id extractor to work \
+        correctly, wrap the data with `Projection::new().aggregator::<MyAggregator>(id)`. \
+        Ensure that types align in both the set and retrieve calls.",
+            A::aggregator_type()
+        );
+
+        self.aggregators
+            .get(A::aggregator_type())
+            .expect("Projection Aggregator not configured correctly. View/enable debug logs for more details.")
+            .to_owned()
+    }
+}
+
+impl<'a, E: Executor> Deref for Context<'a, E> {
+    type Target = context::RwContext;
+
+    fn deref(&self) -> &Self::Target {
+        &self.context
+    }
+}
 
 /// Trait for event handlers.
 ///
@@ -117,23 +219,33 @@ pub trait ProjectionAggregator: ProjectionCursor {
 /// // The macro generates the restore implementation that loads
 /// // from a snapshot table if available
 /// ```
-pub trait Snapshot: ProjectionCursor + Sized {
+pub trait Snapshot<E: Executor>: ProjectionCursor + Sized {
     /// Restores state from a snapshot if available.
     ///
     /// Returns `None` if no snapshot exists for the given ID.
     fn restore(
-        _context: &context::RwContext,
-        _id: String,
-        _aggregators: &HashMap<String, String>,
+        _context: &Context<'_, E>,
     ) -> impl Future<Output = anyhow::Result<Option<Self>>> + Send {
         Box::pin(async { Ok(None) })
     }
 
     fn take_snapshot(
         &self,
-        _context: &context::RwContext,
+        _context: &Context<'_, E>,
     ) -> impl Future<Output = anyhow::Result<()>> + Send {
         Box::pin(async { Ok(()) })
+    }
+}
+
+impl<T: bitcode::Encode + bitcode::DecodeOwned + ProjectionCursor + Send + Sync, E: Executor>
+    Snapshot<E> for T
+{
+    async fn restore(context: &Context<'_, E>) -> anyhow::Result<Option<Self>> {
+        context.get_snapshot(&context.id).await
+    }
+
+    async fn take_snapshot(&self, context: &Context<'_, E>) -> anyhow::Result<()> {
+        context.take_snapshot(&context.id, self).await
     }
 }
 
@@ -152,15 +264,18 @@ pub trait Snapshot: ProjectionCursor + Sized {
 ///     .execute(&executor)
 ///     .await?;
 /// ```
-pub struct Projection<P: Snapshot + Default + 'static> {
+pub struct Projection<E: Executor, P: Default + 'static> {
     id: String,
+    aggregator_type: String,
+    revision: u16,
     aggregators: HashMap<String, String>,
     handlers: HashMap<String, Box<dyn Handler<P>>>,
     context: context::RwContext,
     safety_disabled: bool,
+    executor: PhantomData<E>,
 }
 
-impl<P: Snapshot + Default + 'static> Projection<P> {
+impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
     /// Creates a builder for loading aggregate state.
     ///
     /// This consumes the projection and returns a [`LoadBuilder`] configured
@@ -169,9 +284,9 @@ impl<P: Snapshot + Default + 'static> Projection<P> {
     /// # Type Parameters
     ///
     /// - `A`: The aggregate type to load
-    pub fn new<A: Aggregator>(id: impl Into<String>) -> Projection<P>
+    pub fn new<A: Aggregator>(id: impl Into<String>) -> Projection<E, P>
     where
-        P: Snapshot + Default,
+        P: Snapshot<E> + Default,
     {
         let id = id.into();
         let mut aggregators = HashMap::new();
@@ -179,11 +294,20 @@ impl<P: Snapshot + Default + 'static> Projection<P> {
 
         Projection {
             id,
+            aggregator_type: A::aggregator_type().to_owned(),
             aggregators,
             context: Default::default(),
             handlers: HashMap::new(),
             safety_disabled: true,
+            executor: PhantomData,
+            revision: 0,
         }
+    }
+
+    pub fn revision(mut self, value: u16) -> Self {
+        self.revision = value;
+
+        self
     }
 
     pub fn safety_check(mut self) -> Self {
@@ -247,9 +371,16 @@ impl<P: Snapshot + Default + 'static> Projection<P> {
     ///
     /// Returns `None` if no events exist for the aggregate.
     /// Returns `Err` if there are too many events to process in one batch.
-    pub async fn execute<E: Executor>(&self, executor: &E) -> anyhow::Result<Option<P>> {
-        let context = self.context.clone();
-        let snapshot = P::restore(&context, self.id.to_owned(), &self.aggregators).await?;
+    pub async fn execute(&self, executor: &E) -> anyhow::Result<Option<P>> {
+        let context = Context {
+            context: self.context.clone(),
+            executor,
+            id: self.id.to_owned(),
+            aggregator_type: self.aggregator_type.to_owned(),
+            aggregators: &self.aggregators,
+            revision: self.revision,
+        };
+        let snapshot = P::restore(&context).await?;
         let cursor = snapshot.as_ref().map(|s| s.get_cursor());
 
         let read_aggregators = self
