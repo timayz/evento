@@ -24,7 +24,6 @@
 //! ```
 
 use std::time::{SystemTime, UNIX_EPOCH};
-
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -293,4 +292,23 @@ pub fn create() -> AggregatorBuilder {
 /// ```
 pub fn aggregator(id: impl Into<String>) -> AggregatorBuilder {
     AggregatorBuilder::new(id)
+}
+
+pub async fn has_event<A: AggregatorEvent, E: Executor>(
+    executor: &E,
+    id: impl Into<String>,
+) -> anyhow::Result<bool> {
+    let result = executor
+        .read(
+            Some(vec![ReadAggregator::new(
+                A::aggregator_type(),
+                id,
+                A::event_name(),
+            )]),
+            None,
+            Args::backward(1, None),
+        )
+        .await?;
+
+    Ok(!result.edges.is_empty())
 }
