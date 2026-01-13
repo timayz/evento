@@ -24,7 +24,6 @@
 //! ```
 
 use std::time::{SystemTime, UNIX_EPOCH};
-
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -293,4 +292,35 @@ pub fn create() -> AggregatorBuilder {
 /// ```
 pub fn aggregator(id: impl Into<String>) -> AggregatorBuilder {
     AggregatorBuilder::new(id)
+}
+
+pub trait AggregatorExecutor<E: Executor> {
+    fn has_event<A: AggregatorEvent>(
+        &self,
+        id: impl Into<String>,
+    ) -> impl std::future::Future<Output = anyhow::Result<bool>> + Send;
+}
+
+impl<E: Executor> AggregatorExecutor<E> for E {
+    fn has_event<A: AggregatorEvent>(
+        &self,
+        id: impl Into<String>,
+    ) -> impl std::future::Future<Output = anyhow::Result<bool>> + Send {
+        let id = id.into();
+        Box::pin(async {
+            let result = self
+                .read(
+                    Some(vec![ReadAggregator::new(
+                        A::aggregator_type(),
+                        id,
+                        A::event_name(),
+                    )]),
+                    None,
+                    Args::backward(1, None),
+                )
+                .await?;
+
+            Ok(!result.edges.is_empty())
+        })
+    }
 }
