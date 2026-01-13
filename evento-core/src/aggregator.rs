@@ -294,21 +294,33 @@ pub fn aggregator(id: impl Into<String>) -> AggregatorBuilder {
     AggregatorBuilder::new(id)
 }
 
-pub async fn has_event<A: AggregatorEvent, E: Executor>(
-    executor: &E,
-    id: impl Into<String>,
-) -> anyhow::Result<bool> {
-    let result = executor
-        .read(
-            Some(vec![ReadAggregator::new(
-                A::aggregator_type(),
-                id,
-                A::event_name(),
-            )]),
-            None,
-            Args::backward(1, None),
-        )
-        .await?;
+pub trait AggregatorExecutor<E: Executor> {
+    fn has_event<A: AggregatorEvent>(
+        &self,
+        id: impl Into<String>,
+    ) -> impl std::future::Future<Output = anyhow::Result<bool>> + Send;
+}
 
-    Ok(!result.edges.is_empty())
+impl<E: Executor> AggregatorExecutor<E> for E {
+    fn has_event<A: AggregatorEvent>(
+        &self,
+        id: impl Into<String>,
+    ) -> impl std::future::Future<Output = anyhow::Result<bool>> + Send {
+        let id = id.into();
+        Box::pin(async {
+            let result = self
+                .read(
+                    Some(vec![ReadAggregator::new(
+                        A::aggregator_type(),
+                        id,
+                        A::event_name(),
+                    )]),
+                    None,
+                    Args::backward(1, None),
+                )
+                .await?;
+
+            Ok(!result.edges.is_empty())
+        })
+    }
 }
