@@ -36,7 +36,7 @@ base64 = "0.22"
 once_cell = "1"
 
 # Async runtime
-tokio = { version = "1.47", features = ["full"] }
+tokio = { version = "1.49", features = ["full"] }
 futures-util = "0.3"
 backon = "1.5"
 
@@ -47,14 +47,14 @@ ulid = { version = "1.2", features = ["serde"] }
 # Database
 sqlx = { version = "0.8" }
 sqlx_migrator = "0.18"
-sea-query = { version = "1.0.0-rc.27", default-features = false, features = ["derive", "audit"] }
-sea-query-sqlx = { version = "0.8.0-rc.10", features = ["runtime-tokio"] }
+sea-query = { version = "1.0.0-rc.29", default-features = false, features = ["derive", "audit"] }
+sea-query-sqlx = { version = "0.8.0-rc.11", features = ["runtime-tokio"] }
 fjall = "2.11"
 
 # Proc macro
 quote = "1.0"
 convert_case = "0.10"
-syn = { version = "2.0", features = ["full", "parsing", "extra-traits"] }
+syn = { version = "2.0.114", features = ["full", "parsing", "extra-traits"] }
 
 # Web
 axum = "0.8"
