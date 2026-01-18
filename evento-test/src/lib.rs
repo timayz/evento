@@ -1,10 +1,16 @@
+use std::collections::HashMap;
+
 use bank::aggregator::{BankAccount, Created, MoneyDeposited, NameChanged};
 use bank::{
     load_account_details, AccountStatus, AccountType, ChangeOverdraftLimit, CloseAccount,
     DepositMoney, FreezeAccount, OpenAccount, ReceiveMoney, TransferMoney, UnfreezeAccount,
     WithdrawMoney, ACCOUNT_DETAILS_ROWS, COMMAND_ROWS,
 };
-use evento::{cursor::Args, Aggregator, Event, Executor, ProjectionAggregator, ReadAggregator};
+use evento::cursor::{self, Order, ReadResult};
+use evento::Event;
+use evento::{cursor::Args, Aggregator, Executor, ProjectionAggregator, ReadAggregator};
+use rand::seq::IndexedRandom;
+use rand::Rng;
 use ulid::Ulid;
 
 async fn last_routing_key<E: Executor>(
@@ -483,10 +489,7 @@ pub async fn subscriber_running<E: Executor + Clone>(executor: &E) -> anyhow::Re
     Ok(())
 }
 
-pub async fn subscribe<E: Executor + Clone>(
-    executor: &E,
-    _events: Vec<Event>,
-) -> anyhow::Result<()> {
+pub async fn subscribe<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
     let cmd = bank::Command(executor.clone());
 
     // Create first account (Alice)
@@ -578,10 +581,7 @@ pub async fn subscribe<E: Executor + Clone>(
     Ok(())
 }
 
-pub async fn subscribe_routing_key<E: Executor + Clone>(
-    executor: &E,
-    _events: Vec<Event>,
-) -> anyhow::Result<()> {
+pub async fn subscribe_routing_key<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
     let cmd = bank::Command(executor.clone());
 
     // Create account with routing key "us-east-1"
@@ -683,10 +683,7 @@ pub async fn subscribe_routing_key<E: Executor + Clone>(
     Ok(())
 }
 
-pub async fn subscribe_default<E: Executor + Clone>(
-    executor: &E,
-    _events: Vec<Event>,
-) -> anyhow::Result<()> {
+pub async fn subscribe_default<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
     let cmd = bank::Command(executor.clone());
 
     // Create account WITHOUT routing key (default/None)
@@ -784,7 +781,6 @@ pub async fn subscribe_default<E: Executor + Clone>(
 
 pub async fn subscribe_multiple_aggregator<E: Executor + Clone>(
     executor: &E,
-    _events: Vec<Event>,
 ) -> anyhow::Result<()> {
     let cmd = bank::Command(executor.clone());
 
@@ -851,7 +847,6 @@ pub async fn subscribe_multiple_aggregator<E: Executor + Clone>(
 
 pub async fn subscribe_routing_key_multiple_aggregator<E: Executor + Clone>(
     executor: &E,
-    _events: Vec<Event>,
 ) -> anyhow::Result<()> {
     let cmd = bank::Command(executor.clone());
 
@@ -972,7 +967,6 @@ pub async fn subscribe_routing_key_multiple_aggregator<E: Executor + Clone>(
 
 pub async fn subscribe_default_multiple_aggregator<E: Executor + Clone>(
     executor: &E,
-    _events: Vec<Event>,
 ) -> anyhow::Result<()> {
     let cmd = bank::Command(executor.clone());
 
@@ -1093,10 +1087,7 @@ pub async fn subscribe_default_multiple_aggregator<E: Executor + Clone>(
 /// - ChangeOverdraftLimit
 /// - FreezeAccount / UnfreezeAccount
 /// - CloseAccount
-pub async fn all_commands<E: Executor + Clone>(
-    executor: &E,
-    _events: Vec<Event>,
-) -> anyhow::Result<()> {
+pub async fn all_commands<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
     let cmd = bank::Command(executor.clone());
 
     // =========================================================================
@@ -1533,4 +1524,83 @@ mod multiple {
 
         Ok(())
     }
+}
+
+pub fn assert_read_result(
+    args: Args,
+    order: Order,
+    data: Vec<Event>,
+    result: ReadResult<Event>,
+) -> anyhow::Result<()> {
+    let data = cursor::Reader::new(data)
+        .args(args)
+        .order(order)
+        .execute()?;
+
+    assert_eq!(result.page_info, data.page_info);
+    assert_eq!(result.edges, data.edges);
+
+    Ok(())
+}
+
+pub fn get_data() -> Vec<Event> {
+    let aggregator_ids = [
+        Ulid::new().to_string(),
+        Ulid::new().to_string(),
+        Ulid::new().to_string(),
+        Ulid::new().to_string(),
+        Ulid::new().to_string(),
+    ];
+
+    let aggregator_types = ["evento/Calcul", "evento/MyCalcul"];
+
+    let routing_keys = [
+        Some("us-east-1".to_owned()),
+        Some("eu-west-3".to_owned()),
+        None,
+    ];
+
+    let timestamps: Vec<u16> = vec![rand::random(), rand::random(), rand::random()];
+    let mut versions: HashMap<String, u16> = HashMap::new();
+    let mut data = vec![];
+
+    for _ in 0..10 {
+        let mut rng = rand::rng();
+        let aggregator_id = aggregator_ids
+            .choose(&mut rng)
+            .cloned()
+            .unwrap_or_else(|| Ulid::new().to_string());
+
+        let routing_key = routing_keys.choose(&mut rng).cloned().unwrap_or(None);
+        let aggregator_type = aggregator_types
+            .choose(&mut rng)
+            .cloned()
+            .unwrap_or("Calcul");
+        let version = versions.entry(aggregator_id.to_owned()).or_default();
+        let timestamp = if rng.random_range(0..100) < 20 {
+            timestamps.choose(&mut rng).cloned()
+        } else {
+            None
+        }
+        .unwrap_or_else(|| rng.random()) as u64;
+
+        let event = Event {
+            id: Ulid::new(),
+            name: "MessageSent".to_owned(),
+            aggregator_id,
+            aggregator_type: aggregator_type.to_owned(),
+            version: *version,
+            routing_key,
+            timestamp: timestamp as u64,
+            timestamp_subsec: 0,
+            data: Default::default(),
+            metadata: Default::default(),
+        };
+
+        data.push(event);
+
+        *version += 1;
+    }
+
+    data
 }

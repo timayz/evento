@@ -291,37 +291,3 @@ impl cursor::Bind for Event {
         });
     }
 }
-
-#[cfg(any(feature = "sqlite", feature = "mysql", feature = "postgres"))]
-impl<R: sqlx::Row> sqlx::FromRow<'_, R> for Event
-where
-    i32: sqlx::Type<R::Database> + for<'r> sqlx::Decode<'r, R::Database>,
-    Vec<u8>: sqlx::Type<R::Database> + for<'r> sqlx::Decode<'r, R::Database>,
-    String: sqlx::Type<R::Database> + for<'r> sqlx::Decode<'r, R::Database>,
-    i64: sqlx::Type<R::Database> + for<'r> sqlx::Decode<'r, R::Database>,
-    for<'r> &'r str: sqlx::Type<R::Database> + sqlx::Decode<'r, R::Database>,
-    for<'r> &'r str: sqlx::ColumnIndex<R>,
-{
-    fn from_row(row: &R) -> Result<Self, sqlx::Error> {
-        let timestamp: i64 = sqlx::Row::try_get(row, "timestamp")?;
-        let timestamp_subsec: i64 = sqlx::Row::try_get(row, "timestamp_subsec")?;
-        let version: i32 = sqlx::Row::try_get(row, "version")?;
-        let metadata: Vec<u8> = sqlx::Row::try_get(row, "metadata")?;
-        let metadata: Metadata =
-            bitcode::decode(&metadata).map_err(|e| sqlx::Error::Decode(e.into()))?;
-
-        Ok(Event {
-            id: Ulid::from_string(sqlx::Row::try_get(row, "id")?)
-                .map_err(|err| sqlx::Error::InvalidArgument(err.to_string()))?,
-            aggregator_id: sqlx::Row::try_get(row, "aggregator_id")?,
-            aggregator_type: sqlx::Row::try_get(row, "aggregator_type")?,
-            version: version as u16,
-            name: sqlx::Row::try_get(row, "name")?,
-            routing_key: sqlx::Row::try_get(row, "routing_key")?,
-            data: sqlx::Row::try_get(row, "data")?,
-            timestamp: timestamp as u64,
-            timestamp_subsec: timestamp_subsec as u32,
-            metadata,
-        })
-    }
-}

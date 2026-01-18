@@ -22,13 +22,15 @@ tracing.workspace = true
 base64.workspace = true
 backon.workspace = true
 futures-util = { workspace = true, optional = true }
-sqlx = { workspace = true, optional = true }
+
+[dev-dependencies]
+rand.workspace = true
 
 [features]
 default = ["macro"]
 macro = ["evento-macro"]
 group = ["futures-util"]
 rw = []
-sqlite = ["sqlx/sqlite"]
-mysql = ["sqlx/mysql"]
-postgres = ["sqlx/postgres"]
+sqlite = []
+mysql = []
+postgres = []
