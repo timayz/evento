@@ -3,6 +3,7 @@ resolver = "2"
 
 members = [
     "./evento",
+    "./evento-test",
     "./evento-core",
     "./evento-sql",
     "./evento-sql-migrator",
@@ -19,6 +20,7 @@ repository = "https://github.com/timayz/evento"
 [workspace.dependencies]
 # Internal crates
 evento = { path = "./evento" }
+evento-test = { path = "./evento-test" }
 evento-core = { path = "./evento-core" }
 evento-sql = { path = "./evento-sql" }
 evento-sql-migrator = { path = "./evento-sql-migrator" }

@@ -1,0 +1,17 @@
+[package]
+name = "evento-test"
+version = "2.0.0-alpha.10"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Event sourcing and CQRS toolkit with SQL persistence, projections, and subscriptions"
+documentation = "https://docs.rs/evento"
+readme = "README.md"
+
+[dependencies]
+evento = { path = "../evento" }
+bank = { path = "../examples/bank" }
+ulid.workspace = true
+rand.workspace = true
+anyhow.workspace = true
+once_cell.workspace = true

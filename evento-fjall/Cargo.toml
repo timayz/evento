@@ -20,3 +20,4 @@ fjall.workspace = true
 
 [dev-dependencies]
 tempfile = "3.24"
+evento-test = { path = "../evento-test" }

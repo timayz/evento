@@ -1,4 +1,4 @@
-use evento::{
+use evento_core::{
     cursor::{self, Args, Cursor, Edge, Order, PageInfo, ReadResult, Reader},
     Event,
 };
