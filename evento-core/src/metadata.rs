@@ -28,28 +28,21 @@
 //!     .await?;
 //! ```
 
-use crate::EventData;
-
+use std::{collections::HashMap, ops::Deref};
 use thiserror::Error;
 use ulid::Ulid;
+
+const REQUESTED_BY: &str = "REQUESTED_BY";
+const REQUESTED_AS: &str = "REQUESTED_AS";
 
 /// Errors when accessing metadata fields.
 #[derive(Debug, Error)]
 pub enum MetadataError {
-    /// User information not available (anonymous metadata)
-    #[error("User not found")]
+    #[error("not found")]
     NotFound,
-}
 
-/// User identification for event metadata.
-#[derive(Clone, bitcode::Encode, bitcode::Decode)]
-pub enum MetadataUser {
-    /// Anonymous/system action
-    Anonyme,
-    /// Action by a specific user
-    User(String),
-    /// Action by a root user on behalf of another (root_id, user_id)
-    Root(String, String),
+    #[error("decode: {0}")]
+    Decode(#[from] bitcode::Error),
 }
 
 /// Standard event metadata.
@@ -60,40 +53,48 @@ pub enum MetadataUser {
 pub struct Metadata {
     /// Unique metadata ID (ULID)
     pub id: String,
-    /// User who triggered the event
-    pub user: MetadataUser,
+    meta: HashMap<String, Vec<u8>>,
 }
 
 impl Metadata {
-    /// Creates metadata for a user action.
-    pub fn new(user_id: impl Into<String>) -> Self {
-        let user_id = user_id.into();
+    pub(crate) fn insert_enc<V: bitcode::Encode>(
+        &mut self,
+        key: impl Into<String>,
+        value: &V,
+    ) -> &mut Self {
+        self.meta.insert(key.into(), bitcode::encode(value));
 
-        Self {
-            user: MetadataUser::User(user_id),
-            ..Default::default()
-        }
+        self
     }
 
-    /// Creates metadata for a root/admin action on behalf of a user.
-    pub fn root(user_id: impl Into<String>, root_id: impl Into<String>) -> Self {
-        let user_id = user_id.into();
-        let root_id = root_id.into();
+    pub fn try_get<D: bitcode::DecodeOwned>(&self, key: &str) -> Result<D, MetadataError> {
+        let Some(value) = self.meta.get(key) else {
+            return Err(MetadataError::NotFound);
+        };
 
-        Self {
-            user: MetadataUser::Root(user_id, root_id),
-            ..Default::default()
-        }
+        Ok(bitcode::decode(value)?)
     }
 
-    /// Gets the user ID from the metadata.
-    ///
-    /// Returns `MetadataError::NotFound` for anonymous metadata.
-    pub fn user(&self) -> Result<String, MetadataError> {
-        match self.user.to_owned() {
-            MetadataUser::User(id) | MetadataUser::Root(_, id) => Ok(id),
-            _ => Err(MetadataError::NotFound),
-        }
+    pub fn set_requested_as(&mut self, value: impl Into<String>) -> &mut Self {
+        let value = value.into();
+        self.insert_enc(REQUESTED_AS, &value);
+
+        self
+    }
+
+    pub fn requested_as(&self) -> Result<String, MetadataError> {
+        self.try_get(REQUESTED_AS)
+    }
+
+    pub fn set_requested_by(&mut self, value: impl Into<String>) -> &mut Self {
+        let value = value.into();
+        self.insert_enc(REQUESTED_BY, &value);
+
+        self
+    }
+
+    pub fn requested_by(&self) -> Result<String, MetadataError> {
+        self.try_get(REQUESTED_BY)
     }
 }
 
@@ -101,34 +102,21 @@ impl Default for Metadata {
     fn default() -> Self {
         Self {
             id: Ulid::new().to_string(),
-            user: MetadataUser::Anonyme,
+            meta: Default::default(),
         }
     }
 }
 
-/// Type alias for events with standard [`Metadata`].
-///
-/// This is the recommended event type for most applications.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// use evento::metadata::Event;
-///
-/// #[evento::handler]
-/// async fn handle_event<E: Executor>(
-///     event: Event<MyEventData>,
-///     action: Action<'_, MyView, E>,
-/// ) -> anyhow::Result<()> {
-///     // Access event data
-///     println!("Amount: {}", event.data.amount);
-///
-///     // Access metadata
-///     if let Ok(user_id) = event.metadata.user() {
-///         println!("User: {}", user_id);
-///     }
-///
-///     Ok(())
-/// }
-/// ```
-pub type Event<D> = EventData<D, Metadata>;
+impl Deref for Metadata {
+    type Target = HashMap<String, Vec<u8>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.meta
+    }
+}
+
+impl From<&Metadata> for Metadata {
+    fn from(value: &Metadata) -> Self {
+        value.clone()
+    }
+}
