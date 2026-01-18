@@ -145,10 +145,10 @@ pub use aggregator::*;
 pub use executor::*;
 pub use subscription::RoutingKey;
 
-use std::{fmt::Debug, marker::PhantomData, ops::Deref};
+use std::fmt::Debug;
 use ulid::Ulid;
 
-use crate::cursor::Cursor;
+use crate::{cursor::Cursor, metadata::Metadata};
 
 /// Cursor data for event pagination.
 ///
@@ -206,7 +206,7 @@ pub struct Event {
     /// Serialized event data (bitcode format)
     pub data: Vec<u8>,
     /// Serialized event metadata (bitcode format)
-    pub metadata: Vec<u8>,
+    pub metadata: Metadata,
     /// Unix timestamp when the event occurred (seconds)
     pub timestamp: u64,
     /// Sub-second precision (milliseconds)
@@ -306,6 +306,9 @@ where
         let timestamp: i64 = sqlx::Row::try_get(row, "timestamp")?;
         let timestamp_subsec: i64 = sqlx::Row::try_get(row, "timestamp_subsec")?;
         let version: i32 = sqlx::Row::try_get(row, "version")?;
+        let metadata: Vec<u8> = sqlx::Row::try_get(row, "metadata")?;
+        let metadata: Metadata =
+            bitcode::decode(&metadata).map_err(|e| sqlx::Error::Decode(e.into()))?;
 
         Ok(Event {
             id: Ulid::from_string(sqlx::Row::try_get(row, "id")?)
@@ -316,89 +319,9 @@ where
             name: sqlx::Row::try_get(row, "name")?,
             routing_key: sqlx::Row::try_get(row, "routing_key")?,
             data: sqlx::Row::try_get(row, "data")?,
-            metadata: sqlx::Row::try_get(row, "metadata")?,
             timestamp: timestamp as u64,
             timestamp_subsec: timestamp_subsec as u32,
-        })
-    }
-}
-
-/// Typed event with deserialized data and metadata.
-///
-/// `EventData` wraps a raw [`Event`](crate::Event) and provides typed access
-/// to the deserialized event data and metadata. It implements `Deref` to
-/// provide access to the underlying event fields (id, timestamp, version, etc.).
-///
-/// # Type Parameters
-///
-/// - `D`: The event data type (e.g., `AccountOpened`)
-/// - `M`: The metadata type (defaults to `bool` for no metadata)
-///
-/// # Example
-///
-/// ```rust,ignore
-/// use evento::metadata::Event;
-///
-/// #[evento::handler]
-/// async fn handle_deposit<E: Executor>(
-///     event: Event<MoneyDeposited>,
-///     action: Action<'_, AccountView, E>,
-/// ) -> anyhow::Result<()> {
-///     // Access typed data
-///     println!("Amount: {}", event.data.amount);
-///
-///     // Access metadata
-///     if let Ok(user) = event.metadata.user() {
-///         println!("By user: {}", user);
-///     }
-///
-///     // Access underlying event fields via Deref
-///     println!("Event ID: {}", event.id);
-///     println!("Version: {}", event.version);
-///
-///     Ok(())
-/// }
-/// ```
-pub struct EventData<D, M = bool> {
-    event: Event,
-    /// The typed event data
-    pub data: D,
-    /// The typed event metadata
-    pub metadata: M,
-}
-
-impl<D, M> Deref for EventData<D, M> {
-    type Target = Event;
-
-    fn deref(&self) -> &Self::Target {
-        &self.event
-    }
-}
-
-impl<D, M> TryFrom<&Event> for EventData<D, M>
-where
-    D: bitcode::DecodeOwned,
-    M: bitcode::DecodeOwned,
-{
-    type Error = bitcode::Error;
-
-    fn try_from(value: &Event) -> Result<Self, Self::Error> {
-        let data = bitcode::decode::<D>(&value.data)?;
-        let metadata = bitcode::decode::<M>(&value.metadata)?;
-        Ok(EventData {
-            data,
             metadata,
-            event: value.clone(),
         })
-    }
-}
-
-pub struct SkipEventData<D>(pub Event, pub PhantomData<D>);
-
-impl<D> Deref for SkipEventData<D> {
-    type Target = Event;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
     }
 }

@@ -1,4 +1,4 @@
-use evento::{Executor, metadata::Metadata, projection::ProjectionAggregator};
+use evento::{Executor, projection::ProjectionAggregator};
 
 use crate::{aggregator::MoneyReceived, error::BankAccountError, value_object::AccountStatus};
 
@@ -38,7 +38,6 @@ impl<E: Executor> super::Command<E> {
                 transaction_id: cmd.transaction_id,
                 description: cmd.description,
             })
-            .metadata(&Metadata::default())
             .commit(&self.0)
             .await?;
 

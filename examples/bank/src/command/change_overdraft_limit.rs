@@ -1,4 +1,4 @@
-use evento::{Executor, metadata::Metadata, projection::ProjectionAggregator};
+use evento::{Executor, projection::ProjectionAggregator};
 
 use crate::{
     aggregator::OverdraftLimitChanged, error::BankAccountError, value_object::AccountStatus,
@@ -33,7 +33,6 @@ impl<E: Executor> super::Command<E> {
             .event(&OverdraftLimitChanged {
                 new_limit: cmd.new_limit,
             })
-            .metadata(&Metadata::default())
             .commit(&self.0)
             .await?;
 
