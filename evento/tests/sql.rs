@@ -689,11 +689,12 @@ where
         .to_owned();
 
     for event in data.clone() {
+        let metadata = bitcode::encode(&event.metadata);
         statement.values_panic([
             event.id.to_string().into(),
             event.name.into(),
             event.data.into(),
-            event.metadata.into(),
+            metadata.into(),
             event.aggregator_type.into(),
             event.aggregator_id.to_string().into(),
             event.version.into(),

@@ -1,4 +1,4 @@
-use evento::{Executor, metadata::Metadata};
+use evento::Executor;
 
 use crate::{aggregator::AccountOpened, error::BankAccountError, value_object::AccountType};
 
@@ -36,7 +36,6 @@ impl<E: Executor> super::Command<E> {
                 currency: cmd.currency,
                 initial_balance: cmd.initial_balance,
             })
-            .metadata(&Metadata::default())
             .commit(&self.0)
             .await?)
     }
@@ -68,7 +67,6 @@ impl<E: Executor> super::Command<E> {
                 currency: cmd.currency,
                 initial_balance: cmd.initial_balance,
             })
-            .metadata(&Metadata::default())
             .commit(&self.0)
             .await?)
     }

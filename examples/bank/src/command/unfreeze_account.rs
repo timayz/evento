@@ -1,4 +1,4 @@
-use evento::{Executor, metadata::Metadata, projection::ProjectionAggregator};
+use evento::{Executor, projection::ProjectionAggregator};
 
 use crate::{aggregator::AccountUnfrozen, error::BankAccountError, value_object::AccountStatus};
 
@@ -29,7 +29,6 @@ impl<E: Executor> super::Command<E> {
             .aggregator()
             .unwrap()
             .event(&AccountUnfrozen { reason: cmd.reason })
-            .metadata(&Metadata::default())
             .commit(&self.0)
             .await?;
 

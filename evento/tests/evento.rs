@@ -4,10 +4,7 @@ use bank::{
     DepositMoney, FreezeAccount, OpenAccount, ReceiveMoney, TransferMoney, UnfreezeAccount,
     WithdrawMoney, ACCOUNT_DETAILS_ROWS, COMMAND_ROWS,
 };
-use evento::{
-    cursor::Args, metadata::Metadata, Aggregator, Event, Executor, ProjectionAggregator,
-    ReadAggregator,
-};
+use evento::{cursor::Args, Aggregator, Event, Executor, ProjectionAggregator, ReadAggregator};
 use ulid::Ulid;
 
 async fn last_routing_key<E: Executor>(
@@ -263,7 +260,6 @@ pub async fn load_multiple_aggregator<E: Executor + Clone>(executor: &E) -> anyh
         .event(&Created {
             name: "John Doe".to_owned(),
         })
-        .metadata(&Metadata::default())
         .commit(executor)
         .await?;
 
@@ -304,7 +300,6 @@ pub async fn load_multiple_aggregator<E: Executor + Clone>(executor: &E) -> anyh
         .event(&NameChanged {
             value: "John Smith".to_owned(),
         })
-        .metadata(&Metadata::default())
         .commit(executor)
         .await?;
 
@@ -450,7 +445,6 @@ pub async fn invalid_original_version<E: Executor + Clone>(executor: &E) -> anyh
             transaction_id: Ulid::new().to_string(),
             description: "Second deposit (should fail)".to_owned(),
         })
-        .metadata(&Metadata::default())
         .commit(executor)
         .await;
 
@@ -799,7 +793,6 @@ pub async fn subscribe_multiple_aggregator<E: Executor + Clone>(
         .event(&Created {
             name: "John Doe".to_owned(),
         })
-        .metadata(&Metadata::default())
         .commit(executor)
         .await?;
 
@@ -831,7 +824,6 @@ pub async fn subscribe_multiple_aggregator<E: Executor + Clone>(
         .event(&NameChanged {
             value: "John Smith".to_owned(),
         })
-        .metadata(&Metadata::default())
         .commit(executor)
         .await?;
 
@@ -869,7 +861,6 @@ pub async fn subscribe_routing_key_multiple_aggregator<E: Executor + Clone>(
         .event(&Created {
             name: "US Owner".to_owned(),
         })
-        .metadata(&Metadata::default())
         .commit(executor)
         .await?;
 
@@ -879,7 +870,6 @@ pub async fn subscribe_routing_key_multiple_aggregator<E: Executor + Clone>(
         .event(&Created {
             name: "EU Owner".to_owned(),
         })
-        .metadata(&Metadata::default())
         .commit(executor)
         .await?;
 
@@ -918,7 +908,6 @@ pub async fn subscribe_routing_key_multiple_aggregator<E: Executor + Clone>(
         .event(&NameChanged {
             value: "US Owner Updated".to_owned(),
         })
-        .metadata(&Metadata::default())
         .commit(executor)
         .await?;
 
@@ -929,7 +918,6 @@ pub async fn subscribe_routing_key_multiple_aggregator<E: Executor + Clone>(
         .event(&NameChanged {
             value: "EU Owner Updated".to_owned(),
         })
-        .metadata(&Metadata::default())
         .commit(executor)
         .await?;
 
@@ -993,7 +981,6 @@ pub async fn subscribe_default_multiple_aggregator<E: Executor + Clone>(
         .event(&Created {
             name: "Default Owner".to_owned(),
         })
-        .metadata(&Metadata::default())
         .commit(executor)
         .await?;
 
@@ -1003,7 +990,6 @@ pub async fn subscribe_default_multiple_aggregator<E: Executor + Clone>(
         .event(&Created {
             name: "Routed Owner".to_owned(),
         })
-        .metadata(&Metadata::default())
         .commit(executor)
         .await?;
 
@@ -1038,7 +1024,6 @@ pub async fn subscribe_default_multiple_aggregator<E: Executor + Clone>(
         .event(&NameChanged {
             value: "Default Owner Updated".to_owned(),
         })
-        .metadata(&Metadata::default())
         .commit(executor)
         .await?;
 
@@ -1049,7 +1034,6 @@ pub async fn subscribe_default_multiple_aggregator<E: Executor + Clone>(
         .event(&NameChanged {
             value: "Routed Owner Updated".to_owned(),
         })
-        .metadata(&Metadata::default())
         .commit(executor)
         .await?;
 

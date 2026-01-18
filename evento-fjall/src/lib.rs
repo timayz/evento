@@ -54,6 +54,7 @@ use std::path::Path;
 
 use evento_core::{
     cursor::{Args, Cursor, ReadResult, Value},
+    metadata::Metadata,
     Event, Executor, ReadAggregator, RoutingKey, WriteError,
 };
 use fjall::{Config, Keyspace, Partition, PartitionCreateOptions, PersistMode};
@@ -77,7 +78,7 @@ struct StoredEvent {
     name: String,
     routing_key: Option<String>,
     data: Vec<u8>,
-    metadata: Vec<u8>,
+    metadata: Metadata,
     timestamp: u64,
     timestamp_subsec: u32,
 }
@@ -630,7 +631,7 @@ mod tests {
             name: name.to_string(),
             routing_key: Some("test-routing".to_string()),
             data: vec![1, 2, 3],
-            metadata: vec![4, 5, 6],
+            metadata: Metadata::default(),
             timestamp: now.as_secs(),
             timestamp_subsec: now.subsec_millis(),
         }

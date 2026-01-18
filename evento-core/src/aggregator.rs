@@ -27,7 +27,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::{cursor::Args, Event, Executor, ReadAggregator};
+use crate::{cursor::Args, metadata::Metadata, Event, Executor, ReadAggregator};
 
 /// Errors that can occur when writing events.
 #[derive(Debug, Error)]
@@ -127,7 +127,7 @@ pub struct AggregatorBuilder {
     routing_key_locked: bool,
     original_version: u16,
     data: Vec<(&'static str, Vec<u8>)>,
-    metadata: Option<Vec<u8>>,
+    metadata: Metadata,
 }
 
 impl AggregatorBuilder {
@@ -140,7 +140,7 @@ impl AggregatorBuilder {
             routing_key_locked: false,
             original_version: 0,
             data: Vec::default(),
-            metadata: None,
+            metadata: Default::default(),
         }
     }
 
@@ -178,11 +178,29 @@ impl AggregatorBuilder {
     /// Sets the metadata to attach to all events.
     ///
     /// Metadata is serialized using bitcode and stored alongside each event.
-    pub fn metadata<M>(&mut self, v: &M) -> &mut Self
+    pub fn metadata<M>(&mut self, key: impl Into<String>, value: &M) -> &mut Self
     where
         M: bitcode::Encode,
     {
-        self.metadata = Some(bitcode::encode(v));
+        self.metadata.insert_enc(key, value);
+        self
+    }
+
+    pub fn requested_by(&mut self, value: impl Into<String>) -> &mut Self {
+        self.metadata.set_requested_by(value);
+        self
+    }
+
+    pub fn requested_as(&mut self, value: impl Into<String>) -> &mut Self {
+        self.metadata.set_requested_as(value);
+        self
+    }
+
+    /// Sets the metadata to attach to all events.
+    ///
+    /// Metadata is serialized using bitcode and stored alongside each event.
+    pub fn metadata_from(&mut self, value: impl Into<Metadata>) -> &mut Self {
+        self.metadata = value.into();
         self
     }
 
@@ -227,12 +245,6 @@ impl AggregatorBuilder {
         };
 
         let mut version = self.original_version;
-
-        let metadata = self
-            .metadata
-            .to_owned()
-            .unwrap_or_else(|| bitcode::encode(&true));
-
         let mut events = vec![];
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
 
@@ -243,7 +255,7 @@ impl AggregatorBuilder {
                 id: Ulid::new(),
                 name: name.to_string(),
                 data: data.to_vec(),
-                metadata: metadata.to_vec(),
+                metadata: self.metadata.clone(),
                 timestamp: now.as_secs(),
                 timestamp_subsec: now.subsec_millis(),
                 aggregator_id: self.aggregator_id.to_owned(),
