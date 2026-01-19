@@ -36,7 +36,7 @@ pub fn handler_next_impl(input: &ItemFn, debug: bool) -> syn::Result<TokenStream
             ) -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = ::anyhow::Result<()>> + Send + 'a>> {
                 Box::pin(async move {
                     let event = ::evento::metadata::RawEvent(event.clone(), ::std::marker::PhantomData);
-                    Self::#fn_name(context, event.clone()).await
+                    Self::#fn_name(context, event).await
                 })
             }
 
