@@ -605,16 +605,6 @@ impl Subscription {
     }
 }
 
-pub struct SkipEventData<D>(pub crate::Event, pub PhantomData<D>);
-
-impl<D> Deref for SkipEventData<D> {
-    type Target = crate::Event;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
 struct SkipHandler<E: AggregatorEvent>(PhantomData<E>);
 
 impl<E: Executor, EV: AggregatorEvent + Send + Sync> Handler<E> for SkipHandler<EV> {

@@ -28,7 +28,7 @@
 //!     .await?;
 //! ```
 
-use std::{collections::HashMap, ops::Deref};
+use std::{collections::HashMap, marker::PhantomData, ops::Deref};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -183,5 +183,15 @@ where
             data,
             event: value.clone(),
         })
+    }
+}
+
+pub struct RawEvent<D>(pub crate::Event, pub PhantomData<D>);
+
+impl<D> Deref for RawEvent<D> {
+    type Target = crate::Event;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
