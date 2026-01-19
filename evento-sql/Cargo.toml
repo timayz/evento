@@ -1,6 +1,6 @@
 [package]
 name = "evento-sql"
-version = "2.0.0-alpha.10"
+version = "2.0.0-alpha.11"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -10,7 +10,7 @@ documentation = "https://docs.rs/evento-sql"
 readme = "README.md"
 
 [dependencies]
-evento-core = { path = "../evento-core", version = "2.0.0-alpha.10" }
+evento-core = { path = "../evento-core", version = "2.0.0-alpha.11" }
 anyhow.workspace = true
 bitcode.workspace = true
 async-trait.workspace = true
@@ -23,9 +23,7 @@ sea-query-sqlx.workspace = true
 evento = { workspace = true, features = ["sql"] }
 tokio.workspace = true
 evento-test.workspace = true
-# evento-sql-migrator = { path = "../evento-sql-migrator" }
 sqlx_migrator.workspace = true
-
 
 [features]
 default = ["sqlite", "mysql", "postgres"]
