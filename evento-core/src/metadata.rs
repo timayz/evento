@@ -163,6 +163,12 @@ pub struct Event<D> {
     pub data: D,
 }
 
+impl Event<bool> {
+    pub fn new(event: crate::Event) -> Self {
+        Self { event, data: false }
+    }
+}
+
 impl<D> Deref for Event<D> {
     type Target = crate::Event;
 
