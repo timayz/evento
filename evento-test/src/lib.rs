@@ -1403,7 +1403,7 @@ mod simple {
             .handler(handle_account_closed())
     }
 
-    #[evento::sub_handler]
+    #[evento::subscription]
     async fn handle_account_opened<E: Executor>(
         _context: &Context<'_, E>,
         event: Event<AccountOpened>,
@@ -1419,7 +1419,7 @@ mod simple {
         Ok(())
     }
 
-    #[evento::sub_handler]
+    #[evento::subscription]
     async fn handle_account_frozen<E: Executor>(
         _context: &Context<'_, E>,
         event: Event<AccountFrozen>,
@@ -1435,7 +1435,7 @@ mod simple {
         Ok(())
     }
 
-    #[evento::sub_handler]
+    #[evento::subscription]
     async fn handle_account_closed<E: Executor>(
         _context: &Context<'_, E>,
         event: Event<AccountClosed>,
@@ -1480,7 +1480,7 @@ mod multiple {
             .handler(handle_owned_name_chaged())
     }
 
-    #[evento::sub_handler]
+    #[evento::subscription]
     async fn handle_account_opened<E: Executor>(
         _context: &Context<'_, E>,
         event: Event<AccountOpened>,
@@ -1498,7 +1498,7 @@ mod multiple {
         Ok(())
     }
 
-    #[evento::sub_handler]
+    #[evento::subscription]
     async fn handle_account_frozen<E: Executor>(
         _context: &Context<'_, E>,
         event: Event<AccountFrozen>,
@@ -1510,7 +1510,7 @@ mod multiple {
         Ok(())
     }
 
-    #[evento::sub_handler]
+    #[evento::subscription]
     async fn handle_owned_name_chaged<E: Executor>(
         _context: &Context<'_, E>,
         event: Event<NameChanged>,

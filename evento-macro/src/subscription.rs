@@ -3,7 +3,7 @@ use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{Error, FnArg, GenericArgument, ItemFn, PatType, PathArguments, Type, TypePath};
 
-pub fn handler_next_impl(input: &ItemFn, debug: bool) -> syn::Result<TokenStream> {
+pub fn subscription_next_impl(input: &ItemFn, debug: bool) -> syn::Result<TokenStream> {
     let fn_name = &input.sig.ident;
 
     // Extract parameters
@@ -14,7 +14,7 @@ pub fn handler_next_impl(input: &ItemFn, debug: bool) -> syn::Result<TokenStream
     let event_arg = params.next().ok_or_else(|| {
         Error::new_spanned(&input.sig, "expected first parameter: event: Event<T>")
     })?;
-    let (_event_full_type, event_inner_type) = extract_type_with_first_generic(event_arg)?;
+    let (event_full_type, event_inner_type) = extract_type_with_first_generic(event_arg)?;
 
     // Generate struct name: AccountOpened -> AccountOpenedHandler
     let handler_struct = format_ident!("{}Handler", fn_name.to_string().to_case(Case::UpperCamel));
@@ -35,13 +35,17 @@ pub fn handler_next_impl(input: &ItemFn, debug: bool) -> syn::Result<TokenStream
                 event: &'a ::evento::Event,
             ) -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = ::anyhow::Result<()>> + Send + 'a>> {
                 Box::pin(async move {
-                    let event = ::evento::metadata::RawEvent(event.clone(), ::std::marker::PhantomData);
+                    let event: #event_full_type = match event.try_into() {
+                        Ok(data) => data,
+                        Err(e) => return Err(e.into()),
+                    };
                     Self::#fn_name(context, event).await
                 })
             }
 
             fn event_name(&self) -> &'static str {
-                "all"
+                use ::evento::AggregatorEvent as _;
+                #event_inner_type::event_name()
             }
 
             fn aggregator_type(&self) -> &'static str {

@@ -159,8 +159,8 @@ mod aggregator;
 mod cursor;
 mod handler;
 mod projection;
-mod sub_all_handler;
-mod sub_handler;
+mod subscription;
+mod subscription_all;
 
 use proc_macro::TokenStream;
 use syn::{parse_macro_input, DeriveInput, ItemFn};
@@ -360,10 +360,10 @@ pub fn debug_handler(_attr: TokenStream, item: TokenStream) -> TokenStream {
 ///     .await?;
 /// ```
 #[proc_macro_attribute]
-pub fn sub_handler(_attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn subscription(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemFn);
 
-    match sub_handler::handler_next_impl(&input, false) {
+    match subscription::subscription_next_impl(&input, false) {
         Ok(tokens) => tokens,
         Err(e) => e.to_compile_error().into(),
     }
@@ -420,10 +420,10 @@ pub fn sub_handler(_attr: TokenStream, item: TokenStream) -> TokenStream {
 ///     .await?;
 /// ```
 #[proc_macro_attribute]
-pub fn sub_all_handler(_attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn subscription_all(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemFn);
 
-    match sub_all_handler::handler_next_impl(&input, false) {
+    match subscription_all::subscription_all_next_impl(&input, false) {
         Ok(tokens) => tokens,
         Err(e) => e.to_compile_error().into(),
     }
