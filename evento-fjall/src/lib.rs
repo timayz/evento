@@ -57,7 +57,7 @@ use evento_core::{
     metadata::Metadata,
     Event, Executor, ReadAggregator, RoutingKey, WriteError,
 };
-use fjall::{Config, Keyspace, Partition, PartitionCreateOptions, PersistMode};
+use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 use ulid::Ulid;
 
 /// Subscriber state stored in the database.
@@ -134,24 +134,24 @@ impl TryFrom<StoredEvent> for Event {
 /// let executor = Fjall::open("./events.db")?;
 ///
 /// // Or with custom configuration
-/// let keyspace = fjall::Config::new("./events.db")
+/// let db = fjall::Database::builder("./events.db")
 ///     .max_write_buffer_size(64 * 1024 * 1024)
 ///     .open()?;
-/// let executor = Fjall::from_keyspace(keyspace)?;
+/// let executor = Fjall::from_database(db)?;
 /// ```
 pub struct Fjall {
-    keyspace: Keyspace,
-    events: Partition,
-    agg_index: Partition,
-    routing_index: Partition,
-    type_index: Partition,
-    subscribers: Partition,
+    database: Database,
+    events: Keyspace,
+    agg_index: Keyspace,
+    routing_index: Keyspace,
+    type_index: Keyspace,
+    subscribers: Keyspace,
 }
 
 impl Clone for Fjall {
     fn clone(&self) -> Self {
         Self {
-            keyspace: self.keyspace.clone(),
+            database: self.database.clone(),
             events: self.events.clone(),
             agg_index: self.agg_index.clone(),
             routing_index: self.routing_index.clone(),
@@ -168,41 +168,39 @@ impl Fjall {
     ///
     /// # Errors
     ///
-    /// Returns an error if the database cannot be opened or partitions
+    /// Returns an error if the database cannot be opened or keyspaces
     /// cannot be created.
     pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let keyspace = Config::new(path).open()?;
-        Self::from_keyspace(keyspace)
+        let database = Database::builder(path).open()?;
+        Self::from_database(database)
     }
 
-    /// Creates an executor from an existing keyspace.
+    /// Creates an executor from an existing database.
     ///
-    /// Use this when you need custom keyspace configuration.
+    /// Use this when you need custom database configuration.
     ///
     /// # Example
     ///
     /// ```rust,ignore
-    /// let keyspace = fjall::Config::new("./events.db")
+    /// let db = fjall::Database::builder("./events.db")
     ///     .max_write_buffer_size(128 * 1024 * 1024)
     ///     .open()?;
-    /// let executor = Fjall::from_keyspace(keyspace)?;
+    /// let executor = Fjall::from_database(db)?;
     /// ```
-    pub fn from_keyspace(keyspace: Keyspace) -> anyhow::Result<Self> {
-        let opts = PartitionCreateOptions::default();
-
+    pub fn from_database(database: Database) -> anyhow::Result<Self> {
         Ok(Self {
-            events: keyspace.open_partition("events", opts.clone())?,
-            agg_index: keyspace.open_partition("agg_index", opts.clone())?,
-            routing_index: keyspace.open_partition("routing_index", opts.clone())?,
-            type_index: keyspace.open_partition("type_index", opts.clone())?,
-            subscribers: keyspace.open_partition("subscribers", opts)?,
-            keyspace,
+            events: database.keyspace("events", KeyspaceCreateOptions::default)?,
+            agg_index: database.keyspace("agg_index", KeyspaceCreateOptions::default)?,
+            routing_index: database.keyspace("routing_index", KeyspaceCreateOptions::default)?,
+            type_index: database.keyspace("type_index", KeyspaceCreateOptions::default)?,
+            subscribers: database.keyspace("subscribers", KeyspaceCreateOptions::default)?,
+            database,
         })
     }
 
-    /// Returns a reference to the underlying keyspace.
-    pub fn keyspace(&self) -> &Keyspace {
-        &self.keyspace
+    /// Returns a reference to the underlying database.
+    pub fn database(&self) -> &Database {
+        &self.database
     }
 
     /// Persists all pending writes to disk.
@@ -210,7 +208,7 @@ impl Fjall {
     /// By default, writes are persisted after each batch. Call this
     /// if you need to ensure durability at a specific point.
     pub fn persist(&self) -> anyhow::Result<()> {
-        self.keyspace.persist(PersistMode::SyncAll)?;
+        self.database.persist(PersistMode::SyncAll)?;
         Ok(())
     }
 
@@ -258,10 +256,9 @@ impl Fjall {
     ) -> anyhow::Result<Option<u16>> {
         let prefix = Self::agg_prefix(aggregator_type, aggregator_id);
 
-        if let Some(result) = self.agg_index.prefix(&prefix).next_back() {
-            let kv = result?;
+        if let Some(kv) = self.agg_index.prefix(&prefix).next_back() {
             // Version is the last 2 bytes of the key
-            let key_bytes = kv.0.as_ref();
+            let key_bytes = kv.key()?;
             if key_bytes.len() >= 2 {
                 let version_bytes: [u8; 2] = key_bytes[key_bytes.len() - 2..].try_into().unwrap();
                 return Ok(Some(u16::from_be_bytes(version_bytes)));
@@ -311,8 +308,7 @@ impl Fjall {
                         (Some(id), Some(name)) => {
                             let prefix = Self::agg_prefix(&agg.aggregator_type, id);
                             for kv in self.agg_index.prefix(&prefix) {
-                                let kv = kv?;
-                                let ulid_bytes: [u8; 16] = kv.1.as_ref().try_into()?;
+                                let ulid_bytes: [u8; 16] = kv.value()?.as_ref().try_into()?;
                                 let ulid = Ulid::from_bytes(ulid_bytes);
 
                                 // Check if event matches name filter
@@ -327,8 +323,7 @@ impl Fjall {
                         (Some(id), None) => {
                             let prefix = Self::agg_prefix(&agg.aggregator_type, id);
                             for kv in self.agg_index.prefix(&prefix) {
-                                let kv = kv?;
-                                let ulid_bytes: [u8; 16] = kv.1.as_ref().try_into()?;
+                                let ulid_bytes: [u8; 16] = kv.value()?.as_ref().try_into()?;
                                 add_unique!(Ulid::from_bytes(ulid_bytes));
                             }
                         }
@@ -336,8 +331,7 @@ impl Fjall {
                         (None, Some(name)) => {
                             let prefix = Self::type_prefix(&agg.aggregator_type, name);
                             for kv in self.type_index.prefix(&prefix) {
-                                let kv = kv?;
-                                let key_bytes = kv.0.as_ref();
+                                let key_bytes = kv.key()?;
                                 if key_bytes.len() >= 16 {
                                     let ulid_bytes: [u8; 16] =
                                         key_bytes[key_bytes.len() - 16..].try_into()?;
@@ -349,8 +343,7 @@ impl Fjall {
                         (None, None) => {
                             let prefix = format!("{}\x00", agg.aggregator_type);
                             for kv in self.agg_index.prefix(&prefix) {
-                                let kv = kv?;
-                                let ulid_bytes: [u8; 16] = kv.1.as_ref().try_into()?;
+                                let ulid_bytes: [u8; 16] = kv.value()?.as_ref().try_into()?;
                                 add_unique!(Ulid::from_bytes(ulid_bytes));
                             }
                         }
@@ -361,8 +354,7 @@ impl Fjall {
             (None, Some(RoutingKey::Value(Some(ref key)))) => {
                 let prefix = Self::routing_prefix(key);
                 for kv in self.routing_index.prefix(&prefix) {
-                    let kv = kv?;
-                    let key_bytes = kv.0.as_ref();
+                    let key_bytes = kv.key()?;
                     if key_bytes.len() >= 16 {
                         let ulid_bytes: [u8; 16] = key_bytes[key_bytes.len() - 16..].try_into()?;
                         add_unique!(Ulid::from_bytes(ulid_bytes));
@@ -372,8 +364,7 @@ impl Fjall {
             // Query all events
             _ => {
                 for kv in self.events.iter() {
-                    let kv = kv?;
-                    let ulid_bytes: [u8; 16] = kv.0.as_ref().try_into()?;
+                    let ulid_bytes: [u8; 16] = kv.key()?.as_ref().try_into()?;
                     add_unique!(Ulid::from_bytes(ulid_bytes));
                 }
             }
@@ -407,7 +398,7 @@ impl Executor for Fjall {
             }
 
             // Write atomically using batch
-            let mut batch = executor.keyspace.batch();
+            let mut batch = executor.database.batch();
 
             for event in &events {
                 let id_bytes = event.id.to_bytes();
@@ -435,7 +426,7 @@ impl Executor for Fjall {
 
             batch.commit().map_err(|e| WriteError::Unknown(e.into()))?;
             executor
-                .keyspace
+                .database
                 .persist(PersistMode::SyncAll)
                 .map_err(|e| WriteError::Unknown(e.into()))?;
 
@@ -605,9 +596,9 @@ impl Executor for Fjall {
     }
 }
 
-impl From<Keyspace> for Fjall {
-    fn from(keyspace: Keyspace) -> Self {
-        Self::from_keyspace(keyspace).expect("Failed to create Fjall from keyspace")
+impl From<Database> for Fjall {
+    fn from(database: Database) -> Self {
+        Self::from_database(database).expect("Failed to create Fjall from database")
     }
 }
 
