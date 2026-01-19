@@ -28,8 +28,8 @@ evento-macro = "2"
 |-------|------|---------|
 | `#[evento::aggregator]` | Attribute | Transform enum into event structs |
 | `#[evento::handler]` | Attribute | Create projection handler from async function |
-| `#[evento::sub_handler]` | Attribute | Create subscription handler for specific events |
-| `#[evento::sub_all_handler]` | Attribute | Create subscription handler for all events |
+| `#[evento::subscription]` | Attribute | Create subscription handler for specific events |
+| `#[evento::subscription_all]` | Attribute | Create subscription handler for all events |
 | `#[evento::projection]` | Attribute | Add cursor field and implement `ProjectionCursor` |
 | `#[evento::snapshot]` | Attribute | Implement snapshot restoration |
 | `#[derive(Cursor)]` | Derive | Generate cursor struct and trait implementations |
@@ -131,14 +131,14 @@ The macro generates:
 - `handle_money_deposited()` constructor function
 - `projection::Handler<AccountBalanceView>` trait implementation
 
-### Creating Subscription Handlers with `#[evento::sub_handler]`
+### Creating Subscription Handlers with `#[evento::subscription]`
 
 Subscription handlers process events in real-time with side effects:
 
 ```rust
 use evento::{Executor, metadata::Event, subscription::Context};
 
-#[evento::sub_handler]
+#[evento::subscription]
 async fn on_money_deposited<E: Executor>(
     context: &Context<'_, E>,
     event: Event<MoneyDeposited>,
@@ -156,17 +156,17 @@ let subscription = SubscriptionBuilder::<Sqlite>::new("deposit-notifier")
     .await?;
 ```
 
-### Handling All Events with `#[evento::sub_all_handler]`
+### Handling All Events with `#[evento::subscription_all]`
 
 Handle all events from an aggregate type without deserializing:
 
 ```rust
-use evento::{Executor, SkipEventData, subscription::Context};
+use evento::{Executor, metadata::RawEvent, subscription::Context};
 
-#[evento::sub_all_handler]
+#[evento::subscription_all]
 async fn on_any_account_event<E: Executor>(
     context: &Context<'_, E>,
-    event: SkipEventData<BankAccount>,
+    event: RawEvent<BankAccount>,
 ) -> anyhow::Result<()> {
     println!("Event {} on account {}", event.name, event.aggregator_id);
     Ok(())
