@@ -186,7 +186,7 @@ where
     }
 }
 
-pub struct RawEvent<D>(pub crate::Event, PhantomData<D>);
+pub struct RawEvent<D>(pub crate::Event, pub PhantomData<D>);
 
 impl<D> Deref for RawEvent<D> {
     type Target = crate::Event;
