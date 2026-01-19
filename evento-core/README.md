@@ -127,7 +127,7 @@ use std::time::Duration;
 use evento::{Executor, metadata::Event, subscription::{Context, SubscriptionBuilder}};
 
 // Subscription handlers receive context and can perform side effects
-#[evento::sub_handler]
+#[evento::subscription]
 async fn on_account_opened<E: Executor>(
     context: &Context<'_, E>,
     event: Event<AccountOpened>,
@@ -180,8 +180,8 @@ pub struct Event {
     pub aggregator_id: String,
     pub aggregator_type: String,
     pub version: u16,
-    pub data: Vec<u8>,          // bitcode-serialized event data
-    pub metadata: Vec<u8>,      // bitcode-serialized metadata
+    pub data: Vec<u8>,           // bitcode-serialized event data
+    pub metadata: Metadata,      // event metadata
     pub timestamp: u64,
     pub timestamp_subsec: u32,
     pub routing_key: Option<String>,

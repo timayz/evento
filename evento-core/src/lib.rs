@@ -82,7 +82,7 @@
 //! ```rust,ignore
 //! use evento::subscription::SubscriptionBuilder;
 //!
-//! #[evento::sub_handler]
+//! #[evento::subscription]
 //! async fn on_deposited<E: Executor>(
 //!     context: &Context<'_, E>,
 //!     event: Event<MoneyDeposited>,
@@ -181,14 +181,14 @@ pub struct EventCursor {
 /// - `name` - Event type name like `"AccountOpened"`
 /// - `routing_key` - Optional key for event distribution/partitioning
 /// - `data` - Serialized event payload (bitcode format)
-/// - `metadata` - Serialized metadata (bitcode format)
+/// - `metadata` - Event metadata (see [`metadata::Metadata`])
 /// - `timestamp` - When the event occurred (Unix seconds)
 /// - `timestamp_subsec` - Sub-second precision (milliseconds)
 ///
 /// # Serialization
 ///
-/// Event data and metadata are serialized using [bitcode](https://crates.io/crates/bitcode)
-/// for compact binary representation. Use [`projection::EventData`] to deserialize.
+/// Event data is serialized using [bitcode](https://crates.io/crates/bitcode)
+/// for compact binary representation. Use [`metadata::Event`] to deserialize typed events.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Event {
     /// Unique event identifier (ULID)
@@ -205,7 +205,7 @@ pub struct Event {
     pub routing_key: Option<String>,
     /// Serialized event data (bitcode format)
     pub data: Vec<u8>,
-    /// Serialized event metadata (bitcode format)
+    /// Event metadata
     pub metadata: Metadata,
     /// Unix timestamp when the event occurred (seconds)
     pub timestamp: u64,

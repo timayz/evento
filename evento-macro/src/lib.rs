@@ -10,8 +10,8 @@
 //! |-------|------|---------|
 //! | [`aggregator`] | Attribute | Transform enum into event structs with trait impls |
 //! | [`handler`] | Attribute | Create projection handler from async function |
-//! | [`sub_handler`] | Attribute | Create subscription handler for specific events |
-//! | [`sub_all_handler`] | Attribute | Create subscription handler for all events of an aggregate |
+//! | [`subscription`] | Attribute | Create subscription handler for specific events |
+//! | [`subscription_all`] | Attribute | Create subscription handler for all events of an aggregate |
 //! | [`projection`] | Attribute | Add cursor field and implement `ProjectionCursor` |
 //! | [`Cursor`] | Derive | Generate cursor struct and trait implementations |
 //! | [`debug_handler`] | Attribute | Like `handler` but outputs generated code for debugging |
@@ -23,7 +23,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! evento = "1.8"
+//! evento = "2"
 //! ```
 //!
 //! # Examples
@@ -80,14 +80,14 @@
 //!     .handler(handle_money_deposited());
 //! ```
 //!
-//! ## Creating Subscription Handlers with `#[evento::sub_handler]`
+//! ## Creating Subscription Handlers with `#[evento::subscription]`
 //!
 //! Subscription handlers process events in real-time with side effects:
 //!
 //! ```rust,ignore
 //! use evento::{Executor, metadata::Event, subscription::Context};
 //!
-//! #[evento::sub_handler]
+//! #[evento::subscription]
 //! async fn on_money_deposited<E: Executor>(
 //!     context: &Context<'_, E>,
 //!     event: Event<MoneyDeposited>,
@@ -105,17 +105,17 @@
 //!     .await?;
 //! ```
 //!
-//! ## Handling All Events with `#[evento::sub_all_handler]`
+//! ## Handling All Events with `#[evento::subscription_all]`
 //!
 //! Handle all events from an aggregate type without deserializing:
 //!
 //! ```rust,ignore
-//! use evento::{Executor, SkipEventData, subscription::Context};
+//! use evento::{Executor, metadata::RawEvent, subscription::Context};
 //!
-//! #[evento::sub_all_handler]
+//! #[evento::subscription_all]
 //! async fn on_any_account_event<E: Executor>(
 //!     context: &Context<'_, E>,
-//!     event: SkipEventData<BankAccount>,
+//!     event: RawEvent<BankAccount>,
 //! ) -> anyhow::Result<()> {
 //!     println!("Event {} on account {}", event.name, event.aggregator_id);
 //!     Ok(())
@@ -338,7 +338,7 @@ pub fn debug_handler(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```rust,ignore
 /// use evento::{Executor, metadata::Event, subscription::Context};
 ///
-/// #[evento::sub_handler]
+/// #[evento::subscription]
 /// async fn on_money_deposited<E: Executor>(
 ///     context: &Context<'_, E>,
 ///     event: Event<MoneyDeposited>,
@@ -371,10 +371,10 @@ pub fn subscription(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
 /// Creates a subscription handler that processes all events of an aggregate type.
 ///
-/// This macro is similar to [`sub_handler`] but handles all events from an aggregate
+/// This macro is similar to [`subscription`] but handles all events from an aggregate
 /// without requiring the event data to be deserialized. The event is wrapped in
-/// `SkipEventData` which provides access to event metadata (name, id, timestamp, etc.)
-/// without deserializing the payload.
+/// [`RawEvent`](evento_core::metadata::RawEvent) which provides access to event metadata
+/// (name, id, timestamp, etc.) without deserializing the payload.
 ///
 /// # Function Signature
 ///
@@ -383,7 +383,7 @@ pub fn subscription(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```rust,ignore
 /// async fn handler_name<E: Executor>(
 ///     context: &Context<'_, E>,
-///     event: SkipEventData<AggregateType>,
+///     event: RawEvent<AggregateType>,
 /// ) -> anyhow::Result<()>
 /// ```
 ///
@@ -397,12 +397,12 @@ pub fn subscription(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// # Example
 ///
 /// ```rust,ignore
-/// use evento::{Executor, SkipEventData, subscription::Context};
+/// use evento::{Executor, metadata::RawEvent, subscription::Context};
 ///
-/// #[evento::sub_all_handler]
+/// #[evento::subscription_all]
 /// async fn on_any_account_event<E: Executor>(
 ///     context: &Context<'_, E>,
-///     event: SkipEventData<BankAccount>,
+///     event: RawEvent<BankAccount>,
 /// ) -> anyhow::Result<()> {
 ///     // Access event metadata without deserializing
 ///     println!("Event: {} on {}", event.name, event.aggregator_id);

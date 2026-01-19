@@ -5,20 +5,23 @@
 //!
 //! # Types
 //!
-//! - [`Metadata`] - Standard metadata with ID and user info
-//! - [`MetadataUser`] - User identification (anonymous, user, or root)
-//! - [`Event`] - Type alias for `EventData<D, Metadata>`
+//! - [`Metadata`] - Standard metadata with ID and extensible key-value storage
+//! - [`Event`] - Typed event wrapper with deserialized data
+//! - [`RawEvent`] - Raw event without deserialization (for batch processing)
 //!
 //! # Example
 //!
 //! ```rust,ignore
 //! use evento::metadata::Metadata;
 //!
-//! // Create metadata for a user action
-//! let metadata = Metadata::new("user-123");
+//! // Create default metadata (anonymous)
+//! let mut metadata = Metadata::default();
 //!
-//! // Create metadata for a root/admin action
-//! let metadata = Metadata::root("admin-456", "impersonated-user-789");
+//! // Set who is making the request
+//! metadata.set_requested_by("user-123");
+//!
+//! // Set who the request is on behalf of (for impersonation)
+//! metadata.set_requested_as("impersonated-user-789");
 //!
 //! // Use with event creation
 //! create()
@@ -26,6 +29,11 @@
 //!     .metadata(&metadata)
 //!     .commit(&executor)
 //!     .await?;
+//!
+//! // Access metadata from events
+//! if let Ok(user_id) = event.metadata.requested_by() {
+//!     println!("Requested by: {}", user_id);
+//! }
 //! ```
 
 use std::{collections::HashMap, marker::PhantomData, ops::Deref};
@@ -121,16 +129,15 @@ impl From<&Metadata> for Metadata {
     }
 }
 
-/// Typed event with deserialized data and metadata.
+/// Typed event with deserialized data.
 ///
-/// `EventData` wraps a raw [`Event`](crate::Event) and provides typed access
-/// to the deserialized event data and metadata. It implements `Deref` to
-/// provide access to the underlying event fields (id, timestamp, version, etc.).
+/// `Event` wraps a raw [`crate::Event`] and provides typed access
+/// to the deserialized event data. It implements `Deref` to
+/// provide access to the underlying event fields (id, timestamp, version, metadata, etc.).
 ///
 /// # Type Parameters
 ///
 /// - `D`: The event data type (e.g., `AccountOpened`)
-/// - `M`: The metadata type (defaults to `bool` for no metadata)
 ///
 /// # Example
 ///
@@ -138,15 +145,15 @@ impl From<&Metadata> for Metadata {
 /// use evento::metadata::Event;
 ///
 /// #[evento::handler]
-/// async fn handle_deposit<E: Executor>(
+/// async fn handle_deposit(
 ///     event: Event<MoneyDeposited>,
-///     action: Action<'_, AccountView, E>,
+///     view: &mut AccountView,
 /// ) -> anyhow::Result<()> {
 ///     // Access typed data
 ///     println!("Amount: {}", event.data.amount);
 ///
-///     // Access metadata
-///     if let Ok(user) = event.metadata.user() {
+///     // Access metadata via Deref
+///     if let Ok(user) = event.metadata.requested_by() {
 ///         println!("By user: {}", user);
 ///     }
 ///

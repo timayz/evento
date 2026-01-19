@@ -129,7 +129,7 @@
 //! use evento::{Executor, metadata::Event, subscription::{Context, SubscriptionBuilder}};
 //!
 //! // Subscription handlers receive context and can perform side effects
-//! #[evento::sub_handler]
+//! #[evento::subscription]
 //! async fn notify_on_deposit<E: Executor>(
 //!     context: &Context<'_, E>,
 //!     event: Event<MoneyDeposited>,
@@ -154,15 +154,15 @@
 //!
 //! ## Handle All Events from an Aggregate
 //!
-//! Use `sub_all_handler` to process all events without deserializing:
+//! Use `subscription_all` to process all events without deserializing:
 //!
 //! ```rust,ignore
-//! use evento::{Executor, SkipEventData, subscription::Context};
+//! use evento::{Executor, metadata::RawEvent, subscription::Context};
 //!
-//! #[evento::sub_all_handler]
+//! #[evento::subscription_all]
 //! async fn audit_all_events<E: Executor>(
 //!     context: &Context<'_, E>,
-//!     event: SkipEventData<Account>,
+//!     event: RawEvent<Account>,
 //! ) -> anyhow::Result<()> {
 //!     println!("Event {} on account {}", event.name, event.aggregator_id);
 //!     Ok(())

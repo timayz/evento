@@ -143,7 +143,7 @@ async fn get_user(executor: &evento::Sqlite, user_id: &str) -> anyhow::Result<Op
 use std::time::Duration;
 use evento::{Executor, metadata::Event, subscription::{Context, SubscriptionBuilder}};
 
-#[evento::sub_handler]
+#[evento::subscription]
 async fn on_user_created_subscription<E: Executor>(
     _context: &Context<'_, E>,
     event: Event<UserCreated>,

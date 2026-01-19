@@ -132,7 +132,7 @@ use std::time::Duration;
 use evento::{Executor, metadata::Event, subscription::{Context, SubscriptionBuilder}};
 
 // Subscription handlers receive context and can perform side effects
-#[evento::sub_handler]
+#[evento::subscription]
 async fn notify_user_created<E: Executor>(
     context: &Context<'_, E>,
     event: Event<UserCreated>,
@@ -158,15 +158,15 @@ subscription.shutdown().await?;
 
 ## Handle All Events
 
-Use `sub_all_handler` to process all events from an aggregate without deserializing:
+Use `subscription_all` to process all events from an aggregate without deserializing:
 
 ```rust
-use evento::{Executor, SkipEventData, subscription::Context};
+use evento::{Executor, metadata::RawEvent, subscription::Context};
 
-#[evento::sub_all_handler]
+#[evento::subscription_all]
 async fn audit_user_events<E: Executor>(
     context: &Context<'_, E>,
-    event: SkipEventData<User>,
+    event: RawEvent<User>,
 ) -> anyhow::Result<()> {
     println!("Event {} on user {}", event.name, event.aggregator_id);
     Ok(())
