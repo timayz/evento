@@ -455,40 +455,34 @@ impl Executor for Fjall {
 
         tokio::task::spawn_blocking(move || {
             let is_backward = args.is_backward();
-            let (limit, cursor) = args.get_info();
+            let (_, cursor) = args.get_info();
 
             // Collect matching event IDs
             let mut event_ids = executor.collect_event_ids(&aggregators, &routing_key)?;
 
-            // Sort by ULID (time-ordered)
+            // Sort by ULID for position-based slicing
             event_ids.sort();
-            if is_backward {
-                event_ids.reverse();
-            }
 
-            // Apply cursor filter
+            // Use cursor's event ID to find position and slice
             if let Some(ref cursor_value) = cursor {
                 let cursor_data = Event::deserialize_cursor(cursor_value)?;
                 let cursor_ulid = Ulid::from_string(&cursor_data.i)?;
 
-                event_ids.retain(|id| {
-                    if is_backward {
-                        *id < cursor_ulid
-                    } else {
-                        *id > cursor_ulid
-                    }
-                });
+                // Find position of cursor in sorted list
+                let pos = event_ids.partition_point(|id| *id <= cursor_ulid);
+
+                if is_backward {
+                    // Keep events before cursor position
+                    event_ids.truncate(pos.saturating_sub(1));
+                } else {
+                    // Keep events after cursor position
+                    event_ids = event_ids.into_iter().skip(pos).collect();
+                }
             }
 
-            // Load events, filtering by routing key, until we have enough
-            let target_count = (limit + 1) as usize;
+            // Load matching events
             let mut events = Vec::new();
-
             for id in event_ids {
-                if events.len() >= target_count {
-                    break;
-                }
-
                 if let Some(event) = executor.load_event(&id)? {
                     // Apply routing key filter if specified
                     let matches = match &routing_key {
@@ -505,7 +499,8 @@ impl Executor for Fjall {
                 }
             }
 
-            // Build paginated result
+            // Build paginated result - Reader handles sorting by (timestamp, version, id)
+            // and cursor filtering correctly
             evento_core::cursor::Reader::new(events)
                 .args(args)
                 .execute()
