@@ -39,8 +39,6 @@
 
 use std::{collections::HashMap, future::Future, marker::PhantomData, ops::Deref, pin::Pin};
 
-use sha3::{Digest, Sha3_256};
-
 use crate::{
     context,
     cursor::{self, Args, Cursor},
@@ -347,12 +345,7 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
     where
         P: Snapshot<E> + Default,
     {
-        let mut hasher = Sha3_256::new();
-        for id in ids {
-            hasher.update(id.into());
-        }
-
-        Self::new::<A>(hex::encode(hasher.finalize()))
+        Self::new::<A>(crate::hash_ids(ids))
     }
 
     /// Sets the snapshot revision.
