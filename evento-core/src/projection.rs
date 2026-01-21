@@ -39,6 +39,8 @@
 
 use std::{collections::HashMap, future::Future, marker::PhantomData, ops::Deref, pin::Pin};
 
+use sha3::{Digest, Sha3_256};
+
 use crate::{
     context,
     cursor::{self, Args, Cursor},
@@ -75,27 +77,35 @@ pub struct Context<'a, E: Executor> {
     pub executor: &'a E,
     pub id: String,
     revision: u16,
-    aggregator_type: String,
     aggregators: &'a HashMap<String, String>,
 }
 
 impl<'a, E: Executor> Context<'a, E> {
+    fn get_snapshot_id(&self) -> Vec<u8> {
+        let mut hasher = Sha3_256::new();
+
+        let mut pairs: Vec<_> = self.aggregators.iter().collect();
+        pairs.sort_by_key(|(k, _)| *k);
+
+        for (key, value) in pairs {
+            hasher.update((key.len() as u64).to_le_bytes());
+            hasher.update(key.as_bytes());
+            hasher.update((value.len() as u64).to_le_bytes());
+            hasher.update(value.as_bytes());
+        }
+
+        hasher.finalize().to_vec()
+    }
+
     /// Retrieves a stored snapshot for the given ID.
     ///
     /// Returns `None` if no snapshot exists.
     pub async fn get_snapshot<D: bitcode::DecodeOwned + ProjectionCursor>(
         &self,
-        id: impl Into<String>,
     ) -> anyhow::Result<Option<D>> {
-        let id = id.into();
-
         let Some((data, cursor)) = self
             .executor
-            .get_snapshot(
-                self.aggregator_type.to_owned(),
-                self.revision.to_string(),
-                id,
-            )
+            .get_snapshot(self.revision.to_string(), self.get_snapshot_id())
             .await?
         else {
             return Ok(None);
@@ -112,18 +122,15 @@ impl<'a, E: Executor> Context<'a, E> {
     /// The snapshot cursor is extracted from the data to track the event position.
     pub async fn take_snapshot<D: bitcode::Encode + ProjectionCursor>(
         &self,
-        id: impl Into<String>,
         data: &D,
     ) -> anyhow::Result<()> {
-        let id = id.into();
         let cursor = data.get_cursor();
         let data = bitcode::encode(data);
 
         self.executor
             .save_snapshot(
-                self.aggregator_type.to_owned(),
                 self.revision.to_string(),
-                id,
+                self.get_snapshot_id(),
                 data,
                 cursor,
             )
@@ -275,11 +282,11 @@ impl<T: bitcode::Encode + bitcode::DecodeOwned + ProjectionCursor + Send + Sync,
     Snapshot<E> for T
 {
     async fn restore(context: &Context<'_, E>) -> anyhow::Result<Option<Self>> {
-        context.get_snapshot(&context.id).await
+        context.get_snapshot().await
     }
 
     async fn take_snapshot(&self, context: &Context<'_, E>) -> anyhow::Result<()> {
-        context.take_snapshot(&context.id, self).await
+        context.take_snapshot(self).await
     }
 }
 
@@ -300,7 +307,6 @@ impl<T: bitcode::Encode + bitcode::DecodeOwned + ProjectionCursor + Send + Sync,
 /// ```
 pub struct Projection<E: Executor, P: Default + 'static> {
     id: String,
-    aggregator_type: String,
     revision: u16,
     aggregators: HashMap<String, String>,
     handlers: HashMap<String, Box<dyn Handler<P>>>,
@@ -328,7 +334,6 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
 
         Projection {
             id,
-            aggregator_type: A::aggregator_type().to_owned(),
             aggregators,
             context: Default::default(),
             handlers: HashMap::new(),
@@ -416,7 +421,6 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
             context: self.context.clone(),
             executor,
             id: self.id.to_owned(),
-            aggregator_type: self.aggregator_type.to_owned(),
             aggregators: &self.aggregators,
             revision: self.revision,
         };

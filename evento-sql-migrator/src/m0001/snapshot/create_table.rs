@@ -1,4 +1,4 @@
-use sea_query::{ColumnDef, Expr, Index, Table, TableCreateStatement, TableDropStatement};
+use sea_query::{ColumnDef, Expr, Table, TableCreateStatement, TableDropStatement};
 
 use evento_sql::Snapshot;
 
@@ -10,15 +10,9 @@ fn up_statement() -> TableCreateStatement {
         .if_not_exists()
         .col(
             ColumnDef::new(Snapshot::Id)
-                .string()
-                .not_null()
-                .string_len(26),
-        )
-        .col(
-            ColumnDef::new(Snapshot::Type)
-                .string()
-                .string_len(50)
-                .not_null(),
+                .blob()
+                .binary_len(32)
+                .primary_key(),
         )
         .col(ColumnDef::new(Snapshot::Cursor).string().not_null())
         .col(ColumnDef::new(Snapshot::Revision).string().not_null())
@@ -34,7 +28,6 @@ fn up_statement() -> TableCreateStatement {
                 .timestamp_with_time_zone()
                 .null(),
         )
-        .primary_key(Index::create().col(Snapshot::Type).col(Snapshot::Id))
         .to_owned()
 }
 

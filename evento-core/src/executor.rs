@@ -150,9 +150,8 @@ pub trait Executor: Send + Sync + 'static {
     /// if no snapshot exists for the given aggregate.
     async fn get_snapshot(
         &self,
-        aggregator_type: String,
-        aggregator_revision: String,
-        id: String,
+        revision: String,
+        id: Vec<u8>,
     ) -> anyhow::Result<Option<(Vec<u8>, Value)>>;
 
     /// Stores a snapshot for an aggregate.
@@ -161,9 +160,8 @@ pub trait Executor: Send + Sync + 'static {
     /// The `cursor` indicates the event position up to which the snapshot is valid.
     async fn save_snapshot(
         &self,
-        aggregator_type: String,
-        aggregator_revision: String,
-        id: String,
+        revision: String,
+        id: Vec<u8>,
         data: Vec<u8>,
         cursor: Value,
     ) -> anyhow::Result<()>;
@@ -224,26 +222,20 @@ impl Executor for Evento {
 
     async fn get_snapshot(
         &self,
-        aggregator_type: String,
-        aggregator_revision: String,
-        id: String,
+        revision: String,
+        id: Vec<u8>,
     ) -> anyhow::Result<Option<(Vec<u8>, Value)>> {
-        self.0
-            .get_snapshot(aggregator_type, aggregator_revision, id)
-            .await
+        self.0.get_snapshot(revision, id).await
     }
 
     async fn save_snapshot(
         &self,
-        aggregator_type: String,
-        aggregator_revision: String,
-        id: String,
+        revision: String,
+        id: Vec<u8>,
         data: Vec<u8>,
         cursor: Value,
     ) -> anyhow::Result<()> {
-        self.0
-            .save_snapshot(aggregator_type, aggregator_revision, id, data, cursor)
-            .await
+        self.0.save_snapshot(revision, id, data, cursor).await
     }
 }
 
@@ -337,26 +329,20 @@ impl Executor for EventoGroup {
 
     async fn get_snapshot(
         &self,
-        aggregator_type: String,
-        aggregator_revision: String,
-        id: String,
+        revision: String,
+        id: Vec<u8>,
     ) -> anyhow::Result<Option<(Vec<u8>, Value)>> {
-        self.first()
-            .get_snapshot(aggregator_type, aggregator_revision, id)
-            .await
+        self.first().get_snapshot(revision, id).await
     }
 
     async fn save_snapshot(
         &self,
-        aggregator_type: String,
-        aggregator_revision: String,
-        id: String,
+        revision: String,
+        id: Vec<u8>,
         data: Vec<u8>,
         cursor: Value,
     ) -> anyhow::Result<()> {
-        self.first()
-            .save_snapshot(aggregator_type, aggregator_revision, id, data, cursor)
-            .await
+        self.first().save_snapshot(revision, id, data, cursor).await
     }
 }
 
@@ -420,26 +406,20 @@ impl<R: Executor, W: Executor> Executor for Rw<R, W> {
 
     async fn get_snapshot(
         &self,
-        aggregator_type: String,
-        aggregator_revision: String,
-        id: String,
+        revision: String,
+        id: Vec<u8>,
     ) -> anyhow::Result<Option<(Vec<u8>, Value)>> {
-        self.r
-            .get_snapshot(aggregator_type, aggregator_revision, id)
-            .await
+        self.r.get_snapshot(revision, id).await
     }
 
     async fn save_snapshot(
         &self,
-        aggregator_type: String,
-        aggregator_revision: String,
-        id: String,
+        revision: String,
+        id: Vec<u8>,
         data: Vec<u8>,
         cursor: Value,
     ) -> anyhow::Result<()> {
-        self.w
-            .save_snapshot(aggregator_type, aggregator_revision, id, data, cursor)
-            .await
+        self.w.save_snapshot(revision, id, data, cursor).await
     }
 }
 
