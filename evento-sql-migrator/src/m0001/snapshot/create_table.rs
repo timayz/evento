@@ -12,7 +12,7 @@ fn up_statement() -> TableCreateStatement {
             ColumnDef::new(Snapshot::Id)
                 .string()
                 .not_null()
-                .string_len(26),
+                .string_len(64),
         )
         .col(
             ColumnDef::new(Snapshot::Type)

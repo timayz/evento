@@ -16,6 +16,8 @@ tokio.workspace = true
 evento-macro = { path = "../evento-macro", optional = true, version = "2.0.0-alpha.11" }
 anyhow.workspace = true
 bitcode.workspace = true
+sha3.workspace = true
+hex.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
 tracing.workspace = true

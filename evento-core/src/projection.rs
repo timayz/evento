@@ -85,16 +85,13 @@ impl<'a, E: Executor> Context<'a, E> {
     /// Returns `None` if no snapshot exists.
     pub async fn get_snapshot<D: bitcode::DecodeOwned + ProjectionCursor>(
         &self,
-        id: impl Into<String>,
     ) -> anyhow::Result<Option<D>> {
-        let id = id.into();
-
         let Some((data, cursor)) = self
             .executor
             .get_snapshot(
                 self.aggregator_type.to_owned(),
                 self.revision.to_string(),
-                id,
+                self.id.to_owned(),
             )
             .await?
         else {
@@ -112,10 +109,8 @@ impl<'a, E: Executor> Context<'a, E> {
     /// The snapshot cursor is extracted from the data to track the event position.
     pub async fn take_snapshot<D: bitcode::Encode + ProjectionCursor>(
         &self,
-        id: impl Into<String>,
         data: &D,
     ) -> anyhow::Result<()> {
-        let id = id.into();
         let cursor = data.get_cursor();
         let data = bitcode::encode(data);
 
@@ -123,7 +118,7 @@ impl<'a, E: Executor> Context<'a, E> {
             .save_snapshot(
                 self.aggregator_type.to_owned(),
                 self.revision.to_string(),
-                id,
+                self.id.to_owned(),
                 data,
                 cursor,
             )
@@ -275,11 +270,11 @@ impl<T: bitcode::Encode + bitcode::DecodeOwned + ProjectionCursor + Send + Sync,
     Snapshot<E> for T
 {
     async fn restore(context: &Context<'_, E>) -> anyhow::Result<Option<Self>> {
-        context.get_snapshot(&context.id).await
+        context.get_snapshot().await
     }
 
     async fn take_snapshot(&self, context: &Context<'_, E>) -> anyhow::Result<()> {
-        context.take_snapshot(&context.id, self).await
+        context.take_snapshot(self).await
     }
 }
 
@@ -336,6 +331,21 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
             executor: PhantomData,
             revision: 0,
         }
+    }
+
+    /// Creates a builder for loading aggregate state.
+    ///
+    /// This consumes the projection and returns a [`LoadBuilder`] configured
+    /// to load the state for the specified aggregate.
+    ///
+    /// # Type Parameters
+    ///
+    /// - `A`: The aggregate type to load
+    pub fn ids<A: Aggregator>(ids: Vec<impl Into<String>>) -> Projection<E, P>
+    where
+        P: Snapshot<E> + Default,
+    {
+        Self::new::<A>(crate::hash_ids(ids))
     }
 
     /// Sets the snapshot revision.
