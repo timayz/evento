@@ -29,7 +29,7 @@ fn up_statement() -> TableCreateStatement {
         .col(
             ColumnDef::new(Event::AggregatorId)
                 .string()
-                .string_len(26)
+                .string_len(64)
                 .not_null(),
         )
         .col(ColumnDef::new(Event::Version).integer().not_null())

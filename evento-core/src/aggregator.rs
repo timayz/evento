@@ -23,6 +23,7 @@
 //!     .await?;
 //! ```
 
+use sha3::{Digest, Sha3_256};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use ulid::Ulid;
@@ -142,6 +143,16 @@ impl AggregatorBuilder {
             data: Vec::default(),
             metadata: Default::default(),
         }
+    }
+
+    /// Creates a new builder for the given aggregate IDs.
+    pub fn ids(ids: Vec<impl Into<String>>) -> AggregatorBuilder {
+        let mut hasher = Sha3_256::new();
+        for id in ids {
+            hasher.update(id.into());
+        }
+
+        Self::new(hex::encode(hasher.finalize()))
     }
 
     /// Sets the expected version for optimistic concurrency control.
