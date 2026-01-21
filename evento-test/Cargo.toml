@@ -1,6 +1,6 @@
 [package]
 name = "evento-test"
-version = "2.0.0-alpha.11"
+version = "2.0.0-alpha.12"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -9,8 +9,8 @@ documentation = "https://docs.rs/evento"
 readme = "README.md"
 
 [dependencies]
-evento = { path = "../evento", version = "2.0.0-alpha.11" }
-bank = { path = "../examples/bank", version = "2.0.0-alpha.11" }
+evento = { path = "../evento", version = "2.0.0-alpha.12" }
+bank = { path = "../examples/bank", version = "2.0.0-alpha.12" }
 ulid.workspace = true
 rand.workspace = true
 anyhow.workspace = true

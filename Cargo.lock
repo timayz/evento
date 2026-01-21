@@ -219,7 +219,7 @@ dependencies = [
 
 [[package]]
 name = "bank"
-version = "2.0.0-alpha.11"
+version = "2.0.0-alpha.12"
 dependencies = [
  "anyhow",
  "bitcode",
@@ -229,7 +229,7 @@ dependencies = [
 
 [[package]]
 name = "bank-axum-sqlite"
-version = "2.0.0-alpha.11"
+version = "2.0.0-alpha.12"
 dependencies = [
  "anyhow",
  "askama",
@@ -660,7 +660,7 @@ dependencies = [
 
 [[package]]
 name = "evento"
-version = "2.0.0-alpha.11"
+version = "2.0.0-alpha.12"
 dependencies = [
  "anyhow",
  "bank",
@@ -682,7 +682,7 @@ dependencies = [
 
 [[package]]
 name = "evento-core"
-version = "2.0.0-alpha.11"
+version = "2.0.0-alpha.12"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -703,7 +703,7 @@ dependencies = [
 
 [[package]]
 name = "evento-fjall"
-version = "2.0.0-alpha.11"
+version = "2.0.0-alpha.12"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -718,7 +718,7 @@ dependencies = [
 
 [[package]]
 name = "evento-macro"
-version = "2.0.0-alpha.11"
+version = "2.0.0-alpha.12"
 dependencies = [
  "convert_case",
  "quote",
@@ -727,7 +727,7 @@ dependencies = [
 
 [[package]]
 name = "evento-sql"
-version = "2.0.0-alpha.11"
+version = "2.0.0-alpha.12"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -745,7 +745,7 @@ dependencies = [
 
 [[package]]
 name = "evento-sql-migrator"
-version = "2.0.0-alpha.11"
+version = "2.0.0-alpha.12"
 dependencies = [
  "async-trait",
  "evento-sql",
@@ -756,7 +756,7 @@ dependencies = [
 
 [[package]]
 name = "evento-test"
-version = "2.0.0-alpha.11"
+version = "2.0.0-alpha.12"
 dependencies = [
  "anyhow",
  "bank",
@@ -946,9 +946,9 @@ dependencies = [
 
 [[package]]
 name = "glam"
-version = "0.30.10"
+version = "0.31.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19fc433e8437a212d1b6f1e68c7824af3aed907da60afa994e7f542d18d12aa9"
+checksum = "74a4d85559e2637d3d839438b5b3d75c31e655276f9544d72475c36b92fabbed"
 
 [[package]]
 name = "gloo-timers"
@@ -1614,9 +1614,9 @@ dependencies = [
 
 [[package]]
 name = "proc-macro2"
-version = "1.0.105"
+version = "1.0.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "535d180e0ecab6268a3e718bb9fd44db66bbbc256257165fc699dadf70d16fe7"
+checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
 ]
@@ -2892,6 +2892,6 @@ dependencies = [
 
 [[package]]
 name = "zmij"
-version = "1.0.15"
+version = "1.0.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94f63c051f4fe3c1509da62131a678643c5b6fbdc9273b2b79d4378ebda003d2"
+checksum = "dfcd145825aace48cff44a8844de64bf75feec3080e0aa5cdbde72961ae51a65"
