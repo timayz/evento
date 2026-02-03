@@ -57,7 +57,7 @@ fjall = "2.11"
 
 # Proc macro
 quote = "1.0"
-convert_case = "0.10"
+convert_case = "0.11"
 syn = { version = "2.0.114", features = ["full", "parsing", "extra-traits"] }
 
 # Web
