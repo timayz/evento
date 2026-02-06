@@ -327,6 +327,11 @@ pub trait AggregatorExecutor<E: Executor> {
         &self,
         id: impl Into<String>,
     ) -> impl std::future::Future<Output = anyhow::Result<bool>> + Send;
+
+    fn original_version<A: AggregatorEvent>(
+        &self,
+        id: impl Into<String>,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<u16>>> + Send;
 }
 
 impl<E: Executor> AggregatorExecutor<E> for E {
@@ -349,6 +354,24 @@ impl<E: Executor> AggregatorExecutor<E> for E {
                 .await?;
 
             Ok(!result.edges.is_empty())
+        })
+    }
+
+    fn original_version<A: AggregatorEvent>(
+        &self,
+        id: impl Into<String>,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<u16>>> + Send {
+        let id = id.into();
+        Box::pin(async {
+            let result = self
+                .read(
+                    Some(vec![ReadAggregator::id(A::aggregator_type(), id)]),
+                    None,
+                    Args::backward(1, None),
+                )
+                .await?;
+
+            Ok(result.edges.first().map(|e| e.node.version))
         })
     }
 }
