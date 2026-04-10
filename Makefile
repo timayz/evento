@@ -32,7 +32,7 @@ lint.fix:
 	cargo clippy --fix --all-features -- -D warnings
 
 machete:
-	cargo machete
+	cargo machete --with-metadata
 
 advisory.clean:
 	rm -rf ~/.cargo/advisory-db

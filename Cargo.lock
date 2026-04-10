@@ -717,22 +717,10 @@ dependencies = [
 name = "evento"
 version = "2.0.0-alpha.13"
 dependencies = [
- "anyhow",
- "bank",
- "bitcode",
  "evento-core",
- "evento-fjall",
  "evento-sql",
  "evento-sql-migrator",
- "once_cell",
- "rand 0.10.0",
- "sea-query",
- "sea-query-sqlx",
- "sqlx",
  "sqlx_migrator",
- "tempfile",
- "tokio",
- "ulid",
 ]
 
 [[package]]
