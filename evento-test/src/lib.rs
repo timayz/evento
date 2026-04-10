@@ -10,7 +10,7 @@ use evento::cursor::{self, Order, ReadResult};
 use evento::Event;
 use evento::{cursor::Args, Aggregator, Executor, ProjectionAggregator, ReadAggregator};
 use rand::seq::IndexedRandom;
-use rand::Rng;
+use rand::RngExt;
 use ulid::Ulid;
 
 async fn last_routing_key<E: Executor>(
