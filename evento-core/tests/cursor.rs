@@ -2,7 +2,7 @@ use evento_core::{
     cursor::{self, Args, Cursor, Edge, Order, PageInfo, ReadResult, Reader},
     Event,
 };
-use rand::{seq::IndexedRandom, Rng};
+use rand::{seq::IndexedRandom, RngExt};
 use std::collections::HashMap;
 use ulid::Ulid;
 
