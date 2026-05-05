@@ -260,13 +260,10 @@ impl AggregatorBuilder {
             _ => self.routing_key.to_owned(),
         };
 
-        let mut version = self.original_version;
         let mut events = vec![];
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
 
-        for (name, data) in &self.data {
-            version += 1;
-
+        for (version, (name, data)) in (self.original_version + 1..).zip(&self.data) {
             let event = Event {
                 id: Ulid::new(),
                 name: name.to_string(),
