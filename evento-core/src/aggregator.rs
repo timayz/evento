@@ -263,7 +263,7 @@ impl AggregatorBuilder {
         let mut events = vec![];
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
 
-        for (version, (name, data)) in (self.original_version..).zip(self.data.iter()) {
+        for (version, (name, data)) in (self.original_version + 1..).zip(&self.data) {
             let event = Event {
                 id: Ulid::new(),
                 name: name.to_string(),
