@@ -62,7 +62,7 @@ syn = { version = "2.0.114", features = ["full", "parsing", "extra-traits"] }
 
 # Web
 axum = "0.8"
-askama = "0.15"
+askama = "0.16"
 
 # Testing
 rand = "0.10"
