@@ -1,6 +1,6 @@
 [package]
 name = "evento-fjall"
-version = "2.0.0-alpha.15"
+version = "2.0.0-alpha.16"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -9,7 +9,7 @@ documentation = "https://docs.rs/evento-fjall"
 readme = "README.md"
 
 [dependencies]
-evento-core = { path = "../evento-core", version = "2.0.0-alpha.15" }
+evento-core = { path = "../evento-core", version = "2.0.0-alpha.16" }
 anyhow.workspace = true
 bitcode.workspace = true
 async-trait.workspace = true
