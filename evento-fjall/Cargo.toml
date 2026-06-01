@@ -4,7 +4,6 @@ version = "2.0.0-alpha.15"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-publish = true
 description = "Fjall embedded key-value store implementation for evento event sourcing library"
 documentation = "https://docs.rs/evento-fjall"
 readme = "README.md"
@@ -19,5 +18,5 @@ tokio.workspace = true
 fjall.workspace = true
 
 [dev-dependencies]
-tempfile = "3.24"
+tempfile = "3.27"
 evento-test = { path = "../evento-test" }
