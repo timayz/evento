@@ -24,6 +24,7 @@
             pkg-config
             cargo-watch
             cargo-machete
+            cargo-edit
             tailwindcss
             (rust-bin.stable.latest.default.override {
               extensions = [ "rust-src" "rust-analyzer" ];
