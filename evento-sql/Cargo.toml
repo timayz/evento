@@ -28,5 +28,5 @@ sqlx_migrator.workspace = true
 [features]
 default = ["sqlite", "mysql", "postgres"]
 sqlite = ["evento-core/rw", "evento-core/sqlite", "sea-query/backend-sqlite", "sea-query-sqlx/sqlx-sqlite", "sqlx/sqlite"]
-mysql = ["evento-core/rw", "evento-core/mysql", "sea-query/backend-mysql", "sea-query-sqlx/sqlx-mysql", "sqlx/mysql"]
+mysql = ["evento-core/rw", "evento-core/mysql", "sea-query/backend-mysql", "sea-query-sqlx/sqlx-mysql", "sqlx/mysql", "sqlx/mysql-rsa"]
 postgres = ["evento-core/rw", "evento-core/postgres", "sea-query/backend-postgres", "sea-query-sqlx/sqlx-postgres", "sqlx/postgres"]
