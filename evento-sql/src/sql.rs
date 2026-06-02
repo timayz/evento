@@ -560,6 +560,28 @@ where
 
         Ok(())
     }
+
+    async fn delete_snapshot(
+        &self,
+        aggregator_type: String,
+        aggregator_revision: String,
+        id: String,
+    ) -> anyhow::Result<()> {
+        let statement = Query::delete()
+            .from_table(Snapshot::Table)
+            .and_where(Expr::col(Snapshot::Type).eq(Expr::value(aggregator_type)))
+            .and_where(Expr::col(Snapshot::Id).eq(Expr::value(id)))
+            .and_where(Expr::col(Snapshot::Revision).eq(Expr::value(aggregator_revision)))
+            .to_owned();
+
+        let (sql, values) = Self::build_sqlx(statement);
+
+        sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
+            .execute(&self.0)
+            .await?;
+
+        Ok(())
+    }
 }
 
 impl<D: Database> Clone for Sql<D> {

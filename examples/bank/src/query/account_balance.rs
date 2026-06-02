@@ -5,8 +5,8 @@ use crate::aggregator::{
     OverdraftLimitChanged,
 };
 
-pub fn create_projection<E: Executor>(id: impl Into<String>) -> Projection<E, AccountBalanceView> {
-    Projection::new::<BankAccount>(id)
+pub fn create_projection<E: Executor>() -> Projection<E, AccountBalanceView> {
+    Projection::new::<BankAccount>()
         .handler(handle_money_deposit())
         .handler(handle_account_opened())
         .handler(handle_money_received())

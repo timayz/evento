@@ -19,8 +19,8 @@ use crate::{
 pub static ACCOUNT_DETAILS_ROWS: Lazy<RwLock<HashMap<String, AccountDetailsView>>> =
     Lazy::new(Default::default);
 
-pub fn create_projection<E: Executor>(id: impl Into<String>) -> Projection<E, AccountDetailsView> {
-    Projection::new::<BankAccount>(id)
+pub fn create_projection<E: Executor>() -> Projection<E, AccountDetailsView> {
+    Projection::new::<BankAccount>()
         .handler(handle_money_deposit())
         .handler(handle_account_opened())
         .handler(handle_money_received())
@@ -39,7 +39,8 @@ pub async fn load<E: Executor>(
     account_id: impl Into<String>,
     owner_id: impl Into<String>,
 ) -> Result<Option<AccountDetailsView>, anyhow::Error> {
-    create_projection(account_id)
+    create_projection()
+        .load(account_id)
         .aggregator::<Owner>(owner_id)
         .execute(executor)
         .await
