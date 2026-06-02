@@ -8,7 +8,7 @@ use sea_query::MysqlQueryBuilder;
 use sea_query::PostgresQueryBuilder;
 #[cfg(feature = "sqlite")]
 use sea_query::SqliteQueryBuilder;
-use sea_query::{Cond, Expr, ExprTrait, Iden, IntoColumnRef, OnConflict, Query, SelectStatement};
+use sea_query::{Cond, Expr, ExprTrait, Func, Iden, IntoColumnRef, OnConflict, Query, SelectStatement};
 use sea_query_sqlx::SqlxBinder;
 use sqlx::{Database, Pool};
 use ulid::Ulid;
@@ -215,6 +215,7 @@ where
     String: for<'r> sqlx::Decode<'r, DB> + sqlx::Type<DB>,
     bool: for<'r> sqlx::Decode<'r, DB> + sqlx::Type<DB>,
     Vec<u8>: for<'r> sqlx::Decode<'r, DB> + sqlx::Type<DB>,
+    i64: for<'r> sqlx::Decode<'r, DB> + sqlx::Type<DB>,
     usize: sqlx::ColumnIndex<DB::Row>,
     SqlEvent: for<'r> sqlx::FromRow<'r, DB::Row>,
 {
@@ -288,6 +289,69 @@ where
             .execute::<_, SqlEvent, _>(&self.0)
             .await?
             .map(|e| e.0))
+    }
+
+    async fn latest_timestamp(
+        &self,
+        aggregators: Option<Vec<ReadAggregator>>,
+        routing_key: Option<evento_core::RoutingKey>,
+    ) -> anyhow::Result<u64> {
+        let statement = Query::select()
+            .expr(Func::max(Expr::col(Event::Timestamp)))
+            .from(Event::Table)
+            .conditions(
+                aggregators.is_some(),
+                |q| {
+                    let Some(aggregators) = aggregators else {
+                        return;
+                    };
+
+                    let mut cond = Cond::any();
+
+                    for aggregator in aggregators {
+                        let mut aggregator_cond = Cond::all()
+                            .add(Expr::col(Event::AggregatorType).eq(aggregator.aggregator_type));
+
+                        if let Some(id) = aggregator.aggregator_id {
+                            aggregator_cond =
+                                aggregator_cond.add(Expr::col(Event::AggregatorId).eq(id));
+                        }
+
+                        if let Some(name) = aggregator.name {
+                            aggregator_cond = aggregator_cond.add(Expr::col(Event::Name).eq(name));
+                        }
+
+                        cond = cond.add(aggregator_cond);
+                    }
+
+                    q.and_where(cond.into());
+                },
+                |_| {},
+            )
+            .conditions(
+                matches!(routing_key, Some(evento_core::RoutingKey::Value(_))),
+                |q| {
+                    if let Some(evento_core::RoutingKey::Value(Some(ref routing_key))) = routing_key
+                    {
+                        q.and_where(Expr::col(Event::RoutingKey).eq(routing_key));
+                    }
+
+                    if let Some(evento_core::RoutingKey::Value(None)) = routing_key {
+                        q.and_where(Expr::col(Event::RoutingKey).is_null());
+                    }
+                },
+                |_q| {},
+            )
+            .to_owned();
+
+        let (sql, values) = Self::build_sqlx(statement);
+
+        let (ts,): (Option<i64>,) =
+            sqlx::query_as_with::<DB, (Option<i64>,), _>(&sql, values)
+                .fetch_one(&self.0)
+                .await?;
+
+        Ok(ts.map(|v| if v < 0 { 0 } else { v as u64 }).unwrap_or(0))
     }
 
     async fn get_subscriber_cursor(&self, key: String) -> anyhow::Result<Option<Value>> {
