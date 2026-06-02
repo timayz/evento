@@ -9,7 +9,7 @@ use sqlx::database::Database;
 use sqlx::decode::Decode;
 use sqlx::encode::{Encode, IsNull};
 use sqlx::error::BoxDynError;
-use sqlx::sqlite::{SqliteArgumentValue, SqliteTypeInfo};
+use sqlx::sqlite::SqliteTypeInfo;
 use sqlx::types::Type;
 
 /// A wrapper type for bitcode-serialized data in SQL databases.
@@ -131,13 +131,9 @@ where
 {
     fn encode_by_ref(
         &self,
-        buf: &mut <sqlx::Sqlite as Database>::ArgumentBuffer<'_>,
+        buf: &mut <sqlx::Sqlite as Database>::ArgumentBuffer,
     ) -> Result<IsNull, BoxDynError> {
-        buf.push(SqliteArgumentValue::Blob(std::borrow::Cow::Owned(
-            self.encode_to(),
-        )));
-
-        Ok(IsNull::No)
+        <Vec<u8> as Encode<'_, sqlx::Sqlite>>::encode(self.encode_to(), buf)
     }
 }
 
