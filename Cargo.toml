@@ -53,7 +53,7 @@ sqlx = { version = "0.9" }
 sqlx_migrator = "0.19"
 sea-query = { version = "1.0.1", default-features = false, features = ["derive", "audit"] }
 sea-query-sqlx = { version = "0.9.1", features = ["runtime-tokio"] }
-fjall = "2.11"
+fjall = "3.0"
 
 # Proc macro
 quote = "1.0"
