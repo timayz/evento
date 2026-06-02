@@ -339,18 +339,6 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
 
             let cursor = executor.get_subscriber_cursor(self.key()).await?;
 
-            let timestamp = executor
-                .read(
-                    Some(aggregators.to_vec()),
-                    Some(self.routing_key.to_owned()),
-                    Args::backward(1, None),
-                )
-                .await?
-                .edges
-                .last()
-                .map(|e| e.node.timestamp)
-                .unwrap_or_default();
-
             let res = executor
                 .read(
                     Some(aggregators.to_vec()),
@@ -362,6 +350,13 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             if res.edges.is_empty() {
                 return Ok(false);
             }
+
+            let timestamp = executor
+                .latest_timestamp(
+                    Some(aggregators.to_vec()),
+                    Some(self.routing_key.to_owned()),
+                )
+                .await?;
 
             let context = Context {
                 context: self.context.clone(),

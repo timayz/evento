@@ -113,6 +113,7 @@ impl Hash for ReadAggregator {
 ///
 /// - `write` - Persist events atomically
 /// - `read` - Query events with filtering and pagination
+/// - `latest_timestamp` - Get the timestamp of the most recent matching event
 /// - `get_subscriber_cursor` - Get subscription position
 /// - `is_subscriber_running` - Check if subscription is active
 /// - `upsert_subscriber` - Create/update subscription
@@ -143,6 +144,16 @@ pub trait Executor: Send + Sync + 'static {
         routing_key: Option<RoutingKey>,
         args: Args,
     ) -> anyhow::Result<ReadResult<Event>>;
+
+    /// Returns the timestamp of the most recent event matching the filter.
+    ///
+    /// Returns 0 when no matching event exists. Used by the subscription loop
+    /// to compute lag without fetching the full event row (data/metadata blobs).
+    async fn latest_timestamp(
+        &self,
+        aggregators: Option<Vec<ReadAggregator>>,
+        routing_key: Option<RoutingKey>,
+    ) -> anyhow::Result<u64>;
 
     /// Retrieves a stored snapshot for an aggregate.
     ///
@@ -204,6 +215,14 @@ impl Executor for Evento {
         args: Args,
     ) -> anyhow::Result<ReadResult<Event>> {
         self.0.read(aggregators, routing_key, args).await
+    }
+
+    async fn latest_timestamp(
+        &self,
+        aggregators: Option<Vec<ReadAggregator>>,
+        routing_key: Option<RoutingKey>,
+    ) -> anyhow::Result<u64> {
+        self.0.latest_timestamp(aggregators, routing_key).await
     }
 
     async fn get_subscriber_cursor(&self, key: String) -> anyhow::Result<Option<Value>> {
@@ -319,6 +338,28 @@ impl Executor for EventoGroup {
         Ok(cursor::Reader::new(events).args(args).execute()?)
     }
 
+    async fn latest_timestamp(
+        &self,
+        aggregators: Option<Vec<ReadAggregator>>,
+        routing_key: Option<RoutingKey>,
+    ) -> anyhow::Result<u64> {
+        let futures = self
+            .executors
+            .iter()
+            .map(|e| e.latest_timestamp(aggregators.to_owned(), routing_key.to_owned()));
+
+        let results = futures_util::future::join_all(futures).await;
+        let mut max = 0u64;
+        for res in results {
+            let ts = res?;
+            if ts > max {
+                max = ts;
+            }
+        }
+
+        Ok(max)
+    }
+
     async fn get_subscriber_cursor(&self, key: String) -> anyhow::Result<Option<Value>> {
         self.first().get_subscriber_cursor(key).await
     }
@@ -400,6 +441,14 @@ impl<R: Executor, W: Executor> Executor for Rw<R, W> {
         args: Args,
     ) -> anyhow::Result<ReadResult<Event>> {
         self.r.read(aggregators, routing_key, args).await
+    }
+
+    async fn latest_timestamp(
+        &self,
+        aggregators: Option<Vec<ReadAggregator>>,
+        routing_key: Option<RoutingKey>,
+    ) -> anyhow::Result<u64> {
+        self.r.latest_timestamp(aggregators, routing_key).await
     }
 
     async fn get_subscriber_cursor(&self, key: String) -> anyhow::Result<Option<Value>> {

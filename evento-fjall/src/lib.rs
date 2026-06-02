@@ -514,6 +514,17 @@ impl Executor for Fjall {
         .await?
     }
 
+    async fn latest_timestamp(
+        &self,
+        aggregators: Option<Vec<ReadAggregator>>,
+        routing_key: Option<RoutingKey>,
+    ) -> anyhow::Result<u64> {
+        let result = self
+            .read(aggregators, routing_key, Args::backward(1, None))
+            .await?;
+        Ok(result.edges.last().map(|e| e.node.timestamp).unwrap_or(0))
+    }
+
     async fn get_subscriber_cursor(&self, key: String) -> anyhow::Result<Option<Value>> {
         let executor = self.clone();
 
