@@ -522,11 +522,7 @@ impl Executor for Fjall {
         let result = self
             .read(aggregators, routing_key, Args::backward(1, None))
             .await?;
-        Ok(result
-            .edges
-            .last()
-            .map(|e| e.node.timestamp)
-            .unwrap_or(0))
+        Ok(result.edges.last().map(|e| e.node.timestamp).unwrap_or(0))
     }
 
     async fn get_subscriber_cursor(&self, key: String) -> anyhow::Result<Option<Value>> {

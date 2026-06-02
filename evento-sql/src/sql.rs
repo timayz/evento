@@ -8,7 +8,9 @@ use sea_query::MysqlQueryBuilder;
 use sea_query::PostgresQueryBuilder;
 #[cfg(feature = "sqlite")]
 use sea_query::SqliteQueryBuilder;
-use sea_query::{Cond, Expr, ExprTrait, Func, Iden, IntoColumnRef, OnConflict, Query, SelectStatement};
+use sea_query::{
+    Cond, Expr, ExprTrait, Func, Iden, IntoColumnRef, OnConflict, Query, SelectStatement,
+};
 use sea_query_sqlx::SqlxBinder;
 use sqlx::{Database, Pool};
 use ulid::Ulid;
@@ -346,10 +348,9 @@ where
 
         let (sql, values) = Self::build_sqlx(statement);
 
-        let (ts,): (Option<i64>,) =
-            sqlx::query_as_with::<DB, (Option<i64>,), _>(&sql, values)
-                .fetch_one(&self.0)
-                .await?;
+        let (ts,): (Option<i64>,) = sqlx::query_as_with::<DB, (Option<i64>,), _>(&sql, values)
+            .fetch_one(&self.0)
+            .await?;
 
         Ok(ts.map(|v| if v < 0 { 0 } else { v as u64 }).unwrap_or(0))
     }
