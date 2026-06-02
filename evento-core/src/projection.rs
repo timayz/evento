@@ -38,7 +38,10 @@
 //!     .await?;
 //! ```
 
-use std::{collections::HashMap, future::Future, marker::PhantomData, ops::Deref, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap, future::Future, marker::PhantomData, ops::Deref, pin::Pin, sync::Arc,
+    time::Duration,
+};
 
 use crate::{
     context,
@@ -253,9 +256,7 @@ pub trait Snapshot<E: Executor>: ProjectionCursor + Sized {
     /// event is observed (see [`Projection::tombstone`]). Override this for
     /// projections backed by a custom table to delete the row; the default
     /// is a no-op.
-    fn drop_snapshot(
-        _context: &Context<'_, E>,
-    ) -> impl Future<Output = anyhow::Result<()>> + Send {
+    fn drop_snapshot(_context: &Context<'_, E>) -> impl Future<Output = anyhow::Result<()>> + Send {
         Box::pin(async { Ok(()) })
     }
 }
@@ -552,8 +553,7 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> LoadBuilder<E, P> {
         aggregator_type: impl Into<String>,
         id: impl Into<String>,
     ) -> Self {
-        self.aggregators
-            .insert(aggregator_type.into(), id.into());
+        self.aggregators.insert(aggregator_type.into(), id.into());
 
         self
     }

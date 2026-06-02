@@ -187,8 +187,8 @@ pub use evento_core::*;
 /// - [`ProjectionCursor`] - Trait for cursor position tracking
 /// - [`Snapshot`] - Trait for snapshot restoration
 pub use evento_core::projection::{
-    Handler, LoadBuilder, Projection, ProjectionAggregator, ProjectionCursor, ProjectionSubscription,
-    Snapshot,
+    Handler, LoadBuilder, Projection, ProjectionAggregator, ProjectionCursor,
+    ProjectionSubscription, Snapshot,
 };
 
 // Re-export SQL types when SQL features are enabled
