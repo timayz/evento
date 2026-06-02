@@ -348,9 +348,10 @@ where
 
         let (sql, values) = Self::build_sqlx(statement);
 
-        let (ts,): (Option<i64>,) = sqlx::query_as_with::<DB, (Option<i64>,), _>(sqlx::AssertSqlSafe(sql.as_str()), values)
-            .fetch_one(&self.0)
-            .await?;
+        let (ts,): (Option<i64>,) =
+            sqlx::query_as_with::<DB, (Option<i64>,), _>(sqlx::AssertSqlSafe(sql.as_str()), values)
+                .fetch_one(&self.0)
+                .await?;
 
         Ok(ts.map(|v| if v < 0 { 0 } else { v as u64 }).unwrap_or(0))
     }
@@ -365,9 +366,12 @@ where
 
         let (sql, values) = Self::build_sqlx(statement);
 
-        let Some((cursor,)) = sqlx::query_as_with::<DB, (Option<String>,), _>(sqlx::AssertSqlSafe(sql.as_str()), values)
-            .fetch_optional(&self.0)
-            .await?
+        let Some((cursor,)) = sqlx::query_as_with::<DB, (Option<String>,), _>(
+            sqlx::AssertSqlSafe(sql.as_str()),
+            values,
+        )
+        .fetch_optional(&self.0)
+        .await?
         else {
             return Ok(None);
         };
@@ -385,9 +389,10 @@ where
 
         let (sql, values) = Self::build_sqlx(statement);
 
-        let (id, enabled) = sqlx::query_as_with::<DB, (String, bool), _>(sqlx::AssertSqlSafe(sql.as_str()), values)
-            .fetch_one(&self.0)
-            .await?;
+        let (id, enabled) =
+            sqlx::query_as_with::<DB, (String, bool), _>(sqlx::AssertSqlSafe(sql.as_str()), values)
+                .fetch_one(&self.0)
+                .await?;
 
         Ok(worker_id.to_string() == id && enabled)
     }
@@ -506,12 +511,13 @@ where
 
         let (sql, values) = Self::build_sqlx(statement);
 
-        Ok(
-            sqlx::query_as_with::<DB, (Vec<u8>, String), _>(sqlx::AssertSqlSafe(sql.as_str()), values)
-                .fetch_optional(&self.0)
-                .await
-                .map(|res| res.map(|(data, cursor)| (data, cursor.into())))?,
+        Ok(sqlx::query_as_with::<DB, (Vec<u8>, String), _>(
+            sqlx::AssertSqlSafe(sql.as_str()),
+            values,
         )
+        .fetch_optional(&self.0)
+        .await
+        .map(|res| res.map(|(data, cursor)| (data, cursor.into())))?)
     }
 
     async fn save_snapshot(
