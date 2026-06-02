@@ -14,7 +14,7 @@ pub async fn forward_asc<DB>(pool: Pool<DB>) -> anyhow::Result<()>
 where
     DB: Database,
     for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
-    sea_query_sqlx::SqlxValues: for<'q> sqlx::IntoArguments<'q, DB>,
+    sea_query_sqlx::SqlxValues: sqlx::IntoArguments<DB>,
     usize: sqlx::ColumnIndex<DB::Row>,
     evento_sql::SqlEvent: for<'r> sqlx::FromRow<'r, DB::Row>,
 {
@@ -44,7 +44,7 @@ pub async fn forward_desc<DB>(pool: Pool<DB>) -> anyhow::Result<()>
 where
     DB: Database,
     for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
-    sea_query_sqlx::SqlxValues: for<'q> sqlx::IntoArguments<'q, DB>,
+    sea_query_sqlx::SqlxValues: sqlx::IntoArguments<DB>,
     usize: sqlx::ColumnIndex<DB::Row>,
     evento_sql::SqlEvent: for<'r> sqlx::FromRow<'r, DB::Row>,
 {
@@ -74,7 +74,7 @@ pub async fn backward_asc<DB>(pool: Pool<DB>) -> anyhow::Result<()>
 where
     DB: Database,
     for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
-    sea_query_sqlx::SqlxValues: for<'q> sqlx::IntoArguments<'q, DB>,
+    sea_query_sqlx::SqlxValues: sqlx::IntoArguments<DB>,
     usize: sqlx::ColumnIndex<DB::Row>,
     evento_sql::SqlEvent: for<'r> sqlx::FromRow<'r, DB::Row>,
 {
@@ -104,7 +104,7 @@ pub async fn backward_desc<DB>(pool: Pool<DB>) -> anyhow::Result<()>
 where
     DB: Database,
     for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
-    sea_query_sqlx::SqlxValues: for<'q> sqlx::IntoArguments<'q, DB>,
+    sea_query_sqlx::SqlxValues: sqlx::IntoArguments<DB>,
     usize: sqlx::ColumnIndex<DB::Row>,
     evento_sql::SqlEvent: for<'r> sqlx::FromRow<'r, DB::Row>,
 {
@@ -138,7 +138,7 @@ pub async fn read<DB>(
 where
     DB: Database,
     for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
-    sea_query_sqlx::SqlxValues: for<'q> sqlx::IntoArguments<'q, DB>,
+    sea_query_sqlx::SqlxValues: sqlx::IntoArguments<DB>,
     usize: sqlx::ColumnIndex<DB::Row>,
     evento_sql::SqlEvent: for<'r> sqlx::FromRow<'r, DB::Row>,
 {
@@ -170,7 +170,7 @@ pub async fn get_data<DB>(pool: &Pool<DB>) -> anyhow::Result<Vec<Event>>
 where
     DB: Database,
     for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
-    sea_query_sqlx::SqlxValues: for<'q> sqlx::IntoArguments<'q, DB>,
+    sea_query_sqlx::SqlxValues: sqlx::IntoArguments<DB>,
 {
     let data = evento_test::get_data();
     let mut statement = Query::insert()
@@ -212,7 +212,7 @@ where
         name => panic!("'{name}' not supported, consider using SQLite, PostgreSQL or MySQL"),
     };
 
-    sqlx::query_with::<DB, _>(&sql, values)
+    sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
         .execute(pool)
         .await?;
 
@@ -221,7 +221,7 @@ where
 
 pub async fn create_pool<DB: Database>(url: impl Into<String>) -> anyhow::Result<Pool<DB>>
 where
-    for<'q> DB::Arguments<'q>: sqlx::IntoArguments<'q, DB>,
+    DB::Arguments: sqlx::IntoArguments<DB>,
     for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
     InitMigration: sqlx_migrator::Migration<DB>,
     M0002: sqlx_migrator::Migration<DB>,

@@ -53,7 +53,7 @@ impl sqlx_migrator::Operation<sqlx::Sqlite> for Operation {
 impl sqlx_migrator::Operation<sqlx::MySql> for Operation {
     async fn up(&self, connection: &mut sqlx::MySqlConnection) -> Result<(), sqlx_migrator::Error> {
         let statment = up_statement().to_string(sea_query::MysqlQueryBuilder);
-        sqlx::query(&statment).execute(connection).await?;
+        sqlx::query(sqlx::AssertSqlSafe(statment.as_str())).execute(connection).await?;
 
         Ok(())
     }
@@ -63,7 +63,7 @@ impl sqlx_migrator::Operation<sqlx::MySql> for Operation {
         connection: &mut sqlx::MySqlConnection,
     ) -> Result<(), sqlx_migrator::Error> {
         let statment = down_statement().to_string(sea_query::MysqlQueryBuilder);
-        sqlx::query(&statment).execute(connection).await?;
+        sqlx::query(sqlx::AssertSqlSafe(statment.as_str())).execute(connection).await?;
 
         Ok(())
     }
@@ -74,14 +74,14 @@ impl sqlx_migrator::Operation<sqlx::MySql> for Operation {
 impl sqlx_migrator::Operation<sqlx::Postgres> for Operation {
     async fn up(&self, connection: &mut sqlx::PgConnection) -> Result<(), sqlx_migrator::Error> {
         let statment = up_statement().to_string(sea_query::PostgresQueryBuilder);
-        sqlx::query(&statment).execute(connection).await?;
+        sqlx::query(sqlx::AssertSqlSafe(statment.as_str())).execute(connection).await?;
 
         Ok(())
     }
 
     async fn down(&self, connection: &mut sqlx::PgConnection) -> Result<(), sqlx_migrator::Error> {
         let statment = down_statement().to_string(sea_query::PostgresQueryBuilder);
-        sqlx::query(&statment).execute(connection).await?;
+        sqlx::query(sqlx::AssertSqlSafe(statment.as_str())).execute(connection).await?;
 
         Ok(())
     }

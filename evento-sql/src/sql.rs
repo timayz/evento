@@ -213,7 +213,7 @@ impl<DB> Executor for Sql<DB>
 where
     DB: Database,
     for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
-    sea_query_sqlx::SqlxValues: for<'q> sqlx::IntoArguments<'q, DB>,
+    sea_query_sqlx::SqlxValues: sqlx::IntoArguments<DB>,
     String: for<'r> sqlx::Decode<'r, DB> + sqlx::Type<DB>,
     bool: for<'r> sqlx::Decode<'r, DB> + sqlx::Type<DB>,
     Vec<u8>: for<'r> sqlx::Decode<'r, DB> + sqlx::Type<DB>,
@@ -348,7 +348,7 @@ where
 
         let (sql, values) = Self::build_sqlx(statement);
 
-        let (ts,): (Option<i64>,) = sqlx::query_as_with::<DB, (Option<i64>,), _>(&sql, values)
+        let (ts,): (Option<i64>,) = sqlx::query_as_with::<DB, (Option<i64>,), _>(sqlx::AssertSqlSafe(sql.as_str()), values)
             .fetch_one(&self.0)
             .await?;
 
@@ -365,7 +365,7 @@ where
 
         let (sql, values) = Self::build_sqlx(statement);
 
-        let Some((cursor,)) = sqlx::query_as_with::<DB, (Option<String>,), _>(&sql, values)
+        let Some((cursor,)) = sqlx::query_as_with::<DB, (Option<String>,), _>(sqlx::AssertSqlSafe(sql.as_str()), values)
             .fetch_optional(&self.0)
             .await?
         else {
@@ -385,7 +385,7 @@ where
 
         let (sql, values) = Self::build_sqlx(statement);
 
-        let (id, enabled) = sqlx::query_as_with::<DB, (String, bool), _>(&sql, values)
+        let (id, enabled) = sqlx::query_as_with::<DB, (String, bool), _>(sqlx::AssertSqlSafe(sql.as_str()), values)
             .fetch_one(&self.0)
             .await?;
 
@@ -407,7 +407,7 @@ where
 
         let (sql, values) = Self::build_sqlx(statement);
 
-        sqlx::query_with::<DB, _>(&sql, values)
+        sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
             .execute(&self.0)
             .await?;
 
@@ -449,7 +449,7 @@ where
 
         let (sql, values) = Self::build_sqlx(statement);
 
-        sqlx::query_with::<DB, _>(&sql, values)
+        sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
             .execute(&self.0)
             .await
             .map_err(|err| {
@@ -482,7 +482,7 @@ where
 
         let (sql, values) = Self::build_sqlx(statement);
 
-        sqlx::query_with::<DB, _>(&sql, values)
+        sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
             .execute(&self.0)
             .await?;
 
@@ -507,7 +507,7 @@ where
         let (sql, values) = Self::build_sqlx(statement);
 
         Ok(
-            sqlx::query_as_with::<DB, (Vec<u8>, String), _>(&sql, values)
+            sqlx::query_as_with::<DB, (Vec<u8>, String), _>(sqlx::AssertSqlSafe(sql.as_str()), values)
                 .fetch_optional(&self.0)
                 .await
                 .map(|res| res.map(|(data, cursor)| (data, cursor.into())))?,
@@ -548,7 +548,7 @@ where
 
         let (sql, values) = Self::build_sqlx(statement);
 
-        sqlx::query_with::<DB, _>(&sql, values)
+        sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
             .execute(&self.0)
             .await?;
 
@@ -696,7 +696,7 @@ impl Reader {
         O: Bind<Cursor = O>,
         <<O as Bind>::I as IntoIterator>::IntoIter: DoubleEndedIterator,
         <<O as Bind>::V as IntoIterator>::IntoIter: DoubleEndedIterator,
-        sea_query_sqlx::SqlxValues: for<'q> sqlx::IntoArguments<'q, DB>,
+        sea_query_sqlx::SqlxValues: sqlx::IntoArguments<DB>,
     {
         let limit = self.build_reader::<O, O>()?;
 
@@ -710,7 +710,7 @@ impl Reader {
             name => panic!("'{name}' not supported, consider using SQLite, PostgreSQL or MySQL"),
         };
 
-        let mut rows = sqlx::query_as_with::<DB, O, _>(&sql, values)
+        let mut rows = sqlx::query_as_with::<DB, O, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
             .fetch_all(executor)
             .await?;
 
