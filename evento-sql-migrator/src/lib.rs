@@ -48,7 +48,7 @@
 //! - [`InitMigration`] - Creates the initial database schema (event, snapshot, subscriber tables)
 //! - [`M0002`] - Adds `timestamp_subsec` column for sub-second precision timestamps
 //! - [`M0003`] - Drops the snapshot table and extends the event name column length
-//! - [`M0004`] - Adds composite indexes covering subscription cursor scans
+//! - [`M0004`] - Replaces `idx_event_type` with a composite cursor-scan index
 //!
 //! # Database Schema
 //!

@@ -13,7 +13,6 @@ fn up_statement() -> IndexCreateStatement {
         .col(Event::Timestamp)
         .col(Event::TimestampSubsec)
         .col(Event::Version)
-        .col(Event::Id)
         .to_owned()
 }
 

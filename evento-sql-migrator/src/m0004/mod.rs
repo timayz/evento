@@ -1,32 +1,36 @@
-//! Migration adding composite indexes for subscription cursor scans.
+//! Migration adding a composite index for subscription cursor scans.
 //!
-//! This module adds two composite indexes on the event table that cover both the
-//! filter and the `ORDER BY` columns used by subscription cursor queries, so the
-//! database can satisfy them with an index scan instead of a temp B-tree sort.
+//! Subscription cursor queries filter on `aggregator_type` (optionally `name`,
+//! always with a `routing_key` predicate) and order by
+//! `(timestamp, timestamp_subsec, version, id)`. The original `idx_event_type`
+//! covers only the filter, so the planner loads every matching row and sorts
+//! externally; this dominates polling cost as the event table grows.
+//!
+//! This migration replaces the single-column `idx_event_type` with one composite
+//! index that covers both filter and sort columns, allowing the planner to walk
+//! the index in sorted order without an external sort.
 
 mod event;
 
 use sqlx_migrator::vec_box;
 
-/// Migration that adds composite cursor-scan indexes to the event table.
-///
-/// Subscription cursor queries filter on `aggregator_type` (optionally also `name`)
-/// and `routing_key`, ordering by `(timestamp, timestamp_subsec, version, id)`.
-/// The original indexes (`idx_event_type`, `idx_event_type_id`,
-/// `idx_event_routing_key_type`) cover only the filter, so the planner must load
-/// every matching row and sort. As the event table grows this becomes the
-/// dominant cost of subscription polling.
+/// Migration that swaps `idx_event_type` for a composite cursor-scan index.
 ///
 /// ## Changes
 ///
-/// Two composite indexes are added. The leading columns match the filter; the
-/// trailing columns match the `ORDER BY`, allowing a forward index scan (read in
-/// reverse for `DESC`) without an external sort:
+/// - Creates `idx_event_type_routing_cursor` on
+///   `(aggregator_type, routing_key, timestamp, timestamp_subsec, version)`.
+/// - Drops `idx_event_type` (redundant once the composite index exists — same
+///   leading column, planner will use the new one).
 ///
-/// - `idx_event_type_routing_cursor` on
-///   `(aggregator_type, routing_key, timestamp, timestamp_subsec, version, id)`
-/// - `idx_event_type_name_routing_cursor` on
-///   `(aggregator_type, name, routing_key, timestamp, timestamp_subsec, version, id)`
+/// ## Notes
+///
+/// - `name` is intentionally not part of the index: it is only ever a
+///   per-aggregator-branch residual predicate inside an OR, and with the typical
+///   small set of event names per aggregator type the residual scan stays cheap.
+/// - The `ORDER BY` tail stops at `version`; `(timestamp, timestamp_subsec,
+///   version)` is unique in practice, so the trailing `id` adds storage without
+///   eliminating any sort work.
 ///
 /// ## Dependencies
 ///
@@ -41,7 +45,7 @@ sqlx_migrator::sqlite_migration!(
     vec_box![crate::M0003],
     vec_box![
         event::create_type_routing_cursor_idx::Operation,
-        event::create_type_name_routing_cursor_idx::Operation,
+        event::drop_type_idx::Operation,
     ]
 );
 
@@ -53,7 +57,7 @@ sqlx_migrator::mysql_migration!(
     vec_box![crate::M0003],
     vec_box![
         event::create_type_routing_cursor_idx::Operation,
-        event::create_type_name_routing_cursor_idx::Operation,
+        event::drop_type_idx::Operation,
     ]
 );
 
@@ -65,6 +69,6 @@ sqlx_migrator::postgres_migration!(
     vec_box![crate::M0003],
     vec_box![
         event::create_type_routing_cursor_idx::Operation,
-        event::create_type_name_routing_cursor_idx::Operation,
+        event::drop_type_idx::Operation,
     ]
 );
