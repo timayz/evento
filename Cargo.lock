@@ -229,6 +229,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "bank-axum-fjall"
+version = "2.0.0-alpha.20"
+dependencies = [
+ "anyhow",
+ "askama",
+ "axum",
+ "bank",
+ "evento",
+ "serde",
+ "tempfile",
+ "tokio",
+ "ulid",
+]
+
+[[package]]
 name = "bank-axum-sqlite"
 version = "2.0.0-alpha.20"
 dependencies = [
