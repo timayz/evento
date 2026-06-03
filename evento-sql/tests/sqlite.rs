@@ -104,6 +104,14 @@ async fn sqlite_subscribe_default_routing_key() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn sqlite_subscribe_default_routing_key_all_isolation() -> anyhow::Result<()> {
+    let pool = create_sqlite_pool("subscribe_default_routing_key_all_isolation").await?;
+
+    evento_test::subscribe_default_routing_key_all_isolation::<Sql<sqlx::Sqlite>>(&pool.into())
+        .await
+}
+
+#[tokio::test]
 async fn sqlite_all_commands() -> anyhow::Result<()> {
     let pool = create_sqlite_pool("all_commands").await?;
 

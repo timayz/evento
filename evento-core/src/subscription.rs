@@ -144,6 +144,7 @@ pub struct SubscriptionBuilder<E: Executor> {
     handlers: HashMap<String, Box<dyn Handler<E>>>,
     context: context::RwContext,
     routing_key: Option<RoutingKey>,
+    prefix_key: Option<String>,
     delay: Option<Duration>,
     chunk_size: u16,
     is_accept_failure: bool,
@@ -168,6 +169,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             chunk_size: 300,
             is_accept_failure: false,
             routing_key: None,
+            prefix_key: None,
             aggregators: Default::default(),
             shutdown_rx: None,
         }
@@ -304,19 +306,32 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
     }
 
     fn key(&self) -> String {
-        if let Some(RoutingKey::Value(Some(ref key))) = self.routing_key {
-            return format!("{key}.{}", self.key);
+        let prefix = match &self.routing_key {
+            Some(RoutingKey::Value(Some(k))) => Some(k.as_str()),
+            Some(RoutingKey::All) => self.prefix_key.as_deref(),
+            _ => None,
+        };
+        match prefix {
+            Some(p) => format!("{p}.{}", self.key),
+            None => self.key.to_owned(),
         }
-
-        self.key.to_owned()
     }
 
-    /// Resolves an unset routing key from the executor's default.
+    /// Resolves an unset routing key from the executor's default and captures
+    /// the default as a storage-key prefix.
     ///
     /// Called once at the top of `start()` / `execute()` before any other
     /// method reads `self.routing_key`. After this, `routing_key` is always
     /// `Some(_)`.
+    ///
+    /// `prefix_key` is captured from `executor.default_routing_key()` even
+    /// when the user has already called `.all()`, so the storage key remains
+    /// scoped to the executor's tenant — otherwise two executors with
+    /// different defaults would share one row in the subscriber table.
     fn resolve_routing_key(&mut self, executor: &E) {
+        if self.prefix_key.is_none() {
+            self.prefix_key = executor.default_routing_key().map(|s| s.to_owned());
+        }
         if self.routing_key.is_some() {
             return;
         }
