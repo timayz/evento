@@ -182,12 +182,9 @@ pub trait Executor: Send + Sync + 'static {
     /// Deletes a stored snapshot for an aggregate.
     ///
     /// Idempotent: deleting a snapshot that does not exist is not an error.
-    async fn delete_snapshot(
-        &self,
-        aggregator_type: String,
-        aggregator_revision: String,
-        id: String,
-    ) -> anyhow::Result<()>;
+    /// Revision is intentionally omitted — `save_snapshot` upserts on
+    /// `(type, id)` so there is only ever one row per aggregate.
+    async fn delete_snapshot(&self, aggregator_type: String, id: String) -> anyhow::Result<()>;
 }
 
 /// Type-erased wrapper around any [`Executor`] implementation.
@@ -275,15 +272,8 @@ impl Executor for Evento {
             .await
     }
 
-    async fn delete_snapshot(
-        &self,
-        aggregator_type: String,
-        aggregator_revision: String,
-        id: String,
-    ) -> anyhow::Result<()> {
-        self.0
-            .delete_snapshot(aggregator_type, aggregator_revision, id)
-            .await
+    async fn delete_snapshot(&self, aggregator_type: String, id: String) -> anyhow::Result<()> {
+        self.0.delete_snapshot(aggregator_type, id).await
     }
 }
 
@@ -421,15 +411,8 @@ impl Executor for EventoGroup {
             .await
     }
 
-    async fn delete_snapshot(
-        &self,
-        aggregator_type: String,
-        aggregator_revision: String,
-        id: String,
-    ) -> anyhow::Result<()> {
-        self.first()
-            .delete_snapshot(aggregator_type, aggregator_revision, id)
-            .await
+    async fn delete_snapshot(&self, aggregator_type: String, id: String) -> anyhow::Result<()> {
+        self.first().delete_snapshot(aggregator_type, id).await
     }
 }
 
@@ -523,15 +506,8 @@ impl<R: Executor, W: Executor> Executor for Rw<R, W> {
             .await
     }
 
-    async fn delete_snapshot(
-        &self,
-        aggregator_type: String,
-        aggregator_revision: String,
-        id: String,
-    ) -> anyhow::Result<()> {
-        self.w
-            .delete_snapshot(aggregator_type, aggregator_revision, id)
-            .await
+    async fn delete_snapshot(&self, aggregator_type: String, id: String) -> anyhow::Result<()> {
+        self.w.delete_snapshot(aggregator_type, id).await
     }
 }
 

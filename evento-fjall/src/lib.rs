@@ -620,12 +620,7 @@ impl Executor for Fjall {
         todo!()
     }
 
-    async fn delete_snapshot(
-        &self,
-        _aggregator_type: String,
-        _aggregator_revision: String,
-        _id: String,
-    ) -> anyhow::Result<()> {
+    async fn delete_snapshot(&self, _aggregator_type: String, _id: String) -> anyhow::Result<()> {
         todo!()
     }
 }

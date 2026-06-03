@@ -561,17 +561,11 @@ where
         Ok(())
     }
 
-    async fn delete_snapshot(
-        &self,
-        aggregator_type: String,
-        aggregator_revision: String,
-        id: String,
-    ) -> anyhow::Result<()> {
+    async fn delete_snapshot(&self, aggregator_type: String, id: String) -> anyhow::Result<()> {
         let statement = Query::delete()
             .from_table(Snapshot::Table)
             .and_where(Expr::col(Snapshot::Type).eq(Expr::value(aggregator_type)))
             .and_where(Expr::col(Snapshot::Id).eq(Expr::value(id)))
-            .and_where(Expr::col(Snapshot::Revision).eq(Expr::value(aggregator_revision)))
             .to_owned();
 
         let (sql, values) = Self::build_sqlx(statement);

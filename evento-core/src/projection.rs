@@ -116,11 +116,7 @@ impl<'a, E: Executor> Context<'a, E> {
     /// Idempotent: no error if no snapshot exists.
     pub async fn drop_snapshot(&self) -> anyhow::Result<()> {
         self.executor
-            .delete_snapshot(
-                self.aggregator_type.to_owned(),
-                self.revision.to_string(),
-                self.id.to_owned(),
-            )
+            .delete_snapshot(self.aggregator_type.to_owned(), self.id.to_owned())
             .await
     }
 
