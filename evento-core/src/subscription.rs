@@ -143,7 +143,7 @@ pub struct SubscriptionBuilder<E: Executor> {
     key: String,
     handlers: HashMap<String, Box<dyn Handler<E>>>,
     context: context::RwContext,
-    routing_key: RoutingKey,
+    routing_key: Option<RoutingKey>,
     delay: Option<Duration>,
     chunk_size: u16,
     is_accept_failure: bool,
@@ -167,7 +167,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             retry: Some(30),
             chunk_size: 300,
             is_accept_failure: false,
-            routing_key: RoutingKey::Value(None),
+            routing_key: None,
             aggregators: Default::default(),
             shutdown_rx: None,
         }
@@ -246,8 +246,9 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
     /// Filters events by routing key.
     ///
     /// Only events with the matching routing key will be processed.
+    /// Overrides any executor-level default.
     pub fn routing_key(mut self, v: impl Into<String>) -> Self {
-        self.routing_key = RoutingKey::Value(Some(v.into()));
+        self.routing_key = Some(RoutingKey::Value(Some(v.into())));
 
         self
     }
@@ -262,8 +263,10 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
     }
 
     /// Processes all events regardless of routing key.
+    ///
+    /// Overrides any executor-level default.
     pub fn all(mut self) -> Self {
-        self.routing_key = RoutingKey::All;
+        self.routing_key = Some(RoutingKey::All);
 
         self
     }
@@ -301,11 +304,30 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
     }
 
     fn key(&self) -> String {
-        if let RoutingKey::Value(Some(ref key)) = self.routing_key {
+        if let Some(RoutingKey::Value(Some(ref key))) = self.routing_key {
             return format!("{key}.{}", self.key);
         }
 
         self.key.to_owned()
+    }
+
+    /// Resolves an unset routing key from the executor's default.
+    ///
+    /// Called once at the top of `start()` / `execute()` before any other
+    /// method reads `self.routing_key`. After this, `routing_key` is always
+    /// `Some(_)`.
+    fn resolve_routing_key(&mut self, executor: &E) {
+        if self.routing_key.is_some() {
+            return;
+        }
+        self.routing_key = Some(match executor.default_routing_key() {
+            Some(k) => RoutingKey::Value(Some(k.to_owned())),
+            None => RoutingKey::Value(None),
+        });
+    }
+
+    fn effective_routing_key(&self) -> RoutingKey {
+        self.routing_key.clone().unwrap_or(RoutingKey::Value(None))
     }
 
     #[tracing::instrument(
@@ -342,7 +364,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             let res = executor
                 .read(
                     Some(aggregators.to_vec()),
-                    Some(self.routing_key.to_owned()),
+                    Some(self.effective_routing_key()),
                     Args::forward(self.chunk_size, cursor),
                 )
                 .await?;
@@ -354,7 +376,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             let timestamp = executor
                 .latest_timestamp(
                     Some(aggregators.to_vec()),
-                    Some(self.routing_key.to_owned()),
+                    Some(self.effective_routing_key()),
                 )
                 .await?;
 
@@ -435,6 +457,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
     where
         E: Clone,
     {
+        self.resolve_routing_key(executor);
         let executor = executor.clone();
         let id = Ulid::new();
         let subscription_id = id;
@@ -532,7 +555,8 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
         aggregator_id = tracing::field::Empty,
         event = tracing::field::Empty,
     ))]
-    pub async fn execute(&self, executor: &E) -> anyhow::Result<()> {
+    pub async fn execute(&mut self, executor: &E) -> anyhow::Result<()> {
+        self.resolve_routing_key(executor);
         let id = Ulid::new();
 
         executor
