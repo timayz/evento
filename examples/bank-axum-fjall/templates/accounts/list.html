@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+
+{% block title %}Accounts - Evento Bank{% endblock %}
+
+{% block content %}
+<div class="card">
+    <h2>Accounts</h2>
+    {% if accounts.is_empty() %}
+    <p>No accounts yet. <a href="/accounts/new">Create one</a>.</p>
+    {% else %}
+    <table>
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>Balance</th>
+                <th>Status</th>
+                <th>Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for account in accounts %}
+            <tr>
+                <td><code>{{ account.id[..8] }}...</code></td>
+                <td>{{ account.balance }} {{ account.currency }}</td>
+                <td>{{ account.status }}</td>
+                <td><a href="/accounts/{{ account.id }}" class="btn">View</a></td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% endif %}
+</div>
+
+<p style="margin-top: 1rem;">
+    <a href="/accounts/new" class="btn btn-success">+ New Account</a>
+</p>
+{% endblock %}

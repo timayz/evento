@@ -221,3 +221,11 @@ pub use evento_sql::Postgres;
 /// SQLite executor type alias.
 #[cfg(feature = "sqlite")]
 pub use evento_sql::Sqlite;
+
+/// Fjall executor and types (requires `fjall` feature).
+#[cfg(feature = "fjall")]
+pub use evento_fjall as fjall;
+
+/// Fjall executor type alias.
+#[cfg(feature = "fjall")]
+pub use evento_fjall::Fjall;
