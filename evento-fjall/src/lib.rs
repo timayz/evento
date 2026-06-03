@@ -49,15 +49,16 @@
 //! - `routing_index` - Routing key index: `{routing_key}\0{ULID}` -> `()`
 //! - `type_index` - Event type index: `{type}\0{name}\0{ULID}` -> `()`
 //! - `subscribers` - Subscription state: `{key}` -> `SubscriberState`
+//! - `snapshots` - Aggregate snapshots: `{type}\0{id}` -> `StoredSnapshot`
 
 use std::path::Path;
 
 use evento_core::{
-    cursor::{Args, Cursor, ReadResult, Value},
+    cursor::{Args, ReadResult, Value},
     metadata::Metadata,
     Event, Executor, ReadAggregator, RoutingKey, WriteError,
 };
-use fjall::{Config, Keyspace, Partition, PartitionCreateOptions, PersistMode};
+use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 use ulid::Ulid;
 
 /// Subscriber state stored in the database.
@@ -66,6 +67,14 @@ struct SubscriberState {
     worker_id: String,
     cursor: Option<String>,
     lag: u64,
+}
+
+/// Snapshot record stored in the database.
+#[derive(Debug, Clone, bitcode::Encode, bitcode::Decode)]
+struct StoredSnapshot {
+    revision: String,
+    data: Vec<u8>,
+    cursor: String,
 }
 
 /// Stored event in fjall format.
@@ -134,29 +143,30 @@ impl TryFrom<StoredEvent> for Event {
 /// let executor = Fjall::open("./events.db")?;
 ///
 /// // Or with custom configuration
-/// let keyspace = fjall::Config::new("./events.db")
-///     .max_write_buffer_size(64 * 1024 * 1024)
+/// let db = fjall::Database::builder("./events.db")
 ///     .open()?;
-/// let executor = Fjall::from_keyspace(keyspace)?;
+/// let executor = Fjall::from_database(db)?;
 /// ```
 pub struct Fjall {
-    keyspace: Keyspace,
-    events: Partition,
-    agg_index: Partition,
-    routing_index: Partition,
-    type_index: Partition,
-    subscribers: Partition,
+    db: Database,
+    events: Keyspace,
+    agg_index: Keyspace,
+    routing_index: Keyspace,
+    type_index: Keyspace,
+    subscribers: Keyspace,
+    snapshots: Keyspace,
 }
 
 impl Clone for Fjall {
     fn clone(&self) -> Self {
         Self {
-            keyspace: self.keyspace.clone(),
+            db: self.db.clone(),
             events: self.events.clone(),
             agg_index: self.agg_index.clone(),
             routing_index: self.routing_index.clone(),
             type_index: self.type_index.clone(),
             subscribers: self.subscribers.clone(),
+            snapshots: self.snapshots.clone(),
         }
     }
 }
@@ -168,41 +178,39 @@ impl Fjall {
     ///
     /// # Errors
     ///
-    /// Returns an error if the database cannot be opened or partitions
+    /// Returns an error if the database cannot be opened or keyspaces
     /// cannot be created.
     pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let keyspace = Config::new(path).open()?;
-        Self::from_keyspace(keyspace)
+        let db = Database::builder(path).open()?;
+        Self::from_database(db)
     }
 
-    /// Creates an executor from an existing keyspace.
+    /// Creates an executor from an existing database.
     ///
-    /// Use this when you need custom keyspace configuration.
+    /// Use this when you need custom database configuration.
     ///
     /// # Example
     ///
     /// ```rust,ignore
-    /// let keyspace = fjall::Config::new("./events.db")
-    ///     .max_write_buffer_size(128 * 1024 * 1024)
+    /// let db = fjall::Database::builder("./events.db")
     ///     .open()?;
-    /// let executor = Fjall::from_keyspace(keyspace)?;
+    /// let executor = Fjall::from_database(db)?;
     /// ```
-    pub fn from_keyspace(keyspace: Keyspace) -> anyhow::Result<Self> {
-        let opts = PartitionCreateOptions::default();
-
+    pub fn from_database(db: Database) -> anyhow::Result<Self> {
         Ok(Self {
-            events: keyspace.open_partition("events", opts.clone())?,
-            agg_index: keyspace.open_partition("agg_index", opts.clone())?,
-            routing_index: keyspace.open_partition("routing_index", opts.clone())?,
-            type_index: keyspace.open_partition("type_index", opts.clone())?,
-            subscribers: keyspace.open_partition("subscribers", opts)?,
-            keyspace,
+            events: db.keyspace("events", KeyspaceCreateOptions::default)?,
+            agg_index: db.keyspace("agg_index", KeyspaceCreateOptions::default)?,
+            routing_index: db.keyspace("routing_index", KeyspaceCreateOptions::default)?,
+            type_index: db.keyspace("type_index", KeyspaceCreateOptions::default)?,
+            subscribers: db.keyspace("subscribers", KeyspaceCreateOptions::default)?,
+            snapshots: db.keyspace("snapshots", KeyspaceCreateOptions::default)?,
+            db,
         })
     }
 
-    /// Returns a reference to the underlying keyspace.
-    pub fn keyspace(&self) -> &Keyspace {
-        &self.keyspace
+    /// Returns a reference to the underlying database.
+    pub fn database(&self) -> &Database {
+        &self.db
     }
 
     /// Persists all pending writes to disk.
@@ -210,7 +218,7 @@ impl Fjall {
     /// By default, writes are persisted after each batch. Call this
     /// if you need to ensure durability at a specific point.
     pub fn persist(&self) -> anyhow::Result<()> {
-        self.keyspace.persist(PersistMode::SyncAll)?;
+        self.db.persist(PersistMode::SyncAll)?;
         Ok(())
     }
 
@@ -250,6 +258,11 @@ impl Fjall {
         format!("{}\x00", routing_key)
     }
 
+    /// Builds the snapshot key.
+    fn snapshot_key(aggregator_type: &str, id: &str) -> Vec<u8> {
+        format!("{}\x00{}", aggregator_type, id).into_bytes()
+    }
+
     /// Gets the last version for an aggregate.
     fn get_last_version(
         &self,
@@ -258,10 +271,10 @@ impl Fjall {
     ) -> anyhow::Result<Option<u16>> {
         let prefix = Self::agg_prefix(aggregator_type, aggregator_id);
 
-        if let Some(result) = self.agg_index.prefix(&prefix).next_back() {
-            let kv = result?;
+        if let Some(guard) = self.agg_index.prefix(&prefix).next_back() {
+            let (key, _) = guard.into_inner()?;
             // Version is the last 2 bytes of the key
-            let key_bytes = kv.0.as_ref();
+            let key_bytes = key.as_ref();
             if key_bytes.len() >= 2 {
                 let version_bytes: [u8; 2] = key_bytes[key_bytes.len() - 2..].try_into().unwrap();
                 return Ok(Some(u16::from_be_bytes(version_bytes)));
@@ -275,7 +288,7 @@ impl Fjall {
     fn load_event(&self, id: &Ulid) -> anyhow::Result<Option<Event>> {
         match self.events.get(id.to_bytes())? {
             Some(bytes) => {
-                let stored: StoredEvent = bitcode::decode(&bytes)
+                let stored: StoredEvent = bitcode::decode(bytes.as_ref())
                     .map_err(|e| anyhow::anyhow!("Failed to deserialize event: {}", e))?;
                 Ok(Some(stored.try_into()?))
             }
@@ -310,9 +323,9 @@ impl Fjall {
                         // Specific aggregate ID with event name filter
                         (Some(id), Some(name)) => {
                             let prefix = Self::agg_prefix(&agg.aggregator_type, id);
-                            for kv in self.agg_index.prefix(&prefix) {
-                                let kv = kv?;
-                                let ulid_bytes: [u8; 16] = kv.1.as_ref().try_into()?;
+                            for guard in self.agg_index.prefix(&prefix) {
+                                let (_, value) = guard.into_inner()?;
+                                let ulid_bytes: [u8; 16] = value.as_ref().try_into()?;
                                 let ulid = Ulid::from_bytes(ulid_bytes);
 
                                 // Check if event matches name filter
@@ -326,18 +339,18 @@ impl Fjall {
                         // Specific aggregate ID, all events
                         (Some(id), None) => {
                             let prefix = Self::agg_prefix(&agg.aggregator_type, id);
-                            for kv in self.agg_index.prefix(&prefix) {
-                                let kv = kv?;
-                                let ulid_bytes: [u8; 16] = kv.1.as_ref().try_into()?;
+                            for guard in self.agg_index.prefix(&prefix) {
+                                let (_, value) = guard.into_inner()?;
+                                let ulid_bytes: [u8; 16] = value.as_ref().try_into()?;
                                 add_unique!(Ulid::from_bytes(ulid_bytes));
                             }
                         }
                         // All aggregates of type, specific event name
                         (None, Some(name)) => {
                             let prefix = Self::type_prefix(&agg.aggregator_type, name);
-                            for kv in self.type_index.prefix(&prefix) {
-                                let kv = kv?;
-                                let key_bytes = kv.0.as_ref();
+                            for guard in self.type_index.prefix(&prefix) {
+                                let (key, _) = guard.into_inner()?;
+                                let key_bytes = key.as_ref();
                                 if key_bytes.len() >= 16 {
                                     let ulid_bytes: [u8; 16] =
                                         key_bytes[key_bytes.len() - 16..].try_into()?;
@@ -348,9 +361,9 @@ impl Fjall {
                         // All events of aggregator type - scan all
                         (None, None) => {
                             let prefix = format!("{}\x00", agg.aggregator_type);
-                            for kv in self.agg_index.prefix(&prefix) {
-                                let kv = kv?;
-                                let ulid_bytes: [u8; 16] = kv.1.as_ref().try_into()?;
+                            for guard in self.agg_index.prefix(&prefix) {
+                                let (_, value) = guard.into_inner()?;
+                                let ulid_bytes: [u8; 16] = value.as_ref().try_into()?;
                                 add_unique!(Ulid::from_bytes(ulid_bytes));
                             }
                         }
@@ -360,9 +373,9 @@ impl Fjall {
             // Query by routing key only
             (None, Some(RoutingKey::Value(Some(ref key)))) => {
                 let prefix = Self::routing_prefix(key);
-                for kv in self.routing_index.prefix(&prefix) {
-                    let kv = kv?;
-                    let key_bytes = kv.0.as_ref();
+                for guard in self.routing_index.prefix(&prefix) {
+                    let (key, _) = guard.into_inner()?;
+                    let key_bytes = key.as_ref();
                     if key_bytes.len() >= 16 {
                         let ulid_bytes: [u8; 16] = key_bytes[key_bytes.len() - 16..].try_into()?;
                         add_unique!(Ulid::from_bytes(ulid_bytes));
@@ -371,9 +384,9 @@ impl Fjall {
             }
             // Query all events
             _ => {
-                for kv in self.events.iter() {
-                    let kv = kv?;
-                    let ulid_bytes: [u8; 16] = kv.0.as_ref().try_into()?;
+                for guard in self.events.iter() {
+                    let (key, _) = guard.into_inner()?;
+                    let ulid_bytes: [u8; 16] = key.as_ref().try_into()?;
                     add_unique!(Ulid::from_bytes(ulid_bytes));
                 }
             }
@@ -407,7 +420,7 @@ impl Executor for Fjall {
             }
 
             // Write atomically using batch
-            let mut batch = executor.keyspace.batch();
+            let mut batch = executor.db.batch();
 
             for event in &events {
                 let id_bytes = event.id.to_bytes();
@@ -415,7 +428,7 @@ impl Executor for Fjall {
                 let event_bytes = bitcode::encode(&stored);
 
                 // Primary: ULID -> Event
-                batch.insert(&executor.events, id_bytes, event_bytes.as_slice());
+                batch.insert(&executor.events, id_bytes, event_bytes);
 
                 // Aggregate index: {type}\0{id}\0{version} -> ULID
                 let agg_key =
@@ -435,7 +448,7 @@ impl Executor for Fjall {
 
             batch.commit().map_err(|e| WriteError::Unknown(e.into()))?;
             executor
-                .keyspace
+                .db
                 .persist(PersistMode::SyncAll)
                 .map_err(|e| WriteError::Unknown(e.into()))?;
 
@@ -454,43 +467,17 @@ impl Executor for Fjall {
         let executor = self.clone();
 
         tokio::task::spawn_blocking(move || {
-            let is_backward = args.is_backward();
-            let (limit, cursor) = args.get_info();
+            // Collect matching event IDs (deduplicated across the aggregator filters).
+            let event_ids = executor.collect_event_ids(&aggregators, &routing_key)?;
 
-            // Collect matching event IDs
-            let mut event_ids = executor.collect_event_ids(&aggregators, &routing_key)?;
-
-            // Sort by ULID (time-ordered)
-            event_ids.sort();
-            if is_backward {
-                event_ids.reverse();
-            }
-
-            // Apply cursor filter
-            if let Some(ref cursor_value) = cursor {
-                let cursor_data = Event::deserialize_cursor(cursor_value)?;
-                let cursor_ulid = Ulid::from_string(&cursor_data.i)?;
-
-                event_ids.retain(|id| {
-                    if is_backward {
-                        *id < cursor_ulid
-                    } else {
-                        *id > cursor_ulid
-                    }
-                });
-            }
-
-            // Load events, filtering by routing key, until we have enough
-            let target_count = (limit + 1) as usize;
-            let mut events = Vec::new();
-
+            // Load every matching event and apply the routing-key filter. The cursor
+            // is intentionally NOT pre-filtered here: `Event`'s cursor uses
+            // (timestamp, subsec, version, id), which can disagree with raw ULID
+            // ordering when events land in the same millisecond. `Reader::execute`
+            // applies the canonical sort, cursor predicate, and limit.
+            let mut events = Vec::with_capacity(event_ids.len());
             for id in event_ids {
-                if events.len() >= target_count {
-                    break;
-                }
-
                 if let Some(event) = executor.load_event(&id)? {
-                    // Apply routing key filter if specified
                     let matches = match &routing_key {
                         Some(RoutingKey::Value(Some(ref key))) => {
                             event.routing_key.as_ref() == Some(key)
@@ -505,7 +492,6 @@ impl Executor for Fjall {
                 }
             }
 
-            // Build paginated result
             evento_core::cursor::Reader::new(events)
                 .args(args)
                 .execute()
@@ -530,7 +516,7 @@ impl Executor for Fjall {
 
         tokio::task::spawn_blocking(move || match executor.subscribers.get(&key)? {
             Some(bytes) => {
-                let state: SubscriberState = bitcode::decode(&bytes)
+                let state: SubscriberState = bitcode::decode(bytes.as_ref())
                     .map_err(|e| anyhow::anyhow!("Failed to deserialize subscriber: {}", e))?;
                 Ok(state.cursor.map(Value))
             }
@@ -544,7 +530,7 @@ impl Executor for Fjall {
 
         tokio::task::spawn_blocking(move || match executor.subscribers.get(&key)? {
             Some(bytes) => {
-                let state: SubscriberState = bitcode::decode(&bytes)
+                let state: SubscriberState = bitcode::decode(bytes.as_ref())
                     .map_err(|e| anyhow::anyhow!("Failed to deserialize subscriber: {}", e))?;
                 Ok(state.worker_id == worker_id.to_string())
             }
@@ -560,7 +546,7 @@ impl Executor for Fjall {
             // Try to preserve existing cursor if subscriber exists
             let cursor = match executor.subscribers.get(&key)? {
                 Some(bytes) => {
-                    let state: SubscriberState = bitcode::decode(&bytes)
+                    let state: SubscriberState = bitcode::decode(bytes.as_ref())
                         .map_err(|e| anyhow::anyhow!("Failed to deserialize subscriber: {}", e))?;
                     state.cursor
                 }
@@ -573,7 +559,9 @@ impl Executor for Fjall {
                 lag: 0,
             };
 
-            executor.subscribers.insert(&key, bitcode::encode(&state))?;
+            executor
+                .subscribers
+                .insert(key.as_bytes(), bitcode::encode(&state))?;
             Ok(())
         })
         .await?
@@ -585,7 +573,7 @@ impl Executor for Fjall {
         tokio::task::spawn_blocking(move || {
             let state = match executor.subscribers.get(&key)? {
                 Some(bytes) => {
-                    let mut state: SubscriberState = bitcode::decode(&bytes)
+                    let mut state: SubscriberState = bitcode::decode(bytes.as_ref())
                         .map_err(|e| anyhow::anyhow!("Failed to deserialize subscriber: {}", e))?;
                     state.cursor = Some(cursor.0);
                     state.lag = lag;
@@ -594,7 +582,9 @@ impl Executor for Fjall {
                 None => anyhow::bail!("Subscriber not found: {}", key),
             };
 
-            executor.subscribers.insert(&key, bitcode::encode(&state))?;
+            executor
+                .subscribers
+                .insert(key.as_bytes(), bitcode::encode(&state))?;
             Ok(())
         })
         .await?
@@ -602,34 +592,80 @@ impl Executor for Fjall {
 
     async fn get_snapshot(
         &self,
-        _aggregator_type: String,
-        _aggregator_revision: String,
-        _id: String,
+        aggregator_type: String,
+        aggregator_revision: String,
+        id: String,
     ) -> anyhow::Result<Option<(Vec<u8>, Value)>> {
-        todo!()
+        let executor = self.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let key = Fjall::snapshot_key(&aggregator_type, &id);
+            match executor.snapshots.get(&key)? {
+                Some(bytes) => {
+                    let stored: StoredSnapshot = bitcode::decode(bytes.as_ref())
+                        .map_err(|e| anyhow::anyhow!("Failed to deserialize snapshot: {}", e))?;
+
+                    // Revision mismatch invalidates the snapshot (forces a rebuild).
+                    if stored.revision != aggregator_revision {
+                        return Ok(None);
+                    }
+
+                    Ok(Some((stored.data, Value(stored.cursor))))
+                }
+                None => Ok(None),
+            }
+        })
+        .await?
     }
 
     async fn save_snapshot(
         &self,
-        _aggregator_type: String,
-        _aggregator_revision: String,
-        _id: String,
-        _data: Vec<u8>,
-        _cursor: Value,
+        aggregator_type: String,
+        aggregator_revision: String,
+        id: String,
+        data: Vec<u8>,
+        cursor: Value,
     ) -> anyhow::Result<()> {
-        todo!()
+        let executor = self.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let key = Fjall::snapshot_key(&aggregator_type, &id);
+            let stored = StoredSnapshot {
+                revision: aggregator_revision,
+                data,
+                cursor: cursor.0,
+            };
+
+            executor.snapshots.insert(key, bitcode::encode(&stored))?;
+            Ok(())
+        })
+        .await?
     }
 
-    async fn delete_snapshot(&self, _aggregator_type: String, _id: String) -> anyhow::Result<()> {
-        todo!()
+    async fn delete_snapshot(&self, aggregator_type: String, id: String) -> anyhow::Result<()> {
+        let executor = self.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let key = Fjall::snapshot_key(&aggregator_type, &id);
+            executor.snapshots.remove(key)?;
+            Ok(())
+        })
+        .await?
     }
 }
 
-impl From<Keyspace> for Fjall {
-    fn from(keyspace: Keyspace) -> Self {
-        Self::from_keyspace(keyspace).expect("Failed to create Fjall from keyspace")
+impl From<Database> for Fjall {
+    fn from(db: Database) -> Self {
+        Self::from_database(db).expect("Failed to create Fjall from database")
     }
 }
+
+/// Read-write executor pair for Fjall.
+///
+/// Used in CQRS patterns where reads and writes are routed to the same
+/// embedded store; both halves share a single Fjall handle.
+#[cfg(feature = "rw")]
+pub type RwFjall = evento_core::Rw<Fjall, Fjall>;
 
 #[cfg(test)]
 mod tests {
@@ -730,5 +766,92 @@ mod tests {
         // Check cursor is updated
         let cursor = executor.get_subscriber_cursor(key).await.unwrap();
         assert_eq!(cursor.unwrap().0, "test-cursor");
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_lifecycle() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let executor = Fjall::open(temp_dir.path()).unwrap();
+
+        let aggregator_type = "test/Account".to_string();
+        let revision = "1".to_string();
+        let id = "agg-1".to_string();
+        let data = vec![10, 20, 30];
+        let cursor = Value("cursor-1".to_string());
+
+        // Initially: no snapshot
+        let result = executor
+            .get_snapshot(aggregator_type.clone(), revision.clone(), id.clone())
+            .await
+            .unwrap();
+        assert!(result.is_none());
+
+        // Save snapshot
+        executor
+            .save_snapshot(
+                aggregator_type.clone(),
+                revision.clone(),
+                id.clone(),
+                data.clone(),
+                cursor.clone(),
+            )
+            .await
+            .unwrap();
+
+        // Get matching revision returns the snapshot
+        let (got_data, got_cursor) = executor
+            .get_snapshot(aggregator_type.clone(), revision.clone(), id.clone())
+            .await
+            .unwrap()
+            .expect("snapshot should exist");
+        assert_eq!(got_data, data);
+        assert_eq!(got_cursor.0, cursor.0);
+
+        // Get with different revision returns None (revision invalidation)
+        let result = executor
+            .get_snapshot(aggregator_type.clone(), "2".to_string(), id.clone())
+            .await
+            .unwrap();
+        assert!(result.is_none());
+
+        // Overwriting with a new revision works
+        let new_data = vec![40, 50];
+        let new_cursor = Value("cursor-2".to_string());
+        executor
+            .save_snapshot(
+                aggregator_type.clone(),
+                "2".to_string(),
+                id.clone(),
+                new_data.clone(),
+                new_cursor.clone(),
+            )
+            .await
+            .unwrap();
+
+        let (got_data, got_cursor) = executor
+            .get_snapshot(aggregator_type.clone(), "2".to_string(), id.clone())
+            .await
+            .unwrap()
+            .expect("snapshot should exist");
+        assert_eq!(got_data, new_data);
+        assert_eq!(got_cursor.0, new_cursor.0);
+
+        // Delete snapshot
+        executor
+            .delete_snapshot(aggregator_type.clone(), id.clone())
+            .await
+            .unwrap();
+
+        let result = executor
+            .get_snapshot(aggregator_type, "2".to_string(), id.clone())
+            .await
+            .unwrap();
+        assert!(result.is_none());
+
+        // Delete is idempotent
+        executor
+            .delete_snapshot("test/Account".to_string(), id)
+            .await
+            .unwrap();
     }
 }
