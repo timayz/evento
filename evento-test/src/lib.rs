@@ -779,6 +779,95 @@ pub async fn subscribe_default<E: Executor + Clone>(executor: &E) -> anyhow::Res
     Ok(())
 }
 
+pub async fn subscribe_default_routing_key<E: Executor + Clone>(
+    executor: &E,
+) -> anyhow::Result<()> {
+    // Wrap the underlying executor in an Evento with a global default routing key.
+    let evento = evento::Evento::new(executor.clone()).default_routing_key("default-region");
+    let cmd = bank::Command(evento.clone());
+
+    // (1) Writing without an explicit routing key should pick up the executor default.
+    let default_account_id = cmd
+        .open_account(OpenAccount {
+            owner_id: "owner_default".to_owned(),
+            owner_name: "Default User".to_owned(),
+            account_type: AccountType::Checking,
+            currency: "USD".to_owned(),
+            initial_balance: 1000,
+        })
+        .await?;
+
+    // (2) Writing with an explicit routing key should still win over the default.
+    let other_account_id = cmd
+        .open_account_with_routing(
+            OpenAccount {
+                owner_id: "owner_other".to_owned(),
+                owner_name: "Other User".to_owned(),
+                account_type: AccountType::Checking,
+                currency: "EUR".to_owned(),
+                initial_balance: 2000,
+            },
+            "other-region",
+        )
+        .await?;
+
+    assert_eq!(
+        last_routing_key(&evento, &default_account_id).await?,
+        Some("default-region".to_owned()),
+        "events without explicit routing key should inherit the executor default"
+    );
+    assert_eq!(
+        last_routing_key(&evento, &other_account_id).await?,
+        Some("other-region".to_owned()),
+        "explicit per-aggregator routing key must win over the executor default"
+    );
+
+    // Drop any state these accounts left behind so we can observe the subscription pass.
+    {
+        let mut rows = simple::ROWS.write().unwrap();
+        rows.remove(&default_account_id);
+        rows.remove(&other_account_id);
+    }
+
+    // (3) A subscription with neither .routing_key() nor .all() should inherit the
+    // executor default when started against the Evento wrapper.
+    simple::subscription().unretry_execute(&evento).await?;
+
+    {
+        let rows = simple::ROWS.read().unwrap();
+        assert!(
+            rows.contains_key(&default_account_id),
+            "default-region account should be processed by the inherited subscription"
+        );
+        assert!(
+            !rows.contains_key(&other_account_id),
+            "other-region account should NOT be processed by the inherited subscription"
+        );
+    }
+
+    // (4) An explicit .routing_key("other-region") on the SubscriptionBuilder still
+    // overrides the executor default. Use a separate subscription key to keep its
+    // cursor independent from the one above.
+    simple_explicit::subscription("simple_other")
+        .routing_key("other-region")
+        .unretry_execute(&evento)
+        .await?;
+
+    {
+        let rows = simple_explicit::ROWS.read().unwrap();
+        let other_row = rows.get(&other_account_id).expect(
+            "other-region account should be processed when subscription explicitly opts in",
+        );
+        assert_eq!(other_row.status, AccountStatus::Active);
+        assert!(
+            !rows.contains_key(&default_account_id),
+            "default-region account should NOT be processed by an explicit other-region subscription"
+        );
+    }
+
+    Ok(())
+}
+
 pub async fn subscribe_multiple_aggregator<E: Executor + Clone>(
     executor: &E,
 ) -> anyhow::Result<()> {
@@ -1445,6 +1534,46 @@ mod simple {
             event.aggregator_id.to_owned(),
             Row {
                 status: AccountStatus::Closed,
+            },
+        );
+
+        Ok(())
+    }
+}
+
+mod simple_explicit {
+    use std::{collections::HashMap, sync::RwLock};
+
+    use bank::aggregator::AccountOpened;
+    use bank::AccountStatus;
+    use evento::{
+        metadata::Event,
+        subscription::{Context, SubscriptionBuilder},
+        Executor,
+    };
+    use once_cell::sync::Lazy;
+
+    pub static ROWS: Lazy<RwLock<HashMap<String, Row>>> = Lazy::new(Default::default);
+
+    #[derive(Default)]
+    pub struct Row {
+        pub status: AccountStatus,
+    }
+
+    pub fn subscription<E: Executor>(key: impl Into<String>) -> SubscriptionBuilder<E> {
+        SubscriptionBuilder::new(key).handler(handle_account_opened())
+    }
+
+    #[evento::subscription]
+    async fn handle_account_opened<E: Executor>(
+        _context: &Context<'_, E>,
+        event: Event<AccountOpened>,
+    ) -> anyhow::Result<()> {
+        let mut rows = ROWS.write().unwrap();
+        rows.insert(
+            event.aggregator_id.to_owned(),
+            Row {
+                status: AccountStatus::Active,
             },
         );
 

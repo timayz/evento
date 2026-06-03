@@ -84,6 +84,12 @@ async fn fjall_subscribe_default_multiple_aggregator() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn fjall_subscribe_default_routing_key() -> anyhow::Result<()> {
+    let (executor, _temp_dir) = create_fjall_executor("subscribe_default_routing_key")?;
+    evento_test::subscribe_default_routing_key(&executor).await
+}
+
+#[tokio::test]
 async fn fjall_all_commands() -> anyhow::Result<()> {
     let (executor, _temp_dir) = create_fjall_executor("all_commands")?;
     evento_test::all_commands(&executor).await

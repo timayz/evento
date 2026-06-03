@@ -414,7 +414,7 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
         ProjectionSubscription {
             projection: self,
             key: key.into(),
-            routing_key: RoutingKey::Value(None),
+            routing_key: None,
             chunk_size: 300,
             retry: Some(30),
             delay: None,
@@ -575,7 +575,7 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> LoadBuilder<E, P> {
 pub struct ProjectionSubscription<E: Executor, P: Default + 'static> {
     projection: Projection<E, P>,
     key: String,
-    routing_key: RoutingKey,
+    routing_key: Option<RoutingKey>,
     chunk_size: u16,
     retry: Option<u8>,
     delay: Option<Duration>,
@@ -588,14 +588,18 @@ where
     P: Snapshot<E> + Default + Send + Sync + 'static,
 {
     /// Filters events by routing key.
+    ///
+    /// Overrides any executor-level default.
     pub fn routing_key(mut self, v: impl Into<String>) -> Self {
-        self.routing_key = RoutingKey::Value(Some(v.into()));
+        self.routing_key = Some(RoutingKey::Value(Some(v.into())));
         self
     }
 
     /// Processes all events regardless of routing key.
+    ///
+    /// Overrides any executor-level default.
     pub fn all(mut self) -> Self {
-        self.routing_key = RoutingKey::All;
+        self.routing_key = Some(RoutingKey::All);
         self
     }
 
@@ -666,9 +670,9 @@ where
 
         let mut builder: SubscriptionBuilder<E> = SubscriptionBuilder::new(key);
         builder = match routing_key {
-            RoutingKey::All => builder.all(),
-            RoutingKey::Value(Some(v)) => builder.routing_key(v),
-            RoutingKey::Value(None) => builder,
+            Some(RoutingKey::All) => builder.all(),
+            Some(RoutingKey::Value(Some(v))) => builder.routing_key(v),
+            Some(RoutingKey::Value(None)) | None => builder,
         };
         builder = builder.chunk_size(chunk_size);
         builder = match retry {

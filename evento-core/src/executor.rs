@@ -120,6 +120,17 @@ impl Hash for ReadAggregator {
 /// - `acknowledge` - Update subscription cursor
 #[async_trait::async_trait]
 pub trait Executor: Send + Sync + 'static {
+    /// Default routing key applied to writes and inherited by subscriptions.
+    ///
+    /// Most backends return `None`; [`Evento`] overrides this to expose its
+    /// configured default. Used by `Evento::write` to fill in missing routing
+    /// keys, and by `SubscriptionBuilder::start` /
+    /// `ProjectionSubscription::start` to inherit a default when the user
+    /// has not called `.routing_key()` or `.all()`.
+    fn default_routing_key(&self) -> Option<&str> {
+        None
+    }
+
     /// Persists events atomically.
     ///
     /// Returns `WriteError::InvalidOriginalVersion` if version conflicts occur.
@@ -201,18 +212,35 @@ pub trait Executor: Send + Sync + 'static {
 /// // Use like any executor
 /// evento.write(events).await?;
 /// ```
-pub struct Evento(Arc<Box<dyn Executor>>);
+pub struct Evento {
+    inner: Arc<Box<dyn Executor>>,
+    default_routing_key: Option<String>,
+}
 
 impl Clone for Evento {
     fn clone(&self) -> Self {
-        Self(self.0.clone())
+        Self {
+            inner: self.inner.clone(),
+            default_routing_key: self.default_routing_key.clone(),
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl Executor for Evento {
-    async fn write(&self, events: Vec<Event>) -> Result<(), WriteError> {
-        self.0.write(events).await
+    fn default_routing_key(&self) -> Option<&str> {
+        self.default_routing_key.as_deref()
+    }
+
+    async fn write(&self, mut events: Vec<Event>) -> Result<(), WriteError> {
+        if let Some(default) = self.default_routing_key.as_deref() {
+            for event in &mut events {
+                if event.routing_key.is_none() {
+                    event.routing_key = Some(default.to_owned());
+                }
+            }
+        }
+        self.inner.write(events).await
     }
 
     async fn read(
@@ -221,7 +249,7 @@ impl Executor for Evento {
         routing_key: Option<RoutingKey>,
         args: Args,
     ) -> anyhow::Result<ReadResult<Event>> {
-        self.0.read(aggregators, routing_key, args).await
+        self.inner.read(aggregators, routing_key, args).await
     }
 
     async fn latest_timestamp(
@@ -229,23 +257,23 @@ impl Executor for Evento {
         aggregators: Option<Vec<ReadAggregator>>,
         routing_key: Option<RoutingKey>,
     ) -> anyhow::Result<u64> {
-        self.0.latest_timestamp(aggregators, routing_key).await
+        self.inner.latest_timestamp(aggregators, routing_key).await
     }
 
     async fn get_subscriber_cursor(&self, key: String) -> anyhow::Result<Option<Value>> {
-        self.0.get_subscriber_cursor(key).await
+        self.inner.get_subscriber_cursor(key).await
     }
 
     async fn is_subscriber_running(&self, key: String, worker_id: Ulid) -> anyhow::Result<bool> {
-        self.0.is_subscriber_running(key, worker_id).await
+        self.inner.is_subscriber_running(key, worker_id).await
     }
 
     async fn upsert_subscriber(&self, key: String, worker_id: Ulid) -> anyhow::Result<()> {
-        self.0.upsert_subscriber(key, worker_id).await
+        self.inner.upsert_subscriber(key, worker_id).await
     }
 
     async fn acknowledge(&self, key: String, cursor: Value, lag: u64) -> anyhow::Result<()> {
-        self.0.acknowledge(key, cursor, lag).await
+        self.inner.acknowledge(key, cursor, lag).await
     }
 
     async fn get_snapshot(
@@ -254,7 +282,7 @@ impl Executor for Evento {
         aggregator_revision: String,
         id: String,
     ) -> anyhow::Result<Option<(Vec<u8>, Value)>> {
-        self.0
+        self.inner
             .get_snapshot(aggregator_type, aggregator_revision, id)
             .await
     }
@@ -267,20 +295,34 @@ impl Executor for Evento {
         data: Vec<u8>,
         cursor: Value,
     ) -> anyhow::Result<()> {
-        self.0
+        self.inner
             .save_snapshot(aggregator_type, aggregator_revision, id, data, cursor)
             .await
     }
 
     async fn delete_snapshot(&self, aggregator_type: String, id: String) -> anyhow::Result<()> {
-        self.0.delete_snapshot(aggregator_type, id).await
+        self.inner.delete_snapshot(aggregator_type, id).await
     }
 }
 
 impl Evento {
     /// Creates a new type-erased executor wrapper.
     pub fn new<E: Executor>(executor: E) -> Self {
-        Self(Arc::new(Box::new(executor)))
+        Self {
+            inner: Arc::new(Box::new(executor)),
+            default_routing_key: None,
+        }
+    }
+
+    /// Sets a default routing key applied to writes and inherited by
+    /// subscriptions built from this executor.
+    ///
+    /// Per-event/per-aggregator routing keys still take precedence on writes.
+    /// Subscriptions inherit this key only when the user has not called
+    /// `.routing_key()` or `.all()`.
+    pub fn default_routing_key(mut self, key: impl Into<String>) -> Self {
+        self.default_routing_key = Some(key.into());
+        self
     }
 }
 
@@ -322,6 +364,10 @@ impl EventoGroup {
 #[cfg(feature = "group")]
 #[async_trait::async_trait]
 impl Executor for EventoGroup {
+    fn default_routing_key(&self) -> Option<&str> {
+        self.first().default_routing_key()
+    }
+
     async fn write(&self, events: Vec<Event>) -> Result<(), WriteError> {
         self.first().write(events).await
     }
@@ -445,6 +491,10 @@ impl<R: Executor + Clone, W: Executor + Clone> Clone for Rw<R, W> {
 #[cfg(feature = "rw")]
 #[async_trait::async_trait]
 impl<R: Executor, W: Executor> Executor for Rw<R, W> {
+    fn default_routing_key(&self) -> Option<&str> {
+        self.w.default_routing_key()
+    }
+
     async fn write(&self, events: Vec<Event>) -> Result<(), WriteError> {
         self.w.write(events).await
     }
