@@ -90,6 +90,13 @@ async fn fjall_subscribe_default_routing_key() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn fjall_subscribe_default_routing_key_all_isolation() -> anyhow::Result<()> {
+    let (executor, _temp_dir) =
+        create_fjall_executor("subscribe_default_routing_key_all_isolation")?;
+    evento_test::subscribe_default_routing_key_all_isolation(&executor).await
+}
+
+#[tokio::test]
 async fn fjall_all_commands() -> anyhow::Result<()> {
     let (executor, _temp_dir) = create_fjall_executor("all_commands")?;
     evento_test::all_commands(&executor).await

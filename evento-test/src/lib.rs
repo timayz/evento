@@ -868,6 +868,87 @@ pub async fn subscribe_default_routing_key<E: Executor + Clone>(
     Ok(())
 }
 
+/// Regression test for the bug where two Evento wrappers with different
+/// `default_routing_key` values shared the same row in the subscriber table
+/// when subscriptions called `.all()`, so the second tenant inherited the
+/// first tenant's cursor and never replayed.
+///
+/// The storage key for `.all()` must include the executor's default routing
+/// key as a prefix; otherwise tenant-b reads from where tenant-a stopped.
+pub async fn subscribe_default_routing_key_all_isolation<E: Executor + Clone>(
+    executor: &E,
+) -> anyhow::Result<()> {
+    let evento_a = evento::Evento::new(executor.clone()).default_routing_key("tenant-a");
+    let evento_b = evento::Evento::new(executor.clone()).default_routing_key("tenant-b");
+    let cmd_a = bank::Command(evento_a.clone());
+    let cmd_b = bank::Command(evento_b.clone());
+
+    let acc_a = cmd_a
+        .open_account(OpenAccount {
+            owner_id: "owner_a".to_owned(),
+            owner_name: "A".to_owned(),
+            account_type: AccountType::Checking,
+            currency: "USD".to_owned(),
+            initial_balance: 100,
+        })
+        .await?;
+    let acc_b = cmd_b
+        .open_account(OpenAccount {
+            owner_id: "owner_b".to_owned(),
+            owner_name: "B".to_owned(),
+            account_type: AccountType::Checking,
+            currency: "USD".to_owned(),
+            initial_balance: 200,
+        })
+        .await?;
+
+    // Tenant-a runs .all() — should process both events (it reads all routing keys).
+    simple::subscription()
+        .all()
+        .unretry_execute(&evento_a)
+        .await?;
+    {
+        let rows = simple::ROWS.read().unwrap();
+        assert!(
+            rows.contains_key(&acc_a),
+            "tenant-a .all() should process acc_a"
+        );
+        assert!(
+            rows.contains_key(&acc_b),
+            "tenant-a .all() should process acc_b"
+        );
+    }
+
+    // Wipe the projection so we can observe whether tenant-b actually re-reads
+    // the events from its own cursor (which should start fresh).
+    {
+        let mut rows = simple::ROWS.write().unwrap();
+        rows.remove(&acc_a);
+        rows.remove(&acc_b);
+    }
+
+    // Tenant-b runs .all() — with the fix, it has its own cursor (storage key
+    // "tenant-b.simple" vs tenant-a's "tenant-a.simple") and replays both
+    // events from the beginning.
+    simple::subscription()
+        .all()
+        .unretry_execute(&evento_b)
+        .await?;
+    {
+        let rows = simple::ROWS.read().unwrap();
+        assert!(
+            rows.contains_key(&acc_a),
+            "tenant-b .all() must replay acc_a — without per-tenant cursor scoping it would inherit tenant-a's position"
+        );
+        assert!(
+            rows.contains_key(&acc_b),
+            "tenant-b .all() must replay acc_b"
+        );
+    }
+
+    Ok(())
+}
+
 pub async fn subscribe_multiple_aggregator<E: Executor + Clone>(
     executor: &E,
 ) -> anyhow::Result<()> {
