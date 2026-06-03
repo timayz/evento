@@ -5,8 +5,8 @@ use crate::{
     value_object::AccountStatus,
 };
 
-pub fn create_projection<E: Executor>(id: impl Into<String>) -> Projection<E, AccountStatusView> {
-    Projection::new::<BankAccount>(id)
+pub fn create_projection<E: Executor>() -> Projection<E, AccountStatusView> {
+    Projection::new::<BankAccount>()
         .handler(handle_account_opened())
         .handler(handle_account_closed())
         .handler(handle_account_frozen())

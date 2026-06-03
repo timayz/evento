@@ -113,9 +113,10 @@
 //! }
 //!
 //! // Load aggregate state via projection
-//! let result = Projection::<AccountView, _>::new::<Account>(&account_id)
+//! let result = Projection::<_, AccountView>::new::<Account>()
 //!     .handler(on_account_opened())
 //!     .handler(on_money_deposited())
+//!     .load(&account_id)
 //!     .execute(&executor)
 //!     .await?;
 //! ```
@@ -186,7 +187,8 @@ pub use evento_core::*;
 /// - [`ProjectionCursor`] - Trait for cursor position tracking
 /// - [`Snapshot`] - Trait for snapshot restoration
 pub use evento_core::projection::{
-    Handler, Projection, ProjectionAggregator, ProjectionCursor, Snapshot,
+    Handler, LoadBuilder, Projection, ProjectionAggregator, ProjectionCursor,
+    ProjectionSubscription, Snapshot,
 };
 
 // Re-export SQL types when SQL features are enabled

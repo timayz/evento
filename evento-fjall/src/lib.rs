@@ -619,6 +619,10 @@ impl Executor for Fjall {
     ) -> anyhow::Result<()> {
         todo!()
     }
+
+    async fn delete_snapshot(&self, _aggregator_type: String, _id: String) -> anyhow::Result<()> {
+        todo!()
+    }
 }
 
 impl From<Keyspace> for Fjall {

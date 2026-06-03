@@ -69,8 +69,9 @@
 //!     Ok(())
 //! }
 //!
-//! let result = Projection::<AccountView, _>::new::<BankAccount>("account-123")
+//! let result = Projection::<_, AccountView>::new::<BankAccount>()
 //!     .handler(on_deposited())
+//!     .load("account-123")
 //!     .execute(&executor)
 //!     .await?;
 //! ```

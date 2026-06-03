@@ -76,8 +76,9 @@
 //! }
 //!
 //! // Use in a projection
-//! let projection = Projection::<AccountBalanceView, _>::new::<BankAccount>("account-123")
-//!     .handler(handle_money_deposited());
+//! let projection = Projection::<_, AccountBalanceView>::new::<BankAccount>()
+//!     .handler(handle_money_deposited())
+//!     .load("account-123");
 //! ```
 //!
 //! ## Creating Subscription Handlers with `#[evento::subscription]`
@@ -264,11 +265,11 @@ pub fn aggregator(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// }
 ///
 /// // Register with projection
-/// let projection = Projection::<AccountBalanceView, _>::new::<BankAccount>("account-123")
+/// let projection = Projection::<_, AccountBalanceView>::new::<BankAccount>()
 ///     .handler(handle_money_deposited());
 ///
 /// // Execute projection to get current state
-/// let result = projection.execute(&executor).await?;
+/// let result = projection.load("account-123").execute(&executor).await?;
 /// ```
 #[proc_macro_attribute]
 pub fn handler(_attr: TokenStream, item: TokenStream) -> TokenStream {

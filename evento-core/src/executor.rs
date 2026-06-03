@@ -178,6 +178,13 @@ pub trait Executor: Send + Sync + 'static {
         data: Vec<u8>,
         cursor: Value,
     ) -> anyhow::Result<()>;
+
+    /// Deletes a stored snapshot for an aggregate.
+    ///
+    /// Idempotent: deleting a snapshot that does not exist is not an error.
+    /// Revision is intentionally omitted — `save_snapshot` upserts on
+    /// `(type, id)` so there is only ever one row per aggregate.
+    async fn delete_snapshot(&self, aggregator_type: String, id: String) -> anyhow::Result<()>;
 }
 
 /// Type-erased wrapper around any [`Executor`] implementation.
@@ -263,6 +270,10 @@ impl Executor for Evento {
         self.0
             .save_snapshot(aggregator_type, aggregator_revision, id, data, cursor)
             .await
+    }
+
+    async fn delete_snapshot(&self, aggregator_type: String, id: String) -> anyhow::Result<()> {
+        self.0.delete_snapshot(aggregator_type, id).await
     }
 }
 
@@ -399,6 +410,10 @@ impl Executor for EventoGroup {
             .save_snapshot(aggregator_type, aggregator_revision, id, data, cursor)
             .await
     }
+
+    async fn delete_snapshot(&self, aggregator_type: String, id: String) -> anyhow::Result<()> {
+        self.first().delete_snapshot(aggregator_type, id).await
+    }
 }
 
 /// Read-write split executor (requires `rw` feature).
@@ -489,6 +504,10 @@ impl<R: Executor, W: Executor> Executor for Rw<R, W> {
         self.w
             .save_snapshot(aggregator_type, aggregator_revision, id, data, cursor)
             .await
+    }
+
+    async fn delete_snapshot(&self, aggregator_type: String, id: String) -> anyhow::Result<()> {
+        self.w.delete_snapshot(aggregator_type, id).await
     }
 }
 

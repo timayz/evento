@@ -47,9 +47,7 @@ impl<E: Executor> Deref for Command<E> {
 
 impl<E: Executor> Command<E> {
     pub async fn load(&self, id: impl Into<String>) -> anyhow::Result<Option<BankAccount>> {
-        let id = id.into();
-
-        create_projection(&id).execute(&self.0).await
+        create_projection().load(id).execute(&self.0).await
     }
 }
 
@@ -93,8 +91,8 @@ impl BankAccount {
     }
 }
 
-fn create_projection<E: Executor>(id: impl Into<String>) -> Projection<E, BankAccount> {
-    Projection::new::<crate::aggregator::BankAccount>(id)
+fn create_projection<E: Executor>() -> Projection<E, BankAccount> {
+    Projection::new::<crate::aggregator::BankAccount>()
         .handler(handle_money_deposit())
         .handler(handle_account_opened())
         .handler(handle_money_received())
