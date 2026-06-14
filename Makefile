@@ -11,7 +11,7 @@ reset: down up
 
 check: test fmt lint machete
 
-test: test.sql test.core test.fjall
+test: test.sql test.core test.fjall test.doc
 
 test.sql:
 	cargo test --all-features -p evento-sql
@@ -21,6 +21,9 @@ test.core:
 
 test.fjall:
 	cargo test --all-features -p evento-fjall
+
+test.doc:
+	cargo test --doc -p evento
 
 fmt:
 	cargo fmt -- --emit files
