@@ -265,11 +265,15 @@ storage backend (sql/fjall). Phases, in order:
   the `Replica` (status, ballots, decision) and replays committed transactions into
   the data store on startup; in-flight transactions resume via the sweep.
   `tests/restart.rs` proves a node rebuilds from its journal and rejoins — both
-  cleanly and *while writes are in flight*. *Remaining:* a genuinely disk-backed
-  `Journal` over sql/fjall (today the journal is a kept in-memory handle, and it
-  records synchronously per transition — production needs batched async fsync),
-  and snapshots + compaction + log truncation (bounds the journal and the
-  in-memory `Replica.commands`, both currently unbounded).
+  cleanly and *while writes are in flight*. ✅ **Disk-backed journal:**
+  `FjallJournal` (bitcode-serialized `CommandState`s in a fjall database, fsync
+  per record) is a genuinely durable `Journal`; `tests/fjall_journal.rs` proves
+  records survive a full close/reopen (a real process restart). The `Journal`
+  trait stays open, so a sql-backed journal is a drop-in alternative.
+  *Remaining:* batched/group-commit fsync (today it syncs per consensus message —
+  correct but slow), and snapshots + compaction + log truncation (bounds the
+  journal and the in-memory `Replica.commands`, both currently unbounded — the
+  blocker for long-running deployments).
 - **Phase C — Geo hardening.** Bounded-clock-skew handling, tunable per-link
   timeouts, region-aware quorum/fast-path placement, TLS + mutual auth, a real
   failure detector, backpressure.

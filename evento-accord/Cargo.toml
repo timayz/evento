@@ -22,6 +22,7 @@ ulid.workspace = true
 bitcode = { workspace = true, features = ["serde"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 bytes = "1"
+fjall.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true }

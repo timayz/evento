@@ -27,6 +27,7 @@
 pub mod api;
 pub mod clock;
 pub mod executor;
+pub mod fjall_journal;
 pub mod message;
 pub mod node;
 pub mod replica;
@@ -40,6 +41,7 @@ pub use api::{
 };
 pub use clock::{Ballot, Clock, HybridLogicalClock, NodeId, Timestamp, TxnId};
 pub use executor::{AccordExecutor, ExecutorDataStore};
+pub use fjall_journal::FjallJournal;
 pub use message::{CommandState, Key, Message, Status};
 pub use node::{CommitOutcome, Node};
 pub use store::{AppliedEntry, InMemoryDataStore, InMemoryJournal};
