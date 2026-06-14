@@ -133,3 +133,45 @@ async fn create_postgres_pool(key: impl Into<String>) -> anyhow::Result<PgPool> 
 
     pool::create_pool(url).await
 }
+
+#[tokio::test]
+async fn postgres_read_order_timestamp() -> anyhow::Result<()> {
+    let executor = create_postgres_executor("read_order_timestamp").await?;
+    evento_test::read_order_timestamp(&executor).await
+}
+
+#[tokio::test]
+async fn postgres_exact_filter() -> anyhow::Result<()> {
+    let executor = create_postgres_executor("exact_filter").await?;
+    evento_test::exact_filter(&executor).await
+}
+
+#[tokio::test]
+async fn postgres_concurrent_append() -> anyhow::Result<()> {
+    let executor = create_postgres_executor("concurrent_append").await?;
+    evento_test::concurrent_append(&executor).await
+}
+
+#[tokio::test]
+async fn postgres_strict_unhandled() -> anyhow::Result<()> {
+    let executor = create_postgres_executor("strict_unhandled").await?;
+    evento_test::strict_unhandled(&executor).await
+}
+
+#[tokio::test]
+async fn postgres_tombstone() -> anyhow::Result<()> {
+    let executor = create_postgres_executor("tombstone").await?;
+    evento_test::tombstone(&executor).await
+}
+
+#[tokio::test]
+async fn postgres_subscription_all_counts() -> anyhow::Result<()> {
+    let executor = create_postgres_executor("subscription_all_counts").await?;
+    evento_test::subscription_all_counts(&executor).await
+}
+
+#[tokio::test]
+async fn postgres_snapshot_revision_scope() -> anyhow::Result<()> {
+    let executor = create_postgres_executor("snapshot_revision_scope").await?;
+    evento_test::snapshot_revision_scope(&executor).await
+}

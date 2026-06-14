@@ -1,11 +1,11 @@
 //! Event creation and committing.
 //!
-//! This module provides the [`AggregatorBuilder`] for creating and persisting events.
+//! This module provides the [`WriteBuilder`] for creating and persisting events.
 //!
 //! # Example
 //!
 //! ```rust,ignore
-//! use evento::{create, aggregator};
+//! use evento::{create, append};
 //!
 //! // Create a new aggregate with auto-generated ID
 //! let id = create()
@@ -16,7 +16,7 @@
 //!     .await?;
 //!
 //! // Add events to existing aggregate
-//! aggregator(&existing_id)
+//! append(&existing_id)
 //!     .original_version(current_version)
 //!     .event(&MoneyDeposited { amount: 100 })
 //!     .commit(&executor)
@@ -28,7 +28,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::{cursor::Args, metadata::Metadata, Event, Executor, ReadAggregator};
+use crate::{cursor::Args, metadata::Metadata, Event, EventFilter, Executor};
 
 /// Creates a new builder for the given aggregate IDs.
 pub fn hash_ids(ids: Vec<impl Into<String>>) -> String {
@@ -65,47 +65,47 @@ pub enum WriteError {
 /// Aggregates are the root entities in event sourcing. Each aggregate
 /// type has a unique identifier string used for event storage and routing.
 ///
-/// This trait is typically derived using the `#[evento::aggregator]` macro.
+/// This trait is typically derived using the `#[evento::aggregate]` macro.
 ///
 /// # Example
 ///
 /// ```rust,ignore
-/// #[evento::aggregator("myapp/Account")]
+/// #[evento::aggregate("myapp/Account")]
 /// #[derive(Default)]
 /// pub struct Account {
 ///     pub balance: i64,
 ///     pub owner: String,
 /// }
 /// ```
-pub trait Aggregator: Default {
+pub trait Aggregate: Default {
     /// Returns the unique type identifier for this aggregate (e.g., "myapp/Account")
-    fn aggregator_type() -> &'static str;
+    fn aggregate_type() -> &'static str;
 }
 
 /// Trait for event types.
 ///
 /// Events represent state changes that have occurred. Each event type
-/// has a name and belongs to an aggregator type.
+/// has a name and belongs to an aggregate type.
 ///
-/// This trait is typically derived using the `#[evento::aggregator]` macro.
+/// This trait is typically derived using the `#[evento::aggregate]` macro.
 ///
 /// # Example
 ///
 /// ```rust,ignore
-/// #[evento::aggregator("myapp/Account")]
+/// #[evento::aggregate("myapp/Account")]
 /// #[derive(bitcode::Encode, bitcode::Decode)]
 /// pub struct AccountOpened {
 ///     pub owner: String,
 /// }
 /// ```
-pub trait AggregatorEvent: Aggregator {
+pub trait AggregateEvent: Aggregate {
     /// Returns the event name (e.g., "AccountOpened")
     fn event_name() -> &'static str;
 }
 
 /// Builder for creating and committing events.
 ///
-/// Use [`create()`] or [`aggregator()`] to create an instance, then chain
+/// Use [`create()`] or [`append()`] to create an instance, then chain
 /// method calls to add events and metadata before committing.
 ///
 /// # Optimistic Concurrency
@@ -124,16 +124,16 @@ pub trait AggregatorEvent: Aggregator {
 ///     .await?;
 ///
 /// // Existing aggregate with version check
-/// aggregator(&id)
+/// append(&id)
 ///     .original_version(5)
 ///     .event(&AnotherEvent { ... })
 ///     .commit(&executor)
 ///     .await?;
 /// ```
 #[derive(Clone)]
-pub struct AggregatorBuilder {
-    aggregator_id: String,
-    aggregator_type: String,
+pub struct WriteBuilder {
+    aggregate_id: String,
+    aggregate_type: String,
     routing_key: Option<String>,
     routing_key_locked: bool,
     original_version: u16,
@@ -141,12 +141,12 @@ pub struct AggregatorBuilder {
     metadata: Metadata,
 }
 
-impl AggregatorBuilder {
+impl WriteBuilder {
     /// Creates a new builder for the given aggregate ID.
-    pub fn new(aggregator_id: impl Into<String>) -> AggregatorBuilder {
-        AggregatorBuilder {
-            aggregator_id: aggregator_id.into(),
-            aggregator_type: "".to_owned(),
+    pub fn new(aggregate_id: impl Into<String>) -> WriteBuilder {
+        WriteBuilder {
+            aggregate_id: aggregate_id.into(),
+            aggregate_type: "".to_owned(),
             routing_key: None,
             routing_key_locked: false,
             original_version: 0,
@@ -156,7 +156,7 @@ impl AggregatorBuilder {
     }
 
     /// Creates a new builder for the given aggregate IDs.
-    pub fn ids(ids: Vec<impl Into<String>>) -> AggregatorBuilder {
+    pub fn ids(ids: Vec<impl Into<String>>) -> WriteBuilder {
         Self::new(hash_ids(ids))
     }
 
@@ -226,10 +226,10 @@ impl AggregatorBuilder {
     /// The event data is serialized using bitcode.
     pub fn event<D>(&mut self, v: &D) -> &mut Self
     where
-        D: AggregatorEvent + bitcode::Encode,
+        D: AggregateEvent + bitcode::Encode,
     {
         self.data.push((D::event_name(), bitcode::encode(v)));
-        self.aggregator_type = D::aggregator_type().to_owned();
+        self.aggregate_type = D::aggregate_type().to_owned();
         self
     }
 
@@ -245,9 +245,9 @@ impl AggregatorBuilder {
     pub async fn commit<E: Executor>(&self, executor: &E) -> Result<String, WriteError> {
         let first_event = executor
             .read(
-                Some(vec![ReadAggregator::id(
-                    &self.aggregator_type,
-                    &self.aggregator_id,
+                Some(vec![EventFilter::by_id(
+                    &self.aggregate_type,
+                    &self.aggregate_id,
                 )]),
                 None,
                 Args::forward(1, None),
@@ -271,8 +271,8 @@ impl AggregatorBuilder {
                 metadata: self.metadata.clone(),
                 timestamp: now.as_secs(),
                 timestamp_subsec: now.subsec_millis(),
-                aggregator_id: self.aggregator_id.to_owned(),
-                aggregator_type: self.aggregator_type.to_owned(),
+                aggregate_id: self.aggregate_id.to_owned(),
+                aggregate_type: self.aggregate_type.to_owned(),
                 version,
                 routing_key: routing_key.to_owned(),
             };
@@ -286,7 +286,7 @@ impl AggregatorBuilder {
 
         executor.write(events).await?;
 
-        Ok(self.aggregator_id.to_owned())
+        Ok(self.aggregate_id.to_owned())
     }
 }
 
@@ -300,8 +300,8 @@ impl AggregatorBuilder {
 ///     .commit(&executor)
 ///     .await?;
 /// ```
-pub fn create() -> AggregatorBuilder {
-    AggregatorBuilder::new(Ulid::new())
+pub fn create() -> WriteBuilder {
+    WriteBuilder::new(Ulid::new())
 }
 
 /// Creates a builder for an existing aggregate.
@@ -309,30 +309,30 @@ pub fn create() -> AggregatorBuilder {
 /// # Example
 ///
 /// ```rust,ignore
-/// aggregator(&existing_id)
+/// append(&existing_id)
 ///     .original_version(current_version)
 ///     .event(&MoneyDeposited { amount: 100 })
 ///     .commit(&executor)
 ///     .await?;
 /// ```
-pub fn aggregator(id: impl Into<String>) -> AggregatorBuilder {
-    AggregatorBuilder::new(id)
+pub fn append(id: impl Into<String>) -> WriteBuilder {
+    WriteBuilder::new(id)
 }
 
-pub trait AggregatorExecutor<E: Executor> {
-    fn has_event<A: AggregatorEvent>(
+pub trait AggregateExt<E: Executor> {
+    fn has_event<A: AggregateEvent>(
         &self,
         id: impl Into<String>,
     ) -> impl std::future::Future<Output = anyhow::Result<bool>> + Send;
 
-    fn original_version<A: AggregatorEvent>(
+    fn original_version<A: AggregateEvent>(
         &self,
         id: impl Into<String>,
     ) -> impl std::future::Future<Output = anyhow::Result<Option<u16>>> + Send;
 }
 
-impl<E: Executor> AggregatorExecutor<E> for E {
-    fn has_event<A: AggregatorEvent>(
+impl<E: Executor> AggregateExt<E> for E {
+    fn has_event<A: AggregateEvent>(
         &self,
         id: impl Into<String>,
     ) -> impl std::future::Future<Output = anyhow::Result<bool>> + Send {
@@ -340,8 +340,8 @@ impl<E: Executor> AggregatorExecutor<E> for E {
         Box::pin(async {
             let result = self
                 .read(
-                    Some(vec![ReadAggregator::new(
-                        A::aggregator_type(),
+                    Some(vec![EventFilter::exact(
+                        A::aggregate_type(),
                         id,
                         A::event_name(),
                     )]),
@@ -354,7 +354,7 @@ impl<E: Executor> AggregatorExecutor<E> for E {
         })
     }
 
-    fn original_version<A: AggregatorEvent>(
+    fn original_version<A: AggregateEvent>(
         &self,
         id: impl Into<String>,
     ) -> impl std::future::Future<Output = anyhow::Result<Option<u16>>> + Send {
@@ -362,7 +362,7 @@ impl<E: Executor> AggregatorExecutor<E> for E {
         Box::pin(async {
             let result = self
                 .read(
-                    Some(vec![ReadAggregator::id(A::aggregator_type(), id)]),
+                    Some(vec![EventFilter::by_id(A::aggregate_type(), id)]),
                     None,
                     Args::backward(1, None),
                 )

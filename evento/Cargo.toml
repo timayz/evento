@@ -16,6 +16,11 @@ evento-sql-migrator = { path = "../evento-sql-migrator", optional = true, versio
 evento-fjall = { path = "../evento-fjall", optional = true, version = "2.0.0-alpha.20" }
 sqlx_migrator = { workspace = true, optional = true }
 
+[dev-dependencies]
+# Used only by the crate-level doctest (generic over `Executor`).
+anyhow.workspace = true
+bitcode.workspace = true
+
 [features]
 default = ["macro"]
 macro = ["evento-core/macro"]

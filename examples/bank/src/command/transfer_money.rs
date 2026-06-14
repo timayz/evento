@@ -1,4 +1,4 @@
-use evento::{Executor, projection::ProjectionAggregator};
+use evento::{Executor, projection::ProjectionAggregate};
 
 use crate::{aggregator::MoneyTransferred, error::BankAccountError, value_object::AccountStatus};
 
@@ -18,8 +18,8 @@ impl<E: Executor> super::Command<E> {
         id: impl Into<String>,
         cmd: TransferMoney,
     ) -> Result<(), BankAccountError> {
-        let Some(account) = self.load(id).await.unwrap() else {
-            return Err(BankAccountError::Server("not found".to_owned()));
+        let Some(account) = self.load(id).await? else {
+            return Err(BankAccountError::AccountNotFound);
         };
         if matches!(account.status, AccountStatus::Closed) {
             return Err(BankAccountError::AccountClosed);
@@ -40,8 +40,7 @@ impl<E: Executor> super::Command<E> {
         }
 
         account
-            .aggregator()
-            .unwrap()
+            .write()?
             .event(&MoneyTransferred {
                 amount: cmd.amount,
                 to_account_id: cmd.to_account_id,
@@ -61,8 +60,8 @@ impl<E: Executor> super::Command<E> {
         cmd: TransferMoney,
         key: impl Into<String>,
     ) -> Result<(), BankAccountError> {
-        let Some(account) = self.load(id).await.unwrap() else {
-            return Err(BankAccountError::Server("not found".to_owned()));
+        let Some(account) = self.load(id).await? else {
+            return Err(BankAccountError::AccountNotFound);
         };
         if matches!(account.status, AccountStatus::Closed) {
             return Err(BankAccountError::AccountClosed);
@@ -83,8 +82,7 @@ impl<E: Executor> super::Command<E> {
         }
 
         account
-            .aggregator()
-            .unwrap()
+            .write()?
             .routing_key(key)
             .event(&MoneyTransferred {
                 amount: cmd.amount,

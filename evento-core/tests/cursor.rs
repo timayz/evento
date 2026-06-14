@@ -1,5 +1,5 @@
 use evento_core::{
-    cursor::{self, Args, Cursor, Edge, Order, PageInfo, ReadResult, Reader},
+    cursor::{self, Args, Bind, Cursor, Edge, Order, PageInfo, ReadResult, Reader},
     Event,
 };
 use rand::{seq::IndexedRandom, RngExt};
@@ -582,17 +582,17 @@ pub fn get_data() -> Vec<Event> {
 
     for _ in 0..10 {
         let mut rng = rand::rng();
-        let aggregator_id = aggregator_ids
+        let aggregate_id = aggregator_ids
             .choose(&mut rng)
             .cloned()
             .unwrap_or_else(|| Ulid::new().to_string());
 
         let routing_key = routing_keys.choose(&mut rng).cloned().unwrap_or(None);
-        let aggregator_type = aggregator_types
+        let aggregate_type = aggregator_types
             .choose(&mut rng)
             .cloned()
             .unwrap_or("Calcul");
-        let version = versions.entry(aggregator_id.to_owned()).or_default();
+        let version = versions.entry(aggregate_id.to_owned()).or_default();
         let timestamp = if rng.random_range(0..100) < 20 {
             timestamps.choose(&mut rng).cloned()
         } else {
@@ -603,8 +603,8 @@ pub fn get_data() -> Vec<Event> {
         let event = Event {
             id: Ulid::new(),
             name: "MessageSent".to_owned(),
-            aggregator_id,
-            aggregator_type: aggregator_type.to_owned(),
+            aggregate_id,
+            aggregate_type: aggregate_type.to_owned(),
             version: *version,
             routing_key,
             timestamp: timestamp as u64,
@@ -619,6 +619,44 @@ pub fn get_data() -> Vec<Event> {
     }
 
     data
+}
+
+/// Regression: when the number of matching rows equals `limit + 1`, the reader
+/// must return exactly `limit` edges and report a further page — not return the
+/// extra probe row with `has_next_page = false`. This boundary disagreed with the
+/// SQL backend and caused `backward(1)` to return the wrong (first) event.
+#[test]
+fn forward_at_exact_boundary() -> anyhow::Result<()> {
+    let events = get_events(); // 10 events
+    let res = Reader::new(events.clone())
+        .args(Args::forward(9, None))
+        .execute()?;
+
+    assert_eq!(res.edges.len(), 9, "must return exactly `limit` edges");
+    assert!(
+        res.page_info.has_next_page,
+        "limit+1 matches must report a further page"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn backward_limit_one_returns_last() -> anyhow::Result<()> {
+    // Two events for the ordering: backward(1) must yield only the latest.
+    let mut events = get_events();
+    events.truncate(2);
+    let res = Reader::new(events.clone())
+        .args(Args::backward(1, None))
+        .execute()?;
+
+    assert_eq!(res.edges.len(), 1, "backward(1) must return a single edge");
+    // The single edge must be the greatest by (timestamp, subsec, version, id).
+    let mut sorted = events.clone();
+    Event::sort_by(&mut sorted, false);
+    assert_eq!(res.edges[0].node, *sorted.last().unwrap());
+
+    Ok(())
 }
 
 fn get_events() -> Vec<Event> {
@@ -640,8 +678,8 @@ fn create_event(id: &str, version: u16, timestamp: u32) -> Event {
     Event {
         id: Ulid::from_string(id).unwrap(),
         name: "MessageSent".to_owned(),
-        aggregator_id: Ulid::new().to_string(),
-        aggregator_type: "Message".to_owned(),
+        aggregate_id: Ulid::new().to_string(),
+        aggregate_type: "Message".to_owned(),
         version,
         routing_key: None,
         timestamp: timestamp as u64,

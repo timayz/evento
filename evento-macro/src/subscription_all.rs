@@ -44,9 +44,9 @@ pub fn subscription_all_next_impl(input: &ItemFn, debug: bool) -> syn::Result<To
                 "all"
             }
 
-            fn aggregator_type(&self) -> &'static str {
-                use ::evento::Aggregator as _;
-                #event_inner_type::aggregator_type()
+            fn aggregate_type(&self) -> &'static str {
+                use ::evento::Aggregate as _;
+                #event_inner_type::aggregate_type()
             }
         }
     };

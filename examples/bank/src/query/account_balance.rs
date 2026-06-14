@@ -12,7 +12,7 @@ pub fn create_projection<E: Executor>() -> Projection<E, AccountBalanceView> {
         .handler(handle_money_received())
         .handler(handle_money_withdrawn())
         .handler(handle_money_transferred())
-        .handler(handle_overdraf_limit_changed())
+        .handler(handle_overdraft_limit_changed())
 }
 
 #[evento::projection(bitcode::Encode, bitcode::Decode)]
@@ -79,7 +79,7 @@ async fn handle_money_received(
 }
 
 #[evento::handler]
-async fn handle_overdraf_limit_changed(
+async fn handle_overdraft_limit_changed(
     event: Event<OverdraftLimitChanged>,
     row: &mut AccountBalanceView,
 ) -> anyhow::Result<()> {

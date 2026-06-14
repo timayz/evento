@@ -4,7 +4,7 @@ use crate::value_object::AccountType;
 // EVENTS
 // =============================================================================
 
-#[evento::aggregator]
+#[evento::aggregate]
 pub enum BankAccount {
     /// Event raised when a new bank account is opened
     AccountOpened {
@@ -60,7 +60,7 @@ pub enum BankAccount {
     AccountClosed { reason: String, final_balance: i64 },
 }
 
-#[evento::aggregator]
+#[evento::aggregate]
 pub enum Owner {
     Created { pub name: String },
     NameChanged { pub value: String },

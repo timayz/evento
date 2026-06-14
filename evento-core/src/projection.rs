@@ -10,8 +10,8 @@
 //! - [`Projection`] - Defines handlers for building projections
 //! - [`LoadBuilder`] - Loads aggregate state from events
 //! - [`ProjectionSubscription`] - Starts a subscription that keeps a projection up to date
-//! - [`SubscriptionBuilder`](crate::subscription::SubscriptionBuilder) - Builds continuous event subscriptions
-//! - [`Subscription`](crate::subscription::Subscription) - Handle to a running subscription
+//! - [`SubscriptionBuilder`] - Builds continuous event subscriptions
+//! - [`Subscription`] - Handle to a running subscription
 //!
 //! # Example
 //!
@@ -47,7 +47,7 @@ use crate::{
     context,
     cursor::{self, Args, Cursor},
     subscription::{self, RoutingKey, Subscription, SubscriptionBuilder},
-    Aggregator, AggregatorBuilder, AggregatorEvent, Executor, ReadAggregator,
+    Aggregate, AggregateEvent, EventFilter, Executor, WriteBuilder,
 };
 
 /// Handler context providing access to executor and shared data.
@@ -61,7 +61,7 @@ pub struct Context<'a, E: Executor> {
     pub executor: &'a E,
     pub id: String,
     revision: u16,
-    aggregator_type: String,
+    aggregate_type: String,
     aggregators: &'a HashMap<String, String>,
 }
 
@@ -75,7 +75,7 @@ impl<'a, E: Executor> Context<'a, E> {
         let Some((data, cursor)) = self
             .executor
             .get_snapshot(
-                self.aggregator_type.to_owned(),
+                self.aggregate_type.to_owned(),
                 self.revision.to_string(),
                 self.id.to_owned(),
             )
@@ -102,7 +102,7 @@ impl<'a, E: Executor> Context<'a, E> {
 
         self.executor
             .save_snapshot(
-                self.aggregator_type.to_owned(),
+                self.aggregate_type.to_owned(),
                 self.revision.to_string(),
                 self.id.to_owned(),
                 data,
@@ -116,26 +116,26 @@ impl<'a, E: Executor> Context<'a, E> {
     /// Idempotent: no error if no snapshot exists.
     pub async fn drop_snapshot(&self) -> anyhow::Result<()> {
         self.executor
-            .delete_snapshot(self.aggregator_type.to_owned(), self.id.to_owned())
+            .delete_snapshot(self.aggregate_type.to_owned(), self.id.to_owned())
             .await
     }
 
-    /// Returns the aggregate ID for a registered aggregator type.
+    /// Returns the aggregate ID for a registered aggregate type.
     ///
     /// # Panics
     ///
-    /// Panics if the aggregator type was not registered via [`LoadBuilder::aggregator`].
-    pub async fn aggregator<A: Aggregator>(&self) -> String {
+    /// Panics if the aggregate type was not registered via [`LoadBuilder::aggregate`].
+    pub async fn aggregate<A: Aggregate>(&self) -> String {
         tracing::debug!(
-            "Failed to get `Aggregator id <{}>` For the Aggregator id extractor to work \
-        correctly, register the related aggregator with `.aggregator::<MyAggregator>(id)` on \
+            "Failed to get `Aggregate id <{}>` For the Aggregate id extractor to work \
+        correctly, register the related aggregator with `.aggregate::<MyAggregator>(id)` on \
         the load builder. Ensure that types align in both the set and retrieve calls.",
-            A::aggregator_type()
+            A::aggregate_type()
         );
 
         self.aggregators
-            .get(A::aggregator_type())
-            .expect("Projection Aggregator not configured correctly. View/enable debug logs for more details.")
+            .get(A::aggregate_type())
+            .expect("Projection Aggregate not configured correctly. View/enable debug logs for more details.")
             .to_owned()
     }
 }
@@ -166,8 +166,8 @@ pub trait Handler<P: 'static>: Sync + Send {
         event: &'a crate::Event,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>>;
 
-    /// Returns the aggregator type this handler processes.
-    fn aggregator_type(&self) -> &'static str;
+    /// Returns the aggregate type this handler processes.
+    fn aggregate_type(&self) -> &'static str;
     /// Returns the event name this handler processes.
     fn event_name(&self) -> &'static str;
 }
@@ -182,24 +182,21 @@ pub trait ProjectionCursor {
     fn set_cursor(&mut self, v: &cursor::Value);
 }
 
-/// Trait for projections that can create an [`AggregatorBuilder`].
+/// Trait for projections that can create a [`WriteBuilder`].
 ///
 /// Extends [`ProjectionCursor`] to provide aggregate identity and versioning,
 /// enabling projections to emit new events.
-pub trait ProjectionAggregator: ProjectionCursor {
+pub trait ProjectionAggregate: ProjectionCursor {
     /// Returns the aggregate ID for this projection.
     ///
-    /// # Panics
-    ///
-    /// Default implementation panics; must be overridden.
-    fn aggregator_id(&self) -> String {
-        todo!("ProjectionCursor.aggregator_id must be implemented for ProjectionCursor.aggregator")
-    }
+    /// Implementors must return the stable identity of the aggregate this
+    /// projection represents (typically a field populated from the first event).
+    fn aggregate_id(&self) -> String;
 
     /// Returns the current aggregate version from the cursor.
     ///
     /// Returns `0` if no cursor is set.
-    fn aggregator_version(&self) -> anyhow::Result<u16> {
+    fn aggregate_version(&self) -> anyhow::Result<u16> {
         let value = self.get_cursor();
         if value == Default::default() {
             return Ok(0);
@@ -210,12 +207,12 @@ pub trait ProjectionAggregator: ProjectionCursor {
         Ok(cursor.v)
     }
 
-    /// Creates an [`AggregatorBuilder`] pre-configured with ID and version.
+    /// Creates a [`WriteBuilder`] pre-configured with this projection's ID and version.
     ///
-    /// Use this to emit new events from a projection.
-    fn aggregator(&self) -> anyhow::Result<AggregatorBuilder> {
-        Ok(AggregatorBuilder::new(self.aggregator_id())
-            .original_version(self.aggregator_version()?)
+    /// Use this to emit new events from a projection (the write gateway).
+    fn write(&self) -> anyhow::Result<WriteBuilder> {
+        Ok(WriteBuilder::new(self.aggregate_id())
+            .original_version(self.aggregate_version()?)
             .to_owned())
     }
 }
@@ -273,7 +270,7 @@ impl<T: bitcode::Encode + bitcode::DecodeOwned + ProjectionCursor + Send + Sync,
     }
 }
 
-/// Projection definition: a set of handlers for a primary aggregator type.
+/// Projection definition: a set of handlers for a primary aggregate type.
 ///
 /// A `Projection` is constructed without an aggregate id. Terminal operations:
 /// - [`Projection::load`] returns a [`LoadBuilder`] bound to a specific aggregate id.
@@ -302,7 +299,7 @@ impl<T: bitcode::Encode + bitcode::DecodeOwned + ProjectionCursor + Send + Sync,
 ///     .await?;
 /// ```
 pub struct Projection<E: Executor, P: Default + 'static> {
-    aggregator_type: &'static str,
+    aggregate_type: &'static str,
     revision: u16,
     handlers: HashMap<String, Box<dyn Handler<P>>>,
     context: context::RwContext,
@@ -312,10 +309,10 @@ pub struct Projection<E: Executor, P: Default + 'static> {
 }
 
 impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
-    /// Creates a new projection definition for the given primary aggregator type.
-    pub fn new<A: Aggregator>() -> Projection<E, P> {
+    /// Creates a new projection definition for the given primary aggregate type.
+    pub fn new<A: Aggregate>() -> Projection<E, P> {
         Projection {
-            aggregator_type: A::aggregator_type(),
+            aggregate_type: A::aggregate_type(),
             context: Default::default(),
             handlers: HashMap::new(),
             safety_disabled: true,
@@ -337,7 +334,7 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
     /// Enables safety checks for unhandled events.
     ///
     /// When enabled, execution fails if an event is encountered without a handler.
-    pub fn safety_check(mut self) -> Self {
+    pub fn strict(mut self) -> Self {
         self.safety_disabled = false;
 
         self
@@ -351,8 +348,8 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
     ///   any snapshot read or event replay.
     /// - [`ProjectionSubscription`] routes tombstone events to
     ///   [`Snapshot::drop_snapshot`] so the user can delete their snapshot row.
-    pub fn tombstone<EV: AggregatorEvent + Send + Sync + 'static>(mut self) -> Self {
-        self.tombstone = Some((EV::aggregator_type(), EV::event_name()));
+    pub fn tombstone<EV: AggregateEvent + Send + Sync + 'static>(mut self) -> Self {
+        self.tombstone = Some((EV::aggregate_type(), EV::event_name()));
         self
     }
 
@@ -362,7 +359,7 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
     ///
     /// Panics if a handler for the same event type is already registered.
     pub fn handler<H: Handler<P> + 'static>(mut self, h: H) -> Self {
-        let key = format!("{}_{}", h.aggregator_type(), h.event_name());
+        let key = format!("{}_{}", h.aggregate_type(), h.event_name());
         if self.handlers.insert(key.to_owned(), Box::new(h)).is_some() {
             panic!("Cannot register event handler: key {} already exists", key);
         }
@@ -374,7 +371,7 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
     /// # Panics
     ///
     /// Panics if a handler for the same event type is already registered.
-    pub fn skip<EV: AggregatorEvent + Send + Sync + 'static>(self) -> Self {
+    pub fn skip<EV: AggregateEvent + Send + Sync + 'static>(self) -> Self {
         self.handler(SkipHandler::<EV>(PhantomData))
     }
 
@@ -393,7 +390,7 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
     pub fn load(self, id: impl Into<String>) -> LoadBuilder<E, P> {
         let id = id.into();
         let mut aggregators = HashMap::new();
-        aggregators.insert(self.aggregator_type.to_string(), id.to_owned());
+        aggregators.insert(self.aggregate_type.to_string(), id.to_owned());
 
         LoadBuilder {
             projection: self,
@@ -418,7 +415,7 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
             chunk_size: 300,
             retry: Some(30),
             delay: None,
-            is_accept_failure: false,
+            continue_on_error: false,
         }
     }
 
@@ -431,7 +428,7 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
         if let Some((tombstone_type, tombstone_event)) = self.tombstone {
             let res = executor
                 .read(
-                    Some(vec![ReadAggregator::new(
+                    Some(vec![EventFilter::exact(
                         tombstone_type,
                         id.to_owned(),
                         tombstone_event,
@@ -446,7 +443,7 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
         }
 
         let mut aggregators = HashMap::with_capacity(extra_aggregators.len() + 1);
-        aggregators.insert(self.aggregator_type.to_string(), id.to_owned());
+        aggregators.insert(self.aggregate_type.to_string(), id.to_owned());
         for (k, v) in extra_aggregators {
             aggregators.insert(k.to_owned(), v.to_owned());
         }
@@ -455,7 +452,7 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
             context: self.context.clone(),
             executor,
             id: id.to_owned(),
-            aggregator_type: self.aggregator_type.to_string(),
+            aggregate_type: self.aggregate_type.to_string(),
             aggregators: &aggregators,
             revision: self.revision,
         };
@@ -465,10 +462,10 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
         let read_aggregators = self
             .handlers
             .values()
-            .map(|h| match aggregators.get(h.aggregator_type()) {
-                Some(id) => ReadAggregator {
-                    aggregator_type: h.aggregator_type().to_owned(),
-                    aggregator_id: Some(id.to_owned()),
+            .map(|h| match aggregators.get(h.aggregate_type()) {
+                Some(id) => EventFilter {
+                    aggregate_type: h.aggregate_type().to_owned(),
+                    aggregate_id: Some(id.to_owned()),
                     name: if self.safety_disabled {
                         Some(h.event_name().to_owned())
                     } else {
@@ -477,9 +474,9 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
                 },
                 _ => {
                     if self.safety_disabled {
-                        ReadAggregator::event(h.aggregator_type(), h.event_name())
+                        EventFilter::by_event(h.aggregate_type(), h.event_name())
                     } else {
-                        ReadAggregator::aggregator(h.aggregator_type())
+                        EventFilter::by_type(h.aggregate_type())
                     }
                 }
             })
@@ -500,7 +497,7 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
         let mut snapshot = snapshot.unwrap_or_default();
 
         for event in events.edges.iter() {
-            let key = format!("{}_{}", event.node.aggregator_type, event.node.name);
+            let key = format!("{}_{}", event.node.aggregate_type, event.node.name);
 
             let Some(handler) = self.handlers.get(&key) else {
                 if !self.safety_disabled {
@@ -528,7 +525,7 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
 
 /// Builder for loading the projection state of a specific aggregate id.
 ///
-/// Created via [`Projection::load`]. Allows registering related aggregators
+/// Created via [`Projection::load`]. Allows registering related aggregates
 /// whose events also feed this projection, then [`LoadBuilder::execute`] runs
 /// the load.
 pub struct LoadBuilder<E: Executor, P: Default + 'static> {
@@ -539,17 +536,17 @@ pub struct LoadBuilder<E: Executor, P: Default + 'static> {
 
 impl<E: Executor, P: Snapshot<E> + Default + 'static> LoadBuilder<E, P> {
     /// Adds a related aggregate to load events from.
-    pub fn aggregator<A: Aggregator>(self, id: impl Into<String>) -> Self {
-        self.aggregator_raw(A::aggregator_type().to_owned(), id)
+    pub fn aggregate<A: Aggregate>(self, id: impl Into<String>) -> Self {
+        self.aggregate_raw(A::aggregate_type().to_owned(), id)
     }
 
-    /// Adds a related aggregate to load events from (raw aggregator type).
-    pub fn aggregator_raw(
+    /// Adds a related aggregate to load events from (raw aggregate type).
+    pub fn aggregate_raw(
         mut self,
-        aggregator_type: impl Into<String>,
+        aggregate_type: impl Into<String>,
         id: impl Into<String>,
     ) -> Self {
-        self.aggregators.insert(aggregator_type.into(), id.into());
+        self.aggregators.insert(aggregate_type.into(), id.into());
 
         self
     }
@@ -579,7 +576,7 @@ pub struct ProjectionSubscription<E: Executor, P: Default + 'static> {
     chunk_size: u16,
     retry: Option<u8>,
     delay: Option<Duration>,
-    is_accept_failure: bool,
+    continue_on_error: bool,
 }
 
 impl<E, P> ProjectionSubscription<E, P>
@@ -628,8 +625,8 @@ where
     }
 
     /// Allows the subscription to continue after handler failures.
-    pub fn accept_failure(mut self) -> Self {
-        self.is_accept_failure = true;
+    pub fn continue_on_error(mut self) -> Self {
+        self.continue_on_error = true;
         self
     }
 
@@ -644,10 +641,10 @@ where
             chunk_size,
             retry,
             delay,
-            is_accept_failure,
+            continue_on_error,
         } = self;
 
-        let aggregator_type: &'static str = projection.aggregator_type;
+        let aggregate_type: &'static str = projection.aggregate_type;
         let tombstone = projection.tombstone;
         // Capture the event names registered for the primary aggregator type.
         // Each event_name is &'static str because Handler::event_name returns
@@ -657,10 +654,10 @@ where
         let event_names: Vec<&'static str> = projection
             .handlers
             .values()
-            .filter(|h| h.aggregator_type() == aggregator_type)
+            .filter(|h| h.aggregate_type() == aggregate_type)
             .filter(|h| {
                 tombstone
-                    .map(|(t, e)| !(h.aggregator_type() == t && h.event_name() == e))
+                    .map(|(t, e)| !(h.aggregate_type() == t && h.event_name() == e))
                     .unwrap_or(true)
             })
             .map(|h| h.event_name())
@@ -682,14 +679,14 @@ where
         if let Some(d) = delay {
             builder = builder.delay(d);
         }
-        if is_accept_failure {
-            builder = builder.accept_failure();
+        if continue_on_error {
+            builder = builder.continue_on_error();
         }
 
         for event_name in event_names {
             builder = builder.handler(ProjectionAutoHandler::<E, P> {
                 projection: projection.clone(),
-                aggregator_type,
+                aggregate_type,
                 event_name,
                 _marker: PhantomData,
             });
@@ -698,14 +695,14 @@ where
         if let Some((tombstone_type, tombstone_event)) = tombstone {
             builder = builder.handler(ProjectionTombstoneHandler::<E, P> {
                 projection: projection.clone(),
-                aggregator_type: tombstone_type,
+                aggregate_type: tombstone_type,
                 event_name: tombstone_event,
                 _marker: PhantomData,
             });
         }
 
         if retry.is_none() {
-            builder.unretry_start(executor).await
+            builder.no_retry().start(executor).await
         } else {
             builder.start(executor).await
         }
@@ -714,7 +711,7 @@ where
 
 struct ProjectionAutoHandler<E: Executor, P: Default + 'static> {
     projection: Arc<Projection<E, P>>,
-    aggregator_type: &'static str,
+    aggregate_type: &'static str,
     event_name: &'static str,
     _marker: PhantomData<E>,
 }
@@ -731,14 +728,14 @@ where
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>> {
         Box::pin(async move {
             self.projection
-                .load_aggregator(context.executor, &event.aggregator_id, &HashMap::new())
+                .load_aggregator(context.executor, &event.aggregate_id, &HashMap::new())
                 .await?;
             Ok(())
         })
     }
 
-    fn aggregator_type(&self) -> &'static str {
-        self.aggregator_type
+    fn aggregate_type(&self) -> &'static str {
+        self.aggregate_type
     }
 
     fn event_name(&self) -> &'static str {
@@ -748,7 +745,7 @@ where
 
 struct ProjectionTombstoneHandler<E: Executor, P: Default + 'static> {
     projection: Arc<Projection<E, P>>,
-    aggregator_type: &'static str,
+    aggregate_type: &'static str,
     event_name: &'static str,
     _marker: PhantomData<E>,
 }
@@ -768,8 +765,8 @@ where
             let ctx = Context {
                 context: self.projection.context.clone(),
                 executor: context.executor,
-                id: event.aggregator_id.clone(),
-                aggregator_type: self.projection.aggregator_type.to_string(),
+                id: event.aggregate_id.clone(),
+                aggregate_type: self.projection.aggregate_type.to_string(),
                 aggregators: &aggregators,
                 revision: self.projection.revision,
             };
@@ -778,8 +775,8 @@ where
         })
     }
 
-    fn aggregator_type(&self) -> &'static str {
-        self.aggregator_type
+    fn aggregate_type(&self) -> &'static str {
+        self.aggregate_type
     }
 
     fn event_name(&self) -> &'static str {
@@ -787,9 +784,9 @@ where
     }
 }
 
-pub(crate) struct SkipHandler<E: AggregatorEvent>(PhantomData<E>);
+pub(crate) struct SkipHandler<E: AggregateEvent>(PhantomData<E>);
 
-impl<P: 'static, EV: AggregatorEvent + Send + Sync> Handler<P> for SkipHandler<EV> {
+impl<P: 'static, EV: AggregateEvent + Send + Sync> Handler<P> for SkipHandler<EV> {
     fn handle<'a>(
         &'a self,
         _projection: &'a mut P,
@@ -798,8 +795,8 @@ impl<P: 'static, EV: AggregatorEvent + Send + Sync> Handler<P> for SkipHandler<E
         Box::pin(async { Ok(()) })
     }
 
-    fn aggregator_type(&self) -> &'static str {
-        EV::aggregator_type()
+    fn aggregate_type(&self) -> &'static str {
+        EV::aggregate_type()
     }
 
     fn event_name(&self) -> &'static str {

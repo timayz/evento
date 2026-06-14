@@ -23,7 +23,7 @@ pub use transfer_money::*;
 pub use unfreeze_account::*;
 pub use withdraw_money::*;
 
-use evento::{Executor, Projection, Snapshot, metadata::Event, projection::ProjectionAggregator};
+use evento::{Executor, Projection, Snapshot, metadata::Event, projection::ProjectionAggregate};
 
 use crate::aggregator::{
     AccountClosed, AccountFrozen, AccountOpened, AccountUnfrozen, MoneyDeposited, MoneyReceived,
@@ -98,15 +98,15 @@ fn create_projection<E: Executor>() -> Projection<E, BankAccount> {
         .handler(handle_money_received())
         .handler(handle_money_withdrawn())
         .handler(handle_money_transferred())
-        .handler(handle_overdraf_limit_changed())
+        .handler(handle_overdraft_limit_changed())
         .handler(handle_account_closed())
         .handler(handle_account_frozen())
         .handler(handle_account_unfrozen())
-        .safety_check()
+        .strict()
 }
 
-impl ProjectionAggregator for BankAccount {
-    fn aggregator_id(&self) -> String {
+impl ProjectionAggregate for BankAccount {
+    fn aggregate_id(&self) -> String {
         self.id.to_owned()
     }
 }
@@ -131,7 +131,7 @@ async fn handle_account_opened(
     event: Event<AccountOpened>,
     row: &mut BankAccount,
 ) -> anyhow::Result<()> {
-    row.id = event.aggregator_id.to_owned();
+    row.id = event.aggregate_id.to_owned();
     row.balance = event.data.initial_balance;
     row.status = AccountStatus::Active;
     row.overdraft_limit = 0;
@@ -180,7 +180,7 @@ async fn handle_money_received(
 }
 
 #[evento::handler]
-async fn handle_overdraf_limit_changed(
+async fn handle_overdraft_limit_changed(
     event: Event<OverdraftLimitChanged>,
     row: &mut BankAccount,
 ) -> anyhow::Result<()> {
