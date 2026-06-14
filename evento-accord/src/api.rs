@@ -6,9 +6,13 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::sync::Mutex;
 
 use async_trait::async_trait;
-use evento_core::Event;
+use evento_core::{
+    cursor::{Args, ReadResult},
+    Event, ReadAggregator, RoutingKey,
+};
 
 use crate::{
     clock::{NodeId, Timestamp, TxnId},
@@ -72,6 +76,10 @@ pub trait Topology: Send + Sync + 'static {
     fn owns(&self, node: NodeId, key: &Key) -> bool {
         self.node_shard(node) == Some(self.shard_of(key))
     }
+
+    /// Installs a later epoch's shard layout. The default is a no-op (fixed
+    /// topologies do not change); [`DynamicTopology`] overrides it.
+    fn install(&self, _epoch: u64, _shards: Vec<Vec<NodeId>>) {}
 }
 
 /// Durable command log. Each replica persists its [`CommandState`] per
@@ -108,6 +116,18 @@ pub trait DataStore: Send + Sync + 'static {
         events: Vec<Event>,
         commit: bool,
     ) -> anyhow::Result<()>;
+
+    /// Serves a read query from the local backend, so a node can answer reads
+    /// forwarded to it for a key range it owns. The default returns nothing (a
+    /// store that holds no queryable events, e.g. the in-memory test store).
+    async fn read(
+        &self,
+        _aggregators: Option<Vec<ReadAggregator>>,
+        _routing_key: Option<RoutingKey>,
+        _args: Args,
+    ) -> anyhow::Result<ReadResult<Event>> {
+        Ok(ReadResult::default())
+    }
 }
 
 /// Static, single-shard [`Topology`]: every node replicates every key. The
@@ -236,6 +256,104 @@ impl Topology for ShardedTopology {
 
     fn node_shard(&self, node: NodeId) -> Option<ShardId> {
         self.shards.iter().position(|shard| shard.contains(&node))
+    }
+}
+
+/// A [`Topology`] whose shard layout can be replaced atomically as the cluster
+/// grows. Each layout is tagged with a monotonically increasing **epoch**.
+///
+/// Unlike [`ShardedTopology`], the running node need not yet belong to any shard
+/// (a joining node holds the current layout to find a peer to bootstrap from,
+/// then [`install`](DynamicTopology::install)s the new epoch that includes it).
+/// Coordinating the epoch change across the cluster — and handling transactions
+/// in flight across it — is future work; callers install an agreed layout.
+pub struct DynamicTopology {
+    this: NodeId,
+    state: Mutex<DynamicState>,
+}
+
+struct DynamicState {
+    epoch: u64,
+    shards: Vec<Vec<NodeId>>,
+}
+
+impl DynamicTopology {
+    /// Builds a topology at `epoch` from disjoint shard replica sets. `this` need
+    /// not be a member yet.
+    pub fn new(this: NodeId, epoch: u64, shards: Vec<Vec<NodeId>>) -> Self {
+        Self {
+            this,
+            state: Mutex::new(DynamicState { epoch, shards }),
+        }
+    }
+
+    fn shard_index(shards: &[Vec<NodeId>], key: &Key) -> ShardId {
+        let mut hasher = DefaultHasher::new();
+        key.0.hash(&mut hasher);
+        (hasher.finish() as usize) % shards.len()
+    }
+}
+
+impl Topology for DynamicTopology {
+    fn epoch(&self) -> u64 {
+        self.state.lock().expect("topology poisoned").epoch
+    }
+
+    fn this_node(&self) -> NodeId {
+        self.this
+    }
+
+    fn nodes(&self) -> Vec<NodeId> {
+        self.state
+            .lock()
+            .expect("topology poisoned")
+            .shards
+            .iter()
+            .flatten()
+            .copied()
+            .collect()
+    }
+
+    fn replicas(&self, key: &Key) -> Vec<NodeId> {
+        let state = self.state.lock().expect("topology poisoned");
+        state.shards[Self::shard_index(&state.shards, key)].clone()
+    }
+
+    fn fast_quorum(&self, key: &Key) -> usize {
+        let state = self.state.lock().expect("topology poisoned");
+        let n = state.shards[Self::shard_index(&state.shards, key)].len();
+        let f = n.saturating_sub(1) / 2;
+        (3 * f).div_ceil(2) + 1
+    }
+
+    fn slow_quorum(&self, key: &Key) -> usize {
+        let state = self.state.lock().expect("topology poisoned");
+        let n = state.shards[Self::shard_index(&state.shards, key)].len();
+        n.saturating_sub(1) / 2 + 1
+    }
+
+    fn shard_of(&self, key: &Key) -> ShardId {
+        let state = self.state.lock().expect("topology poisoned");
+        Self::shard_index(&state.shards, key)
+    }
+
+    fn node_shard(&self, node: NodeId) -> Option<ShardId> {
+        self.state
+            .lock()
+            .expect("topology poisoned")
+            .shards
+            .iter()
+            .position(|shard| shard.contains(&node))
+    }
+
+    /// Atomically replaces the layout with a later `epoch`. Ignored if `epoch`
+    /// is not newer than the current one.
+    fn install(&self, epoch: u64, shards: Vec<Vec<NodeId>>) {
+        let mut state = self.state.lock().expect("topology poisoned");
+        if epoch > state.epoch {
+            state.epoch = epoch;
+            state.shards = shards;
+        }
     }
 }
 

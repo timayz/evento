@@ -16,16 +16,20 @@
 //! reads/applies the events for keys it owns.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use evento_core::Event;
+use evento_core::{
+    cursor::{Args, Edge, ReadResult},
+    Event, ReadAggregator, RoutingKey,
+};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant};
 
 use crate::api::{DataStore, Journal, MessageSink, ShardId, Topology};
 use crate::clock::{Ballot, Clock, HybridLogicalClock, NodeId, Timestamp, TxnId};
-use crate::message::{Key, Message, Status};
+use crate::message::{CommandState, Key, Message, Status};
 use crate::replica::Replica;
 use crate::transport::Envelope;
 
@@ -77,6 +81,32 @@ enum RecoverResp {
 /// responses `(responder, message)`.
 type Pending = Arc<Mutex<HashMap<TxnId, mpsc::UnboundedSender<(NodeId, Message)>>>>;
 
+/// An acceptor's single-decree-Paxos state for one config epoch.
+#[derive(Clone)]
+struct ConfigAcceptor {
+    promised: Ballot,
+    accepted: Option<(Ballot, Vec<Vec<NodeId>>)>,
+}
+
+impl Default for ConfigAcceptor {
+    fn default() -> Self {
+        Self {
+            promised: Ballot(Timestamp {
+                micros: 0,
+                logical: 0,
+                node: NodeId(0),
+            }),
+            accepted: None,
+        }
+    }
+}
+
+/// Per-epoch config acceptor state.
+type ConfigState = Arc<Mutex<HashMap<u64, ConfigAcceptor>>>;
+
+/// Delivers config-Paxos responses to an in-flight epoch change.
+type ConfigInbox = Arc<Mutex<Option<mpsc::UnboundedSender<Message>>>>;
+
 /// A cluster node. Cheap to clone — all state is shared behind `Arc`.
 #[derive(Clone)]
 pub struct Node {
@@ -88,6 +118,23 @@ pub struct Node {
     journal: Arc<dyn Journal>,
     replica: Arc<Mutex<Replica>>,
     pending: Pending,
+    /// Delivers the [`SyncData`](Message::SyncData) response to an in-flight
+    /// [`join`](Node::join).
+    sync_inbox: Arc<Mutex<Option<mpsc::UnboundedSender<Vec<CommandState>>>>>,
+    /// True once this node may process consensus messages. A joining node clears
+    /// it (via [`begin_join`](Node::begin_join)) so messages that arrive while it
+    /// bootstraps are buffered and replayed, not dropped.
+    bootstrapped: Arc<AtomicBool>,
+    /// Consensus messages received while not yet bootstrapped, replayed by
+    /// [`join`](Node::join) after the snapshot is imported.
+    join_buffer: Arc<Mutex<Vec<Envelope>>>,
+    /// This node's acceptor state per config epoch.
+    config: ConfigState,
+    /// Delivers config-Paxos responses to an in-flight epoch change.
+    config_inbox: ConfigInbox,
+    /// Next id for a forwarded read, and the channels awaiting their replies.
+    read_seq: Arc<AtomicU64>,
+    read_pending: Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<Message>>>>,
 }
 
 impl Node {
@@ -109,6 +156,13 @@ impl Node {
             journal,
             replica: Arc::new(Mutex::new(Replica::new())),
             pending: Arc::new(Mutex::new(HashMap::new())),
+            sync_inbox: Arc::new(Mutex::new(None)),
+            bootstrapped: Arc::new(AtomicBool::new(true)),
+            join_buffer: Arc::new(Mutex::new(Vec::new())),
+            config: Arc::new(Mutex::new(HashMap::new())),
+            config_inbox: Arc::new(Mutex::new(None)),
+            read_seq: Arc::new(AtomicU64::new(0)),
+            read_pending: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -131,6 +185,27 @@ impl Node {
 
     /// Processes one inbound message.
     async fn handle(&self, env: Envelope) {
+        // While bootstrapping, buffer consensus messages for replay after the
+        // snapshot is imported. Cluster-management messages (bootstrap + epoch
+        // changes) pass through so the node can still sync and learn its layout.
+        let control = matches!(
+            env.message,
+            Message::SyncRequest
+                | Message::SyncData { .. }
+                | Message::ConfigPrepare { .. }
+                | Message::ConfigPromise { .. }
+                | Message::ConfigAccept { .. }
+                | Message::ConfigAccepted { .. }
+                | Message::ConfigCommit { .. }
+                | Message::ConfigNack { .. }
+                | Message::ReadForward { .. }
+                | Message::ReadReply { .. }
+        );
+        if !control && !self.bootstrapped.load(Ordering::Acquire) {
+            self.join_buffer.lock().expect("buffer poisoned").push(env);
+            return;
+        }
+
         let from = env.from;
         match env.message {
             Message::PreAccept { txn, keys, events } => {
@@ -238,17 +313,136 @@ impl Node {
                 };
                 self.send(from, message).await;
             }
-            // Responses: hand to the waiting coordinator, tagged with the sender.
-            response => {
-                let txn = response.txn();
-                let tx = self
-                    .pending
+            // Bootstrap: a joining node asks for our committed state.
+            Message::SyncRequest => {
+                let commands = self
+                    .replica
                     .lock()
-                    .expect("pending poisoned")
-                    .get(&txn)
+                    .expect("replica poisoned")
+                    .export_applied();
+                self.send(from, Message::SyncData { commands }).await;
+            }
+            Message::SyncData { commands } => {
+                let tx = self.sync_inbox.lock().expect("sync poisoned").clone();
+                if let Some(tx) = tx {
+                    let _ = tx.send(commands);
+                }
+            }
+            // Config Paxos — acceptor side.
+            Message::ConfigPrepare { epoch, ballot } => {
+                let reply = {
+                    let mut config = self.config.lock().expect("config poisoned");
+                    let acc = config.entry(epoch).or_default();
+                    if ballot < acc.promised {
+                        Message::ConfigNack {
+                            epoch,
+                            promised: acc.promised,
+                        }
+                    } else {
+                        acc.promised = ballot;
+                        let (accepted_ballot, accepted_layout) = match &acc.accepted {
+                            Some((b, l)) => (*b, Some(l.clone())),
+                            None => (ConfigAcceptor::default().promised, None),
+                        };
+                        Message::ConfigPromise {
+                            epoch,
+                            accepted_ballot,
+                            accepted_layout,
+                        }
+                    }
+                };
+                self.send(from, reply).await;
+            }
+            Message::ConfigAccept {
+                epoch,
+                ballot,
+                layout,
+            } => {
+                let reply = {
+                    let mut config = self.config.lock().expect("config poisoned");
+                    let acc = config.entry(epoch).or_default();
+                    if ballot < acc.promised {
+                        Message::ConfigNack {
+                            epoch,
+                            promised: acc.promised,
+                        }
+                    } else {
+                        acc.promised = ballot;
+                        acc.accepted = Some((ballot, layout));
+                        Message::ConfigAccepted { epoch }
+                    }
+                };
+                self.send(from, reply).await;
+            }
+            Message::ConfigCommit { epoch, layout } => {
+                self.topology.install(epoch, layout);
+            }
+            // Config Paxos responses — route to the in-flight epoch change.
+            response @ (Message::ConfigPromise { .. }
+            | Message::ConfigAccepted { .. }
+            | Message::ConfigNack { .. }) => {
+                let tx = self.config_inbox.lock().expect("config poisoned").clone();
+                if let Some(tx) = tx {
+                    let _ = tx.send(response);
+                }
+            }
+            // A forwarded read: serve it from the local backend and reply.
+            Message::ReadForward {
+                id,
+                aggregators,
+                routing_key,
+                args,
+            } => {
+                let result = self
+                    .datastore
+                    .read(aggregators, routing_key, args)
+                    .await
+                    .unwrap_or_default();
+                let page_info = result.page_info;
+                let mut cursors = Vec::with_capacity(result.edges.len());
+                let mut events = Vec::with_capacity(result.edges.len());
+                for edge in result.edges {
+                    cursors.push(edge.cursor);
+                    events.push(edge.node);
+                }
+                self.send(
+                    from,
+                    Message::ReadReply {
+                        id,
+                        cursors,
+                        events,
+                        page_info,
+                    },
+                )
+                .await;
+            }
+            reply @ Message::ReadReply { .. } => {
+                let id = match &reply {
+                    Message::ReadReply { id, .. } => *id,
+                    _ => unreachable!(),
+                };
+                let tx = self
+                    .read_pending
+                    .lock()
+                    .expect("reads poisoned")
+                    .get(&id)
                     .cloned();
                 if let Some(tx) = tx {
-                    let _ = tx.send((from, response));
+                    let _ = tx.send(reply);
+                }
+            }
+            // Responses: hand to the waiting coordinator, tagged with the sender.
+            response => {
+                if let Some(txn) = response.txn() {
+                    let tx = self
+                        .pending
+                        .lock()
+                        .expect("pending poisoned")
+                        .get(&txn)
+                        .cloned();
+                    if let Some(tx) = tx {
+                        let _ = tx.send((from, response));
+                    }
                 }
             }
         }
@@ -736,6 +930,299 @@ impl Node {
             }
         }
         Ok(txn)
+    }
+
+    /// Marks this node as joining: until [`join`](Node::join) completes,
+    /// consensus messages are buffered rather than processed. Call this before
+    /// the epoch that adds this node is installed, so nothing is lost in the gap.
+    pub fn begin_join(&self) {
+        self.bootstrapped.store(false, Ordering::Release);
+    }
+
+    /// Bootstraps this (joining) node from `contact`: fetches its committed state,
+    /// imports every command for a key this node now owns (recording it in the
+    /// conflict graph and applying its events), then replays any consensus
+    /// messages buffered since [`begin_join`](Node::begin_join) — so a transaction
+    /// committed during the join still lands. Returns how many were imported.
+    ///
+    /// Coordinating the epoch change across the cluster (rather than each node
+    /// installing an agreed layout) remains future work.
+    pub async fn join(&self, contact: NodeId) -> anyhow::Result<usize> {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        *self.sync_inbox.lock().expect("sync poisoned") = Some(tx);
+        self.send(contact, Message::SyncRequest).await;
+
+        let commands = tokio::time::timeout(COLLECT_TIMEOUT, rx.recv())
+            .await
+            .map_err(|_| anyhow::anyhow!("bootstrap sync timed out"))?
+            .ok_or_else(|| anyhow::anyhow!("bootstrap sync channel closed"))?;
+        *self.sync_inbox.lock().expect("sync poisoned") = None;
+
+        let mut imported = 0;
+        for cmd in commands {
+            if !cmd.keys.iter().any(|k| self.topology.owns(self.id, k)) {
+                continue;
+            }
+            let (txn, execute_at, events) = (cmd.txn, cmd.execute_at, cmd.events.clone());
+            let commit = cmd.applied_conflict == Some(false);
+            let inserted = self
+                .replica
+                .lock()
+                .expect("replica poisoned")
+                .import_applied(cmd);
+            if inserted {
+                let _ = self.datastore.apply(txn, execute_at, events, commit).await;
+                imported += 1;
+            }
+        }
+
+        // Resume normal processing and replay anything buffered during bootstrap.
+        self.bootstrapped.store(true, Ordering::Release);
+        let buffered = std::mem::take(&mut *self.join_buffer.lock().expect("buffer poisoned"));
+        for env in buffered {
+            Box::pin(self.handle(env)).await;
+        }
+
+        Ok(imported)
+    }
+
+    /// Coordinates installing `shards` as the new `epoch`'s layout, fault
+    /// tolerantly: runs single-decree Paxos over the **current members** so the
+    /// decision survives this coordinator failing, then commits it cluster-wide.
+    /// Returns the decided layout (which differs from `shards` only if a prior,
+    /// interrupted change for this epoch had already been accepted).
+    ///
+    /// The acceptor set is the members of the current epoch (a node proposing the
+    /// next epoch is still on this one), so it tracks membership: changes keep
+    /// working after the original founders have left.
+    pub async fn change_topology(
+        &self,
+        epoch: u64,
+        shards: Vec<Vec<NodeId>>,
+    ) -> anyhow::Result<Vec<Vec<NodeId>>> {
+        let acceptors = self.topology.nodes();
+        let decided = self.run_config_paxos(epoch, shards, &acceptors).await?;
+        self.commit_topology(epoch, &decided, &acceptors).await;
+        Ok(decided)
+    }
+
+    /// Drives Paxos phases 1–2 for `epoch` (no commit), returning the decided
+    /// layout. Exposed so tests can simulate a coordinator that fails after the
+    /// decision is durable but before committing.
+    pub async fn propose_topology(
+        &self,
+        epoch: u64,
+        proposed: Vec<Vec<NodeId>>,
+    ) -> anyhow::Result<Vec<Vec<NodeId>>> {
+        let acceptors = self.topology.nodes();
+        self.run_config_paxos(epoch, proposed, &acceptors).await
+    }
+
+    /// The config-Paxos coordinator over an explicit `acceptors` set.
+    async fn run_config_paxos(
+        &self,
+        epoch: u64,
+        proposed: Vec<Vec<NodeId>>,
+        acceptors: &[NodeId],
+    ) -> anyhow::Result<Vec<Vec<NodeId>>> {
+        let need = acceptors.len() / 2 + 1;
+        let mut ballot = Ballot(self.clock.now());
+
+        for _attempt in 0..3 {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            *self.config_inbox.lock().expect("config poisoned") = Some(tx);
+
+            // Phase 1: Prepare → adopt the highest already-accepted value, if any.
+            for &node in acceptors {
+                self.send(node, Message::ConfigPrepare { epoch, ballot })
+                    .await;
+            }
+            let mut promises = 0;
+            let mut nack: Option<Ballot> = None;
+            let mut adopted: Option<(Ballot, Vec<Vec<NodeId>>)> = None;
+            let deadline = Self::after(COLLECT_TIMEOUT);
+            while promises < need {
+                match tokio::time::timeout_at(deadline, rx.recv()).await {
+                    Ok(Some(Message::ConfigPromise {
+                        accepted_ballot,
+                        accepted_layout,
+                        ..
+                    })) => {
+                        promises += 1;
+                        if let Some(layout) = accepted_layout {
+                            if adopted.as_ref().is_none_or(|(b, _)| accepted_ballot > *b) {
+                                adopted = Some((accepted_ballot, layout));
+                            }
+                        }
+                    }
+                    Ok(Some(Message::ConfigNack { promised, .. })) => {
+                        nack = Some(promised);
+                        break;
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(_) => break,
+                }
+            }
+            if let Some(promised) = nack {
+                *self.config_inbox.lock().expect("config poisoned") = None;
+                ballot = self.higher_ballot(promised);
+                continue;
+            }
+            if promises < need {
+                *self.config_inbox.lock().expect("config poisoned") = None;
+                anyhow::bail!("config prepare quorum not reached for epoch {epoch}");
+            }
+
+            let layout = adopted.map(|(_, l)| l).unwrap_or(proposed.clone());
+
+            // Phase 2: Accept the chosen layout.
+            for &node in acceptors {
+                self.send(
+                    node,
+                    Message::ConfigAccept {
+                        epoch,
+                        ballot,
+                        layout: layout.clone(),
+                    },
+                )
+                .await;
+            }
+            let mut accepts = 0;
+            let mut nack: Option<Ballot> = None;
+            let deadline = Self::after(COLLECT_TIMEOUT);
+            while accepts < need {
+                match tokio::time::timeout_at(deadline, rx.recv()).await {
+                    Ok(Some(Message::ConfigAccepted { .. })) => accepts += 1,
+                    Ok(Some(Message::ConfigNack { promised, .. })) => {
+                        nack = Some(promised);
+                        break;
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(_) => break,
+                }
+            }
+            *self.config_inbox.lock().expect("config poisoned") = None;
+
+            if let Some(promised) = nack {
+                ballot = self.higher_ballot(promised);
+                continue;
+            }
+            if accepts < need {
+                anyhow::bail!("config accept quorum not reached for epoch {epoch}");
+            }
+            return Ok(layout);
+        }
+        anyhow::bail!("config change for epoch {epoch} exhausted its ballots")
+    }
+
+    /// Recovers a possibly-interrupted change for `epoch`: completes whatever
+    /// layout was already accepted (or, if none was, keeps the current layout),
+    /// then commits it. Any node can call this after the original coordinator
+    /// fails.
+    pub async fn recover_topology(&self, epoch: u64) -> anyhow::Result<Vec<Vec<NodeId>>> {
+        let acceptors = self.topology.nodes();
+        let fallback = self.current_layout();
+        let decided = self.run_config_paxos(epoch, fallback, &acceptors).await?;
+        self.commit_topology(epoch, &decided, &acceptors).await;
+        Ok(decided)
+    }
+
+    /// Installs the decided layout locally and broadcasts it to the acceptors and
+    /// the new members so they install it too.
+    async fn commit_topology(&self, epoch: u64, layout: &[Vec<NodeId>], acceptors: &[NodeId]) {
+        self.topology.install(epoch, layout.to_vec());
+        let mut recipients = acceptors.to_vec();
+        for node in layout.iter().flatten() {
+            if !recipients.contains(node) {
+                recipients.push(*node);
+            }
+        }
+        for &node in &recipients {
+            self.send(
+                node,
+                Message::ConfigCommit {
+                    epoch,
+                    layout: layout.to_vec(),
+                },
+            )
+            .await;
+        }
+    }
+
+    /// This node's current shard layout, recovered shard-by-shard from the
+    /// topology (used as the no-op fallback when recovering a config change).
+    fn current_layout(&self) -> Vec<Vec<NodeId>> {
+        // Single contiguous group per shard is sufficient for the fallback; the
+        // recovered (accepted) value replaces it whenever one exists.
+        let nodes = self.topology.nodes();
+        vec![nodes]
+    }
+
+    // ----- read routing ---------------------------------------------------
+
+    /// Whether this node replicates `key` (and so can serve reads for it locally).
+    pub fn owns_key(&self, key: &Key) -> bool {
+        self.topology.owns(self.id, key)
+    }
+
+    /// A replica that owns `key`, to forward a read to. Prefers another node but
+    /// falls back to self.
+    pub fn an_owner_of(&self, key: &Key) -> Option<NodeId> {
+        let replicas = self.topology.replicas(key);
+        replicas
+            .iter()
+            .find(|&&n| n != self.id)
+            .copied()
+            .or_else(|| replicas.first().copied())
+    }
+
+    /// Forwards a read to `to` (an owner of the queried range) and returns its
+    /// result.
+    pub async fn forward_read(
+        &self,
+        to: NodeId,
+        aggregators: Option<Vec<ReadAggregator>>,
+        routing_key: Option<RoutingKey>,
+        args: Args,
+    ) -> anyhow::Result<ReadResult<Event>> {
+        let id = self.read_seq.fetch_add(1, Ordering::Relaxed);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        self.read_pending
+            .lock()
+            .expect("reads poisoned")
+            .insert(id, tx);
+        self.send(
+            to,
+            Message::ReadForward {
+                id,
+                aggregators,
+                routing_key,
+                args,
+            },
+        )
+        .await;
+
+        let reply = tokio::time::timeout(COLLECT_TIMEOUT, rx.recv()).await;
+        self.read_pending
+            .lock()
+            .expect("reads poisoned")
+            .remove(&id);
+        match reply {
+            Ok(Some(Message::ReadReply {
+                cursors,
+                events,
+                page_info,
+                ..
+            })) => {
+                let edges = events
+                    .into_iter()
+                    .zip(cursors)
+                    .map(|(node, cursor)| Edge { cursor, node })
+                    .collect();
+                Ok(ReadResult { edges, page_info })
+            }
+            _ => anyhow::bail!("forwarded read to {to:?} failed"),
+        }
     }
 
     // ----- helpers --------------------------------------------------------

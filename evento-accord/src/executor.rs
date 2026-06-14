@@ -28,7 +28,24 @@ use ulid::Ulid;
 
 use crate::api::DataStore;
 use crate::clock::{Timestamp, TxnId};
+use crate::message::Key;
 use crate::node::Node;
+
+/// The single key a read targets, if it can be pinned to one shard: an explicit
+/// routing key, or a query for one aggregate by id. Broad scans (multiple
+/// aggregates, or by event type) return `None` and are served locally.
+fn target_key(
+    aggregators: &Option<Vec<ReadAggregator>>,
+    routing_key: &Option<RoutingKey>,
+) -> Option<Key> {
+    if let Some(RoutingKey::Value(Some(key))) = routing_key {
+        return Some(Key(key.clone()));
+    }
+    match aggregators.as_deref() {
+        Some([only]) => only.aggregator_id.clone().map(Key),
+        _ => None,
+    }
+}
 
 /// An Accord [`DataStore`] backed by a local evento [`Executor`].
 ///
@@ -86,6 +103,15 @@ impl<E: Executor> DataStore for ExecutorDataStore<E> {
             Err(err) => Err(err.into()),
         }
     }
+
+    async fn read(
+        &self,
+        aggregators: Option<Vec<ReadAggregator>>,
+        routing_key: Option<RoutingKey>,
+        args: Args,
+    ) -> anyhow::Result<ReadResult<Event>> {
+        self.local.read(aggregators, routing_key, args).await
+    }
 }
 
 /// An evento [`Executor`] whose writes are coordinated through an Accord cluster
@@ -134,6 +160,19 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
         routing_key: Option<RoutingKey>,
         args: Args,
     ) -> anyhow::Result<ReadResult<Event>> {
+        // A single-shard read for a key this node does not own is forwarded to an
+        // owner. Everything else (owned keys, and broad scans that can't be pinned
+        // to one shard) is served from the local backend.
+        if let Some(key) = target_key(&aggregators, &routing_key) {
+            if !self.node.owns_key(&key) {
+                if let Some(owner) = self.node.an_owner_of(&key) {
+                    return self
+                        .node
+                        .forward_read(owner, aggregators, routing_key, args)
+                        .await;
+                }
+            }
+        }
         self.local.read(aggregators, routing_key, args).await
     }
 

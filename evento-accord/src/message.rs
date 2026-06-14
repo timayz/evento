@@ -7,7 +7,10 @@
 //! (it was slow or down) can still apply, and the per-shard dependency set for
 //! that shard's execution barrier.
 
-use evento_core::Event;
+use evento_core::{
+    cursor::{Args, PageInfo, Value},
+    Event, ReadAggregator, RoutingKey,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::clock::{Ballot, NodeId, Timestamp, TxnId};
@@ -50,8 +53,9 @@ pub enum Status {
 }
 
 /// A replica's knowledge of one transaction — the unit the
-/// [`Journal`](crate::api::Journal) persists and recovery replays.
-#[derive(Debug, Clone)]
+/// [`Journal`](crate::api::Journal) persists and recovery replays, and that a
+/// joining node imports during bootstrap.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandState {
     /// Transaction identity (`t0`); its node component is the coordinator.
     pub txn: TxnId,
@@ -71,6 +75,7 @@ pub struct CommandState {
     /// Keys this transaction touches (for conflict detection).
     pub keys: Vec<Key>,
     /// The events this transaction conditionally appends on apply.
+    #[serde(with = "wire_events")]
     pub events: Vec<Event>,
     /// Node to report the execution result to — the original coordinator, or a
     /// recovery coordinator that took over.
@@ -158,12 +163,56 @@ pub enum Message {
     /// Replica → coordinator: a ballot was too low; `promised` is the ballot the
     /// replica has already promised, so the sender can retry above it.
     Nack { txn: TxnId, promised: Ballot },
+    /// Joining node → an existing replica: send me your committed state so I can
+    /// bootstrap.
+    SyncRequest,
+    /// Existing replica → joining node: the applied commands to import.
+    SyncData { commands: Vec<CommandState> },
+    /// Config coordinator → acceptors: Paxos phase 1 for `epoch`'s layout.
+    ConfigPrepare { epoch: u64, ballot: Ballot },
+    /// Acceptor → coordinator: promised `ballot`, reporting any value it has
+    /// already accepted (which the coordinator must adopt).
+    ConfigPromise {
+        epoch: u64,
+        accepted_ballot: Ballot,
+        accepted_layout: Option<Vec<Vec<NodeId>>>,
+    },
+    /// Config coordinator → acceptors: Paxos phase 2 — accept this layout.
+    ConfigAccept {
+        epoch: u64,
+        ballot: Ballot,
+        layout: Vec<Vec<NodeId>>,
+    },
+    /// Acceptor → coordinator: accepted under the proposing ballot.
+    ConfigAccepted { epoch: u64 },
+    /// Config coordinator → all nodes: the layout is decided; install it.
+    ConfigCommit {
+        epoch: u64,
+        layout: Vec<Vec<NodeId>>,
+    },
+    /// Acceptor → coordinator: a config ballot was too low for `epoch`.
+    ConfigNack { epoch: u64, promised: Ballot },
+    /// A node → an owner of the queried key range: serve this read locally.
+    ReadForward {
+        id: u64,
+        aggregators: Option<Vec<ReadAggregator>>,
+        routing_key: Option<RoutingKey>,
+        args: Args,
+    },
+    /// Owner → requester: the read result (events paired with their cursors).
+    ReadReply {
+        id: u64,
+        cursors: Vec<Value>,
+        #[serde(with = "wire_events")]
+        events: Vec<Event>,
+        page_info: PageInfo,
+    },
 }
 
 impl Message {
     /// The transaction this message concerns, used to route responses to the
-    /// in-flight coordination.
-    pub fn txn(&self) -> TxnId {
+    /// in-flight coordination. `None` for cluster-management messages (sync).
+    pub fn txn(&self) -> Option<TxnId> {
         match self {
             Message::PreAccept { txn, .. }
             | Message::PreAcceptOk { txn, .. }
@@ -175,7 +224,17 @@ impl Message {
             | Message::Applied { txn, .. }
             | Message::Recover { txn, .. }
             | Message::RecoverOk { txn, .. }
-            | Message::Nack { txn, .. } => *txn,
+            | Message::Nack { txn, .. } => Some(*txn),
+            Message::SyncRequest
+            | Message::SyncData { .. }
+            | Message::ConfigPrepare { .. }
+            | Message::ConfigPromise { .. }
+            | Message::ConfigAccept { .. }
+            | Message::ConfigAccepted { .. }
+            | Message::ConfigCommit { .. }
+            | Message::ConfigNack { .. }
+            | Message::ReadForward { .. }
+            | Message::ReadReply { .. } => None,
         }
     }
 }

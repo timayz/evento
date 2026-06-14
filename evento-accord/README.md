@@ -37,9 +37,17 @@ The protocol depends only on the `api` traits; each has an in-memory
 implementation for the test harness and a production one (framed TCP, static
 membership, a Fjall/SQL-backed store).
 
+## Also supported
+
+- **Elastic membership** — epoch-versioned topology; nodes join (bootstrapping
+  their key range) and leave; epoch changes are decided by Paxos over the current
+  members, so they survive a coordinator crash and keep working after the founders
+  have left; keys re-shard onto new owners.
+- **Multi-shard reads** — a read for a key a node doesn't own is routed to an
+  owner.
+
 ## Not yet
 
-Topology changes (epochs, nodes joining/leaving, range movement) and routing
-reads to owning shards in a multi-shard cluster.
+Garbage-collecting a moved key range from its old owners.
 
 [CEP-15]: https://cwiki.apache.org/confluence/display/CASSANDRA/CEP-15:+General+Purpose+Transactions

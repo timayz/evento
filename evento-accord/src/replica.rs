@@ -430,6 +430,31 @@ impl Replica {
     pub fn snapshot(&self, txn: TxnId) -> Option<CommandState> {
         self.commands.get(&txn).cloned()
     }
+
+    /// Every applied command, in execution-timestamp order — the committed state
+    /// a joining node bootstraps from.
+    pub fn export_applied(&self) -> Vec<CommandState> {
+        let mut applied: Vec<CommandState> = self
+            .commands
+            .values()
+            .filter(|cmd| cmd.status == Status::Applied)
+            .cloned()
+            .collect();
+        applied.sort_by_key(|cmd| (cmd.execute_at, cmd.txn));
+        applied
+    }
+
+    /// Imports an already-applied command during bootstrap: records it (so this
+    /// replica's conflict graph and dependency barriers see it) unless already
+    /// known. Returns whether it was newly inserted.
+    pub fn import_applied(&mut self, mut cmd: CommandState) -> bool {
+        if self.commands.contains_key(&cmd.txn) {
+            return false;
+        }
+        cmd.status = Status::Applied;
+        self.insert(cmd);
+        true
+    }
 }
 
 #[cfg(test)]

@@ -35,7 +35,8 @@ pub mod tcp;
 pub mod transport;
 
 pub use api::{
-    DataStore, Journal, MessageSink, ShardId, ShardedTopology, StaticTopology, Topology,
+    DataStore, DynamicTopology, Journal, MessageSink, ShardId, ShardedTopology, StaticTopology,
+    Topology,
 };
 pub use clock::{Ballot, Clock, HybridLogicalClock, NodeId, Timestamp, TxnId};
 pub use executor::{AccordExecutor, ExecutorDataStore};

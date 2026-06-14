@@ -32,6 +32,8 @@ pub struct Envelope {
 pub struct InMemoryNetwork {
     inboxes: Mutex<HashMap<NodeId, mpsc::UnboundedSender<Envelope>>>,
     crashed: Mutex<HashSet<NodeId>>,
+    /// Unordered node pairs that cannot exchange messages (a partition).
+    partitions: Mutex<HashSet<(NodeId, NodeId)>>,
 }
 
 impl InMemoryNetwork {
@@ -69,6 +71,21 @@ impl InMemoryNetwork {
         self.crashed.lock().expect("network poisoned").remove(&node);
     }
 
+    /// Severs the link between `a` and `b` in both directions (a partition).
+    pub fn partition(&self, a: NodeId, b: NodeId) {
+        let mut partitions = self.partitions.lock().expect("network poisoned");
+        partitions.insert((a, b));
+        partitions.insert((b, a));
+    }
+
+    /// Whether messages between `from` and `to` are currently partitioned.
+    fn is_partitioned(&self, from: NodeId, to: NodeId) -> bool {
+        self.partitions
+            .lock()
+            .expect("network poisoned")
+            .contains(&(from, to))
+    }
+
     /// Whether `node` is currently crashed.
     fn is_crashed(&self, node: NodeId) -> bool {
         self.crashed
@@ -88,8 +105,11 @@ pub struct InMemorySink {
 #[async_trait]
 impl MessageSink for InMemorySink {
     async fn send(&self, to: NodeId, message: Message) -> anyhow::Result<()> {
-        // A crashed node neither sends nor receives.
-        if self.net.is_crashed(self.from) || self.net.is_crashed(to) {
+        // A crashed node neither sends nor receives; a partition drops the link.
+        if self.net.is_crashed(self.from)
+            || self.net.is_crashed(to)
+            || self.net.is_partitioned(self.from, to)
+        {
             return Ok(());
         }
 

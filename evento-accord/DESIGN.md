@@ -105,6 +105,26 @@ The trait isolates the choice; `tonic` stays a swap-in if we later want TLS/code
 Membership for the first milestones is **static config** (fixed node-id ↔
 address list). Dynamic membership / gossip is deferred to M4.
 
+## A note on the config / metadata layer
+
+Accord itself is only the *transaction* protocol (the data plane). It does **not**
+decide membership or epochs — it consumes an already-agreed topology through the
+`Topology` trait (modelled on `accord-core`'s `TopologyService`). In real
+Cassandra, that agreement is provided by a **separate** subsystem: the cluster
+metadata service (CEP-21, Transactional Cluster Metadata — a linearizable
+replicated metadata *log*).
+
+`evento-accord` is standalone, with no host metadata service, so the config Paxos
+(`ConfigPrepare`/`Promise`/`Accept`/`Accepted`/`Commit`) is a **minimal stand-in
+for that role** — an implementation choice, not part of Accord. It is scoped to
+"agree on one topology layout per epoch" (single-decree Paxos per epoch number)
+rather than a general metadata log; the epoch number supplies the ordering a log
+would otherwise provide. Known gaps versus a full metadata service: a node that
+misses several epoch changes has no log to replay (it only learns of changes it
+receives a `ConfigCommit` for), and there is no leader for liveness under
+contention. Keep this boundary in mind: anything `Config*` is the control plane,
+everything else is Accord.
+
 ## Milestones
 
 - **M0 — Skeleton.** ✅ `api` traits, core types (`NodeId`, `Timestamp`,
@@ -148,19 +168,46 @@ address list). Dynamic membership / gossip is deferred to M4.
   `tests/shard_cluster.rs` proves shard routing, atomic cross-shard commit, and
   atomic cross-shard abort (a stale aggregate aborts the whole write, leaving the
   other untouched).
-- **M4 — Topology changes.** Epoch transitions, bootstrap/sync of joining nodes,
-  range movement. Large and intricate.
+- **M4 — Topology changes.** ✅ `DynamicTopology` carries an
+  **epoch** and can `install` a new shard layout atomically. A joining node
+  **bootstraps**: `begin_join` starts buffering consensus messages; `Node::join`
+  fetches a peer's committed state (`SyncRequest` / `SyncData` carrying serialized
+  `CommandState`s), imports each command into its conflict graph
+  (`Replica::import_applied`) and applies its events, then **replays the buffered
+  messages** — so a transaction that commits *during* the join still lands
+  (sync-point-style). A node drives an epoch change with `Node::change_topology`,
+  which runs **single-decree Paxos** over the current members (`ConfigPrepare` /
+  `ConfigPromise` / `ConfigAccept` / `ConfigAccepted` / `ConfigCommit`) so the
+  layout decision is durable; `Node::recover_topology` lets any node complete a
+  change whose coordinator died after the value was accepted. **Node leave** is
+  just installing a smaller layout. `tests/membership.rs` proves: a coordinated
+  join where the joiner converges on the global order; optimistic concurrency on
+  the joined node; a write committed mid-bootstrap reaching the joiner *only*
+  through the replay buffer (via a partition); a node leaving while the smaller
+  cluster keeps serving; and a config change surviving the coordinator crashing
+  after the value is durable but before commit (another node recovers it).
+  **Range movement** composes from these: re-sharding into more shards is a config
+  change, and the new shard's nodes bootstrap *only their key range* (the join's
+  ownership filter); `tests/resharding.rs` moves a key to a new 3-node shard and
+  shows writes route to — and version state is enforced by — its new owners. The
+  config-Paxos **acceptor set is the current members** (a node proposing the next
+  epoch is still on this one), so reconfiguration keeps working after the founders
+  have left (`config_changes_outlive_the_founders` removes a founder majority and
+  still reconfigures). *Remaining:* garbage-collecting a moved range from its old
+  owners, and multi-shard read routing for the executor.
 - **M5 — Executor wiring.** ✅ `AccordExecutor` is a real `evento_core::Executor`:
   **writes** are coordinated through the Accord cluster (mapping the outcome to
   `Ok(())` / `WriteError::InvalidOriginalVersion`); **reads, subscriptions, and
   snapshots** delegate to a local evento backend (`Fjall`) that each replica keeps
   current by applying committed transactions via `ExecutorDataStore` (the bridge
   `DataStore` — `version` reads the aggregate's current version, `apply` appends).
-  The coordinator waits for its own local apply (read-your-writes). Scope:
-  single-shard cluster (a node's backend holds the whole log); routing reads to
-  owning shards is a later layer. `tests/executor.rs` (fjall-backed 3-node
-  cluster) proves cross-node replication, read-your-writes, and cluster-wide
-  optimistic concurrency through the standard evento API.
+  The coordinator waits for its own local apply (read-your-writes). On a
+  **multi-shard** cluster, a single-aggregate read for a key this node does not
+  own is **routed** to an owner (`ReadForward` / `ReadReply`, served from the
+  owner's backend); broad scans are served locally. `tests/executor.rs`
+  (fjall-backed, single shard) proves replication, read-your-writes, and
+  cluster-wide optimistic concurrency through the standard evento API;
+  `tests/shard_executor.rs` proves read routing on a 2-shard cluster.
 - **Transport — framed TCP.** ✅ `tcp.rs`: `TcpTransport` (`MessageSink`) + `serve`
   over real sockets, static `NodeId → SocketAddr` membership, bitcode wire
   encoding. `tests/tcp_cluster.rs` runs a 3-node cluster over localhost TCP
@@ -178,11 +225,15 @@ address list). Dynamic membership / gossip is deferred to M4.
 
 ## Status
 
-**M0–M3 + M5 complete + production TCP transport.** Multi-shard Accord: quorum
-progress (tolerates `f` failures per shard), ballot-fenced recovery, atomic
-cross-shard conditional appends via the Read→Apply split with **per-shard
-dependencies**, a real framed-TCP `MessageSink`, and `AccordExecutor` — a drop-in
-`evento_core::Executor` backed by the cluster. 21 tests pass (7 unit, 6 cluster,
-3 multi-shard, 3 executor, 2 TCP), clippy clean, stable across repeated runs.
-Remaining: **M4 — topology changes** (epochs, joining/leaving nodes, range
-movement) for elastic clusters, and multi-shard read routing for the executor.
+**M0–M3 + M5 complete, production TCP transport, M4 first increment.** Multi-shard
+Accord: quorum progress (tolerates `f` failures per shard), ballot-fenced
+recovery, atomic cross-shard conditional appends via the Read→Apply split with
+**per-shard dependencies**, a real framed-TCP `MessageSink`, `AccordExecutor`
+(drop-in `evento_core::Executor`), and an epoch-versioned `DynamicTopology` with
+node-join bootstrap with buffer-replay, node leave, Paxos-backed epoch changes
+that survive a coordinator crash (acceptor set tracks current membership), and
+range movement (re-sharding), and multi-shard executor read routing. **30 tests**
+(8 unit, 6 cluster, 3 multi-shard, 6 membership, 1 resharding, 3 executor,
+1 shard-executor, 2 TCP), clippy clean, stable across repeated runs. The full
+M0–M5 roadmap plus elastic membership (M4) is implemented; the only known
+follow-up is garbage-collecting a moved range from its old owners.
