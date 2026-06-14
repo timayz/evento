@@ -21,6 +21,11 @@ sqlx_migrator = { workspace = true, optional = true }
 anyhow.workspace = true
 bitcode.workspace = true
 
+# These are exercised solely from the crate-level `no_run` doctest, which
+# cargo-machete does not parse, so it reports them as unused.
+[package.metadata.cargo-machete]
+ignored = ["anyhow", "bitcode"]
+
 [features]
 default = ["macro"]
 macro = ["evento-core/macro"]
