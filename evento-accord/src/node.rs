@@ -39,6 +39,11 @@ const FAST_TIMEOUT: Duration = Duration::from_millis(50);
 /// Cap on waiting for a slow quorum at later phases (returns as soon as the
 /// quorum is reached; the cap only bounds a genuinely stuck phase).
 const COLLECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How often the automatic-recovery sweep runs.
+const RECOVERY_INTERVAL: Duration = Duration::from_millis(100);
+/// A transaction unapplied this long is presumed stalled and recovered. Well
+/// above normal write latency so healthy in-flight writes are never disturbed.
+const RECOVERY_TIMEOUT: Duration = Duration::from_millis(300);
 
 /// The result of a coordinated (or recovered) write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,6 +186,80 @@ impl Node {
         })
     }
 
+    /// Spawns the automatic-recovery sweep: periodically takes over any
+    /// transaction that has stalled (its coordinator presumed dead) and drives it
+    /// to completion, so a crashed coordinator can never block progress forever.
+    /// Opt-in — call alongside [`start`](Node::start) on a real deployment.
+    pub fn start_recovery(&self) -> JoinHandle<()> {
+        let node = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(RECOVERY_INTERVAL).await;
+                node.recovery_sweep().await;
+            }
+        })
+    }
+
+    /// Rebuilds this node's state from the journal after a process restart:
+    /// restores every command's consensus state (status, ballots, decision) and
+    /// replays committed, applied transactions into the data store. Call once on
+    /// startup before [`start`](Node::start). In-flight (unapplied) transactions
+    /// resume via the recovery sweep.
+    pub async fn recover_state(&self) -> anyhow::Result<()> {
+        let mut commands = self.journal.load_all().await?;
+        commands.sort_by_key(|cmd| (cmd.execute_at, cmd.txn));
+
+        {
+            let mut replica = self.replica.lock().expect("replica poisoned");
+            for cmd in &commands {
+                replica.restore(cmd.clone());
+            }
+        }
+        // Rebuild the data store in execution order from the durable record.
+        for cmd in &commands {
+            if cmd.status == Status::Applied && cmd.applied_conflict == Some(false) {
+                let _ = self
+                    .datastore
+                    .apply(cmd.txn, cmd.execute_at, cmd.events.clone(), true)
+                    .await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Recovers every currently-stalled transaction this node knows about, then
+    /// runs one anti-entropy round against a peer.
+    async fn recovery_sweep(&self) {
+        let now = self.clock.now().micros;
+        let cutoff = Timestamp {
+            micros: now.saturating_sub(RECOVERY_TIMEOUT.as_micros() as u64),
+            logical: 0,
+            node: NodeId(0),
+        };
+        let stuck = self.replica.lock().expect("replica poisoned").stuck(cutoff);
+        for txn in stuck {
+            // Idempotent and ballot-fenced: concurrent recoveries on other nodes
+            // serialize safely; a re-confirm of a healthy txn is harmless.
+            let _ = self.recover(txn).await;
+        }
+        self.anti_entropy().await;
+    }
+
+    /// Anti-entropy repair: pull any committed transactions a rotating peer has
+    /// that this node missed (e.g. while it was briefly down). Recovery alone
+    /// can't fix this — a transaction that completed on a quorum without this
+    /// node is "stuck" nowhere — so a healed node converges via this sweep.
+    async fn anti_entropy(&self) {
+        let nodes = self.topology.nodes();
+        let peers: Vec<NodeId> = nodes.into_iter().filter(|&n| n != self.id).collect();
+        if peers.is_empty() {
+            return;
+        }
+        let next = self.read_seq.fetch_add(1, Ordering::Relaxed) as usize;
+        let peer = peers[next % peers.len()];
+        let _ = self.import_from(peer, RECOVERY_INTERVAL).await;
+    }
+
     // ----- inbox handling -------------------------------------------------
 
     /// Processes one inbound message.
@@ -217,6 +296,7 @@ impl Node {
                     .lock()
                     .expect("replica poisoned")
                     .preaccept(txn, keys, events);
+                self.journal_record(txn).await;
                 self.send(
                     from,
                     Message::PreAcceptOk {
@@ -238,6 +318,7 @@ impl Node {
                     .lock()
                     .expect("replica poisoned")
                     .accept(txn, ballot, execute_at, deps);
+                self.journal_record(txn).await;
                 match reply {
                     Ok(deps) => self.send(from, Message::AcceptOk { txn, deps }).await,
                     Err(promised) => self.send(from, Message::Nack { txn, promised }).await,
@@ -948,15 +1029,31 @@ impl Node {
     /// Coordinating the epoch change across the cluster (rather than each node
     /// installing an agreed layout) remains future work.
     pub async fn join(&self, contact: NodeId) -> anyhow::Result<usize> {
+        let imported = self.import_from(contact, COLLECT_TIMEOUT).await?;
+
+        // Resume normal processing and replay anything buffered during bootstrap.
+        self.bootstrapped.store(true, Ordering::Release);
+        let buffered = std::mem::take(&mut *self.join_buffer.lock().expect("buffer poisoned"));
+        for env in buffered {
+            Box::pin(self.handle(env)).await;
+        }
+
+        Ok(imported)
+    }
+
+    /// Fetches `contact`'s committed state and imports every command for a key
+    /// this node owns that it does not already have, applying its events. Used by
+    /// both bootstrap ([`join`](Node::join)) and the anti-entropy repair sweep.
+    async fn import_from(&self, contact: NodeId, timeout: Duration) -> anyhow::Result<usize> {
         let (tx, mut rx) = mpsc::unbounded_channel();
         *self.sync_inbox.lock().expect("sync poisoned") = Some(tx);
         self.send(contact, Message::SyncRequest).await;
 
-        let commands = tokio::time::timeout(COLLECT_TIMEOUT, rx.recv())
-            .await
-            .map_err(|_| anyhow::anyhow!("bootstrap sync timed out"))?
-            .ok_or_else(|| anyhow::anyhow!("bootstrap sync channel closed"))?;
+        let received = tokio::time::timeout(timeout, rx.recv()).await;
         *self.sync_inbox.lock().expect("sync poisoned") = None;
+        let commands = received
+            .map_err(|_| anyhow::anyhow!("sync timed out"))?
+            .ok_or_else(|| anyhow::anyhow!("sync channel closed"))?;
 
         let mut imported = 0;
         for cmd in commands {
@@ -975,14 +1072,6 @@ impl Node {
                 imported += 1;
             }
         }
-
-        // Resume normal processing and replay anything buffered during bootstrap.
-        self.bootstrapped.store(true, Ordering::Release);
-        let buffered = std::mem::take(&mut *self.join_buffer.lock().expect("buffer poisoned"));
-        for env in buffered {
-            Box::pin(self.handle(env)).await;
-        }
-
         Ok(imported)
     }
 

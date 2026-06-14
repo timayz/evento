@@ -234,6 +234,47 @@ node-join bootstrap with buffer-replay, node leave, Paxos-backed epoch changes
 that survive a coordinator crash (acceptor set tracks current membership), and
 range movement (re-sharding), and multi-shard executor read routing. **30 tests**
 (8 unit, 6 cluster, 3 multi-shard, 6 membership, 1 resharding, 3 executor,
-1 shard-executor, 2 TCP), clippy clean, stable across repeated runs. The full
-M0–M5 roadmap plus elastic membership (M4) is implemented; the only known
-follow-up is garbage-collecting a moved range from its old owners.
+1 shard-executor, 2 TCP, 1 simulation), clippy clean, stable across repeated
+runs. The full M0–M5 roadmap plus elastic membership (M4) is implemented.
+
+## Production roadmap
+
+The above is a faithful, well-tested **reference implementation** — not yet
+production-grade (no crash durability, unbounded in-memory consensus state, no
+adversarial verification). Goal: production-ready, geo-distributed, on any evento
+storage backend (sql/fjall). Phases, in order:
+
+- **Phase A — Trust the protocol (verification).** 🚧 *In progress.*
+  `tests/simulation.rs` is a seeded fault-injection harness with correctness
+  **oracles** (agreement, no double-commit, no lost/phantom commits, no
+  split-brain). Two scenarios: minority-replica churn under a live quorum, and
+  full chaos (writers on random coordinators that crash mid-write while a minority
+  of any nodes churn). Across all seeds, **safety holds** — no split-brain, no
+  double-commit — and after healing the cluster **converges**. The harness already
+  paid off: it found two real gaps (non-convergence from stalled transactions and
+  from missed transactions), both now fixed (see Phase B). *Next:* partitions and
+  node-restart scenarios; then true deterministic simulation (virtual-time runtime
+  / `madsim`) for bit-reproducible failures.
+- **Phase B — Durability & recovery (delivers the pluggable-storage goal).**
+  ✅ **Automatic recovery** (`Node::start_recovery` runs a progress sweep that
+  takes over any transaction stalled past a timeout — its coordinator presumed
+  dead) and ✅ **anti-entropy repair** (the same sweep pulls committed transactions
+  a peer has that this node missed, so a healed node converges); together they get
+  the chaos scenario to full convergence. ✅ **Restart recovery:** the `Journal`
+  records every command transition (`load_all`), and `Node::recover_state` rebuilds
+  the `Replica` (status, ballots, decision) and replays committed transactions into
+  the data store on startup; in-flight transactions resume via the sweep.
+  `tests/restart.rs` proves a node rebuilds from its journal and rejoins — both
+  cleanly and *while writes are in flight*. *Remaining:* a genuinely disk-backed
+  `Journal` over sql/fjall (today the journal is a kept in-memory handle, and it
+  records synchronously per transition — production needs batched async fsync),
+  and snapshots + compaction + log truncation (bounds the journal and the
+  in-memory `Replica.commands`, both currently unbounded).
+- **Phase C — Geo hardening.** Bounded-clock-skew handling, tunable per-link
+  timeouts, region-aware quorum/fast-path placement, TLS + mutual auth, a real
+  failure detector, backpressure.
+- **Phase D — Sign-off.** Jepsen, external review, observability, performance
+  (batching/pipelining), the deferred correctness edge cases.
+
+The event-data path is already backend-agnostic (`AccordExecutor` runs on any
+`evento_core::Executor`); Phase B extends that to the consensus state.

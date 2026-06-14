@@ -32,6 +32,9 @@ pub struct AppliedEntry {
 struct StoreState {
     /// Highest version appended per `(aggregator_type, aggregator_id)`.
     versions: HashMap<(String, String), u16>,
+    /// The event id that committed each `(type, id, version)` — for the
+    /// simulation's split-brain oracle (no two distinct events at one version).
+    committed: HashMap<(String, String, u16), ulid::Ulid>,
     /// Applied transactions, in the order this replica executed them.
     log: Vec<AppliedEntry>,
 }
@@ -52,6 +55,17 @@ impl InMemoryDataStore {
     /// tests to compare the global serial order across replicas.
     pub fn applied_log(&self) -> Vec<AppliedEntry> {
         self.state.lock().expect("store poisoned").log.clone()
+    }
+
+    /// Every `(type, id, version)` committed here and the event that did it.
+    pub fn committed_events(&self) -> Vec<((String, String, u16), ulid::Ulid)> {
+        self.state
+            .lock()
+            .expect("store poisoned")
+            .committed
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect()
     }
 }
 
@@ -82,7 +96,10 @@ impl DataStore for InMemoryDataStore {
         if commit {
             for event in &events {
                 let key = (event.aggregator_type.clone(), event.aggregator_id.clone());
-                state.versions.insert(key, event.version);
+                state.versions.insert(key.clone(), event.version);
+                state
+                    .committed
+                    .insert((key.0, key.1, event.version), event.id);
             }
         }
 
@@ -128,5 +145,15 @@ impl Journal for InMemoryJournal {
             .expect("journal poisoned")
             .get(&txn)
             .cloned())
+    }
+
+    async fn load_all(&self) -> anyhow::Result<Vec<CommandState>> {
+        Ok(self
+            .entries
+            .lock()
+            .expect("journal poisoned")
+            .values()
+            .cloned()
+            .collect())
     }
 }

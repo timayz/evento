@@ -91,6 +91,12 @@ pub trait Journal: Send + Sync + 'static {
 
     /// Loads the persisted state for `txn`, if any.
     async fn load(&self, txn: TxnId) -> anyhow::Result<Option<CommandState>>;
+
+    /// All persisted command states, for rebuilding replica state after a
+    /// process restart. The default returns nothing (a non-durable journal).
+    async fn load_all(&self) -> anyhow::Result<Vec<CommandState>> {
+        Ok(Vec::new())
+    }
 }
 
 /// Applied state — the materialised event store on a replica. Backed by an

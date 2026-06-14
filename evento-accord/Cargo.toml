@@ -27,3 +27,4 @@ bytes = "1"
 tokio = { workspace = true }
 evento-fjall = { path = "../evento-fjall" }
 tempfile = "3.27"
+rand = { workspace = true }

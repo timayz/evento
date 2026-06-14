@@ -431,6 +431,24 @@ impl Replica {
         self.commands.get(&txn).cloned()
     }
 
+    /// Restores a command from the journal on restart, preserving its actual
+    /// status, ballots, and decision (unlike [`import_applied`], which is for
+    /// bootstrap and forces `Applied`).
+    pub fn restore(&mut self, cmd: CommandState) {
+        self.insert(cmd);
+    }
+
+    /// Transactions this replica knows but has not applied, whose `t0` is older
+    /// than `cutoff` — i.e. stalled long enough to warrant recovery (the
+    /// coordinator is presumed dead). Drives automatic progress.
+    pub fn stuck(&self, cutoff: Timestamp) -> Vec<TxnId> {
+        self.commands
+            .values()
+            .filter(|cmd| cmd.status != Status::Applied && cmd.txn.0 < cutoff)
+            .map(|cmd| cmd.txn)
+            .collect()
+    }
+
     /// Every applied command, in execution-timestamp order — the committed state
     /// a joining node bootstraps from.
     pub fn export_applied(&self) -> Vec<CommandState> {
