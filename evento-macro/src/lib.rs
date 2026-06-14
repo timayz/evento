@@ -8,7 +8,7 @@
 //!
 //! | Macro | Type | Purpose |
 //! |-------|------|---------|
-//! | [`aggregator`] | Attribute | Transform enum into event structs with trait impls |
+//! | [`aggregate`] | Attribute | Transform enum into event structs with trait impls |
 //! | [`handler`] | Attribute | Create projection handler from async function |
 //! | [`subscription`] | Attribute | Create subscription handler for specific events |
 //! | [`subscription_all`] | Attribute | Create subscription handler for all events of an aggregate |
@@ -28,12 +28,12 @@
 //!
 //! # Examples
 //!
-//! ## Defining Events with `#[evento::aggregator]`
+//! ## Defining Events with `#[evento::aggregate]`
 //!
 //! Transform an enum into individual event structs:
 //!
 //! ```rust,ignore
-//! #[evento::aggregator]
+//! #[evento::aggregate]
 //! pub enum BankAccount {
 //!     /// Event raised when a new bank account is opened
 //!     AccountOpened {
@@ -56,7 +56,7 @@
 //!
 //! This generates:
 //! - `AccountOpened`, `MoneyDeposited`, `MoneyWithdrawn` structs
-//! - `Aggregator` and `Event` trait implementations for each
+//! - `Aggregate` and `Event` trait implementations for each
 //! - Automatic derives: `Debug`, `Clone`, `PartialEq`, `Default`, and bitcode serialization
 //!
 //! ## Creating Projection Handlers with `#[evento::handler]`
@@ -118,7 +118,7 @@
 //!     context: &Context<'_, E>,
 //!     event: RawEvent<BankAccount>,
 //! ) -> anyhow::Result<()> {
-//!     println!("Event {} on account {}", event.name, event.aggregator_id);
+//!     println!("Event {} on account {}", event.name, event.aggregate_id);
 //!     Ok(())
 //! }
 //! ```
@@ -145,7 +145,7 @@
 //!
 //! When using these macros, your types must meet certain requirements:
 //!
-//! - **Events** (from `#[aggregator]`): Automatically derive required traits
+//! - **Events** (from `#[aggregate]`): Automatically derive required traits
 //! - **Projections**: Must implement `Default`, `Send`, `Sync`, `Clone`
 //! - **Projection handlers**: Must be `async` and return `anyhow::Result<()>`
 //! - **Subscription handlers**: Must be `async`, take `Context` first, and return `anyhow::Result<()>`
@@ -153,7 +153,7 @@
 //! # Serialization
 //!
 //! Events are serialized using [bitcode](https://crates.io/crates/bitcode) for compact
-//! binary representation. The `#[aggregator]` macro automatically adds the required
+//! binary representation. The `#[aggregate]` macro automatically adds the required
 //! bitcode derives.
 
 mod aggregator;
@@ -170,19 +170,19 @@ use syn::{parse_macro_input, DeriveInput, ItemFn};
 ///
 /// This macro takes an enum where each variant represents an event type and generates:
 /// - Individual public structs for each variant
-/// - `Aggregator` trait implementation (provides `aggregator_type()`)
-/// - `AggregatorEvent` trait implementation (provides `event_name()`)
-/// - A unit struct with the enum name implementing `Aggregator`
+/// - `Aggregate` trait implementation (provides `aggregate_type()`)
+/// - `AggregateEvent` trait implementation (provides `event_name()`)
+/// - A unit struct with the enum name implementing `Aggregate`
 /// - Automatic derives: `Debug`, `Clone`, `PartialEq`, `Default`, and bitcode serialization
 ///
-/// # Aggregator Type Format
+/// # Aggregate Type Format
 ///
-/// The aggregator type is formatted as `"{package_name}/{enum_name}"`, e.g., `"bank/BankAccount"`.
+/// The aggregate type is formatted as `"{package_name}/{enum_name}"`, e.g., `"bank/BankAccount"`.
 ///
 /// # Example
 ///
 /// ```rust,ignore
-/// #[evento::aggregator]
+/// #[evento::aggregate]
 /// pub enum BankAccount {
 ///     /// Event raised when account is opened
 ///     AccountOpened {
@@ -210,7 +210,7 @@ use syn::{parse_macro_input, DeriveInput, ItemFn};
 /// Pass additional derives as arguments:
 ///
 /// ```rust,ignore
-/// #[evento::aggregator(serde::Serialize, serde::Deserialize)]
+/// #[evento::aggregate(serde::Serialize, serde::Deserialize)]
 /// pub enum MyEvents {
 ///     // variants...
 /// }
@@ -223,7 +223,7 @@ use syn::{parse_macro_input, DeriveInput, ItemFn};
 /// - Tuple fields: `Variant(Type1, Type2)`
 /// - Unit variants: `Variant`
 #[proc_macro_attribute]
-pub fn aggregator(attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn aggregate(attr: TokenStream, item: TokenStream) -> TokenStream {
     aggregator::aggregator(attr, item)
 }
 
@@ -290,9 +290,9 @@ pub fn handler(_attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// ```rust,ignore
 /// #[evento::debug_handler]
-/// async fn handle_event<E: Executor>(
+/// async fn handle_event(
 ///     event: Event<MyEvent>,
-///     action: Action<'_, MyView, E>,
+///     projection: &mut MyView,
 /// ) -> anyhow::Result<()> {
 ///     // ...
 /// }
@@ -374,7 +374,7 @@ pub fn subscription(_attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// This macro is similar to [`subscription`] but handles all events from an aggregate
 /// without requiring the event data to be deserialized. The event is wrapped in
-/// [`RawEvent`](evento_core::metadata::RawEvent) which provides access to event metadata
+/// `RawEvent` which provides access to event metadata
 /// (name, id, timestamp, etc.) without deserializing the payload.
 ///
 /// # Function Signature
@@ -406,7 +406,7 @@ pub fn subscription(_attr: TokenStream, item: TokenStream) -> TokenStream {
 ///     event: RawEvent<BankAccount>,
 /// ) -> anyhow::Result<()> {
 ///     // Access event metadata without deserializing
-///     println!("Event: {} on {}", event.name, event.aggregator_id);
+///     println!("Event: {} on {}", event.name, event.aggregate_id);
 ///     println!("Version: {}", event.version);
 ///     println!("Timestamp: {}", event.timestamp);
 ///

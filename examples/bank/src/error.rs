@@ -2,6 +2,7 @@ use std::fmt;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum BankAccountError {
+    AccountNotFound,
     AccountNotActive,
     AccountFrozen,
     AccountClosed,
@@ -20,6 +21,7 @@ pub enum BankAccountError {
 impl fmt::Display for BankAccountError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::AccountNotFound => write!(f, "Account not found"),
             Self::AccountNotActive => write!(f, "Account is not active"),
             Self::AccountFrozen => write!(f, "Account is frozen"),
             Self::AccountClosed => write!(f, "Account is closed"),
@@ -49,6 +51,12 @@ impl std::error::Error for BankAccountError {}
 
 impl From<evento::WriteError> for BankAccountError {
     fn from(value: evento::WriteError) -> Self {
+        Self::Server(value.to_string())
+    }
+}
+
+impl From<anyhow::Error> for BankAccountError {
+    fn from(value: anyhow::Error) -> Self {
         Self::Server(value.to_string())
     }
 }

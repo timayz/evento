@@ -349,10 +349,14 @@ where
             T::retain(&mut data, cursor, is_order_desc);
         }
 
-        let data_len = data.len();
+        // Fetch one extra to detect a further page. If we actually got more than
+        // `limit`, there is another page — drop the probe row. Comparing against
+        // `limit` (not the pre-take length) is required so that exactly `limit + 1`
+        // matching rows still report `has_more` and return only `limit` edges,
+        // matching the SQL backend's pagination.
         data = data.into_iter().take((limit + 1).into()).collect();
 
-        let has_more = data_len > data.len();
+        let has_more = data.len() > limit as usize;
         if has_more {
             data.pop();
         }

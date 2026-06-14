@@ -101,3 +101,45 @@ async fn fjall_all_commands() -> anyhow::Result<()> {
     let (executor, _temp_dir) = create_fjall_executor("all_commands")?;
     evento_test::all_commands(&executor).await
 }
+
+#[tokio::test]
+async fn fjall_read_order_timestamp() -> anyhow::Result<()> {
+    let (executor, _temp_dir) = create_fjall_executor("read_order_timestamp")?;
+    evento_test::read_order_timestamp(&executor).await
+}
+
+#[tokio::test]
+async fn fjall_exact_filter() -> anyhow::Result<()> {
+    let (executor, _temp_dir) = create_fjall_executor("exact_filter")?;
+    evento_test::exact_filter(&executor).await
+}
+
+#[tokio::test]
+async fn fjall_concurrent_append() -> anyhow::Result<()> {
+    let (executor, _temp_dir) = create_fjall_executor("concurrent_append")?;
+    evento_test::concurrent_append(&executor).await
+}
+
+#[tokio::test]
+async fn fjall_strict_unhandled() -> anyhow::Result<()> {
+    let (executor, _temp_dir) = create_fjall_executor("strict_unhandled")?;
+    evento_test::strict_unhandled(&executor).await
+}
+
+#[tokio::test]
+async fn fjall_tombstone() -> anyhow::Result<()> {
+    let (executor, _temp_dir) = create_fjall_executor("tombstone")?;
+    evento_test::tombstone(&executor).await
+}
+
+#[tokio::test]
+async fn fjall_subscription_all_counts() -> anyhow::Result<()> {
+    let (executor, _temp_dir) = create_fjall_executor("subscription_all_counts")?;
+    evento_test::subscription_all_counts(&executor).await
+}
+
+#[tokio::test]
+async fn fjall_snapshot_revision_scope() -> anyhow::Result<()> {
+    let (executor, _temp_dir) = create_fjall_executor("snapshot_revision_scope")?;
+    evento_test::snapshot_revision_scope(&executor).await
+}

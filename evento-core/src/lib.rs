@@ -19,8 +19,8 @@
 //! The [`Event`] struct stores serialized event data with metadata:
 //!
 //! ```rust,ignore
-//! // Define events using the aggregator macro
-//! #[evento::aggregator]
+//! // Define events using the aggregate macro
+//! #[evento::aggregate]
 //! pub enum BankAccount {
 //!     AccountOpened { owner_id: String, initial_balance: i64 },
 //!     MoneyDeposited { amount: i64 },
@@ -32,9 +32,9 @@
 //! The [`Executor`] trait abstracts event storage and retrieval. Implementations
 //! handle persisting events, querying, and managing subscriptions.
 //!
-//! ## Aggregator Builder
+//! ## Aggregate Builder
 //!
-//! Use [`create()`] or [`aggregator()`] to build and commit events:
+//! Use [`create()`] or [`append()`] to build and commit events:
 //!
 //! ```rust,ignore
 //! use evento::metadata::Metadata;
@@ -48,7 +48,7 @@
 //!
 //! ## Projections
 //!
-//! Build read models by replaying events. Use the [`projection`] module for loading
+//! Build read models by replaying events. Use the [`projection`](mod@projection) module for loading
 //! aggregate state:
 //!
 //! ```rust,ignore
@@ -78,7 +78,7 @@
 //!
 //! ## Subscriptions
 //!
-//! Process events continuously in real-time. See the [`subscription`] module:
+//! Process events continuously in real-time. See the [`subscription`](mod@subscription) module:
 //!
 //! ```rust,ignore
 //! use evento::subscription::SubscriptionBuilder;
@@ -108,13 +108,13 @@
 //! - [`context`] - Type-safe request context for storing arbitrary data
 //! - [`cursor`] - Cursor-based pagination types and traits
 //! - [`metadata`] - Standard event metadata types
-//! - [`projection`] - Projections for loading aggregate state
-//! - [`subscription`] - Continuous event processing with subscriptions
+//! - [`projection`](mod@projection) - Projections for loading aggregate state
+//! - [`subscription`](mod@subscription) - Continuous event processing with subscriptions
 //!
 //! # Example
 //!
 //! ```rust,ignore
-//! use evento::{Executor, metadata::Metadata, cursor::Args, ReadAggregator};
+//! use evento::{Executor, metadata::Metadata, cursor::Args, EventFilter};
 //!
 //! // Create and persist an event
 //! let id = evento::create()
@@ -125,7 +125,7 @@
 //!
 //! // Query events with pagination
 //! let events = executor.read(
-//!     Some(vec![ReadAggregator::id("myapp/Account", &id)]),
+//!     Some(vec![EventFilter::by_id("myapp/Account", &id)]),
 //!     None,
 //!     Args::forward(10, None),
 //! ).await?;
@@ -176,8 +176,8 @@ pub struct EventCursor {
 /// # Fields
 ///
 /// - `id` - Unique event identifier (ULID format for time-ordering)
-/// - `aggregator_id` - The aggregate instance this event belongs to
-/// - `aggregator_type` - Type name like `"myapp/BankAccount"`
+/// - `aggregate_id` - The aggregate instance this event belongs to
+/// - `aggregate_type` - Type name like `"myapp/BankAccount"`
 /// - `version` - Sequence number within the aggregate (for optimistic concurrency)
 /// - `name` - Event type name like `"AccountOpened"`
 /// - `routing_key` - Optional key for event distribution/partitioning
@@ -195,9 +195,9 @@ pub struct Event {
     /// Unique event identifier (ULID)
     pub id: Ulid,
     /// ID of the aggregate this event belongs to
-    pub aggregator_id: String,
+    pub aggregate_id: String,
     /// Type name of the aggregate (e.g., "myapp/User")
-    pub aggregator_type: String,
+    pub aggregate_type: String,
     /// Version number of the aggregate after this event
     pub version: u16,
     /// Event type name
@@ -233,12 +233,12 @@ impl cursor::Bind for Event {
     fn sort_by(data: &mut Vec<Self::T>, is_order_desc: bool) {
         if !is_order_desc {
             data.sort_by(|a, b| {
-                if a.timestamp_subsec != b.timestamp_subsec {
-                    return a.timestamp_subsec.cmp(&b.timestamp_subsec);
-                }
-
                 if a.timestamp != b.timestamp {
                     return a.timestamp.cmp(&b.timestamp);
+                }
+
+                if a.timestamp_subsec != b.timestamp_subsec {
+                    return a.timestamp_subsec.cmp(&b.timestamp_subsec);
                 }
 
                 if a.version != b.version {
@@ -249,12 +249,12 @@ impl cursor::Bind for Event {
             });
         } else {
             data.sort_by(|a, b| {
-                if a.timestamp_subsec != b.timestamp_subsec {
-                    return b.timestamp_subsec.cmp(&a.timestamp_subsec);
-                }
-
                 if a.timestamp != b.timestamp {
                     return b.timestamp.cmp(&a.timestamp);
+                }
+
+                if a.timestamp_subsec != b.timestamp_subsec {
+                    return b.timestamp_subsec.cmp(&a.timestamp_subsec);
                 }
 
                 if a.version != b.version {
@@ -290,5 +290,64 @@ impl cursor::Bind for Event {
                                         && event.id.to_string() > cursor.i)))))
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cursor::Bind;
+
+    fn event_at(timestamp: u64, timestamp_subsec: u32) -> Event {
+        Event {
+            id: Ulid::new(),
+            timestamp,
+            timestamp_subsec,
+            ..Default::default()
+        }
+    }
+
+    /// Events must be ordered by whole seconds first, then sub-seconds — matching
+    /// the SQL `ORDER BY timestamp, timestamp_subsec, version, id`. A regression for
+    /// the bug where `timestamp_subsec` was (incorrectly) the major sort key, which
+    /// reordered events whose larger second carried a smaller sub-second.
+    #[test]
+    fn sort_orders_by_timestamp_before_subsec() {
+        // (t=1000, s=500) must come before (t=1001, s=100) ascending.
+        let earlier = event_at(1000, 500);
+        let later = event_at(1001, 100);
+
+        let mut asc = vec![later.clone(), earlier.clone()];
+        Event::sort_by(&mut asc, false);
+        assert_eq!(
+            (asc[0].timestamp, asc[1].timestamp),
+            (1000, 1001),
+            "ascending order must place the smaller whole-second first"
+        );
+
+        let mut desc = vec![earlier, later];
+        Event::sort_by(&mut desc, true);
+        assert_eq!(
+            (desc[0].timestamp, desc[1].timestamp),
+            (1001, 1000),
+            "descending order must place the larger whole-second first"
+        );
+    }
+
+    /// `retain` (cursor keyset filter) must agree with `sort_by`: forward pagination
+    /// from a cursor at (t=1000, s=500) keeps the strictly-later (t=1001, s=100).
+    #[test]
+    fn retain_agrees_with_sort_order() {
+        let cursor = EventCursor {
+            i: Ulid::nil().to_string(),
+            v: 0,
+            t: 1000,
+            s: 500,
+        };
+
+        let mut forward = vec![event_at(1001, 100), event_at(1000, 400)];
+        Event::retain(&mut forward, cursor, false);
+        assert_eq!(forward.len(), 1);
+        assert_eq!(forward[0].timestamp, 1001);
     }
 }

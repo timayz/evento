@@ -10,7 +10,7 @@
 //! - [`Evento`] - Type-erased wrapper around any executor
 //! - [`EventoGroup`] - Multi-executor aggregation (feature: `group`)
 //! - [`Rw`] - Read-write split executor (feature: `rw`)
-//! - [`ReadAggregator`] - Query filter for reading events
+//! - [`EventFilter`] - Query filter for reading events
 
 use std::{hash::Hash, sync::Arc};
 use ulid::Ulid;
@@ -20,86 +20,86 @@ use crate::{
     Event, RoutingKey, WriteError,
 };
 
-/// Filter for querying events by aggregator.
+/// Filter for querying events by aggregate.
 ///
 /// Use the constructor methods to create filters:
 ///
 /// # Example
 ///
 /// ```rust,ignore
-/// // All events for an aggregator type
-/// let filter = ReadAggregator::aggregator("myapp/User");
+/// // All events for an aggregate type
+/// let filter = EventFilter::by_type("myapp/User");
 ///
 /// // Events for a specific aggregate instance
-/// let filter = ReadAggregator::id("myapp/User", "user-123");
+/// let filter = EventFilter::by_id("myapp/User", "user-123");
 ///
 /// // Events of a specific type
-/// let filter = ReadAggregator::event("myapp/User", "UserCreated");
+/// let filter = EventFilter::by_event("myapp/User", "UserCreated");
 /// ```
 #[derive(Clone, PartialEq, Eq)]
-pub struct ReadAggregator {
-    /// Aggregator type (e.g., "myapp/User")
-    pub aggregator_type: String,
+pub struct EventFilter {
+    /// Aggregate type (e.g., "myapp/User")
+    pub aggregate_type: String,
     /// Optional specific aggregate ID
-    pub aggregator_id: Option<String>,
+    pub aggregate_id: Option<String>,
     /// Optional event name filter
     pub name: Option<String>,
 }
 
-impl ReadAggregator {
+impl EventFilter {
     /// Creates a filter with all fields specified.
     ///
-    /// Filters events by aggregator type, specific aggregate ID, and event name.
-    pub fn new(
-        aggregator_type: impl Into<String>,
+    /// Filters events by aggregate type, specific aggregate ID, and event name.
+    pub fn exact(
+        aggregate_type: impl Into<String>,
         id: impl Into<String>,
         name: impl Into<String>,
     ) -> Self {
         Self {
-            aggregator_type: aggregator_type.into(),
-            aggregator_id: Some(id.into()),
+            aggregate_type: aggregate_type.into(),
+            aggregate_id: Some(id.into()),
             name: Some(name.into()),
         }
     }
 
-    /// Creates a filter for all events of an aggregator type.
+    /// Creates a filter for all events of an aggregate type.
     ///
     /// Returns all events regardless of aggregate ID or event name.
-    pub fn aggregator(value: impl Into<String>) -> Self {
+    pub fn by_type(value: impl Into<String>) -> Self {
         Self {
-            aggregator_type: value.into(),
-            aggregator_id: None,
+            aggregate_type: value.into(),
+            aggregate_id: None,
             name: None,
         }
     }
 
     /// Creates a filter for a specific aggregate instance.
     ///
-    /// Returns all events for the given aggregator type and ID.
-    pub fn id(aggregator_type: impl Into<String>, id: impl Into<String>) -> Self {
+    /// Returns all events for the given aggregate type and ID.
+    pub fn by_id(aggregate_type: impl Into<String>, id: impl Into<String>) -> Self {
         Self {
-            aggregator_type: aggregator_type.into(),
-            aggregator_id: Some(id.into()),
+            aggregate_type: aggregate_type.into(),
+            aggregate_id: Some(id.into()),
             name: None,
         }
     }
 
     /// Creates a filter for a specific event type.
     ///
-    /// Returns all events of the given name for an aggregator type.
-    pub fn event(aggregator_type: impl Into<String>, name: impl Into<String>) -> Self {
+    /// Returns all events of the given name for an aggregate type.
+    pub fn by_event(aggregate_type: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
-            aggregator_type: aggregator_type.into(),
-            aggregator_id: None,
+            aggregate_type: aggregate_type.into(),
+            aggregate_id: None,
             name: Some(name.into()),
         }
     }
 }
 
-impl Hash for ReadAggregator {
+impl Hash for EventFilter {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.aggregator_type.hash(state);
-        self.aggregator_id.hash(state);
+        self.aggregate_type.hash(state);
+        self.aggregate_id.hash(state);
         self.name.hash(state);
     }
 }
@@ -151,7 +151,7 @@ pub trait Executor: Send + Sync + 'static {
     /// Queries events with filtering and pagination.
     async fn read(
         &self,
-        aggregators: Option<Vec<ReadAggregator>>,
+        aggregators: Option<Vec<EventFilter>>,
         routing_key: Option<RoutingKey>,
         args: Args,
     ) -> anyhow::Result<ReadResult<Event>>;
@@ -162,7 +162,7 @@ pub trait Executor: Send + Sync + 'static {
     /// to compute lag without fetching the full event row (data/metadata blobs).
     async fn latest_timestamp(
         &self,
-        aggregators: Option<Vec<ReadAggregator>>,
+        aggregators: Option<Vec<EventFilter>>,
         routing_key: Option<RoutingKey>,
     ) -> anyhow::Result<u64>;
 
@@ -172,8 +172,8 @@ pub trait Executor: Send + Sync + 'static {
     /// if no snapshot exists for the given aggregate.
     async fn get_snapshot(
         &self,
-        aggregator_type: String,
-        aggregator_revision: String,
+        aggregate_type: String,
+        aggregate_revision: String,
         id: String,
     ) -> anyhow::Result<Option<(Vec<u8>, Value)>>;
 
@@ -183,8 +183,8 @@ pub trait Executor: Send + Sync + 'static {
     /// The `cursor` indicates the event position up to which the snapshot is valid.
     async fn save_snapshot(
         &self,
-        aggregator_type: String,
-        aggregator_revision: String,
+        aggregate_type: String,
+        aggregate_revision: String,
         id: String,
         data: Vec<u8>,
         cursor: Value,
@@ -195,7 +195,7 @@ pub trait Executor: Send + Sync + 'static {
     /// Idempotent: deleting a snapshot that does not exist is not an error.
     /// Revision is intentionally omitted — `save_snapshot` upserts on
     /// `(type, id)` so there is only ever one row per aggregate.
-    async fn delete_snapshot(&self, aggregator_type: String, id: String) -> anyhow::Result<()>;
+    async fn delete_snapshot(&self, aggregate_type: String, id: String) -> anyhow::Result<()>;
 }
 
 /// Type-erased wrapper around any [`Executor`] implementation.
@@ -245,7 +245,7 @@ impl Executor for Evento {
 
     async fn read(
         &self,
-        aggregators: Option<Vec<ReadAggregator>>,
+        aggregators: Option<Vec<EventFilter>>,
         routing_key: Option<RoutingKey>,
         args: Args,
     ) -> anyhow::Result<ReadResult<Event>> {
@@ -254,7 +254,7 @@ impl Executor for Evento {
 
     async fn latest_timestamp(
         &self,
-        aggregators: Option<Vec<ReadAggregator>>,
+        aggregators: Option<Vec<EventFilter>>,
         routing_key: Option<RoutingKey>,
     ) -> anyhow::Result<u64> {
         self.inner.latest_timestamp(aggregators, routing_key).await
@@ -278,30 +278,30 @@ impl Executor for Evento {
 
     async fn get_snapshot(
         &self,
-        aggregator_type: String,
-        aggregator_revision: String,
+        aggregate_type: String,
+        aggregate_revision: String,
         id: String,
     ) -> anyhow::Result<Option<(Vec<u8>, Value)>> {
         self.inner
-            .get_snapshot(aggregator_type, aggregator_revision, id)
+            .get_snapshot(aggregate_type, aggregate_revision, id)
             .await
     }
 
     async fn save_snapshot(
         &self,
-        aggregator_type: String,
-        aggregator_revision: String,
+        aggregate_type: String,
+        aggregate_revision: String,
         id: String,
         data: Vec<u8>,
         cursor: Value,
     ) -> anyhow::Result<()> {
         self.inner
-            .save_snapshot(aggregator_type, aggregator_revision, id, data, cursor)
+            .save_snapshot(aggregate_type, aggregate_revision, id, data, cursor)
             .await
     }
 
-    async fn delete_snapshot(&self, aggregator_type: String, id: String) -> anyhow::Result<()> {
-        self.inner.delete_snapshot(aggregator_type, id).await
+    async fn delete_snapshot(&self, aggregate_type: String, id: String) -> anyhow::Result<()> {
+        self.inner.delete_snapshot(aggregate_type, id).await
     }
 }
 
@@ -317,7 +317,7 @@ impl Evento {
     /// Sets a default routing key applied to writes and inherited by
     /// subscriptions built from this executor.
     ///
-    /// Per-event/per-aggregator routing keys still take precedence on writes.
+    /// Per-event/per-aggregate routing keys still take precedence on writes.
     /// Subscriptions inherit this key only when the user has not called
     /// `.routing_key()` or `.all()`.
     pub fn default_routing_key(mut self, key: impl Into<String>) -> Self {
@@ -374,7 +374,7 @@ impl Executor for EventoGroup {
 
     async fn read(
         &self,
-        aggregators: Option<Vec<ReadAggregator>>,
+        aggregators: Option<Vec<EventFilter>>,
         routing_key: Option<RoutingKey>,
         args: Args,
     ) -> anyhow::Result<ReadResult<Event>> {
@@ -397,7 +397,7 @@ impl Executor for EventoGroup {
 
     async fn latest_timestamp(
         &self,
-        aggregators: Option<Vec<ReadAggregator>>,
+        aggregators: Option<Vec<EventFilter>>,
         routing_key: Option<RoutingKey>,
     ) -> anyhow::Result<u64> {
         let futures = self
@@ -435,30 +435,30 @@ impl Executor for EventoGroup {
 
     async fn get_snapshot(
         &self,
-        aggregator_type: String,
-        aggregator_revision: String,
+        aggregate_type: String,
+        aggregate_revision: String,
         id: String,
     ) -> anyhow::Result<Option<(Vec<u8>, Value)>> {
         self.first()
-            .get_snapshot(aggregator_type, aggregator_revision, id)
+            .get_snapshot(aggregate_type, aggregate_revision, id)
             .await
     }
 
     async fn save_snapshot(
         &self,
-        aggregator_type: String,
-        aggregator_revision: String,
+        aggregate_type: String,
+        aggregate_revision: String,
         id: String,
         data: Vec<u8>,
         cursor: Value,
     ) -> anyhow::Result<()> {
         self.first()
-            .save_snapshot(aggregator_type, aggregator_revision, id, data, cursor)
+            .save_snapshot(aggregate_type, aggregate_revision, id, data, cursor)
             .await
     }
 
-    async fn delete_snapshot(&self, aggregator_type: String, id: String) -> anyhow::Result<()> {
-        self.first().delete_snapshot(aggregator_type, id).await
+    async fn delete_snapshot(&self, aggregate_type: String, id: String) -> anyhow::Result<()> {
+        self.first().delete_snapshot(aggregate_type, id).await
     }
 }
 
@@ -501,7 +501,7 @@ impl<R: Executor, W: Executor> Executor for Rw<R, W> {
 
     async fn read(
         &self,
-        aggregators: Option<Vec<ReadAggregator>>,
+        aggregators: Option<Vec<EventFilter>>,
         routing_key: Option<RoutingKey>,
         args: Args,
     ) -> anyhow::Result<ReadResult<Event>> {
@@ -510,7 +510,7 @@ impl<R: Executor, W: Executor> Executor for Rw<R, W> {
 
     async fn latest_timestamp(
         &self,
-        aggregators: Option<Vec<ReadAggregator>>,
+        aggregators: Option<Vec<EventFilter>>,
         routing_key: Option<RoutingKey>,
     ) -> anyhow::Result<u64> {
         self.r.latest_timestamp(aggregators, routing_key).await
@@ -534,30 +534,30 @@ impl<R: Executor, W: Executor> Executor for Rw<R, W> {
 
     async fn get_snapshot(
         &self,
-        aggregator_type: String,
-        aggregator_revision: String,
+        aggregate_type: String,
+        aggregate_revision: String,
         id: String,
     ) -> anyhow::Result<Option<(Vec<u8>, Value)>> {
         self.r
-            .get_snapshot(aggregator_type, aggregator_revision, id)
+            .get_snapshot(aggregate_type, aggregate_revision, id)
             .await
     }
 
     async fn save_snapshot(
         &self,
-        aggregator_type: String,
-        aggregator_revision: String,
+        aggregate_type: String,
+        aggregate_revision: String,
         id: String,
         data: Vec<u8>,
         cursor: Value,
     ) -> anyhow::Result<()> {
         self.w
-            .save_snapshot(aggregator_type, aggregator_revision, id, data, cursor)
+            .save_snapshot(aggregate_type, aggregate_revision, id, data, cursor)
             .await
     }
 
-    async fn delete_snapshot(&self, aggregator_type: String, id: String) -> anyhow::Result<()> {
-        self.w.delete_snapshot(aggregator_type, id).await
+    async fn delete_snapshot(&self, aggregate_type: String, id: String) -> anyhow::Result<()> {
+        self.w.delete_snapshot(aggregate_type, id).await
     }
 }
 

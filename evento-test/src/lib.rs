@@ -8,7 +8,7 @@ use bank::{
 };
 use evento::cursor::{self, Order, ReadResult};
 use evento::Event;
-use evento::{cursor::Args, Aggregator, Executor, ProjectionAggregator, ReadAggregator};
+use evento::{cursor::Args, Aggregate, AggregateExt, EventFilter, Executor, ProjectionAggregate};
 use rand::seq::IndexedRandom;
 use rand::RngExt;
 use ulid::Ulid;
@@ -19,7 +19,7 @@ async fn last_routing_key<E: Executor>(
 ) -> anyhow::Result<Option<String>> {
     let events = executor
         .read(
-            Some(vec![ReadAggregator::id(BankAccount::aggregator_type(), id)]),
+            Some(vec![EventFilter::by_id(BankAccount::aggregate_type(), id)]),
             None,
             Args::backward(1, None),
         )
@@ -59,7 +59,7 @@ pub async fn load<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
         .expect("john account should exist");
 
     assert_eq!(john.balance, 1000);
-    assert_eq!(john.aggregator_version()?, 1);
+    assert_eq!(john.aggregate_version()?, 1);
     assert!(john.is_active());
 
     // Load Jane's account and verify initial state
@@ -69,7 +69,7 @@ pub async fn load<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
         .expect("jane account should exist");
 
     assert_eq!(jane.balance, 500);
-    assert_eq!(jane.aggregator_version()?, 1);
+    assert_eq!(jane.aggregate_version()?, 1);
     assert!(jane.is_active());
 
     // Deposit money to John's account
@@ -90,7 +90,7 @@ pub async fn load<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
         .expect("john account should exist");
 
     assert_eq!(john.balance, 1250);
-    assert_eq!(john.aggregator_version()?, 2);
+    assert_eq!(john.aggregate_version()?, 2);
 
     // Transfer money from John to Jane
     let transaction_id = Ulid::new().to_string();
@@ -134,9 +134,9 @@ pub async fn load<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
         .expect("jane account should exist");
 
     assert_eq!(john.balance, 950); // 1250 - 300
-    assert_eq!(john.aggregator_version()?, 3); // AccountOpened + MoneyDeposited + MoneyTransferred
+    assert_eq!(john.aggregate_version()?, 3); // AccountOpened + MoneyDeposited + MoneyTransferred
     assert_eq!(jane.balance, 800); // 500 + 300
-    assert_eq!(jane.aggregator_version()?, 2); // AccountOpened + MoneyReceived
+    assert_eq!(jane.aggregate_version()?, 2); // AccountOpened + MoneyReceived
 
     // Verify non-existent account returns None
     let non_existent = cmd.load("non_existent_id").await?;
@@ -168,7 +168,7 @@ pub async fn routing_key<E: Executor + Clone>(executor: &E) -> anyhow::Result<()
     let routing_key = last_routing_key(executor, &account_id).await?;
 
     assert_eq!(routing_key, Some("us-east-1".to_owned()));
-    assert_eq!(account.aggregator_version()?, 1);
+    assert_eq!(account.aggregate_version()?, 1);
     assert_eq!(account.balance, 1000);
 
     // Deposit money - routing key should be preserved from first event
@@ -188,7 +188,7 @@ pub async fn routing_key<E: Executor + Clone>(executor: &E) -> anyhow::Result<()
     let routing_key = last_routing_key(executor, &account_id).await?;
 
     assert_eq!(routing_key, Some("us-east-1".to_owned()));
-    assert_eq!(account.aggregator_version()?, 2);
+    assert_eq!(account.aggregate_version()?, 2);
     assert_eq!(account.balance, 1500);
 
     // Create another account with different routing key "eu-west-1"
@@ -212,7 +212,7 @@ pub async fn routing_key<E: Executor + Clone>(executor: &E) -> anyhow::Result<()
 
     let routing_key = last_routing_key(executor, &account2_id).await?;
     assert_eq!(routing_key, Some("eu-west-1".to_owned()));
-    assert_eq!(account2.aggregator_version()?, 1);
+    assert_eq!(account2.aggregate_version()?, 1);
 
     // Create account WITHOUT routing key
     let account3_id = cmd
@@ -232,7 +232,7 @@ pub async fn routing_key<E: Executor + Clone>(executor: &E) -> anyhow::Result<()
 
     let routing_key = last_routing_key(executor, &account3_id).await?;
     assert_eq!(routing_key, None);
-    assert_eq!(account3.aggregator_version()?, 1);
+    assert_eq!(account3.aggregate_version()?, 1);
 
     // Deposit to account without routing key - should remain None
     cmd.deposit_money(
@@ -252,7 +252,7 @@ pub async fn routing_key<E: Executor + Clone>(executor: &E) -> anyhow::Result<()
 
     let routing_key = last_routing_key(executor, &account3_id).await?;
     assert_eq!(routing_key, None);
-    assert_eq!(account3.aggregator_version()?, 2);
+    assert_eq!(account3.aggregate_version()?, 2);
     assert_eq!(account3.balance, 3100);
 
     Ok(())
@@ -301,7 +301,7 @@ pub async fn load_multiple_aggregator<E: Executor + Clone>(executor: &E) -> anyh
     .await?;
 
     // Update owner name
-    evento::aggregator(&owner_id)
+    evento::append(&owner_id)
         .original_version(1)
         .event(&NameChanged {
             value: "John Smith".to_owned(),
@@ -378,7 +378,7 @@ pub async fn load_with_snapshot<E: Executor + Clone>(executor: &E) -> anyhow::Re
     let account = cmd.load(&account_id).await?.unwrap();
 
     assert_eq!(account.balance, 1500); // 1000 (snapshot) + 200 + 300
-    assert_eq!(account.aggregator_version()?, 3);
+    assert_eq!(account.aggregate_version()?, 3);
 
     // Test with a snapshot at version 2
     {
@@ -391,7 +391,7 @@ pub async fn load_with_snapshot<E: Executor + Clone>(executor: &E) -> anyhow::Re
     let account = cmd.load(&account_id).await?.unwrap();
 
     assert_eq!(account.balance, 1500); // 1200 (snapshot) + 300
-    assert_eq!(account.aggregator_version()?, 3);
+    assert_eq!(account.aggregate_version()?, 3);
 
     // Test with snapshot at latest version (no events to apply)
     {
@@ -403,7 +403,7 @@ pub async fn load_with_snapshot<E: Executor + Clone>(executor: &E) -> anyhow::Re
     let account = cmd.load(&account_id).await?.unwrap();
 
     assert_eq!(account.balance, 1500);
-    assert_eq!(account.aggregator_version()?, 3);
+    assert_eq!(account.aggregate_version()?, 3);
 
     Ok(())
 }
@@ -424,7 +424,7 @@ pub async fn invalid_original_version<E: Executor + Clone>(executor: &E) -> anyh
 
     // Load and verify initial version
     let account = cmd.load(&account_id).await?.expect("account should exist");
-    assert_eq!(account.aggregator_version()?, 1);
+    assert_eq!(account.aggregate_version()?, 1);
 
     // First deposit commits successfully (version 1 -> 2)
     cmd.deposit_money(
@@ -439,12 +439,12 @@ pub async fn invalid_original_version<E: Executor + Clone>(executor: &E) -> anyh
 
     // Verify first commit succeeded
     let account_after_first = cmd.load(&account_id).await?.expect("account should exist");
-    assert_eq!(account_after_first.aggregator_version()?, 2);
+    assert_eq!(account_after_first.aggregate_version()?, 2);
     assert_eq!(account_after_first.balance, 1100);
 
     // Simulate a stale client trying to commit with version 1
     // This should fail because version is now 2
-    let result = evento::aggregator(&account_id)
+    let result = evento::append(&account_id)
         .original_version(1) // stale version
         .event(&MoneyDeposited {
             amount: 200,
@@ -465,7 +465,7 @@ pub async fn invalid_original_version<E: Executor + Clone>(executor: &E) -> anyh
 
     // Verify the second commit didn't go through - balance unchanged
     let account_final = cmd.load(&account_id).await?.expect("account should exist");
-    assert_eq!(account_final.aggregator_version()?, 2);
+    assert_eq!(account_final.aggregate_version()?, 2);
     assert_eq!(account_final.balance, 1100); // Only first deposit counted
 
     Ok(())
@@ -563,7 +563,7 @@ pub async fn subscribe<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> 
     }
 
     // Run subscription to rebuild projection from events
-    simple::subscription().unretry_execute(executor).await?;
+    simple::subscription().no_retry().run_once(executor).await?;
 
     // Verify projection was rebuilt correctly
     let rows = simple::ROWS.read().unwrap();
@@ -643,7 +643,8 @@ pub async fn subscribe_routing_key<E: Executor + Clone>(executor: &E) -> anyhow:
     // Run subscription filtered by "us-east-1" routing key
     simple::subscription()
         .routing_key("us-east-1")
-        .unretry_execute(executor)
+        .no_retry()
+        .run_once(executor)
         .await?;
 
     // Verify only US account was processed
@@ -666,7 +667,8 @@ pub async fn subscribe_routing_key<E: Executor + Clone>(executor: &E) -> anyhow:
     // Now run subscription filtered by "eu-west-1" routing key
     simple::subscription()
         .routing_key("eu-west-1")
-        .unretry_execute(executor)
+        .no_retry()
+        .run_once(executor)
         .await?;
 
     // Verify EU account was now processed
@@ -740,7 +742,7 @@ pub async fn subscribe_default<E: Executor + Clone>(executor: &E) -> anyhow::Res
     }
 
     // Run default subscription (no routing key = processes events with routing_key IS NULL)
-    simple::subscription().unretry_execute(executor).await?;
+    simple::subscription().no_retry().run_once(executor).await?;
 
     // Verify only default (no routing key) account was processed
     {
@@ -762,7 +764,8 @@ pub async fn subscribe_default<E: Executor + Clone>(executor: &E) -> anyhow::Res
     // Now run subscription with specific routing key
     simple::subscription()
         .routing_key("eu-west-1")
-        .unretry_execute(executor)
+        .no_retry()
+        .run_once(executor)
         .await?;
 
     // Verify routed account was now processed
@@ -831,7 +834,7 @@ pub async fn subscribe_default_routing_key<E: Executor + Clone>(
 
     // (3) A subscription with neither .routing_key() nor .all() should inherit the
     // executor default when started against the Evento wrapper.
-    simple::subscription().unretry_execute(&evento).await?;
+    simple::subscription().no_retry().run_once(&evento).await?;
 
     {
         let rows = simple::ROWS.read().unwrap();
@@ -850,7 +853,8 @@ pub async fn subscribe_default_routing_key<E: Executor + Clone>(
     // cursor independent from the one above.
     simple_explicit::subscription("simple_other")
         .routing_key("other-region")
-        .unretry_execute(&evento)
+        .no_retry()
+        .run_once(&evento)
         .await?;
 
     {
@@ -905,7 +909,8 @@ pub async fn subscribe_default_routing_key_all_isolation<E: Executor + Clone>(
     // Tenant-a runs .all() — should process both events (it reads all routing keys).
     simple::subscription()
         .all()
-        .unretry_execute(&evento_a)
+        .no_retry()
+        .run_once(&evento_a)
         .await?;
     {
         let rows = simple::ROWS.read().unwrap();
@@ -932,7 +937,8 @@ pub async fn subscribe_default_routing_key_all_isolation<E: Executor + Clone>(
     // events from the beginning.
     simple::subscription()
         .all()
-        .unretry_execute(&evento_b)
+        .no_retry()
+        .run_once(&evento_b)
         .await?;
     {
         let rows = simple::ROWS.read().unwrap();
@@ -984,8 +990,8 @@ pub async fn subscribe_multiple_aggregator<E: Executor + Clone>(
     )
     .await?;
 
-    // Update owner name using evento::aggregator()
-    evento::aggregator(&owner_id)
+    // Update owner name using evento::append()
+    evento::append(&owner_id)
         .original_version(1)
         .event(&NameChanged {
             value: "John Smith".to_owned(),
@@ -1000,7 +1006,10 @@ pub async fn subscribe_multiple_aggregator<E: Executor + Clone>(
     }
 
     // Run account_details subscription (handles both BankAccount and Owner events)
-    multiple::subscription().unretry_execute(executor).await?;
+    multiple::subscription()
+        .no_retry()
+        .run_once(executor)
+        .await?;
 
     // Verify projection was rebuilt correctly with both aggregator types processed
     let rows = multiple::ROWS.read().unwrap();
@@ -1067,7 +1076,7 @@ pub async fn subscribe_routing_key_multiple_aggregator<E: Executor + Clone>(
         .await?;
 
     // Update US owner name
-    evento::aggregator(&us_owner_id)
+    evento::append(&us_owner_id)
         .original_version(1)
         .routing_key("us-east-1")
         .event(&NameChanged {
@@ -1077,7 +1086,7 @@ pub async fn subscribe_routing_key_multiple_aggregator<E: Executor + Clone>(
         .await?;
 
     // Update EU owner name
-    evento::aggregator(&eu_owner_id)
+    evento::append(&eu_owner_id)
         .original_version(1)
         .routing_key("eu-west-1")
         .event(&NameChanged {
@@ -1096,7 +1105,8 @@ pub async fn subscribe_routing_key_multiple_aggregator<E: Executor + Clone>(
     // Run subscription filtered by "us-east-1" routing key
     multiple::subscription()
         .routing_key("us-east-1")
-        .unretry_execute(executor)
+        .no_retry()
+        .run_once(executor)
         .await?;
 
     // Verify only US account was processed
@@ -1119,7 +1129,8 @@ pub async fn subscribe_routing_key_multiple_aggregator<E: Executor + Clone>(
     // Now run subscription filtered by "eu-west-1" routing key
     multiple::subscription()
         .routing_key("eu-west-1")
-        .unretry_execute(executor)
+        .no_retry()
+        .run_once(executor)
         .await?;
 
     // Verify EU account was now processed
@@ -1183,7 +1194,7 @@ pub async fn subscribe_default_multiple_aggregator<E: Executor + Clone>(
         .await?;
 
     // Update default owner name (no routing key)
-    evento::aggregator(&default_owner_id)
+    evento::append(&default_owner_id)
         .original_version(1)
         .event(&NameChanged {
             value: "Default Owner Updated".to_owned(),
@@ -1192,7 +1203,7 @@ pub async fn subscribe_default_multiple_aggregator<E: Executor + Clone>(
         .await?;
 
     // Update routed owner name (with routing key)
-    evento::aggregator(&routed_owner_id)
+    evento::append(&routed_owner_id)
         .original_version(1)
         .routing_key("eu-west-1")
         .event(&NameChanged {
@@ -1209,7 +1220,10 @@ pub async fn subscribe_default_multiple_aggregator<E: Executor + Clone>(
     }
 
     // Run default subscription (no routing key = processes events with routing_key IS NULL)
-    multiple::subscription().unretry_execute(executor).await?;
+    multiple::subscription()
+        .no_retry()
+        .run_once(executor)
+        .await?;
 
     // Verify only default (no routing key) account was processed
     {
@@ -1231,7 +1245,8 @@ pub async fn subscribe_default_multiple_aggregator<E: Executor + Clone>(
     // Now run subscription with specific routing key
     multiple::subscription()
         .routing_key("eu-west-1")
-        .unretry_execute(executor)
+        .no_retry()
+        .run_once(executor)
         .await?;
 
     // Verify routed account was now processed
@@ -1295,7 +1310,7 @@ pub async fn all_commands<E: Executor + Clone>(executor: &E) -> anyhow::Result<(
         .await?
         .expect("Account A should exist");
     assert_eq!(account_a.balance, 5000);
-    assert_eq!(account_a.aggregator_version()?, 1);
+    assert_eq!(account_a.aggregate_version()?, 1);
     assert!(account_a.is_active());
 
     let account_b = cmd
@@ -1323,7 +1338,7 @@ pub async fn all_commands<E: Executor + Clone>(executor: &E) -> anyhow::Result<(
         .await?
         .expect("Account A should exist");
     assert_eq!(account_a.balance, 7500); // 5000 + 2500
-    assert_eq!(account_a.aggregator_version()?, 2);
+    assert_eq!(account_a.aggregate_version()?, 2);
 
     // =========================================================================
     // 3. WithdrawMoney
@@ -1344,7 +1359,7 @@ pub async fn all_commands<E: Executor + Clone>(executor: &E) -> anyhow::Result<(
         .await?
         .expect("Account A should exist");
     assert_eq!(account_a.balance, 7000); // 7500 - 500
-    assert_eq!(account_a.aggregator_version()?, 3);
+    assert_eq!(account_a.aggregate_version()?, 3);
 
     // =========================================================================
     // 4. ChangeOverdraftLimit
@@ -1358,7 +1373,7 @@ pub async fn all_commands<E: Executor + Clone>(executor: &E) -> anyhow::Result<(
         .await?
         .expect("Account A should exist");
     assert_eq!(account_a.overdraft_limit, 1000);
-    assert_eq!(account_a.aggregator_version()?, 4);
+    assert_eq!(account_a.aggregate_version()?, 4);
 
     // =========================================================================
     // 5. TransferMoney / ReceiveMoney
@@ -1401,9 +1416,9 @@ pub async fn all_commands<E: Executor + Clone>(executor: &E) -> anyhow::Result<(
         .expect("Account B should exist");
 
     assert_eq!(account_a.balance, 5000); // 7000 - 2000
-    assert_eq!(account_a.aggregator_version()?, 5);
+    assert_eq!(account_a.aggregate_version()?, 5);
     assert_eq!(account_b.balance, 3000); // 1000 + 2000
-    assert_eq!(account_b.aggregator_version()?, 2);
+    assert_eq!(account_b.aggregate_version()?, 2);
 
     // =========================================================================
     // 6. FreezeAccount / UnfreezeAccount
@@ -1422,7 +1437,7 @@ pub async fn all_commands<E: Executor + Clone>(executor: &E) -> anyhow::Result<(
         .await?
         .expect("Account A should exist");
     assert!(account_a.is_frozen());
-    assert_eq!(account_a.aggregator_version()?, 6);
+    assert_eq!(account_a.aggregate_version()?, 6);
 
     // Try to withdraw while frozen - should fail
     let withdraw_result = cmd
@@ -1451,7 +1466,7 @@ pub async fn all_commands<E: Executor + Clone>(executor: &E) -> anyhow::Result<(
         .await?
         .expect("Account A should exist");
     assert!(account_a.is_active());
-    assert_eq!(account_a.aggregator_version()?, 7);
+    assert_eq!(account_a.aggregate_version()?, 7);
 
     // =========================================================================
     // 7. CloseAccount
@@ -1473,7 +1488,7 @@ pub async fn all_commands<E: Executor + Clone>(executor: &E) -> anyhow::Result<(
         .await?
         .expect("Account A should exist");
     assert_eq!(account_a.balance, 0);
-    assert_eq!(account_a.aggregator_version()?, 8);
+    assert_eq!(account_a.aggregate_version()?, 8);
 
     // Close the account
     cmd.close_account(
@@ -1489,7 +1504,7 @@ pub async fn all_commands<E: Executor + Clone>(executor: &E) -> anyhow::Result<(
         .await?
         .expect("Account A should exist");
     assert!(account_a.is_closed());
-    assert_eq!(account_a.aggregator_version()?, 9);
+    assert_eq!(account_a.aggregate_version()?, 9);
 
     // Try operations on closed account - should fail
     let deposit_result = cmd
@@ -1516,7 +1531,7 @@ pub async fn all_commands<E: Executor + Clone>(executor: &E) -> anyhow::Result<(
     }
 
     // Run subscription to rebuild projection from events
-    simple::subscription().unretry_execute(executor).await?;
+    simple::subscription().no_retry().run_once(executor).await?;
 
     // Verify Account A projection
     {
@@ -1531,7 +1546,8 @@ pub async fn all_commands<E: Executor + Clone>(executor: &E) -> anyhow::Result<(
     // Run subscription with routing key for Account B
     simple::subscription()
         .routing_key("region-1")
-        .unretry_execute(executor)
+        .no_retry()
+        .run_once(executor)
         .await?;
 
     // Verify Account B projection
@@ -1580,7 +1596,7 @@ mod simple {
     ) -> anyhow::Result<()> {
         let mut rows = ROWS.write().unwrap();
         rows.insert(
-            event.aggregator_id.to_owned(),
+            event.aggregate_id.to_owned(),
             Row {
                 status: AccountStatus::Active,
             },
@@ -1596,7 +1612,7 @@ mod simple {
     ) -> anyhow::Result<()> {
         let mut rows = ROWS.write().unwrap();
         rows.insert(
-            event.aggregator_id.to_owned(),
+            event.aggregate_id.to_owned(),
             Row {
                 status: AccountStatus::Frozen,
             },
@@ -1612,7 +1628,7 @@ mod simple {
     ) -> anyhow::Result<()> {
         let mut rows = ROWS.write().unwrap();
         rows.insert(
-            event.aggregator_id.to_owned(),
+            event.aggregate_id.to_owned(),
             Row {
                 status: AccountStatus::Closed,
             },
@@ -1652,7 +1668,7 @@ mod simple_explicit {
     ) -> anyhow::Result<()> {
         let mut rows = ROWS.write().unwrap();
         rows.insert(
-            event.aggregator_id.to_owned(),
+            event.aggregate_id.to_owned(),
             Row {
                 status: AccountStatus::Active,
             },
@@ -1697,7 +1713,7 @@ mod multiple {
     ) -> anyhow::Result<()> {
         let mut rows = ROWS.write().unwrap();
         rows.insert(
-            event.aggregator_id.to_owned(),
+            event.aggregate_id.to_owned(),
             Row {
                 status: AccountStatus::Active,
                 owner_name: event.data.owner_name,
@@ -1714,7 +1730,7 @@ mod multiple {
         event: Event<AccountFrozen>,
     ) -> anyhow::Result<()> {
         let mut rows = ROWS.write().unwrap();
-        let row = rows.get_mut(&event.aggregator_id).unwrap();
+        let row = rows.get_mut(&event.aggregate_id).unwrap();
         row.status = AccountStatus::Frozen;
 
         Ok(())
@@ -1727,12 +1743,381 @@ mod multiple {
     ) -> anyhow::Result<()> {
         let mut rows = ROWS.write().unwrap();
         for (_, row) in rows.iter_mut() {
-            if row.owner_id == event.aggregator_id {
+            if row.owner_id == event.aggregate_id {
                 row.owner_name = event.data.value.to_owned();
             }
         }
 
         Ok(())
+    }
+}
+
+/// Events must order by whole seconds, THEN sub-seconds, THEN version, THEN id —
+/// matching the SQL `ORDER BY timestamp, timestamp_subsec, version, id`. This is a
+/// regression guard against ordering by `timestamp_subsec` first (which reorders
+/// events whose larger whole-second carries a smaller sub-second). The existing
+/// suite cannot catch it because it always uses `timestamp_subsec: 0`.
+pub async fn read_order_timestamp<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
+    let agg_type = "evento/OrderTest";
+    let mk = |t: u64, s: u32| Event {
+        id: Ulid::new(),
+        aggregate_id: Ulid::new().to_string(),
+        aggregate_type: agg_type.to_owned(),
+        version: 1,
+        name: "Tick".to_owned(),
+        routing_key: None,
+        data: vec![],
+        metadata: Default::default(),
+        timestamp: t,
+        timestamp_subsec: s,
+    };
+    // (100,500) < (101,100) < (101,900) < (102,0) by (timestamp, subsec).
+    let e1 = mk(100, 500);
+    let e2 = mk(101, 100);
+    let e3 = mk(101, 900);
+    let e4 = mk(102, 0);
+    let expected = vec![e1.id, e2.id, e3.id, e4.id];
+    executor
+        .write(vec![e1.clone(), e2.clone(), e3.clone(), e4.clone()])
+        .await?;
+
+    let ids = |r: &ReadResult<Event>| r.edges.iter().map(|e| e.node.id).collect::<Vec<_>>();
+    let read = |args| {
+        let f = EventFilter::by_type(agg_type);
+        async move { executor.read(Some(vec![f]), None, args).await }
+    };
+
+    // Full forward read.
+    let all = read(Args::forward(10, None)).await?;
+    assert_eq!(ids(&all), expected, "forward order must be timestamp-major");
+
+    // Forward pagination across the boundary.
+    let p1 = read(Args::forward(2, None)).await?;
+    assert_eq!(ids(&p1), vec![expected[0], expected[1]]);
+    assert!(p1.page_info.has_next_page);
+    let p2 = read(Args::forward(2, p1.page_info.end_cursor.clone())).await?;
+    assert_eq!(ids(&p2), vec![expected[2], expected[3]]);
+
+    // Backward selects the last window but still yields ascending order (Relay-style).
+    let back = read(Args::backward(2, None)).await?;
+    assert_eq!(
+        ids(&back),
+        vec![expected[2], expected[3]],
+        "backward(last=2) must return the last two events in ascending order"
+    );
+
+    Ok(())
+}
+
+/// `EventFilter::exact(type, id, name)` must return only events of that exact name
+/// for the given aggregate. This exercises Fjall's `agg_name_index` fast path.
+pub async fn exact_filter<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
+    let agg_type = "evento/FilterTest";
+    let id = Ulid::new().to_string();
+    let mk = |v: u16, name: &str| Event {
+        id: Ulid::new(),
+        aggregate_id: id.clone(),
+        aggregate_type: agg_type.to_owned(),
+        version: v,
+        name: name.to_owned(),
+        routing_key: None,
+        data: vec![],
+        metadata: Default::default(),
+        timestamp: 100 + v as u64,
+        timestamp_subsec: 0,
+    };
+    executor
+        .write(vec![mk(1, "Alpha"), mk(2, "Beta"), mk(3, "Alpha")])
+        .await?;
+
+    let alpha = executor
+        .read(
+            Some(vec![EventFilter::exact(agg_type, &id, "Alpha")]),
+            None,
+            Args::forward(10, None),
+        )
+        .await?;
+    assert_eq!(
+        alpha.edges.len(),
+        2,
+        "exact filter must return both Alpha events"
+    );
+    assert!(alpha.edges.iter().all(|e| e.node.name == "Alpha"));
+
+    let beta = executor
+        .read(
+            Some(vec![EventFilter::exact(agg_type, &id, "Beta")]),
+            None,
+            Args::forward(10, None),
+        )
+        .await?;
+    assert_eq!(
+        beta.edges.len(),
+        1,
+        "exact filter must return the single Beta event"
+    );
+
+    Ok(())
+}
+
+/// Concurrent appends at the same `original_version` must conflict: exactly one
+/// wins, the rest get `InvalidOriginalVersion`. Guards optimistic concurrency under
+/// real parallelism (the existing suite only tests it sequentially).
+pub async fn concurrent_append<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
+    let id = evento::create()
+        .event(&MoneyDeposited {
+            amount: 1,
+            transaction_id: Ulid::new().to_string(),
+            description: "seed".to_owned(),
+        })
+        .commit(executor)
+        .await?;
+
+    let mut handles = Vec::new();
+    for i in 0..8u32 {
+        let ex = executor.clone();
+        let id = id.clone();
+        handles.push(tokio::spawn(async move {
+            evento::append(&id)
+                .original_version(1)
+                .event(&MoneyDeposited {
+                    amount: 10,
+                    transaction_id: Ulid::new().to_string(),
+                    description: format!("concurrent-{i}"),
+                })
+                .commit(&ex)
+                .await
+        }));
+    }
+
+    let mut winners = 0;
+    for h in handles {
+        if h.await?.is_ok() {
+            winners += 1;
+        }
+    }
+    assert_eq!(
+        winners, 1,
+        "exactly one concurrent append at the same version must win"
+    );
+
+    assert_eq!(
+        executor.original_version::<MoneyDeposited>(&id).await?,
+        Some(2),
+        "the aggregate must advance by exactly one version"
+    );
+
+    Ok(())
+}
+
+/// A `.strict()` subscription must fail when it encounters an event with no handler.
+pub async fn strict_unhandled<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
+    let cmd = bank::Command(executor.clone());
+    let id = cmd
+        .open_account(OpenAccount {
+            owner_id: "owner".to_owned(),
+            owner_name: "Strict".to_owned(),
+            account_type: AccountType::Checking,
+            currency: "USD".to_owned(),
+            initial_balance: 100,
+        })
+        .await?;
+    // MoneyDeposited has no handler in `simple` -> strict must reject it.
+    cmd.deposit_money(
+        &id,
+        DepositMoney {
+            amount: 10,
+            transaction_id: Ulid::new().to_string(),
+            description: "d".to_owned(),
+        },
+    )
+    .await?;
+
+    let result = simple::subscription()
+        .strict()
+        .no_retry()
+        .run_once(executor)
+        .await;
+    assert!(
+        result.is_err(),
+        "strict subscription must fail on an unhandled event"
+    );
+
+    Ok(())
+}
+
+/// A registered tombstone event must make projection load return `None`.
+pub async fn tombstone<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
+    use bank::aggregator::AccountClosed;
+
+    let cmd = bank::Command(executor.clone());
+    let id = cmd
+        .open_account(OpenAccount {
+            owner_id: "owner".to_owned(),
+            owner_name: "Tomb".to_owned(),
+            account_type: AccountType::Checking,
+            currency: "USD".to_owned(),
+            initial_balance: 100,
+        })
+        .await?;
+
+    // Without a tombstone the projection loads normally.
+    let alive = feature::balance().load(&id).execute(executor).await?;
+    assert!(alive.is_some(), "account should load before it is closed");
+
+    cmd.close_account(
+        &id,
+        CloseAccount {
+            reason: "closing".to_owned(),
+        },
+    )
+    .await?; // emits AccountClosed
+
+    // With a tombstone on AccountClosed, load returns None once the event exists.
+    let dead = feature::balance()
+        .tombstone::<AccountClosed>()
+        .load(&id)
+        .execute(executor)
+        .await?;
+    assert!(dead.is_none(), "tombstone event must make load return None");
+
+    Ok(())
+}
+
+/// `#[subscription_all]` must observe every event of the aggregate regardless of type.
+pub async fn subscription_all_counts<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    feature::ALL_COUNT.store(0, SeqCst);
+    let cmd = bank::Command(executor.clone());
+    let id = cmd
+        .open_account(OpenAccount {
+            owner_id: "owner".to_owned(),
+            owner_name: "All".to_owned(),
+            account_type: AccountType::Checking,
+            currency: "USD".to_owned(),
+            initial_balance: 100,
+        })
+        .await?; // AccountOpened
+    cmd.deposit_money(
+        &id,
+        DepositMoney {
+            amount: 10,
+            transaction_id: Ulid::new().to_string(),
+            description: "d".to_owned(),
+        },
+    )
+    .await?; // MoneyDeposited
+
+    feature::all_subscription()
+        .no_retry()
+        .run_once(executor)
+        .await?;
+
+    assert_eq!(
+        feature::ALL_COUNT.load(SeqCst),
+        2,
+        "subscription_all must see every event regardless of type"
+    );
+
+    Ok(())
+}
+
+/// The executor snapshot contract: snapshots are scoped by revision (a revision
+/// bump invalidates old snapshots), and delete removes them.
+pub async fn snapshot_revision_scope<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
+    use evento::cursor::Value;
+
+    let agg = "evento/SnapTest";
+    let id = "snap-1";
+    let data = vec![1u8, 2, 3];
+
+    executor
+        .save_snapshot(
+            agg.to_owned(),
+            "0".to_owned(),
+            id.to_owned(),
+            data.clone(),
+            Value(String::new()),
+        )
+        .await?;
+
+    let same = executor
+        .get_snapshot(agg.to_owned(), "0".to_owned(), id.to_owned())
+        .await?;
+    assert!(same.is_some(), "same revision must return the snapshot");
+    assert_eq!(same.unwrap().0, data);
+
+    let other = executor
+        .get_snapshot(agg.to_owned(), "1".to_owned(), id.to_owned())
+        .await?;
+    assert!(
+        other.is_none(),
+        "a snapshot stored under a different revision must not be returned"
+    );
+
+    executor
+        .delete_snapshot(agg.to_owned(), id.to_owned())
+        .await?;
+    assert!(
+        executor
+            .get_snapshot(agg.to_owned(), "0".to_owned(), id.to_owned())
+            .await?
+            .is_none(),
+        "delete_snapshot must remove the snapshot"
+    );
+
+    Ok(())
+}
+
+/// Supporting projection + subscription_all handler for the feature tests above.
+mod feature {
+    use std::sync::atomic::AtomicU32;
+
+    use bank::aggregator::{AccountOpened, BankAccount, MoneyDeposited};
+    use evento::{
+        metadata::{Event, RawEvent},
+        projection::Projection,
+        subscription::{Context, SubscriptionBuilder},
+        Executor,
+    };
+
+    pub static ALL_COUNT: AtomicU32 = AtomicU32::new(0);
+
+    #[evento::projection(bitcode::Encode, bitcode::Decode)]
+    pub struct Balance {
+        pub amount: i64,
+    }
+
+    #[evento::handler]
+    async fn on_opened(event: Event<AccountOpened>, view: &mut Balance) -> anyhow::Result<()> {
+        view.amount = event.data.initial_balance;
+        Ok(())
+    }
+
+    #[evento::handler]
+    async fn on_deposited(event: Event<MoneyDeposited>, view: &mut Balance) -> anyhow::Result<()> {
+        view.amount += event.data.amount;
+        Ok(())
+    }
+
+    pub fn balance<E: Executor>() -> Projection<E, Balance> {
+        Projection::new::<BankAccount>()
+            .handler(on_opened())
+            .handler(on_deposited())
+    }
+
+    #[evento::subscription_all]
+    async fn count_all<E: Executor>(
+        _ctx: &Context<'_, E>,
+        _event: RawEvent<BankAccount>,
+    ) -> anyhow::Result<()> {
+        ALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    pub fn all_subscription<E: Executor>() -> SubscriptionBuilder<E> {
+        SubscriptionBuilder::new("feature_all").handler(count_all())
     }
 }
 
@@ -1776,17 +2161,17 @@ pub fn get_data() -> Vec<Event> {
 
     for _ in 0..10 {
         let mut rng = rand::rng();
-        let aggregator_id = aggregator_ids
+        let aggregate_id = aggregator_ids
             .choose(&mut rng)
             .cloned()
             .unwrap_or_else(|| Ulid::new().to_string());
 
         let routing_key = routing_keys.choose(&mut rng).cloned().unwrap_or(None);
-        let aggregator_type = aggregator_types
+        let aggregate_type = aggregator_types
             .choose(&mut rng)
             .cloned()
             .unwrap_or("Calcul");
-        let version = versions.entry(aggregator_id.to_owned()).or_default();
+        let version = versions.entry(aggregate_id.to_owned()).or_default();
         let timestamp = if rng.random_range(0..100) < 20 {
             timestamps.choose(&mut rng).cloned()
         } else {
@@ -1797,8 +2182,8 @@ pub fn get_data() -> Vec<Event> {
         let event = Event {
             id: Ulid::new(),
             name: "MessageSent".to_owned(),
-            aggregator_id,
-            aggregator_type: aggregator_type.to_owned(),
+            aggregate_id,
+            aggregate_type: aggregate_type.to_owned(),
             version: *version,
             routing_key,
             timestamp: timestamp as u64,

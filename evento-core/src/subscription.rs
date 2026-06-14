@@ -42,7 +42,7 @@ use tokio::{
 use tracing::field::Empty;
 use ulid::Ulid;
 
-use crate::{context, cursor::Args, Aggregator, AggregatorEvent, Executor, ReadAggregator};
+use crate::{context, cursor::Args, Aggregate, AggregateEvent, EventFilter, Executor};
 
 /// Filter for events by routing key.
 ///
@@ -64,18 +64,16 @@ pub enum RoutingKey {
 /// # Example
 ///
 /// ```rust,ignore
-/// #[evento::handler]
+/// #[evento::subscription]
 /// async fn my_handler<E: Executor>(
+///     context: &Context<'_, E>,
 ///     event: Event<MyEventData>,
-///     action: Action<'_, MyView, E>,
 /// ) -> anyhow::Result<()> {
-///     if let Action::Handle(ctx) = action {
-///         // Access shared data
-///         let config: Data<AppConfig> = ctx.extract();
+///     // Access shared data
+///     let config: Data<AppConfig> = context.extract();
 ///
-///         // Use executor for queries
-///         let events = ctx.executor.read(...).await?;
-///     }
+///     // Use executor for queries
+///     let events = context.executor.read(...).await?;
 ///     Ok(())
 /// }
 /// ```
@@ -112,15 +110,15 @@ pub trait Handler<E: Executor>: Sync + Send {
         event: &'a crate::Event,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>>;
 
-    /// Returns the aggregator type this handler processes.
-    fn aggregator_type(&self) -> &'static str;
+    /// Returns the aggregate type this handler processes.
+    fn aggregate_type(&self) -> &'static str;
     /// Returns the event name this handler processes.
     fn event_name(&self) -> &'static str;
 }
 
 /// Builder for creating event subscriptions.
 ///
-/// Created via [`Projection::subscription`], this builder configures
+/// Created via [`Projection::subscription`](crate::projection::Projection::subscription), this builder configures
 /// a continuous event processing subscription with retry logic,
 /// routing key filtering, and graceful shutdown support.
 ///
@@ -147,7 +145,7 @@ pub struct SubscriptionBuilder<E: Executor> {
     prefix_key: Option<String>,
     delay: Option<Duration>,
     chunk_size: u16,
-    is_accept_failure: bool,
+    continue_on_error: bool,
     retry: Option<u8>,
     aggregators: HashMap<String, String>,
     safety_disabled: bool,
@@ -167,7 +165,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             delay: None,
             retry: Some(30),
             chunk_size: 300,
-            is_accept_failure: false,
+            continue_on_error: false,
             routing_key: None,
             prefix_key: None,
             aggregators: Default::default(),
@@ -178,7 +176,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
     /// Enables safety checks for unhandled events.
     ///
     /// When enabled, processing fails if an event is encountered without a handler.
-    pub fn safety_check(mut self) -> Self {
+    pub fn strict(mut self) -> Self {
         self.safety_disabled = false;
 
         self
@@ -190,7 +188,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
     ///
     /// Panics if a handler for the same event type is already registered.
     pub fn handler<H: Handler<E> + 'static>(mut self, h: H) -> Self {
-        let key = format!("{}_{}", h.aggregator_type(), h.event_name());
+        let key = format!("{}_{}", h.aggregate_type(), h.event_name());
         if self.handlers.insert(key.to_owned(), Box::new(h)).is_some() {
             panic!("Cannot register event handler: key {} already exists", key);
         }
@@ -204,7 +202,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
     /// # Panics
     ///
     /// Panics if a handler for the same event type is already registered.
-    pub fn skip<EV: AggregatorEvent + Send + Sync + 'static>(self) -> Self {
+    pub fn skip<EV: AggregateEvent + Send + Sync + 'static>(self) -> Self {
         self.handler(SkipHandler::<EV>(PhantomData))
     }
 
@@ -221,8 +219,8 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
     ///
     /// By default, subscriptions stop on the first error. With this flag,
     /// errors are logged but processing continues.
-    pub fn accept_failure(mut self) -> Self {
-        self.is_accept_failure = true;
+    pub fn continue_on_error(mut self) -> Self {
+        self.continue_on_error = true;
 
         self
     }
@@ -274,31 +272,33 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
     }
 
     /// Adds a related aggregate to process events from.
-    pub fn aggregator<A: Aggregator>(mut self, id: impl Into<String>) -> Self {
+    pub fn aggregate<A: Aggregate>(mut self, id: impl Into<String>) -> Self {
         self.aggregators
-            .insert(A::aggregator_type().to_owned(), id.into());
+            .insert(A::aggregate_type().to_owned(), id.into());
 
         self
     }
 
-    fn read_aggregators(&self) -> Vec<ReadAggregator> {
+    fn read_aggregators(&self) -> Vec<EventFilter> {
         self.handlers
             .values()
-            .map(|h| match self.aggregators.get(h.aggregator_type()) {
-                Some(id) => ReadAggregator {
-                    aggregator_type: h.aggregator_type().to_owned(),
-                    aggregator_id: Some(id.to_owned()),
-                    name: if self.safety_disabled {
-                        Some(h.event_name().to_owned())
-                    } else {
-                        None
+            .map(|h| {
+                // `#[subscription_all]` handlers report the sentinel name "all" and
+                // match every event of the type, so they must read by type rather
+                // than by a literal event name (which would match nothing).
+                let by_name = self.safety_disabled && h.event_name() != "all";
+                match self.aggregators.get(h.aggregate_type()) {
+                    Some(id) => EventFilter {
+                        aggregate_type: h.aggregate_type().to_owned(),
+                        aggregate_id: Some(id.to_owned()),
+                        name: by_name.then(|| h.event_name().to_owned()),
                     },
-                },
-                _ => {
-                    if self.safety_disabled {
-                        ReadAggregator::event(h.aggregator_type(), h.event_name())
-                    } else {
-                        ReadAggregator::aggregator(h.aggregator_type())
+                    _ => {
+                        if by_name {
+                            EventFilter::by_event(h.aggregate_type(), h.event_name())
+                        } else {
+                            EventFilter::by_type(h.aggregate_type())
+                        }
                     }
                 }
             })
@@ -320,7 +320,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
     /// Resolves an unset routing key from the executor's default and captures
     /// the default as a storage-key prefix.
     ///
-    /// Called once at the top of `start()` / `execute()` before any other
+    /// Called once at the top of `start()` / `run_once()` before any other
     /// method reads `self.routing_key`. After this, `routing_key` is always
     /// `Some(_)`.
     ///
@@ -349,8 +349,8 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
         skip_all,
         fields(
             subscription = Empty,
-            aggregator_type = Empty,
-            aggregator_id = Empty,
+            aggregate_type = Empty,
+            aggregate_id = Empty,
             event = Empty,
         )
     )]
@@ -358,7 +358,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
         &self,
         executor: &E,
         id: &Ulid,
-        aggregators: &[ReadAggregator],
+        aggregators: &[EventFilter],
     ) -> anyhow::Result<bool> {
         let mut interval = interval_at(
             Instant::now() - Duration::from_millis(400),
@@ -406,7 +406,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                     if rx.try_recv().is_ok() {
                         tracing::info!(
                             key = self.key(),
-                            "Subscription received shutdown signal, stopping gracefull"
+                            "Subscription received shutdown signal, stopping gracefully"
                         );
 
                         return Ok(true);
@@ -414,12 +414,12 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                     drop(rx);
                 }
 
-                tracing::Span::current().record("aggregator_type", &event.node.aggregator_type);
-                tracing::Span::current().record("aggregator_id", &event.node.aggregator_id);
+                tracing::Span::current().record("aggregate_type", &event.node.aggregate_type);
+                tracing::Span::current().record("aggregate_id", &event.node.aggregate_id);
                 tracing::Span::current().record("event", &event.node.name);
 
-                let all_key = format!("{}_all", event.node.aggregator_type);
-                let key = format!("{}_{}", event.node.aggregator_type, event.node.name);
+                let all_key = format!("{}_all", event.node.aggregate_type);
+                let key = format!("{}_{}", event.node.aggregate_type, event.node.name);
                 let Some(handler) = self.handlers.get(&all_key).or(self.handlers.get(&key)) else {
                     if !self.safety_disabled {
                         anyhow::bail!("no handler s={} k={key}", self.key());
@@ -447,15 +447,15 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
         }
     }
 
-    /// Starts the subscription without retry logic.
+    /// Disables retry-on-failure for this subscription.
     ///
-    /// Equivalent to calling `start()` with retries disabled.
-    pub async fn unretry_start(mut self, executor: &E) -> anyhow::Result<Subscription>
-    where
-        E: Clone,
-    {
+    /// By default failed batches are retried with exponential backoff (see
+    /// [`retry`](Self::retry)). Combine this with [`start`](Self::start) or
+    /// [`run_once`](Self::run_once) to process without retries.
+    pub fn no_retry(mut self) -> Self {
         self.retry = None;
-        self.start(executor).await
+
+        self
     }
 
     /// Starts a continuous background subscription.
@@ -464,8 +464,8 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
     /// The subscription runs in a spawned tokio task and polls for new events.
     #[tracing::instrument(skip_all, fields(
         subscription = self.key(),
-        aggregator_type = tracing::field::Empty,
-        aggregator_id = tracing::field::Empty,
+        aggregate_type = tracing::field::Empty,
+        aggregate_id = tracing::field::Empty,
         event = tracing::field::Empty,
     ))]
     pub async fn start(mut self, executor: &E) -> anyhow::Result<Subscription>
@@ -503,7 +503,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                     if rx.try_recv().is_ok() {
                         tracing::info!(
                             key = self.key(),
-                            "Subscription received shutdown signal, stopping gracefull"
+                            "Subscription received shutdown signal, stopping gracefully"
                         );
 
                         break;
@@ -537,7 +537,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                     Err(err) => {
                         tracing::error!(error = %err, "Failed to process event");
 
-                        if !self.is_accept_failure {
+                        if !self.continue_on_error {
                             break;
                         }
                     }
@@ -552,25 +552,18 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
         })
     }
 
-    /// Executes the subscription once without retry logic.
+    /// Processes all currently pending events once, then returns.
     ///
-    /// Processes all pending events and returns. Does not poll for new events.
-    pub async fn unretry_execute(mut self, executor: &E) -> anyhow::Result<()> {
-        self.retry = None;
-        self.execute(executor).await
-    }
-
-    /// Executes the subscription once, processing all pending events.
-    ///
-    /// Unlike `start()`, this does not run continuously. It processes
-    /// all currently pending events and returns.
+    /// Unlike [`start`](Self::start), this does not run continuously or spawn a
+    /// background task — it drains the events available now and returns. Pair with
+    /// [`no_retry`](Self::no_retry) to run a single pass without retries.
     #[tracing::instrument(skip_all, fields(
         subscription = self.key(),
-        aggregator_type = tracing::field::Empty,
-        aggregator_id = tracing::field::Empty,
+        aggregate_type = tracing::field::Empty,
+        aggregate_id = tracing::field::Empty,
         event = tracing::field::Empty,
     ))]
-    pub async fn execute(&mut self, executor: &E) -> anyhow::Result<()> {
+    pub async fn run_once(&mut self, executor: &E) -> anyhow::Result<()> {
         self.resolve_routing_key(executor);
         let id = Ulid::new();
 
@@ -639,9 +632,9 @@ impl Subscription {
     }
 }
 
-struct SkipHandler<E: AggregatorEvent>(PhantomData<E>);
+struct SkipHandler<E: AggregateEvent>(PhantomData<E>);
 
-impl<E: Executor, EV: AggregatorEvent + Send + Sync> Handler<E> for SkipHandler<EV> {
+impl<E: Executor, EV: AggregateEvent + Send + Sync> Handler<E> for SkipHandler<EV> {
     fn handle<'a>(
         &'a self,
         _context: &'a Context<'a, E>,
@@ -650,8 +643,8 @@ impl<E: Executor, EV: AggregatorEvent + Send + Sync> Handler<E> for SkipHandler<
         Box::pin(async { Ok(()) })
     }
 
-    fn aggregator_type(&self) -> &'static str {
-        EV::aggregator_type()
+    fn aggregate_type(&self) -> &'static str {
+        EV::aggregate_type()
     }
 
     fn event_name(&self) -> &'static str {

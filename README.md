@@ -9,7 +9,7 @@ A collection of libraries and tools that help you build DDD, CQRS, and event sou
 - Domain-driven design support
 - Event handlers and subscriptions
 - Built-in migrations
-- Macro support for easy aggregator implementation
+- Macros for easy aggregate and handler implementation
 - Compact binary serialization with bitcode
 
 ## Quick Start
@@ -32,13 +32,11 @@ bitcode = "0.6"
 
 ## Basic Usage
 
-### 1. Define Events with Aggregator Enum
+### 1. Define Events with an Aggregate Enum
 
 ```rust
-use evento::aggregator;
-
-// Define your events using an enum
-#[evento::aggregator]
+// Define your events using an enum; each variant becomes an event struct.
+#[evento::aggregate]
 pub enum User {
     UserCreated {
         name: String,
@@ -53,18 +51,16 @@ pub enum User {
 
 This generates individual event structs (`UserCreated`, `UserEmailChanged`) with all required traits.
 
-### 2. Create Events
+### 2. Create a New Aggregate
 
 ```rust
-use evento::metadata::Metadata;
-
 async fn create_user(executor: &evento::Sqlite) -> anyhow::Result<String> {
+    // `create()` starts a brand-new aggregate and returns its generated id.
     let user_id = evento::create()
         .event(&UserCreated {
             name: "John Doe".to_string(),
             email: "john@example.com".to_string(),
         })
-        .metadata(&Metadata::default())
         .commit(executor)
         .await?;
 
@@ -72,23 +68,22 @@ async fn create_user(executor: &evento::Sqlite) -> anyhow::Result<String> {
 }
 ```
 
-### 3. Save Events to Existing Aggregates
+### 3. Append Events to an Existing Aggregate
 
 ```rust
-use evento::metadata::Metadata;
-
 async fn change_user_email(
     executor: &evento::Sqlite,
     user_id: &str,
     original_version: u16,
-    new_email: &str
+    new_email: &str,
 ) -> anyhow::Result<()> {
-    evento::aggregator(user_id)
+    // `append(id)` continues an existing aggregate. `original_version` enables
+    // optimistic concurrency: the commit fails if another writer raced ahead.
+    evento::append(user_id)
         .original_version(original_version)
         .event(&UserEmailChanged {
             email: new_email.to_string(),
         })
-        .metadata(&Metadata::default())
         .commit(executor)
         .await?;
 
@@ -127,9 +122,11 @@ async fn on_email_changed(
 }
 
 async fn get_user(executor: &evento::Sqlite, user_id: &str) -> anyhow::Result<Option<UserView>> {
-    let result = Projection::<_, UserView>::new::<User>(user_id)
+    // Register handlers, then `load(id)` the aggregate and `execute` to replay it.
+    let result = Projection::<_, UserView>::new::<User>()
         .handler(on_user_created())
         .handler(on_email_changed())
+        .load(user_id)
         .execute(executor)
         .await?;
 
@@ -170,13 +167,16 @@ async fn setup_subscriptions(executor: evento::Sqlite) -> anyhow::Result<()> {
 }
 ```
 
+To drain currently-pending events once instead of running a background loop, use
+`run_once(&executor)` (optionally after `no_retry()`) rather than `start`.
+
 ### 6. Complete Example with SQLite
 
 ```rust
-use evento::{metadata::{Event, Metadata}, projection::Projection};
+use evento::{metadata::Event, projection::Projection};
 use sqlx::SqlitePool;
 
-#[evento::aggregator]
+#[evento::aggregate]
 pub enum User {
     UserCreated { name: String, email: String },
     UserEmailChanged { email: String },
@@ -213,10 +213,11 @@ async fn main() -> anyhow::Result<()> {
     let pool = SqlitePool::connect("sqlite:events.db").await?;
     let mut conn = pool.acquire().await?;
 
-    // Run migrations
-    evento::sql_migrator::new()?
+    // Run migrations (the database type is required)
+    evento::sql_migrator::new::<sqlx::Sqlite>()?
         .run(&mut *conn, &evento::migrator::Plan::apply_all())
         .await?;
+    drop(conn);
 
     let executor: evento::Sqlite = pool.into();
 
@@ -226,14 +227,14 @@ async fn main() -> anyhow::Result<()> {
             name: "Alice".to_string(),
             email: "alice@example.com".to_string(),
         })
-        .metadata(&Metadata::default())
         .commit(&executor)
         .await?;
 
     // Load the user via projection
-    let user = Projection::<_, UserView>::new::<User>(&user_id)
+    let user = Projection::<_, UserView>::new::<User>()
         .handler(on_user_created())
         .handler(on_email_changed())
+        .load(&user_id)
         .execute(&executor)
         .await?;
 
@@ -241,13 +242,12 @@ async fn main() -> anyhow::Result<()> {
         println!("Loaded user: {} ({})", user.name, user.email);
     }
 
-    // Update the user
-    evento::aggregator(&user_id)
+    // Update the user (version 1 -> 2)
+    evento::append(&user_id)
         .original_version(1)
         .event(&UserEmailChanged {
             email: "alice.doe@example.com".to_string(),
         })
-        .metadata(&Metadata::default())
         .commit(&executor)
         .await?;
 
@@ -280,15 +280,29 @@ evento = { version = "2", features = ["fjall"] }
 ## Key Concepts
 
 - **Events**: Immutable facts that represent something that happened
-- **Aggregators**: Domain objects that group related events
+- **Aggregates**: Domain entities whose state is the fold of their events
 - **Projections**: Read models built by replaying events
-- **Handlers**: Functions that react to events and can trigger side effects
+- **Handlers**: Functions that react to events (pure for projections, side-effecting for subscriptions)
 - **Subscriptions**: Continuous processing of events with cursor tracking
 - **CQRS**: Command Query Responsibility Segregation pattern support
 
+## Core API at a Glance
+
+| Concern | Entry point |
+|---------|-------------|
+| Define events | `#[evento::aggregate] enum` |
+| Start a new aggregate | `evento::create()` → `WriteBuilder` |
+| Append to an aggregate | `evento::append(id)` → `WriteBuilder` |
+| Load a read model | `Projection::new::<A>().handler(..).load(id).execute(exec)` |
+| Filter events when reading | `EventFilter::by_type / by_id / by_event / exact` |
+| Continuous processing | `SubscriptionBuilder::new(key)...start(exec)` |
+| One-shot processing | `SubscriptionBuilder::new(key)...run_once(exec)` |
+| Fail on unhandled events | `.strict()` |
+| Keep going after a handler error | `.continue_on_error()` |
+
 ## Features
 
-- `macro` - Enable procedural macros for aggregators and handlers (default)
+- `macro` - Enable procedural macros for aggregates and handlers (default)
 - `sql` - Enable all SQL database backends
 - `sqlite` - SQLite support with automatic migrations
 - `postgres` - PostgreSQL support with automatic migrations
@@ -302,7 +316,8 @@ evento = { version = "2", features = ["fjall"] }
 See the `examples/` directory for complete working examples:
 
 - `examples/bank/` - Bank account domain model with commands, queries, and projections
-- `examples/bank-axum-sqlite/` - Integration with Axum web framework and SQLite
+- `examples/bank-axum-sqlite/` - Integration with the Axum web framework and SQLite
+- `examples/bank-axum-fjall/` - Integration with the Axum web framework and embedded Fjall storage
 
 ## License
 

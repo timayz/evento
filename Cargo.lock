@@ -777,6 +777,8 @@ dependencies = [
 name = "evento"
 version = "2.0.0-alpha.20"
 dependencies = [
+ "anyhow",
+ "bitcode",
  "evento-core",
  "evento-fjall",
  "evento-sql",
@@ -864,9 +866,11 @@ version = "2.0.0-alpha.20"
 dependencies = [
  "anyhow",
  "bank",
+ "bitcode",
  "evento",
  "once_cell",
  "rand 0.10.1",
+ "tokio",
  "ulid",
 ]
 

@@ -132,3 +132,45 @@ async fn mysql_backward_desc() -> anyhow::Result<()> {
 
     pool::backward_desc(pool).await
 }
+
+#[tokio::test]
+async fn mysql_read_order_timestamp() -> anyhow::Result<()> {
+    let executor = create_mysql_executor("read_order_timestamp").await?;
+    evento_test::read_order_timestamp(&executor).await
+}
+
+#[tokio::test]
+async fn mysql_exact_filter() -> anyhow::Result<()> {
+    let executor = create_mysql_executor("exact_filter").await?;
+    evento_test::exact_filter(&executor).await
+}
+
+#[tokio::test]
+async fn mysql_concurrent_append() -> anyhow::Result<()> {
+    let executor = create_mysql_executor("concurrent_append").await?;
+    evento_test::concurrent_append(&executor).await
+}
+
+#[tokio::test]
+async fn mysql_strict_unhandled() -> anyhow::Result<()> {
+    let executor = create_mysql_executor("strict_unhandled").await?;
+    evento_test::strict_unhandled(&executor).await
+}
+
+#[tokio::test]
+async fn mysql_tombstone() -> anyhow::Result<()> {
+    let executor = create_mysql_executor("tombstone").await?;
+    evento_test::tombstone(&executor).await
+}
+
+#[tokio::test]
+async fn mysql_subscription_all_counts() -> anyhow::Result<()> {
+    let executor = create_mysql_executor("subscription_all_counts").await?;
+    evento_test::subscription_all_counts(&executor).await
+}
+
+#[tokio::test]
+async fn mysql_snapshot_revision_scope() -> anyhow::Result<()> {
+    let executor = create_mysql_executor("snapshot_revision_scope").await?;
+    evento_test::snapshot_revision_scope(&executor).await
+}

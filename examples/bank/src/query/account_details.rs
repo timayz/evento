@@ -26,7 +26,7 @@ pub fn create_projection<E: Executor>() -> Projection<E, AccountDetailsView> {
         .handler(handle_money_received())
         .handler(handle_money_withdrawn())
         .handler(handle_money_transferred())
-        .handler(handle_overdraf_limit_changed())
+        .handler(handle_overdraft_limit_changed())
         .handler(handle_daily_withdrawal_limit_changed())
         .handler(handle_account_closed())
         .handler(handle_account_frozen())
@@ -41,7 +41,7 @@ pub async fn load<E: Executor>(
 ) -> Result<Option<AccountDetailsView>, anyhow::Error> {
     create_projection()
         .load(account_id)
-        .aggregator::<Owner>(owner_id)
+        .aggregate::<Owner>(owner_id)
         .execute(executor)
         .await
 }
@@ -91,7 +91,7 @@ async fn handle_account_opened(
     event: Event<AccountOpened>,
     row: &mut AccountDetailsView,
 ) -> anyhow::Result<()> {
-    row.id = event.aggregator_id.to_owned();
+    row.id = event.aggregate_id.to_owned();
     row.owner_id = event.data.owner_id;
     row.owner_name = event.data.owner_name;
     row.account_type = event.data.account_type;
@@ -159,7 +159,7 @@ async fn handle_daily_withdrawal_limit_changed(
 }
 
 #[evento::handler]
-async fn handle_overdraf_limit_changed(
+async fn handle_overdraft_limit_changed(
     event: Event<OverdraftLimitChanged>,
     row: &mut AccountDetailsView,
 ) -> anyhow::Result<()> {

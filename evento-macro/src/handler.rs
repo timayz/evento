@@ -15,7 +15,7 @@ pub fn handler_next_impl(input: &ItemFn, debug: bool) -> syn::Result<TokenStream
     })?;
     let (event_full_type, event_inner_type) = extract_type_with_first_generic(event_arg)?;
 
-    // Second param: Action<'_, AccountBalanceView, E>
+    // Second param: the projection reference, e.g. `&mut AccountBalanceView`
     let action_arg = params.next().ok_or_else(|| {
         Error::new_spanned(
             &input.sig,
@@ -53,13 +53,13 @@ pub fn handler_next_impl(input: &ItemFn, debug: bool) -> syn::Result<TokenStream
             }
 
             fn event_name(&self) -> &'static str {
-                use ::evento::AggregatorEvent as _;
+                use ::evento::AggregateEvent as _;
                 #event_inner_type::event_name()
             }
 
-            fn aggregator_type(&self) -> &'static str {
-                use ::evento::Aggregator as _;
-                #event_inner_type::aggregator_type()
+            fn aggregate_type(&self) -> &'static str {
+                use ::evento::Aggregate as _;
+                #event_inner_type::aggregate_type()
             }
         }
     };
@@ -123,7 +123,7 @@ fn extract_type_with_first_generic(arg: &FnArg) -> syn::Result<(&Type, &TypePath
     Ok((ty.as_ref(), inner))
 }
 
-// Extract `AccountBalanceView` from `Action<'_, AccountBalanceView, E>`
+// Extract `AccountBalanceView` from `&mut AccountBalanceView`
 fn extract_projection_type(arg: &FnArg) -> syn::Result<&Type> {
     let FnArg::Typed(PatType { ty, .. }) = arg else {
         return Err(Error::new_spanned(arg, "expected typed argument"));

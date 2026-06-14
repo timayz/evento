@@ -17,7 +17,7 @@ use ulid::Ulid;
 
 use evento_core::{
     cursor::{self, Args, Cursor, Edge, PageInfo, ReadResult, Value},
-    Executor, ReadAggregator, WriteError,
+    EventFilter, Executor, WriteError,
 };
 
 /// Column identifiers for the `event` table.
@@ -64,9 +64,9 @@ pub enum Event {
 
 /// Column identifiers for the `snapshot` table.
 ///
-/// Used with sea-query for type-safe SQL query construction.
-///
-/// **Note:** The snapshot table is dropped in migration M0003 and is no longer used.
+/// Used with sea-query for type-safe SQL query construction. The snapshot table
+/// backs projection snapshots via [`Executor::get_snapshot`], [`Executor::save_snapshot`],
+/// and [`Executor::delete_snapshot`].
 #[derive(Iden)]
 pub enum Snapshot {
     /// The table name: `snapshot`
@@ -223,7 +223,7 @@ where
 {
     async fn read(
         &self,
-        aggregators: Option<Vec<ReadAggregator>>,
+        aggregators: Option<Vec<EventFilter>>,
         routing_key: Option<evento_core::RoutingKey>,
         args: Args,
     ) -> anyhow::Result<ReadResult<evento_core::Event>> {
@@ -252,9 +252,9 @@ where
 
                     for aggregator in aggregators {
                         let mut aggregator_cond = Cond::all()
-                            .add(Expr::col(Event::AggregatorType).eq(aggregator.aggregator_type));
+                            .add(Expr::col(Event::AggregatorType).eq(aggregator.aggregate_type));
 
-                        if let Some(id) = aggregator.aggregator_id {
+                        if let Some(id) = aggregator.aggregate_id {
                             aggregator_cond =
                                 aggregator_cond.add(Expr::col(Event::AggregatorId).eq(id));
                         }
@@ -295,7 +295,7 @@ where
 
     async fn latest_timestamp(
         &self,
-        aggregators: Option<Vec<ReadAggregator>>,
+        aggregators: Option<Vec<EventFilter>>,
         routing_key: Option<evento_core::RoutingKey>,
     ) -> anyhow::Result<u64> {
         let statement = Query::select()
@@ -312,9 +312,9 @@ where
 
                     for aggregator in aggregators {
                         let mut aggregator_cond = Cond::all()
-                            .add(Expr::col(Event::AggregatorType).eq(aggregator.aggregator_type));
+                            .add(Expr::col(Event::AggregatorType).eq(aggregator.aggregate_type));
 
-                        if let Some(id) = aggregator.aggregator_id {
+                        if let Some(id) = aggregator.aggregate_id {
                             aggregator_cond =
                                 aggregator_cond.add(Expr::col(Event::AggregatorId).eq(id));
                         }
@@ -443,8 +443,8 @@ where
                 event.name.into(),
                 event.data.into(),
                 metadata.into(),
-                event.aggregator_type.into(),
-                event.aggregator_id.into(),
+                event.aggregate_type.into(),
+                event.aggregate_id.into(),
                 event.version.into(),
                 event.routing_key.into(),
                 event.timestamp.into(),
@@ -496,16 +496,16 @@ where
 
     async fn get_snapshot(
         &self,
-        aggregator_type: String,
-        aggregator_revision: String,
+        aggregate_type: String,
+        aggregate_revision: String,
         id: String,
     ) -> anyhow::Result<Option<(Vec<u8>, Value)>> {
         let statement = Query::select()
             .columns([Snapshot::Data, Snapshot::Cursor])
             .from(Snapshot::Table)
-            .and_where(Expr::col(Snapshot::Type).eq(Expr::value(aggregator_type)))
+            .and_where(Expr::col(Snapshot::Type).eq(Expr::value(aggregate_type)))
             .and_where(Expr::col(Snapshot::Id).eq(Expr::value(id)))
-            .and_where(Expr::col(Snapshot::Revision).eq(Expr::value(aggregator_revision)))
+            .and_where(Expr::col(Snapshot::Revision).eq(Expr::value(aggregate_revision)))
             .limit(1)
             .to_owned();
 
@@ -522,8 +522,8 @@ where
 
     async fn save_snapshot(
         &self,
-        aggregator_type: String,
-        aggregator_revision: String,
+        aggregate_type: String,
+        aggregate_revision: String,
         id: String,
         data: Vec<u8>,
         cursor: Value,
@@ -538,10 +538,10 @@ where
                 Snapshot::Data,
             ])
             .values_panic([
-                aggregator_type.into(),
+                aggregate_type.into(),
                 id.to_string().into(),
                 cursor.to_string().into(),
-                aggregator_revision.into(),
+                aggregate_revision.into(),
                 data.into(),
             ])
             .on_conflict(
@@ -561,10 +561,10 @@ where
         Ok(())
     }
 
-    async fn delete_snapshot(&self, aggregator_type: String, id: String) -> anyhow::Result<()> {
+    async fn delete_snapshot(&self, aggregate_type: String, id: String) -> anyhow::Result<()> {
         let statement = Query::delete()
             .from_table(Snapshot::Table)
-            .and_where(Expr::col(Snapshot::Type).eq(Expr::value(aggregator_type)))
+            .and_where(Expr::col(Snapshot::Type).eq(Expr::value(aggregate_type)))
             .and_where(Expr::col(Snapshot::Id).eq(Expr::value(id)))
             .to_owned();
 
@@ -803,11 +803,11 @@ impl Reader {
     {
         let is_order_desc = self.is_order_desc();
         let cursor = O::deserialize_cursor(cursor)?;
-        let colums = B::columns().into_iter().rev();
+        let columns = B::columns().into_iter().rev();
         let values = B::values(cursor).into_iter().rev();
 
         let mut expr = None::<Expr>;
-        for (col, value) in colums.zip(values) {
+        for (col, value) in columns.zip(values) {
             let current_expr = if is_order_desc {
                 Expr::col(col.clone()).lt(value.clone())
             } else {
@@ -834,8 +834,8 @@ impl Reader {
             sea_query::Order::Asc
         };
 
-        let colums = O::columns();
-        for col in colums {
+        let columns = O::columns();
+        for col in columns {
             self.order_by(col, order.clone());
         }
     }
@@ -998,8 +998,8 @@ where
         Ok(SqlEvent(evento_core::Event {
             id: Ulid::from_string(sqlx::Row::try_get(row, "id")?)
                 .map_err(|err| sqlx::Error::InvalidArgument(err.to_string()))?,
-            aggregator_id: sqlx::Row::try_get(row, "aggregator_id")?,
-            aggregator_type: sqlx::Row::try_get(row, "aggregator_type")?,
+            aggregate_id: sqlx::Row::try_get(row, "aggregator_id")?,
+            aggregate_type: sqlx::Row::try_get(row, "aggregator_type")?,
             version: version as u16,
             name: sqlx::Row::try_get(row, "name")?,
             routing_key: sqlx::Row::try_get(row, "routing_key")?,

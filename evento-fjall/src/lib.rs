@@ -14,10 +14,10 @@
 //!
 //! ```rust,ignore
 //! use evento_fjall::Fjall;
-//! use evento_core::{Executor, metadata::Metadata, cursor::Args, ReadAggregator};
+//! use evento_core::{Executor, metadata::Metadata, cursor::Args, EventFilter};
 //!
 //! // Define events using an enum
-//! #[evento::aggregator]
+//! #[evento::aggregate]
 //! pub enum User {
 //!     UserCreated { name: String },
 //! }
@@ -34,7 +34,7 @@
 //!
 //! // Query events
 //! let events = executor.read(
-//!     Some(vec![ReadAggregator::id("user/User", &id)]),
+//!     Some(vec![EventFilter::by_id("user/User", &id)]),
 //!     None,
 //!     Args::forward(10, None),
 //! ).await?;
@@ -46,17 +46,19 @@
 //!
 //! - `events` - Primary storage: `ULID -> Event`
 //! - `agg_index` - Aggregate index: `{type}\0{id}\0{version}` -> `ULID`
+//! - `agg_name_index` - Aggregate-name index: `{type}\0{id}\0{name}\0{ULID}` -> `()`
 //! - `routing_index` - Routing key index: `{routing_key}\0{ULID}` -> `()`
 //! - `type_index` - Event type index: `{type}\0{name}\0{ULID}` -> `()`
 //! - `subscribers` - Subscription state: `{key}` -> `SubscriberState`
 //! - `snapshots` - Aggregate snapshots: `{type}\0{id}` -> `StoredSnapshot`
 
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use evento_core::{
     cursor::{Args, ReadResult, Value},
     metadata::Metadata,
-    Event, Executor, ReadAggregator, RoutingKey, WriteError,
+    Event, EventFilter, Executor, RoutingKey, WriteError,
 };
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 use ulid::Ulid;
@@ -81,8 +83,8 @@ struct StoredSnapshot {
 #[derive(Debug, Clone, bitcode::Encode, bitcode::Decode)]
 struct StoredEvent {
     id: String,
-    aggregator_id: String,
-    aggregator_type: String,
+    aggregate_id: String,
+    aggregate_type: String,
     version: u16,
     name: String,
     routing_key: Option<String>,
@@ -96,8 +98,8 @@ impl From<&Event> for StoredEvent {
     fn from(event: &Event) -> Self {
         Self {
             id: event.id.to_string(),
-            aggregator_id: event.aggregator_id.clone(),
-            aggregator_type: event.aggregator_type.clone(),
+            aggregate_id: event.aggregate_id.clone(),
+            aggregate_type: event.aggregate_type.clone(),
             version: event.version,
             name: event.name.clone(),
             routing_key: event.routing_key.clone(),
@@ -115,8 +117,8 @@ impl TryFrom<StoredEvent> for Event {
     fn try_from(stored: StoredEvent) -> Result<Self, Self::Error> {
         Ok(Self {
             id: Ulid::from_string(&stored.id)?,
-            aggregator_id: stored.aggregator_id,
-            aggregator_type: stored.aggregator_type,
+            aggregate_id: stored.aggregate_id,
+            aggregate_type: stored.aggregate_type,
             version: stored.version,
             name: stored.name,
             routing_key: stored.routing_key,
@@ -151,10 +153,15 @@ pub struct Fjall {
     db: Database,
     events: Keyspace,
     agg_index: Keyspace,
+    agg_name_index: Keyspace,
     routing_index: Keyspace,
     type_index: Keyspace,
     subscribers: Keyspace,
     snapshots: Keyspace,
+    /// Serializes the read-validate-write critical section of `write` so that
+    /// concurrent appends cannot both pass the optimistic version check (the
+    /// version is read non-atomically before the batch commits).
+    write_lock: Arc<Mutex<()>>,
 }
 
 impl Clone for Fjall {
@@ -163,10 +170,12 @@ impl Clone for Fjall {
             db: self.db.clone(),
             events: self.events.clone(),
             agg_index: self.agg_index.clone(),
+            agg_name_index: self.agg_name_index.clone(),
             routing_index: self.routing_index.clone(),
             type_index: self.type_index.clone(),
             subscribers: self.subscribers.clone(),
             snapshots: self.snapshots.clone(),
+            write_lock: self.write_lock.clone(),
         }
     }
 }
@@ -200,10 +209,12 @@ impl Fjall {
         Ok(Self {
             events: db.keyspace("events", KeyspaceCreateOptions::default)?,
             agg_index: db.keyspace("agg_index", KeyspaceCreateOptions::default)?,
+            agg_name_index: db.keyspace("agg_name_index", KeyspaceCreateOptions::default)?,
             routing_index: db.keyspace("routing_index", KeyspaceCreateOptions::default)?,
             type_index: db.keyspace("type_index", KeyspaceCreateOptions::default)?,
             subscribers: db.keyspace("subscribers", KeyspaceCreateOptions::default)?,
             snapshots: db.keyspace("snapshots", KeyspaceCreateOptions::default)?,
+            write_lock: Arc::new(Mutex::new(())),
             db,
         })
     }
@@ -223,27 +234,40 @@ impl Fjall {
     }
 
     /// Builds the aggregate index key.
-    fn agg_key(aggregator_type: &str, aggregator_id: &str, version: u16) -> Vec<u8> {
-        let mut key = format!("{}\x00{}\x00", aggregator_type, aggregator_id).into_bytes();
+    fn agg_key(aggregate_type: &str, aggregate_id: &str, version: u16) -> Vec<u8> {
+        let mut key = format!("{}\x00{}\x00", aggregate_type, aggregate_id).into_bytes();
         key.extend_from_slice(&version.to_be_bytes());
         key
     }
 
     /// Builds the aggregate index prefix (without version).
-    fn agg_prefix(aggregator_type: &str, aggregator_id: &str) -> String {
-        format!("{}\x00{}\x00", aggregator_type, aggregator_id)
+    fn agg_prefix(aggregate_type: &str, aggregate_id: &str) -> String {
+        format!("{}\x00{}\x00", aggregate_type, aggregate_id)
+    }
+
+    /// Builds the aggregate-name index key: `{type}\0{id}\0{name}\0{ULID}`.
+    fn agg_name_key(aggregate_type: &str, aggregate_id: &str, name: &str, id: &Ulid) -> Vec<u8> {
+        let mut key =
+            format!("{}\x00{}\x00{}\x00", aggregate_type, aggregate_id, name).into_bytes();
+        key.extend_from_slice(&id.to_bytes());
+        key
+    }
+
+    /// Builds the aggregate-name index prefix: `{type}\0{id}\0{name}\0`.
+    fn agg_name_prefix(aggregate_type: &str, aggregate_id: &str, name: &str) -> String {
+        format!("{}\x00{}\x00{}\x00", aggregate_type, aggregate_id, name)
     }
 
     /// Builds the type index key.
-    fn type_key(aggregator_type: &str, name: &str, id: &Ulid) -> Vec<u8> {
-        let mut key = format!("{}\x00{}\x00", aggregator_type, name).into_bytes();
+    fn type_key(aggregate_type: &str, name: &str, id: &Ulid) -> Vec<u8> {
+        let mut key = format!("{}\x00{}\x00", aggregate_type, name).into_bytes();
         key.extend_from_slice(&id.to_bytes());
         key
     }
 
     /// Builds the type index prefix.
-    fn type_prefix(aggregator_type: &str, name: &str) -> String {
-        format!("{}\x00{}\x00", aggregator_type, name)
+    fn type_prefix(aggregate_type: &str, name: &str) -> String {
+        format!("{}\x00{}\x00", aggregate_type, name)
     }
 
     /// Builds the routing index key.
@@ -259,17 +283,17 @@ impl Fjall {
     }
 
     /// Builds the snapshot key.
-    fn snapshot_key(aggregator_type: &str, id: &str) -> Vec<u8> {
-        format!("{}\x00{}", aggregator_type, id).into_bytes()
+    fn snapshot_key(aggregate_type: &str, id: &str) -> Vec<u8> {
+        format!("{}\x00{}", aggregate_type, id).into_bytes()
     }
 
     /// Gets the last version for an aggregate.
     fn get_last_version(
         &self,
-        aggregator_type: &str,
-        aggregator_id: &str,
+        aggregate_type: &str,
+        aggregate_id: &str,
     ) -> anyhow::Result<Option<u16>> {
-        let prefix = Self::agg_prefix(aggregator_type, aggregator_id);
+        let prefix = Self::agg_prefix(aggregate_type, aggregate_id);
 
         if let Some(guard) = self.agg_index.prefix(&prefix).next_back() {
             let (key, _) = guard.into_inner()?;
@@ -299,7 +323,7 @@ impl Fjall {
     /// Collects event IDs matching the given filters.
     fn collect_event_ids(
         &self,
-        aggregators: &Option<Vec<ReadAggregator>>,
+        aggregators: &Option<Vec<EventFilter>>,
         routing_key: &Option<RoutingKey>,
     ) -> anyhow::Result<Vec<Ulid>> {
         use std::collections::HashSet;
@@ -319,26 +343,25 @@ impl Fjall {
             // Query by specific aggregator ID and optionally event name
             (Some(aggs), _) => {
                 for agg in aggs {
-                    match (&agg.aggregator_id, &agg.name) {
-                        // Specific aggregate ID with event name filter
+                    match (&agg.aggregate_id, &agg.name) {
+                        // Specific aggregate ID with event name filter.
+                        // The agg_name_index stores the ULID in the key tail, so we
+                        // can resolve matches by prefix scan without loading events.
                         (Some(id), Some(name)) => {
-                            let prefix = Self::agg_prefix(&agg.aggregator_type, id);
-                            for guard in self.agg_index.prefix(&prefix) {
-                                let (_, value) = guard.into_inner()?;
-                                let ulid_bytes: [u8; 16] = value.as_ref().try_into()?;
-                                let ulid = Ulid::from_bytes(ulid_bytes);
-
-                                // Check if event matches name filter
-                                if let Some(event) = self.load_event(&ulid)? {
-                                    if &event.name == name {
-                                        add_unique!(ulid);
-                                    }
+                            let prefix = Self::agg_name_prefix(&agg.aggregate_type, id, name);
+                            for guard in self.agg_name_index.prefix(&prefix) {
+                                let (key, _) = guard.into_inner()?;
+                                let key_bytes = key.as_ref();
+                                if key_bytes.len() >= 16 {
+                                    let ulid_bytes: [u8; 16] =
+                                        key_bytes[key_bytes.len() - 16..].try_into()?;
+                                    add_unique!(Ulid::from_bytes(ulid_bytes));
                                 }
                             }
                         }
                         // Specific aggregate ID, all events
                         (Some(id), None) => {
-                            let prefix = Self::agg_prefix(&agg.aggregator_type, id);
+                            let prefix = Self::agg_prefix(&agg.aggregate_type, id);
                             for guard in self.agg_index.prefix(&prefix) {
                                 let (_, value) = guard.into_inner()?;
                                 let ulid_bytes: [u8; 16] = value.as_ref().try_into()?;
@@ -347,7 +370,7 @@ impl Fjall {
                         }
                         // All aggregates of type, specific event name
                         (None, Some(name)) => {
-                            let prefix = Self::type_prefix(&agg.aggregator_type, name);
+                            let prefix = Self::type_prefix(&agg.aggregate_type, name);
                             for guard in self.type_index.prefix(&prefix) {
                                 let (key, _) = guard.into_inner()?;
                                 let key_bytes = key.as_ref();
@@ -360,7 +383,7 @@ impl Fjall {
                         }
                         // All events of aggregator type - scan all
                         (None, None) => {
-                            let prefix = format!("{}\x00", agg.aggregator_type);
+                            let prefix = format!("{}\x00", agg.aggregate_type);
                             for guard in self.agg_index.prefix(&prefix) {
                                 let (_, value) = guard.into_inner()?;
                                 let ulid_bytes: [u8; 16] = value.as_ref().try_into()?;
@@ -402,11 +425,26 @@ impl Executor for Fjall {
         let executor = self.clone();
 
         tokio::task::spawn_blocking(move || {
-            // Validate versions first (optimistic concurrency)
+            // Hold the write lock across validate + commit so concurrent appends
+            // cannot both observe the same "last version" and both succeed.
+            let _guard = executor
+                .write_lock
+                .lock()
+                .map_err(|_| WriteError::Unknown(anyhow::anyhow!("write lock poisoned")))?;
+
+            // Validate versions first (optimistic concurrency). `seen` tracks the
+            // version assigned earlier in THIS batch so multiple events for the same
+            // aggregate (e.g. a create() committing several events) validate correctly.
+            let mut seen: std::collections::HashMap<(String, String), u16> =
+                std::collections::HashMap::new();
             for event in &events {
-                let last_version = executor
-                    .get_last_version(&event.aggregator_type, &event.aggregator_id)
-                    .map_err(WriteError::Unknown)?;
+                let agg = (event.aggregate_type.clone(), event.aggregate_id.clone());
+                let last_version = match seen.get(&agg) {
+                    Some(v) => Some(*v),
+                    None => executor
+                        .get_last_version(&event.aggregate_type, &event.aggregate_id)
+                        .map_err(WriteError::Unknown)?,
+                };
 
                 match last_version {
                     Some(v) if event.version != v + 1 => {
@@ -417,6 +455,8 @@ impl Executor for Fjall {
                     }
                     _ => {}
                 }
+
+                seen.insert(agg, event.version);
             }
 
             // Write atomically using batch
@@ -432,11 +472,20 @@ impl Executor for Fjall {
 
                 // Aggregate index: {type}\0{id}\0{version} -> ULID
                 let agg_key =
-                    Fjall::agg_key(&event.aggregator_type, &event.aggregator_id, event.version);
+                    Fjall::agg_key(&event.aggregate_type, &event.aggregate_id, event.version);
                 batch.insert(&executor.agg_index, agg_key, id_bytes);
 
+                // Aggregate-name index: {type}\0{id}\0{name}\0{ULID} -> ()
+                let agg_name_key = Fjall::agg_name_key(
+                    &event.aggregate_type,
+                    &event.aggregate_id,
+                    &event.name,
+                    &event.id,
+                );
+                batch.insert(&executor.agg_name_index, agg_name_key, []);
+
                 // Type index: {type}\0{name}\0{ULID} -> ()
-                let type_key = Fjall::type_key(&event.aggregator_type, &event.name, &event.id);
+                let type_key = Fjall::type_key(&event.aggregate_type, &event.name, &event.id);
                 batch.insert(&executor.type_index, type_key, []);
 
                 // Routing index (if routing key exists): {routing}\0{ULID} -> ()
@@ -460,7 +509,7 @@ impl Executor for Fjall {
 
     async fn read(
         &self,
-        aggregators: Option<Vec<ReadAggregator>>,
+        aggregators: Option<Vec<EventFilter>>,
         routing_key: Option<RoutingKey>,
         args: Args,
     ) -> anyhow::Result<ReadResult<Event>> {
@@ -502,7 +551,7 @@ impl Executor for Fjall {
 
     async fn latest_timestamp(
         &self,
-        aggregators: Option<Vec<ReadAggregator>>,
+        aggregators: Option<Vec<EventFilter>>,
         routing_key: Option<RoutingKey>,
     ) -> anyhow::Result<u64> {
         let result = self
@@ -592,21 +641,21 @@ impl Executor for Fjall {
 
     async fn get_snapshot(
         &self,
-        aggregator_type: String,
-        aggregator_revision: String,
+        aggregate_type: String,
+        aggregate_revision: String,
         id: String,
     ) -> anyhow::Result<Option<(Vec<u8>, Value)>> {
         let executor = self.clone();
 
         tokio::task::spawn_blocking(move || {
-            let key = Fjall::snapshot_key(&aggregator_type, &id);
+            let key = Fjall::snapshot_key(&aggregate_type, &id);
             match executor.snapshots.get(&key)? {
                 Some(bytes) => {
                     let stored: StoredSnapshot = bitcode::decode(bytes.as_ref())
                         .map_err(|e| anyhow::anyhow!("Failed to deserialize snapshot: {}", e))?;
 
                     // Revision mismatch invalidates the snapshot (forces a rebuild).
-                    if stored.revision != aggregator_revision {
+                    if stored.revision != aggregate_revision {
                         return Ok(None);
                     }
 
@@ -620,8 +669,8 @@ impl Executor for Fjall {
 
     async fn save_snapshot(
         &self,
-        aggregator_type: String,
-        aggregator_revision: String,
+        aggregate_type: String,
+        aggregate_revision: String,
         id: String,
         data: Vec<u8>,
         cursor: Value,
@@ -629,9 +678,9 @@ impl Executor for Fjall {
         let executor = self.clone();
 
         tokio::task::spawn_blocking(move || {
-            let key = Fjall::snapshot_key(&aggregator_type, &id);
+            let key = Fjall::snapshot_key(&aggregate_type, &id);
             let stored = StoredSnapshot {
-                revision: aggregator_revision,
+                revision: aggregate_revision,
                 data,
                 cursor: cursor.0,
             };
@@ -642,11 +691,11 @@ impl Executor for Fjall {
         .await?
     }
 
-    async fn delete_snapshot(&self, aggregator_type: String, id: String) -> anyhow::Result<()> {
+    async fn delete_snapshot(&self, aggregate_type: String, id: String) -> anyhow::Result<()> {
         let executor = self.clone();
 
         tokio::task::spawn_blocking(move || {
-            let key = Fjall::snapshot_key(&aggregator_type, &id);
+            let key = Fjall::snapshot_key(&aggregate_type, &id);
             executor.snapshots.remove(key)?;
             Ok(())
         })
@@ -672,12 +721,12 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn create_test_event(aggregator_id: &str, version: u16, name: &str) -> Event {
+    fn create_test_event(aggregate_id: &str, version: u16, name: &str) -> Event {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
         Event {
             id: Ulid::new(),
-            aggregator_id: aggregator_id.to_string(),
-            aggregator_type: "test/Account".to_string(),
+            aggregate_id: aggregate_id.to_string(),
+            aggregate_type: "test/Account".to_string(),
             version,
             name: name.to_string(),
             routing_key: Some("test-routing".to_string()),
@@ -703,7 +752,7 @@ mod tests {
         // Read all events
         let result = executor
             .read(
-                Some(vec![ReadAggregator::id("test/Account", "agg-1")]),
+                Some(vec![EventFilter::by_id("test/Account", "agg-1")]),
                 None,
                 Args::forward(10, None),
             )
@@ -773,7 +822,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let executor = Fjall::open(temp_dir.path()).unwrap();
 
-        let aggregator_type = "test/Account".to_string();
+        let aggregate_type = "test/Account".to_string();
         let revision = "1".to_string();
         let id = "agg-1".to_string();
         let data = vec![10, 20, 30];
@@ -781,7 +830,7 @@ mod tests {
 
         // Initially: no snapshot
         let result = executor
-            .get_snapshot(aggregator_type.clone(), revision.clone(), id.clone())
+            .get_snapshot(aggregate_type.clone(), revision.clone(), id.clone())
             .await
             .unwrap();
         assert!(result.is_none());
@@ -789,7 +838,7 @@ mod tests {
         // Save snapshot
         executor
             .save_snapshot(
-                aggregator_type.clone(),
+                aggregate_type.clone(),
                 revision.clone(),
                 id.clone(),
                 data.clone(),
@@ -800,7 +849,7 @@ mod tests {
 
         // Get matching revision returns the snapshot
         let (got_data, got_cursor) = executor
-            .get_snapshot(aggregator_type.clone(), revision.clone(), id.clone())
+            .get_snapshot(aggregate_type.clone(), revision.clone(), id.clone())
             .await
             .unwrap()
             .expect("snapshot should exist");
@@ -809,7 +858,7 @@ mod tests {
 
         // Get with different revision returns None (revision invalidation)
         let result = executor
-            .get_snapshot(aggregator_type.clone(), "2".to_string(), id.clone())
+            .get_snapshot(aggregate_type.clone(), "2".to_string(), id.clone())
             .await
             .unwrap();
         assert!(result.is_none());
@@ -819,7 +868,7 @@ mod tests {
         let new_cursor = Value("cursor-2".to_string());
         executor
             .save_snapshot(
-                aggregator_type.clone(),
+                aggregate_type.clone(),
                 "2".to_string(),
                 id.clone(),
                 new_data.clone(),
@@ -829,7 +878,7 @@ mod tests {
             .unwrap();
 
         let (got_data, got_cursor) = executor
-            .get_snapshot(aggregator_type.clone(), "2".to_string(), id.clone())
+            .get_snapshot(aggregate_type.clone(), "2".to_string(), id.clone())
             .await
             .unwrap()
             .expect("snapshot should exist");
@@ -838,12 +887,12 @@ mod tests {
 
         // Delete snapshot
         executor
-            .delete_snapshot(aggregator_type.clone(), id.clone())
+            .delete_snapshot(aggregate_type.clone(), id.clone())
             .await
             .unwrap();
 
         let result = executor
-            .get_snapshot(aggregator_type, "2".to_string(), id.clone())
+            .get_snapshot(aggregate_type, "2".to_string(), id.clone())
             .await
             .unwrap();
         assert!(result.is_none());
