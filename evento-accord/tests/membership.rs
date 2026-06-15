@@ -12,12 +12,13 @@
 //! layout) and keeps working after the original founders have left. Range movement
 //! is covered in `resharding.rs`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use evento_accord::{
     AppliedEntry, DataStore, DynamicTopology, HybridLogicalClock, InMemoryDataStore,
-    InMemoryJournal, InMemoryNetwork, Journal, MessageSink, Node, NodeId, Topology,
+    InMemoryJournal, InMemoryNetwork, Journal, MessageSink, Node, NodeId, RegionId, Topology,
 };
 use evento_core::Event;
 
@@ -615,4 +616,101 @@ async fn metadata_log_survives_restart() {
         abc_only,
         "and ends at the epoch-3 layout"
     );
+}
+
+/// One-way latency between two same-region nodes (a local hop).
+const INTRA: Duration = Duration::from_millis(1);
+/// One-way latency between regions — well above the 50 ms fast-path timeout.
+const CROSS: Duration = Duration::from_millis(200);
+
+/// `DynamicTopology` derives its fast-path electorate from the agreed layout +
+/// static region tags, so a region-local coordinator commits in one local
+/// round-trip — and the property **survives an epoch change** (the electorate is
+/// re-derived from the new layout, nothing extra crosses consensus).
+#[tokio::test(start_paused = true)]
+async fn dynamic_region_electorate_gives_a_local_fast_path_across_epochs() {
+    let ids: Vec<NodeId> = (0..5).map(NodeId).collect();
+    let net = InMemoryNetwork::new();
+    // Region A = {0,1,2}, Region B = {3,4}. The same map on every node.
+    let region_map: HashMap<NodeId, RegionId> = HashMap::from([
+        (NodeId(0), 0),
+        (NodeId(1), 0),
+        (NodeId(2), 0),
+        (NodeId(3), 1),
+        (NodeId(4), 1),
+    ]);
+    let shard = vec![ids.clone()];
+
+    let mut nodes = Vec::new();
+    let mut topos = Vec::new();
+    let mut loops = Vec::new();
+    for &id in &ids {
+        let inbox = net.register(id);
+        let clock = Arc::new(HybridLogicalClock::new(id));
+        let sink: Arc<dyn MessageSink> = Arc::new(net.sink(id));
+        let store = Arc::new(InMemoryDataStore::new());
+        let journal: Arc<dyn Journal> = Arc::new(InMemoryJournal::new());
+        let topology =
+            Arc::new(DynamicTopology::new(id, 0, shard.clone()).with_regions(region_map.clone()));
+        let node = Node::new(
+            id,
+            topology.clone() as Arc<dyn Topology>,
+            clock,
+            sink,
+            Arc::clone(&store) as Arc<dyn DataStore>,
+            journal,
+        );
+        loops.push(node.start(inbox));
+        loops.push(node.start_recovery());
+        topos.push(topology);
+        nodes.push(node);
+    }
+
+    // Latency matrix: cheap within a region, expensive across.
+    for &a in &[0u64, 1, 2] {
+        for &b in &[3u64, 4] {
+            net.set_link_latency(NodeId(a), NodeId(b), CROSS);
+        }
+    }
+    net.set_link_latency(NodeId(0), NodeId(1), INTRA);
+    net.set_link_latency(NodeId(0), NodeId(2), INTRA);
+    net.set_link_latency(NodeId(1), NodeId(2), INTRA);
+    net.set_link_latency(NodeId(3), NodeId(4), INTRA);
+
+    // Region-A coordinator: the derived electorate {0,1,2} forms a fast quorum
+    // over local links, so it commits well before a region-B reply could arrive.
+    let start = tokio::time::Instant::now();
+    nodes[0]
+        .write(vec![event("acc", 1, "Opened")])
+        .await
+        .expect("write commits");
+    assert!(
+        start.elapsed() < Duration::from_millis(50),
+        "epoch 0: expected a local fast path, took {:?}",
+        start.elapsed()
+    );
+    assert_eq!(nodes[0].metrics().fast_path, 1, "epoch 0 fast path");
+
+    // Bump the epoch (config-Paxos commits a new layout). The electorate is a pure
+    // function of the installed layout, so it re-derives to {0,1,2} again.
+    nodes[0]
+        .change_topology(1, vec![ids.clone()])
+        .await
+        .expect("epoch change commits");
+    for t in &topos {
+        await_epoch(t, 1).await;
+    }
+
+    // A region-A write still takes the local fast path after the epoch change.
+    let start = tokio::time::Instant::now();
+    nodes[0]
+        .write(vec![event("acc", 2, "Bumped")])
+        .await
+        .expect("post-epoch write commits");
+    assert!(
+        start.elapsed() < Duration::from_millis(50),
+        "epoch 1: expected a local fast path, took {:?}",
+        start.elapsed()
+    );
+    assert_eq!(nodes[0].metrics().fast_path, 2, "epoch 1 fast path persists");
 }

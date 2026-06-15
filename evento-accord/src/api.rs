@@ -488,6 +488,11 @@ impl Topology for ShardedTopology {
 pub struct DynamicTopology {
     this: NodeId,
     state: Mutex<DynamicState>,
+    /// Optional node → region map for region-aware routing and the region-derived
+    /// fast-path electorate (empty ⇒ no regions ⇒ the classic whole-set fast path).
+    /// Static cluster config — the operator supplies the **same** map to every node,
+    /// so all nodes derive the identical electorate from the identical layout.
+    regions: std::collections::HashMap<NodeId, RegionId>,
 }
 
 struct DynamicState {
@@ -502,13 +507,62 @@ impl DynamicTopology {
         Self {
             this,
             state: Mutex::new(DynamicState { epoch, shards }),
+            regions: std::collections::HashMap::new(),
         }
+    }
+
+    /// Tags nodes with regions, enabling region-aware read routing and the
+    /// **region-derived fast-path electorate** (a node absent from the map has no
+    /// region). The map must be identical on every node.
+    pub fn with_regions(mut self, regions: std::collections::HashMap<NodeId, RegionId>) -> Self {
+        self.regions = regions;
+        self
     }
 
     fn shard_index(shards: &[Vec<NodeId>], key: &Key) -> ShardId {
         let mut hasher = DefaultHasher::new();
         key.0.hash(&mut hasher);
         (hasher.finish() as usize) % shards.len()
+    }
+
+    /// Derives shard `idx`'s fast-path electorate from the layout + region tags:
+    /// the **largest in-region group** of that shard's replicas (ties break to the
+    /// lowest [`RegionId`], so every node — holding the same layout + map — derives
+    /// the same set). Used iff that group has size in `[f+1, N]` (a recovery-sound
+    /// electorate; `== N` when one region holds the shard, i.e. no shrink);
+    /// otherwise (no regions, or the largest region is below `f+1`) the whole shard.
+    fn electorate_for(
+        shards: &[Vec<NodeId>],
+        idx: usize,
+        regions: &std::collections::HashMap<NodeId, RegionId>,
+    ) -> Vec<NodeId> {
+        let replicas = &shards[idx];
+        if regions.is_empty() {
+            return replicas.clone();
+        }
+        let f = replicas.len().saturating_sub(1) / 2;
+        // Distinct regions present among the replicas, ascending so a size tie
+        // resolves to the lowest RegionId (the `<=` keeps the incumbent).
+        let mut present: Vec<RegionId> =
+            replicas.iter().filter_map(|n| regions.get(n).copied()).collect();
+        present.sort_unstable();
+        present.dedup();
+        let mut best: Option<(RegionId, usize)> = None;
+        for &r in &present {
+            let count = replicas.iter().filter(|n| regions.get(n) == Some(&r)).count();
+            if best.is_none_or(|(_, bc)| count > bc) {
+                best = Some((r, count));
+            }
+        }
+        match best {
+            // `count > f` ≡ `count >= f + 1`: the recovery-sound lower bound.
+            Some((r, count)) if count > f => replicas
+                .iter()
+                .copied()
+                .filter(|n| regions.get(n) == Some(&r))
+                .collect(),
+            _ => replicas.clone(),
+        }
     }
 }
 
@@ -537,15 +591,22 @@ impl Topology for DynamicTopology {
         state.shards[Self::shard_index(&state.shards, key)].clone()
     }
 
-    // Note: `fast_electorate` uses the trait default (the whole replica set), so
-    // the fast quorum is the classic `⌈3f/2⌉ + 1`.
-    // TODO (Phase D follow-up): replicate a per-shard electorate through the
-    // metadata log so a shrunk, region-favouring electorate survives epoch changes.
+    /// The **region-derived** electorate for `key`'s shard (see
+    /// [`electorate_for`](DynamicTopology::electorate_for)). A pure function of the
+    /// installed layout + region tags, so it is recomputed correctly after every
+    /// epoch change with no extra state crossing consensus.
+    fn fast_electorate(&self, key: &Key) -> Vec<NodeId> {
+        let state = self.state.lock().expect("topology poisoned");
+        let idx = Self::shard_index(&state.shards, key);
+        Self::electorate_for(&state.shards, idx, &self.regions)
+    }
+
     fn fast_quorum(&self, key: &Key) -> usize {
         let state = self.state.lock().expect("topology poisoned");
-        let n = state.shards[Self::shard_index(&state.shards, key)].len();
-        let f = n.saturating_sub(1) / 2;
-        fast_quorum_size(n, f)
+        let idx = Self::shard_index(&state.shards, key);
+        let f = state.shards[idx].len().saturating_sub(1) / 2;
+        let e = Self::electorate_for(&state.shards, idx, &self.regions).len();
+        fast_quorum_size(e, f)
     }
 
     fn slow_quorum(&self, key: &Key) -> usize {
@@ -566,6 +627,10 @@ impl Topology for DynamicTopology {
             .shards
             .iter()
             .position(|shard| shard.contains(&node))
+    }
+
+    fn region(&self, node: NodeId) -> Option<RegionId> {
+        self.regions.get(&node).copied()
     }
 
     /// Atomically replaces the layout with a later `epoch`. Ignored if `epoch`
@@ -691,5 +756,75 @@ mod tests {
         assert_eq!(topo.fast_electorate(&k0).len(), 2);
         assert_eq!(topo.fast_quorum(&k0), 2);
         assert_eq!(topo.fast_quorum(&k1), 3);
+    }
+
+    fn regions(pairs: &[(u64, RegionId)]) -> std::collections::HashMap<NodeId, RegionId> {
+        pairs.iter().map(|&(n, r)| (NodeId(n), r)).collect()
+    }
+
+    #[test]
+    fn dynamic_electorate_is_region_derived() {
+        let k = Key("x".into());
+        let five = vec![vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3), NodeId(4)]];
+
+        // (a) No regions ⇒ whole shard ⇒ classic fast quorum (N=5,f=2 ⇒ 4).
+        let plain = DynamicTopology::new(NodeId(0), 0, five.clone());
+        assert_eq!(plain.fast_electorate(&k).len(), 5);
+        assert_eq!(plain.fast_quorum(&k), 4);
+
+        // (b) A={0,1,2}, B={3,4} ⇒ electorate {0,1,2}, fast=(3+2)/2+1=3.
+        let split = DynamicTopology::new(NodeId(0), 0, five.clone())
+            .with_regions(regions(&[(0, 0), (1, 0), (2, 0), (3, 1), (4, 1)]));
+        assert_eq!(
+            split.fast_electorate(&k),
+            vec![NodeId(0), NodeId(1), NodeId(2)]
+        );
+        assert_eq!(split.fast_quorum(&k), 3);
+
+        // (e) All in one region ⇒ e == N, no shrink (whole shard, classic quorum).
+        let one = DynamicTopology::new(NodeId(0), 0, five.clone())
+            .with_regions(regions(&[(0, 7), (1, 7), (2, 7), (3, 7), (4, 7)]));
+        assert_eq!(one.fast_electorate(&k).len(), 5);
+        assert_eq!(one.fast_quorum(&k), 4);
+
+        // (d) Largest tagged region below f+1 (=3) ⇒ whole-shard fallback.
+        let tiny = DynamicTopology::new(NodeId(0), 0, five)
+            .with_regions(regions(&[(0, 0), (1, 0), (2, 1)])); // 3,4 untagged
+        assert_eq!(tiny.fast_electorate(&k).len(), 5);
+        assert_eq!(tiny.fast_quorum(&k), 4);
+    }
+
+    #[test]
+    fn dynamic_electorate_tie_breaks_to_lowest_region() {
+        // N=4 (f=1): two equal regions of 2. The lower RegionId must win on every
+        // node so the derived electorate is identical cluster-wide.
+        let k = Key("x".into());
+        let shard = vec![vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3)]];
+        let topo = DynamicTopology::new(NodeId(0), 0, shard)
+            .with_regions(regions(&[(0, 5), (1, 5), (2, 2), (3, 2)]));
+        // Region 2 (the lower id) wins the tie ⇒ electorate {2,3}; f=1 ⇒ fast=2.
+        assert_eq!(topo.fast_electorate(&k), vec![NodeId(2), NodeId(3)]);
+        assert_eq!(topo.fast_quorum(&k), 2);
+    }
+
+    #[test]
+    fn dynamic_electorate_survives_an_epoch_change() {
+        // The electorate is a pure function of the installed layout, so an epoch
+        // change re-derives it from the new layout — no extra state needed.
+        let k = Key("x".into());
+        let topo = DynamicTopology::new(
+            NodeId(0),
+            0,
+            vec![vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3), NodeId(4)]],
+        )
+        .with_regions(regions(&[(0, 0), (1, 0), (2, 0), (3, 1), (4, 1)]));
+        // Epoch 0: N=5, electorate {0,1,2}, fast=3.
+        assert_eq!(topo.fast_quorum(&k), 3);
+
+        // Epoch 1: shard becomes {0,1,3} — region 0 holds {0,1}, region 1 {3}.
+        // N=3, f=1; largest region {0,1} (e=2 ≥ f+1) ⇒ electorate {0,1}, fast=2.
+        topo.install(1, vec![vec![NodeId(0), NodeId(1), NodeId(3)]]);
+        assert_eq!(topo.fast_electorate(&k), vec![NodeId(0), NodeId(1)]);
+        assert_eq!(topo.fast_quorum(&k), 2);
     }
 }

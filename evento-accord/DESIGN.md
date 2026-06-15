@@ -254,8 +254,9 @@ node-join bootstrap with buffer-replay, node leave, Paxos-backed epoch changes
 that survive a coordinator crash (acceptor set tracks current membership), and
 range movement (re-sharding), and multi-shard executor read routing, plus an opt-in
 linearizable-read **read-index** barrier (`NodeConfig.linearizable_reads`), and a
-region-favouring **fast-path electorate** (Phase D). **94 tests**
-(39 unit, 6 cluster, 5 electorate, 3 multi-shard, 9 membership, 1 resharding, 6 executor,
+region-favouring **fast-path electorate** (Phase D, including a region-derived
+electorate on `DynamicTopology`). **98 tests**
+(42 unit, 6 cluster, 5 electorate, 3 multi-shard, 10 membership, 1 resharding, 6 executor,
 1 linearizable-stress, 1 shard-executor, 2 TCP, 2 mTLS, 13 simulation, 3 restart,
 3 fjall-journal), clippy clean,
 stable across repeated runs (the simulation suite is deterministic — see Phase A).
@@ -507,8 +508,18 @@ backend (sql/fjall). Phases, in order:
         geography; plus the recovery-quorum gate and idempotent double-recovery
         under a shrunk electorate. The deterministic partition oracle also runs
         under a shrunk electorate (`safety_holds_under_partitions_with_a_shrunk_electorate`,
-        20 seeds). *Deferred follow-up:* propagating a per-shard electorate through
-        `DynamicTopology` / the metadata log so it survives epoch changes.
+        20 seeds). **`DynamicTopology` electorate:** rather than threading an explicit
+        electorate through config-Paxos / the metadata log, the dynamic topology
+        derives it **from the agreed layout + static region tags**
+        (`DynamicTopology::with_regions`): each shard's electorate is the largest
+        in-region group of its replicas (lowest-`RegionId` tie-break), used when its
+        size is in `[f+1, N]` and the whole shard otherwise. Since every node holds
+        the same layout and region map, all nodes derive the identical electorate —
+        so **nothing extra crosses consensus or the wire** (no format-version bump),
+        and it is recomputed correctly after every epoch change. A latency-model
+        integration test (`tests/membership.rs`) shows a region-local coordinator
+        commits on the fast path and that the property survives a `change_topology`
+        epoch bump.
 
 - **Phase E — Production readiness.** 🚧 *In progress.* The items that make it
   safe to run, not just correct in a lab. **Five of the six items are done; PKI/cert
