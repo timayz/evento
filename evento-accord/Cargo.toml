@@ -33,8 +33,9 @@ sea-query-sqlx = { workspace = true, optional = true }
 # parity with `FjallJournal`. Off by default so the consensus core stays lean.
 sql = ["dep:sqlx", "dep:sea-query", "dep:sea-query-sqlx", "sqlx/runtime-tokio"]
 sqlite = ["sql", "sea-query/backend-sqlite", "sea-query-sqlx/sqlx-sqlite", "sqlx/sqlite"]
-mysql = ["sql", "sea-query/backend-mysql", "sea-query-sqlx/sqlx-mysql", "sqlx/mysql"]
-postgres = ["sql", "sea-query/backend-postgres", "sea-query-sqlx/sqlx-postgres", "sqlx/postgres"]
+# `sqlx/migrate` is for the integration tests' per-scenario `create_database`.
+mysql = ["sql", "sea-query/backend-mysql", "sea-query-sqlx/sqlx-mysql", "sqlx/mysql", "sqlx/mysql-rsa", "sqlx/migrate"]
+postgres = ["sql", "sea-query/backend-postgres", "sea-query-sqlx/sqlx-postgres", "sqlx/postgres", "sqlx/migrate"]
 
 [dev-dependencies]
 # test-util adds the paused-clock runtime (start_paused) the deterministic
@@ -53,3 +54,11 @@ harness = false
 [[test]]
 name = "sql_journal"
 required-features = ["sqlite"]
+
+[[test]]
+name = "sql_journal_postgres"
+required-features = ["postgres"]
+
+[[test]]
+name = "sql_journal_mysql"
+required-features = ["mysql"]

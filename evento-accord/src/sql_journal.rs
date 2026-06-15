@@ -342,7 +342,14 @@ where
             .into_table(AccordMetadataLog::Table)
             .columns([AccordMetadataLog::Epoch, AccordMetadataLog::Layout])
             .values_panic([(epoch as i64).into(), value.into()])
-            .on_conflict(OnConflict::column(AccordMetadataLog::Epoch).do_nothing().to_owned())
+            // `do_nothing_on` (not bare `do_nothing`) so MySQL emits a valid
+            // `ON DUPLICATE KEY UPDATE epoch = epoch` no-op rather than the invalid
+            // `ON DUPLICATE KEY IGNORE`; Postgres/SQLite still render `DO NOTHING`.
+            .on_conflict(
+                OnConflict::column(AccordMetadataLog::Epoch)
+                    .do_nothing_on([AccordMetadataLog::Epoch])
+                    .to_owned(),
+            )
             .to_owned();
         let (sql, values) = Self::build_sqlx(&statement);
         sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)

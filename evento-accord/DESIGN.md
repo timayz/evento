@@ -325,9 +325,14 @@ backend (sql/fjall). Phases, in order:
   so a deployment already on SQL keeps its consensus state in the **same database** as
   its events. It shares the tagged-bitcode format with the fjall journal, group-commits
   a staged batch in one transaction, and uses an order-preserving `TxnId` key so
-  `truncate` is a single range `DELETE`; `tests/sql_journal.rs` (`--features sqlite`)
-  proves round-trip of every record type, truncation, batching, and close/reopen
-  durability. The schema is managed the canonical way — through **`evento-sql-migrator`**
+  `truncate` is a single range `DELETE`. It is **integration-tested on all three
+  backends** — round-trip of every record type, truncation, group-commit batching, and
+  reopen/reconnect durability run against SQLite *and* live MySQL + PostgreSQL
+  (`tests/sql_journal{,_postgres,_mysql}.rs`, shared scenarios, gated by the
+  `sqlite`/`postgres`/`mysql` features; servers via the repo's `make up`). The
+  MySQL run already paid off — it caught a real dialect bug (sea-query's bare
+  `do_nothing` emits an invalid `ON DUPLICATE KEY IGNORE`; fixed with `do_nothing_on`).
+  The schema is managed the canonical way — through **`evento-sql-migrator`**
   (opt-in `accord` feature: a versioned, reversible migration registered in `new()`),
   so an operator runs one migrator for both their event schema and the consensus
   journal; `SqlJournal::migrate` is the equivalent self-contained convenience for
