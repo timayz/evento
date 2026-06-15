@@ -1605,11 +1605,17 @@ async fn sweep_for_bugs() {
         }
         // Full chaos + convergence measurement.
         let a = run_adversarial(seed).await;
-        assert!(a.safety.is_none(), "adversarial seed {seed}: {:?}", a.safety);
+        assert!(
+            a.safety.is_none(),
+            "adversarial seed {seed}: {:?}",
+            a.safety
+        );
         assert!(a.converged, "adversarial seed {seed}: did not converge");
         // Partitions — default electorate and the shrunk {0,1,2} electorate.
-        for (label, e) in [("partition", None), ("partition+electorate", Some(electorate.clone()))]
-        {
+        for (label, e) in [
+            ("partition", None),
+            ("partition+electorate", Some(electorate.clone())),
+        ] {
             let p = run_partition(seed, e).await;
             assert!(p.safety.is_none(), "{label} seed {seed}: {:?}", p.safety);
             assert!(p.converged, "{label} seed {seed}: did not converge");
@@ -1629,11 +1635,17 @@ async fn sweep_for_bugs() {
         let probe = run_churn(seed).await;
         let max_epoch = *probe.per_node_epoch.iter().max().unwrap();
         for (node, &e) in probe.per_node_epoch.iter().enumerate() {
-            assert_eq!(e, max_epoch, "churn seed {seed}: node {node} stuck at epoch {e}/{max_epoch}");
+            assert_eq!(
+                e, max_epoch,
+                "churn seed {seed}: node {node} stuck at epoch {e}/{max_epoch}"
+            );
         }
         let first = &probe.per_node_committed[0];
         for (node, set) in probe.per_node_committed.iter().enumerate() {
-            assert_eq!(set, first, "churn seed {seed}: node {node} committed-set diverged");
+            assert_eq!(
+                set, first,
+                "churn seed {seed}: node {node} committed-set diverged"
+            );
         }
         let mut seen = std::collections::HashSet::new();
         for (agg, ver, committed) in &probe.history {
