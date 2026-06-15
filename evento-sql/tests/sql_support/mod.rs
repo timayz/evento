@@ -71,14 +71,31 @@ where
     let loaded = journal.load(b.txn).await.unwrap().unwrap();
     assert_eq!(loaded.execute_at, b.execute_at);
     journal.record(&command(200, 2)).await.unwrap();
-    assert_eq!(journal.load_all().await.unwrap().len(), 2, "re-record upserts");
+    assert_eq!(
+        journal.load_all().await.unwrap().len(),
+        2,
+        "re-record upserts"
+    );
 
-    journal.append_metadata(2, &layout(&[0, 1, 2, 3])).await.unwrap();
-    journal.append_metadata(1, &layout(&[0, 1, 2])).await.unwrap();
-    journal.append_metadata(1, &layout(&[9, 9, 9])).await.unwrap(); // ignored
+    journal
+        .append_metadata(2, &layout(&[0, 1, 2, 3]))
+        .await
+        .unwrap();
+    journal
+        .append_metadata(1, &layout(&[0, 1, 2]))
+        .await
+        .unwrap();
+    journal
+        .append_metadata(1, &layout(&[9, 9, 9]))
+        .await
+        .unwrap(); // ignored
     let entries = journal.load_metadata().await.unwrap();
     assert_eq!(entries.len(), 2);
-    assert_eq!(entries[0], (1, layout(&[0, 1, 2])), "first layout wins, ascending");
+    assert_eq!(
+        entries[0],
+        (1, layout(&[0, 1, 2])),
+        "first layout wins, ascending"
+    );
     assert_eq!(entries[1].0, 2);
 
     journal

@@ -45,5 +45,9 @@ async fn accord_journal_migration_applies_and_reverts() {
     assert_eq!(count_tables(&pool).await, 4, "all accord tables created");
 
     migrator.run(&mut *conn, &Plan::revert_all()).await.unwrap();
-    assert_eq!(count_tables(&pool).await, 0, "all accord tables dropped on revert");
+    assert_eq!(
+        count_tables(&pool).await,
+        0,
+        "all accord tables dropped on revert"
+    );
 }

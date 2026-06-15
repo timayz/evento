@@ -65,7 +65,10 @@ fn authenticated_node(
 }
 
 /// Whether the presented chain's leaf matches the `expected` pinned certificate.
-fn leaf_matches(presented: Option<&[CertificateDer<'_>]>, expected: &CertificateDer<'static>) -> bool {
+fn leaf_matches(
+    presented: Option<&[CertificateDer<'_>]>,
+    expected: &CertificateDer<'static>,
+) -> bool {
     presented
         .and_then(|c| c.first())
         .is_some_and(|leaf| leaf.as_ref() == expected.as_ref())

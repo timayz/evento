@@ -194,7 +194,9 @@ where
         ];
         for table in &tables {
             let sql = Self::build_ddl(table);
-            sqlx::raw_sql(sqlx::AssertSqlSafe(sql)).execute(&self.pool).await?;
+            sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+                .execute(&self.pool)
+                .await?;
         }
         Ok(())
     }
@@ -294,9 +296,10 @@ where
             .and_where(Expr::col(AccordMeta::K).eq(Expr::value(WATERMARK_KEY)))
             .to_owned();
         let (sql, values) = Self::build_sqlx(&statement);
-        let row = sqlx::query_as_with::<DB, (Vec<u8>,), _>(sqlx::AssertSqlSafe(sql.as_str()), values)
-            .fetch_optional(&self.pool)
-            .await?;
+        let row =
+            sqlx::query_as_with::<DB, (Vec<u8>,), _>(sqlx::AssertSqlSafe(sql.as_str()), values)
+                .fetch_optional(&self.pool)
+                .await?;
         match row {
             Some((bytes,)) => Ok(Some(decode_tagged(RecordKind::Watermark, &bytes)?)),
             None => Ok(None),
@@ -310,9 +313,10 @@ where
             .and_where(Expr::col(AccordCommands::Txn).eq(Expr::value(txn_key(txn))))
             .to_owned();
         let (sql, values) = Self::build_sqlx(&statement);
-        let row = sqlx::query_as_with::<DB, (Vec<u8>,), _>(sqlx::AssertSqlSafe(sql.as_str()), values)
-            .fetch_optional(&self.pool)
-            .await?;
+        let row =
+            sqlx::query_as_with::<DB, (Vec<u8>,), _>(sqlx::AssertSqlSafe(sql.as_str()), values)
+                .fetch_optional(&self.pool)
+                .await?;
         match row {
             Some((bytes,)) => Ok(Some(decode_tagged(RecordKind::Command, &bytes)?)),
             None => Ok(None),
@@ -325,9 +329,10 @@ where
             .from(AccordCommands::Table)
             .to_owned();
         let (sql, values) = Self::build_sqlx(&statement);
-        let rows = sqlx::query_as_with::<DB, (Vec<u8>,), _>(sqlx::AssertSqlSafe(sql.as_str()), values)
-            .fetch_all(&self.pool)
-            .await?;
+        let rows =
+            sqlx::query_as_with::<DB, (Vec<u8>,), _>(sqlx::AssertSqlSafe(sql.as_str()), values)
+                .fetch_all(&self.pool)
+                .await?;
         rows.into_iter()
             .map(|(bytes,)| decode_tagged(RecordKind::Command, &bytes))
             .collect()
@@ -368,7 +373,12 @@ where
                 .fetch_all(&self.pool)
                 .await?;
         rows.into_iter()
-            .map(|(epoch, bytes)| Ok((epoch as u64, decode_tagged(RecordKind::MetadataEntry, &bytes)?)))
+            .map(|(epoch, bytes)| {
+                Ok((
+                    epoch as u64,
+                    decode_tagged(RecordKind::MetadataEntry, &bytes)?,
+                ))
+            })
             .collect()
     }
 
@@ -403,7 +413,12 @@ where
                 .fetch_all(&self.pool)
                 .await?;
         rows.into_iter()
-            .map(|(epoch, bytes)| Ok((epoch as u64, decode_tagged(RecordKind::AcceptorState, &bytes)?)))
+            .map(|(epoch, bytes)| {
+                Ok((
+                    epoch as u64,
+                    decode_tagged(RecordKind::AcceptorState, &bytes)?,
+                ))
+            })
             .collect()
     }
 }

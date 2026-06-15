@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use evento_accord::{
     serve_tls_verified, DataStore, HybridLogicalClock, InMemoryDataStore, InMemoryJournal, Journal,
-    Message, MessageSink, Node, NodeId, PeerCerts, StaticTopology, TcpTransport, TlsClient,
-    Timestamp, TxnId,
+    Message, MessageSink, Node, NodeId, PeerCerts, StaticTopology, TcpTransport, Timestamp,
+    TlsClient, TxnId,
 };
 use evento_core::Event;
 use tokio::net::TcpListener;
@@ -299,7 +299,12 @@ async fn an_unpinned_outsider_is_refused_while_a_pinned_peer_is_served() {
     let addr = listener.local_addr().unwrap();
 
     let (inbox_tx, inbox_rx) = mpsc::channel(1024);
-    let _serve = serve_tls_verified(listener, inbox_tx, tls.nodes[0].acceptor.clone(), tls.pins.clone());
+    let _serve = serve_tls_verified(
+        listener,
+        inbox_tx,
+        tls.nodes[0].acceptor.clone(),
+        tls.pins.clone(),
+    );
 
     let node = Node::new(
         NodeId(0),
@@ -318,7 +323,8 @@ async fn an_unpinned_outsider_is_refused_while_a_pinned_peer_is_served() {
     let outsider = TcpTransport::with_tls(
         NodeId(1),
         peers.clone(),
-        TlsClient::new(tls.outsider.clone(), tls.server_name.clone()).with_peer_certs(tls.pins.clone()),
+        TlsClient::new(tls.outsider.clone(), tls.server_name.clone())
+            .with_peer_certs(tls.pins.clone()),
     );
     for n in 0..5 {
         outsider.send(NodeId(0), applied_msg(n)).await.unwrap();

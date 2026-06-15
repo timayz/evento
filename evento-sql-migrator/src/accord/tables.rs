@@ -2,7 +2,7 @@
 
 use sea_query::{ColumnDef, Table, TableCreateStatement, TableDropStatement};
 
-use super::{AccordAcceptors, AccordCommands, AccordMetadataLog, AccordMeta};
+use super::{AccordAcceptors, AccordCommands, AccordMeta, AccordMetadataLog};
 
 pub struct Operation;
 
@@ -72,7 +72,10 @@ fn down_statements() -> Vec<TableDropStatement> {
 #[cfg(feature = "sqlite")]
 #[async_trait::async_trait]
 impl sqlx_migrator::Operation<sqlx::Sqlite> for Operation {
-    async fn up(&self, connection: &mut sqlx::SqliteConnection) -> Result<(), sqlx_migrator::Error> {
+    async fn up(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+    ) -> Result<(), sqlx_migrator::Error> {
         for statement in up_statements() {
             let sql = statement.to_string(sea_query::SqliteQueryBuilder);
             sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
@@ -109,7 +112,10 @@ impl sqlx_migrator::Operation<sqlx::MySql> for Operation {
         Ok(())
     }
 
-    async fn down(&self, connection: &mut sqlx::MySqlConnection) -> Result<(), sqlx_migrator::Error> {
+    async fn down(
+        &self,
+        connection: &mut sqlx::MySqlConnection,
+    ) -> Result<(), sqlx_migrator::Error> {
         for statement in down_statements() {
             let sql = statement.to_string(sea_query::MysqlQueryBuilder);
             sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))

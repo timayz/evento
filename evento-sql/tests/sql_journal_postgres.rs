@@ -51,7 +51,11 @@ async fn survives_reconnect() {
     // Reconnect a brand-new pool to the same database (tables already migrated).
     let journal = SqlJournal::new(PgPool::connect(&format!("{BASE}/{name}")).await.unwrap());
     let all = journal.load_all().await.unwrap();
-    assert_eq!(all.len(), 1, "consensus state is durable across a reconnect");
+    assert_eq!(
+        all.len(),
+        1,
+        "consensus state is durable across a reconnect"
+    );
     assert_eq!(all[0].txn, b.txn);
     assert_eq!(
         journal.load_watermark().await.unwrap(),

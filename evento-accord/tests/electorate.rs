@@ -78,8 +78,7 @@ impl Cluster {
     fn set_two_region_latency(&self, region_a: &[u64], region_b: &[u64]) {
         for &a in region_a {
             for &b in region_b {
-                self.net
-                    .set_link_latency(NodeId(a), NodeId(b), CROSS);
+                self.net.set_link_latency(NodeId(a), NodeId(b), CROSS);
             }
         }
         for region in [region_a, region_b] {
@@ -164,8 +163,16 @@ async fn without_an_electorate_a_geo_write_takes_the_slow_path() {
     let elapsed = start.elapsed();
 
     assert!(!outcome.conflict);
-    assert_eq!(cluster.nodes[0].metrics().fast_path, 0, "no local fast quorum");
-    assert_eq!(cluster.nodes[0].metrics().slow_path, 1, "fell back to slow path");
+    assert_eq!(
+        cluster.nodes[0].metrics().fast_path,
+        0,
+        "no local fast quorum"
+    );
+    assert_eq!(
+        cluster.nodes[0].metrics().slow_path,
+        1,
+        "fell back to slow path"
+    );
     assert!(
         elapsed >= Duration::from_millis(50),
         "the coordinator waited out the fast-path timeout (got {elapsed:?})"
@@ -231,7 +238,10 @@ async fn recovery_under_an_electorate_is_idempotent() {
         .expect("preaccept reached a quorum");
 
     let first = cluster.nodes[1].recover(txn).await.expect("first recovery");
-    let second = cluster.nodes[2].recover(txn).await.expect("second recovery");
+    let second = cluster.nodes[2]
+        .recover(txn)
+        .await
+        .expect("second recovery");
     assert_eq!(first.txn, second.txn);
     assert_eq!(
         first.conflict, second.conflict,

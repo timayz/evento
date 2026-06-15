@@ -530,7 +530,11 @@ async fn racing_operator_changes_converge() {
 
     for n in &nodes {
         await_epoch(&n.topology, 1).await;
-        assert_eq!(n.topology.nodes(), d1[0], "every node installs the chosen layout");
+        assert_eq!(
+            n.topology.nodes(),
+            d1[0],
+            "every node installs the chosen layout"
+        );
     }
 }
 
@@ -800,5 +804,9 @@ async fn dynamic_region_electorate_gives_a_local_fast_path_across_epochs() {
         "epoch 1: expected a local fast path, took {:?}",
         start.elapsed()
     );
-    assert_eq!(nodes[0].metrics().fast_path, 2, "epoch 1 fast path persists");
+    assert_eq!(
+        nodes[0].metrics().fast_path,
+        2,
+        "epoch 1 fast path persists"
+    );
 }

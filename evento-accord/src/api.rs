@@ -350,7 +350,9 @@ impl Topology for StaticTopology {
     }
 
     fn fast_electorate(&self, _key: &Key) -> Vec<NodeId> {
-        self.electorate.clone().unwrap_or_else(|| self.nodes.clone())
+        self.electorate
+            .clone()
+            .unwrap_or_else(|| self.nodes.clone())
     }
 
     fn fast_quorum(&self, key: &Key) -> usize {
@@ -543,13 +545,18 @@ impl DynamicTopology {
         let f = replicas.len().saturating_sub(1) / 2;
         // Distinct regions present among the replicas, ascending so a size tie
         // resolves to the lowest RegionId (the `<=` keeps the incumbent).
-        let mut present: Vec<RegionId> =
-            replicas.iter().filter_map(|n| regions.get(n).copied()).collect();
+        let mut present: Vec<RegionId> = replicas
+            .iter()
+            .filter_map(|n| regions.get(n).copied())
+            .collect();
         present.sort_unstable();
         present.dedup();
         let mut best: Option<(RegionId, usize)> = None;
         for &r in &present {
-            let count = replicas.iter().filter(|n| regions.get(n) == Some(&r)).count();
+            let count = replicas
+                .iter()
+                .filter(|n| regions.get(n) == Some(&r))
+                .count();
             if best.is_none_or(|(_, bc)| count > bc) {
                 best = Some((r, count));
             }
@@ -707,7 +714,11 @@ mod tests {
             // The smallest electorate (e=f+1) collapses fast to slow (f+1).
             let smallest = StaticTopology::new(NodeId(0), nodes.clone())
                 .with_fast_electorate(nodes[..f + 1].to_vec());
-            assert_eq!(smallest.fast_quorum(&k), f + 1, "e=f+1 ⇒ fast=slow for N={n}");
+            assert_eq!(
+                smallest.fast_quorum(&k),
+                f + 1,
+                "e=f+1 ⇒ fast=slow for N={n}"
+            );
         }
     }
 
@@ -723,8 +734,11 @@ mod tests {
     #[should_panic(expected = "not a replica")]
     fn electorate_with_a_non_replica_panics() {
         let nodes: Vec<NodeId> = (0..5).map(NodeId).collect();
-        StaticTopology::new(NodeId(0), nodes)
-            .with_fast_electorate(vec![NodeId(0), NodeId(1), NodeId(99)]);
+        StaticTopology::new(NodeId(0), nodes).with_fast_electorate(vec![
+            NodeId(0),
+            NodeId(1),
+            NodeId(99),
+        ]);
     }
 
     #[test]
@@ -773,8 +787,13 @@ mod tests {
         assert_eq!(plain.fast_quorum(&k), 4);
 
         // (b) A={0,1,2}, B={3,4} ⇒ electorate {0,1,2}, fast=(3+2)/2+1=3.
-        let split = DynamicTopology::new(NodeId(0), 0, five.clone())
-            .with_regions(regions(&[(0, 0), (1, 0), (2, 0), (3, 1), (4, 1)]));
+        let split = DynamicTopology::new(NodeId(0), 0, five.clone()).with_regions(regions(&[
+            (0, 0),
+            (1, 0),
+            (2, 0),
+            (3, 1),
+            (4, 1),
+        ]));
         assert_eq!(
             split.fast_electorate(&k),
             vec![NodeId(0), NodeId(1), NodeId(2)]
@@ -782,14 +801,22 @@ mod tests {
         assert_eq!(split.fast_quorum(&k), 3);
 
         // (e) All in one region ⇒ e == N, no shrink (whole shard, classic quorum).
-        let one = DynamicTopology::new(NodeId(0), 0, five.clone())
-            .with_regions(regions(&[(0, 7), (1, 7), (2, 7), (3, 7), (4, 7)]));
+        let one = DynamicTopology::new(NodeId(0), 0, five.clone()).with_regions(regions(&[
+            (0, 7),
+            (1, 7),
+            (2, 7),
+            (3, 7),
+            (4, 7),
+        ]));
         assert_eq!(one.fast_electorate(&k).len(), 5);
         assert_eq!(one.fast_quorum(&k), 4);
 
         // (d) Largest tagged region below f+1 (=3) ⇒ whole-shard fallback.
-        let tiny = DynamicTopology::new(NodeId(0), 0, five)
-            .with_regions(regions(&[(0, 0), (1, 0), (2, 1)])); // 3,4 untagged
+        let tiny = DynamicTopology::new(NodeId(0), 0, five).with_regions(regions(&[
+            (0, 0),
+            (1, 0),
+            (2, 1),
+        ])); // 3,4 untagged
         assert_eq!(tiny.fast_electorate(&k).len(), 5);
         assert_eq!(tiny.fast_quorum(&k), 4);
     }
@@ -800,8 +827,12 @@ mod tests {
         // node so the derived electorate is identical cluster-wide.
         let k = Key("x".into());
         let shard = vec![vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3)]];
-        let topo = DynamicTopology::new(NodeId(0), 0, shard)
-            .with_regions(regions(&[(0, 5), (1, 5), (2, 2), (3, 2)]));
+        let topo = DynamicTopology::new(NodeId(0), 0, shard).with_regions(regions(&[
+            (0, 5),
+            (1, 5),
+            (2, 2),
+            (3, 2),
+        ]));
         // Region 2 (the lower id) wins the tie ⇒ electorate {2,3}; f=1 ⇒ fast=2.
         assert_eq!(topo.fast_electorate(&k), vec![NodeId(2), NodeId(3)]);
         assert_eq!(topo.fast_quorum(&k), 2);

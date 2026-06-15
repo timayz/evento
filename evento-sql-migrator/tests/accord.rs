@@ -37,10 +37,7 @@ async fn accord_journal_migration_applies_and_reverts() {
     let migrator = evento_sql_migrator::new::<Sqlite>().unwrap();
 
     // Apply everything (event schema + the accord journal migration).
-    migrator
-        .run(&mut *conn, &Plan::apply_all())
-        .await
-        .unwrap();
+    migrator.run(&mut *conn, &Plan::apply_all()).await.unwrap();
     for table in TABLES {
         assert!(
             table_exists(&mut conn, table).await,
@@ -49,10 +46,7 @@ async fn accord_journal_migration_applies_and_reverts() {
     }
 
     // Revert everything — the accord tables are dropped.
-    migrator
-        .run(&mut *conn, &Plan::revert_all())
-        .await
-        .unwrap();
+    migrator.run(&mut *conn, &Plan::revert_all()).await.unwrap();
     for table in TABLES {
         assert!(
             !table_exists(&mut conn, table).await,

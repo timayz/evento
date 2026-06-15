@@ -64,14 +64,21 @@ async fn survives_close_and_reopen() {
         let journal = at(temp.path()).await;
         journal.record(&a).await.unwrap();
         journal.record(&b).await.unwrap();
-        journal.append_metadata(1, &layout(&[0, 1, 2])).await.unwrap();
+        journal
+            .append_metadata(1, &layout(&[0, 1, 2]))
+            .await
+            .unwrap();
         journal.truncate(timestamp(150, 0)).await.unwrap(); // drops `a`, keeps `b`
         journal.close().await;
     }
 
     let journal = at(temp.path()).await;
     let all = journal.load_all().await.unwrap();
-    assert_eq!(all.len(), 1, "durable across restart, minus the truncated prefix");
+    assert_eq!(
+        all.len(),
+        1,
+        "durable across restart, minus the truncated prefix"
+    );
     assert_eq!(all[0].txn, b.txn);
     assert_eq!(
         journal.load_watermark().await.unwrap(),

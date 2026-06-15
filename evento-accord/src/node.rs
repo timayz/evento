@@ -1271,7 +1271,9 @@ impl Node {
         // (the latency win: a coordinator co-located with the electorate need not
         // wait for remote, non-electorate replicas), or at the fast-path timeout.
         let electorate_responders = |p: &ShardPlan, got: &[(NodeId, (Timestamp, Vec<TxnId>))]| {
-            got.iter().filter(|(from, _)| p.electorate.contains(from)).count()
+            got.iter()
+                .filter(|(from, _)| p.electorate.contains(from))
+                .count()
         };
         let pre = self
             .collect_by_shard_tagged(

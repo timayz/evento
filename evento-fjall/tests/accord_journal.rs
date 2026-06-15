@@ -4,7 +4,9 @@
 
 #![cfg(feature = "accord")]
 
-use evento_accord::{AcceptorRecord, Ballot, CommandState, Journal, Key, NodeId, Status, Timestamp, TxnId};
+use evento_accord::{
+    AcceptorRecord, Ballot, CommandState, Journal, Key, NodeId, Status, Timestamp, TxnId,
+};
 use evento_core::Event;
 use evento_fjall::FjallJournal;
 
@@ -118,8 +120,14 @@ async fn metadata_log_and_acceptor_state_survive_close_and_reopen() {
 
     {
         let journal = FjallJournal::open(temp.path()).unwrap();
-        journal.append_metadata(2, &layout(&[0, 1, 2, 3])).await.unwrap();
-        journal.append_metadata(1, &layout(&[0, 1, 2])).await.unwrap();
+        journal
+            .append_metadata(2, &layout(&[0, 1, 2, 3]))
+            .await
+            .unwrap();
+        journal
+            .append_metadata(1, &layout(&[0, 1, 2]))
+            .await
+            .unwrap();
         journal
             .record_acceptor(
                 2,
@@ -135,7 +143,11 @@ async fn metadata_log_and_acceptor_state_survive_close_and_reopen() {
     let journal = FjallJournal::open(temp.path()).unwrap();
 
     let entries = journal.load_metadata().await.unwrap();
-    assert_eq!(entries.len(), 2, "both metadata entries survived the restart");
+    assert_eq!(
+        entries.len(),
+        2,
+        "both metadata entries survived the restart"
+    );
     assert_eq!(entries[0].0, 1, "entries come back ascending by epoch");
     assert_eq!(entries[1].0, 2);
     assert_eq!(entries[1].1, layout(&[0, 1, 2, 3]));
