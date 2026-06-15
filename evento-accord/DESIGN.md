@@ -258,7 +258,7 @@ region-favouring **fast-path electorate** (Phase D, including a region-derived
 electorate on `DynamicTopology`). **101 tests**
 (42 unit, 6 cluster, 5 electorate, 3 multi-shard, 12 membership, 1 resharding, 6 executor,
 1 linearizable-stress, 1 shard-executor, 2 TCP, 3 mTLS, 13 simulation, 3 restart,
-3 fjall-journal), clippy clean,
+3 fjall-journal; plus 4 SQL-journal tests under `--features sqlite`), clippy clean,
 stable across repeated runs (the simulation suite is deterministic — see Phase A).
 The full M0–M5 roadmap plus elastic membership (M4) is implemented. **External
 verification has begun**: an independent Jepsen/Elle harness (`evento-accord/jepsen/`,
@@ -319,8 +319,15 @@ backend (sql/fjall). Phases, in order:
   cleanly and *while writes are in flight*. ✅ **Disk-backed journal:**
   `FjallJournal` (bitcode-serialized `CommandState`s in a fjall database) is a
   genuinely durable `Journal`; `tests/fjall_journal.rs` proves records survive a
-  full close/reopen (a real process restart). The `Journal` trait stays open, so a
-  sql-backed journal is a drop-in alternative. ✅ **Group-commit fsync:** the
+  full close/reopen (a real process restart). ✅ **SQL-backed journal:** `SqlJournal<DB>`
+  (behind the optional `sql` feature) is a drop-in `Journal` over `sqlx` + `sea-query`,
+  portable across **sqlite/mysql/postgres** exactly like `evento-sql`'s `Sql<DB>` —
+  so a deployment already on SQL keeps its consensus state in the **same database** as
+  its events. It shares the tagged-bitcode format with the fjall journal, group-commits
+  a staged batch in one transaction, and uses an order-preserving `TxnId` key so
+  `truncate` is a single range `DELETE`; `tests/sql_journal.rs` (`--features sqlite`)
+  proves round-trip of every record type, truncation, batching, and close/reopen
+  durability. ✅ **Group-commit fsync:** the
   `Journal` trait splits into `stage` (buffer a write) + `flush` (one fsync), and
   the node's inbox loop drains up to `MAX_JOURNAL_BATCH` queued messages, stages
   each, then flushes **once** — so a burst of consensus messages costs a single

@@ -23,6 +23,18 @@ tokio-util = { version = "0.7", features = ["codec"] }
 tokio-rustls = "0.26"
 bytes = "1"
 fjall.workspace = true
+# Optional SQL-backed Journal (consensus log on the same DB as evento-sql events).
+sqlx = { workspace = true, optional = true }
+sea-query = { workspace = true, optional = true }
+sea-query-sqlx = { workspace = true, optional = true }
+
+[features]
+# A SQL-backed `Journal` (durable consensus state on sqlite/mysql/postgres),
+# parity with `FjallJournal`. Off by default so the consensus core stays lean.
+sql = ["dep:sqlx", "dep:sea-query", "dep:sea-query-sqlx", "sqlx/runtime-tokio"]
+sqlite = ["sql", "sea-query/backend-sqlite", "sea-query-sqlx/sqlx-sqlite", "sqlx/sqlite"]
+mysql = ["sql", "sea-query/backend-mysql", "sea-query-sqlx/sqlx-mysql", "sqlx/mysql"]
+postgres = ["sql", "sea-query/backend-postgres", "sea-query-sqlx/sqlx-postgres", "sqlx/postgres"]
 
 [dev-dependencies]
 # test-util adds the paused-clock runtime (start_paused) the deterministic
@@ -37,3 +49,7 @@ criterion = "0.5"
 [[bench]]
 name = "throughput"
 harness = false
+
+[[test]]
+name = "sql_journal"
+required-features = ["sqlite"]

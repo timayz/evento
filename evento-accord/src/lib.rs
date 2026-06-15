@@ -34,6 +34,8 @@ pub mod message;
 pub mod metrics;
 pub mod node;
 pub mod replica;
+#[cfg(feature = "sql")]
+pub mod sql_journal;
 pub mod store;
 pub mod tcp;
 pub mod transport;
@@ -49,6 +51,8 @@ pub use fjall_journal::FjallJournal;
 pub use message::{CommandState, Key, Message, Status};
 pub use metrics::{Metrics, MetricsSnapshot};
 pub use node::{CommitOutcome, Node, NodeConfig};
+#[cfg(feature = "sql")]
+pub use sql_journal::SqlJournal;
 pub use store::{AppliedEntry, InMemoryDataStore, InMemoryJournal};
 pub use tcp::{serve, serve_tls, serve_tls_verified, PeerCerts, TcpTransport, TlsClient};
 pub use transport::{Envelope, InMemoryNetwork, InMemorySink};
