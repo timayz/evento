@@ -25,6 +25,11 @@ test.fjall:
 test.doc:
 	cargo test --doc -p evento
 
+# Independent, adversarial verification of evento-accord (Docker + Jepsen + Elle).
+# Requires Docker; everything else runs in containers. See evento-accord/jepsen.
+jepsen:
+	cd evento-accord/jepsen && ./run.sh
+
 fmt:
 	cargo fmt -- --emit files
 

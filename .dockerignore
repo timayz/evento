@@ -1,0 +1,8 @@
+# Keep the Docker build context small. The evento-accord Jepsen node image builds
+# the workspace from source; shipping target/ or VCS data would bloat the context.
+target/
+.git/
+evento-accord/jepsen/store/
+**/*.log
+# NOTE: do not ignore evento-accord/jepsen/docker/secret/ — the Dockerfiles COPY
+# the generated keypair from there into the images.

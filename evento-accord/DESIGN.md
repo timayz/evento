@@ -397,9 +397,26 @@ backend (sql/fjall). Phases, in order:
   **Phase D remaining (sign-off):**
   - [x] Observability — in-process metrics + `tracing`.
   - [x] Performance baseline — criterion latency/throughput benchmark.
-  - [ ] **External / adversarial verification — Jepsen suite.** The deterministic
-        sim is self-authored; consensus safety must survive an independent,
-        adversarial harness before it is trustworthy in production.
+  - [~] **External / adversarial verification — Jepsen suite.** 🚧 Harness built
+        (`evento-accord/jepsen/`): a self-contained Docker cluster (control + n1..n5)
+        runs the `jepsen-node` binary (`examples/jepsen-node`, a generic-API Accord
+        replica over real TCP + durable Fjall + `FjallJournal`) under an **Elle**
+        list-append workload — atomic multi-key appends + single-key reads — with a
+        network-partition nemesis. **First finding (partitions only):** with
+        `--consistency-model serializable` the history is **valid** (atomic multi-key
+        writes commit in one global order — no G0/G1c/lost-update; the consensus core
+        is sound under partitions), but `strict-serializable` (the default bar)
+        **fails** with a real-time read anomaly (`:G-single-item-realtime`): a read
+        served off a *lagging* replica returns state inconsistent with wall-clock
+        order, because local reads have **no linearizing barrier**. So writes are
+        serializable & atomic; **reads are not linearizable**. The nemesis set
+        (`--faults`, `jepsen.nemesis.combined`) now also drives **process kill** (incl.
+        all-nodes-down → journal-recovered restart) and **pause** (SIGSTOP/SIGCONT):
+        under `partition+kill+pause` the history stays **serializable**, confirming
+        write-path safety under compound faults. *Remaining:* clock-skew (off by
+        default — bumps the kernel clock, so it needs real VMs, not shared-kernel
+        Docker), then a linearizable read path (or an explicit weaker-reads contract)
+        before the box is checked.
   - [ ] **Independent expert review** of the protocol and implementation.
   - [ ] **Real-cluster soak + chaos** over days (kills, partitions, clock skew,
         disk pressure, slow disks/links) on actual hardware — zero production
@@ -432,11 +449,14 @@ implementation** — verified in a deterministic fault-injection simulation,
 durable, bounded, geo-hardened, observable, and benchmarked (Phases A–C complete,
 Phase D partial) — and a strong base to *take* to production. It is suitable for
 prototypes, demos, and controlled/low-stakes use. It is **not** yet safe for
-production: it has no external/adversarial verification (Jepsen), no independent
-review, no real-cluster soak mileage, an unoptimized throughput ceiling, and a
-stand-in membership/metadata layer. The gating items are the unchecked boxes in
-Phases D and E above, in roughly that order (verification and soak first). The
-crate version (`2.0.0-alpha.*`) reflects this.
+production: external/adversarial verification has only just begun (a Jepsen/Elle
+harness now exists and its first partition run already found that **reads are not
+linearizable** — writes are serializable & atomic, but a read off a lagging replica
+can break real-time order), and there is still no independent review, no real-cluster
+soak mileage, an unoptimized throughput ceiling, and a stand-in membership/metadata
+layer. The gating items are the unchecked boxes in Phases D and E above, in roughly
+that order (verification and soak first). The crate version (`2.0.0-alpha.*`)
+reflects this.
 
 The event-data path is already backend-agnostic (`AccordExecutor` runs on any
 `evento_core::Executor`); Phase B extends that to the consensus state.

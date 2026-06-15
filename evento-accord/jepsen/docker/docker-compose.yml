@@ -1,0 +1,39 @@
+name: evento-accord-jepsen
+
+networks:
+  jepsen:
+
+services:
+  n1: &node
+    build:
+      context: ../../..
+      dockerfile: evento-accord/jepsen/docker/Dockerfile.node
+    image: evento-accord-jepsen-node
+    networks: [jepsen]
+    # iptables-based partition nemesis needs network admin caps.
+    cap_add: [NET_ADMIN, NET_RAW]
+    hostname: n1
+  n2:
+    <<: *node
+    hostname: n2
+  n3:
+    <<: *node
+    hostname: n3
+  n4:
+    <<: *node
+    hostname: n4
+  n5:
+    <<: *node
+    hostname: n5
+
+  control:
+    build:
+      context: ../../..
+      dockerfile: evento-accord/jepsen/docker/Dockerfile.control
+    image: evento-accord-jepsen-control
+    networks: [jepsen]
+    depends_on: [n1, n2, n3, n4, n5]
+    # Live-mount the project so edits to the Clojure test don't need a rebuild
+    # (deps + the SSH key live outside this path in the image and survive).
+    volumes:
+      - ../:/jepsen
