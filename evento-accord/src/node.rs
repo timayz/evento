@@ -374,10 +374,21 @@ impl Node {
                         Err(_) => break,
                     }
                 }
-                let _ = node.journal.flush().await;
-                node.metrics.record_flush();
-                for (to, message) in sends {
-                    node.send(to, message).await;
+                // Only release the batch's durability-gated replies once the fsync
+                // succeeds. If the flush fails (e.g. a disk error), withhold them —
+                // a node that could not persist must not ack a decision as durable.
+                // Dropping the replies is exactly the message loss quorums/recovery
+                // already tolerate, so the cluster makes progress via durable peers.
+                if node.journal.flush().await.is_ok() {
+                    node.metrics.record_flush();
+                    for (to, message) in sends {
+                        node.send(to, message).await;
+                    }
+                } else {
+                    tracing::warn!(
+                        node = node.id.0,
+                        "journal flush failed; withholding durability-gated sends"
+                    );
                 }
             }
         })
@@ -671,10 +682,17 @@ impl Node {
     /// across a whole drained batch of messages.
     async fn handle(&self, env: Envelope) {
         let sends = self.handle_staged(env).await;
-        let _ = self.journal.flush().await;
-        self.metrics.record_flush();
-        for (to, message) in sends {
-            self.send(to, message).await;
+        // Withhold the durability-gated sends if the fsync failed (see `start`).
+        if self.journal.flush().await.is_ok() {
+            self.metrics.record_flush();
+            for (to, message) in sends {
+                self.send(to, message).await;
+            }
+        } else {
+            tracing::warn!(
+                node = self.id.0,
+                "journal flush failed; withholding durability-gated sends"
+            );
         }
     }
 
@@ -2457,6 +2475,36 @@ mod tests {
         }
     }
 
+    /// A [`Journal`] whose `flush` fails — models a node that cannot fsync (disk
+    /// error / full disk). `stage` still records so we can confirm the message was
+    /// processed; only the durability barrier fails.
+    #[derive(Default)]
+    struct FlakyJournal {
+        inner: InMemoryJournal,
+        stages: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Journal for FlakyJournal {
+        async fn record(&self, state: &CommandState) -> anyhow::Result<()> {
+            self.stage(state).await?;
+            self.flush().await
+        }
+        async fn stage(&self, state: &CommandState) -> anyhow::Result<()> {
+            self.stages.fetch_add(1, Ordering::SeqCst);
+            self.inner.record(state).await
+        }
+        async fn flush(&self) -> anyhow::Result<()> {
+            anyhow::bail!("simulated fsync failure")
+        }
+        async fn load(&self, txn: TxnId) -> anyhow::Result<Option<CommandState>> {
+            self.inner.load(txn).await
+        }
+        async fn load_all(&self) -> anyhow::Result<Vec<CommandState>> {
+            self.inner.load_all().await
+        }
+    }
+
     fn preaccept(i: u64) -> Message {
         let txn = TxnId(Timestamp {
             micros: i + 1,
@@ -2525,6 +2573,56 @@ mod tests {
             journal.flushes.load(Ordering::SeqCst),
             1,
             "the whole queued burst should cost exactly one group-commit flush"
+        );
+    }
+
+    /// Durability gate: if the journal `flush` (fsync) fails, the node must
+    /// **withhold** the batch's durability-gated replies — it processed the message
+    /// (staged it) but must not ack a decision it could not persist. The withheld
+    /// reply is just the loss quorums/recovery already tolerate.
+    #[tokio::test(start_paused = true)]
+    async fn flush_failure_withholds_the_durability_gated_ack() {
+        let node_id = NodeId(0);
+        let coord = NodeId(1);
+        let ids = vec![node_id, coord, NodeId(2)];
+        let net = InMemoryNetwork::new();
+        let inbox = net.register(node_id);
+        let mut coord_inbox = net.register(coord);
+        let journal = Arc::new(FlakyJournal::default());
+
+        let node = Node::new(
+            node_id,
+            Arc::new(StaticTopology::new(node_id, ids.clone())) as Arc<dyn Topology>,
+            Arc::new(HybridLogicalClock::new(node_id)),
+            Arc::new(net.sink(node_id)) as Arc<dyn MessageSink>,
+            Arc::new(InMemoryDataStore::new()) as Arc<dyn DataStore>,
+            Arc::clone(&journal) as Arc<dyn Journal>,
+        );
+        let _loop = node.start(inbox);
+
+        // The coordinator sends a PreAccept; normally the node replies PreAcceptOk
+        // once the record is durable.
+        net.sink(coord).send(node_id, preaccept(0)).await.unwrap();
+
+        // Wait until the node has processed (staged) it — so the flush was attempted.
+        for _ in 0..1000 {
+            if journal.stages.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            journal.stages.load(Ordering::SeqCst),
+            1,
+            "the message was processed and its record staged"
+        );
+        // Give the loop ample opportunity to (not) send the reply.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            coord_inbox.try_recv().is_err(),
+            "a failed fsync must withhold the durability-gated PreAcceptOk"
         );
     }
 

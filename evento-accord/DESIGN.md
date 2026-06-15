@@ -255,8 +255,8 @@ that survive a coordinator crash (acceptor set tracks current membership), and
 range movement (re-sharding), and multi-shard executor read routing, plus an opt-in
 linearizable-read **read-index** barrier (`NodeConfig.linearizable_reads`), and a
 region-favouring **fast-path electorate** (Phase D, including a region-derived
-electorate on `DynamicTopology`). **98 tests in the consensus crate**
-(42 unit, 6 cluster, 5 electorate, 3 multi-shard, 12 membership, 1 resharding, 6 executor,
+electorate on `DynamicTopology`). **99 tests in the consensus crate**
+(43 unit, 6 cluster, 5 electorate, 3 multi-shard, 12 membership, 1 resharding, 6 executor,
 1 linearizable-stress, 1 shard-executor, 2 TCP, 3 mTLS, 13 simulation, 3 restart),
 clippy clean, stable across repeated runs (the simulation suite is deterministic — see
 Phase A). The durable-journal tests live with their backends: 3 `FjallJournal` tests in
@@ -354,7 +354,13 @@ backend (sql/fjall). Phases, in order:
   gated sends (`handle_staged`/`drive_staged`). A node-level test
   (`inbox_drains_a_burst_into_one_group_commit`) proves 50 staged records collapse
   to one flush, and the deterministic simulation confirms safety/convergence are
-  unchanged. ✅ **Snapshots + compaction + log truncation** (bounds both the
+  unchanged. **Flush-failure gate:** if the `flush` (fsync) itself *fails* (a disk
+  error / full disk), the node now **withholds** that batch's durability-gated
+  replies rather than acking a decision it could not persist — so a node that can't
+  fsync can never claim durability (a quorum of such nodes restarting would otherwise
+  lose an acked write). The withheld replies are exactly the loss quorums/recovery
+  already tolerate, so the cluster proceeds via durable peers
+  (`flush_failure_withholds_the_durability_gated_ack`). ✅ **Snapshots + compaction + log truncation** (bounds both the
   journal and the in-memory `Replica.commands`/`by_key`, previously unbounded —
   the blocker for long-running deployments). A **redundancy watermark** (mirroring
   Accord's `redundantBefore`): below it every replica has applied everything, so
@@ -487,7 +493,14 @@ backend (sql/fjall). Phases, in order:
         normal execution can't apply it (needs a decision) and anti-entropy refused to,
         so it was stuck forever and the node diverged permanently; reads off it were
         stale. Fix: `import_applied` adopts a peer's *applied* state for a known-but-
-        unapplied command. *Remaining:* clock-skew (off by default — bumps the shared
+        unapplied command. **Re-validated after the Phase D/E work** (fast-path
+        electorate + recovery-quorum gate, config-Paxos liveness, per-node TLS, and the
+        journal relocation to `evento-fjall`/`evento-sql`): a fresh `make jepsen` run is
+        **strict-serializable / `Everything looks good!` at conc 10** with
+        `--linearizable-reads`, and the default (no read barrier) reproduces exactly the
+        documented `:G-single-item-realtime` read anomaly with **no write anomaly** — so
+        the cumulative changes preserved write serializability and, with the barrier,
+        strict serializability. *Remaining:* clock-skew (off by default — bumps the shared
         kernel clock, needs real VMs; the node image now ships a compiler for jepsen's
         time helper and `run.sh` refuses it under Docker without `ALLOW_CLOCK_SKEW=1`);
         then the box can be checked.
