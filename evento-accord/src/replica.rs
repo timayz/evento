@@ -151,6 +151,48 @@ impl Replica {
         self.commands.insert(cmd.txn, cmd);
     }
 
+    /// A **read-index probe**: the `(execute_at, deps)` a read at `txn`'s
+    /// timestamp over `keys` would witness, computed exactly like [`preaccept`]
+    /// but storing **nothing** (a read never enters the conflict graph). The
+    /// coordinator unions these across a quorum, then waits for the deps to be
+    /// applied locally before serving — so the read reflects every write that
+    /// committed before it began.
+    ///
+    /// [`preaccept`]: Self::preaccept
+    pub fn read_probe(&self, txn: TxnId, keys: &[Key]) -> (Timestamp, Vec<TxnId>) {
+        let conflicts = self.conflicts(keys, txn);
+
+        let mut execute_at = txn.0;
+        for &c in &conflicts {
+            let c_exec = self.commands[&c].execute_at;
+            let candidate = Self::successor_with_node(c_exec, txn.0.node);
+            if candidate > execute_at {
+                execute_at = candidate;
+            }
+        }
+
+        let deps: Vec<TxnId> = conflicts
+            .iter()
+            .copied()
+            .filter(|c| c.0 < execute_at)
+            .collect();
+
+        (execute_at, deps)
+    }
+
+    /// Whether every transaction in `deps` has been applied locally — i.e. its
+    /// effect is in the data store. A dep is satisfied if it is `Applied` (an
+    /// abort is also marked applied), or compacted away below the redundancy
+    /// watermark (which means every replica had applied it). A dep this node has
+    /// not yet received, or has not yet executed, is **not** satisfied — the
+    /// read barrier waits for it.
+    pub fn deps_applied(&self, deps: &[TxnId]) -> bool {
+        deps.iter().all(|dep| match self.commands.get(dep) {
+            Some(d) => d.status == Status::Applied,
+            None => dep.0 < self.redundant_before,
+        })
+    }
+
     /// Handles PreAccept: records the transaction and returns the execution
     /// timestamp and dependencies this replica witnesses. Idempotent.
     pub fn preaccept(

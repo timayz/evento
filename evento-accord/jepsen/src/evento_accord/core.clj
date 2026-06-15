@@ -69,7 +69,13 @@
     :parse-fn parse-faults]
    [nil "--linearizable-reads"
     "Enable evento-accord read barriers (linearizable reads; needed for strict-serializable)."
-    :default false]])
+    :default false]
+   [nil "--partition-targets TARGETS"
+    "Comma-separated partition shapes: one,majority,majorities-ring. `one` keeps a
+    quorum live (so linearizable reads stay available); the default can strand
+    everyone."
+    :default [:one :majority :majorities-ring]
+    :parse-fn (fn [s] (mapv keyword (remove str/blank? (str/split s #","))))]])
 
 (defn evento-test
   "Builds the Jepsen test map from CLI opts."
@@ -95,7 +101,7 @@
         npkg    (-> {:db        db
                      :nodes     (:nodes opts)
                      :faults    faults
-                     :partition {:targets [:one :majority :majorities-ring]}
+                     :partition {:targets (:partition-targets opts)}
                      :kill      {:targets [:one :all]}
                      :pause     {:targets [:one :all]}
                      :interval  10})

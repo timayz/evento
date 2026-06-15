@@ -413,17 +413,21 @@ backend (sql/fjall). Phases, in order:
         (`--faults`, `jepsen.nemesis.combined`) now also drives **process kill** (incl.
         all-nodes-down → journal-recovered restart) and **pause** (SIGSTOP/SIGCONT):
         under `partition+kill+pause` the history stays **serializable**, confirming
-        write-path safety under compound faults. A prototype **linearizable read path**
-        (`Node::read_barrier`, gated by `NodeConfig.linearizable_reads`) closes the
-        strict-serializable gap: a read of an owned key first coordinates a read-only
-        Accord barrier txn at timestamp `t`, so the subsequent local read reflects every
-        write that committed before it began. With `--linearizable-reads` a healthy run
-        is **strict-serializable valid** and non-vacuous (2770/2984 ops committed). The
-        cost: one consensus round per read, and it is CP — a quorum-destroying partition
-        makes reads *unavailable* rather than stale. *Remaining:* clock-skew (off by
-        default — bumps the kernel clock, so it needs real VMs, not shared-kernel
-        Docker); productionize the read barrier (read-index/lease instead of a full
-        round; keep read-only txns out of the conflict graph) before the box is checked.
+        write-path safety under compound faults. A **linearizable read path**
+        (`Node::read_barrier`, gated by `NodeConfig.linearizable_reads`) addresses the
+        read gap as a lightweight **read-index** that stores nothing (reads never enter
+        the conflict graph or journal — `ReadProbe`/`ReadProbeOk` + `Replica::read_probe`
+        / `deps_applied`): probe a slow quorum for the deps a read would witness, wait for
+        them to apply locally, then serve. Jepsen results: a **healthy** run is
+        **strict-serializable valid** (2920 ok, reads are linearizable); under a
+        quorum-preserving `:one` partition the cluster stays **serializable** (2788 ok) but
+        strict-serializable still **fails on a real-time anomaly** — and crucially that is
+        *not* a serializability cycle. It is **premature visibility**: a node applies a
+        committed write and serves it to a read before the write's coordinator acks its
+        client, which a partition widens. *Remaining:* close real-time consistency under
+        partition (commit-wait / fence read visibility to a quorum-durable point — a
+        deeper change); clock-skew (off by default — bumps the kernel clock, needs real
+        VMs); then the box can be checked.
   - [ ] **Independent expert review** of the protocol and implementation.
   - [ ] **Real-cluster soak + chaos** over days (kills, partitions, clock skew,
         disk pressure, slow disks/links) on actual hardware — zero production
@@ -459,9 +463,10 @@ prototypes, demos, and controlled/low-stakes use. It is **not** yet safe for
 production: external/adversarial verification has only just begun (a Jepsen/Elle
 harness now exists and its first partition run already found that **reads are not
 linearizable** by default — writes are serializable & atomic, but a read off a lagging
-replica can break real-time order; an opt-in `linearizable_reads` barrier closes this
-at a consensus-round-per-read cost and is Jepsen-validated strict-serializable), and
-there is still no independent review, no real-cluster
+replica can break real-time order; an opt-in `linearizable_reads` read-index barrier
+makes reads linearizable when healthy — Jepsen-validated strict-serializable — and keeps
+the cluster serializable under partition, though a real-time *premature-visibility* gap
+remains under partition), and there is still no independent review, no real-cluster
 soak mileage, an unoptimized throughput ceiling, and a stand-in membership/metadata
 layer. The gating items are the unchecked boxes in Phases D and E above, in roughly
 that order (verification and soak first). The crate version (`2.0.0-alpha.*`)

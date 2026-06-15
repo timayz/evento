@@ -178,6 +178,30 @@ async fn linearizable_read_observes_a_write_from_another_node() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn linearizable_reads_store_nothing() {
+    let cluster = ExecCluster::start_linearizable(3);
+
+    // No writes: the conflict graph is empty everywhere.
+    for e in &cluster.execs {
+        assert_eq!(e.node().command_count(), 0);
+    }
+
+    // Many linearizable reads of various keys. Each is a read-index probe that
+    // stores nothing — the conflict graph must stay empty (unlike the previous
+    // read-only-transaction approach, which left a command per read).
+    for i in 0..20 {
+        let _ = cluster.read_all(i % 3, &format!("acc-{i}")).await;
+    }
+    for e in &cluster.execs {
+        assert_eq!(
+            e.node().command_count(),
+            0,
+            "linearizable reads must not enter the conflict graph"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn enforces_optimistic_concurrency_across_the_cluster() {
     let cluster = ExecCluster::start(3);
 

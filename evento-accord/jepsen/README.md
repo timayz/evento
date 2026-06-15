@@ -64,23 +64,33 @@ adversarial harness exists to surface.
 
 ### Closing the gap: `--linearizable-reads`
 
-A prototype linearizable read path (`Node::read_barrier`, gated by
-`NodeConfig.linearizable_reads`) closes it. A read of an owned key first coordinates a
-**read-only Accord transaction** — a barrier at timestamp `t` — before serving the
-local backend. By Accord's `(execute_at, txn)` execution order, once that barrier
-executes locally every conflicting write with `execute_at < t` is already applied, so
-the subsequent local read reflects every write that committed before the read began.
+A linearizable read path (`Node::read_barrier`, gated by `NodeConfig.linearizable_reads`)
+addresses it. It is a lightweight **read-index** that stores nothing (reads never enter
+the conflict graph or journal): a read of an owned key (1) probes a slow quorum (`f+1`)
+of the key's replicas for the dependencies a read at a fresh timestamp would witness
+(`ReadProbe`), then (2) waits until those deps are applied locally, then serves the
+backend. Any write that committed before the read is committed on a quorum, which
+intersects the probe quorum, so it is in the deps — and the local wait fences the read
+behind it.
 
-Validated here (`./run.sh --linearizable-reads`):
+Validated (`./run.sh --linearizable-reads`):
 
-* **Healthy, strict-serializable ⇒ `:valid? true`**, non-vacuously — 2770/2984 ops
-  committed, 0 indeterminate. The stale-read anomaly is gone; reads are linearizable.
+| Run | Model | Verdict | ops |
+|-----|-------|---------|-----|
+| healthy | strict-serializable | **valid** | 2920 ok, 0 info |
+| `:one` partition | serializable | **valid** | 2788 ok |
+| `:one` partition | strict-serializable | **invalid** (realtime) | 2038 ok |
 
-The cost is real and twofold: (1) **one consensus round per read** (throughput drops);
-(2) it is **CP** — under a partition that leaves *no* quorum (e.g. `majorities-ring`),
-reads correctly become **unavailable** (`:info`) instead of stale, so a partitioned run
-commits very few ops (the safe, expected trade). A production version would cut the cost
-with a read-index/lease barrier and keep read-only txns out of the conflict graph.
+So the read-index makes reads **linearizable when healthy** (the stale-read anomaly is
+gone), and the cluster stays **serializable under partition**. A **residual real-time
+anomaly remains under partition**, and it is *not* a serializability cycle (serializable
+is valid): it is **premature visibility** — a node applies a committed write and serves
+it to a read before that write's coordinator has acked its client, and a partition
+widens that window. Closing real-time external consistency under partition needs a
+deeper change (commit-wait, or fencing read visibility to a quorum-durable point); the
+read barrier alone does not provide it. The cost of the barrier is also real: one
+quorum round-trip per read, and it is CP — a partition that leaves no quorum makes reads
+**unavailable** (`:info`) rather than stale.
 
 ## Running it
 

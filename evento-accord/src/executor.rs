@@ -182,7 +182,7 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
                 // committed before this read began, then serve locally. Off by
                 // default — reads stay local-only (serializable, not linearizable).
                 if self.node.linearizable_reads() {
-                    self.node.read_barrier(vec![key]).await?;
+                    self.node.read_barrier(key).await?;
                 }
             } else if let Some(owner) = self.node.an_owner_of(&key) {
                 // NOTE: a forwarded (non-owned, multi-shard) read is not yet

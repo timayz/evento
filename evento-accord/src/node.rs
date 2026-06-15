@@ -543,6 +543,8 @@ impl Node {
                 | Message::ConfigNack { .. }
                 | Message::ReadForward { .. }
                 | Message::ReadReply { .. }
+                | Message::ReadProbe { .. }
+                | Message::ReadProbeOk { .. }
         );
         if !control && !self.bootstrapped.load(Ordering::Acquire) {
             self.join_buffer.lock().expect("buffer poisoned").push(env);
@@ -793,6 +795,23 @@ impl Node {
                     },
                 ));
             }
+            // Read-index probe: a pure query of the conflict graph — report the
+            // deps a read at `txn` would witness over `key`, storing nothing.
+            Message::ReadProbe { txn, key } => {
+                let (execute_at, deps) = self
+                    .replica
+                    .lock()
+                    .expect("replica poisoned")
+                    .read_probe(txn, std::slice::from_ref(&key));
+                out.push((
+                    from,
+                    Message::ReadProbeOk {
+                        txn,
+                        execute_at,
+                        deps,
+                    },
+                ));
+            }
             reply @ Message::ReadReply { .. } => {
                 let id = match &reply {
                     Message::ReadReply { id, .. } => *id,
@@ -909,21 +928,80 @@ impl Node {
         Ok(outcome)
     }
 
-    /// A **linearizable read barrier**: coordinates a read-only (no-events)
-    /// transaction over `keys`, exactly like a write but appending nothing. Once
-    /// it returns, this node's local replica has executed the barrier at its
-    /// timestamp `t`; by Accord's `(execute_at, txn)` execution order that means
-    /// every conflicting write with `execute_at < t` is already applied locally.
-    /// A subsequent local read of those keys therefore reflects every write that
-    /// committed before the barrier began — i.e. it is linearizable. Costs one
-    /// consensus round; the caller must own the keys (be a replica) so the
-    /// barrier's local apply actually fences this node's reads.
-    pub async fn read_barrier(&self, keys: Vec<Key>) -> anyhow::Result<()> {
-        if keys.is_empty() {
-            return Ok(());
+    /// A **linearizable read barrier** for one owned `key`, as a lightweight
+    /// **read-index** (it stores nothing and is never journaled — a read never
+    /// enters the conflict graph):
+    ///
+    /// 1. Probe a slow quorum (`f + 1`) of the key's replicas for the
+    ///    dependencies a read at a fresh timestamp would witness ([`ReadProbe`]).
+    ///    Any write that committed before this read is committed on a quorum,
+    ///    which intersects the probe quorum, so that write is in some reply's
+    ///    deps.
+    /// 2. Wait until every witnessed dependency is **applied locally**
+    ///    ([`Replica::deps_applied`]).
+    ///
+    /// A subsequent local read of `key` then reflects every write that committed
+    /// before the barrier began — i.e. it is linearizable. The caller must own
+    /// `key` (be a replica) so the local wait actually fences its reads. Errors
+    /// (quorum unreachable, or a dependency that never applies in time) surface
+    /// as an unavailable read rather than a stale one.
+    ///
+    /// [`ReadProbe`]: Message::ReadProbe
+    pub async fn read_barrier(&self, key: Key) -> anyhow::Result<()> {
+        let replicas = self.topology.replicas(&key);
+        let slow_q = self.topology.slow_quorum(&key);
+        let t0 = self.clock.now();
+        let txn = TxnId(t0);
+        let mut rx = self.register(txn);
+
+        self.broadcast(
+            &replicas,
+            Message::ReadProbe {
+                txn,
+                key: key.clone(),
+            },
+        )
+        .await;
+        let probes = Self::collect_tagged(
+            &mut rx,
+            slow_q,
+            Self::after(self.settings.collect_timeout),
+            |m| match m {
+                Message::ReadProbeOk { deps, .. } => Some(deps),
+                _ => None,
+            },
+        )
+        .await;
+        self.deregister(txn);
+        if probes.len() < slow_q {
+            anyhow::bail!("read barrier quorum not reached for {key:?}");
         }
-        self.coordinate(keys, Vec::new()).await?;
-        Ok(())
+
+        // The union of every dependency the quorum witnessed: every write
+        // conflicting on `key` that orders before this read.
+        let deps: Vec<TxnId> = probes
+            .into_iter()
+            .flat_map(|(_, deps)| deps)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+
+        // Wait until they are all applied locally, then the caller reads.
+        let deadline = Self::after(self.settings.collect_timeout);
+        loop {
+            if self
+                .replica
+                .lock()
+                .expect("replica poisoned")
+                .deps_applied(&deps)
+            {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!("read barrier timed out: {} deps unapplied", deps.len());
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
     }
 
     /// The shared PreAccept → (Accept) → Commit → Read → Apply coordination for a

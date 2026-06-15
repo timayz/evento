@@ -225,6 +225,17 @@ pub enum Message {
         events: Vec<Event>,
         page_info: PageInfo,
     },
+    /// Linearizable-read coordinator → a quorum of a key's replicas: report the
+    /// execution timestamp and dependencies a read at `txn`'s timestamp would
+    /// witness over `key`. Unlike `PreAccept`, the replica stores **nothing** —
+    /// it is a pure query of the conflict graph (a read-index probe).
+    ReadProbe { txn: TxnId, key: Key },
+    /// Replica → read coordinator: the probe's witnessed `(execute_at, deps)`.
+    ReadProbeOk {
+        txn: TxnId,
+        execute_at: Timestamp,
+        deps: Vec<TxnId>,
+    },
 }
 
 impl Message {
@@ -242,7 +253,10 @@ impl Message {
             | Message::Applied { txn, .. }
             | Message::Recover { txn, .. }
             | Message::RecoverOk { txn, .. }
-            | Message::Nack { txn, .. } => Some(*txn),
+            | Message::Nack { txn, .. }
+            | Message::ReadProbeOk { txn, .. } => Some(*txn),
+            // A request the replica handles inline (not routed to a coordinator).
+            Message::ReadProbe { .. } => None,
             Message::SyncRequest { .. }
             | Message::SyncData { .. }
             | Message::Watermark { .. }
