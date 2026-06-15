@@ -56,7 +56,7 @@ pub struct Edge<N> {
 }
 
 /// Pagination metadata for a result set.
-#[derive(Default, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PageInfo {
     /// Whether there are more items before the first edge
     pub has_previous_page: bool,
@@ -71,7 +71,7 @@ pub struct PageInfo {
 /// Result of a paginated query.
 ///
 /// Contains the requested edges and pagination metadata.
-#[derive(Default, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReadResult<N> {
     /// The paginated items with their cursors
     pub edges: Vec<Edge<N>>,
@@ -202,7 +202,7 @@ pub enum CursorError {
 /// // Backward: last 20 items before cursor
 /// let args = Args::backward(20, Some(start_cursor));
 /// ```
-#[derive(Default, Serialize, Deserialize, Clone)]
+#[derive(Default, Debug, Serialize, Deserialize, Clone)]
 pub struct Args {
     /// Number of items for forward pagination
     pub first: Option<u16>,

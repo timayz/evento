@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+
+{% block title %}Account {{ account.id[..8] }}... - Evento Bank{% endblock %}
+
+{% block content %}
+<div class="card">
+    <h2>Account Details</h2>
+    <p><strong>ID:</strong> <code>{{ account.id }}</code></p>
+    <p><strong>Status:</strong> {{ account.status }}</p>
+    <p class="balance {% if account.balance < 0 %}negative{% endif %}" style="margin-top: 1rem;">
+        {{ account.balance }} {{ account.currency }}
+    </p>
+</div>
+
+<div class="card">
+    <h2>Deposit</h2>
+    <form method="post" action="/accounts/{{ account.id }}/deposit" class="inline-form">
+        <div class="form-group">
+            <label for="deposit_amount">Amount</label>
+            <input type="number" id="deposit_amount" name="amount" min="1" value="100" required>
+        </div>
+        <button type="submit" class="btn btn-success">Deposit</button>
+    </form>
+</div>
+
+<div class="card">
+    <h2>Withdraw</h2>
+    <form method="post" action="/accounts/{{ account.id }}/withdraw" class="inline-form">
+        <div class="form-group">
+            <label for="withdraw_amount">Amount</label>
+            <input type="number" id="withdraw_amount" name="amount" min="1" value="100" required>
+        </div>
+        <button type="submit" class="btn btn-danger">Withdraw</button>
+    </form>
+</div>
+
+<div class="card">
+    <h2>Transfer</h2>
+    <form method="post" action="/accounts/{{ account.id }}/transfer">
+        <div class="form-group">
+            <label for="to_account_id">To Account</label>
+            <select id="to_account_id" name="to_account_id" required>
+                <option value="">Select account...</option>
+                {% for other in accounts %}
+                {% if other.id != account.id %}
+                <option value="{{ other.id }}">{{ other.id[..8] }}... ({{ other.balance }} {{ other.currency }})</option>
+                {% endif %}
+                {% endfor %}
+            </select>
+        </div>
+        <div class="form-group">
+            <label for="transfer_amount">Amount</label>
+            <input type="number" id="transfer_amount" name="amount" min="1" value="100" required>
+        </div>
+        <button type="submit" class="btn">Transfer</button>
+    </form>
+</div>
+
+<p style="margin-top: 1rem;">
+    <a href="/accounts" class="btn" style="background: #6b7280;">Back to Accounts</a>
+</p>
+{% endblock %}

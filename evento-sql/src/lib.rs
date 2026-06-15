@@ -68,3 +68,10 @@ mod sql;
 pub mod sql_types;
 
 pub use sql::*;
+
+/// A SQL-backed [`evento_accord::Journal`] (the Accord consensus log), behind the
+/// optional `accord` feature.
+#[cfg(feature = "accord")]
+mod accord_journal;
+#[cfg(feature = "accord")]
+pub use accord_journal::SqlJournal;

@@ -48,7 +48,7 @@ use crate::{context, cursor::Args, Aggregate, AggregateEvent, EventFilter, Execu
 ///
 /// Routing keys allow partitioning events for parallel processing
 /// or filtering subscriptions to specific event streams.
-#[derive(Clone)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum RoutingKey {
     /// Match all events regardless of routing key
     All,

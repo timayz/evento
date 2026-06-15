@@ -1,0 +1,4 @@
+/store/
+/target/
+/docker/secret/
+*.class

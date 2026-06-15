@@ -1,0 +1,24 @@
+# The Jepsen control node: JVM + Leiningen + the test project. It SSHes into the
+# n1..n5 node containers to install/start the binary, inject faults, and run Elle.
+#
+# Build context is the repo root (see docker-compose.yml).
+FROM clojure:temurin-21-lein-bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        openssh-client iputils-ping gnuplot graphviz ca-certificates git \
+    && rm -rf /var/lib/apt/lists/*
+# Jepsen runs `git` on the control node to record the test's repo version; the
+# mounted project isn't a git repo, so give it a harmless one.
+RUN git config --global user.email jepsen@example.com \
+    && git config --global user.name jepsen \
+    && git config --global init.defaultBranch main
+WORKDIR /jepsen
+# Prefetch deps first so they cache independently of source changes.
+COPY evento-accord/jepsen/project.clj ./project.clj
+RUN lein deps
+COPY evento-accord/jepsen/ ./
+# Private half of the keypair run.sh generates.
+COPY evento-accord/jepsen/docker/secret/jepsen /root/.ssh/id_rsa
+RUN mkdir -p /root/.ssh && chmod 700 /root/.ssh && chmod 600 /root/.ssh/id_rsa \
+    && printf 'Host *\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n  LogLevel ERROR\n' \
+        > /root/.ssh/config
+CMD ["sleep", "infinity"]

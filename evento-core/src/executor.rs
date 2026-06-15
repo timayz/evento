@@ -36,7 +36,7 @@ use crate::{
 /// // Events of a specific type
 /// let filter = EventFilter::by_event("myapp/User", "UserCreated");
 /// ```
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EventFilter {
     /// Aggregate type (e.g., "myapp/User")
     pub aggregate_type: String,

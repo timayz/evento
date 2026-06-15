@@ -87,11 +87,15 @@
 
 use sqlx_migrator::{Info, Migrator};
 
+#[cfg(feature = "accord")]
+mod accord;
 mod m0001;
 mod m0002;
 mod m0003;
 mod m0004;
 
+#[cfg(feature = "accord")]
+pub use accord::AccordMigration;
 pub use m0001::InitMigration;
 pub use m0002::M0002;
 pub use m0003::M0003;
@@ -123,6 +127,10 @@ pub use m0004::M0004;
 /// # Errors
 ///
 /// Returns an error if migration registration fails.
+// Two definitions: the `accord` build adds the consensus-journal migration (and its
+// extra trait bound); the default build is unchanged — so the `AccordMigration` bound
+// never leaks onto callers (e.g. evento-sql's generic test harness) that don't opt in.
+#[cfg(not(feature = "accord"))]
 pub fn new<DB: sqlx::Database>() -> Result<Migrator<DB>, sqlx_migrator::Error>
 where
     InitMigration: sqlx_migrator::Migration<DB>,
@@ -135,6 +143,24 @@ where
     migrator.add_migration(Box::new(M0002))?;
     migrator.add_migration(Box::new(M0003))?;
     migrator.add_migration(Box::new(M0004))?;
+    Ok(migrator)
+}
 
+#[cfg(feature = "accord")]
+pub fn new<DB: sqlx::Database>() -> Result<Migrator<DB>, sqlx_migrator::Error>
+where
+    InitMigration: sqlx_migrator::Migration<DB>,
+    M0002: sqlx_migrator::Migration<DB>,
+    M0003: sqlx_migrator::Migration<DB>,
+    M0004: sqlx_migrator::Migration<DB>,
+    AccordMigration: sqlx_migrator::Migration<DB>,
+{
+    let mut migrator = Migrator::default();
+    migrator.add_migration(Box::new(InitMigration))?;
+    migrator.add_migration(Box::new(M0002))?;
+    migrator.add_migration(Box::new(M0003))?;
+    migrator.add_migration(Box::new(M0004))?;
+    // The optional evento-accord consensus-journal tables.
+    migrator.add_migration(Box::new(AccordMigration))?;
     Ok(migrator)
 }

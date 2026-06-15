@@ -1,0 +1,29 @@
+# Build context is the repo root (see docker-compose.yml) so the whole workspace
+# is available to compile the jepsen-node binary against the local crates.
+#
+# Stage 1: build the binary on Debian/glibc so it runs in the slim node image.
+FROM rust:1-bookworm AS build
+WORKDIR /src
+COPY . .
+RUN cargo build --release -p jepsen-node
+
+# Stage 2: an SSH-reachable node with iptables (for partition nemesis) + the binary.
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        openssh-server iptables iproute2 procps sudo curl ca-certificates \
+        netcat-openbsd \
+        # gcc + libc headers: jepsen's clock nemesis (--faults clock) compiles a
+        # small C helper on each node to call settimeofday. Harmless to bake in;
+        # clock skew still requires REAL VMs (it bumps the shared kernel clock).
+        gcc libc6-dev ntpdate \
+    && rm -rf /var/lib/apt/lists/*
+RUN mkdir -p /opt/jepsen-node /var/lib/jepsen-node /run/sshd /root/.ssh \
+    && ssh-keygen -A \
+    && sed -i 's/#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
+COPY --from=build /src/target/release/jepsen-node /opt/jepsen-node/jepsen-node
+# Public half of the keypair run.sh generates; lets the control node SSH in.
+COPY evento-accord/jepsen/docker/secret/jepsen.pub /root/.ssh/authorized_keys
+RUN chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys
+EXPOSE 22 7000 8080
+# /run/sshd must exist at start (a tmpfs/overlay /run can be empty); create it here.
+CMD ["bash", "-c", "mkdir -p /run/sshd && exec /usr/sbin/sshd -D -e"]

@@ -19,5 +19,11 @@ async-trait.workspace = true
 [features]
 default = ["sqlite", "mysql", "postgres"]
 sqlite = ["evento-sql/sqlite", "sea-query/backend-sqlite", "sqlx/sqlite", "sqlx_migrator/sqlite"]
-mysql = ["evento-sql/mysql", "sea-query/backend-mysql", "sqlx/mysql", "sqlx_migrator/mysql"]
-postgres = ["evento-sql/postgres", "sea-query/backend-postgres", "sqlx/postgres", "sqlx_migrator/postgres"]
+# `sqlx/migrate` lets the accord integration tests create a throwaway database.
+mysql = ["evento-sql/mysql", "sea-query/backend-mysql", "sqlx/mysql", "sqlx/migrate", "sqlx_migrator/mysql"]
+postgres = ["evento-sql/postgres", "sea-query/backend-postgres", "sqlx/postgres", "sqlx/migrate", "sqlx_migrator/postgres"]
+# Adds the optional evento-accord consensus-journal migration to `new()`.
+accord = []
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
