@@ -1587,3 +1587,64 @@ async fn membership_churn_is_bit_reproducible() {
         );
     }
 }
+
+/// Aggressive bug-hunt: run **every** scenario across a wide seed range and fail on
+/// the first oracle violation (printing the seed, so it replays exactly). Ignored by
+/// default — it's a soak, not a CI gate:
+///   cargo test -p evento-accord --test simulation -- --ignored --nocapture sweep_for_bugs
+#[tokio::test(start_paused = true)]
+#[ignore = "soak: run explicitly with --ignored"]
+async fn sweep_for_bugs() {
+    const COUNT: u64 = 250;
+    let electorate = vec![NodeId(0), NodeId(1), NodeId(2)];
+
+    for seed in 0..COUNT {
+        // Chaos (crash/heal minority, coordinators crash mid-write) — strong oracle.
+        if let Err(v) = run_scenario(seed).await {
+            panic!("chaos seed {seed}: {v}");
+        }
+        // Full chaos + convergence measurement.
+        let a = run_adversarial(seed).await;
+        assert!(a.safety.is_none(), "adversarial seed {seed}: {:?}", a.safety);
+        assert!(a.converged, "adversarial seed {seed}: did not converge");
+        // Partitions — default electorate and the shrunk {0,1,2} electorate.
+        for (label, e) in [("partition", None), ("partition+electorate", Some(electorate.clone()))]
+        {
+            let p = run_partition(seed, e).await;
+            assert!(p.safety.is_none(), "{label} seed {seed}: {:?}", p.safety);
+            assert!(p.converged, "{label} seed {seed}: did not converge");
+        }
+        // Restarts from the durable journal mid-workload.
+        let r = run_with_restarts(seed).await;
+        assert!(r.safety.is_none(), "restarts seed {seed}: {:?}", r.safety);
+        assert!(r.converged, "restarts seed {seed}: did not converge");
+        // Compaction boundedness + clock skew.
+        if let Err(v) = run_bounded(seed).await {
+            panic!("bounded seed {seed}: {v}");
+        }
+        if let Err(v) = run_skew(seed).await {
+            panic!("skew seed {seed}: {v}");
+        }
+        // Membership churn (concurrent reconfiguration + writes + minority churn).
+        let probe = run_churn(seed).await;
+        let max_epoch = *probe.per_node_epoch.iter().max().unwrap();
+        for (node, &e) in probe.per_node_epoch.iter().enumerate() {
+            assert_eq!(e, max_epoch, "churn seed {seed}: node {node} stuck at epoch {e}/{max_epoch}");
+        }
+        let first = &probe.per_node_committed[0];
+        for (node, set) in probe.per_node_committed.iter().enumerate() {
+            assert_eq!(set, first, "churn seed {seed}: node {node} committed-set diverged");
+        }
+        let mut seen = std::collections::HashSet::new();
+        for (agg, ver, committed) in &probe.history {
+            if *committed && !seen.insert((agg.clone(), *ver)) {
+                panic!("churn seed {seed}: double-commit {agg} v{ver}");
+            }
+        }
+
+        if seed % 25 == 0 {
+            eprintln!("swept {seed}/{COUNT}");
+        }
+    }
+    eprintln!("swept all {COUNT} seeds with no violation");
+}

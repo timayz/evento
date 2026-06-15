@@ -255,9 +255,9 @@ that survive a coordinator crash (acceptor set tracks current membership), and
 range movement (re-sharding), and multi-shard executor read routing, plus an opt-in
 linearizable-read **read-index** barrier (`NodeConfig.linearizable_reads`), and a
 region-favouring **fast-path electorate** (Phase D, including a region-derived
-electorate on `DynamicTopology`). **99 tests in the consensus crate**
+electorate on `DynamicTopology`). **100 tests in the consensus crate**
 (43 unit, 6 cluster, 5 electorate, 3 multi-shard, 12 membership, 1 resharding, 6 executor,
-1 linearizable-stress, 1 shard-executor, 2 TCP, 3 mTLS, 13 simulation, 3 restart),
+1 linearizable-stress, 1 shard-executor, 1 journal-faults, 2 TCP, 3 mTLS, 13 simulation, 3 restart),
 clippy clean, stable across repeated runs (the simulation suite is deterministic — see
 Phase A). The durable-journal tests live with their backends: 3 `FjallJournal` tests in
 `evento-fjall` (`--features accord`) and 12 `SqlJournal` tests in `evento-sql`
@@ -297,7 +297,9 @@ backend (sql/fjall). Phases, in order:
   seeds, **safety holds** — no split-brain, no double-commit — and after healing
   the cluster **converges**. The harness already paid off: it found two real gaps
   (non-convergence from stalled transactions and from missed transactions), both
-  now fixed (see Phase B). ✅ **Deterministic runtime:** the tests run under
+  now fixed (see Phase B). An `#[ignore]`d soak (`sweep_for_bugs`) runs every scenario
+  across a wide seed range (250 seeds × all scenarios, ~8 min) for deeper hunting —
+  last run clean. ✅ **Deterministic runtime:** the tests run under
   `#[tokio::test(start_paused = true)]` — a single-threaded, virtual-time runtime —
   with a virtual physical-time source injected into the HLC
   (`HybridLogicalClock::with_physical`) and deterministic event ids, so a given
@@ -360,7 +362,11 @@ backend (sql/fjall). Phases, in order:
   fsync can never claim durability (a quorum of such nodes restarting would otherwise
   lose an acked write). The withheld replies are exactly the loss quorums/recovery
   already tolerate, so the cluster proceeds via durable peers
-  (`flush_failure_withholds_the_durability_gated_ack`). ✅ **Snapshots + compaction + log truncation** (bounds both the
+  (`flush_failure_withholds_the_durability_gated_ack`). The cluster-level invariant —
+  **a write reported committed is durable on a quorum** — is guarded by a storage-fault
+  test (`tests/journal_faults.rs`): with a `FaultJournal` failing fsync on a quorum, a
+  write must fail to commit rather than ack non-durably (the test fails on the pre-fix
+  code, durable on only 1 node). ✅ **Snapshots + compaction + log truncation** (bounds both the
   journal and the in-memory `Replica.commands`/`by_key`, previously unbounded —
   the blocker for long-running deployments). A **redundancy watermark** (mirroring
   Accord's `redundantBefore`): below it every replica has applied everything, so
