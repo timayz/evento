@@ -922,7 +922,11 @@ async fn run_bounded(seed: u64) -> Result<(), String> {
 
     let mut rng = StdRng::seed_from_u64(seed);
     let writer_plans: Vec<Vec<usize>> = (0..WRITERS)
-        .map(|_| (0..WRITES_EACH).map(|_| rng.random_range(0..AGGS)).collect())
+        .map(|_| {
+            (0..WRITES_EACH)
+                .map(|_| rng.random_range(0..AGGS))
+                .collect()
+        })
         .collect();
 
     // Writers coordinate through the always-live node 0, so every write commits
@@ -994,7 +998,9 @@ async fn run_bounded(seed: u64) -> Result<(), String> {
         return Err(format!("seed {seed}: {v}"));
     }
     if !converge(&sim.stores).await {
-        return Err(format!("seed {seed}: committed state lost after compaction"));
+        return Err(format!(
+            "seed {seed}: committed state lost after compaction"
+        ));
     }
     Ok(())
 }

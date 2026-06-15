@@ -43,9 +43,7 @@ fn cluster_tls() -> ClusterTls {
 
     let leaf_key = rcgen::KeyPair::generate().unwrap();
     let leaf_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
-    let leaf_cert = leaf_params
-        .signed_by(&leaf_key, &ca_cert, &ca_key)
-        .unwrap();
+    let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_cert, &ca_key).unwrap();
 
     let ca_der = ca_cert.der().clone();
     let leaf_chain = vec![leaf_cert.der().clone()];
@@ -105,7 +103,8 @@ impl TlsCluster {
 
             let clock = Arc::new(HybridLogicalClock::new(id));
             let client = TlsClient::new(tls.connector.clone(), tls.server_name.clone());
-            let sink: Arc<dyn MessageSink> = Arc::new(TcpTransport::with_tls(id, peers.clone(), client));
+            let sink: Arc<dyn MessageSink> =
+                Arc::new(TcpTransport::with_tls(id, peers.clone(), client));
             let store = Arc::new(InMemoryDataStore::new());
             let journal: Arc<dyn Journal> = Arc::new(InMemoryJournal::new());
             let topology = Arc::new(StaticTopology::new(id, ids.clone()));

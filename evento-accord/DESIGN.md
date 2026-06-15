@@ -393,9 +393,50 @@ backend (sql/fjall). Phases, in order:
   round-trips through it). So the inbox loop — not the network or fsync — is the
   throughput ceiling, and parallelizing/pipelining it is the concrete next perf
   lever, now measurable.
-  *Remaining:* Jepsen, external review, write pipelining (the benchmark now exists
-  to quantify it), and the deferred correctness edge case (the region-favoring
-  fast-path electorate) — largely external/operational rather than core-protocol.
+
+  **Phase D remaining (sign-off):**
+  - [x] Observability — in-process metrics + `tracing`.
+  - [x] Performance baseline — criterion latency/throughput benchmark.
+  - [ ] **External / adversarial verification — Jepsen suite.** The deterministic
+        sim is self-authored; consensus safety must survive an independent,
+        adversarial harness before it is trustworthy in production.
+  - [ ] **Independent expert review** of the protocol and implementation.
+  - [ ] **Real-cluster soak + chaos** over days (kills, partitions, clock skew,
+        disk pressure, slow disks/links) on actual hardware — zero production
+        mileage today.
+  - [ ] **Write pipelining** — parallelize the per-node inbox loop (the measured
+        throughput ceiling); validate the win against the benchmark.
+  - [ ] **Fast-path electorate** (deferred from Phase C) — region-favoring
+        single-round-trip commits; not validatable without a latency model.
+
+- **Phase E — Production readiness.** ⬜ *Not started.* The items that make it
+  safe to run, not just correct in a lab:
+  - [ ] **Cluster-metadata / membership service** replacing the minimal config-
+        Paxos stand-in (today: single-decree per epoch, no log replay for a node
+        that misses epochs, no leader for liveness under contention).
+  - [ ] **Metrics export** (Prometheus / OpenTelemetry) and structured-log wiring,
+        not just in-process counters.
+  - [ ] **PKI / cert management** — issuance, rotation, per-node identities (the
+        TLS tests use a self-signed shared cert).
+  - [ ] **Format & upgrade story** — versioning for the journal/wire `CommandState`
+        encoding and a rolling-upgrade path.
+  - [ ] **Snapshot-at-scale** for large aggregates (the `ExecutorDataStore`
+        `version`/`snapshot` reads cap at `u16::MAX` events per aggregate today).
+  - [ ] **Backpressure/rate-limiting policy** beyond drop-on-full, and bounded
+        `Replica.commands` recovery memory under sustained partition.
+
+## Production-readiness verdict
+
+**Not production-ready.** This is a faithful, well-tested **reference
+implementation** — verified in a deterministic fault-injection simulation,
+durable, bounded, geo-hardened, observable, and benchmarked (Phases A–C complete,
+Phase D partial) — and a strong base to *take* to production. It is suitable for
+prototypes, demos, and controlled/low-stakes use. It is **not** yet safe for
+production: it has no external/adversarial verification (Jepsen), no independent
+review, no real-cluster soak mileage, an unoptimized throughput ceiling, and a
+stand-in membership/metadata layer. The gating items are the unchecked boxes in
+Phases D and E above, in roughly that order (verification and soak first). The
+crate version (`2.0.0-alpha.*`) reflects this.
 
 The event-data path is already backend-agnostic (`AccordExecutor` runs on any
 `evento_core::Executor`); Phase B extends that to the consensus state.

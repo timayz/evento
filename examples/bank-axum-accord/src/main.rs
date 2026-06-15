@@ -104,9 +104,10 @@ async fn main() -> anyhow::Result<()> {
     // A Fjall-backed event store. A temp directory keeps each run self-contained;
     // swap for a persistent path to keep data across runs.
     // Single-node by default; set NODE_ID=0..N to join the localhost TCP cluster.
-    let node_id = std::env::var("NODE_ID")
-        .ok()
-        .map(|v| v.parse::<u64>().expect("NODE_ID must be an integer 0..CLUSTER_SIZE"));
+    let node_id = std::env::var("NODE_ID").ok().map(|v| {
+        v.parse::<u64>()
+            .expect("NODE_ID must be an integer 0..CLUSTER_SIZE")
+    });
 
     let label = node_id
         .map(|n| n.to_string())
@@ -136,7 +137,10 @@ async fn main() -> anyhow::Result<()> {
             (executor, WEB_BASE_PORT + id as u16)
         }
         None => {
-            println!("single-node mode — set NODE_ID=0..{} for a TCP cluster", CLUSTER_SIZE - 1);
+            println!(
+                "single-node mode — set NODE_ID=0..{} for a TCP cluster",
+                CLUSTER_SIZE - 1
+            );
             (build_single_node(local), WEB_BASE_PORT)
         }
     };

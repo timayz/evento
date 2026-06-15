@@ -640,7 +640,11 @@ mod tests {
 
         replica.compact(txn(20).0);
 
-        assert_eq!(replica.command_count(), 0, "the applied command was dropped");
+        assert_eq!(
+            replica.command_count(),
+            0,
+            "the applied command was dropped"
+        );
         assert!(replica.snapshot(a).is_none());
         assert_eq!(replica.redundant_before(), txn(20).0);
 
@@ -648,7 +652,10 @@ mod tests {
         // conflict from the compacted-away one.
         let b = txn(30);
         let (_, deps) = replica.preaccept(b, vec![key.clone()], vec![event("k", 2)]);
-        assert!(deps.is_empty(), "compacted command must not be a dependency");
+        assert!(
+            deps.is_empty(),
+            "compacted command must not be a dependency"
+        );
     }
 
     /// `compact` never advances past a still-unapplied transaction: the watermark
@@ -670,7 +677,10 @@ mod tests {
             txn(10).0,
             "watermark clamped to the oldest un-applied t0"
         );
-        assert!(replica.snapshot(old).is_none(), "old applied command dropped");
+        assert!(
+            replica.snapshot(old).is_none(),
+            "old applied command dropped"
+        );
         assert!(
             replica.snapshot(pending).is_some(),
             "un-applied command retained"

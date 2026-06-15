@@ -30,8 +30,8 @@ use tokio::time::{Duration, Instant};
 use crate::api::{DataStore, Journal, MessageSink, ShardId, Topology};
 use crate::clock::{Ballot, Clock, HybridLogicalClock, NodeId, Timestamp, TxnId};
 use crate::failure_detector::FailureDetector;
-use crate::metrics::{Metrics, MetricsSnapshot};
 use crate::message::{CommandState, Key, Message, Status};
+use crate::metrics::{Metrics, MetricsSnapshot};
 use crate::replica::Replica;
 use crate::transport::Envelope;
 
@@ -244,7 +244,10 @@ impl Node {
     /// Number of consensus commands currently held in memory — the state that
     /// compaction bounds. For tests and observability.
     pub fn command_count(&self) -> usize {
-        self.replica.lock().expect("replica poisoned").command_count()
+        self.replica
+            .lock()
+            .expect("replica poisoned")
+            .command_count()
     }
 
     /// How many transactions this node has taken over via the recovery sweep — a
@@ -396,7 +399,13 @@ impl Node {
             let timed_out = txn.0 < timeout;
             if suspected || timed_out {
                 self.metrics.record_recovery();
-                tracing::debug!(node = self.id.0, ?txn, suspected, timed_out, "recovering stalled transaction");
+                tracing::debug!(
+                    node = self.id.0,
+                    ?txn,
+                    suspected,
+                    timed_out,
+                    "recovering stalled transaction"
+                );
                 let _ = self.recover(txn).await;
             }
         }
@@ -453,8 +462,13 @@ impl Node {
 
         for &peer in &shard_peers {
             if peer != self.id {
-                self.send(peer, Message::Watermark { applied_through: mine })
-                    .await;
+                self.send(
+                    peer,
+                    Message::Watermark {
+                        applied_through: mine,
+                    },
+                )
+                .await;
             }
         }
 
@@ -1098,34 +1112,36 @@ impl Node {
 
             // Gather what every reachable replica knows within a short window,
             // tagged with the responder so deps can be grouped by shard.
-            let resp =
-                Self::collect_tagged(&mut rx, all_nodes.len(), Self::after(self.settings.fast_timeout), |m| {
-                    match m {
-                        Message::RecoverOk {
-                            known,
-                            status,
-                            accepted,
-                            execute_at,
-                            deps,
-                            superseding_rejects,
-                            keys,
-                            events,
-                            ..
-                        } => Some(RecoverResp::Ok(RecoverFields {
-                            known,
-                            status,
-                            accepted,
-                            execute_at,
-                            deps,
-                            superseding_rejects,
-                            keys,
-                            events,
-                        })),
-                        Message::Nack { promised, .. } => Some(RecoverResp::Nack(promised)),
-                        _ => None,
-                    }
-                })
-                .await;
+            let resp = Self::collect_tagged(
+                &mut rx,
+                all_nodes.len(),
+                Self::after(self.settings.fast_timeout),
+                |m| match m {
+                    Message::RecoverOk {
+                        known,
+                        status,
+                        accepted,
+                        execute_at,
+                        deps,
+                        superseding_rejects,
+                        keys,
+                        events,
+                        ..
+                    } => Some(RecoverResp::Ok(RecoverFields {
+                        known,
+                        status,
+                        accepted,
+                        execute_at,
+                        deps,
+                        superseding_rejects,
+                        keys,
+                        events,
+                    })),
+                    Message::Nack { promised, .. } => Some(RecoverResp::Nack(promised)),
+                    _ => None,
+                },
+            )
+            .await;
 
             if let Some(promised) = resp.iter().find_map(|(_, r)| match r {
                 RecoverResp::Nack(p) => Some(*p),
@@ -1352,9 +1368,12 @@ impl Node {
     ) -> anyhow::Result<usize> {
         let (tx, mut rx) = mpsc::unbounded_channel();
         *self.sync_inbox.lock().expect("sync poisoned") = Some(tx);
-        self.send(contact, Message::SyncRequest {
-            snapshot: want_snapshot,
-        })
+        self.send(
+            contact,
+            Message::SyncRequest {
+                snapshot: want_snapshot,
+            },
+        )
         .await;
 
         let received = tokio::time::timeout(timeout, rx.recv()).await;

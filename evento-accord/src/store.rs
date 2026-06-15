@@ -233,7 +233,11 @@ mod tests {
         journal.truncate(before).await.unwrap();
 
         let remaining = journal.load_all().await.unwrap();
-        assert_eq!(remaining.len(), 1, "only the record above the watermark stays");
+        assert_eq!(
+            remaining.len(),
+            1,
+            "only the record above the watermark stays"
+        );
         assert_eq!(remaining[0].txn.0.micros, 300);
         assert_eq!(journal.load_watermark().await.unwrap(), Some(before));
     }

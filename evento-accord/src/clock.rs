@@ -174,7 +174,9 @@ impl Clock for HybridLogicalClock {
         // far-future timestamp cannot run the clock away — which, unbounded, would
         // pin `phys` below `micros` forever and grow the `logical: u32` counter
         // without bound until it collides.
-        let observed_micros = observed.micros.min(phys.saturating_add(self.max_skew_micros));
+        let observed_micros = observed
+            .micros
+            .min(phys.saturating_add(self.max_skew_micros));
 
         // HLC receive rule: the new physical high-water mark is the max of our
         // physical, the (bounded) observed physical, and the real wall clock; the
@@ -241,7 +243,10 @@ mod tests {
         };
         clock.witness(ahead);
         let next = clock.now();
-        assert!(next > ahead, "{next:?} must advance past the adopted peer {ahead:?}");
+        assert!(
+            next > ahead,
+            "{next:?} must advance past the adopted peer {ahead:?}"
+        );
         assert!(
             next.micros >= ahead.micros,
             "the clock adopted the peer's within-bound physical time"

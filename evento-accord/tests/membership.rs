@@ -202,7 +202,11 @@ async fn a_joining_node_bootstraps_from_a_compacted_contact() {
 
     // Build up three committed events, then let everyone converge.
     for (v, name) in [(1, "Opened"), (2, "Deposited"), (3, "Withdrawn")] {
-        nodes[0].node.write(vec![event("acc", v, name)]).await.unwrap();
+        nodes[0]
+            .node
+            .write(vec![event("acc", v, name)])
+            .await
+            .unwrap();
     }
     for n in &nodes {
         await_committed(&n.store, 3).await;
@@ -221,7 +225,11 @@ async fn a_joining_node_bootstraps_from_a_compacted_contact() {
     // A fourth node joins, bootstrapping from the compacted contact A.
     let d = spawn_node(NodeId(3), 0, vec![abc.clone()], &net);
     d.node.begin_join();
-    nodes[0].node.change_topology(1, vec![abcd.clone()]).await.unwrap();
+    nodes[0]
+        .node
+        .change_topology(1, vec![abcd.clone()])
+        .await
+        .unwrap();
     await_epoch(&d.topology, 1).await;
     let imported = d.node.join(NodeId(0)).await.unwrap();
     assert_eq!(
@@ -234,11 +242,18 @@ async fn a_joining_node_bootstraps_from_a_compacted_contact() {
     use std::collections::BTreeSet;
     let committed0: BTreeSet<_> = nodes[0].store.committed_events().into_iter().collect();
     let committed_d: BTreeSet<_> = d.store.committed_events().into_iter().collect();
-    assert_eq!(committed0, committed_d, "joiner matches the compacted contact");
+    assert_eq!(
+        committed0, committed_d,
+        "joiner matches the compacted contact"
+    );
 
     // And D participates in a new write over the 4-node epoch.
     nodes.push(d);
-    let outcome = nodes[0].node.write(vec![event("acc", 4, "Closed")]).await.unwrap();
+    let outcome = nodes[0]
+        .node
+        .write(vec![event("acc", 4, "Closed")])
+        .await
+        .unwrap();
     assert!(!outcome.conflict);
     for n in &nodes {
         await_committed(&n.store, 4).await;

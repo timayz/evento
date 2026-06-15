@@ -42,7 +42,11 @@ impl Metrics {
         } else {
             self.writes_committed.fetch_add(1, Ordering::Relaxed);
         }
-        let path = if fast { &self.fast_path } else { &self.slow_path };
+        let path = if fast {
+            &self.fast_path
+        } else {
+            &self.slow_path
+        };
         path.fetch_add(1, Ordering::Relaxed);
     }
 
