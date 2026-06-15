@@ -5,7 +5,7 @@ use std::sync::Arc;
 use askama::Template;
 use axum::{
     extract::State,
-    http::StatusCode,
+    http::{header, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
     Form, Router,
@@ -170,6 +170,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/accounts/{id}/deposit", post(deposit))
         .route("/accounts/{id}/withdraw", post(withdraw))
         .route("/accounts/{id}/transfer", post(transfer))
+        // Ops endpoints (see OPERATIONS.md): Prometheus scrape target + liveness.
+        .route("/metrics", get(metrics))
+        .route("/health", get(health))
         .with_state(state);
 
     let web_addr = format!("127.0.0.1:{web_port}");
@@ -221,6 +224,20 @@ fn render<T: Template>(template: T) -> Response {
 
 async fn index() -> Response {
     render(IndexTemplate)
+}
+
+/// Prometheus scrape target: the node's consensus counters
+/// (`accord_*_total` — writes, fast/slow path, recoveries, compactions, journal
+/// flushes, messages, shed) in text exposition format. See OPERATIONS.md.
+async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
+    let body = state.executor.node().metrics().to_prometheus();
+    ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body)
+}
+
+/// Liveness probe: 200 while the process is up. Readiness (is this node caught up
+/// and serving fresh reads?) is derived from `/metrics` — see OPERATIONS.md.
+async fn health() -> impl IntoResponse {
+    (StatusCode::OK, "ok")
 }
 
 async fn list_accounts() -> Response {

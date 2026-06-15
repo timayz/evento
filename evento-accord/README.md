@@ -5,8 +5,10 @@ Cassandra [CEP-15]) — a leaderless, strictly-serializable, highly-available
 replicated event store. Events are replicated across `N = 2f + 1` nodes with a
 single global serial order and no elected leader, tolerating `f` failures.
 
-> **Status: experimental.** Not published. See [`DESIGN.md`](./DESIGN.md) for the
-> architecture and milestone plan.
+> **Status: alpha.** A well-tested reference implementation, not yet
+> production-hardened (pending independent review + real-cluster soak). See
+> [`DESIGN.md`](./DESIGN.md) for the architecture and milestone plan, and
+> [`OPERATIONS.md`](./OPERATIONS.md) for the deployment/ops runbook.
 
 ## What works
 
