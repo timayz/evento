@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio_rustls::rustls::pki_types::ServerName;
+use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tokio_util::either::Either;
@@ -46,12 +46,40 @@ type ClientStream = Either<TcpStream, tokio_rustls::client::TlsStream<TcpStream>
 /// Inbound connection: plain TCP, or a server-side TLS session over it.
 type ServerStream = Either<TcpStream, tokio_rustls::server::TlsStream<TcpStream>>;
 
+/// Per-node certificate pins: each node's expected **leaf** certificate, by id.
+/// The operator supplies the same map cluster-wide (every node controls all node
+/// certs). Identity is enforced by DER byte-comparison of the presented leaf —
+/// no x509 parsing — so a node can only act as the id whose cert it holds.
+pub type PeerCerts = std::collections::HashMap<NodeId, CertificateDer<'static>>;
+
+/// The id whose pinned leaf certificate equals the one presented (the chain's
+/// leaf, `[0]`), if any — the authenticated identity of a verified connection.
+fn authenticated_node(
+    presented: Option<&[CertificateDer<'_>]>,
+    pins: &PeerCerts,
+) -> Option<NodeId> {
+    let leaf = presented?.first()?;
+    pins.iter()
+        .find(|(_, pinned)| pinned.as_ref() == leaf.as_ref())
+        .map(|(id, _)| *id)
+}
+
+/// Whether the presented chain's leaf matches the `expected` pinned certificate.
+fn leaf_matches(presented: Option<&[CertificateDer<'_>]>, expected: &CertificateDer<'static>) -> bool {
+    presented
+        .and_then(|c| c.first())
+        .is_some_and(|leaf| leaf.as_ref() == expected.as_ref())
+}
+
 /// Client-side TLS settings: the rustls connector and the server name presented
-/// for certificate verification.
+/// for certificate verification. Optionally **pins** each peer's leaf certificate
+/// (`with_peer_certs`), so the client only trusts a dialed peer if it presents
+/// exactly that node's certificate — defeating a CA-valid impostor at the address.
 #[derive(Clone)]
 pub struct TlsClient {
     connector: TlsConnector,
     server_name: ServerName<'static>,
+    peer_certs: Option<Arc<PeerCerts>>,
 }
 
 impl TlsClient {
@@ -61,7 +89,16 @@ impl TlsClient {
         Self {
             connector,
             server_name,
+            peer_certs: None,
         }
+    }
+
+    /// Pins each peer's expected leaf certificate (see [`PeerCerts`]). A dialed
+    /// connection is dropped unless the server presents the pinned certificate for
+    /// that node id.
+    pub fn with_peer_certs(mut self, peer_certs: PeerCerts) -> Self {
+        self.peer_certs = Some(Arc::new(peer_certs));
+        self
     }
 }
 
@@ -151,7 +188,7 @@ impl TcpTransport {
         }
         let addr = *self.peers.get(&to)?;
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
-        tokio::spawn(peer_writer(addr, rx, self.tls.clone()));
+        tokio::spawn(peer_writer(to, addr, rx, self.tls.clone()));
         senders.insert(to, tx.clone());
         Some(tx)
     }
@@ -178,7 +215,7 @@ impl MessageSink for TcpTransport {
 
 /// Establishes one outbound connection to `addr`, wrapping it in client TLS when
 /// configured. `None` on a connect/handshake failure.
-async fn connect(addr: SocketAddr, tls: &Option<TlsClient>) -> Option<ClientStream> {
+async fn connect(to: NodeId, addr: SocketAddr, tls: &Option<TlsClient>) -> Option<ClientStream> {
     let stream = TcpStream::connect(addr).await.ok()?;
     let _ = stream.set_nodelay(true);
     match tls {
@@ -189,6 +226,15 @@ async fn connect(addr: SocketAddr, tls: &Option<TlsClient>) -> Option<ClientStre
                 .connect(tls.server_name.clone(), stream)
                 .await
                 .ok()?;
+            // If `to`'s certificate is pinned, the server must present exactly it —
+            // otherwise this is a CA-valid impostor at the address; drop the link.
+            if let Some(pins) = &tls.peer_certs {
+                if let Some(expected) = pins.get(&to) {
+                    if !leaf_matches(session.get_ref().1.peer_certificates(), expected) {
+                        return None;
+                    }
+                }
+            }
             Some(Either::Right(session))
         }
     }
@@ -197,11 +243,16 @@ async fn connect(addr: SocketAddr, tls: &Option<TlsClient>) -> Option<ClientStre
 /// Drains a peer's outbound queue to a (TLS or plain) connection, connecting on
 /// demand and reconnecting after a failure. Frames sent while the peer is
 /// unreachable are dropped (loss is tolerated by the protocol).
-async fn peer_writer(addr: SocketAddr, mut rx: mpsc::Receiver<Frame>, tls: Option<TlsClient>) {
+async fn peer_writer(
+    to: NodeId,
+    addr: SocketAddr,
+    mut rx: mpsc::Receiver<Frame>,
+    tls: Option<TlsClient>,
+) {
     let mut conn: Option<Framed<ClientStream, LengthDelimitedCodec>> = None;
     while let Some(frame) = rx.recv().await {
         if conn.is_none() {
-            match connect(addr, &tls).await {
+            match connect(to, addr, &tls).await {
                 Some(stream) => conn = Some(Framed::new(stream, LengthDelimitedCodec::new())),
                 None => continue,
             }
@@ -224,13 +275,16 @@ pub fn serve(listener: TcpListener, inbox: mpsc::Sender<Envelope>) -> JoinHandle
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
             let _ = stream.set_nodelay(true);
-            tokio::spawn(read_connection(Either::Left(stream), inbox.clone()));
+            tokio::spawn(read_connection(Either::Left(stream), inbox.clone(), None));
         }
     })
 }
 
 /// Like [`serve`] but completes a TLS handshake (`acceptor`, with client-cert
 /// verification for mutual TLS) on each inbound connection before reading frames.
+/// The wire `from` is **trusted** — for a trusted network, or where every node
+/// shares one certificate. Use [`serve_tls_verified`] to authenticate per-node
+/// identity instead.
 pub fn serve_tls(
     listener: TcpListener,
     inbox: mpsc::Sender<Envelope>,
@@ -243,15 +297,56 @@ pub fn serve_tls(
             let inbox = inbox.clone();
             tokio::spawn(async move {
                 if let Ok(session) = acceptor.accept(stream).await {
-                    read_connection(Either::Right(session), inbox).await;
+                    read_connection(Either::Right(session), inbox, None).await;
                 }
             });
         }
     })
 }
 
-/// Reads framed messages from one inbound connection until it closes.
-async fn read_connection(stream: ServerStream, inbox: mpsc::Sender<Envelope>) {
+/// Like [`serve_tls`] but **authenticates each peer's identity** by pinning: after
+/// the handshake the client's presented leaf certificate must equal one of `peers`,
+/// and the matched [`NodeId`] — *not* the self-declared wire `from` — is stamped on
+/// every [`Envelope`]. A connection whose certificate matches no pin is dropped, so
+/// a CA-valid outsider cannot join, and no node can frame messages as another.
+pub fn serve_tls_verified(
+    listener: TcpListener,
+    inbox: mpsc::Sender<Envelope>,
+    acceptor: TlsAcceptor,
+    peers: PeerCerts,
+) -> JoinHandle<()> {
+    let peers = Arc::new(peers);
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let _ = stream.set_nodelay(true);
+            let acceptor = acceptor.clone();
+            let inbox = inbox.clone();
+            let peers = Arc::clone(&peers);
+            tokio::spawn(async move {
+                let Ok(session) = acceptor.accept(stream).await else {
+                    return;
+                };
+                // Authenticate the peer by its pinned leaf certificate; an unknown
+                // certificate (CA-valid but un-pinned) is refused.
+                let Some(id) = authenticated_node(session.get_ref().1.peer_certificates(), &peers)
+                else {
+                    return;
+                };
+                read_connection(Either::Right(session), inbox, Some(id)).await;
+            });
+        }
+    })
+}
+
+/// Reads framed messages from one inbound connection until it closes. When
+/// `identity` is `Some`, every envelope is stamped with that **authenticated** id
+/// (the wire `from` is ignored — impersonation-proof); otherwise the wire `from` is
+/// used.
+async fn read_connection(
+    stream: ServerStream,
+    inbox: mpsc::Sender<Envelope>,
+    identity: Option<NodeId>,
+) {
     let mut framed = Framed::new(stream, LengthDelimitedCodec::new());
     while let Some(item) = framed.next().await {
         let bytes = match item {
@@ -261,7 +356,7 @@ async fn read_connection(stream: ServerStream, inbox: mpsc::Sender<Envelope>) {
         match decode(&bytes) {
             Ok(frame) => {
                 let envelope = Envelope {
-                    from: frame.from,
+                    from: identity.unwrap_or(frame.from),
                     message: frame.message,
                 };
                 match inbox.try_send(envelope) {

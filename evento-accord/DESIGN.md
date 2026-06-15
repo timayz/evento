@@ -255,9 +255,9 @@ that survive a coordinator crash (acceptor set tracks current membership), and
 range movement (re-sharding), and multi-shard executor read routing, plus an opt-in
 linearizable-read **read-index** barrier (`NodeConfig.linearizable_reads`), and a
 region-favouring **fast-path electorate** (Phase D, including a region-derived
-electorate on `DynamicTopology`). **98 tests**
+electorate on `DynamicTopology`). **99 tests**
 (42 unit, 6 cluster, 5 electorate, 3 multi-shard, 10 membership, 1 resharding, 6 executor,
-1 linearizable-stress, 1 shard-executor, 2 TCP, 2 mTLS, 13 simulation, 3 restart,
+1 linearizable-stress, 1 shard-executor, 2 TCP, 3 mTLS, 13 simulation, 3 restart,
 3 fjall-journal), clippy clean,
 stable across repeated runs (the simulation suite is deterministic — see Phase A).
 The full M0–M5 roadmap plus elastic membership (M4) is implemented. **External
@@ -521,9 +521,9 @@ backend (sql/fjall). Phases, in order:
         commits on the fast path and that the property survives a `change_topology`
         epoch bump.
 
-- **Phase E — Production readiness.** 🚧 *In progress.* The items that make it
-  safe to run, not just correct in a lab. **Five of the six items are done; PKI/cert
-  management is deferred** (see below):
+- **Phase E — Production readiness.** ✅ The items that make it safe to run, not
+  just correct in a lab — **all six done** (cert *issuance* stays an external-CA
+  concern; see PKI below):
   - [x] **Cluster-metadata / membership service** — the config-Paxos stand-in is now
         a durable, replicated **metadata log** (the "core" CEP-21 depth: log replay +
         durability, no leader/Raft). Per-epoch single-decree Paxos still decides each
@@ -548,10 +548,22 @@ backend (sql/fjall). Phases, in order:
         `/metrics` HTTP endpoint and serves the string, alongside the existing
         `tracing` events. (A live `prometheus`-crate registry behind an optional cargo
         feature is the future path if ever wanted; unwarranted for 9 plain counters.)
-  - [ ] **PKI / cert management** — issuance, rotation, per-node identities (the
-        TLS tests use a self-signed shared cert). *Deferred — cert issuance is an
-        external-CA concern; the TLS API already accepts an operator-supplied rustls
-        connector/acceptor, so per-node identities are wireable today.*
+  - [x] **PKI / per-node identities** — mutual TLS now **authenticates each peer's
+        identity by certificate pinning** (`serve_tls_verified` + `TlsClient::with_peer_certs`,
+        `tcp.rs`): the operator supplies a `NodeId → leaf-cert` map (`PeerCerts`), and a
+        connection is bound to the `NodeId` whose pinned leaf it presents — matched by
+        DER byte-comparison, so **no x509-parsing dependency**. On a verified inbound
+        connection the authenticated id, **not** the self-declared wire `from`, is
+        stamped on every `Envelope`, so a node can only act as itself (no forged
+        ballots/votes/commits); a CA-valid but **un-pinned** certificate is refused
+        outright. The client side pins each peer too, defeating a CA-valid impostor at
+        a peer's address. `tests/tls_cluster.rs` gives every node its **own** leaf and
+        proves replication + one-winner conflict resolution over per-node-pinned mTLS,
+        and that an un-pinned outsider's frames are never handled while a pinned peer's
+        are. The trusted-network `serve_tls`/`TlsClient::new` paths are unchanged.
+        *External/operator concerns (not code here):* cert **issuance** (an external CA)
+        and **hot rotation** (swap the acceptor/connector + pin map; a possible future
+        helper).
   - [x] **Format & upgrade story** — every bitcode record (the framed-TCP wire and the
         disk-journal *values*) now carries a 4-byte `[MAGIC | format_version | kind]`
         header (`src/format.rs`, `encode_tagged`/`decode_tagged`), so a layout change
@@ -584,9 +596,10 @@ backend (sql/fjall). Phases, in order:
 **Not production-ready.** This is a faithful, well-tested **reference
 implementation** — verified in a deterministic fault-injection simulation,
 durable, bounded, geo-hardened, observable, and benchmarked (Phases A–C complete,
-Phases D and E partial — Phase E's format-versioning, Prometheus metrics export,
-snapshot-at-scale, backpressure, and the durable replicated metadata log are in,
-leaving only PKI/cert management) — and a strong base to *take* to production. It is suitable for
+**Phase E complete** — format-versioning, Prometheus metrics export, snapshot-at-scale,
+backpressure, the durable replicated metadata log, and per-node TLS identities (cert
+pinning) are all in; cert issuance/rotation stay external concerns — with Phase D
+partial) — and a strong base to *take* to production. It is suitable for
 prototypes, demos, and controlled/low-stakes use. It is **not** yet safe for
 production: external/adversarial verification has only just begun (a Jepsen/Elle
 harness now exists and its first partition run already found that **reads are not
@@ -597,8 +610,9 @@ partition — Jepsen-validated to concurrency 10, after the harness found and fi
 anti-entropy convergence bug), and there is still no independent review and no
 real-cluster soak mileage. The membership/metadata layer is now a durable, replicated
 metadata log (Phase E) with replay and restart-durability, though it still lacks a
-leader for liveness under contention. The gating items are the unchecked boxes in
-Phases D and E above, in roughly that order (verification and soak first). The crate
+leader for liveness under contention. The gating items are the remaining unchecked
+boxes in Phase D above — independent expert review and real-cluster soak (verification
+and soak first). The crate
 version (`2.0.0-alpha.*`) reflects this.
 
 The event-data path is already backend-agnostic (`AccordExecutor` runs on any

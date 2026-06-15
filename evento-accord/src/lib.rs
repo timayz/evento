@@ -50,5 +50,5 @@ pub use message::{CommandState, Key, Message, Status};
 pub use metrics::{Metrics, MetricsSnapshot};
 pub use node::{CommitOutcome, Node, NodeConfig};
 pub use store::{AppliedEntry, InMemoryDataStore, InMemoryJournal};
-pub use tcp::{serve, serve_tls, TcpTransport, TlsClient};
+pub use tcp::{serve, serve_tls, serve_tls_verified, PeerCerts, TcpTransport, TlsClient};
 pub use transport::{Envelope, InMemoryNetwork, InMemorySink};
