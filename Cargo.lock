@@ -1045,6 +1045,7 @@ dependencies = [
  "sea-query",
  "sqlx",
  "sqlx_migrator",
+ "tokio",
 ]
 
 [[package]]

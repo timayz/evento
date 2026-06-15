@@ -327,7 +327,12 @@ backend (sql/fjall). Phases, in order:
   a staged batch in one transaction, and uses an order-preserving `TxnId` key so
   `truncate` is a single range `DELETE`; `tests/sql_journal.rs` (`--features sqlite`)
   proves round-trip of every record type, truncation, batching, and close/reopen
-  durability. ✅ **Group-commit fsync:** the
+  durability. The schema is managed the canonical way — through **`evento-sql-migrator`**
+  (opt-in `accord` feature: a versioned, reversible migration registered in `new()`),
+  so an operator runs one migrator for both their event schema and the consensus
+  journal; `SqlJournal::migrate` is the equivalent self-contained convenience for
+  standalone/test use (identical tables — `VARBINARY(20)` txn / `VARCHAR(64)` meta
+  keys keep the primary keys portable to MySQL). ✅ **Group-commit fsync:** the
   `Journal` trait splits into `stage` (buffer a write) + `flush` (one fsync), and
   the node's inbox loop drains up to `MAX_JOURNAL_BATCH` queued messages, stages
   each, then flushes **once** — so a burst of consensus messages costs a single

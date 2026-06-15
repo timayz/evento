@@ -139,20 +139,36 @@ where
     i64: for<'r> sqlx::Decode<'r, DB> + sqlx::Type<DB>,
     usize: sqlx::ColumnIndex<DB::Row>,
 {
-    /// Creates the journal's tables if absent (idempotent). Safe to call on every
-    /// startup.
+    /// Creates the journal's tables if absent (idempotent) — a self-contained
+    /// convenience for standalone/test use.
+    ///
+    /// The **production** path is `evento-sql-migrator` with its `accord` feature
+    /// (versioned, reversible, tracked migrations alongside the event schema). This
+    /// method and that migration **must produce the same schema** — the table and
+    /// column names and types here are the contract (`VARBINARY(20)` txn key,
+    /// `VARCHAR(64)` meta key, so a BLOB/TEXT primary key never breaks MySQL).
     pub async fn migrate(&self) -> anyhow::Result<()> {
         let tables = [
             Table::create()
                 .table(AccordCommands::Table)
                 .if_not_exists()
-                .col(ColumnDef::new(AccordCommands::Txn).blob().primary_key())
+                .col(
+                    ColumnDef::new(AccordCommands::Txn)
+                        .var_binary(20)
+                        .not_null()
+                        .primary_key(),
+                )
                 .col(ColumnDef::new(AccordCommands::Data).blob().not_null())
                 .to_owned(),
             Table::create()
                 .table(AccordMeta::Table)
                 .if_not_exists()
-                .col(ColumnDef::new(AccordMeta::K).text().primary_key())
+                .col(
+                    ColumnDef::new(AccordMeta::K)
+                        .string_len(64)
+                        .not_null()
+                        .primary_key(),
+                )
                 .col(ColumnDef::new(AccordMeta::V).blob().not_null())
                 .to_owned(),
             Table::create()
@@ -161,6 +177,7 @@ where
                 .col(
                     ColumnDef::new(AccordMetadataLog::Epoch)
                         .big_integer()
+                        .not_null()
                         .primary_key(),
                 )
                 .col(ColumnDef::new(AccordMetadataLog::Layout).blob().not_null())
@@ -171,6 +188,7 @@ where
                 .col(
                     ColumnDef::new(AccordAcceptors::Epoch)
                         .big_integer()
+                        .not_null()
                         .primary_key(),
                 )
                 .col(ColumnDef::new(AccordAcceptors::State).blob().not_null())
