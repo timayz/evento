@@ -73,24 +73,36 @@ backend. Any write that committed before the read is committed on a quorum, whic
 intersects the probe quorum, so it is in the deps — and the local wait fences the read
 behind it.
 
-Validated (`./run.sh --linearizable-reads`):
+Validated (`./run.sh --linearizable-reads`, quorum-preserving `:one` partition unless
+noted; Elle's `:cycle-search-timeout` raised to 60 s so high-contention runs reach a
+*conclusive* verdict instead of timing out):
 
-| Run | Model | Verdict | ops |
-|-----|-------|---------|-----|
-| healthy | strict-serializable | **valid** | 2920 ok, 0 info |
-| `:one` partition | serializable | **valid** | 2788 ok |
-| `:one` partition | strict-serializable | **invalid** (realtime) | 2038 ok |
+| Run | conc | Model | Verdict |
+|-----|------|-------|---------|
+| healthy | 10 | strict-serializable | **valid** (2920 ok) |
+| `:one` partition | 2 | strict-serializable | **valid** (2080 ok) |
+| `:one` partition | 5 | strict-serializable | **valid** (1734 ok) |
+| `:one` partition | 10 | strict-serializable | **invalid** — confirmed `G-nonadjacent-item-realtime` |
+| `:one` partition | 10 | serializable | **valid** (2788 ok) |
 
-So the read-index makes reads **linearizable when healthy** (the stale-read anomaly is
-gone), and the cluster stays **serializable under partition**. A **residual real-time
-anomaly remains under partition**, and it is *not* a serializability cycle (serializable
-is valid): it is **premature visibility** — a node applies a committed write and serves
-it to a read before that write's coordinator has acked its client, and a partition
-widens that window. Closing real-time external consistency under partition needs a
-deeper change (commit-wait, or fencing read visibility to a quorum-durable point); the
-read barrier alone does not provide it. The cost of the barrier is also real: one
-quorum round-trip per read, and it is CP — a partition that leaves no quorum makes reads
-**unavailable** (`:info`) rather than stale.
+So the read-index makes reads **linearizable when healthy**, and the cluster is
+**strict-serializable under quorum-preserving partition up to moderate concurrency**
+(≤5) and **always serializable**. But a **real, contention-dependent strict-
+serializability anomaly remains at high concurrency** (10): a *confirmed* (not a search
+timeout) `G-nonadjacent-item-realtime` — a multi-key cycle of read/write
+anti-dependencies (reads missing the *next* committed write across keys) plus real-time
+edges.
+
+This is **not** the "premature visibility" we first guessed (that framing was wrong —
+the violating edges are `rw` anti-dependencies, i.e. stale reads under load, not a write
+made visible too early), so **commit-wait is not the fix**. The root cause is not yet
+isolated: the read-index discovers a committed write via quorum intersection and waits
+for it to apply locally, which *should* preclude these stale reads, yet under high
+contention some read still misses one. It needs deeper investigation (a likely suspect:
+the interaction of atomic multi-key writes with single-key read barriers that are not
+serialized against each other once reads left the conflict graph). The barrier's cost is
+also real: one quorum round-trip per read, and it is CP — a partition that leaves no
+quorum makes reads **unavailable** (`:info`) rather than stale.
 
 ## Running it
 

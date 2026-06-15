@@ -13,6 +13,16 @@ cd "$(dirname "$0")"
 COMPOSE="docker compose -f docker/docker-compose.yml"
 SECRET="docker/secret"
 
+# Footgun guard: jepsen's clock nemesis bumps CLOCK_REALTIME, which these
+# containers share with the host kernel — running it here would skew YOUR machine's
+# clock. Clock skew must run on real VMs. Force past this only if you know the host
+# is disposable (ALLOW_CLOCK_SKEW=1).
+if [[ " $* " == *clock* && "${ALLOW_CLOCK_SKEW:-0}" != "1" ]]; then
+  echo "ERROR: --faults clock skews the shared host clock under Docker. Run it on" >&2
+  echo "real VMs, or set ALLOW_CLOCK_SKEW=1 if this host's clock is disposable." >&2
+  exit 1
+fi
+
 # 1. One-time SSH keypair shared between control (private) and nodes (public).
 mkdir -p "$SECRET"
 if [ ! -f "$SECRET/jepsen" ]; then

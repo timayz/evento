@@ -89,9 +89,14 @@
         model   (:consistency-model opts)
         faults  (:faults opts)
         db      (ec-db/db)
-        elle    (:checker (append/test {:key-count          key-count
-                                        :max-txn-length     max-append-keys
-                                        :consistency-models [model]}))
+        ;; Give Elle a generous per-SCC cycle-search budget: under high contention
+        ;; the dependency graph forms one huge strongly-connected component, and the
+        ;; default budget times out *inconclusively* (reported as a cycle-search-
+        ;; timeout, not a confirmed anomaly) before it can verify it.
+        elle    (:checker (append/test {:key-count            key-count
+                                        :max-txn-length       max-append-keys
+                                        :cycle-search-timeout 60000
+                                        :consistency-models   [model]}))
         ;; Build ONLY the requested packages and compose them. We can't use
         ;; nc/nemesis-package: it always constructs every package (incl.
         ;; file-corruption, whose setup! downloads a tool and crashes offline) —

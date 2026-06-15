@@ -242,8 +242,10 @@ The full M0–M5 roadmap plus elastic membership (M4) is implemented. **External
 verification has begun**: an independent Jepsen/Elle harness (`evento-accord/jepsen/`,
 self-contained Docker cluster) drives the cluster under partition/kill/pause and checks
 strict-serializability — see Phase D. Its findings: writes are serializable & atomic;
-reads are linearizable with `--linearizable-reads` when healthy, and the cluster stays
-serializable under partition, with a residual real-time gap under partition.
+reads are linearizable with `--linearizable-reads` when healthy and under
+quorum-preserving partition up to moderate concurrency; the cluster is always
+serializable, with a confirmed contention-dependent real-time (stale-read) anomaly
+still open at high concurrency.
 
 ## Production roadmap
 
@@ -424,16 +426,22 @@ backend (sql/fjall). Phases, in order:
         read gap as a lightweight **read-index** that stores nothing (reads never enter
         the conflict graph or journal — `ReadProbe`/`ReadProbeOk` + `Replica::read_probe`
         / `deps_applied`): probe a slow quorum for the deps a read would witness, wait for
-        them to apply locally, then serve. Jepsen results: a **healthy** run is
-        **strict-serializable valid** (2920 ok, reads are linearizable); under a
-        quorum-preserving `:one` partition the cluster stays **serializable** (2788 ok) but
-        strict-serializable still **fails on a real-time anomaly** — and crucially that is
-        *not* a serializability cycle. It is **premature visibility**: a node applies a
-        committed write and serves it to a read before the write's coordinator acks its
-        client, which a partition widens. *Remaining:* close real-time consistency under
-        partition (commit-wait / fence read visibility to a quorum-durable point — a
-        deeper change); clock-skew (off by default — bumps the kernel clock, needs real
-        VMs); then the box can be checked.
+        them to apply locally, then serve. Jepsen results (Elle `:cycle-search-timeout`
+        raised to 60 s so high-contention runs reach a conclusive verdict): a **healthy**
+        run is **strict-serializable valid** (2920 ok, reads linearizable); under a
+        quorum-preserving `:one` partition the cluster is **strict-serializable up to
+        moderate concurrency** (valid at conc 2 and 5) and **always serializable** (conc
+        10, 2788 ok) — but a **confirmed** (not a search timeout), contention-dependent
+        `G-nonadjacent-item-realtime` anomaly appears at **high concurrency** (conc 10):
+        a multi-key cycle of read/write **anti-dependencies** (stale reads under load)
+        plus real-time edges. (An earlier "premature visibility" guess was wrong — the
+        violating edges are `rw`, so commit-wait is *not* the fix.) *Remaining:* isolate
+        and fix this residual high-contention stale-read anomaly (suspect: single-key read
+        barriers no longer serialized against each other once reads left the conflict
+        graph, interacting with atomic multi-key writes); clock-skew (off by default —
+        bumps the shared kernel clock, needs real VMs; the node image now ships a compiler
+        for jepsen's time helper and `run.sh` refuses it under Docker without
+        `ALLOW_CLOCK_SKEW=1`); then the box can be checked.
   - [ ] **Independent expert review** of the protocol and implementation.
   - [ ] **Real-cluster soak + chaos** over days (kills, partitions, clock skew,
         disk pressure, slow disks/links) on actual hardware — zero production
@@ -470,9 +478,11 @@ production: external/adversarial verification has only just begun (a Jepsen/Elle
 harness now exists and its first partition run already found that **reads are not
 linearizable** by default — writes are serializable & atomic, but a read off a lagging
 replica can break real-time order; an opt-in `linearizable_reads` read-index barrier
-makes reads linearizable when healthy — Jepsen-validated strict-serializable — and keeps
-the cluster serializable under partition, though a real-time *premature-visibility* gap
-remains under partition), and there is still no independent review, no real-cluster
+makes reads linearizable when healthy and under quorum-preserving partition up to
+moderate concurrency — Jepsen-validated strict-serializable — and keeps the cluster
+serializable, though a confirmed contention-dependent real-time stale-read anomaly
+remains open at high concurrency), and there is still no independent review, no
+real-cluster
 soak mileage, an unoptimized throughput ceiling, and a stand-in membership/metadata
 layer. The gating items are the unchecked boxes in Phases D and E above, in roughly
 that order (verification and soak first). The crate version (`2.0.0-alpha.*`)

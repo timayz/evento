@@ -12,6 +12,10 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
         openssh-server iptables iproute2 procps sudo curl ca-certificates \
         netcat-openbsd \
+        # gcc + libc headers: jepsen's clock nemesis (--faults clock) compiles a
+        # small C helper on each node to call settimeofday. Harmless to bake in;
+        # clock skew still requires REAL VMs (it bumps the shared kernel clock).
+        gcc libc6-dev ntpdate \
     && rm -rf /var/lib/apt/lists/*
 RUN mkdir -p /opt/jepsen-node /var/lib/jepsen-node /run/sshd /root/.ssh \
     && ssh-keygen -A \
