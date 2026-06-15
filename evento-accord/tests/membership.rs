@@ -447,6 +447,94 @@ async fn a_config_change_survives_a_coordinator_crash() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn concurrent_recovery_of_one_epoch_converges() {
+    // Liveness under contention: every surviving node drives recovery of the SAME
+    // accepted-but-uncommitted epoch at once (what the per-node sweep does). Without
+    // the distinguished-proposer deference they duel ballots and all fail; with it,
+    // the preferred proposer commits and the rest adopt that decision.
+    let net = InMemoryNetwork::new();
+    let abcde = vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
+    let abcd = vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3)];
+
+    let nodes: Vec<TestNode> = abcde
+        .iter()
+        .map(|&id| spawn_node(id, 0, vec![abcde.clone()], &net))
+        .collect();
+
+    // Node 0 makes epoch 1 durable (a quorum accepts) but crashes before committing.
+    nodes[0]
+        .node
+        .propose_topology(1, vec![abcd.clone()])
+        .await
+        .unwrap();
+    net.crash(NodeId(0));
+
+    // All four survivors recover epoch 1 concurrently.
+    let mut handles = Vec::new();
+    for n in &nodes[1..] {
+        let node = n.node.clone();
+        handles.push(tokio::spawn(async move { node.recover_topology(1).await }));
+    }
+    for h in handles {
+        let decided = tokio::time::timeout(Duration::from_secs(10), h)
+            .await
+            .expect("recovery timed out")
+            .unwrap()
+            .expect("recovery converges, not duels to failure");
+        assert_eq!(decided, vec![abcd.clone()], "all recover the same layout");
+    }
+
+    for n in &nodes[1..] {
+        await_epoch(&n.topology, 1).await;
+        assert_eq!(n.topology.nodes(), abcd);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn racing_operator_changes_converge() {
+    // Two operators reconfigure the same epoch to DIFFERENT layouts concurrently.
+    // Single-decree Paxos chooses one; yield-on-conflict makes the loser adopt and
+    // report that same committed layout rather than erroring out under a ballot duel.
+    let net = InMemoryNetwork::new();
+    let abcde = vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
+    let drop_e = vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3)];
+    let drop_d = vec![NodeId(0), NodeId(1), NodeId(2), NodeId(4)];
+
+    let nodes: Vec<TestNode> = abcde
+        .iter()
+        .map(|&id| spawn_node(id, 0, vec![abcde.clone()], &net))
+        .collect();
+
+    let n1 = nodes[1].node.clone();
+    let n2 = nodes[2].node.clone();
+    let x = drop_e.clone();
+    let y = drop_d.clone();
+    let w1 = tokio::spawn(async move { n1.change_topology(1, vec![x]).await });
+    let w2 = tokio::spawn(async move { n2.change_topology(1, vec![y]).await });
+
+    let d1 = tokio::time::timeout(Duration::from_secs(10), w1)
+        .await
+        .expect("w1 timed out")
+        .unwrap()
+        .expect("operator change 1 converges");
+    let d2 = tokio::time::timeout(Duration::from_secs(10), w2)
+        .await
+        .expect("w2 timed out")
+        .unwrap()
+        .expect("operator change 2 converges");
+    assert_eq!(d1, d2, "both operators converge on the one chosen layout");
+    assert!(
+        d1 == vec![drop_e.clone()] || d1 == vec![drop_d.clone()],
+        "the chosen layout is one of the two proposed: {d1:?}"
+    );
+
+    for n in &nodes {
+        await_epoch(&n.topology, 1).await;
+        assert_eq!(n.topology.nodes(), d1[0], "every node installs the chosen layout");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn config_changes_outlive_the_founders() {
     let net = InMemoryNetwork::new();
     let abc = vec![NodeId(0), NodeId(1), NodeId(2)];

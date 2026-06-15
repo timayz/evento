@@ -159,6 +159,11 @@ impl Journal for FjallJournal {
         let meta = self.meta.clone();
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            // Idempotent: the first decided layout for an epoch wins; a re-commit is a
+            // no-op (never overwrite the durable chosen value).
+            if meta.contains_key(&key)? {
+                return Ok(());
+            }
             meta.insert(key, value)?;
             db.persist(PersistMode::SyncAll)?;
             Ok(())

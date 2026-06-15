@@ -195,10 +195,13 @@ impl Journal for InMemoryJournal {
     }
 
     async fn append_metadata(&self, epoch: u64, layout: &[Vec<NodeId>]) -> anyhow::Result<()> {
+        // Idempotent: the first decided layout for an epoch wins (Paxos guarantees it
+        // is the chosen value); a re-commit never overwrites it.
         self.metadata
             .lock()
             .expect("journal poisoned")
-            .insert(epoch, layout.to_vec());
+            .entry(epoch)
+            .or_insert_with(|| layout.to_vec());
         Ok(())
     }
 

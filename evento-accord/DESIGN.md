@@ -255,8 +255,8 @@ that survive a coordinator crash (acceptor set tracks current membership), and
 range movement (re-sharding), and multi-shard executor read routing, plus an opt-in
 linearizable-read **read-index** barrier (`NodeConfig.linearizable_reads`), and a
 region-favouring **fast-path electorate** (Phase D, including a region-derived
-electorate on `DynamicTopology`). **99 tests**
-(42 unit, 6 cluster, 5 electorate, 3 multi-shard, 10 membership, 1 resharding, 6 executor,
+electorate on `DynamicTopology`). **101 tests**
+(42 unit, 6 cluster, 5 electorate, 3 multi-shard, 12 membership, 1 resharding, 6 executor,
 1 linearizable-stress, 1 shard-executor, 2 TCP, 3 mTLS, 13 simulation, 3 restart,
 3 fjall-journal), clippy clean,
 stable across repeated runs (the simulation suite is deterministic — see Phase A).
@@ -540,7 +540,20 @@ backend (sql/fjall). Phases, in order:
         **membership-churn** simulation scenario (`membership_churn_converges` +
         `membership_churn_is_bit_reproducible`) proving the log converges under
         concurrent reconfiguration, writes, and minority churn while data-plane safety
-        holds. *Remaining (deferred): a leader/lease for liveness under contention.*
+        holds. **Liveness under contention** (concurrent proposals for one epoch used to
+        duel ballots and all fail — the sweep's drive-to-completion runs on every node)
+        is provided **without a leader or lease**: a deterministic *distinguished
+        proposer* per epoch (`config_rank` = `members_sorted[epoch % n]`, members sorted
+        by `NodeId`) proposes first while non-preferred automatic recoveries defer by
+        `rank * config_defer_step` and skip if it already committed; and `run_config_paxos`
+        **yields on a `ConfigNack`** — backs off (rank/attempt-asymmetric, so racers
+        desync) and adopts the committed layout instead of escalating ballots forever.
+        Safety is untouched (acceptor logic, ballot monotonicity, and adopt-highest-accepted
+        are unchanged; this only reorders *who proposes when*), and the delays are
+        deterministic so the simulation stays bit-reproducible. `tests/membership.rs`
+        proves N-node concurrent recovery of one epoch and two racing operator changes
+        both converge (they fail without this). `append_metadata` is now genuinely
+        idempotent (first decided layout wins) per its contract.
   - [x] **Metrics export** — `MetricsSnapshot::to_prometheus` /
         `to_prometheus_labeled` render the counters in **Prometheus text exposition
         format** (`accord_*_total` counters, optional labels e.g. the node id),
@@ -609,8 +622,9 @@ makes reads linearizable and the cluster strict-serializable under quorum-preser
 partition — Jepsen-validated to concurrency 10, after the harness found and fixed an
 anti-entropy convergence bug), and there is still no independent review and no
 real-cluster soak mileage. The membership/metadata layer is now a durable, replicated
-metadata log (Phase E) with replay and restart-durability, though it still lacks a
-leader for liveness under contention. The gating items are the remaining unchecked
+metadata log (Phase E) with replay, restart-durability, and contention liveness (a
+deterministic distinguished proposer + yield-on-conflict — no leader/lease needed).
+The gating items are the remaining unchecked
 boxes in Phase D above — independent expert review and real-cluster soak (verification
 and soak first). The crate
 version (`2.0.0-alpha.*`) reflects this.

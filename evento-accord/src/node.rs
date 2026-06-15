@@ -80,6 +80,13 @@ pub struct NodeConfig {
     /// consensus messages is never refused (that would break safety/liveness). Set
     /// high enough to never trip in a healthy cluster.
     pub max_commands: usize,
+    /// Control-plane anti-dueling delay. An automatic config-change recovery defers
+    /// by `rank * config_defer_step` (the **distinguished proposer** for an epoch has
+    /// rank 0 and proposes first; others wait, then skip if it already committed), and
+    /// a ballot duel backs off by a rank/attempt-derived multiple of this — so
+    /// concurrent reconfigurations converge instead of livelocking. Deterministic
+    /// (no RNG), so the simulation stays bit-reproducible.
+    pub config_defer_step: Duration,
 }
 
 impl Default for NodeConfig {
@@ -94,6 +101,7 @@ impl Default for NodeConfig {
             phi_threshold: 8.0,
             linearizable_reads: false,
             max_commands: 100_000,
+            config_defer_step: Duration::from_millis(100),
         }
     }
 }
@@ -1855,6 +1863,44 @@ impl Node {
         self.run_config_paxos(epoch, proposed, &acceptors).await
     }
 
+    /// The committed layout for `epoch`, if it is already in the metadata log.
+    fn committed_layout(&self, epoch: u64) -> Option<Vec<Vec<NodeId>>> {
+        self.meta_log
+            .lock()
+            .expect("meta_log poisoned")
+            .entries
+            .get(&epoch)
+            .cloned()
+    }
+
+    /// This node's **rank** for proposing `epoch` among `acceptors`: 0 for the
+    /// *distinguished proposer* `members[epoch % n]` (members sorted by `NodeId` and
+    /// deduplicated — `topology.nodes()` is layout order, which is not stable), then
+    /// 1, 2, … going round the ring. A node absent from the set ranks last. Drives
+    /// the anti-dueling deference: the rank-0 node proposes first, others wait
+    /// `rank * config_defer_step` and skip if it already committed.
+    fn config_rank(&self, epoch: u64, acceptors: &[NodeId]) -> usize {
+        let mut members: Vec<NodeId> = acceptors.to_vec();
+        members.sort_unstable();
+        members.dedup();
+        let n = members.len();
+        if n == 0 {
+            return 0;
+        }
+        let preferred = epoch as usize % n;
+        match members.iter().position(|&m| m == self.id) {
+            Some(mine) => (mine + n - preferred) % n,
+            None => n, // not a member — defer behind everyone
+        }
+    }
+
+    /// Deterministic, rank/attempt-asymmetric ballot-duel backoff: grows with the
+    /// attempt and is offset by this node's rank, so two racing proposers wait
+    /// *different* amounts and one pulls ahead instead of re-colliding every round.
+    fn config_backoff(&self, attempt: usize, rank: usize) -> Duration {
+        self.settings.config_defer_step * (attempt + rank + 1) as u32
+    }
+
     /// The config-Paxos coordinator over an explicit `acceptors` set.
     async fn run_config_paxos(
         &self,
@@ -1863,9 +1909,17 @@ impl Node {
         acceptors: &[NodeId],
     ) -> anyhow::Result<Vec<Vec<NodeId>>> {
         let need = acceptors.len() / 2 + 1;
+        let rank = self.config_rank(epoch, acceptors);
         let mut ballot = Ballot(self.clock.now());
 
-        for _attempt in 0..3 {
+        for attempt in 0..6 {
+            // Yield: if the epoch committed (this round or while we were backing off
+            // from a duel), adopt that decided layout — never our own `proposed`,
+            // which may differ from the chosen value.
+            if let Some(layout) = self.committed_layout(epoch) {
+                *self.config_inbox.lock().expect("config poisoned") = None;
+                return Ok(layout);
+            }
             let (tx, mut rx) = mpsc::unbounded_channel();
             *self.config_inbox.lock().expect("config poisoned") = Some(tx);
 
@@ -1902,6 +1956,11 @@ impl Node {
             }
             if let Some(promised) = nack {
                 *self.config_inbox.lock().expect("config poisoned") = None;
+                // Back off before re-preparing so duelling proposers desync (the
+                // delay is rank/attempt-asymmetric, so two racers never re-collide in
+                // lockstep) — then the top-of-loop committed-check lets the loser
+                // adopt the winner's decision instead of escalating forever.
+                tokio::time::sleep(self.config_backoff(attempt, rank)).await;
                 ballot = self.higher_ballot(promised);
                 continue;
             }
@@ -1941,12 +2000,17 @@ impl Node {
             *self.config_inbox.lock().expect("config poisoned") = None;
 
             if let Some(promised) = nack {
+                tokio::time::sleep(self.config_backoff(attempt, rank)).await;
                 ballot = self.higher_ballot(promised);
                 continue;
             }
             if accepts < need {
                 anyhow::bail!("config accept quorum not reached for epoch {epoch}");
             }
+            return Ok(layout);
+        }
+        // A winner may have committed during our final backoff — adopt it.
+        if let Some(layout) = self.committed_layout(epoch) {
             return Ok(layout);
         }
         anyhow::bail!("config change for epoch {epoch} exhausted its ballots")
@@ -1958,6 +2022,18 @@ impl Node {
     /// fails.
     pub async fn recover_topology(&self, epoch: u64) -> anyhow::Result<Vec<Vec<NodeId>>> {
         let acceptors = self.topology.nodes();
+        // Anti-dueling deference (this is the automatic path, run by the sweep on
+        // every node): the distinguished proposer for `epoch` (rank 0) drives first;
+        // others wait `rank * config_defer_step` and skip if it already committed, so
+        // N concurrent sweeps don't duel. A dead preferred node just means the next
+        // rank takes over after its delay (and the periodic sweep retries).
+        let rank = self.config_rank(epoch, &acceptors);
+        if rank > 0 {
+            tokio::time::sleep(self.settings.config_defer_step * rank as u32).await;
+            if let Some(layout) = self.committed_layout(epoch) {
+                return Ok(layout);
+            }
+        }
         let fallback = self.current_layout();
         let decided = self.run_config_paxos(epoch, fallback, &acceptors).await?;
         self.commit_topology(epoch, &decided, &acceptors).await;
