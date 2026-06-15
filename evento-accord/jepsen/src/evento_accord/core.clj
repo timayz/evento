@@ -66,7 +66,10 @@
    [nil "--faults FAULTS"
     "Comma-separated nemesis faults: partition,kill,pause,clock (clock needs real VMs)."
     :default #{:partition :kill :pause}
-    :parse-fn parse-faults]])
+    :parse-fn parse-faults]
+   [nil "--linearizable-reads"
+    "Enable evento-accord read barriers (linearizable reads; needed for strict-serializable)."
+    :default false]])
 
 (defn evento-test
   "Builds the Jepsen test map from CLI opts."
@@ -103,7 +106,9 @@
                     (faults :clock)                       (conj (nc/clock-package npkg))))]
     (merge tests/noop-test
            opts
-           {:name      (str "evento-accord-" (str/join "+" (sort (map name faults))))
+           {:name      (str "evento-accord-"
+                            (if (seq faults) (str/join "+" (sort (map name faults))) "healthy")
+                            (when (:linearizable-reads opts) "-linreads"))
             :os        os/noop
             :db        db
             :client    (ec-client/client)

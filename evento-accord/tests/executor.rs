@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use evento_accord::{
     AccordExecutor, DataStore, ExecutorDataStore, HybridLogicalClock, InMemoryJournal,
-    InMemoryNetwork, Journal, MessageSink, Node, NodeId, StaticTopology,
+    InMemoryNetwork, Journal, MessageSink, Node, NodeConfig, NodeId, StaticTopology,
 };
 use evento_core::{cursor::Args, Event, EventFilter, Executor, WriteError};
 use evento_fjall::Fjall;
@@ -24,6 +24,15 @@ struct ExecCluster {
 
 impl ExecCluster {
     fn start(n: u64) -> Self {
+        Self::start_with(n, false)
+    }
+
+    /// A cluster whose nodes serve **linearizable** reads (read barriers on).
+    fn start_linearizable(n: u64) -> Self {
+        Self::start_with(n, true)
+    }
+
+    fn start_with(n: u64, linearizable_reads: bool) -> Self {
         let ids: Vec<NodeId> = (0..n).map(NodeId).collect();
         let net = InMemoryNetwork::new();
 
@@ -44,7 +53,11 @@ impl ExecCluster {
             let datastore: Arc<dyn DataStore> = Arc::new(ExecutorDataStore::new(fjall.clone()));
             let journal: Arc<dyn Journal> = Arc::new(InMemoryJournal::new());
             let topology = Arc::new(StaticTopology::new(id, ids.clone()));
-            let node = Node::new(id, topology, clock, sink, datastore, journal);
+            let node =
+                Node::new(id, topology, clock, sink, datastore, journal).with_config(NodeConfig {
+                    linearizable_reads,
+                    ..Default::default()
+                });
 
             loops.push(node.start(inbox));
             execs.push(AccordExecutor::new(node, fjall));
@@ -139,6 +152,29 @@ async fn read_your_writes_on_the_coordinator() {
         1,
         "the write must be readable on its coordinator"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn linearizable_read_observes_a_write_from_another_node() {
+    let cluster = ExecCluster::start_linearizable(3);
+
+    // Write through node 0 and wait for its own apply.
+    cluster.execs[0]
+        .write(vec![event("k", 1, "Opened")])
+        .await
+        .unwrap();
+
+    // A linearizable read on node 1 — with NO polling — must observe the write:
+    // the read barrier coordinates a read-only transaction whose timestamp orders
+    // after the write, so node 1 applies the write before serving its backend.
+    // (Without the barrier this immediate cross-node read could still be empty.)
+    let events = cluster.read_all(1, "k").await;
+    assert_eq!(
+        events.len(),
+        1,
+        "a linearizable read must observe a write that completed before it began"
+    );
+    assert_eq!(events[0].version, 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

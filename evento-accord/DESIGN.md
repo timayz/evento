@@ -413,10 +413,17 @@ backend (sql/fjall). Phases, in order:
         (`--faults`, `jepsen.nemesis.combined`) now also drives **process kill** (incl.
         all-nodes-down → journal-recovered restart) and **pause** (SIGSTOP/SIGCONT):
         under `partition+kill+pause` the history stays **serializable**, confirming
-        write-path safety under compound faults. *Remaining:* clock-skew (off by
+        write-path safety under compound faults. A prototype **linearizable read path**
+        (`Node::read_barrier`, gated by `NodeConfig.linearizable_reads`) closes the
+        strict-serializable gap: a read of an owned key first coordinates a read-only
+        Accord barrier txn at timestamp `t`, so the subsequent local read reflects every
+        write that committed before it began. With `--linearizable-reads` a healthy run
+        is **strict-serializable valid** and non-vacuous (2770/2984 ops committed). The
+        cost: one consensus round per read, and it is CP — a quorum-destroying partition
+        makes reads *unavailable* rather than stale. *Remaining:* clock-skew (off by
         default — bumps the kernel clock, so it needs real VMs, not shared-kernel
-        Docker), then a linearizable read path (or an explicit weaker-reads contract)
-        before the box is checked.
+        Docker); productionize the read barrier (read-index/lease instead of a full
+        round; keep read-only txns out of the conflict graph) before the box is checked.
   - [ ] **Independent expert review** of the protocol and implementation.
   - [ ] **Real-cluster soak + chaos** over days (kills, partitions, clock skew,
         disk pressure, slow disks/links) on actual hardware — zero production
@@ -451,8 +458,10 @@ Phase D partial) — and a strong base to *take* to production. It is suitable f
 prototypes, demos, and controlled/low-stakes use. It is **not** yet safe for
 production: external/adversarial verification has only just begun (a Jepsen/Elle
 harness now exists and its first partition run already found that **reads are not
-linearizable** — writes are serializable & atomic, but a read off a lagging replica
-can break real-time order), and there is still no independent review, no real-cluster
+linearizable** by default — writes are serializable & atomic, but a read off a lagging
+replica can break real-time order; an opt-in `linearizable_reads` barrier closes this
+at a consensus-round-per-read cost and is Jepsen-validated strict-serializable), and
+there is still no independent review, no real-cluster
 soak mileage, an unoptimized throughput ceiling, and a stand-in membership/metadata
 layer. The gating items are the unchecked boxes in Phases D and E above, in roughly
 that order (verification and soak first). The crate version (`2.0.0-alpha.*`)

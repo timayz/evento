@@ -43,6 +43,7 @@
                     "export LISTEN=0.0.0.0:" accord-port "\n"
                     "export HTTP_PORT=" http-port "\n"
                     "export DATA_DIR=" data-dir "\n"
+                    "export LINEARIZABLE_READS=" (if (:linearizable-reads test) "1" "0") "\n"
                     "exec " binary "\n")]
     (c/exec :bash :-c
             (str "cat > " launcher " <<'LAUNCH_EOF'\n" script "LAUNCH_EOF"))

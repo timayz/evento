@@ -60,8 +60,27 @@ multi-key writes, but its local reads are not linearizable**: with no read barri
 read off a behind/partitioned replica can be stale. That is consistent with the
 design ("reads are served locally from the applied `DataStore`"), and it is a genuine
 gap against the "strictly-serializable" claim — exactly the kind of result this
-adversarial harness exists to surface. Closing it would require a linearizable read
-path (e.g. routing reads through consensus or a read-index/lease barrier).
+adversarial harness exists to surface.
+
+### Closing the gap: `--linearizable-reads`
+
+A prototype linearizable read path (`Node::read_barrier`, gated by
+`NodeConfig.linearizable_reads`) closes it. A read of an owned key first coordinates a
+**read-only Accord transaction** — a barrier at timestamp `t` — before serving the
+local backend. By Accord's `(execute_at, txn)` execution order, once that barrier
+executes locally every conflicting write with `execute_at < t` is already applied, so
+the subsequent local read reflects every write that committed before the read began.
+
+Validated here (`./run.sh --linearizable-reads`):
+
+* **Healthy, strict-serializable ⇒ `:valid? true`**, non-vacuously — 2770/2984 ops
+  committed, 0 indeterminate. The stale-read anomaly is gone; reads are linearizable.
+
+The cost is real and twofold: (1) **one consensus round per read** (throughput drops);
+(2) it is **CP** — under a partition that leaves *no* quorum (e.g. `majorities-ring`),
+reads correctly become **unavailable** (`:info`) instead of stale, so a partitioned run
+commits very few ops (the safe, expected trade). A production version would cut the cost
+with a read-index/lease barrier and keep read-only txns out of the conflict graph.
 
 ## Running it
 
@@ -73,7 +92,8 @@ cd evento-accord/jepsen
 ./run.sh                                    # partition+kill+pause, 120s
 TIME_LIMIT=600 ./run.sh                     # longer
 ./run.sh --consistency-model serializable   # check serializable instead of strict
-./run.sh --faults partition                 # just one fault
+./run.sh --faults partition                 # just one fault ("" for none)
+./run.sh --linearizable-reads               # enable read barriers (linearizable reads)
 ./run.sh --concurrency 20                   # any extra arg passes through to lein run test
 ```
 

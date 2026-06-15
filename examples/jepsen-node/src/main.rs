@@ -49,7 +49,7 @@ use evento::cursor::Args;
 use evento::{Event, EventFilter, Executor, Fjall, WriteError};
 use evento_accord::{
     serve, AccordExecutor, DataStore, ExecutorDataStore, FjallJournal, HybridLogicalClock, Journal,
-    MessageSink, Node, NodeId, StaticTopology, TcpTransport, Topology,
+    MessageSink, Node, NodeConfig, NodeId, StaticTopology, TcpTransport, Topology,
 };
 use serde_json::{json, Value as JsonValue};
 use tokio::sync::mpsc;
@@ -113,6 +113,15 @@ async fn main() -> anyhow::Result<()> {
     let (inbox_tx, inbox_rx) = mpsc::channel(1024);
     serve(listener, inbox_tx);
 
+    // LINEARIZABLE_READS=1 fences each owned single-key read with a read-barrier
+    // consensus round (linearizable, strict-serializable). Off → local-only reads
+    // (serializable, faster).
+    let config = NodeConfig {
+        linearizable_reads: std::env::var("LINEARIZABLE_READS")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false),
+        ..Default::default()
+    };
     let node = Node::new(
         id,
         Arc::new(StaticTopology::new(id, ids)) as Arc<dyn Topology>,
@@ -120,7 +129,8 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(TcpTransport::new(id, peers)) as Arc<dyn MessageSink>,
         Arc::new(ExecutorDataStore::new(local.clone())) as Arc<dyn DataStore>,
         journal,
-    );
+    )
+    .with_config(config);
 
     // Rebuild consensus + applied state from the durable journal before serving,
     // so a process restart resumes rather than starts fresh.

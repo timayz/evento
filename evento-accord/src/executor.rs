@@ -176,13 +176,21 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
         // owner. Everything else (owned keys, and broad scans that can't be pinned
         // to one shard) is served from the local backend.
         if let Some(key) = target_key(&aggregators, &routing_key) {
-            if !self.node.owns_key(&key) {
-                if let Some(owner) = self.node.an_owner_of(&key) {
-                    return self
-                        .node
-                        .forward_read(owner, aggregators, routing_key, args)
-                        .await;
+            if self.node.owns_key(&key) {
+                // Linearizable reads: fence the local backend with a read barrier
+                // (a read-only consensus round) so it reflects every write that
+                // committed before this read began, then serve locally. Off by
+                // default — reads stay local-only (serializable, not linearizable).
+                if self.node.linearizable_reads() {
+                    self.node.read_barrier(vec![key]).await?;
                 }
+            } else if let Some(owner) = self.node.an_owner_of(&key) {
+                // NOTE: a forwarded (non-owned, multi-shard) read is not yet
+                // linearized — the owner would need to barrier before serving.
+                return self
+                    .node
+                    .forward_read(owner, aggregators, routing_key, args)
+                    .await;
             }
         }
         self.local.read(aggregators, routing_key, args).await

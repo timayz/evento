@@ -65,6 +65,13 @@ pub struct NodeConfig {
     /// recovered (adaptively, ahead of `recovery_timeout`). Higher tolerates more
     /// latency variance before suspecting.
     pub phi_threshold: f64,
+    /// Serve **linearizable** reads of a single owned key by coordinating a
+    /// read-only barrier transaction (`Node::read_barrier`) before reading the
+    /// local backend, instead of reading possibly-stale local state directly.
+    /// Costs one consensus round per read; off by default (reads stay local and
+    /// fast, but are only serializable — a read off a lagging replica can break
+    /// real-time order).
+    pub linearizable_reads: bool,
 }
 
 impl Default for NodeConfig {
@@ -77,6 +84,7 @@ impl Default for NodeConfig {
             compaction_margin: Duration::from_secs(1),
             max_journal_batch: 128,
             phi_threshold: 8.0,
+            linearizable_reads: false,
         }
     }
 }
@@ -880,10 +888,52 @@ impl Node {
 
     // ----- coordination ---------------------------------------------------
 
+    /// Whether reads should be linearized through a [`read_barrier`](Self::read_barrier).
+    pub fn linearizable_reads(&self) -> bool {
+        self.settings.linearizable_reads
+    }
+
     /// Coordinates appending `events` as one strictly-serializable, atomic
     /// transaction across every shard it touches.
     pub async fn write(&self, events: Vec<Event>) -> anyhow::Result<CommitOutcome> {
         let keys = Self::keys_of(&events);
+        let (outcome, all_fast) = self.coordinate(keys, events).await?;
+        self.metrics.record_outcome(outcome.conflict, all_fast);
+        tracing::debug!(
+            node = self.id.0,
+            txn = ?outcome.txn,
+            conflict = outcome.conflict,
+            fast_path = all_fast,
+            "write complete"
+        );
+        Ok(outcome)
+    }
+
+    /// A **linearizable read barrier**: coordinates a read-only (no-events)
+    /// transaction over `keys`, exactly like a write but appending nothing. Once
+    /// it returns, this node's local replica has executed the barrier at its
+    /// timestamp `t`; by Accord's `(execute_at, txn)` execution order that means
+    /// every conflicting write with `execute_at < t` is already applied locally.
+    /// A subsequent local read of those keys therefore reflects every write that
+    /// committed before the barrier began — i.e. it is linearizable. Costs one
+    /// consensus round; the caller must own the keys (be a replica) so the
+    /// barrier's local apply actually fences this node's reads.
+    pub async fn read_barrier(&self, keys: Vec<Key>) -> anyhow::Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        self.coordinate(keys, Vec::new()).await?;
+        Ok(())
+    }
+
+    /// The shared PreAccept → (Accept) → Commit → Read → Apply coordination for a
+    /// transaction over `keys` appending `events` (empty for a read barrier).
+    /// Returns the outcome and whether it took the one-round fast path.
+    async fn coordinate(
+        &self,
+        keys: Vec<Key>,
+        events: Vec<Event>,
+    ) -> anyhow::Result<(CommitOutcome, bool)> {
         let (plans, union) = self.plan(&keys);
 
         let t0 = self.clock.now();
@@ -989,15 +1039,7 @@ impl Node {
             .execute(&mut rx, &plans, txn, execute_at, shard_deps, events)
             .await?;
         self.deregister(txn);
-        self.metrics.record_outcome(conflict, all_fast);
-        tracing::debug!(
-            node = self.id.0,
-            ?txn,
-            conflict,
-            fast_path = all_fast,
-            "write complete"
-        );
-        Ok(CommitOutcome { txn, conflict })
+        Ok((CommitOutcome { txn, conflict }, all_fast))
     }
 
     /// Commit → Read → Apply: drive the atomic decision across all touched
