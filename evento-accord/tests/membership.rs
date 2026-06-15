@@ -79,6 +79,18 @@ async fn await_len(store: &InMemoryDataStore, len: usize) -> Vec<AppliedEntry> {
     panic!("store did not reach {len} applied entries");
 }
 
+/// Waits until `store` holds at least `n` committed events (works for a node that
+/// bootstrapped via snapshot, whose applied log does not replay each transaction).
+async fn await_committed(store: &InMemoryDataStore, n: usize) {
+    for _ in 0..1000 {
+        if store.committed_events().len() >= n {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("store did not reach {n} committed events");
+}
+
 /// Waits until `topology` reaches at least `epoch` (config commits propagate
 /// asynchronously after the Paxos decision).
 async fn await_epoch(topology: &DynamicTopology, epoch: u64) {
@@ -134,10 +146,17 @@ async fn a_joining_node_bootstraps_and_then_participates() {
     let imported = d.node.join(NodeId(0)).await.unwrap();
     assert_eq!(imported, 2, "D must import both committed transactions");
 
-    // D now holds the pre-join state.
-    let d_log = d.store.applied_log();
-    assert_eq!(d_log.len(), 2);
-    assert!(d_log.iter().all(|e| !e.conflict));
+    // D now holds the pre-join state, materialised from the bootstrap snapshot.
+    assert_eq!(
+        d.store.version("test/Account", "acc").await.unwrap(),
+        2,
+        "D must hold the pre-join aggregate version"
+    );
+    assert_eq!(
+        d.store.committed_events().len(),
+        2,
+        "both committed events are present"
+    );
 
     // A subsequent write coordinates over the 4-node epoch; D participates.
     nodes.push(d);
@@ -148,17 +167,82 @@ async fn a_joining_node_bootstraps_and_then_participates() {
         .unwrap();
     assert!(!outcome.conflict);
 
-    // Every node — including the freshly-joined D — converges on all 3 events.
+    // Every node — including the freshly-joined D — converges on all 3 committed
+    // events. (D materialised the pre-join pair from the bootstrap snapshot, so we
+    // compare committed state rather than per-entry applied-log replay.)
     for n in &nodes {
-        let log = await_len(&n.store, 3).await;
-        let order: Vec<_> = log.iter().map(|e| (e.txn, e.conflict)).collect();
-        assert_eq!(order.len(), 3);
+        await_committed(&n.store, 3).await;
     }
 
-    // The joined node's view matches the founders' global order.
-    let order0: Vec<_> = nodes[0].store.applied_log().iter().map(|e| e.txn).collect();
-    let order_d: Vec<_> = nodes[3].store.applied_log().iter().map(|e| e.txn).collect();
-    assert_eq!(order0, order_d, "joined node agrees on the global order");
+    // The joined node's committed state matches the founders'.
+    use std::collections::BTreeSet;
+    let committed0: BTreeSet<_> = nodes[0].store.committed_events().into_iter().collect();
+    let committed_d: BTreeSet<_> = nodes[3].store.committed_events().into_iter().collect();
+    assert_eq!(
+        committed0, committed_d,
+        "joined node agrees on the committed state"
+    );
+}
+
+/// A node joins a cluster whose contact has already **compacted and truncated**
+/// the pre-join commands: the joiner must still converge, reconstructing the lost
+/// state from the contact's data-store snapshot rather than command replay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joining_node_bootstraps_from_a_compacted_contact() {
+    use evento_accord::Timestamp;
+
+    let net = InMemoryNetwork::new();
+    let abc = vec![NodeId(0), NodeId(1), NodeId(2)];
+    let abcd = vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3)];
+
+    let mut nodes: Vec<TestNode> = abc
+        .iter()
+        .map(|&id| spawn_node(id, 0, vec![abc.clone()], &net))
+        .collect();
+
+    // Build up three committed events, then let everyone converge.
+    for (v, name) in [(1, "Opened"), (2, "Deposited"), (3, "Withdrawn")] {
+        nodes[0].node.write(vec![event("acc", v, name)]).await.unwrap();
+    }
+    for n in &nodes {
+        await_committed(&n.store, 3).await;
+    }
+
+    // Compact the contact (A) above every committed transaction: its in-memory
+    // commands and journal records for the pre-join writes are now gone — only its
+    // data store retains the materialised state.
+    let high = Timestamp {
+        micros: u64::MAX,
+        logical: 0,
+        node: NodeId(0),
+    };
+    nodes[0].node.compact(high).await;
+
+    // A fourth node joins, bootstrapping from the compacted contact A.
+    let d = spawn_node(NodeId(3), 0, vec![abc.clone()], &net);
+    d.node.begin_join();
+    nodes[0].node.change_topology(1, vec![abcd.clone()]).await.unwrap();
+    await_epoch(&d.topology, 1).await;
+    let imported = d.node.join(NodeId(0)).await.unwrap();
+    assert_eq!(
+        imported, 0,
+        "the contact had compacted away every command; state came via the snapshot"
+    );
+
+    // D reconstructed the pre-join state from the snapshot alone.
+    await_committed(&d.store, 3).await;
+    use std::collections::BTreeSet;
+    let committed0: BTreeSet<_> = nodes[0].store.committed_events().into_iter().collect();
+    let committed_d: BTreeSet<_> = d.store.committed_events().into_iter().collect();
+    assert_eq!(committed0, committed_d, "joiner matches the compacted contact");
+
+    // And D participates in a new write over the 4-node epoch.
+    nodes.push(d);
+    let outcome = nodes[0].node.write(vec![event("acc", 4, "Closed")]).await.unwrap();
+    assert!(!outcome.conflict);
+    for n in &nodes {
+        await_committed(&n.store, 4).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

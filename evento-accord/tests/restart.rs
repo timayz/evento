@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use evento_accord::{
     DataStore, HybridLogicalClock, InMemoryDataStore, InMemoryJournal, InMemoryNetwork, Journal,
-    Node, NodeId, StaticTopology, Topology,
+    Node, NodeId, StaticTopology, Timestamp, Topology,
 };
 use evento_core::Event;
 
@@ -42,7 +42,8 @@ async fn a_node_restarts_from_its_journal() {
     let ids: Vec<NodeId> = (0..3).map(NodeId).collect();
 
     // Journals are kept across the restart (durable); stores/nodes are not.
-    let journals: Vec<Arc<InMemoryJournal>> = (0..3).map(|_| Arc::new(InMemoryJournal::new())).collect();
+    let journals: Vec<Arc<InMemoryJournal>> =
+        (0..3).map(|_| Arc::new(InMemoryJournal::new())).collect();
     let mut stores: Vec<Arc<InMemoryDataStore>> = Vec::new();
     let mut nodes: Vec<Node> = Vec::new();
     let mut tasks: Vec<Vec<tokio::task::JoinHandle<()>>> = Vec::new();
@@ -193,4 +194,104 @@ async fn futures_versions(stores: &[Arc<InMemoryDataStore>]) -> Vec<u16> {
         out.push(s.version("test/Account", "acc").await.unwrap_or(0));
     }
     out
+}
+
+/// After compaction has truncated a node's journal, a restart rebuilds correctly
+/// from the durable data store plus the persisted watermark and the (now empty)
+/// journal tail — it restores the redundancy floor, holds no stale consensus
+/// state, and rejoins the cluster.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_restarts_after_compaction() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let net = InMemoryNetwork::new();
+    let ids: Vec<NodeId> = (0..3).map(NodeId).collect();
+
+    // Both the journal and the data store are durable (kept across the restart);
+    // only the in-memory node state is lost. This models a real disk-backed store.
+    let journals: Vec<Arc<InMemoryJournal>> =
+        (0..3).map(|_| Arc::new(InMemoryJournal::new())).collect();
+    let stores: Vec<Arc<InMemoryDataStore>> =
+        (0..3).map(|_| Arc::new(InMemoryDataStore::new())).collect();
+    let mut nodes: Vec<Node> = Vec::new();
+    let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
+    for &id in &ids {
+        let inbox = net.register(id);
+        let node = Node::new(
+            id,
+            Arc::new(StaticTopology::new(id, ids.clone())) as Arc<dyn Topology>,
+            Arc::new(HybridLogicalClock::new(id)),
+            Arc::new(net.sink(id)),
+            Arc::clone(&stores[id.0 as usize]) as Arc<dyn DataStore>,
+            Arc::clone(&journals[id.0 as usize]) as Arc<dyn Journal>,
+        );
+        tasks.push(node.start(inbox));
+        nodes.push(node);
+    }
+
+    // Commit three events; let all three replicas apply them.
+    for v in 1..=3 {
+        nodes[0].write(vec![event("acc", v)]).await.unwrap();
+    }
+    for s in &stores {
+        await_version(s, "acc", 3).await;
+    }
+
+    // Compact node 1 above every committed transaction: its journal is truncated
+    // to empty and its in-memory commands are dropped, but its durable store keeps
+    // the materialised state.
+    let now_micros = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as u64;
+    let watermark = Timestamp {
+        micros: now_micros + 10_000,
+        logical: 0,
+        node: NodeId(0),
+    };
+    nodes[1].compact(watermark).await;
+    assert_eq!(
+        nodes[1].command_count(),
+        0,
+        "compaction dropped node 1's consensus state"
+    );
+
+    // Restart node 1: drop its in-memory state, rebuild with the SAME (durable)
+    // store and the SAME (truncated) journal.
+    tasks[1].abort();
+    let id = NodeId(1);
+    let inbox = net.register(id);
+    let restarted = Node::new(
+        id,
+        Arc::new(StaticTopology::new(id, ids.clone())) as Arc<dyn Topology>,
+        Arc::new(HybridLogicalClock::new(id)),
+        Arc::new(net.sink(id)),
+        Arc::clone(&stores[1]) as Arc<dyn DataStore>,
+        Arc::clone(&journals[1]) as Arc<dyn Journal>,
+    );
+    restarted.recover_state().await.unwrap();
+
+    // Rebuilt from the durable store + persisted watermark: state intact, no stale
+    // consensus commands replayed (the journal was truncated).
+    assert_eq!(
+        stores[1].version("test/Account", "acc").await.unwrap(),
+        3,
+        "the durable store retained the compacted state"
+    );
+    assert_eq!(
+        restarted.command_count(),
+        0,
+        "nothing to replay from the truncated journal"
+    );
+
+    tasks[1] = restarted.start(inbox);
+    nodes[1] = restarted;
+
+    // A fresh write (above the watermark) lands on the restarted node too.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    nodes[0].write(vec![event("acc", 4)]).await.unwrap();
+    for s in &stores {
+        await_version(s, "acc", 4).await;
+    }
 }

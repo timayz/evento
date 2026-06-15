@@ -22,6 +22,10 @@ use crate::{
 /// Identifies a shard — a partition of the key space with its own replica set.
 pub type ShardId = usize;
 
+/// Identifies a region / datacenter — a locality group of nodes. Used to prefer
+/// same-region peers for lower-latency operations (e.g. read routing).
+pub type RegionId = u16;
+
 /// Outbound transport. The protocol core sends a [`Message`] to a peer by
 /// [`NodeId`]; correlation of responses is by `TxnId` inside the message, not by
 /// the transport. Implementations: in-memory channels (tests) and
@@ -77,6 +81,13 @@ pub trait Topology: Send + Sync + 'static {
         self.node_shard(node) == Some(self.shard_of(key))
     }
 
+    /// The region / datacenter `node` lives in, if regions are configured. Used to
+    /// prefer a same-region peer (e.g. for read routing). The default is `None`
+    /// (no region awareness — all nodes treated as one locality).
+    fn region(&self, _node: NodeId) -> Option<RegionId> {
+        None
+    }
+
     /// Installs a later epoch's shard layout. The default is a no-op (fixed
     /// topologies do not change); [`DynamicTopology`] overrides it.
     fn install(&self, _epoch: u64, _shards: Vec<Vec<NodeId>>) {}
@@ -84,10 +95,49 @@ pub trait Topology: Send + Sync + 'static {
 
 /// Durable command log. Each replica persists its [`CommandState`] per
 /// transaction so it survives restarts and can be replayed during recovery.
+///
+/// Two write paths support **group commit**: [`stage`](Journal::stage) buffers a
+/// write that must be durable no later than the next [`flush`](Journal::flush),
+/// and `flush` makes every staged write durable in one fsync. The node's inbox
+/// loop drains a batch of messages, stages each, then flushes once — amortizing
+/// the fsync across the batch. [`record`](Journal::record) is the immediate
+/// (stage-then-flush) path for callers that need durability right away.
 #[async_trait]
 pub trait Journal: Send + Sync + 'static {
-    /// Durably records (upserts) a replica's state for one transaction.
+    /// Durably records (upserts) a replica's state for one transaction — durable
+    /// by the time it returns (equivalent to [`stage`](Journal::stage) then
+    /// [`flush`](Journal::flush)).
     async fn record(&self, state: &CommandState) -> anyhow::Result<()>;
+
+    /// Buffers a write that must be made durable no later than the next
+    /// [`flush`](Journal::flush). The default is the immediate [`record`] — fine
+    /// for journals that do not (or need not) batch their fsync.
+    async fn stage(&self, state: &CommandState) -> anyhow::Result<()> {
+        self.record(state).await
+    }
+
+    /// Makes every write [`stage`](Journal::stage)d since the last flush durable,
+    /// in one operation (a group-commit fsync). The default is a no-op, since a
+    /// non-batching journal's [`record`]/[`stage`] are already durable.
+    async fn flush(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Discards every record whose transaction is below `before` (its
+    /// transactions are redundant — applied on every replica) and persists
+    /// `before` as the truncation watermark, so a restart sets its redundancy
+    /// floor and trusts the data store for everything below it. Bounds the log to
+    /// in-flight work. The default is a no-op (a non-truncating journal).
+    async fn truncate(&self, before: Timestamp) -> anyhow::Result<()> {
+        let _ = before;
+        Ok(())
+    }
+
+    /// The persisted truncation watermark, if any — the redundancy floor a restart
+    /// restores. The default returns nothing.
+    async fn load_watermark(&self) -> anyhow::Result<Option<Timestamp>> {
+        Ok(None)
+    }
 
     /// Loads the persisted state for `txn`, if any.
     async fn load(&self, txn: TxnId) -> anyhow::Result<Option<CommandState>>;
@@ -133,6 +183,14 @@ pub trait DataStore: Send + Sync + 'static {
         _args: Args,
     ) -> anyhow::Result<ReadResult<Event>> {
         Ok(ReadResult::default())
+    }
+
+    /// All applied events materialised in this store — the bootstrap snapshot a
+    /// joining node installs to reconstruct the state that log truncation has
+    /// removed from the command journal. The default is empty (a store whose
+    /// journal never truncates needs no snapshot).
+    async fn snapshot(&self) -> anyhow::Result<Vec<Event>> {
+        Ok(Vec::new())
     }
 }
 
@@ -198,6 +256,8 @@ pub struct ShardedTopology {
     this: NodeId,
     /// Shard id → replica set. Replica sets are disjoint.
     shards: Vec<Vec<NodeId>>,
+    /// Optional node → region map for region-aware routing (empty ⇒ no regions).
+    regions: std::collections::HashMap<NodeId, RegionId>,
 }
 
 impl ShardedTopology {
@@ -218,7 +278,18 @@ impl ShardedTopology {
             seen.contains(&this),
             "this node {this:?} must belong to a shard"
         );
-        Self { this, shards }
+        Self {
+            this,
+            shards,
+            regions: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Tags nodes with regions for region-aware routing (a node absent from the
+    /// map has no region).
+    pub fn with_regions(mut self, regions: std::collections::HashMap<NodeId, RegionId>) -> Self {
+        self.regions = regions;
+        self
     }
 
     /// Failures a replica set of size `n = 2f + 1` tolerates.
@@ -262,6 +333,10 @@ impl Topology for ShardedTopology {
 
     fn node_shard(&self, node: NodeId) -> Option<ShardId> {
         self.shards.iter().position(|shard| shard.contains(&node))
+    }
+
+    fn region(&self, node: NodeId) -> Option<RegionId> {
+        self.regions.get(&node).copied()
     }
 }
 

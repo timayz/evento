@@ -29,21 +29,57 @@ use tokio::time::{Duration, Instant};
 
 use crate::api::{DataStore, Journal, MessageSink, ShardId, Topology};
 use crate::clock::{Ballot, Clock, HybridLogicalClock, NodeId, Timestamp, TxnId};
+use crate::failure_detector::FailureDetector;
+use crate::metrics::{Metrics, MetricsSnapshot};
 use crate::message::{CommandState, Key, Message, Status};
 use crate::replica::Replica;
 use crate::transport::Envelope;
 
-/// Wait for the fast quorum before falling back to the slow path. Short so a
-/// down node barely delays a write.
-const FAST_TIMEOUT: Duration = Duration::from_millis(50);
-/// Cap on waiting for a slow quorum at later phases (returns as soon as the
-/// quorum is reached; the cap only bounds a genuinely stuck phase).
-const COLLECT_TIMEOUT: Duration = Duration::from_secs(5);
-/// How often the automatic-recovery sweep runs.
-const RECOVERY_INTERVAL: Duration = Duration::from_millis(100);
-/// A transaction unapplied this long is presumed stalled and recovered. Well
-/// above normal write latency so healthy in-flight writes are never disturbed.
-const RECOVERY_TIMEOUT: Duration = Duration::from_millis(300);
+/// Tunable timing/sizing parameters for a [`Node`]. [`Default`] reproduces the
+/// values the cluster shipped with; geo deployments raise the timeouts to match
+/// cross-region round-trips. (The clock-skew bound lives on the injected
+/// [`HybridLogicalClock`] — see `with_max_skew` — since only the clock reads it.)
+#[derive(Debug, Clone, Copy)]
+pub struct NodeConfig {
+    /// Wait for the fast quorum before falling back to the slow path. Short so a
+    /// down node barely delays a write.
+    pub fast_timeout: Duration,
+    /// Cap on waiting for a slow quorum at later phases (returns as soon as the
+    /// quorum is reached; the cap only bounds a genuinely stuck phase).
+    pub collect_timeout: Duration,
+    /// How often the automatic-recovery sweep runs.
+    pub recovery_interval: Duration,
+    /// A transaction unapplied this long is presumed stalled and recovered. Well
+    /// above normal write latency so healthy in-flight writes are never disturbed.
+    pub recovery_timeout: Duration,
+    /// How far behind the present a node's reported redundancy point lags, so a
+    /// not-yet-propagated commit is never skipped when state below the watermark is
+    /// compacted away. Keep it above the clock-skew bound and propagation latency.
+    pub compaction_margin: Duration,
+    /// Most messages the inbox loop stages before forcing a group-commit flush.
+    /// Caps the latency a deferred reply waits for its batch's fsync and the memory
+    /// held for the batch's pending sends.
+    pub max_journal_batch: usize,
+    /// Suspicion threshold for the phi-accrual failure detector: a coordinator
+    /// whose φ exceeds this is presumed dead and its stalled transactions are
+    /// recovered (adaptively, ahead of `recovery_timeout`). Higher tolerates more
+    /// latency variance before suspecting.
+    pub phi_threshold: f64,
+}
+
+impl Default for NodeConfig {
+    fn default() -> Self {
+        Self {
+            fast_timeout: Duration::from_millis(50),
+            collect_timeout: Duration::from_secs(5),
+            recovery_interval: Duration::from_millis(100),
+            recovery_timeout: Duration::from_millis(300),
+            compaction_margin: Duration::from_secs(1),
+            max_journal_batch: 128,
+            phi_threshold: 8.0,
+        }
+    }
+}
 
 /// The result of a coordinated (or recovered) write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +148,13 @@ type ConfigState = Arc<Mutex<HashMap<u64, ConfigAcceptor>>>;
 /// Delivers config-Paxos responses to an in-flight epoch change.
 type ConfigInbox = Arc<Mutex<Option<mpsc::UnboundedSender<Message>>>>;
 
+/// A [`SyncData`](Message::SyncData) payload handed to an in-flight sync: the
+/// contact's `(watermark, snapshot events, recent commands)`.
+type SyncPayload = (Timestamp, Vec<Event>, Vec<CommandState>);
+
+/// Delivers the sync response to an in-flight [`join`](Node::join)/anti-entropy.
+type SyncInbox = Arc<Mutex<Option<mpsc::UnboundedSender<SyncPayload>>>>;
+
 /// A cluster node. Cheap to clone — all state is shared behind `Arc`.
 #[derive(Clone)]
 pub struct Node {
@@ -124,8 +167,8 @@ pub struct Node {
     replica: Arc<Mutex<Replica>>,
     pending: Pending,
     /// Delivers the [`SyncData`](Message::SyncData) response to an in-flight
-    /// [`join`](Node::join).
-    sync_inbox: Arc<Mutex<Option<mpsc::UnboundedSender<Vec<CommandState>>>>>,
+    /// [`join`](Node::join)/anti-entropy.
+    sync_inbox: SyncInbox,
     /// True once this node may process consensus messages. A joining node clears
     /// it (via [`begin_join`](Node::begin_join)) so messages that arrive while it
     /// bootstraps are buffered and replayed, not dropped.
@@ -140,6 +183,16 @@ pub struct Node {
     /// Next id for a forwarded read, and the channels awaiting their replies.
     read_seq: Arc<AtomicU64>,
     read_pending: Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<Message>>>>,
+    /// Latest `applied_through` gossiped by each shard peer (and self); the
+    /// recovery sweep compacts below the per-shard minimum of these.
+    peer_watermarks: Arc<Mutex<HashMap<NodeId, Timestamp>>>,
+    /// Phi-accrual liveness estimator: every inbound message is a heartbeat, and a
+    /// coordinator suspected dead has its stalled transactions recovered.
+    failure_detector: Arc<FailureDetector>,
+    /// Runtime observability counters (writes, paths, recoveries, compactions, …).
+    metrics: Arc<Metrics>,
+    /// Tunable timing/sizing parameters (see [`NodeConfig`]).
+    settings: NodeConfig,
 }
 
 impl Node {
@@ -168,7 +221,41 @@ impl Node {
             config_inbox: Arc::new(Mutex::new(None)),
             read_seq: Arc::new(AtomicU64::new(0)),
             read_pending: Arc::new(Mutex::new(HashMap::new())),
+            peer_watermarks: Arc::new(Mutex::new(HashMap::new())),
+            failure_detector: Arc::new(FailureDetector::new()),
+            metrics: Arc::new(Metrics::new()),
+            settings: NodeConfig::default(),
         }
+    }
+
+    /// Overrides the timing/sizing [`NodeConfig`] (default reproduces the shipped
+    /// values). Call before [`start`](Node::start); geo deployments raise the
+    /// timeouts here.
+    pub fn with_config(mut self, config: NodeConfig) -> Self {
+        self.settings = config;
+        self
+    }
+
+    /// This node's timing/sizing configuration.
+    pub fn config(&self) -> NodeConfig {
+        self.settings
+    }
+
+    /// Number of consensus commands currently held in memory — the state that
+    /// compaction bounds. For tests and observability.
+    pub fn command_count(&self) -> usize {
+        self.replica.lock().expect("replica poisoned").command_count()
+    }
+
+    /// How many transactions this node has taken over via the recovery sweep — a
+    /// healthy cluster recovers nothing. For tests and observability.
+    pub fn recovery_count(&self) -> u64 {
+        self.metrics.recoveries.load(Ordering::Relaxed)
+    }
+
+    /// A point-in-time snapshot of this node's observability counters.
+    pub fn metrics(&self) -> MetricsSnapshot {
+        self.metrics.snapshot()
     }
 
     /// This node's id.
@@ -177,11 +264,33 @@ impl Node {
     }
 
     /// Spawns the inbox loop that drives this node until the network closes.
-    pub fn start(&self, mut inbox: mpsc::UnboundedReceiver<Envelope>) -> JoinHandle<()> {
+    ///
+    /// **Group commit:** each iteration drains up to
+    /// [`max_journal_batch`](NodeConfig::max_journal_batch) already-
+    /// queued messages, stages each one's durable writes, flushes the journal
+    /// **once** for the whole batch, then performs the deferred (durability-gated)
+    /// sends. Under load a burst of consensus messages costs a single fsync; with
+    /// one message in flight it behaves exactly as a per-message sync.
+    pub fn start(&self, mut inbox: mpsc::Receiver<Envelope>) -> JoinHandle<()> {
         let node = self.clone();
         tokio::spawn(async move {
-            while let Some(env) = inbox.recv().await {
-                node.handle(env).await;
+            while let Some(first) = inbox.recv().await {
+                let mut sends = node.handle_staged(first).await;
+                let mut batched = 1;
+                while batched < node.settings.max_journal_batch {
+                    match inbox.try_recv() {
+                        Ok(env) => {
+                            sends.extend(node.handle_staged(env).await);
+                            batched += 1;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let _ = node.journal.flush().await;
+                node.metrics.record_flush();
+                for (to, message) in sends {
+                    node.send(to, message).await;
+                }
             }
         })
     }
@@ -194,7 +303,7 @@ impl Node {
         let node = self.clone();
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(RECOVERY_INTERVAL).await;
+                tokio::time::sleep(node.settings.recovery_interval).await;
                 node.recovery_sweep().await;
             }
         })
@@ -206,6 +315,7 @@ impl Node {
     /// startup before [`start`](Node::start). In-flight (unapplied) transactions
     /// resume via the recovery sweep.
     pub async fn recover_state(&self) -> anyhow::Result<()> {
+        let watermark = self.journal.load_watermark().await?;
         let mut commands = self.journal.load_all().await?;
         commands.sort_by_key(|cmd| (cmd.execute_at, cmd.txn));
 
@@ -214,8 +324,16 @@ impl Node {
             for cmd in &commands {
                 replica.restore(cmd.clone());
             }
+            // Restore the redundancy floor so a dependency on a transaction that
+            // was compacted away before the restart (and is therefore absent from
+            // the truncated journal) counts as already satisfied.
+            if let Some(wm) = watermark {
+                replica.compact(wm);
+            }
         }
-        // Rebuild the data store in execution order from the durable record.
+        // Replay the retained (post-truncation) applied tail into the data store.
+        // The truncated prefix is not in the journal; a durable data store already
+        // holds it, and re-applying the tail is idempotent.
         for cmd in &commands {
             if cmd.status == Status::Applied && cmd.applied_conflict == Some(false) {
                 let _ = self
@@ -227,22 +345,63 @@ impl Node {
         Ok(())
     }
 
-    /// Recovers every currently-stalled transaction this node knows about, then
-    /// runs one anti-entropy round against a peer.
+    /// Compacts consensus state below `before`: drops redundant commands from the
+    /// in-memory replica and truncates the journal, bounding both to in-flight
+    /// work. `before` must be a **cluster-safe** watermark — every replica has
+    /// applied everything below it (the recovery sweep computes this as the
+    /// per-shard minimum; supplied directly here and in tests). The journal is
+    /// truncated to the replica's *actual* resulting watermark, which `compact`
+    /// may clamp below `before` if a local transaction is not yet applied.
+    pub async fn compact(&self, before: Timestamp) {
+        let (previous, watermark) = {
+            let mut replica = self.replica.lock().expect("replica poisoned");
+            let previous = replica.redundant_before();
+            replica.compact(before);
+            (previous, replica.redundant_before())
+        };
+        if watermark > previous {
+            self.metrics.record_compaction();
+            tracing::debug!(node = self.id.0, ?watermark, "compacted consensus state");
+        }
+        let _ = self.journal.truncate(watermark).await;
+    }
+
+    /// Recovers stalled transactions whose coordinator is presumed dead, then runs
+    /// one anti-entropy round against a peer.
+    ///
+    /// A candidate is any unapplied transaction pending past a short grace (one
+    /// sweep interval). It is recovered when its coordinator is **suspected** by
+    /// the phi-accrual failure detector (adaptive — fires as soon as the
+    /// coordinator's heartbeats stop, ahead of the fixed timeout on a slow link),
+    /// or when it has been stalled past `recovery_timeout` (the fixed fallback,
+    /// which guarantees liveness even with no liveness history). Both paths are
+    /// idempotent and ballot-fenced, so concurrent recoveries are safe.
     async fn recovery_sweep(&self) {
         let now = self.clock.now().micros;
-        let cutoff = Timestamp {
-            micros: now.saturating_sub(RECOVERY_TIMEOUT.as_micros() as u64),
+        let micros_ago = |d: Duration| Timestamp {
+            micros: now.saturating_sub(d.as_micros() as u64),
             logical: 0,
             node: NodeId(0),
         };
-        let stuck = self.replica.lock().expect("replica poisoned").stuck(cutoff);
-        for txn in stuck {
-            // Idempotent and ballot-fenced: concurrent recoveries on other nodes
-            // serialize safely; a re-confirm of a healthy txn is harmless.
-            let _ = self.recover(txn).await;
+        let grace = micros_ago(self.settings.recovery_interval);
+        let timeout = micros_ago(self.settings.recovery_timeout);
+
+        let candidates = self.replica.lock().expect("replica poisoned").stuck(grace);
+        for txn in candidates {
+            let coordinator = txn.0.node;
+            let suspected = coordinator != self.id
+                && self
+                    .failure_detector
+                    .suspect(coordinator, self.settings.phi_threshold);
+            let timed_out = txn.0 < timeout;
+            if suspected || timed_out {
+                self.metrics.record_recovery();
+                tracing::debug!(node = self.id.0, ?txn, suspected, timed_out, "recovering stalled transaction");
+                let _ = self.recover(txn).await;
+            }
         }
         self.anti_entropy().await;
+        self.advance_watermark().await;
     }
 
     /// Anti-entropy repair: pull any committed transactions a rotating peer has
@@ -257,20 +416,103 @@ impl Node {
         }
         let next = self.read_seq.fetch_add(1, Ordering::Relaxed) as usize;
         let peer = peers[next % peers.len()];
-        let _ = self.import_from(peer, RECOVERY_INTERVAL).await;
+        let _ = self
+            .import_from(peer, self.settings.recovery_interval, false)
+            .await;
+    }
+
+    /// Gossips this node's redundancy point to its shard peers and compacts below
+    /// the per-shard minimum once every peer has reported. The point is its
+    /// applied-through, lagged by [`compaction_margin`](NodeConfig::compaction_margin)
+    /// so a not-yet-propagated
+    /// commit is never skipped; the per-shard min ensures every replica has
+    /// applied everything below the compaction watermark (a still-behind or
+    /// partitioned peer holds the min down, and an unheard-from peer blocks
+    /// compaction entirely), so dropping that state is safe.
+    async fn advance_watermark(&self) {
+        let now = self.clock.now().micros;
+        let cutoff = Timestamp {
+            micros: now.saturating_sub(self.settings.compaction_margin.as_micros() as u64),
+            logical: 0,
+            node: NodeId(0),
+        };
+        let mine = self
+            .replica
+            .lock()
+            .expect("replica poisoned")
+            .applied_through(cutoff);
+
+        // The disjoint replica set this node belongs to.
+        let my_shard = self.topology.node_shard(self.id);
+        let shard_peers: Vec<NodeId> = self
+            .topology
+            .nodes()
+            .into_iter()
+            .filter(|&n| self.topology.node_shard(n) == my_shard)
+            .collect();
+
+        for &peer in &shard_peers {
+            if peer != self.id {
+                self.send(peer, Message::Watermark { applied_through: mine })
+                    .await;
+            }
+        }
+
+        let watermark = {
+            let mut watermarks = self.peer_watermarks.lock().expect("watermarks poisoned");
+            watermarks.insert(self.id, mine);
+            let mut wm = mine;
+            let mut complete = true;
+            for &peer in &shard_peers {
+                match watermarks.get(&peer) {
+                    Some(&point) => wm = wm.min(point),
+                    None => {
+                        complete = false;
+                        break;
+                    }
+                }
+            }
+            complete.then_some(wm)
+        };
+        if let Some(watermark) = watermark {
+            self.compact(watermark).await;
+        }
     }
 
     // ----- inbox handling -------------------------------------------------
 
-    /// Processes one inbound message.
+    /// Processes one inbound message in full: stages its durable writes, flushes
+    /// the journal, then performs its (durability-gated) sends. Used by the
+    /// bootstrap-replay path; the inbox loop calls
+    /// [`handle_staged`](Self::handle_staged) directly so it can batch the flush
+    /// across a whole drained batch of messages.
     async fn handle(&self, env: Envelope) {
+        let sends = self.handle_staged(env).await;
+        let _ = self.journal.flush().await;
+        self.metrics.record_flush();
+        for (to, message) in sends {
+            self.send(to, message).await;
+        }
+    }
+
+    /// Applies one inbound message to local state, **staging** any journal writes,
+    /// and returns the peer sends to perform once the batch is durable (the caller
+    /// flushes the journal first). Local-channel responses and state changes run
+    /// inline; only durability-gated peer sends are deferred so a reply is never
+    /// observable before the decision behind it is durable.
+    async fn handle_staged(&self, env: Envelope) -> Vec<(NodeId, Message)> {
+        self.metrics.record_message();
+        // Every inbound message is a liveness heartbeat from its sender.
+        self.failure_detector.heartbeat(env.from);
+
         // While bootstrapping, buffer consensus messages for replay after the
         // snapshot is imported. Cluster-management messages (bootstrap + epoch
         // changes) pass through so the node can still sync and learn its layout.
         let control = matches!(
             env.message,
-            Message::SyncRequest
+            Message::SyncRequest { .. }
                 | Message::SyncData { .. }
+                | Message::Watermark { .. }
                 | Message::ConfigPrepare { .. }
                 | Message::ConfigPromise { .. }
                 | Message::ConfigAccept { .. }
@@ -282,10 +524,18 @@ impl Node {
         );
         if !control && !self.bootstrapped.load(Ordering::Acquire) {
             self.join_buffer.lock().expect("buffer poisoned").push(env);
-            return;
+            return Vec::new();
+        }
+
+        // Witness the peer's timestamp so this node's clock tracks the cluster
+        // (bounded by `MAX_SKEW` in the clock) — keeping recovery/compaction
+        // cutoffs valid for every node's transactions even under wall-clock drift.
+        if let Some(txn) = env.message.txn() {
+            self.clock.witness(txn.0);
         }
 
         let from = env.from;
+        let mut out: Vec<(NodeId, Message)> = Vec::new();
         match env.message {
             Message::PreAccept { txn, keys, events } => {
                 // Only handle the keys/events this node owns.
@@ -296,16 +546,15 @@ impl Node {
                     .lock()
                     .expect("replica poisoned")
                     .preaccept(txn, keys, events);
-                self.journal_record(txn).await;
-                self.send(
+                self.journal_stage(txn).await;
+                out.push((
                     from,
                     Message::PreAcceptOk {
                         txn,
                         execute_at,
                         deps,
                     },
-                )
-                .await;
+                ));
             }
             Message::Accept {
                 txn,
@@ -313,15 +562,17 @@ impl Node {
                 execute_at,
                 deps,
             } => {
+                // A slow-path `execute_at` can exceed `t0`; witness it too.
+                self.clock.witness(execute_at);
                 let reply = self
                     .replica
                     .lock()
                     .expect("replica poisoned")
                     .accept(txn, ballot, execute_at, deps);
-                self.journal_record(txn).await;
+                self.journal_stage(txn).await;
                 match reply {
-                    Ok(deps) => self.send(from, Message::AcceptOk { txn, deps }).await,
-                    Err(promised) => self.send(from, Message::Nack { txn, promised }).await,
+                    Ok(deps) => out.push((from, Message::AcceptOk { txn, deps })),
+                    Err(promised) => out.push((from, Message::Nack { txn, promised })),
                 }
             }
             Message::Commit {
@@ -331,12 +582,13 @@ impl Node {
                 events,
                 reply_to,
             } => {
+                self.clock.witness(execute_at);
                 let events = self.owned_events(events);
                 self.replica
                     .lock()
                     .expect("replica poisoned")
                     .commit(txn, execute_at, deps, events, reply_to);
-                self.journal_record(txn).await;
+                self.journal_stage(txn).await;
 
                 // If already applied (e.g. a second recovery), short-circuit the
                 // read phase with the stored outcome.
@@ -347,10 +599,9 @@ impl Node {
                     .applied_result(txn);
                 match applied {
                     Some(conflict) => {
-                        self.send(reply_to, Message::ReadOk { txn, ok: !conflict })
-                            .await;
+                        out.push((reply_to, Message::ReadOk { txn, ok: !conflict }));
                     }
-                    None => self.drive().await,
+                    None => out.extend(self.drive_staged().await),
                 }
             }
             Message::Apply { txn, commit } => {
@@ -366,10 +617,10 @@ impl Node {
                 if already_applied {
                     let reply_to = self.replica.lock().expect("replica poisoned").reply_to(txn);
                     if let Some(reply_to) = reply_to {
-                        self.send(reply_to, Message::Applied { txn }).await;
+                        out.push((reply_to, Message::Applied { txn }));
                     }
                 } else {
-                    self.drive().await;
+                    out.extend(self.drive_staged().await);
                 }
             }
             Message::Recover { txn, ballot } => {
@@ -392,22 +643,46 @@ impl Node {
                     },
                     Err(promised) => Message::Nack { txn, promised },
                 };
-                self.send(from, message).await;
+                out.push((from, message));
             }
-            // Bootstrap: a joining node asks for our committed state.
-            Message::SyncRequest => {
-                let commands = self
-                    .replica
-                    .lock()
-                    .expect("replica poisoned")
-                    .export_applied();
-                self.send(from, Message::SyncData { commands }).await;
+            // Bootstrap / anti-entropy: a node asks for our committed state.
+            Message::SyncRequest { snapshot } => {
+                let (watermark, commands) = {
+                    let replica = self.replica.lock().expect("replica poisoned");
+                    (replica.redundant_before(), replica.export_applied())
+                };
+                // A bootstrapping joiner may be below our truncation watermark, so
+                // it also needs the materialised state command replay no longer
+                // covers; anti-entropy (snapshot = false) only needs the commands.
+                let snapshot = if snapshot {
+                    self.datastore.snapshot().await.unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                out.push((
+                    from,
+                    Message::SyncData {
+                        watermark,
+                        snapshot,
+                        commands,
+                    },
+                ));
             }
-            Message::SyncData { commands } => {
+            Message::SyncData {
+                watermark,
+                snapshot,
+                commands,
+            } => {
                 let tx = self.sync_inbox.lock().expect("sync poisoned").clone();
                 if let Some(tx) = tx {
-                    let _ = tx.send(commands);
+                    let _ = tx.send((watermark, snapshot, commands));
                 }
+            }
+            Message::Watermark { applied_through } => {
+                self.peer_watermarks
+                    .lock()
+                    .expect("watermarks poisoned")
+                    .insert(from, applied_through);
             }
             // Config Paxos — acceptor side.
             Message::ConfigPrepare { epoch, ballot } => {
@@ -432,7 +707,7 @@ impl Node {
                         }
                     }
                 };
-                self.send(from, reply).await;
+                out.push((from, reply));
             }
             Message::ConfigAccept {
                 epoch,
@@ -453,7 +728,7 @@ impl Node {
                         Message::ConfigAccepted { epoch }
                     }
                 };
-                self.send(from, reply).await;
+                out.push((from, reply));
             }
             Message::ConfigCommit { epoch, layout } => {
                 self.topology.install(epoch, layout);
@@ -486,7 +761,7 @@ impl Node {
                     cursors.push(edge.cursor);
                     events.push(edge.node);
                 }
-                self.send(
+                out.push((
                     from,
                     Message::ReadReply {
                         id,
@@ -494,8 +769,7 @@ impl Node {
                         events,
                         page_info,
                     },
-                )
-                .await;
+                ));
             }
             reply @ Message::ReadReply { .. } => {
                 let id = match &reply {
@@ -527,13 +801,17 @@ impl Node {
                 }
             }
         }
+        out
     }
 
     /// Drives execution in execution-timestamp order: applies any transaction
     /// whose decision is known and whose dependencies are satisfied, otherwise
     /// reads (and holds the slot for) the next ready undecided transaction. Re-run
-    /// after any Commit or Apply, since either can unblock more work.
-    async fn drive(&self) {
+    /// after any Commit or Apply, since either can unblock more work. Stages its
+    /// journal writes and returns the (durability-gated) acks to send once the
+    /// caller has flushed.
+    async fn drive_staged(&self) -> Vec<(NodeId, Message)> {
+        let mut out: Vec<(NodeId, Message)> = Vec::new();
         loop {
             // Prefer enacting a decided, ready transaction.
             let apply = self.replica.lock().expect("replica poisoned").next_apply();
@@ -546,9 +824,8 @@ impl Node {
                     .lock()
                     .expect("replica poisoned")
                     .mark_applied(apply.txn, !apply.commit);
-                self.journal_record(apply.txn).await;
-                self.send(apply.reply_to, Message::Applied { txn: apply.txn })
-                    .await;
+                self.journal_stage(apply.txn).await;
+                out.push((apply.reply_to, Message::Applied { txn: apply.txn }));
                 continue;
             }
 
@@ -556,9 +833,9 @@ impl Node {
             let read = self.replica.lock().expect("replica poisoned").next_read();
             let Some(read) = read else { break };
             let ok = self.read_condition(&read.events).await;
-            self.send(read.reply_to, Message::ReadOk { txn: read.txn, ok })
-                .await;
+            out.push((read.reply_to, Message::ReadOk { txn: read.txn, ok }));
         }
+        out
     }
 
     /// Whether every owned event extends its aggregate (version strictly greater
@@ -577,11 +854,13 @@ impl Node {
         true
     }
 
-    /// Persists the current durable state of `txn` to the journal.
-    async fn journal_record(&self, txn: TxnId) {
+    /// Stages the current durable state of `txn` to the journal — durable once the
+    /// caller (the inbox batch loop, or the [`handle`](Self::handle) wrapper)
+    /// flushes.
+    async fn journal_stage(&self, txn: TxnId) {
         let snapshot = self.replica.lock().expect("replica poisoned").snapshot(txn);
         if let Some(state) = snapshot {
-            let _ = self.journal.record(&state).await;
+            let _ = self.journal.stage(&state).await;
         }
     }
 
@@ -613,7 +892,7 @@ impl Node {
                 &mut rx,
                 &plans,
                 |p| p.fast_q,
-                Self::after(FAST_TIMEOUT),
+                Self::after(self.settings.fast_timeout),
                 |m| match m {
                     Message::PreAcceptOk {
                         execute_at, deps, ..
@@ -670,7 +949,7 @@ impl Node {
                     &mut rx,
                     &plans,
                     |p| p.slow_q,
-                    Self::after(COLLECT_TIMEOUT),
+                    Self::after(self.settings.collect_timeout),
                     |m| match m {
                         Message::AcceptOk { deps, .. } => Some(deps),
                         _ => None,
@@ -696,6 +975,14 @@ impl Node {
             .execute(&mut rx, &plans, txn, execute_at, shard_deps, events)
             .await?;
         self.deregister(txn);
+        self.metrics.record_outcome(conflict, all_fast);
+        tracing::debug!(
+            node = self.id.0,
+            ?txn,
+            conflict,
+            fast_path = all_fast,
+            "write complete"
+        );
         Ok(CommitOutcome { txn, conflict })
     }
 
@@ -742,7 +1029,7 @@ impl Node {
                 rx,
                 plans,
                 |p| p.slow_q,
-                Self::after(COLLECT_TIMEOUT),
+                Self::after(self.settings.collect_timeout),
                 |m| match m {
                     Message::ReadOk { ok, .. } => Some(ok),
                     _ => None,
@@ -764,7 +1051,7 @@ impl Node {
                 rx,
                 plans,
                 |p| p.slow_q,
-                Self::after(COLLECT_TIMEOUT),
+                Self::after(self.settings.collect_timeout),
                 |m| match m {
                     Message::Applied { .. } => Some(()),
                     _ => None,
@@ -780,7 +1067,7 @@ impl Node {
         // Read-your-writes: if this coordinator is itself a replica, wait for its
         // own local apply so a subsequent read on this node sees the write.
         if union.contains(&self.id) {
-            let deadline = Self::after(COLLECT_TIMEOUT);
+            let deadline = Self::after(self.settings.collect_timeout);
             while self
                 .replica
                 .lock()
@@ -812,7 +1099,7 @@ impl Node {
             // Gather what every reachable replica knows within a short window,
             // tagged with the responder so deps can be grouped by shard.
             let resp =
-                Self::collect_tagged(&mut rx, all_nodes.len(), Self::after(FAST_TIMEOUT), |m| {
+                Self::collect_tagged(&mut rx, all_nodes.len(), Self::after(self.settings.fast_timeout), |m| {
                     match m {
                         Message::RecoverOk {
                             known,
@@ -944,7 +1231,7 @@ impl Node {
                         &mut rx,
                         &plans,
                         |p| p.slow_q,
-                        Self::after(COLLECT_TIMEOUT),
+                        Self::after(self.settings.collect_timeout),
                         |m| match m {
                             Message::AcceptOk { deps, .. } => Some(Ok(deps)),
                             Message::Nack { promised, .. } => Some(Err(promised)),
@@ -996,7 +1283,7 @@ impl Node {
                 &mut rx,
                 &plans,
                 |p| p.slow_q,
-                Self::after(COLLECT_TIMEOUT),
+                Self::after(self.settings.collect_timeout),
                 |m| match m {
                     Message::PreAcceptOk { .. } => Some(()),
                     _ => None,
@@ -1029,7 +1316,9 @@ impl Node {
     /// Coordinating the epoch change across the cluster (rather than each node
     /// installing an agreed layout) remains future work.
     pub async fn join(&self, contact: NodeId) -> anyhow::Result<usize> {
-        let imported = self.import_from(contact, COLLECT_TIMEOUT).await?;
+        let imported = self
+            .import_from(contact, self.settings.collect_timeout, true)
+            .await?;
 
         // Resume normal processing and replay anything buffered during bootstrap.
         self.bootstrapped.store(true, Ordering::Release);
@@ -1042,18 +1331,51 @@ impl Node {
     }
 
     /// Fetches `contact`'s committed state and imports every command for a key
-    /// this node owns that it does not already have, applying its events. Used by
-    /// both bootstrap ([`join`](Node::join)) and the anti-entropy repair sweep.
-    async fn import_from(&self, contact: NodeId, timeout: Duration) -> anyhow::Result<usize> {
+    /// this node owns that it does not already have. Used by both bootstrap
+    /// ([`join`](Node::join), `want_snapshot = true`) and the anti-entropy repair
+    /// sweep (`false`).
+    ///
+    /// With `want_snapshot`, the contact also ships its materialised data-store
+    /// snapshot and redundancy watermark: a bootstrapping node may be below the
+    /// cluster's truncation point, where command replay alone no longer
+    /// reconstructs the state. It installs the snapshot, adopts the watermark
+    /// (so a dependency on a compacted-away transaction counts as satisfied), and
+    /// imports the recent commands into its conflict graph only — their events are
+    /// already in the snapshot. Anti-entropy needs no snapshot (the watermark is
+    /// the cluster-wide min, so an existing replica has already applied everything
+    /// below it), so it applies each imported command's events as before.
+    async fn import_from(
+        &self,
+        contact: NodeId,
+        timeout: Duration,
+        want_snapshot: bool,
+    ) -> anyhow::Result<usize> {
         let (tx, mut rx) = mpsc::unbounded_channel();
         *self.sync_inbox.lock().expect("sync poisoned") = Some(tx);
-        self.send(contact, Message::SyncRequest).await;
+        self.send(contact, Message::SyncRequest {
+            snapshot: want_snapshot,
+        })
+        .await;
 
         let received = tokio::time::timeout(timeout, rx.recv()).await;
         *self.sync_inbox.lock().expect("sync poisoned") = None;
-        let commands = received
+        let (watermark, snapshot, commands) = received
             .map_err(|_| anyhow::anyhow!("sync timed out"))?
             .ok_or_else(|| anyhow::anyhow!("sync channel closed"))?;
+
+        // Install the materialised snapshot (the truncated prefix and beyond) for
+        // owned keys under a synthetic, sub-watermark id — redundant for ordering
+        // but it sets this node's versions and committed map.
+        let owned_snapshot: Vec<Event> = snapshot
+            .into_iter()
+            .filter(|event| self.topology.owns(self.id, &Key::of(event)))
+            .collect();
+        if !owned_snapshot.is_empty() {
+            let _ = self
+                .datastore
+                .apply(TxnId(watermark), watermark, owned_snapshot, true)
+                .await;
+        }
 
         let mut imported = 0;
         for cmd in commands {
@@ -1068,10 +1390,24 @@ impl Node {
                 .expect("replica poisoned")
                 .import_applied(cmd);
             if inserted {
-                let _ = self.datastore.apply(txn, execute_at, events, commit).await;
+                // On bootstrap the snapshot already materialised these events.
+                if !want_snapshot {
+                    let _ = self.datastore.apply(txn, execute_at, events, commit).await;
+                }
                 imported += 1;
             }
         }
+
+        // A bootstrapping node adopts the contact's (cluster-agreed) redundancy
+        // floor. Anti-entropy must not: its peer's watermark is not the cluster
+        // min, so advancing here could be premature — that is the sweep's job.
+        if want_snapshot {
+            self.replica
+                .lock()
+                .expect("replica poisoned")
+                .compact(watermark);
+        }
+
         Ok(imported)
     }
 
@@ -1129,7 +1465,7 @@ impl Node {
             let mut promises = 0;
             let mut nack: Option<Ballot> = None;
             let mut adopted: Option<(Ballot, Vec<Vec<NodeId>>)> = None;
-            let deadline = Self::after(COLLECT_TIMEOUT);
+            let deadline = Self::after(self.settings.collect_timeout);
             while promises < need {
                 match tokio::time::timeout_at(deadline, rx.recv()).await {
                     Ok(Some(Message::ConfigPromise {
@@ -1178,7 +1514,7 @@ impl Node {
             }
             let mut accepts = 0;
             let mut nack: Option<Ballot> = None;
-            let deadline = Self::after(COLLECT_TIMEOUT);
+            let deadline = Self::after(self.settings.collect_timeout);
             while accepts < need {
                 match tokio::time::timeout_at(deadline, rx.recv()).await {
                     Ok(Some(Message::ConfigAccepted { .. })) => accepts += 1,
@@ -1258,10 +1594,14 @@ impl Node {
     /// falls back to self.
     pub fn an_owner_of(&self, key: &Key) -> Option<NodeId> {
         let replicas = self.topology.replicas(key);
+        let my_region = self.topology.region(self.id);
+        // Prefer an owner in this node's region (lower-latency reads when regions
+        // are configured), then any other owner, then self as a last resort.
         replicas
             .iter()
-            .find(|&&n| n != self.id)
+            .find(|&&n| n != self.id && my_region.is_some() && self.topology.region(n) == my_region)
             .copied()
+            .or_else(|| replicas.iter().find(|&&n| n != self.id).copied())
             .or_else(|| replicas.first().copied())
     }
 
@@ -1291,7 +1631,7 @@ impl Node {
         )
         .await;
 
-        let reply = tokio::time::timeout(COLLECT_TIMEOUT, rx.recv()).await;
+        let reply = tokio::time::timeout(self.settings.collect_timeout, rx.recv()).await;
         self.read_pending
             .lock()
             .expect("reads poisoned")
@@ -1488,5 +1828,222 @@ impl Node {
     /// Sends a single message, ignoring transport-level loss.
     async fn send(&self, to: NodeId, message: Message) {
         let _ = self.sink.send(to, message).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use evento_core::Event;
+
+    use crate::api::{DataStore, Journal, ShardedTopology, Topology};
+    use crate::clock::{HybridLogicalClock, NodeId, Timestamp, TxnId};
+    use crate::message::{CommandState, Key, Message};
+    use crate::store::{InMemoryDataStore, InMemoryJournal};
+    use crate::transport::InMemoryNetwork;
+    use crate::{api::MessageSink, StaticTopology};
+
+    use super::{Node, NodeConfig};
+
+    /// A [`Journal`] that counts `stage`/`flush` calls so a test can observe
+    /// group commit: many staged writes, few flushes.
+    #[derive(Default)]
+    struct CountingJournal {
+        inner: InMemoryJournal,
+        stages: AtomicUsize,
+        flushes: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Journal for CountingJournal {
+        async fn record(&self, state: &CommandState) -> anyhow::Result<()> {
+            self.stage(state).await?;
+            self.flush().await
+        }
+        async fn stage(&self, state: &CommandState) -> anyhow::Result<()> {
+            self.stages.fetch_add(1, Ordering::SeqCst);
+            self.inner.record(state).await
+        }
+        async fn flush(&self) -> anyhow::Result<()> {
+            self.flushes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn load(&self, txn: TxnId) -> anyhow::Result<Option<CommandState>> {
+            self.inner.load(txn).await
+        }
+        async fn load_all(&self) -> anyhow::Result<Vec<CommandState>> {
+            self.inner.load_all().await
+        }
+    }
+
+    fn preaccept(i: u64) -> Message {
+        let txn = TxnId(Timestamp {
+            micros: i + 1,
+            logical: 0,
+            node: NodeId(9),
+        });
+        let agg = format!("acc{i}");
+        let event = Event {
+            id: ulid::Ulid::new(),
+            aggregator_type: "test/Account".into(),
+            aggregator_id: agg.clone(),
+            version: 1,
+            name: "Bumped".into(),
+            ..Default::default()
+        };
+        Message::PreAccept {
+            txn,
+            keys: vec![Key(agg)],
+            events: vec![event],
+        }
+    }
+
+    /// A burst of messages already queued in the inbox is drained as one batch and
+    /// made durable with a **single** `flush` — group commit. Without batching this
+    /// would be one fsync per message.
+    #[tokio::test(start_paused = true)]
+    async fn inbox_drains_a_burst_into_one_group_commit() {
+        const N: u64 = 50;
+        let id = NodeId(0);
+        let ids = vec![id, NodeId(1), NodeId(2)];
+        let net = InMemoryNetwork::new();
+        let inbox = net.register(id);
+        let journal = Arc::new(CountingJournal::default());
+        let node = Node::new(
+            id,
+            Arc::new(StaticTopology::new(id, ids.clone())) as Arc<dyn Topology>,
+            Arc::new(HybridLogicalClock::new(id)),
+            Arc::new(net.sink(NodeId(1))) as Arc<dyn MessageSink>,
+            Arc::new(InMemoryDataStore::new()) as Arc<dyn DataStore>,
+            Arc::clone(&journal) as Arc<dyn Journal>,
+        );
+
+        // Queue the whole burst *before* the loop starts, so its first iteration
+        // drains all of them in one batch.
+        let coordinator = net.sink(NodeId(1));
+        for i in 0..N {
+            coordinator.send(id, preaccept(i)).await.unwrap();
+        }
+
+        let _loop = node.start(inbox);
+
+        // Let the loop drain + flush, then check the counters.
+        for _ in 0..1000 {
+            if journal.stages.load(Ordering::SeqCst) as u64 == N {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            journal.stages.load(Ordering::SeqCst) as u64,
+            N,
+            "every message should stage its record"
+        );
+        assert_eq!(
+            journal.flushes.load(Ordering::SeqCst),
+            1,
+            "the whole queued burst should cost exactly one group-commit flush"
+        );
+    }
+
+    /// A custom [`NodeConfig`] is honoured end to end: a small group-commit batch
+    /// cap splits the same queued burst into several flushes instead of one.
+    #[tokio::test(start_paused = true)]
+    async fn config_caps_the_group_commit_batch() {
+        const N: u64 = 50;
+        const BATCH: usize = 8;
+        let id = NodeId(0);
+        let ids = vec![id, NodeId(1), NodeId(2)];
+        let net = InMemoryNetwork::new();
+        let inbox = net.register(id);
+        let journal = Arc::new(CountingJournal::default());
+        let node = Node::new(
+            id,
+            Arc::new(StaticTopology::new(id, ids.clone())) as Arc<dyn Topology>,
+            Arc::new(HybridLogicalClock::new(id)),
+            Arc::new(net.sink(NodeId(1))) as Arc<dyn MessageSink>,
+            Arc::new(InMemoryDataStore::new()) as Arc<dyn DataStore>,
+            Arc::clone(&journal) as Arc<dyn Journal>,
+        )
+        .with_config(NodeConfig {
+            max_journal_batch: BATCH,
+            ..NodeConfig::default()
+        });
+        assert_eq!(node.config().max_journal_batch, BATCH);
+
+        let coordinator = net.sink(NodeId(1));
+        for i in 0..N {
+            coordinator.send(id, preaccept(i)).await.unwrap();
+        }
+        let _loop = node.start(inbox);
+
+        for _ in 0..1000 {
+            if journal.stages.load(Ordering::SeqCst) as u64 == N {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(journal.stages.load(Ordering::SeqCst) as u64, N);
+        assert_eq!(
+            journal.flushes.load(Ordering::SeqCst),
+            N.div_ceil(BATCH as u64) as usize,
+            "the configured batch cap splits the burst into multiple group commits"
+        );
+    }
+
+    /// A read for a key this node doesn't own is routed to a **same-region** owner
+    /// when regions are configured — even when a remote-region owner is listed
+    /// first in the replica set.
+    #[test]
+    fn read_routing_prefers_a_same_region_owner() {
+        use std::collections::HashMap;
+
+        // Shard 1's owners are listed region-1 first, so a naive "first other
+        // owner" would pick a remote node; region preference must pick node 2.
+        let shards = vec![
+            vec![NodeId(0), NodeId(1)],
+            vec![NodeId(3), NodeId(4), NodeId(2)],
+        ];
+        let regions = HashMap::from([
+            (NodeId(0), 0u16),
+            (NodeId(1), 1),
+            (NodeId(2), 0),
+            (NodeId(3), 1),
+            (NodeId(4), 1),
+        ]);
+        let topology = Arc::new(ShardedTopology::new(NodeId(0), shards).with_regions(regions));
+        let net = InMemoryNetwork::new();
+        let node = Node::new(
+            NodeId(0),
+            topology.clone() as Arc<dyn Topology>,
+            Arc::new(HybridLogicalClock::new(NodeId(0))),
+            Arc::new(net.sink(NodeId(0))) as Arc<dyn MessageSink>,
+            Arc::new(InMemoryDataStore::new()) as Arc<dyn DataStore>,
+            Arc::new(InMemoryJournal::new()) as Arc<dyn Journal>,
+        );
+
+        // A key node 0 does not own (it hashes to shard 1).
+        let key = (0..)
+            .map(|i| Key(format!("k{i}")))
+            .find(|k| topology.shard_of(k) == 1)
+            .expect("a shard-1 key");
+        assert!(!node.owns_key(&key));
+
+        let owner = node.an_owner_of(&key).expect("an owner");
+        assert_eq!(
+            topology.region(owner),
+            Some(0),
+            "read routed to a same-region owner"
+        );
+        assert_eq!(
+            owner,
+            NodeId(2),
+            "the region-0 owner, not the region-1 nodes listed first"
+        );
     }
 }

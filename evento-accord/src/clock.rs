@@ -33,6 +33,16 @@ pub struct Timestamp {
     pub node: NodeId,
 }
 
+impl Timestamp {
+    /// The smallest possible timestamp — the initial redundancy floor (nothing is
+    /// redundant yet) and a natural lower bound.
+    pub const MIN: Timestamp = Timestamp {
+        micros: 0,
+        logical: 0,
+        node: NodeId(0),
+    };
+}
+
 /// The identity of a transaction.
 ///
 /// Equal to the timestamp `t0` proposed by its coordinator during PreAccept; in
@@ -63,36 +73,76 @@ pub trait Clock: Send + Sync + 'static {
     fn witness(&self, observed: Timestamp);
 }
 
-/// Production [`Clock`]: a Hybrid Logical Clock combining wall-clock
-/// microseconds with a logical counter, tagged with this node's [`NodeId`].
+/// Maximum clock skew the Hybrid Logical Clock will adopt from a peer. A
+/// witnessed timestamp more than this far beyond the local wall clock is capped,
+/// so a faulty/far-future timestamp cannot run the clock away. Recovery and
+/// compaction margins (`RECOVERY_TIMEOUT`, `COMPACTION_MARGIN` in `node.rs`) are
+/// kept comfortably above this so the bounded residual skew is absorbed.
+pub const MAX_SKEW_MICROS: u64 = 200_000; // 200ms
+
+/// Wall-clock microseconds since the Unix epoch (0 if the system clock is before
+/// the epoch, which should never happen in practice). The default physical-time
+/// source for [`HybridLogicalClock`].
+pub fn system_micros() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0)
+}
+
+/// Production [`Clock`]: a Hybrid Logical Clock combining a physical-time source
+/// (microseconds) with a logical counter, tagged with this node's [`NodeId`].
 pub struct HybridLogicalClock {
     node: NodeId,
     /// `(micros, logical)` — the high-water mark of physical and logical time.
     state: Mutex<(u64, u32)>,
+    /// Physical-time source in microseconds. The wall clock in production; the
+    /// deterministic simulation injects a virtual source so the clock — and thus
+    /// every timestamp — is bit-reproducible.
+    physical: Box<dyn Fn() -> u64 + Send + Sync>,
+    /// How far beyond the local wall clock a witnessed peer timestamp may push
+    /// this clock (the skew bound). Defaults to [`MAX_SKEW_MICROS`]; tune per
+    /// deployment with [`with_max_skew`](Self::with_max_skew).
+    max_skew_micros: u64,
 }
 
 impl HybridLogicalClock {
-    /// Creates a clock issuing timestamps tagged with `node`.
+    /// Creates a clock issuing timestamps tagged with `node`, driven by the
+    /// wall clock ([`system_micros`]).
     pub fn new(node: NodeId) -> Self {
+        Self::with_physical(node, system_micros)
+    }
+
+    /// Creates a clock with a custom physical-time source (microseconds, from any
+    /// fixed epoch). Used by the deterministic simulation to drive the clock from
+    /// virtual time; production uses [`new`](Self::new).
+    pub fn with_physical(node: NodeId, physical: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
         Self {
             node,
             state: Mutex::new((0, 0)),
+            physical: Box::new(physical),
+            max_skew_micros: MAX_SKEW_MICROS,
         }
     }
 
-    /// Current wall clock in microseconds since the Unix epoch (0 if the system
-    /// clock is before the epoch, which should never happen in practice).
-    fn physical_now() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_micros() as u64)
-            .unwrap_or(0)
+    /// Sets the clock-skew bound — how far a witnessed peer timestamp may push this
+    /// clock beyond its own wall clock. Tune for the deployment's expected drift
+    /// (geo links need more headroom); recovery/compaction margins should stay
+    /// above it. Defaults to [`MAX_SKEW_MICROS`].
+    pub fn with_max_skew(mut self, max_skew_micros: u64) -> Self {
+        self.max_skew_micros = max_skew_micros;
+        self
+    }
+
+    /// The current physical time in microseconds, from the injected source.
+    fn physical_now(&self) -> u64 {
+        (self.physical)()
     }
 }
 
 impl Clock for HybridLogicalClock {
     fn now(&self) -> Timestamp {
-        let phys = Self::physical_now();
+        let phys = self.physical_now();
         let mut guard = self.state.lock().expect("clock poisoned");
         let (micros, logical) = &mut *guard;
 
@@ -114,19 +164,27 @@ impl Clock for HybridLogicalClock {
     }
 
     fn witness(&self, observed: Timestamp) {
-        let phys = Self::physical_now();
+        let phys = self.physical_now();
         let mut guard = self.state.lock().expect("clock poisoned");
         let (micros, logical) = &mut *guard;
 
+        // Bound how far a peer can push this clock: a timestamp more than
+        // MAX_SKEW beyond our own wall clock is capped. A peer within MAX_SKEW is
+        // adopted in full (a lagging node catches up to the cluster); a faulty or
+        // far-future timestamp cannot run the clock away — which, unbounded, would
+        // pin `phys` below `micros` forever and grow the `logical: u32` counter
+        // without bound until it collides.
+        let observed_micros = observed.micros.min(phys.saturating_add(self.max_skew_micros));
+
         // HLC receive rule: the new physical high-water mark is the max of our
-        // physical, the observed physical, and the real wall clock; the logical
-        // counter is reconciled so the result is strictly past both inputs.
-        let high = (*micros).max(observed.micros).max(phys);
-        let new_logical = if high == *micros && high == observed.micros {
+        // physical, the (bounded) observed physical, and the real wall clock; the
+        // logical counter is reconciled so the result is strictly past both inputs.
+        let high = (*micros).max(observed_micros).max(phys);
+        let new_logical = if high == *micros && high == observed_micros {
             (*logical).max(observed.logical) + 1
         } else if high == *micros {
             *logical + 1
-        } else if high == observed.micros {
+        } else if high == observed_micros {
             observed.logical + 1
         } else {
             0
@@ -153,17 +211,59 @@ mod tests {
     }
 
     #[test]
-    fn witness_advances_past_a_future_peer_timestamp() {
-        let clock = HybridLogicalClock::new(NodeId(1));
-        // A peer stamp far in the future relative to our wall clock.
+    fn witness_caps_a_far_future_peer_timestamp_at_max_skew() {
+        // A fixed wall clock so the bound can be asserted exactly.
+        let wall = 1_000_000u64;
+        let clock = HybridLogicalClock::with_physical(NodeId(1), move || wall);
+        // A peer stamp far beyond our wall clock + MAX_SKEW (a faulty/malicious value).
         let future = Timestamp {
-            micros: HybridLogicalClock::physical_now() + 1_000_000_000,
+            micros: wall + 1_000_000_000,
             logical: 7,
             node: NodeId(99),
         };
         clock.witness(future);
         let next = clock.now();
-        assert!(next > future, "{next:?} must be > witnessed {future:?}");
+        assert!(
+            next.micros <= wall + MAX_SKEW_MICROS,
+            "{next:?} must be capped at wall + MAX_SKEW, not the far-future peer value"
+        );
+    }
+
+    #[test]
+    fn witness_adopts_a_peer_within_max_skew() {
+        let wall = 1_000_000u64;
+        let clock = HybridLogicalClock::with_physical(NodeId(1), move || wall);
+        // A peer modestly ahead (within MAX_SKEW): a lagging node catches up.
+        let ahead = Timestamp {
+            micros: wall + MAX_SKEW_MICROS / 2,
+            logical: 3,
+            node: NodeId(2),
+        };
+        clock.witness(ahead);
+        let next = clock.now();
+        assert!(next > ahead, "{next:?} must advance past the adopted peer {ahead:?}");
+        assert!(
+            next.micros >= ahead.micros,
+            "the clock adopted the peer's within-bound physical time"
+        );
+    }
+
+    #[test]
+    fn with_max_skew_overrides_the_default_bound() {
+        let wall = 1_000_000u64;
+        let custom_skew = 50u64; // far tighter than the default
+        let clock =
+            HybridLogicalClock::with_physical(NodeId(1), move || wall).with_max_skew(custom_skew);
+        let future = Timestamp {
+            micros: wall + 1_000_000,
+            logical: 0,
+            node: NodeId(2),
+        };
+        clock.witness(future);
+        assert!(
+            clock.now().micros <= wall + custom_skew,
+            "the configured (tighter) skew bound is enforced"
+        );
     }
 
     #[test]

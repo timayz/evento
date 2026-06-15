@@ -21,11 +21,20 @@ serde.workspace = true
 ulid.workspace = true
 bitcode = { workspace = true, features = ["serde"] }
 tokio-util = { version = "0.7", features = ["codec"] }
+tokio-rustls = "0.26"
 bytes = "1"
 fjall.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true }
+# test-util adds the paused-clock runtime (start_paused) the deterministic
+# simulation uses; the workspace "full" feature set does not include it.
+tokio = { workspace = true, features = ["test-util"] }
 evento-fjall = { path = "../evento-fjall" }
 tempfile = "3.27"
 rand = { workspace = true }
+rcgen = "0.13"
+criterion = "0.5"
+
+[[bench]]
+name = "throughput"
+harness = false

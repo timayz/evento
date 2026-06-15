@@ -71,3 +71,42 @@ async fn journal_survives_close_and_reopen() {
     assert_eq!(loaded.execute_at, b.execute_at);
     assert_eq!(loaded.applied_conflict, Some(false));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn truncation_drops_old_records_and_persists_the_watermark() {
+    let temp = tempfile::Builder::new()
+        .prefix("evento_accord_journal_truncate")
+        .tempdir()
+        .unwrap();
+
+    let old = command(100, 1);
+    let mid = command(200, 2);
+    let new = command(300, 3);
+
+    {
+        let journal = FjallJournal::open(temp.path()).unwrap();
+        journal.record(&old).await.unwrap();
+        journal.record(&mid).await.unwrap();
+        journal.record(&new).await.unwrap();
+        assert!(journal.load_watermark().await.unwrap().is_none());
+
+        // Truncate everything below t0=250: drops `old` and `mid`, keeps `new`.
+        journal.truncate(timestamp(250, 0)).await.unwrap();
+    }
+
+    // Reopen — a fresh process's view of the disk.
+    let journal = FjallJournal::open(temp.path()).unwrap();
+
+    let all = journal.load_all().await.unwrap();
+    assert_eq!(all.len(), 1, "only the record above the watermark survives");
+    assert_eq!(all[0].txn, new.txn);
+    assert!(journal.load(old.txn).await.unwrap().is_none());
+    assert!(journal.load(mid.txn).await.unwrap().is_none());
+
+    // The watermark itself is durable across the reopen.
+    assert_eq!(
+        journal.load_watermark().await.unwrap(),
+        Some(timestamp(250, 0)),
+        "the truncation watermark survives a restart"
+    );
+}

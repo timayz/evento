@@ -232,29 +232,50 @@ recovery, atomic cross-shard conditional appends via the Read→Apply split with
 (drop-in `evento_core::Executor`), and an epoch-versioned `DynamicTopology` with
 node-join bootstrap with buffer-replay, node leave, Paxos-backed epoch changes
 that survive a coordinator crash (acceptor set tracks current membership), and
-range movement (re-sharding), and multi-shard executor read routing. **30 tests**
-(8 unit, 6 cluster, 3 multi-shard, 6 membership, 1 resharding, 3 executor,
-1 shard-executor, 2 TCP, 1 simulation), clippy clean, stable across repeated
-runs. The full M0–M5 roadmap plus elastic membership (M4) is implemented.
+range movement (re-sharding), and multi-shard executor read routing. **64 tests**
+(24 unit, 6 cluster, 3 multi-shard, 7 membership, 1 resharding, 3 executor,
+1 shard-executor, 2 TCP, 2 mTLS, 10 simulation, 3 restart, 2 fjall-journal), clippy
+clean,
+stable across repeated runs (the simulation suite is deterministic — see Phase A).
+The full M0–M5 roadmap plus elastic membership (M4) is implemented.
 
 ## Production roadmap
 
-The above is a faithful, well-tested **reference implementation** — not yet
-production-grade (no crash durability, unbounded in-memory consensus state, no
-adversarial verification). Goal: production-ready, geo-distributed, on any evento
-storage backend (sql/fjall). Phases, in order:
+The above is a faithful, well-tested **reference implementation**. Hardening it
+toward production. **Phases A, B, and C are complete:** the protocol is exercised
+by a deterministic, bit-reproducible fault-injection simulation (crash/partition/
+restart, with correctness oracles); consensus state is durable (disk-backed
+journal, restart recovery), group-commit-batched, and **bounded** (snapshots +
+compaction + log truncation); and it is geo-hardened (bounded clock-skew, tunable
+config, backpressure, a phi-accrual failure detector, region-aware read routing,
+and mutual TLS). Goal: production-ready, geo-distributed, on any evento storage
+backend (sql/fjall). Phases, in order:
 
-- **Phase A — Trust the protocol (verification).** 🚧 *In progress.*
+- **Phase A — Trust the protocol (verification).** ✅
   `tests/simulation.rs` is a seeded fault-injection harness with correctness
   **oracles** (agreement, no double-commit, no lost/phantom commits, no
-  split-brain). Two scenarios: minority-replica churn under a live quorum, and
-  full chaos (writers on random coordinators that crash mid-write while a minority
-  of any nodes churn). Across all seeds, **safety holds** — no split-brain, no
-  double-commit — and after healing the cluster **converges**. The harness already
-  paid off: it found two real gaps (non-convergence from stalled transactions and
-  from missed transactions), both now fixed (see Phase B). *Next:* partitions and
-  node-restart scenarios; then true deterministic simulation (virtual-time runtime
-  / `madsim`) for bit-reproducible failures.
+  split-brain). Four scenarios: minority-replica churn under a live quorum; full
+  chaos (writers on random coordinators that crash mid-write while a minority of
+  any nodes churn); **network partitions** (the cluster is repeatedly split into a
+  live majority {0,1,2} and a stranded minority {3,4}, then healed — a stranded
+  minority must never invent a phantom commit, checked by a `minority_never_ahead`
+  oracle); and **node restarts** (minority nodes are torn down and rebuilt from
+  their durable journal mid-workload, so a restart must never resurrect a stale
+  commit and recovery + anti-entropy must catch the node back up). Across all
+  seeds, **safety holds** — no split-brain, no double-commit — and after healing
+  the cluster **converges**. The harness already paid off: it found two real gaps
+  (non-convergence from stalled transactions and from missed transactions), both
+  now fixed (see Phase B). ✅ **Deterministic runtime:** the tests run under
+  `#[tokio::test(start_paused = true)]` — a single-threaded, virtual-time runtime —
+  with a virtual physical-time source injected into the HLC
+  (`HybridLogicalClock::with_physical`) and deterministic event ids, so a given
+  seed reproduces **exactly** (proven by `simulation_is_bit_reproducible`, which
+  runs a seed twice and asserts byte-identical fingerprints). The protocol core was
+  already order-independent (every map iteration feeding a decision is sorted or
+  keyed; `Replica::stuck` now sorts too). Virtual time also made the suite ~85×
+  faster (no real sleeping). *Possible future step:* `madsim` for a contractually
+  guaranteed deterministic scheduler + simulated network, if the in-process
+  virtual-time guarantee ever proves insufficient.
 - **Phase B — Durability & recovery (delivers the pluggable-storage goal).**
   ✅ **Automatic recovery** (`Node::start_recovery` runs a progress sweep that
   takes over any transaction stalled past a timeout — its coordinator presumed
@@ -266,19 +287,115 @@ storage backend (sql/fjall). Phases, in order:
   the data store on startup; in-flight transactions resume via the sweep.
   `tests/restart.rs` proves a node rebuilds from its journal and rejoins — both
   cleanly and *while writes are in flight*. ✅ **Disk-backed journal:**
-  `FjallJournal` (bitcode-serialized `CommandState`s in a fjall database, fsync
-  per record) is a genuinely durable `Journal`; `tests/fjall_journal.rs` proves
-  records survive a full close/reopen (a real process restart). The `Journal`
-  trait stays open, so a sql-backed journal is a drop-in alternative.
-  *Remaining:* batched/group-commit fsync (today it syncs per consensus message —
-  correct but slow), and snapshots + compaction + log truncation (bounds the
-  journal and the in-memory `Replica.commands`, both currently unbounded — the
-  blocker for long-running deployments).
-- **Phase C — Geo hardening.** Bounded-clock-skew handling, tunable per-link
-  timeouts, region-aware quorum/fast-path placement, TLS + mutual auth, a real
-  failure detector, backpressure.
-- **Phase D — Sign-off.** Jepsen, external review, observability, performance
-  (batching/pipelining), the deferred correctness edge cases.
+  `FjallJournal` (bitcode-serialized `CommandState`s in a fjall database) is a
+  genuinely durable `Journal`; `tests/fjall_journal.rs` proves records survive a
+  full close/reopen (a real process restart). The `Journal` trait stays open, so a
+  sql-backed journal is a drop-in alternative. ✅ **Group-commit fsync:** the
+  `Journal` trait splits into `stage` (buffer a write) + `flush` (one fsync), and
+  the node's inbox loop drains up to `MAX_JOURNAL_BATCH` queued messages, stages
+  each, then flushes **once** — so a burst of consensus messages costs a single
+  fsync instead of one per message, with no weakening of durability (a reply is
+  still deferred until the decision behind it is durable). `FjallJournal::flush`
+  is the `persist(SyncAll)`; the handler refactor returns deferred, durability-
+  gated sends (`handle_staged`/`drive_staged`). A node-level test
+  (`inbox_drains_a_burst_into_one_group_commit`) proves 50 staged records collapse
+  to one flush, and the deterministic simulation confirms safety/convergence are
+  unchanged. ✅ **Snapshots + compaction + log truncation** (bounds both the
+  journal and the in-memory `Replica.commands`/`by_key`, previously unbounded —
+  the blocker for long-running deployments). A **redundancy watermark** (mirroring
+  Accord's `redundantBefore`): below it every replica has applied everything, so
+  the state is redundant. Each node gossips its `applied_through` (lagged by
+  `COMPACTION_MARGIN` so a not-yet-propagated commit is never skipped); the
+  recovery sweep computes the **per-shard minimum** and `Node::compact`s below it —
+  dropping redundant commands (`Replica::compact`, pruning `by_key`) and
+  truncating the journal (`Journal::truncate` + a persisted watermark). `is_ready`
+  treats a dependency missing below the watermark as satisfied (a `Commit`'s
+  quorum-unioned deps can name a compacted-away transaction). A still-behind or
+  partitioned peer holds the min down (and an unheard-from peer blocks compaction),
+  so truncating is always safe. **Catch-up:** only a brand-new joining node can be
+  below the watermark, so `join` transfers a **data-store snapshot**
+  (`DataStore::snapshot`) for the truncated prefix plus the recent commands and the
+  watermark; anti-entropy stays command-based. `recover_state` restores the floor
+  and trusts the durable data store for the prefix, replaying only the journal
+  tail. Validated by the deterministic simulation: a **bound oracle**
+  (`consensus_state_stays_bounded`) proves `command_count` returns to zero after a
+  workload while committed state is preserved, and safety/convergence/bit-
+  reproducibility hold across all seeds with compaction live (churn, partitions,
+  restarts), plus join-after-compaction and restart-after-compaction tests.
+- **Phase C — Geo hardening.** ✅ ✅ **Bounded clock-skew
+  handling:** the HLC now **witnesses** every inbound peer timestamp
+  (`Node::handle_staged` → `Clock::witness`, previously dead code) so node clocks
+  track the cluster — but adoption is **capped at `MAX_SKEW`** beyond the local
+  wall clock (`clock.rs`), so a faulty/far-future timestamp can't run a clock away
+  (which, unbounded, would pin the physical clock below the logical and overflow
+  the `logical` counter). With clocks kept within `MAX_SKEW` and the recovery/
+  compaction margins sized above it, the `now - margin` cutoffs stay valid under
+  drift, so a skewed node no longer stalls recovery or compaction; a node beyond
+  the bound degrades gracefully rather than poisoning peers. Clock unit tests pin
+  the cap and the catch-up; a simulation scenario (`safety_and_bound_hold_under_clock_skew`)
+  proves a skewed cluster stays safe, converges, and keeps state bounded.
+  ✅ **Tunable timing/sizing:** the hard-coded constants are now an injected
+  `NodeConfig` (fast/collect timeouts, recovery interval/timeout, compaction
+  margin, journal-batch cap) with `Default` reproducing the shipped values and a
+  fluent `Node::with_config` (so geo deployments raise the timeouts); the clock's
+  skew bound is likewise tunable via `HybridLogicalClock::with_max_skew`. A node
+  unit test confirms a custom batch cap is honoured end to end.
+  ✅ **Backpressure:** the inbox (`transport.rs`) and per-peer TCP writer/inbox
+  channels (`tcp.rs`) are now **bounded** (`mpsc::channel`, capacity
+  `DEFAULT_INBOX_CAPACITY` / `CHANNEL_CAPACITY`); a full channel **sheds** via
+  `try_send` (loss is already tolerated by quorums/recovery) instead of blocking
+  the sender or growing memory without limit, so a flooding or slow/unreachable
+  peer can't OOM a node. A transport unit test proves a flood past capacity is
+  bounded and never blocks; the deterministic sim (well under capacity) is
+  unaffected.
+  ✅ **Phi-accrual failure detector:** every inbound message is a heartbeat, and a
+  per-peer φ (`failure_detector.rs`, Akka's logistic approximation) accrues from
+  the heartbeat inter-arrival distribution; the recovery sweep takes over a
+  stalled transaction once its coordinator's φ exceeds `NodeConfig.phi_threshold`
+  — adapting to a link's real latency — with the fixed `recovery_timeout` kept as
+  a liveness fallback (so the change is purely additive: never slower than before,
+  and at the default config the fallback still dominates). Unit tests pin the φ
+  math and that a silenced peer is suspected while a regular one is not; sim tests
+  prove that with the fixed timeout disabled the detector alone recovers a crashed
+  coordinator's stalled transaction, and that a healthy cluster recovers nothing.
+  ✅ **Region awareness:** the `Topology` carries optional `region(node)` tags
+  (`RegionId`; `ShardedTopology::with_regions`), and read routing
+  (`Node::an_owner_of`) prefers a **same-region** owner before any other — so a
+  read forwarded for a non-local key stays in-region when possible. Quorum latency
+  needs no change: the coordinator already collects the *first N* responses, so
+  nearby replicas form the quorum naturally. (The deeper region-favoring fast-path
+  *electorate* — single-region commits in one local round-trip — is a larger
+  CEP-15 change left for later; it isn't validatable without a latency model.) A
+  unit test proves a read routes to the same-region owner even when a remote owner
+  is listed first.
+  ✅ **TLS + mutual auth:** the TCP transport can wrap every connection in rustls
+  with mutual certificate auth — `TcpTransport::with_tls` (client side) + `serve_tls`
+  (server side, verifying client certs), the stream becoming plain-or-TLS via
+  `tokio_util::either::Either` so framing/consensus are unchanged. Operators supply
+  the rustls connector/acceptor; plaintext `new`/`serve` stay for trusted networks.
+  `tests/tls_cluster.rs` runs a 3-node cluster over **real mutual-TLS sockets**
+  (rcgen-generated CA + leaf), proving replication and one-winner conflict
+  resolution end to end over an authenticated, encrypted transport.
+- **Phase D — Sign-off.** 🚧 *In progress.* ✅ **Observability:** a per-node
+  `Metrics` (`metrics.rs`) of atomic counters — writes committed/conflicted, fast
+  vs slow path, recoveries, compactions, journal flushes, messages handled —
+  exposed via `Node::metrics()` (a `MetricsSnapshot`) for export to a backend,
+  alongside `tracing` debug events at the same decision points (write outcome,
+  recovery takeover, compaction). A sim test asserts the counters track real
+  activity (clean commits, a raced conflict, transport/journal traffic).
+  ✅ **Performance baseline:** a criterion benchmark (`benches/throughput.rs`,
+  `cargo bench`) measures (a) conflict-free write **latency** — ≈ 0.46 ms (1
+  node), 0.72 ms (3), 1.2 ms (5), growing with quorum size as expected — and (b)
+  **concurrent throughput** (a 64-deep burst). The throughput probe surfaced a
+  real bottleneck: aggregate throughput is *lower* than serial latency predicts,
+  because each node's **single inbox loop** serializes message processing across
+  all in-flight transactions (every write still needs three sequential quorum
+  round-trips through it). So the inbox loop — not the network or fsync — is the
+  throughput ceiling, and parallelizing/pipelining it is the concrete next perf
+  lever, now measurable.
+  *Remaining:* Jepsen, external review, write pipelining (the benchmark now exists
+  to quantify it), and the deferred correctness edge case (the region-favoring
+  fast-path electorate) — largely external/operational rather than core-protocol.
 
 The event-data path is already backend-agnostic (`AccordExecutor` runs on any
 `evento_core::Executor`); Phase B extends that to the consensus state.

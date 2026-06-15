@@ -27,7 +27,9 @@
 pub mod api;
 pub mod clock;
 pub mod executor;
+pub mod failure_detector;
 pub mod fjall_journal;
+pub mod metrics;
 pub mod message;
 pub mod node;
 pub mod replica;
@@ -36,14 +38,16 @@ pub mod tcp;
 pub mod transport;
 
 pub use api::{
-    DataStore, DynamicTopology, Journal, MessageSink, ShardId, ShardedTopology, StaticTopology,
-    Topology,
+    DataStore, DynamicTopology, Journal, MessageSink, RegionId, ShardId, ShardedTopology,
+    StaticTopology, Topology,
 };
-pub use clock::{Ballot, Clock, HybridLogicalClock, NodeId, Timestamp, TxnId};
+pub use clock::{Ballot, Clock, HybridLogicalClock, NodeId, Timestamp, TxnId, MAX_SKEW_MICROS};
 pub use executor::{AccordExecutor, ExecutorDataStore};
+pub use failure_detector::FailureDetector;
 pub use fjall_journal::FjallJournal;
 pub use message::{CommandState, Key, Message, Status};
-pub use node::{CommitOutcome, Node};
+pub use metrics::{Metrics, MetricsSnapshot};
+pub use node::{CommitOutcome, Node, NodeConfig};
 pub use store::{AppliedEntry, InMemoryDataStore, InMemoryJournal};
-pub use tcp::{serve, TcpTransport};
+pub use tcp::{serve, serve_tls, TcpTransport, TlsClient};
 pub use transport::{Envelope, InMemoryNetwork, InMemorySink};

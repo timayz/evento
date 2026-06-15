@@ -32,9 +32,10 @@ pub struct AppliedEntry {
 struct StoreState {
     /// Highest version appended per `(aggregator_type, aggregator_id)`.
     versions: HashMap<(String, String), u16>,
-    /// The event id that committed each `(type, id, version)` — for the
-    /// simulation's split-brain oracle (no two distinct events at one version).
-    committed: HashMap<(String, String, u16), ulid::Ulid>,
+    /// The event that committed each `(type, id, version)` — for the simulation's
+    /// split-brain oracle (no two distinct events at one version) and to serve the
+    /// bootstrap [`snapshot`](DataStore::snapshot).
+    committed: HashMap<(String, String, u16), Event>,
     /// Applied transactions, in the order this replica executed them.
     log: Vec<AppliedEntry>,
 }
@@ -57,14 +58,15 @@ impl InMemoryDataStore {
         self.state.lock().expect("store poisoned").log.clone()
     }
 
-    /// Every `(type, id, version)` committed here and the event that did it.
+    /// Every `(type, id, version)` committed here and the id of the event that did
+    /// it.
     pub fn committed_events(&self) -> Vec<((String, String, u16), ulid::Ulid)> {
         self.state
             .lock()
             .expect("store poisoned")
             .committed
             .iter()
-            .map(|(k, v)| (k.clone(), *v))
+            .map(|(k, v)| (k.clone(), v.id))
             .collect()
     }
 }
@@ -99,7 +101,7 @@ impl DataStore for InMemoryDataStore {
                 state.versions.insert(key.clone(), event.version);
                 state
                     .committed
-                    .insert((key.0, key.1, event.version), event.id);
+                    .insert((key.0, key.1, event.version), event.clone());
             }
         }
 
@@ -111,6 +113,21 @@ impl DataStore for InMemoryDataStore {
 
         Ok(())
     }
+
+    async fn snapshot(&self) -> anyhow::Result<Vec<Event>> {
+        // Every committed event, ordered by (type, id, version) so a consumer that
+        // re-applies them sees each aggregate's versions ascending.
+        let state = self.state.lock().expect("store poisoned");
+        let mut events: Vec<Event> = state.committed.values().cloned().collect();
+        events.sort_by(|a, b| {
+            (&a.aggregator_type, &a.aggregator_id, a.version).cmp(&(
+                &b.aggregator_type,
+                &b.aggregator_id,
+                b.version,
+            ))
+        });
+        Ok(events)
+    }
 }
 
 /// In-memory [`Journal`]. Records each command's durable state as it advances;
@@ -119,6 +136,8 @@ impl DataStore for InMemoryDataStore {
 #[derive(Default)]
 pub struct InMemoryJournal {
     entries: Mutex<HashMap<TxnId, CommandState>>,
+    /// The persisted truncation watermark (redundancy floor).
+    watermark: Mutex<Option<Timestamp>>,
 }
 
 impl InMemoryJournal {
@@ -155,5 +174,67 @@ impl Journal for InMemoryJournal {
             .values()
             .cloned()
             .collect())
+    }
+
+    async fn truncate(&self, before: Timestamp) -> anyhow::Result<()> {
+        self.entries
+            .lock()
+            .expect("journal poisoned")
+            .retain(|txn, _| txn.0 >= before);
+        *self.watermark.lock().expect("journal poisoned") = Some(before);
+        Ok(())
+    }
+
+    async fn load_watermark(&self) -> anyhow::Result<Option<Timestamp>> {
+        Ok(*self.watermark.lock().expect("journal poisoned"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clock::{Ballot, NodeId};
+    use crate::message::Status;
+
+    fn command(micros: u64) -> CommandState {
+        let txn = TxnId(Timestamp {
+            micros,
+            logical: 0,
+            node: NodeId(0),
+        });
+        CommandState {
+            txn,
+            status: Status::Applied,
+            promised: Ballot(txn.0),
+            accepted: Ballot(txn.0),
+            execute_at: txn.0,
+            deps: vec![],
+            keys: vec![],
+            events: vec![],
+            reply_to: NodeId(0),
+            decision: Some(true),
+            applied_conflict: Some(false),
+        }
+    }
+
+    #[tokio::test]
+    async fn in_memory_truncate_drops_below_and_records_the_watermark() {
+        let journal = InMemoryJournal::new();
+        for micros in [100, 200, 300] {
+            journal.record(&command(micros)).await.unwrap();
+        }
+        assert!(journal.load_watermark().await.unwrap().is_none());
+
+        let before = Timestamp {
+            micros: 250,
+            logical: 0,
+            node: NodeId(0),
+        };
+        journal.truncate(before).await.unwrap();
+
+        let remaining = journal.load_all().await.unwrap();
+        assert_eq!(remaining.len(), 1, "only the record above the watermark stays");
+        assert_eq!(remaining[0].txn.0.micros, 300);
+        assert_eq!(journal.load_watermark().await.unwrap(), Some(before));
     }
 }

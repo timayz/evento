@@ -32,12 +32,26 @@ use crate::clock::{Ballot, NodeId, Timestamp, TxnId};
 use crate::message::{CommandState, Key, Status};
 
 /// Per-replica consensus state.
-#[derive(Default)]
 pub struct Replica {
     /// Every transaction this replica knows about.
     commands: HashMap<TxnId, CommandState>,
     /// Index from key to the transactions touching it, for conflict lookup.
     by_key: HashMap<Key, BTreeSet<TxnId>>,
+    /// Redundancy watermark: every transaction with `t0` below this has been
+    /// applied on every replica, so it is dropped from `commands`/`by_key` and a
+    /// dependency below it counts as already satisfied (its effect is in the data
+    /// store). Advances monotonically via [`compact`](Replica::compact).
+    redundant_before: Timestamp,
+}
+
+impl Default for Replica {
+    fn default() -> Self {
+        Self {
+            commands: HashMap::new(),
+            by_key: HashMap::new(),
+            redundant_before: Timestamp::MIN,
+        }
+    }
 }
 
 /// A transaction whose dependencies are satisfied and that the node should now
@@ -348,6 +362,12 @@ impl Replica {
         cmd.deps.iter().all(|dep| match self.commands.get(dep) {
             Some(d) if d.status == Status::Applied => true,
             Some(d) if d.status >= Status::Committed && (d.execute_at, *dep) > here => true,
+            // A dependency we no longer hold but that is below the redundancy
+            // watermark was applied here and garbage-collected: it orders before
+            // this transaction and its effect is already in the data store. (A
+            // committed transaction's deps are the quorum union, so a peer can
+            // legitimately name a transaction we have already compacted away.)
+            None if dep.0 < self.redundant_before => true,
             _ => false,
         })
     }
@@ -442,11 +462,16 @@ impl Replica {
     /// than `cutoff` — i.e. stalled long enough to warrant recovery (the
     /// coordinator is presumed dead). Drives automatic progress.
     pub fn stuck(&self, cutoff: Timestamp) -> Vec<TxnId> {
-        self.commands
+        let mut stuck: Vec<TxnId> = self
+            .commands
             .values()
             .filter(|cmd| cmd.status != Status::Applied && cmd.txn.0 < cutoff)
             .map(|cmd| cmd.txn)
-            .collect()
+            .collect();
+        // Sorted so the recovery sweep drives transactions in a deterministic
+        // order (the raw HashMap iteration order is not reproducible).
+        stuck.sort();
+        stuck
     }
 
     /// Every applied command, in execution-timestamp order — the committed state
@@ -472,6 +497,66 @@ impl Replica {
         cmd.status = Status::Applied;
         self.insert(cmd);
         true
+    }
+
+    /// The current redundancy watermark (see the field docs).
+    pub fn redundant_before(&self) -> Timestamp {
+        self.redundant_before
+    }
+
+    /// How many commands this replica currently holds — the in-memory consensus
+    /// state whose growth [`compact`](Replica::compact) bounds.
+    pub fn command_count(&self) -> usize {
+        self.commands.len()
+    }
+
+    /// The largest watermark `<= cutoff` that is *locally* safe: no transaction
+    /// this replica holds below the result is still un-applied. (Below it, every
+    /// command here is `Applied`, so its effect is durable in the data store.)
+    /// Reported to peers; the cluster-safe watermark is the min across the shard.
+    pub fn applied_through(&self, cutoff: Timestamp) -> Timestamp {
+        match self
+            .commands
+            .values()
+            .filter(|cmd| cmd.status != Status::Applied)
+            .map(|cmd| cmd.txn.0)
+            .min()
+        {
+            Some(oldest_unapplied) => cutoff.min(oldest_unapplied),
+            None => cutoff,
+        }
+    }
+
+    /// Drops every `Applied` command with `t0 < before` from `commands` and prunes
+    /// `by_key`, advancing the redundancy watermark. `before` is first clamped to
+    /// the locally-safe point ([`applied_through`](Replica::applied_through)) so a
+    /// not-yet-applied transaction is never declared redundant; the *caller* is
+    /// responsible for the cross-replica guarantee (that every replica has applied
+    /// everything below `before`). Monotonic and idempotent.
+    pub fn compact(&mut self, before: Timestamp) {
+        let safe = self.applied_through(before);
+        if safe <= self.redundant_before {
+            return;
+        }
+        let drop: Vec<TxnId> = self
+            .commands
+            .values()
+            .filter(|cmd| cmd.status == Status::Applied && cmd.txn.0 < safe)
+            .map(|cmd| cmd.txn)
+            .collect();
+        for txn in &drop {
+            if let Some(cmd) = self.commands.remove(txn) {
+                for key in &cmd.keys {
+                    if let Some(set) = self.by_key.get_mut(key) {
+                        set.remove(txn);
+                        if set.is_empty() {
+                            self.by_key.remove(key);
+                        }
+                    }
+                }
+            }
+        }
+        self.redundant_before = safe;
     }
 }
 
@@ -531,5 +616,108 @@ mod tests {
             .expect("B becomes ready after A applies");
         assert_eq!(ready_b.txn, b);
         assert!(ready_b.commit);
+    }
+
+    /// Applies `txn` end to end (preaccept → commit → decide → apply) on `key`.
+    fn apply(replica: &mut Replica, t: TxnId, key: &Key, version: u16) {
+        replica.preaccept(t, vec![key.clone()], vec![event("k", version)]);
+        replica.commit(t, t.0, vec![], vec![event("k", version)], NodeId(0));
+        replica.record_decision(t, true);
+        let ready = replica.next_apply().expect("ready to apply");
+        assert_eq!(ready.txn, t);
+        replica.mark_applied(t, false);
+    }
+
+    /// `compact` drops applied commands below the watermark, prunes the conflict
+    /// index, and advances `redundant_before`.
+    #[test]
+    fn compact_drops_applied_commands_and_prunes_the_index() {
+        let mut replica = Replica::new();
+        let key = Key("k".into());
+        let a = txn(10);
+        apply(&mut replica, a, &key, 1);
+        assert_eq!(replica.command_count(), 1);
+
+        replica.compact(txn(20).0);
+
+        assert_eq!(replica.command_count(), 0, "the applied command was dropped");
+        assert!(replica.snapshot(a).is_none());
+        assert_eq!(replica.redundant_before(), txn(20).0);
+
+        // The index was pruned: a later transaction on the same key sees no
+        // conflict from the compacted-away one.
+        let b = txn(30);
+        let (_, deps) = replica.preaccept(b, vec![key.clone()], vec![event("k", 2)]);
+        assert!(deps.is_empty(), "compacted command must not be a dependency");
+    }
+
+    /// `compact` never advances past a still-unapplied transaction: the watermark
+    /// is clamped to the oldest un-applied `t0`.
+    #[test]
+    fn compact_clamps_to_the_oldest_unapplied_transaction() {
+        let mut replica = Replica::new();
+        let key = Key("k".into());
+        let old = txn(5);
+        apply(&mut replica, old, &key, 1);
+        // A second transaction stays un-applied, below the requested watermark.
+        let pending = txn(10);
+        replica.preaccept(pending, vec![key.clone()], vec![event("k", 2)]);
+
+        replica.compact(txn(20).0);
+
+        assert_eq!(
+            replica.redundant_before(),
+            txn(10).0,
+            "watermark clamped to the oldest un-applied t0"
+        );
+        assert!(replica.snapshot(old).is_none(), "old applied command dropped");
+        assert!(
+            replica.snapshot(pending).is_some(),
+            "un-applied command retained"
+        );
+    }
+
+    /// The redundancy-watermark fix for the dependency-union hazard: a committed
+    /// transaction whose dependency was already compacted away still applies,
+    /// because a missing dependency below `redundant_before` counts as satisfied.
+    #[test]
+    fn dependency_compacted_below_the_watermark_counts_as_satisfied() {
+        let mut replica = Replica::new();
+        let key = Key("k".into());
+        let c = txn(10);
+        let d = txn(20);
+        replica.preaccept(c, vec![key.clone()], vec![event("k", 1)]);
+        replica.preaccept(d, vec![key.clone()], vec![event("k", 2)]);
+
+        // Apply and compact away C.
+        replica.commit(c, c.0, vec![], vec![event("k", 1)], NodeId(0));
+        replica.record_decision(c, true);
+        assert_eq!(replica.next_apply().expect("C ready").txn, c);
+        replica.mark_applied(c, false);
+        replica.compact(txn(15).0);
+        assert!(replica.snapshot(c).is_none());
+
+        // D commits with C still in its deps (the quorum union); it must apply.
+        replica.commit(d, d.0, vec![c], vec![event("k", 2)], NodeId(0));
+        replica.record_decision(d, true);
+        let ready = replica
+            .next_apply()
+            .expect("D applies despite its dependency C being compacted away");
+        assert_eq!(ready.txn, d);
+    }
+
+    /// The watermark only ever moves forward; a lower or equal `compact` is a
+    /// no-op.
+    #[test]
+    fn compact_is_monotonic() {
+        let mut replica = Replica::new();
+        replica.compact(txn(30).0);
+        assert_eq!(replica.redundant_before(), txn(30).0);
+
+        replica.compact(txn(20).0);
+        assert_eq!(replica.redundant_before(), txn(30).0, "lower is a no-op");
+
+        replica.compact(txn(30).0);
+        assert_eq!(replica.redundant_before(), txn(30).0, "equal is a no-op");
     }
 }

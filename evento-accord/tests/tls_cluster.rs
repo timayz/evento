@@ -1,34 +1,92 @@
-//! End-to-end test of the production framed-TCP transport: a 3-node Accord
-//! cluster wired over real localhost TCP sockets must replicate writes into one
-//! global serial order and resolve a concurrent same-version race to a single
-//! winner — exercising the same consensus logic as the in-memory tests, but with
-//! messages crossing actual connections and bitcode wire encoding.
+//! End-to-end test of the framed-TCP transport **over mutual TLS**: a 3-node
+//! Accord cluster wired across real localhost sockets, every connection wrapped
+//! in rustls with each side presenting a certificate the other verifies against a
+//! shared CA. Proves the consensus path is identical over an authenticated,
+//! encrypted transport — replication into one serial order, and one-winner
+//! conflict resolution.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use evento_accord::{
-    serve, DataStore, HybridLogicalClock, InMemoryDataStore, InMemoryJournal, Journal, MessageSink,
-    Node, NodeId, StaticTopology, TcpTransport, TxnId,
+    serve_tls, DataStore, HybridLogicalClock, InMemoryDataStore, InMemoryJournal, Journal,
+    MessageSink, Node, NodeId, StaticTopology, TcpTransport, TlsClient, TxnId,
 };
 use evento_core::Event;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
+use tokio_rustls::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+use tokio_rustls::rustls::{self, ClientConfig, RootCertStore, ServerConfig};
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-/// A cluster whose nodes communicate over real TCP.
-struct TcpCluster {
+/// The shared TLS material for the cluster: an acceptor (server side, verifying
+/// client certs) and a connector (client side, with its own cert).
+#[derive(Clone)]
+struct ClusterTls {
+    acceptor: TlsAcceptor,
+    connector: TlsConnector,
+    server_name: ServerName<'static>,
+}
+
+/// Builds a CA, a single leaf certificate (identity `localhost`) signed by it, and
+/// the rustls configs for mutual TLS — every node shares the leaf as both its
+/// server and client identity, all chaining to the CA.
+fn cluster_tls() -> ClusterTls {
+    // rustls 0.23 needs a process-wide crypto provider.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    let ca_key = rcgen::KeyPair::generate().unwrap();
+    let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+    let leaf_key = rcgen::KeyPair::generate().unwrap();
+    let leaf_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    let leaf_cert = leaf_params
+        .signed_by(&leaf_key, &ca_cert, &ca_key)
+        .unwrap();
+
+    let ca_der = ca_cert.der().clone();
+    let leaf_chain = vec![leaf_cert.der().clone()];
+    let leaf_key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
+
+    let mut roots = RootCertStore::empty();
+    roots.add(ca_der).unwrap();
+    let roots = Arc::new(roots);
+
+    let verifier = rustls::server::WebPkiClientVerifier::builder(roots.clone())
+        .build()
+        .unwrap();
+    let server_config = ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(leaf_chain.clone(), leaf_key_der.clone_key())
+        .unwrap();
+
+    let client_config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_client_auth_cert(leaf_chain, leaf_key_der)
+        .unwrap();
+
+    ClusterTls {
+        acceptor: TlsAcceptor::from(Arc::new(server_config)),
+        connector: TlsConnector::from(Arc::new(client_config)),
+        server_name: ServerName::try_from("localhost").unwrap(),
+    }
+}
+
+/// A cluster whose nodes communicate over mutual-TLS TCP.
+struct TlsCluster {
     nodes: Vec<Node>,
     stores: Vec<Arc<InMemoryDataStore>>,
     _tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
-impl TcpCluster {
+impl TlsCluster {
     async fn start(n: u64) -> Self {
         let ids: Vec<NodeId> = (0..n).map(NodeId).collect();
+        let tls = cluster_tls();
 
-        // Bind every listener first so the address map is known and the kernel
-        // accepts connections (into the backlog) before any node sends.
         let mut listeners = Vec::new();
         let mut peers: HashMap<NodeId, std::net::SocketAddr> = HashMap::new();
         for &id in &ids {
@@ -43,10 +101,11 @@ impl TcpCluster {
 
         for (id, listener) in listeners {
             let (inbox_tx, inbox_rx) = mpsc::channel(1024);
-            tasks.push(serve(listener, inbox_tx));
+            tasks.push(serve_tls(listener, inbox_tx, tls.acceptor.clone()));
 
             let clock = Arc::new(HybridLogicalClock::new(id));
-            let sink: Arc<dyn MessageSink> = Arc::new(TcpTransport::new(id, peers.clone()));
+            let client = TlsClient::new(tls.connector.clone(), tls.server_name.clone());
+            let sink: Arc<dyn MessageSink> = Arc::new(TcpTransport::with_tls(id, peers.clone(), client));
             let store = Arc::new(InMemoryDataStore::new());
             let journal: Arc<dyn Journal> = Arc::new(InMemoryJournal::new());
             let topology = Arc::new(StaticTopology::new(id, ids.clone()));
@@ -64,14 +123,13 @@ impl TcpCluster {
             stores.push(store);
         }
 
-        TcpCluster {
+        TlsCluster {
             nodes,
             stores,
             _tasks: tasks,
         }
     }
 
-    /// Waits until every replica has applied at least `expected_len` transactions.
     async fn await_applied(&self, expected_len: usize) {
         for _ in 0..400 {
             if self
@@ -83,10 +141,9 @@ impl TcpCluster {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        panic!("replicas did not converge to {expected_len} applied entries");
+        panic!("replicas did not converge to {expected_len} applied entries over mTLS");
     }
 
-    /// Asserts every replica has the same applied order, returning it.
     fn assert_identical_order(&self, expected_len: usize) -> Vec<(TxnId, bool)> {
         let order: Vec<(TxnId, bool)> = self.stores[0]
             .applied_log()
@@ -117,10 +174,9 @@ fn event(aggregator_id: &str, version: u16, name: &str) -> Event {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn replicates_over_real_tcp() {
-    let cluster = TcpCluster::start(3).await;
+async fn replicates_over_mutual_tls() {
+    let cluster = TlsCluster::start(3).await;
 
-    // Non-conflicting writes from rotating coordinators.
     for i in 0..4u32 {
         let outcome = tokio::time::timeout(
             Duration::from_secs(10),
@@ -128,7 +184,7 @@ async fn replicates_over_real_tcp() {
         )
         .await
         .expect("write timed out")
-        .expect("write failed over tcp");
+        .expect("write failed over mTLS");
         assert!(!outcome.conflict);
     }
 
@@ -138,10 +194,9 @@ async fn replicates_over_real_tcp() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn resolves_a_conflict_over_real_tcp() {
-    let cluster = TcpCluster::start(3).await;
+async fn resolves_a_conflict_over_mutual_tls() {
+    let cluster = TlsCluster::start(3).await;
 
-    // Two coordinators race to append version 1 to the same aggregate.
     let n0 = cluster.nodes[0].clone();
     let n1 = cluster.nodes[1].clone();
     let w0 = tokio::spawn(async move { n0.write(vec![event("acc", 1, "A")]).await.unwrap() });
@@ -158,7 +213,7 @@ async fn resolves_a_conflict_over_real_tcp() {
 
     assert!(
         o0.conflict ^ o1.conflict,
-        "exactly one write must conflict over tcp, got {o0:?} {o1:?}"
+        "exactly one write must conflict over mTLS, got {o0:?} {o1:?}"
     );
 
     cluster.await_applied(2).await;

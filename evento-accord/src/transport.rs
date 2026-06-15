@@ -1,8 +1,9 @@
 //! In-memory [`MessageSink`] for tests and the simulation harness.
 //!
-//! All replicas live in one process and exchange [`Message`]s over unbounded
-//! channels. This is the deterministic transport twin of the production framed
-//! TCP sink (M1); the protocol core cannot tell them apart.
+//! All replicas live in one process and exchange [`Message`]s over bounded
+//! channels (capacity [`DEFAULT_INBOX_CAPACITY`]; a full inbox sheds, modelling
+//! backpressure). This is the deterministic transport twin of the production
+//! framed TCP sink (M1); the protocol core cannot tell them apart.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -24,13 +25,19 @@ pub struct Envelope {
     pub message: Message,
 }
 
+/// Inbox channel capacity — the backpressure bound. A node that falls far enough
+/// behind that its inbox fills sheds further inbound messages (loss is tolerated
+/// by quorums and recovery), so memory stays bounded under a flood or a slow
+/// consumer instead of growing without limit.
+pub const DEFAULT_INBOX_CAPACITY: usize = 1024;
+
 /// Shared in-memory network. Register one inbox per node, then hand each node a
 /// [`InMemorySink`] via [`sink`](InMemoryNetwork::sink). A node can be
 /// [`crash`](InMemoryNetwork::crash)ed to model a failure: all messages to or
 /// from it are dropped until [`heal`](InMemoryNetwork::heal)ed.
 #[derive(Default)]
 pub struct InMemoryNetwork {
-    inboxes: Mutex<HashMap<NodeId, mpsc::UnboundedSender<Envelope>>>,
+    inboxes: Mutex<HashMap<NodeId, mpsc::Sender<Envelope>>>,
     crashed: Mutex<HashSet<NodeId>>,
     /// Unordered node pairs that cannot exchange messages (a partition).
     partitions: Mutex<HashSet<(NodeId, NodeId)>>,
@@ -42,10 +49,10 @@ impl InMemoryNetwork {
         Arc::new(Self::default())
     }
 
-    /// Registers `node` and returns its inbox receiver. Call once per node
-    /// before sending; re-registering replaces the previous inbox.
-    pub fn register(&self, node: NodeId) -> mpsc::UnboundedReceiver<Envelope> {
-        let (tx, rx) = mpsc::unbounded_channel();
+    /// Registers `node` and returns its (bounded) inbox receiver. Call once per
+    /// node before sending; re-registering replaces the previous inbox.
+    pub fn register(&self, node: NodeId) -> mpsc::Receiver<Envelope> {
+        let (tx, rx) = mpsc::channel(DEFAULT_INBOX_CAPACITY);
         self.inboxes
             .lock()
             .expect("network poisoned")
@@ -76,6 +83,20 @@ impl InMemoryNetwork {
         let mut partitions = self.partitions.lock().expect("network poisoned");
         partitions.insert((a, b));
         partitions.insert((b, a));
+    }
+
+    /// Restores a previously [`partition`](InMemoryNetwork::partition)ed link
+    /// between `a` and `b` in both directions.
+    pub fn heal_partition(&self, a: NodeId, b: NodeId) {
+        let mut partitions = self.partitions.lock().expect("network poisoned");
+        partitions.remove(&(a, b));
+        partitions.remove(&(b, a));
+    }
+
+    /// Restores every partitioned link at once. Convenient for scenario
+    /// teardown, where a seed-skipped heal must not leave a residual cut.
+    pub fn heal_all_partitions(&self) {
+        self.partitions.lock().expect("network poisoned").clear();
     }
 
     /// Whether messages between `from` and `to` are currently partitioned.
@@ -119,10 +140,11 @@ impl MessageSink for InMemorySink {
         };
 
         match inbox {
-            // A closed/missing inbox models a partitioned or down peer — the
-            // protocol tolerates this, so it is not a local error.
+            // A closed/missing inbox models a partitioned or down peer, and a
+            // full inbox is backpressure shedding — both are tolerated loss, not a
+            // local error. `try_send` never blocks the sender.
             Some(tx) => {
-                let _ = tx.send(Envelope {
+                let _ = tx.try_send(Envelope {
                     from: self.from,
                     message,
                 });
@@ -174,5 +196,82 @@ mod tests {
         sink.send(NodeId(9), Message::Applied { txn: txn(1) })
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_partition_drops_the_link_and_healing_restores_it() {
+        let net = InMemoryNetwork::new();
+        let mut inbox2 = net.register(NodeId(2));
+        let sink1 = net.sink(NodeId(1));
+
+        // Cut the 1<->2 link: messages are dropped in both directions.
+        net.partition(NodeId(1), NodeId(2));
+        sink1
+            .send(NodeId(2), Message::Applied { txn: txn(1) })
+            .await
+            .unwrap();
+        assert!(
+            inbox2.try_recv().is_err(),
+            "a partitioned link must drop the message"
+        );
+
+        // Heal the link: delivery resumes.
+        net.heal_partition(NodeId(1), NodeId(2));
+        sink1
+            .send(NodeId(2), Message::Applied { txn: txn(2) })
+            .await
+            .unwrap();
+        let env = inbox2.recv().await.expect("a message after healing");
+        match env.message {
+            Message::Applied { txn: got } => assert_eq!(got, txn(2)),
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_full_inbox_sheds_messages_and_never_blocks() {
+        let net = InMemoryNetwork::new();
+        let mut inbox = net.register(NodeId(2));
+        let sink1 = net.sink(NodeId(1));
+
+        // Flood far past capacity while the consumer never drains.
+        let flood = DEFAULT_INBOX_CAPACITY + 500;
+        for i in 0..flood {
+            // `send` never blocks despite the full inbox (it sheds).
+            sink1
+                .send(NodeId(2), Message::Applied { txn: txn(i as u64) })
+                .await
+                .unwrap();
+        }
+
+        // The inbox buffered only up to its capacity; the rest were shed.
+        let mut received = 0;
+        while inbox.try_recv().is_ok() {
+            received += 1;
+        }
+        assert_eq!(
+            received, DEFAULT_INBOX_CAPACITY,
+            "the inbox is bounded to its capacity"
+        );
+    }
+
+    #[tokio::test]
+    async fn heal_all_partitions_restores_every_link() {
+        let net = InMemoryNetwork::new();
+        let mut inbox2 = net.register(NodeId(2));
+        let sink1 = net.sink(NodeId(1));
+
+        net.partition(NodeId(1), NodeId(2));
+        net.heal_all_partitions();
+
+        sink1
+            .send(NodeId(2), Message::Applied { txn: txn(3) })
+            .await
+            .unwrap();
+        let env = inbox2.recv().await.expect("a message after heal_all");
+        match env.message {
+            Message::Applied { txn: got } => assert_eq!(got, txn(3)),
+            other => panic!("unexpected message: {other:?}"),
+        }
     }
 }

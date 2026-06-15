@@ -164,10 +164,28 @@ pub enum Message {
     /// replica has already promised, so the sender can retry above it.
     Nack { txn: TxnId, promised: Ballot },
     /// Joining node → an existing replica: send me your committed state so I can
-    /// bootstrap.
-    SyncRequest,
-    /// Existing replica → joining node: the applied commands to import.
-    SyncData { commands: Vec<CommandState> },
+    /// bootstrap. `snapshot` requests the materialized data-store snapshot too
+    /// (set by a bootstrapping join, whose state may be below the contact's
+    /// truncation watermark); anti-entropy clears it (it only needs recent
+    /// commands).
+    SyncRequest { snapshot: bool },
+    /// Periodic gossip between shard replicas: the sender has applied every
+    /// transaction below `applied_through`. The cluster compacts (drops redundant
+    /// consensus state and truncates the log) below the per-shard minimum of these.
+    Watermark { applied_through: Timestamp },
+    /// Existing replica → joining node: the committed state to import.
+    SyncData {
+        /// The contact's redundancy watermark; the joiner adopts it as its floor,
+        /// so a dependency on a compacted-away transaction counts as satisfied.
+        watermark: Timestamp,
+        /// Materialized applied events (the state below the watermark that command
+        /// replay no longer covers). Empty unless a snapshot was requested.
+        #[serde(with = "wire_events")]
+        snapshot: Vec<Event>,
+        /// The un-truncated applied commands (`t0 >= watermark`), for the conflict
+        /// graph and dependency barriers.
+        commands: Vec<CommandState>,
+    },
     /// Config coordinator → acceptors: Paxos phase 1 for `epoch`'s layout.
     ConfigPrepare { epoch: u64, ballot: Ballot },
     /// Acceptor → coordinator: promised `ballot`, reporting any value it has
@@ -225,8 +243,9 @@ impl Message {
             | Message::Recover { txn, .. }
             | Message::RecoverOk { txn, .. }
             | Message::Nack { txn, .. } => Some(*txn),
-            Message::SyncRequest
+            Message::SyncRequest { .. }
             | Message::SyncData { .. }
+            | Message::Watermark { .. }
             | Message::ConfigPrepare { .. }
             | Message::ConfigPromise { .. }
             | Message::ConfigAccept { .. }

@@ -10,6 +10,14 @@
 //! Membership is static: construct a [`TcpTransport`] with a fixed
 //! `NodeId → SocketAddr` map. Inbound frames are decoded and forwarded to a
 //! node's inbox by [`serve`].
+//!
+//! **Mutual TLS (optional).** Build with [`TcpTransport::with_tls`] and serve with
+//! [`serve_tls`] to encrypt and authenticate inter-node traffic: every connection
+//! is wrapped in rustls, with each side presenting a certificate the other
+//! verifies against a shared root (the operator supplies the rustls
+//! [`TlsConnector`]/[`TlsAcceptor`]). Plain [`new`](TcpTransport::new)/[`serve`]
+//! stay available for trusted networks; the framing and consensus layers are
+//! identical either way.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -22,12 +30,39 @@ use serde::{Deserialize, Serialize};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio_rustls::rustls::pki_types::ServerName;
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
+use tokio_util::either::Either;
 
 use crate::api::MessageSink;
 use crate::clock::NodeId;
 use crate::message::Message;
 use crate::transport::Envelope;
+
+/// Outbound connection: plain TCP, or a client-side TLS session over it.
+type ClientStream = Either<TcpStream, tokio_rustls::client::TlsStream<TcpStream>>;
+/// Inbound connection: plain TCP, or a server-side TLS session over it.
+type ServerStream = Either<TcpStream, tokio_rustls::server::TlsStream<TcpStream>>;
+
+/// Client-side TLS settings: the rustls connector and the server name presented
+/// for certificate verification.
+#[derive(Clone)]
+pub struct TlsClient {
+    connector: TlsConnector,
+    server_name: ServerName<'static>,
+}
+
+impl TlsClient {
+    /// Builds client TLS settings from a rustls connector and the peer server
+    /// name to verify against.
+    pub fn new(connector: TlsConnector, server_name: ServerName<'static>) -> Self {
+        Self {
+            connector,
+            server_name,
+        }
+    }
+}
 
 /// A wire frame: the originating node plus the message. The sender id travels in
 /// the frame so the receiver can reply without a separate handshake.
@@ -45,34 +80,54 @@ fn decode(bytes: &[u8]) -> anyhow::Result<Frame> {
     Ok(bitcode::deserialize(bytes)?)
 }
 
-/// A framed-TCP [`MessageSink`] over a static membership map.
+/// Capacity of a per-peer outbound queue and of an inbound inbox — the
+/// backpressure bound. When a peer is slow or unreachable its queue fills and
+/// further frames are dropped (loss is tolerated), so memory stays bounded
+/// instead of growing without limit.
+pub const CHANNEL_CAPACITY: usize = 1024;
+
+/// A framed-TCP [`MessageSink`] over a static membership map, optionally over TLS.
 pub struct TcpTransport {
     from: NodeId,
     peers: Arc<HashMap<NodeId, SocketAddr>>,
-    /// Per-peer outbound queues; each backed by a lazily-spawned writer task.
-    senders: Mutex<HashMap<NodeId, mpsc::UnboundedSender<Frame>>>,
+    /// Per-peer outbound queues (bounded); each backed by a lazily-spawned writer.
+    senders: Mutex<HashMap<NodeId, mpsc::Sender<Frame>>>,
+    /// Client TLS settings; `None` for plaintext.
+    tls: Option<TlsClient>,
 }
 
 impl TcpTransport {
-    /// Builds a transport for `from` that can reach the nodes in `peers`.
+    /// Builds a plaintext transport for `from` that can reach the nodes in `peers`.
     pub fn new(from: NodeId, peers: HashMap<NodeId, SocketAddr>) -> Self {
         Self {
             from,
             peers: Arc::new(peers),
             senders: Mutex::new(HashMap::new()),
+            tls: None,
+        }
+    }
+
+    /// Builds a transport whose outbound connections use mutual TLS (`tls`), for
+    /// an untrusted network. Pair with [`serve_tls`] on the inbound side.
+    pub fn with_tls(from: NodeId, peers: HashMap<NodeId, SocketAddr>, tls: TlsClient) -> Self {
+        Self {
+            from,
+            peers: Arc::new(peers),
+            senders: Mutex::new(HashMap::new()),
+            tls: Some(tls),
         }
     }
 
     /// The outbound queue for `to`, spawning its writer task on first use.
     /// `None` if `to` is not a known peer.
-    fn writer_for(&self, to: NodeId) -> Option<mpsc::UnboundedSender<Frame>> {
+    fn writer_for(&self, to: NodeId) -> Option<mpsc::Sender<Frame>> {
         let mut senders = self.senders.lock().expect("senders poisoned");
         if let Some(tx) = senders.get(&to) {
             return Some(tx.clone());
         }
         let addr = *self.peers.get(&to)?;
-        let (tx, rx) = mpsc::unbounded_channel();
-        tokio::spawn(peer_writer(addr, rx));
+        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        tokio::spawn(peer_writer(addr, rx, self.tls.clone()));
         senders.insert(to, tx.clone());
         Some(tx)
     }
@@ -82,7 +137,9 @@ impl TcpTransport {
 impl MessageSink for TcpTransport {
     async fn send(&self, to: NodeId, message: Message) -> anyhow::Result<()> {
         if let Some(tx) = self.writer_for(to) {
-            let _ = tx.send(Frame {
+            // `try_send` never blocks the caller: a full queue (slow/unreachable
+            // peer) sheds the frame, which the protocol tolerates.
+            let _ = tx.try_send(Frame {
                 from: self.from,
                 message,
             });
@@ -91,19 +148,34 @@ impl MessageSink for TcpTransport {
     }
 }
 
-/// Drains a peer's outbound queue to a TCP connection, connecting on demand and
-/// reconnecting after a failure. Frames sent while the peer is unreachable are
-/// dropped (loss is tolerated by the protocol).
-async fn peer_writer(addr: SocketAddr, mut rx: mpsc::UnboundedReceiver<Frame>) {
-    let mut conn: Option<Framed<TcpStream, LengthDelimitedCodec>> = None;
+/// Establishes one outbound connection to `addr`, wrapping it in client TLS when
+/// configured. `None` on a connect/handshake failure.
+async fn connect(addr: SocketAddr, tls: &Option<TlsClient>) -> Option<ClientStream> {
+    let stream = TcpStream::connect(addr).await.ok()?;
+    let _ = stream.set_nodelay(true);
+    match tls {
+        None => Some(Either::Left(stream)),
+        Some(tls) => {
+            let session = tls
+                .connector
+                .connect(tls.server_name.clone(), stream)
+                .await
+                .ok()?;
+            Some(Either::Right(session))
+        }
+    }
+}
+
+/// Drains a peer's outbound queue to a (TLS or plain) connection, connecting on
+/// demand and reconnecting after a failure. Frames sent while the peer is
+/// unreachable are dropped (loss is tolerated by the protocol).
+async fn peer_writer(addr: SocketAddr, mut rx: mpsc::Receiver<Frame>, tls: Option<TlsClient>) {
+    let mut conn: Option<Framed<ClientStream, LengthDelimitedCodec>> = None;
     while let Some(frame) = rx.recv().await {
         if conn.is_none() {
-            match TcpStream::connect(addr).await {
-                Ok(stream) => {
-                    let _ = stream.set_nodelay(true);
-                    conn = Some(Framed::new(stream, LengthDelimitedCodec::new()));
-                }
-                Err(_) => continue,
+            match connect(addr, &tls).await {
+                Some(stream) => conn = Some(Framed::new(stream, LengthDelimitedCodec::new())),
+                None => continue,
             }
         }
         let bytes = match encode(&frame) {
@@ -120,17 +192,38 @@ async fn peer_writer(addr: SocketAddr, mut rx: mpsc::UnboundedReceiver<Frame>) {
 
 /// Accepts inbound connections on `listener`, decoding frames and forwarding
 /// each as an [`Envelope`] to `inbox`. Returns the accept-loop task handle.
-pub fn serve(listener: TcpListener, inbox: mpsc::UnboundedSender<Envelope>) -> JoinHandle<()> {
+pub fn serve(listener: TcpListener, inbox: mpsc::Sender<Envelope>) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
-            tokio::spawn(read_connection(stream, inbox.clone()));
+            let _ = stream.set_nodelay(true);
+            tokio::spawn(read_connection(Either::Left(stream), inbox.clone()));
+        }
+    })
+}
+
+/// Like [`serve`] but completes a TLS handshake (`acceptor`, with client-cert
+/// verification for mutual TLS) on each inbound connection before reading frames.
+pub fn serve_tls(
+    listener: TcpListener,
+    inbox: mpsc::Sender<Envelope>,
+    acceptor: TlsAcceptor,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let _ = stream.set_nodelay(true);
+            let acceptor = acceptor.clone();
+            let inbox = inbox.clone();
+            tokio::spawn(async move {
+                if let Ok(session) = acceptor.accept(stream).await {
+                    read_connection(Either::Right(session), inbox).await;
+                }
+            });
         }
     })
 }
 
 /// Reads framed messages from one inbound connection until it closes.
-async fn read_connection(stream: TcpStream, inbox: mpsc::UnboundedSender<Envelope>) {
-    let _ = stream.set_nodelay(true);
+async fn read_connection(stream: ServerStream, inbox: mpsc::Sender<Envelope>) {
     let mut framed = Framed::new(stream, LengthDelimitedCodec::new());
     while let Some(item) = framed.next().await {
         let bytes = match item {
@@ -139,14 +232,16 @@ async fn read_connection(stream: TcpStream, inbox: mpsc::UnboundedSender<Envelop
         };
         match decode(&bytes) {
             Ok(frame) => {
-                if inbox
-                    .send(Envelope {
-                        from: frame.from,
-                        message: frame.message,
-                    })
-                    .is_err()
-                {
-                    break;
+                let envelope = Envelope {
+                    from: frame.from,
+                    message: frame.message,
+                };
+                match inbox.try_send(envelope) {
+                    Ok(()) => {}
+                    // A full inbox is backpressure — shed this frame but keep the
+                    // connection; only a closed inbox (node gone) ends the loop.
+                    Err(mpsc::error::TrySendError::Full(_)) => continue,
+                    Err(mpsc::error::TrySendError::Closed(_)) => break,
                 }
             }
             Err(_) => continue,

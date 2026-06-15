@@ -112,6 +112,18 @@ impl<E: Executor> DataStore for ExecutorDataStore<E> {
     ) -> anyhow::Result<ReadResult<Event>> {
         self.local.read(aggregators, routing_key, args).await
     }
+
+    async fn snapshot(&self) -> anyhow::Result<Vec<Event>> {
+        // The materialised state is the full event log; a joining node re-applies
+        // it to reconstruct the prefix that journal truncation removed. (Reads up
+        // to u16::MAX-1 events in one page; very large stores want pagination —
+        // a refinement for this adapter, matching the `version` caveat above.)
+        let result = self
+            .local
+            .read(None, None, Args::forward(u16::MAX - 1, None))
+            .await?;
+        Ok(result.edges.into_iter().map(|edge| edge.node).collect())
+    }
 }
 
 /// An evento [`Executor`] whose writes are coordinated through an Accord cluster
