@@ -82,27 +82,34 @@ noted; Elle's `:cycle-search-timeout` raised to 60 s so high-contention runs rea
 | healthy | 10 | strict-serializable | **valid** (2920 ok) |
 | `:one` partition | 2 | strict-serializable | **valid** (2080 ok) |
 | `:one` partition | 5 | strict-serializable | **valid** (1734 ok) |
-| `:one` partition | 10 | strict-serializable | **invalid** — confirmed `G-nonadjacent-item-realtime` |
+| `:one` partition | 10 | strict-serializable | **valid** (1922 ok) — *after the convergence fix below* |
 | `:one` partition | 10 | serializable | **valid** (2788 ok) |
 
-So the read-index makes reads **linearizable when healthy**, and the cluster is
-**strict-serializable under quorum-preserving partition up to moderate concurrency**
-(≤5) and **always serializable**. But a **real, contention-dependent strict-
-serializability anomaly remains at high concurrency** (10): a *confirmed* (not a search
-timeout) `G-nonadjacent-item-realtime` — a multi-key cycle of read/write
-anti-dependencies (reads missing the *next* committed write across keys) plus real-time
-edges.
+So with linearizable reads the cluster is **strict-serializable under quorum-preserving
+partition** (and **always serializable**). Getting the high-concurrency case (10) to
+pass took a real bug fix.
 
-This is **not** the "premature visibility" we first guessed (that framing was wrong —
-the violating edges are `rw` anti-dependencies, i.e. stale reads under load, not a write
-made visible too early), so **commit-wait is not the fix**. The root cause is not yet
-isolated: the read-index discovers a committed write via quorum intersection and waits
-for it to apply locally, which *should* preclude these stale reads, yet under high
-contention some read still misses one. It needs deeper investigation (a likely suspect:
-the interaction of atomic multi-key writes with single-key read barriers that are not
-serialized against each other once reads left the conflict graph). The barrier's cost is
-also real: one quorum round-trip per read, and it is CP — a partition that leaves no
-quorum makes reads **unavailable** (`:info`) rather than stale.
+#### The bug the harness found: anti-entropy never converged a churned node
+
+At concurrency 10 the run was first **invalid** with a *confirmed* (not a search-timeout)
+`G-nonadjacent-item-realtime` — a multi-key cycle of read/write **anti-dependencies**
+(stale reads), *not* the "premature visibility" we first guessed. A deterministic Rust
+reproduction (`tests/linearizable_stress.rs`: concurrent writers/readers across nodes
+with node crash/heal churn, a monotonicity + premature-read oracle, and a per-node
+convergence probe) localized it: **churned nodes never caught up**, even after the
+network fully healed (e.g. `[66,66,66,5,54]` value counts across nodes for one key).
+
+Root cause in `Replica::import_applied`: a node that received a transaction's `Commit`
+but missed its `Apply` (it was briefly down) holds it at status `Committed` with **no
+decision**, so normal execution never applies it (that needs a decision) — *and*
+anti-entropy skipped it, because `import_applied` returned "already present" for any
+known command. So the command was stuck at `Committed` forever and the node diverged
+permanently; reads served off it were stale. The fix: `import_applied` now adopts the
+peer's *applied* state for a known-but-unapplied command (applying its events) instead
+of skipping. With it, nodes converge and the conc-10 strict-serializable run is valid.
+
+The barrier's cost is still real: one quorum round-trip per read, and it is CP — a
+partition that leaves no quorum makes reads **unavailable** (`:info`) rather than stale.
 
 ## Running it
 

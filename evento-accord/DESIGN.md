@@ -233,19 +233,19 @@ recovery, atomic cross-shard conditional appends via the Read→Apply split with
 node-join bootstrap with buffer-replay, node leave, Paxos-backed epoch changes
 that survive a coordinator crash (acceptor set tracks current membership), and
 range movement (re-sharding), and multi-shard executor read routing, plus an opt-in
-linearizable-read **read-index** barrier (`NodeConfig.linearizable_reads`). **66 tests**
+linearizable-read **read-index** barrier (`NodeConfig.linearizable_reads`). **67 tests**
 (24 unit, 6 cluster, 3 multi-shard, 7 membership, 1 resharding, 5 executor,
-1 shard-executor, 2 TCP, 2 mTLS, 10 simulation, 3 restart, 2 fjall-journal), clippy
-clean,
+1 linearizable-stress, 1 shard-executor, 2 TCP, 2 mTLS, 10 simulation, 3 restart,
+2 fjall-journal), clippy clean,
 stable across repeated runs (the simulation suite is deterministic — see Phase A).
 The full M0–M5 roadmap plus elastic membership (M4) is implemented. **External
 verification has begun**: an independent Jepsen/Elle harness (`evento-accord/jepsen/`,
 self-contained Docker cluster) drives the cluster under partition/kill/pause and checks
-strict-serializability — see Phase D. Its findings: writes are serializable & atomic;
-reads are linearizable with `--linearizable-reads` when healthy and under
-quorum-preserving partition up to moderate concurrency; the cluster is always
-serializable, with a confirmed contention-dependent real-time (stale-read) anomaly
-still open at high concurrency.
+strict-serializability — see Phase D. It already found and fixed a real bug (anti-entropy
+never converging a node that received a txn's Commit but missed its Apply). Findings:
+writes are serializable & atomic; with `--linearizable-reads` reads are linearizable and
+the cluster is strict-serializable under quorum-preserving partition (validated to
+concurrency 10) and always serializable.
 
 ## Production roadmap
 
@@ -427,21 +427,24 @@ backend (sql/fjall). Phases, in order:
         the conflict graph or journal — `ReadProbe`/`ReadProbeOk` + `Replica::read_probe`
         / `deps_applied`): probe a slow quorum for the deps a read would witness, wait for
         them to apply locally, then serve. Jepsen results (Elle `:cycle-search-timeout`
-        raised to 60 s so high-contention runs reach a conclusive verdict): a **healthy**
-        run is **strict-serializable valid** (2920 ok, reads linearizable); under a
-        quorum-preserving `:one` partition the cluster is **strict-serializable up to
-        moderate concurrency** (valid at conc 2 and 5) and **always serializable** (conc
-        10, 2788 ok) — but a **confirmed** (not a search timeout), contention-dependent
-        `G-nonadjacent-item-realtime` anomaly appears at **high concurrency** (conc 10):
-        a multi-key cycle of read/write **anti-dependencies** (stale reads under load)
-        plus real-time edges. (An earlier "premature visibility" guess was wrong — the
-        violating edges are `rw`, so commit-wait is *not* the fix.) *Remaining:* isolate
-        and fix this residual high-contention stale-read anomaly (suspect: single-key read
-        barriers no longer serialized against each other once reads left the conflict
-        graph, interacting with atomic multi-key writes); clock-skew (off by default —
-        bumps the shared kernel clock, needs real VMs; the node image now ships a compiler
-        for jepsen's time helper and `run.sh` refuses it under Docker without
-        `ALLOW_CLOCK_SKEW=1`); then the box can be checked.
+        raised to 60 s so high-contention runs reach a conclusive verdict): under a
+        quorum-preserving `:one` partition the cluster is **strict-serializable at conc 2,
+        5, and 10** (1922 ok at conc 10) and healthy is strict-serializable (2920 ok) —
+        reads are linearizable. **A real bug surfaced and was fixed along the way:** at
+        conc 10 the run was first invalid with a *confirmed* `G-nonadjacent-item-realtime`
+        (read/write **anti-dependencies** = stale reads, not the "premature visibility" we
+        first guessed). A deterministic Rust reproduction (`tests/linearizable_stress.rs`:
+        writers/readers under crash-heal churn + monotonicity/premature/convergence
+        oracles) localized it to **anti-entropy never converging a churned node**:
+        `Replica::import_applied` skipped any *known* command, but a node that received a
+        txn's `Commit` and missed its `Apply` holds it at `Committed` with no decision —
+        normal execution can't apply it (needs a decision) and anti-entropy refused to,
+        so it was stuck forever and the node diverged permanently; reads off it were
+        stale. Fix: `import_applied` adopts a peer's *applied* state for a known-but-
+        unapplied command. *Remaining:* clock-skew (off by default — bumps the shared
+        kernel clock, needs real VMs; the node image now ships a compiler for jepsen's
+        time helper and `run.sh` refuses it under Docker without `ALLOW_CLOCK_SKEW=1`);
+        then the box can be checked.
   - [ ] **Independent expert review** of the protocol and implementation.
   - [ ] **Real-cluster soak + chaos** over days (kills, partitions, clock skew,
         disk pressure, slow disks/links) on actual hardware — zero production
@@ -478,10 +481,9 @@ production: external/adversarial verification has only just begun (a Jepsen/Elle
 harness now exists and its first partition run already found that **reads are not
 linearizable** by default — writes are serializable & atomic, but a read off a lagging
 replica can break real-time order; an opt-in `linearizable_reads` read-index barrier
-makes reads linearizable when healthy and under quorum-preserving partition up to
-moderate concurrency — Jepsen-validated strict-serializable — and keeps the cluster
-serializable, though a confirmed contention-dependent real-time stale-read anomaly
-remains open at high concurrency), and there is still no independent review, no
+makes reads linearizable and the cluster strict-serializable under quorum-preserving
+partition — Jepsen-validated to concurrency 10, after the harness found and fixed an
+anti-entropy convergence bug), and there is still no independent review, no
 real-cluster
 soak mileage, an unoptimized throughput ceiling, and a stand-in membership/metadata
 layer. The gating items are the unchecked boxes in Phases D and E above, in roughly

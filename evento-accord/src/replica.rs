@@ -533,9 +533,17 @@ impl Replica {
     /// replica's conflict graph and dependency barriers see it) unless already
     /// known. Returns whether it was newly inserted.
     pub fn import_applied(&mut self, mut cmd: CommandState) -> bool {
-        if self.commands.contains_key(&cmd.txn) {
+        // Already applied here — nothing to do.
+        if matches!(self.commands.get(&cmd.txn), Some(c) if c.status == Status::Applied) {
             return false;
         }
+        // Either new, or known but **not yet applied** — e.g. this node received the
+        // transaction's Commit but missed its Apply (it was briefly down), so it is
+        // stuck at `Committed` with no decision: normal execution won't apply it
+        // (that needs a decision) and, before this, anti-entropy skipped it because
+        // it was "already present", leaving the node permanently behind. Adopt the
+        // contact's applied state (overwriting the stale entry) so its events get
+        // applied locally and the node converges.
         cmd.status = Status::Applied;
         self.insert(cmd);
         true
