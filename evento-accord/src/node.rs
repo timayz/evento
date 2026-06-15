@@ -113,6 +113,10 @@ pub struct CommitOutcome {
 struct ShardPlan {
     shard: ShardId,
     replicas: Vec<NodeId>,
+    /// The fast-path electorate — the subset of `replicas` whose `PreAccept` votes
+    /// decide the fast path. Equals `replicas` unless a smaller electorate is
+    /// configured (region-favouring single-round-trip commits).
+    electorate: Vec<NodeId>,
     fast_q: usize,
     slow_q: usize,
 }
@@ -1255,11 +1259,17 @@ impl Node {
             },
         )
         .await;
+        // Stop as soon as each shard's **electorate** has returned a fast quorum
+        // (the latency win: a coordinator co-located with the electorate need not
+        // wait for remote, non-electorate replicas), or at the fast-path timeout.
+        let electorate_responders = |p: &ShardPlan, got: &[(NodeId, (Timestamp, Vec<TxnId>))]| {
+            got.iter().filter(|(from, _)| p.electorate.contains(from)).count()
+        };
         let pre = self
-            .collect_by_shard(
+            .collect_by_shard_tagged(
                 &mut rx,
                 &plans,
-                |p| p.fast_q,
+                |p, got| electorate_responders(p, got) >= p.fast_q,
                 Self::after(self.settings.fast_timeout),
                 |m| match m {
                     Message::PreAcceptOk {
@@ -1276,11 +1286,23 @@ impl Node {
             }
         }
 
+        // Fast path iff every shard's electorate returned a fast quorum that all
+        // agree `t0` may stand. Only electorate votes count toward the fast path;
+        // non-electorate replicas still witnessed (for deps & recovery) but do not
+        // vote, so their disagreement never blocks a fast commit.
         let all_fast = plans.iter().all(|p| {
-            let r = &pre[&p.shard];
-            r.len() >= p.fast_q && r.iter().all(|(e, _)| *e == t0)
+            let agree = pre[&p.shard]
+                .iter()
+                .filter(|(from, _)| p.electorate.contains(from))
+                .collect::<Vec<_>>();
+            agree.len() >= p.fast_q && agree.iter().all(|(_, (e, _))| *e == t0)
         });
-        let execute_at = pre.values().flatten().map(|(e, _)| *e).max().unwrap_or(t0);
+        let execute_at = pre
+            .values()
+            .flatten()
+            .map(|(_, (e, _))| *e)
+            .max()
+            .unwrap_or(t0);
         // Dependencies are kept **per shard** — each shard's deps come only from
         // its own replicas, so a replica never receives (and stalls on) a
         // dependency in a shard it cannot witness.
@@ -1289,7 +1311,7 @@ impl Node {
             .map(|p| {
                 let deps = pre[&p.shard]
                     .iter()
-                    .flat_map(|(_, d)| d.iter().copied())
+                    .flat_map(|(_, (_, d))| d.iter().copied())
                     .collect();
                 (p.shard, deps)
             })
@@ -1498,6 +1520,18 @@ impl Node {
                 continue;
             }
 
+            // Every node that answered (whether or not it witnessed the txn). The
+            // recovery decision must rest on a slow quorum (`f + 1`) per shard, so
+            // it intersects any quorum that could already have decided — without
+            // that gate a sub-quorum sample could miss a Commit/Accept (or, under a
+            // shrunk electorate, raise `t0` while the txn already fast-committed at
+            // `t0` on the electorate). A non-witness still counts: it attests the
+            // txn was absent there.
+            let responders: Vec<NodeId> = resp
+                .iter()
+                .filter_map(|(from, r)| matches!(r, RecoverResp::Ok(_)).then_some(*from))
+                .collect();
+
             let known: Vec<(NodeId, RecoverFields)> = resp
                 .into_iter()
                 .filter_map(|(from, r)| match r {
@@ -1518,6 +1552,19 @@ impl Node {
                 }
             }
             let (plans, _union) = self.plan(&keys);
+
+            // Recovery-quorum gate: bail (retry on the next sweep) unless a slow
+            // quorum of each touched shard reported.
+            for plan in &plans {
+                let heard = responders
+                    .iter()
+                    .filter(|from| self.topology.node_shard(**from) == Some(plan.shard))
+                    .count();
+                if heard < plan.slow_q {
+                    self.deregister(txn);
+                    anyhow::bail!("recovery quorum not reached for shard {}", plan.shard);
+                }
+            }
             // Each shard reported only its owned events; reassemble the whole set
             // so every replica can extract its part from the Commit.
             let events_full = self.reassemble_events(&known);
@@ -2097,6 +2144,7 @@ impl Node {
             shards.entry(shard).or_insert_with(|| ShardPlan {
                 shard,
                 replicas: self.topology.replicas(key),
+                electorate: self.topology.fast_electorate(key),
                 fast_q: self.topology.fast_quorum(key),
                 slow_q: self.topology.slow_quorum(key),
             });
@@ -2200,6 +2248,41 @@ impl Node {
             }
         }
         out
+    }
+
+    /// Like [`collect_by_shard`](Self::collect_by_shard) but keeps each item
+    /// tagged with its responder, and stops once `done(plan, items)` holds for
+    /// every planned shard (or at the deadline). The responder is needed to gate
+    /// the fast path on the **electorate** subset of a shard's replicas.
+    async fn collect_by_shard_tagged<T>(
+        &self,
+        rx: &mut mpsc::UnboundedReceiver<(NodeId, Message)>,
+        plans: &[ShardPlan],
+        done: impl Fn(&ShardPlan, &[(NodeId, T)]) -> bool,
+        deadline: Instant,
+        mut extract: impl FnMut(Message) -> Option<T>,
+    ) -> HashMap<ShardId, Vec<(NodeId, T)>> {
+        let mut got: HashMap<ShardId, Vec<(NodeId, T)>> =
+            plans.iter().map(|p| (p.shard, Vec::new())).collect();
+
+        loop {
+            if plans.iter().all(|p| done(p, &got[&p.shard])) {
+                break;
+            }
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some((from, msg))) => {
+                    if let Some(item) = extract(msg) {
+                        if let Some(shard) = self.topology.node_shard(from) {
+                            if let Some(bucket) = got.get_mut(&shard) {
+                                bucket.push((from, item));
+                            }
+                        }
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+        got
     }
 
     /// Collects matching responses grouped by the responder's shard, stopping

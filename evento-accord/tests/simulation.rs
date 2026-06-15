@@ -80,25 +80,48 @@ struct Sim {
     tasks: Vec<Vec<tokio::task::JoinHandle<()>>>,
     /// The virtual-time origin all node clocks measure from (see [`virtual_micros`]).
     base: tokio::time::Instant,
+    /// Shared fast-path electorate (a subset of the nodes); `None` ⇒ all nodes.
+    /// Kept so a restarted node rebuilds with the same topology.
+    electorate: Option<Vec<NodeId>>,
 }
 
 impl Sim {
     fn build(n: u64) -> Self {
-        Self::build_inner(n, None, NodeConfig::default())
+        Self::build_inner(n, None, NodeConfig::default(), None)
     }
 
     /// Builds a cluster where node `skewed`'s clock runs `skew` microseconds ahead
     /// of the others — to exercise bounded clock-skew handling.
     fn build_with_skew(n: u64, skewed: usize, skew: u64) -> Self {
-        Self::build_inner(n, Some((skewed, skew)), NodeConfig::default())
+        Self::build_inner(n, Some((skewed, skew)), NodeConfig::default(), None)
     }
 
     /// Builds a cluster with a custom [`NodeConfig`] on every node.
     fn build_with_config(n: u64, config: NodeConfig) -> Self {
-        Self::build_inner(n, None, config)
+        Self::build_inner(n, None, config, None)
     }
 
-    fn build_inner(n: u64, skew: Option<(usize, u64)>, config: NodeConfig) -> Self {
+    /// Builds a cluster with a shared fast-path electorate, to exercise the
+    /// shrunk-electorate consensus & recovery paths under the oracles.
+    fn build_with_electorate(n: u64, electorate: Vec<NodeId>) -> Self {
+        Self::build_inner(n, None, NodeConfig::default(), Some(electorate))
+    }
+
+    /// Builds a [`StaticTopology`] for `id`, applying the shared electorate if set.
+    fn topology(id: NodeId, ids: &[NodeId], electorate: &Option<Vec<NodeId>>) -> StaticTopology {
+        let topology = StaticTopology::new(id, ids.to_vec());
+        match electorate {
+            Some(e) => topology.with_fast_electorate(e.clone()),
+            None => topology,
+        }
+    }
+
+    fn build_inner(
+        n: u64,
+        skew: Option<(usize, u64)>,
+        config: NodeConfig,
+        electorate: Option<Vec<NodeId>>,
+    ) -> Self {
         let ids: Vec<NodeId> = (0..n).map(NodeId).collect();
         let net = InMemoryNetwork::new();
         let base = tokio::time::Instant::now();
@@ -117,7 +140,7 @@ impl Sim {
             let sink: Arc<dyn MessageSink> = Arc::new(net.sink(id));
             let store = Arc::new(InMemoryDataStore::new());
             let journal = Arc::new(InMemoryJournal::new());
-            let topology = Arc::new(StaticTopology::new(id, ids.clone()));
+            let topology = Arc::new(Self::topology(id, &ids, &electorate));
             let node = Node::new(
                 id,
                 topology,
@@ -140,6 +163,7 @@ impl Sim {
             net,
             tasks,
             base,
+            electorate,
         }
     }
 
@@ -156,7 +180,7 @@ impl Sim {
         let store = Arc::new(InMemoryDataStore::new());
         let node = Node::new(
             id,
-            Arc::new(StaticTopology::new(id, self.ids.clone())),
+            Arc::new(Self::topology(id, &self.ids, &self.electorate)),
             Arc::new(HybridLogicalClock::with_physical(
                 id,
                 virtual_micros(self.base),
@@ -539,13 +563,16 @@ const MINORITY: [usize; 2] = [3, 4];
 /// healed. Writers coordinate only through the majority so the scenario tests
 /// whether a stranded minority can cause split-brain or phantom commits — it must
 /// not. Safety must hold throughout, and the cluster must converge after healing.
-async fn run_partition(seed: u64) -> Adversarial {
+async fn run_partition(seed: u64, electorate: Option<Vec<NodeId>>) -> Adversarial {
     const N: u64 = 5;
     const AGGS: usize = 4;
     const WRITERS: usize = 5;
     const WRITES_EACH: usize = 12;
 
-    let sim = Sim::build(N);
+    let sim = match electorate {
+        Some(e) => Sim::build_with_electorate(N, e),
+        None => Sim::build(N),
+    };
     let history: History = Arc::new(Mutex::new(Vec::new()));
 
     let mut rng = StdRng::seed_from_u64(seed);
@@ -656,13 +683,34 @@ async fn minority_never_ahead(sim: &Sim, history: &[WriteRecord]) -> Option<Stri
 async fn safety_holds_under_partitions() {
     const TOTAL: u64 = 20;
     for seed in 0..TOTAL {
-        let result = run_partition(seed).await;
+        let result = run_partition(seed, None).await;
         if let Some(v) = result.safety {
             panic!("SAFETY VIOLATION (partition) at seed {seed}: {v}");
         }
         assert!(
             result.converged,
             "seed {seed}: cluster failed to converge after partition heal"
+        );
+    }
+}
+
+/// The partition scenario under a **shrunk fast-path electorate** {0,1,2} (= the
+/// majority side). Writers coordinate through the majority, so they take the
+/// region-local fast path; the stranded minority {3,4} is recovered across the
+/// heal. This exercises the shrunk-electorate consensus and the recovery-quorum
+/// gate against the same safety + convergence oracles.
+#[tokio::test(start_paused = true)]
+async fn safety_holds_under_partitions_with_a_shrunk_electorate() {
+    const TOTAL: u64 = 20;
+    let electorate = vec![NodeId(0), NodeId(1), NodeId(2)];
+    for seed in 0..TOTAL {
+        let result = run_partition(seed, Some(electorate.clone())).await;
+        if let Some(v) = result.safety {
+            panic!("SAFETY VIOLATION (partition+electorate) at seed {seed}: {v}");
+        }
+        assert!(
+            result.converged,
+            "seed {seed}: cluster failed to converge after partition heal (electorate)"
         );
     }
 }

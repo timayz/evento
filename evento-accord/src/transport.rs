@@ -8,6 +8,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;
@@ -46,6 +47,13 @@ pub struct InMemoryNetwork {
     /// Observe-only — it never influences delivery, so the harness stays
     /// deterministic.
     shed: AtomicU64,
+    /// Per-directed-link delivery latency. **Empty by default**, so the common
+    /// path delivers inline exactly as before (the deterministic / bit-reproducible
+    /// simulation is byte-identical). A non-zero entry defers delivery by that
+    /// duration — a latency model for validating the region-favouring fast-path
+    /// electorate (a co-located coordinator commits before a remote replica could
+    /// even reply). For tests only; the production TCP transport is untouched.
+    latency: Mutex<HashMap<(NodeId, NodeId), Duration>>,
 }
 
 impl InMemoryNetwork {
@@ -118,6 +126,48 @@ impl InMemoryNetwork {
         self.shed.load(Ordering::Relaxed)
     }
 
+    /// Sets the one-way delivery latency on the directed link `from → to`. Zero
+    /// (the default) means inline delivery. Used by the latency model that
+    /// validates the region-favouring fast-path electorate.
+    pub fn set_latency(&self, from: NodeId, to: NodeId, latency: Duration) {
+        self.latency
+            .lock()
+            .expect("network poisoned")
+            .insert((from, to), latency);
+    }
+
+    /// Sets the delivery latency on the link between `a` and `b` in both
+    /// directions. Convenience over two [`set_latency`](Self::set_latency) calls.
+    pub fn set_link_latency(&self, a: NodeId, b: NodeId, latency: Duration) {
+        self.set_latency(a, b, latency);
+        self.set_latency(b, a, latency);
+    }
+
+    /// The configured delivery latency on `from → to` (zero if unset).
+    fn latency_of(&self, from: NodeId, to: NodeId) -> Duration {
+        self.latency
+            .lock()
+            .expect("network poisoned")
+            .get(&(from, to))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Enqueues `envelope` into `to`'s inbox via `try_send`, counting a shed on a
+    /// full inbox (backpressure). A closed/missing inbox is a down/partitioned
+    /// peer — tolerated loss, not counted.
+    fn deliver(&self, to: NodeId, envelope: Envelope) {
+        let inbox = {
+            let inboxes = self.inboxes.lock().expect("network poisoned");
+            inboxes.get(&to).cloned()
+        };
+        if let Some(tx) = inbox {
+            if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(envelope) {
+                self.shed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
     /// Whether `node` is currently crashed.
     fn is_crashed(&self, node: NodeId) -> bool {
         self.crashed
@@ -145,29 +195,29 @@ impl MessageSink for InMemorySink {
             return Ok(());
         }
 
-        let inbox = {
-            let inboxes = self.net.inboxes.lock().expect("network poisoned");
-            inboxes.get(&to).cloned()
+        let envelope = Envelope {
+            from: self.from,
+            message,
         };
-
-        match inbox {
-            // A closed/missing inbox models a partitioned or down peer, and a
-            // full inbox is backpressure shedding — both are tolerated loss, not a
-            // local error. `try_send` never blocks the sender.
-            Some(tx) => {
-                if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(Envelope {
-                    from: self.from,
-                    message,
-                }) {
-                    // A full inbox is backpressure shedding — count it (a *closed*
-                    // inbox is a down/partitioned peer, not backpressure, so it
-                    // isn't counted). The drop itself is unchanged; observe-only.
-                    self.net.shed.fetch_add(1, Ordering::Relaxed);
+        let latency = self.net.latency_of(self.from, to);
+        if latency.is_zero() {
+            // The common path: deliver inline, byte-identical to before (so the
+            // deterministic simulation is unchanged).
+            self.net.deliver(to, envelope);
+        } else {
+            // Latency model: defer delivery. Re-check liveness at arrival so a
+            // crash/partition during flight still drops the in-flight message.
+            let net = Arc::clone(&self.net);
+            let from = self.from;
+            tokio::spawn(async move {
+                tokio::time::sleep(latency).await;
+                if net.is_crashed(from) || net.is_crashed(to) || net.is_partitioned(from, to) {
+                    return;
                 }
-                Ok(())
-            }
-            None => Ok(()),
+                net.deliver(to, envelope);
+            });
         }
+        Ok(())
     }
 }
 

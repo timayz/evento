@@ -39,8 +39,13 @@ Quorums for `N = 2f + 1`:
 
 | Quorum     | Size            | N=3 (f=1) | N=5 (f=2) |
 |------------|-----------------|-----------|-----------|
-| Fast path  | `⌈3f/2⌉ + 1`    | 3         | 4         |
+| Fast path  | `⌊(e + f)/2⌋ + 1` | 3       | 4         |
 | Slow / recovery | `f + 1`    | 2         | 3         |
+
+The fast-path quorum is over the **fast-path electorate** of size `e` — a
+cluster-agreed subset of the replicas (default `e = N`, where the formula is the
+classic `⌈3f/2⌉ + 1`). Shrinking `e` (toward `f + 1`, placed in one region) shrinks
+the fast quorum, enabling single-region one-round-trip commits (Phase D).
 
 ## How Accord maps onto evento
 
@@ -248,9 +253,10 @@ recovery, atomic cross-shard conditional appends via the Read→Apply split with
 node-join bootstrap with buffer-replay, node leave, Paxos-backed epoch changes
 that survive a coordinator crash (acceptor set tracks current membership), and
 range movement (re-sharding), and multi-shard executor read routing, plus an opt-in
-linearizable-read **read-index** barrier (`NodeConfig.linearizable_reads`). **84 tests**
-(35 unit, 6 cluster, 3 multi-shard, 9 membership, 1 resharding, 6 executor,
-1 linearizable-stress, 1 shard-executor, 2 TCP, 2 mTLS, 12 simulation, 3 restart,
+linearizable-read **read-index** barrier (`NodeConfig.linearizable_reads`), and a
+region-favouring **fast-path electorate** (Phase D). **94 tests**
+(39 unit, 6 cluster, 5 electorate, 3 multi-shard, 9 membership, 1 resharding, 6 executor,
+1 linearizable-stress, 1 shard-executor, 2 TCP, 2 mTLS, 13 simulation, 3 restart,
 3 fjall-journal), clippy clean,
 stable across repeated runs (the simulation suite is deterministic — see Phase A).
 The full M0–M5 roadmap plus elastic membership (M4) is implemented. **External
@@ -386,11 +392,10 @@ backend (sql/fjall). Phases, in order:
   (`Node::an_owner_of`) prefers a **same-region** owner before any other — so a
   read forwarded for a non-local key stays in-region when possible. Quorum latency
   needs no change: the coordinator already collects the *first N* responses, so
-  nearby replicas form the quorum naturally. (The deeper region-favoring fast-path
-  *electorate* — single-region commits in one local round-trip — is a larger
-  CEP-15 change left for later; it isn't validatable without a latency model.) A
-  unit test proves a read routes to the same-region owner even when a remote owner
-  is listed first.
+  nearby replicas form the quorum naturally. (The deeper region-favouring fast-path
+  *electorate* — single-region commits in one local round-trip — is implemented in
+  **Phase D**.) A unit test proves a read routes to the same-region owner even when
+  a remote owner is listed first.
   ✅ **TLS + mutual auth:** the TCP transport can wrap every connection in rustls
   with mutual certificate auth — `TcpTransport::with_tls` (client side) + `serve_tls`
   (server side, verifying client certs), the stream becoming plain-or-TLS via
@@ -475,8 +480,35 @@ backend (sql/fjall). Phases, in order:
         (incl. bit-reproducibility — the `BTreeSet` order is deterministic) and all
         67 tests still pass. (Thread-level parallelization of the single inbox loop
         remains a further, now far less urgent, lever.)
-  - [ ] **Fast-path electorate** (deferred from Phase C) — region-favoring
-        single-round-trip commits; not validatable without a latency model.
+  - [x] **Fast-path electorate** (deferred from Phase C) — region-favouring
+        single-round-trip commits, now implemented and validated. A shard's
+        **electorate** is a cluster-agreed subset of its replicas (the same for
+        every coordinator — a `Topology::fast_electorate` property, defaulting to
+        the whole set) whose `PreAccept` votes decide the fast path. The fast
+        quorum generalises to `⌊(e + f)/2⌋ + 1` over the electorate size `e`
+        (`api.rs`), reducing to the classic `⌈3f/2⌉ + 1` at `e = N` and shrinking
+        toward `f + 1` as the electorate shrinks; the builders assert the
+        recovery-sound bound `f + 1 ≤ e ≤ N`. Placed in one region, the electorate
+        lets a co-located coordinator commit in **one local round-trip** without
+        waiting for remote replicas — non-electorate replicas still witness (for
+        deps & recovery) but do not vote, so the coordinator gates the fast path on
+        electorate responses only (`node.rs coordinate`). Recovery stays sound
+        because the shared electorate keeps the two intersection invariants
+        (`fast ≥ f+1`; `2·fast > e`); **a latent recovery gap surfaced and was
+        fixed** along the way: `recover` decided the PreAccepted keep-`t0`-vs-raise
+        branch on whatever arrived before the timeout, not on a quorum — harmless
+        at `e = N` but a split risk under a shrunk electorate, so it now gates the
+        decision on a slow quorum (`f + 1`) per touched shard. Validated by a
+        **latency model** in the in-memory transport (per-link delay, **off by
+        default** so the deterministic suite is byte-identical): `tests/electorate.rs`
+        shows a region-local electorate commits on the fast path in a few local
+        round-trips — far below a cross-region reply or the fast-path timeout —
+        while the default electorate falls back to the slow path under the same
+        geography; plus the recovery-quorum gate and idempotent double-recovery
+        under a shrunk electorate. The deterministic partition oracle also runs
+        under a shrunk electorate (`safety_holds_under_partitions_with_a_shrunk_electorate`,
+        20 seeds). *Deferred follow-up:* propagating a per-shard electorate through
+        `DynamicTopology` / the metadata log so it survives epoch changes.
 
 - **Phase E — Production readiness.** 🚧 *In progress.* The items that make it
   safe to run, not just correct in a lab. **Five of the six items are done; PKI/cert

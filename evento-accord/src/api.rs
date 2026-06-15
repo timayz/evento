@@ -58,8 +58,25 @@ pub trait Topology: Send + Sync + 'static {
     /// quorum within.
     fn replicas(&self, key: &Key) -> Vec<NodeId>;
 
-    /// Fast-path quorum size for `key`'s replica set: `⌈3f/2⌉ + 1` where the
-    /// replica set has size `2f + 1`.
+    /// The **fast-path electorate** for `key`'s shard — the subset of
+    /// [`replicas`](Topology::replicas) whose `PreAccept` votes decide the
+    /// one-round-trip fast path. It is a *fixed, cluster-agreed* property of the
+    /// shard (every coordinator of the shard uses the same set), placed in one
+    /// region so a co-located coordinator commits in a single local round-trip.
+    ///
+    /// The default is the whole replica set (no region favouring — the classic
+    /// `⌈3f/2⌉ + 1` fast path). A configured electorate must be a subset of
+    /// `replicas(key)` with `f + 1 ≤ |E| ≤ N` (asserted at construction): that
+    /// bound keeps recovery sound — a recovery quorum (`f + 1`) always intersects
+    /// a fast quorum, and any two fast quorums of the shared electorate intersect.
+    fn fast_electorate(&self, key: &Key) -> Vec<NodeId> {
+        self.replicas(key)
+    }
+
+    /// Fast-path quorum size for `key`: `⌊(e + f)/2⌋ + 1` where `e` is the
+    /// [`fast_electorate`](Topology::fast_electorate) size and the replica set has
+    /// size `N = 2f + 1`. Reduces to `⌈3f/2⌉ + 1` when the electorate is the whole
+    /// replica set (`e = N`).
     fn fast_quorum(&self, key: &Key) -> usize;
 
     /// Slow-path / recovery quorum size for `key`'s replica set: `f + 1`.
@@ -246,11 +263,41 @@ pub trait DataStore: Send + Sync + 'static {
     }
 }
 
+/// Fast-path quorum size: `⌊(electorate + faults)/2⌋ + 1`. With the electorate set
+/// to the whole replica set (`electorate = 2f + 1`) this is the classic
+/// `⌈3f/2⌉ + 1`; shrinking the electorate toward `f + 1` shrinks the quorum toward
+/// `f + 1`, enabling a single-region one-round-trip commit.
+pub(crate) fn fast_quorum_size(electorate: usize, faults: usize) -> usize {
+    (electorate + faults) / 2 + 1
+}
+
+/// Asserts a configured fast-path electorate is well-formed for a replica set:
+/// a subset of `replicas`, with `f + 1 ≤ |electorate| ≤ N` (the bound that keeps
+/// recovery sound). Panics on violation — a configuration error.
+pub(crate) fn assert_valid_electorate(electorate: &[NodeId], replicas: &[NodeId]) {
+    let n = replicas.len();
+    let f = n.saturating_sub(1) / 2;
+    let min = f + 1; // the smallest electorate that keeps recovery sound
+    assert!(
+        electorate.len() >= min && electorate.len() <= n,
+        "fast-path electorate of {} is out of range for N={n} (need f+1={min}..=N)",
+        electorate.len(),
+    );
+    for node in electorate {
+        assert!(
+            replicas.contains(node),
+            "fast-path electorate member {node:?} is not a replica of the shard"
+        );
+    }
+}
+
 /// Static, single-shard [`Topology`]: every node replicates every key. The
 /// starting point for M1; superseded by sharded/epoch-aware topologies in M3/M4.
 pub struct StaticTopology {
     this: NodeId,
     nodes: Vec<NodeId>,
+    /// Optional fast-path electorate (a subset of `nodes`); `None` ⇒ all nodes.
+    electorate: Option<Vec<NodeId>>,
 }
 
 impl StaticTopology {
@@ -262,7 +309,20 @@ impl StaticTopology {
             nodes.contains(&this),
             "this node {this:?} must be part of the cluster"
         );
-        Self { this, nodes }
+        Self {
+            this,
+            nodes,
+            electorate: None,
+        }
+    }
+
+    /// Sets the fast-path electorate — the subset of nodes whose `PreAccept` votes
+    /// decide the one-round-trip fast path (see [`Topology::fast_electorate`]).
+    /// Panics unless it is a subset of the nodes with `f + 1 ≤ |E| ≤ N`.
+    pub fn with_fast_electorate(mut self, electorate: Vec<NodeId>) -> Self {
+        assert_valid_electorate(&electorate, &self.nodes);
+        self.electorate = Some(electorate);
+        self
     }
 
     /// Failures tolerated: for `N = 2f + 1`, `f = (N - 1) / 2`.
@@ -289,10 +349,13 @@ impl Topology for StaticTopology {
         self.nodes.clone()
     }
 
-    fn fast_quorum(&self, _key: &Key) -> usize {
-        // ⌈3f/2⌉ + 1.
-        let f = self.faults();
-        (3 * f).div_ceil(2) + 1
+    fn fast_electorate(&self, _key: &Key) -> Vec<NodeId> {
+        self.electorate.clone().unwrap_or_else(|| self.nodes.clone())
+    }
+
+    fn fast_quorum(&self, key: &Key) -> usize {
+        // ⌊(e + f)/2⌋ + 1; ⌈3f/2⌉ + 1 when the electorate is the whole set.
+        fast_quorum_size(self.fast_electorate(key).len(), self.faults())
     }
 
     fn slow_quorum(&self, _key: &Key) -> usize {
@@ -308,6 +371,9 @@ pub struct ShardedTopology {
     this: NodeId,
     /// Shard id → replica set. Replica sets are disjoint.
     shards: Vec<Vec<NodeId>>,
+    /// Shard id → optional fast-path electorate (a subset of that shard's
+    /// replicas); `None` ⇒ the whole shard.
+    electorates: Vec<Option<Vec<NodeId>>>,
     /// Optional node → region map for region-aware routing (empty ⇒ no regions).
     regions: std::collections::HashMap<NodeId, RegionId>,
 }
@@ -330,9 +396,11 @@ impl ShardedTopology {
             seen.contains(&this),
             "this node {this:?} must belong to a shard"
         );
+        let electorates = vec![None; shards.len()];
         Self {
             this,
             shards,
+            electorates,
             regions: std::collections::HashMap::new(),
         }
     }
@@ -341,6 +409,16 @@ impl ShardedTopology {
     /// map has no region).
     pub fn with_regions(mut self, regions: std::collections::HashMap<NodeId, RegionId>) -> Self {
         self.regions = regions;
+        self
+    }
+
+    /// Sets `shard`'s fast-path electorate — the subset of its replicas whose
+    /// `PreAccept` votes decide the one-round-trip fast path (see
+    /// [`Topology::fast_electorate`]). Panics unless it is a subset of the shard's
+    /// replicas with `f + 1 ≤ |E| ≤ N`.
+    pub fn with_fast_electorate(mut self, shard: ShardId, electorate: Vec<NodeId>) -> Self {
+        assert_valid_electorate(&electorate, &self.shards[shard]);
+        self.electorates[shard] = Some(electorate);
         self
     }
 
@@ -367,9 +445,16 @@ impl Topology for ShardedTopology {
         self.shards[self.shard_of(key)].clone()
     }
 
+    fn fast_electorate(&self, key: &Key) -> Vec<NodeId> {
+        let shard = self.shard_of(key);
+        self.electorates[shard]
+            .clone()
+            .unwrap_or_else(|| self.shards[shard].clone())
+    }
+
     fn fast_quorum(&self, key: &Key) -> usize {
         let f = Self::faults(self.shards[self.shard_of(key)].len());
-        (3 * f).div_ceil(2) + 1
+        fast_quorum_size(self.fast_electorate(key).len(), f)
     }
 
     fn slow_quorum(&self, key: &Key) -> usize {
@@ -452,11 +537,15 @@ impl Topology for DynamicTopology {
         state.shards[Self::shard_index(&state.shards, key)].clone()
     }
 
+    // Note: `fast_electorate` uses the trait default (the whole replica set), so
+    // the fast quorum is the classic `⌈3f/2⌉ + 1`.
+    // TODO (Phase D follow-up): replicate a per-shard electorate through the
+    // metadata log so a shrunk, region-favouring electorate survives epoch changes.
     fn fast_quorum(&self, key: &Key) -> usize {
         let state = self.state.lock().expect("topology poisoned");
         let n = state.shards[Self::shard_index(&state.shards, key)].len();
         let f = n.saturating_sub(1) / 2;
-        (3 * f).div_ceil(2) + 1
+        fast_quorum_size(n, f)
     }
 
     fn slow_quorum(&self, key: &Key) -> usize {
@@ -520,5 +609,87 @@ mod tests {
         let t7 = topo(7);
         assert_eq!(t7.fast_quorum(&k), 6);
         assert_eq!(t7.slow_quorum(&k), 4);
+    }
+
+    #[test]
+    fn electorate_quorum_table_and_invariants() {
+        let k = Key("x".into());
+        // For each N, sweep the electorate size e over the legal range [f+1, N] and
+        // check the formula plus the two recovery-safety invariants.
+        for &n in &[3u64, 5, 7] {
+            let f = (n as usize - 1) / 2;
+            let nodes: Vec<NodeId> = (0..n).map(NodeId).collect();
+            for e in (f + 1)..=(n as usize) {
+                let topo = StaticTopology::new(NodeId(0), nodes.clone())
+                    .with_fast_electorate(nodes[..e].to_vec());
+                let fast = topo.fast_quorum(&k);
+                let slow = topo.slow_quorum(&k);
+                assert_eq!(fast, (e + f) / 2 + 1, "N={n} e={e}");
+                assert_eq!(slow, f + 1, "slow quorum is f+1 regardless of electorate");
+                // Invariant 1: a recovery quorum (f+1) always intersects a fast quorum.
+                assert!(fast > f, "fast≥f+1 fails for N={n} e={e}");
+                // Invariant 2: any two fast quorums of the electorate intersect.
+                assert!(2 * fast > e, "2·fast>e fails for N={n} e={e}");
+                // A fast quorum is reachable within the electorate.
+                assert!(fast <= e, "fast≤e fails for N={n} e={e}");
+            }
+            // The full electorate (default) reproduces the classic ⌈3f/2⌉+1.
+            assert_eq!(
+                StaticTopology::new(NodeId(0), nodes.clone()).fast_quorum(&k),
+                (3 * f).div_ceil(2) + 1,
+                "default electorate is the classic fast quorum for N={n}"
+            );
+            // The smallest electorate (e=f+1) collapses fast to slow (f+1).
+            let smallest = StaticTopology::new(NodeId(0), nodes.clone())
+                .with_fast_electorate(nodes[..f + 1].to_vec());
+            assert_eq!(smallest.fast_quorum(&k), f + 1, "e=f+1 ⇒ fast=slow for N={n}");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn electorate_below_f_plus_one_panics() {
+        // N=5, f=2: an electorate of 2 (< f+1=3) is unsafe.
+        let nodes: Vec<NodeId> = (0..5).map(NodeId).collect();
+        StaticTopology::new(NodeId(0), nodes.clone()).with_fast_electorate(nodes[..2].to_vec());
+    }
+
+    #[test]
+    #[should_panic(expected = "not a replica")]
+    fn electorate_with_a_non_replica_panics() {
+        let nodes: Vec<NodeId> = (0..5).map(NodeId).collect();
+        StaticTopology::new(NodeId(0), nodes)
+            .with_fast_electorate(vec![NodeId(0), NodeId(1), NodeId(99)]);
+    }
+
+    #[test]
+    fn sharded_per_shard_electorate() {
+        // Two 3-node shards; shrink shard 0's electorate to 2 (region-local),
+        // leave shard 1 at the default.
+        let shards = vec![
+            vec![NodeId(0), NodeId(1), NodeId(2)],
+            vec![NodeId(3), NodeId(4), NodeId(5)],
+        ];
+        let topo = ShardedTopology::new(NodeId(0), shards)
+            .with_fast_electorate(0, vec![NodeId(0), NodeId(1)]);
+        // Find a key for each shard.
+        let mut k0 = None;
+        let mut k1 = None;
+        for i in 0..1000 {
+            let k = Key(format!("k{i}"));
+            match topo.shard_of(&k) {
+                0 if k0.is_none() => k0 = Some(k),
+                1 if k1.is_none() => k1 = Some(k),
+                _ => {}
+            }
+            if k0.is_some() && k1.is_some() {
+                break;
+            }
+        }
+        let (k0, k1) = (k0.unwrap(), k1.unwrap());
+        // Shard 0: e=2, f=1 ⇒ fast=(2+1)/2+1=2. Shard 1: default e=3 ⇒ fast=3.
+        assert_eq!(topo.fast_electorate(&k0).len(), 2);
+        assert_eq!(topo.fast_quorum(&k0), 2);
+        assert_eq!(topo.fast_quorum(&k1), 3);
     }
 }
