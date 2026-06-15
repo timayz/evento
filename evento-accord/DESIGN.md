@@ -392,15 +392,16 @@ backend (sql/fjall). Phases, in order:
   recovery takeover, compaction). A sim test asserts the counters track real
   activity (clean commits, a raced conflict, transport/journal traffic).
   ✅ **Performance baseline:** a criterion benchmark (`benches/throughput.rs`,
-  `cargo bench`) measures (a) conflict-free write **latency** — ≈ 0.46 ms (1
-  node), 0.72 ms (3), 1.2 ms (5), growing with quorum size as expected — and (b)
-  **concurrent throughput** (a 64-deep burst). The throughput probe surfaced a
-  real bottleneck: aggregate throughput is *lower* than serial latency predicts,
-  because each node's **single inbox loop** serializes message processing across
-  all in-flight transactions (every write still needs three sequential quorum
-  round-trips through it). So the inbox loop — not the network or fsync — is the
-  throughput ceiling, and parallelizing/pipelining it is the concrete next perf
-  lever, now measurable.
+  `cargo bench`) measures (a) conflict-free write **latency** and (b) **concurrent
+  throughput** (a 64-deep burst). The baseline probe surfaced a real bottleneck —
+  and the fix is now in (see **Write pipelining** below): the execution scheduler
+  (`next_apply`/`next_read`) used to linearly scan **every** command per execution
+  step, so as applied state accumulates between compactions the inbox loop's
+  per-message cost grew O(n). Replacing the scan with an ordered execution queue
+  (`Replica.pending`) cut the 64-deep-burst time **~10–15×** (3 nodes ≈ 1.7→27 K
+  writes/s; 5 nodes ≈ 2.4→25 K) and write latency to ≈ 65 µs (1 node), 87 µs (3),
+  87 µs (5). The node's single inbox loop remains a *further* (now far less urgent)
+  parallelization lever.
 
   **Phase D remaining (sign-off):**
   - [x] Observability — in-process metrics + `tracing`.
@@ -449,8 +450,16 @@ backend (sql/fjall). Phases, in order:
   - [ ] **Real-cluster soak + chaos** over days (kills, partitions, clock skew,
         disk pressure, slow disks/links) on actual hardware — zero production
         mileage today.
-  - [ ] **Write pipelining** — parallelize the per-node inbox loop (the measured
-        throughput ceiling); validate the win against the benchmark.
+  - [x] **Write pipelining** — the measured throughput ceiling was the inbox
+        loop's **O(n) execution scan**, not the network/fsync: `next_apply`/
+        `next_read` scanned every command (incl. all the accumulated `Applied` ones)
+        per step. Fixed with an ordered execution queue (`Replica.pending`, a
+        `BTreeSet<(execute_at, txn)>` of only the un-applied commands), kept in
+        lockstep with `commands`. **~10–15× throughput** on the 64-deep burst and
+        ~10× lower write latency, validated against the benchmark; the simulation
+        (incl. bit-reproducibility — the `BTreeSet` order is deterministic) and all
+        67 tests still pass. (Thread-level parallelization of the single inbox loop
+        remains a further, now far less urgent, lever.)
   - [ ] **Fast-path electorate** (deferred from Phase C) — region-favoring
         single-round-trip commits; not validatable without a latency model.
 

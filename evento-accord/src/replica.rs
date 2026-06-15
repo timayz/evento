@@ -37,6 +37,15 @@ pub struct Replica {
     commands: HashMap<TxnId, CommandState>,
     /// Index from key to the transactions touching it, for conflict lookup.
     by_key: HashMap<Key, BTreeSet<TxnId>>,
+    /// Execution queue: the `(execute_at, txn)` of every command awaiting
+    /// execution — status [`Committed`](Status::Committed) or
+    /// [`Reading`](Status::Reading), i.e. final order known but not yet applied.
+    /// Ordered, so [`next_apply`](Replica::next_apply)/[`next_read`](Replica::next_read)
+    /// scan only the (few) un-applied commands in execution order instead of every
+    /// command — the apply pipeline stays O(pending), not O(all commands), as
+    /// applied state accumulates between compactions. Kept in lockstep with
+    /// `commands` (an entry is present iff its status is Committed or Reading).
+    pending: BTreeSet<(Timestamp, TxnId)>,
     /// Redundancy watermark: every transaction with `t0` below this has been
     /// applied on every replica, so it is dropped from `commands`/`by_key` and a
     /// dependency below it counts as already satisfied (its effect is in the data
@@ -49,9 +58,16 @@ impl Default for Replica {
         Self {
             commands: HashMap::new(),
             by_key: HashMap::new(),
+            pending: BTreeSet::new(),
             redundant_before: Timestamp::MIN,
         }
     }
+}
+
+/// Whether a command at `status` is awaiting execution (in the `pending` queue):
+/// its execution order is final but it has not been applied yet.
+fn awaiting_execution(status: Status) -> bool {
+    status >= Status::Committed && status != Status::Applied
 }
 
 /// A transaction whose dependencies are satisfied and that the node should now
@@ -143,10 +159,20 @@ impl Replica {
         }
     }
 
-    /// Indexes a transaction's keys and inserts its command state.
+    /// Indexes a transaction's keys and inserts its command state, keeping the
+    /// `pending` execution queue in lockstep (including when overwriting an
+    /// existing command, e.g. [`import_applied`](Self::import_applied)).
     fn insert(&mut self, cmd: CommandState) {
+        if let Some(old) = self.commands.get(&cmd.txn) {
+            if awaiting_execution(old.status) {
+                self.pending.remove(&(old.execute_at, old.txn));
+            }
+        }
         for key in &cmd.keys {
             self.by_key.entry(key.clone()).or_default().insert(cmd.txn);
+        }
+        if awaiting_execution(cmd.status) {
+            self.pending.insert((cmd.execute_at, cmd.txn));
         }
         self.commands.insert(cmd.txn, cmd);
     }
@@ -253,6 +279,13 @@ impl Replica {
             if ballot < cmd.promised {
                 return Err(cmd.promised);
             }
+            // Commit is terminal: a (possibly reordered/stale) Accept must never
+            // downgrade an already-committed transaction's final timestamp/deps —
+            // doing so would also desync the `pending` execution queue. Answer with
+            // the committed deps instead.
+            if cmd.status >= Status::Committed {
+                return Ok(cmd.deps.clone());
+            }
             cmd.promised = ballot;
             cmd.accepted = ballot;
             cmd.status = Status::Accepted;
@@ -302,6 +335,8 @@ impl Replica {
             if cmd.events.is_empty() {
                 cmd.events = events;
             }
+            // Newly executable: enter the execution queue at its final order.
+            self.pending.insert((execute_at, txn));
         } else {
             self.insert(CommandState {
                 txn,
@@ -419,24 +454,26 @@ impl Replica {
     /// blocking dependents until applied. Decided transactions go through
     /// [`next_apply`](Replica::next_apply) instead.
     pub fn next_read(&mut self) -> Option<Ready> {
-        let next = self
-            .commands
-            .values()
-            .filter(|cmd| cmd.status == Status::Committed && cmd.decision.is_none())
-            .filter(|cmd| self.is_ready(cmd.txn))
-            .min_by_key(|cmd| (cmd.execute_at, cmd.txn))
-            .map(|cmd| (cmd.txn, cmd.execute_at, cmd.events.clone(), cmd.reply_to));
+        // The `pending` queue is ordered by `(execute_at, txn)`, so the first
+        // entry that is ready and undecided is the lowest-order one to read.
+        let txn = self.pending.iter().map(|&(_, txn)| txn).find(|&txn| {
+            let cmd = &self.commands[&txn];
+            cmd.status == Status::Committed && cmd.decision.is_none() && self.is_ready(txn)
+        })?;
 
-        let (txn, execute_at, events, reply_to) = next?;
+        let cmd = &self.commands[&txn];
+        let ready = Ready {
+            txn,
+            execute_at: cmd.execute_at,
+            events: cmd.events.clone(),
+            reply_to: cmd.reply_to,
+        };
+        // Committed → Reading: still awaiting execution at the same order, so its
+        // `pending` entry is unchanged.
         if let Some(cmd) = self.commands.get_mut(&txn) {
             cmd.status = Status::Reading;
         }
-        Some(Ready {
-            txn,
-            execute_at,
-            events,
-            reply_to,
-        })
+        Some(ready)
     }
 
     /// Records the coordinator's commit/abort decision for `txn` (from Apply).
@@ -453,29 +490,23 @@ impl Replica {
     /// Picks the lowest-order transaction that has a decision and whose
     /// dependencies are satisfied, to be applied next.
     pub fn next_apply(&mut self) -> Option<ApplyReady> {
-        let next = self
-            .commands
-            .values()
-            .filter(|cmd| cmd.decision.is_some() && cmd.status != Status::Applied)
-            .filter(|cmd| self.is_ready(cmd.txn))
-            .min_by_key(|cmd| (cmd.execute_at, cmd.txn))
-            .map(|cmd| {
-                (
-                    cmd.txn,
-                    cmd.execute_at,
-                    cmd.events.clone(),
-                    cmd.decision.expect("decision present"),
-                    cmd.reply_to,
-                )
-            });
+        // `pending` holds exactly the un-applied (Committed/Reading) commands in
+        // execution order; the first that is decided and ready applies next.
+        // (A command decided before it committed isn't in `pending` yet — it was
+        // never ready either, so the old full scan would have skipped it too.)
+        let txn = self
+            .pending
+            .iter()
+            .map(|&(_, txn)| txn)
+            .find(|&txn| self.commands[&txn].decision.is_some() && self.is_ready(txn))?;
 
-        let (txn, execute_at, events, commit, reply_to) = next?;
+        let cmd = &self.commands[&txn];
         Some(ApplyReady {
             txn,
-            execute_at,
-            events,
-            commit,
-            reply_to,
+            execute_at: cmd.execute_at,
+            events: cmd.events.clone(),
+            commit: cmd.decision.expect("decision present"),
+            reply_to: cmd.reply_to,
         })
     }
 
@@ -483,8 +514,10 @@ impl Replica {
     /// conflict outcome and unblocking dependents.
     pub fn mark_applied(&mut self, txn: TxnId, conflict: bool) {
         if let Some(cmd) = self.commands.get_mut(&txn) {
+            let at = cmd.execute_at;
             cmd.status = Status::Applied;
             cmd.applied_conflict = Some(conflict);
+            self.pending.remove(&(at, txn));
         }
     }
 
