@@ -11,7 +11,7 @@ use evento_accord::{
     AccordExecutor, DataStore, DynamicTopology, ExecutorDataStore, HybridLogicalClock,
     InMemoryJournal, InMemoryNetwork, Journal, Key, MessageSink, Node, NodeId, Topology,
 };
-use evento_core::{cursor::Args, Event, Executor, EventFilter};
+use evento_core::{cursor::Args, Event, EventFilter, Executor};
 use evento_fjall::Fjall;
 use tempfile::TempDir;
 

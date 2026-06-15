@@ -10,7 +10,7 @@ use evento_accord::{
     AccordExecutor, DataStore, ExecutorDataStore, HybridLogicalClock, InMemoryJournal,
     InMemoryNetwork, Journal, MessageSink, Node, NodeId, StaticTopology,
 };
-use evento_core::{cursor::Args, Event, Executor, EventFilter, WriteError};
+use evento_core::{cursor::Args, Event, EventFilter, Executor, WriteError};
 use evento_fjall::Fjall;
 use tempfile::TempDir;
 use ulid::Ulid;

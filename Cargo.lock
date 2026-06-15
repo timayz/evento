@@ -963,7 +963,6 @@ dependencies = [
  "rcgen",
  "serde",
  "tempfile",
- "thiserror",
  "tokio",
  "tokio-rustls",
  "tokio-util",

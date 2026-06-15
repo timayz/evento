@@ -22,7 +22,7 @@
 use async_trait::async_trait;
 use evento_core::{
     cursor::{Args, ReadResult, Value},
-    Event, Executor, EventFilter, RoutingKey, WriteError,
+    Event, EventFilter, Executor, RoutingKey, WriteError,
 };
 use ulid::Ulid;
 
