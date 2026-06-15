@@ -4,7 +4,8 @@
 
 use std::path::Path;
 
-use evento_accord::{Journal, SqlJournal};
+use evento_accord::Journal;
+use evento_sql::SqlJournal;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::Sqlite;
 

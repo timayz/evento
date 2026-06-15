@@ -63,6 +63,13 @@ use evento_core::{
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 use ulid::Ulid;
 
+/// A fjall-backed [`evento_accord::Journal`] (the Accord consensus log), behind the
+/// optional `accord` feature.
+#[cfg(feature = "accord")]
+mod accord_journal;
+#[cfg(feature = "accord")]
+pub use accord_journal::FjallJournal;
+
 /// Subscriber state stored in the database.
 #[derive(Debug, Clone, bitcode::Encode, bitcode::Decode)]
 struct SubscriberState {

@@ -2,7 +2,8 @@
 //! convention URL, `postgres://postgres:postgres@localhost:5432`). Each scenario runs
 //! in its own database for isolation. Gated by the `postgres` feature.
 
-use evento_accord::{Journal, SqlJournal};
+use evento_accord::Journal;
+use evento_sql::SqlJournal;
 use sqlx::migrate::MigrateDatabase;
 use sqlx::{PgPool, Postgres};
 

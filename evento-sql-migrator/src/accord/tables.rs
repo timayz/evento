@@ -10,7 +10,7 @@ pub struct Operation;
 /// across SQLite/MySQL/PostgreSQL: the `txn` key is `VARBINARY(20)` (a BLOB primary
 /// key is invalid on MySQL) — the 20-byte order-preserving `(micros, logical, node)`
 /// pack `SqlJournal` writes — and the `meta` key is `VARCHAR(64)`. **Must match
-/// `evento_accord::sql_journal::SqlJournal::migrate`.**
+/// `evento_sql::SqlJournal::migrate`.**
 fn up_statements() -> Vec<TableCreateStatement> {
     vec![
         Table::create()

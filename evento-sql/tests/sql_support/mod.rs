@@ -4,10 +4,10 @@
 #![allow(dead_code)]
 
 use evento_accord::{
-    AcceptorRecord, Ballot, CommandState, Journal, Key, NodeId, SqlJournal, Status, Timestamp,
-    TxnId,
+    AcceptorRecord, Ballot, CommandState, Journal, Key, NodeId, Status, Timestamp, TxnId,
 };
 use evento_core::Event;
+use evento_sql::SqlJournal;
 use sqlx::Database;
 
 pub fn timestamp(micros: u64, node: u64) -> Timestamp {

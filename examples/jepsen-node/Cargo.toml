@@ -14,9 +14,10 @@ path = "src/main.rs"
 evento = { workspace = true, features = ["fjall"] }
 # evento-accord wraps that backend in the Accord consensus executor.
 evento-accord.workspace = true
+# the fjall-backed durable consensus journal (`FjallJournal`).
+evento-fjall = { workspace = true, features = ["accord"] }
 axum.workspace = true
 tokio.workspace = true
-serde.workspace = true
 serde_json = "1.0"
 ulid.workspace = true
 anyhow.workspace = true

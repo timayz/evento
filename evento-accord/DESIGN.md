@@ -255,11 +255,13 @@ that survive a coordinator crash (acceptor set tracks current membership), and
 range movement (re-sharding), and multi-shard executor read routing, plus an opt-in
 linearizable-read **read-index** barrier (`NodeConfig.linearizable_reads`), and a
 region-favouring **fast-path electorate** (Phase D, including a region-derived
-electorate on `DynamicTopology`). **101 tests**
+electorate on `DynamicTopology`). **98 tests in the consensus crate**
 (42 unit, 6 cluster, 5 electorate, 3 multi-shard, 12 membership, 1 resharding, 6 executor,
-1 linearizable-stress, 1 shard-executor, 2 TCP, 3 mTLS, 13 simulation, 3 restart,
-3 fjall-journal; plus 4 SQL-journal tests under `--features sqlite`), clippy clean,
-stable across repeated runs (the simulation suite is deterministic — see Phase A).
+1 linearizable-stress, 1 shard-executor, 2 TCP, 3 mTLS, 13 simulation, 3 restart),
+clippy clean, stable across repeated runs (the simulation suite is deterministic — see
+Phase A). The durable-journal tests live with their backends: 3 `FjallJournal` tests in
+`evento-fjall` (`--features accord`) and 12 `SqlJournal` tests in `evento-sql`
+(`--features accord` × sqlite/postgres/mysql).
 The full M0–M5 roadmap plus elastic membership (M4) is implemented. **External
 verification has begun**: an independent Jepsen/Elle harness (`evento-accord/jepsen/`,
 self-contained Docker cluster) drives the cluster under partition/kill/pause and checks
@@ -316,20 +318,25 @@ backend (sql/fjall). Phases, in order:
   the `Replica` (status, ballots, decision) and replays committed transactions into
   the data store on startup; in-flight transactions resume via the sweep.
   `tests/restart.rs` proves a node rebuilds from its journal and rejoins — both
-  cleanly and *while writes are in flight*. ✅ **Disk-backed journal:**
-  `FjallJournal` (bitcode-serialized `CommandState`s in a fjall database) is a
-  genuinely durable `Journal`; `tests/fjall_journal.rs` proves records survive a
-  full close/reopen (a real process restart). ✅ **SQL-backed journal:** `SqlJournal<DB>`
-  (behind the optional `sql` feature) is a drop-in `Journal` over `sqlx` + `sea-query`,
-  portable across **sqlite/mysql/postgres** exactly like `evento-sql`'s `Sql<DB>` —
-  so a deployment already on SQL keeps its consensus state in the **same database** as
-  its events. It shares the tagged-bitcode format with the fjall journal, group-commits
+  cleanly and *while writes are in flight*. **The durable `Journal` impls live in
+  their backend crates, not here** — mirroring how `evento-core` defines `Executor`
+  and the backends implement it. `evento-accord`'s core depends only on its own
+  `Journal` trait + `evento-core` (no `fjall`/`sqlx`); each backend opts in via an
+  `accord` cargo feature: ✅ **Disk-backed journal:** `evento_fjall::FjallJournal`
+  (bitcode-serialized `CommandState`s in a fjall database, `evento-fjall`'s `accord`
+  feature) is a genuinely durable `Journal`; its test proves records survive a full
+  close/reopen (a real process restart). ✅ **SQL-backed journal:**
+  `evento_sql::SqlJournal<DB>` (`evento-sql`'s `accord` feature) is a drop-in `Journal`
+  over `sqlx` + `sea-query`, portable across **sqlite/mysql/postgres** exactly like
+  `evento-sql`'s `Sql<DB>` — so a deployment already on SQL keeps its consensus state
+  in the **same database** as its events. It shares the tagged-bitcode format with the
+  fjall journal, group-commits
   a staged batch in one transaction, and uses an order-preserving `TxnId` key so
   `truncate` is a single range `DELETE`. It is **integration-tested on all three
   backends** — round-trip of every record type, truncation, group-commit batching, and
   reopen/reconnect durability run against SQLite *and* live MySQL + PostgreSQL
-  (`tests/sql_journal{,_postgres,_mysql}.rs`, shared scenarios, gated by the
-  `sqlite`/`postgres`/`mysql` features; servers via the repo's `make up`). The
+  (`evento-sql/tests/sql_journal{,_postgres,_mysql}.rs`, shared scenarios, gated by the
+  `accord` + `sqlite`/`postgres`/`mysql` features; servers via the repo's `make up`). The
   MySQL run already paid off — it caught a real dialect bug (sea-query's bare
   `do_nothing` emits an invalid `ON DUPLICATE KEY IGNORE`; fixed with `do_nothing_on`).
   The schema is managed the canonical way — through **`evento-sql-migrator`**

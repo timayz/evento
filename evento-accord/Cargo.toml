@@ -4,7 +4,7 @@ version = "2.0.0-alpha.20"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-publish = false
+publish = true
 description = "Accord consensus protocol (CEP-15) executor for evento — a leaderless, strictly-serializable, highly-available replicated event store"
 documentation = "https://docs.rs/evento-accord"
 readme = "README.md"
@@ -22,25 +22,13 @@ bitcode = { workspace = true, features = ["serde"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 tokio-rustls = "0.26"
 bytes = "1"
-fjall.workspace = true
-# Optional SQL-backed Journal (consensus log on the same DB as evento-sql events).
-sqlx = { workspace = true, optional = true }
-sea-query = { workspace = true, optional = true }
-sea-query-sqlx = { workspace = true, optional = true }
-
-[features]
-# A SQL-backed `Journal` (durable consensus state on sqlite/mysql/postgres),
-# parity with `FjallJournal`. Off by default so the consensus core stays lean.
-sql = ["dep:sqlx", "dep:sea-query", "dep:sea-query-sqlx", "sqlx/runtime-tokio"]
-sqlite = ["sql", "sea-query/backend-sqlite", "sea-query-sqlx/sqlx-sqlite", "sqlx/sqlite"]
-# `sqlx/migrate` is for the integration tests' per-scenario `create_database`.
-mysql = ["sql", "sea-query/backend-mysql", "sea-query-sqlx/sqlx-mysql", "sqlx/mysql", "sqlx/mysql-rsa", "sqlx/migrate"]
-postgres = ["sql", "sea-query/backend-postgres", "sea-query-sqlx/sqlx-postgres", "sqlx/postgres", "sqlx/migrate"]
 
 [dev-dependencies]
 # test-util adds the paused-clock runtime (start_paused) the deterministic
 # simulation uses; the workspace "full" feature set does not include it.
 tokio = { workspace = true, features = ["test-util"] }
+# A concrete `Executor` backing the executor/linearizable/shard tests (the Fjall
+# event store, not the consensus journal — so no `accord` feature here).
 evento-fjall = { path = "../evento-fjall" }
 tempfile = "3.27"
 rand = { workspace = true }
@@ -50,15 +38,3 @@ criterion = "0.5"
 [[bench]]
 name = "throughput"
 harness = false
-
-[[test]]
-name = "sql_journal"
-required-features = ["sqlite"]
-
-[[test]]
-name = "sql_journal_postgres"
-required-features = ["postgres"]
-
-[[test]]
-name = "sql_journal_mysql"
-required-features = ["mysql"]

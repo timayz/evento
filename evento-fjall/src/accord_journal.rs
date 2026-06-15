@@ -1,16 +1,16 @@
-//! A disk-backed [`Journal`] over [fjall], so a node's consensus state survives a
-//! real process restart (not just an in-process rebuild).
+//! A disk-backed [`Journal`] over [fjall], so an evento-accord node's consensus state
+//! survives a real process restart (not just an in-process rebuild).
 //!
 //! Each [`CommandState`] is bitcode-serialized and stored keyed by its `TxnId`;
 //! [`load_all`](Journal::load_all) replays them all on startup via
-//! [`Node::recover_state`](crate::node::Node::recover_state).
+//! `Node::recover_state`.
 //!
 //! **Group commit.** [`stage`](Journal::stage) inserts a record without an fsync;
-//! [`flush`](Journal::flush) does a single `persist(SyncAll)` covering every
-//! staged insert. The node's inbox loop drains a batch of messages, stages each,
-//! then flushes once — so a burst of consensus messages costs one fsync, not one
-//! per message. [`record`](Journal::record) (stage + flush) remains for callers
-//! that need a write durable immediately.
+//! [`flush`](Journal::flush) does a single `persist(SyncAll)` covering every staged
+//! insert. The node's inbox loop drains a batch of messages, stages each, then flushes
+//! once — so a burst of consensus messages costs one fsync, not one per message.
+//! [`record`](Journal::record) (stage + flush) remains for callers that need a write
+//! durable immediately.
 //!
 //! [fjall]: https://crates.io/crates/fjall
 
@@ -19,10 +19,8 @@ use std::path::Path;
 use async_trait::async_trait;
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 
-use crate::api::{AcceptorRecord, Journal};
-use crate::clock::{NodeId, Timestamp, TxnId};
-use crate::format::{decode_tagged, encode_tagged, RecordKind};
-use crate::message::CommandState;
+use evento_accord::format::{decode_tagged, encode_tagged, RecordKind};
+use evento_accord::{AcceptorRecord, CommandState, Journal, NodeId, Timestamp, TxnId};
 
 /// Key under which the truncation watermark is stored in the `meta` keyspace.
 const WATERMARK_KEY: &[u8] = b"redundant_before";

@@ -1,13 +1,13 @@
 //! A SQL-backed [`Journal`] over `sqlx` + `sea-query`, portable across SQLite,
-//! MySQL, and PostgreSQL — parity with [`FjallJournal`](crate::fjall_journal::FjallJournal)
-//! for deployments that already run evento on SQL (`evento-sql`) and want their
-//! consensus state in the **same** database as their events.
+//! MySQL, and PostgreSQL — parity with `evento_fjall::FjallJournal` for deployments
+//! that already run evento on SQL (`evento-sql`) and want their consensus state in the
+//! **same** database as their events.
 //!
-//! Mirrors `evento-sql`'s `Sql<DB>`: statements are built with `sea-query` and bound
+//! Mirrors this crate's `Sql<DB>`: statements are built with `sea-query` and bound
 //! via [`sea_query_sqlx::SqlxBinder`], then executed against a generic
-//! [`sqlx::Pool`]. Values reuse the crate's tagged-bitcode encoding
-//! ([`crate::format`]), so the SQL journal shares the format-versioning / upgrade
-//! story with the fjall one.
+//! [`sqlx::Pool`]. Values reuse evento-accord's tagged-bitcode encoding
+//! (`evento_accord::format`), so the SQL journal shares the format-versioning /
+//! upgrade story with the fjall one.
 //!
 //! **Group commit.** [`stage`](Journal::stage) buffers a command in memory;
 //! [`flush`](Journal::flush) writes every buffered row in **one transaction**, so a
@@ -29,10 +29,8 @@ use sqlx::{Database, Pool};
 
 use async_trait::async_trait;
 
-use crate::api::{AcceptorRecord, Journal};
-use crate::clock::{NodeId, Timestamp, TxnId};
-use crate::format::{decode_tagged, encode_tagged, RecordKind};
-use crate::message::CommandState;
+use evento_accord::format::{decode_tagged, encode_tagged, RecordKind};
+use evento_accord::{AcceptorRecord, CommandState, Journal, NodeId, Timestamp, TxnId};
 
 /// `k` value under which the truncation watermark is stored in `accord_meta`.
 const WATERMARK_KEY: &str = "redundant_before";

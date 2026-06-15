@@ -1,11 +1,12 @@
-//! Phase B — genuine durability: the disk-backed `FjallJournal` survives a full
-//! close/reopen (a real process restart), not just an in-process rebuild.
+//! Phase B (evento-accord) — genuine durability: the disk-backed `FjallJournal`
+//! survives a full close/reopen (a real process restart), not just an in-process
+//! rebuild. Gated by the `accord` feature.
 
-use evento_accord::{
-    AcceptorRecord, Ballot, CommandState, FjallJournal, Journal, Key, NodeId, Status, Timestamp,
-    TxnId,
-};
+#![cfg(feature = "accord")]
+
+use evento_accord::{AcceptorRecord, Ballot, CommandState, Journal, Key, NodeId, Status, Timestamp, TxnId};
 use evento_core::Event;
+use evento_fjall::FjallJournal;
 
 fn timestamp(micros: u64, node: u64) -> Timestamp {
     Timestamp {
@@ -49,14 +50,12 @@ async fn journal_survives_close_and_reopen() {
     let a = command(100, 1);
     let b = command(200, 2);
 
-    // Open, record, then drop (close the database on disk).
     {
         let journal = FjallJournal::open(temp.path()).unwrap();
         journal.record(&a).await.unwrap();
         journal.record(&b).await.unwrap();
     }
 
-    // Reopen at the same path — this is a fresh process's view of the disk.
     let journal = FjallJournal::open(temp.path()).unwrap();
 
     let mut all = journal.load_all().await.unwrap();
@@ -67,7 +66,6 @@ async fn journal_survives_close_and_reopen() {
     assert_eq!(all[1].events[0].version, 2);
     assert_eq!(all[1].status, Status::Applied);
 
-    // Point lookup also works after reopening.
     let loaded = journal.load(b.txn).await.unwrap().unwrap();
     assert_eq!(loaded.execute_at, b.execute_at);
     assert_eq!(loaded.applied_conflict, Some(false));
@@ -91,11 +89,9 @@ async fn truncation_drops_old_records_and_persists_the_watermark() {
         journal.record(&new).await.unwrap();
         assert!(journal.load_watermark().await.unwrap().is_none());
 
-        // Truncate everything below t0=250: drops `old` and `mid`, keeps `new`.
         journal.truncate(timestamp(250, 0)).await.unwrap();
     }
 
-    // Reopen — a fresh process's view of the disk.
     let journal = FjallJournal::open(temp.path()).unwrap();
 
     let all = journal.load_all().await.unwrap();
@@ -104,7 +100,6 @@ async fn truncation_drops_old_records_and_persists_the_watermark() {
     assert!(journal.load(old.txn).await.unwrap().is_none());
     assert!(journal.load(mid.txn).await.unwrap().is_none());
 
-    // The watermark itself is durable across the reopen.
     assert_eq!(
         journal.load_watermark().await.unwrap(),
         Some(timestamp(250, 0)),
@@ -123,15 +118,8 @@ async fn metadata_log_and_acceptor_state_survive_close_and_reopen() {
 
     {
         let journal = FjallJournal::open(temp.path()).unwrap();
-        // Append epochs out of order; load must return them ascending.
-        journal
-            .append_metadata(2, &layout(&[0, 1, 2, 3]))
-            .await
-            .unwrap();
-        journal
-            .append_metadata(1, &layout(&[0, 1, 2]))
-            .await
-            .unwrap();
+        journal.append_metadata(2, &layout(&[0, 1, 2, 3])).await.unwrap();
+        journal.append_metadata(1, &layout(&[0, 1, 2])).await.unwrap();
         journal
             .record_acceptor(
                 2,
@@ -144,15 +132,10 @@ async fn metadata_log_and_acceptor_state_survive_close_and_reopen() {
             .unwrap();
     }
 
-    // Reopen — a fresh process's view of the disk.
     let journal = FjallJournal::open(temp.path()).unwrap();
 
     let entries = journal.load_metadata().await.unwrap();
-    assert_eq!(
-        entries.len(),
-        2,
-        "both metadata entries survived the restart"
-    );
+    assert_eq!(entries.len(), 2, "both metadata entries survived the restart");
     assert_eq!(entries[0].0, 1, "entries come back ascending by epoch");
     assert_eq!(entries[1].0, 2);
     assert_eq!(entries[1].1, layout(&[0, 1, 2, 3]));
@@ -163,6 +146,5 @@ async fn metadata_log_and_acceptor_state_survive_close_and_reopen() {
     assert_eq!(acceptors[0].1.promised, Ballot(timestamp(500, 1)));
     assert!(acceptors[0].1.accepted.is_some());
 
-    // The watermark scan is not confused by the new prefixed keys.
     assert!(journal.load_watermark().await.unwrap().is_none());
 }

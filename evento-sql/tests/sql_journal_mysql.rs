@@ -2,7 +2,8 @@
 //! convention URL, `mysql://root:root@localhost:3306`). Each scenario runs in its own
 //! database for isolation. Gated by the `mysql` feature.
 
-use evento_accord::{Journal, SqlJournal};
+use evento_accord::Journal;
+use evento_sql::SqlJournal;
 use sqlx::migrate::MigrateDatabase;
 use sqlx::{MySql, MySqlPool};
 

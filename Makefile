@@ -11,7 +11,7 @@ reset: down up
 
 check: test fmt lint machete
 
-test: test.sql test.core test.fjall test.doc
+test: test.sql test.core test.fjall test.accord test.migrator test.doc
 
 test.sql:
 	cargo test --all-features -p evento-sql
@@ -21,6 +21,16 @@ test.core:
 
 test.fjall:
 	cargo test --all-features -p evento-fjall
+
+# The Accord consensus crate (simulation, cluster, membership, electorate, TCP/mTLS,
+# recovery, …). The fjall/sql journal tests live with their backends (test.fjall /
+# test.sql, which run them via each crate's `accord` feature).
+test.accord:
+	cargo test -p evento-accord
+
+# The SQL migrations, including the optional accord consensus-journal migration.
+test.migrator:
+	cargo test --all-features -p evento-sql-migrator
 
 test.doc:
 	cargo test --doc -p evento

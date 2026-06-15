@@ -48,9 +48,10 @@ use axum::{
 use evento::cursor::Args;
 use evento::{Event, EventFilter, Executor, Fjall, WriteError};
 use evento_accord::{
-    serve, AccordExecutor, DataStore, ExecutorDataStore, FjallJournal, HybridLogicalClock, Journal,
-    MessageSink, Node, NodeConfig, NodeId, StaticTopology, TcpTransport, Topology,
+    serve, AccordExecutor, DataStore, ExecutorDataStore, HybridLogicalClock, Journal, MessageSink,
+    Node, NodeConfig, NodeId, StaticTopology, TcpTransport, Topology,
 };
+use evento_fjall::FjallJournal;
 use serde_json::{json, Value as JsonValue};
 use tokio::sync::mpsc;
 use ulid::Ulid;

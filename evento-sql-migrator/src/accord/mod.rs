@@ -4,8 +4,8 @@
 //! These four tables back a replica's durable consensus state — the per-transaction
 //! command log, the truncation watermark, the metadata (epoch→layout) log, and the
 //! config-Paxos acceptor records. The table and column **names are a contract** with
-//! `evento_accord::sql_journal::SqlJournal`; keep them in sync. The migration is pure
-//! DDL, so this crate needs no dependency on `evento-accord`.
+//! `evento_sql::SqlJournal`; keep them in sync. The migration is pure DDL, so this
+//! crate needs no dependency on `evento-accord`.
 
 mod tables;
 
