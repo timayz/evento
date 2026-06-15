@@ -232,12 +232,18 @@ recovery, atomic cross-shard conditional appends via the Read→Apply split with
 (drop-in `evento_core::Executor`), and an epoch-versioned `DynamicTopology` with
 node-join bootstrap with buffer-replay, node leave, Paxos-backed epoch changes
 that survive a coordinator crash (acceptor set tracks current membership), and
-range movement (re-sharding), and multi-shard executor read routing. **64 tests**
-(24 unit, 6 cluster, 3 multi-shard, 7 membership, 1 resharding, 3 executor,
+range movement (re-sharding), and multi-shard executor read routing, plus an opt-in
+linearizable-read **read-index** barrier (`NodeConfig.linearizable_reads`). **66 tests**
+(24 unit, 6 cluster, 3 multi-shard, 7 membership, 1 resharding, 5 executor,
 1 shard-executor, 2 TCP, 2 mTLS, 10 simulation, 3 restart, 2 fjall-journal), clippy
 clean,
 stable across repeated runs (the simulation suite is deterministic — see Phase A).
-The full M0–M5 roadmap plus elastic membership (M4) is implemented.
+The full M0–M5 roadmap plus elastic membership (M4) is implemented. **External
+verification has begun**: an independent Jepsen/Elle harness (`evento-accord/jepsen/`,
+self-contained Docker cluster) drives the cluster under partition/kill/pause and checks
+strict-serializability — see Phase D. Its findings: writes are serializable & atomic;
+reads are linearizable with `--linearizable-reads` when healthy, and the cluster stays
+serializable under partition, with a residual real-time gap under partition.
 
 ## Production roadmap
 
