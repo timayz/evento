@@ -31,6 +31,12 @@ use crate::clock::{Timestamp, TxnId};
 use crate::message::Key;
 use crate::node::Node;
 
+/// Page size for the full-store scans behind [`ExecutorDataStore::version`] and
+/// [`ExecutorDataStore::snapshot`]. Both walk the backend page by page until
+/// exhausted, so an aggregate (or store) of any size is handled — no longer capped at
+/// one `u16::MAX`-sized page. Sized to balance round-trips against per-page memory.
+const SNAPSHOT_PAGE_SIZE: u16 = 4096;
+
 /// The single key a read targets, if it can be pinned to one shard: an explicit
 /// routing key, or a query for one aggregate by id. Broad scans (multiple
 /// aggregates, or by event type) return `None` and are served locally.
@@ -66,23 +72,34 @@ impl<E: Executor> ExecutorDataStore<E> {
 #[async_trait]
 impl<E: Executor> DataStore for ExecutorDataStore<E> {
     async fn version(&self, aggregate_type: &str, aggregate_id: &str) -> anyhow::Result<u16> {
-        // The aggregate's current version is the highest among its events.
-        // (Reads up to u16::MAX-1 events; aggregates beyond that need snapshot
-        // compaction, which evento provides — a refinement for this adapter.)
-        let result = self
-            .local
-            .read(
-                Some(vec![EventFilter::by_id(aggregate_type, aggregate_id)]),
-                None,
-                Args::forward(u16::MAX - 1, None),
-            )
-            .await?;
-        Ok(result
-            .edges
-            .iter()
-            .map(|e| e.node.version)
-            .max()
-            .unwrap_or(0))
+        // The aggregate's current version is the highest among its events. Walk the
+        // backend a page at a time and keep the running max, so an aggregate with more
+        // than one page of events is handled correctly (not capped at one page).
+        let mut max = 0u16;
+        let mut after = None;
+        loop {
+            let result = self
+                .local
+                .read(
+                    Some(vec![EventFilter::by_id(aggregate_type, aggregate_id)]),
+                    None,
+                    Args::forward(SNAPSHOT_PAGE_SIZE, after),
+                )
+                .await?;
+            if let Some(page_max) = result.edges.iter().map(|e| e.node.version).max() {
+                max = max.max(page_max);
+            }
+            if !result.page_info.has_next_page {
+                break;
+            }
+            // Defensive: a "more pages" claim with no cursor can't advance — stop
+            // rather than loop forever (evento sets the cursor whenever edges exist).
+            match result.page_info.end_cursor {
+                Some(cursor) => after = Some(cursor),
+                None => break,
+            }
+        }
+        Ok(max)
     }
 
     async fn apply(
@@ -114,15 +131,30 @@ impl<E: Executor> DataStore for ExecutorDataStore<E> {
     }
 
     async fn snapshot(&self) -> anyhow::Result<Vec<Event>> {
-        // The materialised state is the full event log; a joining node re-applies
-        // it to reconstruct the prefix that journal truncation removed. (Reads up
-        // to u16::MAX-1 events in one page; very large stores want pagination —
-        // a refinement for this adapter, matching the `version` caveat above.)
-        let result = self
-            .local
-            .read(None, None, Args::forward(u16::MAX - 1, None))
-            .await?;
-        Ok(result.edges.into_iter().map(|edge| edge.node).collect())
+        // The materialised state is the full event log; a joining node re-applies it
+        // to reconstruct the prefix that journal truncation removed. Walk the backend
+        // a page at a time so a store of any size is captured (no longer capped at one
+        // page). The whole log is materialised in memory — fine for the bootstrap path;
+        // a streaming snapshot for very large stores is a future refinement.
+        let mut out = Vec::new();
+        let mut after = None;
+        loop {
+            let result = self
+                .local
+                .read(None, None, Args::forward(SNAPSHOT_PAGE_SIZE, after))
+                .await?;
+            let has_next = result.page_info.has_next_page;
+            let cursor = result.page_info.end_cursor;
+            out.extend(result.edges.into_iter().map(|edge| edge.node));
+            if !has_next {
+                break;
+            }
+            match cursor {
+                Some(cursor) => after = Some(cursor),
+                None => break,
+            }
+        }
+        Ok(out)
     }
 }
 

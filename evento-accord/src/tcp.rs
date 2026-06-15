@@ -38,6 +38,7 @@ use tokio_util::either::Either;
 use crate::api::MessageSink;
 use crate::clock::NodeId;
 use crate::message::Message;
+use crate::metrics::{Metrics, MetricsSnapshot};
 use crate::transport::Envelope;
 
 /// Outbound connection: plain TCP, or a client-side TLS session over it.
@@ -73,11 +74,11 @@ struct Frame {
 }
 
 fn encode(frame: &Frame) -> anyhow::Result<Vec<u8>> {
-    Ok(bitcode::serialize(frame)?)
+    crate::format::encode_tagged(crate::format::RecordKind::WireFrame, frame)
 }
 
 fn decode(bytes: &[u8]) -> anyhow::Result<Frame> {
-    Ok(bitcode::deserialize(bytes)?)
+    crate::format::decode_tagged(crate::format::RecordKind::WireFrame, bytes)
 }
 
 /// Capacity of a per-peer outbound queue and of an inbound inbox — the
@@ -94,6 +95,9 @@ pub struct TcpTransport {
     senders: Mutex<HashMap<NodeId, mpsc::Sender<Frame>>>,
     /// Client TLS settings; `None` for plaintext.
     tls: Option<TlsClient>,
+    /// Observability counters; bumps `messages_shed` when a full peer queue drops a
+    /// frame. Defaults to a private set; share the node's via [`with_metrics`](Self::with_metrics).
+    metrics: Arc<Metrics>,
 }
 
 impl TcpTransport {
@@ -104,6 +108,7 @@ impl TcpTransport {
             peers: Arc::new(peers),
             senders: Mutex::new(HashMap::new()),
             tls: None,
+            metrics: Arc::new(Metrics::new()),
         }
     }
 
@@ -115,7 +120,26 @@ impl TcpTransport {
             peers: Arc::new(peers),
             senders: Mutex::new(HashMap::new()),
             tls: Some(tls),
+            metrics: Arc::new(Metrics::new()),
         }
+    }
+
+    /// Shares an external [`Metrics`] with this transport so its shed count lands in
+    /// the same snapshot as the node's counters. Use the node's
+    /// [`metrics_handle`](crate::node::Node::metrics_handle):
+    ///
+    /// ```ignore
+    /// let transport = TcpTransport::new(id, peers).with_metrics(node.metrics_handle());
+    /// ```
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    /// A point-in-time snapshot of this transport's observability counters (only the
+    /// shed count is transport-driven; the rest come from a shared node, if any).
+    pub fn metrics(&self) -> MetricsSnapshot {
+        self.metrics.snapshot()
     }
 
     /// The outbound queue for `to`, spawning its writer task on first use.
@@ -138,11 +162,15 @@ impl MessageSink for TcpTransport {
     async fn send(&self, to: NodeId, message: Message) -> anyhow::Result<()> {
         if let Some(tx) = self.writer_for(to) {
             // `try_send` never blocks the caller: a full queue (slow/unreachable
-            // peer) sheds the frame, which the protocol tolerates.
-            let _ = tx.try_send(Frame {
+            // peer) sheds the frame, which the protocol tolerates. Count a full-queue
+            // shed for backpressure observability (a closed queue is a dropped
+            // connection, reconnected lazily — not counted).
+            if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(Frame {
                 from: self.from,
                 message,
-            });
+            }) {
+                self.metrics.record_shed();
+            }
         }
         Ok(())
     }

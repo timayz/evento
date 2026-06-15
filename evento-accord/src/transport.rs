@@ -6,6 +6,7 @@
 //! framed TCP sink (M1); the protocol core cannot tell them apart.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -41,6 +42,10 @@ pub struct InMemoryNetwork {
     crashed: Mutex<HashSet<NodeId>>,
     /// Unordered node pairs that cannot exchange messages (a partition).
     partitions: Mutex<HashSet<(NodeId, NodeId)>>,
+    /// Messages shed because the destination inbox was full (backpressure).
+    /// Observe-only — it never influences delivery, so the harness stays
+    /// deterministic.
+    shed: AtomicU64,
 }
 
 impl InMemoryNetwork {
@@ -107,6 +112,12 @@ impl InMemoryNetwork {
             .contains(&(from, to))
     }
 
+    /// How many messages have been shed for a full inbox (backpressure) so far.
+    /// For observability/tests; the in-memory twin of `Metrics::messages_shed`.
+    pub fn shed_count(&self) -> u64 {
+        self.shed.load(Ordering::Relaxed)
+    }
+
     /// Whether `node` is currently crashed.
     fn is_crashed(&self, node: NodeId) -> bool {
         self.crashed
@@ -144,10 +155,15 @@ impl MessageSink for InMemorySink {
             // full inbox is backpressure shedding — both are tolerated loss, not a
             // local error. `try_send` never blocks the sender.
             Some(tx) => {
-                let _ = tx.try_send(Envelope {
+                if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(Envelope {
                     from: self.from,
                     message,
-                });
+                }) {
+                    // A full inbox is backpressure shedding — count it (a *closed*
+                    // inbox is a down/partitioned peer, not backpressure, so it
+                    // isn't counted). The drop itself is unchanged; observe-only.
+                    self.net.shed.fetch_add(1, Ordering::Relaxed);
+                }
                 Ok(())
             }
             None => Ok(()),
@@ -252,6 +268,12 @@ mod tests {
         assert_eq!(
             received, DEFAULT_INBOX_CAPACITY,
             "the inbox is bounded to its capacity"
+        );
+        // And every shed message was counted (observe-only backpressure metric).
+        assert_eq!(
+            net.shed_count() as usize,
+            flood - DEFAULT_INBOX_CAPACITY,
+            "the shed counter tracks exactly the dropped overflow"
         );
     }
 

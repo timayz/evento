@@ -13,9 +13,10 @@ use evento_core::{
     cursor::{Args, ReadResult},
     Event, EventFilter, RoutingKey,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::{
-    clock::{NodeId, Timestamp, TxnId},
+    clock::{Ballot, NodeId, Timestamp, TxnId},
     message::{CommandState, Key, Message},
 };
 
@@ -91,6 +92,27 @@ pub trait Topology: Send + Sync + 'static {
     /// Installs a later epoch's shard layout. The default is a no-op (fixed
     /// topologies do not change); [`DynamicTopology`] overrides it.
     fn install(&self, _epoch: u64, _shards: Vec<Vec<NodeId>>) {}
+
+    /// Whether this topology can change epoch (reconfigure). The default is
+    /// `false` (fixed topologies); [`DynamicTopology`] overrides it to `true`. The
+    /// node's metadata-log catch-up sweep only runs for dynamic topologies, so a
+    /// fixed-membership cluster issues no control-plane traffic.
+    fn dynamic(&self) -> bool {
+        false
+    }
+}
+
+/// A config-Paxos acceptor's durable state for one epoch — the highest ballot it
+/// has promised and the highest-ballot layout it has accepted, if any. Persisted
+/// (via [`Journal::record_acceptor`]) **before** the matching promise/accept reply
+/// is sent, so a restarted acceptor restores its `promised` ballot and can never
+/// regress to a lower one (the Paxos crash-safety requirement).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptorRecord {
+    /// Highest ballot ever promised for this epoch.
+    pub promised: Ballot,
+    /// The highest-ballot `(ballot, layout)` accepted for this epoch, if any.
+    pub accepted: Option<(Ballot, Vec<Vec<NodeId>>)>,
 }
 
 /// Durable command log. Each replica persists its [`CommandState`] per
@@ -145,6 +167,36 @@ pub trait Journal: Send + Sync + 'static {
     /// All persisted command states, for rebuilding replica state after a
     /// process restart. The default returns nothing (a non-durable journal).
     async fn load_all(&self) -> anyhow::Result<Vec<CommandState>> {
+        Ok(Vec::new())
+    }
+
+    /// Durably appends a decided metadata-log entry — one `epoch`'s committed
+    /// topology `layout`. Durable by the time it returns. Idempotent: re-appending
+    /// an epoch already present with the same layout is a no-op. The default is a
+    /// no-op (a journal that does not back dynamic membership).
+    async fn append_metadata(&self, epoch: u64, layout: &[Vec<NodeId>]) -> anyhow::Result<()> {
+        let _ = (epoch, layout);
+        Ok(())
+    }
+
+    /// All persisted metadata-log entries, ascending by epoch, for replaying the
+    /// committed topology sequence after a restart. The default returns nothing.
+    async fn load_metadata(&self) -> anyhow::Result<Vec<(u64, Vec<Vec<NodeId>>)>> {
+        Ok(Vec::new())
+    }
+
+    /// Durably persists this node's config-Paxos acceptor state for one `epoch`.
+    /// Durable by the time it returns — this is the crash-safety gate (a restarted
+    /// acceptor must not promise/accept a ballot lower than one already promised).
+    /// The default is a no-op.
+    async fn record_acceptor(&self, epoch: u64, state: &AcceptorRecord) -> anyhow::Result<()> {
+        let _ = (epoch, state);
+        Ok(())
+    }
+
+    /// All persisted acceptor states, for restoring config-Paxos safety after a
+    /// process restart. The default returns nothing.
+    async fn load_acceptors(&self) -> anyhow::Result<Vec<(u64, AcceptorRecord)>> {
         Ok(Vec::new())
     }
 }
@@ -435,6 +487,10 @@ impl Topology for DynamicTopology {
             state.epoch = epoch;
             state.shards = shards;
         }
+    }
+
+    fn dynamic(&self) -> bool {
+        true
     }
 }
 

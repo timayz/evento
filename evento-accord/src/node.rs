@@ -27,7 +27,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant};
 
-use crate::api::{DataStore, Journal, MessageSink, ShardId, Topology};
+use crate::api::{AcceptorRecord, DataStore, Journal, MessageSink, ShardId, Topology};
 use crate::clock::{Ballot, Clock, HybridLogicalClock, NodeId, Timestamp, TxnId};
 use crate::failure_detector::FailureDetector;
 use crate::message::{CommandState, Key, Message, Status};
@@ -72,6 +72,14 @@ pub struct NodeConfig {
     /// fast, but are only serializable — a read off a lagging replica can break
     /// real-time order).
     pub linearizable_reads: bool,
+    /// Backpressure on the consensus backlog: if this node already holds at least
+    /// this many un-compacted commands, it **refuses to coordinate a new write**
+    /// (returning an error) rather than letting `Replica.commands` grow without bound
+    /// — e.g. under a sustained partition where compaction stalls. Only the local
+    /// coordinator's new-write entry point is gated; replica-side handling of peer
+    /// consensus messages is never refused (that would break safety/liveness). Set
+    /// high enough to never trip in a healthy cluster.
+    pub max_commands: usize,
 }
 
 impl Default for NodeConfig {
@@ -85,6 +93,7 @@ impl Default for NodeConfig {
             max_journal_batch: 128,
             phi_threshold: 8.0,
             linearizable_reads: false,
+            max_commands: 100_000,
         }
     }
 }
@@ -150,11 +159,44 @@ impl Default for ConfigAcceptor {
     }
 }
 
+impl ConfigAcceptor {
+    /// A durable snapshot of this acceptor for the journal.
+    fn to_record(&self) -> AcceptorRecord {
+        AcceptorRecord {
+            promised: self.promised,
+            accepted: self.accepted.clone(),
+        }
+    }
+
+    /// Rebuilds in-memory acceptor state from a durable record (restart restore).
+    fn from_record(record: AcceptorRecord) -> Self {
+        Self {
+            promised: record.promised,
+            accepted: record.accepted,
+        }
+    }
+}
+
 /// Per-epoch config acceptor state.
 type ConfigState = Arc<Mutex<HashMap<u64, ConfigAcceptor>>>;
 
 /// Delivers config-Paxos responses to an in-flight epoch change.
 type ConfigInbox = Arc<Mutex<Option<mpsc::UnboundedSender<Message>>>>;
+
+/// The committed metadata log: decided `(epoch, layout)` entries, plus the highest
+/// epoch actually installed into the [`Topology`]. The log is the source of truth
+/// that drives `topology.install` in **strict, contiguous** epoch order — an entry
+/// for a future epoch is held until every intervening epoch arrives, so no epoch is
+/// ever skipped (the gap a behind node fills via [`Message::MetadataFetch`]).
+struct MetadataLog {
+    /// Decided entries by epoch (`BTreeMap` → deterministic ascending iteration).
+    entries: BTreeMap<u64, Vec<Vec<NodeId>>>,
+    /// Highest epoch installed into the topology so far (`== topology.epoch()`).
+    installed_epoch: u64,
+}
+
+/// Shared metadata log.
+type MetaLog = Arc<Mutex<MetadataLog>>;
 
 /// A [`SyncData`](Message::SyncData) payload handed to an in-flight sync: the
 /// contact's `(watermark, snapshot events, recent commands)`.
@@ -188,6 +230,9 @@ pub struct Node {
     config: ConfigState,
     /// Delivers config-Paxos responses to an in-flight epoch change.
     config_inbox: ConfigInbox,
+    /// The committed metadata log — decided topology entries, installed in strict
+    /// epoch order (drives [`Topology::install`]).
+    meta_log: MetaLog,
     /// Next id for a forwarded read, and the channels awaiting their replies.
     read_seq: Arc<AtomicU64>,
     read_pending: Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<Message>>>>,
@@ -213,6 +258,7 @@ impl Node {
         datastore: Arc<dyn DataStore>,
         journal: Arc<dyn Journal>,
     ) -> Self {
+        let start_epoch = topology.epoch();
         Self {
             id,
             clock,
@@ -227,6 +273,10 @@ impl Node {
             join_buffer: Arc::new(Mutex::new(Vec::new())),
             config: Arc::new(Mutex::new(HashMap::new())),
             config_inbox: Arc::new(Mutex::new(None)),
+            meta_log: Arc::new(Mutex::new(MetadataLog {
+                entries: BTreeMap::new(),
+                installed_epoch: start_epoch,
+            })),
             read_seq: Arc::new(AtomicU64::new(0)),
             read_pending: Arc::new(Mutex::new(HashMap::new())),
             peer_watermarks: Arc::new(Mutex::new(HashMap::new())),
@@ -247,6 +297,21 @@ impl Node {
     /// This node's timing/sizing configuration.
     pub fn config(&self) -> NodeConfig {
         self.settings
+    }
+
+    /// Shares an external [`Metrics`] with this node, so counters this node records
+    /// and counters a transport records (e.g. [`TcpTransport`](crate::tcp::TcpTransport)'s
+    /// shed count) accumulate into one snapshot. Build the node and the transport with
+    /// the *same* `Arc<Metrics>`, then read both through [`metrics`](Self::metrics).
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    /// A handle to this node's shared [`Metrics`], e.g. to hand to a transport via
+    /// [`TcpTransport::with_metrics`](crate::tcp::TcpTransport::with_metrics).
+    pub fn metrics_handle(&self) -> Arc<Metrics> {
+        Arc::clone(&self.metrics)
     }
 
     /// Number of consensus commands currently held in memory — the state that
@@ -329,6 +394,25 @@ impl Node {
         let watermark = self.journal.load_watermark().await?;
         let mut commands = self.journal.load_all().await?;
         commands.sort_by_key(|cmd| (cmd.execute_at, cmd.txn));
+
+        // Restore the control plane: acceptor state (so a restarted acceptor keeps
+        // its promised ballots — Paxos crash-safety) and the metadata log (so the
+        // node re-installs the contiguous topology prefix it had decided).
+        {
+            let acceptors = self.journal.load_acceptors().await?;
+            let mut config = self.config.lock().expect("config poisoned");
+            for (epoch, record) in acceptors {
+                config.insert(epoch, ConfigAcceptor::from_record(record));
+            }
+        }
+        for (epoch, layout) in self.journal.load_metadata().await? {
+            self.meta_log
+                .lock()
+                .expect("meta_log poisoned")
+                .entries
+                .insert(epoch, layout);
+        }
+        self.apply_log();
 
         {
             let mut replica = self.replica.lock().expect("replica poisoned");
@@ -419,6 +503,71 @@ impl Node {
         }
         self.anti_entropy().await;
         self.advance_watermark().await;
+        self.metadata_sweep().await;
+    }
+
+    /// Control-plane sweep: converge the metadata log without operator action.
+    ///
+    /// 1. **Gap-fill** — if this node holds a decided entry it cannot install
+    ///    because an intervening epoch is missing (it was down/partitioned for an
+    ///    epoch change), pull the missing run from a peer via [`Message::MetadataFetch`].
+    /// 2. **Drive-to-completion** — if this node accepted a layout for an epoch that
+    ///    was never committed (its coordinator died after the value was durable but
+    ///    before commit), finish the change itself — the automatic equivalent of a
+    ///    manual [`recover_topology`](Self::recover_topology).
+    ///
+    /// A no-op for static topologies (no epochs are ever decided), so a
+    /// fixed-membership cluster issues no control-plane traffic.
+    async fn metadata_sweep(&self) {
+        if !self.topology.dynamic() {
+            return;
+        }
+
+        // (1) Metadata anti-entropy: pull any entries above our installed epoch from
+        // a rotating peer. Covers a node that missed the latest epochs entirely (no
+        // local gap to detect) as well as one holding an uninstallable future entry;
+        // the peer replies only if it has something newer.
+        let peers: Vec<NodeId> = self
+            .topology
+            .nodes()
+            .into_iter()
+            .filter(|&n| n != self.id)
+            .collect();
+        if !peers.is_empty() {
+            let next = self.read_seq.fetch_add(1, Ordering::Relaxed) as usize;
+            let peer = peers[next % peers.len()];
+            self.send(
+                peer,
+                Message::MetadataFetch {
+                    after_epoch: self.installed_epoch(),
+                },
+            )
+            .await;
+        }
+
+        // (2) Drive-to-completion: complete any accepted-but-uncommitted epoch.
+        // Sort epochs so the order is deterministic (the in-memory map is a HashMap).
+        let pending: Vec<u64> = {
+            let installed = self.installed_epoch();
+            let committed = self.meta_log.lock().expect("meta_log poisoned");
+            let mut pending: Vec<u64> = self
+                .config
+                .lock()
+                .expect("config poisoned")
+                .iter()
+                .filter(|(epoch, acc)| {
+                    **epoch > installed
+                        && acc.accepted.is_some()
+                        && !committed.entries.contains_key(epoch)
+                })
+                .map(|(epoch, _)| *epoch)
+                .collect();
+            pending.sort_unstable();
+            pending
+        };
+        for epoch in pending {
+            let _ = self.recover_topology(epoch).await;
+        }
     }
 
     /// Anti-entropy repair: pull any committed transactions a rotating peer has
@@ -541,6 +690,8 @@ impl Node {
                 | Message::ConfigAccepted { .. }
                 | Message::ConfigCommit { .. }
                 | Message::ConfigNack { .. }
+                | Message::MetadataFetch { .. }
+                | Message::MetadataEntries { .. }
                 | Message::ReadForward { .. }
                 | Message::ReadReply { .. }
                 | Message::ReadProbe { .. }
@@ -710,27 +861,39 @@ impl Node {
             }
             // Config Paxos — acceptor side.
             Message::ConfigPrepare { epoch, ballot } => {
-                let reply = {
+                let (reply, record) = {
                     let mut config = self.config.lock().expect("config poisoned");
                     let acc = config.entry(epoch).or_default();
                     if ballot < acc.promised {
-                        Message::ConfigNack {
-                            epoch,
-                            promised: acc.promised,
-                        }
+                        (
+                            Message::ConfigNack {
+                                epoch,
+                                promised: acc.promised,
+                            },
+                            None,
+                        )
                     } else {
                         acc.promised = ballot;
                         let (accepted_ballot, accepted_layout) = match &acc.accepted {
                             Some((b, l)) => (*b, Some(l.clone())),
                             None => (ConfigAcceptor::default().promised, None),
                         };
-                        Message::ConfigPromise {
-                            epoch,
-                            accepted_ballot,
-                            accepted_layout,
-                        }
+                        (
+                            Message::ConfigPromise {
+                                epoch,
+                                accepted_ballot,
+                                accepted_layout,
+                            },
+                            Some(acc.to_record()),
+                        )
                     }
                 };
+                // A promise must be durable before it is observable: a restarted
+                // acceptor restores `promised` and so can never regress to a lower
+                // ballot. Persist inline (before the deferred reply is sent).
+                if let Some(record) = record {
+                    let _ = self.journal.record_acceptor(epoch, &record).await;
+                }
                 out.push((from, reply));
             }
             Message::ConfigAccept {
@@ -738,24 +901,68 @@ impl Node {
                 ballot,
                 layout,
             } => {
-                let reply = {
+                let (reply, record) = {
                     let mut config = self.config.lock().expect("config poisoned");
                     let acc = config.entry(epoch).or_default();
                     if ballot < acc.promised {
-                        Message::ConfigNack {
-                            epoch,
-                            promised: acc.promised,
-                        }
+                        (
+                            Message::ConfigNack {
+                                epoch,
+                                promised: acc.promised,
+                            },
+                            None,
+                        )
                     } else {
                         acc.promised = ballot;
                         acc.accepted = Some((ballot, layout));
-                        Message::ConfigAccepted { epoch }
+                        (Message::ConfigAccepted { epoch }, Some(acc.to_record()))
                     }
                 };
+                if let Some(record) = record {
+                    let _ = self.journal.record_acceptor(epoch, &record).await;
+                }
                 out.push((from, reply));
             }
             Message::ConfigCommit { epoch, layout } => {
-                self.topology.install(epoch, layout);
+                // Append to the durable log, then install every now-contiguous
+                // epoch. If this commit arrived before an intervening epoch, ask the
+                // sender (which decided it, so holds the full prefix) to fill the gap.
+                let _ = self.journal.append_metadata(epoch, &layout).await;
+                self.ingest_entry(epoch, layout);
+                if self.has_metadata_gap() {
+                    out.push((
+                        from,
+                        Message::MetadataFetch {
+                            after_epoch: self.installed_epoch(),
+                        },
+                    ));
+                }
+            }
+            Message::MetadataFetch { after_epoch } => {
+                // Reply with the contiguous run of decided entries starting just
+                // after `after_epoch` (never a set with our own holes, so the
+                // requester can apply them in order).
+                let entries = {
+                    let log = self.meta_log.lock().expect("meta_log poisoned");
+                    let mut entries = Vec::new();
+                    let mut next = after_epoch + 1;
+                    while let Some(layout) = log.entries.get(&next) {
+                        entries.push((next, layout.clone()));
+                        next += 1;
+                    }
+                    entries
+                };
+                if !entries.is_empty() {
+                    out.push((from, Message::MetadataEntries { entries }));
+                }
+            }
+            Message::MetadataEntries { entries } => {
+                // Ingest in ascending order; `apply_log` installs each now-contiguous
+                // epoch. Idempotent, so an overlapping pull is harmless.
+                for (epoch, layout) in entries {
+                    let _ = self.journal.append_metadata(epoch, &layout).await;
+                    self.ingest_entry(epoch, layout);
+                }
             }
             // Config Paxos responses — route to the in-flight epoch change.
             response @ (Message::ConfigPromise { .. }
@@ -915,6 +1122,25 @@ impl Node {
     /// Coordinates appending `events` as one strictly-serializable, atomic
     /// transaction across every shard it touches.
     pub async fn write(&self, events: Vec<Event>) -> anyhow::Result<CommitOutcome> {
+        // Backpressure: if the un-compacted backlog is already at the cap (e.g.
+        // compaction stalled under a sustained partition), refuse new load rather
+        // than grow `Replica.commands` without bound. We shed *new writes* only —
+        // existing consensus state is never dropped, and peer messages are never
+        // refused (gated only here, the local coordinator's entry point).
+        let backlog = self.command_count();
+        if backlog >= self.settings.max_commands {
+            tracing::warn!(
+                node = self.id.0,
+                backlog,
+                cap = self.settings.max_commands,
+                "refusing new write: consensus backlog at cap (compaction stalled?)"
+            );
+            anyhow::bail!(
+                "consensus backlog at cap ({backlog} >= {}); refusing new write",
+                self.settings.max_commands
+            );
+        }
+
         let keys = Self::keys_of(&events);
         let (outcome, all_fast) = self.coordinate(keys, events).await?;
         self.metrics.record_outcome(outcome.conflict, all_fast);
@@ -1691,10 +1917,62 @@ impl Node {
         Ok(decided)
     }
 
+    /// Records a decided metadata-log entry and installs every now-contiguous epoch.
+    ///
+    /// The entry is held in [`MetadataLog::entries`] but only installed into the
+    /// [`Topology`] once **every** intervening epoch is present — so a node that
+    /// receives epoch N+2 before N+1 holds it until N+1 arrives, never skipping an
+    /// epoch. Idempotent: re-ingesting a known entry is a no-op.
+    fn ingest_entry(&self, epoch: u64, layout: Vec<Vec<NodeId>>) {
+        {
+            let mut log = self.meta_log.lock().expect("meta_log poisoned");
+            log.entries.entry(epoch).or_insert(layout);
+        }
+        self.apply_log();
+    }
+
+    /// Installs each contiguous metadata-log entry above the installed epoch, in
+    /// order. Only ever calls `install(installed_epoch + 1, …)`, so no epoch is
+    /// skipped even if a far-future entry is already in the log.
+    fn apply_log(&self) {
+        loop {
+            let next = {
+                let log = self.meta_log.lock().expect("meta_log poisoned");
+                let next = log.installed_epoch + 1;
+                log.entries.get(&next).map(|layout| (next, layout.clone()))
+            };
+            let Some((next, layout)) = next else { break };
+            self.topology.install(next, layout);
+            self.meta_log
+                .lock()
+                .expect("meta_log poisoned")
+                .installed_epoch = next;
+        }
+    }
+
+    /// Whether the log holds a decided entry the topology cannot install yet because
+    /// an intervening epoch is missing — the catch-up trigger.
+    fn has_metadata_gap(&self) -> bool {
+        let log = self.meta_log.lock().expect("meta_log poisoned");
+        log.entries
+            .keys()
+            .next_back()
+            .is_some_and(|&max| max > log.installed_epoch + 1)
+    }
+
+    /// The highest epoch this node has installed into its topology.
+    fn installed_epoch(&self) -> u64 {
+        self.meta_log
+            .lock()
+            .expect("meta_log poisoned")
+            .installed_epoch
+    }
+
     /// Installs the decided layout locally and broadcasts it to the acceptors and
     /// the new members so they install it too.
     async fn commit_topology(&self, epoch: u64, layout: &[Vec<NodeId>], acceptors: &[NodeId]) {
-        self.topology.install(epoch, layout.to_vec());
+        let _ = self.journal.append_metadata(epoch, layout).await;
+        self.ingest_entry(epoch, layout.to_vec());
         let mut recipients = acceptors.to_vec();
         for node in layout.iter().flatten() {
             if !recipients.contains(node) {
@@ -2135,6 +2413,68 @@ mod tests {
         );
     }
 
+    /// Backpressure: once the un-compacted command backlog reaches `max_commands`,
+    /// the node refuses to coordinate a **new** write, while the existing consensus
+    /// state it already holds is retained untouched (never evicted).
+    #[tokio::test(start_paused = true)]
+    async fn max_commands_refuses_new_writes_but_keeps_existing_state() {
+        const CAP: usize = 3;
+        let id = NodeId(0);
+        let ids = vec![id, NodeId(1), NodeId(2)];
+        let net = InMemoryNetwork::new();
+        let inbox = net.register(id);
+        let node = Node::new(
+            id,
+            Arc::new(StaticTopology::new(id, ids.clone())) as Arc<dyn Topology>,
+            Arc::new(HybridLogicalClock::new(id)),
+            Arc::new(net.sink(NodeId(1))) as Arc<dyn MessageSink>,
+            Arc::new(InMemoryDataStore::new()) as Arc<dyn DataStore>,
+            Arc::new(InMemoryJournal::new()) as Arc<dyn Journal>,
+        )
+        .with_config(NodeConfig {
+            max_commands: CAP,
+            ..NodeConfig::default()
+        });
+
+        // Fill the backlog to the cap via peer PreAccepts (the replica-side path,
+        // which is never gated).
+        let coordinator = net.sink(NodeId(1));
+        for i in 0..CAP as u64 {
+            coordinator.send(id, preaccept(i)).await.unwrap();
+        }
+        let _loop = node.start(inbox);
+        for _ in 0..1000 {
+            if node.command_count() == CAP {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(node.command_count(), CAP, "backlog filled to the cap");
+
+        // A new local write is refused rather than growing the backlog further.
+        let event = Event {
+            id: ulid::Ulid::new(),
+            aggregate_type: "test/Account".into(),
+            aggregate_id: "new".into(),
+            version: 1,
+            name: "Opened".into(),
+            ..Default::default()
+        };
+        let err = node.write(vec![event]).await.unwrap_err();
+        assert!(
+            err.to_string().contains("backlog at cap"),
+            "the refusal names the backpressure cause: {err}"
+        );
+
+        // Existing consensus state is intact — backpressure shed *new load*, it did
+        // not drop anything already accepted.
+        assert_eq!(
+            node.command_count(),
+            CAP,
+            "existing commands are retained, never evicted"
+        );
+    }
+
     /// A read for a key this node doesn't own is routed to a **same-region** owner
     /// when regions are configured — even when a remote-region owner is listed
     /// first in the replica set.
@@ -2184,5 +2524,71 @@ mod tests {
             NodeId(2),
             "the region-0 owner, not the region-1 nodes listed first"
         );
+    }
+
+    /// Config-Paxos crash safety: an acceptor that promised a ballot must, after a
+    /// restart, still reject a lower ballot — its `promised` is durable.
+    #[tokio::test]
+    async fn restarted_acceptor_rejects_stale_ballot() {
+        use crate::clock::Ballot;
+        use crate::transport::Envelope;
+
+        let id = NodeId(0);
+        let ids = vec![id, NodeId(1), NodeId(2)];
+        let net = InMemoryNetwork::new();
+        // A durable journal handle kept across the simulated restart.
+        let journal = Arc::new(InMemoryJournal::new());
+        let build = || {
+            Node::new(
+                id,
+                Arc::new(StaticTopology::new(id, ids.clone())) as Arc<dyn Topology>,
+                Arc::new(HybridLogicalClock::new(id)),
+                Arc::new(net.sink(id)) as Arc<dyn MessageSink>,
+                Arc::new(InMemoryDataStore::new()) as Arc<dyn DataStore>,
+                Arc::clone(&journal) as Arc<dyn Journal>,
+            )
+        };
+        let ballot = |micros: u64| {
+            Ballot(Timestamp {
+                micros,
+                logical: 0,
+                node: NodeId(9),
+            })
+        };
+
+        // Acceptor promises a high ballot for epoch 1 (persisted before the reply).
+        let node = build();
+        let out = node
+            .handle_staged(Envelope {
+                from: NodeId(9),
+                message: Message::ConfigPrepare {
+                    epoch: 1,
+                    ballot: ballot(1000),
+                },
+            })
+            .await;
+        assert!(
+            matches!(out.as_slice(), [(_, Message::ConfigPromise { .. })]),
+            "high ballot is promised"
+        );
+
+        // Restart: a fresh node over the same durable journal restores `promised`.
+        let restarted = build();
+        restarted.recover_state().await.unwrap();
+        let out = restarted
+            .handle_staged(Envelope {
+                from: NodeId(9),
+                message: Message::ConfigPrepare {
+                    epoch: 1,
+                    ballot: ballot(1), // lower than the promised 1000
+                },
+            })
+            .await;
+        match out.as_slice() {
+            [(_, Message::ConfigNack { promised, .. })] => {
+                assert_eq!(*promised, ballot(1000), "restored the promised ballot")
+            }
+            other => panic!("a restarted acceptor must reject a stale ballot: {other:?}"),
+        }
     }
 }

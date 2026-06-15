@@ -6,14 +6,14 @@
 //! applies committed transactions strictly in execution-timestamp order, two
 //! racing same-version appends deterministically resolve to one winner.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
 use evento_core::Event;
 
-use crate::api::{DataStore, Journal};
-use crate::clock::{Timestamp, TxnId};
+use crate::api::{AcceptorRecord, DataStore, Journal};
+use crate::clock::{NodeId, Timestamp, TxnId};
 use crate::message::CommandState;
 
 /// One applied transaction, recorded so tests can assert that every replica
@@ -138,6 +138,11 @@ pub struct InMemoryJournal {
     entries: Mutex<HashMap<TxnId, CommandState>>,
     /// The persisted truncation watermark (redundancy floor).
     watermark: Mutex<Option<Timestamp>>,
+    /// Decided metadata-log entries (epoch → layout). `BTreeMap` so iteration is
+    /// ascending and deterministic.
+    metadata: Mutex<BTreeMap<u64, Vec<Vec<NodeId>>>>,
+    /// Config-Paxos acceptor state per epoch.
+    acceptors: Mutex<HashMap<u64, AcceptorRecord>>,
 }
 
 impl InMemoryJournal {
@@ -187,6 +192,42 @@ impl Journal for InMemoryJournal {
 
     async fn load_watermark(&self) -> anyhow::Result<Option<Timestamp>> {
         Ok(*self.watermark.lock().expect("journal poisoned"))
+    }
+
+    async fn append_metadata(&self, epoch: u64, layout: &[Vec<NodeId>]) -> anyhow::Result<()> {
+        self.metadata
+            .lock()
+            .expect("journal poisoned")
+            .insert(epoch, layout.to_vec());
+        Ok(())
+    }
+
+    async fn load_metadata(&self) -> anyhow::Result<Vec<(u64, Vec<Vec<NodeId>>)>> {
+        Ok(self
+            .metadata
+            .lock()
+            .expect("journal poisoned")
+            .iter()
+            .map(|(&epoch, layout)| (epoch, layout.clone()))
+            .collect())
+    }
+
+    async fn record_acceptor(&self, epoch: u64, state: &AcceptorRecord) -> anyhow::Result<()> {
+        self.acceptors
+            .lock()
+            .expect("journal poisoned")
+            .insert(epoch, state.clone());
+        Ok(())
+    }
+
+    async fn load_acceptors(&self) -> anyhow::Result<Vec<(u64, AcceptorRecord)>> {
+        Ok(self
+            .acceptors
+            .lock()
+            .expect("journal poisoned")
+            .iter()
+            .map(|(&epoch, state)| (epoch, state.clone()))
+            .collect())
     }
 }
 
@@ -240,5 +281,39 @@ mod tests {
         );
         assert_eq!(remaining[0].txn.0.micros, 300);
         assert_eq!(journal.load_watermark().await.unwrap(), Some(before));
+    }
+
+    #[tokio::test]
+    async fn in_memory_metadata_and_acceptors_round_trip_ascending() {
+        let journal = InMemoryJournal::new();
+        let layout = |n: &[u64]| vec![n.iter().map(|&i| NodeId(i)).collect::<Vec<_>>()];
+
+        // Append out of order; load_metadata must return ascending by epoch.
+        journal
+            .append_metadata(3, &layout(&[1, 2, 3]))
+            .await
+            .unwrap();
+        journal
+            .append_metadata(1, &layout(&[0, 1, 2]))
+            .await
+            .unwrap();
+        let entries = journal.load_metadata().await.unwrap();
+        assert_eq!(
+            entries.iter().map(|(e, _)| *e).collect::<Vec<_>>(),
+            vec![1, 3],
+            "metadata entries come back ascending"
+        );
+
+        let rec = AcceptorRecord {
+            promised: Ballot(Timestamp {
+                micros: 7,
+                logical: 0,
+                node: NodeId(1),
+            }),
+            accepted: None,
+        };
+        journal.record_acceptor(1, &rec).await.unwrap();
+        let accs = journal.load_acceptors().await.unwrap();
+        assert_eq!(accs, vec![(1, rec)]);
     }
 }

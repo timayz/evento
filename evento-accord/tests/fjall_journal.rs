@@ -2,7 +2,8 @@
 //! close/reopen (a real process restart), not just an in-process rebuild.
 
 use evento_accord::{
-    Ballot, CommandState, FjallJournal, Journal, Key, NodeId, Status, Timestamp, TxnId,
+    AcceptorRecord, Ballot, CommandState, FjallJournal, Journal, Key, NodeId, Status, Timestamp,
+    TxnId,
 };
 use evento_core::Event;
 
@@ -109,4 +110,59 @@ async fn truncation_drops_old_records_and_persists_the_watermark() {
         Some(timestamp(250, 0)),
         "the truncation watermark survives a restart"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metadata_log_and_acceptor_state_survive_close_and_reopen() {
+    let temp = tempfile::Builder::new()
+        .prefix("evento_accord_journal_meta")
+        .tempdir()
+        .unwrap();
+
+    let layout = |nodes: &[u64]| vec![nodes.iter().map(|&n| NodeId(n)).collect::<Vec<_>>()];
+
+    {
+        let journal = FjallJournal::open(temp.path()).unwrap();
+        // Append epochs out of order; load must return them ascending.
+        journal
+            .append_metadata(2, &layout(&[0, 1, 2, 3]))
+            .await
+            .unwrap();
+        journal
+            .append_metadata(1, &layout(&[0, 1, 2]))
+            .await
+            .unwrap();
+        journal
+            .record_acceptor(
+                2,
+                &AcceptorRecord {
+                    promised: Ballot(timestamp(500, 1)),
+                    accepted: Some((Ballot(timestamp(500, 1)), layout(&[0, 1, 2, 3]))),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    // Reopen — a fresh process's view of the disk.
+    let journal = FjallJournal::open(temp.path()).unwrap();
+
+    let entries = journal.load_metadata().await.unwrap();
+    assert_eq!(
+        entries.len(),
+        2,
+        "both metadata entries survived the restart"
+    );
+    assert_eq!(entries[0].0, 1, "entries come back ascending by epoch");
+    assert_eq!(entries[1].0, 2);
+    assert_eq!(entries[1].1, layout(&[0, 1, 2, 3]));
+
+    let acceptors = journal.load_acceptors().await.unwrap();
+    assert_eq!(acceptors.len(), 1);
+    assert_eq!(acceptors[0].0, 2);
+    assert_eq!(acceptors[0].1.promised, Ballot(timestamp(500, 1)));
+    assert!(acceptors[0].1.accepted.is_some());
+
+    // The watermark scan is not confused by the new prefixed keys.
+    assert!(journal.load_watermark().await.unwrap().is_none());
 }

@@ -500,3 +500,119 @@ async fn config_changes_outlive_the_founders() {
         "F joined under the new epoch"
     );
 }
+
+/// A node that comes up at a stale epoch and receives a *later* `ConfigCommit`
+/// **replays the missed epochs in order** via the metadata-log catch-up, rather
+/// than skipping straight to the latest layout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn metadata_log_replays_missed_epochs() {
+    let net = InMemoryNetwork::new();
+    let abc = vec![NodeId(0), NodeId(1), NodeId(2)];
+    let abcd = vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3)];
+
+    let nodes: Vec<TestNode> = abc
+        .iter()
+        .map(|&id| spawn_node(id, 0, vec![abc.clone()], &net))
+        .collect();
+    // Node D starts at epoch 0 and is NOT in epoch 1, so it never sees commit 1.
+    let d = spawn_node(NodeId(3), 0, vec![abc.clone()], &net);
+
+    // Epoch 1 stays within {A,B,C} — D misses it entirely.
+    nodes[0]
+        .node
+        .change_topology(1, vec![abc.clone()])
+        .await
+        .unwrap();
+    for n in &nodes {
+        await_epoch(&n.topology, 1).await;
+    }
+    assert_eq!(d.topology.epoch(), 0, "D missed epoch 1");
+
+    // Epoch 2 adds D. The commit for epoch 2 reveals the gap (D is at 0), so D pulls
+    // the missed epoch 1 and installs 1 then 2 — contiguously, never skipping.
+    nodes[0]
+        .node
+        .change_topology(2, vec![abcd.clone()])
+        .await
+        .unwrap();
+    await_epoch(&d.topology, 2).await;
+    assert_eq!(
+        d.topology.nodes(),
+        abcd,
+        "D caught up to the epoch-2 layout via metadata-log replay"
+    );
+}
+
+/// The metadata log is durable: after a restart from its journal, a node restores
+/// the committed topology sequence and re-installs the contiguous prefix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn metadata_log_survives_restart() {
+    let net = InMemoryNetwork::new();
+    let ids = vec![NodeId(0), NodeId(1), NodeId(2)];
+    let abc = ids.clone();
+    let abcd = vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3)];
+    let abc_only = vec![NodeId(0), NodeId(1)];
+
+    // Build nodes keeping the journal handles, so node 0 can be rebuilt over its
+    // durable journal (mirrors tests/restart.rs).
+    let journals: Vec<Arc<InMemoryJournal>> =
+        (0..3).map(|_| Arc::new(InMemoryJournal::new())).collect();
+    let mut topos: Vec<Arc<DynamicTopology>> = Vec::new();
+    let mut nodes: Vec<Node> = Vec::new();
+    let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    for &id in &ids {
+        let inbox = net.register(id);
+        let topology = Arc::new(DynamicTopology::new(id, 0, vec![abc.clone()]));
+        let node = Node::new(
+            id,
+            topology.clone() as Arc<dyn Topology>,
+            Arc::new(HybridLogicalClock::new(id)),
+            Arc::new(net.sink(id)) as Arc<dyn MessageSink>,
+            Arc::new(InMemoryDataStore::new()) as Arc<dyn DataStore>,
+            Arc::clone(&journals[id.0 as usize]) as Arc<dyn Journal>,
+        );
+        tasks.push(node.start(inbox));
+        topos.push(topology);
+        nodes.push(node);
+    }
+
+    // Drive three epoch changes; node 0 records each in its durable journal.
+    nodes[0]
+        .change_topology(1, vec![abcd.clone()])
+        .await
+        .unwrap();
+    nodes[0]
+        .change_topology(2, vec![abc.clone()])
+        .await
+        .unwrap();
+    nodes[0]
+        .change_topology(3, vec![abc_only.clone()])
+        .await
+        .unwrap();
+    await_epoch(&topos[0], 3).await;
+
+    // Restart node 0: tear it down (losing in-memory state) and rebuild over the
+    // SAME durable journal with a fresh topology at epoch 0.
+    tasks[0].abort();
+    let fresh_topo = Arc::new(DynamicTopology::new(NodeId(0), 0, vec![abc.clone()]));
+    let restarted = Node::new(
+        NodeId(0),
+        fresh_topo.clone() as Arc<dyn Topology>,
+        Arc::new(HybridLogicalClock::new(NodeId(0))),
+        Arc::new(net.sink(NodeId(0))) as Arc<dyn MessageSink>,
+        Arc::new(InMemoryDataStore::new()) as Arc<dyn DataStore>,
+        Arc::clone(&journals[0]) as Arc<dyn Journal>,
+    );
+    restarted.recover_state().await.unwrap();
+
+    assert_eq!(
+        fresh_topo.epoch(),
+        3,
+        "the restarted node re-installs the committed metadata log up to epoch 3"
+    );
+    assert_eq!(
+        fresh_topo.nodes(),
+        abc_only,
+        "and ends at the epoch-3 layout"
+    );
+}

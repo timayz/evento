@@ -29,6 +29,7 @@ pub mod clock;
 pub mod executor;
 pub mod failure_detector;
 pub mod fjall_journal;
+pub mod format;
 pub mod message;
 pub mod metrics;
 pub mod node;
@@ -38,8 +39,8 @@ pub mod tcp;
 pub mod transport;
 
 pub use api::{
-    DataStore, DynamicTopology, Journal, MessageSink, RegionId, ShardId, ShardedTopology,
-    StaticTopology, Topology,
+    AcceptorRecord, DataStore, DynamicTopology, Journal, MessageSink, RegionId, ShardId,
+    ShardedTopology, StaticTopology, Topology,
 };
 pub use clock::{Ballot, Clock, HybridLogicalClock, NodeId, Timestamp, TxnId, MAX_SKEW_MICROS};
 pub use executor::{AccordExecutor, ExecutorDataStore};

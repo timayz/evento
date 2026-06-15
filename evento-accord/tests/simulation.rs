@@ -33,8 +33,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use evento_accord::{
-    DataStore, HybridLogicalClock, InMemoryDataStore, InMemoryJournal, InMemoryNetwork, Journal,
-    MessageSink, Node, NodeConfig, NodeId, StaticTopology,
+    DataStore, DynamicTopology, HybridLogicalClock, InMemoryDataStore, InMemoryJournal,
+    InMemoryNetwork, Journal, MessageSink, Node, NodeConfig, NodeId, StaticTopology, Topology,
 };
 use evento_core::Event;
 use rand::rngs::StdRng;
@@ -1292,4 +1292,250 @@ async fn metrics_track_cluster_activity() {
     );
     assert!(messages > 0, "replicas handled inbound messages");
     assert!(flushes > 0, "replicas performed journal flushes");
+}
+
+// ----- membership churn (the metadata log under faults) -------------------------
+//
+// The cluster reconfigures (a sequence of epoch changes) **while** writers run and
+// a minority churns. Every epoch is decided by config-Paxos, appended to the
+// durable metadata log, and disseminated; a node that misses epochs (crashed across
+// a `ConfigCommit`) must replay them **contiguously** via the metadata-log catch-up
+// to converge on the same epoch — no epoch skipped. Membership stays the full five
+// nodes in one shard across every epoch (so quorums/ownership are invariant and no
+// data bootstrap is needed); what churns is the *epoch sequence*, which is exactly
+// what the metadata log must converge. Data-plane safety must hold throughout.
+
+/// A churn run's reproducibility fingerprint: each node's committed set, each
+/// node's installed epoch, and the client history — all canonically sorted.
+#[derive(PartialEq, Eq, Debug)]
+struct ChurnProbe {
+    per_node_committed: Vec<Vec<Commit>>,
+    per_node_epoch: Vec<u64>,
+    history: Vec<(String, u16, bool)>,
+}
+
+async fn run_churn(seed: u64) -> ChurnProbe {
+    const N: u64 = 5;
+    const AGGS: usize = 3;
+    const WRITERS: usize = 3;
+    const WRITES_EACH: usize = 10;
+
+    let ids: Vec<NodeId> = (0..N).map(NodeId).collect();
+    // One shard with every node, identical across epochs — only the epoch advances.
+    let layout = vec![ids.clone()];
+    let net = InMemoryNetwork::new();
+    let base = tokio::time::Instant::now();
+
+    let mut nodes: Vec<Node> = Vec::new();
+    let mut stores: Vec<Arc<InMemoryDataStore>> = Vec::new();
+    let mut topos: Vec<Arc<DynamicTopology>> = Vec::new();
+    for &id in &ids {
+        let inbox = net.register(id);
+        let clock = Arc::new(HybridLogicalClock::with_physical(id, virtual_micros(base)));
+        let store = Arc::new(InMemoryDataStore::new());
+        let journal = Arc::new(InMemoryJournal::new());
+        let topology = Arc::new(DynamicTopology::new(id, 0, layout.clone()));
+        let node = Node::new(
+            id,
+            Arc::clone(&topology) as Arc<dyn Topology>,
+            clock,
+            Arc::new(net.sink(id)) as Arc<dyn MessageSink>,
+            Arc::clone(&store) as Arc<dyn DataStore>,
+            Arc::clone(&journal) as Arc<dyn Journal>,
+        );
+        // The recovery loop drives the metadata-log catch-up sweep.
+        let _ = (node.start(inbox), node.start_recovery());
+        nodes.push(node);
+        stores.push(store);
+        topos.push(topology);
+    }
+
+    // Seed-derived plans.
+    let mut rng = StdRng::seed_from_u64(seed);
+    let reconfigs: u64 = rng.random_range(3..7);
+    let writer_plans: Vec<Vec<usize>> = (0..WRITERS)
+        .map(|_| {
+            (0..WRITES_EACH)
+                .map(|_| rng.random_range(0..AGGS))
+                .collect()
+        })
+        .collect();
+    // Reconfig schedule: when to drive each epoch change (coordinated by node 0).
+    let reconfig_delays: Vec<u64> = (0..reconfigs).map(|_| rng.random_range(2..20)).collect();
+    // Fault schedule: churn the minority {3,4}; the quorum {0,1,2} stays live for
+    // both the data and the config Paxos.
+    let fault_plan: Vec<(u64, NodeId, bool)> = (0..16)
+        .map(|_| {
+            (
+                rng.random_range(2..25),
+                NodeId(3 + rng.random_range(0..2)),
+                rng.random_bool(0.5),
+            )
+        })
+        .collect();
+
+    let net_f = Arc::clone(&net);
+    let fault_task = tokio::spawn(async move {
+        for (delay, node, crash) in fault_plan {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+            if crash {
+                net_f.crash(node);
+            } else {
+                net_f.heal(node);
+            }
+        }
+    });
+
+    // Reconfig task: node 0 drives epochs 1..=reconfigs sequentially.
+    let coordinator = nodes[0].clone();
+    let reconfig_layout = layout.clone();
+    let reconfig_task = tokio::spawn(async move {
+        for (i, delay) in reconfig_delays.into_iter().enumerate() {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+            let epoch = i as u64 + 1;
+            let _ = tokio::time::timeout(
+                Duration::from_secs(3),
+                coordinator.change_topology(epoch, reconfig_layout.clone()),
+            )
+            .await;
+        }
+    });
+
+    // Writers coordinate through node 0 (always live).
+    let history: History = Arc::new(Mutex::new(Vec::new()));
+    let coordinator = nodes[0].clone();
+    let store0 = Arc::clone(&stores[0]);
+    let id_seq = Arc::new(AtomicU64::new(1));
+    let mut writers = Vec::new();
+    for plan in writer_plans {
+        let coordinator = coordinator.clone();
+        let store0 = Arc::clone(&store0);
+        let history = Arc::clone(&history);
+        let id_seq = Arc::clone(&id_seq);
+        writers.push(tokio::spawn(async move {
+            for agg_idx in plan {
+                let agg = format!("a{agg_idx}");
+                let version = store0.version(AGG_TYPE, &agg).await.unwrap_or(0) + 1;
+                let seq = id_seq.fetch_add(1, Ordering::Relaxed);
+                if let Ok(Ok(outcome)) = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    coordinator.write(vec![event(&agg, version, seq)]),
+                )
+                .await
+                {
+                    history.lock().unwrap().push(WriteRecord {
+                        agg,
+                        version,
+                        committed: !outcome.conflict,
+                    });
+                }
+            }
+        }));
+    }
+    for w in writers {
+        let _ = w.await;
+    }
+    let _ = reconfig_task.await;
+    let _ = fault_task.await;
+
+    // Heal the minority and let the cluster converge: data (committed sets) and the
+    // control plane (every node installs the full epoch sequence via catch-up).
+    net.heal(NodeId(3));
+    net.heal(NodeId(4));
+    converge(&stores).await;
+    for topo in &topos {
+        for _ in 0..1500 {
+            if topo.epoch() >= reconfigs {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    let per_node_committed = stores
+        .iter()
+        .map(|s| {
+            let mut v: Vec<Commit> = s
+                .committed_events()
+                .into_iter()
+                .map(|(k, id)| (k, u128::from(id)))
+                .collect();
+            v.sort();
+            v
+        })
+        .collect();
+    let per_node_epoch = topos.iter().map(|t| t.epoch()).collect();
+    let mut history: Vec<(String, u16, bool)> = history
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|r| (r.agg.clone(), r.version, r.committed))
+        .collect();
+    history.sort();
+
+    ChurnProbe {
+        per_node_committed,
+        per_node_epoch,
+        history,
+    }
+}
+
+/// Under concurrent reconfiguration, writes, and minority churn: every node
+/// converges on the **same final epoch** (the metadata log replayed contiguously,
+/// including for nodes that missed epochs), the data converges, and no
+/// `(aggregate, version)` was double-committed.
+#[tokio::test(start_paused = true)]
+async fn membership_churn_converges() {
+    for seed in 0..8 {
+        let probe = run_churn(seed).await;
+
+        // Control plane: all nodes reach the same, highest epoch.
+        let max_epoch = *probe.per_node_epoch.iter().max().unwrap();
+        assert!(
+            max_epoch >= 3,
+            "seed {seed}: reconfigs should have advanced epochs"
+        );
+        for (node, &e) in probe.per_node_epoch.iter().enumerate() {
+            assert_eq!(
+                e, max_epoch,
+                "seed {seed}: node {node} stuck at epoch {e}, cluster at {max_epoch}"
+            );
+        }
+
+        // Data plane: every node converged to the same non-empty committed set.
+        let first = &probe.per_node_committed[0];
+        assert!(!first.is_empty(), "seed {seed}: no commits");
+        for (node, set) in probe.per_node_committed.iter().enumerate() {
+            assert_eq!(
+                set, first,
+                "seed {seed}: node {node} diverged on committed set"
+            );
+        }
+
+        // No double-commit of any (aggregate, version) from the client's view.
+        let mut seen = BTreeSet::new();
+        for (agg, version, committed) in &probe.history {
+            if *committed {
+                assert!(
+                    seen.insert((agg.clone(), *version)),
+                    "seed {seed}: double-commit on {agg} v{version}"
+                );
+            }
+        }
+    }
+}
+
+/// The churn scenario is bit-reproducible: two runs of a seed produce identical
+/// committed state, epochs, and client history (the metadata-log paths — Paxos,
+/// replay, the catch-up sweep — are all deterministic under virtual time).
+#[tokio::test(start_paused = true)]
+async fn membership_churn_is_bit_reproducible() {
+    for seed in 0..6 {
+        let first = run_churn(seed).await;
+        let second = run_churn(seed).await;
+        assert_eq!(
+            first, second,
+            "seed {seed}: two churn runs diverged — not deterministic"
+        );
+    }
 }

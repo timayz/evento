@@ -237,3 +237,32 @@ async fn enforces_optimistic_concurrency_across_the_cluster() {
         assert_eq!(events[1].version, 2);
     }
 }
+
+/// `ExecutorDataStore::version`/`snapshot` paginate the backend, so an aggregate with
+/// more than one page of events (> `SNAPSHOT_PAGE_SIZE`, 4096) is handled fully — not
+/// capped at a single page. Seeds the Fjall backend directly (bypassing consensus,
+/// which would be far too slow for thousands of events) and reads through the bridge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn data_store_paginates_beyond_one_page() {
+    let temp = tempfile::Builder::new()
+        .prefix("evento_accord_page")
+        .tempdir()
+        .unwrap();
+    let fjall = Fjall::open(temp.path()).unwrap();
+
+    // More than one 4096-event page for a single aggregate.
+    let count: u16 = 5000;
+    let events: Vec<Event> = (1..=count).map(|v| event("big", v, "Tick")).collect();
+    fjall.write(events).await.unwrap();
+
+    let store = ExecutorDataStore::new(fjall);
+
+    // `version` must return the true max, which lives past the first page boundary.
+    let version = store.version("test/Account", "big").await.unwrap();
+    assert_eq!(version, count);
+
+    // `snapshot` must return every event across all pages.
+    let snap = store.snapshot().await.unwrap();
+    assert_eq!(snap.len() as u16, count);
+    assert_eq!(snap.iter().map(|e| e.version).max().unwrap(), count);
+}

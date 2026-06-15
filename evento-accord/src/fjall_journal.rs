@@ -19,12 +19,33 @@ use std::path::Path;
 use async_trait::async_trait;
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 
-use crate::api::Journal;
-use crate::clock::{Timestamp, TxnId};
+use crate::api::{AcceptorRecord, Journal};
+use crate::clock::{NodeId, Timestamp, TxnId};
+use crate::format::{decode_tagged, encode_tagged, RecordKind};
 use crate::message::CommandState;
 
 /// Key under which the truncation watermark is stored in the `meta` keyspace.
 const WATERMARK_KEY: &[u8] = b"redundant_before";
+/// Prefix for metadata-log entry keys (`mlog/` + 8-byte big-endian epoch).
+const METADATA_PREFIX: &[u8] = b"mlog/";
+/// Prefix for acceptor-state keys (`acc/` + 8-byte big-endian epoch).
+const ACCEPTOR_PREFIX: &[u8] = b"acc/";
+
+/// Builds a `prefix`-namespaced key for `epoch`, big-endian so the keyspace's
+/// lexicographic order matches epoch order (a prefix scan returns them ascending).
+fn epoch_key(prefix: &[u8], epoch: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(prefix.len() + 8);
+    key.extend_from_slice(prefix);
+    key.extend_from_slice(&epoch.to_be_bytes());
+    key
+}
+
+/// Recovers the epoch from a `prefix`-namespaced key, if it matches.
+fn epoch_of(prefix: &[u8], key: &[u8]) -> Option<u64> {
+    let rest = key.strip_prefix(prefix)?;
+    let bytes: [u8; 8] = rest.try_into().ok()?;
+    Some(u64::from_be_bytes(bytes))
+}
 
 /// A [`Journal`] persisting command states to a fjall database on disk.
 #[derive(Clone)]
@@ -53,8 +74,10 @@ impl Journal for FjallJournal {
     }
 
     async fn stage(&self, state: &CommandState) -> anyhow::Result<()> {
+        // Keys stay bare (their `TxnId` ordering drives the truncation scan); only the
+        // value is version-tagged, since that is the schema that evolves.
         let key = bitcode::serialize(&state.txn)?;
-        let value = bitcode::serialize(state)?;
+        let value = encode_tagged(RecordKind::Command, state)?;
         let commands = self.commands.clone();
         // Insert into the keyspace (write-ahead) but do not fsync; the next
         // `flush` makes this — and every other staged write — durable at once.
@@ -87,7 +110,10 @@ impl Journal for FjallJournal {
             for key in redundant {
                 commands.remove(key)?;
             }
-            meta.insert(WATERMARK_KEY, bitcode::serialize(&before)?)?;
+            meta.insert(
+                WATERMARK_KEY,
+                encode_tagged(RecordKind::Watermark, &before)?,
+            )?;
             db.persist(PersistMode::SyncAll)?;
             Ok(())
         })
@@ -99,7 +125,7 @@ impl Journal for FjallJournal {
         let meta = self.meta.clone();
         let bytes = tokio::task::spawn_blocking(move || meta.get(WATERMARK_KEY)).await??;
         match bytes {
-            Some(bytes) => Ok(Some(bitcode::deserialize(&bytes)?)),
+            Some(bytes) => Ok(Some(decode_tagged(RecordKind::Watermark, &bytes)?)),
             None => Ok(None),
         }
     }
@@ -109,7 +135,7 @@ impl Journal for FjallJournal {
         let commands = self.commands.clone();
         let bytes = tokio::task::spawn_blocking(move || commands.get(key)).await??;
         match bytes {
-            Some(bytes) => Ok(Some(bitcode::deserialize(&bytes)?)),
+            Some(bytes) => Ok(Some(decode_tagged(RecordKind::Command, &bytes)?)),
             None => Ok(None),
         }
     }
@@ -120,7 +146,67 @@ impl Journal for FjallJournal {
             let mut out = Vec::new();
             for guard in commands.iter() {
                 let (_, value) = guard.into_inner()?;
-                out.push(bitcode::deserialize(&value)?);
+                out.push(decode_tagged(RecordKind::Command, &value)?);
+            }
+            Ok(out)
+        })
+        .await?
+    }
+
+    async fn append_metadata(&self, epoch: u64, layout: &[Vec<NodeId>]) -> anyhow::Result<()> {
+        let key = epoch_key(METADATA_PREFIX, epoch);
+        let value = encode_tagged(RecordKind::MetadataEntry, &layout.to_vec())?;
+        let meta = self.meta.clone();
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            meta.insert(key, value)?;
+            db.persist(PersistMode::SyncAll)?;
+            Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    async fn load_metadata(&self) -> anyhow::Result<Vec<(u64, Vec<Vec<NodeId>>)>> {
+        let meta = self.meta.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<(u64, Vec<Vec<NodeId>>)>> {
+            let mut out = Vec::new();
+            for guard in meta.iter() {
+                let (key, value) = guard.into_inner()?;
+                if let Some(epoch) = epoch_of(METADATA_PREFIX, &key) {
+                    out.push((epoch, decode_tagged(RecordKind::MetadataEntry, &value)?));
+                }
+            }
+            // Big-endian keys already sort ascending, but be explicit.
+            out.sort_by_key(|(epoch, _)| *epoch);
+            Ok(out)
+        })
+        .await?
+    }
+
+    async fn record_acceptor(&self, epoch: u64, state: &AcceptorRecord) -> anyhow::Result<()> {
+        let key = epoch_key(ACCEPTOR_PREFIX, epoch);
+        let value = encode_tagged(RecordKind::AcceptorState, state)?;
+        let meta = self.meta.clone();
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            meta.insert(key, value)?;
+            db.persist(PersistMode::SyncAll)?;
+            Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    async fn load_acceptors(&self) -> anyhow::Result<Vec<(u64, AcceptorRecord)>> {
+        let meta = self.meta.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<(u64, AcceptorRecord)>> {
+            let mut out = Vec::new();
+            for guard in meta.iter() {
+                let (key, value) = guard.into_inner()?;
+                if let Some(epoch) = epoch_of(ACCEPTOR_PREFIX, &key) {
+                    out.push((epoch, decode_tagged(RecordKind::AcceptorState, &value)?));
+                }
             }
             Ok(out)
         })

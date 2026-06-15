@@ -57,6 +57,24 @@ outdated:
 dev:
 	cargo watch -x "run -p todos"
 
+# bank-axum-accord: the Accord-backed bank demo. Run standalone, or as a 3-node
+# localhost TCP cluster (NODE_ID=0..2 → Accord port 7000+id, web port 3000+id).
+accord:
+	cargo run -p bank-axum-accord
+
+accord.node0:
+	NODE_ID=0 cargo run -p bank-axum-accord
+
+accord.node1:
+	NODE_ID=1 cargo run -p bank-axum-accord
+
+accord.node2:
+	NODE_ID=2 cargo run -p bank-axum-accord
+
+# Run the whole 3-node cluster at once (each node in its own process).
+accord.cluster:
+	$(MAKE) accord.node0 accord.node1 accord.node2 -j3
+
 # dev:
 # 	$(MAKE) _dev -j2
 #

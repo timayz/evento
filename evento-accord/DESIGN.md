@@ -115,15 +115,30 @@ metadata service (CEP-21, Transactional Cluster Metadata — a linearizable
 replicated metadata *log*).
 
 `evento-accord` is standalone, with no host metadata service, so the config Paxos
-(`ConfigPrepare`/`Promise`/`Accept`/`Accepted`/`Commit`) is a **minimal stand-in
-for that role** — an implementation choice, not part of Accord. It is scoped to
-"agree on one topology layout per epoch" (single-decree Paxos per epoch number)
-rather than a general metadata log; the epoch number supplies the ordering a log
-would otherwise provide. Known gaps versus a full metadata service: a node that
-misses several epoch changes has no log to replay (it only learns of changes it
-receives a `ConfigCommit` for), and there is no leader for liveness under
-contention. Keep this boundary in mind: anything `Config*` is the control plane,
-everything else is Accord.
+(`ConfigPrepare`/`Promise`/`Accept`/`Accepted`/`Commit`) **decides** each epoch's
+layout — an implementation choice, not part of Accord. Per-epoch single-decree
+Paxos remains the *decider*, but the decided `(epoch, layout)` entries are now a
+durable, replicated **metadata log** (Phase E), closing the original stand-in's
+gaps:
+
+- **Log replay / catch-up.** A node tracks the committed log and installs epochs in
+  **strict contiguous order** (`MetadataLog`/`apply_log` in `node.rs`): an entry for
+  a future epoch is held until every intervening epoch arrives, so a node can never
+  skip an epoch. A node that missed epochs (down/partitioned across a `ConfigCommit`)
+  converges by pulling the missing run from a peer (`MetadataFetch`/`MetadataEntries`,
+  metadata anti-entropy in the recovery sweep), or eagerly when a later `ConfigCommit`
+  reveals the gap.
+- **Durability.** Acceptor state is persisted **before** any promise/accept reply
+  (`Journal::record_acceptor`), and the committed log is persisted
+  (`Journal::append_metadata`); `recover_state` restores both, so a restarted acceptor
+  keeps its promised ballots (Paxos crash-safety) and re-installs its epoch prefix.
+- **Automatic completion.** The recovery sweep finishes any accepted-but-uncommitted
+  epoch itself (the automatic equivalent of `recover_topology`).
+
+Remaining gap versus a full CEP-21 service: **no leader** for liveness under
+contention (concurrent reconfigurations can still duel on ballots) and no Raft-style
+single log stream. Keep this boundary in mind: anything `Config*`/`Metadata*` is the
+control plane, everything else is Accord.
 
 ## Milestones
 
@@ -233,10 +248,10 @@ recovery, atomic cross-shard conditional appends via the Read→Apply split with
 node-join bootstrap with buffer-replay, node leave, Paxos-backed epoch changes
 that survive a coordinator crash (acceptor set tracks current membership), and
 range movement (re-sharding), and multi-shard executor read routing, plus an opt-in
-linearizable-read **read-index** barrier (`NodeConfig.linearizable_reads`). **67 tests**
-(24 unit, 6 cluster, 3 multi-shard, 7 membership, 1 resharding, 5 executor,
-1 linearizable-stress, 1 shard-executor, 2 TCP, 2 mTLS, 10 simulation, 3 restart,
-2 fjall-journal), clippy clean,
+linearizable-read **read-index** barrier (`NodeConfig.linearizable_reads`). **84 tests**
+(35 unit, 6 cluster, 3 multi-shard, 9 membership, 1 resharding, 6 executor,
+1 linearizable-stress, 1 shard-executor, 2 TCP, 2 mTLS, 12 simulation, 3 restart,
+3 fjall-journal), clippy clean,
 stable across repeated runs (the simulation suite is deterministic — see Phase A).
 The full M0–M5 roadmap plus elastic membership (M4) is implemented. **External
 verification has begun**: an independent Jepsen/Elle harness (`evento-accord/jepsen/`,
@@ -463,28 +478,72 @@ backend (sql/fjall). Phases, in order:
   - [ ] **Fast-path electorate** (deferred from Phase C) — region-favoring
         single-round-trip commits; not validatable without a latency model.
 
-- **Phase E — Production readiness.** ⬜ *Not started.* The items that make it
-  safe to run, not just correct in a lab:
-  - [ ] **Cluster-metadata / membership service** replacing the minimal config-
-        Paxos stand-in (today: single-decree per epoch, no log replay for a node
-        that misses epochs, no leader for liveness under contention).
-  - [ ] **Metrics export** (Prometheus / OpenTelemetry) and structured-log wiring,
-        not just in-process counters.
+- **Phase E — Production readiness.** 🚧 *In progress.* The items that make it
+  safe to run, not just correct in a lab. **Five of the six items are done; PKI/cert
+  management is deferred** (see below):
+  - [x] **Cluster-metadata / membership service** — the config-Paxos stand-in is now
+        a durable, replicated **metadata log** (the "core" CEP-21 depth: log replay +
+        durability, no leader/Raft). Per-epoch single-decree Paxos still decides each
+        entry, but decided `(epoch, layout)` entries form an append-only log installed
+        in **strict contiguous order** (`MetadataLog`/`apply_log`, so no epoch is ever
+        skipped); a behind node catches up via `MetadataFetch`/`MetadataEntries`
+        (metadata anti-entropy in the recovery sweep, plus an eager pull when a later
+        `ConfigCommit` reveals a gap); acceptor state + the committed log are persisted
+        via the extended `Journal` (`record_acceptor`/`append_metadata`) and restored
+        by `recover_state` (a restarted acceptor never regresses a ballot); and the
+        sweep auto-completes an accepted-but-uncommitted epoch. Validated by
+        `tests/membership.rs` (replay-of-missed-epochs, restart durability,
+        restarted-acceptor-rejects-stale-ballot) and a deterministic
+        **membership-churn** simulation scenario (`membership_churn_converges` +
+        `membership_churn_is_bit_reproducible`) proving the log converges under
+        concurrent reconfiguration, writes, and minority churn while data-plane safety
+        holds. *Remaining (deferred): a leader/lease for liveness under contention.*
+  - [x] **Metrics export** — `MetricsSnapshot::to_prometheus` /
+        `to_prometheus_labeled` render the counters in **Prometheus text exposition
+        format** (`accord_*_total` counters, optional labels e.g. the node id),
+        hand-rolled so the crate stays **dependency-free** — the operator wires the
+        `/metrics` HTTP endpoint and serves the string, alongside the existing
+        `tracing` events. (A live `prometheus`-crate registry behind an optional cargo
+        feature is the future path if ever wanted; unwarranted for 9 plain counters.)
   - [ ] **PKI / cert management** — issuance, rotation, per-node identities (the
-        TLS tests use a self-signed shared cert).
-  - [ ] **Format & upgrade story** — versioning for the journal/wire `CommandState`
-        encoding and a rolling-upgrade path.
-  - [ ] **Snapshot-at-scale** for large aggregates (the `ExecutorDataStore`
-        `version`/`snapshot` reads cap at `u16::MAX` events per aggregate today).
-  - [ ] **Backpressure/rate-limiting policy** beyond drop-on-full, and bounded
-        `Replica.commands` recovery memory under sustained partition.
+        TLS tests use a self-signed shared cert). *Deferred — cert issuance is an
+        external-CA concern; the TLS API already accepts an operator-supplied rustls
+        connector/acceptor, so per-node identities are wireable today.*
+  - [x] **Format & upgrade story** — every bitcode record (the framed-TCP wire and the
+        disk-journal *values*) now carries a 4-byte `[MAGIC | format_version | kind]`
+        header (`src/format.rs`, `encode_tagged`/`decode_tagged`), so a layout change
+        is **detected, not silently mis-parsed** (bitcode is positional). Journal keys
+        stay bare (their `TxnId` ordering drives the truncation scan). **Rolling-upgrade
+        path:** version mismatch makes peers mutually *shed* frames (loss the consensus
+        layer tolerates), so a cluster rolls **drain-and-replace** (keep a quorum on one
+        version at a time); a future field addition bumps `FORMAT_VERSION` and adds a
+        per-version `decode_tagged` branch. Pre-1.0: the tag is mandatory, with no reader
+        for untagged records (upgrade-from-untagged wipes and re-bootstraps via `join`).
+  - [x] **Snapshot-at-scale** — `ExecutorDataStore::version`/`snapshot` now **paginate**
+        the backend (`SNAPSHOT_PAGE_SIZE`-event pages, walking until exhausted) instead
+        of a single `u16::MAX`-capped page, so an aggregate (or store) of any size is
+        handled. (`version` folds a running max across pages.) A streaming snapshot for
+        truly huge stores is a noted future refinement.
+  - [x] **Backpressure/rate-limiting policy** beyond drop-on-full — (1) shed
+        observability: a `messages_shed` metric counts frames dropped for a full peer
+        queue (`TcpTransport`, sharable `Arc<Metrics>` via `with_metrics`) and an
+        `InMemoryNetwork::shed_count`, both **observe-only** (never feed control flow, so
+        the simulation stays deterministic); (2) a bounded consensus backlog —
+        `NodeConfig.max_commands` makes a node **refuse to coordinate a new write** once
+        `Replica.commands` reaches the cap (e.g. compaction stalled under a sustained
+        partition), shedding *new load* only. Existing consensus state is **never
+        evicted** and peer messages are **never refused** (the gate is the local
+        coordinator's entry point alone — refusing peer messages would break
+        safety/liveness).
 
 ## Production-readiness verdict
 
 **Not production-ready.** This is a faithful, well-tested **reference
 implementation** — verified in a deterministic fault-injection simulation,
 durable, bounded, geo-hardened, observable, and benchmarked (Phases A–C complete,
-Phase D partial) — and a strong base to *take* to production. It is suitable for
+Phases D and E partial — Phase E's format-versioning, Prometheus metrics export,
+snapshot-at-scale, backpressure, and the durable replicated metadata log are in,
+leaving only PKI/cert management) — and a strong base to *take* to production. It is suitable for
 prototypes, demos, and controlled/low-stakes use. It is **not** yet safe for
 production: external/adversarial verification has only just begun (a Jepsen/Elle
 harness now exists and its first partition run already found that **reads are not
@@ -492,12 +551,12 @@ linearizable** by default — writes are serializable & atomic, but a read off a
 replica can break real-time order; an opt-in `linearizable_reads` read-index barrier
 makes reads linearizable and the cluster strict-serializable under quorum-preserving
 partition — Jepsen-validated to concurrency 10, after the harness found and fixed an
-anti-entropy convergence bug), and there is still no independent review, no
-real-cluster
-soak mileage, an unoptimized throughput ceiling, and a stand-in membership/metadata
-layer. The gating items are the unchecked boxes in Phases D and E above, in roughly
-that order (verification and soak first). The crate version (`2.0.0-alpha.*`)
-reflects this.
+anti-entropy convergence bug), and there is still no independent review and no
+real-cluster soak mileage. The membership/metadata layer is now a durable, replicated
+metadata log (Phase E) with replay and restart-durability, though it still lacks a
+leader for liveness under contention. The gating items are the unchecked boxes in
+Phases D and E above, in roughly that order (verification and soak first). The crate
+version (`2.0.0-alpha.*`) reflects this.
 
 The event-data path is already backend-agnostic (`AccordExecutor` runs on any
 `evento_core::Executor`); Phase B extends that to the consensus state.

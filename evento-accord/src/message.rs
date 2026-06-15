@@ -210,6 +210,15 @@ pub enum Message {
     },
     /// Acceptor → coordinator: a config ballot was too low for `epoch`.
     ConfigNack { epoch: u64, promised: Ballot },
+    /// A behind node → any peer: send every decided metadata-log entry strictly
+    /// after `after_epoch`, so this node can fill a gap in its topology history.
+    MetadataFetch { after_epoch: u64 },
+    /// A peer → the requester: contiguous decided `(epoch, layout)` entries in
+    /// ascending order (all `> after_epoch`). Fire-and-forget; the requester ingests
+    /// them, installing each now-contiguous epoch. May be empty.
+    MetadataEntries {
+        entries: Vec<(u64, Vec<Vec<NodeId>>)>,
+    },
     /// A node → an owner of the queried key range: serve this read locally.
     ReadForward {
         id: u64,
@@ -266,6 +275,8 @@ impl Message {
             | Message::ConfigAccepted { .. }
             | Message::ConfigCommit { .. }
             | Message::ConfigNack { .. }
+            | Message::MetadataFetch { .. }
+            | Message::MetadataEntries { .. }
             | Message::ReadForward { .. }
             | Message::ReadReply { .. } => None,
         }
