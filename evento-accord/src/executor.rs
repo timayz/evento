@@ -22,7 +22,7 @@
 use async_trait::async_trait;
 use evento_core::{
     cursor::{Args, ReadResult, Value},
-    Event, Executor, ReadAggregator, RoutingKey, WriteError,
+    Event, Executor, EventFilter, RoutingKey, WriteError,
 };
 use ulid::Ulid;
 
@@ -35,14 +35,14 @@ use crate::node::Node;
 /// routing key, or a query for one aggregate by id. Broad scans (multiple
 /// aggregates, or by event type) return `None` and are served locally.
 fn target_key(
-    aggregators: &Option<Vec<ReadAggregator>>,
+    aggregators: &Option<Vec<EventFilter>>,
     routing_key: &Option<RoutingKey>,
 ) -> Option<Key> {
     if let Some(RoutingKey::Value(Some(key))) = routing_key {
         return Some(Key(key.clone()));
     }
     match aggregators.as_deref() {
-        Some([only]) => only.aggregator_id.clone().map(Key),
+        Some([only]) => only.aggregate_id.clone().map(Key),
         _ => None,
     }
 }
@@ -65,14 +65,14 @@ impl<E: Executor> ExecutorDataStore<E> {
 
 #[async_trait]
 impl<E: Executor> DataStore for ExecutorDataStore<E> {
-    async fn version(&self, aggregator_type: &str, aggregator_id: &str) -> anyhow::Result<u16> {
+    async fn version(&self, aggregate_type: &str, aggregate_id: &str) -> anyhow::Result<u16> {
         // The aggregate's current version is the highest among its events.
         // (Reads up to u16::MAX-1 events; aggregates beyond that need snapshot
         // compaction, which evento provides — a refinement for this adapter.)
         let result = self
             .local
             .read(
-                Some(vec![ReadAggregator::id(aggregator_type, aggregator_id)]),
+                Some(vec![EventFilter::by_id(aggregate_type, aggregate_id)]),
                 None,
                 Args::forward(u16::MAX - 1, None),
             )
@@ -106,7 +106,7 @@ impl<E: Executor> DataStore for ExecutorDataStore<E> {
 
     async fn read(
         &self,
-        aggregators: Option<Vec<ReadAggregator>>,
+        aggregators: Option<Vec<EventFilter>>,
         routing_key: Option<RoutingKey>,
         args: Args,
     ) -> anyhow::Result<ReadResult<Event>> {
@@ -168,7 +168,7 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
 
     async fn read(
         &self,
-        aggregators: Option<Vec<ReadAggregator>>,
+        aggregators: Option<Vec<EventFilter>>,
         routing_key: Option<RoutingKey>,
         args: Args,
     ) -> anyhow::Result<ReadResult<Event>> {
@@ -190,7 +190,7 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
 
     async fn latest_timestamp(
         &self,
-        aggregators: Option<Vec<ReadAggregator>>,
+        aggregators: Option<Vec<EventFilter>>,
         routing_key: Option<RoutingKey>,
     ) -> anyhow::Result<u64> {
         self.local.latest_timestamp(aggregators, routing_key).await
@@ -214,29 +214,29 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
 
     async fn get_snapshot(
         &self,
-        aggregator_type: String,
+        aggregate_type: String,
         aggregator_revision: String,
         id: String,
     ) -> anyhow::Result<Option<(Vec<u8>, Value)>> {
         self.local
-            .get_snapshot(aggregator_type, aggregator_revision, id)
+            .get_snapshot(aggregate_type, aggregator_revision, id)
             .await
     }
 
     async fn save_snapshot(
         &self,
-        aggregator_type: String,
+        aggregate_type: String,
         aggregator_revision: String,
         id: String,
         data: Vec<u8>,
         cursor: Value,
     ) -> anyhow::Result<()> {
         self.local
-            .save_snapshot(aggregator_type, aggregator_revision, id, data, cursor)
+            .save_snapshot(aggregate_type, aggregator_revision, id, data, cursor)
             .await
     }
 
-    async fn delete_snapshot(&self, aggregator_type: String, id: String) -> anyhow::Result<()> {
-        self.local.delete_snapshot(aggregator_type, id).await
+    async fn delete_snapshot(&self, aggregate_type: String, id: String) -> anyhow::Result<()> {
+        self.local.delete_snapshot(aggregate_type, id).await
     }
 }

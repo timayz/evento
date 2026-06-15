@@ -10,7 +10,7 @@ use evento_accord::{
     AccordExecutor, DataStore, ExecutorDataStore, HybridLogicalClock, InMemoryJournal,
     InMemoryNetwork, Journal, MessageSink, Node, NodeId, StaticTopology,
 };
-use evento_core::{cursor::Args, Event, Executor, ReadAggregator, WriteError};
+use evento_core::{cursor::Args, Event, Executor, EventFilter, WriteError};
 use evento_fjall::Fjall;
 use tempfile::TempDir;
 use ulid::Ulid;
@@ -62,7 +62,7 @@ impl ExecCluster {
     async fn read_all(&self, node: usize, id: &str) -> Vec<Event> {
         let result = self.execs[node]
             .read(
-                Some(vec![ReadAggregator::id("test/Account", id)]),
+                Some(vec![EventFilter::by_id("test/Account", id)]),
                 None,
                 Args::forward(50, None),
             )
@@ -88,13 +88,13 @@ impl ExecCluster {
 /// increasing `timestamp_subsec` so the backend orders them by creation, exactly
 /// as evento's commit builder produces real timestamps (events with all-zero
 /// timestamps would break cursor ordering).
-fn event(aggregator_id: &str, version: u16, name: &str) -> Event {
+fn event(aggregate_id: &str, version: u16, name: &str) -> Event {
     use std::sync::atomic::{AtomicU32, Ordering};
     static SEQ: AtomicU32 = AtomicU32::new(1);
     Event {
         id: Ulid::new(),
-        aggregator_type: "test/Account".into(),
-        aggregator_id: aggregator_id.into(),
+        aggregate_type: "test/Account".into(),
+        aggregate_id: aggregate_id.into(),
         version,
         name: name.into(),
         timestamp: 1,

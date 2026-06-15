@@ -37,9 +37,9 @@ use crate::{
 /// let filter = EventFilter::by_event("myapp/User", "UserCreated");
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ReadAggregator {
-    /// Aggregator type (e.g., "myapp/User")
-    pub aggregator_type: String,
+pub struct EventFilter {
+    /// Aggregate type (e.g., "myapp/User")
+    pub aggregate_type: String,
     /// Optional specific aggregate ID
     pub aggregate_id: Option<String>,
     /// Optional event name filter

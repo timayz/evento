@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use evento_core::{
     cursor::{Args, ReadResult},
-    Event, ReadAggregator, RoutingKey,
+    Event, EventFilter, RoutingKey,
 };
 
 use crate::{
@@ -158,7 +158,7 @@ pub trait DataStore: Send + Sync + 'static {
     /// Current version of an aggregate. Returns 0 for an aggregate with no
     /// events. Used during the Read phase to evaluate the optimistic-version
     /// condition before any shard appends.
-    async fn version(&self, aggregator_type: &str, aggregator_id: &str) -> anyhow::Result<u16>;
+    async fn version(&self, aggregate_type: &str, aggregate_id: &str) -> anyhow::Result<u16>;
 
     /// Records a decided transaction at its execution timestamp. When
     /// `commit` is true the `events` are appended (advancing versions);
@@ -178,7 +178,7 @@ pub trait DataStore: Send + Sync + 'static {
     /// store that holds no queryable events, e.g. the in-memory test store).
     async fn read(
         &self,
-        _aggregators: Option<Vec<ReadAggregator>>,
+        _aggregators: Option<Vec<EventFilter>>,
         _routing_key: Option<RoutingKey>,
         _args: Args,
     ) -> anyhow::Result<ReadResult<Event>> {

@@ -26,8 +26,8 @@ fn command(micros: u64, version: u16) -> CommandState {
         keys: vec![Key("acc".into())],
         events: vec![Event {
             id: ulid::Ulid::new(),
-            aggregator_type: "test/Account".into(),
-            aggregator_id: "acc".into(),
+            aggregate_type: "test/Account".into(),
+            aggregate_id: "acc".into(),
             version,
             name: "Bumped".into(),
             ..Default::default()

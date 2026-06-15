@@ -9,7 +9,7 @@
 
 use evento_core::{
     cursor::{Args, PageInfo, Value},
-    Event, ReadAggregator, RoutingKey,
+    Event, EventFilter, RoutingKey,
 };
 use serde::{Deserialize, Serialize};
 
@@ -28,7 +28,7 @@ impl Key {
         Key(event
             .routing_key
             .clone()
-            .unwrap_or_else(|| event.aggregator_id.clone()))
+            .unwrap_or_else(|| event.aggregate_id.clone()))
     }
 }
 
@@ -213,7 +213,7 @@ pub enum Message {
     /// A node → an owner of the queried key range: serve this read locally.
     ReadForward {
         id: u64,
-        aggregators: Option<Vec<ReadAggregator>>,
+        aggregators: Option<Vec<EventFilter>>,
         routing_key: Option<RoutingKey>,
         args: Args,
     },
@@ -271,8 +271,8 @@ mod wire_events {
     #[derive(Serialize, Deserialize)]
     struct WireEvent {
         id: Ulid,
-        aggregator_id: String,
-        aggregator_type: String,
+        aggregate_id: String,
+        aggregate_type: String,
         version: u16,
         name: String,
         routing_key: Option<String>,
@@ -287,8 +287,8 @@ mod wire_events {
         fn from(e: &Event) -> Self {
             WireEvent {
                 id: e.id,
-                aggregator_id: e.aggregator_id.clone(),
-                aggregator_type: e.aggregator_type.clone(),
+                aggregate_id: e.aggregate_id.clone(),
+                aggregate_type: e.aggregate_type.clone(),
                 version: e.version,
                 name: e.name.clone(),
                 routing_key: e.routing_key.clone(),
@@ -306,8 +306,8 @@ mod wire_events {
         fn try_from(w: WireEvent) -> Result<Self, Self::Error> {
             Ok(Event {
                 id: w.id,
-                aggregator_id: w.aggregator_id,
-                aggregator_type: w.aggregator_type,
+                aggregate_id: w.aggregate_id,
+                aggregate_type: w.aggregate_type,
                 version: w.version,
                 name: w.name,
                 routing_key: w.routing_key,

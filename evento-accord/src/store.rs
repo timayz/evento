@@ -1,7 +1,7 @@
 //! In-memory [`DataStore`] and [`Journal`] for tests and the simulation harness.
 //!
 //! The data store mirrors evento's optimistic-concurrency rule — a unique
-//! constraint on `(aggregator_type, aggregator_id, version)` — by rejecting an
+//! constraint on `(aggregate_type, aggregate_id, version)` — by rejecting an
 //! append whose version is already taken for that aggregate. Because the node
 //! applies committed transactions strictly in execution-timestamp order, two
 //! racing same-version appends deterministically resolve to one winner.
@@ -30,7 +30,7 @@ pub struct AppliedEntry {
 
 #[derive(Default)]
 struct StoreState {
-    /// Highest version appended per `(aggregator_type, aggregator_id)`.
+    /// Highest version appended per `(aggregate_type, aggregate_id)`.
     versions: HashMap<(String, String), u16>,
     /// The event that committed each `(type, id, version)` — for the simulation's
     /// split-brain oracle (no two distinct events at one version) and to serve the
@@ -73,11 +73,11 @@ impl InMemoryDataStore {
 
 #[async_trait]
 impl DataStore for InMemoryDataStore {
-    async fn version(&self, aggregator_type: &str, aggregator_id: &str) -> anyhow::Result<u16> {
+    async fn version(&self, aggregate_type: &str, aggregate_id: &str) -> anyhow::Result<u16> {
         let state = self.state.lock().expect("store poisoned");
         Ok(state
             .versions
-            .get(&(aggregator_type.to_owned(), aggregator_id.to_owned()))
+            .get(&(aggregate_type.to_owned(), aggregate_id.to_owned()))
             .copied()
             .unwrap_or(0))
     }
@@ -97,7 +97,7 @@ impl DataStore for InMemoryDataStore {
         // no-op so the global order is still observable.
         if commit {
             for event in &events {
-                let key = (event.aggregator_type.clone(), event.aggregator_id.clone());
+                let key = (event.aggregate_type.clone(), event.aggregate_id.clone());
                 state.versions.insert(key.clone(), event.version);
                 state
                     .committed
@@ -120,9 +120,9 @@ impl DataStore for InMemoryDataStore {
         let state = self.state.lock().expect("store poisoned");
         let mut events: Vec<Event> = state.committed.values().cloned().collect();
         events.sort_by(|a, b| {
-            (&a.aggregator_type, &a.aggregator_id, a.version).cmp(&(
-                &b.aggregator_type,
-                &b.aggregator_id,
+            (&a.aggregate_type, &a.aggregate_id, a.version).cmp(&(
+                &b.aggregate_type,
+                &b.aggregate_id,
                 b.version,
             ))
         });

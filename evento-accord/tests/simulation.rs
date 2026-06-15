@@ -177,11 +177,11 @@ impl Sim {
 /// random `Ulid::new()` would otherwise defeat reproducibility. Distinct events
 /// still get distinct ids because the counter is monotonic and, under the
 /// deterministic runtime, advances in a reproducible order.
-fn event(aggregator_id: &str, version: u16, seq: u64) -> Event {
+fn event(aggregate_id: &str, version: u16, seq: u64) -> Event {
     Event {
         id: ulid::Ulid::from(seq as u128),
-        aggregator_type: AGG_TYPE.into(),
-        aggregator_id: aggregator_id.into(),
+        aggregate_type: AGG_TYPE.into(),
+        aggregate_id: aggregate_id.into(),
         version,
         name: "Bumped".into(),
         timestamp: 1,

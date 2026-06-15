@@ -15,11 +15,11 @@ use evento_accord::{
 };
 use evento_core::Event;
 
-fn event(aggregator_id: &str, version: u16) -> Event {
+fn event(aggregate_id: &str, version: u16) -> Event {
     Event {
         id: ulid::Ulid::new(),
-        aggregator_type: "test/Account".into(),
-        aggregator_id: aggregator_id.into(),
+        aggregate_type: "test/Account".into(),
+        aggregate_id: aggregate_id.into(),
         version,
         name: "Bumped".into(),
         ..Default::default()

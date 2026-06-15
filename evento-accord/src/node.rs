@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use evento_core::{
     cursor::{Args, Edge, ReadResult},
-    Event, ReadAggregator, RoutingKey,
+    Event, EventFilter, RoutingKey,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -858,7 +858,7 @@ impl Node {
         for event in owned_events {
             let current = self
                 .datastore
-                .version(&event.aggregator_type, &event.aggregator_id)
+                .version(&event.aggregate_type, &event.aggregate_id)
                 .await
                 .unwrap_or(0);
             if event.version <= current {
@@ -1629,7 +1629,7 @@ impl Node {
     pub async fn forward_read(
         &self,
         to: NodeId,
-        aggregators: Option<Vec<ReadAggregator>>,
+        aggregators: Option<Vec<EventFilter>>,
         routing_key: Option<RoutingKey>,
         args: Args,
     ) -> anyhow::Result<ReadResult<Event>> {
@@ -1682,7 +1682,7 @@ impl Node {
         for event in known.iter().flat_map(|(_, f)| f.events.iter()) {
             if !events
                 .iter()
-                .any(|e| e.aggregator_id == event.aggregator_id && e.version == event.version)
+                .any(|e| e.aggregate_id == event.aggregate_id && e.version == event.version)
             {
                 events.push(event.clone());
             }
@@ -1907,8 +1907,8 @@ mod tests {
         let agg = format!("acc{i}");
         let event = Event {
             id: ulid::Ulid::new(),
-            aggregator_type: "test/Account".into(),
-            aggregator_id: agg.clone(),
+            aggregate_type: "test/Account".into(),
+            aggregate_id: agg.clone(),
             version: 1,
             name: "Bumped".into(),
             ..Default::default()

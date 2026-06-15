@@ -573,10 +573,10 @@ mod tests {
         })
     }
 
-    fn event(aggregator_id: &str, version: u16) -> Event {
+    fn event(aggregate_id: &str, version: u16) -> Event {
         Event {
-            aggregator_id: aggregator_id.into(),
-            aggregator_type: "test/T".into(),
+            aggregate_id: aggregate_id.into(),
+            aggregate_type: "test/T".into(),
             version,
             ..Default::default()
         }

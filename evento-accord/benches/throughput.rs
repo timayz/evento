@@ -38,11 +38,11 @@ fn cluster(rt: &Runtime, n: u64) -> Vec<Node> {
     })
 }
 
-fn event(aggregator_id: &str, version: u16) -> Event {
+fn event(aggregate_id: &str, version: u16) -> Event {
     Event {
         id: ulid::Ulid::new(),
-        aggregator_type: "bench/Account".into(),
-        aggregator_id: aggregator_id.into(),
+        aggregate_type: "bench/Account".into(),
+        aggregate_id: aggregate_id.into(),
         version,
         name: "Bumped".into(),
         ..Default::default()

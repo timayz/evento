@@ -71,7 +71,7 @@ pub struct PageInfo {
 /// Result of a paginated query.
 ///
 /// Contains the requested edges and pagination metadata.
-#[derive(Default, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReadResult<N> {
     /// The paginated items with their cursors
     pub edges: Vec<Edge<N>>,

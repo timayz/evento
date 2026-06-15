@@ -11,7 +11,7 @@ use evento_accord::{
     AccordExecutor, DataStore, DynamicTopology, ExecutorDataStore, HybridLogicalClock,
     InMemoryJournal, InMemoryNetwork, Journal, Key, MessageSink, Node, NodeId, Topology,
 };
-use evento_core::{cursor::Args, Event, Executor, ReadAggregator};
+use evento_core::{cursor::Args, Event, Executor, EventFilter};
 use evento_fjall::Fjall;
 use tempfile::TempDir;
 
@@ -70,7 +70,7 @@ impl ShardExec {
     async fn read_all(&self, node: u64, id: &str) -> Vec<Event> {
         let result = self.execs[&NodeId(node)]
             .read(
-                Some(vec![ReadAggregator::id("test/Account", id)]),
+                Some(vec![EventFilter::by_id("test/Account", id)]),
                 None,
                 Args::forward(50, None),
             )
@@ -91,12 +91,12 @@ impl ShardExec {
     }
 }
 
-fn event(aggregator_id: &str, version: u16, name: &str) -> Event {
+fn event(aggregate_id: &str, version: u16, name: &str) -> Event {
     static SEQ: AtomicU32 = AtomicU32::new(1);
     Event {
         id: ulid::Ulid::new(),
-        aggregator_type: "test/Account".into(),
-        aggregator_id: aggregator_id.into(),
+        aggregate_type: "test/Account".into(),
+        aggregate_id: aggregate_id.into(),
         version,
         name: name.into(),
         timestamp: 1,

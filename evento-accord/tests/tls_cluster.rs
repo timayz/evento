@@ -162,10 +162,10 @@ impl TlsCluster {
     }
 }
 
-fn event(aggregator_id: &str, version: u16, name: &str) -> Event {
+fn event(aggregate_id: &str, version: u16, name: &str) -> Event {
     Event {
-        aggregator_type: "test/Account".into(),
-        aggregator_id: aggregator_id.into(),
+        aggregate_type: "test/Account".into(),
+        aggregate_id: aggregate_id.into(),
         version,
         name: name.into(),
         ..Default::default()
