@@ -1,14 +1,11 @@
 [package]
 name = "bank-axum-accord"
-version = "2.0.0-alpha.20"
+version = "2.0.0-alpha.21"
 edition = "2021"
 
 [dependencies]
 bank.workspace = true
-# evento (with the Fjall backend) provides the local event store that each Accord
-# replica applies to and serves reads from.
 evento = { workspace = true, features = ["fjall"] }
-# evento-accord wraps that backend in the Accord consensus executor.
 evento-accord.workspace = true
 axum.workspace = true
 askama.workspace = true

@@ -1,6 +1,6 @@
 [package]
 name = "evento-fjall"
-version = "2.0.0-alpha.20"
+version = "2.0.0-alpha.21"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -10,15 +10,14 @@ documentation = "https://docs.rs/evento-fjall"
 readme = "README.md"
 
 [dependencies]
-evento-core = { path = "../evento-core", version = "2.0.0-alpha.20" }
+evento-core = { path = "../evento-core", version = "2.0.0-alpha.21" }
 anyhow.workspace = true
 bitcode.workspace = true
 async-trait.workspace = true
 ulid.workspace = true
 tokio.workspace = true
 fjall.workspace = true
-# Optional: a fjall-backed Journal for the evento-accord consensus log.
-evento-accord = { path = "../evento-accord", version = "2.0.0-alpha.20", optional = true }
+evento-accord = { path = "../evento-accord", version = "2.0.0-alpha.21", optional = true }
 
 [dev-dependencies]
 tempfile = "3.27"
@@ -27,5 +26,4 @@ evento-test = { path = "../evento-test" }
 [features]
 default = ["rw"]
 rw = ["evento-core/rw"]
-# Provides `FjallJournal`, an `evento_accord::Journal` over fjall.
 accord = ["dep:evento-accord"]
