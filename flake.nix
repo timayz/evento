@@ -26,6 +26,11 @@
             cargo-machete
             cargo-edit
             tailwindcss
+            # gRPC / multi-language clients (evento-server, clients/go)
+            go
+            buf
+            protoc-gen-go
+            protoc-gen-go-grpc
             (rust-bin.stable.latest.default.override {
               extensions = [ "rust-src" "rust-analyzer" ];
             })

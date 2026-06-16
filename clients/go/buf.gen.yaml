@@ -1,0 +1,16 @@
+version: v2
+plugins:
+  # Local plugins (provided by the dev shell): no network needed for codegen.
+  # `module=` strips the module prefix from the go_package import path, so files
+  # land flat under `eventov1/` (matching the import path) instead of nested
+  # under `evento/v1/`.
+  - local: protoc-gen-go
+    out: .
+    opt:
+      - module=github.com/timayz/evento/clients/go
+  - local: protoc-gen-go-grpc
+    out: .
+    opt:
+      - module=github.com/timayz/evento/clients/go
+inputs:
+  - directory: ../../server/proto
