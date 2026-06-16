@@ -2,15 +2,9 @@
 resolver = "2"
 
 members = [
-    "./evento",
-    "./evento-test",
-    "./evento-core",
-    "./evento-sql",
-    "./evento-sql-migrator",
-    "./evento-macro",
-    "./evento-fjall",
-    "./evento-accord",
-    "./examples/*"
+    "crates/*",
+    "server",
+    "examples/*",
 ]
 
 [workspace.package]
@@ -20,15 +14,22 @@ repository = "https://github.com/timayz/evento"
 
 [workspace.dependencies]
 # Internal crates 
-evento = { path = "./evento" }
-evento-test = { path = "./evento-test" }
-evento-core = { path = "./evento-core" }
-evento-sql = { path = "./evento-sql" }
-evento-sql-migrator = { path = "./evento-sql-migrator" }
-evento-macro = { path = "./evento-macro" }
-evento-fjall = { path = "./evento-fjall" }
-evento-accord = { path = "./evento-accord" }
+evento = { path = "./crates/evento" }
+evento-test = { path = "./crates/test" }
+evento-core = { path = "./crates/core" }
+evento-sql = { path = "./crates/sql" }
+evento-sql-migrator = { path = "./crates/sql-migrator" }
+evento-macro = { path = "./crates/macro" }
+evento-fjall = { path = "./crates/fjall" }
+evento-accord = { path = "./crates/accord" }
 bank = { path = "./examples/bank" }
+
+# gRPC (evento-server)
+tonic = "0.12"
+prost = "0.13"
+tonic-build = "0.12"
+# Pure-Rust protobuf compiler — lets the build work without a system `protoc`.
+protox = "0.7"
 
 # Core dependencies
 anyhow = "1.0"

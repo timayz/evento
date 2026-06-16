@@ -1,0 +1,230 @@
+syntax = "proto3";
+
+package evento.v1;
+
+// Go import path for the generated client SDK (ignored by the Rust/prost build).
+option go_package = "github.com/timayz/evento/clients/go/eventov1;eventov1";
+
+// gRPC surface for the raw evento event store (v1).
+//
+// This service exposes evento's `Executor` write/read paths over the wire so
+// non-Rust clients can use evento as an event store. Higher-level ergonomics
+// (aggregate replay, projections, subscriptions) are reimplemented client-side.
+//
+// Conventions:
+//   * Event `data` and `Metadata.meta` values are OPAQUE bytes; the server is
+//     encoding-agnostic (bitcode framing is purely a Rust-client concern).
+//   * ULIDs and pagination cursors are strings, never decoded server-side.
+//   * Fields that map to a Rust `u16` use `uint32` with server-side range
+//     validation (`<= 65535`).
+//   * `optional string` is used wherever the Rust type is `Option<String>` so
+//     "absent" is distinguishable from "present but empty".
+service EventStore {
+  // Appends events to a (possibly new) aggregate. The server assigns each
+  // event's id (ULID), version (original_version+1..), and timestamp.
+  //
+  // Optimistic concurrency: if `original_version` does not match the
+  // aggregate's current version, returns FAILED_PRECONDITION with the error
+  // detail reason "INVALID_ORIGINAL_VERSION".
+  rpc Write(WriteRequest) returns (WriteResponse);
+
+  // Cursor-paginated query over stored events.
+  rpc Read(ReadRequest) returns (ReadResponse);
+
+  // Timestamp (unix seconds) of the most recent matching event; 0 if none.
+  rpc LatestTimestamp(LatestTimestampRequest) returns (LatestTimestampResponse);
+
+  // Durable, resumable event subscription (at-least-once delivery).
+  //
+  // The client opens the stream with a `SubscribeStart`; the server replays
+  // from the subscription key's saved cursor and then tails live events,
+  // pushing `EventBatch` messages. After each batch the client sends a
+  // `SubscribeAck` with the last cursor it processed, and the server persists
+  // that cursor — so a reconnect resumes where it left off rather than
+  // redelivering everything. Only one stream per key is active at a time
+  // (last writer wins); a superseded stream ends.
+  rpc Subscribe(stream SubscribeRequest) returns (stream EventBatch);
+
+  // Snapshots cache a projection's folded state plus the cursor it was valid
+  // at, so a reader can resume from the cursor instead of replaying from zero.
+  // `data` and `cursor` are opaque to the server.
+
+  // Returns the snapshot for (aggregate_type, aggregate_revision, id), or none
+  // if absent — including when the stored revision differs (forcing a rebuild).
+  rpc GetSnapshot(GetSnapshotRequest) returns (GetSnapshotResponse);
+
+  // Upserts the snapshot for (aggregate_type, id) — one row per aggregate.
+  rpc SaveSnapshot(SaveSnapshotRequest) returns (SaveSnapshotResponse);
+
+  // Deletes the snapshot for (aggregate_type, id). Idempotent.
+  rpc DeleteSnapshot(DeleteSnapshotRequest) returns (DeleteSnapshotResponse);
+}
+
+// ---- Core event ----
+
+message Event {
+  string id = 1;                  // ULID
+  string aggregate_id = 2;
+  string aggregate_type = 3;
+  uint32 version = 4;             // logical u16; server validates <= 65535
+  string name = 5;
+  optional string routing_key = 6;
+  bytes data = 7;                 // opaque payload
+  Metadata metadata = 8;
+  uint64 timestamp = 9;           // unix seconds
+  uint32 timestamp_subsec = 10;   // milliseconds
+}
+
+message Metadata {
+  string id = 1;                  // metadata ULID; server-assigned if empty
+  map<string, bytes> meta = 2;    // opaque pairs (e.g. EVENTO_REQUESTED_BY)
+}
+
+// ---- Write ----
+
+// One event to append. The server assigns id/version/timestamp.
+message NewEvent {
+  string name = 1;
+  bytes data = 2;                 // opaque payload
+}
+
+message WriteRequest {
+  string aggregate_type = 1;
+  // Omit/empty to create a new aggregate (server generates a ULID id).
+  optional string aggregate_id = 2;
+  // Expected current version for optimistic concurrency. 0 == new aggregate.
+  uint32 original_version = 3;    // logical u16; validated
+  optional string routing_key = 4;
+  // Metadata applied to every event in this write. `id` may be empty (server fills).
+  Metadata metadata = 5;
+  repeated NewEvent events = 6;   // must be non-empty (else INVALID_ARGUMENT)
+}
+
+message WriteResponse {
+  string aggregate_id = 1;        // the (possibly generated) aggregate id
+  uint32 last_version = 2;        // version of the last appended event
+}
+
+// ---- Read ----
+
+message EventFilter {
+  string aggregate_type = 1;
+  optional string aggregate_id = 2;
+  optional string name = 3;
+}
+
+// Mirrors evento's RoutingKey enum (All | Value(Option<String>)):
+//   * all = true                -> RoutingKey::All
+//   * all = false, no value      -> RoutingKey::Value(None)
+//   * all = false, value = "x"   -> RoutingKey::Value(Some("x"))
+// Omitting the whole RoutingKey message -> None (no routing filter).
+message RoutingKey {
+  bool all = 1;
+  optional string value = 2;
+}
+
+// Cursor pagination (GraphQL-style): first/after OR last/before.
+message Args {
+  optional uint32 first = 1;      // logical u16
+  optional string after = 2;      // opaque cursor (base64)
+  optional uint32 last = 3;       // logical u16
+  optional string before = 4;     // opaque cursor (base64)
+}
+
+message ReadRequest {
+  // Empty list -> None (read everything, no aggregate filter).
+  repeated EventFilter aggregators = 1;
+  optional RoutingKey routing_key = 2;
+  Args args = 3;
+}
+
+message Edge {
+  string cursor = 1;              // opaque
+  Event node = 2;
+}
+
+message PageInfo {
+  bool has_previous_page = 1;
+  bool has_next_page = 2;
+  optional string start_cursor = 3;
+  optional string end_cursor = 4;
+}
+
+message ReadResponse {
+  repeated Edge edges = 1;
+  PageInfo page_info = 2;
+}
+
+// ---- LatestTimestamp ----
+
+message LatestTimestampRequest {
+  repeated EventFilter aggregators = 1;   // empty -> None
+  optional RoutingKey routing_key = 2;
+}
+
+message LatestTimestampResponse {
+  uint64 timestamp = 1;
+}
+
+// ---- Subscribe ----
+
+// Opens a subscription. Sent once, as the first message on the stream.
+message SubscribeStart {
+  // Durable subscription identity; its cursor persists across reconnects.
+  string key = 1;
+  // Optional event filters (empty -> all events).
+  repeated EventFilter aggregators = 2;
+  optional RoutingKey routing_key = 3;
+  // Max events per pushed batch (logical u16; 0 -> server default).
+  uint32 chunk_size = 4;
+}
+
+// Acknowledges processing up to (and including) `cursor`. Sent after each batch.
+message SubscribeAck {
+  string cursor = 1;              // opaque; the last processed event's cursor
+}
+
+message SubscribeRequest {
+  oneof message {
+    SubscribeStart start = 1;
+    SubscribeAck ack = 2;
+  }
+}
+
+message EventBatch {
+  repeated Edge edges = 1;
+}
+
+// ---- Snapshots ----
+
+message Snapshot {
+  bytes data = 1;     // opaque serialized projection state
+  string cursor = 2;  // opaque; the position the snapshot is valid up to
+}
+
+message GetSnapshotRequest {
+  string aggregate_type = 1;
+  string aggregate_revision = 2;
+  string id = 3;
+}
+
+message GetSnapshotResponse {
+  optional Snapshot snapshot = 1;   // absent if none for (type, revision, id)
+}
+
+message SaveSnapshotRequest {
+  string aggregate_type = 1;
+  string aggregate_revision = 2;
+  string id = 3;
+  bytes data = 4;
+  string cursor = 5;
+}
+
+message SaveSnapshotResponse {}
+
+message DeleteSnapshotRequest {
+  string aggregate_type = 1;
+  string id = 2;
+}
+
+message DeleteSnapshotResponse {}

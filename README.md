@@ -311,6 +311,34 @@ evento = { version = "2", features = ["fjall"] }
 - `group` - Multi-executor support for querying across databases
 - `rw` - Read-write split executor for CQRS patterns
 
+## gRPC server (multi-language clients)
+
+evento can be served over gRPC so non-Rust applications can use it as an event
+store. The `evento-server` binary wraps any backend (Fjall, SQL, or an Accord
+cluster) and exposes the `evento.v1.EventStore` service — `Write`, `Read` (with
+cursor pagination), `LatestTimestamp`, `Subscribe` (a durable, resumable,
+at-least-once event stream for building live projections), and snapshot
+get/save/delete (cache folded state to avoid replaying from zero). Event
+payloads and metadata travel as opaque bytes; the server is encoding-agnostic.
+
+```sh
+# Single-node, Fjall backend
+EVENTO_GRPC_ADDR=127.0.0.1:50051 EVENTO_STORE_PATH=./data/store evento-server
+
+# SQL backend
+EVENTO_BACKEND=postgres EVENTO_DATABASE_URL=postgres://... evento-server
+
+# Accord cluster node (consensus over TCP, durable journal)
+EVENTO_MODE=accord-cluster EVENTO_NODE_ID=0 \
+  EVENTO_PEERS=0=127.0.0.1:7000,1=127.0.0.1:7001,2=127.0.0.1:7002 evento-server
+```
+
+Set `EVENTO_DEFAULT_ROUTING_KEY` to apply a global default routing key to writes
+that don't specify one. The schema lives at `server/proto/evento/v1/store.proto`.
+
+- `evento-server` — the gRPC server: a tonic service over any backend, run as a daemon (configured via environment variables).
+- `clients/go/` — Go client SDK.
+
 ## Examples
 
 See the `examples/` directory for complete working examples:

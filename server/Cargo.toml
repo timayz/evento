@@ -1,0 +1,47 @@
+[package]
+name = "evento-server"
+version = "2.0.0-alpha.20"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "evento gRPC server: serves any evento backend (single-node or Accord cluster) over gRPC"
+
+# Library: the tonic service generic over any `Executor` (used by the binary and
+# the integration tests). Binary: the configurable server daemon (src/main.rs).
+
+[dependencies]
+evento-core = { path = "../crates/core", version = "2.0.0-alpha.20" }
+tonic.workspace = true
+prost.workspace = true
+anyhow.workspace = true
+ulid.workspace = true
+tracing.workspace = true
+# Binary (backend selection + serve):
+tokio = { workspace = true }
+tracing-subscriber = "0.3"
+evento-fjall = { path = "../crates/fjall" }
+evento-sql = { path = "../crates/sql", features = ["sqlite", "postgres", "mysql"] }
+evento-sql-migrator = { path = "../crates/sql-migrator", features = ["sqlite", "postgres", "mysql"] }
+sqlx = { workspace = true, features = ["sqlite", "postgres", "mysql", "runtime-tokio"] }
+sqlx_migrator.workspace = true
+# Stream wrappers for the Subscribe server stream (and TcpListenerStream in tests).
+tokio-stream = { version = "0.1", features = ["net"] }
+# Accord cluster backend (enabled by default; build with --no-default-features to drop it).
+evento-accord = { path = "../crates/accord", optional = true }
+
+[build-dependencies]
+tonic-build.workspace = true
+protox.workspace = true
+
+[dev-dependencies]
+tempfile = "3.27"
+
+[features]
+default = ["accord"]
+accord = ["dep:evento-accord", "evento-fjall/accord"]
+
+# False positives: `prost` is used by the tonic-generated code (in OUT_DIR, not
+# scanned), and `protox`/`tonic-build` are used in build.rs.
+[package.metadata.cargo-machete]
+ignored = ["prost", "protox", "tonic-build"]
