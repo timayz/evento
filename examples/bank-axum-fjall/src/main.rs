@@ -258,12 +258,18 @@ async fn transfer(
 
 fn get_all_accounts() -> Vec<AccountView> {
     let rows = ACCOUNT_DETAILS_ROWS.read().unwrap();
-    rows.iter()
+    let mut accounts: Vec<AccountView> = rows
+        .iter()
         .map(|(id, view)| AccountView {
             id: id.to_owned(),
             balance: view.balance,
             currency: view.currency.to_owned(),
             status: format!("{:?}", view.status),
         })
-        .collect()
+        .collect();
+    // The read model is an unordered `HashMap`, whose iteration order is random
+    // per process. Account ids are ULIDs, so sorting by id gives a stable
+    // creation-time order that is identical across runs and nodes.
+    accounts.sort_by(|a, b| a.id.cmp(&b.id));
+    accounts
 }
