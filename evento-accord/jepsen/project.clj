@@ -8,5 +8,5 @@
                  ;; Jepsen bundles Elle (the strict-serializability checker).
                  [jepsen "0.3.11"]
                  [clj-http "3.13.1"]
-                 [cheshire "5.13.0"]]
+                 [cheshire "6.2.0"]]
   :repl-options {:init-ns evento-accord.core})
