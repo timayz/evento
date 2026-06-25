@@ -54,6 +54,12 @@ async fn fjall_subscribe() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn fjall_subscribe_low_latency() -> anyhow::Result<()> {
+    let (executor, _temp_dir) = create_fjall_executor("subscribe_low_latency")?;
+    evento_test::subscribe_low_latency(&executor).await
+}
+
+#[tokio::test]
 async fn fjall_subscribe_routing_key() -> anyhow::Result<()> {
     let (executor, _temp_dir) = create_fjall_executor("subscribe_routing_key")?;
     evento_test::subscribe_routing_key(&executor).await

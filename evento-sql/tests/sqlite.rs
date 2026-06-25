@@ -62,6 +62,13 @@ async fn sqlite_subscribe() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn sqlite_subscribe_low_latency() -> anyhow::Result<()> {
+    let pool = create_sqlite_pool("subscribe_low_latency").await?;
+
+    evento_test::subscribe_low_latency::<Sql<sqlx::Sqlite>>(&pool.into()).await
+}
+
+#[tokio::test]
 async fn sqlite_subscribe_routing_key() -> anyhow::Result<()> {
     let pool = create_sqlite_pool("subscribe_routing_key").await?;
 

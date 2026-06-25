@@ -136,6 +136,36 @@ pub trait Executor: Send + Sync + 'static {
     /// Returns `WriteError::InvalidOriginalVersion` if version conflicts occur.
     async fn write(&self, events: Vec<Event>) -> Result<(), WriteError>;
 
+    /// Returns a receiver notified after each successful in-process `write`,
+    /// for low-latency subscription wakeup.
+    ///
+    /// The channel carries a monotonically increasing write generation. A
+    /// running subscription selects on this alongside its poll interval so it
+    /// wakes the instant an event is committed through the same executor
+    /// instance (or a clone), instead of waiting for the next poll tick.
+    ///
+    /// Default `None` → pure polling. Cross-process writers are not observed by
+    /// this signal; the poll interval remains the fallback for those.
+    fn write_watch(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        None
+    }
+
+    /// An exclusive upper bound, in microseconds since the Unix epoch, on the
+    /// event timestamps a subscription may safely process — or `None` for no
+    /// bound (the default).
+    ///
+    /// Single-store backends append in a total order that matches the
+    /// subscription cursor, so they return `None`. A replicated backend whose
+    /// events can be applied to a node out of cursor order (multi-node Accord)
+    /// returns a stability watermark: the subscription processes only events
+    /// whose timestamp is strictly below it, so it never advances past a
+    /// position where a lower-cursor event could still be applied later. Safety
+    /// holds under the same clock-skew/propagation bound the backend already
+    /// assumes for its own state (e.g. Accord's `compaction_margin`).
+    fn stable_timestamp(&self) -> Option<u64> {
+        None
+    }
+
     /// Gets the current cursor position for a subscription.
     async fn get_subscriber_cursor(&self, key: String) -> anyhow::Result<Option<Value>>;
 
@@ -241,6 +271,14 @@ impl Executor for Evento {
             }
         }
         self.inner.write(events).await
+    }
+
+    fn write_watch(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        self.inner.write_watch()
+    }
+
+    fn stable_timestamp(&self) -> Option<u64> {
+        self.inner.stable_timestamp()
     }
 
     async fn read(
@@ -372,6 +410,14 @@ impl Executor for EventoGroup {
         self.first().write(events).await
     }
 
+    fn write_watch(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        self.first().write_watch()
+    }
+
+    fn stable_timestamp(&self) -> Option<u64> {
+        self.first().stable_timestamp()
+    }
+
     async fn read(
         &self,
         aggregators: Option<Vec<EventFilter>>,
@@ -497,6 +543,14 @@ impl<R: Executor, W: Executor> Executor for Rw<R, W> {
 
     async fn write(&self, events: Vec<Event>) -> Result<(), WriteError> {
         self.w.write(events).await
+    }
+
+    fn write_watch(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        self.r.write_watch()
+    }
+
+    fn stable_timestamp(&self) -> Option<u64> {
+        self.r.stable_timestamp()
     }
 
     async fn read(

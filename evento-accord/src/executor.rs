@@ -198,6 +198,23 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
         }
     }
 
+    fn write_watch(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        // Subscriptions read from the local backend, and committed writes are
+        // applied to it via the node's `ExecutorDataStore`. That apply calls the
+        // local executor's `write`, which bumps the local signal — so forwarding
+        // here delivers a wakeup once a write is locally visible.
+        self.local.write_watch()
+    }
+
+    fn stable_timestamp(&self) -> Option<u64> {
+        // Gate subscriptions by the node's stability watermark. Events are
+        // applied to each replica's local store in Accord's `(execute_at, txn)`
+        // order — which can differ from the subscription's wall-clock cursor —
+        // so without this gate a late, lower-cursor event applied out of order
+        // would be skipped by the forward read. See `Node::stable_micros`.
+        Some(self.node.stable_micros())
+    }
+
     async fn read(
         &self,
         aggregators: Option<Vec<EventFilter>>,
