@@ -198,6 +198,14 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
         }
     }
 
+    fn write_watch(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        // Subscriptions read from the local backend, and committed writes are
+        // applied to it via the node's `ExecutorDataStore`. That apply calls the
+        // local executor's `write`, which bumps the local signal — so forwarding
+        // here delivers a wakeup once a write is locally visible.
+        self.local.write_watch()
+    }
+
     async fn read(
         &self,
         aggregators: Option<Vec<EventFilter>>,

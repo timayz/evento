@@ -169,6 +169,10 @@ pub struct Fjall {
     /// concurrent appends cannot both pass the optimistic version check (the
     /// version is read non-atomically before the batch commits).
     write_lock: Arc<Mutex<()>>,
+    /// Notifies in-process subscriptions after each successful `write` so they
+    /// wake immediately instead of waiting for their next poll tick. Carries a
+    /// monotonically increasing write generation.
+    write_tx: tokio::sync::watch::Sender<u64>,
 }
 
 impl Clone for Fjall {
@@ -183,6 +187,9 @@ impl Clone for Fjall {
             subscribers: self.subscribers.clone(),
             snapshots: self.snapshots.clone(),
             write_lock: self.write_lock.clone(),
+            // `watch::Sender` clones share the same channel, so all clones of
+            // this executor notify the same subscription receivers on write.
+            write_tx: self.write_tx.clone(),
         }
     }
 }
@@ -222,6 +229,7 @@ impl Fjall {
             subscribers: db.keyspace("subscribers", KeyspaceCreateOptions::default)?,
             snapshots: db.keyspace("snapshots", KeyspaceCreateOptions::default)?,
             write_lock: Arc::new(Mutex::new(())),
+            write_tx: tokio::sync::watch::channel(0).0,
             db,
         })
     }
@@ -511,7 +519,17 @@ impl Executor for Fjall {
             Ok(())
         })
         .await
-        .map_err(|e| WriteError::Unknown(e.into()))?
+        .map_err(|e| WriteError::Unknown(e.into()))??;
+
+        // Wake any in-process subscriptions immediately instead of waiting for
+        // their next poll tick.
+        self.write_tx.send_modify(|v| *v += 1);
+
+        Ok(())
+    }
+
+    fn write_watch(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        Some(self.write_tx.subscribe())
     }
 
     async fn read(

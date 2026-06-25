@@ -192,7 +192,7 @@ pub type RwSqlite = evento_core::Rw<Sqlite, Sqlite>;
 /// - **`is_subscriber_running`** - Check if a subscriber is active with a specific worker
 /// - **`upsert_subscriber`** - Create or update a subscriber record
 /// - **`acknowledge`** - Update subscriber cursor after processing events
-pub struct Sql<DB: Database>(Pool<DB>);
+pub struct Sql<DB: Database>(Pool<DB>, tokio::sync::watch::Sender<u64>);
 
 impl<DB: Database> Sql<DB> {
     fn build_sqlx<S: SqlxBinder>(statement: S) -> (String, sea_query_sqlx::SqlxValues) {
@@ -471,7 +471,15 @@ where
                 WriteError::Unknown(err.into())
             })?;
 
+        // Wake any in-process subscriptions immediately instead of waiting for
+        // their next poll tick.
+        self.1.send_modify(|v| *v += 1);
+
         Ok(())
+    }
+
+    fn write_watch(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        Some(self.1.subscribe())
     }
 
     async fn acknowledge(&self, key: String, cursor: Value, lag: u64) -> anyhow::Result<()> {
@@ -580,13 +588,15 @@ where
 
 impl<D: Database> Clone for Sql<D> {
     fn clone(&self) -> Self {
-        Self(self.0.clone())
+        // `watch::Sender` clones share the same channel, so all clones of this
+        // executor notify the same set of subscription receivers on write.
+        Self(self.0.clone(), self.1.clone())
     }
 }
 
 impl<D: Database> From<Pool<D>> for Sql<D> {
     fn from(value: Pool<D>) -> Self {
-        Self(value)
+        Self(value, tokio::sync::watch::channel(0).0)
     }
 }
 

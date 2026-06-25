@@ -581,6 +581,73 @@ pub async fn subscribe<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> 
     Ok(())
 }
 
+/// A running subscription must pick up a freshly written event almost
+/// immediately, driven by the executor's in-process write signal rather than by
+/// the poll interval.
+///
+/// The poll interval is set deliberately high (5s) so that polling alone cannot
+/// explain a fast pickup — if the handler runs well under that, it is the
+/// `write_watch` signal waking the loop. A regression to pure polling would make
+/// this take ~5s and time out.
+pub async fn subscribe_low_latency<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
+    use std::time::{Duration, Instant};
+
+    let subscription = simple::subscription()
+        .poll_interval(Duration::from_secs(5))
+        .start(executor)
+        .await?;
+
+    // Let the subscription reach its idle wait (first tick drains any backlog).
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let cmd = bank::Command(executor.clone());
+    let started = Instant::now();
+    let account_id = cmd
+        .open_account(OpenAccount {
+            owner_id: "owner_lowlat".to_owned(),
+            owner_name: "Low Latency".to_owned(),
+            account_type: AccountType::Checking,
+            currency: "USD".to_owned(),
+            initial_balance: 100,
+        })
+        .await?;
+
+    // Poll the projection until the handler has processed the new event.
+    let elapsed = loop {
+        if simple::ROWS.read().unwrap().contains_key(&account_id) {
+            break started.elapsed();
+        }
+        if started.elapsed() >= Duration::from_secs(2) {
+            subscription.shutdown().await.ok();
+            anyhow::bail!(
+                "event not processed within 2s despite a 5s poll interval: \
+                 write signal did not wake the subscription"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    };
+
+    // Far below the 5s poll interval — proves the wakeup came from the signal.
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "expected sub-500ms latency from the write signal, got {elapsed:?}"
+    );
+
+    {
+        let rows = simple::ROWS.read().unwrap();
+        assert_eq!(
+            rows.get(&account_id)
+                .expect("account should be in projection")
+                .status,
+            AccountStatus::Active
+        );
+    }
+
+    subscription.shutdown().await.ok();
+
+    Ok(())
+}
+
 pub async fn subscribe_routing_key<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
     let cmd = bank::Command(executor.clone());
 

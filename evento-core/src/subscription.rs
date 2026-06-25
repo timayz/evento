@@ -144,6 +144,7 @@ pub struct SubscriptionBuilder<E: Executor> {
     routing_key: Option<RoutingKey>,
     prefix_key: Option<String>,
     delay: Option<Duration>,
+    poll_interval: Duration,
     chunk_size: u16,
     continue_on_error: bool,
     retry: Option<u8>,
@@ -163,6 +164,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             safety_disabled: true,
             context: Default::default(),
             delay: None,
+            poll_interval: Duration::from_millis(250),
             retry: Some(30),
             chunk_size: 300,
             continue_on_error: false,
@@ -239,6 +241,20 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
     /// Useful for staggering subscription starts in multi-node deployments.
     pub fn delay(mut self, v: Duration) -> Self {
         self.delay = Some(v);
+
+        self
+    }
+
+    /// Sets the polling interval used as a fallback when no write signal is
+    /// available.
+    ///
+    /// When the executor supports [`write_watch`](crate::Executor::write_watch)
+    /// (the default backends do), an in-process write wakes the subscription
+    /// immediately and this interval only bounds latency for writes the signal
+    /// cannot observe — cross-process writers or custom executors. Backlogs are
+    /// drained at full speed regardless of this value. Default is 250ms.
+    pub fn poll_interval(mut self, v: Duration) -> Self {
+        self.poll_interval = v;
 
         self
     }
@@ -360,16 +376,13 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
         id: &Ulid,
         aggregators: &[EventFilter],
     ) -> anyhow::Result<bool> {
-        let mut interval = interval_at(
-            Instant::now() - Duration::from_millis(400),
-            Duration::from_millis(300),
-        );
-
+        // Drains all currently-available events back-to-back and returns as soon
+        // as it catches up. The caller (`start`'s loop) owns all waiting — poll
+        // interval, write signal, and shutdown — so there is no pacing here: this
+        // keeps both fresh-event latency and backlog drain at full speed.
         tracing::Span::current().record("subscription", self.key());
 
         loop {
-            interval.tick().await;
-
             if !executor.is_subscriber_running(self.key(), *id).await? {
                 return Ok(false);
             }
@@ -387,6 +400,11 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             if res.edges.is_empty() {
                 return Ok(false);
             }
+
+            // A partial chunk means everything currently available has been read;
+            // a full chunk likely has more pending, so loop and read the next one
+            // immediately.
+            let drained = res.edges.len() < self.chunk_size as usize;
 
             let timestamp = executor
                 .latest_timestamp(
@@ -444,6 +462,10 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                     )
                     .await?;
             }
+
+            if drained {
+                return Ok(false);
+            }
         }
     }
 
@@ -483,6 +505,8 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             .upsert_subscriber(self.key(), id.to_owned())
             .await?;
 
+        let mut write_watch = executor.write_watch();
+
         let task_handle = tokio::spawn(async move {
             let read_aggregators = self.read_aggregators();
             let start = self
@@ -490,25 +514,60 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                 .map(|d| Instant::now() + d)
                 .unwrap_or_else(Instant::now);
 
-            let mut interval = interval_at(
-                start - Duration::from_millis(1200),
-                Duration::from_millis(1000),
-            );
+            // First tick fires at `start` (immediately when no delay is set), so
+            // an existing backlog is processed right away. Thereafter this paces
+            // the fallback re-poll; the write signal (when available) wakes the
+            // loop sooner.
+            let mut interval = interval_at(start, self.poll_interval);
 
             loop {
-                interval.tick().await;
-
-                if let Some(ref rx) = self.shutdown_rx {
-                    let mut rx = rx.lock().await;
-                    if rx.try_recv().is_ok() {
-                        tracing::info!(
-                            key = self.key(),
-                            "Subscription received shutdown signal, stopping gracefully"
-                        );
-
-                        break;
+                // Wake on whichever comes first: an in-process write (when the
+                // executor exposes a signal), the fallback poll tick, or a
+                // shutdown signal. Selecting on shutdown here keeps shutdown
+                // immediate even with a long poll interval. `changed()` only
+                // resolves for write generations newer than the last seen, so it
+                // never busy-loops.
+                let mut shutdown = false;
+                {
+                    let mut shutdown_guard = match self.shutdown_rx {
+                        Some(ref rx) => Some(rx.lock().await),
+                        None => None,
+                    };
+                    match (write_watch.as_mut(), shutdown_guard.as_mut()) {
+                        (Some(rx), Some(srx)) => tokio::select! {
+                            _ = interval.tick() => {}
+                            res = rx.changed() => {
+                                if res.is_ok() {
+                                    rx.borrow_and_update();
+                                }
+                            }
+                            _ = &mut **srx => { shutdown = true; }
+                        },
+                        (Some(rx), None) => tokio::select! {
+                            _ = interval.tick() => {}
+                            res = rx.changed() => {
+                                if res.is_ok() {
+                                    rx.borrow_and_update();
+                                }
+                            }
+                        },
+                        (None, Some(srx)) => tokio::select! {
+                            _ = interval.tick() => {}
+                            _ = &mut **srx => { shutdown = true; }
+                        },
+                        (None, None) => {
+                            interval.tick().await;
+                        }
                     }
-                    drop(rx);
+                }
+
+                if shutdown {
+                    tracing::info!(
+                        key = self.key(),
+                        "Subscription received shutdown signal, stopping gracefully"
+                    );
+
+                    break;
                 }
 
                 let result = match self.retry {
