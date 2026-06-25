@@ -48,8 +48,7 @@ struct ClusterTls {
 /// Mints a fresh leaf certificate (with the shared `localhost` SAN) signed by the
 /// CA, returning its chain, private key, and leaf DER (for pinning).
 fn make_leaf(
-    ca_cert: &rcgen::Certificate,
-    ca_key: &rcgen::KeyPair,
+    issuer: &rcgen::Issuer<'_, impl rcgen::SigningKey>,
 ) -> (
     Vec<CertificateDer<'static>>,
     PrivateKeyDer<'static>,
@@ -57,7 +56,7 @@ fn make_leaf(
 ) {
     let key = rcgen::KeyPair::generate().unwrap();
     let params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
-    let cert = params.signed_by(&key, ca_cert, ca_key).unwrap();
+    let cert = params.signed_by(&key, issuer).unwrap();
     let der = cert.der().clone();
     let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
     (vec![der.clone()], key_der, der)
@@ -94,6 +93,7 @@ fn cluster_tls(n: u64) -> ClusterTls {
     let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
     ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+    let issuer = rcgen::Issuer::from_params(&ca_params, &ca_key);
 
     let mut roots = RootCertStore::empty();
     roots.add(ca_cert.der().clone()).unwrap();
@@ -102,7 +102,7 @@ fn cluster_tls(n: u64) -> ClusterTls {
     let mut nodes = Vec::new();
     let mut pins: PeerCerts = HashMap::new();
     for i in 0..n {
-        let (chain, key, der) = make_leaf(&ca_cert, &ca_key);
+        let (chain, key, der) = make_leaf(&issuer);
         pins.insert(NodeId(i), der);
         let (server, client) = configs(roots.clone(), chain, key);
         nodes.push(NodeTls {
@@ -112,7 +112,7 @@ fn cluster_tls(n: u64) -> ClusterTls {
     }
 
     // A CA-valid leaf that is NOT in the pin map — a would-be impostor.
-    let (chain, key, _der) = make_leaf(&ca_cert, &ca_key);
+    let (chain, key, _der) = make_leaf(&issuer);
     let (_s, outsider_client) = configs(roots, chain, key);
 
     ClusterTls {
