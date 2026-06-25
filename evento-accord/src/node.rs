@@ -341,6 +341,31 @@ impl Node {
         self.metrics.recoveries.load(Ordering::Relaxed)
     }
 
+    /// Locally-safe subscription watermark, in microseconds since the Unix epoch:
+    /// every committed transaction with a `t0` below this is already applied to
+    /// the local data store, and no future transaction can be assigned a `t0`
+    /// below it (future timestamps are `>= now - max_skew`, and this trails `now`
+    /// by [`compaction_margin`](NodeConfig::compaction_margin)).
+    ///
+    /// It is the same `applied_through` point the compaction sweep trusts, so a
+    /// subscription that only processes events below it cannot skip a late,
+    /// lower-cursor event applied out of order from another node — provided
+    /// propagation + clock skew stays within `compaction_margin` (the bound the
+    /// node already assumes). Exposed to [`Executor::stable_timestamp`].
+    pub fn stable_micros(&self) -> u64 {
+        let now = self.clock.now().micros;
+        let cutoff = Timestamp {
+            micros: now.saturating_sub(self.settings.compaction_margin.as_micros() as u64),
+            logical: 0,
+            node: NodeId(0),
+        };
+        self.replica
+            .lock()
+            .expect("replica poisoned")
+            .applied_through(cutoff)
+            .micros
+    }
+
     /// A point-in-time snapshot of this node's observability counters.
     pub fn metrics(&self) -> MetricsSnapshot {
         self.metrics.snapshot()

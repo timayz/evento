@@ -206,6 +206,15 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
         self.local.write_watch()
     }
 
+    fn stable_timestamp(&self) -> Option<u64> {
+        // Gate subscriptions by the node's stability watermark. Events are
+        // applied to each replica's local store in Accord's `(execute_at, txn)`
+        // order — which can differ from the subscription's wall-clock cursor —
+        // so without this gate a late, lower-cursor event applied out of order
+        // would be skipped by the forward read. See `Node::stable_micros`.
+        Some(self.node.stable_micros())
+    }
+
     async fn read(
         &self,
         aggregators: Option<Vec<EventFilter>>,

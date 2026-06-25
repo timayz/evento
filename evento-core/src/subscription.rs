@@ -406,6 +406,12 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             // immediately.
             let drained = res.edges.len() < self.chunk_size as usize;
 
+            // Stability watermark (microseconds since epoch): on a replicated
+            // backend that can apply events out of cursor order, the subscription
+            // must not advance past it, or a late lower-cursor event would be
+            // skipped. `None` (single-store backends) means no gating.
+            let stable = executor.stable_timestamp();
+
             let timestamp = executor
                 .latest_timestamp(
                     Some(aggregators.to_vec()),
@@ -419,6 +425,19 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             };
 
             for event in res.edges {
+                // Edges arrive in ascending cursor order, so the first event at or
+                // above the watermark (and every event after it) is held back: we
+                // stop without advancing the cursor and retry on the next tick,
+                // once the watermark has moved forward.
+                if let Some(w) = stable {
+                    let event_micros = (event.node.timestamp)
+                        .saturating_mul(1_000_000)
+                        .saturating_add(event.node.timestamp_subsec as u64 * 1_000);
+                    if event_micros >= w {
+                        return Ok(false);
+                    }
+                }
+
                 if let Some(ref rx) = self.shutdown_rx {
                     let mut rx = rx.lock().await;
                     if rx.try_recv().is_ok() {
