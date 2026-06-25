@@ -28,8 +28,8 @@ tokio = { workspace = true, features = ["test-util"] }
 evento-fjall = { path = "../evento-fjall" }
 tempfile = "3.27"
 rand = { workspace = true }
-rcgen = "0.13"
-criterion = "0.5"
+rcgen = "0.14"
+criterion = "0.8"
 
 [[bench]]
 name = "throughput"
