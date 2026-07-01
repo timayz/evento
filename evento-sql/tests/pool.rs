@@ -1,7 +1,7 @@
 use evento::{
     cursor::{Args, Order, ReadResult},
     sql::Reader,
-    sql_migrator::{InitMigration, M0002, M0003, M0004},
+    sql_migrator::{InitMigration, M0002, M0003, M0004, M0005},
     Event,
 };
 use evento_test::assert_read_result;
@@ -227,6 +227,7 @@ where
     M0002: sqlx_migrator::Migration<DB>,
     M0003: sqlx_migrator::Migration<DB>,
     M0004: sqlx_migrator::Migration<DB>,
+    M0005: sqlx_migrator::Migration<DB>,
     sqlx_migrator::Migrator<DB>: sqlx_migrator::migrator::DatabaseOperation<DB>,
 {
     install_default_drivers();
