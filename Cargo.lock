@@ -306,7 +306,7 @@ dependencies = [
 
 [[package]]
 name = "bank"
-version = "2.0.0-alpha.22"
+version = "2.0.0-alpha.23"
 dependencies = [
  "anyhow",
  "bitcode",
@@ -316,7 +316,7 @@ dependencies = [
 
 [[package]]
 name = "bank-axum-accord"
-version = "2.0.0-alpha.22"
+version = "2.0.0-alpha.23"
 dependencies = [
  "anyhow",
  "askama",
@@ -331,7 +331,7 @@ dependencies = [
 
 [[package]]
 name = "bank-axum-fjall"
-version = "2.0.0-alpha.22"
+version = "2.0.0-alpha.23"
 dependencies = [
  "anyhow",
  "askama",
@@ -346,7 +346,7 @@ dependencies = [
 
 [[package]]
 name = "bank-axum-sqlite"
-version = "2.0.0-alpha.22"
+version = "2.0.0-alpha.23"
 dependencies = [
  "anyhow",
  "askama",
@@ -1011,7 +1011,7 @@ dependencies = [
 
 [[package]]
 name = "evento"
-version = "2.0.0-alpha.22"
+version = "2.0.0-alpha.23"
 dependencies = [
  "anyhow",
  "bitcode",
@@ -1024,7 +1024,7 @@ dependencies = [
 
 [[package]]
 name = "evento-accord"
-version = "2.0.0-alpha.22"
+version = "2.0.0-alpha.23"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1047,7 +1047,7 @@ dependencies = [
 
 [[package]]
 name = "evento-core"
-version = "2.0.0-alpha.22"
+version = "2.0.0-alpha.23"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1068,7 +1068,7 @@ dependencies = [
 
 [[package]]
 name = "evento-fjall"
-version = "2.0.0-alpha.22"
+version = "2.0.0-alpha.23"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1084,7 +1084,7 @@ dependencies = [
 
 [[package]]
 name = "evento-macro"
-version = "2.0.0-alpha.22"
+version = "2.0.0-alpha.23"
 dependencies = [
  "convert_case",
  "quote",
@@ -1093,7 +1093,7 @@ dependencies = [
 
 [[package]]
 name = "evento-sql"
-version = "2.0.0-alpha.22"
+version = "2.0.0-alpha.23"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1113,7 +1113,7 @@ dependencies = [
 
 [[package]]
 name = "evento-sql-migrator"
-version = "2.0.0-alpha.22"
+version = "2.0.0-alpha.23"
 dependencies = [
  "async-trait",
  "evento-sql",
@@ -1125,7 +1125,7 @@ dependencies = [
 
 [[package]]
 name = "evento-test"
-version = "2.0.0-alpha.22"
+version = "2.0.0-alpha.23"
 dependencies = [
  "anyhow",
  "bank",
@@ -1675,7 +1675,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jepsen-node"
-version = "2.0.0-alpha.22"
+version = "2.0.0-alpha.23"
 dependencies = [
  "anyhow",
  "axum",
