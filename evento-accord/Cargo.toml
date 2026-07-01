@@ -1,6 +1,6 @@
 [package]
 name = "evento-accord"
-version = "2.0.0-alpha.21"
+version = "2.0.0-alpha.22"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -10,7 +10,7 @@ documentation = "https://docs.rs/evento-accord"
 readme = "README.md"
 
 [dependencies]
-evento-core = { path = "../evento-core", version = "2.0.0-alpha.21" }
+evento-core = { path = "../evento-core", version = "2.0.0-alpha.22" }
 anyhow.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
