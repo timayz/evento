@@ -462,22 +462,25 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
         let read_aggregators = self
             .handlers
             .values()
-            .map(|h| match aggregators.get(h.aggregate_type()) {
-                Some(id) => EventFilter {
+            .map(|h| {
+                // Scope each handler to one id: the id registered via
+                // `.aggregate::<S>(id)` when present, otherwise auto-key to the
+                // primary id (co-keyed by default). In subscription mode the
+                // primary id is the event's aggregate id, so co-keyed secondary
+                // aggregates are scoped correctly with no explicit registration.
+                let aggregate_id = aggregators
+                    .get(h.aggregate_type())
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| id.to_owned());
+
+                EventFilter {
                     aggregate_type: h.aggregate_type().to_owned(),
-                    aggregate_id: Some(id.to_owned()),
+                    aggregate_id: Some(aggregate_id),
                     name: if self.safety_disabled {
                         Some(h.event_name().to_owned())
                     } else {
                         None
                     },
-                },
-                _ => {
-                    if self.safety_disabled {
-                        EventFilter::by_event(h.aggregate_type(), h.event_name())
-                    } else {
-                        EventFilter::by_type(h.aggregate_type())
-                    }
                 }
             })
             .collect::<Vec<_>>();
@@ -528,6 +531,11 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
 /// Created via [`Projection::load`]. Allows registering related aggregates
 /// whose events also feed this projection, then [`LoadBuilder::execute`] runs
 /// the load.
+///
+/// A handler's aggregate type defaults to **co-keyed** with the loaded id: its
+/// events are read scoped to that same id. Register a secondary aggregate with
+/// [`LoadBuilder::aggregate`] (or [`LoadBuilder::aggregate_raw`]) only when it
+/// uses a different id.
 pub struct LoadBuilder<E: Executor, P: Default + 'static> {
     projection: Projection<E, P>,
     id: String,
@@ -569,6 +577,26 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> LoadBuilder<E, P> {
 /// Created via [`Projection::subscription`]. On each incoming event, the
 /// subscription loads the affected aggregate id through the projection,
 /// which in turn re-runs handlers and persists the snapshot.
+///
+/// # Multi-aggregate projections (co-keying)
+///
+/// Unlike [`LoadBuilder`], a subscription has no per-call related-aggregate
+/// ids to work with — it only knows the id of the event that woke it. So every
+/// **secondary** aggregate a handler targets (any aggregate type other than the
+/// primary passed to [`Projection::new`]) is treated as **co-keyed**: assumed
+/// to share the primary aggregate's id. Concretely:
+///
+/// - The worker also wakes on secondary-aggregate events (not just primary
+///   ones), so a change to a co-keyed aggregate re-projects the row.
+/// - When reloading, each secondary aggregate is scoped to the woken
+///   `event.aggregate_id`, exactly as if you had called
+///   `.aggregate::<Secondary>(event.aggregate_id)` in load mode.
+///
+/// **Limitation:** if a secondary aggregate does *not* share the primary's id,
+/// its events won't be found under that id and won't be applied by the
+/// subscription. For that case, rebuild on demand with
+/// [`LoadBuilder::aggregate`] (which takes the real secondary id) or drive a
+/// manual [`SubscriptionBuilder`] that resolves the mapping itself.
 pub struct ProjectionSubscription<E: Executor, P: Default + 'static> {
     projection: Projection<E, P>,
     key: String,
@@ -634,6 +662,22 @@ where
     ///
     /// Returns a [`Subscription`] handle that can be used for graceful shutdown.
     pub async fn start(self, executor: &E) -> anyhow::Result<Subscription> {
+        self.into_builder().start(executor).await
+    }
+
+    /// Processes every currently-available event once, then returns.
+    ///
+    /// Runs a single drain pass without spawning a background worker. Useful
+    /// for tests and one-shot rebuilds; [`start`](Self::start) is the normal
+    /// entry point for a long-running subscription.
+    pub async fn run_once(self, executor: &E) -> anyhow::Result<()> {
+        let mut builder = self.into_builder();
+        builder.run_once(executor).await
+    }
+
+    /// Assembles the underlying [`SubscriptionBuilder`] shared by
+    /// [`start`](Self::start) and [`run_once`](Self::run_once).
+    fn into_builder(self) -> SubscriptionBuilder<E> {
         let ProjectionSubscription {
             projection,
             key,
@@ -644,23 +688,24 @@ where
             continue_on_error,
         } = self;
 
-        let aggregate_type: &'static str = projection.aggregate_type;
         let tombstone = projection.tombstone;
-        // Capture the event names registered for the primary aggregator type.
-        // Each event_name is &'static str because Handler::event_name returns
-        // &'static str (always derived from the `#[evento::handler]` macro).
-        // Drop any handler that collides with the tombstone — that event is
-        // routed to ProjectionTombstoneHandler instead.
-        let event_names: Vec<&'static str> = projection
+
+        // One auto-handler per registered event, across the primary *and* any
+        // co-keyed secondary aggregate, so the worker wakes on secondary events
+        // too (not just the primary's). Each event_name is &'static str
+        // (Handler::event_name always derives from the `#[evento::handler]`
+        // macro). Drop any handler that collides with the tombstone — that event
+        // routes to ProjectionTombstoneHandler. Secondary aggregates are scoped
+        // by `load_aggregator`, which auto-keys them to the event's id.
+        let specs: Vec<(&'static str, &'static str)> = projection
             .handlers
             .values()
-            .filter(|h| h.aggregate_type() == aggregate_type)
             .filter(|h| {
                 tombstone
                     .map(|(t, e)| !(h.aggregate_type() == t && h.event_name() == e))
                     .unwrap_or(true)
             })
-            .map(|h| h.event_name())
+            .map(|h| (h.aggregate_type(), h.event_name()))
             .collect();
 
         let projection = Arc::new(projection);
@@ -674,7 +719,7 @@ where
         builder = builder.chunk_size(chunk_size);
         builder = match retry {
             Some(n) => builder.retry(n),
-            None => builder,
+            None => builder.no_retry(),
         };
         if let Some(d) = delay {
             builder = builder.delay(d);
@@ -683,10 +728,10 @@ where
             builder = builder.continue_on_error();
         }
 
-        for event_name in event_names {
+        for (spec_type, event_name) in specs {
             builder = builder.handler(ProjectionAutoHandler::<E, P> {
                 projection: projection.clone(),
-                aggregate_type,
+                aggregate_type: spec_type,
                 event_name,
                 _marker: PhantomData,
             });
@@ -701,11 +746,7 @@ where
             });
         }
 
-        if retry.is_none() {
-            builder.no_retry().start(executor).await
-        } else {
-            builder.start(executor).await
-        }
+        builder
     }
 }
 
@@ -727,6 +768,8 @@ where
         event: &'a crate::Event,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>> {
         Box::pin(async move {
+            // `load_aggregator` auto-keys every co-keyed secondary aggregate to
+            // this event's id, so no extra aggregators need to be supplied here.
             self.projection
                 .load_aggregator(context.executor, &event.aggregate_id, &HashMap::new())
                 .await?;
