@@ -1,6 +1,6 @@
 [package]
 name = "bank-axum-fjall"
-version = "2.0.0-alpha.23"
+version = "2.0.0-alpha.24"
 edition = "2021"
 
 [dependencies]

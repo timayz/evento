@@ -1,6 +1,6 @@
 [package]
 name = "evento-sql"
-version = "2.0.0-alpha.23"
+version = "2.0.0-alpha.24"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -10,7 +10,7 @@ documentation = "https://docs.rs/evento-sql"
 readme = "README.md"
 
 [dependencies]
-evento-core = { path = "../evento-core", version = "2.0.0-alpha.23" }
+evento-core = { path = "../evento-core", version = "2.0.0-alpha.24" }
 anyhow.workspace = true
 bitcode.workspace = true
 async-trait.workspace = true
@@ -19,7 +19,7 @@ sqlx.workspace = true
 sea-query.workspace = true
 sea-query-sqlx.workspace = true
 tokio.workspace = true
-evento-accord = { path = "../evento-accord", version = "2.0.0-alpha.23", optional = true }
+evento-accord = { path = "../evento-accord", version = "2.0.0-alpha.24", optional = true }
 
 [dev-dependencies]
 evento = { workspace = true, features = ["sql"] }
