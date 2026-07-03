@@ -74,6 +74,20 @@ async fn postgres_subscribe_multiple_aggregator() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn postgres_subscribe_co_keyed_aggregator() -> anyhow::Result<()> {
+    let pool = create_postgres_pool("subscribe_co_keyed_aggregator").await?;
+
+    evento_test::subscribe_co_keyed_aggregator::<Sql<sqlx::Postgres>>(&pool.into()).await
+}
+
+#[tokio::test]
+async fn postgres_load_co_keyed_aggregator() -> anyhow::Result<()> {
+    let pool = create_postgres_pool("load_co_keyed_aggregator").await?;
+
+    evento_test::load_co_keyed_aggregator::<Sql<sqlx::Postgres>>(&pool.into()).await
+}
+
+#[tokio::test]
 async fn postgres_subscribe_routing_key_multiple_aggregator() -> anyhow::Result<()> {
     let pool = create_postgres_pool("subscribe_routing_key_multiple_aggregator").await?;
 

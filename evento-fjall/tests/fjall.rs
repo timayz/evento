@@ -78,6 +78,18 @@ async fn fjall_subscribe_multiple_aggregator() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn fjall_subscribe_co_keyed_aggregator() -> anyhow::Result<()> {
+    let (executor, _temp_dir) = create_fjall_executor("subscribe_co_keyed_aggregator")?;
+    evento_test::subscribe_co_keyed_aggregator(&executor).await
+}
+
+#[tokio::test]
+async fn fjall_load_co_keyed_aggregator() -> anyhow::Result<()> {
+    let (executor, _temp_dir) = create_fjall_executor("load_co_keyed_aggregator")?;
+    evento_test::load_co_keyed_aggregator(&executor).await
+}
+
+#[tokio::test]
 async fn fjall_subscribe_routing_key_multiple_aggregator() -> anyhow::Result<()> {
     let (executor, _temp_dir) = create_fjall_executor("subscribe_routing_key_multiple_aggregator")?;
     evento_test::subscribe_routing_key_multiple_aggregator(&executor).await

@@ -90,6 +90,20 @@ async fn sqlite_subscribe_multiple_aggregator() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn sqlite_subscribe_co_keyed_aggregator() -> anyhow::Result<()> {
+    let pool = create_sqlite_pool("subscribe_co_keyed_aggregator").await?;
+
+    evento_test::subscribe_co_keyed_aggregator::<Sql<sqlx::Sqlite>>(&pool.into()).await
+}
+
+#[tokio::test]
+async fn sqlite_load_co_keyed_aggregator() -> anyhow::Result<()> {
+    let pool = create_sqlite_pool("load_co_keyed_aggregator").await?;
+
+    evento_test::load_co_keyed_aggregator::<Sql<sqlx::Sqlite>>(&pool.into()).await
+}
+
+#[tokio::test]
 async fn sqlite_subscribe_routing_key_multiple_aggregator() -> anyhow::Result<()> {
     let pool = create_sqlite_pool("subscribe_routing_key_multiple_aggregator").await?;
 
@@ -193,6 +207,20 @@ async fn rw_sqlite_subscribe_multiple_aggregator() -> anyhow::Result<()> {
     let pool = create_rw_sqlite_pool("subscribe_multiple_aggregator").await?;
 
     evento_test::subscribe_multiple_aggregator::<RwSqlite>(&rw_from_pools(pool)).await
+}
+
+#[tokio::test]
+async fn rw_sqlite_subscribe_co_keyed_aggregator() -> anyhow::Result<()> {
+    let pool = create_rw_sqlite_pool("subscribe_co_keyed_aggregator").await?;
+
+    evento_test::subscribe_co_keyed_aggregator::<RwSqlite>(&rw_from_pools(pool)).await
+}
+
+#[tokio::test]
+async fn rw_sqlite_load_co_keyed_aggregator() -> anyhow::Result<()> {
+    let pool = create_rw_sqlite_pool("load_co_keyed_aggregator").await?;
+
+    evento_test::load_co_keyed_aggregator::<RwSqlite>(&rw_from_pools(pool)).await
 }
 
 #[tokio::test]

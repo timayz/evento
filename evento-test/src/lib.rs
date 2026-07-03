@@ -1091,6 +1091,182 @@ pub async fn subscribe_multiple_aggregator<E: Executor + Clone>(
     Ok(())
 }
 
+/// A `Projection` whose handlers span the primary (`BankAccount`) and a
+/// **co-keyed** secondary (`Owner`) aggregate — one whose events share the
+/// primary's id. In subscription mode the worker must wake on the secondary's
+/// events and scope them to `event.aggregate_id`; without that, an `Owner`
+/// handler would read every `NameChanged` in the store and smear the last one
+/// into every row.
+mod co_keyed {
+    use std::{collections::HashMap, sync::RwLock};
+
+    use bank::aggregator::{AccountOpened, BankAccount, NameChanged};
+    use evento::{metadata::Event, projection::Projection, Executor};
+    use once_cell::sync::Lazy;
+
+    // aggregate_id -> owner_name, written by the Owner handler as a subscription
+    // applies co-keyed `NameChanged` events. Keyed by the unique account id so
+    // concurrent backend tests don't collide.
+    pub static ROWS: Lazy<RwLock<HashMap<String, String>>> = Lazy::new(Default::default);
+
+    #[evento::projection(bitcode::Encode, bitcode::Decode)]
+    pub struct View {
+        pub id: String,
+        pub owner_name: String,
+    }
+
+    // Sets identity only — deliberately does not touch `owner_name`, so the
+    // co-keyed `NameChanged` is its sole writer and the result is independent of
+    // the order the two co-keyed events (same id, both version 1) replay in.
+    #[evento::handler]
+    async fn on_account_opened(event: Event<AccountOpened>, view: &mut View) -> anyhow::Result<()> {
+        view.id = event.aggregate_id.to_owned();
+        Ok(())
+    }
+
+    #[evento::handler]
+    async fn on_owner_name_changed(
+        event: Event<NameChanged>,
+        view: &mut View,
+    ) -> anyhow::Result<()> {
+        view.owner_name = event.data.value.to_owned();
+        ROWS.write()
+            .unwrap()
+            .insert(event.aggregate_id.to_owned(), event.data.value);
+        Ok(())
+    }
+
+    pub fn projection<E: Executor>() -> Projection<E, View> {
+        Projection::new::<BankAccount>()
+            .handler(on_account_opened())
+            .handler(on_owner_name_changed())
+    }
+}
+
+/// A projection subscription over a co-keyed secondary aggregate must scope that
+/// aggregate to each event's id — not read every instance of its type.
+pub async fn subscribe_co_keyed_aggregator<E: Executor + Clone>(
+    executor: &E,
+) -> anyhow::Result<()> {
+    let cmd = bank::Command(executor.clone());
+
+    // Two accounts, each with an `Owner` stream co-keyed under the account's own
+    // id (append the Owner `NameChanged` to the account id). Versions are tracked
+    // per (aggregate_type, id), so this is independent of the account's version.
+    let account_a = cmd
+        .open_account(OpenAccount {
+            owner_id: Ulid::new().to_string(),
+            owner_name: "A-at-open".to_owned(),
+            account_type: AccountType::Checking,
+            currency: "USD".to_owned(),
+            initial_balance: 1000,
+        })
+        .await?;
+    evento::append(&account_a)
+        .event(&NameChanged {
+            value: "Alice".to_owned(),
+        })
+        .commit(executor)
+        .await?;
+
+    let account_b = cmd
+        .open_account(OpenAccount {
+            owner_id: Ulid::new().to_string(),
+            owner_name: "B-at-open".to_owned(),
+            account_type: AccountType::Checking,
+            currency: "USD".to_owned(),
+            initial_balance: 2000,
+        })
+        .await?;
+    evento::append(&account_b)
+        .event(&NameChanged {
+            value: "Bob".to_owned(),
+        })
+        .commit(executor)
+        .await?;
+
+    // Co-keying is automatic: no `.aggregate::<Owner>()` call needed.
+    co_keyed::projection()
+        .subscription("co-keyed")
+        .all()
+        .no_retry()
+        .run_once(executor)
+        .await?;
+
+    // Copy the values out and drop the lock before asserting, so a failing
+    // assert can't poison the shared lock for other concurrent tests.
+    let (a, b) = {
+        let rows = co_keyed::ROWS.read().unwrap();
+        (rows.get(&account_a).cloned(), rows.get(&account_b).cloned())
+    };
+    assert_eq!(
+        a.as_deref(),
+        Some("Alice"),
+        "account A must get its own co-keyed owner name"
+    );
+    assert_eq!(
+        b.as_deref(),
+        Some("Bob"),
+        "co-keyed Owner must be scoped per id, not smeared across every account"
+    );
+
+    Ok(())
+}
+
+/// `.load()` auto-keys a secondary aggregate to the loaded id when it is not
+/// registered with `.aggregate::<S>(id)` — scoping its events to that id rather
+/// than reading every instance of the type.
+pub async fn load_co_keyed_aggregator<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
+    let cmd = bank::Command(executor.clone());
+
+    let account_a = cmd
+        .open_account(OpenAccount {
+            owner_id: Ulid::new().to_string(),
+            owner_name: "A-at-open".to_owned(),
+            account_type: AccountType::Checking,
+            currency: "USD".to_owned(),
+            initial_balance: 1000,
+        })
+        .await?;
+    evento::append(&account_a)
+        .event(&NameChanged {
+            value: "Alice".to_owned(),
+        })
+        .commit(executor)
+        .await?;
+
+    // A second account with its own co-keyed Owner rename — it must not leak
+    // into account A's view.
+    let account_b = cmd
+        .open_account(OpenAccount {
+            owner_id: Ulid::new().to_string(),
+            owner_name: "B-at-open".to_owned(),
+            account_type: AccountType::Checking,
+            currency: "USD".to_owned(),
+            initial_balance: 2000,
+        })
+        .await?;
+    evento::append(&account_b)
+        .event(&NameChanged {
+            value: "Bob".to_owned(),
+        })
+        .commit(executor)
+        .await?;
+
+    // No `.aggregate::<Owner>(..)`: the Owner handler auto-keys to `account_a`.
+    let view = co_keyed::projection()
+        .load(&account_a)
+        .execute(executor)
+        .await?
+        .expect("account A view");
+    assert_eq!(
+        view.owner_name, "Alice",
+        "unregistered secondary must auto-key to the loaded id, not read every instance"
+    );
+
+    Ok(())
+}
+
 pub async fn subscribe_routing_key_multiple_aggregator<E: Executor + Clone>(
     executor: &E,
 ) -> anyhow::Result<()> {

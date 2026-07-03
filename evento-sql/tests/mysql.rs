@@ -85,6 +85,20 @@ async fn mysql_subscribe_multiple_aggregator() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn mysql_subscribe_co_keyed_aggregator() -> anyhow::Result<()> {
+    let pool = create_mysql_pool("subscribe_co_keyed_aggregator").await?;
+
+    evento_test::subscribe_co_keyed_aggregator::<Sql<sqlx::MySql>>(&pool.into()).await
+}
+
+#[tokio::test]
+async fn mysql_load_co_keyed_aggregator() -> anyhow::Result<()> {
+    let pool = create_mysql_pool("load_co_keyed_aggregator").await?;
+
+    evento_test::load_co_keyed_aggregator::<Sql<sqlx::MySql>>(&pool.into()).await
+}
+
+#[tokio::test]
 async fn mysql_subscribe_routing_key_multiple_aggregator() -> anyhow::Result<()> {
     let pool = create_mysql_pool("subscribe_routing_key_multiple_aggregator").await?;
 
