@@ -1985,7 +1985,7 @@ mod multiple {
         event: Event<NameChanged>,
     ) -> anyhow::Result<()> {
         let mut rows = ROWS.write().unwrap();
-        for (_, row) in rows.iter_mut() {
+        for row in rows.values_mut() {
             if row.owner_id == event.aggregate_id {
                 row.owner_name = event.data.value.to_owned();
             }
