@@ -1318,7 +1318,7 @@ impl Node {
                 .filter(|(from, _)| p.electorate.contains(from))
                 .count()
         };
-        let pre = self
+        let mut pre = self
             .collect_by_shard_tagged(
                 &mut rx,
                 &plans,
@@ -1332,6 +1332,35 @@ impl Node {
                 },
             )
             .await;
+        // The fast-path window may close before a slow quorum has witnessed the
+        // txn (e.g. cold connections at startup, where the first handshake
+        // outlasts `fast_timeout`). Keep collecting up to the slow-path budget
+        // so a simple majority can still carry the write down the slow path.
+        if plans.iter().any(|p| pre[&p.shard].len() < p.slow_q) {
+            let remaining: HashMap<ShardId, usize> = plans
+                .iter()
+                .map(|p| (p.shard, p.slow_q.saturating_sub(pre[&p.shard].len())))
+                .collect();
+            let more = self
+                .collect_by_shard_tagged(
+                    &mut rx,
+                    &plans,
+                    |p, got| got.len() >= remaining[&p.shard],
+                    Self::after(self.settings.collect_timeout),
+                    |m| match m {
+                        Message::PreAcceptOk {
+                            execute_at, deps, ..
+                        } => Some((execute_at, deps)),
+                        _ => None,
+                    },
+                )
+                .await;
+            for (shard, mut items) in more {
+                if let Some(bucket) = pre.get_mut(&shard) {
+                    bucket.append(&mut items);
+                }
+            }
+        }
         for plan in &plans {
             if pre[&plan.shard].len() < plan.slow_q {
                 self.deregister(txn);
