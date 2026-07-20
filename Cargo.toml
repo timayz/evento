@@ -60,7 +60,7 @@ fjall = "3.1"
 # Proc macro
 quote = "1.0"
 convert_case = "0.11"
-syn = { version = "2.0.117", features = ["full", "parsing", "extra-traits"] }
+syn = { version = "3.0.0", features = ["full", "parsing", "extra-traits"] }
 
 # Web
 axum = "0.8"
