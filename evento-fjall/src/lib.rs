@@ -749,7 +749,7 @@ mod tests {
     fn create_test_event(aggregate_id: &str, version: u16, name: &str) -> Event {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
         Event {
-            id: Ulid::new(),
+            id: Ulid::generate(),
             aggregate_id: aggregate_id.to_string(),
             aggregate_type: "test/Account".to_string(),
             version,
@@ -809,7 +809,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let executor = Fjall::open(temp_dir.path()).unwrap();
 
-        let worker_id = Ulid::new();
+        let worker_id = Ulid::generate();
         let key = "test-subscriber".to_string();
 
         // Create subscriber

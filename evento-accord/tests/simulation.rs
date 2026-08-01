@@ -198,7 +198,7 @@ impl Sim {
 
 /// Builds an event with a *deterministic* id derived from `seq` (a per-scenario
 /// counter), so a given seed produces byte-identical events run to run — the
-/// random `Ulid::new()` would otherwise defeat reproducibility. Distinct events
+/// random `Ulid::generate()` would otherwise defeat reproducibility. Distinct events
 /// still get distinct ids because the counter is monotonic and, under the
 /// deterministic runtime, advances in a reproducible order.
 fn event(aggregate_id: &str, version: u16, seq: u64) -> Event {

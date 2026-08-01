@@ -109,7 +109,7 @@ impl Metadata {
 impl Default for Metadata {
     fn default() -> Self {
         Self {
-            id: Ulid::new().to_string(),
+            id: Ulid::generate().to_string(),
             meta: Default::default(),
         }
     }

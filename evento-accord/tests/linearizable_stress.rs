@@ -112,7 +112,7 @@ async fn read_len(exec: &AccordExecutor<Fjall>, key: &str) -> Option<usize> {
 
 fn event(key: &str, version: u16, value: u64) -> Event {
     Event {
-        id: Ulid::new(),
+        id: Ulid::generate(),
         aggregate_type: "lin/Reg".into(),
         aggregate_id: key.into(),
         version,

@@ -265,7 +265,7 @@ impl WriteBuilder {
 
         for (version, (name, data)) in (self.original_version + 1..).zip(&self.data) {
             let event = Event {
-                id: Ulid::new(),
+                id: Ulid::generate(),
                 name: name.to_string(),
                 data: data.to_vec(),
                 metadata: self.metadata.clone(),
@@ -301,7 +301,7 @@ impl WriteBuilder {
 ///     .await?;
 /// ```
 pub fn create() -> WriteBuilder {
-    WriteBuilder::new(Ulid::new())
+    WriteBuilder::new(Ulid::generate())
 }
 
 /// Creates a builder for an existing aggregate.

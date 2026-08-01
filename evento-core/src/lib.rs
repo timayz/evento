@@ -300,7 +300,7 @@ mod tests {
 
     fn event_at(timestamp: u64, timestamp_subsec: u32) -> Event {
         Event {
-            id: Ulid::new(),
+            id: Ulid::generate(),
             timestamp,
             timestamp_subsec,
             ..Default::default()

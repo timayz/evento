@@ -17,7 +17,7 @@ use evento_core::Event;
 
 fn event(aggregate_id: &str, version: u16) -> Event {
     Event {
-        id: ulid::Ulid::new(),
+        id: ulid::Ulid::generate(),
         aggregate_type: "test/Account".into(),
         aggregate_id: aggregate_id.into(),
         version,

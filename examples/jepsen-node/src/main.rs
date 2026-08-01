@@ -300,7 +300,7 @@ fn append_event(key: &str, version: u16, value: i64) -> Event {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     Event {
-        id: Ulid::new(),
+        id: Ulid::generate(),
         aggregate_id: key.to_string(),
         aggregate_type: AGGREGATE_TYPE.to_string(),
         version,

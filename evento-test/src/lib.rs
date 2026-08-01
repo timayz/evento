@@ -77,7 +77,7 @@ pub async fn load<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
         &john_id,
         DepositMoney {
             amount: 250,
-            transaction_id: Ulid::new().to_string(),
+            transaction_id: Ulid::generate().to_string(),
             description: "Salary deposit".to_owned(),
         },
     )
@@ -93,7 +93,7 @@ pub async fn load<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
     assert_eq!(john.aggregate_version()?, 2);
 
     // Transfer money from John to Jane
-    let transaction_id = Ulid::new().to_string();
+    let transaction_id = Ulid::generate().to_string();
 
     cmd.transfer_money(
         &john_id,
@@ -176,7 +176,7 @@ pub async fn routing_key<E: Executor + Clone>(executor: &E) -> anyhow::Result<()
         &account_id,
         DepositMoney {
             amount: 500,
-            transaction_id: Ulid::new().to_string(),
+            transaction_id: Ulid::generate().to_string(),
             description: "Deposit".to_owned(),
         },
     )
@@ -239,7 +239,7 @@ pub async fn routing_key<E: Executor + Clone>(executor: &E) -> anyhow::Result<()
         &account3_id,
         DepositMoney {
             amount: 100,
-            transaction_id: Ulid::new().to_string(),
+            transaction_id: Ulid::generate().to_string(),
             description: "Small deposit".to_owned(),
         },
     )
@@ -294,7 +294,7 @@ pub async fn load_multiple_aggregator<E: Executor + Clone>(executor: &E) -> anyh
         &account_id,
         DepositMoney {
             amount: 500,
-            transaction_id: Ulid::new().to_string(),
+            transaction_id: Ulid::generate().to_string(),
             description: "Deposit".to_owned(),
         },
     )
@@ -343,7 +343,7 @@ pub async fn load_with_snapshot<E: Executor + Clone>(executor: &E) -> anyhow::Re
         &account_id,
         DepositMoney {
             amount: 200,
-            transaction_id: Ulid::new().to_string(),
+            transaction_id: Ulid::generate().to_string(),
             description: "Deposit 1".to_owned(),
         },
     )
@@ -355,7 +355,7 @@ pub async fn load_with_snapshot<E: Executor + Clone>(executor: &E) -> anyhow::Re
         &account_id,
         DepositMoney {
             amount: 300,
-            transaction_id: Ulid::new().to_string(),
+            transaction_id: Ulid::generate().to_string(),
             description: "Deposit 2".to_owned(),
         },
     )
@@ -431,7 +431,7 @@ pub async fn invalid_original_version<E: Executor + Clone>(executor: &E) -> anyh
         &account_id,
         DepositMoney {
             amount: 100,
-            transaction_id: Ulid::new().to_string(),
+            transaction_id: Ulid::generate().to_string(),
             description: "First deposit".to_owned(),
         },
     )
@@ -448,7 +448,7 @@ pub async fn invalid_original_version<E: Executor + Clone>(executor: &E) -> anyh
         .original_version(1) // stale version
         .event(&MoneyDeposited {
             amount: 200,
-            transaction_id: Ulid::new().to_string(),
+            transaction_id: Ulid::generate().to_string(),
             description: "Second deposit (should fail)".to_owned(),
         })
         .commit(executor)
@@ -519,13 +519,13 @@ pub async fn subscribe<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> 
         &alice_id,
         DepositMoney {
             amount: 200,
-            transaction_id: Ulid::new().to_string(),
+            transaction_id: Ulid::generate().to_string(),
             description: "Deposit".to_owned(),
         },
     )
     .await?;
 
-    let transaction_id = Ulid::new().to_string();
+    let transaction_id = Ulid::generate().to_string();
     cmd.transfer_money(
         &alice_id,
         TransferMoney {
@@ -684,7 +684,7 @@ pub async fn subscribe_routing_key<E: Executor + Clone>(executor: &E) -> anyhow:
         &us_account_id,
         DepositMoney {
             amount: 500,
-            transaction_id: Ulid::new().to_string(),
+            transaction_id: Ulid::generate().to_string(),
             description: "US deposit".to_owned(),
         },
     )
@@ -694,7 +694,7 @@ pub async fn subscribe_routing_key<E: Executor + Clone>(executor: &E) -> anyhow:
         &eu_account_id,
         DepositMoney {
             amount: 300,
-            transaction_id: Ulid::new().to_string(),
+            transaction_id: Ulid::generate().to_string(),
             description: "EU deposit".to_owned(),
         },
     )
@@ -785,7 +785,7 @@ pub async fn subscribe_default<E: Executor + Clone>(executor: &E) -> anyhow::Res
         &default_account_id,
         DepositMoney {
             amount: 500,
-            transaction_id: Ulid::new().to_string(),
+            transaction_id: Ulid::generate().to_string(),
             description: "Default deposit".to_owned(),
         },
     )
@@ -795,7 +795,7 @@ pub async fn subscribe_default<E: Executor + Clone>(executor: &E) -> anyhow::Res
         &routed_account_id,
         DepositMoney {
             amount: 300,
-            transaction_id: Ulid::new().to_string(),
+            transaction_id: Ulid::generate().to_string(),
             description: "Routed deposit".to_owned(),
         },
     )
@@ -1051,7 +1051,7 @@ pub async fn subscribe_multiple_aggregator<E: Executor + Clone>(
         &account_id,
         DepositMoney {
             amount: 500,
-            transaction_id: Ulid::new().to_string(),
+            transaction_id: Ulid::generate().to_string(),
             description: "Deposit".to_owned(),
         },
     )
@@ -1155,7 +1155,7 @@ pub async fn subscribe_co_keyed_aggregator<E: Executor + Clone>(
     // per (aggregate_type, id), so this is independent of the account's version.
     let account_a = cmd
         .open_account(OpenAccount {
-            owner_id: Ulid::new().to_string(),
+            owner_id: Ulid::generate().to_string(),
             owner_name: "A-at-open".to_owned(),
             account_type: AccountType::Checking,
             currency: "USD".to_owned(),
@@ -1171,7 +1171,7 @@ pub async fn subscribe_co_keyed_aggregator<E: Executor + Clone>(
 
     let account_b = cmd
         .open_account(OpenAccount {
-            owner_id: Ulid::new().to_string(),
+            owner_id: Ulid::generate().to_string(),
             owner_name: "B-at-open".to_owned(),
             account_type: AccountType::Checking,
             currency: "USD".to_owned(),
@@ -1221,7 +1221,7 @@ pub async fn load_co_keyed_aggregator<E: Executor + Clone>(executor: &E) -> anyh
 
     let account_a = cmd
         .open_account(OpenAccount {
-            owner_id: Ulid::new().to_string(),
+            owner_id: Ulid::generate().to_string(),
             owner_name: "A-at-open".to_owned(),
             account_type: AccountType::Checking,
             currency: "USD".to_owned(),
@@ -1239,7 +1239,7 @@ pub async fn load_co_keyed_aggregator<E: Executor + Clone>(executor: &E) -> anyh
     // into account A's view.
     let account_b = cmd
         .open_account(OpenAccount {
-            owner_id: Ulid::new().to_string(),
+            owner_id: Ulid::generate().to_string(),
             owner_name: "B-at-open".to_owned(),
             account_type: AccountType::Checking,
             currency: "USD".to_owned(),
@@ -1570,7 +1570,7 @@ pub async fn all_commands<E: Executor + Clone>(executor: &E) -> anyhow::Result<(
         &account_a_id,
         DepositMoney {
             amount: 2500,
-            transaction_id: Ulid::new().to_string(),
+            transaction_id: Ulid::generate().to_string(),
             description: "Salary deposit".to_owned(),
         },
     )
@@ -1591,7 +1591,7 @@ pub async fn all_commands<E: Executor + Clone>(executor: &E) -> anyhow::Result<(
         &account_a_id,
         WithdrawMoney {
             amount: 500,
-            transaction_id: Ulid::new().to_string(),
+            transaction_id: Ulid::generate().to_string(),
             description: "ATM withdrawal".to_owned(),
         },
     )
@@ -1622,7 +1622,7 @@ pub async fn all_commands<E: Executor + Clone>(executor: &E) -> anyhow::Result<(
     // 5. TransferMoney / ReceiveMoney
     // =========================================================================
 
-    let transfer_tx_id = Ulid::new().to_string();
+    let transfer_tx_id = Ulid::generate().to_string();
 
     // Alice transfers to Bob
     cmd.transfer_money(
@@ -1688,7 +1688,7 @@ pub async fn all_commands<E: Executor + Clone>(executor: &E) -> anyhow::Result<(
             &account_a_id,
             WithdrawMoney {
                 amount: 100,
-                transaction_id: Ulid::new().to_string(),
+                transaction_id: Ulid::generate().to_string(),
                 description: "Should fail".to_owned(),
             },
         )
@@ -1720,7 +1720,7 @@ pub async fn all_commands<E: Executor + Clone>(executor: &E) -> anyhow::Result<(
         &account_a_id,
         WithdrawMoney {
             amount: 5000,
-            transaction_id: Ulid::new().to_string(),
+            transaction_id: Ulid::generate().to_string(),
             description: "Final withdrawal before closure".to_owned(),
         },
     )
@@ -1755,7 +1755,7 @@ pub async fn all_commands<E: Executor + Clone>(executor: &E) -> anyhow::Result<(
             &account_a_id,
             DepositMoney {
                 amount: 100,
-                transaction_id: Ulid::new().to_string(),
+                transaction_id: Ulid::generate().to_string(),
                 description: "Should fail".to_owned(),
             },
         )
@@ -2003,8 +2003,8 @@ mod multiple {
 pub async fn read_order_timestamp<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
     let agg_type = "evento/OrderTest";
     let mk = |t: u64, s: u32| Event {
-        id: Ulid::new(),
-        aggregate_id: Ulid::new().to_string(),
+        id: Ulid::generate(),
+        aggregate_id: Ulid::generate().to_string(),
         aggregate_type: agg_type.to_owned(),
         version: 1,
         name: "Tick".to_owned(),
@@ -2056,9 +2056,9 @@ pub async fn read_order_timestamp<E: Executor + Clone>(executor: &E) -> anyhow::
 /// for the given aggregate. This exercises Fjall's `agg_name_index` fast path.
 pub async fn exact_filter<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
     let agg_type = "evento/FilterTest";
-    let id = Ulid::new().to_string();
+    let id = Ulid::generate().to_string();
     let mk = |v: u16, name: &str| Event {
-        id: Ulid::new(),
+        id: Ulid::generate(),
         aggregate_id: id.clone(),
         aggregate_type: agg_type.to_owned(),
         version: v,
@@ -2110,7 +2110,7 @@ pub async fn concurrent_append<E: Executor + Clone>(executor: &E) -> anyhow::Res
     let id = evento::create()
         .event(&MoneyDeposited {
             amount: 1,
-            transaction_id: Ulid::new().to_string(),
+            transaction_id: Ulid::generate().to_string(),
             description: "seed".to_owned(),
         })
         .commit(executor)
@@ -2125,7 +2125,7 @@ pub async fn concurrent_append<E: Executor + Clone>(executor: &E) -> anyhow::Res
                 .original_version(1)
                 .event(&MoneyDeposited {
                     amount: 10,
-                    transaction_id: Ulid::new().to_string(),
+                    transaction_id: Ulid::generate().to_string(),
                     description: format!("concurrent-{i}"),
                 })
                 .commit(&ex)
@@ -2170,7 +2170,7 @@ pub async fn strict_unhandled<E: Executor + Clone>(executor: &E) -> anyhow::Resu
         &id,
         DepositMoney {
             amount: 10,
-            transaction_id: Ulid::new().to_string(),
+            transaction_id: Ulid::generate().to_string(),
             description: "d".to_owned(),
         },
     )
@@ -2246,7 +2246,7 @@ pub async fn subscription_all_counts<E: Executor + Clone>(executor: &E) -> anyho
         &id,
         DepositMoney {
             amount: 10,
-            transaction_id: Ulid::new().to_string(),
+            transaction_id: Ulid::generate().to_string(),
             description: "d".to_owned(),
         },
     )
@@ -2383,11 +2383,11 @@ pub fn assert_read_result(
 
 pub fn get_data() -> Vec<Event> {
     let aggregator_ids = [
-        Ulid::new().to_string(),
-        Ulid::new().to_string(),
-        Ulid::new().to_string(),
-        Ulid::new().to_string(),
-        Ulid::new().to_string(),
+        Ulid::generate().to_string(),
+        Ulid::generate().to_string(),
+        Ulid::generate().to_string(),
+        Ulid::generate().to_string(),
+        Ulid::generate().to_string(),
     ];
 
     let aggregator_types = ["evento/Calcul", "evento/MyCalcul"];
@@ -2407,7 +2407,7 @@ pub fn get_data() -> Vec<Event> {
         let aggregate_id = aggregator_ids
             .choose(&mut rng)
             .cloned()
-            .unwrap_or_else(|| Ulid::new().to_string());
+            .unwrap_or_else(|| Ulid::generate().to_string());
 
         let routing_key = routing_keys.choose(&mut rng).cloned().unwrap_or(None);
         let aggregate_type = aggregator_types
@@ -2423,7 +2423,7 @@ pub fn get_data() -> Vec<Event> {
         .unwrap_or_else(|| rng.random()) as u64;
 
         let event = Event {
-            id: Ulid::new(),
+            id: Ulid::generate(),
             name: "MessageSent".to_owned(),
             aggregate_id,
             aggregate_type: aggregate_type.to_owned(),
