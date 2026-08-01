@@ -1088,7 +1088,7 @@ version = "2.0.0-alpha.25"
 dependencies = [
  "convert_case",
  "quote",
- "syn 2.0.119",
+ "syn 3.0.2",
 ]
 
 [[package]]
