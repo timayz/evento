@@ -6,7 +6,7 @@
   :jvm-opts ["-Djava.awt.headless=true"]
   :dependencies [[org.clojure/clojure "1.12.5"]
                  ;; Jepsen bundles Elle (the strict-serializability checker).
-                 [jepsen "0.3.11"]
+                 [jepsen "0.3.13"]
                  [clj-http "3.13.1"]
                  [cheshire "6.2.0"]]
   :repl-options {:init-ns evento-accord.core})
