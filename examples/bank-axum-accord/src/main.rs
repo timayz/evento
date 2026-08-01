@@ -153,7 +153,7 @@ async fn main() -> anyhow::Result<()> {
     // stable key would instead resume from the last cursor — wrong for a RAM cache
     // that doesn't survive restarts.)
     let _subscription = account_details::create_projection()
-        .subscription(format!("account-details-{}", Ulid::new()))
+        .subscription(format!("account-details-{}", Ulid::generate()))
         .all()
         .start(&executor)
         .await?;
@@ -261,7 +261,7 @@ async fn create_account(
     Form(form): Form<CreateAccountForm>,
 ) -> impl IntoResponse {
     let cmd = Command(state.executor.as_ref().clone());
-    let owner_id = Ulid::new().to_string();
+    let owner_id = Ulid::generate().to_string();
 
     let id = cmd
         .open_account(OpenAccount {
@@ -316,7 +316,7 @@ async fn deposit(
             &id,
             DepositMoney {
                 amount: form.amount,
-                transaction_id: Ulid::new().to_string(),
+                transaction_id: Ulid::generate().to_string(),
                 description: "Web deposit".to_string(),
             },
         )
@@ -341,7 +341,7 @@ async fn withdraw(
             &id,
             WithdrawMoney {
                 amount: form.amount,
-                transaction_id: Ulid::new().to_string(),
+                transaction_id: Ulid::generate().to_string(),
                 description: "Web withdrawal".to_string(),
             },
         )
@@ -362,7 +362,7 @@ async fn transfer(
     Form(form): Form<TransferForm>,
 ) -> impl IntoResponse {
     let cmd = Command(state.executor.as_ref().clone());
-    let transfer_tx = Ulid::new().to_string();
+    let transfer_tx = Ulid::generate().to_string();
 
     let _ = cmd
         .transfer_money(

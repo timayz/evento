@@ -70,7 +70,7 @@ impl<E: Executor> Handler<E> for Recorder {
 fn opened(aggregate_id: &str) -> Event {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
     Event {
-        id: Ulid::new(),
+        id: Ulid::generate(),
         aggregate_type: "test/Account".into(),
         aggregate_id: aggregate_id.into(),
         version: 1,

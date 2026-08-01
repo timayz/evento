@@ -29,7 +29,7 @@ fn command(micros: u64, version: u16) -> CommandState {
         deps: vec![],
         keys: vec![Key("acc".into())],
         events: vec![Event {
-            id: ulid::Ulid::new(),
+            id: ulid::Ulid::generate(),
             aggregate_type: "test/Account".into(),
             aggregate_id: "acc".into(),
             version,

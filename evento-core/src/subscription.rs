@@ -515,7 +515,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
     {
         self.resolve_routing_key(executor);
         let executor = executor.clone();
-        let id = Ulid::new();
+        let id = Ulid::generate();
         let subscription_id = id;
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         self.shutdown_rx = Some(Mutex::new(shutdown_rx));
@@ -643,7 +643,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
     ))]
     pub async fn run_once(&mut self, executor: &E) -> anyhow::Result<()> {
         self.resolve_routing_key(executor);
-        let id = Ulid::new();
+        let id = Ulid::generate();
 
         executor
             .upsert_subscriber(self.key(), id.to_owned())

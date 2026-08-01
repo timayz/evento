@@ -2567,7 +2567,7 @@ mod tests {
         });
         let agg = format!("acc{i}");
         let event = Event {
-            id: ulid::Ulid::new(),
+            id: ulid::Ulid::generate(),
             aggregate_type: "test/Account".into(),
             aggregate_id: agg.clone(),
             version: 1,
@@ -2766,7 +2766,7 @@ mod tests {
 
         // A new local write is refused rather than growing the backlog further.
         let event = Event {
-            id: ulid::Ulid::new(),
+            id: ulid::Ulid::generate(),
             aggregate_type: "test/Account".into(),
             aggregate_id: "new".into(),
             version: 1,

@@ -94,7 +94,7 @@ impl ShardExec {
 fn event(aggregate_id: &str, version: u16, name: &str) -> Event {
     static SEQ: AtomicU32 = AtomicU32::new(1);
     Event {
-        id: ulid::Ulid::new(),
+        id: ulid::Ulid::generate(),
         aggregate_type: "test/Account".into(),
         aggregate_id: aggregate_id.into(),
         version,

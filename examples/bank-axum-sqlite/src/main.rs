@@ -130,7 +130,7 @@ async fn create_account(
     Form(form): Form<CreateAccountForm>,
 ) -> impl IntoResponse {
     let cmd = Command(state.executor.as_ref().clone());
-    let owner_id = Ulid::new().to_string();
+    let owner_id = Ulid::generate().to_string();
 
     let id = cmd
         .open_account(OpenAccount {
@@ -185,7 +185,7 @@ async fn deposit(
             &id,
             DepositMoney {
                 amount: form.amount,
-                transaction_id: Ulid::new().to_string(),
+                transaction_id: Ulid::generate().to_string(),
                 description: "Web deposit".to_string(),
             },
         )
@@ -210,7 +210,7 @@ async fn withdraw(
             &id,
             WithdrawMoney {
                 amount: form.amount,
-                transaction_id: Ulid::new().to_string(),
+                transaction_id: Ulid::generate().to_string(),
                 description: "Web withdrawal".to_string(),
             },
         )
@@ -237,7 +237,7 @@ async fn transfer(
             TransferMoney {
                 amount: form.amount,
                 to_account_id: form.to_account_id,
-                transaction_id: Ulid::new().to_string(),
+                transaction_id: Ulid::generate().to_string(),
                 description: "Web transfer".to_string(),
             },
         )

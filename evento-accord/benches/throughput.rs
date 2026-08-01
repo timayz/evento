@@ -40,7 +40,7 @@ fn cluster(rt: &Runtime, n: u64) -> Vec<Node> {
 
 fn event(aggregate_id: &str, version: u16) -> Event {
     Event {
-        id: ulid::Ulid::new(),
+        id: ulid::Ulid::generate(),
         aggregate_type: "bench/Account".into(),
         aggregate_id: aggregate_id.into(),
         version,

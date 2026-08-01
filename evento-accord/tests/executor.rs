@@ -105,7 +105,7 @@ fn event(aggregate_id: &str, version: u16, name: &str) -> Event {
     use std::sync::atomic::{AtomicU32, Ordering};
     static SEQ: AtomicU32 = AtomicU32::new(1);
     Event {
-        id: Ulid::new(),
+        id: Ulid::generate(),
         aggregate_type: "test/Account".into(),
         aggregate_id: aggregate_id.into(),
         version,
