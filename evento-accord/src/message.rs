@@ -283,6 +283,7 @@ impl Message {
     }
 }
 
+// NOTE: keep in sync with evento-remote/src/wire.rs `mod wire_events`.
 /// Serde bridge for `Vec<Event>`. evento's [`Event`] is not itself
 /// (de)serializable, so it is mirrored field-for-field by [`WireEvent`], whose
 /// only non-trivial field is the bitcode-encoded [`Metadata`]. This lets the

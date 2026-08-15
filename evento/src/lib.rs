@@ -24,6 +24,7 @@
 //! - `mysql` - MySQL support via sqlx
 //! - `postgres` - PostgreSQL support via sqlx
 //! - `fjall` - Embedded key-value storage with Fjall
+//! - `remote` - Client/server executor over framed TCP
 //!
 //! # Quick Start
 //!
@@ -171,3 +172,11 @@ pub use evento_fjall as fjall;
 /// Fjall executor type alias.
 #[cfg(feature = "fjall")]
 pub use evento_fjall::Fjall;
+
+/// Remote client/server executor (requires `remote` feature).
+#[cfg(feature = "remote")]
+pub use evento_remote as remote;
+
+/// Remote executor client type alias.
+#[cfg(feature = "remote")]
+pub use evento_remote::Client as RemoteClient;

@@ -1,0 +1,14 @@
+[package]
+name = "bank-axum-remote"
+version = "2.0.0-alpha.26"
+edition = "2021"
+
+[dependencies]
+bank.workspace = true
+evento = { workspace = true, features = ["fjall", "remote"] }
+axum.workspace = true
+askama.workspace = true
+tokio.workspace = true
+serde.workspace = true
+ulid.workspace = true
+anyhow.workspace = true
