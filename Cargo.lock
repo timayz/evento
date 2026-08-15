@@ -345,6 +345,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "bank-axum-remote"
+version = "2.0.0-alpha.26"
+dependencies = [
+ "anyhow",
+ "askama",
+ "axum",
+ "bank",
+ "evento",
+ "serde",
+ "tokio",
+ "ulid",
+]
+
+[[package]]
 name = "bank-axum-sqlite"
 version = "2.0.0-alpha.26"
 dependencies = [

@@ -336,6 +336,7 @@ See the `examples/` directory for complete working examples:
 - `examples/bank/` - Bank account domain model with commands, queries, and projections
 - `examples/bank-axum-sqlite/` - Integration with the Axum web framework and SQLite
 - `examples/bank-axum-fjall/` - Integration with the Axum web framework and embedded Fjall storage
+- `examples/bank-axum-remote/` - Axum web app(s) talking to a store served over `evento-remote` (client/server split)
 
 ## License
 
