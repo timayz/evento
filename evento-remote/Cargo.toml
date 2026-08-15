@@ -1,6 +1,6 @@
 [package]
 name = "evento-remote"
-version = "2.0.0-alpha.26"
+version = "2.0.0-alpha.27"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -9,7 +9,7 @@ description = "Client/server remote executor for evento — serve any executor o
 documentation = "https://docs.rs/evento-remote"
 
 [dependencies]
-evento-core = { path = "../evento-core", version = "2.0.0-alpha.26" }
+evento-core = { path = "../evento-core", version = "2.0.0-alpha.27" }
 anyhow.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
