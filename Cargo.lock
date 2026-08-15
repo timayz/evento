@@ -1013,6 +1013,7 @@ dependencies = [
  "bitcode",
  "evento-core",
  "evento-fjall",
+ "evento-remote",
  "evento-sql",
  "evento-sql-migrator",
  "sqlx_migrator",
@@ -1085,6 +1086,26 @@ dependencies = [
  "convert_case",
  "quote",
  "syn 3.0.3",
+]
+
+[[package]]
+name = "evento-remote"
+version = "2.0.0-alpha.26"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bitcode",
+ "bytes",
+ "evento-core",
+ "evento-fjall",
+ "evento-test",
+ "futures-util",
+ "serde",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "ulid",
 ]
 
 [[package]]

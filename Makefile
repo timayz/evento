@@ -11,7 +11,7 @@ reset: down up
 
 check: test fmt lint machete
 
-test: test.sql test.core test.fjall test.accord test.migrator test.doc
+test: test.sql test.core test.fjall test.accord test.remote test.migrator test.doc
 
 test.sql:
 	cargo test --all-features -p evento-sql
@@ -27,6 +27,11 @@ test.fjall:
 # test.sql, which run them via each crate's `accord` feature).
 test.accord:
 	cargo test -p evento-accord
+
+# The client/server executor: runs the shared conformance suite over a TCP
+# round-trip to a served Fjall backend.
+test.remote:
+	cargo test --all-features -p evento-remote
 
 # The SQL migrations, including the optional accord consensus-journal migration.
 test.migrator:

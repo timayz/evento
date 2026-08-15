@@ -1,0 +1,27 @@
+[package]
+name = "evento-remote"
+version = "2.0.0-alpha.26"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = true
+description = "Client/server remote executor for evento — serve any executor over framed TCP"
+documentation = "https://docs.rs/evento-remote"
+
+[dependencies]
+evento-core = { path = "../evento-core", version = "2.0.0-alpha.26" }
+anyhow.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+futures-util = { workspace = true, features = ["sink"] }
+serde.workspace = true
+ulid.workspace = true
+bitcode = { workspace = true, features = ["serde"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+bytes = "1"
+
+[dev-dependencies]
+evento-fjall = { path = "../evento-fjall" }
+evento-test = { path = "../evento-test" }
+tempfile = "3.27"
