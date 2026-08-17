@@ -139,6 +139,90 @@ where
     );
 }
 
+/// Re-staging the same txn within one batch flushes the LAST staged value
+/// through the multi-row upsert (Postgres would reject a statement updating
+/// one row twice) and still drains the whole staged buffer.
+pub async fn flush_dedupes_restaged_txn<DB>(journal: &SqlJournal<DB>)
+where
+    DB: Database,
+    for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
+    sea_query_sqlx::SqlxValues: sqlx::IntoArguments<DB>,
+    Vec<u8>: for<'r> sqlx::Decode<'r, DB> + sqlx::Type<DB>,
+    i64: for<'r> sqlx::Decode<'r, DB> + sqlx::Type<DB>,
+    usize: sqlx::ColumnIndex<DB::Row>,
+{
+    let mut state = command(100, 1);
+    journal.stage(&state).await.unwrap();
+    state.applied_conflict = Some(true);
+    journal.stage(&state).await.unwrap();
+    journal.stage(&command(200, 2)).await.unwrap();
+
+    journal.flush().await.unwrap();
+
+    let loaded = journal.load(state.txn).await.unwrap().unwrap();
+    assert_eq!(
+        loaded.applied_conflict,
+        Some(true),
+        "the last staged value for a re-staged txn wins"
+    );
+    assert_eq!(journal.load_all().await.unwrap().len(), 2);
+    // The buffer drained fully (all three staged entries, not just the two
+    // deduped rows): a second flush has nothing to write.
+    journal.flush().await.unwrap();
+    assert_eq!(journal.load_all().await.unwrap().len(), 2);
+}
+
+/// A staged batch larger than one multi-row statement chunk (8000 rows) lands
+/// in a single flush.
+pub async fn flush_chunks_large_batches<DB>(journal: &SqlJournal<DB>)
+where
+    DB: Database,
+    for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
+    sea_query_sqlx::SqlxValues: sqlx::IntoArguments<DB>,
+    Vec<u8>: for<'r> sqlx::Decode<'r, DB> + sqlx::Type<DB>,
+    i64: for<'r> sqlx::Decode<'r, DB> + sqlx::Type<DB>,
+    usize: sqlx::ColumnIndex<DB::Row>,
+{
+    const TOTAL: u64 = 8_500;
+    for i in 0..TOTAL {
+        journal.stage(&command(1_000 + i, 1)).await.unwrap();
+    }
+    journal.flush().await.unwrap();
+    assert_eq!(journal.load_all().await.unwrap().len(), TOTAL as usize);
+}
+
+/// A batched metadata append is idempotent per entry: an epoch that is already
+/// durable keeps its first decided layout.
+pub async fn metadata_batch_append<DB>(journal: &SqlJournal<DB>)
+where
+    DB: Database,
+    for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
+    sea_query_sqlx::SqlxValues: sqlx::IntoArguments<DB>,
+    Vec<u8>: for<'r> sqlx::Decode<'r, DB> + sqlx::Type<DB>,
+    i64: for<'r> sqlx::Decode<'r, DB> + sqlx::Type<DB>,
+    usize: sqlx::ColumnIndex<DB::Row>,
+{
+    journal.append_metadata(2, &layout(&[0, 1])).await.unwrap();
+    journal
+        .append_metadata_batch(&[
+            (1, layout(&[0])),
+            (2, layout(&[9, 9, 9])),
+            (3, layout(&[0, 1, 2])),
+        ])
+        .await
+        .unwrap();
+
+    let entries = journal.load_metadata().await.unwrap();
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0], (1, layout(&[0])));
+    assert_eq!(
+        entries[1],
+        (2, layout(&[0, 1])),
+        "the first decided layout for an epoch wins over a batched re-append"
+    );
+    assert_eq!(entries[2], (3, layout(&[0, 1, 2])));
+}
+
 /// `truncate` drops commands below the watermark (single range delete) and persists
 /// the watermark.
 pub async fn truncate<DB>(journal: &SqlJournal<DB>)

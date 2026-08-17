@@ -242,19 +242,38 @@ where
         if batch.is_empty() {
             return Ok(());
         }
+
+        // A command's state advances and is re-staged under the same txn, and a
+        // multi-row upsert must carry each key at most once (Postgres rejects
+        // `ON CONFLICT DO UPDATE` affecting one row twice) — dedupe keeping the
+        // LAST staged value, which is what the per-row upserts converged to.
+        let mut seen = std::collections::HashSet::new();
+        let mut rows: Vec<&(Vec<u8>, Vec<u8>)> = batch
+            .iter()
+            .rev()
+            .filter(|(key, _)| seen.insert(key.as_slice()))
+            .collect();
+        rows.reverse();
+
+        // One multi-row upsert per chunk, all chunks in one transaction: a
+        // batch of N staged commands costs one commit and ⌈N/8000⌉ statements
+        // instead of N round trips. 2 binds per row keeps a chunk well under
+        // every backend's bind limit (SQLite 32766, Postgres/MySQL 65535).
+        const ROWS_PER_STATEMENT: usize = 8_000;
         let mut tx = self.pool.begin().await?;
-        for (key, value) in &batch {
-            // Upsert: a command's state advances and is re-recorded under its txn.
-            let statement = Query::insert()
+        for chunk in rows.chunks(ROWS_PER_STATEMENT) {
+            let mut statement = Query::insert()
                 .into_table(AccordCommands::Table)
                 .columns([AccordCommands::Txn, AccordCommands::Data])
-                .values_panic([key.clone().into(), value.clone().into()])
                 .on_conflict(
                     OnConflict::column(AccordCommands::Txn)
                         .update_column(AccordCommands::Data)
                         .to_owned(),
                 )
                 .to_owned();
+            for (key, value) in chunk {
+                statement.values_panic([key.clone().into(), value.clone().into()]);
+            }
             let (sql, values) = Self::build_sqlx(&statement);
             sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
                 .execute(&mut *tx)
@@ -378,6 +397,41 @@ where
                     .to_owned(),
             )
             .to_owned();
+        let (sql, values) = Self::build_sqlx(&statement);
+        sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn append_metadata_batch(
+        &self,
+        entries: &[(u64, Vec<Vec<NodeId>>)],
+    ) -> anyhow::Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        // One multi-row insert with the same first-decided-wins conflict
+        // handling as `append_metadata`. Entries arrive as distinct ascending
+        // epochs; dedupe defensively anyway (first wins) so a malformed batch
+        // cannot break the multi-row statement.
+        let mut seen = std::collections::HashSet::new();
+        let mut statement = Query::insert()
+            .into_table(AccordMetadataLog::Table)
+            .columns([AccordMetadataLog::Epoch, AccordMetadataLog::Layout])
+            .on_conflict(
+                OnConflict::column(AccordMetadataLog::Epoch)
+                    .do_nothing_on([AccordMetadataLog::Epoch])
+                    .to_owned(),
+            )
+            .to_owned();
+        for (epoch, layout) in entries {
+            if !seen.insert(*epoch) {
+                continue;
+            }
+            let value = encode_tagged(RecordKind::MetadataEntry, &layout.to_vec())?;
+            statement.values_panic([(*epoch as i64).into(), value.into()]);
+        }
         let (sql, values) = Self::build_sqlx(&statement);
         sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
             .execute(&self.pool)
