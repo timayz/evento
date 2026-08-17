@@ -35,6 +35,16 @@ pub trait MessageSink: Send + Sync + 'static {
     /// enqueue; delivery is best-effort and unacknowledged (the protocol
     /// tolerates loss via quorums and recovery).
     async fn send(&self, to: NodeId, message: Message) -> anyhow::Result<()>;
+
+    /// Sends `message` to every node in `nodes`. The default clones the
+    /// message per peer; transports that serialize should override it to
+    /// encode once and share the buffer across peers (see `TcpTransport`).
+    async fn broadcast(&self, nodes: &[NodeId], message: Message) -> anyhow::Result<()> {
+        for &node in nodes {
+            let _ = self.send(node, message.clone()).await;
+        }
+        Ok(())
+    }
 }
 
 /// Cluster membership and key→replica-set mapping for the current epoch.

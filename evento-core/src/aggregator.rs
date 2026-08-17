@@ -280,25 +280,24 @@ impl WriteBuilder {
             return Err(WriteError::MixedAggregateTypes { expected, got });
         }
 
-        let first_event = executor
-            .read(
-                Some(vec![EventFilter::by_id(
-                    self.aggregate_type,
-                    &self.aggregate_id,
-                )]),
-                None,
-                Args::forward(1, None),
-            )
-            .await
-            .map_err(WriteError::Unknown)?;
-
         // An existing stream keeps the routing key of its first event — even
         // when that key is `None` — so one aggregate never spans two keys. Only
         // a brand-new aggregate consults the builder value or the executor's
-        // configured default.
-        let routing_key = match first_event.edges.first() {
-            Some(event) => event.node.routing_key.to_owned(),
-            _ => self
+        // configured default. `original_version == 0` declares a brand-new
+        // stream, so the lookup is skipped entirely: if the stream secretly
+        // exists, `write` fails with `InvalidOriginalVersion` before anything
+        // is persisted, so a wrong key can never reach storage.
+        let existing_key = if self.original_version == 0 {
+            None
+        } else {
+            executor
+                .stream_routing_key(self.aggregate_type.to_owned(), self.aggregate_id.to_owned())
+                .await
+                .map_err(WriteError::Unknown)?
+        };
+        let routing_key = match existing_key {
+            Some(key) => key,
+            None => self
                 .routing_key
                 .to_owned()
                 .or_else(|| executor.default_routing_key().map(str::to_owned)),

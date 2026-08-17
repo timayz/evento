@@ -268,6 +268,16 @@ impl cursor::Bind for Event {
         }
     }
 
+    fn retain_before_micros(data: &mut Vec<Self::T>, to_micros: u64) {
+        data.retain(|event| {
+            let micros = event
+                .timestamp
+                .saturating_mul(1_000_000)
+                .saturating_add(event.timestamp_subsec as u64 * 1_000);
+            micros < to_micros
+        });
+    }
+
     fn retain(
         data: &mut Vec<Self::T>,
         cursor: <<Self as cursor::Bind>::T as Cursor>::T,

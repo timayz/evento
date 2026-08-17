@@ -15,6 +15,8 @@
 //! [fjall]: https://crates.io/crates/fjall
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
@@ -52,6 +54,10 @@ pub struct FjallJournal {
     commands: Keyspace,
     /// Small keyspace for journal metadata (currently the truncation watermark).
     meta: Keyspace,
+    /// Whether anything was staged since the last flush. Lets `flush` skip the
+    /// fsync entirely for inbox batches that staged nothing (gossip, response
+    /// routing, probes), which otherwise cost a full `SyncAll` each.
+    dirty: Arc<AtomicBool>,
 }
 
 impl FjallJournal {
@@ -71,7 +77,12 @@ impl FjallJournal {
     pub fn from_database(db: Database) -> anyhow::Result<Self> {
         let commands = db.keyspace("accord_commands", KeyspaceCreateOptions::default)?;
         let meta = db.keyspace("accord_meta", KeyspaceCreateOptions::default)?;
-        Ok(Self { db, commands, meta })
+        Ok(Self {
+            db,
+            commands,
+            meta,
+            dirty: Arc::new(AtomicBool::new(false)),
+        })
     }
 }
 
@@ -91,13 +102,27 @@ impl Journal for FjallJournal {
         // Insert into the keyspace (write-ahead) but do not fsync; the next
         // `flush` makes this — and every other staged write — durable at once.
         tokio::task::spawn_blocking(move || commands.insert(key, value)).await??;
+        self.dirty.store(true, Ordering::Release);
         Ok(())
     }
 
     async fn flush(&self) -> anyhow::Result<()> {
+        // Nothing staged since the last flush → no fsync needed.
+        if !self.dirty.swap(false, Ordering::AcqRel) {
+            return Ok(());
+        }
         let db = self.db.clone();
-        tokio::task::spawn_blocking(move || db.persist(PersistMode::SyncAll)).await??;
-        Ok(())
+        let result = tokio::task::spawn_blocking(move || db.persist(PersistMode::SyncAll)).await;
+        match result {
+            Ok(Ok(())) => Ok(()),
+            other => {
+                // The staged data may not be durable yet — make the next
+                // flush try again rather than silently skipping.
+                self.dirty.store(true, Ordering::Release);
+                other??;
+                Ok(())
+            }
+        }
     }
 
     async fn truncate(&self, before: Timestamp) -> anyhow::Result<()> {

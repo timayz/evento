@@ -132,11 +132,24 @@ async fn connection<E: Executor + Clone>(
     let inflight = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_PER_CONNECTION));
 
     let writer = tokio::spawn(async move {
-        while let Some(frame) = out_rx.recv().await {
+        // Coalesce: feed this frame plus everything already queued, then flush
+        // once — one syscall per burst instead of one per frame.
+        'writer: while let Some(frame) = out_rx.recv().await {
             let Ok(bytes) = encode_tagged(RecordKind::ServerFrame, &frame) else {
                 continue;
             };
-            if sink.send(Bytes::from(bytes)).await.is_err() {
+            if sink.feed(Bytes::from(bytes)).await.is_err() {
+                break;
+            }
+            while let Ok(frame) = out_rx.try_recv() {
+                let Ok(bytes) = encode_tagged(RecordKind::ServerFrame, &frame) else {
+                    continue;
+                };
+                if sink.feed(Bytes::from(bytes)).await.is_err() {
+                    break 'writer;
+                }
+            }
+            if sink.flush().await.is_err() {
                 break;
             }
         }
@@ -272,6 +285,23 @@ async fn handle<E: Executor>(executor: &E, request: Request) -> Response {
         }
         Request::IsSubscriberRunning { key, worker_id } => Response::SubscriberRunning(err_string(
             executor.is_subscriber_running(key, worker_id).await,
+        )),
+        Request::SubscriberStatus { key, worker_id } => {
+            Response::SubscriberStatus(err_string(executor.subscriber_status(key, worker_id).await))
+        }
+        Request::LatestVersion {
+            aggregate_type,
+            aggregate_id,
+        } => Response::LatestVersion(err_string(
+            executor.latest_version(aggregate_type, aggregate_id).await,
+        )),
+        Request::StreamRoutingKey {
+            aggregate_type,
+            aggregate_id,
+        } => Response::StreamRoutingKey(err_string(
+            executor
+                .stream_routing_key(aggregate_type, aggregate_id)
+                .await,
         )),
         Request::UpsertSubscriber { key, worker_id } => {
             Response::Unit(err_string(executor.upsert_subscriber(key, worker_id).await))

@@ -33,13 +33,29 @@
 
 use backon::{ExponentialBuilder, Retryable};
 use std::{
-    collections::HashMap, future::Future, marker::PhantomData, ops::Deref, pin::Pin, time::Duration,
+    collections::HashMap, future::Future, marker::PhantomData, ops::Deref, pin::Pin, sync::Mutex,
+    time::Duration,
 };
 use tokio::time::{interval_at, Instant};
 use tracing::field::Empty;
 use ulid::Ulid;
 
-use crate::{context, cursor::Args, Aggregate, AggregateEvent, EventFilter, Executor};
+use crate::{
+    context,
+    cursor::{Args, Value},
+    Aggregate, AggregateEvent, EventFilter, Executor,
+};
+
+/// Bounds on the adaptive retry delay after a `Gated` pass. The lower bound
+/// keeps a nearly-stable event from spinning the loop; the upper bound keeps
+/// the subscription responsive while the watermark advances.
+const GATED_RETRY_MIN: Duration = Duration::from_millis(5);
+const GATED_RETRY_MAX: Duration = Duration::from_millis(250);
+
+/// How long a cached `latest_timestamp` sample may feed the lag metric before
+/// being refreshed. The metric has whole-second resolution, so a ≤1s-old
+/// sample is as good as a fresh MAX() scan per acknowledge.
+const LATEST_TS_TTL: Duration = Duration::from_secs(1);
 
 /// Filter for events by routing key.
 ///
@@ -148,15 +164,20 @@ pub struct SubscriptionBuilder<E: Executor> {
     aggregators: HashMap<String, String>,
     safety_disabled: bool,
     shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    ack_every: Option<u16>,
+    /// Cached `(sampled at, latest event timestamp in seconds)` feeding the
+    /// lag metric, so acknowledges don't pay a MAX() scan each.
+    latest_ts_cache: Mutex<Option<(Instant, u64)>>,
 }
 
 /// What a single `process` pass concluded, beyond a hard error.
 enum ProcessOutcome {
     /// Everything currently available was processed (or nothing was pending).
     Drained,
-    /// Remaining events sit at/above the stability watermark; retry after it
-    /// has advanced.
-    Gated,
+    /// Remaining events sit at/above the stability watermark; retry after
+    /// roughly `wait`, by which time the watermark will have reached the next
+    /// pending event.
+    Gated { wait: Duration },
     /// Another worker took over this subscription key; this worker must stop.
     LostOwnership,
     /// A shutdown signal was observed mid-chunk.
@@ -182,6 +203,8 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             prefix_key: None,
             aggregators: Default::default(),
             shutdown_rx: None,
+            ack_every: None,
+            latest_ts_cache: Mutex::new(None),
         }
     }
 
@@ -243,6 +266,21 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
     /// would make the subscription silently read nothing forever.
     pub fn chunk_size(mut self, v: u16) -> Self {
         self.chunk_size = v.max(1);
+
+        self
+    }
+
+    /// Sets how many events may be processed between cursor acknowledges.
+    ///
+    /// The cursor is flushed to the store every `v` events and at the end of
+    /// every chunk, instead of once per event. Delivery stays at-least-once
+    /// (handlers must already be idempotent); the trade-off is the fencing
+    /// bound — a worker that has lost ownership stops within `v` events plus
+    /// the per-pass ownership check, and after a crash up to `v` events are
+    /// redelivered. Defaults to the chunk size. Values below 1 are clamped
+    /// to 1 (ack per event, the pre-batching behavior).
+    pub fn ack_every(mut self, v: u16) -> Self {
+        self.ack_every = Some(v.max(1));
 
         self
     }
@@ -393,59 +431,77 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
         // keeps both fresh-event latency and backlog drain at full speed.
         tracing::Span::current().record("subscription", self.key());
 
+        let ack_every = usize::from(self.ack_every.unwrap_or(self.chunk_size).max(1));
+
         loop {
-            if !executor.is_subscriber_running(self.key(), *id).await? {
+            let status = executor.subscriber_status(self.key(), *id).await?;
+            if !status.running {
                 return Ok(ProcessOutcome::LostOwnership);
             }
-
-            let cursor = executor.get_subscriber_cursor(self.key()).await?;
-
-            let res = executor
-                .read(
-                    Some(aggregators.to_vec()),
-                    Some(self.effective_routing_key()),
-                    Args::forward(self.chunk_size, cursor),
-                )
-                .await?;
-
-            if res.edges.is_empty() {
-                return Ok(ProcessOutcome::Drained);
-            }
-
-            // A partial chunk means everything currently available has been read;
-            // a full chunk likely has more pending, so loop and read the next one
-            // immediately.
-            let drained = res.edges.len() < self.chunk_size as usize;
+            let cursor = status.cursor;
 
             // Stability watermark (microseconds since epoch): on a backend where
             // independent writers can commit out of cursor order, the
             // subscription must not advance past it, or a late lower-cursor event
             // would be skipped. `None` (single-writer backends) means no gating.
+            // Fetched *before* the read so the read is bounded by it and a gated
+            // pass fetches nothing instead of a chunk it would discard.
             let stable = executor.stable_timestamp().await?;
 
-            let timestamp = executor
-                .latest_timestamp(
+            let mut args = Args::forward(self.chunk_size, cursor.clone());
+            args.to_micros = stable;
+
+            let res = executor
+                .read(
                     Some(aggregators.to_vec()),
                     Some(self.effective_routing_key()),
+                    args,
                 )
                 .await?;
+
+            // A partial chunk means everything below the watermark has been
+            // read; a full chunk likely has more pending, so loop and read the
+            // next one immediately.
+            let full_chunk = res.edges.len() >= self.chunk_size as usize;
+
+            if res.edges.is_empty() {
+                return self
+                    .drained_or_gated(executor, aggregators, cursor, stable)
+                    .await;
+            }
 
             let context = Context {
                 context: self.context.clone(),
                 executor,
             };
 
+            // Cursor + timestamp of the last processed-but-unacknowledged
+            // event; flushed every `ack_every` events and on every exit path,
+            // so cursor persistence costs one round trip per batch instead of
+            // one per event.
+            let mut pending_ack: Option<(Value, u64)> = None;
+            let mut since_ack = 0usize;
+            let mut last_seen = cursor;
+
             for event in res.edges {
-                // Edges arrive in ascending cursor order, so the first event at or
-                // above the watermark (and every event after it) is held back: we
-                // stop without advancing the cursor and retry on the next tick,
-                // once the watermark has moved forward.
+                // Defensive backstop: the read was already bounded by the
+                // watermark, so this only fires for a backend that ignores
+                // `Args::to_micros`. Edges arrive in ascending cursor order, so
+                // everything from here on is gated too.
                 if let Some(w) = stable {
                     let event_micros = (event.node.timestamp)
                         .saturating_mul(1_000_000)
                         .saturating_add(event.node.timestamp_subsec as u64 * 1_000);
                     if event_micros >= w {
-                        return Ok(ProcessOutcome::Gated);
+                        if !self
+                            .flush_ack(executor, id, aggregators, &mut pending_ack, &mut since_ack)
+                            .await?
+                        {
+                            return Ok(ProcessOutcome::LostOwnership);
+                        }
+                        let wait = Duration::from_micros(event_micros - w)
+                            .clamp(GATED_RETRY_MIN, GATED_RETRY_MAX);
+                        return Ok(ProcessOutcome::Gated { wait });
                     }
                 }
 
@@ -459,6 +515,8 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                         "Subscription received shutdown signal, stopping gracefully"
                     );
 
+                    self.flush_ack(executor, id, aggregators, &mut pending_ack, &mut since_ack)
+                        .await?;
                     return Ok(ProcessOutcome::ShutdownRequested);
                 }
 
@@ -473,6 +531,8 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                 let handler = match self.handlers.get(&key).or(self.handlers.get(&all_key)) {
                     Some(handler) => Some(handler),
                     None if !self.safety_disabled && !self.continue_on_error => {
+                        self.flush_ack(executor, id, aggregators, &mut pending_ack, &mut since_ack)
+                            .await?;
                         anyhow::bail!("no handler s={} k={key}", self.key())
                     }
                     None if !self.safety_disabled => {
@@ -489,6 +549,17 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                     if let Err(err) = handler.handle(&context, &event.node).await {
                         if !self.continue_on_error {
                             tracing::error!("failed");
+                            // Persist the successfully processed prefix before
+                            // surfacing the error, so a retry resumes at the
+                            // failing event instead of re-running the chunk.
+                            self.flush_ack(
+                                executor,
+                                id,
+                                aggregators,
+                                &mut pending_ack,
+                                &mut since_ack,
+                            )
+                            .await?;
                             return Err(err);
                         }
                         // continue_on_error: log and acknowledge so the
@@ -500,25 +571,118 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                     }
                 }
 
-                let acked = executor
-                    .acknowledge(
-                        self.key(),
-                        *id,
-                        event.cursor.to_owned(),
-                        timestamp.saturating_sub(event.node.timestamp),
-                    )
-                    .await?;
-                if !acked {
-                    // Another worker took over mid-chunk; stop immediately so
-                    // we do not process events the new owner will also handle.
+                last_seen = Some(event.cursor.clone());
+                pending_ack = Some((event.cursor, event.node.timestamp));
+                since_ack += 1;
+                if since_ack >= ack_every
+                    && !self
+                        .flush_ack(executor, id, aggregators, &mut pending_ack, &mut since_ack)
+                        .await?
+                {
+                    // Another worker took over mid-chunk; stop so we do not
+                    // process events the new owner will also handle.
                     return Ok(ProcessOutcome::LostOwnership);
                 }
             }
 
-            if drained {
-                return Ok(ProcessOutcome::Drained);
+            if !self
+                .flush_ack(executor, id, aggregators, &mut pending_ack, &mut since_ack)
+                .await?
+            {
+                return Ok(ProcessOutcome::LostOwnership);
+            }
+
+            if !full_chunk {
+                return self
+                    .drained_or_gated(executor, aggregators, last_seen, stable)
+                    .await;
             }
         }
+    }
+
+    /// Flushes the pending cursor via a fenced acknowledge. Returns `false`
+    /// when ownership was lost (the fenced update did not apply); `true` when
+    /// nothing was pending or the ack succeeded.
+    async fn flush_ack(
+        &self,
+        executor: &E,
+        id: &Ulid,
+        aggregators: &[EventFilter],
+        pending: &mut Option<(Value, u64)>,
+        since_ack: &mut usize,
+    ) -> anyhow::Result<bool> {
+        let Some((cursor, event_ts)) = pending.take() else {
+            return Ok(true);
+        };
+        *since_ack = 0;
+
+        let latest = self.cached_latest_timestamp(executor, aggregators).await?;
+        executor
+            .acknowledge(self.key(), *id, cursor, latest.saturating_sub(event_ts))
+            .await
+    }
+
+    /// The latest matching event timestamp (whole seconds), refreshed at most
+    /// once per [`LATEST_TS_TTL`]. Feeds the lag metric only, so a slightly
+    /// stale sample is fine and saves a MAX() scan per acknowledge.
+    async fn cached_latest_timestamp(
+        &self,
+        executor: &E,
+        aggregators: &[EventFilter],
+    ) -> anyhow::Result<u64> {
+        {
+            let guard = self.latest_ts_cache.lock().expect("latest_ts poisoned");
+            if let Some((at, v)) = *guard {
+                if at.elapsed() < LATEST_TS_TTL {
+                    return Ok(v);
+                }
+            }
+        }
+
+        let v = executor
+            .latest_timestamp(
+                Some(aggregators.to_vec()),
+                Some(self.effective_routing_key()),
+            )
+            .await?;
+        *self.latest_ts_cache.lock().expect("latest_ts poisoned") = Some((Instant::now(), v));
+        Ok(v)
+    }
+
+    /// A bounded read returned less than a full chunk: distinguish "nothing
+    /// further exists" from "the next event sits at/above the watermark" with
+    /// a single-row unbounded probe, and derive how long until that event
+    /// becomes stable (the watermark advances in real time).
+    async fn drained_or_gated(
+        &self,
+        executor: &E,
+        aggregators: &[EventFilter],
+        after: Option<Value>,
+        stable: Option<u64>,
+    ) -> anyhow::Result<ProcessOutcome> {
+        let Some(stable) = stable else {
+            // No watermark means the read was unbounded: a non-full chunk is a
+            // genuine drain.
+            return Ok(ProcessOutcome::Drained);
+        };
+
+        let probe = executor
+            .read(
+                Some(aggregators.to_vec()),
+                Some(self.effective_routing_key()),
+                Args::forward(1, after),
+            )
+            .await?;
+        let Some(edge) = probe.edges.first() else {
+            return Ok(ProcessOutcome::Drained);
+        };
+
+        let event_micros = (edge.node.timestamp)
+            .saturating_mul(1_000_000)
+            .saturating_add(edge.node.timestamp_subsec as u64 * 1_000);
+        let wait = Duration::from_micros(event_micros.saturating_sub(stable))
+            .clamp(GATED_RETRY_MIN, GATED_RETRY_MAX);
+        Ok(ProcessOutcome::Gated { wait })
     }
 
     /// Disables retry-on-failure for this subscription.
@@ -573,7 +737,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             // the fallback re-poll; the write signal (when available) wakes the
             // loop sooner.
             let mut interval = interval_at(start, self.poll_interval);
-            let mut gated = false;
+            let mut gated: Option<Duration> = None;
 
             loop {
                 // Wake on whichever comes first: an in-process write (when the
@@ -589,9 +753,9 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                 // after a `Gated` pass, re-check on a short cadence instead of
                 // waiting out the full poll interval.
                 let mut shutdown = false;
-                if gated {
+                if let Some(wait) = gated {
                     tokio::select! {
-                        _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+                        _ = tokio::time::sleep(wait) => {}
                         _ = shutdown_rx.changed() => { shutdown = true; }
                     }
                 } else {
@@ -660,8 +824,8 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                 };
 
                 match result {
-                    Ok(ProcessOutcome::Drained) => gated = false,
-                    Ok(ProcessOutcome::Gated) => gated = true,
+                    Ok(ProcessOutcome::Drained) => gated = None,
+                    Ok(ProcessOutcome::Gated { wait }) => gated = Some(wait),
                     Ok(ProcessOutcome::ShutdownRequested) => break,
                     Ok(ProcessOutcome::LostOwnership) => {
                         tracing::info!(
@@ -761,7 +925,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                         self.key()
                     )
                 }
-                ProcessOutcome::Gated => {
+                ProcessOutcome::Gated { wait } => {
                     // Wait for the watermark to pass everything that was
                     // pending at entry, then run one final pass: this `Gated`
                     // may rest on a watermark `process` fetched before it
@@ -772,7 +936,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                     // out of scope for this pass.
                     match executor.stable_timestamp().await? {
                         Some(w) if w < target_micros => {
-                            tokio::time::sleep(Duration::from_millis(25)).await;
+                            tokio::time::sleep(wait).await;
                         }
                         _ if watermark_passed => return Ok(()),
                         _ => watermark_passed = true,

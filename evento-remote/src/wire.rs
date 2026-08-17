@@ -18,7 +18,9 @@ pub const MAGIC: [u8; 2] = *b"Er";
 
 /// Current wire format version. Bump on any breaking change to the frame
 /// enums' layout; add the matching decode branch then.
-pub const FORMAT_VERSION: u8 = 1;
+/// v2: `Args` gained `to_micros`; added `SubscriberStatus`, `LatestVersion`
+/// and `StreamRoutingKey` requests.
+pub const FORMAT_VERSION: u8 = 2;
 
 /// Length of the fixed header: `MAGIC (2) + version (1) + kind (1)`.
 const HEADER_LEN: usize = 4;
@@ -142,6 +144,22 @@ pub enum Request {
         key: String,
         worker_id: Ulid,
     },
+    /// Fencing state + cursor in one round trip (see
+    /// `Executor::subscriber_status`).
+    SubscriberStatus {
+        key: String,
+        worker_id: Ulid,
+    },
+    /// Highest committed version of a stream (see `Executor::latest_version`).
+    LatestVersion {
+        aggregate_type: String,
+        aggregate_id: String,
+    },
+    /// Routing key of an existing stream (see `Executor::stream_routing_key`).
+    StreamRoutingKey {
+        aggregate_type: String,
+        aggregate_id: String,
+    },
     UpsertSubscriber {
         key: String,
         worker_id: Ulid,
@@ -183,6 +201,10 @@ pub enum Response {
     LatestTimestamp(Result<u64, String>),
     SubscriberCursor(Result<Option<Value>, String>),
     SubscriberRunning(Result<bool, String>),
+    SubscriberStatus(Result<evento_core::SubscriberStatus, String>),
+    LatestVersion(Result<u16, String>),
+    /// Outer `None`: the stream does not exist; inner: its routing key.
+    StreamRoutingKey(Result<Option<Option<String>>, String>),
     /// Whether the fenced cursor update was applied (false: lost ownership).
     Acknowledge(Result<bool, String>),
     /// upsert_subscriber, save_snapshot, delete_snapshot.

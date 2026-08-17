@@ -70,7 +70,7 @@ use std::sync::{Arc, Mutex};
 use evento_core::{
     cursor::{Args, ReadResult, Value},
     metadata::Metadata,
-    Event, EventFilter, Executor, RoutingKey, WriteError,
+    Event, EventFilter, Executor, RoutingKey, SubscriberStatus, WriteError,
 };
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 use ulid::Ulid;
@@ -183,12 +183,20 @@ pub struct Fjall {
     meta: Keyspace,
     /// Serializes the read-validate-write critical section of `write` (so
     /// concurrent appends cannot both pass the optimistic version check) and
-    /// all subscriber read-modify-write updates. Holds the monotonic commit
-    /// clock in **milliseconds** since the Unix epoch: each write batch is
-    /// stamped `max(now, last + 1)`, persisted under [`LAST_STAMP_KEY`] in the
-    /// same batch so a wall-clock regression across restarts cannot mint
-    /// cursors below already-acknowledged ones.
-    write_lock: Arc<Mutex<u64>>,
+    /// all subscriber read-modify-write updates. Deliberately NOT held across
+    /// the fsync at the end of `write` — that would serialize writers on disk
+    /// latency and block `latest_timestamp` readers for the fsync duration.
+    write_lock: Arc<Mutex<()>>,
+    /// The monotonic commit clock in **milliseconds** since the Unix epoch:
+    /// each write batch is stamped `max(now, last + 1)` (updated only while
+    /// `write_lock` is held), persisted under [`LAST_STAMP_KEY`] in the same
+    /// batch so a wall-clock regression across restarts cannot mint cursors
+    /// below already-acknowledged ones. Atomic so `latest_timestamp` reads it
+    /// lock-free.
+    last_stamp: Arc<std::sync::atomic::AtomicU64>,
+    /// Durability mode applied after each write batch (see
+    /// [`persist_mode`](Self::persist_mode)).
+    write_persist_mode: PersistMode,
     /// Notifies in-process subscriptions after each successful `write` so they
     /// wake immediately instead of waiting for their next poll tick. Carries a
     /// monotonically increasing write generation.
@@ -211,6 +219,8 @@ impl Clone for Fjall {
             snapshots: self.snapshots.clone(),
             meta: self.meta.clone(),
             write_lock: self.write_lock.clone(),
+            last_stamp: self.last_stamp.clone(),
+            write_persist_mode: self.write_persist_mode,
             // `watch::Sender` clones share the same channel, so all clones of
             // this executor notify the same subscription receivers on write.
             write_tx: self.write_tx.clone(),
@@ -268,10 +278,24 @@ impl Fjall {
             subscribers: db.keyspace("subscribers", KeyspaceCreateOptions::default)?,
             snapshots: db.keyspace("snapshots", KeyspaceCreateOptions::default)?,
             meta,
-            write_lock: Arc::new(Mutex::new(last_stamp)),
+            write_lock: Arc::new(Mutex::new(())),
+            last_stamp: Arc::new(std::sync::atomic::AtomicU64::new(last_stamp)),
+            write_persist_mode: PersistMode::SyncAll,
             write_tx: tokio::sync::watch::channel(0).0,
             db,
         })
+    }
+
+    /// Sets the durability mode applied after each write batch (default
+    /// [`PersistMode::SyncAll`]).
+    ///
+    /// `SyncAll` fsyncs once per `write`/`replicate` call, capping throughput
+    /// at the disk's fsync rate. A weaker mode (e.g. `Buffer`) trades
+    /// crash-durability of the most recent writes for much higher write
+    /// throughput; batch ordering and atomicity are unaffected.
+    pub fn persist_mode(mut self, mode: PersistMode) -> Self {
+        self.write_persist_mode = mode;
+        self
     }
 
     /// Enables or disables a subscription (the kill switch).
@@ -444,7 +468,15 @@ impl Fjall {
         match (aggregators, routing_key) {
             // Query by specific aggregator ID and optionally event name
             (Some(aggs), _) => {
+                // Subscriptions emit one filter per handler, and those often
+                // collapse to identical values (e.g. `by_type` once per
+                // handler): scan each distinct filter once, not once per
+                // handler.
+                let mut seen_filters = HashSet::new();
                 for agg in aggs {
+                    if !seen_filters.insert(agg) {
+                        continue;
+                    }
                     match (&agg.aggregate_id, &agg.name) {
                         // Specific aggregate ID with event name filter.
                         // The agg_name_index stores the ULID in the key tail, so we
@@ -527,10 +559,16 @@ impl Fjall {
     /// events are stamped from the monotonic commit clock (`max(now, last+1)`
     /// millis), which is persisted in the same batch.
     fn write_events(&self, mut events: Vec<Event>, restamp: bool) -> Result<(), WriteError> {
+        use std::sync::atomic::Ordering;
+
         // Hold the write lock across validate + stamp + commit so concurrent
         // appends cannot both observe the same "last version" and the commit
-        // clock stays strictly increasing.
-        let mut last_stamp = self
+        // clock stays strictly increasing. The fsync below runs *after* the
+        // guard is dropped: `persist` is database-global, so a later writer's
+        // fsync covers every earlier committed batch, and keeping it outside
+        // the lock lets concurrent writers group-commit instead of
+        // serializing on disk latency.
+        let guard = self
             .write_lock
             .lock()
             .map_err(|_| WriteError::Unknown(anyhow::anyhow!("write lock poisoned")))?;
@@ -540,12 +578,14 @@ impl Fjall {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
                 .unwrap_or(0);
-            let stamp = now_millis.max(last_stamp.saturating_add(1));
+            // Only ever written under `write_lock`, so load-then-store is
+            // race-free; the atomic exists for lock-free readers.
+            let stamp = now_millis.max(self.last_stamp.load(Ordering::Acquire).saturating_add(1));
             for event in &mut events {
                 event.timestamp = stamp / 1000;
                 event.timestamp_subsec = (stamp % 1000) as u32;
             }
-            *last_stamp = stamp;
+            self.last_stamp.store(stamp, Ordering::Release);
         }
 
         // Validate versions first (optimistic concurrency). `seen` tracks the
@@ -626,12 +666,19 @@ impl Fjall {
 
         if restamp {
             // Persist the commit clock atomically with the events it stamped.
-            batch.insert(&self.meta, LAST_STAMP_KEY, last_stamp.to_be_bytes());
+            batch.insert(
+                &self.meta,
+                LAST_STAMP_KEY,
+                self.last_stamp.load(Ordering::Acquire).to_be_bytes(),
+            );
         }
 
         batch.commit().map_err(|e| WriteError::Unknown(e.into()))?;
+
+        // Commit order is fixed; durability doesn't need the lock (see above).
+        drop(guard);
         self.db
-            .persist(PersistMode::SyncAll)
+            .persist(self.write_persist_mode)
             .map_err(|e| WriteError::Unknown(e.into()))?;
 
         Ok(())
@@ -728,12 +775,10 @@ impl Executor for Fjall {
         // instead of a filtered lookup makes this O(1) rather than a full
         // load-and-sort of every matching event on every subscription poll;
         // the cost is that lag reported for a quiet stream can reflect writes
-        // to other streams (an upper bound, never an undercount).
-        let last_stamp = *self
-            .write_lock
-            .lock()
-            .map_err(|_| anyhow::anyhow!("write lock poisoned"))?;
-        Ok(last_stamp / 1000)
+        // to other streams (an upper bound, never an undercount). Lock-free:
+        // this must never wait on a writer's critical section from the async
+        // runtime.
+        Ok(self.last_stamp.load(std::sync::atomic::Ordering::Acquire) / 1000)
     }
 
     async fn get_subscriber_cursor(&self, key: String) -> anyhow::Result<Option<Value>> {
@@ -760,6 +805,70 @@ impl Executor for Fjall {
                 Ok(state.worker_id == worker_id.to_string() && state.enabled)
             }
             None => Ok(false),
+        })
+        .await?
+    }
+
+    async fn subscriber_status(
+        &self,
+        key: String,
+        worker_id: Ulid,
+    ) -> anyhow::Result<SubscriberStatus> {
+        let executor = self.clone();
+
+        tokio::task::spawn_blocking(move || match executor.subscribers.get(&key)? {
+            Some(bytes) => {
+                let state: SubscriberState = bitcode::decode(bytes.as_ref())
+                    .map_err(|e| anyhow::anyhow!("Failed to deserialize subscriber: {}", e))?;
+                Ok(SubscriberStatus {
+                    running: state.worker_id == worker_id.to_string() && state.enabled,
+                    cursor: state.cursor.map(Value),
+                })
+            }
+            None => Ok(SubscriberStatus::default()),
+        })
+        .await?
+    }
+
+    async fn latest_version(
+        &self,
+        aggregate_type: String,
+        aggregate_id: String,
+    ) -> anyhow::Result<u16> {
+        let executor = self.clone();
+
+        // A single reverse seek on the version-ordered aggregate index —
+        // exact under `replicate` too, since it orders by version, not by
+        // timestamp.
+        tokio::task::spawn_blocking(move || {
+            Ok(executor
+                .get_last_version(&aggregate_type, &aggregate_id)?
+                .unwrap_or(0))
+        })
+        .await?
+    }
+
+    async fn stream_routing_key(
+        &self,
+        aggregate_type: String,
+        aggregate_id: String,
+    ) -> anyhow::Result<Option<Option<String>>> {
+        let executor = self.clone();
+
+        // Version 1 is the stream's first event and carries the routing key
+        // the stream was created with: one index point-get + one event load.
+        tokio::task::spawn_blocking(move || {
+            let key = Fjall::agg_key(&aggregate_type, &aggregate_id, 1);
+            let Some(id_bytes) = executor.agg_index.get(&key)? else {
+                return Ok(None);
+            };
+            let id_bytes: [u8; 16] = id_bytes
+                .as_ref()
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("invalid ULID in aggregate index"))?;
+            Ok(executor
+                .load_event(&Ulid::from_bytes(id_bytes))?
+                .map(|e| e.routing_key))
         })
         .await?
     }
@@ -824,7 +933,9 @@ impl Executor for Fjall {
             };
             let mut state: SubscriberState = bitcode::decode(bytes.as_ref())
                 .map_err(|e| anyhow::anyhow!("Failed to deserialize subscriber: {}", e))?;
-            if state.worker_id != worker_id.to_string() {
+            // A disabled subscriber reads as lost ownership too, matching
+            // `is_subscriber_running` (and the SQL backend's fenced UPDATE).
+            if state.worker_id != worker_id.to_string() || !state.enabled {
                 return Ok(false);
             }
             state.cursor = Some(cursor.0);

@@ -39,7 +39,12 @@
 //! ```
 
 use std::{
-    collections::HashMap, future::Future, marker::PhantomData, ops::Deref, pin::Pin, sync::Arc,
+    collections::HashMap,
+    future::Future,
+    marker::PhantomData,
+    ops::Deref,
+    pin::Pin,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -313,8 +318,24 @@ pub struct Projection<E: Executor, P: Default + 'static> {
     context: context::RwContext,
     safety_disabled: bool,
     tombstone: Option<(&'static str, &'static str)>,
+    /// Per-aggregate position (cursor order key) the persisted snapshot
+    /// already reflects. Lets [`ProjectionAutoHandler`] skip events an earlier
+    /// same-chunk reload has already folded, instead of re-loading the whole
+    /// aggregate once per event. Only populated through a subscription's
+    /// `Arc<Projection>`.
+    recent: Mutex<HashMap<String, EventOrderKey>>,
     executor: PhantomData<E>,
 }
+
+/// An event's position in cursor order: `(timestamp, subsec, version, id)`.
+/// ULID strings are lexicographically ordered, so tuple comparison matches the
+/// store's cursor ordering exactly.
+type EventOrderKey = (u64, u32, u16, String);
+
+/// Bound on the [`Projection::recent`] cache. On overflow the cache resets —
+/// the worst case is a few redundant reloads after a burst of distinct
+/// aggregates, never a correctness issue.
+const RECENT_CACHE_MAX: usize = 1024;
 
 impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
     /// Creates a new projection definition for the given primary aggregate type.
@@ -325,9 +346,40 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
             handlers: HashMap::new(),
             safety_disabled: true,
             tombstone: None,
+            recent: Mutex::new(HashMap::new()),
             executor: PhantomData,
             revision: 0,
         }
+    }
+
+    /// Whether the persisted snapshot for `id` already reflects the event at
+    /// `key` (its position is at or below the recorded persisted position).
+    fn covered(&self, id: &str, key: &EventOrderKey) -> bool {
+        self.recent
+            .lock()
+            .expect("recent cache poisoned")
+            .get(id)
+            .is_some_and(|persisted| key <= persisted)
+    }
+
+    /// Records how far the persisted snapshot for `id` reaches.
+    fn record_persisted(&self, id: &str, cursor: &cursor::Value) {
+        let Ok(c) = <crate::Event as cursor::Cursor>::deserialize_cursor(cursor) else {
+            return;
+        };
+        let mut recent = self.recent.lock().expect("recent cache poisoned");
+        if recent.len() >= RECENT_CACHE_MAX && !recent.contains_key(id) {
+            recent.clear();
+        }
+        recent.insert(id.to_owned(), (c.t, c.s, c.v, c.i));
+    }
+
+    /// Drops the recorded position for `id` (e.g. on tombstone).
+    fn invalidate_recent(&self, id: &str) {
+        self.recent
+            .lock()
+            .expect("recent cache poisoned")
+            .remove(id);
     }
 
     /// Sets the snapshot revision.
@@ -427,12 +479,16 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
         }
     }
 
+    /// Rebuilds the projection state for `id`, persisting snapshots along the
+    /// way. Returns the in-memory state plus the position (cursor) the
+    /// *persisted* snapshot reaches after this call — `None` when nothing has
+    /// ever been persisted (empty stream or tombstoned).
     async fn load_aggregator(
         &self,
         executor: &E,
         id: &str,
         extra_aggregators: &HashMap<String, String>,
-    ) -> anyhow::Result<Option<P>> {
+    ) -> anyhow::Result<(Option<P>, Option<cursor::Value>)> {
         if let Some((tombstone_type, tombstone_event)) = self.tombstone {
             let res = executor
                 .read(
@@ -446,7 +502,7 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
                 )
                 .await?;
             if !res.edges.is_empty() {
-                return Ok(None);
+                return Ok((None, None));
             }
         }
 
@@ -466,6 +522,9 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
         };
         let snapshot = P::restore(&context).await?;
         let cursor = snapshot.as_ref().map(|s| s.get_cursor());
+        // Position the persisted snapshot reaches; advanced after every
+        // `take_snapshot` below.
+        let mut persisted = cursor.clone();
 
         let read_aggregators = self
             .handlers
@@ -533,6 +592,7 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
                             // that could still be reordered.
                             if dirty {
                                 state.take_snapshot(&context).await?;
+                                persisted = Some(state.get_cursor());
                                 dirty = false;
                             }
                             gated = true;
@@ -564,15 +624,16 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
         }
 
         if !any_events && snapshot_state.is_none() {
-            return Ok(None);
+            return Ok((None, None));
         }
 
         let snapshot = snapshot_state.unwrap_or_default();
         if dirty {
             snapshot.take_snapshot(&context).await?;
+            persisted = Some(snapshot.get_cursor());
         }
 
-        Ok(Some(snapshot))
+        Ok((Some(snapshot), persisted))
     }
 }
 
@@ -619,6 +680,7 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> LoadBuilder<E, P> {
         self.projection
             .load_aggregator(executor, &self.id, &self.aggregators)
             .await
+            .map(|(state, _persisted)| state)
     }
 }
 
@@ -818,11 +880,32 @@ where
         event: &'a crate::Event,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>> {
         Box::pin(async move {
+            // A reload reads the aggregate's whole stream, so one load covers
+            // every same-chunk event at or below the position it persisted:
+            // skip those instead of re-running the full
+            // tombstone/snapshot/read/persist cycle once per event. Events
+            // beyond the persisted position (the tail that was unstable at
+            // load time) trigger a fresh load once delivered.
+            let key = (
+                event.timestamp,
+                event.timestamp_subsec,
+                event.version,
+                event.id.to_string(),
+            );
+            if self.projection.covered(&event.aggregate_id, &key) {
+                return Ok(());
+            }
+
             // `load_aggregator` auto-keys every co-keyed secondary aggregate to
             // this event's id, so no extra aggregators need to be supplied here.
-            self.projection
+            let (_, persisted) = self
+                .projection
                 .load_aggregator(context.executor, &event.aggregate_id, &HashMap::new())
                 .await?;
+            if let Some(cursor) = persisted {
+                self.projection
+                    .record_persisted(&event.aggregate_id, &cursor);
+            }
             Ok(())
         })
     }
@@ -864,6 +947,7 @@ where
                 revision: self.projection.revision,
             };
             P::drop_snapshot(&ctx).await?;
+            self.projection.invalidate_recent(&event.aggregate_id);
             Ok(())
         })
     }

@@ -212,6 +212,10 @@ pub struct Args {
     pub last: Option<u16>,
     /// Cursor to end before (backward pagination)
     pub before: Option<Value>,
+    /// Exclusive upper bound on event stamps, in microseconds since the Unix
+    /// epoch. Rows at or above the bound are excluded server-side, so a
+    /// watermark-gated subscription never fetches rows it would discard.
+    pub to_micros: Option<u64>,
 }
 
 impl Args {
@@ -221,6 +225,7 @@ impl Args {
             after,
             last: None,
             before: None,
+            to_micros: None,
         }
     }
 
@@ -230,7 +235,14 @@ impl Args {
             after: None,
             last: Some(last),
             before,
+            to_micros: None,
         }
+    }
+
+    /// Sets an exclusive upper bound (microseconds since epoch) on event stamps.
+    pub fn to_micros(mut self, bound: u64) -> Self {
+        self.to_micros = Some(bound);
+        self
     }
 
     pub fn is_backward(&self) -> bool {
@@ -248,11 +260,13 @@ impl Args {
     }
 
     pub fn limit(self, v: u16) -> Self {
-        if self.is_backward() {
+        let mut args = if self.is_backward() {
             Args::backward(self.last.unwrap_or(v).min(v), self.before)
         } else {
             Args::forward(self.first.unwrap_or(v).min(v), self.after)
-        }
+        };
+        args.to_micros = self.to_micros;
+        args
     }
 }
 
@@ -302,23 +316,23 @@ where
         }
     }
 
-    pub fn order(&mut self, order: Order) -> &mut Self {
+    pub fn order(mut self, order: Order) -> Self {
         self.order = order;
 
         self
     }
 
-    pub fn desc(&mut self) -> &mut Self {
+    pub fn desc(self) -> Self {
         self.order(Order::Desc)
     }
 
-    pub fn args(&mut self, args: Args) -> &mut Self {
+    pub fn args(mut self, args: Args) -> Self {
         self.args = args;
 
         self
     }
 
-    pub fn backward(&mut self, last: u16, before: Option<Value>) -> &mut Self {
+    pub fn backward(self, last: u16, before: Option<Value>) -> Self {
         self.args(Args {
             last: Some(last),
             before,
@@ -326,7 +340,7 @@ where
         })
     }
 
-    pub fn forward(&mut self, first: u16, after: Option<Value>) -> &mut Self {
+    pub fn forward(self, first: u16, after: Option<Value>) -> Self {
         self.args(Args {
             first: Some(first),
             after,
@@ -334,13 +348,16 @@ where
         })
     }
 
-    pub fn execute(&self) -> Result<ReadResult<T>, ReadError> {
+    pub fn execute(self) -> Result<ReadResult<T>, ReadError> {
         let is_order_desc = matches!(
             (&self.order, self.args.is_backward()),
             (Order::Asc, true) | (Order::Desc, false)
         );
 
-        let mut data = self.data.clone().into_iter().collect::<Vec<_>>();
+        let mut data = self.data;
+        if let Some(bound) = self.args.to_micros {
+            T::retain_before_micros(&mut data, bound);
+        }
         T::sort_by(&mut data, is_order_desc);
         let (limit, cursor) = self.args.get_info();
 
@@ -354,7 +371,7 @@ where
         // `limit` (not the pre-take length) is required so that exactly `limit + 1`
         // matching rows still report `has_more` and return only `limit` edges,
         // matching the SQL backend's pagination.
-        data = data.into_iter().take(limit as usize + 1).collect();
+        data.truncate(limit as usize + 1);
 
         let has_more = data.len() > limit as usize;
         if has_more {
@@ -372,7 +389,7 @@ where
             .collect::<Vec<_>>();
 
         if self.args.is_backward() {
-            edges = edges.into_iter().rev().collect();
+            edges.reverse();
         }
 
         // Both boundary cursors are always populated so a caller can reverse
@@ -428,4 +445,10 @@ pub trait Bind {
         cursor: <<Self as Bind>::T as Cursor>::T,
         is_order_desc: bool,
     );
+    /// Retains only items whose stamp is strictly below `to_micros`
+    /// (microseconds since epoch), honoring [`Args::to_micros`]. The default
+    /// keeps everything — types without a time stamp ignore the bound, and
+    /// callers that rely on it (the subscription loop) keep their own
+    /// per-item check as a backstop.
+    fn retain_before_micros(_data: &mut Vec<Self::T>, _to_micros: u64) {}
 }

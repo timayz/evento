@@ -104,6 +104,17 @@ impl Hash for EventFilter {
     }
 }
 
+/// Combined subscriber fencing + cursor state, fetched in one backend round
+/// trip by [`Executor::subscriber_status`].
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct SubscriberStatus {
+    /// Whether the queried `worker_id` is still the registered owner of the
+    /// subscription (same contract as [`Executor::is_subscriber_running`]).
+    pub running: bool,
+    /// The subscription's current cursor position.
+    pub cursor: Option<Value>,
+}
+
 /// Core trait for event storage backends.
 ///
 /// Implementations handle persisting events, querying, and managing subscriptions.
@@ -195,6 +206,90 @@ pub trait Executor: Send + Sync + 'static {
 
     /// Checks if a subscription is running with the given worker ID.
     async fn is_subscriber_running(&self, key: String, worker_id: Ulid) -> anyhow::Result<bool>;
+
+    /// Fetches subscriber fencing state and cursor together.
+    ///
+    /// The subscription loop calls this once per pass; backends should
+    /// override it to answer from a single query instead of the default's two
+    /// round trips. The cursor is only meaningful while `running` is true, so
+    /// the default skips fetching it for a fenced-out worker.
+    async fn subscriber_status(
+        &self,
+        key: String,
+        worker_id: Ulid,
+    ) -> anyhow::Result<SubscriberStatus> {
+        if !self.is_subscriber_running(key.clone(), worker_id).await? {
+            return Ok(SubscriberStatus {
+                running: false,
+                cursor: None,
+            });
+        }
+        let cursor = self.get_subscriber_cursor(key).await?;
+        Ok(SubscriberStatus {
+            running: true,
+            cursor,
+        })
+    }
+
+    /// Returns the highest committed version of an aggregate stream, or 0 when
+    /// the stream does not exist.
+    ///
+    /// Must be exact under both [`write`](Self::write) and
+    /// [`replicate`](Self::replicate): replicated events can carry timestamps
+    /// out of version order, so backends must derive this from versions (e.g.
+    /// `MAX(version)` or a version index), never from cursor position. The
+    /// default pages through the stream and takes the running max — correct
+    /// but O(stream length); backends should override with an indexed lookup.
+    async fn latest_version(
+        &self,
+        aggregate_type: String,
+        aggregate_id: String,
+    ) -> anyhow::Result<u16> {
+        const PAGE_SIZE: u16 = 4096;
+        let filters = vec![EventFilter::by_id(aggregate_type, aggregate_id)];
+        let mut max = 0u16;
+        let mut after = None;
+        loop {
+            let result = self
+                .read(Some(filters.clone()), None, Args::forward(PAGE_SIZE, after))
+                .await?;
+            if let Some(page_max) = result.edges.iter().map(|e| e.node.version).max() {
+                max = max.max(page_max);
+            }
+            if !result.page_info.has_next_page {
+                break;
+            }
+            // Defensive: a "more pages" claim with no cursor can't advance —
+            // stop rather than loop forever.
+            match result.page_info.end_cursor {
+                Some(cursor) => after = Some(cursor),
+                None => break,
+            }
+        }
+        Ok(max)
+    }
+
+    /// Returns the routing key of an existing aggregate stream.
+    ///
+    /// `None` means the stream does not exist; `Some(key)` is the routing key
+    /// its first event was committed with (which may itself be `None`). Used
+    /// by `WriteBuilder::commit` so an append inherits the stream's original
+    /// key without fetching a full event row — backends should override with
+    /// a narrow lookup of the version-1 event.
+    async fn stream_routing_key(
+        &self,
+        aggregate_type: String,
+        aggregate_id: String,
+    ) -> anyhow::Result<Option<Option<String>>> {
+        let result = self
+            .read(
+                Some(vec![EventFilter::by_id(aggregate_type, aggregate_id)]),
+                None,
+                Args::forward(1, None),
+            )
+            .await?;
+        Ok(result.edges.first().map(|e| e.node.routing_key.clone()))
+    }
 
     /// Creates or updates a subscription record.
     async fn upsert_subscriber(&self, key: String, worker_id: Ulid) -> anyhow::Result<()>;
@@ -345,6 +440,36 @@ impl Executor for Evento {
 
     async fn is_subscriber_running(&self, key: String, worker_id: Ulid) -> anyhow::Result<bool> {
         self.inner.is_subscriber_running(key, worker_id).await
+    }
+
+    // Explicitly forwarded (not left to the trait default) so the inner
+    // backend's single-round-trip overrides are reached through the wrapper.
+    async fn subscriber_status(
+        &self,
+        key: String,
+        worker_id: Ulid,
+    ) -> anyhow::Result<SubscriberStatus> {
+        self.inner.subscriber_status(key, worker_id).await
+    }
+
+    async fn latest_version(
+        &self,
+        aggregate_type: String,
+        aggregate_id: String,
+    ) -> anyhow::Result<u16> {
+        self.inner
+            .latest_version(aggregate_type, aggregate_id)
+            .await
+    }
+
+    async fn stream_routing_key(
+        &self,
+        aggregate_type: String,
+        aggregate_id: String,
+    ) -> anyhow::Result<Option<Option<String>>> {
+        self.inner
+            .stream_routing_key(aggregate_type, aggregate_id)
+            .await
     }
 
     async fn upsert_subscriber(&self, key: String, worker_id: Ulid) -> anyhow::Result<()> {
@@ -534,6 +659,18 @@ impl Executor for EventoGroup {
         self.first().is_subscriber_running(key, worker_id).await
     }
 
+    // Subscriber state lives on the first executor. `latest_version` and
+    // `stream_routing_key` intentionally keep the trait defaults: those go
+    // through `self.read`, which merges all children — forwarding to
+    // `first()` would miss events held by the other executors.
+    async fn subscriber_status(
+        &self,
+        key: String,
+        worker_id: Ulid,
+    ) -> anyhow::Result<SubscriberStatus> {
+        self.first().subscriber_status(key, worker_id).await
+    }
+
     async fn upsert_subscriber(&self, key: String, worker_id: Ulid) -> anyhow::Result<()> {
         self.first().upsert_subscriber(key, worker_id).await
     }
@@ -655,6 +792,34 @@ impl<R: Executor, W: Executor> Executor for Rw<R, W> {
 
     async fn is_subscriber_running(&self, key: String, worker_id: Ulid) -> anyhow::Result<bool> {
         self.r.is_subscriber_running(key, worker_id).await
+    }
+
+    // Forwarded to the same sides the constituent calls already use (reads
+    // from `r`), so the backends' single-round-trip overrides are reached.
+    async fn subscriber_status(
+        &self,
+        key: String,
+        worker_id: Ulid,
+    ) -> anyhow::Result<SubscriberStatus> {
+        self.r.subscriber_status(key, worker_id).await
+    }
+
+    async fn latest_version(
+        &self,
+        aggregate_type: String,
+        aggregate_id: String,
+    ) -> anyhow::Result<u16> {
+        self.r.latest_version(aggregate_type, aggregate_id).await
+    }
+
+    async fn stream_routing_key(
+        &self,
+        aggregate_type: String,
+        aggregate_id: String,
+    ) -> anyhow::Result<Option<Option<String>>> {
+        self.r
+            .stream_routing_key(aggregate_type, aggregate_id)
+            .await
     }
 
     async fn upsert_subscriber(&self, key: String, worker_id: Ulid) -> anyhow::Result<()> {

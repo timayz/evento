@@ -89,6 +89,19 @@ pub struct CommandState {
     pub applied_conflict: Option<bool>,
 }
 
+/// An anti-entropy requester's view of its own applied state: its redundancy
+/// floor plus the ids of every applied command it holds at/above that floor.
+/// The responder ships only applied commands with `t0 >= since` missing from
+/// `txns`, so a healthy in-sync round transfers ids instead of full command
+/// payloads.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncKnown {
+    /// The requester's redundancy floor (`Replica::redundant_before`).
+    pub since: Timestamp,
+    /// Applied txns the requester already holds at/above `since`.
+    pub txns: Vec<TxnId>,
+}
+
 /// A protocol message between nodes. Every message names its transaction by
 /// [`TxnId`]; the id's node component identifies the *original* coordinator, so
 /// replicas route execution results back without any separate addressing.
@@ -180,9 +193,16 @@ pub enum Message {
     /// bootstrap. `snapshot` requests the materialized data-store snapshot too
     /// (set by a bootstrapping join, whose state may be below the contact's
     /// truncation watermark); anti-entropy clears it (it only needs recent
-    /// commands). `id` correlates the reply with the in-flight request, so a
-    /// concurrent join and anti-entropy round cannot steal each other's data.
-    SyncRequest { id: u64, snapshot: bool },
+    /// commands). `known` is the anti-entropy digest — when present, the
+    /// responder ships only the applied commands the requester is missing;
+    /// bootstrap sends `None` (ship everything). `id` correlates the reply
+    /// with the in-flight request, so a concurrent join and anti-entropy round
+    /// cannot steal each other's data.
+    SyncRequest {
+        id: u64,
+        snapshot: bool,
+        known: Option<SyncKnown>,
+    },
     /// Periodic gossip between shard replicas: the sender has applied every
     /// transaction below `applied_through`. The cluster compacts (drops redundant
     /// consensus state and truncates the log) below the per-shard minimum of these.
