@@ -2057,9 +2057,7 @@ pub async fn read_order_timestamp<E: Executor + Clone>(executor: &E) -> anyhow::
 /// `write` must replace client-supplied timestamps with the store's commit
 /// clock (so cursor order tracks commit order), while `replicate` persists
 /// them verbatim (for replication layers that own ordering).
-pub async fn write_restamps_client_clock<E: Executor + Clone>(
-    executor: &E,
-) -> anyhow::Result<()> {
+pub async fn write_restamps_client_clock<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
     let agg_type = "evento/RestampTest";
     let mk = |id: &str| Event {
         id: Ulid::generate(),

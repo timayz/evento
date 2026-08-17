@@ -885,7 +885,11 @@ mod tests {
 
         // A later conflicting transaction must witness A as a dependency.
         let (_, deps) = replica.preaccept(b, vec![key.clone()], vec![event("k", 1)]);
-        assert_eq!(deps, vec![a], "the Accept-only transaction must be a dependency");
+        assert_eq!(
+            deps,
+            vec![a],
+            "the Accept-only transaction must be a dependency"
+        );
     }
 
     /// Same repair via Commit: a keyless entry (created by a keyless Accept
@@ -898,8 +902,17 @@ mod tests {
         let a = txn(10);
         let b = txn(20);
 
-        replica.accept(a, Ballot(a.0), a.0, vec![], vec![]).expect("accepted");
-        replica.commit(a, a.0, vec![], vec![event("k", 1)], vec![key.clone()], NodeId(0));
+        replica
+            .accept(a, Ballot(a.0), a.0, vec![], vec![])
+            .expect("accepted");
+        replica.commit(
+            a,
+            a.0,
+            vec![],
+            vec![event("k", 1)],
+            vec![key.clone()],
+            NodeId(0),
+        );
 
         let (_, deps) = replica.preaccept(b, vec![key.clone()], vec![event("k", 2)]);
         assert_eq!(deps, vec![a], "Commit must index the keys it carries");

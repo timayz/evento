@@ -17,8 +17,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use evento_accord::{
     AcceptorRecord, CommandState, DataStore, HybridLogicalClock, InMemoryDataStore,
-    InMemoryJournal, InMemoryNetwork, Journal, MessageSink, Node, NodeConfig, NodeId, StaticTopology,
-    Timestamp, Topology, TxnId,
+    InMemoryJournal, InMemoryNetwork, Journal, MessageSink, Node, NodeConfig, NodeId,
+    StaticTopology, Timestamp, Topology, TxnId,
 };
 use evento_core::Event;
 

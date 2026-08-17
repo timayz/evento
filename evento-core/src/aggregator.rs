@@ -500,7 +500,11 @@ mod tests {
         ) -> anyhow::Result<()> {
             unreachable!()
         }
-        async fn delete_snapshot(&self, _aggregate_type: String, _id: String) -> anyhow::Result<()> {
+        async fn delete_snapshot(
+            &self,
+            _aggregate_type: String,
+            _id: String,
+        ) -> anyhow::Result<()> {
             unreachable!()
         }
     }

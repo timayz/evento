@@ -64,10 +64,22 @@ fn down_statements() -> Vec<TableDropStatement> {
     // `if_exists` keeps the revert runnable after a partial apply on MySQL,
     // whose DDL is non-transactional.
     vec![
-        Table::drop().table(AccordCommands::Table).if_exists().to_owned(),
-        Table::drop().table(AccordMeta::Table).if_exists().to_owned(),
-        Table::drop().table(AccordMetadataLog::Table).if_exists().to_owned(),
-        Table::drop().table(AccordAcceptors::Table).if_exists().to_owned(),
+        Table::drop()
+            .table(AccordCommands::Table)
+            .if_exists()
+            .to_owned(),
+        Table::drop()
+            .table(AccordMeta::Table)
+            .if_exists()
+            .to_owned(),
+        Table::drop()
+            .table(AccordMetadataLog::Table)
+            .if_exists()
+            .to_owned(),
+        Table::drop()
+            .table(AccordAcceptors::Table)
+            .if_exists()
+            .to_owned(),
     ]
 }
 

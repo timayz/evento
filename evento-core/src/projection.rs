@@ -548,8 +548,7 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
                 }
 
                 state.set_cursor(&event.cursor);
-                if event.node.aggregate_type == self.aggregate_type
-                    && event.node.aggregate_id == id
+                if event.node.aggregate_type == self.aggregate_type && event.node.aggregate_id == id
                 {
                     state.set_aggregate_version(event.node.version);
                 }

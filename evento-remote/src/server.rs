@@ -129,9 +129,7 @@ async fn connection<E: Executor + Clone>(
     let framed = Framed::new(stream, codec());
     let (mut sink, mut inbound) = framed.split();
     let (out_tx, mut out_rx) = mpsc::channel::<ServerFrame>(OUT_CAPACITY);
-    let inflight = std::sync::Arc::new(tokio::sync::Semaphore::new(
-        MAX_INFLIGHT_PER_CONNECTION,
-    ));
+    let inflight = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_PER_CONNECTION));
 
     let writer = tokio::spawn(async move {
         while let Some(frame) = out_rx.recv().await {

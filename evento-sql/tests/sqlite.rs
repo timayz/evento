@@ -69,7 +69,8 @@ async fn sqlite_subscribe_low_latency() -> anyhow::Result<()> {
     // watermark gate defers events younger than the margin). The default 1s
     // margin is sized for multi-process deployments; this single-writer test
     // DB shrinks it so the sub-500ms latency assertion measures the wake path.
-    let executor = Sql::<sqlx::Sqlite>::from(pool).stable_margin(std::time::Duration::from_millis(50));
+    let executor =
+        Sql::<sqlx::Sqlite>::from(pool).stable_margin(std::time::Duration::from_millis(50));
     evento_test::subscribe_low_latency::<Sql<sqlx::Sqlite>>(&executor).await
 }
 

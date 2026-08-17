@@ -1031,7 +1031,10 @@ mod tests {
             .set_subscriber_enabled(key.clone(), false)
             .await
             .unwrap();
-        assert!(!executor.is_subscriber_running(key, worker_id).await.unwrap());
+        assert!(!executor
+            .is_subscriber_running(key, worker_id)
+            .await
+            .unwrap());
     }
 
     /// Length-prefixed index keys: an aggregate id containing the old NUL

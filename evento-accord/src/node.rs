@@ -1826,9 +1826,9 @@ impl Node {
                         |p| p.slow_q,
                         Self::after(self.settings.collect_timeout),
                         |m| match m {
-                            Message::AcceptOk { ballot: b, deps, .. } if b == ballot => {
-                                Some(Ok(deps))
-                            }
+                            Message::AcceptOk {
+                                ballot: b, deps, ..
+                            } if b == ballot => Some(Ok(deps)),
                             Message::Nack { promised, .. } => Some(Err(promised)),
                             _ => None,
                         },

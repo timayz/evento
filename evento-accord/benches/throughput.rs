@@ -6,13 +6,13 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use std::hint::black_box;
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use evento_accord::{
     DataStore, HybridLogicalClock, InMemoryDataStore, InMemoryJournal, InMemoryNetwork, Journal,
     MessageSink, Node, NodeId, StaticTopology,
 };
 use evento_core::Event;
+use std::hint::black_box;
 use tokio::runtime::Runtime;
 
 /// Builds and starts an `n`-node in-memory cluster, returning the nodes (their

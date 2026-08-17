@@ -47,10 +47,7 @@ sqlx_migrator::sqlite_migration!(
     "main",
     "m0006",
     vec_box![crate::M0005],
-    vec_box![
-        snapshot_create::Operation,
-        repair_columns::Operation,
-    ]
+    vec_box![snapshot_create::Operation, repair_columns::Operation,]
 );
 
 #[cfg(feature = "mysql")]
@@ -59,10 +56,7 @@ sqlx_migrator::mysql_migration!(
     "main",
     "m0006",
     vec_box![crate::M0005],
-    vec_box![
-        snapshot_create::Operation,
-        repair_columns::Operation,
-    ]
+    vec_box![snapshot_create::Operation, repair_columns::Operation,]
 );
 
 #[cfg(feature = "postgres")]
@@ -71,8 +65,5 @@ sqlx_migrator::postgres_migration!(
     "main",
     "m0006",
     vec_box![crate::M0005],
-    vec_box![
-        snapshot_create::Operation,
-        repair_columns::Operation,
-    ]
+    vec_box![snapshot_create::Operation, repair_columns::Operation,]
 );
