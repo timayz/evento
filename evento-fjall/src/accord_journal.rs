@@ -58,6 +58,17 @@ impl FjallJournal {
     /// Opens (creating if absent) a journal at `path`.
     pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let db = Database::builder(path).open()?;
+        Self::from_database(db)
+    }
+
+    /// Creates a journal inside an existing database.
+    ///
+    /// fjall takes a directory lock per database, so this is the only way to
+    /// colocate the consensus journal with a [`crate::Fjall`] event store in
+    /// one database (`Fjall::database()` exposes the handle). The journal uses
+    /// its own `accord_*`-prefixed keyspaces, so it never collides with the
+    /// event store's.
+    pub fn from_database(db: Database) -> anyhow::Result<Self> {
         let commands = db.keyspace("accord_commands", KeyspaceCreateOptions::default)?;
         let meta = db.keyspace("accord_meta", KeyspaceCreateOptions::default)?;
         Ok(Self { db, commands, meta })

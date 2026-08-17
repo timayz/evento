@@ -17,8 +17,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use evento_accord::{
     AcceptorRecord, CommandState, DataStore, HybridLogicalClock, InMemoryDataStore,
-    InMemoryJournal, InMemoryNetwork, Journal, MessageSink, Node, NodeId, StaticTopology,
-    Timestamp, Topology, TxnId,
+    InMemoryJournal, InMemoryNetwork, Journal, MessageSink, Node, NodeConfig, NodeId,
+    StaticTopology, Timestamp, Topology, TxnId,
 };
 use evento_core::Event;
 
@@ -130,7 +130,15 @@ fn start(n: u64) -> Cluster {
             Arc::new(net.sink(id)) as Arc<dyn MessageSink>,
             Arc::clone(&store) as Arc<dyn DataStore>,
             Arc::clone(&journal) as Arc<dyn Journal>,
-        );
+        )
+        // A write that cannot reach a durable quorum now fails only at
+        // `collect_timeout` (the recovery sweep no longer hijacks the node's
+        // own in-flight write, which used to abort it early by accident) —
+        // keep the timeout below this test's 3s write budget.
+        .with_config(NodeConfig {
+            collect_timeout: Duration::from_secs(1),
+            ..NodeConfig::default()
+        });
         loops.push(node.start(inbox));
         loops.push(node.start_recovery());
         nodes.push(node);

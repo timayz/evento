@@ -45,7 +45,7 @@ use std::{
 
 use crate::{
     context,
-    cursor::{self, Args, Cursor},
+    cursor::{self, Args},
     subscription::{self, RoutingKey, Subscription, SubscriptionBuilder},
     Aggregate, AggregateEvent, EventFilter, Executor, WriteBuilder,
 };
@@ -126,17 +126,18 @@ impl<'a, E: Executor> Context<'a, E> {
     ///
     /// Panics if the aggregate type was not registered via [`LoadBuilder::aggregate`].
     pub async fn aggregate<A: Aggregate>(&self) -> String {
-        tracing::debug!(
-            "Failed to get `Aggregate id <{}>` For the Aggregate id extractor to work \
-        correctly, register the related aggregator with `.aggregate::<MyAggregator>(id)` on \
-        the load builder. Ensure that types align in both the set and retrieve calls.",
-            A::aggregate_type()
-        );
-
-        self.aggregators
-            .get(A::aggregate_type())
-            .expect("Projection Aggregate not configured correctly. View/enable debug logs for more details.")
-            .to_owned()
+        match self.aggregators.get(A::aggregate_type()) {
+            Some(id) => id.to_owned(),
+            None => {
+                tracing::error!(
+                    "Failed to get `Aggregate id <{}>` For the Aggregate id extractor to work \
+                correctly, register the related aggregator with `.aggregate::<MyAggregator>(id)` on \
+                the load builder. Ensure that types align in both the set and retrieve calls.",
+                    A::aggregate_type()
+                );
+                panic!("Projection Aggregate not configured correctly. See error logs for details.")
+            }
+        }
     }
 }
 
@@ -180,6 +181,17 @@ pub trait ProjectionCursor {
     fn get_cursor(&self) -> cursor::Value;
     /// Sets the cursor position.
     fn set_cursor(&mut self, v: &cursor::Value);
+
+    /// Returns the version of the primary aggregate as of the last applied
+    /// primary-aggregate event (0 when none has been applied yet).
+    ///
+    /// Maintained by `Projection::load_aggregator`; unlike the stream cursor,
+    /// this only ever advances on events of the primary aggregate itself, so
+    /// it stays correct for multi-aggregate and name-filtered projections.
+    fn get_aggregate_version(&self) -> u16;
+
+    /// Records the version of the primary aggregate.
+    fn set_aggregate_version(&mut self, v: u16);
 }
 
 /// Trait for projections that can create a [`WriteBuilder`].
@@ -193,18 +205,14 @@ pub trait ProjectionAggregate: ProjectionCursor {
     /// projection represents (typically a field populated from the first event).
     fn aggregate_id(&self) -> String;
 
-    /// Returns the current aggregate version from the cursor.
+    /// Returns the current version of the primary aggregate.
     ///
-    /// Returns `0` if no cursor is set.
+    /// Returns `0` if no primary-aggregate event has been applied yet. This is
+    /// tracked separately from the stream cursor: the cursor's last event may
+    /// belong to a secondary aggregate or a name-filtered subset, so its
+    /// version field is not a reliable source for optimistic concurrency.
     fn aggregate_version(&self) -> anyhow::Result<u16> {
-        let value = self.get_cursor();
-        if value == Default::default() {
-            return Ok(0);
-        }
-
-        let cursor = crate::Event::deserialize_cursor(&value)?;
-
-        Ok(cursor.v)
+        Ok(self.get_aggregate_version())
     }
 
     /// Creates a [`WriteBuilder`] pre-configured with this projection's ID and version.
@@ -485,41 +493,83 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
             })
             .collect::<Vec<_>>();
 
-        let events = executor
-            .read(
-                Some(read_aggregators.to_vec()),
-                None,
-                Args::forward(100, cursor.clone()),
-            )
-            .await?;
+        // On a backend with a stability watermark, events at/above it may still
+        // be reordered by late commits, so the persisted snapshot cursor must
+        // never advance past the watermark. Such events are still folded into
+        // the returned in-memory state (read-your-writes), just not persisted.
+        let stable = executor.stable_timestamp().await?;
 
-        if events.edges.is_empty() && snapshot.is_none() {
+        let mut snapshot_state: Option<P> = snapshot;
+        let mut page_cursor = cursor;
+        // Applied events pending persistence; only ever true below the watermark.
+        let mut dirty = false;
+        // Once set, the watermark was reached: keep applying in memory, stop persisting.
+        let mut gated = false;
+        let mut any_events = false;
+
+        loop {
+            let events = executor
+                .read(
+                    Some(read_aggregators.to_vec()),
+                    None,
+                    Args::forward(100, page_cursor.clone()),
+                )
+                .await?;
+
+            if events.edges.is_empty() {
+                break;
+            }
+            any_events = true;
+            let state = snapshot_state.get_or_insert_with(Default::default);
+
+            for event in events.edges.iter() {
+                if !gated {
+                    if let Some(w) = stable {
+                        let event_micros = (event.node.timestamp)
+                            .saturating_mul(1_000_000)
+                            .saturating_add(event.node.timestamp_subsec as u64 * 1_000);
+                        if event_micros >= w {
+                            // Persist the stable prefix before folding events
+                            // that could still be reordered.
+                            if dirty {
+                                state.take_snapshot(&context).await?;
+                                dirty = false;
+                            }
+                            gated = true;
+                        }
+                    }
+                }
+
+                let key = format!("{}_{}", event.node.aggregate_type, event.node.name);
+                match self.handlers.get(&key) {
+                    Some(handler) => handler.handle(state, &event.node).await?,
+                    None if !self.safety_disabled => anyhow::bail!("no handler k={key}"),
+                    None => {}
+                }
+
+                state.set_cursor(&event.cursor);
+                if event.node.aggregate_type == self.aggregate_type && event.node.aggregate_id == id
+                {
+                    state.set_aggregate_version(event.node.version);
+                }
+                if !gated {
+                    dirty = true;
+                }
+            }
+
+            page_cursor = events.edges.last().map(|e| e.cursor.to_owned());
+            if !events.page_info.has_next_page {
+                break;
+            }
+        }
+
+        if !any_events && snapshot_state.is_none() {
             return Ok(None);
         }
 
-        let mut snapshot = snapshot.unwrap_or_default();
-
-        for event in events.edges.iter() {
-            let key = format!("{}_{}", event.node.aggregate_type, event.node.name);
-
-            let Some(handler) = self.handlers.get(&key) else {
-                if !self.safety_disabled {
-                    anyhow::bail!("no handler k={key}");
-                }
-
-                continue;
-            };
-
-            handler.handle(&mut snapshot, &event.node).await?;
-        }
-
-        if let Some(event) = events.edges.last() {
-            snapshot.set_cursor(&event.cursor);
+        let snapshot = snapshot_state.unwrap_or_default();
+        if dirty {
             snapshot.take_snapshot(&context).await?;
-        }
-
-        if events.page_info.has_next_page {
-            anyhow::bail!("Too busy");
         }
 
         Ok(Some(snapshot))
@@ -561,10 +611,10 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> LoadBuilder<E, P> {
 
     /// Executes the load, returning the rebuilt state.
     ///
-    /// Returns `None` if no events exist for the aggregate, or if a tombstone
-    /// was registered via [`Projection::tombstone`] and the corresponding
-    /// event has been committed for this id.
-    /// Returns `Err` if there are too many events to process in one batch.
+    /// Replays events in pages of 100, restoring from a snapshot when one is
+    /// available. Returns `None` if no events exist for the aggregate, or if a
+    /// tombstone was registered via [`Projection::tombstone`] and the
+    /// corresponding event has been committed for this id.
     pub async fn execute(&self, executor: &E) -> anyhow::Result<Option<P>> {
         self.projection
             .load_aggregator(executor, &self.id, &self.aggregators)

@@ -1,6 +1,9 @@
 //! Core SQL implementation for event sourcing.
 
-use std::ops::{Deref, DerefMut};
+use std::{
+    ops::{Deref, DerefMut},
+    time::Duration,
+};
 
 #[cfg(feature = "mysql")]
 use sea_query::MysqlQueryBuilder;
@@ -29,7 +32,7 @@ use evento_core::{
 /// - `Id` - Event identifier (ULID format, VARCHAR(26))
 /// - `Name` - Event type name (VARCHAR(50))
 /// - `AggregatorType` - Aggregate root type (VARCHAR(50))
-/// - `AggregatorId` - Aggregate root instance ID (VARCHAR(26))
+/// - `AggregatorId` - Aggregate root instance ID (VARCHAR(64))
 /// - `Version` - Event sequence number within the aggregate
 /// - `Data` - Serialized event payload (BLOB, bitcode format)
 /// - `Metadata` - Serialized event metadata (BLOB, bitcode format)
@@ -96,7 +99,7 @@ pub enum Snapshot {
 /// - `Key` - Subscriber identifier (primary key)
 /// - `WorkerId` - ULID of the current worker processing events
 /// - `Cursor` - Current position in the event stream
-/// - `Lag` - Number of events behind the latest
+/// - `Lag` - Seconds behind the newest matching event (not an event count)
 /// - `Enabled` - Whether the subscription is active
 /// - `CreatedAt` / `UpdatedAt` - Timestamps
 #[derive(Iden)]
@@ -192,9 +195,39 @@ pub type RwSqlite = evento_core::Rw<Sqlite, Sqlite>;
 /// - **`is_subscriber_running`** - Check if a subscriber is active with a specific worker
 /// - **`upsert_subscriber`** - Create or update a subscriber record
 /// - **`acknowledge`** - Update subscriber cursor after processing events
-pub struct Sql<DB: Database>(Pool<DB>, tokio::sync::watch::Sender<u64>);
+///
+/// # Ordering and the stability watermark
+///
+/// `write` stamps `timestamp`/`timestamp_subsec` with the **database server
+/// clock** (statement time), so cursor order cannot be skewed by writer-host
+/// clocks. Because several processes can still commit out of cursor order
+/// within a small window, `stable_timestamp` returns DB-server time minus
+/// [`stable_margin`](Self::stable_margin) (default 1s) and subscriptions only
+/// process events below that watermark. The margin must exceed the worst-case
+/// duration of a single event INSERT (plus replica lag when reading from a
+/// replica via `Rw`); subscription end-to-end latency grows by roughly the
+/// margin.
+pub struct Sql<DB: Database> {
+    pool: Pool<DB>,
+    write_watch: tokio::sync::watch::Sender<u64>,
+    stable_margin: Duration,
+}
+
+/// Default stability margin for [`Sql::stable_margin`].
+const DEFAULT_STABLE_MARGIN: Duration = Duration::from_secs(1);
 
 impl<DB: Database> Sql<DB> {
+    /// Sets the stability margin subtracted from DB-server time to form the
+    /// subscription watermark (default 1s).
+    ///
+    /// Lower values reduce subscription latency but must stay above the
+    /// worst-case commit duration of a single event INSERT — otherwise a slow
+    /// commit can land below an already-acknowledged cursor and be skipped.
+    pub fn stable_margin(mut self, v: Duration) -> Self {
+        self.stable_margin = v;
+        self
+    }
+
     fn build_sqlx<S: SqlxBinder>(statement: S) -> (String, sea_query_sqlx::SqlxValues) {
         match DB::NAME {
             #[cfg(feature = "sqlite")]
@@ -203,6 +236,47 @@ impl<DB: Database> Sql<DB> {
             "MySQL" => statement.build_sqlx(MysqlQueryBuilder),
             #[cfg(feature = "postgres")]
             "PostgreSQL" => statement.build_sqlx(PostgresQueryBuilder),
+            name => panic!("'{name}' not supported, consider using SQLite, PostgreSQL or MySQL"),
+        }
+    }
+
+    /// Per-dialect SQL expressions evaluating to the DB server's current time
+    /// as `(whole seconds, milliseconds-within-second)`.
+    ///
+    /// All date/time functions are statement-stable on every supported
+    /// backend (SQLite caches the instant per statement, MySQL's `NOW()` is
+    /// statement-start, Postgres' `now()` is transaction-start), so the two
+    /// columns — and every row of a multi-event batch — always agree.
+    fn server_time_exprs() -> (Expr, Expr) {
+        match DB::NAME {
+            #[cfg(feature = "sqlite")]
+            "SQLite" => (
+                Expr::cust("CAST(unixepoch('subsec') AS INTEGER)"),
+                Expr::cust("CAST(unixepoch('subsec') * 1000 AS INTEGER) % 1000"),
+            ),
+            #[cfg(feature = "mysql")]
+            "MySQL" => (
+                Expr::cust("FLOOR(UNIX_TIMESTAMP(NOW(3)))"),
+                Expr::cust("MOD(FLOOR(UNIX_TIMESTAMP(NOW(3)) * 1000), 1000)"),
+            ),
+            #[cfg(feature = "postgres")]
+            "PostgreSQL" => (
+                Expr::cust("FLOOR(EXTRACT(EPOCH FROM now()))::BIGINT"),
+                Expr::cust("MOD(FLOOR(EXTRACT(EPOCH FROM now()) * 1000)::BIGINT, 1000)"),
+            ),
+            name => panic!("'{name}' not supported, consider using SQLite, PostgreSQL or MySQL"),
+        }
+    }
+
+    /// SQL expression evaluating to the DB server's current time in microseconds.
+    fn server_time_micros_expr() -> &'static str {
+        match DB::NAME {
+            #[cfg(feature = "sqlite")]
+            "SQLite" => "CAST(unixepoch('subsec') * 1000000 AS INTEGER)",
+            #[cfg(feature = "mysql")]
+            "MySQL" => "CAST(UNIX_TIMESTAMP(NOW(6)) * 1000000 AS SIGNED)",
+            #[cfg(feature = "postgres")]
+            "PostgreSQL" => "(EXTRACT(EPOCH FROM now()) * 1000000)::BIGINT",
             name => panic!("'{name}' not supported, consider using SQLite, PostgreSQL or MySQL"),
         }
     }
@@ -288,7 +362,7 @@ where
 
         Ok(Reader::new(statement)
             .args(args)
-            .execute::<_, SqlEvent, _>(&self.0)
+            .execute::<_, SqlEvent, _>(&self.pool)
             .await?
             .map(|e| e.0))
     }
@@ -350,7 +424,7 @@ where
 
         let (ts,): (Option<i64>,) =
             sqlx::query_as_with::<DB, (Option<i64>,), _>(sqlx::AssertSqlSafe(sql.as_str()), values)
-                .fetch_one(&self.0)
+                .fetch_one(&self.pool)
                 .await?;
 
         Ok(ts.map(|v| if v < 0 { 0 } else { v as u64 }).unwrap_or(0))
@@ -370,7 +444,7 @@ where
             sqlx::AssertSqlSafe(sql.as_str()),
             values,
         )
-        .fetch_optional(&self.0)
+        .fetch_optional(&self.pool)
         .await?
         else {
             return Ok(None);
@@ -389,10 +463,15 @@ where
 
         let (sql, values) = Self::build_sqlx(statement);
 
-        let (id, enabled) =
+        // A missing row (e.g. an operator deleted the subscriber to stop it)
+        // means "not running", not an error.
+        let Some((id, enabled)) =
             sqlx::query_as_with::<DB, (String, bool), _>(sqlx::AssertSqlSafe(sql.as_str()), values)
-                .fetch_one(&self.0)
-                .await?;
+                .fetch_optional(&self.pool)
+                .await?
+        else {
+            return Ok(false);
+        };
 
         Ok(worker_id.to_string() == id && enabled)
     }
@@ -413,76 +492,101 @@ where
         let (sql, values) = Self::build_sqlx(statement);
 
         sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
-            .execute(&self.0)
+            .execute(&self.pool)
             .await?;
 
         Ok(())
     }
 
     async fn write(&self, events: Vec<evento_core::Event>) -> Result<(), WriteError> {
-        let mut statement = Query::insert()
-            .into_table(Event::Table)
-            .columns([
-                Event::Id,
-                Event::Name,
-                Event::Data,
-                Event::Metadata,
-                Event::AggregatorType,
-                Event::AggregatorId,
-                Event::Version,
-                Event::RoutingKey,
-                Event::Timestamp,
-                Event::TimestampSubsec,
-            ])
-            .to_owned();
-
-        for event in events {
-            let metadata = bitcode::encode(&event.metadata);
-            statement.values_panic([
-                event.id.to_string().into(),
-                event.name.into(),
-                event.data.into(),
-                metadata.into(),
-                event.aggregate_type.into(),
-                event.aggregate_id.into(),
-                event.version.into(),
-                event.routing_key.into(),
-                event.timestamp.into(),
-                event.timestamp_subsec.into(),
-            ]);
+        if events.is_empty() {
+            return Ok(());
         }
 
-        let (sql, values) = Self::build_sqlx(statement);
-
-        sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
-            .execute(&self.0)
+        // Contiguity check: the unique `(type, id, version)` index only catches
+        // duplicate versions, not a gap (e.g. writing version 11 when the
+        // aggregate is at 5). A concurrent writer that advances the version
+        // after this check can only cause the batch to collide on the unique
+        // index — never to create a gap — so check + index together enforce
+        // contiguity.
+        if let Some(first) = events.first() {
+            // CAST so the result decodes as i64 on every dialect (Postgres
+            // returns MAX(INT4) as INT4; MySQL spells the target type SIGNED).
+            let max_version_expr = match DB::NAME {
+                #[cfg(feature = "mysql")]
+                "MySQL" => "CAST(MAX(version) AS SIGNED)",
+                _ => "CAST(MAX(version) AS BIGINT)",
+            };
+            let statement = Query::select()
+                .expr(Expr::cust(max_version_expr))
+                .from(Event::Table)
+                .and_where(Expr::col(Event::AggregatorType).eq(first.aggregate_type.as_str()))
+                .and_where(Expr::col(Event::AggregatorId).eq(first.aggregate_id.as_str()))
+                .to_owned();
+            let (sql, values) = Self::build_sqlx(statement);
+            let (last,): (Option<i64>,) = sqlx::query_as_with::<DB, (Option<i64>,), _>(
+                sqlx::AssertSqlSafe(sql.as_str()),
+                values,
+            )
+            .fetch_one(&self.pool)
             .await
-            .map_err(|err| {
-                let err_str = err.to_string();
-                if err_str.contains("(code: 2067)") {
-                    return WriteError::InvalidOriginalVersion;
-                }
-                if err_str.contains("1062 (23000): Duplicate entry") {
-                    return WriteError::InvalidOriginalVersion;
-                }
-                if err_str.contains("duplicate key value violates unique constraint") {
-                    return WriteError::InvalidOriginalVersion;
-                }
-                WriteError::Unknown(err.into())
-            })?;
+            .map_err(|err| WriteError::Unknown(err.into()))?;
+
+            let expected = last.unwrap_or(0) as u64 + 1;
+            if u64::from(first.version) != expected {
+                return Err(WriteError::InvalidOriginalVersion);
+            }
+        }
+
+        self.insert_events(events, true).await?;
 
         // Wake any in-process subscriptions immediately instead of waiting for
         // their next poll tick.
-        self.1.send_modify(|v| *v += 1);
+        self.write_watch.send_modify(|v| *v += 1);
+
+        Ok(())
+    }
+
+    async fn replicate(&self, events: Vec<evento_core::Event>) -> Result<(), WriteError> {
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        // Replication layers own ordering and versioning: persist the caller's
+        // timestamps verbatim and skip the contiguity pre-check.
+        self.insert_events(events, false).await?;
+        self.write_watch.send_modify(|v| *v += 1);
 
         Ok(())
     }
 
     fn write_watch(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
-        Some(self.1.subscribe())
+        Some(self.write_watch.subscribe())
     }
 
-    async fn acknowledge(&self, key: String, cursor: Value, lag: u64) -> anyhow::Result<()> {
+    async fn stable_timestamp(&self) -> anyhow::Result<Option<u64>> {
+        let statement = Query::select()
+            .expr(Expr::cust(Self::server_time_micros_expr()))
+            .to_owned();
+        let (sql, values) = Self::build_sqlx(statement);
+        let (now_micros,): (i64,) =
+            sqlx::query_as_with::<DB, (i64,), _>(sqlx::AssertSqlSafe(sql.as_str()), values)
+                .fetch_one(&self.pool)
+                .await?;
+
+        let now_micros = u64::try_from(now_micros).unwrap_or(0);
+        Ok(Some(now_micros.saturating_sub(
+            self.stable_margin.as_micros().min(u128::from(u64::MAX)) as u64,
+        )))
+    }
+
+    async fn acknowledge(
+        &self,
+        key: String,
+        worker_id: Ulid,
+        cursor: Value,
+        lag: u64,
+    ) -> anyhow::Result<bool> {
         let statement = Query::update()
             .table(Subscriber::Table)
             .values([
@@ -490,16 +594,23 @@ where
                 (Subscriber::Lag, lag.into()),
                 (Subscriber::UpdatedAt, Expr::current_timestamp()),
             ])
-            .and_where(Expr::col(Subscriber::Key).eq(key))
+            .and_where(Expr::col(Subscriber::Key).eq(key.as_str()))
+            // Fenced on the worker id: a superseded worker's ack must not
+            // rewind the cursor the new owner is advancing.
+            .and_where(Expr::col(Subscriber::WorkerId).eq(worker_id.to_string()))
             .to_owned();
 
         let (sql, values) = Self::build_sqlx(statement);
 
         sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
-            .execute(&self.0)
+            .execute(&self.pool)
             .await?;
 
-        Ok(())
+        // sqlx exposes no dialect-agnostic rows_affected, so re-check
+        // ownership: if this worker no longer owns the key, the fenced update
+        // was a no-op. (A takeover between the two queries reads as "lost",
+        // which is the conservative outcome.)
+        self.is_subscriber_running(key, worker_id).await
     }
 
     async fn get_snapshot(
@@ -523,7 +634,7 @@ where
             sqlx::AssertSqlSafe(sql.as_str()),
             values,
         )
-        .fetch_optional(&self.0)
+        .fetch_optional(&self.pool)
         .await
         .map(|res| res.map(|(data, cursor)| (data, cursor.into())))?)
     }
@@ -563,7 +674,7 @@ where
         let (sql, values) = Self::build_sqlx(statement);
 
         sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
-            .execute(&self.0)
+            .execute(&self.pool)
             .await?;
 
         Ok(())
@@ -579,8 +690,86 @@ where
         let (sql, values) = Self::build_sqlx(statement);
 
         sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
-            .execute(&self.0)
+            .execute(&self.pool)
             .await?;
+
+        Ok(())
+    }
+}
+
+impl<DB> Sql<DB>
+where
+    DB: Database,
+    for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
+    sea_query_sqlx::SqlxValues: sqlx::IntoArguments<DB>,
+{
+    /// Inserts a batch of events; with `restamp`, `timestamp`/
+    /// `timestamp_subsec` are replaced by DB-server statement time so cursor
+    /// order matches commit order regardless of writer-host clocks.
+    async fn insert_events(
+        &self,
+        events: Vec<evento_core::Event>,
+        restamp: bool,
+    ) -> Result<(), WriteError> {
+        let mut statement = Query::insert()
+            .into_table(Event::Table)
+            .columns([
+                Event::Id,
+                Event::Name,
+                Event::Data,
+                Event::Metadata,
+                Event::AggregatorType,
+                Event::AggregatorId,
+                Event::Version,
+                Event::RoutingKey,
+                Event::Timestamp,
+                Event::TimestampSubsec,
+            ])
+            .to_owned();
+
+        for event in events {
+            let metadata = bitcode::encode(&event.metadata);
+            let (timestamp, timestamp_subsec) = if restamp {
+                Self::server_time_exprs()
+            } else {
+                (event.timestamp.into(), event.timestamp_subsec.into())
+            };
+            statement.values_panic([
+                event.id.to_string().into(),
+                event.name.into(),
+                event.data.into(),
+                metadata.into(),
+                event.aggregate_type.into(),
+                event.aggregate_id.into(),
+                event.version.into(),
+                event.routing_key.into(),
+                timestamp,
+                timestamp_subsec,
+            ]);
+        }
+
+        let (sql, values) = Self::build_sqlx(statement);
+
+        sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
+            .execute(&self.pool)
+            .await
+            .map_err(|err| {
+                // Structured detection: driver `Display` strings are localized
+                // (Postgres `lc_messages`, MySQL locale) and matching them
+                // silently breaks optimistic concurrency on non-English
+                // servers. The only unique constraints on `event` are the
+                // primary key (random ULID, collision-free in practice) and
+                // the `(type, id, version)` index, so a unique violation means
+                // a version conflict.
+                let is_unique = err
+                    .as_database_error()
+                    .is_some_and(|db_err| db_err.is_unique_violation());
+                if is_unique {
+                    WriteError::InvalidOriginalVersion
+                } else {
+                    WriteError::Unknown(err.into())
+                }
+            })?;
 
         Ok(())
     }
@@ -590,13 +779,29 @@ impl<D: Database> Clone for Sql<D> {
     fn clone(&self) -> Self {
         // `watch::Sender` clones share the same channel, so all clones of this
         // executor notify the same set of subscription receivers on write.
-        Self(self.0.clone(), self.1.clone())
+        Self {
+            pool: self.pool.clone(),
+            write_watch: self.write_watch.clone(),
+            stable_margin: self.stable_margin,
+        }
     }
 }
 
 impl<D: Database> From<Pool<D>> for Sql<D> {
+    /// Builds an executor with a fresh write-wake channel and the default
+    /// [`stable_margin`](Sql::stable_margin).
+    ///
+    /// Note: two executors built from the same pool via separate `.into()`
+    /// calls do **not** share the wake channel — a subscription started on one
+    /// is not woken by writes through the other and falls back to its poll
+    /// interval. Build once and [`Clone`] (clones share the channel) when
+    /// low-latency wakeups matter.
     fn from(value: Pool<D>) -> Self {
-        Self(value, tokio::sync::watch::channel(0).0)
+        Self {
+            pool: value,
+            write_watch: tokio::sync::watch::channel(0).0,
+            stable_margin: DEFAULT_STABLE_MARGIN,
+        }
     }
 }
 
@@ -763,21 +968,24 @@ impl Reader {
             edges = edges.into_iter().rev().collect();
         }
 
+        // Both boundary cursors are always populated so a caller can reverse
+        // direction from either end of a page. Only the paging direction's
+        // "more" flag can be computed from the probe row; the opposite flag
+        // stays `false` (unknown), per the GraphQL cursor-connection spec.
+        let start_cursor = edges.first().map(|e| e.cursor.clone());
+        let end_cursor = edges.last().map(|e| e.cursor.clone());
         let page_info = if self.args.is_backward() {
-            let start_cursor = edges.first().map(|e| e.cursor.clone());
-
             PageInfo {
                 has_previous_page: has_more,
                 has_next_page: false,
                 start_cursor,
-                end_cursor: None,
+                end_cursor,
             }
         } else {
-            let end_cursor = edges.last().map(|e| e.cursor.clone());
             PageInfo {
                 has_previous_page: false,
                 has_next_page: has_more,
-                start_cursor: None,
+                start_cursor,
                 end_cursor,
             }
         };
@@ -798,7 +1006,7 @@ impl Reader {
         }
 
         self.build_reader_order::<B>();
-        self.limit((limit + 1).into());
+        self.limit(limit as u64 + 1);
 
         Ok(limit)
     }
@@ -832,7 +1040,12 @@ impl Reader {
             expr = Some(current_expr.or(Expr::col(col).eq(value).and(prev_expr.clone())));
         }
 
-        self.and_where(expr.unwrap());
+        // `expr` is only `None` when a `Bind` impl declares zero columns; such
+        // a cursor cannot constrain anything, so leave the query unfiltered
+        // rather than panicking on a public-trait misuse.
+        if let Some(expr) = expr {
+            self.and_where(expr);
+        }
 
         Ok(())
     }
@@ -1005,17 +1218,28 @@ where
         let metadata: evento_core::metadata::Metadata =
             bitcode::decode(&metadata).map_err(|e| sqlx::Error::Decode(e.into()))?;
 
+        // Checked narrowing: an out-of-range column value (negative timestamp,
+        // version above u16::MAX) is a decode error, not silent wraparound.
+        let version = u16::try_from(version)
+            .map_err(|_| sqlx::Error::Decode(format!("version {version} out of range").into()))?;
+        let timestamp = u64::try_from(timestamp).map_err(|_| {
+            sqlx::Error::Decode(format!("timestamp {timestamp} out of range").into())
+        })?;
+        let timestamp_subsec = u32::try_from(timestamp_subsec).map_err(|_| {
+            sqlx::Error::Decode(format!("timestamp_subsec {timestamp_subsec} out of range").into())
+        })?;
+
         Ok(SqlEvent(evento_core::Event {
             id: Ulid::from_string(sqlx::Row::try_get(row, "id")?)
                 .map_err(|err| sqlx::Error::InvalidArgument(err.to_string()))?,
             aggregate_id: sqlx::Row::try_get(row, "aggregator_id")?,
             aggregate_type: sqlx::Row::try_get(row, "aggregator_type")?,
-            version: version as u16,
+            version,
             name: sqlx::Row::try_get(row, "name")?,
             routing_key: sqlx::Row::try_get(row, "routing_key")?,
             data: sqlx::Row::try_get(row, "data")?,
-            timestamp: timestamp as u64,
-            timestamp_subsec: timestamp_subsec as u32,
+            timestamp,
+            timestamp_subsec,
             metadata,
         }))
     }

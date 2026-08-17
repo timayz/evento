@@ -16,16 +16,11 @@ fn up_statement() -> TableAlterStatement {
         .to_owned()
 }
 
+// `down` restores the same width as `up`: databases created at the current
+// schema already have VARCHAR(50) from `m0001`, so shrinking to the historical
+// VARCHAR(20) would truncate or reject data that was always valid there.
 fn down_statement() -> TableAlterStatement {
-    Table::alter()
-        .table(Event::Table)
-        .modify_column(
-            ColumnDef::new(Event::Name)
-                .string()
-                .string_len(20)
-                .not_null(),
-        )
-        .to_owned()
+    up_statement()
 }
 
 #[cfg(feature = "sqlite")]

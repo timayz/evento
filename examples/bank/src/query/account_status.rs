@@ -20,6 +20,7 @@ pub struct AccountStatusView {
     pub is_frozen: bool,
     pub is_closed: bool,
     pub cursor: cursor::Value,
+    pub aggregate_version: u16,
 }
 
 impl evento::ProjectionCursor for AccountStatusView {
@@ -29,6 +30,14 @@ impl evento::ProjectionCursor for AccountStatusView {
 
     fn set_cursor(&mut self, v: &cursor::Value) {
         self.cursor = v.to_owned();
+    }
+
+    fn get_aggregate_version(&self) -> u16 {
+        self.aggregate_version
+    }
+
+    fn set_aggregate_version(&mut self, v: u16) {
+        self.aggregate_version = v;
     }
 }
 impl<E: Executor> evento::Snapshot<E> for AccountStatusView {}

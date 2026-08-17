@@ -61,10 +61,12 @@
 //!
 //! # Serialization
 //!
-//! The [`sql_types`] module provides the [`Bitcode`](sql_types::Bitcode) wrapper for compact
-//! binary serialization of event data using the bitcode format.
+//! The `sql_types` module (SQLite only, feature `sqlite`) provides the
+//! `Bitcode` wrapper for compact binary serialization of event data using the
+//! bitcode format.
 
 mod sql;
+#[cfg(feature = "sqlite")]
 pub mod sql_types;
 
 pub use sql::*;

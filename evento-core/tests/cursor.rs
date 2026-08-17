@@ -16,6 +16,7 @@ fn forward() -> anyhow::Result<()> {
         res.page_info,
         PageInfo {
             has_next_page: false,
+            start_cursor: res.edges.first().map(|e| e.cursor.to_owned()),
             end_cursor: res.edges.last().map(|e| e.cursor.to_owned()),
             ..Default::default()
         }
@@ -62,6 +63,7 @@ fn forward_3() -> anyhow::Result<()> {
         res.page_info,
         PageInfo {
             has_next_page: true,
+            start_cursor: res.edges.first().map(|e| e.cursor.to_owned()),
             end_cursor: res.edges.last().map(|e| e.cursor.to_owned()),
             ..Default::default()
         }
@@ -84,6 +86,7 @@ fn forward_2_after_3() -> anyhow::Result<()> {
         res.page_info,
         PageInfo {
             has_next_page: true,
+            start_cursor: res.edges.first().map(|e| e.cursor.to_owned()),
             end_cursor: res.edges.last().map(|e| e.cursor.to_owned()),
             ..Default::default()
         }
@@ -106,6 +109,7 @@ fn forward_2_after_9() -> anyhow::Result<()> {
         res.page_info,
         PageInfo {
             has_next_page: true,
+            start_cursor: res.edges.first().map(|e| e.cursor.to_owned()),
             end_cursor: res.edges.last().map(|e| e.cursor.to_owned()),
             ..Default::default()
         }
@@ -128,6 +132,7 @@ fn forward_3_after_8() -> anyhow::Result<()> {
         res.page_info,
         PageInfo {
             has_next_page: false,
+            start_cursor: res.edges.first().map(|e| e.cursor.to_owned()),
             end_cursor: res.edges.last().map(|e| e.cursor.to_owned()),
             ..Default::default()
         }
@@ -150,6 +155,7 @@ fn forward_desc() -> anyhow::Result<()> {
         res.page_info,
         PageInfo {
             has_next_page: false,
+            start_cursor: res.edges.first().map(|e| e.cursor.to_owned()),
             end_cursor: res.edges.last().map(|e| e.cursor.to_owned()),
             ..Default::default()
         }
@@ -184,6 +190,7 @@ fn forward_desc_3() -> anyhow::Result<()> {
         res.page_info,
         PageInfo {
             has_next_page: true,
+            start_cursor: res.edges.first().map(|e| e.cursor.to_owned()),
             end_cursor: res.edges.last().map(|e| e.cursor.to_owned()),
             ..Default::default()
         }
@@ -210,6 +217,7 @@ fn forward_desc_2_after_3() -> anyhow::Result<()> {
         res.page_info,
         PageInfo {
             has_next_page: false,
+            start_cursor: res.edges.first().map(|e| e.cursor.to_owned()),
             end_cursor: res.edges.last().map(|e| e.cursor.to_owned()),
             ..Default::default()
         }
@@ -233,6 +241,7 @@ fn forward_desc_2_after_9() -> anyhow::Result<()> {
         res.page_info,
         PageInfo {
             has_next_page: true,
+            start_cursor: res.edges.first().map(|e| e.cursor.to_owned()),
             end_cursor: res.edges.last().map(|e| e.cursor.to_owned()),
             ..Default::default()
         }
@@ -259,6 +268,7 @@ fn forward_desc_3_after_8() -> anyhow::Result<()> {
         res.page_info,
         PageInfo {
             has_next_page: true,
+            start_cursor: res.edges.first().map(|e| e.cursor.to_owned()),
             end_cursor: res.edges.last().map(|e| e.cursor.to_owned()),
             ..Default::default()
         }
@@ -282,6 +292,7 @@ fn backward_20() -> anyhow::Result<()> {
         PageInfo {
             has_previous_page: false,
             start_cursor: res.edges.first().map(|e| e.cursor.to_owned()),
+            end_cursor: res.edges.last().map(|e| e.cursor.to_owned()),
             ..Default::default()
         }
     );
@@ -324,6 +335,7 @@ fn backward_3() -> anyhow::Result<()> {
         PageInfo {
             has_previous_page: true,
             start_cursor: res.edges.first().map(|e| e.cursor.to_owned()),
+            end_cursor: res.edges.last().map(|e| e.cursor.to_owned()),
             ..Default::default()
         }
     );
@@ -347,6 +359,7 @@ fn backward_2_after_4() -> anyhow::Result<()> {
         PageInfo {
             has_previous_page: true,
             start_cursor: res.edges.first().map(|e| e.cursor.to_owned()),
+            end_cursor: res.edges.last().map(|e| e.cursor.to_owned()),
             ..Default::default()
         }
     );
@@ -369,6 +382,7 @@ fn backward_2_after_2() -> anyhow::Result<()> {
         PageInfo {
             has_previous_page: false,
             start_cursor: res.edges.first().map(|e| e.cursor.to_owned()),
+            end_cursor: res.edges.last().map(|e| e.cursor.to_owned()),
             ..Default::default()
         }
     );
@@ -390,6 +404,7 @@ fn backward_3_after_8() -> anyhow::Result<()> {
         PageInfo {
             has_previous_page: true,
             start_cursor: res.edges.first().map(|e| e.cursor.to_owned()),
+            end_cursor: res.edges.last().map(|e| e.cursor.to_owned()),
             ..Default::default()
         }
     );
@@ -416,6 +431,7 @@ fn backward_desc_20() -> anyhow::Result<()> {
         PageInfo {
             has_previous_page: false,
             start_cursor: res.edges.first().map(|e| e.cursor.to_owned()),
+            end_cursor: res.edges.last().map(|e| e.cursor.to_owned()),
             ..Default::default()
         }
     );
@@ -448,6 +464,7 @@ fn backward_desc_3() -> anyhow::Result<()> {
         PageInfo {
             has_previous_page: true,
             start_cursor: res.edges.first().map(|e| e.cursor.to_owned()),
+            end_cursor: res.edges.last().map(|e| e.cursor.to_owned()),
             ..Default::default()
         }
     );
@@ -474,6 +491,7 @@ fn backward_desc_2_after_4() -> anyhow::Result<()> {
         PageInfo {
             has_previous_page: false,
             start_cursor: res.edges.first().map(|e| e.cursor.to_owned()),
+            end_cursor: res.edges.last().map(|e| e.cursor.to_owned()),
             ..Default::default()
         }
     );
@@ -497,6 +515,7 @@ fn backward_desc_2_after_2() -> anyhow::Result<()> {
         PageInfo {
             has_previous_page: true,
             start_cursor: res.edges.first().map(|e| e.cursor.to_owned()),
+            end_cursor: res.edges.last().map(|e| e.cursor.to_owned()),
             ..Default::default()
         }
     );
@@ -521,6 +540,7 @@ fn backward_desc_3_after_8() -> anyhow::Result<()> {
         PageInfo {
             has_previous_page: false,
             start_cursor: res.edges.first().map(|e| e.cursor.to_owned()),
+            end_cursor: res.edges.last().map(|e| e.cursor.to_owned()),
             ..Default::default()
         }
     );

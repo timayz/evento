@@ -30,11 +30,16 @@ use ulid::Ulid;
 
 use crate::{cursor::Args, metadata::Metadata, Event, EventFilter, Executor};
 
-/// Creates a new builder for the given aggregate IDs.
+/// Derives a stable aggregate ID from a set of IDs by hashing them.
+///
+/// Each ID is length-prefixed before hashing so distinct ID lists can never
+/// collide (`["ab", "c"]` and `["a", "bc"]` produce different digests).
 pub fn hash_ids(ids: Vec<impl Into<String>>) -> String {
     let mut hasher = Sha3_256::new();
     for id in ids {
-        hasher.update(id.into());
+        let id: String = id.into();
+        hasher.update((id.len() as u64).to_be_bytes());
+        hasher.update(id);
     }
 
     hex::encode(hasher.finalize())
@@ -50,6 +55,17 @@ pub enum WriteError {
     /// Attempted to commit without adding any events
     #[error("trying to commit event without data")]
     MissingData,
+
+    /// Events from more than one aggregate type were added to a single builder
+    #[error("all events in one commit must belong to aggregate type {expected}, got {got}")]
+    MixedAggregateTypes {
+        expected: &'static str,
+        got: &'static str,
+    },
+
+    /// The aggregate reached the maximum representable version (`u16::MAX`)
+    #[error("aggregate version overflow")]
+    VersionOverflow,
 
     /// Unknown error from the executor
     #[error("{0}")]
@@ -110,9 +126,10 @@ pub trait AggregateEvent: Aggregate {
 ///
 /// # Optimistic Concurrency
 ///
-/// If `original_version` is 0 (default for new aggregates), the builder
-/// queries the current version before writing. Otherwise, it uses the
-/// provided version for optimistic concurrency control.
+/// `original_version` (default 0, meaning a brand-new aggregate) is the
+/// version the caller last observed. Events are written as
+/// `original_version + 1..`; if another writer committed in between, the
+/// store rejects the write with [`WriteError::InvalidOriginalVersion`].
 ///
 /// # Example
 ///
@@ -133,12 +150,13 @@ pub trait AggregateEvent: Aggregate {
 #[derive(Clone)]
 pub struct WriteBuilder {
     aggregate_id: String,
-    aggregate_type: String,
+    aggregate_type: &'static str,
     routing_key: Option<String>,
     routing_key_locked: bool,
     original_version: u16,
     data: Vec<(&'static str, Vec<u8>)>,
     metadata: Metadata,
+    mixed_types: Option<(&'static str, &'static str)>,
 }
 
 impl WriteBuilder {
@@ -146,12 +164,13 @@ impl WriteBuilder {
     pub fn new(aggregate_id: impl Into<String>) -> WriteBuilder {
         WriteBuilder {
             aggregate_id: aggregate_id.into(),
-            aggregate_type: "".to_owned(),
+            aggregate_type: "",
             routing_key: None,
             routing_key_locked: false,
             original_version: 0,
             data: Vec::default(),
             metadata: Default::default(),
+            mixed_types: None,
         }
     }
 
@@ -191,9 +210,11 @@ impl WriteBuilder {
         self
     }
 
-    /// Sets the metadata to attach to all events.
+    /// Inserts a single metadata entry attached to all events of this commit.
     ///
     /// Metadata is serialized using bitcode and stored alongside each event.
+    /// Call multiple times to add several entries; note that a later
+    /// [`metadata_from`](Self::metadata_from) call replaces the whole map.
     pub fn metadata<M>(&mut self, key: impl Into<String>, value: &M) -> &mut Self
     where
         M: bitcode::Encode,
@@ -212,9 +233,12 @@ impl WriteBuilder {
         self
     }
 
-    /// Sets the metadata to attach to all events.
+    /// Replaces the entire metadata map attached to all events of this commit.
     ///
-    /// Metadata is serialized using bitcode and stored alongside each event.
+    /// Any entries added earlier via [`metadata`](Self::metadata),
+    /// [`requested_by`](Self::requested_by) or
+    /// [`requested_as`](Self::requested_as) are discarded — call this first
+    /// when combining it with per-entry setters.
     pub fn metadata_from(&mut self, value: impl Into<Metadata>) -> &mut Self {
         self.metadata = value.into();
         self
@@ -222,14 +246,20 @@ impl WriteBuilder {
 
     /// Adds an event to be committed.
     ///
-    /// Multiple events can be added and will be committed atomically.
-    /// The event data is serialized using bitcode.
+    /// Multiple events can be added and will be committed atomically. All
+    /// events in one builder must belong to the same aggregate type;
+    /// [`commit`](Self::commit) fails with [`WriteError::MixedAggregateTypes`]
+    /// otherwise. The event data is serialized using bitcode.
     pub fn event<D>(&mut self, v: &D) -> &mut Self
     where
         D: AggregateEvent + bitcode::Encode,
     {
+        if self.aggregate_type.is_empty() {
+            self.aggregate_type = D::aggregate_type();
+        } else if self.aggregate_type != D::aggregate_type() && self.mixed_types.is_none() {
+            self.mixed_types = Some((self.aggregate_type, D::aggregate_type()));
+        }
         self.data.push((D::event_name(), bitcode::encode(v)));
-        self.aggregate_type = D::aggregate_type().to_owned();
         self
     }
 
@@ -243,10 +273,17 @@ impl WriteBuilder {
     /// - [`WriteError::InvalidOriginalVersion`] - Version conflict occurred
     /// - [`WriteError::Unknown`] - Executor error
     pub async fn commit<E: Executor>(&self, executor: &E) -> Result<String, WriteError> {
+        if self.data.is_empty() {
+            return Err(WriteError::MissingData);
+        }
+        if let Some((expected, got)) = self.mixed_types {
+            return Err(WriteError::MixedAggregateTypes { expected, got });
+        }
+
         let first_event = executor
             .read(
                 Some(vec![EventFilter::by_id(
-                    &self.aggregate_type,
+                    self.aggregate_type,
                     &self.aggregate_id,
                 )]),
                 None,
@@ -255,20 +292,34 @@ impl WriteBuilder {
             .await
             .map_err(WriteError::Unknown)?;
 
+        // An existing stream keeps the routing key of its first event — even
+        // when that key is `None` — so one aggregate never spans two keys. Only
+        // a brand-new aggregate consults the builder value or the executor's
+        // configured default.
         let routing_key = match first_event.edges.first() {
             Some(event) => event.node.routing_key.to_owned(),
-            _ => self.routing_key.to_owned(),
+            _ => self
+                .routing_key
+                .to_owned()
+                .or_else(|| executor.default_routing_key().map(str::to_owned)),
         };
 
         let mut events = vec![];
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
 
-        for (version, (name, data)) in (self.original_version + 1..).zip(&self.data) {
+        for (offset, (name, data)) in self.data.iter().enumerate() {
+            let version = u16::try_from(offset)
+                .ok()
+                .and_then(|o| self.original_version.checked_add(1)?.checked_add(o))
+                .ok_or(WriteError::VersionOverflow)?;
+
             let event = Event {
                 id: Ulid::generate(),
                 name: name.to_string(),
                 data: data.to_vec(),
                 metadata: self.metadata.clone(),
+                // Provisional stamp: backends that own ordering (SQL, Fjall)
+                // replace it with their commit clock inside `write`.
                 timestamp: now.as_secs(),
                 timestamp_subsec: now.subsec_millis(),
                 aggregate_id: self.aggregate_id.to_owned(),
@@ -278,10 +329,6 @@ impl WriteBuilder {
             };
 
             events.push(event);
-        }
-
-        if events.is_empty() {
-            return Err(WriteError::MissingData);
         }
 
         executor.write(events).await?;
@@ -370,5 +417,147 @@ impl<E: Executor> AggregateExt<E> for E {
 
             Ok(result.edges.first().map(|e| e.node.version))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cursor::{Args, ReadResult, Value};
+    use crate::{EventFilter, RoutingKey};
+
+    #[test]
+    fn hash_ids_is_collision_free_across_boundaries() {
+        // Without length prefixes these two lists concatenate identically.
+        assert_ne!(
+            hash_ids(vec!["ab", "c"]),
+            hash_ids(vec!["a", "bc"]),
+            "id-boundary shifts must produce different digests"
+        );
+        assert_eq!(hash_ids(vec!["a", "b"]), hash_ids(vec!["a", "b"]));
+    }
+
+    /// An executor stub for paths that must fail before any storage call.
+    struct UnreachableExecutor;
+
+    #[async_trait::async_trait]
+    impl Executor for UnreachableExecutor {
+        async fn write(&self, _events: Vec<Event>) -> Result<(), WriteError> {
+            unreachable!()
+        }
+        async fn get_subscriber_cursor(&self, _key: String) -> anyhow::Result<Option<Value>> {
+            unreachable!()
+        }
+        async fn is_subscriber_running(
+            &self,
+            _key: String,
+            _worker_id: Ulid,
+        ) -> anyhow::Result<bool> {
+            unreachable!()
+        }
+        async fn upsert_subscriber(&self, _key: String, _worker_id: Ulid) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        async fn acknowledge(
+            &self,
+            _key: String,
+            _worker_id: Ulid,
+            _cursor: Value,
+            _lag: u64,
+        ) -> anyhow::Result<bool> {
+            unreachable!()
+        }
+        async fn read(
+            &self,
+            _aggregators: Option<Vec<EventFilter>>,
+            _routing_key: Option<RoutingKey>,
+            _args: Args,
+        ) -> anyhow::Result<ReadResult<Event>> {
+            unreachable!()
+        }
+        async fn latest_timestamp(
+            &self,
+            _aggregators: Option<Vec<EventFilter>>,
+            _routing_key: Option<RoutingKey>,
+        ) -> anyhow::Result<u64> {
+            unreachable!()
+        }
+        async fn get_snapshot(
+            &self,
+            _aggregate_type: String,
+            _aggregate_revision: String,
+            _id: String,
+        ) -> anyhow::Result<Option<(Vec<u8>, Value)>> {
+            unreachable!()
+        }
+        async fn save_snapshot(
+            &self,
+            _aggregate_type: String,
+            _aggregate_revision: String,
+            _id: String,
+            _data: Vec<u8>,
+            _cursor: Value,
+        ) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        async fn delete_snapshot(
+            &self,
+            _aggregate_type: String,
+            _id: String,
+        ) -> anyhow::Result<()> {
+            unreachable!()
+        }
+    }
+
+    #[derive(bitcode::Encode, bitcode::Decode, Default)]
+    struct AlphaOpened;
+    impl Aggregate for AlphaOpened {
+        fn aggregate_type() -> &'static str {
+            "test/Alpha"
+        }
+    }
+    impl AggregateEvent for AlphaOpened {
+        fn event_name() -> &'static str {
+            "AlphaOpened"
+        }
+    }
+
+    #[derive(bitcode::Encode, bitcode::Decode, Default)]
+    struct BetaOpened;
+    impl Aggregate for BetaOpened {
+        fn aggregate_type() -> &'static str {
+            "test/Beta"
+        }
+    }
+    impl AggregateEvent for BetaOpened {
+        fn event_name() -> &'static str {
+            "BetaOpened"
+        }
+    }
+
+    /// Mixing events of two aggregate types in one builder must fail the
+    /// commit instead of silently writing both streams under the last type.
+    #[tokio::test]
+    async fn commit_rejects_mixed_aggregate_types() {
+        let result = create()
+            .event(&AlphaOpened)
+            .event(&BetaOpened)
+            .commit(&UnreachableExecutor)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(WriteError::MixedAggregateTypes {
+                expected: "test/Alpha",
+                got: "test/Beta",
+            })
+        ));
+    }
+
+    /// An empty builder fails with `MissingData` before touching the executor.
+    #[tokio::test]
+    async fn commit_rejects_empty_builder() {
+        let result = create().commit(&UnreachableExecutor).await;
+        assert!(matches!(result, Err(WriteError::MissingData)));
     }
 }

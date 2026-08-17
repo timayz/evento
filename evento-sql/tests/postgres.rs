@@ -161,6 +161,12 @@ async fn postgres_exact_filter() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn postgres_write_restamps_client_clock() -> anyhow::Result<()> {
+    let executor = create_postgres_executor("write_restamps_client_clock").await?;
+    evento_test::write_restamps_client_clock(&executor).await
+}
+
+#[tokio::test]
 async fn postgres_concurrent_append() -> anyhow::Result<()> {
     let executor = create_postgres_executor("concurrent_append").await?;
     evento_test::concurrent_append(&executor).await

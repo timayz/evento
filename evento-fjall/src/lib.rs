@@ -42,15 +42,27 @@
 //!
 //! # Data Model
 //!
-//! Events are stored across multiple partitions for efficient querying:
+//! Events are stored across multiple partitions for efficient querying. Index
+//! keys are built from **length-prefixed** components (`{u32 len}{bytes}` per
+//! component), so caller-supplied strings can contain any byte — including
+//! NUL — without one aggregate's keys colliding with or shadowing another's:
 //!
 //! - `events` - Primary storage: `ULID -> Event`
-//! - `agg_index` - Aggregate index: `{type}\0{id}\0{version}` -> `ULID`
-//! - `agg_name_index` - Aggregate-name index: `{type}\0{id}\0{name}\0{ULID}` -> `()`
-//! - `routing_index` - Routing key index: `{routing_key}\0{ULID}` -> `()`
-//! - `type_index` - Event type index: `{type}\0{name}\0{ULID}` -> `()`
+//! - `agg_index` - Aggregate index: `enc(type, id) + {version BE}` -> `ULID`
+//! - `agg_name_index` - Aggregate-name index: `enc(type, id, name) + {ULID}` -> `()`
+//! - `routing_index` - Routing key index: `enc(routing_key) + {ULID}` -> `()`
+//! - `type_index` - Event type index: `enc(type, name) + {ULID}` -> `()`
 //! - `subscribers` - Subscription state: `{key}` -> `SubscriberState`
-//! - `snapshots` - Aggregate snapshots: `{type}\0{id}` -> `StoredSnapshot`
+//! - `snapshots` - Aggregate snapshots: `enc(type, id)` -> `StoredSnapshot`
+//! - `meta` - Store metadata: the monotonic commit clock (`last_stamp`)
+//!
+//! # Ordering
+//!
+//! `write` re-stamps events with a **monotonic commit clock** held under the
+//! write lock and persisted in the same batch, so subscription cursor order
+//! always equals commit order — even across restarts and wall-clock
+//! regressions. `replicate` persists caller timestamps verbatim for
+//! replication layers that own ordering themselves.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -76,6 +88,9 @@ struct SubscriberState {
     worker_id: String,
     cursor: Option<String>,
     lag: u64,
+    /// Kill switch: a disabled subscription reports "not running" to its
+    /// worker, mirroring the SQL backend's `enabled` column.
+    enabled: bool,
 }
 
 /// Snapshot record stored in the database.
@@ -165,15 +180,23 @@ pub struct Fjall {
     type_index: Keyspace,
     subscribers: Keyspace,
     snapshots: Keyspace,
-    /// Serializes the read-validate-write critical section of `write` so that
-    /// concurrent appends cannot both pass the optimistic version check (the
-    /// version is read non-atomically before the batch commits).
-    write_lock: Arc<Mutex<()>>,
+    meta: Keyspace,
+    /// Serializes the read-validate-write critical section of `write` (so
+    /// concurrent appends cannot both pass the optimistic version check) and
+    /// all subscriber read-modify-write updates. Holds the monotonic commit
+    /// clock in **milliseconds** since the Unix epoch: each write batch is
+    /// stamped `max(now, last + 1)`, persisted under [`LAST_STAMP_KEY`] in the
+    /// same batch so a wall-clock regression across restarts cannot mint
+    /// cursors below already-acknowledged ones.
+    write_lock: Arc<Mutex<u64>>,
     /// Notifies in-process subscriptions after each successful `write` so they
     /// wake immediately instead of waiting for their next poll tick. Carries a
     /// monotonically increasing write generation.
     write_tx: tokio::sync::watch::Sender<u64>,
 }
+
+/// `meta` keyspace key holding the monotonic commit clock (millis, BE u64).
+const LAST_STAMP_KEY: &[u8] = b"last_stamp";
 
 impl Clone for Fjall {
     fn clone(&self) -> Self {
@@ -186,6 +209,7 @@ impl Clone for Fjall {
             type_index: self.type_index.clone(),
             subscribers: self.subscribers.clone(),
             snapshots: self.snapshots.clone(),
+            meta: self.meta.clone(),
             write_lock: self.write_lock.clone(),
             // `watch::Sender` clones share the same channel, so all clones of
             // this executor notify the same subscription receivers on write.
@@ -220,6 +244,21 @@ impl Fjall {
     /// let executor = Fjall::from_database(db)?;
     /// ```
     pub fn from_database(db: Database) -> anyhow::Result<Self> {
+        let meta = db.keyspace("meta", KeyspaceCreateOptions::default)?;
+
+        // Restore the monotonic commit clock so stamps stay strictly
+        // increasing across restarts even if the wall clock went backwards.
+        let last_stamp = match meta.get(LAST_STAMP_KEY)? {
+            Some(bytes) => {
+                let bytes: [u8; 8] = bytes
+                    .as_ref()
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("corrupt last_stamp meta entry"))?;
+                u64::from_be_bytes(bytes)
+            }
+            None => 0,
+        };
+
         Ok(Self {
             events: db.keyspace("events", KeyspaceCreateOptions::default)?,
             agg_index: db.keyspace("agg_index", KeyspaceCreateOptions::default)?,
@@ -228,10 +267,38 @@ impl Fjall {
             type_index: db.keyspace("type_index", KeyspaceCreateOptions::default)?,
             subscribers: db.keyspace("subscribers", KeyspaceCreateOptions::default)?,
             snapshots: db.keyspace("snapshots", KeyspaceCreateOptions::default)?,
-            write_lock: Arc::new(Mutex::new(())),
+            meta,
+            write_lock: Arc::new(Mutex::new(last_stamp)),
             write_tx: tokio::sync::watch::channel(0).0,
             db,
         })
+    }
+
+    /// Enables or disables a subscription (the kill switch).
+    ///
+    /// A disabled subscription reports "not running" to its worker, which
+    /// stops without processing further events. Missing subscribers are
+    /// ignored.
+    pub async fn set_subscriber_enabled(&self, key: String, enabled: bool) -> anyhow::Result<()> {
+        let executor = self.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let _guard = executor
+                .write_lock
+                .lock()
+                .map_err(|_| anyhow::anyhow!("write lock poisoned"))?;
+            let Some(bytes) = executor.subscribers.get(&key)? else {
+                return Ok(());
+            };
+            let mut state: SubscriberState = bitcode::decode(bytes.as_ref())
+                .map_err(|e| anyhow::anyhow!("Failed to deserialize subscriber: {}", e))?;
+            state.enabled = enabled;
+            executor
+                .subscribers
+                .insert(key.as_bytes(), bitcode::encode(&state))?;
+            Ok(())
+        })
+        .await?
     }
 
     /// Returns a reference to the underlying database.
@@ -248,58 +315,78 @@ impl Fjall {
         Ok(())
     }
 
+    /// Encodes key components with a length prefix per component
+    /// (`{u32 BE len}{bytes}`).
+    ///
+    /// Unlike a separator byte, this cannot be confused by components that
+    /// themselves contain the separator: `("Ab","c")`, `("A","bc")`, and
+    /// `("A","b\0c")` all encode to distinct, non-prefixing keys, and
+    /// `encode_components(parts)` is a byte-prefix exactly of keys built from
+    /// `parts` plus more data — the property prefix scans rely on.
+    fn encode_components(parts: &[&[u8]]) -> Vec<u8> {
+        let mut key = Vec::with_capacity(parts.iter().map(|p| p.len() + 4).sum());
+        for part in parts {
+            key.extend_from_slice(&(part.len() as u32).to_be_bytes());
+            key.extend_from_slice(part);
+        }
+        key
+    }
+
     /// Builds the aggregate index key.
     fn agg_key(aggregate_type: &str, aggregate_id: &str, version: u16) -> Vec<u8> {
-        let mut key = format!("{}\x00{}\x00", aggregate_type, aggregate_id).into_bytes();
+        let mut key = Self::agg_prefix(aggregate_type, aggregate_id);
         key.extend_from_slice(&version.to_be_bytes());
         key
     }
 
     /// Builds the aggregate index prefix (without version).
-    fn agg_prefix(aggregate_type: &str, aggregate_id: &str) -> String {
-        format!("{}\x00{}\x00", aggregate_type, aggregate_id)
+    fn agg_prefix(aggregate_type: &str, aggregate_id: &str) -> Vec<u8> {
+        Self::encode_components(&[aggregate_type.as_bytes(), aggregate_id.as_bytes()])
     }
 
-    /// Builds the aggregate-name index key: `{type}\0{id}\0{name}\0{ULID}`.
+    /// Builds the aggregate-name index key: `enc(type, id, name) + {ULID}`.
     fn agg_name_key(aggregate_type: &str, aggregate_id: &str, name: &str, id: &Ulid) -> Vec<u8> {
-        let mut key =
-            format!("{}\x00{}\x00{}\x00", aggregate_type, aggregate_id, name).into_bytes();
+        let mut key = Self::agg_name_prefix(aggregate_type, aggregate_id, name);
         key.extend_from_slice(&id.to_bytes());
         key
     }
 
-    /// Builds the aggregate-name index prefix: `{type}\0{id}\0{name}\0`.
-    fn agg_name_prefix(aggregate_type: &str, aggregate_id: &str, name: &str) -> String {
-        format!("{}\x00{}\x00{}\x00", aggregate_type, aggregate_id, name)
+    /// Builds the aggregate-name index prefix: `enc(type, id, name)`.
+    fn agg_name_prefix(aggregate_type: &str, aggregate_id: &str, name: &str) -> Vec<u8> {
+        Self::encode_components(&[
+            aggregate_type.as_bytes(),
+            aggregate_id.as_bytes(),
+            name.as_bytes(),
+        ])
     }
 
     /// Builds the type index key.
     fn type_key(aggregate_type: &str, name: &str, id: &Ulid) -> Vec<u8> {
-        let mut key = format!("{}\x00{}\x00", aggregate_type, name).into_bytes();
+        let mut key = Self::type_prefix(aggregate_type, name);
         key.extend_from_slice(&id.to_bytes());
         key
     }
 
     /// Builds the type index prefix.
-    fn type_prefix(aggregate_type: &str, name: &str) -> String {
-        format!("{}\x00{}\x00", aggregate_type, name)
+    fn type_prefix(aggregate_type: &str, name: &str) -> Vec<u8> {
+        Self::encode_components(&[aggregate_type.as_bytes(), name.as_bytes()])
     }
 
     /// Builds the routing index key.
     fn routing_key(routing_key: &str, id: &Ulid) -> Vec<u8> {
-        let mut key = format!("{}\x00", routing_key).into_bytes();
+        let mut key = Self::routing_prefix(routing_key);
         key.extend_from_slice(&id.to_bytes());
         key
     }
 
     /// Builds the routing index prefix.
-    fn routing_prefix(routing_key: &str) -> String {
-        format!("{}\x00", routing_key)
+    fn routing_prefix(routing_key: &str) -> Vec<u8> {
+        Self::encode_components(&[routing_key.as_bytes()])
     }
 
     /// Builds the snapshot key.
     fn snapshot_key(aggregate_type: &str, id: &str) -> Vec<u8> {
-        format!("{}\x00{}", aggregate_type, id).into_bytes()
+        Self::encode_components(&[aggregate_type.as_bytes(), id.as_bytes()])
     }
 
     /// Gets the last version for an aggregate.
@@ -398,7 +485,7 @@ impl Fjall {
                         }
                         // All events of aggregator type - scan all
                         (None, None) => {
-                            let prefix = format!("{}\x00", agg.aggregate_type);
+                            let prefix = Self::encode_components(&[agg.aggregate_type.as_bytes()]);
                             for guard in self.agg_index.prefix(&prefix) {
                                 let (_, value) = guard.into_inner()?;
                                 let ulid_bytes: [u8; 16] = value.as_ref().try_into()?;
@@ -434,95 +521,153 @@ impl Fjall {
     }
 }
 
+impl Fjall {
+    /// Shared body of `write`/`replicate`: validates version contiguity and
+    /// commits the batch atomically under the write lock. With `restamp`, all
+    /// events are stamped from the monotonic commit clock (`max(now, last+1)`
+    /// millis), which is persisted in the same batch.
+    fn write_events(&self, mut events: Vec<Event>, restamp: bool) -> Result<(), WriteError> {
+        // Hold the write lock across validate + stamp + commit so concurrent
+        // appends cannot both observe the same "last version" and the commit
+        // clock stays strictly increasing.
+        let mut last_stamp = self
+            .write_lock
+            .lock()
+            .map_err(|_| WriteError::Unknown(anyhow::anyhow!("write lock poisoned")))?;
+
+        if restamp {
+            let now_millis = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
+                .unwrap_or(0);
+            let stamp = now_millis.max(last_stamp.saturating_add(1));
+            for event in &mut events {
+                event.timestamp = stamp / 1000;
+                event.timestamp_subsec = (stamp % 1000) as u32;
+            }
+            *last_stamp = stamp;
+        }
+
+        // Validate versions first (optimistic concurrency). `seen` tracks the
+        // version assigned earlier in THIS batch so multiple events for the same
+        // aggregate (e.g. a create() committing several events) validate correctly.
+        let mut seen: std::collections::HashMap<(String, String), u16> =
+            std::collections::HashMap::new();
+        for event in &events {
+            let agg = (event.aggregate_type.clone(), event.aggregate_id.clone());
+            let last_version = match seen.get(&agg) {
+                Some(v) => Some(*v),
+                None => self
+                    .get_last_version(&event.aggregate_type, &event.aggregate_id)
+                    .map_err(WriteError::Unknown)?,
+            };
+
+            match last_version {
+                Some(v) if event.version != v + 1 => {
+                    return Err(WriteError::InvalidOriginalVersion);
+                }
+                None if event.version != 1 => {
+                    return Err(WriteError::InvalidOriginalVersion);
+                }
+                _ => {}
+            }
+
+            seen.insert(agg, event.version);
+
+            // A reused ULID would silently overwrite the original event row
+            // while both index entries survive — reject it instead.
+            if self
+                .events
+                .get(event.id.to_bytes())
+                .map_err(|e| WriteError::Unknown(e.into()))?
+                .is_some()
+            {
+                return Err(WriteError::Unknown(anyhow::anyhow!(
+                    "duplicate event id {}",
+                    event.id
+                )));
+            }
+        }
+
+        // Write atomically using batch
+        let mut batch = self.db.batch();
+
+        for event in &events {
+            let id_bytes = event.id.to_bytes();
+            let stored = StoredEvent::from(event);
+            let event_bytes = bitcode::encode(&stored);
+
+            // Primary: ULID -> Event
+            batch.insert(&self.events, id_bytes, event_bytes);
+
+            // Aggregate index: enc(type, id) + version -> ULID
+            let agg_key = Fjall::agg_key(&event.aggregate_type, &event.aggregate_id, event.version);
+            batch.insert(&self.agg_index, agg_key, id_bytes);
+
+            // Aggregate-name index: enc(type, id, name) + ULID -> ()
+            let agg_name_key = Fjall::agg_name_key(
+                &event.aggregate_type,
+                &event.aggregate_id,
+                &event.name,
+                &event.id,
+            );
+            batch.insert(&self.agg_name_index, agg_name_key, []);
+
+            // Type index: enc(type, name) + ULID -> ()
+            let type_key = Fjall::type_key(&event.aggregate_type, &event.name, &event.id);
+            batch.insert(&self.type_index, type_key, []);
+
+            // Routing index (if routing key exists): enc(routing) + ULID -> ()
+            if let Some(ref routing_key) = event.routing_key {
+                let routing_key = Fjall::routing_key(routing_key, &event.id);
+                batch.insert(&self.routing_index, routing_key, []);
+            }
+        }
+
+        if restamp {
+            // Persist the commit clock atomically with the events it stamped.
+            batch.insert(&self.meta, LAST_STAMP_KEY, last_stamp.to_be_bytes());
+        }
+
+        batch.commit().map_err(|e| WriteError::Unknown(e.into()))?;
+        self.db
+            .persist(PersistMode::SyncAll)
+            .map_err(|e| WriteError::Unknown(e.into()))?;
+
+        Ok(())
+    }
+}
+
 #[async_trait::async_trait]
 impl Executor for Fjall {
     async fn write(&self, events: Vec<Event>) -> Result<(), WriteError> {
+        if events.is_empty() {
+            return Ok(());
+        }
         let executor = self.clone();
 
-        tokio::task::spawn_blocking(move || {
-            // Hold the write lock across validate + commit so concurrent appends
-            // cannot both observe the same "last version" and both succeed.
-            let _guard = executor
-                .write_lock
-                .lock()
-                .map_err(|_| WriteError::Unknown(anyhow::anyhow!("write lock poisoned")))?;
-
-            // Validate versions first (optimistic concurrency). `seen` tracks the
-            // version assigned earlier in THIS batch so multiple events for the same
-            // aggregate (e.g. a create() committing several events) validate correctly.
-            let mut seen: std::collections::HashMap<(String, String), u16> =
-                std::collections::HashMap::new();
-            for event in &events {
-                let agg = (event.aggregate_type.clone(), event.aggregate_id.clone());
-                let last_version = match seen.get(&agg) {
-                    Some(v) => Some(*v),
-                    None => executor
-                        .get_last_version(&event.aggregate_type, &event.aggregate_id)
-                        .map_err(WriteError::Unknown)?,
-                };
-
-                match last_version {
-                    Some(v) if event.version != v + 1 => {
-                        return Err(WriteError::InvalidOriginalVersion);
-                    }
-                    None if event.version != 1 => {
-                        return Err(WriteError::InvalidOriginalVersion);
-                    }
-                    _ => {}
-                }
-
-                seen.insert(agg, event.version);
-            }
-
-            // Write atomically using batch
-            let mut batch = executor.db.batch();
-
-            for event in &events {
-                let id_bytes = event.id.to_bytes();
-                let stored = StoredEvent::from(event);
-                let event_bytes = bitcode::encode(&stored);
-
-                // Primary: ULID -> Event
-                batch.insert(&executor.events, id_bytes, event_bytes);
-
-                // Aggregate index: {type}\0{id}\0{version} -> ULID
-                let agg_key =
-                    Fjall::agg_key(&event.aggregate_type, &event.aggregate_id, event.version);
-                batch.insert(&executor.agg_index, agg_key, id_bytes);
-
-                // Aggregate-name index: {type}\0{id}\0{name}\0{ULID} -> ()
-                let agg_name_key = Fjall::agg_name_key(
-                    &event.aggregate_type,
-                    &event.aggregate_id,
-                    &event.name,
-                    &event.id,
-                );
-                batch.insert(&executor.agg_name_index, agg_name_key, []);
-
-                // Type index: {type}\0{name}\0{ULID} -> ()
-                let type_key = Fjall::type_key(&event.aggregate_type, &event.name, &event.id);
-                batch.insert(&executor.type_index, type_key, []);
-
-                // Routing index (if routing key exists): {routing}\0{ULID} -> ()
-                if let Some(ref routing_key) = event.routing_key {
-                    let routing_key = Fjall::routing_key(routing_key, &event.id);
-                    batch.insert(&executor.routing_index, routing_key, []);
-                }
-            }
-
-            batch.commit().map_err(|e| WriteError::Unknown(e.into()))?;
-            executor
-                .db
-                .persist(PersistMode::SyncAll)
-                .map_err(|e| WriteError::Unknown(e.into()))?;
-
-            Ok(())
-        })
-        .await
-        .map_err(|e| WriteError::Unknown(e.into()))??;
+        tokio::task::spawn_blocking(move || executor.write_events(events, true))
+            .await
+            .map_err(|e| WriteError::Unknown(e.into()))??;
 
         // Wake any in-process subscriptions immediately instead of waiting for
         // their next poll tick.
+        self.write_tx.send_modify(|v| *v += 1);
+
+        Ok(())
+    }
+
+    async fn replicate(&self, events: Vec<Event>) -> Result<(), WriteError> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let executor = self.clone();
+
+        // Replication layers own ordering: persist caller timestamps verbatim.
+        tokio::task::spawn_blocking(move || executor.write_events(events, false))
+            .await
+            .map_err(|e| WriteError::Unknown(e.into()))??;
+
         self.write_tx.send_modify(|v| *v += 1);
 
         Ok(())
@@ -576,13 +721,19 @@ impl Executor for Fjall {
 
     async fn latest_timestamp(
         &self,
-        aggregators: Option<Vec<EventFilter>>,
-        routing_key: Option<RoutingKey>,
+        _aggregators: Option<Vec<EventFilter>>,
+        _routing_key: Option<RoutingKey>,
     ) -> anyhow::Result<u64> {
-        let result = self
-            .read(aggregators, routing_key, Args::backward(1, None))
-            .await?;
-        Ok(result.edges.last().map(|e| e.node.timestamp).unwrap_or(0))
+        // The commit clock is the max timestamp over ALL events. Using it
+        // instead of a filtered lookup makes this O(1) rather than a full
+        // load-and-sort of every matching event on every subscription poll;
+        // the cost is that lag reported for a quiet stream can reflect writes
+        // to other streams (an upper bound, never an undercount).
+        let last_stamp = *self
+            .write_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("write lock poisoned"))?;
+        Ok(last_stamp / 1000)
     }
 
     async fn get_subscriber_cursor(&self, key: String) -> anyhow::Result<Option<Value>> {
@@ -606,7 +757,7 @@ impl Executor for Fjall {
             Some(bytes) => {
                 let state: SubscriberState = bitcode::decode(bytes.as_ref())
                     .map_err(|e| anyhow::anyhow!("Failed to deserialize subscriber: {}", e))?;
-                Ok(state.worker_id == worker_id.to_string())
+                Ok(state.worker_id == worker_id.to_string() && state.enabled)
             }
             None => Ok(false),
         })
@@ -617,20 +768,28 @@ impl Executor for Fjall {
         let executor = self.clone();
 
         tokio::task::spawn_blocking(move || {
-            // Try to preserve existing cursor if subscriber exists
-            let cursor = match executor.subscribers.get(&key)? {
-                Some(bytes) => {
-                    let state: SubscriberState = bitcode::decode(bytes.as_ref())
-                        .map_err(|e| anyhow::anyhow!("Failed to deserialize subscriber: {}", e))?;
-                    state.cursor
-                }
-                None => None,
-            };
+            // Read-modify-write under the write lock so a concurrent upsert or
+            // acknowledge cannot lose the cursor. Cursor, lag, and enabled all
+            // survive a worker takeover (mirroring the SQL upsert, which only
+            // touches worker_id).
+            let _guard = executor
+                .write_lock
+                .lock()
+                .map_err(|_| anyhow::anyhow!("write lock poisoned"))?;
 
-            let state = SubscriberState {
-                worker_id: worker_id.to_string(),
-                cursor,
-                lag: 0,
+            let state = match executor.subscribers.get(&key)? {
+                Some(bytes) => {
+                    let mut state: SubscriberState = bitcode::decode(bytes.as_ref())
+                        .map_err(|e| anyhow::anyhow!("Failed to deserialize subscriber: {}", e))?;
+                    state.worker_id = worker_id.to_string();
+                    state
+                }
+                None => SubscriberState {
+                    worker_id: worker_id.to_string(),
+                    cursor: None,
+                    lag: 0,
+                    enabled: true,
+                },
             };
 
             executor
@@ -641,25 +800,40 @@ impl Executor for Fjall {
         .await?
     }
 
-    async fn acknowledge(&self, key: String, cursor: Value, lag: u64) -> anyhow::Result<()> {
+    async fn acknowledge(
+        &self,
+        key: String,
+        worker_id: Ulid,
+        cursor: Value,
+        lag: u64,
+    ) -> anyhow::Result<bool> {
         let executor = self.clone();
 
         tokio::task::spawn_blocking(move || {
-            let state = match executor.subscribers.get(&key)? {
-                Some(bytes) => {
-                    let mut state: SubscriberState = bitcode::decode(bytes.as_ref())
-                        .map_err(|e| anyhow::anyhow!("Failed to deserialize subscriber: {}", e))?;
-                    state.cursor = Some(cursor.0);
-                    state.lag = lag;
-                    state
-                }
-                None => anyhow::bail!("Subscriber not found: {}", key),
+            // Fenced read-modify-write under the write lock: a superseded
+            // worker's ack must not rewind the cursor the new owner is
+            // advancing. A missing subscriber (deleted to stop the
+            // subscription) also reads as lost ownership rather than an error.
+            let _guard = executor
+                .write_lock
+                .lock()
+                .map_err(|_| anyhow::anyhow!("write lock poisoned"))?;
+
+            let Some(bytes) = executor.subscribers.get(&key)? else {
+                return Ok(false);
             };
+            let mut state: SubscriberState = bitcode::decode(bytes.as_ref())
+                .map_err(|e| anyhow::anyhow!("Failed to deserialize subscriber: {}", e))?;
+            if state.worker_id != worker_id.to_string() {
+                return Ok(false);
+            }
+            state.cursor = Some(cursor.0);
+            state.lag = lag;
 
             executor
                 .subscribers
                 .insert(key.as_bytes(), bitcode::encode(&state))?;
-            Ok(())
+            Ok(true)
         })
         .await?
     }
@@ -831,15 +1005,155 @@ mod tests {
             .unwrap()
             .is_none());
 
-        // Acknowledge with cursor
-        executor
-            .acknowledge(key.clone(), Value("test-cursor".to_string()), 0)
+        // Acknowledge with cursor (fenced on the owning worker id)
+        assert!(executor
+            .acknowledge(key.clone(), worker_id, Value("test-cursor".to_string()), 0)
             .await
-            .unwrap();
+            .unwrap());
+
+        // A superseded worker's ack is rejected and does not move the cursor
+        assert!(!executor
+            .acknowledge(
+                key.clone(),
+                Ulid::generate(),
+                Value("stale-cursor".to_string()),
+                0
+            )
+            .await
+            .unwrap());
 
         // Check cursor is updated
-        let cursor = executor.get_subscriber_cursor(key).await.unwrap();
+        let cursor = executor.get_subscriber_cursor(key.clone()).await.unwrap();
         assert_eq!(cursor.unwrap().0, "test-cursor");
+
+        // Disabling the subscription reports "not running"
+        executor
+            .set_subscriber_enabled(key.clone(), false)
+            .await
+            .unwrap();
+        assert!(!executor
+            .is_subscriber_running(key, worker_id)
+            .await
+            .unwrap());
+    }
+
+    /// Length-prefixed index keys: an aggregate id containing the old NUL
+    /// separator (or a type/id boundary shift) must not leak into another
+    /// aggregate's prefix scans or version lookup.
+    #[tokio::test]
+    async fn test_key_isolation_with_hostile_ids() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let executor = Fjall::open(temp_dir.path()).unwrap();
+
+        // "a" and "a\0x" collided under the NUL-separator scheme: the prefix
+        // for ("test/Account", "a") was a byte-prefix of ("test/Account", "a\0x").
+        let mut tricky = create_test_event("a x", 1, "Created");
+        tricky.aggregate_type = "test/Account".to_string();
+        executor.write(vec![tricky]).await.unwrap();
+
+        let plain = executor
+            .read(
+                Some(vec![EventFilter::by_id("test/Account", "a")]),
+                None,
+                Args::forward(10, None),
+            )
+            .await
+            .unwrap();
+        assert!(
+            plain.edges.is_empty(),
+            "aggregate 'a' must not see events of aggregate 'a\0x'"
+        );
+
+        // And the version check for "a" starts fresh (no bleed-through from
+        // the hostile neighbour's index entries).
+        let fresh = create_test_event("a", 1, "Created");
+        executor.write(vec![fresh]).await.unwrap();
+    }
+
+    /// The commit clock survives a reopen: stamps stay strictly increasing
+    /// even if events are written back-to-back across a close/open cycle.
+    #[tokio::test]
+    async fn test_commit_clock_is_monotonic_across_reopen() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let first_stamp = {
+            let executor = Fjall::open(temp_dir.path()).unwrap();
+            executor
+                .write(vec![create_test_event("agg-mono", 1, "Created")])
+                .await
+                .unwrap();
+            let read = executor
+                .read(
+                    Some(vec![EventFilter::by_id("test/Account", "agg-mono")]),
+                    None,
+                    Args::forward(10, None),
+                )
+                .await
+                .unwrap();
+            let e = &read.edges[0].node;
+            (e.timestamp, e.timestamp_subsec)
+        };
+
+        let executor = Fjall::open(temp_dir.path()).unwrap();
+        executor
+            .write(vec![create_test_event("agg-mono", 2, "Updated")])
+            .await
+            .unwrap();
+        let read = executor
+            .read(
+                Some(vec![EventFilter::by_id("test/Account", "agg-mono")]),
+                None,
+                Args::forward(10, None),
+            )
+            .await
+            .unwrap();
+        let second = &read.edges[1].node;
+        assert!(
+            (second.timestamp, second.timestamp_subsec) > first_stamp,
+            "commit stamps must stay strictly increasing across a reopen"
+        );
+    }
+
+    /// `write` re-stamps with the commit clock; `replicate` persists the
+    /// caller's timestamps verbatim.
+    #[tokio::test]
+    async fn test_write_restamps_and_replicate_preserves() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let executor = Fjall::open(temp_dir.path()).unwrap();
+
+        let mut stale = create_test_event("agg-restamp", 1, "Created");
+        stale.timestamp = 42; // long in the past
+        stale.timestamp_subsec = 7;
+        executor.write(vec![stale]).await.unwrap();
+
+        let mut verbatim = create_test_event("agg-verbatim", 1, "Created");
+        verbatim.timestamp = 42;
+        verbatim.timestamp_subsec = 7;
+        executor.replicate(vec![verbatim]).await.unwrap();
+
+        let restamped = executor
+            .read(
+                Some(vec![EventFilter::by_id("test/Account", "agg-restamp")]),
+                None,
+                Args::forward(1, None),
+            )
+            .await
+            .unwrap();
+        assert!(
+            restamped.edges[0].node.timestamp > 42,
+            "write must replace a stale client stamp with the commit clock"
+        );
+
+        let preserved = executor
+            .read(
+                Some(vec![EventFilter::by_id("test/Account", "agg-verbatim")]),
+                None,
+                Args::forward(1, None),
+            )
+            .await
+            .unwrap();
+        assert_eq!(preserved.edges[0].node.timestamp, 42);
+        assert_eq!(preserved.edges[0].node.timestamp_subsec, 7);
     }
 
     #[tokio::test]

@@ -190,15 +190,26 @@ async fn run_late_event_scenario(
 /// THE FIX: with the compaction margin above the link delay, the stability
 /// watermark holds B's own event Y back until A's earlier-cursor X has arrived, so
 /// both are processed in cursor order — X is not skipped.
+///
+/// Timings are deliberately generous: a loaded CI runner can oversleep a fixed
+/// sleep by hundreds of milliseconds, so the "X has not arrived yet" check is
+/// event-driven (poll for Y, which `write` has already applied locally) and the
+/// link delay is large enough that scheduler jitter cannot cross it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn subscription_waits_for_a_late_lower_cursor_event() {
-    let margin = Duration::from_secs(1);
-    let link_delay = Duration::from_millis(300); // < margin
+    let margin = Duration::from_secs(3);
+    let link_delay = Duration::from_millis(1500); // < margin, >> scheduler jitter
     let (cluster, subscription, handled) = run_late_event_scenario(margin, link_delay).await;
 
-    // Shortly after the writes, before X has crossed the delayed link: Y is in B's
-    // store but the watermark is still below it, so nothing is handled yet.
-    tokio::time::sleep(Duration::from_millis(120)).await;
+    // B's own Y is applied locally by the time its `write` returned (the
+    // coordinator waits for its own apply); confirm event-driven rather than
+    // with a fixed sleep, then check the delayed X is still in flight and the
+    // watermark is holding Y back.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while cluster.count(1, "local").await == 0 {
+        assert!(Instant::now() < deadline, "B never applied its own write Y");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     assert_eq!(
         cluster.count(1, "delayed").await,
         0,
@@ -211,7 +222,7 @@ async fn subscription_waits_for_a_late_lower_cursor_event() {
     );
 
     // Wait for the watermark to advance past Y (it trails `now` by the margin).
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if handled.lock().unwrap().len() >= 2 {
             break;
@@ -242,12 +253,15 @@ async fn subscription_waits_for_a_late_lower_cursor_event() {
 /// This documents the assumption rather than a supported configuration.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn skip_returns_when_propagation_exceeds_the_margin() {
-    let margin = Duration::from_millis(100);
-    let link_delay = Duration::from_millis(800); // > margin: assumption violated
+    // Wide ratio (10x) so the violation holds even when a loaded CI runner
+    // stretches every step: Y is released after ~margin, X arrives after
+    // ~link_delay, and scheduler jitter cannot close that gap.
+    let margin = Duration::from_millis(200);
+    let link_delay = Duration::from_millis(2000); // >> margin: assumption violated
     let (cluster, subscription, handled) = run_late_event_scenario(margin, link_delay).await;
 
     // Wait until X has finally arrived and been applied to B.
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(6);
     loop {
         if cluster.count(1, "delayed").await == 1 {
             break;
@@ -256,7 +270,7 @@ async fn skip_returns_when_propagation_exceeds_the_margin() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     // Give the subscription a chance to (not) process the late X.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     assert_eq!(cluster.count(1, "local").await, 1);
     assert_eq!(

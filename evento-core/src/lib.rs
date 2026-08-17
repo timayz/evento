@@ -8,8 +8,10 @@
 //! - **`macro`** (default) - Procedural macros from `evento-macro`
 //! - **`group`** - Multi-executor support via `EventoGroup`
 //! - **`rw`** - Read-write split executor pattern via `Rw`
-//! - **`sqlite`**, **`mysql`**, **`postgres`** - Database support via sqlx
-//! - **`fjall`** - Embedded key-value storage with Fjall
+//!
+//! Storage backends (SQL via sqlx, Fjall) live in the `evento-sql` and
+//! `evento-fjall` crates and are re-exported through the `evento` facade
+//! crate's feature flags.
 //!
 //! # Core Concepts
 //!

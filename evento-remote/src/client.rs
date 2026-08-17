@@ -39,8 +39,13 @@ const RECONNECT_MAX: Duration = Duration::from_secs(5);
 const HELLO_ID: u64 = 0;
 /// Capacity of the client's outbound request queue.
 const REQ_CAPACITY: usize = 1024;
-/// Sentinel in the cached watermark atomic meaning "no stable timestamp".
-const NO_STABLE: u64 = u64::MAX;
+/// Capacity of the per-connection encoded-frame queue feeding the writer task.
+const OUT_CAPACITY: usize = 1024;
+
+/// The cached stability watermark pushed by the server (`None` until/unless the
+/// server reports one). A plain `Option` behind a mutex — no sentinel value can
+/// collide with a real watermark.
+type Stable = Arc<Mutex<Option<u64>>>;
 
 fn codec() -> LengthDelimitedCodec {
     LengthDelimitedCodec::builder()
@@ -64,7 +69,7 @@ struct Inner {
     watch_tx: Arc<watch::Sender<u64>>,
     /// Fixed at server executor construction; snapshotted once at connect.
     default_routing_key: Option<String>,
-    stable: Arc<AtomicU64>,
+    stable: Stable,
     request_timeout: Duration,
 }
 
@@ -87,7 +92,7 @@ impl ClientBuilder {
     /// is unreachable; after that the connection is kept alive with automatic
     /// reconnect.
     pub async fn connect(self) -> anyhow::Result<Client> {
-        let stable = Arc::new(AtomicU64::new(NO_STABLE));
+        let stable: Stable = Arc::new(Mutex::new(None));
         let (framed, default_routing_key) =
             connect_and_hello(self.addr, &stable, self.request_timeout).await?;
 
@@ -183,11 +188,11 @@ impl Executor for Client {
         Some(self.inner.watch_tx.subscribe())
     }
 
-    fn stable_timestamp(&self) -> Option<u64> {
-        match self.inner.stable.load(Ordering::Relaxed) {
-            NO_STABLE => None,
-            v => Some(v),
-        }
+    async fn stable_timestamp(&self) -> anyhow::Result<Option<u64>> {
+        // The cached watermark is refreshed by every response and notify frame;
+        // a polling subscription issues several requests per pass, so the cache
+        // is at most one round-trip stale by the time the gate consults it.
+        Ok(*self.inner.stable.lock().expect("stable poisoned"))
     }
 
     async fn write(&self, events: Vec<Event>) -> Result<(), WriteError> {
@@ -195,6 +200,15 @@ impl Executor for Client {
             Ok(Response::Write(Ok(()))) => Ok(()),
             Ok(Response::Write(Err(e))) => Err(e.into()),
             Ok(_) => Err(WriteError::Unknown(protocol_err("write"))),
+            Err(e) => Err(WriteError::Unknown(e)),
+        }
+    }
+
+    async fn replicate(&self, events: Vec<Event>) -> Result<(), WriteError> {
+        match self.request(Request::Replicate { events }).await {
+            Ok(Response::Write(Ok(()))) => Ok(()),
+            Ok(Response::Write(Err(e))) => Err(e.into()),
+            Ok(_) => Err(WriteError::Unknown(protocol_err("replicate"))),
             Err(e) => Err(WriteError::Unknown(e)),
         }
     }
@@ -267,13 +281,24 @@ impl Executor for Client {
         }
     }
 
-    async fn acknowledge(&self, key: String, cursor: Value, lag: u64) -> anyhow::Result<()> {
+    async fn acknowledge(
+        &self,
+        key: String,
+        worker_id: Ulid,
+        cursor: Value,
+        lag: u64,
+    ) -> anyhow::Result<bool> {
         match self
-            .request(Request::Acknowledge { key, cursor, lag })
+            .request(Request::Acknowledge {
+                key,
+                worker_id,
+                cursor,
+                lag,
+            })
             .await?
         {
-            Response::Unit(Ok(())) => Ok(()),
-            Response::Unit(Err(msg)) => Err(anyhow::anyhow!(msg)),
+            Response::Acknowledge(Ok(v)) => Ok(v),
+            Response::Acknowledge(Err(msg)) => Err(anyhow::anyhow!(msg)),
             _ => Err(protocol_err("acknowledge")),
         }
     }
@@ -342,7 +367,7 @@ struct Actor {
     req_rx: mpsc::Receiver<(u64, Request)>,
     pending: Pending,
     watch_tx: Arc<watch::Sender<u64>>,
-    stable: Arc<AtomicU64>,
+    stable: Stable,
     request_timeout: Duration,
 }
 
@@ -358,16 +383,36 @@ impl Actor {
                 },
             };
             let (mut sink, mut inbound) = framed.split();
+            // Dedicated writer task: the read side must keep draining even
+            // while an outbound send is blocked on TCP backpressure, or a
+            // pipelining client and a slow server can deadlock head-of-line
+            // (each side blocked sending, neither reading).
+            let (out_tx, mut out_rx) = mpsc::channel::<Bytes>(OUT_CAPACITY);
+            let writer = tokio::spawn(async move {
+                while let Some(bytes) = out_rx.recv().await {
+                    if sink.send(bytes).await.is_err() {
+                        break;
+                    }
+                }
+            });
             loop {
                 tokio::select! {
                     item = self.req_rx.recv() => {
-                        let Some((id, request)) = item else { return };
+                        let Some((id, request)) = item else { break };
+                        // A request queued before a disconnect whose caller was
+                        // already failed over the reconnect must NOT be sent on
+                        // the new connection: the caller may have retried it
+                        // under a fresh id, and replaying the stale one would
+                        // execute the write twice.
+                        if !self.pending.lock().expect("pending poisoned").contains_key(&id) {
+                            continue;
+                        }
                         let frame = ClientFrame::Request { id, request };
                         let Ok(bytes) = encode_tagged(RecordKind::ClientFrame, &frame) else {
                             self.fail(id);
                             continue;
                         };
-                        if sink.send(Bytes::from(bytes)).await.is_err() {
+                        if out_tx.send(Bytes::from(bytes)).await.is_err() {
                             self.fail(id);
                             break;
                         }
@@ -400,7 +445,14 @@ impl Actor {
                     }
                 }
             }
-            // Disconnected: fail everything in flight, then reconnect.
+            // Disconnected (or all clients dropped): stop the writer, fail
+            // everything in flight, then reconnect.
+            drop(out_tx);
+            let _ = writer.await;
+            if self.req_rx.is_closed() && self.pending.lock().expect("pending poisoned").is_empty()
+            {
+                return;
+            }
             self.fail_pending();
         }
     }
@@ -429,7 +481,7 @@ impl Actor {
 
     fn update_stable(&self, stable_timestamp: Option<u64>) {
         if let Some(v) = stable_timestamp {
-            self.stable.store(v, Ordering::Relaxed);
+            *self.stable.lock().expect("stable poisoned") = Some(v);
         }
     }
 
@@ -449,7 +501,7 @@ impl Actor {
 /// update the watermark.
 async fn connect_and_hello(
     addr: SocketAddr,
-    stable: &AtomicU64,
+    stable: &Mutex<Option<u64>>,
     timeout: Duration,
 ) -> anyhow::Result<(Framed<TcpStream, LengthDelimitedCodec>, Option<String>)> {
     let stream = TcpStream::connect(addr).await?;
@@ -479,7 +531,7 @@ async fn connect_and_hello(
                     stable_timestamp,
                 } => {
                     if let Some(v) = stable_timestamp {
-                        stable.store(v, Ordering::Relaxed);
+                        *stable.lock().expect("stable poisoned") = Some(v);
                     }
                     return Ok(default_routing_key);
                 }
@@ -487,7 +539,7 @@ async fn connect_and_hello(
                     stable_timestamp, ..
                 } => {
                     if let Some(v) = stable_timestamp {
-                        stable.store(v, Ordering::Relaxed);
+                        *stable.lock().expect("stable poisoned") = Some(v);
                     }
                 }
                 _ => anyhow::bail!("unexpected frame during hello"),

@@ -83,6 +83,9 @@ pub struct SqlJournal<DB: Database> {
     pool: Pool<DB>,
     /// Commands staged since the last [`flush`](Journal::flush), as `(key, value)`.
     staged: Mutex<Vec<(Vec<u8>, Vec<u8>)>>,
+    /// Serializes flushes so staged entries are only drained once their
+    /// transaction has committed — a failed flush must leave them staged.
+    flush_lock: tokio::sync::Mutex<()>,
 }
 
 impl<DB: Database> SqlJournal<DB> {
@@ -92,6 +95,7 @@ impl<DB: Database> SqlJournal<DB> {
         Self {
             pool,
             staged: Mutex::new(Vec::new()),
+            flush_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -228,17 +232,23 @@ where
     }
 
     async fn flush(&self) -> anyhow::Result<()> {
-        let batch = std::mem::take(&mut *self.staged.lock().expect("journal poisoned"));
+        // Serialize flushes; entries leave `staged` only after their
+        // transaction commits, so a failed flush keeps the batch for retry and
+        // a concurrent `record` cannot observe "flushed" state that was never
+        // made durable.
+        let _guard = self.flush_lock.lock().await;
+
+        let batch = self.staged.lock().expect("journal poisoned").clone();
         if batch.is_empty() {
             return Ok(());
         }
         let mut tx = self.pool.begin().await?;
-        for (key, value) in batch {
+        for (key, value) in &batch {
             // Upsert: a command's state advances and is re-recorded under its txn.
             let statement = Query::insert()
                 .into_table(AccordCommands::Table)
                 .columns([AccordCommands::Txn, AccordCommands::Data])
-                .values_panic([key.into(), value.into()])
+                .values_panic([key.clone().into(), value.clone().into()])
                 .on_conflict(
                     OnConflict::column(AccordCommands::Txn)
                         .update_column(AccordCommands::Data)
@@ -251,12 +261,26 @@ where
                 .await?;
         }
         tx.commit().await?;
+
+        // Drain exactly what was flushed; entries staged mid-transaction stay.
+        self.staged
+            .lock()
+            .expect("journal poisoned")
+            .drain(..batch.len());
         Ok(())
     }
 
     async fn truncate(&self, before: Timestamp) -> anyhow::Result<()> {
         let bound = ts_key(before);
         let watermark = encode_tagged(RecordKind::Watermark, &before)?;
+
+        // Also purge staged (unflushed) commands below the bound, or a later
+        // flush would resurrect rows this truncation just deleted.
+        self.staged
+            .lock()
+            .expect("journal poisoned")
+            .retain(|(key, _)| key.as_slice() >= bound.as_slice());
+
         let mut tx = self.pool.begin().await?;
 
         // Single range delete — the order-preserving key makes `txn < before`

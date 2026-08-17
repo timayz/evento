@@ -68,8 +68,12 @@ pub trait Clock: Send + Sync + 'static {
     /// clock has previously issued or witnessed.
     fn now(&self) -> Timestamp;
 
-    /// Advances the clock to be strictly past `observed`, merging a peer's
-    /// timestamp into the local Hybrid Logical Clock state.
+    /// Advances the clock **toward** `observed`, merging a peer's timestamp
+    /// into the local Hybrid Logical Clock state. The result is strictly past
+    /// `observed` only when `observed` lies within the clock's skew bound;
+    /// beyond it the adopted value is capped (see
+    /// [`HybridLogicalClock::with_max_skew`]) so a faulty far-future peer
+    /// cannot run the clock away.
     fn witness(&self, observed: Timestamp);
 }
 
@@ -185,7 +189,10 @@ impl Clock for HybridLogicalClock {
         let new_logical = if high == *micros && high == observed_micros {
             (*logical).max(observed.logical) + 1
         } else if high == *micros {
-            *logical + 1
+            // The local state already exceeds the observation; bumping the
+            // logical counter here would inflate it on every stale message
+            // sharing the same microsecond (an unbounded-growth hazard).
+            *logical
         } else if high == observed_micros {
             observed.logical + 1
         } else {

@@ -35,10 +35,7 @@ use backon::{ExponentialBuilder, Retryable};
 use std::{
     collections::HashMap, future::Future, marker::PhantomData, ops::Deref, pin::Pin, time::Duration,
 };
-use tokio::{
-    sync::{oneshot::Receiver, Mutex},
-    time::{interval_at, Instant},
-};
+use tokio::time::{interval_at, Instant};
 use tracing::field::Empty;
 use ulid::Ulid;
 
@@ -150,11 +147,24 @@ pub struct SubscriptionBuilder<E: Executor> {
     retry: Option<u8>,
     aggregators: HashMap<String, String>,
     safety_disabled: bool,
-    shutdown_rx: Option<Mutex<Receiver<()>>>,
+    shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+}
+
+/// What a single `process` pass concluded, beyond a hard error.
+enum ProcessOutcome {
+    /// Everything currently available was processed (or nothing was pending).
+    Drained,
+    /// Remaining events sit at/above the stability watermark; retry after it
+    /// has advanced.
+    Gated,
+    /// Another worker took over this subscription key; this worker must stop.
+    LostOwnership,
+    /// A shutdown signal was observed mid-chunk.
+    ShutdownRequested,
 }
 
 impl<E: Executor + 'static> SubscriptionBuilder<E> {
-    /// Creates a new projection with the given key.
+    /// Creates a new subscription builder with the given key.
     ///
     /// The key is used as the subscription identifier for cursor tracking.
     pub fn new(key: impl Into<String>) -> Self {
@@ -229,9 +239,10 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
 
     /// Sets the number of events to process per batch.
     ///
-    /// Default is 300.
+    /// Default is 300. Values below 1 are clamped to 1 — a chunk size of 0
+    /// would make the subscription silently read nothing forever.
     pub fn chunk_size(mut self, v: u16) -> Self {
-        self.chunk_size = v;
+        self.chunk_size = v.max(1);
 
         self
     }
@@ -375,7 +386,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
         executor: &E,
         id: &Ulid,
         aggregators: &[EventFilter],
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<ProcessOutcome> {
         // Drains all currently-available events back-to-back and returns as soon
         // as it catches up. The caller (`start`'s loop) owns all waiting — poll
         // interval, write signal, and shutdown — so there is no pacing here: this
@@ -384,7 +395,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
 
         loop {
             if !executor.is_subscriber_running(self.key(), *id).await? {
-                return Ok(false);
+                return Ok(ProcessOutcome::LostOwnership);
             }
 
             let cursor = executor.get_subscriber_cursor(self.key()).await?;
@@ -398,7 +409,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                 .await?;
 
             if res.edges.is_empty() {
-                return Ok(false);
+                return Ok(ProcessOutcome::Drained);
             }
 
             // A partial chunk means everything currently available has been read;
@@ -406,11 +417,11 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             // immediately.
             let drained = res.edges.len() < self.chunk_size as usize;
 
-            // Stability watermark (microseconds since epoch): on a replicated
-            // backend that can apply events out of cursor order, the subscription
-            // must not advance past it, or a late lower-cursor event would be
-            // skipped. `None` (single-store backends) means no gating.
-            let stable = executor.stable_timestamp();
+            // Stability watermark (microseconds since epoch): on a backend where
+            // independent writers can commit out of cursor order, the
+            // subscription must not advance past it, or a late lower-cursor event
+            // would be skipped. `None` (single-writer backends) means no gating.
+            let stable = executor.stable_timestamp().await?;
 
             let timestamp = executor
                 .latest_timestamp(
@@ -434,56 +445,78 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                         .saturating_mul(1_000_000)
                         .saturating_add(event.node.timestamp_subsec as u64 * 1_000);
                     if event_micros >= w {
-                        return Ok(false);
+                        return Ok(ProcessOutcome::Gated);
                     }
                 }
 
-                if let Some(ref rx) = self.shutdown_rx {
-                    let mut rx = rx.lock().await;
-                    if rx.try_recv().is_ok() {
-                        tracing::info!(
-                            key = self.key(),
-                            "Subscription received shutdown signal, stopping gracefully"
-                        );
+                if self
+                    .shutdown_rx
+                    .as_ref()
+                    .is_some_and(|rx| *rx.borrow() || rx.has_changed().is_err())
+                {
+                    tracing::info!(
+                        key = self.key(),
+                        "Subscription received shutdown signal, stopping gracefully"
+                    );
 
-                        return Ok(true);
-                    }
-                    drop(rx);
+                    return Ok(ProcessOutcome::ShutdownRequested);
                 }
 
                 tracing::Span::current().record("aggregate_type", &event.node.aggregate_type);
                 tracing::Span::current().record("aggregate_id", &event.node.aggregate_id);
                 tracing::Span::current().record("event", &event.node.name);
 
+                // A specific handler takes precedence over a `subscription_all`
+                // catch-all for the same aggregate type.
                 let all_key = format!("{}_all", event.node.aggregate_type);
                 let key = format!("{}_{}", event.node.aggregate_type, event.node.name);
-                let Some(handler) = self.handlers.get(&all_key).or(self.handlers.get(&key)) else {
-                    if !self.safety_disabled {
-                        anyhow::bail!("no handler s={} k={key}", self.key());
+                let handler = match self.handlers.get(&key).or(self.handlers.get(&all_key)) {
+                    Some(handler) => Some(handler),
+                    None if !self.safety_disabled && !self.continue_on_error => {
+                        anyhow::bail!("no handler s={} k={key}", self.key())
                     }
-
-                    continue;
+                    None if !self.safety_disabled => {
+                        // Strict mode with continue_on_error: skip the poison
+                        // event (acknowledged below) instead of re-reading and
+                        // re-failing the same batch forever.
+                        tracing::error!(key = key, "no handler, skipping event");
+                        None
+                    }
+                    None => None,
                 };
 
-                if let Err(err) = handler.handle(&context, &event.node).await {
-                    tracing::error!("failed");
-
-                    return Err(err);
+                if let Some(handler) = handler {
+                    if let Err(err) = handler.handle(&context, &event.node).await {
+                        if !self.continue_on_error {
+                            tracing::error!("failed");
+                            return Err(err);
+                        }
+                        // continue_on_error: log and acknowledge so the
+                        // subscription makes progress past the failing event
+                        // rather than retrying it forever.
+                        tracing::error!(error = %err, "failed, skipping event");
+                    } else {
+                        tracing::debug!("completed");
+                    }
                 }
 
-                tracing::debug!("completed");
-
-                executor
+                let acked = executor
                     .acknowledge(
                         self.key(),
+                        *id,
                         event.cursor.to_owned(),
                         timestamp.saturating_sub(event.node.timestamp),
                     )
                     .await?;
+                if !acked {
+                    // Another worker took over mid-chunk; stop immediately so
+                    // we do not process events the new owner will also handle.
+                    return Ok(ProcessOutcome::LostOwnership);
+                }
             }
 
             if drained {
-                return Ok(false);
+                return Ok(ProcessOutcome::Drained);
             }
         }
     }
@@ -504,7 +537,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
     /// Returns a [`Subscription`] handle that can be used for graceful shutdown.
     /// The subscription runs in a spawned tokio task and polls for new events.
     #[tracing::instrument(skip_all, fields(
-        subscription = self.key(),
+        subscription = tracing::field::Empty,
         aggregate_type = tracing::field::Empty,
         aggregate_id = tracing::field::Empty,
         event = tracing::field::Empty,
@@ -514,11 +547,13 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
         E: Clone,
     {
         self.resolve_routing_key(executor);
+        tracing::Span::current().record("subscription", self.key());
         let executor = executor.clone();
         let id = Ulid::generate();
         let subscription_id = id;
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-        self.shutdown_rx = Some(Mutex::new(shutdown_rx));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        self.shutdown_rx = Some(shutdown_rx.clone());
+        let mut shutdown_rx = shutdown_rx;
 
         executor
             .upsert_subscriber(self.key(), id.to_owned())
@@ -538,6 +573,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             // the fallback re-poll; the write signal (when available) wakes the
             // loop sooner.
             let mut interval = interval_at(start, self.poll_interval);
+            let mut gated = false;
 
             loop {
                 // Wake on whichever comes first: an in-process write (when the
@@ -545,38 +581,34 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                 // shutdown signal. Selecting on shutdown here keeps shutdown
                 // immediate even with a long poll interval. `changed()` only
                 // resolves for write generations newer than the last seen, so it
-                // never busy-loops.
+                // never busy-loops. A closed shutdown channel (handle dropped
+                // without calling `shutdown`) also stops the worker.
+                //
+                // Watermark-gated events become processable as the watermark
+                // advances on its own — no write signal will fire for them — so
+                // after a `Gated` pass, re-check on a short cadence instead of
+                // waiting out the full poll interval.
                 let mut shutdown = false;
-                {
-                    let mut shutdown_guard = match self.shutdown_rx {
-                        Some(ref rx) => Some(rx.lock().await),
-                        None => None,
-                    };
-                    match (write_watch.as_mut(), shutdown_guard.as_mut()) {
-                        (Some(rx), Some(srx)) => tokio::select! {
+                if gated {
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+                        _ = shutdown_rx.changed() => { shutdown = true; }
+                    }
+                } else {
+                    match write_watch.as_mut() {
+                        Some(rx) => tokio::select! {
                             _ = interval.tick() => {}
                             res = rx.changed() => {
                                 if res.is_ok() {
                                     rx.borrow_and_update();
                                 }
                             }
-                            _ = &mut **srx => { shutdown = true; }
+                            _ = shutdown_rx.changed() => { shutdown = true; }
                         },
-                        (Some(rx), None) => tokio::select! {
+                        None => tokio::select! {
                             _ = interval.tick() => {}
-                            res = rx.changed() => {
-                                if res.is_ok() {
-                                    rx.borrow_and_update();
-                                }
-                            }
+                            _ = shutdown_rx.changed() => { shutdown = true; }
                         },
-                        (None, Some(srx)) => tokio::select! {
-                            _ = interval.tick() => {}
-                            _ = &mut **srx => { shutdown = true; }
-                        },
-                        (None, None) => {
-                            interval.tick().await;
-                        }
                     }
                 }
 
@@ -589,28 +621,54 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                     break;
                 }
 
-                let result = match self.retry {
-                    Some(retry) => {
-                        (|| async { self.process(&executor, &id, &read_aggregators).await })
-                            .retry(ExponentialBuilder::default().with_max_times(retry.into()))
-                            .sleep(tokio::time::sleep)
-                            .notify(|err, dur| {
-                                tracing::error!(
-                                    error = %err,
-                                    duration = ?dur,
-                                    "Failed to process event"
-                                );
-                            })
-                            .await
+                // The retry backoff can span minutes; selecting the shutdown
+                // signal against it keeps `Subscription::shutdown` responsive
+                // even while a failing pass is backing off.
+                let process_fut = async {
+                    match self.retry {
+                        Some(retry) => {
+                            (|| async { self.process(&executor, &id, &read_aggregators).await })
+                                .retry(
+                                    ExponentialBuilder::default()
+                                        .with_jitter()
+                                        .with_max_times(retry.into()),
+                                )
+                                .sleep(tokio::time::sleep)
+                                .notify(|err, dur| {
+                                    tracing::error!(
+                                        error = %err,
+                                        duration = ?dur,
+                                        "Failed to process event"
+                                    );
+                                })
+                                .await
+                        }
+                        _ => self.process(&executor, &id, &read_aggregators).await,
                     }
-                    _ => self.process(&executor, &id, &read_aggregators).await,
+                };
+                tokio::pin!(process_fut);
+                let result = tokio::select! {
+                    res = &mut process_fut => Some(res),
+                    _ = shutdown_rx.changed() => None,
+                };
+                let Some(result) = result else {
+                    tracing::info!(
+                        key = self.key(),
+                        "Subscription received shutdown signal, stopping gracefully"
+                    );
+                    break;
                 };
 
                 match result {
-                    Ok(shutdown) => {
-                        if shutdown {
-                            break;
-                        }
+                    Ok(ProcessOutcome::Drained) => gated = false,
+                    Ok(ProcessOutcome::Gated) => gated = true,
+                    Ok(ProcessOutcome::ShutdownRequested) => break,
+                    Ok(ProcessOutcome::LostOwnership) => {
+                        tracing::info!(
+                            key = self.key(),
+                            "Subscription taken over by another worker, stopping"
+                        );
+                        break;
                     }
                     Err(err) => {
                         tracing::error!(error = %err, "Failed to process event");
@@ -633,16 +691,21 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
     /// Processes all currently pending events once, then returns.
     ///
     /// Unlike [`start`](Self::start), this does not run continuously or spawn a
-    /// background task — it drains the events available now and returns. Pair with
-    /// [`no_retry`](Self::no_retry) to run a single pass without retries.
+    /// background task — it drains the events available now and returns. On a
+    /// backend with a stability watermark it waits (briefly, in 25ms steps) for
+    /// the watermark to pass the events that were pending at entry, so a
+    /// completed `run_once` really has processed everything that was committed
+    /// before it was called. Pair with [`no_retry`](Self::no_retry) to run a
+    /// single pass without retries.
     #[tracing::instrument(skip_all, fields(
-        subscription = self.key(),
+        subscription = tracing::field::Empty,
         aggregate_type = tracing::field::Empty,
         aggregate_id = tracing::field::Empty,
         event = tracing::field::Empty,
     ))]
     pub async fn run_once(&mut self, executor: &E) -> anyhow::Result<()> {
         self.resolve_routing_key(executor);
+        tracing::Span::current().record("subscription", self.key());
         let id = Ulid::generate();
 
         executor
@@ -651,24 +714,72 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
 
         let read_aggregators = self.read_aggregators();
 
-        match self.retry {
-            Some(retry) => {
-                (|| async { self.process(executor, &id, &read_aggregators).await })
-                    .retry(ExponentialBuilder::default().with_max_times(retry.into()))
-                    .sleep(tokio::time::sleep)
-                    .notify(|err, dur| {
-                        tracing::error!(
-                            error = %err,
-                            duration = ?dur,
-                            "Failed to process event"
-                        );
-                    })
-                    .await
-            }
-            _ => self.process(executor, &id, &read_aggregators).await,
-        }?;
+        // Exclusive upper bound (µs) covering every event committed before
+        // entry: `latest_timestamp` has whole-second resolution, so cover the
+        // entire latest second.
+        let target_micros = executor
+            .latest_timestamp(
+                Some(read_aggregators.to_vec()),
+                Some(self.effective_routing_key()),
+            )
+            .await?
+            .saturating_add(1)
+            .saturating_mul(1_000_000);
 
-        Ok(())
+        // Set once the watermark has passed `target_micros`; one further pass
+        // is still required (a `Gated` outcome may rest on a watermark fetched
+        // before it advanced), after which anything still gated is post-entry.
+        let mut watermark_passed = false;
+
+        loop {
+            let outcome = match self.retry {
+                Some(retry) => {
+                    (|| async { self.process(executor, &id, &read_aggregators).await })
+                        .retry(
+                            ExponentialBuilder::default()
+                                .with_jitter()
+                                .with_max_times(retry.into()),
+                        )
+                        .sleep(tokio::time::sleep)
+                        .notify(|err, dur| {
+                            tracing::error!(
+                                error = %err,
+                                duration = ?dur,
+                                "Failed to process event"
+                            );
+                        })
+                        .await
+                }
+                _ => self.process(executor, &id, &read_aggregators).await,
+            }?;
+
+            match outcome {
+                ProcessOutcome::Drained | ProcessOutcome::ShutdownRequested => return Ok(()),
+                ProcessOutcome::LostOwnership => {
+                    anyhow::bail!(
+                        "subscription {} was taken over by another worker during run_once",
+                        self.key()
+                    )
+                }
+                ProcessOutcome::Gated => {
+                    // Wait for the watermark to pass everything that was
+                    // pending at entry, then run one final pass: this `Gated`
+                    // may rest on a watermark `process` fetched before it
+                    // advanced, so returning immediately could strand
+                    // pre-entry events between the stale watermark and the
+                    // target. After that pass, anything still gated has a
+                    // timestamp at/above the target — it arrived later and is
+                    // out of scope for this pass.
+                    match executor.stable_timestamp().await? {
+                        Some(w) if w < target_micros => {
+                            tokio::time::sleep(Duration::from_millis(25)).await;
+                        }
+                        _ if watermark_passed => return Ok(()),
+                        _ => watermark_passed = true,
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -695,16 +806,18 @@ pub struct Subscription {
     /// Unique ID for this subscription instance
     pub id: Ulid,
     task_handle: tokio::task::JoinHandle<()>,
-    shutdown_tx: tokio::sync::oneshot::Sender<()>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
 }
 
 impl Subscription {
     /// Gracefully shuts down the subscription.
     ///
     /// Signals the subscription to stop and waits for it to finish
-    /// processing the current event before returning.
+    /// processing the current event before returning. The signal also
+    /// interrupts a retry backoff in progress, so shutdown stays prompt even
+    /// while the subscription is failing.
     pub async fn shutdown(self) -> Result<(), tokio::task::JoinError> {
-        let _ = self.shutdown_tx.send(());
+        let _ = self.shutdown_tx.send(true);
 
         self.task_handle.await
     }

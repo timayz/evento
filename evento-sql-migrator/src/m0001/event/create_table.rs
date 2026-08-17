@@ -7,6 +7,9 @@ pub struct Operation;
 fn up_statement() -> TableCreateStatement {
     Table::create()
         .table(Event::Table)
+        // MySQL DDL is non-transactional, so a partially-failed InitMigration
+        // leaves this table behind; IF NOT EXISTS keeps the retry runnable.
+        .if_not_exists()
         .col(
             ColumnDef::new(Event::Id)
                 .string()
