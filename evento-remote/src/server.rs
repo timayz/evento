@@ -16,6 +16,7 @@
 use bytes::Bytes;
 use evento_core::Executor;
 use futures_util::{SinkExt, StreamExt};
+use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -271,7 +272,7 @@ async fn handle<E: Executor>(executor: &E, request: Request) -> Response {
             to_micros,
         } => Response::Read(err_string(
             executor
-                .read(aggregators, routing_key, args, to_micros)
+                .read(aggregators.map(Arc::from), routing_key, args, to_micros)
                 .await
                 .map(WireReadResult::from),
         )),
@@ -279,7 +280,9 @@ async fn handle<E: Executor>(executor: &E, request: Request) -> Response {
             aggregators,
             routing_key,
         } => Response::LatestTimestamp(err_string(
-            executor.latest_timestamp(aggregators, routing_key).await,
+            executor
+                .latest_timestamp(aggregators.map(Arc::from), routing_key)
+                .await,
         )),
         Request::GetSubscriberCursor { key } => {
             Response::SubscriberCursor(err_string(executor.get_subscriber_cursor(key).await))

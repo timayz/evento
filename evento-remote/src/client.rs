@@ -215,14 +215,14 @@ impl Executor for Client {
 
     async fn read(
         &self,
-        aggregators: Option<Vec<EventFilter>>,
+        aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<RoutingKey>,
         args: Args,
         to_micros: Option<u64>,
     ) -> anyhow::Result<ReadResult<Event>> {
         match self
             .request(Request::Read {
-                aggregators,
+                aggregators: aggregators.map(|a| a.to_vec()),
                 routing_key,
                 args,
                 to_micros,
@@ -237,12 +237,12 @@ impl Executor for Client {
 
     async fn latest_timestamp(
         &self,
-        aggregators: Option<Vec<EventFilter>>,
+        aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<RoutingKey>,
     ) -> anyhow::Result<u64> {
         match self
             .request(Request::LatestTimestamp {
-                aggregators,
+                aggregators: aggregators.map(|a| a.to_vec()),
                 routing_key,
             })
             .await?

@@ -500,11 +500,11 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
         if let Some((tombstone_type, tombstone_event)) = self.tombstone {
             let res = executor
                 .read(
-                    Some(vec![EventFilter::exact(
+                    Some(Arc::from([EventFilter::exact(
                         tombstone_type,
                         id.to_owned(),
                         tombstone_event,
-                    )]),
+                    )])),
                     None,
                     Args::backward(1, None),
                     None,
@@ -559,7 +559,7 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
                     },
                 }
             })
-            .collect::<Vec<_>>();
+            .collect::<Arc<[EventFilter]>>();
 
         // On a backend with a stability watermark, events at/above it may still
         // be reordered by late commits, so the persisted snapshot cursor must
@@ -578,7 +578,7 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
         loop {
             let events = executor
                 .read(
-                    Some(read_aggregators.to_vec()),
+                    Some(read_aggregators.clone()),
                     None,
                     Args::forward(100, page_cursor.clone()),
                     // Deliberately unbounded: gated events are folded into the

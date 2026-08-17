@@ -342,7 +342,7 @@ where
 {
     async fn read(
         &self,
-        aggregators: Option<Vec<EventFilter>>,
+        aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<evento_core::RoutingKey>,
         args: Args,
         to_micros: Option<u64>,
@@ -370,17 +370,19 @@ where
 
                     let mut cond = Cond::any();
 
-                    for aggregator in aggregators {
-                        let mut aggregator_cond = Cond::all()
-                            .add(Expr::col(Event::AggregatorType).eq(aggregator.aggregate_type));
+                    for aggregator in aggregators.iter() {
+                        let mut aggregator_cond = Cond::all().add(
+                            Expr::col(Event::AggregatorType).eq(aggregator.aggregate_type.clone()),
+                        );
 
-                        if let Some(id) = aggregator.aggregate_id {
+                        if let Some(id) = &aggregator.aggregate_id {
                             aggregator_cond =
-                                aggregator_cond.add(Expr::col(Event::AggregatorId).eq(id));
+                                aggregator_cond.add(Expr::col(Event::AggregatorId).eq(id.clone()));
                         }
 
-                        if let Some(name) = aggregator.name {
-                            aggregator_cond = aggregator_cond.add(Expr::col(Event::Name).eq(name));
+                        if let Some(name) = &aggregator.name {
+                            aggregator_cond =
+                                aggregator_cond.add(Expr::col(Event::Name).eq(name.clone()));
                         }
 
                         cond = cond.add(aggregator_cond);
@@ -440,7 +442,7 @@ where
 
     async fn latest_timestamp(
         &self,
-        aggregators: Option<Vec<EventFilter>>,
+        aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<evento_core::RoutingKey>,
     ) -> anyhow::Result<u64> {
         let statement = Query::select()
@@ -455,17 +457,19 @@ where
 
                     let mut cond = Cond::any();
 
-                    for aggregator in aggregators {
-                        let mut aggregator_cond = Cond::all()
-                            .add(Expr::col(Event::AggregatorType).eq(aggregator.aggregate_type));
+                    for aggregator in aggregators.iter() {
+                        let mut aggregator_cond = Cond::all().add(
+                            Expr::col(Event::AggregatorType).eq(aggregator.aggregate_type.clone()),
+                        );
 
-                        if let Some(id) = aggregator.aggregate_id {
+                        if let Some(id) = &aggregator.aggregate_id {
                             aggregator_cond =
-                                aggregator_cond.add(Expr::col(Event::AggregatorId).eq(id));
+                                aggregator_cond.add(Expr::col(Event::AggregatorId).eq(id.clone()));
                         }
 
-                        if let Some(name) = aggregator.name {
-                            aggregator_cond = aggregator_cond.add(Expr::col(Event::Name).eq(name));
+                        if let Some(name) = &aggregator.name {
+                            aggregator_cond =
+                                aggregator_cond.add(Expr::col(Event::Name).eq(name.clone()));
                         }
 
                         cond = cond.add(aggregator_cond);

@@ -258,7 +258,10 @@ fn parse_op(op: &JsonValue) -> Option<(String, String, Option<i64>)> {
 async fn current_version(exec: &Exec, key: &str) -> anyhow::Result<u16> {
     let result = exec
         .read(
-            Some(vec![EventFilter::by_id(AGGREGATE_TYPE, key)]),
+            Some(std::sync::Arc::from([EventFilter::by_id(
+                AGGREGATE_TYPE,
+                key,
+            )])),
             None,
             Args::forward(u16::MAX - 1, None),
             None,
@@ -277,7 +280,10 @@ async fn current_version(exec: &Exec, key: &str) -> anyhow::Result<u16> {
 async fn read_values(exec: &Exec, key: &str) -> anyhow::Result<Vec<i64>> {
     let result = exec
         .read(
-            Some(vec![EventFilter::by_id(AGGREGATE_TYPE, key)]),
+            Some(std::sync::Arc::from([EventFilter::by_id(
+                AGGREGATE_TYPE,
+                key,
+            )])),
             None,
             Args::forward(u16::MAX - 1, None),
             None,

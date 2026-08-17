@@ -4,7 +4,7 @@
 //! production implementation (real transport, static-config membership,
 //! Fjall/SQL-backed storage).
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use evento_core::{
@@ -273,7 +273,7 @@ pub trait DataStore: Send + Sync + 'static {
     /// in-memory test store).
     async fn read(
         &self,
-        _aggregators: Option<Vec<EventFilter>>,
+        _aggregators: Option<Arc<[EventFilter]>>,
         _routing_key: Option<RoutingKey>,
         _args: Args,
         _to_micros: Option<u64>,

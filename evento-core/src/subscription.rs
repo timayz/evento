@@ -33,7 +33,12 @@
 
 use backon::{ExponentialBuilder, Retryable};
 use std::{
-    collections::HashMap, future::Future, marker::PhantomData, ops::Deref, pin::Pin, sync::Mutex,
+    collections::HashMap,
+    future::Future,
+    marker::PhantomData,
+    ops::Deref,
+    pin::Pin,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio::time::{interval_at, Instant};
@@ -357,7 +362,12 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
         self
     }
 
-    fn read_aggregators(&self) -> Vec<EventFilter> {
+    /// Builds the read filters once per worker: handlers frequently collapse
+    /// to identical filters (e.g. `by_type` once per handler), so they are
+    /// deduplicated here, and the result is shared as an `Arc` — every poll
+    /// clones the handle, not the filters.
+    fn read_aggregators(&self) -> Arc<[EventFilter]> {
+        let mut seen = std::collections::HashSet::new();
         self.handlers
             .values()
             .map(|h| {
@@ -380,6 +390,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                     }
                 }
             })
+            .filter(|filter| seen.insert(filter.clone()))
             .collect()
     }
 
@@ -436,7 +447,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
         &self,
         executor: &E,
         id: &Ulid,
-        aggregators: &[EventFilter],
+        aggregators: &Arc<[EventFilter]>,
     ) -> anyhow::Result<ProcessOutcome> {
         // Drains all currently-available events back-to-back and returns as soon
         // as it catches up. The caller (`start`'s loop) owns all waiting — poll
@@ -465,7 +476,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
 
             let res = executor
                 .read(
-                    Some(aggregators.to_vec()),
+                    Some(aggregators.clone()),
                     Some(self.effective_routing_key()),
                     Args::forward(self.chunk_size, cursor.clone()),
                     stable,
@@ -623,7 +634,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
         &self,
         executor: &E,
         id: &Ulid,
-        aggregators: &[EventFilter],
+        aggregators: &Arc<[EventFilter]>,
         pending: &mut Option<(Value, u64)>,
         since_ack: &mut usize,
     ) -> anyhow::Result<bool> {
@@ -649,7 +660,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
     async fn cached_latest_timestamp(
         &self,
         executor: &E,
-        aggregators: &[EventFilter],
+        aggregators: &Arc<[EventFilter]>,
     ) -> anyhow::Result<u64> {
         {
             let guard = self.latest_ts_cache.lock().expect("latest_ts poisoned");
@@ -662,7 +673,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
 
         let v = executor
             .latest_timestamp(
-                Some(aggregators.to_vec()),
+                Some(aggregators.clone()),
                 Some(self.effective_routing_key()),
             )
             .await?;
@@ -677,7 +688,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
     async fn drained_or_gated(
         &self,
         executor: &E,
-        aggregators: &[EventFilter],
+        aggregators: &Arc<[EventFilter]>,
         after: Option<Value>,
         stable: Option<u64>,
     ) -> anyhow::Result<ProcessOutcome> {
@@ -689,7 +700,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
 
         let probe = executor
             .read(
-                Some(aggregators.to_vec()),
+                Some(aggregators.clone()),
                 Some(self.effective_routing_key()),
                 Args::forward(1, after),
                 None,
@@ -905,7 +916,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
         // entire latest second.
         let target_micros = executor
             .latest_timestamp(
-                Some(read_aggregators.to_vec()),
+                Some(read_aggregators.clone()),
                 Some(self.effective_routing_key()),
             )
             .await?

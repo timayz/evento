@@ -24,6 +24,7 @@
 //! ```
 
 use sha3::{Digest, Sha3_256};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use ulid::Ulid;
@@ -386,11 +387,11 @@ impl<E: Executor> AggregateExt<E> for E {
         Box::pin(async {
             let result = self
                 .read(
-                    Some(vec![EventFilter::exact(
+                    Some(Arc::from([EventFilter::exact(
                         A::aggregate_type(),
                         id,
                         A::event_name(),
-                    )]),
+                    )])),
                     None,
                     Args::backward(1, None),
                     None,
@@ -409,7 +410,7 @@ impl<E: Executor> AggregateExt<E> for E {
         Box::pin(async {
             let result = self
                 .read(
-                    Some(vec![EventFilter::by_id(A::aggregate_type(), id)]),
+                    Some(Arc::from([EventFilter::by_id(A::aggregate_type(), id)])),
                     None,
                     Args::backward(1, None),
                     None,
@@ -470,7 +471,7 @@ mod tests {
         }
         async fn read(
             &self,
-            _aggregators: Option<Vec<EventFilter>>,
+            _aggregators: Option<Arc<[EventFilter]>>,
             _routing_key: Option<RoutingKey>,
             _args: Args,
             _to_micros: Option<u64>,
@@ -479,7 +480,7 @@ mod tests {
         }
         async fn latest_timestamp(
             &self,
-            _aggregators: Option<Vec<EventFilter>>,
+            _aggregators: Option<Arc<[EventFilter]>>,
             _routing_key: Option<RoutingKey>,
         ) -> anyhow::Result<u64> {
             unreachable!()

@@ -68,7 +68,7 @@ fn cluster(n: u64) -> Cluster {
 async fn local_len(backend: &Fjall, key: &str) -> usize {
     backend
         .read(
-            Some(vec![EventFilter::by_id("lin/Reg", key)]),
+            Some([EventFilter::by_id("lin/Reg", key)].into()),
             None,
             Args::forward(u16::MAX - 1, None),
             None,
@@ -84,7 +84,7 @@ async fn local_len(backend: &Fjall, key: &str) -> usize {
 async fn read_values(exec: &AccordExecutor<Fjall>, key: &str) -> Option<Vec<u64>> {
     let r = exec
         .read(
-            Some(vec![EventFilter::by_id("lin/Reg", key)]),
+            Some([EventFilter::by_id("lin/Reg", key)].into()),
             None,
             Args::forward(u16::MAX - 1, None),
             None,
@@ -103,7 +103,7 @@ async fn read_values(exec: &AccordExecutor<Fjall>, key: &str) -> Option<Vec<u64>
 
 async fn read_len(exec: &AccordExecutor<Fjall>, key: &str) -> Option<usize> {
     exec.read(
-        Some(vec![EventFilter::by_id("lin/Reg", key)]),
+        Some([EventFilter::by_id("lin/Reg", key)].into()),
         None,
         Args::forward(u16::MAX - 1, None),
         None,

@@ -1158,7 +1158,7 @@ impl Node {
             } => {
                 let result = self
                     .datastore
-                    .read(aggregators, routing_key, args, to_micros)
+                    .read(aggregators.map(Arc::from), routing_key, args, to_micros)
                     .await
                     .unwrap_or_default();
                 let page_info = result.page_info;
@@ -2457,7 +2457,7 @@ impl Node {
     pub async fn forward_read(
         &self,
         to: NodeId,
-        aggregators: Option<Vec<EventFilter>>,
+        aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<RoutingKey>,
         args: Args,
         to_micros: Option<u64>,
@@ -2472,7 +2472,7 @@ impl Node {
             to,
             Message::ReadForward {
                 id,
-                aggregators,
+                aggregators: aggregators.map(|a| a.to_vec()),
                 routing_key,
                 args,
                 to_micros,
