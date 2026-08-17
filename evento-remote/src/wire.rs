@@ -18,7 +18,7 @@ pub const MAGIC: [u8; 2] = *b"Er";
 
 /// Current wire format version. Bump on any breaking change to the frame
 /// enums' layout; add the matching decode branch then.
-/// v2: `Args` gained `to_micros`; added `SubscriberStatus`, `LatestVersion`
+/// v2: `Read` gained `to_micros`; added `SubscriberStatus`, `LatestVersion`
 /// and `StreamRoutingKey` requests.
 pub const FORMAT_VERSION: u8 = 2;
 
@@ -132,6 +132,8 @@ pub enum Request {
         aggregators: Option<Vec<EventFilter>>,
         routing_key: Option<RoutingKey>,
         args: Args,
+        /// Exclusive stamp bound (see `Executor::read`).
+        to_micros: Option<u64>,
     },
     LatestTimestamp {
         aggregators: Option<Vec<EventFilter>>,

@@ -261,6 +261,7 @@ async fn current_version(exec: &Exec, key: &str) -> anyhow::Result<u16> {
             Some(vec![EventFilter::by_id(AGGREGATE_TYPE, key)]),
             None,
             Args::forward(u16::MAX - 1, None),
+            None,
         )
         .await?;
     Ok(result
@@ -279,6 +280,7 @@ async fn read_values(exec: &Exec, key: &str) -> anyhow::Result<Vec<i64>> {
             Some(vec![EventFilter::by_id(AGGREGATE_TYPE, key)]),
             None,
             Args::forward(u16::MAX - 1, None),
+            None,
         )
         .await?;
     let mut events: Vec<&Event> = result.edges.iter().map(|e| &e.node).collect();

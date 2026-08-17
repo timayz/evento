@@ -729,6 +729,7 @@ impl Executor for Fjall {
         aggregators: Option<Vec<EventFilter>>,
         routing_key: Option<RoutingKey>,
         args: Args,
+        to_micros: Option<u64>,
     ) -> anyhow::Result<ReadResult<Event>> {
         let executor = self.clone();
 
@@ -736,11 +737,12 @@ impl Executor for Fjall {
             // Collect matching event IDs (deduplicated across the aggregator filters).
             let event_ids = executor.collect_event_ids(&aggregators, &routing_key)?;
 
-            // Load every matching event and apply the routing-key filter. The cursor
-            // is intentionally NOT pre-filtered here: `Event`'s cursor uses
-            // (timestamp, subsec, version, id), which can disagree with raw ULID
-            // ordering when events land in the same millisecond. `Reader::execute`
-            // applies the canonical sort, cursor predicate, and limit.
+            // Load every matching event and apply the routing-key and stamp
+            // filters. The cursor is intentionally NOT pre-filtered here:
+            // `Event`'s cursor uses (timestamp, subsec, version, id), which can
+            // disagree with raw ULID ordering when events land in the same
+            // millisecond. `Reader::execute` applies the canonical sort, cursor
+            // predicate, and limit.
             let mut events = Vec::with_capacity(event_ids.len());
             for id in event_ids {
                 if let Some(event) = executor.load_event(&id)? {
@@ -751,8 +753,17 @@ impl Executor for Fjall {
                         Some(RoutingKey::Value(None)) => event.routing_key.is_none(),
                         Some(RoutingKey::All) | None => true,
                     };
+                    // Exclusive upper bound on the event stamp (the
+                    // subscription watermark).
+                    let below_bound = to_micros.is_none_or(|bound| {
+                        event
+                            .timestamp
+                            .saturating_mul(1_000_000)
+                            .saturating_add(u64::from(event.timestamp_subsec) * 1_000)
+                            < bound
+                    });
 
-                    if matches {
+                    if matches && below_bound {
                         events.push(event);
                     }
                 }
@@ -1065,6 +1076,7 @@ mod tests {
                 Some(vec![EventFilter::by_id("test/Account", "agg-1")]),
                 None,
                 Args::forward(10, None),
+                None,
             )
             .await
             .unwrap();
@@ -1167,6 +1179,7 @@ mod tests {
                 Some(vec![EventFilter::by_id("test/Account", "a")]),
                 None,
                 Args::forward(10, None),
+                None,
             )
             .await
             .unwrap();
@@ -1198,6 +1211,7 @@ mod tests {
                     Some(vec![EventFilter::by_id("test/Account", "agg-mono")]),
                     None,
                     Args::forward(10, None),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -1215,6 +1229,7 @@ mod tests {
                 Some(vec![EventFilter::by_id("test/Account", "agg-mono")]),
                 None,
                 Args::forward(10, None),
+                None,
             )
             .await
             .unwrap();
@@ -1247,6 +1262,7 @@ mod tests {
                 Some(vec![EventFilter::by_id("test/Account", "agg-restamp")]),
                 None,
                 Args::forward(1, None),
+                None,
             )
             .await
             .unwrap();
@@ -1260,6 +1276,7 @@ mod tests {
                 Some(vec![EventFilter::by_id("test/Account", "agg-verbatim")]),
                 None,
                 Args::forward(1, None),
+                None,
             )
             .await
             .unwrap();

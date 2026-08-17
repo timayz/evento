@@ -71,6 +71,7 @@ async fn local_len(backend: &Fjall, key: &str) -> usize {
             Some(vec![EventFilter::by_id("lin/Reg", key)]),
             None,
             Args::forward(u16::MAX - 1, None),
+            None,
         )
         .await
         .map(|r| r.edges.len())
@@ -86,6 +87,7 @@ async fn read_values(exec: &AccordExecutor<Fjall>, key: &str) -> Option<Vec<u64>
             Some(vec![EventFilter::by_id("lin/Reg", key)]),
             None,
             Args::forward(u16::MAX - 1, None),
+            None,
         )
         .await
         .ok()?;
@@ -104,6 +106,7 @@ async fn read_len(exec: &AccordExecutor<Fjall>, key: &str) -> Option<usize> {
         Some(vec![EventFilter::by_id("lin/Reg", key)]),
         None,
         Args::forward(u16::MAX - 1, None),
+        None,
     )
     .await
     .ok()

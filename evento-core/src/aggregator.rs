@@ -393,6 +393,7 @@ impl<E: Executor> AggregateExt<E> for E {
                     )]),
                     None,
                     Args::backward(1, None),
+                    None,
                 )
                 .await?;
 
@@ -411,6 +412,7 @@ impl<E: Executor> AggregateExt<E> for E {
                     Some(vec![EventFilter::by_id(A::aggregate_type(), id)]),
                     None,
                     Args::backward(1, None),
+                    None,
                 )
                 .await?;
 
@@ -471,6 +473,7 @@ mod tests {
             _aggregators: Option<Vec<EventFilter>>,
             _routing_key: Option<RoutingKey>,
             _args: Args,
+            _to_micros: Option<u64>,
         ) -> anyhow::Result<ReadResult<Event>> {
             unreachable!()
         }

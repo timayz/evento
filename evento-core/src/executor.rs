@@ -251,7 +251,12 @@ pub trait Executor: Send + Sync + 'static {
         let mut after = None;
         loop {
             let result = self
-                .read(Some(filters.clone()), None, Args::forward(PAGE_SIZE, after))
+                .read(
+                    Some(filters.clone()),
+                    None,
+                    Args::forward(PAGE_SIZE, after),
+                    None,
+                )
                 .await?;
             if let Some(page_max) = result.edges.iter().map(|e| e.node.version).max() {
                 max = max.max(page_max);
@@ -286,6 +291,7 @@ pub trait Executor: Send + Sync + 'static {
                 Some(vec![EventFilter::by_id(aggregate_type, aggregate_id)]),
                 None,
                 Args::forward(1, None),
+                None,
             )
             .await?;
         Ok(result.edges.first().map(|e| e.node.routing_key.clone()))
@@ -311,11 +317,20 @@ pub trait Executor: Send + Sync + 'static {
     ) -> anyhow::Result<bool>;
 
     /// Queries events with filtering and pagination.
+    ///
+    /// `to_micros` is an optional **exclusive** upper bound on event stamps,
+    /// in microseconds since the Unix epoch: events at or above it are
+    /// excluded, ideally by the backend itself (SQL adds a sargable predicate;
+    /// fjall filters before pagination) so a watermark-gated subscription
+    /// never fetches rows it would discard. Implementations may ignore it —
+    /// the subscription loop keeps a per-event check as a backstop — but
+    /// should honor it for performance.
     async fn read(
         &self,
         aggregators: Option<Vec<EventFilter>>,
         routing_key: Option<RoutingKey>,
         args: Args,
+        to_micros: Option<u64>,
     ) -> anyhow::Result<ReadResult<Event>>;
 
     /// Returns the timestamp of the most recent event matching the filter, in
@@ -422,8 +437,11 @@ impl Executor for Evento {
         aggregators: Option<Vec<EventFilter>>,
         routing_key: Option<RoutingKey>,
         args: Args,
+        to_micros: Option<u64>,
     ) -> anyhow::Result<ReadResult<Event>> {
-        self.inner.read(aggregators, routing_key, args).await
+        self.inner
+            .read(aggregators, routing_key, args, to_micros)
+            .await
     }
 
     async fn latest_timestamp(
@@ -599,12 +617,17 @@ impl Executor for EventoGroup {
         aggregators: Option<Vec<EventFilter>>,
         routing_key: Option<RoutingKey>,
         args: Args,
+        to_micros: Option<u64>,
     ) -> anyhow::Result<ReadResult<Event>> {
         use crate::cursor;
-        let futures = self
-            .executors
-            .iter()
-            .map(|e| e.read(aggregators.to_owned(), routing_key.to_owned(), args.clone()));
+        let futures = self.executors.iter().map(|e| {
+            e.read(
+                aggregators.to_owned(),
+                routing_key.to_owned(),
+                args.clone(),
+                to_micros,
+            )
+        });
 
         let results = futures_util::future::join_all(futures).await;
         let mut events = vec![];
@@ -774,8 +797,9 @@ impl<R: Executor, W: Executor> Executor for Rw<R, W> {
         aggregators: Option<Vec<EventFilter>>,
         routing_key: Option<RoutingKey>,
         args: Args,
+        to_micros: Option<u64>,
     ) -> anyhow::Result<ReadResult<Event>> {
-        self.r.read(aggregators, routing_key, args).await
+        self.r.read(aggregators, routing_key, args, to_micros).await
     }
 
     async fn latest_timestamp(

@@ -218,12 +218,14 @@ impl Executor for Client {
         aggregators: Option<Vec<EventFilter>>,
         routing_key: Option<RoutingKey>,
         args: Args,
+        to_micros: Option<u64>,
     ) -> anyhow::Result<ReadResult<Event>> {
         match self
             .request(Request::Read {
                 aggregators,
                 routing_key,
                 args,
+                to_micros,
             })
             .await?
         {

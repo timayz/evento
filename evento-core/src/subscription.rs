@@ -448,14 +448,12 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             // pass fetches nothing instead of a chunk it would discard.
             let stable = executor.stable_timestamp().await?;
 
-            let mut args = Args::forward(self.chunk_size, cursor.clone());
-            args.to_micros = stable;
-
             let res = executor
                 .read(
                     Some(aggregators.to_vec()),
                     Some(self.effective_routing_key()),
-                    args,
+                    Args::forward(self.chunk_size, cursor.clone()),
+                    stable,
                 )
                 .await?;
 
@@ -486,8 +484,8 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             for event in res.edges {
                 // Defensive backstop: the read was already bounded by the
                 // watermark, so this only fires for a backend that ignores
-                // `Args::to_micros`. Edges arrive in ascending cursor order, so
-                // everything from here on is gated too.
+                // `read`'s `to_micros` bound. Edges arrive in ascending cursor
+                // order, so everything from here on is gated too.
                 if let Some(w) = stable {
                     let event_micros = (event.node.timestamp)
                         .saturating_mul(1_000_000)
@@ -671,6 +669,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                 Some(aggregators.to_vec()),
                 Some(self.effective_routing_key()),
                 Args::forward(1, after),
+                None,
             )
             .await?;
         let Some(edge) = probe.edges.first() else {

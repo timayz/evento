@@ -116,8 +116,11 @@ impl<E: Executor> DataStore for ExecutorDataStore<E> {
         aggregators: Option<Vec<EventFilter>>,
         routing_key: Option<RoutingKey>,
         args: Args,
+        to_micros: Option<u64>,
     ) -> anyhow::Result<ReadResult<Event>> {
-        self.local.read(aggregators, routing_key, args).await
+        self.local
+            .read(aggregators, routing_key, args, to_micros)
+            .await
     }
 
     async fn snapshot(&self) -> anyhow::Result<Vec<Event>> {
@@ -131,7 +134,7 @@ impl<E: Executor> DataStore for ExecutorDataStore<E> {
         loop {
             let result = self
                 .local
-                .read(None, None, Args::forward(SNAPSHOT_PAGE_SIZE, after))
+                .read(None, None, Args::forward(SNAPSHOT_PAGE_SIZE, after), None)
                 .await?;
             let has_next = result.page_info.has_next_page;
             let cursor = result.page_info.end_cursor;
@@ -210,6 +213,7 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
         aggregators: Option<Vec<EventFilter>>,
         routing_key: Option<RoutingKey>,
         args: Args,
+        to_micros: Option<u64>,
     ) -> anyhow::Result<ReadResult<Event>> {
         // A single-shard read for a key this node does not own is forwarded to an
         // owner. Everything else (owned keys, and broad scans that can't be pinned
@@ -228,11 +232,13 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
                 // linearized — the owner would need to barrier before serving.
                 return self
                     .node
-                    .forward_read(owner, aggregators, routing_key, args)
+                    .forward_read(owner, aggregators, routing_key, args, to_micros)
                     .await;
             }
         }
-        self.local.read(aggregators, routing_key, args).await
+        self.local
+            .read(aggregators, routing_key, args, to_micros)
+            .await
     }
 
     async fn latest_timestamp(

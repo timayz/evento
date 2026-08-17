@@ -259,11 +259,14 @@ pub enum Message {
         entries: Vec<(u64, Vec<Vec<NodeId>>)>,
     },
     /// A node → an owner of the queried key range: serve this read locally.
+    /// `to_micros` forwards the exclusive stamp bound (see
+    /// `evento_core::Executor::read`).
     ReadForward {
         id: u64,
         aggregators: Option<Vec<EventFilter>>,
         routing_key: Option<RoutingKey>,
         args: Args,
+        to_micros: Option<u64>,
     },
     /// Owner → requester: the read result (events paired with their cursors).
     ReadReply {

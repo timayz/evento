@@ -22,6 +22,7 @@ async fn last_routing_key<E: Executor>(
             Some(vec![EventFilter::by_id(BankAccount::aggregate_type(), id)]),
             None,
             Args::backward(1, None),
+            None,
         )
         .await?
         .edges;
@@ -2029,7 +2030,7 @@ pub async fn read_order_timestamp<E: Executor + Clone>(executor: &E) -> anyhow::
     let ids = |r: &ReadResult<Event>| r.edges.iter().map(|e| e.node.id).collect::<Vec<_>>();
     let read = |args| {
         let f = EventFilter::by_type(agg_type);
-        async move { executor.read(Some(vec![f]), None, args).await }
+        async move { executor.read(Some(vec![f]), None, args, None).await }
     };
 
     // Full forward read.
@@ -2081,6 +2082,7 @@ pub async fn write_restamps_client_clock<E: Executor + Clone>(executor: &E) -> a
             Some(vec![EventFilter::by_id(agg_type, "restamped")]),
             None,
             Args::forward(1, None),
+            None,
         )
         .await?;
     assert!(
@@ -2094,6 +2096,7 @@ pub async fn write_restamps_client_clock<E: Executor + Clone>(executor: &E) -> a
             Some(vec![EventFilter::by_id(agg_type, "verbatim")]),
             None,
             Args::forward(1, None),
+            None,
         )
         .await?;
     assert_eq!(verbatim.edges[0].node.timestamp, 42);
@@ -2128,6 +2131,7 @@ pub async fn exact_filter<E: Executor + Clone>(executor: &E) -> anyhow::Result<(
             Some(vec![EventFilter::exact(agg_type, &id, "Alpha")]),
             None,
             Args::forward(10, None),
+            None,
         )
         .await?;
     assert_eq!(
@@ -2142,6 +2146,7 @@ pub async fn exact_filter<E: Executor + Clone>(executor: &E) -> anyhow::Result<(
             Some(vec![EventFilter::exact(agg_type, &id, "Beta")]),
             None,
             Args::forward(10, None),
+            None,
         )
         .await?;
     assert_eq!(

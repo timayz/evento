@@ -345,8 +345,8 @@ where
         aggregators: Option<Vec<EventFilter>>,
         routing_key: Option<evento_core::RoutingKey>,
         args: Args,
+        to_micros: Option<u64>,
     ) -> anyhow::Result<ReadResult<evento_core::Event>> {
-        let to_micros = args.to_micros;
         let statement = Query::select()
             .columns([
                 Event::Id,

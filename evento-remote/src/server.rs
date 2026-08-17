@@ -268,9 +268,10 @@ async fn handle<E: Executor>(executor: &E, request: Request) -> Response {
             aggregators,
             routing_key,
             args,
+            to_micros,
         } => Response::Read(err_string(
             executor
-                .read(aggregators, routing_key, args)
+                .read(aggregators, routing_key, args, to_micros)
                 .await
                 .map(WireReadResult::from),
         )),

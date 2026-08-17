@@ -194,12 +194,14 @@ async fn remote_requests_fail_after_shutdown() -> anyhow::Result<()> {
         .connect()
         .await?;
 
-    client.read(None, None, Args::forward(1, None)).await?;
+    client
+        .read(None, None, Args::forward(1, None), None)
+        .await?;
 
     handle.shutdown().await;
 
     let err = client
-        .read(None, None, Args::forward(1, None))
+        .read(None, None, Args::forward(1, None), None)
         .await
         .expect_err("request against a stopped server must fail");
     let msg = format!("{err:#}");

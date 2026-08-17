@@ -499,6 +499,7 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
                     )]),
                     None,
                     Args::backward(1, None),
+                    None,
                 )
                 .await?;
             if !res.edges.is_empty() {
@@ -572,6 +573,10 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
                     Some(read_aggregators.to_vec()),
                     None,
                     Args::forward(100, page_cursor.clone()),
+                    // Deliberately unbounded: gated events are folded into the
+                    // returned in-memory state (read-your-writes) and only
+                    // excluded from the persisted snapshot.
+                    None,
                 )
                 .await?;
 

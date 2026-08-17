@@ -1152,10 +1152,11 @@ impl Node {
                 aggregators,
                 routing_key,
                 args,
+                to_micros,
             } => {
                 let result = self
                     .datastore
-                    .read(aggregators, routing_key, args)
+                    .read(aggregators, routing_key, args, to_micros)
                     .await
                     .unwrap_or_default();
                 let page_info = result.page_info;
@@ -2457,6 +2458,7 @@ impl Node {
         aggregators: Option<Vec<EventFilter>>,
         routing_key: Option<RoutingKey>,
         args: Args,
+        to_micros: Option<u64>,
     ) -> anyhow::Result<ReadResult<Event>> {
         let id = self.correlation_seq.fetch_add(1, Ordering::Relaxed);
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -2471,6 +2473,7 @@ impl Node {
                 aggregators,
                 routing_key,
                 args,
+                to_micros,
             },
         )
         .await;
