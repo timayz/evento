@@ -159,20 +159,16 @@ pub trait Cursor {
     fn serialize(&self) -> Self::T;
     /// Serializes cursor data to a base64 [`Value`].
     fn serialize_cursor(&self) -> Result<Value, CursorError> {
-        use base64::{alphabet, engine::general_purpose, engine::GeneralPurpose, Engine};
+        use base64::{engine::general_purpose::URL_SAFE, Engine};
 
         let bytes = self.serialize().encode()?;
-        let engine = GeneralPurpose::new(&alphabet::URL_SAFE, general_purpose::PAD);
-
-        Ok(Value(engine.encode(&bytes)))
+        Ok(Value(URL_SAFE.encode(&bytes)))
     }
     /// Deserializes cursor data from a base64 [`Value`].
     fn deserialize_cursor(value: &Value) -> Result<Self::T, CursorError> {
-        use base64::{alphabet, engine::general_purpose, engine::GeneralPurpose, Engine};
+        use base64::{engine::general_purpose::URL_SAFE, Engine};
 
-        let engine = GeneralPurpose::new(&alphabet::URL_SAFE, general_purpose::PAD);
-        let bytes = engine.decode(value)?;
-
+        let bytes = URL_SAFE.decode(value)?;
         Self::T::decode(&bytes)
     }
 }

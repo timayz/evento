@@ -156,6 +156,9 @@ pub struct SubscriptionBuilder<E: Executor> {
     context: context::RwContext,
     routing_key: Option<RoutingKey>,
     prefix_key: Option<String>,
+    /// The storage key with its routing/tenant prefix applied — computed once
+    /// in `resolve_routing_key` so the hot paths never re-format it.
+    resolved_key: String,
     delay: Option<Duration>,
     poll_interval: Duration,
     chunk_size: u16,
@@ -189,8 +192,10 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
     ///
     /// The key is used as the subscription identifier for cursor tracking.
     pub fn new(key: impl Into<String>) -> Self {
+        let key = key.into();
         Self {
-            key: key.into(),
+            resolved_key: key.clone(),
+            key,
             handlers: HashMap::new(),
             safety_disabled: true,
             context: Default::default(),
@@ -224,8 +229,16 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
     /// Panics if a handler for the same event type is already registered.
     pub fn handler<H: Handler<E> + 'static>(mut self, h: H) -> Self {
         let key = format!("{}_{}", h.aggregate_type(), h.event_name());
-        if self.handlers.insert(key.to_owned(), Box::new(h)).is_some() {
-            panic!("Cannot register event handler: key {} already exists", key);
+        match self.handlers.entry(key) {
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                panic!(
+                    "Cannot register event handler: key {} already exists",
+                    entry.key()
+                );
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Box::new(h));
+            }
         }
         self
     }
@@ -370,16 +383,8 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             .collect()
     }
 
-    fn key(&self) -> String {
-        let prefix = match &self.routing_key {
-            Some(RoutingKey::Value(Some(k))) => Some(k.as_str()),
-            Some(RoutingKey::All) => self.prefix_key.as_deref(),
-            _ => None,
-        };
-        match prefix {
-            Some(p) => format!("{p}.{}", self.key),
-            None => self.key.to_owned(),
-        }
+    fn resolved_key(&self) -> &str {
+        &self.resolved_key
     }
 
     /// Resolves an unset routing key from the executor's default and captures
@@ -397,13 +402,21 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
         if self.prefix_key.is_none() {
             self.prefix_key = executor.default_routing_key().map(|s| s.to_owned());
         }
-        if self.routing_key.is_some() {
-            return;
+        if self.routing_key.is_none() {
+            self.routing_key = Some(match executor.default_routing_key() {
+                Some(k) => RoutingKey::Value(Some(k.to_owned())),
+                None => RoutingKey::Value(None),
+            });
         }
-        self.routing_key = Some(match executor.default_routing_key() {
-            Some(k) => RoutingKey::Value(Some(k.to_owned())),
-            None => RoutingKey::Value(None),
-        });
+        let prefix = match &self.routing_key {
+            Some(RoutingKey::Value(Some(k))) => Some(k.as_str()),
+            Some(RoutingKey::All) => self.prefix_key.as_deref(),
+            _ => None,
+        };
+        self.resolved_key = match prefix {
+            Some(p) => format!("{p}.{}", self.key),
+            None => self.key.clone(),
+        };
     }
 
     fn effective_routing_key(&self) -> RoutingKey {
@@ -429,12 +442,14 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
         // as it catches up. The caller (`start`'s loop) owns all waiting — poll
         // interval, write signal, and shutdown — so there is no pacing here: this
         // keeps both fresh-event latency and backlog drain at full speed.
-        tracing::Span::current().record("subscription", self.key());
+        tracing::Span::current().record("subscription", self.resolved_key());
 
         let ack_every = usize::from(self.ack_every.unwrap_or(self.chunk_size).max(1));
 
         loop {
-            let status = executor.subscriber_status(self.key(), *id).await?;
+            let status = executor
+                .subscriber_status(self.resolved_key().to_owned(), *id)
+                .await?;
             if !status.running {
                 return Ok(ProcessOutcome::LostOwnership);
             }
@@ -509,7 +524,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                     .is_some_and(|rx| *rx.borrow() || rx.has_changed().is_err())
                 {
                     tracing::info!(
-                        key = self.key(),
+                        key = self.resolved_key(),
                         "Subscription received shutdown signal, stopping gracefully"
                     );
 
@@ -523,15 +538,18 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                 tracing::Span::current().record("event", &event.node.name);
 
                 // A specific handler takes precedence over a `subscription_all`
-                // catch-all for the same aggregate type.
-                let all_key = format!("{}_all", event.node.aggregate_type);
+                // catch-all for the same aggregate type; the catch-all key is
+                // only built on a miss.
                 let key = format!("{}_{}", event.node.aggregate_type, event.node.name);
-                let handler = match self.handlers.get(&key).or(self.handlers.get(&all_key)) {
+                let handler = match self.handlers.get(&key).or_else(|| {
+                    self.handlers
+                        .get(&format!("{}_all", event.node.aggregate_type))
+                }) {
                     Some(handler) => Some(handler),
                     None if !self.safety_disabled && !self.continue_on_error => {
                         self.flush_ack(executor, id, aggregators, &mut pending_ack, &mut since_ack)
                             .await?;
-                        anyhow::bail!("no handler s={} k={key}", self.key())
+                        anyhow::bail!("no handler s={} k={key}", self.resolved_key())
                     }
                     None if !self.safety_disabled => {
                         // Strict mode with continue_on_error: skip the poison
@@ -616,7 +634,12 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
 
         let latest = self.cached_latest_timestamp(executor, aggregators).await?;
         executor
-            .acknowledge(self.key(), *id, cursor, latest.saturating_sub(event_ts))
+            .acknowledge(
+                self.resolved_key().to_owned(),
+                *id,
+                cursor,
+                latest.saturating_sub(event_ts),
+            )
             .await
     }
 
@@ -710,7 +733,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
         E: Clone,
     {
         self.resolve_routing_key(executor);
-        tracing::Span::current().record("subscription", self.key());
+        tracing::Span::current().record("subscription", self.resolved_key());
         let executor = executor.clone();
         let id = Ulid::generate();
         let subscription_id = id;
@@ -719,7 +742,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
         let mut shutdown_rx = shutdown_rx;
 
         executor
-            .upsert_subscriber(self.key(), id.to_owned())
+            .upsert_subscriber(self.resolved_key().to_owned(), id.to_owned())
             .await?;
 
         let mut write_watch = executor.write_watch();
@@ -777,7 +800,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
 
                 if shutdown {
                     tracing::info!(
-                        key = self.key(),
+                        key = self.resolved_key(),
                         "Subscription received shutdown signal, stopping gracefully"
                     );
 
@@ -816,7 +839,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                 };
                 let Some(result) = result else {
                     tracing::info!(
-                        key = self.key(),
+                        key = self.resolved_key(),
                         "Subscription received shutdown signal, stopping gracefully"
                     );
                     break;
@@ -828,7 +851,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                     Ok(ProcessOutcome::ShutdownRequested) => break,
                     Ok(ProcessOutcome::LostOwnership) => {
                         tracing::info!(
-                            key = self.key(),
+                            key = self.resolved_key(),
                             "Subscription taken over by another worker, stopping"
                         );
                         break;
@@ -868,11 +891,11 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
     ))]
     pub async fn run_once(&mut self, executor: &E) -> anyhow::Result<()> {
         self.resolve_routing_key(executor);
-        tracing::Span::current().record("subscription", self.key());
+        tracing::Span::current().record("subscription", self.resolved_key());
         let id = Ulid::generate();
 
         executor
-            .upsert_subscriber(self.key(), id.to_owned())
+            .upsert_subscriber(self.resolved_key().to_owned(), id.to_owned())
             .await?;
 
         let read_aggregators = self.read_aggregators();
@@ -921,7 +944,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                 ProcessOutcome::LostOwnership => {
                     anyhow::bail!(
                         "subscription {} was taken over by another worker during run_once",
-                        self.key()
+                        self.resolved_key()
                     )
                 }
                 ProcessOutcome::Gated { wait } => {

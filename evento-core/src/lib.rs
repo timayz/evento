@@ -309,6 +309,31 @@ mod tests {
         }
     }
 
+    /// Cursor strings persisted by earlier releases (hand-built base64
+    /// engine, URL_SAFE + PAD) must keep round-tripping through the prebuilt
+    /// `URL_SAFE` engine constant — subscriber cursors live in the store.
+    #[test]
+    fn cursor_encoding_is_stable_across_releases() {
+        use crate::cursor::{Cursor, Value};
+
+        let event = Event {
+            id: Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap(),
+            version: 7,
+            timestamp: 1_700_000_000,
+            timestamp_subsec: 123,
+            ..Default::default()
+        };
+        // Fixture produced by the pre-change encoder.
+        let fixture = Value("GjAxQVJaM05ERUtUU1Y0UlJGRlE2OUc1RkFWBwACAPFTZQR7".to_string());
+
+        assert_eq!(event.serialize_cursor().unwrap(), fixture);
+        let decoded = Event::deserialize_cursor(&fixture).unwrap();
+        assert_eq!(decoded.i, "01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        assert_eq!(decoded.v, 7);
+        assert_eq!(decoded.t, 1_700_000_000);
+        assert_eq!(decoded.s, 123);
+    }
+
     /// Events must be ordered by whole seconds first, then sub-seconds — matching
     /// the SQL `ORDER BY timestamp, timestamp_subsec, version, id`. A regression for
     /// the bug where `timestamp_subsec` was (incorrectly) the major sort key, which

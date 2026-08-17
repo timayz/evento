@@ -420,8 +420,16 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
     /// Panics if a handler for the same event type is already registered.
     pub fn handler<H: Handler<P> + 'static>(mut self, h: H) -> Self {
         let key = format!("{}_{}", h.aggregate_type(), h.event_name());
-        if self.handlers.insert(key.to_owned(), Box::new(h)).is_some() {
-            panic!("Cannot register event handler: key {} already exists", key);
+        match self.handlers.entry(key) {
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                panic!(
+                    "Cannot register event handler: key {} already exists",
+                    entry.key()
+                );
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Box::new(h));
+            }
         }
         self
     }
