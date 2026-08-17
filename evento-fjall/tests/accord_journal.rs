@@ -160,3 +160,40 @@ async fn metadata_log_and_acceptor_state_survive_close_and_reopen() {
 
     assert!(journal.load_watermark().await.unwrap().is_none());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metadata_batch_append_keeps_first_decided_layout() {
+    let temp = tempfile::Builder::new()
+        .prefix("evento_accord_journal_meta_batch")
+        .tempdir()
+        .unwrap();
+
+    let layout = |nodes: &[u64]| vec![nodes.iter().map(|&n| NodeId(n)).collect::<Vec<_>>()];
+
+    {
+        let journal = FjallJournal::open(temp.path()).unwrap();
+        journal.append_metadata(2, &layout(&[0, 1])).await.unwrap();
+        // A batch overlapping an already-durable epoch must not overwrite its
+        // decided layout, and must still append the new epochs.
+        journal
+            .append_metadata_batch(&[
+                (1, layout(&[0])),
+                (2, layout(&[9, 9, 9])),
+                (3, layout(&[0, 1, 2])),
+            ])
+            .await
+            .unwrap();
+    }
+
+    let journal = FjallJournal::open(temp.path()).unwrap();
+
+    let entries = journal.load_metadata().await.unwrap();
+    assert_eq!(entries.len(), 3, "all epochs survived the restart");
+    assert_eq!(entries[0], (1, layout(&[0])));
+    assert_eq!(
+        entries[1],
+        (2, layout(&[0, 1])),
+        "the first decided layout for an epoch wins over a batched re-append"
+    );
+    assert_eq!(entries[2], (3, layout(&[0, 1, 2])));
+}
