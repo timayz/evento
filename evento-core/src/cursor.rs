@@ -354,7 +354,7 @@ where
         // `limit` (not the pre-take length) is required so that exactly `limit + 1`
         // matching rows still report `has_more` and return only `limit` edges,
         // matching the SQL backend's pagination.
-        data = data.into_iter().take((limit + 1).into()).collect();
+        data = data.into_iter().take(limit as usize + 1).collect();
 
         let has_more = data.len() > limit as usize;
         if has_more {
@@ -375,15 +375,21 @@ where
             edges = edges.into_iter().rev().collect();
         }
 
+        // Both boundary cursors are always populated so a caller can reverse
+        // direction from either end of a page. Only the paging direction's
+        // "more" flag can be computed from the probe row; the opposite flag
+        // stays `false` (unknown), per the GraphQL cursor-connection spec.
         let page_info = if self.args.is_backward() {
             PageInfo {
                 has_previous_page: has_more,
                 start_cursor: edges.first().map(|e| e.cursor.to_owned()),
+                end_cursor: edges.last().map(|e| e.cursor.to_owned()),
                 ..Default::default()
             }
         } else {
             PageInfo {
                 has_next_page: has_more,
+                start_cursor: edges.first().map(|e| e.cursor.to_owned()),
                 end_cursor: edges.last().map(|e| e.cursor.to_owned()),
                 ..Default::default()
             }

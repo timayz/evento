@@ -120,11 +120,13 @@ impl Hash for EventFilter {
 /// - `acknowledge` - Update subscription cursor
 #[async_trait::async_trait]
 pub trait Executor: Send + Sync + 'static {
-    /// Default routing key applied to writes and inherited by subscriptions.
+    /// Default routing key applied to new aggregates and inherited by
+    /// subscriptions.
     ///
     /// Most backends return `None`; [`Evento`] overrides this to expose its
-    /// configured default. Used by `Evento::write` to fill in missing routing
-    /// keys, and by `SubscriptionBuilder::start` /
+    /// configured default. Used by `WriteBuilder::commit` to fill in the
+    /// routing key for a brand-new aggregate (an existing stream keeps its
+    /// original key), and by `SubscriptionBuilder::start` /
     /// `ProjectionSubscription::start` to inherit a default when the user
     /// has not called `.routing_key()` or `.all()`.
     fn default_routing_key(&self) -> Option<&str> {
@@ -133,8 +135,25 @@ pub trait Executor: Send + Sync + 'static {
 
     /// Persists events atomically.
     ///
+    /// Backends that own event ordering (SQL, Fjall) re-stamp
+    /// `timestamp`/`timestamp_subsec` with their commit clock here, so cursor
+    /// order matches commit order. Callers must not rely on the timestamps
+    /// they supplied surviving a `write`; use [`replicate`](Self::replicate)
+    /// to persist pre-stamped events verbatim.
+    ///
     /// Returns `WriteError::InvalidOriginalVersion` if version conflicts occur.
     async fn write(&self, events: Vec<Event>) -> Result<(), WriteError>;
+
+    /// Persists pre-stamped events verbatim, without re-stamping timestamps.
+    ///
+    /// Replication layers that own ordering themselves (e.g. Accord applying
+    /// consensus-ordered events to a local store) use this to preserve the
+    /// timestamps agreed on by the replication protocol. The default delegates
+    /// to [`write`](Self::write); backends that re-stamp in `write` must
+    /// override this to skip the re-stamp.
+    async fn replicate(&self, events: Vec<Event>) -> Result<(), WriteError> {
+        self.write(events).await
+    }
 
     /// Returns a receiver notified after each successful in-process `write`,
     /// for low-latency subscription wakeup.
@@ -154,16 +173,21 @@ pub trait Executor: Send + Sync + 'static {
     /// event timestamps a subscription may safely process — or `None` for no
     /// bound (the default).
     ///
-    /// Single-store backends append in a total order that matches the
-    /// subscription cursor, so they return `None`. A replicated backend whose
-    /// events can be applied to a node out of cursor order (multi-node Accord)
-    /// returns a stability watermark: the subscription processes only events
-    /// whose timestamp is strictly below it, so it never advances past a
-    /// position where a lower-cursor event could still be applied later. Safety
-    /// holds under the same clock-skew/propagation bound the backend already
-    /// assumes for its own state (e.g. Accord's `compaction_margin`).
-    fn stable_timestamp(&self) -> Option<u64> {
-        None
+    /// Backends that serialize writes in-process and stamp them with a
+    /// monotonic commit clock (Fjall) return `None`: their cursor order always
+    /// matches commit order. Backends where independent writers can commit out
+    /// of cursor order return a stability watermark: a SQL store shared by
+    /// several processes returns DB-server time minus a small margin covering
+    /// in-flight statement duration, and a replicated backend (multi-node
+    /// Accord) returns its own stability bound. The subscription processes only
+    /// events whose timestamp is strictly below the watermark, so it never
+    /// advances past a position where a lower-cursor event could still become
+    /// visible later.
+    ///
+    /// Async so implementations can consult an authoritative clock (e.g. the
+    /// DB server) instead of the local wall clock.
+    async fn stable_timestamp(&self) -> anyhow::Result<Option<u64>> {
+        Ok(None)
     }
 
     /// Gets the current cursor position for a subscription.
@@ -175,8 +199,21 @@ pub trait Executor: Send + Sync + 'static {
     /// Creates or updates a subscription record.
     async fn upsert_subscriber(&self, key: String, worker_id: Ulid) -> anyhow::Result<()>;
 
-    /// Updates subscription cursor after processing events.
-    async fn acknowledge(&self, key: String, cursor: Value, lag: u64) -> anyhow::Result<()>;
+    /// Updates the subscription cursor after processing an event, fenced by
+    /// `worker_id`.
+    ///
+    /// Implementations must only apply the update while `worker_id` is still
+    /// the registered worker for `key`, and return `Ok(false)` (without
+    /// updating) when ownership has been taken over by another worker — this
+    /// prevents a superseded worker from rewinding the shared cursor
+    /// mid-chunk. Returns `Ok(true)` when the cursor was updated.
+    async fn acknowledge(
+        &self,
+        key: String,
+        worker_id: Ulid,
+        cursor: Value,
+        lag: u64,
+    ) -> anyhow::Result<bool>;
 
     /// Queries events with filtering and pagination.
     async fn read(
@@ -186,7 +223,9 @@ pub trait Executor: Send + Sync + 'static {
         args: Args,
     ) -> anyhow::Result<ReadResult<Event>>;
 
-    /// Returns the timestamp of the most recent event matching the filter.
+    /// Returns the timestamp of the most recent event matching the filter, in
+    /// whole **seconds** since the Unix epoch (unlike
+    /// [`stable_timestamp`](Self::stable_timestamp), which is microseconds).
     ///
     /// Returns 0 when no matching event exists. Used by the subscription loop
     /// to compute lag without fetching the full event row (data/metadata blobs).
@@ -262,23 +301,25 @@ impl Executor for Evento {
         self.default_routing_key.as_deref()
     }
 
-    async fn write(&self, mut events: Vec<Event>) -> Result<(), WriteError> {
-        if let Some(default) = self.default_routing_key.as_deref() {
-            for event in &mut events {
-                if event.routing_key.is_none() {
-                    event.routing_key = Some(default.to_owned());
-                }
-            }
-        }
+    async fn write(&self, events: Vec<Event>) -> Result<(), WriteError> {
+        // The default routing key is applied by `WriteBuilder::commit` (which
+        // consults `default_routing_key()` only for a brand-new aggregate, so
+        // an existing stream keeps its original key even when that key is
+        // `None`). Filling it in here would split such a stream across two
+        // routing keys.
         self.inner.write(events).await
+    }
+
+    async fn replicate(&self, events: Vec<Event>) -> Result<(), WriteError> {
+        self.inner.replicate(events).await
     }
 
     fn write_watch(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
         self.inner.write_watch()
     }
 
-    fn stable_timestamp(&self) -> Option<u64> {
-        self.inner.stable_timestamp()
+    async fn stable_timestamp(&self) -> anyhow::Result<Option<u64>> {
+        self.inner.stable_timestamp().await
     }
 
     async fn read(
@@ -310,8 +351,14 @@ impl Executor for Evento {
         self.inner.upsert_subscriber(key, worker_id).await
     }
 
-    async fn acknowledge(&self, key: String, cursor: Value, lag: u64) -> anyhow::Result<()> {
-        self.inner.acknowledge(key, cursor, lag).await
+    async fn acknowledge(
+        &self,
+        key: String,
+        worker_id: Ulid,
+        cursor: Value,
+        lag: u64,
+    ) -> anyhow::Result<bool> {
+        self.inner.acknowledge(key, worker_id, cursor, lag).await
     }
 
     async fn get_snapshot(
@@ -410,12 +457,16 @@ impl Executor for EventoGroup {
         self.first().write(events).await
     }
 
+    async fn replicate(&self, events: Vec<Event>) -> Result<(), WriteError> {
+        self.first().replicate(events).await
+    }
+
     fn write_watch(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
         self.first().write_watch()
     }
 
-    fn stable_timestamp(&self) -> Option<u64> {
-        self.first().stable_timestamp()
+    async fn stable_timestamp(&self) -> anyhow::Result<Option<u64>> {
+        self.first().stable_timestamp().await
     }
 
     async fn read(
@@ -432,13 +483,25 @@ impl Executor for EventoGroup {
 
         let results = futures_util::future::join_all(futures).await;
         let mut events = vec![];
+        // A child executor that filled its own limit may hold further pages the
+        // merged in-memory reader cannot see (it never over-fetches children),
+        // so its `has_next_page`/`has_previous_page` must carry over — otherwise
+        // callers stop paginating early and silently miss that child's events.
+        let mut child_has_next = false;
+        let mut child_has_previous = false;
         for res in results {
-            for edge in res?.edges {
+            let res = res?;
+            child_has_next |= res.page_info.has_next_page;
+            child_has_previous |= res.page_info.has_previous_page;
+            for edge in res.edges {
                 events.push(edge.node);
             }
         }
 
-        Ok(cursor::Reader::new(events).args(args).execute()?)
+        let mut merged = cursor::Reader::new(events).args(args).execute()?;
+        merged.page_info.has_next_page |= child_has_next;
+        merged.page_info.has_previous_page |= child_has_previous;
+        Ok(merged)
     }
 
     async fn latest_timestamp(
@@ -475,8 +538,14 @@ impl Executor for EventoGroup {
         self.first().upsert_subscriber(key, worker_id).await
     }
 
-    async fn acknowledge(&self, key: String, cursor: Value, lag: u64) -> anyhow::Result<()> {
-        self.first().acknowledge(key, cursor, lag).await
+    async fn acknowledge(
+        &self,
+        key: String,
+        worker_id: Ulid,
+        cursor: Value,
+        lag: u64,
+    ) -> anyhow::Result<bool> {
+        self.first().acknowledge(key, worker_id, cursor, lag).await
     }
 
     async fn get_snapshot(
@@ -545,12 +614,22 @@ impl<R: Executor, W: Executor> Executor for Rw<R, W> {
         self.w.write(events).await
     }
 
-    fn write_watch(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
-        self.r.write_watch()
+    async fn replicate(&self, events: Vec<Event>) -> Result<(), WriteError> {
+        self.w.replicate(events).await
     }
 
-    fn stable_timestamp(&self) -> Option<u64> {
-        self.r.stable_timestamp()
+    fn write_watch(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        // Writes go through `w`, so its channel is the one that fires; `r`
+        // never observes writes and its watch would leave subscriptions on
+        // pure polling.
+        self.w.write_watch()
+    }
+
+    async fn stable_timestamp(&self) -> anyhow::Result<Option<u64>> {
+        // The watermark gates what a subscription reads, and reads come from
+        // `r`. With a genuine read replica the backend's margin must also
+        // cover replication lag — see `Sql::stable_margin`.
+        self.r.stable_timestamp().await
     }
 
     async fn read(
@@ -582,8 +661,14 @@ impl<R: Executor, W: Executor> Executor for Rw<R, W> {
         self.w.upsert_subscriber(key, worker_id).await
     }
 
-    async fn acknowledge(&self, key: String, cursor: Value, lag: u64) -> anyhow::Result<()> {
-        self.w.acknowledge(key, cursor, lag).await
+    async fn acknowledge(
+        &self,
+        key: String,
+        worker_id: Ulid,
+        cursor: Value,
+        lag: u64,
+    ) -> anyhow::Result<bool> {
+        self.w.acknowledge(key, worker_id, cursor, lag).await
     }
 
     async fn get_snapshot(

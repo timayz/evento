@@ -40,6 +40,13 @@ const SNAPSHOT_PAGE_SIZE: u16 = 4096;
 /// The single key a read targets, if it can be pinned to one shard: an explicit
 /// routing key, or a query for one aggregate by id. Broad scans (multiple
 /// aggregates, or by event type) return `None` and are served locally.
+///
+/// **Caveat:** the write side derives the shard key from `routing_key` falling
+/// back to the aggregate id ([`Key::of`]). A by-id pin is therefore only
+/// correct for aggregates written **without** a routing key; a read of a
+/// *routed* aggregate must pass its routing key too, or the pin lands on the
+/// wrong key — a forwarded read goes to the wrong shard, and a read barrier
+/// fences the wrong conflict set.
 fn target_key(
     aggregators: &Option<Vec<EventFilter>>,
     routing_key: &Option<RoutingKey>,
@@ -112,7 +119,10 @@ impl<E: Executor> DataStore for ExecutorDataStore<E> {
         if !commit || events.is_empty() {
             return Ok(());
         }
-        match self.local.write(events).await {
+        // `replicate`, not `write`: the replication layer owns ordering, so
+        // the events' timestamps must be persisted verbatim (a re-stamping
+        // backend would desync this replica's cursors from its peers').
+        match self.local.replicate(events).await {
             // Accord already validated the condition at this serial point;
             // a version conflict here means the events are already present
             // (idempotent re-apply), which is fine.
@@ -206,13 +216,13 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
         self.local.write_watch()
     }
 
-    fn stable_timestamp(&self) -> Option<u64> {
+    async fn stable_timestamp(&self) -> anyhow::Result<Option<u64>> {
         // Gate subscriptions by the node's stability watermark. Events are
         // applied to each replica's local store in Accord's `(execute_at, txn)`
         // order — which can differ from the subscription's wall-clock cursor —
         // so without this gate a late, lower-cursor event applied out of order
         // would be skipped by the forward read. See `Node::stable_micros`.
-        Some(self.node.stable_micros())
+        Ok(Some(self.node.stable_micros()))
     }
 
     async fn read(
@@ -265,8 +275,14 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
         self.local.upsert_subscriber(key, worker_id).await
     }
 
-    async fn acknowledge(&self, key: String, cursor: Value, lag: u64) -> anyhow::Result<()> {
-        self.local.acknowledge(key, cursor, lag).await
+    async fn acknowledge(
+        &self,
+        key: String,
+        worker_id: Ulid,
+        cursor: Value,
+        lag: u64,
+    ) -> anyhow::Result<bool> {
+        self.local.acknowledge(key, worker_id, cursor, lag).await
     }
 
     async fn get_snapshot(

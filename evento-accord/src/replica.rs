@@ -24,7 +24,7 @@
 //! `superseding_rejects`: whether a later conflicting transaction failed to
 //! witness this one, which proves it could not have committed on the fast path.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use evento_core::Event;
 
@@ -51,6 +51,11 @@ pub struct Replica {
     /// dependency below it counts as already satisfied (its effect is in the data
     /// store). Advances monotonically via [`compact`](Replica::compact).
     redundant_before: Timestamp,
+    /// Transactions handed out by [`next_apply`](Replica::next_apply) whose apply
+    /// is in flight (the node performs it outside the lock). Excluded from
+    /// further `next_apply` picks so two concurrent drivers cannot double-apply
+    /// the same transaction.
+    applying: HashSet<TxnId>,
 }
 
 impl Default for Replica {
@@ -60,6 +65,7 @@ impl Default for Replica {
             by_key: HashMap::new(),
             pending: BTreeSet::new(),
             redundant_before: Timestamp::MIN,
+            applying: HashSet::new(),
         }
     }
 }
@@ -159,6 +165,21 @@ impl Replica {
         }
     }
 
+    /// Adds `keys` to a known command and indexes them in the conflict graph.
+    /// Repairs commands first learned via Accept/Commit (which used to leave
+    /// `keys` empty, hiding the transaction from later conflict lookups).
+    fn index_keys(&mut self, txn: TxnId, keys: &[Key]) {
+        let Some(cmd) = self.commands.get_mut(&txn) else {
+            return;
+        };
+        for key in keys {
+            if !cmd.keys.contains(key) {
+                cmd.keys.push(key.clone());
+            }
+            self.by_key.entry(key.clone()).or_default().insert(txn);
+        }
+    }
+
     /// Indexes a transaction's keys and inserts its command state, keeping the
     /// `pending` execution queue in lockstep (including when overwriting an
     /// existing command, e.g. [`import_applied`](Self::import_applied)).
@@ -219,6 +240,30 @@ impl Replica {
         })
     }
 
+    /// An upper bound (µs) on what a subscription may safely process: `cutoff`,
+    /// clamped by the **event timestamps** of every un-applied command — not
+    /// just its `t0`. An event is stamped by its writer *before* consensus, so
+    /// it can sit below its transaction's `t0`; clamping only by `t0` would let
+    /// a subscription advance past an event a stuck transaction will apply
+    /// later, silently skipping it.
+    pub fn stable_event_micros(&self, cutoff: Timestamp) -> u64 {
+        let mut bound = cutoff.micros;
+        for cmd in self.commands.values() {
+            if cmd.status == Status::Applied {
+                continue;
+            }
+            bound = bound.min(cmd.txn.0.micros);
+            for event in &cmd.events {
+                let event_micros = event
+                    .timestamp
+                    .saturating_mul(1_000_000)
+                    .saturating_add(u64::from(event.timestamp_subsec) * 1_000);
+                bound = bound.min(event_micros);
+            }
+        }
+        bound
+    }
+
     /// Handles PreAccept: records the transaction and returns the execution
     /// timestamp and dependencies this replica witnesses. Idempotent.
     pub fn preaccept(
@@ -227,7 +272,15 @@ impl Replica {
         keys: Vec<Key>,
         events: Vec<Event>,
     ) -> (Timestamp, Vec<TxnId>) {
-        if let Some(existing) = self.commands.get(&txn) {
+        if self.commands.contains_key(&txn) {
+            // Late PreAccept after an Accept/Commit created the entry: repair a
+            // keyless/eventless command so the conflict index and recovery's
+            // superseding check see it.
+            self.index_keys(txn, &keys);
+            let existing = self.commands.get_mut(&txn).expect("present");
+            if existing.events.is_empty() {
+                existing.events = events;
+            }
             return (existing.execute_at, existing.deps.clone());
         }
 
@@ -274,6 +327,7 @@ impl Replica {
         ballot: Ballot,
         execute_at: Timestamp,
         deps: Vec<TxnId>,
+        keys: Vec<Key>,
     ) -> Result<Vec<TxnId>, Ballot> {
         if let Some(cmd) = self.commands.get_mut(&txn) {
             if ballot < cmd.promised {
@@ -284,17 +338,22 @@ impl Replica {
             // doing so would also desync the `pending` execution queue. Answer with
             // the committed deps instead.
             if cmd.status >= Status::Committed {
-                return Ok(cmd.deps.clone());
+                let deps = cmd.deps.clone();
+                self.index_keys(txn, &keys);
+                return Ok(deps);
             }
             cmd.promised = ballot;
             cmd.accepted = ballot;
             cmd.status = Status::Accepted;
             cmd.execute_at = execute_at;
             cmd.deps = deps;
-            Ok(cmd.deps.clone())
+            let deps = cmd.deps.clone();
+            self.index_keys(txn, &keys);
+            Ok(deps)
         } else {
-            // The replica missed PreAccept; record what it was told (events
-            // arrive with Commit).
+            // The replica missed PreAccept; record what it was told — including
+            // the keys, so the conflict index and recovery's superseding check
+            // still see this transaction (events arrive with Commit).
             self.insert(CommandState {
                 txn,
                 status: Status::Accepted,
@@ -302,7 +361,7 @@ impl Replica {
                 accepted: ballot,
                 execute_at,
                 deps: deps.clone(),
-                keys: Vec::new(),
+                keys,
                 events: Vec::new(),
                 reply_to: txn.0.node,
                 decision: None,
@@ -322,9 +381,14 @@ impl Replica {
         execute_at: Timestamp,
         deps: Vec<TxnId>,
         events: Vec<Event>,
+        keys: Vec<Key>,
         reply_to: NodeId,
     ) {
-        if let Some(cmd) = self.commands.get_mut(&txn) {
+        if self.commands.contains_key(&txn) {
+            // Repair a keyless command first learned via Accept, so the
+            // conflict index sees it permanently.
+            self.index_keys(txn, &keys);
+            let cmd = self.commands.get_mut(&txn).expect("present");
             cmd.reply_to = reply_to;
             if cmd.status >= Status::Committed {
                 return;
@@ -345,7 +409,7 @@ impl Replica {
                 accepted: Ballot(txn.0),
                 execute_at,
                 deps,
-                keys: Vec::new(),
+                keys,
                 events,
                 reply_to,
                 decision: None,
@@ -494,12 +558,15 @@ impl Replica {
         // execution order; the first that is decided and ready applies next.
         // (A command decided before it committed isn't in `pending` yet — it was
         // never ready either, so the old full scan would have skipped it too.)
-        let txn = self
-            .pending
-            .iter()
-            .map(|&(_, txn)| txn)
-            .find(|&txn| self.commands[&txn].decision.is_some() && self.is_ready(txn))?;
+        // A transaction already handed out (its apply is in flight outside the
+        // lock) is skipped, so two concurrent drivers cannot double-apply it.
+        let txn = self.pending.iter().map(|&(_, txn)| txn).find(|&txn| {
+            !self.applying.contains(&txn)
+                && self.commands[&txn].decision.is_some()
+                && self.is_ready(txn)
+        })?;
 
+        self.applying.insert(txn);
         let cmd = &self.commands[&txn];
         Some(ApplyReady {
             txn,
@@ -513,6 +580,7 @@ impl Replica {
     /// Records that a transaction's decision has been enacted, storing its
     /// conflict outcome and unblocking dependents.
     pub fn mark_applied(&mut self, txn: TxnId, conflict: bool) {
+        self.applying.remove(&txn);
         if let Some(cmd) = self.commands.get_mut(&txn) {
             let at = cmd.execute_at;
             cmd.status = Status::Applied;
@@ -679,7 +747,7 @@ mod tests {
         replica.preaccept(b, vec![key.clone()], vec![event("k", 2)]);
 
         // B commits and its decision arrives while A is still unapplied.
-        replica.commit(b, b.0, vec![a], vec![event("k", 2)], NodeId(0));
+        replica.commit(b, b.0, vec![a], vec![event("k", 2)], vec![], NodeId(0));
         replica.record_decision(b, true);
         assert!(
             replica.next_apply().is_none(),
@@ -687,7 +755,7 @@ mod tests {
         );
 
         // A commits, decides, and applies.
-        replica.commit(a, a.0, vec![], vec![event("k", 1)], NodeId(0));
+        replica.commit(a, a.0, vec![], vec![event("k", 1)], vec![], NodeId(0));
         replica.record_decision(a, true);
         let ready_a = replica.next_apply().expect("A is ready");
         assert_eq!(ready_a.txn, a);
@@ -704,7 +772,7 @@ mod tests {
     /// Applies `txn` end to end (preaccept → commit → decide → apply) on `key`.
     fn apply(replica: &mut Replica, t: TxnId, key: &Key, version: u16) {
         replica.preaccept(t, vec![key.clone()], vec![event("k", version)]);
-        replica.commit(t, t.0, vec![], vec![event("k", version)], NodeId(0));
+        replica.commit(t, t.0, vec![], vec![event("k", version)], vec![], NodeId(0));
         replica.record_decision(t, true);
         let ready = replica.next_apply().expect("ready to apply");
         assert_eq!(ready.txn, t);
@@ -783,7 +851,7 @@ mod tests {
         replica.preaccept(d, vec![key.clone()], vec![event("k", 2)]);
 
         // Apply and compact away C.
-        replica.commit(c, c.0, vec![], vec![event("k", 1)], NodeId(0));
+        replica.commit(c, c.0, vec![], vec![event("k", 1)], vec![], NodeId(0));
         replica.record_decision(c, true);
         assert_eq!(replica.next_apply().expect("C ready").txn, c);
         replica.mark_applied(c, false);
@@ -791,12 +859,69 @@ mod tests {
         assert!(replica.snapshot(c).is_none());
 
         // D commits with C still in its deps (the quorum union); it must apply.
-        replica.commit(d, d.0, vec![c], vec![event("k", 2)], NodeId(0));
+        replica.commit(d, d.0, vec![c], vec![event("k", 2)], vec![], NodeId(0));
         replica.record_decision(d, true);
         let ready = replica
             .next_apply()
             .expect("D applies despite its dependency C being compacted away");
         assert_eq!(ready.txn, d);
+    }
+
+    /// A replica that first learns a transaction via Accept (it missed
+    /// PreAccept) must still index its keys: a later conflicting transaction
+    /// has to witness it as a dependency, or replicas order the two writes
+    /// differently.
+    #[test]
+    fn accept_without_preaccept_still_enters_the_conflict_index() {
+        let mut replica = Replica::new();
+        let key = Key("k".into());
+        let a = txn(10);
+        let b = txn(20);
+
+        // A arrives via Accept only — with its keys.
+        replica
+            .accept(a, Ballot(a.0), a.0, vec![], vec![key.clone()])
+            .expect("accepted");
+
+        // A later conflicting transaction must witness A as a dependency.
+        let (_, deps) = replica.preaccept(b, vec![key.clone()], vec![event("k", 1)]);
+        assert_eq!(deps, vec![a], "the Accept-only transaction must be a dependency");
+    }
+
+    /// Same repair via Commit: a keyless entry (created by a keyless Accept
+    /// from an older peer, or any path that lost the keys) is re-indexed when
+    /// Commit supplies them.
+    #[test]
+    fn commit_repairs_a_keyless_command() {
+        let mut replica = Replica::new();
+        let key = Key("k".into());
+        let a = txn(10);
+        let b = txn(20);
+
+        replica.accept(a, Ballot(a.0), a.0, vec![], vec![]).expect("accepted");
+        replica.commit(a, a.0, vec![], vec![event("k", 1)], vec![key.clone()], NodeId(0));
+
+        let (_, deps) = replica.preaccept(b, vec![key.clone()], vec![event("k", 2)]);
+        assert_eq!(deps, vec![a], "Commit must index the keys it carries");
+    }
+
+    /// Two concurrent apply drivers must not hand out the same transaction —
+    /// `next_apply` reserves it until `mark_applied`.
+    #[test]
+    fn next_apply_reserves_the_transaction() {
+        let mut replica = Replica::new();
+        let key = Key("k".into());
+        let a = txn(10);
+        replica.preaccept(a, vec![key.clone()], vec![event("k", 1)]);
+        replica.commit(a, a.0, vec![], vec![event("k", 1)], vec![], NodeId(0));
+        replica.record_decision(a, true);
+
+        assert_eq!(replica.next_apply().expect("ready").txn, a);
+        assert!(
+            replica.next_apply().is_none(),
+            "a second driver must not receive the same in-flight apply"
+        );
+        replica.mark_applied(a, false);
     }
 
     /// The watermark only ever moves forward; a lower or equal `compact` is a

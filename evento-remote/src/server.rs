@@ -31,6 +31,11 @@ use crate::wire::{
 /// replies.
 const OUT_CAPACITY: usize = 1024;
 
+/// Maximum concurrently-executing request handlers per connection. Without a
+/// cap a client pipelining arbitrarily many large frames could spawn unbounded
+/// tasks; at the cap the read loop stops pulling frames (TCP backpressure).
+const MAX_INFLIGHT_PER_CONNECTION: usize = 256;
+
 fn codec() -> LengthDelimitedCodec {
     LengthDelimitedCodec::builder()
         .max_frame_length(MAX_FRAME_LENGTH)
@@ -124,6 +129,9 @@ async fn connection<E: Executor + Clone>(
     let framed = Framed::new(stream, codec());
     let (mut sink, mut inbound) = framed.split();
     let (out_tx, mut out_rx) = mpsc::channel::<ServerFrame>(OUT_CAPACITY);
+    let inflight = std::sync::Arc::new(tokio::sync::Semaphore::new(
+        MAX_INFLIGHT_PER_CONNECTION,
+    ));
 
     let writer = tokio::spawn(async move {
         while let Some(frame) = out_rx.recv().await {
@@ -148,9 +156,11 @@ async fn connection<E: Executor + Clone>(
                             break;
                         }
                         let generation = *notify_rx.borrow_and_update();
+                        let stable_timestamp =
+                            executor.stable_timestamp().await.ok().flatten();
                         let frame = ServerFrame::Notify {
                             generation,
-                            stable_timestamp: executor.stable_timestamp(),
+                            stable_timestamp,
                         };
                         if out_tx.send(frame).await.is_err() {
                             break;
@@ -187,7 +197,7 @@ async fn connection<E: Executor + Clone>(
             let frame = ServerFrame::Response {
                 id,
                 response,
-                stable_timestamp: executor.stable_timestamp(),
+                stable_timestamp: executor.stable_timestamp().await.ok().flatten(),
             };
             if out_tx.send(frame).await.is_err() {
                 break;
@@ -195,11 +205,17 @@ async fn connection<E: Executor + Clone>(
             continue;
         }
 
+        // Bound concurrent handlers: at the cap, stop pulling frames until one
+        // finishes (backpressure), instead of spawning without limit.
+        let Ok(permit) = std::sync::Arc::clone(&inflight).acquire_owned().await else {
+            break;
+        };
         let executor = executor.clone();
         let out_tx = out_tx.clone();
         let notify_tx = notify_tx.clone();
         tokio::spawn(async move {
-            let is_write = matches!(request, Request::Write { .. });
+            let _permit = permit;
+            let is_write = matches!(request, Request::Write { .. } | Request::Replicate { .. });
             let response = handle(&executor, request).await;
             if bump_on_write && is_write && matches!(response, Response::Write(Ok(()))) {
                 notify_tx.send_modify(|g| *g += 1);
@@ -207,7 +223,7 @@ async fn connection<E: Executor + Clone>(
             let frame = ServerFrame::Response {
                 id,
                 response,
-                stable_timestamp: executor.stable_timestamp(),
+                stable_timestamp: executor.stable_timestamp().await.ok().flatten(),
             };
             let _ = out_tx.send(frame).await;
         });
@@ -228,6 +244,12 @@ async fn handle<E: Executor>(executor: &E, request: Request) -> Response {
         Request::Write { events } => Response::Write(
             executor
                 .write(events)
+                .await
+                .map_err(|e| WireWriteError::from(&e)),
+        ),
+        Request::Replicate { events } => Response::Write(
+            executor
+                .replicate(events)
                 .await
                 .map_err(|e| WireWriteError::from(&e)),
         ),
@@ -256,9 +278,14 @@ async fn handle<E: Executor>(executor: &E, request: Request) -> Response {
         Request::UpsertSubscriber { key, worker_id } => {
             Response::Unit(err_string(executor.upsert_subscriber(key, worker_id).await))
         }
-        Request::Acknowledge { key, cursor, lag } => {
-            Response::Unit(err_string(executor.acknowledge(key, cursor, lag).await))
-        }
+        Request::Acknowledge {
+            key,
+            worker_id,
+            cursor,
+            lag,
+        } => Response::Acknowledge(err_string(
+            executor.acknowledge(key, worker_id, cursor, lag).await,
+        )),
         Request::GetSnapshot {
             aggregate_type,
             aggregate_revision,

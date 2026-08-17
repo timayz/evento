@@ -4,8 +4,6 @@
 //! production implementation (real transport, static-config membership,
 //! Fjall/SQL-backed storage).
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
@@ -79,7 +77,8 @@ pub trait Topology: Send + Sync + 'static {
     /// replica set (`e = N`).
     fn fast_quorum(&self, key: &Key) -> usize;
 
-    /// Slow-path / recovery quorum size for `key`'s replica set: `f + 1`.
+    /// Slow-path / recovery quorum size for `key`'s replica set: a strict
+    /// majority, `⌊N/2⌋ + 1` (equal to `f + 1` for odd `N = 2f + 1`).
     fn slow_quorum(&self, key: &Key) -> usize;
 
     /// The shard that owns `key`. Single-shard topologies return `0`.
@@ -271,6 +270,32 @@ pub(crate) fn fast_quorum_size(electorate: usize, faults: usize) -> usize {
     (electorate + faults) / 2 + 1
 }
 
+/// Slow-path / recovery quorum size: a strict **majority** of the replica set.
+///
+/// This must be `⌊n/2⌋ + 1`, not `f + 1` with `f = (n-1)/2`: the two only agree
+/// for odd `n`. For even `n` (e.g. a 4-node shard) `f + 1 = n/2`, and two
+/// disjoint "quorums" of that size exist — recovery could then miss a value a
+/// quorum already accepted, and two coordinators could decide differently.
+pub(crate) fn slow_quorum_size(n: usize) -> usize {
+    n / 2 + 1
+}
+
+/// A stable 64-bit FNV-1a hash for key→shard placement.
+///
+/// `DefaultHasher` is explicitly not guaranteed stable across Rust releases, so
+/// two nodes built with different toolchains could derive different key→shard
+/// maps — a silent split brain. FNV-1a is fixed forever.
+pub(crate) fn stable_hash(bytes: &[u8]) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET;
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
 /// Asserts a configured fast-path electorate is well-formed for a replica set:
 /// a subset of `replicas`, with `f + 1 ≤ |electorate| ≤ N` (the bound that keeps
 /// recovery sound). Panics on violation — a configuration error.
@@ -361,7 +386,7 @@ impl Topology for StaticTopology {
     }
 
     fn slow_quorum(&self, _key: &Key) -> usize {
-        self.faults() + 1
+        slow_quorum_size(self.nodes.len())
     }
 }
 
@@ -460,14 +485,12 @@ impl Topology for ShardedTopology {
     }
 
     fn slow_quorum(&self, key: &Key) -> usize {
-        Self::faults(self.shards[self.shard_of(key)].len()) + 1
+        slow_quorum_size(self.shards[self.shard_of(key)].len())
     }
 
     fn shard_of(&self, key: &Key) -> ShardId {
-        // Deterministic across nodes: DefaultHasher uses fixed seeds.
-        let mut hasher = DefaultHasher::new();
-        key.0.hash(&mut hasher);
-        (hasher.finish() as usize) % self.shards.len()
+        // Stable across nodes AND toolchains (unlike DefaultHasher).
+        (stable_hash(key.0.as_bytes()) as usize) % self.shards.len()
     }
 
     fn node_shard(&self, node: NodeId) -> Option<ShardId> {
@@ -522,9 +545,8 @@ impl DynamicTopology {
     }
 
     fn shard_index(shards: &[Vec<NodeId>], key: &Key) -> ShardId {
-        let mut hasher = DefaultHasher::new();
-        key.0.hash(&mut hasher);
-        (hasher.finish() as usize) % shards.len()
+        // Stable across nodes AND toolchains (unlike DefaultHasher).
+        (stable_hash(key.0.as_bytes()) as usize) % shards.len()
     }
 
     /// Derives shard `idx`'s fast-path electorate from the layout + region tags:
@@ -619,7 +641,7 @@ impl Topology for DynamicTopology {
     fn slow_quorum(&self, key: &Key) -> usize {
         let state = self.state.lock().expect("topology poisoned");
         let n = state.shards[Self::shard_index(&state.shards, key)].len();
-        n.saturating_sub(1) / 2 + 1
+        slow_quorum_size(n)
     }
 
     fn shard_of(&self, key: &Key) -> ShardId {
@@ -662,6 +684,32 @@ mod tests {
     fn topo(n: u64) -> StaticTopology {
         let nodes: Vec<NodeId> = (0..n).map(NodeId).collect();
         StaticTopology::new(NodeId(0), nodes)
+    }
+
+    /// Even replica-set sizes must still use a strict majority: `f + 1` with
+    /// `f = (N-1)/2` would allow two disjoint "quorums" for N=4 (2+2) and a
+    /// single-node quorum for N=2 — non-intersecting, hence unsafe.
+    #[test]
+    fn slow_quorum_is_a_strict_majority_for_even_n() {
+        let k = Key("x".into());
+        assert_eq!(topo(2).slow_quorum(&k), 2, "N=2 needs both nodes");
+        assert_eq!(topo(4).slow_quorum(&k), 3, "N=4 needs 3, not 2");
+        assert_eq!(topo(6).slow_quorum(&k), 4, "N=6 needs 4, not 3");
+
+        let shards = vec![vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3)]];
+        let sharded = ShardedTopology::new(NodeId(0), shards.clone());
+        assert_eq!(sharded.slow_quorum(&k), 3);
+        let dynamic = DynamicTopology::new(NodeId(0), 0, shards);
+        assert_eq!(dynamic.slow_quorum(&k), 3);
+    }
+
+    /// The key→shard hash must not depend on `DefaultHasher`'s unstable
+    /// algorithm; FNV-1a is fixed forever. Golden values pin the placement so
+    /// an accidental hash change fails loudly instead of splitting the cluster.
+    #[test]
+    fn shard_hash_is_stable() {
+        assert_eq!(stable_hash(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(stable_hash(b"a"), 0xaf63_dc4c_8601_ec8c);
     }
 
     #[test]

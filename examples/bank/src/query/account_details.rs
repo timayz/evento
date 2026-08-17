@@ -59,6 +59,7 @@ pub struct AccountDetailsView {
     pub daily_withdrawal_limit: i64,
     pub overdraft_limit: i64,
     pub cursor: cursor::Value,
+    pub aggregate_version: u16,
 }
 
 impl evento::ProjectionCursor for AccountDetailsView {
@@ -68,6 +69,14 @@ impl evento::ProjectionCursor for AccountDetailsView {
 
     fn get_cursor(&self) -> cursor::Value {
         self.cursor.clone()
+    }
+
+    fn get_aggregate_version(&self) -> u16 {
+        self.aggregate_version
+    }
+
+    fn set_aggregate_version(&mut self, v: u16) {
+        self.aggregate_version = v;
     }
 }
 

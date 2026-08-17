@@ -121,6 +121,11 @@ pub enum Request {
         #[serde(with = "wire_events")]
         events: Vec<Event>,
     },
+    /// Persist pre-stamped events verbatim (see `Executor::replicate`).
+    Replicate {
+        #[serde(with = "wire_events")]
+        events: Vec<Event>,
+    },
     Read {
         aggregators: Option<Vec<EventFilter>>,
         routing_key: Option<RoutingKey>,
@@ -143,6 +148,7 @@ pub enum Request {
     },
     Acknowledge {
         key: String,
+        worker_id: Ulid,
         cursor: Value,
         lag: u64,
     },
@@ -177,7 +183,9 @@ pub enum Response {
     LatestTimestamp(Result<u64, String>),
     SubscriberCursor(Result<Option<Value>, String>),
     SubscriberRunning(Result<bool, String>),
-    /// upsert_subscriber, acknowledge, save_snapshot, delete_snapshot.
+    /// Whether the fenced cursor update was applied (false: lost ownership).
+    Acknowledge(Result<bool, String>),
+    /// upsert_subscriber, save_snapshot, delete_snapshot.
     Unit(Result<(), String>),
     Snapshot(Result<Option<(Vec<u8>, Value)>, String>),
 }

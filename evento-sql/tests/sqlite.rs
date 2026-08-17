@@ -65,7 +65,12 @@ async fn sqlite_subscribe() -> anyhow::Result<()> {
 async fn sqlite_subscribe_low_latency() -> anyhow::Result<()> {
     let pool = create_sqlite_pool("subscribe_low_latency").await?;
 
-    evento_test::subscribe_low_latency::<Sql<sqlx::Sqlite>>(&pool.into()).await
+    // Subscription latency ≈ stable_margin + a short re-check tick (the
+    // watermark gate defers events younger than the margin). The default 1s
+    // margin is sized for multi-process deployments; this single-writer test
+    // DB shrinks it so the sub-500ms latency assertion measures the wake path.
+    let executor = Sql::<sqlx::Sqlite>::from(pool).stable_margin(std::time::Duration::from_millis(50));
+    evento_test::subscribe_low_latency::<Sql<sqlx::Sqlite>>(&executor).await
 }
 
 #[tokio::test]
@@ -348,6 +353,12 @@ async fn sqlite_read_order_timestamp() -> anyhow::Result<()> {
 async fn sqlite_exact_filter() -> anyhow::Result<()> {
     let executor = create_sqlite_executor("exact_filter").await?;
     evento_test::exact_filter(&executor).await
+}
+
+#[tokio::test]
+async fn sqlite_write_restamps_client_clock() -> anyhow::Result<()> {
+    let executor = create_sqlite_executor("write_restamps_client_clock").await?;
+    evento_test::write_restamps_client_clock(&executor).await
 }
 
 #[tokio::test]

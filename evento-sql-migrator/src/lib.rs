@@ -47,9 +47,10 @@
 //!
 //! - [`InitMigration`] - Creates the initial database schema (event, snapshot, subscriber tables)
 //! - [`M0002`] - Adds `timestamp_subsec` column for sub-second precision timestamps
-//! - [`M0003`] - Drops the snapshot table and extends the event name column length
+//! - [`M0003`] - Widens the event `name` column (no-op on databases created at the current schema)
 //! - [`M0004`] - Replaces `idx_event_type` with a composite cursor-scan index
 //! - [`M0005`] - Adds a leading-cursor index for no-routing-key subscription scans
+//! - [`M0006`] - Repairs schema drift from early alphas (recreates `snapshot`, widens columns)
 //!
 //! # Database Schema
 //!
@@ -64,7 +65,7 @@
 //! | `id` | VARCHAR(26) | Event ID (ULID format) |
 //! | `name` | VARCHAR(50) | Event type name |
 //! | `aggregator_type` | VARCHAR(50) | Aggregate root type |
-//! | `aggregator_id` | VARCHAR(26) | Aggregate root instance ID |
+//! | `aggregator_id` | VARCHAR(64) | Aggregate root instance ID |
 //! | `version` | INTEGER | Event sequence number |
 //! | `data` | BLOB | Serialized event data |
 //! | `metadata` | BLOB | Serialized event metadata |
@@ -78,10 +79,10 @@
 //!
 //! | Column | Type | Description |
 //! |--------|------|-------------|
-//! | `key` | VARCHAR(50) | Subscriber identifier (primary key) |
+//! | `key` | VARCHAR(255) | Subscriber identifier (primary key) |
 //! | `worker_id` | VARCHAR(26) | Associated worker ID |
 //! | `cursor` | TEXT | Current event stream position |
-//! | `lag` | INTEGER | Subscription lag counter |
+//! | `lag` | INTEGER | Seconds behind the newest matching event |
 //! | `enabled` | BOOLEAN | Whether subscription is active |
 //! | `created_at` | TIMESTAMP | Creation timestamp |
 //! | `updated_at` | TIMESTAMP | Last update timestamp |
@@ -95,6 +96,7 @@ mod m0002;
 mod m0003;
 mod m0004;
 mod m0005;
+mod m0006;
 
 #[cfg(feature = "accord")]
 pub use accord::AccordMigration;
@@ -103,6 +105,7 @@ pub use m0002::M0002;
 pub use m0003::M0003;
 pub use m0004::M0004;
 pub use m0005::M0005;
+pub use m0006::M0006;
 
 /// Creates a new [`Migrator`] instance with all Evento migrations registered.
 ///
@@ -141,6 +144,7 @@ where
     M0003: sqlx_migrator::Migration<DB>,
     M0004: sqlx_migrator::Migration<DB>,
     M0005: sqlx_migrator::Migration<DB>,
+    M0006: sqlx_migrator::Migration<DB>,
 {
     let mut migrator = Migrator::default();
     migrator.add_migration(Box::new(InitMigration))?;
@@ -148,6 +152,7 @@ where
     migrator.add_migration(Box::new(M0003))?;
     migrator.add_migration(Box::new(M0004))?;
     migrator.add_migration(Box::new(M0005))?;
+    migrator.add_migration(Box::new(M0006))?;
     Ok(migrator)
 }
 
@@ -159,6 +164,7 @@ where
     M0003: sqlx_migrator::Migration<DB>,
     M0004: sqlx_migrator::Migration<DB>,
     M0005: sqlx_migrator::Migration<DB>,
+    M0006: sqlx_migrator::Migration<DB>,
     AccordMigration: sqlx_migrator::Migration<DB>,
 {
     let mut migrator = Migrator::default();
@@ -167,6 +173,7 @@ where
     migrator.add_migration(Box::new(M0003))?;
     migrator.add_migration(Box::new(M0004))?;
     migrator.add_migration(Box::new(M0005))?;
+    migrator.add_migration(Box::new(M0006))?;
     // The optional evento-accord consensus-journal tables.
     migrator.add_migration(Box::new(AccordMigration))?;
     Ok(migrator)

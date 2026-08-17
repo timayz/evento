@@ -36,7 +36,7 @@ use sqlx_migrator::vec_box;
 ///
 /// ## Snapshot Table
 ///
-/// Table for storing aggregate snapshots (note: dropped in [`M0003`](crate::M0003)):
+/// Table for storing aggregate snapshots:
 /// - `id` - Snapshot identifier
 /// - `type` - Snapshot type
 /// - `cursor` - Event stream cursor

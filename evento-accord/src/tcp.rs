@@ -127,6 +127,23 @@ fn decode(bytes: &[u8]) -> anyhow::Result<Frame> {
 /// instead of growing without limit.
 pub const CHANNEL_CAPACITY: usize = 1024;
 
+/// Maximum frame size, matching `evento-remote`. The codec default (8 MB) is
+/// too small for a bootstrap `SyncData`, which carries the contact's whole
+/// materialised event log — an oversized encode would fail forever and the
+/// joining node could never bootstrap.
+pub const MAX_FRAME_LENGTH: usize = 64 * 1024 * 1024;
+
+/// A length-delimited codec with the raised frame cap, for both directions.
+fn codec() -> LengthDelimitedCodec {
+    LengthDelimitedCodec::builder()
+        .max_frame_length(MAX_FRAME_LENGTH)
+        .new_codec()
+}
+
+/// Bound on a TLS handshake, so a hung or malicious dialer cannot pin an accept
+/// task forever.
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// A framed-TCP [`MessageSink`] over a static membership map, optionally over TLS.
 pub struct TcpTransport {
     from: NodeId,
@@ -202,14 +219,21 @@ impl MessageSink for TcpTransport {
     async fn send(&self, to: NodeId, message: Message) -> anyhow::Result<()> {
         if let Some(tx) = self.writer_for(to) {
             // `try_send` never blocks the caller: a full queue (slow/unreachable
-            // peer) sheds the frame, which the protocol tolerates. Count a full-queue
-            // shed for backpressure observability (a closed queue is a dropped
-            // connection, reconnected lazily — not counted).
-            if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(Frame {
+            // peer) sheds the frame, which the protocol tolerates and the shed
+            // counter records. A closed queue means the writer task died —
+            // remove its entry so the next send respawns it, instead of
+            // black-holing this peer forever.
+            match tx.try_send(Frame {
                 from: self.from,
                 message,
             }) {
-                self.metrics.record_shed();
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    self.metrics.record_shed();
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    self.senders.lock().expect("senders poisoned").remove(&to);
+                }
             }
         }
         Ok(())
@@ -256,7 +280,7 @@ async fn peer_writer(
     while let Some(frame) = rx.recv().await {
         if conn.is_none() {
             match connect(to, addr, &tls).await {
-                Some(stream) => conn = Some(Framed::new(stream, LengthDelimitedCodec::new())),
+                Some(stream) => conn = Some(Framed::new(stream, codec())),
                 None => continue,
             }
         }
@@ -276,9 +300,20 @@ async fn peer_writer(
 /// each as an [`Envelope`] to `inbox`. Returns the accept-loop task handle.
 pub fn serve(listener: TcpListener, inbox: mpsc::Sender<Envelope>) -> JoinHandle<()> {
     tokio::spawn(async move {
-        while let Ok((stream, _)) = listener.accept().await {
-            let _ = stream.set_nodelay(true);
-            tokio::spawn(read_connection(Either::Left(stream), inbox.clone(), None));
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    let _ = stream.set_nodelay(true);
+                    tokio::spawn(read_connection(Either::Left(stream), inbox.clone(), None));
+                }
+                // Transient errors (EMFILE, ECONNABORTED, …) must not end the
+                // accept loop — a node that stops accepting looks alive to
+                // peers (it still sends) but silently receives nothing.
+                Err(err) => {
+                    tracing::warn!(error = %err, "accept failed; retrying");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
         }
     })
 }
@@ -294,15 +329,28 @@ pub fn serve_tls(
     acceptor: TlsAcceptor,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        while let Ok((stream, _)) = listener.accept().await {
-            let _ = stream.set_nodelay(true);
-            let acceptor = acceptor.clone();
-            let inbox = inbox.clone();
-            tokio::spawn(async move {
-                if let Ok(session) = acceptor.accept(stream).await {
-                    read_connection(Either::Right(session), inbox, None).await;
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    let _ = stream.set_nodelay(true);
+                    let acceptor = acceptor.clone();
+                    let inbox = inbox.clone();
+                    tokio::spawn(async move {
+                        // Bounded handshake: a hung dialer must not pin this
+                        // task forever.
+                        let Ok(Ok(session)) =
+                            tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await
+                        else {
+                            return;
+                        };
+                        read_connection(Either::Right(session), inbox, None).await;
+                    });
                 }
-            });
+                Err(err) => {
+                    tracing::warn!(error = %err, "accept failed; retrying");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
         }
     })
 }
@@ -320,23 +368,34 @@ pub fn serve_tls_verified(
 ) -> JoinHandle<()> {
     let peers = Arc::new(peers);
     tokio::spawn(async move {
-        while let Ok((stream, _)) = listener.accept().await {
-            let _ = stream.set_nodelay(true);
-            let acceptor = acceptor.clone();
-            let inbox = inbox.clone();
-            let peers = Arc::clone(&peers);
-            tokio::spawn(async move {
-                let Ok(session) = acceptor.accept(stream).await else {
-                    return;
-                };
-                // Authenticate the peer by its pinned leaf certificate; an unknown
-                // certificate (CA-valid but un-pinned) is refused.
-                let Some(id) = authenticated_node(session.get_ref().1.peer_certificates(), &peers)
-                else {
-                    return;
-                };
-                read_connection(Either::Right(session), inbox, Some(id)).await;
-            });
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    let _ = stream.set_nodelay(true);
+                    let acceptor = acceptor.clone();
+                    let inbox = inbox.clone();
+                    let peers = Arc::clone(&peers);
+                    tokio::spawn(async move {
+                        let Ok(Ok(session)) =
+                            tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await
+                        else {
+                            return;
+                        };
+                        // Authenticate the peer by its pinned leaf certificate; an unknown
+                        // certificate (CA-valid but un-pinned) is refused.
+                        let Some(id) =
+                            authenticated_node(session.get_ref().1.peer_certificates(), &peers)
+                        else {
+                            return;
+                        };
+                        read_connection(Either::Right(session), inbox, Some(id)).await;
+                    });
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "accept failed; retrying");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
         }
     })
 }
@@ -350,7 +409,7 @@ async fn read_connection(
     inbox: mpsc::Sender<Envelope>,
     identity: Option<NodeId>,
 ) {
-    let mut framed = Framed::new(stream, LengthDelimitedCodec::new());
+    let mut framed = Framed::new(stream, codec());
     while let Some(item) = framed.next().await {
         let bytes = match item {
             Ok(bytes) => bytes,

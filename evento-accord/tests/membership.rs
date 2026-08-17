@@ -304,12 +304,16 @@ async fn a_joined_node_enforces_optimistic_concurrency() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_join_replays_a_write_committed_during_bootstrap() {
     let net = InMemoryNetwork::new();
-    let abc = vec![NodeId(0), NodeId(1), NodeId(2)];
-    let abcd = vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3)];
+    // Four founding nodes so that after D joins (five nodes, majority 3) a
+    // write still reaches a sound quorum with A partitioned and D buffering.
+    // (The old three-node version relied on the unsound even-N "quorum" of 2
+    // out of 4 that the majority fix removed.)
+    let abce = vec![NodeId(0), NodeId(1), NodeId(2), NodeId(4)];
+    let abcde = vec![NodeId(0), NodeId(1), NodeId(2), NodeId(4), NodeId(3)];
 
-    let nodes: Vec<TestNode> = abc
+    let nodes: Vec<TestNode> = abce
         .iter()
-        .map(|&id| spawn_node(id, 0, vec![abc.clone()], &net))
+        .map(|&id| spawn_node(id, 0, vec![abce.clone()], &net))
         .collect();
     nodes[0]
         .node
@@ -321,18 +325,19 @@ async fn a_join_replays_a_write_committed_during_bootstrap() {
     }
 
     // D begins joining (buffering) and the epoch that includes it is installed.
-    let d = spawn_node(NodeId(3), 0, vec![abc.clone()], &net);
+    let d = spawn_node(NodeId(3), 0, vec![abce.clone()], &net);
     d.node.begin_join();
     for n in &nodes {
-        n.topology.install(1, vec![abcd.clone()]);
+        n.topology.install(1, vec![abcde.clone()]);
     }
-    d.topology.install(1, vec![abcd.clone()]);
+    d.topology.install(1, vec![abcde.clone()]);
 
-    // Partition node A — D's future bootstrap source — from B and C, so A will
-    // miss the next write. Y then commits on the {B, C} quorum while D buffers
-    // its messages; A stays at version 1.
+    // Partition node A — D's future bootstrap source — from every peer, so A
+    // will miss the next write. Y then commits on the {B, C, E} majority while
+    // D buffers its messages; A stays at version 1.
     net.partition(NodeId(0), NodeId(1));
     net.partition(NodeId(0), NodeId(2));
+    net.partition(NodeId(0), NodeId(4));
     nodes[1]
         .node
         .write(vec![event("acc", 2, "Deposited")])

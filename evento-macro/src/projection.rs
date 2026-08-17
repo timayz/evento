@@ -105,6 +105,7 @@ pub fn projection_cursor_impl(attr: TokenStream, input: &DeriveInput) -> Result<
         #vis struct #struct_name #generics {
             #(#existing_fields,)*
             pub cursor: String,
+            pub aggregate_version: u16,
         }
 
         impl #impl_generics ::evento::ProjectionCursor for #struct_name #ty_generics #where_clause {
@@ -114,6 +115,14 @@ pub fn projection_cursor_impl(attr: TokenStream, input: &DeriveInput) -> Result<
 
             fn get_cursor(&self) -> ::evento::cursor::Value {
                 self.cursor.to_owned().into()
+            }
+
+            fn set_aggregate_version(&mut self, v: u16) {
+                self.aggregate_version = v;
+            }
+
+            fn get_aggregate_version(&self) -> u16 {
+                self.aggregate_version
             }
         }
     }

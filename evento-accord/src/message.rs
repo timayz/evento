@@ -110,15 +110,25 @@ pub enum Message {
         deps: Vec<TxnId>,
     },
     /// Coordinator → replicas (slow path / recovery): adopt the execution
-    /// timestamp and dependency set under `ballot`.
+    /// timestamp and dependency set under `ballot`. Carries the keys so a
+    /// replica that missed PreAccept still indexes the transaction in its
+    /// conflict graph (otherwise later conflicting transactions would miss it
+    /// as a dependency, and recovery's superseding check would be wrong).
     Accept {
         txn: TxnId,
         ballot: Ballot,
         execute_at: Timestamp,
         deps: Vec<TxnId>,
+        keys: Vec<Key>,
     },
-    /// Replica → coordinator: accepted, echoing any additional dependencies.
-    AcceptOk { txn: TxnId, deps: Vec<TxnId> },
+    /// Replica → coordinator: accepted under `ballot`, echoing any additional
+    /// dependencies. The ballot lets the coordinator drop stale responses from
+    /// an earlier attempt.
+    AcceptOk {
+        txn: TxnId,
+        ballot: Ballot,
+        deps: Vec<TxnId>,
+    },
     /// Coordinator → replicas: the execution timestamp and dependencies are
     /// final; execute when dependencies allow. Carries events for replicas that
     /// missed PreAccept, and `reply_to` so the execution result reaches whoever
@@ -147,6 +157,9 @@ pub enum Message {
     /// transaction did not witness `txn`, so it cannot have taken the fast path).
     RecoverOk {
         txn: TxnId,
+        /// The ballot this report answers, so the recovery coordinator can drop
+        /// stale responses from an earlier attempt.
+        ballot: Ballot,
         /// False when this replica never witnessed the transaction.
         known: bool,
         status: Status,
@@ -167,14 +180,17 @@ pub enum Message {
     /// bootstrap. `snapshot` requests the materialized data-store snapshot too
     /// (set by a bootstrapping join, whose state may be below the contact's
     /// truncation watermark); anti-entropy clears it (it only needs recent
-    /// commands).
-    SyncRequest { snapshot: bool },
+    /// commands). `id` correlates the reply with the in-flight request, so a
+    /// concurrent join and anti-entropy round cannot steal each other's data.
+    SyncRequest { id: u64, snapshot: bool },
     /// Periodic gossip between shard replicas: the sender has applied every
     /// transaction below `applied_through`. The cluster compacts (drops redundant
     /// consensus state and truncates the log) below the per-shard minimum of these.
     Watermark { applied_through: Timestamp },
     /// Existing replica → joining node: the committed state to import.
     SyncData {
+        /// Correlates with the [`SyncRequest`](Message::SyncRequest) `id`.
+        id: u64,
         /// The contact's redundancy watermark; the joiner adopts it as its floor,
         /// so a dependency on a compacted-away transaction counts as satisfied.
         watermark: Timestamp,
@@ -189,9 +205,11 @@ pub enum Message {
     /// Config coordinator → acceptors: Paxos phase 1 for `epoch`'s layout.
     ConfigPrepare { epoch: u64, ballot: Ballot },
     /// Acceptor → coordinator: promised `ballot`, reporting any value it has
-    /// already accepted (which the coordinator must adopt).
+    /// already accepted (which the coordinator must adopt). `ballot` names the
+    /// prepare this promise answers, so a coordinator can drop stale replies.
     ConfigPromise {
         epoch: u64,
+        ballot: Ballot,
         accepted_ballot: Ballot,
         accepted_layout: Option<Vec<Vec<NodeId>>>,
     },
@@ -201,8 +219,9 @@ pub enum Message {
         ballot: Ballot,
         layout: Vec<Vec<NodeId>>,
     },
-    /// Acceptor → coordinator: accepted under the proposing ballot.
-    ConfigAccepted { epoch: u64 },
+    /// Acceptor → coordinator: accepted under `ballot` (named so a coordinator
+    /// can drop stale replies from an earlier attempt or another proposer).
+    ConfigAccepted { epoch: u64, ballot: Ballot },
     /// Config coordinator → all nodes: the layout is decided; install it.
     ConfigCommit {
         epoch: u64,

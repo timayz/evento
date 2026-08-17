@@ -2020,8 +2020,10 @@ pub async fn read_order_timestamp<E: Executor + Clone>(executor: &E) -> anyhow::
     let e3 = mk(101, 900);
     let e4 = mk(102, 0);
     let expected = vec![e1.id, e2.id, e3.id, e4.id];
+    // `replicate` persists the hand-crafted timestamps verbatim; `write` would
+    // re-stamp them with the store's commit clock.
     executor
-        .write(vec![e1.clone(), e2.clone(), e3.clone(), e4.clone()])
+        .replicate(vec![e1.clone(), e2.clone(), e3.clone(), e4.clone()])
         .await?;
 
     let ids = |r: &ReadResult<Event>| r.edges.iter().map(|e| e.node.id).collect::<Vec<_>>();
@@ -2048,6 +2050,56 @@ pub async fn read_order_timestamp<E: Executor + Clone>(executor: &E) -> anyhow::
         vec![expected[2], expected[3]],
         "backward(last=2) must return the last two events in ascending order"
     );
+
+    Ok(())
+}
+
+/// `write` must replace client-supplied timestamps with the store's commit
+/// clock (so cursor order tracks commit order), while `replicate` persists
+/// them verbatim (for replication layers that own ordering).
+pub async fn write_restamps_client_clock<E: Executor + Clone>(
+    executor: &E,
+) -> anyhow::Result<()> {
+    let agg_type = "evento/RestampTest";
+    let mk = |id: &str| Event {
+        id: Ulid::generate(),
+        aggregate_id: id.to_owned(),
+        aggregate_type: agg_type.to_owned(),
+        version: 1,
+        name: "Stamped".to_owned(),
+        routing_key: None,
+        data: vec![],
+        metadata: Default::default(),
+        // A stale client stamp, long in the past.
+        timestamp: 42,
+        timestamp_subsec: 7,
+    };
+
+    executor.write(vec![mk("restamped")]).await?;
+    executor.replicate(vec![mk("verbatim")]).await?;
+
+    let restamped = executor
+        .read(
+            Some(vec![EventFilter::by_id(agg_type, "restamped")]),
+            None,
+            Args::forward(1, None),
+        )
+        .await?;
+    assert!(
+        restamped.edges[0].node.timestamp > 42,
+        "write must replace the stale client stamp with the store's commit clock, got {}",
+        restamped.edges[0].node.timestamp
+    );
+
+    let verbatim = executor
+        .read(
+            Some(vec![EventFilter::by_id(agg_type, "verbatim")]),
+            None,
+            Args::forward(1, None),
+        )
+        .await?;
+    assert_eq!(verbatim.edges[0].node.timestamp, 42);
+    assert_eq!(verbatim.edges[0].node.timestamp_subsec, 7);
 
     Ok(())
 }
