@@ -164,41 +164,45 @@ impl From<&Metadata> for Metadata {
 ///     Ok(())
 /// }
 /// ```
-pub struct Event<D> {
-    event: crate::Event,
+pub struct Event<'a, D> {
+    /// The raw event, borrowed for the duration of the handler call — a typed
+    /// dispatch decodes `data` without deep-copying the event's strings and
+    /// blobs. To keep an event past the handler, clone the raw event through
+    /// `Deref`: `let owned: evento::Event = (*event).clone();`.
+    event: &'a crate::Event,
     /// The typed event data
     pub data: D,
 }
 
-impl<D> Deref for Event<D> {
+impl<D> Deref for Event<'_, D> {
     type Target = crate::Event;
 
     fn deref(&self) -> &Self::Target {
-        &self.event
+        self.event
     }
 }
 
-impl<D> TryFrom<&crate::Event> for Event<D>
+impl<'a, D> TryFrom<&'a crate::Event> for Event<'a, D>
 where
     D: bitcode::DecodeOwned,
 {
     type Error = bitcode::Error;
 
-    fn try_from(value: &crate::Event) -> Result<Self, Self::Error> {
+    fn try_from(value: &'a crate::Event) -> Result<Self, Self::Error> {
         let data = bitcode::decode::<D>(&value.data)?;
-        Ok(Event {
-            data,
-            event: value.clone(),
-        })
+        Ok(Event { data, event: value })
     }
 }
 
-pub struct RawEvent<D>(pub crate::Event, pub PhantomData<D>);
+/// The untyped counterpart of [`Event`] handed to `#[subscription_all]`
+/// handlers: the raw event borrowed for the handler call, tagged with the
+/// aggregate's event enum. Clone through `Deref` to keep it past the call.
+pub struct RawEvent<'a, D>(pub &'a crate::Event, pub PhantomData<D>);
 
-impl<D> Deref for RawEvent<D> {
+impl<D> Deref for RawEvent<'_, D> {
     type Target = crate::Event;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        self.0
     }
 }

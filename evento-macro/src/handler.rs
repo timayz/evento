@@ -4,6 +4,13 @@ use quote::{format_ident, quote};
 use syn::{Error, FnArg, GenericArgument, ItemFn, PatType, PathArguments, Type, TypePath};
 
 pub fn handler_next_impl(input: &ItemFn, debug: bool) -> syn::Result<TokenStream> {
+    // `metadata::Event` borrows the raw event, so the (macro-owned) handler
+    // signature gets its lifetime injected — users keep writing `Event<T>`.
+    let mut input = input.clone();
+    if let Some(arg) = input.sig.inputs.first_mut() {
+        crate::util::inject_elided_lifetime(arg);
+    }
+    let input = &input;
     let fn_name = &input.sig.ident;
 
     // Extract parameters

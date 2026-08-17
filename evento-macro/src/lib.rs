@@ -162,6 +162,7 @@ mod handler;
 mod projection;
 mod subscription;
 mod subscription_all;
+mod util;
 
 use proc_macro::TokenStream;
 use syn::{parse_macro_input, DeriveInput, ItemFn};
