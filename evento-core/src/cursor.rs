@@ -302,23 +302,23 @@ where
         }
     }
 
-    pub fn order(&mut self, order: Order) -> &mut Self {
+    pub fn order(mut self, order: Order) -> Self {
         self.order = order;
 
         self
     }
 
-    pub fn desc(&mut self) -> &mut Self {
+    pub fn desc(self) -> Self {
         self.order(Order::Desc)
     }
 
-    pub fn args(&mut self, args: Args) -> &mut Self {
+    pub fn args(mut self, args: Args) -> Self {
         self.args = args;
 
         self
     }
 
-    pub fn backward(&mut self, last: u16, before: Option<Value>) -> &mut Self {
+    pub fn backward(self, last: u16, before: Option<Value>) -> Self {
         self.args(Args {
             last: Some(last),
             before,
@@ -326,7 +326,7 @@ where
         })
     }
 
-    pub fn forward(&mut self, first: u16, after: Option<Value>) -> &mut Self {
+    pub fn forward(self, first: u16, after: Option<Value>) -> Self {
         self.args(Args {
             first: Some(first),
             after,
@@ -334,13 +334,13 @@ where
         })
     }
 
-    pub fn execute(&self) -> Result<ReadResult<T>, ReadError> {
+    pub fn execute(self) -> Result<ReadResult<T>, ReadError> {
         let is_order_desc = matches!(
             (&self.order, self.args.is_backward()),
             (Order::Asc, true) | (Order::Desc, false)
         );
 
-        let mut data = self.data.clone().into_iter().collect::<Vec<_>>();
+        let mut data = self.data;
         T::sort_by(&mut data, is_order_desc);
         let (limit, cursor) = self.args.get_info();
 
@@ -354,7 +354,7 @@ where
         // `limit` (not the pre-take length) is required so that exactly `limit + 1`
         // matching rows still report `has_more` and return only `limit` edges,
         // matching the SQL backend's pagination.
-        data = data.into_iter().take(limit as usize + 1).collect();
+        data.truncate(limit as usize + 1);
 
         let has_more = data.len() > limit as usize;
         if has_more {
@@ -372,7 +372,7 @@ where
             .collect::<Vec<_>>();
 
         if self.args.is_backward() {
-            edges = edges.into_iter().rev().collect();
+            edges.reverse();
         }
 
         // Both boundary cursors are always populated so a caller can reverse

@@ -78,6 +78,7 @@ impl ExecCluster {
                 Some(vec![EventFilter::by_id("test/Account", id)]),
                 None,
                 Args::forward(50, None),
+                None,
             )
             .await
             .unwrap();

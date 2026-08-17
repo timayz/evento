@@ -35,6 +35,16 @@ pub trait MessageSink: Send + Sync + 'static {
     /// enqueue; delivery is best-effort and unacknowledged (the protocol
     /// tolerates loss via quorums and recovery).
     async fn send(&self, to: NodeId, message: Message) -> anyhow::Result<()>;
+
+    /// Sends `message` to every node in `nodes`. The default clones the
+    /// message per peer; transports that serialize should override it to
+    /// encode once and share the buffer across peers (see `TcpTransport`).
+    async fn broadcast(&self, nodes: &[NodeId], message: Message) -> anyhow::Result<()> {
+        for &node in nodes {
+            let _ = self.send(node, message.clone()).await;
+        }
+        Ok(())
+    }
 }
 
 /// Cluster membership and key→replica-set mapping for the current epoch.
@@ -242,13 +252,16 @@ pub trait DataStore: Send + Sync + 'static {
     ) -> anyhow::Result<()>;
 
     /// Serves a read query from the local backend, so a node can answer reads
-    /// forwarded to it for a key range it owns. The default returns nothing (a
-    /// store that holds no queryable events, e.g. the in-memory test store).
+    /// forwarded to it for a key range it owns. `to_micros` is the forwarded
+    /// exclusive stamp bound (see `evento_core::Executor::read`). The default
+    /// returns nothing (a store that holds no queryable events, e.g. the
+    /// in-memory test store).
     async fn read(
         &self,
         _aggregators: Option<Vec<EventFilter>>,
         _routing_key: Option<RoutingKey>,
         _args: Args,
+        _to_micros: Option<u64>,
     ) -> anyhow::Result<ReadResult<Event>> {
         Ok(ReadResult::default())
     }

@@ -148,8 +148,10 @@ const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 pub struct TcpTransport {
     from: NodeId,
     peers: Arc<HashMap<NodeId, SocketAddr>>,
-    /// Per-peer outbound queues (bounded); each backed by a lazily-spawned writer.
-    senders: Mutex<HashMap<NodeId, mpsc::Sender<Frame>>>,
+    /// Per-peer outbound queues (bounded); each backed by a lazily-spawned
+    /// writer. Carries pre-encoded frames (`Bytes`), so a broadcast encodes
+    /// once and every peer's queue shares the same buffer.
+    senders: Mutex<HashMap<NodeId, mpsc::Sender<Bytes>>>,
     /// Client TLS settings; `None` for plaintext.
     tls: Option<TlsClient>,
     /// Observability counters; bumps `messages_shed` when a full peer queue drops a
@@ -201,7 +203,7 @@ impl TcpTransport {
 
     /// The outbound queue for `to`, spawning its writer task on first use.
     /// `None` if `to` is not a known peer.
-    fn writer_for(&self, to: NodeId) -> Option<mpsc::Sender<Frame>> {
+    fn writer_for(&self, to: NodeId) -> Option<mpsc::Sender<Bytes>> {
         let mut senders = self.senders.lock().expect("senders poisoned");
         if let Some(tx) = senders.get(&to) {
             return Some(tx.clone());
@@ -212,21 +214,17 @@ impl TcpTransport {
         senders.insert(to, tx.clone());
         Some(tx)
     }
-}
 
-#[async_trait]
-impl MessageSink for TcpTransport {
-    async fn send(&self, to: NodeId, message: Message) -> anyhow::Result<()> {
+    /// Enqueues a pre-encoded frame for `to`.
+    ///
+    /// `try_send` never blocks the caller: a full queue (slow/unreachable
+    /// peer) sheds the frame, which the protocol tolerates and the shed
+    /// counter records. A closed queue means the writer task died — remove its
+    /// entry so the next send respawns it, instead of black-holing this peer
+    /// forever.
+    fn enqueue(&self, to: NodeId, bytes: Bytes) {
         if let Some(tx) = self.writer_for(to) {
-            // `try_send` never blocks the caller: a full queue (slow/unreachable
-            // peer) sheds the frame, which the protocol tolerates and the shed
-            // counter records. A closed queue means the writer task died —
-            // remove its entry so the next send respawns it, instead of
-            // black-holing this peer forever.
-            match tx.try_send(Frame {
-                from: self.from,
-                message,
-            }) {
+            match tx.try_send(bytes) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     self.metrics.record_shed();
@@ -235,6 +233,31 @@ impl MessageSink for TcpTransport {
                     self.senders.lock().expect("senders poisoned").remove(&to);
                 }
             }
+        }
+    }
+}
+
+#[async_trait]
+impl MessageSink for TcpTransport {
+    async fn send(&self, to: NodeId, message: Message) -> anyhow::Result<()> {
+        let bytes = encode(&Frame {
+            from: self.from,
+            message,
+        })?;
+        self.enqueue(to, Bytes::from(bytes));
+        Ok(())
+    }
+
+    async fn broadcast(&self, nodes: &[NodeId], message: Message) -> anyhow::Result<()> {
+        // One encode for the whole fan-out; `Bytes` clones share the buffer.
+        // Valid because `Frame.from` is constant for this transport, so every
+        // peer receives the identical frame.
+        let bytes = Bytes::from(encode(&Frame {
+            from: self.from,
+            message,
+        })?);
+        for &to in nodes {
+            self.enqueue(to, bytes.clone());
         }
         Ok(())
     }
@@ -273,25 +296,35 @@ async fn connect(to: NodeId, addr: SocketAddr, tls: &Option<TlsClient>) -> Optio
 async fn peer_writer(
     to: NodeId,
     addr: SocketAddr,
-    mut rx: mpsc::Receiver<Frame>,
+    mut rx: mpsc::Receiver<Bytes>,
     tls: Option<TlsClient>,
 ) {
     let mut conn: Option<Framed<ClientStream, LengthDelimitedCodec>> = None;
-    while let Some(frame) = rx.recv().await {
+    while let Some(bytes) = rx.recv().await {
         if conn.is_none() {
             match connect(to, addr, &tls).await {
                 Some(stream) => conn = Some(Framed::new(stream, codec())),
                 None => continue,
             }
         }
-        let bytes = match encode(&frame) {
-            Ok(bytes) => bytes,
-            Err(_) => continue,
+        let Some(framed) = conn.as_mut() else {
+            continue;
         };
-        if let Some(framed) = conn.as_mut() {
-            if framed.send(Bytes::from(bytes)).await.is_err() {
-                conn = None;
+        // Coalesce: feed this frame plus everything already queued, then flush
+        // once — one syscall per burst instead of one per frame.
+        if framed.feed(bytes).await.is_err() {
+            conn = None;
+            continue;
+        }
+        let mut failed = false;
+        while let Ok(bytes) = rx.try_recv() {
+            if framed.feed(bytes).await.is_err() {
+                failed = true;
+                break;
             }
+        }
+        if failed || framed.flush().await.is_err() {
+            conn = None;
         }
     }
 }

@@ -138,6 +138,7 @@ impl Cluster {
                 Some(vec![EventFilter::by_id("test/Account", aggregate_id)]),
                 None,
                 Args::forward(50, None),
+                None,
             )
             .await
             .unwrap()

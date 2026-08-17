@@ -56,6 +56,22 @@ pub struct Replica {
     /// further `next_apply` picks so two concurrent drivers cannot double-apply
     /// the same transaction.
     applying: HashSet<TxnId>,
+    /// Every un-applied command's watermark bound: `min(t0.micros, min event
+    /// stamp)` (see [`stable_event_micros`](Replica::stable_event_micros)),
+    /// keyed by txn so it can be removed when the command's status or events
+    /// change. Kept in lockstep with `commands` by
+    /// [`reindex_unapplied`](Replica::reindex_unapplied).
+    unapplied_bounds: HashMap<TxnId, u64>,
+    /// The bounds above, ordered — `stable_event_micros` reads the minimum in
+    /// O(log n) instead of scanning every command (it runs on every remote
+    /// response frame).
+    unapplied_by_bound: BTreeSet<(u64, TxnId)>,
+    /// Un-applied txns in `t0` order, serving `applied_through` and `stuck`
+    /// without a full command scan.
+    unapplied_by_t0: BTreeSet<TxnId>,
+    /// Applied (un-compacted) txns in `t0` order, serving the anti-entropy
+    /// digest and missing-command export without a full command scan.
+    applied_by_t0: BTreeSet<TxnId>,
 }
 
 impl Default for Replica {
@@ -66,6 +82,10 @@ impl Default for Replica {
             pending: BTreeSet::new(),
             redundant_before: Timestamp::MIN,
             applying: HashSet::new(),
+            unapplied_bounds: HashMap::new(),
+            unapplied_by_bound: BTreeSet::new(),
+            unapplied_by_t0: BTreeSet::new(),
+            applied_by_t0: BTreeSet::new(),
         }
     }
 }
@@ -195,7 +215,46 @@ impl Replica {
         if awaiting_execution(cmd.status) {
             self.pending.insert((cmd.execute_at, cmd.txn));
         }
-        self.commands.insert(cmd.txn, cmd);
+        let txn = cmd.txn;
+        self.commands.insert(txn, cmd);
+        self.reindex_unapplied(txn);
+    }
+
+    /// Re-derives `txn`'s entry in the un-applied indexes from its current
+    /// command state. Must be called whenever a command's applied status or
+    /// event set changes — including the late event-repair paths in
+    /// [`preaccept`](Self::preaccept) and [`commit`](Self::commit), where
+    /// events (and thus the watermark bound) attach after first insertion.
+    fn reindex_unapplied(&mut self, txn: TxnId) {
+        if let Some(old) = self.unapplied_bounds.remove(&txn) {
+            self.unapplied_by_bound.remove(&(old, txn));
+            self.unapplied_by_t0.remove(&txn);
+        }
+        let bound = match self.commands.get(&txn) {
+            Some(cmd) if cmd.status != Status::Applied => {
+                let mut bound = cmd.txn.0.micros;
+                for event in &cmd.events {
+                    let event_micros = event
+                        .timestamp
+                        .saturating_mul(1_000_000)
+                        .saturating_add(u64::from(event.timestamp_subsec) * 1_000);
+                    bound = bound.min(event_micros);
+                }
+                bound
+            }
+            Some(_) => {
+                self.applied_by_t0.insert(txn);
+                return;
+            }
+            None => {
+                self.applied_by_t0.remove(&txn);
+                return;
+            }
+        };
+        self.applied_by_t0.remove(&txn);
+        self.unapplied_bounds.insert(txn, bound);
+        self.unapplied_by_bound.insert((bound, txn));
+        self.unapplied_by_t0.insert(txn);
     }
 
     /// A **read-index probe**: the `(execute_at, deps)` a read at `txn`'s
@@ -247,19 +306,30 @@ impl Replica {
     /// a subscription advance past an event a stuck transaction will apply
     /// later, silently skipping it.
     pub fn stable_event_micros(&self, cutoff: Timestamp) -> u64 {
-        let mut bound = cutoff.micros;
-        for cmd in self.commands.values() {
-            if cmd.status == Status::Applied {
-                continue;
+        // Served from the incrementally-maintained index: O(1) instead of a
+        // scan of every command — this runs on every remote response frame,
+        // while holding the replica lock the inbox loop contends on.
+        let bound = match self.unapplied_by_bound.first() {
+            Some(&(bound, _)) => cutoff.micros.min(bound),
+            None => cutoff.micros,
+        };
+        #[cfg(debug_assertions)]
+        {
+            let mut scan = cutoff.micros;
+            for cmd in self.commands.values() {
+                if cmd.status == Status::Applied {
+                    continue;
+                }
+                scan = scan.min(cmd.txn.0.micros);
+                for event in &cmd.events {
+                    let event_micros = event
+                        .timestamp
+                        .saturating_mul(1_000_000)
+                        .saturating_add(u64::from(event.timestamp_subsec) * 1_000);
+                    scan = scan.min(event_micros);
+                }
             }
-            bound = bound.min(cmd.txn.0.micros);
-            for event in &cmd.events {
-                let event_micros = event
-                    .timestamp
-                    .saturating_mul(1_000_000)
-                    .saturating_add(u64::from(event.timestamp_subsec) * 1_000);
-                bound = bound.min(event_micros);
-            }
+            debug_assert_eq!(bound, scan, "unapplied bound index out of sync");
         }
         bound
     }
@@ -278,10 +348,17 @@ impl Replica {
             // superseding check see it.
             self.index_keys(txn, &keys);
             let existing = self.commands.get_mut(&txn).expect("present");
-            if existing.events.is_empty() {
+            let mut events_attached = false;
+            if existing.events.is_empty() && !events.is_empty() {
                 existing.events = events;
+                events_attached = true;
             }
-            return (existing.execute_at, existing.deps.clone());
+            let result = (existing.execute_at, existing.deps.clone());
+            if events_attached {
+                // Late-attached events can lower the watermark bound.
+                self.reindex_unapplied(txn);
+            }
+            return result;
         }
 
         let conflicts = self.conflicts(&keys, txn);
@@ -396,11 +473,16 @@ impl Replica {
             cmd.status = Status::Committed;
             cmd.execute_at = execute_at;
             cmd.deps = deps;
-            if cmd.events.is_empty() {
+            let events_attached = cmd.events.is_empty() && !events.is_empty();
+            if events_attached {
                 cmd.events = events;
             }
             // Newly executable: enter the execution queue at its final order.
             self.pending.insert((execute_at, txn));
+            if events_attached {
+                // Late-attached events can lower the watermark bound.
+                self.reindex_unapplied(txn);
+            }
         } else {
             self.insert(CommandState {
                 txn,
@@ -586,6 +668,7 @@ impl Replica {
             cmd.status = Status::Applied;
             cmd.applied_conflict = Some(conflict);
             self.pending.remove(&(at, txn));
+            self.reindex_unapplied(txn);
         }
     }
 
@@ -605,16 +688,12 @@ impl Replica {
     /// than `cutoff` — i.e. stalled long enough to warrant recovery (the
     /// coordinator is presumed dead). Drives automatic progress.
     pub fn stuck(&self, cutoff: Timestamp) -> Vec<TxnId> {
-        let mut stuck: Vec<TxnId> = self
-            .commands
-            .values()
-            .filter(|cmd| cmd.status != Status::Applied && cmd.txn.0 < cutoff)
-            .map(|cmd| cmd.txn)
-            .collect();
-        // Sorted so the recovery sweep drives transactions in a deterministic
-        // order (the raw HashMap iteration order is not reproducible).
-        stuck.sort();
-        stuck
+        // The `t0`-ordered un-applied index makes this O(result), already in
+        // the deterministic order the recovery sweep needs.
+        self.unapplied_by_t0
+            .range(..TxnId(cutoff))
+            .copied()
+            .collect()
     }
 
     /// Every applied command, in execution-timestamp order — the committed state
@@ -628,6 +707,36 @@ impl Replica {
             .collect();
         applied.sort_by_key(|cmd| (cmd.execute_at, cmd.txn));
         applied
+    }
+
+    /// The anti-entropy digest of this replica's applied state: its redundancy
+    /// floor plus the ids of every applied (un-compacted) command. A peer ships
+    /// back only the applied commands the digest is missing, instead of its
+    /// whole applied set (payloads included) every round.
+    pub fn applied_digest(&self) -> (Timestamp, Vec<TxnId>) {
+        (
+            self.redundant_before,
+            self.applied_by_t0.iter().copied().collect(),
+        )
+    }
+
+    /// Applied commands with `t0 >= since` that are not in `known`, in
+    /// execution-timestamp order — what an anti-entropy requester holding
+    /// `known` above its floor `since` is missing. O(window), and empty (no
+    /// clones at all) when the peers are in sync.
+    pub fn export_applied_missing(
+        &self,
+        since: Timestamp,
+        known: &HashSet<TxnId>,
+    ) -> Vec<CommandState> {
+        let mut missing: Vec<CommandState> = self
+            .applied_by_t0
+            .range(TxnId(since)..)
+            .filter(|txn| !known.contains(txn))
+            .map(|txn| self.commands[txn].clone())
+            .collect();
+        missing.sort_by_key(|cmd| (cmd.execute_at, cmd.txn));
+        missing
     }
 
     /// Imports an already-applied command during bootstrap: records it (so this
@@ -666,14 +775,8 @@ impl Replica {
     /// command here is `Applied`, so its effect is durable in the data store.)
     /// Reported to peers; the cluster-safe watermark is the min across the shard.
     pub fn applied_through(&self, cutoff: Timestamp) -> Timestamp {
-        match self
-            .commands
-            .values()
-            .filter(|cmd| cmd.status != Status::Applied)
-            .map(|cmd| cmd.txn.0)
-            .min()
-        {
-            Some(oldest_unapplied) => cutoff.min(oldest_unapplied),
+        match self.unapplied_by_t0.first() {
+            Some(oldest_unapplied) => cutoff.min(oldest_unapplied.0),
             None => cutoff,
         }
     }
@@ -706,6 +809,7 @@ impl Replica {
                     }
                 }
             }
+            self.reindex_unapplied(*txn);
         }
         self.redundant_before = safe;
     }

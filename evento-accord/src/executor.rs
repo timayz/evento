@@ -79,34 +79,14 @@ impl<E: Executor> ExecutorDataStore<E> {
 #[async_trait]
 impl<E: Executor> DataStore for ExecutorDataStore<E> {
     async fn version(&self, aggregate_type: &str, aggregate_id: &str) -> anyhow::Result<u16> {
-        // The aggregate's current version is the highest among its events. Walk the
-        // backend a page at a time and keep the running max, so an aggregate with more
-        // than one page of events is handled correctly (not capped at one page).
-        let mut max = 0u16;
-        let mut after = None;
-        loop {
-            let result = self
-                .local
-                .read(
-                    Some(vec![EventFilter::by_id(aggregate_type, aggregate_id)]),
-                    None,
-                    Args::forward(SNAPSHOT_PAGE_SIZE, after),
-                )
-                .await?;
-            if let Some(page_max) = result.edges.iter().map(|e| e.node.version).max() {
-                max = max.max(page_max);
-            }
-            if !result.page_info.has_next_page {
-                break;
-            }
-            // Defensive: a "more pages" claim with no cursor can't advance — stop
-            // rather than loop forever (evento sets the cursor whenever edges exist).
-            match result.page_info.end_cursor {
-                Some(cursor) => after = Some(cursor),
-                None => break,
-            }
-        }
-        Ok(max)
+        // The aggregate's current version is the highest among its events —
+        // an indexed lookup on every backend (`MAX(version)` on SQL, a
+        // reverse index seek on fjall) instead of paging the whole stream.
+        // The default trait impl still pages for backends without an
+        // override, so correctness never depends on the fast path.
+        self.local
+            .latest_version(aggregate_type.to_owned(), aggregate_id.to_owned())
+            .await
     }
 
     async fn apply(
@@ -136,8 +116,11 @@ impl<E: Executor> DataStore for ExecutorDataStore<E> {
         aggregators: Option<Vec<EventFilter>>,
         routing_key: Option<RoutingKey>,
         args: Args,
+        to_micros: Option<u64>,
     ) -> anyhow::Result<ReadResult<Event>> {
-        self.local.read(aggregators, routing_key, args).await
+        self.local
+            .read(aggregators, routing_key, args, to_micros)
+            .await
     }
 
     async fn snapshot(&self) -> anyhow::Result<Vec<Event>> {
@@ -151,7 +134,7 @@ impl<E: Executor> DataStore for ExecutorDataStore<E> {
         loop {
             let result = self
                 .local
-                .read(None, None, Args::forward(SNAPSHOT_PAGE_SIZE, after))
+                .read(None, None, Args::forward(SNAPSHOT_PAGE_SIZE, after), None)
                 .await?;
             let has_next = result.page_info.has_next_page;
             let cursor = result.page_info.end_cursor;
@@ -230,6 +213,7 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
         aggregators: Option<Vec<EventFilter>>,
         routing_key: Option<RoutingKey>,
         args: Args,
+        to_micros: Option<u64>,
     ) -> anyhow::Result<ReadResult<Event>> {
         // A single-shard read for a key this node does not own is forwarded to an
         // owner. Everything else (owned keys, and broad scans that can't be pinned
@@ -248,11 +232,13 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
                 // linearized — the owner would need to barrier before serving.
                 return self
                     .node
-                    .forward_read(owner, aggregators, routing_key, args)
+                    .forward_read(owner, aggregators, routing_key, args, to_micros)
                     .await;
             }
         }
-        self.local.read(aggregators, routing_key, args).await
+        self.local
+            .read(aggregators, routing_key, args, to_micros)
+            .await
     }
 
     async fn latest_timestamp(
@@ -269,6 +255,36 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
 
     async fn is_subscriber_running(&self, key: String, worker_id: Ulid) -> anyhow::Result<bool> {
         self.local.is_subscriber_running(key, worker_id).await
+    }
+
+    // Explicitly forwarded (not left to the trait defaults) so the local
+    // backend's single-round-trip overrides are reached through the wrapper.
+    async fn subscriber_status(
+        &self,
+        key: String,
+        worker_id: Ulid,
+    ) -> anyhow::Result<evento_core::SubscriberStatus> {
+        self.local.subscriber_status(key, worker_id).await
+    }
+
+    async fn latest_version(
+        &self,
+        aggregate_type: String,
+        aggregate_id: String,
+    ) -> anyhow::Result<u16> {
+        self.local
+            .latest_version(aggregate_type, aggregate_id)
+            .await
+    }
+
+    async fn stream_routing_key(
+        &self,
+        aggregate_type: String,
+        aggregate_id: String,
+    ) -> anyhow::Result<Option<Option<String>>> {
+        self.local
+            .stream_routing_key(aggregate_type, aggregate_id)
+            .await
     }
 
     async fn upsert_subscriber(&self, key: String, worker_id: Ulid) -> anyhow::Result<()> {

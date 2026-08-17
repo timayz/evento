@@ -218,12 +218,14 @@ impl Executor for Client {
         aggregators: Option<Vec<EventFilter>>,
         routing_key: Option<RoutingKey>,
         args: Args,
+        to_micros: Option<u64>,
     ) -> anyhow::Result<ReadResult<Event>> {
         match self
             .request(Request::Read {
                 aggregators,
                 routing_key,
                 args,
+                to_micros,
             })
             .await?
         {
@@ -267,6 +269,57 @@ impl Executor for Client {
             Response::SubscriberRunning(Ok(v)) => Ok(v),
             Response::SubscriberRunning(Err(msg)) => Err(anyhow::anyhow!(msg)),
             _ => Err(protocol_err("is_subscriber_running")),
+        }
+    }
+
+    async fn subscriber_status(
+        &self,
+        key: String,
+        worker_id: Ulid,
+    ) -> anyhow::Result<evento_core::SubscriberStatus> {
+        match self
+            .request(Request::SubscriberStatus { key, worker_id })
+            .await?
+        {
+            Response::SubscriberStatus(Ok(v)) => Ok(v),
+            Response::SubscriberStatus(Err(msg)) => Err(anyhow::anyhow!(msg)),
+            _ => Err(protocol_err("subscriber_status")),
+        }
+    }
+
+    async fn latest_version(
+        &self,
+        aggregate_type: String,
+        aggregate_id: String,
+    ) -> anyhow::Result<u16> {
+        match self
+            .request(Request::LatestVersion {
+                aggregate_type,
+                aggregate_id,
+            })
+            .await?
+        {
+            Response::LatestVersion(Ok(v)) => Ok(v),
+            Response::LatestVersion(Err(msg)) => Err(anyhow::anyhow!(msg)),
+            _ => Err(protocol_err("latest_version")),
+        }
+    }
+
+    async fn stream_routing_key(
+        &self,
+        aggregate_type: String,
+        aggregate_id: String,
+    ) -> anyhow::Result<Option<Option<String>>> {
+        match self
+            .request(Request::StreamRoutingKey {
+                aggregate_type,
+                aggregate_id,
+            })
+            .await?
+        {
+            Response::StreamRoutingKey(Ok(v)) => Ok(v),
+            Response::StreamRoutingKey(Err(msg)) => Err(anyhow::anyhow!(msg)),
+            _ => Err(protocol_err("stream_routing_key")),
         }
     }
 
@@ -389,8 +442,19 @@ impl Actor {
             // (each side blocked sending, neither reading).
             let (out_tx, mut out_rx) = mpsc::channel::<Bytes>(OUT_CAPACITY);
             let writer = tokio::spawn(async move {
-                while let Some(bytes) = out_rx.recv().await {
-                    if sink.send(bytes).await.is_err() {
+                // Coalesce: feed this frame plus everything already queued,
+                // then flush once — one syscall per burst instead of one per
+                // frame (`send` = `feed` + `flush`).
+                'writer: while let Some(bytes) = out_rx.recv().await {
+                    if sink.feed(bytes).await.is_err() {
+                        break;
+                    }
+                    while let Ok(bytes) = out_rx.try_recv() {
+                        if sink.feed(bytes).await.is_err() {
+                            break 'writer;
+                        }
+                    }
+                    if sink.flush().await.is_err() {
                         break;
                     }
                 }

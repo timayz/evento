@@ -2,7 +2,8 @@
 
 use std::{
     ops::{Deref, DerefMut},
-    time::Duration,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 #[cfg(feature = "mysql")]
@@ -20,8 +21,41 @@ use ulid::Ulid;
 
 use evento_core::{
     cursor::{self, Args, Cursor, Edge, PageInfo, ReadResult, Value},
-    EventFilter, Executor, WriteError,
+    EventFilter, Executor, SubscriberStatus, WriteError,
 };
+
+/// Dialect-agnostic access to a statement's affected-row count.
+///
+/// sqlx exposes `rows_affected` only on each driver's concrete `QueryResult`;
+/// this bridges them so the fenced UPDATE in [`Executor::acknowledge`] can
+/// report ownership without a follow-up SELECT. On MySQL sqlx connects with
+/// `CLIENT_FOUND_ROWS`, so the count is rows *matched* (not changed) — a
+/// re-ack of an identical cursor still reports the row as owned.
+pub trait RowsAffected {
+    /// Number of rows matched/affected by the statement.
+    fn affected_rows(&self) -> u64;
+}
+
+#[cfg(feature = "sqlite")]
+impl RowsAffected for sqlx::sqlite::SqliteQueryResult {
+    fn affected_rows(&self) -> u64 {
+        self.rows_affected()
+    }
+}
+
+#[cfg(feature = "mysql")]
+impl RowsAffected for sqlx::mysql::MySqlQueryResult {
+    fn affected_rows(&self) -> u64 {
+        self.rows_affected()
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl RowsAffected for sqlx::postgres::PgQueryResult {
+    fn affected_rows(&self) -> u64 {
+        self.rows_affected()
+    }
+}
 
 /// Column identifiers for the `event` table.
 ///
@@ -211,10 +245,20 @@ pub struct Sql<DB: Database> {
     pool: Pool<DB>,
     write_watch: tokio::sync::watch::Sender<u64>,
     stable_margin: Duration,
+    /// Last DB-server clock sample: (when it was taken locally, DB `now()` in
+    /// microseconds). Shared across clones so one re-sample per TTL serves
+    /// every subscription on this executor.
+    clock_sample: Arc<Mutex<Option<(Instant, u64)>>>,
 }
 
 /// Default stability margin for [`Sql::stable_margin`].
 const DEFAULT_STABLE_MARGIN: Duration = Duration::from_secs(1);
+
+/// How long a DB-clock sample may serve [`Executor::stable_timestamp`] before
+/// being refreshed with a round trip. Must stay well under any configured
+/// [`Sql::stable_margin`], which already absorbs far more skew than a
+/// TTL-stale sample introduces.
+const CLOCK_SAMPLE_TTL: Duration = Duration::from_secs(1);
 
 impl<DB: Database> Sql<DB> {
     /// Sets the stability margin subtracted from DB-server time to form the
@@ -294,12 +338,14 @@ where
     i64: for<'r> sqlx::Decode<'r, DB> + sqlx::Type<DB>,
     usize: sqlx::ColumnIndex<DB::Row>,
     SqlEvent: for<'r> sqlx::FromRow<'r, DB::Row>,
+    DB::QueryResult: RowsAffected,
 {
     async fn read(
         &self,
         aggregators: Option<Vec<EventFilter>>,
         routing_key: Option<evento_core::RoutingKey>,
         args: Args,
+        to_micros: Option<u64>,
     ) -> anyhow::Result<ReadResult<evento_core::Event>> {
         let statement = Query::select()
             .columns([
@@ -355,6 +401,31 @@ where
                     if let Some(evento_core::RoutingKey::Value(None)) = routing_key {
                         q.and_where(Expr::col(Event::RoutingKey).is_null());
                     }
+                },
+                |_q| {},
+            )
+            .conditions(
+                to_micros.is_some(),
+                |q| {
+                    let Some(bound) = to_micros else {
+                        return;
+                    };
+
+                    // Exclusive bound on the event stamp (`ts` seconds +
+                    // `subsec` milliseconds): stamp < bound ⇔
+                    // ts < bound_secs, or ts = bound_secs and
+                    // subsec·1000 < bound_rem_micros — the latter rewritten as
+                    // an integer comparison (subsec < ceil(rem / 1000)). The
+                    // leading `timestamp <` term keeps the predicate sargable.
+                    let secs = (bound / 1_000_000) as i64;
+                    let subsec_bound = ((bound % 1_000_000).div_ceil(1_000)) as i64;
+                    q.and_where(
+                        Expr::col(Event::Timestamp)
+                            .lt(secs)
+                            .or(Expr::col(Event::Timestamp)
+                                .eq(secs)
+                                .and(Expr::col(Event::TimestampSubsec).lt(subsec_bound))),
+                    );
                 },
                 |_q| {},
             )
@@ -476,6 +547,101 @@ where
         Ok(worker_id.to_string() == id && enabled)
     }
 
+    async fn subscriber_status(
+        &self,
+        key: String,
+        worker_id: Ulid,
+    ) -> anyhow::Result<SubscriberStatus> {
+        let statement = Query::select()
+            .columns([
+                Subscriber::WorkerId,
+                Subscriber::Enabled,
+                Subscriber::Cursor,
+            ])
+            .from(Subscriber::Table)
+            .and_where(Expr::col(Subscriber::Key).eq(Expr::value(key)))
+            .limit(1)
+            .to_owned();
+
+        let (sql, values) = Self::build_sqlx(statement);
+
+        // A missing row (e.g. an operator deleted the subscriber to stop it)
+        // means "not running", not an error.
+        let Some((id, enabled, cursor)) = sqlx::query_as_with::<
+            DB,
+            (String, bool, Option<String>),
+            _,
+        >(sqlx::AssertSqlSafe(sql.as_str()), values)
+        .fetch_optional(&self.pool)
+        .await?
+        else {
+            return Ok(SubscriberStatus::default());
+        };
+
+        Ok(SubscriberStatus {
+            running: worker_id.to_string() == id && enabled,
+            cursor: cursor.map(Into::into),
+        })
+    }
+
+    async fn latest_version(
+        &self,
+        aggregate_type: String,
+        aggregate_id: String,
+    ) -> anyhow::Result<u16> {
+        // CAST so the result decodes as i64 on every dialect (Postgres
+        // returns MAX(INT4) as INT4; MySQL spells the target type SIGNED).
+        let max_version_expr = match DB::NAME {
+            #[cfg(feature = "mysql")]
+            "MySQL" => "CAST(MAX(version) AS SIGNED)",
+            _ => "CAST(MAX(version) AS BIGINT)",
+        };
+        let statement = Query::select()
+            .expr(Expr::cust(max_version_expr))
+            .from(Event::Table)
+            .and_where(Expr::col(Event::AggregatorType).eq(aggregate_type))
+            .and_where(Expr::col(Event::AggregatorId).eq(aggregate_id))
+            .to_owned();
+        let (sql, values) = Self::build_sqlx(statement);
+        let (last,): (Option<i64>,) =
+            sqlx::query_as_with::<DB, (Option<i64>,), _>(sqlx::AssertSqlSafe(sql.as_str()), values)
+                .fetch_one(&self.pool)
+                .await?;
+
+        Ok(last
+            .map(|v| u16::try_from(v).unwrap_or(u16::MAX))
+            .unwrap_or(0))
+    }
+
+    async fn stream_routing_key(
+        &self,
+        aggregate_type: String,
+        aggregate_id: String,
+    ) -> anyhow::Result<Option<Option<String>>> {
+        // Seek on the unique `(type, id, version)` index: version 1 is the
+        // stream's first event and carries the routing key the stream was
+        // created with — no full event row (data/metadata blobs) needed.
+        let statement = Query::select()
+            .columns([Event::RoutingKey])
+            .from(Event::Table)
+            .and_where(Expr::col(Event::AggregatorType).eq(aggregate_type))
+            .and_where(Expr::col(Event::AggregatorId).eq(aggregate_id))
+            .and_where(Expr::col(Event::Version).eq(1))
+            .limit(1)
+            .to_owned();
+
+        let (sql, values) = Self::build_sqlx(statement);
+
+        let row = sqlx::query_as_with::<DB, (Option<String>,), _>(
+            sqlx::AssertSqlSafe(sql.as_str()),
+            values,
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|(routing_key,)| routing_key))
+    }
+
     async fn upsert_subscriber(&self, key: String, worker_id: Ulid) -> anyhow::Result<()> {
         let statement = Query::insert()
             .into_table(Subscriber::Table)
@@ -508,33 +674,19 @@ where
         // aggregate is at 5). A concurrent writer that advances the version
         // after this check can only cause the batch to collide on the unique
         // index — never to create a gap — so check + index together enforce
-        // contiguity.
+        // contiguity. A brand-new stream (version 1) needs no pre-check: no
+        // gap is possible below version 1, and if the stream already exists
+        // the unique index turns the insert into `InvalidOriginalVersion`.
         if let Some(first) = events.first() {
-            // CAST so the result decodes as i64 on every dialect (Postgres
-            // returns MAX(INT4) as INT4; MySQL spells the target type SIGNED).
-            let max_version_expr = match DB::NAME {
-                #[cfg(feature = "mysql")]
-                "MySQL" => "CAST(MAX(version) AS SIGNED)",
-                _ => "CAST(MAX(version) AS BIGINT)",
-            };
-            let statement = Query::select()
-                .expr(Expr::cust(max_version_expr))
-                .from(Event::Table)
-                .and_where(Expr::col(Event::AggregatorType).eq(first.aggregate_type.as_str()))
-                .and_where(Expr::col(Event::AggregatorId).eq(first.aggregate_id.as_str()))
-                .to_owned();
-            let (sql, values) = Self::build_sqlx(statement);
-            let (last,): (Option<i64>,) = sqlx::query_as_with::<DB, (Option<i64>,), _>(
-                sqlx::AssertSqlSafe(sql.as_str()),
-                values,
-            )
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|err| WriteError::Unknown(err.into()))?;
+            if first.version != 1 {
+                let last = self
+                    .latest_version(first.aggregate_type.clone(), first.aggregate_id.clone())
+                    .await
+                    .map_err(WriteError::Unknown)?;
 
-            let expected = last.unwrap_or(0) as u64 + 1;
-            if u64::from(first.version) != expected {
-                return Err(WriteError::InvalidOriginalVersion);
+                if u64::from(first.version) != u64::from(last) + 1 {
+                    return Err(WriteError::InvalidOriginalVersion);
+                }
             }
         }
 
@@ -565,16 +717,39 @@ where
     }
 
     async fn stable_timestamp(&self) -> anyhow::Result<Option<u64>> {
-        let statement = Query::select()
-            .expr(Expr::cust(Self::server_time_micros_expr()))
-            .to_owned();
-        let (sql, values) = Self::build_sqlx(statement);
-        let (now_micros,): (i64,) =
-            sqlx::query_as_with::<DB, (i64,), _>(sqlx::AssertSqlSafe(sql.as_str()), values)
-                .fetch_one(&self.pool)
-                .await?;
+        // Derive DB-server "now" from a cached sample plus locally elapsed
+        // time instead of a round trip per call — the subscription loop calls
+        // this once per pass. The sample is taken *after* the query returns,
+        // so the derived clock lags the true DB clock slightly (never leads
+        // it), which only makes the watermark more conservative.
+        let derived = {
+            let guard = self.clock_sample.lock().expect("clock sample poisoned");
+            guard.and_then(|(at, db_micros)| {
+                let elapsed = at.elapsed();
+                (elapsed < CLOCK_SAMPLE_TTL)
+                    .then(|| db_micros.saturating_add(elapsed.as_micros() as u64))
+            })
+        };
 
-        let now_micros = u64::try_from(now_micros).unwrap_or(0);
+        let now_micros = match derived {
+            Some(v) => v,
+            None => {
+                let statement = Query::select()
+                    .expr(Expr::cust(Self::server_time_micros_expr()))
+                    .to_owned();
+                let (sql, values) = Self::build_sqlx(statement);
+                let (now_micros,): (i64,) =
+                    sqlx::query_as_with::<DB, (i64,), _>(sqlx::AssertSqlSafe(sql.as_str()), values)
+                        .fetch_one(&self.pool)
+                        .await?;
+
+                let now_micros = u64::try_from(now_micros).unwrap_or(0);
+                *self.clock_sample.lock().expect("clock sample poisoned") =
+                    Some((Instant::now(), now_micros));
+                now_micros
+            }
+        };
+
         Ok(Some(now_micros.saturating_sub(
             self.stable_margin.as_micros().min(u128::from(u64::MAX)) as u64,
         )))
@@ -596,21 +771,25 @@ where
             ])
             .and_where(Expr::col(Subscriber::Key).eq(key.as_str()))
             // Fenced on the worker id: a superseded worker's ack must not
-            // rewind the cursor the new owner is advancing.
+            // rewind the cursor the new owner is advancing. The enabled
+            // condition makes a disabled subscriber read as "lost" too,
+            // matching `is_subscriber_running`.
             .and_where(Expr::col(Subscriber::WorkerId).eq(worker_id.to_string()))
+            .and_where(Expr::col(Subscriber::Enabled).eq(true))
             .to_owned();
 
         let (sql, values) = Self::build_sqlx(statement);
 
-        sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
+        // Zero matched rows means the fenced update was a no-op: the key is
+        // owned by another worker, disabled, or gone. `affected_rows` counts
+        // *matched* rows on every dialect (sqlx's MySQL connection sets
+        // CLIENT_FOUND_ROWS), so re-acking an identical cursor still reports
+        // ownership.
+        let result = sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
             .execute(&self.pool)
             .await?;
 
-        // sqlx exposes no dialect-agnostic rows_affected, so re-check
-        // ownership: if this worker no longer owns the key, the fenced update
-        // was a no-op. (A takeover between the two queries reads as "lost",
-        // which is the conservative outcome.)
-        self.is_subscriber_running(key, worker_id).await
+        Ok(result.affected_rows() > 0)
     }
 
     async fn get_snapshot(
@@ -783,6 +962,7 @@ impl<D: Database> Clone for Sql<D> {
             pool: self.pool.clone(),
             write_watch: self.write_watch.clone(),
             stable_margin: self.stable_margin,
+            clock_sample: self.clock_sample.clone(),
         }
     }
 }
@@ -801,6 +981,7 @@ impl<D: Database> From<Pool<D>> for Sql<D> {
             pool: value,
             write_watch: tokio::sync::watch::channel(0).0,
             stable_margin: DEFAULT_STABLE_MARGIN,
+            clock_sample: Arc::new(Mutex::new(None)),
         }
     }
 }

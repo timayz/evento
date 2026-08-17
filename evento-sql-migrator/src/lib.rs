@@ -51,6 +51,8 @@
 //! - [`M0004`] - Replaces `idx_event_type` with a composite cursor-scan index
 //! - [`M0005`] - Adds a leading-cursor index for no-routing-key subscription scans
 //! - [`M0006`] - Repairs schema drift from early alphas (recreates `snapshot`, widens columns)
+//!   and aligns `event` indexes with the hot read paths (aggregate-scoped cursor index, drops
+//!   the redundant `(type, id)` prefix index, adds `id` to the routing cursor index)
 //!
 //! # Database Schema
 //!

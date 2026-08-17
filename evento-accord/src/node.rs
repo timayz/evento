@@ -30,7 +30,7 @@ use tokio::time::{Duration, Instant};
 use crate::api::{AcceptorRecord, DataStore, Journal, MessageSink, ShardId, Topology};
 use crate::clock::{Ballot, Clock, HybridLogicalClock, NodeId, Timestamp, TxnId};
 use crate::failure_detector::FailureDetector;
-use crate::message::{CommandState, Key, Message, Status};
+use crate::message::{CommandState, Key, Message, Status, SyncKnown};
 use crate::metrics::{Metrics, MetricsSnapshot};
 use crate::replica::Replica;
 use crate::transport::Envelope;
@@ -49,6 +49,12 @@ pub struct NodeConfig {
     pub collect_timeout: Duration,
     /// How often the automatic-recovery sweep runs.
     pub recovery_interval: Duration,
+    /// How often the anti-entropy repair round runs (hosted by the recovery
+    /// sweep, but on its own — typically slower — cadence). Must stay well
+    /// below [`compaction_margin`](Self::compaction_margin): a transaction a
+    /// replica missed entirely can only be repaired until compaction drops it,
+    /// so several anti-entropy rounds must fit inside the margin.
+    pub anti_entropy_interval: Duration,
     /// A transaction unapplied this long is presumed stalled and recovered. Well
     /// above normal write latency so healthy in-flight writes are never disturbed.
     pub recovery_timeout: Duration,
@@ -95,6 +101,7 @@ impl Default for NodeConfig {
             fast_timeout: Duration::from_millis(50),
             collect_timeout: Duration::from_secs(5),
             recovery_interval: Duration::from_millis(100),
+            anti_entropy_interval: Duration::from_millis(250),
             recovery_timeout: Duration::from_millis(300),
             compaction_margin: Duration::from_secs(1),
             max_journal_batch: 128,
@@ -261,6 +268,13 @@ pub struct Node {
     /// Phi-accrual liveness estimator: every inbound message is a heartbeat, and a
     /// coordinator suspected dead has its stalled transactions recovered.
     failure_detector: Arc<FailureDetector>,
+    /// Bumped whenever local applied state advances (an apply or an
+    /// anti-entropy import). Waiters (`read_barrier`, read-your-writes) select
+    /// on it instead of polling the replica lock every millisecond.
+    applied_gen: Arc<tokio::sync::watch::Sender<u64>>,
+    /// When the last anti-entropy round ran, pacing it on
+    /// [`NodeConfig::anti_entropy_interval`] independent of the recovery sweep.
+    last_anti_entropy: Arc<Mutex<Option<Instant>>>,
     /// Runtime observability counters (writes, paths, recoveries, compactions, …).
     metrics: Arc<Metrics>,
     /// Tunable timing/sizing parameters (see [`NodeConfig`]).
@@ -300,6 +314,8 @@ impl Node {
             read_pending: Arc::new(Mutex::new(HashMap::new())),
             peer_watermarks: Arc::new(Mutex::new(HashMap::new())),
             failure_detector: Arc::new(FailureDetector::new()),
+            applied_gen: Arc::new(tokio::sync::watch::channel(0).0),
+            last_anti_entropy: Arc::new(Mutex::new(None)),
             metrics: Arc::new(Metrics::new()),
             settings: NodeConfig::default(),
         }
@@ -643,6 +659,18 @@ impl Node {
     /// can't fix this — a transaction that completed on a quorum without this
     /// node is "stuck" nowhere — so a healed node converges via this sweep.
     async fn anti_entropy(&self) {
+        // Paced on its own interval, independent of the (faster) recovery
+        // sweep that hosts it.
+        {
+            let mut last = self
+                .last_anti_entropy
+                .lock()
+                .expect("anti-entropy poisoned");
+            if last.is_some_and(|at| at.elapsed() < self.settings.anti_entropy_interval) {
+                return;
+            }
+            *last = Some(Instant::now());
+        }
         let nodes = self.topology.nodes();
         let peers: Vec<NodeId> = nodes.into_iter().filter(|&n| n != self.id).collect();
         if peers.is_empty() {
@@ -650,8 +678,20 @@ impl Node {
         }
         let next = self.correlation_seq.fetch_add(1, Ordering::Relaxed) as usize;
         let peer = peers[next % peers.len()];
+        // The digest lets the peer answer with only the commands this node is
+        // missing, instead of its full applied set every round.
+        let known = {
+            let replica = self.replica.lock().expect("replica poisoned");
+            let (since, txns) = replica.applied_digest();
+            SyncKnown { since, txns }
+        };
         let _ = self
-            .import_from(peer, self.settings.recovery_interval, false)
+            .import_from(
+                peer,
+                self.settings.anti_entropy_interval,
+                false,
+                Some(known),
+            )
             .await;
     }
 
@@ -689,17 +729,18 @@ impl Node {
         // consumes same-shard reports, but the message doubles as the periodic
         // heartbeat the phi-accrual failure detector needs — without it a quiet
         // cross-shard coordinator would be falsely suspected between writes.
-        for &peer in &all_nodes {
-            if peer != self.id {
-                self.send(
-                    peer,
-                    Message::Watermark {
-                        applied_through: mine,
-                    },
-                )
-                .await;
-            }
-        }
+        let peers: Vec<NodeId> = all_nodes
+            .iter()
+            .copied()
+            .filter(|&n| n != self.id)
+            .collect();
+        self.broadcast(
+            &peers,
+            Message::Watermark {
+                applied_through: mine,
+            },
+        )
+        .await;
 
         let watermark = {
             let mut watermarks = self.peer_watermarks.lock().expect("watermarks poisoned");
@@ -916,10 +957,25 @@ impl Node {
                 out.push((from, message));
             }
             // Bootstrap / anti-entropy: a node asks for our committed state.
-            Message::SyncRequest { id, snapshot } => {
+            Message::SyncRequest {
+                id,
+                snapshot,
+                known,
+            } => {
                 let (watermark, commands) = {
                     let replica = self.replica.lock().expect("replica poisoned");
-                    (replica.redundant_before(), replica.export_applied())
+                    // With a digest (anti-entropy), ship only what the
+                    // requester is missing — a healthy in-sync round clones
+                    // and ships nothing. Bootstrap (no digest) still gets the
+                    // full applied set.
+                    let commands = match &known {
+                        Some(known) => {
+                            let have: HashSet<TxnId> = known.txns.iter().copied().collect();
+                            replica.export_applied_missing(known.since, &have)
+                        }
+                        None => replica.export_applied(),
+                    };
+                    (replica.redundant_before(), commands)
                 };
                 // A bootstrapping joiner may be below our truncation watermark, so
                 // it also needs the materialised state command replay no longer
@@ -1096,10 +1152,11 @@ impl Node {
                 aggregators,
                 routing_key,
                 args,
+                to_micros,
             } => {
                 let result = self
                     .datastore
-                    .read(aggregators, routing_key, args)
+                    .read(aggregators, routing_key, args, to_micros)
                     .await
                     .unwrap_or_default();
                 let page_info = result.page_info;
@@ -1189,6 +1246,9 @@ impl Node {
                     .lock()
                     .expect("replica poisoned")
                     .mark_applied(apply.txn, !apply.commit);
+                // Wake read barriers / read-your-writes waiters instead of
+                // letting them poll the replica lock.
+                self.applied_gen.send_modify(|v| *v += 1);
                 self.journal_stage(apply.txn).await;
                 out.push((apply.reply_to, Message::Applied { txn: apply.txn }));
                 continue;
@@ -1340,6 +1400,7 @@ impl Node {
         // from probe data can skip a write that committed before the read
         // began — a real stale read observed under contention + churn.
         let deadline = Self::after(self.settings.collect_timeout);
+        let mut applied_rx = self.applied_gen.subscribe();
         loop {
             if self
                 .replica
@@ -1349,10 +1410,17 @@ impl Node {
             {
                 return Ok(());
             }
-            if Instant::now() >= deadline {
+            let now = Instant::now();
+            if now >= deadline {
                 anyhow::bail!("read barrier timed out: {} deps unapplied", deps.len());
             }
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            // Woken by the next apply (local or imported); the timeout arm only
+            // bounds a genuinely stuck dependency.
+            if let Ok(Err(_)) = tokio::time::timeout(deadline - now, applied_rx.changed()).await {
+                // Sender dropped (cannot happen while `self` lives) — degrade
+                // to a bounded poll rather than busy-looping.
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
         }
     }
 
@@ -1615,6 +1683,7 @@ impl Node {
         // own local apply so a subsequent read on this node sees the write.
         if union.contains(&self.id) {
             let deadline = Self::after(self.settings.collect_timeout);
+            let mut applied_rx = self.applied_gen.subscribe();
             while self
                 .replica
                 .lock()
@@ -1622,10 +1691,16 @@ impl Node {
                 .applied_result(txn)
                 .is_none()
             {
-                if Instant::now() >= deadline {
+                let now = Instant::now();
+                if now >= deadline {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(1)).await;
+                // Woken by the next apply instead of polling the replica lock
+                // every millisecond.
+                if let Ok(Err(_)) = tokio::time::timeout(deadline - now, applied_rx.changed()).await
+                {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
             }
         }
 
@@ -1912,7 +1987,7 @@ impl Node {
     /// installing an agreed layout) remains future work.
     pub async fn join(&self, contact: NodeId) -> anyhow::Result<usize> {
         let imported = self
-            .import_from(contact, self.settings.collect_timeout, true)
+            .import_from(contact, self.settings.collect_timeout, true, None)
             .await?;
 
         // Resume normal processing and replay anything buffered during bootstrap.
@@ -1949,6 +2024,7 @@ impl Node {
         contact: NodeId,
         timeout: Duration,
         want_snapshot: bool,
+        known: Option<SyncKnown>,
     ) -> anyhow::Result<usize> {
         let id = self.correlation_seq.fetch_add(1, Ordering::Relaxed);
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -1961,6 +2037,7 @@ impl Node {
             Message::SyncRequest {
                 id,
                 snapshot: want_snapshot,
+                known,
             },
         )
         .await;
@@ -2014,6 +2091,11 @@ impl Node {
                 .lock()
                 .expect("replica poisoned")
                 .compact(watermark);
+        }
+
+        if imported > 0 {
+            // Imported applies advance local applied state too.
+            self.applied_gen.send_modify(|v| *v += 1);
         }
 
         Ok(imported)
@@ -2376,6 +2458,7 @@ impl Node {
         aggregators: Option<Vec<EventFilter>>,
         routing_key: Option<RoutingKey>,
         args: Args,
+        to_micros: Option<u64>,
     ) -> anyhow::Result<ReadResult<Event>> {
         let id = self.correlation_seq.fetch_add(1, Ordering::Relaxed);
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -2390,6 +2473,7 @@ impl Node {
                 aggregators,
                 routing_key,
                 args,
+                to_micros,
             },
         )
         .await;
@@ -2630,11 +2714,11 @@ impl Node {
         got
     }
 
-    /// Sends `message` to every node in `nodes`.
+    /// Sends `message` to every node in `nodes`, ignoring transport-level loss.
+    /// Delegated to the sink so a serializing transport encodes once for the
+    /// whole fan-out instead of cloning and re-encoding per peer.
     async fn broadcast(&self, nodes: &[NodeId], message: Message) {
-        for &node in nodes {
-            self.send(node, message.clone()).await;
-        }
+        let _ = self.sink.broadcast(nodes, message).await;
     }
 
     /// Sends a single message, ignoring transport-level loss.
