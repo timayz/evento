@@ -1,3 +1,27 @@
+//! Bank web app on the **Accord consensus** executor (`evento-accord`): writes
+//! are replicated through the cluster (strictly serializable, leaderless);
+//! reads and subscriptions are served from each node's local Fjall store.
+//!
+//! Run standalone (single node, in-memory transport, no ports):
+//!
+//! ```text
+//! cargo run -p bank-axum-accord            # or: make accord
+//! # then open http://127.0.0.1:3000
+//! ```
+//!
+//! Or as a 3-node localhost TCP cluster (`NODE_ID=0..2` → Accord port
+//! `7000+id`, web port `3000+id`); writes need a 2-of-3 quorum, so it
+//! tolerates one node down:
+//!
+//! ```text
+//! # each in its own terminal…
+//! NODE_ID=0 cargo run -p bank-axum-accord  # or: make accord.node0
+//! NODE_ID=1 cargo run -p bank-axum-accord  # or: make accord.node1
+//! NODE_ID=2 cargo run -p bank-axum-accord  # or: make accord.node2
+//! # …or the whole cluster at once:
+//! make accord.cluster
+//! ```
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;

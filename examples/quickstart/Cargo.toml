@@ -1,0 +1,12 @@
+[package]
+name = "quickstart"
+version = "2.0.0-alpha.27"
+edition.workspace = true
+publish = false
+
+[dependencies]
+evento = { workspace = true, features = ["fjall"] }
+anyhow.workspace = true
+bitcode.workspace = true
+tokio.workspace = true
+tempfile = "3.27"
