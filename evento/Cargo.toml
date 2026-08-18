@@ -1,6 +1,6 @@
 [package]
 name = "evento"
-version = "2.0.0-alpha.27"
+version = "2.0.0-alpha.28"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -19,15 +19,13 @@ rustdoc-args = ["--cfg", "docsrs"]
 ignored = ["anyhow", "bitcode", "sqlx", "tokio"]
 
 [dependencies]
-evento-core = { path = "../evento-core", version = "2.0.0-alpha.27" }
-evento-sql = { path = "../evento-sql", optional = true, version = "2.0.0-alpha.27" }
-evento-sql-migrator = { path = "../evento-sql-migrator", optional = true, version = "2.0.0-alpha.27" }
-evento-fjall = { path = "../evento-fjall", optional = true, version = "2.0.0-alpha.27" }
-evento-remote = { path = "../evento-remote", optional = true, version = "2.0.0-alpha.27" }
+evento-core = { path = "../evento-core", version = "2.0.0-alpha.28" }
+evento-sql = { path = "../evento-sql", optional = true, version = "2.0.0-alpha.28" }
+evento-sql-migrator = { path = "../evento-sql-migrator", optional = true, version = "2.0.0-alpha.28" }
+evento-fjall = { path = "../evento-fjall", optional = true, version = "2.0.0-alpha.28" }
+evento-remote = { path = "../evento-remote", optional = true, version = "2.0.0-alpha.28" }
 sqlx_migrator = { workspace = true, optional = true }
 
-# anyhow/bitcode/sqlx/tokio exist solely so the crate docs and the root README
-# (compile-checked via the cfg(doctest) include in src/lib.rs) build.
 [dev-dependencies]
 anyhow.workspace = true
 bitcode.workspace = true

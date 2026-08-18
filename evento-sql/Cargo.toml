@@ -1,6 +1,6 @@
 [package]
 name = "evento-sql"
-version = "2.0.0-alpha.27"
+version = "2.0.0-alpha.28"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -16,7 +16,7 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
-evento-core = { path = "../evento-core", version = "2.0.0-alpha.27" }
+evento-core = { path = "../evento-core", version = "2.0.0-alpha.28" }
 anyhow.workspace = true
 bitcode.workspace = true
 async-trait.workspace = true
@@ -25,7 +25,7 @@ sqlx.workspace = true
 sea-query.workspace = true
 sea-query-sqlx.workspace = true
 tokio.workspace = true
-evento-accord = { path = "../evento-accord", version = "2.0.0-alpha.27", optional = true }
+evento-accord = { path = "../evento-accord", version = "2.0.0-alpha.28", optional = true }
 
 [dev-dependencies]
 evento = { workspace = true, features = ["sql"] }

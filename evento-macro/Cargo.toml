@@ -1,6 +1,6 @@
 [package]
 name = "evento-macro"
-version = "2.0.0-alpha.27"
+version = "2.0.0-alpha.28"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -21,7 +21,6 @@ syn.workspace = true
 
 [dev-dependencies]
 trybuild = "1"
-# `sqlite` pulls in `evento::sql`, which the `Cursor` derive expands against.
 evento = { workspace = true, features = ["sqlite"] }
 anyhow.workspace = true
 bitcode.workspace = true

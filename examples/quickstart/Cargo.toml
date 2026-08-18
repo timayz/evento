@@ -1,11 +1,9 @@
 [package]
 name = "quickstart"
-version = "2.0.0-alpha.27"
+version = "2.0.0-alpha.28"
 edition.workspace = true
 publish = false
 
-# `bitcode` is referenced only by macro-generated derives (#[evento::aggregate]
-# emits bitcode::Encode/Decode), which machete cannot see.
 [package.metadata.cargo-machete]
 ignored = ["bitcode"]
 
