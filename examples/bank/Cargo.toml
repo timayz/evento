@@ -7,4 +7,3 @@ edition = "2024"
 evento.workspace = true
 bitcode.workspace = true
 anyhow.workspace = true
-once_cell.workspace = true

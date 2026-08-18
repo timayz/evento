@@ -311,7 +311,6 @@ dependencies = [
  "anyhow",
  "bitcode",
  "evento",
- "once_cell",
 ]
 
 [[package]]
