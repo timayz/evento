@@ -50,10 +50,12 @@ pub struct NodeConfig {
     /// How often the automatic-recovery sweep runs.
     pub recovery_interval: Duration,
     /// How often the anti-entropy repair round runs (hosted by the recovery
-    /// sweep, but on its own — typically slower — cadence). Must stay well
-    /// below [`compaction_margin`](Self::compaction_margin): a transaction a
-    /// replica missed entirely can only be repaired until compaction drops it,
-    /// so several anti-entropy rounds must fit inside the margin.
+    /// sweep, but on its own — typically slower — cadence). Also paces how
+    /// quickly a node re-proves the sync coverage that unclamps its compaction
+    /// watermark reports (a replica only vouches for a window once syncs with
+    /// enough shard peers have covered it), so keep it well below
+    /// [`compaction_margin`](Self::compaction_margin) or compaction lags the
+    /// margin by the extra coverage round-trips.
     pub anti_entropy_interval: Duration,
     /// A transaction unapplied this long is presumed stalled and recovered. Well
     /// above normal write latency so healthy in-flight writes are never disturbed.
@@ -225,8 +227,8 @@ struct MetadataLog {
 type MetaLog = Arc<Mutex<MetadataLog>>;
 
 /// A [`SyncData`](Message::SyncData) payload handed to an in-flight sync: the
-/// contact's `(watermark, snapshot events, recent commands)`.
-type SyncPayload = (Timestamp, Vec<Event>, Vec<CommandState>);
+/// contact's `(watermark, coverage, snapshot events, recent commands)`.
+type SyncPayload = (Timestamp, Timestamp, Vec<Event>, Vec<CommandState>);
 
 /// Delivers each sync response to its in-flight [`join`](Node::join)/anti-entropy
 /// request, keyed by the request's correlation id — so a concurrent join and
@@ -270,6 +272,16 @@ pub struct Node {
     /// Latest `applied_through` gossiped by each shard peer (and self); the
     /// recovery sweep compacts below the per-shard minimum of these.
     peer_watermarks: Arc<Mutex<HashMap<NodeId, Timestamp>>>,
+    /// Proven sync coverage per shard peer: a successful sync round with `peer`
+    /// established that every transaction `peer` had applied below the recorded
+    /// timestamp is in this node's store. Clamps the watermark this node
+    /// reports — a replica must not vouch for a window it wasn't connected for
+    /// (it cannot know what it never witnessed), only for one it has provably
+    /// re-covered with enough peers to intersect every commit quorum.
+    /// Max-merged per peer, keyed to the topology epoch it was accrued under
+    /// (cleared on epoch change); never persisted — a restarted node re-proves
+    /// its coverage, which is conservative.
+    sync_coverage: Arc<Mutex<(u64, HashMap<NodeId, Timestamp>)>>,
     /// Phi-accrual liveness estimator: every inbound message is a heartbeat, and a
     /// coordinator suspected dead has its stalled transactions recovered.
     failure_detector: Arc<FailureDetector>,
@@ -318,6 +330,7 @@ impl Node {
             correlation_seq: Arc::new(AtomicU64::new(0)),
             read_pending: Arc::new(Mutex::new(HashMap::new())),
             peer_watermarks: Arc::new(Mutex::new(HashMap::new())),
+            sync_coverage: Arc::new(Mutex::new((start_epoch, HashMap::new()))),
             failure_detector: Arc::new(FailureDetector::new()),
             applied_gen: Arc::new(tokio::sync::watch::channel(0).0),
             last_anti_entropy: Arc::new(Mutex::new(None)),
@@ -381,16 +394,23 @@ impl Node {
     /// propagation + clock skew stays within `compaction_margin` (the bound the
     /// node already assumes). Exposed to [`Executor::stable_timestamp`].
     pub fn stable_micros(&self) -> u64 {
-        let now = self.clock.now().micros;
-        let cutoff = Timestamp {
-            micros: now.saturating_sub(self.settings.compaction_margin.as_micros() as u64),
-            logical: 0,
-            node: NodeId(0),
-        };
+        let cutoff = self.margin_cutoff();
         self.replica
             .lock()
             .expect("replica poisoned")
             .stable_event_micros(cutoff)
+    }
+
+    /// The present lagged by [`compaction_margin`](NodeConfig::compaction_margin):
+    /// the newest point this node may vouch for, since a message sent within the
+    /// margin (bounded propagation + clock skew) may still be in flight to it.
+    fn margin_cutoff(&self) -> Timestamp {
+        let now = self.clock.now().micros;
+        Timestamp {
+            micros: now.saturating_sub(self.settings.compaction_margin.as_micros() as u64),
+            logical: 0,
+            node: NodeId(0),
+        }
     }
 
     /// A point-in-time snapshot of this node's observability counters.
@@ -700,22 +720,72 @@ impl Node {
             .await;
     }
 
+    /// Records `peer`'s proven sync coverage after a successful sync round:
+    /// every transaction `peer` had applied below `coverage` is now in this
+    /// node's store. Max-merged; the map is reset when the topology epoch
+    /// changes, since coverage accrued under an old layout says nothing about
+    /// the keys this node owns under the new one.
+    fn record_sync_coverage(&self, peer: NodeId, coverage: Timestamp) {
+        let epoch = self.topology.epoch();
+        let mut guard = self.sync_coverage.lock().expect("coverage poisoned");
+        let (at, map) = &mut *guard;
+        if *at != epoch {
+            *at = epoch;
+            map.clear();
+        }
+        let entry = map.entry(peer).or_insert(Timestamp::MIN);
+        *entry = (*entry).max(coverage);
+    }
+
+    /// The newest point this node has *proven* it holds every committed
+    /// transaction below, via sync coverage of enough shard peers that
+    /// `{self} ∪ covered` intersects every commit quorum: with `slow_q − 1`
+    /// covered peers the set is a majority, every fast quorum meets every
+    /// majority (`fast_q ≥ f + 1`), and the intersecting witness either still
+    /// had the transaction unapplied when it reported (keeping its coverage
+    /// below the transaction's `t0`) or had applied it and shipped it in that
+    /// round. `None` when no clamp applies (a single-node shard witnesses
+    /// everything itself); [`Timestamp::MIN`] when too few peers are covered
+    /// yet (fresh start, restart, or epoch change).
+    fn quorum_sync_coverage(&self, shard_peers: &[NodeId]) -> Option<Timestamp> {
+        let needed = crate::api::slow_quorum_size(shard_peers.len()).saturating_sub(1);
+        if needed == 0 {
+            return None;
+        }
+        let epoch = self.topology.epoch();
+        let guard = self.sync_coverage.lock().expect("coverage poisoned");
+        let (at, map) = &*guard;
+        if *at != epoch {
+            return Some(Timestamp::MIN);
+        }
+        let mut covered: Vec<Timestamp> = shard_peers
+            .iter()
+            .filter(|&&peer| peer != self.id)
+            .filter_map(|peer| map.get(peer).copied())
+            .collect();
+        if covered.len() < needed {
+            return Some(Timestamp::MIN);
+        }
+        covered.sort_unstable_by(|a, b| b.cmp(a));
+        Some(covered[needed - 1])
+    }
+
     /// Gossips this node's redundancy point to its shard peers and compacts below
     /// the per-shard minimum once every peer has reported. The point is its
     /// applied-through, lagged by [`compaction_margin`](NodeConfig::compaction_margin)
     /// so a not-yet-propagated
-    /// commit is never skipped; the per-shard min ensures every replica has
+    /// commit is never skipped, and clamped to this node's proven sync coverage
+    /// ([`quorum_sync_coverage`](Self::quorum_sync_coverage)) — applied-through
+    /// alone cannot vouch for transactions this node never witnessed (e.g.
+    /// while partitioned away), so until anti-entropy has provably re-covered
+    /// the window, the clamp holds cluster compaction back and keeps those
+    /// transactions repairable. The per-shard min ensures every replica has
     /// applied everything below the compaction watermark (a still-behind or
     /// partitioned peer holds the min down, and an unheard-from peer blocks
     /// compaction entirely), so dropping that state is safe.
     async fn advance_watermark(&self) {
-        let now = self.clock.now().micros;
-        let cutoff = Timestamp {
-            micros: now.saturating_sub(self.settings.compaction_margin.as_micros() as u64),
-            logical: 0,
-            node: NodeId(0),
-        };
-        let mine = self
+        let cutoff = self.margin_cutoff();
+        let local = self
             .replica
             .lock()
             .expect("replica poisoned")
@@ -729,6 +799,20 @@ impl Node {
             .copied()
             .filter(|&n| self.topology.node_shard(n) == my_shard)
             .collect();
+
+        let mine = match self.quorum_sync_coverage(&shard_peers) {
+            Some(coverage) if coverage < local => {
+                self.metrics.record_watermark_clamp();
+                tracing::debug!(
+                    node = self.id.0,
+                    ?local,
+                    ?coverage,
+                    "watermark report clamped by sync coverage"
+                );
+                coverage
+            }
+            _ => local,
+        };
 
         // Watermarks go to EVERY peer, not just shard peers: compaction only
         // consumes same-shard reports, but the message doubles as the periodic
@@ -969,7 +1053,8 @@ impl Node {
                 snapshot,
                 known,
             } => {
-                let (watermark, commands) = {
+                let cutoff = self.margin_cutoff();
+                let (watermark, coverage, commands) = {
                     let replica = self.replica.lock().expect("replica poisoned");
                     // With a digest (anti-entropy), ship only what the
                     // requester is missing — a healthy in-sync round clones
@@ -982,7 +1067,14 @@ impl Node {
                         }
                         None => replica.export_applied(),
                     };
-                    (replica.redundant_before(), commands)
+                    // Everything this node holds below its margin-lagged
+                    // applied-through is applied — and, with `commands`, on its
+                    // way to the requester, which records it as sync coverage.
+                    (
+                        replica.redundant_before(),
+                        replica.applied_through(cutoff),
+                        commands,
+                    )
                 };
                 // A bootstrapping joiner may be below our truncation watermark, so
                 // it also needs the materialised state command replay no longer
@@ -997,6 +1089,7 @@ impl Node {
                     Message::SyncData {
                         id,
                         watermark,
+                        coverage,
                         snapshot,
                         commands,
                     },
@@ -1005,6 +1098,7 @@ impl Node {
             Message::SyncData {
                 id,
                 watermark,
+                coverage,
                 snapshot,
                 commands,
             } => {
@@ -1015,7 +1109,7 @@ impl Node {
                     .get(&id)
                     .cloned();
                 if let Some(tx) = tx {
-                    let _ = tx.send((watermark, snapshot, commands));
+                    let _ = tx.send((watermark, coverage, snapshot, commands));
                 }
             }
             Message::Watermark { applied_through } => {
@@ -2061,22 +2155,26 @@ impl Node {
 
         let received = tokio::time::timeout(timeout, rx.recv()).await;
         self.sync_inbox.lock().expect("sync poisoned").remove(&id);
-        let (watermark, snapshot, commands) = received
+        let (watermark, coverage, snapshot, commands) = received
             .map_err(|_| anyhow::anyhow!("sync timed out"))?
             .ok_or_else(|| anyhow::anyhow!("sync channel closed"))?;
 
         // Install the materialised snapshot (the truncated prefix and beyond) for
         // owned keys under a synthetic, sub-watermark id — redundant for ordering
         // but it sets this node's versions and committed map.
+        let mut apply_failed = false;
         let owned_snapshot: Vec<Event> = snapshot
             .into_iter()
             .filter(|event| self.topology.owns(self.id, &Key::of(event)))
             .collect();
-        if !owned_snapshot.is_empty() {
-            let _ = self
+        if !owned_snapshot.is_empty()
+            && self
                 .datastore
                 .apply(TxnId(watermark), watermark, owned_snapshot, true)
-                .await;
+                .await
+                .is_err()
+        {
+            apply_failed = true;
         }
 
         let mut imported = 0;
@@ -2093,8 +2191,14 @@ impl Node {
                 .import_applied(cmd);
             if inserted {
                 // On bootstrap the snapshot already materialised these events.
-                if !want_snapshot {
-                    let _ = self.datastore.apply(txn, execute_at, events, commit).await;
+                if !want_snapshot
+                    && self
+                        .datastore
+                        .apply(txn, execute_at, events, commit)
+                        .await
+                        .is_err()
+                {
+                    apply_failed = true;
                 }
                 imported += 1;
             }
@@ -2108,6 +2212,51 @@ impl Node {
                 .lock()
                 .expect("replica poisoned")
                 .compact(watermark);
+        }
+
+        // A completed round (even one that shipped nothing — the strongest
+        // evidence) proves this node holds everything the contact had applied
+        // below its reported coverage, clamping this node's watermark reports.
+        // Only a same-shard contact witnesses this shard's transactions, and a
+        // failed local apply voids the claim for this round.
+        if !apply_failed && self.topology.node_shard(contact) == self.topology.node_shard(self.id) {
+            self.record_sync_coverage(contact, coverage);
+        }
+        // Tripwire: an anti-entropy contact that already truncated above what
+        // this node has applied can no longer ship the window in between —
+        // compaction outran repair, the divergence the coverage clamp exists
+        // to prevent (or an operator compacted manually). A bootstrapping
+        // joiner is legitimately below the contact's floor: the snapshot
+        // covers it.
+        if !want_snapshot {
+            let (applied, floor) = {
+                let replica = self.replica.lock().expect("replica poisoned");
+                (
+                    replica.applied_through(self.margin_cutoff()),
+                    replica.redundant_before(),
+                )
+            };
+            let my_shard = self.topology.node_shard(self.id);
+            let shard_peers: Vec<NodeId> = self
+                .topology
+                .nodes()
+                .into_iter()
+                .filter(|&n| self.topology.node_shard(n) == my_shard)
+                .collect();
+            let vouched = match self.quorum_sync_coverage(&shard_peers) {
+                Some(coverage) => coverage.min(applied),
+                None => applied,
+            };
+            if watermark > vouched.max(floor) {
+                tracing::warn!(
+                    node = self.id.0,
+                    contact = contact.0,
+                    ?watermark,
+                    ?vouched,
+                    "sync contact truncated above this node's proven coverage — \
+                     possible unrepairable divergence"
+                );
+            }
         }
 
         if imported > 0 {

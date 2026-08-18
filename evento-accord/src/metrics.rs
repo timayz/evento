@@ -22,6 +22,10 @@ pub struct Metrics {
     pub recoveries: AtomicU64,
     /// Compaction rounds that advanced the redundancy watermark.
     pub compactions: AtomicU64,
+    /// Watermark reports clamped below the local applied-through point because
+    /// sync coverage hadn't (yet) proven the window — e.g. after a partition
+    /// heal or restart, until anti-entropy re-covers it.
+    pub watermark_clamps: AtomicU64,
     /// Group-commit journal flushes performed.
     pub journal_flushes: AtomicU64,
     /// Inbound messages handled.
@@ -62,6 +66,11 @@ impl Metrics {
         self.compactions.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records a watermark report clamped by missing sync coverage.
+    pub fn record_watermark_clamp(&self) {
+        self.watermark_clamps.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Records a group-commit journal flush.
     pub fn record_flush(&self) {
         self.journal_flushes.fetch_add(1, Ordering::Relaxed);
@@ -86,6 +95,7 @@ impl Metrics {
             slow_path: self.slow_path.load(Ordering::Relaxed),
             recoveries: self.recoveries.load(Ordering::Relaxed),
             compactions: self.compactions.load(Ordering::Relaxed),
+            watermark_clamps: self.watermark_clamps.load(Ordering::Relaxed),
             journal_flushes: self.journal_flushes.load(Ordering::Relaxed),
             messages_handled: self.messages_handled.load(Ordering::Relaxed),
             messages_shed: self.messages_shed.load(Ordering::Relaxed),
@@ -102,6 +112,7 @@ pub struct MetricsSnapshot {
     pub slow_path: u64,
     pub recoveries: u64,
     pub compactions: u64,
+    pub watermark_clamps: u64,
     pub journal_flushes: u64,
     pub messages_handled: u64,
     pub messages_shed: u64,
@@ -112,7 +123,7 @@ impl MetricsSnapshot {
     /// source of truth for both [`to_prometheus`](Self::to_prometheus) and
     /// [`to_prometheus_labeled`](Self::to_prometheus_labeled); add a counter here and
     /// both renderings pick it up.
-    fn counters(&self) -> [(&'static str, &'static str, u64); 9] {
+    fn counters(&self) -> [(&'static str, &'static str, u64); 10] {
         [
             (
                 "accord_writes_committed_total",
@@ -143,6 +154,11 @@ impl MetricsSnapshot {
                 "accord_compactions_total",
                 "Compaction rounds that advanced the redundancy watermark.",
                 self.compactions,
+            ),
+            (
+                "accord_watermark_clamps_total",
+                "Watermark reports clamped below local applied-through by missing sync coverage.",
+                self.watermark_clamps,
             ),
             (
                 "accord_journal_flushes_total",

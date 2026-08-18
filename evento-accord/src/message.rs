@@ -35,6 +35,12 @@ impl Key {
     }
 }
 
+/// Serde default for [`Message::SyncData`]'s `coverage`: a peer predating the
+/// field decodes as "no coverage proven", which is conservatively ignored.
+fn min_timestamp() -> Timestamp {
+    Timestamp::MIN
+}
+
 /// How far a transaction has progressed on a given replica. Ordered so that
 /// `>= Committed` means the execution timestamp and dependencies are final.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -221,6 +227,13 @@ pub enum Message {
         /// The contact's redundancy watermark; the joiner adopts it as its floor,
         /// so a dependency on a compacted-away transaction counts as satisfied.
         watermark: Timestamp,
+        /// The responder's applied-through point (lagged by its compaction
+        /// margin) when it answered: below this, everything the responder holds
+        /// is applied — and, together with this reply's `commands`, now in the
+        /// requester's store too. The requester records it as proven sync
+        /// coverage, which clamps its own compaction-watermark reports.
+        #[serde(default = "min_timestamp")]
+        coverage: Timestamp,
         /// Materialized applied events (the state below the watermark that command
         /// replay no longer covers). Empty unless a snapshot was requested.
         #[serde(with = "wire_events")]

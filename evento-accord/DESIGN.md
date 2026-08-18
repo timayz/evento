@@ -377,8 +377,22 @@ backend (sql/fjall). Phases, in order:
   truncating the journal (`Journal::truncate` + a persisted watermark). `is_ready`
   treats a dependency missing below the watermark as satisfied (a `Commit`'s
   quorum-unioned deps can name a compacted-away transaction). A still-behind or
-  partitioned peer holds the min down (and an unheard-from peer blocks compaction),
-  so truncating is always safe. **Catch-up:** only a brand-new joining node can be
+  partitioned peer holds the min down (and an unheard-from peer blocks compaction).
+  `applied_through` alone is not enough, though: a replica partitioned *during*
+  consensus never witnessed the missed transactions at all, so after healing its
+  report would vouch for a window it wasn't connected for and prematurely unblock
+  compaction — anti-entropy then races truncation and, losing, leaves that replica
+  **permanently** divergent (jepsen `G-single-item-realtime`, issue #228). So each
+  node also **clamps its report to proven sync coverage**: a completed anti-entropy
+  round records the contact's applied-through as covered, and a node only vouches
+  up to the `slow_q − 1`-th best coverage among its shard peers — `{self} ∪
+  covered` then intersects every commit quorum (fast quorums meet every majority),
+  so every committed transaction below the report is provably held. Until a healed
+  or restarted replica re-proves coverage it reports `MIN`, holding cluster
+  compaction back (`accord_watermark_clamps_total` counts this), which keeps the
+  missing commands exportable and truncating always safe (regression:
+  `partitioned_minority_cannot_unblock_compaction_and_diverge`). **Catch-up:**
+  only a brand-new joining node can be
   below the watermark, so `join` transfers a **data-store snapshot**
   (`DataStore::snapshot`) for the truncated prefix plus the recent commands and the
   watermark; anti-entropy stays command-based. `recover_state` restores the floor

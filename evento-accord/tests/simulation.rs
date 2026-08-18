@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use evento_accord::{
     DataStore, DynamicTopology, HybridLogicalClock, InMemoryDataStore, InMemoryJournal,
-    InMemoryNetwork, Journal, MessageSink, Node, NodeConfig, NodeId, StaticTopology, Topology,
+    InMemoryNetwork, Journal, Key, MessageSink, Node, NodeConfig, NodeId, StaticTopology, Topology,
 };
 use evento_core::Event;
 use rand::rngs::StdRng;
@@ -1060,6 +1060,117 @@ async fn consensus_state_stays_bounded() {
             panic!("bound oracle violated: {e}");
         }
     }
+}
+
+/// Issue #228 regression: a minority stranded during consensus never witnesses
+/// the partition-era transactions, so after healing its (unclamped) redundancy
+/// report would vouch for a window it wasn't connected for — unblocking
+/// cluster-wide compaction before an anti-entropy round can repair it. Once the
+/// witnesses truncate, the missing commands can never be shipped and the
+/// minority's store is *permanently* divergent (jepsen's
+/// `G-single-item-realtime`: a barriered read then serves the stale prefix).
+///
+/// The scenario forces the race the wrong way on purpose: a short
+/// `compaction_margin` with a much slower `anti_entropy_interval` guarantees
+/// many watermark rounds fit between the heal and the first repair round.
+/// Correct behaviour — enforced by clamping watermark reports to proven sync
+/// coverage — is that compaction *waits* for the minority to catch up, so the
+/// cluster still converges, a barriered read on a minority node sees every
+/// acked write, and compaction then resumes (bounded state).
+#[tokio::test(start_paused = true)]
+async fn partitioned_minority_cannot_unblock_compaction_and_diverge() {
+    const HOT: &str = "hot";
+    const PARTITION_WRITES: u16 = 5;
+
+    let sim = Sim::build_with_config(
+        5,
+        NodeConfig {
+            compaction_margin: Duration::from_millis(300),
+            anti_entropy_interval: Duration::from_secs(2),
+            ..NodeConfig::default()
+        },
+    );
+
+    // Baseline: healthy-cluster writes still compact away with the coverage
+    // clamp in place (liveness of the fix itself).
+    for version in 1..=3u16 {
+        sim.nodes[0]
+            .write(vec![event(HOT, version, version as u64)])
+            .await
+            .expect("baseline write");
+    }
+    assert!(converge(&sim.stores).await, "baseline did not converge");
+    let mut compacted = false;
+    for _ in 0..2000 {
+        if sim.nodes.iter().all(|n| n.command_count() == 0) {
+            compacted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        compacted,
+        "healthy cluster failed to compact (clamp too strict)"
+    );
+
+    // Strand the minority, then commit writes it can never witness.
+    for &a in &MAJORITY {
+        for &b in &MINORITY {
+            sim.net.partition(NodeId(a as u64), NodeId(b as u64));
+        }
+    }
+    let mut acked = 3u16;
+    for _ in 0..PARTITION_WRITES {
+        let version = acked + 1;
+        let outcome = sim.nodes[0]
+            .write(vec![event(HOT, version, 100 + version as u64)])
+            .await
+            .expect("partitioned-majority write");
+        assert!(!outcome.conflict, "partition-era write conflicted");
+        acked = version;
+    }
+
+    // Outlast the compaction margin while stranded, then heal and give the
+    // watermark sweep (100ms) a long head start on anti-entropy (2s): the
+    // unfixed race truncates the partition-era commands right here.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    for &a in &MAJORITY {
+        for &b in &MINORITY {
+            sim.net.heal_partition(NodeId(a as u64), NodeId(b as u64));
+        }
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // Repair must still be possible: every store converges on the acked writes.
+    assert!(
+        converge(&sim.stores).await,
+        "cluster failed to converge after heal — partition-era writes were compacted away"
+    );
+    for &m in &MINORITY {
+        sim.nodes[m]
+            .read_barrier(Key(HOT.into()))
+            .await
+            .expect("read barrier on healed minority node");
+        let version = version_of(&sim.stores[m], HOT).await;
+        assert_eq!(
+            version, acked,
+            "stale barriered read on minority node {m}: {version} < acked {acked}"
+        );
+    }
+
+    // And the clamp releases once coverage catches up: state stays bounded.
+    let mut bounded = false;
+    for _ in 0..4000 {
+        if sim.nodes.iter().all(|n| n.command_count() == 0) {
+            bounded = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        bounded,
+        "compaction never resumed after the minority caught up"
+    );
 }
 
 /// Bounded clock-skew handling: one node's wall clock runs ahead (within the
