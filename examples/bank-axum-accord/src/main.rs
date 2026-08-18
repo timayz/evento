@@ -47,9 +47,10 @@ use serde::Deserialize;
 use tokio::sync::mpsc;
 use ulid::Ulid;
 
-/// Accord membership for the demo cluster: 3 nodes on localhost. With `N = 2f+1`
-/// this tolerates one node down (writes need a 2-of-3 quorum).
-const CLUSTER_SIZE: u64 = 3;
+/// Accord membership for the demo cluster: 3 nodes on localhost by default
+/// (override with `CLUSTER_SIZE`). With `N = 2f+1` this tolerates
+/// `(N-1)/2` nodes down (writes need a majority quorum).
+const DEFAULT_CLUSTER_SIZE: u64 = 3;
 const ACCORD_BASE_PORT: u16 = 7000;
 const WEB_BASE_PORT: u16 = 3000;
 
@@ -132,6 +133,13 @@ async fn main() -> anyhow::Result<()> {
         v.parse::<u64>()
             .expect("NODE_ID must be an integer 0..CLUSTER_SIZE")
     });
+    let cluster_size = std::env::var("CLUSTER_SIZE")
+        .ok()
+        .map(|v| {
+            v.parse::<u64>()
+                .expect("CLUSTER_SIZE must be a positive integer")
+        })
+        .unwrap_or(DEFAULT_CLUSTER_SIZE);
 
     let label = node_id
         .map(|n| n.to_string())
@@ -146,8 +154,8 @@ async fn main() -> anyhow::Result<()> {
 
     let (executor, web_port) = match node_id {
         Some(id) => {
-            assert!(id < CLUSTER_SIZE, "NODE_ID must be 0..{CLUSTER_SIZE}");
-            let peers: HashMap<NodeId, SocketAddr> = (0..CLUSTER_SIZE)
+            assert!(id < cluster_size, "NODE_ID must be 0..{cluster_size}");
+            let peers: HashMap<NodeId, SocketAddr> = (0..cluster_size)
                 .map(|n| {
                     let addr = format!("127.0.0.1:{}", ACCORD_BASE_PORT + n as u16)
                         .parse()
@@ -156,14 +164,14 @@ async fn main() -> anyhow::Result<()> {
                 })
                 .collect();
             let listen = peers[&NodeId(id)];
-            println!("Accord node {id} listening on {listen} ({CLUSTER_SIZE}-node cluster)");
+            println!("Accord node {id} listening on {listen} ({cluster_size}-node cluster)");
             let executor = build_cluster_node(NodeId(id), listen, peers, local).await?;
             (executor, WEB_BASE_PORT + id as u16)
         }
         None => {
             println!(
                 "single-node mode — set NODE_ID=0..{} for a TCP cluster",
-                CLUSTER_SIZE - 1
+                cluster_size - 1
             );
             (build_single_node(local), WEB_BASE_PORT)
         }
