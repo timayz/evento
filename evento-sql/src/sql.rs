@@ -203,20 +203,24 @@ pub type RwSqlite = evento_core::Rw<Sqlite, Sqlite>;
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust,no_run
 /// use evento_sql::Sql;
 /// use sqlx::sqlite::SqlitePoolOptions;
 ///
+/// # async fn run() -> anyhow::Result<()> {
 /// // Create a connection pool
 /// let pool = SqlitePoolOptions::new()
 ///     .connect(":memory:")
 ///     .await?;
 ///
 /// // Convert to Sql executor
-/// let executor: Sql<sqlx::Sqlite> = pool.into();
+/// let executor: Sql<sqlx::Sqlite> = pool.clone().into();
 ///
 /// // Or use the type alias
 /// let executor: evento_sql::Sqlite = pool.into();
+/// # let _ = executor;
+/// # Ok(())
+/// # }
 /// ```
 ///
 /// # Executor Implementation
@@ -999,21 +1003,22 @@ impl<D: Database> From<Pool<D>> for Sql<D> {
 ///
 /// # Example
 ///
-/// ```rust,ignore
-/// use evento_sql::{Reader, Event};
+/// ```rust,no_run
+/// use evento_sql::{Event, Reader, SqlEvent};
 /// use sea_query::Query;
 ///
+/// # async fn run(pool: sqlx::SqlitePool) -> anyhow::Result<()> {
 /// let statement = Query::select()
 ///     .columns([Event::Id, Event::Name, Event::Data])
 ///     .from(Event::Table)
 ///     .to_owned();
 ///
-/// let result = Reader::new(statement)
+/// let result = Reader::new(statement.clone())
 ///     .forward(10, None)  // First 10 events
-///     .execute::<_, MyEvent, _>(&pool)
+///     .execute::<_, SqlEvent, _>(&pool)
 ///     .await?;
 ///
-/// for edge in result.edges {
+/// for edge in &result.edges {
 ///     println!("Event: {:?}, Cursor: {:?}", edge.node, edge.cursor);
 /// }
 ///
@@ -1021,9 +1026,12 @@ impl<D: Database> From<Pool<D>> for Sql<D> {
 /// if result.page_info.has_next_page {
 ///     let next_result = Reader::new(statement)
 ///         .forward(10, result.page_info.end_cursor)
-///         .execute::<_, MyEvent, _>(&pool)
+///         .execute::<_, SqlEvent, _>(&pool)
 ///         .await?;
+/// #   let _ = next_result;
 /// }
+/// # Ok(())
+/// # }
 /// ```
 ///
 /// # Deref
@@ -1383,6 +1391,8 @@ impl From<&Postgres> for evento_core::Evento {
     }
 }
 
+/// Newtype over [`evento_core::Event`] carrying the `sqlx::FromRow` mapping
+/// from the events table.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct SqlEvent(pub evento_core::Event);
 

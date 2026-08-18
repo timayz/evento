@@ -12,14 +12,15 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
-//! use evento::cursor::{Args, Reader};
+//! ```rust,no_run
+//! use evento::cursor::{Args, Reader, Value};
 //!
+//! # fn run(cursor: Value, events: Vec<evento::Event>) -> anyhow::Result<()> {
 //! // Forward pagination: first 10 events
 //! let args = Args::forward(10, None);
 //!
 //! // Continue from cursor
-//! let args = Args::forward(10, Some(page_info.end_cursor));
+//! let args = Args::forward(10, Some(cursor.clone()));
 //!
 //! // Backward pagination: last 10 events before cursor
 //! let args = Args::backward(10, Some(cursor));
@@ -28,6 +29,8 @@
 //! let result = Reader::new(events)
 //!     .forward(10, None)
 //!     .execute()?;
+//! # Ok(())
+//! # }
 //! ```
 
 use serde::{Deserialize, Serialize};
@@ -80,6 +83,7 @@ pub struct ReadResult<N> {
 }
 
 impl<N> ReadResult<N> {
+    /// Maps every node to a new type, preserving cursors and page info.
     pub fn map<B, F>(self, f: F) -> ReadResult<B>
     where
         Self: Sized,
@@ -125,12 +129,21 @@ impl AsRef<[u8]> for Value {
     }
 }
 
-// Your encoding traits
+/// Serializes cursor data to bytes.
+///
+/// Blanket-implemented for every [`bitcode::Encode`] type, so custom cursor
+/// types rarely implement this by hand.
 pub trait Encode {
+    /// Encodes `self` to a byte vector.
     fn encode(&self) -> Result<Vec<u8>, CursorError>;
 }
 
+/// Deserializes cursor data from bytes.
+///
+/// Blanket-implemented for every [`bitcode::DecodeOwned`] type, so custom
+/// cursor types rarely implement this by hand.
 pub trait Decode: Sized {
+    /// Decodes a value from the given bytes.
     fn decode(bytes: &[u8]) -> Result<Self, CursorError>;
 }
 
@@ -173,11 +186,14 @@ pub trait Cursor {
     }
 }
 
+/// Error produced while encoding or decoding a cursor [`Value`].
 #[derive(Debug, Error)]
 pub enum CursorError {
+    /// The cursor string is not valid URL-safe base64.
     #[error("base64 decode: {0}")]
     Base64Decode(#[from] base64::DecodeError),
 
+    /// The decoded bytes are not a valid bitcode payload for the cursor type.
     #[error("bitcode: {0}")]
     Bitcode(String),
 }
@@ -188,7 +204,9 @@ pub enum CursorError {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust,no_run
+/// # use evento::cursor::{Args, Value};
+/// # fn run(end_cursor: Value, start_cursor: Value) {
 /// // Forward: first 20 items
 /// let args = Args::forward(20, None);
 ///
@@ -197,6 +215,7 @@ pub enum CursorError {
 ///
 /// // Backward: last 20 items before cursor
 /// let args = Args::backward(20, Some(start_cursor));
+/// # }
 /// ```
 #[derive(Default, Debug, Serialize, Deserialize, Clone)]
 pub struct Args {
@@ -211,6 +230,8 @@ pub struct Args {
 }
 
 impl Args {
+    /// Creates forward-pagination arguments: the `first` items after the
+    /// optional `after` cursor.
     pub fn forward(first: u16, after: Option<Value>) -> Self {
         Self {
             first: Some(first),
@@ -220,6 +241,8 @@ impl Args {
         }
     }
 
+    /// Creates backward-pagination arguments: the `last` items before the
+    /// optional `before` cursor.
     pub fn backward(last: u16, before: Option<Value>) -> Self {
         Self {
             first: None,
@@ -229,12 +252,16 @@ impl Args {
         }
     }
 
+    /// Returns `true` when the arguments describe backward pagination
+    /// (`last`/`before` set and `first`/`after` unset).
     pub fn is_backward(&self) -> bool {
         (self.last.is_some() || self.before.is_some())
             && self.first.is_none()
             && self.after.is_none()
     }
 
+    /// Returns the effective `(limit, cursor)` pair for the paging direction,
+    /// defaulting the limit to 40 when unset.
     pub fn get_info(&self) -> (u16, Option<Value>) {
         if self.is_backward() {
             (self.last.unwrap_or(40), self.before.clone())
@@ -243,6 +270,8 @@ impl Args {
         }
     }
 
+    /// Caps the requested page size at `v`, using `v` as the default when no
+    /// size was requested.
     pub fn limit(self, v: u16) -> Self {
         if self.is_backward() {
             Args::backward(self.last.unwrap_or(v).min(v), self.before)
@@ -252,11 +281,14 @@ impl Args {
     }
 }
 
+/// Error produced while executing a paginated read.
 #[derive(Debug, Error)]
 pub enum ReadError {
+    /// A backend-specific failure while reading the data.
     #[error("{0}")]
     Unknown(#[from] anyhow::Error),
 
+    /// The supplied cursor could not be decoded.
     #[error("cursor: {0}")]
     Cursor(#[from] CursorError),
 }
@@ -268,15 +300,17 @@ pub enum ReadError {
 ///
 /// # Example
 ///
-/// ```rust,ignore
-/// let events = vec![event1, event2, event3];
-///
+/// ```rust,no_run
+/// # use evento::cursor::Reader;
+/// # fn run(events: Vec<evento::Event>) -> anyhow::Result<()> {
 /// let result = Reader::new(events)
 ///     .forward(2, None)
 ///     .execute()?;
 ///
 /// assert_eq!(result.edges.len(), 2);
 /// assert!(result.page_info.has_next_page);
+/// # Ok(())
+/// # }
 /// ```
 pub struct Reader<T> {
     data: Vec<T>,
@@ -290,6 +324,7 @@ where
     T: Send + Unpin,
     T: Bind<T = T>,
 {
+    /// Creates a reader over the given items, ascending order by default.
     pub fn new(data: Vec<T>) -> Self {
         Self {
             data,
@@ -298,22 +333,26 @@ where
         }
     }
 
+    /// Sets the sort order applied before pagination.
     pub fn order(mut self, order: Order) -> Self {
         self.order = order;
 
         self
     }
 
+    /// Shorthand for [`order(Order::Desc)`](Self::order).
     pub fn desc(self) -> Self {
         self.order(Order::Desc)
     }
 
+    /// Sets the pagination arguments.
     pub fn args(mut self, args: Args) -> Self {
         self.args = args;
 
         self
     }
 
+    /// Paginates backward: the `last` items before the optional cursor.
     pub fn backward(self, last: u16, before: Option<Value>) -> Self {
         self.args(Args {
             last: Some(last),
@@ -322,6 +361,7 @@ where
         })
     }
 
+    /// Paginates forward: the `first` items after the optional cursor.
     pub fn forward(self, first: u16, after: Option<Value>) -> Self {
         self.args(Args {
             first: Some(first),
@@ -330,6 +370,7 @@ where
         })
     }
 
+    /// Sorts, filters by cursor, and returns one page of results.
     pub fn execute(self) -> Result<ReadResult<T>, ReadError> {
         let is_order_desc = matches!(
             (&self.order, self.args.is_backward()),

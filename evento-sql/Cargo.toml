@@ -8,6 +8,12 @@ publish = true
 description = "SQL database implementations for evento event sourcing library."
 documentation = "https://docs.rs/evento-sql"
 readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 evento-core = { path = "../evento-core", version = "2.0.0-alpha.27" }
@@ -46,3 +52,6 @@ required-features = ["accord", "postgres"]
 [[test]]
 name = "sql_journal_mysql"
 required-features = ["accord", "mysql"]
+
+[lints]
+workspace = true

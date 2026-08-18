@@ -1029,7 +1029,9 @@ dependencies = [
  "evento-remote",
  "evento-sql",
  "evento-sql-migrator",
+ "sqlx",
  "sqlx_migrator",
+ "tokio",
 ]
 
 [[package]]
@@ -1064,6 +1066,7 @@ dependencies = [
  "backon",
  "base64 0.23.1",
  "bitcode",
+ "evento",
  "evento-macro",
  "futures-util",
  "hex",
@@ -1083,6 +1086,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bitcode",
+ "evento",
  "evento-accord",
  "evento-core",
  "evento-test",
@@ -1101,6 +1105,7 @@ dependencies = [
  "convert_case",
  "evento",
  "quote",
+ "sea-query",
  "serde",
  "syn 3.0.3",
  "trybuild",
@@ -1151,6 +1156,7 @@ name = "evento-sql-migrator"
 version = "2.0.0-alpha.27"
 dependencies = [
  "async-trait",
+ "evento",
  "evento-sql",
  "sea-query",
  "sqlx",
@@ -2106,6 +2112,17 @@ checksum = "b9c6658afe513a3b484e3abfdaa0d03ef3c0bbf017542c178dd55f94eb3051f9"
 dependencies = [
  "equivalent",
  "hashbrown 0.16.1",
+]
+
+[[package]]
+name = "quickstart"
+version = "2.0.0-alpha.27"
+dependencies = [
+ "anyhow",
+ "bitcode",
+ "evento",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

@@ -34,7 +34,7 @@
 //!
 //! Transform an enum into individual event structs:
 //!
-//! ```rust,ignore
+//! ```rust
 //! #[evento::aggregate]
 //! pub enum BankAccount {
 //!     /// Event raised when a new bank account is opened
@@ -65,8 +65,17 @@
 //!
 //! Projection handlers are used to build read models by replaying events:
 //!
-//! ```rust,ignore
-//! use evento::metadata::Event;
+//! ```rust,no_run
+//! use evento::{metadata::Event, Executor, Projection};
+//! # #[evento::aggregate]
+//! # pub enum BankAccount {
+//! #     MoneyDeposited { amount: i64 },
+//! # }
+//!
+//! #[evento::projection(bitcode::Encode, bitcode::Decode)]
+//! pub struct AccountBalanceView {
+//!     pub balance: i64,
+//! }
 //!
 //! #[evento::handler]
 //! async fn handle_money_deposited(
@@ -77,18 +86,30 @@
 //!     Ok(())
 //! }
 //!
+//! # async fn run<E: Executor>(executor: &E) -> anyhow::Result<()> {
 //! // Use in a projection
-//! let projection = Projection::<_, AccountBalanceView>::new::<BankAccount>()
+//! let view: Option<AccountBalanceView> = Projection::<_, AccountBalanceView>::new::<BankAccount>()
 //!     .handler(handle_money_deposited())
-//!     .load("account-123");
+//!     .load("account-123")
+//!     .execute(executor)
+//!     .await?;
+//! # Ok(()) }
 //! ```
 //!
 //! ## Creating Subscription Handlers with `#[evento::subscription]`
 //!
 //! Subscription handlers process events in real-time with side effects:
 //!
-//! ```rust,ignore
-//! use evento::{Executor, metadata::Event, subscription::Context};
+//! ```rust,no_run
+//! use evento::{
+//!     metadata::Event,
+//!     subscription::{Context, SubscriptionBuilder},
+//!     Executor,
+//! };
+//! # #[evento::aggregate]
+//! # pub enum BankAccount {
+//! #     MoneyDeposited { amount: i64 },
+//! # }
 //!
 //! #[evento::subscription]
 //! async fn on_money_deposited<E: Executor>(
@@ -100,20 +121,27 @@
 //!     Ok(())
 //! }
 //!
+//! # async fn run<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
 //! // Use in a subscription
-//! let subscription = SubscriptionBuilder::<Sqlite>::new("deposit-notifier")
+//! let subscription = SubscriptionBuilder::new("deposit-notifier")
 //!     .handler(on_money_deposited())
 //!     .routing_key("accounts")
-//!     .start(&executor)
+//!     .start(executor)
 //!     .await?;
+//! # subscription.shutdown().await?;
+//! # Ok(()) }
 //! ```
 //!
 //! ## Handling All Events with `#[evento::subscription_all]`
 //!
 //! Handle all events from an aggregate type without deserializing:
 //!
-//! ```rust,ignore
-//! use evento::{Executor, metadata::RawEvent, subscription::Context};
+//! ```rust
+//! use evento::{metadata::RawEvent, subscription::Context, Executor};
+//! # #[evento::aggregate]
+//! # pub enum BankAccount {
+//! #     MoneyDeposited { amount: i64 },
+//! # }
 //!
 //! #[evento::subscription_all]
 //! async fn on_any_account_event<E: Executor>(
@@ -129,19 +157,17 @@
 //!
 //! Automatically add cursor tracking to projection structs:
 //!
-//! ```rust,ignore
+//! ```rust
 //! #[evento::projection]
 //! #[derive(Debug)]
 //! pub struct AccountBalanceView {
 //!     pub balance: i64,
 //!     pub owner: String,
 //! }
-//!
-//! // Generates:
-//! // - Adds `pub cursor: String` field
-//! // - Implements `ProjectionCursor` trait
-//! // - Adds `Default` and `Clone` derives
 //! ```
+//!
+//! This adds a `pub cursor: String` field, implements `ProjectionCursor`, and adds
+//! the `Default` and `Clone` derives alongside any you wrote yourself.
 //!
 //! # Requirements
 //!
@@ -187,7 +213,7 @@ use syn::{parse_macro_input, DeriveInput, ItemFn};
 /// silently orphans previously written events. Pin the identity explicitly with
 /// the `name` option to decouple it from code names:
 ///
-/// ```rust,ignore
+/// ```rust
 /// #[evento::aggregate(name = "bank/BankAccount")]
 /// pub enum BankAccount {
 ///     /// Defaults to the variant name; override per variant if needed:
@@ -198,7 +224,7 @@ use syn::{parse_macro_input, DeriveInput, ItemFn};
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust
 /// #[evento::aggregate]
 /// pub enum BankAccount {
 ///     /// Event raised when account is opened
@@ -220,16 +246,17 @@ use syn::{parse_macro_input, DeriveInput, ItemFn};
 ///     owner_name: "John".into(),
 ///     initial_balance: 1000,
 /// };
+/// assert_eq!(event.initial_balance, 1000);
 /// ```
 ///
 /// # Additional Derives
 ///
 /// Pass additional derives as arguments:
 ///
-/// ```rust,ignore
+/// ```rust
 /// #[evento::aggregate(serde::Serialize, serde::Deserialize)]
 /// pub enum MyEvents {
-///     // variants...
+///     SomethingHappened { id: String },
 /// }
 /// ```
 ///
@@ -262,32 +289,41 @@ pub fn aggregate(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// `.routing_key(key)` — write the body once against
 /// `WriteBuilder::routing_key_opt`:
 ///
-/// ```rust,ignore
+/// ```rust
+/// use evento::Executor;
+/// # #[evento::aggregate]
+/// # pub enum BankAccount {
+/// #     MoneyTransferred { to: String, amount: i64 },
+/// # }
+///
+/// pub struct Command<E: Executor>(pub E);
+///
 /// #[evento::command]
 /// impl<E: Executor> Command<E> {
 ///     pub async fn transfer_money(
 ///         &self,
 ///         id: impl Into<String>,
-///         cmd: TransferMoney,
+///         to: String,
+///         amount: i64,
 ///         routing_key: Option<String>,
-///     ) -> Result<(), BankAccountError> {
-///         let Some(account) = self.load(id).await? else {
-///             return Err(BankAccountError::AccountNotFound);
-///         };
+///     ) -> anyhow::Result<()> {
 ///         // guards...
-///         account
-///             .write()?
+///         evento::append(id)
 ///             .routing_key_opt(routing_key)
-///             .event(&MoneyTransferred { /* ... */ })
+///             .event(&MoneyTransferred { to, amount })
 ///             .commit(&self.0)
 ///             .await?;
 ///         Ok(())
 ///     }
 /// }
 ///
+/// # async fn call<E: Executor>(command: Command<E>) -> anyhow::Result<()> {
 /// // Callers get the familiar pair:
-/// command.transfer_money("account-1", cmd).await?;
-/// command.transfer_money_with_routing("account-1", cmd, "eu-west").await?;
+/// command.transfer_money("account-1", "account-2".into(), 100).await?;
+/// command
+///     .transfer_money_with_routing("account-1", "account-2".into(), 100, "eu-west")
+///     .await?;
+/// # Ok(()) }
 /// ```
 ///
 /// Methods without a trailing `routing_key: Option<String>` parameter are
@@ -311,7 +347,7 @@ pub fn command(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// The function must have this signature:
 ///
-/// ```rust,ignore
+/// ```text
 /// async fn handler_name(
 ///     event: Event<EventType>,
 ///     projection: &mut ProjectionType,
@@ -327,8 +363,16 @@ pub fn command(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// # Example
 ///
-/// ```rust,ignore
-/// use evento::metadata::Event;
+/// ```rust,no_run
+/// use evento::{metadata::Event, Executor, Projection};
+/// # #[evento::aggregate]
+/// # pub enum BankAccount {
+/// #     MoneyDeposited { amount: i64 },
+/// # }
+/// # #[evento::projection(bitcode::Encode, bitcode::Decode)]
+/// # pub struct AccountBalanceView {
+/// #     pub balance: i64,
+/// # }
 ///
 /// #[evento::handler]
 /// async fn handle_money_deposited(
@@ -339,12 +383,15 @@ pub fn command(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///     Ok(())
 /// }
 ///
+/// # async fn run<E: Executor>(executor: &E) -> anyhow::Result<()> {
 /// // Register with projection
 /// let projection = Projection::<_, AccountBalanceView>::new::<BankAccount>()
 ///     .handler(handle_money_deposited());
 ///
 /// // Execute projection to get current state
-/// let result = projection.load("account-123").execute(&executor).await?;
+/// let result = projection.load("account-123").execute(executor).await?;
+/// # let _: Option<AccountBalanceView> = result;
+/// # Ok(()) }
 /// ```
 #[proc_macro_attribute]
 pub fn handler(_attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -363,13 +410,24 @@ pub fn handler(_attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust
+/// use evento::metadata::Event;
+/// # #[evento::aggregate]
+/// # pub enum MyAggregate {
+/// #     MyEvent { amount: i64 },
+/// # }
+/// # #[evento::projection(bitcode::Encode, bitcode::Decode)]
+/// # pub struct MyView {
+/// #     pub total: i64,
+/// # }
+///
 /// #[evento::debug_handler]
 /// async fn handle_event(
 ///     event: Event<MyEvent>,
 ///     projection: &mut MyView,
 /// ) -> anyhow::Result<()> {
-///     // ...
+///     projection.total += event.data.amount;
+///     Ok(())
 /// }
 /// ```
 #[proc_macro_attribute]
@@ -395,7 +453,7 @@ pub fn debug_handler(_attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// The function must have this signature:
 ///
-/// ```rust,ignore
+/// ```text
 /// async fn handler_name<E: Executor>(
 ///     context: &Context<'_, E>,
 ///     event: Event<EventType>,
@@ -411,8 +469,24 @@ pub fn debug_handler(_attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// # Example
 ///
-/// ```rust,ignore
-/// use evento::{Executor, metadata::Event, subscription::Context};
+/// ```rust,no_run
+/// use evento::{
+///     context::Data,
+///     metadata::Event,
+///     subscription::{Context, SubscriptionBuilder},
+///     Executor,
+/// };
+/// # #[evento::aggregate]
+/// # pub enum BankAccount {
+/// #     MoneyDeposited { amount: i64 },
+/// # }
+/// # #[derive(Clone)]
+/// # pub struct AppConfig {
+/// #     pub webhook_url: String,
+/// # }
+/// # async fn send_notification(_url: &str, _amount: i64) -> anyhow::Result<()> {
+/// #     Ok(())
+/// # }
 ///
 /// #[evento::subscription]
 /// async fn on_money_deposited<E: Executor>(
@@ -423,17 +497,20 @@ pub fn debug_handler(_attr: TokenStream, item: TokenStream) -> TokenStream {
 ///     let config: Data<AppConfig> = context.extract();
 ///
 ///     // Perform side effects
-///     send_notification(&event.data).await?;
+///     send_notification(&config.webhook_url, event.data.amount).await?;
 ///
 ///     Ok(())
 /// }
 ///
+/// # async fn run<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
 /// // Register with subscription
-/// let subscription = SubscriptionBuilder::<Sqlite>::new("deposit-notifier")
+/// let subscription = SubscriptionBuilder::new("deposit-notifier")
 ///     .handler(on_money_deposited())
 ///     .routing_key("accounts")
-///     .start(&executor)
+///     .start(executor)
 ///     .await?;
+/// # subscription.shutdown().await?;
+/// # Ok(()) }
 /// ```
 #[proc_macro_attribute]
 pub fn subscription(_attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -456,7 +533,7 @@ pub fn subscription(_attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// The function must have this signature:
 ///
-/// ```rust,ignore
+/// ```text
 /// async fn handler_name<E: Executor>(
 ///     context: &Context<'_, E>,
 ///     event: RawEvent<AggregateType>,
@@ -472,8 +549,16 @@ pub fn subscription(_attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// # Example
 ///
-/// ```rust,ignore
-/// use evento::{Executor, metadata::RawEvent, subscription::Context};
+/// ```rust,no_run
+/// use evento::{
+///     metadata::RawEvent,
+///     subscription::{Context, SubscriptionBuilder},
+///     Executor,
+/// };
+/// # #[evento::aggregate]
+/// # pub enum BankAccount {
+/// #     MoneyDeposited { amount: i64 },
+/// # }
 ///
 /// #[evento::subscription_all]
 /// async fn on_any_account_event<E: Executor>(
@@ -489,11 +574,14 @@ pub fn subscription(_attr: TokenStream, item: TokenStream) -> TokenStream {
 ///     Ok(())
 /// }
 ///
+/// # async fn run<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
 /// // Register with subscription - handles all BankAccount events
-/// let subscription = SubscriptionBuilder::<Sqlite>::new("account-auditor")
+/// let subscription = SubscriptionBuilder::new("account-auditor")
 ///     .handler(on_any_account_event())
-///     .start(&executor)
+///     .start(executor)
 ///     .await?;
+/// # subscription.shutdown().await?;
+/// # Ok(()) }
 /// ```
 #[proc_macro_attribute]
 pub fn subscription_all(_attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -507,9 +595,23 @@ pub fn subscription_all(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
 /// Derive macro for generating cursor structs and trait implementations.
 ///
+/// Each `#[cursor(Column::Variant, order)]` field becomes part of a keyset cursor,
+/// ordered by the given rank. The expansion binds against `sea_query` and
+/// `evento::sql`, so this derive requires a SQL backend feature on `evento` plus a
+/// direct `sea-query` dependency.
+///
 /// # Example
 ///
-/// ```ignore
+/// ```rust
+/// use evento::Cursor;
+/// use sea_query::Iden;
+///
+/// #[derive(Iden, Clone)]
+/// pub enum ContactAdmin {
+///     Id,
+///     CreatedAt,
+/// }
+///
 /// #[derive(Cursor)]
 /// pub struct AdminView {
 ///     #[cursor(ContactAdmin::Id, 1)]
@@ -556,7 +658,7 @@ pub fn derive_cursor(input: TokenStream) -> TokenStream {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust
 /// #[evento::projection]
 /// #[evento::snapshot(memory)]
 /// pub struct AccountDetailsView {
@@ -566,6 +668,7 @@ pub fn derive_cursor(input: TokenStream) -> TokenStream {
 ///
 /// // Read the materialized rows elsewhere:
 /// let rows = AccountDetailsView::snapshot_rows().read().unwrap();
+/// assert!(rows.is_empty());
 /// ```
 #[proc_macro_attribute]
 pub fn snapshot(attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -599,7 +702,7 @@ pub fn snapshot(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///   emitting events from the projection.
 /// - any path (e.g. `serde::Serialize`) — added to the derive list.
 ///
-/// ```ignore
+/// ```rust
 /// #[evento::projection(cursor = evento::cursor::Value, id = id, serde::Serialize)]
 /// pub struct MyView {
 ///     pub id: String,
@@ -608,24 +711,27 @@ pub fn snapshot(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```rust
 /// #[evento::projection]
 /// #[derive(Debug)]
 /// pub struct MyStruct {
 ///     pub id: String,
 ///     pub name: String,
 /// }
+/// ```
 ///
-/// // Generates:
-/// // #[derive(Default, Clone, Debug)]
-/// // pub struct MyStruct {
-/// //     pub id: String,
-/// //     pub name: String,
-/// //     pub cursor: String,
-/// //     pub aggregate_version: u16,
-/// // }
-/// //
-/// // impl evento::ProjectionCursor for MyStruct { ... }
+/// expands to:
+///
+/// ```text
+/// #[derive(Default, Clone, Debug)]
+/// pub struct MyStruct {
+///     pub id: String,
+///     pub name: String,
+///     pub cursor: String,
+///     pub aggregate_version: u16,
+/// }
+///
+/// impl evento::ProjectionCursor for MyStruct { ... }
 /// ```
 #[proc_macro_attribute]
 pub fn projection(attr: TokenStream, item: TokenStream) -> TokenStream {

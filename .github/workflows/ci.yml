@@ -15,4 +15,4 @@ jobs:
     with:
       mysql: true
       postgres: true
-      tests: '["make test.core", "make test.sql", "make test.fjall", "make test.accord", "make test.migrator", "make test.doc"]'
+      tests: '["make test.core", "make test.sql", "make test.fjall", "make test.accord", "make test.migrator", "make test.macro", "make test.doc", "make check.examples"]'

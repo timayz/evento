@@ -15,9 +15,31 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```rust,no_run
 //! use evento::projection::Projection;
 //!
+//! # use evento::metadata::Event;
+//! # #[evento::aggregate]
+//! # pub enum Account {
+//! #     AccountOpened { owner: String },
+//! #     MoneyDeposited { amount: i64 },
+//! # }
+//! # #[evento::projection(bitcode::Encode, bitcode::Decode)]
+//! # pub struct AccountView {
+//! #     pub owner: String,
+//! #     pub balance: i64,
+//! # }
+//! # #[evento::handler]
+//! # async fn account_opened(event: Event<AccountOpened>, view: &mut AccountView) -> anyhow::Result<()> {
+//! #     view.owner = event.data.owner.clone();
+//! #     Ok(())
+//! # }
+//! # #[evento::handler]
+//! # async fn money_deposited(event: Event<MoneyDeposited>, view: &mut AccountView) -> anyhow::Result<()> {
+//! #     view.balance += event.data.amount;
+//! #     Ok(())
+//! # }
+//! # async fn run<E: evento::Executor + Clone>(executor: &E) -> anyhow::Result<()> {
 //! // Define a projection with event handlers (no id at construction)
 //! let projection = Projection::<_, AccountView>::new::<Account>()
 //!     .handler(account_opened())
@@ -26,7 +48,7 @@
 //! // Load aggregate state for one id
 //! let result = projection
 //!     .load("account-123")
-//!     .execute(&executor)
+//!     .execute(executor)
 //!     .await?;
 //!
 //! // Or keep the projection auto-updated via a subscription
@@ -34,8 +56,10 @@
 //!     .handler(account_opened())
 //!     .handler(money_deposited())
 //!     .subscription("account-view")
-//!     .start(&executor)
+//!     .start(executor)
 //!     .await?;
+//! # Ok(())
+//! # }
 //! ```
 
 use std::{
@@ -64,6 +88,8 @@ pub struct Context<'a, E: Executor> {
     context: context::RwContext,
     /// Reference to the executor for database operations
     pub executor: &'a E,
+    /// The projection id the current event resolves to (the aggregate id, or
+    /// the co-key for secondary aggregates).
     pub id: String,
     revision: u16,
     aggregate_type: String,
@@ -295,24 +321,42 @@ impl<T: bitcode::Encode + bitcode::DecodeOwned + ProjectionCursor + Send + Sync,
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust,no_run
+/// # use evento::metadata::Event;
+/// # use evento::projection::Projection;
+/// # #[evento::aggregate]
+/// # pub enum Account {
+/// #     AccountOpened { owner: String },
+/// # }
+/// # #[evento::projection(bitcode::Encode, bitcode::Decode)]
+/// # pub struct AccountView {
+/// #     pub owner: String,
+/// # }
+/// # #[evento::handler]
+/// # async fn account_opened(event: Event<AccountOpened>, view: &mut AccountView) -> anyhow::Result<()> {
+/// #     view.owner = event.data.owner.clone();
+/// #     Ok(())
+/// # }
+/// # #[derive(Clone)]
+/// # struct AppConfig;
+/// # async fn run<E: evento::Executor + Clone>(executor: &E, app_config: AppConfig) -> anyhow::Result<()> {
 /// // Load a single aggregate
 /// let result = Projection::<_, AccountView>::new::<Account>()
 ///     .handler(account_opened())
-///     .handler(money_deposited())
-///     .data(app_config)
+///     .data(app_config.clone())
 ///     .load("account-123")
-///     .execute(&executor)
+///     .execute(executor)
 ///     .await?;
 ///
 /// // Start a subscription that keeps every aggregate up to date
 /// let subscription = Projection::<_, AccountView>::new::<Account>()
 ///     .handler(account_opened())
-///     .handler(money_deposited())
 ///     .data(app_config)
 ///     .subscription("account-view")
-///     .start(&executor)
+///     .start(executor)
 ///     .await?;
+/// # Ok(())
+/// # }
 /// ```
 pub struct Projection<E: Executor, P: Default + 'static> {
     aggregate_type: &'static str,

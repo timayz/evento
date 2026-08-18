@@ -171,15 +171,17 @@ pub trait Journal: Send + Sync + 'static {
     async fn record(&self, state: &CommandState) -> anyhow::Result<()>;
 
     /// Buffers a write that must be made durable no later than the next
-    /// [`flush`](Journal::flush). The default is the immediate [`record`] — fine
-    /// for journals that do not (or need not) batch their fsync.
+    /// [`flush`](Journal::flush). The default is the immediate
+    /// [`record`](Journal::record) — fine for journals that do not (or need
+    /// not) batch their fsync.
     async fn stage(&self, state: &CommandState) -> anyhow::Result<()> {
         self.record(state).await
     }
 
     /// Makes every write [`stage`](Journal::stage)d since the last flush durable,
     /// in one operation (a group-commit fsync). The default is a no-op, since a
-    /// non-batching journal's [`record`]/[`stage`] are already durable.
+    /// non-batching journal's [`record`](Journal::record)/[`stage`](Journal::stage)
+    /// are already durable.
     async fn flush(&self) -> anyhow::Result<()> {
         Ok(())
     }
@@ -222,7 +224,7 @@ pub trait Journal: Send + Sync + 'static {
     /// same per-entry idempotency as [`append_metadata`](Journal::append_metadata).
     /// Journals that batch their fsync should override this to make the whole run
     /// durable with one sync instead of one per entry. The default loops
-    /// [`append_metadata`].
+    /// [`append_metadata`](Journal::append_metadata).
     async fn append_metadata_batch(
         &self,
         entries: &[(u64, Vec<Vec<NodeId>>)],
@@ -712,7 +714,7 @@ impl Topology for DynamicTopology {
     }
 
     /// The **region-derived** electorate for `key`'s shard (see
-    /// [`electorate_for`](DynamicTopology::electorate_for)). A pure function of the
+    /// `DynamicTopology::electorate_for`). A pure function of the
     /// installed layout + region tags, so it is recomputed correctly after every
     /// epoch change with no extra state crossing consensus.
     fn fast_electorate(&self, key: &Key) -> Vec<NodeId> {

@@ -1,3 +1,16 @@
+//! Bank web app on the **embedded Fjall** store (`evento-fjall`) — no external
+//! database, no migrations.
+//!
+//! Events live in a temp directory (fresh per run); commands are executed
+//! through the shared `bank` domain crate, and a projection subscription keeps
+//! the in-memory read model (`AccountDetailsView::snapshot_rows()`) current so
+//! `/accounts` lists every account.
+//!
+//! ```text
+//! cargo run -p bank-axum-fjall
+//! # then open http://127.0.0.1:3000
+//! ```
+
 use std::sync::Arc;
 
 use askama::Template;
@@ -34,6 +47,15 @@ async fn main() -> anyhow::Result<()> {
 
     let executor: Executor = Fjall::open(dir.path())?;
 
+    // Keep the in-memory read model (`AccountDetailsView::snapshot_rows()`)
+    // current, so `/accounts` lists every account. Fjall's in-process write
+    // signal wakes the subscription the instant a command commits.
+    let subscription = account_details::create_projection()
+        .subscription(format!("account-details-{}", Ulid::generate()))
+        .all()
+        .start(&executor)
+        .await?;
+
     let state = AppState {
         executor: Arc::new(executor),
     };
@@ -50,7 +72,13 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
     println!("Listening on http://127.0.0.1:3000");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await?;
+
+    subscription.shutdown().await?;
 
     // Keep the temp directory alive until the server shuts down.
     drop(dir);

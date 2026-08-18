@@ -14,21 +14,45 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
-//! use evento::subscription::SubscriptionBuilder;
+//! ```rust,no_run
+//! use evento::metadata::Event;
+//! use evento::subscription::{Context, SubscriptionBuilder};
+//! use evento::Executor;
 //!
+//! # #[evento::aggregate]
+//! # pub enum Account {
+//! #     AccountOpened { owner: String },
+//! #     MoneyDeposited { amount: i64 },
+//! # }
+//! # #[evento::subscription]
+//! # async fn account_opened<E: Executor>(
+//! #     _ctx: &Context<'_, E>,
+//! #     _event: Event<AccountOpened>,
+//! # ) -> anyhow::Result<()> {
+//! #     Ok(())
+//! # }
+//! # #[evento::subscription]
+//! # async fn money_deposited<E: Executor>(
+//! #     _ctx: &Context<'_, E>,
+//! #     _event: Event<MoneyDeposited>,
+//! # ) -> anyhow::Result<()> {
+//! #     Ok(())
+//! # }
+//! # async fn run<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
 //! // Build a subscription with handlers
 //! let subscription = SubscriptionBuilder::new("my-subscription")
-//!     .handler(account_opened_handler)
-//!     .handler(money_deposited_handler)
+//!     .handler(account_opened())
+//!     .handler(money_deposited())
 //!     .routing_key("accounts")
 //!     .chunk_size(100)
 //!     .retry(5)
-//!     .start(&executor)
+//!     .start(executor)
 //!     .await?;
 //!
 //! // Later, gracefully shutdown
 //! subscription.shutdown().await?;
+//! # Ok(())
+//! # }
 //! ```
 
 use backon::{ExponentialBuilder, Retryable};
@@ -81,17 +105,31 @@ pub enum RoutingKey {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust,no_run
+/// use evento::context::Data;
+/// use evento::cursor::Args;
+/// use evento::metadata::Event;
+/// use evento::subscription::Context;
+/// use evento::Executor;
+///
+/// # #[evento::aggregate]
+/// # pub enum Account {
+/// #     MoneyDeposited { amount: i64 },
+/// # }
+/// # struct AppConfig;
 /// #[evento::subscription]
 /// async fn my_handler<E: Executor>(
 ///     context: &Context<'_, E>,
-///     event: Event<MyEventData>,
+///     event: Event<MoneyDeposited>,
 /// ) -> anyhow::Result<()> {
 ///     // Access shared data
 ///     let config: Data<AppConfig> = context.extract();
 ///
 ///     // Use executor for queries
-///     let events = context.executor.read(...).await?;
+///     let events = context
+///         .executor
+///         .read(None, None, Args::forward(10, None), None)
+///         .await?;
 ///     Ok(())
 /// }
 /// ```
@@ -136,24 +174,28 @@ pub trait Handler<E: Executor>: Sync + Send {
 
 /// Builder for creating event subscriptions.
 ///
-/// Created via [`Projection::subscription`](crate::projection::Projection::subscription), this builder configures
+/// Created with [`SubscriptionBuilder::new`], this builder configures
 /// a continuous event processing subscription with retry logic,
 /// routing key filtering, and graceful shutdown support.
 ///
 /// # Example
 ///
-/// ```rust,ignore
-/// let subscription = projection
-///     .subscription()
+/// ```rust,no_run
+/// # use std::time::Duration;
+/// # use evento::subscription::SubscriptionBuilder;
+/// # async fn run<E: evento::Executor + Clone>(executor: &E) -> anyhow::Result<()> {
+/// let subscription = SubscriptionBuilder::new("my-subscription")
 ///     .routing_key("accounts")
 ///     .chunk_size(100)
 ///     .retry(5)
 ///     .delay(Duration::from_secs(10))
-///     .start(&executor)
+///     .start(executor)
 ///     .await?;
 ///
 /// // Later, gracefully shutdown
 /// subscription.shutdown().await?;
+/// # Ok(())
+/// # }
 /// ```
 pub struct SubscriptionBuilder<E: Executor> {
     key: String,
@@ -987,16 +1029,19 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
 ///
 /// # Example
 ///
-/// ```rust,ignore
-/// let subscription = projection
-///     .subscription()
-///     .start(&executor)
+/// ```rust,no_run
+/// # use evento::subscription::SubscriptionBuilder;
+/// # async fn run<E: evento::Executor + Clone>(executor: &E) -> anyhow::Result<()> {
+/// let subscription = SubscriptionBuilder::new("my-subscription")
+///     .start(executor)
 ///     .await?;
 ///
 /// println!("Started subscription: {}", subscription.id);
 ///
 /// // On application shutdown
 /// subscription.shutdown().await?;
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Debug)]
 pub struct Subscription {

@@ -1,3 +1,19 @@
+//! Bank web app on **SQLite** (`evento-sql`) with schema migrations.
+//!
+//! An in-memory SQLite database is created and migrated on boot, commands are
+//! executed through the shared `bank` domain crate, and a projection
+//! subscription keeps the in-memory read model
+//! (`AccountDetailsView::snapshot_rows()`) current — so `/accounts` lists every
+//! account, not just the ones already visited.
+//!
+//! ```text
+//! cargo run -p bank-axum-sqlite
+//! # then open http://127.0.0.1:3000
+//! ```
+//!
+//! Domain errors (insufficient funds, frozen account, …) surface as
+//! `422 Unprocessable Entity` instead of being silently swallowed.
+
 use std::sync::Arc;
 
 use askama::Template;
@@ -9,8 +25,8 @@ use axum::{
     Form, Router,
 };
 use bank::{
-    account_details, AccountDetailsView, AccountType, Command, DepositMoney, OpenAccount,
-    TransferMoney, WithdrawMoney,
+    account_details, AccountDetailsView, AccountType, BankAccountError, Command, DepositMoney,
+    OpenAccount, TransferMoney, WithdrawMoney,
 };
 use evento::sql::Sql;
 use serde::Deserialize;
@@ -45,6 +61,15 @@ async fn main() -> anyhow::Result<()> {
 
     let executor: Executor = pool.into();
 
+    // Keep the in-memory read model (`AccountDetailsView::snapshot_rows()`)
+    // current. The cache is per-process, so a fresh per-boot subscription key
+    // replays all events and then streams new ones live.
+    let subscription = account_details::create_projection()
+        .subscription(format!("account-details-{}", Ulid::generate()))
+        .all()
+        .start(&executor)
+        .await?;
+
     let state = AppState {
         executor: Arc::new(executor),
     };
@@ -61,9 +86,26 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
     println!("Listening on http://127.0.0.1:3000");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await?;
 
+    subscription.shutdown().await?;
     Ok(())
+}
+
+/// Maps a command's outcome to an HTTP response: domain rejections become 422,
+/// infrastructure failures 500, success redirects to the account page.
+fn command_response(id: &str, result: Result<(), BankAccountError>) -> Response {
+    match result {
+        Ok(()) => Redirect::to(&format!("/accounts/{id}")).into_response(),
+        Err(BankAccountError::Server(err)) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, err).into_response()
+        }
+        Err(err) => (StatusCode::UNPROCESSABLE_ENTITY, err.to_string()).into_response(),
+    }
 }
 
 // Templates
@@ -128,11 +170,11 @@ struct CreateAccountForm {
 async fn create_account(
     State(state): State<AppState>,
     Form(form): Form<CreateAccountForm>,
-) -> impl IntoResponse {
+) -> Response {
     let cmd = Command(state.executor.as_ref().clone());
     let owner_id = Ulid::generate().to_string();
 
-    let id = cmd
+    match cmd
         .open_account(OpenAccount {
             owner_id,
             owner_name: form.owner_name,
@@ -141,18 +183,38 @@ async fn create_account(
             initial_balance: form.initial_balance,
         })
         .await
-        .unwrap();
-
-    Redirect::to(&format!("/accounts/{id}"))
+    {
+        Ok(id) => Redirect::to(&format!("/accounts/{id}")).into_response(),
+        Err(BankAccountError::Server(err)) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, err).into_response()
+        }
+        Err(err) => (StatusCode::UNPROCESSABLE_ENTITY, err.to_string()).into_response(),
+    }
 }
 
 async fn view_account(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
-    let row = account_details::load(state.executor.as_ref(), &id, "")
+    // The owner id lives on the view itself (set by AccountOpened): load the
+    // account's own events first, then re-load co-keyed with the owner so the
+    // owner's events (e.g. a name change) are folded in as well.
+    let row = match account_details::create_projection()
+        .load(&id)
+        .execute(state.executor.as_ref())
         .await
-        .unwrap();
+    {
+        Ok(Some(first)) => {
+            match account_details::load(state.executor.as_ref(), &id, first.owner_id).await {
+                Ok(row) => row,
+                Err(err) => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
+                }
+            }
+        }
+        Ok(None) => None,
+        Err(err) => return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    };
     let accounts = get_all_accounts();
 
     match row {
@@ -178,9 +240,9 @@ async fn deposit(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
     Form(form): Form<DepositForm>,
-) -> impl IntoResponse {
+) -> Response {
     let cmd = Command(state.executor.as_ref().clone());
-    let _ = cmd
+    let result = cmd
         .deposit_money(
             &id,
             DepositMoney {
@@ -191,7 +253,7 @@ async fn deposit(
         )
         .await;
 
-    Redirect::to(&format!("/accounts/{}", id))
+    command_response(&id, result)
 }
 
 #[derive(Deserialize)]
@@ -203,9 +265,9 @@ async fn withdraw(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
     Form(form): Form<WithdrawForm>,
-) -> impl IntoResponse {
+) -> Response {
     let cmd = Command(state.executor.as_ref().clone());
-    let _ = cmd
+    let result = cmd
         .withdraw_money(
             &id,
             WithdrawMoney {
@@ -216,7 +278,7 @@ async fn withdraw(
         )
         .await;
 
-    Redirect::to(&format!("/accounts/{}", id))
+    command_response(&id, result)
 }
 
 #[derive(Deserialize)]
@@ -229,9 +291,9 @@ async fn transfer(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
     Form(form): Form<TransferForm>,
-) -> impl IntoResponse {
+) -> Response {
     let cmd = Command(state.executor.as_ref().clone());
-    let _ = cmd
+    let result = cmd
         .transfer_money(
             &id,
             TransferMoney {
@@ -243,7 +305,7 @@ async fn transfer(
         )
         .await;
 
-    Redirect::to(&format!("/accounts/{}", id))
+    command_response(&id, result)
 }
 
 // Helper functions

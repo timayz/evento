@@ -4,23 +4,31 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
-//! use evento::{create, append};
+//! ```rust,no_run
+//! use evento::{append, create, Executor};
 //!
+//! # #[evento::aggregate]
+//! # pub enum Account {
+//! #     AccountOpened { owner: String },
+//! #     MoneyDeposited { amount: i64 },
+//! # }
+//! # async fn run<E: Executor>(executor: &E, existing_id: &str) -> anyhow::Result<()> {
 //! // Create a new aggregate with auto-generated ID
 //! let id = create()
 //!     .event(&AccountOpened { owner: "John".into() })
-//!     .metadata(&metadata)
+//!     .metadata("request_id", &"abc123".to_owned())
 //!     .routing_key("accounts")
-//!     .commit(&executor)
+//!     .commit(executor)
 //!     .await?;
 //!
 //! // Add events to existing aggregate
-//! append(&existing_id)
-//!     .original_version(current_version)
+//! append(existing_id)
+//!     .original_version(1)
 //!     .event(&MoneyDeposited { amount: 100 })
-//!     .commit(&executor)
+//!     .commit(executor)
 //!     .await?;
+//! # Ok(())
+//! # }
 //! ```
 
 use sha3::{Digest, Sha3_256};
@@ -60,7 +68,9 @@ pub enum WriteError {
     /// Events from more than one aggregate type were added to a single builder
     #[error("all events in one commit must belong to aggregate type {expected}, got {got}")]
     MixedAggregateTypes {
+        /// The aggregate type of the first event added to the builder.
         expected: &'static str,
+        /// The differing aggregate type of a later event.
         got: &'static str,
     },
 
@@ -86,13 +96,15 @@ pub enum WriteError {
 ///
 /// # Example
 ///
-/// ```rust,ignore
-/// #[evento::aggregate("myapp/Account")]
-/// #[derive(Default)]
-/// pub struct Account {
-///     pub balance: i64,
-///     pub owner: String,
+/// ```rust
+/// use evento::Aggregate;
+///
+/// #[evento::aggregate(name = "myapp/Account")]
+/// pub enum Account {
+///     AccountOpened { owner: String },
 /// }
+///
+/// assert_eq!(Account::aggregate_type(), "myapp/Account");
 /// ```
 pub trait Aggregate: Default {
     /// Returns the unique type identifier for this aggregate (e.g., "myapp/Account")
@@ -108,12 +120,18 @@ pub trait Aggregate: Default {
 ///
 /// # Example
 ///
-/// ```rust,ignore
-/// #[evento::aggregate("myapp/Account")]
-/// #[derive(bitcode::Encode, bitcode::Decode)]
-/// pub struct AccountOpened {
-///     pub owner: String,
+/// Each variant of an `#[evento::aggregate]` enum becomes an event struct
+/// implementing this trait:
+///
+/// ```rust
+/// use evento::AggregateEvent;
+///
+/// #[evento::aggregate]
+/// pub enum Account {
+///     AccountOpened { owner: String },
 /// }
+///
+/// assert_eq!(AccountOpened::event_name(), "AccountOpened");
 /// ```
 pub trait AggregateEvent: Aggregate {
     /// Returns the event name (e.g., "AccountOpened")
@@ -134,19 +152,28 @@ pub trait AggregateEvent: Aggregate {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust,no_run
+/// # use evento::{append, create, Executor};
+/// # #[evento::aggregate]
+/// # pub enum Counter {
+/// #     Incremented { by: i64 },
+/// #     Reset,
+/// # }
+/// # async fn run<E: Executor>(executor: &E) -> anyhow::Result<()> {
 /// // New aggregate
 /// let id = create()
-///     .event(&MyEvent { ... })
-///     .commit(&executor)
+///     .event(&Incremented { by: 1 })
+///     .commit(executor)
 ///     .await?;
 ///
 /// // Existing aggregate with version check
 /// append(&id)
 ///     .original_version(5)
-///     .event(&AnotherEvent { ... })
-///     .commit(&executor)
+///     .event(&Reset)
+///     .commit(executor)
 ///     .await?;
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Clone)]
 pub struct WriteBuilder {
@@ -224,11 +251,15 @@ impl WriteBuilder {
         self
     }
 
+    /// Records who initiated this commit (e.g. a user id) in the metadata of
+    /// all its events.
     pub fn requested_by(&mut self, value: impl Into<String>) -> &mut Self {
         self.metadata.set_requested_by(value);
         self
     }
 
+    /// Records the role or identity the initiator acted as (e.g. when
+    /// impersonating) in the metadata of all events of this commit.
     pub fn requested_as(&mut self, value: impl Into<String>) -> &mut Self {
         self.metadata.set_requested_as(value);
         self
@@ -341,11 +372,19 @@ impl WriteBuilder {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust,no_run
+/// # use evento::{create, Executor};
+/// # #[evento::aggregate]
+/// # pub enum Account {
+/// #     AccountOpened { owner: String },
+/// # }
+/// # async fn run<E: Executor>(executor: &E) -> anyhow::Result<()> {
 /// let id = create()
-///     .event(&AccountOpened { ... })
-///     .commit(&executor)
+///     .event(&AccountOpened { owner: "Alice".into() })
+///     .commit(executor)
 ///     .await?;
+/// # Ok(())
+/// # }
 /// ```
 pub fn create() -> WriteBuilder {
     WriteBuilder::new(Ulid::generate())
@@ -355,23 +394,37 @@ pub fn create() -> WriteBuilder {
 ///
 /// # Example
 ///
-/// ```rust,ignore
-/// append(&existing_id)
-///     .original_version(current_version)
+/// ```rust,no_run
+/// # use evento::{append, Executor};
+/// # #[evento::aggregate]
+/// # pub enum Account {
+/// #     MoneyDeposited { amount: i64 },
+/// # }
+/// # async fn run<E: Executor>(executor: &E, existing_id: &str) -> anyhow::Result<()> {
+/// append(existing_id)
+///     .original_version(1)
 ///     .event(&MoneyDeposited { amount: 100 })
-///     .commit(&executor)
+///     .commit(executor)
 ///     .await?;
+/// # Ok(())
+/// # }
 /// ```
 pub fn append(id: impl Into<String>) -> WriteBuilder {
     WriteBuilder::new(id)
 }
 
+/// Convenience queries about an aggregate's event stream, implemented for
+/// every [`Executor`].
 pub trait AggregateExt<E: Executor> {
+    /// Returns `true` if the aggregate `id` has at least one event of type `A`.
     fn has_event<A: AggregateEvent>(
         &self,
         id: impl Into<String>,
     ) -> impl std::future::Future<Output = anyhow::Result<bool>> + Send;
 
+    /// Returns the current version of the aggregate `id`'s stream (the version
+    /// of its most recent event), or `None` when the stream is empty. Useful
+    /// as input to `WriteBuilder::original_version` for optimistic concurrency.
     fn original_version<A: AggregateEvent>(
         &self,
         id: impl Into<String>,

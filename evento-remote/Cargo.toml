@@ -7,6 +7,9 @@ repository.workspace = true
 publish = true
 description = "Client/server remote executor for evento — serve any executor over framed TCP"
 documentation = "https://docs.rs/evento-remote"
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 evento-core = { path = "../evento-core", version = "2.0.0-alpha.27" }
@@ -25,3 +28,6 @@ bytes = "1"
 evento-fjall = { path = "../evento-fjall" }
 evento-test = { path = "../evento-test" }
 tempfile = "3.27"
+
+[lints]
+workspace = true

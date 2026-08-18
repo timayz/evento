@@ -12,20 +12,23 @@ description: >-
 # Evento — event sourcing in Rust
 
 Evento stores state changes as immutable events and folds them into read models.
-Backends: SQLite / PostgreSQL / MySQL (via `sqlx`) and embedded Fjall. Events are
-serialized with `bitcode`.
+Backends: SQLite / PostgreSQL / MySQL (via `sqlx`), embedded Fjall, a remote
+client/server executor (`remote`), and a consensus-replicated executor
+(`evento-accord`, alpha). Events are serialized with `bitcode`.
 
 ## Setup
 
+2.x is a pre-release — pin the exact version (a bare `"2"` won't resolve):
+
 ```toml
 [dependencies]
-evento = { version = "2", features = ["sqlite"] }  # or "postgres", "mysql", "fjall"
+evento = { version = "2.0.0-alpha.27", features = ["sqlite"] }  # or "postgres", "mysql", "fjall", "remote"
 bitcode = "0.6"
 anyhow = "1"
 tokio = { version = "1", features = ["full"] }
 ```
 
-Feature flags: `sqlite` / `postgres` / `mysql` / `fjall`, `sql` (all SQL),
+Feature flags: `sqlite` / `postgres` / `mysql` / `fjall` / `remote`, `sql` (all SQL),
 `macro` (default, the proc-macros), `group` (multi-executor), `rw` (read/write split).
 
 ### Executor + migrations (SQL)
@@ -64,6 +67,10 @@ pub enum Account {
 // unit struct `Account`. Pass extra derives: `#[evento::aggregate(serde::Serialize)]`.
 ```
 
+Pin on-disk identities so refactors never orphan stored events:
+`#[evento::aggregate(name = "bank/BankAccount")]` on the enum,
+`#[evento(name = "opened.v1")]` on a variant.
+
 ## 2. Write events
 
 `create()` starts a new aggregate (auto-generated ULID id, returned by `commit`).
@@ -71,11 +78,9 @@ pub enum Account {
 concurrency — `commit` returns `WriteError::InvalidOriginalVersion` on a race.
 
 ```rust
-use evento::metadata::Metadata;
-
 let id = evento::create()
     .event(&AccountOpened { owner: "Alice".into(), initial_balance: 1000 })
-    .metadata(&Metadata::default())   // or .requested_by("user-1")
+    .metadata("request_id", &req_id)  // key/value; or .requested_by("user-1") / .metadata_from(m)
     .routing_key("accounts")          // optional partition key; .routing_key_opt(Option<String>)
     .commit(&executor)
     .await?;
@@ -94,8 +99,11 @@ evento::append(&id)
 ## 3. Projections (read models)
 
 `#[evento::projection]` adds a `cursor` field and implements `ProjectionCursor`.
-`#[evento::handler]` turns an async fn into a pure handler. Handler signature is
-`(event: Event<SomeEvent>, view: &mut View)` — note the event comes first.
+Options: `cursor = <Type>` (custom cursor type, e.g. `evento::cursor::Value`);
+`id = <field>` (also implements `ProjectionAggregate` → enables `view.write()`);
+extra derive paths (e.g. `bitcode::Encode, bitcode::Decode` for executor-backed
+snapshots). `#[evento::handler]` turns an async fn into a pure handler. Handler
+signature is `(event: Event<SomeEvent>, view: &mut View)` — the event comes first.
 
 ```rust
 use evento::{metadata::Event, projection::Projection};
@@ -131,34 +139,58 @@ let view: Option<AccountView> = Projection::<_, AccountView>::new::<Account>()
 `ProjectionSubscription`. On `LoadBuilder`, register related aggregates with
 `.aggregate::<Other>(other_id)` and read them in a handler via `context.aggregate::<Other>()`.
 
-### Snapshots
+### Snapshots — three modes
 
-Any projection that is `bitcode::Encode + DecodeOwned` gets snapshots for free
-(stored via the executor). Override the `Snapshot` trait for a custom store.
+- **Executor-backed** (default): give the projection bitcode derives —
+  `#[evento::projection(bitcode::Encode, bitcode::Decode)]` — and snapshots are
+  persisted via the executor (blanket `Snapshot` impl).
+- **`#[evento::snapshot(memory)]`**: process-local table keyed by aggregate id;
+  read materialized rows with `View::snapshot_rows().read().unwrap()`.
+- **`#[evento::snapshot(none)]`**: no snapshots, always replay.
 
-### Emitting events from a projection (command pattern)
+Projections backed by a custom table (SQL, …) implement `Snapshot` by hand.
 
-Implement `ProjectionAggregate` and call `.write()` (the write gateway) to get a
-`WriteBuilder` pre-filled with the aggregate id + version:
+### Commands and the write gateway (`#[evento::command]`)
+
+The write model is a projection with `id = <field>` (this implements
+`ProjectionAggregate`, whose `write()` returns a `WriteBuilder` pre-filled with
+the aggregate id + the version the load observed — optimistic concurrency for
+free). `#[evento::command]` on an impl block turns each method with a trailing
+`routing_key: Option<String>` parameter into three wrappers: `x(..)`,
+`x_with_routing(.., key)`, `x_opt(.., Option<String>)`.
 
 ```rust
-use evento::projection::ProjectionAggregate;
+use evento::{Executor, Projection, ProjectionAggregate};
 
-impl ProjectionAggregate for AccountView {
-    fn aggregate_id(&self) -> String { /* a field populated from the first event */ self.owner.clone() }
+#[evento::projection(id = id)]
+#[evento::snapshot(memory)]
+pub struct BankAccount { pub id: String, pub balance: i64 /* … */ }
+
+pub struct Command<E: Executor>(pub E);
+
+#[evento::command]
+impl<E: Executor> Command<E> {
+    pub async fn withdraw_money(
+        &self,
+        id: impl Into<String>,
+        amount: i64,
+        routing_key: Option<String>,
+    ) -> anyhow::Result<()> {
+        // load -> guard -> write
+        let Some(account) = account_projection().load(id).execute(&self.0).await? else {
+            anyhow::bail!("not found");
+        };
+        if amount <= 0 { anyhow::bail!("invalid amount"); }
+        account.write()?
+            .routing_key_opt(routing_key)
+            .event(&MoneyWithdrawn { amount })
+            .commit(&self.0)
+            .await?;
+        Ok(())
+    }
 }
-
-// In a command: load -> validate -> write
-let Some(view) = projection.load(&id).execute(&executor).await? else {
-    anyhow::bail!("not found");
-};
-view.write()?                              // pre-configured id + original_version
-    .event(&MoneyWithdrawn { amount: 50 })
-    .commit(&executor)
-    .await?;
+// Callers: cmd.withdraw_money(id, 50).await? / cmd.withdraw_money_with_routing(id, 50, "eu").await?
 ```
-
-`aggregate_id()` is **required** (no default). `aggregate_version()` comes from the cursor.
 
 ## 4. Subscriptions (continuous side effects)
 
@@ -201,9 +233,10 @@ sub.shutdown().await?;
 use evento::{EventFilter, cursor::Args};
 
 let page = executor.read(
-    Some(vec![EventFilter::by_id("mycrate/Account", &id)]),  // by_type / by_event / exact
-    None,                                                    // routing key filter
-    Args::forward(50, None),                                 // cursor pagination
+    Some([EventFilter::by_id("mycrate/Account", &id)].into()),  // by_type / by_event / exact
+    None,                                                       // routing key filter
+    Args::forward(50, None),                                    // cursor pagination
+    None,                                                       // exclusive timestamp bound (µs)
 ).await?;
 ```
 
@@ -228,7 +261,12 @@ let page = executor.read(
 ## Reference
 
 Canonical, compiling usage lives in this repo:
-- `examples/bank/` — aggregates, commands (write path), queries/projections, snapshots.
-- `examples/bank-axum-sqlite/` and `examples/bank-axum-fjall/` — web wiring + migrations.
+- `examples/quickstart/` — smallest end-to-end run (aggregate → command → load → subscription).
+- `examples/bank/` — aggregates, `#[evento::command]` commands, queries/projections
+  (one per snapshot mode), co-keyed `Owner` aggregate.
+- `examples/bank-axum-sqlite/` and `examples/bank-axum-fjall/` — web wiring,
+  migrations, projection subscriptions; `bank-axum-remote/` (client/server split)
+  and `bank-axum-accord/` (consensus cluster).
+- `evento-macro/README.md` — full macro reference (all options).
 - `evento-test/src/lib.rs` — the behavioral contract suite (load, routing isolation,
   snapshots, optimistic locking, multi-aggregate, full command lifecycle).

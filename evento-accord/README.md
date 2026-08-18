@@ -10,6 +10,10 @@ single global serial order and no elected leader, tolerating `f` failures.
 > [`DESIGN.md`](./DESIGN.md) for the architecture and milestone plan, and
 > [`OPERATIONS.md`](./OPERATIONS.md) for the deployment/ops runbook.
 
+Part of the [evento](https://github.com/timayz/evento#readme) event sourcing toolkit;
+see [`examples/bank-axum-accord`](../examples/bank-axum-accord) for a runnable 1- or
+3-node demo (`make accord` / `make accord.cluster`).
+
 ## What works
 
 - **`AccordExecutor`** — a drop-in `evento_core::Executor`. Writes are

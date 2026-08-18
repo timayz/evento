@@ -1,3 +1,4 @@
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
 //! SQL database migrations for the Evento event sourcing library.
 //!
 //! This crate provides database schema migrations required for storing events, snapshots,
@@ -22,9 +23,10 @@
 //! The main entry point is the [`new`] function, which creates a [`Migrator`]
 //! instance configured with all Evento migrations.
 //!
-//! ```rust,ignore
+//! ```rust,no_run
 //! use sqlx_migrator::{Migrate, Plan};
 //!
+//! # async fn run(pool: sqlx::SqlitePool) -> Result<(), Box<dyn std::error::Error>> {
 //! // Acquire a database connection
 //! let mut conn = pool.acquire().await?;
 //!
@@ -33,12 +35,18 @@
 //!
 //! // Run all pending migrations
 //! migrator.run(&mut *conn, &Plan::apply_all()).await?;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! When using the main `evento` crate, the migrator is re-exported:
 //!
-//! ```rust,ignore
+//! ```rust,no_run
+//! # fn run() -> Result<(), Box<dyn std::error::Error>> {
 //! let migrator = evento::sql_migrator::new::<sqlx::Sqlite>()?;
+//! # let _ = migrator;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! # Migrations
@@ -116,9 +124,12 @@ pub use m0006::M0006;
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust,no_run
 /// use sqlx_migrator::{Migrate, Plan};
 ///
+/// # async fn run(
+/// #     conn: &mut sqlx::pool::PoolConnection<sqlx::MySql>,
+/// # ) -> Result<(), Box<dyn std::error::Error>> {
 /// // For SQLite
 /// let migrator = evento_sql_migrator::new::<sqlx::Sqlite>()?;
 ///
@@ -129,7 +140,9 @@ pub use m0006::M0006;
 /// let migrator = evento_sql_migrator::new::<sqlx::MySql>()?;
 ///
 /// // Run migrations
-/// migrator.run(&mut *conn, &Plan::apply_all()).await?;
+/// migrator.run(&mut **conn, &Plan::apply_all()).await?;
+/// # Ok(())
+/// # }
 /// ```
 ///
 /// # Errors
@@ -158,6 +171,38 @@ where
     Ok(migrator)
 }
 
+/// Creates a new [`Migrator`] instance with all Evento migrations registered.
+///
+/// This is the `accord` variant: identical to the default build, plus the
+/// consensus-journal migration ([`AccordMigration`]) required by
+/// `evento-accord`'s SQL journal.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use sqlx_migrator::{Migrate, Plan};
+///
+/// # async fn run(
+/// #     conn: &mut sqlx::pool::PoolConnection<sqlx::MySql>,
+/// # ) -> Result<(), Box<dyn std::error::Error>> {
+/// // For SQLite
+/// let migrator = evento_sql_migrator::new::<sqlx::Sqlite>()?;
+///
+/// // For PostgreSQL
+/// let migrator = evento_sql_migrator::new::<sqlx::Postgres>()?;
+///
+/// // For MySQL
+/// let migrator = evento_sql_migrator::new::<sqlx::MySql>()?;
+///
+/// // Run migrations
+/// migrator.run(&mut **conn, &Plan::apply_all()).await?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// # Errors
+///
+/// Returns an error if migration registration fails.
 #[cfg(feature = "accord")]
 pub fn new<DB: sqlx::Database>() -> Result<Migrator<DB>, sqlx_migrator::Error>
 where

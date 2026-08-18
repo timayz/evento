@@ -5,9 +5,11 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = true
-description = "A collection of libraries and tools that help you build DDD, CQRS, and event sourcing."
-documentation = "https://docs.rs/evento"
+description = "Procedural macros for the evento event sourcing toolkit."
+documentation = "https://docs.rs/evento-macro"
 readme = "README.md"
+keywords = ["event-sourcing", "cqrs", "ddd", "macros", "derive"]
+categories = ["database", "development-tools::procedural-macro-helpers"]
 
 [lib]
 proc-macro = true
@@ -19,7 +21,12 @@ syn.workspace = true
 
 [dev-dependencies]
 trybuild = "1"
-evento.workspace = true
+# `sqlite` pulls in `evento::sql`, which the `Cursor` derive expands against.
+evento = { workspace = true, features = ["sqlite"] }
 anyhow.workspace = true
 bitcode.workspace = true
 serde.workspace = true
+sea-query.workspace = true
+
+[lints]
+workspace = true

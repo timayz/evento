@@ -11,8 +11,13 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```rust,no_run
 //! use evento::metadata::Metadata;
+//! # use evento::{create, Executor};
+//! # #[evento::aggregate]
+//! # pub enum Account {
+//! #     AccountOpened { owner: String },
+//! # }
 //!
 //! // Create default metadata (anonymous)
 //! let mut metadata = Metadata::default();
@@ -23,17 +28,22 @@
 //! // Set who the request is on behalf of (for impersonation)
 //! metadata.set_requested_as("impersonated-user-789");
 //!
+//! # async fn run<E: Executor>(executor: &E, metadata: Metadata) -> anyhow::Result<()> {
 //! // Use with event creation
 //! create()
-//!     .event(&my_event)
-//!     .metadata(&metadata)
-//!     .commit(&executor)
+//!     .event(&AccountOpened { owner: "Alice".into() })
+//!     .metadata_from(metadata)
+//!     .commit(executor)
 //!     .await?;
+//! # Ok(())
+//! # }
 //!
+//! # fn read(event: &evento::Event) {
 //! // Access metadata from events
 //! if let Ok(user_id) = event.metadata.requested_by() {
 //!     println!("Requested by: {}", user_id);
 //! }
+//! # }
 //! ```
 
 use std::{collections::HashMap, marker::PhantomData, ops::Deref};
@@ -46,9 +56,11 @@ const REQUESTED_AS: &str = "EVENTO_REQUESTED_AS";
 /// Errors when accessing metadata fields.
 #[derive(Debug, Error)]
 pub enum MetadataError {
+    /// No entry exists under the requested key.
     #[error("not found")]
     NotFound,
 
+    /// The stored bytes could not be decoded as the requested type.
     #[error("decode: {0}")]
     Decode(#[from] bitcode::Error),
 }
@@ -75,6 +87,7 @@ impl Metadata {
         self
     }
 
+    /// Decodes the entry stored under `key`.
     pub fn try_get<D: bitcode::DecodeOwned>(&self, key: &str) -> Result<D, MetadataError> {
         let Some(value) = self.meta.get(key) else {
             return Err(MetadataError::NotFound);
@@ -83,6 +96,7 @@ impl Metadata {
         Ok(bitcode::decode(value)?)
     }
 
+    /// Sets the role or identity the initiator acted as.
     pub fn set_requested_as(&mut self, value: impl Into<String>) -> &mut Self {
         let value = value.into();
         self.insert_enc(REQUESTED_AS, &value);
@@ -90,10 +104,12 @@ impl Metadata {
         self
     }
 
+    /// Returns the role or identity the initiator acted as.
     pub fn requested_as(&self) -> Result<String, MetadataError> {
         self.try_get(REQUESTED_AS)
     }
 
+    /// Sets who initiated the commit (e.g. a user id).
     pub fn set_requested_by(&mut self, value: impl Into<String>) -> &mut Self {
         let value = value.into();
         self.insert_enc(REQUESTED_BY, &value);
@@ -101,6 +117,7 @@ impl Metadata {
         self
     }
 
+    /// Returns who initiated the commit.
     pub fn requested_by(&self) -> Result<String, MetadataError> {
         self.try_get(REQUESTED_BY)
     }
@@ -141,9 +158,17 @@ impl From<&Metadata> for Metadata {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust,no_run
 /// use evento::metadata::Event;
 ///
+/// # #[evento::aggregate]
+/// # pub enum Account {
+/// #     MoneyDeposited { amount: i64 },
+/// # }
+/// # #[evento::projection(bitcode::Encode, bitcode::Decode)]
+/// # pub struct AccountView {
+/// #     pub balance: i64,
+/// # }
 /// #[evento::handler]
 /// async fn handle_deposit(
 ///     event: Event<MoneyDeposited>,

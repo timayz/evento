@@ -30,9 +30,9 @@ use sqlx::types::Type;
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust,no_run
+/// use bitcode::{Decode, Encode};
 /// use evento_sql::sql_types::Bitcode;
-/// use bitcode::{Encode, Decode};
 ///
 /// #[derive(Encode, Decode)]
 /// struct MyData {
@@ -40,15 +40,18 @@ use sqlx::types::Type;
 ///     name: String,
 /// }
 ///
+/// # fn run() -> Result<(), bitcode::Error> {
 /// // Wrap data for storage
 /// let data = Bitcode(MyData { value: 42, name: "test".into() });
 ///
 /// // Encode to bytes
-/// let bytes = data.encode_to()?;
+/// let bytes = data.encode_to();
 ///
 /// // Decode from bytes
 /// let decoded = Bitcode::<MyData>::decode_from_bytes(&bytes)?;
 /// assert_eq!(decoded.value, 42);
+/// # Ok(())
+/// # }
 /// ```
 ///
 /// # Deref
