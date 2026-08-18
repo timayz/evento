@@ -1,114 +1,39 @@
 # evento-sql-migrator
 
-SQL database migrations for the [Evento](https://github.com/timayz/evento) event sourcing library.
+Database schema migrations for the [evento](https://github.com/timayz/evento) SQL
+backend ([evento-sql](https://crates.io/crates/evento-sql)), built on
+[sqlx_migrator](https://crates.io/crates/sqlx_migrator). Supports SQLite, MySQL, and
+PostgreSQL through feature flags.
 
-## Overview
-
-This crate provides database schema migrations required for storing events and subscriber state in SQL databases. It supports SQLite, MySQL, and PostgreSQL.
-
-## Installation
-
-Add to your `Cargo.toml`:
+Most applications use it through the [`evento`](https://crates.io/crates/evento)
+facade, where it is re-exported as `evento::sql_migrator`:
 
 ```toml
 [dependencies]
-evento-sql-migrator = "1.8"
+evento = { version = "2.0.0-alpha.27", features = ["sqlite"] }
 ```
 
-By default, all database backends are enabled. To use only specific databases:
+Run all migrations before creating the executor (the snippet needs a database feature
+enabled, e.g. `sqlite`):
 
-```toml
-[dependencies]
-evento-sql-migrator = { version = "1.8", default-features = false, features = ["postgres"] }
-```
-
-## Features
-
-- `sqlite` - SQLite database support
-- `mysql` - MySQL database support
-- `postgres` - PostgreSQL database support
-
-## Usage
-
-```rust
+```rust,no_run
 use sqlx_migrator::{Migrate, Plan};
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    // Create your database connection pool
-    let pool = sqlx::SqlitePool::connect(":memory:").await?;
-
-    // Acquire a connection
-    let mut conn = pool.acquire().await?;
-
-    // Create the migrator for your database type
-    let migrator = evento_sql_migrator::new::<sqlx::Sqlite>()?;
-
-    // Run all pending migrations
-    migrator.run(&mut *conn, &Plan::apply_all()).await?;
-
-    Ok(())
-}
+# #[cfg(feature = "sqlite")]
+# async fn run(pool: sqlx::SqlitePool) -> anyhow::Result<()> {
+let mut conn = pool.acquire().await?;
+evento_sql_migrator::new::<sqlx::Sqlite>()?
+    .run(&mut *conn, &Plan::apply_all())
+    .await?;
+# Ok(())
+# }
 ```
 
-When using the main `evento` crate, the migrator is re-exported:
+The resulting schema (event, snapshot, and subscriber tables) is documented in the
+[crate docs](https://docs.rs/evento-sql-migrator).
 
-```rust
-let migrator = evento::sql_migrator::new::<sqlx::Sqlite>()?;
-migrator.run(&mut *conn, &Plan::apply_all()).await?;
-```
+## Learn more
 
-## Migrations
-
-The crate includes the following migrations:
-
-| Migration | Description |
-|-----------|-------------|
-| `InitMigration` | Creates the initial schema (event, snapshot, subscriber tables) |
-| `M0002` | Adds `timestamp_subsec` column for sub-second precision |
-| `M0003` | Drops snapshot table, extends event name column to VARCHAR(50) |
-
-## Database Schema
-
-After running all migrations, the following tables are created:
-
-### Event Table
-
-Stores all domain events:
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `id` | VARCHAR(26) | Event ID (ULID format) |
-| `name` | VARCHAR(50) | Event type name |
-| `aggregator_type` | VARCHAR(50) | Aggregate root type |
-| `aggregator_id` | VARCHAR(26) | Aggregate root instance ID |
-| `version` | INTEGER | Event sequence number |
-| `data` | BLOB | Serialized event data |
-| `metadata` | BLOB | Serialized event metadata |
-| `routing_key` | VARCHAR(50) | Optional routing key |
-| `timestamp` | BIGINT | Event timestamp (seconds) |
-| `timestamp_subsec` | BIGINT | Sub-second precision |
-
-**Indexes:**
-- `idx_event_type` - On `aggregator_type`
-- `idx_event_type_id` - On `(aggregator_type, aggregator_id)`
-- `idx_event_routing_key_type` - On `(routing_key, aggregator_type)`
-- Unique constraint on `(aggregator_type, aggregator_id, version)`
-
-### Subscriber Table
-
-Tracks event subscription progress:
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `key` | VARCHAR(50) | Subscriber identifier (primary key) |
-| `worker_id` | VARCHAR(26) | Associated worker ID |
-| `cursor` | TEXT | Current event stream position |
-| `lag` | INTEGER | Subscription lag counter |
-| `enabled` | BOOLEAN | Whether subscription is active |
-| `created_at` | TIMESTAMP | Creation timestamp |
-| `updated_at` | TIMESTAMP | Last update timestamp |
-
-## License
-
-See the [LICENSE](../LICENSE) file in the repository root.
+- [API documentation](https://docs.rs/evento-sql-migrator)
+- [Workspace README](https://github.com/timayz/evento#readme)
+- Runnable example: [`bank-axum-sqlite`](https://github.com/timayz/evento/tree/main/examples/bank-axum-sqlite)
