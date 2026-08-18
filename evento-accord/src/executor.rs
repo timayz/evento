@@ -19,6 +19,8 @@
 //! so a node's local backend holds the whole log and serves complete reads.
 //! Routing reads to owning shards in a multi-shard cluster is a later layer.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use evento_core::{
     cursor::{Args, ReadResult, Value},
@@ -48,7 +50,7 @@ const SNAPSHOT_PAGE_SIZE: u16 = 4096;
 /// wrong key — a forwarded read goes to the wrong shard, and a read barrier
 /// fences the wrong conflict set.
 fn target_key(
-    aggregators: &Option<Vec<EventFilter>>,
+    aggregators: &Option<Arc<[EventFilter]>>,
     routing_key: &Option<RoutingKey>,
 ) -> Option<Key> {
     if let Some(RoutingKey::Value(Some(key))) = routing_key {
@@ -113,7 +115,7 @@ impl<E: Executor> DataStore for ExecutorDataStore<E> {
 
     async fn read(
         &self,
-        aggregators: Option<Vec<EventFilter>>,
+        aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<RoutingKey>,
         args: Args,
         to_micros: Option<u64>,
@@ -210,7 +212,7 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
 
     async fn read(
         &self,
-        aggregators: Option<Vec<EventFilter>>,
+        aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<RoutingKey>,
         args: Args,
         to_micros: Option<u64>,
@@ -243,7 +245,7 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
 
     async fn latest_timestamp(
         &self,
-        aggregators: Option<Vec<EventFilter>>,
+        aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<RoutingKey>,
     ) -> anyhow::Result<u64> {
         self.local.latest_timestamp(aggregators, routing_key).await

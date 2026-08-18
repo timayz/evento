@@ -75,7 +75,7 @@ impl ExecCluster {
     async fn read_all(&self, node: usize, id: &str) -> Vec<Event> {
         let result = self.execs[node]
             .read(
-                Some(vec![EventFilter::by_id("test/Account", id)]),
+                Some([EventFilter::by_id("test/Account", id)].into()),
                 None,
                 Args::forward(50, None),
                 None,

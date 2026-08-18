@@ -134,6 +134,11 @@ struct ShardPlan {
     electorate: Vec<NodeId>,
     fast_q: usize,
     slow_q: usize,
+    /// This shard's slice of the transaction's keys — what PreAccept / Accept /
+    /// Commit carry to this shard's replicas instead of the full set.
+    keys: Vec<Key>,
+    /// This shard's slice of the transaction's events.
+    events: Vec<Event>,
 }
 
 /// One replica's recovery report, extracted from a `RecoverOk`.
@@ -885,14 +890,16 @@ impl Node {
                 txn,
                 execute_at,
                 deps,
+                keys,
                 events,
                 reply_to,
             } => {
                 self.clock.witness(execute_at);
-                // Keys derived from the FULL event set (then filtered to owned),
-                // so a replica that missed PreAccept still indexes this
-                // transaction in its conflict graph.
-                let keys = self.owned_keys(Self::keys_of(&events));
+                // The coordinator ships this shard's keys explicitly, so a
+                // replica that missed PreAccept still indexes this transaction
+                // in its conflict graph. The owned filters stay as defense
+                // against a stale-epoch coordinator's view of ownership.
+                let keys = self.owned_keys(keys);
                 let events = self.owned_events(events);
                 self.replica
                     .lock()
@@ -1158,7 +1165,7 @@ impl Node {
             } => {
                 let result = self
                     .datastore
-                    .read(aggregators, routing_key, args, to_micros)
+                    .read(aggregators.map(Arc::from), routing_key, args, to_micros)
                     .await
                     .unwrap_or_default();
                 let page_info = result.page_info;
@@ -1434,23 +1441,26 @@ impl Node {
         keys: Vec<Key>,
         events: Vec<Event>,
     ) -> anyhow::Result<(CommitOutcome, bool)> {
-        let (plans, union) = self.plan(&keys);
+        let (plans, _union) = self.plan(&keys, &events);
 
         let t0 = self.clock.now();
         let txn = TxnId(t0);
         let mut rx = self.register(txn);
 
         // PreAccept: a fast quorum per shard, or whatever arrives before the
-        // fast-path timeout.
-        self.broadcast(
-            &union,
-            Message::PreAccept {
-                txn,
-                keys: keys.clone(),
-                events: events.clone(),
-            },
-        )
-        .await;
+        // fast-path timeout. Each shard's replicas receive only that shard's
+        // keys/events — one encode per shard, no cross-shard payload.
+        for plan in &plans {
+            self.broadcast(
+                &plan.replicas,
+                Message::PreAccept {
+                    txn,
+                    keys: plan.keys.clone(),
+                    events: plan.events.clone(),
+                },
+            )
+            .await;
+        }
         // Stop as soon as each shard's **electorate** has returned a fast quorum
         // (the latency win: a coordinator co-located with the electorate need not
         // wait for remote, non-electorate replicas), or at the fast-path timeout.
@@ -1553,19 +1563,17 @@ impl Node {
         if !all_fast {
             for plan in &plans {
                 let deps: Vec<TxnId> = shard_deps[&plan.shard].iter().copied().collect();
-                for &node in &plan.replicas {
-                    self.send(
-                        node,
-                        Message::Accept {
-                            txn,
-                            ballot: Ballot(t0),
-                            execute_at,
-                            deps: deps.clone(),
-                            keys: keys.clone(),
-                        },
-                    )
-                    .await;
-                }
+                self.broadcast(
+                    &plan.replicas,
+                    Message::Accept {
+                        txn,
+                        ballot: Ballot(t0),
+                        execute_at,
+                        deps,
+                        keys: plan.keys.clone(),
+                    },
+                )
+                .await;
             }
             let acks = self
                 .collect_by_shard(
@@ -1597,14 +1605,15 @@ impl Node {
         }
 
         let conflict = self
-            .execute(&mut rx, &plans, txn, execute_at, shard_deps, events)
+            .execute(&mut rx, &plans, txn, execute_at, shard_deps)
             .await?;
         self.deregister(txn);
         Ok((CommitOutcome { txn, conflict }, all_fast))
     }
 
     /// Commit → Read → Apply: drive the atomic decision across all touched
-    /// shards and return whether the write was aborted.
+    /// shards (each plan carries its shard's keys/events slice) and return
+    /// whether the write was aborted.
     async fn execute(
         &self,
         rx: &mut mpsc::UnboundedReceiver<(NodeId, Message)>,
@@ -1612,11 +1621,11 @@ impl Node {
         txn: TxnId,
         execute_at: Timestamp,
         shard_deps: HashMap<ShardId, BTreeSet<TxnId>>,
-        events: Vec<Event>,
     ) -> anyhow::Result<bool> {
         let union = Self::union_of(plans);
 
-        // Commit each shard with its own dependency set.
+        // Commit each shard with its own dependency set and its own key/event
+        // slice — one encode per shard instead of one per replica.
         for plan in plans {
             let deps: Vec<TxnId> = shard_deps
                 .get(&plan.shard)
@@ -1625,19 +1634,18 @@ impl Node {
                 .copied()
                 .filter(|d| *d != txn)
                 .collect();
-            for &node in &plan.replicas {
-                self.send(
-                    node,
-                    Message::Commit {
-                        txn,
-                        execute_at,
-                        deps: deps.clone(),
-                        events: events.clone(),
-                        reply_to: self.id,
-                    },
-                )
-                .await;
-            }
+            self.broadcast(
+                &plan.replicas,
+                Message::Commit {
+                    txn,
+                    execute_at,
+                    deps,
+                    keys: plan.keys.clone(),
+                    events: plan.events.clone(),
+                    reply_to: self.id,
+                },
+            )
+            .await;
         }
 
         // Read: a slow quorum per shard reports its version condition.
@@ -1804,14 +1812,17 @@ impl Node {
                 anyhow::bail!("transaction unknown to recovery quorum");
             }
 
-            // Reconstruct the full key/event set and plan the touched shards.
+            // Reconstruct the full key/event set (each shard reported only its
+            // owned subset) and plan the touched shards — the plan re-partitions
+            // both back into per-shard slices for Accept/Commit.
             let mut keys: Vec<Key> = Vec::new();
             for k in known.iter().flat_map(|(_, f)| f.keys.iter()) {
                 if !keys.contains(k) {
                     keys.push(k.clone());
                 }
             }
-            let (plans, _union) = self.plan(&keys);
+            let events_full = self.reassemble_events(&known);
+            let (plans, _union) = self.plan(&keys, &events_full);
 
             // Recovery-quorum gate: bail (retry on the next sweep) unless a slow
             // quorum of each touched shard reported.
@@ -1825,9 +1836,6 @@ impl Node {
                     anyhow::bail!("recovery quorum not reached for shard {}", plan.shard);
                 }
             }
-            // Each shard reported only its owned events; reassemble the whole set
-            // so every replica can extract its part from the Commit.
-            let events_full = self.reassemble_events(&known);
 
             let max_status = known
                 .iter()
@@ -1882,19 +1890,17 @@ impl Node {
             if max_status < Status::Committed {
                 for plan in &plans {
                     let deps: Vec<TxnId> = shard_deps[&plan.shard].iter().copied().collect();
-                    for &node in &plan.replicas {
-                        self.send(
-                            node,
-                            Message::Accept {
-                                txn,
-                                ballot,
-                                execute_at,
-                                deps: deps.clone(),
-                                keys: keys.clone(),
-                            },
-                        )
-                        .await;
-                    }
+                    self.broadcast(
+                        &plan.replicas,
+                        Message::Accept {
+                            txn,
+                            ballot,
+                            execute_at,
+                            deps,
+                            keys: plan.keys.clone(),
+                        },
+                    )
+                    .await;
                 }
                 let acks = self
                     .collect_by_shard(
@@ -1930,7 +1936,7 @@ impl Node {
             }
 
             let conflict = self
-                .execute(&mut rx, &plans, txn, execute_at, shard_deps, events_full)
+                .execute(&mut rx, &plans, txn, execute_at, shard_deps)
                 .await?;
             self.deregister(txn);
             return Ok(CommitOutcome { txn, conflict });
@@ -1943,13 +1949,22 @@ impl Node {
     /// coordinator that crashed before committing. For tests of [`recover`].
     pub async fn coordinate_preaccept(&self, events: Vec<Event>) -> anyhow::Result<TxnId> {
         let keys = Self::keys_of(&events);
-        let (plans, union) = self.plan(&keys);
+        let (plans, _union) = self.plan(&keys, &events);
         let t0 = self.clock.now();
         let txn = TxnId(t0);
 
         let mut rx = self.register(txn);
-        self.broadcast(&union, Message::PreAccept { txn, keys, events })
+        for plan in &plans {
+            self.broadcast(
+                &plan.replicas,
+                Message::PreAccept {
+                    txn,
+                    keys: plan.keys.clone(),
+                    events: plan.events.clone(),
+                },
+            )
             .await;
+        }
         let pre = self
             .collect_by_shard(
                 &mut rx,
@@ -2457,7 +2472,7 @@ impl Node {
     pub async fn forward_read(
         &self,
         to: NodeId,
-        aggregators: Option<Vec<EventFilter>>,
+        aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<RoutingKey>,
         args: Args,
         to_micros: Option<u64>,
@@ -2472,7 +2487,7 @@ impl Node {
             to,
             Message::ReadForward {
                 id,
-                aggregators,
+                aggregators: aggregators.map(|a| a.to_vec()),
                 routing_key,
                 args,
                 to_micros,
@@ -2508,54 +2523,88 @@ impl Node {
     /// Re-assembles the full event set from the owned subsets each shard's
     /// replicas reported during recovery.
     fn reassemble_events(&self, known: &[(NodeId, RecoverFields)]) -> Vec<Event> {
+        // Dedupe by the event's ULID — `(aggregate_id, version)` alone
+        // would collapse two aggregates of different types sharing an id.
+        let mut seen: HashSet<ulid::Ulid> = HashSet::new();
         let mut events: Vec<Event> = Vec::new();
         for event in known.iter().flat_map(|(_, f)| f.events.iter()) {
-            // Dedupe by the event's ULID — `(aggregate_id, version)` alone
-            // would collapse two aggregates of different types sharing an id.
-            if !events.iter().any(|e| e.id == event.id) {
+            if seen.insert(event.id) {
                 events.push(event.clone());
             }
         }
         events
     }
 
-    /// The shards a key set touches, with their replica sets and quorum sizes,
-    /// plus the deduplicated union of all their replicas.
-    fn plan(&self, keys: &[Key]) -> (Vec<ShardPlan>, Vec<NodeId>) {
+    /// The shards a key set touches — replica sets, quorum sizes, and each
+    /// shard's slice of `keys`/`events` (one partition pass, so PreAccept /
+    /// Accept / Commit ship each shard only what it owns) — plus the
+    /// deduplicated union of all their replicas.
+    fn plan(&self, keys: &[Key], events: &[Event]) -> (Vec<ShardPlan>, Vec<NodeId>) {
         let mut shards: BTreeMap<ShardId, ShardPlan> = BTreeMap::new();
+        let mut shard_of: HashMap<&str, ShardId> = HashMap::with_capacity(keys.len());
         for key in keys {
             let shard = self.topology.shard_of(key);
-            shards.entry(shard).or_insert_with(|| ShardPlan {
-                shard,
-                replicas: self.topology.replicas(key),
-                electorate: self.topology.fast_electorate(key),
-                fast_q: self.topology.fast_quorum(key),
-                slow_q: self.topology.slow_quorum(key),
-            });
+            shard_of.insert(key.0.as_str(), shard);
+            shards
+                .entry(shard)
+                .or_insert_with(|| ShardPlan {
+                    shard,
+                    replicas: self.topology.replicas(key),
+                    electorate: self.topology.fast_electorate(key),
+                    fast_q: self.topology.fast_quorum(key),
+                    slow_q: self.topology.slow_quorum(key),
+                    keys: Vec::new(),
+                    events: Vec::new(),
+                })
+                .keys
+                .push(key.clone());
+        }
+        for event in events {
+            // Every event's key is in `keys` (they are derived from the events,
+            // or reassembled alongside them in recovery); compute defensively
+            // for one that is not.
+            let shard = match shard_of.get(Key::str_of(event)) {
+                Some(shard) => *shard,
+                None => self.topology.shard_of(&Key::of(event)),
+            };
+            if let Some(plan) = shards.get_mut(&shard) {
+                plan.events.push(event.clone());
+            }
         }
         let plans: Vec<ShardPlan> = shards.into_values().collect();
         let union = Self::union_of(&plans);
         (plans, union)
     }
 
-    /// The deduplicated union of every shard's replica set.
+    /// The deduplicated union of every shard's replica set (sorted — the order
+    /// is deterministic, callers only use it as a broadcast target set).
     fn union_of(plans: &[ShardPlan]) -> Vec<NodeId> {
-        let mut union: Vec<NodeId> = Vec::new();
-        for plan in plans {
-            for &node in &plan.replicas {
-                if !union.contains(&node) {
-                    union.push(node);
-                }
-            }
-        }
+        let mut union: Vec<NodeId> = plans
+            .iter()
+            .flat_map(|p| p.replicas.iter().copied())
+            .collect();
+        union.sort_unstable();
+        union.dedup();
         union
     }
 
-    /// The events this node owns (keys in this node's shard).
+    /// The events this node owns (keys in this node's shard). Ownership is
+    /// resolved once per distinct key, not once per event.
     fn owned_events(&self, events: Vec<Event>) -> Vec<Event> {
+        let mut owned: HashMap<String, bool> = HashMap::new();
         events
             .into_iter()
-            .filter(|e| self.topology.owns(self.id, &Key::of(e)))
+            .filter(|e| {
+                let key = Key::str_of(e);
+                match owned.get(key) {
+                    Some(&v) => v,
+                    None => {
+                        let v = self.topology.owns(self.id, &Key(key.to_string()));
+                        owned.insert(key.to_string(), v);
+                        v
+                    }
+                }
+            })
             .collect()
     }
 
@@ -2568,11 +2617,12 @@ impl Node {
 
     /// The distinct keys a set of events touches.
     fn keys_of(events: &[Event]) -> Vec<Key> {
+        let mut seen: HashSet<&str> = HashSet::new();
         let mut keys: Vec<Key> = Vec::new();
         for event in events {
-            let key = Key::of(event);
-            if !keys.contains(&key) {
-                keys.push(key);
+            let key = Key::str_of(event);
+            if seen.insert(key) {
+                keys.push(Key(key.to_string()));
             }
         }
         keys
@@ -2827,6 +2877,137 @@ mod tests {
             keys: vec![Key(agg)],
             events: vec![event],
         }
+    }
+
+    /// `plan` partitions the transaction's keys and events into per-shard
+    /// slices in one pass: every shard's slice hashes to that shard, and the
+    /// slices cover the full input (nothing dropped, nothing duplicated).
+    #[tokio::test]
+    async fn plan_partitions_keys_and_events_per_shard() {
+        let id = NodeId(0);
+        let shards = vec![vec![NodeId(0), NodeId(1)], vec![NodeId(2), NodeId(3)]];
+        let topology = Arc::new(ShardedTopology::new(id, shards));
+        let net = InMemoryNetwork::new();
+        let node = Node::new(
+            id,
+            Arc::clone(&topology) as Arc<dyn Topology>,
+            Arc::new(HybridLogicalClock::new(id)),
+            Arc::new(net.sink(id)) as Arc<dyn MessageSink>,
+            Arc::new(InMemoryDataStore::new()) as Arc<dyn DataStore>,
+            Arc::new(InMemoryJournal::new()) as Arc<dyn Journal>,
+        );
+
+        // Enough distinct aggregates to land keys in both shards.
+        let events: Vec<Event> = (0..8)
+            .map(|i| Event {
+                id: ulid::Ulid::generate(),
+                aggregate_type: "test/Account".into(),
+                aggregate_id: format!("acc{i}"),
+                version: 1,
+                name: "Bumped".into(),
+                ..Default::default()
+            })
+            .collect();
+        let keys = Node::keys_of(&events);
+        assert!(
+            (0..2).all(|s| keys.iter().any(|k| topology.shard_of(k) == s)),
+            "test aggregates must span both shards"
+        );
+
+        let (plans, union) = node.plan(&keys, &events);
+
+        assert_eq!(plans.len(), 2, "both shards are planned");
+        let mut keys_covered = 0;
+        let mut events_covered = 0;
+        for plan in &plans {
+            assert!(
+                plan.keys.iter().all(|k| topology.shard_of(k) == plan.shard),
+                "a shard's key slice must be exactly its own keys"
+            );
+            assert!(
+                plan.events
+                    .iter()
+                    .all(|e| topology.shard_of(&Key::of(e)) == plan.shard),
+                "a shard's event slice must be exactly its own events"
+            );
+            keys_covered += plan.keys.len();
+            events_covered += plan.events.len();
+        }
+        assert_eq!(keys_covered, keys.len(), "key slices cover the full set");
+        assert_eq!(
+            events_covered,
+            events.len(),
+            "event slices cover the full set"
+        );
+        let mut expected_union: Vec<NodeId> = (0..4).map(NodeId).collect();
+        expected_union.sort_unstable();
+        assert_eq!(union, expected_union);
+    }
+
+    /// A replica that never saw PreAccept indexes the transaction from the
+    /// explicit `keys` on Commit and still applies it — the conflict-graph
+    /// guarantee the coordinator's per-shard subsetting must preserve.
+    #[tokio::test(start_paused = true)]
+    async fn commit_with_explicit_keys_applies_without_preaccept() {
+        let id = NodeId(0);
+        let coord = NodeId(1);
+        let ids = vec![id, coord, NodeId(2)];
+        let net = InMemoryNetwork::new();
+        let inbox = net.register(id);
+        let _coord_inbox = net.register(coord);
+        let store = Arc::new(InMemoryDataStore::new());
+        let node = Node::new(
+            id,
+            Arc::new(StaticTopology::new(id, ids)) as Arc<dyn Topology>,
+            Arc::new(HybridLogicalClock::new(id)),
+            Arc::new(net.sink(id)) as Arc<dyn MessageSink>,
+            Arc::clone(&store) as Arc<dyn DataStore>,
+            Arc::new(InMemoryJournal::new()) as Arc<dyn Journal>,
+        );
+        let _loop = node.start(inbox);
+
+        let event = Event {
+            id: ulid::Ulid::generate(),
+            aggregate_type: "test/Account".into(),
+            aggregate_id: "acc-commit-only".into(),
+            version: 1,
+            name: "Bumped".into(),
+            ..Default::default()
+        };
+        let txn = TxnId(Timestamp {
+            micros: 100,
+            logical: 0,
+            node: coord,
+        });
+        let sink = net.sink(coord);
+        sink.send(
+            id,
+            Message::Commit {
+                txn,
+                execute_at: txn.0,
+                deps: vec![],
+                keys: vec![Key("acc-commit-only".into())],
+                events: vec![event],
+                reply_to: coord,
+            },
+        )
+        .await
+        .unwrap();
+        sink.send(id, Message::Apply { txn, commit: true })
+            .await
+            .unwrap();
+
+        for _ in 0..1000 {
+            if !store.applied_log().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            store.applied_log().len(),
+            1,
+            "the commit-only replica applied the transaction"
+        );
     }
 
     /// A burst of messages already queued in the inbox is drained as one batch and

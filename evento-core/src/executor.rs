@@ -246,7 +246,8 @@ pub trait Executor: Send + Sync + 'static {
         aggregate_id: String,
     ) -> anyhow::Result<u16> {
         const PAGE_SIZE: u16 = 4096;
-        let filters = vec![EventFilter::by_id(aggregate_type, aggregate_id)];
+        let filters: Arc<[EventFilter]> =
+            Arc::from([EventFilter::by_id(aggregate_type, aggregate_id)]);
         let mut max = 0u16;
         let mut after = None;
         loop {
@@ -288,7 +289,10 @@ pub trait Executor: Send + Sync + 'static {
     ) -> anyhow::Result<Option<Option<String>>> {
         let result = self
             .read(
-                Some(vec![EventFilter::by_id(aggregate_type, aggregate_id)]),
+                Some(Arc::from([EventFilter::by_id(
+                    aggregate_type,
+                    aggregate_id,
+                )])),
                 None,
                 Args::forward(1, None),
                 None,
@@ -327,7 +331,7 @@ pub trait Executor: Send + Sync + 'static {
     /// should honor it for performance.
     async fn read(
         &self,
-        aggregators: Option<Vec<EventFilter>>,
+        aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<RoutingKey>,
         args: Args,
         to_micros: Option<u64>,
@@ -341,7 +345,7 @@ pub trait Executor: Send + Sync + 'static {
     /// to compute lag without fetching the full event row (data/metadata blobs).
     async fn latest_timestamp(
         &self,
-        aggregators: Option<Vec<EventFilter>>,
+        aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<RoutingKey>,
     ) -> anyhow::Result<u64>;
 
@@ -434,7 +438,7 @@ impl Executor for Evento {
 
     async fn read(
         &self,
-        aggregators: Option<Vec<EventFilter>>,
+        aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<RoutingKey>,
         args: Args,
         to_micros: Option<u64>,
@@ -446,7 +450,7 @@ impl Executor for Evento {
 
     async fn latest_timestamp(
         &self,
-        aggregators: Option<Vec<EventFilter>>,
+        aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<RoutingKey>,
     ) -> anyhow::Result<u64> {
         self.inner.latest_timestamp(aggregators, routing_key).await
@@ -614,7 +618,7 @@ impl Executor for EventoGroup {
 
     async fn read(
         &self,
-        aggregators: Option<Vec<EventFilter>>,
+        aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<RoutingKey>,
         args: Args,
         to_micros: Option<u64>,
@@ -654,7 +658,7 @@ impl Executor for EventoGroup {
 
     async fn latest_timestamp(
         &self,
-        aggregators: Option<Vec<EventFilter>>,
+        aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<RoutingKey>,
     ) -> anyhow::Result<u64> {
         let futures = self
@@ -794,7 +798,7 @@ impl<R: Executor, W: Executor> Executor for Rw<R, W> {
 
     async fn read(
         &self,
-        aggregators: Option<Vec<EventFilter>>,
+        aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<RoutingKey>,
         args: Args,
         to_micros: Option<u64>,
@@ -804,7 +808,7 @@ impl<R: Executor, W: Executor> Executor for Rw<R, W> {
 
     async fn latest_timestamp(
         &self,
-        aggregators: Option<Vec<EventFilter>>,
+        aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<RoutingKey>,
     ) -> anyhow::Result<u64> {
         self.r.latest_timestamp(aggregators, routing_key).await

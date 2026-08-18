@@ -34,7 +34,7 @@
 //!
 //! // Query events
 //! let events = executor.read(
-//!     Some(vec![EventFilter::by_id("user/User", &id)]),
+//!     Some([EventFilter::by_id("user/User", &id)].into()),
 //!     None,
 //!     Args::forward(10, None),
 //! ).await?;
@@ -646,7 +646,7 @@ impl Fjall {
     /// (the aggregator indexes don't encode it).
     fn cursor_sources(
         &self,
-        aggregators: &Option<Vec<EventFilter>>,
+        aggregators: &Option<Arc<[EventFilter]>>,
         routing_key: &Option<RoutingKey>,
     ) -> (Vec<(&Keyspace, Vec<u8>)>, bool) {
         match (aggregators, routing_key) {
@@ -657,7 +657,7 @@ impl Fjall {
                 // handler.
                 let mut seen_filters = std::collections::HashSet::new();
                 let mut sources = Vec::new();
-                for agg in aggs {
+                for agg in aggs.iter() {
                     if !seen_filters.insert(agg) {
                         continue;
                     }
@@ -698,7 +698,7 @@ impl Fjall {
     /// never a whole-prefix scan.
     fn read_indexed(
         &self,
-        aggregators: Option<Vec<EventFilter>>,
+        aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<RoutingKey>,
         args: Args,
         to_micros: Option<u64>,
@@ -1020,7 +1020,7 @@ impl Executor for Fjall {
 
     async fn read(
         &self,
-        aggregators: Option<Vec<EventFilter>>,
+        aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<RoutingKey>,
         args: Args,
         to_micros: Option<u64>,
@@ -1035,7 +1035,7 @@ impl Executor for Fjall {
 
     async fn latest_timestamp(
         &self,
-        _aggregators: Option<Vec<EventFilter>>,
+        _aggregators: Option<Arc<[EventFilter]>>,
         _routing_key: Option<RoutingKey>,
     ) -> anyhow::Result<u64> {
         // The commit clock is the max timestamp over ALL events. Using it
@@ -1329,7 +1329,7 @@ mod tests {
         // Read all events
         let result = executor
             .read(
-                Some(vec![EventFilter::by_id("test/Account", "agg-1")]),
+                Some([EventFilter::by_id("test/Account", "agg-1")].into()),
                 None,
                 Args::forward(10, None),
                 None,
@@ -1432,7 +1432,7 @@ mod tests {
 
         let plain = executor
             .read(
-                Some(vec![EventFilter::by_id("test/Account", "a")]),
+                Some([EventFilter::by_id("test/Account", "a")].into()),
                 None,
                 Args::forward(10, None),
                 None,
@@ -1464,7 +1464,7 @@ mod tests {
                 .unwrap();
             let read = executor
                 .read(
-                    Some(vec![EventFilter::by_id("test/Account", "agg-mono")]),
+                    Some([EventFilter::by_id("test/Account", "agg-mono")].into()),
                     None,
                     Args::forward(10, None),
                     None,
@@ -1482,7 +1482,7 @@ mod tests {
             .unwrap();
         let read = executor
             .read(
-                Some(vec![EventFilter::by_id("test/Account", "agg-mono")]),
+                Some([EventFilter::by_id("test/Account", "agg-mono")].into()),
                 None,
                 Args::forward(10, None),
                 None,
@@ -1515,7 +1515,7 @@ mod tests {
 
         let restamped = executor
             .read(
-                Some(vec![EventFilter::by_id("test/Account", "agg-restamp")]),
+                Some([EventFilter::by_id("test/Account", "agg-restamp")].into()),
                 None,
                 Args::forward(1, None),
                 None,
@@ -1529,7 +1529,7 @@ mod tests {
 
         let preserved = executor
             .read(
-                Some(vec![EventFilter::by_id("test/Account", "agg-verbatim")]),
+                Some([EventFilter::by_id("test/Account", "agg-verbatim")].into()),
                 None,
                 Args::forward(1, None),
                 None,
@@ -1716,7 +1716,7 @@ mod tests {
         // Filtered and routing reads work off the rebuilt indexes too.
         let by_id = executor
             .read(
-                Some(vec![EventFilter::by_id("test/Account", "agg-m")]),
+                Some([EventFilter::by_id("test/Account", "agg-m")].into()),
                 None,
                 Args::forward(10, None),
                 None,
@@ -1768,7 +1768,7 @@ mod tests {
         ] {
             let forward = executor
                 .read(
-                    Some(vec![EventFilter::by_id("test/Account", "agg-b")]),
+                    Some([EventFilter::by_id("test/Account", "agg-b")].into()),
                     None,
                     Args::forward(10, None),
                     bound,
@@ -1778,7 +1778,7 @@ mod tests {
             assert_eq!(forward.edges.len(), expect, "forward, bound {bound:?}");
             let backward = executor
                 .read(
-                    Some(vec![EventFilter::by_id("test/Account", "agg-b")]),
+                    Some([EventFilter::by_id("test/Account", "agg-b")].into()),
                     None,
                     Args::backward(10, None),
                     bound,
@@ -1885,7 +1885,7 @@ mod tests {
 
         let page = executor
             .read(
-                Some(vec![EventFilter::by_id("test/Account", "agg-s")]),
+                Some([EventFilter::by_id("test/Account", "agg-s")].into()),
                 Some(RoutingKey::Value(Some("hot".to_string()))),
                 Args::forward(2, None),
                 None,
@@ -1899,7 +1899,7 @@ mod tests {
 
         let rest = executor
             .read(
-                Some(vec![EventFilter::by_id("test/Account", "agg-s")]),
+                Some([EventFilter::by_id("test/Account", "agg-s")].into()),
                 Some(RoutingKey::Value(Some("hot".to_string()))),
                 Args::forward(2, page.page_info.end_cursor.clone()),
                 None,

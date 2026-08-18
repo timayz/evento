@@ -51,6 +51,21 @@ async fn truncate_drops_below_the_watermark() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn flush_dedupes_restaged_txn() {
+    sql_support::flush_dedupes_restaged_txn(&memory().await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn flush_chunks_large_batches() {
+    sql_support::flush_chunks_large_batches(&memory().await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metadata_batch_append() {
+    sql_support::metadata_batch_append(&memory().await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn survives_close_and_reopen() {
     let temp = tempfile::Builder::new()
         .prefix("accord_sql_reopen")

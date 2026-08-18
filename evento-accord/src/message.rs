@@ -25,10 +25,13 @@ impl Key {
     /// The key a write touches: its routing key, or the aggregate id when no
     /// routing key is set.
     pub fn of(event: &Event) -> Self {
-        Key(event
-            .routing_key
-            .clone()
-            .unwrap_or_else(|| event.aggregate_id.clone()))
+        Key(Self::str_of(event).to_string())
+    }
+
+    /// [`of`](Key::of) without the allocation — for hashing/grouping hot paths
+    /// that only need to compare or bucket by the key string.
+    pub fn str_of(event: &Event) -> &str {
+        event.routing_key.as_deref().unwrap_or(&event.aggregate_id)
     }
 }
 
@@ -142,14 +145,18 @@ pub enum Message {
         ballot: Ballot,
         deps: Vec<TxnId>,
     },
-    /// Coordinator → replicas: the execution timestamp and dependencies are
-    /// final; execute when dependencies allow. Carries events for replicas that
-    /// missed PreAccept, and `reply_to` so the execution result reaches whoever
-    /// is driving the commit (original coordinator or recoverer).
+    /// Coordinator → a shard's replicas: the execution timestamp and
+    /// dependencies are final; execute when dependencies allow. Carries the
+    /// shard's keys and events explicitly (a replica that missed PreAccept must
+    /// still index the transaction in its conflict graph, and events/keys are
+    /// per-shard subsets now, so they cannot be re-derived from each other),
+    /// and `reply_to` so the execution result reaches whoever is driving the
+    /// commit (original coordinator or recoverer).
     Commit {
         txn: TxnId,
         execute_at: Timestamp,
         deps: Vec<TxnId>,
+        keys: Vec<Key>,
         #[serde(with = "wire_events")]
         events: Vec<Event>,
         reply_to: NodeId,

@@ -19,7 +19,7 @@ async fn last_routing_key<E: Executor>(
 ) -> anyhow::Result<Option<String>> {
     let events = executor
         .read(
-            Some(vec![EventFilter::by_id(BankAccount::aggregate_type(), id)]),
+            Some([EventFilter::by_id(BankAccount::aggregate_type(), id)].into()),
             None,
             Args::backward(1, None),
             None,
@@ -2030,7 +2030,7 @@ pub async fn read_order_timestamp<E: Executor + Clone>(executor: &E) -> anyhow::
     let ids = |r: &ReadResult<Event>| r.edges.iter().map(|e| e.node.id).collect::<Vec<_>>();
     let read = |args| {
         let f = EventFilter::by_type(agg_type);
-        async move { executor.read(Some(vec![f]), None, args, None).await }
+        async move { executor.read(Some([f].into()), None, args, None).await }
     };
 
     // Full forward read.
@@ -2079,7 +2079,7 @@ pub async fn write_restamps_client_clock<E: Executor + Clone>(executor: &E) -> a
 
     let restamped = executor
         .read(
-            Some(vec![EventFilter::by_id(agg_type, "restamped")]),
+            Some([EventFilter::by_id(agg_type, "restamped")].into()),
             None,
             Args::forward(1, None),
             None,
@@ -2093,7 +2093,7 @@ pub async fn write_restamps_client_clock<E: Executor + Clone>(executor: &E) -> a
 
     let verbatim = executor
         .read(
-            Some(vec![EventFilter::by_id(agg_type, "verbatim")]),
+            Some([EventFilter::by_id(agg_type, "verbatim")].into()),
             None,
             Args::forward(1, None),
             None,
@@ -2128,7 +2128,7 @@ pub async fn exact_filter<E: Executor + Clone>(executor: &E) -> anyhow::Result<(
 
     let alpha = executor
         .read(
-            Some(vec![EventFilter::exact(agg_type, &id, "Alpha")]),
+            Some([EventFilter::exact(agg_type, &id, "Alpha")].into()),
             None,
             Args::forward(10, None),
             None,
@@ -2143,7 +2143,7 @@ pub async fn exact_filter<E: Executor + Clone>(executor: &E) -> anyhow::Result<(
 
     let beta = executor
         .read(
-            Some(vec![EventFilter::exact(agg_type, &id, "Beta")]),
+            Some([EventFilter::exact(agg_type, &id, "Beta")].into()),
             None,
             Args::forward(10, None),
             None,

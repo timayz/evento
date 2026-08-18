@@ -1,21 +1,25 @@
 //! Client side: an [`Executor`] that forwards every call to a remote server.
 //!
-//! One connection actor owns the TCP stream: it multiplexes requests from all
-//! [`Client`] clones over the single connection, demultiplexes replies by
-//! correlation id, feeds pushed [`ServerFrame::Notify`] frames into a local
-//! `write_watch` channel, and keeps the connection alive with capped
-//! exponential backoff (eager reconnect — the push channel must stay alive
-//! even while the client is idle-subscribed).
+//! Each pooled connection ([`ClientBuilder::connections`], default 1) is owned
+//! by one actor: it multiplexes requests dispatched to it over its TCP stream,
+//! demultiplexes replies by correlation id, and keeps the connection alive
+//! with capped exponential backoff (eager reconnect — the push channel must
+//! stay alive even while the client is idle-subscribed). Requests are
+//! round-robined across connections; pushed [`ServerFrame::Notify`] frames
+//! feed a local `write_watch` channel (from the first connection only — the
+//! watch is level-triggered, duplicates from every connection add nothing).
 //!
 //! **At-most-once semantics.** A request in flight when the connection drops
 //! fails at the caller, but may still have executed on the server — a retried
 //! `write` can then surface `InvalidOriginalVersion`. This is the same
-//! contract as any RPC store.
+//! contract as any RPC store. Requests on different pooled connections have no
+//! ordering relative to each other; the executor contract is request/response,
+//! and callers await a reply before issuing a dependent call.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -37,15 +41,16 @@ const RECONNECT_MIN: Duration = Duration::from_millis(100);
 const RECONNECT_MAX: Duration = Duration::from_secs(5);
 /// Correlation id of the per-connection `Hello` exchange; regular ids start at 1.
 const HELLO_ID: u64 = 0;
-/// Capacity of the client's outbound request queue.
+/// Capacity of each connection's outbound request queue.
 const REQ_CAPACITY: usize = 1024;
 /// Capacity of the per-connection encoded-frame queue feeding the writer task.
 const OUT_CAPACITY: usize = 1024;
 
-/// The cached stability watermark pushed by the server (`None` until/unless the
-/// server reports one). A plain `Option` behind a mutex — no sentinel value can
-/// collide with a real watermark.
-type Stable = Arc<Mutex<Option<u64>>>;
+/// The cached stability watermark pushed by the server, max-merged across
+/// every connection's responses and notifies (so cross-connection reordering
+/// can never move it backwards). `0` = not reported yet — the watermark is
+/// microseconds since the Unix epoch, so a real report is never 0.
+type Stable = Arc<AtomicU64>;
 
 fn codec() -> LengthDelimitedCodec {
     LengthDelimitedCodec::builder()
@@ -53,21 +58,25 @@ fn codec() -> LengthDelimitedCodec {
         .new_codec()
 }
 
-type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Response>>>>;
+/// A request dispatched to a connection actor: the reply channel travels with
+/// it, and the actor owns its own pending map — no shared lock.
+type Dispatch = (u64, Request, oneshot::Sender<Response>);
 
 /// A remote [`Executor`]: forwards every call to a [`serve`](crate::serve)d
-/// executor over TCP. Cheap to clone; all clones share one connection.
+/// executor over TCP. Cheap to clone; all clones share the connection pool.
 #[derive(Clone)]
 pub struct Client {
     inner: Arc<Inner>,
 }
 
 struct Inner {
-    req_tx: mpsc::Sender<(u64, Request)>,
-    pending: Pending,
+    /// One request queue per pooled connection.
+    lanes: Vec<mpsc::Sender<Dispatch>>,
+    round_robin: AtomicUsize,
     next_id: AtomicU64,
     watch_tx: Arc<watch::Sender<u64>>,
-    /// Fixed at server executor construction; snapshotted once at connect.
+    /// Fixed at server executor construction; snapshotted once from the first
+    /// connection's `Hello` (it is borrowed as `&str`, so it must stay fixed).
     default_routing_key: Option<String>,
     stable: Stable,
     request_timeout: Duration,
@@ -77,6 +86,7 @@ struct Inner {
 pub struct ClientBuilder {
     addr: SocketAddr,
     request_timeout: Duration,
+    connections: usize,
 }
 
 impl ClientBuilder {
@@ -88,35 +98,50 @@ impl ClientBuilder {
         self
     }
 
-    /// Connects and performs the `Hello` exchange. Fails fast when the server
-    /// is unreachable; after that the connection is kept alive with automatic
-    /// reconnect.
-    pub async fn connect(self) -> anyhow::Result<Client> {
-        let stable: Stable = Arc::new(Mutex::new(None));
-        let (framed, default_routing_key) =
-            connect_and_hello(self.addr, &stable, self.request_timeout).await?;
+    /// Number of TCP connections in the pool (default 1, clamped to ≥ 1).
+    /// Requests are round-robined across them, so concurrent callers stop
+    /// sharing one socket's head-of-line and one server-side in-flight budget.
+    pub fn connections(mut self, n: usize) -> Self {
+        self.connections = n.max(1);
+        self
+    }
 
-        let (req_tx, req_rx) = mpsc::channel(REQ_CAPACITY);
+    /// Connects and performs the `Hello` exchange on every pooled connection.
+    /// Fails fast when the server is unreachable; after that each connection
+    /// is kept alive with automatic reconnect.
+    pub async fn connect(self) -> anyhow::Result<Client> {
+        let stable: Stable = Arc::new(AtomicU64::new(0));
         let (watch_tx, _) = watch::channel(0u64);
         let watch_tx = Arc::new(watch_tx);
-        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
 
-        tokio::spawn(
-            Actor {
-                addr: self.addr,
-                req_rx,
-                pending: Arc::clone(&pending),
-                watch_tx: Arc::clone(&watch_tx),
-                stable: Arc::clone(&stable),
-                request_timeout: self.request_timeout,
+        let mut lanes = Vec::with_capacity(self.connections);
+        let mut default_routing_key = None;
+        for lane in 0..self.connections {
+            let (framed, routing_key) =
+                connect_and_hello(self.addr, &stable, self.request_timeout).await?;
+            if lane == 0 {
+                default_routing_key = routing_key;
             }
-            .run(framed),
-        );
+            let (req_tx, req_rx) = mpsc::channel(REQ_CAPACITY);
+            tokio::spawn(
+                Actor {
+                    addr: self.addr,
+                    req_rx,
+                    // One forwarder is enough: the watch is a level-triggered
+                    // wakeup, and every connection receives the same notifies.
+                    watch_tx: (lane == 0).then(|| Arc::clone(&watch_tx)),
+                    stable: Arc::clone(&stable),
+                    request_timeout: self.request_timeout,
+                }
+                .run(framed),
+            );
+            lanes.push(req_tx);
+        }
 
         Ok(Client {
             inner: Arc::new(Inner {
-                req_tx,
-                pending,
+                lanes,
+                round_robin: AtomicUsize::new(0),
                 next_id: AtomicU64::new(HELLO_ID + 1),
                 watch_tx,
                 default_routing_key,
@@ -137,40 +162,31 @@ impl Client {
         ClientBuilder {
             addr,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            connections: 1,
         }
     }
 
     async fn request(&self, request: Request) -> anyhow::Result<Response> {
+        // Ids only need uniqueness per connection (they are per-connection on
+        // the wire); a global counter is a superset of that.
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
+        let lane = self.inner.round_robin.fetch_add(1, Ordering::Relaxed) % self.inner.lanes.len();
         let (tx, rx) = oneshot::channel();
-        self.inner
-            .pending
-            .lock()
-            .expect("pending poisoned")
-            .insert(id, tx);
-        if self.inner.req_tx.send((id, request)).await.is_err() {
-            self.remove_pending(id);
+        if self.inner.lanes[lane]
+            .send((id, request, tx))
+            .await
+            .is_err()
+        {
             anyhow::bail!("remote executor connection is closed");
         }
         match tokio::time::timeout(self.inner.request_timeout, rx).await {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(_)) => anyhow::bail!("remote executor connection lost"),
-            Err(_) => {
-                self.remove_pending(id);
-                anyhow::bail!(
-                    "remote request timed out after {:?}",
-                    self.inner.request_timeout
-                )
-            }
+            Err(_) => anyhow::bail!(
+                "remote request timed out after {:?}",
+                self.inner.request_timeout
+            ),
         }
-    }
-
-    fn remove_pending(&self, id: u64) {
-        self.inner
-            .pending
-            .lock()
-            .expect("pending poisoned")
-            .remove(&id);
     }
 }
 
@@ -192,7 +208,10 @@ impl Executor for Client {
         // The cached watermark is refreshed by every response and notify frame;
         // a polling subscription issues several requests per pass, so the cache
         // is at most one round-trip stale by the time the gate consults it.
-        Ok(*self.inner.stable.lock().expect("stable poisoned"))
+        match self.inner.stable.load(Ordering::Acquire) {
+            0 => Ok(None),
+            v => Ok(Some(v)),
+        }
     }
 
     async fn write(&self, events: Vec<Event>) -> Result<(), WriteError> {
@@ -215,14 +234,14 @@ impl Executor for Client {
 
     async fn read(
         &self,
-        aggregators: Option<Vec<EventFilter>>,
+        aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<RoutingKey>,
         args: Args,
         to_micros: Option<u64>,
     ) -> anyhow::Result<ReadResult<Event>> {
         match self
             .request(Request::Read {
-                aggregators,
+                aggregators: aggregators.map(|a| a.to_vec()),
                 routing_key,
                 args,
                 to_micros,
@@ -237,12 +256,12 @@ impl Executor for Client {
 
     async fn latest_timestamp(
         &self,
-        aggregators: Option<Vec<EventFilter>>,
+        aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<RoutingKey>,
     ) -> anyhow::Result<u64> {
         match self
             .request(Request::LatestTimestamp {
-                aggregators,
+                aggregators: aggregators.map(|a| a.to_vec()),
                 routing_key,
             })
             .await?
@@ -412,14 +431,16 @@ impl Executor for Client {
     }
 }
 
-/// Owns the framed connection: sends queued requests, demultiplexes replies,
-/// feeds pushed notifications into the local watch channel, reconnects with
-/// capped exponential backoff. Exits when every [`Client`] clone is dropped.
+/// Owns one framed connection of the pool: sends dispatched requests,
+/// demultiplexes replies via its **own** pending map (the reply channel
+/// arrives with each request, so there is no shared lock), optionally feeds
+/// pushed notifications into the watch channel, reconnects with capped
+/// exponential backoff. Exits when every [`Client`] clone is dropped.
 struct Actor {
     addr: SocketAddr,
-    req_rx: mpsc::Receiver<(u64, Request)>,
-    pending: Pending,
-    watch_tx: Arc<watch::Sender<u64>>,
+    req_rx: mpsc::Receiver<Dispatch>,
+    /// `Some` on the notify-forwarding connection only.
+    watch_tx: Option<Arc<watch::Sender<u64>>>,
     stable: Stable,
     request_timeout: Duration,
 }
@@ -427,6 +448,13 @@ struct Actor {
 impl Actor {
     async fn run(mut self, initial: Framed<TcpStream, LengthDelimitedCodec>) {
         let mut conn = Some(initial);
+        // In-flight requests on the current connection. Cleared (failing the
+        // callers) on disconnect: a possibly-executed request must never be
+        // replayed on the next connection — the caller may retry it under a
+        // fresh id. Requests still queued in `req_rx` at that point were never
+        // sent, so their callers keep waiting and they go out on the new
+        // connection safely.
+        let mut pending: HashMap<u64, oneshot::Sender<Response>> = HashMap::new();
         loop {
             let framed = match conn.take() {
                 Some(framed) => framed,
@@ -462,22 +490,14 @@ impl Actor {
             loop {
                 tokio::select! {
                     item = self.req_rx.recv() => {
-                        let Some((id, request)) = item else { break };
-                        // A request queued before a disconnect whose caller was
-                        // already failed over the reconnect must NOT be sent on
-                        // the new connection: the caller may have retried it
-                        // under a fresh id, and replaying the stale one would
-                        // execute the write twice.
-                        if !self.pending.lock().expect("pending poisoned").contains_key(&id) {
-                            continue;
-                        }
+                        let Some((id, request, reply_tx)) = item else { break };
                         let frame = ClientFrame::Request { id, request };
                         let Ok(bytes) = encode_tagged(RecordKind::ClientFrame, &frame) else {
-                            self.fail(id);
-                            continue;
+                            continue; // dropping reply_tx fails the caller
                         };
+                        pending.insert(id, reply_tx);
                         if out_tx.send(Bytes::from(bytes)).await.is_err() {
-                            self.fail(id);
+                            pending.remove(&id);
                             break;
                         }
                     }
@@ -487,19 +507,17 @@ impl Actor {
                             Ok(ServerFrame::Response { id, response, stable_timestamp }) => {
                                 self.update_stable(stable_timestamp);
                                 // An unknown id is a reply to a request that
-                                // already timed out or failed over a reconnect.
-                                if let Some(tx) = self
-                                    .pending
-                                    .lock()
-                                    .expect("pending poisoned")
-                                    .remove(&id)
-                                {
+                                // already timed out (its caller is gone — the
+                                // send below just fails harmlessly).
+                                if let Some(tx) = pending.remove(&id) {
                                     let _ = tx.send(response);
                                 }
                             }
                             Ok(ServerFrame::Notify { stable_timestamp, .. }) => {
                                 self.update_stable(stable_timestamp);
-                                self.watch_tx.send_modify(|g| *g += 1);
+                                if let Some(watch_tx) = &self.watch_tx {
+                                    watch_tx.send_modify(|g| *g += 1);
+                                }
                             }
                             Err(err) => {
                                 tracing::debug!(?err, "undecodable frame, reconnecting");
@@ -510,14 +528,14 @@ impl Actor {
                 }
             }
             // Disconnected (or all clients dropped): stop the writer, fail
-            // everything in flight, then reconnect.
+            // everything in flight (dropping the reply senders surfaces
+            // "connection lost" at each caller), then reconnect.
             drop(out_tx);
             let _ = writer.await;
-            if self.req_rx.is_closed() && self.pending.lock().expect("pending poisoned").is_empty()
-            {
+            pending.clear();
+            if self.req_rx.is_closed() {
                 return;
             }
-            self.fail_pending();
         }
     }
 
@@ -545,17 +563,8 @@ impl Actor {
 
     fn update_stable(&self, stable_timestamp: Option<u64>) {
         if let Some(v) = stable_timestamp {
-            *self.stable.lock().expect("stable poisoned") = Some(v);
+            self.stable.fetch_max(v, Ordering::AcqRel);
         }
-    }
-
-    fn fail(&self, id: u64) {
-        self.pending.lock().expect("pending poisoned").remove(&id);
-    }
-
-    fn fail_pending(&self) {
-        // Dropping the senders surfaces "connection lost" at every caller.
-        self.pending.lock().expect("pending poisoned").clear();
     }
 }
 
@@ -565,7 +574,7 @@ impl Actor {
 /// update the watermark.
 async fn connect_and_hello(
     addr: SocketAddr,
-    stable: &Mutex<Option<u64>>,
+    stable: &AtomicU64,
     timeout: Duration,
 ) -> anyhow::Result<(Framed<TcpStream, LengthDelimitedCodec>, Option<String>)> {
     let stream = TcpStream::connect(addr).await?;
@@ -595,7 +604,7 @@ async fn connect_and_hello(
                     stable_timestamp,
                 } => {
                     if let Some(v) = stable_timestamp {
-                        *stable.lock().expect("stable poisoned") = Some(v);
+                        stable.fetch_max(v, Ordering::AcqRel);
                     }
                     return Ok(default_routing_key);
                 }
@@ -603,7 +612,7 @@ async fn connect_and_hello(
                     stable_timestamp, ..
                 } => {
                     if let Some(v) = stable_timestamp {
-                        *stable.lock().expect("stable poisoned") = Some(v);
+                        stable.fetch_max(v, Ordering::AcqRel);
                     }
                 }
                 _ => anyhow::bail!("unexpected frame during hello"),
