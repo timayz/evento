@@ -12,7 +12,9 @@
 //! | [`handler`] | Attribute | Create projection handler from async function |
 //! | [`subscription`] | Attribute | Create subscription handler for specific events |
 //! | [`subscription_all`] | Attribute | Create subscription handler for all events of an aggregate |
-//! | [`projection`] | Attribute | Add cursor field and implement `ProjectionCursor` |
+//! | [`projection`] | Attribute | Add cursor fields and implement `ProjectionCursor` |
+//! | [`snapshot`] | Attribute | Implement the `Snapshot` trait (`none` or `memory` mode) |
+//! | [`command`] | Attribute | Generate routing-key command variants from one method body |
 //! | [`Cursor`] | Derive | Generate cursor struct and trait implementations |
 //! | [`debug_handler`] | Attribute | Like `handler` but outputs generated code for debugging |
 //!
@@ -157,9 +159,11 @@
 //! bitcode derives.
 
 mod aggregator;
+mod command;
 mod cursor;
 mod handler;
 mod projection;
+mod snapshot;
 mod subscription;
 mod subscription_all;
 mod util;
@@ -178,7 +182,19 @@ use syn::{parse_macro_input, DeriveInput, ItemFn};
 ///
 /// # Aggregate Type Format
 ///
-/// The aggregate type is formatted as `"{package_name}/{enum_name}"`, e.g., `"bank/BankAccount"`.
+/// The aggregate type defaults to `"{package_name}/{enum_name}"`, e.g., `"bank/BankAccount"`.
+/// Because this identifies stored events on disk, renaming the crate or the enum
+/// silently orphans previously written events. Pin the identity explicitly with
+/// the `name` option to decouple it from code names:
+///
+/// ```rust,ignore
+/// #[evento::aggregate(name = "bank/BankAccount")]
+/// pub enum BankAccount {
+///     /// Defaults to the variant name; override per variant if needed:
+///     #[evento(name = "AccountOpened")]
+///     AccountOpened { owner_id: String },
+/// }
+/// ```
 ///
 /// # Example
 ///
@@ -225,7 +241,65 @@ use syn::{parse_macro_input, DeriveInput, ItemFn};
 /// - Unit variants: `Variant`
 #[proc_macro_attribute]
 pub fn aggregate(attr: TokenStream, item: TokenStream) -> TokenStream {
-    aggregator::aggregator(attr, item)
+    match aggregator::aggregator(attr, item) {
+        Ok(tokens) => tokens,
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+/// Generates routing-key command variants from a single method body.
+///
+/// Apply to an `impl` block. Every method whose **last** parameter is exactly
+/// `routing_key: Option<String>` is expanded into three methods:
+///
+/// - `name_opt(..., routing_key: Option<String>)` — the original body (hidden
+///   from docs)
+/// - `name(...)` — forwards `None`
+/// - `name_with_routing(..., routing_key: impl Into<String>)` — forwards
+///   `Some(key)`
+///
+/// This removes the need to duplicate a command body just to add
+/// `.routing_key(key)` — write the body once against
+/// `WriteBuilder::routing_key_opt`:
+///
+/// ```rust,ignore
+/// #[evento::command]
+/// impl<E: Executor> Command<E> {
+///     pub async fn transfer_money(
+///         &self,
+///         id: impl Into<String>,
+///         cmd: TransferMoney,
+///         routing_key: Option<String>,
+///     ) -> Result<(), BankAccountError> {
+///         let Some(account) = self.load(id).await? else {
+///             return Err(BankAccountError::AccountNotFound);
+///         };
+///         // guards...
+///         account
+///             .write()?
+///             .routing_key_opt(routing_key)
+///             .event(&MoneyTransferred { /* ... */ })
+///             .commit(&self.0)
+///             .await?;
+///         Ok(())
+///     }
+/// }
+///
+/// // Callers get the familiar pair:
+/// command.transfer_money("account-1", cmd).await?;
+/// command.transfer_money_with_routing("account-1", cmd, "eu-west").await?;
+/// ```
+///
+/// Methods without a trailing `routing_key: Option<String>` parameter are
+/// passed through untouched. Expanded methods must be `async`, take `&self`,
+/// and use simple identifier parameters.
+#[proc_macro_attribute]
+pub fn command(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(item as syn::ItemImpl);
+    match command::command_impl(attr, &input) {
+        Ok(tokens) => tokens,
+        Err(e) => e.to_compile_error().into(),
+    }
 }
 
 /// Creates a projection handler from an async function.
@@ -365,7 +439,7 @@ pub fn debug_handler(_attr: TokenStream, item: TokenStream) -> TokenStream {
 pub fn subscription(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemFn);
 
-    match subscription::subscription_next_impl(&input, false) {
+    match subscription::subscription_next_impl(&input) {
         Ok(tokens) => tokens,
         Err(e) => e.to_compile_error().into(),
     }
@@ -425,7 +499,7 @@ pub fn subscription(_attr: TokenStream, item: TokenStream) -> TokenStream {
 pub fn subscription_all(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemFn);
 
-    match subscription_all::subscription_all_next_impl(&input, false) {
+    match subscription_all::subscription_all_next_impl(&input) {
         Ok(tokens) => tokens,
         Err(e) => e.to_compile_error().into(),
     }
@@ -458,24 +532,78 @@ pub fn derive_cursor(input: TokenStream) -> TokenStream {
     }
 }
 
-/// Adds a `cursor: String` field and implements `ProjectionCursor`.
+/// Implements the `Snapshot` trait for a projection struct.
+///
+/// Projections that derive `bitcode::Encode`/`bitcode::Decode` already get
+/// executor-backed snapshots from a blanket impl. This macro covers the two
+/// other common cases; the mode is required:
+///
+/// - `#[evento::snapshot(none)]` — opt out of snapshotting entirely (an empty
+///   `Snapshot` impl). Use for views that are cheap to rebuild, or to prevent
+///   a bitcode-encodable view from persisting snapshots.
+/// - `#[evento::snapshot(memory)]` — an in-memory snapshot store. Generates a
+///   `snapshot_rows()` associated function returning a
+///   `&'static RwLock<HashMap<String, Self>>` keyed by aggregate id, and a
+///   `Snapshot` impl whose `restore`/`take_snapshot`/`drop_snapshot` read,
+///   insert, and remove entries in it.
+///
+/// Projections backed by a custom table (SQL, etc.) should keep implementing
+/// `Snapshot` by hand.
+///
+/// Note: on a struct that is `bitcode::Encode + Decode`, either mode conflicts
+/// with the blanket impl and rustc reports overlapping trait implementations —
+/// drop the bitcode derives or the attribute.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// #[evento::projection]
+/// #[evento::snapshot(memory)]
+/// pub struct AccountDetailsView {
+///     pub id: String,
+///     pub balance: i64,
+/// }
+///
+/// // Read the materialized rows elsewhere:
+/// let rows = AccountDetailsView::snapshot_rows().read().unwrap();
+/// ```
+#[proc_macro_attribute]
+pub fn snapshot(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(item as DeriveInput);
+    match snapshot::snapshot_impl(attr, &input) {
+        Ok(tokens) => tokens,
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+/// Adds cursor tracking fields and implements `ProjectionCursor`.
 ///
 /// This attribute macro transforms a struct to track its position in the event stream.
-/// It automatically adds a `cursor` field and implements the `ProjectionCursor` trait.
+/// It automatically adds cursor fields and implements the `ProjectionCursor` trait.
 ///
 /// # Generated Code
 ///
-/// - Adds `pub cursor: String` field
+/// - Adds `pub cursor: String` and `pub aggregate_version: u16` fields
 /// - Adds `Default` and `Clone` derives (preserves existing derives)
 /// - Implements `ProjectionCursor` trait
 ///
-/// # Additional Derives
+/// # Options
 ///
-/// Pass additional derives as arguments:
+/// Arguments may combine named options and extra derive paths, in any order:
+///
+/// - `cursor = <Type>` — use a custom cursor field type instead of `String`.
+///   The type must be `Clone + From<evento::cursor::Value> +
+///   Into<evento::cursor::Value>` (`evento::cursor::Value` itself qualifies).
+/// - `id = <field>` — additionally implement `ProjectionAggregate`, returning
+///   the named field as the aggregate id. This enables `view.write()` for
+///   emitting events from the projection.
+/// - any path (e.g. `serde::Serialize`) — added to the derive list.
 ///
 /// ```ignore
-/// #[evento::projection(serde::Serialize)]
-/// pub struct MyView { ... }
+/// #[evento::projection(cursor = evento::cursor::Value, id = id, serde::Serialize)]
+/// pub struct MyView {
+///     pub id: String,
+/// }
 /// ```
 ///
 /// # Example
@@ -494,6 +622,7 @@ pub fn derive_cursor(input: TokenStream) -> TokenStream {
 /// //     pub id: String,
 /// //     pub name: String,
 /// //     pub cursor: String,
+/// //     pub aggregate_version: u16,
 /// // }
 /// //
 /// // impl evento::ProjectionCursor for MyStruct { ... }

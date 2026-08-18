@@ -1,0 +1,5 @@
+error: expected a string literal: `name = "myapp/MyAggregate"`
+ --> tests/ui/fail/aggregate_bad_name.rs:1:28
+  |
+1 | #[evento::aggregate(name = 42)]
+  |                            ^^

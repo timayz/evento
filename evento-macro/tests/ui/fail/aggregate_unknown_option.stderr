@@ -1,0 +1,5 @@
+error: unknown option; expected `name = "..."` or derive paths like `serde::Serialize`
+ --> tests/ui/fail/aggregate_unknown_option.rs:1:21
+  |
+1 | #[evento::aggregate(rename = "custom/Account")]
+  |                     ^^^^^^

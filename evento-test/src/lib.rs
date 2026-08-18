@@ -2,9 +2,9 @@ use std::collections::HashMap;
 
 use bank::aggregator::{BankAccount, Created, MoneyDeposited, NameChanged};
 use bank::{
-    load_account_details, AccountStatus, AccountType, ChangeOverdraftLimit, CloseAccount,
-    DepositMoney, FreezeAccount, OpenAccount, ReceiveMoney, TransferMoney, UnfreezeAccount,
-    WithdrawMoney, ACCOUNT_DETAILS_ROWS, COMMAND_ROWS,
+    load_account_details, AccountDetailsView, AccountStatus, AccountType, ChangeOverdraftLimit,
+    CloseAccount, DepositMoney, FreezeAccount, OpenAccount, ReceiveMoney, TransferMoney,
+    UnfreezeAccount, WithdrawMoney,
 };
 use evento::cursor::{self, Order, ReadResult};
 use evento::Event;
@@ -370,7 +370,7 @@ pub async fn load_with_snapshot<E: Executor + Clone>(executor: &E) -> anyhow::Re
     // Manually insert a "snapshot" at version 1 with balance 1000
     // This simulates a snapshot taken after AccountOpened
     {
-        let mut rows = COMMAND_ROWS.write().unwrap();
+        let mut rows = bank::BankAccount::snapshot_rows().write().unwrap();
         rows.insert(account_id.clone(), data1);
     }
 
@@ -383,7 +383,7 @@ pub async fn load_with_snapshot<E: Executor + Clone>(executor: &E) -> anyhow::Re
 
     // Test with a snapshot at version 2
     {
-        let mut rows = COMMAND_ROWS.write().unwrap();
+        let mut rows = bank::BankAccount::snapshot_rows().write().unwrap();
         rows.insert(account_id.clone(), data2);
     }
 
@@ -396,7 +396,7 @@ pub async fn load_with_snapshot<E: Executor + Clone>(executor: &E) -> anyhow::Re
 
     // Test with snapshot at latest version (no events to apply)
     {
-        let mut rows = COMMAND_ROWS.write().unwrap();
+        let mut rows = bank::BankAccount::snapshot_rows().write().unwrap();
         rows.insert(account_id.clone(), account.clone());
     }
 
@@ -1069,7 +1069,7 @@ pub async fn subscribe_multiple_aggregator<E: Executor + Clone>(
 
     // Remove this test's account from projection
     {
-        let mut rows = ACCOUNT_DETAILS_ROWS.write().unwrap();
+        let mut rows = AccountDetailsView::snapshot_rows().write().unwrap();
         rows.remove(&account_id);
     }
 

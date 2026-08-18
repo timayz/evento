@@ -1,11 +1,4 @@
-use std::{collections::HashMap, sync::RwLock};
-
-use evento::{
-    Executor, cursor,
-    metadata::Event,
-    projection::{Context, Projection},
-};
-use once_cell::sync::Lazy;
+use evento::{Executor, metadata::Event, projection::Projection};
 
 use crate::{
     aggregator::{
@@ -15,9 +8,6 @@ use crate::{
     },
     value_object::{AccountStatus, AccountType},
 };
-
-pub static ACCOUNT_DETAILS_ROWS: Lazy<RwLock<HashMap<String, AccountDetailsView>>> =
-    Lazy::new(Default::default);
 
 pub fn create_projection<E: Executor>() -> Projection<E, AccountDetailsView> {
     Projection::new::<BankAccount>()
@@ -46,7 +36,8 @@ pub async fn load<E: Executor>(
         .await
 }
 
-#[derive(Default, Clone)]
+#[evento::projection(cursor = evento::cursor::Value)]
+#[evento::snapshot(memory)]
 pub struct AccountDetailsView {
     pub id: String,
     pub owner_id: String,
@@ -58,41 +49,6 @@ pub struct AccountDetailsView {
     pub status: AccountStatus,
     pub daily_withdrawal_limit: i64,
     pub overdraft_limit: i64,
-    pub cursor: cursor::Value,
-    pub aggregate_version: u16,
-}
-
-impl evento::ProjectionCursor for AccountDetailsView {
-    fn set_cursor(&mut self, v: &cursor::Value) {
-        self.cursor = v.clone();
-    }
-
-    fn get_cursor(&self) -> cursor::Value {
-        self.cursor.clone()
-    }
-
-    fn get_aggregate_version(&self) -> u16 {
-        self.aggregate_version
-    }
-
-    fn set_aggregate_version(&mut self, v: u16) {
-        self.aggregate_version = v;
-    }
-}
-
-impl<E: Executor> evento::Snapshot<E> for AccountDetailsView {
-    async fn restore(context: &Context<'_, E>) -> anyhow::Result<Option<Self>> {
-        let rows = ACCOUNT_DETAILS_ROWS.read().unwrap();
-
-        Ok(rows.get(&context.id).cloned())
-    }
-
-    async fn take_snapshot(&self, _context: &Context<'_, E>) -> anyhow::Result<()> {
-        let mut rows = ACCOUNT_DETAILS_ROWS.write().unwrap();
-        rows.insert(self.id.to_owned(), self.clone());
-
-        Ok(())
-    }
 }
 
 #[evento::handler]

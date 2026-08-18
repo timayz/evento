@@ -1,0 +1,5 @@
+error: unknown option; expected `cursor = <Type>`, `id = <field>`, or derive paths
+ --> tests/ui/fail/projection_unknown_option.rs:1:22
+  |
+1 | #[evento::projection(cursors = String)]
+  |                      ^^^^^^^

@@ -12,38 +12,13 @@ pub struct OpenAccount {
     pub initial_balance: i64,
 }
 
+#[evento::command]
 impl<E: Executor> super::Command<E> {
     /// Handle OpenAccount command - creates a new account
-    pub async fn open_account(&self, cmd: OpenAccount) -> Result<String, BankAccountError> {
-        if cmd.owner_id.is_empty() {
-            return Err(BankAccountError::OwnerIdRequired);
-        }
-        if cmd.owner_name.is_empty() {
-            return Err(BankAccountError::OwnerNameRequired);
-        }
-        if cmd.currency.is_empty() {
-            return Err(BankAccountError::CurrencyRequired);
-        }
-        if cmd.initial_balance < 0 {
-            return Err(BankAccountError::InvalidAmount);
-        }
-
-        Ok(evento::create()
-            .event(&AccountOpened {
-                owner_id: cmd.owner_id,
-                owner_name: cmd.owner_name,
-                account_type: cmd.account_type,
-                currency: cmd.currency,
-                initial_balance: cmd.initial_balance,
-            })
-            .commit(&self.0)
-            .await?)
-    }
-
-    pub async fn open_account_with_routing(
+    pub async fn open_account(
         &self,
         cmd: OpenAccount,
-        key: impl Into<String>,
+        routing_key: Option<String>,
     ) -> Result<String, BankAccountError> {
         if cmd.owner_id.is_empty() {
             return Err(BankAccountError::OwnerIdRequired);
@@ -59,7 +34,7 @@ impl<E: Executor> super::Command<E> {
         }
 
         Ok(evento::create()
-            .routing_key(key)
+            .routing_key_opt(routing_key)
             .event(&AccountOpened {
                 owner_id: cmd.owner_id,
                 owner_name: cmd.owner_name,

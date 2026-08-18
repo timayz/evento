@@ -31,8 +31,8 @@ use axum::{
     Form, Router,
 };
 use bank::{
-    account_details, AccountType, Command, DepositMoney, OpenAccount, ReceiveMoney, TransferMoney,
-    WithdrawMoney, ACCOUNT_DETAILS_ROWS,
+    account_details, AccountDetailsView, AccountType, Command, DepositMoney, OpenAccount,
+    ReceiveMoney, TransferMoney, WithdrawMoney,
 };
 use serde::Deserialize;
 use ulid::Ulid;
@@ -87,7 +87,7 @@ async fn run_web() -> anyhow::Result<()> {
         })?;
 
     // Rebuild this app's read model from the event log and then keep it current.
-    // The cache (`ACCOUNT_DETAILS_ROWS`) is in-memory, so it must be re-projected
+    // The cache (`AccountDetailsView::snapshot_rows()`) is in-memory, so it must be re-projected
     // from the start on every boot: a fresh per-boot subscription key has no
     // saved cursor, so the subscription replays all events and then streams new
     // ones live. Writes made through *other* web apps arrive without polling —
@@ -326,7 +326,7 @@ async fn transfer(
 // Helper functions
 
 fn get_all_accounts() -> Vec<AccountView> {
-    let rows = ACCOUNT_DETAILS_ROWS.read().unwrap();
+    let rows = AccountDetailsView::snapshot_rows().read().unwrap();
     let mut accounts: Vec<AccountView> = rows
         .iter()
         .map(|(id, view)| AccountView {

@@ -9,13 +9,12 @@ mod transfer_money;
 mod unfreeze_account;
 mod withdraw_money;
 
-use std::{collections::HashMap, ops::Deref, sync::RwLock};
+use std::ops::Deref;
 
 pub use change_daily_withdrawal_limit::*;
 pub use change_overdraft_limit::*;
 pub use close_account::*;
 pub use deposit_money::*;
-use evento::projection::Context;
 pub use freeze_account::*;
 pub use open_account::*;
 pub use receive_money::*;
@@ -23,17 +22,13 @@ pub use transfer_money::*;
 pub use unfreeze_account::*;
 pub use withdraw_money::*;
 
-use evento::{Executor, Projection, Snapshot, metadata::Event, projection::ProjectionAggregate};
+use evento::{Executor, Projection, metadata::Event};
 
 use crate::aggregator::{
     AccountClosed, AccountFrozen, AccountOpened, AccountUnfrozen, MoneyDeposited, MoneyReceived,
     MoneyTransferred, MoneyWithdrawn, OverdraftLimitChanged,
 };
 use crate::value_object::AccountStatus;
-
-use once_cell::sync::Lazy;
-
-pub static COMMAND_ROWS: Lazy<RwLock<HashMap<String, BankAccount>>> = Lazy::new(Default::default);
 
 pub struct Command<E: Executor>(pub E);
 
@@ -51,7 +46,8 @@ impl<E: Executor> Command<E> {
     }
 }
 
-#[evento::projection]
+#[evento::projection(id = id)]
+#[evento::snapshot(memory)]
 pub struct BankAccount {
     pub id: String,
     pub balance: i64,
@@ -103,27 +99,6 @@ fn create_projection<E: Executor>() -> Projection<E, BankAccount> {
         .handler(handle_account_frozen())
         .handler(handle_account_unfrozen())
         .strict()
-}
-
-impl ProjectionAggregate for BankAccount {
-    fn aggregate_id(&self) -> String {
-        self.id.to_owned()
-    }
-}
-
-impl<E: Executor> Snapshot<E> for BankAccount {
-    async fn restore(context: &Context<'_, E>) -> anyhow::Result<Option<Self>> {
-        let rows = COMMAND_ROWS.read().unwrap();
-
-        Ok(rows.get(&context.id).cloned())
-    }
-
-    async fn take_snapshot(&self, _context: &Context<'_, E>) -> anyhow::Result<()> {
-        let mut rows = COMMAND_ROWS.write().unwrap();
-        rows.insert(self.id.to_owned(), self.clone());
-
-        Ok(())
-    }
 }
 
 #[evento::handler]

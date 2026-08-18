@@ -4,7 +4,9 @@ use crate::value_object::AccountType;
 // EVENTS
 // =============================================================================
 
-#[evento::aggregate]
+// The explicit name pins the on-disk identity so renaming the crate or enum
+// can't orphan stored events. It matches the previous computed default.
+#[evento::aggregate(name = "bank/BankAccount")]
 pub enum BankAccount {
     /// Event raised when a new bank account is opened
     AccountOpened {
@@ -62,6 +64,6 @@ pub enum BankAccount {
 
 #[evento::aggregate]
 pub enum Owner {
-    Created { pub name: String },
-    NameChanged { pub value: String },
+    Created { name: String },
+    NameChanged { value: String },
 }

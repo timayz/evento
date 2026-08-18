@@ -1,0 +1,5 @@
+error: #[evento::command] methods with a `routing_key` parameter must take `&self`
+ --> tests/ui/fail/command_no_receiver.rs:5:9
+  |
+5 |     pub async fn act(routing_key: Option<String>) -> Option<String> {
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

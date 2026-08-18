@@ -1,0 +1,13 @@
+error: expected a mutable reference like `&mut YourProjection`
+  --> tests/ui/fail/handler_wrong_second_param.rs:14:51
+   |
+14 | async fn handle_opened(event: Event<Opened>, row: Row) -> anyhow::Result<()> {
+   |                                                   ^^^
+
+warning: unused import: `evento::metadata::Event`
+ --> tests/ui/fail/handler_wrong_second_param.rs:1:5
+  |
+1 | use evento::metadata::Event;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

@@ -1,7 +1,7 @@
 use convert_case::{Case, Casing};
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
-use syn::{Error, FnArg, GenericArgument, ItemFn, PatType, PathArguments, Type, TypePath};
+use syn::{Error, FnArg, ItemFn, PatType, Type};
 
 pub fn handler_next_impl(input: &ItemFn, debug: bool) -> syn::Result<TokenStream> {
     // `metadata::Event` borrows the raw event, so the (macro-owned) handler
@@ -12,6 +12,7 @@ pub fn handler_next_impl(input: &ItemFn, debug: bool) -> syn::Result<TokenStream
     }
     let input = &input;
     let fn_name = &input.sig.ident;
+    let vis = &input.vis;
 
     // Extract parameters
     let mut params = input.sig.inputs.iter();
@@ -20,13 +21,14 @@ pub fn handler_next_impl(input: &ItemFn, debug: bool) -> syn::Result<TokenStream
     let event_arg = params.next().ok_or_else(|| {
         Error::new_spanned(&input.sig, "expected first parameter: event: Event<T>")
     })?;
-    let (event_full_type, event_inner_type) = extract_type_with_first_generic(event_arg)?;
+    let (event_full_type, event_inner_type) =
+        crate::util::extract_type_with_first_generic(event_arg)?;
 
     // Second param: the projection reference, e.g. `&mut AccountBalanceView`
     let action_arg = params.next().ok_or_else(|| {
         Error::new_spanned(
             &input.sig,
-            "expected second parameter: action: Action<'_, P, E>",
+            "expected second parameter: `&mut YourProjection`",
         )
     })?;
     let projection_type = extract_projection_type(action_arg)?;
@@ -35,9 +37,9 @@ pub fn handler_next_impl(input: &ItemFn, debug: bool) -> syn::Result<TokenStream
     let handler_struct = format_ident!("{}Handler", fn_name.to_string().to_case(Case::UpperCamel));
 
     let output = quote! {
-        pub struct #handler_struct;
+        #vis struct #handler_struct;
 
-        fn #fn_name() -> #handler_struct { #handler_struct }
+        #vis fn #fn_name() -> #handler_struct { #handler_struct }
 
         impl #handler_struct {
             #input
@@ -71,63 +73,11 @@ pub fn handler_next_impl(input: &ItemFn, debug: bool) -> syn::Result<TokenStream
         }
     };
 
-    if !debug {
-        return Ok(output.into());
+    if debug {
+        crate::util::write_debug_expansion("evento_debug_handler_macro.rs", &output);
     }
 
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let debug_path =
-        std::path::PathBuf::from(&manifest_dir).join("../target/evento_debug_handler_macro.rs"); // adjust ../ as needed
-
-    std::fs::write(&debug_path, output.to_string()).ok();
-
-    let debug_path_str = debug_path
-        .canonicalize()
-        .unwrap()
-        .to_string_lossy()
-        .to_string();
-
-    Ok(quote! {
-        include!(#debug_path_str);
-    }
-    .into())
-}
-
-// Extract full type and first generic type argument
-// e.g., `EventData<AccountOpened, true>` -> (full type, AccountOpened)
-fn extract_type_with_first_generic(arg: &FnArg) -> syn::Result<(&Type, &TypePath)> {
-    let FnArg::Typed(PatType { ty, .. }) = arg else {
-        return Err(Error::new_spanned(arg, "expected typed argument"));
-    };
-
-    let Type::Path(type_path) = ty.as_ref() else {
-        return Err(Error::new_spanned(ty, "expected path type with generic"));
-    };
-
-    let segment = type_path
-        .path
-        .segments
-        .last()
-        .ok_or_else(|| Error::new_spanned(type_path, "empty type path"))?;
-
-    let PathArguments::AngleBracketed(args) = &segment.arguments else {
-        return Err(Error::new_spanned(
-            segment,
-            format!("expected generic arguments on {}", segment.ident),
-        ));
-    };
-
-    // Find first Type::Path argument
-    let inner = args
-        .args
-        .iter()
-        .find_map(|arg| match arg {
-            GenericArgument::Type(Type::Path(p)) => Some(p),
-            _ => None,
-        })
-        .ok_or_else(|| Error::new_spanned(args, "expected type argument"))?;
-
-    Ok((ty.as_ref(), inner))
+    Ok(output.into())
 }
 
 // Extract `AccountBalanceView` from `&mut AccountBalanceView`
@@ -139,7 +89,7 @@ fn extract_projection_type(arg: &FnArg) -> syn::Result<&Type> {
     let Type::Reference(type_path) = ty.as_ref() else {
         return Err(Error::new_spanned(
             ty,
-            "expected path type like Action<'_, P, E>",
+            "expected a mutable reference like `&mut YourProjection`",
         ));
     };
 

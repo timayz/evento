@@ -1,0 +1,5 @@
+error: `routing_key` parameter must have type `Option<String>`
+ --> tests/ui/fail/command_bad_routing_type.rs:5:42
+  |
+5 |     pub async fn act(&self, routing_key: Option<i64>) -> i64 {
+  |                                          ^^^^^^^^^^^

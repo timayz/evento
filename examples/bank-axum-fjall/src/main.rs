@@ -9,8 +9,8 @@ use axum::{
     Form, Router,
 };
 use bank::{
-    account_details, AccountType, Command, DepositMoney, OpenAccount, ReceiveMoney, TransferMoney,
-    WithdrawMoney, ACCOUNT_DETAILS_ROWS,
+    account_details, AccountDetailsView, AccountType, Command, DepositMoney, OpenAccount,
+    ReceiveMoney, TransferMoney, WithdrawMoney,
 };
 use evento::Fjall;
 use serde::Deserialize;
@@ -257,7 +257,7 @@ async fn transfer(
 // Helper functions
 
 fn get_all_accounts() -> Vec<AccountView> {
-    let rows = ACCOUNT_DETAILS_ROWS.read().unwrap();
+    let rows = AccountDetailsView::snapshot_rows().read().unwrap();
     let mut accounts: Vec<AccountView> = rows
         .iter()
         .map(|(id, view)| AccountView {

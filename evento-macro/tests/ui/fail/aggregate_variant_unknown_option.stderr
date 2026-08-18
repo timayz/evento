@@ -1,0 +1,5 @@
+error: unknown option; expected `name = "..."`
+ --> tests/ui/fail/aggregate_variant_unknown_option.rs:3:14
+  |
+3 |     #[evento(rename = "opened.v1")]
+  |              ^^^^^^
