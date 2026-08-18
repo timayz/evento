@@ -8,6 +8,12 @@ publish = true
 description = "Core types and traits for evento event sourcing library."
 documentation = "https://docs.rs/evento-core"
 readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 serde.workspace = true
@@ -27,9 +33,15 @@ futures-util = { workspace = true, optional = true }
 
 [dev-dependencies]
 rand.workspace = true
+# Doctests are written against the `evento` facade so examples read exactly as
+# users write them (a cargo-legal dev-dependency cycle).
+evento.workspace = true
 
 [features]
 default = ["macro"]
 macro = ["evento-macro"]
 group = ["futures-util"]
 rw = []
+
+[lints]
+workspace = true

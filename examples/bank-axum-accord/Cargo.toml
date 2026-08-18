@@ -1,7 +1,8 @@
 [package]
 name = "bank-axum-accord"
 version = "2.0.0-alpha.27"
-edition = "2021"
+edition.workspace = true
+publish = false
 
 [dependencies]
 bank.workspace = true

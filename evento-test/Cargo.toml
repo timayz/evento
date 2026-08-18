@@ -4,16 +4,19 @@ version = "2.0.0-alpha.27"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Event sourcing and CQRS toolkit with SQL persistence, projections, and subscriptions"
-documentation = "https://docs.rs/evento"
+description = "Shared conformance test suite for evento executor backends."
 readme = "README.md"
+publish = false
 
 [dependencies]
 evento = { path = "../evento", version = "2.0.0-alpha.27" }
-bank = { path = "../examples/bank", version = "2.0.0-alpha.27" }
+bank = { path = "../examples/bank" }
 ulid.workspace = true
 rand.workspace = true
 anyhow.workspace = true
 once_cell.workspace = true
 bitcode.workspace = true
 tokio.workspace = true
+
+[lints]
+workspace = true

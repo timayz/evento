@@ -8,6 +8,8 @@ publish = true
 description = "Accord consensus protocol (CEP-15) executor for evento — a leaderless, strictly-serializable, highly-available replicated event store"
 documentation = "https://docs.rs/evento-accord"
 readme = "README.md"
+keywords = ["event-sourcing", "cqrs", "consensus", "events", "eventstore"]
+categories.workspace = true
 
 [dependencies]
 evento-core = { path = "../evento-core", version = "2.0.0-alpha.27" }
@@ -34,3 +36,6 @@ criterion = "0.8"
 [[bench]]
 name = "throughput"
 harness = false
+
+[lints]
+workspace = true

@@ -8,6 +8,12 @@ publish = true
 description = "SQL migrations for evento event sourcing library."
 documentation = "https://docs.rs/evento-sql-migrator"
 readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 evento-sql = { path = "../evento-sql", version = "2.0.0-alpha.27" }
@@ -25,3 +31,7 @@ accord = []
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+evento = { workspace = true, features = ["sql"] }
+
+[lints]
+workspace = true
