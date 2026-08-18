@@ -9,9 +9,9 @@ down:
 
 reset: down up
 
-check: test fmt lint machete
+check: test fmt lint machete check.examples
 
-test: test.sql test.core test.fjall test.accord test.remote test.migrator test.doc
+test: test.sql test.core test.fjall test.accord test.remote test.migrator test.macro test.doc
 
 test.sql:
 	cargo test --all-features -p evento-sql
@@ -37,8 +37,19 @@ test.remote:
 test.migrator:
 	cargo test --all-features -p evento-sql-migrator
 
+# The proc macros: unit tests plus the trybuild UI suite (tests/ui/{pass,fail}).
+test.macro:
+	cargo test -p evento-macro
+
+# Every doctest in the workspace, including the root README (compile-checked via
+# the cfg(doctest) include in evento/src/lib.rs). Feature-gated examples need
+# --all-features.
 test.doc:
-	cargo test --doc -p evento
+	cargo test --doc --workspace --all-features
+
+# Examples (and everything else) type-check; examples are not covered by `test`.
+check.examples:
+	cargo check --workspace --all-features
 
 # Independent, adversarial verification of evento-accord (Docker + Jepsen + Elle).
 # Requires Docker; everything else runs in containers. See evento-accord/jepsen.
