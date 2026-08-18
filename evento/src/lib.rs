@@ -1,3 +1,4 @@
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
 //! Event sourcing and CQRS toolkit with SQL persistence, projections, and subscriptions.
 //!
 //! Evento provides a complete toolkit for implementing event sourcing patterns in Rust,
@@ -117,6 +118,14 @@
 //!
 //! This crate re-exports types from [`evento_core`] and conditionally from
 //! `evento_sql` and `evento_sql_migrator` when database features are enabled.
+
+// Compile-check every ```rust block in the workspace README as a doctest, so
+// the README cannot drift from the actual API. Runs under
+// `cargo test --doc -p evento --all-features` (feature-gated blocks need
+// --all-features).
+#[cfg(doctest)]
+#[doc = include_str!("../../README.md")]
+struct ReadmeDoctests;
 
 // Re-export everything from evento-core
 pub use evento_core::*;

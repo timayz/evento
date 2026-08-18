@@ -114,6 +114,9 @@ pub struct SyncKnown {
 /// A protocol message between nodes. Every message names its transaction by
 /// [`TxnId`]; the id's node component identifies the *original* coordinator, so
 /// replicas route execution results back without any separate addressing.
+// Field semantics are described in each variant's doc; per-field one-liners
+// would only repeat them.
+#[allow(missing_docs)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Message {
     /// Coordinator → replicas: propose `txn` (= `t0`) for the given keys/events.

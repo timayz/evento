@@ -18,7 +18,7 @@
 //! ## Scope
 //!
 //! Only the **bitcode boundary** is tagged: the framed-TCP wire ([`crate::tcp`]) and
-//! the disk journal *values* ([``evento_fjall::FjallJournal``]). The in-memory transport and
+//! the disk journal *values* (`evento_fjall::FjallJournal`). The in-memory transport and
 //! journal pass typed structs by value and never serialize, so they are untouched.
 //! Journal **keys** are likewise left bare (a `TxnId` whose ordering the journal's
 //! truncation scan relies on); the value carries the schema that evolves.

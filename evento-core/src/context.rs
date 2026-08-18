@@ -11,19 +11,21 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```rust
 //! use evento::context::{RwContext, Data};
 //!
+//! # struct MyAppState { greeting: &'static str }
 //! // Create a context
 //! let ctx = RwContext::new();
 //!
 //! // Store data by type
-//! ctx.insert(Data::new(MyAppState { ... }));
+//! ctx.insert(Data::new(MyAppState { greeting: "hello" }));
 //! ctx.insert(42u32);
 //!
 //! // Retrieve data by type
 //! let state: Data<MyAppState> = ctx.extract();
 //! let number: u32 = ctx.get().unwrap();
+//! # assert_eq!(number, 42);
 //! ```
 
 use serde::Serialize;
@@ -66,7 +68,8 @@ impl Hasher for NoOpHasher {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust
+/// # use evento::context::Context;
 /// let mut ctx = Context::new();
 /// ctx.insert(42u32);
 /// ctx.insert("hello".to_string());
@@ -172,7 +175,7 @@ fn downcast_owned<T: Send + Sync + 'static>(boxed: Box<dyn Any + Send + Sync>) -
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust
 /// use evento::context::Data;
 ///
 /// struct AppConfig {
@@ -250,7 +253,7 @@ where
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust
 /// use evento::context::RwContext;
 ///
 /// let ctx = RwContext::new();
@@ -263,6 +266,7 @@ where
 ///
 /// // Extract panics if not found (useful for required dependencies)
 /// let value: u32 = ctx.extract();
+/// # assert_eq!(value, 42);
 /// ```
 ///
 /// # Panics

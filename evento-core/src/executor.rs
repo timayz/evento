@@ -26,7 +26,8 @@ use crate::{
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust
+/// # use evento::EventFilter;
 /// // All events for an aggregate type
 /// let filter = EventFilter::by_type("myapp/User");
 ///
@@ -117,18 +118,12 @@ pub struct SubscriberStatus {
 
 /// Core trait for event storage backends.
 ///
-/// Implementations handle persisting events, querying, and managing subscriptions.
-/// The main implementation is [`evento_sql::Sql`](../evento_sql/struct.Sql.html).
-///
-/// # Methods
-///
-/// - `write` - Persist events atomically
-/// - `read` - Query events with filtering and pagination
-/// - `latest_timestamp` - Get the timestamp of the most recent matching event
-/// - `get_subscriber_cursor` - Get subscription position
-/// - `is_subscriber_running` - Check if subscription is active
-/// - `upsert_subscriber` - Create/update subscription
-/// - `acknowledge` - Update subscription cursor
+/// Implementations handle persisting events (`write`/`replicate`), querying
+/// (`read`, `latest_timestamp`), and managing subscription state
+/// (`upsert_subscriber`, `acknowledge`, `subscriber_status`). Backends include
+/// `evento_sql::Sql` (SQLite/MySQL/PostgreSQL), `evento_fjall::Fjall`
+/// (embedded), `evento_remote::Client` (TCP), and `evento_accord`
+/// (consensus-replicated).
 #[async_trait::async_trait]
 pub trait Executor: Send + Sync + 'static {
     /// Default routing key applied to new aggregates and inherited by
@@ -388,12 +383,15 @@ pub trait Executor: Send + Sync + 'static {
 ///
 /// # Example
 ///
-/// ```rust,ignore
-/// let sql_executor: Sql<sqlx::Sqlite> = pool.into();
-/// let evento = Evento::new(sql_executor);
+/// ```rust,no_run
+/// # use evento::{Event, Evento, Executor};
+/// # async fn run<E: Executor>(executor: E, events: Vec<Event>) -> anyhow::Result<()> {
+/// let evento = Evento::new(executor);
 ///
 /// // Use like any executor
 /// evento.write(events).await?;
+/// # Ok(())
+/// # }
 /// ```
 pub struct Evento {
     inner: Arc<Box<dyn Executor>>,
@@ -748,8 +746,12 @@ impl Executor for EventoGroup {
 ///
 /// # Example
 ///
-/// ```rust,ignore
-/// let rw: Rw<ReadReplica, Primary> = (read_executor, write_executor).into();
+/// ```rust,no_run
+/// # use evento::{Executor, Rw};
+/// # fn wire<R: Executor, W: Executor>(read_executor: R, write_executor: W) {
+/// let rw: Rw<R, W> = (read_executor, write_executor).into();
+/// # let _ = rw;
+/// # }
 /// ```
 #[cfg(feature = "rw")]
 pub struct Rw<R: Executor, W: Executor> {

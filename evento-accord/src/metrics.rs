@@ -103,7 +103,9 @@ impl Metrics {
     }
 }
 
-/// An immutable point-in-time view of [`Metrics`].
+/// An immutable point-in-time view of [`Metrics`], field-for-field; see the
+/// counter docs there.
+#[allow(missing_docs)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MetricsSnapshot {
     pub writes_committed: u64,
@@ -190,8 +192,23 @@ impl MetricsSnapshot {
     /// Like [`to_prometheus`](Self::to_prometheus) but attaches `labels` (e.g. the
     /// node id) to every metric, so a multi-node scrape can disambiguate series:
     ///
-    /// ```ignore
-    /// let text = node.metrics().to_prometheus_labeled(&[("node", &node_id.to_string())]);
+    /// ```rust,no_run
+    /// # use std::sync::Arc;
+    /// # use evento_accord::{
+    /// #     HybridLogicalClock, InMemoryDataStore, InMemoryJournal, InMemoryNetwork, Node,
+    /// #     NodeId, StaticTopology,
+    /// # };
+    /// # let node_id = NodeId(0);
+    /// # let net = InMemoryNetwork::new();
+    /// # let node = Node::new(
+    /// #     node_id,
+    /// #     Arc::new(StaticTopology::new(node_id, vec![node_id])),
+    /// #     Arc::new(HybridLogicalClock::new(node_id)),
+    /// #     Arc::new(net.sink(node_id)),
+    /// #     Arc::new(InMemoryDataStore::new()),
+    /// #     Arc::new(InMemoryJournal::new()),
+    /// # );
+    /// let text = node.metrics().to_prometheus_labeled(&[("node", &node_id.0.to_string())]);
     /// ```
     pub fn to_prometheus_labeled(&self, labels: &[(&str, &str)]) -> String {
         let label_set = if labels.is_empty() {

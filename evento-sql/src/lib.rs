@@ -1,3 +1,4 @@
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
 //! SQL database implementations for the Evento event sourcing library.
 //!
 //! This crate provides SQL-based persistence for events and subscriber state, supporting
@@ -23,10 +24,11 @@
 //!
 //! ## Quick Start
 //!
-//! ```rust,ignore
+//! ```rust,no_run
 //! use evento_sql::Sql;
 //! use sqlx::sqlite::SqlitePoolOptions;
 //!
+//! # async fn run() -> anyhow::Result<()> {
 //! // Create a connection pool
 //! let pool = SqlitePoolOptions::new()
 //!     .connect(":memory:")
@@ -36,6 +38,9 @@
 //! let executor: Sql<sqlx::Sqlite> = pool.into();
 //!
 //! // Use with Evento for event sourcing operations
+//! # let _ = executor;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! ## Type Aliases

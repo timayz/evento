@@ -1,3 +1,17 @@
+//! Shared conformance test suite for evento [`Executor`] backends.
+//!
+//! Each public async function is one scenario, generic over the executor, so
+//! every backend (`evento-sql`, `evento-fjall`, `evento-remote`, …) runs the
+//! exact same behavioral checks. A backend's integration test simply calls
+//! each scenario with its executor:
+//!
+//! ```rust,ignore
+//! #[tokio::test]
+//! async fn load() -> anyhow::Result<()> {
+//!     evento_test::load(&my_executor().into()).await
+//! }
+//! ```
+
 use std::collections::HashMap;
 
 use bank::aggregator::{BankAccount, Created, MoneyDeposited, NameChanged};
@@ -29,6 +43,7 @@ async fn last_routing_key<E: Executor>(
     Ok(events.first().unwrap().node.routing_key.clone())
 }
 
+/// Scenario: committed events fold into the expected projection state on load.
 pub async fn load<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
     let cmd = bank::Command(executor.clone());
     // Create first account (John) with initial balance
@@ -146,6 +161,8 @@ pub async fn load<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Scenario: a stream's routing key is locked at first write and preserved by
+/// later commits.
 pub async fn routing_key<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
     let cmd = bank::Command(executor.clone());
 
@@ -259,6 +276,7 @@ pub async fn routing_key<E: Executor + Clone>(executor: &E) -> anyhow::Result<()
     Ok(())
 }
 
+/// Scenario: loading a projection whose handlers span multiple aggregate types.
 pub async fn load_multiple_aggregator<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
     let cmd = bank::Command(executor.clone());
 
@@ -325,6 +343,8 @@ pub async fn load_multiple_aggregator<E: Executor + Clone>(executor: &E) -> anyh
     Ok(())
 }
 
+/// Scenario: loading a projection resumes from a stored snapshot plus trailing
+/// events.
 pub async fn load_with_snapshot<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
     let cmd = bank::Command(executor.clone());
 
@@ -409,6 +429,8 @@ pub async fn load_with_snapshot<E: Executor + Clone>(executor: &E) -> anyhow::Re
     Ok(())
 }
 
+/// Scenario: optimistic concurrency — a commit with a stale `original_version`
+/// is rejected.
 pub async fn invalid_original_version<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
     let cmd = bank::Command(executor.clone());
 
@@ -472,6 +494,7 @@ pub async fn invalid_original_version<E: Executor + Clone>(executor: &E) -> anyh
     Ok(())
 }
 
+/// Scenario: subscriber registration and worker-ownership tracking.
 pub async fn subscriber_running<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
     let sub1 = simple::subscription().start(executor).await?;
     let sub2 = simple::subscription().start(executor).await?;
@@ -490,6 +513,7 @@ pub async fn subscriber_running<E: Executor + Clone>(executor: &E) -> anyhow::Re
     Ok(())
 }
 
+/// Scenario: a running subscription processes existing backlog and live writes.
 pub async fn subscribe<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
     let cmd = bank::Command(executor.clone());
 
@@ -590,6 +614,7 @@ pub async fn subscribe<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> 
 /// explain a fast pickup — if the handler runs well under that, it is the
 /// `write_watch` signal waking the loop. A regression to pure polling would make
 /// this take ~5s and time out.
+/// Scenario: writes wake a subscription without waiting out the poll interval.
 pub async fn subscribe_low_latency<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
     use std::time::{Duration, Instant};
 
@@ -649,6 +674,7 @@ pub async fn subscribe_low_latency<E: Executor + Clone>(executor: &E) -> anyhow:
     Ok(())
 }
 
+/// Scenario: a subscription only receives events matching its routing key.
 pub async fn subscribe_routing_key<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
     let cmd = bank::Command(executor.clone());
 
@@ -753,6 +779,7 @@ pub async fn subscribe_routing_key<E: Executor + Clone>(executor: &E) -> anyhow:
     Ok(())
 }
 
+/// Scenario: subscription behavior when no explicit routing key is configured.
 pub async fn subscribe_default<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
     let cmd = bank::Command(executor.clone());
 
@@ -850,6 +877,8 @@ pub async fn subscribe_default<E: Executor + Clone>(executor: &E) -> anyhow::Res
     Ok(())
 }
 
+/// Scenario: an executor-level default routing key is inherited by writes and
+/// subscriptions.
 pub async fn subscribe_default_routing_key<E: Executor + Clone>(
     executor: &E,
 ) -> anyhow::Result<()> {
@@ -947,6 +976,8 @@ pub async fn subscribe_default_routing_key<E: Executor + Clone>(
 ///
 /// The storage key for `.all()` must include the executor's default routing
 /// key as a prefix; otherwise tenant-b reads from where tenant-a stopped.
+/// Scenario: isolation between default-routing-key subscriptions and
+/// all-events subscriptions.
 pub async fn subscribe_default_routing_key_all_isolation<E: Executor + Clone>(
     executor: &E,
 ) -> anyhow::Result<()> {
@@ -1023,6 +1054,7 @@ pub async fn subscribe_default_routing_key_all_isolation<E: Executor + Clone>(
     Ok(())
 }
 
+/// Scenario: one subscription handling events from multiple aggregate types.
 pub async fn subscribe_multiple_aggregator<E: Executor + Clone>(
     executor: &E,
 ) -> anyhow::Result<()> {
@@ -1146,6 +1178,8 @@ mod co_keyed {
 
 /// A projection subscription over a co-keyed secondary aggregate must scope that
 /// aggregate to each event's id — not read every instance of its type.
+/// Scenario: subscribing over a secondary aggregate co-keyed with the
+/// projection id.
 pub async fn subscribe_co_keyed_aggregator<E: Executor + Clone>(
     executor: &E,
 ) -> anyhow::Result<()> {
@@ -1217,6 +1251,8 @@ pub async fn subscribe_co_keyed_aggregator<E: Executor + Clone>(
 /// `.load()` auto-keys a secondary aggregate to the loaded id when it is not
 /// registered with `.aggregate::<S>(id)` — scoping its events to that id rather
 /// than reading every instance of the type.
+/// Scenario: loading a projection over a secondary aggregate co-keyed with the
+/// projection id.
 pub async fn load_co_keyed_aggregator<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
     let cmd = bank::Command(executor.clone());
 
@@ -1268,6 +1304,8 @@ pub async fn load_co_keyed_aggregator<E: Executor + Clone>(executor: &E) -> anyh
     Ok(())
 }
 
+/// Scenario: routing-key filtering combined with handlers over multiple
+/// aggregate types.
 pub async fn subscribe_routing_key_multiple_aggregator<E: Executor + Clone>(
     executor: &E,
 ) -> anyhow::Result<()> {
@@ -1390,6 +1428,8 @@ pub async fn subscribe_routing_key_multiple_aggregator<E: Executor + Clone>(
     Ok(())
 }
 
+/// Scenario: default-key subscription with handlers over multiple aggregate
+/// types.
 pub async fn subscribe_default_multiple_aggregator<E: Executor + Clone>(
     executor: &E,
 ) -> anyhow::Result<()> {
@@ -2001,6 +2041,7 @@ mod multiple {
 /// regression guard against ordering by `timestamp_subsec` first (which reorders
 /// events whose larger whole-second carries a smaller sub-second). The existing
 /// suite cannot catch it because it always uses `timestamp_subsec: 0`.
+/// Scenario: events read back in commit (timestamp/cursor) order.
 pub async fn read_order_timestamp<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
     let agg_type = "evento/OrderTest";
     let mk = |t: u64, s: u32| Event {
@@ -2058,6 +2099,8 @@ pub async fn read_order_timestamp<E: Executor + Clone>(executor: &E) -> anyhow::
 /// `write` must replace client-supplied timestamps with the store's commit
 /// clock (so cursor order tracks commit order), while `replicate` persists
 /// them verbatim (for replication layers that own ordering).
+/// Scenario: `write` re-stamps client-supplied timestamps with the store's
+/// commit clock.
 pub async fn write_restamps_client_clock<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
     let agg_type = "evento/RestampTest";
     let mk = |id: &str| Event {
@@ -2107,6 +2150,7 @@ pub async fn write_restamps_client_clock<E: Executor + Clone>(executor: &E) -> a
 
 /// `EventFilter::exact(type, id, name)` must return only events of that exact name
 /// for the given aggregate. This exercises Fjall's `agg_name_index` fast path.
+/// Scenario: `EventFilter::exact` matches a single aggregate/event pair only.
 pub async fn exact_filter<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
     let agg_type = "evento/FilterTest";
     let id = Ulid::generate().to_string();
@@ -2161,6 +2205,7 @@ pub async fn exact_filter<E: Executor + Clone>(executor: &E) -> anyhow::Result<(
 /// Concurrent appends at the same `original_version` must conflict: exactly one
 /// wins, the rest get `InvalidOriginalVersion`. Guards optimistic concurrency under
 /// real parallelism (the existing suite only tests it sequentially).
+/// Scenario: concurrent appends to one stream serialize without losing events.
 pub async fn concurrent_append<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
     let id = evento::create()
         .event(&MoneyDeposited {
@@ -2209,6 +2254,7 @@ pub async fn concurrent_append<E: Executor + Clone>(executor: &E) -> anyhow::Res
 }
 
 /// A `.strict()` subscription must fail when it encounters an event with no handler.
+/// Scenario: a `strict()` subscription fails on an event without a handler.
 pub async fn strict_unhandled<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
     let cmd = bank::Command(executor.clone());
     let id = cmd
@@ -2245,6 +2291,7 @@ pub async fn strict_unhandled<E: Executor + Clone>(executor: &E) -> anyhow::Resu
 }
 
 /// A registered tombstone event must make projection load return `None`.
+/// Scenario: tombstone handling for deleted aggregates.
 pub async fn tombstone<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
     use bank::aggregator::AccountClosed;
 
@@ -2283,6 +2330,7 @@ pub async fn tombstone<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> 
 }
 
 /// `#[subscription_all]` must observe every event of the aggregate regardless of type.
+/// Scenario: an all-events subscription observes every event exactly once.
 pub async fn subscription_all_counts<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
     use std::sync::atomic::Ordering::SeqCst;
 
@@ -2323,6 +2371,8 @@ pub async fn subscription_all_counts<E: Executor + Clone>(executor: &E) -> anyho
 
 /// The executor snapshot contract: snapshots are scoped by revision (a revision
 /// bump invalidates old snapshots), and delete removes them.
+/// Scenario: stored snapshots are scoped to the projection revision that wrote
+/// them.
 pub async fn snapshot_revision_scope<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
     use evento::cursor::Value;
 
@@ -2419,6 +2469,8 @@ mod feature {
     }
 }
 
+/// Asserts that a backend's paginated read matches the in-memory
+/// [`cursor::Reader`] reference implementation for the same data and args.
 pub fn assert_read_result(
     args: Args,
     order: Order,
@@ -2436,6 +2488,8 @@ pub fn assert_read_result(
     Ok(())
 }
 
+/// Generates a randomized set of events across several aggregates, types, and
+/// routing keys for pagination tests.
 pub fn get_data() -> Vec<Event> {
     let aggregator_ids = [
         Ulid::generate().to_string(),

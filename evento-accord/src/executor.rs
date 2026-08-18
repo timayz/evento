@@ -7,7 +7,7 @@
 //! to date by applying committed transactions.
 //!
 //! [`ExecutorDataStore`] is the bridge in the other direction: the Accord
-//! [`DataStore`](crate::api::DataStore) that a replica uses to read an
+//! [`DataStore`] that a replica uses to read an
 //! aggregate's version (for the commit condition) and to append committed events
 //! — both delegated to that same local backend. Share one backend instance
 //! (it is `Clone`/`Arc`-backed) between the two so a node's writes are visible to

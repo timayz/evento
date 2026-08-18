@@ -678,8 +678,9 @@ impl Replica {
     }
 
     /// Restores a command from the journal on restart, preserving its actual
-    /// status, ballots, and decision (unlike [`import_applied`], which is for
-    /// bootstrap and forces `Applied`).
+    /// status, ballots, and decision (unlike
+    /// [`import_applied`](Self::import_applied), which is for bootstrap and
+    /// forces `Applied`).
     pub fn restore(&mut self, cmd: CommandState) {
         self.insert(cmd);
     }

@@ -1,3 +1,4 @@
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
 //! Core types and traits for the Evento event sourcing library.
 //!
 //! This crate provides the foundational abstractions for building event-sourced applications
@@ -20,7 +21,7 @@
 //! Events are immutable facts that represent something that happened in your domain.
 //! The [`Event`] struct stores serialized event data with metadata:
 //!
-//! ```rust,ignore
+//! ```rust,no_run
 //! // Define events using the aggregate macro
 //! #[evento::aggregate]
 //! pub enum BankAccount {
@@ -38,14 +39,19 @@
 //!
 //! Use [`create()`] or [`append()`] to build and commit events:
 //!
-//! ```rust,ignore
-//! use evento::metadata::Metadata;
-//!
+//! ```rust,no_run
+//! # #[evento::aggregate]
+//! # pub enum BankAccount {
+//! #     AccountOpened { owner_id: String, initial_balance: i64 },
+//! # }
+//! # async fn run<E: evento::Executor>(executor: &E) -> anyhow::Result<()> {
 //! let id = evento::create()
 //!     .event(&AccountOpened { owner_id: "user1".into(), initial_balance: 1000 })
-//!     .metadata(&Metadata::default())
-//!     .commit(&executor)
+//!     .metadata("request_id", &"abc123".to_owned())
+//!     .commit(executor)
 //!     .await?;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! ## Projections
@@ -53,11 +59,15 @@
 //! Build read models by replaying events. Use the [`projection`](mod@projection) module for loading
 //! aggregate state:
 //!
-//! ```rust,ignore
+//! ```rust,no_run
+//! use evento::metadata::Event;
 //! use evento::projection::Projection;
 //!
-//! #[evento::projection]
-//! #[derive(Debug)]
+//! # #[evento::aggregate]
+//! # pub enum BankAccount {
+//! #     MoneyDeposited { amount: i64 },
+//! # }
+//! #[evento::projection(bitcode::Encode, bitcode::Decode)]
 //! pub struct AccountView {
 //!     pub balance: i64,
 //! }
@@ -71,20 +81,29 @@
 //!     Ok(())
 //! }
 //!
+//! # async fn run<E: evento::Executor>(executor: &E) -> anyhow::Result<()> {
 //! let result = Projection::<_, AccountView>::new::<BankAccount>()
 //!     .handler(on_deposited())
 //!     .load("account-123")
-//!     .execute(&executor)
+//!     .execute(executor)
 //!     .await?;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! ## Subscriptions
 //!
 //! Process events continuously in real-time. See the [`subscription`](mod@subscription) module:
 //!
-//! ```rust,ignore
-//! use evento::subscription::SubscriptionBuilder;
+//! ```rust,no_run
+//! use evento::metadata::Event;
+//! use evento::subscription::{Context, SubscriptionBuilder};
+//! use evento::Executor;
 //!
+//! # #[evento::aggregate]
+//! # pub enum BankAccount {
+//! #     MoneyDeposited { amount: i64 },
+//! # }
 //! #[evento::subscription]
 //! async fn on_deposited<E: Executor>(
 //!     context: &Context<'_, E>,
@@ -94,11 +113,14 @@
 //!     Ok(())
 //! }
 //!
-//! let subscription = SubscriptionBuilder::<Sqlite>::new("deposit-processor")
+//! # async fn run<E: Executor + Clone + 'static>(executor: &E) -> anyhow::Result<()> {
+//! let subscription = SubscriptionBuilder::new("deposit-processor")
 //!     .handler(on_deposited())
 //!     .routing_key("accounts")
-//!     .start(&executor)
+//!     .start(executor)
 //!     .await?;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! ## Cursor-based Pagination
@@ -115,22 +137,31 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
-//! use evento::{Executor, metadata::Metadata, cursor::Args, EventFilter};
+//! ```rust,no_run
+//! use evento::{cursor::Args, Aggregate, EventFilter, Executor};
 //!
+//! # #[evento::aggregate]
+//! # pub enum BankAccount {
+//! #     AccountOpened { owner_id: String, initial_balance: i64 },
+//! # }
+//! # async fn run<E: Executor>(executor: &E) -> anyhow::Result<()> {
 //! // Create and persist an event
 //! let id = evento::create()
 //!     .event(&AccountOpened { owner_id: "user1".into(), initial_balance: 1000 })
-//!     .metadata(&Metadata::default())
-//!     .commit(&executor)
+//!     .commit(executor)
 //!     .await?;
 //!
 //! // Query events with pagination
-//! let events = executor.read(
-//!     Some(vec![EventFilter::by_id("myapp/Account", &id)]),
-//!     None,
-//!     Args::forward(10, None),
-//! ).await?;
+//! let events = executor
+//!     .read(
+//!         Some([EventFilter::by_id(BankAccount::aggregate_type(), &id)].into()),
+//!         None,
+//!         Args::forward(10, None),
+//!         None,
+//!     )
+//!     .await?;
+//! # Ok(())
+//! # }
 //! ```
 
 mod aggregator;

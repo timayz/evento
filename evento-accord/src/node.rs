@@ -392,7 +392,8 @@ impl Node {
     /// subscription that only processes events below it cannot skip a late,
     /// lower-cursor event applied out of order from another node — provided
     /// propagation + clock skew stays within `compaction_margin` (the bound the
-    /// node already assumes). Exposed to [`Executor::stable_timestamp`].
+    /// node already assumes). Exposed to
+    /// [`Executor::stable_timestamp`](evento_core::Executor::stable_timestamp).
     pub fn stable_micros(&self) -> u64 {
         let cutoff = self.margin_cutoff();
         self.replica
@@ -2040,7 +2041,8 @@ impl Node {
     }
 
     /// Runs only PreAccept and returns the transaction id, modelling a
-    /// coordinator that crashed before committing. For tests of [`recover`].
+    /// coordinator that crashed before committing. For tests of
+    /// [`recover`](Self::recover).
     pub async fn coordinate_preaccept(&self, events: Vec<Event>) -> anyhow::Result<TxnId> {
         let keys = Self::keys_of(&events);
         let (plans, _union) = self.plan(&keys, &events);

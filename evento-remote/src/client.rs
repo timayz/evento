@@ -158,6 +158,7 @@ impl Client {
         Client::builder(addr).connect().await
     }
 
+    /// Starts building a client for `addr` (request timeout, connection count).
     pub fn builder(addr: SocketAddr) -> ClientBuilder {
         ClientBuilder {
             addr,

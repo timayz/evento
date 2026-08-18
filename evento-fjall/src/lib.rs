@@ -1,3 +1,4 @@
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
 //! Fjall embedded key-value store implementation for evento.
 //!
 //! This crate provides an [`Executor`] implementation using [fjall](https://crates.io/crates/fjall),
@@ -12,9 +13,9 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```rust,no_run
 //! use evento_fjall::Fjall;
-//! use evento_core::{Executor, metadata::Metadata, cursor::Args, EventFilter};
+//! use evento_core::{cursor::Args, Aggregate, EventFilter, Executor};
 //!
 //! // Define events using an enum
 //! #[evento::aggregate]
@@ -22,22 +23,25 @@
 //!     UserCreated { name: String },
 //! }
 //!
+//! # async fn run() -> anyhow::Result<()> {
 //! // Open the database
 //! let executor = Fjall::open("./my-events")?;
 //!
 //! // Create events
 //! let id = evento::create()
 //!     .event(&UserCreated { name: "Alice".into() })
-//!     .metadata(&Metadata::default())
 //!     .commit(&executor)
 //!     .await?;
 //!
 //! // Query events
 //! let events = executor.read(
-//!     Some([EventFilter::by_id("user/User", &id)].into()),
+//!     Some([EventFilter::by_id(User::aggregate_type(), &id)].into()),
 //!     None,
 //!     Args::forward(10, None),
+//!     None,
 //! ).await?;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! # Data Model
@@ -175,9 +179,10 @@ impl TryFrom<StoredEvent> for Event {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust,no_run
 /// use evento_fjall::Fjall;
 ///
+/// # fn run() -> anyhow::Result<()> {
 /// // Open with default options
 /// let executor = Fjall::open("./events.db")?;
 ///
@@ -185,6 +190,9 @@ impl TryFrom<StoredEvent> for Event {
 /// let db = fjall::Database::builder("./events.db")
 ///     .open()?;
 /// let executor = Fjall::from_database(db)?;
+/// # let _ = executor;
+/// # Ok(())
+/// # }
 /// ```
 pub struct Fjall {
     db: Database,
@@ -304,10 +312,14 @@ impl Fjall {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```rust,no_run
+    /// # fn run() -> anyhow::Result<()> {
     /// let db = fjall::Database::builder("./events.db")
     ///     .open()?;
-    /// let executor = Fjall::from_database(db)?;
+    /// let executor = evento_fjall::Fjall::from_database(db)?;
+    /// # let _ = executor;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn from_database(db: Database) -> anyhow::Result<Self> {
         let meta = db.keyspace("meta", KeyspaceCreateOptions::default)?;
@@ -1426,7 +1438,7 @@ mod tests {
 
         // "a" and "a\0x" collided under the NUL-separator scheme: the prefix
         // for ("test/Account", "a") was a byte-prefix of ("test/Account", "a\0x").
-        let mut tricky = create_test_event("a x", 1, "Created");
+        let mut tricky = create_test_event("a\u{0}x", 1, "Created");
         tricky.aggregate_type = "test/Account".to_string();
         executor.write(vec![tricky]).await.unwrap();
 

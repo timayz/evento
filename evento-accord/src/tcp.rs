@@ -1,7 +1,7 @@
 //! Production transport: length-delimited framed TCP behind the
 //! [`MessageSink`] trait, for a real multi-process cluster.
 //!
-//! Each frame is a bitcode-serialised [`Frame`] (sender id + [`Message`]) over a
+//! Each frame is a bitcode-serialised `Frame` (sender id + [`Message`]) over a
 //! [`LengthDelimitedCodec`] stream. Outbound delivery is per-peer and lazy: the
 //! first message to a peer spawns a writer task that connects on demand and
 //! reconnects after a drop. Delivery is best-effort and unacknowledged — exactly
@@ -187,7 +187,24 @@ impl TcpTransport {
     /// the same snapshot as the node's counters. Use the node's
     /// [`metrics_handle`](crate::node::Node::metrics_handle):
     ///
-    /// ```ignore
+    /// ```rust,no_run
+    /// # use std::collections::HashMap;
+    /// # use std::sync::Arc;
+    /// # use evento_accord::{
+    /// #     HybridLogicalClock, InMemoryDataStore, InMemoryJournal, InMemoryNetwork, Node,
+    /// #     NodeId, StaticTopology, TcpTransport,
+    /// # };
+    /// # let id = NodeId(0);
+    /// # let peers = HashMap::new();
+    /// # let net = InMemoryNetwork::new();
+    /// # let node = Node::new(
+    /// #     id,
+    /// #     Arc::new(StaticTopology::new(id, vec![id])),
+    /// #     Arc::new(HybridLogicalClock::new(id)),
+    /// #     Arc::new(net.sink(id)),
+    /// #     Arc::new(InMemoryDataStore::new()),
+    /// #     Arc::new(InMemoryJournal::new()),
+    /// # );
     /// let transport = TcpTransport::new(id, peers).with_metrics(node.metrics_handle());
     /// ```
     pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
