@@ -15,6 +15,11 @@ categories.workspace = true
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
+# `evento` is a dev-dependency used only in doctests; machete's metadata pass
+# can't see through the dev-cycle with the facade crate.
+[package.metadata.cargo-machete]
+ignored = ["evento"]
+
 [dependencies]
 evento-core = { path = "../evento-core", version = "2.0.0-alpha.27" }
 anyhow.workspace = true
