@@ -1,0 +1,7 @@
+error: expected a snapshot mode: `#[evento::snapshot(none)]` or `#[evento::snapshot(memory)]`
+ --> tests/ui/fail/snapshot_missing_mode.rs:2:1
+  |
+2 | #[evento::snapshot]
+  | ^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `evento::snapshot` (in Nightly builds, run with -Z macro-backtrace for more info)

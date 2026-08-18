@@ -1,4 +1,4 @@
-use evento::{Executor, cursor, metadata::Event, projection::Projection};
+use evento::{Executor, metadata::Event, projection::Projection};
 
 use crate::{
     aggregator::{AccountClosed, AccountFrozen, AccountOpened, AccountUnfrozen, BankAccount},
@@ -13,34 +13,14 @@ pub fn create_projection<E: Executor>() -> Projection<E, AccountStatusView> {
         .handler(handle_account_unfrozen())
 }
 
-#[derive(Default)]
+#[evento::projection(cursor = evento::cursor::Value)]
+#[evento::snapshot(none)]
 pub struct AccountStatusView {
     pub status: AccountStatus,
     pub is_active: bool,
     pub is_frozen: bool,
     pub is_closed: bool,
-    pub cursor: cursor::Value,
-    pub aggregate_version: u16,
 }
-
-impl evento::ProjectionCursor for AccountStatusView {
-    fn get_cursor(&self) -> evento::cursor::Value {
-        self.cursor.to_owned()
-    }
-
-    fn set_cursor(&mut self, v: &cursor::Value) {
-        self.cursor = v.to_owned();
-    }
-
-    fn get_aggregate_version(&self) -> u16 {
-        self.aggregate_version
-    }
-
-    fn set_aggregate_version(&mut self, v: u16) {
-        self.aggregate_version = v;
-    }
-}
-impl<E: Executor> evento::Snapshot<E> for AccountStatusView {}
 
 #[evento::handler]
 async fn handle_account_opened(

@@ -1,0 +1,5 @@
+error: unknown snapshot mode `disk`; expected `none` or `memory`
+ --> tests/ui/fail/snapshot_bad_mode.rs:2:20
+  |
+2 | #[evento::snapshot(disk)]
+  |                    ^^^^

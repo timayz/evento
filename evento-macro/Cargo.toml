@@ -16,3 +16,10 @@ proc-macro = true
 quote.workspace = true
 convert_case.workspace = true
 syn.workspace = true
+
+[dev-dependencies]
+trybuild = "1"
+evento.workspace = true
+anyhow.workspace = true
+bitcode.workspace = true
+serde.workspace = true

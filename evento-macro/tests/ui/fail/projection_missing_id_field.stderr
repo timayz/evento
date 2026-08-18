@@ -1,0 +1,5 @@
+error: no field named `account_id`; available fields: `id`, `balance`
+ --> tests/ui/fail/projection_missing_id_field.rs:1:27
+  |
+1 | #[evento::projection(id = account_id)]
+  |                           ^^^^^^^^^^

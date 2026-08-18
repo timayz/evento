@@ -1,0 +1,5 @@
+error: event struct fields are always public; remove the visibility qualifier
+ --> tests/ui/fail/aggregate_restricted_vis.rs:3:14
+  |
+3 |     Opened { pub(crate) id: String },
+  |              ^^^^^^^^^^

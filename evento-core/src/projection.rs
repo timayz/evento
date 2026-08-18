@@ -235,7 +235,10 @@ pub trait ProjectionAggregate: ProjectionCursor {
 /// Snapshots provide a performance optimization by storing pre-computed
 /// state, avoiding the need to replay all events from the beginning.
 ///
-/// This trait is typically implemented via the `#[evento::snapshot]` macro.
+/// Projections that are `bitcode::Encode + Decode` get executor-backed
+/// snapshots from a blanket impl. Otherwise use the `#[evento::snapshot]`
+/// macro (`none` to opt out, `memory` for an in-memory store), or implement
+/// this trait by hand for custom-table stores.
 pub trait Snapshot<E: Executor>: ProjectionCursor + Sized {
     /// Restores state from a snapshot if available.
     ///

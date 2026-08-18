@@ -11,12 +11,14 @@ pub struct TransferMoney {
     pub description: String,
 }
 
+#[evento::command]
 impl<E: Executor> super::Command<E> {
     /// Handle TransferMoney command
     pub async fn transfer_money(
         &self,
         id: impl Into<String>,
         cmd: TransferMoney,
+        routing_key: Option<String>,
     ) -> Result<(), BankAccountError> {
         let Some(account) = self.load(id).await? else {
             return Err(BankAccountError::AccountNotFound);
@@ -41,49 +43,7 @@ impl<E: Executor> super::Command<E> {
 
         account
             .write()?
-            .event(&MoneyTransferred {
-                amount: cmd.amount,
-                to_account_id: cmd.to_account_id,
-                transaction_id: cmd.transaction_id,
-                description: cmd.description,
-            })
-            .commit(&self.0)
-            .await?;
-
-        Ok(())
-    }
-
-    /// Handle TransferMoney command
-    pub async fn transfer_money_with_routing(
-        &self,
-        id: impl Into<String>,
-        cmd: TransferMoney,
-        key: impl Into<String>,
-    ) -> Result<(), BankAccountError> {
-        let Some(account) = self.load(id).await? else {
-            return Err(BankAccountError::AccountNotFound);
-        };
-        if matches!(account.status, AccountStatus::Closed) {
-            return Err(BankAccountError::AccountClosed);
-        }
-        if matches!(account.status, AccountStatus::Frozen) {
-            return Err(BankAccountError::AccountFrozen);
-        }
-        if cmd.amount <= 0 {
-            return Err(BankAccountError::InvalidAmount);
-        }
-
-        let available = account.balance + account.overdraft_limit;
-        if cmd.amount > available {
-            return Err(BankAccountError::InsufficientFunds {
-                available,
-                requested: cmd.amount,
-            });
-        }
-
-        account
-            .write()?
-            .routing_key(key)
+            .routing_key_opt(routing_key)
             .event(&MoneyTransferred {
                 amount: cmd.amount,
                 to_account_id: cmd.to_account_id,
