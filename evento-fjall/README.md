@@ -112,15 +112,30 @@ let result = Projection::<_, UserView>::new::<User>(&user_id)
 
 ## Data Model
 
-Events are stored across multiple partitions for efficient querying:
+Events are stored across multiple partitions. Index keys are built from
+length-prefixed components (`enc(...)` = `{u32 BE len}{bytes}` per component),
+so caller-supplied strings can contain any byte without key collisions. Reads
+are served by **cursor-ordered** indexes whose keys end with the 30-byte
+`cursor_key` = `{timestamp BE u64}{subsec BE u32}{version BE u16}{ULID bytes}`
+— lexicographic key order equals cursor order, so a page is a seek plus
+`limit` steps:
 
 | Partition | Key Format | Value | Purpose |
 |-----------|------------|-------|---------|
 | `events` | `{ULID}` | `Event` | Primary event storage |
-| `agg_index` | `{type}\0{id}\0{version}` | `ULID` | Query by aggregate |
-| `routing_index` | `{routing_key}\0{ULID}` | `()` | Query by routing key |
-| `type_index` | `{type}\0{name}\0{ULID}` | `()` | Query by event type |
+| `agg_index` | `enc(type, id) + {version BE}` | `ULID` | Version lookup (optimistic concurrency) |
+| `cursor_all` | `{cursor_key}` | `()` | Unfiltered reads |
+| `cursor_agg` | `enc(type, id) + {cursor_key}` | `()` | Query by aggregate |
+| `cursor_agg_name` | `enc(type, id, name) + {cursor_key}` | `()` | Query by aggregate + event name |
+| `cursor_type` | `enc(type) + {cursor_key}` | `()` | Query by aggregate type |
+| `cursor_type_name` | `enc(type, name) + {cursor_key}` | `()` | Query by event type |
+| `cursor_routing` | `{0x01}enc(routing_key) + {cursor_key}` (`{0x00} + {cursor_key}` when unkeyed) | `()` | Query by routing key |
 | `subscribers` | `{key}` | `SubscriberState` | Subscription state |
+| `snapshots` | `enc(type, id)` | `StoredSnapshot` | Aggregate snapshots |
+| `meta` | `last_stamp`, `index_version` | `u64 BE` | Commit clock, index layout version |
+
+Opening a database written by an older layout rebuilds the cursor indexes from
+`events` once (O(total events)), then stamps `index_version`.
 
 ## Performance Considerations
 

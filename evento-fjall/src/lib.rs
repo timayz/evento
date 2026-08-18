@@ -48,13 +48,28 @@
 //! NUL — without one aggregate's keys colliding with or shadowing another's:
 //!
 //! - `events` - Primary storage: `ULID -> Event`
-//! - `agg_index` - Aggregate index: `enc(type, id) + {version BE}` -> `ULID`
-//! - `agg_name_index` - Aggregate-name index: `enc(type, id, name) + {ULID}` -> `()`
-//! - `routing_index` - Routing key index: `enc(routing_key) + {ULID}` -> `()`
-//! - `type_index` - Event type index: `enc(type, name) + {ULID}` -> `()`
+//! - `agg_index` - Aggregate version index: `enc(type, id) + {version BE}` -> `ULID`
 //! - `subscribers` - Subscription state: `{key}` -> `SubscriberState`
 //! - `snapshots` - Aggregate snapshots: `enc(type, id)` -> `StoredSnapshot`
-//! - `meta` - Store metadata: the monotonic commit clock (`last_stamp`)
+//! - `meta` - Store metadata: the monotonic commit clock (`last_stamp`) and the
+//!   on-disk index-layout version (`index_version`)
+//!
+//! Reads are served by **cursor-ordered** index keyspaces: each key is a filter
+//! prefix followed by the 30-byte `cursor_key` = `{timestamp BE u64}{subsec BE
+//! u32}{version BE u16}{ULID bytes}`, whose lexicographic order equals the
+//! canonical cursor order — so a page is a seek plus `limit` steps, never a
+//! whole-prefix scan:
+//!
+//! - `cursor_all` - `{cursor_key}` -> `()`
+//! - `cursor_agg` - `enc(type, id) + {cursor_key}` -> `()`
+//! - `cursor_agg_name` - `enc(type, id, name) + {cursor_key}` -> `()`
+//! - `cursor_type` - `enc(type) + {cursor_key}` -> `()`
+//! - `cursor_type_name` - `enc(type, name) + {cursor_key}` -> `()`
+//! - `cursor_routing` - `{0x01}enc(routing_key) + {cursor_key}` (or
+//!   `{0x00} + {cursor_key}` for events without a routing key) -> `()`
+//!
+//! Opening a database whose `index_version` predates this layout rebuilds the
+//! cursor keyspaces from `events` (one O(total events) pass, then never again).
 //!
 //! # Ordering
 //!
@@ -175,9 +190,15 @@ pub struct Fjall {
     db: Database,
     events: Keyspace,
     agg_index: Keyspace,
-    agg_name_index: Keyspace,
-    routing_index: Keyspace,
-    type_index: Keyspace,
+    /// Cursor-ordered index keyspaces (see the module docs): keys end with the
+    /// 30-byte `cursor_key`, so a read is a seek + `limit` steps in cursor
+    /// order instead of a whole-prefix scan sorted in memory.
+    cursor_all: Keyspace,
+    cursor_agg: Keyspace,
+    cursor_agg_name: Keyspace,
+    cursor_type: Keyspace,
+    cursor_type_name: Keyspace,
+    cursor_routing: Keyspace,
     subscribers: Keyspace,
     snapshots: Keyspace,
     meta: Keyspace,
@@ -206,15 +227,46 @@ pub struct Fjall {
 /// `meta` keyspace key holding the monotonic commit clock (millis, BE u64).
 const LAST_STAMP_KEY: &[u8] = b"last_stamp";
 
+/// `meta` keyspace key holding the on-disk index-layout version (BE u64).
+/// Absent (version 0) means the legacy ULID-ordered index layout.
+const INDEX_VERSION_KEY: &[u8] = b"index_version";
+
+/// The current index layout: cursor-ordered `cursor_*` keyspaces. Opening a
+/// database stamped with a different version rebuilds them from `events`.
+const INDEX_VERSION: u64 = 2;
+
+/// Length of the cursor-ordered key suffix:
+/// `{timestamp BE u64}{subsec BE u32}{version BE u16}{ULID bytes}`.
+const CURSOR_KEY_LEN: usize = 8 + 4 + 2 + 16;
+
+/// Names of the cursor-index keyspaces plus the legacy (pre-`INDEX_VERSION` 2)
+/// index keyspaces — everything a rebuild deletes before re-indexing. Legacy
+/// names stay listed so an upgraded database reclaims their space.
+const REBUILT_KEYSPACES: &[&str] = &[
+    "cursor_all",
+    "cursor_agg",
+    "cursor_agg_name",
+    "cursor_type",
+    "cursor_type_name",
+    "cursor_routing",
+    // Legacy ULID-ordered indexes, superseded by the cursor keyspaces.
+    "agg_name_index",
+    "type_index",
+    "routing_index",
+];
+
 impl Clone for Fjall {
     fn clone(&self) -> Self {
         Self {
             db: self.db.clone(),
             events: self.events.clone(),
             agg_index: self.agg_index.clone(),
-            agg_name_index: self.agg_name_index.clone(),
-            routing_index: self.routing_index.clone(),
-            type_index: self.type_index.clone(),
+            cursor_all: self.cursor_all.clone(),
+            cursor_agg: self.cursor_agg.clone(),
+            cursor_agg_name: self.cursor_agg_name.clone(),
+            cursor_type: self.cursor_type.clone(),
+            cursor_type_name: self.cursor_type_name.clone(),
+            cursor_routing: self.cursor_routing.clone(),
             subscribers: self.subscribers.clone(),
             snapshots: self.snapshots.clone(),
             meta: self.meta.clone(),
@@ -246,6 +298,10 @@ impl Fjall {
     ///
     /// Use this when you need custom database configuration.
     ///
+    /// The first open of a database written by an older layout rebuilds the
+    /// cursor-index keyspaces from `events` — one O(total events) pass, made
+    /// durable before this returns; subsequent opens skip it.
+    ///
     /// # Example
     ///
     /// ```rust,ignore
@@ -269,12 +325,39 @@ impl Fjall {
             None => 0,
         };
 
-        Ok(Self {
+        let index_version = match meta.get(INDEX_VERSION_KEY)? {
+            Some(bytes) => {
+                let bytes: [u8; 8] = bytes
+                    .as_ref()
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("corrupt index_version meta entry"))?;
+                u64::from_be_bytes(bytes)
+            }
+            None => 0,
+        };
+
+        if index_version != INDEX_VERSION {
+            // Drop stale/partial index keyspaces before re-indexing. Only our
+            // own named keyspaces — the database may be shared (e.g. with a
+            // `FjallJournal`'s `accord_*` keyspaces), so never wipe by
+            // discovery.
+            for name in REBUILT_KEYSPACES {
+                if db.keyspace_exists(name) {
+                    let keyspace = db.keyspace(name, KeyspaceCreateOptions::default)?;
+                    db.delete_keyspace(keyspace)?;
+                }
+            }
+        }
+
+        let executor = Self {
             events: db.keyspace("events", KeyspaceCreateOptions::default)?,
             agg_index: db.keyspace("agg_index", KeyspaceCreateOptions::default)?,
-            agg_name_index: db.keyspace("agg_name_index", KeyspaceCreateOptions::default)?,
-            routing_index: db.keyspace("routing_index", KeyspaceCreateOptions::default)?,
-            type_index: db.keyspace("type_index", KeyspaceCreateOptions::default)?,
+            cursor_all: db.keyspace("cursor_all", KeyspaceCreateOptions::default)?,
+            cursor_agg: db.keyspace("cursor_agg", KeyspaceCreateOptions::default)?,
+            cursor_agg_name: db.keyspace("cursor_agg_name", KeyspaceCreateOptions::default)?,
+            cursor_type: db.keyspace("cursor_type", KeyspaceCreateOptions::default)?,
+            cursor_type_name: db.keyspace("cursor_type_name", KeyspaceCreateOptions::default)?,
+            cursor_routing: db.keyspace("cursor_routing", KeyspaceCreateOptions::default)?,
             subscribers: db.keyspace("subscribers", KeyspaceCreateOptions::default)?,
             snapshots: db.keyspace("snapshots", KeyspaceCreateOptions::default)?,
             meta,
@@ -283,7 +366,58 @@ impl Fjall {
             write_persist_mode: PersistMode::SyncAll,
             write_tx: tokio::sync::watch::channel(0).0,
             db,
-        })
+        };
+
+        if index_version != INDEX_VERSION {
+            executor.rebuild_cursor_indexes()?;
+            // Stamp + fsync last: a crash mid-rebuild leaves the version
+            // absent, so the next open simply redoes the (idempotent) rebuild.
+            executor
+                .meta
+                .insert(INDEX_VERSION_KEY, INDEX_VERSION.to_be_bytes())?;
+            executor.db.persist(PersistMode::SyncAll)?;
+        }
+
+        Ok(executor)
+    }
+
+    /// Re-derives every cursor-index entry from the `events` keyspace, in
+    /// batched (unsynced) commits; the caller persists once afterwards.
+    fn rebuild_cursor_indexes(&self) -> anyhow::Result<()> {
+        const REBUILD_BATCH: usize = 8_192;
+
+        let mut batch = self.db.batch();
+        let mut pending = 0usize;
+        for guard in self.events.iter() {
+            let (_, value) = guard.into_inner()?;
+            let stored: StoredEvent = bitcode::decode(value.as_ref())
+                .map_err(|e| anyhow::anyhow!("Failed to deserialize event: {}", e))?;
+            let id = Ulid::from_string(&stored.id)?;
+            let suffix = Self::cursor_key_suffix(
+                stored.timestamp,
+                stored.timestamp_subsec,
+                stored.version,
+                &id,
+            );
+            self.insert_cursor_entries(
+                &mut batch,
+                &stored.aggregate_type,
+                &stored.aggregate_id,
+                &stored.name,
+                stored.routing_key.as_deref(),
+                &suffix,
+            );
+            pending += 1;
+            if pending >= REBUILD_BATCH {
+                batch.commit()?;
+                batch = self.db.batch();
+                pending = 0;
+            }
+        }
+        if pending > 0 {
+            batch.commit()?;
+        }
+        Ok(())
     }
 
     /// Sets the durability mode applied after each write batch (default
@@ -368,14 +502,7 @@ impl Fjall {
         Self::encode_components(&[aggregate_type.as_bytes(), aggregate_id.as_bytes()])
     }
 
-    /// Builds the aggregate-name index key: `enc(type, id, name) + {ULID}`.
-    fn agg_name_key(aggregate_type: &str, aggregate_id: &str, name: &str, id: &Ulid) -> Vec<u8> {
-        let mut key = Self::agg_name_prefix(aggregate_type, aggregate_id, name);
-        key.extend_from_slice(&id.to_bytes());
-        key
-    }
-
-    /// Builds the aggregate-name index prefix: `enc(type, id, name)`.
+    /// Builds the aggregate-name cursor-index prefix: `enc(type, id, name)`.
     fn agg_name_prefix(aggregate_type: &str, aggregate_id: &str, name: &str) -> Vec<u8> {
         Self::encode_components(&[
             aggregate_type.as_bytes(),
@@ -384,28 +511,95 @@ impl Fjall {
         ])
     }
 
-    /// Builds the type index key.
-    fn type_key(aggregate_type: &str, name: &str, id: &Ulid) -> Vec<u8> {
-        let mut key = Self::type_prefix(aggregate_type, name);
-        key.extend_from_slice(&id.to_bytes());
-        key
-    }
-
-    /// Builds the type index prefix.
+    /// Builds the type-name cursor-index prefix: `enc(type, name)`.
     fn type_prefix(aggregate_type: &str, name: &str) -> Vec<u8> {
         Self::encode_components(&[aggregate_type.as_bytes(), name.as_bytes()])
     }
 
-    /// Builds the routing index key.
-    fn routing_key(routing_key: &str, id: &Ulid) -> Vec<u8> {
-        let mut key = Self::routing_prefix(routing_key);
-        key.extend_from_slice(&id.to_bytes());
-        key
+    /// Builds the type cursor-index prefix: `enc(type)`.
+    fn type_only_prefix(aggregate_type: &str) -> Vec<u8> {
+        Self::encode_components(&[aggregate_type.as_bytes()])
     }
 
-    /// Builds the routing index prefix.
-    fn routing_prefix(routing_key: &str) -> Vec<u8> {
-        Self::encode_components(&[routing_key.as_bytes()])
+    /// Builds the routing cursor-index prefix. A discriminator byte separates
+    /// keyed events (`0x01` + `enc(key)`) from events without a routing key
+    /// (`0x00`), so the null range is unambiguous even against a real `""` key.
+    fn routing_cursor_prefix(routing_key: Option<&str>) -> Vec<u8> {
+        match routing_key {
+            Some(key) => {
+                let enc = Self::encode_components(&[key.as_bytes()]);
+                let mut prefix = Vec::with_capacity(1 + enc.len());
+                prefix.push(0x01);
+                prefix.extend_from_slice(&enc);
+                prefix
+            }
+            None => vec![0x00],
+        }
+    }
+
+    /// Builds the 30-byte cursor-ordered key suffix. Its lexicographic order
+    /// equals the canonical cursor order `(timestamp, subsec, version, id)` —
+    /// ULID bytes compare identically to the ULID's Crockford string, which is
+    /// what `Event`'s cursor predicate compares.
+    fn cursor_key_suffix(
+        timestamp: u64,
+        timestamp_subsec: u32,
+        version: u16,
+        id: &Ulid,
+    ) -> [u8; CURSOR_KEY_LEN] {
+        let mut suffix = [0u8; CURSOR_KEY_LEN];
+        suffix[..8].copy_from_slice(&timestamp.to_be_bytes());
+        suffix[8..12].copy_from_slice(&timestamp_subsec.to_be_bytes());
+        suffix[12..14].copy_from_slice(&version.to_be_bytes());
+        suffix[14..].copy_from_slice(&id.to_bytes());
+        suffix
+    }
+
+    /// Appends `suffix` to `prefix`, yielding a full cursor-index key.
+    fn with_suffix(mut prefix: Vec<u8>, suffix: &[u8]) -> Vec<u8> {
+        prefix.extend_from_slice(suffix);
+        prefix
+    }
+
+    /// Stages one event's entry into each cursor-index keyspace.
+    fn insert_cursor_entries(
+        &self,
+        batch: &mut fjall::OwnedWriteBatch,
+        aggregate_type: &str,
+        aggregate_id: &str,
+        name: &str,
+        routing_key: Option<&str>,
+        suffix: &[u8; CURSOR_KEY_LEN],
+    ) {
+        batch.insert(&self.cursor_all, *suffix, []);
+        batch.insert(
+            &self.cursor_agg,
+            Self::with_suffix(Self::agg_prefix(aggregate_type, aggregate_id), suffix),
+            [],
+        );
+        batch.insert(
+            &self.cursor_agg_name,
+            Self::with_suffix(
+                Self::agg_name_prefix(aggregate_type, aggregate_id, name),
+                suffix,
+            ),
+            [],
+        );
+        batch.insert(
+            &self.cursor_type,
+            Self::with_suffix(Self::type_only_prefix(aggregate_type), suffix),
+            [],
+        );
+        batch.insert(
+            &self.cursor_type_name,
+            Self::with_suffix(Self::type_prefix(aggregate_type, name), suffix),
+            [],
+        );
+        batch.insert(
+            &self.cursor_routing,
+            Self::with_suffix(Self::routing_cursor_prefix(routing_key), suffix),
+            [],
+        );
     }
 
     /// Builds the snapshot key.
@@ -446,110 +640,212 @@ impl Fjall {
         }
     }
 
-    /// Collects event IDs matching the given filters.
-    fn collect_event_ids(
+    /// Resolves the read filters to cursor-index scan sources — `(keyspace,
+    /// prefix)` pairs whose keys under `prefix` are in cursor order. The flag
+    /// says whether the routing key must still be checked per loaded event
+    /// (the aggregator indexes don't encode it).
+    fn cursor_sources(
         &self,
         aggregators: &Option<Vec<EventFilter>>,
         routing_key: &Option<RoutingKey>,
-    ) -> anyhow::Result<Vec<Ulid>> {
-        use std::collections::HashSet;
-        let mut event_ids_set = HashSet::new();
-        let mut event_ids = Vec::new();
-
-        // Helper macro to add unique event IDs
-        macro_rules! add_unique {
-            ($ulid:expr) => {
-                if event_ids_set.insert($ulid) {
-                    event_ids.push($ulid);
-                }
-            };
-        }
-
+    ) -> (Vec<(&Keyspace, Vec<u8>)>, bool) {
         match (aggregators, routing_key) {
-            // Query by specific aggregator ID and optionally event name
-            (Some(aggs), _) => {
+            (Some(aggs), routing) => {
                 // Subscriptions emit one filter per handler, and those often
                 // collapse to identical values (e.g. `by_type` once per
                 // handler): scan each distinct filter once, not once per
                 // handler.
-                let mut seen_filters = HashSet::new();
+                let mut seen_filters = std::collections::HashSet::new();
+                let mut sources = Vec::new();
                 for agg in aggs {
                     if !seen_filters.insert(agg) {
                         continue;
                     }
-                    match (&agg.aggregate_id, &agg.name) {
-                        // Specific aggregate ID with event name filter.
-                        // The agg_name_index stores the ULID in the key tail, so we
-                        // can resolve matches by prefix scan without loading events.
-                        (Some(id), Some(name)) => {
-                            let prefix = Self::agg_name_prefix(&agg.aggregate_type, id, name);
-                            for guard in self.agg_name_index.prefix(&prefix) {
-                                let (key, _) = guard.into_inner()?;
-                                let key_bytes = key.as_ref();
-                                if key_bytes.len() >= 16 {
-                                    let ulid_bytes: [u8; 16] =
-                                        key_bytes[key_bytes.len() - 16..].try_into()?;
-                                    add_unique!(Ulid::from_bytes(ulid_bytes));
-                                }
-                            }
-                        }
-                        // Specific aggregate ID, all events
+                    sources.push(match (&agg.aggregate_id, &agg.name) {
+                        (Some(id), Some(name)) => (
+                            &self.cursor_agg_name,
+                            Self::agg_name_prefix(&agg.aggregate_type, id, name),
+                        ),
                         (Some(id), None) => {
-                            let prefix = Self::agg_prefix(&agg.aggregate_type, id);
-                            for guard in self.agg_index.prefix(&prefix) {
-                                let (_, value) = guard.into_inner()?;
-                                let ulid_bytes: [u8; 16] = value.as_ref().try_into()?;
-                                add_unique!(Ulid::from_bytes(ulid_bytes));
-                            }
+                            (&self.cursor_agg, Self::agg_prefix(&agg.aggregate_type, id))
                         }
-                        // All aggregates of type, specific event name
-                        (None, Some(name)) => {
-                            let prefix = Self::type_prefix(&agg.aggregate_type, name);
-                            for guard in self.type_index.prefix(&prefix) {
-                                let (key, _) = guard.into_inner()?;
-                                let key_bytes = key.as_ref();
-                                if key_bytes.len() >= 16 {
-                                    let ulid_bytes: [u8; 16] =
-                                        key_bytes[key_bytes.len() - 16..].try_into()?;
-                                    add_unique!(Ulid::from_bytes(ulid_bytes));
-                                }
-                            }
-                        }
-                        // All events of aggregator type - scan all
-                        (None, None) => {
-                            let prefix = Self::encode_components(&[agg.aggregate_type.as_bytes()]);
-                            for guard in self.agg_index.prefix(&prefix) {
-                                let (_, value) = guard.into_inner()?;
-                                let ulid_bytes: [u8; 16] = value.as_ref().try_into()?;
-                                add_unique!(Ulid::from_bytes(ulid_bytes));
-                            }
-                        }
-                    }
+                        (None, Some(name)) => (
+                            &self.cursor_type_name,
+                            Self::type_prefix(&agg.aggregate_type, name),
+                        ),
+                        (None, None) => (
+                            &self.cursor_type,
+                            Self::type_only_prefix(&agg.aggregate_type),
+                        ),
+                    });
                 }
+                (sources, matches!(routing, Some(RoutingKey::Value(_))))
             }
-            // Query by routing key only
-            (None, Some(RoutingKey::Value(Some(ref key)))) => {
-                let prefix = Self::routing_prefix(key);
-                for guard in self.routing_index.prefix(&prefix) {
-                    let (key, _) = guard.into_inner()?;
-                    let key_bytes = key.as_ref();
-                    if key_bytes.len() >= 16 {
-                        let ulid_bytes: [u8; 16] = key_bytes[key_bytes.len() - 16..].try_into()?;
-                        add_unique!(Ulid::from_bytes(ulid_bytes));
+            (None, Some(RoutingKey::Value(key))) => (
+                vec![(
+                    &self.cursor_routing,
+                    Self::routing_cursor_prefix(key.as_deref()),
+                )],
+                false,
+            ),
+            (None, Some(RoutingKey::All) | None) => (vec![(&self.cursor_all, Vec::new())], false),
+        }
+    }
+
+    /// Serves a `read` off the cursor-ordered indexes: seek each distinct
+    /// filter's range past the cursor, take `limit + 1` matches, merge. Cost is
+    /// O(sources × limit) key steps plus one point-get per returned event —
+    /// never a whole-prefix scan.
+    fn read_indexed(
+        &self,
+        aggregators: Option<Vec<EventFilter>>,
+        routing_key: Option<RoutingKey>,
+        args: Args,
+        to_micros: Option<u64>,
+    ) -> anyhow::Result<ReadResult<Event>> {
+        use std::collections::HashSet;
+        use std::ops::Bound;
+
+        let finish = |events: Vec<Event>, args: Args| {
+            evento_core::cursor::Reader::new(events)
+                .args(args)
+                .execute()
+                .map_err(|e| anyhow::anyhow!("{}", e))
+        };
+
+        // An exclusive stamp bound of 0 admits nothing.
+        if to_micros == Some(0) {
+            return finish(Vec::new(), args);
+        }
+        // The exclusive micro bound as an inclusive key suffix: stamps have
+        // milli precision, so `stamp_micros < bound` ⇔ `stamp_millis ≤
+        // (bound - 1) / 1000` — the scan stops at the watermark instead of
+        // fetching and discarding gated events.
+        let bound_suffix = to_micros.map(|bound| {
+            let millis = (bound - 1) / 1000;
+            Self::cursor_key_suffix(
+                millis / 1000,
+                (millis % 1000) as u32,
+                u16::MAX,
+                &Ulid::from_bytes([0xFF; 16]),
+            )
+        });
+
+        let (limit, cursor_value) = args.get_info();
+        let backward = args.is_backward();
+        // `limit + 1` per source: the extra row is the `has_more` probe, and
+        // each source's first `limit + 1` matches are a superset of the merged
+        // page (standard top-k merge property).
+        let target = usize::from(limit) + 1;
+
+        let cursor_suffix = match &cursor_value {
+            Some(value) => {
+                let cursor = <Event as evento_core::cursor::Cursor>::deserialize_cursor(value)
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                let id = Ulid::from_string(&cursor.i)?;
+                Some(Self::cursor_key_suffix(cursor.t, cursor.s, cursor.v, &id))
+            }
+            None => None,
+        };
+
+        let (sources, check_routing) = self.cursor_sources(&aggregators, &routing_key);
+
+        let mut picked: HashSet<Ulid> = HashSet::new();
+        let mut rejected: HashSet<Ulid> = HashSet::new();
+        let mut events: Vec<Event> = Vec::new();
+
+        for (keyspace, prefix) in sources {
+            // Every key in the range is `prefix` + a 30-byte suffix, so
+            // `prefix` (shorter than any real key) and `prefix + [0xFF; 30]`
+            // bracket exactly this filter's entries. The cursor bound is
+            // exclusive in both directions (the canonical predicate is
+            // strictly-beyond-cursor).
+            let max_suffix = [0xFF; CURSOR_KEY_LEN];
+            let upper_suffix = bound_suffix.as_ref().unwrap_or(&max_suffix);
+            let (lower, upper) = if backward {
+                let upper = match &cursor_suffix {
+                    Some(suffix) => Bound::Excluded(Self::with_suffix(prefix.clone(), suffix)),
+                    None => Bound::Included(Self::with_suffix(prefix.clone(), upper_suffix)),
+                };
+                (Bound::Included(prefix), upper)
+            } else {
+                let lower = match &cursor_suffix {
+                    Some(suffix) => Bound::Excluded(Self::with_suffix(prefix.clone(), suffix)),
+                    None => Bound::Included(prefix.clone()),
+                };
+                (
+                    lower,
+                    Bound::Included(Self::with_suffix(prefix, upper_suffix)),
+                )
+            };
+
+            let mut range = keyspace.range((lower, upper));
+            let mut matches = 0usize;
+            loop {
+                let guard = if backward {
+                    range.next_back()
+                } else {
+                    range.next()
+                };
+                let Some(guard) = guard else { break };
+                let (key, _) = guard.into_inner()?;
+                let key = key.as_ref();
+                let ulid_bytes: [u8; 16] = key[key.len() - 16..].try_into()?;
+                let ulid = Ulid::from_bytes(ulid_bytes);
+
+                if picked.contains(&ulid) {
+                    // Already collected via another filter — still one of this
+                    // source's matches, so it counts toward the cap.
+                    matches += 1;
+                    if matches >= target {
+                        break;
                     }
+                    continue;
                 }
-            }
-            // Query all events
-            _ => {
-                for guard in self.events.iter() {
-                    let (key, _) = guard.into_inner()?;
-                    let ulid_bytes: [u8; 16] = key.as_ref().try_into()?;
-                    add_unique!(Ulid::from_bytes(ulid_bytes));
+                if rejected.contains(&ulid) {
+                    continue;
+                }
+                // An index entry without its event would be corruption; skip
+                // it rather than serving a page with a hole.
+                let Some(event) = self.load_event(&ulid)? else {
+                    continue;
+                };
+
+                let routing_matches = !check_routing
+                    || match &routing_key {
+                        Some(RoutingKey::Value(Some(key))) => {
+                            event.routing_key.as_ref() == Some(key)
+                        }
+                        Some(RoutingKey::Value(None)) => event.routing_key.is_none(),
+                        Some(RoutingKey::All) | None => true,
+                    };
+                // Defensive re-check of the stamp bound (the range's upper
+                // bound already enforces it).
+                let below_bound = to_micros.is_none_or(|bound| {
+                    event
+                        .timestamp
+                        .saturating_mul(1_000_000)
+                        .saturating_add(u64::from(event.timestamp_subsec) * 1_000)
+                        < bound
+                });
+
+                if routing_matches && below_bound {
+                    picked.insert(ulid);
+                    events.push(event);
+                    matches += 1;
+                    if matches >= target {
+                        break;
+                    }
+                } else {
+                    rejected.insert(ulid);
                 }
             }
         }
 
-        Ok(event_ids)
+        // `Reader` re-applies the canonical sort, cursor predicate, and limit,
+        // so a seek bug degrades to a short page — never wrong order or
+        // duplicates.
+        finish(events, args)
     }
 }
 
@@ -640,28 +936,26 @@ impl Fjall {
             // Primary: ULID -> Event
             batch.insert(&self.events, id_bytes, event_bytes);
 
-            // Aggregate index: enc(type, id) + version -> ULID
+            // Aggregate version index: enc(type, id) + version -> ULID
             let agg_key = Fjall::agg_key(&event.aggregate_type, &event.aggregate_id, event.version);
             batch.insert(&self.agg_index, agg_key, id_bytes);
 
-            // Aggregate-name index: enc(type, id, name) + ULID -> ()
-            let agg_name_key = Fjall::agg_name_key(
+            // Cursor-ordered indexes (uses the final stamp, so entries land in
+            // cursor order for both `write` and `replicate`).
+            let suffix = Self::cursor_key_suffix(
+                event.timestamp,
+                event.timestamp_subsec,
+                event.version,
+                &event.id,
+            );
+            self.insert_cursor_entries(
+                &mut batch,
                 &event.aggregate_type,
                 &event.aggregate_id,
                 &event.name,
-                &event.id,
+                event.routing_key.as_deref(),
+                &suffix,
             );
-            batch.insert(&self.agg_name_index, agg_name_key, []);
-
-            // Type index: enc(type, name) + ULID -> ()
-            let type_key = Fjall::type_key(&event.aggregate_type, &event.name, &event.id);
-            batch.insert(&self.type_index, type_key, []);
-
-            // Routing index (if routing key exists): enc(routing) + ULID -> ()
-            if let Some(ref routing_key) = event.routing_key {
-                let routing_key = Fjall::routing_key(routing_key, &event.id);
-                batch.insert(&self.routing_index, routing_key, []);
-            }
         }
 
         if restamp {
@@ -734,45 +1028,7 @@ impl Executor for Fjall {
         let executor = self.clone();
 
         tokio::task::spawn_blocking(move || {
-            // Collect matching event IDs (deduplicated across the aggregator filters).
-            let event_ids = executor.collect_event_ids(&aggregators, &routing_key)?;
-
-            // Load every matching event and apply the routing-key and stamp
-            // filters. The cursor is intentionally NOT pre-filtered here:
-            // `Event`'s cursor uses (timestamp, subsec, version, id), which can
-            // disagree with raw ULID ordering when events land in the same
-            // millisecond. `Reader::execute` applies the canonical sort, cursor
-            // predicate, and limit.
-            let mut events = Vec::with_capacity(event_ids.len());
-            for id in event_ids {
-                if let Some(event) = executor.load_event(&id)? {
-                    let matches = match &routing_key {
-                        Some(RoutingKey::Value(Some(ref key))) => {
-                            event.routing_key.as_ref() == Some(key)
-                        }
-                        Some(RoutingKey::Value(None)) => event.routing_key.is_none(),
-                        Some(RoutingKey::All) | None => true,
-                    };
-                    // Exclusive upper bound on the event stamp (the
-                    // subscription watermark).
-                    let below_bound = to_micros.is_none_or(|bound| {
-                        event
-                            .timestamp
-                            .saturating_mul(1_000_000)
-                            .saturating_add(u64::from(event.timestamp_subsec) * 1_000)
-                            < bound
-                    });
-
-                    if matches && below_bound {
-                        events.push(event);
-                    }
-                }
-            }
-
-            evento_core::cursor::Reader::new(events)
-                .args(args)
-                .execute()
-                .map_err(|e| anyhow::anyhow!("{}", e))
+            executor.read_indexed(aggregators, routing_key, args, to_micros)
         })
         .await?
     }
@@ -1369,5 +1625,289 @@ mod tests {
             .delete_snapshot("test/Account".to_string(), id)
             .await
             .unwrap();
+    }
+
+    /// An event with a caller-controlled stamp and routing key, for
+    /// `replicate` (which persists stamps verbatim).
+    fn stamped_event(
+        aggregate_id: &str,
+        version: u16,
+        timestamp: u64,
+        timestamp_subsec: u32,
+        routing_key: Option<&str>,
+    ) -> Event {
+        Event {
+            id: Ulid::generate(),
+            aggregate_id: aggregate_id.to_string(),
+            aggregate_type: "test/Account".to_string(),
+            version,
+            name: "Stamped".to_string(),
+            routing_key: routing_key.map(str::to_string),
+            data: vec![],
+            metadata: Metadata::default(),
+            timestamp,
+            timestamp_subsec,
+        }
+    }
+
+    /// Opening a database stamped with an older index layout rebuilds the
+    /// cursor keyspaces from `events` and serves reads correctly afterwards.
+    #[tokio::test]
+    async fn test_rebuild_on_open_reindexes_legacy_database() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        {
+            let executor = Fjall::open(temp_dir.path()).unwrap();
+            // Out-of-order stamps prove the rebuilt index orders by cursor,
+            // not by insertion or ULID order.
+            executor
+                .replicate(vec![stamped_event("agg-r", 1, 300, 0, None)])
+                .await
+                .unwrap();
+            executor
+                .replicate(vec![stamped_event("agg-m", 1, 100, 0, Some("k"))])
+                .await
+                .unwrap();
+            executor
+                .replicate(vec![stamped_event("agg-m", 2, 200, 0, Some("k"))])
+                .await
+                .unwrap();
+        }
+
+        // Simulate a pre-migration database: no index version, no cursor
+        // keyspaces (their content would have been the legacy layout).
+        {
+            let db = Database::builder(temp_dir.path()).open().unwrap();
+            let meta = db.keyspace("meta", KeyspaceCreateOptions::default).unwrap();
+            meta.remove(INDEX_VERSION_KEY).unwrap();
+            for name in REBUILT_KEYSPACES {
+                if db.keyspace_exists(name) {
+                    let keyspace = db.keyspace(name, KeyspaceCreateOptions::default).unwrap();
+                    db.delete_keyspace(keyspace).unwrap();
+                }
+            }
+            db.persist(PersistMode::SyncAll).unwrap();
+        }
+
+        let executor = Fjall::open(temp_dir.path()).unwrap();
+
+        // Paged read across all events comes back in cursor (stamp) order.
+        let page = executor
+            .read(None, None, Args::forward(2, None), None)
+            .await
+            .unwrap();
+        assert_eq!(page.edges.len(), 2);
+        assert_eq!(page.edges[0].node.timestamp, 100);
+        assert_eq!(page.edges[1].node.timestamp, 200);
+        assert!(page.page_info.has_next_page);
+        let rest = executor
+            .read(
+                None,
+                None,
+                Args::forward(2, page.page_info.end_cursor.clone()),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(rest.edges.len(), 1);
+        assert_eq!(rest.edges[0].node.timestamp, 300);
+        assert!(!rest.page_info.has_next_page);
+
+        // Filtered and routing reads work off the rebuilt indexes too.
+        let by_id = executor
+            .read(
+                Some(vec![EventFilter::by_id("test/Account", "agg-m")]),
+                None,
+                Args::forward(10, None),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(by_id.edges.len(), 2);
+        let null_routing = executor
+            .read(
+                None,
+                Some(RoutingKey::Value(None)),
+                Args::forward(10, None),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(null_routing.edges.len(), 1);
+        assert_eq!(null_routing.edges[0].node.aggregate_id, "agg-r");
+
+        // The rebuild is stamped: a plain reopen keeps serving reads.
+        drop(executor);
+        let executor = Fjall::open(temp_dir.path()).unwrap();
+        let all = executor
+            .read(None, None, Args::forward(10, None), None)
+            .await
+            .unwrap();
+        assert_eq!(all.edges.len(), 3);
+    }
+
+    /// The exclusive `to_micros` bound converts to an inclusive milli bound on
+    /// the index scan — probe the off-by-one edges in both directions.
+    #[tokio::test]
+    async fn test_to_micros_watermark_milli_boundary() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let executor = Fjall::open(temp_dir.path()).unwrap();
+
+        // Event stamp: 100 s + 500 ms = 100_500_000 µs.
+        executor
+            .replicate(vec![stamped_event("agg-b", 1, 100, 500, None)])
+            .await
+            .unwrap();
+
+        for (bound, expect) in [
+            (Some(100_499_999), 0),
+            (Some(100_500_000), 0), // exclusive: == stamp is gated
+            (Some(100_500_001), 1),
+            (Some(0), 0),
+            (None, 1),
+        ] {
+            let forward = executor
+                .read(
+                    Some(vec![EventFilter::by_id("test/Account", "agg-b")]),
+                    None,
+                    Args::forward(10, None),
+                    bound,
+                )
+                .await
+                .unwrap();
+            assert_eq!(forward.edges.len(), expect, "forward, bound {bound:?}");
+            let backward = executor
+                .read(
+                    Some(vec![EventFilter::by_id("test/Account", "agg-b")]),
+                    None,
+                    Args::backward(10, None),
+                    bound,
+                )
+                .await
+                .unwrap();
+            assert_eq!(backward.edges.len(), expect, "backward, bound {bound:?}");
+        }
+    }
+
+    /// Routing-only reads: the null range (`0x00` discriminator) pages
+    /// correctly through a store mixing keyed and unkeyed events, and hostile
+    /// routing keys (NUL bytes, the empty string) stay isolated from each
+    /// other and from the null range.
+    #[tokio::test]
+    async fn test_routing_ranges_page_and_stay_isolated() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let executor = Fjall::open(temp_dir.path()).unwrap();
+
+        for (agg, stamp, routing) in [
+            ("agg-1", 10, None),
+            ("agg-2", 20, Some("a")),
+            ("agg-3", 30, None),
+            ("agg-4", 40, Some("a\0x")),
+            ("agg-5", 50, Some("")),
+        ] {
+            executor
+                .replicate(vec![stamped_event(agg, 1, stamp, 0, routing)])
+                .await
+                .unwrap();
+        }
+
+        // Page through the null range one event at a time.
+        let first = executor
+            .read(
+                None,
+                Some(RoutingKey::Value(None)),
+                Args::forward(1, None),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.edges.len(), 1);
+        assert_eq!(first.edges[0].node.aggregate_id, "agg-1");
+        assert!(first.page_info.has_next_page);
+        let second = executor
+            .read(
+                None,
+                Some(RoutingKey::Value(None)),
+                Args::forward(1, first.page_info.end_cursor.clone()),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.edges.len(), 1);
+        assert_eq!(second.edges[0].node.aggregate_id, "agg-3");
+        assert!(!second.page_info.has_next_page);
+
+        // "a", "a\0x", "" and the null range are four disjoint result sets.
+        for (routing, expect_agg) in [
+            (Some("a"), "agg-2"),
+            (Some("a\0x"), "agg-4"),
+            (Some(""), "agg-5"),
+        ] {
+            let result = executor
+                .read(
+                    None,
+                    Some(RoutingKey::Value(routing.map(str::to_string))),
+                    Args::forward(10, None),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.edges.len(), 1, "routing {routing:?}");
+            assert_eq!(result.edges[0].node.aggregate_id, expect_agg);
+        }
+    }
+
+    /// Aggregator filter + routing key: matches sparser than the scan must
+    /// keep scanning past non-matching entries until the page fills.
+    #[tokio::test]
+    async fn test_sparse_routing_match_continues_past_limit() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let executor = Fjall::open(temp_dir.path()).unwrap();
+
+        // Versions 1-5 are "cold"; only versions 6-8 match "hot".
+        for version in 1u16..=8 {
+            let routing = if version >= 6 {
+                Some("hot")
+            } else {
+                Some("cold")
+            };
+            executor
+                .replicate(vec![stamped_event(
+                    "agg-s",
+                    version,
+                    u64::from(version) * 10,
+                    0,
+                    routing,
+                )])
+                .await
+                .unwrap();
+        }
+
+        let page = executor
+            .read(
+                Some(vec![EventFilter::by_id("test/Account", "agg-s")]),
+                Some(RoutingKey::Value(Some("hot".to_string()))),
+                Args::forward(2, None),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.edges.len(), 2);
+        assert_eq!(page.edges[0].node.version, 6);
+        assert_eq!(page.edges[1].node.version, 7);
+        assert!(page.page_info.has_next_page);
+
+        let rest = executor
+            .read(
+                Some(vec![EventFilter::by_id("test/Account", "agg-s")]),
+                Some(RoutingKey::Value(Some("hot".to_string()))),
+                Args::forward(2, page.page_info.end_cursor.clone()),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(rest.edges.len(), 1);
+        assert_eq!(rest.edges[0].node.version, 8);
+        assert!(!rest.page_info.has_next_page);
     }
 }

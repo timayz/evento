@@ -206,18 +206,57 @@ impl Journal for FjallJournal {
         Ok(())
     }
 
+    async fn append_metadata_batch(
+        &self,
+        entries: &[(u64, Vec<Vec<NodeId>>)],
+    ) -> anyhow::Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let encoded = entries
+            .iter()
+            .map(|(epoch, layout)| {
+                Ok((
+                    epoch_key(METADATA_PREFIX, *epoch),
+                    encode_tagged(RecordKind::MetadataEntry, layout)?,
+                ))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let meta = self.meta.clone();
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            // Same first-decided-wins idempotency as `append_metadata`, but one
+            // fsync covers the whole run (a metadata catch-up otherwise pays one
+            // per entry).
+            let mut inserted = false;
+            for (key, value) in encoded {
+                if meta.contains_key(&key)? {
+                    continue;
+                }
+                meta.insert(key, value)?;
+                inserted = true;
+            }
+            if inserted {
+                db.persist(PersistMode::SyncAll)?;
+            }
+            Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
     async fn load_metadata(&self) -> anyhow::Result<Vec<(u64, Vec<Vec<NodeId>>)>> {
         let meta = self.meta.clone();
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<(u64, Vec<Vec<NodeId>>)>> {
             let mut out = Vec::new();
-            for guard in meta.iter() {
+            // Big-endian epoch keys sort ascending, so the prefix scan already
+            // yields entries in epoch order.
+            for guard in meta.prefix(METADATA_PREFIX) {
                 let (key, value) = guard.into_inner()?;
                 if let Some(epoch) = epoch_of(METADATA_PREFIX, &key) {
                     out.push((epoch, decode_tagged(RecordKind::MetadataEntry, &value)?));
                 }
             }
-            // Big-endian keys already sort ascending, but be explicit.
-            out.sort_by_key(|(epoch, _)| *epoch);
             Ok(out)
         })
         .await?
@@ -241,7 +280,7 @@ impl Journal for FjallJournal {
         let meta = self.meta.clone();
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<(u64, AcceptorRecord)>> {
             let mut out = Vec::new();
-            for guard in meta.iter() {
+            for guard in meta.prefix(ACCEPTOR_PREFIX) {
                 let (key, value) = guard.into_inner()?;
                 if let Some(epoch) = epoch_of(ACCEPTOR_PREFIX, &key) {
                     out.push((epoch, decode_tagged(RecordKind::AcceptorState, &value)?));

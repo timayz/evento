@@ -205,6 +205,21 @@ pub trait Journal: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Durably appends a run of decided metadata-log entries at once, with the
+    /// same per-entry idempotency as [`append_metadata`](Journal::append_metadata).
+    /// Journals that batch their fsync should override this to make the whole run
+    /// durable with one sync instead of one per entry. The default loops
+    /// [`append_metadata`].
+    async fn append_metadata_batch(
+        &self,
+        entries: &[(u64, Vec<Vec<NodeId>>)],
+    ) -> anyhow::Result<()> {
+        for (epoch, layout) in entries {
+            self.append_metadata(*epoch, layout).await?;
+        }
+        Ok(())
+    }
+
     /// All persisted metadata-log entries, ascending by epoch, for replaying the
     /// committed topology sequence after a restart. The default returns nothing.
     async fn load_metadata(&self) -> anyhow::Result<Vec<(u64, Vec<Vec<NodeId>>)>> {

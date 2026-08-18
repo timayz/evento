@@ -1119,10 +1119,12 @@ impl Node {
                 }
             }
             Message::MetadataEntries { entries } => {
-                // Ingest in ascending order; `apply_log` installs each now-contiguous
-                // epoch. Idempotent, so an overlapping pull is harmless.
+                // Persist the whole run first (one group fsync for journals that
+                // support it), then ingest in ascending order; `apply_log` installs
+                // each now-contiguous epoch. Idempotent, so an overlapping pull is
+                // harmless.
+                let _ = self.journal.append_metadata_batch(&entries).await;
                 for (epoch, layout) in entries {
-                    let _ = self.journal.append_metadata(epoch, &layout).await;
                     self.ingest_entry(epoch, layout);
                 }
             }
