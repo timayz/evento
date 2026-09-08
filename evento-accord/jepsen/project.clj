@@ -4,7 +4,7 @@
   :license {:name "Apache-2.0"}
   :main evento-accord.core
   :jvm-opts ["-Djava.awt.headless=true"]
-  :dependencies [[org.clojure/clojure "1.12.5"]
+  :dependencies [[org.clojure/clojure "1.12.6"]
                  ;; Jepsen bundles Elle (the strict-serializability checker).
                  [jepsen "0.3.13"]
                  [clj-http "3.13.1"]
