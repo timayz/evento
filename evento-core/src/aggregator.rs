@@ -541,6 +541,7 @@ mod tests {
         async fn get_snapshot(
             &self,
             _aggregate_type: String,
+            _projection: String,
             _aggregate_revision: String,
             _id: String,
         ) -> anyhow::Result<Option<(Vec<u8>, Value)>> {
@@ -549,6 +550,7 @@ mod tests {
         async fn save_snapshot(
             &self,
             _aggregate_type: String,
+            _projection: String,
             _aggregate_revision: String,
             _id: String,
             _data: Vec<u8>,
@@ -559,6 +561,7 @@ mod tests {
         async fn delete_snapshot(
             &self,
             _aggregate_type: String,
+            _projection: String,
             _id: String,
         ) -> anyhow::Result<()> {
             unreachable!()

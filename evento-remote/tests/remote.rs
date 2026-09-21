@@ -176,6 +176,12 @@ async fn remote_snapshot_revision_scope() -> anyhow::Result<()> {
     evento_test::snapshot_revision_scope(&server.client).await
 }
 
+#[tokio::test]
+async fn remote_snapshot_projection_scope() -> anyhow::Result<()> {
+    let server = setup("snapshot_projection_scope").await?;
+    evento_test::snapshot_projection_scope(&server.client).await
+}
+
 /// After shutdown the server no longer answers; a request fails cleanly (with
 /// the client's request timeout as the upper bound) instead of hanging.
 #[tokio::test]

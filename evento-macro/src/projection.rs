@@ -2,17 +2,20 @@ use proc_macro::TokenStream;
 use quote::quote;
 use syn::{
     parse::{Parse, ParseStream},
-    Data, DeriveInput, Error, Fields, Ident, Path, Result, Token, Type,
+    Data, DeriveInput, Error, Fields, Ident, LitStr, Path, Result, Token, Type,
 };
 
 /// Parsed arguments for
-/// `#[evento::projection(cursor = <Type>, id = <field>, Derive1, Derive2, ...)]`
+/// `#[evento::projection(cursor = <Type>, id = <field>, name = "...", Derive1, Derive2, ...)]`
 struct ProjectionCursorArgs {
     /// Cursor field type; defaults to `String`.
     cursor: Option<Type>,
     /// Field holding the aggregate id; when set, `ProjectionAggregate` is
     /// implemented too.
     id: Option<Ident>,
+    /// Pinned `ProjectionCursor::projection_name`; defaults to
+    /// `"<module path>::<Struct>"`.
+    name: Option<LitStr>,
     derives: Vec<Path>,
 }
 
@@ -21,6 +24,7 @@ impl Parse for ProjectionCursorArgs {
         let mut args = Self {
             cursor: None,
             id: None,
+            name: None,
             derives: vec![],
         };
 
@@ -31,13 +35,34 @@ impl Parse for ProjectionCursorArgs {
                 match key.to_string().as_str() {
                     "cursor" if args.cursor.is_none() => args.cursor = Some(input.parse()?),
                     "id" if args.id.is_none() => args.id = Some(input.parse()?),
-                    "cursor" | "id" => {
+                    "name" if args.name.is_none() => {
+                        let lit: LitStr = input.parse().map_err(|e| {
+                            Error::new(
+                                e.span(),
+                                "expected a string literal: `name = \"myapp/MyView\"`",
+                            )
+                        })?;
+                        if lit.value().is_empty() {
+                            return Err(Error::new_spanned(
+                                lit,
+                                "projection name must not be empty",
+                            ));
+                        }
+                        if lit.value().len() > 255 {
+                            return Err(Error::new_spanned(
+                                lit,
+                                "projection name must be at most 255 bytes",
+                            ));
+                        }
+                        args.name = Some(lit);
+                    }
+                    "cursor" | "id" | "name" => {
                         return Err(Error::new(key.span(), format!("duplicate `{key}` option")));
                     }
                     _ => {
                         return Err(Error::new(
                             key.span(),
-                            "unknown option; expected `cursor = <Type>`, `id = <field>`, or derive paths",
+                            "unknown option; expected `cursor = <Type>`, `id = <field>`, `name = \"...\"`, or derive paths",
                         ));
                     }
                 }
@@ -174,6 +199,30 @@ pub fn projection_cursor_impl(attr: TokenStream, input: &DeriveInput) -> Result<
         ),
     };
 
+    // The name is part of the snapshot key. A generic struct keeps the
+    // trait's `type_name` default: one literal would be shared by every
+    // instantiation, and those must not share a snapshot slot.
+    let projection_name = match (&args.name, generics.params.is_empty()) {
+        (Some(name), false) => {
+            return Err(Error::new_spanned(
+                name,
+                "`name` is not supported on a generic projection: every instantiation would share one snapshot slot",
+            ));
+        }
+        (Some(name), true) => Some(quote! { #name }),
+        (None, true) => Some(quote! {
+            ::core::concat!(::core::module_path!(), "::", ::core::stringify!(#struct_name))
+        }),
+        (None, false) => None,
+    }
+    .map(|name| {
+        quote! {
+            fn projection_name() -> &'static str {
+                #name
+            }
+        }
+    });
+
     let projection_aggregate = args.id.as_ref().map(|id| {
         quote! {
             impl #impl_generics ::evento::projection::ProjectionAggregate for #struct_name #ty_generics #where_clause {
@@ -203,6 +252,8 @@ pub fn projection_cursor_impl(attr: TokenStream, input: &DeriveInput) -> Result<
             fn get_aggregate_version(&self) -> u16 {
                 self.aggregate_version
             }
+
+            #projection_name
         }
 
         #projection_aggregate

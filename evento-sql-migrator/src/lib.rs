@@ -61,6 +61,8 @@
 //! - [`M0006`] - Repairs schema drift from early alphas (recreates `snapshot`, widens columns)
 //!   and aligns `event` indexes with the hot read paths (aggregate-scoped cursor index, drops
 //!   the redundant `(type, id)` prefix index, adds `id` to the routing cursor index)
+//! - [`M0007`] - Keys snapshots by projection: recreates `snapshot` with primary key
+//!   `(type, projection, id)` (existing snapshots are discarded; they are a cache)
 //!
 //! # Database Schema
 //!
@@ -82,6 +84,21 @@
 //! | `routing_key` | VARCHAR(50) | Optional routing key |
 //! | `timestamp` | BIGINT | Event timestamp (seconds) |
 //! | `timestamp_subsec` | BIGINT | Sub-second precision |
+//!
+//! ## Snapshot Table
+//!
+//! Caches projection state; primary key `(type, projection, id)`:
+//!
+//! | Column | Type | Description |
+//! |--------|------|-------------|
+//! | `type` | VARCHAR(50) | Aggregate root type |
+//! | `projection` | VARCHAR(255) | Name of the projection the snapshot belongs to |
+//! | `id` | VARCHAR(64) | Aggregate root instance ID |
+//! | `cursor` | TEXT | Event stream position the snapshot reflects |
+//! | `revision` | TEXT | Projection revision the snapshot was taken at |
+//! | `data` | BLOB | Serialized projection state |
+//! | `created_at` | TIMESTAMP | Creation timestamp |
+//! | `updated_at` | TIMESTAMP | Last update timestamp |
 //!
 //! ## Subscriber Table
 //!
@@ -107,6 +124,7 @@ mod m0003;
 mod m0004;
 mod m0005;
 mod m0006;
+mod m0007;
 
 #[cfg(feature = "accord")]
 pub use accord::AccordMigration;
@@ -116,6 +134,7 @@ pub use m0003::M0003;
 pub use m0004::M0004;
 pub use m0005::M0005;
 pub use m0006::M0006;
+pub use m0007::M0007;
 
 /// Creates a new [`Migrator`] instance with all Evento migrations registered.
 ///
@@ -160,6 +179,7 @@ where
     M0004: sqlx_migrator::Migration<DB>,
     M0005: sqlx_migrator::Migration<DB>,
     M0006: sqlx_migrator::Migration<DB>,
+    M0007: sqlx_migrator::Migration<DB>,
 {
     let mut migrator = Migrator::default();
     migrator.add_migration(Box::new(InitMigration))?;
@@ -168,6 +188,7 @@ where
     migrator.add_migration(Box::new(M0004))?;
     migrator.add_migration(Box::new(M0005))?;
     migrator.add_migration(Box::new(M0006))?;
+    migrator.add_migration(Box::new(M0007))?;
     Ok(migrator)
 }
 
@@ -212,6 +233,7 @@ where
     M0004: sqlx_migrator::Migration<DB>,
     M0005: sqlx_migrator::Migration<DB>,
     M0006: sqlx_migrator::Migration<DB>,
+    M0007: sqlx_migrator::Migration<DB>,
     AccordMigration: sqlx_migrator::Migration<DB>,
 {
     let mut migrator = Migrator::default();
@@ -221,6 +243,7 @@ where
     migrator.add_migration(Box::new(M0004))?;
     migrator.add_migration(Box::new(M0005))?;
     migrator.add_migration(Box::new(M0006))?;
+    migrator.add_migration(Box::new(M0007))?;
     // The optional evento-accord consensus-journal tables.
     migrator.add_migration(Box::new(AccordMigration))?;
     Ok(migrator)

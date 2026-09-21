@@ -112,6 +112,8 @@ pub enum Snapshot {
     Id,
     /// Snapshot type
     Type,
+    /// Name of the projection the snapshot belongs to
+    Projection,
     /// Event stream cursor position
     Cursor,
     /// Revision identifier
@@ -803,6 +805,7 @@ where
     async fn get_snapshot(
         &self,
         aggregate_type: String,
+        projection: String,
         aggregate_revision: String,
         id: String,
     ) -> anyhow::Result<Option<(Vec<u8>, Value)>> {
@@ -810,6 +813,7 @@ where
             .columns([Snapshot::Data, Snapshot::Cursor])
             .from(Snapshot::Table)
             .and_where(Expr::col(Snapshot::Type).eq(Expr::value(aggregate_type)))
+            .and_where(Expr::col(Snapshot::Projection).eq(Expr::value(projection)))
             .and_where(Expr::col(Snapshot::Id).eq(Expr::value(id)))
             .and_where(Expr::col(Snapshot::Revision).eq(Expr::value(aggregate_revision)))
             .limit(1)
@@ -829,6 +833,7 @@ where
     async fn save_snapshot(
         &self,
         aggregate_type: String,
+        projection: String,
         aggregate_revision: String,
         id: String,
         data: Vec<u8>,
@@ -838,6 +843,7 @@ where
             .into_table(Snapshot::Table)
             .columns([
                 Snapshot::Type,
+                Snapshot::Projection,
                 Snapshot::Id,
                 Snapshot::Cursor,
                 Snapshot::Revision,
@@ -845,13 +851,14 @@ where
             ])
             .values_panic([
                 aggregate_type.into(),
+                projection.into(),
                 id.to_string().into(),
                 cursor.to_string().into(),
                 aggregate_revision.into(),
                 data.into(),
             ])
             .on_conflict(
-                OnConflict::columns([Snapshot::Type, Snapshot::Id])
+                OnConflict::columns([Snapshot::Type, Snapshot::Projection, Snapshot::Id])
                     .update_columns([Snapshot::Data, Snapshot::Cursor, Snapshot::Revision])
                     .value(Snapshot::UpdatedAt, Expr::current_timestamp())
                     .to_owned(),
@@ -867,10 +874,16 @@ where
         Ok(())
     }
 
-    async fn delete_snapshot(&self, aggregate_type: String, id: String) -> anyhow::Result<()> {
+    async fn delete_snapshot(
+        &self,
+        aggregate_type: String,
+        projection: String,
+        id: String,
+    ) -> anyhow::Result<()> {
         let statement = Query::delete()
             .from_table(Snapshot::Table)
             .and_where(Expr::col(Snapshot::Type).eq(Expr::value(aggregate_type)))
+            .and_where(Expr::col(Snapshot::Projection).eq(Expr::value(projection)))
             .and_where(Expr::col(Snapshot::Id).eq(Expr::value(id)))
             .to_owned();
 

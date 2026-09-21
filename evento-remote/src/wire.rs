@@ -20,7 +20,9 @@ pub const MAGIC: [u8; 2] = *b"Er";
 /// enums' layout; add the matching decode branch then.
 /// v2: `Read` gained `to_micros`; added `SubscriberStatus`, `LatestVersion`
 /// and `StreamRoutingKey` requests.
-pub const FORMAT_VERSION: u8 = 2;
+/// v3: the snapshot requests gained `projection` (snapshots are keyed by
+/// projection name).
+pub const FORMAT_VERSION: u8 = 3;
 
 /// Length of the fixed header: `MAGIC (2) + version (1) + kind (1)`.
 const HEADER_LEN: usize = 4;
@@ -174,11 +176,13 @@ pub enum Request {
     },
     GetSnapshot {
         aggregate_type: String,
+        projection: String,
         aggregate_revision: String,
         id: String,
     },
     SaveSnapshot {
         aggregate_type: String,
+        projection: String,
         aggregate_revision: String,
         id: String,
         data: Vec<u8>,
@@ -186,6 +190,7 @@ pub enum Request {
     },
     DeleteSnapshot {
         aggregate_type: String,
+        projection: String,
         id: String,
     },
 }

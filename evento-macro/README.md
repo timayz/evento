@@ -125,8 +125,22 @@ pub struct AccountDetailsView {
 ### Snapshots with `#[evento::snapshot]`
 
 Projections that derive `bitcode::Encode`/`bitcode::Decode` get executor-backed
-snapshots from a blanket impl. For the other common cases, apply this attribute
-to the projection struct (mode required):
+snapshots from a blanket impl. Those snapshots are keyed by
+`(aggregate type, projection name, aggregate id)`, so several snapshotted
+projections of one aggregate never share a slot. The projection name defaults to
+`"<module path>::<Struct>"`; pin it so that renaming or moving the struct keeps
+its snapshots:
+
+```rust
+#[evento::projection(name = "myapp/BalanceView", bitcode::Encode, bitcode::Decode)]
+pub struct BalanceView {
+    pub balance: i64,
+}
+```
+
+(`name` is rejected on generic structs, which keep a per-instantiation type
+name.) For the other common cases, apply this attribute to the projection
+struct (mode required):
 
 ```rust
 // Opt out of snapshotting entirely:

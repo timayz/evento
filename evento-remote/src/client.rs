@@ -379,12 +379,14 @@ impl Executor for Client {
     async fn get_snapshot(
         &self,
         aggregate_type: String,
+        projection: String,
         aggregate_revision: String,
         id: String,
     ) -> anyhow::Result<Option<(Vec<u8>, Value)>> {
         match self
             .request(Request::GetSnapshot {
                 aggregate_type,
+                projection,
                 aggregate_revision,
                 id,
             })
@@ -399,6 +401,7 @@ impl Executor for Client {
     async fn save_snapshot(
         &self,
         aggregate_type: String,
+        projection: String,
         aggregate_revision: String,
         id: String,
         data: Vec<u8>,
@@ -407,6 +410,7 @@ impl Executor for Client {
         match self
             .request(Request::SaveSnapshot {
                 aggregate_type,
+                projection,
                 aggregate_revision,
                 id,
                 data,
@@ -420,9 +424,18 @@ impl Executor for Client {
         }
     }
 
-    async fn delete_snapshot(&self, aggregate_type: String, id: String) -> anyhow::Result<()> {
+    async fn delete_snapshot(
+        &self,
+        aggregate_type: String,
+        projection: String,
+        id: String,
+    ) -> anyhow::Result<()> {
         match self
-            .request(Request::DeleteSnapshot { aggregate_type, id })
+            .request(Request::DeleteSnapshot {
+                aggregate_type,
+                projection,
+                id,
+            })
             .await?
         {
             Response::Unit(Ok(())) => Ok(()),

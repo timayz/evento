@@ -161,3 +161,9 @@ async fn fjall_snapshot_revision_scope() -> anyhow::Result<()> {
     let (executor, _temp_dir) = create_fjall_executor("snapshot_revision_scope")?;
     evento_test::snapshot_revision_scope(&executor).await
 }
+
+#[tokio::test]
+async fn fjall_snapshot_projection_scope() -> anyhow::Result<()> {
+    let (executor, _temp_dir) = create_fjall_executor("snapshot_projection_scope")?;
+    evento_test::snapshot_projection_scope(&executor).await
+}

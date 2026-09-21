@@ -54,7 +54,8 @@
 //! - `events` - Primary storage: `ULID -> Event`
 //! - `agg_index` - Aggregate version index: `enc(type, id) + {version BE}` -> `ULID`
 //! - `subscribers` - Subscription state: `{key}` -> `SubscriberState`
-//! - `snapshots` - Aggregate snapshots: `enc(type, id)` -> `StoredSnapshot`
+//! - `projection_snapshots` - Projection snapshots:
+//!   `enc(type, projection, id)` -> `StoredSnapshot`
 //! - `meta` - Store metadata: the monotonic commit clock (`last_stamp`) and the
 //!   on-disk index-layout version (`index_version`)
 //!
@@ -250,6 +251,12 @@ const CURSOR_KEY_LEN: usize = 8 + 4 + 2 + 16;
 /// Names of the cursor-index keyspaces plus the legacy (pre-`INDEX_VERSION` 2)
 /// index keyspaces — everything a rebuild deletes before re-indexing. Legacy
 /// names stay listed so an upgraded database reclaims their space.
+/// Keyspace holding projection snapshots, keyed `enc(type, projection, id)`.
+const SNAPSHOTS_KEYSPACE: &str = "projection_snapshots";
+
+/// Keyspace that held snapshots keyed `enc(type, id)`; dropped on open.
+const LEGACY_SNAPSHOTS_KEYSPACE: &str = "snapshots";
+
 const REBUILT_KEYSPACES: &[&str] = &[
     "cursor_all",
     "cursor_agg",
@@ -361,6 +368,16 @@ impl Fjall {
             }
         }
 
+        // Snapshots used to be keyed `enc(type, id)` in a `snapshots` keyspace,
+        // with nothing telling two projections of one aggregate apart. They
+        // are a cache, so the legacy keyspace is dropped rather than migrated;
+        // every projection rebuilds from events on its next load.
+        if db.keyspace_exists(LEGACY_SNAPSHOTS_KEYSPACE) {
+            let keyspace =
+                db.keyspace(LEGACY_SNAPSHOTS_KEYSPACE, KeyspaceCreateOptions::default)?;
+            db.delete_keyspace(keyspace)?;
+        }
+
         let executor = Self {
             events: db.keyspace("events", KeyspaceCreateOptions::default)?,
             agg_index: db.keyspace("agg_index", KeyspaceCreateOptions::default)?,
@@ -371,7 +388,7 @@ impl Fjall {
             cursor_type_name: db.keyspace("cursor_type_name", KeyspaceCreateOptions::default)?,
             cursor_routing: db.keyspace("cursor_routing", KeyspaceCreateOptions::default)?,
             subscribers: db.keyspace("subscribers", KeyspaceCreateOptions::default)?,
-            snapshots: db.keyspace("snapshots", KeyspaceCreateOptions::default)?,
+            snapshots: db.keyspace(SNAPSHOTS_KEYSPACE, KeyspaceCreateOptions::default)?,
             meta,
             write_lock: Arc::new(Mutex::new(())),
             last_stamp: Arc::new(std::sync::atomic::AtomicU64::new(last_stamp)),
@@ -615,8 +632,12 @@ impl Fjall {
     }
 
     /// Builds the snapshot key.
-    fn snapshot_key(aggregate_type: &str, id: &str) -> Vec<u8> {
-        Self::encode_components(&[aggregate_type.as_bytes(), id.as_bytes()])
+    fn snapshot_key(aggregate_type: &str, projection: &str, id: &str) -> Vec<u8> {
+        Self::encode_components(&[
+            aggregate_type.as_bytes(),
+            projection.as_bytes(),
+            id.as_bytes(),
+        ])
     }
 
     /// Gets the last version for an aggregate.
@@ -1231,17 +1252,32 @@ impl Executor for Fjall {
     async fn get_snapshot(
         &self,
         aggregate_type: String,
+        projection: String,
         aggregate_revision: String,
         id: String,
     ) -> anyhow::Result<Option<(Vec<u8>, Value)>> {
         let executor = self.clone();
 
         tokio::task::spawn_blocking(move || {
-            let key = Fjall::snapshot_key(&aggregate_type, &id);
+            let key = Fjall::snapshot_key(&aggregate_type, &projection, &id);
             match executor.snapshots.get(&key)? {
                 Some(bytes) => {
-                    let stored: StoredSnapshot = bitcode::decode(bytes.as_ref())
-                        .map_err(|e| anyhow::anyhow!("Failed to deserialize snapshot: {}", e))?;
+                    // A snapshot is a cache: an unreadable one is a miss (the
+                    // projection rebuilds and overwrites it), never an error a
+                    // subscription would retry for ever.
+                    let stored: StoredSnapshot = match bitcode::decode(bytes.as_ref()) {
+                        Ok(stored) => stored,
+                        Err(error) => {
+                            tracing::warn!(
+                                aggregate_type,
+                                projection,
+                                id,
+                                %error,
+                                "stored snapshot does not decode, ignoring it"
+                            );
+                            return Ok(None);
+                        }
+                    };
 
                     // Revision mismatch invalidates the snapshot (forces a rebuild).
                     if stored.revision != aggregate_revision {
@@ -1259,6 +1295,7 @@ impl Executor for Fjall {
     async fn save_snapshot(
         &self,
         aggregate_type: String,
+        projection: String,
         aggregate_revision: String,
         id: String,
         data: Vec<u8>,
@@ -1267,7 +1304,7 @@ impl Executor for Fjall {
         let executor = self.clone();
 
         tokio::task::spawn_blocking(move || {
-            let key = Fjall::snapshot_key(&aggregate_type, &id);
+            let key = Fjall::snapshot_key(&aggregate_type, &projection, &id);
             let stored = StoredSnapshot {
                 revision: aggregate_revision,
                 data,
@@ -1280,11 +1317,16 @@ impl Executor for Fjall {
         .await?
     }
 
-    async fn delete_snapshot(&self, aggregate_type: String, id: String) -> anyhow::Result<()> {
+    async fn delete_snapshot(
+        &self,
+        aggregate_type: String,
+        projection: String,
+        id: String,
+    ) -> anyhow::Result<()> {
         let executor = self.clone();
 
         tokio::task::spawn_blocking(move || {
-            let key = Fjall::snapshot_key(&aggregate_type, &id);
+            let key = Fjall::snapshot_key(&aggregate_type, &projection, &id);
             executor.snapshots.remove(key)?;
             Ok(())
         })
@@ -1558,6 +1600,7 @@ mod tests {
         let executor = Fjall::open(temp_dir.path()).unwrap();
 
         let aggregate_type = "test/Account".to_string();
+        let projection = "test::AccountView".to_string();
         let revision = "1".to_string();
         let id = "agg-1".to_string();
         let data = vec![10, 20, 30];
@@ -1565,7 +1608,12 @@ mod tests {
 
         // Initially: no snapshot
         let result = executor
-            .get_snapshot(aggregate_type.clone(), revision.clone(), id.clone())
+            .get_snapshot(
+                aggregate_type.clone(),
+                projection.clone(),
+                revision.clone(),
+                id.clone(),
+            )
             .await
             .unwrap();
         assert!(result.is_none());
@@ -1574,6 +1622,7 @@ mod tests {
         executor
             .save_snapshot(
                 aggregate_type.clone(),
+                projection.clone(),
                 revision.clone(),
                 id.clone(),
                 data.clone(),
@@ -1584,7 +1633,12 @@ mod tests {
 
         // Get matching revision returns the snapshot
         let (got_data, got_cursor) = executor
-            .get_snapshot(aggregate_type.clone(), revision.clone(), id.clone())
+            .get_snapshot(
+                aggregate_type.clone(),
+                projection.clone(),
+                revision.clone(),
+                id.clone(),
+            )
             .await
             .unwrap()
             .expect("snapshot should exist");
@@ -1593,7 +1647,12 @@ mod tests {
 
         // Get with different revision returns None (revision invalidation)
         let result = executor
-            .get_snapshot(aggregate_type.clone(), "2".to_string(), id.clone())
+            .get_snapshot(
+                aggregate_type.clone(),
+                projection.clone(),
+                "2".to_string(),
+                id.clone(),
+            )
             .await
             .unwrap();
         assert!(result.is_none());
@@ -1604,6 +1663,7 @@ mod tests {
         executor
             .save_snapshot(
                 aggregate_type.clone(),
+                projection.clone(),
                 "2".to_string(),
                 id.clone(),
                 new_data.clone(),
@@ -1613,7 +1673,12 @@ mod tests {
             .unwrap();
 
         let (got_data, got_cursor) = executor
-            .get_snapshot(aggregate_type.clone(), "2".to_string(), id.clone())
+            .get_snapshot(
+                aggregate_type.clone(),
+                projection.clone(),
+                "2".to_string(),
+                id.clone(),
+            )
             .await
             .unwrap()
             .expect("snapshot should exist");
@@ -1622,19 +1687,24 @@ mod tests {
 
         // Delete snapshot
         executor
-            .delete_snapshot(aggregate_type.clone(), id.clone())
+            .delete_snapshot(aggregate_type.clone(), projection.clone(), id.clone())
             .await
             .unwrap();
 
         let result = executor
-            .get_snapshot(aggregate_type, "2".to_string(), id.clone())
+            .get_snapshot(
+                aggregate_type,
+                projection.clone(),
+                "2".to_string(),
+                id.clone(),
+            )
             .await
             .unwrap();
         assert!(result.is_none());
 
         // Delete is idempotent
         executor
-            .delete_snapshot("test/Account".to_string(), id)
+            .delete_snapshot("test/Account".to_string(), projection, id)
             .await
             .unwrap();
     }
@@ -1660,6 +1730,28 @@ mod tests {
             timestamp,
             timestamp_subsec,
         }
+    }
+
+    /// Opening a database that still has the `enc(type, id)`-keyed `snapshots`
+    /// keyspace drops it: those snapshots cannot be attributed to a projection.
+    #[tokio::test]
+    async fn test_open_drops_legacy_snapshots_keyspace() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        {
+            let db = Database::builder(temp_dir.path()).open().unwrap();
+            let legacy = db
+                .keyspace(LEGACY_SNAPSHOTS_KEYSPACE, KeyspaceCreateOptions::default)
+                .unwrap();
+            legacy.insert("stale", [1u8, 2, 3]).unwrap();
+            db.persist(PersistMode::SyncAll).unwrap();
+        }
+
+        let db = Database::builder(temp_dir.path()).open().unwrap();
+        assert!(db.keyspace_exists(LEGACY_SNAPSHOTS_KEYSPACE));
+        let _executor = Fjall::from_database(db.clone()).unwrap();
+        assert!(!db.keyspace_exists(LEGACY_SNAPSHOTS_KEYSPACE));
+        assert!(db.keyspace_exists(SNAPSHOTS_KEYSPACE));
     }
 
     /// Opening a database stamped with an older index layout rebuilds the

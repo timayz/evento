@@ -320,26 +320,41 @@ async fn handle<E: Executor>(executor: &E, request: Request) -> Response {
         )),
         Request::GetSnapshot {
             aggregate_type,
+            projection,
             aggregate_revision,
             id,
         } => Response::Snapshot(err_string(
             executor
-                .get_snapshot(aggregate_type, aggregate_revision, id)
+                .get_snapshot(aggregate_type, projection, aggregate_revision, id)
                 .await,
         )),
         Request::SaveSnapshot {
             aggregate_type,
+            projection,
             aggregate_revision,
             id,
             data,
             cursor,
         } => Response::Unit(err_string(
             executor
-                .save_snapshot(aggregate_type, aggregate_revision, id, data, cursor)
+                .save_snapshot(
+                    aggregate_type,
+                    projection,
+                    aggregate_revision,
+                    id,
+                    data,
+                    cursor,
+                )
                 .await,
         )),
-        Request::DeleteSnapshot { aggregate_type, id } => Response::Unit(err_string(
-            executor.delete_snapshot(aggregate_type, id).await,
+        Request::DeleteSnapshot {
+            aggregate_type,
+            projection,
+            id,
+        } => Response::Unit(err_string(
+            executor
+                .delete_snapshot(aggregate_type, projection, id)
+                .await,
         )),
     }
 }

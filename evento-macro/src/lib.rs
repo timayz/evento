@@ -700,6 +700,12 @@ pub fn snapshot(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// - `id = <field>` — additionally implement `ProjectionAggregate`, returning
 ///   the named field as the aggregate id. This enables `view.write()` for
 ///   emitting events from the projection.
+/// - `name = "..."` — pin `ProjectionCursor::projection_name`, the part of the
+///   snapshot key `(aggregate type, projection name, id)` that keeps several
+///   snapshotted projections of one aggregate apart. Defaults to
+///   `"<module path>::<Struct>"`, which changes (orphaning stored snapshots)
+///   when the struct is renamed or moved. Not supported on generic structs,
+///   which keep a per-instantiation type name.
 /// - any path (e.g. `serde::Serialize`) — added to the derive list.
 ///
 /// ```rust

@@ -1,0 +1,5 @@
+error: projection name must not be empty
+ --> tests/ui/fail/projection_empty_name.rs:1:29
+  |
+1 | #[evento::projection(name = "")]
+  |                             ^^

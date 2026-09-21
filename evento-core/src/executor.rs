@@ -344,36 +344,49 @@ pub trait Executor: Send + Sync + 'static {
         routing_key: Option<RoutingKey>,
     ) -> anyhow::Result<u64>;
 
-    /// Retrieves a stored snapshot for an aggregate.
+    /// Retrieves the snapshot a projection stored for an aggregate.
+    ///
+    /// Snapshots are keyed by `(aggregate_type, projection, id)`: `projection`
+    /// is the name of the view the bytes belong to (see
+    /// [`ProjectionCursor::projection_name`](crate::projection::ProjectionCursor::projection_name)),
+    /// so several snapshotted projections of one aggregate never share a slot.
     ///
     /// Returns the serialized snapshot data and cursor position, or `None`
-    /// if no snapshot exists for the given aggregate.
+    /// if no snapshot exists under that key at `aggregate_revision`.
     async fn get_snapshot(
         &self,
         aggregate_type: String,
+        projection: String,
         aggregate_revision: String,
         id: String,
     ) -> anyhow::Result<Option<(Vec<u8>, Value)>>;
 
-    /// Stores a snapshot for an aggregate.
+    /// Stores a projection's snapshot for an aggregate.
     ///
     /// Snapshots cache aggregate state to avoid replaying all events.
     /// The `cursor` indicates the event position up to which the snapshot is valid.
     async fn save_snapshot(
         &self,
         aggregate_type: String,
+        projection: String,
         aggregate_revision: String,
         id: String,
         data: Vec<u8>,
         cursor: Value,
     ) -> anyhow::Result<()>;
 
-    /// Deletes a stored snapshot for an aggregate.
+    /// Deletes a projection's stored snapshot for an aggregate.
     ///
     /// Idempotent: deleting a snapshot that does not exist is not an error.
     /// Revision is intentionally omitted — `save_snapshot` upserts on
-    /// `(type, id)` so there is only ever one row per aggregate.
-    async fn delete_snapshot(&self, aggregate_type: String, id: String) -> anyhow::Result<()>;
+    /// `(type, projection, id)` so there is only ever one row per projection
+    /// of an aggregate.
+    async fn delete_snapshot(
+        &self,
+        aggregate_type: String,
+        projection: String,
+        id: String,
+    ) -> anyhow::Result<()>;
 }
 
 /// Type-erased wrapper around any [`Executor`] implementation.
@@ -509,29 +522,45 @@ impl Executor for Evento {
     async fn get_snapshot(
         &self,
         aggregate_type: String,
+        projection: String,
         aggregate_revision: String,
         id: String,
     ) -> anyhow::Result<Option<(Vec<u8>, Value)>> {
         self.inner
-            .get_snapshot(aggregate_type, aggregate_revision, id)
+            .get_snapshot(aggregate_type, projection, aggregate_revision, id)
             .await
     }
 
     async fn save_snapshot(
         &self,
         aggregate_type: String,
+        projection: String,
         aggregate_revision: String,
         id: String,
         data: Vec<u8>,
         cursor: Value,
     ) -> anyhow::Result<()> {
         self.inner
-            .save_snapshot(aggregate_type, aggregate_revision, id, data, cursor)
+            .save_snapshot(
+                aggregate_type,
+                projection,
+                aggregate_revision,
+                id,
+                data,
+                cursor,
+            )
             .await
     }
 
-    async fn delete_snapshot(&self, aggregate_type: String, id: String) -> anyhow::Result<()> {
-        self.inner.delete_snapshot(aggregate_type, id).await
+    async fn delete_snapshot(
+        &self,
+        aggregate_type: String,
+        projection: String,
+        id: String,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .delete_snapshot(aggregate_type, projection, id)
+            .await
     }
 }
 
@@ -713,29 +742,45 @@ impl Executor for EventoGroup {
     async fn get_snapshot(
         &self,
         aggregate_type: String,
+        projection: String,
         aggregate_revision: String,
         id: String,
     ) -> anyhow::Result<Option<(Vec<u8>, Value)>> {
         self.first()
-            .get_snapshot(aggregate_type, aggregate_revision, id)
+            .get_snapshot(aggregate_type, projection, aggregate_revision, id)
             .await
     }
 
     async fn save_snapshot(
         &self,
         aggregate_type: String,
+        projection: String,
         aggregate_revision: String,
         id: String,
         data: Vec<u8>,
         cursor: Value,
     ) -> anyhow::Result<()> {
         self.first()
-            .save_snapshot(aggregate_type, aggregate_revision, id, data, cursor)
+            .save_snapshot(
+                aggregate_type,
+                projection,
+                aggregate_revision,
+                id,
+                data,
+                cursor,
+            )
             .await
     }
 
-    async fn delete_snapshot(&self, aggregate_type: String, id: String) -> anyhow::Result<()> {
-        self.first().delete_snapshot(aggregate_type, id).await
+    async fn delete_snapshot(
+        &self,
+        aggregate_type: String,
+        projection: String,
+        id: String,
+    ) -> anyhow::Result<()> {
+        self.first()
+            .delete_snapshot(aggregate_type, projection, id)
+            .await
     }
 }
 
@@ -869,29 +914,43 @@ impl<R: Executor, W: Executor> Executor for Rw<R, W> {
     async fn get_snapshot(
         &self,
         aggregate_type: String,
+        projection: String,
         aggregate_revision: String,
         id: String,
     ) -> anyhow::Result<Option<(Vec<u8>, Value)>> {
         self.r
-            .get_snapshot(aggregate_type, aggregate_revision, id)
+            .get_snapshot(aggregate_type, projection, aggregate_revision, id)
             .await
     }
 
     async fn save_snapshot(
         &self,
         aggregate_type: String,
+        projection: String,
         aggregate_revision: String,
         id: String,
         data: Vec<u8>,
         cursor: Value,
     ) -> anyhow::Result<()> {
         self.w
-            .save_snapshot(aggregate_type, aggregate_revision, id, data, cursor)
+            .save_snapshot(
+                aggregate_type,
+                projection,
+                aggregate_revision,
+                id,
+                data,
+                cursor,
+            )
             .await
     }
 
-    async fn delete_snapshot(&self, aggregate_type: String, id: String) -> anyhow::Result<()> {
-        self.w.delete_snapshot(aggregate_type, id).await
+    async fn delete_snapshot(
+        &self,
+        aggregate_type: String,
+        projection: String,
+        id: String,
+    ) -> anyhow::Result<()> {
+        self.w.delete_snapshot(aggregate_type, projection, id).await
     }
 }
 
