@@ -11,6 +11,7 @@ members = [
     "./evento-fjall",
     "./evento-accord",
     "./evento-remote",
+    "./evento-lock",
     "./examples/*"
 ]
 
@@ -38,6 +39,7 @@ evento-macro = { path = "./evento-macro" }
 evento-fjall = { path = "./evento-fjall" }
 evento-accord = { path = "./evento-accord" }
 evento-remote = { path = "./evento-remote" }
+evento-lock = { path = "./evento-lock" }
 bank = { path = "./examples/bank" }
 
 # Core dependencies
@@ -59,6 +61,7 @@ backon = "1.6"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 ulid = { version = "3.0", features = ["serde"] }
 
 # Database

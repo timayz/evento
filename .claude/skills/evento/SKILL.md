@@ -113,6 +113,13 @@ registers `.handler(..)` or `.skip::<PaymentRefundedV2>()` also accepts
 consumers migrate one at a time. `#[evento::subscription_all]` sees stored
 events un-upcast.
 
+**Locking shapes.** `evento-lock` (dev-dependency) records every event, every
+`Encode` type an event reaches, and every executor-snapshotted view in
+`events.lock`; a test (`evento_lock::check(env!("CARGO_MANIFEST_DIR")).unwrap()`)
+fails when a frozen line changes. After adding an event run
+`EVENTO_LOCK=update cargo test` and commit `events.lock`. A failing lock means:
+restore the edit and add a variant, or bump the view's `.revision(n)`.
+
 ## 2. Write events
 
 `create()` starts a new aggregate (auto-generated ULID id, returned by `commit`).
@@ -342,6 +349,9 @@ aggregate type as a string; it has no `.decode()`.
 - **Upcasting changes what handlers fold, not what snapshots hold.** If the `From`
   conversion yields different state than the old handler you deleted, bump
   `.revision(n)` so stored snapshots are rebuilt.
+- **Frozen means nested types too.** Adding a field to `Money`, or a variant to an
+  enum used in an event (even at the end), breaks decoding as surely as editing the
+  event. `events.lock` catches it; `EVENTO_LOCK=force` is only for never-deployed shapes.
 - **Don't `.unwrap()` a load.** `projection.load(id).execute(exec).await` returns
   `anyhow::Result<Option<T>>`; propagate the error with `?` and treat `None` as not-found.
 
