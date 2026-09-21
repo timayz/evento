@@ -1,0 +1,5 @@
+error: `name` is not supported on a generic projection: every instantiation would share one snapshot slot
+ --> tests/ui/fail/projection_generic_name.rs:1:29
+  |
+1 | #[evento::projection(name = "myapp/View")]
+  |                             ^^^^^^^^^^^^

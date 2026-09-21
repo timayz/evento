@@ -306,28 +306,44 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
     async fn get_snapshot(
         &self,
         aggregate_type: String,
+        projection: String,
         aggregator_revision: String,
         id: String,
     ) -> anyhow::Result<Option<(Vec<u8>, Value)>> {
         self.local
-            .get_snapshot(aggregate_type, aggregator_revision, id)
+            .get_snapshot(aggregate_type, projection, aggregator_revision, id)
             .await
     }
 
     async fn save_snapshot(
         &self,
         aggregate_type: String,
+        projection: String,
         aggregator_revision: String,
         id: String,
         data: Vec<u8>,
         cursor: Value,
     ) -> anyhow::Result<()> {
         self.local
-            .save_snapshot(aggregate_type, aggregator_revision, id, data, cursor)
+            .save_snapshot(
+                aggregate_type,
+                projection,
+                aggregator_revision,
+                id,
+                data,
+                cursor,
+            )
             .await
     }
 
-    async fn delete_snapshot(&self, aggregate_type: String, id: String) -> anyhow::Result<()> {
-        self.local.delete_snapshot(aggregate_type, id).await
+    async fn delete_snapshot(
+        &self,
+        aggregate_type: String,
+        projection: String,
+        id: String,
+    ) -> anyhow::Result<()> {
+        self.local
+            .delete_snapshot(aggregate_type, projection, id)
+            .await
     }
 }

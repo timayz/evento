@@ -42,7 +42,8 @@ use sqlx_migrator::vec_box;
 /// - `cursor` - Event stream cursor
 /// - `revision` - Revision identifier
 /// - `data` - Serialized snapshot data
-/// - Primary key: composite `(type, id)`
+/// - Primary key: composite `(type, id)` (becomes `(type, projection, id)` in
+///   [`M0007`](crate::M0007))
 ///
 /// ## Subscriber Table
 ///

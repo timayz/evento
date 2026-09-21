@@ -93,13 +93,27 @@ pub struct Context<'a, E: Executor> {
     pub id: String,
     revision: u16,
     aggregate_type: String,
+    projection: &'static str,
     aggregators: &'a HashMap<String, String>,
 }
 
 impl<'a, E: Executor> Context<'a, E> {
+    /// Name of the projection being loaded — the part of the snapshot key
+    /// that keeps several snapshotted views of one aggregate apart (see
+    /// [`ProjectionCursor::projection_name`]).
+    ///
+    /// Hand-written [`Snapshot`] impls backed by a custom table can use it to
+    /// scope their own rows.
+    pub fn projection_name(&self) -> &'static str {
+        self.projection
+    }
+
     /// Retrieves a stored snapshot for the given ID.
     ///
-    /// Returns `None` if no snapshot exists.
+    /// Returns `None` if no snapshot exists, or if the stored bytes no longer
+    /// decode as `D`: a snapshot is a cache, so an unreadable one is a miss
+    /// (rebuilt from events and overwritten) rather than an error a
+    /// subscription would retry for ever.
     pub async fn get_snapshot<D: bitcode::DecodeOwned + ProjectionCursor>(
         &self,
     ) -> anyhow::Result<Option<D>> {
@@ -107,6 +121,7 @@ impl<'a, E: Executor> Context<'a, E> {
             .executor
             .get_snapshot(
                 self.aggregate_type.to_owned(),
+                self.projection.to_owned(),
                 self.revision.to_string(),
                 self.id.to_owned(),
             )
@@ -115,7 +130,19 @@ impl<'a, E: Executor> Context<'a, E> {
             return Ok(None);
         };
 
-        let mut data: D = bitcode::decode(&data)?;
+        let mut data: D = match bitcode::decode(&data) {
+            Ok(data) => data,
+            Err(error) => {
+                tracing::warn!(
+                    aggregate_type = self.aggregate_type,
+                    projection = self.projection,
+                    id = self.id,
+                    %error,
+                    "snapshot does not decode, ignoring it (did the projection change without a `.revision()` bump?)"
+                );
+                return Ok(None);
+            }
+        };
         data.set_cursor(&cursor);
 
         Ok(Some(data))
@@ -134,6 +161,7 @@ impl<'a, E: Executor> Context<'a, E> {
         self.executor
             .save_snapshot(
                 self.aggregate_type.to_owned(),
+                self.projection.to_owned(),
                 self.revision.to_string(),
                 self.id.to_owned(),
                 data,
@@ -147,7 +175,11 @@ impl<'a, E: Executor> Context<'a, E> {
     /// Idempotent: no error if no snapshot exists.
     pub async fn drop_snapshot(&self) -> anyhow::Result<()> {
         self.executor
-            .delete_snapshot(self.aggregate_type.to_owned(), self.id.to_owned())
+            .delete_snapshot(
+                self.aggregate_type.to_owned(),
+                self.projection.to_owned(),
+                self.id.to_owned(),
+            )
             .await
     }
 
@@ -223,6 +255,21 @@ pub trait ProjectionCursor {
 
     /// Records the version of the primary aggregate.
     fn set_aggregate_version(&mut self, v: u16);
+
+    /// Name identifying this projection in the snapshot key
+    /// `(aggregate_type, projection, id)`, so several snapshotted views of one
+    /// aggregate each get their own slot.
+    ///
+    /// `#[evento::projection]` generates `"<module path>::<Struct>"`, or the
+    /// literal given with `name = "..."`. Renaming or moving the struct changes
+    /// the generated name: the old snapshot is orphaned and the view rebuilds
+    /// from events once, so pin `name` when that matters. This default (used
+    /// by hand-written impls and generic structs) is the type name, which is
+    /// not guaranteed stable across compiler versions — again only a cold
+    /// rebuild. At most 255 bytes.
+    fn projection_name() -> &'static str {
+        std::any::type_name::<Self>()
+    }
 }
 
 /// Trait for projections that can create a [`WriteBuilder`].
@@ -262,7 +309,9 @@ pub trait ProjectionAggregate: ProjectionCursor {
 /// state, avoiding the need to replay all events from the beginning.
 ///
 /// Projections that are `bitcode::Encode + Decode` get executor-backed
-/// snapshots from a blanket impl. Otherwise use the `#[evento::snapshot]`
+/// snapshots from a blanket impl, keyed by `(aggregate type,
+/// [projection name](ProjectionCursor::projection_name), id)` so an aggregate
+/// can have any number of snapshotted projections. Otherwise use the `#[evento::snapshot]`
 /// macro (`none` to opt out, `memory` for an in-memory store), or implement
 /// this trait by hand for custom-table stores.
 pub trait Snapshot<E: Executor>: ProjectionCursor + Sized {
@@ -384,9 +433,28 @@ type EventOrderKey = (u64, u32, u16, String);
 /// aggregates, never a correctness issue.
 const RECENT_CACHE_MAX: usize = 1024;
 
+/// Longest [`ProjectionCursor::projection_name`] a snapshot key can hold (the
+/// SQL `snapshot.projection` column is a `VARCHAR(255)`).
+const MAX_PROJECTION_NAME_LEN: usize = 255;
+
 impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
     /// Creates a new projection definition for the given primary aggregate type.
+    ///
+    /// # Panics
+    ///
+    /// Panics if [`ProjectionCursor::projection_name`] is longer than 255
+    /// bytes: it is part of the snapshot key, and SQL backends store it in a
+    /// `VARCHAR(255)`.
     pub fn new<A: Aggregate>() -> Projection<E, P> {
+        let name = P::projection_name();
+        if name.len() > MAX_PROJECTION_NAME_LEN {
+            tracing::error!(
+                "Projection name `{name}` is {} bytes, more than the {MAX_PROJECTION_NAME_LEN} a snapshot key can hold.",
+                name.len()
+            );
+            panic!("Projection name too long: pin a shorter one with `#[evento::projection(name = \"...\")]`")
+        }
+
         Projection {
             aggregate_type: A::aggregate_type(),
             context: Default::default(),
@@ -575,6 +643,7 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
             aggregate_type: self.aggregate_type.to_string(),
             aggregators: &aggregators,
             revision: self.revision,
+            projection: P::projection_name(),
         };
         let snapshot = P::restore(&context).await?;
         let cursor = snapshot.as_ref().map(|s| s.get_cursor());
@@ -1005,6 +1074,7 @@ where
                 aggregate_type: self.projection.aggregate_type.to_string(),
                 aggregators: &aggregators,
                 revision: self.projection.revision,
+                projection: P::projection_name(),
             };
             P::drop_snapshot(&ctx).await?;
             self.projection.invalidate_recent(&event.aggregate_id);

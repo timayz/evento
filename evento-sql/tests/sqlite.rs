@@ -391,3 +391,9 @@ async fn sqlite_snapshot_revision_scope() -> anyhow::Result<()> {
     let executor = create_sqlite_executor("snapshot_revision_scope").await?;
     evento_test::snapshot_revision_scope(&executor).await
 }
+
+#[tokio::test]
+async fn sqlite_snapshot_projection_scope() -> anyhow::Result<()> {
+    let executor = create_sqlite_executor("snapshot_projection_scope").await?;
+    evento_test::snapshot_projection_scope(&executor).await
+}

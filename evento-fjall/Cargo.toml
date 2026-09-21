@@ -25,6 +25,7 @@ bitcode.workspace = true
 async-trait.workspace = true
 ulid.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 fjall.workspace = true
 evento-accord = { path = "../evento-accord", version = "2.0.0-alpha.28", optional = true }
 

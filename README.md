@@ -225,7 +225,11 @@ Loading replays an aggregate's events; snapshots cut that short. Three modes:
 
 - **Executor-backed** (default): derive `bitcode::Encode`/`bitcode::Decode` on the
   projection (`#[evento::projection(bitcode::Encode, bitcode::Decode)]`) and the
-  snapshot is persisted in the event store.
+  snapshot is persisted in the event store, keyed by
+  `(aggregate type, projection name, aggregate id)` — so an aggregate can have any
+  number of snapshotted views. The projection name defaults to
+  `"<module path>::<Struct>"`; pin it with `name = "..."` so that renaming or moving
+  the struct does not orphan its snapshots.
 - **`#[evento::snapshot(memory)]`**: a process-local table keyed by aggregate id, with
   a `snapshot_rows()` accessor for reading materialized rows.
 - **`#[evento::snapshot(none)]`**: opt out — always replay from scratch.
@@ -246,7 +250,17 @@ pub struct StatusView {
 
 let rows = MemView::snapshot_rows().read().unwrap();
 # drop(rows);
+
+// Executor-backed, with a name that survives refactors:
+#[evento::projection(name = "myapp/BalanceView", bitcode::Encode, bitcode::Decode)]
+pub struct BalanceView {
+    pub balance: i64,
+}
 ```
+
+Changing the shape of an executor-backed projection needs a `.revision(n)` bump on its
+`Projection`, so snapshots taken with the old shape are dropped instead of mis-decoded.
+A stored snapshot that no longer decodes is treated as a miss and rebuilt from events.
 
 ### 6. Subscriptions
 

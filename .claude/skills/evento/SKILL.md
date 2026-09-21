@@ -143,7 +143,11 @@ let view: Option<AccountView> = Projection::<_, AccountView>::new::<Account>()
 
 - **Executor-backed** (default): give the projection bitcode derives —
   `#[evento::projection(bitcode::Encode, bitcode::Decode)]` — and snapshots are
-  persisted via the executor (blanket `Snapshot` impl).
+  persisted via the executor (blanket `Snapshot` impl), keyed by
+  `(aggregate type, projection name, id)`: several snapshotted views of one
+  aggregate are fine. The name defaults to `"<module path>::<Struct>"`; pin it
+  with `#[evento::projection(name = "myapp/View", ...)]` so a rename/move does
+  not orphan the stored snapshots. An undecodable snapshot is a cache miss.
 - **`#[evento::snapshot(memory)]`**: process-local table keyed by aggregate id;
   read materialized rows with `View::snapshot_rows().read().unwrap()`.
 - **`#[evento::snapshot(none)]`**: no snapshots, always replay.

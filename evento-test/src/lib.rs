@@ -2377,12 +2377,14 @@ pub async fn snapshot_revision_scope<E: Executor + Clone>(executor: &E) -> anyho
     use evento::cursor::Value;
 
     let agg = "evento/SnapTest";
+    let view = "evento_test::SnapView";
     let id = "snap-1";
     let data = vec![1u8, 2, 3];
 
     executor
         .save_snapshot(
             agg.to_owned(),
+            view.to_owned(),
             "0".to_owned(),
             id.to_owned(),
             data.clone(),
@@ -2391,13 +2393,23 @@ pub async fn snapshot_revision_scope<E: Executor + Clone>(executor: &E) -> anyho
         .await?;
 
     let same = executor
-        .get_snapshot(agg.to_owned(), "0".to_owned(), id.to_owned())
+        .get_snapshot(
+            agg.to_owned(),
+            view.to_owned(),
+            "0".to_owned(),
+            id.to_owned(),
+        )
         .await?;
     assert!(same.is_some(), "same revision must return the snapshot");
     assert_eq!(same.unwrap().0, data);
 
     let other = executor
-        .get_snapshot(agg.to_owned(), "1".to_owned(), id.to_owned())
+        .get_snapshot(
+            agg.to_owned(),
+            view.to_owned(),
+            "1".to_owned(),
+            id.to_owned(),
+        )
         .await?;
     assert!(
         other.is_none(),
@@ -2405,17 +2417,240 @@ pub async fn snapshot_revision_scope<E: Executor + Clone>(executor: &E) -> anyho
     );
 
     executor
-        .delete_snapshot(agg.to_owned(), id.to_owned())
+        .delete_snapshot(agg.to_owned(), view.to_owned(), id.to_owned())
         .await?;
     assert!(
         executor
-            .get_snapshot(agg.to_owned(), "0".to_owned(), id.to_owned())
+            .get_snapshot(
+                agg.to_owned(),
+                view.to_owned(),
+                "0".to_owned(),
+                id.to_owned()
+            )
             .await?
             .is_none(),
         "delete_snapshot must remove the snapshot"
     );
 
     Ok(())
+}
+
+/// The executor snapshot contract: snapshots are keyed by projection name, so
+/// several snapshotted projections of one aggregate never share a slot.
+/// Scenario: stored snapshots are scoped to the projection that wrote them.
+pub async fn snapshot_projection_scope<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
+    use evento::{cursor::Value, ProjectionCursor};
+
+    // Executor level: same aggregate type, id and revision, two projections.
+    let agg = "evento/SnapScopeTest";
+    let id = "snap-scope-1";
+    for (view, data) in [("view::A", vec![1u8]), ("view::B", vec![2u8, 2])] {
+        executor
+            .save_snapshot(
+                agg.to_owned(),
+                view.to_owned(),
+                "0".to_owned(),
+                id.to_owned(),
+                data,
+                Value(String::new()),
+            )
+            .await?;
+    }
+
+    let get = |view: &'static str| {
+        executor.get_snapshot(
+            agg.to_owned(),
+            view.to_owned(),
+            "0".to_owned(),
+            id.to_owned(),
+        )
+    };
+    assert_eq!(get("view::A").await?.map(|s| s.0), Some(vec![1u8]));
+    assert_eq!(get("view::B").await?.map(|s| s.0), Some(vec![2u8, 2]));
+    assert!(
+        get("view::C").await?.is_none(),
+        "a snapshot stored by another projection must not be returned"
+    );
+
+    executor
+        .delete_snapshot(agg.to_owned(), "view::A".to_owned(), id.to_owned())
+        .await?;
+    assert!(get("view::A").await?.is_none());
+    assert_eq!(
+        get("view::B").await?.map(|s| s.0),
+        Some(vec![2u8, 2]),
+        "deleting one projection's snapshot must leave the others"
+    );
+
+    // End to end: two differently-shaped snapshotted views of one account.
+    assert_ne!(
+        proj_scope_a::View::projection_name(),
+        proj_scope_b::View::projection_name(),
+        "same-named structs in different modules must get different names"
+    );
+
+    let cmd = bank::Command(executor.clone());
+    let id = cmd
+        .open_account(OpenAccount {
+            owner_id: "owner".to_owned(),
+            owner_name: "Scope".to_owned(),
+            account_type: AccountType::Checking,
+            currency: "USD".to_owned(),
+            initial_balance: 100,
+        })
+        .await?;
+    cmd.deposit_money(
+        &id,
+        DepositMoney {
+            amount: 10,
+            transaction_id: Ulid::generate().to_string(),
+            description: "d".to_owned(),
+        },
+    )
+    .await?;
+
+    let mut a = proj_scope_a::view()
+        .load(&id)
+        .execute(executor)
+        .await?
+        .unwrap();
+    let mut b = proj_scope_b::view()
+        .load(&id)
+        .execute(executor)
+        .await?
+        .unwrap();
+    assert_eq!(a.amount, 110);
+    assert_eq!((b.owner_name.as_str(), b.deposits), ("Scope", 1));
+
+    // Store a marked snapshot for each at the cursor they reached: a load that
+    // restores its own snapshot returns the mark, a rebuild would not. (Seeded
+    // by hand because a backend with a stability watermark does not persist
+    // fresh events yet.)
+    let bank_account = BankAccount::aggregate_type().to_owned();
+    a.amount = 9_999;
+    b.owner_name = "Marked".to_owned();
+    executor
+        .save_snapshot(
+            bank_account.clone(),
+            proj_scope_a::View::projection_name().to_owned(),
+            "0".to_owned(),
+            id.clone(),
+            bitcode::encode(&a),
+            a.get_cursor(),
+        )
+        .await?;
+    executor
+        .save_snapshot(
+            bank_account.clone(),
+            proj_scope_b::View::projection_name().to_owned(),
+            "0".to_owned(),
+            id.clone(),
+            bitcode::encode(&b),
+            b.get_cursor(),
+        )
+        .await?;
+
+    for _ in 0..2 {
+        let a = proj_scope_a::view()
+            .load(&id)
+            .execute(executor)
+            .await?
+            .unwrap();
+        let b = proj_scope_b::view()
+            .load(&id)
+            .execute(executor)
+            .await?
+            .unwrap();
+        assert_eq!(a.amount, 9_999, "view A must restore its own snapshot");
+        assert_eq!(
+            (b.owner_name.as_str(), b.deposits),
+            ("Marked", 1),
+            "view B must restore its own snapshot"
+        );
+    }
+
+    // A stored snapshot that does not decode is a cache miss, not an error.
+    executor
+        .save_snapshot(
+            bank_account,
+            proj_scope_a::View::projection_name().to_owned(),
+            "0".to_owned(),
+            id.clone(),
+            vec![0xFF],
+            a.get_cursor(),
+        )
+        .await?;
+    let a = proj_scope_a::view()
+        .load(&id)
+        .execute(executor)
+        .await?
+        .unwrap();
+    assert_eq!(
+        a.amount, 110,
+        "an unreadable snapshot must be rebuilt from events"
+    );
+
+    Ok(())
+}
+
+/// First of two same-named, differently-shaped snapshotted views of
+/// `BankAccount` for [`snapshot_projection_scope`].
+mod proj_scope_a {
+    use bank::aggregator::{AccountOpened, BankAccount, MoneyDeposited};
+    use evento::{metadata::Event, projection::Projection, Executor};
+
+    #[evento::projection(bitcode::Encode, bitcode::Decode)]
+    pub struct View {
+        pub amount: i64,
+    }
+
+    #[evento::handler]
+    async fn on_opened(event: Event<AccountOpened>, view: &mut View) -> anyhow::Result<()> {
+        view.amount = event.data.initial_balance;
+        Ok(())
+    }
+
+    #[evento::handler]
+    async fn on_deposited(event: Event<MoneyDeposited>, view: &mut View) -> anyhow::Result<()> {
+        view.amount += event.data.amount;
+        Ok(())
+    }
+
+    pub fn view<E: Executor>() -> Projection<E, View> {
+        Projection::new::<BankAccount>()
+            .handler(on_opened())
+            .handler(on_deposited())
+    }
+}
+
+/// Second view for [`snapshot_projection_scope`]; see [`proj_scope_a`].
+mod proj_scope_b {
+    use bank::aggregator::{AccountOpened, BankAccount, MoneyDeposited};
+    use evento::{metadata::Event, projection::Projection, Executor};
+
+    #[evento::projection(bitcode::Encode, bitcode::Decode)]
+    pub struct View {
+        pub owner_name: String,
+        pub deposits: u32,
+    }
+
+    #[evento::handler]
+    async fn on_opened(event: Event<AccountOpened>, view: &mut View) -> anyhow::Result<()> {
+        view.owner_name = event.data.owner_name.to_owned();
+        Ok(())
+    }
+
+    #[evento::handler]
+    async fn on_deposited(_event: Event<MoneyDeposited>, view: &mut View) -> anyhow::Result<()> {
+        view.deposits += 1;
+        Ok(())
+    }
+
+    pub fn view<E: Executor>() -> Projection<E, View> {
+        Projection::new::<BankAccount>()
+            .handler(on_opened())
+            .handler(on_deposited())
+    }
 }
 
 /// Supporting projection + subscription_all handler for the feature tests above.
