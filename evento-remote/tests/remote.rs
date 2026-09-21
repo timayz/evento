@@ -182,6 +182,60 @@ async fn remote_snapshot_projection_scope() -> anyhow::Result<()> {
     evento_test::snapshot_projection_scope(&server.client).await
 }
 
+#[tokio::test]
+async fn remote_upcast_load() -> anyhow::Result<()> {
+    let server = setup("upcast_load").await?;
+    evento_test::upcast_load(&server.client).await
+}
+
+#[tokio::test]
+async fn remote_upcast_nearest_target() -> anyhow::Result<()> {
+    let server = setup("upcast_nearest_target").await?;
+    evento_test::upcast_nearest_target(&server.client).await
+}
+
+#[tokio::test]
+async fn remote_upcast_explicit_wins() -> anyhow::Result<()> {
+    let server = setup("upcast_explicit_wins").await?;
+    evento_test::upcast_explicit_wins(&server.client).await
+}
+
+#[tokio::test]
+async fn remote_upcast_skip() -> anyhow::Result<()> {
+    let server = setup("upcast_skip").await?;
+    evento_test::upcast_skip(&server.client).await
+}
+
+#[tokio::test]
+async fn remote_upcast_strict_unhandled_target() -> anyhow::Result<()> {
+    let server = setup("upcast_strict_unhandled_target").await?;
+    evento_test::upcast_strict_unhandled_target(&server.client).await
+}
+
+#[tokio::test]
+async fn remote_upcast_subscription() -> anyhow::Result<()> {
+    let server = setup("upcast_subscription").await?;
+    evento_test::upcast_subscription(&server.client).await
+}
+
+#[tokio::test]
+async fn remote_upcast_projection_subscription() -> anyhow::Result<()> {
+    let server = setup("upcast_projection_subscription").await?;
+    evento_test::upcast_projection_subscription(&server.client).await
+}
+
+#[tokio::test]
+async fn remote_upcast_tombstone() -> anyhow::Result<()> {
+    let server = setup("upcast_tombstone").await?;
+    evento_test::upcast_tombstone(&server.client).await
+}
+
+#[tokio::test]
+async fn remote_upcast_has_event() -> anyhow::Result<()> {
+    let server = setup("upcast_has_event").await?;
+    evento_test::upcast_has_event(&server.client).await
+}
+
 /// After shutdown the server no longer answers; a request fails cleanly (with
 /// the client's request timeout as the upper bound) instead of hanging.
 #[tokio::test]

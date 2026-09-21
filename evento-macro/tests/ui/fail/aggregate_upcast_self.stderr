@@ -1,0 +1,5 @@
+error: an event cannot upcast to itself
+ --> tests/ui/fail/aggregate_upcast_self.rs:3:26
+  |
+3 |     #[evento(upcast_to = PaymentRefunded)]
+  |                          ^^^^^^^^^^^^^^^

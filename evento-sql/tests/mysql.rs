@@ -200,3 +200,57 @@ async fn mysql_snapshot_projection_scope() -> anyhow::Result<()> {
     let executor = create_mysql_executor("snapshot_projection_scope").await?;
     evento_test::snapshot_projection_scope(&executor).await
 }
+
+#[tokio::test]
+async fn mysql_upcast_load() -> anyhow::Result<()> {
+    let executor = create_mysql_executor("upcast_load").await?;
+    evento_test::upcast_load(&executor).await
+}
+
+#[tokio::test]
+async fn mysql_upcast_nearest_target() -> anyhow::Result<()> {
+    let executor = create_mysql_executor("upcast_nearest_target").await?;
+    evento_test::upcast_nearest_target(&executor).await
+}
+
+#[tokio::test]
+async fn mysql_upcast_explicit_wins() -> anyhow::Result<()> {
+    let executor = create_mysql_executor("upcast_explicit_wins").await?;
+    evento_test::upcast_explicit_wins(&executor).await
+}
+
+#[tokio::test]
+async fn mysql_upcast_skip() -> anyhow::Result<()> {
+    let executor = create_mysql_executor("upcast_skip").await?;
+    evento_test::upcast_skip(&executor).await
+}
+
+#[tokio::test]
+async fn mysql_upcast_strict_unhandled_target() -> anyhow::Result<()> {
+    let executor = create_mysql_executor("upcast_strict_unhandled_target").await?;
+    evento_test::upcast_strict_unhandled_target(&executor).await
+}
+
+#[tokio::test]
+async fn mysql_upcast_subscription() -> anyhow::Result<()> {
+    let executor = create_mysql_executor("upcast_subscription").await?;
+    evento_test::upcast_subscription(&executor).await
+}
+
+#[tokio::test]
+async fn mysql_upcast_projection_subscription() -> anyhow::Result<()> {
+    let executor = create_mysql_executor("upcast_projection_subscription").await?;
+    evento_test::upcast_projection_subscription(&executor).await
+}
+
+#[tokio::test]
+async fn mysql_upcast_tombstone() -> anyhow::Result<()> {
+    let executor = create_mysql_executor("upcast_tombstone").await?;
+    evento_test::upcast_tombstone(&executor).await
+}
+
+#[tokio::test]
+async fn mysql_upcast_has_event() -> anyhow::Result<()> {
+    let executor = create_mysql_executor("upcast_has_event").await?;
+    evento_test::upcast_has_event(&executor).await
+}

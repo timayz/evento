@@ -171,6 +171,7 @@ mod executor;
 pub mod metadata;
 pub mod projection;
 pub mod subscription;
+mod upcast;
 
 #[cfg(feature = "macro")]
 pub use evento_macro::*;

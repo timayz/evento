@@ -71,6 +71,28 @@ Pin on-disk identities so refactors never orphan stored events:
 `#[evento::aggregate(name = "bank/BankAccount")]` on the enum,
 `#[evento(name = "opened.v1")]` on a variant.
 
+**Evolving an event.** A stored event's layout is frozen (bitcode is positional):
+never edit a variant that a database may hold. Add a new variant and upcast the
+old one to it — old stored events are converted before handlers see them, so only
+the newest handler is needed:
+
+```rust
+#[evento::aggregate(name = "myapp/Payment")]
+pub enum Payment {
+    #[evento(upcast_to = PaymentRefundedV2)]   // keep: it is the decode schema
+    PaymentRefunded { amount: i64 },
+    PaymentRefundedV2 { amount: i64, reason: String },
+}
+impl From<PaymentRefunded> for PaymentRefundedV2 { /* fill the new fields */ }
+```
+
+Declared once on the aggregate; every `Projection`/`SubscriptionBuilder` that
+registers `.handler(..)` or `.skip::<PaymentRefundedV2>()` also accepts
+`PaymentRefunded` (`tombstone::<New>()` and `has_event::<New>()` too). Chains
+(`V1 -> V2 -> V3`) work; a handler for the old event itself still wins, so
+consumers migrate one at a time. `#[evento::subscription_all]` sees stored
+events un-upcast.
+
 ## 2. Write events
 
 `create()` starts a new aggregate (auto-generated ULID id, returned by `commit`).
@@ -258,7 +280,11 @@ let page = executor.read(
 - **Optimistic concurrency:** always pass the correct `original_version` to `append`;
   handle `WriteError::InvalidOriginalVersion` (retry by reloading).
 - **Handler order doesn't matter, coverage does.** Unhandled events are silently
-  skipped unless you call `.strict()`.
+  skipped unless you call `.strict()`. An older event declared with
+  `#[evento(upcast_to = New)]` counts as handled when `New` is handled or skipped.
+- **Upcasting changes what handlers fold, not what snapshots hold.** If the `From`
+  conversion yields different state than the old handler you deleted, bump
+  `.revision(n)` so stored snapshots are rebuilt.
 - **Don't `.unwrap()` a load.** `projection.load(id).execute(exec).await` returns
   `anyhow::Result<Option<T>>`; propagate the error with `?` and treat `None` as not-found.
 

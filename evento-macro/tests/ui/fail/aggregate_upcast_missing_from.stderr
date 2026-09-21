@@ -1,0 +1,14 @@
+error[E0277]: event `PaymentRefunded` cannot be upcast to `PaymentRefundedV2`
+ --> tests/ui/fail/aggregate_upcast_missing_from.rs:3:26
+  |
+3 |     #[evento(upcast_to = PaymentRefundedV2)]
+  |                          ^^^^^^^^^^^^^^^^^ `From<PaymentRefunded>` is not implemented for `PaymentRefundedV2`
+  |
+help: the trait `From<PaymentRefunded>` is not implemented for `PaymentRefundedV2`
+ --> tests/ui/fail/aggregate_upcast_missing_from.rs:1:1
+  |
+1 | #[evento::aggregate]
+  | ^^^^^^^^^^^^^^^^^^^^
+  = note: add `impl From<PaymentRefunded> for PaymentRefundedV2`
+  = note: required for `PaymentRefundedV2` to implement `UpcastFrom<PaymentRefunded>`
+  = note: this error originates in the attribute macro `evento::aggregate` (in Nightly builds, run with -Z macro-backtrace for more info)
