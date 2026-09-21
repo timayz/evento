@@ -304,6 +304,61 @@ auto-updated, use `projection.subscription("key").start(&executor)`. Handlers fo
 events of an aggregate without deserializing go through `#[evento::subscription_all]`
 with `RawEvent<A>`.
 
+### 7. Evolving events
+
+A stored event never changes: bitcode is positional, so its layout is frozen once a
+database holds one. When an event needs a new shape, add a new variant and point the
+old one at it. Older stored events are then converted **before** handlers see them, so
+only the newest handler has to exist:
+
+```rust
+use evento::{metadata::Event, projection::Projection, Executor};
+
+#[evento::aggregate(name = "myapp/Payment")]
+pub enum Payment {
+    // Still in old streams, no longer written. Keep it: it is the decode schema.
+    #[evento(upcast_to = PaymentRefundedV2)]
+    PaymentRefunded { amount: i64 },
+    PaymentRefundedV2 { amount: i64, reason: String },
+}
+
+impl From<PaymentRefunded> for PaymentRefundedV2 {
+    fn from(old: PaymentRefunded) -> Self {
+        Self { amount: old.amount, reason: "unknown".to_owned() }
+    }
+}
+
+#[evento::projection]
+#[evento::snapshot(none)]
+pub struct RefundsView {
+    pub total: i64,
+}
+
+#[evento::handler]
+async fn on_refunded(event: Event<PaymentRefundedV2>, view: &mut RefundsView) -> anyhow::Result<()> {
+    view.total += event.data.amount;
+    Ok(())
+}
+
+fn refunds<E: Executor>() -> Projection<E, RefundsView> {
+    // The only handler: it receives `PaymentRefunded` events too, upcast.
+    Projection::new::<Payment>().handler(on_refunded()).strict()
+}
+```
+
+- It is declared once, on the aggregate. Every `Projection` and `SubscriptionBuilder`
+  that registers a handler — or a `.skip::<New>()` — for the newer event picks it up;
+  `tombstone::<New>()` and `has_event::<New>()` follow the older names as well.
+- Chains work (`V1 -> V2 -> V3`) and are folded into one decode and one encode. With
+  handlers for both `V2` and `V3`, a `V1` event goes to the nearest one.
+- A handler registered for the older event itself wins over the upcast, so consumers
+  can migrate one at a time.
+- The handler sees the newer event: `event.name` and `event.data` are the newer ones,
+  everything else (id, version, timestamp, metadata) is the stored event's.
+  `#[evento::subscription_all]` handlers keep receiving stored events as they are.
+- Snapshots hold folded state, not events: if the conversion yields different state
+  than the handler you removed did, bump the projection's `.revision(n)`.
+
 ## Wiring a backend
 
 ### Fjall (embedded, zero setup)

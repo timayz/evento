@@ -222,6 +222,39 @@ use syn::{parse_macro_input, DeriveInput, ItemFn};
 /// }
 /// ```
 ///
+/// # Evolving an event
+///
+/// A stored event's layout is frozen, so a new shape is a new variant. Mark
+/// the old variant with `#[evento(upcast_to = <NewVariant>)]` and implement
+/// `From<Old> for New`: older stored events are converted before handlers see
+/// them, so only a handler for the newest event is needed. It is declared
+/// once here — every `Projection` and `SubscriptionBuilder` that handles (or
+/// skips) the newer event picks it up.
+///
+/// ```rust
+/// use evento::AggregateEvent;
+///
+/// #[evento::aggregate(name = "myapp/Payment")]
+/// pub enum Payment {
+///     // Keep the old variant: it is the schema old events are decoded with.
+///     #[evento(upcast_to = PaymentRefundedV2)]
+///     PaymentRefunded { amount: i64 },
+///     PaymentRefundedV2 { amount: i64, reason: String },
+/// }
+///
+/// impl From<PaymentRefunded> for PaymentRefundedV2 {
+///     fn from(old: PaymentRefunded) -> Self {
+///         Self { amount: old.amount, reason: "unknown".to_owned() }
+///     }
+/// }
+///
+/// assert_eq!(PaymentRefundedV2::upcasters()[0].from, "PaymentRefunded");
+/// ```
+///
+/// The target must be another variant of the same enum. Self-references and
+/// cycles are rejected, and chains (`V1 -> V2 -> V3`) are folded into a single
+/// conversion; when both `V2` and `V3` have a handler, `V1` goes to the nearest.
+///
 /// # Example
 ///
 /// ```rust

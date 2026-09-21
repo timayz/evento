@@ -1,0 +1,5 @@
+error: no variant named `PaymentRefundedV9` in this enum; `upcast_to` must name a sibling variant
+ --> tests/ui/fail/aggregate_upcast_unknown_variant.rs:3:26
+  |
+3 |     #[evento(upcast_to = PaymentRefundedV9)]
+  |                          ^^^^^^^^^^^^^^^^^

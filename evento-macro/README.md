@@ -76,6 +76,34 @@ pub enum BankAccount {
 }
 ```
 
+#### Evolving an event with `upcast_to`
+
+A stored event's layout is frozen, so a new shape is a new variant. Point the old
+variant at it and provide a `From` impl: older stored events are converted before
+handlers see them, and only the newest handler has to exist.
+
+```rust
+#[evento::aggregate(name = "myapp/Payment")]
+pub enum Payment {
+    #[evento(upcast_to = PaymentRefundedV2)]
+    PaymentRefunded { amount: i64 },
+    PaymentRefundedV2 { amount: i64, reason: String },
+}
+
+impl From<PaymentRefunded> for PaymentRefundedV2 {
+    fn from(old: PaymentRefunded) -> Self {
+        Self { amount: old.amount, reason: "unknown".to_owned() }
+    }
+}
+```
+
+The target must be another variant of the same enum; self-references and cycles
+are compile errors, and chains (`V1 -> V2 -> V3`) are folded into a single
+conversion. The macro generates `AggregateEvent::upcasters()` on the newer
+event; `#[evento::handler]`, `#[evento::subscription]` and `.skip::<E>()` pick
+it up, so nothing is declared per projection. Keep the old variant in the enum —
+it is the schema old events are decoded with.
+
 #### Additional Derives
 
 Pass additional derives as arguments (they combine with `name = "..."` in any order):

@@ -1,0 +1,5 @@
+error: event name `PaymentRefunded` is already used by variant `PaymentRefunded`
+ --> tests/ui/fail/aggregate_duplicate_event_name.rs:5:5
+  |
+5 |     PaymentRefundedV2 { amount: i64, reason: String },
+  |     ^^^^^^^^^^^^^^^^^

@@ -76,6 +76,7 @@ use crate::{
     context,
     cursor::{self, Args},
     subscription::{self, RoutingKey, Subscription, SubscriptionBuilder},
+    upcast::Aliases,
     Aggregate, AggregateEvent, EventFilter, Executor, WriteBuilder,
 };
 
@@ -234,6 +235,13 @@ pub trait Handler<P: 'static>: Sync + Send {
     fn aggregate_type(&self) -> &'static str;
     /// Returns the event name this handler processes.
     fn event_name(&self) -> &'static str;
+
+    /// Older stored events this handler also accepts, converted to its event
+    /// first (see [`AggregateEvent::upcasters`]). The `#[evento::handler]`
+    /// macro returns its event's list; hand-written handlers default to none.
+    fn upcasters(&self) -> &'static [crate::Upcaster] {
+        &[]
+    }
 }
 
 /// Trait for types that track their cursor position in the event stream.
@@ -411,9 +419,13 @@ pub struct Projection<E: Executor, P: Default + 'static> {
     aggregate_type: &'static str,
     revision: u16,
     handlers: HashMap<String, Box<dyn Handler<P>>>,
+    /// Older event names routed to the handler of the event they upcast to.
+    aliases: Aliases,
     context: context::RwContext,
     safety_disabled: bool,
-    tombstone: Option<(&'static str, &'static str)>,
+    /// Tombstone aggregate type and event names: the declared event plus the
+    /// older events that upcast to it.
+    tombstone: Option<(&'static str, Vec<&'static str>)>,
     /// Per-aggregate position (cursor order key) the persisted snapshot
     /// already reflects. Lets [`ProjectionAutoHandler`] skip events an earlier
     /// same-chunk reload has already folded, instead of re-loading the whole
@@ -459,6 +471,7 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
             aggregate_type: A::aggregate_type(),
             context: Default::default(),
             handlers: HashMap::new(),
+            aliases: Aliases::default(),
             safety_disabled: true,
             tombstone: None,
             recent: Mutex::new(HashMap::new()),
@@ -524,16 +537,31 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
     /// - [`ProjectionSubscription`] routes tombstone events to
     ///   [`Snapshot::drop_snapshot`] so the user can delete their snapshot row.
     pub fn tombstone<EV: AggregateEvent + Send + Sync + 'static>(mut self) -> Self {
-        self.tombstone = Some((EV::aggregate_type(), EV::event_name()));
+        let names = std::iter::once(EV::event_name())
+            .chain(EV::upcasters().iter().map(|u| u.from))
+            .collect();
+        self.tombstone = Some((EV::aggregate_type(), names));
         self
     }
 
     /// Registers an event handler with this projection.
     ///
+    /// Older events declared with `#[evento(upcast_to = ...)]` that lead to
+    /// the handler's event are routed to it too, converted first — unless a
+    /// handler is registered for the older event itself, which then wins.
+    ///
     /// # Panics
     ///
     /// Panics if a handler for the same event type is already registered.
-    pub fn handler<H: Handler<P> + 'static>(mut self, h: H) -> Self {
+    pub fn handler<H: Handler<P> + 'static>(self, h: H) -> Self {
+        self.register(h, true)
+    }
+
+    /// `convert` is `false` for skips: their payload is never read.
+    fn register<H: Handler<P> + 'static>(mut self, h: H, convert: bool) -> Self {
+        self.aliases
+            .register(h.aggregate_type(), h.event_name(), h.upcasters(), convert);
+
         let key = format!("{}_{}", h.aggregate_type(), h.event_name());
         match self.handlers.entry(key) {
             std::collections::hash_map::Entry::Occupied(entry) => {
@@ -551,11 +579,13 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
 
     /// Registers a skip handler with this projection.
     ///
+    /// Older events that upcast to `EV` are skipped too.
+    ///
     /// # Panics
     ///
     /// Panics if a handler for the same event type is already registered.
     pub fn skip<EV: AggregateEvent + Send + Sync + 'static>(self) -> Self {
-        self.handler(SkipHandler::<EV>(PhantomData))
+        self.register(SkipHandler::<EV>(PhantomData), false)
     }
 
     /// Adds shared data to the handler context.
@@ -612,18 +642,13 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
         id: &str,
         extra_aggregators: &HashMap<String, String>,
     ) -> anyhow::Result<(Option<P>, Option<cursor::Value>)> {
-        if let Some((tombstone_type, tombstone_event)) = self.tombstone {
+        if let Some((tombstone_type, tombstone_events)) = &self.tombstone {
+            let filters = tombstone_events
+                .iter()
+                .map(|name| EventFilter::exact(*tombstone_type, id.to_owned(), *name))
+                .collect::<Arc<[EventFilter]>>();
             let res = executor
-                .read(
-                    Some(Arc::from([EventFilter::exact(
-                        tombstone_type,
-                        id.to_owned(),
-                        tombstone_event,
-                    )])),
-                    None,
-                    Args::backward(1, None),
-                    None,
-                )
+                .read(Some(filters), None, Args::backward(1, None), None)
                 .await?;
             if !res.edges.is_empty() {
                 return Ok((None, None));
@@ -651,25 +676,35 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
         // `take_snapshot` below.
         let mut persisted = cursor.clone();
 
+        // Older events that upcast to a handled one are read as well; in
+        // strict mode every event of the type already is.
+        let upcast_names = self
+            .aliases
+            .iter()
+            .filter(|(key, _)| self.safety_disabled && !self.handlers.contains_key(*key))
+            .map(|(_, alias)| (alias.aggregate_type, alias.from));
+
         let read_aggregators = self
             .handlers
             .values()
-            .map(|h| {
+            .map(|h| (h.aggregate_type(), h.event_name()))
+            .chain(upcast_names)
+            .map(|(aggregate_type, event_name)| {
                 // Scope each handler to one id: the id registered via
                 // `.aggregate::<S>(id)` when present, otherwise auto-key to the
                 // primary id (co-keyed by default). In subscription mode the
                 // primary id is the event's aggregate id, so co-keyed secondary
                 // aggregates are scoped correctly with no explicit registration.
                 let aggregate_id = aggregators
-                    .get(h.aggregate_type())
+                    .get(aggregate_type)
                     .map(ToOwned::to_owned)
                     .unwrap_or_else(|| id.to_owned());
 
                 EventFilter {
-                    aggregate_type: h.aggregate_type().to_owned(),
+                    aggregate_type: aggregate_type.to_owned(),
                     aggregate_id: Some(aggregate_id),
                     name: if self.safety_disabled {
-                        Some(h.event_name().to_owned())
+                        Some(event_name.to_owned())
                     } else {
                         None
                     },
@@ -730,10 +765,18 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
                 }
 
                 let key = format!("{}_{}", event.node.aggregate_type, event.node.name);
-                match self.handlers.get(&key) {
-                    Some(handler) => handler.handle(state, &event.node).await?,
-                    None if !self.safety_disabled => anyhow::bail!("no handler k={key}"),
-                    None => {}
+                // An exact handler wins over an upcast, so consumers can
+                // migrate to the newer event one at a time.
+                match (self.handlers.get(&key), self.aliases.get(&key)) {
+                    (Some(handler), _) => handler.handle(state, &event.node).await?,
+                    (None, Some(alias)) => {
+                        let upcast = alias.apply(&event.node)?;
+                        self.handlers[&alias.target_key]
+                            .handle(state, &upcast)
+                            .await?
+                    }
+                    (None, None) if !self.safety_disabled => anyhow::bail!("no handler k={key}"),
+                    (None, None) => {}
                 }
 
                 state.set_cursor(&event.cursor);
@@ -929,7 +972,12 @@ where
             continue_on_error,
         } = self;
 
-        let tombstone = projection.tombstone;
+        let tombstone = projection.tombstone.clone();
+        let is_tombstone = |aggregate_type: &str, event_name: &str| {
+            tombstone
+                .as_ref()
+                .is_some_and(|(t, names)| *t == aggregate_type && names.contains(&event_name))
+        };
 
         // One auto-handler per registered event, across the primary *and* any
         // co-keyed secondary aggregate, so the worker wakes on secondary events
@@ -938,15 +986,20 @@ where
         // macro). Drop any handler that collides with the tombstone — that event
         // routes to ProjectionTombstoneHandler. Secondary aggregates are scoped
         // by `load_aggregator`, which auto-keys them to the event's id.
+        //
+        // Older events that upcast to a handled one wake the worker as well;
+        // the auto-handler ignores the payload, so nothing is converted here.
+        let upcast_specs = projection
+            .aliases
+            .iter()
+            .filter(|(key, _)| !projection.handlers.contains_key(*key))
+            .map(|(_, alias)| (alias.aggregate_type, alias.from));
         let specs: Vec<(&'static str, &'static str)> = projection
             .handlers
             .values()
-            .filter(|h| {
-                tombstone
-                    .map(|(t, e)| !(h.aggregate_type() == t && h.event_name() == e))
-                    .unwrap_or(true)
-            })
             .map(|h| (h.aggregate_type(), h.event_name()))
+            .chain(upcast_specs)
+            .filter(|(aggregate_type, event_name)| !is_tombstone(aggregate_type, event_name))
             .collect();
 
         let projection = Arc::new(projection);
@@ -978,13 +1031,15 @@ where
             });
         }
 
-        if let Some((tombstone_type, tombstone_event)) = tombstone {
-            builder = builder.handler(ProjectionTombstoneHandler::<E, P> {
-                projection: projection.clone(),
-                aggregate_type: tombstone_type,
-                event_name: tombstone_event,
-                _marker: PhantomData,
-            });
+        if let Some((tombstone_type, tombstone_events)) = tombstone {
+            for tombstone_event in tombstone_events {
+                builder = builder.handler(ProjectionTombstoneHandler::<E, P> {
+                    projection: projection.clone(),
+                    aggregate_type: tombstone_type,
+                    event_name: tombstone_event,
+                    _marker: PhantomData,
+                });
+            }
         }
 
         builder
@@ -1108,5 +1163,9 @@ impl<P: 'static, EV: AggregateEvent + Send + Sync> Handler<P> for SkipHandler<EV
 
     fn event_name(&self) -> &'static str {
         EV::event_name()
+    }
+
+    fn upcasters(&self) -> &'static [crate::Upcaster] {
+        EV::upcasters()
     }
 }

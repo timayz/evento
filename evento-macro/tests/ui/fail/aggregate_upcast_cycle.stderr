@@ -1,0 +1,5 @@
+error: `upcast_to` cycle: A -> B -> C -> A
+ --> tests/ui/fail/aggregate_upcast_cycle.rs:3:26
+  |
+3 |     #[evento(upcast_to = B)]
+  |                          ^

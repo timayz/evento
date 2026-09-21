@@ -1,8 +1,8 @@
 use proc_macro::TokenStream;
-use quote::quote;
+use quote::{format_ident, quote, quote_spanned, ToTokens};
 use syn::{
-    punctuated::Punctuated, Attribute, Error, Expr, ExprLit, Fields, ItemEnum, Lit, LitStr, Meta,
-    Token, Variant, Visibility,
+    punctuated::Punctuated, Attribute, Error, Expr, ExprLit, Fields, Ident, ItemEnum, Lit, LitStr,
+    Meta, Token, Variant, Visibility,
 };
 
 /// Parsed arguments for `#[evento::aggregate(name = "...", Derive1, Derive2)]`.
@@ -58,35 +58,201 @@ fn parse_args(attr: TokenStream) -> syn::Result<AggregateArgs> {
     Ok(args)
 }
 
-/// Extracts an optional `#[evento(name = "...")]` event-name override from a
-/// variant's attributes and returns the remaining attributes to re-emit.
-fn parse_variant_attrs(variant: &Variant) -> syn::Result<(Option<LitStr>, Vec<&Attribute>)> {
+/// What `#[evento(...)]` on a variant says, plus the attributes to re-emit on
+/// the generated struct.
+struct VariantInfo<'a> {
+    variant: &'a Variant,
+    /// Stored event name: `#[evento(name = "...")]`, else the variant ident.
+    event_name: String,
+    /// `#[evento(upcast_to = <Variant>)]`: the newer event this one converts to.
+    upcast_to: Option<Ident>,
+    attrs: Vec<&'a Attribute>,
+}
+
+/// Extracts the `#[evento(name = "...", upcast_to = <Variant>)]` options from a
+/// variant's attributes and keeps the remaining attributes to re-emit.
+fn parse_variant(variant: &Variant) -> syn::Result<VariantInfo<'_>> {
     let mut event_name: Option<LitStr> = None;
-    let mut rest = vec![];
+    let mut upcast_to: Option<Ident> = None;
+    let mut attrs = vec![];
 
     for attr in &variant.attrs {
         if !attr.path().is_ident("evento") {
-            rest.push(attr);
+            attrs.push(attr);
             continue;
         }
 
         attr.parse_nested_meta(|meta| {
-            if !meta.path.is_ident("name") {
-                return Err(meta.error("unknown option; expected `name = \"...\"`"));
+            if meta.path.is_ident("name") {
+                let lit: LitStr = meta.value()?.parse()?;
+                if lit.value().is_empty() {
+                    return Err(Error::new_spanned(lit, "event name must not be empty"));
+                }
+                if event_name.is_some() {
+                    return Err(meta.error("duplicate `name` option"));
+                }
+                event_name = Some(lit);
+                return Ok(());
             }
-            let lit: LitStr = meta.value()?.parse()?;
-            if lit.value().is_empty() {
-                return Err(Error::new_spanned(lit, "event name must not be empty"));
+
+            if meta.path.is_ident("upcast_to") {
+                let target: Ident = meta.value()?.parse().map_err(|e| {
+                    Error::new(
+                        e.span(),
+                        "expected a variant of this enum: `upcast_to = MyEventV2`",
+                    )
+                })?;
+                if upcast_to.is_some() {
+                    return Err(meta.error("duplicate `upcast_to` option"));
+                }
+                upcast_to = Some(target);
+                return Ok(());
             }
-            if event_name.is_some() {
-                return Err(meta.error("duplicate `name` option"));
-            }
-            event_name = Some(lit);
-            Ok(())
+
+            Err(meta.error("unknown option; expected `name = \"...\"` or `upcast_to = <Variant>`"))
         })?;
     }
 
-    Ok((event_name, rest))
+    Ok(VariantInfo {
+        variant,
+        event_name: event_name
+            .map(|lit| lit.value())
+            .unwrap_or_else(|| variant.ident.to_string()),
+        upcast_to,
+        attrs,
+    })
+}
+
+/// Checks the `upcast_to` graph: every target is a sibling variant, and no
+/// chain loops. Each variant has at most one out-edge, so a walk suffices.
+fn check_upcasts(variants: &[VariantInfo]) -> syn::Result<()> {
+    for (i, info) in variants.iter().enumerate() {
+        if let Some(other) = variants[..i]
+            .iter()
+            .find(|other| other.event_name == info.event_name)
+        {
+            return Err(Error::new_spanned(
+                &info.variant.ident,
+                format!(
+                    "event name `{}` is already used by variant `{}`",
+                    info.event_name, other.variant.ident
+                ),
+            ));
+        }
+    }
+
+    let target_of = |ident: &Ident| {
+        variants
+            .iter()
+            .find(|info| &info.variant.ident == ident)
+            .and_then(|info| info.upcast_to.as_ref())
+    };
+
+    for info in variants {
+        let Some(target) = &info.upcast_to else {
+            continue;
+        };
+        let start = &info.variant.ident;
+
+        if target == start {
+            return Err(Error::new_spanned(
+                target,
+                "an event cannot upcast to itself",
+            ));
+        }
+        if !variants.iter().any(|other| &other.variant.ident == target) {
+            return Err(Error::new_spanned(
+                target,
+                format!("no variant named `{target}` in this enum; `upcast_to` must name a sibling variant"),
+            ));
+        }
+
+        let mut path = vec![start.to_string(), target.to_string()];
+        let mut current = target;
+        while let Some(next) = target_of(current) {
+            path.push(next.to_string());
+            if next == start {
+                return Err(Error::new_spanned(
+                    target,
+                    format!("`upcast_to` cycle: {}", path.join(" -> ")),
+                ));
+            }
+            // A loop that does not include `start` is reported on its own
+            // variants; stop here rather than walking it for ever.
+            if path.len() > variants.len() + 1 {
+                break;
+            }
+            current = next;
+        }
+    }
+
+    Ok(())
+}
+
+/// The `upcasters()` override for `target`: one [`Upcaster`] per older variant
+/// whose `upcast_to` chain reaches it, the chain folded into a single typed
+/// function (one decode, one encode, whatever its length).
+fn upcasters_impl(target: &VariantInfo, variants: &[VariantInfo]) -> syn::Result<impl ToTokens> {
+    let mut fns = vec![];
+    let mut entries = vec![];
+
+    for source in variants {
+        // Follow `source`'s chain; keep it if it reaches `target`.
+        let mut steps: Vec<(&Ident, &Ident)> = vec![];
+        let mut current = source;
+        let reached = loop {
+            let Some(next) = &current.upcast_to else {
+                break false;
+            };
+            steps.push((&current.variant.ident, next));
+            if next == &target.variant.ident {
+                break true;
+            }
+            current = variants
+                .iter()
+                .find(|info| &info.variant.ident == next)
+                .expect("checked by check_upcasts");
+        };
+        if !reached {
+            continue;
+        }
+
+        let hops = u8::try_from(steps.len()).map_err(|_| {
+            Error::new_spanned(&source.variant.ident, "`upcast_to` chain is too long")
+        })?;
+        let fn_name = format_ident!("__upcast_{}", fns.len());
+        let source_ident = &source.variant.ident;
+        // Spanned on the `upcast_to = New` that asks for the conversion, so a
+        // missing `From` impl is reported there.
+        let conversions = steps.iter().map(|(old, new)| {
+            quote_spanned! {new.span()=>
+                let event: #new = <#new as evento::UpcastFrom<#old>>::upcast_from(event);
+            }
+        });
+
+        fns.push(quote! {
+            fn #fn_name(data: &[u8]) -> ::core::result::Result<Vec<u8>, bitcode::Error> {
+                let event: #source_ident = bitcode::decode(data)?;
+                #(#conversions)*
+                Ok(bitcode::encode(&event))
+            }
+        });
+        let from = &source.event_name;
+        entries.push(quote! { evento::Upcaster::new(#from, #hops, #fn_name) });
+    }
+
+    if entries.is_empty() {
+        return Ok(quote! {});
+    }
+
+    Ok(quote! {
+        fn upcasters() -> &'static [evento::Upcaster] {
+            #(#fns)*
+
+            const UPCASTERS: &[evento::Upcaster] = &[#(#entries),*];
+            UPCASTERS
+        }
+    })
 }
 
 /// Event struct fields are always emitted `pub`; bare `pub` or inherited
@@ -125,16 +291,22 @@ pub fn aggregator(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStre
         },
     };
 
-    // Generate a struct for each variant
-    let structs = input
+    let variants = input
         .variants
         .iter()
-        .map(|variant| {
+        .map(parse_variant)
+        .collect::<syn::Result<Vec<_>>>()?;
+    check_upcasts(&variants)?;
+
+    // Generate a struct for each variant
+    let structs = variants
+        .iter()
+        .map(|info| {
+            let variant = info.variant;
             let variant_name = &variant.ident;
-            let (event_name, attrs) = parse_variant_attrs(variant)?;
-            let event_name_str = event_name
-                .map(|lit| lit.value())
-                .unwrap_or_else(|| variant_name.to_string());
+            let attrs = &info.attrs;
+            let event_name_str = &info.event_name;
+            let upcasters = upcasters_impl(info, &variants)?;
             check_field_vis(&variant.fields)?;
 
             // Mandatory + user derives
@@ -155,6 +327,8 @@ pub fn aggregator(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStre
                     fn event_name() -> &'static str {
                         #event_name_str
                     }
+
+                    #upcasters
                 }
             };
 

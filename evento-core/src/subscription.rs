@@ -72,6 +72,7 @@ use ulid::Ulid;
 use crate::{
     context,
     cursor::{Args, Value},
+    upcast::Aliases,
     Aggregate, AggregateEvent, EventFilter, Executor,
 };
 
@@ -166,6 +167,13 @@ pub trait Handler<E: Executor>: Sync + Send {
         event: &'a crate::Event,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>>;
 
+    /// Older stored events this handler also accepts, converted to its event
+    /// first (see [`AggregateEvent::upcasters`]). The `#[evento::subscription]`
+    /// macro returns its event's list; hand-written handlers default to none.
+    fn upcasters(&self) -> &'static [crate::Upcaster] {
+        &[]
+    }
+
     /// Returns the aggregate type this handler processes.
     fn aggregate_type(&self) -> &'static str;
     /// Returns the event name this handler processes.
@@ -200,6 +208,8 @@ pub trait Handler<E: Executor>: Sync + Send {
 pub struct SubscriptionBuilder<E: Executor> {
     key: String,
     handlers: HashMap<String, Box<dyn Handler<E>>>,
+    /// Older event names routed to the handler of the event they upcast to.
+    aliases: Aliases,
     context: context::RwContext,
     routing_key: Option<RoutingKey>,
     prefix_key: Option<String>,
@@ -244,6 +254,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             resolved_key: key.clone(),
             key,
             handlers: HashMap::new(),
+            aliases: Aliases::default(),
             safety_disabled: true,
             context: Default::default(),
             delay: None,
@@ -271,10 +282,24 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
 
     /// Registers an event handler with this subscription.
     ///
+    /// Older events declared with `#[evento(upcast_to = ...)]` that lead to
+    /// the handler's event are routed to it too, converted first — unless a
+    /// handler is registered for the older event itself, which then wins.
+    /// `#[evento::subscription_all]` handlers receive stored events as they
+    /// are, never upcast.
+    ///
     /// # Panics
     ///
     /// Panics if a handler for the same event type is already registered.
-    pub fn handler<H: Handler<E> + 'static>(mut self, h: H) -> Self {
+    pub fn handler<H: Handler<E> + 'static>(self, h: H) -> Self {
+        self.register(h, true)
+    }
+
+    /// `convert` is `false` for skips: their payload is never read.
+    fn register<H: Handler<E> + 'static>(mut self, h: H, convert: bool) -> Self {
+        self.aliases
+            .register(h.aggregate_type(), h.event_name(), h.upcasters(), convert);
+
         let key = format!("{}_{}", h.aggregate_type(), h.event_name());
         match self.handlers.entry(key) {
             std::collections::hash_map::Entry::Occupied(entry) => {
@@ -292,13 +317,14 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
 
     /// Registers a skip handler for an event type.
     ///
-    /// Events of this type will be acknowledged but not processed.
+    /// Events of this type — and older events that upcast to it — will be
+    /// acknowledged but not processed.
     ///
     /// # Panics
     ///
     /// Panics if a handler for the same event type is already registered.
     pub fn skip<EV: AggregateEvent + Send + Sync + 'static>(self) -> Self {
-        self.handler(SkipHandler::<EV>(PhantomData))
+        self.register(SkipHandler::<EV>(PhantomData), false)
     }
 
     /// Adds shared data to the subscription context.
@@ -410,24 +436,34 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
     /// clones the handle, not the filters.
     fn read_aggregators(&self) -> Arc<[EventFilter]> {
         let mut seen = std::collections::HashSet::new();
+        // Older events that upcast to a handled one are read as well; in
+        // strict mode every event of the type already is.
+        let upcast_names = self
+            .aliases
+            .iter()
+            .filter(|(key, _)| self.safety_disabled && !self.handlers.contains_key(*key))
+            .map(|(_, alias)| (alias.aggregate_type, alias.from));
+
         self.handlers
             .values()
-            .map(|h| {
+            .map(|h| (h.aggregate_type(), h.event_name()))
+            .chain(upcast_names)
+            .map(|(aggregate_type, event_name)| {
                 // `#[subscription_all]` handlers report the sentinel name "all" and
                 // match every event of the type, so they must read by type rather
                 // than by a literal event name (which would match nothing).
-                let by_name = self.safety_disabled && h.event_name() != "all";
-                match self.aggregators.get(h.aggregate_type()) {
+                let by_name = self.safety_disabled && event_name != "all";
+                match self.aggregators.get(aggregate_type) {
                     Some(id) => EventFilter {
-                        aggregate_type: h.aggregate_type().to_owned(),
+                        aggregate_type: aggregate_type.to_owned(),
                         aggregate_id: Some(id.to_owned()),
-                        name: by_name.then(|| h.event_name().to_owned()),
+                        name: by_name.then(|| event_name.to_owned()),
                     },
                     _ => {
                         if by_name {
-                            EventFilter::by_event(h.aggregate_type(), h.event_name())
+                            EventFilter::by_event(aggregate_type, event_name)
                         } else {
-                            EventFilter::by_type(h.aggregate_type())
+                            EventFilter::by_type(aggregate_type)
                         }
                     }
                 }
@@ -590,14 +626,22 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                 tracing::Span::current().record("aggregate_id", &event.node.aggregate_id);
                 tracing::Span::current().record("event", &event.node.name);
 
-                // A specific handler takes precedence over a `subscription_all`
-                // catch-all for the same aggregate type; the catch-all key is
-                // only built on a miss.
+                // A specific handler takes precedence over an upcast to a newer
+                // event's handler (so consumers migrate one at a time), which
+                // takes precedence over a `subscription_all` catch-all for the
+                // same aggregate type; the catch-all key is only built on a miss.
                 let key = format!("{}_{}", event.node.aggregate_type, event.node.name);
-                let handler = match self.handlers.get(&key).or_else(|| {
-                    self.handlers
-                        .get(&format!("{}_all", event.node.aggregate_type))
-                }) {
+                let alias = match self.handlers.contains_key(&key) {
+                    true => None,
+                    false => self.aliases.get(&key),
+                };
+                let handler = match self
+                    .handlers
+                    .get(alias.map_or(&key, |alias| &alias.target_key))
+                    .or_else(|| {
+                        self.handlers
+                            .get(&format!("{}_all", event.node.aggregate_type))
+                    }) {
                     Some(handler) => Some(handler),
                     None if !self.safety_disabled && !self.continue_on_error => {
                         self.flush_ack(executor, id, aggregators, &mut pending_ack, &mut since_ack)
@@ -615,7 +659,13 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                 };
 
                 if let Some(handler) = handler {
-                    if let Err(err) = handler.handle(&context, &event.node).await {
+                    // A failed upcast is handled like a failed handler.
+                    let result = match alias.map(|alias| alias.apply(&event.node)) {
+                        Some(Ok(upcast)) => handler.handle(&context, &upcast).await,
+                        Some(Err(err)) => Err(err),
+                        None => handler.handle(&context, &event.node).await,
+                    };
+                    if let Err(err) = result {
                         if !self.continue_on_error {
                             tracing::error!("failed");
                             // Persist the successfully processed prefix before
@@ -1082,5 +1132,9 @@ impl<E: Executor, EV: AggregateEvent + Send + Sync> Handler<E> for SkipHandler<E
 
     fn event_name(&self) -> &'static str {
         EV::event_name()
+    }
+
+    fn upcasters(&self) -> &'static [crate::Upcaster] {
+        EV::upcasters()
     }
 }

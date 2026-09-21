@@ -2653,6 +2653,594 @@ mod proj_scope_b {
     }
 }
 
+/// Commits one refund stream holding every generation of the event:
+/// `Refunded` (10), `RefundedV2` (20, "v2"), `RefundedV3` (30, "v3", "ref").
+async fn upcast_refund_stream<E: Executor>(executor: &E) -> anyhow::Result<String> {
+    let id = evento::create()
+        .event(&upcast::Refunded { amount: 10 })
+        .event(&upcast::RefundedV2 {
+            amount: 20,
+            reason: "v2".to_owned(),
+        })
+        .event(&upcast::RefundedV3 {
+            amount: 30,
+            reason: "v3".to_owned(),
+            reference: Some("ref".to_owned()),
+        })
+        .commit(executor)
+        .await?;
+
+    Ok(id)
+}
+
+/// Scenario: a projection with only the newest event's handler folds every
+/// older generation, converted through the whole `upcast_to` chain — in lenient
+/// mode (older names are added to the read filter) and in `strict()` mode.
+pub async fn upcast_load<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
+    let id = upcast_refund_stream(executor).await?;
+    evento::append(&id)
+        .original_version(3)
+        .event(&upcast::Noted {
+            text: "hello".to_owned(),
+        })
+        .commit(executor)
+        .await?;
+
+    for strict in [false, true] {
+        let projection = upcast::latest_only();
+        let projection = if strict {
+            projection.strict()
+        } else {
+            projection
+        };
+        let view = projection.load(&id).execute(executor).await?.unwrap();
+
+        assert_eq!(view.total, 60, "strict={strict}");
+        assert_eq!(view.reasons, ["unknown", "v2", "v3"], "strict={strict}");
+        assert_eq!(
+            view.references,
+            [None, None, Some("ref".to_owned())],
+            "strict={strict}"
+        );
+        // Handlers see the newer event: name and payload are a consistent pair.
+        assert_eq!(
+            view.names,
+            ["RefundedV3", "RefundedV3", "RefundedV3", "NotedV2"],
+            "strict={strict}"
+        );
+        // `Noted` pins its stored name with `#[evento(name = "legacy.noted")]`.
+        assert_eq!(view.notes, ["hello (anonymous)"], "strict={strict}");
+        assert_eq!(view.aggregate_version, 4, "strict={strict}");
+    }
+
+    Ok(())
+}
+
+/// Scenario: with handlers for `V2` and `V3`, a `V1` event goes to the nearest
+/// one (`V2`), whatever the registration order.
+pub async fn upcast_nearest_target<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
+    let id = upcast_refund_stream(executor).await?;
+
+    for projection in [upcast::v2_then_v3(), upcast::v3_then_v2()] {
+        let view = projection
+            .strict()
+            .load(&id)
+            .execute(executor)
+            .await?
+            .unwrap();
+        assert_eq!(view.total, 60);
+        assert_eq!(view.names, ["RefundedV2", "RefundedV2", "RefundedV3"]);
+        assert_eq!(view.reasons, ["unknown", "v2", "v3"]);
+    }
+
+    Ok(())
+}
+
+/// Scenario: a handler registered for the older event itself wins over the
+/// upcast, so consumers can migrate one at a time.
+pub async fn upcast_explicit_wins<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
+    let id = upcast_refund_stream(executor).await?;
+
+    let view = upcast::with_v1_handler()
+        .strict()
+        .load(&id)
+        .execute(executor)
+        .await?
+        .unwrap();
+    assert_eq!(view.names, ["Refunded", "RefundedV3", "RefundedV3"]);
+    assert_eq!(view.reasons, ["v1-handler", "v2", "v3"]);
+
+    Ok(())
+}
+
+/// Scenario: `.skip::<New>()` also skips the older events, without decoding
+/// them (the stream below holds a `Refunded` whose bytes are not a `Refunded`).
+pub async fn upcast_skip<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
+    let id = evento::create()
+        .event(&upcast::NotedV2 {
+            text: "kept".to_owned(),
+            author: "me".to_owned(),
+        })
+        .commit(executor)
+        .await?;
+    // Bytes of another shape under the old name: converting them would fail.
+    let mut broken = executor
+        .read(
+            Some([EventFilter::by_id(upcast::Refund::aggregate_type(), &id)].into()),
+            None,
+            Args::forward(1, None),
+            None,
+        )
+        .await?
+        .edges
+        .remove(0)
+        .node;
+    broken.id = Ulid::generate();
+    broken.version = 2;
+    broken.name = "Refunded".to_owned();
+    broken.data = vec![0xFF];
+    executor.replicate(vec![broken]).await?;
+
+    let view = upcast::skip_refunds()
+        .strict()
+        .load(&id)
+        .execute(executor)
+        .await?
+        .unwrap();
+    assert_eq!(view.notes, ["kept (me)"]);
+    assert_eq!(view.total, 0);
+
+    // The same stream through a real handler surfaces the failed conversion.
+    let err = upcast::latest_only().load(&id).execute(executor).await;
+    assert!(
+        err.is_err_and(|e| e.to_string().contains("failed to upcast `Refunded`")),
+        "a payload that does not decode as the older event must fail the load"
+    );
+
+    Ok(())
+}
+
+/// Scenario: in `strict()` mode an older event whose target is neither
+/// handled nor skipped still fails — upcasting never hides a missing consumer.
+pub async fn upcast_strict_unhandled_target<E: Executor + Clone>(
+    executor: &E,
+) -> anyhow::Result<()> {
+    let id = evento::create()
+        .event(&upcast::Refunded { amount: 1 })
+        .commit(executor)
+        .await?;
+
+    let result = upcast::notes_only()
+        .strict()
+        .load(&id)
+        .execute(executor)
+        .await;
+    assert!(
+        result.is_err_and(|e| e.to_string().contains("no handler")),
+        "strict must reject an old event whose upcast target has no handler"
+    );
+    // Lenient: the unrelated event is simply not read.
+    assert!(upcast::notes_only()
+        .load(&id)
+        .execute(executor)
+        .await?
+        .is_none());
+
+    Ok(())
+}
+
+/// Scenario: a `SubscriptionBuilder` with only the newest handler receives the
+/// older events upcast (`name` and `data` rewritten, everything else as
+/// stored), while a `#[subscription_all]` handler sees them as stored.
+pub async fn upcast_subscription<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
+    let id = evento::create()
+        .metadata("trace", &"abc".to_owned())
+        .event(&upcast::Refunded { amount: 10 })
+        .event(&upcast::RefundedV2 {
+            amount: 20,
+            reason: "v2".to_owned(),
+        })
+        .commit(executor)
+        .await?;
+
+    upcast::subscription("upcast-sub")
+        .all()
+        .no_retry()
+        .run_once(executor)
+        .await?;
+    // Strict: older names resolve to the registered handler, nothing is unhandled.
+    upcast::subscription("upcast-sub-strict")
+        .strict()
+        .all()
+        .no_retry()
+        .run_once(executor)
+        .await?;
+
+    let seen = upcast::SEEN
+        .read()
+        .unwrap()
+        .get(&id)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(seen.len(), 4, "two events, two subscriptions");
+    for row in &seen {
+        assert_eq!(row.name, "RefundedV3");
+        assert_eq!(
+            row.trace.as_deref(),
+            Some("abc"),
+            "metadata must be preserved"
+        );
+    }
+    let mut versions: Vec<_> = seen
+        .iter()
+        .map(|r| (r.version, r.amount, r.reason.clone()))
+        .collect();
+    versions.sort();
+    versions.dedup();
+    assert_eq!(
+        versions,
+        [(1, 10, "unknown".to_owned()), (2, 20, "v2".to_owned())],
+        "payload upcast, version preserved"
+    );
+
+    upcast::raw_subscription("upcast-sub-raw")
+        .all()
+        .no_retry()
+        .run_once(executor)
+        .await?;
+    let raw = upcast::RAW
+        .read()
+        .unwrap()
+        .get(&id)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        raw,
+        ["Refunded", "RefundedV2"],
+        "subscription_all must see stored events, not upcast ones"
+    );
+
+    Ok(())
+}
+
+/// Scenario: a projection subscription whose projection only handles the
+/// newest event is woken by the older events too.
+pub async fn upcast_projection_subscription<E: Executor + Clone>(
+    executor: &E,
+) -> anyhow::Result<()> {
+    let id = evento::create()
+        .event(&upcast::Refunded { amount: 7 })
+        .commit(executor)
+        .await?;
+
+    upcast::recording()
+        .subscription("upcast-projection")
+        .all()
+        .no_retry()
+        .run_once(executor)
+        .await?;
+
+    let total = upcast::TOTALS.read().unwrap().get(&id).copied();
+    assert_eq!(
+        total,
+        Some(7),
+        "an older event alone must trigger the projection's auto handler"
+    );
+
+    Ok(())
+}
+
+/// Scenario: `tombstone::<New>()` also fires on the older events that upcast
+/// to it — on load, and in a projection subscription.
+pub async fn upcast_tombstone<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
+    let id = evento::create()
+        .event(&upcast::Refunded { amount: 5 })
+        .commit(executor)
+        .await?;
+
+    let alive = upcast::recording()
+        .tombstone::<upcast::ClosedV2>()
+        .load(&id)
+        .execute(executor)
+        .await?;
+    assert!(alive.is_some());
+
+    evento::append(&id)
+        .original_version(1)
+        .event(&upcast::Closed {
+            by: "admin".to_owned(),
+        })
+        .commit(executor)
+        .await?;
+
+    let dead = upcast::recording()
+        .tombstone::<upcast::ClosedV2>()
+        .load(&id)
+        .execute(executor)
+        .await?;
+    assert!(
+        dead.is_none(),
+        "an older tombstone event must make load return None"
+    );
+
+    // The subscription registers a tombstone handler per name without
+    // colliding with the auto handlers.
+    upcast::recording()
+        .tombstone::<upcast::ClosedV2>()
+        .subscription("upcast-tombstone")
+        .all()
+        .no_retry()
+        .run_once(executor)
+        .await?;
+
+    Ok(())
+}
+
+/// Scenario: `has_event::<New>()` is true for a stream that only holds an
+/// older event upcasting to it.
+pub async fn upcast_has_event<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
+    let id = evento::create()
+        .event(&upcast::Refunded { amount: 1 })
+        .commit(executor)
+        .await?;
+
+    assert!(executor.has_event::<upcast::Refunded>(&id).await?);
+    assert!(executor.has_event::<upcast::RefundedV2>(&id).await?);
+    assert!(executor.has_event::<upcast::RefundedV3>(&id).await?);
+    assert!(!executor.has_event::<upcast::NotedV2>(&id).await?);
+
+    Ok(())
+}
+
+/// Aggregate with several generations of its events, plus the projections and
+/// subscriptions used by the `upcast_*` scenarios.
+mod upcast {
+    use std::{collections::HashMap, sync::RwLock};
+
+    use evento::{
+        metadata::{Event, RawEvent},
+        projection::Projection,
+        subscription::{Context, SubscriptionBuilder},
+        Executor,
+    };
+    use once_cell::sync::Lazy;
+
+    #[evento::aggregate(name = "evento-test/Refund")]
+    pub enum Refund {
+        #[evento(upcast_to = RefundedV2)]
+        Refunded {
+            amount: i64,
+        },
+        #[evento(upcast_to = RefundedV3)]
+        RefundedV2 {
+            amount: i64,
+            reason: String,
+        },
+        RefundedV3 {
+            amount: i64,
+            reason: String,
+            reference: Option<String>,
+        },
+
+        #[evento(name = "legacy.noted", upcast_to = NotedV2)]
+        Noted {
+            text: String,
+        },
+        NotedV2 {
+            text: String,
+            author: String,
+        },
+
+        #[evento(upcast_to = ClosedV2)]
+        Closed {
+            by: String,
+        },
+        ClosedV2 {
+            by: String,
+            reason: String,
+        },
+    }
+
+    impl From<Refunded> for RefundedV2 {
+        fn from(old: Refunded) -> Self {
+            Self {
+                amount: old.amount,
+                reason: "unknown".to_owned(),
+            }
+        }
+    }
+
+    impl From<RefundedV2> for RefundedV3 {
+        fn from(old: RefundedV2) -> Self {
+            Self {
+                amount: old.amount,
+                reason: old.reason,
+                reference: None,
+            }
+        }
+    }
+
+    impl From<Noted> for NotedV2 {
+        fn from(old: Noted) -> Self {
+            Self {
+                text: old.text,
+                author: "anonymous".to_owned(),
+            }
+        }
+    }
+
+    impl From<Closed> for ClosedV2 {
+        fn from(old: Closed) -> Self {
+            Self {
+                by: old.by,
+                reason: "unspecified".to_owned(),
+            }
+        }
+    }
+
+    #[evento::projection]
+    #[evento::snapshot(none)]
+    pub struct View {
+        pub total: i64,
+        pub reasons: Vec<String>,
+        pub references: Vec<Option<String>>,
+        /// `event.name` as each handler saw it.
+        pub names: Vec<String>,
+        pub notes: Vec<String>,
+    }
+
+    #[evento::handler]
+    async fn on_refunded(event: Event<Refunded>, view: &mut View) -> anyhow::Result<()> {
+        view.total += event.data.amount;
+        view.reasons.push("v1-handler".to_owned());
+        view.names.push(event.name.to_owned());
+        Ok(())
+    }
+
+    #[evento::handler]
+    async fn on_refunded_v2(event: Event<RefundedV2>, view: &mut View) -> anyhow::Result<()> {
+        view.total += event.data.amount;
+        view.reasons.push(event.data.reason.to_owned());
+        view.names.push(event.name.to_owned());
+        Ok(())
+    }
+
+    #[evento::handler]
+    async fn on_refunded_v3(event: Event<RefundedV3>, view: &mut View) -> anyhow::Result<()> {
+        view.total += event.data.amount;
+        view.reasons.push(event.data.reason.to_owned());
+        view.references.push(event.data.reference.to_owned());
+        view.names.push(event.name.to_owned());
+        Ok(())
+    }
+
+    #[evento::handler]
+    async fn on_noted_v2(event: Event<NotedV2>, view: &mut View) -> anyhow::Result<()> {
+        view.notes
+            .push(format!("{} ({})", event.data.text, event.data.author));
+        view.names.push(event.name.to_owned());
+        Ok(())
+    }
+
+    /// Only the newest generation of each event is handled.
+    pub fn latest_only<E: Executor>() -> Projection<E, View> {
+        Projection::new::<Refund>()
+            .handler(on_refunded_v3())
+            .handler(on_noted_v2())
+    }
+
+    pub fn v2_then_v3<E: Executor>() -> Projection<E, View> {
+        Projection::new::<Refund>()
+            .handler(on_refunded_v2())
+            .handler(on_refunded_v3())
+    }
+
+    pub fn v3_then_v2<E: Executor>() -> Projection<E, View> {
+        Projection::new::<Refund>()
+            .handler(on_refunded_v3())
+            .handler(on_refunded_v2())
+    }
+
+    pub fn with_v1_handler<E: Executor>() -> Projection<E, View> {
+        Projection::new::<Refund>()
+            .handler(on_refunded())
+            .handler(on_refunded_v3())
+    }
+
+    pub fn skip_refunds<E: Executor>() -> Projection<E, View> {
+        Projection::new::<Refund>()
+            .skip::<RefundedV3>()
+            .handler(on_noted_v2())
+    }
+
+    pub fn notes_only<E: Executor>() -> Projection<E, View> {
+        Projection::new::<Refund>().handler(on_noted_v2())
+    }
+
+    // aggregate id -> total, written as a projection subscription folds events.
+    pub static TOTALS: Lazy<RwLock<HashMap<String, i64>>> = Lazy::new(Default::default);
+
+    #[evento::projection]
+    #[evento::snapshot(none)]
+    pub struct Recorded {
+        pub total: i64,
+    }
+
+    #[evento::handler]
+    async fn record_refunded_v3(
+        event: Event<RefundedV3>,
+        view: &mut Recorded,
+    ) -> anyhow::Result<()> {
+        view.total += event.data.amount;
+        TOTALS
+            .write()
+            .unwrap()
+            .insert(event.aggregate_id.to_owned(), view.total);
+        Ok(())
+    }
+
+    pub fn recording<E: Executor>() -> Projection<E, Recorded> {
+        Projection::new::<Refund>().handler(record_refunded_v3())
+    }
+
+    #[derive(Clone, Debug)]
+    pub struct Seen {
+        pub name: String,
+        pub version: u16,
+        pub amount: i64,
+        pub reason: String,
+        pub trace: Option<String>,
+    }
+
+    // aggregate id -> what the subscription handler received.
+    pub static SEEN: Lazy<RwLock<HashMap<String, Vec<Seen>>>> = Lazy::new(Default::default);
+    // aggregate id -> stored names a `subscription_all` handler received.
+    pub static RAW: Lazy<RwLock<HashMap<String, Vec<String>>>> = Lazy::new(Default::default);
+
+    #[evento::subscription]
+    async fn see_refunded_v3<E: Executor>(
+        _context: &Context<'_, E>,
+        event: Event<RefundedV3>,
+    ) -> anyhow::Result<()> {
+        SEEN.write()
+            .unwrap()
+            .entry(event.aggregate_id.to_owned())
+            .or_default()
+            .push(Seen {
+                name: event.name.to_owned(),
+                version: event.version,
+                amount: event.data.amount,
+                reason: event.data.reason.to_owned(),
+                trace: event.metadata.try_get::<String>("trace").ok(),
+            });
+        Ok(())
+    }
+
+    pub fn subscription<E: Executor>(key: &str) -> SubscriptionBuilder<E> {
+        SubscriptionBuilder::new(key)
+            .handler(see_refunded_v3())
+            .skip::<NotedV2>()
+            .skip::<ClosedV2>()
+    }
+
+    #[evento::subscription_all]
+    async fn see_raw<E: Executor>(
+        _context: &Context<'_, E>,
+        event: RawEvent<Refund>,
+    ) -> anyhow::Result<()> {
+        RAW.write()
+            .unwrap()
+            .entry(event.aggregate_id.to_owned())
+            .or_default()
+            .push(event.name.to_owned());
+        Ok(())
+    }
+
+    pub fn raw_subscription<E: Executor>(key: &str) -> SubscriptionBuilder<E> {
+        SubscriptionBuilder::new(key).handler(see_raw())
+    }
+}
+
 /// Supporting projection + subscription_all handler for the feature tests above.
 mod feature {
     use std::sync::atomic::AtomicU32;

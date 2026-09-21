@@ -61,6 +61,10 @@ pub fn subscription_next_impl(input: &ItemFn) -> syn::Result<TokenStream> {
                 use ::evento::Aggregate as _;
                 #event_inner_type::aggregate_type()
             }
+
+            fn upcasters(&self) -> &'static [::evento::Upcaster] {
+                <#event_inner_type as ::evento::AggregateEvent>::upcasters()
+            }
         }
     };
 
