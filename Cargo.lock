@@ -1029,6 +1029,7 @@ dependencies = [
  "evento-remote",
  "evento-sql",
  "evento-sql-migrator",
+ "serde",
  "sqlx",
  "sqlx_migrator",
  "tokio",

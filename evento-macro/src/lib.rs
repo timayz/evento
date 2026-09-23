@@ -325,10 +325,13 @@ use syn::{parse_macro_input, DeriveInput, ItemFn};
 ///
 /// # Additional Derives
 ///
-/// Pass additional derives as arguments:
+/// Pass additional derives as arguments; they combine with `name = "..."` in
+/// any order. They apply to the event structs *and* to the `{Enum}Event` enum
+/// described above, so `serde::Serialize` is enough to serialize a whole
+/// decoded event.
 ///
 /// ```rust
-/// #[evento::aggregate(serde::Serialize, serde::Deserialize)]
+/// #[evento::aggregate(name = "myapp/MyEvents", serde::Serialize, serde::Deserialize)]
 /// pub enum MyEvents {
 ///     SomethingHappened { id: String },
 /// }

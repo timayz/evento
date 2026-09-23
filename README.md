@@ -65,6 +65,17 @@ pub enum BankAccount {
 }
 ```
 
+Additional derives are passed the same way and combine with `name =` in any
+order. They land on every generated event struct, so putting an event on the
+wire as JSON needs no hand-written DTO:
+
+```rust
+#[evento::aggregate(name = "bank/BankAccount", serde::Serialize, serde::Deserialize)]
+pub enum BankAccount {
+    AccountOpened { owner: String },
+}
+```
+
 Each variant is also collected into a sibling `{Enum}Event` enum, so a stored
 event can be matched exhaustively on the way back out — to SSE, webhooks, an
 outbox table or an audit log — instead of laddering over `event.name`:
@@ -91,7 +102,8 @@ match BankAccountEvent::try_from(&event)? {
 
 Adding a variant now breaks every match site at compile time. Events decode
 verbatim: `upcast_to` is not applied here, so an old stored event decodes to its
-own variant.
+own variant. Derives passed to the attribute land on this enum too, so
+`serde::Serialize` is enough to forward a whole decoded event.
 
 ### 2. Write events
 
