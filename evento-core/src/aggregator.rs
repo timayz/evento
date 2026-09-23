@@ -565,7 +565,7 @@ impl<E: Executor> AggregateExt<E> for E {
             // Older events that upcast into `A` count as `A`.
             let filters = std::iter::once(A::event_name())
                 .chain(A::upcasters().iter().map(|u| u.from))
-                .map(|name| EventFilter::exact(A::aggregate_type(), id.clone(), name))
+                .map(|name| EventFilter::exact_raw(A::aggregate_type(), id.clone(), name))
                 .collect::<Arc<[EventFilter]>>();
 
             let result = self
@@ -584,7 +584,7 @@ impl<E: Executor> AggregateExt<E> for E {
         Box::pin(async {
             let result = self
                 .read(
-                    Some(Arc::from([EventFilter::by_id(A::aggregate_type(), id)])),
+                    Some(Arc::from([EventFilter::by_id::<A>(id)])),
                     None,
                     Args::backward(1, None),
                     None,

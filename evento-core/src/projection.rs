@@ -645,7 +645,7 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
         if let Some((tombstone_type, tombstone_events)) = &self.tombstone {
             let filters = tombstone_events
                 .iter()
-                .map(|name| EventFilter::exact(*tombstone_type, id.to_owned(), *name))
+                .map(|name| EventFilter::exact_raw(*tombstone_type, id.to_owned(), *name))
                 .collect::<Arc<[EventFilter]>>();
             let res = executor
                 .read(Some(filters), None, Args::backward(1, None), None)

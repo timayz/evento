@@ -19,7 +19,7 @@ use evento_accord::{
     AccordExecutor, DataStore, ExecutorDataStore, HybridLogicalClock, InMemoryJournal,
     InMemoryNetwork, Journal, MessageSink, Node, NodeConfig, NodeId, StaticTopology,
 };
-use evento_core::{cursor::Args, Event, EventFilter, Executor};
+use evento_core::{Event, Executor};
 use evento_fjall::Fjall;
 use tokio::time::Instant;
 use ulid::Ulid;
@@ -66,15 +66,10 @@ fn cluster(n: u64) -> Cluster {
 /// Reads a key's value count directly from a node's local backend — bypassing the
 /// read barrier — to inspect raw replicated state.
 async fn local_len(backend: &Fjall, key: &str) -> usize {
-    backend
-        .read(
-            Some([EventFilter::by_id("lin/Reg", key)].into()),
-            None,
-            Args::forward(u16::MAX - 1, None),
-            None,
-        )
+    evento_core::read_raw("lin/Reg", key)
+        .execute(backend)
         .await
-        .map(|r| r.edges.len())
+        .map(|events| events.len())
         .unwrap_or(usize::MAX)
 }
 
@@ -82,16 +77,10 @@ async fn local_len(backend: &Fjall, key: &str) -> usize {
 /// `None` if the (linearizable) read was unavailable — a crashed node can't reach
 /// a quorum, exactly like a Jepsen `:info`; such reads are excluded from the oracle.
 async fn read_values(exec: &AccordExecutor<Fjall>, key: &str) -> Option<Vec<u64>> {
-    let r = exec
-        .read(
-            Some([EventFilter::by_id("lin/Reg", key)].into()),
-            None,
-            Args::forward(u16::MAX - 1, None),
-            None,
-        )
+    let mut events = evento_core::read_raw("lin/Reg", key)
+        .execute(exec)
         .await
         .ok()?;
-    let mut events: Vec<&Event> = r.edges.iter().map(|e| &e.node).collect();
     events.sort_by_key(|e| e.version);
     Some(
         events
@@ -102,15 +91,11 @@ async fn read_values(exec: &AccordExecutor<Fjall>, key: &str) -> Option<Vec<u64>
 }
 
 async fn read_len(exec: &AccordExecutor<Fjall>, key: &str) -> Option<usize> {
-    exec.read(
-        Some([EventFilter::by_id("lin/Reg", key)].into()),
-        None,
-        Args::forward(u16::MAX - 1, None),
-        None,
-    )
-    .await
-    .ok()
-    .map(|r| r.edges.len())
+    evento_core::read_raw("lin/Reg", key)
+        .execute(exec)
+        .await
+        .ok()
+        .map(|events| events.len())
 }
 
 fn event(key: &str, version: u16, value: u64) -> Event {

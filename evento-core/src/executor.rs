@@ -17,25 +17,39 @@ use ulid::Ulid;
 
 use crate::{
     cursor::{Args, ReadResult, Value},
-    Event, RoutingKey, WriteError,
+    Aggregate, AggregateEvent, Event, RoutingKey, WriteError,
 };
 
 /// Filter for querying events by aggregate.
 ///
-/// Use the constructor methods to create filters:
+/// Each constructor comes in two forms: a typed one that takes the aggregate (or
+/// event) as a type parameter and reads the stored type name off it, and a
+/// `*_raw` one that takes the name as a string for callers holding a type only
+/// at runtime. Prefer the typed form — it cannot drift from the aggregate.
 ///
 /// # Example
 ///
 /// ```rust
 /// # use evento::EventFilter;
+/// #[evento::aggregate(name = "myapp/User")]
+/// pub enum User {
+///     UserCreated { name: String },
+/// }
+///
 /// // All events for an aggregate type
-/// let filter = EventFilter::by_type("myapp/User");
+/// let filter = EventFilter::by_type::<User>();
 ///
 /// // Events for a specific aggregate instance
-/// let filter = EventFilter::by_id("myapp/User", "user-123");
+/// let filter = EventFilter::by_id::<User>("user-123");
 ///
 /// // Events of a specific type
-/// let filter = EventFilter::by_event("myapp/User", "UserCreated");
+/// let filter = EventFilter::by_event::<UserCreated>();
+///
+/// // ...and one specific event of one instance
+/// let filter = EventFilter::exact::<UserCreated>("user-123");
+///
+/// // When the aggregate type is only known as a string:
+/// let filter = EventFilter::by_id_raw("myapp/User", "user-123");
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EventFilter {
@@ -48,10 +62,19 @@ pub struct EventFilter {
 }
 
 impl EventFilter {
-    /// Creates a filter with all fields specified.
+    /// Creates a filter for one specific event of one aggregate instance.
+    ///
+    /// The aggregate type and event name both come from `EV`; see
+    /// [`exact_raw`](Self::exact_raw) for the string form.
+    pub fn exact<EV: AggregateEvent>(id: impl Into<String>) -> Self {
+        Self::exact_raw(EV::aggregate_type(), id, EV::event_name())
+    }
+
+    /// Creates a filter with all fields specified, from raw strings.
     ///
     /// Filters events by aggregate type, specific aggregate ID, and event name.
-    pub fn exact(
+    /// Prefer [`exact`](Self::exact) when the event type is known at compile time.
+    pub fn exact_raw(
         aggregate_type: impl Into<String>,
         id: impl Into<String>,
         name: impl Into<String>,
@@ -65,8 +88,16 @@ impl EventFilter {
 
     /// Creates a filter for all events of an aggregate type.
     ///
-    /// Returns all events regardless of aggregate ID or event name.
-    pub fn by_type(value: impl Into<String>) -> Self {
+    /// Returns all events regardless of aggregate ID or event name. See
+    /// [`by_type_raw`](Self::by_type_raw) for the string form.
+    pub fn by_type<A: Aggregate>() -> Self {
+        Self::by_type_raw(A::aggregate_type())
+    }
+
+    /// Creates a filter for all events of an aggregate type, from a raw string.
+    ///
+    /// Prefer [`by_type`](Self::by_type) when the aggregate is known at compile time.
+    pub fn by_type_raw(value: impl Into<String>) -> Self {
         Self {
             aggregate_type: value.into(),
             aggregate_id: None,
@@ -76,8 +107,16 @@ impl EventFilter {
 
     /// Creates a filter for a specific aggregate instance.
     ///
-    /// Returns all events for the given aggregate type and ID.
-    pub fn by_id(aggregate_type: impl Into<String>, id: impl Into<String>) -> Self {
+    /// Returns all events for the given ID, with the aggregate type taken from
+    /// `A`. See [`by_id_raw`](Self::by_id_raw) for the string form.
+    pub fn by_id<A: Aggregate>(id: impl Into<String>) -> Self {
+        Self::by_id_raw(A::aggregate_type(), id)
+    }
+
+    /// Creates a filter for a specific aggregate instance, from a raw type string.
+    ///
+    /// Prefer [`by_id`](Self::by_id) when the aggregate is known at compile time.
+    pub fn by_id_raw(aggregate_type: impl Into<String>, id: impl Into<String>) -> Self {
         Self {
             aggregate_type: aggregate_type.into(),
             aggregate_id: Some(id.into()),
@@ -85,10 +124,18 @@ impl EventFilter {
         }
     }
 
-    /// Creates a filter for a specific event type.
+    /// Creates a filter for one event type, across every aggregate instance.
     ///
-    /// Returns all events of the given name for an aggregate type.
-    pub fn by_event(aggregate_type: impl Into<String>, name: impl Into<String>) -> Self {
+    /// Both the aggregate type and the event name come from `EV`; see
+    /// [`by_event_raw`](Self::by_event_raw) for the string form.
+    pub fn by_event<EV: AggregateEvent>() -> Self {
+        Self::by_event_raw(EV::aggregate_type(), EV::event_name())
+    }
+
+    /// Creates a filter for a specific event type, from raw strings.
+    ///
+    /// Prefer [`by_event`](Self::by_event) when the event is known at compile time.
+    pub fn by_event_raw(aggregate_type: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
             aggregate_type: aggregate_type.into(),
             aggregate_id: None,
@@ -242,7 +289,7 @@ pub trait Executor: Send + Sync + 'static {
     ) -> anyhow::Result<u16> {
         const PAGE_SIZE: u16 = 4096;
         let filters: Arc<[EventFilter]> =
-            Arc::from([EventFilter::by_id(aggregate_type, aggregate_id)]);
+            Arc::from([EventFilter::by_id_raw(aggregate_type, aggregate_id)]);
         let mut max = 0u16;
         let mut after = None;
         loop {
@@ -284,7 +331,7 @@ pub trait Executor: Send + Sync + 'static {
     ) -> anyhow::Result<Option<Option<String>>> {
         let result = self
             .read(
-                Some(Arc::from([EventFilter::by_id(
+                Some(Arc::from([EventFilter::by_id_raw(
                     aggregate_type,
                     aggregate_id,
                 )])),

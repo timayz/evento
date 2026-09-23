@@ -15,7 +15,7 @@
 //!
 //! ```rust,no_run
 //! use evento_fjall::Fjall;
-//! use evento_core::{cursor::Args, Aggregate, EventFilter, Executor};
+//! use evento_core::Executor;
 //!
 //! // Define events using an enum
 //! #[evento::aggregate]
@@ -34,12 +34,7 @@
 //!     .await?;
 //!
 //! // Query events
-//! let events = executor.read(
-//!     Some([EventFilter::by_id(User::aggregate_type(), &id)].into()),
-//!     None,
-//!     Args::forward(10, None),
-//!     None,
-//! ).await?;
+//! let events = evento::read::<User>(&id).limit(10).execute(&executor).await?;
 //! # Ok(())
 //! # }
 //! ```
@@ -1383,7 +1378,7 @@ mod tests {
         // Read all events
         let result = executor
             .read(
-                Some([EventFilter::by_id("test/Account", "agg-1")].into()),
+                Some([EventFilter::by_id_raw("test/Account", "agg-1")].into()),
                 None,
                 Args::forward(10, None),
                 None,
@@ -1486,7 +1481,7 @@ mod tests {
 
         let plain = executor
             .read(
-                Some([EventFilter::by_id("test/Account", "a")].into()),
+                Some([EventFilter::by_id_raw("test/Account", "a")].into()),
                 None,
                 Args::forward(10, None),
                 None,
@@ -1518,7 +1513,7 @@ mod tests {
                 .unwrap();
             let read = executor
                 .read(
-                    Some([EventFilter::by_id("test/Account", "agg-mono")].into()),
+                    Some([EventFilter::by_id_raw("test/Account", "agg-mono")].into()),
                     None,
                     Args::forward(10, None),
                     None,
@@ -1536,7 +1531,7 @@ mod tests {
             .unwrap();
         let read = executor
             .read(
-                Some([EventFilter::by_id("test/Account", "agg-mono")].into()),
+                Some([EventFilter::by_id_raw("test/Account", "agg-mono")].into()),
                 None,
                 Args::forward(10, None),
                 None,
@@ -1569,7 +1564,7 @@ mod tests {
 
         let restamped = executor
             .read(
-                Some([EventFilter::by_id("test/Account", "agg-restamp")].into()),
+                Some([EventFilter::by_id_raw("test/Account", "agg-restamp")].into()),
                 None,
                 Args::forward(1, None),
                 None,
@@ -1583,7 +1578,7 @@ mod tests {
 
         let preserved = executor
             .read(
-                Some([EventFilter::by_id("test/Account", "agg-verbatim")].into()),
+                Some([EventFilter::by_id_raw("test/Account", "agg-verbatim")].into()),
                 None,
                 Args::forward(1, None),
                 None,
@@ -1820,7 +1815,7 @@ mod tests {
         // Filtered and routing reads work off the rebuilt indexes too.
         let by_id = executor
             .read(
-                Some([EventFilter::by_id("test/Account", "agg-m")].into()),
+                Some([EventFilter::by_id_raw("test/Account", "agg-m")].into()),
                 None,
                 Args::forward(10, None),
                 None,
@@ -1872,7 +1867,7 @@ mod tests {
         ] {
             let forward = executor
                 .read(
-                    Some([EventFilter::by_id("test/Account", "agg-b")].into()),
+                    Some([EventFilter::by_id_raw("test/Account", "agg-b")].into()),
                     None,
                     Args::forward(10, None),
                     bound,
@@ -1882,7 +1877,7 @@ mod tests {
             assert_eq!(forward.edges.len(), expect, "forward, bound {bound:?}");
             let backward = executor
                 .read(
-                    Some([EventFilter::by_id("test/Account", "agg-b")].into()),
+                    Some([EventFilter::by_id_raw("test/Account", "agg-b")].into()),
                     None,
                     Args::backward(10, None),
                     bound,
@@ -1989,7 +1984,7 @@ mod tests {
 
         let page = executor
             .read(
-                Some([EventFilter::by_id("test/Account", "agg-s")].into()),
+                Some([EventFilter::by_id_raw("test/Account", "agg-s")].into()),
                 Some(RoutingKey::Value(Some("hot".to_string()))),
                 Args::forward(2, None),
                 None,
@@ -2003,7 +1998,7 @@ mod tests {
 
         let rest = executor
             .read(
-                Some([EventFilter::by_id("test/Account", "agg-s")].into()),
+                Some([EventFilter::by_id_raw("test/Account", "agg-s")].into()),
                 Some(RoutingKey::Value(Some("hot".to_string()))),
                 Args::forward(2, page.page_info.end_cursor.clone()),
                 None,

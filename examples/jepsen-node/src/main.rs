@@ -45,8 +45,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use evento::cursor::Args;
-use evento::{Event, EventFilter, Executor, Fjall, WriteError};
+use evento::{Event, Executor, Fjall, WriteError};
 use evento_accord::{
     serve, AccordExecutor, DataStore, ExecutorDataStore, HybridLogicalClock, Journal, MessageSink,
     Node, NodeConfig, NodeId, StaticTopology, TcpTransport, Topology,
@@ -256,40 +255,14 @@ fn parse_op(op: &JsonValue) -> Option<(String, String, Option<i64>)> {
 /// The aggregate's current version: the max version among its events (mirrors
 /// `ExecutorDataStore::version`).
 async fn current_version(exec: &Exec, key: &str) -> anyhow::Result<u16> {
-    let result = exec
-        .read(
-            Some(std::sync::Arc::from([EventFilter::by_id(
-                AGGREGATE_TYPE,
-                key,
-            )])),
-            None,
-            Args::forward(u16::MAX - 1, None),
-            None,
-        )
-        .await?;
-    Ok(result
-        .edges
-        .iter()
-        .map(|e| e.node.version)
-        .max()
-        .unwrap_or(0))
+    let events = evento::read_raw(AGGREGATE_TYPE, key).execute(exec).await?;
+    Ok(events.iter().map(|e| e.version).max().unwrap_or(0))
 }
 
 /// All appended values for a key, ordered by version (the true append order the
 /// CAS enforces — robust regardless of the store's timestamp-based read order).
 async fn read_values(exec: &Exec, key: &str) -> anyhow::Result<Vec<i64>> {
-    let result = exec
-        .read(
-            Some(std::sync::Arc::from([EventFilter::by_id(
-                AGGREGATE_TYPE,
-                key,
-            )])),
-            None,
-            Args::forward(u16::MAX - 1, None),
-            None,
-        )
-        .await?;
-    let mut events: Vec<&Event> = result.edges.iter().map(|e| &e.node).collect();
+    let mut events = evento::read_raw(AGGREGATE_TYPE, key).execute(exec).await?;
     events.sort_by_key(|e| e.version);
     events
         .iter()

@@ -221,3 +221,39 @@ async fn fjall_upcast_has_event() -> anyhow::Result<()> {
     let (executor, _temp_dir) = create_fjall_executor("upcast_has_event")?;
     evento_test::upcast_has_event(&executor).await
 }
+
+#[tokio::test]
+async fn fjall_read_stream() -> anyhow::Result<()> {
+    let (executor, _temp_dir) = create_fjall_executor("read_stream")?;
+    evento_test::read_stream(&executor).await
+}
+
+#[tokio::test]
+async fn fjall_read_drains_pages() -> anyhow::Result<()> {
+    let (executor, _temp_dir) = create_fjall_executor("read_drains_pages")?;
+    evento_test::read_drains_pages(&executor).await
+}
+
+#[tokio::test]
+async fn fjall_read_limit() -> anyhow::Result<()> {
+    let (executor, _temp_dir) = create_fjall_executor("read_limit")?;
+    evento_test::read_limit(&executor).await
+}
+
+#[tokio::test]
+async fn fjall_read_page_cursor() -> anyhow::Result<()> {
+    let (executor, _temp_dir) = create_fjall_executor("read_page_cursor")?;
+    evento_test::read_page_cursor(&executor).await
+}
+
+#[tokio::test]
+async fn fjall_read_decode() -> anyhow::Result<()> {
+    let (executor, _temp_dir) = create_fjall_executor("read_decode")?;
+    evento_test::read_decode(&executor).await
+}
+
+#[tokio::test]
+async fn fjall_read_routing_key() -> anyhow::Result<()> {
+    let (executor, _temp_dir) = create_fjall_executor("read_routing_key")?;
+    evento_test::read_routing_key(&executor).await
+}

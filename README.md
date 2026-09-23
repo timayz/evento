@@ -388,6 +388,63 @@ fn refunds<E: Executor>() -> Projection<E, RefundsView> {
 - Snapshots hold folded state, not events: if the conversion yields different state
   than the handler you removed did, bump the projection's `.revision(n)`.
 
+### 8. Reading events directly
+
+Projections fold events into state. When you want the events themselves — to feed an
+SSE stream, a webhook, an outbox row or an audit log — read the stream directly:
+
+```rust,no_run
+# #[evento::aggregate]
+# pub enum Account {
+#     AccountOpened { owner: String },
+#     MoneyDeposited { amount: i64 },
+# }
+# async fn run<E: evento::Executor>(executor: &E, id: &str) -> anyhow::Result<()> {
+// The whole stream, oldest first. Pages are drained internally.
+let events: Vec<evento::Event> = evento::read::<Account>(id).execute(executor).await?;
+
+// Typed and exhaustively matchable — a new variant becomes a compile error.
+for event in evento::read::<Account>(id).decode(executor).await? {
+    match event {
+        AccountEvent::AccountOpened(opened) => println!("opened by {}", opened.owner),
+        AccountEvent::MoneyDeposited(d) => println!("+{}", d.amount),
+    }
+}
+
+// The last 10 events, still oldest-first, and just the deposits.
+let recent = evento::read::<Account>(id).backward().limit(10).execute(executor).await?;
+let deposits = evento::read::<Account>(id).event::<MoneyDeposited>().execute(executor).await?;
+# let _ = (events, recent, deposits);
+# Ok(())
+# }
+```
+
+`limit(n)` caps the **total** number of events, not a page size, so a plain `execute()`
+never silently truncates a stream. When you want to drive pagination yourself — a
+GraphQL connection, an infinite scroll — `page()` returns one page plus the cursors to
+continue from:
+
+```rust,no_run
+# #[evento::aggregate]
+# pub enum Account {
+#     AccountOpened { owner: String },
+# }
+# async fn run<E: evento::Executor>(executor: &E, id: &str) -> anyhow::Result<()> {
+let page = evento::read::<Account>(id).limit(50).page(executor).await?;
+if let Some(cursor) = page.page_info.end_cursor {
+    let next = evento::read::<Account>(id).limit(50).after(cursor).page(executor).await?;
+    let _ = next;
+}
+# Ok(())
+# }
+```
+
+Unlike a subscription, a reader with no `routing_key(..)` reads events under **every**
+routing key; `no_routing_key()` narrows it to events committed without one. Use
+`read_raw(type, id)` when the aggregate type is only known as a string, and drop to
+`executor.read(..)` with hand-built `EventFilter`s for queries spanning several
+aggregates.
+
 ## Wiring a backend
 
 ### Fjall (embedded, zero setup)
@@ -463,7 +520,10 @@ plus the [`bank-axum-accord`](examples/bank-axum-accord) 3-node demo.
 | Snapshot strategy | bitcode derives / `#[evento::snapshot(memory)]` / `#[evento::snapshot(none)]` |
 | Load a read model | `Projection::new::<A>().handler(..).load(id).execute(exec)` |
 | Co-keyed secondary aggregate | `.load(id).aggregate::<Other>(other_id)` |
-| Filter events when reading | `EventFilter::by_type / by_id / by_event / exact` |
+| Read an aggregate's events | `evento::read::<A>(id).execute(exec)` |
+| Read them typed | `evento::read::<A>(id).decode(exec)` |
+| Paginate a read | `.limit(n)` / `.after(cursor)` / `.page(exec)` |
+| Filter events when reading | `EventFilter::by_type::<A>() / by_id::<A>(id) / by_event::<Ev>() / exact::<Ev>(id)` |
 | Continuous processing | `SubscriptionBuilder::new(key)...start(exec)` |
 | One-shot processing | `SubscriptionBuilder::new(key)...run_once(exec)` |
 | Keep a projection updated | `projection.subscription(key).start(exec)` |
