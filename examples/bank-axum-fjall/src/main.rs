@@ -335,21 +335,23 @@ fn get_all_accounts() -> Vec<AccountView> {
 
 // Live account feed (SSE)
 //
-// One ephemeral subscription per open connection. Three opt-ins make that
-// affordable, and each is load-bearing:
+// One ephemeral subscription per open connection, started with `live()` — the
+// one-call form of `.ephemeral().start_from_latest().start(..)`. Both halves are
+// load-bearing:
 //
-// - `.ephemeral()` keeps the cursor in memory. No subscriber row, no ownership
+// - *ephemeral* keeps the cursor in memory. No subscriber row, no ownership
 //   fence, no acknowledge — the store sees only reads. Without it every browser
 //   tab would leave a row behind and, because the key is normally a cursor
 //   identity, a second tab would fence the first one out.
-// - `.start_from_latest()` begins at the head. Without it a connection opened
-//   on an account with a long history would have that history replayed into it
-//   before it saw anything live.
-// - `.aggregate::<BankAccount>(&id)` pushes the filter into the store's read,
-//   so this connection never even loads another account's events. That server-
-//   side slice is what makes a subscription *per connection* worth its cost; an
-//   unfiltered global feed should instead run one subscription fanning out into
-//   a `tokio::sync::broadcast` channel.
+// - *start from latest* begins at the head. Without it a connection opened on an
+//   account with a long history would have that history replayed into it before
+//   it saw anything live.
+//
+// `.aggregate::<BankAccount>(&id)` is this endpoint's own addition: it pushes the
+// filter into the store's read, so a connection never even loads another
+// account's events. That server-side slice is what makes a subscription *per
+// connection* worth its cost; an unfiltered global feed should instead run one
+// subscription fanning out into a `tokio::sync::broadcast` channel.
 
 /// One line of the live feed, as the browser receives it.
 #[derive(serde::Serialize)]
@@ -372,9 +374,8 @@ async fn account_events(
         .data(tx)
         .aggregate::<BankAccount>(&id)
         .any_routing_key()
-        .ephemeral()
-        .start_from_latest()
-        .start(state.executor.as_ref())
+        // `live()` is `.ephemeral().start_from_latest().start(..)` in one call.
+        .live(state.executor.as_ref())
         .await
     {
         Ok(subscription) => subscription,

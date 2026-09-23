@@ -53,6 +53,10 @@
 //! - [`Context::stop`] lets a handler end its own subscription when its send
 //!   fails, reporting [`StopReason::StoppedByHandler`] rather than a failure.
 //!
+//! [`live`](SubscriptionBuilder::live) is the first two plus
+//! [`start`](SubscriptionBuilder::start) in one call, which is how a bridge
+//! usually reads:
+//!
 //! ```rust,no_run
 //! # use evento::{Executor, metadata::Event, subscription::{Context, SubscriptionBuilder}};
 //! # #[evento::aggregate]
@@ -69,9 +73,7 @@
 //! let subscription = SubscriptionBuilder::new("sse")
 //!     .handler(fanout())
 //!     .data(tx)
-//!     .ephemeral()
-//!     .start_from_latest()
-//!     .start(executor)
+//!     .live(executor)
 //!     .await?;
 //! # subscription.shutdown().await?;
 //! # Ok(()) }
@@ -1544,6 +1546,50 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             shutdown_tx,
             stop_rx,
         })
+    }
+
+    /// Starts this subscription as a live bridge — the one-call form of
+    /// [`ephemeral`](Self::ephemeral) + [`start_from_latest`](Self::start_from_latest)
+    /// + [`start`](Self::start).
+    ///
+    /// This is the shape an SSE response, a WebSocket or a per-connection
+    /// fanout wants: begin at the stream head, keep the cursor in memory, and
+    /// write nothing to the store. The returned [`Subscription`] behaves like
+    /// any other — drop it or [`shutdown`](Subscription::shutdown) it to stop
+    /// the worker, and [`stopped`](Subscription::stopped) to learn why it did.
+    ///
+    /// ```rust,no_run
+    /// # use evento::{Executor, metadata::Event, subscription::{Context, SubscriptionBuilder}};
+    /// # #[evento::aggregate]
+    /// # pub enum Account { MoneyDeposited { amount: i64 } }
+    /// # #[evento::subscription]
+    /// # async fn fanout<E: Executor>(
+    /// #     context: &Context<'_, E>,
+    /// #     event: Event<MoneyDeposited>,
+    /// # ) -> anyhow::Result<()> { Ok(()) }
+    /// # async fn run<E: Executor + Clone>(
+    /// #     executor: &E,
+    /// #     tx: tokio::sync::mpsc::Sender<i64>,
+    /// # ) -> anyhow::Result<()> {
+    /// let subscription = SubscriptionBuilder::new("sse")
+    ///     .handler(fanout())
+    ///     .data(tx)
+    ///     .live(executor)
+    ///     .await?;
+    /// # subscription.shutdown().await?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// Reach past it for the combinations it does not cover: `ephemeral()`
+    /// alone (a throwaway in-memory index rebuilt from the whole stream on
+    /// every boot), or `start_from_latest()` alone (a durable subscription that
+    /// skips history on its *first* start and resumes normally after). Both
+    /// remain callable, and calling either before this is harmless.
+    pub async fn live(self, executor: &E) -> anyhow::Result<Subscription>
+    where
+        E: Clone,
+    {
+        self.ephemeral().start_from_latest().start(executor).await
     }
 
     /// Processes all currently pending events once, then returns.

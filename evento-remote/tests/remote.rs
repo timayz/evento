@@ -484,9 +484,9 @@ async fn remote_subscription_context_stop() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn remote_subscription_ephemeral_context_stop() -> anyhow::Result<()> {
+async fn remote_subscription_live() -> anyhow::Result<()> {
     let server = setup().await?;
-    evento_test::subscription_ephemeral_context_stop(&server.client).await
+    evento_test::subscription_live(&server.client).await
 }
 
 #[tokio::test]

@@ -335,9 +335,9 @@ async fn postgres_subscription_context_stop() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn postgres_subscription_ephemeral_context_stop() -> anyhow::Result<()> {
-    let executor = create_postgres_executor("sub_ephemeral_context_stop").await?;
-    evento_test::subscription_ephemeral_context_stop(&executor).await
+async fn postgres_subscription_live() -> anyhow::Result<()> {
+    let executor = create_postgres_executor("sub_live").await?;
+    evento_test::subscription_live(&executor).await
 }
 
 #[tokio::test]

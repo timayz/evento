@@ -289,9 +289,9 @@ async fn fjall_subscription_context_stop() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn fjall_subscription_ephemeral_context_stop() -> anyhow::Result<()> {
+async fn fjall_subscription_live() -> anyhow::Result<()> {
     let executor = Fjall::temporary()?;
-    evento_test::subscription_ephemeral_context_stop(&executor).await
+    evento_test::subscription_live(&executor).await
 }
 
 #[tokio::test]

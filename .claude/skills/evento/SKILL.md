@@ -273,10 +273,12 @@ sub.shutdown().await?;
 
 - `.start(exec)` runs a background loop; `.run_once(exec)` drains pending events once and returns.
 - `.strict()` fails on an unhandled event; `.continue_on_error()` keeps going after a handler error.
-- **Live bridge (SSE, WebSocket, fanout):** `.ephemeral()` keeps the cursor in memory — no
+- **Live bridge (SSE, WebSocket, fanout):** `.live(exec)` is the whole shape in one call —
+  `.ephemeral().start_from_latest().start(exec)`. `.ephemeral()` keeps the cursor in memory — no
   subscriber row, no fence, no acknowledge, reads only — and `.start_from_latest()` begins at
   the stream head instead of replaying history (it applies only when there is no cursor yet, so
-  a durable subscription still resumes on restart). A handler ends its own subscription with
+  a durable subscription still resumes on restart); use them separately for the combinations
+  `.live()` does not cover. A handler ends its own subscription with
   `ctx.stop()`, reporting `StopReason::StoppedByHandler` — a normal end, not a failure.
   Neither `.ephemeral()` nor `.start_from_latest()` is offered on `ProjectionSubscription`.
   One subscription per connection is worth it only when each wants a different slice

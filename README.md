@@ -413,9 +413,8 @@ async fn fanout<E: Executor>(
 let subscription = SubscriptionBuilder::new("sse")
     .handler(fanout())
     .data(tx)
-    .ephemeral()          // no subscriber row, no persisted cursor — reads only
-    .start_from_latest()  // begin at the head instead of replaying history
-    .start(executor)
+    // `.ephemeral().start_from_latest().start(executor)` in one call
+    .live(executor)
     .await?;
 # subscription.shutdown().await?;
 # Ok(())
@@ -427,6 +426,11 @@ of connections can share one, which is the whole point when there is a subscript
 connection. `.start_from_latest()` applies only when there is no cursor yet, so a *durable*
 subscription still resumes on restart rather than jumping forward. `ctx.stop()` ends the
 worker with `StopReason::StoppedByHandler` — a normal end, not a failure.
+
+Reach past `.live()` for the combinations it does not cover: `.ephemeral()` on its own is a
+throwaway in-memory index rebuilt from the whole stream on every boot, and
+`.start_from_latest()` on its own is a durable subscription that skips history on its
+*first* start and resumes normally after.
 
 Each subscription is its own poller. One per connection earns its cost when each wants a
 different slice (`.aggregate::<A>(id)`, `.routing_key(tenant)`); for an unfiltered global
@@ -641,7 +645,7 @@ plus the [`bank-axum-accord`](examples/bank-axum-accord) 3-node demo.
 | Fail on unhandled events | `.strict()` |
 | Keep going after a handler error | `.continue_on_error()` |
 | Notice a stopped subscription | `subscription.stopped().await` → `StopReason` |
-| Live bridge (SSE/WebSocket) | `.ephemeral().start_from_latest()` |
+| Live bridge (SSE/WebSocket) | `.live(exec)` = `.ephemeral().start_from_latest().start(exec)` |
 | Skip history on a new subscription | `.start_from_latest()` |
 | Stop a subscription from inside a handler | `ctx.stop()` |
 

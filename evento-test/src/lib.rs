@@ -4363,46 +4363,80 @@ pub async fn subscription_context_stop<E: Executor + Clone>(executor: &E) -> any
     Ok(())
 }
 
-/// Scenario: the full SSE shape — ephemeral, started at the head, ended by its
-/// own handler — leaves no trace in the store.
-pub async fn subscription_ephemeral_context_stop<E: Executor + Clone>(
-    executor: &E,
-) -> anyhow::Result<()> {
+/// Scenario: `live()` is exactly `ephemeral()` + `start_from_latest()` +
+/// `start()`, and the whole SSE shape works through it.
+///
+/// One scenario for all three properties, because a shortcut's failure mode is
+/// quietly dropping one of them: history behind it is not delivered
+/// (`start_from_latest`), no cursor reaches the store (`ephemeral`), and the
+/// handler ends its own worker (`Context::stop`).
+pub async fn subscription_live<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
     use std::time::Duration;
 
     use evento::subscription::StopReason;
 
-    let key = format!("ephemeral-stop-{}", Ulid::generate());
+    let key = format!("live-{}", Ulid::generate());
     let cmd = bank::Command(executor.clone());
+
+    let history_id = cmd
+        .open_account(OpenAccount {
+            owner_id: "owner_live_history".to_owned(),
+            owner_name: "History".to_owned(),
+            account_type: AccountType::Checking,
+            currency: "USD".to_owned(),
+            initial_balance: 100,
+        })
+        .await?;
+
+    // Below the watermark, so the head probe can see it: otherwise a `live()`
+    // that forgot `start_from_latest` would pass here by accident.
+    wait_for_stable_watermark(executor).await?;
 
     let seen = live_bridge::Seen::new();
     let sub = live_bridge::stopping_subscription(&key)
         .data(seen.clone())
         .data(live_bridge::StopAfter(1))
-        .ephemeral()
-        .start_from_latest()
         .no_retry()
-        .start(executor)
+        .live(executor)
         .await?;
 
-    cmd.open_account(OpenAccount {
-        owner_id: "owner_eph_stop".to_owned(),
-        owner_name: "Disconnect".to_owned(),
-        account_type: AccountType::Checking,
-        currency: "USD".to_owned(),
-        initial_balance: 100,
-    })
-    .await?;
+    // `live()` seeds before it spawns the worker, so this needs no polling.
+    assert!(
+        executor.get_subscriber_cursor(key.clone()).await?.is_none(),
+        "live() must imply ephemeral: seeding at the head may not write a cursor"
+    );
+
+    let live_id = cmd
+        .open_account(OpenAccount {
+            owner_id: "owner_live_now".to_owned(),
+            owner_name: "Now".to_owned(),
+            account_type: AccountType::Savings,
+            currency: "EUR".to_owned(),
+            initial_balance: 200,
+        })
+        .await?;
 
     let reason = tokio::time::timeout(Duration::from_secs(15), sub.stopped()).await?;
     assert!(
         matches!(reason, StopReason::StoppedByHandler),
         "got {reason:?}"
     );
-    assert_eq!(seen.snapshot().len(), 1);
+    assert!(!reason.is_failure(), "{reason}");
+
+    // The handler stops after one event, so had history been replayed this
+    // would be the *old* account and the assertion would name it.
+    assert_eq!(
+        seen.snapshot(),
+        vec![live_id],
+        "live() must imply start_from_latest: history must not be delivered"
+    );
+    assert!(
+        !seen.snapshot().contains(&history_id),
+        "the pre-start account must never be delivered"
+    );
     assert!(
         executor.get_subscriber_cursor(key).await?.is_none(),
-        "a stopped ephemeral bridge leaves nothing behind"
+        "a stopped live bridge leaves nothing behind"
     );
 
     Ok(())
