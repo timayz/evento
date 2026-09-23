@@ -452,3 +452,45 @@ async fn pooled_reconnect_recovers_all_connections() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn remote_subscription_start_from_latest() -> anyhow::Result<()> {
+    let server = setup().await?;
+    evento_test::subscription_start_from_latest(&server.client).await
+}
+
+#[tokio::test]
+async fn remote_subscription_ephemeral() -> anyhow::Result<()> {
+    let server = setup().await?;
+    evento_test::subscription_ephemeral(&server.client).await
+}
+
+#[tokio::test]
+async fn remote_subscription_ephemeral_start_from_latest() -> anyhow::Result<()> {
+    let server = setup().await?;
+    evento_test::subscription_ephemeral_start_from_latest(&server.client).await
+}
+
+#[tokio::test]
+async fn remote_subscription_ephemeral_concurrent_same_key() -> anyhow::Result<()> {
+    let server = setup().await?;
+    evento_test::subscription_ephemeral_concurrent_same_key(&server.client).await
+}
+
+#[tokio::test]
+async fn remote_subscription_context_stop() -> anyhow::Result<()> {
+    let server = setup().await?;
+    evento_test::subscription_context_stop(&server.client).await
+}
+
+#[tokio::test]
+async fn remote_subscription_live() -> anyhow::Result<()> {
+    let server = setup().await?;
+    evento_test::subscription_live(&server.client).await
+}
+
+#[tokio::test]
+async fn remote_subscription_ephemeral_run_once() -> anyhow::Result<()> {
+    let server = setup().await?;
+    evento_test::subscription_ephemeral_run_once(&server.client).await
+}

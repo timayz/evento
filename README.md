@@ -374,14 +374,68 @@ By default a subscription **stops on the first handler error** —
 `.continue_on_error()` is opt-in — and a stopped worker never processes another event.
 The handle is how you find out: `stopped()` resolves with a
 [`StopReason`](https://docs.rs/evento/latest/evento/subscription/enum.StopReason.html)
-(`Failed`, `LostOwnership`, `Shutdown`, `Panicked`), `stop_reason()` is the
-non-blocking peek, and `stop()` signals a worker held behind an `Arc`. Combined with the
-subscriber above, a broken handler is visible in minute one instead of hour two.
+(`Failed`, `LostOwnership`, `Shutdown`, `StoppedByHandler`, `Panicked`), `stop_reason()`
+is the non-blocking peek, and `stop()` signals a worker held behind an `Arc`. Combined with
+the subscriber above, a broken handler is visible in minute one instead of hour two.
 
 `.data(v)` stores `v` under its own type; a handler reads it back with
 `ctx.extract::<T>()`, or `ctx.try_extract::<T>()?` to get an error instead of a panic
 when it was never registered. Extraction clones, so the type should be `Clone` and cheap
 to clone — wrap anything else in `evento::context::Data` and extract it as `Data<T>`.
+
+#### Live bridges (SSE, WebSocket, fanout)
+
+Forwarding events to a connection inverts every default above. History is noise to a client
+that just connected, the cursor is not worth a database write, and the handler — not a
+supervisor — is often the first thing to learn the consumer is gone. Three opt-ins cover it:
+
+```rust,no_run
+# use evento::{Executor, metadata::Event, subscription::{Context, SubscriptionBuilder}};
+# #[evento::aggregate]
+# pub enum BankAccount { MoneyDeposited { amount: i64 } }
+#[evento::subscription]
+async fn fanout<E: Executor>(
+    ctx: &Context<'_, E>,
+    event: Event<MoneyDeposited>,
+) -> anyhow::Result<()> {
+    let tx: tokio::sync::broadcast::Sender<i64> = ctx.extract();
+    // No receivers left: every client disconnected, so there is nothing to bridge to.
+    if tx.send(event.data.amount).is_err() {
+        ctx.stop();
+    }
+    Ok(())
+}
+
+# async fn run<E: Executor + Clone>(
+#     executor: &E,
+#     tx: tokio::sync::broadcast::Sender<i64>,
+# ) -> anyhow::Result<()> {
+let subscription = SubscriptionBuilder::new("sse")
+    .handler(fanout())
+    .data(tx)
+    // `.ephemeral().start_from_latest().start(executor)` in one call
+    .live(executor)
+    .await?;
+# subscription.shutdown().await?;
+# Ok(())
+# }
+```
+
+`.ephemeral()` keeps the cursor in memory, so the key stops being an identity: any number
+of connections can share one, which is the whole point when there is a subscription per
+connection. `.start_from_latest()` applies only when there is no cursor yet, so a *durable*
+subscription still resumes on restart rather than jumping forward. `ctx.stop()` ends the
+worker with `StopReason::StoppedByHandler` — a normal end, not a failure.
+
+Reach past `.live()` for the combinations it does not cover: `.ephemeral()` on its own is a
+throwaway in-memory index rebuilt from the whole stream on every boot, and
+`.start_from_latest()` on its own is a durable subscription that skips history on its
+*first* start and resumes normally after.
+
+Each subscription is its own poller. One per connection earns its cost when each wants a
+different slice (`.aggregate::<A>(id)`, `.routing_key(tenant)`); for an unfiltered global
+feed run **one** of them fanning out over a broadcast channel, as above.
+`examples/bank-axum-fjall` serves a per-account SSE feed this way.
 
 To drain currently-pending events once instead of running a background loop, use
 `run_once(&executor)` (optionally after `no_retry()`). To keep a projection
@@ -591,6 +645,9 @@ plus the [`bank-axum-accord`](examples/bank-axum-accord) 3-node demo.
 | Fail on unhandled events | `.strict()` |
 | Keep going after a handler error | `.continue_on_error()` |
 | Notice a stopped subscription | `subscription.stopped().await` → `StopReason` |
+| Live bridge (SSE/WebSocket) | `.live(exec)` = `.ephemeral().start_from_latest().start(exec)` |
+| Skip history on a new subscription | `.start_from_latest()` |
+| Stop a subscription from inside a handler | `ctx.stop()` |
 
 Full macro reference: [evento-macro/README.md](evento-macro/README.md).
 
@@ -624,7 +681,7 @@ Complete working examples in [`examples/`](examples):
 - [`quickstart`](examples/quickstart) - Smallest end-to-end run (Fjall): `cargo run -p quickstart`
 - [`bank`](examples/bank) - Bank domain: aggregates, ten commands, projections, snapshots
 - [`bank-axum-sqlite`](examples/bank-axum-sqlite) - Axum + SQLite + migrations: `cargo run -p bank-axum-sqlite`
-- [`bank-axum-fjall`](examples/bank-axum-fjall) - Axum + embedded Fjall: `cargo run -p bank-axum-fjall`
+- [`bank-axum-fjall`](examples/bank-axum-fjall) - Axum + embedded Fjall, plus a live SSE feed per account: `cargo run -p bank-axum-fjall`
 - [`bank-axum-remote`](examples/bank-axum-remote) - Two-process client/server split: `cargo run -p bank-axum-remote -- store` then `cargo run -p bank-axum-remote`
 - [`bank-axum-accord`](examples/bank-axum-accord) - 1- or 3-node Accord cluster: `make accord` or `make accord.cluster`
 

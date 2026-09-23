@@ -56,7 +56,30 @@
     </form>
 </div>
 
+<div class="card">
+    <h2>Live Feed</h2>
+    <p style="color: #6b7280; font-size: 0.9rem;">
+        Server-sent events from an ephemeral subscription scoped to this account.
+        It starts at the stream head, so nothing above appears here until it
+        happens. Open this page in two tabs: both feeds receive every update.
+    </p>
+    <ul id="feed" style="margin-top: 0.75rem; padding-left: 1rem;"></ul>
+</div>
+
 <p style="margin-top: 1rem;">
     <a href="/accounts" class="btn" style="background: #6b7280;">Back to Accounts</a>
 </p>
+
+<script>
+    const feed = document.getElementById("feed");
+    const source = new EventSource("/accounts/{{ account.id }}/events");
+    source.addEventListener("account", (message) => {
+        const update = JSON.parse(message.data);
+        const item = document.createElement("li");
+        const sign = update.balance_change > 0 ? "+" : "";
+        const change = update.balance_change === 0 ? "" : ` (${sign}${update.balance_change})`;
+        item.textContent = `${update.kind}: ${update.detail}${change}`;
+        feed.prepend(item);
+    });
+</script>
 {% endblock %}

@@ -6,11 +6,18 @@
 //! the in-memory read model (`AccountDetailsView::snapshot_rows()`) current so
 //! `/accounts` lists every account.
 //!
+//! `GET /accounts/{id}/events` is the other half: a **live bridge**. It serves
+//! server-sent events from an `.ephemeral().start_from_latest()` subscription
+//! started per connection and scoped to that one account, ended by
+//! `context.stop()` when the browser disconnects. See `account_events` at the
+//! bottom of this file.
+//!
 //! ```text
 //! cargo run -p bank-axum-fjall
 //! # then open http://127.0.0.1:3000
 //! ```
 
+use std::convert::Infallible;
 use std::future::IntoFuture;
 use std::sync::Arc;
 
@@ -18,16 +25,22 @@ use askama::Template;
 use axum::{
     extract::State,
     http::StatusCode,
-    response::{Html, IntoResponse, Redirect, Response},
+    response::{
+        sse::{Event as SseEvent, KeepAlive, Sse},
+        Html, IntoResponse, Redirect, Response,
+    },
     routing::{get, post},
     Form, Router,
 };
+use bank::aggregator::BankAccount;
 use bank::{
     account_details, AccountDetailsView, AccountType, Command, DepositMoney, OpenAccount,
     ReceiveMoney, TransferMoney, WithdrawMoney,
 };
+use evento::subscription::{Context, SubscriptionBuilder};
 use evento::Fjall;
 use serde::Deserialize;
+use tokio::sync::mpsc::error::TrySendError;
 use ulid::Ulid;
 
 type Executor = Fjall;
@@ -74,6 +87,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/accounts", get(list_accounts))
         .route("/accounts/new", get(new_account_form).post(create_account))
         .route("/accounts/{id}", get(view_account))
+        .route("/accounts/{id}/events", get(account_events))
         .route("/accounts/{id}/deposit", post(deposit))
         .route("/accounts/{id}/withdraw", post(withdraw))
         .route("/accounts/{id}/transfer", post(transfer))
@@ -317,4 +331,165 @@ fn get_all_accounts() -> Vec<AccountView> {
     // creation-time order that is identical across runs and nodes.
     accounts.sort_by(|a, b| a.id.cmp(&b.id));
     accounts
+}
+
+// Live account feed (SSE)
+//
+// One ephemeral subscription per open connection, started with `live()` — the
+// one-call form of `.ephemeral().start_from_latest().start(..)`. Both halves are
+// load-bearing:
+//
+// - *ephemeral* keeps the cursor in memory. No subscriber row, no ownership
+//   fence, no acknowledge — the store sees only reads. Without it every browser
+//   tab would leave a row behind and, because the key is normally a cursor
+//   identity, a second tab would fence the first one out.
+// - *start from latest* begins at the head. Without it a connection opened on an
+//   account with a long history would have that history replayed into it before
+//   it saw anything live.
+//
+// `.aggregate::<BankAccount>(&id)` is this endpoint's own addition: it pushes the
+// filter into the store's read, so a connection never even loads another
+// account's events. That server-side slice is what makes a subscription *per
+// connection* worth its cost; an unfiltered global feed should instead run one
+// subscription fanning out into a `tokio::sync::broadcast` channel.
+
+/// One line of the live feed, as the browser receives it.
+#[derive(serde::Serialize)]
+struct AccountUpdate {
+    kind: &'static str,
+    detail: String,
+    balance_change: i64,
+}
+
+async fn account_events(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    // Bounded, so one stalled client cannot make the worker buffer without
+    // limit. The handler below uses `try_send` for the same reason.
+    let (tx, rx) = tokio::sync::mpsc::channel::<AccountUpdate>(32);
+
+    let subscription = match SubscriptionBuilder::new("sse-account-feed")
+        .handler(forward_to_sse())
+        .data(tx)
+        .aggregate::<BankAccount>(&id)
+        .any_routing_key()
+        // `live()` is `.ephemeral().start_from_latest().start(..)` in one call.
+        .live(state.executor.as_ref())
+        .await
+    {
+        Ok(subscription) => subscription,
+        Err(err) => {
+            tracing::error!(%err, "could not start the live feed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "live feed unavailable").into_response();
+        }
+    };
+
+    // `unfold` owns `(rx, subscription)` for the life of the response body, so
+    // when the client disconnects axum drops the body, which drops the handle,
+    // which stops the worker. For a channel-backed bridge that is the prompt
+    // signal and it is all you need: the receiver dies the instant the
+    // connection does, whereas a handler can only notice on the *next* event.
+    //
+    // `context.stop()` in the handler below is still worth having, and is the
+    // primary mechanism in the shape this example does not use: one shared
+    // subscription fanning out to every client over a `broadcast` channel,
+    // where "no receivers left" is a fact only the sending handler can observe.
+    let stream = futures_util::stream::unfold((rx, subscription), |(mut rx, sub)| async move {
+        let update = rx.recv().await?;
+        let event = SseEvent::default()
+            .event("account")
+            .json_data(update)
+            .expect("AccountUpdate serializes");
+        Some((Ok::<_, Infallible>(event), (rx, sub)))
+    });
+
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+/// Forwards every event of the watched account to its SSE connection.
+///
+/// `#[evento::subscription_all]` plus `decode()` gives an exhaustive match, so
+/// adding a `BankAccount` variant is a compile error here rather than an update
+/// that silently never reaches the browser.
+#[evento::subscription_all]
+async fn forward_to_sse<E: evento::Executor>(
+    context: &Context<'_, E>,
+    event: evento::metadata::RawEvent<BankAccount>,
+) -> anyhow::Result<()> {
+    use bank::aggregator::BankAccountEvent as Ev;
+
+    let update = match event.decode()? {
+        Ev::AccountOpened(e) => AccountUpdate {
+            kind: "opened",
+            detail: format!("{} opened a {:?} account", e.owner_name, e.account_type),
+            balance_change: e.initial_balance,
+        },
+        Ev::MoneyDeposited(e) => AccountUpdate {
+            kind: "deposit",
+            detail: e.description,
+            balance_change: e.amount,
+        },
+        Ev::MoneyWithdrawn(e) => AccountUpdate {
+            kind: "withdrawal",
+            detail: e.description,
+            balance_change: -e.amount,
+        },
+        Ev::MoneyTransferred(e) => AccountUpdate {
+            kind: "transfer-out",
+            detail: format!("to {}", e.to_account_id),
+            balance_change: -e.amount,
+        },
+        Ev::MoneyReceived(e) => AccountUpdate {
+            kind: "transfer-in",
+            detail: format!("from {}", e.from_account_id),
+            balance_change: e.amount,
+        },
+        Ev::AccountFrozen(e) => AccountUpdate {
+            kind: "frozen",
+            detail: e.reason,
+            balance_change: 0,
+        },
+        Ev::AccountUnfrozen(e) => AccountUpdate {
+            kind: "unfrozen",
+            detail: e.reason,
+            balance_change: 0,
+        },
+        Ev::DailyWithdrawalLimitChanged(e) => AccountUpdate {
+            kind: "limit",
+            detail: format!("daily withdrawal limit is now {}", e.new_limit),
+            balance_change: 0,
+        },
+        Ev::OverdraftLimitChanged(e) => AccountUpdate {
+            kind: "limit",
+            detail: format!("overdraft limit is now {}", e.new_limit),
+            balance_change: 0,
+        },
+        Ev::AccountClosed(e) => AccountUpdate {
+            kind: "closed",
+            detail: e.reason,
+            balance_change: 0,
+        },
+    };
+
+    // `try_send`, never `send().await`: awaiting a full channel would block the
+    // subscription worker mid-chunk on one slow browser.
+    match context
+        .try_extract::<tokio::sync::mpsc::Sender<AccountUpdate>>()?
+        .try_send(update)
+    {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => {
+            tracing::warn!("SSE client is behind, dropping an update");
+        }
+        // The receiver is gone: the response body was dropped, so this client
+        // disconnected. Stop now rather than keep reading the store — and keep
+        // reporting it as a *normal* end (`StopReason::StoppedByHandler`),
+        // which returning an error here would not.
+        Err(TrySendError::Closed(_)) => context.stop(),
+    }
+
+    Ok(())
 }
