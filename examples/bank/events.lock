@@ -1,0 +1,20 @@
+# Shapes persisted by evento. Generated: `EVENTO_LOCK=update cargo test`.
+# `event` and `type` lines are frozen — add a new variant instead of editing
+# one. A `view` line may change when its projection's `.revision(n)` grows.
+
+event bank/BankAccount::AccountClosed { reason: String, final_balance: i64 }
+event bank/BankAccount::AccountFrozen { reason: String }
+event bank/BankAccount::AccountOpened { owner_id: String, owner_name: String, account_type: AccountType, currency: String, initial_balance: i64 }
+event bank/BankAccount::AccountUnfrozen { reason: String }
+event bank/BankAccount::DailyWithdrawalLimitChanged { new_limit: i64 }
+event bank/BankAccount::MoneyDeposited { amount: i64, transaction_id: String, description: String }
+event bank/BankAccount::MoneyReceived { amount: i64, from_account_id: String, transaction_id: String, description: String }
+event bank/BankAccount::MoneyTransferred { amount: i64, to_account_id: String, transaction_id: String, description: String }
+event bank/BankAccount::MoneyWithdrawn { amount: i64, transaction_id: String, description: String }
+event bank/BankAccount::OverdraftLimitChanged { new_limit: i64 }
+event bank/Owner::Created { name: String }
+event bank/Owner::NameChanged { value: String }
+
+type bank::value_object::AccountType enum { Checking, Savings, Business }
+
+view bank::query::account_balance::AccountBalanceView rev=0 { balance: i64, currency: String, available_balance: i64, cursor: String, aggregate_version: u16 }

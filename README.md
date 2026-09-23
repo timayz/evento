@@ -499,6 +499,38 @@ fn refunds<E: Executor>() -> Projection<E, RefundsView> {
 - Snapshots hold folded state, not events: if the conversion yields different state
   than the handler you removed did, bump the projection's `.revision(n)`.
 
+#### Locking persisted shapes
+
+Nothing in the compiler stops someone from editing a variant, or `Money`, or a
+snapshotted view. [`evento-lock`](evento-lock) does: it scans the workspace with
+`syn`, writes every persisted shape to `events.lock`, and fails a test when a line
+that is already there changes.
+
+```text
+event bank/BankAccount::MoneyDeposited { amount: i64, transaction_id: String, description: String }
+type bank::value_object::AccountType enum { Checking, Savings, Business }
+view bank::query::account_balance::AccountBalanceView rev=0 { balance: i64, …, cursor: String, aggregate_version: u16 }
+```
+
+- `event` lines (keyed by the stored name) and `type` lines (every `Encode` type an
+  event reaches, enums included: appending a variant changes the packed discriminant)
+  are **frozen**. A new variant, companion event or upcast target is a new line.
+- `view` lines (projections snapshotted through the executor) **may change** when their
+  projection's `.revision(n)` grows in the same commit.
+- Write-side `#[evento::snapshot(none | memory)]` state and SQL read models are not
+  persisted as bitcode, so they are not in the lock: they change freely.
+
+```rust,ignore
+// tests/events_lock.rs, with evento-lock as a dev-dependency
+#[test]
+fn persisted_shapes_only_grow() {
+    evento_lock::check(env!("CARGO_MANIFEST_DIR")).unwrap();
+}
+```
+
+Run `EVENTO_LOCK=update cargo test` after adding events (it refuses breaking changes),
+and `EVENTO_LOCK=force` only for shapes no deployed database has ever stored.
+
 ### 8. Reading events directly
 
 Projections fold events into state. When you want the events themselves — to feed an
@@ -673,6 +705,7 @@ Full macro reference: [evento-macro/README.md](evento-macro/README.md).
 | [evento-fjall](evento-fjall) | Embedded LSM-tree executor |
 | [evento-remote](evento-remote) | Client/server executor over framed TCP |
 | [evento-accord](evento-accord) | Accord consensus replicated executor (alpha) |
+| [evento-lock](evento-lock) | `events.lock`: test that persisted shapes only grow |
 
 ## Examples
 

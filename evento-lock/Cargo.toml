@@ -1,0 +1,21 @@
+[package]
+name = "evento-lock"
+version = "2.0.0-alpha.28"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = true
+description = "Keeps the shapes an evento application persists (events, their value types, snapshotted views) append-only."
+documentation = "https://docs.rs/evento-lock"
+readme = "README.md"
+keywords = ["event-sourcing", "cqrs", "schema", "bitcode", "lockfile"]
+categories = ["development-tools::testing", "database"]
+
+[dependencies]
+anyhow.workspace = true
+quote.workspace = true
+serde_json.workspace = true
+syn = { workspace = true, features = ["visit"] }
+
+[lints]
+workspace = true

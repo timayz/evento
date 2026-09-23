@@ -11,7 +11,7 @@ reset: down up
 
 check: test fmt lint machete check.examples
 
-test: test.sql test.core test.fjall test.accord test.remote test.migrator test.macro test.doc
+test: test.sql test.core test.fjall test.accord test.remote test.migrator test.macro test.lock test.doc
 
 test.sql:
 	cargo test --all-features -p evento-sql
@@ -40,6 +40,10 @@ test.migrator:
 # The proc macros: unit tests plus the trybuild UI suite (tests/ui/{pass,fail}).
 test.macro:
 	cargo test -p evento-macro
+
+# The events.lock checker: unit tests plus a dogfood run over examples/bank.
+test.lock:
+	cargo test -p evento-lock
 
 # Every doctest in the workspace, including the root README (compile-checked via
 # the cfg(doctest) include in evento/src/lib.rs). Feature-gated examples need
