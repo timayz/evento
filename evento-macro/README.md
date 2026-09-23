@@ -58,6 +58,7 @@ This generates:
 - `Aggregate` trait implementation (provides `aggregate_type()`)
 - `AggregateEvent` trait implementation (provides `event_name()`)
 - A unit struct named after the enum, for use as the aggregate marker
+- A `{Enum}Event` enum newtyping those structs, with `TryFrom<&evento::Event>`
 - Automatic derives: `Debug`, `Clone`, `PartialEq`, `Default`, and bitcode serialization
 
 The aggregate type defaults to `"{package_name}/{enum_name}"`, e.g. `"bank/BankAccount"`.
@@ -104,9 +105,48 @@ event; `#[evento::handler]`, `#[evento::subscription]` and `.skip::<E>()` pick
 it up, so nothing is declared per projection. Keep the old variant in the enum —
 it is the schema old events are decoded with.
 
+#### Decoding a stored event back to the enum
+
+The enum name is taken by the marker struct, so the events are also collected
+into a sibling `{Enum}Event` that newtypes them. Anything forwarding events out
+of the store — SSE, webhooks, outbox tables, audit logs — can then match
+exhaustively instead of laddering over `event.name` with a `_` arm that silently
+swallows variants added later:
+
+```rust
+match BankAccountEvent::try_from(&event)? {
+    BankAccountEvent::AccountOpened(AccountOpened { owner_id, .. }) => { /* ... */ }
+    BankAccountEvent::MoneyDeposited(deposit) => credit(deposit),
+}
+```
+
+`event_name()` on the enum returns the stored name of the event it holds. The
+conversion fails with `evento::FromEventError` when the event belongs to another
+aggregate, names no known variant, or does not decode.
+
+Decoding is verbatim — `#[evento(upcast_to = ...)]` is **not** applied, so an old
+stored event decodes to its own variant. That matches what
+`#[evento::subscription_all]` sees, and a `RawEvent<A>` decodes the same way:
+
+```rust
+#[evento::subscription_all]
+async fn audit<E: Executor>(
+    _ctx: &Context<'_, E>,
+    event: RawEvent<BankAccount>,
+) -> anyhow::Result<()> {
+    match event.decode()? {
+        BankAccountEvent::AccountOpened(_) => { /* ... */ }
+        _ => {}
+    }
+    Ok(())
+}
+```
+
 #### Additional Derives
 
-Pass additional derives as arguments (they combine with `name = "..."` in any order):
+Pass additional derives as arguments (they combine with `name = "..."` in any
+order). They apply to the event structs *and* to the `{Enum}Event` enum, so
+`serde::Serialize` is enough to serialize a whole decoded event:
 
 ```rust
 #[evento::aggregate(serde::Serialize, serde::Deserialize)]

@@ -231,3 +231,14 @@ impl<D> Deref for RawEvent<'_, D> {
         self.0
     }
 }
+
+impl<D: crate::AggregateEvents> RawEvent<'_, D> {
+    /// Decodes the stored event into this aggregate's events enum.
+    ///
+    /// Events are decoded exactly as stored: `#[evento(upcast_to = ...)]` is
+    /// **not** applied, which matches what a `#[evento::subscription_all]`
+    /// handler observes.
+    pub fn decode(&self) -> Result<D::Events, crate::FromEventError> {
+        D::Events::try_from(self.0)
+    }
+}

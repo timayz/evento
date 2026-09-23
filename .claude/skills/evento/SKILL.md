@@ -63,8 +63,25 @@ pub enum Account {
     MoneyDeposited { amount: i64 },
     MoneyWithdrawn { amount: i64 },
 }
-// Generated: structs `AccountOpened`, `MoneyDeposited`, `MoneyWithdrawn`, and a
-// unit struct `Account`. Pass extra derives: `#[evento::aggregate(serde::Serialize)]`.
+// Generated: structs `AccountOpened`, `MoneyDeposited`, `MoneyWithdrawn`, a
+// unit struct `Account`, and an enum `AccountEvent` newtyping those structs.
+// Pass extra derives: `#[evento::aggregate(serde::Serialize)]` (they also apply
+// to `AccountEvent`).
+```
+
+**Going back out.** `AccountEvent::try_from(&event)?` turns a stored
+`evento::Event` into an exhaustively matchable value — use it for SSE, webhooks,
+outbox rows and audit logs instead of matching on `event.name`, so a new variant
+is a compile error rather than a silent `_` fallthrough. `.event_name()` gives
+the stored name back; errors are `evento::FromEventError`. Decoding is verbatim,
+so an `upcast_to` predecessor decodes to its *own* variant.
+
+```rust
+match AccountEvent::try_from(&event)? {
+    AccountEvent::AccountOpened(AccountOpened { owner, .. }) => sse.send(owner),
+    AccountEvent::MoneyDeposited(d) => sse.send(d.amount),
+    AccountEvent::MoneyWithdrawn(_) => {}
+}
 ```
 
 Pin on-disk identities so refactors never orphan stored events:
@@ -250,7 +267,8 @@ sub.shutdown().await?;
 - `.start(exec)` runs a background loop; `.run_once(exec)` drains pending events once and returns.
 - `.strict()` fails on an unhandled event; `.continue_on_error()` keeps going after a handler error.
 - Process **all** raw events of an aggregate (no payload deserialization) with
-  `#[evento::subscription_all]` + `event: evento::metadata::RawEvent<Account>`.
+  `#[evento::subscription_all]` + `event: evento::metadata::RawEvent<Account>`;
+  call `event.decode()?` for the typed `AccountEvent` when you want it.
 - Keep a projection auto-updated: `Projection::new::<A>().handler(..).subscription("key").start(&exec)`.
 
 ## 5. Reading events directly

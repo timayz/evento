@@ -65,6 +65,34 @@ pub enum BankAccount {
 }
 ```
 
+Each variant is also collected into a sibling `{Enum}Event` enum, so a stored
+event can be matched exhaustively on the way back out — to SSE, webhooks, an
+outbox table or an audit log — instead of laddering over `event.name`:
+
+```rust
+# use evento::Aggregate;
+# #[evento::aggregate(name = "bank/BankAccount")]
+# pub enum BankAccount {
+#     AccountOpened { owner: String, initial_balance: i64 },
+#     MoneyDeposited { amount: i64 },
+# }
+# let event = evento::Event {
+#     aggregate_type: BankAccount::aggregate_type().to_owned(),
+#     name: "MoneyDeposited".to_owned(),
+#     data: bitcode::encode(&MoneyDeposited { amount: 100 }),
+#     ..Default::default()
+# };
+match BankAccountEvent::try_from(&event)? {
+    BankAccountEvent::AccountOpened(AccountOpened { owner, .. }) => println!("opened by {owner}"),
+    BankAccountEvent::MoneyDeposited(d) => println!("deposit {}", d.amount),
+}
+# Ok::<(), evento::FromEventError>(())
+```
+
+Adding a variant now breaks every match site at compile time. Events decode
+verbatim: `upcast_to` is not applied here, so an old stored event decodes to its
+own variant.
+
 ### 2. Write events
 
 `create()` starts a new aggregate; `append(id)` continues an existing one with
@@ -302,7 +330,8 @@ To drain currently-pending events once instead of running a background loop, use
 `run_once(&executor)` (optionally after `no_retry()`). To keep a projection
 auto-updated, use `projection.subscription("key").start(&executor)`. Handlers for all
 events of an aggregate without deserializing go through `#[evento::subscription_all]`
-with `RawEvent<A>`.
+with `RawEvent<A>`, whose `.decode()` yields the same `{Enum}Event` when you do
+want it typed.
 
 ### 7. Evolving events
 
@@ -425,6 +454,7 @@ plus the [`bank-axum-accord`](examples/bank-axum-accord) 3-node demo.
 | Concern | Entry point |
 |---------|-------------|
 | Define events | `#[evento::aggregate] enum` |
+| Decode a stored event | `{Enum}Event::try_from(&event)?` |
 | Start a new aggregate | `evento::create()` → `WriteBuilder` |
 | Append to an aggregate | `evento::append(id)` → `WriteBuilder` |
 | Command with routing variants | `#[evento::command] impl Command<E>` |
