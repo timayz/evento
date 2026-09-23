@@ -16,7 +16,7 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [package.metadata.cargo-machete]
-ignored = ["anyhow", "bitcode", "sqlx", "tokio"]
+ignored = ["anyhow", "bitcode", "serde", "sqlx", "tokio"]
 
 [dependencies]
 evento-core = { path = "../evento-core", version = "2.0.0-alpha.28" }
@@ -29,6 +29,7 @@ sqlx_migrator = { workspace = true, optional = true }
 [dev-dependencies]
 anyhow.workspace = true
 bitcode.workspace = true
+serde.workspace = true
 sqlx = { workspace = true, features = ["runtime-tokio", "sqlite"] }
 tokio.workspace = true
 

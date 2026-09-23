@@ -173,7 +173,7 @@ pub struct AccountBalanceView {
 // - Adds `Default` and `Clone` derives
 ```
 
-Options:
+Options, which may be combined in any order:
 
 - `cursor = <Type>` — use a custom cursor field type instead of `String`. The
   type must be `Clone + From<evento::cursor::Value> + Into<evento::cursor::Value>`
@@ -181,6 +181,11 @@ Options:
 - `id = <field>` — additionally implement `ProjectionAggregate`, returning the
   named field as the aggregate id. This enables `view.write()` for emitting
   events from the projection.
+- `name = "..."` — pin the projection name that snapshots are keyed by, instead
+  of the default `"<module path>::<Struct>"` (see [Snapshots](#snapshots-with-eventosnapshot)).
+- any path (e.g. `bitcode::Encode`, `serde::Serialize`) — added to the derive
+  list, alongside the `Default` and `Clone` the macro adds and any
+  `#[derive(...)]` written on the struct.
 
 ```rust
 #[evento::projection(cursor = evento::cursor::Value, id = id)]
