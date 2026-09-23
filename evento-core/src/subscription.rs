@@ -404,20 +404,21 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
         self
     }
 
+    /// Processes events with any routing key, instead of filtering by one.
+    ///
+    /// The counterpart to [`routing_key`](Self::routing_key). Overrides any
+    /// executor-level default.
+    pub fn any_routing_key(mut self) -> Self {
+        self.routing_key = Some(RoutingKey::All);
+
+        self
+    }
+
     /// Sets the maximum number of retries on failure.
     ///
     /// Uses exponential backoff. Default is 30.
     pub fn retry(mut self, v: u8) -> Self {
         self.retry = Some(v);
-
-        self
-    }
-
-    /// Processes all events regardless of routing key.
-    ///
-    /// Overrides any executor-level default.
-    pub fn all(mut self) -> Self {
-        self.routing_key = Some(RoutingKey::All);
 
         self
     }
@@ -484,8 +485,8 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
     /// `Some(_)`.
     ///
     /// `prefix_key` is captured from `executor.default_routing_key()` even
-    /// when the user has already called `.all()`, so the storage key remains
-    /// scoped to the executor's tenant — otherwise two executors with
+    /// when the user has already called `.any_routing_key()`, so the storage key
+    /// remains scoped to the executor's tenant — otherwise two executors with
     /// different defaults would share one row in the subscriber table.
     fn resolve_routing_key(&mut self, executor: &E) {
         if self.prefix_key.is_none() {

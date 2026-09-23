@@ -904,10 +904,11 @@ where
         self
     }
 
-    /// Processes all events regardless of routing key.
+    /// Processes events with any routing key, instead of filtering by one.
     ///
-    /// Overrides any executor-level default.
-    pub fn all(mut self) -> Self {
+    /// The counterpart to [`routing_key`](Self::routing_key). Overrides any
+    /// executor-level default.
+    pub fn any_routing_key(mut self) -> Self {
         self.routing_key = Some(RoutingKey::All);
         self
     }
@@ -1006,7 +1007,7 @@ where
 
         let mut builder: SubscriptionBuilder<E> = SubscriptionBuilder::new(key);
         builder = match routing_key {
-            Some(RoutingKey::All) => builder.all(),
+            Some(RoutingKey::All) => builder.any_routing_key(),
             Some(RoutingKey::Value(Some(v))) => builder.routing_key(v),
             Some(RoutingKey::Value(None)) | None => builder,
         };

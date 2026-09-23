@@ -94,7 +94,7 @@ async fn run_web() -> anyhow::Result<()> {
     // the store server pushes a notification on every write.
     let subscription = account_details::create_projection()
         .subscription(format!("account-details-{}", Ulid::generate()))
-        .all()
+        .any_routing_key()
         .start(&executor)
         .await?;
 

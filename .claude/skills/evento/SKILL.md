@@ -255,7 +255,7 @@ async fn notify_deposit<E: Executor>(
 
 let sub = SubscriptionBuilder::<evento::Sqlite>::new("notifier") // unique key = cursor scope
     .handler(notify_deposit())
-    .routing_key("accounts")   // or .all() for every routing key; default = only NULL routing key
+    .routing_key("accounts")   // .any_routing_key() for every key; default = only NULL routing key
     .chunk_size(100)
     .retry(5)                  // exponential backoff; .no_retry() to disable
     .start(&executor)          // background task; returns a handle
@@ -310,8 +310,8 @@ aggregate type as a string; it has no `.decode()`.
 
 - **Readers and subscriptions default routing keys oppositely.** `evento::read(..)` with
   no `.routing_key()` reads **every** routing key; narrow it with `.no_routing_key()`.
-  A subscription with no `.routing_key()`/`.all()`
-  only sees events whose routing key is NULL. `.all()` subscriptions are stored per
+  A subscription with no `.routing_key()`/`.any_routing_key()` only sees events whose
+  routing key is NULL. `.any_routing_key()` subscriptions are stored per
   executor-default-routing-key, so multi-tenant setups stay isolated.
 - **The subscription key is the cursor identity.** Reusing a key across two different
   subscriptions makes them share (and corrupt) one cursor. Keep keys unique.

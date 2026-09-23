@@ -181,7 +181,7 @@ pub trait Executor: Send + Sync + 'static {
     /// routing key for a brand-new aggregate (an existing stream keeps its
     /// original key), and by `SubscriptionBuilder::start` /
     /// `ProjectionSubscription::start` to inherit a default when the user
-    /// has not called `.routing_key()` or `.all()`.
+    /// has not called `.routing_key()` or `.any_routing_key()`.
     fn default_routing_key(&self) -> Option<&str> {
         None
     }
@@ -625,7 +625,7 @@ impl Evento {
     ///
     /// Per-event/per-aggregate routing keys still take precedence on writes.
     /// Subscriptions inherit this key only when the user has not called
-    /// `.routing_key()` or `.all()`.
+    /// `.routing_key()` or `.any_routing_key()`.
     pub fn default_routing_key(mut self, key: impl Into<String>) -> Self {
         self.default_routing_key = Some(key.into());
         self

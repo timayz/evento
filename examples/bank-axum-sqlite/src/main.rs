@@ -66,7 +66,7 @@ async fn main() -> anyhow::Result<()> {
     // replays all events and then streams new ones live.
     let subscription = account_details::create_projection()
         .subscription(format!("account-details-{}", Ulid::generate()))
-        .all()
+        .any_routing_key()
         .start(&executor)
         .await?;
 

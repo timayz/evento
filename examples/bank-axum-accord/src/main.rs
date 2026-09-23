@@ -186,7 +186,7 @@ async fn main() -> anyhow::Result<()> {
     // that doesn't survive restarts.)
     let _subscription = account_details::create_projection()
         .subscription(format!("account-details-{}", Ulid::generate()))
-        .all()
+        .any_routing_key()
         .start(&executor)
         .await?;
 
