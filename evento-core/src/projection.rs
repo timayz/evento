@@ -943,6 +943,9 @@ where
     }
 
     /// Allows the subscription to continue after handler failures.
+    ///
+    /// Without it, a failing handler stops the worker for good and the
+    /// projection silently goes stale; see [`Subscription::stopped`].
     pub fn continue_on_error(mut self) -> Self {
         self.continue_on_error = true;
         self
@@ -951,6 +954,10 @@ where
     /// Starts the subscription.
     ///
     /// Returns a [`Subscription`] handle that can be used for graceful shutdown.
+    ///
+    /// Supervise it: if the worker stops on its own the projection stops being
+    /// updated with nothing else to say so. [`Subscription::stopped`] resolves
+    /// with the reason.
     pub async fn start(self, executor: &E) -> anyhow::Result<Subscription> {
         self.into_builder().start(executor).await
     }

@@ -19,6 +19,7 @@
 //! up in the others without polling, because the store server pushes write
 //! notifications to every connected client.
 
+use std::future::IntoFuture;
 use std::sync::Arc;
 
 use anyhow::Context as _;
@@ -48,6 +49,17 @@ struct AppState {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Without a subscriber, every `tracing` event evento emits — including the
+    // error a failing subscription logs on its way out — is a no-op. The
+    // default filter keeps evento audible while muting the embedded storage
+    // engine; `RUST_LOG=evento_core=debug` overrides it.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,fjall=warn,lsm_tree=warn".into()),
+        )
+        .init();
+
     match std::env::args().nth(1).as_deref() {
         Some("store") => run_store().await,
         None => run_web().await,
@@ -115,11 +127,22 @@ async fn run_web() -> anyhow::Result<()> {
     let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_owned());
     let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await?;
     println!("Listening on http://127.0.0.1:{port}");
-    axum::serve(listener, app)
+    let server = axum::serve(listener, app)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })
-        .await?;
+        .into_future();
+    tokio::pin!(server);
+
+    // The projection worker can stop on its own — a handler error (the default
+    // is to stop on the first one), or another process taking over its key. If
+    // it does, the read model silently freezes, so stop serving stale data.
+    tokio::select! {
+        res = &mut server => res?,
+        reason = subscription.stopped() => {
+            tracing::error!(%reason, "projection subscription stopped, shutting down");
+        }
+    }
 
     // Stop the projection subscription cleanly; dropping the last RemoteClient
     // clone on return then stops the connection actor — nothing else to close.

@@ -3783,3 +3783,110 @@ mod context_data {
         Ok(())
     }
 }
+
+/// Scenario: a subscription that dies takes the reason with it.
+///
+/// Guards issue #246: with `continue_on_error` unset a failing handler stops
+/// the worker for good, and the handle is the only way to notice. The worker
+/// also logs, but `tracing` is a no-op until the application installs a
+/// subscriber — so `stopped()` is what a supervisor can actually rely on.
+pub async fn subscription_stop_reason<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
+    use std::time::Duration;
+
+    use evento::subscription::StopReason;
+
+    let cmd = bank::Command(executor.clone());
+
+    cmd.open_account(OpenAccount {
+        owner_id: "owner_stop_reason".to_owned(),
+        owner_name: "Stop Reason".to_owned(),
+        account_type: AccountType::Checking,
+        currency: "USD".to_owned(),
+        initial_balance: 100,
+    })
+    .await?;
+
+    // A handler that always fails, with no retries: the worker must stop and
+    // report why.
+    let failing = stop_reason::subscription(format!("stop-reason-failing-{}", Ulid::generate()))
+        .no_retry()
+        .start(executor)
+        .await?;
+
+    // Bounded so a regression fails instead of hanging the suite.
+    let reason = tokio::time::timeout(Duration::from_secs(10), failing.stopped()).await?;
+
+    assert!(
+        matches!(reason, StopReason::Failed(_)),
+        "expected the handler error to stop the worker, got {reason:?}"
+    );
+    assert!(reason.is_failure(), "{reason}");
+    assert!(
+        reason.to_string().contains(stop_reason::FAILURE),
+        "the handler's message should survive: {reason}"
+    );
+    assert!(reason.error().is_some(), "{reason}");
+
+    // The same reason is readable without blocking, and the handle now reports
+    // itself as finished.
+    assert!(failing.is_finished());
+    assert!(matches!(failing.stop_reason(), Some(StopReason::Failed(_))));
+
+    // A healthy subscription is not finished, and a requested stop is reported
+    // as a shutdown rather than a failure.
+    let healthy = stop_reason::healthy(format!("stop-reason-healthy-{}", Ulid::generate()))
+        .start(executor)
+        .await?;
+
+    assert!(!healthy.is_finished());
+    assert!(healthy.stop_reason().is_none());
+
+    healthy.stop();
+    let reason = tokio::time::timeout(Duration::from_secs(10), healthy.stopped()).await?;
+
+    assert!(
+        matches!(reason, StopReason::Shutdown),
+        "expected a graceful shutdown, got {reason:?}"
+    );
+    assert!(!reason.is_failure(), "{reason}");
+
+    healthy.shutdown().await?;
+
+    Ok(())
+}
+
+mod stop_reason {
+    use bank::aggregator::AccountOpened;
+    use evento::{
+        metadata::Event,
+        subscription::{Context, SubscriptionBuilder},
+        Executor,
+    };
+
+    /// The handler's error message, asserted on by the scenario.
+    pub const FAILURE: &str = "boom, the handler failed";
+
+    pub fn subscription<E: Executor>(key: impl Into<String>) -> SubscriptionBuilder<E> {
+        SubscriptionBuilder::new(key).handler(always_fails())
+    }
+
+    pub fn healthy<E: Executor>(key: impl Into<String>) -> SubscriptionBuilder<E> {
+        SubscriptionBuilder::new(key).handler(never_fails())
+    }
+
+    #[evento::subscription]
+    async fn always_fails<E: Executor>(
+        _context: &Context<'_, E>,
+        _event: Event<AccountOpened>,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!(FAILURE)
+    }
+
+    #[evento::subscription]
+    async fn never_fails<E: Executor>(
+        _context: &Context<'_, E>,
+        _event: Event<AccountOpened>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+}

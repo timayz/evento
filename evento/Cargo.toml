@@ -16,7 +16,7 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [package.metadata.cargo-machete]
-ignored = ["anyhow", "bitcode", "serde", "sqlx", "tokio"]
+ignored = ["anyhow", "bitcode", "serde", "sqlx", "tokio", "tracing", "tracing-subscriber"]
 
 [dependencies]
 evento-core = { path = "../evento-core", version = "2.0.0-alpha.28" }
@@ -32,6 +32,8 @@ bitcode.workspace = true
 serde.workspace = true
 sqlx = { workspace = true, features = ["runtime-tokio", "sqlite"] }
 tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [features]
 default = ["macro"]

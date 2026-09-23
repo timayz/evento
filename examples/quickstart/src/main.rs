@@ -98,6 +98,17 @@ async fn deposit_logger<E: Executor>(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Without a subscriber, every `tracing` event evento emits — including the
+    // error a failing subscription logs on its way out — is a no-op. The
+    // default filter keeps evento audible while muting the embedded storage
+    // engine; `RUST_LOG=evento_core=debug` overrides it.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,fjall=warn,lsm_tree=warn".into()),
+        )
+        .init();
+
     // An embedded Fjall store in a temp directory — swap for a persistent path
     // (or a SQL pool, or a remote client) without touching the code above.
     let dir = tempfile::tempdir()?;

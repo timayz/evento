@@ -103,16 +103,25 @@
 //!         .execute(executor)
 //!         .await?;
 //!
-//!     // Run a background subscription, then shut it down.
+//!     // Run a background subscription. It stops on the first handler error
+//!     // unless `.continue_on_error()` is set, so supervise the handle:
+//!     // `stopped()` resolves with the reason the worker died.
 //!     let subscription = SubscriptionBuilder::new("deposit-notifier")
 //!         .handler(notify())
 //!         .routing_key("accounts")
 //!         .start(executor)
 //!         .await?;
+//!     if let Some(reason) = subscription.stop_reason() {
+//!         tracing::error!(%reason, "subscription is not running");
+//!     }
 //!     subscription.shutdown().await?;
 //!     Ok(())
 //! }
 //! ```
+//!
+//! Install a `tracing` subscriber in `main` (`tracing_subscriber::fmt::init()`)
+//! before any of this: evento logs through `tracing`, which discards
+//! everything until an application installs one.
 //!
 //! # Re-exports
 //!

@@ -8,9 +8,24 @@
 //!
 //! - [`SubscriptionBuilder`] - Builds and configures event subscriptions
 //! - [`Subscription`] - Handle to a running subscription
+//! - [`StopReason`] - Why a subscription's worker stopped
 //! - [`Handler`] - Trait for event handlers
 //! - [`Context`] - Handler context with executor access
 //! - [`RoutingKey`] - Filter for event routing
+//!
+//! # Failure handling
+//!
+//! By default a subscription stops on the first handler error
+//! ([`continue_on_error`](SubscriptionBuilder::continue_on_error) is opt-in),
+//! and a stopped worker never processes another event. It is easy to miss:
+//!
+//! - the worker reports itself through `tracing`, which does nothing unless the
+//!   application installs a subscriber (`tracing_subscriber::fmt::init()`);
+//! - the store-side `running` flag is ownership state, not liveness — it stays
+//!   set after the local worker dies.
+//!
+//! So supervise the handle: [`Subscription::stopped`] resolves with the
+//! [`StopReason`], and [`Subscription::is_finished`] is the non-blocking check.
 //!
 //! # Example
 //!
@@ -393,6 +408,11 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
     ///
     /// By default, subscriptions stop on the first error. With this flag,
     /// errors are logged but processing continues.
+    ///
+    /// Without it, a failing handler stops the worker for good and the only
+    /// signals are a `tracing::error!` (a no-op unless the application installs
+    /// a subscriber) and [`Subscription::stopped`], which reports
+    /// [`StopReason::Failed`].
     pub fn continue_on_error(mut self) -> Self {
         self.continue_on_error = true;
 
@@ -721,7 +741,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                     };
                     if let Err(err) = result {
                         if !self.continue_on_error {
-                            tracing::error!("failed");
+                            tracing::error!(error = %err, key = self.resolved_key(), "failed");
                             // Persist the successfully processed prefix before
                             // surfacing the error, so a retry resumes at the
                             // failing event instead of re-running the chunk.
@@ -879,6 +899,11 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
     ///
     /// Returns a [`Subscription`] handle that can be used for graceful shutdown.
     /// The subscription runs in a spawned tokio task and polls for new events.
+    ///
+    /// The worker can also stop on its own — a handler error without
+    /// [`continue_on_error`](Self::continue_on_error), or another worker taking
+    /// over the key — and the returned handle is the only way to find out:
+    /// see [`Subscription::stopped`] and [`StopReason`].
     #[tracing::instrument(skip_all, fields(
         subscription = tracing::field::Empty,
         aggregate_type = tracing::field::Empty,
@@ -897,6 +922,11 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         self.shutdown_rx = Some(shutdown_rx.clone());
         let mut shutdown_rx = shutdown_rx;
+        // Records why the worker stopped. The sender is owned by the spawned
+        // task below and dropped with it, so a closed channel that never
+        // received a value means the task died without recording one —
+        // a panic, an abort, or a runtime shutdown.
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(None::<StopReason>);
 
         executor
             .upsert_subscriber(self.resolved_key().to_owned(), id.to_owned())
@@ -918,7 +948,10 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             let mut interval = interval_at(start, self.poll_interval);
             let mut gated: Option<Duration> = None;
 
-            loop {
+            // Every exit from this loop names a `StopReason`, so the worker can
+            // never die without saying why: adding a new terminal path is a
+            // compile error until it does.
+            let reason = loop {
                 // Wake on whichever comes first: an in-process write (when the
                 // executor exposes a signal), the fallback poll tick, or a
                 // shutdown signal. Selecting on shutdown here keeps shutdown
@@ -956,12 +989,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                 }
 
                 if shutdown {
-                    tracing::info!(
-                        key = self.resolved_key(),
-                        "Subscription received shutdown signal, stopping gracefully"
-                    );
-
-                    break;
+                    break StopReason::Shutdown;
                 }
 
                 // The retry backoff can span minutes; selecting the shutdown
@@ -995,39 +1023,48 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                     _ = shutdown_rx.changed() => None,
                 };
                 let Some(result) = result else {
-                    tracing::info!(
-                        key = self.resolved_key(),
-                        "Subscription received shutdown signal, stopping gracefully"
-                    );
-                    break;
+                    break StopReason::Shutdown;
                 };
 
                 match result {
                     Ok(ProcessOutcome::Drained) => gated = None,
                     Ok(ProcessOutcome::Gated { wait }) => gated = Some(wait),
-                    Ok(ProcessOutcome::ShutdownRequested) => break,
-                    Ok(ProcessOutcome::LostOwnership) => {
-                        tracing::info!(
-                            key = self.resolved_key(),
-                            "Subscription taken over by another worker, stopping"
-                        );
-                        break;
-                    }
+                    Ok(ProcessOutcome::ShutdownRequested) => break StopReason::Shutdown,
+                    Ok(ProcessOutcome::LostOwnership) => break StopReason::LostOwnership,
                     Err(err) => {
                         tracing::error!(error = %err, "Failed to process event");
 
                         if !self.continue_on_error {
-                            break;
+                            break StopReason::Failed(Arc::new(err));
                         }
                     }
                 };
+            };
+
+            // The one record that says the worker is gone. Without it a stopped
+            // subscription is invisible: the per-pass error above does not say
+            // whether processing continues, and nothing else ever fires again.
+            match &reason {
+                StopReason::Failed(err) => tracing::error!(
+                    key = self.resolved_key(),
+                    error = %err,
+                    "Subscription stopped: a pass failed and continue_on_error is not set"
+                ),
+                reason => tracing::info!(
+                    key = self.resolved_key(),
+                    reason = %reason,
+                    "Subscription stopped"
+                ),
             }
+
+            let _ = stop_tx.send(Some(reason));
         });
 
         Ok(Subscription {
             id: subscription_id,
             task_handle,
             shutdown_tx,
+            stop_rx,
         })
     }
 
@@ -1126,10 +1163,63 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
     }
 }
 
+/// Why a [`Subscription`]'s worker stopped.
+///
+/// The worker records this as it exits. Read it without blocking through
+/// [`Subscription::stop_reason`], or wait for it with
+/// [`Subscription::stopped`].
+///
+/// [`Failed`](Self::Failed) and [`Panicked`](Self::Panicked) are the abnormal
+/// ones — the others are the worker doing what it was told.
+#[derive(Clone, Debug)]
+pub enum StopReason {
+    /// [`Subscription::shutdown`] or [`Subscription::stop`] was called, or the
+    /// handle was dropped (which also signals the worker).
+    Shutdown,
+    /// Another worker claimed this subscription key, so this one stepped aside.
+    LostOwnership,
+    /// A pass failed after exhausting [`retry`](SubscriptionBuilder::retry),
+    /// and the subscription was not built with
+    /// [`continue_on_error`](SubscriptionBuilder::continue_on_error).
+    Failed(Arc<anyhow::Error>),
+    /// The worker ended without recording a reason: it panicked, was aborted,
+    /// or the runtime shut down under it.
+    Panicked,
+}
+
+impl StopReason {
+    /// The error that stopped the subscription, if it stopped because of one.
+    pub fn error(&self) -> Option<&anyhow::Error> {
+        match self {
+            StopReason::Failed(err) => Some(err),
+            _ => None,
+        }
+    }
+
+    /// Whether the subscription stopped abnormally instead of on request.
+    pub fn is_failure(&self) -> bool {
+        matches!(self, StopReason::Failed(_) | StopReason::Panicked)
+    }
+}
+
+impl std::fmt::Display for StopReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StopReason::Shutdown => f.write_str("shutdown requested"),
+            StopReason::LostOwnership => f.write_str("taken over by another worker"),
+            // `{:#}` keeps the whole `anyhow` context chain on one line —
+            // without it a `%reason` log drops everything a handler added.
+            StopReason::Failed(err) => write!(f, "failed: {err:#}"),
+            StopReason::Panicked => f.write_str("worker task panicked or was aborted"),
+        }
+    }
+}
+
 /// Handle to a running event subscription.
 ///
-/// Returned by [`SubscriptionBuilder::start`], this handle provides
-/// the subscription ID and a method for graceful shutdown.
+/// Returned by [`SubscriptionBuilder::start`], this handle carries the
+/// subscription ID, graceful shutdown, and — because a worker can also stop on
+/// its own — the reason it stopped.
 ///
 /// # Example
 ///
@@ -1142,7 +1232,15 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
 ///
 /// println!("Started subscription: {}", subscription.id);
 ///
-/// // On application shutdown
+/// // Supervise it: a failing handler stops the worker for good, and this
+/// // handle is the only way to find out.
+/// tokio::select! {
+///     _ = tokio::signal::ctrl_c() => {}
+///     reason = subscription.stopped() => {
+///         tracing::error!(%reason, "subscription stopped on its own");
+///     }
+/// }
+///
 /// subscription.shutdown().await?;
 /// # Ok(())
 /// # }
@@ -1153,6 +1251,7 @@ pub struct Subscription {
     pub id: Ulid,
     task_handle: tokio::task::JoinHandle<()>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
+    stop_rx: tokio::sync::watch::Receiver<Option<StopReason>>,
 }
 
 impl Subscription {
@@ -1163,9 +1262,91 @@ impl Subscription {
     /// interrupts a retry backoff in progress, so shutdown stays prompt even
     /// while the subscription is failing.
     pub async fn shutdown(self) -> Result<(), tokio::task::JoinError> {
-        let _ = self.shutdown_tx.send(true);
+        self.stop();
 
         self.task_handle.await
+    }
+
+    /// Signals the worker to stop, without waiting for it.
+    ///
+    /// Unlike [`shutdown`](Self::shutdown) this takes `&self`, so a supervisor
+    /// holding an `Arc<Subscription>` can stop it. Pair it with
+    /// [`stopped`](Self::stopped) to wait for the worker to actually exit.
+    pub fn stop(&self) {
+        let _ = self.shutdown_tx.send(true);
+    }
+
+    /// Whether the worker has stopped — `true` means no further events will be
+    /// processed, whatever the reason.
+    ///
+    /// Equivalent to `self.stop_reason().is_some()`. The task itself may still
+    /// be unwinding; [`shutdown`](Self::shutdown) joins it.
+    pub fn is_finished(&self) -> bool {
+        self.stop_reason().is_some()
+    }
+
+    /// Why the worker stopped, or `None` while it is still running.
+    ///
+    /// A non-blocking snapshot; [`stopped`](Self::stopped) waits for it.
+    pub fn stop_reason(&self) -> Option<StopReason> {
+        peek_stop_reason(&self.stop_rx)
+    }
+
+    /// Waits until the worker stops, and reports why.
+    ///
+    /// Resolves immediately if it has already stopped. Cancel-safe: the reason
+    /// lives in a watch channel, so this can be dropped inside a
+    /// [`tokio::select!`] and awaited again later without losing it.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use evento::subscription::{StopReason, SubscriptionBuilder};
+    /// # async fn run<E: evento::Executor + Clone>(executor: &E) -> anyhow::Result<()> {
+    /// # let subscription = SubscriptionBuilder::new("my-subscription").start(executor).await?;
+    /// match subscription.stopped().await {
+    ///     StopReason::Failed(err) => tracing::error!(%err, "restarting"),
+    ///     reason => tracing::info!(%reason, "worker stopped"),
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn stopped(&self) -> StopReason {
+        // `wait_for` needs `&mut`; cloning the receiver is an `Arc` bump and
+        // keeps this `&self`, so an `Arc<Subscription>` supervisor can await it.
+        await_stop_reason(self.stop_rx.clone()).await
+    }
+}
+
+/// Reads a recorded stop reason without blocking.
+///
+/// Shared with the unit tests, which exercise it without a live worker.
+fn peek_stop_reason(rx: &tokio::sync::watch::Receiver<Option<StopReason>>) -> Option<StopReason> {
+    // Sample "closed" *before* the value: if the channel is already closed then
+    // any send happened before the sender dropped, so the borrow below sees it.
+    // The other order can read a stale `None`, then observe the close, and
+    // report `Panicked` for a worker that did record a reason.
+    let closed = rx.has_changed().is_err();
+    let recorded = rx.borrow().as_ref().cloned();
+
+    match recorded {
+        Some(reason) => Some(reason),
+        // Closed with nothing recorded: the task ended without setting one.
+        None if closed => Some(StopReason::Panicked),
+        None => None,
+    }
+}
+
+/// Waits for a stop reason to be recorded.
+///
+/// Shared with the unit tests, which exercise it without a live worker.
+async fn await_stop_reason(mut rx: tokio::sync::watch::Receiver<Option<StopReason>>) -> StopReason {
+    // `wait_for` re-checks the current value after observing a close, so a
+    // reason sent just before the sender dropped still comes back as `Ok`.
+    match rx.wait_for(|reason| reason.is_some()).await {
+        Ok(reason) => reason.as_ref().cloned().unwrap_or(StopReason::Panicked),
+        // All senders dropped without a reason: the task panicked or was aborted.
+        Err(_) => StopReason::Panicked,
     }
 }
 
@@ -1190,5 +1371,107 @@ impl<E: Executor, EV: AggregateEvent + Send + Sync> Handler<E> for SkipHandler<E
 
     fn upcasters(&self) -> &'static [crate::Upcaster] {
         EV::upcasters()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{await_stop_reason, peek_stop_reason, StopReason};
+    use std::sync::Arc;
+
+    fn channel() -> (
+        tokio::sync::watch::Sender<Option<StopReason>>,
+        tokio::sync::watch::Receiver<Option<StopReason>>,
+    ) {
+        tokio::sync::watch::channel(None)
+    }
+
+    #[test]
+    fn peek_is_none_while_the_worker_runs() {
+        let (_tx, rx) = channel();
+
+        assert!(peek_stop_reason(&rx).is_none());
+    }
+
+    /// A reason recorded before the worker task ended must survive the sender
+    /// being dropped — reading the value before the closed flag would report a
+    /// spurious `Panicked` here.
+    #[test]
+    fn peek_prefers_a_recorded_reason_over_the_closed_channel() {
+        let (tx, rx) = channel();
+        tx.send(Some(StopReason::Failed(Arc::new(anyhow::anyhow!("boom")))))
+            .unwrap();
+        drop(tx);
+
+        let reason = peek_stop_reason(&rx).expect("a reason was recorded");
+        assert!(matches!(reason, StopReason::Failed(_)), "{reason}");
+    }
+
+    #[test]
+    fn peek_reports_panicked_when_nothing_was_recorded() {
+        let (tx, rx) = channel();
+        drop(tx);
+
+        assert!(matches!(peek_stop_reason(&rx), Some(StopReason::Panicked)));
+    }
+
+    #[tokio::test]
+    async fn await_resolves_with_a_reason_recorded_earlier() {
+        let (tx, rx) = channel();
+        tx.send(Some(StopReason::LostOwnership)).unwrap();
+
+        assert!(matches!(
+            await_stop_reason(rx).await,
+            StopReason::LostOwnership
+        ));
+    }
+
+    #[tokio::test]
+    async fn await_resolves_when_the_worker_records_later() {
+        let (tx, rx) = channel();
+        let waiting = tokio::spawn(await_stop_reason(rx));
+
+        tokio::task::yield_now().await;
+        tx.send(Some(StopReason::Shutdown)).unwrap();
+
+        assert!(matches!(waiting.await.unwrap(), StopReason::Shutdown));
+    }
+
+    #[tokio::test]
+    async fn await_reports_panicked_when_the_sender_drops_empty() {
+        let (tx, rx) = channel();
+        let waiting = tokio::spawn(await_stop_reason(rx));
+
+        tokio::task::yield_now().await;
+        drop(tx);
+
+        assert!(matches!(waiting.await.unwrap(), StopReason::Panicked));
+    }
+
+    /// `Display` must flatten the whole `anyhow` context chain: a `%reason` log
+    /// that only carried the outermost message would lose the diagnosis.
+    #[test]
+    fn display_keeps_the_error_context_chain() {
+        let err = anyhow::anyhow!("boom").context("while handling MoneyDeposited");
+        let reason = StopReason::Failed(Arc::new(err));
+
+        let rendered = reason.to_string();
+        assert!(
+            rendered.contains("while handling MoneyDeposited"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("boom"), "{rendered}");
+    }
+
+    #[test]
+    fn only_abnormal_reasons_are_failures() {
+        assert!(!StopReason::Shutdown.is_failure());
+        assert!(!StopReason::LostOwnership.is_failure());
+        assert!(StopReason::Panicked.is_failure());
+
+        let failed = StopReason::Failed(Arc::new(anyhow::anyhow!("boom")));
+        assert!(failed.is_failure());
+        assert!(failed.error().is_some());
+        assert!(StopReason::Shutdown.error().is_none());
     }
 }
