@@ -394,13 +394,10 @@ impl<T: bitcode::Encode + bitcode::DecodeOwned + ProjectionCursor + Send + Sync,
 /// #     view.owner = event.data.owner.clone();
 /// #     Ok(())
 /// # }
-/// # #[derive(Clone)]
-/// # struct AppConfig;
-/// # async fn run<E: evento::Executor + Clone>(executor: &E, app_config: AppConfig) -> anyhow::Result<()> {
+/// # async fn run<E: evento::Executor + Clone>(executor: &E) -> anyhow::Result<()> {
 /// // Load a single aggregate
 /// let result = Projection::<_, AccountView>::new::<Account>()
 ///     .handler(account_opened())
-///     .data(app_config.clone())
 ///     .load("account-123")
 ///     .execute(executor)
 ///     .await?;
@@ -408,7 +405,6 @@ impl<T: bitcode::Encode + bitcode::DecodeOwned + ProjectionCursor + Send + Sync,
 /// // Start a subscription that keeps every aggregate up to date
 /// let subscription = Projection::<_, AccountView>::new::<Account>()
 ///     .handler(account_opened())
-///     .data(app_config)
 ///     .subscription("account-view")
 ///     .start(executor)
 ///     .await?;
@@ -588,11 +584,20 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
         self.register(SkipHandler::<EV>(PhantomData), false)
     }
 
-    /// Adds shared data to the handler context.
+    /// Adds shared data to the projection context.
     ///
-    /// Data added here is accessible in handlers via the context. Data lives
-    /// on the projection definition and is reused for both [`Projection::load`]
-    /// and [`Projection::subscription`].
+    /// Unlike a subscription handler, a projection handler takes `(event, &mut
+    /// view)` and never sees the context. This data is for hand-written
+    /// [`Snapshot`] impls, which receive a [`Context`] in
+    /// [`restore`](Snapshot::restore), [`take_snapshot`](Snapshot::take_snapshot)
+    /// and [`drop_snapshot`](Snapshot::drop_snapshot) — a custom snapshot table
+    /// reads its pool from here. It lives on the projection definition, so it is
+    /// there for both [`Projection::load`] and [`Projection::subscription`].
+    ///
+    /// The value is stored under its own type and read back with
+    /// `context.extract::<D>()`, which clones it: `D` should be `Clone` and cheap
+    /// to clone, or be wrapped in [`Data`](crate::context::Data) and extracted as
+    /// `Data<D>`.
     pub fn data<D: Send + Sync + 'static>(self, v: D) -> Self {
         self.context.insert(v);
 

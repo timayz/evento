@@ -3688,3 +3688,98 @@ pub async fn read_routing_key<E: Executor + Clone>(executor: &E) -> anyhow::Resu
 
     Ok(())
 }
+
+/// Scenario: data registered with `.data(..)` is extractable in a handler under
+/// the type it was registered with.
+///
+/// Guards the documented idiom (see `SubscriptionBuilder::data`): a bare value
+/// comes back as `T`, a value registered as `Data<T>` comes back as `Data<T>`,
+/// and a type that was never registered is a `try_extract` error rather than a
+/// panic in the worker task.
+pub async fn subscription_data<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
+    let cmd = bank::Command(executor.clone());
+
+    let account_id = cmd
+        .open_account(OpenAccount {
+            owner_id: "owner_ctx_data".to_owned(),
+            owner_name: "Context Data".to_owned(),
+            account_type: AccountType::Checking,
+            currency: "USD".to_owned(),
+            initial_balance: 100,
+        })
+        .await?;
+
+    context_data::subscription()
+        .data(context_data::Smtp {
+            host: "smtp.example.com".to_owned(),
+        })
+        .data(evento::context::Data::new(context_data::Templates {
+            welcome: "welcome!".to_owned(),
+        }))
+        .no_retry()
+        .run_once(executor)
+        .await?;
+
+    let rows = context_data::ROWS.read().unwrap();
+    let row = rows
+        .get(&account_id)
+        .expect("the handler should have run for this account");
+    assert_eq!(row, "smtp.example.com/welcome!");
+
+    Ok(())
+}
+
+mod context_data {
+    use std::{collections::HashMap, sync::RwLock};
+
+    use bank::aggregator::AccountOpened;
+    use evento::{
+        context::Data,
+        metadata::Event,
+        subscription::{Context, SubscriptionBuilder},
+        Executor,
+    };
+    use once_cell::sync::Lazy;
+
+    pub static ROWS: Lazy<RwLock<HashMap<String, String>>> = Lazy::new(Default::default);
+
+    /// Cheap to clone, so it is registered as itself.
+    #[derive(Clone)]
+    pub struct Smtp {
+        pub host: String,
+    }
+
+    /// Not `Clone`, so it is registered wrapped in `Data`.
+    pub struct Templates {
+        pub welcome: String,
+    }
+
+    pub fn subscription<E: Executor>() -> SubscriptionBuilder<E> {
+        SubscriptionBuilder::new("context-data").handler(handle_account_opened())
+    }
+
+    #[evento::subscription]
+    async fn handle_account_opened<E: Executor>(
+        context: &Context<'_, E>,
+        event: Event<AccountOpened>,
+    ) -> anyhow::Result<()> {
+        // A bare value is extracted under its own type.
+        let smtp: Smtp = context.extract();
+
+        // A value registered as `Data<T>` is extracted as `Data<T>`.
+        let templates: Data<Templates> = context.try_extract()?;
+
+        // A type that was never registered is an error, not a panic.
+        assert!(
+            context.try_extract::<u64>().is_err(),
+            "an unregistered type must not extract"
+        );
+
+        ROWS.write().unwrap().insert(
+            event.aggregate_id.to_owned(),
+            format!("{}/{}", smtp.host, templates.welcome),
+        );
+
+        Ok(())
+    }
+}

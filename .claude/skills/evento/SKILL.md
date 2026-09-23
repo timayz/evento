@@ -171,7 +171,8 @@ let view: Option<AccountView> = Projection::<_, AccountView>::new::<Account>()
     .await?;
 ```
 
-`Projection` builder: `.handler(h)`, `.skip::<Ev>()`, `.data(v)`, `.revision(n)`
+`Projection` builder: `.handler(h)`, `.skip::<Ev>()`, `.data(v)` (reaches hand-written
+`Snapshot` impls, not handlers — projection handlers take no context), `.revision(n)`
 (bumps snapshot version → invalidates old snapshots), `.strict()`,
 `.tombstone::<Ev>()` (an event that deletes the projection), then a terminal
 `.load(id)` / `.load_ids(ids)` → `LoadBuilder`, or `.subscription(key)` →
@@ -239,7 +240,10 @@ impl<E: Executor> Command<E> {
 
 `#[evento::subscription]` handlers take the context first, then the event:
 `(context: &Context<'_, E>, event: Event<SomeEvent>)`. They may do side effects
-(read models, notifications) via `context.executor` and `context.extract::<Data<T>>()`.
+(read models, notifications) via `context.executor` and `context.extract::<T>()` —
+`.data(v)` stores `v` under its own type, and `extract` clones it, so `T` must be `Clone`
+and cheap to clone; wrap anything else in `Data` and extract `Data<T>`.
+`context.try_extract::<T>()?` returns a `MissingData` error instead of panicking.
 
 ```rust
 use evento::{Executor, metadata::Event, subscription::{Context, SubscriptionBuilder}};

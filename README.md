@@ -314,17 +314,23 @@ use evento::{metadata::Event, subscription::{Context, SubscriptionBuilder}, Exec
 # pub enum BankAccount {
 #     MoneyDeposited { amount: i64 },
 # }
+#[derive(Clone)]
+pub struct Smtp { /* … */ }
+
 #[evento::subscription]
 async fn notify<E: Executor>(
-    _ctx: &Context<'_, E>,
+    ctx: &Context<'_, E>,
     event: Event<MoneyDeposited>,
 ) -> anyhow::Result<()> {
+    // Shared data comes back under the type it was registered with
+    let _smtp: Smtp = ctx.extract();
     println!("deposited {}", event.data.amount);
     Ok(())
 }
 
-# async fn run<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
+# async fn run<E: Executor + Clone>(executor: &E, smtp: Smtp) -> anyhow::Result<()> {
 let subscription = SubscriptionBuilder::new("deposit-notifier")
+    .data(smtp)
     .handler(notify())
     .routing_key("accounts")
     .chunk_size(100)
@@ -337,6 +343,11 @@ subscription.shutdown().await?;
 # Ok(())
 # }
 ```
+
+`.data(v)` stores `v` under its own type; a handler reads it back with
+`ctx.extract::<T>()`, or `ctx.try_extract::<T>()?` to get an error instead of a panic
+when it was never registered. Extraction clones, so the type should be `Clone` and cheap
+to clone — wrap anything else in `evento::context::Data` and extract it as `Data<T>`.
 
 To drain currently-pending events once instead of running a background loop, use
 `run_once(&executor)` (optionally after `no_retry()`). To keep a projection

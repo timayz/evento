@@ -165,6 +165,12 @@ async fn remote_tombstone() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn remote_subscription_data() -> anyhow::Result<()> {
+    let server = setup("subscription_data").await?;
+    evento_test::subscription_data(&server.client).await
+}
+
+#[tokio::test]
 async fn remote_subscription_all_counts() -> anyhow::Result<()> {
     let server = setup("subscription_all_counts").await?;
     evento_test::subscription_all_counts(&server.client).await

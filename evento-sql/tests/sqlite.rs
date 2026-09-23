@@ -381,6 +381,12 @@ async fn sqlite_tombstone() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn sqlite_subscription_data() -> anyhow::Result<()> {
+    let executor = create_sqlite_executor("subscription_data").await?;
+    evento_test::subscription_data(&executor).await
+}
+
+#[tokio::test]
 async fn sqlite_subscription_all_counts() -> anyhow::Result<()> {
     let executor = create_sqlite_executor("subscription_all_counts").await?;
     evento_test::subscription_all_counts(&executor).await

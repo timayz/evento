@@ -548,7 +548,6 @@ pub fn debug_handler(_attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// ```rust,no_run
 /// use evento::{
-///     context::Data,
 ///     metadata::Event,
 ///     subscription::{Context, SubscriptionBuilder},
 ///     Executor,
@@ -570,8 +569,8 @@ pub fn debug_handler(_attr: TokenStream, item: TokenStream) -> TokenStream {
 ///     context: &Context<'_, E>,
 ///     event: Event<MoneyDeposited>,
 /// ) -> anyhow::Result<()> {
-///     // Access shared data from context
-///     let config: Data<AppConfig> = context.extract();
+///     // Access shared data from context, by the type it was registered under
+///     let config: AppConfig = context.extract();
 ///
 ///     // Perform side effects
 ///     send_notification(&config.webhook_url, event.data.amount).await?;
@@ -579,9 +578,11 @@ pub fn debug_handler(_attr: TokenStream, item: TokenStream) -> TokenStream {
 ///     Ok(())
 /// }
 ///
-/// # async fn run<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
-/// // Register with subscription
+/// # async fn run<E: Executor + Clone>(executor: &E, app_config: AppConfig) -> anyhow::Result<()> {
+/// // Register with subscription — every type a handler extracts is registered
+/// // here with `.data(..)`
 /// let subscription = SubscriptionBuilder::new("deposit-notifier")
+///     .data(app_config)
 ///     .handler(on_money_deposited())
 ///     .routing_key("accounts")
 ///     .start(executor)
