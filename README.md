@@ -390,6 +390,17 @@ events of an aggregate without deserializing go through `#[evento::subscription_
 with `RawEvent<A>`, whose `.decode()` yields the same `{Enum}Event` when you do
 want it typed.
 
+A brand-new subscription starts at the beginning of history. For a live bridge — SSE, a
+WebSocket, a broadcast fanout — where replaying history pushes stale updates at clients
+that only care about what happens from now on, add `.start_from_latest()`: a key with **no
+stored cursor** is seeded at the stream head instead. It only affects that first start;
+once a cursor exists the subscription resumes exactly where it left off, so a restart
+never jumps forward. On a backend with a stability watermark the head is the newest event
+*below* it, so up to the stability margin (1s by default for `Sql`) of very recent events
+is still delivered rather than risking a skip — this skips history, not "everything before
+now". Not offered on `projection.subscription(..)`: a read model needs the state its
+handlers exist to fold.
+
 ### 7. Evolving events
 
 A stored event never changes: bitcode is positional, so its layout is frozen once a
@@ -587,6 +598,7 @@ plus the [`bank-axum-accord`](examples/bank-axum-accord) 3-node demo.
 | Filter events when reading | `EventFilter::by_type::<A>() / by_id::<A>(id) / by_event::<Ev>() / exact::<Ev>(id)` |
 | Continuous processing | `SubscriptionBuilder::new(key)...start(exec)` |
 | One-shot processing | `SubscriptionBuilder::new(key)...run_once(exec)` |
+| Skip history on a new subscription | `.start_from_latest()` |
 | Keep a projection updated | `projection.subscription(key).start(exec)` |
 | Fail on unhandled events | `.strict()` |
 | Keep going after a handler error | `.continue_on_error()` |

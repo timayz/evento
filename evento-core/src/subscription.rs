@@ -27,6 +27,15 @@
 //! So supervise the handle: [`Subscription::stopped`] resolves with the
 //! [`StopReason`], and [`Subscription::is_finished`] is the non-blocking check.
 //!
+//! # Starting position
+//!
+//! A subscription resumes from its stored cursor, and a key that has never
+//! acknowledged an event starts at the beginning of history. For a live bridge
+//! (SSE, a WebSocket, a broadcast fanout) where history is meaningless, opt out
+//! with [`start_from_latest`](SubscriptionBuilder::start_from_latest): a
+//! brand-new key is seeded at the stream head instead. Once a cursor exists it
+//! has no effect, so a restart always resumes rather than jumping forward.
+//!
 //! # Example
 //!
 //! ```rust,no_run
@@ -259,6 +268,9 @@ pub struct SubscriptionBuilder<E: Executor> {
     safety_disabled: bool,
     shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     ack_every: Option<u16>,
+    /// When set and this key has no stored cursor yet, the cursor is seeded at
+    /// the stream's head before the first read, so history is never delivered.
+    start_from_latest: bool,
     /// Cached `(sampled at, latest event timestamp in seconds)` feeding the
     /// lag metric, so acknowledges don't pay a MAX() scan each.
     latest_ts_cache: Mutex<Option<(Instant, u64)>>,
@@ -301,6 +313,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             aggregators: Default::default(),
             shutdown_rx: None,
             ack_every: None,
+            start_from_latest: false,
             latest_ts_cache: Mutex::new(None),
         }
     }
@@ -440,6 +453,84 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
     /// to 1 (ack per event, the pre-batching behavior).
     pub fn ack_every(mut self, v: u16) -> Self {
         self.ack_every = Some(v.max(1));
+
+        self
+    }
+
+    /// Starts a brand-new subscription at the stream's head instead of at the
+    /// beginning of history.
+    ///
+    /// This applies **only when the key has no stored cursor yet**: the head is
+    /// recorded as the cursor before the first event is read, so history is
+    /// never delivered. Once a cursor exists — the first acknowledged event, or
+    /// a restart of an existing subscription — this has no effect and the
+    /// subscription resumes exactly where it left off, so a restart still picks
+    /// up everything committed while the process was down.
+    ///
+    /// The shape this exists for is a live bridge — SSE, a WebSocket, push
+    /// notifications, an in-process broadcast channel — where replaying history
+    /// pushes stale updates at clients that only care about what happens from
+    /// now on:
+    ///
+    /// ```rust,no_run
+    /// # use evento::{Executor, metadata::Event, subscription::{Context, SubscriptionBuilder}};
+    /// # #[evento::aggregate]
+    /// # pub enum Account { MoneyDeposited { amount: i64 } }
+    /// #[evento::subscription]
+    /// async fn fanout<E: Executor>(
+    ///     context: &Context<'_, E>,
+    ///     event: Event<MoneyDeposited>,
+    /// ) -> anyhow::Result<()> {
+    ///     let tx: tokio::sync::broadcast::Sender<i64> = context.extract();
+    ///     let _ = tx.send(event.data.amount);
+    ///     Ok(())
+    /// }
+    ///
+    /// # async fn run<E: Executor + Clone>(
+    /// #     executor: &E,
+    /// #     tx: tokio::sync::broadcast::Sender<i64>,
+    /// # ) -> anyhow::Result<()> {
+    /// let subscription = SubscriptionBuilder::new("sse-fanout")
+    ///     .handler(fanout())
+    ///     .data(tx)
+    ///     .start_from_latest()
+    ///     .start(executor)
+    ///     .await?;
+    /// # subscription.shutdown().await?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// Keep the key stable across restarts: that is what makes the resume half
+    /// work. A fresh key per process re-seeds at the head every time, which is
+    /// harmless for a pure fanout but leaves a subscriber row behind per
+    /// process.
+    ///
+    /// The head is sampled when [`start`](Self::start) or
+    /// [`run_once`](Self::run_once) is called, not when the worker first polls,
+    /// so events committed while a [`delay`](Self::delay) elapses are still
+    /// delivered.
+    ///
+    /// # This skips history, not "everything before now"
+    ///
+    /// On a backend with a stability watermark (a shared SQL store, multi-node
+    /// Accord) the head is the newest event *below* the watermark, so up to the
+    /// backend's stability margin — default 1s for `Sql` — of very recent
+    /// events can still be delivered on a first start. That is deliberate:
+    /// seeding past the watermark could permanently skip an event committed
+    /// moments after the subscription started. On a single-writer backend the
+    /// watermark does not exist and the head is exact.
+    ///
+    /// With the read/write split executor (`Rw`) the cursor is read from the
+    /// replica, so a stale replica can report "no cursor" and seed again. The
+    /// subscription already trusts the replica for cursor state on every pass,
+    /// so this adds no new hazard.
+    ///
+    /// Deliberately not offered on
+    /// [`ProjectionSubscription`](crate::projection::ProjectionSubscription):
+    /// a read model started at the head would be missing the state its
+    /// handlers exist to fold.
+    pub fn start_from_latest(mut self) -> Self {
+        self.start_from_latest = true;
 
         self
     }
@@ -884,6 +975,87 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
         Ok(ProcessOutcome::Gated { wait })
     }
 
+    /// Seeds the cursor at the stream's head when
+    /// [`start_from_latest`](Self::start_from_latest) is set and this key has no
+    /// stored cursor yet. A no-op otherwise.
+    ///
+    /// Must be called *after* `upsert_subscriber`: the fence claimed there is
+    /// what makes check-then-seed safe. A worker that loses the fence in between
+    /// fails the fenced acknowledge, seeds nothing, and stops on its first
+    /// `process` pass with [`StopReason::LostOwnership`] — so it can never
+    /// replay the history it was told to skip.
+    async fn seed_latest_cursor(
+        &self,
+        executor: &E,
+        id: &Ulid,
+        aggregators: &Arc<[EventFilter]>,
+    ) -> anyhow::Result<()> {
+        if !self.start_from_latest {
+            return Ok(());
+        }
+
+        // One round trip for both facts: a stored cursor means "resume", which
+        // `start_from_latest` never overrides, and a lost fence means there is
+        // nothing to seed for.
+        let status = executor
+            .subscriber_status(self.resolved_key().to_owned(), *id)
+            .await?;
+        if !status.running || status.cursor.is_some() {
+            return Ok(());
+        }
+
+        // Bounded by the stability watermark, exactly like the reads in
+        // `process`: the seeded cursor is then a position the normal read path
+        // could itself have reached right now, so it inherits the watermark's
+        // no-skip guarantee instead of introducing a new one. Seeding to the
+        // *unbounded* head would put the cursor beyond where `process` is
+        // allowed to go, and any event committed just after start but stamped
+        // below the head would be skipped for good.
+        let stable = executor.stable_timestamp().await?;
+        // Same filters and routing key the worker will read with, so `.strict()`,
+        // `.aggregate::<A>(id)` and `.routing_key(..)` all scope the head to
+        // *this* subscription's stream. A global head could sit above a matching
+        // event and skip it.
+        let head = executor
+            .read(
+                Some(aggregators.clone()),
+                Some(self.effective_routing_key()),
+                Args::backward(1, None),
+                stable,
+            )
+            .await?;
+
+        // Nothing matches yet: cursor zero already skips nothing, so leave it
+        // unset and let the first real acknowledge write it.
+        let Some(edge) = head.edges.first() else {
+            return Ok(());
+        };
+
+        // Through `flush_ack` so the lag metric is computed the same way as for
+        // every other acknowledge.
+        let mut pending = Some((edge.cursor.clone(), edge.node.timestamp));
+        let mut since_ack = 0usize;
+        if self
+            .flush_ack(executor, id, aggregators, &mut pending, &mut since_ack)
+            .await?
+        {
+            tracing::info!(
+                key = self.resolved_key(),
+                "Subscription seeded at the stream head, history skipped"
+            );
+        } else {
+            // Another worker claimed the key between the status read and the
+            // acknowledge. It seeds (or resumes) on its own; this worker stops
+            // on its first pass.
+            tracing::debug!(
+                key = self.resolved_key(),
+                "Lost ownership before the head cursor could be stored"
+            );
+        }
+
+        Ok(())
+    }
+
     /// Disables retry-on-failure for this subscription.
     ///
     /// By default failed batches are retried with exponential backoff (see
@@ -932,10 +1104,19 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             .upsert_subscriber(self.resolved_key().to_owned(), id.to_owned())
             .await?;
 
+        // Hoisted above the spawn so `start_from_latest` can seed the cursor
+        // while the fence claimed just above is still held, and before the
+        // worker can read anything. Seeding here rather than inside the task
+        // also makes a failing probe a `start()` error instead of a worker that
+        // dies later, and makes "after `start()` returns, history will not be
+        // replayed" an observable guarantee.
+        let read_aggregators = self.read_aggregators();
+        self.seed_latest_cursor(&executor, &id, &read_aggregators)
+            .await?;
+
         let mut write_watch = executor.write_watch();
 
         let task_handle = tokio::spawn(async move {
-            let read_aggregators = self.read_aggregators();
             let start = self
                 .delay
                 .map(|d| Instant::now() + d)
@@ -1093,6 +1274,10 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             .await?;
 
         let read_aggregators = self.read_aggregators();
+
+        // Under the fence claimed just above, and before the first read.
+        self.seed_latest_cursor(executor, &id, &read_aggregators)
+            .await?;
 
         // Exclusive upper bound (µs) covering every event committed before
         // entry: `latest_timestamp` has whole-second resolution, so cover the

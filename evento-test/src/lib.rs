@@ -43,6 +43,37 @@ async fn last_routing_key<E: Executor>(
     Ok(events.first().unwrap().node.routing_key.clone())
 }
 
+/// Blocks until the stability watermark has passed every event committed so
+/// far, so a watermark-bounded read can actually see them.
+///
+/// Returns immediately on a backend without a watermark (fjall, and remote over
+/// a served fjall store), where such reads are unbounded anyway. On SQL this
+/// waits out the configured `stable_margin` (1s by default).
+async fn wait_for_stable_watermark<E: Executor>(executor: &E) -> anyhow::Result<()> {
+    use std::time::{Duration, Instant};
+
+    // `latest_timestamp` has whole-second resolution, so cover the entire
+    // latest second — the same bound `run_once` uses.
+    let target = executor
+        .latest_timestamp(None, None)
+        .await?
+        .saturating_add(1)
+        .saturating_mul(1_000_000);
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        match executor.stable_timestamp().await? {
+            None => return Ok(()),
+            Some(w) if w >= target => return Ok(()),
+            _ => {}
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("the stability watermark did not reach {target} within 15s");
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 /// Scenario: committed events fold into the expected projection state on load.
 pub async fn load<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
     let cmd = bank::Command(executor.clone());
@@ -3887,6 +3918,216 @@ mod stop_reason {
         _context: &Context<'_, E>,
         _event: Event<AccountOpened>,
     ) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// Scenario: `start_from_latest` skips history on a brand-new key only.
+///
+/// Guards issue #248. Three things must hold, each asserted without a race:
+///
+/// - **A.** nothing to seed from → the cursor stays unset, so it is never
+///   pinned to some other stream's head (which would skip this one);
+/// - **B.** a fresh key with history behind it is seeded before the worker is
+///   spawned, so that history is never delivered but live writes are;
+/// - **C.** a key that already has a cursor resumes from it — this option must
+///   not jump a restarting subscription forward.
+pub async fn subscription_start_from_latest<E: Executor + Clone>(
+    executor: &E,
+) -> anyhow::Result<()> {
+    use std::time::Duration;
+
+    // Unique keys per run: the SQL backends reuse one database per test name
+    // across `cargo test` invocations, so a fixed key would already carry a
+    // cursor from the previous run and phase B would test nothing.
+    let key_empty = format!("start-from-latest-empty-{}", Ulid::generate());
+    let key = format!("start-from-latest-{}", Ulid::generate());
+
+    let cmd = bank::Command(executor.clone());
+
+    // ---- A. nothing to seed from -------------------------------------------
+    // Scoped to an aggregate id that does not exist yet, so this holds whatever
+    // a previous run left in the store.
+    let scoped_id = Ulid::generate().to_string();
+    let seen_empty = start_from_latest::Seen::new();
+    let sub_empty = start_from_latest::subscription(&key_empty)
+        .aggregate::<BankAccount>(&scoped_id)
+        .data(seen_empty.clone())
+        .start_from_latest()
+        .no_retry()
+        .start(executor)
+        .await?;
+
+    assert!(
+        executor
+            .get_subscriber_cursor(key_empty.clone())
+            .await?
+            .is_none(),
+        "with no matching event there is no head to seed from, and cursor zero \
+         already skips nothing"
+    );
+
+    evento::append(&scoped_id)
+        .event(&bank::aggregator::AccountOpened {
+            owner_id: "owner_sfl_scoped".to_owned(),
+            owner_name: "Scoped".to_owned(),
+            account_type: AccountType::Checking,
+            currency: "USD".to_owned(),
+            initial_balance: 10,
+        })
+        .commit(executor)
+        .await?;
+
+    seen_empty
+        .wait_for(&scoped_id, Duration::from_secs(15))
+        .await?;
+    sub_empty.shutdown().await?;
+
+    // ---- B. history behind a fresh key is skipped ---------------------------
+    let old_id = cmd
+        .open_account(OpenAccount {
+            owner_id: "owner_sfl_old".to_owned(),
+            owner_name: "Old".to_owned(),
+            account_type: AccountType::Checking,
+            currency: "USD".to_owned(),
+            initial_balance: 100,
+        })
+        .await?;
+
+    // The head probe is bounded by the watermark, so the history has to be
+    // below it before the subscription starts — otherwise the probe cannot see
+    // it and the history is delivered, which is what this phase asserts
+    // against.
+    wait_for_stable_watermark(executor).await?;
+
+    let seen = start_from_latest::Seen::new();
+    let sub = start_from_latest::subscription(&key)
+        .data(seen.clone())
+        .start_from_latest()
+        .no_retry()
+        .start(executor)
+        .await?;
+
+    // `start()` seeds before it spawns the worker, so this needs no polling.
+    assert!(
+        executor.get_subscriber_cursor(key.clone()).await?.is_some(),
+        "a fresh key must be seeded at the head before the worker can read"
+    );
+
+    let live_id = cmd
+        .open_account(OpenAccount {
+            owner_id: "owner_sfl_live".to_owned(),
+            owner_name: "Live".to_owned(),
+            account_type: AccountType::Savings,
+            currency: "EUR".to_owned(),
+            initial_balance: 200,
+        })
+        .await?;
+
+    // Generous: on a watermarked backend the live event is gated for up to the
+    // stability margin before it becomes readable.
+    seen.wait_for(&live_id, Duration::from_secs(15)).await?;
+    sub.shutdown().await?;
+
+    assert_eq!(
+        seen.snapshot(),
+        vec![live_id.clone()],
+        "only the post-start event may be delivered; history must not be replayed"
+    );
+
+    // ---- C. an existing cursor wins over start_from_latest ------------------
+    let after_id = cmd
+        .open_account(OpenAccount {
+            owner_id: "owner_sfl_after".to_owned(),
+            owner_name: "After".to_owned(),
+            account_type: AccountType::Checking,
+            currency: "USD".to_owned(),
+            initial_balance: 300,
+        })
+        .await?;
+
+    // Pushed below the watermark first: an implementation that re-seeds despite
+    // the stored cursor would then treat this event as history and skip it,
+    // failing the wait below instead of passing by luck.
+    wait_for_stable_watermark(executor).await?;
+
+    let resumed_seen = start_from_latest::Seen::new();
+    let resumed = start_from_latest::subscription(&key)
+        .data(resumed_seen.clone())
+        .start_from_latest()
+        .no_retry()
+        .start(executor)
+        .await?;
+
+    resumed_seen
+        .wait_for(&after_id, Duration::from_secs(15))
+        .await?;
+    resumed.shutdown().await?;
+
+    assert!(
+        !resumed_seen.snapshot().contains(&old_id),
+        "a resume must not reach back past the seeded position either"
+    );
+
+    Ok(())
+}
+
+mod start_from_latest {
+    use std::{
+        sync::{Arc, Mutex},
+        time::{Duration, Instant},
+    };
+
+    use bank::aggregator::AccountOpened;
+    use evento::{
+        metadata::Event,
+        subscription::{Context, SubscriptionBuilder},
+        Executor,
+    };
+
+    /// Per-subscription recorder, registered with `.data(..)` and read back with
+    /// `context.extract()` so parallel scenarios never share state the way a
+    /// `static` would.
+    #[derive(Clone)]
+    pub struct Seen(Arc<Mutex<Vec<String>>>);
+
+    impl Seen {
+        pub fn new() -> Self {
+            Self(Arc::new(Mutex::new(Vec::new())))
+        }
+
+        pub fn snapshot(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+
+        /// Waits for `id` to be delivered, rather than sleeping a fixed amount:
+        /// the watermark makes delivery latency backend-dependent.
+        pub async fn wait_for(&self, id: &str, within: Duration) -> anyhow::Result<()> {
+            let deadline = Instant::now() + within;
+            loop {
+                if self.0.lock().unwrap().iter().any(|seen| seen == id) {
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    anyhow::bail!("{id} was not delivered within {within:?}");
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    }
+
+    pub fn subscription<E: Executor>(key: impl Into<String>) -> SubscriptionBuilder<E> {
+        SubscriptionBuilder::new(key).handler(record_opened())
+    }
+
+    #[evento::subscription]
+    async fn record_opened<E: Executor>(
+        context: &Context<'_, E>,
+        event: Event<AccountOpened>,
+    ) -> anyhow::Result<()> {
+        let seen: Seen = context.extract();
+        seen.0.lock().unwrap().push(event.aggregate_id.to_owned());
+
         Ok(())
     }
 }

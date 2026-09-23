@@ -393,6 +393,12 @@ async fn sqlite_subscription_stop_reason() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn sqlite_subscription_start_from_latest() -> anyhow::Result<()> {
+    let executor = create_sqlite_executor("subscription_start_from_latest").await?;
+    evento_test::subscription_start_from_latest(&executor).await
+}
+
+#[tokio::test]
 async fn sqlite_subscription_all_counts() -> anyhow::Result<()> {
     let executor = create_sqlite_executor("subscription_all_counts").await?;
     evento_test::subscription_all_counts(&executor).await

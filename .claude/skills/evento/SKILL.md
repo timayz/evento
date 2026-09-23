@@ -273,6 +273,11 @@ sub.shutdown().await?;
 
 - `.start(exec)` runs a background loop; `.run_once(exec)` drains pending events once and returns.
 - `.strict()` fails on an unhandled event; `.continue_on_error()` keeps going after a handler error.
+- `.start_from_latest()` seeds a **brand-new** key at the stream head — for live SSE /
+  WebSocket / broadcast bridges where history is meaningless. Once a cursor exists it does
+  nothing, so a restart still resumes. On a watermarked backend (`Sql`) up to the stability
+  margin of recent events still arrives: it skips history, not "everything before now".
+  Not on `ProjectionSubscription` — a read model needs its history.
 - Process **all** raw events of an aggregate (no payload deserialization) with
   `#[evento::subscription_all]` + `event: evento::metadata::RawEvent<Account>`;
   call `event.decode()?` for the typed `AccountEvent` when you want it.
