@@ -13,11 +13,9 @@ use evento_accord::{
 };
 use evento_core::{cursor::Args, Event, EventFilter, Executor};
 use evento_fjall::Fjall;
-use tempfile::TempDir;
 
 struct ShardExec {
     execs: HashMap<NodeId, AccordExecutor<Fjall>>,
-    _temps: Vec<TempDir>,
     _loops: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -30,15 +28,10 @@ impl ShardExec {
         let net = InMemoryNetwork::new();
 
         let mut execs = HashMap::new();
-        let mut temps = Vec::new();
         let mut loops = Vec::new();
 
         for id in shard_ids.iter().flatten().copied() {
-            let temp = tempfile::Builder::new()
-                .prefix("evento_accord_shard_exec")
-                .tempdir()
-                .unwrap();
-            let fjall = Fjall::open(temp.path()).unwrap();
+            let fjall = Fjall::temporary().unwrap();
 
             let inbox = net.register(id);
             let clock = Arc::new(HybridLogicalClock::new(id));
@@ -57,12 +50,10 @@ impl ShardExec {
 
             loops.push(node.start(inbox));
             execs.insert(id, AccordExecutor::new(node, fjall));
-            temps.push(temp);
         }
 
         ShardExec {
             execs,
-            _temps: temps,
             _loops: loops,
         }
     }

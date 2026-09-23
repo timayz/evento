@@ -36,7 +36,6 @@ use evento_core::cursor::Args;
 use evento_core::subscription::{Context, Handler, SubscriptionBuilder};
 use evento_core::{Event, EventFilter, Executor};
 use evento_fjall::Fjall;
-use tempfile::TempDir;
 use ulid::Ulid;
 
 /// Records the `aggregate_id` of every event the subscription handles, in order.
@@ -86,7 +85,6 @@ fn opened(aggregate_id: &str) -> Event {
 struct Cluster {
     execs: Vec<AccordExecutor<Fjall>>,
     net: Arc<InMemoryNetwork>,
-    _temps: Vec<TempDir>,
     _loops: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -95,15 +93,10 @@ impl Cluster {
         let ids: Vec<NodeId> = (0..n).map(NodeId).collect();
         let net = InMemoryNetwork::new();
         let mut execs = Vec::new();
-        let mut temps = Vec::new();
         let mut loops = Vec::new();
 
         for &id in &ids {
-            let temp = tempfile::Builder::new()
-                .prefix("evento_accord_skip")
-                .tempdir()
-                .unwrap();
-            let fjall = Fjall::open(temp.path()).unwrap();
+            let fjall = Fjall::temporary().unwrap();
 
             let inbox = net.register(id);
             let clock = Arc::new(HybridLogicalClock::new(id));
@@ -121,13 +114,11 @@ impl Cluster {
 
             loops.push(node.start(inbox));
             execs.push(AccordExecutor::new(node, fjall));
-            temps.push(temp);
         }
 
         Cluster {
             execs,
             net,
-            _temps: temps,
             _loops: loops,
         }
     }

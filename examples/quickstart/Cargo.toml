@@ -13,4 +13,3 @@ anyhow.workspace = true
 tracing-subscriber.workspace = true
 bitcode.workspace = true
 tokio.workspace = true
-tempfile = "3.27"

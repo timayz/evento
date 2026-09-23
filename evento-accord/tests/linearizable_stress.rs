@@ -24,22 +24,15 @@ use evento_fjall::Fjall;
 use tokio::time::Instant;
 use ulid::Ulid;
 
-type Cluster = (
-    Vec<AccordExecutor<Fjall>>,
-    Vec<Fjall>,
-    Arc<InMemoryNetwork>,
-    Vec<tempfile::TempDir>,
-);
+type Cluster = (Vec<AccordExecutor<Fjall>>, Vec<Fjall>, Arc<InMemoryNetwork>);
 
 fn cluster(n: u64) -> Cluster {
     let ids: Vec<NodeId> = (0..n).map(NodeId).collect();
     let net = InMemoryNetwork::new();
     let mut execs = Vec::new();
     let mut backends = Vec::new();
-    let mut temps = Vec::new();
     for &id in &ids {
-        let temp = tempfile::Builder::new().prefix("lin").tempdir().unwrap();
-        let fjall = Fjall::open(temp.path()).unwrap();
+        let fjall = Fjall::temporary().unwrap();
         let inbox = net.register(id);
         let clock = Arc::new(HybridLogicalClock::new(id));
         let sink: Arc<dyn MessageSink> = Arc::new(net.sink(id));
@@ -58,9 +51,8 @@ fn cluster(n: u64) -> Cluster {
         node.start_recovery();
         execs.push(AccordExecutor::new(node, fjall.clone()));
         backends.push(fjall);
-        temps.push(temp);
     }
-    (execs, backends, net, temps)
+    (execs, backends, net)
 }
 
 /// Reads a key's value count directly from a node's local backend — bypassing the
@@ -128,7 +120,7 @@ async fn linearizable_reads_hold_under_contention_and_churn() {
     const READERS: usize = 8;
     const OPS: usize = 80;
 
-    let (execs, backends, net, _temps) = cluster(5);
+    let (execs, backends, net) = cluster(5);
     let execs = Arc::new(execs);
     let value = Arc::new(AtomicU64::new(1));
     // value -> (key index, time the writing op started). A committed value's write
