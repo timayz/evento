@@ -135,7 +135,7 @@ impl Cluster {
     async fn count(&self, node: usize, aggregate_id: &str) -> usize {
         self.execs[node]
             .read(
-                Some([EventFilter::by_id("test/Account", aggregate_id)].into()),
+                Some([EventFilter::by_id_raw("test/Account", aggregate_id)].into()),
                 None,
                 Args::forward(50, None),
                 None,

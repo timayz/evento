@@ -33,7 +33,7 @@ async fn last_routing_key<E: Executor>(
 ) -> anyhow::Result<Option<String>> {
     let events = executor
         .read(
-            Some([EventFilter::by_id(BankAccount::aggregate_type(), id)].into()),
+            Some([EventFilter::by_id::<BankAccount>(id)].into()),
             None,
             Args::backward(1, None),
             None,
@@ -2070,7 +2070,7 @@ pub async fn read_order_timestamp<E: Executor + Clone>(executor: &E) -> anyhow::
 
     let ids = |r: &ReadResult<Event>| r.edges.iter().map(|e| e.node.id).collect::<Vec<_>>();
     let read = |args| {
-        let f = EventFilter::by_type(agg_type);
+        let f = EventFilter::by_type_raw(agg_type);
         async move { executor.read(Some([f].into()), None, args, None).await }
     };
 
@@ -2122,7 +2122,7 @@ pub async fn write_restamps_client_clock<E: Executor + Clone>(executor: &E) -> a
 
     let restamped = executor
         .read(
-            Some([EventFilter::by_id(agg_type, "restamped")].into()),
+            Some([EventFilter::by_id_raw(agg_type, "restamped")].into()),
             None,
             Args::forward(1, None),
             None,
@@ -2136,7 +2136,7 @@ pub async fn write_restamps_client_clock<E: Executor + Clone>(executor: &E) -> a
 
     let verbatim = executor
         .read(
-            Some([EventFilter::by_id(agg_type, "verbatim")].into()),
+            Some([EventFilter::by_id_raw(agg_type, "verbatim")].into()),
             None,
             Args::forward(1, None),
             None,
@@ -2148,9 +2148,9 @@ pub async fn write_restamps_client_clock<E: Executor + Clone>(executor: &E) -> a
     Ok(())
 }
 
-/// `EventFilter::exact(type, id, name)` must return only events of that exact name
+/// `EventFilter::exact_raw(type, id, name)` must return only events of that exact name
 /// for the given aggregate. This exercises Fjall's `agg_name_index` fast path.
-/// Scenario: `EventFilter::exact` matches a single aggregate/event pair only.
+/// Scenario: `EventFilter::exact_raw` matches a single aggregate/event pair only.
 pub async fn exact_filter<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
     let agg_type = "evento/FilterTest";
     let id = Ulid::generate().to_string();
@@ -2172,7 +2172,7 @@ pub async fn exact_filter<E: Executor + Clone>(executor: &E) -> anyhow::Result<(
 
     let alpha = executor
         .read(
-            Some([EventFilter::exact(agg_type, &id, "Alpha")].into()),
+            Some([EventFilter::exact_raw(agg_type, &id, "Alpha")].into()),
             None,
             Args::forward(10, None),
             None,
@@ -2187,7 +2187,7 @@ pub async fn exact_filter<E: Executor + Clone>(executor: &E) -> anyhow::Result<(
 
     let beta = executor
         .read(
-            Some([EventFilter::exact(agg_type, &id, "Beta")].into()),
+            Some([EventFilter::exact_raw(agg_type, &id, "Beta")].into()),
             None,
             Args::forward(10, None),
             None,
@@ -2766,7 +2766,7 @@ pub async fn upcast_skip<E: Executor + Clone>(executor: &E) -> anyhow::Result<()
     // Bytes of another shape under the old name: converting them would fail.
     let mut broken = executor
         .read(
-            Some([EventFilter::by_id(upcast::Refund::aggregate_type(), &id)].into()),
+            Some([EventFilter::by_id::<upcast::Refund>(&id)].into()),
             None,
             Args::forward(1, None),
             None,
@@ -3379,4 +3379,308 @@ pub fn get_data() -> Vec<Event> {
     }
 
     data
+}
+
+/// Commits a stream of `count` deposits after an opening event, returning its id.
+async fn seed_stream<E: Executor>(executor: &E, count: usize) -> anyhow::Result<String> {
+    let id = evento::create()
+        .event(&bank::aggregator::AccountOpened {
+            owner_id: "owner-1".to_owned(),
+            owner_name: "Alice".to_owned(),
+            account_type: AccountType::Checking,
+            currency: "EUR".to_owned(),
+            initial_balance: 0,
+        })
+        .commit(executor)
+        .await?;
+
+    for i in 0..count {
+        evento::append(&id)
+            .original_version((i + 1) as u16)
+            .event(&MoneyDeposited {
+                amount: i as i64 + 1,
+                transaction_id: format!("tx-{i}"),
+                description: format!("deposit {i}"),
+            })
+            .commit(executor)
+            .await?;
+    }
+
+    Ok(id)
+}
+
+/// `evento::read::<A>(id)` must return the aggregate's whole stream, and an
+/// empty `Vec` — not an error — for an id that was never written.
+///
+/// Scenario: the reader returns every event of one aggregate instance.
+pub async fn read_stream<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
+    let id = seed_stream(executor, 3).await?;
+
+    let events = evento::read::<BankAccount>(&id).execute(executor).await?;
+    assert_eq!(events.len(), 4, "opening event plus three deposits");
+    assert_eq!(
+        events.iter().map(|e| e.version).collect::<Vec<_>>(),
+        vec![1, 2, 3, 4],
+        "a single stream must come back in version order"
+    );
+    assert_eq!(events[0].name, "AccountOpened");
+    assert!(
+        events.iter().all(|e| e.aggregate_id == id),
+        "the reader must not leak events of other instances"
+    );
+
+    let missing = evento::read::<BankAccount>("does-not-exist")
+        .execute(executor)
+        .await?;
+    assert!(
+        missing.is_empty(),
+        "an unknown aggregate is an empty stream, not an error"
+    );
+
+    // Narrowing to one event type keeps only that name.
+    let deposits = evento::read::<BankAccount>(&id)
+        .event::<MoneyDeposited>()
+        .execute(executor)
+        .await?;
+    assert_eq!(deposits.len(), 3);
+    assert!(deposits.iter().all(|e| e.name == "MoneyDeposited"));
+
+    Ok(())
+}
+
+/// `execute()` must page through the whole stream, not stop at one page — the
+/// regression guard for the internal drain loop (page size 100).
+///
+/// Scenario: the reader drains past its internal page size.
+pub async fn read_drains_pages<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
+    // 1 opening event + 249 deposits = 250, comfortably over two pages of 100.
+    let id = seed_stream(executor, 249).await?;
+
+    let events = evento::read::<BankAccount>(&id).execute(executor).await?;
+    assert_eq!(
+        events.len(),
+        250,
+        "execute() must drain every page, not return only the first"
+    );
+
+    let versions = events.iter().map(|e| e.version).collect::<Vec<_>>();
+    assert_eq!(
+        versions,
+        (1..=250).collect::<Vec<u16>>(),
+        "draining must neither drop nor duplicate an event across page boundaries"
+    );
+
+    Ok(())
+}
+
+/// `limit(n)` caps the total number of events returned across all pages, and is
+/// a no-op when it exceeds the stream length.
+///
+/// Scenario: `limit` bounds the total, not the page size.
+pub async fn read_limit<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
+    let id = seed_stream(executor, 4).await?;
+
+    let capped = evento::read::<BankAccount>(&id)
+        .limit(3)
+        .execute(executor)
+        .await?;
+    assert_eq!(capped.len(), 3, "limit must cap the total");
+    assert_eq!(
+        capped.iter().map(|e| e.version).collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+
+    let over = evento::read::<BankAccount>(&id)
+        .limit(500)
+        .execute(executor)
+        .await?;
+    assert_eq!(
+        over.len(),
+        5,
+        "a limit above the stream length returns it all"
+    );
+
+    // A limit larger than one internal page still caps correctly.
+    let long = seed_stream(executor, 149).await?;
+    let partial = evento::read::<BankAccount>(&long)
+        .limit(120)
+        .execute(executor)
+        .await?;
+    assert_eq!(partial.len(), 120, "limit must cap across page boundaries");
+
+    // `backward()` takes the tail of the stream, still oldest-first (GraphQL
+    // `last:` semantics).
+    let newest = evento::read::<BankAccount>(&id)
+        .backward()
+        .limit(2)
+        .execute(executor)
+        .await?;
+    assert_eq!(
+        newest.iter().map(|e| e.version).collect::<Vec<_>>(),
+        vec![4, 5],
+        "backward() must take the last events, in chronological order"
+    );
+
+    // Draining backward across several pages must stitch them back in order,
+    // not emit page-sized blocks out of sequence.
+    let tail = evento::read::<BankAccount>(&long)
+        .backward()
+        .limit(150)
+        .execute(executor)
+        .await?;
+    assert_eq!(tail.len(), 150);
+    assert_eq!(
+        tail.iter().map(|e| e.version).collect::<Vec<_>>(),
+        (1..=150).collect::<Vec<u16>>(),
+        "a multi-page backward drain must stay chronological"
+    );
+
+    Ok(())
+}
+
+/// `page()` exposes the raw cursor surface: one page plus the `page_info` needed
+/// to fetch the next, and `after(..)` must resume exactly where it left off.
+///
+/// Scenario: `page`/`after` paginate without gaps or duplicates.
+pub async fn read_page_cursor<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
+    let id = seed_stream(executor, 4).await?;
+
+    let first = evento::read::<BankAccount>(&id)
+        .limit(2)
+        .page(executor)
+        .await?;
+    assert_eq!(first.edges.len(), 2, "limit is the page size for page()");
+    assert!(first.page_info.has_next_page, "two of five events remain");
+
+    let cursor = first
+        .page_info
+        .end_cursor
+        .clone()
+        .expect("a non-empty page must carry an end cursor");
+
+    let second = evento::read::<BankAccount>(&id)
+        .limit(2)
+        .after(cursor.clone())
+        .page(executor)
+        .await?;
+    assert_eq!(
+        second
+            .edges
+            .iter()
+            .map(|e| e.node.version)
+            .collect::<Vec<_>>(),
+        vec![3, 4],
+        "after(end_cursor) must resume with no gap and no repeat"
+    );
+
+    // The same cursor also seeds a drain of the remainder.
+    let rest = evento::read::<BankAccount>(&id)
+        .after(cursor)
+        .execute(executor)
+        .await?;
+    assert_eq!(
+        rest.iter().map(|e| e.version).collect::<Vec<_>>(),
+        vec![3, 4, 5],
+        "execute() must honour a starting cursor"
+    );
+
+    Ok(())
+}
+
+/// `decode()` must yield the generated events enum, in stream order.
+///
+/// Scenario: the reader decodes into `{Enum}Event`.
+pub async fn read_decode<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
+    use bank::aggregator::BankAccountEvent;
+
+    let id = seed_stream(executor, 2).await?;
+
+    let events = evento::read::<BankAccount>(&id).decode(executor).await?;
+    assert_eq!(events.len(), 3);
+
+    assert!(
+        matches!(events[0], BankAccountEvent::AccountOpened(_)),
+        "first event must decode to the opening variant"
+    );
+
+    let amounts = events
+        .iter()
+        .filter_map(|e| match e {
+            BankAccountEvent::MoneyDeposited(d) => Some(d.amount),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(amounts, vec![1, 2], "payloads must decode in stream order");
+
+    Ok(())
+}
+
+/// The reader's routing-key default is the inverse of a subscription's: with no
+/// filter it reads **every** routing key, and `routing_key(..)` narrows it.
+///
+/// Scenario: routing keys filter the reader only when asked.
+pub async fn read_routing_key<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
+    let open = |owner: &str| bank::aggregator::AccountOpened {
+        owner_id: owner.to_owned(),
+        owner_name: owner.to_owned(),
+        account_type: AccountType::Checking,
+        currency: "EUR".to_owned(),
+        initial_balance: 0,
+    };
+
+    let eu = evento::create()
+        .routing_key("read-eu")
+        .event(&open("eu"))
+        .commit(executor)
+        .await?;
+    let us = evento::create()
+        .routing_key("read-us")
+        .event(&open("us"))
+        .commit(executor)
+        .await?;
+
+    // Unset: every routing key is visible.
+    assert_eq!(
+        evento::read::<BankAccount>(&eu)
+            .execute(executor)
+            .await?
+            .len(),
+        1
+    );
+    assert_eq!(
+        evento::read::<BankAccount>(&us)
+            .execute(executor)
+            .await?
+            .len(),
+        1
+    );
+
+    // Narrowed: the stream is invisible under the wrong key.
+    assert_eq!(
+        evento::read::<BankAccount>(&eu)
+            .routing_key("read-eu")
+            .execute(executor)
+            .await?
+            .len(),
+        1,
+        "the matching routing key must return the stream"
+    );
+    assert!(
+        evento::read::<BankAccount>(&eu)
+            .routing_key("read-us")
+            .execute(executor)
+            .await?
+            .is_empty(),
+        "a non-matching routing key must exclude the stream"
+    );
+    assert!(
+        evento::read::<BankAccount>(&eu)
+            .no_routing_key()
+            .execute(executor)
+            .await?
+            .is_empty(),
+        "no_routing_key() must match only events committed without a key"
+    );
+
+    Ok(())
 }

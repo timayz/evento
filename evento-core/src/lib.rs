@@ -133,12 +133,13 @@
 //! - [`cursor`] - Cursor-based pagination types and traits
 //! - [`metadata`] - Standard event metadata types
 //! - [`projection`](mod@projection) - Projections for loading aggregate state
+//! - [`read`] - Reading an aggregate's events directly
 //! - [`subscription`](mod@subscription) - Continuous event processing with subscriptions
 //!
 //! # Example
 //!
 //! ```rust,no_run
-//! use evento::{cursor::Args, Aggregate, EventFilter, Executor};
+//! use evento::Executor;
 //!
 //! # #[evento::aggregate]
 //! # pub enum BankAccount {
@@ -151,15 +152,8 @@
 //!     .commit(executor)
 //!     .await?;
 //!
-//! // Query events with pagination
-//! let events = executor
-//!     .read(
-//!         Some([EventFilter::by_id(BankAccount::aggregate_type(), &id)].into()),
-//!         None,
-//!         Args::forward(10, None),
-//!         None,
-//!     )
-//!     .await?;
+//! // Read the stream back
+//! let events = evento::read::<BankAccount>(&id).execute(executor).await?;
 //! # Ok(())
 //! # }
 //! ```
@@ -170,6 +164,7 @@ pub mod cursor;
 mod executor;
 pub mod metadata;
 pub mod projection;
+mod reader;
 pub mod subscription;
 mod upcast;
 
@@ -178,6 +173,7 @@ pub use evento_macro::*;
 
 pub use aggregator::*;
 pub use executor::*;
+pub use reader::*;
 pub use subscription::RoutingKey;
 
 use std::fmt::Debug;

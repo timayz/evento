@@ -236,6 +236,42 @@ async fn remote_upcast_has_event() -> anyhow::Result<()> {
     evento_test::upcast_has_event(&server.client).await
 }
 
+#[tokio::test]
+async fn remote_read_stream() -> anyhow::Result<()> {
+    let server = setup("read_stream").await?;
+    evento_test::read_stream(&server.client).await
+}
+
+#[tokio::test]
+async fn remote_read_drains_pages() -> anyhow::Result<()> {
+    let server = setup("read_drains_pages").await?;
+    evento_test::read_drains_pages(&server.client).await
+}
+
+#[tokio::test]
+async fn remote_read_limit() -> anyhow::Result<()> {
+    let server = setup("read_limit").await?;
+    evento_test::read_limit(&server.client).await
+}
+
+#[tokio::test]
+async fn remote_read_page_cursor() -> anyhow::Result<()> {
+    let server = setup("read_page_cursor").await?;
+    evento_test::read_page_cursor(&server.client).await
+}
+
+#[tokio::test]
+async fn remote_read_decode() -> anyhow::Result<()> {
+    let server = setup("read_decode").await?;
+    evento_test::read_decode(&server.client).await
+}
+
+#[tokio::test]
+async fn remote_read_routing_key() -> anyhow::Result<()> {
+    let server = setup("read_routing_key").await?;
+    evento_test::read_routing_key(&server.client).await
+}
+
 /// After shutdown the server no longer answers; a request fails cleanly (with
 /// the client's request timeout as the upper bound) instead of hanging.
 #[tokio::test]
@@ -347,7 +383,7 @@ async fn pooled_concurrent_requests() -> anyhow::Result<()> {
         let page = server
             .client
             .read(
-                Some([evento_core::EventFilter::by_type("remote/Concurrent")].into()),
+                Some([evento_core::EventFilter::by_type_raw("remote/Concurrent")].into()),
                 None,
                 PoolArgs::forward(50, after),
                 None,

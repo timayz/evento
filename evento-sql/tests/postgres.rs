@@ -255,3 +255,39 @@ async fn postgres_upcast_has_event() -> anyhow::Result<()> {
     let executor = create_postgres_executor("upcast_has_event").await?;
     evento_test::upcast_has_event(&executor).await
 }
+
+#[tokio::test]
+async fn postgres_read_stream() -> anyhow::Result<()> {
+    let executor = create_postgres_executor("read_stream").await?;
+    evento_test::read_stream(&executor).await
+}
+
+#[tokio::test]
+async fn postgres_read_drains_pages() -> anyhow::Result<()> {
+    let executor = create_postgres_executor("read_drains_pages").await?;
+    evento_test::read_drains_pages(&executor).await
+}
+
+#[tokio::test]
+async fn postgres_read_limit() -> anyhow::Result<()> {
+    let executor = create_postgres_executor("read_limit").await?;
+    evento_test::read_limit(&executor).await
+}
+
+#[tokio::test]
+async fn postgres_read_page_cursor() -> anyhow::Result<()> {
+    let executor = create_postgres_executor("read_page_cursor").await?;
+    evento_test::read_page_cursor(&executor).await
+}
+
+#[tokio::test]
+async fn postgres_read_decode() -> anyhow::Result<()> {
+    let executor = create_postgres_executor("read_decode").await?;
+    evento_test::read_decode(&executor).await
+}
+
+#[tokio::test]
+async fn postgres_read_routing_key() -> anyhow::Result<()> {
+    let executor = create_postgres_executor("read_routing_key").await?;
+    evento_test::read_routing_key(&executor).await
+}

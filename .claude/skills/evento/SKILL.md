@@ -273,24 +273,44 @@ sub.shutdown().await?;
 
 ## 5. Reading events directly
 
-```rust
-use evento::{EventFilter, cursor::Args};
+`evento::read::<A>(id)` is the read-side counterpart of `Projection::load` — use it
+when you want the events themselves (SSE, webhooks, outbox rows, audit logs).
 
-let page = executor.read(
-    Some([EventFilter::by_id("mycrate/Account", &id)].into()),  // by_type / by_event / exact
-    None,                                                       // routing key filter
-    Args::forward(50, None),                                    // cursor pagination
-    None,                                                       // exclusive timestamp bound (µs)
-).await?;
+```rust
+// Whole stream, oldest first; pages are drained internally.
+let events: Vec<evento::Event> = evento::read::<Account>(&id).execute(&executor).await?;
+
+// Typed: exhaustive match, a new variant is a compile error.
+for event in evento::read::<Account>(&id).decode(&executor).await? {
+    match event {
+        AccountEvent::MoneyDeposited(d) => sse.send(d.amount),
+        _ => {}
+    }
+}
 ```
 
-`EventFilter`: `by_type(type)`, `by_id(type, id)`, `by_event(type, name)`,
-`exact(type, id, name)`. The ext trait `AggregateExt` adds
-`executor.has_event::<Ev>(id)` and `executor.original_version::<Ev>(id)`.
+`ReadBuilder`: `.event::<Ev>()` (one event type), `.routing_key(k)` /
+`.no_routing_key()`, `.limit(n)`, `.after(cursor)` / `.before(cursor)`,
+`.backward()`, `.args(Args)`, then a terminal `.execute()` → `Vec<Event>`,
+`.decode()` → `Vec<{Enum}Event>`, or `.page()` → `ReadResult<Event>` (one page +
+`page_info` for cursor-driven callers). `evento::read_raw(type, id)` takes the
+aggregate type as a string; it has no `.decode()`.
+
+- **`.limit(n)` is a total, not a page size** — `.execute()` never silently truncates.
+- **`.backward()` takes the tail** of the stream (GraphQL `last:`); events still come
+  back oldest-first.
+- Drop to `executor.read(filters, routing_key, args, to_micros)` only for queries
+  spanning several aggregates. `EventFilter` constructors are typed —
+  `by_type::<A>()`, `by_id::<A>(id)`, `by_event::<Ev>()`, `exact::<Ev>(id)` — each with
+  a `*_raw` string form (`by_id_raw(type, id)`, …) for runtime types.
+- The ext trait `AggregateExt` adds `executor.has_event::<Ev>(id)` and
+  `executor.original_version::<Ev>(id)`.
 
 ## Gotchas
 
-- **Routing keys scope subscriptions.** A subscription with no `.routing_key()`/`.all()`
+- **Readers and subscriptions default routing keys oppositely.** `evento::read(..)` with
+  no `.routing_key()` reads **every** routing key; narrow it with `.no_routing_key()`.
+  A subscription with no `.routing_key()`/`.all()`
   only sees events whose routing key is NULL. `.all()` subscriptions are stored per
   executor-default-routing-key, so multi-tenant setups stay isolated.
 - **The subscription key is the cursor identity.** Reusing a key across two different

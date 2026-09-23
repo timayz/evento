@@ -461,9 +461,9 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                     },
                     _ => {
                         if by_name {
-                            EventFilter::by_event(aggregate_type, event_name)
+                            EventFilter::by_event_raw(aggregate_type, event_name)
                         } else {
-                            EventFilter::by_type(aggregate_type)
+                            EventFilter::by_type_raw(aggregate_type)
                         }
                     }
                 }

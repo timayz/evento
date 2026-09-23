@@ -70,7 +70,7 @@ impl ShardExec {
     async fn read_all(&self, node: u64, id: &str) -> Vec<Event> {
         let result = self.execs[&NodeId(node)]
             .read(
-                Some([EventFilter::by_id("test/Account", id)].into()),
+                Some([EventFilter::by_id_raw("test/Account", id)].into()),
                 None,
                 Args::forward(50, None),
                 None,
