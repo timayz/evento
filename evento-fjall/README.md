@@ -18,7 +18,11 @@ Opening a store is one line — no pool, no migrations:
 # fn run() -> anyhow::Result<()> {
 let executor = evento_fjall::Fjall::open("./data")?;
 // via the facade: evento::Fjall::open("./data")?
-# let _ = executor;
+
+// For tests, examples and experiments: a temp directory the executor owns and
+// removes when its last clone drops.
+let ephemeral = evento_fjall::Fjall::temporary()?;
+# let _ = (executor, ephemeral);
 # Ok(())
 # }
 ```

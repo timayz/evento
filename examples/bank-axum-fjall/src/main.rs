@@ -50,14 +50,11 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    // Open a Fjall-backed event store. A temp directory keeps each run
-    // self-contained; swap for a persistent path to keep data across runs.
-    let dir = tempfile::Builder::new()
-        .prefix("bank-axum-fjall-")
-        .tempdir()?;
-    println!("Fjall store: {}", dir.path().display());
-
-    let executor: Executor = Fjall::open(dir.path())?;
+    // An ephemeral Fjall store: a temp directory owned by the executor and
+    // removed once the last clone of it drops, so each run starts clean. Swap
+    // for `Fjall::open("./data")` to keep data across runs.
+    let executor: Executor = Fjall::temporary()?;
+    println!("Fjall store: temporary (removed on exit)");
 
     // Keep the in-memory read model (`AccountDetailsView::snapshot_rows()`)
     // current, so `/accounts` lists every account. Fjall's in-process write
@@ -102,9 +99,6 @@ async fn main() -> anyhow::Result<()> {
     }
 
     subscription.shutdown().await?;
-
-    // Keep the temp directory alive until the server shuts down.
-    drop(dir);
 
     Ok(())
 }

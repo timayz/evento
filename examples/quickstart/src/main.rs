@@ -109,10 +109,10 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    // An embedded Fjall store in a temp directory — swap for a persistent path
-    // (or a SQL pool, or a remote client) without touching the code above.
-    let dir = tempfile::tempdir()?;
-    let executor = evento::Fjall::open(dir.path())?;
+    // An embedded Fjall store in a temp directory the executor owns and removes
+    // on drop — swap for `Fjall::open(path)` (or a SQL pool, or a remote client)
+    // without touching the code above.
+    let executor = evento::Fjall::temporary()?;
 
     // Write: start a new aggregate…
     let id = evento::create()

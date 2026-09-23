@@ -226,6 +226,14 @@ pub struct Fjall {
     /// wake immediately instead of waiting for their next poll tick. Carries a
     /// monotonically increasing write generation.
     write_tx: tokio::sync::watch::Sender<u64>,
+    /// Owns the directory of a [`temporary`](Self::temporary) store, so it is
+    /// removed once the last clone of this executor is gone (`None` for a store
+    /// opened at a caller-chosen path).
+    ///
+    /// Declared last on purpose: struct fields drop in declaration order, so
+    /// every field above — the database and its keyspace handles — is released
+    /// before the directory tree disappears underneath them.
+    temp_dir: Option<Arc<tempfile::TempDir>>,
 }
 
 /// `meta` keyspace key holding the monotonic commit clock (millis, BE u64).
@@ -286,6 +294,8 @@ impl Clone for Fjall {
             // `watch::Sender` clones share the same channel, so all clones of
             // this executor notify the same subscription receivers on write.
             write_tx: self.write_tx.clone(),
+            // Shared: a temporary store's directory outlives every clone.
+            temp_dir: self.temp_dir.clone(),
         }
     }
 }
@@ -302,6 +312,41 @@ impl Fjall {
     pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let db = Database::builder(path).open()?;
         Self::from_database(db)
+    }
+
+    /// Opens a store in a fresh temporary directory, removed when the last
+    /// clone of the returned executor is dropped.
+    ///
+    /// For tests, examples and experiments: no path to pick, nothing to
+    /// gitignore, nothing to delete between runs. The directory is created
+    /// under the OS temp directory; use [`open`](Self::open) for a store that
+    /// outlives the process.
+    ///
+    /// Cleanup is tied to the executor, not to a binding the caller has to keep
+    /// alive — clones share the directory, so it survives until every one of
+    /// them is gone. A [`Database`] handle cloned out via
+    /// [`database`](Self::database) is the one exception: it is not counted, so
+    /// it must not outlive the executor it came from.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the temporary directory cannot be created, or if the
+    /// database cannot be opened inside it.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn run() -> anyhow::Result<()> {
+    /// let executor = evento_fjall::Fjall::temporary()?;
+    /// # let _ = executor;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn temporary() -> anyhow::Result<Self> {
+        let dir = tempfile::Builder::new().prefix("evento-fjall-").tempdir()?;
+        let mut executor = Self::open(dir.path())?;
+        executor.temp_dir = Some(Arc::new(dir));
+        Ok(executor)
     }
 
     /// Creates an executor from an existing database.
@@ -389,6 +434,7 @@ impl Fjall {
             last_stamp: Arc::new(std::sync::atomic::AtomicU64::new(last_stamp)),
             write_persist_mode: PersistMode::SyncAll,
             write_tx: tokio::sync::watch::channel(0).0,
+            temp_dir: None,
             db,
         };
 
@@ -1363,10 +1409,67 @@ mod tests {
         }
     }
 
+    /// The directory a `temporary()` store lives in belongs to the executor, not
+    /// to a binding the caller has to keep alive: it survives as long as any
+    /// clone does, and disappears with the last one.
+    #[tokio::test]
+    async fn test_temporary_directory_dies_with_the_last_clone() {
+        let executor = Fjall::temporary().unwrap();
+        let path = executor.temp_dir.as_ref().unwrap().path().to_path_buf();
+        assert!(path.exists(), "temporary() must create its directory");
+
+        executor
+            .write(vec![create_test_event("agg-1", 1, "Created")])
+            .await
+            .unwrap();
+
+        let clone = executor.clone();
+        drop(executor);
+        assert!(
+            path.exists(),
+            "directory must outlive a dropped clone while another is alive"
+        );
+
+        drop(clone);
+        assert!(
+            !path.exists(),
+            "directory must be removed once the last clone drops"
+        );
+    }
+
+    /// Two temporary stores are genuinely separate, so tests using them cannot
+    /// leak state into one another.
+    #[tokio::test]
+    async fn test_temporary_stores_are_isolated() {
+        let first = Fjall::temporary().unwrap();
+        let second = Fjall::temporary().unwrap();
+
+        first
+            .write(vec![create_test_event("agg-1", 1, "Created")])
+            .await
+            .unwrap();
+
+        async fn count(executor: &Fjall) -> usize {
+            executor
+                .read(
+                    Some([EventFilter::by_id_raw("test/Account", "agg-1")].into()),
+                    None,
+                    Args::forward(10, None),
+                    None,
+                )
+                .await
+                .unwrap()
+                .edges
+                .len()
+        }
+
+        assert_eq!(count(&first).await, 1);
+        assert_eq!(count(&second).await, 0);
+    }
+
     #[tokio::test]
     async fn test_write_and_read_events() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let executor = Fjall::open(temp_dir.path()).unwrap();
+        let executor = Fjall::temporary().unwrap();
 
         let event1 = create_test_event("agg-1", 1, "Created");
         let event2 = create_test_event("agg-1", 2, "Updated");
@@ -1393,8 +1496,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_version_conflict() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let executor = Fjall::open(temp_dir.path()).unwrap();
+        let executor = Fjall::temporary().unwrap();
 
         let event1 = create_test_event("agg-1", 1, "Created");
         executor.write(vec![event1]).await.unwrap();
@@ -1408,8 +1510,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_subscriber_lifecycle() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let executor = Fjall::open(temp_dir.path()).unwrap();
+        let executor = Fjall::temporary().unwrap();
 
         let worker_id = Ulid::generate();
         let key = "test-subscriber".to_string();
@@ -1470,8 +1571,7 @@ mod tests {
     /// aggregate's prefix scans or version lookup.
     #[tokio::test]
     async fn test_key_isolation_with_hostile_ids() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let executor = Fjall::open(temp_dir.path()).unwrap();
+        let executor = Fjall::temporary().unwrap();
 
         // "a" and "a\0x" collided under the NUL-separator scheme: the prefix
         // for ("test/Account", "a") was a byte-prefix of ("test/Account", "a\0x").
@@ -1549,8 +1649,7 @@ mod tests {
     /// caller's timestamps verbatim.
     #[tokio::test]
     async fn test_write_restamps_and_replicate_preserves() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let executor = Fjall::open(temp_dir.path()).unwrap();
+        let executor = Fjall::temporary().unwrap();
 
         let mut stale = create_test_event("agg-restamp", 1, "Created");
         stale.timestamp = 42; // long in the past
@@ -1591,8 +1690,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_snapshot_lifecycle() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let executor = Fjall::open(temp_dir.path()).unwrap();
+        let executor = Fjall::temporary().unwrap();
 
         let aggregate_type = "test/Account".to_string();
         let projection = "test::AccountView".to_string();
@@ -1849,8 +1947,7 @@ mod tests {
     /// the index scan — probe the off-by-one edges in both directions.
     #[tokio::test]
     async fn test_to_micros_watermark_milli_boundary() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let executor = Fjall::open(temp_dir.path()).unwrap();
+        let executor = Fjall::temporary().unwrap();
 
         // Event stamp: 100 s + 500 ms = 100_500_000 µs.
         executor
@@ -1894,8 +1991,7 @@ mod tests {
     /// other and from the null range.
     #[tokio::test]
     async fn test_routing_ranges_page_and_stay_isolated() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let executor = Fjall::open(temp_dir.path()).unwrap();
+        let executor = Fjall::temporary().unwrap();
 
         for (agg, stamp, routing) in [
             ("agg-1", 10, None),
@@ -1960,8 +2056,7 @@ mod tests {
     /// keep scanning past non-matching entries until the page fills.
     #[tokio::test]
     async fn test_sparse_routing_match_continues_past_limit() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let executor = Fjall::open(temp_dir.path()).unwrap();
+        let executor = Fjall::temporary().unwrap();
 
         // Versions 1-5 are "cold"; only versions 6-8 match "hot".
         for version in 1u16..=8 {

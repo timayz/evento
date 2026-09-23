@@ -20,7 +20,7 @@ One `Executor` trait, many backends:
 | Backend | Feature | Crate | Notes |
 |---------|---------|-------|-------|
 | SQLite / PostgreSQL / MySQL | `sqlite` / `postgres` / `mysql` | [evento-sql](evento-sql) | via sqlx, with [built-in migrations](evento-sql-migrator) |
-| Fjall (embedded LSM-tree) | `fjall` | [evento-fjall](evento-fjall) | no external server |
+| Fjall (embedded LSM-tree) | `fjall` | [evento-fjall](evento-fjall) | no external server; `Fjall::temporary()` for tests |
 | Remote (client/server TCP) | `remote` | [evento-remote](evento-remote) | serve any executor over framed TCP |
 | Accord (consensus, alpha) | — | [evento-accord](evento-accord) | leaderless replicated store, strictly serializable ([design](evento-accord/DESIGN.md)) |
 
@@ -509,7 +509,11 @@ aggregates.
 ```rust,no_run
 # fn run() -> anyhow::Result<()> {
 let executor = evento::Fjall::open("./data")?;
-# let _ = executor;
+
+// Tests, examples, experiments: a temp directory the executor owns and removes
+// when its last clone drops — no path to pick, nothing to clean up.
+let ephemeral = evento::Fjall::temporary()?;
+# let _ = (executor, ephemeral);
 # Ok(())
 # }
 ```

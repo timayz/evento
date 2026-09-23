@@ -48,6 +48,9 @@ let executor: evento::Sqlite = pool.into();   // also: evento::Postgres / evento
 
 ```rust
 let executor = evento::Fjall::open("./events.db")?;
+
+// Tests/examples: a temp store, removed when the last clone of the executor drops.
+let executor = evento::Fjall::temporary()?;
 ```
 
 ## 1. Define aggregates & events

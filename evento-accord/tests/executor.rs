@@ -12,13 +12,11 @@ use evento_accord::{
 };
 use evento_core::{cursor::Args, Event, EventFilter, Executor, WriteError};
 use evento_fjall::Fjall;
-use tempfile::TempDir;
 use ulid::Ulid;
 
 /// A single-shard cluster of fjall-backed `AccordExecutor`s.
 struct ExecCluster {
     execs: Vec<AccordExecutor<Fjall>>,
-    _temps: Vec<TempDir>,
     _loops: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -37,15 +35,10 @@ impl ExecCluster {
         let net = InMemoryNetwork::new();
 
         let mut execs = Vec::new();
-        let mut temps = Vec::new();
         let mut loops = Vec::new();
 
         for &id in &ids {
-            let temp = tempfile::Builder::new()
-                .prefix("evento_accord_m5")
-                .tempdir()
-                .unwrap();
-            let fjall = Fjall::open(temp.path()).unwrap();
+            let fjall = Fjall::temporary().unwrap();
 
             let inbox = net.register(id);
             let clock = Arc::new(HybridLogicalClock::new(id));
@@ -61,12 +54,10 @@ impl ExecCluster {
 
             loops.push(node.start(inbox));
             execs.push(AccordExecutor::new(node, fjall));
-            temps.push(temp);
         }
 
         ExecCluster {
             execs,
-            _temps: temps,
             _loops: loops,
         }
     }
@@ -245,11 +236,7 @@ async fn enforces_optimistic_concurrency_across_the_cluster() {
 /// which would be far too slow for thousands of events) and reads through the bridge.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn data_store_paginates_beyond_one_page() {
-    let temp = tempfile::Builder::new()
-        .prefix("evento_accord_page")
-        .tempdir()
-        .unwrap();
-    let fjall = Fjall::open(temp.path()).unwrap();
+    let fjall = Fjall::temporary().unwrap();
 
     // More than one 4096-event page for a single aggregate.
     let count: u16 = 5000;

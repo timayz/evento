@@ -1,20 +1,15 @@
 use evento_remote::{serve, Client, ServerHandle};
-use tempfile::TempDir;
 
-/// Serves a Fjall executor (in a temporary directory) on an ephemeral port and
-/// connects a client to it. The handle and TempDir are returned to keep the
-/// server and its directory alive for the test's duration.
+/// Serves an ephemeral Fjall executor on an ephemeral port and connects a client
+/// to it. The handle is kept to hold the server alive for the test's duration;
+/// the store's temporary directory is owned by the executor the server holds.
 struct TestServer {
     client: Client,
     _handle: ServerHandle,
-    _temp_dir: TempDir,
 }
 
-async fn setup(name: &str) -> anyhow::Result<TestServer> {
-    let temp_dir = tempfile::Builder::new()
-        .prefix(&format!("evento_remote_test_{name}"))
-        .tempdir()?;
-    let fjall = evento_fjall::Fjall::open(temp_dir.path())?;
+async fn setup() -> anyhow::Result<TestServer> {
+    let fjall = evento_fjall::Fjall::temporary()?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let handle = serve(listener, fjall);
@@ -22,265 +17,264 @@ async fn setup(name: &str) -> anyhow::Result<TestServer> {
     Ok(TestServer {
         client,
         _handle: handle,
-        _temp_dir: temp_dir,
     })
 }
 
 #[tokio::test]
 async fn remote_routing_key() -> anyhow::Result<()> {
-    let server = setup("routing_key").await?;
+    let server = setup().await?;
     evento_test::routing_key(&server.client).await
 }
 
 #[tokio::test]
 async fn remote_load() -> anyhow::Result<()> {
-    let server = setup("load").await?;
+    let server = setup().await?;
     evento_test::load(&server.client).await
 }
 
 #[tokio::test]
 async fn remote_load_multiple_aggregator() -> anyhow::Result<()> {
-    let server = setup("load_multiple_aggregator").await?;
+    let server = setup().await?;
     evento_test::load_multiple_aggregator(&server.client).await
 }
 
 #[tokio::test]
 async fn remote_load_with_snapshot() -> anyhow::Result<()> {
-    let server = setup("load_with_snapshot").await?;
+    let server = setup().await?;
     evento_test::load_with_snapshot(&server.client).await
 }
 
 #[tokio::test]
 async fn remote_invalid_original_version() -> anyhow::Result<()> {
-    let server = setup("invalid_original_version").await?;
+    let server = setup().await?;
     evento_test::invalid_original_version(&server.client).await
 }
 
 #[tokio::test]
 async fn remote_subscriber_running() -> anyhow::Result<()> {
-    let server = setup("subscriber_running").await?;
+    let server = setup().await?;
     evento_test::subscriber_running(&server.client).await
 }
 
 #[tokio::test]
 async fn remote_subscribe() -> anyhow::Result<()> {
-    let server = setup("subscribe").await?;
+    let server = setup().await?;
     evento_test::subscribe(&server.client).await
 }
 
 #[tokio::test]
 async fn remote_subscribe_low_latency() -> anyhow::Result<()> {
-    let server = setup("subscribe_low_latency").await?;
+    let server = setup().await?;
     evento_test::subscribe_low_latency(&server.client).await
 }
 
 #[tokio::test]
 async fn remote_subscribe_routing_key() -> anyhow::Result<()> {
-    let server = setup("subscribe_routing_key").await?;
+    let server = setup().await?;
     evento_test::subscribe_routing_key(&server.client).await
 }
 
 #[tokio::test]
 async fn remote_subscribe_default() -> anyhow::Result<()> {
-    let server = setup("subscribe_default").await?;
+    let server = setup().await?;
     evento_test::subscribe_default(&server.client).await
 }
 
 #[tokio::test]
 async fn remote_subscribe_multiple_aggregator() -> anyhow::Result<()> {
-    let server = setup("subscribe_multiple_aggregator").await?;
+    let server = setup().await?;
     evento_test::subscribe_multiple_aggregator(&server.client).await
 }
 
 #[tokio::test]
 async fn remote_subscribe_co_keyed_aggregator() -> anyhow::Result<()> {
-    let server = setup("subscribe_co_keyed_aggregator").await?;
+    let server = setup().await?;
     evento_test::subscribe_co_keyed_aggregator(&server.client).await
 }
 
 #[tokio::test]
 async fn remote_load_co_keyed_aggregator() -> anyhow::Result<()> {
-    let server = setup("load_co_keyed_aggregator").await?;
+    let server = setup().await?;
     evento_test::load_co_keyed_aggregator(&server.client).await
 }
 
 #[tokio::test]
 async fn remote_subscribe_routing_key_multiple_aggregator() -> anyhow::Result<()> {
-    let server = setup("subscribe_routing_key_multiple_aggregator").await?;
+    let server = setup().await?;
     evento_test::subscribe_routing_key_multiple_aggregator(&server.client).await
 }
 
 #[tokio::test]
 async fn remote_subscribe_default_multiple_aggregator() -> anyhow::Result<()> {
-    let server = setup("subscribe_default_multiple_aggregator").await?;
+    let server = setup().await?;
     evento_test::subscribe_default_multiple_aggregator(&server.client).await
 }
 
 #[tokio::test]
 async fn remote_subscribe_default_routing_key() -> anyhow::Result<()> {
-    let server = setup("subscribe_default_routing_key").await?;
+    let server = setup().await?;
     evento_test::subscribe_default_routing_key(&server.client).await
 }
 
 #[tokio::test]
 async fn remote_subscribe_default_routing_key_all_isolation() -> anyhow::Result<()> {
-    let server = setup("subscribe_default_routing_key_all_isolation").await?;
+    let server = setup().await?;
     evento_test::subscribe_default_routing_key_all_isolation(&server.client).await
 }
 
 #[tokio::test]
 async fn remote_all_commands() -> anyhow::Result<()> {
-    let server = setup("all_commands").await?;
+    let server = setup().await?;
     evento_test::all_commands(&server.client).await
 }
 
 #[tokio::test]
 async fn remote_read_order_timestamp() -> anyhow::Result<()> {
-    let server = setup("read_order_timestamp").await?;
+    let server = setup().await?;
     evento_test::read_order_timestamp(&server.client).await
 }
 
 #[tokio::test]
 async fn remote_exact_filter() -> anyhow::Result<()> {
-    let server = setup("exact_filter").await?;
+    let server = setup().await?;
     evento_test::exact_filter(&server.client).await
 }
 
 #[tokio::test]
 async fn remote_concurrent_append() -> anyhow::Result<()> {
-    let server = setup("concurrent_append").await?;
+    let server = setup().await?;
     evento_test::concurrent_append(&server.client).await
 }
 
 #[tokio::test]
 async fn remote_strict_unhandled() -> anyhow::Result<()> {
-    let server = setup("strict_unhandled").await?;
+    let server = setup().await?;
     evento_test::strict_unhandled(&server.client).await
 }
 
 #[tokio::test]
 async fn remote_tombstone() -> anyhow::Result<()> {
-    let server = setup("tombstone").await?;
+    let server = setup().await?;
     evento_test::tombstone(&server.client).await
 }
 
 #[tokio::test]
 async fn remote_subscription_data() -> anyhow::Result<()> {
-    let server = setup("subscription_data").await?;
+    let server = setup().await?;
     evento_test::subscription_data(&server.client).await
 }
 
 #[tokio::test]
 async fn remote_subscription_stop_reason() -> anyhow::Result<()> {
-    let server = setup("subscription_stop_reason").await?;
+    let server = setup().await?;
     evento_test::subscription_stop_reason(&server.client).await
 }
 
 #[tokio::test]
 async fn remote_subscription_all_counts() -> anyhow::Result<()> {
-    let server = setup("subscription_all_counts").await?;
+    let server = setup().await?;
     evento_test::subscription_all_counts(&server.client).await
 }
 
 #[tokio::test]
 async fn remote_snapshot_revision_scope() -> anyhow::Result<()> {
-    let server = setup("snapshot_revision_scope").await?;
+    let server = setup().await?;
     evento_test::snapshot_revision_scope(&server.client).await
 }
 
 #[tokio::test]
 async fn remote_snapshot_projection_scope() -> anyhow::Result<()> {
-    let server = setup("snapshot_projection_scope").await?;
+    let server = setup().await?;
     evento_test::snapshot_projection_scope(&server.client).await
 }
 
 #[tokio::test]
 async fn remote_upcast_load() -> anyhow::Result<()> {
-    let server = setup("upcast_load").await?;
+    let server = setup().await?;
     evento_test::upcast_load(&server.client).await
 }
 
 #[tokio::test]
 async fn remote_upcast_nearest_target() -> anyhow::Result<()> {
-    let server = setup("upcast_nearest_target").await?;
+    let server = setup().await?;
     evento_test::upcast_nearest_target(&server.client).await
 }
 
 #[tokio::test]
 async fn remote_upcast_explicit_wins() -> anyhow::Result<()> {
-    let server = setup("upcast_explicit_wins").await?;
+    let server = setup().await?;
     evento_test::upcast_explicit_wins(&server.client).await
 }
 
 #[tokio::test]
 async fn remote_upcast_skip() -> anyhow::Result<()> {
-    let server = setup("upcast_skip").await?;
+    let server = setup().await?;
     evento_test::upcast_skip(&server.client).await
 }
 
 #[tokio::test]
 async fn remote_upcast_strict_unhandled_target() -> anyhow::Result<()> {
-    let server = setup("upcast_strict_unhandled_target").await?;
+    let server = setup().await?;
     evento_test::upcast_strict_unhandled_target(&server.client).await
 }
 
 #[tokio::test]
 async fn remote_upcast_subscription() -> anyhow::Result<()> {
-    let server = setup("upcast_subscription").await?;
+    let server = setup().await?;
     evento_test::upcast_subscription(&server.client).await
 }
 
 #[tokio::test]
 async fn remote_upcast_projection_subscription() -> anyhow::Result<()> {
-    let server = setup("upcast_projection_subscription").await?;
+    let server = setup().await?;
     evento_test::upcast_projection_subscription(&server.client).await
 }
 
 #[tokio::test]
 async fn remote_upcast_tombstone() -> anyhow::Result<()> {
-    let server = setup("upcast_tombstone").await?;
+    let server = setup().await?;
     evento_test::upcast_tombstone(&server.client).await
 }
 
 #[tokio::test]
 async fn remote_upcast_has_event() -> anyhow::Result<()> {
-    let server = setup("upcast_has_event").await?;
+    let server = setup().await?;
     evento_test::upcast_has_event(&server.client).await
 }
 
 #[tokio::test]
 async fn remote_read_stream() -> anyhow::Result<()> {
-    let server = setup("read_stream").await?;
+    let server = setup().await?;
     evento_test::read_stream(&server.client).await
 }
 
 #[tokio::test]
 async fn remote_read_drains_pages() -> anyhow::Result<()> {
-    let server = setup("read_drains_pages").await?;
+    let server = setup().await?;
     evento_test::read_drains_pages(&server.client).await
 }
 
 #[tokio::test]
 async fn remote_read_limit() -> anyhow::Result<()> {
-    let server = setup("read_limit").await?;
+    let server = setup().await?;
     evento_test::read_limit(&server.client).await
 }
 
 #[tokio::test]
 async fn remote_read_page_cursor() -> anyhow::Result<()> {
-    let server = setup("read_page_cursor").await?;
+    let server = setup().await?;
     evento_test::read_page_cursor(&server.client).await
 }
 
 #[tokio::test]
 async fn remote_read_decode() -> anyhow::Result<()> {
-    let server = setup("read_decode").await?;
+    let server = setup().await?;
     evento_test::read_decode(&server.client).await
 }
 
 #[tokio::test]
 async fn remote_read_routing_key() -> anyhow::Result<()> {
-    let server = setup("read_routing_key").await?;
+    let server = setup().await?;
     evento_test::read_routing_key(&server.client).await
 }
 
@@ -290,10 +284,7 @@ async fn remote_read_routing_key() -> anyhow::Result<()> {
 async fn remote_requests_fail_after_shutdown() -> anyhow::Result<()> {
     use evento_core::{cursor::Args, Executor};
 
-    let temp_dir = tempfile::Builder::new()
-        .prefix("evento_remote_test_shutdown")
-        .tempdir()?;
-    let fjall = evento_fjall::Fjall::open(temp_dir.path())?;
+    let fjall = evento_fjall::Fjall::temporary()?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let handle = serve(listener, fjall);
@@ -324,11 +315,8 @@ use evento_core::{cursor::Args as PoolArgs, Executor as _};
 
 /// A pooled client (4 connections) drives the same conformance scenarios as
 /// the single-connection one — round-robined dispatch is transparent.
-async fn setup_pooled(name: &str, connections: usize) -> anyhow::Result<TestServer> {
-    let temp_dir = tempfile::Builder::new()
-        .prefix(&format!("evento_remote_test_{name}"))
-        .tempdir()?;
-    let fjall = evento_fjall::Fjall::open(temp_dir.path())?;
+async fn setup_pooled(connections: usize) -> anyhow::Result<TestServer> {
+    let fjall = evento_fjall::Fjall::temporary()?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let handle = serve(listener, fjall);
@@ -339,25 +327,24 @@ async fn setup_pooled(name: &str, connections: usize) -> anyhow::Result<TestServ
     Ok(TestServer {
         client,
         _handle: handle,
-        _temp_dir: temp_dir,
     })
 }
 
 #[tokio::test]
 async fn pooled_routing_key() -> anyhow::Result<()> {
-    let server = setup_pooled("pooled_routing_key", 4).await?;
+    let server = setup_pooled(4).await?;
     evento_test::routing_key(&server.client).await
 }
 
 #[tokio::test]
 async fn pooled_subscribe() -> anyhow::Result<()> {
-    let server = setup_pooled("pooled_subscribe", 4).await?;
+    let server = setup_pooled(4).await?;
     evento_test::subscribe(&server.client).await
 }
 
 #[tokio::test]
 async fn pooled_read_order_timestamp() -> anyhow::Result<()> {
-    let server = setup_pooled("pooled_read_order", 4).await?;
+    let server = setup_pooled(4).await?;
     evento_test::read_order_timestamp(&server.client).await
 }
 
@@ -365,7 +352,7 @@ async fn pooled_read_order_timestamp() -> anyhow::Result<()> {
 /// afterwards observes all of them.
 #[tokio::test]
 async fn pooled_concurrent_requests() -> anyhow::Result<()> {
-    let server = setup_pooled("pooled_concurrent", 4).await?;
+    let server = setup_pooled(4).await?;
 
     let mut handles = Vec::new();
     for task in 0..8u16 {
@@ -416,10 +403,7 @@ async fn pooled_concurrent_requests() -> anyhow::Result<()> {
 /// connections recover.
 #[tokio::test]
 async fn pooled_reconnect_recovers_all_connections() -> anyhow::Result<()> {
-    let temp_dir = tempfile::Builder::new()
-        .prefix("evento_remote_test_pooled_reconnect")
-        .tempdir()?;
-    let fjall = evento_fjall::Fjall::open(temp_dir.path())?;
+    let fjall = evento_fjall::Fjall::temporary()?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let handle = serve(listener, fjall.clone());

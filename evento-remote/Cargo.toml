@@ -27,7 +27,6 @@ bytes = "1"
 [dev-dependencies]
 evento-fjall = { path = "../evento-fjall" }
 evento-test = { path = "../evento-test" }
-tempfile = "3.27"
 
 [lints]
 workspace = true
