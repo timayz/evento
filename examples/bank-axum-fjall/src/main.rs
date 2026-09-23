@@ -52,7 +52,7 @@ async fn main() -> anyhow::Result<()> {
     // signal wakes the subscription the instant a command commits.
     let subscription = account_details::create_projection()
         .subscription(format!("account-details-{}", Ulid::generate()))
-        .all()
+        .any_routing_key()
         .start(&executor)
         .await?;
 

@@ -929,8 +929,9 @@ pub async fn subscribe_default_routing_key<E: Executor + Clone>(
         rows.remove(&other_account_id);
     }
 
-    // (3) A subscription with neither .routing_key() nor .all() should inherit the
-    // executor default when started against the Evento wrapper.
+    // (3) A subscription with neither .routing_key() nor .any_routing_key()
+    // should inherit the executor default when started against the Evento
+    // wrapper.
     simple::subscription().no_retry().run_once(&evento).await?;
 
     {
@@ -971,11 +972,12 @@ pub async fn subscribe_default_routing_key<E: Executor + Clone>(
 
 /// Regression test for the bug where two Evento wrappers with different
 /// `default_routing_key` values shared the same row in the subscriber table
-/// when subscriptions called `.all()`, so the second tenant inherited the
-/// first tenant's cursor and never replayed.
+/// when subscriptions called `.any_routing_key()`, so the second tenant
+/// inherited the first tenant's cursor and never replayed.
 ///
-/// The storage key for `.all()` must include the executor's default routing
-/// key as a prefix; otherwise tenant-b reads from where tenant-a stopped.
+/// The storage key for `.any_routing_key()` must include the executor's default
+/// routing key as a prefix; otherwise tenant-b reads from where tenant-a
+/// stopped.
 /// Scenario: isolation between default-routing-key subscriptions and
 /// all-events subscriptions.
 pub async fn subscribe_default_routing_key_all_isolation<E: Executor + Clone>(
@@ -1005,9 +1007,10 @@ pub async fn subscribe_default_routing_key_all_isolation<E: Executor + Clone>(
         })
         .await?;
 
-    // Tenant-a runs .all() — should process both events (it reads all routing keys).
+    // Tenant-a runs .any_routing_key() — should process both events (it reads
+    // every routing key).
     simple::subscription()
-        .all()
+        .any_routing_key()
         .no_retry()
         .run_once(&evento_a)
         .await?;
@@ -1015,11 +1018,11 @@ pub async fn subscribe_default_routing_key_all_isolation<E: Executor + Clone>(
         let rows = simple::ROWS.read().unwrap();
         assert!(
             rows.contains_key(&acc_a),
-            "tenant-a .all() should process acc_a"
+            "tenant-a .any_routing_key() should process acc_a"
         );
         assert!(
             rows.contains_key(&acc_b),
-            "tenant-a .all() should process acc_b"
+            "tenant-a .any_routing_key() should process acc_b"
         );
     }
 
@@ -1031,11 +1034,11 @@ pub async fn subscribe_default_routing_key_all_isolation<E: Executor + Clone>(
         rows.remove(&acc_b);
     }
 
-    // Tenant-b runs .all() — with the fix, it has its own cursor (storage key
-    // "tenant-b.simple" vs tenant-a's "tenant-a.simple") and replays both
-    // events from the beginning.
+    // Tenant-b runs .any_routing_key() — with the fix, it has its own cursor
+    // (storage key "tenant-b.simple" vs tenant-a's "tenant-a.simple") and
+    // replays both events from the beginning.
     simple::subscription()
-        .all()
+        .any_routing_key()
         .no_retry()
         .run_once(&evento_b)
         .await?;
@@ -1043,11 +1046,12 @@ pub async fn subscribe_default_routing_key_all_isolation<E: Executor + Clone>(
         let rows = simple::ROWS.read().unwrap();
         assert!(
             rows.contains_key(&acc_a),
-            "tenant-b .all() must replay acc_a — without per-tenant cursor scoping it would inherit tenant-a's position"
+            "tenant-b .any_routing_key() must replay acc_a — without per-tenant \
+             cursor scoping it would inherit tenant-a's position"
         );
         assert!(
             rows.contains_key(&acc_b),
-            "tenant-b .all() must replay acc_b"
+            "tenant-b .any_routing_key() must replay acc_b"
         );
     }
 
@@ -1223,7 +1227,7 @@ pub async fn subscribe_co_keyed_aggregator<E: Executor + Clone>(
     // Co-keying is automatic: no `.aggregate::<Owner>()` call needed.
     co_keyed::projection()
         .subscription("co-keyed")
-        .all()
+        .any_routing_key()
         .no_retry()
         .run_once(executor)
         .await?;
@@ -2844,14 +2848,14 @@ pub async fn upcast_subscription<E: Executor + Clone>(executor: &E) -> anyhow::R
         .await?;
 
     upcast::subscription("upcast-sub")
-        .all()
+        .any_routing_key()
         .no_retry()
         .run_once(executor)
         .await?;
     // Strict: older names resolve to the registered handler, nothing is unhandled.
     upcast::subscription("upcast-sub-strict")
         .strict()
-        .all()
+        .any_routing_key()
         .no_retry()
         .run_once(executor)
         .await?;
@@ -2884,7 +2888,7 @@ pub async fn upcast_subscription<E: Executor + Clone>(executor: &E) -> anyhow::R
     );
 
     upcast::raw_subscription("upcast-sub-raw")
-        .all()
+        .any_routing_key()
         .no_retry()
         .run_once(executor)
         .await?;
@@ -2915,7 +2919,7 @@ pub async fn upcast_projection_subscription<E: Executor + Clone>(
 
     upcast::recording()
         .subscription("upcast-projection")
-        .all()
+        .any_routing_key()
         .no_retry()
         .run_once(executor)
         .await?;
@@ -2968,7 +2972,7 @@ pub async fn upcast_tombstone<E: Executor + Clone>(executor: &E) -> anyhow::Resu
     upcast::recording()
         .tombstone::<upcast::ClosedV2>()
         .subscription("upcast-tombstone")
-        .all()
+        .any_routing_key()
         .no_retry()
         .run_once(executor)
         .await?;

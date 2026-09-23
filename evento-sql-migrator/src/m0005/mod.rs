@@ -2,10 +2,11 @@
 //!
 //! The m0004 index `idx_event_type_routing_cursor` places `routing_key` between
 //! `aggregator_type` and the cursor/sort columns, so it only helps subscriptions
-//! that constrain `routing_key`. A subscription reading with `.all()` has no
-//! `routing_key` predicate, so the planner can only use that index up to
-//! `aggregator_type=?` — the `timestamp` range becomes unreachable, forcing a full
-//! scan of every matching row plus an external sort on every poll.
+//! that constrain `routing_key`. A subscription reading with
+//! `.any_routing_key()` has no `routing_key` predicate, so the planner can only
+//! use that index up to `aggregator_type=?` — the `timestamp` range becomes
+//! unreachable, forcing a full scan of every matching row plus an external sort
+//! on every poll.
 //!
 //! This migration adds a second, complementary index whose cursor columns come
 //! immediately after `aggregator_type`, letting the `timestamp > ?` cursor bound
@@ -15,7 +16,8 @@ mod event;
 
 use sqlx_migrator::vec_box;
 
-/// Migration that adds a leading-cursor index for `.all()` subscription scans.
+/// Migration that adds a leading-cursor index for `.any_routing_key()`
+/// subscription scans.
 ///
 /// ## Changes
 ///
