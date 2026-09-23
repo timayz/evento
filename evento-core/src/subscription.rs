@@ -27,6 +27,64 @@
 //! So supervise the handle: [`Subscription::stopped`] resolves with the
 //! [`StopReason`], and [`Subscription::is_finished`] is the non-blocking check.
 //!
+//! # Starting position
+//!
+//! A subscription resumes from its stored cursor, and a key that has never
+//! acknowledged an event starts at the beginning of history. For a live bridge
+//! (SSE, a WebSocket, a broadcast fanout) where history is meaningless, opt out
+//! with [`start_from_latest`](SubscriptionBuilder::start_from_latest): a
+//! subscription with no cursor is seeded at the stream head instead. Once a
+//! cursor exists it has no effect, so a restart always resumes rather than
+//! jumping forward.
+//!
+//! # Live bridges
+//!
+//! Forwarding events to an SSE response, a WebSocket or a per-connection
+//! channel inverts every default here. The consumer is the connection, so
+//! history is noise, the cursor is not worth a database write, and the handler
+//! — not a supervisor — is the first thing to learn the client is gone. Three
+//! opt-ins cover it:
+//!
+//! - [`ephemeral`](SubscriptionBuilder::ephemeral) keeps the cursor in memory:
+//!   no subscriber row, no ownership fence, no acknowledge. The key stops being
+//!   an identity, so any number of connections can share one.
+//! - [`start_from_latest`](SubscriptionBuilder::start_from_latest) begins at the
+//!   head instead of replaying the store into a socket that just opened.
+//! - [`Context::stop`] lets a handler end its own subscription when its send
+//!   fails, reporting [`StopReason::StoppedByHandler`] rather than a failure.
+//!
+//! ```rust,no_run
+//! # use evento::{Executor, metadata::Event, subscription::{Context, SubscriptionBuilder}};
+//! # #[evento::aggregate]
+//! # pub enum Account { MoneyDeposited { amount: i64 } }
+//! # #[evento::subscription]
+//! # async fn fanout<E: Executor>(
+//! #     context: &Context<'_, E>,
+//! #     event: Event<MoneyDeposited>,
+//! # ) -> anyhow::Result<()> { Ok(()) }
+//! # async fn run<E: Executor + Clone>(
+//! #     executor: &E,
+//! #     tx: tokio::sync::mpsc::Sender<i64>,
+//! # ) -> anyhow::Result<()> {
+//! let subscription = SubscriptionBuilder::new("sse")
+//!     .handler(fanout())
+//!     .data(tx)
+//!     .ephemeral()
+//!     .start_from_latest()
+//!     .start(executor)
+//!     .await?;
+//! # subscription.shutdown().await?;
+//! # Ok(()) }
+//! ```
+//!
+//! Each subscription is its own poller, so one per connection is worth its cost
+//! when each connection wants a *different* slice
+//! ([`aggregate`](SubscriptionBuilder::aggregate),
+//! [`routing_key`](SubscriptionBuilder::routing_key)). For an unfiltered global
+//! feed, run **one** such subscription pushing into a
+//! `tokio::sync::broadcast::Sender` and give every response a `Receiver`: one
+//! poller regardless of how many clients connect.
+//!
 //! # Example
 //!
 //! ```rust,no_run
@@ -77,7 +135,10 @@ use std::{
     marker::PhantomData,
     ops::Deref,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 use tokio::time::{interval_at, Instant};
@@ -173,6 +234,62 @@ pub struct Context<'a, E: Executor> {
     context: context::RwContext,
     /// Reference to the executor for database operations
     pub executor: &'a E,
+    /// Set by [`stop`](Self::stop), read by the worker between events. A
+    /// borrow rather than an `Arc`: `&AtomicBool` is `Copy` (so this type
+    /// stays `Clone` for free) and the flag lives in the builder, which the
+    /// worker owns — a handler cannot smuggle it into a `'static` task.
+    stop: &'a AtomicBool,
+}
+
+impl<'a, E: Executor> Context<'a, E> {
+    /// Asks this subscription to stop after the current event.
+    ///
+    /// The event being handled is still acknowledged — it *was* processed —
+    /// and no further event is delivered. The worker then exits with
+    /// [`StopReason::StoppedByHandler`], which [`Subscription::stopped`]
+    /// reports like any other reason. It is a normal end, not a failure:
+    /// `is_failure()` is `false`.
+    ///
+    /// This is the handler's half of stopping; [`Subscription::stop`] is the
+    /// supervisor's, and reports [`StopReason::Shutdown`]. Use it when the
+    /// handler is the only thing that *can* know the bridge is finished. The
+    /// clearest case is a shared fanout: one subscription serving every
+    /// connected client over a broadcast channel, which should stop once the
+    /// last of them has gone — a fact only the sending handler observes.
+    ///
+    /// ```rust,no_run
+    /// # use evento::{Executor, metadata::Event, subscription::Context};
+    /// # #[evento::aggregate]
+    /// # pub enum Account { MoneyDeposited { amount: i64 } }
+    /// #[evento::subscription]
+    /// async fn fanout<E: Executor>(
+    ///     context: &Context<'_, E>,
+    ///     event: Event<MoneyDeposited>,
+    /// ) -> anyhow::Result<()> {
+    ///     let tx: tokio::sync::broadcast::Sender<i64> = context.extract();
+    ///     // `send` fails only when there are no receivers left: every client
+    ///     // has disconnected, so there is nothing left to bridge to.
+    ///     if tx.send(event.data.amount).is_err() {
+    ///         context.stop();
+    ///     }
+    ///     Ok(())
+    /// }
+    /// ```
+    ///
+    /// A handler can only notice on the *next* event, so where the consumer's
+    /// departure is observable directly — one subscription per connection whose
+    /// handle lives in the response body, for instance — dropping that handle
+    /// stops the worker sooner and this is redundant.
+    ///
+    /// Returning `Err` *after* calling this still stops the worker with
+    /// [`StopReason::Failed`]: the error wins, because it is what reaches the
+    /// worker loop.
+    pub fn stop(&self) {
+        // `Relaxed` is sufficient: the only writer is a handler running inside
+        // the same task as the `process` loop that reads it, so program order
+        // already guarantees visibility. There is no cross-thread publication.
+        self.stop.store(true, Ordering::Relaxed);
+    }
 }
 
 impl<'a, E: Executor> Deref for Context<'a, E> {
@@ -259,9 +376,47 @@ pub struct SubscriptionBuilder<E: Executor> {
     safety_disabled: bool,
     shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     ack_every: Option<u16>,
+    /// Where this subscription's cursor lives — see [`CursorStore`].
+    cursor_store: CursorStore,
+    /// When set and this subscription has no cursor yet, the cursor is seeded
+    /// at the stream's head before the first read, so history is never
+    /// delivered.
+    start_from_latest: bool,
+    /// Raised by [`Context::stop`]; read by `process` between events. Owned by
+    /// the builder, so it moves into the worker task and is never reachable
+    /// from the [`Subscription`] handle — unlike the shutdown channel, whose
+    /// sender must stay with the handle for a drop to stop the worker.
+    stop_flag: AtomicBool,
     /// Cached `(sampled at, latest event timestamp in seconds)` feeding the
     /// lag metric, so acknowledges don't pay a MAX() scan each.
     latest_ts_cache: Mutex<Option<(Instant, u64)>>,
+}
+
+/// Where a subscription's cursor lives.
+enum CursorStore {
+    /// The subscriber row: fenced by worker id, and it survives restarts, so
+    /// the subscription resumes exactly where it left off.
+    Persisted,
+    /// This worker's memory, for a live bridge that owns nothing and resumes
+    /// nothing (see [`SubscriptionBuilder::ephemeral`]). No row, no fence, and
+    /// no write to the store at all.
+    Local(Mutex<Option<Value>>),
+}
+
+impl CursorStore {
+    fn is_ephemeral(&self) -> bool {
+        matches!(self, Self::Local(_))
+    }
+}
+
+/// Where the next read should start, plus whether this worker still owns the
+/// subscription.
+enum CursorRead {
+    /// Read from here. Always this variant when ephemeral — there is no fence
+    /// to lose.
+    At(Option<Value>),
+    /// Another worker claimed the key (or an operator disabled it).
+    LostOwnership,
 }
 
 /// What a single `process` pass concluded, beyond a hard error.
@@ -276,6 +431,8 @@ enum ProcessOutcome {
     LostOwnership,
     /// A shutdown signal was observed mid-chunk.
     ShutdownRequested,
+    /// A handler called [`Context::stop`].
+    StoppedByHandler,
 }
 
 impl<E: Executor + 'static> SubscriptionBuilder<E> {
@@ -301,6 +458,9 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             aggregators: Default::default(),
             shutdown_rx: None,
             ack_every: None,
+            cursor_store: CursorStore::Persisted,
+            start_from_latest: false,
+            stop_flag: AtomicBool::new(false),
             latest_ts_cache: Mutex::new(None),
         }
     }
@@ -440,6 +600,172 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
     /// to 1 (ack per event, the pre-batching behavior).
     pub fn ack_every(mut self, v: u16) -> Self {
         self.ack_every = Some(v.max(1));
+
+        self
+    }
+
+    /// Keeps this subscription's cursor in memory instead of in the store.
+    ///
+    /// An ephemeral subscription registers no subscriber row, takes no
+    /// ownership fence and never acknowledges: its **only** store access is
+    /// reads. The cursor lives for the life of the worker and is gone when it
+    /// stops.
+    ///
+    /// This is for a live bridge — an SSE response, a WebSocket, a
+    /// per-connection fanout — where the consumer is the connection. Where
+    /// connection #4117 got to is not state worth writing to a database, and a
+    /// durable subscription would leave a row behind per connection.
+    ///
+    /// Pair it with [`start_from_latest`](Self::start_from_latest), which is
+    /// the other half of the live-bridge shape:
+    ///
+    /// ```rust,no_run
+    /// # use evento::{Executor, metadata::Event, subscription::{Context, SubscriptionBuilder}};
+    /// # #[evento::aggregate]
+    /// # pub enum Account { MoneyDeposited { amount: i64 } }
+    /// # #[evento::subscription]
+    /// # async fn fanout<E: Executor>(
+    /// #     context: &Context<'_, E>,
+    /// #     event: Event<MoneyDeposited>,
+    /// # ) -> anyhow::Result<()> { Ok(()) }
+    /// # async fn run<E: Executor + Clone>(
+    /// #     executor: &E,
+    /// #     tx: tokio::sync::mpsc::Sender<i64>,
+    /// # ) -> anyhow::Result<()> {
+    /// let subscription = SubscriptionBuilder::new("sse")
+    ///     .handler(fanout())
+    ///     .data(tx)
+    ///     .ephemeral()
+    ///     .start_from_latest()
+    ///     .start(executor)
+    ///     .await?;
+    /// # subscription.shutdown().await?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// **On its own this does not skip history.** An ephemeral subscription
+    /// has no stored cursor to resume from, so without
+    /// `start_from_latest` every start replays the whole store — which for a
+    /// bridge means replaying it into a socket that just opened. Ephemeral
+    /// alone is for the other case: a throwaway in-memory index rebuilt from
+    /// the full stream on every boot.
+    ///
+    /// # The key becomes a label
+    ///
+    /// Nothing is stored under the key, so it stops being an identity. Any
+    /// number of ephemeral subscriptions may share one key concurrently
+    /// without interfering — one key for every SSE connection is the expected
+    /// shape, and a unique key per connection buys nothing but noisier logs.
+    /// This is the one place the "keep subscription keys unique" rule does not
+    /// apply. An ephemeral subscription cannot disturb a *persisted* one
+    /// sharing its key either, but the two would be indistinguishable in
+    /// `tracing`, so give them different names.
+    ///
+    /// # What else changes
+    ///
+    /// - [`StopReason::LostOwnership`] becomes unreachable: nothing can take
+    ///   over a subscription that claimed nothing. An ephemeral worker can only
+    ///   stop with [`Shutdown`](StopReason::Shutdown),
+    ///   [`StoppedByHandler`](StopReason::StoppedByHandler),
+    ///   [`Failed`](StopReason::Failed) or [`Panicked`](StopReason::Panicked).
+    /// - [`Subscription::id`] still exists but fences nothing.
+    /// - [`ack_every`](Self::ack_every)'s crash trade-off no longer applies —
+    ///   there is no persisted position to lose. It now only controls how much
+    ///   is redelivered when a failed pass is retried.
+    /// - Repeated [`run_once`](Self::run_once) calls on the same builder resume
+    ///   from the in-memory cursor rather than replaying.
+    /// - The [`start_from_latest`](Self::start_from_latest) caveat about a
+    ///   stale `Rw` replica reporting "no cursor" disappears: no cursor is ever
+    ///   read from anywhere.
+    ///
+    /// Deliberately not offered on
+    /// [`ProjectionSubscription`](crate::projection::ProjectionSubscription):
+    /// a projection's cursor and its snapshots have to agree across restarts,
+    /// and an in-memory cursor would make every boot re-fold from zero.
+    pub fn ephemeral(mut self) -> Self {
+        self.cursor_store = CursorStore::Local(Mutex::new(None));
+
+        self
+    }
+
+    /// Starts a subscription with no cursor at the stream's head instead of at
+    /// the beginning of history.
+    ///
+    /// This applies **only when there is no cursor yet**. For a persisted
+    /// subscription that means the first start of a key: the head is recorded
+    /// as the cursor before the first event is read, and once a cursor exists —
+    /// the first acknowledged event, or a restart — this has no effect, so a
+    /// restart still picks up everything committed while the process was down.
+    /// For an [`ephemeral`](Self::ephemeral) subscription there is never a
+    /// stored cursor, so every start seeds at the head.
+    ///
+    /// The shape this exists for is a live bridge — SSE, a WebSocket, push
+    /// notifications, an in-process broadcast channel — where replaying history
+    /// pushes stale updates at clients that only care about what happens from
+    /// now on:
+    ///
+    /// ```rust,no_run
+    /// # use evento::{Executor, metadata::Event, subscription::{Context, SubscriptionBuilder}};
+    /// # #[evento::aggregate]
+    /// # pub enum Account { MoneyDeposited { amount: i64 } }
+    /// #[evento::subscription]
+    /// async fn fanout<E: Executor>(
+    ///     context: &Context<'_, E>,
+    ///     event: Event<MoneyDeposited>,
+    /// ) -> anyhow::Result<()> {
+    ///     let tx: tokio::sync::broadcast::Sender<i64> = context.extract();
+    ///     let _ = tx.send(event.data.amount);
+    ///     Ok(())
+    /// }
+    ///
+    /// # async fn run<E: Executor + Clone>(
+    /// #     executor: &E,
+    /// #     tx: tokio::sync::broadcast::Sender<i64>,
+    /// # ) -> anyhow::Result<()> {
+    /// let subscription = SubscriptionBuilder::new("sse-fanout")
+    ///     .handler(fanout())
+    ///     .data(tx)
+    ///     .start_from_latest()
+    ///     .start(executor)
+    ///     .await?;
+    /// # subscription.shutdown().await?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// Used without [`ephemeral`](Self::ephemeral), keep the key stable across
+    /// restarts: that is what makes the resume half work. A fresh key per
+    /// process re-seeds at the head every time, which is harmless for a pure
+    /// fanout but leaves a subscriber row behind per process — which is the
+    /// problem `ephemeral` solves.
+    ///
+    /// The head is sampled when [`start`](Self::start) or
+    /// [`run_once`](Self::run_once) is called, not when the worker first polls,
+    /// so events committed while a [`delay`](Self::delay) elapses are still
+    /// delivered.
+    ///
+    /// # This skips history, not "everything before now"
+    ///
+    /// On a backend with a stability watermark (a shared SQL store, multi-node
+    /// Accord) the head is the newest event *below* the watermark, so up to the
+    /// backend's stability margin — default 1s for `Sql` — of very recent
+    /// events can still be delivered on a first start. That is deliberate:
+    /// seeding past the watermark could permanently skip an event committed
+    /// moments after the subscription started, because the normal read path is
+    /// forbidden to go there. On a single-writer backend the watermark does not
+    /// exist and the head is exact.
+    ///
+    /// With the read/write split executor (`Rw`) a persisted cursor is read
+    /// from the replica, so a stale replica can report "no cursor" and seed
+    /// again. The subscription already trusts the replica for cursor state on
+    /// every pass, so this adds no new hazard — and an `ephemeral` subscription
+    /// reads no cursor at all.
+    ///
+    /// Deliberately not offered on
+    /// [`ProjectionSubscription`](crate::projection::ProjectionSubscription):
+    /// a read model started at the head would be missing the state its
+    /// handlers exist to fold.
+    pub fn start_from_latest(mut self) -> Self {
+        self.start_from_latest = true;
 
         self
     }
@@ -610,13 +936,18 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
         let ack_every = usize::from(self.ack_every.unwrap_or(self.chunk_size).max(1));
 
         loop {
-            let status = executor
-                .subscriber_status(self.resolved_key().to_owned(), *id)
-                .await?;
-            if !status.running {
-                return Ok(ProcessOutcome::LostOwnership);
+            // Checked here as well as after each handler: a handler that calls
+            // `stop()` and *then* returns an error makes the retry re-invoke
+            // `process`, and without this the already-stopped subscription
+            // would re-read and redeliver before the per-event check fires.
+            if self.stop_flag.load(Ordering::Relaxed) {
+                return Ok(ProcessOutcome::StoppedByHandler);
             }
-            let cursor = status.cursor;
+
+            let cursor = match self.current_cursor(executor, id).await? {
+                CursorRead::At(cursor) => cursor,
+                CursorRead::LostOwnership => return Ok(ProcessOutcome::LostOwnership),
+            };
 
             // Stability watermark (microseconds since epoch): on a backend where
             // independent writers can commit out of cursor order, the
@@ -649,6 +980,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             let context = Context {
                 context: self.context.clone(),
                 executor,
+                stop: &self.stop_flag,
             };
 
             // Cursor + timestamp of the last processed-but-unacknowledged
@@ -776,6 +1108,22 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                     // process events the new owner will also handle.
                     return Ok(ProcessOutcome::LostOwnership);
                 }
+
+                // A handler asked to stop — its SSE client disconnected, its
+                // channel closed. Checked *after* the handler rather than
+                // before the next event, so a handler that stops on the last
+                // event of a chunk stops the worker now: the `for` would
+                // otherwise exit normally, report `Drained`, and leave the
+                // worker waiting for an event that may never come.
+                if self.stop_flag.load(Ordering::Relaxed) {
+                    if !self
+                        .flush_ack(executor, id, aggregators, &mut pending_ack, &mut since_ack)
+                        .await?
+                    {
+                        return Ok(ProcessOutcome::LostOwnership);
+                    }
+                    return Ok(ProcessOutcome::StoppedByHandler);
+                }
             }
 
             if !self
@@ -793,9 +1141,34 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
         }
     }
 
-    /// Flushes the pending cursor via a fenced acknowledge. Returns `false`
-    /// when ownership was lost (the fenced update did not apply); `true` when
-    /// nothing was pending or the ack succeeded.
+    /// Where the next read starts, and whether this worker still owns the
+    /// subscription.
+    ///
+    /// The one place the two cursor stores are told apart on the read side;
+    /// `process` and `seed_latest_cursor` both go through it.
+    async fn current_cursor(&self, executor: &E, id: &Ulid) -> anyhow::Result<CursorRead> {
+        match &self.cursor_store {
+            // Bound out of the guard in one statement: holding it across the
+            // caller's `await` would make this future non-`Send`.
+            CursorStore::Local(cell) => Ok(CursorRead::At(
+                cell.lock().expect("local cursor poisoned").clone(),
+            )),
+            CursorStore::Persisted => {
+                let status = executor
+                    .subscriber_status(self.resolved_key().to_owned(), *id)
+                    .await?;
+                Ok(match status.running {
+                    true => CursorRead::At(status.cursor),
+                    false => CursorRead::LostOwnership,
+                })
+            }
+        }
+    }
+
+    /// Flushes the pending cursor: a fenced acknowledge for a persisted
+    /// subscription, a store into the local cell for an ephemeral one. Returns
+    /// `false` when ownership was lost (the fenced update did not apply);
+    /// `true` when nothing was pending or the cursor was recorded.
     async fn flush_ack(
         &self,
         executor: &E,
@@ -808,6 +1181,21 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             return Ok(true);
         };
         *since_ack = 0;
+
+        // The ephemeral path returns before any store access — including
+        // `cached_latest_timestamp`, whose only consumer is the `lag` argument
+        // below. An ephemeral subscription therefore never writes to the store
+        // and never pays the MAX() scan.
+        //
+        // It must still go through this function rather than a parallel path:
+        // `process` flushes the successfully-processed prefix before
+        // propagating a handler error, and that is what makes a retry resume at
+        // the failing event instead of replaying the chunk. An in-memory cursor
+        // that skipped this would silently reintroduce replay-on-retry.
+        if let CursorStore::Local(cell) = &self.cursor_store {
+            *cell.lock().expect("local cursor poisoned") = Some(cursor);
+            return Ok(true);
+        }
 
         let latest = self.cached_latest_timestamp(executor, aggregators).await?;
         executor
@@ -884,6 +1272,85 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
         Ok(ProcessOutcome::Gated { wait })
     }
 
+    /// Seeds the cursor at the stream's head when
+    /// [`start_from_latest`](Self::start_from_latest) is set and there is no
+    /// cursor yet. A no-op otherwise.
+    ///
+    /// For a persisted subscription this must be called *after*
+    /// `upsert_subscriber`: the fence claimed there is what makes
+    /// check-then-seed safe. A worker that loses the fence in between fails the
+    /// fenced acknowledge, seeds nothing, and stops on its first `process` pass
+    /// with [`StopReason::LostOwnership`] — so it can never replay the history
+    /// it was told to skip. An ephemeral subscription has no fence and nothing
+    /// to race with: the cell it writes is private to this worker.
+    async fn seed_latest_cursor(
+        &self,
+        executor: &E,
+        id: &Ulid,
+        aggregators: &Arc<[EventFilter]>,
+    ) -> anyhow::Result<()> {
+        if !self.start_from_latest {
+            return Ok(());
+        }
+
+        // A cursor already here means "resume", which this never overrides, and
+        // a lost fence means there is nothing to seed for. The resume arm is
+        // not dead for an ephemeral subscription either: it is what makes a
+        // second `run_once` on the same builder continue rather than re-seed.
+        match self.current_cursor(executor, id).await? {
+            CursorRead::At(None) => {}
+            CursorRead::At(Some(_)) | CursorRead::LostOwnership => return Ok(()),
+        }
+
+        // Bounded by the watermark, which is the non-obvious part. `process`
+        // reads with the same bound, so the seeded position is one the normal
+        // read path could itself have reached — it inherits the watermark's
+        // no-skip guarantee instead of adding an assumption. An unbounded head
+        // would sit where `process` is forbidden to go: a writer that stamps an
+        // earlier timestamp but commits later would have its event, committed
+        // *after* the subscription started, skipped forever.
+        let stable = executor.stable_timestamp().await?;
+
+        // Scoped to *this* subscription's stream by the same filters and
+        // routing key the worker reads with, so `.strict()`,
+        // `.aggregate::<A>(id)` and `.routing_key(..)` all apply. A global head
+        // could sit above a matching event.
+        let head = executor
+            .read(
+                Some(aggregators.clone()),
+                Some(self.effective_routing_key()),
+                Args::backward(1, None),
+                stable,
+            )
+            .await?;
+
+        // No matching event means no seed: cursor zero already skips nothing.
+        let Some(edge) = head.edges.first() else {
+            return Ok(());
+        };
+
+        // Through `flush_ack`, so the persisted path computes `lag` like every
+        // other acknowledge and the ephemeral path fills its cell.
+        let mut pending = Some((edge.cursor.clone(), edge.node.timestamp));
+        let mut since_ack = 0usize;
+        if self
+            .flush_ack(executor, id, aggregators, &mut pending, &mut since_ack)
+            .await?
+        {
+            tracing::info!(
+                key = self.resolved_key(),
+                "Subscription seeded at the stream head, skipping history"
+            );
+        } else {
+            tracing::debug!(
+                key = self.resolved_key(),
+                "Lost ownership before the head cursor could be stored"
+            );
+        }
+
+        Ok(())
+    }
+
     /// Disables retry-on-failure for this subscription.
     ///
     /// By default failed batches are retried with exponential backoff (see
@@ -928,14 +1395,24 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
         // a panic, an abort, or a runtime shutdown.
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(None::<StopReason>);
 
-        executor
-            .upsert_subscriber(self.resolved_key().to_owned(), id.to_owned())
+        // An ephemeral subscription claims nothing: no row, no fence.
+        if !self.cursor_store.is_ephemeral() {
+            executor
+                .upsert_subscriber(self.resolved_key().to_owned(), id.to_owned())
+                .await?;
+        }
+
+        // Hoisted above the spawn so the seed below runs under the fence
+        // claimed just above and before the worker can read anything, which
+        // makes "after `start()` returns, history will not be replayed"
+        // observable rather than eventual.
+        let read_aggregators = self.read_aggregators();
+        self.seed_latest_cursor(&executor, &id, &read_aggregators)
             .await?;
 
         let mut write_watch = executor.write_watch();
 
         let task_handle = tokio::spawn(async move {
-            let read_aggregators = self.read_aggregators();
             let start = self
                 .delay
                 .map(|d| Instant::now() + d)
@@ -1031,6 +1508,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                     Ok(ProcessOutcome::Gated { wait }) => gated = Some(wait),
                     Ok(ProcessOutcome::ShutdownRequested) => break StopReason::Shutdown,
                     Ok(ProcessOutcome::LostOwnership) => break StopReason::LostOwnership,
+                    Ok(ProcessOutcome::StoppedByHandler) => break StopReason::StoppedByHandler,
                     Err(err) => {
                         tracing::error!(error = %err, "Failed to process event");
 
@@ -1088,11 +1566,16 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
         tracing::Span::current().record("subscription", self.resolved_key());
         let id = Ulid::generate();
 
-        executor
-            .upsert_subscriber(self.resolved_key().to_owned(), id.to_owned())
-            .await?;
+        // An ephemeral subscription claims nothing: no row, no fence.
+        if !self.cursor_store.is_ephemeral() {
+            executor
+                .upsert_subscriber(self.resolved_key().to_owned(), id.to_owned())
+                .await?;
+        }
 
         let read_aggregators = self.read_aggregators();
+        self.seed_latest_cursor(executor, &id, &read_aggregators)
+            .await?;
 
         // Exclusive upper bound (µs) covering every event committed before
         // entry: `latest_timestamp` has whole-second resolution, so cover the
@@ -1134,7 +1617,9 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             }?;
 
             match outcome {
-                ProcessOutcome::Drained | ProcessOutcome::ShutdownRequested => return Ok(()),
+                ProcessOutcome::Drained
+                | ProcessOutcome::ShutdownRequested
+                | ProcessOutcome::StoppedByHandler => return Ok(()),
                 ProcessOutcome::LostOwnership => {
                     anyhow::bail!(
                         "subscription {} was taken over by another worker during run_once",
@@ -1172,11 +1657,18 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
 /// [`Failed`](Self::Failed) and [`Panicked`](Self::Panicked) are the abnormal
 /// ones — the others are the worker doing what it was told.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum StopReason {
     /// [`Subscription::shutdown`] or [`Subscription::stop`] was called, or the
     /// handle was dropped (which also signals the worker).
     Shutdown,
+    /// A handler called [`Context::stop`] — the supervisor's
+    /// [`Shutdown`](Self::Shutdown) seen from the other side. Normal, not a
+    /// failure: a live bridge whose consumer went away ends here.
+    StoppedByHandler,
     /// Another worker claimed this subscription key, so this one stepped aside.
+    /// Unreachable for an [`ephemeral`](SubscriptionBuilder::ephemeral)
+    /// subscription, which claims nothing.
     LostOwnership,
     /// A pass failed after exhausting [`retry`](SubscriptionBuilder::retry),
     /// and the subscription was not built with
@@ -1206,6 +1698,7 @@ impl std::fmt::Display for StopReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             StopReason::Shutdown => f.write_str("shutdown requested"),
+            StopReason::StoppedByHandler => f.write_str("stopped by a handler"),
             StopReason::LostOwnership => f.write_str("taken over by another worker"),
             // `{:#}` keeps the whole `anyhow` context chain on one line —
             // without it a `%reason` log drops everything a handler added.
@@ -1376,8 +1869,11 @@ impl<E: Executor, EV: AggregateEvent + Send + Sync> Handler<E> for SkipHandler<E
 
 #[cfg(test)]
 mod tests {
-    use super::{await_stop_reason, peek_stop_reason, StopReason};
-    use std::sync::Arc;
+    use super::{
+        await_stop_reason, context, peek_stop_reason, AtomicBool, Context, CursorStore, Ordering,
+        StopReason, Value,
+    };
+    use std::sync::{Arc, Mutex};
 
     fn channel() -> (
         tokio::sync::watch::Sender<Option<StopReason>>,
@@ -1450,6 +1946,50 @@ mod tests {
 
     /// `Display` must flatten the whole `anyhow` context chain: a `%reason` log
     /// that only carried the outermost message would lose the diagnosis.
+    /// The ephemeral cursor is read back exactly as written, and starts unset —
+    /// the property `process` relies on to skip an already-processed prefix
+    /// when a failed pass is retried.
+    #[test]
+    fn the_local_cursor_round_trips() {
+        let store = CursorStore::Local(Mutex::new(None));
+        assert!(store.is_ephemeral());
+
+        let CursorStore::Local(cell) = &store else {
+            panic!("built as Local");
+        };
+        assert_eq!(*cell.lock().unwrap(), None, "a fresh cell has no cursor");
+
+        *cell.lock().unwrap() = Some(Value("c1".to_owned()));
+        assert_eq!(cell.lock().unwrap().clone(), Some(Value("c1".to_owned())));
+
+        *cell.lock().unwrap() = Some(Value("c2".to_owned()));
+        assert_eq!(cell.lock().unwrap().clone(), Some(Value("c2".to_owned())));
+    }
+
+    #[test]
+    fn a_persisted_store_is_not_ephemeral() {
+        assert!(!CursorStore::Persisted.is_ephemeral());
+    }
+
+    /// `Context::stop` is the only writer, and `process` reads the same flag.
+    #[test]
+    fn stop_raises_the_flag_the_worker_reads() {
+        let flag = AtomicBool::new(false);
+        let context = Context {
+            context: context::RwContext::new(),
+            executor: &crate::aggregator::tests::UnreachableExecutor,
+            stop: &flag,
+        };
+
+        assert!(!flag.load(Ordering::Relaxed));
+        context.stop();
+        assert!(flag.load(Ordering::Relaxed));
+
+        // Idempotent: a handler may stop on every remaining event of a chunk.
+        context.stop();
+        assert!(flag.load(Ordering::Relaxed));
+    }
+
     #[test]
     fn display_keeps_the_error_context_chain() {
         let err = anyhow::anyhow!("boom").context("while handling MoneyDeposited");
@@ -1467,6 +2007,10 @@ mod tests {
     fn only_abnormal_reasons_are_failures() {
         assert!(!StopReason::Shutdown.is_failure());
         assert!(!StopReason::LostOwnership.is_failure());
+        // A live bridge whose client disconnected ended normally: reporting it
+        // as a failure would page someone every time a browser tab closed.
+        assert!(!StopReason::StoppedByHandler.is_failure());
+        assert!(StopReason::StoppedByHandler.error().is_none());
         assert!(StopReason::Panicked.is_failure());
 
         let failed = StopReason::Failed(Arc::new(anyhow::anyhow!("boom")));

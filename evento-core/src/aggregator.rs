@@ -597,7 +597,7 @@ impl<E: Executor> AggregateExt<E> for E {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::cursor::{Args, ReadResult, Value};
     use crate::{EventFilter, RoutingKey};
@@ -614,7 +614,9 @@ mod tests {
     }
 
     /// An executor stub for paths that must fail before any storage call.
-    struct UnreachableExecutor;
+    /// Shared with `subscription`'s unit tests, which need an `&E` to build a
+    /// `Context` and must never touch the store through it.
+    pub(crate) struct UnreachableExecutor;
 
     #[async_trait::async_trait]
     impl Executor for UnreachableExecutor {

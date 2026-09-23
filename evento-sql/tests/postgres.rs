@@ -303,3 +303,45 @@ async fn postgres_read_routing_key() -> anyhow::Result<()> {
     let executor = create_postgres_executor("read_routing_key").await?;
     evento_test::read_routing_key(&executor).await
 }
+
+#[tokio::test]
+async fn postgres_subscription_start_from_latest() -> anyhow::Result<()> {
+    let executor = create_postgres_executor("sub_start_from_latest").await?;
+    evento_test::subscription_start_from_latest(&executor).await
+}
+
+#[tokio::test]
+async fn postgres_subscription_ephemeral() -> anyhow::Result<()> {
+    let executor = create_postgres_executor("sub_ephemeral").await?;
+    evento_test::subscription_ephemeral(&executor).await
+}
+
+#[tokio::test]
+async fn postgres_subscription_ephemeral_start_from_latest() -> anyhow::Result<()> {
+    let executor = create_postgres_executor("sub_ephemeral_start_from_latest").await?;
+    evento_test::subscription_ephemeral_start_from_latest(&executor).await
+}
+
+#[tokio::test]
+async fn postgres_subscription_ephemeral_concurrent_same_key() -> anyhow::Result<()> {
+    let executor = create_postgres_executor("sub_ephemeral_concurrent_same_key").await?;
+    evento_test::subscription_ephemeral_concurrent_same_key(&executor).await
+}
+
+#[tokio::test]
+async fn postgres_subscription_context_stop() -> anyhow::Result<()> {
+    let executor = create_postgres_executor("sub_context_stop").await?;
+    evento_test::subscription_context_stop(&executor).await
+}
+
+#[tokio::test]
+async fn postgres_subscription_ephemeral_context_stop() -> anyhow::Result<()> {
+    let executor = create_postgres_executor("sub_ephemeral_context_stop").await?;
+    evento_test::subscription_ephemeral_context_stop(&executor).await
+}
+
+#[tokio::test]
+async fn postgres_subscription_ephemeral_run_once() -> anyhow::Result<()> {
+    let executor = create_postgres_executor("sub_ephemeral_run_once").await?;
+    evento_test::subscription_ephemeral_run_once(&executor).await
+}

@@ -273,6 +273,14 @@ sub.shutdown().await?;
 
 - `.start(exec)` runs a background loop; `.run_once(exec)` drains pending events once and returns.
 - `.strict()` fails on an unhandled event; `.continue_on_error()` keeps going after a handler error.
+- **Live bridge (SSE, WebSocket, fanout):** `.ephemeral()` keeps the cursor in memory — no
+  subscriber row, no fence, no acknowledge, reads only — and `.start_from_latest()` begins at
+  the stream head instead of replaying history (it applies only when there is no cursor yet, so
+  a durable subscription still resumes on restart). A handler ends its own subscription with
+  `ctx.stop()`, reporting `StopReason::StoppedByHandler` — a normal end, not a failure.
+  Neither `.ephemeral()` nor `.start_from_latest()` is offered on `ProjectionSubscription`.
+  One subscription per connection is worth it only when each wants a different slice
+  (`.aggregate::<A>(id)`); otherwise run one fanning out over a `broadcast` channel.
 - Process **all** raw events of an aggregate (no payload deserialization) with
   `#[evento::subscription_all]` + `event: evento::metadata::RawEvent<Account>`;
   call `event.decode()?` for the typed `AccountEvent` when you want it.
@@ -321,7 +329,9 @@ aggregate type as a string; it has no `.decode()`.
   routing key is NULL. `.any_routing_key()` subscriptions are stored per
   executor-default-routing-key, so multi-tenant setups stay isolated.
 - **The subscription key is the cursor identity.** Reusing a key across two different
-  subscriptions makes them share (and corrupt) one cursor. Keep keys unique.
+  subscriptions makes them share (and corrupt) one cursor. Keep keys unique — except under
+  `.ephemeral()`, where nothing is stored under the key and any number of subscriptions may
+  share one concurrently.
 - **Optimistic concurrency:** always pass the correct `original_version` to `append`;
   handle `WriteError::InvalidOriginalVersion` (retry by reloading).
 - **Handler order doesn't matter, coverage does.** Unhandled events are silently

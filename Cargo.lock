@@ -339,6 +339,7 @@ dependencies = [
  "axum",
  "bank",
  "evento",
+ "futures-util",
  "serde",
  "tokio",
  "tracing",

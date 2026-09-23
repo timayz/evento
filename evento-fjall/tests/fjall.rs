@@ -257,3 +257,45 @@ async fn fjall_read_routing_key() -> anyhow::Result<()> {
     let executor = Fjall::temporary()?;
     evento_test::read_routing_key(&executor).await
 }
+
+#[tokio::test]
+async fn fjall_subscription_start_from_latest() -> anyhow::Result<()> {
+    let executor = Fjall::temporary()?;
+    evento_test::subscription_start_from_latest(&executor).await
+}
+
+#[tokio::test]
+async fn fjall_subscription_ephemeral() -> anyhow::Result<()> {
+    let executor = Fjall::temporary()?;
+    evento_test::subscription_ephemeral(&executor).await
+}
+
+#[tokio::test]
+async fn fjall_subscription_ephemeral_start_from_latest() -> anyhow::Result<()> {
+    let executor = Fjall::temporary()?;
+    evento_test::subscription_ephemeral_start_from_latest(&executor).await
+}
+
+#[tokio::test]
+async fn fjall_subscription_ephemeral_concurrent_same_key() -> anyhow::Result<()> {
+    let executor = Fjall::temporary()?;
+    evento_test::subscription_ephemeral_concurrent_same_key(&executor).await
+}
+
+#[tokio::test]
+async fn fjall_subscription_context_stop() -> anyhow::Result<()> {
+    let executor = Fjall::temporary()?;
+    evento_test::subscription_context_stop(&executor).await
+}
+
+#[tokio::test]
+async fn fjall_subscription_ephemeral_context_stop() -> anyhow::Result<()> {
+    let executor = Fjall::temporary()?;
+    evento_test::subscription_ephemeral_context_stop(&executor).await
+}
+
+#[tokio::test]
+async fn fjall_subscription_ephemeral_run_once() -> anyhow::Result<()> {
+    let executor = Fjall::temporary()?;
+    evento_test::subscription_ephemeral_run_once(&executor).await
+}
