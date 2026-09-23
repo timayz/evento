@@ -104,27 +104,36 @@ pub enum RoutingKey {
 /// `Context` wraps an [`RwContext`](crate::context::RwContext) for type-safe
 /// data storage and provides access to the executor for database operations.
 ///
+/// Shared data is registered with [`SubscriptionBuilder::data`] and read back in
+/// a handler by the same type it was registered under. `extract` clones the
+/// value, so that type must be `Clone` and cheap to clone; wrap anything else in
+/// [`Data`](crate::context::Data) and extract it as `Data<T>`.
+///
 /// # Example
 ///
 /// ```rust,no_run
-/// use evento::context::Data;
 /// use evento::cursor::Args;
 /// use evento::metadata::Event;
-/// use evento::subscription::Context;
+/// use evento::subscription::{Context, SubscriptionBuilder};
 /// use evento::Executor;
 ///
 /// # #[evento::aggregate]
 /// # pub enum Account {
 /// #     MoneyDeposited { amount: i64 },
 /// # }
-/// # struct AppConfig;
+/// #[derive(Clone)]
+/// struct AppConfig {
+///     webhook_url: String,
+/// }
+///
 /// #[evento::subscription]
 /// async fn my_handler<E: Executor>(
 ///     context: &Context<'_, E>,
 ///     event: Event<MoneyDeposited>,
 /// ) -> anyhow::Result<()> {
-///     // Access shared data
-///     let config: Data<AppConfig> = context.extract();
+///     // Access shared data (or `context.try_extract::<AppConfig>()?` to get an
+///     // error instead of a panic when it was never registered)
+///     let config: AppConfig = context.extract();
 ///
 ///     // Use executor for queries
 ///     let events = context
@@ -133,6 +142,16 @@ pub enum RoutingKey {
 ///         .await?;
 ///     Ok(())
 /// }
+///
+/// # async fn run<E: Executor + Clone>(executor: &E, config: AppConfig) -> anyhow::Result<()> {
+/// // The other half: whatever a handler extracts must be registered here.
+/// let subscription = SubscriptionBuilder::new("deposits")
+///     .data(config)
+///     .handler(my_handler())
+///     .start(executor)
+///     .await?;
+/// # subscription.shutdown().await?;
+/// # Ok(()) }
 /// ```
 #[derive(Clone)]
 pub struct Context<'a, E: Executor> {
@@ -329,7 +348,41 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
 
     /// Adds shared data to the subscription context.
     ///
-    /// Data added here is accessible in handlers via the context.
+    /// The value is stored under its own type, and a handler reads it back with
+    /// `context.extract::<D>()` (or [`try_extract`](crate::context::RwContext::try_extract)
+    /// for a `Result`). Extraction clones the value out of a read lock, so `D`
+    /// should be `Clone` and cheap to clone — a pool handle, an `Arc`, a small
+    /// config.
+    ///
+    /// For a type that is not `Clone`, or is expensive to clone, register
+    /// `Data::new(value)` and extract it as [`Data<D>`](crate::context::Data).
+    /// The registered and extracted types must match exactly.
+    ///
+    /// ```rust,no_run
+    /// # use evento::{subscription::{Context, SubscriptionBuilder}, metadata::Event, Executor};
+    /// # #[evento::aggregate]
+    /// # pub enum Account { MoneyDeposited { amount: i64 } }
+    /// # #[derive(Clone)]
+    /// # struct AppConfig { webhook_url: String }
+    /// #[evento::subscription]
+    /// async fn on_deposit<E: Executor>(
+    ///     context: &Context<'_, E>,
+    ///     event: Event<MoneyDeposited>,
+    /// ) -> anyhow::Result<()> {
+    ///     let config: AppConfig = context.extract();
+    ///     println!("{} {}", config.webhook_url, event.data.amount);
+    ///     Ok(())
+    /// }
+    ///
+    /// # async fn run<E: Executor + Clone>(executor: &E, config: AppConfig) -> anyhow::Result<()> {
+    /// let subscription = SubscriptionBuilder::new("deposits")
+    ///     .data(config)
+    ///     .handler(on_deposit())
+    ///     .start(executor)
+    ///     .await?;
+    /// # subscription.shutdown().await?;
+    /// # Ok(()) }
+    /// ```
     pub fn data<D: Send + Sync + 'static>(self, v: D) -> Self {
         self.context.insert(v);
 
