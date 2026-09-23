@@ -21,6 +21,13 @@
 //! # …or the whole cluster at once:
 //! make accord.cluster
 //! ```
+//!
+//! A subscription stops on the first handler error unless
+//! `.continue_on_error()` is set, and a stopped projection worker means this
+//! node keeps answering reads from a read model that no longer updates. `/health`
+//! reports that as 503 so an orchestrator depools this replica while the rest of
+//! the cluster keeps serving — the other bank examples, which are single
+//! processes with nothing to fail over to, exit instead.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -63,6 +70,9 @@ type Executor = AccordExecutor<Fjall>;
 #[derive(Clone)]
 struct AppState {
     executor: Arc<Executor>,
+    /// The projection worker behind `/health`. Held as an `Arc` because the
+    /// handler only observes it — `Subscription::stop_reason` takes `&self`.
+    subscription: Arc<evento::subscription::Subscription>,
 }
 
 /// Builds a **single-node** Accord cluster over `local` (a Fjall event store),
@@ -126,6 +136,18 @@ async fn build_cluster_node(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Without a subscriber, every `tracing` event evento emits — including the
+    // error a failing subscription logs on its way out — is a no-op. Accord is
+    // the workspace's busiest emitter, so this is where it pays most. The
+    // default filter mutes the embedded storage engine;
+    // `RUST_LOG=evento_accord=debug` overrides it.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,fjall=warn,lsm_tree=warn".into()),
+        )
+        .init();
+
     // A Fjall-backed event store. A temp directory keeps each run self-contained;
     // swap for a persistent path to keep data across runs.
     // Single-node by default; set NODE_ID=0..N to join the localhost TCP cluster.
@@ -184,14 +206,17 @@ async fn main() -> anyhow::Result<()> {
     // account into the cache) and then streams new/replicated events live. (A
     // stable key would instead resume from the last cursor — wrong for a RAM cache
     // that doesn't survive restarts.)
-    let _subscription = account_details::create_projection()
-        .subscription(format!("account-details-{}", Ulid::generate()))
-        .any_routing_key()
-        .start(&executor)
-        .await?;
+    let subscription = Arc::new(
+        account_details::create_projection()
+            .subscription(format!("account-details-{}", Ulid::generate()))
+            .any_routing_key()
+            .start(&executor)
+            .await?,
+    );
 
     let state = AppState {
         executor: Arc::new(executor),
+        subscription: subscription.clone(),
     };
 
     let app = Router::new()
@@ -210,7 +235,28 @@ async fn main() -> anyhow::Result<()> {
     let web_addr = format!("127.0.0.1:{web_port}");
     let listener = tokio::net::TcpListener::bind(&web_addr).await?;
     println!("Listening on http://{web_addr}");
-    axum::serve(listener, app).await?;
+    // Unlike the other bank examples, this node does not exit when its
+    // projection worker dies — it keeps serving and reports the failure through
+    // `/health`, so an orchestrator depools this replica while the rest of the
+    // cluster stays up. Log it too, since a probe nobody reads is no better
+    // than silence.
+    let watched = subscription.clone();
+    tokio::spawn(async move {
+        let reason = watched.stopped().await;
+        if reason.is_failure() {
+            tracing::error!(%reason, "projection subscription stopped, /health now fails");
+        }
+    });
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await?;
+
+    // `stop` is the `&self` half of `shutdown`, for a handle shared behind an
+    // `Arc` like this one.
+    subscription.stop();
 
     Ok(())
 }
@@ -266,10 +312,18 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body)
 }
 
-/// Liveness probe: 200 while the process is up. Readiness (is this node caught up
-/// and serving fresh reads?) is derived from `/metrics` — see OPERATIONS.md.
-async fn health() -> impl IntoResponse {
-    (StatusCode::OK, "ok")
+/// Liveness probe: 200 while the process is up *and* its projection worker is
+/// still running. A dead worker means this node keeps answering reads from a
+/// read model that has stopped updating — up, but not healthy. Readiness (is
+/// this node caught up?) is derived from `/metrics` — see OPERATIONS.md.
+async fn health(State(state): State<AppState>) -> impl IntoResponse {
+    match state.subscription.stop_reason() {
+        None => (StatusCode::OK, "ok".to_owned()),
+        Some(reason) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("projection subscription stopped: {reason}"),
+        ),
+    }
 }
 
 async fn list_accounts() -> Response {

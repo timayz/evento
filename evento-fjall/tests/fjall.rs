@@ -157,6 +157,12 @@ async fn fjall_subscription_data() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn fjall_subscription_stop_reason() -> anyhow::Result<()> {
+    let (executor, _temp_dir) = create_fjall_executor("subscription_stop_reason")?;
+    evento_test::subscription_stop_reason(&executor).await
+}
+
+#[tokio::test]
 async fn fjall_subscription_all_counts() -> anyhow::Result<()> {
     let (executor, _temp_dir) = create_fjall_executor("subscription_all_counts")?;
     evento_test::subscription_all_counts(&executor).await

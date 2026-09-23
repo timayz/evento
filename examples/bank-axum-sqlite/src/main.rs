@@ -14,6 +14,7 @@
 //! Domain errors (insufficient funds, frozen account, …) surface as
 //! `422 Unprocessable Entity` instead of being silently swallowed.
 
+use std::future::IntoFuture;
 use std::sync::Arc;
 
 use askama::Template;
@@ -43,6 +44,17 @@ struct AppState {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Without a subscriber, every `tracing` event evento emits — including the
+    // error a failing subscription logs on its way out — is a no-op. The
+    // default filter keeps evento audible while muting the embedded storage
+    // engine; `RUST_LOG=evento_core=debug` overrides it.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,fjall=warn,lsm_tree=warn".into()),
+        )
+        .init();
+
     // Create in-memory SQLite database
     let options = SqliteConnectOptions::new()
         .filename(":memory:")
@@ -86,11 +98,22 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
     println!("Listening on http://127.0.0.1:3000");
-    axum::serve(listener, app)
+    let server = axum::serve(listener, app)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })
-        .await?;
+        .into_future();
+    tokio::pin!(server);
+
+    // The projection worker can stop on its own — a handler error (the default
+    // is to stop on the first one), or another process taking over its key. If
+    // it does, the read model silently freezes, so stop serving stale data.
+    tokio::select! {
+        res = &mut server => res?,
+        reason = subscription.stopped() => {
+            tracing::error!(%reason, "projection subscription stopped, shutting down");
+        }
+    }
 
     subscription.shutdown().await?;
     Ok(())

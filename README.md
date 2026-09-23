@@ -34,10 +34,28 @@ does not resolve pre-releases):
 evento = { version = "2.0.0-alpha.27", features = ["sqlite"] }
 bitcode = "0.6"
 anyhow = "1"
+tracing-subscriber = "0.3"
 ```
 
 Swap `sqlite` for `postgres`, `mysql`, `fjall`, or `remote` as needed (see
 [Feature flags](#feature-flags)).
+
+Evento reports itself through [`tracing`](https://crates.io/crates/tracing), which does
+nothing until the application installs a subscriber — so install one in `main` before
+anything else:
+
+```rust,no_run
+fn main() {
+    // Without this, every evento log — including the error a failing
+    // subscription emits on its way out — is silently discarded.
+    // `RUST_LOG=evento_core=debug` turns up the volume.
+    tracing_subscriber::fmt::init();
+}
+```
+
+The default level is `info`. Add `features = ["env-filter"]` and
+`.with_env_filter(..)` when a dependency is chatty at that level — the embedded
+Fjall store is, so every app under [`examples/`](#examples) does exactly that.
 
 ## Quick start
 
@@ -338,11 +356,27 @@ let subscription = SubscriptionBuilder::new("deposit-notifier")
     .start(executor)
     .await?;
 
+// A subscription can also stop on its own — supervise it.
+tokio::select! {
+    _ = tokio::signal::ctrl_c() => {}
+    reason = subscription.stopped() => {
+        tracing::error!(%reason, "subscription stopped, no longer processing events");
+    }
+}
+
 // On application shutdown
 subscription.shutdown().await?;
 # Ok(())
 # }
 ```
+
+By default a subscription **stops on the first handler error** —
+`.continue_on_error()` is opt-in — and a stopped worker never processes another event.
+The handle is how you find out: `stopped()` resolves with a
+[`StopReason`](https://docs.rs/evento/latest/evento/subscription/enum.StopReason.html)
+(`Failed`, `LostOwnership`, `Shutdown`, `Panicked`), `stop_reason()` is the
+non-blocking peek, and `stop()` signals a worker held behind an `Arc`. Combined with the
+subscriber above, a broken handler is visible in minute one instead of hour two.
 
 `.data(v)` stores `v` under its own type; a handler reads it back with
 `ctx.extract::<T>()`, or `ctx.try_extract::<T>()?` to get an error instead of a panic
@@ -552,6 +586,7 @@ plus the [`bank-axum-accord`](examples/bank-axum-accord) 3-node demo.
 | Keep a projection updated | `projection.subscription(key).start(exec)` |
 | Fail on unhandled events | `.strict()` |
 | Keep going after a handler error | `.continue_on_error()` |
+| Notice a stopped subscription | `subscription.stopped().await` → `StopReason` |
 
 Full macro reference: [evento-macro/README.md](evento-macro/README.md).
 
