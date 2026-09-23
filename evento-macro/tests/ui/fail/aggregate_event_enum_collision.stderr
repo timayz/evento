@@ -1,0 +1,5 @@
+error: variant `LedgerEvent` collides with the events enum generated for this aggregate; rename the variant
+ --> tests/ui/fail/aggregate_event_enum_collision.rs:4:5
+  |
+4 |     LedgerEvent { amount: i64 },
+  |     ^^^^^^^^^^^

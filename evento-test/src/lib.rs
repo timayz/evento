@@ -3228,6 +3228,12 @@ mod upcast {
         _context: &Context<'_, E>,
         event: RawEvent<Refund>,
     ) -> anyhow::Result<()> {
+        // `decode()` reconstructs the typed enum from the raw event. It is
+        // verbatim: an old stored event decodes to its own variant, so the
+        // name it reports must equal the name that was stored.
+        let decoded = event.decode()?;
+        assert_eq!(decoded.event_name(), event.name);
+
         RAW.write()
             .unwrap()
             .entry(event.aggregate_id.to_owned())

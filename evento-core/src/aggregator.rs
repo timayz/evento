@@ -150,6 +150,67 @@ pub trait AggregateEvent: Aggregate {
     }
 }
 
+/// Errors from reconstructing a typed aggregate event out of a stored [`Event`].
+///
+/// Returned by the `TryFrom<&Event>` implementation that `#[evento::aggregate]`
+/// generates for the `{Enum}Event` enum, and by
+/// [`RawEvent::decode`](crate::metadata::RawEvent::decode).
+#[derive(Debug, Error)]
+pub enum FromEventError {
+    /// The stored event belongs to a different aggregate type.
+    #[error("event belongs to aggregate `{got}`, expected `{expected}`")]
+    AggregateMismatch {
+        /// Aggregate type of the enum the conversion targeted.
+        expected: &'static str,
+        /// Aggregate type recorded on the stored event.
+        got: String,
+    },
+
+    /// No variant of this aggregate declares the stored event name.
+    #[error("unknown event `{name}` for aggregate `{aggregate_type}`")]
+    UnknownEvent {
+        /// Aggregate type of the enum the conversion targeted.
+        aggregate_type: &'static str,
+        /// The stored event name that matched no variant.
+        name: String,
+    },
+
+    /// The stored payload did not decode into the variant's schema.
+    #[error("failed to decode event `{name}`: {source}")]
+    Decode {
+        /// The stored event name whose payload failed to decode.
+        name: String,
+        /// The underlying bitcode failure.
+        #[source]
+        source: bitcode::Error,
+    },
+}
+
+/// Links an aggregate marker type to the enum of all its events.
+///
+/// Implemented by `#[evento::aggregate]` on the marker struct, pointing at the
+/// generated `{Enum}Event`. It lets a
+/// [`RawEvent<A>`](crate::metadata::RawEvent) decode itself without the caller
+/// having to name the events enum.
+///
+/// # Example
+///
+/// ```rust
+/// use evento::AggregateEvents;
+///
+/// #[evento::aggregate(name = "myapp/Account")]
+/// pub enum Account {
+///     Opened { owner: String },
+/// }
+///
+/// fn assert_linked<A: AggregateEvents>() {}
+/// assert_linked::<Account>();
+/// ```
+pub trait AggregateEvents: Aggregate {
+    /// The generated enum holding one variant per event of this aggregate.
+    type Events: for<'a> TryFrom<&'a Event, Error = FromEventError>;
+}
+
 /// Converts the stored payload of an older event into the payload of the
 /// event it [upcasts](AggregateEvent::upcasters) to.
 ///

@@ -204,6 +204,8 @@ use syn::{parse_macro_input, DeriveInput, ItemFn};
 /// - `Aggregate` trait implementation (provides `aggregate_type()`)
 /// - `AggregateEvent` trait implementation (provides `event_name()`)
 /// - A unit struct with the enum name implementing `Aggregate`
+/// - A `{Enum}Event` enum newtyping the event structs, with
+///   `TryFrom<&evento::Event>` and `AggregateEvents`
 /// - Automatic derives: `Debug`, `Clone`, `PartialEq`, `Default`, and bitcode serialization
 ///
 /// # Aggregate Type Format
@@ -254,6 +256,45 @@ use syn::{parse_macro_input, DeriveInput, ItemFn};
 /// The target must be another variant of the same enum. Self-references and
 /// cycles are rejected, and chains (`V1 -> V2 -> V3`) are folded into a single
 /// conversion; when both `V2` and `V3` have a handler, `V1` goes to the nearest.
+///
+/// # Decoding a stored event
+///
+/// The enum itself becomes the aggregate marker struct, so the events are also
+/// collected into a sibling `{Enum}Event` enum that newtypes them. It turns the
+/// outbound path — SSE, webhooks, outbox tables, audit logs — into an
+/// exhaustive match the compiler checks, instead of a ladder over `event.name`
+/// with a `_` arm that silently swallows new variants.
+///
+/// ```rust
+/// use evento::Aggregate;
+///
+/// #[evento::aggregate(name = "myapp/Account")]
+/// pub enum Account {
+///     Opened { owner: String },
+///     Closed,
+/// }
+///
+/// let stored = evento::Event {
+///     aggregate_type: Account::aggregate_type().to_owned(),
+///     name: "Opened".to_owned(),
+///     data: bitcode::encode(&Opened { owner: "alice".to_owned() }),
+///     ..Default::default()
+/// };
+///
+/// match AccountEvent::try_from(&stored)? {
+///     AccountEvent::Opened(Opened { owner }) => assert_eq!(owner, "alice"),
+///     AccountEvent::Closed(_) => unreachable!(),
+/// }
+/// # Ok::<(), evento::FromEventError>(())
+/// ```
+///
+/// Decoding is verbatim: `#[evento(upcast_to = ...)]` is **not** applied, so an
+/// old stored event decodes to its own variant — the same semantics
+/// `#[evento::subscription_all]` already has. A `RawEvent<A>` handed to such a
+/// handler decodes the same way with `event.decode()?`.
+///
+/// Derives passed to the attribute also land on this enum, so
+/// `#[evento::aggregate(serde::Serialize)]` serializes a whole decoded event.
 ///
 /// # Example
 ///
