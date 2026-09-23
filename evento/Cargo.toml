@@ -1,6 +1,6 @@
 [package]
 name = "evento"
-version = "2.0.0-alpha.28"
+version = "2.0.0-alpha.29"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -19,11 +19,11 @@ rustdoc-args = ["--cfg", "docsrs"]
 ignored = ["anyhow", "bitcode", "serde", "sqlx", "tokio", "tracing", "tracing-subscriber"]
 
 [dependencies]
-evento-core = { path = "../evento-core", version = "2.0.0-alpha.28" }
-evento-sql = { path = "../evento-sql", optional = true, version = "2.0.0-alpha.28" }
-evento-sql-migrator = { path = "../evento-sql-migrator", optional = true, version = "2.0.0-alpha.28" }
-evento-fjall = { path = "../evento-fjall", optional = true, version = "2.0.0-alpha.28" }
-evento-remote = { path = "../evento-remote", optional = true, version = "2.0.0-alpha.28" }
+evento-core = { path = "../evento-core", version = "2.0.0-alpha.29" }
+evento-sql = { path = "../evento-sql", optional = true, version = "2.0.0-alpha.29" }
+evento-sql-migrator = { path = "../evento-sql-migrator", optional = true, version = "2.0.0-alpha.29" }
+evento-fjall = { path = "../evento-fjall", optional = true, version = "2.0.0-alpha.29" }
+evento-remote = { path = "../evento-remote", optional = true, version = "2.0.0-alpha.29" }
 sqlx_migrator = { workspace = true, optional = true }
 
 [dev-dependencies]
