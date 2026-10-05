@@ -2184,24 +2184,50 @@ impl Node {
             if !cmd.keys.iter().any(|k| self.topology.owns(self.id, k)) {
                 continue;
             }
+            // Already applied here (or compacted away below the floor): nothing
+            // to ship. A cheap pre-check; `import_applied` re-checks under the
+            // lock, so a concurrent local apply only costs one idempotent
+            // data-store write.
+            if self
+                .replica
+                .lock()
+                .expect("replica poisoned")
+                .deps_applied(std::slice::from_ref(&cmd.txn))
+            {
+                continue;
+            }
             let (txn, execute_at, events) = (cmd.txn, cmd.execute_at, cmd.events.clone());
             let commit = cmd.applied_conflict == Some(false);
+            // Materialise the events in the data store **before** recording the
+            // command as `Applied`. `Status::Applied` is the promise that a
+            // transaction's effect is visible in the store: the read barrier
+            // (`deps_applied`) and the execution gate (`is_ready`) both trust it.
+            // Marking first — as this used to — opened a window in which a
+            // linearizable read woken by any other apply served the local store
+            // without this command's events (a stale read), and in which a
+            // dependent transaction executed ahead of it, writing a version gap
+            // the backend rejects and the store swallows as a duplicate — losing
+            // every later event on that key here (a lasting divergence).
+            //
+            // On bootstrap the snapshot already materialised these events. A
+            // failed apply leaves the command un-imported so the next
+            // anti-entropy round ships it again.
+            if !want_snapshot
+                && self
+                    .datastore
+                    .apply(txn, execute_at, events, commit)
+                    .await
+                    .is_err()
+            {
+                apply_failed = true;
+                continue;
+            }
             let inserted = self
                 .replica
                 .lock()
                 .expect("replica poisoned")
                 .import_applied(cmd);
             if inserted {
-                // On bootstrap the snapshot already materialised these events.
-                if !want_snapshot
-                    && self
-                        .datastore
-                        .apply(txn, execute_at, events, commit)
-                        .await
-                        .is_err()
-                {
-                    apply_failed = true;
-                }
                 imported += 1;
             }
         }
