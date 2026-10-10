@@ -365,8 +365,17 @@ async fn connect(to: NodeId, addr: SocketAddr, tls: &Option<TlsClient>) -> Optio
 }
 
 /// Drains a peer's outbound queue to a (TLS or plain) connection, connecting on
-/// demand and reconnecting after a failure. Frames sent while the peer is
-/// unreachable are dropped (loss is tolerated by the protocol).
+/// demand and reconnecting after a failure. Frames are written in batches (the
+/// first queued frame plus everything already waiting, one flush), so a burst
+/// costs one syscall instead of one per frame.
+///
+/// A write that fails is **retried once over a fresh connection**: the usual
+/// cause is a stale connection to a peer that restarted, where the first write
+/// after the restart fails. Without the retry that frame was dropped and only
+/// the *next* one reconnected — on a multiplexed transport one connection
+/// carries every group, so one stale connection cost every tenant a frame. A
+/// batch whose peer cannot be reached at all (connect fails) is dropped; loss is
+/// tolerated by quorums and recovery.
 async fn peer_writer(
     to: NodeId,
     addr: SocketAddr,
@@ -374,33 +383,40 @@ async fn peer_writer(
     tls: Option<TlsClient>,
 ) {
     let mut conn: Option<Framed<ClientStream, LengthDelimitedCodec>> = None;
-    while let Some(bytes) = rx.recv().await {
-        if conn.is_none() {
-            match connect(to, addr, &tls).await {
-                Some(stream) => conn = Some(Framed::new(stream, codec())),
-                None => continue,
-            }
-        }
-        let Some(framed) = conn.as_mut() else {
-            continue;
-        };
-        // Coalesce: feed this frame plus everything already queued, then flush
-        // once — one syscall per burst instead of one per frame.
-        if framed.feed(bytes).await.is_err() {
-            conn = None;
-            continue;
-        }
-        let mut failed = false;
+    while let Some(first) = rx.recv().await {
+        // Coalesce this frame with everything already queued.
+        let mut batch = vec![first];
         while let Ok(bytes) = rx.try_recv() {
-            if framed.feed(bytes).await.is_err() {
-                failed = true;
+            batch.push(bytes);
+        }
+        for _attempt in 0..2 {
+            if conn.is_none() {
+                conn = connect(to, addr, &tls)
+                    .await
+                    .map(|stream| Framed::new(stream, codec()));
+            }
+            let Some(framed) = conn.as_mut() else {
+                // Unreachable right now: drop the batch, reconnect on the next.
+                break;
+            };
+            if write_batch(framed, &batch).await.is_ok() {
                 break;
             }
-        }
-        if failed || framed.flush().await.is_err() {
+            // Stale or broken connection: reconnect and resend once.
             conn = None;
         }
     }
+}
+
+/// Feeds every frame of `batch`, then flushes once.
+async fn write_batch(
+    framed: &mut Framed<ClientStream, LengthDelimitedCodec>,
+    batch: &[Bytes],
+) -> std::io::Result<()> {
+    for bytes in batch {
+        framed.feed(bytes.clone()).await?;
+    }
+    framed.flush().await
 }
 
 // ---------------------------------------------------------------------------

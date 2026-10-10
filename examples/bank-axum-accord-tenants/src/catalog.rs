@@ -20,10 +20,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use evento::cursor::{Args, Value};
 use evento::metadata::Event;
 use evento::migrator::{Migrate, Plan};
 use evento::subscription::{Context, Subscription, SubscriptionBuilder};
-use evento::{Executor, WriteError};
+use evento::{EventFilter, Executor, WriteError};
 use evento_accord::{
     AccordExecutor, DataStore, ExecutorDataStore, GroupHost, GroupId, Journal, NodeConfig, NodeId,
     StaticTopology, Topology,
@@ -84,6 +85,10 @@ pub struct TenantRegistry {
     open: Mutex<HashMap<GroupId, OpenTenant>>,
     /// Serializes opening one group (see `ensure_open`).
     open_locks: Mutex<HashMap<GroupId, Arc<tokio::sync::Mutex<()>>>>,
+    /// How far `refresh_catalog` has read the catalog stream.
+    catalog_cursor: Mutex<Option<Value>>,
+    /// Serializes `refresh_catalog` (several unrouted frames can trigger it at once).
+    refresh_lock: tokio::sync::Mutex<()>,
 }
 
 /// Tenants created within this many seconds are opened eagerly by every host when
@@ -119,6 +124,8 @@ impl TenantRegistry {
             by_group: RwLock::new(HashMap::new()),
             open: Mutex::new(HashMap::new()),
             open_locks: Mutex::new(HashMap::new()),
+            catalog_cursor: Mutex::new(None),
+            refresh_lock: tokio::sync::Mutex::new(()),
         }))
     }
 
@@ -386,29 +393,89 @@ impl TenantRegistry {
         }
     }
 
-    /// The transport's unrouted-group hook: a peer sent frames for a group this host
-    /// has not registered. Re-open it **only if the catalog knows it** (an evicted
-    /// tenant); anything else is ignored — the wire cannot create tenants. Runs on
-    /// the connection's read task, so the open is spawned.
-    pub fn reopen(self: &Arc<Self>, group: GroupId) {
-        let slug = self
-            .by_group
+    fn slug_of(&self, group: GroupId) -> Option<String> {
+        self.by_group
             .read()
             .expect("by_group poisoned")
             .get(&group)
-            .cloned();
-        let Some(slug) = slug else {
-            tracing::debug!(group = group.0, "frames for an unknown group ignored");
-            return;
-        };
-        let Some(info) = self.info(&slug) else {
-            return;
-        };
-        if info.suspended {
-            return;
+            .cloned()
+    }
+
+    /// Reads the catalog stream past where this registry last looked and learns
+    /// every tenant it finds. The catalog *subscription* only sees an event once it
+    /// is below the stability watermark (about a second), but the catalog group
+    /// applies it to this host's `system.db` within milliseconds of the commit — so
+    /// this is how a host finds out about a tenant another host created a moment
+    /// ago, when that tenant's first write is already knocking (`reopen`). Returns
+    /// how many catalog events were read.
+    pub async fn refresh_catalog(&self) -> anyhow::Result<usize> {
+        let _serial = self.refresh_lock.lock().await;
+        let filters: Arc<[EventFilter]> = Arc::from(vec![
+            EventFilter::by_event::<TenantCreated>(),
+            EventFilter::by_event::<TenantSuspended>(),
+        ]);
+        const PAGE: u16 = 200;
+        let mut read = 0;
+        loop {
+            let after = self.catalog_cursor.lock().expect("cursor poisoned").clone();
+            let page = self
+                .system
+                .read(
+                    Some(filters.clone()),
+                    None,
+                    Args::forward(PAGE, after),
+                    None,
+                )
+                .await?;
+            let full = page.edges.len() >= usize::from(PAGE);
+            for edge in page.edges {
+                let slug = edge.node.aggregate_id.clone();
+                match TenantEvent::try_from(&edge.node) {
+                    Ok(TenantEvent::TenantCreated(TenantCreated { name })) => {
+                        self.learn(TenantInfo {
+                            group: Self::group_of(&slug),
+                            slug,
+                            name,
+                            suspended: false,
+                        })
+                    }
+                    Ok(TenantEvent::TenantSuspended(_)) => self.mark_suspended(&slug),
+                    Err(err) => tracing::warn!(%slug, error = %err, "undecodable catalog event"),
+                }
+                *self.catalog_cursor.lock().expect("cursor poisoned") = Some(edge.cursor);
+                read += 1;
+            }
+            if !full {
+                return Ok(read);
+            }
         }
+    }
+
+    /// The transport's unrouted-group hook: a peer sent frames for a group this host
+    /// has not registered. Open it **only if the catalog knows it** — an evicted
+    /// tenant, or one created on another host so recently that this host's catalog
+    /// subscription has not delivered it yet (so the catalog is re-read first).
+    /// Anything the catalog does not know is ignored: the wire cannot create
+    /// tenants. Runs on the connection's read task, so all the work is spawned.
+    pub fn reopen(self: &Arc<Self>, group: GroupId) {
         let registry = Arc::clone(self);
         tokio::spawn(async move {
+            if registry.slug_of(group).is_none() {
+                if let Err(err) = registry.refresh_catalog().await {
+                    tracing::warn!(group = group.0, error = %err, "catalog refresh failed");
+                    return;
+                }
+            }
+            let Some(slug) = registry.slug_of(group) else {
+                tracing::debug!(group = group.0, "frames for an unknown group ignored");
+                return;
+            };
+            let Some(info) = registry.info(&slug) else {
+                return;
+            };
+            if info.suspended {
+                return;
+            }
             if let Err(err) = registry.ensure_open(&info).await {
                 tracing::warn!(tenant = %info.slug, error = %err, "re-open failed");
             }
@@ -523,4 +590,131 @@ async fn open_db(path: &Path) -> anyhow::Result<(Sql<Sqlite>, SqlitePool)> {
     // the same pool would not share the write-wake channel subscriptions rely on.
     let sql: Sql<Sqlite> = pool.clone().into();
     Ok((sql, pool))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::SocketAddr;
+    use std::sync::OnceLock;
+
+    use bank::{AccountType, Command, OpenAccount};
+    use evento_accord::{MuxTransport, SweepConfig, SweepScheduler};
+    use tokio::net::TcpListener;
+
+    struct Host {
+        registry: Arc<TenantRegistry>,
+        dir: PathBuf,
+        _tasks: Vec<tokio::task::JoinHandle<()>>,
+    }
+
+    /// `n` hosts over localhost TCP, each with its catalog group open and **no**
+    /// catalog subscription — so the unrouted hook is the only way a host learns
+    /// about a tenant another host created.
+    async fn hosts(n: u64) -> Vec<Host> {
+        let ids: Vec<NodeId> = (0..n).map(NodeId).collect();
+        let mut listeners = Vec::new();
+        let mut peers: HashMap<NodeId, SocketAddr> = HashMap::new();
+        for &id in &ids {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            peers.insert(id, listener.local_addr().unwrap());
+            listeners.push((id, listener));
+        }
+        let mut hosts = Vec::new();
+        for (id, listener) in listeners {
+            let slot: Arc<OnceLock<Arc<TenantRegistry>>> = Arc::new(OnceLock::new());
+            let hook = Arc::clone(&slot);
+            let mux = Arc::new(MuxTransport::new(id, peers.clone()).with_unrouted_handler(
+                move |group| {
+                    if let Some(registry) = hook.get() {
+                        registry.reopen(group);
+                    }
+                },
+            ));
+            let mut tasks = vec![mux.serve(listener)];
+            let scheduler = SweepScheduler::new(SweepConfig::default());
+            tasks.push(scheduler.start());
+            let host = Arc::new(GroupHost::new(mux, scheduler));
+            let dir = std::env::temp_dir().join(format!(
+                "tenants-catalog-test-{}-{}",
+                ulid::Ulid::generate(),
+                id.0
+            ));
+            let registry = TenantRegistry::new(host, ids.clone(), dir.clone(), 8)
+                .await
+                .unwrap();
+            let _ = slot.set(Arc::clone(&registry));
+            hosts.push(Host {
+                registry,
+                dir,
+                _tasks: tasks,
+            });
+        }
+        hosts
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_peer_learns_a_just_created_tenant_from_its_first_frames() {
+        let hosts = hosts(2).await;
+        let (a, b) = (&hosts[0].registry, &hosts[1].registry);
+
+        // Create on A and write immediately. B has never heard of "acme": its
+        // catalog subscription is not running, so only A's consensus frames —
+        // parked, reported to the hook, which re-reads the catalog — can tell it.
+        let info = a.create("acme", "Acme").await.unwrap();
+        assert!(b.info("acme").is_none(), "B knows nothing yet");
+        let executor = a.executor("acme").await.unwrap().unwrap();
+        let account = Command(executor)
+            .open_account(OpenAccount {
+                owner_id: "o".into(),
+                owner_name: "Ann".into(),
+                account_type: AccountType::Checking,
+                currency: "EUR".into(),
+                initial_balance: 100,
+            })
+            .await
+            .unwrap();
+
+        // B opens the tenant from the hook and converges on the write.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if b.host().is_open(info.group) {
+                if let Ok(Some(executor)) = b.executor("acme").await {
+                    if let Ok(Some(view)) =
+                        bank::load_account_details(&executor, &account, "").await
+                    {
+                        assert_eq!(view.balance, 100);
+                        break;
+                    }
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "B never opened acme / saw the account"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(hosts[1].dir.join("tenants").join("acme.db").exists());
+
+        // Frames for a group the catalog does not know never create anything.
+        b.reopen(GroupId(0xdead_beef));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(b.open_count(), 1);
+        assert_eq!(
+            std::fs::read_dir(hosts[1].dir.join("tenants"))
+                .unwrap()
+                .filter(|e| e
+                    .as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|x| x == "db"))
+                .count(),
+            1
+        );
+
+        for h in &hosts {
+            let _ = std::fs::remove_dir_all(&h.dir);
+        }
+    }
 }

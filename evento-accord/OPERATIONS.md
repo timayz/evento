@@ -269,7 +269,25 @@ file is also the consensus journal, so keep `synchronous(Full)` under WAL. Build
 | `MuxTransport::with_inbox_capacity` | 1024 | Per-group inbound inbox. |
 
 Caveat: a per-peer connection and queue are shared, so one group's 64 MB bootstrap
-`SyncData` delays the others' frames on that link.
+`SyncData` delays the others' frames on that link. (A write that fails on a stale
+connection — the peer restarted — is retried once over a fresh one, so one dead
+connection does not cost every group a frame.)
+
+**A tenant's first write races its peers' opens.** The creating host opens the group
+and writes at once; a peer that has not opened it yet parks the frames. If the peer's
+open (file create + migrate) outlasts `fast_timeout` the write takes the slow path; if
+it outlasts `collect_timeout` (5 s) on enough peers the write fails. So peers must learn
+of a new tenant *fast*: the example's unrouted hook re-reads the catalog stream from the
+local system store (applied within milliseconds of the commit) before deciding a group
+is unknown, instead of waiting for the catalog subscription (which trails the stability
+watermark by about a second). Keep per-tenant opens cheap, or raise `collect_timeout`.
+
+**CPU-bound test rigs.** Every committed write is two fsynced SQLite transactions per
+replica (journal flush, event apply), and a debug build multiplies the encode and
+query-building cost roughly tenfold — six or more replicas in one debug process can
+exceed `collect_timeout` under load. Measure in release before tuning; for a load-test
+project, `[profile.dev.package."*"] opt-level = 2` builds dependencies optimized while
+your own code stays debuggable.
 
 ---
 
