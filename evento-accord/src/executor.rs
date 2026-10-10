@@ -40,8 +40,10 @@ use crate::node::Node;
 const SNAPSHOT_PAGE_SIZE: u16 = 4096;
 
 /// The single key a read targets, if it can be pinned to one shard: an explicit
-/// routing key, or a query for one aggregate by id. Broad scans (multiple
-/// aggregates, or by event type) return `None` and are served locally.
+/// routing key, or a query for one aggregate by id — however many filters spell
+/// it out (a projection load issues one filter per handled event type, all for
+/// the same id). Broad scans (several aggregate ids, or by event type alone)
+/// return `None` and are served locally.
 ///
 /// **Caveat:** the write side derives the shard key from `routing_key` falling
 /// back to the aggregate id ([`Key::of`]). A by-id pin is therefore only
@@ -56,9 +58,65 @@ fn target_key(
     if let Some(RoutingKey::Value(Some(key))) = routing_key {
         return Some(Key(key.clone()));
     }
-    match aggregators.as_deref() {
-        Some([only]) => only.aggregate_id.clone().map(Key),
-        _ => None,
+    let filters = aggregators.as_deref()?;
+    let (first, rest) = filters.split_first()?;
+    let id = first.aggregate_id.as_deref()?;
+    rest.iter()
+        .all(|f| f.aggregate_id.as_deref() == Some(id))
+        .then(|| Key(id.to_owned()))
+}
+
+#[cfg(test)]
+mod target_key_tests {
+    use super::*;
+
+    fn filter(id: Option<&str>, name: Option<&str>) -> EventFilter {
+        EventFilter {
+            aggregate_type: "t/A".into(),
+            aggregate_id: id.map(str::to_owned),
+            name: name.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn pins_one_aggregate_however_many_filters_name_it() {
+        let one: Arc<[EventFilter]> = Arc::from(vec![filter(Some("a"), None)]);
+        assert_eq!(target_key(&Some(one), &None), Some(Key("a".into())));
+        // A projection load: one filter per handled event, same id.
+        let many: Arc<[EventFilter]> = Arc::from(vec![
+            filter(Some("a"), Some("Opened")),
+            filter(Some("a"), Some("Deposited")),
+            filter(Some("a"), None),
+        ]);
+        assert_eq!(target_key(&Some(many), &None), Some(Key("a".into())));
+    }
+
+    #[test]
+    fn broad_scans_are_not_pinned() {
+        let by_type: Arc<[EventFilter]> = Arc::from(vec![filter(None, Some("Opened"))]);
+        assert_eq!(target_key(&Some(by_type), &None), None);
+        let two_ids: Arc<[EventFilter]> =
+            Arc::from(vec![filter(Some("a"), None), filter(Some("b"), None)]);
+        assert_eq!(target_key(&Some(two_ids), &None), None);
+        let mixed: Arc<[EventFilter]> =
+            Arc::from(vec![filter(Some("a"), None), filter(None, Some("Opened"))]);
+        assert_eq!(target_key(&Some(mixed), &None), None);
+        let empty: Arc<[EventFilter]> = Arc::from(Vec::<EventFilter>::new());
+        assert_eq!(target_key(&Some(empty), &None), None);
+        assert_eq!(target_key(&None, &None), None);
+    }
+
+    #[test]
+    fn an_explicit_routing_key_wins() {
+        let two_ids: Arc<[EventFilter]> =
+            Arc::from(vec![filter(Some("a"), None), filter(Some("b"), None)]);
+        assert_eq!(
+            target_key(
+                &Some(two_ids),
+                &Some(RoutingKey::Value(Some("tenant".into())))
+            ),
+            Some(Key("tenant".into()))
+        );
     }
 }
 

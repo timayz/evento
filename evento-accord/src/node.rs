@@ -33,6 +33,7 @@ use crate::failure_detector::FailureDetector;
 use crate::message::{CommandState, Key, Message, Status, SyncKnown};
 use crate::metrics::{Metrics, MetricsSnapshot};
 use crate::replica::Replica;
+use crate::sweep::SweepPressure;
 use crate::transport::Envelope;
 
 /// Tunable timing/sizing parameters for a [`Node`]. [`Default`] reproduces the
@@ -479,6 +480,35 @@ impl Node {
                 node.recovery_sweep().await;
             }
         })
+    }
+
+    /// One iteration of the loop [`start_recovery`](Node::start_recovery) runs:
+    /// recover stalled transactions, one anti-entropy round, watermark gossip +
+    /// compaction, metadata catch-up. For a process hosting **many** nodes (one
+    /// consensus group per tenant), drive this from a shared
+    /// [`SweepScheduler`](crate::sweep::SweepScheduler) instead of starting a
+    /// recovery task per node — it sweeps idle groups far less often. Not
+    /// re-entrant: do not run two sweeps of one node concurrently.
+    pub async fn sweep(&self) {
+        self.recovery_sweep().await;
+    }
+
+    /// Cheap liveness signal for a shared [`SweepScheduler`](crate::sweep::SweepScheduler):
+    /// whether this node has un-applied or in-flight work (must be swept at full
+    /// cadence), and a monotone counter that moves only when applied state
+    /// advances (an apply or an anti-entropy import — *not* on sweep gossip, so
+    /// idle peers cannot keep each other awake).
+    pub fn sweep_pressure(&self) -> SweepPressure {
+        let busy = self
+            .replica
+            .lock()
+            .expect("replica poisoned")
+            .has_unapplied()
+            || !self.pending.lock().expect("pending poisoned").is_empty();
+        SweepPressure {
+            busy,
+            activity: *self.applied_gen.borrow(),
+        }
     }
 
     /// Rebuilds this node's state from the journal after a process restart:
@@ -1494,6 +1524,14 @@ impl Node {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
+
+        tracing::debug!(
+            node = self.id.0,
+            ?key,
+            probes = slow_q,
+            deps = deps.len(),
+            "read barrier"
+        );
 
         // Wait until they are all applied locally, then the caller reads.
         //

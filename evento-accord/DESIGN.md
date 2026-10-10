@@ -107,6 +107,21 @@ trait** (recommended over gRPC/QUIC) — ✅ implemented in `tcp.rs`:
 
 The trait isolates the choice; `tonic` stays a swap-in if we later want TLS/codegen.
 
+**Many groups per process (`MuxTransport`).** A process hosting one consensus group
+per tenant (one `Node`, one data store, one journal each — the per-tenant-database
+shape) multiplexes them over **one** connection set: a `GroupFrame` (its own additive
+`RecordKind`, so a legacy `Frame` still decodes and a pre-upgrade reader simply sheds
+it) carries a `GroupId` next to `from`, `mux.sink(group)` stamps it, and the single
+accept loop demuxes into per-group inboxes. `Envelope`, `Node`, and the protocol are
+untouched — a `TxnId`/`Ballot`/watermark is only ever compared within one group, so
+every group reuses the same `NodeId`s. Frames for a group not yet registered are
+parked briefly and replayed on `register` (a tenant being opened keeps its first
+write's fast path); a hook reports unrouted groups so an evicted tenant can be
+re-opened, while the wire can never create one. The companion `SweepScheduler` drives
+every node's recovery sweep from one task, at full cadence only while a node is busy
+or its applied state recently moved — idle groups sweep every few seconds, staggered —
+so a thousand idle groups do not gossip tens of thousands of frames a second.
+
 Membership for the first milestones is **static config** (fixed node-id ↔
 address list). Dynamic membership / gossip is deferred to M4.
 
@@ -644,6 +659,11 @@ backend (sql/fjall). Phases, in order:
         version at a time); a future field addition bumps `FORMAT_VERSION` and adds a
         per-version `decode_tagged` branch. Pre-1.0: the tag is mandatory, with no reader
         for untagged records (upgrade-from-untagged wipes and re-bootstraps via `join`).
+        A new payload *type* is **additive** instead — a fresh `RecordKind`, no version
+        bump (the version byte is shared with the journal, so bumping it for a wire-only
+        addition would invalidate every journal on disk): `GroupFrame` (kind 6, the
+        multiplexed wire frame) was added this way, `TcpTransport` still emits kind 1,
+        and an older build sheds kind 6 as an unknown kind.
   - [x] **Snapshot-at-scale** — `ExecutorDataStore::version`/`snapshot` now **paginate**
         the backend (`SNAPSHOT_PAGE_SIZE`-event pages, walking until exhausted) instead
         of a single `u16::MAX`-capped page, so an aggregate (or store) of any size is

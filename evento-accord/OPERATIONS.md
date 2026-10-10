@@ -11,6 +11,9 @@ This is the *ops* companion to [`DESIGN.md`](./DESIGN.md) (which covers the prot
 Worked, copy-pasteable deployments live in the examples:
 - `examples/bank-axum-accord` — a node over TCP (single-node or a 3-node localhost
   cluster), with `/metrics` and `/health` endpoints.
+- `examples/bank-axum-accord-tenants` — **many consensus groups per process**: one
+  SQLite file and one Accord group per tenant, tenants created at runtime through a
+  replicated catalog, over one multiplexed transport (§10).
 - `examples/jepsen-node` — a node over real TCP with a durable `FjallJournal`.
 
 ---
@@ -114,6 +117,7 @@ Serve it on an HTTP endpoint (see `bank-axum-accord`'s `/metrics`). Counters:
 | `journal_flushes` | group-commit activity; **0 while writing** = the journal can't fsync (see §9). |
 | `messages_handled` | liveness/traffic. |
 | `messages_shed` | inbound backpressure drops; sustained > 0 = a node is overloaded or a peer is flooding. |
+| `messages_unrouted` | (`MuxTransport` only) inbound frames for a group this host has not registered that were dropped — parked past the pending-buffer TTL or over its bounds. Steady > 0 = peers address groups this host never opens (a tenant evicted here and never re-opened, or a stale/unknown group id). |
 
 **Health/readiness.**
 - *Liveness:* a simple `200` while the process is up (`bank-axum-accord`'s `/health`).
@@ -198,7 +202,78 @@ real-time guarantees across nodes.
 
 ---
 
-## 10. Pre-production checklist
+## 10. Many groups per process (multi-tenant)
+
+One `Node` is one consensus group over one data store and one journal. To give every
+tenant its own database (hard isolation) you run **one group per tenant**, and a
+process hosts *all* of its tenants' groups at once. Three pieces make that cheap at a
+thousand-plus groups per process; none of them changes the protocol or the `Node`:
+
+- **`MuxTransport`** — one connection set per process shared by every group. Each
+  frame carries a `GroupId` (an additive wire record kind; a classic `TcpTransport`
+  node still interoperates in `GroupId::DEFAULT`). `mux.sink(group)` is a group's
+  `MessageSink`; `mux.register(group)` its inbox; `mux.serve(listener)` the single
+  accept loop (`serve_tls` / `serve_tls_verified` for mTLS — the pinned identity
+  applies to every group on a connection).
+- **`SweepScheduler`** — one task drives every node's recovery/anti-entropy/
+  compaction sweep instead of a 100 ms task per node. A node with un-applied work, or
+  whose applied state moved within `active_hold`, sweeps every tick (the recovery
+  bound is unchanged); an idle one sweeps once per `idle_interval`, staggered. Without
+  it, 1000 idle groups at N=3 gossip ~28k frames/s per process; with the defaults,
+  ~800.
+- **`GroupHost`** — `open(group, topology, datastore, journal, config)` does the
+  per-group wiring (register → sink → `Node::new` → `recover_state` → `start` →
+  schedule) and `close(group)` undoes it.
+
+```rust
+let mux = Arc::new(MuxTransport::new(id, peer_addrs).with_unrouted_handler(reopen));
+mux.serve(listener);
+let scheduler = SweepScheduler::new(SweepConfig::default());
+scheduler.start();
+let host = GroupHost::new(Arc::clone(&mux), scheduler);
+// per tenant:
+let node = host.open(group, topology, store, journal, cfg).await?;
+let executor = AccordExecutor::new(node, sql);
+```
+
+**Tenants created at runtime.** Every host must learn about a new tenant on its own,
+and the wire must never be able to *create* one. The example does this with a
+**catalog group** (`GroupId::DEFAULT`, its own `system.db`) holding a `Tenant`
+aggregate: creating a tenant is a replicated write (duplicate slugs are rejected
+cluster-wide by the version condition), and each host runs a subscription on the
+catalog that opens the tenant's database + group when it sees `TenantCreated`. The
+**pending-register buffer** (`with_pending_buffer`, default 64 frames × 1024 groups ×
+5 s) parks frames for a group that is still being opened and replays them on
+`register`, so the first write to a brand-new tenant keeps its fast path. The
+**unrouted handler** (`with_unrouted_handler`) is told (rate-limited) about frames for
+an unregistered group — use it to re-open an *evicted* tenant from your catalog; ignore
+ids the catalog does not know.
+
+**SQLite footprint.** sqlx-sqlite runs one OS thread per *open* connection, so bound
+each tenant pool (`max_connections(2–3)`, `min_connections(0)`, an `idle_timeout`) and
+cap the number of tenants open per process (LRU; `host.close` + `pool.close()` on
+eviction — a closed tenant catches up via anti-entropy when re-opened). The tenant
+file is also the consensus journal, so keep `synchronous(Full)` under WAL. Build
+**one** `Sql` per tenant and clone it into both `ExecutorDataStore` and
+`AccordExecutor` — two `.into()`s from one pool do not share the write-wake channel.
+
+**Knobs and bounds.**
+
+| | Default | Meaning |
+|-|---------|---------|
+| `SweepConfig.tick` | 100 ms | Busy/active cadence; match `recovery_interval`. |
+| `SweepConfig.active_hold` | 3 s | Full cadence after applied state moved; must cover `compaction_margin` + a few anti-entropy rounds so a burst compacts before backing off. |
+| `SweepConfig.idle_interval` | 5 s | Idle cadence; bounds an idle group's anti-entropy convergence and metadata catch-up. |
+| `SweepConfig.max_concurrent` | 64 | Sweeps in flight at once; a due node that finds no slot is retried next tick (`SweepStats.sweeps_deferred`). Size above your simultaneously-active tenants. |
+| `MuxTransport::with_queue_capacity` | 1024 | Per-peer outbound queue, shared by all groups — raise for many groups bursting at once (a full queue sheds for all of them). |
+| `MuxTransport::with_inbox_capacity` | 1024 | Per-group inbound inbox. |
+
+Caveat: a per-peer connection and queue are shared, so one group's 64 MB bootstrap
+`SyncData` delays the others' frames on that link.
+
+---
+
+## 11. Pre-production checklist
 
 - [ ] Odd `N` (3 or 5); replicas in independent failure domains.
 - [ ] **Durable** journal (`FjallJournal`/`SqlJournal`), not `InMemoryJournal`.
