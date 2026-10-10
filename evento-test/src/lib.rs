@@ -4333,16 +4333,33 @@ pub async fn subscription_context_stop<E: Executor + Clone>(executor: &E) -> any
         "a bridge whose consumer went away ended normally: {reason}"
     );
 
+    // Exactly two of the three were delivered. Which two is a property of the
+    // store's cursor order, not of creation order: two accounts opened within
+    // the same millisecond carry the same timestamp, and the id tie-break is a
+    // random ULID suffix — so the assertion is on the count and membership,
+    // and the rest of the scenario is phrased in terms of what was delivered.
+    let delivered = seen.snapshot();
     assert_eq!(
-        seen.snapshot(),
-        ids[..2].to_vec(),
-        "no event may be delivered after the handler asked to stop"
+        delivered.len(),
+        2,
+        "no event may be delivered after the handler asked to stop: {delivered:?}"
     );
+    assert!(
+        delivered.iter().all(|id| ids.contains(id)),
+        "only this scenario's accounts may be delivered: {delivered:?}"
+    );
+    let stopped_on = delivered[1].clone();
+    let remaining: Vec<String> = ids
+        .iter()
+        .filter(|id| !delivered.contains(id))
+        .cloned()
+        .collect();
+    assert_eq!(remaining.len(), 1, "one account is left for the resume");
 
     // The stopping event *was* processed, so it must have been acknowledged:
-    // a resume picks up at the third account, not the second. Asserted through
-    // delivery rather than by comparing opaque cursor values, so it holds on
-    // every backend.
+    // a resume picks up at the remaining account, not the one stopped on.
+    // Asserted through delivery rather than by comparing opaque cursor values,
+    // so it holds on every backend.
     let resumed_seen = live_bridge::Seen::new();
     let resumed = live_bridge::subscription(&key)
         .data(resumed_seen.clone())
@@ -4351,12 +4368,12 @@ pub async fn subscription_context_stop<E: Executor + Clone>(executor: &E) -> any
         .await?;
 
     resumed_seen
-        .wait_for(&ids[2], Duration::from_secs(15))
+        .wait_for(&remaining[0], Duration::from_secs(15))
         .await?;
     resumed.shutdown().await?;
 
     assert!(
-        !resumed_seen.snapshot().contains(&ids[1]),
+        !resumed_seen.snapshot().contains(&stopped_on),
         "the event the handler stopped on must have been acknowledged before stopping"
     );
 
