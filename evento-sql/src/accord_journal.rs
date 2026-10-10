@@ -281,11 +281,16 @@ where
         }
         tx.commit().await?;
 
-        // Drain exactly what was flushed; entries staged mid-transaction stay.
+        // Drop exactly what was flushed; entries staged mid-transaction stay.
+        // By entry, not by position: a concurrent `truncate` may have purged
+        // part of `staged` while the transaction ran, so the batch is no
+        // longer a prefix of it (and draining `batch.len()` entries would
+        // overrun — or worse, drop entries never flushed).
+        let flushed: std::collections::HashSet<&(Vec<u8>, Vec<u8>)> = batch.iter().collect();
         self.staged
             .lock()
             .expect("journal poisoned")
-            .drain(..batch.len());
+            .retain(|entry| !flushed.contains(entry));
         Ok(())
     }
 
