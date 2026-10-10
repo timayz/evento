@@ -39,6 +39,13 @@
 //!   with a per-version branch (e.g. deserialize the old layout, then fill new fields
 //!   with defaults). The version byte is what selects that branch; without it the old
 //!   bytes would parse as the new layout and corrupt state.
+//! - **New record kinds are additive.** A new payload *type* (not a changed layout of an
+//!   existing one) gets a fresh [`RecordKind`] and leaves `FORMAT_VERSION` alone — the
+//!   version byte is shared by the wire and the journal, so bumping it for a wire-only
+//!   addition would needlessly invalidate every journal on disk. An older build sheds
+//!   the unknown kind (`decode_tagged` fails on it), which is loss the consensus layer
+//!   tolerates. [`RecordKind::GroupFrame`] (the multiplexed wire frame of
+//!   `crate::tcp::MuxTransport`) was added this way.
 
 use serde::{de::DeserializeOwned, Serialize};
 
@@ -70,6 +77,10 @@ pub enum RecordKind {
     MetadataEntry = 4,
     /// A config-Paxos acceptor's durable state for one epoch.
     AcceptorState = 5,
+    /// A multiplexed [`crate::tcp`] wire frame: sender id + group id +
+    /// [`Message`](crate::message::Message), emitted by `MuxTransport` so one
+    /// connection set can carry many independent consensus groups.
+    GroupFrame = 6,
 }
 
 impl RecordKind {
@@ -80,6 +91,7 @@ impl RecordKind {
             3 => Some(Self::Watermark),
             4 => Some(Self::MetadataEntry),
             5 => Some(Self::AcceptorState),
+            6 => Some(Self::GroupFrame),
             _ => None,
         }
     }
@@ -95,6 +107,17 @@ pub fn encode_tagged<T: Serialize>(kind: RecordKind, value: &T) -> anyhow::Resul
     out.push(kind as u8);
     out.extend_from_slice(&payload);
     Ok(out)
+}
+
+/// The [`RecordKind`] a tagged record carries, after validating the magic and format
+/// version — `None` if the header is short, foreign, from another format version, or
+/// names an unknown kind. Lets a reader that accepts several kinds (the multiplexed
+/// wire) pick the payload type before [`decode_tagged`] without parsing twice.
+pub fn peek_kind(bytes: &[u8]) -> Option<RecordKind> {
+    if bytes.len() < HEADER_LEN || bytes[0..2] != MAGIC || bytes[2] != FORMAT_VERSION {
+        return None;
+    }
+    RecordKind::from_byte(bytes[3])
 }
 
 /// Deserializes a tagged record, validating the header first. Fails loudly — bad magic,
@@ -133,12 +156,29 @@ mod tests {
             RecordKind::Watermark,
             RecordKind::MetadataEntry,
             RecordKind::AcceptorState,
+            RecordKind::GroupFrame,
         ] {
             let value = (42u64, "hello".to_string());
             let bytes = encode_tagged(kind, &value).unwrap();
             let back: (u64, String) = decode_tagged(kind, &bytes).unwrap();
             assert_eq!(back, value);
+            assert_eq!(peek_kind(&bytes), Some(kind));
         }
+    }
+
+    #[test]
+    fn peek_kind_rejects_foreign_or_unknown_headers() {
+        let mut bytes = encode_tagged(RecordKind::GroupFrame, &7u64).unwrap();
+        assert_eq!(peek_kind(&bytes), Some(RecordKind::GroupFrame));
+        bytes[3] = 200; // unknown kind
+        assert_eq!(peek_kind(&bytes), None);
+        bytes[3] = RecordKind::GroupFrame as u8;
+        bytes[2] = FORMAT_VERSION + 1; // another format version
+        assert_eq!(peek_kind(&bytes), None);
+        bytes[2] = FORMAT_VERSION;
+        bytes[0] = b'X'; // bad magic
+        assert_eq!(peek_kind(&bytes), None);
+        assert_eq!(peek_kind(&bytes[..3]), None); // short
     }
 
     #[test]

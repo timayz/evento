@@ -32,6 +32,10 @@ pub struct Metrics {
     pub messages_handled: AtomicU64,
     /// Outbound messages shed because a peer's queue was full (backpressure).
     pub messages_shed: AtomicU64,
+    /// Inbound frames for a consensus group with no registered inbox on this host
+    /// that could not be parked for it (buffer full) or expired before it registered
+    /// — a multiplexed transport (`MuxTransport`) counter.
+    pub messages_unrouted: AtomicU64,
 }
 
 impl Metrics {
@@ -86,6 +90,11 @@ impl Metrics {
         self.messages_shed.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records one inbound frame dropped for want of a registered group.
+    pub fn record_unrouted(&self) {
+        self.messages_unrouted.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// A consistent-enough point-in-time view of all counters.
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
@@ -99,6 +108,7 @@ impl Metrics {
             journal_flushes: self.journal_flushes.load(Ordering::Relaxed),
             messages_handled: self.messages_handled.load(Ordering::Relaxed),
             messages_shed: self.messages_shed.load(Ordering::Relaxed),
+            messages_unrouted: self.messages_unrouted.load(Ordering::Relaxed),
         }
     }
 }
@@ -118,6 +128,7 @@ pub struct MetricsSnapshot {
     pub journal_flushes: u64,
     pub messages_handled: u64,
     pub messages_shed: u64,
+    pub messages_unrouted: u64,
 }
 
 impl MetricsSnapshot {
@@ -125,7 +136,7 @@ impl MetricsSnapshot {
     /// source of truth for both [`to_prometheus`](Self::to_prometheus) and
     /// [`to_prometheus_labeled`](Self::to_prometheus_labeled); add a counter here and
     /// both renderings pick it up.
-    fn counters(&self) -> [(&'static str, &'static str, u64); 10] {
+    fn counters(&self) -> [(&'static str, &'static str, u64); 11] {
         [
             (
                 "accord_writes_committed_total",
@@ -176,6 +187,11 @@ impl MetricsSnapshot {
                 "accord_messages_shed_total",
                 "Outbound messages shed because a peer's queue was full.",
                 self.messages_shed,
+            ),
+            (
+                "accord_messages_unrouted_total",
+                "Inbound frames for a group with no registered inbox that were dropped.",
+                self.messages_unrouted,
             ),
         ]
     }

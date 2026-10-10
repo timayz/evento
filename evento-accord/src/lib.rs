@@ -29,11 +29,13 @@ pub mod clock;
 pub mod executor;
 pub mod failure_detector;
 pub mod format;
+pub mod group;
 pub mod message;
 pub mod metrics;
 pub mod node;
 pub mod replica;
 pub mod store;
+pub mod sweep;
 pub mod tcp;
 pub mod transport;
 
@@ -44,9 +46,14 @@ pub use api::{
 pub use clock::{Ballot, Clock, HybridLogicalClock, NodeId, Timestamp, TxnId, MAX_SKEW_MICROS};
 pub use executor::{AccordExecutor, ExecutorDataStore};
 pub use failure_detector::FailureDetector;
+pub use group::GroupHost;
 pub use message::{CommandState, Key, Message, Status};
 pub use metrics::{Metrics, MetricsSnapshot};
 pub use node::{CommitOutcome, Node, NodeConfig};
 pub use store::{AppliedEntry, InMemoryDataStore, InMemoryJournal};
-pub use tcp::{serve, serve_tls, serve_tls_verified, PeerCerts, TcpTransport, TlsClient};
-pub use transport::{Envelope, InMemoryNetwork, InMemorySink};
+pub use sweep::{SweepConfig, SweepPressure, SweepScheduler, SweepStats, Sweepable};
+pub use tcp::{
+    serve, serve_tls, serve_tls_verified, GroupSink, MuxTransport, PeerCerts, TcpTransport,
+    TlsClient, UnroutedHandler,
+};
+pub use transport::{Envelope, GroupId, InMemoryNetwork, InMemorySink};

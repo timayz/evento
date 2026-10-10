@@ -771,6 +771,14 @@ impl Replica {
         self.commands.len()
     }
 
+    /// Whether any known transaction is still un-applied here — in flight, or
+    /// stalled and awaiting recovery. The liveness signal a shared sweep
+    /// scheduler keys off: a replica with un-applied work must be swept at full
+    /// cadence so the recovery bound holds.
+    pub fn has_unapplied(&self) -> bool {
+        !self.unapplied_by_t0.is_empty()
+    }
+
     /// The largest watermark `<= cutoff` that is *locally* safe: no transaction
     /// this replica holds below the result is still un-applied. (Below it, every
     /// command here is `Applied`, so its effect is durable in the data store.)

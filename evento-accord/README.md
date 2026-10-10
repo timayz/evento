@@ -51,6 +51,11 @@ membership, a Fjall/SQL-backed store).
   have left; keys re-shard onto new owners.
 - **Multi-shard reads** — a read for a key a node doesn't own is routed to an
   owner.
+- **Many groups per process** — `MuxTransport` + `SweepScheduler` + `GroupHost` host
+  any number of independent consensus groups (one per tenant, each with its own
+  database) over one connection set, with idle groups swept sparingly. See
+  [`OPERATIONS.md` §10](./OPERATIONS.md) and
+  [`examples/bank-axum-accord-tenants`](../examples/bank-axum-accord-tenants).
 
 ## Not yet
 

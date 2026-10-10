@@ -355,3 +355,149 @@ async fn an_unpinned_outsider_is_refused_while_a_pinned_peer_is_served() {
         "a pinned peer's frames must be handled"
     );
 }
+
+/// Two consensus groups over **one** per-node-pinned mutual-TLS connection set per
+/// host (`MuxTransport::with_tls` + `MuxTransport::serve_tls_verified`): the pinned
+/// identity is stamped on every group's envelopes, writes replicate within each
+/// group and never cross groups, and the un-pinned outsider is refused for every
+/// group alike.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multiplexed_groups_share_one_pinned_mutual_tls_connection_set() {
+    use evento_accord::{GroupId, MuxTransport};
+
+    let n = 3u64;
+    let ids: Vec<NodeId> = (0..n).map(NodeId).collect();
+    let tls = cluster_tls(n);
+
+    let mut listeners = Vec::new();
+    let mut peers: HashMap<NodeId, std::net::SocketAddr> = HashMap::new();
+    for &id in &ids {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        peers.insert(id, listener.local_addr().unwrap());
+        listeners.push((id, listener));
+    }
+
+    let groups = [GroupId(1), GroupId(2)];
+    // nodes[g][host], stores[g][host]
+    let mut nodes: Vec<Vec<Node>> = vec![Vec::new(), Vec::new()];
+    let mut stores: Vec<Vec<Arc<InMemoryDataStore>>> = vec![Vec::new(), Vec::new()];
+    let mut muxes = Vec::new();
+    let mut tasks = Vec::new();
+
+    for (id, listener) in listeners {
+        let node_tls = tls.nodes[id.0 as usize].clone();
+        let client = TlsClient::new(node_tls.connector, tls.server_name.clone())
+            .with_peer_certs(tls.pins.clone());
+        let mux = Arc::new(MuxTransport::with_tls(id, peers.clone(), client));
+        tasks.push(mux.serve_tls_verified(listener, node_tls.acceptor, tls.pins.clone()));
+
+        for (g, group) in groups.iter().enumerate() {
+            let inbox = mux.register(*group);
+            let store = Arc::new(InMemoryDataStore::new());
+            let node = Node::new(
+                id,
+                Arc::new(StaticTopology::new(id, ids.clone())),
+                Arc::new(HybridLogicalClock::new(id)),
+                Arc::new(mux.sink(*group)) as Arc<dyn MessageSink>,
+                Arc::clone(&store) as Arc<dyn DataStore>,
+                Arc::new(InMemoryJournal::new()) as Arc<dyn Journal>,
+            );
+            tasks.push(node.start(inbox));
+            nodes[g].push(node);
+            stores[g].push(store);
+        }
+        muxes.push(mux);
+    }
+
+    // Writes in each group from rotating coordinators.
+    for (g, group_nodes) in nodes.iter().enumerate() {
+        for i in 0..3u32 {
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(10),
+                group_nodes[(i % 3) as usize].write(vec![event(
+                    &format!("g{g}-acc-{i}"),
+                    1,
+                    "Opened",
+                )]),
+            )
+            .await
+            .expect("write timed out")
+            .expect("write failed over mTLS mux");
+            assert!(!outcome.conflict);
+        }
+    }
+    for group_stores in &stores {
+        for _ in 0..400 {
+            if group_stores.iter().all(|s| s.applied_log().len() >= 3) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let order: Vec<TxnId> = group_stores[0]
+            .applied_log()
+            .iter()
+            .map(|e| e.txn)
+            .collect();
+        assert_eq!(
+            order.len(),
+            3,
+            "each group converges on exactly its own writes"
+        );
+        for s in group_stores {
+            let this: Vec<TxnId> = s.applied_log().iter().map(|e| e.txn).collect();
+            assert_eq!(this, order);
+        }
+    }
+    // The two groups applied disjoint transactions.
+    let g1: Vec<TxnId> = stores[0][0].applied_log().iter().map(|e| e.txn).collect();
+    let g2: Vec<TxnId> = stores[1][0].applied_log().iter().map(|e| e.txn).collect();
+    assert!(g1.iter().all(|t| !g2.contains(t)));
+
+    // An un-pinned outsider framing itself as node 1 is refused for any group. A
+    // dedicated quiet group on host 0 (nothing else ever reaches it) makes the
+    // check exact: its handled count must stay zero.
+    let quiet = GroupId(3);
+    let quiet_inbox = muxes[0].register(quiet);
+    let quiet_node = Node::new(
+        NodeId(0),
+        Arc::new(StaticTopology::new(NodeId(0), vec![NodeId(0)])),
+        Arc::new(HybridLogicalClock::new(NodeId(0))),
+        Arc::new(muxes[0].sink(quiet)) as Arc<dyn MessageSink>,
+        Arc::new(InMemoryDataStore::new()) as Arc<dyn DataStore>,
+        Arc::new(InMemoryJournal::new()) as Arc<dyn Journal>,
+    );
+    tasks.push(quiet_node.start(quiet_inbox));
+    let outsider = MuxTransport::with_tls(
+        NodeId(1),
+        peers.clone(),
+        TlsClient::new(tls.outsider.clone(), tls.server_name.clone())
+            .with_peer_certs(tls.pins.clone()),
+    );
+    for n in 0..5 {
+        outsider
+            .sink(quiet)
+            .send(NodeId(0), applied_msg(n))
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        quiet_node.metrics().messages_handled,
+        0,
+        "the un-pinned outsider's frames must never be handled, in any group"
+    );
+    // …while a pinned peer's grouped frames for the same group are handled.
+    muxes[1]
+        .sink(quiet)
+        .send(NodeId(0), applied_msg(1))
+        .await
+        .unwrap();
+    for _ in 0..200 {
+        if quiet_node.metrics().messages_handled > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(quiet_node.metrics().messages_handled > 0);
+    drop(tasks);
+}

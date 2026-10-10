@@ -46,6 +46,10 @@ name = "sql_journal"
 required-features = ["accord", "sqlite"]
 
 [[test]]
+name = "accord_tenants_sqlite"
+required-features = ["accord", "sqlite"]
+
+[[test]]
 name = "sql_journal_postgres"
 required-features = ["accord", "postgres"]
 

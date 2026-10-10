@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+
+{% block title %}{{ name }} - Accounts{% endblock %}
+
+{% block content %}
+<div class="card">
+    <h2>{{ name }} <small style="color:#6b7280">({{ slug }})</small> — Accounts</h2>
+    {% if accounts.is_empty() %}
+    <p>No accounts yet. <a href="/t/{{ slug }}/accounts/new">Create one</a>.</p>
+    {% else %}
+    <table>
+        <thead>
+            <tr><th>ID</th><th>Balance</th><th>Status</th><th>Actions</th></tr>
+        </thead>
+        <tbody>
+            {% for account in accounts %}
+            <tr>
+                <td><code>{{ account.id[..8] }}...</code></td>
+                <td>{{ account.balance }} {{ account.currency }}</td>
+                <td>{{ account.status }}</td>
+                <td><a href="/t/{{ slug }}/accounts/{{ account.id }}" class="btn">View</a></td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% endif %}
+</div>
+
+<p style="margin-top: 1rem;">
+    <a href="/t/{{ slug }}/accounts/new" class="btn btn-success">+ New Account</a>
+    <a href="/" class="btn" style="background: #6b7280;">All tenants</a>
+</p>
+{% endblock %}
