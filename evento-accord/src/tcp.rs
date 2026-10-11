@@ -416,7 +416,9 @@ async fn write_batch(
     for bytes in batch {
         framed.feed(bytes.clone()).await?;
     }
-    framed.flush().await
+    // `LengthDelimitedCodec` encodes both `Bytes` and `&[u8]` (tokio-util 0.7.20+),
+    // so `Framed` is a `Sink` for two item types; name the one we feed.
+    SinkExt::<Bytes>::flush(framed).await
 }
 
 // ---------------------------------------------------------------------------
