@@ -1,6 +1,6 @@
 [package]
 name = "bank-axum-accord"
-version = "2.0.0-alpha.31"
+version = "2.0.0-alpha.32"
 edition.workspace = true
 publish = false
 
