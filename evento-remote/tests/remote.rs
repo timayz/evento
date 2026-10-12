@@ -1,3 +1,6 @@
+//! The shared executor conformance suite, run over a TCP round trip to a
+//! served Fjall backend, plus the pooled-connection and shutdown cases.
+
 use evento_remote::{serve, Client, ServerHandle};
 
 /// Serves an ephemeral Fjall executor on an ephemeral port and connects a client

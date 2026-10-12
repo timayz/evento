@@ -22,7 +22,9 @@ pub const MAGIC: [u8; 2] = *b"Er";
 /// and `StreamRoutingKey` requests.
 /// v3: the snapshot requests gained `projection` (snapshots are keyed by
 /// projection name).
-pub const FORMAT_VERSION: u8 = 3;
+/// v4: `Hello` carries an optional token and its reply may refuse the
+/// connection; the server requires `Hello` as the first frame.
+pub const FORMAT_VERSION: u8 = 4;
 
 /// Length of the fixed header: `MAGIC (2) + version (1) + kind (1)`.
 const HEADER_LEN: usize = 4;
@@ -118,9 +120,13 @@ pub enum ServerFrame {
 /// wire, plus the connect-time `Hello` exchange.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Request {
-    /// Sent once per connection; the reply carries connection-scoped facts the
-    /// sync `Executor` methods need cached client-side.
-    Hello,
+    /// The first frame of every connection: the credential the server's
+    /// resolver authenticates (none for an open server). The reply carries
+    /// connection-scoped facts the sync `Executor` methods need cached
+    /// client-side, or the reason the connection is refused.
+    Hello {
+        token: Option<Token>,
+    },
     Write {
         #[serde(with = "wire_events")]
         events: Vec<Event>,
@@ -200,9 +206,7 @@ pub enum Request {
 /// [`WireWriteError`] because callers match on it (retry-on-conflict).
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Response {
-    Hello {
-        default_routing_key: Option<String>,
-    },
+    Hello(Result<HelloOk, Rejection>),
     Write(Result<(), WireWriteError>),
     Read(Result<WireReadResult, String>),
     LatestTimestamp(Result<u64, String>),
@@ -218,6 +222,45 @@ pub enum Response {
     Unit(Result<(), String>),
     Snapshot(Result<Option<(Vec<u8>, Value)>, String>),
 }
+
+/// A credential presented at `Hello`. Its `Debug` is redacted: frames are
+/// logged at debug level, and a token must never land in a log.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Token(pub String);
+
+impl std::fmt::Debug for Token {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Token(******)")
+    }
+}
+
+/// What an accepted connection learns at `Hello`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HelloOk {
+    /// The served executor's default routing key, fixed for the connection.
+    pub default_routing_key: Option<String>,
+}
+
+/// Why a server refused a connection at `Hello`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum Rejection {
+    /// No token, or one the resolver does not accept.
+    Unauthorized,
+    /// The token is fine but what it names cannot be served right now; the
+    /// text is for the client's logs.
+    Unavailable(String),
+}
+
+impl std::fmt::Display for Rejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Rejection::Unauthorized => f.write_str("unauthorized"),
+            Rejection::Unavailable(reason) => write!(f, "unavailable: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for Rejection {}
 
 /// `ReadResult<Event>` cannot derive serde (`Event` is not serde), so edges
 /// travel as parallel `cursors`/`events` vectors and are re-zipped client-side.
@@ -442,6 +485,53 @@ mod tests {
         };
         assert_eq!(id, 9);
         assert_eq!(events, vec![event]);
+    }
+
+    #[test]
+    fn hello_round_trip() {
+        let hello = ClientFrame::Request {
+            id: 0,
+            request: Request::Hello {
+                token: Some(Token("secret".to_owned())),
+            },
+        };
+        let bytes = encode_tagged(RecordKind::ClientFrame, &hello).unwrap();
+        let back: ClientFrame = decode_tagged(RecordKind::ClientFrame, &bytes).unwrap();
+        let ClientFrame::Request {
+            request: Request::Hello { token: Some(token) },
+            ..
+        } = back
+        else {
+            panic!("wrong frame");
+        };
+        assert_eq!(token.0, "secret");
+        assert!(!format!("{token:?}").contains("secret"), "{token:?}");
+
+        for response in [
+            Response::Hello(Ok(HelloOk {
+                default_routing_key: Some("eu".to_owned()),
+            })),
+            Response::Hello(Err(Rejection::Unavailable("down".to_owned()))),
+        ] {
+            let frame = ServerFrame::Response {
+                id: 0,
+                response,
+                stable_timestamp: None,
+            };
+            let bytes = encode_tagged(RecordKind::ServerFrame, &frame).unwrap();
+            let back: ServerFrame = decode_tagged(RecordKind::ServerFrame, &bytes).unwrap();
+            let ServerFrame::Response {
+                response: Response::Hello(reply),
+                ..
+            } = back
+            else {
+                panic!("wrong frame");
+            };
+            match reply {
+                Ok(ok) => assert_eq!(ok.default_routing_key.as_deref(), Some("eu")),
+                Err(err) => assert_eq!(err.to_string(), "unavailable: down"),
+            }
+        }
     }
 
     #[test]

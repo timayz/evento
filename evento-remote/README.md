@@ -14,7 +14,7 @@ Most applications depend on the [`evento`](https://crates.io/crates/evento) faca
 
 ```toml
 [dependencies]
-evento = { version = "2.0.0-alpha.27", features = ["remote"] }
+evento = { version = "2.0.0-alpha.34", features = ["remote"] }
 ```
 
 ```rust,no_run
@@ -32,8 +32,16 @@ let client = evento_remote::Client::connect("127.0.0.1:4321".parse()?).await?;
 ```
 
 Writes through the server are pushed to every connected client, so client-side
-subscriptions wake with the same low latency as a local `write_watch`. v1 is
-plaintext TCP for trusted networks.
+subscriptions wake with the same low latency as a local `write_watch`.
+
+A host serving one store per tenant implements `Resolver`: every connection opens
+with a `Hello` carrying the client's token (`Client::builder(addr).token(..)`), and
+the resolver answers with the `Session` to serve it — the executor, a guard kept
+for the connection's lifetime, a signal that ends it — or a `Rejection` the client
+sees as its `connect` error. `serve_with(listener, resolver)` takes it; `serve` is
+the open single-store case. `serve_tls` / `serve_tls_with` and
+`ClientBuilder::tls` wrap connections in rustls; plain TCP is for trusted networks,
+where a token travels in clear text.
 
 ## Learn more
 

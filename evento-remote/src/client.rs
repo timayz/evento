@@ -22,19 +22,43 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context as _;
 use bytes::Bytes;
 use evento_core::cursor::{Args, ReadResult, Value};
 use evento_core::{Event, EventFilter, Executor, RoutingKey, WriteError};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
+use tokio_rustls::rustls::pki_types::ServerName;
+use tokio_rustls::TlsConnector;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
+use tokio_util::either::Either;
 use ulid::Ulid;
 
 use crate::wire::{
-    decode_tagged, encode_tagged, ClientFrame, RecordKind, Request, Response, ServerFrame,
-    MAX_FRAME_LENGTH,
+    decode_tagged, encode_tagged, ClientFrame, RecordKind, Rejection, Request, Response,
+    ServerFrame, Token, MAX_FRAME_LENGTH,
 };
+
+/// Outbound connection: plain TCP, or a client-side TLS session over it.
+type ClientStream = Either<TcpStream, tokio_rustls::client::TlsStream<TcpStream>>;
+
+/// Client-side TLS settings: the rustls connector and the server name
+/// presented for certificate verification.
+#[derive(Clone)]
+struct Tls {
+    connector: TlsConnector,
+    server_name: ServerName<'static>,
+}
+
+/// Everything a connection attempt needs; shared by the first connect and
+/// every reconnect.
+#[derive(Clone)]
+struct Dial {
+    addr: SocketAddr,
+    token: Option<Token>,
+    tls: Option<Tls>,
+}
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const RECONNECT_MIN: Duration = Duration::from_millis(100);
@@ -84,12 +108,31 @@ struct Inner {
 
 /// Builds a [`Client`] with non-default settings.
 pub struct ClientBuilder {
-    addr: SocketAddr,
+    dial: Dial,
     request_timeout: Duration,
     connections: usize,
 }
 
 impl ClientBuilder {
+    /// The credential presented at `Hello`, on every connection of the pool
+    /// and again on each reconnect. What it means is the server's resolver's
+    /// business; an open server ignores it.
+    pub fn token(mut self, token: impl Into<String>) -> Self {
+        self.dial.token = Some(Token(token.into()));
+        self
+    }
+
+    /// Wraps every connection in TLS: `connector` carries the trust roots
+    /// (and the client certificate, for mutual TLS), `server_name` is what the
+    /// server's certificate is verified against.
+    pub fn tls(mut self, connector: TlsConnector, server_name: ServerName<'static>) -> Self {
+        self.dial.tls = Some(Tls {
+            connector,
+            server_name,
+        });
+        self
+    }
+
     /// How long a single request may wait for its reply before failing
     /// (default 30s). Raise for servers that can stall, e.g. an Accord-backed
     /// store during recovery.
@@ -107,7 +150,8 @@ impl ClientBuilder {
     }
 
     /// Connects and performs the `Hello` exchange on every pooled connection.
-    /// Fails fast when the server is unreachable; after that each connection
+    /// Fails fast when the server is unreachable or refuses the credential
+    /// (the error then carries the [`Rejection`]); after that each connection
     /// is kept alive with automatic reconnect.
     pub async fn connect(self) -> anyhow::Result<Client> {
         let stable: Stable = Arc::new(AtomicU64::new(0));
@@ -118,14 +162,14 @@ impl ClientBuilder {
         let mut default_routing_key = None;
         for lane in 0..self.connections {
             let (framed, routing_key) =
-                connect_and_hello(self.addr, &stable, self.request_timeout).await?;
+                connect_and_hello(&self.dial, &stable, self.request_timeout).await?;
             if lane == 0 {
                 default_routing_key = routing_key;
             }
             let (req_tx, req_rx) = mpsc::channel(REQ_CAPACITY);
             tokio::spawn(
                 Actor {
-                    addr: self.addr,
+                    dial: self.dial.clone(),
                     req_rx,
                     // One forwarder is enough: the watch is a level-triggered
                     // wakeup, and every connection receives the same notifies.
@@ -158,10 +202,15 @@ impl Client {
         Client::builder(addr).connect().await
     }
 
-    /// Starts building a client for `addr` (request timeout, connection count).
+    /// Starts building a client for `addr` (token, TLS, request timeout,
+    /// connection count).
     pub fn builder(addr: SocketAddr) -> ClientBuilder {
         ClientBuilder {
-            addr,
+            dial: Dial {
+                addr,
+                token: None,
+                tls: None,
+            },
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             connections: 1,
         }
@@ -451,7 +500,7 @@ impl Executor for Client {
 /// pushed notifications into the watch channel, reconnects with capped
 /// exponential backoff. Exits when every [`Client`] clone is dropped.
 struct Actor {
-    addr: SocketAddr,
+    dial: Dial,
     req_rx: mpsc::Receiver<Dispatch>,
     /// `Some` on the notify-forwarding connection only.
     watch_tx: Option<Arc<watch::Sender<u64>>>,
@@ -460,7 +509,7 @@ struct Actor {
 }
 
 impl Actor {
-    async fn run(mut self, initial: Framed<TcpStream, LengthDelimitedCodec>) {
+    async fn run(mut self, initial: Framed<ClientStream, LengthDelimitedCodec>) {
         let mut conn = Some(initial);
         // In-flight requests on the current connection. Cleared (failing the
         // callers) on disconnect: a possibly-executed request must never be
@@ -555,19 +604,27 @@ impl Actor {
 
     /// Reconnects with capped exponential backoff. `None` when every client
     /// clone has been dropped (nothing left to serve).
-    async fn reconnect(&mut self) -> Option<Framed<TcpStream, LengthDelimitedCodec>> {
+    async fn reconnect(&mut self) -> Option<Framed<ClientStream, LengthDelimitedCodec>> {
         let mut backoff = RECONNECT_MIN;
         loop {
             if self.req_rx.is_closed() {
                 return None;
             }
-            match connect_and_hello(self.addr, &self.stable, self.request_timeout).await {
+            match connect_and_hello(&self.dial, &self.stable, self.request_timeout).await {
                 // The routing key from a re-Hello is ignored: it is fixed at
                 // server construction, and the cached one must stay stable for
                 // the lifetime of this Client (it is borrowed as &str).
                 Ok((framed, _)) => return Some(framed),
                 Err(err) => {
-                    tracing::debug!(?err, addr = %self.addr, "reconnect failed, backing off");
+                    // A refusal is the server's decision (the credential was
+                    // revoked, the store is down), worth more than a debug
+                    // line; it is retried like any failure, the resolver may
+                    // accept again.
+                    if let Some(rejection) = err.downcast_ref::<Rejection>() {
+                        tracing::warn!(%rejection, addr = %self.dial.addr, "the server refused the reconnect, backing off");
+                    } else {
+                        tracing::debug!(?err, addr = %self.dial.addr, "reconnect failed, backing off");
+                    }
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(RECONNECT_MAX);
                 }
@@ -582,22 +639,36 @@ impl Actor {
     }
 }
 
-/// Establishes one connection and performs the `Hello` exchange, returning the
-/// framed stream and the server's `default_routing_key`. Seeds the stable
-/// watermark from the reply. Frames pushed before the reply (notifies) only
-/// update the watermark.
+/// Establishes one connection (TLS handshake included) and performs the
+/// `Hello` exchange, returning the framed stream and the server's
+/// `default_routing_key`. Seeds the stable watermark from the reply. Frames
+/// pushed before the reply (notifies) only update the watermark. A refusal
+/// comes back as an error whose source is the [`Rejection`].
 async fn connect_and_hello(
-    addr: SocketAddr,
+    dial: &Dial,
     stable: &AtomicU64,
     timeout: Duration,
-) -> anyhow::Result<(Framed<TcpStream, LengthDelimitedCodec>, Option<String>)> {
-    let stream = TcpStream::connect(addr).await?;
+) -> anyhow::Result<(Framed<ClientStream, LengthDelimitedCodec>, Option<String>)> {
+    let stream = TcpStream::connect(dial.addr).await?;
     let _ = stream.set_nodelay(true);
+    let stream = match &dial.tls {
+        None => Either::Left(stream),
+        Some(tls) => Either::Right(
+            tokio::time::timeout(
+                timeout,
+                tls.connector.connect(tls.server_name.clone(), stream),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("TLS handshake timed out after {timeout:?}"))??,
+        ),
+    };
     let mut framed = Framed::new(stream, codec());
 
     let hello = ClientFrame::Request {
         id: HELLO_ID,
-        request: Request::Hello,
+        request: Request::Hello {
+            token: dial.token.clone(),
+        },
     };
     framed
         .send(Bytes::from(encode_tagged(RecordKind::ClientFrame, &hello)?))
@@ -611,16 +682,16 @@ async fn connect_and_hello(
             match decode_tagged::<ServerFrame>(RecordKind::ServerFrame, &item?)? {
                 ServerFrame::Response {
                     id: HELLO_ID,
-                    response:
-                        Response::Hello {
-                            default_routing_key,
-                        },
+                    response: Response::Hello(reply),
                     stable_timestamp,
                 } => {
                     if let Some(v) = stable_timestamp {
                         stable.fetch_max(v, Ordering::AcqRel);
                     }
-                    return Ok(default_routing_key);
+                    let ok = reply
+                        .map_err(anyhow::Error::new)
+                        .context("the server refused the connection")?;
+                    return Ok(ok.default_routing_key);
                 }
                 ServerFrame::Notify {
                     stable_timestamp, ..
