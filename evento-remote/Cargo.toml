@@ -22,11 +22,13 @@ serde.workspace = true
 ulid.workspace = true
 bitcode = { workspace = true, features = ["serde"] }
 tokio-util = { version = "0.7", features = ["codec"] }
+tokio-rustls = "0.26"
 bytes = "1"
 
 [dev-dependencies]
 evento-fjall = { path = "../evento-fjall" }
 evento-test = { path = "../evento-test" }
+rcgen = "0.14"
 
 [lints]
 workspace = true

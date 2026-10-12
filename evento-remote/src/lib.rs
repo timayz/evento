@@ -28,12 +28,26 @@
 //! piggybacks on every frame, so fronting a replicated backend (Accord) keeps
 //! subscription safety intact.
 //!
-//! v1 is plaintext TCP for trusted networks; TLS variants are the designed
-//! extension point (mirroring `evento-accord`'s `serve`/`serve_tls` split).
+//! **Many stores, credentials.** A host serving one store per tenant implements
+//! [`Resolver`]: each connection opens with a `Hello` carrying the token the
+//! client was built with ([`ClientBuilder::token`]), and the resolver answers
+//! with the [`Session`] to serve it — the executor, something to keep alive
+//! for the connection's lifetime (a tenant lease), a signal to end it (a
+//! revoked credential) — or a [`Rejection`]. [`serve_with`] takes the
+//! resolver; [`serve`] is the open single-store case.
+//!
+//! **TLS.** [`serve_tls`] / [`serve_tls_with`] complete a rustls handshake
+//! on each connection (the operator supplies the `TlsAcceptor`), and
+//! [`ClientBuilder::tls`] the matching connector, mirroring `evento-accord`'s
+//! `serve`/`serve_tls` split. Plain TCP stays for trusted networks: a token
+//! then travels in clear text.
 
 mod client;
 mod server;
 mod wire;
 
 pub use client::{Client, ClientBuilder};
-pub use server::{serve, ServerHandle};
+pub use server::{
+    serve, serve_tls, serve_tls_with, serve_with, Hello, Resolver, ServerHandle, Session,
+};
+pub use wire::Rejection;
