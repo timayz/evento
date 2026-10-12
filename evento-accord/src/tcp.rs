@@ -591,6 +591,10 @@ impl GroupTable {
 
     fn unrouted(&self, group: GroupId, envelope: Envelope) {
         let now = Instant::now();
+        // Sweep traffic (watermarks, anti-entropy) is parked like anything else
+        // but never wakes the application: an idle group's peers keep emitting
+        // it, and it is not a reason to open a group this host closed.
+        let sweep = envelope.message.is_sweep();
         let parked = self
             .pending
             .lock()
@@ -598,6 +602,9 @@ impl GroupTable {
             .park(group, envelope, now);
         if !parked {
             self.metrics.record_unrouted();
+        }
+        if sweep {
+            return;
         }
         if let Some(handler) = &self.unrouted {
             let due = {
@@ -796,7 +803,10 @@ async fn read_connection(stream: ServerStream, inbox: Inbox, identity: Option<No
 /// elsewhere, or one evicted and re-opened on demand) does not lose the first
 /// write's fast path — and the optional
 /// [`with_unrouted_handler`](Self::with_unrouted_handler) hook is told, so the
-/// application can open it. Parked frames that expire or overflow are counted in
+/// application can open it. Sweep traffic ([`Message::is_sweep`]: the watermark
+/// gossip and anti-entropy an idle group keeps emitting) is parked but never
+/// reported, so a group closed for inactivity stays closed until a peer actually
+/// needs it. Parked frames that expire or overflow are counted in
 /// `messages_unrouted`.
 ///
 /// Legacy interop: an un-grouped frame from a classic [`TcpTransport`] is delivered
@@ -894,7 +904,9 @@ impl MuxTransport {
     }
 
     /// Installs the [`UnroutedHandler`] invoked when frames arrive for a group this
-    /// host has not registered.
+    /// host has not registered — consensus, read and configuration traffic, not
+    /// the sweep gossip of idle peers (see [`Message::is_sweep`]). Rate-limited
+    /// per group.
     pub fn with_unrouted_handler(
         mut self,
         handler: impl Fn(GroupId) + Send + Sync + 'static,

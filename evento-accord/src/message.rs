@@ -313,6 +313,19 @@ pub enum Message {
 }
 
 impl Message {
+    /// Periodic background traffic an idle group keeps emitting — watermark
+    /// gossip and anti-entropy. Unlike every other message, it is never a
+    /// reason for a host to open a group it has closed: a `MuxTransport` does
+    /// not tell its unrouted handler about these frames, otherwise a tenant
+    /// closed for inactivity on one host would be reopened by its peers'
+    /// heartbeats a moment later, forever.
+    pub fn is_sweep(&self) -> bool {
+        matches!(
+            self,
+            Message::Watermark { .. } | Message::SyncRequest { .. } | Message::SyncData { .. }
+        )
+    }
+
     /// The transaction this message concerns, used to route responses to the
     /// in-flight coordination. `None` for cluster-management messages (sync).
     pub fn txn(&self) -> Option<TxnId> {

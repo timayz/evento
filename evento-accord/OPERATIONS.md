@@ -247,7 +247,10 @@ catalog that opens the tenant's database + group when it sees `TenantCreated`. T
 `register`, so the first write to a brand-new tenant keeps its fast path. The
 **unrouted handler** (`with_unrouted_handler`) is told (rate-limited) about frames for
 an unregistered group — use it to re-open an *evicted* tenant from your catalog; ignore
-ids the catalog does not know.
+ids the catalog does not know. Sweep gossip (`Message::is_sweep`: watermarks and
+anti-entropy, which an idle group's peers keep emitting every `idle_interval`) never
+reaches the handler, so a tenant closed for inactivity on one host is not reopened by
+its peers' heartbeats; the next real write or read wakes it.
 
 **SQLite footprint.** sqlx-sqlite runs one OS thread per *open* connection, so bound
 each tenant pool (`max_connections(2–3)`, `min_connections(0)`, an `idle_timeout`) and
