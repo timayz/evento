@@ -1007,3 +1007,215 @@ impl<R: Executor, W: Executor> From<(R, W)> for Rw<R, W> {
         Self { r, w }
     }
 }
+
+/// Keeps events on one executor and a subscription's bookkeeping on another.
+///
+/// Events are written to and read from `events` — typically a remote store
+/// shared by many processes — while subscriber cursors, worker fences and
+/// projection snapshots live in `local`, a store this process owns (an
+/// embedded Fjall directory, a SQLite file). A replica of a client application
+/// can then follow a shared store with its own cursor: several replicas never
+/// fence each other out of one subscription key, nothing accumulates on the
+/// shared store, and a restart resumes from the local cursor.
+///
+/// `local` must belong to exactly one process: two processes sharing it would
+/// share cursors again. Cursor keys are still prefixed by the routing key of
+/// `events` (`{routing_key}.{name}`), so one local store may follow several
+/// event stores with distinct routing keys.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// # use evento::{Executor, Sidecar};
+/// # fn wire<E: Executor, L: Executor>(events: E, local: L) {
+/// let sidecar: Sidecar<E, L> = (events, local).into();
+/// # let _ = sidecar;
+/// # }
+/// ```
+#[cfg(feature = "rw")]
+pub struct Sidecar<E: Executor, L: Executor> {
+    events: E,
+    local: L,
+}
+
+#[cfg(feature = "rw")]
+impl<E: Executor, L: Executor> Sidecar<E, L> {
+    /// Pairs the store of the events with the store of the bookkeeping.
+    pub fn new(events: E, local: L) -> Self {
+        Self { events, local }
+    }
+
+    /// The executor holding the events.
+    pub fn events(&self) -> &E {
+        &self.events
+    }
+
+    /// The executor holding the subscriber cursors and the snapshots.
+    pub fn local(&self) -> &L {
+        &self.local
+    }
+}
+
+#[cfg(feature = "rw")]
+impl<E: Executor + Clone, L: Executor + Clone> Clone for Sidecar<E, L> {
+    fn clone(&self) -> Self {
+        Self {
+            events: self.events.clone(),
+            local: self.local.clone(),
+        }
+    }
+}
+
+#[cfg(feature = "rw")]
+#[async_trait::async_trait]
+impl<E: Executor, L: Executor> Executor for Sidecar<E, L> {
+    fn default_routing_key(&self) -> Option<&str> {
+        // The events' key: it scopes new aggregates and prefixes the cursor
+        // keys, so a local store following two event stores keeps them apart.
+        self.events.default_routing_key()
+    }
+
+    async fn write(&self, events: Vec<Event>) -> Result<(), WriteError> {
+        self.events.write(events).await
+    }
+
+    async fn replicate(&self, events: Vec<Event>) -> Result<(), WriteError> {
+        self.events.replicate(events).await
+    }
+
+    fn write_watch(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        // Writes land on `events`; a remote client forwards the server's
+        // notifications through this channel.
+        self.events.write_watch()
+    }
+
+    async fn stable_timestamp(&self) -> anyhow::Result<Option<u64>> {
+        // The watermark gates what a subscription reads, and reads come from
+        // `events`.
+        self.events.stable_timestamp().await
+    }
+
+    async fn read(
+        &self,
+        aggregators: Option<Arc<[EventFilter]>>,
+        routing_key: Option<RoutingKey>,
+        args: Args,
+        to_micros: Option<u64>,
+    ) -> anyhow::Result<ReadResult<Event>> {
+        self.events
+            .read(aggregators, routing_key, args, to_micros)
+            .await
+    }
+
+    async fn latest_timestamp(
+        &self,
+        aggregators: Option<Arc<[EventFilter]>>,
+        routing_key: Option<RoutingKey>,
+    ) -> anyhow::Result<u64> {
+        self.events.latest_timestamp(aggregators, routing_key).await
+    }
+
+    // Forwarded explicitly so the backends' indexed overrides are reached
+    // instead of the trait defaults paging through `read`.
+    async fn latest_version(
+        &self,
+        aggregate_type: String,
+        aggregate_id: String,
+    ) -> anyhow::Result<u16> {
+        self.events
+            .latest_version(aggregate_type, aggregate_id)
+            .await
+    }
+
+    async fn stream_routing_key(
+        &self,
+        aggregate_type: String,
+        aggregate_id: String,
+    ) -> anyhow::Result<Option<Option<String>>> {
+        self.events
+            .stream_routing_key(aggregate_type, aggregate_id)
+            .await
+    }
+
+    async fn get_subscriber_cursor(&self, key: String) -> anyhow::Result<Option<Value>> {
+        self.local.get_subscriber_cursor(key).await
+    }
+
+    async fn is_subscriber_running(&self, key: String, worker_id: Ulid) -> anyhow::Result<bool> {
+        self.local.is_subscriber_running(key, worker_id).await
+    }
+
+    // One local round trip instead of the default's two.
+    async fn subscriber_status(
+        &self,
+        key: String,
+        worker_id: Ulid,
+    ) -> anyhow::Result<SubscriberStatus> {
+        self.local.subscriber_status(key, worker_id).await
+    }
+
+    async fn upsert_subscriber(&self, key: String, worker_id: Ulid) -> anyhow::Result<()> {
+        self.local.upsert_subscriber(key, worker_id).await
+    }
+
+    async fn acknowledge(
+        &self,
+        key: String,
+        worker_id: Ulid,
+        cursor: Value,
+        lag: u64,
+    ) -> anyhow::Result<bool> {
+        self.local.acknowledge(key, worker_id, cursor, lag).await
+    }
+
+    async fn get_snapshot(
+        &self,
+        aggregate_type: String,
+        projection: String,
+        aggregate_revision: String,
+        id: String,
+    ) -> anyhow::Result<Option<(Vec<u8>, Value)>> {
+        self.local
+            .get_snapshot(aggregate_type, projection, aggregate_revision, id)
+            .await
+    }
+
+    async fn save_snapshot(
+        &self,
+        aggregate_type: String,
+        projection: String,
+        aggregate_revision: String,
+        id: String,
+        data: Vec<u8>,
+        cursor: Value,
+    ) -> anyhow::Result<()> {
+        self.local
+            .save_snapshot(
+                aggregate_type,
+                projection,
+                aggregate_revision,
+                id,
+                data,
+                cursor,
+            )
+            .await
+    }
+
+    async fn delete_snapshot(
+        &self,
+        aggregate_type: String,
+        projection: String,
+        id: String,
+    ) -> anyhow::Result<()> {
+        self.local
+            .delete_snapshot(aggregate_type, projection, id)
+            .await
+    }
+}
+
+#[cfg(feature = "rw")]
+impl<E: Executor, L: Executor> From<(E, L)> for Sidecar<E, L> {
+    fn from((events, local): (E, L)) -> Self {
+        Self { events, local }
+    }
+}
