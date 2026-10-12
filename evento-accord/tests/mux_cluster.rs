@@ -348,6 +348,40 @@ async fn a_closed_group_keeps_committing_elsewhere_and_catches_up_on_reopen() {
     g.assert_identical_order(2);
 }
 
+/// An idle group's peers keep gossiping watermarks; a host that closed the group
+/// must not be asked to reopen it for them (that would undo every close).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sweep_traffic_for_an_unknown_group_never_wakes_the_handler() {
+    let cluster = MuxCluster::start(2, Duration::from_millis(100)).await;
+    let stray = GroupId(98);
+    let sink = cluster.hosts[0].transport().sink(stray);
+    let watermark = Message::Watermark {
+        applied_through: Timestamp {
+            micros: 1,
+            logical: 0,
+            node: NodeId(0),
+        },
+    };
+    sink.send(NodeId(1), watermark).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        cluster.unrouted[1].lock().unwrap().is_empty(),
+        "a watermark is not a reason to open a group"
+    );
+
+    // A consensus message for the same group still is.
+    let applied = Message::Applied {
+        txn: TxnId(Timestamp {
+            micros: 1,
+            logical: 0,
+            node: NodeId(0),
+        }),
+    };
+    sink.send(NodeId(1), applied).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(cluster.unrouted[1].lock().unwrap().as_slice(), &[stray]);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn frames_for_an_unknown_group_are_parked_then_counted_when_they_expire() {
     let cluster = MuxCluster::start(2, Duration::from_millis(100)).await;
