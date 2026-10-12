@@ -151,6 +151,12 @@ async fn fjall_subscription_stop_reason() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn fjall_subscription_shutdown_acknowledges_in_flight() -> anyhow::Result<()> {
+    let executor = Fjall::temporary()?;
+    evento_test::subscription_shutdown_acknowledges_in_flight(&executor).await
+}
+
+#[tokio::test]
 async fn fjall_subscription_all_counts() -> anyhow::Result<()> {
     let executor = Fjall::temporary()?;
     evento_test::subscription_all_counts(&executor).await

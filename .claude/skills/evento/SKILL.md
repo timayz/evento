@@ -4,7 +4,7 @@ description: >-
   Build event-sourcing / CQRS / DDD features in Rust with the `evento` crate.
   Use when defining aggregates and events, writing commands that commit events,
   building projections/read models, wiring subscriptions, or setting up the
-  SQL/Fjall executor and migrations. Triggers on `#[evento::aggregate]`,
+  SQL/Fjall/remote executor and migrations. Triggers on `#[evento::aggregate]`,
   `evento::create`/`evento::append`, `Projection`, `SubscriptionBuilder`,
   `Executor`, or a Cargo dependency on `evento`.
 ---
@@ -22,14 +22,15 @@ client/server executor (`remote`), and a consensus-replicated executor
 
 ```toml
 [dependencies]
-evento = { version = "2.0.0-alpha.27", features = ["sqlite"] }  # or "postgres", "mysql", "fjall", "remote"
+evento = { version = "2.0.0-alpha.35", features = ["sqlite"] }  # or "postgres", "mysql", "fjall", "remote"
 bitcode = "0.6"
 anyhow = "1"
 tokio = { version = "1", features = ["full"] }
 ```
 
 Feature flags: `sqlite` / `postgres` / `mysql` / `fjall` / `remote`, `sql` (all SQL),
-`macro` (default, the proc-macros), `group` (multi-executor), `rw` (read/write split).
+`macro` (default, the proc-macros), `group` (multi-executor), `rw` (executor combinators:
+`Rw` read/write split and `Sidecar`; implied by `fjall`).
 
 ### Executor + migrations (SQL)
 
@@ -52,6 +53,50 @@ let executor = evento::Fjall::open("./events.db")?;
 // Tests/examples: a temp store, removed when the last clone of the executor drops.
 let executor = evento::Fjall::temporary()?;
 ```
+
+### Remote (client/server split) and executor combinators
+
+Serve any executor over framed TCP; `RemoteClient` implements `Executor`, so
+commands, projections and subscriptions work unchanged across the network.
+
+```rust
+// Server process — `serve` is the open single-store case (tokens ignored).
+let listener = tokio::net::TcpListener::bind("0.0.0.0:4321").await?;
+let handle = evento::remote::serve(listener, evento::Fjall::open("./data")?);
+// Client process
+let client = evento::RemoteClient::connect("127.0.0.1:4321".parse()?).await?;
+// handle.shutdown().await — dropping the handle does NOT stop the server.
+```
+
+- **One store per tenant / authentication:** implement `evento::remote::Resolver`.
+  Every connection opens with a `Hello { token, peer }` (client side:
+  `RemoteClient::builder(addr).token("…").connect().await?`); `resolve` answers
+  `Session::new(executor)` — optionally `.keep(guard)` (dropped when the connection
+  ends, e.g. a tenant lease) and `.close_when(watch_rx)` (server-side kick on
+  revocation) — or `Err(Rejection)`, which the client sees as its `connect` error.
+  Pass it to `serve_with(listener, resolver)`. It runs again on every reconnect.
+- **TLS:** `serve_tls(listener, acceptor, exec)` / `serve_tls_with(listener, acceptor, resolver)`
+  take a `tokio_rustls::TlsAcceptor`; the client side is
+  `.builder(addr).tls(connector, server_name)`. Plain TCP is for trusted networks —
+  a token travels in clear text there.
+- **A client that runs its own subscriptions** (a replica of a web app following the
+  shared store) must keep cursors and snapshots in a store it owns, or replicas fence
+  each other out of one subscription key:
+
+```rust
+let client = evento::RemoteClient::connect("127.0.0.1:4321".parse()?).await?;
+let local = evento::Fjall::open("./replica-state")?;          // owned by THIS process only
+let executor = evento::Sidecar::from((client, local));        // events: client; cursors/snapshots: local
+```
+
+- `Rw::from((read_exec, write_exec))` splits reads from writes (CQRS with two databases).
+- `evento::Evento::new(exec)` type-erases any executor (`Arc<Box<dyn Executor>>`) —
+  use it when a struct must hold "some executor" without a generic parameter.
+- **Accord (consensus-replicated, alpha):** `evento-accord` replicates writes
+  leaderlessly with any local backend serving reads. One process can host many
+  consensus groups (one SQLite DB per tenant) via `MuxTransport` + `SweepScheduler`
+  + `GroupHost`; see `evento-accord/OPERATIONS.md` §10 and
+  `examples/bank-axum-accord-tenants/`.
 
 ## 1. Define aggregates & events
 
@@ -279,6 +324,10 @@ sub.shutdown().await?;
 ```
 
 - `.start(exec)` runs a background loop; `.run_once(exec)` drains pending events once and returns.
+- `sub.stopped().await` resolves to a `StopReason` once the worker ends: `Shutdown`,
+  `StoppedByHandler`, `LostOwnership` (another worker claimed the key), `Failed(err)`
+  (retries exhausted, no `.continue_on_error()`), or `Panicked`. Await it to notice a
+  dead subscription instead of discovering a stale read model later.
 - `.strict()` fails on an unhandled event; `.continue_on_error()` keeps going after a handler error.
 - **Live bridge (SSE, WebSocket, fanout):** `.live(exec)` is the whole shape in one call —
   `.ephemeral().start_from_latest().start(exec)`. `.ephemeral()` keeps the cursor in memory — no
@@ -352,6 +401,9 @@ aggregate type as a string; it has no `.decode()`.
 - **Frozen means nested types too.** Adding a field to `Money`, or a variant to an
   enum used in an event (even at the end), breaks decoding as surely as editing the
   event. `events.lock` catches it; `EVENTO_LOCK=force` is only for never-deployed shapes.
+- **A `Sidecar` local store belongs to exactly one process.** Two processes sharing it
+  share cursors again. Cursor keys are prefixed by the events store's routing key, so one
+  local store may follow several event stores with distinct routing keys.
 - **Don't `.unwrap()` a load.** `projection.load(id).execute(exec).await` returns
   `anyhow::Result<Option<T>>`; propagate the error with `?` and treat `None` as not-found.
 
@@ -363,7 +415,9 @@ Canonical, compiling usage lives in this repo:
   (one per snapshot mode), co-keyed `Owner` aggregate.
 - `examples/bank-axum-sqlite/` and `examples/bank-axum-fjall/` — web wiring,
   migrations, projection subscriptions; `bank-axum-remote/` (client/server split)
-  and `bank-axum-accord/` (consensus cluster).
+  and `bank-axum-accord/` (consensus cluster); `bank-axum-accord-tenants/` (many
+  consensus groups per process, one SQLite DB per tenant).
+- `evento-remote/README.md` — resolver, `Hello` token, TLS; `evento-accord/OPERATIONS.md`.
 - `evento-macro/README.md` — full macro reference (all options).
 - `evento-test/src/lib.rs` — the behavioral contract suite (load, routing isolation,
   snapshots, optimistic locking, multi-aggregate, full command lifecycle).

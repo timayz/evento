@@ -3922,6 +3922,129 @@ mod stop_reason {
     }
 }
 
+/// Scenario: a shutdown that lands while a handler is running waits for the
+/// handler and acknowledges its event.
+///
+/// The worker selects the shutdown signal against the in-flight pass, and
+/// that pass owns the cursor of every event it has already handled — flushed
+/// when it sees the signal (before the next event) or ends. Dropping the pass
+/// on shutdown discards that cursor, and the next start replays events whose
+/// side effects already happened. Deterministic: the handler parks on a gate
+/// the scenario holds until the shutdown has been requested and the worker
+/// has had time to act on it.
+pub async fn subscription_shutdown_acknowledges_in_flight<E: Executor + Clone>(
+    executor: &E,
+) -> anyhow::Result<()> {
+    use std::time::Duration;
+
+    use evento::subscription::StopReason;
+
+    let key = format!("shutdown-ack-{}", Ulid::generate());
+    let gate = in_flight::Gate::default();
+    let running = in_flight::subscription(&key, &gate).start(executor).await?;
+    assert!(
+        executor.get_subscriber_cursor(key.clone()).await?.is_none(),
+        "nothing acknowledged yet"
+    );
+
+    bank::Command(executor.clone())
+        .open_account(OpenAccount {
+            owner_id: "owner_shutdown_ack".to_owned(),
+            owner_name: "Shutdown Ack".to_owned(),
+            account_type: AccountType::Checking,
+            currency: "USD".to_owned(),
+            initial_balance: 100,
+        })
+        .await?;
+
+    // The handler is inside: the pass holds an event it has not acknowledged.
+    tokio::time::timeout(Duration::from_secs(10), gate.entered()).await?;
+    running.stop();
+    // Long enough for the worker to act on the signal before the handler is
+    // let out. A worker that drops the pass on shutdown has done so by now;
+    // one that waits for it is unaffected by the delay.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !running.is_finished(),
+        "the worker must wait for the in-flight handler"
+    );
+    gate.release();
+
+    let reason = tokio::time::timeout(Duration::from_secs(10), running.stopped()).await?;
+    assert!(
+        matches!(reason, StopReason::Shutdown),
+        "expected a graceful shutdown, got {reason:?}"
+    );
+    running.shutdown().await?;
+
+    assert!(
+        executor.get_subscriber_cursor(key).await?.is_some(),
+        "the event handled during shutdown must be acknowledged, or a restart replays it"
+    );
+
+    Ok(())
+}
+
+mod in_flight {
+    use std::sync::Arc;
+
+    use bank::aggregator::AccountOpened;
+    use evento::{
+        metadata::Event,
+        subscription::{Context, SubscriptionBuilder},
+        Executor,
+    };
+    use tokio::sync::watch;
+
+    /// Shared by the scenario and the handler: the handler reports it is in,
+    /// then waits to be let out.
+    #[derive(Clone)]
+    pub struct Gate {
+        entered: Arc<watch::Sender<bool>>,
+        release: Arc<watch::Sender<bool>>,
+    }
+
+    impl Default for Gate {
+        fn default() -> Self {
+            Self {
+                entered: Arc::new(watch::channel(false).0),
+                release: Arc::new(watch::channel(false).0),
+            }
+        }
+    }
+
+    impl Gate {
+        /// Resolves once the handler is running.
+        pub async fn entered(&self) {
+            let mut rx = self.entered.subscribe();
+            let _ = rx.wait_for(|entered| *entered).await;
+        }
+
+        /// Lets the handler return.
+        pub fn release(&self) {
+            self.release.send_replace(true);
+        }
+    }
+
+    pub fn subscription<E: Executor>(key: &str, gate: &Gate) -> SubscriptionBuilder<E> {
+        SubscriptionBuilder::new(key)
+            .data(gate.clone())
+            .handler(parked())
+    }
+
+    #[evento::subscription]
+    async fn parked<E: Executor>(
+        context: &Context<'_, E>,
+        _event: Event<AccountOpened>,
+    ) -> anyhow::Result<()> {
+        let gate = context.extract::<Gate>();
+        gate.entered.send_replace(true);
+        let mut rx = gate.release.subscribe();
+        rx.wait_for(|released| *released).await?;
+        Ok(())
+    }
+}
+
 /// Scenario: `start_from_latest` skips history on a brand-new key only.
 ///
 /// Guards issue #248. Three things must hold, each asserted without a race:
