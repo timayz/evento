@@ -306,7 +306,7 @@ dependencies = [
 
 [[package]]
 name = "bank"
-version = "2.0.0-alpha.33"
+version = "2.0.0-alpha.34"
 dependencies = [
  "anyhow",
  "bitcode",
@@ -315,7 +315,7 @@ dependencies = [
 
 [[package]]
 name = "bank-axum-accord"
-version = "2.0.0-alpha.33"
+version = "2.0.0-alpha.34"
 dependencies = [
  "anyhow",
  "askama",
@@ -332,7 +332,7 @@ dependencies = [
 
 [[package]]
 name = "bank-axum-accord-tenants"
-version = "2.0.0-alpha.33"
+version = "2.0.0-alpha.34"
 dependencies = [
  "anyhow",
  "askama",
@@ -353,7 +353,7 @@ dependencies = [
 
 [[package]]
 name = "bank-axum-fjall"
-version = "2.0.0-alpha.33"
+version = "2.0.0-alpha.34"
 dependencies = [
  "anyhow",
  "askama",
@@ -370,7 +370,7 @@ dependencies = [
 
 [[package]]
 name = "bank-axum-remote"
-version = "2.0.0-alpha.33"
+version = "2.0.0-alpha.34"
 dependencies = [
  "anyhow",
  "askama",
@@ -386,7 +386,7 @@ dependencies = [
 
 [[package]]
 name = "bank-axum-sqlite"
-version = "2.0.0-alpha.33"
+version = "2.0.0-alpha.34"
 dependencies = [
  "anyhow",
  "askama",
@@ -1049,7 +1049,7 @@ dependencies = [
 
 [[package]]
 name = "evento"
-version = "2.0.0-alpha.33"
+version = "2.0.0-alpha.34"
 dependencies = [
  "anyhow",
  "bitcode",
@@ -1068,7 +1068,7 @@ dependencies = [
 
 [[package]]
 name = "evento-accord"
-version = "2.0.0-alpha.33"
+version = "2.0.0-alpha.34"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1090,7 +1090,7 @@ dependencies = [
 
 [[package]]
 name = "evento-core"
-version = "2.0.0-alpha.33"
+version = "2.0.0-alpha.34"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1112,7 +1112,7 @@ dependencies = [
 
 [[package]]
 name = "evento-fjall"
-version = "2.0.0-alpha.33"
+version = "2.0.0-alpha.34"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1130,7 +1130,7 @@ dependencies = [
 
 [[package]]
 name = "evento-lock"
-version = "2.0.0-alpha.33"
+version = "2.0.0-alpha.34"
 dependencies = [
  "anyhow",
  "quote",
@@ -1140,7 +1140,7 @@ dependencies = [
 
 [[package]]
 name = "evento-macro"
-version = "2.0.0-alpha.33"
+version = "2.0.0-alpha.34"
 dependencies = [
  "anyhow",
  "bitcode",
@@ -1155,7 +1155,7 @@ dependencies = [
 
 [[package]]
 name = "evento-remote"
-version = "2.0.0-alpha.33"
+version = "2.0.0-alpha.34"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1176,7 +1176,7 @@ dependencies = [
 
 [[package]]
 name = "evento-sql"
-version = "2.0.0-alpha.33"
+version = "2.0.0-alpha.34"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1196,7 +1196,7 @@ dependencies = [
 
 [[package]]
 name = "evento-sql-migrator"
-version = "2.0.0-alpha.33"
+version = "2.0.0-alpha.34"
 dependencies = [
  "async-trait",
  "evento",
@@ -1209,7 +1209,7 @@ dependencies = [
 
 [[package]]
 name = "evento-test"
-version = "2.0.0-alpha.33"
+version = "2.0.0-alpha.34"
 dependencies = [
  "anyhow",
  "bank",
@@ -1747,7 +1747,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jepsen-node"
-version = "2.0.0-alpha.33"
+version = "2.0.0-alpha.34"
 dependencies = [
  "anyhow",
  "axum",
@@ -2167,7 +2167,7 @@ dependencies = [
 
 [[package]]
 name = "quickstart"
-version = "2.0.0-alpha.33"
+version = "2.0.0-alpha.34"
 dependencies = [
  "anyhow",
  "bitcode",
@@ -2562,9 +2562,9 @@ dependencies = [
 
 [[package]]
 name = "sha2"
-version = "0.11.0"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "446ba717509524cb3f22f17ecc096f10f4822d76ab5c0b9822c5f9c284e825f4"
+checksum = "47d7069beb7d6ac7b9acd1039986e73443f24234f41074da099d6f994ac9ad19"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.3.1",
@@ -2775,7 +2775,7 @@ dependencies = [
  "rsa",
  "serde",
  "sha1",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "sqlx-core",
  "thiserror",
  "tracing",
@@ -2807,7 +2807,7 @@ dependencies = [
  "rand",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "smallvec",
  "sqlx-core",
  "stringprep",
