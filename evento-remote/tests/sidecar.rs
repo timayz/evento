@@ -3,7 +3,7 @@
 //! the combination, then the split itself is checked: nothing lands on the
 //! server, a restart with the same local store resumes from its cursor.
 
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bank::account_balance;
@@ -60,24 +60,41 @@ conformance!(
     subscribe_low_latency,
     subscribe_default_routing_key,
     subscription_stop_reason,
+    subscription_shutdown_acknowledges_in_flight,
     subscription_start_from_latest,
     snapshot_projection_scope,
 );
 
-/// The accounts opened, as seen by the test subscription.
-static OPENED: LazyLock<Mutex<Vec<String>>> = LazyLock::new(Mutex::default);
+/// The accounts opened, as seen by one test's subscription. One per test —
+/// tests of this binary run concurrently, so a process-wide sink would mix
+/// their accounts.
+#[derive(Clone, Default)]
+struct Opened(Arc<Mutex<Vec<String>>>);
+
+impl Opened {
+    fn seen(&self) -> Vec<String> {
+        self.0.lock().unwrap().clone()
+    }
+
+    fn clear(&self) {
+        self.0.lock().unwrap().clear();
+    }
+}
 
 #[evento::subscription]
 async fn on_account_opened<E: Executor>(
-    _context: &Context<'_, E>,
+    context: &Context<'_, E>,
     event: Event<AccountOpened>,
 ) -> anyhow::Result<()> {
-    OPENED.lock().unwrap().push(event.aggregate_id.clone());
+    let opened = context.extract::<Opened>();
+    opened.0.lock().unwrap().push(event.aggregate_id.clone());
     Ok(())
 }
 
-fn subscription<E: Executor>(key: &str) -> SubscriptionBuilder<E> {
-    SubscriptionBuilder::new(key).handler(on_account_opened())
+fn subscription<E: Executor>(key: &str, opened: &Opened) -> SubscriptionBuilder<E> {
+    SubscriptionBuilder::new(key)
+        .data(opened.clone())
+        .handler(on_account_opened())
 }
 
 async fn open_account(executor: &Replica, owner: &str) -> anyhow::Result<String> {
@@ -104,10 +121,11 @@ async fn eventually(what: &str, mut ok: impl FnMut() -> bool) {
 async fn sidecar_keeps_bookkeeping_local() -> anyhow::Result<()> {
     let t = setup().await?;
     let key = "sidecar-bookkeeping";
-    let running = subscription(key).start(&t.executor).await?;
+    let opened = Opened::default();
+    let running = subscription(key, &opened).start(&t.executor).await?;
     let id = open_account(&t.executor, "local-owner").await?;
     eventually("the subscription sees the account", || {
-        OPENED.lock().unwrap().contains(&id)
+        opened.seen().contains(&id)
     })
     .await;
 
@@ -169,30 +187,29 @@ async fn sidecar_keeps_bookkeeping_local() -> anyhow::Result<()> {
 async fn sidecar_resumes_from_the_local_cursor() -> anyhow::Result<()> {
     let t = setup().await?;
     let key = "sidecar-resume";
-    let first = subscription(key).start(&t.executor).await?;
+    let opened = Opened::default();
+    let first = subscription(key, &opened).start(&t.executor).await?;
     let a = open_account(&t.executor, "resume-a").await?;
     let b = open_account(&t.executor, "resume-b").await?;
     eventually("both accounts are seen", || {
-        let seen = OPENED.lock().unwrap();
+        let seen = opened.seen();
         seen.contains(&a) && seen.contains(&b)
     })
     .await;
+    // Shutdown may land while the pass that handled `b` is still in flight;
+    // the worker must let it flush its cursor rather than drop it.
     first.shutdown().await.ok();
     drop(t.executor);
 
     // A fresh client over the same local store: only what came after the
     // cursor is delivered.
     let restarted = Sidecar::from((Client::connect(t.addr).await?, t.local.clone()));
-    OPENED.lock().unwrap().clear();
-    let second = subscription(key).start(&restarted).await?;
+    opened.clear();
+    let second = subscription(key, &opened).start(&restarted).await?;
     let c = open_account(&restarted, "resume-c").await?;
-    eventually("the new account is seen", || {
-        OPENED.lock().unwrap().contains(&c)
-    })
-    .await;
+    eventually("the new account is seen", || opened.seen().contains(&c)).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let seen = OPENED.lock().unwrap().clone();
-    assert_eq!(seen, vec![c], "a and b were not replayed");
+    assert_eq!(opened.seen(), vec![c], "a and b were not replayed");
 
     second.shutdown().await.ok();
     Ok(())

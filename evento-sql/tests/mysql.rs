@@ -196,6 +196,12 @@ async fn mysql_subscription_stop_reason() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn mysql_subscription_shutdown_acknowledges_in_flight() -> anyhow::Result<()> {
+    let executor = create_mysql_executor("subscription_shutdown_acknowledges_in_flight").await?;
+    evento_test::subscription_shutdown_acknowledges_in_flight(&executor).await
+}
+
+#[tokio::test]
 async fn mysql_subscription_all_counts() -> anyhow::Result<()> {
     let executor = create_mysql_executor("subscription_all_counts").await?;
     evento_test::subscription_all_counts(&executor).await

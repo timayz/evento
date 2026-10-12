@@ -174,6 +174,12 @@ async fn remote_subscription_stop_reason() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn remote_subscription_shutdown_acknowledges_in_flight() -> anyhow::Result<()> {
+    let server = setup().await?;
+    evento_test::subscription_shutdown_acknowledges_in_flight(&server.client).await
+}
+
+#[tokio::test]
 async fn remote_subscription_all_counts() -> anyhow::Result<()> {
     let server = setup().await?;
     evento_test::subscription_all_counts(&server.client).await

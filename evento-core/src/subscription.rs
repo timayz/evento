@@ -1471,9 +1471,12 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                     break StopReason::Shutdown;
                 }
 
-                // The retry backoff can span minutes; selecting the shutdown
-                // signal against it keeps `Subscription::shutdown` responsive
-                // even while a failing pass is backing off.
+                // The retry backoff can span minutes, so the sleep between
+                // attempts ends early on shutdown and no further attempt is
+                // made once it was requested: `Subscription::shutdown` stays
+                // responsive even while a failing pass is backing off.
+                let sleep_rx = shutdown_rx.clone();
+                let when_rx = shutdown_rx.clone();
                 let process_fut = async {
                     match self.retry {
                         Some(retry) => {
@@ -1483,7 +1486,16 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                                         .with_jitter()
                                         .with_max_times(retry.into()),
                                 )
-                                .sleep(tokio::time::sleep)
+                                .sleep(move |dur| {
+                                    let mut rx = sleep_rx.clone();
+                                    async move {
+                                        tokio::select! {
+                                            _ = tokio::time::sleep(dur) => {}
+                                            _ = rx.wait_for(|stop| *stop) => {}
+                                        }
+                                    }
+                                })
+                                .when(move |_| !*when_rx.borrow())
                                 .notify(|err, dur| {
                                     tracing::error!(
                                         error = %err,
@@ -1497,12 +1509,21 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                     }
                 };
                 tokio::pin!(process_fut);
+
+                // A shutdown that lands mid-pass must not drop the pass: the
+                // handlers that already ran in it have a cursor pending in
+                // `process`, flushed only when the pass sees the signal (it
+                // checks before every event) or ends. Dropping the future here
+                // would lose that acknowledge and replay those events after a
+                // restart — with a remote store, where every read is a network
+                // await, almost every shutdown would land there.
+                let mut shutdown = false;
                 let result = tokio::select! {
-                    res = &mut process_fut => Some(res),
-                    _ = shutdown_rx.changed() => None,
-                };
-                let Some(result) = result else {
-                    break StopReason::Shutdown;
+                    res = &mut process_fut => res,
+                    _ = shutdown_rx.changed() => {
+                        shutdown = true;
+                        (&mut process_fut).await
+                    }
                 };
 
                 match result {
@@ -1514,11 +1535,20 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                     Err(err) => {
                         tracing::error!(error = %err, "Failed to process event");
 
+                        // `process` flushed the successfully-processed prefix
+                        // before propagating, so a pass that failed while a
+                        // shutdown was pending has nothing left to lose.
+                        if shutdown {
+                            break StopReason::Shutdown;
+                        }
                         if !self.continue_on_error {
                             break StopReason::Failed(Arc::new(err));
                         }
                     }
                 };
+                if shutdown {
+                    break StopReason::Shutdown;
+                }
             };
 
             // The one record that says the worker is gone. Without it a stopped
