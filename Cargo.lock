@@ -306,7 +306,7 @@ dependencies = [
 
 [[package]]
 name = "bank"
-version = "2.0.0-alpha.34"
+version = "2.0.0-alpha.35"
 dependencies = [
  "anyhow",
  "bitcode",
@@ -315,7 +315,7 @@ dependencies = [
 
 [[package]]
 name = "bank-axum-accord"
-version = "2.0.0-alpha.34"
+version = "2.0.0-alpha.35"
 dependencies = [
  "anyhow",
  "askama",
@@ -332,7 +332,7 @@ dependencies = [
 
 [[package]]
 name = "bank-axum-accord-tenants"
-version = "2.0.0-alpha.34"
+version = "2.0.0-alpha.35"
 dependencies = [
  "anyhow",
  "askama",
@@ -353,7 +353,7 @@ dependencies = [
 
 [[package]]
 name = "bank-axum-fjall"
-version = "2.0.0-alpha.34"
+version = "2.0.0-alpha.35"
 dependencies = [
  "anyhow",
  "askama",
@@ -370,7 +370,7 @@ dependencies = [
 
 [[package]]
 name = "bank-axum-remote"
-version = "2.0.0-alpha.34"
+version = "2.0.0-alpha.35"
 dependencies = [
  "anyhow",
  "askama",
@@ -386,7 +386,7 @@ dependencies = [
 
 [[package]]
 name = "bank-axum-sqlite"
-version = "2.0.0-alpha.34"
+version = "2.0.0-alpha.35"
 dependencies = [
  "anyhow",
  "askama",
@@ -1049,7 +1049,7 @@ dependencies = [
 
 [[package]]
 name = "evento"
-version = "2.0.0-alpha.34"
+version = "2.0.0-alpha.35"
 dependencies = [
  "anyhow",
  "bitcode",
@@ -1068,7 +1068,7 @@ dependencies = [
 
 [[package]]
 name = "evento-accord"
-version = "2.0.0-alpha.34"
+version = "2.0.0-alpha.35"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1090,7 +1090,7 @@ dependencies = [
 
 [[package]]
 name = "evento-core"
-version = "2.0.0-alpha.34"
+version = "2.0.0-alpha.35"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1112,7 +1112,7 @@ dependencies = [
 
 [[package]]
 name = "evento-fjall"
-version = "2.0.0-alpha.34"
+version = "2.0.0-alpha.35"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1130,7 +1130,7 @@ dependencies = [
 
 [[package]]
 name = "evento-lock"
-version = "2.0.0-alpha.34"
+version = "2.0.0-alpha.35"
 dependencies = [
  "anyhow",
  "quote",
@@ -1140,7 +1140,7 @@ dependencies = [
 
 [[package]]
 name = "evento-macro"
-version = "2.0.0-alpha.34"
+version = "2.0.0-alpha.35"
 dependencies = [
  "anyhow",
  "bitcode",
@@ -1155,7 +1155,7 @@ dependencies = [
 
 [[package]]
 name = "evento-remote"
-version = "2.0.0-alpha.34"
+version = "2.0.0-alpha.35"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1178,7 +1178,7 @@ dependencies = [
 
 [[package]]
 name = "evento-sql"
-version = "2.0.0-alpha.34"
+version = "2.0.0-alpha.35"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1198,7 +1198,7 @@ dependencies = [
 
 [[package]]
 name = "evento-sql-migrator"
-version = "2.0.0-alpha.34"
+version = "2.0.0-alpha.35"
 dependencies = [
  "async-trait",
  "evento",
@@ -1211,7 +1211,7 @@ dependencies = [
 
 [[package]]
 name = "evento-test"
-version = "2.0.0-alpha.34"
+version = "2.0.0-alpha.35"
 dependencies = [
  "anyhow",
  "bank",
@@ -1749,7 +1749,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jepsen-node"
-version = "2.0.0-alpha.34"
+version = "2.0.0-alpha.35"
 dependencies = [
  "anyhow",
  "axum",
@@ -2169,7 +2169,7 @@ dependencies = [
 
 [[package]]
 name = "quickstart"
-version = "2.0.0-alpha.34"
+version = "2.0.0-alpha.35"
 dependencies = [
  "anyhow",
  "bitcode",
