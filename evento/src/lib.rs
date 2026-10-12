@@ -19,7 +19,7 @@
 //!
 //! - `macro` (default) - Procedural macros for cleaner code
 //! - `group` - Multi-executor support via `EventoGroup`
-//! - `rw` - Read-write split executor pattern
+//! - `rw` - Executor combinators: `Rw` (read-write split) and `Sidecar` (events on a shared store, subscription cursors and snapshots on a local one)
 //! - `sql` - Enable all SQL database backends
 //! - `sqlite` - SQLite support via sqlx
 //! - `mysql` - MySQL support via sqlx

@@ -8,7 +8,7 @@
 //!
 //! - **`macro`** (default) - Procedural macros from `evento-macro`
 //! - **`group`** - Multi-executor support via `EventoGroup`
-//! - **`rw`** - Read-write split executor pattern via `Rw`
+//! - **`rw`** - Executor combinators: `Rw` (read-write split) and `Sidecar` (events on one store, subscription bookkeeping on another)
 //!
 //! Storage backends (SQL via sqlx, Fjall) live in the `evento-sql` and
 //! `evento-fjall` crates and are re-exported through the `evento` facade

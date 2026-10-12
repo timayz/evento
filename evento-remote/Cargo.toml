@@ -26,6 +26,10 @@ tokio-rustls = "0.26"
 bytes = "1"
 
 [dev-dependencies]
+# The facade and the bank example, for tests that use the macros (the same
+# dev-dependency cycle evento-sql relies on).
+evento = { workspace = true, features = ["fjall", "remote"] }
+bank.workspace = true
 evento-fjall = { path = "../evento-fjall" }
 evento-test = { path = "../evento-test" }
 rcgen = "0.14"

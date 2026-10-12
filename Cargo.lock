@@ -1159,8 +1159,10 @@ version = "2.0.0-alpha.34"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bank",
  "bitcode",
  "bytes",
+ "evento",
  "evento-core",
  "evento-fjall",
  "evento-test",

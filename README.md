@@ -645,6 +645,22 @@ let client = evento::RemoteClient::connect("127.0.0.1:4321".parse()?).await?;
 # }
 ```
 
+A client that runs subscriptions of its own (a replica of a web app following
+the shared store) keeps its cursors and snapshots in a store it owns with
+`Sidecar`: several replicas never fence each other out of one subscription key,
+nothing accumulates on the shared store, and a restart resumes from the local
+cursor.
+
+```rust,no_run
+# async fn run() -> anyhow::Result<()> {
+let client = evento::RemoteClient::connect("127.0.0.1:4321".parse()?).await?;
+let local = evento::Fjall::open("./replica-state")?;
+let executor = evento::Evento::new(evento::Sidecar::from((client, local)));
+# let _ = executor;
+# Ok(())
+# }
+```
+
 ### Accord (replicated, alpha)
 
 [evento-accord](evento-accord) replicates writes through the Accord consensus protocol
@@ -691,7 +707,7 @@ Full macro reference: [evento-macro/README.md](evento-macro/README.md).
 - `fjall` - Embedded key-value storage with Fjall
 - `remote` - Client/server executor over framed TCP
 - `group` - Multi-executor support for querying across databases
-- `rw` - Read-write split executor for CQRS patterns
+- `rw` - Executor combinators: `Rw` (read-write split) and `Sidecar` (events on a shared store, subscription cursors and snapshots on a local one)
 
 ## Workspace crates
 
