@@ -89,7 +89,7 @@ async fn run_store() -> anyhow::Result<()> {
 /// The web process: identical to `bank-axum-fjall`, except the executor is a
 /// `RemoteClient` connected to the store server instead of an embedded Fjall.
 async fn run_web() -> anyhow::Result<()> {
-    let executor: Executor = evento::RemoteClient::connect(STORE_ADDR.parse()?)
+    let executor: Executor = evento::RemoteClient::connect(STORE_ADDR)
         .await
         .with_context(|| {
             format!(

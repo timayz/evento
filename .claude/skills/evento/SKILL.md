@@ -64,10 +64,15 @@ commands, projections and subscriptions work unchanged across the network.
 let listener = tokio::net::TcpListener::bind("0.0.0.0:4321").await?;
 let handle = evento::remote::serve(listener, evento::Fjall::open("./data")?);
 // Client process
-let client = evento::RemoteClient::connect("127.0.0.1:4321".parse()?).await?;
+let client = evento::RemoteClient::connect("127.0.0.1:4321").await?;
 // handle.shutdown().await — dropping the handle does NOT stop the server.
 ```
 
+- **Addresses:** `connect`/`builder` take `impl Into<RemoteAddress>`: a `SocketAddr`,
+  `"127.0.0.1:4321"` or `"store.example.com:4321"`. A host name is looked up again
+  on every (re)connect, so a client behind a load balancer or DNS failover follows
+  it. The server clamps a bounded `read` to its own `stable_timestamp`, so a
+  client that reconnects to a lagging node never skips events.
 - **One store per tenant / authentication:** implement `evento::remote::Resolver`.
   Every connection opens with a `Hello { token, peer }` (client side:
   `RemoteClient::builder(addr).token("…").connect().await?`); `resolve` answers
@@ -84,7 +89,7 @@ let client = evento::RemoteClient::connect("127.0.0.1:4321".parse()?).await?;
   each other out of one subscription key:
 
 ```rust
-let client = evento::RemoteClient::connect("127.0.0.1:4321".parse()?).await?;
+let client = evento::RemoteClient::connect("127.0.0.1:4321").await?;
 let local = evento::Fjall::open("./replica-state")?;          // owned by THIS process only
 let executor = evento::Sidecar::from((client, local));        // events: client; cursors/snapshots: local
 ```

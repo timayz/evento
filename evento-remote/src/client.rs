@@ -15,8 +15,15 @@
 //! contract as any RPC store. Requests on different pooled connections have no
 //! ordering relative to each other; the executor contract is request/response,
 //! and callers await a reply before issuing a dependent call.
+//!
+//! **Addresses.** The server is named by an [`Address`]: an IP and port, or a
+//! `host:port` looked up again on every connection attempt, each address it
+//! resolves to tried in turn. A reconnect therefore follows the name — a load
+//! balancer's current address, a DNS failover, a geo-routed record — rather
+//! than redialling the node it first reached.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -51,11 +58,48 @@ struct Tls {
     server_name: ServerName<'static>,
 }
 
+/// Where a [`Client`] connects: an IP and port, or a `host:port` looked up
+/// again on every connection attempt (the first connect and each reconnect).
+///
+/// ```
+/// # use evento_remote::Address;
+/// let ip: Address = "127.0.0.1:4321".into();
+/// let name: Address = "store.example.com:4321".into();
+/// let socket: Address = std::net::SocketAddr::from(([127, 0, 0, 1], 4321)).into();
+/// # let _ = (ip, name, socket);
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Address(String);
+
+impl From<SocketAddr> for Address {
+    fn from(addr: SocketAddr) -> Self {
+        Address(addr.to_string())
+    }
+}
+
+impl From<&str> for Address {
+    fn from(addr: &str) -> Self {
+        Address(addr.to_owned())
+    }
+}
+
+impl From<String> for Address {
+    fn from(addr: String) -> Self {
+        Address(addr)
+    }
+}
+
+impl fmt::Display for Address {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Everything a connection attempt needs; shared by the first connect and
 /// every reconnect.
 #[derive(Clone)]
 struct Dial {
-    addr: SocketAddr,
+    addr: Address,
     token: Option<Token>,
     tls: Option<Tls>,
 }
@@ -198,16 +242,17 @@ impl ClientBuilder {
 
 impl Client {
     /// Connects with default settings. See [`Client::builder`] for knobs.
-    pub async fn connect(addr: SocketAddr) -> anyhow::Result<Client> {
+    pub async fn connect(addr: impl Into<Address>) -> anyhow::Result<Client> {
         Client::builder(addr).connect().await
     }
 
     /// Starts building a client for `addr` (token, TLS, request timeout,
-    /// connection count).
-    pub fn builder(addr: SocketAddr) -> ClientBuilder {
+    /// connection count). A host name in `addr` is looked up on every
+    /// connection attempt, not once here.
+    pub fn builder(addr: impl Into<Address>) -> ClientBuilder {
         ClientBuilder {
             dial: Dial {
-                addr,
+                addr: addr.into(),
                 token: None,
                 tls: None,
             },
@@ -649,7 +694,11 @@ async fn connect_and_hello(
     stable: &AtomicU64,
     timeout: Duration,
 ) -> anyhow::Result<(Framed<ClientStream, LengthDelimitedCodec>, Option<String>)> {
-    let stream = TcpStream::connect(dial.addr).await?;
+    // A host name is looked up here, on every attempt, and each address it
+    // resolves to is tried in turn; an IP is used as is.
+    let stream = TcpStream::connect(dial.addr.0.as_str())
+        .await
+        .with_context(|| format!("cannot connect to {}", dial.addr))?;
     let _ = stream.set_nodelay(true);
     let stream = match &dial.tls {
         None => Either::Left(stream),
