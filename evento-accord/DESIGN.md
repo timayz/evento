@@ -453,6 +453,13 @@ backend (sql/fjall). Phases, in order:
   math and that a silenced peer is suspected while a regular one is not; sim tests
   prove that with the fixed timeout disabled the detector alone recovers a crashed
   coordinator's stalled transaction, and that a healthy cluster recovers nothing.
+  Three guards keep a live but slow coordinator from being suspected: messages
+  closer than 50 ms count as one beat (a write's burst would otherwise teach the
+  detector a millisecond rhythm), `NodeConfig.acceptable_pause` is added to the
+  expected interval, and a peer's silence runs only until another peer was last
+  heard from (a node whose own inbox or host stalled hears from no one and so
+  blames no one). Sim tests pin both: a coordinator quiet for 700 ms keeps its
+  transaction, and a node cut off from every peer recovers nothing.
   ✅ **Region awareness:** the `Topology` carries optional `region(node)` tags
   (`RegionId`; `ShardedTopology::with_regions`), and read routing
   (`Node::an_owner_of`) prefers a **same-region** owner before any other — so a

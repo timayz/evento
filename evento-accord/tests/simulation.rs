@@ -1411,6 +1411,64 @@ async fn failure_detector_recovers_a_crashed_coordinator() {
     );
 }
 
+/// Builds a three-node cluster with the fixed recovery timeout disabled (only
+/// suspicion can recover anything), warms the failure detectors up with a few
+/// writes and heartbeat rounds, then leaves node 0 holding a transaction the
+/// other two have pre-accepted.
+async fn suspicion_rig() -> Sim {
+    let config = NodeConfig {
+        recovery_timeout: Duration::from_secs(3600),
+        ..NodeConfig::default()
+    };
+    let sim = Sim::build_with_config(3, config);
+    for seq in 1..=9u64 {
+        let coord = (seq % 3) as usize;
+        sim.nodes[coord]
+            .write(vec![event(&format!("w{seq}"), 1, seq)])
+            .await
+            .expect("warm-up write");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    sim.nodes[0]
+        .coordinate_preaccept(vec![event("a0", 1, 100)])
+        .await
+        .expect("preaccept");
+    sim
+}
+
+/// A coordinator that goes quiet for a few hundred milliseconds (a loaded
+/// machine, a slow disk) is alive: its peers must not take its transaction over.
+#[tokio::test(start_paused = true)]
+async fn a_briefly_quiet_coordinator_is_not_suspected() {
+    let sim = suspicion_rig().await;
+    for peer in [NodeId(1), NodeId(2)] {
+        sim.net
+            .set_latency(NodeId(0), peer, Duration::from_millis(700));
+    }
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(
+        sim.nodes.iter().map(|n| n.recovery_count()).sum::<u64>(),
+        0,
+        "a coordinator quiet for 700 ms was taken for dead"
+    );
+}
+
+/// A node that hears from no one for a while (its own inbox or machine stalled)
+/// has no evidence against any one peer: it must not suspect the coordinator.
+#[tokio::test(start_paused = true)]
+async fn a_node_that_hears_from_no_one_suspects_no_one() {
+    let sim = suspicion_rig().await;
+    for peer in [NodeId(0), NodeId(2)] {
+        sim.net.set_latency(peer, NodeId(1), Duration::from_secs(2));
+    }
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        sim.nodes[1].recovery_count(),
+        0,
+        "a node cut off from everyone blamed the coordinator"
+    );
+}
+
 /// Observability counters move with real activity: clean writes commit, a raced
 /// write conflicts, and the transport/journal counters advance.
 #[tokio::test(start_paused = true)]

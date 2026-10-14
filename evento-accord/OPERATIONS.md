@@ -75,6 +75,7 @@ timeouts for geo/WAN** deployments.
 | `compaction_margin` | 1 s | Lag on the redundancy watermark; keep above clock-skew bound + propagation latency. |
 | `max_journal_batch` | 128 | Messages drained per group-commit fsync (latency vs. fsync amortization). |
 | `phi_threshold` | 8.0 | Phi-accrual suspicion level; higher tolerates more latency variance before suspecting a coordinator. |
+| `acceptable_pause` | 500 ms | How long a live peer may go quiet beyond its usual heartbeat interval (scheduler stall, slow fsync, loaded host) before suspicion starts to rise. |
 | `linearizable_reads` | false | Opt-in linearizable reads (§10) — one consensus round per read. |
 | `max_commands` | 100 000 | Backpressure: refuse *new* local writes once the un-compacted backlog hits this (e.g. compaction stalled under a partition). |
 | `config_defer_step` | 100 ms | Control-plane anti-dueling delay for concurrent reconfigurations. |

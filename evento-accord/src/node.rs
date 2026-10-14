@@ -74,6 +74,11 @@ pub struct NodeConfig {
     /// recovered (adaptively, ahead of `recovery_timeout`). Higher tolerates more
     /// latency variance before suspecting.
     pub phi_threshold: f64,
+    /// How long a live peer may go quiet beyond its usual heartbeat interval
+    /// before the failure detector's suspicion starts to rise: room for a
+    /// scheduler stall, a slow fsync or a loaded machine. A coordinator is
+    /// suspected roughly this much later than its rhythm alone would allow.
+    pub acceptable_pause: Duration,
     /// Serve **linearizable** reads of a single owned key by coordinating a
     /// read-only barrier transaction (`Node::read_barrier`) before reading the
     /// local backend, instead of reading possibly-stale local state directly.
@@ -109,6 +114,7 @@ impl Default for NodeConfig {
             compaction_margin: Duration::from_secs(1),
             max_journal_batch: 128,
             phi_threshold: 8.0,
+            acceptable_pause: Duration::from_millis(500),
             linearizable_reads: false,
             max_commands: 100_000,
             config_defer_step: Duration::from_millis(100),
@@ -631,9 +637,11 @@ impl Node {
                 continue;
             }
             let suspected = coordinator != self.id
-                && self
-                    .failure_detector
-                    .suspect(coordinator, self.settings.phi_threshold);
+                && self.failure_detector.suspect(
+                    coordinator,
+                    self.settings.phi_threshold,
+                    self.settings.acceptable_pause,
+                );
             let timed_out = txn.0 < timeout;
             if suspected || timed_out {
                 self.metrics.record_recovery();
