@@ -247,6 +247,11 @@ pub struct Node {
     journal: Arc<dyn Journal>,
     replica: Arc<Mutex<Replica>>,
     pending: Pending,
+    /// Transactions this node is coordinating, from their first PreAccept
+    /// until their outcome is known. The watermark this node reports stays
+    /// below the oldest, so no replica compacts a transaction its coordinator
+    /// may still have to learn the outcome of through recovery.
+    coordinating: Arc<Mutex<BTreeSet<TxnId>>>,
     /// Delivers the [`SyncData`](Message::SyncData) response to an in-flight
     /// [`join`](Node::join)/anti-entropy.
     sync_inbox: SyncInbox,
@@ -319,6 +324,7 @@ impl Node {
             journal,
             replica: Arc::new(Mutex::new(Replica::new())),
             pending: Arc::new(Mutex::new(HashMap::new())),
+            coordinating: Arc::new(Mutex::new(BTreeSet::new())),
             sync_inbox: Arc::new(Mutex::new(HashMap::new())),
             bootstrapped: Arc::new(AtomicBool::new(true)),
             join_buffer: Arc::new(Mutex::new(Vec::new())),
@@ -843,6 +849,18 @@ impl Node {
                 coverage
             }
             _ => local,
+        };
+        // Never past a transaction this node is still coordinating: if its
+        // coordination fails, the node recovers it to learn the outcome, and
+        // that needs every replica to still hold it.
+        let mine = match self
+            .coordinating
+            .lock()
+            .expect("coordinating poisoned")
+            .first()
+        {
+            Some(oldest) if oldest.0 < mine => oldest.0,
+            _ => mine,
         };
 
         // Watermarks go to EVERY peer, not just shard peers: compaction only
@@ -1453,7 +1471,20 @@ impl Node {
         }
 
         let keys = Self::keys_of(&events);
-        let (outcome, all_fast) = self.coordinate(keys, events).await?;
+        let txn = TxnId(self.clock.now());
+        self.coordinating
+            .lock()
+            .expect("coordinating poisoned")
+            .insert(txn);
+        let coordinated = match self.coordinate(txn, keys, events).await {
+            Ok(done) => Ok(done),
+            Err(err) => self.settle(txn, err).await.map(|outcome| (outcome, false)),
+        };
+        self.coordinating
+            .lock()
+            .expect("coordinating poisoned")
+            .remove(&txn);
+        let (outcome, all_fast) = coordinated?;
         self.metrics.record_outcome(outcome.conflict, all_fast);
         tracing::debug!(
             node = self.id.0,
@@ -1571,13 +1602,13 @@ impl Node {
     /// Returns the outcome and whether it took the one-round fast path.
     async fn coordinate(
         &self,
+        txn: TxnId,
         keys: Vec<Key>,
         events: Vec<Event>,
     ) -> anyhow::Result<(CommitOutcome, bool)> {
         let (plans, _union) = self.plan(&keys, &events);
 
-        let t0 = self.clock.now();
-        let txn = TxnId(t0);
+        let t0 = txn.0;
         let mut rx = self.register(txn);
 
         // PreAccept: a fast quorum per shard, or whatever arrives before the
@@ -1848,6 +1879,59 @@ impl Node {
         }
 
         Ok(!commit)
+    }
+
+    /// Learns how a write this node failed to coordinate ended. Once its
+    /// PreAccept went out, a failed coordination does not mean a failed
+    /// write: another node may have taken the transaction over by recovery
+    /// (it suspected this one, or saw the transaction late and took it for
+    /// stalled) and committed it. Reporting `failure` then would tell the
+    /// caller a committed write failed, and a retry would apply it twice.
+    ///
+    /// So the coordinator recovers its own transaction: that returns the
+    /// outcome another recovery decided, or drives the transaction to one.
+    /// When recovery cannot reach a quorum either, the transaction may still
+    /// be in another node's hands, so this node waits for it to apply locally
+    /// (every replica applies what any coordinator commits). Only when neither
+    /// settles it is `failure` returned. The transaction cannot have been
+    /// compacted meanwhile: it is in `coordinating` until this returns.
+    async fn settle(&self, txn: TxnId, failure: anyhow::Error) -> anyhow::Result<CommitOutcome> {
+        self.deregister(txn);
+        if let Some(conflict) = self.local_outcome(txn) {
+            return Ok(CommitOutcome { txn, conflict });
+        }
+        match self.recover(txn).await {
+            Ok(outcome) => {
+                tracing::debug!(node = self.id.0, ?txn, error = %failure, "write settled by recovery");
+                return Ok(outcome);
+            }
+            Err(err) => {
+                tracing::debug!(node = self.id.0, ?txn, %err, "cannot recover a failed write");
+            }
+        }
+        let deadline = Self::after(self.settings.collect_timeout);
+        let mut applied_rx = self.applied_gen.subscribe();
+        loop {
+            if let Some(conflict) = self.local_outcome(txn) {
+                tracing::debug!(node = self.id.0, ?txn, error = %failure, "write settled by another node");
+                return Ok(CommitOutcome { txn, conflict });
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(failure);
+            }
+            if let Ok(Err(_)) = tokio::time::timeout(deadline - now, applied_rx.changed()).await {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+    }
+
+    /// The outcome of `txn` if this node has applied it: `Some(conflict)`.
+    fn local_outcome(&self, txn: TxnId) -> Option<bool> {
+        self.replica
+            .lock()
+            .expect("replica poisoned")
+            .applied_result(txn)
     }
 
     /// Recovers `txn`: takes it over under a fresh ballot and drives it to an
