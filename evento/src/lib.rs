@@ -198,3 +198,8 @@ pub use evento_remote as remote;
 /// Remote executor client type alias.
 #[cfg(feature = "remote")]
 pub use evento_remote::Client as RemoteClient;
+
+/// Where a [`RemoteClient`] connects: an IP and port, or a `host:port` looked
+/// up again on every connection attempt.
+#[cfg(feature = "remote")]
+pub use evento_remote::Address as RemoteAddress;

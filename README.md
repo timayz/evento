@@ -639,11 +639,15 @@ let listener = tokio::net::TcpListener::bind("0.0.0.0:4321").await?;
 let handle = evento::remote::serve(listener, executor);
 
 // Client process
-let client = evento::RemoteClient::connect("127.0.0.1:4321".parse()?).await?;
+let client = evento::RemoteClient::connect("127.0.0.1:4321").await?;
 # let _ = (handle, client);
 # Ok(())
 # }
 ```
+
+The address may be a host name (`"store.example.com:4321"`): it is looked up
+again on every reconnect, so a client behind a load balancer or a DNS failover
+follows it to whichever node answers.
 
 A client that runs subscriptions of its own (a replica of a web app following
 the shared store) keeps its cursors and snapshots in a store it owns with
@@ -653,7 +657,7 @@ cursor.
 
 ```rust,no_run
 # async fn run() -> anyhow::Result<()> {
-let client = evento::RemoteClient::connect("127.0.0.1:4321".parse()?).await?;
+let client = evento::RemoteClient::connect("127.0.0.1:4321").await?;
 let local = evento::Fjall::open("./replica-state")?;
 let executor = evento::Evento::new(evento::Sidecar::from((client, local)));
 # let _ = executor;

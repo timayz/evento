@@ -510,12 +510,27 @@ async fn handle<E: Executor>(executor: &E, request: Request) -> Response {
             routing_key,
             args,
             to_micros,
-        } => Response::Read(err_string(
-            executor
-                .read(aggregators.map(Arc::from), routing_key, args, to_micros)
-                .await
-                .map(WireReadResult::from),
-        )),
+        } => {
+            // The bound comes from the client's cached watermark, which may
+            // have been reported by another node (a reconnect through a load
+            // balancer) or be a round trip stale. This node only vouches for
+            // its own watermark, so a bounded read never goes past it: events
+            // below the client's bound that this node has not applied yet are
+            // read on a later pass instead of being skipped.
+            let to_micros = match to_micros {
+                Some(bound) => match executor.stable_timestamp().await {
+                    Ok(Some(own)) => Some(bound.min(own)),
+                    _ => Some(bound),
+                },
+                None => None,
+            };
+            Response::Read(err_string(
+                executor
+                    .read(aggregators.map(Arc::from), routing_key, args, to_micros)
+                    .await
+                    .map(WireReadResult::from),
+            ))
+        }
         Request::LatestTimestamp {
             aggregators,
             routing_key,

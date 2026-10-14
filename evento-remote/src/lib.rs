@@ -16,7 +16,7 @@
 //! let handle = evento_remote::serve(listener, executor);
 //!
 //! // Client process: connect and use like any executor.
-//! let client = evento_remote::Client::connect("127.0.0.1:4321".parse()?).await?;
+//! let client = evento_remote::Client::connect("127.0.0.1:4321").await?;
 //! # let _ = (handle, client);
 //! # Ok(())
 //! # }
@@ -36,6 +36,13 @@
 //! revoked credential) — or a [`Rejection`]. [`serve_with`] takes the
 //! resolver; [`serve`] is the open single-store case.
 //!
+//! **Addresses.** A client names its server by an [`Address`]: an IP and port,
+//! or a `host:port` looked up again on every connection attempt, so a
+//! reconnect follows a load balancer or a DNS (geo-)failover to whichever node
+//! now answers. Each server bounds a subscription's read by its own stability
+//! watermark, so a client reconnecting to a node that is further behind never
+//! skips events.
+//!
 //! **TLS.** [`serve_tls`] / [`serve_tls_with`] complete a rustls handshake
 //! on each connection (the operator supplies the `TlsAcceptor`), and
 //! [`ClientBuilder::tls`] the matching connector, mirroring `evento-accord`'s
@@ -46,7 +53,7 @@ mod client;
 mod server;
 mod wire;
 
-pub use client::{Client, ClientBuilder};
+pub use client::{Address, Client, ClientBuilder};
 pub use server::{
     serve, serve_tls, serve_tls_with, serve_with, Hello, Resolver, ServerHandle, Session,
 };

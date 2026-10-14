@@ -25,7 +25,7 @@ let listener = tokio::net::TcpListener::bind("0.0.0.0:4321").await?;
 let handle = evento_remote::serve(listener, executor);
 
 // Client process: connect and use like any executor.
-let client = evento_remote::Client::connect("127.0.0.1:4321".parse()?).await?;
+let client = evento_remote::Client::connect("127.0.0.1:4321").await?;
 # let _ = (handle, client);
 # Ok(())
 # }
