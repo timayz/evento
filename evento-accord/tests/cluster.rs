@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use evento_accord::{
     AppliedEntry, DataStore, HybridLogicalClock, InMemoryDataStore, InMemoryJournal,
-    InMemoryNetwork, Journal, MessageSink, Node, NodeId, StaticTopology, TxnId,
+    InMemoryNetwork, Journal, MessageSink, Node, NodeConfig, NodeId, StaticTopology, TxnId,
 };
 use evento_core::Event;
 
@@ -25,6 +25,11 @@ struct Cluster {
 impl Cluster {
     /// Builds and starts an `n`-node single-shard cluster.
     fn start(n: u64) -> Self {
+        Self::start_with(n, NodeConfig::default())
+    }
+
+    /// Like [`start`](Self::start), every node with `config`.
+    fn start_with(n: u64, config: NodeConfig) -> Self {
         let ids: Vec<NodeId> = (0..n).map(NodeId).collect();
         let net = InMemoryNetwork::new();
 
@@ -46,7 +51,8 @@ impl Cluster {
                 sink,
                 Arc::clone(&store) as Arc<dyn DataStore>,
                 journal,
-            );
+            )
+            .with_config(config);
 
             loops.push(node.start(inbox));
             nodes.push(node);
@@ -308,4 +314,67 @@ async fn recovery_is_idempotent_with_a_late_original_commit() {
     // The transaction was applied exactly once on every replica.
     let order = cluster.assert_identical_order(1).await;
     assert_eq!(order[0].0, txn);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_another_node_recovered_reports_its_outcome_not_a_failure() {
+    // Node 0's peers answer it only after its collect timeout, so its own
+    // coordination fails. Meanwhile they take the transaction for stalled and
+    // recover it, committing the write. Node 0 must report that commit, not
+    // the quorum it missed: the caller would otherwise retry a write that
+    // already took effect.
+    let config = NodeConfig {
+        collect_timeout: Duration::from_millis(1000),
+        recovery_timeout: Duration::from_millis(100),
+        ..NodeConfig::default()
+    };
+    let cluster = Cluster::start_with(3, config);
+    cluster
+        .net
+        .set_latency(NodeId(1), NodeId(0), Duration::from_millis(1500));
+    cluster
+        .net
+        .set_latency(NodeId(2), NodeId(0), Duration::from_millis(1500));
+    let _sweeps = [
+        cluster.nodes[1].start_recovery(),
+        cluster.nodes[2].start_recovery(),
+    ];
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(10),
+        cluster.nodes[0].write(vec![event("acc", 1, "Opened")]),
+    )
+    .await
+    .expect("the write settles")
+    .expect("a write another node committed is reported as committed");
+    assert!(!outcome.conflict, "the lone write must take effect");
+
+    // Applied once, everywhere, as the transaction node 0 reported.
+    let order = cluster.assert_identical_order(1).await;
+    assert_eq!(order[0].0, outcome.txn);
+    assert!(!order[0].1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_no_quorum_ever_saw_still_fails() {
+    // Settling a failed write must not turn a real failure into a success:
+    // with both peers down nobody can decide the transaction, and the write
+    // reports the quorum it missed, in bounded time.
+    let config = NodeConfig {
+        collect_timeout: Duration::from_millis(300),
+        ..NodeConfig::default()
+    };
+    let cluster = Cluster::start_with(3, config);
+    cluster.net.crash(NodeId(1));
+    cluster.net.crash(NodeId(2));
+
+    let err = tokio::time::timeout(
+        Duration::from_secs(5),
+        cluster.nodes[0].write(vec![event("acc", 1, "Opened")]),
+    )
+    .await
+    .expect("the write gives up")
+    .expect_err("no quorum, no write");
+    assert!(err.to_string().contains("quorum not reached"), "{err}");
+    assert!(cluster.stores[0].applied_log().is_empty());
 }

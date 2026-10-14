@@ -164,6 +164,14 @@ metadata log (config-Paxos); concurrent reconfigurations converge without a lead
   restores the metadata-log/acceptor state and redundancy watermark. Then
   `start()`/`start_recovery()`. In-flight transactions resume via the sweep, and
   anti-entropy catches the node up. (See `tests/restart.rs`.)
+- **A coordinator overtaken by recovery:** a node can take over a write whose
+  coordinator is alive but slow or wrongly suspected, or which reached it late (a
+  group it had not opened yet). The coordinator's own rounds then fail, but the write
+  may still commit. Before `Node::write` reports such a failure, the coordinator
+  recovers its own transaction, or failing that waits for it to apply locally, and
+  returns the outcome the cluster decided. An error from `write` therefore means the
+  outcome could not be established, not that a decided write was lost. No replica
+  compacts a transaction while its coordinator is still settling it.
 - **Down node:** with `f+1` survivors, writes continue; the down node catches up on
   return. Lose more than `f` and writes block (by design — no split-brain) until enough
   return.
