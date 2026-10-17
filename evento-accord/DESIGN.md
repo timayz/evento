@@ -412,7 +412,13 @@ backend (sql/fjall). Phases, in order:
   (`DataStore::snapshot`) for the truncated prefix plus the recent commands and the
   watermark; anti-entropy stays command-based. `recover_state` restores the floor
   and trusts the durable data store for the prefix, replaying only the journal
-  tail. Validated by the deterministic simulation: a **bound oracle**
+  tail. A replica that lost its store (new disk, deleted
+  file) is a joiner too: `GroupHost::open_joining` calls `begin_join` before the
+  inbox loop starts and `join`s the first contact that answers (a contact still
+  joining stays silent, so a half-bootstrapped replica never hands out a partial
+  snapshot); `join` fails if the snapshot cannot be installed, and persists the
+  adopted floor so a restart keeps dependencies on compacted transactions
+  satisfied. Validated by the deterministic simulation: a **bound oracle**
   (`consensus_state_stays_bounded`) proves `command_count` returns to zero after a
   workload while committed state is preserved, and safety/convergence/bit-
   reproducibility hold across all seeds with compaction live (churn, partitions,

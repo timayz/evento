@@ -264,6 +264,10 @@ const DEFAULT_STABLE_MARGIN: Duration = Duration::from_secs(1);
 /// being refreshed with a round trip. Must stay well under any configured
 /// [`Sql::stable_margin`], which already absorbs far more skew than a
 /// TTL-stale sample introduces.
+/// Rows per `INSERT` into the event table: ten bound values each keeps a
+/// statement well under every backend's bound-value cap (SQLite: 32766).
+const INSERT_CHUNK: usize = 1000;
+
 const CLOCK_SAMPLE_TTL: Duration = Duration::from_secs(1);
 
 impl<DB: Database> Sql<DB> {
@@ -911,67 +915,93 @@ where
         events: Vec<evento_core::Event>,
         restamp: bool,
     ) -> Result<(), WriteError> {
-        let mut statement = Query::insert()
-            .into_table(Event::Table)
-            .columns([
-                Event::Id,
-                Event::Name,
-                Event::Data,
-                Event::Metadata,
-                Event::AggregatorType,
-                Event::AggregatorId,
-                Event::Version,
-                Event::RoutingKey,
-                Event::Timestamp,
-                Event::TimestampSubsec,
-            ])
-            .to_owned();
+        // One statement binds ten values per row, and every backend caps the
+        // bound values of a statement (SQLite at 32766): a large batch — a
+        // joining replica's snapshot — goes in chunks, inside one transaction
+        // so the batch stays all-or-nothing.
+        let mut statements = Vec::new();
+        let mut events = events.into_iter().peekable();
+        while events.peek().is_some() {
+            let mut statement = Query::insert()
+                .into_table(Event::Table)
+                .columns([
+                    Event::Id,
+                    Event::Name,
+                    Event::Data,
+                    Event::Metadata,
+                    Event::AggregatorType,
+                    Event::AggregatorId,
+                    Event::Version,
+                    Event::RoutingKey,
+                    Event::Timestamp,
+                    Event::TimestampSubsec,
+                ])
+                .to_owned();
 
-        for event in events {
-            let metadata = bitcode::encode(&event.metadata);
-            let (timestamp, timestamp_subsec) = if restamp {
-                Self::server_time_exprs()
-            } else {
-                (event.timestamp.into(), event.timestamp_subsec.into())
-            };
-            statement.values_panic([
-                event.id.to_string().into(),
-                event.name.into(),
-                event.data.into(),
-                metadata.into(),
-                event.aggregate_type.into(),
-                event.aggregate_id.into(),
-                event.version.into(),
-                event.routing_key.into(),
-                timestamp,
-                timestamp_subsec,
-            ]);
+            for event in events.by_ref().take(INSERT_CHUNK) {
+                let metadata = bitcode::encode(&event.metadata);
+                let (timestamp, timestamp_subsec) = if restamp {
+                    Self::server_time_exprs()
+                } else {
+                    (event.timestamp.into(), event.timestamp_subsec.into())
+                };
+                statement.values_panic([
+                    event.id.to_string().into(),
+                    event.name.into(),
+                    event.data.into(),
+                    metadata.into(),
+                    event.aggregate_type.into(),
+                    event.aggregate_id.into(),
+                    event.version.into(),
+                    event.routing_key.into(),
+                    timestamp,
+                    timestamp_subsec,
+                ]);
+            }
+            statements.push(Self::build_sqlx(statement));
         }
 
-        let (sql, values) = Self::build_sqlx(statement);
+        if let [(sql, values)] = statements.as_slice() {
+            sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values.clone())
+                .execute(&self.pool)
+                .await
+                .map_err(Self::insert_error)?;
+            return Ok(());
+        }
 
-        sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
-            .execute(&self.pool)
+        let mut tx = self
+            .pool
+            .begin()
             .await
-            .map_err(|err| {
-                // Structured detection: driver `Display` strings are localized
-                // (Postgres `lc_messages`, MySQL locale) and matching them
-                // silently breaks optimistic concurrency on non-English
-                // servers. The only unique constraints on `event` are the
-                // primary key (random ULID, collision-free in practice) and
-                // the `(type, id, version)` index, so a unique violation means
-                // a version conflict.
-                let is_unique = err
-                    .as_database_error()
-                    .is_some_and(|db_err| db_err.is_unique_violation());
-                if is_unique {
-                    WriteError::InvalidOriginalVersion
-                } else {
-                    WriteError::Unknown(err.into())
-                }
-            })?;
+            .map_err(|err| WriteError::Unknown(err.into()))?;
+        for (sql, values) in statements {
+            sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
+                .execute(&mut *tx)
+                .await
+                .map_err(Self::insert_error)?;
+        }
+        tx.commit()
+            .await
+            .map_err(|err| WriteError::Unknown(err.into()))?;
 
         Ok(())
+    }
+
+    fn insert_error(err: sqlx::Error) -> WriteError {
+        // Structured detection: driver `Display` strings are localized
+        // (Postgres `lc_messages`, MySQL locale) and matching them silently
+        // breaks optimistic concurrency on non-English servers. The only
+        // unique constraints on `event` are the primary key (random ULID,
+        // collision-free in practice) and the `(type, id, version)` index,
+        // so a unique violation means a version conflict.
+        let is_unique = err
+            .as_database_error()
+            .is_some_and(|db_err| db_err.is_unique_violation());
+        if is_unique {
+            WriteError::InvalidOriginalVersion
+        } else {
+            WriteError::Unknown(err.into())
+        }
     }
 }
 

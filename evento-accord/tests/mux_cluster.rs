@@ -348,6 +348,155 @@ async fn a_closed_group_keeps_committing_elsewhere_and_catches_up_on_reopen() {
     g.assert_identical_order(2);
 }
 
+/// Every committed `(type, id, version)` on a host, comparable across hosts.
+fn committed(store: &InMemoryDataStore) -> std::collections::BTreeSet<(String, String, u16)> {
+    store
+        .committed_events()
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect()
+}
+
+async fn await_committed(store: &InMemoryDataStore, expected_len: usize) {
+    for _ in 0..600 {
+        if store.committed_events().len() >= expected_len {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!(
+        "store holds {} committed events, expected {expected_len}",
+        store.committed_events().len()
+    );
+}
+
+const COMPACT_ALL: Timestamp = Timestamp {
+    micros: u64::MAX,
+    logical: 0,
+    node: NodeId(0),
+};
+
+impl MuxCluster {
+    async fn open_joining(
+        &self,
+        group: &Group,
+        host: usize,
+        config: NodeConfig,
+        contacts: &[NodeId],
+    ) -> anyhow::Result<Node> {
+        self.hosts[host]
+            .open_joining(
+                group.id,
+                self.topology(host),
+                Arc::clone(&group.stores[host]) as Arc<dyn DataStore>,
+                Arc::clone(&group.journals[host]) as Arc<dyn Journal>,
+                config,
+                contacts,
+            )
+            .await
+    }
+}
+
+/// A host that lost a group's store (a new disk, a deleted file) after its
+/// peers compacted cannot catch up through anti-entropy — the prefix is no
+/// longer held as commands anywhere. Opening it by joining installs a peer's
+/// snapshot and floor, and the floor is persisted for the next restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_group_with_a_lost_store_rejoins_after_compaction() {
+    let cluster = MuxCluster::start(3, Duration::from_millis(200)).await;
+    let mut g = Group::new(GroupId(50), 3);
+    let nodes = cluster.open_everywhere(&g).await;
+    for i in 0..3 {
+        write(&nodes[0], vec![event(&format!("acc-{i}"), 1, "Opened")]).await;
+    }
+    for store in &g.stores {
+        await_committed(store, 3).await;
+    }
+    for node in &nodes {
+        node.compact(COMPACT_ALL).await;
+        assert_eq!(node.command_count(), 0, "every command compacted away");
+    }
+
+    // Host 2 comes back with nothing: a new store and journal.
+    cluster.hosts[2].close(g.id).expect("open on host 2");
+    g.stores[2] = Arc::new(InMemoryDataStore::new());
+    g.journals[2] = Arc::new(InMemoryJournal::new());
+
+    // A plain open recovers nothing and anti-entropy ships nothing: every
+    // command it would replay is compacted away on the peers.
+    cluster.open(&g, 2).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(g.stores[2].committed_events().is_empty());
+    cluster.hosts[2].close(g.id).expect("open on host 2");
+    g.stores[2] = Arc::new(InMemoryDataStore::new());
+    g.journals[2] = Arc::new(InMemoryJournal::new());
+
+    let joined = cluster
+        .open_joining(&g, 2, NodeConfig::default(), &[NodeId(0), NodeId(1)])
+        .await
+        .expect("join");
+    assert!(cluster.hosts[2].is_open(g.id));
+    assert_eq!(committed(&g.stores[2]), committed(&g.stores[0]));
+    let floor = g.journals[2]
+        .load_watermark()
+        .await
+        .unwrap()
+        .expect("the adopted floor is persisted");
+    assert!(floor > Timestamp::MIN);
+
+    // A write that depends on a compacted transaction lands on the joiner,
+    // and the joiner can coordinate one too.
+    write(&nodes[0], vec![event("acc-0", 2, "Deposited")]).await;
+    write(&joined, vec![event("acc-1", 2, "Deposited")]).await;
+    for store in &g.stores {
+        await_committed(store, 5).await;
+    }
+    assert_eq!(committed(&g.stores[2]), committed(&g.stores[0]));
+}
+
+/// A contact that cannot answer (here: the group is closed on it and nothing
+/// reopens it) costs one timeout; the join moves on to the next contact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_join_moves_on_when_a_contact_does_not_answer() {
+    let cluster = MuxCluster::start(3, Duration::from_millis(200)).await;
+    let mut g = Group::new(GroupId(51), 3);
+    let nodes = cluster.open_everywhere(&g).await;
+    write(&nodes[0], vec![event("acc", 1, "Opened")]).await;
+    for store in &g.stores {
+        await_committed(store, 1).await;
+    }
+    for node in &nodes {
+        node.compact(COMPACT_ALL).await;
+    }
+
+    cluster.hosts[1].close(g.id).expect("open on host 1");
+    cluster.hosts[2].close(g.id).expect("open on host 2");
+    g.stores[2] = Arc::new(InMemoryDataStore::new());
+    g.journals[2] = Arc::new(InMemoryJournal::new());
+    let config = NodeConfig {
+        collect_timeout: Duration::from_millis(500),
+        ..NodeConfig::default()
+    };
+    cluster
+        .open_joining(&g, 2, config, &[NodeId(1), NodeId(0)])
+        .await
+        .expect("join through the second contact");
+    assert_eq!(committed(&g.stores[2]), committed(&g.stores[0]));
+    // The join request asked the closed host to open the group.
+    assert!(cluster.unrouted[1].lock().unwrap().contains(&g.id));
+
+    // With no contact answering, nothing is left registered.
+    cluster.hosts[2].close(g.id).expect("open on host 2");
+    cluster.hosts[0].close(g.id).expect("open on host 0");
+    g.stores[2] = Arc::new(InMemoryDataStore::new());
+    g.journals[2] = Arc::new(InMemoryJournal::new());
+    assert!(cluster
+        .open_joining(&g, 2, config, &[NodeId(1), NodeId(0)])
+        .await
+        .is_err());
+    assert!(!cluster.hosts[2].is_open(g.id));
+}
+
 /// An idle group's peers keep gossiping watermarks; a host that closed the group
 /// must not be asked to reopen it for them (that would undo every close).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -380,6 +529,26 @@ async fn sweep_traffic_for_an_unknown_group_never_wakes_the_handler() {
     sink.send(NodeId(1), applied).await.unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(cluster.unrouted[1].lock().unwrap().as_slice(), &[stray]);
+
+    // So is a joining replica's snapshot request, unlike anti-entropy's.
+    let other = GroupId(97);
+    let sink = cluster.hosts[0].transport().sink(other);
+    let anti_entropy = Message::SyncRequest {
+        id: 1,
+        snapshot: false,
+        known: None,
+    };
+    sink.send(NodeId(1), anti_entropy).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!cluster.unrouted[1].lock().unwrap().contains(&other));
+    let join = Message::SyncRequest {
+        id: 2,
+        snapshot: true,
+        known: None,
+    };
+    sink.send(NodeId(1), join).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(cluster.unrouted[1].lock().unwrap().contains(&other));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

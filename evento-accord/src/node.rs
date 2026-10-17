@@ -1110,6 +1110,12 @@ impl Node {
                 snapshot,
                 known,
             } => {
+                // A node still joining holds only part of the state: serving
+                // its snapshot would bootstrap the requester into the same
+                // gap. Staying silent sends the joiner to its next contact.
+                if snapshot && !self.bootstrapped.load(Ordering::Acquire) {
+                    return out;
+                }
                 let cutoff = self.margin_cutoff();
                 let (watermark, coverage, commands) = {
                     let replica = self.replica.lock().expect("replica poisoned");
@@ -2232,6 +2238,15 @@ impl Node {
         let imported = self
             .import_from(contact, self.settings.collect_timeout, true, None)
             .await?;
+        // Persist the adopted floor: a restart recovers it from the journal,
+        // and without it a dependency on a compacted-away transaction would
+        // never count as satisfied again.
+        let floor = self
+            .replica
+            .lock()
+            .expect("replica poisoned")
+            .redundant_before();
+        self.journal.truncate(floor).await?;
 
         // Resume normal processing and replay anything buffered during bootstrap.
         // Flag flip and drain happen under the buffer lock (see `handle_staged`)
@@ -2299,14 +2314,21 @@ impl Node {
             .into_iter()
             .filter(|event| self.topology.owns(self.id, &Key::of(event)))
             .collect();
-        if !owned_snapshot.is_empty()
-            && self
+        let snapshot_len = owned_snapshot.len();
+        if snapshot_len > 0 {
+            if let Err(err) = self
                 .datastore
                 .apply(TxnId(watermark), watermark, owned_snapshot, true)
                 .await
-                .is_err()
-        {
-            apply_failed = true;
+            {
+                // A joiner without its snapshot would adopt the contact's
+                // floor over a missing prefix — a permanent hole. Fail the
+                // join instead.
+                if want_snapshot {
+                    return Err(err.context("cannot install the bootstrap snapshot"));
+                }
+                apply_failed = true;
+            }
         }
 
         let mut imported = 0;
@@ -2417,7 +2439,7 @@ impl Node {
             }
         }
 
-        if imported > 0 {
+        if imported > 0 || snapshot_len > 0 {
             // Imported applies advance local applied state too.
             self.applied_gen.send_modify(|v| *v += 1);
         }

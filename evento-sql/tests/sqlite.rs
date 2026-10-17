@@ -547,3 +547,10 @@ async fn sqlite_subscription_ephemeral_run_once() -> anyhow::Result<()> {
     let executor = create_sqlite_executor("sub_ephemeral_run_once").await?;
     evento_test::subscription_ephemeral_run_once(&executor).await
 }
+
+#[tokio::test]
+async fn sqlite_replicate_large_batch() -> anyhow::Result<()> {
+    let executor = create_sqlite_executor("replicate_large_batch").await?;
+
+    evento_test::replicate_large_batch(&executor).await
+}

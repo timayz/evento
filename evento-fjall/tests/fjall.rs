@@ -305,3 +305,9 @@ async fn fjall_subscription_ephemeral_run_once() -> anyhow::Result<()> {
     let executor = Fjall::temporary()?;
     evento_test::subscription_ephemeral_run_once(&executor).await
 }
+
+#[tokio::test]
+async fn fjall_replicate_large_batch() -> anyhow::Result<()> {
+    let executor = Fjall::temporary()?;
+    evento_test::replicate_large_batch(&executor).await
+}

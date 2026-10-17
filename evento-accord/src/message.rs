@@ -318,11 +318,18 @@ impl Message {
     /// reason for a host to open a group it has closed: a `MuxTransport` does
     /// not tell its unrouted handler about these frames, otherwise a tenant
     /// closed for inactivity on one host would be reopened by its peers'
-    /// heartbeats a moment later, forever.
+    /// heartbeats a moment later, forever. A joining replica's snapshot
+    /// request (`SyncRequest { snapshot: true }`) is not one: it must open the
+    /// group on a contact that has it closed, or the join would time out.
     pub fn is_sweep(&self) -> bool {
         matches!(
             self,
-            Message::Watermark { .. } | Message::SyncRequest { .. } | Message::SyncData { .. }
+            Message::Watermark { .. }
+                | Message::SyncRequest {
+                    snapshot: false,
+                    ..
+                }
+                | Message::SyncData { .. }
         )
     }
 
