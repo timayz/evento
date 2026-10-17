@@ -176,6 +176,19 @@ metadata log (config-Paxos); concurrent reconfigurations converge without a lead
 - **Down node:** with `f+1` survivors, writes continue; the down node catches up on
   return. Lose more than `f` and writes block (by design — no split-brain) until enough
   return.
+  A down node also holds compaction back: peers compact only below the minimum
+  watermark every shard peer has reported, so the backlog grows until it returns
+  (watch it against `max_commands`).
+- **Node back with a lost store** (new disk, deleted tenant file, a backup older than
+  its peers' compaction): its journal floor is gone, so anti-entropy can ship only the
+  commands peers still hold and the compacted prefix never comes back — the
+  `sync contact truncated above this node's proven coverage` warning names this case.
+  Wipe the store and journal and open the group by **joining** instead:
+  `GroupHost::open_joining(…, contacts)` (or `begin_join` + `join` on a bare `Node`)
+  installs a contact's data-store snapshot, adopts and persists its floor, then replays
+  the traffic buffered meanwhile. Contacts are tried in order; one that is itself
+  joining does not answer. Join only over an empty store: a snapshot that overlaps
+  existing events is skipped as an idempotent re-apply.
 
 ---
 
@@ -191,7 +204,8 @@ metadata log (config-Paxos); concurrent reconfigurations converge without a lead
   materialized state and read source) and, if you want fast restart without re-syncing,
   the **journal** (Fjall dir, or the `accord_*` SQL tables). The journal is bounded by
   compaction; the event store grows with history. Back up per node; a restored node also
-  re-syncs missing tail from peers via anti-entropy.
+  re-syncs missing tail from peers via anti-entropy — unless its peers have compacted
+  past the backup, in which case discard it and rejoin (§7, lost store).
 - **SQL backend:** run the schema via `evento-sql-migrator` with its `accord` feature
   (the `accord_commands/meta/metadata_log/acceptors` tables), alongside your event
   schema — one migrator for both.
@@ -232,7 +246,8 @@ thousand-plus groups per process; none of them changes the protocol or the `Node
   ~800.
 - **`GroupHost`** — `open(group, topology, datastore, journal, config)` does the
   per-group wiring (register → sink → `Node::new` → `recover_state` → `start` →
-  schedule) and `close(group)` undoes it.
+  schedule) and `close(group)` undoes it. `open_joining(…, contacts)` opens a group
+  whose store was lost by bootstrapping it from a peer's snapshot (§7).
 
 ```rust
 let mux = Arc::new(MuxTransport::new(id, peer_addrs).with_unrouted_handler(reopen));
@@ -259,7 +274,9 @@ an unregistered group — use it to re-open an *evicted* tenant from your catalo
 ids the catalog does not know. Sweep gossip (`Message::is_sweep`: watermarks and
 anti-entropy, which an idle group's peers keep emitting every `idle_interval`) never
 reaches the handler, so a tenant closed for inactivity on one host is not reopened by
-its peers' heartbeats; the next real write or read wakes it.
+its peers' heartbeats; the next real write or read wakes it. A joining replica's snapshot request
+(`SyncRequest { snapshot: true }`) is not sweep gossip: it wakes the group on a contact
+that has it closed.
 
 **SQLite footprint.** sqlx-sqlite runs one OS thread per *open* connection, so bound
 each tenant pool (`max_connections(2–3)`, `min_connections(0)`, an `idle_timeout`) and
@@ -281,7 +298,9 @@ file is also the consensus journal, so keep `synchronous(Full)` under WAL. Build
 | `MuxTransport::with_inbox_capacity` | 1024 | Per-group inbound inbox. |
 
 Caveat: a per-peer connection and queue are shared, so one group's 64 MB bootstrap
-`SyncData` delays the others' frames on that link. (A write that fails on a stale
+`SyncData` delays the others' frames on that link. A join snapshot is the contact's whole
+event log in **one** frame, capped at 64 MiB: a group larger than that cannot be
+bootstrapped by `join` yet (a streaming snapshot is future work). (A write that fails on a stale
 connection — the peer restarted — is retried once over a fresh one, so one dead
 connection does not cost every group a frame.)
 

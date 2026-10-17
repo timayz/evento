@@ -89,6 +89,45 @@ impl GroupHost {
         journal: Arc<dyn Journal>,
         config: NodeConfig,
     ) -> anyhow::Result<Node> {
+        self.open_with(group, topology, datastore, journal, config, &[])
+            .await
+    }
+
+    /// Opens `group` over a store that lost its state (a new disk, a deleted
+    /// file) by **joining** it: the node buffers consensus traffic while it
+    /// fetches a peer's data-store snapshot, compaction floor and recent
+    /// commands ([`Node::join`]), then replays what it buffered. A plain
+    /// [`open`](Self::open) would recover only the journal tail and leave the
+    /// prefix its peers already compacted missing for good.
+    ///
+    /// `contacts` are tried in order until one answers; a contact that is
+    /// itself joining does not answer. If none does, nothing is left
+    /// registered and the error is returned, so the caller can retry later.
+    /// Idempotent like `open`. The store should be empty: a snapshot that
+    /// overlaps existing events is skipped as an idempotent re-apply.
+    pub async fn open_joining(
+        &self,
+        group: GroupId,
+        topology: Arc<dyn Topology>,
+        datastore: Arc<dyn DataStore>,
+        journal: Arc<dyn Journal>,
+        config: NodeConfig,
+        contacts: &[NodeId],
+    ) -> anyhow::Result<Node> {
+        anyhow::ensure!(!contacts.is_empty(), "joining a group needs a contact");
+        self.open_with(group, topology, datastore, journal, config, contacts)
+            .await
+    }
+
+    async fn open_with(
+        &self,
+        group: GroupId,
+        topology: Arc<dyn Topology>,
+        datastore: Arc<dyn DataStore>,
+        journal: Arc<dyn Journal>,
+        config: NodeConfig,
+        contacts: &[NodeId],
+    ) -> anyhow::Result<Node> {
         if let Some(node) = self.get(group) {
             return Ok(node);
         }
@@ -104,7 +143,33 @@ impl GroupHost {
             self.mux.unregister(group);
             return Err(err);
         }
+        let joining = !contacts.is_empty();
+        if joining {
+            // Before the inbox loop starts, so no frame (parked ones included)
+            // is processed ahead of the snapshot.
+            node.begin_join();
+        }
         let inbox_task = node.start(inbox);
+        if joining {
+            let mut last = None;
+            for &contact in contacts {
+                match node.join(contact).await {
+                    Ok(_) => {
+                        last = None;
+                        break;
+                    }
+                    Err(err) => {
+                        tracing::debug!(node = self.id.0, contact = contact.0, %err, "join contact failed");
+                        last = Some(err);
+                    }
+                }
+            }
+            if let Some(err) = last {
+                inbox_task.abort();
+                self.mux.unregister(group);
+                return Err(err.context("no contact could bootstrap the group"));
+            }
+        }
         self.scheduler.add(group, Arc::new(node.clone()));
 
         let mut groups = self.groups.lock().expect("groups poisoned");
