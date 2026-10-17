@@ -31,6 +31,16 @@ impl ExecCluster {
     }
 
     fn start_with(n: u64, linearizable_reads: bool) -> Self {
+        Self::start_configured(
+            n,
+            NodeConfig {
+                linearizable_reads,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn start_configured(n: u64, config: NodeConfig) -> Self {
         let ids: Vec<NodeId> = (0..n).map(NodeId).collect();
         let net = InMemoryNetwork::new();
 
@@ -46,11 +56,7 @@ impl ExecCluster {
             let datastore: Arc<dyn DataStore> = Arc::new(ExecutorDataStore::new(fjall.clone()));
             let journal: Arc<dyn Journal> = Arc::new(InMemoryJournal::new());
             let topology = Arc::new(StaticTopology::new(id, ids.clone()));
-            let node =
-                Node::new(id, topology, clock, sink, datastore, journal).with_config(NodeConfig {
-                    linearizable_reads,
-                    ..Default::default()
-                });
+            let node = Node::new(id, topology, clock, sink, datastore, journal).with_config(config);
 
             loops.push(node.start(inbox));
             execs.push(AccordExecutor::new(node, fjall));
@@ -228,6 +234,48 @@ async fn enforces_optimistic_concurrency_across_the_cluster() {
         assert_eq!(events.len(), 2);
         assert_eq!(events[1].version, 2);
     }
+}
+
+/// A write the node refuses because its un-compacted backlog is at
+/// `max_commands` is a transient refusal, not a failure: the executor answers
+/// `WriteError::Unavailable`, and the typed cause is still there to downcast.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_backlog_at_its_cap_is_a_transient_refusal() {
+    use evento_accord::BacklogAtCap;
+
+    // One node never compacts (no peer to agree a watermark with below the
+    // margin), so two writes fill a cap of two.
+    let cluster = ExecCluster::start_configured(
+        1,
+        NodeConfig {
+            max_commands: 2,
+            compaction_margin: Duration::from_secs(3600),
+            ..Default::default()
+        },
+    );
+    cluster.execs[0]
+        .write(vec![event("acc", 1, "Opened")])
+        .await
+        .unwrap();
+    cluster.execs[0]
+        .write(vec![event("acc", 2, "Deposited")])
+        .await
+        .unwrap();
+    let err = cluster.execs[0]
+        .write(vec![event("acc", 3, "Deposited")])
+        .await
+        .expect_err("the third write is refused");
+    match &err {
+        WriteError::Unavailable(cause) => {
+            let cap = cause
+                .downcast_ref::<BacklogAtCap>()
+                .expect("the cause is the typed backlog error");
+            assert_eq!(cap.cap, 2);
+            assert!(cap.backlog >= 2);
+        }
+        other => panic!("expected Unavailable, got {other:?}"),
+    }
+    assert!(err.to_string().contains("not taking writes right now"));
 }
 
 /// `ExecutorDataStore::version`/`snapshot` paginate the backend, so an aggregate with

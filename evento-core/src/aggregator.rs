@@ -78,6 +78,14 @@ pub enum WriteError {
     #[error("aggregate version overflow")]
     VersionOverflow,
 
+    /// The store is not taking writes right now and will again on its own:
+    /// a replicated executor whose backlog for a node that is away reached
+    /// its cap, or a node told to rejoin its group. Nothing about the write
+    /// itself is wrong; retry it later. The cause is the source error (a
+    /// replicated executor's own typed error, downcastable).
+    #[error("the store is not taking writes right now: {0}")]
+    Unavailable(#[source] anyhow::Error),
+
     /// Unknown error from the executor
     #[error("{0}")]
     Unknown(#[from] anyhow::Error),
@@ -426,6 +434,7 @@ impl WriteBuilder {
     ///
     /// - [`WriteError::MissingData`] - No events were added
     /// - [`WriteError::InvalidOriginalVersion`] - Version conflict occurred
+    /// - [`WriteError::Unavailable`] - The store is not taking writes right now
     /// - [`WriteError::Unknown`] - Executor error
     pub async fn commit<E: Executor>(&self, executor: &E) -> Result<String, WriteError> {
         if self.data.is_empty() {
