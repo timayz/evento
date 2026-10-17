@@ -795,11 +795,13 @@ impl Replica {
     /// the locally-safe point ([`applied_through`](Replica::applied_through)) so a
     /// not-yet-applied transaction is never declared redundant; the *caller* is
     /// responsible for the cross-replica guarantee (that every replica has applied
-    /// everything below `before`). Monotonic and idempotent.
-    pub fn compact(&mut self, before: Timestamp) {
+    /// everything below `before`). Monotonic and idempotent. Returns the newest
+    /// `t0` dropped, if any command was: what a peer that never applied it can no
+    /// longer get through anti-entropy.
+    pub fn compact(&mut self, before: Timestamp) -> Option<Timestamp> {
         let safe = self.applied_through(before);
         if safe <= self.redundant_before {
-            return;
+            return None;
         }
         let drop: Vec<TxnId> = self
             .commands
@@ -807,6 +809,7 @@ impl Replica {
             .filter(|cmd| cmd.status == Status::Applied && cmd.txn.0 < safe)
             .map(|cmd| cmd.txn)
             .collect();
+        let newest = drop.iter().map(|txn| txn.0).max();
         for txn in &drop {
             if let Some(cmd) = self.commands.remove(txn) {
                 for key in &cmd.keys {
@@ -821,6 +824,7 @@ impl Replica {
             self.reindex_unapplied(*txn);
         }
         self.redundant_before = safe;
+        newest
     }
 }
 

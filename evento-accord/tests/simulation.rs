@@ -1829,3 +1829,280 @@ async fn sweep_for_bugs() {
     }
     eprintln!("swept all {COUNT} seeds with no violation");
 }
+
+// ---------------------------------------------------------------------------
+// Absent peers: a silent peer stops holding compaction back
+// (`NodeConfig::peer_absence_limit`), is counted again if nothing it lacks
+// was compacted, and is told to rejoin otherwise.
+// ---------------------------------------------------------------------------
+
+impl Sim {
+    /// What a host does when node `i` is told to rejoin: tears it down, builds
+    /// a fresh node over an **empty** store and journal, and joins through
+    /// `contact` before its sweeps start (as `GroupHost::open_joining` does).
+    async fn rejoin(&mut self, i: usize, contact: NodeId, config: NodeConfig) {
+        for t in &self.tasks[i] {
+            t.abort();
+        }
+        let id = self.ids[i];
+        let inbox = self.net.register(id);
+        let store = Arc::new(InMemoryDataStore::new());
+        let journal = Arc::new(InMemoryJournal::new());
+        let node = Node::new(
+            id,
+            Arc::new(Self::topology(id, &self.ids, &self.electorate)),
+            Arc::new(HybridLogicalClock::with_physical(
+                id,
+                virtual_micros(self.base),
+            )),
+            Arc::new(self.net.sink(id)),
+            Arc::clone(&store) as Arc<dyn DataStore>,
+            Arc::clone(&journal) as Arc<dyn Journal>,
+        )
+        .with_config(config);
+        node.begin_join();
+        let inbox_task = node.start(inbox);
+        node.join(contact).await.expect("rejoin from a snapshot");
+        self.tasks[i] = vec![inbox_task, node.start_recovery()];
+        self.nodes[i] = node;
+        self.stores[i] = store;
+        self.journals[i] = journal;
+    }
+}
+
+/// A short absence limit, a short margin, and anti-entropy fast enough that
+/// coverage re-proves itself within the test budget.
+fn absence_config(limit: Duration) -> NodeConfig {
+    NodeConfig {
+        compaction_margin: Duration::from_millis(300),
+        peer_absence_limit: Some(limit),
+        ..NodeConfig::default()
+    }
+}
+
+/// Waits until every node in `which` holds no command, or fails.
+async fn await_compacted(sim: &Sim, which: &[usize], what: &str) {
+    for _ in 0..2000 {
+        if which.iter().all(|&i| sim.nodes[i].command_count() == 0) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!(
+        "{what}: commands still held: {:?}",
+        which
+            .iter()
+            .map(|&i| (i, sim.nodes[i].command_count()))
+            .collect::<Vec<_>>()
+    );
+}
+
+async fn await_rejoin_required(node: &Node) {
+    for _ in 0..1000 {
+        if node.rejoin_required() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("node {:?} was never told to rejoin", node.id());
+}
+
+/// A node down past the absence limit no longer holds compaction back: its
+/// peers compact the writes it missed. Back, it is told to rejoin (anti-entropy
+/// can no longer ship what was compacted), refuses writes meanwhile, and once
+/// rejoined from a snapshot it is counted again and the cluster compacts as
+/// before.
+#[tokio::test(start_paused = true)]
+async fn an_absent_peer_stops_holding_compaction_back() {
+    const HOT: &str = "hot";
+    let config = absence_config(Duration::from_secs(2));
+    let mut sim = Sim::build_with_config(3, config);
+
+    for version in 1..=3u16 {
+        sim.nodes[0]
+            .write(vec![event(HOT, version, version as u64)])
+            .await
+            .expect("baseline write");
+    }
+    assert!(converge(&sim.stores).await);
+    await_compacted(&sim, &[0, 1, 2], "baseline").await;
+
+    // Node 2 goes down; writes continue on the quorum.
+    sim.net.crash(NodeId(2));
+    for version in 4..=8u16 {
+        sim.nodes[0]
+            .write(vec![event(HOT, version, 100 + version as u64)])
+            .await
+            .expect("write with a node down");
+    }
+    await_compacted(&sim, &[0, 1], "with node 2 down").await;
+    assert_eq!(sim.nodes[0].absent_peers(), vec![NodeId(2)]);
+    assert_eq!(sim.nodes[1].absent_peers(), vec![NodeId(2)]);
+    assert!(sim.nodes[0].metrics().peers_absent >= 1);
+
+    // Back with its old state, node 2 is behind what its peers compacted.
+    sim.net.heal(NodeId(2));
+    await_rejoin_required(&sim.nodes[2]).await;
+    let err = sim.nodes[2]
+        .write(vec![event(HOT, 9, 999)])
+        .await
+        .expect_err("a node told to rejoin refuses writes");
+    assert!(
+        err.downcast_ref::<evento_accord::RejoinRequired>()
+            .is_some(),
+        "unexpected error: {err:#}"
+    );
+    assert!(sim.nodes[2].metrics().rejoins_required >= 1);
+    // Its peers keep refusing to count it: nothing it sends gets it back in.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(sim.nodes[0].absent_peers(), vec![NodeId(2)]);
+
+    // Its host rejoins it from a snapshot; it is counted again and the next
+    // writes compact everywhere.
+    sim.rejoin(2, NodeId(0), config).await;
+    assert!(converge(&sim.stores).await, "the rejoined node converges");
+    assert_eq!(version_of(&sim.stores[2], HOT).await, 8);
+    for version in 9..=10u16 {
+        sim.nodes[0]
+            .write(vec![event(HOT, version, 200 + version as u64)])
+            .await
+            .expect("write after the rejoin");
+    }
+    assert!(converge(&sim.stores).await);
+    await_compacted(&sim, &[0, 1, 2], "after the rejoin").await;
+    assert!(sim.nodes[0].absent_peers().is_empty());
+    assert!(sim.nodes[1].absent_peers().is_empty());
+}
+
+/// A node down past the limit while nothing was written lacks nothing: back,
+/// its first report counts it again, and no rejoin is asked of it.
+#[tokio::test(start_paused = true)]
+async fn a_peer_back_before_anything_compacted_past_it_is_reinstated() {
+    const HOT: &str = "hot";
+    let sim = Sim::build_with_config(3, absence_config(Duration::from_secs(2)));
+
+    for version in 1..=3u16 {
+        sim.nodes[0]
+            .write(vec![event(HOT, version, version as u64)])
+            .await
+            .expect("baseline write");
+    }
+    assert!(converge(&sim.stores).await);
+    await_compacted(&sim, &[0, 1, 2], "baseline").await;
+
+    sim.net.crash(NodeId(2));
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(sim.nodes[0].absent_peers(), vec![NodeId(2)]);
+
+    sim.net.heal(NodeId(2));
+    for _ in 0..500 {
+        if sim.nodes[0].absent_peers().is_empty() && sim.nodes[1].absent_peers().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        sim.nodes[0].absent_peers().is_empty(),
+        "node 0 counts node 2 again"
+    );
+    assert!(
+        sim.nodes[1].absent_peers().is_empty(),
+        "node 1 counts node 2 again"
+    );
+    assert!(!sim.nodes[2].rejoin_required(), "nothing to rejoin for");
+    assert_eq!(sim.nodes[2].metrics().rejoins_required, 0);
+
+    for version in 4..=5u16 {
+        sim.nodes[0]
+            .write(vec![event(HOT, version, 100 + version as u64)])
+            .await
+            .expect("write after the return");
+    }
+    assert!(converge(&sim.stores).await);
+    await_compacted(&sim, &[0, 1, 2], "after the return").await;
+}
+
+/// A partitioned minority never stops waiting for enough peers to compact on
+/// its own: with three nodes, the stranded one may give up on one peer, not
+/// two. The majority gives it up and compacts; back, it is told to rejoin.
+#[tokio::test(start_paused = true)]
+async fn a_minority_never_drops_its_way_to_compaction() {
+    const HOT: &str = "hot";
+    let config = absence_config(Duration::from_secs(2));
+    let mut sim = Sim::build_with_config(3, config);
+
+    for version in 1..=2u16 {
+        sim.nodes[0]
+            .write(vec![event(HOT, version, version as u64)])
+            .await
+            .expect("baseline write");
+    }
+    assert!(converge(&sim.stores).await);
+    await_compacted(&sim, &[0, 1, 2], "baseline").await;
+
+    sim.net.partition(NodeId(0), NodeId(2));
+    sim.net.partition(NodeId(1), NodeId(2));
+    for version in 3..=5u16 {
+        sim.nodes[0]
+            .write(vec![event(HOT, version, 100 + version as u64)])
+            .await
+            .expect("majority write");
+    }
+    await_compacted(&sim, &[0, 1], "majority").await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(
+        sim.nodes[2].absent_peers().len(),
+        1,
+        "the stranded node keeps waiting for a quorum's worth of peers"
+    );
+    assert_eq!(sim.nodes[2].metrics().peers_absent, 1);
+
+    sim.net.heal_all_partitions();
+    await_rejoin_required(&sim.nodes[2]).await;
+    sim.rejoin(2, NodeId(1), config).await;
+    assert!(converge(&sim.stores).await);
+    assert_eq!(version_of(&sim.stores[2], HOT).await, 5);
+}
+
+/// The bound an absent peer must report above survives the restart of the
+/// node that gave it up: a peer back after that restart is still told to
+/// rejoin rather than silently counted in with a gap.
+#[tokio::test(start_paused = true)]
+async fn rejoin_bounds_survive_a_restart() {
+    const HOT: &str = "hot";
+    let config = absence_config(Duration::from_secs(2));
+    let mut sim = Sim::build_with_config(3, config);
+
+    for version in 1..=2u16 {
+        sim.nodes[0]
+            .write(vec![event(HOT, version, version as u64)])
+            .await
+            .expect("baseline write");
+    }
+    assert!(converge(&sim.stores).await);
+    await_compacted(&sim, &[0, 1, 2], "baseline").await;
+
+    sim.net.crash(NodeId(2));
+    for version in 3..=4u16 {
+        sim.nodes[0]
+            .write(vec![event(HOT, version, 100 + version as u64)])
+            .await
+            .expect("write with a node down");
+    }
+    await_compacted(&sim, &[0, 1], "with node 2 down").await;
+    assert_eq!(
+        sim.journals[0].load_rejoin_bounds().await.unwrap().len(),
+        1,
+        "node 0 persisted the bound"
+    );
+
+    // Both survivors restart (with the default config: no absence limit), so
+    // only the persisted bound can keep node 2 out.
+    sim.restart(0).await;
+    sim.restart(1).await;
+    assert_eq!(sim.nodes[0].absent_peers(), vec![NodeId(2)]);
+    assert_eq!(sim.nodes[1].absent_peers(), vec![NodeId(2)]);
+
+    sim.net.heal(NodeId(2));
+    await_rejoin_required(&sim.nodes[2]).await;
+}

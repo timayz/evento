@@ -310,6 +310,13 @@ pub enum Message {
         execute_at: Timestamp,
         deps: Vec<TxnId>,
     },
+    /// Replica → a peer it stopped waiting for: the peer was silent past
+    /// `NodeConfig::peer_absence_limit`, and this replica has since compacted
+    /// transactions at or above the peer's last watermark report, which
+    /// anti-entropy can no longer ship. The peer must rejoin the group from a
+    /// snapshot before it takes part again (`Node::rejoin_required`); `above`
+    /// is the highest compacted `t0` it may be missing.
+    Rejoin { above: Timestamp },
 }
 
 impl Message {
@@ -363,7 +370,8 @@ impl Message {
             | Message::MetadataFetch { .. }
             | Message::MetadataEntries { .. }
             | Message::ReadForward { .. }
-            | Message::ReadReply { .. } => None,
+            | Message::ReadReply { .. }
+            | Message::Rejoin { .. } => None,
         }
     }
 }

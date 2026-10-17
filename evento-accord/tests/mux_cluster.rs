@@ -23,10 +23,11 @@ use tokio::sync::mpsc;
 /// `n` multiplexed hosts over real localhost TCP, with no groups open yet.
 struct MuxCluster {
     ids: Vec<NodeId>,
-    peers: HashMap<NodeId, SocketAddr>,
     hosts: Vec<Arc<GroupHost>>,
     /// Groups each host's unrouted handler was told about.
     unrouted: Vec<Arc<Mutex<Vec<GroupId>>>>,
+    /// Groups each host's rejoin handler was told about.
+    rejoined: Vec<Arc<Mutex<Vec<GroupId>>>>,
     _tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -105,10 +106,13 @@ impl MuxCluster {
 
         let mut hosts = Vec::new();
         let mut unrouted = Vec::new();
+        let mut rejoined = Vec::new();
         let mut tasks = Vec::new();
         for (id, listener) in listeners {
             let seen = Arc::new(Mutex::new(Vec::new()));
             let hook = Arc::clone(&seen);
+            let told = Arc::new(Mutex::new(Vec::new()));
+            let rejoin_hook = Arc::clone(&told);
             let mux = Arc::new(
                 MuxTransport::new(id, peers.clone())
                     .with_pending_buffer(64, 64, pending_ttl)
@@ -121,15 +125,19 @@ impl MuxCluster {
                 ..SweepConfig::default()
             });
             tasks.push(scheduler.start());
-            hosts.push(Arc::new(GroupHost::new(mux, scheduler)));
+            hosts.push(Arc::new(
+                GroupHost::new(mux, scheduler)
+                    .with_rejoin_handler(move |g| rejoin_hook.lock().unwrap().push(g)),
+            ));
             unrouted.push(seen);
+            rejoined.push(told);
         }
 
         MuxCluster {
             ids,
-            peers,
             hosts,
             unrouted,
+            rejoined,
             _tasks: tasks,
         }
     }
@@ -293,7 +301,7 @@ async fn frames_parked_before_register_are_replayed_and_keep_the_fast_path() {
     // The PreAccept reaches host 2 while unregistered → parked, handler told.
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(cluster.unrouted[2].lock().unwrap().as_slice(), &[g.id]);
-    assert!(writer.is_finished() == false, "fast quorum needs host 2");
+    assert!(!writer.is_finished(), "fast quorum needs host 2");
 
     // Opening the group replays the parked frames; the fast path completes.
     let _n2 = cluster.open_with(&g, 2, config).await;
@@ -642,4 +650,96 @@ async fn a_legacy_single_group_node_interoperates_in_the_default_group() {
         assert_eq!(this, order);
     }
     drop(tasks);
+}
+
+/// A host that had a group closed (a tenant evicted, a node down) past
+/// `peer_absence_limit` no longer holds its peers' compaction back. Reopened
+/// over its old journal after writes were compacted without it, its node is
+/// told to rejoin and the host's handler hears of it; the host then does what
+/// a lost store needs: close, discard, open by joining.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_rejoins_a_group_its_peers_gave_up_on() {
+    let cluster = MuxCluster::start(3, Duration::from_millis(200)).await;
+    let mut g = Group::new(GroupId(52), 3);
+    let config = NodeConfig {
+        compaction_margin: Duration::from_millis(300),
+        peer_absence_limit: Some(Duration::from_secs(1)),
+        ..NodeConfig::default()
+    };
+    let mut nodes = Vec::new();
+    for h in 0..3 {
+        nodes.push(cluster.open_with(&g, h, config).await);
+    }
+    write(&nodes[0], vec![event("acc", 1, "Opened")]).await;
+    for store in &g.stores {
+        await_committed(store, 1).await;
+    }
+
+    // Host 2 closes the group; the others keep writing and, once host 2 has
+    // been silent past the limit, compact without it.
+    cluster.hosts[2].close(g.id).expect("open on host 2");
+    write(&nodes[0], vec![event("acc", 2, "Deposited")]).await;
+    write(&nodes[1], vec![event("acc", 3, "Deposited")]).await;
+    for _ in 0..600 {
+        if nodes[0].command_count() == 0 && nodes[1].command_count() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        nodes[0].command_count(),
+        0,
+        "host 0 compacted without host 2"
+    );
+    assert_eq!(nodes[0].absent_peers(), vec![NodeId(2)]);
+
+    // Back over its old journal (the in-memory store is not durable, so it is
+    // rebuilt from the journal as in the restart tests), host 2's node is
+    // behind and told so.
+    g.stores[2] = Arc::new(InMemoryDataStore::new());
+    let stale = cluster.open_with(&g, 2, config).await;
+    for _ in 0..600 {
+        if cluster.rejoined[2].lock().unwrap().contains(&g.id) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(cluster.rejoined[2].lock().unwrap().as_slice(), &[g.id]);
+    assert!(stale.rejoin_required());
+    assert!(stale
+        .write(vec![event("acc", 4, "Deposited")])
+        .await
+        .is_err());
+
+    // The handler's job: close, discard the store and journal, open by joining.
+    cluster.hosts[2].close(g.id).expect("open on host 2");
+    g.stores[2] = Arc::new(InMemoryDataStore::new());
+    g.journals[2] = Arc::new(InMemoryJournal::new());
+    let joined = cluster
+        .open_joining(&g, 2, config, &[NodeId(0), NodeId(1)])
+        .await
+        .expect("join");
+    assert_eq!(committed(&g.stores[2]), committed(&g.stores[0]));
+    for _ in 0..200 {
+        if nodes[0].absent_peers().is_empty() && nodes[1].absent_peers().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        nodes[0].absent_peers().is_empty(),
+        "host 0 counts host 2 again"
+    );
+    assert!(
+        nodes[1].absent_peers().is_empty(),
+        "host 1 counts host 2 again"
+    );
+
+    // Writes land on the joiner and it can coordinate one.
+    write(&nodes[0], vec![event("acc", 4, "Deposited")]).await;
+    write(&joined, vec![event("acc", 5, "Deposited")]).await;
+    for store in &g.stores {
+        await_committed(store, 5).await;
+    }
+    assert_eq!(committed(&g.stores[2]), committed(&g.stores[0]));
 }

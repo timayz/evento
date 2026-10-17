@@ -81,6 +81,10 @@ pub enum RecordKind {
     /// [`Message`](crate::message::Message), emitted by `MuxTransport` so one
     /// connection set can carry many independent consensus groups.
     GroupFrame = 6,
+    /// The journal's persisted rejoin bounds: per peer this node stopped
+    /// waiting for, the compacted `t0` it must report above to be counted
+    /// again (`Journal::save_rejoin_bounds`).
+    RejoinBounds = 7,
 }
 
 impl RecordKind {
@@ -92,6 +96,7 @@ impl RecordKind {
             4 => Some(Self::MetadataEntry),
             5 => Some(Self::AcceptorState),
             6 => Some(Self::GroupFrame),
+            7 => Some(Self::RejoinBounds),
             _ => None,
         }
     }

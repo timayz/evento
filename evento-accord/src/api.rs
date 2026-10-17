@@ -202,6 +202,24 @@ pub trait Journal: Send + Sync + 'static {
         Ok(None)
     }
 
+    /// Persists, for each peer this node stopped waiting for (see
+    /// `NodeConfig::peer_absence_limit`), the highest compacted transaction that
+    /// peer must prove it holds before it is counted again. Replaces the
+    /// previous set; an empty slice clears it. A restart restores the set with
+    /// [`load_rejoin_bounds`](Journal::load_rejoin_bounds), so a peer that
+    /// returns after this node restarted is still told to rejoin. The default
+    /// is a no-op (a journal that forgets them is merely less strict: the peer
+    /// is counted again as soon as it reports).
+    async fn save_rejoin_bounds(&self, bounds: &[(NodeId, Timestamp)]) -> anyhow::Result<()> {
+        let _ = bounds;
+        Ok(())
+    }
+
+    /// The persisted rejoin bounds, if any. The default returns none.
+    async fn load_rejoin_bounds(&self) -> anyhow::Result<Vec<(NodeId, Timestamp)>> {
+        Ok(Vec::new())
+    }
+
     /// Loads the persisted state for `txn`, if any.
     async fn load(&self, txn: TxnId) -> anyhow::Result<Option<CommandState>>;
 

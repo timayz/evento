@@ -77,7 +77,8 @@ timeouts for geo/WAN** deployments.
 | `phi_threshold` | 8.0 | Phi-accrual suspicion level; higher tolerates more latency variance before suspecting a coordinator. |
 | `acceptable_pause` | 500 ms | How long a live peer may go quiet beyond its usual heartbeat interval (scheduler stall, slow fsync, loaded host) before suspicion starts to rise. |
 | `linearizable_reads` | false | Opt-in linearizable reads (§10) — one consensus round per read. |
-| `max_commands` | 100 000 | Backpressure: refuse *new* local writes once the un-compacted backlog hits this (e.g. compaction stalled under a partition). |
+| `max_commands` | 100 000 | Backpressure: refuse *new* local writes (`BacklogAtCap`) once the un-compacted backlog hits this (e.g. compaction stalled under a partition, or a peer down with `peer_absence_limit` unset). |
+| `peer_absence_limit` | none | Stop waiting for a same-shard peer silent this long: compaction then proceeds without it (§7, down node). Set it well above any restart or maintenance window; a peer given up on while writes went through must rejoin from a snapshot on return. Never leaves fewer than a slow quorum counted. |
 | `config_defer_step` | 100 ms | Control-plane anti-dueling delay for concurrent reconfigurations. |
 
 Clock-skew tolerance is on the clock: `HybridLogicalClock::with_max_skew(..)` (default
@@ -119,6 +120,8 @@ Serve it on an HTTP endpoint (see `bank-axum-accord`'s `/metrics`). Counters:
 | `messages_handled` | liveness/traffic. |
 | `messages_shed` | inbound backpressure drops; sustained > 0 = a node is overloaded or a peer is flooding. |
 | `messages_unrouted` | (`MuxTransport` only) inbound frames for a group this host has not registered that were dropped — parked past the pending-buffer TTL or over its bounds. Steady > 0 = peers address groups this host never opens (a tenant evicted here and never re-opened, or a stale/unknown group id). |
+| `peers_absent` | shard peers this node stopped waiting for (`peer_absence_limit`); each is a node that was silent for that long. |
+| `rejoins_required` | a peer told this node to rejoin: it had been given up on while writes it never applied were compacted. The node is stale until its host rejoins it (§7). |
 
 **Health/readiness.**
 - *Liveness:* a simple `200` while the process is up (`bank-axum-accord`'s `/health`).
@@ -178,7 +181,22 @@ metadata log (config-Paxos); concurrent reconfigurations converge without a lead
   return.
   A down node also holds compaction back: peers compact only below the minimum
   watermark every shard peer has reported, so the backlog grows until it returns
-  (watch it against `max_commands`).
+  (watch it against `max_commands`) — unless `peer_absence_limit` is set. Then a
+  peer silent that long is **given up on** (`accord_peers_absent_total`, a warning
+  names it) and compaction proceeds below the minimum of the peers still heard
+  from; a node never gives up so many peers that fewer than a slow quorum stay
+  counted, so a stranded minority keeps waiting. Back, the absent node is counted
+  again as soon as it reports a watermark above everything compacted past its last
+  report (it was merely quiet, or down while nothing was written). If writes it
+  never applied were compacted meanwhile, every message it sends is answered with
+  `Message::Rejoin` instead: it logs an error, drops every message, refuses writes
+  (`RejoinRequired`) and stays like that until its host rejoins it — the `GroupHost`
+  `with_rejoin_handler` hook is told, and should close the group, discard its store
+  and journal, and `open_joining` it (next item). The bound a given-up peer must
+  report above is persisted (`Journal::save_rejoin_bounds`), so it holds across a
+  restart of the node that gave it up. Mind the snapshot cap (§10): a group whose
+  log exceeds one frame cannot be rejoined until snapshots stream, so leave the
+  limit unset where that applies.
 - **Node back with a lost store** (new disk, deleted tenant file, a backup older than
   its peers' compaction): its journal floor is gone, so anti-entropy can ship only the
   commands peers still hold and the compacted prefix never comes back — the
@@ -329,6 +347,9 @@ your own code stays debuggable.
 - [ ] Timeouts tuned for your network (raise for WAN/geo).
 - [ ] mutual TLS (`serve_tls_verified` + pinned `PeerCerts`) on untrusted networks.
 - [ ] `/metrics` scraped + alerts on recoveries / compaction-stall / shed / backlog.
+- [ ] `peer_absence_limit` decided: unset keeps a down node's writes shippable on
+      return but lets the backlog grow toward `max_commands`; set, a node away
+      longer rejoins from a snapshot (host hook `with_rejoin_handler` in place).
 - [ ] Backups of the event store (and journal) per node; restore drill rehearsed.
 - [ ] `linearizable_reads` decision made (freshness vs. read latency).
 - [ ] Load/soak test on representative hardware before trusting it — and note the

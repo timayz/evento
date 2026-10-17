@@ -36,6 +36,13 @@ pub struct Metrics {
     /// that could not be parked for it (buffer full) or expired before it registered
     /// — a multiplexed transport (`MuxTransport`) counter.
     pub messages_unrouted: AtomicU64,
+    /// Same-shard peers this node stopped waiting for because they were silent
+    /// past `NodeConfig::peer_absence_limit` (compaction then proceeds without
+    /// them).
+    pub peers_absent: AtomicU64,
+    /// Times a peer told this node to rejoin the group from a snapshot: it had
+    /// been absent while transactions it never applied were compacted.
+    pub rejoins_required: AtomicU64,
 }
 
 impl Metrics {
@@ -58,6 +65,16 @@ impl Metrics {
             &self.slow_path
         };
         path.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records that a silent peer is no longer waited for.
+    pub fn record_peer_absent(&self) {
+        self.peers_absent.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records that a peer told this node to rejoin.
+    pub fn record_rejoin_required(&self) {
+        self.rejoins_required.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Records that the recovery sweep took over a stalled transaction.
@@ -109,6 +126,8 @@ impl Metrics {
             messages_handled: self.messages_handled.load(Ordering::Relaxed),
             messages_shed: self.messages_shed.load(Ordering::Relaxed),
             messages_unrouted: self.messages_unrouted.load(Ordering::Relaxed),
+            peers_absent: self.peers_absent.load(Ordering::Relaxed),
+            rejoins_required: self.rejoins_required.load(Ordering::Relaxed),
         }
     }
 }
@@ -129,6 +148,8 @@ pub struct MetricsSnapshot {
     pub messages_handled: u64,
     pub messages_shed: u64,
     pub messages_unrouted: u64,
+    pub peers_absent: u64,
+    pub rejoins_required: u64,
 }
 
 impl MetricsSnapshot {
@@ -136,7 +157,7 @@ impl MetricsSnapshot {
     /// source of truth for both [`to_prometheus`](Self::to_prometheus) and
     /// [`to_prometheus_labeled`](Self::to_prometheus_labeled); add a counter here and
     /// both renderings pick it up.
-    fn counters(&self) -> [(&'static str, &'static str, u64); 11] {
+    fn counters(&self) -> [(&'static str, &'static str, u64); 13] {
         [
             (
                 "accord_writes_committed_total",
@@ -192,6 +213,16 @@ impl MetricsSnapshot {
                 "accord_messages_unrouted_total",
                 "Inbound frames for a group with no registered inbox that were dropped.",
                 self.messages_unrouted,
+            ),
+            (
+                "accord_peers_absent_total",
+                "Silent shard peers this node stopped waiting for (compaction proceeds without them).",
+                self.peers_absent,
+            ),
+            (
+                "accord_rejoins_required_total",
+                "Times a peer told this node to rejoin the group from a snapshot.",
+                self.rejoins_required,
             ),
         ]
     }

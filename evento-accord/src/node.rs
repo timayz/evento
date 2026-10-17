@@ -94,6 +94,20 @@ pub struct NodeConfig {
     /// consensus messages is never refused (that would break safety/liveness). Set
     /// high enough to never trip in a healthy cluster.
     pub max_commands: usize,
+    /// How long a same-shard peer may stay silent before this node stops
+    /// waiting for it. Compaction needs every shard peer's watermark, so a
+    /// peer that is down holds every command on the others until it returns —
+    /// and `max_commands` then refuses writes. Past this limit the peer is
+    /// *absent*: compaction proceeds below the minimum of the peers still
+    /// heard from. An absent peer is counted again as soon as it reports a
+    /// watermark above everything compacted meanwhile (it was merely quiet,
+    /// or down while nothing was written); if transactions it never applied
+    /// were compacted, it is told to rejoin from a snapshot instead
+    /// ([`Message::Rejoin`], [`Node::rejoin_required`]), since anti-entropy
+    /// can no longer ship them. A node never stops waiting for so many peers
+    /// that fewer than a slow quorum stay counted, so a partitioned minority
+    /// cannot compact on its own. `None` (the default) waits forever.
+    pub peer_absence_limit: Option<Duration>,
     /// Control-plane anti-dueling delay. An automatic config-change recovery defers
     /// by `rank * config_defer_step` (the **distinguished proposer** for an epoch has
     /// rank 0 and proposes first; others wait, then skip if it already committed), and
@@ -117,9 +131,70 @@ impl Default for NodeConfig {
             acceptable_pause: Duration::from_millis(500),
             linearizable_reads: false,
             max_commands: 100_000,
+            peer_absence_limit: None,
             config_defer_step: Duration::from_millis(100),
         }
     }
+}
+
+/// [`Node::write`] refused a new write: the un-compacted backlog reached
+/// [`NodeConfig::max_commands`] (compaction stalled — a peer is down or
+/// partitioned). Returned through `anyhow`; downcast to tell it apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BacklogAtCap {
+    /// Commands this node holds.
+    pub backlog: usize,
+    /// The configured cap.
+    pub cap: usize,
+}
+
+impl std::fmt::Display for BacklogAtCap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "consensus backlog at cap ({} >= {}); refusing new write",
+            self.backlog, self.cap
+        )
+    }
+}
+
+impl std::error::Error for BacklogAtCap {}
+
+/// [`Node::write`] refused a new write: a peer told this node to rejoin the
+/// group from a snapshot (see [`NodeConfig::peer_absence_limit`]), so it no
+/// longer takes part until its host does. Returned through `anyhow`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RejoinRequired;
+
+impl std::fmt::Display for RejoinRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("this node fell behind its peers' compaction and must rejoin the group")
+    }
+}
+
+impl std::error::Error for RejoinRequired {}
+
+/// A same-shard peer this node stopped waiting for; see
+/// [`NodeConfig::peer_absence_limit`].
+#[derive(Debug, Clone, Copy)]
+struct AbsentPeer {
+    /// What it last reported ([`Timestamp::MIN`] if never): a report is a
+    /// proof that the peer holds every transaction with a lower `t0`.
+    last_report: Timestamp,
+    /// The newest `t0` compacted since at or above that report — what the peer
+    /// may lack. It must report above this to be counted again; until then it
+    /// is told to rejoin. Persisted through the journal.
+    rejoin_above: Option<Timestamp>,
+}
+
+/// What to do with a message from an absent peer.
+enum Screen {
+    /// Not absent, or a join request: handle it.
+    Pass,
+    /// Reinstated by this message; the bounds changed if `persist`.
+    Reinstated { persist: bool },
+    /// Still behind: answer this instead.
+    Reply(Message),
 }
 
 /// The result of a coordinated (or recovered) write.
@@ -297,6 +372,17 @@ pub struct Node {
     /// Phi-accrual liveness estimator: every inbound message is a heartbeat, and a
     /// coordinator suspected dead has its stalled transactions recovered.
     failure_detector: Arc<FailureDetector>,
+    /// When this node was built: the silence of a peer never heard from is
+    /// measured from here.
+    started_at: Instant,
+    /// Same-shard peers this node stopped waiting for (silent past
+    /// [`NodeConfig::peer_absence_limit`]). Locked before `peer_watermarks`
+    /// wherever both are held.
+    absent: Arc<Mutex<HashMap<NodeId, AbsentPeer>>>,
+    /// True once a peer told this node to rejoin: it then drops every message
+    /// and refuses writes until its host replaces its store and opens the
+    /// group by joining (`GroupHost::open_joining`).
+    rejoin_required: Arc<tokio::sync::watch::Sender<bool>>,
     /// Bumped whenever local applied state advances (an apply or an
     /// anti-entropy import). Waiters (`read_barrier`, read-your-writes) select
     /// on it instead of polling the replica lock every millisecond.
@@ -345,6 +431,9 @@ impl Node {
             peer_watermarks: Arc::new(Mutex::new(HashMap::new())),
             sync_coverage: Arc::new(Mutex::new((start_epoch, HashMap::new()))),
             failure_detector: Arc::new(FailureDetector::new()),
+            started_at: Instant::now(),
+            absent: Arc::new(Mutex::new(HashMap::new())),
+            rejoin_required: Arc::new(tokio::sync::watch::channel(false).0),
             applied_gen: Arc::new(tokio::sync::watch::channel(0).0),
             last_anti_entropy: Arc::new(Mutex::new(None)),
             metrics: Arc::new(Metrics::new()),
@@ -393,6 +482,45 @@ impl Node {
     /// healthy cluster recovers nothing. For tests and observability.
     pub fn recovery_count(&self) -> u64 {
         self.metrics.recoveries.load(Ordering::Relaxed)
+    }
+
+    /// Same-shard peers this node has stopped waiting for (see
+    /// [`NodeConfig::peer_absence_limit`]), sorted. For observability.
+    pub fn absent_peers(&self) -> Vec<NodeId> {
+        let mut peers: Vec<NodeId> = self
+            .absent
+            .lock()
+            .expect("absent poisoned")
+            .keys()
+            .copied()
+            .collect();
+        peers.sort_unstable();
+        peers
+    }
+
+    /// How long since the last message from `peer` — since this node started,
+    /// if it never heard from it. For observability.
+    pub fn silent_for(&self, peer: NodeId) -> Duration {
+        let heard = self
+            .failure_detector
+            .last_heard(peer)
+            .unwrap_or(self.started_at);
+        Instant::now().saturating_duration_since(heard)
+    }
+
+    /// Whether a peer told this node to rejoin the group from a snapshot: it
+    /// was absent while transactions it never applied were compacted, so it
+    /// can no longer catch up. The node drops every message and refuses writes
+    /// from then on; the host closes it, discards its store and journal, and
+    /// opens the group by joining (`GroupHost::open_joining`).
+    pub fn rejoin_required(&self) -> bool {
+        *self.rejoin_required.borrow()
+    }
+
+    /// A watch that turns `true` when [`rejoin_required`](Self::rejoin_required)
+    /// does.
+    pub fn rejoin_signal(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.rejoin_required.subscribe()
     }
 
     /// Locally-safe subscription watermark, in microseconds since the Unix epoch:
@@ -564,6 +692,21 @@ impl Node {
                 replica.compact(wm);
             }
         }
+        // Peers this node had stopped waiting for stay excluded until they
+        // report above what was compacted past them (or rejoin).
+        let bounds = self.journal.load_rejoin_bounds().await?;
+        if !bounds.is_empty() {
+            let mut absent = self.absent.lock().expect("absent poisoned");
+            for (peer, bound) in bounds {
+                absent.insert(
+                    peer,
+                    AbsentPeer {
+                        last_report: bound,
+                        rejoin_above: Some(bound),
+                    },
+                );
+            }
+        }
         // Replay the retained (post-truncation) applied tail into the data store.
         // The truncated prefix is not in the journal; a durable data store already
         // holds it, and re-applying the tail is idempotent.
@@ -586,17 +729,66 @@ impl Node {
     /// truncated to the replica's *actual* resulting watermark, which `compact`
     /// may clamp below `before` if a local transaction is not yet applied.
     pub async fn compact(&self, before: Timestamp) {
-        let (previous, watermark) = {
+        let (previous, watermark, newest) = {
             let mut replica = self.replica.lock().expect("replica poisoned");
             let previous = replica.redundant_before();
-            replica.compact(before);
-            (previous, replica.redundant_before())
+            let newest = replica.compact(before);
+            (previous, replica.redundant_before(), newest)
         };
         if watermark > previous {
             self.metrics.record_compaction();
             tracing::debug!(node = self.id.0, ?watermark, "compacted consensus state");
         }
         let _ = self.journal.truncate(watermark).await;
+        if let Some(newest) = newest {
+            self.note_compacted_past_absent(newest).await;
+        }
+    }
+
+    /// After a compaction that dropped commands up to `newest`: every absent
+    /// peer whose last report is at or below it may lack one of them (a
+    /// report vouches only for lower `t0`s), so it must now report above
+    /// `newest` to be counted again. The bounds are persisted, so a restart of
+    /// this node does not let such a peer back in unproven.
+    async fn note_compacted_past_absent(&self, newest: Timestamp) {
+        let bounds = {
+            let mut absent = self.absent.lock().expect("absent poisoned");
+            let mut changed = false;
+            for (&peer, state) in absent.iter_mut() {
+                if newest >= state.last_report && state.rejoin_above.is_none_or(|b| newest > b) {
+                    if state.rejoin_above.is_none() {
+                        tracing::warn!(
+                            node = self.id.0,
+                            peer = peer.0,
+                            ?newest,
+                            "compacted past an absent peer's last report; it must rejoin on return"
+                        );
+                    }
+                    state.rejoin_above = Some(newest);
+                    changed = true;
+                }
+            }
+            if !changed {
+                return;
+            }
+            Self::bounds_of(&absent)
+        };
+        self.save_rejoin_bounds(&bounds).await;
+    }
+
+    fn bounds_of(absent: &HashMap<NodeId, AbsentPeer>) -> Vec<(NodeId, Timestamp)> {
+        let mut bounds: Vec<(NodeId, Timestamp)> = absent
+            .iter()
+            .filter_map(|(&peer, state)| state.rejoin_above.map(|bound| (peer, bound)))
+            .collect();
+        bounds.sort_unstable();
+        bounds
+    }
+
+    async fn save_rejoin_bounds(&self, bounds: &[(NodeId, Timestamp)]) {
+        if let Err(err) = self.journal.save_rejoin_bounds(bounds).await {
+            tracing::warn!(node = self.id.0, %err, "cannot persist the rejoin bounds");
+        }
     }
 
     /// Recovers stalled transactions whose coordinator is presumed dead, then runs
@@ -610,6 +802,11 @@ impl Node {
     /// which guarantees liveness even with no liveness history). Both paths are
     /// idempotent and ballot-fenced, so concurrent recoveries are safe.
     async fn recovery_sweep(&self) {
+        // A node told to rejoin holds state its peers compacted past: it
+        // recovers, repairs and gossips nothing until its host rejoins it.
+        if self.rejoin_required() {
+            return;
+        }
         let now = self.clock.now().micros;
         let micros_ago = |d: Duration| Timestamp {
             micros: now.saturating_sub(d.as_micros() as u64),
@@ -829,47 +1026,11 @@ impl Node {
     /// partitioned peer holds the min down, and an unheard-from peer blocks
     /// compaction entirely), so dropping that state is safe.
     async fn advance_watermark(&self) {
-        let cutoff = self.margin_cutoff();
-        let local = self
-            .replica
-            .lock()
-            .expect("replica poisoned")
-            .applied_through(cutoff);
-
         // The disjoint replica set this node belongs to.
         let all_nodes = self.topology.nodes();
-        let my_shard = self.topology.node_shard(self.id);
-        let shard_peers: Vec<NodeId> = all_nodes
-            .iter()
-            .copied()
-            .filter(|&n| self.topology.node_shard(n) == my_shard)
-            .collect();
-
-        let mine = match self.quorum_sync_coverage(&shard_peers) {
-            Some(coverage) if coverage < local => {
-                self.metrics.record_watermark_clamp();
-                tracing::debug!(
-                    node = self.id.0,
-                    ?local,
-                    ?coverage,
-                    "watermark report clamped by sync coverage"
-                );
-                coverage
-            }
-            _ => local,
-        };
-        // Never past a transaction this node is still coordinating: if its
-        // coordination fails, the node recovers it to learn the outcome, and
-        // that needs every replica to still hold it.
-        let mine = match self
-            .coordinating
-            .lock()
-            .expect("coordinating poisoned")
-            .first()
-        {
-            Some(oldest) if oldest.0 < mine => oldest.0,
-            _ => mine,
-        };
+        let shard_peers = self.shard_peers();
+        let mine = self.report(&shard_peers);
+        self.give_up_on_silent_peers(&shard_peers);
 
         // Watermarks go to EVERY peer, not just shard peers: compaction only
         // consumes same-shard reports, but the message doubles as the periodic
@@ -889,14 +1050,19 @@ impl Node {
         .await;
 
         let watermark = {
+            let mut absent = self.absent.lock().expect("absent poisoned");
             let mut watermarks = self.peer_watermarks.lock().expect("watermarks poisoned");
             // Evict reports from nodes no longer in the topology, or a removed
             // peer's last (stale) watermark would hold compaction back forever.
             watermarks.retain(|node, _| all_nodes.contains(node));
+            absent.retain(|node, _| all_nodes.contains(node));
             watermarks.insert(self.id, mine);
             let mut wm = mine;
             let mut complete = true;
             for &peer in &shard_peers {
+                if absent.contains_key(&peer) {
+                    continue;
+                }
                 match watermarks.get(&peer) {
                     Some(&point) => wm = wm.min(point),
                     None => {
@@ -910,6 +1076,181 @@ impl Node {
         if let Some(watermark) = watermark {
             self.compact(watermark).await;
         }
+    }
+
+    /// The nodes of this node's shard, itself included.
+    fn shard_peers(&self) -> Vec<NodeId> {
+        let my_shard = self.topology.node_shard(self.id);
+        self.topology
+            .nodes()
+            .into_iter()
+            .filter(|&n| self.topology.node_shard(n) == my_shard)
+            .collect()
+    }
+
+    /// The redundancy point this node vouches for: its applied-through lagged
+    /// by the compaction margin, clamped to its proven sync coverage and to
+    /// the oldest transaction it is still coordinating (see
+    /// [`advance_watermark`](Self::advance_watermark)).
+    fn report(&self, shard_peers: &[NodeId]) -> Timestamp {
+        let cutoff = self.margin_cutoff();
+        let local = self
+            .replica
+            .lock()
+            .expect("replica poisoned")
+            .applied_through(cutoff);
+
+        let mine = match self.quorum_sync_coverage(shard_peers) {
+            Some(coverage) if coverage < local => {
+                self.metrics.record_watermark_clamp();
+                tracing::debug!(
+                    node = self.id.0,
+                    ?local,
+                    ?coverage,
+                    "watermark report clamped by sync coverage"
+                );
+                coverage
+            }
+            _ => local,
+        };
+        // Never past a transaction this node is still coordinating: if its
+        // coordination fails, the node recovers it to learn the outcome, and
+        // that needs every replica to still hold it.
+        match self
+            .coordinating
+            .lock()
+            .expect("coordinating poisoned")
+            .first()
+        {
+            Some(oldest) if oldest.0 < mine => oldest.0,
+            _ => mine,
+        }
+    }
+
+    /// Stops waiting for same-shard peers silent past
+    /// [`NodeConfig::peer_absence_limit`]: their report leaves the compaction
+    /// minimum, and what they last reported is kept to tell, when they return,
+    /// whether anything they lack was compacted meanwhile. Never leaves fewer
+    /// than a slow quorum counted (this node included), so a partitioned
+    /// minority keeps waiting.
+    fn give_up_on_silent_peers(&self, shard_peers: &[NodeId]) {
+        let Some(limit) = self.settings.peer_absence_limit else {
+            return;
+        };
+        let now = Instant::now();
+        let quorum = crate::api::slow_quorum_size(shard_peers.len());
+        let mut absent = self.absent.lock().expect("absent poisoned");
+        let mut watermarks = self.peer_watermarks.lock().expect("watermarks poisoned");
+        for &peer in shard_peers {
+            if peer == self.id || absent.contains_key(&peer) {
+                continue;
+            }
+            let heard = self
+                .failure_detector
+                .last_heard(peer)
+                .unwrap_or(self.started_at);
+            let silent = now.saturating_duration_since(heard);
+            if silent < limit {
+                continue;
+            }
+            let counted = shard_peers.len() - absent.len();
+            if counted <= quorum {
+                tracing::debug!(
+                    node = self.id.0,
+                    peer = peer.0,
+                    "a silent peer is still waited for: giving it up would leave less than a quorum"
+                );
+                continue;
+            }
+            let last_report = watermarks.remove(&peer).unwrap_or(Timestamp::MIN);
+            absent.insert(
+                peer,
+                AbsentPeer {
+                    last_report,
+                    rejoin_above: None,
+                },
+            );
+            self.metrics.record_peer_absent();
+            tracing::warn!(
+                node = self.id.0,
+                peer = peer.0,
+                silent_secs = silent.as_secs(),
+                "stopped waiting for a silent peer; compaction proceeds without it"
+            );
+        }
+    }
+
+    /// What to do with a message from `from` if this node stopped waiting for
+    /// it. A watermark report above everything compacted past it (or any
+    /// message, if nothing was) proves it lacks nothing and counts it again; a
+    /// join request is served, since joining is how it catches up; anything
+    /// else while it is behind is answered with [`Message::Rejoin`] instead
+    /// of being handled — a stale replica must not take part (its recovery of
+    /// a compacted transaction would find no one who knows it).
+    fn screen_absent(&self, from: NodeId, message: &Message) -> Screen {
+        let mut absent = self.absent.lock().expect("absent poisoned");
+        let Some(state) = absent.get(&from) else {
+            return Screen::Pass;
+        };
+        let behind = match message {
+            Message::SyncRequest { snapshot: true, .. } => return Screen::Pass,
+            Message::Watermark { applied_through } => match state.rejoin_above {
+                Some(bound) if *applied_through <= bound => Some(bound),
+                _ => None,
+            },
+            _ => state.rejoin_above,
+        };
+        match behind {
+            Some(above) => Screen::Reply(Message::Rejoin { above }),
+            None => {
+                let persist = state.rejoin_above.is_some();
+                absent.remove(&from);
+                tracing::info!(
+                    node = self.id.0,
+                    peer = from.0,
+                    "an absent peer is back and lacks nothing compacted; waiting for it again"
+                );
+                Screen::Reinstated { persist }
+            }
+        }
+    }
+
+    /// A peer stopped waiting for this node and compacted past what it holds.
+    /// If this node can nevertheless prove it holds everything up to `above`
+    /// (its own report is higher: a stale bound, or a report that crossed the
+    /// peer's message), it answers with that report; otherwise it stops taking
+    /// part and waits for its host to rejoin it.
+    async fn on_rejoin(&self, from: NodeId, above: Timestamp) {
+        if self.rejoin_required() {
+            return;
+        }
+        let mine = self.report(&self.shard_peers());
+        if mine > above {
+            tracing::debug!(
+                node = self.id.0,
+                peer = from.0,
+                ?above,
+                ?mine,
+                "told to rejoin but holding everything compacted; reporting instead"
+            );
+            self.send(
+                from,
+                Message::Watermark {
+                    applied_through: mine,
+                },
+            )
+            .await;
+            return;
+        }
+        self.metrics.record_rejoin_required();
+        tracing::error!(
+            node = self.id.0,
+            peer = from.0,
+            ?above,
+            ?mine,
+            "behind the peers' compaction; this node must rejoin the group from a snapshot"
+        );
+        self.rejoin_required.send_replace(true);
     }
 
     // ----- inbox handling -------------------------------------------------
@@ -944,6 +1285,26 @@ impl Node {
         self.metrics.record_message();
         // Every inbound message is a liveness heartbeat from its sender.
         self.failure_detector.heartbeat(env.from);
+
+        // Told to rejoin: this node's state is stale, so it takes no part until
+        // its host rejoins it (see `NodeConfig::peer_absence_limit`).
+        if self.rejoin_required() {
+            return Vec::new();
+        }
+        if let Message::Rejoin { above } = env.message {
+            self.on_rejoin(env.from, above).await;
+            return Vec::new();
+        }
+        match self.screen_absent(env.from, &env.message) {
+            Screen::Pass => {}
+            Screen::Reinstated { persist } => {
+                if persist {
+                    let bounds = Self::bounds_of(&self.absent.lock().expect("absent poisoned"));
+                    self.save_rejoin_bounds(&bounds).await;
+                }
+            }
+            Screen::Reply(reply) => return vec![(env.from, reply)],
+        }
 
         // While bootstrapping, buffer consensus messages for replay after the
         // snapshot is imported. Cluster-management messages (bootstrap + epoch
@@ -1470,6 +1831,9 @@ impl Node {
         // than grow `Replica.commands` without bound. We shed *new writes* only —
         // existing consensus state is never dropped, and peer messages are never
         // refused (gated only here, the local coordinator's entry point).
+        if self.rejoin_required() {
+            return Err(RejoinRequired.into());
+        }
         let backlog = self.command_count();
         if backlog >= self.settings.max_commands {
             tracing::warn!(
@@ -1478,10 +1842,11 @@ impl Node {
                 cap = self.settings.max_commands,
                 "refusing new write: consensus backlog at cap (compaction stalled?)"
             );
-            anyhow::bail!(
-                "consensus backlog at cap ({backlog} >= {}); refusing new write",
-                self.settings.max_commands
-            );
+            return Err(BacklogAtCap {
+                backlog,
+                cap: self.settings.max_commands,
+            }
+            .into());
         }
 
         let keys = Self::keys_of(&events);
@@ -2247,6 +2612,25 @@ impl Node {
             .expect("replica poisoned")
             .redundant_before();
         self.journal.truncate(floor).await?;
+
+        // Report first: a peer that had stopped waiting for this node counts it
+        // again on a report above what it compacted. Links deliver in order,
+        // so the report lands before anything this node sends as a replica or
+        // coordinator, which that peer would otherwise answer with `Rejoin`.
+        let mine = self.report(&self.shard_peers());
+        let peers: Vec<NodeId> = self
+            .topology
+            .nodes()
+            .into_iter()
+            .filter(|&n| n != self.id)
+            .collect();
+        self.broadcast(
+            &peers,
+            Message::Watermark {
+                applied_through: mine,
+            },
+        )
+        .await;
 
         // Resume normal processing and replay anything buffered during bootstrap.
         // Flag flip and drain happen under the buffer lock (see `handle_staged`)
