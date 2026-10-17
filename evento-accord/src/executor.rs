@@ -31,7 +31,7 @@ use ulid::Ulid;
 use crate::api::{snapshot_event_size, DataStore, SnapshotPage};
 use crate::clock::{Timestamp, TxnId};
 use crate::message::Key;
-use crate::node::Node;
+use crate::node::{BacklogAtCap, Node, RejoinRequired};
 
 /// Most events one backend read returns for the scans behind
 /// [`ExecutorDataStore::snapshot_page`] and [`ExecutorDataStore::snapshot`].
@@ -280,7 +280,16 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
         if events.is_empty() {
             return Err(WriteError::MissingData);
         }
-        let outcome = self.node.write(events).await.map_err(WriteError::Unknown)?;
+        // A refusal that clears on its own (the backlog cap, a rejoin in
+        // progress) is `Unavailable`, so a caller can tell a transient
+        // condition from a failure and keep the typed cause.
+        let outcome = self.node.write(events).await.map_err(|err| {
+            if err.is::<BacklogAtCap>() || err.is::<RejoinRequired>() {
+                WriteError::Unavailable(err)
+            } else {
+                WriteError::Unknown(err)
+            }
+        })?;
         if outcome.conflict {
             Err(WriteError::InvalidOriginalVersion)
         } else {

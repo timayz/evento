@@ -299,13 +299,16 @@ impl From<WireReadResult> for evento_core::cursor::ReadResult<Event> {
 
 /// Serde mirror of [`WriteError`], which is not itself serializable.
 /// `InvalidOriginalVersion` and `MissingData` map 1:1 — `WriteBuilder`'s
-/// retry-on-conflict matches on the variant, so fidelity matters;
+/// retry-on-conflict matches on the variant, so fidelity matters — and so
+/// does `Unavailable`, which a client shows as a transient refusal rather
+/// than a failure (its cause travels as its `Display` string);
 /// `Unknown`/`SystemTime` collapse to their `Display` strings.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum WireWriteError {
     InvalidOriginalVersion,
     MissingData,
     Other(String),
+    Unavailable(String),
 }
 
 impl From<&WriteError> for WireWriteError {
@@ -313,6 +316,7 @@ impl From<&WriteError> for WireWriteError {
         match e {
             WriteError::InvalidOriginalVersion => WireWriteError::InvalidOriginalVersion,
             WriteError::MissingData => WireWriteError::MissingData,
+            WriteError::Unavailable(cause) => WireWriteError::Unavailable(cause.to_string()),
             other => WireWriteError::Other(other.to_string()),
         }
     }
@@ -324,6 +328,7 @@ impl From<WireWriteError> for WriteError {
             WireWriteError::InvalidOriginalVersion => WriteError::InvalidOriginalVersion,
             WireWriteError::MissingData => WriteError::MissingData,
             WireWriteError::Other(msg) => WriteError::Unknown(anyhow::anyhow!(msg)),
+            WireWriteError::Unavailable(cause) => WriteError::Unavailable(anyhow::anyhow!(cause)),
         }
     }
 }
@@ -561,15 +566,18 @@ mod tests {
             WriteError::InvalidOriginalVersion,
             WriteError::MissingData,
             WriteError::Unknown(anyhow::anyhow!("boom")),
+            WriteError::Unavailable(anyhow::anyhow!("backlog at cap")),
         ];
         for original in cases {
             let wire = WireWriteError::from(&original);
             let bytes = bitcode::serialize(&wire).unwrap();
             let back: WireWriteError = bitcode::deserialize(&bytes).unwrap();
+            let back = WriteError::from(back);
+            assert_eq!(back.to_string(), original.to_string(), "message fidelity");
             assert_eq!(
-                WriteError::from(back).to_string(),
-                original.to_string(),
-                "message fidelity"
+                matches!(back, WriteError::Unavailable(_)),
+                matches!(original, WriteError::Unavailable(_)),
+                "a transient refusal stays one across the wire"
             );
         }
     }

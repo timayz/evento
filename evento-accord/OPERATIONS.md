@@ -77,7 +77,7 @@ timeouts for geo/WAN** deployments.
 | `phi_threshold` | 8.0 | Phi-accrual suspicion level; higher tolerates more latency variance before suspecting a coordinator. |
 | `acceptable_pause` | 500 ms | How long a live peer may go quiet beyond its usual heartbeat interval (scheduler stall, slow fsync, loaded host) before suspicion starts to rise. |
 | `linearizable_reads` | false | Opt-in linearizable reads (§10) — one consensus round per read. |
-| `max_commands` | 100 000 | Backpressure: refuse *new* local writes (`BacklogAtCap`) once the un-compacted backlog hits this (e.g. compaction stalled under a partition, or a peer down with `peer_absence_limit` unset). |
+| `max_commands` | 100 000 | Backpressure: refuse *new* local writes (`BacklogAtCap`; `WriteError::Unavailable` through `AccordExecutor`) once the un-compacted backlog hits this (e.g. compaction stalled under a partition, or a peer down with `peer_absence_limit` unset). |
 | `peer_absence_limit` | none | Stop waiting for a same-shard peer silent this long: compaction then proceeds without it (§7, down node). Set it well above any restart or maintenance window; a peer given up on while writes went through must rejoin from a snapshot on return. Never leaves fewer than a slow quorum counted. |
 | `snapshot_page_events` | 4096 | Most events this node puts in one snapshot page when a joiner bootstraps from it (§7, lost store). |
 | `snapshot_page_bytes` | 4 MiB | Byte budget of one snapshot page (a single larger event still crosses alone). Keep it far below the transport's 64 MiB frame cap and small enough that one group's bootstrap does not hold the link it shares with every other group for long. |
@@ -194,7 +194,8 @@ metadata log (config-Paxos); concurrent reconfigurations converge without a lead
   report (it was merely quiet, or down while nothing was written). If writes it
   never applied were compacted meanwhile, every message it sends is answered with
   `Message::Rejoin` instead: it logs an error, drops every message, refuses writes
-  (`RejoinRequired`) and stays like that until its host rejoins it — the `GroupHost`
+  (`RejoinRequired`; `WriteError::Unavailable` through `AccordExecutor`) and stays
+  like that until its host rejoins it — the `GroupHost`
   `with_rejoin_handler` hook is told, and should close the group, discard its store
   and journal, and `open_joining` it (next item). The bound a given-up peer must
   report above is persisted (`Journal::save_rejoin_bounds`), so it holds across a
