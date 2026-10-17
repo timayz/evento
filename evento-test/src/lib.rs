@@ -4737,3 +4737,56 @@ mod live_bridge {
         Ok(())
     }
 }
+
+/// Scenario: a replication batch larger than one statement can bind (a
+/// joining replica's snapshot) lands whole, and stays all-or-nothing when one
+/// of its events conflicts.
+pub async fn replicate_large_batch<E: Executor>(executor: &E) -> anyhow::Result<()> {
+    const LEN: u16 = 5000;
+    let aggregate_id = Ulid::generate().to_string();
+    let batch = |from: u16, to: u16| -> Vec<Event> {
+        (from..=to)
+            .map(|version| Event {
+                id: Ulid::generate(),
+                aggregate_type: "test/Replicated".to_owned(),
+                aggregate_id: aggregate_id.clone(),
+                version,
+                name: "Recorded".to_owned(),
+                timestamp: 1_700_000_000 + u64::from(version),
+                ..Default::default()
+            })
+            .collect()
+    };
+    let count = || async {
+        let filter = EventFilter::by_id_raw("test/Replicated", aggregate_id.clone());
+        let mut total = 0;
+        let mut after = None;
+        loop {
+            let page = executor
+                .read(
+                    Some(vec![filter.clone()].into()),
+                    None,
+                    Args::forward(1000, after),
+                    None,
+                )
+                .await?;
+            total += page.edges.len();
+            if !page.page_info.has_next_page {
+                return anyhow::Ok(total);
+            }
+            after = page.page_info.end_cursor;
+        }
+    };
+
+    executor.replicate(batch(1, LEN)).await?;
+    assert_eq!(count().await?, usize::from(LEN));
+
+    // The last event of this batch takes an existing version: nothing of it
+    // is kept.
+    let mut overlapping = batch(LEN + 1, LEN + 3500);
+    overlapping.push(batch(LEN, LEN).remove(0));
+    assert!(executor.replicate(overlapping).await.is_err());
+    assert_eq!(count().await?, usize::from(LEN));
+
+    Ok(())
+}

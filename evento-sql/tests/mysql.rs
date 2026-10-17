@@ -350,3 +350,10 @@ async fn mysql_subscription_ephemeral_run_once() -> anyhow::Result<()> {
     let executor = create_mysql_executor("sub_ephemeral_run_once").await?;
     evento_test::subscription_ephemeral_run_once(&executor).await
 }
+
+#[tokio::test]
+async fn mysql_replicate_large_batch() -> anyhow::Result<()> {
+    let executor = create_mysql_executor("replicate_large_batch").await?;
+
+    evento_test::replicate_large_batch(&executor).await
+}
