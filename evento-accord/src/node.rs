@@ -20,14 +20,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use evento_core::{
-    cursor::{Args, Edge, ReadResult},
+    cursor::{Args, Edge, ReadResult, Value},
     Event, EventFilter, RoutingKey,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant};
 
-use crate::api::{AcceptorRecord, DataStore, Journal, MessageSink, ShardId, Topology};
+use crate::api::{
+    snapshot_event_size, AcceptorRecord, DataStore, Journal, MessageSink, ShardId, Topology,
+};
 use crate::clock::{Ballot, Clock, HybridLogicalClock, NodeId, Timestamp, TxnId};
 use crate::failure_detector::FailureDetector;
 use crate::message::{CommandState, Key, Message, Status, SyncKnown};
@@ -108,6 +110,18 @@ pub struct NodeConfig {
     /// that fewer than a slow quorum stay counted, so a partitioned minority
     /// cannot compact on its own. `None` (the default) waits forever.
     pub peer_absence_limit: Option<Duration>,
+    /// Most events this node puts in one snapshot page when a joining peer
+    /// bootstraps from it ([`Message::SnapshotPageRequest`]). With
+    /// [`snapshot_page_bytes`](Self::snapshot_page_bytes), bounds the memory
+    /// a page holds and the size of its frame.
+    pub snapshot_page_events: u16,
+    /// Byte budget of one snapshot page (the sum of the events' wire sizes,
+    /// [`snapshot_event_size`]); a single event larger than it still crosses
+    /// alone. Keep it far below the transport's frame cap (64 MiB on the
+    /// TCP transport), and small enough that one group's bootstrap does not
+    /// hold the link it shares with every other group for long: the default
+    /// 4 MiB leaves sixteen times the headroom.
+    pub snapshot_page_bytes: usize,
     /// Control-plane anti-dueling delay. An automatic config-change recovery defers
     /// by `rank * config_defer_step` (the **distinguished proposer** for an epoch has
     /// rank 0 and proposes first; others wait, then skip if it already committed), and
@@ -132,6 +146,8 @@ impl Default for NodeConfig {
             linearizable_reads: false,
             max_commands: 100_000,
             peer_absence_limit: None,
+            snapshot_page_events: 4096,
+            snapshot_page_bytes: 4 * 1024 * 1024,
             config_defer_step: Duration::from_millis(100),
         }
     }
@@ -173,6 +189,49 @@ impl std::fmt::Display for RejoinRequired {
 }
 
 impl std::error::Error for RejoinRequired {}
+
+/// [`Node::join`] failed after at least one snapshot page was installed, so
+/// the store holds a prefix no other contact can complete: a page that
+/// overlaps existing events is skipped whole as an idempotent re-apply, which
+/// would leave a gap. Empty the store (and journal) before joining again.
+/// Attached as context on the error; downcast to tell it apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartialSnapshot {
+    /// Pages installed before the failure.
+    pub pages: usize,
+    /// Events installed before the failure.
+    pub events: usize,
+}
+
+impl std::fmt::Display for PartialSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the join installed {} events over {} pages before failing; empty the store before joining again",
+            self.events, self.pages
+        )
+    }
+}
+
+impl std::error::Error for PartialSnapshot {}
+
+/// How many times a joiner asks for the same snapshot page before giving the
+/// contact up: a page request and its reply are idempotent, so a frame lost
+/// on a lossy link only costs one more round trip.
+const SNAPSHOT_PAGE_ATTEMPTS: usize = 3;
+
+/// What an [`import_from`](Node::import_from) round brought in.
+#[derive(Debug, Clone, Copy, Default)]
+struct Imported {
+    /// Commands imported into the conflict graph.
+    commands: usize,
+    /// Snapshot pages installed (bootstrap only).
+    pages: usize,
+    /// Snapshot events installed (bootstrap only).
+    events: usize,
+    /// Wire size of the snapshot events installed (bootstrap only).
+    bytes: usize,
+}
 
 /// A same-shard peer this node stopped waiting for; see
 /// [`NodeConfig::peer_absence_limit`].
@@ -356,6 +415,9 @@ pub struct Node {
     correlation_seq: Arc<AtomicU64>,
     /// Channels awaiting forwarded-read replies, by correlation id.
     read_pending: Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<Message>>>>,
+    /// Channels awaiting snapshot pages ([`Message::SnapshotPage`]) during a
+    /// [`join`](Node::join), by the page request's correlation id.
+    snapshot_pending: Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<Message>>>>,
     /// Latest `applied_through` gossiped by each shard peer (and self); the
     /// recovery sweep compacts below the per-shard minimum of these.
     peer_watermarks: Arc<Mutex<HashMap<NodeId, Timestamp>>>,
@@ -428,6 +490,7 @@ impl Node {
             })),
             correlation_seq: Arc::new(AtomicU64::new(0)),
             read_pending: Arc::new(Mutex::new(HashMap::new())),
+            snapshot_pending: Arc::new(Mutex::new(HashMap::new())),
             peer_watermarks: Arc::new(Mutex::new(HashMap::new())),
             sync_coverage: Arc::new(Mutex::new((start_epoch, HashMap::new()))),
             failure_detector: Arc::new(FailureDetector::new()),
@@ -1193,7 +1256,10 @@ impl Node {
             return Screen::Pass;
         };
         let behind = match message {
-            Message::SyncRequest { snapshot: true, .. } => return Screen::Pass,
+            // A join is how a peer behind its bound gets back: always served.
+            Message::SyncRequest { snapshot: true, .. }
+            | Message::SnapshotRequest { .. }
+            | Message::SnapshotPageRequest { .. } => return Screen::Pass,
             Message::Watermark { applied_through } => match state.rejoin_above {
                 Some(bound) if *applied_through <= bound => Some(bound),
                 _ => None,
@@ -1313,6 +1379,9 @@ impl Node {
             env.message,
             Message::SyncRequest { .. }
                 | Message::SyncData { .. }
+                | Message::SnapshotRequest { .. }
+                | Message::SnapshotPageRequest { .. }
+                | Message::SnapshotPage { .. }
                 | Message::Watermark { .. }
                 | Message::ConfigPrepare { .. }
                 | Message::ConfigPromise { .. }
@@ -1477,34 +1546,27 @@ impl Node {
                 if snapshot && !self.bootstrapped.load(Ordering::Acquire) {
                     return out;
                 }
-                let cutoff = self.margin_cutoff();
-                let (watermark, coverage, commands) = {
-                    let replica = self.replica.lock().expect("replica poisoned");
-                    // With a digest (anti-entropy), ship only what the
-                    // requester is missing — a healthy in-sync round clones
-                    // and ships nothing. Bootstrap (no digest) still gets the
-                    // full applied set.
-                    let commands = match &known {
-                        Some(known) => {
-                            let have: HashSet<TxnId> = known.txns.iter().copied().collect();
-                            replica.export_applied_missing(known.since, &have)
-                        }
-                        None => replica.export_applied(),
-                    };
-                    // Everything this node holds below its margin-lagged
-                    // applied-through is applied — and, with `commands`, on its
-                    // way to the requester, which records it as sync coverage.
-                    (
-                        replica.redundant_before(),
-                        replica.applied_through(cutoff),
-                        commands,
-                    )
-                };
-                // A bootstrapping joiner may be below our truncation watermark, so
-                // it also needs the materialised state command replay no longer
-                // covers; anti-entropy (snapshot = false) only needs the commands.
+                let (watermark, coverage, commands) = self.export_bootstrap(known.as_ref());
+                // A bootstrapping joiner on the legacy protocol may be below our
+                // truncation watermark, so it also needs the materialised state
+                // command replay no longer covers — inline, in one frame (a
+                // current joiner pulls it page by page instead). Anti-entropy
+                // (snapshot = false) only needs the commands. A snapshot this
+                // node cannot read is not answered at all: an empty one would
+                // have the joiner adopt our floor over a missing prefix.
                 let snapshot = if snapshot {
-                    self.datastore.snapshot().await.unwrap_or_default()
+                    match self.datastore.snapshot().await {
+                        Ok(snapshot) => snapshot,
+                        Err(err) => {
+                            tracing::warn!(
+                                node = self.id.0,
+                                from = from.0,
+                                %err,
+                                "cannot read the bootstrap snapshot; not answering"
+                            );
+                            return out;
+                        }
+                    }
                 } else {
                     Vec::new()
                 };
@@ -1518,6 +1580,74 @@ impl Node {
                         commands,
                     },
                 ));
+            }
+            Message::SnapshotRequest { id } => {
+                // Same as the legacy bootstrap request, without the inline
+                // snapshot: the joiner pulls it page by page next. A node still
+                // joining stays silent (see above).
+                if !self.bootstrapped.load(Ordering::Acquire) {
+                    return out;
+                }
+                let (watermark, coverage, commands) = self.export_bootstrap(None);
+                out.push((
+                    from,
+                    Message::SyncData {
+                        id,
+                        watermark,
+                        coverage,
+                        snapshot: Vec::new(),
+                        commands,
+                    },
+                ));
+            }
+            Message::SnapshotPageRequest { id, after } => {
+                if !self.bootstrapped.load(Ordering::Acquire) {
+                    return out;
+                }
+                match self
+                    .datastore
+                    .snapshot_page(
+                        after,
+                        self.settings.snapshot_page_events,
+                        self.settings.snapshot_page_bytes,
+                    )
+                    .await
+                {
+                    Ok(page) => {
+                        self.metrics.record_snapshot_page();
+                        out.push((
+                            from,
+                            Message::SnapshotPage {
+                                id,
+                                events: page.events,
+                                next: page.next,
+                            },
+                        ));
+                    }
+                    // Not answered: the joiner asks again, then gives this
+                    // contact up — never installs a page with a hole.
+                    Err(err) => tracing::warn!(
+                        node = self.id.0,
+                        from = from.0,
+                        %err,
+                        "cannot read a snapshot page; not answering"
+                    ),
+                }
+            }
+            page @ Message::SnapshotPage { .. } => {
+                let id = match &page {
+                    Message::SnapshotPage { id, .. } => *id,
+                    _ => unreachable!(),
+                };
+                let tx = self
+                    .snapshot_pending
+                    .lock()
+                    .expect("snapshot poisoned")
+                    .get(&id)
+                    .cloned();
+                if let Some(tx) = tx {
+                    let _ = tx.send(page);
+                }
             }
             Message::SyncData {
                 id,
@@ -2605,13 +2735,26 @@ impl Node {
             .await?;
         // Persist the adopted floor: a restart recovers it from the journal,
         // and without it a dependency on a compacted-away transaction would
-        // never count as satisfied again.
+        // never count as satisfied again. Failing here leaves the snapshot
+        // installed without its floor: as unusable as a half-installed one.
         let floor = self
             .replica
             .lock()
             .expect("replica poisoned")
             .redundant_before();
-        self.journal.truncate(floor).await?;
+        if let Err(err) = self.journal.truncate(floor).await {
+            return Err(self.partial(err, &imported));
+        }
+        tracing::info!(
+            node = self.id.0,
+            contact = contact.0,
+            pages = imported.pages,
+            events = imported.events,
+            bytes = imported.bytes,
+            commands = imported.commands,
+            ?floor,
+            "joined from a snapshot"
+        );
 
         // Report first: a peer that had stopped waiting for this node counts it
         // again on a report above what it compacted. Links deliver in order,
@@ -2644,7 +2787,115 @@ impl Node {
             Box::pin(self.handle(env)).await;
         }
 
-        Ok(imported)
+        Ok(imported.commands)
+    }
+
+    /// The error of a join that fails after `imported` installed at least one
+    /// snapshot page, tagged [`PartialSnapshot`]; a failure before anything
+    /// landed stays a plain error, so the caller may try another contact.
+    fn partial(&self, err: anyhow::Error, imported: &Imported) -> anyhow::Error {
+        if imported.pages == 0 {
+            return err;
+        }
+        self.metrics.record_join_partial();
+        err.context(PartialSnapshot {
+            pages: imported.pages,
+            events: imported.events,
+        })
+    }
+
+    /// The bootstrap header a sync requester installs: this node's
+    /// redundancy watermark, its margin-lagged applied-through (the coverage
+    /// the requester may record), and the applied commands it needs — with a
+    /// digest (anti-entropy), only the ones it is missing, so a healthy
+    /// in-sync round ships nothing; without one (bootstrap), the full set.
+    fn export_bootstrap(
+        &self,
+        known: Option<&SyncKnown>,
+    ) -> (Timestamp, Timestamp, Vec<CommandState>) {
+        let cutoff = self.margin_cutoff();
+        let replica = self.replica.lock().expect("replica poisoned");
+        let commands = match known {
+            Some(known) => {
+                let have: HashSet<TxnId> = known.txns.iter().copied().collect();
+                replica.export_applied_missing(known.since, &have)
+            }
+            None => replica.export_applied(),
+        };
+        // Everything this node holds below its margin-lagged applied-through
+        // is applied — and, with `commands`, on its way to the requester,
+        // which records it as sync coverage.
+        (
+            replica.redundant_before(),
+            replica.applied_through(cutoff),
+            commands,
+        )
+    }
+
+    /// One sync round trip: sends `request(id)` to `contact` and waits up to
+    /// `timeout` for the matching [`SyncData`](Message::SyncData).
+    async fn sync_round(
+        &self,
+        contact: NodeId,
+        timeout: Duration,
+        request: impl FnOnce(u64) -> Message,
+    ) -> anyhow::Result<SyncPayload> {
+        let id = self.correlation_seq.fetch_add(1, Ordering::Relaxed);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        self.sync_inbox
+            .lock()
+            .expect("sync poisoned")
+            .insert(id, tx);
+        self.send(contact, request(id)).await;
+        let received = tokio::time::timeout(timeout, rx.recv()).await;
+        self.sync_inbox.lock().expect("sync poisoned").remove(&id);
+        received
+            .map_err(|_| anyhow::anyhow!("sync timed out"))?
+            .ok_or_else(|| anyhow::anyhow!("sync channel closed"))
+    }
+
+    /// Pulls the snapshot page after `after` from `contact`, asking up to
+    /// [`SNAPSHOT_PAGE_ATTEMPTS`] times with `timeout` each. Every attempt
+    /// uses a fresh correlation id, so a reply to a timed-out request that
+    /// arrives late is dropped rather than taken for the next page's.
+    async fn fetch_snapshot_page(
+        &self,
+        contact: NodeId,
+        timeout: Duration,
+        after: Option<Value>,
+    ) -> anyhow::Result<(Vec<Event>, Option<Value>)> {
+        for attempt in 1..=SNAPSHOT_PAGE_ATTEMPTS {
+            let id = self.correlation_seq.fetch_add(1, Ordering::Relaxed);
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            self.snapshot_pending
+                .lock()
+                .expect("snapshot poisoned")
+                .insert(id, tx);
+            self.send(
+                contact,
+                Message::SnapshotPageRequest {
+                    id,
+                    after: after.clone(),
+                },
+            )
+            .await;
+            let received = tokio::time::timeout(timeout, rx.recv()).await;
+            self.snapshot_pending
+                .lock()
+                .expect("snapshot poisoned")
+                .remove(&id);
+            match received {
+                Ok(Some(Message::SnapshotPage { events, next, .. })) => return Ok((events, next)),
+                Ok(_) => anyhow::bail!("snapshot page channel closed"),
+                Err(_) => tracing::debug!(
+                    node = self.id.0,
+                    contact = contact.0,
+                    attempt,
+                    "snapshot page timed out"
+                ),
+            }
+        }
+        anyhow::bail!("snapshot page timed out after {SNAPSHOT_PAGE_ATTEMPTS} attempts")
     }
 
     /// Fetches `contact`'s committed state and imports every command for a key
@@ -2655,67 +2906,98 @@ impl Node {
     /// With `want_snapshot`, the contact also ships its materialised data-store
     /// snapshot and redundancy watermark: a bootstrapping node may be below the
     /// cluster's truncation point, where command replay alone no longer
-    /// reconstructs the state. It installs the snapshot, adopts the watermark
-    /// (so a dependency on a compacted-away transaction counts as satisfied), and
-    /// imports the recent commands into its conflict graph only — their events are
-    /// already in the snapshot. Anti-entropy needs no snapshot (the watermark is
-    /// the cluster-wide min, so an existing replica has already applied everything
-    /// below it), so it applies each imported command's events as before.
+    /// reconstructs the state. The header ([`Message::SnapshotRequest`]) brings
+    /// the watermark and the recent commands; the snapshot then arrives page by
+    /// page ([`Message::SnapshotPageRequest`]), each installed as it lands, so
+    /// a store of any size crosses the wire in frames far under the transport's
+    /// cap. The node adopts the watermark (so a dependency on a compacted-away
+    /// transaction counts as satisfied) and imports the recent commands into its
+    /// conflict graph only — their events are already in the snapshot. The
+    /// header is taken before the pages, so every command it lists has its
+    /// events in a page; a transaction applied on the contact meanwhile is in
+    /// the join buffer too, and its replay finds the events already there.
+    /// A failure once a page is installed is tagged [`PartialSnapshot`].
+    /// Anti-entropy needs no snapshot (the watermark is the cluster-wide min,
+    /// so an existing replica has already applied everything below it), so it
+    /// applies each imported command's events as before.
     async fn import_from(
         &self,
         contact: NodeId,
         timeout: Duration,
         want_snapshot: bool,
         known: Option<SyncKnown>,
-    ) -> anyhow::Result<usize> {
-        let id = self.correlation_seq.fetch_add(1, Ordering::Relaxed);
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        self.sync_inbox
-            .lock()
-            .expect("sync poisoned")
-            .insert(id, tx);
-        self.send(
-            contact,
-            Message::SyncRequest {
-                id,
-                snapshot: want_snapshot,
-                known,
-            },
-        )
-        .await;
-
-        let received = tokio::time::timeout(timeout, rx.recv()).await;
-        self.sync_inbox.lock().expect("sync poisoned").remove(&id);
-        let (watermark, coverage, snapshot, commands) = received
-            .map_err(|_| anyhow::anyhow!("sync timed out"))?
-            .ok_or_else(|| anyhow::anyhow!("sync channel closed"))?;
-
-        // Install the materialised snapshot (the truncated prefix and beyond) for
-        // owned keys under a synthetic, sub-watermark id — redundant for ordering
-        // but it sets this node's versions and committed map.
+    ) -> anyhow::Result<Imported> {
+        let mut imported = Imported::default();
         let mut apply_failed = false;
-        let owned_snapshot: Vec<Event> = snapshot
-            .into_iter()
-            .filter(|event| self.topology.owns(self.id, &Key::of(event)))
-            .collect();
-        let snapshot_len = owned_snapshot.len();
-        if snapshot_len > 0 {
-            if let Err(err) = self
-                .datastore
-                .apply(TxnId(watermark), watermark, owned_snapshot, true)
-                .await
-            {
-                // A joiner without its snapshot would adopt the contact's
-                // floor over a missing prefix — a permanent hole. Fail the
-                // join instead.
-                if want_snapshot {
-                    return Err(err.context("cannot install the bootstrap snapshot"));
+        let (watermark, coverage, commands) = if want_snapshot {
+            // A page overlapping events already here would be skipped whole
+            // (an idempotent re-apply), leaving a gap: a join needs an empty
+            // store, and says so before fetching anything.
+            let probe = self.datastore.snapshot_page(None, 1, usize::MAX).await?;
+            anyhow::ensure!(
+                probe.events.is_empty(),
+                "join only over an empty store; this one holds events"
+            );
+            let (watermark, coverage, _, commands) = self
+                .sync_round(contact, timeout, |id| Message::SnapshotRequest { id })
+                .await?;
+            // Install the materialised snapshot (the truncated prefix and
+            // beyond) for owned keys under a synthetic, sub-watermark id —
+            // redundant for ordering but it sets this node's versions and
+            // committed map. Page by page, in the contact's order, so an
+            // aggregate split across two pages keeps its versions contiguous.
+            let mut after = None;
+            loop {
+                let (events, next) = match self
+                    .fetch_snapshot_page(contact, timeout, after.take())
+                    .await
+                {
+                    Ok(page) => page,
+                    Err(err) => return Err(self.partial(err, &imported)),
+                };
+                let owned: Vec<Event> = events
+                    .into_iter()
+                    .filter(|event| self.topology.owns(self.id, &Key::of(event)))
+                    .collect();
+                if !owned.is_empty() {
+                    let bytes: usize = owned.iter().map(snapshot_event_size).sum();
+                    let count = owned.len();
+                    if let Err(err) = self
+                        .datastore
+                        .apply(TxnId(watermark), watermark, owned, true)
+                        .await
+                    {
+                        // A joiner without its snapshot would adopt the
+                        // contact's floor over a missing prefix — a permanent
+                        // hole. Fail the join instead; the backend may have
+                        // written part of the page, so it counts as installed.
+                        imported.pages += 1;
+                        return Err(self.partial(
+                            err.context("cannot install the bootstrap snapshot"),
+                            &imported,
+                        ));
+                    }
+                    imported.events += count;
+                    imported.bytes += bytes;
                 }
-                apply_failed = true;
+                imported.pages += 1;
+                match next {
+                    Some(cursor) => after = Some(cursor),
+                    None => break,
+                }
             }
-        }
+            (watermark, coverage, commands)
+        } else {
+            let (watermark, coverage, _, commands) = self
+                .sync_round(contact, timeout, |id| Message::SyncRequest {
+                    id,
+                    snapshot: false,
+                    known,
+                })
+                .await?;
+            (watermark, coverage, commands)
+        };
 
-        let mut imported = 0;
         for cmd in commands {
             if !cmd.keys.iter().any(|k| self.topology.owns(self.id, k)) {
                 continue;
@@ -2764,7 +3046,7 @@ impl Node {
                 .expect("replica poisoned")
                 .import_applied(cmd);
             if inserted {
-                imported += 1;
+                imported.commands += 1;
             }
         }
 
@@ -2823,7 +3105,7 @@ impl Node {
             }
         }
 
-        if imported > 0 || snapshot_len > 0 {
+        if imported.commands > 0 || imported.events > 0 {
             // Imported applies advance local applied state too.
             self.applied_gen.send_modify(|v| *v += 1);
         }

@@ -40,8 +40,8 @@ pub mod tcp;
 pub mod transport;
 
 pub use api::{
-    AcceptorRecord, DataStore, DynamicTopology, Journal, MessageSink, RegionId, ShardId,
-    ShardedTopology, StaticTopology, Topology,
+    snapshot_event_size, AcceptorRecord, DataStore, DynamicTopology, Journal, MessageSink,
+    RegionId, ShardId, ShardedTopology, SnapshotPage, StaticTopology, Topology,
 };
 pub use clock::{Ballot, Clock, HybridLogicalClock, NodeId, Timestamp, TxnId, MAX_SKEW_MICROS};
 pub use executor::{AccordExecutor, ExecutorDataStore};
@@ -49,7 +49,7 @@ pub use failure_detector::FailureDetector;
 pub use group::{GroupHost, RejoinHandler};
 pub use message::{CommandState, Key, Message, Status};
 pub use metrics::{Metrics, MetricsSnapshot};
-pub use node::{BacklogAtCap, CommitOutcome, Node, NodeConfig, RejoinRequired};
+pub use node::{BacklogAtCap, CommitOutcome, Node, NodeConfig, PartialSnapshot, RejoinRequired};
 pub use store::{AppliedEntry, InMemoryDataStore, InMemoryJournal};
 pub use sweep::{SweepConfig, SweepPressure, SweepScheduler, SweepStats, Sweepable};
 pub use tcp::{

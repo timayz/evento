@@ -254,3 +254,69 @@ async fn data_store_paginates_beyond_one_page() {
     assert_eq!(snap.len() as u16, count);
     assert_eq!(snap.iter().map(|e| e.version).max().unwrap(), count);
 }
+
+/// `ExecutorDataStore::snapshot_page` walks the backend in the pieces a joiner
+/// pulls: capped by events, capped by bytes (never below one event), and
+/// chained through `next` until the whole store has crossed exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn snapshot_page_walks_the_backend_by_events_and_bytes() {
+    use evento_accord::snapshot_event_size;
+
+    let fjall = Fjall::temporary().unwrap();
+    let count: u16 = 5000;
+    let events: Vec<Event> = (1..=count).map(|v| event("big", v, "Tick")).collect();
+    fjall.write(events).await.unwrap();
+    let store = ExecutorDataStore::new(fjall);
+
+    // By events: 100 per page, chained to the end, every version once.
+    let mut after = None;
+    let mut pages = 0;
+    let mut seen = Vec::new();
+    loop {
+        let page = store.snapshot_page(after, 100, usize::MAX).await.unwrap();
+        assert!(page.events.len() <= 100);
+        pages += 1;
+        seen.extend(page.events.iter().map(|e| e.version));
+        match page.next {
+            Some(cursor) => after = Some(cursor),
+            None => break,
+        }
+    }
+    assert_eq!(pages, 50);
+    assert_eq!(seen.len() as u16, count);
+    assert!(seen.windows(2).all(|w| w[0] < w[1]), "versions ascend");
+
+    // By bytes: a budget under one event still ships one event per page.
+    let first = store.snapshot_page(None, 100, 1).await.unwrap();
+    assert_eq!(first.events.len(), 1);
+    assert!(first.next.is_some());
+    let second = store
+        .snapshot_page(first.next.clone(), 100, 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        second.events[0].version, 2,
+        "the next page starts after the trimmed one"
+    );
+
+    // By bytes: a budget for about ten events gives pages of about ten.
+    let one = snapshot_event_size(&first.events[0]);
+    let page = store
+        .snapshot_page(None, u16::MAX, one * 10 + one / 2)
+        .await
+        .unwrap();
+    assert_eq!(page.events.len(), 10);
+
+    // The last page is the end: no `next`, and nothing after it.
+    let tail = store
+        .snapshot_page(None, u16::MAX, usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(tail.events.len(), 4096, "one backend read at most");
+    let rest = store
+        .snapshot_page(tail.next, u16::MAX, usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(rest.events.len(), 5000 - 4096);
+    assert!(rest.next.is_none());
+}
