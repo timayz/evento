@@ -163,10 +163,12 @@ fn decode_wire(bytes: &[u8]) -> anyhow::Result<(NodeId, GroupId, Message)> {
 /// instead of growing without limit.
 pub const CHANNEL_CAPACITY: usize = 1024;
 
-/// Maximum frame size, matching `evento-remote`. The codec default (8 MB) is
-/// too small for a bootstrap `SyncData`, which carries the contact's whole
-/// materialised event log — an oversized encode would fail forever and the
-/// joining node could never bootstrap.
+/// Maximum frame size, matching `evento-remote`: a sanity bound well above
+/// anything the protocol sends on purpose. A bootstrap snapshot crosses in
+/// pages budgeted far below it (`NodeConfig::snapshot_page_bytes`); a frame
+/// over the cap is shed and counted at `enqueue` rather than handed to the
+/// codec, whose refusal would otherwise tear down the connection and take
+/// the frames batched with it.
 pub const MAX_FRAME_LENGTH: usize = 64 * 1024 * 1024;
 
 /// A length-delimited codec with the raised frame cap, for both directions.
@@ -234,6 +236,16 @@ impl PeerLinks {
     /// entry so the next send respawns it, instead of black-holing this peer
     /// forever.
     fn enqueue(&self, to: NodeId, bytes: Bytes) {
+        if bytes.len() > MAX_FRAME_LENGTH {
+            tracing::warn!(
+                peer = to.0,
+                len = bytes.len(),
+                cap = MAX_FRAME_LENGTH,
+                "frame over the transport cap; dropped"
+            );
+            self.metrics.record_shed();
+            return;
+        }
         if let Some(tx) = self.writer_for(to) {
             match tx.try_send(bytes) {
                 Ok(()) => {}
@@ -389,7 +401,7 @@ async fn peer_writer(
         while let Ok(bytes) = rx.try_recv() {
             batch.push(bytes);
         }
-        for _attempt in 0..2 {
+        for attempt in 0..2 {
             if conn.is_none() {
                 conn = connect(to, addr, &tls)
                     .await
@@ -399,11 +411,21 @@ async fn peer_writer(
                 // Unreachable right now: drop the batch, reconnect on the next.
                 break;
             };
-            if write_batch(framed, &batch).await.is_ok() {
-                break;
+            match write_batch(framed, &batch).await {
+                Ok(()) => break,
+                Err(err) => {
+                    // Stale or broken connection: reconnect and resend once.
+                    conn = None;
+                    if attempt == 1 {
+                        tracing::warn!(
+                            peer = to.0,
+                            frames = batch.len(),
+                            %err,
+                            "write failed again after reconnecting; dropping the batch"
+                        );
+                    }
+                }
             }
-            // Stale or broken connection: reconnect and resend once.
-            conn = None;
         }
     }
 }
@@ -1046,6 +1068,17 @@ mod tests {
 
     fn mux() -> MuxTransport {
         MuxTransport::new(NodeId(0), HashMap::new())
+    }
+
+    /// A frame over the cap never reaches the codec (whose refusal would tear
+    /// the connection down with the batch around it): it is shed and counted.
+    #[test]
+    fn an_oversized_frame_is_shed_not_queued() {
+        let links = PeerLinks::new(NodeId(0), HashMap::new(), None);
+        links.enqueue(NodeId(1), Bytes::from_static(b"small"));
+        assert_eq!(links.metrics.snapshot().messages_shed, 0);
+        links.enqueue(NodeId(1), Bytes::from(vec![0u8; MAX_FRAME_LENGTH + 1]));
+        assert_eq!(links.metrics.snapshot().messages_shed, 1);
     }
 
     #[tokio::test]

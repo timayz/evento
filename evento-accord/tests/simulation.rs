@@ -1871,11 +1871,13 @@ impl Sim {
 }
 
 /// A short absence limit, a short margin, and anti-entropy fast enough that
-/// coverage re-proves itself within the test budget.
+/// coverage re-proves itself within the test budget. One event per snapshot
+/// page, so every rejoin in these tests crosses as several pages.
 fn absence_config(limit: Duration) -> NodeConfig {
     NodeConfig {
         compaction_margin: Duration::from_millis(300),
         peer_absence_limit: Some(limit),
+        snapshot_page_events: 1,
         ..NodeConfig::default()
     }
 }
@@ -1957,11 +1959,17 @@ async fn an_absent_peer_stops_holding_compaction_back() {
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert_eq!(sim.nodes[0].absent_peers(), vec![NodeId(2)]);
 
-    // Its host rejoins it from a snapshot; it is counted again and the next
-    // writes compact everywhere.
+    // Its host rejoins it from a snapshot — page by page, one event each —
+    // and it is counted again; the next writes compact everywhere.
     sim.rejoin(2, NodeId(0), config).await;
     assert!(converge(&sim.stores).await, "the rejoined node converges");
     assert_eq!(version_of(&sim.stores[2], HOT).await, 8);
+    assert!(
+        sim.nodes[0].metrics().snapshot_pages >= 8,
+        "the contact served a page per event: {}",
+        sim.nodes[0].metrics().snapshot_pages
+    );
+    assert_eq!(sim.nodes[2].metrics().joins_partial, 0);
     for version in 9..=10u16 {
         sim.nodes[0]
             .write(vec![event(HOT, version, 200 + version as u64)])

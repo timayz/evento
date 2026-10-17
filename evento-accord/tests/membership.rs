@@ -18,7 +18,8 @@ use std::time::Duration;
 
 use evento_accord::{
     AppliedEntry, DataStore, DynamicTopology, HybridLogicalClock, InMemoryDataStore,
-    InMemoryJournal, InMemoryNetwork, Journal, MessageSink, Node, NodeId, RegionId, Topology,
+    InMemoryJournal, InMemoryNetwork, Journal, MessageSink, Node, NodeConfig, NodeId, RegionId,
+    Topology,
 };
 use evento_core::Event;
 
@@ -36,6 +37,16 @@ fn spawn_node(
     shards: Vec<Vec<NodeId>>,
     net: &Arc<InMemoryNetwork>,
 ) -> TestNode {
+    spawn_node_with(id, epoch, shards, net, NodeConfig::default())
+}
+
+fn spawn_node_with(
+    id: NodeId,
+    epoch: u64,
+    shards: Vec<Vec<NodeId>>,
+    net: &Arc<InMemoryNetwork>,
+    config: NodeConfig,
+) -> TestNode {
     let inbox = net.register(id);
     let clock = Arc::new(HybridLogicalClock::new(id));
     let sink: Arc<dyn MessageSink> = Arc::new(net.sink(id));
@@ -49,7 +60,8 @@ fn spawn_node(
         sink,
         Arc::clone(&store) as Arc<dyn DataStore>,
         journal,
-    );
+    )
+    .with_config(config);
     let _loop = node.start(inbox);
     TestNode {
         node,
@@ -259,6 +271,125 @@ async fn a_joining_node_bootstraps_from_a_compacted_contact() {
     for n in &nodes {
         await_committed(&n.store, 4).await;
     }
+}
+
+/// The snapshot crosses page by page: with one event per page the joiner
+/// pulls as many pages as the contact holds events, installs each as it
+/// lands, and ends up identical to the contact — then takes part in writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joining_node_bootstraps_page_by_page() {
+    use evento_accord::Timestamp;
+
+    let net = InMemoryNetwork::new();
+    let abc = vec![NodeId(0), NodeId(1), NodeId(2)];
+    let abcd = vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3)];
+    let config = NodeConfig {
+        snapshot_page_events: 1,
+        ..NodeConfig::default()
+    };
+
+    let mut nodes: Vec<TestNode> = abc
+        .iter()
+        .map(|&id| spawn_node_with(id, 0, vec![abc.clone()], &net, config))
+        .collect();
+    for (v, name) in [(1, "Opened"), (2, "Deposited"), (3, "Withdrawn")] {
+        nodes[0]
+            .node
+            .write(vec![event("acc", v, name)])
+            .await
+            .unwrap();
+    }
+    nodes[0]
+        .node
+        .write(vec![event("other", 1, "Opened")])
+        .await
+        .unwrap();
+    for n in &nodes {
+        await_committed(&n.store, 4).await;
+    }
+    let high = Timestamp {
+        micros: u64::MAX,
+        logical: 0,
+        node: NodeId(0),
+    };
+    nodes[0].node.compact(high).await;
+
+    let d = spawn_node_with(NodeId(3), 0, vec![abc.clone()], &net, config);
+    d.node.begin_join();
+    nodes[0]
+        .node
+        .change_topology(1, vec![abcd.clone()])
+        .await
+        .unwrap();
+    await_epoch(&d.topology, 1).await;
+    let imported = d.node.join(NodeId(0)).await.unwrap();
+    assert_eq!(imported, 0, "state came through the snapshot pages");
+    assert!(
+        nodes[0].node.metrics().snapshot_pages >= 4,
+        "the contact served a page per event: {}",
+        nodes[0].node.metrics().snapshot_pages
+    );
+
+    use std::collections::BTreeSet;
+    let committed0: BTreeSet<_> = nodes[0].store.committed_events().into_iter().collect();
+    let committed_d: BTreeSet<_> = d.store.committed_events().into_iter().collect();
+    assert_eq!(committed0, committed_d, "joiner matches the contact");
+
+    nodes.push(d);
+    let outcome = nodes[0]
+        .node
+        .write(vec![event("acc", 4, "Closed")])
+        .await
+        .unwrap();
+    assert!(!outcome.conflict);
+    for n in &nodes {
+        await_committed(&n.store, 5).await;
+    }
+}
+
+/// A page that overlaps events already in the store would be skipped whole
+/// as an idempotent re-apply, leaving a gap: a join refuses a store that is
+/// not empty before it fetches anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_join_refuses_a_non_empty_store() {
+    let net = InMemoryNetwork::new();
+    let abc = vec![NodeId(0), NodeId(1), NodeId(2)];
+    let nodes: Vec<TestNode> = abc
+        .iter()
+        .map(|&id| spawn_node(id, 0, vec![abc.clone()], &net))
+        .collect();
+    nodes[0]
+        .node
+        .write(vec![event("acc", 1, "Opened")])
+        .await
+        .unwrap();
+    for n in &nodes {
+        await_committed(&n.store, 1).await;
+    }
+
+    let d = spawn_node(NodeId(3), 0, vec![abc.clone()], &net);
+    let stale = evento_accord::TxnId(evento_accord::Timestamp::MIN);
+    d.store
+        .apply(
+            stale,
+            evento_accord::Timestamp::MIN,
+            vec![event("old", 1, "Opened")],
+            true,
+        )
+        .await
+        .unwrap();
+    d.node.begin_join();
+    let err = d.node.join(NodeId(0)).await.expect_err("refused");
+    assert!(
+        err.to_string().contains("empty store"),
+        "unexpected error: {err:#}"
+    );
+    assert_eq!(
+        d.store.committed_events().len(),
+        1,
+        "nothing was fetched or installed"
+    );
+    assert_eq!(nodes[0].node.metrics().snapshot_pages, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

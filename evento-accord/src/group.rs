@@ -17,7 +17,7 @@ use tokio::task::JoinHandle;
 
 use crate::api::{DataStore, Journal, MessageSink, Topology};
 use crate::clock::{HybridLogicalClock, NodeId};
-use crate::node::{Node, NodeConfig};
+use crate::node::{Node, NodeConfig, PartialSnapshot};
 use crate::sweep::SweepScheduler;
 use crate::tcp::MuxTransport;
 use crate::transport::GroupId;
@@ -128,8 +128,13 @@ impl GroupHost {
     /// `contacts` are tried in order until one answers; a contact that is
     /// itself joining does not answer. If none does, nothing is left
     /// registered and the error is returned, so the caller can retry later.
-    /// Idempotent like `open`. The store should be empty: a snapshot that
-    /// overlaps existing events is skipped as an idempotent re-apply.
+    /// Idempotent like `open`. The store must be empty (`join` refuses
+    /// otherwise): the snapshot arrives page by page, and a page that
+    /// overlaps existing events is skipped whole as an idempotent re-apply.
+    /// For the same reason a join that fails after a page was installed is
+    /// not retried on the next contact: the error carries a
+    /// [`PartialSnapshot`](crate::PartialSnapshot) and nothing is left
+    /// registered — discard the store and journal, then open again.
     pub async fn open_joining(
         &self,
         group: GroupId,
@@ -184,15 +189,32 @@ impl GroupHost {
                         break;
                     }
                     Err(err) => {
-                        tracing::debug!(node = self.id.0, contact = contact.0, %err, "join contact failed");
-                        last = Some(err);
+                        tracing::warn!(
+                            node = self.id.0,
+                            group = group.0,
+                            contact = contact.0,
+                            err = format!("{err:#}"),
+                            "join contact failed"
+                        );
+                        // Part of the snapshot landed: another contact's
+                        // pages would overlap it and be skipped, leaving a
+                        // gap. The store has to be emptied first.
+                        let partial = err.downcast_ref::<PartialSnapshot>().is_some();
+                        last = Some((err, partial));
+                        if partial {
+                            break;
+                        }
                     }
                 }
             }
-            if let Some(err) = last {
+            if let Some((err, partial)) = last {
                 inbox_task.abort();
                 self.mux.unregister(group);
-                return Err(err.context("no contact could bootstrap the group"));
+                return Err(if partial {
+                    err
+                } else {
+                    err.context("no contact could bootstrap the group")
+                });
             }
         }
         self.scheduler.add(group, Arc::new(node.clone()));

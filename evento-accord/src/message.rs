@@ -245,6 +245,29 @@ pub enum Message {
         /// graph and dependency barriers.
         commands: Vec<CommandState>,
     },
+    /// Joining node → an existing replica: the bootstrap header — answered
+    /// with a [`SyncData`](Message::SyncData) whose `snapshot` is empty; the
+    /// materialised events follow page by page through
+    /// [`SnapshotPageRequest`](Message::SnapshotPageRequest), so a store of
+    /// any size crosses the wire in frames far under the transport's cap.
+    /// Not sweep gossip: it must open the group on a contact that has it
+    /// closed, or the join would time out.
+    SnapshotRequest { id: u64 },
+    /// Joining node → the contact: the page of its snapshot after `after`
+    /// (`None` for the first). Idempotent, so a lost reply is simply asked
+    /// for again; the contact bounds the page by
+    /// [`NodeConfig::snapshot_page_events`](crate::NodeConfig::snapshot_page_events)
+    /// and [`snapshot_page_bytes`](crate::NodeConfig::snapshot_page_bytes).
+    SnapshotPageRequest { id: u64, after: Option<Value> },
+    /// Contact → joining node: one page of its materialised events; `next` is
+    /// `None` after the last page (which may be empty: an empty store is a
+    /// legitimate snapshot).
+    SnapshotPage {
+        id: u64,
+        #[serde(with = "wire_events")]
+        events: Vec<Event>,
+        next: Option<Value>,
+    },
     /// Config coordinator → acceptors: Paxos phase 1 for `epoch`'s layout.
     ConfigPrepare { epoch: u64, ballot: Ballot },
     /// Acceptor → coordinator: promised `ballot`, reporting any value it has
@@ -325,9 +348,12 @@ impl Message {
     /// reason for a host to open a group it has closed: a `MuxTransport` does
     /// not tell its unrouted handler about these frames, otherwise a tenant
     /// closed for inactivity on one host would be reopened by its peers'
-    /// heartbeats a moment later, forever. A joining replica's snapshot
-    /// request (`SyncRequest { snapshot: true }`) is not one: it must open the
-    /// group on a contact that has it closed, or the join would time out.
+    /// heartbeats a moment later, forever. A joining replica's requests
+    /// (`SnapshotRequest`, `SnapshotPageRequest`, and the legacy
+    /// `SyncRequest { snapshot: true }`) are not: they must open the group on
+    /// a contact that has it closed, or the join would time out. A
+    /// `SnapshotPage` is: a page arriving late, after a failed join
+    /// unregistered the group, must not reopen it.
     pub fn is_sweep(&self) -> bool {
         matches!(
             self,
@@ -337,6 +363,7 @@ impl Message {
                     ..
                 }
                 | Message::SyncData { .. }
+                | Message::SnapshotPage { .. }
         )
     }
 
@@ -360,6 +387,9 @@ impl Message {
             Message::ReadProbe { .. } => None,
             Message::SyncRequest { .. }
             | Message::SyncData { .. }
+            | Message::SnapshotRequest { .. }
+            | Message::SnapshotPageRequest { .. }
+            | Message::SnapshotPage { .. }
             | Message::Watermark { .. }
             | Message::ConfigPrepare { .. }
             | Message::ConfigPromise { .. }
@@ -448,5 +478,86 @@ mod wire_events {
             .into_iter()
             .map(|w| Event::try_from(w).map_err(serde::de::Error::custom))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::format::{decode_tagged, encode_tagged, RecordKind};
+
+    fn page_event() -> Event {
+        Event {
+            aggregate_type: "test/Account".into(),
+            aggregate_id: "acc".into(),
+            version: 1,
+            name: "Opened".into(),
+            data: vec![1, 2, 3],
+            ..Default::default()
+        }
+    }
+
+    /// The snapshot variants cross the wire with their cursor and events
+    /// intact.
+    #[test]
+    fn snapshot_variants_round_trip_tagged() {
+        let messages = [
+            Message::SnapshotRequest { id: 7 },
+            Message::SnapshotPageRequest {
+                id: 8,
+                after: Some(Value("cursor".into())),
+            },
+            Message::SnapshotPage {
+                id: 8,
+                events: vec![page_event()],
+                next: None,
+            },
+        ];
+        for message in messages {
+            let bytes = encode_tagged(RecordKind::GroupFrame, &message).unwrap();
+            let back: Message = decode_tagged(RecordKind::GroupFrame, &bytes).unwrap();
+            match (&message, &back) {
+                (Message::SnapshotRequest { id }, Message::SnapshotRequest { id: b }) => {
+                    assert_eq!(id, b)
+                }
+                (
+                    Message::SnapshotPageRequest { id, after },
+                    Message::SnapshotPageRequest { id: b, after: c },
+                ) => assert_eq!((id, after), (b, c)),
+                (
+                    Message::SnapshotPage { id, events, next },
+                    Message::SnapshotPage {
+                        id: b,
+                        events: e,
+                        next: n,
+                    },
+                ) => {
+                    assert_eq!((id, next), (b, n));
+                    assert_eq!(events.len(), e.len());
+                    assert_eq!(events[0].data, e[0].data);
+                    assert_eq!(events[0].aggregate_id, e[0].aggregate_id);
+                }
+                other => panic!("variant changed on the wire: {other:?}"),
+            }
+        }
+    }
+
+    /// A joiner's requests must wake a closed contact; a page must not wake
+    /// a joiner that gave up. None of them concerns a transaction.
+    #[test]
+    fn snapshot_variants_sweep_and_route_as_control() {
+        let request = Message::SnapshotRequest { id: 1 };
+        let page_request = Message::SnapshotPageRequest { id: 2, after: None };
+        let page = Message::SnapshotPage {
+            id: 2,
+            events: Vec::new(),
+            next: None,
+        };
+        assert!(!request.is_sweep());
+        assert!(!page_request.is_sweep());
+        assert!(page.is_sweep());
+        for message in [request, page_request, page] {
+            assert_eq!(message.txn(), None);
+        }
     }
 }

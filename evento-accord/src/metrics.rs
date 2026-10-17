@@ -43,6 +43,12 @@ pub struct Metrics {
     /// Times a peer told this node to rejoin the group from a snapshot: it had
     /// been absent while transactions it never applied were compacted.
     pub rejoins_required: AtomicU64,
+    /// Snapshot pages this node served to joining peers.
+    pub snapshot_pages: AtomicU64,
+    /// Joins of this node that failed after part of the snapshot was
+    /// installed: the store holds a prefix no contact can complete, so it
+    /// must be emptied before the next join.
+    pub joins_partial: AtomicU64,
 }
 
 impl Metrics {
@@ -112,6 +118,16 @@ impl Metrics {
         self.messages_unrouted.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records one snapshot page served to a joining peer.
+    pub fn record_snapshot_page(&self) {
+        self.snapshot_pages.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a join that failed after part of the snapshot was installed.
+    pub fn record_join_partial(&self) {
+        self.joins_partial.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// A consistent-enough point-in-time view of all counters.
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
@@ -128,6 +144,8 @@ impl Metrics {
             messages_unrouted: self.messages_unrouted.load(Ordering::Relaxed),
             peers_absent: self.peers_absent.load(Ordering::Relaxed),
             rejoins_required: self.rejoins_required.load(Ordering::Relaxed),
+            snapshot_pages: self.snapshot_pages.load(Ordering::Relaxed),
+            joins_partial: self.joins_partial.load(Ordering::Relaxed),
         }
     }
 }
@@ -150,6 +168,8 @@ pub struct MetricsSnapshot {
     pub messages_unrouted: u64,
     pub peers_absent: u64,
     pub rejoins_required: u64,
+    pub snapshot_pages: u64,
+    pub joins_partial: u64,
 }
 
 impl MetricsSnapshot {
@@ -157,7 +177,7 @@ impl MetricsSnapshot {
     /// source of truth for both [`to_prometheus`](Self::to_prometheus) and
     /// [`to_prometheus_labeled`](Self::to_prometheus_labeled); add a counter here and
     /// both renderings pick it up.
-    fn counters(&self) -> [(&'static str, &'static str, u64); 13] {
+    fn counters(&self) -> [(&'static str, &'static str, u64); 15] {
         [
             (
                 "accord_writes_committed_total",
@@ -223,6 +243,16 @@ impl MetricsSnapshot {
                 "accord_rejoins_required_total",
                 "Times a peer told this node to rejoin the group from a snapshot.",
                 self.rejoins_required,
+            ),
+            (
+                "accord_snapshot_pages_total",
+                "Snapshot pages served to joining peers.",
+                self.snapshot_pages,
+            ),
+            (
+                "accord_joins_partial_total",
+                "Joins that failed after part of the snapshot was installed (empty the store before retrying).",
+                self.joins_partial,
             ),
         ]
     }

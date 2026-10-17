@@ -28,15 +28,15 @@ use evento_core::{
 };
 use ulid::Ulid;
 
-use crate::api::DataStore;
+use crate::api::{snapshot_event_size, DataStore, SnapshotPage};
 use crate::clock::{Timestamp, TxnId};
 use crate::message::Key;
 use crate::node::Node;
 
-/// Page size for the full-store scans behind [`ExecutorDataStore::version`] and
-/// [`ExecutorDataStore::snapshot`]. Both walk the backend page by page until
-/// exhausted, so an aggregate (or store) of any size is handled — no longer capped at
-/// one `u16::MAX`-sized page. Sized to balance round-trips against per-page memory.
+/// Most events one backend read returns for the scans behind
+/// [`ExecutorDataStore::snapshot_page`] and [`ExecutorDataStore::snapshot`].
+/// Both walk the backend page by page until exhausted, so a store of any size
+/// is handled. Sized to balance round-trips against per-page memory.
 const SNAPSHOT_PAGE_SIZE: u16 = 4096;
 
 /// The single key a read targets, if it can be pinned to one shard: an explicit
@@ -184,30 +184,67 @@ impl<E: Executor> DataStore for ExecutorDataStore<E> {
     }
 
     async fn snapshot(&self) -> anyhow::Result<Vec<Event>> {
-        // The materialised state is the full event log; a joining node re-applies it
-        // to reconstruct the prefix that journal truncation removed. Walk the backend
-        // a page at a time so a store of any size is captured (no longer capped at one
-        // page). The whole log is materialised in memory — fine for the bootstrap path;
-        // a streaming snapshot for very large stores is a future refinement.
+        // The materialised state is the full event log, in memory at once: only
+        // the legacy inline bootstrap answer uses it. A joiner on the current
+        // protocol pulls `snapshot_page`s, so a store of any size crosses the
+        // wire in frame-sized pieces.
         let mut out = Vec::new();
         let mut after = None;
         loop {
-            let result = self
-                .local
-                .read(None, None, Args::forward(SNAPSHOT_PAGE_SIZE, after), None)
+            let page = self
+                .snapshot_page(after, SNAPSHOT_PAGE_SIZE, usize::MAX)
                 .await?;
-            let has_next = result.page_info.has_next_page;
-            let cursor = result.page_info.end_cursor;
-            out.extend(result.edges.into_iter().map(|edge| edge.node));
-            if !has_next {
-                break;
-            }
-            match cursor {
+            out.extend(page.events);
+            match page.next {
                 Some(cursor) => after = Some(cursor),
                 None => break,
             }
         }
         Ok(out)
+    }
+
+    async fn snapshot_page(
+        &self,
+        after: Option<Value>,
+        max_events: u16,
+        max_bytes: usize,
+    ) -> anyhow::Result<SnapshotPage> {
+        // One backend read in the store's own cursor order, trimmed to the byte
+        // budget: the cursor of the last event kept is where the next page
+        // starts, so a trimmed remainder is simply read again next time.
+        let result = self
+            .local
+            .read(
+                None,
+                None,
+                Args::forward(max_events.clamp(1, SNAPSHOT_PAGE_SIZE), after),
+                None,
+            )
+            .await?;
+        let has_next = result.page_info.has_next_page;
+        let end_cursor = result.page_info.end_cursor;
+        let mut events = Vec::with_capacity(result.edges.len());
+        let mut last_cursor = None;
+        let mut bytes = 0;
+        let mut trimmed = false;
+        for edge in result.edges {
+            let size = snapshot_event_size(&edge.node);
+            if !events.is_empty() && bytes + size > max_bytes {
+                trimmed = true;
+                break;
+            }
+            bytes += size;
+            last_cursor = Some(edge.cursor);
+            events.push(edge.node);
+        }
+        let next = if trimmed {
+            last_cursor
+        } else if has_next {
+            end_cursor
+        } else {
+            None
+        };
+        Ok(SnapshotPage { events, next })
     }
 }
 

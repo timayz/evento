@@ -8,7 +8,7 @@ use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use evento_core::{
-    cursor::{Args, ReadResult},
+    cursor::{Args, ReadResult, Value},
     Event, EventFilter, RoutingKey,
 };
 use serde::{Deserialize, Serialize};
@@ -314,13 +314,85 @@ pub trait DataStore: Send + Sync + 'static {
         Ok(ReadResult::default())
     }
 
-    /// All applied events materialised in this store — the bootstrap snapshot a
-    /// joining node installs to reconstruct the state that log truncation has
+    /// All applied events materialised in this store, in one `Vec` — the
+    /// state a joining node installs to reconstruct what log truncation has
     /// removed from the command journal. The default is empty (a store whose
     /// journal never truncates needs no snapshot).
+    ///
+    /// The node bootstraps joiners through [`snapshot_page`](Self::snapshot_page),
+    /// which the default implementation pages over this method with an offset
+    /// cursor: fine for a store that fits in memory, O(n) per page otherwise.
+    /// A store that can grow past a few MiB should implement `snapshot_page`
+    /// natively (as [`ExecutorDataStore`](crate::ExecutorDataStore) does).
     async fn snapshot(&self) -> anyhow::Result<Vec<Event>> {
         Ok(Vec::new())
     }
+
+    /// One page of the bootstrap snapshot: the applied events after cursor
+    /// `after` (`None` starts from the beginning), at most `max_events` of them
+    /// and no more than `max_bytes` of [`snapshot_event_size`] in all — but
+    /// always at least one event while any remain, so a single large event
+    /// still crosses. `next` is `None` once nothing follows. Pages must be
+    /// stable in order across calls (each aggregate's versions ascending), as
+    /// the joiner applies them in sequence.
+    async fn snapshot_page(
+        &self,
+        after: Option<Value>,
+        max_events: u16,
+        max_bytes: usize,
+    ) -> anyhow::Result<SnapshotPage> {
+        let all = self.snapshot().await?;
+        let offset = match after {
+            None => 0,
+            Some(cursor) => cursor
+                .parse::<usize>()
+                .map_err(|_| anyhow::anyhow!("not an offset snapshot cursor: {cursor:?}"))?,
+        };
+        let total = all.len();
+        let remaining = all.into_iter().skip(offset);
+        let mut events = Vec::new();
+        let mut bytes = 0;
+        for event in remaining {
+            let size = snapshot_event_size(&event);
+            if !events.is_empty()
+                && (events.len() >= usize::from(max_events) || bytes + size > max_bytes)
+            {
+                break;
+            }
+            bytes += size;
+            events.push(event);
+            if events.len() >= usize::from(max_events) {
+                break;
+            }
+        }
+        let taken = offset + events.len();
+        let next = (total > taken).then(|| Value(taken.to_string()));
+        Ok(SnapshotPage { events, next })
+    }
+}
+
+/// One page of a [`DataStore::snapshot_page`] bootstrap snapshot.
+#[derive(Debug, Clone, Default)]
+pub struct SnapshotPage {
+    /// The events of this page, in the store's stable order.
+    pub events: Vec<Event>,
+    /// The cursor to pass as `after` for the next page; `None` after the last.
+    pub next: Option<Value>,
+}
+
+/// The approximate size of `event` on the wire inside a
+/// [`Message`](crate::Message): what a snapshot page's byte budget counts.
+/// The fixed fields (id, version, timestamps, length prefixes) plus the
+/// strings, the data and the bitcode-encoded metadata.
+pub fn snapshot_event_size(event: &Event) -> usize {
+    const FIXED: usize = 16 + 2 + 8 + 4 + 8 * 6;
+    FIXED
+        + event.aggregate_id.len()
+        + event.aggregate_type.len()
+        + event.name.len()
+        + event.routing_key.as_ref().map_or(0, String::len)
+        + event.data.len()
+        + bitcode::encode(&event.metadata).len()
 }
 
 /// Fast-path quorum size: `⌊(electorate + faults)/2⌋ + 1`. With the electorate set
@@ -799,6 +871,59 @@ impl Topology for DynamicTopology {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The default `snapshot_page` pages `snapshot()` with an offset cursor:
+    /// stable pages, a `next` while anything remains, and a refusal of a
+    /// cursor it did not mint.
+    #[tokio::test]
+    async fn default_snapshot_page_offsets_over_snapshot() {
+        let store = crate::store::InMemoryDataStore::new();
+        let events: Vec<Event> = (1..=5u16)
+            .map(|version| Event {
+                aggregate_type: "test/Account".into(),
+                aggregate_id: "acc".into(),
+                version,
+                name: "Tick".into(),
+                ..Default::default()
+            })
+            .collect();
+        store
+            .apply(TxnId(Timestamp::MIN), Timestamp::MIN, events, true)
+            .await
+            .unwrap();
+
+        let first = store.snapshot_page(None, 2, usize::MAX).await.unwrap();
+        assert_eq!(first.events.len(), 2);
+        assert_eq!(first.next.as_deref().map(String::as_str), Some("2"));
+        let second = store
+            .snapshot_page(first.next, 2, usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(second.events[0].version, 3);
+        assert_eq!(second.next.as_deref().map(String::as_str), Some("4"));
+        let last = store
+            .snapshot_page(second.next, 2, usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(last.events.len(), 1);
+        assert_eq!(last.events[0].version, 5);
+        assert!(last.next.is_none());
+
+        // A byte budget under one event still moves one event per page.
+        let tiny = store.snapshot_page(None, 10, 1).await.unwrap();
+        assert_eq!(tiny.events.len(), 1);
+        assert_eq!(tiny.next.as_deref().map(String::as_str), Some("1"));
+
+        // An empty store is one empty, final page.
+        let empty = crate::store::InMemoryDataStore::new();
+        let page = empty.snapshot_page(None, 10, usize::MAX).await.unwrap();
+        assert!(page.events.is_empty() && page.next.is_none());
+
+        assert!(store
+            .snapshot_page(Some(Value("not-an-offset".into())), 2, usize::MAX)
+            .await
+            .is_err());
+    }
 
     fn topo(n: u64) -> StaticTopology {
         let nodes: Vec<NodeId> = (0..n).map(NodeId).collect();

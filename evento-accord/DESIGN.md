@@ -206,8 +206,9 @@ control plane, everything else is Accord.
 - **M4 — Topology changes.** ✅ `DynamicTopology` carries an
   **epoch** and can `install` a new shard layout atomically. A joining node
   **bootstraps**: `begin_join` starts buffering consensus messages; `Node::join`
-  fetches a peer's committed state (`SyncRequest` / `SyncData` carrying serialized
-  `CommandState`s), imports each command into its conflict graph
+  fetches a peer's committed state (`SnapshotRequest` / `SyncData` carrying serialized
+  `CommandState`s, then the data-store snapshot page by page through
+  `SnapshotPageRequest` / `SnapshotPage`), imports each command into its conflict graph
   (`Replica::import_applied`) and applies its events, then **replays the buffered
   messages** — so a transaction that commits *during* the join still lands
   (sync-point-style). A node drives an epoch change with `Node::change_topology`,
@@ -423,9 +424,19 @@ backend (sql/fjall). Phases, in order:
   missing commands exportable and truncating always safe (regression:
   `partitioned_minority_cannot_unblock_compaction_and_diverge`). **Catch-up:**
   only a brand-new joining node can be
-  below the watermark, so `join` transfers a **data-store snapshot**
-  (`DataStore::snapshot`) for the truncated prefix plus the recent commands and the
-  watermark; anti-entropy stays command-based. `recover_state` restores the floor
+  below the watermark, so `join` transfers a **data-store snapshot** for the
+  truncated prefix plus the recent commands and the watermark; anti-entropy stays
+  command-based. The header (watermark, coverage, commands) comes first, then the
+  joiner **pulls the snapshot in pages** (`DataStore::snapshot_page`, bounded by
+  `NodeConfig::snapshot_page_events` / `snapshot_page_bytes`), installing each under
+  the watermark's synthetic id as it lands, so a store of any size crosses in frames
+  far under the transport's cap. Taking the header before the pages means every
+  command it lists has its events in a page; a transaction the contact applies
+  meanwhile is in the joiner's buffer too, and its replay finds the events already
+  there (an idempotent re-apply). A page overlapping existing events would be
+  skipped whole, so `join` refuses a non-empty store, and a join that fails once a
+  page is installed is tagged `PartialSnapshot` and not retried on another contact:
+  the host wipes the store and joins again. `recover_state` restores the floor
   and trusts the durable data store for the prefix, replaying only the journal
   tail. A replica that lost its store (new disk, deleted
   file) is a joiner too: `GroupHost::open_joining` calls `begin_join` before the
@@ -692,11 +703,12 @@ backend (sql/fjall). Phases, in order:
         addition would invalidate every journal on disk): `GroupFrame` (kind 6, the
         multiplexed wire frame) was added this way, `TcpTransport` still emits kind 1,
         and an older build sheds kind 6 as an unknown kind.
-  - [x] **Snapshot-at-scale** — `ExecutorDataStore::version`/`snapshot` now **paginate**
-        the backend (`SNAPSHOT_PAGE_SIZE`-event pages, walking until exhausted) instead
-        of a single `u16::MAX`-capped page, so an aggregate (or store) of any size is
-        handled. (`version` folds a running max across pages.) A streaming snapshot for
-        truly huge stores is a noted future refinement.
+  - [x] **Snapshot-at-scale** — `ExecutorDataStore::snapshot_page` reads the backend
+        one `SNAPSHOT_PAGE_SIZE`-event page at a time and trims it to a byte budget,
+        and a joiner pulls those pages one request at a time
+        (`SnapshotPageRequest` / `SnapshotPage`), so a store of any size is handled
+        without ever building it in memory or in one frame. (`version` is an indexed
+        lookup; `snapshot` still folds the pages for the legacy inline bootstrap.)
   - [x] **Backpressure/rate-limiting policy** beyond drop-on-full — (1) shed
         observability: a `messages_shed` metric counts frames dropped for a full peer
         queue (`TcpTransport`, sharable `Arc<Metrics>` via `with_metrics`) and an

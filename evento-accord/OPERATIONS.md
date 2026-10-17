@@ -79,6 +79,8 @@ timeouts for geo/WAN** deployments.
 | `linearizable_reads` | false | Opt-in linearizable reads (§10) — one consensus round per read. |
 | `max_commands` | 100 000 | Backpressure: refuse *new* local writes (`BacklogAtCap`) once the un-compacted backlog hits this (e.g. compaction stalled under a partition, or a peer down with `peer_absence_limit` unset). |
 | `peer_absence_limit` | none | Stop waiting for a same-shard peer silent this long: compaction then proceeds without it (§7, down node). Set it well above any restart or maintenance window; a peer given up on while writes went through must rejoin from a snapshot on return. Never leaves fewer than a slow quorum counted. |
+| `snapshot_page_events` | 4096 | Most events this node puts in one snapshot page when a joiner bootstraps from it (§7, lost store). |
+| `snapshot_page_bytes` | 4 MiB | Byte budget of one snapshot page (a single larger event still crosses alone). Keep it far below the transport's 64 MiB frame cap and small enough that one group's bootstrap does not hold the link it shares with every other group for long. |
 | `config_defer_step` | 100 ms | Control-plane anti-dueling delay for concurrent reconfigurations. |
 
 Clock-skew tolerance is on the clock: `HybridLogicalClock::with_max_skew(..)` (default
@@ -122,6 +124,8 @@ Serve it on an HTTP endpoint (see `bank-axum-accord`'s `/metrics`). Counters:
 | `messages_unrouted` | (`MuxTransport` only) inbound frames for a group this host has not registered that were dropped — parked past the pending-buffer TTL or over its bounds. Steady > 0 = peers address groups this host never opens (a tenant evicted here and never re-opened, or a stale/unknown group id). |
 | `peers_absent` | shard peers this node stopped waiting for (`peer_absence_limit`); each is a node that was silent for that long. |
 | `rejoins_required` | a peer told this node to rejoin: it had been given up on while writes it never applied were compacted. The node is stale until its host rejoins it (§7). |
+| `snapshot_pages` | snapshot pages this node served to joining peers; a joiner pulls one per `snapshot_page_events` / `snapshot_page_bytes` of the contact's store. |
+| `joins_partial` | joins of this node that failed after a page was installed: the store holds a prefix no contact can complete, and must be emptied before the next join (§7). Steady > 0 = a contact that cannot read its backend, or a link losing pages faster than the per-page retries cover. |
 
 **Health/readiness.**
 - *Liveness:* a simple `200` while the process is up (`bank-axum-accord`'s `/health`).
@@ -194,19 +198,24 @@ metadata log (config-Paxos); concurrent reconfigurations converge without a lead
   `with_rejoin_handler` hook is told, and should close the group, discard its store
   and journal, and `open_joining` it (next item). The bound a given-up peer must
   report above is persisted (`Journal::save_rejoin_bounds`), so it holds across a
-  restart of the node that gave it up. Mind the snapshot cap (§10): a group whose
-  log exceeds one frame cannot be rejoined until snapshots stream, so leave the
-  limit unset where that applies.
+  restart of the node that gave it up. A rejoin streams the snapshot in pages
+  (`snapshot_page_bytes`), so a group of any size can be given up on and rejoined.
 - **Node back with a lost store** (new disk, deleted tenant file, a backup older than
   its peers' compaction): its journal floor is gone, so anti-entropy can ship only the
   commands peers still hold and the compacted prefix never comes back — the
   `sync contact truncated above this node's proven coverage` warning names this case.
   Wipe the store and journal and open the group by **joining** instead:
   `GroupHost::open_joining(…, contacts)` (or `begin_join` + `join` on a bare `Node`)
-  installs a contact's data-store snapshot, adopts and persists its floor, then replays
-  the traffic buffered meanwhile. Contacts are tried in order; one that is itself
-  joining does not answer. Join only over an empty store: a snapshot that overlaps
-  existing events is skipped as an idempotent re-apply.
+  installs a contact's data-store snapshot page by page, adopts and persists its
+  floor, then replays the traffic buffered meanwhile. Contacts are tried in order;
+  one that is itself joining does not answer. Join only over an empty store (`join`
+  refuses otherwise): a page that overlaps existing events is skipped whole as an
+  idempotent re-apply, which would leave a gap. For the same reason a join that
+  fails after a page was installed (a contact that cannot read its backend, a link
+  that keeps losing pages) is not retried on the next contact: the error carries
+  `PartialSnapshot` (`accord_joins_partial_total`), nothing is left registered, and
+  the store and journal must be discarded before opening again — the same wipe a
+  lost store gets.
 
 ---
 
@@ -292,9 +301,10 @@ an unregistered group — use it to re-open an *evicted* tenant from your catalo
 ids the catalog does not know. Sweep gossip (`Message::is_sweep`: watermarks and
 anti-entropy, which an idle group's peers keep emitting every `idle_interval`) never
 reaches the handler, so a tenant closed for inactivity on one host is not reopened by
-its peers' heartbeats; the next real write or read wakes it. A joining replica's snapshot request
-(`SyncRequest { snapshot: true }`) is not sweep gossip: it wakes the group on a contact
-that has it closed.
+its peers' heartbeats; the next real write or read wakes it. A joining replica's requests
+(`SnapshotRequest`, `SnapshotPageRequest`) are not sweep gossip: they wake the group on
+a contact that has it closed. The pages it is answered with are, so a page arriving
+late, after a failed join unregistered the group, does not reopen it.
 
 **SQLite footprint.** sqlx-sqlite runs one OS thread per *open* connection, so bound
 each tenant pool (`max_connections(2–3)`, `min_connections(0)`, an `idle_timeout`) and
@@ -315,10 +325,13 @@ file is also the consensus journal, so keep `synchronous(Full)` under WAL. Build
 | `MuxTransport::with_queue_capacity` | 1024 | Per-peer outbound queue, shared by all groups — raise for many groups bursting at once (a full queue sheds for all of them). |
 | `MuxTransport::with_inbox_capacity` | 1024 | Per-group inbound inbox. |
 
-Caveat: a per-peer connection and queue are shared, so one group's 64 MB bootstrap
-`SyncData` delays the others' frames on that link. A join snapshot is the contact's whole
-event log in **one** frame, capped at 64 MiB: a group larger than that cannot be
-bootstrapped by `join` yet (a streaming snapshot is future work). (A write that fails on a stale
+A join pulls the contact's log as `SnapshotPage`s of at most `snapshot_page_events` /
+`snapshot_page_bytes` (4096 / 4 MiB), each far below the transport's 64 MiB frame cap,
+so a group of any size can be bootstrapped — and, since a per-peer connection and
+queue are shared, one group's bootstrap holds the link for a page at a time rather
+than for its whole log. A frame over the cap is shed and counted (`messages_shed`,
+with a warning) instead of being handed to the codec, whose refusal would tear the
+connection down and take the frames batched with it. (A write that fails on a stale
 connection — the peer restarted — is retried once over a fresh one, so one dead
 connection does not cost every group a frame.)
 
@@ -350,6 +363,9 @@ your own code stays debuggable.
 - [ ] `peer_absence_limit` decided: unset keeps a down node's writes shippable on
       return but lets the backlog grow toward `max_commands`; set, a node away
       longer rejoins from a snapshot (host hook `with_rejoin_handler` in place).
+- [ ] `snapshot_page_bytes` sized for the link (default 4 MiB): a rejoin moves a
+      page per round trip, so a WAN link wants larger pages and a shared, busy
+      link smaller ones.
 - [ ] Backups of the event store (and journal) per node; restore drill rehearsed.
 - [ ] `linearizable_reads` decision made (freshness vs. read latency).
 - [ ] Load/soak test on representative hardware before trusting it — and note the

@@ -462,6 +462,226 @@ async fn a_group_with_a_lost_store_rejoins_after_compaction() {
     assert_eq!(committed(&g.stores[2]), committed(&g.stores[0]));
 }
 
+/// The snapshot crosses in pages budgeted by bytes: with a budget under one
+/// event, a six-event group takes six pages over real TCP, and the joiner
+/// ends up identical, with the floor persisted, and coordinating writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_large_group_joins_page_by_page_over_tcp() {
+    let cluster = MuxCluster::start(3, Duration::from_millis(200)).await;
+    let mut g = Group::new(GroupId(53), 3);
+    let config = NodeConfig {
+        snapshot_page_bytes: 1,
+        collect_timeout: Duration::from_millis(500),
+        ..NodeConfig::default()
+    };
+    let mut nodes = Vec::new();
+    for h in 0..3 {
+        nodes.push(cluster.open_with(&g, h, config).await);
+    }
+    for i in 0..6 {
+        write(&nodes[0], vec![event(&format!("acc-{i}"), 1, "Opened")]).await;
+    }
+    for store in &g.stores {
+        await_committed(store, 6).await;
+    }
+    for node in &nodes {
+        node.compact(COMPACT_ALL).await;
+    }
+
+    cluster.hosts[2].close(g.id).expect("open on host 2");
+    g.stores[2] = Arc::new(InMemoryDataStore::new());
+    g.journals[2] = Arc::new(InMemoryJournal::new());
+    let joined = cluster
+        .open_joining(&g, 2, config, &[NodeId(0), NodeId(1)])
+        .await
+        .expect("join");
+    assert_eq!(committed(&g.stores[2]), committed(&g.stores[0]));
+    assert!(
+        nodes[0].metrics().snapshot_pages >= 6,
+        "the contact served a page per event: {}",
+        nodes[0].metrics().snapshot_pages
+    );
+    assert_eq!(joined.metrics().joins_partial, 0);
+    let floor = g.journals[2]
+        .load_watermark()
+        .await
+        .unwrap()
+        .expect("the adopted floor is persisted");
+    assert!(floor > Timestamp::MIN);
+
+    write(&nodes[0], vec![event("acc-0", 2, "Deposited")]).await;
+    write(&joined, vec![event("acc-1", 2, "Deposited")]).await;
+    for store in &g.stores {
+        await_committed(store, 8).await;
+    }
+    assert_eq!(committed(&g.stores[2]), committed(&g.stores[0]));
+}
+
+/// A `DataStore` whose snapshot pages stop after the first: what a contact
+/// that cannot read its backend halfway looks like to a joiner.
+struct BreaksAfterFirstPage {
+    inner: Arc<InMemoryDataStore>,
+    pages: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl DataStore for BreaksAfterFirstPage {
+    async fn version(&self, aggregate_type: &str, aggregate_id: &str) -> anyhow::Result<u16> {
+        self.inner.version(aggregate_type, aggregate_id).await
+    }
+
+    async fn apply(
+        &self,
+        txn: TxnId,
+        execute_at: Timestamp,
+        events: Vec<Event>,
+        commit: bool,
+    ) -> anyhow::Result<()> {
+        self.inner.apply(txn, execute_at, events, commit).await
+    }
+
+    async fn snapshot(&self) -> anyhow::Result<Vec<Event>> {
+        self.inner.snapshot().await
+    }
+
+    async fn snapshot_page(
+        &self,
+        after: Option<evento_core::cursor::Value>,
+        max_events: u16,
+        max_bytes: usize,
+    ) -> anyhow::Result<evento_accord::SnapshotPage> {
+        use std::sync::atomic::Ordering;
+        if self.pages.fetch_add(1, Ordering::SeqCst) >= 1 {
+            anyhow::bail!("the backend is gone");
+        }
+        self.inner.snapshot_page(after, max_events, max_bytes).await
+    }
+}
+
+/// A join that breaks once a page has landed cannot move on to another
+/// contact (its pages would overlap the installed prefix and be skipped,
+/// leaving a gap): it stops, says so with `PartialSnapshot`, and leaves
+/// nothing registered. A fresh store joins fine afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_join_that_breaks_after_a_page_stops_and_names_the_partial_install() {
+    use evento_accord::PartialSnapshot;
+
+    let cluster = MuxCluster::start(3, Duration::from_millis(200)).await;
+    let mut g = Group::new(GroupId(54), 3);
+    let config = NodeConfig {
+        snapshot_page_events: 1,
+        collect_timeout: Duration::from_millis(300),
+        ..NodeConfig::default()
+    };
+    let breaking = Arc::new(BreaksAfterFirstPage {
+        inner: Arc::clone(&g.stores[0]),
+        pages: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let node0 = cluster.hosts[0]
+        .open(
+            g.id,
+            cluster.topology(0),
+            breaking as Arc<dyn DataStore>,
+            Arc::clone(&g.journals[0]) as Arc<dyn Journal>,
+            config,
+        )
+        .await
+        .expect("open host 0");
+    let node1 = cluster.open_with(&g, 1, config).await;
+    let node2 = cluster.open_with(&g, 2, config).await;
+    for i in 0..3 {
+        write(&node0, vec![event(&format!("acc-{i}"), 1, "Opened")]).await;
+    }
+    for store in &g.stores {
+        await_committed(store, 3).await;
+    }
+    for node in [&node0, &node1, &node2] {
+        node.compact(COMPACT_ALL).await;
+    }
+
+    cluster.hosts[2].close(g.id).expect("open on host 2");
+    g.stores[2] = Arc::new(InMemoryDataStore::new());
+    g.journals[2] = Arc::new(InMemoryJournal::new());
+    let err = match cluster
+        .open_joining(&g, 2, config, &[NodeId(0), NodeId(1)])
+        .await
+    {
+        Ok(_) => panic!("the join must break after the first page"),
+        Err(err) => err,
+    };
+    assert_eq!(
+        err.downcast_ref::<PartialSnapshot>(),
+        Some(&PartialSnapshot {
+            pages: 1,
+            events: 1
+        }),
+        "unexpected error: {err:#}"
+    );
+    assert!(format!("{err:#}").contains("empty the store"));
+    assert_eq!(
+        node1.metrics().snapshot_pages,
+        0,
+        "the second contact was never asked"
+    );
+    assert!(!cluster.hosts[2].is_open(g.id));
+    assert_eq!(g.stores[2].committed_events().len(), 1, "the prefix stayed");
+
+    // Emptied, the store joins through the healthy contact.
+    g.stores[2] = Arc::new(InMemoryDataStore::new());
+    g.journals[2] = Arc::new(InMemoryJournal::new());
+    let joined = cluster
+        .open_joining(&g, 2, config, &[NodeId(1)])
+        .await
+        .expect("join through host 1");
+    assert_eq!(committed(&g.stores[2]), committed(&g.stores[1]));
+    assert_eq!(joined.metrics().joins_partial, 0);
+}
+
+/// A store larger than one transport frame (64 MiB) joins: the default page
+/// budget splits it into frames the codec accepts. Seeds the contacts'
+/// stores directly (consensus would take far too long for this much data)
+/// and moves about 70 MiB over loopback, so it is left out of the default
+/// run: `cargo test -p evento-accord --test mux_cluster -- --ignored`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "moves 70 MiB over loopback; run on demand"]
+async fn a_store_larger_than_one_frame_joins() {
+    let cluster = MuxCluster::start(3, Duration::from_millis(200)).await;
+    let g = Group::new(GroupId(55), 3);
+    let config = NodeConfig {
+        collect_timeout: Duration::from_secs(30),
+        ..NodeConfig::default()
+    };
+    let events: Vec<Event> = (0..70)
+        .map(|i| Event {
+            data: vec![i as u8; 1024 * 1024],
+            ..event(&format!("blob-{i}"), 1, "Stored")
+        })
+        .collect();
+    for store in &g.stores[..2] {
+        store
+            .apply(TxnId(Timestamp::MIN), Timestamp::MIN, events.clone(), true)
+            .await
+            .unwrap();
+    }
+    let node0 = cluster.open_with(&g, 0, config).await;
+    cluster.open_with(&g, 1, config).await;
+
+    let joined = cluster
+        .open_joining(&g, 2, config, &[NodeId(0)])
+        .await
+        .expect("join");
+    assert_eq!(committed(&g.stores[2]), committed(&g.stores[0]));
+    assert!(
+        node0.metrics().snapshot_pages >= 17,
+        "about 4 MiB per page: {}",
+        node0.metrics().snapshot_pages
+    );
+    write(&joined, vec![event("blob-0", 2, "Touched")]).await;
+    for store in &g.stores {
+        await_committed(store, 71).await;
+    }
+}
+
 /// A contact that cannot answer (here: the group is closed on it and nothing
 /// reopens it) costs one timeout; the join moves on to the next contact.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
