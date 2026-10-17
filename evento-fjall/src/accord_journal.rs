@@ -26,6 +26,8 @@ use evento_accord::{AcceptorRecord, CommandState, Journal, NodeId, Timestamp, Tx
 
 /// Key under which the truncation watermark is stored in the `meta` keyspace.
 const WATERMARK_KEY: &[u8] = b"redundant_before";
+/// Meta key under which the rejoin bounds are stored.
+const REJOIN_BOUNDS_KEY: &[u8] = b"rejoin_above";
 /// Prefix for metadata-log entry keys (`mlog/` + 8-byte big-endian epoch).
 const METADATA_PREFIX: &[u8] = b"mlog/";
 /// Prefix for acceptor-state keys (`acc/` + 8-byte big-endian epoch).
@@ -161,6 +163,35 @@ impl Journal for FjallJournal {
         match bytes {
             Some(bytes) => Ok(Some(decode_tagged(RecordKind::Watermark, &bytes)?)),
             None => Ok(None),
+        }
+    }
+
+    async fn save_rejoin_bounds(&self, bounds: &[(NodeId, Timestamp)]) -> anyhow::Result<()> {
+        let value = if bounds.is_empty() {
+            None
+        } else {
+            Some(encode_tagged(RecordKind::RejoinBounds, &bounds.to_vec())?)
+        };
+        let meta = self.meta.clone();
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            match value {
+                Some(value) => meta.insert(REJOIN_BOUNDS_KEY, value)?,
+                None => meta.remove(REJOIN_BOUNDS_KEY)?,
+            }
+            db.persist(PersistMode::SyncAll)?;
+            Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    async fn load_rejoin_bounds(&self) -> anyhow::Result<Vec<(NodeId, Timestamp)>> {
+        let meta = self.meta.clone();
+        let bytes = tokio::task::spawn_blocking(move || meta.get(REJOIN_BOUNDS_KEY)).await??;
+        match bytes {
+            Some(bytes) => Ok(decode_tagged(RecordKind::RejoinBounds, &bytes)?),
+            None => Ok(Vec::new()),
         }
     }
 

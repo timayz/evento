@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use evento_accord::Journal;
+use evento_accord::{Journal, NodeId};
 use evento_sql::SqlJournal;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::Sqlite;
@@ -101,4 +101,27 @@ async fn survives_close_and_reopen() {
         "the watermark survives the restart"
     );
     assert_eq!(journal.load_metadata().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn rejoin_bounds_survive_close_and_reopen() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("journal.db");
+    let bounds = vec![
+        (NodeId(2), timestamp(300, 1)),
+        (NodeId(4), timestamp(120, 0)),
+    ];
+    {
+        let journal = at(&path).await;
+        assert!(journal.load_rejoin_bounds().await.unwrap().is_empty());
+        journal.save_rejoin_bounds(&bounds).await.unwrap();
+        journal.close().await;
+    }
+    let journal = at(&path).await;
+    assert_eq!(journal.load_rejoin_bounds().await.unwrap(), bounds);
+    // Replaced whole, and an empty set clears the row.
+    journal.save_rejoin_bounds(&bounds[..1]).await.unwrap();
+    assert_eq!(journal.load_rejoin_bounds().await.unwrap(), bounds[..1]);
+    journal.save_rejoin_bounds(&[]).await.unwrap();
+    assert!(journal.load_rejoin_bounds().await.unwrap().is_empty());
 }

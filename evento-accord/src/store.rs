@@ -138,6 +138,8 @@ pub struct InMemoryJournal {
     entries: Mutex<HashMap<TxnId, CommandState>>,
     /// The persisted truncation watermark (redundancy floor).
     watermark: Mutex<Option<Timestamp>>,
+    /// The persisted rejoin bounds (see [`Journal::save_rejoin_bounds`]).
+    rejoin_bounds: Mutex<Vec<(NodeId, Timestamp)>>,
     /// Decided metadata-log entries (epoch → layout). `BTreeMap` so iteration is
     /// ascending and deterministic.
     metadata: Mutex<BTreeMap<u64, Vec<Vec<NodeId>>>>,
@@ -192,6 +194,15 @@ impl Journal for InMemoryJournal {
 
     async fn load_watermark(&self) -> anyhow::Result<Option<Timestamp>> {
         Ok(*self.watermark.lock().expect("journal poisoned"))
+    }
+
+    async fn save_rejoin_bounds(&self, bounds: &[(NodeId, Timestamp)]) -> anyhow::Result<()> {
+        *self.rejoin_bounds.lock().expect("journal poisoned") = bounds.to_vec();
+        Ok(())
+    }
+
+    async fn load_rejoin_bounds(&self) -> anyhow::Result<Vec<(NodeId, Timestamp)>> {
+        Ok(self.rejoin_bounds.lock().expect("journal poisoned").clone())
     }
 
     async fn append_metadata(&self, epoch: u64, layout: &[Vec<NodeId>]) -> anyhow::Result<()> {

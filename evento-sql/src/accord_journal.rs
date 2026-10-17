@@ -34,6 +34,8 @@ use evento_accord::{AcceptorRecord, CommandState, Journal, NodeId, Timestamp, Tx
 
 /// `k` value under which the truncation watermark is stored in `accord_meta`.
 const WATERMARK_KEY: &str = "redundant_before";
+/// `k` value under which the rejoin bounds are stored in `accord_meta`.
+const REJOIN_BOUNDS_KEY: &str = "rejoin_above";
 
 #[derive(Iden)]
 enum AccordCommands {
@@ -141,6 +143,21 @@ where
     i64: for<'r> sqlx::Decode<'r, DB> + sqlx::Type<DB>,
     usize: sqlx::ColumnIndex<DB::Row>,
 {
+    /// The value stored under `key` in `accord_meta`, if any.
+    async fn load_meta(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        let statement = Query::select()
+            .column(AccordMeta::V)
+            .from(AccordMeta::Table)
+            .and_where(Expr::col(AccordMeta::K).eq(Expr::value(key)))
+            .to_owned();
+        let (sql, values) = Self::build_sqlx(&statement);
+        let row =
+            sqlx::query_as_with::<DB, (Vec<u8>,), _>(sqlx::AssertSqlSafe(sql.as_str()), values)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|(bytes,)| bytes))
+    }
+
     /// Creates the journal's tables if absent (idempotent) — a self-contained
     /// convenience for standalone/test use.
     ///
@@ -338,19 +355,46 @@ where
     }
 
     async fn load_watermark(&self) -> anyhow::Result<Option<Timestamp>> {
-        let statement = Query::select()
-            .column(AccordMeta::V)
-            .from(AccordMeta::Table)
-            .and_where(Expr::col(AccordMeta::K).eq(Expr::value(WATERMARK_KEY)))
-            .to_owned();
-        let (sql, values) = Self::build_sqlx(&statement);
-        let row =
-            sqlx::query_as_with::<DB, (Vec<u8>,), _>(sqlx::AssertSqlSafe(sql.as_str()), values)
-                .fetch_optional(&self.pool)
-                .await?;
-        match row {
-            Some((bytes,)) => Ok(Some(decode_tagged(RecordKind::Watermark, &bytes)?)),
+        match self.load_meta(WATERMARK_KEY).await? {
+            Some(bytes) => Ok(Some(decode_tagged(RecordKind::Watermark, &bytes)?)),
             None => Ok(None),
+        }
+    }
+
+    async fn save_rejoin_bounds(&self, bounds: &[(NodeId, Timestamp)]) -> anyhow::Result<()> {
+        if bounds.is_empty() {
+            let delete = Query::delete()
+                .from_table(AccordMeta::Table)
+                .and_where(Expr::col(AccordMeta::K).eq(Expr::value(REJOIN_BOUNDS_KEY)))
+                .to_owned();
+            let (sql, values) = Self::build_sqlx(&delete);
+            sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
+                .execute(&self.pool)
+                .await?;
+            return Ok(());
+        }
+        let value = encode_tagged(RecordKind::RejoinBounds, &bounds.to_vec())?;
+        let upsert = Query::insert()
+            .into_table(AccordMeta::Table)
+            .columns([AccordMeta::K, AccordMeta::V])
+            .values_panic([REJOIN_BOUNDS_KEY.into(), value.into()])
+            .on_conflict(
+                OnConflict::column(AccordMeta::K)
+                    .update_column(AccordMeta::V)
+                    .to_owned(),
+            )
+            .to_owned();
+        let (sql, values) = Self::build_sqlx(&upsert);
+        sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn load_rejoin_bounds(&self) -> anyhow::Result<Vec<(NodeId, Timestamp)>> {
+        match self.load_meta(REJOIN_BOUNDS_KEY).await? {
+            Some(bytes) => Ok(decode_tagged(RecordKind::RejoinBounds, &bytes)?),
+            None => Ok(Vec::new()),
         }
     }
 

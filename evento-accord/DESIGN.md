@@ -392,7 +392,22 @@ backend (sql/fjall). Phases, in order:
   truncating the journal (`Journal::truncate` + a persisted watermark). `is_ready`
   treats a dependency missing below the watermark as satisfied (a `Commit`'s
   quorum-unioned deps can name a compacted-away transaction). A still-behind or
-  partitioned peer holds the min down (and an unheard-from peer blocks compaction).
+  partitioned peer holds the min down (and an unheard-from peer blocks compaction)
+  — unless `NodeConfig::peer_absence_limit` is set: a same-shard peer silent that
+  long is left out of the min (never below a slow quorum of counted nodes, so a
+  stranded minority cannot compact alone). Its last report is kept: a report is a
+  proof the peer holds every lower `t0`, so once compaction drops a transaction at
+  or above it the peer may have a gap, and the newest such `t0` is persisted as
+  the bound it must report above to be counted again (`Journal::save_rejoin_bounds`).
+  A message from a peer under such a bound is answered with `Message::Rejoin`
+  rather than handled — a stale replica recovering a compacted transaction would
+  find no one who knows it and invalidate it — and the told node stops taking
+  part (`Node::rejoin_required`, the `GroupHost` rejoin hook) until its host
+  rejoins it from a snapshot; a node that can prove it holds everything (its own
+  report is above the bound) answers with that report instead. A peer that was
+  silent while nothing was compacted past it is simply counted again
+  (`an_absent_peer_stops_holding_compaction_back`,
+  `a_minority_never_drops_its_way_to_compaction`, `rejoin_bounds_survive_a_restart`).
   `applied_through` alone is not enough, though: a replica partitioned *during*
   consensus never witnessed the missed transactions at all, so after healing its
   report would vouch for a window it wasn't connected for and prematurely unblock

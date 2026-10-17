@@ -197,3 +197,24 @@ async fn metadata_batch_append_keeps_first_decided_layout() {
     );
     assert_eq!(entries[2], (3, layout(&[0, 1, 2])));
 }
+
+#[tokio::test]
+async fn rejoin_bounds_survive_close_and_reopen() {
+    let temp = tempfile::Builder::new()
+        .prefix("evento_accord_journal_bounds")
+        .tempdir()
+        .unwrap();
+    let bounds = vec![
+        (evento_accord::NodeId(2), timestamp(300, 1)),
+        (evento_accord::NodeId(4), timestamp(120, 0)),
+    ];
+    {
+        let journal = FjallJournal::open(temp.path()).unwrap();
+        assert!(journal.load_rejoin_bounds().await.unwrap().is_empty());
+        journal.save_rejoin_bounds(&bounds).await.unwrap();
+    }
+    let journal = FjallJournal::open(temp.path()).unwrap();
+    assert_eq!(journal.load_rejoin_bounds().await.unwrap(), bounds);
+    journal.save_rejoin_bounds(&[]).await.unwrap();
+    assert!(journal.load_rejoin_bounds().await.unwrap().is_empty());
+}

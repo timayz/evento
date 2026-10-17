@@ -22,9 +22,18 @@ use crate::sweep::SweepScheduler;
 use crate::tcp::MuxTransport;
 use crate::transport::GroupId;
 
+/// Called with a group whose node was told to rejoin (see
+/// [`Node::rejoin_required`]): the host should [`close`](GroupHost::close) it,
+/// discard its store and journal, and open it again with
+/// [`open_joining`](GroupHost::open_joining). Called once per open, from a
+/// task of its own, so it may block or spawn as it likes.
+pub type RejoinHandler = Arc<dyn Fn(GroupId) + Send + Sync>;
+
 struct Running {
     node: Node,
     inbox_task: JoinHandle<()>,
+    /// Waits for the node's rejoin signal and calls the handler, if one is set.
+    rejoin_task: Option<JoinHandle<()>>,
 }
 
 /// Hosts the groups one process participates in; see the module docs.
@@ -34,6 +43,7 @@ pub struct GroupHost {
     scheduler: Arc<SweepScheduler>,
     /// A clock shared by every group, if configured; otherwise one per group.
     clock: Option<Arc<HybridLogicalClock>>,
+    rejoin: Option<RejoinHandler>,
     groups: Mutex<HashMap<GroupId, Running>>,
 }
 
@@ -47,8 +57,23 @@ impl GroupHost {
             mux,
             scheduler,
             clock: None,
+            rejoin: None,
             groups: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Installs the [`RejoinHandler`] called when a group's node is told by a
+    /// peer to rejoin: it had been silent past
+    /// [`NodeConfig::peer_absence_limit`] while its peers compacted
+    /// transactions it never applied, so anti-entropy cannot complete it. The
+    /// node drops every message and refuses writes from then on; without a
+    /// handler it stays like that until closed.
+    pub fn with_rejoin_handler(
+        mut self,
+        handler: impl Fn(GroupId) + Send + Sync + 'static,
+    ) -> Self {
+        self.rejoin = Some(Arc::new(handler));
+        self
     }
 
     /// Shares one [`HybridLogicalClock`] across every group instead of a clock per
@@ -171,12 +196,29 @@ impl GroupHost {
             }
         }
         self.scheduler.add(group, Arc::new(node.clone()));
+        let rejoin_task = self.rejoin.clone().map(|handler| {
+            let mut signal = node.rejoin_signal();
+            tokio::spawn(async move {
+                loop {
+                    if *signal.borrow_and_update() {
+                        handler(group);
+                        return;
+                    }
+                    if signal.changed().await.is_err() {
+                        return;
+                    }
+                }
+            })
+        });
 
         let mut groups = self.groups.lock().expect("groups poisoned");
         // Lost a race with a concurrent `open` of the same group: keep the first.
         if let Some(existing) = groups.get(&group) {
             self.scheduler.add(group, Arc::new(existing.node.clone()));
             inbox_task.abort();
+            if let Some(task) = rejoin_task {
+                task.abort();
+            }
             return Ok(existing.node.clone());
         }
         groups.insert(
@@ -184,6 +226,7 @@ impl GroupHost {
             Running {
                 node: node.clone(),
                 inbox_task,
+                rejoin_task,
             },
         );
         Ok(node)
@@ -200,6 +243,9 @@ impl GroupHost {
             .remove(&group)?;
         self.scheduler.remove(group);
         running.inbox_task.abort();
+        if let Some(task) = running.rejoin_task {
+            task.abort();
+        }
         self.mux.unregister(group);
         Some(running.node)
     }

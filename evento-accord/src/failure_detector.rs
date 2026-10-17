@@ -99,6 +99,15 @@ impl FailureDetector {
         }
     }
 
+    /// When the last message from `peer` arrived, if one ever did.
+    pub fn last_heard(&self, peer: NodeId) -> Option<Instant> {
+        self.peers
+            .lock()
+            .expect("failure detector poisoned")
+            .get(&peer)
+            .map(|window| window.last)
+    }
+
     /// Whether `peer` is suspected dead: its φ exceeds `threshold` once
     /// `acceptable_pause` is allowed on top of its usual interval. Its silence is
     /// counted only up to the last message from any other peer (see the module

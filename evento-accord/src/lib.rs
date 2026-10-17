@@ -46,10 +46,10 @@ pub use api::{
 pub use clock::{Ballot, Clock, HybridLogicalClock, NodeId, Timestamp, TxnId, MAX_SKEW_MICROS};
 pub use executor::{AccordExecutor, ExecutorDataStore};
 pub use failure_detector::FailureDetector;
-pub use group::GroupHost;
+pub use group::{GroupHost, RejoinHandler};
 pub use message::{CommandState, Key, Message, Status};
 pub use metrics::{Metrics, MetricsSnapshot};
-pub use node::{CommitOutcome, Node, NodeConfig};
+pub use node::{BacklogAtCap, CommitOutcome, Node, NodeConfig, RejoinRequired};
 pub use store::{AppliedEntry, InMemoryDataStore, InMemoryJournal};
 pub use sweep::{SweepConfig, SweepPressure, SweepScheduler, SweepStats, Sweepable};
 pub use tcp::{
