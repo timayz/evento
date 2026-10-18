@@ -421,6 +421,13 @@ pub struct Node {
     /// Latest `applied_through` gossiped by each shard peer (and self); the
     /// recovery sweep compacts below the per-shard minimum of these.
     peer_watermarks: Arc<Mutex<HashMap<NodeId, Timestamp>>>,
+    /// The truncation watermark the journal is known to have persisted. The
+    /// sweep calls [`compact`](Node::compact) continuously, and a journal's
+    /// `truncate` is a write transaction (an fsync, and on SQLite the writer
+    /// lock) even when it has nothing to delete — so it is only asked when
+    /// the watermark moved past this. Advanced on a successful truncate only,
+    /// so a failed one is retried on the next sweep.
+    journal_watermark: Arc<Mutex<Timestamp>>,
     /// Proven sync coverage per shard peer: a successful sync round with `peer`
     /// established that every transaction `peer` had applied below the recorded
     /// timestamp is in this node's store. Clamps the watermark this node
@@ -492,6 +499,7 @@ impl Node {
             read_pending: Arc::new(Mutex::new(HashMap::new())),
             snapshot_pending: Arc::new(Mutex::new(HashMap::new())),
             peer_watermarks: Arc::new(Mutex::new(HashMap::new())),
+            journal_watermark: Arc::new(Mutex::new(Timestamp::MIN)),
             sync_coverage: Arc::new(Mutex::new((start_epoch, HashMap::new()))),
             failure_detector: Arc::new(FailureDetector::new()),
             started_at: Instant::now(),
@@ -721,6 +729,10 @@ impl Node {
     /// resume via the recovery sweep.
     pub async fn recover_state(&self) -> anyhow::Result<()> {
         let watermark = self.journal.load_watermark().await?;
+        *self
+            .journal_watermark
+            .lock()
+            .expect("journal watermark poisoned") = watermark.unwrap_or(Timestamp::MIN);
         let mut commands = self.journal.load_all().await?;
         commands.sort_by_key(|cmd| (cmd.execute_at, cmd.txn));
 
@@ -790,7 +802,10 @@ impl Node {
     /// applied everything below it (the recovery sweep computes this as the
     /// per-shard minimum; supplied directly here and in tests). The journal is
     /// truncated to the replica's *actual* resulting watermark, which `compact`
-    /// may clamp below `before` if a local transaction is not yet applied.
+    /// may clamp below `before` if a local transaction is not yet applied — and
+    /// only when that watermark is above what the journal already persisted:
+    /// the sweep calls this every pass, and a truncate that has nothing to
+    /// delete still costs the journal a write transaction.
     pub async fn compact(&self, before: Timestamp) {
         let (previous, watermark, newest) = {
             let mut replica = self.replica.lock().expect("replica poisoned");
@@ -802,9 +817,30 @@ impl Node {
             self.metrics.record_compaction();
             tracing::debug!(node = self.id.0, ?watermark, "compacted consensus state");
         }
-        let _ = self.journal.truncate(watermark).await;
+        // Against the journal's watermark, not `previous`: a truncate that
+        // failed is retried next sweep rather than waiting for the next advance.
+        let journal_behind = *self
+            .journal_watermark
+            .lock()
+            .expect("journal watermark poisoned")
+            < watermark;
+        if journal_behind && self.journal.truncate(watermark).await.is_ok() {
+            self.note_journal_watermark(watermark);
+        }
         if let Some(newest) = newest {
             self.note_compacted_past_absent(newest).await;
+        }
+    }
+
+    /// Records that the journal has persisted `watermark` (max-merged: `join`
+    /// and the sweep may both land one).
+    fn note_journal_watermark(&self, watermark: Timestamp) {
+        let mut persisted = self
+            .journal_watermark
+            .lock()
+            .expect("journal watermark poisoned");
+        if watermark > *persisted {
+            *persisted = watermark;
         }
     }
 
@@ -2745,6 +2781,7 @@ impl Node {
         if let Err(err) = self.journal.truncate(floor).await {
             return Err(self.partial(err, &imported));
         }
+        self.note_journal_watermark(floor);
         tracing::info!(
             node = self.id.0,
             contact = contact.0,
