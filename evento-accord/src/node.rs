@@ -67,6 +67,13 @@ pub struct NodeConfig {
     /// not-yet-propagated commit is never skipped when state below the watermark is
     /// compacted away. Keep it above the clock-skew bound and propagation latency.
     pub compaction_margin: Duration,
+    /// Least time between two journal truncations. The replica compacts in
+    /// memory on every sweep, but a journal truncate is a write transaction
+    /// (an fsync, and on SQLite the writer lock) that under steady writes
+    /// would otherwise run every sweep and queue behind the event commits.
+    /// The journal keeps at most this much of a redundant tail beyond the
+    /// replica; a restart replays it idempotently. Default 5 s.
+    pub truncate_interval: Duration,
     /// Most messages the inbox loop stages before forcing a group-commit flush.
     /// Caps the latency a deferred reply waits for its batch's fsync and the memory
     /// held for the batch's pending sends.
@@ -140,6 +147,7 @@ impl Default for NodeConfig {
             anti_entropy_interval: Duration::from_millis(250),
             recovery_timeout: Duration::from_millis(300),
             compaction_margin: Duration::from_secs(1),
+            truncate_interval: Duration::from_secs(5),
             max_journal_batch: 128,
             phi_threshold: 8.0,
             acceptable_pause: Duration::from_millis(500),
@@ -149,6 +157,27 @@ impl Default for NodeConfig {
             snapshot_page_events: 4096,
             snapshot_page_bytes: 4 * 1024 * 1024,
             config_defer_step: Duration::from_millis(100),
+        }
+    }
+}
+
+/// The node's view of the journal's truncation: see `Node::journal_mark`.
+#[derive(Debug, Clone, Copy)]
+struct JournalMark {
+    /// The watermark the journal is known to have persisted; advanced on a
+    /// successful truncate only, so a failed one is retried.
+    persisted: Timestamp,
+    /// When the journal was last asked to truncate, successful or not — the
+    /// pacing clock, so a truncate that failed (say, timed out behind the
+    /// event commits) is not hammered on every sweep either.
+    last_attempt: Option<Instant>,
+}
+
+impl Default for JournalMark {
+    fn default() -> Self {
+        Self {
+            persisted: Timestamp::MIN,
+            last_attempt: None,
         }
     }
 }
@@ -421,6 +450,13 @@ pub struct Node {
     /// Latest `applied_through` gossiped by each shard peer (and self); the
     /// recovery sweep compacts below the per-shard minimum of these.
     peer_watermarks: Arc<Mutex<HashMap<NodeId, Timestamp>>>,
+    /// What the journal has been asked to truncate: the sweep calls
+    /// [`compact`](Node::compact) continuously, and a journal's `truncate` is
+    /// a write transaction (an fsync, and on SQLite the writer lock) even when
+    /// it has nothing to delete — so it is only asked when the watermark moved
+    /// past what it persisted, and at most once per
+    /// [`truncate_interval`](NodeConfig::truncate_interval).
+    journal_mark: Arc<Mutex<JournalMark>>,
     /// Proven sync coverage per shard peer: a successful sync round with `peer`
     /// established that every transaction `peer` had applied below the recorded
     /// timestamp is in this node's store. Clamps the watermark this node
@@ -492,6 +528,7 @@ impl Node {
             read_pending: Arc::new(Mutex::new(HashMap::new())),
             snapshot_pending: Arc::new(Mutex::new(HashMap::new())),
             peer_watermarks: Arc::new(Mutex::new(HashMap::new())),
+            journal_mark: Arc::new(Mutex::new(JournalMark::default())),
             sync_coverage: Arc::new(Mutex::new((start_epoch, HashMap::new()))),
             failure_detector: Arc::new(FailureDetector::new()),
             started_at: Instant::now(),
@@ -721,6 +758,10 @@ impl Node {
     /// resume via the recovery sweep.
     pub async fn recover_state(&self) -> anyhow::Result<()> {
         let watermark = self.journal.load_watermark().await?;
+        self.journal_mark
+            .lock()
+            .expect("journal mark poisoned")
+            .persisted = watermark.unwrap_or(Timestamp::MIN);
         let mut commands = self.journal.load_all().await?;
         commands.sort_by_key(|cmd| (cmd.execute_at, cmd.txn));
 
@@ -790,7 +831,11 @@ impl Node {
     /// applied everything below it (the recovery sweep computes this as the
     /// per-shard minimum; supplied directly here and in tests). The journal is
     /// truncated to the replica's *actual* resulting watermark, which `compact`
-    /// may clamp below `before` if a local transaction is not yet applied.
+    /// may clamp below `before` if a local transaction is not yet applied — and
+    /// only when that watermark is above what the journal already persisted,
+    /// at most once per [`truncate_interval`](NodeConfig::truncate_interval):
+    /// the sweep calls this every pass, and a truncate costs the journal a
+    /// write transaction whether or not it has much to delete.
     pub async fn compact(&self, before: Timestamp) {
         let (previous, watermark, newest) = {
             let mut replica = self.replica.lock().expect("replica poisoned");
@@ -802,9 +847,34 @@ impl Node {
             self.metrics.record_compaction();
             tracing::debug!(node = self.id.0, ?watermark, "compacted consensus state");
         }
-        let _ = self.journal.truncate(watermark).await;
+        // Against the journal's watermark, not `previous`: a truncate that
+        // failed is retried (next interval) rather than waiting for the next
+        // advance.
+        let due = {
+            let mut mark = self.journal_mark.lock().expect("journal mark poisoned");
+            let due = mark.persisted < watermark
+                && mark
+                    .last_attempt
+                    .is_none_or(|at| at.elapsed() >= self.settings.truncate_interval);
+            if due {
+                mark.last_attempt = Some(Instant::now());
+            }
+            due
+        };
+        if due && self.journal.truncate(watermark).await.is_ok() {
+            self.note_journal_watermark(watermark);
+        }
         if let Some(newest) = newest {
             self.note_compacted_past_absent(newest).await;
+        }
+    }
+
+    /// Records that the journal has persisted `watermark` (max-merged: `join`
+    /// and the sweep may both land one).
+    fn note_journal_watermark(&self, watermark: Timestamp) {
+        let mut mark = self.journal_mark.lock().expect("journal mark poisoned");
+        if watermark > mark.persisted {
+            mark.persisted = watermark;
         }
     }
 
@@ -2745,6 +2815,7 @@ impl Node {
         if let Err(err) = self.journal.truncate(floor).await {
             return Err(self.partial(err, &imported));
         }
+        self.note_journal_watermark(floor);
         tracing::info!(
             node = self.id.0,
             contact = contact.0,

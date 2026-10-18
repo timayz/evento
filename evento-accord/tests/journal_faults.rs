@@ -10,9 +10,9 @@
 //! restart. The test asserts the invariant directly (no restart needed): if a write
 //! returns committed, at least a slow quorum holds it durably.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use evento_accord::{
@@ -30,6 +30,10 @@ struct FaultJournal {
     durable: InMemoryJournal,
     pending: Mutex<Vec<CommandState>>,
     failing: AtomicBool,
+    /// `truncate` calls, successful or not.
+    truncates: AtomicUsize,
+    /// While set, `truncate` fails without touching the durable journal.
+    truncate_failing: AtomicBool,
 }
 
 impl FaultJournal {
@@ -38,11 +42,21 @@ impl FaultJournal {
             durable: InMemoryJournal::new(),
             pending: Mutex::new(Vec::new()),
             failing: AtomicBool::new(false),
+            truncates: AtomicUsize::new(0),
+            truncate_failing: AtomicBool::new(false),
         }
     }
 
     fn set_failing(&self, v: bool) {
         self.failing.store(v, Ordering::SeqCst);
+    }
+
+    fn set_truncate_failing(&self, v: bool) {
+        self.truncate_failing.store(v, Ordering::SeqCst);
+    }
+
+    fn truncates(&self) -> usize {
+        self.truncates.load(Ordering::SeqCst)
     }
 
     /// Whether `txn` is **durably** recorded (survived a flush) — the real
@@ -79,6 +93,10 @@ impl Journal for FaultJournal {
         self.durable.load_all().await
     }
     async fn truncate(&self, before: Timestamp) -> anyhow::Result<()> {
+        self.truncates.fetch_add(1, Ordering::SeqCst);
+        if self.truncate_failing.load(Ordering::SeqCst) {
+            anyhow::bail!("simulated truncate failure");
+        }
         self.durable.truncate(before).await
     }
     async fn load_watermark(&self) -> anyhow::Result<Option<Timestamp>> {
@@ -109,6 +127,8 @@ fn event(aggregate_id: &str, version: u16, name: &str) -> Event {
 }
 
 struct Cluster {
+    ids: Vec<NodeId>,
+    net: Arc<InMemoryNetwork>,
     nodes: Vec<Node>,
     journals: Vec<Arc<FaultJournal>>,
     stores: Vec<Arc<InMemoryDataStore>>,
@@ -116,6 +136,12 @@ struct Cluster {
 }
 
 fn start(n: u64) -> Cluster {
+    start_with(n, true, NodeConfig::default())
+}
+
+/// `sweep: false` leaves the recovery sweep (which compacts on every pass)
+/// unstarted, so a test owns every [`Node::compact`] call.
+fn start_with(n: u64, sweep: bool, config: NodeConfig) -> Cluster {
     let ids: Vec<NodeId> = (0..n).map(NodeId).collect();
     let net = InMemoryNetwork::new();
     let (mut nodes, mut journals, mut stores, mut loops) = (vec![], vec![], vec![], vec![]);
@@ -137,15 +163,19 @@ fn start(n: u64) -> Cluster {
         // keep the timeout below this test's 3s write budget.
         .with_config(NodeConfig {
             collect_timeout: Duration::from_secs(1),
-            ..NodeConfig::default()
+            ..config
         });
         loops.push(node.start(inbox));
-        loops.push(node.start_recovery());
+        if sweep {
+            loops.push(node.start_recovery());
+        }
         nodes.push(node);
         journals.push(journal);
         stores.push(store);
     }
     Cluster {
+        ids,
+        net,
         nodes,
         journals,
         stores,
@@ -211,6 +241,162 @@ async fn a_committed_write_is_always_durable_on_a_quorum() {
     }
     // (A write that fails to commit under a flush-failing quorum is the correct,
     // safe outcome — the node refused to ack what it could not persist.)
+}
+
+/// A compaction watermark above every transaction committed so far (`offset`
+/// orders several such watermarks taken in a row).
+fn above_now(offset: u64) -> Timestamp {
+    let now_micros = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as u64;
+    Timestamp {
+        micros: now_micros + 10_000 + offset,
+        logical: 0,
+        node: NodeId(0),
+    }
+}
+
+/// Journal truncation unpaced, so a test isolates the watermark check.
+fn unpaced() -> NodeConfig {
+    NodeConfig {
+        truncate_interval: Duration::ZERO,
+        ..NodeConfig::default()
+    }
+}
+
+/// Writes one event and waits for every store to hold it.
+async fn write_one(cluster: &Cluster, version: u16) {
+    cluster.nodes[0]
+        .write(vec![event("acc", version, "Opened")])
+        .await
+        .expect("healthy write commits");
+    for s in &cluster.stores {
+        await_version(s, "acc", version).await;
+    }
+}
+
+/// The sweep compacts on every pass, and a journal's `truncate` is a write
+/// transaction even when it has nothing to delete — so a node asks for one only
+/// when the watermark moved past what the journal already persisted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unchanged_watermark_does_not_touch_the_journal() {
+    let cluster = start_with(3, false, unpaced());
+    write_one(&cluster, 1).await;
+
+    let w = above_now(0);
+    cluster.nodes[1].compact(w).await;
+    assert_eq!(cluster.journals[1].truncates(), 1);
+    assert_eq!(
+        cluster.journals[1].load_watermark().await.unwrap(),
+        Some(w),
+        "the first compaction persists the watermark"
+    );
+
+    for _ in 0..5 {
+        cluster.nodes[1].compact(w).await;
+    }
+    assert_eq!(
+        cluster.journals[1].truncates(),
+        1,
+        "compacting at an unchanged watermark must not truncate the journal again"
+    );
+
+    // A restart recovers the persisted watermark, so it does not re-persist it
+    // either.
+    let id = cluster.ids[1];
+    let restarted = Node::new(
+        id,
+        Arc::new(StaticTopology::new(id, cluster.ids.clone())) as Arc<dyn Topology>,
+        Arc::new(HybridLogicalClock::new(id)),
+        Arc::new(cluster.net.sink(id)) as Arc<dyn MessageSink>,
+        Arc::clone(&cluster.stores[1]) as Arc<dyn DataStore>,
+        Arc::clone(&cluster.journals[1]) as Arc<dyn Journal>,
+    );
+    restarted.recover_state().await.expect("recovers");
+    restarted.compact(w).await;
+    assert_eq!(
+        cluster.journals[1].truncates(),
+        1,
+        "a restarted node does not re-persist the watermark it recovered"
+    );
+}
+
+/// A truncate that failed is retried on the next compaction even if the
+/// watermark did not move — tracked against what the journal persisted, not
+/// against the replica's previous watermark.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_truncate_is_retried_at_the_same_watermark() {
+    let cluster = start_with(3, false, unpaced());
+    write_one(&cluster, 1).await;
+
+    let w = above_now(0);
+    cluster.journals[1].set_truncate_failing(true);
+    cluster.nodes[1].compact(w).await;
+    assert_eq!(cluster.journals[1].truncates(), 1);
+    assert_eq!(
+        cluster.journals[1].load_watermark().await.unwrap(),
+        None,
+        "the failed truncate persisted nothing"
+    );
+
+    cluster.journals[1].set_truncate_failing(false);
+    cluster.nodes[1].compact(w).await;
+    assert_eq!(
+        cluster.journals[1].truncates(),
+        2,
+        "the same watermark is retried once the journal is back"
+    );
+    assert_eq!(cluster.journals[1].load_watermark().await.unwrap(), Some(w));
+}
+
+/// Under steady writes the watermark moves on every sweep, so "moved at all"
+/// alone would still truncate every pass: the journal is asked at most once per
+/// `truncate_interval`, and the watermark that was skipped lands on the next
+/// due truncate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn truncation_is_paced_by_the_interval() {
+    let interval = Duration::from_millis(300);
+    let cluster = start_with(
+        3,
+        false,
+        NodeConfig {
+            truncate_interval: interval,
+            ..NodeConfig::default()
+        },
+    );
+    write_one(&cluster, 1).await;
+
+    let w1 = above_now(0);
+    cluster.nodes[1].compact(w1).await;
+    assert_eq!(cluster.journals[1].truncates(), 1);
+
+    // The watermark moved, but the interval has not elapsed.
+    let w2 = above_now(1);
+    cluster.nodes[1].compact(w2).await;
+    assert_eq!(
+        cluster.journals[1].truncates(),
+        1,
+        "a watermark that moved within the interval is not truncated yet"
+    );
+    assert_eq!(
+        cluster.journals[1].load_watermark().await.unwrap(),
+        Some(w1)
+    );
+
+    tokio::time::sleep(interval).await;
+    let w3 = above_now(2);
+    cluster.nodes[1].compact(w3).await;
+    assert_eq!(
+        cluster.journals[1].truncates(),
+        2,
+        "due again after the interval"
+    );
+    assert_eq!(
+        cluster.journals[1].load_watermark().await.unwrap(),
+        Some(w3),
+        "the due truncate carries the current watermark"
+    );
 }
 
 async fn count_durable(journals: &[Arc<FaultJournal>], txn: TxnId) -> usize {
