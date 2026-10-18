@@ -136,12 +136,12 @@ struct Cluster {
 }
 
 fn start(n: u64) -> Cluster {
-    start_with(n, true)
+    start_with(n, true, NodeConfig::default())
 }
 
 /// `sweep: false` leaves the recovery sweep (which compacts on every pass)
 /// unstarted, so a test owns every [`Node::compact`] call.
-fn start_with(n: u64, sweep: bool) -> Cluster {
+fn start_with(n: u64, sweep: bool, config: NodeConfig) -> Cluster {
     let ids: Vec<NodeId> = (0..n).map(NodeId).collect();
     let net = InMemoryNetwork::new();
     let (mut nodes, mut journals, mut stores, mut loops) = (vec![], vec![], vec![], vec![]);
@@ -163,7 +163,7 @@ fn start_with(n: u64, sweep: bool) -> Cluster {
         // keep the timeout below this test's 3s write budget.
         .with_config(NodeConfig {
             collect_timeout: Duration::from_secs(1),
-            ..NodeConfig::default()
+            ..config
         });
         loops.push(node.start(inbox));
         if sweep {
@@ -243,16 +243,36 @@ async fn a_committed_write_is_always_durable_on_a_quorum() {
     // safe outcome — the node refused to ack what it could not persist.)
 }
 
-/// A compaction watermark above every transaction committed so far.
-fn above_now() -> Timestamp {
+/// A compaction watermark above every transaction committed so far (`offset`
+/// orders several such watermarks taken in a row).
+fn above_now(offset: u64) -> Timestamp {
     let now_micros = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_micros() as u64;
     Timestamp {
-        micros: now_micros + 10_000,
+        micros: now_micros + 10_000 + offset,
         logical: 0,
         node: NodeId(0),
+    }
+}
+
+/// Journal truncation unpaced, so a test isolates the watermark check.
+fn unpaced() -> NodeConfig {
+    NodeConfig {
+        truncate_interval: Duration::ZERO,
+        ..NodeConfig::default()
+    }
+}
+
+/// Writes one event and waits for every store to hold it.
+async fn write_one(cluster: &Cluster, version: u16) {
+    cluster.nodes[0]
+        .write(vec![event("acc", version, "Opened")])
+        .await
+        .expect("healthy write commits");
+    for s in &cluster.stores {
+        await_version(s, "acc", version).await;
     }
 }
 
@@ -261,16 +281,10 @@ fn above_now() -> Timestamp {
 /// when the watermark moved past what the journal already persisted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unchanged_watermark_does_not_touch_the_journal() {
-    let cluster = start_with(3, false);
-    cluster.nodes[0]
-        .write(vec![event("acc", 1, "Opened")])
-        .await
-        .expect("healthy write commits");
-    for s in &cluster.stores {
-        await_version(s, "acc", 1).await;
-    }
+    let cluster = start_with(3, false, unpaced());
+    write_one(&cluster, 1).await;
 
-    let w = above_now();
+    let w = above_now(0);
     cluster.nodes[1].compact(w).await;
     assert_eq!(cluster.journals[1].truncates(), 1);
     assert_eq!(
@@ -313,16 +327,10 @@ async fn an_unchanged_watermark_does_not_touch_the_journal() {
 /// against the replica's previous watermark.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_failed_truncate_is_retried_at_the_same_watermark() {
-    let cluster = start_with(3, false);
-    cluster.nodes[0]
-        .write(vec![event("acc", 1, "Opened")])
-        .await
-        .expect("healthy write commits");
-    for s in &cluster.stores {
-        await_version(s, "acc", 1).await;
-    }
+    let cluster = start_with(3, false, unpaced());
+    write_one(&cluster, 1).await;
 
-    let w = above_now();
+    let w = above_now(0);
     cluster.journals[1].set_truncate_failing(true);
     cluster.nodes[1].compact(w).await;
     assert_eq!(cluster.journals[1].truncates(), 1);
@@ -340,6 +348,55 @@ async fn a_failed_truncate_is_retried_at_the_same_watermark() {
         "the same watermark is retried once the journal is back"
     );
     assert_eq!(cluster.journals[1].load_watermark().await.unwrap(), Some(w));
+}
+
+/// Under steady writes the watermark moves on every sweep, so "moved at all"
+/// alone would still truncate every pass: the journal is asked at most once per
+/// `truncate_interval`, and the watermark that was skipped lands on the next
+/// due truncate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn truncation_is_paced_by_the_interval() {
+    let interval = Duration::from_millis(300);
+    let cluster = start_with(
+        3,
+        false,
+        NodeConfig {
+            truncate_interval: interval,
+            ..NodeConfig::default()
+        },
+    );
+    write_one(&cluster, 1).await;
+
+    let w1 = above_now(0);
+    cluster.nodes[1].compact(w1).await;
+    assert_eq!(cluster.journals[1].truncates(), 1);
+
+    // The watermark moved, but the interval has not elapsed.
+    let w2 = above_now(1);
+    cluster.nodes[1].compact(w2).await;
+    assert_eq!(
+        cluster.journals[1].truncates(),
+        1,
+        "a watermark that moved within the interval is not truncated yet"
+    );
+    assert_eq!(
+        cluster.journals[1].load_watermark().await.unwrap(),
+        Some(w1)
+    );
+
+    tokio::time::sleep(interval).await;
+    let w3 = above_now(2);
+    cluster.nodes[1].compact(w3).await;
+    assert_eq!(
+        cluster.journals[1].truncates(),
+        2,
+        "due again after the interval"
+    );
+    assert_eq!(
+        cluster.journals[1].load_watermark().await.unwrap(),
+        Some(w3),
+        "the due truncate carries the current watermark"
+    );
 }
 
 async fn count_durable(journals: &[Arc<FaultJournal>], txn: TxnId) -> usize {
