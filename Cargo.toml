@@ -66,7 +66,7 @@ ulid = { version = "3.0", features = ["serde"] }
 
 # Database
 sqlx = { version = "0.9" }
-sqlx_migrator = "0.19"
+sqlx_migrator = "0.20"
 sea-query = { version = "1.0.1", default-features = false, features = ["derive", "audit"] }
 sea-query-sqlx = { version = "0.9.1", features = ["runtime-tokio"] }
 fjall = "3.1"
