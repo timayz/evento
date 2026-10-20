@@ -2759,11 +2759,16 @@ impl Node {
                         .1
                         .execute_at
                 }
+                // The value accepted at the highest ballot — among the reports
+                // that accepted one: a pre-accepted command carries `Ballot(t0)`
+                // as a placeholder, which ties the original coordinator's own
+                // Accept ballot and must not let a pre-accept vote win.
                 Status::Accepted => {
                     known
                         .iter()
+                        .filter(|(_, f)| f.status == Status::Accepted)
                         .max_by_key(|(_, f)| f.accepted)
-                        .expect("non-empty")
+                        .expect("an accepted report")
                         .1
                         .execute_at
                 }
@@ -2833,6 +2838,18 @@ impl Node {
                     ballot = self.higher_ballot(promised);
                     continue;
                 }
+                // Commit only what a quorum of every shard accepted: a value
+                // accepted by fewer may be overlooked by a later recovery,
+                // which could then decide differently.
+                for plan in &plans {
+                    if acks[&plan.shard].iter().filter(|a| a.is_ok()).count() < plan.slow_q {
+                        self.deregister(txn);
+                        anyhow::bail!(
+                            "recovery accept quorum not reached for shard {}",
+                            plan.shard
+                        );
+                    }
+                }
                 for (shard, lists) in acks {
                     if let Some(set) = shard_deps.get_mut(&shard) {
                         for a in lists.into_iter().flatten() {
@@ -2842,11 +2859,17 @@ impl Node {
                 }
             }
 
-            let conflict = self
+            let executed = self
                 .execute(&mut rx, &plans, txn, execute_at, shard_deps)
-                .await?;
+                .await;
+            // Deregistered on failure too: a leaked response channel makes the
+            // sweep take this node's own transaction for locally in flight,
+            // and never recover it.
             self.deregister(txn);
-            return Ok(CommitOutcome { txn, conflict });
+            return Ok(CommitOutcome {
+                txn,
+                conflict: executed?,
+            });
         }
 
         anyhow::bail!("recovery exhausted its ballot retries")
