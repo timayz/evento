@@ -56,6 +56,9 @@ let executor = AccordExecutor::new(node, fjall);                // drop-in event
   `accord` feature) or `evento_sql::SqlJournal` (`evento-sql`'s `accord` feature).
 - **App code is unchanged:** `AccordExecutor` is a drop-in `evento_core::Executor`, so
   `evento::create()/append()`, reads, subscriptions, and snapshots work as usual.
+  An event's stored `timestamp`/`timestamp_subsec` is its transaction's agreed
+  execution time (milliseconds), the same on every replica — not the writing host's
+  clock, so a skewed host cannot reorder an aggregate's versions.
 - **The sweep is required, not optional:** besides recovery and compaction, it runs
   the anti-entropy rounds that prove what a node holds, and a node's subscriptions
   only process events below the window it has proven (§5). A node that never sweeps
@@ -258,6 +261,18 @@ metadata log (config-Paxos); concurrent reconfigurations converge without a lead
 - **SQL backend:** run the schema via `evento-sql-migrator` with its `accord` feature
   (the `accord_commands/meta/metadata_log/acceptors` tables), alongside your event
   schema — one migrator for both.
+- **Upgrading past the apply-time re-stamp** (release note; the journal and wire
+  formats are unchanged): a build before it stored each event with the stamp its
+  writing host gave it, and later builds stamp it from the transaction's agreed
+  execution time. Events a store already holds keep their old stamps — so an
+  aggregate written by skewed hosts before the upgrade can still read with versions
+  out of stamp order — and nothing re-stamps them, not even a rejoin (a join copies
+  the contact's stamps). Do not mix builds in one group: an old and a new replica
+  applying the same transaction stamp it differently, and their subscription cursors
+  stop lining up for good. Upgrade a group's nodes together (stop all, upgrade, start).
+  If a rolling upgrade let both builds apply, pick one upgraded replica and rejoin
+  every other from an empty store against it (§7, lost store), so all share its
+  stamps.
 
 ---
 

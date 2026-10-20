@@ -159,9 +159,12 @@ impl<E: Executor> DataStore for ExecutorDataStore<E> {
         if !commit || events.is_empty() {
             return Ok(());
         }
-        // `replicate`, not `write`: the replication layer owns ordering, so
-        // the events' timestamps must be persisted verbatim (a re-stamping
-        // backend would desync this replica's cursors from its peers').
+        // `replicate`, not `write`: the node has already stamped the events
+        // from the transaction's agreed `execute_at` — the same on every
+        // replica, rising with every key's serial order — so they must be
+        // persisted verbatim (a backend re-stamping with its own clock would
+        // desync this replica's cursors from its peers', and from the
+        // stability watermark computed from those stamps).
         match self.local.replicate(events).await {
             // Accord already validated the condition at this serial point;
             // a version conflict here means the events are already present
@@ -307,10 +310,11 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
 
     async fn stable_timestamp(&self) -> anyhow::Result<Option<u64>> {
         // Gate subscriptions by the node's stability watermark. Events are
-        // applied to each replica's local store in Accord's `(execute_at, txn)`
-        // order — which can differ from the subscription's wall-clock cursor —
-        // so without this gate a late, lower-cursor event applied out of order
-        // would be skipped by the forward read. See `Node::stable_micros`.
+        // stamped from their transaction's `execute_at`, but a replica learns
+        // of non-conflicting transactions in no particular order — one with
+        // a lower `execute_at` (a lower cursor) can arrive after a higher one
+        // was applied — so without this gate the forward read would skip it.
+        // See `Node::stable_micros`.
         Ok(Some(self.node.stable_micros()))
     }
 

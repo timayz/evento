@@ -2,10 +2,10 @@
 //! watermark that makes it safe.
 //!
 //! A running subscription reads its backend with a forward cursor ordered by the
-//! event's `(timestamp, timestamp_subsec, version, id)` — fields stamped on the
-//! *originating* node before consensus. Accord, however, only orders *conflicting*
-//! (same-key) transactions and applies committed transactions to each node's local
-//! store in `(execute_at, txn)` order. So an event with a *smaller* cursor can be
+//! event's `(timestamp, timestamp_subsec, version, id)` — stamped at apply from
+//! the transaction's agreed `execute_at`. Accord, however, only orders
+//! *conflicting* (same-key) transactions, and a node learns of non-conflicting
+//! ones in no particular order. So an event with a *smaller* cursor can be
 //! applied to a node *after* its subscription has advanced past a *larger* cursor
 //! from a different aggregate written elsewhere — and a naive forward read would
 //! **skip** it.
@@ -25,6 +25,9 @@
 //!   the margin (a lagging or cut-off replica) no longer releases the earlier
 //!   cursor early — the coverage clamp waits for anti-entropy to prove the
 //!   window.
+//! - `skewed_hosts_cannot_reverse_an_aggregate_s_versions`: the cursor is the
+//!   *applied* stamp, re-derived from the transaction's agreed `execute_at` on
+//!   every replica, so a writer whose clock lags cannot slip v2 in ahead of v1.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -54,6 +57,32 @@ impl<E: Executor> Handler<E> for Recorder {
         let id = event.aggregate_id.clone();
         Box::pin(async move {
             recorded.lock().unwrap().push(id);
+            Ok(())
+        })
+    }
+
+    fn aggregate_type(&self) -> &'static str {
+        "test/Account"
+    }
+
+    fn event_name(&self) -> &'static str {
+        "Opened"
+    }
+}
+
+/// Records the `version` of every event the subscription handles, in order.
+struct VersionRecorder(Arc<Mutex<Vec<u16>>>);
+
+impl<E: Executor> Handler<E> for VersionRecorder {
+    fn handle<'a>(
+        &'a self,
+        _context: &'a Context<'a, E>,
+        event: &'a Event,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>> {
+        let recorded = self.0.clone();
+        let version = event.version;
+        Box::pin(async move {
+            recorded.lock().unwrap().push(version);
             Ok(())
         })
     }
@@ -280,6 +309,51 @@ async fn a_late_event_is_not_skipped_even_past_the_margin() {
         *handled.lock().unwrap(),
         vec!["delayed".to_string(), "local".to_string()],
         "the late lower-cursor X must be handled, before Y"
+    );
+
+    subscription.shutdown().await.ok();
+}
+
+/// Skewed writers: v1 is written via A at the present, v2 via B with a clock
+/// 10 s behind. Consensus orders v2 after v1, but a cursor built from the
+/// writers' stamps puts v2 first — below the watermark at once, so the
+/// subscription handled v2 and then v1. Re-stamped from `execute_at` at apply,
+/// the cursor follows the agreed order: v1, then v2.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn skewed_hosts_cannot_reverse_an_aggregate_s_versions() {
+    let cluster = Cluster::start(3, Duration::from_secs(1), Duration::from_millis(250));
+
+    let handled = Arc::new(Mutex::new(Vec::<u16>::new()));
+    let subscription = SubscriptionBuilder::new("skew-demo")
+        .handler(VersionRecorder(handled.clone()))
+        .start(&cluster.execs[1])
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let v1 = opened("skewed");
+    let mut v2 = opened("skewed");
+    v2.version = 2;
+    v2.timestamp -= 10;
+    cluster.execs[0].write(vec![v1]).await.unwrap();
+    cluster.execs[1].write(vec![v2]).await.unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if handled.lock().unwrap().len() >= 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "subscription never caught up; handled = {:?}",
+            *handled.lock().unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        *handled.lock().unwrap(),
+        vec![1, 2],
+        "an aggregate's versions must be handled in order"
     );
 
     subscription.shutdown().await.ok();

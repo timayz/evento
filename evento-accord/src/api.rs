@@ -291,6 +291,13 @@ pub trait DataStore: Send + Sync + 'static {
     /// otherwise the transaction is a no-op (an aborted conditional write).
     /// Implementations must apply in `execute_at` order to preserve the global
     /// serial order. `events` is only this replica's owned subset.
+    ///
+    /// A committed transaction's events arrive already stamped from
+    /// `execute_at`, floored to milliseconds — the same stamp on every replica,
+    /// rising with the serial order on every key — so implementations must
+    /// persist them **verbatim**: the stamps are the subscription cursor, and
+    /// the node's stability watermark is computed from them. A bootstrap
+    /// snapshot page arrives with the contact's stored stamps, also verbatim.
     async fn apply(
         &self,
         txn: TxnId,
@@ -393,6 +400,33 @@ pub fn snapshot_event_size(event: &Event) -> usize {
         + event.routing_key.as_ref().map_or(0, String::len)
         + event.data.len()
         + bitcode::encode(&event.metadata).len()
+}
+
+/// Re-stamps a committed transaction's events from its agreed execution
+/// timestamp, floored to **milliseconds** (`timestamp` seconds +
+/// `timestamp_subsec` milliseconds — the precision every backend and the
+/// `to_micros` bound assume).
+///
+/// The stamps an event carries in are its writing host's provisional ones,
+/// and two hosts' skewed clocks could order an aggregate's v2 before its v1.
+/// `execute_at` is agreed by consensus, identical on every replica, and rises
+/// with the serial order of every key, so the stamp derived from it is too
+/// (ties within a millisecond fall back to the version). Called at every
+/// command apply — journal replay, execution, anti-entropy import — but not
+/// at a snapshot install, whose events were already stamped by the replica
+/// that applied them. The id (a ULID) is left alone.
+pub(crate) fn stamp_events(execute_at: Timestamp, events: &mut [Event]) {
+    let millis = execute_at.micros / 1_000;
+    for event in events {
+        event.timestamp = millis / 1_000;
+        event.timestamp_subsec = (millis % 1_000) as u32;
+    }
+}
+
+/// `micros` floored to a whole millisecond: the stamp [`stamp_events`] gives a
+/// transaction executing at `micros`, in microseconds.
+pub(crate) fn floor_millis(micros: u64) -> u64 {
+    micros - micros % 1_000
 }
 
 /// Fast-path quorum size: `⌊(electorate + faults)/2⌋ + 1`. With the electorate set
@@ -923,6 +957,37 @@ mod tests {
             .snapshot_page(Some(Value("not-an-offset".into())), 2, usize::MAX)
             .await
             .is_err());
+    }
+
+    /// Events are stamped with `execute_at` floored to the millisecond:
+    /// seconds + milliseconds, whatever the writer had put there, and the
+    /// stamp in microseconds is exactly `floor_millis(execute_at)`.
+    #[test]
+    fn stamp_events_floors_execute_at_to_milliseconds() {
+        let execute_at = Timestamp {
+            micros: 1_700_000_123_456_789,
+            logical: 7,
+            node: NodeId(2),
+        };
+        let mut events = vec![
+            Event {
+                timestamp: 9_999_999_999,
+                timestamp_subsec: 999,
+                ..Default::default()
+            },
+            Event::default(),
+        ];
+        stamp_events(execute_at, &mut events);
+        for event in &events {
+            assert_eq!(event.timestamp, 1_700_000_123);
+            assert_eq!(event.timestamp_subsec, 456);
+            assert_eq!(
+                event.timestamp * 1_000_000 + u64::from(event.timestamp_subsec) * 1_000,
+                floor_millis(execute_at.micros)
+            );
+        }
+        assert_eq!(floor_millis(1_999), 1_000);
+        assert_eq!(floor_millis(2_000), 2_000);
     }
 
     fn topo(n: u64) -> StaticTopology {
