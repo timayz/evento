@@ -946,3 +946,68 @@ async fn dynamic_region_electorate_gives_a_local_fast_path_across_epochs() {
         "epoch 1 fast path persists"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_duplicated_config_promise_never_completes_a_quorum() {
+    // Five acceptors, node 0 real. Acceptor 1's promise (and accept) is
+    // delivered twice, the other three stay silent: with node 0's own, that is
+    // two distinct acceptors — not the majority of five an epoch's decision
+    // must rest on.
+    use evento_accord::Message;
+    let net = InMemoryNetwork::new();
+    let members: Vec<NodeId> = (0..5).map(NodeId).collect();
+    let inbox = net.register(NodeId(0));
+    let topology = Arc::new(DynamicTopology::new(NodeId(0), 1, vec![members.clone()]));
+    let node = Node::new(
+        NodeId(0),
+        Arc::clone(&topology) as Arc<dyn Topology>,
+        Arc::new(HybridLogicalClock::new(NodeId(0))),
+        Arc::new(net.sink(NodeId(0))) as Arc<dyn MessageSink>,
+        Arc::new(InMemoryDataStore::new()) as Arc<dyn DataStore>,
+        Arc::new(InMemoryJournal::new()) as Arc<dyn Journal>,
+    )
+    .with_config(NodeConfig {
+        collect_timeout: Duration::from_millis(300),
+        ..NodeConfig::default()
+    });
+    let _loop = node.start(inbox);
+
+    let mut peers = Vec::new();
+    for id in 1..5u64 {
+        let mut inbox = net.register(NodeId(id));
+        let sink = net.sink(NodeId(id));
+        peers.push(tokio::spawn(async move {
+            while let Some(env) = inbox.recv().await {
+                if id != 1 {
+                    continue;
+                }
+                let reply = match env.message {
+                    Message::ConfigPrepare { epoch, ballot } => Message::ConfigPromise {
+                        epoch,
+                        ballot,
+                        accepted_ballot: evento_accord::Ballot(evento_accord::Timestamp::MIN),
+                        accepted_layout: None,
+                    },
+                    Message::ConfigAccept { epoch, ballot, .. } => {
+                        Message::ConfigAccepted { epoch, ballot }
+                    }
+                    _ => continue,
+                };
+                let _ = sink.send(env.from, reply.clone()).await;
+                let _ = sink.send(env.from, reply).await;
+            }
+        }));
+    }
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        node.change_topology(2, vec![members[..3].to_vec()]),
+    )
+    .await
+    .expect("the change gives up in bounded time");
+    assert!(
+        result.is_err(),
+        "two distinct acceptors must not decide an epoch: {result:?}"
+    );
+    assert_eq!(topology.epoch(), 1, "nothing was installed");
+}

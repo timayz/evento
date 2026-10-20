@@ -504,3 +504,78 @@ async fn recovery_preaccepts_at_replicas_that_never_saw_the_transaction() {
         "the original coordinator can no longer gather a vote at node 1"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_duplicated_vote_never_completes_a_preaccept_quorum() {
+    // Five replicas, node 0 real; peer 1's vote is delivered twice — once
+    // inside the fast-path window, once after it — and nobody else votes.
+    // Two distinct voters are not the slow quorum of three, so the write must
+    // never reach Accept.
+    let net = InMemoryNetwork::new();
+    let ids: Vec<NodeId> = (0..5).map(NodeId).collect();
+    let inbox = net.register(NodeId(0));
+    let node = Node::new(
+        NodeId(0),
+        Arc::new(StaticTopology::new(NodeId(0), ids)),
+        Arc::new(HybridLogicalClock::new(NodeId(0))),
+        Arc::new(net.sink(NodeId(0))) as Arc<dyn MessageSink>,
+        Arc::new(InMemoryDataStore::new()) as Arc<dyn DataStore>,
+        Arc::new(InMemoryJournal::new()) as Arc<dyn Journal>,
+    )
+    .with_config(NodeConfig {
+        collect_timeout: Duration::from_millis(300),
+        ..NodeConfig::default()
+    });
+    let _loop = node.start(inbox);
+
+    let accepts = Arc::new(Mutex::new(0usize));
+    let mut peers = Vec::new();
+    for id in 1..5u64 {
+        let mut inbox = net.register(NodeId(id));
+        let sink = net.sink(NodeId(id));
+        let accepts = Arc::clone(&accepts);
+        peers.push(tokio::spawn(async move {
+            while let Some(env) = inbox.recv().await {
+                match env.message {
+                    Message::PreAccept { txn, .. } if id == 1 => {
+                        let vote = Message::PreAcceptOk {
+                            txn,
+                            execute_at: txn.0,
+                            deps: Vec::new(),
+                        };
+                        let _ = sink.send(env.from, vote.clone()).await;
+                        tokio::time::sleep(Duration::from_millis(80)).await;
+                        let _ = sink.send(env.from, vote).await;
+                    }
+                    Message::Accept { txn, ballot, .. } => {
+                        *accepts.lock().unwrap() += 1;
+                        let _ = sink
+                            .send(
+                                env.from,
+                                Message::AcceptOk {
+                                    txn,
+                                    ballot,
+                                    deps: Vec::new(),
+                                },
+                            )
+                            .await;
+                    }
+                    _ => {}
+                }
+            }
+        }));
+    }
+
+    let result = tokio::time::timeout(Duration::from_secs(10), node.write(vec![event("acc", 1)]))
+        .await
+        .expect("the write gives up in bounded time");
+    assert!(
+        result.is_err(),
+        "two distinct voters are not a quorum of five"
+    );
+    assert_eq!(
+        *accepts.lock().unwrap(),
+        0,
+        "the write must never reach Accept on a sub-quorum of votes"
+    );
+}

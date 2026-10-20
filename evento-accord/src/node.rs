@@ -397,7 +397,7 @@ type ConfigState = Arc<Mutex<HashMap<u64, ConfigAcceptor>>>;
 /// Delivers config-Paxos responses to the in-flight epoch change per epoch, so
 /// two concurrent proposals (e.g. a manual change and the sweep's recovery)
 /// cannot steal each other's replies.
-type ConfigInbox = Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<Message>>>>;
+type ConfigInbox = Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<(NodeId, Message)>>>>;
 
 /// The committed metadata log: decided `(epoch, layout)` entries, plus the highest
 /// epoch actually installed into the [`Topology`]. The log is the source of truth
@@ -2004,7 +2004,7 @@ impl Node {
                     .get(&epoch)
                     .cloned();
                 if let Some(tx) = tx {
-                    let _ = tx.send(response);
+                    let _ = tx.send((from, response));
                 }
             }
             // A forwarded read: serve it from the local backend and reply.
@@ -2415,6 +2415,7 @@ impl Node {
                 plans,
                 |p, got| electorate_responders(p, got) >= p.fast_q,
                 Self::after(self.settings.fast_timeout),
+                HashSet::new(),
                 |m| match m {
                     Message::PreAcceptOk {
                         execute_at, deps, ..
@@ -2432,12 +2433,17 @@ impl Node {
                 .iter()
                 .map(|p| (p.shard, p.slow_q.saturating_sub(pre[&p.shard].len())))
                 .collect();
+            // A voter of the first round is not counted again: a duplicated
+            // reply would otherwise complete the quorum with fewer distinct
+            // replicas than it takes.
+            let voted: HashSet<NodeId> = pre.values().flatten().map(|(from, _)| *from).collect();
             let more = self
                 .collect_by_shard_tagged(
                     rx,
                     plans,
                     |p, got| got.len() >= remaining[&p.shard],
                     Self::after(self.settings.collect_timeout),
+                    voted,
                     |m| match m {
                         Message::PreAcceptOk {
                             execute_at, deps, ..
@@ -3635,29 +3641,36 @@ impl Node {
                 self.send(node, Message::ConfigPrepare { epoch, ballot })
                     .await;
             }
-            let mut promises = 0;
+            // One vote per acceptor: a duplicated reply (a frame resent over a
+            // fresh connection) must not complete a quorum of fewer acceptors.
+            let mut promisers: HashSet<NodeId> = HashSet::new();
             let mut nack: Option<Ballot> = None;
             let mut adopted: Option<(Ballot, Vec<Vec<NodeId>>)> = None;
             let deadline = Self::after(self.settings.collect_timeout);
-            while promises < need {
+            while promisers.len() < need {
                 match tokio::time::timeout_at(deadline, rx.recv()).await {
                     // Only promises answering THIS ballot count; a stale reply
                     // from an earlier attempt (or another proposer's round)
                     // must not fill the quorum.
-                    Ok(Some(Message::ConfigPromise {
-                        ballot: b,
-                        accepted_ballot,
-                        accepted_layout,
-                        ..
-                    })) if b == ballot => {
-                        promises += 1;
+                    Ok(Some((
+                        from,
+                        Message::ConfigPromise {
+                            ballot: b,
+                            accepted_ballot,
+                            accepted_layout,
+                            ..
+                        },
+                    ))) if b == ballot => {
+                        if !promisers.insert(from) {
+                            continue;
+                        }
                         if let Some(layout) = accepted_layout {
                             if adopted.as_ref().is_none_or(|(b, _)| accepted_ballot > *b) {
                                 adopted = Some((accepted_ballot, layout));
                             }
                         }
                     }
-                    Ok(Some(Message::ConfigNack { promised, .. })) => {
+                    Ok(Some((_, Message::ConfigNack { promised, .. }))) => {
                         nack = Some(promised);
                         break;
                     }
@@ -3678,7 +3691,7 @@ impl Node {
                 ballot = self.higher_ballot(promised);
                 continue;
             }
-            if promises < need {
+            if promisers.len() < need {
                 self.config_inbox
                     .lock()
                     .expect("config poisoned")
@@ -3700,17 +3713,17 @@ impl Node {
                 )
                 .await;
             }
-            let mut accepts = 0;
+            let mut accepters: HashSet<NodeId> = HashSet::new();
             let mut nack: Option<Ballot> = None;
             let deadline = Self::after(self.settings.collect_timeout);
-            while accepts < need {
+            while accepters.len() < need {
                 match tokio::time::timeout_at(deadline, rx.recv()).await {
                     // Only accepts answering THIS ballot count — a stale accept
                     // from a lower ballot proves nothing about this round.
-                    Ok(Some(Message::ConfigAccepted { ballot: b, .. })) if b == ballot => {
-                        accepts += 1
+                    Ok(Some((from, Message::ConfigAccepted { ballot: b, .. }))) if b == ballot => {
+                        accepters.insert(from);
                     }
-                    Ok(Some(Message::ConfigNack { promised, .. })) => {
+                    Ok(Some((_, Message::ConfigNack { promised, .. }))) => {
                         nack = Some(promised);
                         break;
                     }
@@ -3728,7 +3741,7 @@ impl Node {
                 ballot = self.higher_ballot(promised);
                 continue;
             }
-            if accepts < need {
+            if accepters.len() < need {
                 anyhow::bail!("config accept quorum not reached for epoch {epoch}");
             }
             return Ok(layout);
@@ -4134,18 +4147,20 @@ impl Node {
     /// tagged with its responder, and stops once `done(plan, items)` holds for
     /// every planned shard (or at the deadline). The responder is needed to gate
     /// the fast path on the **electorate** subset of a shard's replicas.
+    /// `seen` holds responders already counted (by an earlier round of the
+    /// same phase): their further replies are ignored.
     async fn collect_by_shard_tagged<T>(
         &self,
         rx: &mut mpsc::UnboundedReceiver<(NodeId, Message)>,
         plans: &[ShardPlan],
         done: impl Fn(&ShardPlan, &[(NodeId, T)]) -> bool,
         deadline: Instant,
+        mut seen: HashSet<NodeId>,
         mut extract: impl FnMut(Message) -> Option<T>,
     ) -> HashMap<ShardId, Vec<(NodeId, T)>> {
         let mut got: HashMap<ShardId, Vec<(NodeId, T)>> =
             plans.iter().map(|p| (p.shard, Vec::new())).collect();
         // One vote per responder (see `collect_tagged`).
-        let mut seen: HashSet<NodeId> = HashSet::new();
 
         loop {
             if plans.iter().all(|p| done(p, &got[&p.shard])) {
