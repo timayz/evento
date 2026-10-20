@@ -13,15 +13,18 @@
 //! [`AccordExecutor`] guards against this via [`Executor::stable_timestamp`]
 //! ([`Node::stable_micros`]): the subscription only processes events whose
 //! timestamp is below the node's stability watermark — the `applied_through` point
-//! that trails `now` by `compaction_margin` and is pinned below any known
-//! un-applied transaction. Below it, everything is applied and nothing lower can
-//! still arrive, **provided propagation + clock skew stays within
-//! `compaction_margin`** — the same bound the node already assumes for compaction.
+//! that trails `now` by `compaction_margin`, is pinned below any known
+//! un-applied transaction, and is clamped to the window anti-entropy has proven
+//! with enough peers (a replica cannot vouch for transactions it never
+//! witnessed). Below it, everything is applied and nothing lower can still
+//! arrive.
 //!
-//! - `subscription_waits_for_a_late_lower_cursor_event` proves the gate: with the
-//!   margin above the link delay, the late event is processed in order, not skipped.
-//! - `skip_returns_when_propagation_exceeds_the_margin` documents the boundary:
-//!   violate the assumption (delay > margin) and the skip reappears.
+//! - `subscription_waits_for_a_late_lower_cursor_event` proves the gate: the late
+//!   event is processed in order, not skipped.
+//! - `a_late_event_is_not_skipped_even_past_the_margin`: propagation slower than
+//!   the margin (a lagging or cut-off replica) no longer releases the earlier
+//!   cursor early — the coverage clamp waits for anti-entropy to prove the
+//!   window.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -89,7 +92,9 @@ struct Cluster {
 }
 
 impl Cluster {
-    fn start(n: u64, compaction_margin: Duration) -> Self {
+    /// Every node runs its sweep: the stability watermark only advances over
+    /// windows anti-entropy has proven. `anti_entropy` paces those rounds.
+    fn start(n: u64, compaction_margin: Duration, anti_entropy: Duration) -> Self {
         let ids: Vec<NodeId> = (0..n).map(NodeId).collect();
         let net = InMemoryNetwork::new();
         let mut execs = Vec::new();
@@ -109,10 +114,12 @@ impl Cluster {
             let node =
                 Node::new(id, topology, clock, sink, datastore, journal).with_config(NodeConfig {
                     compaction_margin,
+                    anti_entropy_interval: anti_entropy,
                     ..Default::default()
                 });
 
             loops.push(node.start(inbox));
+            loops.push(node.start_recovery());
             execs.push(AccordExecutor::new(node, fjall));
         }
 
@@ -145,13 +152,14 @@ impl Cluster {
 async fn run_late_event_scenario(
     margin: Duration,
     link_delay: Duration,
+    anti_entropy: Duration,
 ) -> (
     Cluster,
     evento_core::subscription::Subscription,
     Arc<Mutex<Vec<String>>>,
 ) {
     // Nodes: A = 0 (writes X), B = 1 (writes Y, runs the subscription), C = 2.
-    let cluster = Cluster::start(3, margin);
+    let cluster = Cluster::start(3, margin, anti_entropy);
 
     // Delay ONLY A -> B. A still commits X via the {A, C} quorum, but B does not
     // apply X until ~link_delay later — after B has handled its own Y.
@@ -179,9 +187,9 @@ async fn run_late_event_scenario(
     (cluster, subscription, handled)
 }
 
-/// THE FIX: with the compaction margin above the link delay, the stability
-/// watermark holds B's own event Y back until A's earlier-cursor X has arrived, so
-/// both are processed in cursor order — X is not skipped.
+/// The gate: the stability watermark holds B's own event Y back until A's
+/// earlier-cursor X has arrived, so both are processed in cursor order — X is
+/// not skipped.
 ///
 /// Timings are deliberately generous: a loaded CI runner can oversleep a fixed
 /// sleep by hundreds of milliseconds, so the "X has not arrived yet" check is
@@ -191,7 +199,8 @@ async fn run_late_event_scenario(
 async fn subscription_waits_for_a_late_lower_cursor_event() {
     let margin = Duration::from_secs(3);
     let link_delay = Duration::from_millis(1500); // < margin, >> scheduler jitter
-    let (cluster, subscription, handled) = run_late_event_scenario(margin, link_delay).await;
+    let (cluster, subscription, handled) =
+        run_late_event_scenario(margin, link_delay, Duration::from_millis(250)).await;
 
     // B's own Y is applied locally by the time its `write` returned (the
     // coordinator waits for its own apply); confirm event-driven rather than
@@ -239,37 +248,38 @@ async fn subscription_waits_for_a_late_lower_cursor_event() {
     subscription.shutdown().await.ok();
 }
 
-/// THE BOUNDARY: the watermark is only safe while propagation stays within
-/// `compaction_margin`. Violate it (link delay > margin) and the skip returns —
-/// B handles Y, advances past it, and X (which arrives even later) is skipped.
-/// This documents the assumption rather than a supported configuration.
+/// Past the margin: the link delay (2 s) dwarfs the margin (200 ms), as for a
+/// lagging or partitioned replica. Without the coverage clamp, B releases Y a
+/// margin after it applied it, and X — arriving later still — falls behind the
+/// subscription's cursor and is skipped for good. With it, B releases nothing
+/// past what a sync round has proven, and that round brings X (or X arrives
+/// first): both are handled, in order. Anti-entropy is paced (4 s) so that it
+/// cannot happen to fetch X before a premature release.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn skip_returns_when_propagation_exceeds_the_margin() {
-    // Wide ratio (10x) so the violation holds even when a loaded CI runner
-    // stretches every step: Y is released after ~margin, X arrives after
-    // ~link_delay, and scheduler jitter cannot close that gap.
+async fn a_late_event_is_not_skipped_even_past_the_margin() {
     let margin = Duration::from_millis(200);
-    let link_delay = Duration::from_millis(2000); // >> margin: assumption violated
-    let (cluster, subscription, handled) = run_late_event_scenario(margin, link_delay).await;
+    let link_delay = Duration::from_millis(2000); // >> margin
+    let (cluster, subscription, handled) =
+        run_late_event_scenario(margin, link_delay, Duration::from_secs(4)).await;
 
-    // Wait until X has finally arrived and been applied to B.
-    let deadline = Instant::now() + Duration::from_secs(6);
+    let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        if cluster.count(1, "delayed").await == 1 {
+        if handled.lock().unwrap().len() >= 2 {
             break;
         }
-        assert!(Instant::now() < deadline, "X never reached B");
+        assert!(
+            Instant::now() < deadline,
+            "subscription never caught up; handled = {:?}",
+            *handled.lock().unwrap()
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    // Give the subscription a chance to (not) process the late X.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
+    assert_eq!(cluster.count(1, "delayed").await, 1);
     assert_eq!(cluster.count(1, "local").await, 1);
     assert_eq!(
         *handled.lock().unwrap(),
-        vec!["local".to_string()],
-        "with the margin under the propagation delay, the watermark released Y \
-         early and the late lower-cursor X was skipped"
+        vec!["delayed".to_string(), "local".to_string()],
+        "the late lower-cursor X must be handled, before Y"
     );
 
     subscription.shutdown().await.ok();

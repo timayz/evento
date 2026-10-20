@@ -138,6 +138,12 @@ impl HybridLogicalClock {
         self
     }
 
+    /// The skew bound in force (see [`with_max_skew`](Self::with_max_skew)):
+    /// how far ahead of the wall clock this clock can run.
+    pub fn max_skew_micros(&self) -> u64 {
+        self.max_skew_micros
+    }
+
     /// The current physical time in microseconds, from the injected source.
     fn physical_now(&self) -> u64 {
         (self.physical)()

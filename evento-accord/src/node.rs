@@ -650,12 +650,29 @@ impl Node {
     /// propagation + clock skew stays within `compaction_margin` (the bound the
     /// node already assumes). Exposed to
     /// [`Executor::stable_timestamp`](evento_core::Executor::stable_timestamp).
+    ///
+    /// Like the watermark this node reports for compaction, it is clamped to
+    /// the window anti-entropy has proven with enough shard peers
+    /// ([`quorum_sync_coverage`](Self::quorum_sync_coverage)): a replica cut off
+    /// from the transactions its peers commit (a partition, a lossy link)
+    /// cannot vouch for them, and its subscriptions would advance past events
+    /// still on their way to it, skipping them for good. Until a sync round
+    /// re-proves the window — after a start, a restart or a heal — its
+    /// subscriptions wait. The clamp leaves room for the clock skew bound,
+    /// since an event is stamped before its transaction's `t0` is drawn.
     pub fn stable_micros(&self) -> u64 {
         let cutoff = self.margin_cutoff();
-        self.replica
+        let local = self
+            .replica
             .lock()
             .expect("replica poisoned")
-            .stable_event_micros(cutoff)
+            .stable_event_micros(cutoff);
+        match self.quorum_sync_coverage(&self.shard_peers()) {
+            Some(coverage) => {
+                local.min(coverage.micros.saturating_sub(self.clock.max_skew_micros()))
+            }
+            None => local,
+        }
     }
 
     /// The present lagged by [`compaction_margin`](NodeConfig::compaction_margin):
