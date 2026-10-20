@@ -8,7 +8,7 @@
 //! version read that failed says nothing about the condition: answering
 //! "holds" would let a stale write commit.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,6 +24,8 @@ use evento_core::Event;
 struct FaultStore {
     inner: InMemoryDataStore,
     apply_failing: AtomicBool,
+    /// Fails this many applies, then works again.
+    applies_to_fail: AtomicUsize,
     version_failing: AtomicBool,
 }
 
@@ -49,7 +51,12 @@ impl DataStore for FaultStore {
         events: Vec<Event>,
         commit: bool,
     ) -> anyhow::Result<()> {
-        if self.apply_failing.load(Ordering::SeqCst) {
+        if self.apply_failing.load(Ordering::SeqCst)
+            || self
+                .applies_to_fail
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+        {
             anyhow::bail!("simulated write failure");
         }
         self.inner.apply(txn, execute_at, events, commit).await
@@ -63,6 +70,7 @@ impl DataStore for FaultStore {
 struct Cluster {
     nodes: Vec<Node>,
     stores: Vec<Arc<FaultStore>>,
+    net: Arc<InMemoryNetwork>,
     _loops: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -91,6 +99,7 @@ fn start(n: u64, config: NodeConfig) -> Cluster {
     Cluster {
         nodes,
         stores,
+        net,
         _loops: loops,
     }
 }
@@ -196,4 +205,39 @@ async fn a_version_read_the_store_failed_is_not_a_vote() {
         "a stale write must lose the version condition"
     );
     assert!(cluster.nodes[0].metrics().execution_failures > 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn anti_entropy_stops_at_an_import_the_store_failed() {
+    // Node 2 misses two writes to one aggregate while partitioned, then
+    // repairs by anti-entropy — and its store fails the first import. The
+    // second must not land ahead of the first: the store would hold version 2
+    // without version 1, and a subscription could pass the first event's
+    // cursor before its retry arrives.
+    let config = NodeConfig {
+        anti_entropy_interval: Duration::from_millis(200),
+        ..NodeConfig::default()
+    };
+    let cluster = start(3, config);
+    for peer in [NodeId(0), NodeId(1)] {
+        cluster.net.partition(NodeId(2), peer);
+    }
+    let first = cluster.nodes[0].write(vec![event("acc", 1)]).await.unwrap();
+    let second = cluster.nodes[0].write(vec![event("acc", 2)]).await.unwrap();
+    assert!(eventually(|| cluster.stores[1].applied() == vec![first.txn, second.txn]).await);
+
+    cluster.stores[2].applies_to_fail.store(1, Ordering::SeqCst);
+    cluster.net.heal_all_partitions();
+    for _ in 0..6 {
+        cluster.nodes[2].sweep().await;
+        tokio::time::sleep(Duration::from_millis(210)).await;
+        if cluster.stores[2].applied().len() == 2 {
+            break;
+        }
+    }
+    assert_eq!(
+        cluster.stores[2].applied(),
+        vec![first.txn, second.txn],
+        "imports land in execution order, the failed one first on retry"
+    );
 }

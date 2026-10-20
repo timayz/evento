@@ -3454,7 +3454,9 @@ impl Node {
             //
             // On bootstrap the snapshot already materialised these events. A
             // failed apply leaves the command un-imported so the next
-            // anti-entropy round ships it again.
+            // anti-entropy round ships it again — and ends this round: the
+            // commands arrive in execution order, and one applied past a gap
+            // would put a later version in the store ahead of an earlier one.
             if !want_snapshot
                 && self
                     .datastore
@@ -3463,7 +3465,7 @@ impl Node {
                     .is_err()
             {
                 apply_failed = true;
-                continue;
+                break;
             }
             let inserted = self
                 .replica
