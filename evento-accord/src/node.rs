@@ -440,9 +440,15 @@ pub struct Node {
     /// epoch order (drives [`Topology::install`]).
     meta_log: MetaLog,
     /// Monotonic correlation-id source, shared by forwarded reads, sync
-    /// requests, and the anti-entropy/metadata peer rotation (each consumer
-    /// only needs unique — not gap-free — values).
+    /// requests and snapshot pages (each consumer only needs unique — not
+    /// gap-free — values).
     correlation_seq: Arc<AtomicU64>,
+    /// The anti-entropy and metadata catch-up rounds' turns, each picking the
+    /// next peer. Counters of their own: drawn from `correlation_seq`, a turn
+    /// advanced with every other id drawn in between — the sync round's own
+    /// among them — so a rotation could keep landing on the same peer.
+    anti_entropy_turn: Arc<AtomicU64>,
+    metadata_turn: Arc<AtomicU64>,
     /// Channels awaiting forwarded-read replies, by correlation id.
     read_pending: Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<Message>>>>,
     /// Channels awaiting snapshot pages ([`Message::SnapshotPage`]) during a
@@ -526,6 +532,8 @@ impl Node {
                 installed_epoch: start_epoch,
             })),
             correlation_seq: Arc::new(AtomicU64::new(0)),
+            anti_entropy_turn: Arc::new(AtomicU64::new(0)),
+            metadata_turn: Arc::new(AtomicU64::new(0)),
             read_pending: Arc::new(Mutex::new(HashMap::new())),
             snapshot_pending: Arc::new(Mutex::new(HashMap::new())),
             peer_watermarks: Arc::new(Mutex::new(HashMap::new())),
@@ -1057,7 +1065,7 @@ impl Node {
             .filter(|&n| n != self.id)
             .collect();
         if !peers.is_empty() {
-            let next = self.correlation_seq.fetch_add(1, Ordering::Relaxed) as usize;
+            let next = self.metadata_turn.fetch_add(1, Ordering::Relaxed) as usize;
             let peer = peers[next % peers.len()];
             self.send(
                 peer,
@@ -1115,7 +1123,7 @@ impl Node {
         if peers.is_empty() {
             return;
         }
-        let next = self.correlation_seq.fetch_add(1, Ordering::Relaxed) as usize;
+        let next = self.anti_entropy_turn.fetch_add(1, Ordering::Relaxed) as usize;
         let peer = peers[next % peers.len()];
         // The digest lets the peer answer with only the commands this node is
         // missing, instead of its full applied set every round.
