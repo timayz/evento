@@ -398,6 +398,52 @@ async fn a_write_another_node_recovered_reports_its_outcome_not_a_failure() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_dropped_mid_flight_leaves_nothing_pinned() {
+    // A caller gives up on a write while it waits for a quorum (an HTTP client
+    // hung up, a timeout fired). The transaction still exists — node 0
+    // pre-accepted it — so the cluster must finish it and compact it away, as
+    // for any coordinator that vanished; nothing of the abandoned coordination
+    // may keep pinning node 0's watermark or hide the transaction from its
+    // own recovery sweep.
+    let config = NodeConfig {
+        recovery_timeout: Duration::from_millis(300),
+        compaction_margin: Duration::from_millis(200),
+        anti_entropy_interval: Duration::from_millis(50),
+        ..NodeConfig::default()
+    };
+    let cluster = Cluster::start_with(3, config);
+    let _sweeps: Vec<_> = cluster.nodes.iter().map(Node::start_recovery).collect();
+    for peer in [NodeId(1), NodeId(2)] {
+        cluster.net.partition(NodeId(0), peer);
+    }
+    let abandoned = tokio::time::timeout(
+        Duration::from_millis(100),
+        cluster.nodes[0].write(vec![event("acc", 1, "Opened")]),
+    )
+    .await;
+    assert!(
+        abandoned.is_err(),
+        "the write was still waiting for a quorum"
+    );
+    cluster.net.heal_all_partitions();
+
+    for _ in 0..1000 {
+        if cluster.nodes.iter().all(|n| n.command_count() == 0) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let counts: Vec<usize> = cluster.nodes.iter().map(|n| n.command_count()).collect();
+    assert_eq!(
+        counts,
+        vec![0, 0, 0],
+        "the abandoned transaction must be finished and compacted everywhere"
+    );
+    assert!(!cluster.nodes[0].sweep_pressure().busy);
+    cluster.assert_identical_order(1).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_write_no_quorum_ever_saw_still_fails() {
     // Settling a failed write must not turn a real failure into a success:
     // with both peers down nobody can decide the transaction, and the write

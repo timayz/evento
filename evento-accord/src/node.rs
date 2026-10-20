@@ -285,6 +285,23 @@ enum Screen {
     Reply(Message),
 }
 
+/// Ends a write's coordination when dropped (see [`Node::write`]).
+struct Coordinating<'a> {
+    node: &'a Node,
+    txn: TxnId,
+}
+
+impl Drop for Coordinating<'_> {
+    fn drop(&mut self) {
+        self.node.deregister(self.txn);
+        self.node
+            .coordinating
+            .lock()
+            .expect("coordinating poisoned")
+            .remove(&self.txn);
+    }
+}
+
 /// The result of a coordinated (or recovered) write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommitOutcome {
@@ -2217,18 +2234,18 @@ impl Node {
             .lock()
             .expect("coordinating poisoned")
             .insert(txn);
-        let coordinated = match self.coordinate(txn, &keys, &events).await {
+        // Released however this ends — returned, or dropped mid-flight by a
+        // caller that gave up (a hung-up client, a timeout): left behind, the
+        // entry would pin this node's watermark report, and the response
+        // channel would hide the transaction from its own recovery sweep.
+        let _coordinating = Coordinating { node: self, txn };
+        let (outcome, all_fast) = match self.coordinate(txn, &keys, &events).await {
             Ok(done) => Ok(done),
             Err(err) => self
                 .settle(txn, err, &keys, &events)
                 .await
                 .map(|outcome| (outcome, false)),
-        };
-        self.coordinating
-            .lock()
-            .expect("coordinating poisoned")
-            .remove(&txn);
-        let (outcome, all_fast) = coordinated?;
+        }?;
         self.metrics.record_outcome(outcome.conflict, all_fast);
         tracing::debug!(
             node = self.id.0,
