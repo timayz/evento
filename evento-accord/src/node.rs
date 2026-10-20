@@ -819,13 +819,20 @@ impl Node {
         }
         // Replay the retained (post-truncation) applied tail into the data store.
         // The truncated prefix is not in the journal; a durable data store already
-        // holds it, and re-applying the tail is idempotent.
+        // holds it, and re-applying the tail is idempotent. A replay the store
+        // fails fails the restart: the journal says these are applied, so a node
+        // starting without them would never apply them again.
         for cmd in &commands {
             if cmd.status == Status::Applied && cmd.applied_conflict == Some(false) {
-                let _ = self
-                    .datastore
+                self.datastore
                     .apply(cmd.txn, cmd.execute_at, cmd.events.clone(), true)
-                    .await;
+                    .await
+                    .map_err(|err| {
+                        err.context(format!(
+                            "replaying applied transaction {:?} into the data store",
+                            cmd.txn
+                        ))
+                    })?;
             }
         }
         Ok(())
@@ -954,6 +961,7 @@ impl Node {
         };
         let grace = micros_ago(self.settings.recovery_interval);
         let timeout = micros_ago(self.settings.recovery_timeout);
+        self.redrive().await;
 
         let candidates = self.replica.lock().expect("replica poisoned").stuck(grace);
         for txn in candidates {
@@ -994,6 +1002,30 @@ impl Node {
         self.anti_entropy().await;
         self.advance_watermark().await;
         self.metadata_sweep().await;
+    }
+
+    /// Retries local execution the inbox loop left behind: an apply or a read
+    /// the data store failed is only attempted again by the next drive, and a
+    /// quiet group may receive no message to trigger one. Like
+    /// [`handle`](Self::handle), the acknowledgements wait for the journal.
+    /// (`next_apply`/`next_read` reserve what they hand out, so this cannot
+    /// race the inbox loop into executing anything twice.)
+    async fn redrive(&self) {
+        let sends = self.drive_staged().await;
+        if sends.is_empty() {
+            return;
+        }
+        if self.journal.flush().await.is_ok() {
+            self.metrics.record_flush();
+            for (to, message) in sends {
+                self.send(to, message).await;
+            }
+        } else {
+            tracing::warn!(
+                node = self.id.0,
+                "journal flush failed; withholding durability-gated sends"
+            );
+        }
     }
 
     /// Control-plane sweep: converge the metadata log without operator action.
@@ -1978,10 +2010,29 @@ impl Node {
             // Prefer enacting a decided, ready transaction.
             let apply = self.replica.lock().expect("replica poisoned").next_apply();
             if let Some(apply) = apply {
-                let _ = self
+                if let Err(err) = self
                     .datastore
                     .apply(apply.txn, apply.execute_at, apply.events, apply.commit)
-                    .await;
+                    .await
+                {
+                    // Never mark (or acknowledge) what the store did not take:
+                    // `Applied` is the promise that the effect is visible, and
+                    // anti-entropy never ships an applied command again. Hand
+                    // the transaction back and stop; the next drive (a message,
+                    // or the sweep) retries it.
+                    self.replica
+                        .lock()
+                        .expect("replica poisoned")
+                        .release_apply(apply.txn);
+                    self.metrics.record_execution_failure();
+                    tracing::warn!(
+                        node = self.id.0,
+                        txn = ?apply.txn,
+                        %err,
+                        "cannot apply a decided transaction; retrying"
+                    );
+                    break;
+                }
                 self.replica
                     .lock()
                     .expect("replica poisoned")
@@ -1997,7 +2048,25 @@ impl Node {
             // Otherwise read the next ready, undecided transaction.
             let read = self.replica.lock().expect("replica poisoned").next_read();
             let Some(read) = read else { break };
-            let ok = self.read_condition(&read.events).await;
+            let ok = match self.read_condition(&read.events).await {
+                Ok(ok) => ok,
+                Err(err) => {
+                    // A read that failed says nothing about the condition:
+                    // answer nothing, and read it again on the next drive.
+                    self.replica
+                        .lock()
+                        .expect("replica poisoned")
+                        .unread(read.txn);
+                    self.metrics.record_execution_failure();
+                    tracing::warn!(
+                        node = self.id.0,
+                        txn = ?read.txn,
+                        %err,
+                        "cannot read a transaction's version condition; retrying"
+                    );
+                    break;
+                }
+            };
             // Record the result, and answer whoever drives the commit *now*: a
             // recovery's Commit may have taken the transaction over while the
             // read was in flight.
@@ -2013,18 +2082,18 @@ impl Node {
 
     /// Whether every owned event extends its aggregate (version strictly greater
     /// than what is stored) — this node's part of the atomic commit condition.
-    async fn read_condition(&self, owned_events: &[Event]) -> bool {
+    /// An error is not a vote either way.
+    async fn read_condition(&self, owned_events: &[Event]) -> anyhow::Result<bool> {
         for event in owned_events {
             let current = self
                 .datastore
                 .version(&event.aggregate_type, &event.aggregate_id)
-                .await
-                .unwrap_or(0);
+                .await?;
             if event.version <= current {
-                return false;
+                return Ok(false);
             }
         }
-        true
+        Ok(true)
     }
 
     /// Stages the current durable state of `txn` to the journal — durable once the

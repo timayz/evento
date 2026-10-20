@@ -49,6 +49,11 @@ pub struct Metrics {
     /// installed: the store holds a prefix no contact can complete, so it
     /// must be emptied before the next join.
     pub joins_partial: AtomicU64,
+    /// Decided-transaction applies and commit-condition reads the data store
+    /// failed. The transaction is neither marked nor acknowledged; it is
+    /// retried on the next drive, so a persistent count means a store that
+    /// cannot take writes.
+    pub execution_failures: AtomicU64,
 }
 
 impl Metrics {
@@ -128,6 +133,11 @@ impl Metrics {
         self.joins_partial.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records a data-store apply or commit-condition read that failed.
+    pub fn record_execution_failure(&self) {
+        self.execution_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// A consistent-enough point-in-time view of all counters.
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
@@ -146,6 +156,7 @@ impl Metrics {
             rejoins_required: self.rejoins_required.load(Ordering::Relaxed),
             snapshot_pages: self.snapshot_pages.load(Ordering::Relaxed),
             joins_partial: self.joins_partial.load(Ordering::Relaxed),
+            execution_failures: self.execution_failures.load(Ordering::Relaxed),
         }
     }
 }
@@ -170,6 +181,7 @@ pub struct MetricsSnapshot {
     pub rejoins_required: u64,
     pub snapshot_pages: u64,
     pub joins_partial: u64,
+    pub execution_failures: u64,
 }
 
 impl MetricsSnapshot {
@@ -177,7 +189,7 @@ impl MetricsSnapshot {
     /// source of truth for both [`to_prometheus`](Self::to_prometheus) and
     /// [`to_prometheus_labeled`](Self::to_prometheus_labeled); add a counter here and
     /// both renderings pick it up.
-    fn counters(&self) -> [(&'static str, &'static str, u64); 15] {
+    fn counters(&self) -> [(&'static str, &'static str, u64); 16] {
         [
             (
                 "accord_writes_committed_total",
@@ -253,6 +265,11 @@ impl MetricsSnapshot {
                 "accord_joins_partial_total",
                 "Joins that failed after part of the snapshot was installed (empty the store before retrying).",
                 self.joins_partial,
+            ),
+            (
+                "accord_execution_failures_total",
+                "Decided-transaction applies and commit-condition reads the data store failed (retried, never acknowledged).",
+                self.execution_failures,
             ),
         ]
     }

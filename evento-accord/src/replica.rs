@@ -711,6 +711,25 @@ impl Replica {
         })
     }
 
+    /// Hands back an apply reserved by [`next_apply`](Replica::next_apply) that
+    /// the data store failed: the command stays decided and un-applied, to be
+    /// handed out again on the next drive.
+    pub fn release_apply(&mut self, txn: TxnId) {
+        self.applying.remove(&txn);
+    }
+
+    /// Hands back a read taken by [`next_read`](Replica::next_read) that the
+    /// data store failed: the command returns to `Committed`, to be read again
+    /// on the next drive, rather than holding its slot with nothing to answer.
+    pub fn unread(&mut self, txn: TxnId) {
+        if let Some(cmd) = self.commands.get_mut(&txn) {
+            if cmd.status == Status::Reading {
+                cmd.status = Status::Committed;
+            }
+        }
+        self.read_results.remove(&txn);
+    }
+
     /// Records that a transaction's decision has been enacted, storing its
     /// conflict outcome and unblocking dependents.
     pub fn mark_applied(&mut self, txn: TxnId, conflict: bool) {
