@@ -24,7 +24,8 @@ fn event(aggregate_id: &str, version: u16) -> Event {
     }
 }
 
-/// What a scripted replica answers a recovery with.
+/// What a scripted replica answers a recovery with (it plays a replica that
+/// ignores the keys a `BeginRecovery` carries).
 #[derive(Clone)]
 struct Report {
     known: bool,
@@ -57,9 +58,9 @@ impl Scripted {
             while let Some(env) = inbox.recv().await {
                 log.lock().unwrap().push(env.message.clone());
                 let reply = match env.message {
-                    Message::Recover { txn, ballot } => {
+                    Message::BeginRecovery { txn, ballot, .. } => {
                         tokio::time::sleep(report.delay).await;
-                        Some(Message::RecoverOk {
+                        Some(Message::BeginRecoveryOk {
                             txn,
                             ballot,
                             known: report.known,
@@ -68,6 +69,7 @@ impl Scripted {
                             execute_at: report.execute_at,
                             deps: Vec::new(),
                             superseding_rejects: false,
+                            wait: false,
                             keys: if report.known {
                                 keys.clone()
                             } else {
@@ -266,4 +268,239 @@ async fn recovery_adopts_the_accepted_value_not_a_preaccept_vote() {
     let applied = s.store.applied_log();
     assert_eq!(applied.len(), 1);
     assert_eq!(applied[0].execute_at, at);
+}
+
+/// A real replica (node 0 of `{0, 1, 2}`) with a kept journal, plus the inboxes
+/// of an outside coordinator (node 9) and recoverer (node 8) the test plays.
+struct Fence {
+    net: Arc<InMemoryNetwork>,
+    journal: Arc<InMemoryJournal>,
+    node: Node,
+    task: tokio::task::JoinHandle<()>,
+    coordinator: mpsc::Receiver<Envelope>,
+    recoverer: mpsc::Receiver<Envelope>,
+    txn: TxnId,
+    keys: Vec<Key>,
+    events: Vec<Event>,
+}
+
+fn replica(net: &Arc<InMemoryNetwork>, journal: &Arc<InMemoryJournal>) -> Node {
+    let ids = vec![NodeId(0), NodeId(1), NodeId(2)];
+    Node::new(
+        NodeId(0),
+        Arc::new(StaticTopology::new(NodeId(0), ids)),
+        Arc::new(HybridLogicalClock::new(NodeId(0))),
+        Arc::new(net.sink(NodeId(0))) as Arc<dyn MessageSink>,
+        Arc::new(InMemoryDataStore::new()) as Arc<dyn DataStore>,
+        Arc::clone(journal) as Arc<dyn Journal>,
+    )
+}
+
+fn fence() -> Fence {
+    let net = InMemoryNetwork::new();
+    let journal = Arc::new(InMemoryJournal::new());
+    let inbox = net.register(NodeId(0));
+    let node = replica(&net, &journal);
+    let task = node.start(inbox);
+    let micros = HybridLogicalClock::new(NodeId(9)).now().micros;
+    Fence {
+        coordinator: net.register(NodeId(9)),
+        recoverer: net.register(NodeId(8)),
+        net,
+        journal,
+        node,
+        task,
+        txn: TxnId(Timestamp {
+            micros,
+            logical: 0,
+            node: NodeId(9),
+        }),
+        keys: vec![Key("acc".into())],
+        events: vec![event("acc", 1)],
+    }
+}
+
+impl Fence {
+    /// A ballot above the transaction's, owned by the recoverer.
+    fn ballot(&self) -> Ballot {
+        Ballot(Timestamp {
+            micros: self.txn.0.micros + 1_000,
+            logical: 0,
+            node: NodeId(8),
+        })
+    }
+
+    async fn send(&self, from: u64, message: Message) {
+        self.net
+            .sink(NodeId(from))
+            .send(NodeId(0), message)
+            .await
+            .unwrap();
+    }
+
+    fn preaccept(&self) -> Message {
+        Message::PreAccept {
+            txn: self.txn,
+            keys: self.keys.clone(),
+            events: self.events.clone(),
+        }
+    }
+
+    fn accept(&self) -> Message {
+        Message::Accept {
+            txn: self.txn,
+            ballot: Ballot(self.txn.0),
+            execute_at: self.txn.0,
+            deps: Vec::new(),
+            keys: self.keys.clone(),
+        }
+    }
+}
+
+async fn next(inbox: &mut mpsc::Receiver<Envelope>) -> Message {
+    tokio::time::timeout(Duration::from_secs(5), inbox.recv())
+        .await
+        .expect("an answer")
+        .expect("inbox open")
+        .message
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replica_that_answered_a_recovery_blind_refuses_the_original_coordinator() {
+    let mut f = fence();
+    // The recovery reaches node 0 before the original coordinator's PreAccept.
+    let b = f.ballot();
+    f.send(
+        8,
+        Message::Recover {
+            txn: f.txn,
+            ballot: b,
+        },
+    )
+    .await;
+    assert!(matches!(
+        next(&mut f.recoverer).await,
+        Message::RecoverOk { known: false, .. }
+    ));
+
+    // The coordinator, merely slow, must win neither a vote nor an Accept
+    // here: the recovery decided without them.
+    f.send(9, f.preaccept()).await;
+    assert!(
+        matches!(next(&mut f.coordinator).await, Message::Nack { promised, .. } if promised == b),
+        "a late PreAccept below the recovery's promise is refused"
+    );
+    f.send(9, f.accept()).await;
+    assert!(
+        matches!(next(&mut f.coordinator).await, Message::Nack { promised, .. } if promised == b),
+        "and so is a late Accept"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recovery_promise_survives_a_restart() {
+    let mut f = fence();
+    f.send(9, f.preaccept()).await;
+    assert!(matches!(
+        next(&mut f.coordinator).await,
+        Message::PreAcceptOk { .. }
+    ));
+    let b = f.ballot();
+    f.send(
+        8,
+        Message::Recover {
+            txn: f.txn,
+            ballot: b,
+        },
+    )
+    .await;
+    assert!(matches!(
+        next(&mut f.recoverer).await,
+        Message::RecoverOk { known: true, .. }
+    ));
+
+    // Restart node 0 from its journal.
+    f.task.abort();
+    let inbox = f.net.register(NodeId(0));
+    f.node = replica(&f.net, &f.journal);
+    f.node.recover_state().await.unwrap();
+    f.task = f.node.start(inbox);
+
+    f.send(9, f.accept()).await;
+    assert!(
+        matches!(next(&mut f.coordinator).await, Message::Nack { promised, .. } if promised == b),
+        "the promise was durable before the reply revealed it"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recovery_preaccepts_at_replicas_that_never_saw_the_transaction() {
+    // Three real nodes; the outside coordinator's PreAccept reached node 0
+    // only. Recovery hands the transaction to the other two, which vote on it
+    // under the recovery's ballot — so the coordinator's late PreAccept to
+    // them is refused.
+    let net = InMemoryNetwork::new();
+    let ids = vec![NodeId(0), NodeId(1), NodeId(2)];
+    let mut nodes = Vec::new();
+    let mut stores = Vec::new();
+    let mut loops = Vec::new();
+    for &id in &ids {
+        let inbox = net.register(id);
+        let store = Arc::new(InMemoryDataStore::new());
+        let node = Node::new(
+            id,
+            Arc::new(StaticTopology::new(id, ids.clone())),
+            Arc::new(HybridLogicalClock::new(id)),
+            Arc::new(net.sink(id)) as Arc<dyn MessageSink>,
+            Arc::clone(&store) as Arc<dyn DataStore>,
+            Arc::new(InMemoryJournal::new()) as Arc<dyn Journal>,
+        );
+        loops.push(node.start(inbox));
+        nodes.push(node);
+        stores.push(store);
+    }
+    let mut coordinator = net.register(NodeId(9));
+    let micros = HybridLogicalClock::new(NodeId(9)).now().micros;
+    let txn = TxnId(Timestamp {
+        micros,
+        logical: 0,
+        node: NodeId(9),
+    });
+    let preaccept = Message::PreAccept {
+        txn,
+        keys: vec![Key("acc".into())],
+        events: vec![event("acc", 1)],
+    };
+    net.sink(NodeId(9))
+        .send(NodeId(0), preaccept.clone())
+        .await
+        .unwrap();
+    assert!(matches!(
+        next(&mut coordinator).await,
+        Message::PreAcceptOk { .. }
+    ));
+
+    let outcome = tokio::time::timeout(Duration::from_secs(5), nodes[0].recover(txn))
+        .await
+        .expect("recovery completes")
+        .expect("recovered");
+    assert!(!outcome.conflict);
+    for store in &stores {
+        for _ in 0..1000 {
+            if !store.applied_log().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(store.applied_log().len(), 1, "every replica applied it");
+    }
+
+    net.sink(NodeId(9))
+        .send(NodeId(1), preaccept)
+        .await
+        .unwrap();
+    assert!(
+        matches!(next(&mut coordinator).await, Message::Nack { .. }),
+        "the original coordinator can no longer gather a vote at node 1"
+    );
 }
