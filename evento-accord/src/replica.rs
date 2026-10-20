@@ -404,8 +404,17 @@ impl Replica {
     }
 
     /// Handles Accept under `ballot`: adopts the coordinator's execution
-    /// timestamp and dependency set. Returns the replica's dependencies, or
-    /// `Err(promised)` if it has already promised a higher ballot.
+    /// timestamp, and returns the dependencies this replica witnesses **at
+    /// that timestamp** — the coordinator's set plus every conflict here with
+    /// a lower `t0` — or `Err(promised)` if it has already promised a higher
+    /// ballot.
+    ///
+    /// The slow path raises `execute_at` above `t0`, so a conflict that arrived
+    /// after this transaction's PreAccept, with a `t0` in between, now orders
+    /// before it. It must become a dependency: it may already have committed
+    /// at its own `t0` on the fast path, and nothing else would make this
+    /// transaction wait for it. The coordinator unions these replies into the
+    /// committed dependency set.
     pub fn accept(
         &mut self,
         txn: TxnId,
@@ -431,10 +440,7 @@ impl Replica {
             cmd.accepted = ballot;
             cmd.status = Status::Accepted;
             cmd.execute_at = execute_at;
-            cmd.deps = deps;
-            let deps = cmd.deps.clone();
             self.index_keys(txn, &keys);
-            Ok(deps)
         } else {
             // The replica missed PreAccept; record what it was told — including
             // the keys, so the conflict index and recovery's superseding check
@@ -445,15 +451,33 @@ impl Replica {
                 promised: ballot,
                 accepted: ballot,
                 execute_at,
-                deps: deps.clone(),
+                deps: Vec::new(),
                 keys,
                 events: Vec::new(),
                 reply_to: txn.0.node,
                 decision: None,
                 applied_conflict: None,
             });
-            Ok(deps)
         }
+        let deps = self.deps_at(txn, execute_at, deps);
+        if let Some(cmd) = self.commands.get_mut(&txn) {
+            cmd.deps = deps.clone();
+        }
+        Ok(deps)
+    }
+
+    /// `known` plus every transaction conflicting with `txn` here whose `t0`
+    /// is below `execute_at` — the dependencies `txn` has at that timestamp.
+    fn deps_at(&self, txn: TxnId, execute_at: Timestamp, known: Vec<TxnId>) -> Vec<TxnId> {
+        let mut deps: BTreeSet<TxnId> = known.into_iter().collect();
+        if let Some(cmd) = self.commands.get(&txn) {
+            deps.extend(
+                self.conflicts(&cmd.keys, txn)
+                    .into_iter()
+                    .filter(|c| c.0 < execute_at),
+            );
+        }
+        deps.into_iter().collect()
     }
 
     /// Handles Commit: finalises the execution timestamp, dependencies, events,
@@ -1094,6 +1118,62 @@ mod tests {
             "a second driver must not receive the same in-flight apply"
         );
         replica.mark_applied(a, false);
+    }
+
+    /// The slow-path dependency hazard: X (t0 = 10) is raised to execute at 31
+    /// after T (t0 = 20) was witnessed here at its own t0 — T may have
+    /// fast-committed there. X's Accept must name T, or X never waits for T and
+    /// both read the same state.
+    #[test]
+    fn accept_reports_conflicts_below_the_raised_timestamp() {
+        let mut replica = Replica::new();
+        let key = Key("k".into());
+        let x = txn(10);
+        let t = txn(20);
+        replica.preaccept(x, vec![key.clone()], vec![event("k", 1)]);
+        let (t_at, t_deps) = replica.preaccept(t, vec![key.clone()], vec![event("k", 1)]);
+        assert_eq!((t_at, t_deps), (t.0, vec![x]), "T stands at its own t0");
+
+        let raised = txn(31).0;
+        let deps = replica
+            .accept(x, Ballot(x.0), raised, vec![], vec![key.clone()])
+            .expect("accepted");
+        assert_eq!(
+            deps,
+            vec![t],
+            "X now orders after T, so T is its dependency"
+        );
+
+        // Committed as agreed, T (at 20) executes first and X waits for it.
+        replica.commit(t, t.0, vec![x], vec![event("k", 1)], vec![], NodeId(0));
+        replica.commit(x, raised, deps, vec![event("k", 1)], vec![], NodeId(0));
+        assert_eq!(replica.next_read().expect("T is ready").txn, t);
+        assert!(replica.next_read().is_none(), "X waits for T to apply");
+        replica.record_decision(t, true);
+        assert_eq!(replica.next_apply().expect("T decided").txn, t);
+        replica.mark_applied(t, false);
+        assert_eq!(replica.next_read().expect("X is ready now").txn, x);
+    }
+
+    /// The same for a replica that missed X's PreAccept and learns it by Accept.
+    #[test]
+    fn accept_without_preaccept_reports_conflicts_below_its_timestamp() {
+        let mut replica = Replica::new();
+        let key = Key("k".into());
+        let x = txn(10);
+        let t = txn(20);
+        let later = txn(40);
+        replica.preaccept(t, vec![key.clone()], vec![event("k", 1)]);
+        replica.preaccept(later, vec![key.clone()], vec![event("k", 1)]);
+
+        let deps = replica
+            .accept(x, Ballot(x.0), txn(31).0, vec![], vec![key.clone()])
+            .expect("accepted");
+        assert_eq!(
+            deps,
+            vec![t],
+            "T orders before X's 31; the t0 = 40 one after"
+        );
     }
 
     /// A read is taken once: its result stays answerable while the command holds
