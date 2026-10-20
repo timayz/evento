@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use evento_accord::{
     AppliedEntry, DataStore, HybridLogicalClock, InMemoryDataStore, InMemoryJournal,
-    InMemoryNetwork, Journal, MessageSink, Node, NodeConfig, NodeId, StaticTopology, TxnId,
+    InMemoryNetwork, Journal, MessageSink, Node, NodeConfig, NodeId, StaticTopology, Status, TxnId,
 };
 use evento_core::Event;
 
@@ -286,6 +286,48 @@ async fn recovers_a_transaction_whose_coordinator_crashed() {
     let order = cluster.assert_order_among(&[1, 2], 1).await;
     assert_eq!(order[0].0, txn);
     assert!(!order[0].1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recovers_a_transaction_whose_coordinator_crashed_after_commit() {
+    // Node 0 commits a write, then "crashes" before it collects a single read
+    // or sends the decision. Every replica reads, reports to a coordinator that
+    // is no longer listening, and holds its slot. A recovery must still get
+    // those reads: the replicas never read twice.
+    let config = NodeConfig {
+        collect_timeout: Duration::from_millis(1000),
+        ..NodeConfig::default()
+    };
+    let cluster = Cluster::start_with(3, config);
+
+    let txn = cluster.nodes[0]
+        .coordinate_through_commit(vec![event("acc", 1, "Opened")])
+        .await
+        .expect("committed on a quorum");
+    // Wait until the survivors have read it (and so will not read it again).
+    for _ in 0..1000 {
+        if [1, 2]
+            .iter()
+            .all(|&i| cluster.nodes[i].command_status(txn) == Some(Status::Reading))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    for i in [1, 2] {
+        assert_eq!(cluster.nodes[i].command_status(txn), Some(Status::Reading));
+    }
+    cluster.net.crash(NodeId(0));
+
+    let outcome = tokio::time::timeout(Duration::from_secs(5), cluster.nodes[1].recover(txn))
+        .await
+        .expect("recovery timed out")
+        .expect("recovery must decide a transaction every replica already read");
+    assert_eq!(outcome.txn, txn);
+    assert!(!outcome.conflict, "the lone write must take effect");
+
+    let order = cluster.assert_order_among(&[1, 2], 1).await;
+    assert_eq!(order[0], (txn, false));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

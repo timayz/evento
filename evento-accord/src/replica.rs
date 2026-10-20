@@ -72,6 +72,13 @@ pub struct Replica {
     /// Applied (un-compacted) txns in `t0` order, serving the anti-entropy
     /// digest and missing-command export without a full command scan.
     applied_by_t0: BTreeSet<TxnId>,
+    /// The version-condition result of every [`Reading`](Status::Reading)
+    /// command, so a Commit from a recovery coordinator that took over is
+    /// answered with it: the read happens once, and its result stands while
+    /// the command holds its slot. In memory only — a restart turns `Reading`
+    /// back into `Committed` (see [`restore`](Replica::restore)), which reads
+    /// again.
+    read_results: HashMap<TxnId, bool>,
 }
 
 impl Default for Replica {
@@ -86,6 +93,7 @@ impl Default for Replica {
             unapplied_by_bound: BTreeSet::new(),
             unapplied_by_t0: BTreeSet::new(),
             applied_by_t0: BTreeSet::new(),
+            read_results: HashMap::new(),
         }
     }
 }
@@ -622,6 +630,26 @@ impl Replica {
         Some(ready)
     }
 
+    /// Records the version-condition result of a read handed out by
+    /// [`next_read`](Replica::next_read). Ignored unless the command is still
+    /// [`Reading`](Status::Reading) (an anti-entropy import may have applied it
+    /// meanwhile).
+    pub fn record_read(&mut self, txn: TxnId, ok: bool) {
+        if matches!(self.commands.get(&txn), Some(cmd) if cmd.status == Status::Reading) {
+            self.read_results.insert(txn, ok);
+        }
+    }
+
+    /// The recorded read result of a command that is still
+    /// [`Reading`](Status::Reading): what this replica answers whoever drives
+    /// the commit, even one that took the transaction over after the read.
+    pub fn read_result(&self, txn: TxnId) -> Option<bool> {
+        match self.commands.get(&txn) {
+            Some(cmd) if cmd.status == Status::Reading => self.read_results.get(&txn).copied(),
+            _ => None,
+        }
+    }
+
     /// Records the coordinator's commit/abort decision for `txn` (from Apply).
     /// Does not apply it — [`next_apply`](Replica::next_apply) enacts it once the
     /// dependencies clear, so a replica that was behind still converges.
@@ -663,6 +691,7 @@ impl Replica {
     /// conflict outcome and unblocking dependents.
     pub fn mark_applied(&mut self, txn: TxnId, conflict: bool) {
         self.applying.remove(&txn);
+        self.read_results.remove(&txn);
         if let Some(cmd) = self.commands.get_mut(&txn) {
             let at = cmd.execute_at;
             cmd.status = Status::Applied;
@@ -670,6 +699,11 @@ impl Replica {
             self.pending.remove(&(at, txn));
             self.reindex_unapplied(txn);
         }
+    }
+
+    /// How far `txn` has progressed here, if this replica holds it.
+    pub fn status(&self, txn: TxnId) -> Option<Status> {
+        self.commands.get(&txn).map(|cmd| cmd.status)
     }
 
     /// A snapshot of a command's durable state, for the [`Journal`](crate::api::Journal).
@@ -680,8 +714,14 @@ impl Replica {
     /// Restores a command from the journal on restart, preserving its actual
     /// status, ballots, and decision (unlike
     /// [`import_applied`](Self::import_applied), which is for bootstrap and
-    /// forces `Applied`).
-    pub fn restore(&mut self, cmd: CommandState) {
+    /// forces `Applied`). A command journaled mid-read comes back `Committed`:
+    /// its read result was never persisted, and [`next_read`](Self::next_read)
+    /// only hands out `Committed` commands, so a restored `Reading` one would
+    /// never answer a read again.
+    pub fn restore(&mut self, mut cmd: CommandState) {
+        if cmd.status == Status::Reading {
+            cmd.status = Status::Committed;
+        }
         self.insert(cmd);
     }
 
@@ -756,6 +796,7 @@ impl Replica {
         // contact's applied state (overwriting the stale entry) so its events get
         // applied locally and the node converges.
         cmd.status = Status::Applied;
+        self.read_results.remove(&cmd.txn);
         self.insert(cmd);
         true
     }
@@ -811,6 +852,7 @@ impl Replica {
             .collect();
         let newest = drop.iter().map(|txn| txn.0).max();
         for txn in &drop {
+            self.read_results.remove(txn);
             if let Some(cmd) = self.commands.remove(txn) {
                 for key in &cmd.keys {
                     if let Some(set) = self.by_key.get_mut(key) {
@@ -1052,6 +1094,62 @@ mod tests {
             "a second driver must not receive the same in-flight apply"
         );
         replica.mark_applied(a, false);
+    }
+
+    /// A read is taken once: its result stays answerable while the command holds
+    /// its slot (so a recovery coordinator that takes over still gets it), and
+    /// is forgotten once the decision is enacted.
+    #[test]
+    fn a_read_result_stays_answerable_until_applied() {
+        let mut replica = Replica::new();
+        let key = Key("k".into());
+        let a = txn(10);
+        replica.preaccept(a, vec![key.clone()], vec![event("k", 1)]);
+        replica.commit(a, a.0, vec![], vec![event("k", 1)], vec![], NodeId(0));
+        assert_eq!(replica.read_result(a), None, "not read yet");
+
+        assert_eq!(replica.next_read().expect("ready to read").txn, a);
+        replica.record_read(a, true);
+        assert!(
+            replica.next_read().is_none(),
+            "a held slot is not read again"
+        );
+        assert_eq!(replica.read_result(a), Some(true));
+
+        replica.record_decision(a, true);
+        assert_eq!(replica.next_apply().expect("decided").txn, a);
+        replica.mark_applied(a, false);
+        assert_eq!(
+            replica.read_result(a),
+            None,
+            "applied: the outcome answers now"
+        );
+        assert_eq!(replica.applied_result(a), Some(false));
+    }
+
+    /// A command journaled mid-read (its read result is not durable) comes back
+    /// from a restart ready to be read again, instead of holding its slot with
+    /// nothing to answer.
+    #[test]
+    fn a_restored_reading_command_is_read_again() {
+        let mut replica = Replica::new();
+        let key = Key("k".into());
+        let a = txn(10);
+        replica.restore(CommandState {
+            txn: a,
+            status: Status::Reading,
+            promised: Ballot(a.0),
+            accepted: Ballot(a.0),
+            execute_at: a.0,
+            deps: vec![],
+            keys: vec![key],
+            events: vec![event("k", 1)],
+            reply_to: NodeId(0),
+            decision: None,
+            applied_conflict: None,
+        });
+        assert_eq!(replica.status(a), Some(Status::Committed));
+        assert_eq!(replica.next_read().expect("read again").txn, a);
     }
 
     /// The watermark only ever moves forward; a lower or equal `compact` is a

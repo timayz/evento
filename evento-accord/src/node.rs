@@ -578,6 +578,12 @@ impl Node {
             .command_count()
     }
 
+    /// How far `txn` has progressed on this replica, if it holds the command.
+    /// For tests and observability.
+    pub fn command_status(&self, txn: TxnId) -> Option<Status> {
+        self.replica.lock().expect("replica poisoned").status(txn)
+    }
+
     /// How many transactions this node has taken over via the recovery sweep — a
     /// healthy cluster recovers nothing. For tests and observability.
     pub fn recovery_count(&self) -> u64 {
@@ -1549,17 +1555,24 @@ impl Node {
                 self.journal_stage(txn).await;
 
                 // If already applied (e.g. a second recovery), short-circuit the
-                // read phase with the stored outcome.
-                let applied = self
-                    .replica
-                    .lock()
-                    .expect("replica poisoned")
-                    .applied_result(txn);
-                match applied {
-                    Some(conflict) => {
+                // read phase with the stored outcome. If already read — the slot
+                // is held, awaiting a decision — answer with the recorded read:
+                // the replica never reads twice, so a recovery coordinator that
+                // took over from one that never decided would otherwise wait
+                // forever for a read nobody repeats.
+                let (applied, read) = {
+                    let replica = self.replica.lock().expect("replica poisoned");
+                    (replica.applied_result(txn), replica.read_result(txn))
+                };
+                match (applied, read) {
+                    (Some(conflict), _) => {
                         out.push((reply_to, Message::ReadOk { txn, ok: !conflict }));
                     }
-                    None => out.extend(self.drive_staged().await),
+                    (None, Some(ok)) => {
+                        out.push((reply_to, Message::ReadOk { txn, ok }));
+                        out.extend(self.drive_staged().await);
+                    }
+                    (None, None) => out.extend(self.drive_staged().await),
                 }
             }
             Message::Apply { txn, commit } => {
@@ -1985,7 +1998,15 @@ impl Node {
             let read = self.replica.lock().expect("replica poisoned").next_read();
             let Some(read) = read else { break };
             let ok = self.read_condition(&read.events).await;
-            out.push((read.reply_to, Message::ReadOk { txn: read.txn, ok }));
+            // Record the result, and answer whoever drives the commit *now*: a
+            // recovery's Commit may have taken the transaction over while the
+            // read was in flight.
+            let reply_to = {
+                let mut replica = self.replica.lock().expect("replica poisoned");
+                replica.record_read(read.txn, ok);
+                replica.reply_to(read.txn).unwrap_or(read.reply_to)
+            };
+            out.push((reply_to, Message::ReadOk { txn: read.txn, ok }));
         }
         out
     }
@@ -2186,14 +2207,29 @@ impl Node {
         events: Vec<Event>,
     ) -> anyhow::Result<(CommitOutcome, bool)> {
         let (plans, _union) = self.plan(&keys, &events);
-
-        let t0 = txn.0;
         let mut rx = self.register(txn);
+        let (execute_at, shard_deps, all_fast) = self.agree(&mut rx, &plans, txn).await?;
+        let conflict = self
+            .execute(&mut rx, &plans, txn, execute_at, shard_deps)
+            .await?;
+        self.deregister(txn);
+        Ok((CommitOutcome { txn, conflict }, all_fast))
+    }
+
+    /// PreAccept → (Accept): agrees `txn`'s execution timestamp and per-shard
+    /// dependencies, and reports whether the fast path decided them.
+    async fn agree(
+        &self,
+        rx: &mut mpsc::UnboundedReceiver<(NodeId, Message)>,
+        plans: &[ShardPlan],
+        txn: TxnId,
+    ) -> anyhow::Result<(Timestamp, HashMap<ShardId, BTreeSet<TxnId>>, bool)> {
+        let t0 = txn.0;
 
         // PreAccept: a fast quorum per shard, or whatever arrives before the
         // fast-path timeout. Each shard's replicas receive only that shard's
         // keys/events — one encode per shard, no cross-shard payload.
-        for plan in &plans {
+        for plan in plans {
             self.broadcast(
                 &plan.replicas,
                 Message::PreAccept {
@@ -2214,8 +2250,8 @@ impl Node {
         };
         let mut pre = self
             .collect_by_shard_tagged(
-                &mut rx,
-                &plans,
+                rx,
+                plans,
                 |p, got| electorate_responders(p, got) >= p.fast_q,
                 Self::after(self.settings.fast_timeout),
                 |m| match m {
@@ -2237,8 +2273,8 @@ impl Node {
                 .collect();
             let more = self
                 .collect_by_shard_tagged(
-                    &mut rx,
-                    &plans,
+                    rx,
+                    plans,
                     |p, got| got.len() >= remaining[&p.shard],
                     Self::after(self.settings.collect_timeout),
                     |m| match m {
@@ -2255,7 +2291,7 @@ impl Node {
                 }
             }
         }
-        for plan in &plans {
+        for plan in plans {
             if pre[&plan.shard].len() < plan.slow_q {
                 self.deregister(txn);
                 anyhow::bail!("preaccept quorum not reached for shard {}", plan.shard);
@@ -2304,7 +2340,7 @@ impl Node {
 
         // Slow path: Accept the raised timestamp and each shard's dependency set.
         if !all_fast {
-            for plan in &plans {
+            for plan in plans {
                 let deps: Vec<TxnId> = shard_deps[&plan.shard].iter().copied().collect();
                 self.broadcast(
                     &plan.replicas,
@@ -2320,8 +2356,8 @@ impl Node {
             }
             let acks = self
                 .collect_by_shard(
-                    &mut rx,
-                    &plans,
+                    rx,
+                    plans,
                     |p| p.slow_q,
                     Self::after(self.settings.collect_timeout),
                     |m| match m {
@@ -2332,7 +2368,7 @@ impl Node {
                     },
                 )
                 .await;
-            for plan in &plans {
+            for plan in plans {
                 if acks[&plan.shard].len() < plan.slow_q {
                     self.deregister(txn);
                     anyhow::bail!("accept quorum not reached for shard {}", plan.shard);
@@ -2347,11 +2383,7 @@ impl Node {
             }
         }
 
-        let conflict = self
-            .execute(&mut rx, &plans, txn, execute_at, shard_deps)
-            .await?;
-        self.deregister(txn);
-        Ok((CommitOutcome { txn, conflict }, all_fast))
+        Ok((execute_at, shard_deps, all_fast))
     }
 
     /// Commit → Read → Apply: drive the atomic decision across all touched
@@ -2366,30 +2398,8 @@ impl Node {
         shard_deps: HashMap<ShardId, BTreeSet<TxnId>>,
     ) -> anyhow::Result<bool> {
         let union = Self::union_of(plans);
-
-        // Commit each shard with its own dependency set and its own key/event
-        // slice — one encode per shard instead of one per replica.
-        for plan in plans {
-            let deps: Vec<TxnId> = shard_deps
-                .get(&plan.shard)
-                .into_iter()
-                .flatten()
-                .copied()
-                .filter(|d| *d != txn)
-                .collect();
-            self.broadcast(
-                &plan.replicas,
-                Message::Commit {
-                    txn,
-                    execute_at,
-                    deps,
-                    keys: plan.keys.clone(),
-                    events: plan.events.clone(),
-                    reply_to: self.id,
-                },
-            )
+        self.broadcast_commit(plans, txn, execute_at, &shard_deps)
             .await;
-        }
 
         // Read: a slow quorum per shard reports its version condition.
         let reads = self
@@ -2458,6 +2468,38 @@ impl Node {
         }
 
         Ok(!commit)
+    }
+
+    /// Commits `txn` on each shard with its own dependency set and its own
+    /// key/event slice — one encode per shard instead of one per replica.
+    async fn broadcast_commit(
+        &self,
+        plans: &[ShardPlan],
+        txn: TxnId,
+        execute_at: Timestamp,
+        shard_deps: &HashMap<ShardId, BTreeSet<TxnId>>,
+    ) {
+        for plan in plans {
+            let deps: Vec<TxnId> = shard_deps
+                .get(&plan.shard)
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|d| *d != txn)
+                .collect();
+            self.broadcast(
+                &plan.replicas,
+                Message::Commit {
+                    txn,
+                    execute_at,
+                    deps,
+                    keys: plan.keys.clone(),
+                    events: plan.events.clone(),
+                    reply_to: self.id,
+                },
+            )
+            .await;
+        }
     }
 
     /// Learns how a write this node failed to coordinate ended. Once its
@@ -2781,6 +2823,24 @@ impl Node {
                 anyhow::bail!("preaccept quorum not reached for shard {}", plan.shard);
             }
         }
+        Ok(txn)
+    }
+
+    /// Runs PreAccept → (Accept) → Commit and returns without collecting a
+    /// read or sending the decision, modelling a coordinator that crashed
+    /// between Commit and Apply: every replica reads, reports to a coordinator
+    /// that is no longer listening, and holds its slot until a recovery
+    /// decides the transaction. For tests of [`recover`](Self::recover).
+    pub async fn coordinate_through_commit(&self, events: Vec<Event>) -> anyhow::Result<TxnId> {
+        let keys = Self::keys_of(&events);
+        let (plans, _union) = self.plan(&keys, &events);
+        let txn = TxnId(self.clock.now());
+        let mut rx = self.register(txn);
+        let agreed = self.agree(&mut rx, &plans, txn).await;
+        self.deregister(txn);
+        let (execute_at, shard_deps, _) = agreed?;
+        self.broadcast_commit(&plans, txn, execute_at, &shard_deps)
+            .await;
         Ok(txn)
     }
 
