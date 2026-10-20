@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use evento_accord::{
     AppliedEntry, DataStore, HybridLogicalClock, InMemoryDataStore, InMemoryJournal,
-    InMemoryNetwork, Journal, MessageSink, Node, NodeConfig, NodeId, StaticTopology, TxnId,
+    InMemoryNetwork, Journal, MessageSink, Node, NodeConfig, NodeId, StaticTopology, Status, TxnId,
 };
 use evento_core::Event;
 
@@ -289,6 +289,48 @@ async fn recovers_a_transaction_whose_coordinator_crashed() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recovers_a_transaction_whose_coordinator_crashed_after_commit() {
+    // Node 0 commits a write, then "crashes" before it collects a single read
+    // or sends the decision. Every replica reads, reports to a coordinator that
+    // is no longer listening, and holds its slot. A recovery must still get
+    // those reads: the replicas never read twice.
+    let config = NodeConfig {
+        collect_timeout: Duration::from_millis(1000),
+        ..NodeConfig::default()
+    };
+    let cluster = Cluster::start_with(3, config);
+
+    let txn = cluster.nodes[0]
+        .coordinate_through_commit(vec![event("acc", 1, "Opened")])
+        .await
+        .expect("committed on a quorum");
+    // Wait until the survivors have read it (and so will not read it again).
+    for _ in 0..1000 {
+        if [1, 2]
+            .iter()
+            .all(|&i| cluster.nodes[i].command_status(txn) == Some(Status::Reading))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    for i in [1, 2] {
+        assert_eq!(cluster.nodes[i].command_status(txn), Some(Status::Reading));
+    }
+    cluster.net.crash(NodeId(0));
+
+    let outcome = tokio::time::timeout(Duration::from_secs(5), cluster.nodes[1].recover(txn))
+        .await
+        .expect("recovery timed out")
+        .expect("recovery must decide a transaction every replica already read");
+    assert_eq!(outcome.txn, txn);
+    assert!(!outcome.conflict, "the lone write must take effect");
+
+    let order = cluster.assert_order_among(&[1, 2], 1).await;
+    assert_eq!(order[0], (txn, false));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn recovery_is_idempotent_with_a_late_original_commit() {
     // A transaction is recovered by node 1; then node 2 also recovers it. The
     // second recovery must agree on the same outcome, not double-apply.
@@ -353,6 +395,52 @@ async fn a_write_another_node_recovered_reports_its_outcome_not_a_failure() {
     let order = cluster.assert_identical_order(1).await;
     assert_eq!(order[0].0, outcome.txn);
     assert!(!order[0].1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_dropped_mid_flight_leaves_nothing_pinned() {
+    // A caller gives up on a write while it waits for a quorum (an HTTP client
+    // hung up, a timeout fired). The transaction still exists — node 0
+    // pre-accepted it — so the cluster must finish it and compact it away, as
+    // for any coordinator that vanished; nothing of the abandoned coordination
+    // may keep pinning node 0's watermark or hide the transaction from its
+    // own recovery sweep.
+    let config = NodeConfig {
+        recovery_timeout: Duration::from_millis(300),
+        compaction_margin: Duration::from_millis(200),
+        anti_entropy_interval: Duration::from_millis(50),
+        ..NodeConfig::default()
+    };
+    let cluster = Cluster::start_with(3, config);
+    let _sweeps: Vec<_> = cluster.nodes.iter().map(Node::start_recovery).collect();
+    for peer in [NodeId(1), NodeId(2)] {
+        cluster.net.partition(NodeId(0), peer);
+    }
+    let abandoned = tokio::time::timeout(
+        Duration::from_millis(100),
+        cluster.nodes[0].write(vec![event("acc", 1, "Opened")]),
+    )
+    .await;
+    assert!(
+        abandoned.is_err(),
+        "the write was still waiting for a quorum"
+    );
+    cluster.net.heal_all_partitions();
+
+    for _ in 0..1000 {
+        if cluster.nodes.iter().all(|n| n.command_count() == 0) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let counts: Vec<usize> = cluster.nodes.iter().map(|n| n.command_count()).collect();
+    assert_eq!(
+        counts,
+        vec![0, 0, 0],
+        "the abandoned transaction must be finished and compacted everywhere"
+    );
+    assert!(!cluster.nodes[0].sweep_pressure().busy);
+    cluster.assert_identical_order(1).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

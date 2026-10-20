@@ -30,7 +30,9 @@ Phases: `PreAccept → (Accept) → Commit → Read → Apply`, plus `Recovery`.
   can stand as the execution timestamp. If a **fast-path quorum** agrees with no
   reordering, we skip Accept — one round-trip.
 - Otherwise **Accept** (slow path) settles a final execution timestamp
-  **t ≥ t0** and the dependency set.
+  **t ≥ t0** and the dependency set — each replica's AcceptOk names every conflict
+  with a `t0` below `t`, so a conflict that arrived after PreAccept (and may have
+  fast-committed in between) becomes a dependency.
 - Replicas execute transactions in **t order**, each waiting on its
   dependencies — the "reorder buffer" that bounds waiting by clock skew +
   latency instead of adding message rounds.
@@ -189,6 +191,17 @@ control plane, everything else is Accord.
   *M2 simplification:* journal-replay across process restarts is deferred; a
   recovery quorum that has never witnessed the txn errors rather than
   invalidating it as a no-op.
+  *Since hardened (2026-10 review):* recovery sends `BeginRecovery` carrying the
+  keys/events the recoverer holds, so a replica that never witnessed the txn
+  pre-accepts it under the recovery ballot (or, owning none of it, keeps a
+  ballot-only promise) — PreAccept and Accept are refused below any promise, so the
+  original coordinator, if merely slow, can no longer win a replica the recovery
+  counted; promises are journaled before they are revealed; the Accepted branch
+  adopts the highest *accepted* ballot only (a pre-accepted report's `Ballot(t0)` is a
+  placeholder); a re-proposed value is committed only once a quorum accepted it; and
+  an earlier conflict committed past `t0` without the txn rules the fast path out
+  (one only accepted makes recovery wait). A replica holding a read slot answers any
+  recovery's Commit with the read it took.
 - **M3 — Multi-shard transactions.** ✅ `ShardedTopology` partitions keys into
   **disjoint** shards, each with its own replica set; the coordinator reaches a
   quorum in **each** touched shard (`plan` + `collect_by_shard` group responses
@@ -579,6 +592,35 @@ backend (sql/fjall). Phases, in order:
         time helper and `run.sh` refuses it under Docker without `ALLOW_CLOCK_SKEW=1`);
         then the box can be checked.
   - [ ] **Independent expert review** of the protocol and implementation.
+  - [~] **Code review (2026-10-20).** A full read of the crate found, and fixed with
+        a failing test first:
+        a transaction left `Reading` when its decision was lost could never be decided
+        (replicas never re-answered a recovery's Commit);
+        Accept echoed the coordinator's deps instead of reporting conflicts below the
+        raised timestamp (divergence at N ≥ 5 or with a shrunk electorate);
+        recovery fenced neither unknown replicas nor late PreAccepts, did not journal
+        its promise, could commit a value no quorum accepted, and let a pre-accept
+        vote tie the original coordinator's accepted ballot;
+        a failed data-store apply was marked applied (lost events), and a failed
+        version read voted "condition holds";
+        subscriptions on a cut-off replica skipped events (now clamped to proven sync
+        coverage, like the compaction report);
+        anti-entropy always contacted the same peer (a shared counter's parity);
+        a dropped `write` future pinned the watermark for good;
+        duplicated replies could complete a PreAccept or config-Paxos quorum;
+        concurrent `GroupHost::open`s of one group left a deaf node;
+        an anti-entropy import applied past a failed command.
+        **Open** (confirmed or plausible, not yet fixed):
+        a host rejoining a group of N ≥ 4 is told to rejoin again (its first report
+        predates the two-peer coverage proof, and the absent screen refuses its syncs);
+        multi-shard recovery cannot see a shard that never witnessed the txn and could
+        commit it on the others only (needs the txn's route on every message);
+        events keep their client-side provisional stamps, so two hosts' skewed clocks
+        can order an aggregate's versions backwards in subscriptions;
+        an anti-entropy reply or join header over the 64 MiB frame cap is shed forever;
+        a config change's replies are keyed by epoch only, so two on one node collide;
+        stage errors are ignored before durability-gated replies;
+        the sweep scheduler can starve groups beyond `max_concurrent`.
   - [ ] **Real-cluster soak + chaos** over days (kills, partitions, clock skew,
         disk pressure, slow disks/links) on actual hardware — zero production
         mileage today.

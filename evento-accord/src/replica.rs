@@ -72,6 +72,21 @@ pub struct Replica {
     /// Applied (un-compacted) txns in `t0` order, serving the anti-entropy
     /// digest and missing-command export without a full command scan.
     applied_by_t0: BTreeSet<TxnId>,
+    /// The version-condition result of every [`Reading`](Status::Reading)
+    /// command, so a Commit from a recovery coordinator that took over is
+    /// answered with it: the read happens once, and its result stands while
+    /// the command holds its slot. In memory only — a restart turns `Reading`
+    /// back into `Committed` (see [`restore`](Replica::restore)), which reads
+    /// again.
+    read_results: HashMap<TxnId, bool>,
+    /// Ballots promised to a recovery for transactions this replica never
+    /// witnessed. A replica answering such a recovery "unknown" still fences
+    /// the original coordinator: a PreAccept or Accept below the promise is
+    /// refused here, as it would be for a known command — otherwise the
+    /// recovery's quorum would not intersect the coordinator's, and both could
+    /// decide. Never in the un-applied indexes (they would pin the watermark);
+    /// dropped below the redundancy watermark. In memory only.
+    unknown_promises: HashMap<TxnId, Ballot>,
 }
 
 impl Default for Replica {
@@ -86,6 +101,8 @@ impl Default for Replica {
             unapplied_by_bound: BTreeSet::new(),
             unapplied_by_t0: BTreeSet::new(),
             applied_by_t0: BTreeSet::new(),
+            read_results: HashMap::new(),
+            unknown_promises: HashMap::new(),
         }
     }
 }
@@ -137,9 +154,15 @@ pub struct RecoverState {
     pub execute_at: Timestamp,
     /// Its current dependency set.
     pub deps: Vec<TxnId>,
-    /// A later conflicting transaction did not witness this one — proof the
-    /// transaction could not have committed on the fast path.
+    /// A conflicting transaction ordered after this one's `t0` did not witness
+    /// it — proof the transaction could not have committed on the fast path.
     pub superseding_rejects: bool,
+    /// An earlier conflict was *accepted* (not yet committed) to execute after
+    /// this transaction's `t0` without witnessing it here: its committed
+    /// dependencies may still name this transaction (another replica's Accept
+    /// reply), so the fast path can be neither ruled in nor out until it
+    /// commits. Recovery waits.
+    pub wait: bool,
     /// This replica's owned keys for the transaction.
     pub keys: Vec<Key>,
     /// The events, so a recovery coordinator can drive the apply.
@@ -336,9 +359,39 @@ impl Replica {
 
     /// Handles PreAccept: records the transaction and returns the execution
     /// timestamp and dependencies this replica witnesses. Idempotent.
+    ///
+    /// A PreAccept is the original coordinator's, at ballot `Ballot(t0)`: once
+    /// a recovery has promised a higher ballot here — for a known command, or
+    /// for one this replica answered "unknown" — it is refused with
+    /// `Err(promised)`, so that coordinator can no longer gather a vote the
+    /// recovery did not see.
     pub fn preaccept(
         &mut self,
         txn: TxnId,
+        keys: Vec<Key>,
+        events: Vec<Event>,
+    ) -> Result<(Timestamp, Vec<TxnId>), Ballot> {
+        if let Some(promised) = self.promise_of(txn).filter(|p| *p > Ballot(txn.0)) {
+            return Err(promised);
+        }
+        Ok(self.witness(txn, Ballot(txn.0), keys, events))
+    }
+
+    /// The ballot this replica has promised for `txn`, known or not.
+    fn promise_of(&self, txn: TxnId) -> Option<Ballot> {
+        match self.commands.get(&txn) {
+            Some(cmd) => Some(cmd.promised),
+            None => self.unknown_promises.get(&txn).copied(),
+        }
+    }
+
+    /// Records `txn` as pre-accepted under `promised` (or repairs the keys and
+    /// events of a command already known) and returns its vote: the execution
+    /// timestamp and dependencies this replica witnesses.
+    fn witness(
+        &mut self,
+        txn: TxnId,
+        promised: Ballot,
         keys: Vec<Key>,
         events: Vec<Event>,
     ) -> (Timestamp, Vec<TxnId>) {
@@ -378,10 +431,11 @@ impl Replica {
             .filter(|c| c.0 < execute_at)
             .collect();
 
+        self.unknown_promises.remove(&txn);
         self.insert(CommandState {
             txn,
             status: Status::PreAccepted,
-            promised: Ballot(txn.0),
+            promised,
             accepted: Ballot(txn.0),
             execute_at,
             deps: deps.clone(),
@@ -396,8 +450,17 @@ impl Replica {
     }
 
     /// Handles Accept under `ballot`: adopts the coordinator's execution
-    /// timestamp and dependency set. Returns the replica's dependencies, or
-    /// `Err(promised)` if it has already promised a higher ballot.
+    /// timestamp, and returns the dependencies this replica witnesses **at
+    /// that timestamp** — the coordinator's set plus every conflict here with
+    /// a lower `t0` — or `Err(promised)` if it has already promised a higher
+    /// ballot.
+    ///
+    /// The slow path raises `execute_at` above `t0`, so a conflict that arrived
+    /// after this transaction's PreAccept, with a `t0` in between, now orders
+    /// before it. It must become a dependency: it may already have committed
+    /// at its own `t0` on the fast path, and nothing else would make this
+    /// transaction wait for it. The coordinator unions these replies into the
+    /// committed dependency set.
     pub fn accept(
         &mut self,
         txn: TxnId,
@@ -423,11 +486,14 @@ impl Replica {
             cmd.accepted = ballot;
             cmd.status = Status::Accepted;
             cmd.execute_at = execute_at;
-            cmd.deps = deps;
-            let deps = cmd.deps.clone();
             self.index_keys(txn, &keys);
-            Ok(deps)
         } else {
+            if let Some(&promised) = self.unknown_promises.get(&txn) {
+                if ballot < promised {
+                    return Err(promised);
+                }
+            }
+            self.unknown_promises.remove(&txn);
             // The replica missed PreAccept; record what it was told — including
             // the keys, so the conflict index and recovery's superseding check
             // still see this transaction (events arrive with Commit).
@@ -437,15 +503,33 @@ impl Replica {
                 promised: ballot,
                 accepted: ballot,
                 execute_at,
-                deps: deps.clone(),
+                deps: Vec::new(),
                 keys,
                 events: Vec::new(),
                 reply_to: txn.0.node,
                 decision: None,
                 applied_conflict: None,
             });
-            Ok(deps)
         }
+        let deps = self.deps_at(txn, execute_at, deps);
+        if let Some(cmd) = self.commands.get_mut(&txn) {
+            cmd.deps = deps.clone();
+        }
+        Ok(deps)
+    }
+
+    /// `known` plus every transaction conflicting with `txn` here whose `t0`
+    /// is below `execute_at` — the dependencies `txn` has at that timestamp.
+    fn deps_at(&self, txn: TxnId, execute_at: Timestamp, known: Vec<TxnId>) -> Vec<TxnId> {
+        let mut deps: BTreeSet<TxnId> = known.into_iter().collect();
+        if let Some(cmd) = self.commands.get(&txn) {
+            deps.extend(
+                self.conflicts(&cmd.keys, txn)
+                    .into_iter()
+                    .filter(|c| c.0 < execute_at),
+            );
+        }
+        deps.into_iter().collect()
     }
 
     /// Handles Commit: finalises the execution timestamp, dependencies, events,
@@ -461,6 +545,8 @@ impl Replica {
         keys: Vec<Key>,
         reply_to: NodeId,
     ) {
+        // A Commit is the decision itself: no ballot fences it.
+        self.unknown_promises.remove(&txn);
         if self.commands.contains_key(&txn) {
             // Repair a keyless command first learned via Accept, so the
             // conflict index sees it permanently.
@@ -512,8 +598,28 @@ impl Replica {
     /// Handles Recover under `ballot`: promises the ballot and reports the
     /// replica's knowledge, or returns `Err(promised)` if a higher ballot was
     /// already promised.
-    pub fn recover(&mut self, txn: TxnId, ballot: Ballot) -> Result<RecoverState, Ballot> {
-        if !self.commands.contains_key(&txn) {
+    ///
+    /// `keys`/`events` are the owned part of what the recovery coordinator
+    /// holds for the transaction (empty for the legacy `Recover`). A replica
+    /// that never witnessed it pre-accepts that part now, under the ballot —
+    /// its vote is then one the recovery counts, and one the original
+    /// coordinator, whose PreAccept may still be in flight, can no longer
+    /// get. Owning none of it, the replica only remembers the promise and
+    /// answers "unknown".
+    pub fn recover(
+        &mut self,
+        txn: TxnId,
+        ballot: Ballot,
+        keys: Vec<Key>,
+        events: Vec<Event>,
+    ) -> Result<RecoverState, Ballot> {
+        if let Some(promised) = self.promise_of(txn) {
+            if ballot < promised {
+                return Err(promised);
+            }
+        }
+        if !self.commands.contains_key(&txn) && keys.is_empty() {
+            self.unknown_promises.insert(txn, ballot);
             return Ok(RecoverState {
                 known: false,
                 status: Status::PreAccepted,
@@ -521,20 +627,20 @@ impl Replica {
                 execute_at: txn.0,
                 deps: Vec::new(),
                 superseding_rejects: false,
+                wait: false,
                 keys: Vec::new(),
                 events: Vec::new(),
             });
         }
 
-        {
-            let cmd = self.commands.get_mut(&txn).expect("present");
-            if ballot < cmd.promised {
-                return Err(cmd.promised);
-            }
+        // Pre-accepts an unknown transaction (or repairs a known one's keys
+        // and events), then promises the ballot.
+        self.witness(txn, ballot, keys, events);
+        if let Some(cmd) = self.commands.get_mut(&txn) {
             cmd.promised = ballot;
         }
 
-        let superseding_rejects = self.superseding_rejects(txn);
+        let (superseding_rejects, wait) = self.fast_path_evidence(txn);
         let cmd = &self.commands[&txn];
         Ok(RecoverState {
             known: true,
@@ -543,6 +649,7 @@ impl Replica {
             execute_at: cmd.execute_at,
             deps: cmd.deps.clone(),
             superseding_rejects,
+            wait,
             keys: cmd.keys.clone(),
             events: cmd.events.clone(),
         })
@@ -554,16 +661,39 @@ impl Replica {
         self.commands.get(&txn).map(|cmd| cmd.reply_to)
     }
 
-    /// Whether any *later* conflicting transaction (higher `t0`) has reached
-    /// Accepted+ without `txn` in its dependencies. Such a transaction proves
-    /// `txn` did not commit on the fast path, since a fast-path commit at `t0`
-    /// forces every later conflict to witness it.
-    fn superseding_rejects(&self, txn: TxnId) -> bool {
+    /// What this replica's conflicts reveal about whether `txn` could have
+    /// committed on the fast path at its `t0`: `(rejects, wait)`.
+    ///
+    /// - **Rejects** — a conflict that orders after `t0` reached a decision
+    ///   without `txn` among its dependencies:
+    ///   - a *later* one (higher `t0`) accepted or committed: its PreAccept
+    ///     quorum meets any fast quorum, where it would have witnessed `txn`;
+    ///   - an *earlier* one committed to execute after `t0`: its Accept quorum
+    ///     meets any fast quorum, whose replies would have named `txn` (see
+    ///     [`accept`](Replica::accept)).
+    /// - **Wait** — an earlier conflict only *accepted* to execute after `t0`
+    ///   without `txn` here: another replica's Accept reply may still put
+    ///   `txn` in its committed dependencies, so nothing follows until it
+    ///   commits.
+    fn fast_path_evidence(&self, txn: TxnId) -> (bool, bool) {
         let cmd = &self.commands[&txn];
-        self.conflicts(&cmd.keys, txn).into_iter().any(|g| {
+        let mut wait = false;
+        for g in self.conflicts(&cmd.keys, txn) {
             let gc = &self.commands[&g];
-            g.0 > txn.0 && gc.status >= Status::Accepted && !gc.deps.contains(&txn)
-        })
+            if gc.status < Status::Accepted || gc.deps.contains(&txn) {
+                continue;
+            }
+            if g.0 > txn.0 {
+                return (true, false);
+            }
+            if gc.execute_at > txn.0 {
+                if gc.status >= Status::Committed {
+                    return (true, false);
+                }
+                wait = true;
+            }
+        }
+        (false, wait)
     }
 
     /// Whether `txn`'s dependencies permit it to execute on this shard.
@@ -622,6 +752,26 @@ impl Replica {
         Some(ready)
     }
 
+    /// Records the version-condition result of a read handed out by
+    /// [`next_read`](Replica::next_read). Ignored unless the command is still
+    /// [`Reading`](Status::Reading) (an anti-entropy import may have applied it
+    /// meanwhile).
+    pub fn record_read(&mut self, txn: TxnId, ok: bool) {
+        if matches!(self.commands.get(&txn), Some(cmd) if cmd.status == Status::Reading) {
+            self.read_results.insert(txn, ok);
+        }
+    }
+
+    /// The recorded read result of a command that is still
+    /// [`Reading`](Status::Reading): what this replica answers whoever drives
+    /// the commit, even one that took the transaction over after the read.
+    pub fn read_result(&self, txn: TxnId) -> Option<bool> {
+        match self.commands.get(&txn) {
+            Some(cmd) if cmd.status == Status::Reading => self.read_results.get(&txn).copied(),
+            _ => None,
+        }
+    }
+
     /// Records the coordinator's commit/abort decision for `txn` (from Apply).
     /// Does not apply it — [`next_apply`](Replica::next_apply) enacts it once the
     /// dependencies clear, so a replica that was behind still converges.
@@ -659,10 +809,30 @@ impl Replica {
         })
     }
 
+    /// Hands back an apply reserved by [`next_apply`](Replica::next_apply) that
+    /// the data store failed: the command stays decided and un-applied, to be
+    /// handed out again on the next drive.
+    pub fn release_apply(&mut self, txn: TxnId) {
+        self.applying.remove(&txn);
+    }
+
+    /// Hands back a read taken by [`next_read`](Replica::next_read) that the
+    /// data store failed: the command returns to `Committed`, to be read again
+    /// on the next drive, rather than holding its slot with nothing to answer.
+    pub fn unread(&mut self, txn: TxnId) {
+        if let Some(cmd) = self.commands.get_mut(&txn) {
+            if cmd.status == Status::Reading {
+                cmd.status = Status::Committed;
+            }
+        }
+        self.read_results.remove(&txn);
+    }
+
     /// Records that a transaction's decision has been enacted, storing its
     /// conflict outcome and unblocking dependents.
     pub fn mark_applied(&mut self, txn: TxnId, conflict: bool) {
         self.applying.remove(&txn);
+        self.read_results.remove(&txn);
         if let Some(cmd) = self.commands.get_mut(&txn) {
             let at = cmd.execute_at;
             cmd.status = Status::Applied;
@@ -670,6 +840,11 @@ impl Replica {
             self.pending.remove(&(at, txn));
             self.reindex_unapplied(txn);
         }
+    }
+
+    /// How far `txn` has progressed here, if this replica holds it.
+    pub fn status(&self, txn: TxnId) -> Option<Status> {
+        self.commands.get(&txn).map(|cmd| cmd.status)
     }
 
     /// A snapshot of a command's durable state, for the [`Journal`](crate::api::Journal).
@@ -680,8 +855,14 @@ impl Replica {
     /// Restores a command from the journal on restart, preserving its actual
     /// status, ballots, and decision (unlike
     /// [`import_applied`](Self::import_applied), which is for bootstrap and
-    /// forces `Applied`).
-    pub fn restore(&mut self, cmd: CommandState) {
+    /// forces `Applied`). A command journaled mid-read comes back `Committed`:
+    /// its read result was never persisted, and [`next_read`](Self::next_read)
+    /// only hands out `Committed` commands, so a restored `Reading` one would
+    /// never answer a read again.
+    pub fn restore(&mut self, mut cmd: CommandState) {
+        if cmd.status == Status::Reading {
+            cmd.status = Status::Committed;
+        }
         self.insert(cmd);
     }
 
@@ -756,6 +937,8 @@ impl Replica {
         // contact's applied state (overwriting the stale entry) so its events get
         // applied locally and the node converges.
         cmd.status = Status::Applied;
+        self.read_results.remove(&cmd.txn);
+        self.unknown_promises.remove(&cmd.txn);
         self.insert(cmd);
         true
     }
@@ -811,6 +994,7 @@ impl Replica {
             .collect();
         let newest = drop.iter().map(|txn| txn.0).max();
         for txn in &drop {
+            self.read_results.remove(txn);
             if let Some(cmd) = self.commands.remove(txn) {
                 for key in &cmd.keys {
                     if let Some(set) = self.by_key.get_mut(key) {
@@ -823,6 +1007,7 @@ impl Replica {
             }
             self.reindex_unapplied(*txn);
         }
+        self.unknown_promises.retain(|txn, _| txn.0 >= safe);
         self.redundant_before = safe;
         newest
     }
@@ -860,8 +1045,12 @@ mod tests {
         let a = txn(10);
         let b = txn(20);
 
-        replica.preaccept(a, vec![key.clone()], vec![event("k", 1)]);
-        replica.preaccept(b, vec![key.clone()], vec![event("k", 2)]);
+        replica
+            .preaccept(a, vec![key.clone()], vec![event("k", 1)])
+            .unwrap();
+        replica
+            .preaccept(b, vec![key.clone()], vec![event("k", 2)])
+            .unwrap();
 
         // B commits and its decision arrives while A is still unapplied.
         replica.commit(b, b.0, vec![a], vec![event("k", 2)], vec![], NodeId(0));
@@ -888,7 +1077,9 @@ mod tests {
 
     /// Applies `txn` end to end (preaccept → commit → decide → apply) on `key`.
     fn apply(replica: &mut Replica, t: TxnId, key: &Key, version: u16) {
-        replica.preaccept(t, vec![key.clone()], vec![event("k", version)]);
+        replica
+            .preaccept(t, vec![key.clone()], vec![event("k", version)])
+            .unwrap();
         replica.commit(t, t.0, vec![], vec![event("k", version)], vec![], NodeId(0));
         replica.record_decision(t, true);
         let ready = replica.next_apply().expect("ready to apply");
@@ -919,7 +1110,9 @@ mod tests {
         // The index was pruned: a later transaction on the same key sees no
         // conflict from the compacted-away one.
         let b = txn(30);
-        let (_, deps) = replica.preaccept(b, vec![key.clone()], vec![event("k", 2)]);
+        let (_, deps) = replica
+            .preaccept(b, vec![key.clone()], vec![event("k", 2)])
+            .unwrap();
         assert!(
             deps.is_empty(),
             "compacted command must not be a dependency"
@@ -936,7 +1129,9 @@ mod tests {
         apply(&mut replica, old, &key, 1);
         // A second transaction stays un-applied, below the requested watermark.
         let pending = txn(10);
-        replica.preaccept(pending, vec![key.clone()], vec![event("k", 2)]);
+        replica
+            .preaccept(pending, vec![key.clone()], vec![event("k", 2)])
+            .unwrap();
 
         replica.compact(txn(20).0);
 
@@ -964,8 +1159,12 @@ mod tests {
         let key = Key("k".into());
         let c = txn(10);
         let d = txn(20);
-        replica.preaccept(c, vec![key.clone()], vec![event("k", 1)]);
-        replica.preaccept(d, vec![key.clone()], vec![event("k", 2)]);
+        replica
+            .preaccept(c, vec![key.clone()], vec![event("k", 1)])
+            .unwrap();
+        replica
+            .preaccept(d, vec![key.clone()], vec![event("k", 2)])
+            .unwrap();
 
         // Apply and compact away C.
         replica.commit(c, c.0, vec![], vec![event("k", 1)], vec![], NodeId(0));
@@ -1001,7 +1200,9 @@ mod tests {
             .expect("accepted");
 
         // A later conflicting transaction must witness A as a dependency.
-        let (_, deps) = replica.preaccept(b, vec![key.clone()], vec![event("k", 1)]);
+        let (_, deps) = replica
+            .preaccept(b, vec![key.clone()], vec![event("k", 1)])
+            .unwrap();
         assert_eq!(
             deps,
             vec![a],
@@ -1031,7 +1232,9 @@ mod tests {
             NodeId(0),
         );
 
-        let (_, deps) = replica.preaccept(b, vec![key.clone()], vec![event("k", 2)]);
+        let (_, deps) = replica
+            .preaccept(b, vec![key.clone()], vec![event("k", 2)])
+            .unwrap();
         assert_eq!(deps, vec![a], "Commit must index the keys it carries");
     }
 
@@ -1042,7 +1245,9 @@ mod tests {
         let mut replica = Replica::new();
         let key = Key("k".into());
         let a = txn(10);
-        replica.preaccept(a, vec![key.clone()], vec![event("k", 1)]);
+        replica
+            .preaccept(a, vec![key.clone()], vec![event("k", 1)])
+            .unwrap();
         replica.commit(a, a.0, vec![], vec![event("k", 1)], vec![], NodeId(0));
         replica.record_decision(a, true);
 
@@ -1052,6 +1257,250 @@ mod tests {
             "a second driver must not receive the same in-flight apply"
         );
         replica.mark_applied(a, false);
+    }
+
+    /// The slow-path dependency hazard: X (t0 = 10) is raised to execute at 31
+    /// after T (t0 = 20) was witnessed here at its own t0 — T may have
+    /// fast-committed there. X's Accept must name T, or X never waits for T and
+    /// both read the same state.
+    #[test]
+    fn accept_reports_conflicts_below_the_raised_timestamp() {
+        let mut replica = Replica::new();
+        let key = Key("k".into());
+        let x = txn(10);
+        let t = txn(20);
+        replica
+            .preaccept(x, vec![key.clone()], vec![event("k", 1)])
+            .unwrap();
+        let (t_at, t_deps) = replica
+            .preaccept(t, vec![key.clone()], vec![event("k", 1)])
+            .unwrap();
+        assert_eq!((t_at, t_deps), (t.0, vec![x]), "T stands at its own t0");
+
+        let raised = txn(31).0;
+        let deps = replica
+            .accept(x, Ballot(x.0), raised, vec![], vec![key.clone()])
+            .expect("accepted");
+        assert_eq!(
+            deps,
+            vec![t],
+            "X now orders after T, so T is its dependency"
+        );
+
+        // Committed as agreed, T (at 20) executes first and X waits for it.
+        replica.commit(t, t.0, vec![x], vec![event("k", 1)], vec![], NodeId(0));
+        replica.commit(x, raised, deps, vec![event("k", 1)], vec![], NodeId(0));
+        assert_eq!(replica.next_read().expect("T is ready").txn, t);
+        assert!(replica.next_read().is_none(), "X waits for T to apply");
+        replica.record_decision(t, true);
+        assert_eq!(replica.next_apply().expect("T decided").txn, t);
+        replica.mark_applied(t, false);
+        assert_eq!(replica.next_read().expect("X is ready now").txn, x);
+    }
+
+    /// The same for a replica that missed X's PreAccept and learns it by Accept.
+    #[test]
+    fn accept_without_preaccept_reports_conflicts_below_its_timestamp() {
+        let mut replica = Replica::new();
+        let key = Key("k".into());
+        let x = txn(10);
+        let t = txn(20);
+        let later = txn(40);
+        replica
+            .preaccept(t, vec![key.clone()], vec![event("k", 1)])
+            .unwrap();
+        replica
+            .preaccept(later, vec![key.clone()], vec![event("k", 1)])
+            .unwrap();
+
+        let deps = replica
+            .accept(x, Ballot(x.0), txn(31).0, vec![], vec![key.clone()])
+            .expect("accepted");
+        assert_eq!(
+            deps,
+            vec![t],
+            "T orders before X's 31; the t0 = 40 one after"
+        );
+    }
+
+    fn ballot(micros: u64, node: u64) -> Ballot {
+        Ballot(Timestamp {
+            micros,
+            logical: 0,
+            node: NodeId(node),
+        })
+    }
+
+    /// A replica that answered a recovery blind (it never witnessed the
+    /// transaction) is fenced like any other: the original coordinator's
+    /// PreAccept and Accept, still in flight, are refused below the promise.
+    #[test]
+    fn a_blind_recovery_promise_fences_the_original_coordinator() {
+        let mut replica = Replica::new();
+        let key = Key("k".into());
+        let t = txn(20);
+        let b = ballot(50, 1);
+
+        let report = replica.recover(t, b, vec![], vec![]).expect("promised");
+        assert!(!report.known);
+        assert_eq!(
+            replica.preaccept(t, vec![key.clone()], vec![event("k", 1)]),
+            Err(b),
+            "the original PreAccept must not get a vote the recovery did not see"
+        );
+        assert_eq!(
+            replica.accept(t, Ballot(t.0), t.0, vec![], vec![key.clone()]),
+            Err(b),
+            "nor can its Accept win here"
+        );
+        assert_eq!(
+            replica.recover(t, ballot(40, 2), vec![], vec![]).err(),
+            Some(b),
+            "a lower recovery is refused too"
+        );
+        // The recovery's own Accept, at its ballot, goes through.
+        replica
+            .accept(t, b, t.0, vec![], vec![key])
+            .expect("the recovery's own Accept");
+        assert_eq!(replica.status(t), Some(Status::Accepted));
+    }
+
+    /// Handed the transaction's keys and events, a replica that never witnessed
+    /// it pre-accepts it under the recovery's ballot: its vote counts, and the
+    /// original coordinator's late PreAccept is refused.
+    #[test]
+    fn a_recovery_preaccepts_what_it_hands_an_unknown_replica() {
+        let mut replica = Replica::new();
+        let key = Key("k".into());
+        let t = txn(20);
+        let b = ballot(50, 1);
+
+        let report = replica
+            .recover(t, b, vec![key.clone()], vec![event("k", 1)])
+            .expect("promised");
+        assert!(report.known);
+        assert_eq!(report.status, Status::PreAccepted);
+        assert_eq!(report.execute_at, t.0, "no conflict here: the vote is t0");
+        assert_eq!(replica.preaccept(t, vec![key], vec![event("k", 1)]), Err(b));
+    }
+
+    /// An earlier conflict committed to execute after T's t0 without T in its
+    /// dependencies proves T never took the fast path: that conflict's Accept
+    /// quorum meets any fast quorum, whose replies would have named T.
+    #[test]
+    fn an_earlier_conflict_committed_past_t0_without_the_txn_rejects_the_fast_path() {
+        let mut replica = Replica::new();
+        let key = Key("k".into());
+        let x = txn(10);
+        let t = txn(20);
+        replica
+            .preaccept(x, vec![key.clone()], vec![event("k", 1)])
+            .unwrap();
+        replica.commit(x, txn(31).0, vec![], vec![event("k", 1)], vec![], NodeId(0));
+        replica
+            .preaccept(t, vec![key.clone()], vec![event("k", 2)])
+            .unwrap();
+
+        let report = replica.recover(t, ballot(50, 1), vec![], vec![]).unwrap();
+        assert!(report.superseding_rejects);
+        assert!(!report.wait);
+    }
+
+    /// The same conflict only *accepted* proves nothing yet — another replica's
+    /// Accept reply may still put T in its committed dependencies — so recovery
+    /// must wait for it to commit.
+    #[test]
+    fn an_earlier_conflict_only_accepted_past_t0_makes_recovery_wait() {
+        let mut replica = Replica::new();
+        let key = Key("k".into());
+        let x = txn(10);
+        let t = txn(20);
+        replica
+            .preaccept(x, vec![key.clone()], vec![event("k", 1)])
+            .unwrap();
+        replica
+            .accept(x, Ballot(x.0), txn(31).0, vec![], vec![key.clone()])
+            .unwrap();
+        replica
+            .preaccept(t, vec![key.clone()], vec![event("k", 2)])
+            .unwrap();
+
+        let report = replica.recover(t, ballot(50, 1), vec![], vec![]).unwrap();
+        assert!(!report.superseding_rejects);
+        assert!(report.wait);
+    }
+
+    /// Promises for transactions this replica never witnessed stay out of the
+    /// un-applied state (they never pin the watermark) and are dropped once
+    /// the watermark passes them.
+    #[test]
+    fn blind_promises_are_dropped_below_the_watermark() {
+        let mut replica = Replica::new();
+        let t = txn(20);
+        replica.recover(t, ballot(50, 1), vec![], vec![]).unwrap();
+        assert!(!replica.has_unapplied());
+        assert_eq!(replica.applied_through(txn(100).0), txn(100).0);
+
+        replica.compact(txn(30).0);
+        assert!(replica.unknown_promises.is_empty());
+    }
+
+    /// A read is taken once: its result stays answerable while the command holds
+    /// its slot (so a recovery coordinator that takes over still gets it), and
+    /// is forgotten once the decision is enacted.
+    #[test]
+    fn a_read_result_stays_answerable_until_applied() {
+        let mut replica = Replica::new();
+        let key = Key("k".into());
+        let a = txn(10);
+        replica
+            .preaccept(a, vec![key.clone()], vec![event("k", 1)])
+            .unwrap();
+        replica.commit(a, a.0, vec![], vec![event("k", 1)], vec![], NodeId(0));
+        assert_eq!(replica.read_result(a), None, "not read yet");
+
+        assert_eq!(replica.next_read().expect("ready to read").txn, a);
+        replica.record_read(a, true);
+        assert!(
+            replica.next_read().is_none(),
+            "a held slot is not read again"
+        );
+        assert_eq!(replica.read_result(a), Some(true));
+
+        replica.record_decision(a, true);
+        assert_eq!(replica.next_apply().expect("decided").txn, a);
+        replica.mark_applied(a, false);
+        assert_eq!(
+            replica.read_result(a),
+            None,
+            "applied: the outcome answers now"
+        );
+        assert_eq!(replica.applied_result(a), Some(false));
+    }
+
+    /// A command journaled mid-read (its read result is not durable) comes back
+    /// from a restart ready to be read again, instead of holding its slot with
+    /// nothing to answer.
+    #[test]
+    fn a_restored_reading_command_is_read_again() {
+        let mut replica = Replica::new();
+        let key = Key("k".into());
+        let a = txn(10);
+        replica.restore(CommandState {
+            txn: a,
+            status: Status::Reading,
+            promised: Ballot(a.0),
+            accepted: Ballot(a.0),
+            execute_at: a.0,
+            deps: vec![],
+            keys: vec![key],
+            events: vec![event("k", 1)],
+            reply_to: NodeId(0),
+            decision: None,
+            applied_conflict: None,
+        });
+        assert_eq!(replica.status(a), Some(Status::Committed));
+        assert_eq!(replica.next_read().expect("read again").txn, a);
     }
 
     /// The watermark only ever moves forward; a lower or equal `compact` is a

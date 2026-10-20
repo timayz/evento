@@ -45,6 +45,11 @@ pub struct GroupHost {
     clock: Option<Arc<HybridLogicalClock>>,
     rejoin: Option<RejoinHandler>,
     groups: Mutex<HashMap<GroupId, Running>>,
+    /// One open per group at a time. The transport keeps a single inbox per
+    /// group, so a second open registering its own would cut the first node
+    /// off from every frame; it waits instead, and finds the group open.
+    /// Removed once no open of the group is running or waiting.
+    opening: Mutex<HashMap<GroupId, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl GroupHost {
@@ -59,6 +64,7 @@ impl GroupHost {
             clock: None,
             rejoin: None,
             groups: Mutex::new(HashMap::new()),
+            opening: Mutex::new(HashMap::new()),
         }
     }
 
@@ -105,7 +111,9 @@ impl GroupHost {
     /// for it), builds its [`Node`] over the given store/journal/topology,
     /// **recovers** consensus state from the journal, starts the inbox loop, and
     /// schedules its sweeps. Idempotent: an already-open group's node is returned
-    /// as is. On a recovery error nothing is left registered.
+    /// as is, and concurrent opens of one group are serialized — the later
+    /// ones wait and return the node the first opened. On a recovery error
+    /// nothing is left registered.
     pub async fn open(
         &self,
         group: GroupId,
@@ -161,6 +169,41 @@ impl GroupHost {
         if let Some(node) = self.get(group) {
             return Ok(node);
         }
+        let lock = Arc::clone(
+            self.opening
+                .lock()
+                .expect("opening poisoned")
+                .entry(group)
+                .or_default(),
+        );
+        let opened = {
+            let _opening = lock.lock().await;
+            match self.get(group) {
+                Some(node) => Ok(node),
+                None => {
+                    self.open_locked(group, topology, datastore, journal, config, contacts)
+                        .await
+                }
+            }
+        };
+        // The map's handle and ours: nobody else is opening this group.
+        let mut opening = self.opening.lock().expect("opening poisoned");
+        if Arc::strong_count(&lock) == 2 {
+            opening.remove(&group);
+        }
+        opened
+    }
+
+    /// [`open_with`](Self::open_with)'s work, under the group's open lock.
+    async fn open_locked(
+        &self,
+        group: GroupId,
+        topology: Arc<dyn Topology>,
+        datastore: Arc<dyn DataStore>,
+        journal: Arc<dyn Journal>,
+        config: NodeConfig,
+        contacts: &[NodeId],
+    ) -> anyhow::Result<Node> {
         let inbox = self.mux.register(group);
         let clock = self
             .clock
@@ -233,17 +276,7 @@ impl GroupHost {
             })
         });
 
-        let mut groups = self.groups.lock().expect("groups poisoned");
-        // Lost a race with a concurrent `open` of the same group: keep the first.
-        if let Some(existing) = groups.get(&group) {
-            self.scheduler.add(group, Arc::new(existing.node.clone()));
-            inbox_task.abort();
-            if let Some(task) = rejoin_task {
-                task.abort();
-            }
-            return Ok(existing.node.clone());
-        }
-        groups.insert(
+        self.groups.lock().expect("groups poisoned").insert(
             group,
             Running {
                 node: node.clone(),

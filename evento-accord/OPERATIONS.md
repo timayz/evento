@@ -56,6 +56,11 @@ let executor = AccordExecutor::new(node, fjall);                // drop-in event
   `accord` feature) or `evento_sql::SqlJournal` (`evento-sql`'s `accord` feature).
 - **App code is unchanged:** `AccordExecutor` is a drop-in `evento_core::Executor`, so
   `evento::create()/append()`, reads, subscriptions, and snapshots work as usual.
+- **The sweep is required, not optional:** besides recovery and compaction, it runs
+  the anti-entropy rounds that prove what a node holds, and a node's subscriptions
+  only process events below the window it has proven (§5). A node that never sweeps
+  (`start_recovery`, or a `SweepScheduler` for many groups) never releases events
+  to its subscriptions. A single-node group needs no proof.
 - **Static vs dynamic membership:** use `StaticTopology` for a fixed cluster;
   `DynamicTopology` if you need online membership/shard changes (§6).
 
@@ -72,6 +77,7 @@ timeouts for geo/WAN** deployments.
 | `collect_timeout` | 5 s | Cap on the later phases (Accept/Read/Apply). Only bounds a genuinely stuck phase. |
 | `recovery_interval` | 100 ms | How often the recovery/anti-entropy/compaction sweep runs. |
 | `recovery_timeout` | 300 ms | A txn unapplied this long is presumed stalled and recovered. Keep well above normal write latency. |
+| `anti_entropy_interval` | 250 ms | Pace of the anti-entropy rounds (one peer per round, in turn). Each round also proves the window a node holds, which both its compaction report and its subscriptions wait for: subscriptions trail the present by about `compaction_margin` plus `(slow quorum − 1)` rounds. Keep it well below `compaction_margin`. |
 | `compaction_margin` | 1 s | Lag on the redundancy watermark; keep above clock-skew bound + propagation latency. |
 | `max_journal_batch` | 128 | Messages drained per group-commit fsync (latency vs. fsync amortization). |
 | `phi_threshold` | 8.0 | Phi-accrual suspicion level; higher tolerates more latency variance before suspecting a coordinator. |
@@ -126,6 +132,7 @@ Serve it on an HTTP endpoint (see `bank-axum-accord`'s `/metrics`). Counters:
 | `rejoins_required` | a peer told this node to rejoin: it had been given up on while writes it never applied were compacted. The node is stale until its host rejoins it (§7). |
 | `snapshot_pages` | snapshot pages this node served to joining peers; a joiner pulls one per `snapshot_page_events` / `snapshot_page_bytes` of the contact's store. |
 | `joins_partial` | joins of this node that failed after a page was installed: the store holds a prefix no contact can complete, and must be emptied before the next join (§7). Steady > 0 = a contact that cannot read its backend, or a link losing pages faster than the per-page retries cover. |
+| `execution_failures` | data-store applies and commit-condition reads that failed. The transaction is neither marked applied nor acknowledged, and is retried on the next drive (a message, or the sweep). Occasional = transient lock contention; **sustained** = this replica's store cannot take writes (full disk, broken connection), so it falls behind until it can. |
 
 **Health/readiness.**
 - *Liveness:* a simple `200` while the process is up (`bank-axum-accord`'s `/health`).
@@ -134,8 +141,17 @@ Serve it on an HTTP endpoint (see `bank-axum-accord`'s `/metrics`). Counters:
   the local backend's applied version tracking the cluster. For strict freshness, use
   `linearizable_reads` (§10) rather than a readiness gate.
 
+**Subscription lag.** A node's subscriptions process events below its *stability
+watermark*: the present less `compaction_margin`, below any un-applied transaction it
+knows, and below the window anti-entropy has proven with enough peers (a slow quorum,
+counting itself). A node cut off from part of its peers' writes cannot vouch for them,
+so after a start, a restart or a heal its subscriptions wait for a sync round instead
+of advancing past events still on their way. Sustained `watermark_clamps` growth
+means those rounds keep failing, and the subscriptions on that node are stalled.
+
 Suggested alerts: `recoveries` rate > 0 for several minutes; `compactions` flat while
-`writes_committed` climbs; `messages_shed` rate > 0; backlog approaching `max_commands`.
+`writes_committed` climbs; `messages_shed` rate > 0; backlog approaching `max_commands`;
+`execution_failures` rate > 0 for more than a few seconds.
 
 ---
 
@@ -172,6 +188,11 @@ metadata log (config-Paxos); concurrent reconfigurations converge without a lead
   restores the metadata-log/acceptor state and redundancy watermark. Then
   `start()`/`start_recovery()`. In-flight transactions resume via the sweep, and
   anti-entropy catches the node up. (See `tests/restart.rs`.)
+- **A write the caller abandons** (a client that hung up, a `timeout`) is not undone:
+  its coordinator may already have reached the replicas. The node stops coordinating
+  it, and the transaction is finished by recovery, like one whose coordinator
+  vanished. A retry is a new write: if the abandoned one committed, the retry loses
+  the version condition.
 - **A coordinator overtaken by recovery:** a node can take over a write whose
   coordinator is alive but slow or wrongly suspected, or which reached it late (a
   group it had not opened yet). The coordinator's own rounds then fail, but the write

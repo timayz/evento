@@ -963,3 +963,69 @@ async fn a_host_rejoins_a_group_its_peers_gave_up_on() {
     }
     assert_eq!(committed(&g.stores[2]), committed(&g.stores[0]));
 }
+
+/// A journal whose restart load pauses, so two opens of one group overlap.
+struct SlowJournal(Arc<InMemoryJournal>, Duration);
+
+#[async_trait::async_trait]
+impl Journal for SlowJournal {
+    async fn record(&self, state: &evento_accord::CommandState) -> anyhow::Result<()> {
+        self.0.record(state).await
+    }
+    async fn load(&self, txn: TxnId) -> anyhow::Result<Option<evento_accord::CommandState>> {
+        self.0.load(txn).await
+    }
+    async fn load_all(&self) -> anyhow::Result<Vec<evento_accord::CommandState>> {
+        self.0.load_all().await
+    }
+    async fn load_watermark(&self) -> anyhow::Result<Option<Timestamp>> {
+        tokio::time::sleep(self.1).await;
+        self.0.load_watermark().await
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_opens_of_one_group_leave_one_working_node() {
+    let cluster = Arc::new(MuxCluster::start(3, Duration::from_secs(5)).await);
+    let group = Arc::new(Group::new(GroupId(77), 3));
+    let nodes = [cluster.open(&group, 0).await, cluster.open(&group, 1).await];
+
+    // A request and the unrouted handler race to open the group on host 2: the
+    // first to start is also the first to finish recovering its state.
+    let open = |pause: Duration| {
+        let (cluster, group) = (Arc::clone(&cluster), Arc::clone(&group));
+        tokio::spawn(async move {
+            cluster.hosts[2]
+                .open(
+                    group.id,
+                    cluster.topology(2),
+                    Arc::clone(&group.stores[2]) as Arc<dyn DataStore>,
+                    Arc::new(SlowJournal(Arc::clone(&group.journals[2]), pause))
+                        as Arc<dyn Journal>,
+                    NodeConfig::default(),
+                )
+                .await
+                .expect("open")
+        })
+    };
+    let first = open(Duration::from_millis(50));
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let second = open(Duration::from_millis(100));
+    let (first, second) = (first.await.unwrap(), second.await.unwrap());
+    assert_eq!(cluster.hosts[2].len(), 1);
+    let kept = cluster.hosts[2].get(group.id).expect("open");
+    for node in [&first, &second] {
+        assert!(
+            Arc::ptr_eq(&kept.metrics_handle(), &node.metrics_handle()),
+            "both opens return the one node the host keeps"
+        );
+    }
+
+    // The surviving node still hears its peers: it applies a peer's write…
+    write(&nodes[0], vec![event("acc", 1, "Opened")]).await;
+    group.await_applied(1).await;
+    // …and coordinates one of its own.
+    write(&kept, vec![event("acc", 2, "Bumped")]).await;
+    group.await_applied(2).await;
+    group.assert_identical_order(2);
+}

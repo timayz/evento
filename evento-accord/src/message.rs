@@ -340,6 +340,38 @@ pub enum Message {
     /// snapshot before it takes part again (`Node::rejoin_required`); `above`
     /// is the highest compacted `t0` it may be missing.
     Rejoin { above: Timestamp },
+    /// Recovery coordinator → replicas: take `txn` over under `ballot`, like
+    /// [`Recover`](Message::Recover), carrying the keys and events the
+    /// coordinator holds for it. A replica that never witnessed the transaction
+    /// pre-accepts its owned part under the ballot, so its vote counts and the
+    /// original coordinator can no longer win it there; one that owns none of
+    /// it still remembers the promise. Answered by
+    /// [`BeginRecoveryOk`](Message::BeginRecoveryOk).
+    BeginRecovery {
+        txn: TxnId,
+        ballot: Ballot,
+        keys: Vec<Key>,
+        #[serde(with = "wire_events")]
+        events: Vec<Event>,
+    },
+    /// Replica → recovery coordinator: a [`RecoverOk`](Message::RecoverOk) plus
+    /// `wait` — an earlier conflict was accepted to execute after `txn`'s `t0`
+    /// without witnessing it, so until that conflict commits nobody can tell
+    /// whether `txn` could have taken the fast path.
+    BeginRecoveryOk {
+        txn: TxnId,
+        ballot: Ballot,
+        known: bool,
+        status: Status,
+        accepted: Ballot,
+        execute_at: Timestamp,
+        deps: Vec<TxnId>,
+        superseding_rejects: bool,
+        wait: bool,
+        keys: Vec<Key>,
+        #[serde(with = "wire_events")]
+        events: Vec<Event>,
+    },
 }
 
 impl Message {
@@ -382,6 +414,8 @@ impl Message {
             | Message::Recover { txn, .. }
             | Message::RecoverOk { txn, .. }
             | Message::Nack { txn, .. }
+            | Message::BeginRecovery { txn, .. }
+            | Message::BeginRecoveryOk { txn, .. }
             | Message::ReadProbeOk { txn, .. } => Some(*txn),
             // A request the replica handles inline (not routed to a coordinator).
             Message::ReadProbe { .. } => None,
