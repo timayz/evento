@@ -274,7 +274,13 @@ control plane, everything else is Accord.
   meets a routed report switches to the routed path. Skipping a compacted shard drops
   its read, so a decided txn re-driven without it takes the decision from a replica
   that applied it (`execute` waits for that replica's answer to the Commit — it is the
-  decision) and decides nothing while none is heard from.
+  decision) and decides nothing while none is heard from. That replica may be a
+  straggler of the skipped shard itself, not compacted yet: it is sent the Commit and
+  its answer counts like a read, though its shard needs no read or apply quorum (#305).
+  A replica never re-creates a txn below its watermark that it does not hold
+  (`Replica::compacted`): PreAccept, Accept and Commit leave it alone, and an
+  unrouted recovery hears it is below the watermark, so a decider that compacts
+  mid-recovery, or a replayed message, cannot execute an applied txn again.
 - **M3 — Multi-shard transactions.** ✅ `ShardedTopology` partitions keys into
   **disjoint** shards, each with its own replica set; the coordinator reaches a
   quorum in **each** touched shard (`plan` + `collect_by_shard` group responses
@@ -818,6 +824,10 @@ backend (sql/fjall). Phases, in order:
         fast-committed without it, but was still only pre-accepted at every
         replica heard from, was re-proposed at `t0`. It then ordered before a
         write that never waited for it.
+        A recovery that skipped a compacted shard dropped the Applied report
+        of that shard's straggler, and re-read the other shards alone: it
+        could commit what the compacted shard aborted. It now takes the
+        decision from that straggler (#305, see M2).
         **Open** (confirmed or plausible, not yet fixed):
         a decided multi-shard txn whose shard compacted it, with no replica heard
         from that applied it, stays undecided (liveness, not safety);

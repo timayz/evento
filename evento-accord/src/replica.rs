@@ -212,6 +212,16 @@ pub struct ApplyReady {
     pub reply_to: NodeId,
 }
 
+/// Why a replica casts no vote on a PreAccept or Accept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// A recovery promised this higher ballot here: the sender is fenced.
+    Promised(Ballot),
+    /// The transaction is below the redundancy watermark and not held (see
+    /// [`Replica::compacted`]): nothing is recorded, and nothing answered.
+    Compacted,
+}
+
 /// What a replica answers a routed recovery (`Message::Routed` around a
 /// `BeginRecovery`) with: a report on a transaction it holds, or — never
 /// pre-accepting one it does not — that it never witnessed it.
@@ -490,17 +500,29 @@ impl Replica {
     /// a recovery has promised a higher ballot here — for a known command, or
     /// for one this replica answered "unknown" — it is refused with
     /// `Err(promised)`, so that coordinator can no longer gather a vote the
-    /// recovery did not see.
+    /// recovery did not see. A [`compacted`](Self::compacted) transaction is
+    /// refused too.
     pub fn preaccept(
         &mut self,
         txn: TxnId,
         keys: Vec<Key>,
         events: Vec<Event>,
-    ) -> Result<(Timestamp, Vec<TxnId>), Ballot> {
+    ) -> Result<(Timestamp, Vec<TxnId>), Refusal> {
+        if self.compacted(txn) {
+            return Err(Refusal::Compacted);
+        }
         if let Some(promised) = self.promise_of(txn).filter(|p| *p > Ballot(txn.0)) {
-            return Err(promised);
+            return Err(Refusal::Promised(promised));
         }
         Ok(self.witness(txn, Ballot(txn.0), keys, events))
+    }
+
+    /// Whether `txn` is below the redundancy watermark and not held: applied
+    /// here and compacted away, or never witnessed and never to be (no
+    /// coordinator's message outlives the compaction margin). Either way it
+    /// must not be re-created — an applied one would execute a second time.
+    pub fn compacted(&self, txn: TxnId) -> bool {
+        txn.0 < self.redundant_before && !self.commands.contains_key(&txn)
     }
 
     /// The ballot this replica has promised for `txn`, known or not.
@@ -598,10 +620,13 @@ impl Replica {
         execute_at: Timestamp,
         deps: Vec<TxnId>,
         keys: Vec<Key>,
-    ) -> Result<Vec<TxnId>, Ballot> {
+    ) -> Result<Vec<TxnId>, Refusal> {
+        if self.compacted(txn) {
+            return Err(Refusal::Compacted);
+        }
         if let Some(cmd) = self.commands.get_mut(&txn) {
             if ballot < cmd.promised {
-                return Err(cmd.promised);
+                return Err(Refusal::Promised(cmd.promised));
             }
             // Commit is terminal: a (possibly reordered/stale) Accept must never
             // downgrade an already-committed transaction's final timestamp/deps —
@@ -621,7 +646,7 @@ impl Replica {
         } else {
             if let Some(&promised) = self.unknown_promises.get(&txn) {
                 if ballot < promised {
-                    return Err(promised);
+                    return Err(Refusal::Promised(promised));
                 }
             }
             self.unknown_promises.remove(&txn);
@@ -666,7 +691,8 @@ impl Replica {
     /// Handles Commit: finalises the execution timestamp, dependencies, events,
     /// and the node to report the result to. Idempotent — once a command is
     /// Committed or Applied its decision is not downgraded, but `reply_to` is
-    /// refreshed so a recoverer can still collect the outcome.
+    /// refreshed so a recoverer can still collect the outcome. A
+    /// [`compacted`](Self::compacted) transaction is ignored.
     pub fn commit(
         &mut self,
         txn: TxnId,
@@ -676,6 +702,9 @@ impl Replica {
         keys: Vec<Key>,
         reply_to: NodeId,
     ) {
+        if self.compacted(txn) {
+            return;
+        }
         // A Commit is the decision itself: no ballot fences it.
         self.unknown_promises.remove(&txn);
         if self.commands.contains_key(&txn) {
@@ -786,6 +815,25 @@ impl Replica {
             keys: cmd.keys.clone(),
             events: cmd.events.clone(),
         })
+    }
+
+    /// Handles an unrouted `BeginRecovery` under `ballot`: as
+    /// [`recover`](Self::recover), but a [`compacted`](Self::compacted)
+    /// transaction is answered from below the watermark, as
+    /// [`recover_routed`](Self::recover_routed) does, rather than
+    /// pre-accepted afresh.
+    pub fn recover_unrouted(
+        &mut self,
+        txn: TxnId,
+        ballot: Ballot,
+        keys: Vec<Key>,
+        events: Vec<Event>,
+    ) -> Result<RoutedRecovery, Ballot> {
+        if self.compacted(txn) {
+            return Ok(RoutedRecovery::NotWitnessed { redundant: true });
+        }
+        self.recover(txn, ballot, keys, events)
+            .map(RoutedRecovery::Known)
     }
 
     /// Handles a **routed** recovery under `ballot`: like
@@ -1892,12 +1940,12 @@ mod tests {
         assert!(!report.known);
         assert_eq!(
             replica.preaccept(t, vec![key.clone()], vec![event("k", 1)]),
-            Err(b),
+            Err(Refusal::Promised(b)),
             "the original PreAccept must not get a vote the recovery did not see"
         );
         assert_eq!(
             replica.accept(t, Ballot(t.0), t.0, vec![], vec![key.clone()]),
-            Err(b),
+            Err(Refusal::Promised(b)),
             "nor can its Accept win here"
         );
         assert_eq!(
@@ -1928,7 +1976,10 @@ mod tests {
         assert!(report.known);
         assert_eq!(report.status, Status::PreAccepted);
         assert_eq!(report.execute_at, t.0, "no conflict here: the vote is t0");
-        assert_eq!(replica.preaccept(t, vec![key], vec![event("k", 1)]), Err(b));
+        assert_eq!(
+            replica.preaccept(t, vec![key], vec![event("k", 1)]),
+            Err(Refusal::Promised(b))
+        );
     }
 
     /// An earlier conflict committed to execute after T's t0 without T in its
@@ -2014,7 +2065,7 @@ mod tests {
         assert_eq!(replica.unknown_promise(t), Some(b));
         assert_eq!(
             replica.preaccept(t, vec![key.clone()], vec![event("k", 1)]),
-            Err(b)
+            Err(Refusal::Promised(b))
         );
         assert!(matches!(
             replica.recover_routed(t, ballot(40, 2), vec![], vec![]),
@@ -2028,6 +2079,43 @@ mod tests {
             Ok(RoutedRecovery::NotWitnessed { redundant: true })
         ));
         assert_eq!(replica.unknown_promise(old), None);
+    }
+
+    /// Below the redundancy watermark, a transaction not held is never
+    /// re-created: an applied one compacted away would execute again. No
+    /// message re-creates it, and a recovery hears it is below the watermark.
+    #[test]
+    fn a_compacted_transaction_is_never_re_created() {
+        let mut replica = Replica::new();
+        let key = Key("k".into());
+        let t = txn(5);
+        replica.compact(txn(10).0);
+        assert!(replica.compacted(t));
+
+        assert_eq!(
+            replica.preaccept(t, vec![key.clone()], vec![event("k", 1)]),
+            Err(Refusal::Compacted)
+        );
+        assert_eq!(
+            replica.accept(t, ballot(50, 1), t.0, vec![], vec![key.clone()]),
+            Err(Refusal::Compacted)
+        );
+        replica.commit(
+            t,
+            t.0,
+            vec![],
+            vec![event("k", 1)],
+            vec![key.clone()],
+            NodeId(0),
+        );
+        assert_eq!(replica.status(t), None, "nothing was re-created");
+        assert_eq!(replica.applied_result(t), None);
+        assert!(matches!(
+            replica.recover_unrouted(t, ballot(50, 1), vec![key], vec![event("k", 1)]),
+            Ok(RoutedRecovery::NotWitnessed { redundant: true })
+        ));
+        assert_eq!(replica.status(t), None, "recovery pre-accepted nothing");
+        assert_eq!(replica.unknown_promise(t), None);
     }
 
     /// An invalidated command is applied as an abort without executing, is
@@ -2091,7 +2179,7 @@ mod tests {
         replica.restore_promise(t, b);
         assert_eq!(
             replica.preaccept(t, vec![key.clone()], vec![event("k", 1)]),
-            Err(b)
+            Err(Refusal::Promised(b))
         );
 
         let known = txn(30);
