@@ -551,6 +551,23 @@ type SyncPayload = (Timestamp, Timestamp, Vec<Event>, Vec<CommandState>);
 /// A join contact's vouch ([`Message::JoinProof`]): `(epoch, vouched)`.
 type Vouch = (u64, Timestamp);
 
+/// Most bytes of an owner's error a [`Message::ReadFailed`] carries back.
+const READ_FAILURE_MAX: usize = 256;
+
+/// `err` as a [`Message::ReadFailed`] reason: its chain, cut to
+/// [`READ_FAILURE_MAX`] bytes on a character boundary.
+fn read_failure(err: &anyhow::Error) -> String {
+    let mut reason = format!("{err:#}");
+    if reason.len() > READ_FAILURE_MAX {
+        let mut cut = READ_FAILURE_MAX;
+        while !reason.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        reason.truncate(cut);
+    }
+    reason
+}
+
 /// Delivers each sync response to its in-flight [`join`](Node::join)/anti-entropy
 /// request, keyed by the request's correlation id — so a concurrent join and
 /// anti-entropy round cannot steal each other's data.
@@ -1804,6 +1821,7 @@ impl Node {
                 | Message::MetadataEntries { .. }
                 | Message::ReadForward { .. }
                 | Message::ReadReply { .. }
+                | Message::ReadFailed { .. }
                 | Message::ReadProbe { .. }
                 | Message::ReadProbeOk { .. }
         );
@@ -2459,7 +2477,9 @@ impl Node {
                     let _ = tx.send((from, response));
                 }
             }
-            // A forwarded read: serve it from the local backend and reply.
+            // A forwarded read: serve it from the local backend and reply —
+            // with the failure if the store refused it: an empty page would
+            // read as "no such events".
             Message::ReadForward {
                 id,
                 aggregators,
@@ -2467,27 +2487,35 @@ impl Node {
                 args,
                 to_micros,
             } => {
-                let result = self
+                let reply = match self
                     .datastore
                     .read(aggregators.map(Arc::from), routing_key, args, to_micros)
                     .await
-                    .unwrap_or_default();
-                let page_info = result.page_info;
-                let mut cursors = Vec::with_capacity(result.edges.len());
-                let mut events = Vec::with_capacity(result.edges.len());
-                for edge in result.edges {
-                    cursors.push(edge.cursor);
-                    events.push(edge.node);
-                }
-                out.push((
-                    from,
-                    Message::ReadReply {
-                        id,
-                        cursors,
-                        events,
-                        page_info,
-                    },
-                ));
+                {
+                    Ok(result) => {
+                        let page_info = result.page_info;
+                        let mut cursors = Vec::with_capacity(result.edges.len());
+                        let mut events = Vec::with_capacity(result.edges.len());
+                        for edge in result.edges {
+                            cursors.push(edge.cursor);
+                            events.push(edge.node);
+                        }
+                        Message::ReadReply {
+                            id,
+                            cursors,
+                            events,
+                            page_info,
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(node = self.id.0, %err, "cannot serve a forwarded read");
+                        Message::ReadFailed {
+                            id,
+                            reason: read_failure(&err),
+                        }
+                    }
+                };
+                out.push((from, reply));
             }
             // Read-index probe: a pure query of the conflict graph — report the
             // deps a read at `txn` would witness over `key`, storing nothing.
@@ -2506,9 +2534,9 @@ impl Node {
                     },
                 ));
             }
-            reply @ Message::ReadReply { .. } => {
+            reply @ (Message::ReadReply { .. } | Message::ReadFailed { .. }) => {
                 let id = match &reply {
-                    Message::ReadReply { id, .. } => *id,
+                    Message::ReadReply { id, .. } | Message::ReadFailed { id, .. } => *id,
                     _ => unreachable!(),
                 };
                 let tx = self
@@ -5084,6 +5112,9 @@ impl Node {
                     .collect();
                 Ok(ReadResult { edges, page_info })
             }
+            Ok(Some(Message::ReadFailed { reason, .. })) => {
+                anyhow::bail!("forwarded read to {to:?} failed: {reason}")
+            }
             _ => anyhow::bail!("forwarded read to {to:?} failed"),
         }
     }
@@ -5418,6 +5449,17 @@ mod tests {
     use crate::{api::MessageSink, StaticTopology};
 
     use super::{Node, NodeConfig};
+
+    /// A failed read's reason is cut short on a character boundary, keeping
+    /// the start of the error chain.
+    #[test]
+    fn a_read_failure_reason_is_cut_on_a_char_boundary() {
+        let err = anyhow::anyhow!("é".repeat(super::READ_FAILURE_MAX)).context("query failed");
+        let reason = super::read_failure(&err);
+        assert!(reason.len() <= super::READ_FAILURE_MAX);
+        assert!(reason.starts_with("query failed: é"));
+        assert_eq!(super::read_failure(&anyhow::anyhow!("short")), "short");
+    }
 
     /// A [`Journal`] that counts `stage`/`flush` calls so a test can observe
     /// group commit: many staged writes, few flushes.
