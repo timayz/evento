@@ -31,7 +31,7 @@ does not resolve pre-releases):
 
 ```toml
 [dependencies]
-evento = { version = "2.0.0-alpha.27", features = ["sqlite"] }
+evento = { version = "2.0.0-alpha.35", features = ["sqlite"] }
 bitcode = "0.6"
 anyhow = "1"
 tracing-subscriber = "0.3"
@@ -520,11 +520,16 @@ view bank::query::account_balance::AccountBalanceView rev=0 { balance: i64, …,
 - Write-side `#[evento::snapshot(none | memory)]` state and SQL read models are not
   persisted as bitcode, so they are not in the lock: they change freely.
 
+```toml
+[dev-dependencies]
+evento = { version = "2.0.0-alpha.35", features = ["lock"] }
+```
+
 ```rust,ignore
-// tests/events_lock.rs, with evento-lock as a dev-dependency
+// tests/events_lock.rs
 #[test]
 fn persisted_shapes_only_grow() {
-    evento_lock::check(env!("CARGO_MANIFEST_DIR")).unwrap();
+    evento::lock::check(env!("CARGO_MANIFEST_DIR")).unwrap();
 }
 ```
 
@@ -710,6 +715,7 @@ Full macro reference: [evento-macro/README.md](evento-macro/README.md).
 - `sqlite` / `postgres` / `mysql` - Individual SQL backends with migrations
 - `fjall` - Embedded key-value storage with Fjall
 - `remote` - Client/server executor over framed TCP
+- `lock` - `evento::lock`, the `events.lock` checker (enable it on a dev-dependency)
 - `group` - Multi-executor support for querying across databases
 - `rw` - Executor combinators: `Rw` (read-write split) and `Sidecar` (events on a shared store, subscription cursors and snapshots on a local one)
 
