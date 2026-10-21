@@ -28,7 +28,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use evento_core::Event;
 
-use crate::api::floor_millis;
+use crate::api::{floor_millis, snapshot_event_size};
 use crate::clock::{Ballot, NodeId, Timestamp, TxnId};
 use crate::message::{CommandState, Key, Status};
 
@@ -115,6 +115,37 @@ impl Default for Replica {
             routes: HashMap::new(),
         }
     }
+}
+
+/// The approximate size of `cmd` on the wire inside a
+/// [`Message`](crate::Message): its events ([`snapshot_event_size`]) plus
+/// its keys, its dependencies and the fixed fields (ids, ballots,
+/// timestamps, status). What an anti-entropy reply's and a command page's
+/// byte budget counts.
+pub(crate) fn command_size(cmd: &CommandState) -> usize {
+    const FIXED: usize = 128;
+    const TXN: usize = 24;
+    FIXED
+        + cmd.deps.len() * TXN
+        + cmd.keys.iter().map(|key| key.0.len() + 8).sum::<usize>()
+        + cmd.events.iter().map(snapshot_event_size).sum::<usize>()
+}
+
+/// Whether one more command of `events` events and `bytes` bytes still fits
+/// a page already holding `taken` commands of `count` events and `size`
+/// bytes: within both budgets, except that the first command always fits —
+/// a single command larger than the budget still crosses alone (the same
+/// rule as [`DataStore::snapshot_page`](crate::DataStore::snapshot_page)).
+fn fits_page(
+    taken: usize,
+    count: usize,
+    size: usize,
+    events: usize,
+    bytes: usize,
+    max_events: u16,
+    max_bytes: usize,
+) -> bool {
+    taken == 0 || (count + events <= usize::from(max_events) && size + bytes <= max_bytes)
 }
 
 /// Whether a command at `status` is awaiting execution (in the `pending` queue):
@@ -1030,23 +1061,98 @@ impl Replica {
         )
     }
 
-    /// Applied commands with `t0 >= since` that are not in `known`, in
-    /// execution-timestamp order — what an anti-entropy requester holding
-    /// `known` above its floor `since` is missing. O(window), and empty (no
-    /// clones at all) when the peers are in sync.
+    /// Applied commands with `t0 >= since` that are not in `known` — what an
+    /// anti-entropy requester holding `known` above its floor `since` is
+    /// missing — as an execution-timestamp-ordered prefix within `max_events`
+    /// events and `max_bytes` of `command_size` (at least one command while
+    /// any is missing), plus the oldest `t0` of what the budget left out.
+    /// O(window), and empty (no clones at all) when the peers are in sync.
+    ///
+    /// The prefix is in execution order because the requester applies it in
+    /// that order, stopping at a failure: every missing command executing
+    /// before a shipped one is shipped too. The `t0`s it leaves out are not
+    /// above the shipped ones, though — a slow-path commit executes past
+    /// later `t0`s — so the coverage a reply proves must stay below the
+    /// oldest of them, not merely below the last command shipped.
     pub fn export_applied_missing(
         &self,
         since: Timestamp,
         known: &HashSet<TxnId>,
-    ) -> Vec<CommandState> {
-        let mut missing: Vec<CommandState> = self
+        max_events: u16,
+        max_bytes: usize,
+    ) -> (Vec<CommandState>, Option<Timestamp>) {
+        let mut missing: Vec<&CommandState> = self
             .applied_by_t0
             .range(TxnId(since)..)
             .filter(|txn| !known.contains(txn))
-            .map(|txn| self.commands[txn].clone())
+            .map(|txn| &self.commands[txn])
             .collect();
         missing.sort_by_key(|cmd| (cmd.execute_at, cmd.txn));
-        missing
+        let (mut count, mut size) = (0, 0);
+        let mut shipped = Vec::new();
+        let mut rest = missing.into_iter();
+        for cmd in rest.by_ref() {
+            let bytes = command_size(cmd);
+            if !fits_page(
+                shipped.len(),
+                count,
+                size,
+                cmd.events.len(),
+                bytes,
+                max_events,
+                max_bytes,
+            ) {
+                // The first command left out counts too.
+                let omitted = rest.map(|cmd| cmd.txn.0).fold(cmd.txn.0, Timestamp::min);
+                return (shipped, Some(omitted));
+            }
+            count += cmd.events.len();
+            size += bytes;
+            shipped.push(cmd.clone());
+        }
+        (shipped, None)
+    }
+
+    /// One page of the applied commands a joiner imports into its conflict
+    /// graph: those with `t0` after `after` (`None` starts from the oldest),
+    /// in `t0` order, within `max_events` events and `max_bytes` of
+    /// `command_size` (at least one while any remain), plus the cursor of
+    /// the next page — the last `t0` shipped — or `None` after the last.
+    /// A command compacted between two pages is simply no longer walked:
+    /// the floor the page carries along says the joiner may drop it.
+    pub fn export_applied_page(
+        &self,
+        after: Option<TxnId>,
+        max_events: u16,
+        max_bytes: usize,
+    ) -> (Vec<CommandState>, Option<TxnId>) {
+        let from = match after {
+            Some(after) => std::ops::Bound::Excluded(after),
+            None => std::ops::Bound::Unbounded,
+        };
+        let (mut count, mut size) = (0, 0);
+        let mut page: Vec<CommandState> = Vec::new();
+        for txn in self.applied_by_t0.range((from, std::ops::Bound::Unbounded)) {
+            let cmd = &self.commands[txn];
+            let bytes = command_size(cmd);
+            if !fits_page(
+                page.len(),
+                count,
+                size,
+                cmd.events.len(),
+                bytes,
+                max_events,
+                max_bytes,
+            ) {
+                // Never empty here: the first command always fits.
+                let next = page.last().map(|cmd| cmd.txn);
+                return (page, next);
+            }
+            count += cmd.events.len();
+            size += bytes;
+            page.push(cmd.clone());
+        }
+        (page, None)
     }
 
     /// Imports an already-applied command during bootstrap: records it (so this
@@ -1788,5 +1894,102 @@ mod tests {
 
         replica.compact(txn(30).0);
         assert_eq!(replica.redundant_before(), txn(30).0, "equal is a no-op");
+    }
+
+    /// Applies `t` on its own key, executing at `execute_at` (a slow-path
+    /// commit raises it above `t0`), with one event of `data` bytes.
+    fn apply_at(replica: &mut Replica, t: TxnId, execute_at: TxnId, data: usize) {
+        let key = Key(format!("k{}", t.0.micros));
+        let mut ev = event(&key.0, 1);
+        ev.data = vec![0; data];
+        replica
+            .preaccept(t, vec![key.clone()], vec![ev.clone()])
+            .unwrap();
+        replica.commit(t, execute_at.0, vec![], vec![ev], vec![key], NodeId(0));
+        replica.record_decision(t, true);
+        while let Some(ready) = replica.next_apply() {
+            replica.mark_applied(ready.txn, false);
+        }
+    }
+
+    /// Four applied commands whose execution order differs from their `t0`
+    /// order: `b`, `c`, `a`, `d` by `execute_at` — `a` was raised past `c`.
+    fn out_of_order_backlog(replica: &mut Replica) -> [TxnId; 4] {
+        let (a, b, c, d) = (txn(10), txn(20), txn(30), txn(40));
+        apply_at(replica, a, txn(50), 1000);
+        apply_at(replica, b, b, 1000);
+        apply_at(replica, c, c, 1000);
+        apply_at(replica, d, txn(60), 1000);
+        [a, b, c, d]
+    }
+
+    /// An anti-entropy reply over the budget ships an execution-order
+    /// prefix (at least one command) and names the oldest `t0` it left out,
+    /// which is not the last one shipped: here `a` executes after `c` but
+    /// has the smallest `t0`, so a requester's coverage must stay below it.
+    #[test]
+    fn the_anti_entropy_export_is_a_bounded_prefix() {
+        let mut replica = Replica::new();
+        let [a, b, c, d] = out_of_order_backlog(&mut replica);
+        let none = HashSet::new();
+        let size = command_size(&replica.commands[&b]);
+
+        let (two, omitted) =
+            replica.export_applied_missing(Timestamp::MIN, &none, u16::MAX, 2 * size);
+        let shipped: Vec<TxnId> = two.iter().map(|cmd| cmd.txn).collect();
+        assert_eq!(shipped, vec![b, c], "an execution-order prefix");
+        assert_eq!(omitted, Some(a.0), "the oldest t0 left out, not the next");
+
+        let (one, omitted) = replica.export_applied_missing(Timestamp::MIN, &none, u16::MAX, 1);
+        assert_eq!(
+            one.len(),
+            1,
+            "a command over the budget still crosses alone"
+        );
+        assert_eq!(one[0].txn, b);
+        assert_eq!(omitted, Some(a.0));
+
+        let (by_events, _) = replica.export_applied_missing(Timestamp::MIN, &none, 3, usize::MAX);
+        assert_eq!(by_events.len(), 3, "one event each, three events a page");
+
+        let (all, omitted) =
+            replica.export_applied_missing(Timestamp::MIN, &none, u16::MAX, usize::MAX);
+        assert_eq!(all.len(), 4);
+        assert_eq!(omitted, None, "nothing left out");
+
+        // What the requester already holds is neither shipped nor omitted.
+        let known: HashSet<TxnId> = [a, b].into_iter().collect();
+        let (rest, omitted) = replica.export_applied_missing(Timestamp::MIN, &known, u16::MAX, 1);
+        let shipped: Vec<TxnId> = rest.iter().map(|cmd| cmd.txn).collect();
+        assert_eq!(shipped, vec![c]);
+        assert_eq!(omitted, Some(d.0));
+    }
+
+    /// A join walks the applied commands in `t0` order, a budget at a time,
+    /// each page resuming after the last `t0` the previous one shipped.
+    #[test]
+    fn join_command_pages_walk_the_applied_set_in_t0_order() {
+        let mut replica = Replica::new();
+        let [a, b, c, d] = out_of_order_backlog(&mut replica);
+        let size = command_size(&replica.commands[&a]);
+
+        let (first, next) = replica.export_applied_page(None, u16::MAX, 2 * size);
+        assert_eq!(first.iter().map(|cmd| cmd.txn).collect::<Vec<_>>(), [a, b]);
+        assert_eq!(next, Some(b));
+        let (second, next) = replica.export_applied_page(next, u16::MAX, 2 * size);
+        assert_eq!(second.iter().map(|cmd| cmd.txn).collect::<Vec<_>>(), [c, d]);
+        assert_eq!(next, None, "nothing follows the last page");
+
+        let (alone, next) = replica.export_applied_page(Some(a), u16::MAX, 1);
+        assert_eq!(alone.iter().map(|cmd| cmd.txn).collect::<Vec<_>>(), [b]);
+        assert_eq!(next, Some(b));
+
+        // A compaction between two pages drops what it covers from the
+        // walk; the next page carries the floor that says so.
+        replica.compact(txn(35).0);
+        let (after, next) = replica.export_applied_page(Some(a), u16::MAX, usize::MAX);
+        assert_eq!(after.iter().map(|cmd| cmd.txn).collect::<Vec<_>>(), [d]);
+        assert_eq!(next, None);
+        assert_eq!(replica.redundant_before(), txn(35).0);
     }
 }

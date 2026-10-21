@@ -259,9 +259,9 @@ control plane, everything else is Accord.
 - **M4 — Topology changes.** ✅ `DynamicTopology` carries an
   **epoch** and can `install` a new shard layout atomically. A joining node
   **bootstraps**: `begin_join` starts buffering consensus messages; `Node::join`
-  fetches a peer's committed state (`SnapshotRequest` / `SyncData` carrying serialized
-  `CommandState`s, then the data-store snapshot page by page through
-  `SnapshotPageRequest` / `SnapshotPage`), imports each command into its conflict graph
+  fetches a peer's committed state (`JoinHeaderRequest` / `SyncData`, then the serialized
+  `CommandState`s page by page through `CommandPageRequest` / `CommandPage`, then the
+  data-store snapshot page by page through `SnapshotPageRequest` / `SnapshotPage`), imports each command into its conflict graph
   (`Replica::import_applied`) and applies its events, then **replays the buffered
   messages** — so a transaction that commits *during* the join still lands
   (sync-point-style). A node drives an epoch change with `Node::change_topology`,
@@ -494,12 +494,19 @@ backend (sql/fjall). Phases, in order:
   only a brand-new joining node can be
   below the watermark, so `join` transfers a **data-store snapshot** for the
   truncated prefix plus the recent commands and the watermark; anti-entropy stays
-  command-based. The header (watermark, coverage, commands) comes first, then the
-  joiner **pulls the snapshot in pages** (`DataStore::snapshot_page`, bounded by
+  command-based. The header (watermark, coverage) comes first, then the joiner pulls
+  the contact's applied commands in `t0`-ordered **command pages**, then **the
+  snapshot in pages** (`DataStore::snapshot_page`; both bounded by
   `NodeConfig::snapshot_page_events` / `snapshot_page_bytes`), installing each under
-  the watermark's synthetic id as it lands, so a store of any size crosses in frames
-  far under the transport's cap. Taking the header before the pages means every
-  command it lists has its events in a page; a transaction the contact applies
+  the watermark's synthetic id as it lands, so a store and a command backlog of any
+  size cross in frames far under the transport's cap. Taking the header and the
+  command pages before the snapshot pages means every command listed has its events
+  in a page. The contact may compact between two command pages: each carries its
+  floor, the joiner adopts the highest and drops the commands below it, whose events
+  the later snapshot pages hold — so the header's vouch (`JoinProof`) stays sound. A
+  contact predating command pages sheds `JoinHeaderRequest`; hearing nothing, the
+  joiner asks again with `SnapshotRequest`, answered with every command inline (what
+  a joiner predating them asks a current contact for). A transaction the contact applies
   meanwhile is in the joiner's buffer too, and its replay finds the events already
   there (an idempotent re-apply). A page overlapping existing events would be
   skipped whole, so `join` refuses a non-empty store, and a join that fails once a
@@ -685,9 +692,13 @@ backend (sql/fjall). Phases, in order:
         (`tests/recovery.rs`, see M2 below); and a recovery re-driving a decided
         txn that one shard had applied and compacted re-read the other shards
         alone, which could contradict the decision — it now takes the decision
-        from a replica that applied it.
+        from a replica that applied it;
+        an anti-entropy reply or join header over the 64 MiB frame cap was shed
+        forever (now an anti-entropy reply is a budgeted execution-order prefix whose
+        coverage stops below the oldest `t0` it left out, a join pulls its commands in
+        pages, and a write whose command could not fit a frame is refused,
+        `CommandTooLarge`).
         **Open** (confirmed or plausible, not yet fixed):
-        an anti-entropy reply or join header over the 64 MiB frame cap is shed forever;
         a config change's replies are keyed by epoch only, so two on one node collide;
         stage errors are ignored before durability-gated replies;
         the sweep scheduler can starve groups beyond `max_concurrent`;

@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 
 use crate::api::MessageSink;
 use crate::clock::NodeId;
+use crate::format::{encode_tagged, RecordKind};
 use crate::message::Message;
 
 /// A message as delivered to a node's inbox, tagged with its origin so the
@@ -71,7 +72,20 @@ pub struct InMemoryNetwork {
     /// electorate (a co-located coordinator commits before a remote replica could
     /// even reply). For tests only; the production TCP transport is untouched.
     latency: Mutex<HashMap<(NodeId, NodeId), Duration>>,
+    /// A frame cap like the TCP transport's
+    /// ([`MAX_FRAME_LENGTH`](crate::tcp::MAX_FRAME_LENGTH)): a message whose
+    /// wire encoding is longer is shed, as `PeerLinks::enqueue` sheds it.
+    /// `None` by default (nothing is encoded, so the simulation is unchanged);
+    /// set a small one to exercise the protocol against the cap without
+    /// building 64 MiB of state.
+    frame_cap: Mutex<Option<usize>>,
+    /// Messages a receiver cannot read (see
+    /// [`set_unreadable`](InMemoryNetwork::set_unreadable)); `None` by default.
+    unreadable: Mutex<Option<MessageFilter>>,
 }
+
+/// A predicate over messages, for [`InMemoryNetwork::set_unreadable`].
+pub type MessageFilter = Arc<dyn Fn(&Message) -> bool + Send + Sync>;
 
 impl InMemoryNetwork {
     /// Creates an empty network.
@@ -160,6 +174,33 @@ impl InMemoryNetwork {
         self.set_latency(b, a, latency);
     }
 
+    /// Sheds every message whose wire encoding is over `cap` bytes from now
+    /// on (`None` lifts the cap) — the in-memory twin of the TCP transport's
+    /// frame cap. A shed frame counts in [`shed_count`](Self::shed_count).
+    pub fn set_frame_cap(&self, cap: Option<usize>) {
+        *self.frame_cap.lock().expect("network poisoned") = cap;
+    }
+
+    /// Drops every message `filter` matches from now on (`None` delivers
+    /// everything again) — a peer on an older build, which sheds a variant
+    /// it cannot decode. For rolling-upgrade tests.
+    pub fn set_unreadable(&self, filter: Option<MessageFilter>) {
+        *self.unreadable.lock().expect("network poisoned") = filter;
+    }
+
+    /// Whether `message` fits under the configured frame cap and is not
+    /// [unreadable](Self::set_unreadable).
+    fn fits(&self, message: &Message) -> bool {
+        let unreadable = self.unreadable.lock().expect("network poisoned").clone();
+        if unreadable.is_some_and(|unreadable| unreadable(message)) {
+            return false;
+        }
+        let Some(cap) = *self.frame_cap.lock().expect("network poisoned") else {
+            return true;
+        };
+        encode_tagged(RecordKind::GroupFrame, message).is_ok_and(|bytes| bytes.len() <= cap)
+    }
+
     /// The configured delivery latency on `from → to` (zero if unset).
     fn latency_of(&self, from: NodeId, to: NodeId) -> Duration {
         self.latency
@@ -209,6 +250,10 @@ impl MessageSink for InMemorySink {
             || self.net.is_crashed(to)
             || self.net.is_partitioned(self.from, to)
         {
+            return Ok(());
+        }
+        if !self.net.fits(&message) {
+            self.net.shed.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
 

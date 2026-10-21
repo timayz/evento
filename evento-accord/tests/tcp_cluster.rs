@@ -4,13 +4,13 @@
 //! winner — exercising the same consensus logic as the in-memory tests, but with
 //! messages crossing actual connections and bitcode wire encoding.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
 use evento_accord::{
     serve, DataStore, HybridLogicalClock, InMemoryDataStore, InMemoryJournal, Journal, MessageSink,
-    Node, NodeId, StaticTopology, TcpTransport, TxnId,
+    Node, NodeConfig, NodeId, StaticTopology, TcpTransport, TxnId,
 };
 use evento_core::Event;
 use tokio::net::TcpListener;
@@ -25,6 +25,12 @@ struct TcpCluster {
 
 impl TcpCluster {
     async fn start(n: u64) -> Self {
+        Self::start_with(n, NodeConfig::default(), None).await
+    }
+
+    /// [`start`](Self::start) with `config` on every node, and node `joining`
+    /// (if any) left joining ([`Node::begin_join`]) until the test joins it.
+    async fn start_with(n: u64, config: NodeConfig, joining: Option<usize>) -> Self {
         let ids: Vec<NodeId> = (0..n).map(NodeId).collect();
 
         // Bind every listener first so the address map is known and the kernel
@@ -57,7 +63,11 @@ impl TcpCluster {
                 sink,
                 Arc::clone(&store) as Arc<dyn DataStore>,
                 journal,
-            );
+            )
+            .with_config(config);
+            if joining == Some(id.0 as usize) {
+                node.begin_join();
+            }
 
             tasks.push(node.start(inbox_rx));
             nodes.push(node);
@@ -164,4 +174,65 @@ async fn resolves_a_conflict_over_real_tcp() {
     cluster.await_applied(2).await;
     let order = cluster.assert_identical_order(2);
     assert_eq!(order.iter().filter(|(_, c)| !c).count(), 1);
+}
+
+/// A join from a contact holding more commands than one page carries, over
+/// real sockets: the header crosses without them, then the command pages,
+/// then the snapshot pages, each through the bitcode wire encoding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn joins_a_command_backlog_page_by_page_over_real_tcp() {
+    const WRITES: u16 = 24;
+    let config = NodeConfig {
+        snapshot_page_bytes: 4 * 1024,
+        ..NodeConfig::default()
+    };
+    // Node 2 joins later: until then it answers nothing, so nothing compacts
+    // and node 0 holds every command.
+    let cluster = TcpCluster::start_with(3, config, Some(2)).await;
+    for version in 1..=WRITES {
+        let mut write = event("acc", version, "Bumped");
+        write.data = vec![version as u8; 1024];
+        tokio::time::timeout(Duration::from_secs(10), cluster.nodes[0].write(vec![write]))
+            .await
+            .expect("write timed out")
+            .expect("write failed over tcp");
+    }
+
+    let imported = tokio::time::timeout(Duration::from_secs(30), cluster.nodes[2].join(NodeId(0)))
+        .await
+        .expect("join timed out")
+        .expect("join over tcp");
+    assert_eq!(imported, usize::from(WRITES), "every command imported");
+    assert!(
+        cluster.nodes[0].metrics().command_pages >= 3,
+        "the commands crossed in pages: {}",
+        cluster.nodes[0].metrics().command_pages
+    );
+    let committed =
+        |i: usize| -> BTreeSet<_> { cluster.stores[i].committed_events().into_iter().collect() };
+    assert_eq!(
+        committed(2),
+        committed(0),
+        "the joined store matches the contact's"
+    );
+
+    // It takes part: its own write commits everywhere.
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        cluster.nodes[2].write(vec![event("acc", WRITES + 1, "Bumped")]),
+    )
+    .await
+    .expect("write timed out")
+    .expect("a write coordinated by the joined node");
+    for _ in 0..400 {
+        if cluster
+            .stores
+            .iter()
+            .all(|s| s.committed_events().len() == usize::from(WRITES) + 1)
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the write after the join did not reach every replica");
 }

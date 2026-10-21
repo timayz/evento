@@ -89,7 +89,7 @@ timeouts for geo/WAN** deployments.
 | `max_commands` | 100 000 | Backpressure: refuse *new* local writes (`BacklogAtCap`; `WriteError::Unavailable` through `AccordExecutor`) once the un-compacted backlog hits this (e.g. compaction stalled under a partition, or a peer down with `peer_absence_limit` unset). |
 | `peer_absence_limit` | none | Stop waiting for a same-shard peer silent this long: compaction then proceeds without it (§7, down node). Set it well above any restart or maintenance window; a peer given up on while writes went through must rejoin from a snapshot on return. Never leaves fewer than a slow quorum counted. |
 | `snapshot_page_events` | 4096 | Most events this node puts in one snapshot page when a joiner bootstraps from it (§7, lost store). |
-| `snapshot_page_bytes` | 4 MiB | Byte budget of one snapshot page (a single larger event still crosses alone). Keep it far below the transport's 64 MiB frame cap and small enough that one group's bootstrap does not hold the link it shares with every other group for long. |
+| `snapshot_page_bytes` | 4 MiB | Byte budget of one snapshot page, command page or anti-entropy reply (a single larger event or command still crosses alone). Keep it far below the transport's 64 MiB frame cap and small enough that one group's bootstrap does not hold the link it shares with every other group for long. |
 | `config_defer_step` | 100 ms | Control-plane anti-dueling delay for concurrent reconfigurations. |
 
 Clock-skew tolerance is on the clock: `HybridLogicalClock::with_max_skew(..)` (default
@@ -134,6 +134,7 @@ Serve it on an HTTP endpoint (see `bank-axum-accord`'s `/metrics`). Counters:
 | `peers_absent` | shard peers this node stopped waiting for (`peer_absence_limit`); each is a node that was silent for that long. |
 | `rejoins_required` | a peer told this node to rejoin: it had been given up on while writes it never applied were compacted. The node is stale until its host rejoins it (§7). |
 | `snapshot_pages` | snapshot pages this node served to joining peers; a joiner pulls one per `snapshot_page_events` / `snapshot_page_bytes` of the contact's store. |
+| `command_pages` | command pages this node served to joining peers: a joiner pulls the contact's un-compacted applied commands one page at a time, before its snapshot pages. |
 | `joins_partial` | joins of this node that failed after a page was installed: the store holds a prefix no contact can complete, and must be emptied before the next join (§7). Steady > 0 = a contact that cannot read its backend, or a link losing pages faster than the per-page retries cover. |
 | `execution_failures` | data-store applies and commit-condition reads that failed. The transaction is neither marked applied nor acknowledged, and is retried on the next drive (a message, or the sweep). Occasional = transient lock contention; **sustained** = this replica's store cannot take writes (full disk, broken connection), so it falls behind until it can. |
 
@@ -365,7 +366,8 @@ ids the catalog does not know. Sweep gossip (`Message::is_sweep`: watermarks and
 anti-entropy, which an idle group's peers keep emitting every `idle_interval`) never
 reaches the handler, so a tenant closed for inactivity on one host is not reopened by
 its peers' heartbeats; the next real write or read wakes it. A joining replica's requests
-(`SnapshotRequest`, `SnapshotPageRequest`) are not sweep gossip: they wake the group on
+(`JoinHeaderRequest`, `CommandPageRequest`, `SnapshotRequest`, `SnapshotPageRequest`)
+are not sweep gossip: they wake the group on
 a contact that has it closed. The pages it is answered with are, so a page arriving
 late, after a failed join unregistered the group, does not reopen it.
 
@@ -388,15 +390,29 @@ file is also the consensus journal, so keep `synchronous(Full)` under WAL. Build
 | `MuxTransport::with_queue_capacity` | 1024 | Per-peer outbound queue, shared by all groups — raise for many groups bursting at once (a full queue sheds for all of them). |
 | `MuxTransport::with_inbox_capacity` | 1024 | Per-group inbound inbox. |
 
-A join pulls the contact's log as `SnapshotPage`s of at most `snapshot_page_events` /
-`snapshot_page_bytes` (4096 / 4 MiB), each far below the transport's 64 MiB frame cap,
-so a group of any size can be bootstrapped — and, since a per-peer connection and
+A join pulls the contact's un-compacted commands as `CommandPage`s and then its log as
+`SnapshotPage`s, each of at most `snapshot_page_events` / `snapshot_page_bytes`
+(4096 / 4 MiB), far below the transport's 64 MiB frame cap, and an anti-entropy reply
+is bounded the same way (a peer back from a long partition repairs its backlog over
+several rounds, its proven coverage trailing what is still on its way), so a group of
+any size — and any backlog — can be bootstrapped and repaired — and, since a per-peer connection and
 queue are shared, one group's bootstrap holds the link for a page at a time rather
 than for its whole log. A frame over the cap is shed and counted (`messages_shed`,
 with a warning) instead of being handed to the codec, whose refusal would tear the
 connection down and take the frames batched with it. (A write that fails on a stale
 connection — the peer restarted — is retried once over a fresh one, so one dead
-connection does not cost every group a frame.)
+connection does not cost every group a frame.) The one unit no page can split is a
+single transaction: `Node::write` refuses one whose events weigh more than
+`MAX_COMMAND_BYTES` (half the frame cap) with `CommandTooLarge`
+(`WriteError::Unknown` through `AccordExecutor`) — split it into several writes.
+
+**Rolling upgrade.** A joiner asks for the paged header first; a contact predating
+command pages sheds the request, and the joiner asks again for the inline header
+after `collect_timeout` — so a join against an old contact takes that long longer,
+and its whole command backlog must still fit one frame. A joiner predating command
+pages asks a current contact for the inline header, as before; one predating
+snapshot pages (`SyncRequest { snapshot: true }`) still gets its snapshot inline,
+read a page at a time and not answered at all once it outgrows a frame.
 
 **A tenant's first write races its peers' opens.** The creating host opens the group
 and writes at once; a peer that has not opened it yet parks the frames. If the peer's
