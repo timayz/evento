@@ -689,6 +689,48 @@ async fn racing_operator_changes_converge() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn concurrent_changes_on_one_node_converge() {
+    // Two changes for the same epoch on ONE node: each proposal hears its
+    // own replies, so neither starves the other into a quorum timeout.
+    let net = InMemoryNetwork::new();
+    let abcde = vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
+    let drop_e = vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3)];
+    let drop_d = vec![NodeId(0), NodeId(1), NodeId(2), NodeId(4)];
+
+    let nodes: Vec<TestNode> = abcde
+        .iter()
+        .map(|&id| spawn_node(id, 0, vec![abcde.clone()], &net))
+        .collect();
+
+    let a = nodes[1].node.clone();
+    let b = nodes[1].node.clone();
+    let x = drop_e.clone();
+    let y = drop_d.clone();
+    let w1 = tokio::spawn(async move { a.change_topology(1, vec![x]).await });
+    let w2 = tokio::spawn(async move { b.change_topology(1, vec![y]).await });
+
+    let d1 = tokio::time::timeout(Duration::from_secs(10), w1)
+        .await
+        .expect("w1 timed out")
+        .unwrap()
+        .expect("change 1 converges");
+    let d2 = tokio::time::timeout(Duration::from_secs(10), w2)
+        .await
+        .expect("w2 timed out")
+        .unwrap()
+        .expect("change 2 converges");
+    assert_eq!(d1, d2, "both proposals report the one chosen layout");
+    assert!(
+        d1 == vec![drop_e.clone()] || d1 == vec![drop_d.clone()],
+        "the chosen layout is one of the two proposed: {d1:?}"
+    );
+    for n in &nodes {
+        await_epoch(&n.topology, 1).await;
+        assert_eq!(n.topology.nodes(), d1[0], "every node installs it");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn config_changes_outlive_the_founders() {
     let net = InMemoryNetwork::new();
     let abc = vec![NodeId(0), NodeId(1), NodeId(2)];
