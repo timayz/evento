@@ -114,9 +114,11 @@ struct Entry {
     /// The node's last sweep; while it runs, the node is skipped (sweeps are
     /// not re-entrant). A sweep that panicked counts as finished.
     sweep: Option<JoinHandle<()>>,
-    /// Tick index at which its last sweep started (0 before the first): under
-    /// saturation, the nodes swept longest ago get the free slots first.
-    last_swept: u64,
+    /// Tick index at which its last sweep started, `None` before the first:
+    /// under saturation, the nodes swept longest ago get the free slots first,
+    /// and a node never swept goes before them all (`None` sorts first — a
+    /// `0` would tie with a sweep at tick 0).
+    last_swept: Option<u64>,
     /// A due sweep was deferred for want of a slot: the node stays due until it
     /// runs, so an idle node that missed its slot is not put off a whole
     /// `idle_interval`.
@@ -179,7 +181,7 @@ impl SweepScheduler {
             active_until: Instant::now() + self.config.active_hold,
             phase: group.0 % self.slots(),
             sweep: None,
-            last_swept: 0,
+            last_swept: None,
             owed: false,
         };
         self.entries
@@ -294,7 +296,7 @@ impl SweepScheduler {
                 continue;
             };
             entry.owed = false;
-            entry.last_swept = index;
+            entry.last_swept = Some(index);
             self.sweeps_run.fetch_add(1, Ordering::Relaxed);
             let node = Arc::clone(&entry.node);
             entry.sweep = Some(tokio::spawn(async move {
@@ -543,7 +545,12 @@ mod tests {
         assert_eq!(idle.sweeps.load(Ordering::Relaxed), 0);
 
         hold.notify_waiters();
-        tokio::task::yield_now().await;
+        // Let the released sweep finish and hand its slot back.
+        while s.semaphore.available_permits() == 0 {
+            tokio::task::yield_now().await;
+        }
+        // Both are due for the one slot: the busy node, swept at tick 0, and
+        // the idle one, never swept — which goes first.
         run_ticks(&s, 1).await;
         assert_eq!(
             idle.sweeps.load(Ordering::Relaxed),
