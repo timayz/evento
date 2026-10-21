@@ -1955,8 +1955,11 @@ impl Node {
                     .preaccept(txn, keys, events);
                 match vote {
                     Ok((execute_at, deps)) => {
-                        self.keep_route(txn, route.as_deref()).await;
-                        self.journal_stage(txn).await;
+                        // A vote the journal did not take is not sent.
+                        let route_kept = self.keep_route(txn, route.as_deref()).await;
+                        if !(self.journal_stage(txn).await && route_kept) {
+                            return out;
+                        }
                         out.push((
                             from,
                             Message::PreAcceptOk {
@@ -1985,10 +1988,10 @@ impl Node {
                     .lock()
                     .expect("replica poisoned")
                     .accept(txn, ballot, execute_at, deps, keys);
-                if reply.is_ok() {
-                    self.keep_route(txn, route.as_deref()).await;
+                let route_kept = reply.is_err() || self.keep_route(txn, route.as_deref()).await;
+                if !(self.journal_stage(txn).await && route_kept) {
+                    return out;
                 }
-                self.journal_stage(txn).await;
                 match reply {
                     Ok(deps) => out.push((from, Message::AcceptOk { txn, ballot, deps })),
                     Err(promised) => out.push((from, Message::Nack { txn, promised })),
@@ -2013,8 +2016,10 @@ impl Node {
                     .lock()
                     .expect("replica poisoned")
                     .commit(txn, execute_at, deps, events, keys, reply_to);
-                self.keep_route(txn, route.as_deref()).await;
-                self.journal_stage(txn).await;
+                let route_kept = self.keep_route(txn, route.as_deref()).await;
+                // A commit the journal did not take is not answered for; what
+                // it unblocks still executes (each apply gates its own ack).
+                let durable = self.journal_stage(txn).await && route_kept;
 
                 // If already applied (e.g. a second recovery), short-circuit the
                 // read phase with the stored outcome. If already read — the slot
@@ -2028,10 +2033,14 @@ impl Node {
                 };
                 match (applied, read) {
                     (Some(conflict), _) => {
-                        out.push((reply_to, Message::ReadOk { txn, ok: !conflict }));
+                        if durable {
+                            out.push((reply_to, Message::ReadOk { txn, ok: !conflict }));
+                        }
                     }
                     (None, Some(ok)) => {
-                        out.push((reply_to, Message::ReadOk { txn, ok }));
+                        if durable {
+                            out.push((reply_to, Message::ReadOk { txn, ok }));
+                        }
                         out.extend(self.drive_staged().await);
                     }
                     (None, None) => out.extend(self.drive_staged().await),
@@ -2068,7 +2077,9 @@ impl Node {
                 );
                 // The promise must be durable before the reply that reveals it
                 // (a restarted replica must not accept a lower ballot again).
-                self.journal_stage(txn).await;
+                if !self.journal_stage(txn).await {
+                    return out;
+                }
                 let message = match reply {
                     Ok(state) => Message::RecoverOk {
                         txn,
@@ -2105,12 +2116,13 @@ impl Node {
                             .map(RoutedRecovery::Known),
                     }
                 };
-                if matches!(reply, Ok(RoutedRecovery::Known(_))) {
-                    self.keep_route(txn, route.as_deref()).await;
-                }
+                let route_kept = !matches!(reply, Ok(RoutedRecovery::Known(_)))
+                    || self.keep_route(txn, route.as_deref()).await;
                 // Durable before the reply, like any promise or vote — the
                 // promise of a transaction never witnessed included.
-                self.journal_stage(txn).await;
+                if !(self.journal_stage(txn).await && route_kept) {
+                    return out;
+                }
                 let message = match reply {
                     Ok(RoutedRecovery::Known(state)) => {
                         let report = Message::BeginRecoveryOk {
@@ -2156,6 +2168,7 @@ impl Node {
                 if invalidated {
                     tracing::debug!(node = self.id.0, ?txn, "invalidated a transaction");
                     self.applied_gen.send_modify(|v| *v += 1);
+                    // No reply rides on it; the next stage of `txn` retries.
                     self.journal_stage(txn).await;
                     // Its dependents may be free to execute now.
                     out.extend(self.drive_staged().await);
@@ -2718,8 +2731,11 @@ impl Node {
                 // Wake read barriers / read-your-writes waiters instead of
                 // letting them poll the replica lock.
                 self.applied_gen.send_modify(|v| *v += 1);
-                self.journal_stage(apply.txn).await;
-                out.push((apply.reply_to, Message::Applied { txn: apply.txn }));
+                // An apply the journal did not take is not acknowledged; a
+                // restart re-applies it (idempotently) from its commit.
+                if self.journal_stage(apply.txn).await {
+                    out.push((apply.reply_to, Message::Applied { txn: apply.txn }));
+                }
                 continue;
             }
 
@@ -2777,17 +2793,36 @@ impl Node {
     /// Stages the current durable state of `txn` to the journal — durable once the
     /// caller (the inbox batch loop, or the [`handle`](Self::handle) wrapper)
     /// flushes.
-    async fn journal_stage(&self, txn: TxnId) {
+    ///
+    /// Returns whether the stage succeeded (or there was nothing to stage). A
+    /// reply that reveals the staged state is withheld when it did not, as the
+    /// inbox loop withholds a batch whose flush failed: the in-memory state
+    /// may be ahead of the journal, and the next stage of `txn` writes it whole.
+    async fn journal_stage(&self, txn: TxnId) -> bool {
         let (snapshot, promise) = {
             let replica = self.replica.lock().expect("replica poisoned");
             (replica.snapshot(txn), replica.unknown_promise(txn))
         };
-        if let Some(state) = snapshot {
-            let _ = self.journal.stage(&state).await;
+        let staged = if let Some(state) = snapshot {
+            self.journal.stage(&state).await
         } else if let Some(ballot) = promise {
             // Never witnessed, but promised to a recovery: the promise is what
             // fences the original coordinator here, across a restart too.
-            let _ = self.journal.save_promise(txn, ballot).await;
+            self.journal.save_promise(txn, ballot).await
+        } else {
+            return true;
+        };
+        match staged {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!(
+                    node = self.id.0,
+                    ?txn,
+                    %err,
+                    "cannot stage a transaction's state; withholding its reply"
+                );
+                false
+            }
         }
     }
 
@@ -2795,15 +2830,35 @@ impl Node {
     /// it to the journal the first time — durable with the vote it travels
     /// with, so a restarted replica still recovers the transaction on every
     /// shard it touches.
-    async fn keep_route(&self, txn: TxnId, route: Option<&[Key]>) {
-        let Some(route) = route else { return };
+    ///
+    /// Returns whether the route is staged (or needed no staging). On failure
+    /// the route is forgotten again, so the next routed message for `txn`
+    /// retries it, and the vote it travels with is withheld.
+    async fn keep_route(&self, txn: TxnId, route: Option<&[Key]>) -> bool {
+        let Some(route) = route else { return true };
         let kept = self
             .replica
             .lock()
             .expect("replica poisoned")
             .set_route(txn, route);
-        if kept {
-            let _ = self.journal.save_route(txn, route).await;
+        if !kept {
+            return true;
+        }
+        match self.journal.save_route(txn, route).await {
+            Ok(()) => true,
+            Err(err) => {
+                self.replica
+                    .lock()
+                    .expect("replica poisoned")
+                    .forget_route(txn);
+                tracing::warn!(
+                    node = self.id.0,
+                    ?txn,
+                    %err,
+                    "cannot stage a transaction's route; withholding its reply"
+                );
+                false
+            }
         }
     }
 
@@ -5705,7 +5760,7 @@ impl Node {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
     use async_trait::async_trait;
@@ -5716,7 +5771,7 @@ mod tests {
     use crate::message::{CommandState, Key, Message};
     use crate::store::{InMemoryDataStore, InMemoryJournal};
     use crate::transport::InMemoryNetwork;
-    use crate::{api::MessageSink, StaticTopology};
+    use crate::{api::MessageSink, Envelope, StaticTopology};
 
     use super::{Node, NodeConfig};
 
@@ -6041,6 +6096,182 @@ mod tests {
         assert!(
             coord_inbox.try_recv().is_err(),
             "a failed fsync must withhold the durability-gated PreAcceptOk"
+        );
+    }
+
+    /// A [`Journal`] whose `stage` and `save_route` can be made to fail — a
+    /// write the journal refused before any flush.
+    #[derive(Default)]
+    struct StageFailJournal {
+        inner: InMemoryJournal,
+        failing: AtomicBool,
+        routes: AtomicUsize,
+    }
+
+    impl StageFailJournal {
+        fn check(&self) -> anyhow::Result<()> {
+            if self.failing.load(Ordering::SeqCst) {
+                anyhow::bail!("simulated stage failure");
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl Journal for StageFailJournal {
+        async fn record(&self, state: &CommandState) -> anyhow::Result<()> {
+            self.stage(state).await
+        }
+        async fn stage(&self, state: &CommandState) -> anyhow::Result<()> {
+            self.check()?;
+            self.inner.record(state).await
+        }
+        async fn save_route(&self, _txn: TxnId, _route: &[Key]) -> anyhow::Result<()> {
+            self.check()?;
+            self.routes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn load(&self, txn: TxnId) -> anyhow::Result<Option<CommandState>> {
+            self.inner.load(txn).await
+        }
+        async fn load_all(&self) -> anyhow::Result<Vec<CommandState>> {
+            self.inner.load_all().await
+        }
+    }
+
+    fn stage_fail_node(journal: &Arc<StageFailJournal>) -> Node {
+        let id = NodeId(0);
+        let net = InMemoryNetwork::new();
+        Node::new(
+            id,
+            Arc::new(StaticTopology::new(id, vec![id, NodeId(1), NodeId(2)])) as Arc<dyn Topology>,
+            Arc::new(HybridLogicalClock::new(id)),
+            Arc::new(net.sink(id)) as Arc<dyn MessageSink>,
+            Arc::new(InMemoryDataStore::new()) as Arc<dyn DataStore>,
+            Arc::clone(journal) as Arc<dyn Journal>,
+        )
+    }
+
+    /// A vote whose stage failed is withheld, though the flush that follows
+    /// may succeed; once the journal takes it again, the vote goes out.
+    #[tokio::test]
+    async fn stage_failure_withholds_the_vote() {
+        let journal = Arc::new(StageFailJournal::default());
+        let node = stage_fail_node(&journal);
+        let from = NodeId(1);
+
+        journal.failing.store(true, Ordering::SeqCst);
+        let out = node
+            .handle_staged(Envelope {
+                from,
+                message: preaccept(0),
+            })
+            .await;
+        assert!(out.is_empty(), "an unstaged vote is withheld: {out:?}");
+
+        journal.failing.store(false, Ordering::SeqCst);
+        let out = node
+            .handle_staged(Envelope {
+                from,
+                message: preaccept(0),
+            })
+            .await;
+        assert!(
+            matches!(out.as_slice(), [(_, Message::PreAcceptOk { .. })]),
+            "the vote goes out once staged: {out:?}"
+        );
+    }
+
+    /// A route the journal refused is forgotten, so the next routed message
+    /// stages it again — and the vote it travelled with is withheld.
+    #[tokio::test]
+    async fn a_route_the_journal_refused_is_retried() {
+        let journal = Arc::new(StageFailJournal::default());
+        let node = stage_fail_node(&journal);
+        let routed = || {
+            let Message::PreAccept { keys, .. } = preaccept(0) else {
+                unreachable!()
+            };
+            Message::Routed {
+                route: keys.into_iter().chain([Key("elsewhere".into())]).collect(),
+                inner: Box::new(preaccept(0)),
+            }
+        };
+        let txn = preaccept(0).txn().unwrap();
+
+        // The command stages; only the route fails.
+        node.handle_staged(Envelope {
+            from: NodeId(1),
+            message: preaccept(0),
+        })
+        .await;
+        journal.failing.store(true, Ordering::SeqCst);
+        let out = node
+            .handle_staged(Envelope {
+                from: NodeId(1),
+                message: routed(),
+            })
+            .await;
+        assert!(out.is_empty(), "the vote is withheld: {out:?}");
+        assert!(
+            node.replica.lock().unwrap().route(txn).is_none(),
+            "an unstaged route is forgotten"
+        );
+
+        journal.failing.store(false, Ordering::SeqCst);
+        let out = node
+            .handle_staged(Envelope {
+                from: NodeId(1),
+                message: routed(),
+            })
+            .await;
+        assert!(matches!(out.as_slice(), [(_, Message::PreAcceptOk { .. })]));
+        assert!(node.replica.lock().unwrap().route(txn).is_some());
+        assert_eq!(journal.routes.load(Ordering::SeqCst), 1, "staged on retry");
+    }
+
+    /// An apply whose stage failed is enacted but not acknowledged.
+    #[tokio::test]
+    async fn stage_failure_withholds_the_applied_ack() {
+        let journal = Arc::new(StageFailJournal::default());
+        let node = stage_fail_node(&journal);
+        let coord = NodeId(1);
+        let Message::PreAccept { txn, keys, events } = preaccept(0) else {
+            unreachable!()
+        };
+        let out = node
+            .handle_staged(Envelope {
+                from: coord,
+                message: Message::Commit {
+                    txn,
+                    execute_at: txn.0,
+                    deps: Vec::new(),
+                    keys,
+                    events,
+                    reply_to: coord,
+                },
+            })
+            .await;
+        assert!(
+            matches!(out.as_slice(), [(_, Message::ReadOk { ok: true, .. })]),
+            "the commit is read: {out:?}"
+        );
+
+        journal.failing.store(true, Ordering::SeqCst);
+        let out = node
+            .handle_staged(Envelope {
+                from: coord,
+                message: Message::Apply { txn, commit: true },
+            })
+            .await;
+        assert!(
+            out.is_empty(),
+            "an unstaged apply is not acknowledged: {out:?}"
+        );
+        assert_eq!(
+            node.replica.lock().unwrap().applied_result(txn),
+            Some(false),
+            "the apply itself took effect"
         );
     }
 

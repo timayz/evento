@@ -783,6 +783,12 @@ impl Replica {
         true
     }
 
+    /// Drops `txn`'s route again — one the journal did not take, so the next
+    /// [`set_route`](Self::set_route) keeps (and stages) it anew.
+    pub fn forget_route(&mut self, txn: TxnId) {
+        self.routes.remove(&txn);
+    }
+
     /// `txn`'s route, if it is a multi-shard transaction held here.
     pub fn route(&self, txn: TxnId) -> Option<Vec<Key>> {
         self.routes.get(&txn).cloned()
