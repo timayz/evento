@@ -36,6 +36,58 @@ struct Running {
     rejoin_task: Option<JoinHandle<()>>,
 }
 
+/// A group being opened, until [`opened`](Self::opened) hands its inbox loop
+/// to [`Running`]. Dropped before that — the open failed, or the `open`
+/// future itself was dropped mid-join — it unregisters the group and stops
+/// the loop: nothing else owns them, so no `close` could.
+struct Opening<'a> {
+    mux: &'a MuxTransport,
+    group: GroupId,
+    inbox_task: Option<JoinHandle<()>>,
+}
+
+impl Opening<'_> {
+    /// The group is open: its inbox loop now belongs to the caller.
+    fn opened(mut self) -> JoinHandle<()> {
+        let task = self.inbox_task.take().expect("the inbox loop was started");
+        std::mem::forget(self);
+        task
+    }
+
+    /// Unregisters the group and returns once its inbox loop has stopped.
+    async fn stop(mut self) {
+        self.mux.unregister(self.group);
+        if let Some(task) = self.inbox_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for Opening<'_> {
+    fn drop(&mut self) {
+        self.mux.unregister(self.group);
+        if let Some(task) = self.inbox_task.take() {
+            task.abort();
+        }
+    }
+}
+
+/// Releases a group's open/close lock (see [`GroupHost::release_group_lock`])
+/// when dropped, also when the open or close holding it is.
+struct ReleaseLock<'a> {
+    host: &'a GroupHost,
+    group: GroupId,
+    lock: &'a Arc<tokio::sync::Mutex<()>>,
+}
+
+impl Drop for ReleaseLock<'_> {
+    fn drop(&mut self) {
+        self.host.release_group_lock(self.group, self.lock);
+    }
+}
+
 /// Hosts the groups one process participates in; see the module docs.
 pub struct GroupHost {
     id: NodeId,
@@ -171,18 +223,21 @@ impl GroupHost {
             return Ok(node);
         }
         let lock = self.group_lock(group);
-        let opened = {
-            let _opening = lock.lock().await;
-            match self.get(group) {
-                Some(node) => Ok(node),
-                None => {
-                    self.open_locked(group, topology, datastore, journal, config, contacts)
-                        .await
-                }
-            }
+        // Declared first so it drops last, after the lock is unlocked — also
+        // when this future is dropped mid-open.
+        let _release = ReleaseLock {
+            host: self,
+            group,
+            lock: &lock,
         };
-        self.release_group_lock(group, &lock);
-        opened
+        let _opening = lock.lock().await;
+        match self.get(group) {
+            Some(node) => Ok(node),
+            None => {
+                self.open_locked(group, topology, datastore, journal, config, contacts)
+                    .await
+            }
+        }
     }
 
     /// `group`'s open/close lock (see `opening`).
@@ -216,6 +271,11 @@ impl GroupHost {
         contacts: &[NodeId],
     ) -> anyhow::Result<Node> {
         let inbox = self.mux.register(group);
+        let mut opening = Opening {
+            mux: &self.mux,
+            group,
+            inbox_task: None,
+        };
         let clock = self
             .clock
             .clone()
@@ -223,17 +283,14 @@ impl GroupHost {
         let sink: Arc<dyn MessageSink> = Arc::new(self.mux.sink(group));
         let node =
             Node::new(self.id, topology, clock, sink, datastore, journal).with_config(config);
-        if let Err(err) = node.recover_state().await {
-            self.mux.unregister(group);
-            return Err(err);
-        }
+        node.recover_state().await?;
         let joining = !contacts.is_empty();
         if joining {
             // Before the inbox loop starts, so no frame (parked ones included)
             // is processed ahead of the snapshot.
             node.begin_join();
         }
-        let inbox_task = node.start(inbox);
+        opening.inbox_task = Some(node.start(inbox));
         if joining {
             let mut last = None;
             for &contact in contacts {
@@ -264,9 +321,7 @@ impl GroupHost {
             if let Some((err, partial)) = last {
                 // Stopped before returning: on a partial snapshot the caller
                 // discards the store this loop writes to.
-                self.mux.unregister(group);
-                inbox_task.abort();
-                let _ = inbox_task.await;
+                opening.stop().await;
                 return Err(if partial {
                     err
                 } else {
@@ -274,6 +329,7 @@ impl GroupHost {
                 });
             }
         }
+        let inbox_task = opening.opened();
         self.scheduler.add(group, Arc::new(node.clone()));
         let rejoin_task = self.rejoin.clone().map(|handler| {
             let mut signal = node.rejoin_signal();
@@ -317,12 +373,13 @@ impl GroupHost {
     /// directory right away can find it locked a moment longer.
     pub async fn close(&self, group: GroupId) -> Option<Node> {
         let lock = self.group_lock(group);
-        let closed = {
-            let _closing = lock.lock().await;
-            self.close_locked(group).await
+        let _release = ReleaseLock {
+            host: self,
+            group,
+            lock: &lock,
         };
-        self.release_group_lock(group, &lock);
-        closed
+        let _closing = lock.lock().await;
+        self.close_locked(group).await
     }
 
     /// [`close`](Self::close)'s work, under the group's open/close lock.
