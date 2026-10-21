@@ -813,6 +813,22 @@ async fn a_restarted_replica_keeps_its_recovery_promise() {
         .expect("recovery completes")
         .expect("recovery decides");
     assert!(outcome.conflict, "shard B never witnessed it");
+    // The recovery decided on a slow quorum of shard B; node 3 may be the
+    // replica it did not wait for. Restart it only once its promise is
+    // durable, so the restart is what the test exercises.
+    let mut promised = false;
+    for _ in 0..400 {
+        let promises = c.journals[3].load_promises().await.unwrap();
+        if promises
+            .iter()
+            .any(|(promised_txn, _)| *promised_txn == txn)
+        {
+            promised = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(promised, "node 3 journals its recovery promise");
     c.restart(3).await;
 
     // The late PreAccept reaches every shard-B replica, the restarted one too.
