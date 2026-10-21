@@ -1272,7 +1272,9 @@ impl Node {
     async fn recovery_sweep(&self) {
         // A node told to rejoin holds state its peers compacted past: it
         // recovers, repairs and gossips nothing until its host rejoins it.
-        if self.rejoin_required() {
+        // Nor does a node still joining: it holds part of its state, and a
+        // report it gossips would end its contact's hold on compaction.
+        if self.rejoin_required() || !self.bootstrapped.load(Ordering::Acquire) {
             return;
         }
         let now = self.clock.now().micros;
@@ -1737,7 +1739,8 @@ impl Node {
             | Message::JoinHeaderRequest { .. }
             | Message::CommandPageRequest { .. }
             | Message::SnapshotRequest { .. }
-            | Message::SnapshotPageRequest { .. } => return Screen::Pass,
+            | Message::SnapshotPageRequest { .. }
+            | Message::JoinKeepalive => return Screen::Pass,
             Message::Watermark { applied_through } => match state.rejoin_above {
                 Some(bound) if *applied_through <= bound => Some(bound),
                 _ => None,
@@ -1881,6 +1884,7 @@ impl Node {
                 | Message::JoinHeaderRequest { .. }
                 | Message::CommandPageRequest { .. }
                 | Message::CommandPage { .. }
+                | Message::JoinKeepalive
                 | Message::Watermark { .. }
                 | Message::ConfigPrepare { .. }
                 | Message::ConfigPromise { .. }
@@ -2264,6 +2268,9 @@ impl Node {
                 ));
                 out.push((from, Message::JoinProof { id, epoch, vouched }));
             }
+            // A joiner whose install spaces out its page requests: keep the
+            // hold on this node's report alive.
+            Message::JoinKeepalive => self.refresh_join_hold(from),
             Message::CommandPageRequest { id, after } => {
                 if !self.bootstrapped.load(Ordering::Acquire) {
                     return out;
@@ -4145,7 +4152,10 @@ impl Node {
     /// installing an agreed layout) remains future work.
     pub async fn join(&self, contact: NodeId) -> anyhow::Result<usize> {
         let imported = self
-            .import_from(contact, self.settings.collect_timeout, true, None)
+            .keeping_join_hold(
+                contact,
+                self.import_from(contact, self.settings.collect_timeout, true, None),
+            )
             .await?;
         // Persist the adopted floor: a restart recovers it from the journal,
         // and without it a dependency on a compacted-away transaction would
@@ -4156,7 +4166,10 @@ impl Node {
             .lock()
             .expect("replica poisoned")
             .redundant_before();
-        if let Err(err) = self.journal.truncate(floor).await {
+        if let Err(err) = self
+            .keeping_join_hold(contact, self.journal.truncate(floor))
+            .await
+        {
             return Err(self.partial(err, &imported));
         }
         self.note_journal_watermark(floor);
@@ -4206,6 +4219,29 @@ impl Node {
         }
 
         Ok(imported.commands)
+    }
+
+    /// Runs `work`, a step of a join through `contact`, sending the contact a
+    /// [`JoinKeepalive`](Message::JoinKeepalive) every `collect_timeout`
+    /// meanwhile: its hold on its report lapses after a few of those without
+    /// a page request, and a step slower than that (a slow disk, a large
+    /// page) would otherwise let peers compact past what it vouched for —
+    /// and send this node back to rejoin when it reports.
+    async fn keeping_join_hold<T>(
+        &self,
+        contact: NodeId,
+        work: impl std::future::Future<Output = T>,
+    ) -> T {
+        let mut work = std::pin::pin!(work);
+        let period = self.settings.collect_timeout;
+        let mut keepalive = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                out = &mut work => return out,
+                _ = keepalive.tick() => self.send(contact, Message::JoinKeepalive).await,
+            }
+        }
     }
 
     /// The error of a join that fails after `imported` installed at least one
