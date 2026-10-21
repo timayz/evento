@@ -384,6 +384,40 @@ struct JoinHold {
 /// of a page's attempts plus one more for installing it.
 const JOIN_HOLD_PAGE_INTERVALS: u32 = SNAPSHOT_PAGE_ATTEMPTS as u32 + 1;
 
+/// One config-Paxos proposal's slot in `Node::config_inbox`, dropped
+/// however the proposal ends.
+struct ConfigRound<'a> {
+    node: &'a Node,
+    epoch: u64,
+    id: u64,
+}
+
+impl<'a> ConfigRound<'a> {
+    fn open(node: &'a Node, epoch: u64) -> (Self, mpsc::UnboundedReceiver<(NodeId, Message)>) {
+        let id = node.correlation_seq.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::unbounded_channel();
+        node.config_inbox
+            .lock()
+            .expect("config poisoned")
+            .entry(epoch)
+            .or_default()
+            .insert(id, tx);
+        (Self { node, epoch, id }, rx)
+    }
+}
+
+impl Drop for ConfigRound<'_> {
+    fn drop(&mut self) {
+        let mut inbox = self.node.config_inbox.lock().expect("config poisoned");
+        if let Some(rounds) = inbox.get_mut(&self.epoch) {
+            rounds.remove(&self.id);
+            if rounds.is_empty() {
+                inbox.remove(&self.epoch);
+            }
+        }
+    }
+}
+
 /// Ends a write's coordination when dropped (see [`Node::write`]).
 struct Coordinating<'a> {
     node: &'a Node,
@@ -538,10 +572,13 @@ impl ConfigAcceptor {
 /// Per-epoch config acceptor state.
 type ConfigState = Arc<Mutex<HashMap<u64, ConfigAcceptor>>>;
 
-/// Delivers config-Paxos responses to the in-flight epoch change per epoch, so
-/// two concurrent proposals (e.g. a manual change and the sweep's recovery)
-/// cannot steal each other's replies.
-type ConfigInbox = Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<(NodeId, Message)>>>>;
+/// Delivers config-Paxos responses to every in-flight proposal for their
+/// epoch, keyed epoch → proposal id (see [`ConfigRound`]). Two concurrent
+/// proposals on one node (e.g. a manual change and the sweep's recovery)
+/// each hear every reply and keep only those answering their own ballot, so
+/// neither can take or tear down the other's.
+type ConfigInbox = Arc<Mutex<HashMap<u64, HashMap<u64, ConfigSender>>>>;
+type ConfigSender = mpsc::UnboundedSender<(NodeId, Message)>;
 
 /// The committed metadata log: decided `(epoch, layout)` entries, plus the highest
 /// epoch actually installed into the [`Topology`]. The log is the source of truth
@@ -2558,14 +2595,17 @@ impl Node {
                     | Message::ConfigNack { epoch, .. } => *epoch,
                     _ => unreachable!(),
                 };
-                let tx = self
+                // Every proposal for the epoch hears it; each keeps only the
+                // replies answering its own ballot.
+                let rounds: Vec<ConfigSender> = self
                     .config_inbox
                     .lock()
                     .expect("config poisoned")
                     .get(&epoch)
-                    .cloned();
-                if let Some(tx) = tx {
-                    let _ = tx.send((from, response));
+                    .map(|rounds| rounds.values().cloned().collect())
+                    .unwrap_or_default();
+                for tx in rounds {
+                    let _ = tx.send((from, response.clone()));
                 }
             }
             // A forwarded read: serve it from the local backend and reply —
@@ -4974,17 +5014,11 @@ impl Node {
             // from a duel), adopt that decided layout — never our own `proposed`,
             // which may differ from the chosen value.
             if let Some(layout) = self.committed_layout(epoch) {
-                self.config_inbox
-                    .lock()
-                    .expect("config poisoned")
-                    .remove(&epoch);
                 return Ok(layout);
             }
-            let (tx, mut rx) = mpsc::unbounded_channel();
-            self.config_inbox
-                .lock()
-                .expect("config poisoned")
-                .insert(epoch, tx);
+            // This attempt's replies, until it ends; another proposal for the
+            // epoch on this node has a round of its own.
+            let (round, mut rx) = ConfigRound::open(self, epoch);
 
             // Phase 1: Prepare → adopt the highest already-accepted value, if any.
             for &node in acceptors {
@@ -5020,7 +5054,9 @@ impl Node {
                             }
                         }
                     }
-                    Ok(Some((_, Message::ConfigNack { promised, .. }))) => {
+                    // A refusal of this ballot names a higher promise; one at
+                    // or below it refused another proposal's.
+                    Ok(Some((_, Message::ConfigNack { promised, .. }))) if promised > ballot => {
                         nack = Some(promised);
                         break;
                     }
@@ -5029,10 +5065,6 @@ impl Node {
                 }
             }
             if let Some(promised) = nack {
-                self.config_inbox
-                    .lock()
-                    .expect("config poisoned")
-                    .remove(&epoch);
                 // Back off before re-preparing so duelling proposers desync (the
                 // delay is rank/attempt-asymmetric, so two racers never re-collide in
                 // lockstep) — then the top-of-loop committed-check lets the loser
@@ -5042,10 +5074,6 @@ impl Node {
                 continue;
             }
             if promisers.len() < need {
-                self.config_inbox
-                    .lock()
-                    .expect("config poisoned")
-                    .remove(&epoch);
                 anyhow::bail!("config prepare quorum not reached for epoch {epoch}");
             }
 
@@ -5053,10 +5081,6 @@ impl Node {
             // The adopted value (an older proposer's) or a recovery's fallback
             // was never checked; an invalid one is not carried to a decision.
             if let Err(err) = validate_layout(&layout) {
-                self.config_inbox
-                    .lock()
-                    .expect("config poisoned")
-                    .remove(&epoch);
                 return Err(err.context(format!("refusing to decide epoch {epoch}")));
             }
 
@@ -5082,7 +5106,9 @@ impl Node {
                     Ok(Some((from, Message::ConfigAccepted { ballot: b, .. }))) if b == ballot => {
                         accepters.insert(from);
                     }
-                    Ok(Some((_, Message::ConfigNack { promised, .. }))) => {
+                    // A refusal of this ballot names a higher promise; one at
+                    // or below it refused another proposal's.
+                    Ok(Some((_, Message::ConfigNack { promised, .. }))) if promised > ballot => {
                         nack = Some(promised);
                         break;
                     }
@@ -5090,10 +5116,7 @@ impl Node {
                     Ok(None) | Err(_) => break,
                 }
             }
-            self.config_inbox
-                .lock()
-                .expect("config poisoned")
-                .remove(&epoch);
+            drop(round);
 
             if let Some(promised) = nack {
                 tokio::time::sleep(self.config_backoff(attempt, rank)).await;

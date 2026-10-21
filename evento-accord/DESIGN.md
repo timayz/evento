@@ -765,9 +765,15 @@ backend (sql/fjall). Phases, in order:
         contact's hold lost it (now kept alive by `JoinKeepalive`); and a
         `GroupHost::open` dropped mid-join orphaned the joining node's inbox loop
         (now unregistered and stopped).
+        A fourth fix closed two inbox-loop leftovers of #281: a reply went out
+        although the journal refused the stage behind it — a vote, promise,
+        route or apply (now withheld, like a batch whose flush failed; a refused
+        route is forgotten so the next routed message stages it again); and two
+        config changes for one epoch on one node shared a reply slot keyed by the
+        epoch, so one took or tore down the other's replies (now one slot per
+        proposal, every reply fanned out, and a nack counted only by the proposal
+        whose ballot it outbids).
         **Open** (confirmed or plausible, not yet fixed):
-        a config change's replies are keyed by epoch only, so two on one node collide;
-        stage errors are ignored before durability-gated replies;
         the sweep scheduler can starve groups beyond `max_concurrent`;
         (review) recovery's superseding check ignores a later conflict only
         pre-accepted at a replica, which a fast-committed conflict may be;
