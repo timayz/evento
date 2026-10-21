@@ -220,6 +220,21 @@ control plane, everything else is Accord.
   an earlier conflict committed past `t0` without the txn rules the fast path out
   (one only accepted makes recovery wait). A replica holding a read slot answers any
   recovery's Commit with the read it took.
+  *Fast-path votes (#285):* the superseding check alone could keep `t0` for a txn
+  that never fast-committed: a later conflict fast-committed without the txn may
+  still be only pre-accepted at every replica recovery hears from, which proves
+  nothing there. Recovery now also counts the replicas' own PreAccept votes (a
+  pre-accepted report's `execute_at`), as accord-core's `RecoveryTracker` does:
+  once more than `e − F` members of a shard's fast-path electorate are heard
+  voting above `t0`, no fast quorum can have voted `t0`, and recovery re-proposes
+  above every vote (`Node::votes_reject_fast_path`). The count is sound both ways
+  for any electorate `f + 1 ≤ e ≤ n`: a fast commit at `t0` leaves at most `e − F`
+  votes elsewhere, and a conflict fast-committed without the txn puts
+  `F + S − n > e − F` of its fast quorum among any `S` reports (`2F > e + f`),
+  each of which saw the conflict first and so voted above `t0`. Counting a
+  conflict held only pre-accepted as superseding instead would be unsound: the
+  replica holding it is merely outside the txn's fast quorum, and the txn may
+  still have fast-committed through the others.
   *Multi-shard (routes, 2026-10):* each replica stores only its shard's keys, so a
   recovery used to plan the shards the reports revealed within `fast_timeout` — a
   shard that never witnessed the txn (coordinator died mid-broadcast) or answered
@@ -798,9 +813,12 @@ backend (sql/fjall). Phases, in order:
         changes (`Replica.blocked`), the sweep skips parked commands, and
         anti-entropy runs between recoveries on its own cadence: a node cut off
         under load serves again within ~2 s of the heal (`isolated_catch_up`).
+        Recovery's fast-path check now counts the replicas' own PreAccept
+        votes (#285, see M2). Before, a txn whose later conflict had
+        fast-committed without it, but was still only pre-accepted at every
+        replica heard from, was re-proposed at `t0`. It then ordered before a
+        write that never waited for it.
         **Open** (confirmed or plausible, not yet fixed):
-        (review) recovery's superseding check ignores a later conflict only
-        pre-accepted at a replica, which a fast-committed conflict may be;
         a decided multi-shard txn whose shard compacted it, with no replica heard
         from that applied it, stays undecided (liveness, not safety);
         a rejoin (wiped store) forgets the replica's in-flight votes and promises;
