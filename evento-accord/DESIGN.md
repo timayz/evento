@@ -101,10 +101,15 @@ trait** (recommended over gRPC/QUIC) — ✅ implemented in `tcp.rs`:
   unmodified. Frames are `bitcode::serialize`d over a `LengthDelimitedCodec`.
 - Accord traffic is fire-and-correlate-by-`TxnId`, not RPC request/response, so
   one-way framed messages fit better than gRPC call semantics.
-- Per-peer lazy writer tasks connect on demand and reconnect after a drop,
-  with every dial and write bounded by a timeout and failed dials backed off;
-  delivery is best-effort (loss tolerated by quorums/recovery). `serve` runs the
-  inbound accept loop, decoding frames into `Envelope`s for a node's inbox.
+- Per-peer lazy writer tasks connect on demand and reconnect after a drop.
+  Nothing waits on the network unbounded: a dial (connect + TLS handshake)
+  gives up after 2 s and a batch write after 5 s (counted as a failed write,
+  so the writer redials), and a failed dial backs off 100 ms → 1 s before the
+  next — a peer behind a DROP partition cannot pin its writer for the
+  kernel's SYN retries or TCP's retransmit backoff while every frame to it is
+  shed. Delivery is best-effort (loss tolerated by quorums/recovery). `serve`
+  runs the inbound accept loop, decoding frames into `Envelope`s for a node's
+  inbox.
 - Minimal deps (`tokio-util` codec, `bytes`), fully under our control — the same
   `MessageSink` trait still powers the in-memory simulation harness.
 
@@ -774,14 +779,13 @@ backend (sql/fjall). Phases, in order:
         epoch, so one took or tore down the other's replies (now one slot per
         proposal, every reply fanned out, and a nack counted only by the proposal
         whose ballot it outbids).
-        A fifth fix bounded the TCP peer writer: a dial (connect + TLS
-        handshake) now gives up after 2 s and a batch write after 5 s, which
-        counts as a failed write and redials, so a peer behind a DROP partition
-        no longer pins its writer for the kernel's SYN retries or TCP's
-        retransmit backoff while every frame to it is shed; a failed dial backs
-        off 100 ms → 1 s before the next.
+        A further fix made the sweep scheduler fair: it handed its
+        `max_concurrent` slots out in fixed map order, so under saturation the
+        same groups won every tick and the rest went unswept (no recovery,
+        anti-entropy or compaction), and an idle group that missed its slot
+        waited a whole `idle_interval`; now a deferred group stays due and, when
+        slots are short, those swept longest ago go first.
         **Open** (confirmed or plausible, not yet fixed):
-        the sweep scheduler can starve groups beyond `max_concurrent`;
         (review) recovery's superseding check ignores a later conflict only
         pre-accepted at a replica, which a fast-committed conflict may be;
         a decided multi-shard txn whose shard compacted it, with no replica heard
@@ -789,11 +793,11 @@ backend (sql/fjall). Phases, in order:
         a rejoin (wiped store) forgets the replica's in-flight votes and promises;
         an epoch change can remap a route's keys onto replicas that never
         witnessed an in-flight txn, which then answer "never witnessed";
-        under Jepsen faults a node can stay unavailable for the rest of a 120 s
-        run (#291) — not the TCP writer: with it bounded, a partition-only run
-        (`--faults partition --partition-targets one`) still left a node that
-        had been isolated answering only timeouts and 500s after the heal, while
-        its peers' writers had logged it reachable again within ~3 s.
+        under Jepsen faults a node can stay
+        unreachable for the rest of a 120 s run (seen on `alpha` before this round
+        as well) — plausibly because a peer writer's TCP `connect` has no timeout,
+        so behind a DROP partition it blocks for the kernel's SYN retries (about two
+        minutes) while every frame to that peer is shed.
   - [ ] **Real-cluster soak + chaos** over days (kills, partitions, clock skew,
         disk pressure, slow disks/links) on actual hardware — zero production
         mileage today.
