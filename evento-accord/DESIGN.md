@@ -609,14 +609,18 @@ backend (sql/fjall). Phases, in order:
         a dropped `write` future pinned the watermark for good;
         duplicated replies could complete a PreAccept or config-Paxos quorum;
         concurrent `GroupHost::open`s of one group left a deaf node;
-        an anti-entropy import applied past a failed command.
+        an anti-entropy import applied past a failed command;
+        events kept their client-side provisional stamps, so two hosts' skewed clocks
+        could order an aggregate's versions backwards in subscriptions (each event is
+        now re-stamped at apply from its txn's `execute_at`, floored to the
+        millisecond, and the watermark bounds an un-applied command by `t0` floored
+        likewise — a release note, not a format bump: a store applied by an older
+        build keeps its client stamps).
         **Open** (confirmed or plausible, not yet fixed):
         a host rejoining a group of N ≥ 4 is told to rejoin again (its first report
         predates the two-peer coverage proof, and the absent screen refuses its syncs);
         multi-shard recovery cannot see a shard that never witnessed the txn and could
         commit it on the others only (needs the txn's route on every message);
-        events keep their client-side provisional stamps, so two hosts' skewed clocks
-        can order an aggregate's versions backwards in subscriptions;
         an anti-entropy reply or join header over the 64 MiB frame cap is shed forever;
         a config change's replies are keyed by epoch only, so two on one node collide;
         stage errors are ignored before durability-gated replies;

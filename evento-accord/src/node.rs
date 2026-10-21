@@ -28,7 +28,8 @@ use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant};
 
 use crate::api::{
-    snapshot_event_size, AcceptorRecord, DataStore, Journal, MessageSink, ShardId, Topology,
+    floor_millis, snapshot_event_size, stamp_events, AcceptorRecord, DataStore, Journal,
+    MessageSink, ShardId, Topology,
 };
 use crate::clock::{Ballot, Clock, HybridLogicalClock, NodeId, Timestamp, TxnId};
 use crate::failure_detector::FailureDetector;
@@ -675,8 +676,15 @@ impl Node {
     /// cannot vouch for them, and its subscriptions would advance past events
     /// still on their way to it, skipping them for good. Until a sync round
     /// re-proves the window — after a start, a restart or a heal — its
-    /// subscriptions wait. The clamp leaves room for the clock skew bound,
-    /// since an event is stamped before its transaction's `t0` is drawn.
+    /// subscriptions wait. The clamp keeps the clock skew bound below the
+    /// proven window: no longer load-bearing for the stamps (an event is
+    /// stamped at apply from its `execute_at`, never below its `t0`), it stays
+    /// as a conservative hedge on a point a peer computed from its own clock.
+    ///
+    /// The result is floored to a millisecond, the precision events are
+    /// stamped with: a transaction drawing `t0 = 1.5 ms` just above the bound
+    /// still lands at `1.0 ms`, so an unfloored `1.5 ms` watermark would have
+    /// let a subscription pass it.
     pub fn stable_micros(&self) -> u64 {
         let cutoff = self.margin_cutoff();
         let local = self
@@ -684,12 +692,13 @@ impl Node {
             .lock()
             .expect("replica poisoned")
             .stable_event_micros(cutoff);
-        match self.quorum_sync_coverage(&self.shard_peers()) {
+        let bound = match self.quorum_sync_coverage(&self.shard_peers()) {
             Some(coverage) => {
                 local.min(coverage.micros.saturating_sub(self.clock.max_skew_micros()))
             }
             None => local,
-        }
+        };
+        floor_millis(bound)
     }
 
     /// The present lagged by [`compaction_margin`](NodeConfig::compaction_margin):
@@ -864,11 +873,15 @@ impl Node {
         // The truncated prefix is not in the journal; a durable data store already
         // holds it, and re-applying the tail is idempotent. A replay the store
         // fails fails the restart: the journal says these are applied, so a node
-        // starting without them would never apply them again.
+        // starting without them would never apply them again. The events are
+        // stamped from `execute_at` as at the first apply, so a replay over a
+        // store that already holds them is an exact duplicate.
         for cmd in &commands {
             if cmd.status == Status::Applied && cmd.applied_conflict == Some(false) {
+                let mut events = cmd.events.clone();
+                stamp_events(cmd.execute_at, &mut events);
                 self.datastore
-                    .apply(cmd.txn, cmd.execute_at, cmd.events.clone(), true)
+                    .apply(cmd.txn, cmd.execute_at, events, true)
                     .await
                     .map_err(|err| {
                         err.context(format!(
@@ -2098,7 +2111,11 @@ impl Node {
         loop {
             // Prefer enacting a decided, ready transaction.
             let apply = self.replica.lock().expect("replica poisoned").next_apply();
-            if let Some(apply) = apply {
+            if let Some(mut apply) = apply {
+                // The events carry their writer's provisional stamps; the
+                // store gets the agreed ones (see `stamp_events`). The journal
+                // keeps the provisional ones — every apply re-derives the same.
+                stamp_events(apply.execute_at, &mut apply.events);
                 if let Err(err) = self
                     .datastore
                     .apply(apply.txn, apply.execute_at, apply.events, apply.commit)
@@ -3439,7 +3456,10 @@ impl Node {
             {
                 continue;
             }
-            let (txn, execute_at, events) = (cmd.txn, cmd.execute_at, cmd.events.clone());
+            let (txn, execute_at, mut events) = (cmd.txn, cmd.execute_at, cmd.events.clone());
+            // Shipped with the provisional stamps; applied with the agreed
+            // ones, exactly as the contact applied them.
+            stamp_events(execute_at, &mut events);
             let commit = cmd.applied_conflict == Some(false);
             // Materialise the events in the data store **before** recording the
             // command as `Applied`. `Status::Applied` is the promise that a

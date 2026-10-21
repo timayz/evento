@@ -236,6 +236,53 @@ async fn enforces_optimistic_concurrency_across_the_cluster() {
     }
 }
 
+/// Two hosts' skewed clocks cannot reverse an aggregate's versions: the
+/// stamps an event carries in are the writing host's provisional ones, and
+/// every replica re-stamps it from its transaction's agreed `execute_at`. So
+/// v1, stamped 10 s ahead by one host, and v2, stamped at the present by
+/// another, read back as `[1, 2]` everywhere — with identical stamps on every
+/// replica, neither of them the client's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn skewed_client_stamps_cannot_reverse_an_aggregate() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let cluster = ExecCluster::start(3);
+    let stamped = |version: u16, at: Duration| Event {
+        timestamp: at.as_secs(),
+        timestamp_subsec: at.subsec_millis(),
+        ..event("skewed", version, "Opened")
+    };
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+    let ahead = now + Duration::from_secs(10);
+
+    cluster.execs[0]
+        .write(vec![stamped(1, ahead)])
+        .await
+        .unwrap();
+    cluster.execs[1].write(vec![stamped(2, now)]).await.unwrap();
+
+    let stamp = |e: &Event| (e.timestamp, e.timestamp_subsec);
+    let first = cluster.await_read(0, "skewed", 2).await;
+    for node in 0..3 {
+        let events = cluster.await_read(node, "skewed", 2).await;
+        let versions: Vec<u16> = events.iter().map(|e| e.version).collect();
+        assert_eq!(versions, [1, 2], "node {node} reads the versions reversed");
+        assert_eq!(
+            events.iter().map(stamp).collect::<Vec<_>>(),
+            first.iter().map(stamp).collect::<Vec<_>>(),
+            "node {node} stamps the events differently"
+        );
+        assert!(
+            events[0].timestamp < ahead.as_secs(),
+            "node {node} kept the client's stamp"
+        );
+        assert!(
+            events.iter().all(|e| e.timestamp_subsec < 1000),
+            "node {node} stamps finer than milliseconds"
+        );
+    }
+}
+
 /// A write the node refuses because its un-compacted backlog is at
 /// `max_commands` is a transient refusal, not a failure: the executor answers
 /// `WriteError::Unavailable`, and the typed cause is still there to downcast.

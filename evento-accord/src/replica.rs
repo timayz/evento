@@ -28,6 +28,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use evento_core::Event;
 
+use crate::api::floor_millis;
 use crate::clock::{Ballot, NodeId, Timestamp, TxnId};
 use crate::message::{CommandState, Key, Status};
 
@@ -56,10 +57,10 @@ pub struct Replica {
     /// further `next_apply` picks so two concurrent drivers cannot double-apply
     /// the same transaction.
     applying: HashSet<TxnId>,
-    /// Every un-applied command's watermark bound: `min(t0.micros, min event
-    /// stamp)` (see [`stable_event_micros`](Replica::stable_event_micros)),
-    /// keyed by txn so it can be removed when the command's status or events
-    /// change. Kept in lockstep with `commands` by
+    /// Every un-applied command's watermark bound: `t0` floored to a
+    /// millisecond (see [`stable_event_micros`](Replica::stable_event_micros)),
+    /// keyed by txn so it can be removed when the command's status changes.
+    /// Kept in lockstep with `commands` by
     /// [`reindex_unapplied`](Replica::reindex_unapplied).
     unapplied_bounds: HashMap<TxnId, u64>,
     /// The bounds above, ordered — `stable_event_micros` reads the minimum in
@@ -247,24 +248,14 @@ impl Replica {
     /// command state. Must be called whenever a command's applied status or
     /// event set changes — including the late event-repair paths in
     /// [`preaccept`](Self::preaccept) and [`commit`](Self::commit), where
-    /// events (and thus the watermark bound) attach after first insertion.
+    /// events attach after first insertion.
     fn reindex_unapplied(&mut self, txn: TxnId) {
         if let Some(old) = self.unapplied_bounds.remove(&txn) {
             self.unapplied_by_bound.remove(&(old, txn));
             self.unapplied_by_t0.remove(&txn);
         }
         let bound = match self.commands.get(&txn) {
-            Some(cmd) if cmd.status != Status::Applied => {
-                let mut bound = cmd.txn.0.micros;
-                for event in &cmd.events {
-                    let event_micros = event
-                        .timestamp
-                        .saturating_mul(1_000_000)
-                        .saturating_add(u64::from(event.timestamp_subsec) * 1_000);
-                    bound = bound.min(event_micros);
-                }
-                bound
-            }
+            Some(cmd) if cmd.status != Status::Applied => floor_millis(cmd.txn.0.micros),
             Some(_) => {
                 self.applied_by_t0.insert(txn);
                 return;
@@ -323,11 +314,14 @@ impl Replica {
     }
 
     /// An upper bound (µs) on what a subscription may safely process: `cutoff`,
-    /// clamped by the **event timestamps** of every un-applied command — not
-    /// just its `t0`. An event is stamped by its writer *before* consensus, so
-    /// it can sit below its transaction's `t0`; clamping only by `t0` would let
-    /// a subscription advance past an event a stuck transaction will apply
-    /// later, silently skipping it.
+    /// clamped by every un-applied command's `t0` **floored to a millisecond**.
+    /// A command's events are stamped at apply from its `execute_at` (never
+    /// below `t0`), floored to the millisecond the backends store — so an
+    /// event of a transaction at `t0 = 1.5 ms` lands at `1.0 ms`, below an
+    /// unfloored `t0` bound, and a subscription that advanced to `t0` would
+    /// skip it. The provisional stamps the writer put on the events play no
+    /// part: none survives the apply. (`cutoff` itself is floored by the
+    /// caller, [`Node::stable_micros`](crate::Node::stable_micros).)
     pub fn stable_event_micros(&self, cutoff: Timestamp) -> u64 {
         // Served from the incrementally-maintained index: O(1) instead of a
         // scan of every command — this runs on every remote response frame,
@@ -343,14 +337,7 @@ impl Replica {
                 if cmd.status == Status::Applied {
                     continue;
                 }
-                scan = scan.min(cmd.txn.0.micros);
-                for event in &cmd.events {
-                    let event_micros = event
-                        .timestamp
-                        .saturating_mul(1_000_000)
-                        .saturating_add(u64::from(event.timestamp_subsec) * 1_000);
-                    scan = scan.min(event_micros);
-                }
+                scan = scan.min(floor_millis(cmd.txn.0.micros));
             }
             debug_assert_eq!(bound, scan, "unapplied bound index out of sync");
         }
@@ -1073,6 +1060,35 @@ mod tests {
             .expect("B becomes ready after A applies");
         assert_eq!(ready_b.txn, b);
         assert!(ready_b.commit);
+    }
+
+    /// An un-applied command bounds the watermark by its `t0` floored to the
+    /// millisecond its events will be stamped at — not by `t0` itself (the
+    /// stamp of `t0 = 1.5 ms` is `1.0 ms`), and not by the provisional stamps
+    /// the writer put on them (none survives the apply). Applying it lifts the
+    /// bound.
+    #[test]
+    fn an_unapplied_command_bounds_the_watermark_at_its_floored_t0() {
+        let mut replica = Replica::new();
+        let key = Key("k".into());
+        let t = txn(1_500);
+        let cutoff = txn(10_000).0;
+        let provisional = Event {
+            timestamp: 0,
+            timestamp_subsec: 0,
+            ..event("k", 1)
+        };
+
+        replica
+            .preaccept(t, vec![key.clone()], vec![provisional.clone()])
+            .unwrap();
+        assert_eq!(replica.stable_event_micros(cutoff), 1_000);
+
+        replica.commit(t, t.0, vec![], vec![provisional], vec![], NodeId(0));
+        replica.record_decision(t, true);
+        let ready = replica.next_apply().expect("ready to apply");
+        replica.mark_applied(ready.txn, false);
+        assert_eq!(replica.stable_event_micros(cutoff), cutoff.micros);
     }
 
     /// Applies `txn` end to end (preaccept → commit → decide → apply) on `key`.
