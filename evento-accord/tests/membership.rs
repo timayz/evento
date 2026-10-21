@@ -1297,6 +1297,100 @@ async fn a_joining_node_does_not_count_toward_a_read_barrier() {
         .expect("a joined node counts toward the barrier");
 }
 
+/// Asks `node` for anti-entropy as `probe` would, and returns the coverage it
+/// answers with: what a requester records as proof `node` holds everything
+/// it applied below.
+async fn coverage_of(
+    net: &Arc<InMemoryNetwork>,
+    probe: &mut tokio::sync::mpsc::Receiver<evento_accord::Envelope>,
+    node: NodeId,
+) -> evento_accord::Timestamp {
+    use evento_accord::Message;
+
+    net.sink(NodeId(9))
+        .send(
+            node,
+            Message::SyncRequest {
+                id: 1,
+                snapshot: false,
+                known: None,
+            },
+        )
+        .await
+        .unwrap();
+    loop {
+        let env = tokio::time::timeout(Duration::from_secs(5), probe.recv())
+            .await
+            .expect("no anti-entropy reply")
+            .expect("probe inbox closed");
+        if let Message::SyncData { coverage, .. } = env.message {
+            return coverage;
+        }
+    }
+}
+
+/// A freshly joined node holds provably only what its contact vouched for:
+/// a transaction committed before its inbox started, not yet applied by the
+/// contact when it vouched, is in neither the snapshot nor the replayed
+/// inbox. The coverage it hands an anti-entropy requester stays at the vouch
+/// until its own anti-entropy has covered the join, then advances.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joined_node_vouches_for_no_more_than_its_join_proved() {
+    use evento_accord::clock::system_micros;
+
+    let net = InMemoryNetwork::new();
+    let abc = vec![NodeId(0), NodeId(1), NodeId(2)];
+    let abcd = vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3)];
+    let config = NodeConfig {
+        compaction_margin: Duration::from_millis(1),
+        ..NodeConfig::default()
+    };
+    let nodes: Vec<TestNode> = abc
+        .iter()
+        .map(|&id| spawn_node_with(id, 0, vec![abc.clone()], &net, config))
+        .collect();
+    nodes[0]
+        .node
+        .write(vec![event("acc", 1, "Opened")])
+        .await
+        .unwrap();
+    for n in &nodes {
+        await_len(&n.store, 1).await;
+    }
+    let mut probe = net.register(NodeId(9));
+
+    // No anti-entropy has run: the contact can vouch for nothing yet.
+    let before_join = system_micros();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let d = spawn_node_with(NodeId(3), 0, vec![abc.clone()], &net, config);
+    d.node.begin_join();
+    nodes[0]
+        .node
+        .change_topology(1, vec![abcd.clone()])
+        .await
+        .unwrap();
+    await_epoch(&d.topology, 1).await;
+    d.node.join(NodeId(0)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let coverage = coverage_of(&net, &mut probe, NodeId(3)).await;
+    assert!(
+        coverage.micros < before_join,
+        "a joined node vouched past its join proof: {coverage:?}"
+    );
+
+    // Its own anti-entropy covers the join: the cap lifts.
+    let joined = system_micros();
+    for _ in 0..200 {
+        d.node.sweep().await;
+        if coverage_of(&net, &mut probe, NodeId(3)).await.micros > joined {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("a joined node's coverage never advanced past its join");
+}
+
 /// A node whose wall clock lags its group by more than the compaction margin
 /// still mints above the group's compaction floor: a transaction below it
 /// would count as applied at a replica that never saw it. A joiner adopts its

@@ -565,6 +565,19 @@ type SyncPayload = (Timestamp, Timestamp, Vec<Event>, Vec<CommandState>);
 /// A join contact's vouch ([`Message::JoinProof`]): `(epoch, vouched)`.
 type Vouch = (u64, Timestamp);
 
+/// What this node's [`join`](Node::join) proved: the contact's [`Vouch`],
+/// and `until`, this node's clock when the join completed (plus a skew). A transaction
+/// committed before the join's inbox started but not yet applied by the
+/// contact when it vouched is in neither the snapshot nor the replayed
+/// inbox: until its own anti-entropy has covered everything below `until`,
+/// this node holds provably only what was vouched for.
+#[derive(Clone, Copy)]
+struct JoinProven {
+    epoch: u64,
+    vouched: Timestamp,
+    until: Timestamp,
+}
+
 /// Most bytes of an owner's error a [`Message::ReadFailed`] carries back.
 const READ_FAILURE_MAX: usize = 256;
 
@@ -671,7 +684,7 @@ pub struct Node {
     /// [`sync_coverage`](Self::sync_coverage) — a fresh joiner cannot
     /// otherwise prove anything until anti-entropy rounds with enough peers
     /// have run. Ignored once the epoch changes; never persisted.
-    join_proof: Arc<Mutex<Option<Vouch>>>,
+    join_proof: Arc<Mutex<Option<JoinProven>>>,
     /// The [`JoinProof`](Message::JoinProof) of an in-flight join, by its
     /// header request's correlation id (`None` until it arrives).
     proof_pending: Arc<Mutex<HashMap<u64, Option<Vouch>>>>,
@@ -1499,8 +1512,28 @@ impl Node {
     fn proven_coverage(&self, shard_peers: &[NodeId]) -> Option<Timestamp> {
         let coverage = self.quorum_sync_coverage(shard_peers)?;
         match *self.join_proof.lock().expect("join proof poisoned") {
-            Some((epoch, vouched)) if epoch == self.topology.epoch() => Some(coverage.max(vouched)),
+            Some(proof) if proof.epoch == self.topology.epoch() => {
+                Some(coverage.max(proof.vouched))
+            }
             _ => Some(coverage),
+        }
+    }
+
+    /// The sync coverage this node may hand a peer, which records it as proof
+    /// this node holds everything it applied below it: `coverage`, capped at
+    /// [`proven_coverage`](Self::proven_coverage) while a join's gap is open
+    /// ([`JoinProven`]) — applied-through cannot vouch for a transaction the
+    /// join never brought in. Uncapped otherwise, as for any replica.
+    fn exportable_coverage(&self, coverage: Timestamp, shard_peers: &[NodeId]) -> Timestamp {
+        let Some(proof) = *self.join_proof.lock().expect("join proof poisoned") else {
+            return coverage;
+        };
+        if proof.epoch != self.topology.epoch() {
+            return coverage;
+        }
+        match self.quorum_sync_coverage(shard_peers) {
+            Some(quorum) if quorum < proof.until => coverage.min(quorum.max(proof.vouched)),
+            _ => coverage,
         }
     }
 
@@ -4229,7 +4262,10 @@ impl Node {
         // out, all at or above `omitted`.
         let coverage = replica.applied_through(cutoff);
         let coverage = omitted.map_or(coverage, |oldest| coverage.min(oldest));
-        (replica.redundant_before(), coverage, commands)
+        let floor = replica.redundant_before();
+        drop(replica);
+        let coverage = self.exportable_coverage(coverage, &self.shard_peers());
+        (floor, coverage, commands)
     }
 
     /// A join header ([`export_bootstrap`](Self::export_bootstrap) without a
@@ -4266,12 +4302,13 @@ impl Node {
             commands,
         );
         drop(replica);
+        let coverage = self.exportable_coverage(header.1, &shard_peers);
         let vouched = if self.topology.epoch() == epoch {
             vouched
         } else {
             Timestamp::MIN
         };
-        (header.0, header.1, header.2, epoch, vouched)
+        (header.0, coverage, header.2, epoch, vouched)
     }
 
     /// One sync round trip: sends `request(id)` to `contact` and waits up to
@@ -4689,9 +4726,17 @@ impl Node {
                 if epoch == self.topology.epoch()
                     && self.topology.node_shard(contact) == self.topology.node_shard(self.id)
                 {
+                    // A transaction minted elsewhere before the inbox started
+                    // may sit up to a skew above this node's clock.
+                    let mut until = self.clock.now();
+                    until.micros = until.micros.saturating_add(self.clock.max_skew_micros());
                     let mut slot = self.join_proof.lock().expect("join proof poisoned");
-                    if slot.is_none_or(|(at, held)| at != epoch || held < vouched) {
-                        *slot = Some((epoch, vouched));
+                    if slot.is_none_or(|held| held.epoch != epoch || held.vouched < vouched) {
+                        *slot = Some(JoinProven {
+                            epoch,
+                            vouched,
+                            until,
+                        });
                     }
                 }
             }
