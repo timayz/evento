@@ -45,10 +45,11 @@ pub struct GroupHost {
     clock: Option<Arc<HybridLogicalClock>>,
     rejoin: Option<RejoinHandler>,
     groups: Mutex<HashMap<GroupId, Running>>,
-    /// One open per group at a time. The transport keeps a single inbox per
-    /// group, so a second open registering its own would cut the first node
-    /// off from every frame; it waits instead, and finds the group open.
-    /// Removed once no open of the group is running or waiting.
+    /// One open or close per group at a time. The transport keeps a single
+    /// inbox per group, so a second open registering its own would cut the
+    /// first node off from every frame; it waits instead, and finds the
+    /// group open. A close holds it too, so an open waits for the node it
+    /// replaces to be gone. Removed once nobody holds or awaits it.
     opening: Mutex<HashMap<GroupId, Arc<tokio::sync::Mutex<()>>>>,
 }
 
@@ -169,13 +170,7 @@ impl GroupHost {
         if let Some(node) = self.get(group) {
             return Ok(node);
         }
-        let lock = Arc::clone(
-            self.opening
-                .lock()
-                .expect("opening poisoned")
-                .entry(group)
-                .or_default(),
-        );
+        let lock = self.group_lock(group);
         let opened = {
             let _opening = lock.lock().await;
             match self.get(group) {
@@ -186,12 +181,28 @@ impl GroupHost {
                 }
             }
         };
-        // The map's handle and ours: nobody else is opening this group.
+        self.release_group_lock(group, &lock);
+        opened
+    }
+
+    /// `group`'s open/close lock (see `opening`).
+    fn group_lock(&self, group: GroupId) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(
+            self.opening
+                .lock()
+                .expect("opening poisoned")
+                .entry(group)
+                .or_default(),
+        )
+    }
+
+    /// Drops `group`'s lock from the map once nobody else holds or awaits it.
+    fn release_group_lock(&self, group: GroupId, lock: &Arc<tokio::sync::Mutex<()>>) {
+        // The map's handle and ours: nobody else is opening or closing.
         let mut opening = self.opening.lock().expect("opening poisoned");
-        if Arc::strong_count(&lock) == 2 {
+        if Arc::strong_count(lock) == 2 {
             opening.remove(&group);
         }
-        opened
     }
 
     /// [`open_with`](Self::open_with)'s work, under the group's open lock.
@@ -251,8 +262,11 @@ impl GroupHost {
                 }
             }
             if let Some((err, partial)) = last {
-                inbox_task.abort();
+                // Stopped before returning: on a partial snapshot the caller
+                // discards the store this loop writes to.
                 self.mux.unregister(group);
+                inbox_task.abort();
+                let _ = inbox_task.await;
                 return Err(if partial {
                     err
                 } else {
@@ -287,21 +301,48 @@ impl GroupHost {
         Ok(node)
     }
 
-    /// Closes `group` on this host: stops its sweeps and inbox loop and
-    /// unregisters it from the transport (later frames for it are treated as
-    /// unrouted). Returns the node, whose store/journal the caller may now close.
-    pub fn close(&self, group: GroupId) -> Option<Node> {
+    /// Closes `group` on this host: unregisters it from the transport (later
+    /// frames for it are treated as unrouted), stops its sweeps and its inbox
+    /// loop, and returns the node once neither touches its store or journal
+    /// any more — the caller may then close or discard them. The node mints
+    /// nothing more: a clone the application still holds fails to write or
+    /// recover with [`NodeClosed`](crate::NodeClosed), so it can never mint
+    /// an id the group's next node, opened over the same journal, mints too.
+    ///
+    /// A sweep or a message being handled is dropped at its next await point,
+    /// as a crash would drop it. An open of the same group waits until this
+    /// returns. Never call it from one of the group's own tasks (its inbox
+    /// loop or a sweep): it would wait for itself. A dropped Fjall write may
+    /// still finish on its blocking thread, so reopening the same Fjall
+    /// directory right away can find it locked a moment longer.
+    pub async fn close(&self, group: GroupId) -> Option<Node> {
+        let lock = self.group_lock(group);
+        let closed = {
+            let _closing = lock.lock().await;
+            self.close_locked(group).await
+        };
+        self.release_group_lock(group, &lock);
+        closed
+    }
+
+    /// [`close`](Self::close)'s work, under the group's open/close lock.
+    async fn close_locked(&self, group: GroupId) -> Option<Node> {
         let running = self
             .groups
             .lock()
             .expect("groups poisoned")
             .remove(&group)?;
-        self.scheduler.remove(group);
-        running.inbox_task.abort();
+        // Not awaited: the rejoin handler may itself be closing this group.
         if let Some(task) = running.rejoin_task {
             task.abort();
         }
+        running.node.retire().await;
+        self.scheduler.cancel(group).await;
+        // Unregistered first, so frames arriving meanwhile are parked as
+        // unrouted rather than sent into an inbox about to close.
         self.mux.unregister(group);
+        running.inbox_task.abort();
+        let _ = running.inbox_task.await;
         Some(running.node)
     }
 

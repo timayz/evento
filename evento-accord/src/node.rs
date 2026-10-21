@@ -5409,6 +5409,17 @@ impl Node {
         Ok(stamp)
     }
 
+    /// Stops this node minting, for good: its host closed it, and the node
+    /// reopening its journal starts from the clock bound persisted so far.
+    /// Taken under the lock that raises the bound, so a bound being raised is
+    /// persisted before this returns, and every later [`mint`](Self::mint)
+    /// fails with [`NodeClosed`] — a clone the application still holds can
+    /// never mint an id the reopened node mints too.
+    pub(crate) async fn retire(&self) {
+        let _raising = self.clock_bound_lock.lock().await;
+        self.retired.store(true, Ordering::Release);
+    }
+
     /// Starts the clock after a restart past every timestamp this node
     /// minted before: its persisted clock bound, or — for a journal written
     /// before there was one — the transactions it coordinated that the

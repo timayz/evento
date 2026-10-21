@@ -250,8 +250,9 @@ refuses anything else before a vote, and a node never installs it.
   `Message::Rejoin` instead: it logs an error, drops every message, refuses writes
   (`RejoinRequired`; `WriteError::Unavailable` through `AccordExecutor`) and stays
   like that until its host rejoins it — the `GroupHost`
-  `with_rejoin_handler` hook is told, and should close the group, discard its store
-  and journal, and `open_joining` it (next item). The bound a given-up peer must
+  `with_rejoin_handler` hook is told, and should `close(group).await` the group (it
+  returns once nothing touches its store or journal), discard them, and
+  `open_joining` it (next item). The bound a given-up peer must
   report above is persisted (`Journal::save_rejoin_bounds`), so it holds across a
   restart of the node that gave it up. A rejoin streams the snapshot in pages
   (`snapshot_page_bytes`), so a group of any size can be given up on and rejoined.
@@ -353,7 +354,12 @@ thousand-plus groups per process; none of them changes the protocol or the `Node
   ~800.
 - **`GroupHost`** — `open(group, topology, datastore, journal, config)` does the
   per-group wiring (register → sink → `Node::new` → `recover_state` → `start` →
-  schedule) and `close(group)` undoes it. `open_joining(…, contacts)` opens a group
+  schedule) and `close(group).await` undoes it: it returns once the group's sweep and
+  inbox loop have stopped (whatever they were doing is dropped, as a crash would drop
+  it), so its store and journal may be closed or discarded right after, and the
+  returned node mints nothing more (`NodeClosed`; `WriteError::Unavailable` through
+  `AccordExecutor`). An open of the same group waits for a close in progress. Never
+  close a group from one of its own tasks. `open_joining(…, contacts)` opens a group
   whose store was lost by bootstrapping it from a peer's snapshot (§7).
 
 ```rust
@@ -389,8 +395,9 @@ late, after a failed join unregistered the group, does not reopen it.
 
 **SQLite footprint.** sqlx-sqlite runs one OS thread per *open* connection, so bound
 each tenant pool (`max_connections(2–3)`, `min_connections(0)`, an `idle_timeout`) and
-cap the number of tenants open per process (LRU; `host.close` + `pool.close()` on
-eviction — a closed tenant catches up via anti-entropy when re-opened). The tenant
+cap the number of tenants open per process (LRU; `host.close(group).await`, then
+`pool.close()`, on eviction — under the tenant's open lock, so a request for it waits
+and opens it afresh; a closed tenant catches up via anti-entropy when re-opened). The tenant
 file is also the consensus journal, so keep `synchronous(Full)` under WAL. Build
 **one** `Sql` per tenant and clone it into both `ExecutorDataStore` and
 `AccordExecutor` — two `.into()`s from one pool do not share the write-wake channel.
