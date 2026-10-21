@@ -1177,6 +1177,69 @@ async fn a_joining_node_refuses_a_forwarded_read_until_it_has_joined() {
         .expect("a joined node serves reads");
 }
 
+/// A node told to rejoin takes no part until its host rejoins it, but it
+/// refuses a forwarded read out loud: its requester fails at once instead of
+/// waiting out `collect_timeout`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_told_to_rejoin_refuses_a_forwarded_read_at_once() {
+    use evento_accord::{Message, Timestamp};
+    use evento_core::cursor::Args;
+
+    let net = InMemoryNetwork::new();
+    let abc = vec![NodeId(0), NodeId(1), NodeId(2)];
+    let config = NodeConfig {
+        collect_timeout: Duration::from_secs(30),
+        ..NodeConfig::default()
+    };
+    let nodes: Vec<TestNode> = abc
+        .iter()
+        .map(|&id| spawn_node_with(id, 0, vec![abc.clone()], &net, config))
+        .collect();
+    nodes[0]
+        .node
+        .write(vec![event("acc", 1, "Opened")])
+        .await
+        .unwrap();
+    for n in &nodes {
+        await_len(&n.store, 1).await;
+    }
+
+    // A bound above anything it holds: it cannot answer with a report.
+    net.sink(NodeId(1))
+        .send(
+            NodeId(2),
+            Message::Rejoin {
+                above: Timestamp {
+                    micros: u64::MAX,
+                    logical: u32::MAX,
+                    node: NodeId(u64::MAX),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    for _ in 0..1000 {
+        if nodes[2].node.rejoin_required() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(nodes[2].node.rejoin_required());
+
+    let started = std::time::Instant::now();
+    let err = nodes[0]
+        .node
+        .forward_read(NodeId(2), None, None, Args::forward(10, None), None)
+        .await
+        .expect_err("a node told to rejoin served a read");
+    assert!(format!("{err:#}").contains("rejoin"), "{err:#}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the read waited out collect_timeout: {:?}",
+        started.elapsed()
+    );
+}
+
 /// A node whose wall clock lags its group by more than the compaction margin
 /// still mints above the group's compaction floor: a transaction below it
 /// would count as applied at a replica that never saw it. A joiner adopts its

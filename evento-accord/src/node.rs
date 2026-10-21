@@ -1798,8 +1798,19 @@ impl Node {
         self.failure_detector.heartbeat(env.from);
 
         // Told to rejoin: this node's state is stale, so it takes no part until
-        // its host rejoins it (see `NodeConfig::peer_absence_limit`).
+        // its host rejoins it (see `NodeConfig::peer_absence_limit`). A
+        // forwarded read is still refused out loud: unanswered, its requester
+        // would only fail at `collect_timeout`.
         if self.rejoin_required() {
+            if let Message::ReadForward { id, .. } = env.message {
+                return vec![(
+                    env.from,
+                    Message::ReadFailed {
+                        id,
+                        reason: "the owner must rejoin".into(),
+                    },
+                )];
+            }
             return Vec::new();
         }
         if let Message::Rejoin { above } = env.message {
