@@ -153,8 +153,11 @@ gaps:
 - **Durability.** Acceptor state is persisted **before** any promise/accept reply
   (`Journal::record_acceptor`; a vote it could not persist is withheld, like a batch
   whose flush failed), and the committed log is persisted
-  (`Journal::append_metadata`); `recover_state` restores both, so a restarted acceptor
-  keeps its promised ballots (Paxos crash-safety) and re-installs its epoch prefix.
+  (`Journal::append_metadata`) before an epoch is installed — one the log did not
+  take is not installed, and the commit or the metadata sweep retries it, so a
+  restart never falls back below an epoch the node acted on; `recover_state`
+  restores both, so a restarted acceptor keeps its promised ballots (Paxos
+  crash-safety) and re-installs its epoch prefix.
 - **Automatic completion.** The recovery sweep finishes any accepted-but-uncommitted
   epoch itself (the automatic equivalent of `recover_topology`).
 - **Valid layouts only** (`validate_layout`): at least one shard, none empty, every

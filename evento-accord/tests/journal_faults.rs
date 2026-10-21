@@ -16,9 +16,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use evento_accord::{
-    AcceptorRecord, CommandState, DataStore, HybridLogicalClock, InMemoryDataStore,
-    InMemoryJournal, InMemoryNetwork, Journal, MessageSink, Node, NodeConfig, NodeId,
-    StaticTopology, Timestamp, Topology, TxnId,
+    AcceptorRecord, CommandState, DataStore, DynamicTopology, HybridLogicalClock,
+    InMemoryDataStore, InMemoryJournal, InMemoryNetwork, Journal, MessageSink, Node, NodeConfig,
+    NodeId, StaticTopology, Timestamp, Topology, TxnId,
 };
 use evento_core::Event;
 
@@ -38,6 +38,8 @@ struct FaultJournal {
     acceptor_failing: AtomicBool,
     /// While set, a config-acceptor record holding an accepted layout fails.
     accept_failing: AtomicBool,
+    /// While set, appending to the metadata log fails.
+    metadata_failing: AtomicBool,
 }
 
 impl FaultJournal {
@@ -50,6 +52,7 @@ impl FaultJournal {
             truncate_failing: AtomicBool::new(false),
             acceptor_failing: AtomicBool::new(false),
             accept_failing: AtomicBool::new(false),
+            metadata_failing: AtomicBool::new(false),
         }
     }
 
@@ -67,6 +70,10 @@ impl FaultJournal {
 
     fn set_accept_failing(&self, v: bool) {
         self.accept_failing.store(v, Ordering::SeqCst);
+    }
+
+    fn set_metadata_failing(&self, v: bool) {
+        self.metadata_failing.store(v, Ordering::SeqCst);
     }
 
     fn truncates(&self) -> usize {
@@ -117,6 +124,9 @@ impl Journal for FaultJournal {
         self.durable.load_watermark().await
     }
     async fn append_metadata(&self, epoch: u64, layout: &[Vec<NodeId>]) -> anyhow::Result<()> {
+        if self.metadata_failing.load(Ordering::SeqCst) {
+            anyhow::bail!("simulated metadata-log write failure");
+        }
         self.durable.append_metadata(epoch, layout).await
     }
     async fn load_metadata(&self) -> anyhow::Result<Vec<(u64, Vec<Vec<NodeId>>)>> {
@@ -151,6 +161,7 @@ struct Cluster {
     nodes: Vec<Node>,
     journals: Vec<Arc<FaultJournal>>,
     stores: Vec<Arc<InMemoryDataStore>>,
+    topologies: Vec<Arc<dyn Topology>>,
     _loops: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -161,16 +172,38 @@ fn start(n: u64) -> Cluster {
 /// `sweep: false` leaves the recovery sweep (which compacts on every pass)
 /// unstarted, so a test owns every [`Node::compact`] call.
 fn start_with(n: u64, sweep: bool, config: NodeConfig) -> Cluster {
+    build(n, sweep, config, |id, ids| {
+        Arc::new(StaticTopology::new(id, ids.to_vec())) as Arc<dyn Topology>
+    })
+}
+
+/// A single-shard cluster on a [`DynamicTopology`], sweeps started, so it
+/// can change epoch and catch up on the metadata log by itself.
+fn start_dynamic(n: u64) -> Cluster {
+    build(n, true, NodeConfig::default(), |id, ids| {
+        Arc::new(DynamicTopology::new(id, 0, vec![ids.to_vec()])) as Arc<dyn Topology>
+    })
+}
+
+fn build(
+    n: u64,
+    sweep: bool,
+    config: NodeConfig,
+    topology: impl Fn(NodeId, &[NodeId]) -> Arc<dyn Topology>,
+) -> Cluster {
     let ids: Vec<NodeId> = (0..n).map(NodeId).collect();
     let net = InMemoryNetwork::new();
     let (mut nodes, mut journals, mut stores, mut loops) = (vec![], vec![], vec![], vec![]);
+    let mut topologies = Vec::new();
     for &id in &ids {
         let inbox = net.register(id);
         let journal = Arc::new(FaultJournal::new());
         let store = Arc::new(InMemoryDataStore::new());
+        let topology = topology(id, &ids);
+        topologies.push(Arc::clone(&topology));
         let node = Node::new(
             id,
-            Arc::new(StaticTopology::new(id, ids.clone())) as Arc<dyn Topology>,
+            topology,
             Arc::new(HybridLogicalClock::new(id)),
             Arc::new(net.sink(id)) as Arc<dyn MessageSink>,
             Arc::clone(&store) as Arc<dyn DataStore>,
@@ -198,6 +231,7 @@ fn start_with(n: u64, sweep: bool, config: NodeConfig) -> Cluster {
         nodes,
         journals,
         stores,
+        topologies,
         _loops: loops,
     }
 }
@@ -467,4 +501,48 @@ async fn a_config_vote_the_journal_did_not_persist_is_not_sent() {
         .propose_topology(3, layout)
         .await
         .expect("acceptors that persist their votes decide");
+}
+
+/// Waits until `topology` is at `epoch` or later.
+async fn await_epoch(topology: &dyn Topology, epoch: u64) {
+    for _ in 0..500 {
+        if topology.epoch() >= epoch {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("topology did not reach epoch {epoch}");
+}
+
+/// A node whose journal cannot persist a decided epoch does not install it.
+/// Installed, it would act on the epoch, yet fall back to the one before after
+/// a restart; and if the epoch retired every member of the one before, the
+/// peers it would fetch the entry from are gone. Once the journal recovers,
+/// the sweep's metadata catch-up installs it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_epoch_the_journal_did_not_persist_is_not_installed() {
+    let cluster = start_dynamic(3);
+    cluster.journals[2].set_metadata_failing(true);
+
+    cluster.nodes[0]
+        .change_topology(1, vec![cluster.ids.clone()])
+        .await
+        .unwrap();
+    await_epoch(cluster.topologies[1].as_ref(), 1).await;
+    // Several sweeps' worth of catch-up attempts, all failing to persist.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        cluster.topologies[2].epoch(),
+        0,
+        "installed an epoch its journal did not take"
+    );
+    assert!(cluster.journals[2]
+        .load_metadata()
+        .await
+        .unwrap()
+        .is_empty());
+
+    cluster.journals[2].set_metadata_failing(false);
+    await_epoch(cluster.topologies[2].as_ref(), 1).await;
+    assert_eq!(cluster.journals[2].load_metadata().await.unwrap().len(), 1);
 }

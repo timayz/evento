@@ -1151,6 +1151,31 @@ impl Node {
         bounds
     }
 
+    /// Appends decided metadata-log entries, the gate in front of installing
+    /// them. An epoch is never installed unless the log took it: installed, it
+    /// is acted on, yet a restart would fall back to the epoch before — and if
+    /// the epoch retired every member of that one, nobody this node asks for
+    /// the entry is left. The commit or the metadata sweep retries it.
+    async fn persist_metadata(&self, entries: &[(u64, Vec<Vec<NodeId>>)]) -> bool {
+        let persisted = match entries {
+            [] => return true,
+            [(epoch, layout)] => self.journal.append_metadata(*epoch, layout).await,
+            entries => self.journal.append_metadata_batch(entries).await,
+        };
+        match persisted {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!(
+                    node = self.id.0,
+                    epochs = entries.len(),
+                    %err,
+                    "cannot persist decided epochs; not installing them"
+                );
+                false
+            }
+        }
+    }
+
     /// Persists this node's config-acceptor state for `epoch`, the gate in
     /// front of every promise or accept it sends. On failure the vote is
     /// withheld, like a batch whose flush failed: the in-memory state may be
@@ -2354,7 +2379,11 @@ impl Node {
                 // Append to the durable log, then install every now-contiguous
                 // epoch. If this commit arrived before an intervening epoch, ask the
                 // sender (which decided it, so holds the full prefix) to fill the gap.
-                let _ = self.journal.append_metadata(epoch, &layout).await;
+                // An epoch the log did not take is not installed (see
+                // `persist_metadata`); the metadata sweep fetches it again.
+                if !self.persist_metadata(&[(epoch, layout.clone())]).await {
+                    return out;
+                }
                 self.ingest_entry(epoch, layout);
                 if self.has_metadata_gap() {
                     out.push((
@@ -2402,8 +2431,10 @@ impl Node {
                 // Persist the whole run first (one group fsync for journals that
                 // support it), then ingest in ascending order; `apply_log` installs
                 // each now-contiguous epoch. Idempotent, so an overlapping pull is
-                // harmless.
-                let _ = self.journal.append_metadata_batch(&entries).await;
+                // harmless — and a failed one is simply pulled again.
+                if !self.persist_metadata(&entries).await {
+                    return out;
+                }
                 for (epoch, layout) in entries {
                     self.ingest_entry(epoch, layout);
                 }
@@ -4940,8 +4971,11 @@ impl Node {
     /// Installs the decided layout locally and broadcasts it to the acceptors and
     /// the new members so they install it too.
     async fn commit_topology(&self, epoch: u64, layout: &[Vec<NodeId>], acceptors: &[NodeId]) {
-        let _ = self.journal.append_metadata(epoch, layout).await;
-        self.ingest_entry(epoch, layout.to_vec());
+        // Not installed here if the log did not take it: the commit sent to
+        // this node with the others, or the metadata sweep, retries it.
+        if self.persist_metadata(&[(epoch, layout.to_vec())]).await {
+            self.ingest_entry(epoch, layout.to_vec());
+        }
         let mut recipients = acceptors.to_vec();
         for node in layout.iter().flatten() {
             if !recipients.contains(node) {
