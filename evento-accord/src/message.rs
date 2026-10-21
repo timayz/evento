@@ -372,6 +372,21 @@ pub enum Message {
         #[serde(with = "wire_events")]
         events: Vec<Event>,
     },
+    /// Contact → joining node, right after the [`SyncData`](Message::SyncData)
+    /// answering its [`SnapshotRequest`](Message::SnapshotRequest) (same `id`):
+    /// the contact's own watermark report `vouched`, taken in the same cut as
+    /// that header under topology `epoch`. The contact holds every committed
+    /// transaction below it, and the joiner copies that state, so once the
+    /// snapshot is installed the joiner may report it too — without it, its
+    /// first report predates the coverage proof a shard of four or more
+    /// replicas needs, and peers that gave it up keep telling it to rejoin. A
+    /// separate message rather than a field of `SyncData`, so a joiner that
+    /// predates it simply sheds it and joins as before.
+    JoinProof {
+        id: u64,
+        epoch: u64,
+        vouched: Timestamp,
+    },
 }
 
 impl Message {
@@ -384,8 +399,8 @@ impl Message {
     /// (`SnapshotRequest`, `SnapshotPageRequest`, and the legacy
     /// `SyncRequest { snapshot: true }`) are not: they must open the group on
     /// a contact that has it closed, or the join would time out. A
-    /// `SnapshotPage` is: a page arriving late, after a failed join
-    /// unregistered the group, must not reopen it.
+    /// `SnapshotPage` or `JoinProof` is: a reply arriving late, after a
+    /// failed join unregistered the group, must not reopen it.
     pub fn is_sweep(&self) -> bool {
         matches!(
             self,
@@ -396,6 +411,7 @@ impl Message {
                 }
                 | Message::SyncData { .. }
                 | Message::SnapshotPage { .. }
+                | Message::JoinProof { .. }
         )
     }
 
@@ -435,7 +451,8 @@ impl Message {
             | Message::MetadataEntries { .. }
             | Message::ReadForward { .. }
             | Message::ReadReply { .. }
-            | Message::Rejoin { .. } => None,
+            | Message::Rejoin { .. }
+            | Message::JoinProof { .. } => None,
         }
     }
 }
@@ -576,6 +593,32 @@ mod tests {
         }
     }
 
+    /// The join proof crosses the wire intact. (It is appended after every
+    /// earlier variant: bitcode encodes a variant by position, so every
+    /// earlier frame keeps its bytes.)
+    #[test]
+    fn join_proof_round_trips_tagged() {
+        let vouched = Timestamp {
+            micros: 42,
+            logical: 3,
+            node: NodeId(2),
+        };
+        let proof = Message::JoinProof {
+            id: 9,
+            epoch: 4,
+            vouched,
+        };
+        let bytes = encode_tagged(RecordKind::GroupFrame, &proof).unwrap();
+        match decode_tagged(RecordKind::GroupFrame, &bytes).unwrap() {
+            Message::JoinProof {
+                id,
+                epoch,
+                vouched: back,
+            } => assert_eq!((id, epoch, back), (9, 4, vouched)),
+            other => panic!("variant changed on the wire: {other:?}"),
+        }
+    }
+
     /// A joiner's requests must wake a closed contact; a page must not wake
     /// a joiner that gave up. None of them concerns a transaction.
     #[test]
@@ -587,10 +630,16 @@ mod tests {
             events: Vec::new(),
             next: None,
         };
+        let proof = Message::JoinProof {
+            id: 1,
+            epoch: 0,
+            vouched: Timestamp::MIN,
+        };
         assert!(!request.is_sweep());
         assert!(!page_request.is_sweep());
         assert!(page.is_sweep());
-        for message in [request, page_request, page] {
+        assert!(proof.is_sweep());
+        for message in [request, page_request, page, proof] {
             assert_eq!(message.txn(), None);
         }
     }

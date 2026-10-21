@@ -879,15 +879,31 @@ async fn a_legacy_single_group_node_interoperates_in_the_default_group() {
 /// a lost store needs: close, discard, open by joining.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_host_rejoins_a_group_its_peers_gave_up_on() {
-    let cluster = MuxCluster::start(3, Duration::from_millis(200)).await;
-    let mut g = Group::new(GroupId(52), 3);
+    a_host_rejoins_a_group_of(3).await;
+}
+
+/// The same with four hosts, where a report needs two peers' coverage: the
+/// joined node is counted again from its first report, and its host is not
+/// told to rejoin a second time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_rejoins_a_group_of_four_its_peers_gave_up_on() {
+    a_host_rejoins_a_group_of(4).await;
+}
+
+/// Host `n - 1` closes the group past the absence limit, is told to rejoin
+/// over its old journal, and rejoins through the others.
+async fn a_host_rejoins_a_group_of(n: u64) {
+    let cluster = MuxCluster::start(n, Duration::from_millis(200)).await;
+    let size = n as usize;
+    let gone = size - 1;
+    let mut g = Group::new(GroupId(52), size);
     let config = NodeConfig {
         compaction_margin: Duration::from_millis(300),
         peer_absence_limit: Some(Duration::from_secs(1)),
         ..NodeConfig::default()
     };
     let mut nodes = Vec::new();
-    for h in 0..3 {
+    for h in 0..size {
         nodes.push(cluster.open_with(&g, h, config).await);
     }
     write(&nodes[0], vec![event("acc", 1, "Opened")]).await;
@@ -895,13 +911,15 @@ async fn a_host_rejoins_a_group_its_peers_gave_up_on() {
         await_committed(store, 1).await;
     }
 
-    // Host 2 closes the group; the others keep writing and, once host 2 has
-    // been silent past the limit, compact without it.
-    cluster.hosts[2].close(g.id).expect("open on host 2");
+    // The last host closes the group; the others keep writing and, once it
+    // has been silent past the limit, compact without it.
+    cluster.hosts[gone]
+        .close(g.id)
+        .expect("open on the last host");
     write(&nodes[0], vec![event("acc", 2, "Deposited")]).await;
     write(&nodes[1], vec![event("acc", 3, "Deposited")]).await;
     for _ in 0..600 {
-        if nodes[0].command_count() == 0 && nodes[1].command_count() == 0 {
+        if (0..gone).all(|h| nodes[h].command_count() == 0) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -909,22 +927,22 @@ async fn a_host_rejoins_a_group_its_peers_gave_up_on() {
     assert_eq!(
         nodes[0].command_count(),
         0,
-        "host 0 compacted without host 2"
+        "host 0 compacted without the last host"
     );
-    assert_eq!(nodes[0].absent_peers(), vec![NodeId(2)]);
+    assert_eq!(nodes[0].absent_peers(), vec![NodeId(gone as u64)]);
 
     // Back over its old journal (the in-memory store is not durable, so it is
-    // rebuilt from the journal as in the restart tests), host 2's node is
-    // behind and told so.
-    g.stores[2] = Arc::new(InMemoryDataStore::new());
-    let stale = cluster.open_with(&g, 2, config).await;
+    // rebuilt from the journal as in the restart tests), the last host's node
+    // is behind and told so.
+    g.stores[gone] = Arc::new(InMemoryDataStore::new());
+    let stale = cluster.open_with(&g, gone, config).await;
     for _ in 0..600 {
-        if cluster.rejoined[2].lock().unwrap().contains(&g.id) {
+        if cluster.rejoined[gone].lock().unwrap().contains(&g.id) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert_eq!(cluster.rejoined[2].lock().unwrap().as_slice(), &[g.id]);
+    assert_eq!(cluster.rejoined[gone].lock().unwrap().as_slice(), &[g.id]);
     assert!(stale.rejoin_required());
     assert!(stale
         .write(vec![event("acc", 4, "Deposited")])
@@ -932,28 +950,30 @@ async fn a_host_rejoins_a_group_its_peers_gave_up_on() {
         .is_err());
 
     // The handler's job: close, discard the store and journal, open by joining.
-    cluster.hosts[2].close(g.id).expect("open on host 2");
-    g.stores[2] = Arc::new(InMemoryDataStore::new());
-    g.journals[2] = Arc::new(InMemoryJournal::new());
+    cluster.hosts[gone]
+        .close(g.id)
+        .expect("open on the last host");
+    g.stores[gone] = Arc::new(InMemoryDataStore::new());
+    g.journals[gone] = Arc::new(InMemoryJournal::new());
+    let contacts: Vec<NodeId> = (0..gone as u64).map(NodeId).collect();
     let joined = cluster
-        .open_joining(&g, 2, config, &[NodeId(0), NodeId(1)])
+        .open_joining(&g, gone, config, &contacts)
         .await
         .expect("join");
-    assert_eq!(committed(&g.stores[2]), committed(&g.stores[0]));
+    assert_eq!(committed(&g.stores[gone]), committed(&g.stores[0]));
     for _ in 0..200 {
-        if nodes[0].absent_peers().is_empty() && nodes[1].absent_peers().is_empty() {
+        if (0..gone).all(|h| nodes[h].absent_peers().is_empty()) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(
-        nodes[0].absent_peers().is_empty(),
-        "host 0 counts host 2 again"
-    );
-    assert!(
-        nodes[1].absent_peers().is_empty(),
-        "host 1 counts host 2 again"
-    );
+    for (h, node) in nodes.iter().enumerate().take(gone) {
+        assert!(
+            node.absent_peers().is_empty(),
+            "host {h} counts the last host again"
+        );
+    }
+    assert!(!joined.rejoin_required(), "not told to rejoin again");
 
     // Writes land on the joiner and it can coordinate one.
     write(&nodes[0], vec![event("acc", 4, "Deposited")]).await;
@@ -961,7 +981,12 @@ async fn a_host_rejoins_a_group_its_peers_gave_up_on() {
     for store in &g.stores {
         await_committed(store, 5).await;
     }
-    assert_eq!(committed(&g.stores[2]), committed(&g.stores[0]));
+    assert_eq!(committed(&g.stores[gone]), committed(&g.stores[0]));
+    assert_eq!(
+        cluster.rejoined[gone].lock().unwrap().as_slice(),
+        &[g.id],
+        "the host was told to rejoin once"
+    );
 }
 
 /// A journal whose restart load pauses, so two opens of one group overlap.
