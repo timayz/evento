@@ -270,6 +270,193 @@ async fn recovery_adopts_the_accepted_value_not_a_preaccept_vote() {
     assert_eq!(applied[0].execute_at, at);
 }
 
+/// A real node 0 in a group of `n` replicas — the whole group is the
+/// fast-path electorate — whose other replicas are scripted, and two
+/// transactions on one key that node 0 pre-accepted in this order: `later`,
+/// then `earlier`, whose `t0` is lower. Having seen `later` first, node 0
+/// voted above `earlier`'s `t0`: it is in no fast quorum that could have
+/// committed `earlier` at `t0`.
+struct Votes {
+    node: Node,
+    net: Arc<InMemoryNetwork>,
+    earlier: TxnId,
+    later: TxnId,
+    keys: Vec<Key>,
+    events: Vec<Event>,
+    _loop: tokio::task::JoinHandle<()>,
+}
+
+async fn votes(n: u64) -> Votes {
+    let net = InMemoryNetwork::new();
+    let ids: Vec<NodeId> = (0..n).map(NodeId).collect();
+    let inbox = net.register(NodeId(0));
+    let node = Node::new(
+        NodeId(0),
+        Arc::new(StaticTopology::new(NodeId(0), ids)),
+        Arc::new(HybridLogicalClock::new(NodeId(0))),
+        Arc::new(net.sink(NodeId(0))) as Arc<dyn MessageSink>,
+        Arc::new(InMemoryDataStore::new()) as Arc<dyn DataStore>,
+        Arc::new(InMemoryJournal::new()) as Arc<dyn Journal>,
+    )
+    .with_config(NodeConfig {
+        collect_timeout: Duration::from_millis(500),
+        ..NodeConfig::default()
+    });
+    let task = node.start(inbox);
+
+    let micros = HybridLogicalClock::new(NodeId(9)).now().micros;
+    let earlier = TxnId(Timestamp {
+        micros,
+        logical: 0,
+        node: NodeId(7),
+    });
+    let later = TxnId(Timestamp {
+        micros: micros + 1_000,
+        logical: 0,
+        node: NodeId(9),
+    });
+    let keys = vec![Key("acc".into())];
+    let events = vec![event("acc", 1)];
+    // Each outside coordinator pre-accepts its transaction at node 0 and
+    // goes quiet: `later`'s (node 9) first, then `earlier`'s (node 7).
+    for (coordinator, txn, events) in [
+        (9, later, vec![event("acc", 1)]),
+        (7, earlier, events.clone()),
+    ] {
+        let mut inbox = net.register(NodeId(coordinator));
+        net.sink(NodeId(coordinator))
+            .send(
+                NodeId(0),
+                Message::PreAccept {
+                    txn,
+                    keys: keys.clone(),
+                    events,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            next(&mut inbox).await,
+            Message::PreAcceptOk { .. }
+        ));
+    }
+
+    Votes {
+        node,
+        net,
+        earlier,
+        later,
+        keys,
+        events,
+        _loop: task,
+    }
+}
+
+impl Votes {
+    /// Scripts replica `id` to report `earlier` pre-accepted, with `vote` as
+    /// its execution timestamp, and to cooperate with what follows.
+    fn peer(&self, id: u64, vote: Timestamp) -> Scripted {
+        Scripted::spawn(
+            self.net.register(NodeId(id)),
+            self.net.sink(NodeId(id)),
+            Report {
+                known: true,
+                status: Status::PreAccepted,
+                accepted: Ballot(self.earlier.0),
+                execute_at: vote,
+                delay: Duration::ZERO,
+            },
+            self.keys.clone(),
+            self.events.clone(),
+            true,
+        )
+    }
+
+    /// A vote above `later`'s `t0`, as a replica that saw `later` first casts.
+    fn raised(&self) -> Timestamp {
+        Timestamp {
+            micros: self.later.0.micros,
+            logical: 0,
+            node: NodeId(11),
+        }
+    }
+
+    /// Recovers `earlier` from node 0 and returns the execution timestamp its
+    /// Accept proposed, as `peer` received it.
+    async fn proposed(&self, peer: &Scripted) -> Timestamp {
+        tokio::time::timeout(Duration::from_secs(10), self.node.recover(self.earlier))
+            .await
+            .expect("recovery completes")
+            .expect("a quorum cooperates");
+        let proposed: Vec<Timestamp> = peer
+            .received()
+            .iter()
+            .filter_map(|m| match m {
+                Message::Accept { execute_at, .. } => Some(*execute_at),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(proposed.len(), 1, "recovery proposes once: {proposed:?}");
+        proposed[0]
+    }
+}
+
+/// Recovery's fast-path check must count the replicas' own PreAccept votes,
+/// not only the conflicts they already accepted or committed. Of three
+/// replicas a fast quorum is all three, so node 0's vote above `t0` proves
+/// `earlier` never committed on the fast path — although both other replicas
+/// voted `t0`, and node 0 holds `later` only pre-accepted. `later` may have
+/// fast-committed elsewhere without `earlier` among its dependencies:
+/// re-proposed at `t0`, `earlier` would order before a write that never
+/// waits for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recovery_counts_preaccept_votes_against_the_fast_path() {
+    let v = votes(3).await;
+    let peers: Vec<Scripted> = (1..3).map(|id| v.peer(id, v.earlier.0)).collect();
+
+    let proposed = v.proposed(&peers[0]).await;
+    assert!(
+        proposed > v.later.0,
+        "a vote above t0 from the electorate rules the fast path out: proposed {proposed:?}, \
+         t0 {:?}, the later conflict {:?}",
+        v.earlier.0,
+        v.later.0
+    );
+}
+
+/// The other side of the threshold: of five replicas a fast quorum is four,
+/// so the one vote above `t0` (node 0's) leaves the fast path possible — the
+/// other four could have formed it — and recovery must keep `t0`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_vote_above_t0_of_five_leaves_the_fast_path_possible() {
+    let v = votes(5).await;
+    let peers: Vec<Scripted> = (1..5).map(|id| v.peer(id, v.earlier.0)).collect();
+
+    assert_eq!(
+        v.proposed(&peers[0]).await,
+        v.earlier.0,
+        "four votes at t0 may have fast-committed it"
+    );
+}
+
+/// Two votes above `t0` of five leave at most three at `t0`, short of the
+/// fast quorum of four: the fast path is ruled out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_votes_above_t0_of_five_rule_the_fast_path_out() {
+    let v = votes(5).await;
+    let raised = v.raised();
+    let peers: Vec<Scripted> = (1..5)
+        .map(|id| v.peer(id, if id == 1 { raised } else { v.earlier.0 }))
+        .collect();
+
+    let proposed = v.proposed(&peers[0]).await;
+    assert!(
+        proposed > v.later.0,
+        "no fast quorum is left at t0: proposed {proposed:?}, t0 {:?}",
+        v.earlier.0
+    );
+}
+
 /// A real replica (node 0 of `{0, 1, 2}`) with a kept journal, plus the inboxes
 /// of an outside coordinator (node 9) and recoverer (node 8) the test plays.
 struct Fence {

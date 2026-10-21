@@ -4041,6 +4041,42 @@ impl Node {
         }
     }
 
+    /// Whether the replicas' own PreAccept votes rule out that `txn` was
+    /// committed on the fast path at its `t0` (accord-core's
+    /// `RecoveryTracker` / `Shard::rejectsFastPath`). A fast commit needs a
+    /// fast quorum `F` of a shard's electorate (`e` replicas) voting `t0`, so
+    /// once more than `e − F` of that electorate are heard voting anything
+    /// else, no fast quorum formed there. Only electorate votes count, as on
+    /// the coordinator's fast path (`agree`); a PreAccepted report's
+    /// `execute_at` is its replica's vote. `known` holds one report per
+    /// responder.
+    ///
+    /// The superseding check alone misses this: a later conflict that a
+    /// replica holds only pre-accepted may have fast-committed elsewhere
+    /// without `txn` among its dependencies, and a replica's local view of
+    /// such a conflict proves nothing either way. The vote count is sound
+    /// both ways for any electorate `f + 1 ≤ e ≤ n`:
+    /// - a fast commit at `t0` leaves at most `e − F` votes elsewhere, so it
+    ///   is never ruled out;
+    /// - a later conflict fast-committed without `txn` was voted for by a
+    ///   fast quorum, `F + S − n` of whose members are among any `S` reports
+    ///   of the shard (more than `e − F`, since `2F > e + f`). Each of them
+    ///   saw the conflict before `txn` — it would be among its dependencies
+    ///   otherwise — so each voted above `t0`.
+    fn votes_reject_fast_path(
+        txn: TxnId,
+        plans: &[ShardPlan],
+        known: &[(NodeId, RecoverFields)],
+    ) -> bool {
+        plans.iter().any(|plan| {
+            let rejects = known
+                .iter()
+                .filter(|(from, f)| plan.electorate.contains(from) && f.execute_at != txn.0)
+                .count();
+            rejects > plan.electorate.len().saturating_sub(plan.fast_q)
+        })
+    }
+
     /// Decides a recovered transaction from the `known` reports — a slow
     /// quorum of every shard in `plans` — and drives it: re-propose under
     /// `ballot` (unless already committed), then Commit → Read → Apply.
@@ -4091,8 +4127,13 @@ impl Node {
                     .1
                     .execute_at
             }
+            // Nothing accepted: if committed at all, it was on the fast path,
+            // at `t0`. Once a conflict or the votes rule that out, re-propose
+            // above every vote, as the slow path would; otherwise keep `t0`.
             Status::PreAccepted => {
-                if known.iter().any(|(_, f)| f.superseding_rejects) {
+                if known.iter().any(|(_, f)| f.superseding_rejects)
+                    || Self::votes_reject_fast_path(txn, plans, &known)
+                {
                     known
                         .iter()
                         .map(|(_, f)| f.execute_at)
@@ -5980,6 +6021,71 @@ mod tests {
         let mut expected_union: Vec<NodeId> = (0..4).map(NodeId).collect();
         expected_union.sort_unstable();
         assert_eq!(union, expected_union);
+    }
+
+    /// Recovery rules the fast path out from the replicas' own votes the way
+    /// accord-core's `RecoveryTracker` does: votes above `t0` count only from
+    /// the fast-path electorate, and only past its slack, `e − F`.
+    #[tokio::test]
+    async fn the_fast_path_is_ruled_out_past_the_electorates_slack() {
+        use super::RecoverFields;
+        use crate::clock::Ballot;
+        use crate::message::Status;
+
+        let txn = TxnId(Timestamp {
+            micros: 10,
+            logical: 0,
+            node: NodeId(9),
+        });
+        let raised = Timestamp {
+            micros: 20,
+            logical: 0,
+            node: NodeId(9),
+        };
+        let key = Key("acc".into());
+        // Whether these PreAccept votes, one per replica, rule it out.
+        let rejects = |topology: StaticTopology, votes: &[(u64, Timestamp)]| {
+            let net = InMemoryNetwork::new();
+            let node = Node::new(
+                NodeId(0),
+                Arc::new(topology) as Arc<dyn Topology>,
+                Arc::new(HybridLogicalClock::new(NodeId(0))),
+                Arc::new(net.sink(NodeId(0))) as Arc<dyn MessageSink>,
+                Arc::new(InMemoryDataStore::new()) as Arc<dyn DataStore>,
+                Arc::new(InMemoryJournal::new()) as Arc<dyn Journal>,
+            );
+            let (plans, _) = node.plan(std::slice::from_ref(&key), &[]);
+            let known: Vec<(NodeId, RecoverFields)> = votes
+                .iter()
+                .map(|&(id, vote)| {
+                    let report = RecoverFields {
+                        known: true,
+                        status: Status::PreAccepted,
+                        accepted: Ballot(txn.0),
+                        execute_at: vote,
+                        deps: Vec::new(),
+                        superseding_rejects: false,
+                        wait: false,
+                        keys: vec![key.clone()],
+                        events: Vec::new(),
+                        route: None,
+                    };
+                    (NodeId(id), report)
+                })
+                .collect();
+            Node::votes_reject_fast_path(txn, &plans, &known)
+        };
+        let five = || StaticTopology::new(NodeId(0), (0..5).map(NodeId).collect());
+
+        // All five vote on the fast path: F = 4 leaves one vote of slack.
+        assert!(!rejects(five(), &[(0, raised), (1, txn.0), (2, txn.0)]));
+        assert!(rejects(five(), &[(0, raised), (1, raised), (2, txn.0)]));
+
+        // Electorate {0, 1, 2}: e = F = 3, no slack. One electorate vote
+        // above `t0` rules it out; votes outside the electorate never count.
+        let shrunk = || five().with_fast_electorate(vec![NodeId(0), NodeId(1), NodeId(2)]);
+        assert!(rejects(shrunk(), &[(1, raised), (3, txn.0), (4, txn.0)]));
+        assert!(!rejects(shrunk(), &[(3, raised), (4, raised), (0, txn.0)]));
     }
 
     /// A replica that never saw PreAccept indexes the transaction from the

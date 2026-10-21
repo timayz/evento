@@ -23,6 +23,10 @@
 //! decision. [`recover`](Replica::recover) reports a replica's knowledge plus
 //! `superseding_rejects`: whether a later conflicting transaction failed to
 //! witness this one, which proves it could not have committed on the fast path.
+//! A pre-accepted report's `execute_at` is the replica's own vote; the
+//! recovery coordinator also counts those votes, and enough of the fast-path
+//! electorate voting above `t0` rules the fast path out on its own
+//! (`Node::votes_reject_fast_path`).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -233,7 +237,8 @@ pub struct RecoverState {
     pub status: Status,
     /// Ballot at which its execute-at/deps were accepted.
     pub accepted: Ballot,
-    /// Its current execution timestamp.
+    /// Its current execution timestamp — while `PreAccepted`, this replica's
+    /// vote, which recovery counts against the fast path.
     pub execute_at: Timestamp,
     /// Its current dependency set.
     pub deps: Vec<TxnId>,
