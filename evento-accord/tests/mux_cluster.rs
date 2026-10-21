@@ -725,6 +725,47 @@ async fn a_join_moves_on_when_a_contact_does_not_answer() {
     assert!(!cluster.hosts[2].is_open(g.id));
 }
 
+/// An open dropped mid-join (its caller hung up) leaves nothing running: the
+/// group is unregistered, its inbox loop stopped, and a later open joins anew.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_open_dropped_mid_join_leaves_nothing_running() {
+    let cluster = MuxCluster::start(3, Duration::from_millis(200)).await;
+    let mut g = Group::new(GroupId(52), 3);
+    let nodes = cluster.open_everywhere(&g).await;
+    write(&nodes[0], vec![event("acc", 1, "Opened")]).await;
+    for store in &g.stores {
+        await_committed(store, 1).await;
+    }
+
+    // Host 1 is closed and nothing reopens it: a join through it hangs.
+    cluster.hosts[1].close(g.id).await.expect("open on host 1");
+    cluster.hosts[2].close(g.id).await.expect("open on host 2");
+    g.stores[2] = Arc::new(InMemoryDataStore::new());
+    g.journals[2] = Arc::new(InMemoryJournal::new());
+    let config = NodeConfig {
+        collect_timeout: Duration::from_secs(30),
+        ..NodeConfig::default()
+    };
+    let dropped = tokio::time::timeout(
+        Duration::from_millis(300),
+        cluster.open_joining(&g, 2, config, &[NodeId(1)]),
+    )
+    .await;
+    assert!(dropped.is_err(), "the join through a closed host finished");
+    assert!(!cluster.hosts[2].is_open(g.id));
+    assert!(
+        !cluster.hosts[2].transport().is_registered(g.id),
+        "the dropped open left its inbox registered"
+    );
+
+    cluster
+        .open_joining(&g, 2, NodeConfig::default(), &[NodeId(0)])
+        .await
+        .expect("join through host 0");
+    assert_eq!(committed(&g.stores[2]), committed(&g.stores[0]));
+    assert!(cluster.hosts[2].close(g.id).await.is_some());
+}
+
 /// An idle group's peers keep gossiping watermarks; a host that closed the group
 /// must not be asked to reopen it for them (that would undo every close).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

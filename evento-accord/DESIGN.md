@@ -484,13 +484,23 @@ backend (sql/fjall). Phases, in order:
   epoch only, never persisted). Without it the joiner's first report would precede
   the `slow_q − 1` peers' coverage a shard of four or more needs, and it would be
   told to rejoin again. Until the joiner reports, the contact holds its own report
-  at that vouch (a `JoinHold`, refreshed by every page request and lapsing a few
-  page timeouts after the last), so no peer's compaction — and bound — passes the
-  joiner's first report while pages cross the wire under a write load. A node still
-  joining ignores `Rejoin` and answers no anti-entropy (its coverage would vouch for
-  transactions it never witnessed); a stale replica that never rejoined still gets
-  only `Rejoin` (`a_rejoined_peer_is_counted_again_in_a_group_of_four`/`_five`,
+  at that vouch (a `JoinHold`, refreshed by every page request and by the
+  `JoinKeepalive` the joiner sends every `collect_timeout` while its join runs,
+  and lapsing a few page timeouts after the last), so no peer's compaction — and
+  bound — passes the joiner's first report while pages cross the wire under a
+  write load or install on a slow disk. A node still joining ignores `Rejoin`,
+  sweeps nothing (a report it gossiped would end its contact's hold), and answers
+  no anti-entropy and no read-barrier probe (its coverage and its conflict graph
+  lack what the join is importing). Once joined, the coverage it hands an
+  anti-entropy requester stays capped at its proven coverage until its own
+  anti-entropy has covered everything below the join's completion: a transaction
+  committed before its inbox started, not yet applied by the contact when it
+  vouched, is in neither the snapshot nor the replayed inbox. A stale replica that
+  never rejoined still gets only `Rejoin`
+  (`a_rejoined_peer_is_counted_again_in_a_group_of_four`/`_five`,
   `a_peer_rejoining_under_writes_is_counted_again`,
+  `a_joiner_with_a_slow_disk_keeps_its_contact_holding`,
+  `a_joined_node_vouches_for_no_more_than_its_join_proved`,
   `a_stale_replica_cannot_sync_its_way_back_in`).
   `applied_through` alone is not enough, though: a replica partitioned *during*
   consensus never witnessed the missed transactions at all, so after healing its
@@ -745,6 +755,16 @@ backend (sql/fjall). Phases, in order:
         sweep or the inbox loop still used the store and journal (now async, and the
         closed node mints nothing more); and the mux could unregister a reopened
         group's inbox for its closed predecessor.
+        A third round fixed what #277 and #281 left open on the join paths: a node
+        told to rejoin dropped a forwarded read, which failed only at
+        `collect_timeout` (now `ReadFailed` at once); a joining node answered a
+        read barrier's probe from a partial conflict graph (now silent, so it
+        is not counted); a joined node's anti-entropy coverage could vouch for a
+        transaction it never received (now capped at its join proof until its own
+        anti-entropy covers the join); a join whose installs outlasted the
+        contact's hold lost it (now kept alive by `JoinKeepalive`); and a
+        `GroupHost::open` dropped mid-join orphaned the joining node's inbox loop
+        (now unregistered and stopped).
         **Open** (confirmed or plausible, not yet fixed):
         a config change's replies are keyed by epoch only, so two on one node collide;
         stage errors are ignored before durability-gated replies;
@@ -756,9 +776,7 @@ backend (sql/fjall). Phases, in order:
         a rejoin (wiped store) forgets the replica's in-flight votes and promises;
         an epoch change can remap a route's keys onto replicas that never
         witnessed an in-flight txn, which then answer "never witnessed";
-        `GroupHost::open` dropped mid-join (a client hung up) orphans the joining
-        node's inbox loop; a node told to rejoin drops a forwarded read, which then
-        fails only at `collect_timeout`; under Jepsen faults a node can stay
+        under Jepsen faults a node can stay
         unreachable for the rest of a 120 s run (seen on `alpha` before this round
         as well) — plausibly because a peer writer's TCP `connect` has no timeout,
         so behind a DROP partition it blocks for the kernel's SYN retries (about two

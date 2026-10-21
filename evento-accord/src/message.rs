@@ -468,6 +468,12 @@ pub enum Message {
     /// owner's error, cut short. A node predating this variant sheds it, and
     /// its read times out: an error too, never an empty page.
     ReadFailed { id: u64, reason: String },
+    /// Joiner → contact, every `collect_timeout` while its join runs: keeps
+    /// the contact's hold on its watermark report alive between page
+    /// requests a slow install spaces out (a slow disk, a large page). It
+    /// only refreshes a live hold, never re-creates a lapsed one. A contact
+    /// predating this variant sheds it, and its hold lapses as before.
+    JoinKeepalive,
 }
 
 impl Message {
@@ -542,7 +548,8 @@ impl Message {
             | Message::JoinProof { .. }
             | Message::JoinHeaderRequest { .. }
             | Message::CommandPageRequest { .. }
-            | Message::CommandPage { .. } => None,
+            | Message::CommandPage { .. }
+            | Message::JoinKeepalive => None,
         }
     }
 }
@@ -699,6 +706,21 @@ mod tests {
             Message::ReadFailed { id, reason } => {
                 assert_eq!((id, reason.as_str()), (9, "disk full"))
             }
+            other => panic!("variant changed on the wire: {other:?}"),
+        }
+    }
+
+    /// A join keepalive crosses the wire, belongs to no transaction, and is
+    /// not sweep gossip: like the page requests it keeps alive, it may open a
+    /// group its contact has closed.
+    #[test]
+    fn join_keepalive_round_trips_tagged() {
+        let message = Message::JoinKeepalive;
+        assert_eq!(message.txn(), None);
+        assert!(!message.is_sweep());
+        let bytes = encode_tagged(RecordKind::GroupFrame, &message).unwrap();
+        match decode_tagged(RecordKind::GroupFrame, &bytes).unwrap() {
+            Message::JoinKeepalive => {}
             other => panic!("variant changed on the wire: {other:?}"),
         }
     }

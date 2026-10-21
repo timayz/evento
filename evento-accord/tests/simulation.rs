@@ -28,7 +28,7 @@
 //!   version beyond the quorum's (it may only lag).
 
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -1842,12 +1842,31 @@ impl Sim {
     /// a fresh node over an **empty** store and journal, and joins through
     /// `contact` before its sweeps start (as `GroupHost::open_joining` does).
     async fn rejoin(&mut self, i: usize, contact: NodeId, config: NodeConfig) {
+        let store = Arc::new(InMemoryDataStore::new());
+        self.rejoin_over(
+            i,
+            contact,
+            config,
+            Arc::clone(&store) as Arc<dyn DataStore>,
+            store,
+        )
+        .await;
+    }
+
+    /// [`rejoin`](Self::rejoin) over `backend`, a store wrapping `store`.
+    async fn rejoin_over(
+        &mut self,
+        i: usize,
+        contact: NodeId,
+        config: NodeConfig,
+        backend: Arc<dyn DataStore>,
+        store: Arc<InMemoryDataStore>,
+    ) {
         for t in &self.tasks[i] {
             t.abort();
         }
         let id = self.ids[i];
         let inbox = self.net.register(id);
-        let store = Arc::new(InMemoryDataStore::new());
         let journal = Arc::new(InMemoryJournal::new());
         let node = Node::new(
             id,
@@ -1857,7 +1876,7 @@ impl Sim {
                 virtual_micros(self.base),
             )),
             Arc::new(self.net.sink(id)),
-            Arc::clone(&store) as Arc<dyn DataStore>,
+            backend,
             Arc::clone(&journal) as Arc<dyn Journal>,
         )
         .with_config(config);
@@ -2149,6 +2168,139 @@ async fn a_peer_rejoining_under_writes_is_counted_again() {
         .expect("a write coordinated by the rejoined node");
     assert!(converge(&sim.stores).await);
     await_compacted(&sim, &all, "after the rejoin").await;
+}
+
+/// A store whose applies take `delay` while `slow` is set: a joiner's slow
+/// disk, installing each snapshot page long after it landed.
+struct SlowStore {
+    inner: Arc<InMemoryDataStore>,
+    delay: Duration,
+    slow: AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl DataStore for SlowStore {
+    async fn version(&self, aggregate_type: &str, aggregate_id: &str) -> anyhow::Result<u16> {
+        self.inner.version(aggregate_type, aggregate_id).await
+    }
+
+    async fn apply(
+        &self,
+        txn: evento_accord::TxnId,
+        execute_at: evento_accord::Timestamp,
+        events: Vec<Event>,
+        commit: bool,
+    ) -> anyhow::Result<()> {
+        if self.slow.load(Ordering::SeqCst) {
+            tokio::time::sleep(self.delay).await;
+        }
+        self.inner.apply(txn, execute_at, events, commit).await
+    }
+
+    async fn read(
+        &self,
+        aggregators: Option<Arc<[evento_core::EventFilter]>>,
+        routing_key: Option<evento_core::RoutingKey>,
+        args: evento_core::cursor::Args,
+        to_micros: Option<u64>,
+    ) -> anyhow::Result<evento_core::cursor::ReadResult<Event>> {
+        self.inner
+            .read(aggregators, routing_key, args, to_micros)
+            .await
+    }
+
+    async fn snapshot(&self) -> anyhow::Result<Vec<Event>> {
+        self.inner.snapshot().await
+    }
+
+    async fn snapshot_page(
+        &self,
+        after: Option<evento_core::cursor::Value>,
+        max_events: u16,
+        max_bytes: usize,
+    ) -> anyhow::Result<evento_accord::SnapshotPage> {
+        self.inner.snapshot_page(after, max_events, max_bytes).await
+    }
+}
+
+/// A joiner whose disk installs each snapshot page slower than its
+/// contact's hold lapses without a page request (`collect_timeout × 4`),
+/// while the group keeps writing: its keepalives hold the contact's report
+/// at the vouch, so no peer compacts past it and the joiner is counted
+/// again rather than told to rejoin once more.
+#[tokio::test(start_paused = true)]
+async fn a_joiner_with_a_slow_disk_keeps_its_contact_holding() {
+    const HOT: &str = "hot";
+    const COLD: &str = "cold";
+    let config = absence_config(Duration::from_secs(2));
+    let mut sim = Sim::build_with_config(4, config);
+    let all = [0, 1, 2, 3];
+
+    for version in 1..=3u16 {
+        sim.nodes[0]
+            .write(vec![event(HOT, version, version as u64)])
+            .await
+            .expect("baseline write");
+    }
+    assert!(converge(&sim.stores).await);
+    await_compacted(&sim, &all, "baseline").await;
+
+    sim.net.crash(NodeId(3));
+    for version in 4..=6u16 {
+        sim.nodes[0]
+            .write(vec![event(HOT, version, 100 + version as u64)])
+            .await
+            .expect("write with a node down");
+    }
+    await_compacted(&sim, &[0, 1, 2], "with node 3 down").await;
+    sim.net.heal(NodeId(3));
+    await_rejoin_required(&sim.nodes[3]).await;
+
+    let lapse = config.collect_timeout * 4;
+    let store = Arc::new(InMemoryDataStore::new());
+    let slow = Arc::new(SlowStore {
+        inner: Arc::clone(&store),
+        delay: lapse + Duration::from_secs(5),
+        slow: AtomicBool::new(true),
+    });
+    let writer = sim.nodes[1].clone();
+    let writes = tokio::spawn(async move {
+        for version in 1..=40u16 {
+            writer
+                .write(vec![event(COLD, version, 400 + version as u64)])
+                .await
+                .expect("write during the rejoin");
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    });
+    sim.rejoin_over(
+        3,
+        NodeId(0),
+        config,
+        Arc::clone(&slow) as Arc<dyn DataStore>,
+        Arc::clone(&store),
+    )
+    .await;
+    slow.slow.store(false, Ordering::SeqCst);
+    writes.await.unwrap();
+
+    assert!(converge(&sim.stores).await, "the rejoined node converges");
+    for _ in 0..500 {
+        if (0..3).all(|i| sim.nodes[i].absent_peers().is_empty()) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        !sim.nodes[3].rejoin_required(),
+        "the slow joiner is not told to rejoin again"
+    );
+    for i in all {
+        assert!(
+            sim.nodes[i].absent_peers().is_empty(),
+            "node {i} counts the rejoined node again"
+        );
+    }
 }
 
 /// The other side of the vouch: a replica back with its **old** state after

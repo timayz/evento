@@ -565,6 +565,19 @@ type SyncPayload = (Timestamp, Timestamp, Vec<Event>, Vec<CommandState>);
 /// A join contact's vouch ([`Message::JoinProof`]): `(epoch, vouched)`.
 type Vouch = (u64, Timestamp);
 
+/// What this node's [`join`](Node::join) proved: the contact's [`Vouch`],
+/// and `until`, this node's clock when the join completed (plus a skew). A transaction
+/// committed before the join's inbox started but not yet applied by the
+/// contact when it vouched is in neither the snapshot nor the replayed
+/// inbox: until its own anti-entropy has covered everything below `until`,
+/// this node holds provably only what was vouched for.
+#[derive(Clone, Copy)]
+struct JoinProven {
+    epoch: u64,
+    vouched: Timestamp,
+    until: Timestamp,
+}
+
 /// Most bytes of an owner's error a [`Message::ReadFailed`] carries back.
 const READ_FAILURE_MAX: usize = 256;
 
@@ -671,7 +684,7 @@ pub struct Node {
     /// [`sync_coverage`](Self::sync_coverage) — a fresh joiner cannot
     /// otherwise prove anything until anti-entropy rounds with enough peers
     /// have run. Ignored once the epoch changes; never persisted.
-    join_proof: Arc<Mutex<Option<Vouch>>>,
+    join_proof: Arc<Mutex<Option<JoinProven>>>,
     /// The [`JoinProof`](Message::JoinProof) of an in-flight join, by its
     /// header request's correlation id (`None` until it arrives).
     proof_pending: Arc<Mutex<HashMap<u64, Option<Vouch>>>>,
@@ -1259,7 +1272,9 @@ impl Node {
     async fn recovery_sweep(&self) {
         // A node told to rejoin holds state its peers compacted past: it
         // recovers, repairs and gossips nothing until its host rejoins it.
-        if self.rejoin_required() {
+        // Nor does a node still joining: it holds part of its state, and a
+        // report it gossips would end its contact's hold on compaction.
+        if self.rejoin_required() || !self.bootstrapped.load(Ordering::Acquire) {
             return;
         }
         let now = self.clock.now().micros;
@@ -1499,8 +1514,28 @@ impl Node {
     fn proven_coverage(&self, shard_peers: &[NodeId]) -> Option<Timestamp> {
         let coverage = self.quorum_sync_coverage(shard_peers)?;
         match *self.join_proof.lock().expect("join proof poisoned") {
-            Some((epoch, vouched)) if epoch == self.topology.epoch() => Some(coverage.max(vouched)),
+            Some(proof) if proof.epoch == self.topology.epoch() => {
+                Some(coverage.max(proof.vouched))
+            }
             _ => Some(coverage),
+        }
+    }
+
+    /// The sync coverage this node may hand a peer, which records it as proof
+    /// this node holds everything it applied below it: `coverage`, capped at
+    /// [`proven_coverage`](Self::proven_coverage) while a join's gap is open
+    /// ([`JoinProven`]) — applied-through cannot vouch for a transaction the
+    /// join never brought in. Uncapped otherwise, as for any replica.
+    fn exportable_coverage(&self, coverage: Timestamp, shard_peers: &[NodeId]) -> Timestamp {
+        let Some(proof) = *self.join_proof.lock().expect("join proof poisoned") else {
+            return coverage;
+        };
+        if proof.epoch != self.topology.epoch() {
+            return coverage;
+        }
+        match self.quorum_sync_coverage(shard_peers) {
+            Some(quorum) if quorum < proof.until => coverage.min(quorum.max(proof.vouched)),
+            _ => coverage,
         }
     }
 
@@ -1704,7 +1739,8 @@ impl Node {
             | Message::JoinHeaderRequest { .. }
             | Message::CommandPageRequest { .. }
             | Message::SnapshotRequest { .. }
-            | Message::SnapshotPageRequest { .. } => return Screen::Pass,
+            | Message::SnapshotPageRequest { .. }
+            | Message::JoinKeepalive => return Screen::Pass,
             Message::Watermark { applied_through } => match state.rejoin_above {
                 Some(bound) if *applied_through <= bound => Some(bound),
                 _ => None,
@@ -1798,8 +1834,19 @@ impl Node {
         self.failure_detector.heartbeat(env.from);
 
         // Told to rejoin: this node's state is stale, so it takes no part until
-        // its host rejoins it (see `NodeConfig::peer_absence_limit`).
+        // its host rejoins it (see `NodeConfig::peer_absence_limit`). A
+        // forwarded read is still refused out loud: unanswered, its requester
+        // would only fail at `collect_timeout`.
         if self.rejoin_required() {
+            if let Message::ReadForward { id, .. } = env.message {
+                return vec![(
+                    env.from,
+                    Message::ReadFailed {
+                        id,
+                        reason: "the owner must rejoin".into(),
+                    },
+                )];
+            }
             return Vec::new();
         }
         if let Message::Rejoin { above } = env.message {
@@ -1837,6 +1884,7 @@ impl Node {
                 | Message::JoinHeaderRequest { .. }
                 | Message::CommandPageRequest { .. }
                 | Message::CommandPage { .. }
+                | Message::JoinKeepalive
                 | Message::Watermark { .. }
                 | Message::ConfigPrepare { .. }
                 | Message::ConfigPromise { .. }
@@ -2220,6 +2268,9 @@ impl Node {
                 ));
                 out.push((from, Message::JoinProof { id, epoch, vouched }));
             }
+            // A joiner whose install spaces out its page requests: keep the
+            // hold on this node's report alive.
+            Message::JoinKeepalive => self.refresh_join_hold(from),
             Message::CommandPageRequest { id, after } => {
                 if !self.bootstrapped.load(Ordering::Acquire) {
                     return out;
@@ -2558,7 +2609,14 @@ impl Node {
             }
             // Read-index probe: a pure query of the conflict graph — report the
             // deps a read at `txn` would witness over `key`, storing nothing.
+            // A node still joining stays silent: its conflict graph lacks the
+            // commands the join is importing, so its deps could miss a
+            // transaction, and the barrier counts only the replicas that
+            // answer.
             Message::ReadProbe { txn, key } => {
+                if !self.bootstrapped.load(Ordering::Acquire) {
+                    return out;
+                }
                 let (execute_at, deps) = self
                     .replica
                     .lock()
@@ -4094,7 +4152,10 @@ impl Node {
     /// installing an agreed layout) remains future work.
     pub async fn join(&self, contact: NodeId) -> anyhow::Result<usize> {
         let imported = self
-            .import_from(contact, self.settings.collect_timeout, true, None)
+            .keeping_join_hold(
+                contact,
+                self.import_from(contact, self.settings.collect_timeout, true, None),
+            )
             .await?;
         // Persist the adopted floor: a restart recovers it from the journal,
         // and without it a dependency on a compacted-away transaction would
@@ -4105,7 +4166,10 @@ impl Node {
             .lock()
             .expect("replica poisoned")
             .redundant_before();
-        if let Err(err) = self.journal.truncate(floor).await {
+        if let Err(err) = self
+            .keeping_join_hold(contact, self.journal.truncate(floor))
+            .await
+        {
             return Err(self.partial(err, &imported));
         }
         self.note_journal_watermark(floor);
@@ -4155,6 +4219,29 @@ impl Node {
         }
 
         Ok(imported.commands)
+    }
+
+    /// Runs `work`, a step of a join through `contact`, sending the contact a
+    /// [`JoinKeepalive`](Message::JoinKeepalive) every `collect_timeout`
+    /// meanwhile: its hold on its report lapses after a few of those without
+    /// a page request, and a step slower than that (a slow disk, a large
+    /// page) would otherwise let peers compact past what it vouched for —
+    /// and send this node back to rejoin when it reports.
+    async fn keeping_join_hold<T>(
+        &self,
+        contact: NodeId,
+        work: impl std::future::Future<Output = T>,
+    ) -> T {
+        let mut work = std::pin::pin!(work);
+        let period = self.settings.collect_timeout;
+        let mut keepalive = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                out = &mut work => return out,
+                _ = keepalive.tick() => self.send(contact, Message::JoinKeepalive).await,
+            }
+        }
     }
 
     /// The error of a join that fails after `imported` installed at least one
@@ -4211,7 +4298,10 @@ impl Node {
         // out, all at or above `omitted`.
         let coverage = replica.applied_through(cutoff);
         let coverage = omitted.map_or(coverage, |oldest| coverage.min(oldest));
-        (replica.redundant_before(), coverage, commands)
+        let floor = replica.redundant_before();
+        drop(replica);
+        let coverage = self.exportable_coverage(coverage, &self.shard_peers());
+        (floor, coverage, commands)
     }
 
     /// A join header ([`export_bootstrap`](Self::export_bootstrap) without a
@@ -4248,12 +4338,13 @@ impl Node {
             commands,
         );
         drop(replica);
+        let coverage = self.exportable_coverage(header.1, &shard_peers);
         let vouched = if self.topology.epoch() == epoch {
             vouched
         } else {
             Timestamp::MIN
         };
-        (header.0, header.1, header.2, epoch, vouched)
+        (header.0, coverage, header.2, epoch, vouched)
     }
 
     /// One sync round trip: sends `request(id)` to `contact` and waits up to
@@ -4671,9 +4762,17 @@ impl Node {
                 if epoch == self.topology.epoch()
                     && self.topology.node_shard(contact) == self.topology.node_shard(self.id)
                 {
+                    // A transaction minted elsewhere before the inbox started
+                    // may sit up to a skew above this node's clock.
+                    let mut until = self.clock.now();
+                    until.micros = until.micros.saturating_add(self.clock.max_skew_micros());
                     let mut slot = self.join_proof.lock().expect("join proof poisoned");
-                    if slot.is_none_or(|(at, held)| at != epoch || held < vouched) {
-                        *slot = Some((epoch, vouched));
+                    if slot.is_none_or(|held| held.epoch != epoch || held.vouched < vouched) {
+                        *slot = Some(JoinProven {
+                            epoch,
+                            vouched,
+                            until,
+                        });
                     }
                 }
             }
