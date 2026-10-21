@@ -773,8 +773,13 @@ backend (sql/fjall). Phases, in order:
         epoch, so one took or tore down the other's replies (now one slot per
         proposal, every reply fanned out, and a nack counted only by the proposal
         whose ballot it outbids).
+        A further fix made the sweep scheduler fair: it handed its
+        `max_concurrent` slots out in fixed map order, so under saturation the
+        same groups won every tick and the rest went unswept (no recovery,
+        anti-entropy or compaction), and an idle group that missed its slot
+        waited a whole `idle_interval`; now a deferred group stays due and, when
+        slots are short, those swept longest ago go first.
         **Open** (confirmed or plausible, not yet fixed):
-        the sweep scheduler can starve groups beyond `max_concurrent`;
         (review) recovery's superseding check ignores a later conflict only
         pre-accepted at a replica, which a fast-committed conflict may be;
         a decided multi-shard txn whose shard compacted it, with no replica heard
