@@ -1240,6 +1240,63 @@ async fn a_node_told_to_rejoin_refuses_a_forwarded_read_at_once() {
     );
 }
 
+/// A node still joining does not answer a read barrier's probe: its conflict
+/// graph lacks the commands the join is importing. A barrier that needs it
+/// for a quorum fails; once it has joined, it counts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joining_node_does_not_count_toward_a_read_barrier() {
+    use evento_accord::Key;
+
+    let net = InMemoryNetwork::new();
+    let abc = vec![NodeId(0), NodeId(1), NodeId(2)];
+    let abcd = vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3)];
+    let config = NodeConfig {
+        collect_timeout: Duration::from_millis(500),
+        ..NodeConfig::default()
+    };
+    let nodes: Vec<TestNode> = abc
+        .iter()
+        .map(|&id| spawn_node_with(id, 0, vec![abc.clone()], &net, config))
+        .collect();
+    nodes[0]
+        .node
+        .write(vec![event("acc", 1, "Opened")])
+        .await
+        .unwrap();
+    for n in &nodes {
+        await_len(&n.store, 1).await;
+    }
+
+    let d = spawn_node_with(NodeId(3), 0, vec![abc.clone()], &net, config);
+    d.node.begin_join();
+    nodes[0]
+        .node
+        .change_topology(1, vec![abcd.clone()])
+        .await
+        .unwrap();
+    for n in &nodes {
+        await_epoch(&n.topology, 1).await;
+    }
+    await_epoch(&d.topology, 1).await;
+
+    // Four replicas, a slow quorum of three: without node 1, node 0 needs
+    // the joiner's answer.
+    net.partition(NodeId(0), NodeId(1));
+    let err = nodes[0]
+        .node
+        .read_barrier(Key("acc".into()))
+        .await
+        .expect_err("a joining node's probe counted toward the barrier");
+    assert!(format!("{err:#}").contains("quorum not reached"), "{err:#}");
+
+    d.node.join(NodeId(0)).await.unwrap();
+    nodes[0]
+        .node
+        .read_barrier(Key("acc".into()))
+        .await
+        .expect("a joined node counts toward the barrier");
+}
+
 /// A node whose wall clock lags its group by more than the compaction margin
 /// still mints above the group's compaction floor: a transaction below it
 /// would count as applied at a replica that never saw it. A joiner adopts its

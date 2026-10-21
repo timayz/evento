@@ -2569,7 +2569,14 @@ impl Node {
             }
             // Read-index probe: a pure query of the conflict graph — report the
             // deps a read at `txn` would witness over `key`, storing nothing.
+            // A node still joining stays silent: its conflict graph lacks the
+            // commands the join is importing, so its deps could miss a
+            // transaction, and the barrier counts only the replicas that
+            // answer.
             Message::ReadProbe { txn, key } => {
+                if !self.bootstrapped.load(Ordering::Acquire) {
+                    return out;
+                }
                 let (execute_at, deps) = self
                     .replica
                     .lock()
