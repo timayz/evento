@@ -154,6 +154,25 @@ pub struct AcceptorRecord {
     pub accepted: Option<(Ballot, Vec<Vec<NodeId>>)>,
 }
 
+/// What a replica keeps of an applied **multi-shard** transaction once it
+/// compacted the command away: its decision, enough to answer a recovery
+/// from another route shard that still holds the transaction undecided
+/// (the redundancy watermark is per shard, so that shard may not have
+/// applied it yet). Kept, and journaled ([`Journal::save_decision`]), until
+/// every replica of every other route shard has applied it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecisionRecord {
+    /// The transaction.
+    pub txn: TxnId,
+    /// Its execution timestamp — [`INVALIDATED_AT`](crate::message::INVALIDATED_AT)
+    /// for one a recovery invalidated.
+    pub execute_at: Timestamp,
+    /// The decision: `true` for an abort, `false` for a commit.
+    pub conflict: bool,
+    /// Its route — the full key set, every shard it touches.
+    pub route: Vec<Key>,
+}
+
 /// Durable command log. Each replica persists its [`CommandState`] per
 /// transaction so it survives restarts and can be replayed during recovery.
 ///
@@ -252,6 +271,33 @@ pub trait Journal: Send + Sync + 'static {
     /// Every persisted promise. The default returns none.
     async fn load_promises(&self) -> anyhow::Result<Vec<(TxnId, Ballot)>> {
         Ok(Vec::new())
+    }
+
+    /// Buffers the decision record of a multi-shard transaction this replica
+    /// applied and compacted away, durable no later than the next
+    /// [`flush`](Journal::flush). The node stages it, and flushes, before
+    /// the [`truncate`](Journal::truncate) that deletes the command, so the
+    /// decision is never lost in between. **Not** discarded by `truncate`:
+    /// it outlives the command until [`drop_decisions`](Journal::drop_decisions).
+    /// The default is a no-op (a journal that forgets them leaves another
+    /// shard's recovery of such a transaction waiting on a replica that
+    /// still holds it applied).
+    async fn save_decision(&self, record: &DecisionRecord) -> anyhow::Result<()> {
+        let _ = record;
+        Ok(())
+    }
+
+    /// Every persisted decision record. The default returns none.
+    async fn load_decisions(&self) -> anyhow::Result<Vec<DecisionRecord>> {
+        Ok(Vec::new())
+    }
+
+    /// Discards the decision records of `txns`: every route shard applied
+    /// them. Need not be durable at once — a record dropped late is only
+    /// kept longer. The default is a no-op.
+    async fn drop_decisions(&self, txns: &[TxnId]) -> anyhow::Result<()> {
+        let _ = txns;
+        Ok(())
     }
 
     /// Durably persists this node's **clock bound**: every timestamp it has

@@ -4,7 +4,8 @@
 #![allow(dead_code)]
 
 use evento_accord::{
-    AcceptorRecord, Ballot, CommandState, Journal, Key, NodeId, Status, Timestamp, TxnId,
+    AcceptorRecord, Ballot, CommandState, DecisionRecord, Journal, Key, NodeId, Status, Timestamp,
+    TxnId,
 };
 use evento_core::Event;
 use evento_sql::SqlJournal;
@@ -254,9 +255,10 @@ where
     );
 }
 
-/// Routes and blind promises are staged (invisible until the flush), round-trip
-/// after it, keep the last value written per transaction, and are truncated
-/// with the commands.
+/// Routes, blind promises and decision records are staged (invisible until
+/// the flush), round-trip after it, and keep the last value written per
+/// transaction. Routes and promises are truncated with the commands; decision
+/// records — flushed or still staged — outlive them until dropped.
 pub async fn routes_and_promises<DB>(journal: &SqlJournal<DB>)
 where
     DB: Database,
@@ -277,8 +279,21 @@ where
     journal.save_promise(old, low).await.unwrap();
     journal.save_promise(new, low).await.unwrap();
     journal.save_promise(new, high).await.unwrap();
+    let decision = |txn: TxnId, conflict: bool| DecisionRecord {
+        txn,
+        execute_at: timestamp(txn.0.micros + 1, 0),
+        conflict,
+        route: route.clone(),
+    };
+    journal.save_decision(&decision(old, false)).await.unwrap();
+    journal.save_decision(&decision(old, true)).await.unwrap();
+    journal.save_decision(&decision(new, false)).await.unwrap();
     assert!(
         journal.load_routes().await.unwrap().is_empty(),
+        "staged only"
+    );
+    assert!(
+        journal.load_decisions().await.unwrap().is_empty(),
         "staged only"
     );
     journal.flush().await.unwrap();
@@ -290,9 +305,41 @@ where
     promises.sort_by_key(|(txn, _)| *txn);
     assert_eq!(promises, vec![(old, low), (new, high)], "last write wins");
 
+    let decisions = || async {
+        let mut records = journal.load_decisions().await.unwrap();
+        records.sort_by_key(|record| record.txn);
+        records
+    };
+    assert_eq!(
+        decisions().await,
+        vec![decision(old, true), decision(new, false)],
+        "last write wins"
+    );
+
+    // A record staged below the bound survives the truncate too.
+    let staged = TxnId(timestamp(150, 5));
+    journal
+        .save_decision(&decision(staged, false))
+        .await
+        .unwrap();
     journal.truncate(timestamp(200, 0)).await.unwrap();
-    assert_eq!(journal.load_routes().await.unwrap(), vec![(new, route)]);
+    journal.flush().await.unwrap();
+    assert_eq!(
+        journal.load_routes().await.unwrap(),
+        vec![(new, route.clone())]
+    );
     assert_eq!(journal.load_promises().await.unwrap(), vec![(new, high)]);
+    assert_eq!(
+        decisions().await,
+        vec![
+            decision(old, true),
+            decision(staged, false),
+            decision(new, false)
+        ]
+    );
+
+    journal.drop_decisions(&[old, staged]).await.unwrap();
+    assert_eq!(decisions().await, vec![decision(new, false)]);
 }
 
 /// The clock bound round-trips, keeps the last value written, and is not

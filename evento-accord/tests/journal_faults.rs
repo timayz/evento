@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use evento_accord::{
-    AcceptorRecord, CommandState, DataStore, DynamicTopology, HybridLogicalClock,
+    AcceptorRecord, CommandState, DataStore, DecisionRecord, DynamicTopology, HybridLogicalClock,
     InMemoryDataStore, InMemoryJournal, InMemoryNetwork, Journal, MessageSink, Node, NodeConfig,
     NodeId, StaticTopology, Timestamp, Topology, TxnId,
 };
@@ -158,6 +158,15 @@ impl Journal for FaultJournal {
     }
     async fn load_clock_bound(&self) -> anyhow::Result<Option<u64>> {
         self.durable.load_clock_bound().await
+    }
+    async fn save_decision(&self, record: &DecisionRecord) -> anyhow::Result<()> {
+        self.durable.save_decision(record).await
+    }
+    async fn load_decisions(&self) -> anyhow::Result<Vec<DecisionRecord>> {
+        self.durable.load_decisions().await
+    }
+    async fn drop_decisions(&self, txns: &[TxnId]) -> anyhow::Result<()> {
+        self.durable.drop_decisions(txns).await
     }
 }
 

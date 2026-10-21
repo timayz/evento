@@ -18,8 +18,10 @@
 //! A multi-shard transaction's route and a recovery promise for a transaction
 //! never witnessed are rows of `accord_meta` keyed `route/` / `promise/` + the
 //! hex of the order-preserving transaction key — no schema change — staged and
-//! flushed with the commands, and truncated with them. The node's clock bound
-//! is the `accord_meta` row `clock_bound`, written durably on its own and never
+//! flushed with the commands, and truncated with them. A compacted multi-shard
+//! transaction's decision record is a `decision/` row, staged the same way but
+//! kept by `truncate` until the node drops it. The node's clock bound is the
+//! `accord_meta` row `clock_bound`, written durably on its own and never
 //! truncated.
 
 use std::sync::Mutex;
@@ -37,7 +39,9 @@ use sqlx::{Database, Pool};
 use async_trait::async_trait;
 
 use evento_accord::format::{decode_tagged, encode_tagged, RecordKind};
-use evento_accord::{AcceptorRecord, Ballot, CommandState, Journal, Key, NodeId, Timestamp, TxnId};
+use evento_accord::{
+    AcceptorRecord, Ballot, CommandState, DecisionRecord, Journal, Key, NodeId, Timestamp, TxnId,
+};
 
 /// `k` value under which the truncation watermark is stored in `accord_meta`.
 const WATERMARK_KEY: &str = "redundant_before";
@@ -49,6 +53,9 @@ const CLOCK_BOUND_KEY: &str = "clock_bound";
 const ROUTE_PREFIX: &str = "route/";
 /// `k` prefix of a blind recovery promise in `accord_meta`.
 const PROMISE_PREFIX: &str = "promise/";
+/// `k` prefix of a decision record in `accord_meta` (49 characters with the
+/// key). Untouched by `truncate`.
+const DECISION_PREFIX: &str = "decision/";
 
 #[derive(Iden)]
 enum AccordCommands {
@@ -116,8 +123,8 @@ pub struct SqlJournal<DB: Database> {
     pool: Pool<DB>,
     /// Commands staged since the last [`flush`](Journal::flush), as `(key, value)`.
     staged: Mutex<Vec<(Vec<u8>, Vec<u8>)>>,
-    /// `accord_meta` rows (routes, promises) staged since the last flush, as
-    /// `(txn, k, v)`.
+    /// `accord_meta` rows (routes, promises, decision records) staged since
+    /// the last flush, as `(txn, k, v)`.
     staged_meta: Mutex<Vec<(TxnId, String, Vec<u8>)>>,
     /// Serializes flushes so staged entries are only drained once their
     /// transaction has committed — a failed flush must leave them staged.
@@ -431,10 +438,11 @@ where
             .lock()
             .expect("journal poisoned")
             .retain(|(key, _)| key.as_slice() >= bound.as_slice());
+        // Decision records outlive their commands.
         self.staged_meta
             .lock()
             .expect("journal poisoned")
-            .retain(|(txn, _, _)| txn.0 >= before);
+            .retain(|(txn, key, _)| txn.0 >= before || key.starts_with(DECISION_PREFIX));
 
         let mut tx = self.pool.begin().await?;
 
@@ -591,6 +599,53 @@ where
     async fn load_promises(&self) -> anyhow::Result<Vec<(TxnId, Ballot)>> {
         let mut conn = self.pool.acquire().await?;
         self.load_promises_in(&mut *conn).await
+    }
+
+    async fn save_decision(&self, record: &DecisionRecord) -> anyhow::Result<()> {
+        let value = encode_tagged(RecordKind::Decision, record)?;
+        self.staged_meta.lock().expect("journal poisoned").push((
+            record.txn,
+            meta_txn_key(DECISION_PREFIX, record.txn),
+            value,
+        ));
+        Ok(())
+    }
+
+    async fn load_decisions(&self) -> anyhow::Result<Vec<DecisionRecord>> {
+        let mut conn = self.pool.acquire().await?;
+        Self::load_meta_prefixed(&mut *conn, DECISION_PREFIX)
+            .await?
+            .iter()
+            .map(|bytes| decode_tagged(RecordKind::Decision, bytes))
+            .collect()
+    }
+
+    async fn drop_decisions(&self, txns: &[TxnId]) -> anyhow::Result<()> {
+        let keys: Vec<String> = txns
+            .iter()
+            .map(|txn| meta_txn_key(DECISION_PREFIX, *txn))
+            .collect();
+        {
+            let dropped: std::collections::HashSet<&str> =
+                keys.iter().map(String::as_str).collect();
+            self.staged_meta
+                .lock()
+                .expect("journal poisoned")
+                .retain(|(_, key, _)| !dropped.contains(key.as_str()));
+        }
+        // A flush already under way may still write one back: it is then
+        // only kept longer, and dropped again after a restart.
+        for chunk in keys.chunks(8_000) {
+            let delete = Query::delete()
+                .from_table(AccordMeta::Table)
+                .and_where(Expr::col(AccordMeta::K).is_in(chunk.iter().cloned()))
+                .to_owned();
+            let (sql, values) = Self::build_sqlx(&delete);
+            sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(())
     }
 
     async fn load(&self, txn: TxnId) -> anyhow::Result<Option<CommandState>> {

@@ -227,13 +227,22 @@ refuses anything else before a vote, and a node never installs it.
   and the sweep retries — a multi-shard transaction whose coordinator died waits
   for the shard's replicas to come back rather than guessing. A replica answering
   "never witnessed" journals its promise (`Journal::save_promise`), so after a
-  restart it still refuses the original coordinator's late PreAccept. Single-shard
+  restart it still refuses the original coordinator's late PreAccept. A shard can
+  compact a transaction its other shards have not applied yet (each shard's
+  watermark is its own), so compaction keeps a small **decision record** of every
+  applied multi-shard transaction (`Journal::save_decision`, journaled before the
+  truncate that deletes the command): a recovery on another shard learns the
+  decision from it. A record is dropped once every replica of every other shard the
+  transaction touched reports a watermark above it. A replica of such a shard that
+  never reports again (down for good) keeps that shard's records on its peers in
+  other shards until it is removed from the topology (`change_topology`); a joiner
+  does not import records, since its shard peers still hold them. Single-shard
   traffic is unchanged on the wire. **Rolling upgrade:** a node predating routes
   sheds routed frames, so a multi-shard write needs a slow quorum of upgraded nodes
   in every shard it touches while the upgrade is in progress; single-shard writes
   are unaffected. A custom `Journal` that does not implement `save_route` /
-  `save_promise` loses both on restart (the fjall and SQL journals implement them,
-  in their existing keyspace/tables — no migration).
+  `save_promise` / `save_decision` loses them on restart (the fjall and SQL journals
+  implement them, in their existing keyspace/tables — no migration).
 - **Down node:** with `f+1` survivors, writes continue; the down node catches up on
   return. Lose more than `f` and writes block (by design — no split-brain) until enough
   return.
