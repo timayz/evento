@@ -36,7 +36,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use evento_accord::{
     AccordExecutor, DataStore, ExecutorDataStore, HybridLogicalClock, InMemoryJournal,
-    InMemoryNetwork, Journal, MessageSink, Node, NodeConfig, NodeId, StaticTopology,
+    InMemoryNetwork, Journal, Message, MessageSink, Node, NodeConfig, NodeId, StaticTopology,
 };
 use evento_core::cursor::Args;
 use evento_core::subscription::{Context, Handler, SubscriptionBuilder};
@@ -176,12 +176,17 @@ impl Cluster {
 
 /// Writes X (aggregate "delayed", lower cursor) via node A and Y (aggregate
 /// "local", higher cursor) via node B, with the `A → B` link delayed so B applies
-/// its own Y first and X arrives late. Returns the cluster, the subscription
-/// handle, and the shared record of handled aggregate ids.
+/// its own Y first and X arrives late. `hold_syncs` also drops every
+/// anti-entropy reply from before X is written until the caller lifts it with
+/// `net.set_unreadable(None)`: otherwise B's sync round with C, which applied
+/// X at once, can fetch X before the delayed link delivers it. Returns the
+/// cluster, the subscription handle, and the shared record of handled
+/// aggregate ids.
 async fn run_late_event_scenario(
     margin: Duration,
     link_delay: Duration,
     anti_entropy: Duration,
+    hold_syncs: bool,
 ) -> (
     Cluster,
     evento_core::subscription::Subscription,
@@ -203,6 +208,14 @@ async fn run_late_event_scenario(
 
     // Let the subscription reach its idle wait.
     tokio::time::sleep(Duration::from_millis(100)).await;
+
+    if hold_syncs {
+        cluster
+            .net
+            .set_unreadable(Some(Arc::new(|message: &Message| {
+                matches!(message, Message::SyncData { .. })
+            })));
+    }
 
     // X first => smaller cursor; the sleep guarantees a distinct millisecond so
     // the cursor order (X before Y) is deterministic. Different aggregates =>
@@ -229,7 +242,7 @@ async fn subscription_waits_for_a_late_lower_cursor_event() {
     let margin = Duration::from_secs(3);
     let link_delay = Duration::from_millis(1500); // < margin, >> scheduler jitter
     let (cluster, subscription, handled) =
-        run_late_event_scenario(margin, link_delay, Duration::from_millis(250)).await;
+        run_late_event_scenario(margin, link_delay, Duration::from_millis(250), true).await;
 
     // B's own Y is applied locally by the time its `write` returned (the
     // coordinator waits for its own apply); confirm event-driven rather than
@@ -250,6 +263,8 @@ async fn subscription_waits_for_a_late_lower_cursor_event() {
         Vec::<String>::new(),
         "the watermark must hold B's own Y back until the prefix is stable"
     );
+    // Sync rounds prove the windows the watermark advances over.
+    cluster.net.set_unreadable(None);
 
     // Wait for the watermark to advance past Y (it trails `now` by the margin).
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -289,7 +304,7 @@ async fn a_late_event_is_not_skipped_even_past_the_margin() {
     let margin = Duration::from_millis(200);
     let link_delay = Duration::from_millis(2000); // >> margin
     let (cluster, subscription, handled) =
-        run_late_event_scenario(margin, link_delay, Duration::from_secs(4)).await;
+        run_late_event_scenario(margin, link_delay, Duration::from_secs(4), false).await;
 
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
