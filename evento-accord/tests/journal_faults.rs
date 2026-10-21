@@ -34,6 +34,10 @@ struct FaultJournal {
     truncates: AtomicUsize,
     /// While set, `truncate` fails without touching the durable journal.
     truncate_failing: AtomicBool,
+    /// While set, every config-acceptor record fails.
+    acceptor_failing: AtomicBool,
+    /// While set, a config-acceptor record holding an accepted layout fails.
+    accept_failing: AtomicBool,
 }
 
 impl FaultJournal {
@@ -44,6 +48,8 @@ impl FaultJournal {
             failing: AtomicBool::new(false),
             truncates: AtomicUsize::new(0),
             truncate_failing: AtomicBool::new(false),
+            acceptor_failing: AtomicBool::new(false),
+            accept_failing: AtomicBool::new(false),
         }
     }
 
@@ -53,6 +59,14 @@ impl FaultJournal {
 
     fn set_truncate_failing(&self, v: bool) {
         self.truncate_failing.store(v, Ordering::SeqCst);
+    }
+
+    fn set_acceptor_failing(&self, v: bool) {
+        self.acceptor_failing.store(v, Ordering::SeqCst);
+    }
+
+    fn set_accept_failing(&self, v: bool) {
+        self.accept_failing.store(v, Ordering::SeqCst);
     }
 
     fn truncates(&self) -> usize {
@@ -109,6 +123,11 @@ impl Journal for FaultJournal {
         self.durable.load_metadata().await
     }
     async fn record_acceptor(&self, epoch: u64, state: &AcceptorRecord) -> anyhow::Result<()> {
+        if self.acceptor_failing.load(Ordering::SeqCst)
+            || (state.accepted.is_some() && self.accept_failing.load(Ordering::SeqCst))
+        {
+            anyhow::bail!("simulated acceptor-state write failure");
+        }
         self.durable.record_acceptor(epoch, state).await
     }
     async fn load_acceptors(&self) -> anyhow::Result<Vec<(u64, AcceptorRecord)>> {
@@ -407,4 +426,45 @@ async fn count_durable(journals: &[Arc<FaultJournal>], txn: TxnId) -> usize {
         }
     }
     n
+}
+
+/// A config acceptor whose journal cannot persist its state must not vote: a
+/// promise or an accept is a durable commitment that a restart restores, so
+/// one sent without it could be forgotten, and two proposers could then
+/// decide different layouts for one epoch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_config_vote_the_journal_did_not_persist_is_not_sent() {
+    let cluster = start_with(3, false, NodeConfig::default());
+    let layout = vec![cluster.ids.clone()];
+
+    // Two of three acceptors cannot persist a promise: no prepare quorum.
+    cluster.journals[1].set_acceptor_failing(true);
+    cluster.journals[2].set_acceptor_failing(true);
+    let result = cluster.nodes[0].propose_topology(1, layout.clone()).await;
+    assert!(
+        result.is_err(),
+        "decided on promises that were never persisted: {result:?}"
+    );
+    for journal in &cluster.journals[1..] {
+        assert!(journal.load_acceptors().await.unwrap().is_empty());
+    }
+    cluster.journals[1].set_acceptor_failing(false);
+    cluster.journals[2].set_acceptor_failing(false);
+
+    // Promises persist but accepts do not: no accept quorum.
+    cluster.journals[1].set_accept_failing(true);
+    cluster.journals[2].set_accept_failing(true);
+    let result = cluster.nodes[0].propose_topology(2, layout.clone()).await;
+    assert!(
+        result.is_err(),
+        "decided on accepts that were never persisted: {result:?}"
+    );
+    cluster.journals[1].set_accept_failing(false);
+    cluster.journals[2].set_accept_failing(false);
+
+    // Healthy journals: the change is decided.
+    cluster.nodes[0]
+        .propose_topology(3, layout)
+        .await
+        .expect("acceptors that persist their votes decide");
 }

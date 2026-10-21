@@ -1151,6 +1151,26 @@ impl Node {
         bounds
     }
 
+    /// Persists this node's config-acceptor state for `epoch`, the gate in
+    /// front of every promise or accept it sends. On failure the vote is
+    /// withheld, like a batch whose flush failed: the in-memory state may be
+    /// ahead of the journal, which only makes this acceptor refuse more, and
+    /// every later vote persists the whole state before it goes out.
+    async fn persist_acceptor(&self, epoch: u64, record: &AcceptorRecord) -> bool {
+        match self.journal.record_acceptor(epoch, record).await {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!(
+                    node = self.id.0,
+                    epoch,
+                    %err,
+                    "cannot persist a config vote; withholding it"
+                );
+                false
+            }
+        }
+    }
+
     async fn save_rejoin_bounds(&self, bounds: &[(NodeId, Timestamp)]) {
         if let Err(err) = self.journal.save_rejoin_bounds(bounds).await {
             tracing::warn!(node = self.id.0, %err, "cannot persist the rejoin bounds");
@@ -2276,9 +2296,12 @@ impl Node {
                 };
                 // A promise must be durable before it is observable: a restarted
                 // acceptor restores `promised` and so can never regress to a lower
-                // ballot. Persist inline (before the deferred reply is sent).
+                // ballot. Persist inline (before the deferred reply is sent), and
+                // say nothing if that fails.
                 if let Some(record) = record {
-                    let _ = self.journal.record_acceptor(epoch, &record).await;
+                    if !self.persist_acceptor(epoch, &record).await {
+                        return out;
+                    }
                 }
                 out.push((from, reply));
             }
@@ -2315,7 +2338,9 @@ impl Node {
                     }
                 };
                 if let Some(record) = record {
-                    let _ = self.journal.record_acceptor(epoch, &record).await;
+                    if !self.persist_acceptor(epoch, &record).await {
+                        return out;
+                    }
                 }
                 out.push((from, reply));
             }

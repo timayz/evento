@@ -151,7 +151,8 @@ gaps:
   metadata anti-entropy in the recovery sweep), or eagerly when a later `ConfigCommit`
   reveals the gap.
 - **Durability.** Acceptor state is persisted **before** any promise/accept reply
-  (`Journal::record_acceptor`), and the committed log is persisted
+  (`Journal::record_acceptor`; a vote it could not persist is withheld, like a batch
+  whose flush failed), and the committed log is persisted
   (`Journal::append_metadata`); `recover_state` restores both, so a restarted acceptor
   keeps its promised ballots (Paxos crash-safety) and re-installs its epoch prefix.
 - **Automatic completion.** The recovery sweep finishes any accepted-but-uncommitted
