@@ -27,6 +27,7 @@ use evento_core::Event;
 struct TestNode {
     node: Node,
     store: Arc<InMemoryDataStore>,
+    journal: Arc<InMemoryJournal>,
     topology: Arc<DynamicTopology>,
     _loop: tokio::task::JoinHandle<()>,
 }
@@ -51,7 +52,7 @@ fn spawn_node_with(
     let clock = Arc::new(HybridLogicalClock::new(id));
     let sink: Arc<dyn MessageSink> = Arc::new(net.sink(id));
     let store = Arc::new(InMemoryDataStore::new());
-    let journal: Arc<dyn Journal> = Arc::new(InMemoryJournal::new());
+    let journal = Arc::new(InMemoryJournal::new());
     let topology = Arc::new(DynamicTopology::new(id, epoch, shards));
     let node = Node::new(
         id,
@@ -59,13 +60,14 @@ fn spawn_node_with(
         clock,
         sink,
         Arc::clone(&store) as Arc<dyn DataStore>,
-        journal,
+        Arc::clone(&journal) as Arc<dyn Journal>,
     )
     .with_config(config);
     let _loop = node.start(inbox);
     TestNode {
         node,
         store,
+        journal,
         topology,
         _loop,
     }
@@ -1010,4 +1012,110 @@ async fn a_duplicated_config_promise_never_completes_a_quorum() {
         "two distinct acceptors must not decide an epoch: {result:?}"
     );
     assert_eq!(topology.epoch(), 1, "nothing was installed");
+}
+
+/// A layout that would break the cluster is refused before any vote: no shards
+/// (every key's shard index divides by zero), an empty shard (its keys have no
+/// replicas, so they never commit), a node in two shards (ownership is
+/// ambiguous) or twice in one (it would count twice towards a quorum). Nothing
+/// is installed and the cluster keeps serving, then takes a valid change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_invalid_layout_is_refused_and_the_cluster_keeps_serving() {
+    let net = InMemoryNetwork::new();
+    let abc = vec![NodeId(0), NodeId(1), NodeId(2)];
+    let nodes: Vec<TestNode> = abc
+        .iter()
+        .map(|&id| spawn_node(id, 0, vec![abc.clone()], &net))
+        .collect();
+
+    for invalid in [
+        vec![],
+        vec![abc.clone(), vec![]],
+        vec![vec![NodeId(0), NodeId(1)], vec![NodeId(1), NodeId(2)]],
+        vec![vec![NodeId(0), NodeId(0), NodeId(1)]],
+    ] {
+        let result = nodes[0].node.change_topology(1, invalid.clone()).await;
+        assert!(result.is_err(), "{invalid:?} must be refused: {result:?}");
+        let result = nodes[0].node.propose_topology(1, invalid.clone()).await;
+        assert!(result.is_err(), "{invalid:?} must be refused: {result:?}");
+    }
+    for n in &nodes {
+        assert_eq!(n.topology.epoch(), 0, "nothing was installed");
+    }
+
+    nodes[0]
+        .node
+        .write(vec![event("acc", 1, "Opened")])
+        .await
+        .unwrap();
+    for n in &nodes {
+        await_len(&n.store, 1).await;
+    }
+    nodes[0]
+        .node
+        .change_topology(1, vec![abc.clone()])
+        .await
+        .unwrap();
+    for n in &nodes {
+        await_epoch(&n.topology, 1).await;
+    }
+}
+
+/// A commit of an invalid layout arriving off the wire (a forged or corrupt
+/// frame, or an older proposer) is neither installed nor persisted. Persisting
+/// it would be worse than ignoring it: every journal keeps the first entry per
+/// epoch, so it would shut out the epoch's real layout for good.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_commit_of_an_invalid_layout_is_neither_installed_nor_persisted() {
+    use evento_accord::Message;
+
+    let net = InMemoryNetwork::new();
+    let abc = vec![NodeId(0), NodeId(1), NodeId(2)];
+    let nodes: Vec<TestNode> = abc
+        .iter()
+        .map(|&id| spawn_node(id, 0, vec![abc.clone()], &net))
+        .collect();
+
+    let forger = net.sink(NodeId(9));
+    forger
+        .send(
+            NodeId(0),
+            Message::ConfigCommit {
+                epoch: 1,
+                layout: vec![],
+            },
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        nodes[0].topology.epoch(),
+        0,
+        "the invalid layout was installed"
+    );
+    assert!(
+        nodes[0].journal.load_metadata().await.unwrap().is_empty(),
+        "the invalid layout was persisted"
+    );
+
+    // The node still serves, and the epoch's real layout still lands.
+    nodes[0]
+        .node
+        .write(vec![event("acc", 1, "Opened")])
+        .await
+        .unwrap();
+    for n in &nodes {
+        await_len(&n.store, 1).await;
+    }
+    forger
+        .send(
+            NodeId(0),
+            Message::ConfigCommit {
+                epoch: 1,
+                layout: vec![abc.clone()],
+            },
+        )
+        .await
+        .unwrap();
+    await_epoch(&nodes[0].topology, 1).await;
 }

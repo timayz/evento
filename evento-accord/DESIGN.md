@@ -156,6 +156,14 @@ gaps:
   keeps its promised ballots (Paxos crash-safety) and re-installs its epoch prefix.
 - **Automatic completion.** The recovery sweep finishes any accepted-but-uncommitted
   epoch itself (the automatic equivalent of `recover_topology`).
+- **Valid layouts only** (`validate_layout`): at least one shard, none empty, every
+  node in exactly one shard, once. Without shards every key's shard index divides by
+  zero; an empty shard owns keys no replica can commit (and `vec![vec![]]` leaves no
+  acceptor for the next epoch). `change_topology`/`propose_topology` refuse one, the
+  proposer checks the value it carries to phase 2 (an adopted or fallback one too),
+  an acceptor never votes for one, and a node neither persists nor installs one it is
+  sent: the log keeps the first entry per epoch, so a persisted bad entry would shut
+  out the real one, and an entry an older build persisted is never installed.
 
 Remaining gap versus a full CEP-21 service: **no leader** for liveness under
 contention (concurrent reconfigurations can still duel on ballots) and no Raft-style

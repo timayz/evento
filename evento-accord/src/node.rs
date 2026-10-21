@@ -28,8 +28,8 @@ use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant};
 
 use crate::api::{
-    floor_millis, snapshot_event_size, stamp_events, AcceptorRecord, DataStore, Journal,
-    MessageSink, ShardId, Topology,
+    floor_millis, snapshot_event_size, stamp_events, validate_layout, AcceptorRecord, DataStore,
+    Journal, MessageSink, ShardId, Topology,
 };
 use crate::clock::{Ballot, Clock, HybridLogicalClock, NodeId, Timestamp, TxnId};
 use crate::failure_detector::FailureDetector;
@@ -2287,6 +2287,13 @@ impl Node {
                 ballot,
                 layout,
             } => {
+                // Never vote for a layout that would break the cluster, so a
+                // majority of current nodes can never choose one (an older
+                // proposer validates nothing).
+                if let Err(err) = validate_layout(&layout) {
+                    tracing::warn!(node = self.id.0, epoch, %err, "refusing an invalid layout");
+                    return out;
+                }
                 let (reply, record) = {
                     let mut config = self.config.lock().expect("config poisoned");
                     let acc = config.entry(epoch).or_default();
@@ -2313,6 +2320,12 @@ impl Node {
                 out.push((from, reply));
             }
             Message::ConfigCommit { epoch, layout } => {
+                // Checked before the append: the log keeps the first entry per
+                // epoch, so a persisted invalid one would shut out the real one.
+                if let Err(err) = validate_layout(&layout) {
+                    tracing::warn!(node = self.id.0, epoch, %err, "ignoring an invalid layout");
+                    return out;
+                }
                 // Append to the durable log, then install every now-contiguous
                 // epoch. If this commit arrived before an intervening epoch, ask the
                 // sender (which decided it, so holds the full prefix) to fill the gap.
@@ -2346,6 +2359,21 @@ impl Node {
                 }
             }
             Message::MetadataEntries { entries } => {
+                // An invalid layout is dropped before the append, like a
+                // `ConfigCommit`'s; the run stops there, so what is ingested
+                // stays contiguous.
+                let mut entries = entries;
+                if let Some(bad) = entries
+                    .iter()
+                    .position(|(_, layout)| validate_layout(layout).is_err())
+                {
+                    tracing::warn!(
+                        node = self.id.0,
+                        epoch = entries[bad].0,
+                        "ignoring an invalid layout and the entries after it"
+                    );
+                    entries.truncate(bad);
+                }
                 // Persist the whole run first (one group fsync for journals that
                 // support it), then ingest in ascending order; `apply_log` installs
                 // each now-contiguous epoch. Idempotent, so an overlapping pull is
@@ -4585,6 +4613,7 @@ impl Node {
         epoch: u64,
         shards: Vec<Vec<NodeId>>,
     ) -> anyhow::Result<Vec<Vec<NodeId>>> {
+        validate_layout(&shards)?;
         let acceptors = self.topology.nodes();
         let decided = self.run_config_paxos(epoch, shards, &acceptors).await?;
         self.commit_topology(epoch, &decided, &acceptors).await;
@@ -4599,6 +4628,7 @@ impl Node {
         epoch: u64,
         proposed: Vec<Vec<NodeId>>,
     ) -> anyhow::Result<Vec<Vec<NodeId>>> {
+        validate_layout(&proposed)?;
         let acceptors = self.topology.nodes();
         self.run_config_paxos(epoch, proposed, &acceptors).await
     }
@@ -4733,6 +4763,15 @@ impl Node {
             }
 
             let layout = adopted.map(|(_, l)| l).unwrap_or(proposed.clone());
+            // The adopted value (an older proposer's) or a recovery's fallback
+            // was never checked; an invalid one is not carried to a decision.
+            if let Err(err) = validate_layout(&layout) {
+                self.config_inbox
+                    .lock()
+                    .expect("config poisoned")
+                    .remove(&epoch);
+                return Err(err.context(format!("refusing to decide epoch {epoch}")));
+            }
 
             // Phase 2: Accept the chosen layout.
             for &node in acceptors {
@@ -4835,6 +4874,18 @@ impl Node {
                 log.entries.get(&next).map(|layout| (next, layout.clone()))
             };
             let Some((next, layout)) = next else { break };
+            // An entry persisted before layouts were checked: installing it
+            // would break every key (no shard) or strand some (an empty one).
+            // Stay on the last good epoch instead.
+            if let Err(err) = validate_layout(&layout) {
+                tracing::error!(
+                    node = self.id.0,
+                    epoch = next,
+                    %err,
+                    "not installing an invalid layout; staying on the previous epoch"
+                );
+                break;
+            }
             self.topology.install(next, layout);
             self.meta_log
                 .lock()

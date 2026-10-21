@@ -40,8 +40,8 @@ pub mod tcp;
 pub mod transport;
 
 pub use api::{
-    snapshot_event_size, AcceptorRecord, DataStore, DynamicTopology, Journal, MessageSink,
-    RegionId, ShardId, ShardedTopology, SnapshotPage, StaticTopology, Topology,
+    snapshot_event_size, validate_layout, AcceptorRecord, DataStore, DynamicTopology, Journal,
+    MessageSink, RegionId, ShardId, ShardedTopology, SnapshotPage, StaticTopology, Topology,
 };
 pub use clock::{Ballot, Clock, HybridLogicalClock, NodeId, Timestamp, TxnId, MAX_SKEW_MICROS};
 pub use executor::{AccordExecutor, ExecutorDataStore};

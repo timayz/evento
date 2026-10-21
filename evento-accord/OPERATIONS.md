@@ -163,7 +163,9 @@ Suggested alerts: `recoveries` rate > 0 for several minutes; `compactions` flat 
 
 Requires `DynamicTopology`. Membership changes are decided by a durable, replicated
 metadata log (config-Paxos); concurrent reconfigurations converge without a leader
-(distinguished proposer + yield).
+(distinguished proposer + yield). A layout must have at least one shard, no empty
+shard, and every node in exactly one shard (`validate_layout`): `change_topology`
+refuses anything else before a vote, and a node never installs it.
 
 - **Add a node:** start the new process with `begin_join()` (it buffers consensus
   messages), drive `change_topology(epoch, new_layout)` from any current member, then
