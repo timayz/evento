@@ -49,11 +49,14 @@ pub use failure_detector::FailureDetector;
 pub use group::{GroupHost, RejoinHandler};
 pub use message::{CommandState, Key, Message, Status};
 pub use metrics::{Metrics, MetricsSnapshot};
-pub use node::{BacklogAtCap, CommitOutcome, Node, NodeConfig, PartialSnapshot, RejoinRequired};
+pub use node::{
+    BacklogAtCap, CommandTooLarge, CommitOutcome, Node, NodeConfig, PartialSnapshot,
+    RejoinRequired, MAX_COMMAND_BYTES,
+};
 pub use store::{AppliedEntry, InMemoryDataStore, InMemoryJournal};
 pub use sweep::{SweepConfig, SweepPressure, SweepScheduler, SweepStats, Sweepable};
 pub use tcp::{
     serve, serve_tls, serve_tls_verified, GroupSink, MuxTransport, PeerCerts, TcpTransport,
     TlsClient, UnroutedHandler,
 };
-pub use transport::{Envelope, GroupId, InMemoryNetwork, InMemorySink};
+pub use transport::{Envelope, GroupId, InMemoryNetwork, InMemorySink, MessageFilter};

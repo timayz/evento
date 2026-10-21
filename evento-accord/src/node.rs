@@ -35,7 +35,7 @@ use crate::clock::{Ballot, Clock, HybridLogicalClock, NodeId, Timestamp, TxnId};
 use crate::failure_detector::FailureDetector;
 use crate::message::{CommandState, Key, Message, Status, SyncKnown, INVALIDATED_AT};
 use crate::metrics::{Metrics, MetricsSnapshot};
-use crate::replica::{Replica, RoutedRecovery};
+use crate::replica::{command_size, Replica, RoutedRecovery};
 use crate::sweep::SweepPressure;
 use crate::transport::Envelope;
 
@@ -205,6 +205,38 @@ impl std::fmt::Display for BacklogAtCap {
 }
 
 impl std::error::Error for BacklogAtCap {}
+
+/// The most a single transaction's events may weigh on the wire
+/// ([`snapshot_event_size`] summed): half the TCP transport's frame cap
+/// ([`MAX_FRAME_LENGTH`](crate::tcp::MAX_FRAME_LENGTH)), leaving room for
+/// the dependencies, keys and framing every message carrying it adds. A
+/// command is the one unit no page can split: anti-entropy and a join ship
+/// at least one per frame, so a heavier one could never be repaired onto a
+/// replica that missed it.
+pub const MAX_COMMAND_BYTES: usize = crate::tcp::MAX_FRAME_LENGTH / 2;
+
+/// [`Node::write`] refused a new write: its events weigh more on the wire
+/// than [`MAX_COMMAND_BYTES`]. Split it into several transactions. Returned
+/// through `anyhow`; downcast to tell it apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandTooLarge {
+    /// The transaction's wire size ([`snapshot_event_size`] summed).
+    pub bytes: usize,
+    /// The cap, [`MAX_COMMAND_BYTES`].
+    pub cap: usize,
+}
+
+impl std::fmt::Display for CommandTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "transaction too large to replicate ({} bytes > {}); split it",
+            self.bytes, self.cap
+        )
+    }
+}
+
+impl std::error::Error for CommandTooLarge {}
 
 /// [`Node::write`] refused a new write: a peer told this node to rejoin the
 /// group from a snapshot (see [`NodeConfig::peer_absence_limit`]), so it no
@@ -1580,6 +1612,8 @@ impl Node {
         let behind = match message {
             // A join is how a peer behind its bound gets back: always served.
             Message::SyncRequest { snapshot: true, .. }
+            | Message::JoinHeaderRequest { .. }
+            | Message::CommandPageRequest { .. }
             | Message::SnapshotRequest { .. }
             | Message::SnapshotPageRequest { .. } => return Screen::Pass,
             Message::Watermark { applied_through } => match state.rejoin_above {
@@ -1711,6 +1745,9 @@ impl Node {
                 | Message::SnapshotPageRequest { .. }
                 | Message::SnapshotPage { .. }
                 | Message::JoinProof { .. }
+                | Message::JoinHeaderRequest { .. }
+                | Message::CommandPageRequest { .. }
+                | Message::CommandPage { .. }
                 | Message::Watermark { .. }
                 | Message::ConfigPrepare { .. }
                 | Message::ConfigPromise { .. }
@@ -2002,16 +2039,30 @@ impl Node {
                     return out;
                 }
                 let (watermark, coverage, commands) = self.export_bootstrap(known.as_ref());
-                // A bootstrapping joiner on the legacy protocol may be below our
-                // truncation watermark, so it also needs the materialised state
-                // command replay no longer covers — inline, in one frame (a
-                // current joiner pulls it page by page instead). Anti-entropy
-                // (snapshot = false) only needs the commands. A snapshot this
-                // node cannot read is not answered at all: an empty one would
-                // have the joiner adopt our floor over a missing prefix.
+                // A bootstrapping joiner on the legacy protocol (before
+                // `SnapshotRequest`) may be below our truncation watermark, so
+                // it also needs the materialised state command replay no
+                // longer covers — inline, in one frame (a current joiner pulls
+                // it page by page instead). Anti-entropy (snapshot = false)
+                // only needs the commands, already bounded. A snapshot this
+                // node cannot read, or one that cannot fit a frame, is not
+                // answered at all: an empty one would have the joiner adopt
+                // our floor over a missing prefix.
                 let snapshot = if snapshot {
-                    match self.datastore.snapshot().await {
-                        Ok(snapshot) => snapshot,
+                    let budget = crate::tcp::MAX_FRAME_LENGTH
+                        .saturating_sub(commands.iter().map(command_size).sum());
+                    match self.inline_snapshot(budget).await {
+                        Ok(Some(snapshot)) => snapshot,
+                        Ok(None) => {
+                            tracing::warn!(
+                                node = self.id.0,
+                                from = from.0,
+                                cap = crate::tcp::MAX_FRAME_LENGTH,
+                                "a legacy joiner's inline snapshot would not fit a frame; \
+                                 not answering (upgrade the joiner: it pulls pages)"
+                            );
+                            return out;
+                        }
                         Err(err) => {
                             tracing::warn!(
                                 node = self.id.0,
@@ -2036,14 +2087,23 @@ impl Node {
                     },
                 ));
             }
-            Message::SnapshotRequest { id } => {
-                // Same as the legacy bootstrap request, without the inline
-                // snapshot: the joiner pulls it page by page next. A node still
-                // joining stays silent (see above).
+            // The join header. A `SnapshotRequest` (a joiner predating
+            // command pages) gets every applied command inline; a
+            // `JoinHeaderRequest` gets none — it pulls them page by page
+            // next, so a backlog of any size fits the frame cap. Either way
+            // the snapshot follows page by page. A node still joining stays
+            // silent (see above).
+            request @ (Message::SnapshotRequest { .. } | Message::JoinHeaderRequest { .. }) => {
                 if !self.bootstrapped.load(Ordering::Acquire) {
                     return out;
                 }
-                let (watermark, coverage, commands, epoch, vouched) = self.export_join_header();
+                let (id, inline) = match request {
+                    Message::SnapshotRequest { id } => (id, true),
+                    Message::JoinHeaderRequest { id } => (id, false),
+                    _ => unreachable!(),
+                };
+                let (watermark, coverage, commands, epoch, vouched) =
+                    self.export_join_header(inline);
                 // Hold this node's report at the vouch until the joiner's
                 // first report (see `JoinHold`). Only a same-shard joiner's
                 // report is ever compared against this shard's compaction.
@@ -2070,19 +2130,36 @@ impl Node {
                 ));
                 out.push((from, Message::JoinProof { id, epoch, vouched }));
             }
+            Message::CommandPageRequest { id, after } => {
+                if !self.bootstrapped.load(Ordering::Acquire) {
+                    return out;
+                }
+                self.refresh_join_hold(from);
+                let (watermark, commands, next) = {
+                    let replica = self.replica.lock().expect("replica poisoned");
+                    let (commands, next) = replica.export_applied_page(
+                        after,
+                        self.settings.snapshot_page_events,
+                        self.settings.snapshot_page_bytes,
+                    );
+                    (replica.redundant_before(), commands, next)
+                };
+                self.metrics.record_command_page();
+                out.push((
+                    from,
+                    Message::CommandPage {
+                        id,
+                        watermark,
+                        commands,
+                        next,
+                    },
+                ));
+            }
             Message::SnapshotPageRequest { id, after } => {
                 if !self.bootstrapped.load(Ordering::Acquire) {
                     return out;
                 }
-                // The joiner is still at it: its hold stays (see `JoinHold`).
-                if let Some(hold) = self
-                    .join_holds
-                    .lock()
-                    .expect("join holds poisoned")
-                    .get_mut(&from)
-                {
-                    hold.refreshed = Instant::now();
-                }
+                self.refresh_join_hold(from);
                 match self
                     .datastore
                     .snapshot_page(
@@ -2113,9 +2190,9 @@ impl Node {
                     ),
                 }
             }
-            page @ Message::SnapshotPage { .. } => {
+            page @ (Message::SnapshotPage { .. } | Message::CommandPage { .. }) => {
                 let id = match &page {
-                    Message::SnapshotPage { id, .. } => *id,
+                    Message::SnapshotPage { id, .. } | Message::CommandPage { id, .. } => *id,
                     _ => unreachable!(),
                 };
                 let tx = self
@@ -2538,6 +2615,22 @@ impl Node {
         // refused (gated only here, the local coordinator's entry point).
         if self.rejoin_required() {
             return Err(RejoinRequired.into());
+        }
+        // A command is the unit no page can split: one over the cap could
+        // never be repaired onto a replica that missed it.
+        let bytes: usize = events.iter().map(snapshot_event_size).sum();
+        if bytes > MAX_COMMAND_BYTES {
+            tracing::warn!(
+                node = self.id.0,
+                bytes,
+                cap = MAX_COMMAND_BYTES,
+                "refusing new write: too large to replicate"
+            );
+            return Err(CommandTooLarge {
+                bytes,
+                cap: MAX_COMMAND_BYTES,
+            }
+            .into());
         }
         let backlog = self.command_count();
         if backlog >= self.settings.max_commands {
@@ -3932,44 +4025,72 @@ impl Node {
     /// redundancy watermark, its margin-lagged applied-through (the coverage
     /// the requester may record), and the applied commands it needs — with a
     /// digest (anti-entropy), only the ones it is missing, so a healthy
-    /// in-sync round ships nothing; without one (bootstrap), the full set.
+    /// in-sync round ships nothing; without one (legacy bootstrap), the full
+    /// set.
+    ///
+    /// An anti-entropy reply is bounded like a snapshot page
+    /// ([`snapshot_page_events`](NodeConfig::snapshot_page_events) /
+    /// [`snapshot_page_bytes`](NodeConfig::snapshot_page_bytes)): a requester
+    /// back from a long partition would otherwise be sent its whole backlog
+    /// in one frame — over the transport's cap, shed, and asked for again
+    /// every round, forever. It gets an execution-order prefix instead, and
+    /// its next digest asks for the rest. The coverage then stops below the
+    /// oldest `t0` left out: the requester records it as proof it holds
+    /// everything this node applied below it.
     fn export_bootstrap(
         &self,
         known: Option<&SyncKnown>,
     ) -> (Timestamp, Timestamp, Vec<CommandState>) {
         let cutoff = self.margin_cutoff();
         let replica = self.replica.lock().expect("replica poisoned");
-        let commands = match known {
+        let (commands, omitted) = match known {
             Some(known) => {
                 let have: HashSet<TxnId> = known.txns.iter().copied().collect();
-                replica.export_applied_missing(known.since, &have)
+                replica.export_applied_missing(
+                    known.since,
+                    &have,
+                    self.settings.snapshot_page_events,
+                    self.settings.snapshot_page_bytes,
+                )
             }
-            None => replica.export_applied(),
+            None => (replica.export_applied(), None),
         };
         // Everything this node holds below its margin-lagged applied-through
         // is applied — and, with `commands`, on its way to the requester,
-        // which records it as sync coverage.
-        (
-            replica.redundant_before(),
-            replica.applied_through(cutoff),
-            commands,
-        )
+        // which records it as sync coverage — except what the budget left
+        // out, all at or above `omitted`.
+        let coverage = replica.applied_through(cutoff);
+        let coverage = omitted.map_or(coverage, |oldest| coverage.min(oldest));
+        (replica.redundant_before(), coverage, commands)
     }
 
     /// A join header ([`export_bootstrap`](Self::export_bootstrap) without a
-    /// digest) plus what this node vouches for the joiner: its own watermark
-    /// report and the epoch it holds under ([`Message::JoinProof`]). Both are
+    /// digest; with every applied command if `inline`, with none otherwise)
+    /// plus what this node vouches for the joiner: its own watermark report
+    /// and the epoch it holds under ([`Message::JoinProof`]). Both are
     /// taken under one replica lock — and a sync round records its coverage
     /// only after importing its commands — so every applied command below
     /// the vouch is either below the exported floor (in the snapshot) or
-    /// among the exported commands: the joiner ends up holding exactly what
-    /// the vouch covers. An epoch change meanwhile voids the vouch (`MIN`).
-    fn export_join_header(&self) -> (Timestamp, Timestamp, Vec<CommandState>, u64, Timestamp) {
+    /// among the applied commands of this cut: the joiner ends up holding
+    /// exactly what the vouch covers. Not `inline`, those commands follow in
+    /// [`CommandPage`](Message::CommandPage)s cut later; one compacted in
+    /// between is no longer walked, but it is then below the page's floor,
+    /// which the joiner adopts, and its events are in the snapshot pages it
+    /// pulls after the last command page — so the vouch still holds. An
+    /// epoch change meanwhile voids the vouch (`MIN`).
+    fn export_join_header(
+        &self,
+        inline: bool,
+    ) -> (Timestamp, Timestamp, Vec<CommandState>, u64, Timestamp) {
         let epoch = self.topology.epoch();
         let shard_peers = self.shard_peers();
         let cutoff = self.margin_cutoff();
         let replica = self.replica.lock().expect("replica poisoned");
-        let commands = replica.export_applied();
+        let commands = if inline {
+            replica.export_applied()
+        } else {
+            Vec::new()
+        };
         let vouched = self.report_locked(&replica, &shard_peers);
         let header = (
             replica.redundant_before(),
@@ -4007,16 +4128,18 @@ impl Node {
             .ok_or_else(|| anyhow::anyhow!("sync channel closed"))
     }
 
-    /// Pulls the snapshot page after `after` from `contact`, asking up to
-    /// [`SNAPSHOT_PAGE_ATTEMPTS`] times with `timeout` each. Every attempt
-    /// uses a fresh correlation id, so a reply to a timed-out request that
-    /// arrives late is dropped rather than taken for the next page's.
-    async fn fetch_snapshot_page(
+    /// Pulls one join page from `contact` — the reply to `request(id)` —
+    /// asking up to [`SNAPSHOT_PAGE_ATTEMPTS`] times with `timeout` each.
+    /// Every attempt uses a fresh correlation id, so a reply to a timed-out
+    /// request that arrives late is dropped rather than taken for the next
+    /// page's.
+    async fn fetch_page(
         &self,
         contact: NodeId,
         timeout: Duration,
-        after: Option<Value>,
-    ) -> anyhow::Result<(Vec<Event>, Option<Value>)> {
+        what: &str,
+        request: impl Fn(u64) -> Message,
+    ) -> anyhow::Result<Message> {
         for attempt in 1..=SNAPSHOT_PAGE_ATTEMPTS {
             let id = self.correlation_seq.fetch_add(1, Ordering::Relaxed);
             let (tx, mut rx) = mpsc::unbounded_channel();
@@ -4024,31 +4147,167 @@ impl Node {
                 .lock()
                 .expect("snapshot poisoned")
                 .insert(id, tx);
-            self.send(
-                contact,
-                Message::SnapshotPageRequest {
-                    id,
-                    after: after.clone(),
-                },
-            )
-            .await;
+            self.send(contact, request(id)).await;
             let received = tokio::time::timeout(timeout, rx.recv()).await;
             self.snapshot_pending
                 .lock()
                 .expect("snapshot poisoned")
                 .remove(&id);
             match received {
-                Ok(Some(Message::SnapshotPage { events, next, .. })) => return Ok((events, next)),
-                Ok(_) => anyhow::bail!("snapshot page channel closed"),
+                Ok(Some(page)) => return Ok(page),
+                Ok(None) => anyhow::bail!("{what} channel closed"),
                 Err(_) => tracing::debug!(
                     node = self.id.0,
                     contact = contact.0,
                     attempt,
-                    "snapshot page timed out"
+                    "{what} timed out"
                 ),
             }
         }
-        anyhow::bail!("snapshot page timed out after {SNAPSHOT_PAGE_ATTEMPTS} attempts")
+        anyhow::bail!("{what} timed out after {SNAPSHOT_PAGE_ATTEMPTS} attempts")
+    }
+
+    /// Pulls the snapshot page after `after` from `contact` (see
+    /// [`fetch_page`](Self::fetch_page)).
+    async fn fetch_snapshot_page(
+        &self,
+        contact: NodeId,
+        timeout: Duration,
+        after: Option<Value>,
+    ) -> anyhow::Result<(Vec<Event>, Option<Value>)> {
+        let page = self
+            .fetch_page(contact, timeout, "snapshot page", |id| {
+                Message::SnapshotPageRequest {
+                    id,
+                    after: after.clone(),
+                }
+            })
+            .await?;
+        match page {
+            Message::SnapshotPage { events, next, .. } => Ok((events, next)),
+            other => anyhow::bail!("not a snapshot page: {other:?}"),
+        }
+    }
+
+    /// Pulls the command page after `after` from `contact` (see
+    /// [`fetch_page`](Self::fetch_page)): its floor when it cut the page,
+    /// the commands, and the next page's cursor.
+    async fn fetch_command_page(
+        &self,
+        contact: NodeId,
+        timeout: Duration,
+        after: Option<TxnId>,
+    ) -> anyhow::Result<(Timestamp, Vec<CommandState>, Option<TxnId>)> {
+        let page = self
+            .fetch_page(contact, timeout, "command page", |id| {
+                Message::CommandPageRequest { id, after }
+            })
+            .await?;
+        match page {
+            Message::CommandPage {
+                watermark,
+                commands,
+                next,
+                ..
+            } => Ok((watermark, commands, next)),
+            other => anyhow::bail!("not a command page: {other:?}"),
+        }
+    }
+
+    /// Fetches the join header from `contact`: its `(watermark, coverage,
+    /// commands)` and the slot its [`JoinProof`](Message::JoinProof) lands
+    /// in, plus whether the commands follow in pages. Asks with a
+    /// [`JoinHeaderRequest`](Message::JoinHeaderRequest) first (no commands
+    /// inline); a contact that does not answer it in `timeout` — one
+    /// predating it sheds it — is asked again with a
+    /// [`SnapshotRequest`](Message::SnapshotRequest), which it answers with
+    /// every command inline, as before.
+    async fn fetch_join_header(
+        &self,
+        contact: NodeId,
+        timeout: Duration,
+    ) -> anyhow::Result<(SyncPayload, PendingProof<'_>, bool)> {
+        let mut slot = None;
+        let paged = self
+            .sync_round(contact, timeout, |id| {
+                slot = Some(self.pending_proof(id));
+                Message::JoinHeaderRequest { id }
+            })
+            .await;
+        match (paged, slot) {
+            (Ok(header), Some(slot)) => return Ok((header, slot, true)),
+            (Err(err), _) => tracing::debug!(
+                node = self.id.0,
+                contact = contact.0,
+                %err,
+                "no paged join header; asking for the inline one"
+            ),
+            (Ok(_), None) => unreachable!("the request registers its proof slot"),
+        }
+        let mut slot = None;
+        let header = self
+            .sync_round(contact, timeout, |id| {
+                slot = Some(self.pending_proof(id));
+                Message::SnapshotRequest { id }
+            })
+            .await?;
+        Ok((
+            header,
+            slot.expect("the request registers its proof slot"),
+            false,
+        ))
+    }
+
+    /// Registers the [`JoinProof`](Message::JoinProof) slot of the join
+    /// header request `id`.
+    fn pending_proof(&self, id: u64) -> PendingProof<'_> {
+        self.proof_pending
+            .lock()
+            .expect("proof poisoned")
+            .insert(id, None);
+        PendingProof { node: self, id }
+    }
+
+    /// A joiner this node vouched for asked for another page: it is still
+    /// at it, so its hold stays (see [`JoinHold`]).
+    fn refresh_join_hold(&self, joiner: NodeId) {
+        if let Some(hold) = self
+            .join_holds
+            .lock()
+            .expect("join holds poisoned")
+            .get_mut(&joiner)
+        {
+            hold.refreshed = Instant::now();
+        }
+    }
+
+    /// The materialised snapshot a legacy joiner gets inline, read a page at
+    /// a time, or `None` once it outgrows `budget` bytes
+    /// ([`snapshot_event_size`]) — it could not cross the transport in one
+    /// frame anyway, and stopping there bounds what this node reads for it.
+    async fn inline_snapshot(&self, budget: usize) -> anyhow::Result<Option<Vec<Event>>> {
+        let mut snapshot = Vec::new();
+        let mut bytes = 0;
+        let mut after = None;
+        loop {
+            let page = self
+                .datastore
+                .snapshot_page(
+                    after.take(),
+                    self.settings.snapshot_page_events,
+                    self.settings.snapshot_page_bytes,
+                )
+                .await?;
+            bytes += page.events.iter().map(snapshot_event_size).sum::<usize>();
+            if bytes > budget {
+                return Ok(None);
+            }
+            snapshot.extend(page.events);
+            match page.next {
+                Some(cursor) => after = Some(cursor),
+                None => return Ok(Some(snapshot)),
+            }
+        }
     }
 
     /// Fetches `contact`'s committed state and imports every command for a key
@@ -4059,16 +4318,20 @@ impl Node {
     /// With `want_snapshot`, the contact also ships its materialised data-store
     /// snapshot and redundancy watermark: a bootstrapping node may be below the
     /// cluster's truncation point, where command replay alone no longer
-    /// reconstructs the state. The header ([`Message::SnapshotRequest`]) brings
-    /// the watermark and the recent commands; the snapshot then arrives page by
-    /// page ([`Message::SnapshotPageRequest`]), each installed as it lands, so
-    /// a store of any size crosses the wire in frames far under the transport's
-    /// cap. The node adopts the watermark (so a dependency on a compacted-away
-    /// transaction counts as satisfied) and imports the recent commands into its
-    /// conflict graph only — their events are already in the snapshot. The
-    /// header is taken before the pages, so every command it lists has its
-    /// events in a page; a transaction applied on the contact meanwhile is in
-    /// the join buffer too, and its replay finds the events already there.
+    /// reconstructs the state. The header ([`Message::JoinHeaderRequest`],
+    /// or [`Message::SnapshotRequest`] from a contact predating it) brings
+    /// the watermark; the recent commands follow page by page
+    /// ([`Message::CommandPageRequest`]; inline in the older header), then the
+    /// snapshot ([`Message::SnapshotPageRequest`]), each snapshot page
+    /// installed as it lands, so a store and a backlog of any size cross the
+    /// wire in frames far under the transport's cap. The node adopts the
+    /// highest watermark it was sent (so a dependency on a compacted-away
+    /// transaction counts as satisfied) and imports the recent commands above
+    /// it into its conflict graph only — their events are already in the
+    /// snapshot. The header and the command pages are taken before the
+    /// snapshot pages, so every command listed has its events in a page; a
+    /// transaction applied on the contact meanwhile is in the join buffer too,
+    /// and its replay finds the events already there.
     /// A failure once a page is installed is tagged [`PartialSnapshot`].
     /// Anti-entropy needs no snapshot (the watermark is the cluster-wide min,
     /// so an existing replica has already applied everything below it), so it
@@ -4094,16 +4357,28 @@ impl Node {
             );
             // The contact's vouch follows its header on the same link
             // ([`Message::JoinProof`]); a contact predating it sends none.
-            let (watermark, coverage, _, commands) = self
-                .sync_round(contact, timeout, |id| {
-                    self.proof_pending
-                        .lock()
-                        .expect("proof poisoned")
-                        .insert(id, None);
-                    proof_slot = Some(PendingProof { node: self, id });
-                    Message::SnapshotRequest { id }
-                })
-                .await?;
+            let ((mut watermark, coverage, _, mut commands), slot, paged) =
+                self.fetch_join_header(contact, timeout).await?;
+            proof_slot = Some(slot);
+            // Then the applied commands, page by page, before any snapshot
+            // page: every command listed has its events in a page fetched
+            // after it. The contact may compact between pages; the highest
+            // floor it sent is the one to adopt, and what it covers is in the
+            // snapshot — dropped here, as compacting below it would.
+            if paged {
+                let mut after = None;
+                loop {
+                    let (floor, page, next) =
+                        self.fetch_command_page(contact, timeout, after).await?;
+                    watermark = watermark.max(floor);
+                    commands.extend(page);
+                    match next {
+                        Some(cursor) => after = Some(cursor),
+                        None => break,
+                    }
+                }
+                commands.retain(|cmd| cmd.txn.0 >= watermark);
+            }
             // Install the materialised snapshot (the truncated prefix and
             // beyond) for owned keys under a synthetic, sub-watermark id —
             // redundant for ordering but it sets this node's versions and

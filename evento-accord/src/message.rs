@@ -435,6 +435,32 @@ pub enum Message {
     /// it un-committed records it applied as an abort, without executing it
     /// — an abort changes nothing, so it needs no place in the order.
     Invalidate { txn: TxnId },
+    /// Joining node → an existing replica: the bootstrap header, like
+    /// [`SnapshotRequest`](Message::SnapshotRequest) but answered with a
+    /// [`SyncData`](Message::SyncData) carrying **no** commands (then the
+    /// [`JoinProof`](Message::JoinProof)): the applied commands follow page by
+    /// page through [`CommandPageRequest`](Message::CommandPageRequest), and
+    /// only then the snapshot pages, so a backlog of any size crosses in
+    /// frames far under the transport's cap. A contact predating it sheds it
+    /// and the joiner, hearing nothing, asks again with a `SnapshotRequest`.
+    /// Not sweep gossip (see `SnapshotRequest`).
+    JoinHeaderRequest { id: u64 },
+    /// Joining node → the contact: the page of its applied commands after
+    /// `t0` `after` (`None` for the first), bounded like a snapshot page.
+    /// Idempotent, so a lost reply is simply asked for again.
+    CommandPageRequest { id: u64, after: Option<TxnId> },
+    /// Contact → joining node: one page of its applied commands in `t0`
+    /// order; `next` (the last `t0` shipped) is `None` after the last page.
+    /// `watermark` is the contact's redundancy floor when it cut the page:
+    /// a command compacted since the header is no longer walked, but its
+    /// events are in the snapshot pages that follow, and the joiner adopts
+    /// the highest floor it was sent, dropping every command below it.
+    CommandPage {
+        id: u64,
+        watermark: Timestamp,
+        commands: Vec<CommandState>,
+        next: Option<TxnId>,
+    },
 }
 
 impl Message {
@@ -444,11 +470,12 @@ impl Message {
     /// not tell its unrouted handler about these frames, otherwise a tenant
     /// closed for inactivity on one host would be reopened by its peers'
     /// heartbeats a moment later, forever. A joining replica's requests
-    /// (`SnapshotRequest`, `SnapshotPageRequest`, and the legacy
-    /// `SyncRequest { snapshot: true }`) are not: they must open the group on
-    /// a contact that has it closed, or the join would time out. A
-    /// `SnapshotPage` or `JoinProof` is: a reply arriving late, after a
-    /// failed join unregistered the group, must not reopen it.
+    /// (`JoinHeaderRequest`, `CommandPageRequest`, `SnapshotRequest`,
+    /// `SnapshotPageRequest`, and the legacy `SyncRequest { snapshot: true }`)
+    /// are not: they must open the group on a contact that has it closed, or
+    /// the join would time out. A `SnapshotPage`, `CommandPage` or
+    /// `JoinProof` is: a reply arriving late, after a failed join
+    /// unregistered the group, must not reopen it.
     pub fn is_sweep(&self) -> bool {
         matches!(
             self,
@@ -460,6 +487,7 @@ impl Message {
                 | Message::SyncData { .. }
                 | Message::SnapshotPage { .. }
                 | Message::JoinProof { .. }
+                | Message::CommandPage { .. }
         )
     }
 
@@ -503,7 +531,10 @@ impl Message {
             | Message::ReadForward { .. }
             | Message::ReadReply { .. }
             | Message::Rejoin { .. }
-            | Message::JoinProof { .. } => None,
+            | Message::JoinProof { .. }
+            | Message::JoinHeaderRequest { .. }
+            | Message::CommandPageRequest { .. }
+            | Message::CommandPage { .. } => None,
         }
     }
 }
@@ -638,6 +669,78 @@ mod tests {
                     assert_eq!(events.len(), e.len());
                     assert_eq!(events[0].data, e[0].data);
                     assert_eq!(events[0].aggregate_id, e[0].aggregate_id);
+                }
+                other => panic!("variant changed on the wire: {other:?}"),
+            }
+        }
+    }
+
+    /// The paged join's header request and command pages cross the wire
+    /// intact — a command's events included. (Appended after every earlier
+    /// variant, like `JoinProof`.)
+    #[test]
+    fn command_pages_round_trip_tagged() {
+        let txn = TxnId(Timestamp {
+            micros: 42,
+            logical: 1,
+            node: NodeId(2),
+        });
+        let command = CommandState {
+            txn,
+            status: Status::Applied,
+            promised: Ballot(txn.0),
+            accepted: Ballot(txn.0),
+            execute_at: txn.0,
+            deps: vec![txn],
+            keys: vec![Key("acc".into())],
+            events: vec![page_event()],
+            reply_to: NodeId(2),
+            decision: Some(true),
+            applied_conflict: Some(false),
+        };
+        let messages = [
+            Message::JoinHeaderRequest { id: 5 },
+            Message::CommandPageRequest {
+                id: 6,
+                after: Some(txn),
+            },
+            Message::CommandPage {
+                id: 7,
+                watermark: txn.0,
+                commands: vec![command],
+                next: Some(txn),
+            },
+        ];
+        for message in messages {
+            let bytes = encode_tagged(RecordKind::GroupFrame, &message).unwrap();
+            let back: Message = decode_tagged(RecordKind::GroupFrame, &bytes).unwrap();
+            match (&message, &back) {
+                (Message::JoinHeaderRequest { id }, Message::JoinHeaderRequest { id: b }) => {
+                    assert_eq!(id, b)
+                }
+                (
+                    Message::CommandPageRequest { id, after },
+                    Message::CommandPageRequest { id: b, after: c },
+                ) => assert_eq!((id, after), (b, c)),
+                (
+                    Message::CommandPage {
+                        id,
+                        watermark,
+                        commands,
+                        next,
+                    },
+                    Message::CommandPage {
+                        id: b,
+                        watermark: w,
+                        commands: c,
+                        next: n,
+                    },
+                ) => {
+                    assert_eq!((id, watermark, next), (b, w, n));
+                    assert_eq!(c.len(), 1);
+                    assert_eq!(c[0].txn, commands[0].txn);
+                    assert_eq!(c[0].deps, commands[0].deps);
+                    assert_eq!(c[0].events[0].data, commands[0].events[0].data);
                 }
                 other => panic!("variant changed on the wire: {other:?}"),
             }
@@ -791,7 +894,26 @@ mod tests {
         assert!(!page_request.is_sweep());
         assert!(page.is_sweep());
         assert!(proof.is_sweep());
-        for message in [request, page_request, page, proof] {
+        let header_request = Message::JoinHeaderRequest { id: 1 };
+        let command_request = Message::CommandPageRequest { id: 1, after: None };
+        let command_page = Message::CommandPage {
+            id: 1,
+            watermark: Timestamp::MIN,
+            commands: Vec::new(),
+            next: None,
+        };
+        assert!(!header_request.is_sweep());
+        assert!(!command_request.is_sweep());
+        assert!(command_page.is_sweep());
+        for message in [
+            request,
+            page_request,
+            page,
+            proof,
+            header_request,
+            command_request,
+            command_page,
+        ] {
             assert_eq!(message.txn(), None);
         }
     }

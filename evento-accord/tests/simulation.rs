@@ -34,7 +34,8 @@ use std::time::Duration;
 
 use evento_accord::{
     DataStore, DynamicTopology, HybridLogicalClock, InMemoryDataStore, InMemoryJournal,
-    InMemoryNetwork, Journal, Key, MessageSink, Node, NodeConfig, NodeId, StaticTopology, Topology,
+    InMemoryNetwork, Journal, Key, Message, MessageSink, Node, NodeConfig, NodeId, StaticTopology,
+    Topology,
 };
 use evento_core::Event;
 use rand::rngs::StdRng;
@@ -2323,4 +2324,196 @@ async fn rejoin_bounds_survive_a_restart() {
 
     sim.net.heal(NodeId(2));
     await_rejoin_required(&sim.nodes[2]).await;
+}
+
+// ---------------------------------------------------------------------------
+// The transport's frame cap: a backlog too big for one frame still crosses,
+// a page at a time — through anti-entropy and through a join.
+// ---------------------------------------------------------------------------
+
+/// A frame cap far below the backlog these tests build, standing in for the
+/// TCP transport's 64 MiB (`InMemoryNetwork::set_frame_cap`).
+const FRAME_CAP: usize = 64 * 1024;
+
+/// Pages a quarter of the cap: a backlog of [`BACKLOG`] writes needs a dozen.
+fn paged_config() -> NodeConfig {
+    NodeConfig {
+        compaction_margin: Duration::from_millis(300),
+        snapshot_page_bytes: 16 * 1024,
+        ..NodeConfig::default()
+    }
+}
+
+/// Writes in the backlog, each of [`heavy_event`]'s 2 KiB: about 200 KiB,
+/// three times the frame cap.
+const BACKLOG: u64 = 100;
+
+/// An [`event`] carrying 2 KiB of data.
+fn heavy_event(aggregate_id: &str, version: u16, seq: u64) -> Event {
+    Event {
+        data: vec![seq as u8; 2048],
+        ..event(aggregate_id, version, seq)
+    }
+}
+
+/// Writes [`BACKLOG`] heavy events through node 0, round-robin over five
+/// aggregates (so each has a version chain), while node `down` is crashed.
+async fn write_backlog(sim: &Sim, down: usize) {
+    sim.net.crash(sim.ids[down]);
+    for seq in 0..BACKLOG {
+        let agg = format!("acc-{}", seq % 5);
+        let version = (seq / 5 + 1) as u16;
+        sim.nodes[0]
+            .write(vec![heavy_event(&agg, version, 1000 + seq)])
+            .await
+            .expect("write with a node down");
+    }
+}
+
+/// A peer back from a long partition repairs a backlog three times the
+/// frame cap through anti-entropy: each reply is a budgeted prefix of what
+/// it misses, the next round's digest asks for the rest. Unbounded, the one
+/// reply holding all of it would be shed every round, forever — compaction
+/// stalled for good.
+#[tokio::test(start_paused = true)]
+async fn a_healed_peer_repairs_a_backlog_over_the_frame_cap() {
+    let sim = Sim::build_with_config(3, paged_config());
+    sim.net.set_frame_cap(Some(FRAME_CAP));
+    sim.nodes[0]
+        .write(vec![event("baseline", 1, 1)])
+        .await
+        .expect("baseline write");
+    assert!(converge(&sim.stores).await);
+
+    write_backlog(&sim, 2).await;
+    assert!(
+        sim.nodes[0].command_count() as u64 > BACKLOG,
+        "nothing compacts while node 2 is down"
+    );
+    sim.net.heal(NodeId(2));
+
+    assert!(
+        converge(&sim.stores).await,
+        "the healed node repairs the backlog: {} of {} commands",
+        sim.nodes[2].command_count(),
+        sim.nodes[0].command_count()
+    );
+    for agg in 0..5 {
+        assert_eq!(
+            version_of(&sim.stores[2], &format!("acc-{agg}")).await,
+            (BACKLOG / 5) as u16
+        );
+    }
+    // Coverage re-proved over the repair: the cluster compacts it all.
+    await_compacted(&sim, &[0, 1, 2], "after the repair").await;
+}
+
+/// A join from a contact holding a command backlog three times the frame
+/// cap: the header carries none of it, the commands follow page by page.
+/// Unbounded, the header would be shed and the join time out against every
+/// contact.
+#[tokio::test(start_paused = true)]
+async fn a_join_pages_a_command_backlog_over_the_frame_cap() {
+    let config = paged_config();
+    let mut sim = Sim::build_with_config(3, config);
+    sim.net.set_frame_cap(Some(FRAME_CAP));
+    sim.nodes[0]
+        .write(vec![event("baseline", 1, 1)])
+        .await
+        .expect("baseline write");
+    assert!(converge(&sim.stores).await);
+
+    write_backlog(&sim, 2).await;
+    sim.net.heal(NodeId(2));
+    sim.rejoin(2, NodeId(0), config).await;
+
+    assert!(
+        sim.nodes[0].metrics().command_pages >= 3,
+        "the backlog crossed in pages: {}",
+        sim.nodes[0].metrics().command_pages
+    );
+    assert!(converge(&sim.stores).await, "the joined node converges");
+    for agg in 0..5 {
+        assert_eq!(
+            version_of(&sim.stores[2], &format!("acc-{agg}")).await,
+            (BACKLOG / 5) as u16
+        );
+    }
+    // It takes part: a write it coordinates commits, and the whole backlog
+    // compacts everywhere.
+    sim.nodes[2]
+        .write(vec![event("acc-0", (BACKLOG / 5 + 1) as u16, 5000)])
+        .await
+        .expect("a write coordinated by the joined node");
+    assert!(converge(&sim.stores).await);
+    await_compacted(&sim, &[0, 1, 2], "after the join").await;
+    assert_eq!(sim.nodes[2].metrics().joins_partial, 0);
+}
+
+/// Rolling upgrade, both ways: a contact predating command pages sheds the
+/// paged header request, so the joiner asks again for the inline header —
+/// which is also all a joiner predating pages ever asks a current contact
+/// for. The join completes, the contact's vouch still counts it back in at
+/// a group size needing it, and it takes part again.
+#[tokio::test(start_paused = true)]
+async fn a_joiner_falls_back_to_the_inline_header_of_a_contact_predating_pages() {
+    const HOT: &str = "hot";
+    let config = absence_config(Duration::from_secs(2));
+    let mut sim = Sim::build_with_config(4, config);
+    let all = [0, 1, 2, 3];
+    for version in 1..=3u16 {
+        sim.nodes[0]
+            .write(vec![event(HOT, version, version as u64)])
+            .await
+            .expect("baseline write");
+    }
+    assert!(converge(&sim.stores).await);
+    await_compacted(&sim, &all, "baseline").await;
+
+    sim.net.crash(NodeId(3));
+    for version in 4..=8u16 {
+        sim.nodes[0]
+            .write(vec![event(HOT, version, 100 + version as u64)])
+            .await
+            .expect("write with a node down");
+    }
+    await_compacted(&sim, &[0, 1, 2], "with node 3 down").await;
+    sim.net.heal(NodeId(3));
+    await_rejoin_required(&sim.nodes[3]).await;
+
+    sim.net.set_unreadable(Some(Arc::new(|message: &Message| {
+        matches!(
+            message,
+            Message::JoinHeaderRequest { .. }
+                | Message::CommandPageRequest { .. }
+                | Message::CommandPage { .. }
+        )
+    })));
+    sim.rejoin(3, NodeId(0), config).await;
+    assert_eq!(
+        sim.nodes[0].metrics().command_pages,
+        0,
+        "nothing paged: the inline header"
+    );
+    assert!(converge(&sim.stores).await, "the rejoined node converges");
+    assert_eq!(version_of(&sim.stores[3], HOT).await, 8);
+    for _ in 0..500 {
+        if (0..3).all(|i| sim.nodes[i].absent_peers().is_empty()) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    for i in all {
+        assert!(
+            sim.nodes[i].absent_peers().is_empty(),
+            "node {i} counts the rejoined node again"
+        );
+    }
+    assert!(!sim.nodes[3].rejoin_required());
+    sim.nodes[3]
+        .write(vec![event(HOT, 9, 900)])
+        .await
+        .expect("a write coordinated by the rejoined node");
+    assert!(converge(&sim.stores).await);
+    await_compacted(&sim, &all, "after the rejoin").await;
 }
