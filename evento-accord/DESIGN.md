@@ -277,6 +277,17 @@ control plane, everything else is Accord.
   decision) and decides nothing while none is heard from. That replica may be a
   straggler of the skipped shard itself, not compacted yet: it is sent the Commit and
   its answer counts like a read, though its shard needs no read or apply quorum (#305).
+  Once a whole shard has compacted the txn, no such replica is left, so compaction
+  keeps a **decision record** of every applied multi-shard txn it drops
+  (`Replica.decisions`: `execute_at`, the decision and the route, journaled as
+  `RecordKind::Decision` before the truncate that deletes the command). A replica
+  holding one answers a recovery as an applied replica would (`Applied` at the
+  recorded `execute_at`, `INVALIDATED_AT` kept for an invalidated txn), and a Commit
+  or Apply with the recorded outcome, so the decision comes from that shard and the
+  txn no longer pins the other shard's watermark, subscriptions and backlog (#286).
+  A record is dropped once every replica of every other route shard reports a
+  watermark above the txn — each applied it — using the `Watermark` gossip every
+  node already sends every other.
   A replica never re-creates a txn below its watermark that it does not hold
   (`Replica::compacted`): PreAccept, Accept and Commit leave it alone, and an
   unrouted recovery hears it is below the watermark, so a decider that compacts
@@ -485,7 +496,9 @@ backend (sql/fjall). Phases, in order:
   `COMPACTION_MARGIN` so a not-yet-propagated commit is never skipped); the
   recovery sweep computes the **per-shard minimum** and `Node::compact`s below it —
   dropping redundant commands (`Replica::compact`, pruning `by_key`) and
-  truncating the journal (`Journal::truncate` + a persisted watermark). `is_ready`
+  truncating the journal (`Journal::truncate` + a persisted watermark); an applied
+  multi-shard transaction leaves a decision record behind until its other shards
+  have applied it (see M2). `is_ready`
   treats a dependency missing below the watermark as satisfied (a `Commit`'s
   quorum-unioned deps can name a compacted-away transaction). A still-behind or
   partitioned peer holds the min down (and an unheard-from peer blocks compaction)
@@ -828,9 +841,11 @@ backend (sql/fjall). Phases, in order:
         of that shard's straggler, and re-read the other shards alone: it
         could commit what the compacted shard aborted. It now takes the
         decision from that straggler (#305, see M2).
+        A decided multi-shard txn whose shard compacted it on every replica
+        stayed undecided on its other shards, pinning their watermark and
+        backlog; compaction now keeps its decision until every route shard
+        applied it (#286, see M2).
         **Open** (confirmed or plausible, not yet fixed):
-        a decided multi-shard txn whose shard compacted it, with no replica heard
-        from that applied it, stays undecided (liveness, not safety);
         a rejoin (wiped store) forgets the replica's in-flight votes and promises;
         an epoch change can remap a route's keys onto replicas that never
         witnessed an in-flight txn, which then answer "never witnessed".

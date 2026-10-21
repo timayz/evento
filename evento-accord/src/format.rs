@@ -101,6 +101,10 @@ pub enum RecordKind {
     /// The node's clock bound (`Journal::save_clock_bound`): every timestamp
     /// it minted is below these microseconds, as a `u64`.
     ClockBound = 10,
+    /// A compacted multi-shard transaction's decision record
+    /// (`Journal::save_decision`), as a
+    /// [`DecisionRecord`](crate::api::DecisionRecord).
+    Decision = 11,
 }
 
 impl RecordKind {
@@ -116,6 +120,7 @@ impl RecordKind {
             8 => Some(Self::Route),
             9 => Some(Self::Promise),
             10 => Some(Self::ClockBound),
+            11 => Some(Self::Decision),
             _ => None,
         }
     }
@@ -185,6 +190,7 @@ mod tests {
             RecordKind::Route,
             RecordKind::Promise,
             RecordKind::ClockBound,
+            RecordKind::Decision,
         ] {
             let value = (42u64, "hello".to_string());
             let bytes = encode_tagged(kind, &value).unwrap();

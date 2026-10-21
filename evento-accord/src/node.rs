@@ -849,6 +849,16 @@ impl Node {
             .command_count()
     }
 
+    /// How many decision records of compacted multi-shard transactions this
+    /// node keeps, waiting for the transactions' other shards to apply them.
+    /// For tests and observability.
+    pub fn decision_count(&self) -> usize {
+        self.replica
+            .lock()
+            .expect("replica poisoned")
+            .decision_count()
+    }
+
     /// How far `txn` has progressed on this replica, if it holds the command.
     /// For tests and observability.
     pub fn command_status(&self, txn: TxnId) -> Option<Status> {
@@ -1070,6 +1080,7 @@ impl Node {
         commands.sort_by_key(|cmd| (cmd.execute_at, cmd.txn));
         let routes = self.journal.load_routes().await?;
         let promises = self.journal.load_promises().await?;
+        let decisions = self.journal.load_decisions().await?;
         self.restore_clock(&commands).await?;
 
         // Restore the control plane: acceptor state (so a restarted acceptor keeps
@@ -1110,6 +1121,11 @@ impl Node {
             // fences the original coordinator after the restart.
             for (txn, ballot) in promises {
                 replica.restore_promise(txn, ballot);
+            }
+            // The decisions of compacted multi-shard transactions another
+            // shard may still hold undecided.
+            for record in decisions {
+                replica.restore_decision(record);
             }
         }
         // Peers this node had stopped waiting for stay excluded until they
@@ -1162,7 +1178,9 @@ impl Node {
     /// only when that watermark is above what the journal already persisted,
     /// at most once per [`truncate_interval`](NodeConfig::truncate_interval):
     /// the sweep calls this every pass, and a truncate costs the journal a
-    /// write transaction whether or not it has much to delete.
+    /// write transaction whether or not it has much to delete. The decision
+    /// records the compaction leaves are journaled first: until they are,
+    /// the journal is not truncated.
     pub async fn compact(&self, before: Timestamp) {
         let (previous, watermark, newest) = {
             let mut replica = self.replica.lock().expect("replica poisoned");
@@ -1188,11 +1206,93 @@ impl Node {
             }
             due
         };
-        if due && self.journal.truncate(watermark).await.is_ok() {
+        if due && self.save_decisions().await && self.journal.truncate(watermark).await.is_ok() {
             self.note_journal_watermark(watermark);
         }
         if let Some(newest) = newest {
             self.note_compacted_past_absent(newest).await;
+        }
+    }
+
+    /// Journals the decision records the replica has not yet journaled,
+    /// durable before the truncate that deletes their commands. Returns
+    /// whether every one is durable — the truncate waits otherwise, and
+    /// they are retried with it.
+    async fn save_decisions(&self) -> bool {
+        let unsaved = self
+            .replica
+            .lock()
+            .expect("replica poisoned")
+            .unsaved_decisions();
+        if unsaved.is_empty() {
+            return true;
+        }
+        for record in &unsaved {
+            if let Err(err) = self.journal.save_decision(record).await {
+                tracing::warn!(
+                    node = self.id.0,
+                    txn = ?record.txn,
+                    %err,
+                    "cannot stage a decision record; holding the journal truncate back"
+                );
+                return false;
+            }
+        }
+        if let Err(err) = self.journal.flush().await {
+            tracing::warn!(
+                node = self.id.0,
+                %err,
+                "cannot flush decision records; holding the journal truncate back"
+            );
+            return false;
+        }
+        let txns: Vec<TxnId> = unsaved.iter().map(|record| record.txn).collect();
+        self.replica
+            .lock()
+            .expect("replica poisoned")
+            .decisions_saved(&txns);
+        true
+    }
+
+    /// Drops the decision records no route shard needs any more: for every
+    /// route shard but this node's own (which compacted the transaction, so
+    /// every replica counted there applied it), every current replica has
+    /// reported a watermark above the transaction — each applied it, so no
+    /// recovery there will ask for its decision. Reports come from the
+    /// watermark gossip every node sends every other. A replica that never
+    /// reports again (permanently down) keeps its shard's records until it
+    /// leaves the topology.
+    async fn prune_decisions(&self) {
+        let dropped = {
+            let my_shard = self.topology.node_shard(self.id);
+            let watermarks = self
+                .peer_watermarks
+                .lock()
+                .expect("watermarks poisoned")
+                .clone();
+            self.replica
+                .lock()
+                .expect("replica poisoned")
+                .prune_decisions(|record| {
+                    record
+                        .route
+                        .iter()
+                        .filter(|key| Some(self.topology.shard_of(key)) != my_shard)
+                        .flat_map(|key| self.topology.replicas(key))
+                        .all(|node| watermarks.get(&node).is_some_and(|w| *w > record.txn.0))
+                })
+        };
+        if dropped.is_empty() {
+            return;
+        }
+        tracing::debug!(
+            node = self.id.0,
+            records = dropped.len(),
+            "dropped decision records every route shard applied"
+        );
+        // A record the journal keeps is dropped again after a restart.
+        if let Err(err) = self.journal.drop_decisions(&dropped).await {
+            tracing::warn!(node = self.id.0, %err, "cannot drop decision records from the journal");
         }
     }
 
@@ -1665,6 +1765,7 @@ impl Node {
         if let Some(watermark) = watermark {
             self.compact(watermark).await;
         }
+        self.prune_decisions().await;
     }
 
     /// The nodes of this node's shard, itself included.
@@ -2128,10 +2229,15 @@ impl Node {
                     already
                 };
                 if already_applied {
-                    let reply_to = self.replica.lock().expect("replica poisoned").reply_to(txn);
-                    if let Some(reply_to) = reply_to {
-                        out.push((reply_to, Message::Applied { txn }));
-                    }
+                    // Compacted away with a decision record: no coordinator
+                    // is known, so the sender is told.
+                    let reply_to = self
+                        .replica
+                        .lock()
+                        .expect("replica poisoned")
+                        .reply_to(txn)
+                        .unwrap_or(from);
+                    out.push((reply_to, Message::Applied { txn }));
                 } else {
                     out.extend(self.drive_staged().await);
                 }
@@ -4366,6 +4472,12 @@ impl Node {
             .lock()
             .expect("replica poisoned")
             .redundant_before();
+        if !self.save_decisions().await {
+            return Err(self.partial(
+                anyhow::anyhow!("cannot journal the decision records"),
+                &imported,
+            ));
+        }
         if let Err(err) = self
             .keeping_join_hold(contact, self.journal.truncate(floor))
             .await

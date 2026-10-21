@@ -5,7 +5,8 @@
 #![cfg(feature = "accord")]
 
 use evento_accord::{
-    AcceptorRecord, Ballot, CommandState, Journal, Key, NodeId, Status, Timestamp, TxnId,
+    AcceptorRecord, Ballot, CommandState, DecisionRecord, Journal, Key, NodeId, Status, Timestamp,
+    TxnId,
 };
 use evento_core::Event;
 use evento_fjall::FjallJournal;
@@ -238,6 +239,8 @@ async fn routes_and_promises_survive_close_and_reopen_and_truncate() {
         journal.save_route(new, &route).await.unwrap();
         journal.save_promise(old, ballot).await.unwrap();
         journal.save_promise(new, ballot).await.unwrap();
+        journal.save_decision(&decision(old, &route)).await.unwrap();
+        journal.save_decision(&decision(new, &route)).await.unwrap();
         journal.flush().await.unwrap();
     }
     let journal = FjallJournal::open(temp.path()).unwrap();
@@ -248,10 +251,46 @@ async fn routes_and_promises_survive_close_and_reopen_and_truncate() {
     promises.sort_by_key(|(txn, _)| *txn);
     assert_eq!(promises, vec![(old, ballot), (new, ballot)]);
 
-    // Truncated with the commands.
+    let decisions = || async { sorted(journal.load_decisions().await.unwrap()) };
+    assert_eq!(
+        decisions().await,
+        vec![decision(old, &route), decision(new, &route)]
+    );
+
+    // Truncated with the commands — but decision records outlive them,
+    // until dropped.
     journal.truncate(timestamp(200, 0)).await.unwrap();
-    assert_eq!(journal.load_routes().await.unwrap(), vec![(new, route)]);
+    assert_eq!(
+        journal.load_routes().await.unwrap(),
+        vec![(new, route.clone())]
+    );
     assert_eq!(journal.load_promises().await.unwrap(), vec![(new, ballot)]);
+    assert_eq!(
+        decisions().await,
+        vec![decision(old, &route), decision(new, &route)]
+    );
+    journal.drop_decisions(&[old]).await.unwrap();
+    journal.flush().await.unwrap();
+    drop(journal);
+    let journal = FjallJournal::open(temp.path()).unwrap();
+    assert_eq!(
+        journal.load_decisions().await.unwrap(),
+        vec![decision(new, &route)]
+    );
+}
+
+fn decision(txn: TxnId, route: &[Key]) -> DecisionRecord {
+    DecisionRecord {
+        txn,
+        execute_at: timestamp(txn.0.micros + 1, 0),
+        conflict: txn.0.micros % 200 == 100,
+        route: route.to_vec(),
+    }
+}
+
+fn sorted(mut records: Vec<DecisionRecord>) -> Vec<DecisionRecord> {
+    records.sort_by_key(|record| record.txn);
+    records
 }
 
 #[tokio::test]

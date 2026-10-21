@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use evento_core::Event;
 
-use crate::api::{AcceptorRecord, DataStore, Journal};
+use crate::api::{AcceptorRecord, DataStore, DecisionRecord, Journal};
 use crate::clock::{Ballot, NodeId, Timestamp, TxnId};
 use crate::message::{CommandState, Key};
 
@@ -149,6 +149,9 @@ pub struct InMemoryJournal {
     routes: Mutex<HashMap<TxnId, Vec<Key>>>,
     /// Blind recovery promises (see [`Journal::save_promise`]).
     promises: Mutex<HashMap<TxnId, Ballot>>,
+    /// Decision records of compacted multi-shard transactions (see
+    /// [`Journal::save_decision`]) — kept across `truncate`.
+    decisions: Mutex<BTreeMap<TxnId, DecisionRecord>>,
     /// The persisted clock bound (see [`Journal::save_clock_bound`]).
     clock_bound: Mutex<Option<u64>>,
 }
@@ -261,6 +264,32 @@ impl Journal for InMemoryJournal {
             .iter()
             .map(|(&txn, &ballot)| (txn, ballot))
             .collect())
+    }
+
+    async fn save_decision(&self, record: &DecisionRecord) -> anyhow::Result<()> {
+        self.decisions
+            .lock()
+            .expect("journal poisoned")
+            .insert(record.txn, record.clone());
+        Ok(())
+    }
+
+    async fn load_decisions(&self) -> anyhow::Result<Vec<DecisionRecord>> {
+        Ok(self
+            .decisions
+            .lock()
+            .expect("journal poisoned")
+            .values()
+            .cloned()
+            .collect())
+    }
+
+    async fn drop_decisions(&self, txns: &[TxnId]) -> anyhow::Result<()> {
+        let mut decisions = self.decisions.lock().expect("journal poisoned");
+        for txn in txns {
+            decisions.remove(txn);
+        }
+        Ok(())
     }
 
     async fn append_metadata(&self, epoch: u64, layout: &[Vec<NodeId>]) -> anyhow::Result<()> {

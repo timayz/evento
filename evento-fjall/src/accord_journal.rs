@@ -6,8 +6,10 @@
 //! `Node::recover_state`. A multi-shard transaction's route and a recovery
 //! promise for a transaction never witnessed live in the `meta` keyspace under
 //! `route/` / `promise/` + the order-preserving transaction id, staged like a
-//! command and truncated with the commands. The node's clock bound is the `meta`
-//! key `clock_bound`, persisted on its own and never truncated.
+//! command and truncated with the commands. A compacted multi-shard
+//! transaction's decision record lives under `decision/`, staged the same way
+//! but kept by `truncate` until the node drops it. The node's clock bound is the
+//! `meta` key `clock_bound`, persisted on its own and never truncated.
 //!
 //! **Group commit.** [`stage`](Journal::stage) inserts a record without an fsync;
 //! [`flush`](Journal::flush) does a single `persist(SyncAll)` covering every staged
@@ -26,7 +28,9 @@ use async_trait::async_trait;
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 
 use evento_accord::format::{decode_tagged, encode_tagged, RecordKind};
-use evento_accord::{AcceptorRecord, Ballot, CommandState, Journal, Key, NodeId, Timestamp, TxnId};
+use evento_accord::{
+    AcceptorRecord, Ballot, CommandState, DecisionRecord, Journal, Key, NodeId, Timestamp, TxnId,
+};
 
 /// Key under which the truncation watermark is stored in the `meta` keyspace.
 const WATERMARK_KEY: &[u8] = b"redundant_before";
@@ -42,6 +46,9 @@ const ACCEPTOR_PREFIX: &[u8] = b"acc/";
 const ROUTE_PREFIX: &[u8] = b"route/";
 /// Prefix for blind recovery-promise keys (`promise/` + order-preserving txn).
 const PROMISE_PREFIX: &[u8] = b"promise/";
+/// Prefix for decision-record keys (`decision/` + order-preserving txn).
+/// Untouched by `truncate`.
+const DECISION_PREFIX: &[u8] = b"decision/";
 
 /// Builds a `prefix`-namespaced key for `txn`: big-endian `(micros, logical,
 /// node)`, so byte order is timestamp order and truncation can compare keys.
@@ -210,7 +217,8 @@ impl Journal for FjallJournal {
             for key in redundant {
                 commands.remove(key)?;
             }
-            // Routes and blind promises go with the commands.
+            // Routes and blind promises go with the commands; decision
+            // records outlive them.
             for prefix in [ROUTE_PREFIX, PROMISE_PREFIX] {
                 let mut redundant = Vec::new();
                 for guard in meta.prefix(prefix) {
@@ -322,6 +330,45 @@ impl Journal for FjallJournal {
             decode_tagged(RecordKind::Promise, bytes)
         })
         .await
+    }
+
+    async fn save_decision(&self, record: &DecisionRecord) -> anyhow::Result<()> {
+        self.stage_meta(
+            txn_key(DECISION_PREFIX, record.txn),
+            encode_tagged(RecordKind::Decision, record)?,
+        )
+        .await
+    }
+
+    async fn load_decisions(&self) -> anyhow::Result<Vec<DecisionRecord>> {
+        let meta = self.meta.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<DecisionRecord>> {
+            let mut out = Vec::new();
+            for guard in meta.prefix(DECISION_PREFIX) {
+                let (_, value) = guard.into_inner()?;
+                out.push(decode_tagged(RecordKind::Decision, &value)?);
+            }
+            Ok(out)
+        })
+        .await?
+    }
+
+    async fn drop_decisions(&self, txns: &[TxnId]) -> anyhow::Result<()> {
+        let keys: Vec<Vec<u8>> = txns
+            .iter()
+            .map(|txn| txn_key(DECISION_PREFIX, *txn))
+            .collect();
+        let meta = self.meta.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            for key in keys {
+                meta.remove(key)?;
+            }
+            Ok(())
+        })
+        .await??;
+        // Durable with the next flush; a record dropped late is only kept longer.
+        self.dirty.store(true, Ordering::Release);
+        Ok(())
     }
 
     async fn load(&self, txn: TxnId) -> anyhow::Result<Option<CommandState>> {

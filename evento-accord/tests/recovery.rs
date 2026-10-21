@@ -1134,3 +1134,115 @@ async fn recovery_takes_the_decision_from_a_compacted_shards_straggler() {
         assert!(!c.committed(id, txn), "node {id} must not apply its events");
     }
 }
+
+/// Shard B decides its abort, then every replica of it applies the abort and
+/// compacts the transaction away; the Apply never reaches shard A. Returns
+/// the transaction, held `Reading` on shard A with no decision.
+async fn abort_compacted_on_shard_b(c: &Sharded) -> TxnId {
+    let a = c.id_in_shard(0, "a");
+    let b = c.id_in_shard(1, "b");
+    c.nodes[3].write(vec![event(&b, 1)]).await.unwrap();
+    for id in 3..6 {
+        for _ in 0..400 {
+            if c.stores[id].applied_log().len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+    let txn = c.nodes[0]
+        .coordinate_through_commit(vec![event(&a, 1), event(&b, 1)])
+        .await
+        .expect("both shards commit it");
+    // The abort the coordinator decided reaches shard B only.
+    let decider = c.net.sink(NodeId(9));
+    for id in [3, 4, 5] {
+        decider
+            .send(NodeId(id), Message::Apply { txn, commit: false })
+            .await
+            .unwrap();
+    }
+    c.await_applied([3, 4, 5], txn).await;
+    let now = HybridLogicalClock::new(NodeId(9)).now();
+    for id in 3..6 {
+        c.nodes[id].compact(now).await;
+        assert_eq!(c.nodes[id].command_status(txn), None, "compacted away");
+    }
+    txn
+}
+
+/// Recovers `txn` from node 1 and checks shard A settles it as an abort.
+async fn recover_the_abort_on_shard_a(c: &Sharded, txn: TxnId) {
+    let outcome = tokio::time::timeout(Duration::from_secs(10), c.nodes[1].recover(txn))
+        .await
+        .expect("recovery completes")
+        .expect("recovery decides");
+    assert!(outcome.conflict, "shard B's abort stands");
+    c.await_applied(0..3, txn).await;
+    for id in 0..6 {
+        assert!(!c.committed(id, txn), "node {id} must not apply its events");
+    }
+}
+
+/// Every replica of shard B applied the abort and compacted the transaction
+/// away, so no replica that applied it is left to report it. Shard A still
+/// holds it undecided: recovery must learn the abort from shard B's
+/// decision records, not wait forever for an applied replica.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_decided_transaction_recovers_after_its_shard_compacted_it() {
+    let c = Sharded::start();
+    let txn = abort_compacted_on_shard_b(&c).await;
+    recover_the_abort_on_shard_a(&c, txn).await;
+}
+
+/// A decision record outlives a restart: shard B restarted from journals
+/// truncated past the transaction still answers with its abort.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_decision_record_survives_a_restart() {
+    let mut c = Sharded::start();
+    let txn = abort_compacted_on_shard_b(&c).await;
+    for id in 3..6 {
+        assert!(
+            c.journals[id].load(txn).await.unwrap().is_none(),
+            "node {id} truncated the command"
+        );
+        c.restart(id).await;
+        assert_eq!(c.nodes[id].decision_count(), 1, "node {id} kept the record");
+    }
+    recover_the_abort_on_shard_a(&c, txn).await;
+}
+
+/// Once shard A applied the transaction too, its replicas' watermark
+/// reports pass it, and shard B drops its decision records — from memory
+/// and from the journal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_decision_record_is_dropped_once_every_route_shard_passed_it() {
+    let c = Sharded::start();
+    let txn = abort_compacted_on_shard_b(&c).await;
+    for id in 3..6 {
+        assert_eq!(c.nodes[id].decision_count(), 1, "node {id} keeps a record");
+    }
+    recover_the_abort_on_shard_a(&c, txn).await;
+
+    let sweeps: Vec<_> = c.nodes.iter().map(Node::start_recovery).collect();
+    for id in 3..6 {
+        for _ in 0..1_000 {
+            if c.nodes[id].decision_count() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            c.nodes[id].decision_count(),
+            0,
+            "node {id} drops its record"
+        );
+        assert!(
+            c.journals[id].load_decisions().await.unwrap().is_empty(),
+            "node {id} drops the journaled record"
+        );
+    }
+    for sweep in sweeps {
+        sweep.abort();
+    }
+}

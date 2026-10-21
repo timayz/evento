@@ -28,11 +28,11 @@
 //! electorate voting above `t0` rules the fast path out on its own
 //! (`Node::votes_reject_fast_path`).
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use evento_core::Event;
 
-use crate::api::{floor_millis, snapshot_event_size};
+use crate::api::{floor_millis, snapshot_event_size, DecisionRecord};
 use crate::clock::{Ballot, NodeId, Timestamp, TxnId};
 use crate::message::{CommandState, Key, Status};
 
@@ -114,8 +114,23 @@ pub struct Replica {
     /// here, as its coordinator sent it (`Message::Routed`): `keys` above is
     /// only this shard's part, and a recovery must reach every shard the
     /// transaction touches, including one that never witnessed it. Dropped
-    /// with the command below the redundancy watermark.
+    /// with the command below the redundancy watermark — into its decision
+    /// record (`decisions`) when it was applied.
     routes: HashMap<TxnId, Vec<Key>>,
+    /// The decision of every applied multi-shard transaction compacted away
+    /// here while another route shard may still hold it undecided: that
+    /// shard's watermark is its own, and a recovery there needs a replica
+    /// that applied the transaction to learn the decision. Answered as an
+    /// applied command would be — to a recovery, a Commit and an Apply —
+    /// without ever re-creating the command. Below the redundancy
+    /// watermark, so never re-executed (see [`compacted`](Self::compacted)).
+    /// Journaled by the node before the truncate that deletes the command
+    /// (`Journal::save_decision`); dropped once every replica of every other
+    /// route shard has applied it ([`prune_decisions`](Self::prune_decisions)).
+    decisions: BTreeMap<TxnId, DecisionRecord>,
+    /// The records in `decisions` not yet journaled: the node holds back the
+    /// journal truncate until they are.
+    unsaved_decisions: BTreeSet<TxnId>,
 }
 
 impl Default for Replica {
@@ -136,6 +151,8 @@ impl Default for Replica {
             read_results: HashMap::new(),
             unknown_promises: HashMap::new(),
             routes: HashMap::new(),
+            decisions: BTreeMap::new(),
+            unsaved_decisions: BTreeSet::new(),
         }
     }
 }
@@ -748,13 +765,15 @@ impl Replica {
         }
     }
 
-    /// The stored apply outcome for `txn`, if it has already been applied. Lets
-    /// a node answer a late Commit (e.g. from recovery) without re-executing.
+    /// The stored apply outcome for `txn`, if it has already been applied —
+    /// held, or compacted away with a decision record. Lets a node answer a
+    /// late Commit (e.g. from recovery) without re-executing.
     pub fn applied_result(&self, txn: TxnId) -> Option<bool> {
-        self.commands
-            .get(&txn)
-            .filter(|cmd| cmd.status == Status::Applied)
-            .and_then(|cmd| cmd.applied_conflict)
+        match self.commands.get(&txn) {
+            Some(cmd) if cmd.status == Status::Applied => cmd.applied_conflict,
+            Some(_) => None,
+            None => self.decisions.get(&txn).map(|record| record.conflict),
+        }
     }
 
     /// Handles Recover under `ballot`: promises the ballot and reports the
@@ -830,10 +849,31 @@ impl Replica {
         events: Vec<Event>,
     ) -> Result<RoutedRecovery, Ballot> {
         if self.compacted(txn) {
-            return Ok(RoutedRecovery::NotWitnessed { redundant: true });
+            return Ok(self.recorded(txn));
         }
         self.recover(txn, ballot, keys, events)
             .map(RoutedRecovery::Known)
+    }
+
+    /// What a replica answers a recovery of a [`compacted`](Self::compacted)
+    /// transaction with: its decision record as an applied report — the
+    /// decision, its execution timestamp, nothing else — or, without one,
+    /// that it is below the watermark.
+    fn recorded(&self, txn: TxnId) -> RoutedRecovery {
+        match self.decisions.get(&txn) {
+            Some(record) => RoutedRecovery::Known(RecoverState {
+                known: true,
+                status: Status::Applied,
+                accepted: Ballot(txn.0),
+                execute_at: record.execute_at,
+                deps: Vec::new(),
+                superseding_rejects: false,
+                wait: false,
+                keys: Vec::new(),
+                events: Vec::new(),
+            }),
+            None => RoutedRecovery::NotWitnessed { redundant: true },
+        }
     }
 
     /// Handles a **routed** recovery under `ballot`: like
@@ -864,9 +904,10 @@ impl Replica {
             }
         }
         // Below the watermark an absent command may have been applied and
-        // compacted: "not held" is no proof of "never witnessed".
+        // compacted: "not held" is no proof of "never witnessed". A decision
+        // record still tells how it ended.
         if txn.0 < self.redundant_before {
-            return Ok(RoutedRecovery::NotWitnessed { redundant: true });
+            return Ok(self.recorded(txn));
         }
         self.unknown_promises.insert(txn, ballot);
         Ok(RoutedRecovery::NotWitnessed { redundant: false })
@@ -917,9 +958,13 @@ impl Replica {
         self.routes.remove(&txn);
     }
 
-    /// `txn`'s route, if it is a multi-shard transaction held here.
+    /// `txn`'s route, if it is a multi-shard transaction held here or
+    /// recorded as decided.
     pub fn route(&self, txn: TxnId) -> Option<Vec<Key>> {
-        self.routes.get(&txn).cloned()
+        self.routes
+            .get(&txn)
+            .or_else(|| self.decisions.get(&txn).map(|record| &record.route))
+            .cloned()
     }
 
     /// Restores a journaled route on restart.
@@ -927,6 +972,53 @@ impl Replica {
         if txn.0 >= self.redundant_before {
             self.routes.insert(txn, route);
         }
+    }
+
+    /// Restores a journaled decision record on restart. Ignored for a
+    /// transaction held here: the journal still had its command (the
+    /// truncate lagged), and compacting it records the decision again.
+    pub fn restore_decision(&mut self, record: DecisionRecord) {
+        if !self.commands.contains_key(&record.txn) {
+            self.unsaved_decisions.remove(&record.txn);
+            self.decisions.insert(record.txn, record);
+        }
+    }
+
+    /// The decision records not yet journaled, for the node to stage.
+    pub fn unsaved_decisions(&self) -> Vec<DecisionRecord> {
+        self.unsaved_decisions
+            .iter()
+            .filter_map(|txn| self.decisions.get(txn).cloned())
+            .collect()
+    }
+
+    /// Marks `txns`' decision records as journaled.
+    pub fn decisions_saved(&mut self, txns: &[TxnId]) {
+        for txn in txns {
+            self.unsaved_decisions.remove(txn);
+        }
+    }
+
+    /// Drops every decision record `done` says is no longer needed — every
+    /// route shard applied its transaction — and returns their transactions,
+    /// for the node to drop from the journal.
+    pub fn prune_decisions(&mut self, done: impl Fn(&DecisionRecord) -> bool) -> Vec<TxnId> {
+        let dropped: Vec<TxnId> = self
+            .decisions
+            .values()
+            .filter(|record| done(record))
+            .map(|record| record.txn)
+            .collect();
+        for txn in &dropped {
+            self.decisions.remove(txn);
+            self.unsaved_decisions.remove(txn);
+        }
+        dropped
+    }
+
+    /// How many decision records this replica keeps.
+    pub fn decision_count(&self) -> usize {
+        self.decisions.len()
     }
 
     /// The ballot promised for `txn` while never witnessing it, if any — what
@@ -1422,6 +1514,9 @@ impl Replica {
     /// everything below `before`). Monotonic and idempotent. Returns the newest
     /// `t0` dropped, if any command was: what a peer that never applied it can no
     /// longer get through anti-entropy.
+    ///
+    /// A dropped multi-shard transaction leaves a decision record behind (see
+    /// `decisions`), unsaved until the node journals it.
     pub fn compact(&mut self, before: Timestamp) -> Option<Timestamp> {
         let safe = self.applied_through(before);
         if safe <= self.redundant_before {
@@ -1436,7 +1531,20 @@ impl Replica {
         let newest = drop.iter().map(|txn| txn.0).max();
         for txn in &drop {
             self.read_results.remove(txn);
+            let route = self.routes.remove(txn);
             if let Some(cmd) = self.commands.remove(txn) {
+                if let (Some(route), Some(conflict)) = (route, cmd.applied_conflict) {
+                    self.decisions.insert(
+                        *txn,
+                        DecisionRecord {
+                            txn: *txn,
+                            execute_at: cmd.execute_at,
+                            conflict,
+                            route,
+                        },
+                    );
+                    self.unsaved_decisions.insert(*txn);
+                }
                 for key in &cmd.keys {
                     if let Some(set) = self.by_key.get_mut(key) {
                         set.remove(txn);
@@ -2118,6 +2226,128 @@ mod tests {
         assert_eq!(replica.unknown_promise(t), None);
     }
 
+    /// A routed transaction compacted away leaves its decision behind: a
+    /// recovery hears it as applied, a Commit and an Apply as already
+    /// applied — and nothing re-creates the command. A single-shard one
+    /// leaves nothing (no other shard can need it).
+    #[test]
+    fn a_compacted_routed_transaction_keeps_its_decision() {
+        let mut replica = Replica::new();
+        let key = Key("k".into());
+        let route = vec![key.clone(), Key("other".into())];
+        let (routed, single) = (txn(5), txn(6));
+        apply(&mut replica, routed, &key, 1);
+        assert!(replica.set_route(routed, &route));
+        apply(&mut replica, single, &key, 2);
+        replica.compact(txn(10).0);
+
+        assert_eq!(replica.decision_count(), 1, "only the routed one");
+        assert!(replica.compacted(routed));
+        assert_eq!(replica.applied_result(routed), Some(false));
+        assert_eq!(replica.applied_result(single), None);
+        assert_eq!(replica.route(routed), Some(route.clone()));
+        assert_eq!(
+            replica.unsaved_decisions(),
+            vec![DecisionRecord {
+                txn: routed,
+                execute_at: routed.0,
+                conflict: false,
+                route: route.clone(),
+            }]
+        );
+        replica.decisions_saved(&[routed]);
+        assert!(replica.unsaved_decisions().is_empty());
+
+        for report in [
+            replica.recover_routed(routed, ballot(50, 1), vec![], vec![]),
+            replica.recover_unrouted(routed, ballot(50, 1), vec![key.clone()], vec![]),
+        ] {
+            let Ok(RoutedRecovery::Known(state)) = report else {
+                panic!("a recorded decision is reported");
+            };
+            assert_eq!(state.status, Status::Applied);
+            assert_eq!(state.execute_at, routed.0);
+            assert!(state.events.is_empty() && state.deps.is_empty());
+        }
+        assert!(matches!(
+            replica.recover_routed(single, ballot(50, 1), vec![], vec![]),
+            Ok(RoutedRecovery::NotWitnessed { redundant: true })
+        ));
+        replica.commit(
+            routed,
+            routed.0,
+            vec![],
+            vec![event("k", 1)],
+            vec![key.clone()],
+            NodeId(0),
+        );
+        replica.record_decision(routed, true);
+        assert_eq!(replica.status(routed), None, "nothing was re-created");
+        assert_eq!(replica.applied_result(routed), Some(false));
+
+        assert_eq!(replica.prune_decisions(|_| false), Vec::<TxnId>::new());
+        assert_eq!(replica.prune_decisions(|r| r.txn == routed), vec![routed]);
+        assert_eq!(replica.decision_count(), 0);
+        assert_eq!(replica.applied_result(routed), None);
+    }
+
+    /// An invalidated routed transaction's record keeps `INVALIDATED_AT`, so
+    /// a recovery hearing it still invalidates; a restored record is kept
+    /// unless the command itself was restored.
+    #[test]
+    fn decision_records_keep_an_invalidation_and_restore() {
+        let mut replica = Replica::new();
+        let key = Key("k".into());
+        let route = vec![key.clone(), Key("other".into())];
+        let t = txn(5);
+        replica
+            .preaccept(t, vec![key.clone()], vec![event("k", 1)])
+            .unwrap();
+        assert!(replica.set_route(t, &route));
+        assert!(replica.invalidate(t));
+        replica.compact(txn(10).0);
+        let Ok(RoutedRecovery::Known(state)) =
+            replica.recover_routed(t, ballot(50, 1), vec![], vec![])
+        else {
+            panic!("a recorded decision is reported");
+        };
+        assert_eq!(state.execute_at, crate::message::INVALIDATED_AT);
+        assert_eq!(replica.applied_result(t), Some(true));
+
+        let record = replica.unsaved_decisions().remove(0);
+        let mut restarted = Replica::new();
+        restarted.compact(txn(10).0);
+        restarted.restore_decision(record.clone());
+        assert_eq!(restarted.decision_count(), 1);
+        assert!(
+            restarted.unsaved_decisions().is_empty(),
+            "it came from the journal"
+        );
+
+        // The journal still held the command (its truncate lagged): the
+        // command is restored, and compacting it records the decision anew.
+        let mut lagging = Replica::new();
+        lagging.restore(applied_command(t, &key));
+        lagging.restore_decision(record);
+        assert_eq!(lagging.decision_count(), 0, "the command is held");
+    }
+
+    fn applied_command(t: TxnId, key: &Key) -> CommandState {
+        CommandState {
+            txn: t,
+            status: Status::Applied,
+            promised: Ballot(t.0),
+            accepted: Ballot(t.0),
+            execute_at: t.0,
+            deps: vec![],
+            keys: vec![key.clone()],
+            events: vec![],
+            reply_to: NodeId(0),
+            decision: Some(true),
+            applied_conflict: Some(false),
+        }
+    }
+
     /// An invalidated command is applied as an abort without executing, is
     /// recognizable by its timestamp, and is no evidence in another
     /// transaction's recovery: its deps were never agreed.
@@ -2160,11 +2390,14 @@ mod tests {
         replica.commit(x, x.0, vec![], vec![event("k", 1)], vec![], NodeId(0));
         assert!(!replica.invalidate(x));
 
-        // The route is dropped with the command.
+        // The route leaves with the command, into its decision record.
         replica.record_decision(x, true);
         assert_eq!(replica.next_apply().expect("ready").txn, x);
         replica.mark_applied(x, false);
         replica.compact(txn(30).0);
+        assert!(replica.routes.is_empty());
+        assert_eq!(replica.decision_count(), 1);
+        replica.prune_decisions(|_| true);
         assert_eq!(replica.route(t), None);
     }
 
