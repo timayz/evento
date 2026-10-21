@@ -47,6 +47,22 @@ pub struct Replica {
     /// applied state accumulates between compactions. Kept in lockstep with
     /// `commands` (an entry is present iff its status is Committed or Reading).
     pending: BTreeSet<(Timestamp, TxnId)>,
+    /// The entries of `pending` not known to be blocked: what
+    /// [`next_apply`](Replica::next_apply)/[`next_read`](Replica::next_read)
+    /// scan. A pending command found waiting on a dependency moves to
+    /// `blocked` and is skipped — not re-checked — until that dependency
+    /// changes, so a replica that fell behind (thousands of committed commands
+    /// waiting on what it missed) does not re-walk every waiter's dependencies
+    /// on every message. `pending` is exactly `runnable` plus the commands in
+    /// `blocked`.
+    runnable: BTreeSet<(Timestamp, TxnId)>,
+    /// Each pending command known not to be ready, with the dependency it
+    /// waits on (the first unsatisfied one). It returns to `runnable` when
+    /// that dependency's state changes or the redundancy watermark passes it
+    /// ([`wake`](Replica::wake)) — the only events that can satisfy it.
+    blocked: HashMap<TxnId, TxnId>,
+    /// `blocked`, inverted: the commands waiting on each dependency.
+    waiters: HashMap<TxnId, HashSet<TxnId>>,
     /// Redundancy watermark: every transaction with `t0` below this has been
     /// applied on every replica, so it is dropped from `commands`/`by_key` and a
     /// dependency below it counts as already satisfied (its effect is in the data
@@ -104,6 +120,9 @@ impl Default for Replica {
             commands: HashMap::new(),
             by_key: HashMap::new(),
             pending: BTreeSet::new(),
+            runnable: BTreeSet::new(),
+            blocked: HashMap::new(),
+            waiters: HashMap::new(),
             redundant_before: Timestamp::MIN,
             applying: HashSet::new(),
             unapplied_bounds: HashMap::new(),
@@ -147,6 +166,12 @@ fn fits_page(
 ) -> bool {
     taken == 0 || (count + events <= usize::from(max_events) && size + bytes <= max_bytes)
 }
+
+/// Largest execution queue whose scans debug builds cross-check against a
+/// full scan (the pre-index algorithm). Past it the check is skipped: it costs
+/// what the index saves, and a test of a replica that fell far behind would
+/// measure the check instead of the replica.
+const CROSS_CHECK_LIMIT: usize = 64;
 
 /// Whether a command at `status` is awaiting execution (in the `pending` queue):
 /// its execution order is final but it has not been applied yet.
@@ -293,18 +318,64 @@ impl Replica {
     fn insert(&mut self, cmd: CommandState) {
         if let Some(old) = self.commands.get(&cmd.txn) {
             if awaiting_execution(old.status) {
-                self.pending.remove(&(old.execute_at, old.txn));
+                let at = old.execute_at;
+                self.leave_queue(at, cmd.txn);
             }
         }
         for key in &cmd.keys {
             self.by_key.entry(key.clone()).or_default().insert(cmd.txn);
         }
         if awaiting_execution(cmd.status) {
-            self.pending.insert((cmd.execute_at, cmd.txn));
+            self.enter_queue(cmd.execute_at, cmd.txn);
         }
         let txn = cmd.txn;
         self.commands.insert(txn, cmd);
         self.reindex_unapplied(txn);
+        self.wake(txn);
+    }
+
+    /// Adds `txn` to the execution queue at `at`, as runnable.
+    fn enter_queue(&mut self, at: Timestamp, txn: TxnId) {
+        self.pending.insert((at, txn));
+        self.runnable.insert((at, txn));
+    }
+
+    /// Removes `txn` (queued at `at`) from the execution queue, runnable or
+    /// blocked.
+    fn leave_queue(&mut self, at: Timestamp, txn: TxnId) {
+        self.pending.remove(&(at, txn));
+        self.runnable.remove(&(at, txn));
+        if let Some(dep) = self.blocked.remove(&txn) {
+            if let Some(waiting) = self.waiters.get_mut(&dep) {
+                waiting.remove(&txn);
+                if waiting.is_empty() {
+                    self.waiters.remove(&dep);
+                }
+            }
+        }
+    }
+
+    /// Parks the pending `txn` (queued at `at`) until `dep`, a dependency it
+    /// waits on, changes.
+    fn block(&mut self, at: Timestamp, txn: TxnId, dep: TxnId) {
+        self.runnable.remove(&(at, txn));
+        self.blocked.insert(txn, dep);
+        self.waiters.entry(dep).or_default().insert(txn);
+    }
+
+    /// `txn`'s state changed (it was inserted, committed, applied or
+    /// invalidated, or the watermark passed it): every command parked on it
+    /// is runnable again, to be re-checked by the next scan.
+    fn wake(&mut self, txn: TxnId) {
+        let Some(waiting) = self.waiters.remove(&txn) else {
+            return;
+        };
+        for waiter in waiting {
+            if self.blocked.remove(&waiter).is_some() {
+                let at = self.commands[&waiter].execute_at;
+                self.runnable.insert((at, waiter));
+            }
+        }
     }
 
     /// Re-derives `txn`'s entry in the un-applied indexes from its current
@@ -541,6 +612,7 @@ impl Replica {
             cmd.status = Status::Accepted;
             cmd.execute_at = execute_at;
             self.index_keys(txn, &keys);
+            self.wake(txn);
         } else {
             if let Some(&promised) = self.unknown_promises.get(&txn) {
                 if ballot < promised {
@@ -618,11 +690,13 @@ impl Replica {
                 cmd.events = events;
             }
             // Newly executable: enter the execution queue at its final order.
-            self.pending.insert((execute_at, txn));
+            self.enter_queue(execute_at, txn);
             if events_attached {
                 // Late-attached events can lower the watermark bound.
                 self.reindex_unapplied(txn);
             }
+            // Committed: what waits on it may now order before or after it.
+            self.wake(txn);
         } else {
             self.insert(CommandState {
                 txn,
@@ -769,6 +843,7 @@ impl Replica {
         cmd.events = Vec::new();
         self.read_results.remove(&txn);
         self.reindex_unapplied(txn);
+        self.wake(txn);
         true
     }
 
@@ -877,9 +952,15 @@ impl Replica {
 
         // Order by (execute_at, txn): a unique global total order.
         let here = (cmd.execute_at, cmd.txn);
-        cmd.deps.iter().all(|dep| match self.commands.get(dep) {
+        cmd.deps.iter().all(|dep| self.dep_satisfied(here, *dep))
+    }
+
+    /// Whether `dep` no longer holds back a command at order `here`: it is
+    /// applied, or committed to execute after `here`.
+    fn dep_satisfied(&self, here: (Timestamp, TxnId), dep: TxnId) -> bool {
+        match self.commands.get(&dep) {
             Some(d) if d.status == Status::Applied => true,
-            Some(d) if d.status >= Status::Committed && (d.execute_at, *dep) > here => true,
+            Some(d) if d.status >= Status::Committed && (d.execute_at, dep) > here => true,
             // A dependency we no longer hold but that is below the redundancy
             // watermark was applied here and garbage-collected: it orders before
             // this transaction and its effect is already in the data store. (A
@@ -887,7 +968,43 @@ impl Replica {
             // legitimately name a transaction we have already compacted away.)
             None if dep.0 < self.redundant_before => true,
             _ => false,
-        })
+        }
+    }
+
+    /// The first dependency still holding back the pending `txn`, if any —
+    /// [`is_ready`](Self::is_ready) is its absence.
+    fn first_unsatisfied(&self, txn: TxnId) -> Option<TxnId> {
+        let cmd = &self.commands[&txn];
+        let here = (cmd.execute_at, cmd.txn);
+        cmd.deps
+            .iter()
+            .copied()
+            .find(|&dep| !self.dep_satisfied(here, dep))
+    }
+
+    /// The lowest-order runnable command that `eligible` accepts and whose
+    /// dependencies are satisfied. Every eligible command found waiting on a
+    /// dependency on the way is parked in `blocked`, so later scans skip it
+    /// until that dependency changes.
+    fn next_runnable(&mut self, eligible: impl Fn(&Self, TxnId) -> bool) -> Option<TxnId> {
+        let mut found = None;
+        let mut parked = Vec::new();
+        for &(at, txn) in &self.runnable {
+            if !eligible(self, txn) {
+                continue;
+            }
+            match self.first_unsatisfied(txn) {
+                None => {
+                    found = Some(txn);
+                    break;
+                }
+                Some(dep) => parked.push((at, txn, dep)),
+            }
+        }
+        for (at, txn, dep) in parked {
+            self.block(at, txn, dep);
+        }
+        found
     }
 
     /// Picks the lowest-order committed transaction that is ready to read and has
@@ -895,12 +1012,25 @@ impl Replica {
     /// blocking dependents until applied. Decided transactions go through
     /// [`next_apply`](Replica::next_apply) instead.
     pub fn next_read(&mut self) -> Option<Ready> {
-        // The `pending` queue is ordered by `(execute_at, txn)`, so the first
-        // entry that is ready and undecided is the lowest-order one to read.
-        let txn = self.pending.iter().map(|&(_, txn)| txn).find(|&txn| {
-            let cmd = &self.commands[&txn];
-            cmd.status == Status::Committed && cmd.decision.is_none() && self.is_ready(txn)
-        })?;
+        // The queue is ordered by `(execute_at, txn)`, so the first entry that
+        // is ready and undecided is the lowest-order one to read. A blocked
+        // entry is not ready, so scanning only the runnable ones finds it too.
+        let undecided = |replica: &Self, txn: TxnId| {
+            let cmd = &replica.commands[&txn];
+            cmd.status == Status::Committed && cmd.decision.is_none()
+        };
+        let txn = self.next_runnable(undecided);
+        debug_assert!(
+            self.pending.len() > CROSS_CHECK_LIMIT
+                || txn
+                    == self
+                        .pending
+                        .iter()
+                        .map(|&(_, txn)| txn)
+                        .find(|&txn| undecided(self, txn) && self.is_ready(txn)),
+            "next_read diverged from a full scan of the execution queue"
+        );
+        let txn = txn?;
 
         let cmd = &self.commands[&txn];
         let ready = Ready {
@@ -957,11 +1087,21 @@ impl Replica {
         // never ready either, so the old full scan would have skipped it too.)
         // A transaction already handed out (its apply is in flight outside the
         // lock) is skipped, so two concurrent drivers cannot double-apply it.
-        let txn = self.pending.iter().map(|&(_, txn)| txn).find(|&txn| {
-            !self.applying.contains(&txn)
-                && self.commands[&txn].decision.is_some()
-                && self.is_ready(txn)
-        })?;
+        let decided = |replica: &Self, txn: TxnId| {
+            !replica.applying.contains(&txn) && replica.commands[&txn].decision.is_some()
+        };
+        let txn = self.next_runnable(decided);
+        debug_assert!(
+            self.pending.len() > CROSS_CHECK_LIMIT
+                || txn
+                    == self
+                        .pending
+                        .iter()
+                        .map(|&(_, txn)| txn)
+                        .find(|&txn| decided(self, txn) && self.is_ready(txn)),
+            "next_apply diverged from a full scan of the execution queue"
+        );
+        let txn = txn?;
 
         self.applying.insert(txn);
         let cmd = &self.commands[&txn];
@@ -1002,8 +1142,9 @@ impl Replica {
             let at = cmd.execute_at;
             cmd.status = Status::Applied;
             cmd.applied_conflict = Some(conflict);
-            self.pending.remove(&(at, txn));
+            self.leave_queue(at, txn);
             self.reindex_unapplied(txn);
+            self.wake(txn);
         }
     }
 
@@ -1202,6 +1343,13 @@ impl Replica {
         !self.unapplied_by_t0.is_empty()
     }
 
+    /// Whether `txn` is committed here but known to be waiting on a
+    /// dependency (see `blocked`): it is past consensus, and only that
+    /// dependency's progress — not its own recovery — lets it execute.
+    pub fn is_blocked(&self, txn: TxnId) -> bool {
+        self.blocked.contains_key(&txn)
+    }
+
     /// The largest watermark `<= cutoff` that is *locally* safe: no transaction
     /// this replica holds below the result is still un-applied. (Below it, every
     /// command here is `Applied`, so its effect is durable in the data store.)
@@ -1250,6 +1398,16 @@ impl Replica {
         self.unknown_promises.retain(|txn, _| txn.0 >= safe);
         self.routes.retain(|txn, _| txn.0 >= safe);
         self.redundant_before = safe;
+        // A dependency below the watermark counts as satisfied, held or not.
+        let passed: Vec<TxnId> = self
+            .waiters
+            .keys()
+            .copied()
+            .filter(|dep| dep.0 < safe)
+            .collect();
+        for dep in passed {
+            self.wake(dep);
+        }
         newest
     }
 }
@@ -1451,6 +1609,120 @@ mod tests {
             .next_apply()
             .expect("D applies despite its dependency C being compacted away");
         assert_eq!(ready.txn, d);
+    }
+
+    /// A decided command waiting on a dependency this replica never received
+    /// is parked — later scans skip it — until anti-entropy imports that
+    /// dependency, which makes it applicable again.
+    #[test]
+    fn a_command_parked_on_a_missing_dependency_runs_once_it_is_imported() {
+        let mut replica = Replica::new();
+        let key = Key("k".into());
+        let (a, b) = (txn(10), txn(20));
+        replica.commit(
+            b,
+            b.0,
+            vec![a],
+            vec![event("k", 2)],
+            vec![key.clone()],
+            NodeId(0),
+        );
+        replica.record_decision(b, true);
+        assert!(replica.next_apply().is_none(), "B waits for A");
+        assert!(replica.is_blocked(b));
+
+        let imported = CommandState {
+            txn: a,
+            status: Status::Applied,
+            promised: Ballot(a.0),
+            accepted: Ballot(a.0),
+            execute_at: a.0,
+            deps: Vec::new(),
+            keys: vec![key],
+            events: vec![event("k", 1)],
+            reply_to: NodeId(0),
+            decision: Some(true),
+            applied_conflict: Some(false),
+        };
+        assert!(replica.import_applied(imported));
+        assert!(!replica.is_blocked(b));
+        assert_eq!(replica.next_apply().expect("B is ready").txn, b);
+    }
+
+    /// The same on the read side: an undecided command parked on a missing
+    /// dependency is read once that dependency is imported.
+    #[test]
+    fn an_undecided_command_parked_on_a_missing_dependency_is_read_once_it_is_imported() {
+        let mut replica = Replica::new();
+        let key = Key("k".into());
+        let (a, b) = (txn(10), txn(20));
+        replica.commit(
+            b,
+            b.0,
+            vec![a],
+            vec![event("k", 2)],
+            vec![key.clone()],
+            NodeId(0),
+        );
+        assert!(replica.next_read().is_none(), "B waits for A");
+        assert!(replica.is_blocked(b));
+
+        replica.commit(a, a.0, vec![], vec![event("k", 1)], vec![key], NodeId(0));
+        replica.record_decision(a, true);
+        assert_eq!(replica.next_apply().expect("A is ready").txn, a);
+        replica.mark_applied(a, false);
+        assert_eq!(replica.next_read().expect("B is ready").txn, b);
+    }
+
+    /// A parked command whose dependency then commits to execute *after* it
+    /// no longer waits for that dependency.
+    #[test]
+    fn a_command_parked_on_a_dependency_that_commits_after_it_runs() {
+        let mut replica = Replica::new();
+        let key = Key("k".into());
+        let (a, b) = (txn(10), txn(20));
+        replica
+            .preaccept(a, vec![key.clone()], vec![event("k", 1)])
+            .unwrap();
+        replica.commit(
+            b,
+            b.0,
+            vec![a],
+            vec![event("k", 2)],
+            vec![key.clone()],
+            NodeId(0),
+        );
+        replica.record_decision(b, true);
+        assert!(replica.next_apply().is_none(), "B waits for A's order");
+        assert!(replica.is_blocked(b));
+
+        // A's slow path raised it past B.
+        replica.commit(
+            a,
+            txn(30).0,
+            vec![b],
+            vec![event("k", 1)],
+            vec![key],
+            NodeId(0),
+        );
+        assert_eq!(replica.next_apply().expect("B is ready").txn, b);
+    }
+
+    /// A parked command whose missing dependency the watermark then passes —
+    /// every replica applied it, and it was compacted — runs.
+    #[test]
+    fn a_command_parked_on_a_dependency_the_watermark_passes_runs() {
+        let mut replica = Replica::new();
+        let key = Key("k".into());
+        let (a, b) = (txn(10), txn(20));
+        replica.commit(b, b.0, vec![a], vec![event("k", 2)], vec![key], NodeId(0));
+        replica.record_decision(b, true);
+        assert!(replica.next_apply().is_none(), "B waits for A");
+        assert!(replica.is_blocked(b));
+
+        replica.compact(txn(15).0);
+        assert!(!replica.is_blocked(b));
+        assert_eq!(replica.next_apply().expect("B is ready").txn, b);
     }
 
     /// A replica that first learns a transaction via Accept (it missed
