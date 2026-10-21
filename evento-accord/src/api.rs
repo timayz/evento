@@ -254,6 +254,24 @@ pub trait Journal: Send + Sync + 'static {
         Ok(Vec::new())
     }
 
+    /// Durably persists this node's **clock bound**: every timestamp it has
+    /// minted (transaction ids, ballots) is below `micros`. Durable by the
+    /// time it returns — the node raises it before minting past it, and a
+    /// restart starts the clock from it ([`load_clock_bound`](Journal::load_clock_bound)),
+    /// so a restarted node never mints an id it used before, not even after
+    /// its wall clock stepped back. Only ever raised; survives
+    /// [`truncate`](Journal::truncate). The default is a no-op (a restarted
+    /// node then starts its clock past its own journaled transactions only).
+    async fn save_clock_bound(&self, micros: u64) -> anyhow::Result<()> {
+        let _ = micros;
+        Ok(())
+    }
+
+    /// The persisted clock bound, if any. The default returns none.
+    async fn load_clock_bound(&self) -> anyhow::Result<Option<u64>> {
+        Ok(None)
+    }
+
     /// Loads the persisted state for `txn`, if any.
     async fn load(&self, txn: TxnId) -> anyhow::Result<Option<CommandState>>;
 

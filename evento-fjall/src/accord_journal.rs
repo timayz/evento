@@ -6,7 +6,8 @@
 //! `Node::recover_state`. A multi-shard transaction's route and a recovery
 //! promise for a transaction never witnessed live in the `meta` keyspace under
 //! `route/` / `promise/` + the order-preserving transaction id, staged like a
-//! command and truncated with the commands.
+//! command and truncated with the commands. The node's clock bound is the `meta`
+//! key `clock_bound`, persisted on its own and never truncated.
 //!
 //! **Group commit.** [`stage`](Journal::stage) inserts a record without an fsync;
 //! [`flush`](Journal::flush) does a single `persist(SyncAll)` covering every staged
@@ -31,6 +32,8 @@ use evento_accord::{AcceptorRecord, Ballot, CommandState, Journal, Key, NodeId, 
 const WATERMARK_KEY: &[u8] = b"redundant_before";
 /// Meta key under which the rejoin bounds are stored.
 const REJOIN_BOUNDS_KEY: &[u8] = b"rejoin_above";
+/// Meta key under which the node's clock bound is stored.
+const CLOCK_BOUND_KEY: &[u8] = b"clock_bound";
 /// Prefix for metadata-log entry keys (`mlog/` + 8-byte big-endian epoch).
 const METADATA_PREFIX: &[u8] = b"mlog/";
 /// Prefix for acceptor-state keys (`acc/` + 8-byte big-endian epoch).
@@ -266,6 +269,28 @@ impl Journal for FjallJournal {
         match bytes {
             Some(bytes) => Ok(decode_tagged(RecordKind::RejoinBounds, &bytes)?),
             None => Ok(Vec::new()),
+        }
+    }
+
+    async fn save_clock_bound(&self, micros: u64) -> anyhow::Result<()> {
+        let value = encode_tagged(RecordKind::ClockBound, &micros)?;
+        let meta = self.meta.clone();
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            meta.insert(CLOCK_BOUND_KEY, value)?;
+            db.persist(PersistMode::SyncAll)?;
+            Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    async fn load_clock_bound(&self) -> anyhow::Result<Option<u64>> {
+        let meta = self.meta.clone();
+        let bytes = tokio::task::spawn_blocking(move || meta.get(CLOCK_BOUND_KEY)).await??;
+        match bytes {
+            Some(bytes) => Ok(Some(decode_tagged(RecordKind::ClockBound, &bytes)?)),
+            None => Ok(None),
         }
     }
 

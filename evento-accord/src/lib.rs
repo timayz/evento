@@ -50,7 +50,7 @@ pub use group::{GroupHost, RejoinHandler};
 pub use message::{CommandState, Key, Message, Status};
 pub use metrics::{Metrics, MetricsSnapshot};
 pub use node::{
-    BacklogAtCap, CommandTooLarge, CommitOutcome, Node, NodeConfig, PartialSnapshot,
+    BacklogAtCap, CommandTooLarge, CommitOutcome, Node, NodeClosed, NodeConfig, PartialSnapshot,
     RejoinRequired, MAX_COMMAND_BYTES,
 };
 pub use store::{AppliedEntry, InMemoryDataStore, InMemoryJournal};

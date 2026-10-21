@@ -252,6 +252,20 @@ impl std::fmt::Display for RejoinRequired {
 
 impl std::error::Error for RejoinRequired {}
 
+/// The node was closed by its host ([`GroupHost::close`](crate::GroupHost::close)):
+/// it mints no timestamps any more, so it coordinates nothing — the group's
+/// reopened node does. Returned through `anyhow`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeClosed;
+
+impl std::fmt::Display for NodeClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("this node was closed by its host")
+    }
+}
+
+impl std::error::Error for NodeClosed {}
+
 /// [`Node::join`] failed after at least one snapshot page was installed, so
 /// the store holds a prefix no other contact can complete: a page that
 /// overlaps existing events is skipped whole as an idempotent re-apply, which
@@ -578,6 +592,15 @@ type SyncInbox = Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<SyncPayload>>>>;
 pub struct Node {
     id: NodeId,
     clock: Arc<HybridLogicalClock>,
+    /// Every timestamp this node has minted is below these microseconds, and
+    /// the journal holds them ([`Journal::save_clock_bound`]); raised by
+    /// [`mint`](Node::mint) before a stamp reaches them. 0 until the first.
+    clock_bound: Arc<AtomicU64>,
+    /// Serializes raising [`clock_bound`](Self::clock_bound), and
+    /// [`retire`](Node::retire) against it.
+    clock_bound_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Set once this node's host closed it: it mints nothing more.
+    retired: Arc<AtomicBool>,
     topology: Arc<dyn Topology>,
     sink: Arc<dyn MessageSink>,
     datastore: Arc<dyn DataStore>,
@@ -698,6 +721,9 @@ impl Node {
         Self {
             id,
             clock,
+            clock_bound: Arc::new(AtomicU64::new(0)),
+            clock_bound_lock: Arc::new(tokio::sync::Mutex::new(())),
+            retired: Arc::new(AtomicBool::new(false)),
             topology,
             sink,
             datastore,
@@ -994,6 +1020,7 @@ impl Node {
         commands.sort_by_key(|cmd| (cmd.execute_at, cmd.txn));
         let routes = self.journal.load_routes().await?;
         let promises = self.journal.load_promises().await?;
+        self.restore_clock(&commands).await?;
 
         // Restore the control plane: acceptor state (so a restarted acceptor keeps
         // its promised ballots — Paxos crash-safety) and the metadata log (so the
@@ -2772,7 +2799,7 @@ impl Node {
         }
 
         let keys = Self::keys_of(&events);
-        let txn = TxnId(self.clock.now());
+        let txn = TxnId(self.mint().await?);
         self.coordinating
             .lock()
             .expect("coordinating poisoned")
@@ -2822,7 +2849,7 @@ impl Node {
     pub async fn read_barrier(&self, key: Key) -> anyhow::Result<()> {
         let replicas = self.topology.replicas(&key);
         let slow_q = self.topology.slow_quorum(&key);
-        let t0 = self.clock.now();
+        let t0 = self.mint().await?;
         let txn = TxnId(t0);
         let mut rx = self.register(txn);
 
@@ -3431,7 +3458,7 @@ impl Node {
             .expect("replica poisoned")
             .route(txn)
             .or_else(|| self.spans_shards(&keys).then(|| keys.clone()));
-        let mut ballot = Ballot(self.clock.now());
+        let mut ballot = Ballot(self.mint().await?);
 
         for _attempt in 0..3 {
             let mut rx = self.register(txn);
@@ -3451,7 +3478,7 @@ impl Node {
             self.deregister(txn);
             match attempt? {
                 Attempt::Done(outcome) => return Ok(outcome),
-                Attempt::Retry(promised) => ballot = self.higher_ballot(promised),
+                Attempt::Retry(promised) => ballot = self.higher_ballot(promised).await?,
                 // The replicas already promised `ballot`: ask again under it.
                 Attempt::Route(found) => route = Some(found),
             }
@@ -3992,8 +4019,7 @@ impl Node {
         let keys = Self::keys_of(&events);
         let (plans, _union) = self.plan(&keys, &events);
         let route = Self::route_of(&plans, &keys);
-        let t0 = self.clock.now();
-        let txn = TxnId(t0);
+        let txn = TxnId(self.mint().await?);
 
         let mut rx = self.register(txn);
         for plan in &plans {
@@ -4041,7 +4067,7 @@ impl Node {
         let keys = Self::keys_of(&events);
         let (plans, _union) = self.plan(&keys, &events);
         let route = Self::route_of(&plans, &keys);
-        let txn = TxnId(self.clock.now());
+        let txn = TxnId(self.mint().await?);
         let mut rx = self.register(txn);
         let agreed = self.agree(&mut rx, &plans, route.as_deref(), txn).await;
         self.deregister(txn);
@@ -4560,6 +4586,17 @@ impl Node {
             (watermark, coverage, commands)
         };
 
+        // A transaction this node minted, shipped back by a peer (a node that
+        // lost its journal, and with it its clock bound, rejoins this way):
+        // never mint at or below it again.
+        if let Some(minted) = commands
+            .iter()
+            .map(|cmd| cmd.txn.0)
+            .filter(|t0| t0.node == self.id)
+            .max()
+        {
+            self.clock.restore(minted);
+        }
         for cmd in commands {
             if !cmd.keys.iter().any(|k| self.topology.owns(self.id, k)) {
                 continue;
@@ -4776,7 +4813,7 @@ impl Node {
     ) -> anyhow::Result<Vec<Vec<NodeId>>> {
         let need = acceptors.len() / 2 + 1;
         let rank = self.config_rank(epoch, acceptors);
-        let mut ballot = Ballot(self.clock.now());
+        let mut ballot = Ballot(self.mint().await?);
 
         for attempt in 0..6 {
             // Yield: if the epoch committed (this round or while we were backing off
@@ -4847,7 +4884,7 @@ impl Node {
                 // lockstep) — then the top-of-loop committed-check lets the loser
                 // adopt the winner's decision instead of escalating forever.
                 tokio::time::sleep(self.config_backoff(attempt, rank)).await;
-                ballot = self.higher_ballot(promised);
+                ballot = self.higher_ballot(promised).await?;
                 continue;
             }
             if promisers.len() < need {
@@ -4906,7 +4943,7 @@ impl Node {
 
             if let Some(promised) = nack {
                 tokio::time::sleep(self.config_backoff(attempt, rank)).await;
-                ballot = self.higher_ballot(promised);
+                ballot = self.higher_ballot(promised).await?;
                 continue;
             }
             if accepters.len() < need {
@@ -5293,17 +5330,128 @@ impl Node {
     }
 
     /// A ballot strictly greater than `at_least`, owned by this node.
-    fn higher_ballot(&self, at_least: Ballot) -> Ballot {
-        let now = self.clock.now();
+    async fn higher_ballot(&self, at_least: Ballot) -> anyhow::Result<Ballot> {
+        // Witnessed, a ballot within the skew bound puts the clock past it,
+        // so a fresh mint outbids it — covered by the clock bound like any.
+        self.clock.witness(at_least.0);
+        let now = self.mint().await?;
         if now > at_least.0 {
-            Ballot(now)
-        } else {
-            Ballot(Timestamp {
-                micros: at_least.0.micros,
-                logical: at_least.0.logical + 1,
-                node: self.id,
-            })
+            return Ok(Ballot(now));
         }
+        // Only a ballot from a clock beyond the skew bound (a faulty peer far
+        // in the future) gets here. It is outbid directly, and that ballot is
+        // not covered by the clock bound: covering it would drag this node's
+        // own clock out with the faulty peer's after a restart.
+        tracing::warn!(
+            node = self.id.0,
+            ?at_least,
+            "outbidding a ballot beyond the clock-skew bound"
+        );
+        let peer = at_least.0;
+        Ok(Ballot(match peer.logical.checked_add(1) {
+            Some(logical) => Timestamp {
+                micros: peer.micros,
+                logical,
+                node: self.id,
+            },
+            None => Timestamp {
+                micros: peer.micros.saturating_add(1),
+                logical: 0,
+                node: self.id,
+            },
+        }))
+    }
+
+    /// Mints a timestamp this node never used and never will again, for
+    /// whatever one names — a transaction, a ballot, a read probe — as
+    /// opposed to a local cut-off, which reads the clock directly.
+    ///
+    /// It is never below the group's compaction floor, where a transaction
+    /// would count as applied at a replica that never saw it (a wall clock
+    /// lagging the group, or a fresh joiner). And it is always below the
+    /// persisted clock bound: once a stamp reaches it, the bound is raised —
+    /// durably, before the stamp is used — to `2 × max_skew` past the **wall
+    /// clock**, not past the stamp, so restarting the clock from it again and
+    /// again cannot push the clock ever further ahead. At most one journal
+    /// write per `max_skew` of wall time, even with the clock held at its
+    /// skew cap by a peer.
+    async fn mint(&self) -> anyhow::Result<Timestamp> {
+        if self.retired.load(Ordering::Acquire) {
+            return Err(NodeClosed.into());
+        }
+        let floor = self
+            .replica
+            .lock()
+            .expect("replica poisoned")
+            .redundant_before();
+        self.clock.restore(floor);
+        let stamp = self.clock.now();
+        if stamp.micros < self.clock_bound.load(Ordering::Acquire) {
+            return Ok(stamp);
+        }
+        let _raising = self.clock_bound_lock.lock().await;
+        if self.retired.load(Ordering::Acquire) {
+            return Err(NodeClosed.into());
+        }
+        if stamp.micros < self.clock_bound.load(Ordering::Acquire) {
+            return Ok(stamp);
+        }
+        let ahead = self.clock.max_skew_micros().saturating_mul(2);
+        let bound = stamp
+            .micros
+            .saturating_add(1)
+            .max(self.clock.physical_micros().saturating_add(ahead));
+        self.journal
+            .save_clock_bound(bound)
+            .await
+            .map_err(|err| err.context("cannot persist the clock bound"))?;
+        self.clock_bound.store(bound, Ordering::Release);
+        Ok(stamp)
+    }
+
+    /// Starts the clock after a restart past every timestamp this node
+    /// minted before: its persisted clock bound, or — for a journal written
+    /// before there was one — the transactions it coordinated that the
+    /// journal still holds. A restart within a skew of the last mint could
+    /// leave the clock further ahead of the wall clock than the skew bound the
+    /// margins are sized for: that excess (at most one skew) is waited out.
+    /// More means the wall clock stepped back; the clock then leads it until
+    /// it catches up, as it would have without the restart.
+    async fn restore_clock(&self, commands: &[CommandState]) -> anyhow::Result<()> {
+        let bound = self
+            .journal
+            .load_clock_bound()
+            .await?
+            .map(|micros| Timestamp {
+                micros,
+                logical: 0,
+                node: self.id,
+            });
+        let minted = commands
+            .iter()
+            .map(|cmd| cmd.txn.0)
+            .filter(|t0| t0.node == self.id)
+            .max();
+        let Some(floor) = bound.max(minted) else {
+            return Ok(());
+        };
+        self.clock.restore(floor);
+        let skew = self.clock.max_skew_micros();
+        let lead = floor.micros.saturating_sub(self.clock.physical_micros());
+        if lead > skew {
+            let excess = lead - skew;
+            if excess <= skew {
+                tokio::time::sleep(Duration::from_micros(excess)).await;
+            } else {
+                tracing::warn!(
+                    node = self.id.0,
+                    lead_micros = lead,
+                    "the wall clock is behind this node's clock bound (stepped back?); \
+                     stamps lead it until it catches up"
+                );
+            }
+        }
+        Ok(())
     }
 
     /// A deadline `d` from now.

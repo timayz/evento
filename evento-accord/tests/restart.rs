@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use evento_accord::{
     DataStore, HybridLogicalClock, InMemoryDataStore, InMemoryJournal, InMemoryNetwork, Journal,
-    Node, NodeId, StaticTopology, Timestamp, Topology,
+    Key, Node, NodeId, ShardedTopology, StaticTopology, Timestamp, Topology, MAX_SKEW_MICROS,
 };
 use evento_core::Event;
 
@@ -293,5 +293,146 @@ async fn a_node_restarts_after_compaction() {
     nodes[0].write(vec![event("acc", 4)]).await.unwrap();
     for s in &stores {
         await_version(s, "acc", 4).await;
+    }
+}
+
+/// A node restarted with its wall clock back where it minted a transaction id
+/// must not mint that id again: replicas would take the new write for the old
+/// transaction and answer with its outcome, so the write would be acked while
+/// its events were never applied. Node 0 coordinates a write to a key only the
+/// other shard owns, so its own journal never holds the transaction — only the
+/// clock bound it persisted before minting can tell it how far it got.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restarted_coordinator_never_reuses_a_transaction_id() {
+    let net = InMemoryNetwork::new();
+    let shards = vec![
+        vec![NodeId(0), NodeId(1), NodeId(2)],
+        vec![NodeId(3), NodeId(4), NodeId(5)],
+    ];
+    let ids: Vec<NodeId> = shards.iter().flatten().copied().collect();
+    let probe = ShardedTopology::new(NodeId(0), shards.clone());
+    let agg = (0..10_000)
+        .map(|i| format!("far-{i}"))
+        .find(|id| probe.shard_of(&Key(id.clone())) == 1)
+        .expect("an id in shard 1");
+
+    let journals: Vec<Arc<InMemoryJournal>> = ids
+        .iter()
+        .map(|_| Arc::new(InMemoryJournal::new()))
+        .collect();
+    let stores: Vec<Arc<InMemoryDataStore>> = ids
+        .iter()
+        .map(|_| Arc::new(InMemoryDataStore::new()))
+        .collect();
+    let mut nodes = Vec::new();
+    let mut tasks = Vec::new();
+    for (i, &id) in ids.iter().enumerate() {
+        let inbox = net.register(id);
+        let node = Node::new(
+            id,
+            Arc::new(ShardedTopology::new(id, shards.clone())) as Arc<dyn Topology>,
+            Arc::new(HybridLogicalClock::new(id)),
+            Arc::new(net.sink(id)),
+            Arc::clone(&stores[i]) as Arc<dyn DataStore>,
+            Arc::clone(&journals[i]) as Arc<dyn Journal>,
+        );
+        tasks.push(node.start(inbox));
+        nodes.push(node);
+    }
+
+    let old = nodes[0].write(vec![event(&agg, 1)]).await.unwrap().txn;
+    for store in &stores[3..] {
+        await_version(store, &agg, 1).await;
+    }
+    assert_eq!(old.0.node, NodeId(0));
+    assert_eq!(
+        old.0.logical, 0,
+        "precondition: first stamp of its microsecond"
+    );
+    assert!(
+        journals[0].load(old).await.unwrap().is_none(),
+        "precondition: node 0 owns none of the key"
+    );
+
+    // Restart node 0 with its wall clock back at the microsecond it minted `old`.
+    tasks[0].abort();
+    let inbox = net.register(NodeId(0));
+    let micros = old.0.micros;
+    let restarted = Node::new(
+        NodeId(0),
+        Arc::new(ShardedTopology::new(NodeId(0), shards.clone())) as Arc<dyn Topology>,
+        Arc::new(HybridLogicalClock::with_physical(NodeId(0), move || micros)),
+        Arc::new(net.sink(NodeId(0))),
+        Arc::new(InMemoryDataStore::new()) as Arc<dyn DataStore>,
+        Arc::clone(&journals[0]) as Arc<dyn Journal>,
+    );
+    restarted.recover_state().await.unwrap();
+    tasks[0] = restarted.start(inbox);
+
+    let new = tokio::time::timeout(
+        Duration::from_secs(10),
+        restarted.write(vec![event(&agg, 2)]),
+    )
+    .await
+    .expect("the write timed out")
+    .expect("the write commits")
+    .txn;
+    assert!(new > old, "re-minted {new:?} after a restart (was {old:?})");
+    for store in &stores[3..] {
+        await_version(store, &agg, 2).await;
+    }
+}
+
+/// The clock bound sits a few skews past the wall clock, and a restart starts
+/// the clock there: restarting again and again, each time minting, must not
+/// push the clock ever further ahead of the wall clock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn repeated_restarts_keep_the_clock_within_the_skew_bound() {
+    use evento_accord::clock::system_micros;
+    use evento_accord::Clock;
+
+    let net = InMemoryNetwork::new();
+    let ids: Vec<NodeId> = (0..3).map(NodeId).collect();
+    let journals: Vec<Arc<InMemoryJournal>> =
+        (0..3).map(|_| Arc::new(InMemoryJournal::new())).collect();
+    let mut nodes = Vec::new();
+    let mut tasks = Vec::new();
+    for &id in &ids {
+        let inbox = net.register(id);
+        let node = Node::new(
+            id,
+            Arc::new(StaticTopology::new(id, ids.clone())) as Arc<dyn Topology>,
+            Arc::new(HybridLogicalClock::new(id)),
+            Arc::new(net.sink(id)),
+            Arc::new(InMemoryDataStore::new()) as Arc<dyn DataStore>,
+            Arc::clone(&journals[id.0 as usize]) as Arc<dyn Journal>,
+        );
+        tasks.push(node.start(inbox));
+        nodes.push(node);
+    }
+
+    // Scheduling noise on top of the bound.
+    let slack = 50_000;
+    for version in 1..=4 {
+        nodes[0].write(vec![event("acc", version)]).await.unwrap();
+        tasks[0].abort();
+        let inbox = net.register(NodeId(0));
+        let clock = Arc::new(HybridLogicalClock::new(NodeId(0)));
+        let restarted = Node::new(
+            NodeId(0),
+            Arc::new(StaticTopology::new(NodeId(0), ids.clone())) as Arc<dyn Topology>,
+            Arc::clone(&clock),
+            Arc::new(net.sink(NodeId(0))),
+            Arc::new(InMemoryDataStore::new()) as Arc<dyn DataStore>,
+            Arc::clone(&journals[0]) as Arc<dyn Journal>,
+        );
+        restarted.recover_state().await.unwrap();
+        let lead = clock.now().micros.saturating_sub(system_micros());
+        assert!(
+            lead <= MAX_SKEW_MICROS + slack,
+            "restart {version}: the clock leads the wall clock by {lead}µs"
+        );
+        tasks[0] = restarted.start(inbox);
+        nodes[0] = restarted;
     }
 }

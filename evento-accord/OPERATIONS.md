@@ -93,7 +93,14 @@ timeouts for geo/WAN** deployments.
 | `config_defer_step` | 100 ms | Control-plane anti-dueling delay for concurrent reconfigurations. |
 
 Clock-skew tolerance is on the clock: `HybridLogicalClock::with_max_skew(..)` (default
-`MAX_SKEW_MICROS`); keep `recovery_timeout`/`compaction_margin` above it.
+`MAX_SKEW_MICROS`); keep `recovery_timeout`/`compaction_margin` above it. The node
+persists a clock bound in its journal (raised at most once per `max_skew` while it
+mints) and a restart starts its clock there, so a node never reuses a transaction id
+or ballot across a restart, even if its wall clock stepped back. A restart within
+`max_skew` of the last write waits out at most `max_skew`; after a backward step the
+node logs that its wall clock is behind its clock bound and its stamps lead the wall
+clock until it catches up. Writes fail rather than use an id the bound does not cover
+(the journal refused it).
 
 ---
 
@@ -290,6 +297,13 @@ refuses anything else before a vote, and a node never installs it.
 - **SQL backend:** run the schema via `evento-sql-migrator` with its `accord` feature
   (the `accord_commands/meta/metadata_log/acceptors` tables), alongside your event
   schema — one migrator for both.
+- **Clock bound:** the journal holds the node's clock bound (Fjall `meta` key /
+  `accord_meta` row `clock_bound`). Restoring a journal from an older backup restores
+  an older bound: start the node only once its wall clock is past the time of the
+  backup's last write plus a few seconds, or rejoin it from an empty journal (a
+  joiner starts its clock past the group's floor and its own transactions peers ship
+  back). A journal written before the bound existed starts the clock past the node's
+  own journaled transactions on its first restart.
 - **Upgrading past the apply-time re-stamp** (release note; the journal and wire
   formats are unchanged): a build before it stored each event with the stamp its
   writing host gave it, and later builds stamp it from the transaction's agreed

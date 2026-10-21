@@ -40,6 +40,8 @@ struct FaultJournal {
     accept_failing: AtomicBool,
     /// While set, appending to the metadata log fails.
     metadata_failing: AtomicBool,
+    /// While set, persisting the clock bound fails.
+    clock_bound_failing: AtomicBool,
 }
 
 impl FaultJournal {
@@ -53,6 +55,7 @@ impl FaultJournal {
             acceptor_failing: AtomicBool::new(false),
             accept_failing: AtomicBool::new(false),
             metadata_failing: AtomicBool::new(false),
+            clock_bound_failing: AtomicBool::new(false),
         }
     }
 
@@ -74,6 +77,10 @@ impl FaultJournal {
 
     fn set_metadata_failing(&self, v: bool) {
         self.metadata_failing.store(v, Ordering::SeqCst);
+    }
+
+    fn set_clock_bound_failing(&self, v: bool) {
+        self.clock_bound_failing.store(v, Ordering::SeqCst);
     }
 
     fn truncates(&self) -> usize {
@@ -142,6 +149,15 @@ impl Journal for FaultJournal {
     }
     async fn load_acceptors(&self) -> anyhow::Result<Vec<(u64, AcceptorRecord)>> {
         self.durable.load_acceptors().await
+    }
+    async fn save_clock_bound(&self, micros: u64) -> anyhow::Result<()> {
+        if self.clock_bound_failing.load(Ordering::SeqCst) {
+            anyhow::bail!("simulated clock-bound write failure");
+        }
+        self.durable.save_clock_bound(micros).await
+    }
+    async fn load_clock_bound(&self) -> anyhow::Result<Option<u64>> {
+        self.durable.load_clock_bound().await
     }
 }
 
@@ -545,4 +561,32 @@ async fn an_epoch_the_journal_did_not_persist_is_not_installed() {
     cluster.journals[2].set_metadata_failing(false);
     await_epoch(cluster.topologies[2].as_ref(), 1).await;
     assert_eq!(cluster.journals[2].load_metadata().await.unwrap().len(), 1);
+}
+
+/// A node that cannot persist its clock bound must not use a timestamp past
+/// it: after a restart it could mint that id again. A write whose id it cannot
+/// cover fails before any replica hears of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_whose_id_cannot_be_covered_fails_before_it_is_sent() {
+    let cluster = start_with(3, false, NodeConfig::default());
+    cluster.journals[0].set_clock_bound_failing(true);
+
+    let result = cluster.nodes[0]
+        .write(vec![event("acc", 1, "Opened")])
+        .await;
+    assert!(result.is_err(), "used an id it could not cover: {result:?}");
+    for node in &cluster.nodes {
+        assert_eq!(node.command_count(), 0, "a replica heard of the write");
+    }
+
+    cluster.journals[0].set_clock_bound_failing(false);
+    cluster.nodes[0]
+        .write(vec![event("acc", 1, "Opened")])
+        .await
+        .expect("a covered id is used");
+    assert!(cluster.journals[0]
+        .load_clock_bound()
+        .await
+        .unwrap()
+        .is_some());
 }

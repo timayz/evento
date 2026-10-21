@@ -551,6 +551,24 @@ backend (sql/fjall). Phases, in order:
   the bound degrades gracefully rather than poisoning peers. Clock unit tests pin
   the cap and the catch-up; a simulation scenario (`safety_and_bound_hold_under_clock_skew`)
   proves a skewed cluster stays safe, converges, and keeps state bounded.
+  ✅ **The clock never runs back across a restart.** Every id a node mints — a
+  transaction, a ballot, a read probe — goes through `Node::mint`, which keeps it
+  below a **clock bound** persisted in the journal (`Journal::save_clock_bound`),
+  raised durably before a stamp reaches it to `2 × max_skew` past the *wall clock*
+  (so restarting from it cannot compound, and it costs at most one write per skew
+  of wall time). `recover_state` starts the clock at the bound — or, for a journal
+  without one, past the node's own journaled transactions — so a restarted or
+  reopened node never mints an id it used before, even when its wall clock stepped
+  back: replicas would take such a write for the old transaction and ack it with
+  the old outcome, its events never applied. A restart within a skew of the last
+  mint waits out what puts the clock further ahead than `max_skew`; a larger lead
+  means the wall clock stepped back, and the clock leads it until it catches up,
+  as it would without the restart. A mint is also never below the group's
+  compaction floor (a lagging wall clock, a fresh joiner): a transaction under it
+  would count as applied at a replica that never saw it. A joiner that lost its
+  journal starts past its own transactions a peer ships back. The one id not
+  covered is a ballot outbidding a peer's from beyond the skew bound (a faulty,
+  far-future clock): covering it would drag this node's clock out with the peer's.
   ✅ **Tunable timing/sizing:** the hard-coded constants are now an injected
   `NodeConfig` (fast/collect timeouts, recovery interval/timeout, compaction
   margin, journal-batch cap) with `Default` reproducing the shipped values and a

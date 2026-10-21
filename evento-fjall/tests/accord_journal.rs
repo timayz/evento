@@ -253,3 +253,21 @@ async fn routes_and_promises_survive_close_and_reopen_and_truncate() {
     assert_eq!(journal.load_routes().await.unwrap(), vec![(new, route)]);
     assert_eq!(journal.load_promises().await.unwrap(), vec![(new, ballot)]);
 }
+
+#[tokio::test]
+async fn clock_bound_survives_close_reopen_and_truncate() {
+    let temp = tempfile::Builder::new()
+        .prefix("evento_accord_journal_clock")
+        .tempdir()
+        .unwrap();
+    {
+        let journal = FjallJournal::open(temp.path()).unwrap();
+        assert_eq!(journal.load_clock_bound().await.unwrap(), None);
+        journal.save_clock_bound(400).await.unwrap();
+        journal.save_clock_bound(900).await.unwrap();
+    }
+    let journal = FjallJournal::open(temp.path()).unwrap();
+    assert_eq!(journal.load_clock_bound().await.unwrap(), Some(900));
+    journal.truncate(timestamp(1_000, 0)).await.unwrap();
+    assert_eq!(journal.load_clock_bound().await.unwrap(), Some(900));
+}

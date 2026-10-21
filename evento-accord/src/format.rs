@@ -46,7 +46,8 @@
 //!   the unknown kind (`decode_tagged` fails on it), which is loss the consensus layer
 //!   tolerates. [`RecordKind::GroupFrame`] (the multiplexed wire frame of
 //!   `crate::tcp::MuxTransport`) was added this way, and so were
-//!   [`RecordKind::Route`] / [`RecordKind::Promise`] (journal-only). The same
+//!   [`RecordKind::Route`] / [`RecordKind::Promise`] / [`RecordKind::ClockBound`]
+//!   (journal-only). The same
 //!   holds for a new [`Message`](crate::message::Message) variant appended at the
 //!   end (`Message::Routed`): bitcode numbers variants positionally, so every
 //!   existing variant keeps its encoding and an older node fails to decode — and
@@ -97,6 +98,9 @@ pub enum RecordKind {
     /// A recovery ballot promised for a transaction this replica never
     /// witnessed (`Journal::save_promise`), as `(TxnId, Ballot)`.
     Promise = 9,
+    /// The node's clock bound (`Journal::save_clock_bound`): every timestamp
+    /// it minted is below these microseconds, as a `u64`.
+    ClockBound = 10,
 }
 
 impl RecordKind {
@@ -111,6 +115,7 @@ impl RecordKind {
             7 => Some(Self::RejoinBounds),
             8 => Some(Self::Route),
             9 => Some(Self::Promise),
+            10 => Some(Self::ClockBound),
             _ => None,
         }
     }
@@ -179,6 +184,7 @@ mod tests {
             RecordKind::RejoinBounds,
             RecordKind::Route,
             RecordKind::Promise,
+            RecordKind::ClockBound,
         ] {
             let value = (42u64, "hello".to_string());
             let bytes = encode_tagged(kind, &value).unwrap();

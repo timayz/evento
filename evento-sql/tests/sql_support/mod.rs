@@ -294,3 +294,21 @@ where
     assert_eq!(journal.load_routes().await.unwrap(), vec![(new, route)]);
     assert_eq!(journal.load_promises().await.unwrap(), vec![(new, high)]);
 }
+
+/// The clock bound round-trips, keeps the last value written, and is not
+/// touched by truncation (it covers every id the node ever minted).
+pub async fn clock_bound<DB>(journal: &SqlJournal<DB>)
+where
+    DB: Database,
+    for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
+    sea_query_sqlx::SqlxValues: sqlx::IntoArguments<DB>,
+    Vec<u8>: for<'r> sqlx::Decode<'r, DB> + sqlx::Type<DB>,
+    i64: for<'r> sqlx::Decode<'r, DB> + sqlx::Type<DB>,
+    usize: sqlx::ColumnIndex<DB::Row>,
+{
+    assert_eq!(journal.load_clock_bound().await.unwrap(), None);
+    journal.save_clock_bound(400).await.unwrap();
+    journal.save_clock_bound(900).await.unwrap();
+    journal.truncate(timestamp(1_000, 0)).await.unwrap();
+    assert_eq!(journal.load_clock_bound().await.unwrap(), Some(900));
+}

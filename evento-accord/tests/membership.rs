@@ -48,8 +48,20 @@ fn spawn_node_with(
     net: &Arc<InMemoryNetwork>,
     config: NodeConfig,
 ) -> TestNode {
-    let inbox = net.register(id);
     let clock = Arc::new(HybridLogicalClock::new(id));
+    spawn_node_on(id, epoch, shards, net, config, clock)
+}
+
+/// [`spawn_node_with`] over a given clock.
+fn spawn_node_on(
+    id: NodeId,
+    epoch: u64,
+    shards: Vec<Vec<NodeId>>,
+    net: &Arc<InMemoryNetwork>,
+    config: NodeConfig,
+    clock: Arc<HybridLogicalClock>,
+) -> TestNode {
+    let inbox = net.register(id);
     let sink: Arc<dyn MessageSink> = Arc::new(net.sink(id));
     let store = Arc::new(InMemoryDataStore::new());
     let journal = Arc::new(InMemoryJournal::new());
@@ -1163,4 +1175,74 @@ async fn a_joining_node_refuses_a_forwarded_read_until_it_has_joined() {
         .forward_read(NodeId(3), None, None, Args::forward(10, None), None)
         .await
         .expect("a joined node serves reads");
+}
+
+/// A node whose wall clock lags its group by more than the compaction margin
+/// still mints above the group's compaction floor: a transaction below it
+/// would count as applied at a replica that never saw it. A joiner adopts its
+/// contact's floor, and its first write is minted above it and commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joiner_with_a_lagging_clock_mints_above_the_floor() {
+    use evento_accord::clock::system_micros;
+    use evento_accord::Timestamp;
+
+    let net = InMemoryNetwork::new();
+    let abc = vec![NodeId(0), NodeId(1), NodeId(2)];
+    let abcd = vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3)];
+    let nodes: Vec<TestNode> = abc
+        .iter()
+        .map(|&id| spawn_node(id, 0, vec![abc.clone()], &net))
+        .collect();
+    nodes[0]
+        .node
+        .write(vec![event("acc", 1, "Opened")])
+        .await
+        .unwrap();
+    for n in &nodes {
+        await_len(&n.store, 1).await;
+    }
+    let floor = Timestamp {
+        micros: system_micros() + 10_000,
+        logical: 0,
+        node: NodeId(0),
+    };
+    for n in &nodes {
+        n.node.compact(floor).await;
+    }
+
+    let lag = 60_000_000;
+    let d = spawn_node_on(
+        NodeId(3),
+        0,
+        vec![abc.clone()],
+        &net,
+        NodeConfig::default(),
+        Arc::new(HybridLogicalClock::with_physical(NodeId(3), move || {
+            system_micros() - lag
+        })),
+    );
+    d.node.begin_join();
+    nodes[0]
+        .node
+        .change_topology(1, vec![abcd.clone()])
+        .await
+        .unwrap();
+    await_epoch(&d.topology, 1).await;
+    d.node.join(NodeId(0)).await.unwrap();
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(10),
+        d.node.write(vec![event("acc", 2, "Deposited")]),
+    )
+    .await
+    .expect("the write timed out")
+    .expect("the write commits");
+    assert!(
+        outcome.txn.0 > floor,
+        "minted {:?} below the floor {floor:?}",
+        outcome.txn
+    );
+    for n in &nodes {
+        await_len(&n.store, 2).await;
+    }
 }

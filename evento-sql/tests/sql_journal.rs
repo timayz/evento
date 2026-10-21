@@ -71,6 +71,11 @@ async fn routes_and_promises() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clock_bound() {
+    sql_support::clock_bound(&memory().await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn survives_close_and_reopen() {
     let temp = tempfile::Builder::new()
         .prefix("accord_sql_reopen")
@@ -148,4 +153,17 @@ async fn rejoin_bounds_survive_close_and_reopen() {
     assert_eq!(journal.load_rejoin_bounds().await.unwrap(), bounds[..1]);
     journal.save_rejoin_bounds(&[]).await.unwrap();
     assert!(journal.load_rejoin_bounds().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn clock_bound_survives_close_and_reopen() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("journal.db");
+    {
+        let journal = at(&path).await;
+        journal.save_clock_bound(1_234).await.unwrap();
+        journal.close().await;
+    }
+    let journal = at(&path).await;
+    assert_eq!(journal.load_clock_bound().await.unwrap(), Some(1_234));
 }
