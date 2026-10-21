@@ -8,7 +8,7 @@ use std::time::Duration;
 use evento_accord::{
     Ballot, Clock, DataStore, Envelope, HybridLogicalClock, InMemoryDataStore, InMemoryJournal,
     InMemoryNetwork, InMemorySink, Journal, Key, Message, MessageSink, Node, NodeConfig, NodeId,
-    StaticTopology, Status, Timestamp, TxnId,
+    ShardedTopology, StaticTopology, Status, Timestamp, Topology, TxnId,
 };
 use evento_core::Event;
 use tokio::sync::mpsc;
@@ -578,4 +578,302 @@ async fn a_duplicated_vote_never_completes_a_preaccept_quorum() {
         0,
         "the write must never reach Accept on a sub-quorum of votes"
     );
+}
+
+/// Two disjoint shards of three real nodes — `A = {0, 1, 2}` and
+/// `B = {3, 4, 5}` — each node with its own kept journal so it can be
+/// restarted from it.
+struct Sharded {
+    net: Arc<InMemoryNetwork>,
+    layout: Vec<Vec<NodeId>>,
+    nodes: Vec<Node>,
+    stores: Vec<Arc<InMemoryDataStore>>,
+    journals: Vec<Arc<InMemoryJournal>>,
+    loops: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Sharded {
+    fn start() -> Self {
+        let mut cluster = Self {
+            net: InMemoryNetwork::new(),
+            layout: vec![(0..3).map(NodeId).collect(), (3..6).map(NodeId).collect()],
+            nodes: Vec::new(),
+            stores: Vec::new(),
+            journals: Vec::new(),
+            loops: Vec::new(),
+        };
+        for id in 0..6 {
+            let journal = Arc::new(InMemoryJournal::new());
+            let store = Arc::new(InMemoryDataStore::new());
+            let inbox = cluster.net.register(NodeId(id as u64));
+            let node = cluster.build(id, &store, &journal);
+            cluster.loops.push(node.start(inbox));
+            cluster.nodes.push(node);
+            cluster.stores.push(store);
+            cluster.journals.push(journal);
+        }
+        cluster
+    }
+
+    fn build(
+        &self,
+        id: usize,
+        store: &Arc<InMemoryDataStore>,
+        journal: &Arc<InMemoryJournal>,
+    ) -> Node {
+        let id = NodeId(id as u64);
+        Node::new(
+            id,
+            Arc::new(ShardedTopology::new(id, self.layout.clone())),
+            Arc::new(HybridLogicalClock::new(id)),
+            Arc::new(self.net.sink(id)) as Arc<dyn MessageSink>,
+            Arc::clone(store) as Arc<dyn DataStore>,
+            Arc::clone(journal) as Arc<dyn Journal>,
+        )
+        .with_config(NodeConfig {
+            collect_timeout: Duration::from_secs(1),
+            ..NodeConfig::default()
+        })
+    }
+
+    /// Restarts node `id` from its journal, over a fresh data store.
+    async fn restart(&mut self, id: usize) {
+        self.loops[id].abort();
+        let inbox = self.net.register(NodeId(id as u64));
+        let store = Arc::new(InMemoryDataStore::new());
+        let node = self.build(id, &store, &self.journals[id]);
+        node.recover_state().await.unwrap();
+        self.loops[id] = node.start(inbox);
+        self.nodes[id] = node;
+        self.stores[id] = store;
+    }
+
+    /// An aggregate id that hashes into `shard`.
+    fn id_in_shard(&self, shard: usize, prefix: &str) -> String {
+        let probe = ShardedTopology::new(NodeId(0), self.layout.clone());
+        (0..10_000)
+            .map(|i| format!("{prefix}-{i}"))
+            .find(|id| probe.shard_of(&Key(id.clone())) == shard)
+            .expect("an id in the shard")
+    }
+
+    /// The one transaction node `id` has journaled.
+    async fn journaled_txn(&self, id: usize) -> TxnId {
+        let commands = self.journals[id].load_all().await.unwrap();
+        assert_eq!(commands.len(), 1, "node {id} holds exactly one transaction");
+        commands[0].txn
+    }
+
+    /// Whether node `id` applied `txn` as a commit.
+    fn committed(&self, id: usize, txn: TxnId) -> bool {
+        self.stores[id]
+            .applied_log()
+            .iter()
+            .any(|e| e.txn == txn && !e.conflict)
+    }
+
+    /// Waits until every node in `ids` holds `txn` applied.
+    async fn await_applied(&self, ids: impl IntoIterator<Item = usize>, txn: TxnId) {
+        for id in ids {
+            for _ in 0..400 {
+                if self.nodes[id].command_status(txn) == Some(Status::Applied) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert_eq!(
+                self.nodes[id].command_status(txn),
+                Some(Status::Applied),
+                "node {id} must settle the transaction"
+            );
+        }
+    }
+}
+
+/// The coordinator (node 0) pre-accepts a transaction spanning both shards at
+/// shard A only — its frames to shard B are lost — and dies. Shard B never
+/// witnessed it, so it never committed: recovery must abort it on both
+/// shards, not commit shard A's half alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn recovery_aborts_a_transaction_a_shard_never_witnessed() {
+    let c = Sharded::start();
+    let a = c.id_in_shard(0, "a");
+    let b = c.id_in_shard(1, "b");
+    for peer in &c.layout[1] {
+        c.net.partition(NodeId(0), *peer);
+    }
+    let preaccepted = c.nodes[0]
+        .coordinate_preaccept(vec![event(&a, 1), event(&b, 1)])
+        .await;
+    assert!(preaccepted.is_err(), "shard B never answers");
+    let txn = c.journaled_txn(1).await;
+    c.net.crash(NodeId(0));
+
+    let outcome = tokio::time::timeout(Duration::from_secs(10), c.nodes[1].recover(txn))
+        .await
+        .expect("recovery completes")
+        .expect("recovery decides");
+    assert!(
+        outcome.conflict,
+        "a transaction shard B never saw is aborted"
+    );
+
+    c.await_applied([1, 2], txn).await;
+    for id in 1..6 {
+        assert!(!c.committed(id, txn), "node {id} must not apply its events");
+    }
+    for id in 3..6 {
+        assert_eq!(
+            c.nodes[id].command_status(txn),
+            None,
+            "shard B never holds the transaction"
+        );
+    }
+}
+
+/// Shard B answers slower than the fast-path window and its version
+/// condition fails. A recovery must wait for its report: deciding on shard A
+/// alone would commit A's half while B aborts its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn recovery_waits_for_a_slow_shard_before_deciding() {
+    let c = Sharded::start();
+    let a = c.id_in_shard(0, "a");
+    let b = c.id_in_shard(1, "b");
+    // `b` already exists, so the transaction's `b` v1 fails its condition.
+    c.nodes[3].write(vec![event(&b, 1)]).await.unwrap();
+    for id in 3..6 {
+        for _ in 0..400 {
+            if c.stores[id].applied_log().len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    // Each cross-shard link takes 150 ms one way: three times the fast-path
+    // window, well inside the slow-path budget.
+    for x in &c.layout[0] {
+        for y in &c.layout[1] {
+            c.net.set_link_latency(*x, *y, Duration::from_millis(150));
+        }
+    }
+    // The coordinator commits and dies before collecting the reads.
+    let txn = c.nodes[0]
+        .coordinate_through_commit(vec![event(&a, 1), event(&b, 1)])
+        .await
+        .expect("both shards commit it");
+
+    let outcome = tokio::time::timeout(Duration::from_secs(10), c.nodes[1].recover(txn))
+        .await
+        .expect("recovery completes")
+        .expect("recovery decides");
+    assert!(
+        outcome.conflict,
+        "shard B's failed condition aborts it everywhere"
+    );
+
+    c.await_applied(0..6, txn).await;
+    for id in 0..6 {
+        assert!(!c.committed(id, txn), "node {id} must not apply its events");
+    }
+}
+
+/// A shard-B replica that answered a recovery "never witnessed" keeps that
+/// promise across a restart: the original coordinator's PreAccept, merely
+/// slow, must still be refused there — or the recovery's quorum and the
+/// coordinator's would not intersect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_restarted_replica_keeps_its_recovery_promise() {
+    let mut c = Sharded::start();
+    let a = c.id_in_shard(0, "a");
+    let b = c.id_in_shard(1, "b");
+    // The coordinator's frames to shard B take 1.5 s: they land after the
+    // recovery and the restart below.
+    for peer in &c.layout[1] {
+        c.net
+            .set_latency(NodeId(0), *peer, Duration::from_millis(1_500));
+    }
+    let coordinator = c.nodes[0].clone();
+    let (ea, eb) = (event(&a, 1), event(&b, 1));
+    let slow = tokio::spawn(async move { coordinator.coordinate_preaccept(vec![ea, eb]).await });
+    let mut txn = None;
+    for _ in 0..400 {
+        if let Ok(commands) = c.journals[1].load_all().await {
+            if let Some(cmd) = commands.first() {
+                txn = Some(cmd.txn);
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let txn = txn.expect("shard A pre-accepted it");
+
+    let outcome = tokio::time::timeout(Duration::from_secs(10), c.nodes[1].recover(txn))
+        .await
+        .expect("recovery completes")
+        .expect("recovery decides");
+    assert!(outcome.conflict, "shard B never witnessed it");
+    c.restart(3).await;
+
+    // The late PreAccept reaches every shard-B replica, the restarted one too.
+    let _ = slow.await;
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    for id in 3..6 {
+        assert_eq!(
+            c.nodes[id].command_status(txn),
+            None,
+            "node {id} must refuse the original coordinator's late PreAccept"
+        );
+    }
+}
+
+/// The coordinator's abort reached shard B and one shard-A replica before it
+/// died, and shard B has since compacted the transaction away — its failed
+/// read is gone. Recovering from shard A, a fresh read there says "commit":
+/// the decision must come from the replica that applied it instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn recovery_takes_the_decision_a_compacted_shard_applied() {
+    let c = Sharded::start();
+    let a = c.id_in_shard(0, "a");
+    let b = c.id_in_shard(1, "b");
+    c.nodes[3].write(vec![event(&b, 1)]).await.unwrap();
+    for id in 3..6 {
+        for _ in 0..400 {
+            if c.stores[id].applied_log().len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+    let txn = c.nodes[0]
+        .coordinate_through_commit(vec![event(&a, 1), event(&b, 1)])
+        .await
+        .expect("both shards commit it");
+    // The abort the coordinator decided reaches shard B and node 0 only.
+    let decider = c.net.sink(NodeId(9));
+    for id in [3, 4, 5, 0] {
+        decider
+            .send(NodeId(id), Message::Apply { txn, commit: false })
+            .await
+            .unwrap();
+    }
+    c.await_applied([0, 3, 4, 5], txn).await;
+    let now = HybridLogicalClock::new(NodeId(9)).now();
+    for id in 3..6 {
+        c.nodes[id].compact(now).await;
+        assert_eq!(c.nodes[id].command_status(txn), None, "compacted away");
+    }
+    // Node 0's answer is the slowest the recovery hears.
+    c.net
+        .set_latency(NodeId(0), NodeId(1), Duration::from_millis(100));
+
+    let outcome = tokio::time::timeout(Duration::from_secs(10), c.nodes[1].recover(txn))
+        .await
+        .expect("recovery completes")
+        .expect("recovery decides");
+    assert!(outcome.conflict, "the applied abort stands");
+    c.await_applied(0..3, txn).await;
+    for id in 0..3 {
+        assert!(!c.committed(id, txn), "node {id} must not apply its events");
+    }
 }

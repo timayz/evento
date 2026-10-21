@@ -202,6 +202,46 @@ control plane, everything else is Accord.
   an earlier conflict committed past `t0` without the txn rules the fast path out
   (one only accepted makes recovery wait). A replica holding a read slot answers any
   recovery's Commit with the read it took.
+  *Multi-shard (routes, 2026-10):* each replica stores only its shard's keys, so a
+  recovery used to plan the shards the reports revealed within `fast_timeout` — a
+  shard that never witnessed the txn (coordinator died mid-broadcast) or answered
+  late was left out, and the txn committed (or aborted) on the others alone. Now a
+  txn spanning shards carries its **route** — the full key set (keys survive
+  re-sharding, shard ids don't) — in a `Message::Routed { route, inner }` wrapper on
+  PreAccept / Accept / Commit / BeginRecovery / BeginRecoveryOk; each replica keeps it
+  with the command (`Replica.routes`, `Journal::save_route`, record kind `Route`,
+  dropped with the command). A **routed** recovery asks every replica of every route
+  shard and waits (up to `collect_timeout`) until each shard is accounted for. A
+  replica that never witnessed the txn does **not** pre-accept it there (unlike the
+  unrouted path): it journals a promise (`Journal::save_promise`, record kind
+  `Promise` — the blind promise is no longer in-memory only) and answers
+  `NotWitnessed`. This is what makes the decision sound, after Accord's
+  *invalidation*: a slow quorum of shard S answering "never witnessed" under ballot b
+  proves the txn never committed (a commit needs a PreAccept quorum on S, which meets
+  it — a witness journals before it votes and keeps the command until it is applied,
+  when it reports "below the watermark", not "never witnessed") and never will (those
+  replicas refuse the original coordinator below b, and no recovery can assemble a
+  witnessed quorum on S, since nothing but a PreAccept makes a replica witness before
+  a decision). Pre-accepting instead would let a later recovery that learned S's part
+  from a straggler turn the proof into a commit after it was acted on. The recovery
+  then **invalidates** the txn (`Message::Invalidate`): every replica holding it
+  un-committed records it applied as an abort without executing it (an abort changes
+  nothing, so needs no place in the order), marked by `execute_at = INVALIDATED_AT`
+  (`Timestamp::MIN` — no field added to `CommandState`), which a later recovery
+  recognizes as decided and which recovery's superseding check ignores (its deps are
+  one replica's PreAccept view, never agreed). A reply from below a replica's
+  redundancy watermark is no evidence of "never witnessed" (the txn may have been
+  applied and compacted); with a `Committed` report anywhere the decision exists and
+  is re-driven on the shards still holding it; with none, a compacted shard plus a
+  slow quorum elsewhere still below `Committed` means the low shard never witnessed it
+  (invalidate, relying on messages not outliving `compaction_margin`). Anything else —
+  a shard split between witnessed and never-witnessed below a quorum — decides
+  nothing until more replicas answer: a liveness cost only for a multi-shard txn whose
+  coordinator died *and* whose shard lost a replica. A legacy (unrouted) recovery that
+  meets a routed report switches to the routed path. Skipping a compacted shard drops
+  its read, so a decided txn re-driven without it takes the decision from a replica
+  that applied it (`execute` waits for that replica's answer to the Commit — it is the
+  decision) and decides nothing while none is heard from.
 - **M3 — Multi-shard transactions.** ✅ `ShardedTopology` partitions keys into
   **disjoint** shards, each with its own replica set; the coordinator reaches a
   quorum in **each** touched shard (`plan` + `collect_by_shard` group responses
@@ -635,14 +675,29 @@ backend (sql/fjall). Phases, in order:
         predated the two-peer coverage proof — now the contact vouches for it), and
         at any N a long join under writes was too (peers compacted past the vouch
         meanwhile — now the contact holds its report until the joiner's; and a
-        `Rejoin` answering the joiner's mid-join replies aborted the join).
+        `Rejoin` answering the joiner's mid-join replies aborted the join);
+        multi-shard recovery could not see a shard that never witnessed the txn
+        (or answered after `fast_timeout`) and committed it on the others only —
+        a multi-shard txn now carries its **route** (full key set) on every
+        message (`Message::Routed`, single-shard traffic unchanged), journaled with
+        the command; recovery waits for a slow quorum of every route shard, and
+        invalidates the txn when a slow quorum of one shard never witnessed it
+        (`tests/recovery.rs`, see M2 below); and a recovery re-driving a decided
+        txn that one shard had applied and compacted re-read the other shards
+        alone, which could contradict the decision — it now takes the decision
+        from a replica that applied it.
         **Open** (confirmed or plausible, not yet fixed):
-        multi-shard recovery cannot see a shard that never witnessed the txn and could
-        commit it on the others only (needs the txn's route on every message);
         an anti-entropy reply or join header over the 64 MiB frame cap is shed forever;
         a config change's replies are keyed by epoch only, so two on one node collide;
         stage errors are ignored before durability-gated replies;
-        the sweep scheduler can starve groups beyond `max_concurrent`.
+        the sweep scheduler can starve groups beyond `max_concurrent`;
+        (review) recovery's superseding check ignores a later conflict only
+        pre-accepted at a replica, which a fast-committed conflict may be;
+        a decided multi-shard txn whose shard compacted it, with no replica heard
+        from that applied it, stays undecided (liveness, not safety);
+        a rejoin (wiped store) forgets the replica's in-flight votes and promises;
+        an epoch change can remap a route's keys onto replicas that never
+        witnessed an in-flight txn, which then answer "never witnessed".
   - [ ] **Real-cluster soak + chaos** over days (kills, partitions, clock skew,
         disk pressure, slow disks/links) on actual hardware — zero production
         mileage today.

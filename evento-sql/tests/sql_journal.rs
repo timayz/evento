@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use evento_accord::{Journal, NodeId};
+use evento_accord::{Ballot, Journal, Key, NodeId, TxnId};
 use evento_sql::SqlJournal;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::Sqlite;
@@ -66,6 +66,11 @@ async fn metadata_batch_append() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn routes_and_promises() {
+    sql_support::routes_and_promises(&memory().await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn survives_close_and_reopen() {
     let temp = tempfile::Builder::new()
         .prefix("accord_sql_reopen")
@@ -84,6 +89,15 @@ async fn survives_close_and_reopen() {
             .await
             .unwrap();
         journal.truncate(timestamp(150, 0)).await.unwrap(); // drops `a`, keeps `b`
+        journal
+            .save_route(b.txn, &[Key("acc".into()), Key("other".into())])
+            .await
+            .unwrap();
+        journal
+            .save_promise(TxnId(timestamp(400, 1)), Ballot(timestamp(500, 2)))
+            .await
+            .unwrap();
+        journal.flush().await.unwrap();
         journal.close().await;
     }
 
@@ -101,6 +115,16 @@ async fn survives_close_and_reopen() {
         "the watermark survives the restart"
     );
     assert_eq!(journal.load_metadata().await.unwrap().len(), 1);
+    assert_eq!(
+        journal.load_routes().await.unwrap(),
+        vec![(b.txn, vec![Key("acc".into()), Key("other".into())])],
+        "a route survives the restart"
+    );
+    assert_eq!(
+        journal.load_promises().await.unwrap(),
+        vec![(TxnId(timestamp(400, 1)), Ballot(timestamp(500, 2)))],
+        "and so does a blind promise"
+    );
 }
 
 #[tokio::test]

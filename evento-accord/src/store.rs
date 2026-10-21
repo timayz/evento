@@ -13,8 +13,8 @@ use async_trait::async_trait;
 use evento_core::Event;
 
 use crate::api::{AcceptorRecord, DataStore, Journal};
-use crate::clock::{NodeId, Timestamp, TxnId};
-use crate::message::CommandState;
+use crate::clock::{Ballot, NodeId, Timestamp, TxnId};
+use crate::message::{CommandState, Key};
 
 /// One applied transaction, recorded so tests can assert that every replica
 /// produced the same global serial order and the same conflict outcomes.
@@ -145,6 +145,10 @@ pub struct InMemoryJournal {
     metadata: Mutex<BTreeMap<u64, Vec<Vec<NodeId>>>>,
     /// Config-Paxos acceptor state per epoch.
     acceptors: Mutex<HashMap<u64, AcceptorRecord>>,
+    /// Multi-shard routes (see [`Journal::save_route`]).
+    routes: Mutex<HashMap<TxnId, Vec<Key>>>,
+    /// Blind recovery promises (see [`Journal::save_promise`]).
+    promises: Mutex<HashMap<TxnId, Ballot>>,
 }
 
 impl InMemoryJournal {
@@ -188,6 +192,14 @@ impl Journal for InMemoryJournal {
             .lock()
             .expect("journal poisoned")
             .retain(|txn, _| txn.0 >= before);
+        self.routes
+            .lock()
+            .expect("journal poisoned")
+            .retain(|txn, _| txn.0 >= before);
+        self.promises
+            .lock()
+            .expect("journal poisoned")
+            .retain(|txn, _| txn.0 >= before);
         *self.watermark.lock().expect("journal poisoned") = Some(before);
         Ok(())
     }
@@ -203,6 +215,41 @@ impl Journal for InMemoryJournal {
 
     async fn load_rejoin_bounds(&self) -> anyhow::Result<Vec<(NodeId, Timestamp)>> {
         Ok(self.rejoin_bounds.lock().expect("journal poisoned").clone())
+    }
+
+    async fn save_route(&self, txn: TxnId, route: &[Key]) -> anyhow::Result<()> {
+        self.routes
+            .lock()
+            .expect("journal poisoned")
+            .insert(txn, route.to_vec());
+        Ok(())
+    }
+
+    async fn load_routes(&self) -> anyhow::Result<Vec<(TxnId, Vec<Key>)>> {
+        Ok(self
+            .routes
+            .lock()
+            .expect("journal poisoned")
+            .iter()
+            .map(|(&txn, route)| (txn, route.clone()))
+            .collect())
+    }
+
+    async fn save_promise(&self, txn: TxnId, ballot: Ballot) -> anyhow::Result<()> {
+        let mut promises = self.promises.lock().expect("journal poisoned");
+        let promised = promises.entry(txn).or_insert(ballot);
+        *promised = (*promised).max(ballot);
+        Ok(())
+    }
+
+    async fn load_promises(&self) -> anyhow::Result<Vec<(TxnId, Ballot)>> {
+        Ok(self
+            .promises
+            .lock()
+            .expect("journal poisoned")
+            .iter()
+            .map(|(&txn, &ballot)| (txn, ballot))
+            .collect())
     }
 
     async fn append_metadata(&self, epoch: u64, layout: &[Vec<NodeId>]) -> anyhow::Result<()> {

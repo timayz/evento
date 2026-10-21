@@ -33,9 +33,9 @@ use crate::api::{
 };
 use crate::clock::{Ballot, Clock, HybridLogicalClock, NodeId, Timestamp, TxnId};
 use crate::failure_detector::FailureDetector;
-use crate::message::{CommandState, Key, Message, Status, SyncKnown};
+use crate::message::{CommandState, Key, Message, Status, SyncKnown, INVALIDATED_AT};
 use crate::metrics::{Metrics, MetricsSnapshot};
-use crate::replica::Replica;
+use crate::replica::{Replica, RoutedRecovery};
 use crate::sweep::SweepPressure;
 use crate::transport::Envelope;
 
@@ -394,12 +394,57 @@ struct RecoverFields {
     wait: bool,
     keys: Vec<Key>,
     events: Vec<Event>,
+    /// The transaction's route, when the report came routed
+    /// ([`Message::Routed`]): the replica holds a multi-shard transaction.
+    route: Option<Vec<Key>>,
 }
 
-/// A response to a `Recover`: a report, or a ballot rejection.
+impl RecoverFields {
+    /// Whether the replica recorded the transaction as invalidated.
+    fn invalidated(&self) -> bool {
+        self.known && self.status == Status::Applied && self.execute_at == INVALIDATED_AT
+    }
+}
+
+/// A response to a `Recover`: a report, a "never witnessed" (routed recovery
+/// only), or a ballot rejection.
 enum RecoverResp {
     Ok(RecoverFields),
+    NotWitnessed { redundant: bool },
     Nack(Ballot),
+}
+
+/// How one recovery attempt ended (see [`Node::recover_with`]).
+enum Attempt {
+    /// Decided: the outcome.
+    Done(CommitOutcome),
+    /// A higher ballot was promised: retry above it.
+    Retry(Ballot),
+    /// A report revealed the transaction's multi-shard route: retry routed.
+    Route(Vec<Key>),
+}
+
+/// One route shard's replies to a routed recovery, by kind.
+#[derive(Default)]
+struct ShardReports {
+    /// Reports from replicas holding the transaction.
+    known: usize,
+    /// Replicas that never witnessed it and promised the ballot.
+    blind: usize,
+    /// Replicas holding nothing of it below their redundancy watermark.
+    redundant: usize,
+    /// Replies of any kind.
+    heard: usize,
+}
+
+/// What a routed recovery's reports prove (see [`Node::route_verdict`]).
+enum Verdict {
+    /// The transaction never committed and never will: abort it everywhere.
+    Invalidate,
+    /// Recover it on these shards (the others applied it and compacted it).
+    Recover(Vec<ShardId>),
+    /// Not enough evidence yet; the sweep retries.
+    Undecided(String),
 }
 
 /// In-flight coordinations: transaction → channel delivering its tagged
@@ -898,6 +943,8 @@ impl Node {
             .persisted = watermark.unwrap_or(Timestamp::MIN);
         let mut commands = self.journal.load_all().await?;
         commands.sort_by_key(|cmd| (cmd.execute_at, cmd.txn));
+        let routes = self.journal.load_routes().await?;
+        let promises = self.journal.load_promises().await?;
 
         // Restore the control plane: acceptor state (so a restarted acceptor keeps
         // its promised ballots — Paxos crash-safety) and the metadata log (so the
@@ -928,6 +975,15 @@ impl Node {
             // the truncated journal) counts as already satisfied.
             if let Some(wm) = watermark {
                 replica.compact(wm);
+            }
+            // After the floor: what lies below it is redundant.
+            for (txn, route) in routes {
+                replica.restore_route(txn, route);
+            }
+            // A recovery promise for a transaction never witnessed still
+            // fences the original coordinator after the restart.
+            for (txn, ballot) in promises {
+                replica.restore_promise(txn, ballot);
             }
         }
         // Peers this node had stopped waiting for stay excluded until they
@@ -1689,7 +1745,30 @@ impl Node {
 
         let from = env.from;
         let mut out: Vec<(NodeId, Message)> = Vec::new();
-        match env.message {
+        // A multi-shard transaction's messages arrive wrapped with its route:
+        // handled as the inner message, the route kept with the command.
+        let (message, route) = match env.message {
+            Message::Routed { route, inner } => (*inner, Some(route)),
+            message => (message, None),
+        };
+        if route.is_some()
+            && !matches!(
+                message,
+                Message::PreAccept { .. }
+                    | Message::Accept { .. }
+                    | Message::Commit { .. }
+                    | Message::BeginRecovery { .. }
+                    | Message::BeginRecoveryOk { .. }
+            )
+        {
+            tracing::warn!(
+                node = self.id.0,
+                from = from.0,
+                "dropping a malformed routed message"
+            );
+            return out;
+        }
+        match message {
             Message::PreAccept { txn, keys, events } => {
                 // Only handle the keys/events this node owns.
                 let keys = self.owned_keys(keys);
@@ -1701,6 +1780,7 @@ impl Node {
                     .preaccept(txn, keys, events);
                 match vote {
                     Ok((execute_at, deps)) => {
+                        self.keep_route(txn, route.as_deref()).await;
                         self.journal_stage(txn).await;
                         out.push((
                             from,
@@ -1730,6 +1810,9 @@ impl Node {
                     .lock()
                     .expect("replica poisoned")
                     .accept(txn, ballot, execute_at, deps, keys);
+                if reply.is_ok() {
+                    self.keep_route(txn, route.as_deref()).await;
+                }
                 self.journal_stage(txn).await;
                 match reply {
                     Ok(deps) => out.push((from, Message::AcceptOk { txn, ballot, deps })),
@@ -1755,6 +1838,7 @@ impl Node {
                     .lock()
                     .expect("replica poisoned")
                     .commit(txn, execute_at, deps, events, keys, reply_to);
+                self.keep_route(txn, route.as_deref()).await;
                 self.journal_stage(txn).await;
 
                 // If already applied (e.g. a second recovery), short-circuit the
@@ -1835,30 +1919,72 @@ impl Node {
             } => {
                 let keys = self.owned_keys(keys);
                 let events = self.owned_events(events);
-                let reply = self
-                    .replica
-                    .lock()
-                    .expect("replica poisoned")
-                    .recover(txn, ballot, keys, events);
-                // Durable before the reply, like any promise or vote.
+                let reply = {
+                    let mut replica = self.replica.lock().expect("replica poisoned");
+                    match &route {
+                        // Routed: never pre-accept what this replica never
+                        // witnessed (see `Replica::recover_routed`).
+                        Some(_) => replica.recover_routed(txn, ballot, keys, events),
+                        None => replica
+                            .recover(txn, ballot, keys, events)
+                            .map(RoutedRecovery::Known),
+                    }
+                };
+                if matches!(reply, Ok(RoutedRecovery::Known(_))) {
+                    self.keep_route(txn, route.as_deref()).await;
+                }
+                // Durable before the reply, like any promise or vote — the
+                // promise of a transaction never witnessed included.
                 self.journal_stage(txn).await;
                 let message = match reply {
-                    Ok(state) => Message::BeginRecoveryOk {
+                    Ok(RoutedRecovery::Known(state)) => {
+                        let report = Message::BeginRecoveryOk {
+                            txn,
+                            ballot,
+                            known: state.known,
+                            status: state.status,
+                            accepted: state.accepted,
+                            execute_at: state.execute_at,
+                            deps: state.deps,
+                            superseding_rejects: state.superseding_rejects,
+                            wait: state.wait,
+                            keys: state.keys,
+                            events: state.events,
+                        };
+                        // A replica holding a multi-shard transaction always
+                        // answers with its route, so a recovery coordinator
+                        // that lacked it learns every shard to hear from.
+                        let held = self.replica.lock().expect("replica poisoned").route(txn);
+                        match held.or(route) {
+                            Some(route) => Message::Routed {
+                                route,
+                                inner: Box::new(report),
+                            },
+                            None => report,
+                        }
+                    }
+                    Ok(RoutedRecovery::NotWitnessed { redundant }) => Message::NotWitnessed {
                         txn,
                         ballot,
-                        known: state.known,
-                        status: state.status,
-                        accepted: state.accepted,
-                        execute_at: state.execute_at,
-                        deps: state.deps,
-                        superseding_rejects: state.superseding_rejects,
-                        wait: state.wait,
-                        keys: state.keys,
-                        events: state.events,
+                        redundant,
                     },
                     Err(promised) => Message::Nack { txn, promised },
                 };
                 out.push((from, message));
+            }
+            Message::Invalidate { txn } => {
+                let invalidated = self
+                    .replica
+                    .lock()
+                    .expect("replica poisoned")
+                    .invalidate(txn);
+                if invalidated {
+                    tracing::debug!(node = self.id.0, ?txn, "invalidated a transaction");
+                    self.applied_gen.send_modify(|v| *v += 1);
+                    self.journal_stage(txn).await;
+                    // Its dependents may be free to execute now.
+                    out.extend(self.drive_staged().await);
+                }
             }
             // Bootstrap / anti-entropy: a node asks for our committed state.
             Message::SyncRequest {
@@ -2234,8 +2360,16 @@ impl Node {
                     let _ = tx.send(reply);
                 }
             }
-            // Responses: hand to the waiting coordinator, tagged with the sender.
+            // Responses: hand to the waiting coordinator, tagged with the sender
+            // (still wrapped, so it learns the route a report carries).
             response => {
+                let response = match route {
+                    Some(route) => Message::Routed {
+                        route,
+                        inner: Box::new(response),
+                    },
+                    None => response,
+                };
                 if let Some(txn) = response.txn() {
                     let tx = self
                         .pending
@@ -2358,9 +2492,32 @@ impl Node {
     /// caller (the inbox batch loop, or the [`handle`](Self::handle) wrapper)
     /// flushes.
     async fn journal_stage(&self, txn: TxnId) {
-        let snapshot = self.replica.lock().expect("replica poisoned").snapshot(txn);
+        let (snapshot, promise) = {
+            let replica = self.replica.lock().expect("replica poisoned");
+            (replica.snapshot(txn), replica.unknown_promise(txn))
+        };
         if let Some(state) = snapshot {
             let _ = self.journal.stage(&state).await;
+        } else if let Some(ballot) = promise {
+            // Never witnessed, but promised to a recovery: the promise is what
+            // fences the original coordinator here, across a restart too.
+            let _ = self.journal.save_promise(txn, ballot).await;
+        }
+    }
+
+    /// Keeps `route` (when the message came routed) as `txn`'s route, staging
+    /// it to the journal the first time — durable with the vote it travels
+    /// with, so a restarted replica still recovers the transaction on every
+    /// shard it touches.
+    async fn keep_route(&self, txn: TxnId, route: Option<&[Key]>) {
+        let Some(route) = route else { return };
+        let kept = self
+            .replica
+            .lock()
+            .expect("replica poisoned")
+            .set_route(txn, route);
+        if kept {
+            let _ = self.journal.save_route(txn, route).await;
         }
     }
 
@@ -2537,10 +2694,20 @@ impl Node {
         events: &[Event],
     ) -> anyhow::Result<(CommitOutcome, bool)> {
         let (plans, _union) = self.plan(keys, events);
+        let route = Self::route_of(&plans, keys);
         let mut rx = self.register(txn);
-        let (execute_at, shard_deps, all_fast) = self.agree(&mut rx, &plans, txn).await?;
+        let (execute_at, shard_deps, all_fast) =
+            self.agree(&mut rx, &plans, route.as_deref(), txn).await?;
         let conflict = self
-            .execute(&mut rx, &plans, txn, execute_at, shard_deps)
+            .execute(
+                &mut rx,
+                &plans,
+                route.as_deref(),
+                txn,
+                execute_at,
+                shard_deps,
+                &[],
+            )
             .await?;
         self.deregister(txn);
         Ok((CommitOutcome { txn, conflict }, all_fast))
@@ -2552,6 +2719,7 @@ impl Node {
         &self,
         rx: &mut mpsc::UnboundedReceiver<(NodeId, Message)>,
         plans: &[ShardPlan],
+        route: Option<&[Key]>,
         txn: TxnId,
     ) -> anyhow::Result<(Timestamp, HashMap<ShardId, BTreeSet<TxnId>>, bool)> {
         let t0 = txn.0;
@@ -2562,11 +2730,14 @@ impl Node {
         for plan in plans {
             self.broadcast(
                 &plan.replicas,
-                Message::PreAccept {
-                    txn,
-                    keys: plan.keys.clone(),
-                    events: plan.events.clone(),
-                },
+                Self::routed(
+                    route,
+                    Message::PreAccept {
+                        txn,
+                        keys: plan.keys.clone(),
+                        events: plan.events.clone(),
+                    },
+                ),
             )
             .await;
         }
@@ -2680,13 +2851,16 @@ impl Node {
                 let deps: Vec<TxnId> = shard_deps[&plan.shard].iter().copied().collect();
                 self.broadcast(
                     &plan.replicas,
-                    Message::Accept {
-                        txn,
-                        ballot: Ballot(t0),
-                        execute_at,
-                        deps,
-                        keys: plan.keys.clone(),
-                    },
+                    Self::routed(
+                        route,
+                        Message::Accept {
+                            txn,
+                            ballot: Ballot(t0),
+                            execute_at,
+                            deps,
+                            keys: plan.keys.clone(),
+                        },
+                    ),
                 )
                 .await;
             }
@@ -2725,25 +2899,40 @@ impl Node {
     /// Commit → Read → Apply: drive the atomic decision across all touched
     /// shards (each plan carries its shard's keys/events slice) and return
     /// whether the write was aborted.
+    ///
+    /// `applied` names replicas a recovery saw holding the transaction
+    /// applied: each answers the Commit with the decision itself, and a
+    /// shard's read is waited for from one of them. Their decision is final,
+    /// and it may rest on a shard no longer planned (applied and compacted
+    /// there): a fresh read of the planned shards alone could contradict it.
+    #[allow(clippy::too_many_arguments)]
     async fn execute(
         &self,
         rx: &mut mpsc::UnboundedReceiver<(NodeId, Message)>,
         plans: &[ShardPlan],
+        route: Option<&[Key]>,
         txn: TxnId,
         execute_at: Timestamp,
         shard_deps: HashMap<ShardId, BTreeSet<TxnId>>,
+        applied: &[NodeId],
     ) -> anyhow::Result<bool> {
         let union = Self::union_of(plans);
-        self.broadcast_commit(plans, txn, execute_at, &shard_deps)
+        self.broadcast_commit(plans, route, txn, execute_at, &shard_deps)
             .await;
 
-        // Read: a slow quorum per shard reports its version condition.
+        // Read: a slow quorum per shard reports its version condition —
+        // including one of the shard's applied replicas, if it has any.
+        let heard_applied = |p: &ShardPlan, got: &[(NodeId, bool)]| {
+            let mut here = applied.iter().filter(|n| p.replicas.contains(n)).peekable();
+            here.peek().is_none() || here.any(|n| got.iter().any(|(from, _)| from == n))
+        };
         let reads = self
-            .collect_by_shard(
+            .collect_by_shard_tagged(
                 rx,
                 plans,
-                |p| p.slow_q,
+                |p, got| got.len() >= p.slow_q && heard_applied(p, got),
                 Self::after(self.settings.collect_timeout),
+                HashSet::new(),
                 |m| match m {
                     Message::ReadOk { ok, .. } => Some(ok),
                     _ => None,
@@ -2751,12 +2940,13 @@ impl Node {
             )
             .await;
         for plan in plans {
-            if reads[&plan.shard].len() < plan.slow_q {
+            let got = &reads[&plan.shard];
+            if got.len() < plan.slow_q || !heard_applied(plan, got) {
                 anyhow::bail!("read quorum not reached for shard {}", plan.shard);
             }
         }
         // Atomic commit only if every shard's condition holds.
-        let commit = reads.values().flatten().all(|ok| *ok);
+        let commit = reads.values().flatten().all(|(_, ok)| *ok);
 
         // Apply: enact the decision and wait for a slow quorum per shard.
         self.broadcast(&union, Message::Apply { txn, commit }).await;
@@ -2811,6 +3001,7 @@ impl Node {
     async fn broadcast_commit(
         &self,
         plans: &[ShardPlan],
+        route: Option<&[Key]>,
         txn: TxnId,
         execute_at: Timestamp,
         shard_deps: &HashMap<ShardId, BTreeSet<TxnId>>,
@@ -2825,14 +3016,17 @@ impl Node {
                 .collect();
             self.broadcast(
                 &plan.replicas,
-                Message::Commit {
-                    txn,
-                    execute_at,
-                    deps,
-                    keys: plan.keys.clone(),
-                    events: plan.events.clone(),
-                    reply_to: self.id,
-                },
+                Self::routed(
+                    route,
+                    Message::Commit {
+                        txn,
+                        execute_at,
+                        deps,
+                        keys: plan.keys.clone(),
+                        events: plan.events.clone(),
+                        reply_to: self.id,
+                    },
+                ),
             )
             .await;
         }
@@ -2915,6 +3109,14 @@ impl Node {
     /// The recovery reports a message carries, if it answers `ballot`.
     fn recover_report(message: Message, ballot: Ballot) -> Option<RecoverResp> {
         match message {
+            // A routed report carries the transaction's route.
+            Message::Routed { route, inner } => match Self::recover_report(*inner, ballot)? {
+                RecoverResp::Ok(mut fields) => {
+                    fields.route = Some(route);
+                    Some(RecoverResp::Ok(fields))
+                }
+                other => Some(other),
+            },
             // Only reports answering THIS attempt's ballot count — a stale
             // reply from an earlier ballot must not fill the quorum (that could
             // rest the decision on a sub-quorum sample and miss an existing
@@ -2941,6 +3143,7 @@ impl Node {
                 wait,
                 keys,
                 events,
+                route: None,
             })),
             Message::RecoverOk {
                 ballot: b,
@@ -2963,7 +3166,13 @@ impl Node {
                 wait: false,
                 keys,
                 events,
+                route: None,
             })),
+            Message::NotWitnessed {
+                ballot: b,
+                redundant,
+                ..
+            } if b == ballot => Some(RecoverResp::NotWitnessed { redundant }),
             Message::Nack { promised, .. } => Some(RecoverResp::Nack(promised)),
             _ => None,
         }
@@ -2972,6 +3181,14 @@ impl Node {
     /// [`recover`](Self::recover), handing the replicas `keys`/`events` — all
     /// this node knows of the transaction (the coordinator settling its own
     /// write knows all of it).
+    ///
+    /// A multi-shard transaction is recovered **by its route** — kept with
+    /// the command, carried by any report, or, for the coordinator settling
+    /// its own write, its keys — so every shard it touches is heard from,
+    /// including one that never witnessed it or answers late
+    /// ([`recover_routed`](Self::recover_routed)). Without a route (a
+    /// single-shard transaction) the touched shards are those the reports
+    /// reveal ([`recover_unrouted`](Self::recover_unrouted)).
     async fn recover_with(
         &self,
         txn: TxnId,
@@ -2991,190 +3208,507 @@ impl Node {
             anyhow::bail!("transaction {txn:?} is locally in flight; not recovering it");
         }
 
-        let all_nodes = self.topology.nodes();
+        let mut route = self
+            .replica
+            .lock()
+            .expect("replica poisoned")
+            .route(txn)
+            .or_else(|| self.spans_shards(&keys).then(|| keys.clone()));
         let mut ballot = Ballot(self.clock.now());
 
         for _attempt in 0..3 {
             let mut rx = self.register(txn);
-            // Every replica gets what this node holds: one that never
-            // witnessed the transaction pre-accepts it under this ballot, so
-            // its vote counts here and the original coordinator, its PreAccept
-            // possibly still in flight, can no longer win it there.
+            let attempt = match &route {
+                Some(route) => {
+                    self.recover_routed(&mut rx, txn, ballot, route, &keys, &events)
+                        .await
+                }
+                None => {
+                    self.recover_unrouted(&mut rx, txn, ballot, &keys, &events)
+                        .await
+                }
+            };
+            // Deregistered on failure too: a leaked response channel makes the
+            // sweep take this node's own transaction for locally in flight,
+            // and never recover it.
+            self.deregister(txn);
+            match attempt? {
+                Attempt::Done(outcome) => return Ok(outcome),
+                Attempt::Retry(promised) => ballot = self.higher_ballot(promised),
+                // The replicas already promised `ballot`: ask again under it.
+                Attempt::Route(found) => route = Some(found),
+            }
+        }
+
+        anyhow::bail!("recovery exhausted its ballot retries")
+    }
+
+    /// One recovery attempt for a transaction without a known route: the
+    /// touched shards are reassembled from the reports.
+    async fn recover_unrouted(
+        &self,
+        rx: &mut mpsc::UnboundedReceiver<(NodeId, Message)>,
+        txn: TxnId,
+        ballot: Ballot,
+        keys: &[Key],
+        events: &[Event],
+    ) -> anyhow::Result<Attempt> {
+        let all_nodes = self.topology.nodes();
+        // Every replica gets what this node holds: one that never
+        // witnessed the transaction pre-accepts it under this ballot, so
+        // its vote counts here and the original coordinator, its PreAccept
+        // possibly still in flight, can no longer win it there.
+        self.broadcast(
+            &all_nodes,
+            Message::BeginRecovery {
+                txn,
+                ballot,
+                keys: keys.to_vec(),
+                events: events.to_vec(),
+            },
+        )
+        .await;
+
+        // Gather what every reachable replica knows within a short window,
+        // tagged with the responder so deps can be grouped by shard.
+        let mut resp = Self::collect_tagged(
+            rx,
+            all_nodes.len(),
+            Self::after(self.settings.fast_timeout),
+            |m| Self::recover_report(m, ballot),
+        )
+        .await;
+        if let Some(promised) = Self::nack_in(&resp) {
+            return Ok(Attempt::Retry(promised));
+        }
+        // A replica holding the transaction with a multi-shard route: it must
+        // be recovered by that route instead.
+        if let Some(route) = resp
+            .iter()
+            .find_map(|(_, r)| match r {
+                RecoverResp::Ok(f) => f.route.clone(),
+                _ => None,
+            })
+            .filter(|route| self.spans_shards(route))
+        {
+            return Ok(Attempt::Route(route));
+        }
+
+        // Reconstruct the full key/event set (each shard reported only its
+        // owned subset) and plan the touched shards — the plan re-partitions
+        // both back into per-shard slices for Accept/Commit.
+        let (all_keys, all_events) = self.reassemble(keys, events, &resp);
+
+        // A replica that owns none of what this node sent (another shard's
+        // part) answered blind; now that the reports revealed its part, ask
+        // it again so it votes too.
+        let blind: Vec<NodeId> = resp
+            .iter()
+            .filter(|(_, r)| matches!(r, RecoverResp::Ok(f) if !f.known))
+            .map(|(from, _)| *from)
+            .filter(|&node| {
+                all_keys
+                    .iter()
+                    .any(|k| !keys.contains(k) && self.topology.owns(node, k))
+            })
+            .collect();
+        if !blind.is_empty() {
             self.broadcast(
-                &all_nodes,
+                &blind,
                 Message::BeginRecovery {
                     txn,
                     ballot,
-                    keys: keys.clone(),
-                    events: events.clone(),
+                    keys: all_keys.clone(),
+                    events: all_events.clone(),
                 },
             )
             .await;
-
-            // Gather what every reachable replica knows within a short window,
-            // tagged with the responder so deps can be grouped by shard.
-            let mut resp = Self::collect_tagged(
-                &mut rx,
-                all_nodes.len(),
+            let again = Self::collect_tagged(
+                rx,
+                blind.len(),
                 Self::after(self.settings.fast_timeout),
                 |m| Self::recover_report(m, ballot),
             )
             .await;
-            if let Some(promised) = Self::nack_in(&resp) {
-                self.deregister(txn);
-                ballot = self.higher_ballot(promised);
-                continue;
+            if let Some(promised) = Self::nack_in(&again) {
+                return Ok(Attempt::Retry(promised));
             }
+            for (from, report) in again {
+                if let Some(slot) = resp.iter_mut().find(|(n, _)| *n == from) {
+                    slot.1 = report;
+                }
+            }
+        }
 
-            // Reconstruct the full key/event set (each shard reported only its
-            // owned subset) and plan the touched shards — the plan re-partitions
-            // both back into per-shard slices for Accept/Commit.
-            let (all_keys, all_events) = self.reassemble(&keys, &events, &resp);
+        let known: Vec<(NodeId, RecoverFields)> = resp
+            .into_iter()
+            .filter_map(|(from, r)| match r {
+                RecoverResp::Ok(f) if f.known => Some((from, f)),
+                _ => None,
+            })
+            .collect();
+        if known.is_empty() {
+            anyhow::bail!("transaction unknown to recovery quorum");
+        }
+        let (plans, _union) = self.plan(&all_keys, &all_events);
 
-            // A replica that owns none of what this node sent (another shard's
-            // part) answered blind; now that the reports revealed its part, ask
-            // it again so it votes too.
-            let blind: Vec<NodeId> = resp
+        // Recovery-quorum gate: the decision must rest on a slow quorum of
+        // every touched shard's replicas — each one's report and vote — so
+        // it intersects any quorum that could already have decided: without
+        // it a sub-quorum sample could miss a Commit/Accept, or raise `t0`
+        // while the transaction fast-committed at `t0`. A replica that
+        // owns a key of the transaction never answers blind (it pre-accepts
+        // under this ballot), so every one heard from counts. Otherwise
+        // bail; the next sweep retries.
+        for plan in &plans {
+            let heard = known
                 .iter()
-                .filter(|(_, r)| matches!(r, RecoverResp::Ok(f) if !f.known))
-                .map(|(from, _)| *from)
-                .filter(|&node| {
-                    all_keys
-                        .iter()
-                        .any(|k| !keys.contains(k) && self.topology.owns(node, k))
-                })
-                .collect();
-            if !blind.is_empty() {
-                self.broadcast(
-                    &blind,
-                    Message::BeginRecovery {
-                        txn,
-                        ballot,
-                        keys: all_keys.clone(),
-                        events: all_events.clone(),
-                    },
-                )
-                .await;
-                let again = Self::collect_tagged(
-                    &mut rx,
-                    blind.len(),
-                    Self::after(self.settings.fast_timeout),
-                    |m| Self::recover_report(m, ballot),
-                )
-                .await;
-                if let Some(promised) = Self::nack_in(&again) {
-                    self.deregister(txn);
-                    ballot = self.higher_ballot(promised);
+                .filter(|(from, _)| self.topology.node_shard(*from) == Some(plan.shard))
+                .count();
+            if heard < plan.slow_q {
+                anyhow::bail!("recovery quorum not reached for shard {}", plan.shard);
+            }
+        }
+        self.drive_recovery(rx, txn, ballot, &plans, None, known)
+            .await
+    }
+
+    /// One recovery attempt for a multi-shard transaction, by its `route`.
+    ///
+    /// Every replica of every route shard is asked (`BeginRecovery`, routed).
+    /// One holding the transaction reports on it; one that never witnessed it
+    /// does **not** pre-accept it — it promises the ballot (journaled) and
+    /// says so ([`Message::NotWitnessed`]). The reports are gathered until
+    /// each route shard has been heard from enough to decide (or the slow-path
+    /// budget runs out — a shard slower than the fast-path window is waited
+    /// for, never left out), then [`route_verdict`](Self::route_verdict)
+    /// decides: invalidate — a shard never witnessed the transaction, so it
+    /// never committed (abort it everywhere, [`Message::Invalidate`]) — or
+    /// recover it as usual over the route's shards.
+    async fn recover_routed(
+        &self,
+        rx: &mut mpsc::UnboundedReceiver<(NodeId, Message)>,
+        txn: TxnId,
+        ballot: Ballot,
+        route: &[Key],
+        keys: &[Key],
+        events: &[Event],
+    ) -> anyhow::Result<Attempt> {
+        let (shards, targets) = self.plan(route, &[]);
+        self.broadcast(
+            &targets,
+            Self::routed(
+                Some(route),
+                Message::BeginRecovery {
+                    txn,
+                    ballot,
+                    keys: keys.to_vec(),
+                    events: events.to_vec(),
+                },
+            ),
+        )
+        .await;
+        let resp = self.collect_route_reports(rx, &shards, ballot).await;
+        if let Some(promised) = Self::nack_in(&resp) {
+            return Ok(Attempt::Retry(promised));
+        }
+
+        let planned = match self.route_verdict(&shards, &resp) {
+            Verdict::Undecided(why) => anyhow::bail!("recovery of {txn:?} undecided: {why}"),
+            Verdict::Invalidate => {
+                tracing::debug!(
+                    node = self.id.0,
+                    ?txn,
+                    "invalidating a transaction a shard never witnessed"
+                );
+                self.broadcast(&targets, Message::Invalidate { txn }).await;
+                return Ok(Attempt::Done(CommitOutcome {
+                    txn,
+                    conflict: true,
+                }));
+            }
+            Verdict::Recover(planned) => planned,
+        };
+
+        let (_, all_events) = self.reassemble(keys, events, &resp);
+        let planned_keys: Vec<Key> = route
+            .iter()
+            .filter(|k| planned.contains(&self.topology.shard_of(k)))
+            .cloned()
+            .collect();
+        let (plans, _union) = self.plan(&planned_keys, &all_events);
+        let known: Vec<(NodeId, RecoverFields)> = resp
+            .into_iter()
+            .filter_map(|(from, r)| match r {
+                RecoverResp::Ok(f) if f.known => Some((from, f)),
+                _ => None,
+            })
+            .filter(|(from, _)| {
+                self.topology
+                    .node_shard(*from)
+                    .is_some_and(|shard| planned.contains(&shard))
+            })
+            .collect();
+        self.drive_recovery(rx, txn, ballot, &plans, Some(route), known)
+            .await
+    }
+
+    /// Gathers a routed recovery's reports — one per replica of the route's
+    /// `shards` — until [`route_settled`](Self::route_settled) holds, a Nack
+    /// arrives, or the slow-path budget runs out.
+    async fn collect_route_reports(
+        &self,
+        rx: &mut mpsc::UnboundedReceiver<(NodeId, Message)>,
+        shards: &[ShardPlan],
+        ballot: Ballot,
+    ) -> Vec<(NodeId, RecoverResp)> {
+        let deadline = Self::after(self.settings.collect_timeout);
+        let mut resp: Vec<(NodeId, RecoverResp)> = Vec::new();
+        // One report per responder (see `collect_tagged`).
+        let mut seen: HashSet<NodeId> = HashSet::new();
+        while Self::nack_in(&resp).is_none() && !self.route_settled(shards, &resp) {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some((from, message))) => {
+                    let ours = shards.iter().any(|s| s.replicas.contains(&from));
+                    if let Some(report) = Self::recover_report(message, ballot) {
+                        if ours && seen.insert(from) {
+                            resp.push((from, report));
+                        }
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+        resp
+    }
+
+    /// One route shard's reports, counted by kind.
+    fn shard_reports(&self, shard: ShardId, resp: &[(NodeId, RecoverResp)]) -> ShardReports {
+        let mut counts = ShardReports::default();
+        for (_, report) in resp
+            .iter()
+            .filter(|(from, _)| self.topology.node_shard(*from) == Some(shard))
+        {
+            counts.heard += 1;
+            match report {
+                RecoverResp::Ok(f) if f.known => counts.known += 1,
+                RecoverResp::NotWitnessed { redundant: false } => counts.blind += 1,
+                RecoverResp::NotWitnessed { redundant: true } => counts.redundant += 1,
+                _ => {}
+            }
+        }
+        counts
+    }
+
+    /// Whether a routed recovery has heard enough to decide: an invalidation
+    /// is already proven (an invalidated report, or a slow quorum of one shard
+    /// that never witnessed the transaction), or every route shard has a slow
+    /// quorum of reports, a report from below its watermark, or has answered
+    /// in full. A decided transaction one shard compacted needs a report from
+    /// a replica that applied it (see [`route_verdict`](Self::route_verdict)):
+    /// until one arrives, every other shard is heard out in full.
+    fn route_settled(&self, shards: &[ShardPlan], resp: &[(NodeId, RecoverResp)]) -> bool {
+        let known = || {
+            resp.iter().filter_map(|(_, r)| match r {
+                RecoverResp::Ok(f) if f.known => Some(f),
+                _ => None,
+            })
+        };
+        if known().any(RecoverFields::invalidated)
+            || shards
+                .iter()
+                .any(|s| self.shard_reports(s.shard, resp).blind >= s.slow_q)
+        {
+            return true;
+        }
+        let counts: Vec<ShardReports> = shards
+            .iter()
+            .map(|s| self.shard_reports(s.shard, resp))
+            .collect();
+        let await_applied = counts.iter().any(|c| c.redundant > 0)
+            && known().any(|f| f.status >= Status::Committed)
+            && !known().any(|f| f.status == Status::Applied);
+        shards.iter().zip(&counts).all(|(s, c)| {
+            (c.known >= s.slow_q && !await_applied)
+                || c.redundant > 0
+                || c.heard == s.replicas.len()
+        })
+    }
+
+    /// What a routed recovery's reports prove, in order:
+    ///
+    /// 1. **Invalidated** somewhere — a recovery already proved the
+    ///    transaction never committed: abort it again.
+    /// 2. A slow quorum of one shard **never witnessed** it, each having
+    ///    durably promised this ballot: it never committed (a commit needs a
+    ///    PreAccept quorum on every shard, which would meet that quorum), and
+    ///    never will (those replicas refuse the original coordinator below the
+    ///    promise, and no recovery can gather a witnessed quorum there either).
+    ///    Invalidate.
+    /// 3. A report at `Committed` or beyond: the decision exists. Recover it
+    ///    on every shard still holding it — a shard reporting from below its
+    ///    watermark applied it and compacted it away — gated on a slow quorum
+    ///    of reports from each. Skipping such a shard drops its read, so the
+    ///    decision is then taken from a replica that applied it (see
+    ///    [`execute`](Self::execute)); with none heard from, nothing is decided.
+    /// 4. A shard reporting from below its watermark while another shard's
+    ///    slow quorum is still below `Committed`: the low shard never held it
+    ///    un-applied (that pins the watermark), and did not apply it (an Apply
+    ///    follows reads from a quorum of every shard, all `Committed` first) —
+    ///    so it never witnessed it, and never will: no coordinator's message
+    ///    outlives the compaction margin (see
+    ///    [`compaction_margin`](NodeConfig::compaction_margin)). Invalidate.
+    /// 5. A slow quorum of reports from every shard: recover as usual.
+    /// 6. Otherwise, too little is known yet.
+    fn route_verdict(&self, shards: &[ShardPlan], resp: &[(NodeId, RecoverResp)]) -> Verdict {
+        let known = || {
+            resp.iter().filter_map(|(_, r)| match r {
+                RecoverResp::Ok(f) if f.known => Some(f),
+                _ => None,
+            })
+        };
+        if known().any(RecoverFields::invalidated) {
+            return Verdict::Invalidate;
+        }
+        let counts: Vec<(&ShardPlan, ShardReports)> = shards
+            .iter()
+            .map(|s| (s, self.shard_reports(s.shard, resp)))
+            .collect();
+        if counts.iter().any(|(s, c)| c.blind >= s.slow_q) {
+            return Verdict::Invalidate;
+        }
+        let lacking = |s: &ShardPlan, c: &ShardReports| {
+            Verdict::Undecided(format!(
+                "shard {}: {} of {} replicas reported it, {} never witnessed it",
+                s.shard, c.known, s.slow_q, c.blind
+            ))
+        };
+        if known().any(|f| f.status >= Status::Committed) {
+            // A shard that compacted it applied the decision, and its read
+            // is gone: the decision must come from a replica that applied it.
+            let applied = known().any(|f| f.status == Status::Applied);
+            let mut planned = Vec::new();
+            for (s, c) in &counts {
+                if c.redundant > 0 {
+                    if !applied {
+                        return Verdict::Undecided(format!(
+                            "shard {} compacted it, and no replica heard from applied it",
+                            s.shard
+                        ));
+                    }
                     continue;
                 }
-                for (from, report) in again {
-                    if let Some(slot) = resp.iter_mut().find(|(n, _)| *n == from) {
-                        slot.1 = report;
-                    }
+                if c.known < s.slow_q {
+                    return lacking(s, c);
                 }
+                planned.push(s.shard);
             }
-
-            let known: Vec<(NodeId, RecoverFields)> = resp
-                .into_iter()
-                .filter_map(|(from, r)| match r {
-                    RecoverResp::Ok(f) if f.known => Some((from, f)),
-                    _ => None,
-                })
-                .collect();
-            if known.is_empty() {
-                self.deregister(txn);
-                anyhow::bail!("transaction unknown to recovery quorum");
+            if planned.is_empty() {
+                return Verdict::Undecided("every shard compacted it away".into());
             }
-            let (plans, _union) = self.plan(&all_keys, &all_events);
+            return Verdict::Recover(planned);
+        }
+        if counts.iter().any(|(_, c)| c.redundant > 0)
+            && counts.iter().any(|(s, c)| c.known >= s.slow_q)
+        {
+            return Verdict::Invalidate;
+        }
+        match counts.iter().find(|(s, c)| c.known < s.slow_q) {
+            Some((s, c)) => lacking(s, c),
+            None => Verdict::Recover(shards.iter().map(|s| s.shard).collect()),
+        }
+    }
 
-            // Recovery-quorum gate: the decision must rest on a slow quorum of
-            // every touched shard's replicas — each one's report and vote — so
-            // it intersects any quorum that could already have decided: without
-            // it a sub-quorum sample could miss a Commit/Accept, or raise `t0`
-            // while the transaction fast-committed at `t0`. A replica that
-            // owns a key of the transaction never answers blind (it pre-accepts
-            // under this ballot), so every one heard from counts. Otherwise
-            // bail; the next sweep retries.
-            for plan in &plans {
-                let heard = known
+    /// Decides a recovered transaction from the `known` reports — a slow
+    /// quorum of every shard in `plans` — and drives it: re-propose under
+    /// `ballot` (unless already committed), then Commit → Read → Apply.
+    async fn drive_recovery(
+        &self,
+        rx: &mut mpsc::UnboundedReceiver<(NodeId, Message)>,
+        txn: TxnId,
+        ballot: Ballot,
+        plans: &[ShardPlan],
+        route: Option<&[Key]>,
+        known: Vec<(NodeId, RecoverFields)>,
+    ) -> anyhow::Result<Attempt> {
+        // An invalidated report is decided by the routed path; the
+        // timestamp it carries is no position to commit at.
+        if known.iter().any(|(_, f)| f.invalidated()) {
+            anyhow::bail!("transaction {txn:?} was invalidated, but its route is unknown here");
+        }
+        let max_status = known
+            .iter()
+            .map(|(_, f)| f.status)
+            .max()
+            .expect("non-empty");
+        let applied: Vec<NodeId> = known
+            .iter()
+            .filter(|(_, f)| f.status == Status::Applied)
+            .map(|(from, _)| *from)
+            .collect();
+        // The recovered execution timestamp (global), by max status.
+        let execute_at = match max_status {
+            Status::Committed | Status::Reading | Status::Applied => {
+                known
                     .iter()
-                    .filter(|(from, _)| self.topology.node_shard(*from) == Some(plan.shard))
-                    .count();
-                if heard < plan.slow_q {
-                    self.deregister(txn);
-                    anyhow::bail!("recovery quorum not reached for shard {}", plan.shard);
-                }
+                    .find(|(_, f)| f.status >= Status::Committed)
+                    .expect("committed present")
+                    .1
+                    .execute_at
             }
-
-            let max_status = known
-                .iter()
-                .map(|(_, f)| f.status)
-                .max()
-                .expect("non-empty");
-            // The recovered execution timestamp (global), by max status.
-            let execute_at = match max_status {
-                Status::Committed | Status::Reading | Status::Applied => {
+            // The value accepted at the highest ballot — among the reports
+            // that accepted one: a pre-accepted command carries `Ballot(t0)`
+            // as a placeholder, which ties the original coordinator's own
+            // Accept ballot and must not let a pre-accept vote win.
+            Status::Accepted => {
+                known
+                    .iter()
+                    .filter(|(_, f)| f.status == Status::Accepted)
+                    .max_by_key(|(_, f)| f.accepted)
+                    .expect("an accepted report")
+                    .1
+                    .execute_at
+            }
+            Status::PreAccepted => {
+                if known.iter().any(|(_, f)| f.superseding_rejects) {
                     known
                         .iter()
-                        .find(|(_, f)| f.status >= Status::Committed)
-                        .expect("committed present")
-                        .1
-                        .execute_at
-                }
-                // The value accepted at the highest ballot — among the reports
-                // that accepted one: a pre-accepted command carries `Ballot(t0)`
-                // as a placeholder, which ties the original coordinator's own
-                // Accept ballot and must not let a pre-accept vote win.
-                Status::Accepted => {
-                    known
-                        .iter()
-                        .filter(|(_, f)| f.status == Status::Accepted)
-                        .max_by_key(|(_, f)| f.accepted)
-                        .expect("an accepted report")
-                        .1
-                        .execute_at
-                }
-                Status::PreAccepted => {
-                    if known.iter().any(|(_, f)| f.superseding_rejects) {
-                        known
-                            .iter()
-                            .map(|(_, f)| f.execute_at)
-                            .max()
-                            .expect("non-empty")
-                    } else if known.iter().any(|(_, f)| f.wait) {
-                        // An earlier conflict, accepted to execute after `t0`
-                        // without this transaction, has yet to commit: only
-                        // its committed dependencies tell whether the fast
-                        // path was possible. Retry once it has.
-                        self.deregister(txn);
-                        anyhow::bail!(
-                            "recovery waits for an earlier conflict of {txn:?} to commit"
-                        );
-                    } else {
-                        txn.0
-                    }
-                }
-            };
-
-            // Per-shard deps: union of the deps reported by each shard's own
-            // replicas, so no shard's barrier names a transaction from another.
-            let mut shard_deps: HashMap<ShardId, BTreeSet<TxnId>> =
-                plans.iter().map(|p| (p.shard, BTreeSet::new())).collect();
-            for (from, f) in &known {
-                if let Some(shard) = self.topology.node_shard(*from) {
-                    if let Some(set) = shard_deps.get_mut(&shard) {
-                        set.extend(f.deps.iter().copied());
-                    }
+                        .map(|(_, f)| f.execute_at)
+                        .max()
+                        .expect("non-empty")
+                } else if known.iter().any(|(_, f)| f.wait) {
+                    // An earlier conflict, accepted to execute after `t0`
+                    // without this transaction, has yet to commit: only
+                    // its committed dependencies tell whether the fast
+                    // path was possible. Retry once it has.
+                    anyhow::bail!("recovery waits for an earlier conflict of {txn:?} to commit");
+                } else {
+                    txn.0
                 }
             }
+        };
 
-            // Re-propose under our ballot (unless already committed), then drive
-            // the atomic Commit → Read → Apply.
-            if max_status < Status::Committed {
-                for plan in &plans {
-                    let deps: Vec<TxnId> = shard_deps[&plan.shard].iter().copied().collect();
-                    self.broadcast(
-                        &plan.replicas,
+        // Per-shard deps: union of the deps reported by each shard's own
+        // replicas, so no shard's barrier names a transaction from another.
+        let mut shard_deps: HashMap<ShardId, BTreeSet<TxnId>> =
+            plans.iter().map(|p| (p.shard, BTreeSet::new())).collect();
+        for (from, f) in &known {
+            if let Some(shard) = self.topology.node_shard(*from) {
+                if let Some(set) = shard_deps.get_mut(&shard) {
+                    set.extend(f.deps.iter().copied());
+                }
+            }
+        }
+
+        // Re-propose under our ballot (unless already committed), then drive
+        // the atomic Commit → Read → Apply.
+        if max_status < Status::Committed {
+            for plan in plans {
+                let deps: Vec<TxnId> = shard_deps[&plan.shard].iter().copied().collect();
+                self.broadcast(
+                    &plan.replicas,
+                    Self::routed(
+                        route,
                         Message::Accept {
                             txn,
                             ballot,
@@ -3182,68 +3716,56 @@ impl Node {
                             deps,
                             keys: plan.keys.clone(),
                         },
-                    )
-                    .await;
+                    ),
+                )
+                .await;
+            }
+            let acks = self
+                .collect_by_shard(
+                    rx,
+                    plans,
+                    |p| p.slow_q,
+                    Self::after(self.settings.collect_timeout),
+                    |m| match m {
+                        Message::AcceptOk {
+                            ballot: b, deps, ..
+                        } if b == ballot => Some(Ok(deps)),
+                        Message::Nack { promised, .. } => Some(Err(promised)),
+                        _ => None,
+                    },
+                )
+                .await;
+            if let Some(promised) = acks
+                .values()
+                .flatten()
+                .find_map(|a| a.as_ref().err().copied())
+            {
+                return Ok(Attempt::Retry(promised));
+            }
+            // Commit only what a quorum of every shard accepted: a value
+            // accepted by fewer may be overlooked by a later recovery,
+            // which could then decide differently.
+            for plan in plans {
+                if acks[&plan.shard].iter().filter(|a| a.is_ok()).count() < plan.slow_q {
+                    anyhow::bail!(
+                        "recovery accept quorum not reached for shard {}",
+                        plan.shard
+                    );
                 }
-                let acks = self
-                    .collect_by_shard(
-                        &mut rx,
-                        &plans,
-                        |p| p.slow_q,
-                        Self::after(self.settings.collect_timeout),
-                        |m| match m {
-                            Message::AcceptOk {
-                                ballot: b, deps, ..
-                            } if b == ballot => Some(Ok(deps)),
-                            Message::Nack { promised, .. } => Some(Err(promised)),
-                            _ => None,
-                        },
-                    )
-                    .await;
-                if let Some(promised) = acks
-                    .values()
-                    .flatten()
-                    .find_map(|a| a.as_ref().err().copied())
-                {
-                    self.deregister(txn);
-                    ballot = self.higher_ballot(promised);
-                    continue;
-                }
-                // Commit only what a quorum of every shard accepted: a value
-                // accepted by fewer may be overlooked by a later recovery,
-                // which could then decide differently.
-                for plan in &plans {
-                    if acks[&plan.shard].iter().filter(|a| a.is_ok()).count() < plan.slow_q {
-                        self.deregister(txn);
-                        anyhow::bail!(
-                            "recovery accept quorum not reached for shard {}",
-                            plan.shard
-                        );
-                    }
-                }
-                for (shard, lists) in acks {
-                    if let Some(set) = shard_deps.get_mut(&shard) {
-                        for a in lists.into_iter().flatten() {
-                            set.extend(a);
-                        }
+            }
+            for (shard, lists) in acks {
+                if let Some(set) = shard_deps.get_mut(&shard) {
+                    for a in lists.into_iter().flatten() {
+                        set.extend(a);
                     }
                 }
             }
-
-            let executed = self
-                .execute(&mut rx, &plans, txn, execute_at, shard_deps)
-                .await;
-            // Deregistered on failure too: a leaked response channel makes the
-            // sweep take this node's own transaction for locally in flight,
-            // and never recover it.
-            self.deregister(txn);
-            return Ok(CommitOutcome {
-                txn,
-                conflict: executed?,
-            });
         }
 
-        anyhow::bail!("recovery exhausted its ballot retries")
+        let conflict = self
+            .execute(rx, plans, route, txn, execute_at, shard_deps, &applied)
+            .await?;
+        Ok(Attempt::Done(CommitOutcome { txn, conflict }))
     }
 
     /// Runs only PreAccept and returns the transaction id, modelling a
@@ -3252,6 +3774,7 @@ impl Node {
     pub async fn coordinate_preaccept(&self, events: Vec<Event>) -> anyhow::Result<TxnId> {
         let keys = Self::keys_of(&events);
         let (plans, _union) = self.plan(&keys, &events);
+        let route = Self::route_of(&plans, &keys);
         let t0 = self.clock.now();
         let txn = TxnId(t0);
 
@@ -3259,11 +3782,14 @@ impl Node {
         for plan in &plans {
             self.broadcast(
                 &plan.replicas,
-                Message::PreAccept {
-                    txn,
-                    keys: plan.keys.clone(),
-                    events: plan.events.clone(),
-                },
+                Self::routed(
+                    route.as_deref(),
+                    Message::PreAccept {
+                        txn,
+                        keys: plan.keys.clone(),
+                        events: plan.events.clone(),
+                    },
+                ),
             )
             .await;
         }
@@ -3297,12 +3823,13 @@ impl Node {
     pub async fn coordinate_through_commit(&self, events: Vec<Event>) -> anyhow::Result<TxnId> {
         let keys = Self::keys_of(&events);
         let (plans, _union) = self.plan(&keys, &events);
+        let route = Self::route_of(&plans, &keys);
         let txn = TxnId(self.clock.now());
         let mut rx = self.register(txn);
-        let agreed = self.agree(&mut rx, &plans, txn).await;
+        let agreed = self.agree(&mut rx, &plans, route.as_deref(), txn).await;
         self.deregister(txn);
         let (execute_at, shard_deps, _) = agreed?;
-        self.broadcast_commit(&plans, txn, execute_at, &shard_deps)
+        self.broadcast_commit(&plans, route.as_deref(), txn, execute_at, &shard_deps)
             .await;
         Ok(txn)
     }
@@ -3671,7 +4198,9 @@ impl Node {
             // anti-entropy round ships it again — and ends this round: the
             // commands arrive in execution order, and one applied past a gap
             // would put a later version in the store ahead of an earlier one.
+            // An invalidated command never executes: nothing to apply.
             if !want_snapshot
+                && !cmd.invalidated()
                 && self
                     .datastore
                     .apply(txn, execute_at, events, commit)
@@ -4256,6 +4785,31 @@ impl Node {
         let plans: Vec<ShardPlan> = shards.into_values().collect();
         let union = Self::union_of(&plans);
         (plans, union)
+    }
+
+    /// A transaction's route — its full key set — when it spans more than one
+    /// shard; `None` for a single-shard one, whose messages go unwrapped.
+    fn route_of(plans: &[ShardPlan], keys: &[Key]) -> Option<Vec<Key>> {
+        (plans.len() > 1).then(|| keys.to_vec())
+    }
+
+    /// `message`, wrapped with `route` if the transaction has one.
+    fn routed(route: Option<&[Key]>, message: Message) -> Message {
+        match route {
+            Some(route) => Message::Routed {
+                route: route.to_vec(),
+                inner: Box::new(message),
+            },
+            None => message,
+        }
+    }
+
+    /// Whether `keys` span more than one shard.
+    fn spans_shards(&self, keys: &[Key]) -> bool {
+        let mut shards = keys.iter().map(|k| self.topology.shard_of(k));
+        shards
+            .next()
+            .is_some_and(|first| shards.any(|shard| shard != first))
     }
 
     /// The deduplicated union of every shard's replica set (sorted — the order

@@ -3,7 +3,10 @@
 //!
 //! Each [`CommandState`] is bitcode-serialized and stored keyed by its `TxnId`;
 //! [`load_all`](Journal::load_all) replays them all on startup via
-//! `Node::recover_state`.
+//! `Node::recover_state`. A multi-shard transaction's route and a recovery
+//! promise for a transaction never witnessed live in the `meta` keyspace under
+//! `route/` / `promise/` + the order-preserving transaction id, staged like a
+//! command and truncated with the commands.
 //!
 //! **Group commit.** [`stage`](Journal::stage) inserts a record without an fsync;
 //! [`flush`](Journal::flush) does a single `persist(SyncAll)` covering every staged
@@ -22,7 +25,7 @@ use async_trait::async_trait;
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 
 use evento_accord::format::{decode_tagged, encode_tagged, RecordKind};
-use evento_accord::{AcceptorRecord, CommandState, Journal, NodeId, Timestamp, TxnId};
+use evento_accord::{AcceptorRecord, Ballot, CommandState, Journal, Key, NodeId, Timestamp, TxnId};
 
 /// Key under which the truncation watermark is stored in the `meta` keyspace.
 const WATERMARK_KEY: &[u8] = b"redundant_before";
@@ -32,6 +35,34 @@ const REJOIN_BOUNDS_KEY: &[u8] = b"rejoin_above";
 const METADATA_PREFIX: &[u8] = b"mlog/";
 /// Prefix for acceptor-state keys (`acc/` + 8-byte big-endian epoch).
 const ACCEPTOR_PREFIX: &[u8] = b"acc/";
+/// Prefix for multi-shard route keys (`route/` + order-preserving txn).
+const ROUTE_PREFIX: &[u8] = b"route/";
+/// Prefix for blind recovery-promise keys (`promise/` + order-preserving txn).
+const PROMISE_PREFIX: &[u8] = b"promise/";
+
+/// Builds a `prefix`-namespaced key for `txn`: big-endian `(micros, logical,
+/// node)`, so byte order is timestamp order and truncation can compare keys.
+fn txn_key(prefix: &[u8], txn: TxnId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(prefix.len() + 20);
+    key.extend_from_slice(prefix);
+    key.extend_from_slice(&txn.0.micros.to_be_bytes());
+    key.extend_from_slice(&txn.0.logical.to_be_bytes());
+    key.extend_from_slice(&txn.0.node.0.to_be_bytes());
+    key
+}
+
+/// Recovers the transaction from a `prefix`-namespaced key, if it matches.
+fn txn_of(prefix: &[u8], key: &[u8]) -> Option<TxnId> {
+    let rest = key.strip_prefix(prefix)?;
+    if rest.len() != 20 {
+        return None;
+    }
+    Some(TxnId(Timestamp {
+        micros: u64::from_be_bytes(rest[0..8].try_into().ok()?),
+        logical: u32::from_be_bytes(rest[8..12].try_into().ok()?),
+        node: NodeId(u64::from_be_bytes(rest[12..20].try_into().ok()?)),
+    }))
+}
 
 /// Builds a `prefix`-namespaced key for `epoch`, big-endian so the keyspace's
 /// lexicographic order matches epoch order (a prefix scan returns them ascending).
@@ -85,6 +116,36 @@ impl FjallJournal {
             meta,
             dirty: Arc::new(AtomicBool::new(false)),
         })
+    }
+}
+
+impl FjallJournal {
+    /// Inserts a per-transaction `meta` record without an fsync — durable at
+    /// the next `flush`, like a staged command.
+    async fn stage_meta(&self, key: Vec<u8>, value: Vec<u8>) -> anyhow::Result<()> {
+        let meta = self.meta.clone();
+        tokio::task::spawn_blocking(move || meta.insert(key, value)).await??;
+        self.dirty.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Every per-transaction `meta` record under `prefix`, decoded by `decode`
+    /// (the value carries its transaction, as in the SQL journal).
+    async fn load_by_txn<T: Send + 'static>(
+        &self,
+        prefix: &'static [u8],
+        decode: fn(&[u8]) -> anyhow::Result<(TxnId, T)>,
+    ) -> anyhow::Result<Vec<(TxnId, T)>> {
+        let meta = self.meta.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<(TxnId, T)>> {
+            let mut out = Vec::new();
+            for guard in meta.prefix(prefix) {
+                let (_, value) = guard.into_inner()?;
+                out.push(decode(&value)?);
+            }
+            Ok(out)
+        })
+        .await?
     }
 }
 
@@ -146,6 +207,19 @@ impl Journal for FjallJournal {
             for key in redundant {
                 commands.remove(key)?;
             }
+            // Routes and blind promises go with the commands.
+            for prefix in [ROUTE_PREFIX, PROMISE_PREFIX] {
+                let mut redundant = Vec::new();
+                for guard in meta.prefix(prefix) {
+                    let (key, _) = guard.into_inner()?;
+                    if txn_of(prefix, &key).is_some_and(|txn| txn.0 < before) {
+                        redundant.push(key);
+                    }
+                }
+                for key in redundant {
+                    meta.remove(key)?;
+                }
+            }
             meta.insert(
                 WATERMARK_KEY,
                 encode_tagged(RecordKind::Watermark, &before)?,
@@ -193,6 +267,36 @@ impl Journal for FjallJournal {
             Some(bytes) => Ok(decode_tagged(RecordKind::RejoinBounds, &bytes)?),
             None => Ok(Vec::new()),
         }
+    }
+
+    async fn save_route(&self, txn: TxnId, route: &[Key]) -> anyhow::Result<()> {
+        self.stage_meta(
+            txn_key(ROUTE_PREFIX, txn),
+            encode_tagged(RecordKind::Route, &(txn, route.to_vec()))?,
+        )
+        .await
+    }
+
+    async fn load_routes(&self) -> anyhow::Result<Vec<(TxnId, Vec<Key>)>> {
+        self.load_by_txn(ROUTE_PREFIX, |bytes| {
+            decode_tagged(RecordKind::Route, bytes)
+        })
+        .await
+    }
+
+    async fn save_promise(&self, txn: TxnId, ballot: Ballot) -> anyhow::Result<()> {
+        self.stage_meta(
+            txn_key(PROMISE_PREFIX, txn),
+            encode_tagged(RecordKind::Promise, &(txn, ballot))?,
+        )
+        .await
+    }
+
+    async fn load_promises(&self) -> anyhow::Result<Vec<(TxnId, Ballot)>> {
+        self.load_by_txn(PROMISE_PREFIX, |bytes| {
+            decode_tagged(RecordKind::Promise, bytes)
+        })
+        .await
     }
 
     async fn load(&self, txn: TxnId) -> anyhow::Result<Option<CommandState>> {

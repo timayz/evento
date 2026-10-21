@@ -218,3 +218,38 @@ async fn rejoin_bounds_survive_close_and_reopen() {
     journal.save_rejoin_bounds(&[]).await.unwrap();
     assert!(journal.load_rejoin_bounds().await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn routes_and_promises_survive_close_and_reopen_and_truncate() {
+    let temp = tempfile::Builder::new()
+        .prefix("evento_accord_journal_routes")
+        .tempdir()
+        .unwrap();
+    let old = TxnId(timestamp(100, 1));
+    let new = TxnId(timestamp(300, 2));
+    let route = vec![Key("a".into()), Key("b".into())];
+    let ballot = Ballot(timestamp(400, 3));
+    {
+        let journal = FjallJournal::open(temp.path()).unwrap();
+        assert!(journal.load_routes().await.unwrap().is_empty());
+        assert!(journal.load_promises().await.unwrap().is_empty());
+        // Staged, then made durable by the group-commit flush.
+        journal.save_route(old, &route).await.unwrap();
+        journal.save_route(new, &route).await.unwrap();
+        journal.save_promise(old, ballot).await.unwrap();
+        journal.save_promise(new, ballot).await.unwrap();
+        journal.flush().await.unwrap();
+    }
+    let journal = FjallJournal::open(temp.path()).unwrap();
+    let mut routes = journal.load_routes().await.unwrap();
+    routes.sort_by_key(|(txn, _)| *txn);
+    assert_eq!(routes, vec![(old, route.clone()), (new, route.clone())]);
+    let mut promises = journal.load_promises().await.unwrap();
+    promises.sort_by_key(|(txn, _)| *txn);
+    assert_eq!(promises, vec![(old, ballot), (new, ballot)]);
+
+    // Truncated with the commands.
+    journal.truncate(timestamp(200, 0)).await.unwrap();
+    assert_eq!(journal.load_routes().await.unwrap(), vec![(new, route)]);
+    assert_eq!(journal.load_promises().await.unwrap(), vec![(new, ballot)]);
+}

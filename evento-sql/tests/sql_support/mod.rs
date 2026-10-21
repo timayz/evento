@@ -253,3 +253,44 @@ where
         Some(timestamp(250, 0))
     );
 }
+
+/// Routes and blind promises are staged (invisible until the flush), round-trip
+/// after it, keep the last value written per transaction, and are truncated
+/// with the commands.
+pub async fn routes_and_promises<DB>(journal: &SqlJournal<DB>)
+where
+    DB: Database,
+    for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
+    sea_query_sqlx::SqlxValues: sqlx::IntoArguments<DB>,
+    Vec<u8>: for<'r> sqlx::Decode<'r, DB> + sqlx::Type<DB>,
+    i64: for<'r> sqlx::Decode<'r, DB> + sqlx::Type<DB>,
+    usize: sqlx::ColumnIndex<DB::Row>,
+{
+    let old = TxnId(timestamp(100, 1));
+    let new = TxnId(timestamp(300, 2));
+    let route = vec![Key("a".into()), Key("b".into())];
+    let low = Ballot(timestamp(400, 3));
+    let high = Ballot(timestamp(500, 4));
+
+    journal.save_route(old, &route).await.unwrap();
+    journal.save_route(new, &route).await.unwrap();
+    journal.save_promise(old, low).await.unwrap();
+    journal.save_promise(new, low).await.unwrap();
+    journal.save_promise(new, high).await.unwrap();
+    assert!(
+        journal.load_routes().await.unwrap().is_empty(),
+        "staged only"
+    );
+    journal.flush().await.unwrap();
+
+    let mut routes = journal.load_routes().await.unwrap();
+    routes.sort_by_key(|(txn, _)| *txn);
+    assert_eq!(routes, vec![(old, route.clone()), (new, route.clone())]);
+    let mut promises = journal.load_promises().await.unwrap();
+    promises.sort_by_key(|(txn, _)| *txn);
+    assert_eq!(promises, vec![(old, low), (new, high)], "last write wins");
+
+    journal.truncate(timestamp(200, 0)).await.unwrap();
+    assert_eq!(journal.load_routes().await.unwrap(), vec![(new, route)]);
+    assert_eq!(journal.load_promises().await.unwrap(), vec![(new, high)]);
+}

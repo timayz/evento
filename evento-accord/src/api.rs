@@ -220,6 +220,40 @@ pub trait Journal: Send + Sync + 'static {
         Ok(Vec::new())
     }
 
+    /// Buffers the route — full key set — of a multi-shard transaction this
+    /// replica holds, durable no later than the next [`flush`](Journal::flush)
+    /// (like [`stage`](Journal::stage)). A restarted replica that lost it could
+    /// recover the transaction on its own shard only. Discarded by
+    /// [`truncate`](Journal::truncate) with the commands. The default is a
+    /// no-op (a journal that forgets routes recovers such a transaction from
+    /// what the replies reveal, as before routes existed).
+    async fn save_route(&self, txn: TxnId, route: &[Key]) -> anyhow::Result<()> {
+        let _ = (txn, route);
+        Ok(())
+    }
+
+    /// Every persisted route. The default returns none.
+    async fn load_routes(&self) -> anyhow::Result<Vec<(TxnId, Vec<Key>)>> {
+        Ok(Vec::new())
+    }
+
+    /// Buffers the recovery `ballot` promised for a transaction this replica
+    /// never witnessed, durable no later than the next
+    /// [`flush`](Journal::flush). A replica that forgot it after a restart
+    /// would let the original coordinator's late PreAccept win a vote the
+    /// recovery decided without. Discarded by [`truncate`](Journal::truncate)
+    /// with the commands. The default is a no-op (promises then last only as
+    /// long as the process).
+    async fn save_promise(&self, txn: TxnId, ballot: Ballot) -> anyhow::Result<()> {
+        let _ = (txn, ballot);
+        Ok(())
+    }
+
+    /// Every persisted promise. The default returns none.
+    async fn load_promises(&self) -> anyhow::Result<Vec<(TxnId, Ballot)>> {
+        Ok(Vec::new())
+    }
+
     /// Loads the persisted state for `txn`, if any.
     async fn load(&self, txn: TxnId) -> anyhow::Result<Option<CommandState>>;
 
