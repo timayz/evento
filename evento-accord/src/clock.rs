@@ -148,6 +148,25 @@ impl HybridLogicalClock {
     fn physical_now(&self) -> u64 {
         (self.physical)()
     }
+
+    /// The physical time in microseconds — the wall clock in production, the
+    /// injected source otherwise — that this clock's lead is measured from.
+    pub fn physical_micros(&self) -> u64 {
+        self.physical_now()
+    }
+
+    /// Advances the clock to at least `floor`, so every later
+    /// [`now`](Clock::now) is strictly past it. Unlike
+    /// [`witness`](Clock::witness), it is not capped at the skew bound: it is
+    /// for floors the node can vouch for itself — the clock bound it
+    /// persisted before a restart, a transaction it minted, the compaction
+    /// floor its group agreed on — never for a peer's timestamp.
+    pub fn restore(&self, floor: Timestamp) {
+        let mut guard = self.state.lock().expect("clock poisoned");
+        if (floor.micros, floor.logical) > *guard {
+            *guard = (floor.micros, floor.logical);
+        }
+    }
 }
 
 impl Clock for HybridLogicalClock {
@@ -282,6 +301,36 @@ mod tests {
             clock.now().micros <= wall + custom_skew,
             "the configured (tighter) skew bound is enforced"
         );
+    }
+
+    #[test]
+    fn restore_moves_past_a_floor_the_wall_clock_is_behind() {
+        // A wall clock stepped back far below what the clock reached before.
+        let wall = 1_000_000u64;
+        let clock = HybridLogicalClock::with_physical(NodeId(1), move || wall);
+        let floor = Timestamp {
+            micros: wall + 1_000_000_000,
+            logical: 4,
+            node: NodeId(1),
+        };
+        clock.restore(floor);
+        let next = clock.now();
+        assert!(next > floor, "{next:?} must be past the restored {floor:?}");
+        assert!(clock.now() > next);
+    }
+
+    #[test]
+    fn restore_never_moves_the_clock_back() {
+        let wall = 5_000_000u64;
+        let clock = HybridLogicalClock::with_physical(NodeId(1), move || wall);
+        let reached = clock.now();
+        clock.restore(Timestamp {
+            micros: 1,
+            logical: 0,
+            node: NodeId(1),
+        });
+        assert!(clock.now() > reached);
+        assert_eq!(clock.physical_micros(), wall);
     }
 
     #[test]

@@ -254,6 +254,24 @@ pub trait Journal: Send + Sync + 'static {
         Ok(Vec::new())
     }
 
+    /// Durably persists this node's **clock bound**: every timestamp it has
+    /// minted (transaction ids, ballots) is below `micros`. Durable by the
+    /// time it returns — the node raises it before minting past it, and a
+    /// restart starts the clock from it ([`load_clock_bound`](Journal::load_clock_bound)),
+    /// so a restarted node never mints an id it used before, not even after
+    /// its wall clock stepped back. Only ever raised; survives
+    /// [`truncate`](Journal::truncate). The default is a no-op (a restarted
+    /// node then starts its clock past its own journaled transactions only).
+    async fn save_clock_bound(&self, micros: u64) -> anyhow::Result<()> {
+        let _ = micros;
+        Ok(())
+    }
+
+    /// The persisted clock bound, if any. The default returns none.
+    async fn load_clock_bound(&self) -> anyhow::Result<Option<u64>> {
+        Ok(None)
+    }
+
     /// Loads the persisted state for `txn`, if any.
     async fn load(&self, txn: TxnId) -> anyhow::Result<Option<CommandState>>;
 
@@ -495,6 +513,26 @@ pub(crate) fn stable_hash(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(PRIME);
     }
     hash
+}
+
+/// Checks that `shards` can serve as a shard layout: at least one shard, no
+/// empty shard, and every node in exactly one shard, once. A layout without
+/// shards leaves no shard for any key (and no acceptors for the next epoch);
+/// an empty shard owns keys no replica can commit; a node listed twice counts
+/// twice towards a quorum, and one in two shards has ambiguous ownership.
+pub fn validate_layout(shards: &[Vec<NodeId>]) -> anyhow::Result<()> {
+    anyhow::ensure!(!shards.is_empty(), "a layout needs at least one shard");
+    let mut seen = std::collections::HashSet::new();
+    for (shard, replicas) in shards.iter().enumerate() {
+        anyhow::ensure!(!replicas.is_empty(), "shard {shard} has no replicas");
+        for &node in replicas {
+            anyhow::ensure!(
+                seen.insert(node),
+                "{node:?} is listed more than once (shards must be disjoint)"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Asserts a configured fast-path electorate is well-formed for a replica set:
@@ -751,7 +789,13 @@ struct DynamicState {
 impl DynamicTopology {
     /// Builds a topology at `epoch` from disjoint shard replica sets. `this` need
     /// not be a member yet.
+    ///
+    /// Panics if the layout is invalid (see [`validate_layout`]) — a
+    /// configuration error.
     pub fn new(this: NodeId, epoch: u64, shards: Vec<Vec<NodeId>>) -> Self {
+        if let Err(err) = validate_layout(&shards) {
+            panic!("invalid shard layout: {err}");
+        }
         Self {
             this,
             state: RwLock::new(Arc::new(DynamicState { epoch, shards })),
@@ -1227,6 +1271,32 @@ mod tests {
         // Region 2 (the lower id) wins the tie ⇒ electorate {2,3}; f=1 ⇒ fast=2.
         assert_eq!(topo.fast_electorate(&k), vec![NodeId(2), NodeId(3)]);
         assert_eq!(topo.fast_quorum(&k), 2);
+    }
+
+    #[test]
+    fn validate_layout_accepts_disjoint_shards_only() {
+        let n = |ids: &[u64]| ids.iter().copied().map(NodeId).collect::<Vec<_>>();
+        assert!(validate_layout(&[n(&[0, 1, 2])]).is_ok());
+        assert!(validate_layout(&[n(&[0, 1, 2]), n(&[3, 4, 5])]).is_ok());
+        assert!(validate_layout(&[]).is_err(), "no shard");
+        assert!(
+            validate_layout(&[n(&[0, 1, 2]), n(&[])]).is_err(),
+            "an empty shard"
+        );
+        assert!(
+            validate_layout(&[n(&[0, 1]), n(&[1, 2])]).is_err(),
+            "a node in two shards"
+        );
+        assert!(
+            validate_layout(&[n(&[0, 0, 1])]).is_err(),
+            "a node twice in one shard"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid shard layout")]
+    fn dynamic_topology_refuses_an_invalid_layout() {
+        DynamicTopology::new(NodeId(0), 0, vec![]);
     }
 
     #[test]

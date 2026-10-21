@@ -151,11 +151,23 @@ gaps:
   metadata anti-entropy in the recovery sweep), or eagerly when a later `ConfigCommit`
   reveals the gap.
 - **Durability.** Acceptor state is persisted **before** any promise/accept reply
-  (`Journal::record_acceptor`), and the committed log is persisted
-  (`Journal::append_metadata`); `recover_state` restores both, so a restarted acceptor
-  keeps its promised ballots (Paxos crash-safety) and re-installs its epoch prefix.
+  (`Journal::record_acceptor`; a vote it could not persist is withheld, like a batch
+  whose flush failed), and the committed log is persisted
+  (`Journal::append_metadata`) before an epoch is installed — one the log did not
+  take is not installed, and the commit or the metadata sweep retries it, so a
+  restart never falls back below an epoch the node acted on; `recover_state`
+  restores both, so a restarted acceptor keeps its promised ballots (Paxos
+  crash-safety) and re-installs its epoch prefix.
 - **Automatic completion.** The recovery sweep finishes any accepted-but-uncommitted
   epoch itself (the automatic equivalent of `recover_topology`).
+- **Valid layouts only** (`validate_layout`): at least one shard, none empty, every
+  node in exactly one shard, once. Without shards every key's shard index divides by
+  zero; an empty shard owns keys no replica can commit (and `vec![vec![]]` leaves no
+  acceptor for the next epoch). `change_topology`/`propose_topology` refuse one, the
+  proposer checks the value it carries to phase 2 (an adopted or fallback one too),
+  an acceptor never votes for one, and a node neither persists nor installs one it is
+  sent: the log keeps the first entry per epoch, so a persisted bad entry would shut
+  out the real one, and an entry an older build persisted is never installed.
 
 Remaining gap versus a full CEP-21 service: **no leader** for liveness under
 contention (concurrent reconfigurations can still duel on ballots) and no Raft-style
@@ -293,7 +305,10 @@ control plane, everything else is Accord.
   The coordinator waits for its own local apply (read-your-writes). On a
   **multi-shard** cluster, a single-aggregate read for a key this node does not
   own is **routed** to an owner (`ReadForward` / `ReadReply`, served from the
-  owner's backend); broad scans are served locally. `tests/executor.rs`
+  owner's backend; an owner whose store refused the query, or that is still joining
+  and holds part of its store, answers `ReadFailed`, so the read fails instead of
+  returning an empty or partial page that reads as "no such events"); broad scans
+  are served locally. `tests/executor.rs`
   (fjall-backed, single shard) proves replication, read-your-writes, and
   cluster-wide optimistic concurrency through the standard evento API;
   `tests/shard_executor.rs` proves read routing on a 2-shard cluster.
@@ -536,6 +551,24 @@ backend (sql/fjall). Phases, in order:
   the bound degrades gracefully rather than poisoning peers. Clock unit tests pin
   the cap and the catch-up; a simulation scenario (`safety_and_bound_hold_under_clock_skew`)
   proves a skewed cluster stays safe, converges, and keeps state bounded.
+  ✅ **The clock never runs back across a restart.** Every id a node mints — a
+  transaction, a ballot, a read probe — goes through `Node::mint`, which keeps it
+  below a **clock bound** persisted in the journal (`Journal::save_clock_bound`),
+  raised durably before a stamp reaches it to `2 × max_skew` past the *wall clock*
+  (so restarting from it cannot compound, and it costs at most one write per skew
+  of wall time). `recover_state` starts the clock at the bound — or, for a journal
+  without one, past the node's own journaled transactions — so a restarted or
+  reopened node never mints an id it used before, even when its wall clock stepped
+  back: replicas would take such a write for the old transaction and ack it with
+  the old outcome, its events never applied. A restart within a skew of the last
+  mint waits out what puts the clock further ahead than `max_skew`; a larger lead
+  means the wall clock stepped back, and the clock leads it until it catches up,
+  as it would without the restart. A mint is also never below the group's
+  compaction floor (a lagging wall clock, a fresh joiner): a transaction under it
+  would count as applied at a replica that never saw it. A joiner that lost its
+  journal starts past its own transactions a peer ships back. The one id not
+  covered is a ballot outbidding a peer's from beyond the skew bound (a faulty,
+  far-future clock): covering it would drag this node's clock out with the peer's.
   ✅ **Tunable timing/sizing:** the hard-coded constants are now an injected
   `NodeConfig` (fast/collect timeouts, recovery interval/timeout, compaction
   margin, journal-batch cap) with `Default` reproducing the shipped values and a
@@ -698,6 +731,20 @@ backend (sql/fjall). Phases, in order:
         coverage stops below the oldest `t0` it left out, a join pulls its commands in
         pages, and a write whose command could not fit a frame is refused,
         `CommandTooLarge`).
+        A second round (2026-10-21) fixed what the first only listed, and what it
+        turned up: a layout with no shard, an empty one or a node in two could be
+        decided, persisted and installed (a divide by zero in every inbox loop, or
+        keys no replica can commit) — now refused before a vote, and never persisted
+        or installed; a config vote went out although the journal refused it, and
+        an epoch was installed although the metadata log refused it; a forwarded
+        read the owner's store failed, or that a joining owner served from a partial
+        store, came back as an empty or partial page (now `ReadFailed`); a restart,
+        or a group reopened by `GroupHost`, could mint a transaction id or ballot it
+        had used before, and a node with a lagging clock minted below the compaction
+        floor (now the clock bound, see Phase C); `GroupHost::close` returned while a
+        sweep or the inbox loop still used the store and journal (now async, and the
+        closed node mints nothing more); and the mux could unregister a reopened
+        group's inbox for its closed predecessor.
         **Open** (confirmed or plausible, not yet fixed):
         a config change's replies are keyed by epoch only, so two on one node collide;
         stage errors are ignored before durability-gated replies;
@@ -708,7 +755,14 @@ backend (sql/fjall). Phases, in order:
         from that applied it, stays undecided (liveness, not safety);
         a rejoin (wiped store) forgets the replica's in-flight votes and promises;
         an epoch change can remap a route's keys onto replicas that never
-        witnessed an in-flight txn, which then answer "never witnessed".
+        witnessed an in-flight txn, which then answer "never witnessed";
+        `GroupHost::open` dropped mid-join (a client hung up) orphans the joining
+        node's inbox loop; a node told to rejoin drops a forwarded read, which then
+        fails only at `collect_timeout`; under Jepsen faults a node can stay
+        unreachable for the rest of a 120 s run (seen on `alpha` before this round
+        as well) — plausibly because a peer writer's TCP `connect` has no timeout,
+        so behind a DROP partition it blocks for the kernel's SYN retries (about two
+        minutes) while every frame to that peer is shed.
   - [ ] **Real-cluster soak + chaos** over days (kills, partitions, clock skew,
         disk pressure, slow disks/links) on actual hardware — zero production
         mileage today.

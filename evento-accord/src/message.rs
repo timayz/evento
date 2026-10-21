@@ -461,6 +461,13 @@ pub enum Message {
         commands: Vec<CommandState>,
         next: Option<TxnId>,
     },
+    /// Owner → requester: it could not serve the [`ReadForward`](Message::ReadForward)
+    /// `id` — its store refused the query, or it is still joining and holds
+    /// part of its store — so the requester fails the read rather than take
+    /// an empty or partial page for "no such events". `reason` is the
+    /// owner's error, cut short. A node predating this variant sheds it, and
+    /// its read times out: an error too, never an empty page.
+    ReadFailed { id: u64, reason: String },
 }
 
 impl Message {
@@ -530,6 +537,7 @@ impl Message {
             | Message::MetadataEntries { .. }
             | Message::ReadForward { .. }
             | Message::ReadReply { .. }
+            | Message::ReadFailed { .. }
             | Message::Rejoin { .. }
             | Message::JoinProof { .. }
             | Message::JoinHeaderRequest { .. }
@@ -672,6 +680,26 @@ mod tests {
                 }
                 other => panic!("variant changed on the wire: {other:?}"),
             }
+        }
+    }
+
+    /// A failed forwarded read crosses the wire with its reason, belongs to no
+    /// transaction, and is not sweep gossip (a reply to a read, which may wake
+    /// a closed group like any other).
+    #[test]
+    fn read_failed_round_trips_tagged() {
+        let message = Message::ReadFailed {
+            id: 9,
+            reason: "disk full".into(),
+        };
+        assert_eq!(message.txn(), None);
+        assert!(!message.is_sweep());
+        let bytes = encode_tagged(RecordKind::GroupFrame, &message).unwrap();
+        match decode_tagged(RecordKind::GroupFrame, &bytes).unwrap() {
+            Message::ReadFailed { id, reason } => {
+                assert_eq!((id, reason.as_str()), (9, "disk full"))
+            }
+            other => panic!("variant changed on the wire: {other:?}"),
         }
     }
 

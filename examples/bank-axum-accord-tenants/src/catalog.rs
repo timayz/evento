@@ -83,7 +83,7 @@ pub struct TenantRegistry {
     tenants: RwLock<HashMap<String, TenantInfo>>,
     by_group: RwLock<HashMap<GroupId, String>>,
     open: Mutex<HashMap<GroupId, OpenTenant>>,
-    /// Serializes opening one group (see `ensure_open`).
+    /// Serializes opening and closing one group (see `ensure_open`, `close`).
     open_locks: Mutex<HashMap<GroupId, Arc<tokio::sync::Mutex<()>>>>,
     /// How far `refresh_catalog` has read the catalog stream.
     catalog_cursor: Mutex<Option<Value>>,
@@ -187,7 +187,7 @@ impl TenantRegistry {
             .insert(info.slug.clone(), info);
     }
 
-    fn mark_suspended(&self, slug: &str) {
+    async fn mark_suspended(&self, slug: &str) {
         let group = {
             let mut tenants = self.tenants.write().expect("tenants poisoned");
             let Some(info) = tenants.get_mut(slug) else {
@@ -196,7 +196,7 @@ impl TenantRegistry {
             info.suspended = true;
             info.group
         };
-        self.close(group);
+        self.close(group).await;
     }
 
     /// Creates a tenant through the catalog group. `Taken` is decided by consensus:
@@ -252,7 +252,7 @@ impl TenantRegistry {
             })
             .commit(&self.system)
             .await?;
-        self.mark_suspended(slug);
+        self.mark_suspended(slug).await;
         Ok(())
     }
 
@@ -312,16 +312,19 @@ impl TenantRegistry {
         if let Some(executor) = self.touch(info.group) {
             return Ok(executor);
         }
+        let executor = self.open_tenant(info).await?;
+        // Not under this tenant's lock: an eviction takes the victim's, and two
+        // tenants opening at once must not each wait for the other's.
+        self.evict_over_cap().await;
+        Ok(executor)
+    }
+
+    /// [`ensure_open`](Self::ensure_open)'s open, under the tenant's lock.
+    async fn open_tenant(&self, info: &TenantInfo) -> anyhow::Result<TenantExecutor> {
         // One open per group at a time (a request and the catalog subscription may
         // race to open the same tenant, and must not both migrate a fresh file);
         // re-check under the lock.
-        let open_lock = Arc::clone(
-            self.open_locks
-                .lock()
-                .expect("open_locks poisoned")
-                .entry(info.group)
-                .or_default(),
-        );
+        let open_lock = self.open_lock(info.group);
         let _opening = open_lock.lock().await;
         if let Some(executor) = self.touch(info.group) {
             return Ok(executor);
@@ -342,38 +345,63 @@ impl TenantRegistry {
             )
             .await?;
         let executor = AccordExecutor::new(node, sql);
-
-        // No std lock guard may live across an await (the futures must stay `Send`),
-        // so the bookkeeping is one synchronous block and the awaits come after it.
-        let evicted = {
-            let mut open = self.open.lock().expect("open poisoned");
-            open.insert(
-                info.group,
-                OpenTenant {
-                    executor: executor.clone(),
-                    pool,
-                    last_used: Instant::now(),
-                },
-            );
-            // LRU eviction beyond the cap.
-            let mut evicted = Vec::new();
-            while open.len() > self.cap {
-                let Some((&group, _)) = open.iter().min_by_key(|(_, t)| t.last_used) else {
-                    break;
-                };
-                if let Some(t) = open.remove(&group) {
-                    evicted.push((group, t.pool));
-                }
-            }
-            evicted
-        };
+        self.open.lock().expect("open poisoned").insert(
+            info.group,
+            OpenTenant {
+                executor: executor.clone(),
+                pool,
+                last_used: Instant::now(),
+            },
+        );
         tracing::info!(tenant = %info.slug, group = info.group.0, path = %path.display(), "tenant opened");
-        for (group, pool) in evicted {
-            self.host.close(group);
-            tokio::spawn(async move { pool.close().await });
-            tracing::info!(group = group.0, "tenant evicted (LRU)");
-        }
         Ok(executor)
+    }
+
+    /// Closes the least recently used tenants while more than the cap are open,
+    /// each under its own lock, so a request for it waits for the close to
+    /// finish and then opens it afresh — rather than pick up the node being
+    /// closed.
+    async fn evict_over_cap(&self) {
+        while let Some(group) = self.coldest_over_cap() {
+            let open_lock = self.open_lock(group);
+            let _evicting = open_lock.lock().await;
+            // Re-checked under its lock: another eviction or a suspension may
+            // have closed it while this one waited.
+            let tenant = {
+                let mut open = self.open.lock().expect("open poisoned");
+                if open.len() <= self.cap {
+                    return;
+                }
+                open.remove(&group)
+            };
+            if let Some(tenant) = tenant {
+                self.host.close(group).await;
+                tenant.pool.close().await;
+                tracing::info!(group = group.0, "tenant evicted (LRU)");
+            }
+        }
+    }
+
+    /// The least recently used open tenant, if more than the cap are open.
+    fn coldest_over_cap(&self) -> Option<GroupId> {
+        let open = self.open.lock().expect("open poisoned");
+        if open.len() <= self.cap {
+            return None;
+        }
+        open.iter()
+            .min_by_key(|(_, tenant)| tenant.last_used)
+            .map(|(&group, _)| group)
+    }
+
+    /// The lock serializing the opening and closing of `group`.
+    fn open_lock(&self, group: GroupId) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(
+            self.open_locks
+                .lock()
+                .expect("open_locks poisoned")
+                .entry(group)
+                .or_default(),
+        )
     }
 
     /// The executor of an open tenant, marking it recently used.
@@ -384,12 +412,15 @@ impl TenantRegistry {
         Some(tenant.executor.clone())
     }
 
-    /// Closes a tenant's group on this host (it is re-opened on demand).
-    fn close(&self, group: GroupId) {
+    /// Closes a tenant's group on this host (it is re-opened on demand), then
+    /// its database: `GroupHost::close` returns once nothing writes to it.
+    async fn close(&self, group: GroupId) {
+        let open_lock = self.open_lock(group);
+        let _closing = open_lock.lock().await;
         let removed = self.open.lock().expect("open poisoned").remove(&group);
-        if let Some(t) = removed {
-            self.host.close(group);
-            tokio::spawn(async move { t.pool.close().await });
+        if let Some(tenant) = removed {
+            self.host.close(group).await;
+            tenant.pool.close().await;
         }
     }
 
@@ -439,7 +470,7 @@ impl TenantRegistry {
                             suspended: false,
                         })
                     }
-                    Ok(TenantEvent::TenantSuspended(_)) => self.mark_suspended(&slug),
+                    Ok(TenantEvent::TenantSuspended(_)) => self.mark_suspended(&slug).await,
                     Err(err) => tracing::warn!(%slug, error = %err, "undecodable catalog event"),
                 }
                 *self.catalog_cursor.lock().expect("cursor poisoned") = Some(edge.cursor);
@@ -523,7 +554,7 @@ async fn on_tenant_suspended<E: Executor>(
     event: Event<TenantSuspended>,
 ) -> anyhow::Result<()> {
     let registry: Arc<TenantRegistry> = ctx.extract();
-    registry.mark_suspended(&event.aggregate_id);
+    registry.mark_suspended(&event.aggregate_id).await;
     Ok(())
 }
 
@@ -612,6 +643,11 @@ mod tests {
     /// catalog subscription — so the unrouted hook is the only way a host learns
     /// about a tenant another host created.
     async fn hosts(n: u64) -> Vec<Host> {
+        hosts_with_cap(n, 8).await
+    }
+
+    /// [`hosts`] keeping at most `cap` tenants open per host.
+    async fn hosts_with_cap(n: u64, cap: usize) -> Vec<Host> {
         let ids: Vec<NodeId> = (0..n).map(NodeId).collect();
         let mut listeners = Vec::new();
         let mut peers: HashMap<NodeId, SocketAddr> = HashMap::new();
@@ -640,7 +676,7 @@ mod tests {
                 ulid::Ulid::generate(),
                 id.0
             ));
-            let registry = TenantRegistry::new(host, ids.clone(), dir.clone(), 8)
+            let registry = TenantRegistry::new(host, ids.clone(), dir.clone(), cap)
                 .await
                 .unwrap();
             let _ = slot.set(Arc::clone(&registry));
@@ -712,6 +748,44 @@ mod tests {
                 .count(),
             1
         );
+
+        for h in &hosts {
+            let _ = std::fs::remove_dir_all(&h.dir);
+        }
+    }
+
+    /// Beyond the cap the coldest tenant is closed — its group, then its
+    /// database — and a later request opens it afresh and finds its data.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_evicted_tenant_reopens_with_its_data() {
+        let hosts = hosts_with_cap(1, 1).await;
+        let registry = &hosts[0].registry;
+        let one = registry.create("one", "One").await.unwrap();
+        let executor = registry.executor("one").await.unwrap().unwrap();
+        let account = Command(executor)
+            .open_account(OpenAccount {
+                owner_id: "o".into(),
+                owner_name: "Ann".into(),
+                account_type: AccountType::Checking,
+                currency: "EUR".into(),
+                initial_balance: 100,
+            })
+            .await
+            .unwrap();
+
+        let two = registry.create("two", "Two").await.unwrap();
+        assert!(registry.host().is_open(two.group));
+        assert!(!registry.host().is_open(one.group), "one was not evicted");
+        assert_eq!(registry.open_count(), 1);
+
+        let executor = registry.executor("one").await.unwrap().unwrap();
+        let view = bank::load_account_details(&executor, &account, "")
+            .await
+            .unwrap()
+            .expect("the account survived the eviction");
+        assert_eq!(view.balance, 100);
+        assert!(registry.host().is_open(one.group));
+        assert!(!registry.host().is_open(two.group), "two was not evicted");
 
         for h in &hosts {
             let _ = std::fs::remove_dir_all(&h.dir);

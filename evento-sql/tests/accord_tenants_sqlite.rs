@@ -148,7 +148,7 @@ async fn each_tenant_has_its_own_sqlite_file_and_consensus_group() -> anyhow::Re
     assert!(dir.path().join("acme.db").exists());
     assert!(dir.path().join("globex.db").exists());
     assert_eq!(host.len(), 2);
-    host.close(GroupId(1));
-    host.close(GroupId(2));
+    host.close(GroupId(1)).await;
+    host.close(GroupId(2)).await;
     Ok(())
 }

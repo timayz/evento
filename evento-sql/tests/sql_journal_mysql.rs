@@ -53,6 +53,11 @@ async fn routes_and_promises() {
 }
 
 #[tokio::test]
+async fn clock_bound() {
+    sql_support::clock_bound(&fresh("accord_my_clock_bound").await).await;
+}
+
+#[tokio::test]
 async fn survives_reconnect() {
     let name = "accord_my_reconnect";
     let b = command(200, 2);

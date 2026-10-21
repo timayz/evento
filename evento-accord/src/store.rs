@@ -149,6 +149,8 @@ pub struct InMemoryJournal {
     routes: Mutex<HashMap<TxnId, Vec<Key>>>,
     /// Blind recovery promises (see [`Journal::save_promise`]).
     promises: Mutex<HashMap<TxnId, Ballot>>,
+    /// The persisted clock bound (see [`Journal::save_clock_bound`]).
+    clock_bound: Mutex<Option<u64>>,
 }
 
 impl InMemoryJournal {
@@ -215,6 +217,15 @@ impl Journal for InMemoryJournal {
 
     async fn load_rejoin_bounds(&self) -> anyhow::Result<Vec<(NodeId, Timestamp)>> {
         Ok(self.rejoin_bounds.lock().expect("journal poisoned").clone())
+    }
+
+    async fn save_clock_bound(&self, micros: u64) -> anyhow::Result<()> {
+        *self.clock_bound.lock().expect("journal poisoned") = Some(micros);
+        Ok(())
+    }
+
+    async fn load_clock_bound(&self) -> anyhow::Result<Option<u64>> {
+        Ok(*self.clock_bound.lock().expect("journal poisoned"))
     }
 
     async fn save_route(&self, txn: TxnId, route: &[Key]) -> anyhow::Result<()> {
@@ -342,6 +353,23 @@ mod tests {
         );
         assert_eq!(remaining[0].txn.0.micros, 300);
         assert_eq!(journal.load_watermark().await.unwrap(), Some(before));
+    }
+
+    #[tokio::test]
+    async fn in_memory_clock_bound_round_trips_and_survives_truncate() {
+        let journal = InMemoryJournal::new();
+        assert_eq!(journal.load_clock_bound().await.unwrap(), None);
+        journal.save_clock_bound(400).await.unwrap();
+        journal.save_clock_bound(900).await.unwrap();
+        journal
+            .truncate(Timestamp {
+                micros: 1_000,
+                logical: 0,
+                node: NodeId(0),
+            })
+            .await
+            .unwrap();
+        assert_eq!(journal.load_clock_bound().await.unwrap(), Some(900));
     }
 
     #[tokio::test]

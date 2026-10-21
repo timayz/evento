@@ -18,7 +18,9 @@
 //! A multi-shard transaction's route and a recovery promise for a transaction
 //! never witnessed are rows of `accord_meta` keyed `route/` / `promise/` + the
 //! hex of the order-preserving transaction key — no schema change — staged and
-//! flushed with the commands, and truncated with them.
+//! flushed with the commands, and truncated with them. The node's clock bound
+//! is the `accord_meta` row `clock_bound`, written durably on its own and never
+//! truncated.
 
 use std::sync::Mutex;
 
@@ -41,6 +43,8 @@ use evento_accord::{AcceptorRecord, Ballot, CommandState, Journal, Key, NodeId, 
 const WATERMARK_KEY: &str = "redundant_before";
 /// `k` value under which the rejoin bounds are stored in `accord_meta`.
 const REJOIN_BOUNDS_KEY: &str = "rejoin_above";
+/// `k` value under which the node's clock bound is stored in `accord_meta`.
+const CLOCK_BOUND_KEY: &str = "clock_bound";
 /// `k` prefix of a multi-shard transaction's route in `accord_meta`.
 const ROUTE_PREFIX: &str = "route/";
 /// `k` prefix of a blind recovery promise in `accord_meta`.
@@ -530,6 +534,32 @@ where
         match self.load_meta(REJOIN_BOUNDS_KEY).await? {
             Some(bytes) => Ok(decode_tagged(RecordKind::RejoinBounds, &bytes)?),
             None => Ok(Vec::new()),
+        }
+    }
+
+    async fn save_clock_bound(&self, micros: u64) -> anyhow::Result<()> {
+        let value = encode_tagged(RecordKind::ClockBound, &micros)?;
+        let upsert = Query::insert()
+            .into_table(AccordMeta::Table)
+            .columns([AccordMeta::K, AccordMeta::V])
+            .values_panic([CLOCK_BOUND_KEY.into(), value.into()])
+            .on_conflict(
+                OnConflict::column(AccordMeta::K)
+                    .update_column(AccordMeta::V)
+                    .to_owned(),
+            )
+            .to_owned();
+        let (sql, values) = Self::build_sqlx(&upsert);
+        sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn load_clock_bound(&self) -> anyhow::Result<Option<u64>> {
+        match self.load_meta(CLOCK_BOUND_KEY).await? {
+            Some(bytes) => Ok(Some(decode_tagged(RecordKind::ClockBound, &bytes)?)),
+            None => Ok(None),
         }
     }
 

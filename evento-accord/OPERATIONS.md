@@ -93,7 +93,14 @@ timeouts for geo/WAN** deployments.
 | `config_defer_step` | 100 ms | Control-plane anti-dueling delay for concurrent reconfigurations. |
 
 Clock-skew tolerance is on the clock: `HybridLogicalClock::with_max_skew(..)` (default
-`MAX_SKEW_MICROS`); keep `recovery_timeout`/`compaction_margin` above it.
+`MAX_SKEW_MICROS`); keep `recovery_timeout`/`compaction_margin` above it. The node
+persists a clock bound in its journal (raised at most once per `max_skew` while it
+mints) and a restart starts its clock there, so a node never reuses a transaction id
+or ballot across a restart, even if its wall clock stepped back. A restart within
+`max_skew` of the last write waits out at most `max_skew`; after a backward step the
+node logs that its wall clock is behind its clock bound and its stamps lead the wall
+clock until it catches up. Writes fail rather than use an id the bound does not cover
+(the journal refused it).
 
 ---
 
@@ -163,7 +170,9 @@ Suggested alerts: `recoveries` rate > 0 for several minutes; `compactions` flat 
 
 Requires `DynamicTopology`. Membership changes are decided by a durable, replicated
 metadata log (config-Paxos); concurrent reconfigurations converge without a leader
-(distinguished proposer + yield).
+(distinguished proposer + yield). A layout must have at least one shard, no empty
+shard, and every node in exactly one shard (`validate_layout`): `change_topology`
+refuses anything else before a vote, and a node never installs it.
 
 - **Add a node:** start the new process with `begin_join()` (it buffers consensus
   messages), drive `change_topology(epoch, new_layout)` from any current member, then
@@ -241,8 +250,9 @@ metadata log (config-Paxos); concurrent reconfigurations converge without a lead
   `Message::Rejoin` instead: it logs an error, drops every message, refuses writes
   (`RejoinRequired`; `WriteError::Unavailable` through `AccordExecutor`) and stays
   like that until its host rejoins it — the `GroupHost`
-  `with_rejoin_handler` hook is told, and should close the group, discard its store
-  and journal, and `open_joining` it (next item). The bound a given-up peer must
+  `with_rejoin_handler` hook is told, and should `close(group).await` the group (it
+  returns once nothing touches its store or journal), discard them, and
+  `open_joining` it (next item). The bound a given-up peer must
   report above is persisted (`Journal::save_rejoin_bounds`), so it holds across a
   restart of the node that gave it up. A rejoin streams the snapshot in pages
   (`snapshot_page_bytes`), so a group of any size can be given up on and rejoined.
@@ -288,6 +298,13 @@ metadata log (config-Paxos); concurrent reconfigurations converge without a lead
 - **SQL backend:** run the schema via `evento-sql-migrator` with its `accord` feature
   (the `accord_commands/meta/metadata_log/acceptors` tables), alongside your event
   schema — one migrator for both.
+- **Clock bound:** the journal holds the node's clock bound (Fjall `meta` key /
+  `accord_meta` row `clock_bound`). Restoring a journal from an older backup restores
+  an older bound: start the node only once its wall clock is past the time of the
+  backup's last write plus a few seconds, or rejoin it from an empty journal (a
+  joiner starts its clock past the group's floor and its own transactions peers ship
+  back). A journal written before the bound existed starts the clock past the node's
+  own journaled transactions on its first restart.
 - **Upgrading past the apply-time re-stamp** (release note; the journal and wire
   formats are unchanged): a build before it stored each event with the stamp its
   writing host gave it, and later builds stamp it from the transaction's agreed
@@ -337,7 +354,12 @@ thousand-plus groups per process; none of them changes the protocol or the `Node
   ~800.
 - **`GroupHost`** — `open(group, topology, datastore, journal, config)` does the
   per-group wiring (register → sink → `Node::new` → `recover_state` → `start` →
-  schedule) and `close(group)` undoes it. `open_joining(…, contacts)` opens a group
+  schedule) and `close(group).await` undoes it: it returns once the group's sweep and
+  inbox loop have stopped (whatever they were doing is dropped, as a crash would drop
+  it), so its store and journal may be closed or discarded right after, and the
+  returned node mints nothing more (`NodeClosed`; `WriteError::Unavailable` through
+  `AccordExecutor`). An open of the same group waits for a close in progress. Never
+  close a group from one of its own tasks. `open_joining(…, contacts)` opens a group
   whose store was lost by bootstrapping it from a peer's snapshot (§7).
 
 ```rust
@@ -373,8 +395,9 @@ late, after a failed join unregistered the group, does not reopen it.
 
 **SQLite footprint.** sqlx-sqlite runs one OS thread per *open* connection, so bound
 each tenant pool (`max_connections(2–3)`, `min_connections(0)`, an `idle_timeout`) and
-cap the number of tenants open per process (LRU; `host.close` + `pool.close()` on
-eviction — a closed tenant catches up via anti-entropy when re-opened). The tenant
+cap the number of tenants open per process (LRU; `host.close(group).await`, then
+`pool.close()`, on eviction — under the tenant's open lock, so a request for it waits
+and opens it afresh; a closed tenant catches up via anti-entropy when re-opened). The tenant
 file is also the consensus journal, so keep `synchronous(Full)` under WAL. Build
 **one** `Sql` per tenant and clone it into both `ExecutorDataStore` and
 `AccordExecutor` — two `.into()`s from one pool do not share the write-wake channel.

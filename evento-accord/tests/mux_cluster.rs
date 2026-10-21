@@ -331,7 +331,7 @@ async fn a_closed_group_keeps_committing_elsewhere_and_catches_up_on_reopen() {
     g.await_applied(1).await;
 
     // Host 2 evicts the group. Writes still commit on the remaining quorum.
-    assert!(cluster.hosts[2].close(g.id).is_some());
+    assert!(cluster.hosts[2].close(g.id).await.is_some());
     assert!(!cluster.hosts[2].is_open(g.id));
     assert!(
         !write(&nodes[1], vec![event("acc-1", 1, "Opened")])
@@ -426,7 +426,7 @@ async fn a_group_with_a_lost_store_rejoins_after_compaction() {
     }
 
     // Host 2 comes back with nothing: a new store and journal.
-    cluster.hosts[2].close(g.id).expect("open on host 2");
+    cluster.hosts[2].close(g.id).await.expect("open on host 2");
     g.stores[2] = Arc::new(InMemoryDataStore::new());
     g.journals[2] = Arc::new(InMemoryJournal::new());
 
@@ -435,7 +435,7 @@ async fn a_group_with_a_lost_store_rejoins_after_compaction() {
     cluster.open(&g, 2).await;
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert!(g.stores[2].committed_events().is_empty());
-    cluster.hosts[2].close(g.id).expect("open on host 2");
+    cluster.hosts[2].close(g.id).await.expect("open on host 2");
     g.stores[2] = Arc::new(InMemoryDataStore::new());
     g.journals[2] = Arc::new(InMemoryJournal::new());
 
@@ -488,7 +488,7 @@ async fn a_large_group_joins_page_by_page_over_tcp() {
         node.compact(COMPACT_ALL).await;
     }
 
-    cluster.hosts[2].close(g.id).expect("open on host 2");
+    cluster.hosts[2].close(g.id).await.expect("open on host 2");
     g.stores[2] = Arc::new(InMemoryDataStore::new());
     g.journals[2] = Arc::new(InMemoryJournal::new());
     let joined = cluster
@@ -599,7 +599,7 @@ async fn a_join_that_breaks_after_a_page_stops_and_names_the_partial_install() {
         node.compact(COMPACT_ALL).await;
     }
 
-    cluster.hosts[2].close(g.id).expect("open on host 2");
+    cluster.hosts[2].close(g.id).await.expect("open on host 2");
     g.stores[2] = Arc::new(InMemoryDataStore::new());
     g.journals[2] = Arc::new(InMemoryJournal::new());
     let err = match cluster
@@ -697,8 +697,8 @@ async fn a_join_moves_on_when_a_contact_does_not_answer() {
         node.compact(COMPACT_ALL).await;
     }
 
-    cluster.hosts[1].close(g.id).expect("open on host 1");
-    cluster.hosts[2].close(g.id).expect("open on host 2");
+    cluster.hosts[1].close(g.id).await.expect("open on host 1");
+    cluster.hosts[2].close(g.id).await.expect("open on host 2");
     g.stores[2] = Arc::new(InMemoryDataStore::new());
     g.journals[2] = Arc::new(InMemoryJournal::new());
     let config = NodeConfig {
@@ -714,8 +714,8 @@ async fn a_join_moves_on_when_a_contact_does_not_answer() {
     assert!(cluster.unrouted[1].lock().unwrap().contains(&g.id));
 
     // With no contact answering, nothing is left registered.
-    cluster.hosts[2].close(g.id).expect("open on host 2");
-    cluster.hosts[0].close(g.id).expect("open on host 0");
+    cluster.hosts[2].close(g.id).await.expect("open on host 2");
+    cluster.hosts[0].close(g.id).await.expect("open on host 0");
     g.stores[2] = Arc::new(InMemoryDataStore::new());
     g.journals[2] = Arc::new(InMemoryJournal::new());
     assert!(cluster
@@ -915,6 +915,7 @@ async fn a_host_rejoins_a_group_of(n: u64) {
     // has been silent past the limit, compact without it.
     cluster.hosts[gone]
         .close(g.id)
+        .await
         .expect("open on the last host");
     write(&nodes[0], vec![event("acc", 2, "Deposited")]).await;
     write(&nodes[1], vec![event("acc", 3, "Deposited")]).await;
@@ -952,6 +953,7 @@ async fn a_host_rejoins_a_group_of(n: u64) {
     // The handler's job: close, discard the store and journal, open by joining.
     cluster.hosts[gone]
         .close(g.id)
+        .await
         .expect("open on the last host");
     g.stores[gone] = Arc::new(InMemoryDataStore::new());
     g.journals[gone] = Arc::new(InMemoryJournal::new());

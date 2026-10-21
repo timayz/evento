@@ -22,7 +22,7 @@
 //! behaviour; a single-node deployment keeps using `start_recovery`.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -51,6 +51,8 @@ pub trait Sweepable: Send + Sync + 'static {
     /// Current liveness signal; must be cheap (called every tick for every node).
     fn pressure(&self) -> SweepPressure;
     /// One sweep iteration. Never invoked concurrently for the same node.
+    /// [`SweepScheduler::cancel`] drops it at an await point, for a node
+    /// being discarded.
     async fn sweep(&self);
 }
 
@@ -106,8 +108,9 @@ struct Entry {
     active_until: Instant,
     /// Idle slot (`tick_index % slots`) this node sweeps on; staggers idle sweeps.
     phase: u64,
-    /// A sweep is running; skip until it finishes (sweeps are not re-entrant).
-    in_flight: Arc<AtomicBool>,
+    /// The node's last sweep; while it runs, the node is skipped (sweeps are
+    /// not re-entrant). A sweep that panicked counts as finished.
+    sweep: Option<JoinHandle<()>>,
 }
 
 /// Point-in-time counters of a [`SweepScheduler`].
@@ -165,7 +168,7 @@ impl SweepScheduler {
             last_activity: pressure.activity,
             active_until: Instant::now() + self.config.active_hold,
             phase: group.0 % self.slots(),
-            in_flight: Arc::new(AtomicBool::new(false)),
+            sweep: None,
         };
         self.entries
             .lock()
@@ -179,6 +182,27 @@ impl SweepScheduler {
             .lock()
             .expect("entries poisoned")
             .remove(&group);
+    }
+
+    /// Stops scheduling `group` and cancels a sweep of it in flight,
+    /// returning once that sweep has stopped: from then on nothing here
+    /// touches the node's store or journal.
+    ///
+    /// For a node being discarded ([`GroupHost::close`](crate::GroupHost::close)).
+    /// A sweep dropped midway leaves the node's in-memory bookkeeping as a
+    /// crash at that await point would — a recovery still registered, a
+    /// transaction still marked as applying — so a node that keeps running
+    /// is [`remove`](Self::remove)d instead.
+    pub async fn cancel(&self, group: GroupId) {
+        let entry = self
+            .entries
+            .lock()
+            .expect("entries poisoned")
+            .remove(&group);
+        if let Some(sweep) = entry.and_then(|entry| entry.sweep) {
+            sweep.abort();
+            let _ = sweep.await;
+        }
     }
 
     /// Whether `group` is scheduled.
@@ -223,39 +247,34 @@ impl SweepScheduler {
         let slots = self.slots();
         let hold = self.config.active_hold;
 
-        let due: Vec<(Arc<dyn Sweepable>, Arc<AtomicBool>)> = {
-            let mut entries = self.entries.lock().expect("entries poisoned");
-            entries
-                .values_mut()
-                .filter_map(|entry| {
-                    let pressure = entry.node.pressure();
-                    if pressure.activity != entry.last_activity {
-                        entry.last_activity = pressure.activity;
-                        entry.active_until = now + hold;
-                    }
-                    let due =
-                        pressure.busy || now < entry.active_until || index % slots == entry.phase;
-                    if due && !entry.in_flight.load(Ordering::Acquire) {
-                        Some((Arc::clone(&entry.node), Arc::clone(&entry.in_flight)))
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        };
-
-        for (node, in_flight) in due {
+        // Spawned under the lock, so `cancel` never misses a sweep that is
+        // about to start.
+        let mut entries = self.entries.lock().expect("entries poisoned");
+        for entry in entries.values_mut() {
+            let pressure = entry.node.pressure();
+            if pressure.activity != entry.last_activity {
+                entry.last_activity = pressure.activity;
+                entry.active_until = now + hold;
+            }
+            let due = pressure.busy || now < entry.active_until || index % slots == entry.phase;
+            if !due
+                || entry
+                    .sweep
+                    .as_ref()
+                    .is_some_and(|sweep| !sweep.is_finished())
+            {
+                continue;
+            }
             let Ok(permit) = Arc::clone(&self.semaphore).try_acquire_owned() else {
                 self.sweeps_deferred.fetch_add(1, Ordering::Relaxed);
                 continue;
             };
-            in_flight.store(true, Ordering::Release);
             self.sweeps_run.fetch_add(1, Ordering::Relaxed);
-            tokio::spawn(async move {
+            let node = Arc::clone(&entry.node);
+            entry.sweep = Some(tokio::spawn(async move {
                 node.sweep().await;
                 drop(permit);
-                in_flight.store(false, Ordering::Release);
-            });
+            }));
         }
     }
 }
@@ -264,6 +283,8 @@ impl SweepScheduler {
 mod tests {
     use super::*;
 
+    use std::sync::atomic::AtomicBool;
+
     #[derive(Default)]
     struct Fake {
         busy: AtomicBool,
@@ -271,6 +292,19 @@ mod tests {
         sweeps: AtomicU64,
         /// Hold each sweep until released (to test the concurrency cap).
         hold: Option<Arc<tokio::sync::Notify>>,
+        /// Sweeps currently running (dropped ones included, through a guard).
+        running: Arc<AtomicU64>,
+        /// Panic in every sweep.
+        panics: bool,
+    }
+
+    /// Counts a running sweep until it ends, finished or dropped.
+    struct Running(Arc<AtomicU64>);
+
+    impl Drop for Running {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 
     #[async_trait]
@@ -283,6 +317,11 @@ mod tests {
         }
         async fn sweep(&self) {
             self.sweeps.fetch_add(1, Ordering::Relaxed);
+            self.running.fetch_add(1, Ordering::SeqCst);
+            let _running = Running(Arc::clone(&self.running));
+            if self.panics {
+                panic!("a sweep panicked");
+            }
             if let Some(hold) = &self.hold {
                 hold.notified().await;
             }
@@ -440,5 +479,70 @@ mod tests {
         run_ticks(&s, 5).await;
         assert_eq!(node.sweeps.load(Ordering::Relaxed), 2);
         assert_eq!(s.stats().nodes, 0);
+    }
+
+    /// `cancel` stops a sweep in flight and returns once it has: a node being
+    /// discarded must not have its store or journal touched afterwards.
+    #[tokio::test(start_paused = true)]
+    async fn cancel_stops_a_sweep_in_flight_before_returning() {
+        let s = SweepScheduler::new(config());
+        let node = Arc::new(Fake {
+            busy: AtomicBool::new(true),
+            hold: Some(Arc::new(tokio::sync::Notify::new())),
+            ..Default::default()
+        });
+        s.add(GroupId(1), node.clone());
+        s.tick();
+        tokio::task::yield_now().await;
+        assert_eq!(node.running.load(Ordering::SeqCst), 1, "the sweep is held");
+
+        s.cancel(GroupId(1)).await;
+        assert_eq!(
+            node.running.load(Ordering::SeqCst),
+            0,
+            "the sweep was dropped"
+        );
+        assert!(!s.contains(GroupId(1)));
+        run_ticks(&s, 3).await;
+        assert_eq!(node.sweeps.load(Ordering::Relaxed), 1);
+    }
+
+    /// `remove` leaves a sweep in flight to finish on its own, for a node that
+    /// keeps running: dropped midway, it could leave its bookkeeping behind.
+    #[tokio::test(start_paused = true)]
+    async fn remove_lets_a_sweep_in_flight_finish() {
+        let s = SweepScheduler::new(config());
+        let hold = Arc::new(tokio::sync::Notify::new());
+        let node = Arc::new(Fake {
+            busy: AtomicBool::new(true),
+            hold: Some(hold.clone()),
+            ..Default::default()
+        });
+        s.add(GroupId(1), node.clone());
+        s.tick();
+        tokio::task::yield_now().await;
+        s.remove(GroupId(1));
+        assert_eq!(node.running.load(Ordering::SeqCst), 1, "still running");
+        hold.notify_waiters();
+        tokio::task::yield_now().await;
+        assert_eq!(
+            node.running.load(Ordering::SeqCst),
+            0,
+            "finished on its own"
+        );
+    }
+
+    /// A sweep that panicked does not keep its node from being swept again.
+    #[tokio::test(start_paused = true)]
+    async fn a_panicked_sweep_does_not_wedge_its_node() {
+        let s = SweepScheduler::new(config());
+        let node = Arc::new(Fake {
+            busy: AtomicBool::new(true),
+            panics: true,
+            ..Default::default()
+        });
+        s.add(GroupId(1), node.clone());
+        run_ticks(&s, 3).await;
+        assert_eq!(node.sweeps.load(Ordering::Relaxed), 3);
     }
 }

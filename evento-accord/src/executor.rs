@@ -31,7 +31,7 @@ use ulid::Ulid;
 use crate::api::{snapshot_event_size, DataStore, SnapshotPage};
 use crate::clock::{Timestamp, TxnId};
 use crate::message::Key;
-use crate::node::{BacklogAtCap, Node, RejoinRequired};
+use crate::node::{BacklogAtCap, Node, NodeClosed, RejoinRequired};
 
 /// Most events one backend read returns for the scans behind
 /// [`ExecutorDataStore::snapshot_page`] and [`ExecutorDataStore::snapshot`].
@@ -284,10 +284,11 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
             return Err(WriteError::MissingData);
         }
         // A refusal that clears on its own (the backlog cap, a rejoin in
-        // progress) is `Unavailable`, so a caller can tell a transient
-        // condition from a failure and keep the typed cause.
+        // progress, a node closed until its group reopens) is `Unavailable`,
+        // so a caller can tell a transient condition from a failure and keep
+        // the typed cause.
         let outcome = self.node.write(events).await.map_err(|err| {
-            if err.is::<BacklogAtCap>() || err.is::<RejoinRequired>() {
+            if err.is::<BacklogAtCap>() || err.is::<RejoinRequired>() || err.is::<NodeClosed>() {
                 WriteError::Unavailable(err)
             } else {
                 WriteError::Unknown(err)

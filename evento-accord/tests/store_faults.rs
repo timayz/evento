@@ -15,9 +15,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use evento_accord::{
     DataStore, HybridLogicalClock, InMemoryDataStore, InMemoryJournal, InMemoryNetwork, Journal,
-    MessageSink, Node, NodeConfig, NodeId, StaticTopology, Status, Timestamp, TxnId,
+    Message, MessageSink, Node, NodeConfig, NodeId, StaticTopology, Status, Timestamp, TxnId,
 };
-use evento_core::Event;
+use evento_core::cursor::{Args, ReadResult};
+use evento_core::{Event, EventFilter, RoutingKey};
 
 /// An in-memory store whose applies and version reads can be made to fail.
 #[derive(Default)]
@@ -27,6 +28,8 @@ struct FaultStore {
     /// Fails this many applies, then works again.
     applies_to_fail: AtomicUsize,
     version_failing: AtomicBool,
+    /// Fails every query (`DataStore::read`), as a forwarded read runs one.
+    read_failing: AtomicBool,
 }
 
 impl FaultStore {
@@ -60,6 +63,21 @@ impl DataStore for FaultStore {
             anyhow::bail!("simulated write failure");
         }
         self.inner.apply(txn, execute_at, events, commit).await
+    }
+
+    async fn read(
+        &self,
+        aggregators: Option<Arc<[EventFilter]>>,
+        routing_key: Option<RoutingKey>,
+        args: Args,
+        to_micros: Option<u64>,
+    ) -> anyhow::Result<ReadResult<Event>> {
+        if self.read_failing.load(Ordering::SeqCst) {
+            anyhow::bail!("simulated query failure");
+        }
+        self.inner
+            .read(aggregators, routing_key, args, to_micros)
+            .await
     }
 
     async fn snapshot(&self) -> anyhow::Result<Vec<Event>> {
@@ -239,5 +257,59 @@ async fn anti_entropy_stops_at_an_import_the_store_failed() {
         cluster.stores[2].applied(),
         vec![first.txn, second.txn],
         "imports land in execution order, the failed one first on retry"
+    );
+}
+
+/// A forwarded read the owner's store failed is an error for the reader, not
+/// an empty page: an empty page reads as "no such events", so an aggregate
+/// would load as never created.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forwarded_read_the_store_failed_is_an_error() {
+    let cluster = start(3, NodeConfig::default());
+    cluster.stores[1].read_failing.store(true, Ordering::SeqCst);
+
+    let result = cluster.nodes[0]
+        .forward_read(NodeId(1), None, None, Args::forward(10, None), None)
+        .await;
+    let err = result.expect_err("a failed read came back as a page");
+    // The owner's own failure, not a timeout.
+    assert!(
+        format!("{err:#}").contains("simulated query failure"),
+        "unexpected error: {err:#}"
+    );
+
+    cluster.stores[1]
+        .read_failing
+        .store(false, Ordering::SeqCst);
+    cluster.nodes[0]
+        .forward_read(NodeId(1), None, None, Args::forward(10, None), None)
+        .await
+        .expect("a healthy owner serves the read");
+}
+
+/// A requester on a build predating `ReadFailed` sheds it, and its read times
+/// out: still an error, never an empty page.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_requester_that_cannot_decode_the_failure_still_fails_the_read() {
+    let cluster = start(
+        3,
+        NodeConfig {
+            collect_timeout: Duration::from_millis(300),
+            ..NodeConfig::default()
+        },
+    );
+    cluster
+        .net
+        .set_unreadable(Some(Arc::new(|message: &Message| {
+            matches!(message, Message::ReadFailed { .. })
+        })));
+    cluster.stores[1].read_failing.store(true, Ordering::SeqCst);
+
+    let result = cluster.nodes[0]
+        .forward_read(NodeId(1), None, None, Args::forward(10, None), None)
+        .await;
+    assert!(
+        result.is_err(),
+        "a failed read came back as a page: {result:?}"
     );
 }

@@ -16,9 +16,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use evento_accord::{
-    AcceptorRecord, CommandState, DataStore, HybridLogicalClock, InMemoryDataStore,
-    InMemoryJournal, InMemoryNetwork, Journal, MessageSink, Node, NodeConfig, NodeId,
-    StaticTopology, Timestamp, Topology, TxnId,
+    AcceptorRecord, CommandState, DataStore, DynamicTopology, HybridLogicalClock,
+    InMemoryDataStore, InMemoryJournal, InMemoryNetwork, Journal, MessageSink, Node, NodeConfig,
+    NodeId, StaticTopology, Timestamp, Topology, TxnId,
 };
 use evento_core::Event;
 
@@ -34,6 +34,14 @@ struct FaultJournal {
     truncates: AtomicUsize,
     /// While set, `truncate` fails without touching the durable journal.
     truncate_failing: AtomicBool,
+    /// While set, every config-acceptor record fails.
+    acceptor_failing: AtomicBool,
+    /// While set, a config-acceptor record holding an accepted layout fails.
+    accept_failing: AtomicBool,
+    /// While set, appending to the metadata log fails.
+    metadata_failing: AtomicBool,
+    /// While set, persisting the clock bound fails.
+    clock_bound_failing: AtomicBool,
 }
 
 impl FaultJournal {
@@ -44,6 +52,10 @@ impl FaultJournal {
             failing: AtomicBool::new(false),
             truncates: AtomicUsize::new(0),
             truncate_failing: AtomicBool::new(false),
+            acceptor_failing: AtomicBool::new(false),
+            accept_failing: AtomicBool::new(false),
+            metadata_failing: AtomicBool::new(false),
+            clock_bound_failing: AtomicBool::new(false),
         }
     }
 
@@ -53,6 +65,22 @@ impl FaultJournal {
 
     fn set_truncate_failing(&self, v: bool) {
         self.truncate_failing.store(v, Ordering::SeqCst);
+    }
+
+    fn set_acceptor_failing(&self, v: bool) {
+        self.acceptor_failing.store(v, Ordering::SeqCst);
+    }
+
+    fn set_accept_failing(&self, v: bool) {
+        self.accept_failing.store(v, Ordering::SeqCst);
+    }
+
+    fn set_metadata_failing(&self, v: bool) {
+        self.metadata_failing.store(v, Ordering::SeqCst);
+    }
+
+    fn set_clock_bound_failing(&self, v: bool) {
+        self.clock_bound_failing.store(v, Ordering::SeqCst);
     }
 
     fn truncates(&self) -> usize {
@@ -103,16 +131,33 @@ impl Journal for FaultJournal {
         self.durable.load_watermark().await
     }
     async fn append_metadata(&self, epoch: u64, layout: &[Vec<NodeId>]) -> anyhow::Result<()> {
+        if self.metadata_failing.load(Ordering::SeqCst) {
+            anyhow::bail!("simulated metadata-log write failure");
+        }
         self.durable.append_metadata(epoch, layout).await
     }
     async fn load_metadata(&self) -> anyhow::Result<Vec<(u64, Vec<Vec<NodeId>>)>> {
         self.durable.load_metadata().await
     }
     async fn record_acceptor(&self, epoch: u64, state: &AcceptorRecord) -> anyhow::Result<()> {
+        if self.acceptor_failing.load(Ordering::SeqCst)
+            || (state.accepted.is_some() && self.accept_failing.load(Ordering::SeqCst))
+        {
+            anyhow::bail!("simulated acceptor-state write failure");
+        }
         self.durable.record_acceptor(epoch, state).await
     }
     async fn load_acceptors(&self) -> anyhow::Result<Vec<(u64, AcceptorRecord)>> {
         self.durable.load_acceptors().await
+    }
+    async fn save_clock_bound(&self, micros: u64) -> anyhow::Result<()> {
+        if self.clock_bound_failing.load(Ordering::SeqCst) {
+            anyhow::bail!("simulated clock-bound write failure");
+        }
+        self.durable.save_clock_bound(micros).await
+    }
+    async fn load_clock_bound(&self) -> anyhow::Result<Option<u64>> {
+        self.durable.load_clock_bound().await
     }
 }
 
@@ -132,6 +177,7 @@ struct Cluster {
     nodes: Vec<Node>,
     journals: Vec<Arc<FaultJournal>>,
     stores: Vec<Arc<InMemoryDataStore>>,
+    topologies: Vec<Arc<dyn Topology>>,
     _loops: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -142,16 +188,38 @@ fn start(n: u64) -> Cluster {
 /// `sweep: false` leaves the recovery sweep (which compacts on every pass)
 /// unstarted, so a test owns every [`Node::compact`] call.
 fn start_with(n: u64, sweep: bool, config: NodeConfig) -> Cluster {
+    build(n, sweep, config, |id, ids| {
+        Arc::new(StaticTopology::new(id, ids.to_vec())) as Arc<dyn Topology>
+    })
+}
+
+/// A single-shard cluster on a [`DynamicTopology`], sweeps started, so it
+/// can change epoch and catch up on the metadata log by itself.
+fn start_dynamic(n: u64) -> Cluster {
+    build(n, true, NodeConfig::default(), |id, ids| {
+        Arc::new(DynamicTopology::new(id, 0, vec![ids.to_vec()])) as Arc<dyn Topology>
+    })
+}
+
+fn build(
+    n: u64,
+    sweep: bool,
+    config: NodeConfig,
+    topology: impl Fn(NodeId, &[NodeId]) -> Arc<dyn Topology>,
+) -> Cluster {
     let ids: Vec<NodeId> = (0..n).map(NodeId).collect();
     let net = InMemoryNetwork::new();
     let (mut nodes, mut journals, mut stores, mut loops) = (vec![], vec![], vec![], vec![]);
+    let mut topologies = Vec::new();
     for &id in &ids {
         let inbox = net.register(id);
         let journal = Arc::new(FaultJournal::new());
         let store = Arc::new(InMemoryDataStore::new());
+        let topology = topology(id, &ids);
+        topologies.push(Arc::clone(&topology));
         let node = Node::new(
             id,
-            Arc::new(StaticTopology::new(id, ids.clone())) as Arc<dyn Topology>,
+            topology,
             Arc::new(HybridLogicalClock::new(id)),
             Arc::new(net.sink(id)) as Arc<dyn MessageSink>,
             Arc::clone(&store) as Arc<dyn DataStore>,
@@ -179,6 +247,7 @@ fn start_with(n: u64, sweep: bool, config: NodeConfig) -> Cluster {
         nodes,
         journals,
         stores,
+        topologies,
         _loops: loops,
     }
 }
@@ -407,4 +476,117 @@ async fn count_durable(journals: &[Arc<FaultJournal>], txn: TxnId) -> usize {
         }
     }
     n
+}
+
+/// A config acceptor whose journal cannot persist its state must not vote: a
+/// promise or an accept is a durable commitment that a restart restores, so
+/// one sent without it could be forgotten, and two proposers could then
+/// decide different layouts for one epoch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_config_vote_the_journal_did_not_persist_is_not_sent() {
+    let cluster = start_with(3, false, NodeConfig::default());
+    let layout = vec![cluster.ids.clone()];
+
+    // Two of three acceptors cannot persist a promise: no prepare quorum.
+    cluster.journals[1].set_acceptor_failing(true);
+    cluster.journals[2].set_acceptor_failing(true);
+    let result = cluster.nodes[0].propose_topology(1, layout.clone()).await;
+    assert!(
+        result.is_err(),
+        "decided on promises that were never persisted: {result:?}"
+    );
+    for journal in &cluster.journals[1..] {
+        assert!(journal.load_acceptors().await.unwrap().is_empty());
+    }
+    cluster.journals[1].set_acceptor_failing(false);
+    cluster.journals[2].set_acceptor_failing(false);
+
+    // Promises persist but accepts do not: no accept quorum.
+    cluster.journals[1].set_accept_failing(true);
+    cluster.journals[2].set_accept_failing(true);
+    let result = cluster.nodes[0].propose_topology(2, layout.clone()).await;
+    assert!(
+        result.is_err(),
+        "decided on accepts that were never persisted: {result:?}"
+    );
+    cluster.journals[1].set_accept_failing(false);
+    cluster.journals[2].set_accept_failing(false);
+
+    // Healthy journals: the change is decided.
+    cluster.nodes[0]
+        .propose_topology(3, layout)
+        .await
+        .expect("acceptors that persist their votes decide");
+}
+
+/// Waits until `topology` is at `epoch` or later.
+async fn await_epoch(topology: &dyn Topology, epoch: u64) {
+    for _ in 0..500 {
+        if topology.epoch() >= epoch {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("topology did not reach epoch {epoch}");
+}
+
+/// A node whose journal cannot persist a decided epoch does not install it.
+/// Installed, it would act on the epoch, yet fall back to the one before after
+/// a restart; and if the epoch retired every member of the one before, the
+/// peers it would fetch the entry from are gone. Once the journal recovers,
+/// the sweep's metadata catch-up installs it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_epoch_the_journal_did_not_persist_is_not_installed() {
+    let cluster = start_dynamic(3);
+    cluster.journals[2].set_metadata_failing(true);
+
+    cluster.nodes[0]
+        .change_topology(1, vec![cluster.ids.clone()])
+        .await
+        .unwrap();
+    await_epoch(cluster.topologies[1].as_ref(), 1).await;
+    // Several sweeps' worth of catch-up attempts, all failing to persist.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        cluster.topologies[2].epoch(),
+        0,
+        "installed an epoch its journal did not take"
+    );
+    assert!(cluster.journals[2]
+        .load_metadata()
+        .await
+        .unwrap()
+        .is_empty());
+
+    cluster.journals[2].set_metadata_failing(false);
+    await_epoch(cluster.topologies[2].as_ref(), 1).await;
+    assert_eq!(cluster.journals[2].load_metadata().await.unwrap().len(), 1);
+}
+
+/// A node that cannot persist its clock bound must not use a timestamp past
+/// it: after a restart it could mint that id again. A write whose id it cannot
+/// cover fails before any replica hears of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_whose_id_cannot_be_covered_fails_before_it_is_sent() {
+    let cluster = start_with(3, false, NodeConfig::default());
+    cluster.journals[0].set_clock_bound_failing(true);
+
+    let result = cluster.nodes[0]
+        .write(vec![event("acc", 1, "Opened")])
+        .await;
+    assert!(result.is_err(), "used an id it could not cover: {result:?}");
+    for node in &cluster.nodes {
+        assert_eq!(node.command_count(), 0, "a replica heard of the write");
+    }
+
+    cluster.journals[0].set_clock_bound_failing(false);
+    cluster.nodes[0]
+        .write(vec![event("acc", 1, "Opened")])
+        .await
+        .expect("a covered id is used");
+    assert!(cluster.journals[0]
+        .load_clock_bound()
+        .await
+        .unwrap()
+        .is_some());
 }
