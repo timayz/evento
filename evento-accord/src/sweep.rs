@@ -84,8 +84,11 @@ pub struct SweepConfig {
     /// something takes to converge. Default 5 s.
     pub idle_interval: Duration,
     /// Most sweeps in flight at once (each may await an anti-entropy reply or a
-    /// recovery). A due node that finds no slot is retried next tick. Size it above
-    /// the number of simultaneously active groups you expect. Default 64.
+    /// recovery). A due node that finds no slot stays due, and when more nodes are
+    /// due than slots are free, those swept longest ago go first — so every due
+    /// node is swept within about `due / max_concurrent` ticks, none starved by
+    /// the rest. Size it above the number of simultaneously active groups you
+    /// expect. Default 64.
     pub max_concurrent: usize,
 }
 
@@ -111,6 +114,13 @@ struct Entry {
     /// The node's last sweep; while it runs, the node is skipped (sweeps are
     /// not re-entrant). A sweep that panicked counts as finished.
     sweep: Option<JoinHandle<()>>,
+    /// Tick index at which its last sweep started (0 before the first): under
+    /// saturation, the nodes swept longest ago get the free slots first.
+    last_swept: u64,
+    /// A due sweep was deferred for want of a slot: the node stays due until it
+    /// runs, so an idle node that missed its slot is not put off a whole
+    /// `idle_interval`.
+    owed: bool,
 }
 
 /// Point-in-time counters of a [`SweepScheduler`].
@@ -169,6 +179,8 @@ impl SweepScheduler {
             active_until: Instant::now() + self.config.active_hold,
             phase: group.0 % self.slots(),
             sweep: None,
+            last_swept: 0,
+            owed: false,
         };
         self.entries
             .lock()
@@ -239,7 +251,8 @@ impl SweepScheduler {
     }
 
     /// One scheduling pass: decides which nodes are due and spawns their sweeps
-    /// (bounded by `max_concurrent`). Public so a test — or a caller with its own
+    /// (bounded by `max_concurrent`, oldest-swept first when more are due than
+    /// slots are free). Public so a test — or a caller with its own
     /// timer — can drive the scheduler without [`start`](Self::start).
     pub fn tick(&self) {
         let index = self.tick_index.fetch_add(1, Ordering::Relaxed);
@@ -250,25 +263,38 @@ impl SweepScheduler {
         // Spawned under the lock, so `cancel` never misses a sweep that is
         // about to start.
         let mut entries = self.entries.lock().expect("entries poisoned");
-        for entry in entries.values_mut() {
-            let pressure = entry.node.pressure();
-            if pressure.activity != entry.last_activity {
-                entry.last_activity = pressure.activity;
-                entry.active_until = now + hold;
-            }
-            let due = pressure.busy || now < entry.active_until || index % slots == entry.phase;
-            if !due
-                || entry
+        let mut due: Vec<&mut Entry> = entries
+            .values_mut()
+            .filter_map(|entry| {
+                let pressure = entry.node.pressure();
+                if pressure.activity != entry.last_activity {
+                    entry.last_activity = pressure.activity;
+                    entry.active_until = now + hold;
+                }
+                let due = entry.owed
+                    || pressure.busy
+                    || now < entry.active_until
+                    || index % slots == entry.phase;
+                let running = entry
                     .sweep
                     .as_ref()
-                    .is_some_and(|sweep| !sweep.is_finished())
-            {
-                continue;
-            }
+                    .is_some_and(|sweep| !sweep.is_finished());
+                (due && !running).then_some(entry)
+            })
+            .collect();
+        // Map order is fixed, so first-come would hand the slots to the same
+        // nodes every tick; when they are short, the longest-unswept go first.
+        if due.len() > self.semaphore.available_permits() {
+            due.sort_by_key(|entry| entry.last_swept);
+        }
+        for entry in due {
             let Ok(permit) = Arc::clone(&self.semaphore).try_acquire_owned() else {
+                entry.owed = true;
                 self.sweeps_deferred.fetch_add(1, Ordering::Relaxed);
                 continue;
             };
+            entry.owed = false;
+            entry.last_swept = index;
             self.sweeps_run.fetch_add(1, Ordering::Relaxed);
             let node = Arc::clone(&entry.node);
             entry.sweep = Some(tokio::spawn(async move {
@@ -465,6 +491,65 @@ mod tests {
         tokio::task::yield_now().await;
         let total: u64 = nodes.iter().map(|n| n.sweeps.load(Ordering::Relaxed)).sum();
         assert_eq!(total, 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_saturated_scheduler_sweeps_every_busy_node_in_turn() {
+        let s = SweepScheduler::new(SweepConfig {
+            max_concurrent: 2,
+            ..config()
+        });
+        let nodes: Vec<Arc<Fake>> = (0..6)
+            .map(|_| {
+                Arc::new(Fake {
+                    busy: AtomicBool::new(true),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        for (i, n) in nodes.iter().enumerate() {
+            s.add(GroupId(i as u64), n.clone());
+        }
+        tokio::time::advance(Duration::from_secs(2)).await; // past the add hold
+        run_ticks(&s, 9).await; // 18 slots for 6 always-due nodes
+        let sweeps: Vec<u64> = nodes
+            .iter()
+            .map(|n| n.sweeps.load(Ordering::Relaxed))
+            .collect();
+        assert!(
+            sweeps.iter().all(|&n| n >= 2),
+            "every due node gets its turn: {sweeps:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_deferred_idle_node_is_swept_on_the_next_free_tick() {
+        let s = SweepScheduler::new(SweepConfig {
+            max_concurrent: 1,
+            ..config()
+        });
+        let hold = Arc::new(tokio::sync::Notify::new());
+        // Busy, and its sweep holds the only slot until released.
+        let busy = Arc::new(Fake {
+            busy: AtomicBool::new(true),
+            hold: Some(hold.clone()),
+            ..Default::default()
+        });
+        let idle = Arc::new(Fake::default());
+        s.add(GroupId(1), busy.clone());
+        s.add(GroupId(5), idle.clone()); // idle slot: tick 5 of 50
+        tokio::time::advance(Duration::from_secs(2)).await; // past the add hold
+        run_ticks(&s, 10).await; // the idle slot passes while the slot is taken
+        assert_eq!(idle.sweeps.load(Ordering::Relaxed), 0);
+
+        hold.notify_waiters();
+        tokio::task::yield_now().await;
+        run_ticks(&s, 1).await;
+        assert_eq!(
+            idle.sweeps.load(Ordering::Relaxed),
+            1,
+            "the deferred idle sweep runs once a slot frees, not an idle interval later"
+        );
     }
 
     #[tokio::test(start_paused = true)]
