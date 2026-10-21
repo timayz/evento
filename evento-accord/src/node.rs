@@ -2487,6 +2487,18 @@ impl Node {
                 args,
                 to_micros,
             } => {
+                // A node still joining holds part of its store: whatever it
+                // answered could miss events committed long ago.
+                if !self.bootstrapped.load(Ordering::Acquire) {
+                    out.push((
+                        from,
+                        Message::ReadFailed {
+                            id,
+                            reason: "the owner is bootstrapping".into(),
+                        },
+                    ));
+                    return out;
+                }
                 let reply = match self
                     .datastore
                     .read(aggregators.map(Arc::from), routing_key, args, to_micros)

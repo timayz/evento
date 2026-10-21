@@ -1119,3 +1119,48 @@ async fn a_commit_of_an_invalid_layout_is_neither_installed_nor_persisted() {
         .unwrap();
     await_epoch(&nodes[0].topology, 1).await;
 }
+
+/// A node still joining holds only part of its store, so it refuses a
+/// forwarded read rather than answer from it; once joined, it serves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joining_node_refuses_a_forwarded_read_until_it_has_joined() {
+    use evento_core::cursor::Args;
+
+    let net = InMemoryNetwork::new();
+    let abc = vec![NodeId(0), NodeId(1), NodeId(2)];
+    let abcd = vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3)];
+    let nodes: Vec<TestNode> = abc
+        .iter()
+        .map(|&id| spawn_node(id, 0, vec![abc.clone()], &net))
+        .collect();
+    nodes[0]
+        .node
+        .write(vec![event("acc", 1, "Opened")])
+        .await
+        .unwrap();
+    for n in &nodes {
+        await_len(&n.store, 1).await;
+    }
+
+    let d = spawn_node(NodeId(3), 0, vec![abc.clone()], &net);
+    d.node.begin_join();
+    let err = nodes[0]
+        .node
+        .forward_read(NodeId(3), None, None, Args::forward(10, None), None)
+        .await
+        .expect_err("a joining node served a read from a partial store");
+    assert!(format!("{err:#}").contains("bootstrapping"), "{err:#}");
+
+    nodes[0]
+        .node
+        .change_topology(1, vec![abcd.clone()])
+        .await
+        .unwrap();
+    await_epoch(&d.topology, 1).await;
+    d.node.join(NodeId(0)).await.unwrap();
+    nodes[0]
+        .node
+        .forward_read(NodeId(3), None, None, Args::forward(10, None), None)
+        .await
+        .expect("a joined node serves reads");
+}

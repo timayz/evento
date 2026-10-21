@@ -305,9 +305,10 @@ control plane, everything else is Accord.
   The coordinator waits for its own local apply (read-your-writes). On a
   **multi-shard** cluster, a single-aggregate read for a key this node does not
   own is **routed** to an owner (`ReadForward` / `ReadReply`, served from the
-  owner's backend; an owner whose store refused the query answers `ReadFailed`, so
-  the read fails instead of returning an empty page that reads as "no such
-  events"); broad scans are served locally. `tests/executor.rs`
+  owner's backend; an owner whose store refused the query, or that is still joining
+  and holds part of its store, answers `ReadFailed`, so the read fails instead of
+  returning an empty or partial page that reads as "no such events"); broad scans
+  are served locally. `tests/executor.rs`
   (fjall-backed, single shard) proves replication, read-your-writes, and
   cluster-wide optimistic concurrency through the standard evento API;
   `tests/shard_executor.rs` proves read routing on a 2-shard cluster.

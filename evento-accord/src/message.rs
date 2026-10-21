@@ -462,8 +462,9 @@ pub enum Message {
         next: Option<TxnId>,
     },
     /// Owner → requester: it could not serve the [`ReadForward`](Message::ReadForward)
-    /// `id` — its store refused the query — so the requester fails the read
-    /// rather than take an empty page for "no such events". `reason` is the
+    /// `id` — its store refused the query, or it is still joining and holds
+    /// part of its store — so the requester fails the read rather than take
+    /// an empty or partial page for "no such events". `reason` is the
     /// owner's error, cut short. A node predating this variant sheds it, and
     /// its read times out: an error too, never an empty page.
     ReadFailed { id: u64, reason: String },
