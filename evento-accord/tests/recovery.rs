@@ -1080,3 +1080,57 @@ async fn recovery_takes_the_decision_a_compacted_shard_applied() {
         assert!(!c.committed(id, txn), "node {id} must not apply its events");
     }
 }
+
+/// The coordinator's abort reached shard B only, and two of its replicas
+/// have since compacted the transaction away; the third applied it but has
+/// not compacted yet. Recovering from shard A, which hears that straggler
+/// first: a fresh read on shard A says "commit", so the decision must come
+/// from the straggler, even though its shard is skipped as compacted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn recovery_takes_the_decision_from_a_compacted_shards_straggler() {
+    let c = Sharded::start();
+    let a = c.id_in_shard(0, "a");
+    let b = c.id_in_shard(1, "b");
+    c.nodes[3].write(vec![event(&b, 1)]).await.unwrap();
+    for id in 3..6 {
+        for _ in 0..400 {
+            if c.stores[id].applied_log().len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+    let txn = c.nodes[0]
+        .coordinate_through_commit(vec![event(&a, 1), event(&b, 1)])
+        .await
+        .expect("both shards commit it");
+    // The abort the coordinator decided reaches shard B only.
+    let decider = c.net.sink(NodeId(9));
+    for id in [3, 4, 5] {
+        decider
+            .send(NodeId(id), Message::Apply { txn, commit: false })
+            .await
+            .unwrap();
+    }
+    c.await_applied([3, 4, 5], txn).await;
+    let now = HybridLogicalClock::new(NodeId(9)).now();
+    for id in [4, 5] {
+        c.nodes[id].compact(now).await;
+        assert_eq!(c.nodes[id].command_status(txn), None, "compacted away");
+    }
+    // Node 3's Applied report lands first; a compacted one settles shard B.
+    for id in [4, 5] {
+        c.net
+            .set_latency(NodeId(id), NodeId(1), Duration::from_millis(100));
+    }
+
+    let outcome = tokio::time::timeout(Duration::from_secs(10), c.nodes[1].recover(txn))
+        .await
+        .expect("recovery completes")
+        .expect("recovery decides");
+    assert!(outcome.conflict, "the applied abort stands");
+    c.await_applied(0..3, txn).await;
+    for id in 0..6 {
+        assert!(!c.committed(id, txn), "node {id} must not apply its events");
+    }
+}

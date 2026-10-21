@@ -35,7 +35,7 @@ use crate::clock::{Ballot, Clock, HybridLogicalClock, NodeId, Timestamp, TxnId};
 use crate::failure_detector::FailureDetector;
 use crate::message::{CommandState, Key, Message, Status, SyncKnown, INVALIDATED_AT};
 use crate::metrics::{Metrics, MetricsSnapshot};
-use crate::replica::{command_size, Replica, RoutedRecovery};
+use crate::replica::{command_size, Refusal, Replica, RoutedRecovery};
 use crate::sweep::SweepPressure;
 use crate::transport::Envelope;
 
@@ -2032,7 +2032,10 @@ impl Node {
                         ));
                     }
                     // A recovery took the transaction over here.
-                    Err(promised) => out.push((from, Message::Nack { txn, promised })),
+                    Err(Refusal::Promised(promised)) => {
+                        out.push((from, Message::Nack { txn, promised }))
+                    }
+                    Err(Refusal::Compacted) => {}
                 }
             }
             Message::Accept {
@@ -2050,13 +2053,19 @@ impl Node {
                     .lock()
                     .expect("replica poisoned")
                     .accept(txn, ballot, execute_at, deps, keys);
+                if reply == Err(Refusal::Compacted) {
+                    return out;
+                }
                 let route_kept = reply.is_err() || self.keep_route(txn, route.as_deref()).await;
                 if !(self.journal_stage(txn).await && route_kept) {
                     return out;
                 }
                 match reply {
                     Ok(deps) => out.push((from, Message::AcceptOk { txn, ballot, deps })),
-                    Err(promised) => out.push((from, Message::Nack { txn, promised })),
+                    Err(Refusal::Promised(promised)) => {
+                        out.push((from, Message::Nack { txn, promised }))
+                    }
+                    Err(Refusal::Compacted) => {}
                 }
             }
             Message::Commit {
@@ -2173,9 +2182,7 @@ impl Node {
                         // Routed: never pre-accept what this replica never
                         // witnessed (see `Replica::recover_routed`).
                         Some(_) => replica.recover_routed(txn, ballot, keys, events),
-                        None => replica
-                            .recover(txn, ballot, keys, events)
-                            .map(RoutedRecovery::Known),
+                        None => replica.recover_unrouted(txn, ballot, keys, events),
                     }
                 };
                 let route_kept = !matches!(reply, Ok(RoutedRecovery::Known(_)))
@@ -3327,6 +3334,9 @@ impl Node {
     /// shard's read is waited for from one of them. Their decision is final,
     /// and it may rest on a shard no longer planned (applied and compacted
     /// there): a fresh read of the planned shards alone could contradict it.
+    /// An applied replica outside every plan therefore decides for its shard:
+    /// it is sent the Commit, and its answer is waited for and counted like a
+    /// read, but its shard needs no read quorum and is sent no Apply.
     #[allow(clippy::too_many_arguments)]
     async fn execute(
         &self,
@@ -3339,7 +3349,32 @@ impl Node {
         applied: &[NodeId],
     ) -> anyhow::Result<bool> {
         let union = Self::union_of(plans);
-        self.broadcast_commit(plans, route, txn, execute_at, &shard_deps)
+        // A shard skipped as compacted: its applied replicas heard from stand
+        // in for its read, one answer enough. They hold the transaction
+        // applied, so the Commit needs none of its keys, events or deps.
+        let mut skipped: Vec<ShardPlan> = Vec::new();
+        for n in applied
+            .iter()
+            .filter(|n| !plans.iter().any(|p| p.replicas.contains(n)))
+        {
+            let Some(shard) = self.topology.node_shard(*n) else {
+                continue;
+            };
+            match skipped.iter_mut().find(|p| p.shard == shard) {
+                Some(p) => p.replicas.push(*n),
+                None => skipped.push(ShardPlan {
+                    shard,
+                    replicas: vec![*n],
+                    electorate: vec![*n],
+                    fast_q: 1,
+                    slow_q: 1,
+                    keys: Vec::new(),
+                    events: Vec::new(),
+                }),
+            }
+        }
+        let read_plans: Vec<ShardPlan> = plans.iter().chain(&skipped).cloned().collect();
+        self.broadcast_commit(&read_plans, route, txn, execute_at, &shard_deps)
             .await;
 
         // Read: a slow quorum per shard reports its version condition —
@@ -3351,7 +3386,7 @@ impl Node {
         let reads = self
             .collect_by_shard_tagged(
                 rx,
-                plans,
+                &read_plans,
                 |p, got| got.len() >= p.slow_q && heard_applied(p, got),
                 Self::after(self.settings.collect_timeout),
                 HashSet::new(),
@@ -3361,7 +3396,7 @@ impl Node {
                 },
             )
             .await;
-        for plan in plans {
+        for plan in &read_plans {
             let got = &reads[&plan.shard];
             if got.len() < plan.slow_q || !heard_applied(plan, got) {
                 anyhow::bail!("read quorum not reached for shard {}", plan.shard);
@@ -3865,10 +3900,14 @@ impl Node {
                 RecoverResp::Ok(f) if f.known => Some((from, f)),
                 _ => None,
             })
-            .filter(|(from, _)| {
-                self.topology
-                    .node_shard(*from)
-                    .is_some_and(|shard| planned.contains(&shard))
+            // A skipped shard's applied replica stays: it holds the decision
+            // (see `execute`).
+            .filter(|(from, f)| {
+                f.status == Status::Applied
+                    || self
+                        .topology
+                        .node_shard(*from)
+                        .is_some_and(|shard| planned.contains(&shard))
             })
             .collect();
         self.drive_recovery(rx, txn, ballot, &plans, Some(route), known)
