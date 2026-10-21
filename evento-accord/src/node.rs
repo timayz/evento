@@ -1453,8 +1453,8 @@ impl Node {
         }
     }
 
-    /// Anti-entropy repair: pull any committed transactions a rotating peer has
-    /// that this node missed (e.g. while it was briefly down). Recovery alone
+    /// Anti-entropy repair: pull any committed transactions a rotating peer of
+    /// this node's shard has that this node missed (e.g. while it was briefly down). Recovery alone
     /// can't fix this — a transaction that completed on a quorum without this
     /// node is "stuck" nowhere — so a healed node converges via this sweep.
     async fn anti_entropy(&self) {
@@ -1470,8 +1470,17 @@ impl Node {
             }
             *last = Some(Instant::now());
         }
-        let nodes = self.topology.nodes();
-        let peers: Vec<NodeId> = nodes.into_iter().filter(|&n| n != self.id).collect();
+        // Only a replica of this node's shard holds what it is missing; another
+        // shard's node would build and ship a page this node then discards. A
+        // node outside every shard owns nothing to repair.
+        if self.topology.node_shard(self.id).is_none() {
+            return;
+        }
+        let peers: Vec<NodeId> = self
+            .shard_peers()
+            .into_iter()
+            .filter(|&n| n != self.id)
+            .collect();
         if peers.is_empty() {
             return;
         }
