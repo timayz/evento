@@ -24,9 +24,11 @@ use crate::transport::GroupId;
 
 /// Called with a group whose node was told to rejoin (see
 /// [`Node::rejoin_required`]): the host should [`close`](GroupHost::close) it,
-/// discard its store and journal, and open it again with
-/// [`open_joining`](GroupHost::open_joining). Called once per open, from a
-/// task of its own, so it may block or spawn as it likes.
+/// discard its **event store** — but keep its journal — and open it again
+/// with [`open_joining`](GroupHost::open_joining) over the same journal. The
+/// journal holds the node's votes, promises and clock bound, which a
+/// rejoined node must not forget. Called once per open, from a task of its
+/// own, so it may block or spawn as it likes.
 pub type RejoinHandler = Arc<dyn Fn(GroupId) + Send + Sync>;
 
 struct Running {
@@ -179,12 +181,19 @@ impl GroupHost {
             .await
     }
 
-    /// Opens `group` over a store that lost its state (a new disk, a deleted
-    /// file) by **joining** it: the node buffers consensus traffic while it
-    /// fetches a peer's data-store snapshot, compaction floor and recent
-    /// commands ([`Node::join`]), then replays what it buffered. A plain
-    /// [`open`](Self::open) would recover only the journal tail and leave the
-    /// prefix its peers already compacted missing for good.
+    /// Opens `group` over an empty event store by **joining** it: the node
+    /// recovers its journal ([`Node::recover_state_for_join`]) — empty for a
+    /// new member, kept for one told to rejoin or whose store was lost —
+    /// then buffers consensus traffic while it fetches a peer's data-store
+    /// snapshot, compaction floor and recent commands ([`Node::join`]), and
+    /// replays what it buffered. A plain [`open`](Self::open) would recover
+    /// only the journal tail and leave the prefix its peers already compacted
+    /// missing for good.
+    ///
+    /// Keep the journal: only the event store is discarded. A node that lost
+    /// its journal, or got an older one back, forgot votes and promises it
+    /// made — it must come back as a new member under a new node id (see
+    /// `OPERATIONS.md` §7).
     ///
     /// `contacts` are tried in order until one answers; a contact that is
     /// itself joining does not answer. If none does, nothing is left
@@ -195,7 +204,7 @@ impl GroupHost {
     /// For the same reason a join that fails after a page was installed is
     /// not retried on the next contact: the error carries a
     /// [`PartialSnapshot`](crate::PartialSnapshot) and nothing is left
-    /// registered — discard the store and journal, then open again.
+    /// registered — discard the store (keep the journal), then open again.
     pub async fn open_joining(
         &self,
         group: GroupId,
@@ -283,8 +292,14 @@ impl GroupHost {
         let sink: Arc<dyn MessageSink> = Arc::new(self.mux.sink(group));
         let node =
             Node::new(self.id, topology, clock, sink, datastore, journal).with_config(config);
-        node.recover_state().await?;
         let joining = !contacts.is_empty();
+        if joining {
+            // The store is to be rebuilt from a snapshot: nothing is
+            // replayed into it.
+            node.recover_state_for_join().await?;
+        } else {
+            node.recover_state().await?;
+        }
         if joining {
             // Before the inbox loop starts, so no frame (parked ones included)
             // is processed ahead of the snapshot.
@@ -309,7 +324,8 @@ impl GroupHost {
                         );
                         // Part of the snapshot landed: another contact's
                         // pages would overlap it and be skipped, leaving a
-                        // gap. The store has to be emptied first.
+                        // gap. The store has to be emptied first (the
+                        // journal is kept).
                         let partial = err.downcast_ref::<PartialSnapshot>().is_some();
                         last = Some((err, partial));
                         if partial {

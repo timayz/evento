@@ -1839,8 +1839,9 @@ async fn sweep_for_bugs() {
 
 impl Sim {
     /// What a host does when node `i` is told to rejoin: tears it down, builds
-    /// a fresh node over an **empty** store and journal, and joins through
-    /// `contact` before its sweeps start (as `GroupHost::open_joining` does).
+    /// a fresh node over an **empty** store and its **kept** journal, and
+    /// joins through `contact` before its sweeps start (as
+    /// `GroupHost::open_joining` does).
     async fn rejoin(&mut self, i: usize, contact: NodeId, config: NodeConfig) {
         let store = Arc::new(InMemoryDataStore::new());
         self.rejoin_over(
@@ -1867,7 +1868,7 @@ impl Sim {
         }
         let id = self.ids[i];
         let inbox = self.net.register(id);
-        let journal = Arc::new(InMemoryJournal::new());
+        let journal = Arc::clone(&self.journals[i]);
         let node = Node::new(
             id,
             Arc::new(Self::topology(id, &self.ids, &self.electorate)),
@@ -1880,6 +1881,9 @@ impl Sim {
             Arc::clone(&journal) as Arc<dyn Journal>,
         )
         .with_config(config);
+        node.recover_state_for_join()
+            .await
+            .expect("recover the kept journal");
         node.begin_join();
         let inbox_task = node.start(inbox);
         node.join(contact).await.expect("rejoin from a snapshot");

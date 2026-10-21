@@ -260,8 +260,8 @@ refuses anything else before a vote, and a node never installs it.
   (`RejoinRequired`; `WriteError::Unavailable` through `AccordExecutor`) and stays
   like that until its host rejoins it — the `GroupHost`
   `with_rejoin_handler` hook is told, and should `close(group).await` the group (it
-  returns once nothing touches its store or journal), discard them, and
-  `open_joining` it (next item). The bound a given-up peer must
+  returns once nothing touches its store or journal), discard its event store —
+  **keep its journal** — and `open_joining` it over that journal (next item). The bound a given-up peer must
   report above is persisted (`Journal::save_rejoin_bounds`), so it holds across a
   restart of the node that gave it up. A rejoin streams the snapshot in pages
   (`snapshot_page_bytes`), so a group of any size can be given up on and rejoined.
@@ -271,22 +271,39 @@ refuses anything else before a vote, and a node never installs it.
   for the length of the join (it resumes on the joiner's first report, or a few
   `collect_timeout`s after its last page request if it gives up); size
   `max_commands` for the writes a join of your largest store spans.
-- **Node back with a lost store** (new disk, deleted tenant file, a backup older than
-  its peers' compaction): its journal floor is gone, so anti-entropy can ship only the
-  commands peers still hold and the compacted prefix never comes back — the
-  `sync contact truncated above this node's proven coverage` warning names this case.
-  Wipe the store and journal and open the group by **joining** instead:
-  `GroupHost::open_joining(…, contacts)` (or `begin_join` + `join` on a bare `Node`)
-  installs a contact's data-store snapshot page by page, adopts and persists its
-  floor, then replays the traffic buffered meanwhile. Contacts are tried in order;
-  one that is itself joining does not answer. Join only over an empty store (`join`
+- **Node back with a lost store** (new disk, deleted file, a store restored from a
+  backup older than its peers' compaction), its journal intact: anti-entropy can
+  ship only the commands peers still hold, and the compacted prefix never comes
+  back — the `sync contact truncated above this node's proven coverage` warning
+  names this case. Empty the store, **keep the journal**, and open the group by
+  **joining** instead: `GroupHost::open_joining(…, contacts)` (or
+  `recover_state_for_join` + `begin_join` + `join` on a bare `Node`) recovers the
+  journal without replaying it into the store, installs a contact's data-store
+  snapshot page by page, adopts and persists its floor, replays the traffic
+  buffered meanwhile, and applies again what it had applied that the contact had
+  not. The journal keeps the node's votes, recovery promises, config-Paxos
+  promises and clock bound, so the rejoined node never votes against them. When
+  the store and journal share a database (one SQLite file per tenant through
+  `evento-sql`, or Fjall through `FjallJournal::from_database`), empty only the
+  event store — with `evento-sql`, its `event`, `snapshot` and `subscriber`
+  tables; the `accord_*` tables are the journal. Contacts are tried in order; one
+  that is itself joining does not answer. Join only over an empty store (`join`
   refuses otherwise): a page that overlaps existing events is skipped whole as an
   idempotent re-apply, which would leave a gap. For the same reason a join that
   fails after a page was installed (a contact that cannot read its backend, a link
   that keeps losing pages) is not retried on the next contact: the error carries
   `PartialSnapshot` (`accord_joins_partial_total`), nothing is left registered, and
-  the store and journal must be discarded before opening again — the same wipe a
-  lost store gets.
+  the store (not the journal) must be emptied before opening again.
+- **Node back with a lost or rolled-back journal** (a dead disk that held it, a
+  deleted file holding both store and journal, a journal restored from a backup):
+  the node has forgotten votes, recovery promises and config-Paxos promises it
+  made, and ids it minted. Back under its old node id it could vote against them,
+  breaking the quorum intersection recovery and reconfiguration rely on. It must
+  come back as a **new member under a new node id**: remove the old id from the
+  topology (`change_topology`) and add the new one, which joins with an empty store
+  and journal (`open_joining`). Under a `GroupHost` the node id is the host's (its
+  `MuxTransport` id), shared by every group it hosts, so a new id means a new host
+  identity.
 
 ---
 
@@ -299,21 +316,23 @@ refuses anything else before a vote, and a node never installs it.
   never claims durability it doesn't have — so a node that can't fsync stops acking
   (treat a node logging `journal flush failed` as failed; investigate its disk).
 - **What to back up:** the **event store** (Fjall dir / SQL `event` table — the
-  materialized state and read source) and, if you want fast restart without re-syncing,
-  the **journal** (Fjall dir, or the `accord_*` SQL tables). The journal is bounded by
-  compaction; the event store grows with history. Back up per node; a restored node also
-  re-syncs missing tail from peers via anti-entropy — unless its peers have compacted
-  past the backup, in which case discard it and rejoin (§7, lost store).
+  materialized state and read source), per node. A store restored from a backup
+  re-syncs its missing tail from peers via anti-entropy — unless its peers have
+  compacted past the backup, in which case empty it and rejoin over the node's
+  journal (§7, lost store). **Never restore the journal** (Fjall `accord_*`
+  keyspaces, or the `accord_*` SQL tables) from a backup: an older journal forgets
+  the votes and promises the node made since, so a node whose journal was rolled
+  back comes back as a new member (§7, lost journal). The journal is bounded by
+  compaction; the event store grows with history.
 - **SQL backend:** run the schema via `evento-sql-migrator` with its `accord` feature
   (the `accord_commands/meta/metadata_log/acceptors` tables), alongside your event
   schema — one migrator for both.
 - **Clock bound:** the journal holds the node's clock bound (Fjall `meta` key /
-  `accord_meta` row `clock_bound`). Restoring a journal from an older backup restores
-  an older bound: start the node only once its wall clock is past the time of the
-  backup's last write plus a few seconds, or rejoin it from an empty journal (a
-  joiner starts its clock past the group's floor and its own transactions peers ship
-  back). A journal written before the bound existed starts the clock past the node's
-  own journaled transactions on its first restart.
+  `accord_meta` row `clock_bound`), so a restarted or rejoined node never mints an
+  id it minted before, even after its wall clock stepped back. A journal written
+  before the bound existed starts the clock past the node's own journaled
+  transactions on its first restart. (A journal restored from a backup holds an
+  older bound, among everything else it forgets: §7, lost journal.)
 - **Upgrading past the apply-time re-stamp** (release note; the journal and wire
   formats are unchanged): a build before it stored each event with the stamp its
   writing host gave it, and later builds stamp it from the transaction's agreed
@@ -324,8 +343,8 @@ refuses anything else before a vote, and a node never installs it.
   applying the same transaction stamp it differently, and their subscription cursors
   stop lining up for good. Upgrade a group's nodes together (stop all, upgrade, start).
   If a rolling upgrade let both builds apply, pick one upgraded replica and rejoin
-  every other from an empty store against it (§7, lost store), so all share its
-  stamps.
+  every other from an empty store, keeping its journal, against it (§7, lost
+  store), so all share its stamps.
 
 ---
 
@@ -369,7 +388,8 @@ thousand-plus groups per process; none of them changes the protocol or the `Node
   returned node mints nothing more (`NodeClosed`; `WriteError::Unavailable` through
   `AccordExecutor`). An open of the same group waits for a close in progress. Never
   close a group from one of its own tasks. `open_joining(…, contacts)` opens a group
-  whose store was lost by bootstrapping it from a peer's snapshot (§7).
+  whose store was lost, or that was told to rejoin, by bootstrapping it from a peer's
+  snapshot over its kept journal (§7).
 
 ```rust
 let mux = Arc::new(MuxTransport::new(id, peer_addrs).with_unrouted_handler(reopen));

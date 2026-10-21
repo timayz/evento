@@ -425,19 +425,17 @@ async fn a_group_with_a_lost_store_rejoins_after_compaction() {
         assert_eq!(node.command_count(), 0, "every command compacted away");
     }
 
-    // Host 2 comes back with nothing: a new store and journal.
+    // Host 2 comes back with an empty store; its journal survived.
     cluster.hosts[2].close(g.id).await.expect("open on host 2");
     g.stores[2] = Arc::new(InMemoryDataStore::new());
-    g.journals[2] = Arc::new(InMemoryJournal::new());
 
-    // A plain open recovers nothing and anti-entropy ships nothing: every
-    // command it would replay is compacted away on the peers.
+    // A plain open recovers only the journal's floor, and anti-entropy ships
+    // nothing: every command it would replay is compacted away everywhere.
     cluster.open(&g, 2).await;
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert!(g.stores[2].committed_events().is_empty());
     cluster.hosts[2].close(g.id).await.expect("open on host 2");
     g.stores[2] = Arc::new(InMemoryDataStore::new());
-    g.journals[2] = Arc::new(InMemoryJournal::new());
 
     let joined = cluster
         .open_joining(&g, 2, NodeConfig::default(), &[NodeId(0), NodeId(1)])
@@ -490,7 +488,6 @@ async fn a_large_group_joins_page_by_page_over_tcp() {
 
     cluster.hosts[2].close(g.id).await.expect("open on host 2");
     g.stores[2] = Arc::new(InMemoryDataStore::new());
-    g.journals[2] = Arc::new(InMemoryJournal::new());
     let joined = cluster
         .open_joining(&g, 2, config, &[NodeId(0), NodeId(1)])
         .await
@@ -601,7 +598,6 @@ async fn a_join_that_breaks_after_a_page_stops_and_names_the_partial_install() {
 
     cluster.hosts[2].close(g.id).await.expect("open on host 2");
     g.stores[2] = Arc::new(InMemoryDataStore::new());
-    g.journals[2] = Arc::new(InMemoryJournal::new());
     let err = match cluster
         .open_joining(&g, 2, config, &[NodeId(0), NodeId(1)])
         .await
@@ -626,9 +622,8 @@ async fn a_join_that_breaks_after_a_page_stops_and_names_the_partial_install() {
     assert!(!cluster.hosts[2].is_open(g.id));
     assert_eq!(g.stores[2].committed_events().len(), 1, "the prefix stayed");
 
-    // Emptied, the store joins through the healthy contact.
+    // Emptied (the journal kept), the store joins through the healthy contact.
     g.stores[2] = Arc::new(InMemoryDataStore::new());
-    g.journals[2] = Arc::new(InMemoryJournal::new());
     let joined = cluster
         .open_joining(&g, 2, config, &[NodeId(1)])
         .await
@@ -700,7 +695,6 @@ async fn a_join_moves_on_when_a_contact_does_not_answer() {
     cluster.hosts[1].close(g.id).await.expect("open on host 1");
     cluster.hosts[2].close(g.id).await.expect("open on host 2");
     g.stores[2] = Arc::new(InMemoryDataStore::new());
-    g.journals[2] = Arc::new(InMemoryJournal::new());
     let config = NodeConfig {
         collect_timeout: Duration::from_millis(500),
         ..NodeConfig::default()
@@ -717,7 +711,6 @@ async fn a_join_moves_on_when_a_contact_does_not_answer() {
     cluster.hosts[2].close(g.id).await.expect("open on host 2");
     cluster.hosts[0].close(g.id).await.expect("open on host 0");
     g.stores[2] = Arc::new(InMemoryDataStore::new());
-    g.journals[2] = Arc::new(InMemoryJournal::new());
     assert!(cluster
         .open_joining(&g, 2, config, &[NodeId(1), NodeId(0)])
         .await
@@ -741,7 +734,6 @@ async fn an_open_dropped_mid_join_leaves_nothing_running() {
     cluster.hosts[1].close(g.id).await.expect("open on host 1");
     cluster.hosts[2].close(g.id).await.expect("open on host 2");
     g.stores[2] = Arc::new(InMemoryDataStore::new());
-    g.journals[2] = Arc::new(InMemoryJournal::new());
     let config = NodeConfig {
         collect_timeout: Duration::from_secs(30),
         ..NodeConfig::default()
@@ -991,13 +983,13 @@ async fn a_host_rejoins_a_group_of(n: u64) {
         .await
         .is_err());
 
-    // The handler's job: close, discard the store and journal, open by joining.
+    // The handler's job: close, discard the event store (keeping the
+    // journal), open by joining.
     cluster.hosts[gone]
         .close(g.id)
         .await
         .expect("open on the last host");
     g.stores[gone] = Arc::new(InMemoryDataStore::new());
-    g.journals[gone] = Arc::new(InMemoryJournal::new());
     let contacts: Vec<NodeId> = (0..gone as u64).map(NodeId).collect();
     let joined = cluster
         .open_joining(&g, gone, config, &contacts)
