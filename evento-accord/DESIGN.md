@@ -774,9 +774,8 @@ backend (sql/fjall). Phases, in order:
         epoch, so one took or tore down the other's replies (now one slot per
         proposal, every reply fanned out, and a nack counted only by the proposal
         whose ballot it outbids).
-        A fifth fix bounded the TCP peer writer, the leading suspect for a node
-        that stayed unreachable for the rest of a Jepsen run: a dial (connect +
-        TLS handshake) now gives up after 2 s and a batch write after 5 s, which
+        A fifth fix bounded the TCP peer writer: a dial (connect + TLS
+        handshake) now gives up after 2 s and a batch write after 5 s, which
         counts as a failed write and redials, so a peer behind a DROP partition
         no longer pins its writer for the kernel's SYN retries or TCP's
         retransmit backoff while every frame to it is shed; a failed dial backs
@@ -789,7 +788,12 @@ backend (sql/fjall). Phases, in order:
         from that applied it, stays undecided (liveness, not safety);
         a rejoin (wiped store) forgets the replica's in-flight votes and promises;
         an epoch change can remap a route's keys onto replicas that never
-        witnessed an in-flight txn, which then answer "never witnessed".
+        witnessed an in-flight txn, which then answer "never witnessed";
+        under Jepsen faults a node can stay unavailable for the rest of a 120 s
+        run (#291) — not the TCP writer: with it bounded, a partition-only run
+        (`--faults partition --partition-targets one`) still left a node that
+        had been isolated answering only timeouts and 500s after the heal, while
+        its peers' writers had logged it reachable again within ~3 s.
   - [ ] **Real-cluster soak + chaos** over days (kills, partitions, clock skew,
         disk pressure, slow disks/links) on actual hardware — zero production
         mileage today.
