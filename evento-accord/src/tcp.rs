@@ -595,18 +595,40 @@ impl GroupTable {
             let groups = self.groups.lock().expect("groups poisoned");
             groups.get(&group).cloned()
         };
-        let Some(tx) = inbox else {
-            self.unrouted(group, envelope);
-            return;
-        };
-        match tx.try_send(envelope) {
-            // Delivered, or shed for a full inbox (backpressure, tolerated).
-            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
-            // The group's node is gone; forget it and treat the frame as
-            // unrouted. Other groups keep using this connection.
-            Err(mpsc::error::TrySendError::Closed(envelope)) => {
-                self.groups.lock().expect("groups poisoned").remove(&group);
+        self.deliver_to(group, inbox, envelope);
+    }
+
+    /// Hands `envelope` to `inbox`, the sender `group` was registered with
+    /// when the frame was routed (`None`: not registered).
+    fn deliver_to(
+        &self,
+        group: GroupId,
+        mut inbox: Option<mpsc::Sender<Envelope>>,
+        mut envelope: Envelope,
+    ) {
+        loop {
+            let Some(tx) = inbox else {
                 self.unrouted(group, envelope);
+                return;
+            };
+            match tx.try_send(envelope) {
+                // Delivered, or shed for a full inbox (backpressure, tolerated).
+                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => return,
+                // The group's node is gone: forget it and treat the frame as
+                // unrouted (other groups keep using this connection) — unless
+                // the group was registered again since, closed and reopened:
+                // that inbox is live, so the frame goes there instead.
+                Err(mpsc::error::TrySendError::Closed(back)) => {
+                    envelope = back;
+                    let mut groups = self.groups.lock().expect("groups poisoned");
+                    inbox = match groups.get(&group) {
+                        Some(current) if current.same_channel(&tx) => {
+                            groups.remove(&group);
+                            None
+                        }
+                        current => current.cloned(),
+                    };
+                }
             }
         }
     }
@@ -1146,6 +1168,27 @@ mod tests {
         // Rate-limited: a second frame within the interval does not re-notify.
         mux.table.deliver(g, applied(2));
         assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    /// A frame routed to an inbox that closed meanwhile goes to the group's
+    /// newer inbox when the group was registered again since (closed and
+    /// reopened): forgetting whatever is registered would cut the reopened
+    /// group off from every frame.
+    #[tokio::test]
+    async fn a_closed_inbox_never_unregisters_a_newer_one() {
+        let mux = mux();
+        let g = GroupId(4);
+        let first = mux.register(g);
+        let stale = mux.table.groups.lock().unwrap().get(&g).cloned();
+        drop(first);
+        let mut second = mux.register(g);
+
+        mux.table.deliver_to(g, stale, applied(1));
+        assert!(mux.is_registered(g), "the reopened group was unregistered");
+        assert!(
+            second.try_recv().is_ok(),
+            "the frame did not reach the live inbox"
+        );
     }
 
     #[tokio::test]
