@@ -422,6 +422,21 @@ backend (sql/fjall). Phases, in order:
   silent while nothing was compacted past it is simply counted again
   (`an_absent_peer_stops_holding_compaction_back`,
   `a_minority_never_drops_its_way_to_compaction`, `rejoin_bounds_survive_a_restart`).
+  A rejoined node is counted again by its first report: the contact follows the
+  join header with `Message::JoinProof` — its own report, taken in the same cut as
+  the exported commands — which the joiner, once every page is installed, counts as
+  proven coverage (it now holds what the contact held below it; same shard and
+  epoch only, never persisted). Without it the joiner's first report would precede
+  the `slow_q − 1` peers' coverage a shard of four or more needs, and it would be
+  told to rejoin again. Until the joiner reports, the contact holds its own report
+  at that vouch (a `JoinHold`, refreshed by every page request and lapsing a few
+  page timeouts after the last), so no peer's compaction — and bound — passes the
+  joiner's first report while pages cross the wire under a write load. A node still
+  joining ignores `Rejoin` and answers no anti-entropy (its coverage would vouch for
+  transactions it never witnessed); a stale replica that never rejoined still gets
+  only `Rejoin` (`a_rejoined_peer_is_counted_again_in_a_group_of_four`/`_five`,
+  `a_peer_rejoining_under_writes_is_counted_again`,
+  `a_stale_replica_cannot_sync_its_way_back_in`).
   `applied_through` alone is not enough, though: a replica partitioned *during*
   consensus never witnessed the missed transactions at all, so after healing its
   report would vouch for a window it wasn't connected for and prematurely unblock
@@ -615,10 +630,13 @@ backend (sql/fjall). Phases, in order:
         now re-stamped at apply from its txn's `execute_at`, floored to the
         millisecond, and the watermark bounds an un-applied command by `t0` floored
         likewise — a release note, not a format bump: a store applied by an older
-        build keeps its client stamps).
+        build keeps its client stamps);
+        a host rejoining a group of N ≥ 4 was told to rejoin again (its first report
+        predated the two-peer coverage proof — now the contact vouches for it), and
+        at any N a long join under writes was too (peers compacted past the vouch
+        meanwhile — now the contact holds its report until the joiner's; and a
+        `Rejoin` answering the joiner's mid-join replies aborted the join).
         **Open** (confirmed or plausible, not yet fixed):
-        a host rejoining a group of N ≥ 4 is told to rejoin again (its first report
-        predates the two-peer coverage proof, and the absent screen refuses its syncs);
         multi-shard recovery cannot see a shard that never witnessed the txn and could
         commit it on the others only (needs the txn's route on every message);
         an anti-entropy reply or join header over the 64 MiB frame cap is shed forever;

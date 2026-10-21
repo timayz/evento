@@ -286,6 +286,58 @@ enum Screen {
     Reply(Message),
 }
 
+/// The [`Message::JoinProof`] slot of an in-flight join, dropped from
+/// `Node::proof_pending` however the join ends.
+struct PendingProof<'a> {
+    node: &'a Node,
+    id: u64,
+}
+
+impl PendingProof<'_> {
+    /// The vouch the contact sent, if any arrived.
+    fn take(self) -> Option<Vouch> {
+        self.node
+            .proof_pending
+            .lock()
+            .expect("proof poisoned")
+            .get_mut(&self.id)
+            .and_then(Option::take)
+    }
+}
+
+impl Drop for PendingProof<'_> {
+    fn drop(&mut self) {
+        self.node
+            .proof_pending
+            .lock()
+            .expect("proof poisoned")
+            .remove(&self.id);
+    }
+}
+
+/// A join this node is serving as the contact (see `Node::join_holds`).
+///
+/// The joiner's first report is what this node vouched for in its header.
+/// A peer that gave the joiner up counts it again only on a report above
+/// everything it compacted since, and it compacts below the minimum of the
+/// reports it counts — this node's among them. Holding this node's report
+/// at the vouched point until the joiner reports keeps every such peer's
+/// compaction, and so its bound, below that first report however long the
+/// pages take; otherwise a write load during a long join would have the
+/// joiner told to rejoin again, every time.
+struct JoinHold {
+    vouched: Timestamp,
+    /// The joiner's last header or page request. A joiner that stops asking
+    /// for [`JOIN_HOLD_PAGE_INTERVALS`] page timeouts gave up (or died): the
+    /// hold lapses, so a failed join cannot pin compaction.
+    refreshed: Instant,
+}
+
+/// How many page timeouts (`NodeConfig::collect_timeout`, a joiner's wait
+/// per page attempt) a join hold outlives its joiner's last request by: all
+/// of a page's attempts plus one more for installing it.
+const JOIN_HOLD_PAGE_INTERVALS: u32 = SNAPSHOT_PAGE_ATTEMPTS as u32 + 1;
+
 /// Ends a write's coordination when dropped (see [`Node::write`]).
 struct Coordinating<'a> {
     node: &'a Node,
@@ -419,6 +471,9 @@ type MetaLog = Arc<Mutex<MetadataLog>>;
 /// contact's `(watermark, coverage, snapshot events, recent commands)`.
 type SyncPayload = (Timestamp, Timestamp, Vec<Event>, Vec<CommandState>);
 
+/// A join contact's vouch ([`Message::JoinProof`]): `(epoch, vouched)`.
+type Vouch = (u64, Timestamp);
+
 /// Delivers each sync response to its in-flight [`join`](Node::join)/anti-entropy
 /// request, keyed by the request's correlation id — so a concurrent join and
 /// anti-entropy round cannot steal each other's data.
@@ -492,6 +547,22 @@ pub struct Node {
     /// (cleared on epoch change); never persisted — a restarted node re-proves
     /// its coverage, which is conservative.
     sync_coverage: Arc<Mutex<(u64, HashMap<NodeId, Timestamp>)>>,
+    /// What the contact of this node's [`join`](Node::join) vouched for
+    /// ([`Message::JoinProof`]), with the topology epoch it holds under: the
+    /// joiner copied a state holding every committed transaction below it,
+    /// so it counts as proven coverage next to
+    /// [`sync_coverage`](Self::sync_coverage) — a fresh joiner cannot
+    /// otherwise prove anything until anti-entropy rounds with enough peers
+    /// have run. Ignored once the epoch changes; never persisted.
+    join_proof: Arc<Mutex<Option<Vouch>>>,
+    /// The [`JoinProof`](Message::JoinProof) of an in-flight join, by its
+    /// header request's correlation id (`None` until it arrives).
+    proof_pending: Arc<Mutex<HashMap<u64, Option<Vouch>>>>,
+    /// Same-shard joiners this node vouched for and is serving snapshot
+    /// pages to. Until a joiner reports, this node's own report stays at what
+    /// it vouched, so no peer compacts past the joiner's first report while
+    /// its pages cross the wire (see [`JoinHold`]).
+    join_holds: Arc<Mutex<HashMap<NodeId, JoinHold>>>,
     /// Phi-accrual liveness estimator: every inbound message is a heartbeat, and a
     /// coordinator suspected dead has its stalled transactions recovered.
     failure_detector: Arc<FailureDetector>,
@@ -557,6 +628,9 @@ impl Node {
             peer_watermarks: Arc::new(Mutex::new(HashMap::new())),
             journal_mark: Arc::new(Mutex::new(JournalMark::default())),
             sync_coverage: Arc::new(Mutex::new((start_epoch, HashMap::new()))),
+            join_proof: Arc::new(Mutex::new(None)),
+            proof_pending: Arc::new(Mutex::new(HashMap::new())),
+            join_holds: Arc::new(Mutex::new(HashMap::new())),
             failure_detector: Arc::new(FailureDetector::new()),
             started_at: Instant::now(),
             absent: Arc::new(Mutex::new(HashMap::new())),
@@ -676,10 +750,12 @@ impl Node {
     /// cannot vouch for them, and its subscriptions would advance past events
     /// still on their way to it, skipping them for good. Until a sync round
     /// re-proves the window — after a start, a restart or a heal — its
-    /// subscriptions wait. The clamp keeps the clock skew bound below the
-    /// proven window: no longer load-bearing for the stamps (an event is
-    /// stamped at apply from its `execute_at`, never below its `t0`), it stays
-    /// as a conservative hedge on a point a peer computed from its own clock.
+    /// subscriptions wait (a joined node starts from what its contact
+    /// vouched for, [`Message::JoinProof`]). The clamp keeps the clock skew
+    /// bound below the proven window: no longer load-bearing for the stamps
+    /// (an event is stamped at apply from its `execute_at`, never below its
+    /// `t0`), it stays as a conservative hedge on a point a peer computed from
+    /// its own clock.
     ///
     /// The result is floored to a millisecond, the precision events are
     /// stamped with: a transaction drawing `t0 = 1.5 ms` just above the bound
@@ -692,7 +768,7 @@ impl Node {
             .lock()
             .expect("replica poisoned")
             .stable_event_micros(cutoff);
-        let bound = match self.quorum_sync_coverage(&self.shard_peers()) {
+        let bound = match self.proven_coverage(&self.shard_peers()) {
             Some(coverage) => {
                 local.min(coverage.micros.saturating_sub(self.clock.max_skew_micros()))
             }
@@ -1239,6 +1315,18 @@ impl Node {
         Some(covered[needed - 1])
     }
 
+    /// [`quorum_sync_coverage`](Self::quorum_sync_coverage), raised to what
+    /// the contact of this node's join vouched for under the current epoch
+    /// ([`Message::JoinProof`]): what clamps this node's watermark report and
+    /// its subscriptions' stable point.
+    fn proven_coverage(&self, shard_peers: &[NodeId]) -> Option<Timestamp> {
+        let coverage = self.quorum_sync_coverage(shard_peers)?;
+        match *self.join_proof.lock().expect("join proof poisoned") {
+            Some((epoch, vouched)) if epoch == self.topology.epoch() => Some(coverage.max(vouched)),
+            _ => Some(coverage),
+        }
+    }
+
     /// Gossips this node's redundancy point to its shard peers and compacts below
     /// the per-shard minimum once every peer has reported. The point is its
     /// applied-through, lagged by [`compaction_margin`](NodeConfig::compaction_margin)
@@ -1316,18 +1404,23 @@ impl Node {
     }
 
     /// The redundancy point this node vouches for: its applied-through lagged
-    /// by the compaction margin, clamped to its proven sync coverage and to
-    /// the oldest transaction it is still coordinating (see
-    /// [`advance_watermark`](Self::advance_watermark)).
+    /// by the compaction margin, clamped to its proven coverage, to the
+    /// oldest transaction it is still coordinating (see
+    /// [`advance_watermark`](Self::advance_watermark)) and to what it vouched
+    /// for a joiner it is still serving ([`JoinHold`]).
     fn report(&self, shard_peers: &[NodeId]) -> Timestamp {
-        let cutoff = self.margin_cutoff();
-        let local = self
-            .replica
-            .lock()
-            .expect("replica poisoned")
-            .applied_through(cutoff);
+        let replica = self.replica.lock().expect("replica poisoned");
+        self.report_locked(&replica, shard_peers)
+    }
 
-        let mine = match self.quorum_sync_coverage(shard_peers) {
+    /// [`report`](Self::report) over an already-locked replica, so a join
+    /// header can vouch for exactly the state it exports. Takes the coverage,
+    /// join-proof, coordinating and hold locks under the replica lock —
+    /// none of them is ever held while the replica lock is taken.
+    fn report_locked(&self, replica: &Replica, shard_peers: &[NodeId]) -> Timestamp {
+        let local = replica.applied_through(self.margin_cutoff());
+
+        let mine = match self.proven_coverage(shard_peers) {
             Some(coverage) if coverage < local => {
                 self.metrics.record_watermark_clamp();
                 tracing::debug!(
@@ -1343,7 +1436,7 @@ impl Node {
         // Never past a transaction this node is still coordinating: if its
         // coordination fails, the node recovers it to learn the outcome, and
         // that needs every replica to still hold it.
-        match self
+        let mine = match self
             .coordinating
             .lock()
             .expect("coordinating poisoned")
@@ -1351,7 +1444,16 @@ impl Node {
         {
             Some(oldest) if oldest.0 < mine => oldest.0,
             _ => mine,
-        }
+        };
+        // Never past what this node vouched for a joiner still pulling its
+        // snapshot (see `JoinHold`); a lapsed hold is dropped here.
+        let lapse = self.settings.collect_timeout * JOIN_HOLD_PAGE_INTERVALS;
+        let mut holds = self.join_holds.lock().expect("join holds poisoned");
+        holds.retain(|_, hold| hold.refreshed.elapsed() < lapse);
+        holds
+            .values()
+            .map(|hold| hold.vouched)
+            .fold(mine, Timestamp::min)
     }
 
     /// Stops waiting for same-shard peers silent past
@@ -1522,7 +1624,13 @@ impl Node {
             return Vec::new();
         }
         if let Message::Rejoin { above } = env.message {
-            self.on_rejoin(env.from, above).await;
+            // A node still joining is rejoining already: a peer that has it
+            // marked absent answers whatever it hears from it with this
+            // until the join's first report counts it again, and taking that
+            // for a verdict would abort the join it is the cure for.
+            if self.bootstrapped.load(Ordering::Acquire) {
+                self.on_rejoin(env.from, above).await;
+            }
             return Vec::new();
         }
         match self.screen_absent(env.from, &env.message) {
@@ -1546,6 +1654,7 @@ impl Node {
                 | Message::SnapshotRequest { .. }
                 | Message::SnapshotPageRequest { .. }
                 | Message::SnapshotPage { .. }
+                | Message::JoinProof { .. }
                 | Message::Watermark { .. }
                 | Message::ConfigPrepare { .. }
                 | Message::ConfigPromise { .. }
@@ -1760,7 +1869,10 @@ impl Node {
                 // A node still joining holds only part of the state: serving
                 // its snapshot would bootstrap the requester into the same
                 // gap. Staying silent sends the joiner to its next contact.
-                if snapshot && !self.bootstrapped.load(Ordering::Acquire) {
+                // Nor does it answer anti-entropy: with nothing un-applied
+                // yet, its coverage would be its whole margin-lagged clock,
+                // vouching for transactions it never witnessed.
+                if !self.bootstrapped.load(Ordering::Acquire) {
                     return out;
                 }
                 let (watermark, coverage, commands) = self.export_bootstrap(known.as_ref());
@@ -1805,7 +1917,21 @@ impl Node {
                 if !self.bootstrapped.load(Ordering::Acquire) {
                     return out;
                 }
-                let (watermark, coverage, commands) = self.export_bootstrap(None);
+                let (watermark, coverage, commands, epoch, vouched) = self.export_join_header();
+                // Hold this node's report at the vouch until the joiner's
+                // first report (see `JoinHold`). Only a same-shard joiner's
+                // report is ever compared against this shard's compaction.
+                if vouched > Timestamp::MIN
+                    && self.topology.node_shard(from) == self.topology.node_shard(self.id)
+                {
+                    self.join_holds.lock().expect("join holds poisoned").insert(
+                        from,
+                        JoinHold {
+                            vouched,
+                            refreshed: Instant::now(),
+                        },
+                    );
+                }
                 out.push((
                     from,
                     Message::SyncData {
@@ -1816,10 +1942,20 @@ impl Node {
                         commands,
                     },
                 ));
+                out.push((from, Message::JoinProof { id, epoch, vouched }));
             }
             Message::SnapshotPageRequest { id, after } => {
                 if !self.bootstrapped.load(Ordering::Acquire) {
                     return out;
+                }
+                // The joiner is still at it: its hold stays (see `JoinHold`).
+                if let Some(hold) = self
+                    .join_holds
+                    .lock()
+                    .expect("join holds poisoned")
+                    .get_mut(&from)
+                {
+                    hold.refreshed = Instant::now();
                 }
                 match self
                     .datastore
@@ -1883,7 +2019,23 @@ impl Node {
                     let _ = tx.send((watermark, coverage, snapshot, commands));
                 }
             }
+            Message::JoinProof { id, epoch, vouched } => {
+                if let Some(slot) = self
+                    .proof_pending
+                    .lock()
+                    .expect("proof poisoned")
+                    .get_mut(&id)
+                {
+                    *slot = Some((epoch, vouched));
+                }
+            }
             Message::Watermark { applied_through } => {
+                // A joiner's first report ends the hold its contact kept for
+                // it (see `JoinHold`): from here on it is counted itself.
+                self.join_holds
+                    .lock()
+                    .expect("join holds poisoned")
+                    .remove(&from);
                 self.peer_watermarks
                     .lock()
                     .expect("watermarks poisoned")
@@ -3202,6 +3354,9 @@ impl Node {
         // again on a report above what it compacted. Links deliver in order,
         // so the report lands before anything this node sends as a replica or
         // coordinator, which that peer would otherwise answer with `Rejoin`.
+        // It is at least what the contact vouched for (`JoinProof`), which
+        // its hold kept every peer's compaction below meanwhile — however
+        // many peers' coverage a report of this shard needs.
         let mine = self.report(&self.shard_peers());
         let peers: Vec<NodeId> = self
             .topology
@@ -3272,6 +3427,35 @@ impl Node {
             replica.applied_through(cutoff),
             commands,
         )
+    }
+
+    /// A join header ([`export_bootstrap`](Self::export_bootstrap) without a
+    /// digest) plus what this node vouches for the joiner: its own watermark
+    /// report and the epoch it holds under ([`Message::JoinProof`]). Both are
+    /// taken under one replica lock — and a sync round records its coverage
+    /// only after importing its commands — so every applied command below
+    /// the vouch is either below the exported floor (in the snapshot) or
+    /// among the exported commands: the joiner ends up holding exactly what
+    /// the vouch covers. An epoch change meanwhile voids the vouch (`MIN`).
+    fn export_join_header(&self) -> (Timestamp, Timestamp, Vec<CommandState>, u64, Timestamp) {
+        let epoch = self.topology.epoch();
+        let shard_peers = self.shard_peers();
+        let cutoff = self.margin_cutoff();
+        let replica = self.replica.lock().expect("replica poisoned");
+        let commands = replica.export_applied();
+        let vouched = self.report_locked(&replica, &shard_peers);
+        let header = (
+            replica.redundant_before(),
+            replica.applied_through(cutoff),
+            commands,
+        );
+        drop(replica);
+        let vouched = if self.topology.epoch() == epoch {
+            vouched
+        } else {
+            Timestamp::MIN
+        };
+        (header.0, header.1, header.2, epoch, vouched)
     }
 
     /// One sync round trip: sends `request(id)` to `contact` and waits up to
@@ -3371,6 +3555,7 @@ impl Node {
     ) -> anyhow::Result<Imported> {
         let mut imported = Imported::default();
         let mut apply_failed = false;
+        let mut proof_slot: Option<PendingProof<'_>> = None;
         let (watermark, coverage, commands) = if want_snapshot {
             // A page overlapping events already here would be skipped whole
             // (an idempotent re-apply), leaving a gap: a join needs an empty
@@ -3380,8 +3565,17 @@ impl Node {
                 probe.events.is_empty(),
                 "join only over an empty store; this one holds events"
             );
+            // The contact's vouch follows its header on the same link
+            // ([`Message::JoinProof`]); a contact predating it sends none.
             let (watermark, coverage, _, commands) = self
-                .sync_round(contact, timeout, |id| Message::SnapshotRequest { id })
+                .sync_round(contact, timeout, |id| {
+                    self.proof_pending
+                        .lock()
+                        .expect("proof poisoned")
+                        .insert(id, None);
+                    proof_slot = Some(PendingProof { node: self, id });
+                    Message::SnapshotRequest { id }
+                })
                 .await?;
             // Install the materialised snapshot (the truncated prefix and
             // beyond) for owned keys under a synthetic, sub-watermark id —
@@ -3505,6 +3699,19 @@ impl Node {
                 .lock()
                 .expect("replica poisoned")
                 .compact(watermark);
+            // Every page is installed: this node now holds what the contact
+            // vouched for, if it shares the contact's shard and epoch.
+            let proof = proof_slot.take().and_then(PendingProof::take);
+            if let Some((epoch, vouched)) = proof {
+                if epoch == self.topology.epoch()
+                    && self.topology.node_shard(contact) == self.topology.node_shard(self.id)
+                {
+                    let mut slot = self.join_proof.lock().expect("join proof poisoned");
+                    if slot.is_none_or(|(at, held)| at != epoch || held < vouched) {
+                        *slot = Some((epoch, vouched));
+                    }
+                }
+            }
         }
 
         // A completed round (even one that shipped nothing — the strongest
@@ -3536,7 +3743,7 @@ impl Node {
                 .into_iter()
                 .filter(|&n| self.topology.node_shard(n) == my_shard)
                 .collect();
-            let vouched = match self.quorum_sync_coverage(&shard_peers) {
+            let vouched = match self.proven_coverage(&shard_peers) {
                 Some(coverage) => coverage.min(applied),
                 None => applied,
             };

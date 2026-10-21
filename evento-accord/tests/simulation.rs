@@ -1982,6 +1982,216 @@ async fn an_absent_peer_stops_holding_compaction_back() {
     assert!(sim.nodes[1].absent_peers().is_empty());
 }
 
+/// [`an_absent_peer_stops_holding_compaction_back`] in a group of `n ≥ 4`,
+/// where a report needs coverage from two peers or more: the rejoined node's
+/// first report must still count it back in — the contact vouches for the
+/// state it copied — rather than have it told to rejoin again.
+async fn a_rejoined_peer_is_counted_again(n: u64) {
+    const HOT: &str = "hot";
+    let config = absence_config(Duration::from_secs(2));
+    let mut sim = Sim::build_with_config(n, config);
+    let all: Vec<usize> = (0..n as usize).collect();
+    let gone = n as usize - 1;
+    let survivors: Vec<usize> = (0..gone).collect();
+
+    for version in 1..=3u16 {
+        sim.nodes[0]
+            .write(vec![event(HOT, version, version as u64)])
+            .await
+            .expect("baseline write");
+    }
+    assert!(converge(&sim.stores).await);
+    await_compacted(&sim, &all, "baseline").await;
+
+    sim.net.crash(sim.ids[gone]);
+    for version in 4..=8u16 {
+        sim.nodes[0]
+            .write(vec![event(HOT, version, 100 + version as u64)])
+            .await
+            .expect("write with a node down");
+    }
+    await_compacted(&sim, &survivors, "with a node down").await;
+    for &i in &survivors {
+        assert_eq!(sim.nodes[i].absent_peers(), vec![sim.ids[gone]]);
+    }
+    sim.net.heal(sim.ids[gone]);
+    await_rejoin_required(&sim.nodes[gone]).await;
+
+    sim.rejoin(gone, NodeId(0), config).await;
+    assert!(converge(&sim.stores).await, "the rejoined node converges");
+    assert_eq!(version_of(&sim.stores[gone], HOT).await, 8);
+    for _ in 0..500 {
+        if survivors
+            .iter()
+            .all(|&i| sim.nodes[i].absent_peers().is_empty())
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    for &i in &all {
+        assert!(
+            sim.nodes[i].absent_peers().is_empty(),
+            "node {i} counts the rejoined node again: {:?}",
+            sim.nodes[i].absent_peers()
+        );
+    }
+    assert!(
+        !sim.nodes[gone].rejoin_required(),
+        "the rejoined node is not told to rejoin again"
+    );
+    assert_eq!(sim.nodes[gone].metrics().rejoins_required, 0);
+
+    // It takes part again: the next writes, one coordinated by it, compact
+    // everywhere.
+    for version in 9..=10u16 {
+        sim.nodes[0]
+            .write(vec![event(HOT, version, 200 + version as u64)])
+            .await
+            .expect("write after the rejoin");
+    }
+    sim.nodes[gone]
+        .write(vec![event(HOT, 11, 300)])
+        .await
+        .expect("a write coordinated by the rejoined node");
+    assert!(converge(&sim.stores).await);
+    assert_eq!(version_of(&sim.stores[gone], HOT).await, 11);
+    await_compacted(&sim, &all, "after the rejoin").await;
+    assert!(!sim.nodes[gone].rejoin_required());
+    assert_eq!(sim.nodes[gone].metrics().rejoins_required, 0);
+    for &i in &all {
+        assert!(sim.nodes[i].absent_peers().is_empty());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_rejoined_peer_is_counted_again_in_a_group_of_four() {
+    a_rejoined_peer_is_counted_again(4).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_rejoined_peer_is_counted_again_in_a_group_of_five() {
+    a_rejoined_peer_is_counted_again(5).await;
+}
+
+/// A rejoin that takes a while (a slow link to the contact, many pages)
+/// while the group keeps writing: the survivors must not compact past what
+/// the contact vouched for the joiner in the meantime, or its first report
+/// lands below their bound and it is told to rejoin again — every time, for
+/// a store large enough.
+#[tokio::test(start_paused = true)]
+async fn a_peer_rejoining_under_writes_is_counted_again() {
+    const HOT: &str = "hot";
+    const COLD: &str = "cold";
+    let config = absence_config(Duration::from_secs(2));
+    let mut sim = Sim::build_with_config(4, config);
+    let all = [0, 1, 2, 3];
+
+    for version in 1..=3u16 {
+        sim.nodes[0]
+            .write(vec![event(HOT, version, version as u64)])
+            .await
+            .expect("baseline write");
+    }
+    assert!(converge(&sim.stores).await);
+    await_compacted(&sim, &all, "baseline").await;
+
+    sim.net.crash(NodeId(3));
+    for version in 4..=12u16 {
+        sim.nodes[0]
+            .write(vec![event(HOT, version, 100 + version as u64)])
+            .await
+            .expect("write with a node down");
+    }
+    await_compacted(&sim, &[0, 1, 2], "with node 3 down").await;
+    sim.net.heal(NodeId(3));
+    await_rejoin_required(&sim.nodes[3]).await;
+
+    // A page round trip to the contact now takes 200 ms: the dozen pages
+    // span several compaction margins, during which node 1 keeps writing.
+    sim.net
+        .set_link_latency(NodeId(0), NodeId(3), Duration::from_millis(100));
+    let writer = sim.nodes[1].clone();
+    let writes = tokio::spawn(async move {
+        for version in 1..=15u16 {
+            writer
+                .write(vec![event(COLD, version, 400 + version as u64)])
+                .await
+                .expect("write during the rejoin");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    });
+    sim.rejoin(3, NodeId(0), config).await;
+    writes.await.unwrap();
+
+    assert!(converge(&sim.stores).await, "the rejoined node converges");
+    assert_eq!(version_of(&sim.stores[3], COLD).await, 15);
+    for _ in 0..500 {
+        if (0..3).all(|i| sim.nodes[i].absent_peers().is_empty()) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        !sim.nodes[3].rejoin_required(),
+        "the rejoined node is not told to rejoin again"
+    );
+    for i in all {
+        assert!(
+            sim.nodes[i].absent_peers().is_empty(),
+            "node {i} counts the rejoined node again"
+        );
+    }
+    sim.nodes[3]
+        .write(vec![event(HOT, 13, 900)])
+        .await
+        .expect("a write coordinated by the rejoined node");
+    assert!(converge(&sim.stores).await);
+    await_compacted(&sim, &all, "after the rejoin").await;
+}
+
+/// The other side of the vouch: a replica back with its **old** state after
+/// its peers compacted past it (never rejoined) must not repair its way back
+/// in — whatever its anti-entropy rounds can still fetch, the compacted
+/// window is gone. It ends told to rejoin, with nothing imported.
+#[tokio::test(start_paused = true)]
+async fn a_stale_replica_cannot_sync_its_way_back_in() {
+    const HOT: &str = "hot";
+    let config = absence_config(Duration::from_secs(2));
+    let sim = Sim::build_with_config(4, config);
+    let all = [0, 1, 2, 3];
+
+    for version in 1..=2u16 {
+        sim.nodes[0]
+            .write(vec![event(HOT, version, version as u64)])
+            .await
+            .expect("baseline write");
+    }
+    assert!(converge(&sim.stores).await);
+    await_compacted(&sim, &all, "baseline").await;
+
+    sim.net.crash(NodeId(3));
+    for version in 3..=6u16 {
+        sim.nodes[0]
+            .write(vec![event(HOT, version, 100 + version as u64)])
+            .await
+            .expect("write with a node down");
+    }
+    await_compacted(&sim, &[0, 1, 2], "with node 3 down").await;
+    let before = committed_set(&sim.stores[3]);
+
+    sim.net.heal(NodeId(3));
+    await_rejoin_required(&sim.nodes[3]).await;
+    // Several anti-entropy intervals later it is still out, still stale.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert!(sim.nodes[3].rejoin_required());
+    assert_eq!(committed_set(&sim.stores[3]), before, "nothing imported");
+    assert_eq!(version_of(&sim.stores[3], HOT).await, 2);
+    for i in 0..3 {
+        assert_eq!(sim.nodes[i].absent_peers(), vec![NodeId(3)]);
+    }
+}
+
 /// A node down past the limit while nothing was written lacks nothing: back,
 /// its first report counts it again, and no rejoin is asked of it.
 #[tokio::test(start_paused = true)]

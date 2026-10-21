@@ -225,6 +225,12 @@ metadata log (config-Paxos); concurrent reconfigurations converge without a lead
   report above is persisted (`Journal::save_rejoin_bounds`), so it holds across a
   restart of the node that gave it up. A rejoin streams the snapshot in pages
   (`snapshot_page_bytes`), so a group of any size can be given up on and rejoined.
+  The rejoined node is counted again from its first report, at any group size: the
+  contact vouches for the state it copied. While the joiner pulls pages, the contact
+  holds its own watermark report at that vouch, so the shard's compaction pauses
+  for the length of the join (it resumes on the joiner's first report, or a few
+  `collect_timeout`s after its last page request if it gives up); size
+  `max_commands` for the writes a join of your largest store spans.
 - **Node back with a lost store** (new disk, deleted tenant file, a backup older than
   its peers' compaction): its journal floor is gone, so anti-entropy can ship only the
   commands peers still hold and the compacted prefix never comes back — the
