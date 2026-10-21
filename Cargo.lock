@@ -1055,6 +1055,7 @@ dependencies = [
  "bitcode",
  "evento-core",
  "evento-fjall",
+ "evento-lock",
  "evento-remote",
  "evento-sql",
  "evento-sql-migrator",

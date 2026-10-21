@@ -26,6 +26,7 @@
 //! - `postgres` - PostgreSQL support via sqlx
 //! - `fjall` - Embedded key-value storage with Fjall
 //! - `remote` - Client/server executor over framed TCP
+//! - `lock` - `events.lock` checker that keeps persisted shapes append-only (usually enabled on a dev-dependency)
 //!
 //! # Quick Start
 //!
@@ -203,3 +204,8 @@ pub use evento_remote::Client as RemoteClient;
 /// up again on every connection attempt.
 #[cfg(feature = "remote")]
 pub use evento_remote::Address as RemoteAddress;
+
+/// `events.lock` checker: fails a test when a persisted shape changes
+/// (requires `lock` feature).
+#[cfg(feature = "lock")]
+pub use evento_lock as lock;

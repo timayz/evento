@@ -163,9 +163,9 @@ registers `.handler(..)` or `.skip::<PaymentRefundedV2>()` also accepts
 consumers migrate one at a time. `#[evento::subscription_all]` sees stored
 events un-upcast.
 
-**Locking shapes.** `evento-lock` (dev-dependency) records every event, every
+**Locking shapes.** `evento-lock` (dev-dependency, or `evento` with the `lock` feature as `evento::lock`) records every event, every
 `Encode` type an event reaches, and every executor-snapshotted view in
-`events.lock`; a test (`evento_lock::check(env!("CARGO_MANIFEST_DIR")).unwrap()`)
+`events.lock`; a test (`evento_lock::check(env!("CARGO_MANIFEST_DIR")).unwrap()`, or `evento::lock::check(..)`)
 fails when a frozen line changes. After adding an event run
 `EVENTO_LOCK=update cargo test` and commit `events.lock`. A failing lock means:
 restore the edit and add a variant, or bump the view's `.revision(n)`.
