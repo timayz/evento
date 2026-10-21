@@ -773,6 +773,19 @@ backend (sql/fjall). Phases, in order:
         epoch, so one took or tore down the other's replies (now one slot per
         proposal, every reply fanned out, and a nack counted only by the proposal
         whose ballot it outbids).
+        A further fix let a replica that fell behind catch up: the node that
+        answered nothing for the rest of a Jepsen run (#291) had been cut off
+        while the others kept committing, not stalled by its TCP writer. Every
+        commit it then received waited on what it had missed, and each Commit
+        or Apply re-walked every waiting command's dependencies (the execution
+        scan was O(waiting × deps)), so its inbox fell ~400× behind and the
+        replies its repair needed timed out in the queue; its recovery sweep
+        meanwhile re-drove each waiting command, up to `collect_timeout`
+        apiece, before reaching anti-entropy, the only way back. Now a pending
+        command found waiting on a dependency is parked until that dependency
+        changes (`Replica.blocked`), the sweep skips parked commands, and
+        anti-entropy runs between recoveries on its own cadence: a node cut off
+        under load serves again within ~2 s of the heal (`isolated_catch_up`).
         **Open** (confirmed or plausible, not yet fixed):
         the sweep scheduler can starve groups beyond `max_concurrent`;
         (review) recovery's superseding check ignores a later conflict only
@@ -781,12 +794,7 @@ backend (sql/fjall). Phases, in order:
         from that applied it, stays undecided (liveness, not safety);
         a rejoin (wiped store) forgets the replica's in-flight votes and promises;
         an epoch change can remap a route's keys onto replicas that never
-        witnessed an in-flight txn, which then answer "never witnessed";
-        under Jepsen faults a node can stay
-        unreachable for the rest of a 120 s run (seen on `alpha` before this round
-        as well) — plausibly because a peer writer's TCP `connect` has no timeout,
-        so behind a DROP partition it blocks for the kernel's SYN retries (about two
-        minutes) while every frame to that peer is shed.
+        witnessed an in-flight txn, which then answer "never witnessed".
   - [ ] **Real-cluster soak + chaos** over days (kills, partitions, clock skew,
         disk pressure, slow disks/links) on actual hardware — zero production
         mileage today.

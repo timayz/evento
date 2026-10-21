@@ -1324,7 +1324,19 @@ impl Node {
         let timeout = micros_ago(self.settings.recovery_timeout);
         self.redrive().await;
 
-        let candidates = self.replica.lock().expect("replica poisoned").stuck(grace);
+        let candidates: Vec<TxnId> = {
+            let replica = self.replica.lock().expect("replica poisoned");
+            // A command committed here but waiting on a dependency is past
+            // consensus: recovering it cannot apply it, and on a replica that
+            // fell behind there are thousands. What it waits on is what needs
+            // progress — recovered below if held here, imported by
+            // anti-entropy if missed.
+            replica
+                .stuck(grace)
+                .into_iter()
+                .filter(|&txn| !replica.is_blocked(txn))
+                .collect()
+        };
         for txn in candidates {
             let coordinator = txn.0.node;
             // Never recover a transaction this node is actively coordinating:
@@ -1357,6 +1369,10 @@ impl Node {
                     timed_out,
                     "recovering stalled transaction"
                 );
+                // A recovery can wait out `collect_timeout`; anti-entropy
+                // (paced on its own interval) must not wait for them all, or a
+                // replica that fell behind never gets back what it missed.
+                self.anti_entropy().await;
                 let _ = self.recover(txn).await;
             }
         }
