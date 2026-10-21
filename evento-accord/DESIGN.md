@@ -731,6 +731,20 @@ backend (sql/fjall). Phases, in order:
         coverage stops below the oldest `t0` it left out, a join pulls its commands in
         pages, and a write whose command could not fit a frame is refused,
         `CommandTooLarge`).
+        A second round (2026-10-21) fixed what the first only listed, and what it
+        turned up: a layout with no shard, an empty one or a node in two could be
+        decided, persisted and installed (a divide by zero in every inbox loop, or
+        keys no replica can commit) — now refused before a vote, and never persisted
+        or installed; a config vote went out although the journal refused it, and
+        an epoch was installed although the metadata log refused it; a forwarded
+        read the owner's store failed, or that a joining owner served from a partial
+        store, came back as an empty or partial page (now `ReadFailed`); a restart,
+        or a group reopened by `GroupHost`, could mint a transaction id or ballot it
+        had used before, and a node with a lagging clock minted below the compaction
+        floor (now the clock bound, see Phase C); `GroupHost::close` returned while a
+        sweep or the inbox loop still used the store and journal (now async, and the
+        closed node mints nothing more); and the mux could unregister a reopened
+        group's inbox for its closed predecessor.
         **Open** (confirmed or plausible, not yet fixed):
         a config change's replies are keyed by epoch only, so two on one node collide;
         stage errors are ignored before durability-gated replies;
@@ -741,7 +755,14 @@ backend (sql/fjall). Phases, in order:
         from that applied it, stays undecided (liveness, not safety);
         a rejoin (wiped store) forgets the replica's in-flight votes and promises;
         an epoch change can remap a route's keys onto replicas that never
-        witnessed an in-flight txn, which then answer "never witnessed".
+        witnessed an in-flight txn, which then answer "never witnessed";
+        `GroupHost::open` dropped mid-join (a client hung up) orphans the joining
+        node's inbox loop; a node told to rejoin drops a forwarded read, which then
+        fails only at `collect_timeout`; under Jepsen faults a node can stay
+        unreachable for the rest of a 120 s run (seen on `alpha` before this round
+        as well) — plausibly because a peer writer's TCP `connect` has no timeout,
+        so behind a DROP partition it blocks for the kernel's SYN retries (about two
+        minutes) while every frame to that peer is shed.
   - [ ] **Real-cluster soak + chaos** over days (kills, partitions, clock skew,
         disk pressure, slow disks/links) on actual hardware — zero production
         mileage today.
