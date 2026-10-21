@@ -86,8 +86,16 @@ pub struct Replica {
     /// refused here, as it would be for a known command — otherwise the
     /// recovery's quorum would not intersect the coordinator's, and both could
     /// decide. Never in the un-applied indexes (they would pin the watermark);
-    /// dropped below the redundancy watermark. In memory only.
+    /// dropped below the redundancy watermark. Journaled by the node
+    /// (`Journal::save_promise`) and restored on restart
+    /// ([`restore_promise`](Replica::restore_promise)).
     unknown_promises: HashMap<TxnId, Ballot>,
+    /// The route — full key set — of every multi-shard transaction held
+    /// here, as its coordinator sent it (`Message::Routed`): `keys` above is
+    /// only this shard's part, and a recovery must reach every shard the
+    /// transaction touches, including one that never witnessed it. Dropped
+    /// with the command below the redundancy watermark.
+    routes: HashMap<TxnId, Vec<Key>>,
 }
 
 impl Default for Replica {
@@ -104,6 +112,7 @@ impl Default for Replica {
             applied_by_t0: BTreeSet::new(),
             read_results: HashMap::new(),
             unknown_promises: HashMap::new(),
+            routes: HashMap::new(),
         }
     }
 }
@@ -141,6 +150,23 @@ pub struct ApplyReady {
     pub commit: bool,
     /// Node to report the apply acknowledgement to.
     pub reply_to: NodeId,
+}
+
+/// What a replica answers a routed recovery (`Message::Routed` around a
+/// `BeginRecovery`) with: a report on a transaction it holds, or — never
+/// pre-accepting one it does not — that it never witnessed it.
+pub enum RoutedRecovery {
+    /// The replica holds the transaction.
+    Known(RecoverState),
+    /// The replica holds nothing of the transaction. Unless `redundant`, it
+    /// has promised the ballot (the node journals it) and so will never
+    /// witness the transaction below it. `redundant`: the transaction is below
+    /// the redundancy watermark — applied and compacted away, or never seen;
+    /// no evidence either way, and no promise is kept.
+    NotWitnessed {
+        /// Whether `t0` is below this replica's redundancy watermark.
+        redundant: bool,
+    },
 }
 
 /// What a replica reports when asked to recover a transaction.
@@ -213,7 +239,13 @@ impl Replica {
     /// Repairs commands first learned via Accept/Commit (which used to leave
     /// `keys` empty, hiding the transaction from later conflict lookups).
     fn index_keys(&mut self, txn: TxnId, keys: &[Key]) {
-        let Some(cmd) = self.commands.get_mut(&txn) else {
+        // An applied command is final: nothing left to repair (and an
+        // invalidated one must not grow keys it was never committed with).
+        let Some(cmd) = self
+            .commands
+            .get_mut(&txn)
+            .filter(|cmd| cmd.status != Status::Applied)
+        else {
             return;
         };
         for key in keys {
@@ -382,7 +414,11 @@ impl Replica {
         keys: Vec<Key>,
         events: Vec<Event>,
     ) -> (Timestamp, Vec<TxnId>) {
-        if self.commands.contains_key(&txn) {
+        if let Some(existing) = self.commands.get(&txn) {
+            if existing.status == Status::Applied {
+                // Final (possibly invalidated): nothing to repair.
+                return (existing.execute_at, existing.deps.clone());
+            }
             // Late PreAccept after an Accept/Commit created the entry: repair a
             // keyless/eventless command so the conflict index and recovery's
             // superseding check see it.
@@ -642,6 +678,109 @@ impl Replica {
         })
     }
 
+    /// Handles a **routed** recovery under `ballot`: like
+    /// [`recover`](Self::recover) for a transaction held here, but a replica
+    /// that never witnessed it does not pre-accept it — the route tells the
+    /// recovery coordinator which shards to hear from, and a slow quorum of
+    /// one shard answering "never witnessed" (each having durably promised
+    /// the ballot, so the original coordinator can no longer win a vote
+    /// there) proves the transaction never committed. Pre-accepting instead
+    /// would let a later recovery that learned the missing shard's part from
+    /// a straggler turn that proof into a commit after it was acted on.
+    /// `Err(promised)` if a higher ballot was already promised.
+    pub fn recover_routed(
+        &mut self,
+        txn: TxnId,
+        ballot: Ballot,
+        keys: Vec<Key>,
+        events: Vec<Event>,
+    ) -> Result<RoutedRecovery, Ballot> {
+        if self.commands.contains_key(&txn) {
+            return self
+                .recover(txn, ballot, keys, events)
+                .map(RoutedRecovery::Known);
+        }
+        if let Some(&promised) = self.unknown_promises.get(&txn) {
+            if ballot < promised {
+                return Err(promised);
+            }
+        }
+        // Below the watermark an absent command may have been applied and
+        // compacted: "not held" is no proof of "never witnessed".
+        if txn.0 < self.redundant_before {
+            return Ok(RoutedRecovery::NotWitnessed { redundant: true });
+        }
+        self.unknown_promises.insert(txn, ballot);
+        Ok(RoutedRecovery::NotWitnessed { redundant: false })
+    }
+
+    /// Records `txn` as applied **as an abort** without executing it: a
+    /// recovery proved it never committed and never will (one shard never
+    /// witnessed it), and an abort changes nothing, so it needs no place in
+    /// the execution order. Marked by the
+    /// [`INVALIDATED_AT`](crate::message::INVALIDATED_AT) execution timestamp,
+    /// so a later recovery recognizes the decision, and recovery's
+    /// superseding check never reads its (un-agreed, local) dependencies as
+    /// evidence. Only a command not yet committed is invalidated — a committed
+    /// one has a decision of its own (none can exist for a transaction a shard
+    /// never witnessed). Returns whether `txn` was invalidated now.
+    pub fn invalidate(&mut self, txn: TxnId) -> bool {
+        let Some(cmd) = self.commands.get_mut(&txn) else {
+            return false;
+        };
+        if cmd.status >= Status::Committed {
+            return false;
+        }
+        cmd.status = Status::Applied;
+        cmd.execute_at = crate::message::INVALIDATED_AT;
+        cmd.decision = Some(false);
+        cmd.applied_conflict = Some(true);
+        cmd.events = Vec::new();
+        self.read_results.remove(&txn);
+        self.reindex_unapplied(txn);
+        true
+    }
+
+    /// Keeps `route` as `txn`'s route if this replica holds the transaction
+    /// and has none yet. Returns whether it was newly kept (the node then
+    /// journals it).
+    pub fn set_route(&mut self, txn: TxnId, route: &[Key]) -> bool {
+        if !self.commands.contains_key(&txn) || self.routes.contains_key(&txn) {
+            return false;
+        }
+        self.routes.insert(txn, route.to_vec());
+        true
+    }
+
+    /// `txn`'s route, if it is a multi-shard transaction held here.
+    pub fn route(&self, txn: TxnId) -> Option<Vec<Key>> {
+        self.routes.get(&txn).cloned()
+    }
+
+    /// Restores a journaled route on restart.
+    pub fn restore_route(&mut self, txn: TxnId, route: Vec<Key>) {
+        if txn.0 >= self.redundant_before {
+            self.routes.insert(txn, route);
+        }
+    }
+
+    /// The ballot promised for `txn` while never witnessing it, if any — what
+    /// the node journals.
+    pub fn unknown_promise(&self, txn: TxnId) -> Option<Ballot> {
+        self.unknown_promises.get(&txn).copied()
+    }
+
+    /// Restores a journaled blind promise on restart. Ignored for a
+    /// transaction held here (its command carries its own promise) or below
+    /// the redundancy watermark.
+    pub fn restore_promise(&mut self, txn: TxnId, ballot: Ballot) {
+        if self.commands.contains_key(&txn) || txn.0 < self.redundant_before {
+            return;
+        }
+        let promised = self.unknown_promises.entry(txn).or_insert(ballot);
+        *promised = (*promised).max(ballot);
+    }
+
     /// The node coordinating `txn`'s decision (set by Commit), to report results
     /// to when applying.
     pub fn reply_to(&self, txn: TxnId) -> Option<NodeId> {
@@ -667,7 +806,9 @@ impl Replica {
         let mut wait = false;
         for g in self.conflicts(&cmd.keys, txn) {
             let gc = &self.commands[&g];
-            if gc.status < Status::Accepted || gc.deps.contains(&txn) {
+            // An invalidated command's deps are one replica's PreAccept view,
+            // never agreed by a quorum: they prove nothing.
+            if gc.status < Status::Accepted || gc.deps.contains(&txn) || gc.invalidated() {
                 continue;
             }
             if g.0 > txn.0 {
@@ -995,6 +1136,7 @@ impl Replica {
             self.reindex_unapplied(*txn);
         }
         self.unknown_promises.retain(|txn, _| txn.0 >= safe);
+        self.routes.retain(|txn, _| txn.0 >= safe);
         self.redundant_before = safe;
         newest
     }
@@ -1459,6 +1601,120 @@ mod tests {
 
         replica.compact(txn(30).0);
         assert!(replica.unknown_promises.is_empty());
+    }
+
+    /// A routed recovery never pre-accepts what this replica never witnessed:
+    /// it promises the ballot (refusing the original coordinator below it) and
+    /// says so — unless the transaction is below the watermark, where "not
+    /// held" proves nothing and nothing is promised.
+    #[test]
+    fn a_routed_recovery_reports_never_witnessed_without_preaccepting() {
+        let mut replica = Replica::new();
+        let key = Key("k".into());
+        let t = txn(20);
+        let b = ballot(50, 1);
+
+        let report = replica
+            .recover_routed(t, b, vec![key.clone()], vec![event("k", 1)])
+            .expect("promised");
+        assert!(matches!(
+            report,
+            RoutedRecovery::NotWitnessed { redundant: false }
+        ));
+        assert_eq!(replica.status(t), None, "nothing was pre-accepted");
+        assert_eq!(replica.unknown_promise(t), Some(b));
+        assert_eq!(
+            replica.preaccept(t, vec![key.clone()], vec![event("k", 1)]),
+            Err(b)
+        );
+        assert!(matches!(
+            replica.recover_routed(t, ballot(40, 2), vec![], vec![]),
+            Err(promised) if promised == b
+        ));
+
+        let old = txn(5);
+        replica.compact(txn(10).0);
+        assert!(matches!(
+            replica.recover_routed(old, b, vec![key], vec![]),
+            Ok(RoutedRecovery::NotWitnessed { redundant: true })
+        ));
+        assert_eq!(replica.unknown_promise(old), None);
+    }
+
+    /// An invalidated command is applied as an abort without executing, is
+    /// recognizable by its timestamp, and is no evidence in another
+    /// transaction's recovery: its deps were never agreed.
+    #[test]
+    fn an_invalidated_command_is_an_abort_and_no_superseding_evidence() {
+        let mut replica = Replica::new();
+        let key = Key("k".into());
+        let x = txn(10);
+        let t = txn(20);
+        // T is witnessed before X here, so T's (local) deps lack X.
+        replica
+            .preaccept(t, vec![key.clone()], vec![event("k", 1)])
+            .unwrap();
+        replica
+            .preaccept(x, vec![key.clone()], vec![event("k", 1)])
+            .unwrap();
+        assert!(replica.set_route(t, &[key.clone(), Key("other".into())]));
+        assert!(
+            !replica.set_route(t, std::slice::from_ref(&key)),
+            "kept once"
+        );
+
+        assert!(replica.invalidate(t));
+        let cmd = replica.snapshot(t).unwrap();
+        assert!(cmd.invalidated());
+        assert_eq!(cmd.applied_conflict, Some(true));
+        assert_eq!(
+            replica.stuck(txn(100).0),
+            vec![x],
+            "T no longer awaits recovery"
+        );
+
+        let report = replica.recover(x, ballot(50, 1), vec![], vec![]).unwrap();
+        assert!(
+            !report.superseding_rejects,
+            "an invalidated command proves nothing about X's fast path"
+        );
+
+        // A committed command is never invalidated.
+        replica.commit(x, x.0, vec![], vec![event("k", 1)], vec![], NodeId(0));
+        assert!(!replica.invalidate(x));
+
+        // The route is dropped with the command.
+        replica.record_decision(x, true);
+        assert_eq!(replica.next_apply().expect("ready").txn, x);
+        replica.mark_applied(x, false);
+        replica.compact(txn(30).0);
+        assert_eq!(replica.route(t), None);
+    }
+
+    /// A journaled blind promise is restored on restart — but not over a
+    /// command that carries its own, nor below the watermark.
+    #[test]
+    fn a_restored_promise_fences_like_the_original() {
+        let mut replica = Replica::new();
+        let key = Key("k".into());
+        let t = txn(20);
+        let b = ballot(50, 1);
+        replica.restore_promise(t, b);
+        assert_eq!(
+            replica.preaccept(t, vec![key.clone()], vec![event("k", 1)]),
+            Err(b)
+        );
+
+        let known = txn(30);
+        replica
+            .preaccept(known, vec![key], vec![event("k", 2)])
+            .unwrap();
+        replica.restore_promise(known, b);
+        assert_eq!(replica.unknown_promise(known), None);
+
+        replica.compact(txn(25).0);
+        replica.restore_promise(txn(21), b);
+        assert_eq!(replica.unknown_promise(txn(21)), None);
     }
 
     /// A read is taken once: its result stays answerable while the command holds

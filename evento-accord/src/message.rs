@@ -98,6 +98,21 @@ pub struct CommandState {
     pub applied_conflict: Option<bool>,
 }
 
+/// The execution timestamp an **invalidated** command carries — a transaction
+/// a recovery proved never committed, recorded applied as an abort without a
+/// place in the order ([`Replica::invalidate`](crate::replica::Replica::invalidate)).
+/// No real transaction executes at it (every `execute_at` is at least its
+/// `t0`, a clock reading), so the state needs no field of its own: the journal
+/// and the wire carry it as is.
+pub const INVALIDATED_AT: Timestamp = Timestamp::MIN;
+
+impl CommandState {
+    /// Whether this command was invalidated (see [`INVALIDATED_AT`]).
+    pub fn invalidated(&self) -> bool {
+        self.status == Status::Applied && self.execute_at == INVALIDATED_AT
+    }
+}
+
 /// An anti-entropy requester's view of its own applied state: its redundancy
 /// floor plus the ids of every applied command it holds at/above that floor.
 /// The responder ships only applied commands with `t0 >= since` missing from
@@ -346,7 +361,10 @@ pub enum Message {
     /// pre-accepts its owned part under the ballot, so its vote counts and the
     /// original coordinator can no longer win it there; one that owns none of
     /// it still remembers the promise. Answered by
-    /// [`BeginRecoveryOk`](Message::BeginRecoveryOk).
+    /// [`BeginRecoveryOk`](Message::BeginRecoveryOk). A multi-shard
+    /// transaction's recovery is [`Routed`](Message::Routed) instead, and a
+    /// replica that never witnessed it then pre-accepts nothing: it answers
+    /// [`NotWitnessed`](Message::NotWitnessed).
     BeginRecovery {
         txn: TxnId,
         ballot: Ballot,
@@ -387,6 +405,36 @@ pub enum Message {
         epoch: u64,
         vouched: Timestamp,
     },
+    /// `inner` — a `PreAccept`, `Accept`, `Commit`, `BeginRecovery` or
+    /// `BeginRecoveryOk` — for a transaction whose `route` (its **full** key
+    /// set, every shard's part) spans more than one shard. Each replica only
+    /// stores its own shard's keys, so without the route a recovery
+    /// coordinator cannot tell which other shards the transaction touches —
+    /// least of all one that never witnessed it. A replica keeps the route
+    /// (journaled) with the command. Single-shard traffic is never wrapped, so
+    /// it stays byte-identical; a node predating this variant sheds the frame.
+    Routed {
+        route: Vec<Key>,
+        inner: Box<Message>,
+    },
+    /// Replica → recovery coordinator, answering a routed `BeginRecovery`
+    /// for a transaction this replica holds nothing of. `redundant` false: it
+    /// never witnessed it, and has durably promised `ballot` — so it never
+    /// will at a lower one (a slow quorum of a shard answering this proves the
+    /// transaction never committed: it needs a PreAccept quorum on every
+    /// shard). `redundant` true: `txn` is below this replica's redundancy
+    /// watermark, so it may also have applied it and compacted it away — no
+    /// evidence either way.
+    NotWitnessed {
+        txn: TxnId,
+        ballot: Ballot,
+        redundant: bool,
+    },
+    /// Recovery coordinator → a transaction's replicas: it never committed
+    /// and never will (a shard never witnessed it), so every replica holding
+    /// it un-committed records it applied as an abort, without executing it
+    /// — an abort changes nothing, so it needs no place in the order.
+    Invalidate { txn: TxnId },
 }
 
 impl Message {
@@ -432,7 +480,10 @@ impl Message {
             | Message::Nack { txn, .. }
             | Message::BeginRecovery { txn, .. }
             | Message::BeginRecoveryOk { txn, .. }
+            | Message::NotWitnessed { txn, .. }
+            | Message::Invalidate { txn }
             | Message::ReadProbeOk { txn, .. } => Some(*txn),
+            Message::Routed { inner, .. } => inner.txn(),
             // A request the replica handles inline (not routed to a coordinator).
             Message::ReadProbe { .. } => None,
             Message::SyncRequest { .. }
@@ -617,6 +668,107 @@ mod tests {
             } => assert_eq!((id, epoch, back), (9, 4, vouched)),
             other => panic!("variant changed on the wire: {other:?}"),
         }
+    }
+
+    /// The route wrapper and the recovery verdicts cross the wire intact, and
+    /// a wrapped message names its inner transaction.
+    #[test]
+    fn route_variants_round_trip_tagged() {
+        let txn = TxnId(Timestamp {
+            micros: 42,
+            logical: 1,
+            node: NodeId(3),
+        });
+        let ballot = Ballot(Timestamp {
+            micros: 50,
+            logical: 0,
+            node: NodeId(4),
+        });
+        let route = vec![Key("a".into()), Key("b".into())];
+        let routed = Message::Routed {
+            route: route.clone(),
+            inner: Box::new(Message::PreAccept {
+                txn,
+                keys: vec![Key("a".into())],
+                events: vec![page_event()],
+            }),
+        };
+        assert_eq!(routed.txn(), Some(txn));
+        assert!(!routed.is_sweep());
+        let bytes = encode_tagged(RecordKind::WireFrame, &routed).unwrap();
+        match decode_tagged::<Message>(RecordKind::WireFrame, &bytes).unwrap() {
+            Message::Routed { route: r, inner } => {
+                assert_eq!(r, route);
+                match *inner {
+                    Message::PreAccept {
+                        txn: t,
+                        keys,
+                        events,
+                    } => {
+                        assert_eq!(t, txn);
+                        assert_eq!(keys, vec![Key("a".into())]);
+                        assert_eq!(events[0].data, page_event().data);
+                    }
+                    other => panic!("inner changed on the wire: {other:?}"),
+                }
+            }
+            other => panic!("variant changed on the wire: {other:?}"),
+        }
+        for message in [
+            Message::NotWitnessed {
+                txn,
+                ballot,
+                redundant: true,
+            },
+            Message::Invalidate { txn },
+        ] {
+            assert_eq!(message.txn(), Some(txn));
+            let bytes = encode_tagged(RecordKind::GroupFrame, &message).unwrap();
+            let back: Message = decode_tagged(RecordKind::GroupFrame, &bytes).unwrap();
+            assert_eq!(format!("{back:?}"), format!("{message:?}"));
+        }
+    }
+
+    /// Appending enum variants is wire-compatible under bitcode's serde
+    /// encoding: an existing variant encodes the same bytes (an older node
+    /// still decodes every message it knows), and a new variant fails to
+    /// decode on an older node — which sheds the frame — instead of being
+    /// misread as another variant.
+    #[test]
+    fn an_appended_variant_is_shed_by_an_older_decoder() {
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        enum Before {
+            First(u64),
+            Second { key: Key },
+        }
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        enum After {
+            First(u64),
+            Second { key: Key },
+            Appended { route: Vec<Key>, inner: Box<After> },
+        }
+        let known = After::Second {
+            key: Key("k".into()),
+        };
+        let bytes = bitcode::serialize(&known).unwrap();
+        assert_eq!(
+            bytes,
+            bitcode::serialize(&Before::Second {
+                key: Key("k".into())
+            })
+            .unwrap(),
+            "an existing variant's encoding must not change"
+        );
+        let appended = After::Appended {
+            route: vec![Key("k".into())],
+            inner: Box::new(After::First(7)),
+        };
+        let bytes = bitcode::serialize(&appended).unwrap();
+        assert!(
+            bitcode::deserialize::<Before>(&bytes).is_err(),
+            "an older node must reject the appended variant"
+        );
+        assert_eq!(bitcode::deserialize::<After>(&bytes).unwrap(), appended);
     }
 
     /// A joiner's requests must wake a closed contact; a page must not wake

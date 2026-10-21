@@ -45,7 +45,13 @@
 //!   addition would needlessly invalidate every journal on disk. An older build sheds
 //!   the unknown kind (`decode_tagged` fails on it), which is loss the consensus layer
 //!   tolerates. [`RecordKind::GroupFrame`] (the multiplexed wire frame of
-//!   `crate::tcp::MuxTransport`) was added this way.
+//!   `crate::tcp::MuxTransport`) was added this way, and so were
+//!   [`RecordKind::Route`] / [`RecordKind::Promise`] (journal-only). The same
+//!   holds for a new [`Message`](crate::message::Message) variant appended at the
+//!   end (`Message::Routed`): bitcode numbers variants positionally, so every
+//!   existing variant keeps its encoding and an older node fails to decode — and
+//!   sheds — only the new one. Never insert a variant in the middle, and never
+//!   add a field to an existing one.
 
 use serde::{de::DeserializeOwned, Serialize};
 
@@ -85,6 +91,12 @@ pub enum RecordKind {
     /// waiting for, the compacted `t0` it must report above to be counted
     /// again (`Journal::save_rejoin_bounds`).
     RejoinBounds = 7,
+    /// A multi-shard transaction's route — its full key set — journaled with
+    /// the command (`Journal::save_route`), as `(TxnId, Vec<Key>)`.
+    Route = 8,
+    /// A recovery ballot promised for a transaction this replica never
+    /// witnessed (`Journal::save_promise`), as `(TxnId, Ballot)`.
+    Promise = 9,
 }
 
 impl RecordKind {
@@ -97,6 +109,8 @@ impl RecordKind {
             5 => Some(Self::AcceptorState),
             6 => Some(Self::GroupFrame),
             7 => Some(Self::RejoinBounds),
+            8 => Some(Self::Route),
+            9 => Some(Self::Promise),
             _ => None,
         }
     }
@@ -162,6 +176,9 @@ mod tests {
             RecordKind::MetadataEntry,
             RecordKind::AcceptorState,
             RecordKind::GroupFrame,
+            RecordKind::RejoinBounds,
+            RecordKind::Route,
+            RecordKind::Promise,
         ] {
             let value = (42u64, "hello".to_string());
             let bytes = encode_tagged(kind, &value).unwrap();

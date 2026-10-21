@@ -204,6 +204,26 @@ metadata log (config-Paxos); concurrent reconfigurations converge without a lead
   returns the outcome the cluster decided. An error from `write` therefore means the
   outcome could not be established, not that a decided write was lost. No replica
   compacts a transaction while its coordinator is still settling it.
+- **Multi-shard transactions** (`ShardedTopology`, a write spanning shards) carry
+  their **route** — every key they touch — on PreAccept/Accept/Commit and on
+  recovery (`Message::Routed`), and each replica journals it with the command
+  (`Journal::save_route`). A recovery therefore hears from every shard the
+  transaction touches, waiting up to `collect_timeout` for a slow one rather than
+  deciding on the shards that answered first. If a slow quorum of some shard never
+  witnessed the transaction (its coordinator died mid-broadcast), it never committed:
+  recovery **invalidates** it — every replica records it aborted, and the write
+  reports a conflict. A recovery that cannot hear a slow quorum of every route shard
+  (or that quorum is split between "witnessed" and "never witnessed") decides nothing
+  and the sweep retries — a multi-shard transaction whose coordinator died waits
+  for the shard's replicas to come back rather than guessing. A replica answering
+  "never witnessed" journals its promise (`Journal::save_promise`), so after a
+  restart it still refuses the original coordinator's late PreAccept. Single-shard
+  traffic is unchanged on the wire. **Rolling upgrade:** a node predating routes
+  sheds routed frames, so a multi-shard write needs a slow quorum of upgraded nodes
+  in every shard it touches while the upgrade is in progress; single-shard writes
+  are unaffected. A custom `Journal` that does not implement `save_route` /
+  `save_promise` loses both on restart (the fjall and SQL journals implement them,
+  in their existing keyspace/tables — no migration).
 - **Down node:** with `f+1` survivors, writes continue; the down node catches up on
   return. Lose more than `f` and writes block (by design — no split-brain) until enough
   return.

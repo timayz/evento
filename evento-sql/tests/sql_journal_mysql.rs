@@ -48,6 +48,11 @@ async fn metadata_batch_append() {
 }
 
 #[tokio::test]
+async fn routes_and_promises() {
+    sql_support::routes_and_promises(&fresh("accord_my_routes").await).await;
+}
+
+#[tokio::test]
 async fn survives_reconnect() {
     let name = "accord_my_reconnect";
     let b = command(200, 2);

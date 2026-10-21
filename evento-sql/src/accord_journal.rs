@@ -14,6 +14,11 @@
 //! batch of consensus messages costs a single commit. (Staged rows become durable —
 //! and query-visible — at `flush`, which satisfies the trait contract; recovery
 //! reads via [`load_all`](Journal::load_all) only after a restart, i.e. post-flush.)
+//!
+//! A multi-shard transaction's route and a recovery promise for a transaction
+//! never witnessed are rows of `accord_meta` keyed `route/` / `promise/` + the
+//! hex of the order-preserving transaction key — no schema change — staged and
+//! flushed with the commands, and truncated with them.
 
 use std::sync::Mutex;
 
@@ -30,12 +35,16 @@ use sqlx::{Database, Pool};
 use async_trait::async_trait;
 
 use evento_accord::format::{decode_tagged, encode_tagged, RecordKind};
-use evento_accord::{AcceptorRecord, CommandState, Journal, NodeId, Timestamp, TxnId};
+use evento_accord::{AcceptorRecord, Ballot, CommandState, Journal, Key, NodeId, Timestamp, TxnId};
 
 /// `k` value under which the truncation watermark is stored in `accord_meta`.
 const WATERMARK_KEY: &str = "redundant_before";
 /// `k` value under which the rejoin bounds are stored in `accord_meta`.
 const REJOIN_BOUNDS_KEY: &str = "rejoin_above";
+/// `k` prefix of a multi-shard transaction's route in `accord_meta`.
+const ROUTE_PREFIX: &str = "route/";
+/// `k` prefix of a blind recovery promise in `accord_meta`.
+const PROMISE_PREFIX: &str = "promise/";
 
 #[derive(Iden)]
 enum AccordCommands {
@@ -80,11 +89,32 @@ fn txn_key(txn: TxnId) -> Vec<u8> {
     ts_key(txn.0)
 }
 
+/// The `accord_meta` key of a per-transaction record: `prefix` + the hex of
+/// [`txn_key`] (46/48 characters, under the 64 of the `k` column).
+fn meta_txn_key(prefix: &str, txn: TxnId) -> String {
+    let mut key = String::with_capacity(prefix.len() + 40);
+    key.push_str(prefix);
+    for byte in txn_key(txn) {
+        key.push_str(&format!("{byte:02x}"));
+    }
+    key
+}
+
+/// A `LIKE` pattern matching every `accord_meta` key under `prefix`.
+fn like_prefix(prefix: &str) -> String {
+    let mut pattern = prefix.to_string();
+    pattern.push('%');
+    pattern
+}
+
 /// A [`Journal`] persisting consensus state to a SQL database via `sqlx`.
 pub struct SqlJournal<DB: Database> {
     pool: Pool<DB>,
     /// Commands staged since the last [`flush`](Journal::flush), as `(key, value)`.
     staged: Mutex<Vec<(Vec<u8>, Vec<u8>)>>,
+    /// `accord_meta` rows (routes, promises) staged since the last flush, as
+    /// `(txn, k, v)`.
+    staged_meta: Mutex<Vec<(TxnId, String, Vec<u8>)>>,
     /// Serializes flushes so staged entries are only drained once their
     /// transaction has committed — a failed flush must leave them staged.
     flush_lock: tokio::sync::Mutex<()>,
@@ -97,6 +127,7 @@ impl<DB: Database> SqlJournal<DB> {
         Self {
             pool,
             staged: Mutex::new(Vec::new()),
+            staged_meta: Mutex::new(Vec::new()),
             flush_lock: tokio::sync::Mutex::new(()),
         }
     }
@@ -156,6 +187,48 @@ where
                 .fetch_optional(&self.pool)
                 .await?;
         Ok(row.map(|(bytes,)| bytes))
+    }
+
+    /// The values of every `accord_meta` row whose key starts with `prefix`.
+    async fn load_meta_prefixed(
+        conn: &mut DB::Connection,
+        prefix: &str,
+    ) -> anyhow::Result<Vec<Vec<u8>>> {
+        let statement = Query::select()
+            .column(AccordMeta::V)
+            .from(AccordMeta::Table)
+            .and_where(Expr::col(AccordMeta::K).like(like_prefix(prefix)))
+            .to_owned();
+        let (sql, values) = Self::build_sqlx(&statement);
+        let rows =
+            sqlx::query_as_with::<DB, (Vec<u8>,), _>(sqlx::AssertSqlSafe(sql.as_str()), values)
+                .fetch_all(&mut *conn)
+                .await?;
+        Ok(rows.into_iter().map(|(bytes,)| bytes).collect())
+    }
+
+    /// Every persisted route, read over `conn`.
+    async fn load_routes_in(
+        &self,
+        conn: &mut DB::Connection,
+    ) -> anyhow::Result<Vec<(TxnId, Vec<Key>)>> {
+        Self::load_meta_prefixed(conn, ROUTE_PREFIX)
+            .await?
+            .iter()
+            .map(|bytes| decode_tagged(RecordKind::Route, bytes))
+            .collect()
+    }
+
+    /// Every persisted blind promise, read over `conn`.
+    async fn load_promises_in(
+        &self,
+        conn: &mut DB::Connection,
+    ) -> anyhow::Result<Vec<(TxnId, Ballot)>> {
+        Self::load_meta_prefixed(conn, PROMISE_PREFIX)
+            .await?
+            .iter()
+            .map(|bytes| decode_tagged(RecordKind::Promise, bytes))
+            .collect()
     }
 
     /// Creates the journal's tables if absent (idempotent) — a self-contained
@@ -256,7 +329,8 @@ where
         let _guard = self.flush_lock.lock().await;
 
         let batch = self.staged.lock().expect("journal poisoned").clone();
-        if batch.is_empty() {
+        let meta_batch = self.staged_meta.lock().expect("journal poisoned").clone();
+        if batch.is_empty() && meta_batch.is_empty() {
             return Ok(());
         }
 
@@ -296,6 +370,32 @@ where
                 .execute(&mut *tx)
                 .await?;
         }
+        // The staged `accord_meta` rows, deduped the same way (last wins).
+        let mut seen = std::collections::HashSet::new();
+        let mut meta_rows: Vec<&(TxnId, String, Vec<u8>)> = meta_batch
+            .iter()
+            .rev()
+            .filter(|(_, key, _)| seen.insert(key.as_str()))
+            .collect();
+        meta_rows.reverse();
+        for chunk in meta_rows.chunks(ROWS_PER_STATEMENT) {
+            let mut statement = Query::insert()
+                .into_table(AccordMeta::Table)
+                .columns([AccordMeta::K, AccordMeta::V])
+                .on_conflict(
+                    OnConflict::column(AccordMeta::K)
+                        .update_column(AccordMeta::V)
+                        .to_owned(),
+                )
+                .to_owned();
+            for (_, key, value) in chunk {
+                statement.values_panic([key.clone().into(), value.clone().into()]);
+            }
+            let (sql, values) = Self::build_sqlx(&statement);
+            sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
+                .execute(&mut *tx)
+                .await?;
+        }
         tx.commit().await?;
 
         // Drop exactly what was flushed; entries staged mid-transaction stay.
@@ -305,6 +405,12 @@ where
         // overrun — or worse, drop entries never flushed).
         let flushed: std::collections::HashSet<&(Vec<u8>, Vec<u8>)> = batch.iter().collect();
         self.staged
+            .lock()
+            .expect("journal poisoned")
+            .retain(|entry| !flushed.contains(entry));
+        let flushed: std::collections::HashSet<&(TxnId, String, Vec<u8>)> =
+            meta_batch.iter().collect();
+        self.staged_meta
             .lock()
             .expect("journal poisoned")
             .retain(|entry| !flushed.contains(entry));
@@ -321,6 +427,10 @@ where
             .lock()
             .expect("journal poisoned")
             .retain(|(key, _)| key.as_slice() >= bound.as_slice());
+        self.staged_meta
+            .lock()
+            .expect("journal poisoned")
+            .retain(|(txn, _, _)| txn.0 >= before);
 
         let mut tx = self.pool.begin().await?;
 
@@ -334,6 +444,31 @@ where
         sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
             .execute(&mut *tx)
             .await?;
+
+        // Routes and blind promises go with the commands — selected by key
+        // prefix, compared by the transaction their value carries (never by
+        // the column's collation).
+        let mut redundant: Vec<String> = Vec::new();
+        for (txn, _) in self.load_routes_in(&mut *tx).await? {
+            if txn.0 < before {
+                redundant.push(meta_txn_key(ROUTE_PREFIX, txn));
+            }
+        }
+        for (txn, _) in self.load_promises_in(&mut *tx).await? {
+            if txn.0 < before {
+                redundant.push(meta_txn_key(PROMISE_PREFIX, txn));
+            }
+        }
+        for chunk in redundant.chunks(8_000) {
+            let delete = Query::delete()
+                .from_table(AccordMeta::Table)
+                .and_where(Expr::col(AccordMeta::K).is_in(chunk.iter().cloned()))
+                .to_owned();
+            let (sql, values) = Self::build_sqlx(&delete);
+            sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
+                .execute(&mut *tx)
+                .await?;
+        }
 
         let upsert = Query::insert()
             .into_table(AccordMeta::Table)
@@ -396,6 +531,36 @@ where
             Some(bytes) => Ok(decode_tagged(RecordKind::RejoinBounds, &bytes)?),
             None => Ok(Vec::new()),
         }
+    }
+
+    async fn save_route(&self, txn: TxnId, route: &[Key]) -> anyhow::Result<()> {
+        let value = encode_tagged(RecordKind::Route, &(txn, route.to_vec()))?;
+        self.staged_meta.lock().expect("journal poisoned").push((
+            txn,
+            meta_txn_key(ROUTE_PREFIX, txn),
+            value,
+        ));
+        Ok(())
+    }
+
+    async fn load_routes(&self) -> anyhow::Result<Vec<(TxnId, Vec<Key>)>> {
+        let mut conn = self.pool.acquire().await?;
+        self.load_routes_in(&mut *conn).await
+    }
+
+    async fn save_promise(&self, txn: TxnId, ballot: Ballot) -> anyhow::Result<()> {
+        let value = encode_tagged(RecordKind::Promise, &(txn, ballot))?;
+        self.staged_meta.lock().expect("journal poisoned").push((
+            txn,
+            meta_txn_key(PROMISE_PREFIX, txn),
+            value,
+        ));
+        Ok(())
+    }
+
+    async fn load_promises(&self) -> anyhow::Result<Vec<(TxnId, Ballot)>> {
+        let mut conn = self.pool.acquire().await?;
+        self.load_promises_in(&mut *conn).await
     }
 
     async fn load(&self, txn: TxnId) -> anyhow::Result<Option<CommandState>> {
