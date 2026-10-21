@@ -101,9 +101,15 @@ trait** (recommended over gRPC/QUIC) — ✅ implemented in `tcp.rs`:
   unmodified. Frames are `bitcode::serialize`d over a `LengthDelimitedCodec`.
 - Accord traffic is fire-and-correlate-by-`TxnId`, not RPC request/response, so
   one-way framed messages fit better than gRPC call semantics.
-- Per-peer lazy writer tasks connect on demand and reconnect after a drop;
-  delivery is best-effort (loss tolerated by quorums/recovery). `serve` runs the
-  inbound accept loop, decoding frames into `Envelope`s for a node's inbox.
+- Per-peer lazy writer tasks connect on demand and reconnect after a drop.
+  Nothing waits on the network unbounded: a dial (connect + TLS handshake)
+  gives up after 2 s and a batch write after 5 s (counted as a failed write,
+  so the writer redials), and a failed dial backs off 100 ms → 1 s before the
+  next — a peer behind a DROP partition cannot pin its writer for the
+  kernel's SYN retries or TCP's retransmit backoff while every frame to it is
+  shed. Delivery is best-effort (loss tolerated by quorums/recovery). `serve`
+  runs the inbound accept loop, decoding frames into `Envelope`s for a node's
+  inbox.
 - Minimal deps (`tokio-util` codec, `bytes`), fully under our control — the same
   `MessageSink` trait still powers the in-memory simulation harness.
 

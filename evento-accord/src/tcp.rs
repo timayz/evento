@@ -182,6 +182,29 @@ fn codec() -> LengthDelimitedCodec {
 /// task forever.
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Bound on an outbound dial: the TCP connect plus, over TLS, the client
+/// handshake. Without it a peer behind a dropping firewall (a partition) pins
+/// its writer for the kernel's SYN retries — about two minutes — while every
+/// frame queued for it is shed.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Bound on writing one batch. A peer that stops acknowledging (partitioned, or
+/// paused) lets writes fill the kernel's send buffer, then blocks the flush on
+/// TCP's retransmit backoff — minutes, even after the network heals. Past this
+/// bound the connection is treated as dead and redialled. A full sync page
+/// (`NodeConfig::snapshot_page_bytes`) flushes far faster on any live link.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// First wait before redialling a peer that could not be reached; doubles per
+/// failed dial up to [`RECONNECT_BACKOFF_MAX`], and resets on a connect. Batches
+/// queued meanwhile are dropped without dialling, so a dead peer costs one
+/// dial per backoff instead of one per batch.
+const RECONNECT_BACKOFF_MIN: Duration = Duration::from_millis(100);
+
+/// Cap on the redial backoff: small, so a restarted peer is reached again
+/// within about a second.
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(1);
+
 /// The outbound side shared by every transport flavour: one lazily-connected,
 /// bounded writer queue per peer. [`TcpTransport`] owns one for a single node;
 /// [`MuxTransport`] shares one across every group a process hosts, so a thousand
@@ -350,28 +373,49 @@ impl MessageSink for TcpTransport {
 }
 
 /// Establishes one outbound connection to `addr`, wrapping it in client TLS when
-/// configured. `None` on a connect/handshake failure.
+/// configured, within [`CONNECT_TIMEOUT`]. `None` on a connect/handshake
+/// failure or timeout.
 async fn connect(to: NodeId, addr: SocketAddr, tls: &Option<TlsClient>) -> Option<ClientStream> {
-    let stream = TcpStream::connect(addr).await.ok()?;
+    match tokio::time::timeout(CONNECT_TIMEOUT, dial(to, addr, tls)).await {
+        Ok(Ok(stream)) => Some(stream),
+        Ok(Err(err)) => {
+            tracing::debug!(peer = to.0, %addr, %err, "connect failed");
+            None
+        }
+        Err(_) => {
+            tracing::debug!(peer = to.0, %addr, "connect timed out");
+            None
+        }
+    }
+}
+
+/// The unbounded dial behind [`connect`].
+async fn dial(
+    to: NodeId,
+    addr: SocketAddr,
+    tls: &Option<TlsClient>,
+) -> std::io::Result<ClientStream> {
+    let stream = TcpStream::connect(addr).await?;
     let _ = stream.set_nodelay(true);
     match tls {
-        None => Some(Either::Left(stream)),
+        None => Ok(Either::Left(stream)),
         Some(tls) => {
             let session = tls
                 .connector
                 .connect(tls.server_name.clone(), stream)
-                .await
-                .ok()?;
+                .await?;
             // If `to`'s certificate is pinned, the server must present exactly it —
             // otherwise this is a CA-valid impostor at the address; drop the link.
             if let Some(pins) = &tls.peer_certs {
                 if let Some(expected) = pins.get(&to) {
                     if !leaf_matches(session.get_ref().1.peer_certificates(), expected) {
-                        return None;
+                        return Err(std::io::Error::other(
+                            "peer certificate does not match its pin",
+                        ));
                     }
                 }
             }
-            Some(Either::Right(session))
+            Ok(Either::Right(session))
         }
     }
 }
@@ -388,6 +432,13 @@ async fn connect(to: NodeId, addr: SocketAddr, tls: &Option<TlsClient>) -> Optio
 /// carries every group, so one stale connection cost every tenant a frame. A
 /// batch whose peer cannot be reached at all (connect fails) is dropped; loss is
 /// tolerated by quorums and recovery.
+///
+/// Nothing here waits on the network unbounded: a dial gives up after
+/// [`CONNECT_TIMEOUT`] and a batch write after [`WRITE_TIMEOUT`] (which counts
+/// as a failed write), and after a failed dial the peer is not redialled until
+/// its backoff ([`RECONNECT_BACKOFF_MIN`]..[`RECONNECT_BACKOFF_MAX`]) elapses.
+/// Otherwise a partitioned peer could pin this writer for minutes after the
+/// partition heals, shedding every frame meant for it.
 async fn peer_writer(
     to: NodeId,
     addr: SocketAddr,
@@ -395,6 +446,11 @@ async fn peer_writer(
     tls: Option<TlsClient>,
 ) {
     let mut conn: Option<Framed<ClientStream, LengthDelimitedCodec>> = None;
+    let mut backoff = RECONNECT_BACKOFF_MIN;
+    // While set and in the future, batches are dropped without dialling.
+    let mut retry_at: Option<Instant> = None;
+    // Logged on the transition only, not once per dropped batch.
+    let mut unreachable = false;
     while let Some(first) = rx.recv().await {
         // Coalesce this frame with everything already queued.
         let mut batch = vec![first];
@@ -403,28 +459,44 @@ async fn peer_writer(
         }
         for attempt in 0..2 {
             if conn.is_none() {
-                conn = connect(to, addr, &tls)
-                    .await
-                    .map(|stream| Framed::new(stream, codec()));
-            }
-            let Some(framed) = conn.as_mut() else {
-                // Unreachable right now: drop the batch, reconnect on the next.
-                break;
-            };
-            match write_batch(framed, &batch).await {
-                Ok(()) => break,
-                Err(err) => {
-                    // Stale or broken connection: reconnect and resend once.
-                    conn = None;
-                    if attempt == 1 {
-                        tracing::warn!(
-                            peer = to.0,
-                            frames = batch.len(),
-                            %err,
-                            "write failed again after reconnecting; dropping the batch"
-                        );
-                    }
+                if retry_at.is_some_and(|at| Instant::now() < at) {
+                    // Still backing off: drop the batch, dial on a later one.
+                    break;
                 }
+                let Some(stream) = connect(to, addr, &tls).await else {
+                    // Unreachable right now: drop the batch, redial after the
+                    // backoff.
+                    retry_at = Some(Instant::now() + backoff);
+                    backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+                    if !unreachable {
+                        unreachable = true;
+                        tracing::warn!(peer = to.0, %addr, "peer unreachable; dropping its frames");
+                    }
+                    break;
+                };
+                conn = Some(Framed::new(stream, codec()));
+                backoff = RECONNECT_BACKOFF_MIN;
+                retry_at = None;
+                if unreachable {
+                    unreachable = false;
+                    tracing::info!(peer = to.0, %addr, "peer reachable again");
+                }
+            }
+            let framed = conn.as_mut().expect("connected above");
+            let err = match tokio::time::timeout(WRITE_TIMEOUT, write_batch(framed, &batch)).await {
+                Ok(Ok(())) => break,
+                Ok(Err(err)) => err,
+                Err(_) => std::io::Error::new(std::io::ErrorKind::TimedOut, "write timed out"),
+            };
+            // Stale, broken or stalled connection: reconnect and resend once.
+            conn = None;
+            if attempt == 1 {
+                tracing::warn!(
+                    peer = to.0,
+                    frames = batch.len(),
+                    %err,
+                    "write failed again after reconnecting; dropping the batch"
+                );
             }
         }
     }
