@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use evento_core::Event;
 
-use crate::api::{same_event, AcceptorRecord, DataStore, DecisionRecord, Journal};
+use crate::api::{same_event, AcceptorRecord, AmnesiaFence, DataStore, DecisionRecord, Journal};
 use crate::clock::{Ballot, NodeId, Timestamp, TxnId};
 use crate::message::{CommandState, Key};
 
@@ -191,6 +191,9 @@ pub struct InMemoryJournal {
     decisions: Mutex<BTreeMap<TxnId, DecisionRecord>>,
     /// The persisted clock bound (see [`Journal::save_clock_bound`]).
     clock_bound: Mutex<Option<u64>>,
+    /// The persisted amnesia fence (see [`Journal::save_amnesia_fence`]) —
+    /// kept across `truncate`.
+    amnesia_fence: Mutex<Option<AmnesiaFence>>,
 }
 
 impl InMemoryJournal {
@@ -266,6 +269,15 @@ impl Journal for InMemoryJournal {
 
     async fn load_clock_bound(&self) -> anyhow::Result<Option<u64>> {
         Ok(*self.clock_bound.lock().expect("journal poisoned"))
+    }
+
+    async fn save_amnesia_fence(&self, fence: &AmnesiaFence) -> anyhow::Result<()> {
+        *self.amnesia_fence.lock().expect("journal poisoned") = Some(*fence);
+        Ok(())
+    }
+
+    async fn load_amnesia_fence(&self) -> anyhow::Result<Option<AmnesiaFence>> {
+        Ok(*self.amnesia_fence.lock().expect("journal poisoned"))
     }
 
     async fn save_route(&self, txn: TxnId, route: &[Key]) -> anyhow::Result<()> {

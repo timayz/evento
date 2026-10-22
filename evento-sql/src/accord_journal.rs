@@ -40,7 +40,8 @@ use async_trait::async_trait;
 
 use evento_accord::format::{decode_tagged, encode_tagged, RecordKind};
 use evento_accord::{
-    AcceptorRecord, Ballot, CommandState, DecisionRecord, Journal, Key, NodeId, Timestamp, TxnId,
+    AcceptorRecord, AmnesiaFence, Ballot, CommandState, DecisionRecord, Journal, Key, NodeId,
+    Timestamp, TxnId,
 };
 
 /// `k` value under which the truncation watermark is stored in `accord_meta`.
@@ -49,6 +50,9 @@ const WATERMARK_KEY: &str = "redundant_before";
 const REJOIN_BOUNDS_KEY: &str = "rejoin_above";
 /// `k` value under which the node's clock bound is stored in `accord_meta`.
 const CLOCK_BOUND_KEY: &str = "clock_bound";
+/// `k` value under which the replica's amnesia fence is stored in
+/// `accord_meta`. Untouched by `truncate`.
+const AMNESIA_FENCE_KEY: &str = "amnesia_fence";
 /// `k` prefix of a multi-shard transaction's route in `accord_meta`.
 const ROUTE_PREFIX: &str = "route/";
 /// `k` prefix of a blind recovery promise in `accord_meta`.
@@ -567,6 +571,32 @@ where
     async fn load_clock_bound(&self) -> anyhow::Result<Option<u64>> {
         match self.load_meta(CLOCK_BOUND_KEY).await? {
             Some(bytes) => Ok(Some(decode_tagged(RecordKind::ClockBound, &bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn save_amnesia_fence(&self, fence: &AmnesiaFence) -> anyhow::Result<()> {
+        let value = encode_tagged(RecordKind::AmnesiaFence, fence)?;
+        let upsert = Query::insert()
+            .into_table(AccordMeta::Table)
+            .columns([AccordMeta::K, AccordMeta::V])
+            .values_panic([AMNESIA_FENCE_KEY.into(), value.into()])
+            .on_conflict(
+                OnConflict::column(AccordMeta::K)
+                    .update_column(AccordMeta::V)
+                    .to_owned(),
+            )
+            .to_owned();
+        let (sql, values) = Self::build_sqlx(&upsert);
+        sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn load_amnesia_fence(&self) -> anyhow::Result<Option<AmnesiaFence>> {
+        match self.load_meta(AMNESIA_FENCE_KEY).await? {
+            Some(bytes) => Ok(Some(decode_tagged(RecordKind::AmnesiaFence, &bytes)?)),
             None => Ok(None),
         }
     }

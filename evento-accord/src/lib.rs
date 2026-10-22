@@ -40,7 +40,7 @@ pub mod tcp;
 pub mod transport;
 
 pub use api::{
-    snapshot_event_size, validate_layout, AcceptorRecord, DataStore, DecisionRecord,
+    snapshot_event_size, validate_layout, AcceptorRecord, AmnesiaFence, DataStore, DecisionRecord,
     DynamicTopology, Journal, MessageSink, RegionId, ShardId, ShardedTopology, SnapshotPage,
     StaticTopology, Topology,
 };
@@ -51,8 +51,8 @@ pub use group::{GroupHost, RejoinHandler};
 pub use message::{CommandState, Key, Message, Status};
 pub use metrics::{Metrics, MetricsSnapshot};
 pub use node::{
-    BacklogAtCap, CommandTooLarge, CommitOutcome, Node, NodeClosed, NodeConfig, PartialSnapshot,
-    RejoinRequired, MAX_COMMAND_BYTES,
+    BacklogAtCap, CommandTooLarge, CommitOutcome, FenceNotCovered, LostJournal, Node, NodeClosed,
+    NodeConfig, PartialSnapshot, RejoinRequired, MAX_COMMAND_BYTES,
 };
 pub use store::{AppliedEntry, InMemoryDataStore, InMemoryJournal};
 pub use sweep::{SweepConfig, SweepPressure, SweepScheduler, SweepStats, Sweepable};
@@ -61,6 +61,6 @@ pub use tcp::{
     TlsClient, UnroutedHandler,
 };
 pub use transport::{
-    Envelope, GroupId, InMemoryNetwork, InMemorySink, MessageFate, MessageFaults, MessageFilter,
-    TraceEntry,
+    Envelope, GroupId, InMemoryNetwork, InMemorySink, LinkFilter, MessageFate, MessageFaults,
+    MessageFilter, TraceEntry,
 };

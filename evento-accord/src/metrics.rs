@@ -65,6 +65,21 @@ pub struct Metrics {
     /// Decisions learned from peers for transactions this node never
     /// witnessed, but a command committed here waits on (#330).
     pub dependencies_learned: AtomicU64,
+    /// Times this node opened joining over an empty journal and set an
+    /// amnesia fence: it lost the journal it voted with (#312).
+    pub amnesia_fences: AtomicU64,
+    /// Joins over a lost journal that found no contact vouching past the
+    /// fence ([`FenceNotCovered`](crate::FenceNotCovered)): nothing was
+    /// installed. A count that keeps rising means a transaction below the
+    /// fence no replica can decide any more (see OPERATIONS §7).
+    pub amnesia_joins_refused: AtomicU64,
+    /// Votes refused for a transaction whose `t0` lies more than two clock
+    /// skews past this node's clock: its coordinator's clock runs beyond the
+    /// skew bound.
+    pub votes_future_dated: AtomicU64,
+    /// Config-Paxos promises and accepts this node withheld because it lost
+    /// a journal under this node id: it abstains from config Paxos for good.
+    pub config_votes_withheld: AtomicU64,
 }
 
 impl Metrics {
@@ -154,6 +169,26 @@ impl Metrics {
         self.dependencies_learned.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records an amnesia fence set over a lost journal.
+    pub fn record_amnesia_fence(&self) {
+        self.amnesia_fences.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a join over a lost journal that no contact vouched for.
+    pub fn record_amnesia_join_refused(&self) {
+        self.amnesia_joins_refused.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a vote refused for a transaction dated past the skew bound.
+    pub fn record_vote_future_dated(&self) {
+        self.votes_future_dated.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a config-Paxos vote withheld after a lost journal.
+    pub fn record_config_vote_withheld(&self) {
+        self.config_votes_withheld.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Records a join that failed after part of the snapshot was installed.
     pub fn record_join_partial(&self) {
         self.joins_partial.fetch_add(1, Ordering::Relaxed);
@@ -186,6 +221,10 @@ impl Metrics {
             command_pages: self.command_pages.load(Ordering::Relaxed),
             votes_fenced: self.votes_fenced.load(Ordering::Relaxed),
             dependencies_learned: self.dependencies_learned.load(Ordering::Relaxed),
+            amnesia_fences: self.amnesia_fences.load(Ordering::Relaxed),
+            amnesia_joins_refused: self.amnesia_joins_refused.load(Ordering::Relaxed),
+            votes_future_dated: self.votes_future_dated.load(Ordering::Relaxed),
+            config_votes_withheld: self.config_votes_withheld.load(Ordering::Relaxed),
         }
     }
 }
@@ -214,6 +253,10 @@ pub struct MetricsSnapshot {
     pub command_pages: u64,
     pub votes_fenced: u64,
     pub dependencies_learned: u64,
+    pub amnesia_fences: u64,
+    pub amnesia_joins_refused: u64,
+    pub votes_future_dated: u64,
+    pub config_votes_withheld: u64,
 }
 
 impl MetricsSnapshot {
@@ -221,7 +264,7 @@ impl MetricsSnapshot {
     /// source of truth for both [`to_prometheus`](Self::to_prometheus) and
     /// [`to_prometheus_labeled`](Self::to_prometheus_labeled); add a counter here and
     /// both renderings pick it up.
-    fn counters(&self) -> [(&'static str, &'static str, u64); 19] {
+    fn counters(&self) -> [(&'static str, &'static str, u64); 23] {
         [
             (
                 "accord_writes_committed_total",
@@ -317,6 +360,26 @@ impl MetricsSnapshot {
                 "accord_dependencies_learned_total",
                 "Decisions learned from peers for dependencies never witnessed here.",
                 self.dependencies_learned,
+            ),
+            (
+                "accord_amnesia_fences_total",
+                "Times this node opened joining over an empty journal and set an amnesia fence.",
+                self.amnesia_fences,
+            ),
+            (
+                "accord_amnesia_joins_refused_total",
+                "Joins over a lost journal that no contact vouched past the fence (nothing installed).",
+                self.amnesia_joins_refused,
+            ),
+            (
+                "accord_votes_future_dated_total",
+                "Votes refused for transactions dated more than two clock skews past this node's clock.",
+                self.votes_future_dated,
+            ),
+            (
+                "accord_config_votes_withheld_total",
+                "Config-Paxos votes withheld by a node that lost a journal under its node id.",
+                self.config_votes_withheld,
             ),
         ]
     }

@@ -29,7 +29,8 @@ use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 
 use evento_accord::format::{decode_tagged, encode_tagged, RecordKind};
 use evento_accord::{
-    AcceptorRecord, Ballot, CommandState, DecisionRecord, Journal, Key, NodeId, Timestamp, TxnId,
+    AcceptorRecord, AmnesiaFence, Ballot, CommandState, DecisionRecord, Journal, Key, NodeId,
+    Timestamp, TxnId,
 };
 
 /// Key under which the truncation watermark is stored in the `meta` keyspace.
@@ -38,6 +39,9 @@ const WATERMARK_KEY: &[u8] = b"redundant_before";
 const REJOIN_BOUNDS_KEY: &[u8] = b"rejoin_above";
 /// Meta key under which the node's clock bound is stored.
 const CLOCK_BOUND_KEY: &[u8] = b"clock_bound";
+/// Meta key under which the replica's amnesia fence is stored. Untouched by
+/// `truncate`.
+const AMNESIA_FENCE_KEY: &[u8] = b"amnesia_fence";
 /// Prefix for metadata-log entry keys (`mlog/` + 8-byte big-endian epoch).
 const METADATA_PREFIX: &[u8] = b"mlog/";
 /// Prefix for acceptor-state keys (`acc/` + 8-byte big-endian epoch).
@@ -323,6 +327,28 @@ impl Journal for FjallJournal {
         let bytes = tokio::task::spawn_blocking(move || meta.get(CLOCK_BOUND_KEY)).await??;
         match bytes {
             Some(bytes) => Ok(Some(decode_tagged(RecordKind::ClockBound, &bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn save_amnesia_fence(&self, fence: &AmnesiaFence) -> anyhow::Result<()> {
+        let value = encode_tagged(RecordKind::AmnesiaFence, fence)?;
+        let meta = self.meta.clone();
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            meta.insert(AMNESIA_FENCE_KEY, value)?;
+            db.persist(PersistMode::SyncAll)?;
+            Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    async fn load_amnesia_fence(&self) -> anyhow::Result<Option<AmnesiaFence>> {
+        let meta = self.meta.clone();
+        let bytes = tokio::task::spawn_blocking(move || meta.get(AMNESIA_FENCE_KEY)).await??;
+        match bytes {
+            Some(bytes) => Ok(Some(decode_tagged(RecordKind::AmnesiaFence, &bytes)?)),
             None => Ok(None),
         }
     }

@@ -173,6 +173,23 @@ pub struct DecisionRecord {
     pub route: Vec<Key>,
 }
 
+/// The fence of a replica that came back over an empty journal under its old
+/// node id (#312): it forgot the votes, promises and reports it made, and it
+/// joins again only through a contact that vouches past them. Journaled
+/// ([`Journal::save_amnesia_fence`]) before the replica does anything, and
+/// kept for good — it also marks the replica as an acceptor that abstains
+/// from config Paxos under this id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AmnesiaFence {
+    /// Microseconds above every timestamp the replica can have voted on,
+    /// promised, minted or reported before the loss: its wall clock when it
+    /// reopened, plus three skews.
+    pub fence_micros: u64,
+    /// Whether the replica has joined through a contact that vouched at or
+    /// above the fence. Until then it takes no part, and must open joining.
+    pub joined: bool,
+}
+
 /// Durable command log. Each replica persists its [`CommandState`] per
 /// transaction so it survives restarts and can be replayed during recovery.
 ///
@@ -315,6 +332,23 @@ pub trait Journal: Send + Sync + 'static {
 
     /// The persisted clock bound, if any. The default returns none.
     async fn load_clock_bound(&self) -> anyhow::Result<Option<u64>> {
+        Ok(None)
+    }
+
+    /// Durably persists the [`AmnesiaFence`] of a replica that came back over
+    /// an empty journal (#312), replacing any previous one. Durable by the
+    /// time it returns, and **never** discarded by
+    /// [`truncate`](Journal::truncate). The default is a no-op: the node
+    /// reads the fence back before relying on it, so a journal that cannot
+    /// keep it refuses such a replica — which must then come back under a new
+    /// node id.
+    async fn save_amnesia_fence(&self, fence: &AmnesiaFence) -> anyhow::Result<()> {
+        let _ = fence;
+        Ok(())
+    }
+
+    /// The persisted [`AmnesiaFence`], if any. The default returns none.
+    async fn load_amnesia_fence(&self) -> anyhow::Result<Option<AmnesiaFence>> {
         Ok(None)
     }
 

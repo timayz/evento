@@ -58,6 +58,11 @@ async fn clock_bound() {
 }
 
 #[tokio::test]
+async fn amnesia_fence() {
+    sql_support::amnesia_fence(&fresh("accord_pg_amnesia_fence").await).await;
+}
+
+#[tokio::test]
 async fn survives_reconnect() {
     let name = "accord_pg_reconnect";
     let b = command(200, 2);

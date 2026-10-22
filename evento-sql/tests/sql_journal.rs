@@ -76,6 +76,11 @@ async fn clock_bound() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn amnesia_fence() {
+    sql_support::amnesia_fence(&memory().await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn survives_close_and_reopen() {
     let temp = tempfile::Builder::new()
         .prefix("accord_sql_reopen")
@@ -166,4 +171,21 @@ async fn clock_bound_survives_close_and_reopen() {
     }
     let journal = at(&path).await;
     assert_eq!(journal.load_clock_bound().await.unwrap(), Some(1_234));
+}
+
+#[tokio::test]
+async fn amnesia_fence_survives_close_and_reopen() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("journal.db");
+    let fence = evento_accord::AmnesiaFence {
+        fence_micros: 1_234,
+        joined: true,
+    };
+    {
+        let journal = at(&path).await;
+        journal.save_amnesia_fence(&fence).await.unwrap();
+        journal.close().await;
+    }
+    let journal = at(&path).await;
+    assert_eq!(journal.load_amnesia_fence().await.unwrap(), Some(fence));
 }

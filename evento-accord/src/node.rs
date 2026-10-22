@@ -28,8 +28,8 @@ use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant};
 
 use crate::api::{
-    floor_millis, snapshot_event_size, stamp_events, validate_layout, AcceptorRecord, DataStore,
-    Journal, MessageSink, ShardId, Topology,
+    floor_millis, snapshot_event_size, stamp_events, validate_layout, AcceptorRecord,
+    AmnesiaFence, DataStore, Journal, MessageSink, ShardId, Topology,
 };
 use crate::clock::{Ballot, Clock, HybridLogicalClock, NodeId, Timestamp, TxnId};
 use crate::failure_detector::FailureDetector;
@@ -144,6 +144,15 @@ pub struct NodeConfig {
     /// build without the fence, set it `false` until the last node runs a
     /// build with it. Default `true`.
     pub fence_invalidation: bool,
+    /// How long a node joining over a lost journal waits for its contact's
+    /// watermark report to pass its amnesia fence before it gives up with
+    /// [`FenceNotCovered`] (#312). The report passes the fence about
+    /// `compaction_margin` + three clock skews after the node reopened, plus
+    /// the anti-entropy rounds the contact needs to prove its coverage — and,
+    /// for a contact whose group is idle under a
+    /// [`SweepScheduler`](crate::SweepScheduler), its idle interval between
+    /// reports. Default 30 s.
+    pub amnesia_join_timeout: Duration,
 }
 
 impl Default for NodeConfig {
@@ -166,6 +175,7 @@ impl Default for NodeConfig {
             snapshot_page_bytes: 4 * 1024 * 1024,
             config_defer_step: Duration::from_millis(100),
             fence_invalidation: true,
+            amnesia_join_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -299,6 +309,78 @@ impl std::fmt::Display for PartialSnapshot {
 }
 
 impl std::error::Error for PartialSnapshot {}
+
+/// [`Node::recover_state`] refused to open the node: its journal holds
+/// nothing, yet it cannot be a fresh replica. Either its data store holds
+/// events (`join_pending: false`) — the journal that went with them was lost
+/// or deleted — or a join it started over a lost journal never completed
+/// (`join_pending: true`). Over a lost journal the node forgot the votes,
+/// promises and reports it made, so it may only come back by **joining**
+/// (`GroupHost::open_joining`, or [`Node::recover_state_for_join`] +
+/// [`begin_join`](Node::begin_join) + [`join`](Node::join)) over an empty
+/// data store: the join waits for a contact that vouches past everything it
+/// may have forgotten (#312). Returned through `anyhow`; downcast to tell it
+/// apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LostJournal {
+    /// The node already holds an amnesia fence: a join it started over a lost
+    /// journal never completed.
+    pub join_pending: bool,
+}
+
+impl std::fmt::Display for LostJournal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.join_pending {
+            f.write_str(
+                "this node's join after a lost journal never completed; empty its data store and open it joining",
+            )
+        } else {
+            f.write_str(
+                "this node's journal is empty but its data store is not: the journal was lost; \
+                 empty the data store and open it joining",
+            )
+        }
+    }
+}
+
+impl std::error::Error for LostJournal {}
+
+/// [`Node::join`] over a lost journal found no contact vouching for
+/// everything the node may have forgotten (#312): within
+/// [`NodeConfig::amnesia_join_timeout`], the contact's watermark report never
+/// reached the node's fence, or the vouch it gave with its join header
+/// ([`Message::JoinProof`]) was below it, under another epoch, or from
+/// another shard. Nothing was installed: join again, through the same
+/// contact or another. A contact's report stays below the fence while a
+/// transaction below it is still undecided there, or while too few of its
+/// peers are reachable to prove its coverage. Returned through `anyhow`;
+/// downcast to tell it apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FenceNotCovered {
+    /// The node's fence.
+    pub fence: Timestamp,
+    /// What the contact vouched for, if it sent a vouch at all.
+    pub vouched: Option<Timestamp>,
+}
+
+impl std::fmt::Display for FenceNotCovered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.vouched {
+            Some(vouched) => write!(
+                f,
+                "the contact vouched for {vouched:?}, below this node's amnesia fence {:?}; nothing was installed",
+                self.fence
+            ),
+            None => write!(
+                f,
+                "no contact vouched past this node's amnesia fence {:?}; nothing was installed",
+                self.fence
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FenceNotCovered {}
 
 /// How many times a joiner asks for the same snapshot page before giving the
 /// contact up: a page request and its reply are idempotent, so a frame lost
@@ -714,6 +796,12 @@ pub struct Node {
     clock_bound_lock: Arc<tokio::sync::Mutex<()>>,
     /// Set once this node's host closed it: it mints nothing more.
     retired: Arc<AtomicBool>,
+    /// This node's amnesia fence, if it came back over a lost journal
+    /// (#312): restored from or set in the journal by
+    /// [`restore_journal`](Node::restore_journal). While not `joined`, its
+    /// join waits for a contact vouching past the fence; for good, it
+    /// abstains from config Paxos.
+    amnesia: Arc<Mutex<Option<AmnesiaFence>>>,
     topology: Arc<dyn Topology>,
     sink: Arc<dyn MessageSink>,
     datastore: Arc<dyn DataStore>,
@@ -841,6 +929,7 @@ impl Node {
             clock_bound: Arc::new(AtomicU64::new(0)),
             clock_bound_lock: Arc::new(tokio::sync::Mutex::new(())),
             retired: Arc::new(AtomicBool::new(false)),
+            amnesia: Arc::new(Mutex::new(None)),
             topology,
             sink,
             datastore,
@@ -891,6 +980,12 @@ impl Node {
     /// This node's timing/sizing configuration.
     pub fn config(&self) -> NodeConfig {
         self.settings
+    }
+
+    /// This node's amnesia fence, if it came back over a lost journal under
+    /// its node id (#312): see [`Node::recover_state_for_join`].
+    pub fn amnesia_fence(&self) -> Option<AmnesiaFence> {
+        *self.amnesia.lock().expect("amnesia poisoned")
     }
 
     /// Shares an external [`Metrics`] with this node, so counters this node records
