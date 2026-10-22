@@ -59,7 +59,8 @@ pub const DEFAULT_INBOX_CAPACITY: usize = 1024;
 pub struct InMemoryNetwork {
     inboxes: Mutex<HashMap<NodeId, mpsc::Sender<Envelope>>>,
     crashed: Mutex<HashSet<NodeId>>,
-    /// Unordered node pairs that cannot exchange messages (a partition).
+    /// Directed links that drop every message: a [partition](Self::partition)
+    /// severs both directions of a pair, a [cut](Self::cut) one.
     partitions: Mutex<HashSet<(NodeId, NodeId)>>,
     /// Messages shed because the destination inbox was full (backpressure).
     /// Observe-only — it never influences delivery, so the harness stays
@@ -85,6 +86,62 @@ pub struct InMemoryNetwork {
     /// The execution trace (see [`enable_trace`](InMemoryNetwork::enable_trace));
     /// `None` by default, so nothing is encoded.
     trace: Mutex<Option<Trace>>,
+    /// Per-message faults and the seeded generator they draw from (see
+    /// [`set_message_faults`](InMemoryNetwork::set_message_faults)); `None` by
+    /// default, so nothing is drawn and every message is delivered as sent.
+    faults: Mutex<Option<(MessageFaults, SplitMix64)>>,
+}
+
+/// Faults an [`InMemoryNetwork`] injects into individual messages (see
+/// [`set_message_faults`](InMemoryNetwork::set_message_faults)), on top of
+/// whole-node crashes and whole-link partitions. All off by default.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct MessageFaults {
+    /// The probability that a message is lost.
+    pub drop: f64,
+    /// The probability that a message is delivered twice, the copy with a
+    /// delay of its own.
+    pub duplicate: f64,
+    /// Every message (and copy) is held back a random delay up to this, so
+    /// messages on one link overtake each other. Zero keeps send order.
+    pub max_delay: Duration,
+}
+
+/// SplitMix64: a small, seedable, well-mixed generator — enough to draw
+/// message faults reproducibly, without a `rand` dependency in the crate.
+struct SplitMix64(u64);
+
+impl SplitMix64 {
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    /// Whether an event of probability `p` happens.
+    fn chance(&mut self, p: f64) -> bool {
+        // 53 random bits: a uniform draw in [0, 1).
+        let unit = (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64;
+        unit < p
+    }
+
+    /// A uniform delay in `[0, max]`, at microsecond grain.
+    fn delay(&mut self, max: Duration) -> Duration {
+        let micros = max.as_micros() as u64;
+        Duration::from_micros(self.next_u64() % micros.saturating_add(1))
+    }
+}
+
+/// What the faults decided for one message.
+struct Draw {
+    /// Lost.
+    drop: bool,
+    /// Its extra delay.
+    delay: Duration,
+    /// Delivered a second time, after this extra delay.
+    duplicate: Option<Duration>,
 }
 
 /// A predicate over messages, for [`InMemoryNetwork::set_unreadable`].
@@ -96,10 +153,11 @@ pub type MessageFilter = Arc<dyn Fn(&Message) -> bool + Send + Sync>;
 pub enum MessageFate {
     /// Put in the receiver's inbox.
     Delivered,
-    /// Held back for the link's latency; its arrival is traced on its own.
+    /// Held back for the link's latency or a fault's delay; its arrival is
+    /// traced on its own.
     Deferred,
-    /// Dropped: an end is crashed, the link partitioned, or the receiver has
-    /// no open inbox.
+    /// Dropped: an end is crashed, the link partitioned, a fault lost it, or
+    /// the receiver has no open inbox.
     Dropped,
     /// Shed: over the frame cap, unreadable, or the receiver's inbox full.
     Shed,
@@ -137,6 +195,7 @@ struct Trace {
 /// What a trace keeps of one message: its digest, and its variant when
 /// recording. Computed once at send, so a deferred message is not encoded
 /// again on arrival.
+#[derive(Clone)]
 struct Stamp {
     digest: u64,
     kind: Option<String>,
@@ -192,10 +251,66 @@ impl InMemoryNetwork {
         partitions.remove(&(b, a));
     }
 
-    /// Restores every partitioned link at once. Convenient for scenario
-    /// teardown, where a seed-skipped heal must not leave a residual cut.
+    /// Restores every partitioned link at once, [cut](Self::cut) ones
+    /// included. Convenient for scenario teardown, where a seed-skipped heal
+    /// must not leave a residual cut.
     pub fn heal_all_partitions(&self) {
         self.partitions.lock().expect("network poisoned").clear();
+    }
+
+    /// Severs the directed link `from → to` only: messages from `from` to
+    /// `to` are dropped while `to → from` still works — the asymmetric
+    /// partition a symmetric [`partition`](Self::partition) cannot express.
+    /// [`heal_partition`](Self::heal_partition) and
+    /// [`heal_all_partitions`](Self::heal_all_partitions) restore it too.
+    pub fn cut(&self, from: NodeId, to: NodeId) {
+        self.partitions
+            .lock()
+            .expect("network poisoned")
+            .insert((from, to));
+    }
+
+    /// Restores the directed link `from → to`, whether [cut](Self::cut) or
+    /// one direction of a [partition](Self::partition).
+    pub fn restore(&self, from: NodeId, to: NodeId) {
+        self.partitions
+            .lock()
+            .expect("network poisoned")
+            .remove(&(from, to));
+    }
+
+    /// Injects `faults` into every message from now on, drawn from a
+    /// generator seeded with `seed`: each message is lost, held back, or
+    /// delivered twice as they decide (see [`MessageFaults`]). A node's
+    /// messages to itself are no exception — the TCP transport sends those
+    /// through its own peer queue too. Draws happen only when a message is
+    /// sent, a fixed number per message, so under the deterministic
+    /// simulation a seed replays exactly. Replaces any faults set before.
+    pub fn set_message_faults(&self, seed: u64, faults: MessageFaults) {
+        *self.faults.lock().expect("network poisoned") = Some((faults, SplitMix64(seed)));
+    }
+
+    /// Delivers every message as sent again. Messages already held back by a
+    /// fault's delay still arrive.
+    pub fn clear_message_faults(&self) {
+        *self.faults.lock().expect("network poisoned") = None;
+    }
+
+    /// What the faults decide for the next message; `None` with no faults
+    /// set. Always four draws, whatever they decide, so one message's fate
+    /// never shifts the draws of the next.
+    fn draw(&self) -> Option<Draw> {
+        let mut faults = self.faults.lock().expect("network poisoned");
+        let (config, rng) = faults.as_mut()?;
+        let drop = rng.chance(config.drop);
+        let delay = rng.delay(config.max_delay);
+        let duplicate = rng.chance(config.duplicate);
+        let copy_delay = rng.delay(config.max_delay);
+        Some(Draw {
+            drop,
+            delay,
+            duplicate: duplicate.then_some(copy_delay),
+        })
     }
 
     /// Whether messages between `from` and `to` are currently partitioned.
@@ -424,34 +539,69 @@ impl MessageSink for InMemorySink {
             return Ok(());
         }
 
+        let latency = self.net.latency_of(self.from, to);
+        let draw = self.net.draw();
+        let (delay, duplicate) = match draw {
+            Some(Draw { drop: true, .. }) => {
+                self.net
+                    .note(self.from, to, MessageFate::Dropped, stamp.as_ref());
+                return Ok(());
+            }
+            Some(Draw {
+                delay, duplicate, ..
+            }) => (delay, duplicate),
+            None => (Duration::ZERO, None),
+        };
+        let copy = duplicate.map(|copy_delay| {
+            let envelope = Envelope {
+                from: self.from,
+                message: message.clone(),
+            };
+            (envelope, copy_delay)
+        });
         let envelope = Envelope {
             from: self.from,
             message,
         };
-        let latency = self.net.latency_of(self.from, to);
-        if latency.is_zero() {
-            // The common path: deliver inline, byte-identical to before (so the
-            // deterministic simulation is unchanged).
-            let fate = self.net.deliver(to, envelope);
-            self.net.note(self.from, to, fate, stamp.as_ref());
-        } else {
-            // Latency model: defer delivery. Re-check liveness at arrival so a
-            // crash/partition during flight still drops the in-flight message.
-            self.net
-                .note(self.from, to, MessageFate::Deferred, stamp.as_ref());
-            let net = Arc::clone(&self.net);
-            let from = self.from;
-            tokio::spawn(async move {
-                tokio::time::sleep(latency).await;
-                if net.is_crashed(from) || net.is_crashed(to) || net.is_partitioned(from, to) {
-                    net.note(from, to, MessageFate::Dropped, stamp.as_ref());
-                    return;
-                }
-                let fate = net.deliver(to, envelope);
-                net.note(from, to, fate, stamp.as_ref());
-            });
+        self.net
+            .forward(to, envelope, latency + delay, stamp.clone());
+        if let Some((envelope, copy_delay)) = copy {
+            self.net.forward(to, envelope, latency + copy_delay, stamp);
         }
         Ok(())
+    }
+}
+
+impl InMemoryNetwork {
+    /// Delivers `envelope` to `to` after `delay`. Inline when it is zero —
+    /// the common path, byte-identical to before (so the deterministic
+    /// simulation is unchanged) — otherwise from a task that re-checks
+    /// liveness at arrival, so a crash or partition during flight still
+    /// drops the message.
+    fn forward(
+        self: &Arc<Self>,
+        to: NodeId,
+        envelope: Envelope,
+        delay: Duration,
+        stamp: Option<Stamp>,
+    ) {
+        let from = envelope.from;
+        if delay.is_zero() {
+            let fate = self.deliver(to, envelope);
+            self.note(from, to, fate, stamp.as_ref());
+            return;
+        }
+        self.note(from, to, MessageFate::Deferred, stamp.as_ref());
+        let net = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            if net.is_crashed(from) || net.is_crashed(to) || net.is_partitioned(from, to) {
+                net.note(from, to, MessageFate::Dropped, stamp.as_ref());
+                return;
+            }
+            let fate = net.deliver(to, envelope);
+            net.note(from, to, fate, stamp.as_ref());
+        });
     }
 }
 
@@ -621,6 +771,87 @@ mod tests {
             entries[0].digest, entries[1].digest,
             "different messages digest differently"
         );
+    }
+
+    /// Sends `n` numbered messages from node 1 to node 2 over a network
+    /// with `faults` drawn from `seed`, and returns the numbers node 2
+    /// received, in arrival order.
+    async fn faulty_run(seed: u64, faults: MessageFaults, n: u64) -> Vec<u64> {
+        let net = InMemoryNetwork::new();
+        let mut inbox = net.register(NodeId(2));
+        net.set_message_faults(seed, faults);
+        let sink = net.sink(NodeId(1));
+        for i in 0..n {
+            sink.send(NodeId(2), Message::Applied { txn: txn(i) })
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(faults.max_delay + Duration::from_millis(1)).await;
+        let mut got = Vec::new();
+        while let Ok(env) = inbox.try_recv() {
+            match env.message {
+                Message::Applied { txn } => got.push(txn.0.micros),
+                other => panic!("unexpected message: {other:?}"),
+            }
+        }
+        got
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn message_faults_drop_duplicate_and_reorder_reproducibly() {
+        let faults = MessageFaults {
+            drop: 0.2,
+            duplicate: 0.2,
+            max_delay: Duration::from_millis(10),
+        };
+        let got = faulty_run(7, faults, 200).await;
+        assert_eq!(got, faulty_run(7, faults, 200).await, "a seed replays");
+        assert_ne!(
+            got,
+            faulty_run(8, faults, 200).await,
+            "another seed draws differently"
+        );
+
+        let distinct: std::collections::BTreeSet<u64> = got.iter().copied().collect();
+        assert!(distinct.len() < 200, "some messages were lost");
+        assert!(got.len() > distinct.len(), "some were delivered twice");
+        assert!(
+            got.windows(2).any(|pair| pair[0] > pair[1]),
+            "some overtook others"
+        );
+    }
+
+    #[tokio::test]
+    async fn faults_at_zero_deliver_everything_inline_in_order() {
+        let got = faulty_run(7, MessageFaults::default(), 50).await;
+        assert_eq!(got, (0..50).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn a_cut_drops_one_direction_only() {
+        let net = InMemoryNetwork::new();
+        let mut inbox1 = net.register(NodeId(1));
+        let mut inbox2 = net.register(NodeId(2));
+        let (sink1, sink2) = (net.sink(NodeId(1)), net.sink(NodeId(2)));
+
+        net.cut(NodeId(1), NodeId(2));
+        sink1
+            .send(NodeId(2), Message::Applied { txn: txn(1) })
+            .await
+            .unwrap();
+        sink2
+            .send(NodeId(1), Message::Applied { txn: txn(2) })
+            .await
+            .unwrap();
+        assert!(inbox2.try_recv().is_err(), "1 → 2 is cut");
+        assert!(inbox1.try_recv().is_ok(), "2 → 1 still works");
+
+        net.restore(NodeId(1), NodeId(2));
+        sink1
+            .send(NodeId(2), Message::Applied { txn: txn(3) })
+            .await
+            .unwrap();
+        assert!(inbox2.try_recv().is_ok(), "1 → 2 restored");
     }
 
     #[tokio::test]
