@@ -404,6 +404,19 @@ pub trait DataStore: Send + Sync + 'static {
         commit: bool,
     ) -> anyhow::Result<()>;
 
+    /// Whether this store already holds every event of `events`: each
+    /// aggregate's event at that version is that very event: the same id,
+    /// aggregate, version, name, routing key, data and metadata (only its
+    /// stamps may differ). It tells a transaction this replica applied before —
+    /// and forgot: its
+    /// journal record lost across a restart, or applied by an anti-entropy
+    /// import, which is not journaled — from a conflict. Its own events in
+    /// place, its condition held, and applying it again changes nothing.
+    /// The default answers `false`: cannot tell.
+    async fn holds(&self, _events: &[Event]) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
     /// Serves a read query from the local backend, so a node can answer reads
     /// forwarded to it for a key range it owns. `to_micros` is the forwarded
     /// exclusive stamp bound (see `evento_core::Executor::read`). The default
@@ -566,6 +579,21 @@ pub(crate) fn stable_hash_extend(mut hash: u64, bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(PRIME);
     }
     hash
+}
+
+/// Whether `stored` is `event` as a store keeps it: the same id, aggregate,
+/// version, name, routing key, data and metadata. Only the stamps may
+/// differ: a replica stamps a transaction's events from its agreed
+/// `execute_at` as it applies them (see [`stamp_events`]).
+pub(crate) fn same_event(stored: &Event, event: &Event) -> bool {
+    stored.id == event.id
+        && stored.aggregate_type == event.aggregate_type
+        && stored.aggregate_id == event.aggregate_id
+        && stored.version == event.version
+        && stored.name == event.name
+        && stored.routing_key == event.routing_key
+        && stored.data == event.data
+        && stored.metadata == event.metadata
 }
 
 /// Checks that `shards` can serve as a shard layout: at least one shard, no

@@ -28,7 +28,7 @@ use evento_core::{
 };
 use ulid::Ulid;
 
-use crate::api::{snapshot_event_size, DataStore, SnapshotPage};
+use crate::api::{same_event, snapshot_event_size, DataStore, SnapshotPage};
 use crate::clock::{Timestamp, TxnId};
 use crate::message::Key;
 use crate::node::{BacklogAtCap, Node, NodeClosed, RejoinRequired};
@@ -38,6 +38,10 @@ use crate::node::{BacklogAtCap, Node, NodeClosed, RejoinRequired};
 /// Both walk the backend page by page until exhausted, so a store of any size
 /// is handled. Sized to balance round-trips against per-page memory.
 const SNAPSHOT_PAGE_SIZE: u16 = 4096;
+
+/// Events one backend read returns while [`ExecutorDataStore::holds`] scans
+/// an aggregate back from its newest event.
+const HOLDS_PAGE_SIZE: u16 = 64;
 
 /// The single key a read targets, if it can be pinned to one shard: an explicit
 /// routing key, or a query for one aggregate by id — however many filters spell
@@ -165,13 +169,68 @@ impl<E: Executor> DataStore for ExecutorDataStore<E> {
         // persisted verbatim (a backend re-stamping with its own clock would
         // desync this replica's cursors from its peers', and from the
         // stability watermark computed from those stamps).
-        match self.local.replicate(events).await {
-            // Accord already validated the condition at this serial point;
-            // a version conflict here means the events are already present
-            // (idempotent re-apply), which is fine.
-            Ok(()) | Err(WriteError::InvalidOriginalVersion) => Ok(()),
+        match self.local.replicate(events.clone()).await {
+            Ok(()) => Ok(()),
+            // Accord already validated the condition at this serial point,
+            // so a version conflict is an idempotent re-apply — if these very
+            // events are in place. Otherwise the store is behind (a gap) or
+            // holds other events there: taking that for "already present"
+            // would mark the transaction applied with nothing stored, and
+            // every later event on the aggregate would fail the same way — a
+            // store frozen for good (#309). Fail instead: the replica keeps
+            // the transaction un-applied and retries it.
+            Err(WriteError::InvalidOriginalVersion) => {
+                anyhow::ensure!(
+                    self.holds(&events).await?,
+                    "the store's versions do not admit this apply: it is behind, or holds other events"
+                );
+                Ok(())
+            }
             Err(err) => Err(err.into()),
         }
+    }
+
+    async fn holds(&self, events: &[Event]) -> anyhow::Result<bool> {
+        for event in events {
+            let filter: Arc<[EventFilter]> = Arc::from([EventFilter::by_id_raw(
+                event.aggregate_type.clone(),
+                event.aggregate_id.clone(),
+            )]);
+            // Newest first: a transaction's own events are usually among its
+            // aggregates' latest, and versions only rise along a stream, so
+            // the scan stops at the first version below this one.
+            let mut before = None;
+            let held = 'scan: loop {
+                let page = self
+                    .local
+                    .read(
+                        Some(Arc::clone(&filter)),
+                        None,
+                        Args::backward(HOLDS_PAGE_SIZE, before),
+                        None,
+                    )
+                    .await?;
+                for edge in page.edges.iter().rev() {
+                    if edge.node.version == event.version {
+                        break 'scan same_event(&edge.node, event);
+                    }
+                    if edge.node.version < event.version {
+                        break 'scan false;
+                    }
+                }
+                if !page.page_info.has_previous_page {
+                    break false;
+                }
+                match page.page_info.start_cursor {
+                    Some(cursor) => before = Some(cursor),
+                    None => break false,
+                }
+            };
+            if !held {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     async fn read(

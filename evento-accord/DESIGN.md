@@ -480,8 +480,19 @@ backend (sql/fjall). Phases, in order:
   rates; and a restarted node may keep its data store — possibly ahead of its
   journal — or, on the production `ExecutorDataStore` over an in-memory evento
   executor, come back **behind** it, having lost writes it had not persisted.
-  That last case reproduces #309 deterministically: a replica's store freezes
-  while the replica marks transactions applied. Across all
+  That reproduced #309 deterministically, and showed what it is: a **split
+  decision**. A replica whose kept store already held a transaction's own events
+  — its apply forgotten across a restart, or brought by an import, which is not
+  journaled — read that write as a version conflict, and recovery ANDed that read
+  with the applied replicas' "commit": the replicas yet to apply it enacted an
+  abort the others had committed, and the aborting store froze, every later event
+  past the gap swallowed as "already present". Now recovery adopts the decision an
+  applied replica reports, a replica reads its own stored events as its condition
+  holding (`DataStore::holds`), `ExecutorDataStore` takes a version conflict for a
+  re-apply only when the very events are stored, and a startup replay the store
+  cannot take is handed back un-applied rather than swallowed. A decision-agreement
+  oracle checks every run: no transaction enacted as a commit on one replica and an
+  abort on another. Across all
   seeds, **safety holds** — no split-brain, no double-commit — and after healing
   the cluster **converges**. The harness already paid off: it found two real gaps
   (non-convergence from stalled transactions and from missed transactions), both

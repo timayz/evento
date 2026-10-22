@@ -1246,3 +1246,58 @@ async fn a_decision_record_is_dropped_once_every_route_shard_passed_it() {
         sweep.abort();
     }
 }
+
+/// A replica whose store already holds a transaction's own events — applied
+/// before and forgotten: its journal record lost across a restart, or applied
+/// by an anti-entropy import, which is not journaled — reads the transaction's
+/// condition as holding. Reading its own write as a conflict would vote to
+/// abort a decided commit, and a recovery hearing no applied replica would
+/// enact that abort on the replicas yet to apply it (#309).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replica_reads_its_own_forgotten_write_as_holding() {
+    let net = InMemoryNetwork::new();
+    let store = Arc::new(InMemoryDataStore::new());
+    let inbox = net.register(NodeId(0));
+    let mut coordinator = net.register(NodeId(9));
+    let ids = vec![NodeId(0), NodeId(1), NodeId(2)];
+    let node = Node::new(
+        NodeId(0),
+        Arc::new(StaticTopology::new(NodeId(0), ids)),
+        Arc::new(HybridLogicalClock::new(NodeId(0))),
+        Arc::new(net.sink(NodeId(0))) as Arc<dyn MessageSink>,
+        Arc::clone(&store) as Arc<dyn DataStore>,
+        Arc::new(InMemoryJournal::new()) as Arc<dyn Journal>,
+    );
+    let _task = node.start(inbox);
+    let txn = TxnId(Timestamp {
+        micros: HybridLogicalClock::new(NodeId(9)).now().micros,
+        logical: 0,
+        node: NodeId(9),
+    });
+    let events = vec![event("acc", 1)];
+    // Its events are in the store; the replica holds no record of it.
+    store.apply(txn, txn.0, events.clone(), true).await.unwrap();
+
+    net.sink(NodeId(9))
+        .send(
+            NodeId(0),
+            Message::Commit {
+                txn,
+                execute_at: txn.0,
+                deps: Vec::new(),
+                keys: vec![Key("acc".into())],
+                events,
+                reply_to: NodeId(9),
+            },
+        )
+        .await
+        .unwrap();
+    loop {
+        if let Message::ReadOk { txn: read, ok } = next(&mut coordinator).await {
+            if read == txn {
+                assert!(ok, "the replica read its own write as a conflict");
+                break;
+            }
+        }
+    }
+}

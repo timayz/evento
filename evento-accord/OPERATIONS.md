@@ -213,12 +213,17 @@ refuses anything else before a vote, and a node never installs it.
   (status/ballots/decision), replays committed transactions into the data store, and
   restores the metadata-log/acceptor state and redundancy watermark. Then
   `start()`/`start_recovery()`. In-flight transactions resume via the sweep, and
-  anti-entropy catches the node up. (See `tests/restart.rs`.)
+  anti-entropy catches the node up. A replayed transaction the store neither holds
+  nor can take — it lost the write (§8), or misses an earlier one the journal never
+  recorded — is handed back decided but un-applied and applied again once what
+  precedes it is in place. (See `tests/restart.rs`.)
 - **A write the caller abandons** (a client that hung up, a `timeout`) is not undone:
   its coordinator may already have reached the replicas. The node stops coordinating
   it, and the transaction is finished by recovery, like one whose coordinator
   vanished. A retry is a new write: if the abandoned one committed, the retry loses
-  the version condition.
+  the version condition — unless it carries the very same events (same ids and
+  payloads), which then read as already applied: the retry commits, changing
+  nothing.
 - **A coordinator overtaken by recovery:** a node can take over a write whose
   coordinator is alive but slow or wrongly suspected, or which reached it late (a
   group it had not opened yet). The coordinator's own rounds then fail, but the write
@@ -328,6 +333,15 @@ refuses anything else before a vote, and a node never installs it.
   flush **fails** (disk error/full disk) the node *withholds* that batch's acks — it
   never claims durability it doesn't have — so a node that can't fsync stops acking
   (treat a node logging `journal flush failed` as failed; investigate its disk).
+- **The event store must persist an apply before it returns:** evento-fjall's
+  default (`PersistMode::SyncAll` per write), SQL with synchronous commits. The
+  journal records a transaction applied once the store took it, and that record is
+  the node's promise that the effect is stored. A store that acknowledges first
+  (`Fjall::persist_mode(PersistMode::Buffer)`) can come back from a crash behind its
+  journal: the node applies again what its journal still holds, and what
+  anti-entropy can ship, but a gap older than both leaves it stalled on that
+  aggregate (a store refuses an event past a missing version) — rejoin it over its
+  journal (§7, lost store).
 - **What to back up:** the **event store** (Fjall dir / SQL `event` table — the
   materialized state and read source), per node. A store restored from a backup
   re-syncs its missing tail from peers via anti-entropy — unless its peers have

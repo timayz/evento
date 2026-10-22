@@ -1,5 +1,6 @@
 //! A data store whose operations fail, by knob or with a seeded probability.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -9,6 +10,34 @@ use evento_core::cursor::{Args, ReadResult, Value};
 use evento_core::{Event, EventFilter, RoutingKey};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
+
+/// Every transaction's outcome as the stores enacted it, across the cluster:
+/// one enacted as a commit on one replica and an abort on another — a split
+/// decision — shows up with both.
+#[derive(Default)]
+pub struct Outcomes(Mutex<BTreeMap<TxnId, BTreeSet<bool>>>);
+
+impl Outcomes {
+    pub fn record(&self, txn: TxnId, commit: bool) {
+        self.0
+            .lock()
+            .unwrap()
+            .entry(txn)
+            .or_default()
+            .insert(commit);
+    }
+
+    /// The transactions enacted as a commit somewhere and an abort elsewhere.
+    pub fn split(&self) -> Vec<TxnId> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, outcomes)| outcomes.len() > 1)
+            .map(|(txn, _)| *txn)
+            .collect()
+    }
+}
 
 /// A store over another whose applies, version reads and queries can be made
 /// to fail. A failed apply fails before reaching the backend, so nothing is
@@ -25,6 +54,8 @@ pub struct FaultStore {
     pub read_failing: AtomicBool,
     /// Seeded apply failures: the generator and the probability.
     faults: Mutex<Option<(StdRng, f64)>>,
+    /// Where each apply's outcome is recorded, if anywhere.
+    outcomes: Option<Arc<Outcomes>>,
 }
 
 impl Default for FaultStore {
@@ -49,6 +80,15 @@ impl FaultStore {
             version_failing: AtomicBool::new(false),
             read_failing: AtomicBool::new(false),
             faults: Mutex::new(None),
+            outcomes: None,
+        }
+    }
+
+    /// Records the outcome of every apply the backend takes in `outcomes`.
+    pub fn recording(self, outcomes: Arc<Outcomes>) -> Self {
+        Self {
+            outcomes: Some(outcomes),
+            ..self
         }
     }
 
@@ -107,7 +147,18 @@ impl DataStore for FaultStore {
         {
             anyhow::bail!("simulated write failure");
         }
-        self.inner.apply(txn, execute_at, events, commit).await
+        self.inner.apply(txn, execute_at, events, commit).await?;
+        if let Some(outcomes) = &self.outcomes {
+            outcomes.record(txn, commit);
+        }
+        Ok(())
+    }
+
+    async fn holds(&self, events: &[Event]) -> anyhow::Result<bool> {
+        if self.version_failing.load(Ordering::SeqCst) {
+            anyhow::bail!("simulated read failure");
+        }
+        self.inner.holds(events).await
     }
 
     async fn read(

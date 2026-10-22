@@ -415,3 +415,63 @@ async fn snapshot_page_walks_the_backend_by_events_and_bytes() {
     assert_eq!(rest.events.len(), 5000 - 4096);
     assert!(rest.next.is_none());
 }
+
+/// One event of `acc`, stamped so the stream's cursor order is its version
+/// order, as the node stamps a transaction's events from its `execute_at`.
+fn stamped(version: u16) -> Event {
+    Event {
+        id: Ulid::generate(),
+        aggregate_type: "test/Account".into(),
+        aggregate_id: "acc".into(),
+        version,
+        name: "Bumped".into(),
+        timestamp: 1_000 + u64::from(version),
+        ..Default::default()
+    }
+}
+
+fn txn(n: u64) -> evento_accord::TxnId {
+    evento_accord::TxnId(evento_accord::Timestamp {
+        micros: n,
+        logical: 0,
+        node: evento_accord::NodeId(0),
+    })
+}
+
+/// `ExecutorDataStore::apply` takes the backend's version conflict for an
+/// idempotent re-apply only when the very events are stored. A gap (the store
+/// behind) or other events at a taken version fail instead: taken for
+/// "already present", the replica would mark the transaction applied with
+/// nothing stored, and every later event of the aggregate would fail the same
+/// way — its store frozen for good (#309).
+#[tokio::test]
+async fn a_version_conflict_is_a_duplicate_only_if_the_events_are_stored() {
+    let store = ExecutorDataStore::new(Fjall::temporary().unwrap());
+    let (v1, v2, v3, v4) = (stamped(1), stamped(2), stamped(3), stamped(4));
+    let apply = |n: u64, event: &Event| store.apply(txn(n), txn(n).0, vec![event.clone()], true);
+
+    apply(1, &v1).await.unwrap();
+    apply(2, &v2).await.unwrap();
+    apply(2, &v2)
+        .await
+        .expect("a re-apply of what is stored is a no-op");
+    assert!(store.holds(&[v1.clone(), v2.clone()]).await.unwrap());
+
+    let other = stamped(2);
+    assert!(
+        apply(9, &other).await.is_err(),
+        "another event at a taken version is refused"
+    );
+    assert!(!store.holds(&[other]).await.unwrap());
+
+    assert!(
+        apply(4, &v4).await.is_err(),
+        "an apply across a gap is refused, not taken for present"
+    );
+    assert!(!store.holds(std::slice::from_ref(&v4)).await.unwrap());
+    assert_eq!(store.version("test/Account", "acc").await.unwrap(), 2);
+
+    apply(3, &v3).await.unwrap();
+    apply(4, &v4).await.expect("the gap filled, it applies");
+    assert!(store.holds(&[v3, v4]).await.unwrap());
+}
