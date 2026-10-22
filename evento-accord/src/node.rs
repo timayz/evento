@@ -2152,7 +2152,11 @@ impl Node {
         match message {
             Message::PreAccept { txn, keys, events } => {
                 // Only handle the keys/events this node owns.
+                let carried = !keys.is_empty();
                 let keys = self.owned_keys(keys);
+                if self.not_a_replica_of(txn, carried, &keys) {
+                    return out;
+                }
                 let events = self.owned_events(events);
                 let vote = self
                     .replica
@@ -2191,7 +2195,11 @@ impl Node {
             } => {
                 // A slow-path `execute_at` can exceed `t0`; witness it too.
                 self.clock.witness(execute_at);
+                let carried = !keys.is_empty();
                 let keys = self.owned_keys(keys);
+                if self.not_a_replica_of(txn, carried, &keys) {
+                    return out;
+                }
                 let reply = self
                     .replica
                     .lock()
@@ -2225,7 +2233,11 @@ impl Node {
                 // replica that missed PreAccept still indexes this transaction
                 // in its conflict graph. The owned filters stay as defense
                 // against a stale-epoch coordinator's view of ownership.
+                let carried = !keys.is_empty();
                 let keys = self.owned_keys(keys);
+                if self.not_a_replica_of(txn, carried, &keys) {
+                    return out;
+                }
                 let events = self.owned_events(events);
                 self.replica
                     .lock()
@@ -3045,6 +3057,25 @@ impl Node {
                 false
             }
         }
+    }
+
+    /// Whether this node is no replica of the shard a PreAccept, Accept or
+    /// Commit addressed it as: the message `carried` keys, it owns none of
+    /// them (`owned`) under the layout it installed, and it holds nothing of
+    /// `txn`. A coordinator that planned on an older layout must not count
+    /// it, so it casts no vote, answers nothing and records nothing — before,
+    /// it recorded an empty command and voted `t0` with no dependencies, a
+    /// vote that could complete a quorum of replicas none of which hold the
+    /// transaction's keys. A transaction it already holds, witnessed while it
+    /// owned them, is finished as before; one below the redundancy watermark
+    /// is answered as before (it records nothing, and a decision record
+    /// answers a Commit).
+    fn not_a_replica_of(&self, txn: TxnId, carried: bool, owned: &[Key]) -> bool {
+        if !carried || !owned.is_empty() {
+            return false;
+        }
+        let replica = self.replica.lock().expect("replica poisoned");
+        replica.status(txn).is_none() && !replica.compacted(txn)
     }
 
     /// Keeps `route` (when the message came routed) as `txn`'s route, staging
@@ -3969,7 +4000,7 @@ impl Node {
         for plan in &plans {
             let heard = known
                 .iter()
-                .filter(|(from, _)| self.topology.node_shard(*from) == Some(plan.shard))
+                .filter(|(from, _)| plan.replicas.contains(from))
                 .count();
             if heard < plan.slow_q {
                 anyhow::bail!("recovery quorum not reached for shard {}", plan.shard);
@@ -4043,6 +4074,19 @@ impl Node {
             .cloned()
             .collect();
         let (plans, _union) = self.plan(&planned_keys, &all_events);
+        // One attempt, one layout: an epoch installed since the reports were
+        // gathered may have moved replicas between shards, and the reports
+        // were counted for the shards they were planned in. The sweep
+        // retries under the new layout.
+        let moved = plans.iter().any(|p| {
+            shards
+                .iter()
+                .find(|s| s.shard == p.shard)
+                .is_none_or(|s| s.replicas != p.replicas)
+        });
+        if moved {
+            anyhow::bail!("the layout changed while recovering {txn:?}; retrying");
+        }
         let known: Vec<(NodeId, RecoverFields)> = resp
             .into_iter()
             .filter_map(|(from, r)| match r {
@@ -4053,10 +4097,7 @@ impl Node {
             // (see `execute`).
             .filter(|(from, f)| {
                 f.status == Status::Applied
-                    || self
-                        .topology
-                        .node_shard(*from)
-                        .is_some_and(|shard| planned.contains(&shard))
+                    || Self::planned_shard(&plans, *from).is_some_and(|s| planned.contains(&s))
             })
             .collect();
         self.drive_recovery(rx, txn, ballot, &plans, Some(route), known)
@@ -4092,12 +4133,13 @@ impl Node {
         resp
     }
 
-    /// One route shard's reports, counted by kind.
-    fn shard_reports(&self, shard: ShardId, resp: &[(NodeId, RecoverResp)]) -> ShardReports {
+    /// One route shard's reports, counted by kind — from the replicas the
+    /// recovery planned for it (see [`planned_shard`](Self::planned_shard)).
+    fn shard_reports(shard: &ShardPlan, resp: &[(NodeId, RecoverResp)]) -> ShardReports {
         let mut counts = ShardReports::default();
         for (_, report) in resp
             .iter()
-            .filter(|(from, _)| self.topology.node_shard(*from) == Some(shard))
+            .filter(|(from, _)| shard.replicas.contains(from))
         {
             counts.heard += 1;
             match report {
@@ -4127,13 +4169,13 @@ impl Node {
         if known().any(RecoverFields::invalidated)
             || shards
                 .iter()
-                .any(|s| self.shard_reports(s.shard, resp).blind >= s.slow_q)
+                .any(|s| Self::shard_reports(s, resp).blind >= s.slow_q)
         {
             return true;
         }
         let counts: Vec<ShardReports> = shards
             .iter()
-            .map(|s| self.shard_reports(s.shard, resp))
+            .map(|s| Self::shard_reports(s, resp))
             .collect();
         let await_applied = counts.iter().any(|c| c.redundant > 0)
             && known().any(|f| f.status >= Status::Committed)
@@ -4182,7 +4224,7 @@ impl Node {
         }
         let counts: Vec<(&ShardPlan, ShardReports)> = shards
             .iter()
-            .map(|s| (s, self.shard_reports(s.shard, resp)))
+            .map(|s| (s, Self::shard_reports(s, resp)))
             .collect();
         if counts.iter().any(|(s, c)| c.blind >= s.slow_q) {
             return Verdict::Invalidate;
@@ -4344,7 +4386,7 @@ impl Node {
         let mut shard_deps: HashMap<ShardId, BTreeSet<TxnId>> =
             plans.iter().map(|p| (p.shard, BTreeSet::new())).collect();
         for (from, f) in &known {
-            if let Some(shard) = self.topology.node_shard(*from) {
+            if let Some(shard) = Self::planned_shard(plans, *from) {
                 if let Some(set) = shard_deps.get_mut(&shard) {
                     set.extend(f.deps.iter().copied());
                 }
@@ -5990,7 +6032,7 @@ impl Node {
             match tokio::time::timeout_at(deadline, rx.recv()).await {
                 Ok(Some((from, msg))) => {
                     if let Some(item) = extract(msg) {
-                        if let Some(shard) = self.topology.node_shard(from) {
+                        if let Some(shard) = Self::planned_shard(plans, from) {
                             if let Some(bucket) = got.get_mut(&shard) {
                                 if seen.insert(from) {
                                     bucket.push((from, item));
@@ -6005,8 +6047,20 @@ impl Node {
         got
     }
 
-    /// Collects matching responses grouped by the responder's shard, stopping
-    /// once every planned shard has `target(plan)` items (or at the deadline).
+    /// The shard `node` was planned in, if any: replies are counted for the
+    /// shard the coordination planned their sender in, never by the layout
+    /// installed when they land — an epoch installed meanwhile may have
+    /// moved the sender, and the quorums are the plan's.
+    fn planned_shard(plans: &[ShardPlan], node: NodeId) -> Option<ShardId> {
+        plans
+            .iter()
+            .find(|p| p.replicas.contains(&node))
+            .map(|p| p.shard)
+    }
+
+    /// Collects matching responses grouped by the responder's planned shard
+    /// (see [`planned_shard`](Self::planned_shard)), stopping once every
+    /// planned shard has `target(plan)` items (or at the deadline).
     async fn collect_by_shard<T>(
         &self,
         rx: &mut mpsc::UnboundedReceiver<(NodeId, Message)>,
@@ -6027,7 +6081,7 @@ impl Node {
             match tokio::time::timeout_at(deadline, rx.recv()).await {
                 Ok(Some((from, msg))) => {
                     if let Some(item) = extract(msg) {
-                        if let Some(shard) = self.topology.node_shard(from) {
+                        if let Some(shard) = Self::planned_shard(plans, from) {
                             if let Some(bucket) = got.get_mut(&shard) {
                                 if seen.insert(from) {
                                     bucket.push(item);
@@ -6860,5 +6914,281 @@ mod tests {
             }
             other => panic!("a restarted acceptor must reject a stale ballot: {other:?}"),
         }
+    }
+
+    /// A node over a `DynamicTopology` at epoch 0 — shards `{0, 1, 2}` and
+    /// `{3, 4, 5}` — and events whose aggregates land in both shards.
+    fn reshardable_node() -> (Node, Arc<crate::api::DynamicTopology>, Vec<Event>) {
+        let id = NodeId(0);
+        let topology = Arc::new(crate::api::DynamicTopology::new(
+            id,
+            0,
+            vec![(0..3).map(NodeId).collect(), (3..6).map(NodeId).collect()],
+        ));
+        let net = InMemoryNetwork::new();
+        let node = Node::new(
+            id,
+            Arc::clone(&topology) as Arc<dyn Topology>,
+            Arc::new(HybridLogicalClock::new(id)),
+            Arc::new(net.sink(id)) as Arc<dyn MessageSink>,
+            Arc::new(InMemoryDataStore::new()) as Arc<dyn DataStore>,
+            Arc::new(InMemoryJournal::new()) as Arc<dyn Journal>,
+        );
+        let events: Vec<Event> = (0..8)
+            .map(|i| Event {
+                id: ulid::Ulid::generate(),
+                aggregate_type: "test/Account".into(),
+                aggregate_id: format!("acc{i}"),
+                version: 1,
+                name: "Bumped".into(),
+                ..Default::default()
+            })
+            .collect();
+        assert!(
+            (0..2).all(|s| events.iter().any(|e| topology.shard_of(&Key::of(e)) == s)),
+            "test aggregates must span both shards"
+        );
+        (node, topology, events)
+    }
+
+    /// The epoch-1 layout: nodes 2 and 3 swap shards.
+    fn swapped() -> Vec<Vec<NodeId>> {
+        vec![
+            vec![NodeId(0), NodeId(1), NodeId(3)],
+            vec![NodeId(2), NodeId(4), NodeId(5)],
+        ]
+    }
+
+    /// Replies are counted for the shard the coordinator **planned** their
+    /// sender in, even when a layout installed meanwhile moved the sender to
+    /// another shard: the quorums are the plan's.
+    #[tokio::test]
+    async fn replies_are_counted_by_the_plan_not_the_live_layout() {
+        use std::collections::HashSet;
+        use tokio::time::{Duration, Instant};
+
+        let (node, topology, events) = reshardable_node();
+        let keys = Node::keys_of(&events);
+        let (plans, _) = node.plan(&keys, &events);
+        let planned = |n: u64| {
+            plans
+                .iter()
+                .find(|p| p.replicas.contains(&NodeId(n)))
+                .expect("planned")
+                .shard
+        };
+        let (shard_of_2, shard_of_3) = (planned(2), planned(3));
+        topology.install(1, swapped());
+
+        let watermark = |micros: u64| Message::Watermark {
+            applied_through: Timestamp {
+                micros,
+                logical: 0,
+                node: NodeId(micros),
+            },
+        };
+        let micros_of = |m: Message| match m {
+            Message::Watermark { applied_through } => Some(applied_through.micros),
+            _ => None,
+        };
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        for n in [2, 3] {
+            tx.send((NodeId(n), watermark(n))).unwrap();
+        }
+        drop(tx);
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let tagged = node
+            .collect_by_shard_tagged(
+                &mut rx,
+                &plans,
+                |_, _| false,
+                deadline,
+                HashSet::new(),
+                micros_of,
+            )
+            .await;
+        let responders = |shard| {
+            tagged[&shard]
+                .iter()
+                .map(|(from, _)| *from)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(responders(shard_of_2), vec![NodeId(2)]);
+        assert_eq!(responders(shard_of_3), vec![NodeId(3)]);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        for n in [2, 3] {
+            tx.send((NodeId(n), watermark(n))).unwrap();
+        }
+        drop(tx);
+        let counted = node
+            .collect_by_shard(&mut rx, &plans, |_| usize::MAX, deadline, micros_of)
+            .await;
+        assert_eq!(counted[&shard_of_2], vec![2]);
+        assert_eq!(counted[&shard_of_3], vec![3]);
+    }
+
+    /// A routed recovery attributes each report to the shard it planned:
+    /// two of shard B's planned replicas never witnessed the transaction,
+    /// so it never committed — even though a layout installed meanwhile
+    /// moved one of them to shard A.
+    #[tokio::test]
+    async fn routed_recovery_counts_reports_by_the_plan_not_the_live_layout() {
+        use super::{RecoverFields, RecoverResp, Verdict};
+        use crate::clock::Ballot;
+        use crate::message::Status;
+
+        let (node, topology, events) = reshardable_node();
+        let keys = Node::keys_of(&events);
+        let (plans, _) = node.plan(&keys, &[]);
+        topology.install(1, swapped());
+
+        let held = || {
+            RecoverResp::Ok(RecoverFields {
+                known: true,
+                status: Status::PreAccepted,
+                accepted: Ballot(Timestamp::MIN),
+                execute_at: Timestamp::MIN,
+                deps: Vec::new(),
+                superseding_rejects: false,
+                wait: false,
+                keys: Vec::new(),
+                events: Vec::new(),
+                route: None,
+            })
+        };
+        let blind = || RecoverResp::NotWitnessed { redundant: false };
+        let resp = vec![
+            (NodeId(0), held()),
+            (NodeId(1), held()),
+            (NodeId(3), blind()),
+            (NodeId(4), blind()),
+        ];
+        assert!(node.route_settled(&plans, &resp));
+        assert!(
+            matches!(node.route_verdict(&plans, &resp), Verdict::Invalidate),
+            "a slow quorum of the planned shard never witnessed it"
+        );
+    }
+
+    /// A replica that holds nothing of a transaction and, under the layout
+    /// it installed, owns none of the keys a message carries is not that
+    /// shard's replica any more: it casts no vote, answers nothing and
+    /// records nothing — a stale-epoch coordinator must not count it.
+    #[tokio::test]
+    async fn a_replica_that_owns_none_of_the_keys_casts_no_vote() {
+        use crate::clock::Ballot;
+
+        let (node, topology, events) = reshardable_node();
+        let event = events
+            .iter()
+            .find(|e| topology.owns(NodeId(0), &Key::of(e)))
+            .expect("an event node 0 owns")
+            .clone();
+        let key = Key::of(&event);
+        // Epoch 1: node 0 moves to the other shard.
+        topology.install(
+            1,
+            vec![
+                vec![NodeId(3), NodeId(1), NodeId(2)],
+                vec![NodeId(0), NodeId(4), NodeId(5)],
+            ],
+        );
+        assert!(!topology.owns(NodeId(0), &key));
+
+        let txn = TxnId(Timestamp {
+            micros: 1_000,
+            logical: 0,
+            node: NodeId(9),
+        });
+        let messages = [
+            Message::PreAccept {
+                txn,
+                keys: vec![key.clone()],
+                events: vec![event.clone()],
+            },
+            Message::Accept {
+                txn,
+                ballot: Ballot(txn.0),
+                execute_at: txn.0,
+                deps: Vec::new(),
+                keys: vec![key.clone()],
+            },
+            Message::Commit {
+                txn,
+                execute_at: txn.0,
+                deps: Vec::new(),
+                keys: vec![key.clone()],
+                events: vec![event.clone()],
+                reply_to: NodeId(9),
+            },
+        ];
+        for message in messages {
+            let out = node
+                .handle_staged(Envelope {
+                    from: NodeId(9),
+                    message,
+                })
+                .await;
+            assert!(out.is_empty(), "no vote and no answer: {out:?}");
+            assert_eq!(node.command_status(txn), None, "nothing recorded");
+        }
+    }
+
+    /// A replica that witnessed a transaction while it owned its keys still
+    /// finishes it after a layout moved them away: the guard against stale
+    /// coordinators applies only to transactions it holds nothing of.
+    #[tokio::test]
+    async fn an_old_owner_still_finishes_a_transaction_it_holds() {
+        use crate::clock::Ballot;
+
+        let (node, topology, events) = reshardable_node();
+        let event = events
+            .iter()
+            .find(|e| topology.owns(NodeId(0), &Key::of(e)))
+            .expect("an event node 0 owns")
+            .clone();
+        let key = Key::of(&event);
+        let txn = TxnId(Timestamp {
+            micros: 1_000,
+            logical: 0,
+            node: NodeId(9),
+        });
+        let out = node
+            .handle_staged(Envelope {
+                from: NodeId(9),
+                message: Message::PreAccept {
+                    txn,
+                    keys: vec![key.clone()],
+                    events: vec![event.clone()],
+                },
+            })
+            .await;
+        assert!(matches!(out.as_slice(), [(_, Message::PreAcceptOk { .. })]));
+
+        topology.install(
+            1,
+            vec![
+                vec![NodeId(3), NodeId(1), NodeId(2)],
+                vec![NodeId(0), NodeId(4), NodeId(5)],
+            ],
+        );
+        let out = node
+            .handle_staged(Envelope {
+                from: NodeId(9),
+                message: Message::Accept {
+                    txn,
+                    ballot: Ballot(txn.0),
+                    execute_at: txn.0,
+                    deps: Vec::new(),
+                    keys: vec![key.clone()],
+                },
+            })
+            .await;
+        assert!(
+            matches!(out.as_slice(), [(_, Message::AcceptOk { .. })]),
+            "{out:?}"
+        );
     }
 }
