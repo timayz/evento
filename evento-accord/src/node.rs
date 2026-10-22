@@ -28,8 +28,8 @@ use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant};
 
 use crate::api::{
-    floor_millis, snapshot_event_size, stamp_events, validate_layout, AcceptorRecord,
-    AmnesiaFence, DataStore, Journal, MessageSink, ShardId, Topology,
+    floor_millis, snapshot_event_size, stamp_events, validate_layout, AcceptorRecord, AmnesiaFence,
+    DataStore, Journal, MessageSink, ShardId, Topology,
 };
 use crate::clock::{Ballot, Clock, HybridLogicalClock, NodeId, Timestamp, TxnId};
 use crate::failure_detector::FailureDetector;
@@ -431,6 +431,17 @@ struct PendingProof<'a> {
 }
 
 impl PendingProof<'_> {
+    /// The vouch the contact sent, if one arrived yet, leaving it in place.
+    fn peek(&self) -> Option<Vouch> {
+        self.node
+            .proof_pending
+            .lock()
+            .expect("proof poisoned")
+            .get(&self.id)
+            .copied()
+            .flatten()
+    }
+
     /// The vouch the contact sent, if any arrived.
     fn take(self) -> Option<Vouch> {
         self.node
@@ -578,10 +589,16 @@ impl RecoverFields {
 }
 
 /// A response to a `Recover`: a report, a "never witnessed" (routed recovery
-/// only), or a ballot rejection.
+/// only), a replica that lost its journal ([`Message::Amnesiac`]), or a
+/// ballot rejection.
 enum RecoverResp {
     Ok(RecoverFields),
-    NotWitnessed { redundant: bool },
+    NotWitnessed {
+        redundant: bool,
+    },
+    /// The replica holds nothing of it, may have voted for it before it lost
+    /// its journal, and never votes for it again.
+    Amnesiac,
     Nack(Ballot),
 }
 
@@ -1166,6 +1183,33 @@ impl Node {
         }
     }
 
+    /// Whether `txn` is dated more than two clock skews past this node's
+    /// clock — its coordinator's clock runs beyond the skew bound — so this
+    /// node casts no vote and makes no promise for it (counted). Every
+    /// honest `t0` is within the bound: a coordinator's clock reads at most
+    /// one skew past its wall clock, which is within one skew of this one's.
+    /// The bound is what lets a node that lost its journal fence everything
+    /// it ever voted on (#312, [`AmnesiaFence`]): its votes all lie below its
+    /// clock's reading at the time plus two skews, and the reading below its
+    /// wall clock plus one.
+    fn future_dated(&self, txn: TxnId) -> bool {
+        let horizon = self
+            .clock
+            .reading_micros()
+            .saturating_add(self.clock.max_skew_micros().saturating_mul(2));
+        if txn.0.micros <= horizon {
+            return false;
+        }
+        self.metrics.record_vote_future_dated();
+        tracing::debug!(
+            node = self.id.0,
+            ?txn,
+            horizon,
+            "refusing a vote for a transaction dated past the clock-skew bound"
+        );
+        true
+    }
+
     /// A point-in-time snapshot of this node's observability counters.
     pub fn metrics(&self) -> MetricsSnapshot {
         self.metrics.snapshot()
@@ -1267,6 +1311,17 @@ impl Node {
     /// replays committed, applied transactions into the data store. Call once on
     /// startup before [`start`](Node::start). In-flight (unapplied) transactions
     /// resume via the recovery sweep.
+    ///
+    /// Over a journal that holds nothing at all, the node is a fresh replica
+    /// — unless its data store holds events: then the journal that went with
+    /// them was lost, and the node, which forgot what it voted, is refused
+    /// with [`LostJournal`]; it must come back by joining (#312,
+    /// [`recover_state_for_join`](Self::recover_state_for_join)). A cluster
+    /// of this node alone holds nobody's votes but its own, and reopens over
+    /// its store. A fresh replica's first open leaves its clock bound in the
+    /// journal, so the journal is never empty again while the store holds
+    /// what the node applied. A node whose join after a lost journal never
+    /// completed is refused too (`LostJournal { join_pending: true }`).
     pub async fn recover_state(&self) -> anyhow::Result<()> {
         let commands = self.restore_journal(false).await?;
         // Replay the retained (post-truncation) applied tail into the data store.
@@ -1326,6 +1381,17 @@ impl Node {
     /// dropped); otherwise it is applied again once the join completes. Call
     /// once, before [`begin_join`](Self::begin_join) and
     /// [`start`](Self::start).
+    ///
+    /// Over a journal that holds nothing at all — a lost journal, or a new
+    /// member's — the node forgot (or never cast) the votes, promises and
+    /// reports it made. It sets an [`AmnesiaFence`] above all of them (#312):
+    /// its wall clock plus three clock skews, journaled before anything else
+    /// (a journal that cannot keep it is refused), with its clock floored
+    /// past every id it can have minted. Its [`join`](Self::join) then waits
+    /// for a contact that vouches past the fence — every write that committed
+    /// below it is in that contact's state, and none that did not can commit
+    /// any more — and it abstains from config Paxos for good. It begins the
+    /// join itself.
     pub async fn recover_state_for_join(&self) -> anyhow::Result<()> {
         self.restore_journal(true).await.map(|_| ())
     }
@@ -1338,28 +1404,67 @@ impl Node {
     /// but un-applied.
     async fn restore_journal(&self, joining: bool) -> anyhow::Result<Vec<CommandState>> {
         let watermark = self.journal.load_watermark().await?;
-        self.journal_mark
-            .lock()
-            .expect("journal mark poisoned")
-            .persisted = watermark.unwrap_or(Timestamp::MIN);
         let mut commands = self.journal.load_all().await?;
         commands.sort_by_key(|cmd| (cmd.execute_at, cmd.txn));
         let routes = self.journal.load_routes().await?;
         let promises = self.journal.load_promises().await?;
         let decisions = self.journal.load_decisions().await?;
-        self.restore_clock(&commands).await?;
+        let clock_bound = self.journal.load_clock_bound().await?;
+        let acceptors = self.journal.load_acceptors().await?;
+        let metadata = self.journal.load_metadata().await?;
+        let bounds = self.journal.load_rejoin_bounds().await?;
+        let fence = self.journal.load_amnesia_fence().await?;
+        // Nothing durable at all: the node never voted, promised, reported
+        // or minted anything under this journal — a new member's, or a
+        // replacement for one that was lost.
+        let pristine = watermark.is_none()
+            && commands.is_empty()
+            && routes.is_empty()
+            && promises.is_empty()
+            && decisions.is_empty()
+            && clock_bound.is_none()
+            && acceptors.is_empty()
+            && metadata.is_empty()
+            && bounds.is_empty()
+            && fence.is_none();
+        let fence = match fence {
+            Some(fence) if !fence.joined && !joining => {
+                return Err(LostJournal { join_pending: true }.into());
+            }
+            Some(fence) => Some(fence),
+            None if pristine && joining => Some(self.set_amnesia_fence().await?),
+            None if pristine => {
+                self.open_over_an_empty_journal().await?;
+                None
+            }
+            None => None,
+        };
+        *self.amnesia.lock().expect("amnesia poisoned") = fence;
+        if let Some(fence) = fence {
+            self.floor_votes_at(fence);
+            if !fence.joined {
+                // Its join waits for a contact that vouches past the fence;
+                // until then the node takes no part (see
+                // `recover_state_for_join`).
+                self.begin_join();
+            }
+        }
+        self.journal_mark
+            .lock()
+            .expect("journal mark poisoned")
+            .persisted = watermark.unwrap_or(Timestamp::MIN);
+        self.restore_clock(&commands, clock_bound).await?;
 
         // Restore the control plane: acceptor state (so a restarted acceptor keeps
         // its promised ballots — Paxos crash-safety) and the metadata log (so the
         // node re-installs the contiguous topology prefix it had decided).
         {
-            let acceptors = self.journal.load_acceptors().await?;
             let mut config = self.config.lock().expect("config poisoned");
             for (epoch, record) in acceptors {
                 config.insert(epoch, ConfigAcceptor::from_record(record));
             }
         }
-        for (epoch, layout) in self.journal.load_metadata().await? {
+        for (epoch, layout) in metadata {
             self.meta_log
                 .lock()
                 .expect("meta_log poisoned")
@@ -1405,7 +1510,6 @@ impl Node {
         }
         // Peers this node had stopped waiting for stay excluded until they
         // report above what was compacted past them (or rejoin).
-        let bounds = self.journal.load_rejoin_bounds().await?;
         if !bounds.is_empty() {
             let mut absent = self.absent.lock().expect("absent poisoned");
             for (peer, bound) in bounds {
@@ -2180,12 +2284,15 @@ impl Node {
             return Screen::Pass;
         };
         let behind = match message {
-            // A join is how a peer behind its bound gets back: always served.
+            // A join is how a peer behind its bound gets back: always served
+            // — and the decided epochs it may need first, for a vouch to
+            // count under the epoch it installed.
             Message::SyncRequest { snapshot: true, .. }
             | Message::JoinHeaderRequest { .. }
             | Message::CommandPageRequest { .. }
             | Message::SnapshotRequest { .. }
             | Message::SnapshotPageRequest { .. }
+            | Message::MetadataFetch { .. }
             | Message::JoinKeepalive => return Screen::Pass,
             // Its recovery of a transaction it alone holds gathers the vote
             // fences that let it invalidate one no one else can commit (see
@@ -2363,6 +2470,14 @@ impl Node {
                 | Message::ReadProbeOk { .. }
         );
         if !control {
+            // A node joining over a lost journal answers a recovery of a
+            // transaction below its fence at once: it holds nothing of it,
+            // and never votes for it (see `Message::Amnesiac`). Silence
+            // would leave a transaction only it could rule out undecided —
+            // and the contact's report, which the join waits on, below it.
+            if let Some(answer) = self.amnesiac_answer(&env.message) {
+                return vec![(env.from, answer)];
+            }
             // Flag check and push under one lock: `join` flips the flag and
             // drains the buffer while holding it, so a message can never slip
             // into the buffer after the drain (it would be lost forever).
@@ -2407,6 +2522,9 @@ impl Node {
         }
         match message {
             Message::PreAccept { txn, keys, events } => {
+                if self.future_dated(txn) {
+                    return out;
+                }
                 // Only handle the keys/events this node owns.
                 let carried = !keys.is_empty();
                 let keys = self.owned_keys(keys);
@@ -2451,6 +2569,9 @@ impl Node {
                 deps,
                 keys,
             } => {
+                if self.future_dated(txn) {
+                    return out;
+                }
                 // A slow-path `execute_at` can exceed `t0`; witness it too.
                 self.clock.witness(execute_at);
                 let carried = !keys.is_empty();
@@ -2564,6 +2685,9 @@ impl Node {
             // but a replica that never witnessed the transaction still
             // remembers the promise.
             Message::Recover { txn, ballot } => {
+                if self.future_dated(txn) {
+                    return out;
+                }
                 let reply = self.replica.lock().expect("replica poisoned").recover(
                     txn,
                     ballot,
@@ -2598,6 +2722,9 @@ impl Node {
                 keys,
                 events,
             } => {
+                if self.future_dated(txn) {
+                    return out;
+                }
                 let keys = self.owned_keys(keys);
                 let events = self.owned_events(events);
                 let fence = self.vote_fence();
@@ -2915,6 +3042,9 @@ impl Node {
             }
             // Config Paxos — acceptor side.
             Message::ConfigPrepare { epoch, ballot } => {
+                if self.abstains_from_config() {
+                    return out;
+                }
                 let (reply, record) = {
                     let mut config = self.config.lock().expect("config poisoned");
                     let acc = config.entry(epoch).or_default();
@@ -2959,6 +3089,9 @@ impl Node {
                 ballot,
                 layout,
             } => {
+                if self.abstains_from_config() {
+                    return out;
+                }
                 // Never vote for a layout that would break the cluster, so a
                 // majority of current nodes can never choose one (an older
                 // proposer validates nothing).
@@ -4203,6 +4336,7 @@ impl Node {
                 redundant,
                 ..
             } if b == ballot => Some(RecoverResp::NotWitnessed { redundant }),
+            Message::Amnesiac { ballot: b, .. } if b == ballot => Some(RecoverResp::Amnesiac),
             Message::Nack { promised, .. } => Some(RecoverResp::Nack(promised)),
             _ => None,
         }
@@ -4456,8 +4590,21 @@ impl Node {
     ///   replica fencing its votes, so it needs
     ///   [`NodeConfig::fence_invalidation`].
     ///
-    /// A report of the transaction committed anywhere rules both out: a
-    /// decision exists.
+    /// - **A replica that lost its journal answered, and no replica compacted
+    ///   past it** (#312, [`Message::Amnesiac`]): that replica may have
+    ///   voted for the transaction before the loss, but never votes for it
+    ///   again, nor does a fenced one. Counting every replica not heard from
+    ///   as one that may have voted, and may vote: if too few may have
+    ///   accepted it for a slow commit, too few of the electorate may have
+    ///   pre-accepted it for a fast one, and too few replicas are left that
+    ///   could vote for it, it never committed and never will. A holder that
+    ///   accepted it may hold half a decision, so it counts among those that
+    ///   accepted; one that only pre-accepted it promised this recovery's
+    ///   ballot, so the original coordinator can no longer complete an
+    ///   accept there. Needs [`NodeConfig::fence_invalidation`] too.
+    ///
+    /// A report of the transaction committed anywhere rules all of them out:
+    /// a decision exists.
     fn never_commits(&self, plans: &[ShardPlan], resp: &[(NodeId, RecoverResp)]) -> bool {
         if resp.iter().any(
             |(_, r)| matches!(r, RecoverResp::Ok(f) if f.known && f.status >= Status::Committed),
@@ -4466,20 +4613,46 @@ impl Node {
         }
         plans.iter().any(|plan| {
             let (mut fenced, mut redundant, mut holders) = (0, 0, 0);
+            let (mut accepted, mut amnesiac) = (0, 0);
+            // The same, among the fast-path electorate.
+            let (mut answered_e, mut holders_e, mut amnesiac_e) = (0, 0, 0);
             for (from, report) in resp {
                 if !plan.replicas.contains(from) {
                     continue;
                 }
+                let elector = plan.electorate.contains(from);
                 match report {
                     RecoverResp::NotWitnessed { redundant: false } => fenced += 1,
                     RecoverResp::NotWitnessed { redundant: true } => redundant += 1,
-                    RecoverResp::Ok(f) if f.known => holders += 1,
-                    _ => {}
+                    RecoverResp::Ok(f) if f.known => {
+                        holders += 1;
+                        holders_e += usize::from(elector);
+                        accepted += usize::from(f.status >= Status::Accepted);
+                    }
+                    RecoverResp::Amnesiac => {
+                        amnesiac += 1;
+                        amnesiac_e += usize::from(elector);
+                    }
+                    _ => continue,
                 }
+                answered_e += usize::from(elector);
             }
             let spare = plan.replicas.len() - plan.slow_q;
+            // Not heard from, or no answer that says anything of it: may
+            // have voted, may vote.
+            let silent = plan
+                .replicas
+                .len()
+                .saturating_sub(fenced + redundant + holders + amnesiac);
+            let silent_e = plan.electorate.len().saturating_sub(answered_e);
+            let amnesia_rules_it_out = amnesiac > 0
+                && redundant == 0
+                && accepted + amnesiac + silent < plan.slow_q
+                && holders_e + amnesiac_e + silent_e < plan.fast_q
+                && holders + silent < plan.slow_q;
             fenced > spare
                 || (self.settings.fence_invalidation && redundant > 0 && fenced + holders > spare)
+                || (self.settings.fence_invalidation && amnesia_rules_it_out)
         })
     }
 
@@ -5072,6 +5245,9 @@ impl Node {
     /// Coordinating the epoch change across the cluster (rather than each node
     /// installing an agreed layout) remains future work.
     pub async fn join(&self, contact: NodeId) -> anyhow::Result<usize> {
+        if let Some(fence) = self.pending_fence() {
+            self.await_report_past(contact, fence).await?;
+        }
         let imported = self
             .keeping_join_hold(
                 contact,
@@ -5100,6 +5276,15 @@ impl Node {
             return Err(self.partial(err, &imported));
         }
         self.note_journal_watermark(floor);
+        // Joined past the fence: from here on the node is an ordinary
+        // replica, and a restart opens it plainly. The imports are only
+        // staged; durable first, so a plain restart never comes back without
+        // what the join brought in.
+        if self.pending_fence().is_some() {
+            if let Err(err) = self.mark_joined().await {
+                return Err(self.partial(err, &imported));
+            }
+        }
         tracing::info!(
             node = self.id.0,
             contact = contact.0,
@@ -5160,6 +5345,141 @@ impl Node {
     /// a page request, and a step slower than that (a slow disk, a large
     /// page) would otherwise let peers compact past what it vouched for —
     /// and send this node back to rejoin when it reports.
+    /// The [`Message::Amnesiac`] answer of a node joining over a lost
+    /// journal to `message`, a recovery of a transaction below its fence;
+    /// `None` for anything else, which the join buffers as usual.
+    fn amnesiac_answer(&self, message: &Message) -> Option<Message> {
+        let fence = self.pending_fence()?;
+        let recovery = match message {
+            Message::Routed { inner, .. } => inner.as_ref(),
+            message => message,
+        };
+        match *recovery {
+            Message::BeginRecovery { txn, ballot, .. } if txn.0 < fence => {
+                Some(Message::Amnesiac { txn, ballot })
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether this node lost a journal under its node id (#312): it forgot
+    /// the config-Paxos promises and accepts it made, which no fence in time
+    /// bounds (an epoch's proposals may span any time), so it never promises
+    /// or accepts again — counted. It still learns decided epochs; config
+    /// changes need a majority of the other acceptors.
+    fn abstains_from_config(&self) -> bool {
+        if self.amnesia.lock().expect("amnesia poisoned").is_none() {
+            return false;
+        }
+        self.metrics.record_config_vote_withheld();
+        true
+    }
+
+    /// Raises the replica's vote fence to `fence`, for good: a node that
+    /// lost its journal never votes for a transaction below it that it does
+    /// not hold (#312) — it may have voted for it before, and once joined,
+    /// anything below it that committed is in its store. It answers such a
+    /// recovery "never witnessed": one that can still commit is held here.
+    fn floor_votes_at(&self, fence: AmnesiaFence) {
+        self.replica
+            .lock()
+            .expect("replica poisoned")
+            .set_vote_fence(Timestamp {
+                micros: fence.fence_micros,
+                logical: 0,
+                node: NodeId(0),
+            });
+    }
+
+    /// This node's amnesia fence while its join is pending (#312): a
+    /// contact must vouch at or above it before the join installs anything.
+    fn pending_fence(&self) -> Option<Timestamp> {
+        self.amnesia
+            .lock()
+            .expect("amnesia poisoned")
+            .filter(|fence| !fence.joined)
+            .map(|fence| Timestamp {
+                micros: fence.fence_micros,
+                logical: 0,
+                node: NodeId(0),
+            })
+    }
+
+    /// Waits, for at most [`NodeConfig::amnesia_join_timeout`], until
+    /// `contact`'s own watermark report (gossiped to every node, and heard
+    /// while joining) reaches `fence`: only then is its join header asked
+    /// for, since the header installs a [`JoinHold`] that would pin the
+    /// contact's report at an earlier vouch. A keepalive wakes a contact
+    /// whose group is closed; under a topology that changes, the contact's
+    /// decided epochs are fetched meanwhile, since a vouch counts only under
+    /// the epoch this node has installed.
+    async fn await_report_past(&self, contact: NodeId, fence: Timestamp) -> anyhow::Result<()> {
+        let deadline = Instant::now() + self.settings.amnesia_join_timeout;
+        let mut reported = None;
+        loop {
+            reported = self
+                .peer_watermarks
+                .lock()
+                .expect("watermarks poisoned")
+                .get(&contact)
+                .copied()
+                .or(reported);
+            if reported.is_some_and(|report| report >= fence) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                self.metrics.record_amnesia_join_refused();
+                return Err(FenceNotCovered {
+                    fence,
+                    vouched: reported,
+                }
+                .into());
+            }
+            self.send(contact, Message::JoinKeepalive).await;
+            if self.topology.dynamic() {
+                self.send(
+                    contact,
+                    Message::MetadataFetch {
+                        after_epoch: self.installed_epoch(),
+                    },
+                )
+                .await;
+            }
+            tokio::time::sleep(self.settings.recovery_interval).await;
+        }
+    }
+
+    /// Records this node's join past its amnesia fence: the journal flushed
+    /// first, so everything the join staged survives the plain restart the
+    /// record allows.
+    async fn mark_joined(&self) -> anyhow::Result<()> {
+        let fence = self
+            .amnesia
+            .lock()
+            .expect("amnesia poisoned")
+            .map(|fence| AmnesiaFence {
+                joined: true,
+                ..fence
+            });
+        let Some(fence) = fence else {
+            return Ok(());
+        };
+        self.journal.flush().await?;
+        self.metrics.record_flush();
+        self.journal
+            .save_amnesia_fence(&fence)
+            .await
+            .map_err(|err| err.context("cannot record the join past the amnesia fence"))?;
+        *self.amnesia.lock().expect("amnesia poisoned") = Some(fence);
+        self.floor_votes_at(fence);
+        tracing::info!(
+            node = self.id.0,
+            fence = fence.fence_micros,
+            "joined past the amnesia fence"
+        );
+        Ok(())
+    }
+
     async fn keeping_join_hold<T>(
         &self,
         contact: NodeId,
@@ -5556,6 +5876,37 @@ impl Node {
                     }
                 }
                 commands.retain(|cmd| cmd.txn.0 >= watermark);
+            }
+            // A node that lost its journal installs nothing below a contact's
+            // vouch past its amnesia fence (#312): only then is every write
+            // that committed below the fence in the contact's state, and does
+            // none that did not stand a chance any more. The vouch follows the
+            // header on the same link, so it is here by now.
+            if let Some(fence) = self.pending_fence() {
+                let vouch = proof_slot.as_ref().and_then(PendingProof::peek);
+                let covered = vouch.is_some_and(|(epoch, vouched)| {
+                    epoch == self.topology.epoch()
+                        && self.topology.node_shard(contact) == self.topology.node_shard(self.id)
+                        && vouched >= fence
+                });
+                if !covered {
+                    // Release the hold the header made the contact keep at
+                    // its vouch: this node's own report, until it joins, is
+                    // that it holds nothing.
+                    self.send(
+                        contact,
+                        Message::Watermark {
+                            applied_through: Timestamp::MIN,
+                        },
+                    )
+                    .await;
+                    self.metrics.record_amnesia_join_refused();
+                    return Err(FenceNotCovered {
+                        fence,
+                        vouched: vouch.map(|(_, vouched)| vouched),
+                    }
+                    .into());
+                }
             }
             // Install the materialised snapshot (the truncated prefix and
             // beyond) for owned keys under a synthetic, sub-watermark id —
@@ -6508,16 +6859,16 @@ impl Node {
     /// margins are sized for: that excess (at most one skew) is waited out.
     /// More means the wall clock stepped back; the clock then leads it until
     /// it catches up, as it would have without the restart.
-    async fn restore_clock(&self, commands: &[CommandState]) -> anyhow::Result<()> {
-        let bound = self
-            .journal
-            .load_clock_bound()
-            .await?
-            .map(|micros| Timestamp {
-                micros,
-                logical: 0,
-                node: self.id,
-            });
+    async fn restore_clock(
+        &self,
+        commands: &[CommandState],
+        bound: Option<u64>,
+    ) -> anyhow::Result<()> {
+        let bound = bound.map(|micros| Timestamp {
+            micros,
+            logical: 0,
+            node: self.id,
+        });
         let minted = commands
             .iter()
             .map(|cmd| cmd.txn.0)
@@ -6543,6 +6894,94 @@ impl Node {
             }
         }
         Ok(())
+    }
+
+    /// Sets the [`AmnesiaFence`] of a node opened joining over a journal
+    /// that holds nothing (#312): its wall clock plus three skews, above
+    /// every `t0` it can have voted on or promised before the loss (none
+    /// lies past its clock's reading plus two skews, see
+    /// [`future_dated`](Self::future_dated), and the reading leads its wall
+    /// clock by at most one) and every report it made (cut at its clock less
+    /// the compaction margin). Journaled before anything else, then read
+    /// back: a journal that cannot keep it would let a restart forget it.
+    /// Assumes the wall clock did not step back across the loss.
+    async fn set_amnesia_fence(&self) -> anyhow::Result<AmnesiaFence> {
+        let skew = self.clock.max_skew_micros();
+        let fence = AmnesiaFence {
+            fence_micros: self
+                .clock
+                .physical_micros()
+                .saturating_add(skew.saturating_mul(3))
+                .saturating_add(1),
+            joined: false,
+        };
+        self.journal
+            .save_amnesia_fence(&fence)
+            .await
+            .map_err(|err| err.context("cannot persist the amnesia fence"))?;
+        anyhow::ensure!(
+            self.journal.load_amnesia_fence().await? == Some(fence),
+            "this journal cannot keep an amnesia fence (Journal::save_amnesia_fence): \
+             a node that lost its journal must come back under a new node id"
+        );
+        self.floor_clock_after_loss().await?;
+        self.metrics.record_amnesia_fence();
+        tracing::warn!(
+            node = self.id.0,
+            fence = fence.fence_micros,
+            "opened joining over an empty journal: fenced until a contact vouches past it"
+        );
+        Ok(fence)
+    }
+
+    /// A plain open over a journal that holds nothing at all: a fresh
+    /// replica, unless its data store holds events — then the journal that
+    /// went with them was lost, and the node is refused ([`LostJournal`]),
+    /// since it forgot the votes and reports it made. A cluster of this node
+    /// alone holds nobody's votes but its own: it reopens over its store, its
+    /// clock floored past the ids it minted. A fresh replica leaves its clock
+    /// bound in the journal at once, so the journal is never empty again
+    /// while the store holds what the node applies — even one it applied
+    /// before its first flush.
+    async fn open_over_an_empty_journal(&self) -> anyhow::Result<()> {
+        let page = self.datastore.snapshot_page(None, 1, usize::MAX).await?;
+        if page.events.is_empty() {
+            return self
+                .bound_clock_past(self.clock.reading_micros())
+                .await
+                .map_err(|err| err.context("cannot leave the clock bound in a fresh journal"));
+        }
+        if self.topology.nodes() != [self.id] {
+            return Err(LostJournal {
+                join_pending: false,
+            }
+            .into());
+        }
+        tracing::warn!(
+            node = self.id.0,
+            "the journal is empty but the store is not: a single-node cluster reopens over its store"
+        );
+        self.floor_clock_after_loss().await
+    }
+
+    /// Floors the clock past every id a node that lost its journal can have
+    /// minted: its wall clock plus one skew (the clock is never pushed
+    /// further by a peer, and a restart waits out any more), persisted as
+    /// the clock bound. Not the fence itself: three skews ahead, its ids
+    /// would run ahead of the wall clock past what peers accept, and a clock
+    /// a [`GroupHost`](crate::GroupHost) shares would push every group's.
+    async fn floor_clock_after_loss(&self) -> anyhow::Result<()> {
+        let floor = self
+            .clock
+            .physical_micros()
+            .saturating_add(self.clock.max_skew_micros())
+            .saturating_add(1);
+        self.clock.restore(Timestamp {
+            micros: floor,
+            logical: 0,
+            node: self.id,
+        });
+        self.bound_clock_past(floor).await
     }
 
     /// A deadline `d` from now.

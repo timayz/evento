@@ -838,3 +838,118 @@ async fn no_vote_for_a_future_dated_transaction() {
         other => panic!("a t0 within the bound gets a vote: {other:?}"),
     }
 }
+
+/// T' was accepted at R and B — a decision its coordinator holds, but no
+/// replica knows — and A never saw it. R loses its journal. A recovery of T'
+/// then hears A, which never witnessed it, B, which accepted it, and R,
+/// which forgot it: T' may have committed, so it must not be invalidated on
+/// R's word. Once its coordinator commits it at B, R's join goes through,
+/// with T'.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_amnesiac_never_lets_a_recovery_drop_what_may_have_committed() {
+    // No sweep recovers T' on its own: this test drives every recovery.
+    let mut c = Cluster::start_with(
+        3,
+        NodeConfig {
+            recovery_timeout: Duration::from_secs(60),
+            ..config()
+        },
+        clock,
+    );
+    c.baseline().await;
+    let txn = TxnId(Timestamp {
+        micros: system_micros(),
+        logical: 0,
+        node: NodeId(9),
+    });
+    let decided = event("acc", 1);
+    for to in [R, B] {
+        c.send(
+            9,
+            to,
+            Message::PreAccept {
+                txn,
+                keys: vec![key("acc")],
+                events: vec![decided.clone()],
+            },
+        )
+        .await;
+    }
+    for _ in 0..2 {
+        match next_within(&mut c.coordinator, Duration::from_secs(5)).await {
+            Some(Message::PreAcceptOk { .. }) => {}
+            other => panic!("R and B pre-accept: {other:?}"),
+        }
+    }
+    for to in [R, B] {
+        c.send(
+            9,
+            to,
+            Message::Accept {
+                txn,
+                ballot: Ballot(txn.0),
+                execute_at: txn.0,
+                deps: Vec::new(),
+                keys: vec![key("acc")],
+            },
+        )
+        .await;
+    }
+    for _ in 0..2 {
+        match next_within(&mut c.coordinator, Duration::from_secs(5)).await {
+            Some(Message::AcceptOk { .. }) => {}
+            other => panic!("R and B accept: {other:?}"),
+        }
+    }
+    // A's vote fence passes T', which it never saw: it never votes for it.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let join = c.reopen_amnesiac(R, B).await;
+    let recovered =
+        tokio::time::timeout(Duration::from_secs(5), c.nodes[B as usize].recover(txn)).await;
+    assert!(
+        !matches!(recovered, Ok(Ok(ref outcome)) if outcome.conflict),
+        "T' was invalidated on the word of a replica that may have accepted it: {recovered:?}"
+    );
+    assert_eq!(
+        c.nodes[B as usize].command_status(txn),
+        Some(evento_accord::Status::Accepted),
+        "B still holds T' undecided"
+    );
+
+    // Its coordinator commits it at B: decided, it applies, and R's join
+    // goes through with it.
+    c.send(
+        9,
+        B,
+        Message::Commit {
+            txn,
+            execute_at: txn.0,
+            deps: Vec::new(),
+            keys: vec![key("acc")],
+            events: vec![decided.clone()],
+            reply_to: NodeId(9),
+        },
+    )
+    .await;
+    loop {
+        match next_within(&mut c.coordinator, Duration::from_secs(5)).await {
+            Some(Message::ReadOk { ok, .. }) => {
+                assert!(ok, "acc is at version 0");
+                break;
+            }
+            Some(_) => continue,
+            None => panic!("B reads T' once it is committed"),
+        }
+    }
+    c.send(9, B, Message::Apply { txn, commit: true }).await;
+    tokio::time::timeout(Duration::from_secs(20), join)
+        .await
+        .expect("the join completes once T' is decided")
+        .unwrap()
+        .expect("joined");
+    await_until("every store holds T'", Duration::from_secs(10), || {
+        c.stores.iter().all(|store| holds(store, &decided))
+    })
+    .await;
+}
