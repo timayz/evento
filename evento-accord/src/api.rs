@@ -551,9 +551,16 @@ pub(crate) fn slow_quorum_size(n: usize) -> usize {
 /// two nodes built with different toolchains could derive different key→shard
 /// maps — a silent split brain. FNV-1a is fixed forever.
 pub(crate) fn stable_hash(bytes: &[u8]) -> u64 {
-    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    stable_hash_extend(STABLE_HASH_SEED, bytes)
+}
+
+/// The FNV-1a offset basis: the state [`stable_hash`] starts from.
+pub(crate) const STABLE_HASH_SEED: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// Folds `bytes` into a running [`stable_hash`] state, so a long sequence
+/// can be hashed piecewise.
+pub(crate) fn stable_hash_extend(mut hash: u64, bytes: &[u8]) -> u64 {
     const PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut hash = OFFSET;
     for &b in bytes {
         hash ^= u64::from(b);
         hash = hash.wrapping_mul(PRIME);

@@ -577,8 +577,10 @@ type ConfigState = Arc<Mutex<HashMap<u64, ConfigAcceptor>>>;
 /// epoch, keyed epoch → proposal id (see [`ConfigRound`]). Two concurrent
 /// proposals on one node (e.g. a manual change and the sweep's recovery)
 /// each hear every reply and keep only those answering their own ballot, so
-/// neither can take or tear down the other's.
-type ConfigInbox = Arc<Mutex<HashMap<u64, HashMap<u64, ConfigSender>>>>;
+/// neither can take or tear down the other's. The proposals of an epoch are
+/// ordered: a reply reaches them, and wakes their tasks, in id order — a hash
+/// order would differ run to run, and the simulation would no longer replay.
+type ConfigInbox = Arc<Mutex<HashMap<u64, BTreeMap<u64, ConfigSender>>>>;
 type ConfigSender = mpsc::UnboundedSender<(NodeId, Message)>;
 
 /// The committed metadata log: decided `(epoch, layout)` entries, plus the highest
@@ -4428,10 +4430,14 @@ impl Node {
                     },
                 )
                 .await;
+            // Retry above the highest promise any shard reported: one ballot
+            // that clears them all, and the same one whatever order the
+            // shards are iterated in.
             if let Some(promised) = acks
                 .values()
                 .flatten()
-                .find_map(|a| a.as_ref().err().copied())
+                .filter_map(|a| a.as_ref().err().copied())
+                .max()
             {
                 return Ok(Attempt::Retry(promised));
             }
@@ -4644,7 +4650,11 @@ impl Node {
         let mut keepalive = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
         keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
+            // Biased: with both ready, the work's result wins. Unbiased,
+            // tokio picks a branch from an RNG that is not seeded, and the
+            // simulation would no longer replay.
             tokio::select! {
+                biased;
                 out = &mut work => return out,
                 _ = keepalive.tick() => self.send(contact, Message::JoinKeepalive).await,
             }

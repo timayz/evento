@@ -9,12 +9,15 @@
 //! **Deterministic runtime.** The tests run under `#[tokio::test(start_paused =
 //! true)]`: a single-threaded runtime with *virtual* time that advances only
 //! between scheduling steps. Combined with a virtual physical-time source for the
-//! HLC ([`virtual_micros`]) and deterministic event ids ([`event`]), a given seed
-//! reproduces *exactly* — proven by [`simulation_is_bit_reproducible`], which
-//! runs a seed twice and asserts byte-identical fingerprints. So a failure found
-//! at a seed can be replayed and debugged. (The protocol core is already
-//! order-independent: every map iteration that feeds a decision is sorted or
-//! keyed.) The oracles below are the reusable, load-bearing part.
+//! HLC ([`virtual_micros`]) and deterministic events ([`event`]), a given seed
+//! reproduces *exactly*. [`every_scenario_kind_replays_its_trace`] proves it on
+//! the execution itself: every sim traces its network ([`InMemoryNetwork::enable_trace`]
+//! — each message, its ends, its fate, at its virtual time), and two runs of a
+//! seed must trace identically, not merely end in the same state. So a failure
+//! found at a seed can be replayed and debugged. (The protocol core is
+//! order-independent: every map iteration that feeds a decision or a send is
+//! sorted or keyed, and its one `select!` is biased.) The oracles below are the
+//! reusable, load-bearing part.
 //!
 //! ## Oracles
 //!
@@ -27,7 +30,9 @@
 //! - **No split-brain on churned nodes:** a churned replica never stores a
 //!   version beyond the quorum's (it may only lag).
 
+use std::cell::Cell;
 use std::collections::BTreeSet;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -35,8 +40,9 @@ use std::time::Duration;
 use evento_accord::{
     DataStore, DynamicTopology, HybridLogicalClock, InMemoryDataStore, InMemoryJournal,
     InMemoryNetwork, Journal, Key, Message, MessageSink, Node, NodeConfig, NodeId, StaticTopology,
-    Topology,
+    Topology, TraceEntry,
 };
+use evento_core::metadata::Metadata;
 use evento_core::Event;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -70,6 +76,21 @@ fn skewed_virtual_micros(
     }
 }
 
+thread_local! {
+    /// Whether sims built on this thread keep every step of their trace, not
+    /// just its hash (see [`assert_replays`]). Thread-local: each test runs
+    /// its own single-threaded runtime on its own thread.
+    static RECORD_TRACE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// A finished run's execution trace (see [`InMemoryNetwork::enable_trace`]):
+/// its hash, and every step when recording.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct RunTrace {
+    hash: u64,
+    steps: Vec<TraceEntry>,
+}
+
 struct Sim {
     ids: Vec<NodeId>,
     nodes: Vec<Node>,
@@ -84,28 +105,57 @@ struct Sim {
     /// Shared fast-path electorate (a subset of the nodes); `None` ⇒ all nodes.
     /// Kept so a restarted node rebuilds with the same topology.
     electorate: Option<Vec<NodeId>>,
+    /// Every node's configuration, kept so a restarted node rebuilds with it.
+    config: NodeConfig,
+    /// Each node's epoch-versioned topology, for a cluster built by
+    /// [`build_dynamic`](Sim::build_dynamic); empty otherwise.
+    dynamic: Vec<Arc<DynamicTopology>>,
+}
+
+/// A dropped sim stops its nodes: left running, every finished scenario's
+/// cluster would keep sweeping alongside the next one.
+impl Drop for Sim {
+    fn drop(&mut self) {
+        for task in self.tasks.iter().flatten() {
+            task.abort();
+        }
+    }
 }
 
 impl Sim {
     fn build(n: u64) -> Self {
-        Self::build_inner(n, None, NodeConfig::default(), None)
+        Self::build_inner(n, None, NodeConfig::default(), None, false)
     }
 
     /// Builds a cluster where node `skewed`'s clock runs `skew` microseconds ahead
     /// of the others — to exercise bounded clock-skew handling.
     fn build_with_skew(n: u64, skewed: usize, skew: u64) -> Self {
-        Self::build_inner(n, Some((skewed, skew)), NodeConfig::default(), None)
+        Self::build_inner(n, Some((skewed, skew)), NodeConfig::default(), None, false)
     }
 
     /// Builds a cluster with a custom [`NodeConfig`] on every node.
     fn build_with_config(n: u64, config: NodeConfig) -> Self {
-        Self::build_inner(n, None, config, None)
+        Self::build_inner(n, None, config, None, false)
     }
 
     /// Builds a cluster with a shared fast-path electorate, to exercise the
     /// shrunk-electorate consensus & recovery paths under the oracles.
     fn build_with_electorate(n: u64, electorate: Vec<NodeId>) -> Self {
-        Self::build_inner(n, None, NodeConfig::default(), Some(electorate))
+        Self::build_inner(n, None, NodeConfig::default(), Some(electorate), false)
+    }
+
+    /// Builds a cluster over [`DynamicTopology`] — one shard of every node,
+    /// at epoch 0 — whose epochs the scenario changes. Not restartable.
+    fn build_dynamic(n: u64) -> Self {
+        Self::build_inner(n, None, NodeConfig::default(), None, true)
+    }
+
+    /// The execution trace so far (see [`RunTrace`]).
+    fn trace(&self) -> RunTrace {
+        RunTrace {
+            hash: self.net.trace_hash().expect("every sim traces"),
+            steps: self.net.trace(),
+        }
     }
 
     /// Builds a [`StaticTopology`] for `id`, applying the shared electorate if set.
@@ -122,14 +172,17 @@ impl Sim {
         skew: Option<(usize, u64)>,
         config: NodeConfig,
         electorate: Option<Vec<NodeId>>,
+        dynamic: bool,
     ) -> Self {
         let ids: Vec<NodeId> = (0..n).map(NodeId).collect();
         let net = InMemoryNetwork::new();
+        net.enable_trace(RECORD_TRACE.with(Cell::get));
         let base = tokio::time::Instant::now();
         let mut nodes = Vec::new();
         let mut stores = Vec::new();
         let mut journals = Vec::new();
         let mut tasks = Vec::new();
+        let mut topologies = Vec::new();
         for &id in &ids {
             let inbox = net.register(id);
             let clock = match skew {
@@ -141,7 +194,13 @@ impl Sim {
             let sink: Arc<dyn MessageSink> = Arc::new(net.sink(id));
             let store = Arc::new(InMemoryDataStore::new());
             let journal = Arc::new(InMemoryJournal::new());
-            let topology = Arc::new(Self::topology(id, &ids, &electorate));
+            let topology: Arc<dyn Topology> = if dynamic {
+                let topology = Arc::new(DynamicTopology::new(id, 0, vec![ids.clone()]));
+                topologies.push(Arc::clone(&topology));
+                topology
+            } else {
+                Arc::new(Self::topology(id, &ids, &electorate))
+            };
             let node = Node::new(
                 id,
                 topology,
@@ -165,14 +224,25 @@ impl Sim {
             tasks,
             base,
             electorate,
+            config,
+            dynamic: topologies,
         }
     }
 
     /// Restarts node `i`: aborts its loops (dropping in-memory state), rebuilds a
     /// fresh [`Node`] + fresh store keeping the durable journal, recovers from the
     /// journal, restarts the loops, and swaps everything into the `Sim`. Mirrors
-    /// `tests/restart.rs`.
+    /// `tests/restart.rs`. The node comes back with the cluster's configuration.
     async fn restart(&mut self, i: usize) {
+        self.restart_with(i, self.config).await;
+    }
+
+    /// [`restart`](Self::restart), the node coming back with `config`.
+    async fn restart_with(&mut self, i: usize, config: NodeConfig) {
+        assert!(
+            self.dynamic.is_empty(),
+            "a restart over a dynamic topology is not modelled"
+        );
         for t in &self.tasks[i] {
             t.abort();
         }
@@ -189,7 +259,8 @@ impl Sim {
             Arc::new(self.net.sink(id)),
             Arc::clone(&store) as Arc<dyn DataStore>,
             Arc::clone(&self.journals[i]) as Arc<dyn Journal>,
-        );
+        )
+        .with_config(config);
         node.recover_state().await.unwrap();
         self.tasks[i] = vec![node.start(inbox), node.start_recovery()];
         self.nodes[i] = node;
@@ -197,12 +268,66 @@ impl Sim {
     }
 }
 
+/// Runs `run` twice for `seed` and requires both runs to trace identical
+/// executions: the same messages, between the same nodes, with the same fates,
+/// at the same virtual times. Two runs that interleave differently but end in
+/// the same state fail here. On a mismatch it runs `run` twice more, recording
+/// every step, and reports where those two parted.
+async fn assert_replays<F, Fut>(label: &str, seed: u64, run: F)
+where
+    F: Fn(u64) -> Fut,
+    Fut: Future<Output = RunTrace>,
+{
+    let first = run(seed).await;
+    let second = run(seed).await;
+    if first.hash == second.hash {
+        return;
+    }
+    RECORD_TRACE.with(|record| record.set(true));
+    let a = run(seed).await;
+    let b = run(seed).await;
+    RECORD_TRACE.with(|record| record.set(false));
+    panic!(
+        "{label} seed {seed}: two runs traced different executions \
+         ({:#x} vs {:#x}) — the simulation is not deterministic\n{}",
+        first.hash,
+        second.hash,
+        first_difference(&a.steps, &b.steps)
+    );
+}
+
+/// Where two recorded traces part: the first differing step, with the few
+/// steps before it for context.
+fn first_difference(a: &[TraceEntry], b: &[TraceEntry]) -> String {
+    let Some(at) = (0..a.len().max(b.len())).find(|&i| a.get(i) != b.get(i)) else {
+        return "the recorded reruns traced identically (an intermittent leak)".into();
+    };
+    let step = |entry: Option<&TraceEntry>| match entry {
+        Some(e) => format!(
+            "{}µs {}→{} {:?} {} ({:#x})",
+            e.micros, e.from.0, e.to.0, e.fate, e.kind, e.digest
+        ),
+        None => "(trace ended)".into(),
+    };
+    let mut out = format!("first difference at step {at}:\n");
+    for i in at.saturating_sub(3)..at {
+        out.push_str(&format!("    same  {}\n", step(a.get(i))));
+    }
+    out.push_str(&format!("  run A  {}\n", step(a.get(at))));
+    out.push_str(&format!("  run B  {}\n", step(b.get(at))));
+    out
+}
+
 /// Builds an event with a *deterministic* id derived from `seq` (a per-scenario
 /// counter), so a given seed produces byte-identical events run to run — the
 /// random `Ulid::generate()` would otherwise defeat reproducibility. Distinct events
 /// still get distinct ids because the counter is monotonic and, under the
-/// deterministic runtime, advances in a reproducible order.
+/// deterministic runtime, advances in a reproducible order. The metadata id is
+/// derived from `seq` too: `Metadata::default()` mints a random one, and the
+/// event's wire encoding — which the execution trace hashes — carries it.
 fn event(aggregate_id: &str, version: u16, seq: u64) -> Event {
+    let mut metadata = Metadata::default();
+    metadata.id = format!("sim-{seq}");
     Event {
         id: ulid::Ulid::from(seq as u128),
         aggregate_type: AGG_TYPE.into(),
@@ -211,6 +336,7 @@ fn event(aggregate_id: &str, version: u16, seq: u64) -> Event {
         name: "Bumped".into(),
         timestamp: 1,
         timestamp_subsec: seq as u32,
+        metadata,
         ..Default::default()
     }
 }
@@ -225,9 +351,9 @@ struct WriteRecord {
 
 type History = Arc<Mutex<Vec<WriteRecord>>>;
 
-/// Runs one seeded scenario; returns an error string describing any oracle
-/// violation.
-async fn run_scenario(seed: u64) -> Result<(), String> {
+/// Runs one seeded scenario; returns its trace, or an error string describing
+/// any oracle violation.
+async fn run_scenario(seed: u64) -> Result<RunTrace, String> {
     const N: u64 = 5; // f = 2, slow quorum = 3
     const AGGS: usize = 4;
     const WRITERS: usize = 4;
@@ -317,6 +443,7 @@ async fn run_scenario(seed: u64) -> Result<(), String> {
     let records = history.lock().unwrap().clone();
     check_oracles(&sim, &records)
         .await
+        .map(|()| sim.trace())
         .map_err(|e| format!("seed {seed}: {e}"))
 }
 
@@ -416,6 +543,8 @@ struct Adversarial {
     safety: Option<String>,
     /// Whether all nodes converged to the same committed set after healing.
     converged: bool,
+    /// The run's execution trace.
+    trace: RunTrace,
 }
 
 /// Full chaos: writers pick random coordinators while a minority of *any* nodes
@@ -504,6 +633,7 @@ async fn run_adversarial(seed: u64) -> Adversarial {
     Adversarial {
         safety: safety_violation(&sim, &records),
         converged,
+        trace: sim.trace(),
     }
 }
 
@@ -654,7 +784,11 @@ async fn run_partition(seed: u64, electorate: Option<Vec<NodeId>>) -> Adversaria
         Some(v) => Some(v),
         None => minority_never_ahead(&sim, &records).await,
     };
-    Adversarial { safety, converged }
+    Adversarial {
+        safety,
+        converged,
+        trace: sim.trace(),
+    }
 }
 
 /// Post-heal oracle for the partition scenario: a stranded minority node must
@@ -806,6 +940,7 @@ async fn run_with_restarts(seed: u64) -> Adversarial {
     Adversarial {
         safety: safety_violation(&sim, &records),
         converged,
+        trace: sim.trace(),
     }
 }
 
@@ -836,6 +971,8 @@ type Commit = ((String, String, u16), u128);
 struct Probe {
     per_node: Vec<Vec<Commit>>,
     history: Vec<(String, u16, bool)>,
+    /// The run's execution trace.
+    trace: RunTrace,
 }
 
 /// Runs a seeded chaos scenario (random coordinators, a churning minority of any
@@ -935,7 +1072,11 @@ async fn run_probe(seed: u64) -> Probe {
         .map(|r| (r.agg.clone(), r.version, r.committed))
         .collect();
     history.sort();
-    Probe { per_node, history }
+    Probe {
+        per_node,
+        history,
+        trace: sim.trace(),
+    }
 }
 
 /// The payoff of the deterministic runtime: a given seed reproduces *exactly* —
@@ -954,13 +1095,61 @@ async fn simulation_is_bit_reproducible() {
     }
 }
 
+/// Each scenario kind replays its *execution*, not only its outcome: two runs
+/// of a seed must trace the same messages, between the same nodes, with the
+/// same fates, at the same virtual times ([`assert_replays`]). The fingerprint
+/// checks above compare end states, which two differently interleaved runs
+/// can share; as faults and configurations open more paths, a leak would
+/// otherwise surface as a CI failure whose seed does not replay locally.
+#[tokio::test(start_paused = true)]
+async fn every_scenario_kind_replays_its_trace() {
+    let electorate = vec![NodeId(0), NodeId(1), NodeId(2)];
+    for seed in 0..4 {
+        assert_replays("replica churn", seed, |s| async move {
+            run_scenario(s).await.expect("replica churn oracles")
+        })
+        .await;
+        assert_replays("adversarial", seed, |s| async move {
+            run_adversarial(s).await.trace
+        })
+        .await;
+        assert_replays("partition", seed, |s| async move {
+            run_partition(s, None).await.trace
+        })
+        .await;
+        assert_replays("partition+electorate", seed, |s| {
+            let electorate = electorate.clone();
+            async move { run_partition(s, Some(electorate)).await.trace }
+        })
+        .await;
+        assert_replays("restarts", seed, |s| async move {
+            run_with_restarts(s).await.trace
+        })
+        .await;
+        assert_replays("probe", seed, |s| async move { run_probe(s).await.trace }).await;
+        assert_replays("bounded", seed, |s| async move {
+            run_bounded(s).await.expect("bound oracle")
+        })
+        .await;
+        assert_replays("skew", seed, |s| async move {
+            run_skew(s).await.expect("clock-skew oracle")
+        })
+        .await;
+        assert_replays("membership churn", seed, |s| async move {
+            run_churn(s).await.trace
+        })
+        .await;
+    }
+    assert_replays("absent peer rejoins", 0, |_| absent_peer_rejoins()).await;
+}
+
 /// The compaction payoff: in-memory consensus state is **bounded**, not
 /// proportional to lifetime write volume. A workload runs, the cluster heals and
 /// goes idle, and once the redundancy watermark advances past every committed
 /// transaction (all replicas applied it, plus the propagation margin), every
 /// command is compacted away — `command_count` returns to zero — while the
 /// committed state (in the data store) is untouched.
-async fn run_bounded(seed: u64) -> Result<(), String> {
+async fn run_bounded(seed: u64) -> Result<RunTrace, String> {
     const N: u64 = 5;
     const AGGS: usize = 4;
     const WRITERS: usize = 4;
@@ -1051,7 +1240,7 @@ async fn run_bounded(seed: u64) -> Result<(), String> {
             "seed {seed}: committed state lost after compaction"
         ));
     }
-    Ok(())
+    Ok(sim.trace())
 }
 
 #[tokio::test(start_paused = true)]
@@ -1182,7 +1371,7 @@ async fn partitioned_minority_cannot_unblock_compaction_and_diverge() {
 /// keeps every clock within the bound). Skew is kept under `MAX_SKEW` (200ms) so
 /// the bound oracle is clean; the cap on a *beyond*-bound timestamp is covered by
 /// the clock unit tests.
-async fn run_skew(seed: u64) -> Result<(), String> {
+async fn run_skew(seed: u64) -> Result<RunTrace, String> {
     const N: u64 = 5;
     const AGGS: usize = 4;
     const WRITERS: usize = 4;
@@ -1267,7 +1456,7 @@ async fn run_skew(seed: u64) -> Result<(), String> {
     if let Some(v) = safety_violation(&sim, &records) {
         return Err(format!("seed {seed}: {v}"));
     }
-    Ok(())
+    Ok(sim.trace())
 }
 
 #[tokio::test(start_paused = true)]
@@ -1530,6 +1719,8 @@ struct ChurnProbe {
     per_node_committed: Vec<Vec<Commit>>,
     per_node_epoch: Vec<u64>,
     history: Vec<(String, u16, bool)>,
+    /// The run's execution trace.
+    trace: RunTrace,
 }
 
 async fn run_churn(seed: u64) -> ChurnProbe {
@@ -1538,35 +1729,14 @@ async fn run_churn(seed: u64) -> ChurnProbe {
     const WRITERS: usize = 3;
     const WRITES_EACH: usize = 10;
 
-    let ids: Vec<NodeId> = (0..N).map(NodeId).collect();
-    // One shard with every node, identical across epochs — only the epoch advances.
-    let layout = vec![ids.clone()];
-    let net = InMemoryNetwork::new();
-    let base = tokio::time::Instant::now();
-
-    let mut nodes: Vec<Node> = Vec::new();
-    let mut stores: Vec<Arc<InMemoryDataStore>> = Vec::new();
-    let mut topos: Vec<Arc<DynamicTopology>> = Vec::new();
-    for &id in &ids {
-        let inbox = net.register(id);
-        let clock = Arc::new(HybridLogicalClock::with_physical(id, virtual_micros(base)));
-        let store = Arc::new(InMemoryDataStore::new());
-        let journal = Arc::new(InMemoryJournal::new());
-        let topology = Arc::new(DynamicTopology::new(id, 0, layout.clone()));
-        let node = Node::new(
-            id,
-            Arc::clone(&topology) as Arc<dyn Topology>,
-            clock,
-            Arc::new(net.sink(id)) as Arc<dyn MessageSink>,
-            Arc::clone(&store) as Arc<dyn DataStore>,
-            Arc::clone(&journal) as Arc<dyn Journal>,
-        );
-        // The recovery loop drives the metadata-log catch-up sweep.
-        let _ = (node.start(inbox), node.start_recovery());
-        nodes.push(node);
-        stores.push(store);
-        topos.push(topology);
-    }
+    // One shard with every node, identical across epochs — only the epoch
+    // advances. The recovery loop drives the metadata-log catch-up sweep.
+    let sim = Sim::build_dynamic(N);
+    let layout = vec![sim.ids.clone()];
+    let net = Arc::clone(&sim.net);
+    let nodes = &sim.nodes;
+    let stores = &sim.stores;
+    let topos = &sim.dynamic;
 
     // Seed-derived plans.
     let mut rng = StdRng::seed_from_u64(seed);
@@ -1660,8 +1830,8 @@ async fn run_churn(seed: u64) -> ChurnProbe {
     // control plane (every node installs the full epoch sequence via catch-up).
     net.heal(NodeId(3));
     net.heal(NodeId(4));
-    converge(&stores).await;
-    for topo in &topos {
+    converge(stores).await;
+    for topo in topos {
         for _ in 0..1500 {
             if topo.epoch() >= reconfigs {
                 break;
@@ -1695,6 +1865,7 @@ async fn run_churn(seed: u64) -> ChurnProbe {
         per_node_committed,
         per_node_epoch,
         history,
+        trace: sim.trace(),
     }
 }
 
@@ -1940,6 +2111,13 @@ async fn await_rejoin_required(node: &Node) {
 /// before.
 #[tokio::test(start_paused = true)]
 async fn an_absent_peer_stops_holding_compaction_back() {
+    absent_peer_rejoins().await;
+}
+
+/// [`an_absent_peer_stops_holding_compaction_back`]'s flow — an absence, a
+/// compaction past it, a refused write, a paged rejoin — returning its trace,
+/// so the join paths are replay-checked too.
+async fn absent_peer_rejoins() -> RunTrace {
     const HOT: &str = "hot";
     let config = absence_config(Duration::from_secs(2));
     let mut sim = Sim::build_with_config(3, config);
@@ -2004,6 +2182,7 @@ async fn an_absent_peer_stops_holding_compaction_back() {
     await_compacted(&sim, &[0, 1, 2], "after the rejoin").await;
     assert!(sim.nodes[0].absent_peers().is_empty());
     assert!(sim.nodes[1].absent_peers().is_empty());
+    sim.trace()
 }
 
 /// [`an_absent_peer_stops_holding_compaction_back`] in a group of `n ≥ 4`,
@@ -2473,8 +2652,8 @@ async fn rejoin_bounds_survive_a_restart() {
 
     // Both survivors restart (with the default config: no absence limit), so
     // only the persisted bound can keep node 2 out.
-    sim.restart(0).await;
-    sim.restart(1).await;
+    sim.restart_with(0, NodeConfig::default()).await;
+    sim.restart_with(1, NodeConfig::default()).await;
     assert_eq!(sim.nodes[0].absent_peers(), vec![NodeId(2)]);
     assert_eq!(sim.nodes[1].absent_peers(), vec![NodeId(2)]);
 

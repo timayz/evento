@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use crate::api::MessageSink;
+use crate::api::{stable_hash_extend, MessageSink, STABLE_HASH_SEED};
 use crate::clock::NodeId;
 use crate::format::{encode_tagged, RecordKind};
 use crate::message::Message;
@@ -82,10 +82,65 @@ pub struct InMemoryNetwork {
     /// Messages a receiver cannot read (see
     /// [`set_unreadable`](InMemoryNetwork::set_unreadable)); `None` by default.
     unreadable: Mutex<Option<MessageFilter>>,
+    /// The execution trace (see [`enable_trace`](InMemoryNetwork::enable_trace));
+    /// `None` by default, so nothing is encoded.
+    trace: Mutex<Option<Trace>>,
 }
 
 /// A predicate over messages, for [`InMemoryNetwork::set_unreadable`].
 pub type MessageFilter = Arc<dyn Fn(&Message) -> bool + Send + Sync>;
+
+/// What became of one message the network was handed, as its
+/// [trace](InMemoryNetwork::enable_trace) records it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageFate {
+    /// Put in the receiver's inbox.
+    Delivered,
+    /// Held back for the link's latency; its arrival is traced on its own.
+    Deferred,
+    /// Dropped: an end is crashed, the link partitioned, or the receiver has
+    /// no open inbox.
+    Dropped,
+    /// Shed: over the frame cap, unreadable, or the receiver's inbox full.
+    Shed,
+}
+
+/// One traced step, kept when the trace records its entries (see
+/// [`InMemoryNetwork::enable_trace`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceEntry {
+    /// Virtual microseconds since tracing began.
+    pub micros: u64,
+    /// Sending node.
+    pub from: NodeId,
+    /// Addressed node.
+    pub to: NodeId,
+    /// What became of the message.
+    pub fate: MessageFate,
+    /// The message's variant, for reading a trace.
+    pub kind: String,
+    /// A stable hash of the message's wire encoding.
+    pub digest: u64,
+}
+
+/// The running trace of an [`InMemoryNetwork`].
+struct Trace {
+    /// When tracing began: entries are timed from here, so two runs traced
+    /// back to back on one clock compare.
+    start: tokio::time::Instant,
+    /// Every step so far, folded into one stable hash.
+    hash: u64,
+    /// Every step so far, when recording.
+    entries: Option<Vec<TraceEntry>>,
+}
+
+/// What a trace keeps of one message: its digest, and its variant when
+/// recording. Computed once at send, so a deferred message is not encoded
+/// again on arrival.
+struct Stamp {
+    digest: u64,
+    kind: Option<String>,
+}
 
 impl InMemoryNetwork {
     /// Creates an empty network.
@@ -188,6 +243,107 @@ impl InMemoryNetwork {
         *self.unreadable.lock().expect("network poisoned") = filter;
     }
 
+    /// Starts tracing this network's execution: from now on every message it
+    /// is handed — its virtual send time, its ends, its wire encoding, and
+    /// what became of it ([`MessageFate`]) — is folded into one stable hash,
+    /// [`trace_hash`](Self::trace_hash). Under the deterministic simulation's
+    /// paused clock, two runs of one seed must fold identical traces: two
+    /// runs that end in the same state by different paths do not.
+    ///
+    /// Times are measured from this call, so two runs traced back to back on
+    /// one virtual clock compare. With `record`, every step is also kept
+    /// ([`trace`](Self::trace)), to find where two runs part. Restarts the
+    /// trace if one was running. Off by default: nothing is encoded then.
+    pub fn enable_trace(&self, record: bool) {
+        *self.trace.lock().expect("network poisoned") = Some(Trace {
+            start: tokio::time::Instant::now(),
+            hash: STABLE_HASH_SEED,
+            entries: record.then(Vec::new),
+        });
+    }
+
+    /// The hash of every step traced since [`enable_trace`](Self::enable_trace);
+    /// `None` if tracing is off.
+    pub fn trace_hash(&self) -> Option<u64> {
+        self.trace
+            .lock()
+            .expect("network poisoned")
+            .as_ref()
+            .map(|trace| trace.hash)
+    }
+
+    /// Every step traced since [`enable_trace`](Self::enable_trace) with
+    /// `record` on; empty otherwise.
+    pub fn trace(&self) -> Vec<TraceEntry> {
+        self.trace
+            .lock()
+            .expect("network poisoned")
+            .as_ref()
+            .and_then(|trace| trace.entries.clone())
+            .unwrap_or_default()
+    }
+
+    /// What the trace keeps of `message`, if tracing is on.
+    fn stamp(&self, message: &Message) -> Option<Stamp> {
+        let record = self
+            .trace
+            .lock()
+            .expect("network poisoned")
+            .as_ref()?
+            .entries
+            .is_some();
+        // An encoding error still leaves a digest: the trace records that
+        // the message was handed over, whatever it held.
+        let digest = encode_tagged(RecordKind::GroupFrame, message)
+            .map_or(0, |bytes| stable_hash_extend(STABLE_HASH_SEED, &bytes));
+        let kind = record.then(|| {
+            let debug = format!("{message:?}");
+            debug
+                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        });
+        Some(Stamp { digest, kind })
+    }
+
+    /// Folds one step into the trace, if tracing is on.
+    fn note(&self, from: NodeId, to: NodeId, fate: MessageFate, stamp: Option<&Stamp>) {
+        let Some(stamp) = stamp else {
+            return;
+        };
+        let mut guard = self.trace.lock().expect("network poisoned");
+        let Some(trace) = guard.as_mut() else {
+            return;
+        };
+        let micros = tokio::time::Instant::now()
+            .saturating_duration_since(trace.start)
+            .as_micros() as u64;
+        let fate_code: u8 = match fate {
+            MessageFate::Delivered => 0,
+            MessageFate::Deferred => 1,
+            MessageFate::Dropped => 2,
+            MessageFate::Shed => 3,
+        };
+        let mut hash = trace.hash;
+        hash = stable_hash_extend(hash, &micros.to_le_bytes());
+        hash = stable_hash_extend(hash, &from.0.to_le_bytes());
+        hash = stable_hash_extend(hash, &to.0.to_le_bytes());
+        hash = stable_hash_extend(hash, &[fate_code]);
+        hash = stable_hash_extend(hash, &stamp.digest.to_le_bytes());
+        trace.hash = hash;
+        if let Some(entries) = trace.entries.as_mut() {
+            entries.push(TraceEntry {
+                micros,
+                from,
+                to,
+                fate,
+                kind: stamp.kind.clone().unwrap_or_default(),
+                digest: stamp.digest,
+            });
+        }
+    }
+
     /// Whether `message` fits under the configured frame cap and is not
     /// [unreadable](Self::set_unreadable).
     fn fits(&self, message: &Message) -> bool {
@@ -214,15 +370,21 @@ impl InMemoryNetwork {
     /// Enqueues `envelope` into `to`'s inbox via `try_send`, counting a shed on a
     /// full inbox (backpressure). A closed/missing inbox is a down/partitioned
     /// peer — tolerated loss, not counted.
-    fn deliver(&self, to: NodeId, envelope: Envelope) {
+    fn deliver(&self, to: NodeId, envelope: Envelope) -> MessageFate {
         let inbox = {
             let inboxes = self.inboxes.lock().expect("network poisoned");
             inboxes.get(&to).cloned()
         };
-        if let Some(tx) = inbox {
-            if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(envelope) {
+        let Some(tx) = inbox else {
+            return MessageFate::Dropped;
+        };
+        match tx.try_send(envelope) {
+            Ok(()) => MessageFate::Delivered,
+            Err(mpsc::error::TrySendError::Full(_)) => {
                 self.shed.fetch_add(1, Ordering::Relaxed);
+                MessageFate::Shed
             }
+            Err(mpsc::error::TrySendError::Closed(_)) => MessageFate::Dropped,
         }
     }
 
@@ -245,15 +407,20 @@ pub struct InMemorySink {
 #[async_trait]
 impl MessageSink for InMemorySink {
     async fn send(&self, to: NodeId, message: Message) -> anyhow::Result<()> {
+        let stamp = self.net.stamp(&message);
         // A crashed node neither sends nor receives; a partition drops the link.
         if self.net.is_crashed(self.from)
             || self.net.is_crashed(to)
             || self.net.is_partitioned(self.from, to)
         {
+            self.net
+                .note(self.from, to, MessageFate::Dropped, stamp.as_ref());
             return Ok(());
         }
         if !self.net.fits(&message) {
             self.net.shed.fetch_add(1, Ordering::Relaxed);
+            self.net
+                .note(self.from, to, MessageFate::Shed, stamp.as_ref());
             return Ok(());
         }
 
@@ -265,18 +432,23 @@ impl MessageSink for InMemorySink {
         if latency.is_zero() {
             // The common path: deliver inline, byte-identical to before (so the
             // deterministic simulation is unchanged).
-            self.net.deliver(to, envelope);
+            let fate = self.net.deliver(to, envelope);
+            self.net.note(self.from, to, fate, stamp.as_ref());
         } else {
             // Latency model: defer delivery. Re-check liveness at arrival so a
             // crash/partition during flight still drops the in-flight message.
+            self.net
+                .note(self.from, to, MessageFate::Deferred, stamp.as_ref());
             let net = Arc::clone(&self.net);
             let from = self.from;
             tokio::spawn(async move {
                 tokio::time::sleep(latency).await;
                 if net.is_crashed(from) || net.is_crashed(to) || net.is_partitioned(from, to) {
+                    net.note(from, to, MessageFate::Dropped, stamp.as_ref());
                     return;
                 }
-                net.deliver(to, envelope);
+                let fate = net.deliver(to, envelope);
+                net.note(from, to, fate, stamp.as_ref());
             });
         }
         Ok(())
@@ -386,6 +558,68 @@ mod tests {
             net.shed_count() as usize,
             flood - DEFAULT_INBOX_CAPACITY,
             "the shed counter tracks exactly the dropped overflow"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_untraced_network_keeps_no_trace() {
+        let net = InMemoryNetwork::new();
+        let _inbox = net.register(NodeId(2));
+        net.sink(NodeId(1))
+            .send(NodeId(2), Message::Applied { txn: txn(1) })
+            .await
+            .unwrap();
+        assert_eq!(net.trace_hash(), None);
+        assert!(net.trace().is_empty());
+    }
+
+    /// Two sends a few virtual milliseconds apart, the second over a link
+    /// with latency; `cut` partitions the first.
+    async fn traced_run(cut: bool) -> (u64, Vec<TraceEntry>) {
+        let net = InMemoryNetwork::new();
+        let _inbox2 = net.register(NodeId(2));
+        let _inbox3 = net.register(NodeId(3));
+        net.enable_trace(true);
+        let sink = net.sink(NodeId(1));
+        if cut {
+            net.partition(NodeId(1), NodeId(2));
+        }
+        sink.send(NodeId(2), Message::Applied { txn: txn(1) })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        net.set_latency(NodeId(1), NodeId(3), Duration::from_millis(2));
+        sink.send(NodeId(3), Message::Applied { txn: txn(2) })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        (net.trace_hash().expect("tracing is on"), net.trace())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_trace_parts_two_runs_only_where_they_differ() {
+        let (first, entries) = traced_run(false).await;
+        let (second, _) = traced_run(false).await;
+        assert_eq!(first, second, "identical runs fold identical traces");
+        let (cut, cut_entries) = traced_run(true).await;
+        assert_ne!(first, cut, "a dropped message changes the trace");
+
+        let steps: Vec<_> = entries.iter().map(|e| (e.micros, e.to.0, e.fate)).collect();
+        assert_eq!(
+            steps,
+            vec![
+                (0, 2, MessageFate::Delivered),
+                (5_000, 3, MessageFate::Deferred),
+                (7_000, 3, MessageFate::Delivered),
+            ]
+        );
+        assert!(entries
+            .iter()
+            .all(|e| e.from == NodeId(1) && e.kind == "Applied"));
+        assert_eq!(cut_entries[0].fate, MessageFate::Dropped);
+        assert_ne!(
+            entries[0].digest, entries[1].digest,
+            "different messages digest differently"
         );
     }
 
