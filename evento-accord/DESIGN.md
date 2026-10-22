@@ -492,7 +492,13 @@ backend (sql/fjall). Phases, in order:
   re-apply only when the very events are stored, and a startup replay the store
   cannot take is handed back un-applied rather than swallowed. A decision-agreement
   oracle checks every run: no transaction enacted as a commit on one replica and an
-  abort on another. Across all
+  abort on another. Every seeded scenario then ends with a **liveness phase**
+  (#317, `assert_live`): everything healed and any node told to rejoin rejoined,
+  each node must coordinate a write that commits, pass a read barrier on every key
+  (its store then at the highest acknowledged version), and compact its consensus
+  state away, within bounds derived from its `NodeConfig`. It holds everywhere;
+  under message faults a healed cluster takes up to ~50 s of virtual time to recover
+  the transactions left stalled (#326), which the bounds allow. Across all
   seeds, **safety holds** — no split-brain, no double-commit — and after healing
   the cluster **converges**. The harness already paid off: it found two real gaps
   (non-convergence from stalled transactions and from missed transactions), both
