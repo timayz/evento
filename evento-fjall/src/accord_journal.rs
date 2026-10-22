@@ -101,6 +101,13 @@ pub struct FjallJournal {
     /// fsync entirely for inbox batches that staged nothing (gossip, response
     /// routing, probes), which otherwise cost a full `SyncAll` each.
     dirty: Arc<AtomicBool>,
+    /// Held across a flush's check of `dirty` and its fsync, so a flush
+    /// arriving while another's fsync is under way waits for it (see
+    /// [`flush`](Journal::flush)). Shared by clones, like `dirty`.
+    flush_lock: Arc<tokio::sync::Mutex<()>>,
+    /// How long each fsync is held back, so a test can keep one under way.
+    #[cfg(test)]
+    persist_delay: Arc<std::sync::Mutex<std::time::Duration>>,
 }
 
 impl FjallJournal {
@@ -125,6 +132,9 @@ impl FjallJournal {
             commands,
             meta,
             dirty: Arc::new(AtomicBool::new(false)),
+            flush_lock: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            persist_delay: Arc::default(),
         })
     }
 }
@@ -180,12 +190,27 @@ impl Journal for FjallJournal {
     }
 
     async fn flush(&self) -> anyhow::Result<()> {
+        // One flush at a time. A flush arriving while another's fsync is under
+        // way waits for it, then finds `dirty` clear (that fsync covered what
+        // was staged before it) or set again (the fsync failed, or more was
+        // staged meanwhile) and fsyncs itself. Without the lock it would find
+        // `dirty` already cleared and return at once — and the inbox loop
+        // would send a vote whose fsync had not completed, or had failed
+        // (#308).
+        let _guard = self.flush_lock.lock().await;
         // Nothing staged since the last flush → no fsync needed.
         if !self.dirty.swap(false, Ordering::AcqRel) {
             return Ok(());
         }
         let db = self.db.clone();
-        let result = tokio::task::spawn_blocking(move || db.persist(PersistMode::SyncAll)).await;
+        #[cfg(test)]
+        let delay = *self.persist_delay.lock().expect("delay poisoned");
+        let result = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            std::thread::sleep(delay);
+            db.persist(PersistMode::SyncAll)
+        })
+        .await;
         match result {
             Ok(Ok(())) => Ok(()),
             other => {
@@ -496,5 +521,70 @@ impl Journal for FjallJournal {
             Ok(out)
         })
         .await?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use evento_accord::Status;
+    use evento_core::Event;
+
+    use super::*;
+
+    fn command(micros: u64) -> CommandState {
+        let txn = TxnId(Timestamp {
+            micros,
+            logical: 0,
+            node: NodeId(0),
+        });
+        CommandState {
+            txn,
+            status: Status::PreAccepted,
+            promised: Ballot(txn.0),
+            accepted: Ballot(txn.0),
+            execute_at: txn.0,
+            deps: vec![],
+            keys: vec![Key("acc".into())],
+            events: vec![Event {
+                aggregate_type: "test/Account".into(),
+                aggregate_id: "acc".into(),
+                version: 1,
+                name: "Bumped".into(),
+                ..Default::default()
+            }],
+            reply_to: NodeId(0),
+            decision: None,
+            applied_conflict: None,
+        }
+    }
+
+    /// A flush returns only once everything staged before it is durable,
+    /// even while another flush is under way: it waits for that one's fsync
+    /// rather than finding `dirty` cleared and returning at once. The node's
+    /// inbox loop stages a vote and flushes while the sweep may be flushing
+    /// the same journal; returning early, it would send the vote before its
+    /// fsync completed — or after it failed (#308).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_flush_waits_for_the_fsync_under_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = FjallJournal::open(dir.path()).unwrap();
+        *journal.persist_delay.lock().unwrap() = Duration::from_millis(200);
+        journal.stage(&command(100)).await.unwrap();
+
+        let first = {
+            let journal = journal.clone();
+            tokio::spawn(async move { journal.flush().await })
+        };
+        // The first flush clears `dirty` and hands its fsync to the blocking
+        // pool, where it stays for the delay.
+        tokio::task::yield_now().await;
+        journal.flush().await.unwrap();
+        assert!(
+            first.is_finished(),
+            "a flush returned while the fsync covering what was staged before it was under way"
+        );
+        first.await.unwrap().unwrap();
     }
 }
