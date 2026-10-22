@@ -516,7 +516,13 @@ backend (sql/fjall). Phases, in order:
   (non-convergence from stalled transactions and from missed transactions), both
   now fixed (see Phase B). An `#[ignore]`d soak (`sweep_for_bugs`) runs every scenario
   across a wide seed range (250 seeds × all scenarios, ~8 min) for deeper hunting —
-  last run clean. ✅ **Deterministic runtime:** the tests run under
+  last run clean. Every seeded test also takes its seeds from the environment
+  (#319): `SIM_SEED` replays one, `SIM_SEEDS` or `SIM_DURATION` run fresh ones, and
+  a failure prints the line that replays it. **Swarm testing** (`swarm`, ignored)
+  draws each seed's whole shape — 3, 5 or 7 nodes, which faults are on and how hard,
+  the store, the workload and a `NodeConfig` within OPERATIONS' constraints — so
+  turning some faults off lets a run go deeper into the others; a nightly workflow
+  runs it on fresh seeds for 45 minutes and reports a failing seed on an issue. ✅ **Deterministic runtime:** the tests run under
   `#[tokio::test(start_paused = true)]` — a single-threaded, virtual-time runtime —
   with a virtual physical-time source injected into the HLC
   (`HybridLogicalClock::with_physical`) and deterministic events, so a given

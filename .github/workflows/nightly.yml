@@ -1,0 +1,89 @@
+name: Nightly
+
+# Swarm testing of evento-accord's deterministic simulator (#319): fresh
+# random seeds, each drawing its own cluster, faults, store, workload and
+# NodeConfig, for a fixed time. A failing seed is reported on an issue with
+# the one line that replays it locally.
+
+on:
+  schedule:
+    - cron: "23 2 * * *"
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: Seconds of fresh seeds
+        default: "2700"
+      plant_failure:
+        description: A seed to run first and fail on purpose, to exercise the reporting (opens or comments on the issue)
+        default: ""
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+jobs:
+  swarm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the simulator
+        run: cargo test -p evento-accord --release --test simulation --no-run
+
+      - name: Swarm
+        id: swarm
+        env:
+          SIM_DURATION: ${{ inputs.duration || '2700' }}
+          SIM_PLANT_FAILURE: ${{ inputs.plant_failure }}
+        run: |
+          set -o pipefail
+          cargo test -p evento-accord --release --test simulation swarm \
+            -- --exact --ignored --nocapture 2>&1 | tee swarm.log
+
+      - name: Report the failing seed
+        if: failure() && steps.swarm.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="accord: nightly simulation failure"
+          replay=$(grep -m1 '^replay: ' swarm.log | sed 's/^replay: //' || true)
+          config=$(grep -m1 '^swarm config: ' swarm.log || true)
+          {
+            echo "The nightly swarm failed: $RUN_URL"
+            echo
+            echo "Replay it locally:"
+            echo
+            echo '```sh'
+            echo "${replay:-(no replay line: the run failed before a seed did)}"
+            echo '```'
+            echo
+            echo '```'
+            echo "${config:-(no swarm config line)}"
+            rustc -V
+            echo '```'
+            echo
+            echo "<details><summary>Log tail</summary>"
+            echo
+            echo '```'
+            tail -n 80 swarm.log
+            echo '```'
+            echo
+            echo "</details>"
+          } > report.md
+          issue=$(gh issue list --state open --search "in:title \"$title\"" \
+            --json number,title --jq ".[] | select(.title == \"$title\") | .number" | head -n1)
+          if [ -n "$issue" ]; then
+            gh issue comment "$issue" --body-file report.md
+          else
+            gh issue create --title "$title" --label "type: bug" --body-file report.md
+          fi
