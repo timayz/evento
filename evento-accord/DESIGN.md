@@ -474,11 +474,19 @@ backend (sql/fjall). Phases, in order:
   last run clean. ✅ **Deterministic runtime:** the tests run under
   `#[tokio::test(start_paused = true)]` — a single-threaded, virtual-time runtime —
   with a virtual physical-time source injected into the HLC
-  (`HybridLogicalClock::with_physical`) and deterministic event ids, so a given
-  seed reproduces **exactly** (proven by `simulation_is_bit_reproducible`, which
-  runs a seed twice and asserts byte-identical fingerprints). The protocol core was
-  already order-independent (every map iteration feeding a decision is sorted or
-  keyed; `Replica::stuck` now sorts too). Virtual time also made the suite ~85×
+  (`HybridLogicalClock::with_physical`) and deterministic events, so a given
+  seed reproduces **exactly** — checked on the *execution*, not only the outcome:
+  every sim traces its network (`InMemoryNetwork::enable_trace` folds each
+  message, its ends, its fate and its virtual time into one hash), and
+  `every_scenario_kind_replays_its_trace` requires two runs of a seed to trace
+  identically, for every scenario kind including restarts, churn and joins (#320).
+  The protocol core was already order-independent (every map iteration feeding a
+  decision is sorted or keyed; `Replica::stuck` now sorts too). #320 removed the
+  last known leaks — the one `select!` was unbiased, a config reply fanned out in
+  hash order, a multi-shard retry took the first Nack in hash order, and the
+  sim's events carried random metadata ids — and planting either kind back (a
+  random payload, a hash-ordered broadcast) fails the check at its first step.
+  Virtual time also made the suite ~85×
   faster (no real sleeping). *Possible future step:* `madsim` for a contractually
   guaranteed deterministic scheduler + simulated network, if the in-process
   virtual-time guarantee ever proves insufficient.

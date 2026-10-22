@@ -60,4 +60,6 @@ pub use tcp::{
     serve, serve_tls, serve_tls_verified, GroupSink, MuxTransport, PeerCerts, TcpTransport,
     TlsClient, UnroutedHandler,
 };
-pub use transport::{Envelope, GroupId, InMemoryNetwork, InMemorySink, MessageFilter};
+pub use transport::{
+    Envelope, GroupId, InMemoryNetwork, InMemorySink, MessageFate, MessageFilter, TraceEntry,
+};
