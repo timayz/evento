@@ -4,8 +4,12 @@
 //! cluster and then checks correctness oracles. The scenario (workload + fault
 //! schedule) is derived from a seed; faults are crash/heal, network partitions,
 //! and node restarts — and, per message, drops, duplicates and delays that
-//! reorder a link, with one-way cuts in the partition plan ([`Faults`]). A pass
-//! validates the harness and the oracles, and any failure is a real bug.
+//! reorder a link, with one-way cuts in the partition plan; and failing
+//! storage: a restart loses its journal's unflushed tail, fsyncs, truncates
+//! and applies fail at seeded rates, and a restarted node may keep its data
+//! store — the production `ExecutorDataStore`, over [`SimExecutor`], may come
+//! back behind its journal ([`Faults`]). A pass validates the harness and the
+//! oracles, and any failure is a real bug.
 //!
 //! **Deterministic runtime.** The tests run under `#[tokio::test(start_paused =
 //! true)]`: a single-threaded runtime with *virtual* time that advances only
@@ -38,8 +42,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+mod common;
+
+use common::executor::SimExecutor;
+use common::journal::{FaultJournal, JournalFaults};
+use common::store::FaultStore;
 use evento_accord::{
-    DataStore, DynamicTopology, HybridLogicalClock, InMemoryDataStore, InMemoryJournal,
+    DataStore, DynamicTopology, ExecutorDataStore, HybridLogicalClock, InMemoryDataStore,
     InMemoryNetwork, Journal, Key, Message, MessageFaults, MessageSink, Node, NodeConfig, NodeId,
     StaticTopology, Topology, TraceEntry,
 };
@@ -101,7 +110,38 @@ struct Faults {
     messages: Option<MessageFaults>,
     /// Whether the partition plan also severs single directions.
     one_way: bool,
+    /// Failing storage, and restarts that keep the data store or lose part
+    /// of it (#316).
+    storage: Option<StorageFaults>,
 }
+
+/// Storage faults (#316), drawn per node from the scenario seed.
+#[derive(Clone, Copy, Debug)]
+struct StorageFaults {
+    /// Journal flushes, truncates and direct writes that fail.
+    journal: JournalFaults,
+    /// The probability a data-store apply fails.
+    apply: f64,
+    /// How long a journal fsync takes, so concurrent flushes overlap.
+    fsync: Duration,
+    /// The probability a write to a [`SimExecutor`] store persists what was
+    /// written before it: the lower, the longer the tail a crash loses.
+    persist: f64,
+}
+
+/// A few percent of fsyncs, direct writes and applies fail, one truncate in
+/// ten, an fsync takes 2 ms, and a third of the executor store's writes
+/// persist the ones before them.
+const STORAGE_FAULTS: StorageFaults = StorageFaults {
+    journal: JournalFaults {
+        flush: 0.02,
+        truncate: 0.1,
+        metadata: 0.02,
+    },
+    apply: 0.02,
+    fsync: Duration::from_millis(2),
+    persist: 0.3,
+};
 
 /// A few percent of messages lost or doubled, and every message held back up
 /// to 30 ms: below `fast_timeout` (50 ms), so some fast paths miss and the
@@ -116,18 +156,142 @@ const MESSAGE_FAULTS: MessageFaults = MessageFaults {
 /// one on never shifts the draws of the plan, or of another.
 const MESSAGE_SALT: u64 = 0x6d65_7373_6167_6573;
 const ONE_WAY_SALT: u64 = 0x6f6e_652d_7761_7973;
+const JOURNAL_SALT: u64 = 0x6a6f_7572_6e61_6c73;
+const APPLY_SALT: u64 = 0x6170_706c_6965_7321;
+const PERSIST_SALT: u64 = 0x7065_7273_6973_7473;
+const RESTART_SALT: u64 = 0x7265_7374_6172_7473;
 
 impl Faults {
     /// Message faults at [`MESSAGE_FAULTS`], and one-way cuts.
     const ALL: Faults = Faults {
         messages: Some(MESSAGE_FAULTS),
         one_way: true,
+        storage: None,
     };
 
-    /// Turns the message faults on in `sim`, drawn from `seed`.
-    fn arm(&self, sim: &Sim, seed: u64) {
+    /// Storage faults at [`STORAGE_FAULTS`] alone.
+    const STORAGE: Faults = Faults {
+        messages: None,
+        one_way: false,
+        storage: Some(STORAGE_FAULTS),
+    };
+
+    /// Turns the faults on in `sim`, drawn from `seed`.
+    fn arm(&self, sim: &mut Sim, seed: u64) {
         if let Some(faults) = self.messages {
             sim.net.set_message_faults(seed ^ MESSAGE_SALT, faults);
+        }
+        if let Some(faults) = self.storage {
+            sim.set_storage_faults(seed, faults);
+        }
+    }
+}
+
+/// Which data store the nodes run on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum StoreKind {
+    /// `InMemoryDataStore`.
+    #[default]
+    Memory,
+    /// The production `ExecutorDataStore`, over a [`SimExecutor`] (#316).
+    Executor,
+}
+
+/// A node's data store: what the node writes through — the backend behind
+/// seeded apply failures — and the backend itself, which the oracles read.
+#[derive(Clone)]
+struct SimStore {
+    node: Arc<FaultStore>,
+    backend: Backend,
+}
+
+#[derive(Clone)]
+enum Backend {
+    Memory(Arc<InMemoryDataStore>),
+    Executor(SimExecutor),
+}
+
+impl SimStore {
+    fn new(kind: StoreKind) -> Self {
+        let (node, backend): (Arc<dyn DataStore>, _) = match kind {
+            StoreKind::Memory => {
+                let memory = Arc::new(InMemoryDataStore::new());
+                (memory.clone(), Backend::Memory(memory))
+            }
+            StoreKind::Executor => {
+                let executor = SimExecutor::default();
+                (
+                    Arc::new(ExecutorDataStore::new(executor.clone())),
+                    Backend::Executor(executor),
+                )
+            }
+        };
+        SimStore {
+            node: Arc::new(FaultStore::over(node)),
+            backend,
+        }
+    }
+
+    /// What the node is built over.
+    fn data_store(&self) -> Arc<dyn DataStore> {
+        Arc::clone(&self.node) as Arc<dyn DataStore>
+    }
+
+    /// Every `(type, id, version)` committed here and the id of its event.
+    fn committed_events(&self) -> Vec<((String, String, u16), ulid::Ulid)> {
+        match &self.backend {
+            Backend::Memory(memory) => memory.committed_events(),
+            Backend::Executor(executor) => executor.committed_events(),
+        }
+    }
+
+    /// The aggregate's version as the backend holds it, faults aside.
+    async fn version(&self, aggregate_type: &str, aggregate_id: &str) -> anyhow::Result<u16> {
+        match &self.backend {
+            Backend::Memory(memory) => memory.version(aggregate_type, aggregate_id).await,
+            Backend::Executor(executor) => Ok(executor.version_of(aggregate_type, aggregate_id)),
+        }
+    }
+}
+
+/// How a restarted node's data store comes back. Its journal always loses
+/// what was staged and not flushed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Restart {
+    /// Empty: the node replays its journal into a fresh store — a store that
+    /// is not durable (in memory); a durable one lost is a rejoin.
+    EmptyStore,
+    /// As it was: a SQLite or fjall store survives a restart — possibly
+    /// ahead of the journal, holding an apply whose record was not flushed.
+    KeepStore,
+    /// As it was, less what it had not persisted (a [`SimExecutor`] store
+    /// only): a store **behind** its journal, the case #309 suspects.
+    KeepStoreLoseTail,
+}
+
+/// How [`Sim::build_with`] lays a cluster out.
+#[derive(Clone)]
+struct SimOptions {
+    n: u64,
+    /// A node whose clock runs this many microseconds ahead.
+    skew: Option<(usize, u64)>,
+    config: NodeConfig,
+    /// A shared fast-path electorate; `None` ⇒ all nodes.
+    electorate: Option<Vec<NodeId>>,
+    /// Over [`DynamicTopology`] (not restartable).
+    dynamic: bool,
+    store: StoreKind,
+}
+
+impl SimOptions {
+    fn new(n: u64) -> Self {
+        SimOptions {
+            n,
+            skew: None,
+            config: NodeConfig::default(),
+            electorate: None,
+            dynamic: false,
+            store: StoreKind::Memory,
         }
     }
 }
@@ -135,9 +299,9 @@ impl Faults {
 struct Sim {
     ids: Vec<NodeId>,
     nodes: Vec<Node>,
-    stores: Vec<Arc<InMemoryDataStore>>,
+    stores: Vec<SimStore>,
     /// Kept across a restart (durable) so a rebuilt node recovers from it.
-    journals: Vec<Arc<InMemoryJournal>>,
+    journals: Vec<Arc<FaultJournal>>,
     net: Arc<InMemoryNetwork>,
     /// Per-node loops (`[inbox, recovery]`), so one node can be torn down alone.
     tasks: Vec<Vec<tokio::task::JoinHandle<()>>>,
@@ -151,6 +315,11 @@ struct Sim {
     /// Each node's epoch-versioned topology, for a cluster built by
     /// [`build_dynamic`](Sim::build_dynamic); empty otherwise.
     dynamic: Vec<Arc<DynamicTopology>>,
+    /// The data store every node runs on, kept for the ones rebuilt later.
+    store_kind: StoreKind,
+    /// Seeded storage faults and their seed, kept so a rebuilt node's fresh
+    /// store gets them too.
+    storage: Option<(u64, StorageFaults)>,
 }
 
 /// A dropped sim stops its nodes: left running, every finished scenario's
@@ -165,30 +334,42 @@ impl Drop for Sim {
 
 impl Sim {
     fn build(n: u64) -> Self {
-        Self::build_inner(n, None, NodeConfig::default(), None, false)
+        Self::build_with(SimOptions::new(n))
     }
 
     /// Builds a cluster where node `skewed`'s clock runs `skew` microseconds ahead
     /// of the others — to exercise bounded clock-skew handling.
     fn build_with_skew(n: u64, skewed: usize, skew: u64) -> Self {
-        Self::build_inner(n, Some((skewed, skew)), NodeConfig::default(), None, false)
+        Self::build_with(SimOptions {
+            skew: Some((skewed, skew)),
+            ..SimOptions::new(n)
+        })
     }
 
     /// Builds a cluster with a custom [`NodeConfig`] on every node.
     fn build_with_config(n: u64, config: NodeConfig) -> Self {
-        Self::build_inner(n, None, config, None, false)
+        Self::build_with(SimOptions {
+            config,
+            ..SimOptions::new(n)
+        })
     }
 
     /// Builds a cluster with a shared fast-path electorate, to exercise the
     /// shrunk-electorate consensus & recovery paths under the oracles.
     fn build_with_electorate(n: u64, electorate: Vec<NodeId>) -> Self {
-        Self::build_inner(n, None, NodeConfig::default(), Some(electorate), false)
+        Self::build_with(SimOptions {
+            electorate: Some(electorate),
+            ..SimOptions::new(n)
+        })
     }
 
     /// Builds a cluster over [`DynamicTopology`] — one shard of every node,
     /// at epoch 0 — whose epochs the scenario changes. Not restartable.
     fn build_dynamic(n: u64) -> Self {
-        Self::build_inner(n, None, NodeConfig::default(), None, true)
+        Self::build_with(SimOptions {
+            dynamic: true,
+            ..SimOptions::new(n)
+        })
     }
 
     /// The execution trace so far (see [`RunTrace`]).
@@ -208,13 +389,15 @@ impl Sim {
         }
     }
 
-    fn build_inner(
-        n: u64,
-        skew: Option<(usize, u64)>,
-        config: NodeConfig,
-        electorate: Option<Vec<NodeId>>,
-        dynamic: bool,
-    ) -> Self {
+    fn build_with(options: SimOptions) -> Self {
+        let SimOptions {
+            n,
+            skew,
+            config,
+            electorate,
+            dynamic,
+            store: store_kind,
+        } = options;
         let ids: Vec<NodeId> = (0..n).map(NodeId).collect();
         let net = InMemoryNetwork::new();
         net.enable_trace(RECORD_TRACE.with(Cell::get));
@@ -233,8 +416,8 @@ impl Sim {
                 _ => Arc::new(HybridLogicalClock::with_physical(id, virtual_micros(base))),
             };
             let sink: Arc<dyn MessageSink> = Arc::new(net.sink(id));
-            let store = Arc::new(InMemoryDataStore::new());
-            let journal = Arc::new(InMemoryJournal::new());
+            let store = SimStore::new(store_kind);
+            let journal = Arc::new(FaultJournal::new());
             let topology: Arc<dyn Topology> = if dynamic {
                 let topology = Arc::new(DynamicTopology::new(id, 0, vec![ids.clone()]));
                 topologies.push(Arc::clone(&topology));
@@ -247,7 +430,7 @@ impl Sim {
                 topology,
                 clock,
                 sink,
-                Arc::clone(&store) as Arc<dyn DataStore>,
+                store.data_store(),
                 Arc::clone(&journal) as Arc<dyn Journal>,
             )
             .with_config(config);
@@ -267,19 +450,70 @@ impl Sim {
             electorate,
             config,
             dynamic: topologies,
+            store_kind,
+            storage: None,
         }
     }
 
-    /// Restarts node `i`: aborts its loops (dropping in-memory state), rebuilds a
-    /// fresh [`Node`] + fresh store keeping the durable journal, recovers from the
-    /// journal, restarts the loops, and swaps everything into the `Sim`. Mirrors
-    /// `tests/restart.rs`. The node comes back with the cluster's configuration.
-    async fn restart(&mut self, i: usize) {
-        self.restart_with(i, self.config).await;
+    /// Turns `faults` on for every node's journal and store, drawn from
+    /// `seed`.
+    fn set_storage_faults(&mut self, seed: u64, faults: StorageFaults) {
+        self.storage = Some((seed, faults));
+        for i in 0..self.ids.len() {
+            self.arm_journal(i);
+            self.arm_store(i, &self.stores[i]);
+        }
     }
 
-    /// [`restart`](Self::restart), the node coming back with `config`.
+    /// Stops the storage failures — part of a heal. Fsyncs keep their time
+    /// and executor stores their persistence.
+    fn clear_storage_faults(&mut self) {
+        self.storage = None;
+        for journal in &self.journals {
+            journal.clear_storage_faults();
+        }
+        for store in &self.stores {
+            store.node.clear_faults();
+        }
+    }
+
+    /// Each node draws from its own generators, derived from the seed.
+    fn node_seed(seed: u64, i: usize) -> u64 {
+        seed ^ (i as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+    }
+
+    fn arm_journal(&self, i: usize) {
+        let Some((seed, faults)) = self.storage else {
+            return;
+        };
+        let seed = Self::node_seed(seed, i);
+        self.journals[i].set_storage_faults(seed ^ JOURNAL_SALT, faults.journal);
+        self.journals[i].set_fsync_delay(faults.fsync);
+    }
+
+    fn arm_store(&self, i: usize, store: &SimStore) {
+        let Some((seed, faults)) = self.storage else {
+            return;
+        };
+        let seed = Self::node_seed(seed, i);
+        store.node.set_apply_faults(seed ^ APPLY_SALT, faults.apply);
+        if let Backend::Executor(executor) = &store.backend {
+            executor.set_persistence(seed ^ PERSIST_SALT, faults.persist);
+        }
+    }
+
+    /// Restarts node `i` with `config`, over a fresh store (see
+    /// [`restart_as`](Self::restart_as)).
     async fn restart_with(&mut self, i: usize, config: NodeConfig) {
+        self.restart_as(i, config, Restart::EmptyStore).await;
+    }
+
+    /// Restarts node `i`: aborts its loops (dropping in-memory state, and
+    /// whatever its journal had staged but not flushed), rebuilds a fresh
+    /// [`Node`] with `config` over the durable journal and a data store as
+    /// `mode` says, recovers from the journal, restarts the loops, and swaps
+    /// everything into the `Sim`. Mirrors `tests/restart.rs`.
+    async fn restart_as(&mut self, i: usize, config: NodeConfig, mode: Restart) {
         assert!(
             self.dynamic.is_empty(),
             "a restart over a dynamic topology is not modelled"
@@ -287,22 +521,47 @@ impl Sim {
         for t in &self.tasks[i] {
             t.abort();
         }
+        self.journals[i].crash();
+        let store = match mode {
+            Restart::EmptyStore => {
+                let store = SimStore::new(self.store_kind);
+                self.arm_store(i, &store);
+                store
+            }
+            Restart::KeepStore => self.stores[i].clone(),
+            Restart::KeepStoreLoseTail => {
+                let store = self.stores[i].clone();
+                match &store.backend {
+                    Backend::Executor(executor) => executor.crash(),
+                    Backend::Memory(_) => panic!("only an executor store loses a tail"),
+                }
+                store
+            }
+        };
         let id = self.ids[i];
         let inbox = self.net.register(id); // replaces the inbox sender
-        let store = Arc::new(InMemoryDataStore::new());
-        let node = Node::new(
-            id,
-            Arc::new(Self::topology(id, &self.ids, &self.electorate)),
-            Arc::new(HybridLogicalClock::with_physical(
+                                           // A recovery its storage fails fails the start, and its host starts
+                                           // the node again: the faults are seeded rates, so one soon passes.
+        let mut attempts = 0;
+        let node = loop {
+            let node = Node::new(
                 id,
-                virtual_micros(self.base),
-            )),
-            Arc::new(self.net.sink(id)),
-            Arc::clone(&store) as Arc<dyn DataStore>,
-            Arc::clone(&self.journals[i]) as Arc<dyn Journal>,
-        )
-        .with_config(config);
-        node.recover_state().await.unwrap();
+                Arc::new(Self::topology(id, &self.ids, &self.electorate)),
+                Arc::new(HybridLogicalClock::with_physical(
+                    id,
+                    virtual_micros(self.base),
+                )),
+                Arc::new(self.net.sink(id)),
+                store.data_store(),
+                Arc::clone(&self.journals[i]) as Arc<dyn Journal>,
+            )
+            .with_config(config);
+            match node.recover_state().await {
+                Ok(()) => break node,
+                Err(_) if attempts < 100 => attempts += 1,
+                Err(err) => panic!("node {i} could not restart: {err:#}"),
+            }
+        };
         self.tasks[i] = vec![node.start(inbox), node.start_recovery()];
         self.nodes[i] = node;
         self.stores[i] = store;
@@ -439,12 +698,12 @@ async fn run_scenario(seed: u64) -> Result<RunTrace, String> {
     // Writer tasks: all coordinate through node 0 (always live), so every write
     // reaches the {0,1,2} quorum and returns a definite outcome.
     let coordinator = sim.nodes[0].clone();
-    let store0 = Arc::clone(&sim.stores[0]);
+    let store0 = sim.stores[0].clone();
     let ids = Arc::new(AtomicU64::new(1));
     let mut writers = Vec::new();
     for plan in writer_plans {
         let coordinator = coordinator.clone();
-        let store0 = Arc::clone(&store0);
+        let store0 = store0.clone();
         let history = Arc::clone(&history);
         let ids = Arc::clone(&ids);
         writers.push(tokio::spawn(async move {
@@ -492,7 +751,7 @@ async fn run_scenario(seed: u64) -> Result<RunTrace, String> {
 /// have converged when these sets are identical (the applied *log* length differs
 /// legitimately — it also records aborts, which vary per replica — so it is not a
 /// convergence signal; the committed set is).
-fn committed_set(store: &InMemoryDataStore) -> BTreeSet<((String, String, u16), ulid::Ulid)> {
+fn committed_set(store: &SimStore) -> BTreeSet<((String, String, u16), ulid::Ulid)> {
     store.committed_events().into_iter().collect()
 }
 
@@ -500,7 +759,7 @@ fn committed_set(store: &InMemoryDataStore) -> BTreeSet<((String, String, u16), 
 /// set — the exact predicate the oracle asserts, so it returns the instant
 /// convergence is reached and never on a false quiescence. Returns `false` if the
 /// budget (a generous liveness ceiling, not a tuned value) elapses first.
-async fn converge(stores: &[Arc<InMemoryDataStore>]) -> bool {
+async fn converge(stores: &[SimStore]) -> bool {
     for _ in 0..1500 {
         let first = committed_set(&stores[0]);
         if !first.is_empty() && stores.iter().all(|s| committed_set(s) == first) {
@@ -511,7 +770,7 @@ async fn converge(stores: &[Arc<InMemoryDataStore>]) -> bool {
     false
 }
 
-async fn version_of(store: &InMemoryDataStore, agg: &str) -> u16 {
+async fn version_of(store: &SimStore, agg: &str) -> u16 {
     store.version(AGG_TYPE, agg).await.unwrap_or(0)
 }
 
@@ -599,8 +858,8 @@ async fn run_adversarial(seed: u64, faults: Faults) -> Adversarial {
     const WRITES_EACH: usize = 12;
     const MAX_DOWN: usize = 2; // keep a quorum (3 of 5) alive
 
-    let sim = Sim::build(N);
-    faults.arm(&sim, seed);
+    let mut sim = Sim::build(N);
+    faults.arm(&mut sim, seed);
     let history: History = Arc::new(Mutex::new(Vec::new()));
 
     let mut rng = StdRng::seed_from_u64(seed);
@@ -632,12 +891,12 @@ async fn run_adversarial(seed: u64, faults: Faults) -> Adversarial {
     });
 
     let nodes = sim.nodes.clone();
-    let store0 = Arc::clone(&sim.stores[0]);
+    let store0 = sim.stores[0].clone();
     let ids = Arc::new(AtomicU64::new(1));
     let mut writers = Vec::new();
     for plan in writer_plans {
         let nodes = nodes.clone();
-        let store0 = Arc::clone(&store0);
+        let store0 = store0.clone();
         let history = Arc::clone(&history);
         let ids = Arc::clone(&ids);
         writers.push(tokio::spawn(async move {
@@ -743,11 +1002,11 @@ async fn run_partition(seed: u64, electorate: Option<Vec<NodeId>>, faults: Fault
     const WRITERS: usize = 5;
     const WRITES_EACH: usize = 12;
 
-    let sim = match electorate {
+    let mut sim = match electorate {
         Some(e) => Sim::build_with_electorate(N, e),
         None => Sim::build(N),
     };
-    faults.arm(&sim, seed);
+    faults.arm(&mut sim, seed);
     let history: History = Arc::new(Mutex::new(Vec::new()));
 
     let mut rng = StdRng::seed_from_u64(seed);
@@ -803,12 +1062,12 @@ async fn run_partition(seed: u64, electorate: Option<Vec<NodeId>>, faults: Fault
     });
 
     let nodes = sim.nodes.clone();
-    let store0 = Arc::clone(&sim.stores[0]);
+    let store0 = sim.stores[0].clone();
     let ids = Arc::new(AtomicU64::new(1));
     let mut writers = Vec::new();
     for plan in writer_plans {
         let nodes = nodes.clone();
-        let store0 = Arc::clone(&store0);
+        let store0 = store0.clone();
         let history = Arc::clone(&history);
         let ids = Arc::clone(&ids);
         writers.push(tokio::spawn(async move {
@@ -922,14 +1181,17 @@ async fn safety_holds_under_partitions_with_a_shrunk_electorate() {
 /// clone for the run, and restarting a node replaces its inbox — so coordinating
 /// through a just-restarted node would route replies to the new inbox and hang
 /// the old clone's write. Keeping coordinators stable sidesteps that hazard.
-async fn run_with_restarts(seed: u64, faults: Faults) -> Adversarial {
+async fn run_with_restarts(seed: u64, faults: Faults, store: StoreKind) -> Adversarial {
     const N: u64 = 5;
     const AGGS: usize = 4;
     const WRITERS: usize = 5;
     const WRITES_EACH: usize = 12;
 
-    let mut sim = Sim::build(N);
-    faults.arm(&sim, seed);
+    let mut sim = Sim::build_with(SimOptions {
+        store,
+        ..SimOptions::new(N)
+    });
+    faults.arm(&mut sim, seed);
     let history: History = Arc::new(Mutex::new(Vec::new()));
 
     let mut rng = StdRng::seed_from_u64(seed);
@@ -954,15 +1216,34 @@ async fn run_with_restarts(seed: u64, faults: Faults) -> Adversarial {
             )
         })
         .collect();
+    // With storage faults, each restart keeps the store or (in-memory)
+    // rebuilds it from the journal — and an executor store may lose its
+    // unpersisted tail — drawn from its own generator, so the plan above is
+    // unchanged. A durable store never comes back empty from a restart: a
+    // lost store is a rejoin.
+    let mut modes = StdRng::seed_from_u64(seed ^ RESTART_SALT);
+    let restart_modes: Vec<Restart> = restart_plan
+        .iter()
+        .map(|_| match (faults.storage.is_some(), store) {
+            (false, StoreKind::Memory) => Restart::EmptyStore,
+            (false, StoreKind::Executor) => Restart::KeepStore,
+            (true, StoreKind::Memory) => {
+                [Restart::EmptyStore, Restart::KeepStore][modes.random_range(0..2)]
+            }
+            (true, StoreKind::Executor) => {
+                [Restart::KeepStore, Restart::KeepStoreLoseTail][modes.random_range(0..2)]
+            }
+        })
+        .collect();
 
     // node 0 is never restarted, so its store handle stays valid for version reads.
     let nodes = sim.nodes.clone();
-    let store0 = Arc::clone(&sim.stores[0]);
+    let store0 = sim.stores[0].clone();
     let ids = Arc::new(AtomicU64::new(1));
     let mut writers = Vec::new();
     for plan in writer_plans {
         let nodes = nodes.clone();
-        let store0 = Arc::clone(&store0);
+        let store0 = store0.clone();
         let history = Arc::clone(&history);
         let ids = Arc::clone(&ids);
         writers.push(tokio::spawn(async move {
@@ -988,15 +1269,16 @@ async fn run_with_restarts(seed: u64, faults: Faults) -> Adversarial {
 
     // Drive restarts on the main task (Sim::restart needs &mut self), interleaved
     // with the writers running on their own tasks.
-    for (delay, node) in restart_plan {
+    for ((delay, node), mode) in restart_plan.into_iter().zip(restart_modes) {
         tokio::time::sleep(Duration::from_millis(delay)).await;
-        sim.restart(node).await;
+        sim.restart_as(node, sim.config, mode).await;
     }
     for w in writers {
         let _ = w.await;
     }
 
     sim.net.clear_message_faults();
+    sim.clear_storage_faults();
     let converged = converge(&sim.stores).await;
 
     let records = history.lock().unwrap().clone();
@@ -1011,7 +1293,7 @@ async fn run_with_restarts(seed: u64, faults: Faults) -> Adversarial {
 async fn safety_holds_under_restarts() {
     const TOTAL: u64 = 20;
     for seed in 0..TOTAL {
-        let result = run_with_restarts(seed, Faults::default()).await;
+        let result = run_with_restarts(seed, Faults::default(), StoreKind::Memory).await;
         if let Some(v) = result.safety {
             panic!("SAFETY VIOLATION (restart) at seed {seed}: {v}");
         }
@@ -1064,13 +1346,58 @@ async fn safety_holds_under_partitions_and_message_faults() {
 #[tokio::test(start_paused = true)]
 async fn safety_holds_under_restarts_and_message_faults() {
     for seed in 0..20 {
-        let result = run_with_restarts(seed, Faults::ALL).await;
+        let result = run_with_restarts(seed, Faults::ALL, StoreKind::Memory).await;
         if let Some(v) = result.safety {
             panic!("SAFETY VIOLATION (restart +faults) at seed {seed}: {v}");
         }
         assert!(
             result.converged,
             "seed {seed}: cluster failed to converge after restarts (message faults)"
+        );
+    }
+}
+
+/// The restart scenario over failing storage (#316): every restart loses what
+/// the node's journal staged and had not flushed; fsyncs, truncates, direct
+/// journal writes and applies fail at seeded rates; and about half the
+/// restarted nodes keep their data store, possibly ahead of their journal. On
+/// the production `ExecutorDataStore` a kept store may also lose its
+/// unpersisted tail and come back behind its journal.
+#[tokio::test(start_paused = true)]
+async fn safety_holds_under_restarts_and_storage_faults() {
+    for store in [StoreKind::Memory, StoreKind::Executor] {
+        for seed in 0..20 {
+            let result = run_with_restarts(seed, Faults::STORAGE, store).await;
+            if let Some(v) = result.safety {
+                panic!("SAFETY VIOLATION (restart +storage, {store:?}) at seed {seed}: {v}");
+            }
+            assert!(
+                result.converged,
+                "seed {seed}: cluster failed to converge after restarts (storage faults, {store:?})"
+            );
+        }
+    }
+}
+
+/// The seeds of the restart scenario, over failing storage on the production
+/// store, that freeze a replica's store (#309). A restart that keeps the
+/// store but loses its unpersisted tail can leave it behind what the
+/// replica records as applied, with a hole; an apply across the hole fails
+/// the store's version check, `ExecutorDataStore` takes that for "already
+/// present", the replica marks the transaction applied — and every later
+/// apply on the aggregate fails the same way. Compaction then removes any way
+/// back: the node stays behind for good.
+const FROZEN_STORE_SEEDS: [u64; 4] = [76, 189, 222, 224];
+
+#[tokio::test(start_paused = true)]
+#[ignore = "#309: a store behind its journal freezes"]
+async fn a_store_that_lost_its_tail_catches_up() {
+    for seed in FROZEN_STORE_SEEDS {
+        let result = run_with_restarts(seed, Faults::STORAGE, StoreKind::Executor).await;
+        assert!(result.safety.is_none(), "seed {seed}: {:?}", result.safety);
+        assert!(
+            result.converged,
+            "seed {seed}: a replica's store froze behind the others (#309)"
         );
     }
 }
@@ -1131,12 +1458,12 @@ async fn run_probe(seed: u64) -> Probe {
     });
 
     let nodes = sim.nodes.clone();
-    let store0 = Arc::clone(&sim.stores[0]);
+    let store0 = sim.stores[0].clone();
     let ids = Arc::new(AtomicU64::new(1));
     let mut writers = Vec::new();
     for plan in writer_plans {
         let nodes = nodes.clone();
-        let store0 = Arc::clone(&store0);
+        let store0 = store0.clone();
         let history = Arc::clone(&history);
         let ids = Arc::clone(&ids);
         writers.push(tokio::spawn(async move {
@@ -1240,8 +1567,16 @@ async fn every_scenario_kind_replays_its_trace() {
             })
             .await;
             assert_replays(&format!("restarts{label}"), seed, |s| async move {
-                run_with_restarts(s, faults).await.trace
+                run_with_restarts(s, faults, StoreKind::Memory).await.trace
             })
+            .await;
+        }
+        for store in [StoreKind::Memory, StoreKind::Executor] {
+            assert_replays(
+                &format!("restarts +storage {store:?}"),
+                seed,
+                |s| async move { run_with_restarts(s, Faults::STORAGE, store).await.trace },
+            )
             .await;
         }
         assert_replays("probe", seed, |s| async move { run_probe(s).await.trace }).await;
@@ -1288,12 +1623,12 @@ async fn run_bounded(seed: u64) -> Result<RunTrace, String> {
     // Writers coordinate through the always-live node 0, so every write commits
     // and applies cluster-wide (no faults — this isolates the compaction claim).
     let coordinator = sim.nodes[0].clone();
-    let store0 = Arc::clone(&sim.stores[0]);
+    let store0 = sim.stores[0].clone();
     let ids = Arc::new(AtomicU64::new(1));
     let mut writers = Vec::new();
     for plan in writer_plans {
         let coordinator = coordinator.clone();
-        let store0 = Arc::clone(&store0);
+        let store0 = store0.clone();
         let history = Arc::clone(&history);
         let ids = Arc::clone(&ids);
         writers.push(tokio::spawn(async move {
@@ -1512,12 +1847,12 @@ async fn run_skew(seed: u64) -> Result<RunTrace, String> {
         .collect();
 
     let nodes = sim.nodes.clone();
-    let store0 = Arc::clone(&sim.stores[0]);
+    let store0 = sim.stores[0].clone();
     let ids = Arc::new(AtomicU64::new(1));
     let mut writers = Vec::new();
     for plan in writer_plans {
         let nodes = nodes.clone();
-        let store0 = Arc::clone(&store0);
+        let store0 = store0.clone();
         let history = Arc::clone(&history);
         let ids = Arc::clone(&ids);
         writers.push(tokio::spawn(async move {
@@ -1614,12 +1949,12 @@ async fn run_healthy_high_timeout(seed: u64) -> Result<u64, String> {
         .collect();
 
     let nodes = sim.nodes.clone();
-    let store0 = Arc::clone(&sim.stores[0]);
+    let store0 = sim.stores[0].clone();
     let ids = Arc::new(AtomicU64::new(1));
     let mut writers = Vec::new();
     for plan in writer_plans {
         let nodes = nodes.clone();
-        let store0 = Arc::clone(&store0);
+        let store0 = store0.clone();
         let history = Arc::clone(&history);
         let ids = Arc::clone(&ids);
         writers.push(tokio::spawn(async move {
@@ -1910,12 +2245,12 @@ async fn run_churn(seed: u64) -> ChurnProbe {
     // Writers coordinate through node 0 (always live).
     let history: History = Arc::new(Mutex::new(Vec::new()));
     let coordinator = nodes[0].clone();
-    let store0 = Arc::clone(&stores[0]);
+    let store0 = stores[0].clone();
     let id_seq = Arc::new(AtomicU64::new(1));
     let mut writers = Vec::new();
     for plan in writer_plans {
         let coordinator = coordinator.clone();
-        let store0 = Arc::clone(&store0);
+        let store0 = store0.clone();
         let history = Arc::clone(&history);
         let id_seq = Arc::clone(&id_seq);
         writers.push(tokio::spawn(async move {
@@ -2088,13 +2423,45 @@ async fn sweep_for_bugs() {
                 );
                 assert!(p.converged, "{kind}{label} seed {seed}: did not converge");
             }
-            let r = run_with_restarts(seed, faults).await;
+            let r = run_with_restarts(seed, faults, StoreKind::Memory).await;
             assert!(
                 r.safety.is_none(),
                 "restarts{label} seed {seed}: {:?}",
                 r.safety
             );
             assert!(r.converged, "restarts{label} seed {seed}: did not converge");
+        }
+        // Restarts over failing storage, on both stores, alone and with every
+        // network fault on top.
+        for store in [StoreKind::Memory, StoreKind::Executor] {
+            for (label, faults) in [
+                ("+storage", Faults::STORAGE),
+                (
+                    "+storage +faults",
+                    Faults {
+                        storage: Some(STORAGE_FAULTS),
+                        ..Faults::ALL
+                    },
+                ),
+            ] {
+                if store == StoreKind::Executor
+                    && faults.messages.is_none()
+                    && FROZEN_STORE_SEEDS.contains(&seed)
+                {
+                    // #309, until it is fixed: `a_store_that_lost_its_tail_catches_up`.
+                    continue;
+                }
+                let r = run_with_restarts(seed, faults, store).await;
+                assert!(
+                    r.safety.is_none(),
+                    "restarts {label} {store:?} seed {seed}: {:?}",
+                    r.safety
+                );
+                assert!(
+                    r.converged,
+                    "restarts {label} {store:?} seed {seed}: did not converge"
+                );
+            }
         }
         // Compaction boundedness + clock skew.
         if let Err(v) = run_bounded(seed).await {
@@ -2145,15 +2512,10 @@ impl Sim {
     /// joins through `contact` before its sweeps start (as
     /// `GroupHost::open_joining` does).
     async fn rejoin(&mut self, i: usize, contact: NodeId, config: NodeConfig) {
-        let store = Arc::new(InMemoryDataStore::new());
-        self.rejoin_over(
-            i,
-            contact,
-            config,
-            Arc::clone(&store) as Arc<dyn DataStore>,
-            store,
-        )
-        .await;
+        let store = SimStore::new(self.store_kind);
+        self.arm_store(i, &store);
+        self.rejoin_over(i, contact, config, store.data_store(), store)
+            .await;
     }
 
     /// [`rejoin`](Self::rejoin) over `backend`, a store wrapping `store`.
@@ -2163,7 +2525,7 @@ impl Sim {
         contact: NodeId,
         config: NodeConfig,
         backend: Arc<dyn DataStore>,
-        store: Arc<InMemoryDataStore>,
+        store: SimStore,
     ) {
         for t in &self.tasks[i] {
             t.abort();
@@ -2487,7 +2849,7 @@ async fn a_peer_rejoining_under_writes_is_counted_again() {
 /// A store whose applies take `delay` while `slow` is set: a joiner's slow
 /// disk, installing each snapshot page long after it landed.
 struct SlowStore {
-    inner: Arc<InMemoryDataStore>,
+    inner: Arc<dyn DataStore>,
     delay: Duration,
     slow: AtomicBool,
 }
@@ -2571,9 +2933,9 @@ async fn a_joiner_with_a_slow_disk_keeps_its_contact_holding() {
     await_rejoin_required(&sim.nodes[3]).await;
 
     let lapse = config.collect_timeout * 4;
-    let store = Arc::new(InMemoryDataStore::new());
+    let store = SimStore::new(StoreKind::Memory);
     let slow = Arc::new(SlowStore {
-        inner: Arc::clone(&store),
+        inner: store.data_store(),
         delay: lapse + Duration::from_secs(5),
         slow: AtomicBool::new(true),
     });
@@ -2592,7 +2954,7 @@ async fn a_joiner_with_a_slow_disk_keeps_its_contact_holding() {
         NodeId(0),
         config,
         Arc::clone(&slow) as Arc<dyn DataStore>,
-        Arc::clone(&store),
+        store,
     )
     .await;
     slow.slow.store(false, Ordering::SeqCst);

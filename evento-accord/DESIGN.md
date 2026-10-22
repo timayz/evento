@@ -472,7 +472,16 @@ backend (sql/fjall). Phases, in order:
   messages on a link overtake each other, and the partition plan also cuts
   single directions (`InMemoryNetwork::cut`). That reaches the paths whole-node
   faults barely touch — a late or doubled PreAccept, Accept, Commit or Apply, a
-  reply after its ballot moved on, a recovery racing a slow coordinator. Across all
+  reply after its ballot moved on, a recovery racing a slow coordinator. The
+  restart scenario also runs over **failing storage** (#316): the journal
+  double (`tests/common`, shared with the journal- and store-fault suites)
+  keeps staged writes pending until a flush succeeds, so a restart loses its
+  unflushed tail; flushes, truncates, direct writes and applies fail at seeded
+  rates; and a restarted node may keep its data store — possibly ahead of its
+  journal — or, on the production `ExecutorDataStore` over an in-memory evento
+  executor, come back **behind** it, having lost writes it had not persisted.
+  That last case reproduces #309 deterministically: a replica's store freezes
+  while the replica marks transactions applied. Across all
   seeds, **safety holds** — no split-brain, no double-commit — and after healing
   the cluster **converges**. The harness already paid off: it found two real gaps
   (non-convergence from stalled transactions and from missed transactions), both

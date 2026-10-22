@@ -8,82 +8,19 @@
 //! version read that failed says nothing about the condition: answering
 //! "holds" would let a stale write commit.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+mod common;
+
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
+use common::store::FaultStore;
 use evento_accord::{
-    DataStore, HybridLogicalClock, InMemoryDataStore, InMemoryJournal, InMemoryNetwork, Journal,
-    Message, MessageSink, Node, NodeConfig, NodeId, StaticTopology, Status, Timestamp, TxnId,
+    DataStore, HybridLogicalClock, InMemoryJournal, InMemoryNetwork, Journal, Message, MessageSink,
+    Node, NodeConfig, NodeId, StaticTopology, Status,
 };
-use evento_core::cursor::{Args, ReadResult};
-use evento_core::{Event, EventFilter, RoutingKey};
-
-/// An in-memory store whose applies and version reads can be made to fail.
-#[derive(Default)]
-struct FaultStore {
-    inner: InMemoryDataStore,
-    apply_failing: AtomicBool,
-    /// Fails this many applies, then works again.
-    applies_to_fail: AtomicUsize,
-    version_failing: AtomicBool,
-    /// Fails every query (`DataStore::read`), as a forwarded read runs one.
-    read_failing: AtomicBool,
-}
-
-impl FaultStore {
-    fn applied(&self) -> Vec<TxnId> {
-        self.inner.applied_log().iter().map(|e| e.txn).collect()
-    }
-}
-
-#[async_trait]
-impl DataStore for FaultStore {
-    async fn version(&self, aggregate_type: &str, aggregate_id: &str) -> anyhow::Result<u16> {
-        if self.version_failing.load(Ordering::SeqCst) {
-            anyhow::bail!("simulated read failure");
-        }
-        self.inner.version(aggregate_type, aggregate_id).await
-    }
-
-    async fn apply(
-        &self,
-        txn: TxnId,
-        execute_at: Timestamp,
-        events: Vec<Event>,
-        commit: bool,
-    ) -> anyhow::Result<()> {
-        if self.apply_failing.load(Ordering::SeqCst)
-            || self
-                .applies_to_fail
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                .is_ok()
-        {
-            anyhow::bail!("simulated write failure");
-        }
-        self.inner.apply(txn, execute_at, events, commit).await
-    }
-
-    async fn read(
-        &self,
-        aggregators: Option<Arc<[EventFilter]>>,
-        routing_key: Option<RoutingKey>,
-        args: Args,
-        to_micros: Option<u64>,
-    ) -> anyhow::Result<ReadResult<Event>> {
-        if self.read_failing.load(Ordering::SeqCst) {
-            anyhow::bail!("simulated query failure");
-        }
-        self.inner
-            .read(aggregators, routing_key, args, to_micros)
-            .await
-    }
-
-    async fn snapshot(&self) -> anyhow::Result<Vec<Event>> {
-        self.inner.snapshot().await
-    }
-}
+use evento_core::cursor::Args;
+use evento_core::Event;
 
 struct Cluster {
     nodes: Vec<Node>,
