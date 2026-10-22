@@ -42,10 +42,30 @@
 //!   started, or shows a write that returned a conflict or was invoked after
 //!   it ended; and every read is a prefix of the converged history
 //!   ([`read_violation`]).
+//!
+//! ## Seeds
+//!
+//! Every seeded test runs a fixed range by default, the one CI runs. The
+//! environment overrides it ([`sim_seeds`], #319):
+//! - `SIM_SEED=<n>` replays seed `n`;
+//! - `SIM_SEEDS=<count>` runs that many fresh seeds, and
+//!   `SIM_DURATION=<secs>` fresh seeds for that long.
+//!
+//! A failing seed prints the one line that replays it. The `swarm` test
+//! (ignored) draws each seed's whole shape — cluster size, which faults are
+//! on and how hard, the store, the workload and the `NodeConfig`
+//! ([`SwarmConfig`]); the nightly workflow runs it on fresh seeds, and
+//! `SIM_PLANT_FAILURE=<seed>` fails that seed on purpose to exercise the
+//! reporting. For example:
+//!
+//! ```text
+//! SIM_DURATION=600 cargo test -p evento-accord --release --test simulation swarm -- --exact --ignored --nocapture
+//! ```
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
+use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -58,7 +78,7 @@ use common::store::{FaultStore, Outcomes};
 use evento_accord::{
     DataStore, DynamicTopology, ExecutorDataStore, HybridLogicalClock, InMemoryDataStore,
     InMemoryNetwork, Journal, Key, Message, MessageFaults, MessageSink, Node, NodeConfig, NodeId,
-    StaticTopology, Status, Timestamp, Topology, TraceEntry, TxnId,
+    StaticTopology, Status, Timestamp, Topology, TraceEntry, TxnId, MAX_SKEW_MICROS,
 };
 use evento_core::metadata::Metadata;
 use evento_core::Event;
@@ -1120,7 +1140,7 @@ async fn check_oracles(sim: &Sim, history: &[WriteRecord]) -> Result<(), String>
 
 #[tokio::test(start_paused = true)]
 async fn safety_under_replica_churn() {
-    for seed in 0..24 {
+    for (seed, _replay) in sim_seeds("safety_under_replica_churn", 0..24) {
         if let Err(e) = run_scenario(seed).await {
             panic!("simulation oracle violated: {e}");
         }
@@ -1149,13 +1169,13 @@ impl Adversarial {
         if let Some(v) = &self.safety {
             panic!("SAFETY VIOLATION ({what}): {v}");
         }
+        if let Some(stall) = &self.liveness {
+            panic!("{what}: {stall}");
+        }
         assert!(
             self.converged,
             "{what}: cluster failed to converge after healing"
         );
-        if let Some(stall) = &self.liveness {
-            panic!("{what}: {stall}");
-        }
         self.reads
     }
 }
@@ -1295,7 +1315,10 @@ fn safety_violation(sim: &Sim, history: &[WriteRecord]) -> Option<String> {
 #[tokio::test(start_paused = true)]
 async fn adversarial_safety_holds_and_measures_convergence() {
     const TOTAL: u64 = 20;
-    for seed in 0..TOTAL {
+    for (seed, _replay) in sim_seeds(
+        "adversarial_safety_holds_and_measures_convergence",
+        0..TOTAL,
+    ) {
         let result = run_adversarial(seed, Faults::default()).await;
         if let Some(v) = result.safety {
             panic!("SAFETY VIOLATION at seed {seed}: {v}");
@@ -1660,7 +1683,7 @@ async fn minority_never_ahead(sim: &Sim, history: &[WriteRecord]) -> Option<Stri
 #[tokio::test(start_paused = true)]
 async fn safety_holds_under_partitions() {
     const TOTAL: u64 = 20;
-    for seed in 0..TOTAL {
+    for (seed, _replay) in sim_seeds("safety_holds_under_partitions", 0..TOTAL) {
         let result = run_partition(seed, None, Faults::default()).await;
         if let Some(v) = result.safety {
             panic!("SAFETY VIOLATION (partition) at seed {seed}: {v}");
@@ -1684,7 +1707,10 @@ async fn safety_holds_under_partitions() {
 async fn safety_holds_under_partitions_with_a_shrunk_electorate() {
     const TOTAL: u64 = 20;
     let electorate = vec![NodeId(0), NodeId(1), NodeId(2)];
-    for seed in 0..TOTAL {
+    for (seed, _replay) in sim_seeds(
+        "safety_holds_under_partitions_with_a_shrunk_electorate",
+        0..TOTAL,
+    ) {
         let result = run_partition(seed, Some(electorate.clone()), Faults::default()).await;
         if let Some(v) = result.safety {
             panic!("SAFETY VIOLATION (partition+electorate) at seed {seed}: {v}");
@@ -1815,7 +1841,7 @@ async fn run_with_restarts(seed: u64, faults: Faults, store: StoreKind) -> Adver
 #[tokio::test(start_paused = true)]
 async fn safety_holds_under_restarts() {
     const TOTAL: u64 = 20;
-    for seed in 0..TOTAL {
+    for (seed, _replay) in sim_seeds("safety_holds_under_restarts", 0..TOTAL) {
         let result = run_with_restarts(seed, Faults::default(), StoreKind::Memory).await;
         if let Some(v) = result.safety {
             panic!("SAFETY VIOLATION (restart) at seed {seed}: {v}");
@@ -1837,7 +1863,7 @@ async fn safety_holds_under_restarts() {
 /// on, a recovery racing a slow original coordinator. The same oracles hold.
 #[tokio::test(start_paused = true)]
 async fn adversarial_safety_holds_under_message_faults() {
-    for seed in 0..20 {
+    for (seed, _replay) in sim_seeds("adversarial_safety_holds_under_message_faults", 0..20) {
         let result = run_adversarial(seed, Faults::ALL).await;
         if let Some(v) = result.safety {
             panic!("SAFETY VIOLATION (adversarial +faults) at seed {seed}: {v}");
@@ -1857,7 +1883,7 @@ async fn adversarial_safety_holds_under_message_faults() {
 #[tokio::test(start_paused = true)]
 async fn safety_holds_under_partitions_and_message_faults() {
     let electorate = vec![NodeId(0), NodeId(1), NodeId(2)];
-    for seed in 0..20 {
+    for (seed, _replay) in sim_seeds("safety_holds_under_partitions_and_message_faults", 0..20) {
         for (label, e) in [("", None), ("+electorate", Some(electorate.clone()))] {
             let result = run_partition(seed, e, Faults::ALL).await;
             if let Some(v) = result.safety {
@@ -1877,7 +1903,7 @@ async fn safety_holds_under_partitions_and_message_faults() {
 /// [`adversarial_safety_holds_under_message_faults`] for the restart scenario.
 #[tokio::test(start_paused = true)]
 async fn safety_holds_under_restarts_and_message_faults() {
-    for seed in 0..20 {
+    for (seed, _replay) in sim_seeds("safety_holds_under_restarts_and_message_faults", 0..20) {
         let result = run_with_restarts(seed, Faults::ALL, StoreKind::Memory).await;
         if let Some(v) = result.safety {
             panic!("SAFETY VIOLATION (restart +faults) at seed {seed}: {v}");
@@ -1901,7 +1927,7 @@ async fn safety_holds_under_restarts_and_message_faults() {
 #[tokio::test(start_paused = true)]
 async fn safety_holds_under_restarts_and_storage_faults() {
     for store in [StoreKind::Memory, StoreKind::Executor] {
-        for seed in 0..20 {
+        for (seed, _replay) in sim_seeds("safety_holds_under_restarts_and_storage_faults", 0..20) {
             let result = run_with_restarts(seed, Faults::STORAGE, store).await;
             if let Some(v) = result.safety {
                 panic!("SAFETY VIOLATION (restart +storage, {store:?}) at seed {seed}: {v}");
@@ -2094,7 +2120,7 @@ async fn run_probe(seed: u64) -> Probe {
 /// twice must yield byte-identical fingerprints.
 #[tokio::test(start_paused = true)]
 async fn simulation_is_bit_reproducible() {
-    for seed in 0..8 {
+    for (seed, _replay) in sim_seeds("simulation_is_bit_reproducible", 0..8) {
         let first = run_probe(seed).await;
         let second = run_probe(seed).await;
         assert_eq!(
@@ -2113,7 +2139,7 @@ async fn simulation_is_bit_reproducible() {
 #[tokio::test(start_paused = true)]
 async fn every_scenario_kind_replays_its_trace() {
     let electorate = vec![NodeId(0), NodeId(1), NodeId(2)];
-    for seed in 0..4 {
+    for (seed, _replay) in sim_seeds("every_scenario_kind_replays_its_trace", 0..4) {
         assert_replays("replica churn", seed, |s| async move {
             run_scenario(s).await.expect("replica churn oracles")
         })
@@ -2248,7 +2274,7 @@ async fn run_bounded(seed: u64) -> Result<RunTrace, String> {
 
 #[tokio::test(start_paused = true)]
 async fn consensus_state_stays_bounded() {
-    for seed in 0..8 {
+    for (seed, _replay) in sim_seeds("consensus_state_stays_bounded", 0..8) {
         if let Err(e) = run_bounded(seed).await {
             panic!("bound oracle violated: {e}");
         }
@@ -2447,7 +2473,7 @@ async fn run_skew(seed: u64) -> Result<RunTrace, String> {
 
 #[tokio::test(start_paused = true)]
 async fn safety_and_bound_hold_under_clock_skew() {
-    for seed in 0..8 {
+    for (seed, _replay) in sim_seeds("safety_and_bound_hold_under_clock_skew", 0..8) {
         if let Err(e) = run_skew(seed).await {
             panic!("clock-skew oracle violated: {e}");
         }
@@ -2533,7 +2559,7 @@ async fn run_healthy_high_timeout(seed: u64) -> Result<u64, String> {
 /// nothing is recovered.
 #[tokio::test(start_paused = true)]
 async fn no_spurious_recovery_when_healthy() {
-    for seed in 0..8 {
+    for (seed, _replay) in sim_seeds("no_spurious_recovery_when_healthy", 0..8) {
         match run_healthy_high_timeout(seed).await {
             Ok(recoveries) => assert_eq!(
                 recoveries, 0,
@@ -2868,7 +2894,7 @@ async fn run_churn(seed: u64) -> ChurnProbe {
 /// `(aggregate, version)` was double-committed.
 #[tokio::test(start_paused = true)]
 async fn membership_churn_converges() {
-    for seed in 0..8 {
+    for (seed, _replay) in sim_seeds("membership_churn_converges", 0..8) {
         let probe = run_churn(seed).await;
         if let Some(stall) = &probe.liveness {
             panic!("seed {seed}: {stall}");
@@ -2915,7 +2941,7 @@ async fn membership_churn_converges() {
 /// replay, the catch-up sweep — are all deterministic under virtual time).
 #[tokio::test(start_paused = true)]
 async fn membership_churn_is_bit_reproducible() {
-    for seed in 0..6 {
+    for (seed, _replay) in sim_seeds("membership_churn_is_bit_reproducible", 0..6) {
         let first = run_churn(seed).await;
         let second = run_churn(seed).await;
         assert_eq!(
@@ -2923,6 +2949,468 @@ async fn membership_churn_is_bit_reproducible() {
             "seed {seed}: two churn runs diverged — not deterministic"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Seeds from the environment (#319).
+// ---------------------------------------------------------------------------
+
+/// The seeds a seeded test runs (#319):
+/// - `SIM_SEED=<n>` replays seed `n` alone;
+/// - `SIM_SEEDS=<count>` runs that many fresh seeds, and `SIM_DURATION=<secs>`
+///   fresh seeds for that long (wall-clock), from a base drawn from OS entropy
+///   and printed;
+/// - otherwise `default`, the fixed range CI runs.
+///
+/// Each seed comes with a [`Replay`] guard: should the test fail while the
+/// seed runs, it prints the one line that replays it.
+fn sim_seeds(test: &'static str, default: Range<u64>) -> impl Iterator<Item = (u64, Replay)> {
+    let seeds: Box<dyn Iterator<Item = u64>> = match env_u64("SIM_SEED") {
+        Some(seed) => Box::new(std::iter::once(seed)),
+        None if env_u64("SIM_SEEDS").is_some() || env_u64("SIM_DURATION").is_some() => {
+            let base: u64 = rand::random();
+            eprintln!("{test}: fresh seeds from {base}");
+            let count = env_u64("SIM_SEEDS").unwrap_or(u64::MAX);
+            let deadline = env_u64("SIM_DURATION")
+                .map(|secs| std::time::Instant::now() + Duration::from_secs(secs));
+            Box::new(
+                (0..count)
+                    .map(move |i| base.wrapping_add(i))
+                    .take_while(move |_| deadline.is_none_or(|d| std::time::Instant::now() < d)),
+            )
+        }
+        None => Box::new(default),
+    };
+    seeds.map(move |seed| (seed, Replay { test, seed }))
+}
+
+/// A numeric environment variable, if set and not empty.
+fn env_u64(name: &str) -> Option<u64> {
+    let value = std::env::var(name).ok().filter(|value| !value.is_empty())?;
+    Some(
+        value
+            .parse()
+            .unwrap_or_else(|_| panic!("{name}={value}: not a number")),
+    )
+}
+
+/// Prints how to replay its seed if the test panics while the seed runs.
+struct Replay {
+    test: &'static str,
+    seed: u64,
+}
+
+impl Drop for Replay {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            let planted = env_u64("SIM_PLANT_FAILURE")
+                .filter(|&planted| planted == self.seed)
+                .map(|planted| format!("SIM_PLANT_FAILURE={planted} "))
+                .unwrap_or_default();
+            eprintln!(
+                "replay: {planted}SIM_SEED={} cargo test -p evento-accord --release \
+                 --test simulation {} -- --exact --include-ignored --nocapture",
+                self.seed, self.test
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Swarm testing (#319): each seed draws its own cluster, faults, store,
+// workload and configuration.
+// ---------------------------------------------------------------------------
+
+const SWARM_SALT: u64 = 0x7377_6172_6d73_6565;
+
+/// A swarm run's shape, drawn from its seed. Turning some faults off lets a
+/// run go deeper into the others, which a fixed mix of every fault hides.
+#[derive(Clone, Debug)]
+struct SwarmConfig {
+    /// 3, 5 or 7 nodes.
+    n: u64,
+    /// Nodes crash and heal, at most a minority down at once.
+    crash: bool,
+    /// A minority is cut off and healed, in turn; `Some(true)` cuts one way
+    /// too.
+    partition: Option<bool>,
+    /// Nodes restart, each losing its journal's unflushed tail; until a node
+    /// compacts, possibly its store's unpersisted tail, or an in-memory store
+    /// whole.
+    restarts: bool,
+    /// An outside coordinator pre-accepts a write at one node and vanishes.
+    orphans: bool,
+    /// A node goes silent past `peer_absence_limit`, crashed or cut one way.
+    absence: bool,
+    messages: Option<MessageFaults>,
+    storage: Option<StorageFaults>,
+    /// The last node's clock runs this many microseconds ahead.
+    skew: Option<u64>,
+    store: StoreKind,
+    aggs: usize,
+    clients: usize,
+    ops_each: usize,
+    /// The share of operations that read.
+    read_share: f64,
+    /// The longest pause, in milliseconds, a client takes between operations.
+    max_pause: u64,
+    /// Within OPERATIONS.md's constraints.
+    config: NodeConfig,
+}
+
+impl SwarmConfig {
+    fn from_seed(seed: u64) -> Self {
+        let mut rng = StdRng::seed_from_u64(seed ^ SWARM_SALT);
+        let n = [3, 5, 7][rng.random_range(0..3)];
+        let messages = rng.random_bool(0.4).then(|| MessageFaults {
+            drop: rng.random_range(0.0..0.06),
+            duplicate: rng.random_range(0.0..0.06),
+            max_delay: Duration::from_millis(rng.random_range(0..40)),
+        });
+        let storage = rng.random_bool(0.4).then(|| StorageFaults {
+            journal: JournalFaults {
+                flush: rng.random_range(0.0..0.04),
+                truncate: rng.random_range(0.0..0.2),
+                metadata: rng.random_range(0.0..0.04),
+            },
+            apply: rng.random_range(0.0..0.04),
+            fsync: Duration::from_millis(rng.random_range(0..5)),
+            persist: rng.random_range(0.1..1.0),
+        });
+        let skew = rng
+            .random_bool(0.3)
+            .then(|| rng.random_range(0..MAX_SKEW_MICROS));
+        let recovery_timeout = Duration::from_millis(rng.random_range(200..800));
+        // The margin is at least the recovery timeout, twice the clock-skew
+        // bound and the worst message delay.
+        let compaction_margin = recovery_timeout
+            + Duration::from_micros(2 * MAX_SKEW_MICROS)
+            + messages.map_or(Duration::ZERO, |m| m.max_delay)
+            + Duration::from_millis(rng.random_range(0..1000));
+        let absence = rng.random_bool(0.25);
+        let peer_absence_limit = (absence || rng.random_bool(0.2))
+            .then(|| Duration::from_millis(rng.random_range(1500..4000)));
+        // Well below the absence limit: a recovery holds up the sweep that
+        // sends the node's heartbeats for up to this long.
+        let collect_timeout = match peer_absence_limit {
+            Some(limit) => (limit / 4).min(Duration::from_secs(1)),
+            None => Duration::from_millis([500, 1000, 5000][rng.random_range(0..3)]),
+        };
+        let config = NodeConfig {
+            fast_timeout: Duration::from_millis(rng.random_range(30..120)),
+            collect_timeout,
+            recovery_interval: Duration::from_millis(rng.random_range(50..200)),
+            anti_entropy_interval: Duration::from_millis(rng.random_range(100..400))
+                .min(compaction_margin / 2),
+            recovery_timeout,
+            compaction_margin,
+            max_journal_batch: [1, 8, 128][rng.random_range(0..3)],
+            snapshot_page_events: [1, 16, 4096][rng.random_range(0..3)],
+            peer_absence_limit,
+            ..NodeConfig::default()
+        };
+        SwarmConfig {
+            n,
+            crash: rng.random_bool(0.5),
+            partition: rng.random_bool(0.5).then(|| rng.random_bool(0.5)),
+            restarts: rng.random_bool(0.5),
+            orphans: rng.random_bool(0.3),
+            absence,
+            messages,
+            storage,
+            skew,
+            store: if rng.random_bool(0.5) {
+                StoreKind::Executor
+            } else {
+                StoreKind::Memory
+            },
+            aggs: rng.random_range(1..=8),
+            clients: rng.random_range(1..=8),
+            ops_each: rng.random_range(6..=16),
+            read_share: rng.random_range(0.0..0.5),
+            max_pause: if absence {
+                400
+            } else {
+                [20, 100, 300][rng.random_range(0..3)]
+            },
+            config,
+        }
+    }
+}
+
+/// One swarm run of `seed` in `shape`: the workload under the faults the
+/// shape turns on, then the write and read oracles and, healed,
+/// [`assert_live`].
+async fn run_swarm(seed: u64, shape: &SwarmConfig) -> Adversarial {
+    let n = shape.n as usize;
+    let minority = (n - 1) / 2;
+    let mut sim = Sim::build_with(SimOptions {
+        skew: shape.skew.map(|micros| (n - 1, micros)),
+        config: shape.config,
+        store: shape.store,
+        ..SimOptions::new(shape.n)
+    });
+    let faults = Faults {
+        messages: shape.messages,
+        one_way: false,
+        storage: shape.storage,
+    };
+    faults.arm(&mut sim, seed);
+    let clients = Clients::new(&sim);
+    let mut rng = StdRng::seed_from_u64(seed);
+    let ids = Arc::new(AtomicU64::new(1));
+    let done = Arc::new(AtomicBool::new(false));
+    let _orphan_inbox = sim.net.register(ORPHAN_COORDINATOR);
+
+    // Clients: each operation reads, or writes, a seeded aggregate on a
+    // seeded node, after a seeded pause.
+    let mut workload = Vec::new();
+    for _ in 0..shape.clients {
+        let plan: Vec<(bool, usize, usize, u64)> = (0..shape.ops_each)
+            .map(|_| {
+                (
+                    rng.random_bool(shape.read_share),
+                    rng.random_range(0..shape.aggs),
+                    rng.random_range(0..n),
+                    rng.random_range(0..=shape.max_pause),
+                )
+            })
+            .collect();
+        let live = sim.live.clone();
+        let clients = clients.clone();
+        let ids = Arc::clone(&ids);
+        workload.push(tokio::spawn(async move {
+            for (read, agg_idx, node, pause) in plan {
+                tokio::time::sleep(Duration::from_millis(pause)).await;
+                let agg = format!("a{agg_idx}");
+                if read {
+                    clients.read(&live, node, &agg).await;
+                    continue;
+                }
+                let (coordinator, store) = live.get(node);
+                let version = store.version(AGG_TYPE, &agg).await.unwrap_or(0) + 1;
+                let seq = ids.fetch_add(1, Ordering::Relaxed);
+                clients
+                    .write(&coordinator, &agg, version, seq, Duration::from_secs(2))
+                    .await;
+            }
+        }));
+    }
+    let finished = {
+        let done = Arc::clone(&done);
+        tokio::spawn(async move {
+            for task in workload {
+                let _ = task.await;
+            }
+            done.store(true, Ordering::Relaxed);
+        })
+    };
+
+    let mut faulting = Vec::new();
+    if shape.crash {
+        // At most a minority down at once, until the clients are done.
+        let plan: Vec<(u64, usize)> = (0..64)
+            .map(|_| (rng.random_range(5..120), rng.random_range(0..n)))
+            .collect();
+        let net = Arc::clone(&sim.net);
+        let done = Arc::clone(&done);
+        faulting.push(tokio::spawn(async move {
+            let mut down = BTreeSet::new();
+            for (delay, node) in plan.into_iter().cycle() {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                if done.load(Ordering::Relaxed) {
+                    break;
+                }
+                if down.remove(&node) {
+                    net.heal(NodeId(node as u64));
+                } else if down.len() < minority {
+                    net.crash(NodeId(node as u64));
+                    down.insert(node);
+                }
+            }
+        }));
+    }
+    if let Some(one_way) = shape.partition {
+        // A seeded minority cut off for a while, then healed for a while.
+        let plan: Vec<(u64, u64, Vec<usize>, u8)> = (0..32)
+            .map(|_| {
+                let size = rng.random_range(1..=minority);
+                let mut nodes: Vec<usize> = (0..n).collect();
+                for i in 0..size {
+                    let j = rng.random_range(i..n);
+                    nodes.swap(i, j);
+                }
+                nodes.truncate(size);
+                let direction = if one_way { rng.random_range(0..3) } else { 0 };
+                (
+                    rng.random_range(20..300),
+                    rng.random_range(20..300),
+                    nodes,
+                    direction,
+                )
+            })
+            .collect();
+        let net = Arc::clone(&sim.net);
+        let done = Arc::clone(&done);
+        faulting.push(tokio::spawn(async move {
+            for (cut, healed, cut_off, direction) in plan.into_iter().cycle() {
+                if done.load(Ordering::Relaxed) {
+                    break;
+                }
+                let links: Vec<(NodeId, NodeId)> = (0..n)
+                    .filter(|i| !cut_off.contains(i))
+                    .flat_map(|a| cut_off.iter().map(move |&b| (a, b)))
+                    .map(|(a, b)| (NodeId(a as u64), NodeId(b as u64)))
+                    .collect();
+                for &(a, b) in &links {
+                    match direction {
+                        1 => net.cut(a, b),
+                        2 => net.cut(b, a),
+                        _ => net.partition(a, b),
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(cut)).await;
+                for &(a, b) in &links {
+                    net.heal_partition(a, b);
+                }
+                tokio::time::sleep(Duration::from_millis(healed)).await;
+            }
+        }));
+    }
+    if shape.absence {
+        let limit = shape
+            .config
+            .peer_absence_limit
+            .expect("an absence has a limit");
+        let node = NodeId(rng.random_range(0..n) as u64);
+        let start = rng.random_range(0..1500);
+        let length = limit + Duration::from_millis(rng.random_range(500..2500));
+        let crash = rng.random_bool(0.5);
+        let net = Arc::clone(&sim.net);
+        let ids = sim.ids.clone();
+        faulting.push(tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(start)).await;
+            let peers = ids.iter().filter(|&&id| id != node);
+            if crash {
+                net.crash(node);
+            } else {
+                peers.clone().for_each(|&peer| net.cut(node, peer));
+            }
+            tokio::time::sleep(length).await;
+            if crash {
+                net.heal(node);
+            } else {
+                peers.for_each(|&peer| net.restore(node, peer));
+            }
+        }));
+    }
+    if shape.orphans {
+        for k in 0..rng.random_range(1..=3u32) {
+            let at = rng.random_range(0..2000);
+            let node = rng.random_range(0..n);
+            let agg = format!("a{}", rng.random_range(0..shape.aggs));
+            let net = Arc::clone(&sim.net);
+            let live = sim.live.clone();
+            let base = sim.base;
+            faulting.push(tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(at)).await;
+                let version = live.get(node).1.version(AGG_TYPE, &agg).await.unwrap_or(0) + 1;
+                let orphan = event(&agg, version, ORPHAN_SEQ + u64::from(k));
+                orphan_vote(&net, base, node, orphan, k).await;
+            }));
+        }
+    }
+
+    // Restarts, driven here since they need the sim, until the clients are
+    // done. A restart loses store state only while no node has compacted: a
+    // node rebuilds a lost write from its journal, or re-imports it from a
+    // peer, only while both still hold it. Past that, a lost store is a
+    // rejoin (OPERATIONS §7). A node's compaction count starts over when it
+    // restarts, so every node is checked before each restart.
+    let restarts: Vec<(u64, usize, bool)> = if shape.restarts {
+        (0..24)
+            .map(|_| {
+                (
+                    rng.random_range(50..400),
+                    rng.random_range(0..n),
+                    rng.random_bool(0.5),
+                )
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut compacted = false;
+    for (delay, node, lossy) in restarts.into_iter().cycle() {
+        tokio::time::sleep(Duration::from_millis(delay)).await;
+        if done.load(Ordering::Relaxed) {
+            break;
+        }
+        compacted |= sim.nodes.iter().any(|n| n.metrics().compactions > 0);
+        let mode = match (lossy && !compacted, shape.store) {
+            (false, _) => Restart::KeepStore,
+            (true, StoreKind::Memory) => Restart::EmptyStore,
+            (true, StoreKind::Executor) => Restart::KeepStoreLoseTail,
+        };
+        sim.restart_as(node, shape.config, mode).await;
+    }
+    let _ = finished.await;
+    for task in faulting {
+        let _ = task.await;
+    }
+
+    let records = clients.history.lock().unwrap().clone();
+    let safety = safety_violation(&sim, &records);
+    let liveness = assert_live(&mut sim, &acked_versions(&records)).await.err();
+    let converged = liveness.is_none();
+    let safety = safety.or_else(|| read_violation(&clients, converged.then(|| &sim.stores[0])));
+    let reads = clients.ops.lock().unwrap().reads.len();
+    Adversarial {
+        safety,
+        converged,
+        liveness,
+        reads,
+        trace: sim.trace(),
+    }
+}
+
+/// Swarm testing (#319): each seed draws its own shape ([`SwarmConfig`]) and
+/// must keep every oracle. Run with `SIM_SEEDS` or `SIM_DURATION` for fresh
+/// seeds, as the nightly workflow does; a failure prints its shape and the
+/// line that replays it. `SIM_PLANT_FAILURE=<seed>` runs that seed first and
+/// fails it on purpose, to exercise the reporting.
+#[tokio::test(start_paused = true)]
+#[ignore = "swarm: run explicitly, with SIM_SEEDS or SIM_DURATION for fresh seeds"]
+async fn swarm() {
+    let planted = env_u64("SIM_PLANT_FAILURE");
+    let first = planted.map(|seed| {
+        (
+            seed,
+            Replay {
+                test: "swarm",
+                seed,
+            },
+        )
+    });
+    let seeds = first
+        .into_iter()
+        .chain(sim_seeds("swarm", 0..64).filter(move |(seed, _)| Some(*seed) != planted));
+    let mut runs = 0;
+    for (seed, _replay) in seeds {
+        let shape = SwarmConfig::from_seed(seed);
+        let run = run_swarm(seed, &shape).await;
+        let failed = run.safety.is_some() || run.liveness.is_some();
+        if failed || planted == Some(seed) {
+            eprintln!("swarm config: {shape:?}");
+        }
+        assert!(
+            planted != Some(seed),
+            "swarm seed {seed}: a planted failure (SIM_PLANT_FAILURE)"
+        );
+        run.assert_ok(&format!("swarm seed {seed}"));
+        runs += 1;
+    }
+    eprintln!("swarm: {runs} seeds with no violation");
 }
 
 /// Aggressive bug-hunt: run **every** scenario across a wide seed range and fail on
@@ -2934,9 +3422,9 @@ async fn membership_churn_is_bit_reproducible() {
 async fn sweep_for_bugs() {
     const COUNT: u64 = 250;
     let electorate = vec![NodeId(0), NodeId(1), NodeId(2)];
-    let mut reads = 0;
+    let (mut reads, mut swept) = (0, 0);
 
-    for seed in 0..COUNT {
+    for (seed, _replay) in sim_seeds("sweep_for_bugs", 0..COUNT) {
         // Chaos (crash/heal minority, coordinators crash mid-write) — strong oracle.
         if let Err(v) = run_scenario(seed).await {
             panic!("chaos seed {seed}: {v}");
@@ -3017,11 +3505,12 @@ async fn sweep_for_bugs() {
             }
         }
 
-        if seed % 25 == 0 {
-            eprintln!("swept {seed}/{COUNT}");
+        swept += 1;
+        if swept % 25 == 0 {
+            eprintln!("swept {swept} seeds");
         }
     }
-    eprintln!("swept all {COUNT} seeds with no violation ({reads} reads checked)");
+    eprintln!("swept {swept} seeds with no violation ({reads} reads checked)");
 }
 
 // ---------------------------------------------------------------------------
@@ -4088,7 +4577,7 @@ async fn run_absence(seed: u64, faults: Faults) -> Adversarial {
 /// and come back (#310).
 #[tokio::test(start_paused = true)]
 async fn safety_and_liveness_hold_under_absences() {
-    for seed in 0..10 {
+    for (seed, _replay) in sim_seeds("safety_and_liveness_hold_under_absences", 0..10) {
         run_absence(seed, Faults::default())
             .await
             .assert_ok(&format!("absence seed {seed}"));
@@ -4098,7 +4587,10 @@ async fn safety_and_liveness_hold_under_absences() {
 /// [`safety_and_liveness_hold_under_absences`] over lossy links.
 #[tokio::test(start_paused = true)]
 async fn safety_and_liveness_hold_under_absences_and_message_faults() {
-    for seed in 0..10 {
+    for (seed, _replay) in sim_seeds(
+        "safety_and_liveness_hold_under_absences_and_message_faults",
+        0..10,
+    ) {
         run_absence(seed, Faults::ALL)
             .await
             .assert_ok(&format!("absence +faults seed {seed}"));
