@@ -3669,6 +3669,13 @@ impl Node {
     ///
     /// [`ReadProbe`]: Message::ReadProbe
     pub async fn read_barrier(&self, key: Key) -> anyhow::Result<()> {
+        // A node still joining holds part of its store, whatever its probes
+        // say: a read here could miss writes committed long ago (as a
+        // forwarded read would, which it refuses too).
+        anyhow::ensure!(
+            self.bootstrapped.load(Ordering::Acquire),
+            "this node is joining: its store is partial"
+        );
         let replicas = self.topology.replicas(&key);
         let slow_q = self.topology.slow_quorum(&key);
         let t0 = self.mint().await?;
@@ -6843,10 +6850,13 @@ impl Node {
     /// Stops this node minting, for good: its host closed it, and the node
     /// reopening its journal starts from the clock bound persisted so far.
     /// Taken under the lock that raises the bound, so a bound being raised is
-    /// persisted before this returns, and every later [`mint`](Self::mint)
-    /// fails with [`NodeClosed`] — a clone the application still holds can
-    /// never mint an id the reopened node mints too.
-    pub(crate) async fn retire(&self) {
+    /// persisted before this returns, and every later id or ballot it would
+    /// mint fails with [`NodeClosed`] — a clone the application still holds can
+    /// never mint an id the reopened node mints too. [`GroupHost::close`]
+    /// does this; a host managing bare nodes calls it before reopening one.
+    ///
+    /// [`GroupHost::close`]: crate::GroupHost::close
+    pub async fn retire(&self) {
         let _raising = self.clock_bound_lock.lock().await;
         self.retired.store(true, Ordering::Release);
     }

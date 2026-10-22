@@ -953,3 +953,87 @@ async fn an_amnesiac_never_lets_a_recovery_drop_what_may_have_committed() {
     })
     .await;
 }
+
+/// Under a topology that changes epochs, the node that lost its journal
+/// lost its metadata log too, and reopens at the epoch it was built with. A
+/// contact's vouch counts only under the epoch the node installed: its join
+/// fetches the decided epochs while it waits, and joins at the current one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dynamic_amnesiac_catches_up_its_epoch_before_joining() {
+    use evento_accord::{DynamicTopology, Topology};
+
+    let net = InMemoryNetwork::new();
+    let ids: Vec<NodeId> = (0..3).map(NodeId).collect();
+    let spawn = |id: NodeId| {
+        let store = Arc::new(InMemoryDataStore::new());
+        let topology = Arc::new(DynamicTopology::new(id, 0, vec![ids.clone()]));
+        let inbox = net.register(id);
+        let node = Node::new(
+            id,
+            Arc::clone(&topology) as Arc<dyn Topology>,
+            clock(id),
+            Arc::new(net.sink(id)) as Arc<dyn MessageSink>,
+            Arc::clone(&store) as Arc<dyn DataStore>,
+            Arc::new(InMemoryJournal::new()) as Arc<dyn Journal>,
+        )
+        .with_config(config());
+        (node, store, topology, inbox)
+    };
+    let mut nodes = Vec::new();
+    let mut tasks = Vec::new();
+    for &id in &ids {
+        let (node, _store, _topology, inbox) = spawn(id);
+        tasks.push(node.start(inbox));
+        tasks.push(node.start_recovery());
+        nodes.push(node);
+    }
+    let base = event("acc", 1);
+    nodes[0]
+        .write(vec![base.clone()])
+        .await
+        .expect("baseline write");
+    nodes[0]
+        .change_topology(1, vec![ids.clone()])
+        .await
+        .expect("epoch 1");
+
+    // R loses its journal and store, and comes back built at epoch 0.
+    for task in tasks.drain(4..) {
+        task.abort();
+    }
+    let (node, store, topology, inbox) = spawn(NodeId(R));
+    node.recover_state_for_join()
+        .await
+        .expect("an amnesiac open");
+    tasks.push(node.start(inbox));
+    tokio::time::timeout(Duration::from_secs(20), node.join(NodeId(A)))
+        .await
+        .expect("the join completes")
+        .expect("joined");
+    assert_eq!(topology.epoch(), 1, "it joined at the current epoch");
+    assert!(node.amnesia_fence().is_some_and(|fence| fence.joined));
+    assert!(holds(&store, &base), "it copied the write");
+}
+
+/// While a node joins — and a join over a lost journal waits for a vouch
+/// past its fence — its store is partial: a read barrier there is refused,
+/// whatever its probes say. Here they say nothing is in the way: every
+/// write was compacted away on its peers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joining_node_refuses_a_read_barrier() {
+    let c = Cluster::start(3);
+    c.baseline().await;
+    for node in &c.nodes {
+        let node = node.clone();
+        await_until("every node compacts", Duration::from_secs(10), move || {
+            node.command_count() == 0
+        })
+        .await;
+    }
+    c.nodes[R as usize].begin_join();
+    let read = c.nodes[R as usize].read_barrier(key("base")).await;
+    assert!(
+        read.is_err(),
+        "a read barrier passed on a joining node, which holds part of its store"
+    );
+}
