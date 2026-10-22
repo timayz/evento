@@ -1001,6 +1001,17 @@ backend (sql/fjall). Phases, in order:
         changes (`Replica.blocked`), the sweep skips parked commands, and
         anti-entropy runs between recoveries on its own cadence: a node cut off
         under load serves again within ~2 s of the heal (`isolated_catch_up`).
+        Anti-entropy imports a dependency only once it is applied somewhere,
+        though, and where it is held it may itself wait on this replica — on the
+        read of an earlier transaction parked here on it — committed and parked
+        there too, so its holders never recover it: the swarm found such a
+        deadlock (#330). So the sweep now learns, for a few parked dependencies
+        never witnessed here each pass, the oldest first, their decision from
+        the shard's replicas (`Node::learn_decision`): one committed report
+        carries it whole, and it is committed here as any Commit is. A
+        dependency no replica reports committed is left to those holding it,
+        and one invalidated is applied there, so anti-entropy brings it in
+        (`a_replica_recovers_a_dependency_it_never_witnessed`).
         Recovery's fast-path check now counts the replicas' own PreAccept
         votes (#285, see M2). Before, a txn whose later conflict had
         fast-committed without it, but was still only pre-accepted at every

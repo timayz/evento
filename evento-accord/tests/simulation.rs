@@ -4740,3 +4740,72 @@ async fn a_lone_holder_stranded_below_its_peers_compaction_rejoins() {
         assert!(store.committed_events().is_empty(), "replica {i} applied T");
     }
 }
+
+// ---------------------------------------------------------------------------
+// A dependency never witnessed (#330): a replica waiting on a transaction it
+// never saw learns its decision instead of waiting for it to be applied
+// somewhere.
+// ---------------------------------------------------------------------------
+
+/// `U` and `T` write one key. `T` commits with `U` among its dependencies but
+/// executes first, and `U` waits on it. Nodes 0 and 1 hold `U` committed;
+/// node 2 never witnessed it. With node 1 down, `T`'s read needs node 2,
+/// which waits on `U` until it learns that `U` executes after `T`. Node 0
+/// holds `U` blocked on `T`, so it never recovers it, and `U`'s Commit never
+/// reaches node 2: nothing applies unless node 2 recovers `U` itself. Node 2
+/// is cut off past the compaction margin, so on its return its own vote for
+/// `U` is fenced, and node 0's committed report alone carries `U`'s
+/// decision.
+#[tokio::test(start_paused = true)]
+async fn a_replica_recovers_a_dependency_it_never_witnessed() {
+    let sim = Sim::build(3);
+    let _coordinator = sim.net.register(ORPHAN_COORDINATOR);
+    let now = (tokio::time::Instant::now() - sim.base).as_micros() as u64;
+    let stamp = |micros| Timestamp {
+        micros,
+        logical: 0,
+        node: ORPHAN_COORDINATOR,
+    };
+    let (u, t) = (TxnId(stamp(now)), TxnId(stamp(now + 1_000)));
+    let commit = |txn: TxnId, execute_at, dep, version, seq| Message::Commit {
+        txn,
+        execute_at,
+        deps: vec![dep],
+        keys: vec![Key("acc".into())],
+        events: vec![event("acc", version, seq)],
+        reply_to: ORPHAN_COORDINATOR,
+    };
+    let sink = sim.net.sink(ORPHAN_COORDINATOR);
+    for to in [0, 1] {
+        sink.send(NodeId(to), commit(u, stamp(now + 2_000), t, 2, 2))
+            .await
+            .unwrap();
+    }
+    for to in [0, 1, 2] {
+        sink.send(NodeId(to), commit(t, t.0, u, 1, 1))
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    sim.net.crash(NodeId(1));
+    sim.net.partition(NodeId(0), NodeId(2));
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    sim.net.heal_partition(NodeId(0), NodeId(2));
+
+    for _ in 0..1500 {
+        let mut versions = Vec::new();
+        for i in [0, 2] {
+            versions.push(version_of(&sim.stores[i], "acc").await);
+        }
+        if versions == [2, 2] {
+            assert!(sim.nodes[2].metrics().dependencies_learned >= 1);
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!(
+        "T and U never applied on nodes 0 and 2: node 2 holds T {:?}, U {:?}",
+        sim.nodes[2].command_status(t),
+        sim.nodes[2].command_status(u)
+    );
+}

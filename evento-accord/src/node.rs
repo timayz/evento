@@ -675,6 +675,12 @@ struct JoinProven {
 /// Most bytes of an owner's error a [`Message::ReadFailed`] carries back.
 const READ_FAILURE_MAX: usize = 256;
 
+/// How many dependencies never witnessed here a recovery sweep learns the
+/// decision of, at most (see [`Node::learn_decision`]): enough for the few a
+/// stalled execution hangs on, while a replica that fell behind, missing
+/// thousands, catches up through anti-entropy, run between them.
+const MISSING_DEPENDENCY_LOOKUPS: usize = 4;
+
 /// `err` as a [`Message::ReadFailed`] reason: its chain, cut to
 /// [`READ_FAILURE_MAX`] bytes on a character boundary.
 fn read_failure(err: &anyhow::Error) -> String {
@@ -1581,7 +1587,8 @@ impl Node {
             // consensus: recovering it cannot apply it, and on a replica that
             // fell behind there are thousands. What it waits on is what needs
             // progress — recovered below if held here, imported by
-            // anti-entropy if missed.
+            // anti-entropy if missed, or its decision learned from its
+            // holders if never witnessed here (#330).
             replica
                 .stuck(grace)
                 .into_iter()
@@ -1625,6 +1632,29 @@ impl Node {
                 // replica that fell behind never gets back what it missed.
                 self.anti_entropy().await;
                 let _ = self.recover(txn).await;
+            }
+        }
+        // A dependency this replica never witnessed (#330): anti-entropy
+        // imports it only once it is applied somewhere. But where it is held,
+        // it may wait on this very replica — on the read of an earlier
+        // transaction this replica holds blocked on it — and there it is
+        // committed and blocked, so its holders never recover it, and its
+        // Commit never comes. Nothing would ever apply. So its decision is
+        // learned from its holders: a few per sweep, the oldest first, with
+        // anti-entropy, which brings in what is applied, in between.
+        let missing = self
+            .replica
+            .lock()
+            .expect("replica poisoned")
+            .missing_deps(timeout);
+        for dep in missing.into_iter().take(MISSING_DEPENDENCY_LOOKUPS) {
+            self.anti_entropy().await;
+            // Imported by that round, or committed here meanwhile.
+            if self.command_status(dep).is_some() {
+                continue;
+            }
+            if let Err(err) = self.learn_decision(dep).await {
+                tracing::debug!(node = self.id.0, ?dep, %err, "cannot learn a missing dependency");
             }
         }
         self.anti_entropy().await;
@@ -3911,6 +3941,70 @@ impl Node {
             .map(|cmd| (cmd.keys, cmd.events))
             .unwrap_or_default();
         self.recover_with(txn, keys, events).await
+    }
+
+    /// Learns the decision of `txn`, a transaction this replica never
+    /// witnessed but a command committed here waits on (#330), and commits it
+    /// here as its holders did: a decision is final, so one shard peer's
+    /// committed report carries it whole — its execution timestamp,
+    /// dependencies, keys and events. The peers are asked as a recovery asks
+    /// them, under a fresh ballot, with nothing to pre-accept: one that never
+    /// witnessed it only promises the ballot. Returns whether a decision was
+    /// learned. A transaction no peer reports committed is left to the
+    /// replicas holding it, which recover it; one invalidated is applied
+    /// there, so anti-entropy brings it in.
+    async fn learn_decision(&self, txn: TxnId) -> anyhow::Result<bool> {
+        let ballot = Ballot(self.mint().await?);
+        let peers = self.shard_peers();
+        let mut rx = self.register(txn);
+        self.broadcast(
+            &peers,
+            Message::BeginRecovery {
+                txn,
+                ballot,
+                keys: Vec::new(),
+                events: Vec::new(),
+            },
+        )
+        .await;
+        let reports = Self::collect_tagged(
+            &mut rx,
+            peers.len(),
+            Self::after(self.settings.fast_timeout),
+            |m| Self::recover_report(m, ballot),
+        )
+        .await;
+        self.deregister(txn);
+        let decided = reports.into_iter().find_map(|(_, report)| match report {
+            RecoverResp::Ok(f) if f.status >= Status::Committed && f.known && !f.invalidated() => {
+                Some(f)
+            }
+            _ => None,
+        });
+        let Some(f) = decided else {
+            return Ok(false);
+        };
+        self.metrics.record_dependency_learned();
+        tracing::debug!(
+            node = self.id.0,
+            ?txn,
+            execute_at = ?f.execute_at,
+            "learned the decision of a dependency never witnessed here"
+        );
+        // Handled as any Commit is, by the inbox loop: journaled, then
+        // executed when ready. Its read is this node's own: a recovery of
+        // `txn` later gets it from the recorded read.
+        let commit = Message::Commit {
+            txn,
+            execute_at: f.execute_at,
+            deps: f.deps,
+            keys: f.keys,
+            events: f.events,
+            reply_to: self.id,
+        };
+        self.send(self.id, Self::routed(f.route.as_deref(), commit))
+            .await;
+        Ok(true)
     }
 
     /// The recovery reports a message carries, if it answers `ballot`.
