@@ -46,7 +46,7 @@ mod common;
 
 use common::executor::SimExecutor;
 use common::journal::{FaultJournal, JournalFaults};
-use common::store::FaultStore;
+use common::store::{FaultStore, Outcomes};
 use evento_accord::{
     DataStore, DynamicTopology, ExecutorDataStore, HybridLogicalClock, InMemoryDataStore,
     InMemoryNetwork, Journal, Key, Message, MessageFaults, MessageSink, Node, NodeConfig, NodeId,
@@ -212,7 +212,8 @@ enum Backend {
 }
 
 impl SimStore {
-    fn new(kind: StoreKind) -> Self {
+    /// A store of `kind` recording its outcomes in `outcomes`.
+    fn new(kind: StoreKind, outcomes: &Arc<Outcomes>) -> Self {
         let (node, backend): (Arc<dyn DataStore>, _) = match kind {
             StoreKind::Memory => {
                 let memory = Arc::new(InMemoryDataStore::new());
@@ -227,7 +228,7 @@ impl SimStore {
             }
         };
         SimStore {
-            node: Arc::new(FaultStore::over(node)),
+            node: Arc::new(FaultStore::over(node).recording(Arc::clone(outcomes))),
             backend,
         }
     }
@@ -320,6 +321,8 @@ struct Sim {
     /// Seeded storage faults and their seed, kept so a rebuilt node's fresh
     /// store gets them too.
     storage: Option<(u64, StorageFaults)>,
+    /// Every transaction's outcome as each node's store enacted it.
+    outcomes: Arc<Outcomes>,
 }
 
 /// A dropped sim stops its nodes: left running, every finished scenario's
@@ -401,6 +404,7 @@ impl Sim {
         let ids: Vec<NodeId> = (0..n).map(NodeId).collect();
         let net = InMemoryNetwork::new();
         net.enable_trace(RECORD_TRACE.with(Cell::get));
+        let outcomes = Arc::new(Outcomes::default());
         let base = tokio::time::Instant::now();
         let mut nodes = Vec::new();
         let mut stores = Vec::new();
@@ -416,7 +420,7 @@ impl Sim {
                 _ => Arc::new(HybridLogicalClock::with_physical(id, virtual_micros(base))),
             };
             let sink: Arc<dyn MessageSink> = Arc::new(net.sink(id));
-            let store = SimStore::new(store_kind);
+            let store = SimStore::new(store_kind, &outcomes);
             let journal = Arc::new(FaultJournal::new());
             let topology: Arc<dyn Topology> = if dynamic {
                 let topology = Arc::new(DynamicTopology::new(id, 0, vec![ids.clone()]));
@@ -452,6 +456,7 @@ impl Sim {
             dynamic: topologies,
             store_kind,
             storage: None,
+            outcomes,
         }
     }
 
@@ -524,7 +529,7 @@ impl Sim {
         self.journals[i].crash();
         let store = match mode {
             Restart::EmptyStore => {
-                let store = SimStore::new(self.store_kind);
+                let store = SimStore::new(self.store_kind, &self.outcomes);
                 self.arm_store(i, &store);
                 store
             }
@@ -939,9 +944,19 @@ async fn run_adversarial(seed: u64, faults: Faults) -> Adversarial {
     }
 }
 
-/// The core safety oracle: no `(aggregate, version)` is committed by two distinct
-/// events anywhere (split-brain), and no client saw two commits for one version.
+/// The core safety oracle: no transaction is enacted as a commit on one replica
+/// and an abort on another (a split decision), no `(aggregate, version)` is
+/// committed by two distinct events anywhere (split-brain), and no client saw
+/// two commits for one version.
 fn safety_violation(sim: &Sim, history: &[WriteRecord]) -> Option<String> {
+    let split = sim.outcomes.split();
+    if let Some(txn) = split.first() {
+        return Some(format!(
+            "split decision: {txn:?} enacted as a commit on one replica and an abort \
+             on another ({} such)",
+            split.len()
+        ));
+    }
     use std::collections::HashMap;
     let mut by_version: HashMap<(String, String, u16), BTreeSet<ulid::Ulid>> = HashMap::new();
     for store in &sim.stores {
@@ -1390,7 +1405,6 @@ async fn safety_holds_under_restarts_and_storage_faults() {
 const FROZEN_STORE_SEEDS: [u64; 4] = [76, 189, 222, 224];
 
 #[tokio::test(start_paused = true)]
-#[ignore = "#309: a store behind its journal freezes"]
 async fn a_store_that_lost_its_tail_catches_up() {
     for seed in FROZEN_STORE_SEEDS {
         let result = run_with_restarts(seed, Faults::STORAGE, StoreKind::Executor).await;
@@ -2444,13 +2458,6 @@ async fn sweep_for_bugs() {
                     },
                 ),
             ] {
-                if store == StoreKind::Executor
-                    && faults.messages.is_none()
-                    && FROZEN_STORE_SEEDS.contains(&seed)
-                {
-                    // #309, until it is fixed: `a_store_that_lost_its_tail_catches_up`.
-                    continue;
-                }
                 let r = run_with_restarts(seed, faults, store).await;
                 assert!(
                     r.safety.is_none(),
@@ -2512,7 +2519,7 @@ impl Sim {
     /// joins through `contact` before its sweeps start (as
     /// `GroupHost::open_joining` does).
     async fn rejoin(&mut self, i: usize, contact: NodeId, config: NodeConfig) {
-        let store = SimStore::new(self.store_kind);
+        let store = SimStore::new(self.store_kind, &self.outcomes);
         self.arm_store(i, &store);
         self.rejoin_over(i, contact, config, store.data_store(), store)
             .await;
@@ -2873,6 +2880,10 @@ impl DataStore for SlowStore {
         self.inner.apply(txn, execute_at, events, commit).await
     }
 
+    async fn holds(&self, events: &[Event]) -> anyhow::Result<bool> {
+        self.inner.holds(events).await
+    }
+
     async fn read(
         &self,
         aggregators: Option<Arc<[evento_core::EventFilter]>>,
@@ -2933,7 +2944,7 @@ async fn a_joiner_with_a_slow_disk_keeps_its_contact_holding() {
     await_rejoin_required(&sim.nodes[3]).await;
 
     let lapse = config.collect_timeout * 4;
-    let store = SimStore::new(StoreKind::Memory);
+    let store = SimStore::new(StoreKind::Memory, &sim.outcomes);
     let slow = Arc::new(SlowStore {
         inner: store.data_store(),
         delay: lapse + Duration::from_secs(5),

@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use evento_core::Event;
 
-use crate::api::{AcceptorRecord, DataStore, DecisionRecord, Journal};
+use crate::api::{same_event, AcceptorRecord, DataStore, DecisionRecord, Journal};
 use crate::clock::{Ballot, NodeId, Timestamp, TxnId};
 use crate::message::{CommandState, Key};
 
@@ -135,6 +135,20 @@ impl DataStore for InMemoryDataStore {
         });
 
         Ok(())
+    }
+
+    async fn holds(&self, events: &[Event]) -> anyhow::Result<bool> {
+        let state = self.state.lock().expect("store poisoned");
+        Ok(events.iter().all(|event| {
+            state
+                .committed
+                .get(&(
+                    event.aggregate_type.clone(),
+                    event.aggregate_id.clone(),
+                    event.version,
+                ))
+                .is_some_and(|stored| same_event(stored, event))
+        }))
     }
 
     async fn snapshot(&self) -> anyhow::Result<Vec<Event>> {

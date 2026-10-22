@@ -1125,24 +1125,39 @@ impl Node {
         let commands = self.restore_journal(false).await?;
         // Replay the retained (post-truncation) applied tail into the data store.
         // The truncated prefix is not in the journal; a durable data store already
-        // holds it, and re-applying the tail is idempotent. A replay the store
-        // fails fails the restart: the journal says these are applied, so a node
-        // starting without them would never apply them again. The events are
+        // holds it, and re-applying the tail is idempotent. The events are
         // stamped from `execute_at` as at the first apply, so a replay over a
         // store that already holds them is an exact duplicate.
         for cmd in &commands {
             if cmd.status == Status::Applied && cmd.applied_conflict == Some(false) {
                 let mut events = cmd.events.clone();
                 stamp_events(cmd.execute_at, &mut events);
-                self.datastore
+                if let Err(err) = self
+                    .datastore
                     .apply(cmd.txn, cmd.execute_at, events, true)
                     .await
-                    .map_err(|err| {
-                        err.context(format!(
-                            "replaying applied transaction {:?} into the data store",
-                            cmd.txn
-                        ))
-                    })?;
+                {
+                    // The store neither holds it nor takes it now: it lost
+                    // the write (a store that acknowledged before it
+                    // persisted, then crashed), or misses an earlier one the
+                    // journal never recorded (an anti-entropy import). Hand
+                    // the transaction back decided but un-applied, as a join
+                    // does: execution applies it again once what precedes it
+                    // is in place — anti-entropy brings a missing import back
+                    // — rather than the node running on a store that lacks
+                    // it, or not starting at all.
+                    tracing::warn!(
+                        node = self.id.0,
+                        txn = ?cmd.txn,
+                        %err,
+                        "a replayed transaction is not in the data store; it will be applied again"
+                    );
+                    let mut cmd = cmd.clone();
+                    cmd.status = Status::Committed;
+                    cmd.decision = Some(true);
+                    cmd.applied_conflict = None;
+                    self.replica.lock().expect("replica poisoned").restore(cmd);
+                }
             }
         }
         Ok(())
@@ -3065,7 +3080,13 @@ impl Node {
                 .version(&event.aggregate_type, &event.aggregate_id)
                 .await?;
             if event.version <= current {
-                return Ok(false);
+                // Its own events already in place, the transaction was
+                // applied here before — and forgotten: its journal record
+                // lost across a restart, or applied by an import, which is
+                // not journaled. Its condition held then; reading its own
+                // write as a conflict would vote to abort a decided commit
+                // (#309).
+                return self.datastore.holds(owned_events).await;
             }
         }
         Ok(true)
@@ -3623,8 +3644,30 @@ impl Node {
                 anyhow::bail!("read quorum not reached for shard {}", plan.shard);
             }
         }
-        // Atomic commit only if every shard's condition holds.
-        let commit = reads.values().flatten().all(|(_, ok)| *ok);
+        // A replica that applied the transaction answers with its decision,
+        // which is final: adopt it. ANDing it with the fresh reads would let
+        // one replica's read overturn a decided commit — one whose store
+        // already holds the transaction's own events, its apply forgotten
+        // across a restart, reads them as a conflict — and replicas yet to
+        // apply would enact an abort the others committed (#309). Only with
+        // no applied replica heard is the decision made here: commit only if
+        // every shard's condition holds.
+        let decided: Vec<bool> = reads
+            .values()
+            .flatten()
+            .filter(|(from, _)| applied.contains(from))
+            .map(|(_, ok)| *ok)
+            .collect();
+        let commit = match decided.first() {
+            Some(&decision) => {
+                anyhow::ensure!(
+                    decided.iter().all(|&d| d == decision),
+                    "replicas applied {txn:?} with different decisions"
+                );
+                decision
+            }
+            None => reads.values().flatten().all(|(_, ok)| *ok),
+        };
 
         // Apply: enact the decision and wait for a slow quorum per shard.
         self.broadcast(&union, Message::Apply { txn, commit }).await;
