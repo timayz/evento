@@ -11,7 +11,8 @@ use std::time::Duration;
 
 use evento_accord::{
     DataStore, HybridLogicalClock, InMemoryDataStore, InMemoryJournal, InMemoryNetwork, Journal,
-    Key, Node, NodeId, ShardedTopology, StaticTopology, Timestamp, Topology, MAX_SKEW_MICROS,
+    Key, Node, NodeId, ShardedTopology, StaticTopology, Status, Timestamp, Topology,
+    MAX_SKEW_MICROS,
 };
 use evento_core::Event;
 
@@ -231,11 +232,23 @@ async fn a_node_restarts_after_compaction() {
     }
 
     // Commit three events; let all three replicas apply them.
+    let mut txns = Vec::new();
     for v in 1..=3 {
-        nodes[0].write(vec![event("acc", v)]).await.unwrap();
+        txns.push(nodes[0].write(vec![event("acc", v)]).await.unwrap().txn);
     }
     for s in &stores {
         await_version(s, "acc", 3).await;
+    }
+    // A store shows an apply a moment before its replica records it: wait
+    // until node 1 recorded all three, or compaction clamps below the last.
+    for _ in 0..500 {
+        if txns
+            .iter()
+            .all(|&txn| nodes[1].command_status(txn) == Some(Status::Applied))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
     // Compact node 1 above every committed transaction: its journal is truncated

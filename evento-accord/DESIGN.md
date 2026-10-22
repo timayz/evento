@@ -675,8 +675,10 @@ backend (sql/fjall). Phases, in order:
   report can count as applied is journaled first: an anti-entropy import is staged
   before it is recorded (unjournaled, a restart restored only the Commit a command
   had been journaled with, and the command waited for good on a dependency the
-  node had imported and its peers had since compacted); an apply's record is staged
-  before the command is marked applied; and a report the node sends on its own —
+  node had imported and its peers had since compacted); a local apply's record is
+  staged ahead of its store apply, so the store and the in-memory mark stay
+  adjacent (a record ahead of a failed apply is only replayed into the store on a
+  restart, as any applied record is); and a report the node sends on its own —
   the periodic watermark, a report answering `Rejoin`, a joiner's first report —
   flushes the journal before it leaves (`Node::vouch_durably`). A reply to a
   handled batch already waits for the batch's flush

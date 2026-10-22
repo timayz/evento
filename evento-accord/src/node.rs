@@ -3120,6 +3120,39 @@ impl Node {
             // Prefer enacting a decided, ready transaction.
             let apply = self.replica.lock().expect("replica poisoned").next_apply();
             if let Some(mut apply) = apply {
+                // Journaled first (#331): from the mark below on, a report may
+                // count it as applied, and a restart that lost its record would
+                // bring it back committed, its decision lost with it —
+                // undecidable once its peers compacted it. Staged ahead of the
+                // store, which keeps the store and the mark adjacent: a record
+                // ahead of a failed apply is replayed into the store on a
+                // restart, as any applied record is, and staged again by the
+                // retry meanwhile.
+                let applied = self
+                    .replica
+                    .lock()
+                    .expect("replica poisoned")
+                    .snapshot(apply.txn)
+                    .map(|mut state| {
+                        state.status = Status::Applied;
+                        state.applied_conflict = Some(!apply.commit);
+                        state
+                    });
+                let staged = match applied {
+                    Some(state) => match self.journal.stage(&state).await {
+                        Ok(()) => true,
+                        Err(err) => {
+                            tracing::warn!(
+                                node = self.id.0,
+                                txn = ?apply.txn,
+                                %err,
+                                "cannot stage a transaction's state; withholding its reply"
+                            );
+                            false
+                        }
+                    },
+                    None => true,
+                };
                 // The events carry their writer's provisional stamps; the
                 // store gets the agreed ones (see `stamp_events`). The journal
                 // keeps the provisional ones — every apply re-derives the same.
@@ -3147,35 +3180,6 @@ impl Node {
                     );
                     break;
                 }
-                // Journaled before it is marked (#331): from the mark on, a
-                // report may count it as applied, and a restart that lost its
-                // record would bring it back committed, its decision lost with
-                // it — undecidable once its peers compacted it.
-                let applied = self
-                    .replica
-                    .lock()
-                    .expect("replica poisoned")
-                    .snapshot(apply.txn)
-                    .map(|mut state| {
-                        state.status = Status::Applied;
-                        state.applied_conflict = Some(!apply.commit);
-                        state
-                    });
-                let staged = match applied {
-                    Some(state) => match self.journal.stage(&state).await {
-                        Ok(()) => true,
-                        Err(err) => {
-                            tracing::warn!(
-                                node = self.id.0,
-                                txn = ?apply.txn,
-                                %err,
-                                "cannot stage a transaction's state; withholding its reply"
-                            );
-                            false
-                        }
-                    },
-                    None => true,
-                };
                 self.replica
                     .lock()
                     .expect("replica poisoned")
@@ -5543,6 +5547,20 @@ impl Node {
                 continue;
             }
             let (txn, execute_at, mut events) = (cmd.txn, cmd.execute_at, cmd.events.clone());
+            // Journaled first (#331): once recorded here, a report of this node
+            // may count it as applied, and a peer compact it away on that
+            // report. A restart that forgot it would restore only what the
+            // journal held of it — nothing, or a Commit — and a command
+            // waiting on it would wait for good. Staged ahead of the store,
+            // as a local apply is, and only staged: a report flushes the
+            // journal before it leaves (`vouch_durably`).
+            let mut applied = cmd.clone();
+            applied.status = Status::Applied;
+            if let Err(err) = self.journal.stage(&applied).await {
+                tracing::warn!(node = self.id.0, ?txn, %err, "cannot journal an import");
+                apply_failed = true;
+                break;
+            }
             // Shipped with the provisional stamps; applied with the agreed
             // ones, exactly as the contact applied them.
             stamp_events(execute_at, &mut events);
@@ -5572,19 +5590,6 @@ impl Node {
                     .await
                     .is_err()
             {
-                apply_failed = true;
-                break;
-            }
-            // Journaled before it is recorded here (#331): from then on a
-            // report of this node may count it as applied, and a peer compact
-            // it away on that report. A restart that forgot it would restore
-            // only what the journal held of it — nothing, or a Commit — and a
-            // command waiting on it would wait for good. Staged only: a
-            // report flushes the journal before it leaves (`vouch_durably`).
-            let mut applied = cmd.clone();
-            applied.status = Status::Applied;
-            if let Err(err) = self.journal.stage(&applied).await {
-                tracing::warn!(node = self.id.0, ?txn, %err, "cannot journal an import");
                 apply_failed = true;
                 break;
             }
