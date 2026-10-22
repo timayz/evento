@@ -498,7 +498,12 @@ backend (sql/fjall). Phases, in order:
   (its store then at the highest acknowledged version), and compact its consensus
   state away, within bounds derived from its `NodeConfig`. It holds everywhere;
   under message faults a healed cluster takes up to ~50 s of virtual time to recover
-  the transactions left stalled (#326), which the bounds allow. Across all
+  the transactions left stalled (#326), which the bounds allow. An **absence**
+  scenario (#310) has minority nodes go silent past `peer_absence_limit` — crashed,
+  or cut one way — while the majority writes and compacts past them, then come back
+  (rejoined if told to); an outside coordinator pre-accepts a write at a node just
+  before its absence and vanishes, so it may come back holding a transaction alone.
+  Across all
   seeds, **safety holds** — no split-brain, no double-commit — and after healing
   the cluster **converges**. The harness already paid off: it found two real gaps
   (non-convergence from stalled transactions and from missed transactions), both
@@ -651,7 +656,44 @@ backend (sql/fjall). Phases, in order:
   or restarted replica re-proves coverage it reports `MIN`, holding cluster
   compaction back (`accord_watermark_clamps_total` counts this), which keeps the
   missing commands exportable and truncating always safe (regression:
-  `partitioned_minority_cannot_unblock_compaction_and_diverge`). **Catch-up:**
+  `partitioned_minority_cannot_unblock_compaction_and_diverge`). **The vote fence**
+  (#310): a report — and the floor and coverage built on it — stays true only if
+  the replica never votes below it later. Without that, a transaction only R holds
+  is compacted past by P, which gave R up; Q, whose floor lags, pre-accepts it on
+  R's recovery; R and Q commit it, and P, which ignores a commit below its floor,
+  never applies it. So a replica **never newly votes** — PreAccept, Accept, or the
+  pre-accept an unrouted recovery asks for — for a transaction it does not hold
+  whose `t0` is below its clock less `compaction_margin` (`Replica::fenced`,
+  `accord_votes_fenced_total`): to a recovery it answers "never witnessed"
+  (`NotWitnessed { redundant: false }`) and journals the ballot. Every report is
+  cut at the clock less that margin when sent, and the clock never goes back, so
+  the fence is above every report the replica made: none goes stale. Across a
+  restart neither — before a report, sync coverage, join vouch or fenced reply
+  leaves the node, its persisted clock bound is raised past the reading it came
+  from (the `mint` path, at most one write per `max_skew`). A coordinator's
+  messages, and recoveries of a transaction still in flight, land within the
+  margin (OPERATIONS: margin ≥ `recovery_timeout` + 2 × skew + delay). Past it, a
+  transaction only a minority holds can no longer gather a quorum, and a recovery
+  proves it never committed (`Node::never_commits`): with **more than `n − slow_q`
+  replicas fenced**, too few are left that ever voted or ever will; with **a replica
+  compacted past it and more than `n − slow_q` fenced or holding it uncommitted**,
+  that replica's floor rests on at least `slow_q` counted replicas that reported
+  above `t0`, a holder reported below it, so a fenced replica is among them — one
+  that never held the transaction, which its sync coverage would have brought in
+  had it committed. The latter rests on every replica fencing, so it sits behind
+  `NodeConfig::fence_invalidation` for rolling upgrades. When neither holds and
+  fewer than `slow_q` replicas could still vote — the rest fenced or compacted past
+  it — no recovery can decide it, since a compacted replica may have applied it and
+  dropped it. Its holder is then **stale**, and requires a rejoin through that
+  replica (`Node::rejoin_contact`): its floor is past `t0`, so `forget_below`
+  drops the transaction, and the snapshot carries its effect if it had one. A peer
+  that never held what it compacted past sets no rejoin bound, so this is how a
+  holder the others gave up and compacted past gets back
+  (`a_lone_holder_cannot_commit_what_a_peer_compacted_past`,
+  `a_lone_holder_cut_off_from_a_compacted_peer_cannot_commit`,
+  `a_lone_holder_stranded_below_its_peers_compaction_rejoins`,
+  `a_vote_fence_outlives_a_restart_with_a_clock_stepped_back`, and the simulator's
+  absence scenario with orphan votes). **Catch-up:**
   only a brand-new joining node can be
   below the watermark, so `join` transfers a **data-store snapshot** for the
   truncated prefix plus the recent commands and the watermark; anti-entropy stays

@@ -10,19 +10,29 @@ use evento_core::cursor::{Args, ReadResult, Value};
 use evento_core::{Event, EventFilter, RoutingKey};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
+use ulid::Ulid;
 
 /// Every transaction's outcome as the stores enacted it, across the cluster:
 /// one enacted as a commit on one replica and an abort on another — a split
 /// decision — shows up with both.
+///
+/// Keyed by the transaction and its events' ids: a join installs each
+/// snapshot page under the contact's floor as a placeholder id, which can be
+/// a real transaction's `t0`, but a page carries other transactions' events.
 #[derive(Default)]
-pub struct Outcomes(Mutex<BTreeMap<TxnId, BTreeSet<bool>>>);
+pub struct Outcomes(Mutex<BTreeMap<Enacted, BTreeSet<bool>>>);
+
+/// A transaction and the ids of the events it enacted, sorted.
+type Enacted = (TxnId, Vec<Ulid>);
 
 impl Outcomes {
-    pub fn record(&self, txn: TxnId, commit: bool) {
+    pub fn record(&self, txn: TxnId, events: &[Event], commit: bool) {
+        let mut ids: Vec<Ulid> = events.iter().map(|e| e.id).collect();
+        ids.sort();
         self.0
             .lock()
             .unwrap()
-            .entry(txn)
+            .entry((txn, ids))
             .or_default()
             .insert(commit);
     }
@@ -34,7 +44,7 @@ impl Outcomes {
             .unwrap()
             .iter()
             .filter(|(_, outcomes)| outcomes.len() > 1)
-            .map(|(txn, _)| *txn)
+            .map(|((txn, _), _)| *txn)
             .collect()
     }
 }
@@ -147,9 +157,10 @@ impl DataStore for FaultStore {
         {
             anyhow::bail!("simulated write failure");
         }
+        let recorded = self.outcomes.as_ref().map(|_| events.clone());
         self.inner.apply(txn, execute_at, events, commit).await?;
-        if let Some(outcomes) = &self.outcomes {
-            outcomes.record(txn, commit);
+        if let (Some(outcomes), Some(events)) = (&self.outcomes, recorded) {
+            outcomes.record(txn, &events, commit);
         }
         Ok(())
     }

@@ -81,7 +81,7 @@ timeouts for geo/WAN** deployments.
 | `recovery_interval` | 100 ms | How often the recovery/anti-entropy/compaction sweep runs. |
 | `recovery_timeout` | 300 ms | A txn unapplied this long is presumed stalled and recovered. Keep well above normal write latency. |
 | `anti_entropy_interval` | 250 ms | Pace of the anti-entropy rounds (one peer per round, in turn). Each round also proves the window a node holds, which both its compaction report and its subscriptions wait for: subscriptions trail the present by about `compaction_margin` plus `(slow quorum − 1)` rounds. Keep it well below `compaction_margin`. |
-| `compaction_margin` | 1 s | Lag on the redundancy watermark; keep above clock-skew bound + propagation latency. |
+| `compaction_margin` | 1 s | Lag on the redundancy watermark, and the **vote fence**: a node never votes for (pre-accepts, accepts, or pre-accepts in a recovery) a transaction it never witnessed whose `t0` is older than its clock less this margin. Keep it ≥ `recovery_timeout` + 2 × the clock-skew bound + worst-case message delay, so a coordinator's messages and a recovery of a transaction still in flight land inside it; a recovery that comes later, for a transaction only a minority holds, invalidates it. |
 | `max_journal_batch` | 128 | Messages drained per group-commit fsync (latency vs. fsync amortization). |
 | `phi_threshold` | 8.0 | Phi-accrual suspicion level; higher tolerates more latency variance before suspecting a coordinator. |
 | `acceptable_pause` | 500 ms | How long a live peer may go quiet beyond its usual heartbeat interval (scheduler stall, slow fsync, loaded host) before suspicion starts to rise. |
@@ -91,11 +91,13 @@ timeouts for geo/WAN** deployments.
 | `snapshot_page_events` | 4096 | Most events this node puts in one snapshot page when a joiner bootstraps from it (§7, lost store). |
 | `snapshot_page_bytes` | 4 MiB | Byte budget of one snapshot page, command page or anti-entropy reply (a single larger event or command still crosses alone). Keep it far below the transport's 64 MiB frame cap and small enough that one group's bootstrap does not hold the link it shares with every other group for long. |
 | `config_defer_step` | 100 ms | Control-plane anti-dueling delay for concurrent reconfigurations. |
+| `fence_invalidation` | true | Lets a recovery invalidate a transaction one replica compacted past while the others fenced it or hold it uncommitted. Sound only when every replica fences its votes: during a rolling upgrade from a build without the vote fence, set it `false` until the last node is upgraded. |
 
 Clock-skew tolerance is on the clock: `HybridLogicalClock::with_max_skew(..)` (default
 `MAX_SKEW_MICROS`); keep `recovery_timeout`/`compaction_margin` above it. The node
 persists a clock bound in its journal (raised at most once per `max_skew` while it
-mints) and a restart starts its clock there, so a node never reuses a transaction id
+mints, and before it reports a redundancy point or answers a recovery from below its
+vote fence, so the fence never goes back) and a restart starts its clock there, so a node never reuses a transaction id
 or ballot across a restart, even if its wall clock stepped back. A restart within
 `max_skew` of the last write waits out at most `max_skew`; after a backward step the
 node logs that its wall clock is behind its clock bound and its stamps lead the wall
@@ -139,7 +141,8 @@ Serve it on an HTTP endpoint (see `bank-axum-accord`'s `/metrics`). Counters:
 | `messages_shed` | inbound backpressure drops; sustained > 0 = a node is overloaded or a peer is flooding. |
 | `messages_unrouted` | (`MuxTransport` only) inbound frames for a group this host has not registered that were dropped — parked past the pending-buffer TTL or over its bounds. Steady > 0 = peers address groups this host never opens (a tenant evicted here and never re-opened, or a stale/unknown group id). |
 | `peers_absent` | shard peers this node stopped waiting for (`peer_absence_limit`); each is a node that was silent for that long. |
-| `rejoins_required` | a peer told this node to rejoin: it had been given up on while writes it never applied were compacted. The node is stale until its host rejoins it (§7). |
+| `rejoins_required` | this node must rejoin: a peer told it to, having given it up while writes it never applied were compacted; or its own recovery found it holding a transaction its peers compacted past, which no recovery can decide any more. The node is stale until its host rejoins it (§7) — through `Node::rejoin_contact()`, the peer that compacted past what it holds. |
+| `votes_fenced` | votes refused for a transaction this node never witnessed, older than its compaction margin: a late coordinator message, or a recovery by a replica that alone holds the transaction (§3, `compaction_margin`). Spikes after a partition heals are expected; a steady rate means coordinators slower than the margin. |
 | `snapshot_pages` | snapshot pages this node served to joining peers; a joiner pulls one per `snapshot_page_events` / `snapshot_page_bytes` of the contact's store. |
 | `command_pages` | command pages this node served to joining peers: a joiner pulls the contact's un-compacted applied commands one page at a time, before its snapshot pages. |
 | `joins_partial` | joins of this node that failed after a page was installed: the store holds a prefix no contact can complete, and must be emptied before the next join (§7). Steady > 0 = a contact that cannot read its backend, or a link losing pages faster than the per-page retries cover. |
@@ -279,7 +282,12 @@ refuses anything else before a vote, and a node never installs it.
   like that until its host rejoins it — the `GroupHost`
   `with_rejoin_handler` hook is told, and should `close(group).await` the group (it
   returns once nothing touches its store or journal), discard its event store —
-  **keep its journal** — and `open_joining` it over that journal (next item). The bound a given-up peer must
+  **keep its journal** — and `open_joining` it over that journal (next item),
+  listing `Node::rejoin_contact()` first among the contacts: the peer that told it
+  to rejoin (or that its recovery found compacted past a transaction it holds)
+  compacted past what it holds, so joining through it drops everything
+  below that floor, where a contact whose floor lags could leave the node holding a
+  transaction the others compacted past (and have it told to rejoin again). The bound a given-up peer must
   report above is persisted (`Journal::save_rejoin_bounds`), so it holds across a
   restart of the node that gave it up. A rejoin streams the snapshot in pages
   (`snapshot_page_bytes`), so a group of any size can be given up on and rejoined.

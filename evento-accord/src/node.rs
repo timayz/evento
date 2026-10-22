@@ -137,6 +137,13 @@ pub struct NodeConfig {
     /// concurrent reconfigurations converge instead of livelocking. Deterministic
     /// (no RNG), so the simulation stays bit-reproducible.
     pub config_defer_step: Duration,
+    /// Lets a recovery invalidate a transaction one replica compacted past
+    /// while the others fenced it or hold it uncommitted (#310; see the
+    /// replicas' vote fence, `Replica::fenced`). Sound only once every
+    /// replica of the group fences its votes: during a rolling upgrade from a
+    /// build without the fence, set it `false` until the last node runs a
+    /// build with it. Default `true`.
+    pub fence_invalidation: bool,
 }
 
 impl Default for NodeConfig {
@@ -158,6 +165,7 @@ impl Default for NodeConfig {
             snapshot_page_events: 4096,
             snapshot_page_bytes: 4 * 1024 * 1024,
             config_defer_step: Duration::from_millis(100),
+            fence_invalidation: true,
         }
     }
 }
@@ -794,6 +802,9 @@ pub struct Node {
     /// the journal) and opens the group by joining
     /// (`GroupHost::open_joining`).
     rejoin_required: Arc<tokio::sync::watch::Sender<bool>>,
+    /// The peer whose `Rejoin` set `rejoin_required` (see
+    /// [`rejoin_contact`](Self::rejoin_contact)).
+    rejoin_from: Arc<Mutex<Option<NodeId>>>,
     /// Bumped whenever local applied state advances (an apply or an
     /// anti-entropy import). Waiters (`read_barrier`, read-your-writes) wait
     /// on it instead of polling the replica lock every millisecond.
@@ -855,6 +866,7 @@ impl Node {
             started_at: Instant::now(),
             absent: Arc::new(Mutex::new(HashMap::new())),
             rejoin_required: Arc::new(tokio::sync::watch::channel(false).0),
+            rejoin_from: Arc::new(Mutex::new(None)),
             applied: Arc::new(AppliedSignal::default()),
             last_anti_entropy: Arc::new(Mutex::new(None)),
             metrics: Arc::new(Metrics::new()),
@@ -945,14 +957,29 @@ impl Node {
         Instant::now().saturating_duration_since(heard)
     }
 
-    /// Whether a peer told this node to rejoin the group from a snapshot: it
-    /// was absent while transactions it never applied were compacted, so it
-    /// can no longer catch up. The node drops every message and refuses writes
-    /// from then on; the host closes it, discards its event store — keeping
-    /// its journal, whose votes and promises the node must not forget — and
-    /// opens the group by joining (`GroupHost::open_joining`).
+    /// Whether this node must rejoin the group from a snapshot: a peer told it
+    /// to, as it was absent while transactions it never applied were
+    /// compacted; or its own recovery found it holding a transaction its peers
+    /// compacted past, which no recovery can decide any more (see
+    /// `stranded_below`). Either way it can no longer catch up. The node drops
+    /// every message and refuses writes from then on; the host closes it,
+    /// discards its event store — keeping its journal, whose votes and
+    /// promises the node must not forget — and opens the group by joining
+    /// (`GroupHost::open_joining`).
     pub fn rejoin_required(&self) -> bool {
         *self.rejoin_required.borrow()
+    }
+
+    /// The peer that told this node to rejoin, or that its recovery found
+    /// compacted past a transaction it holds, once
+    /// [`rejoin_required`](Self::rejoin_required): it compacted past what
+    /// this node holds, so rejoining **through it** drops everything below
+    /// its floor ([`recover_state_for_join`](Self::recover_state_for_join)
+    /// keeps the journal above the contact's). Through a contact whose floor
+    /// lags, the node could keep a transaction the told peer compacted past,
+    /// and be told to rejoin again.
+    pub fn rejoin_contact(&self) -> Option<NodeId> {
+        *self.rejoin_from.lock().expect("rejoin poisoned")
     }
 
     /// A watch that turns `true` when [`rejoin_required`](Self::rejoin_required)
@@ -1015,6 +1042,24 @@ impl Node {
         let now = self.clock.now().micros;
         Timestamp {
             micros: now.saturating_sub(self.settings.compaction_margin.as_micros() as u64),
+            logical: 0,
+            node: NodeId(0),
+        }
+    }
+
+    /// The vote fence (see [`Replica::fenced`]): this node's clock less the
+    /// compaction margin. Every redundancy point it reports is cut at its
+    /// clock less the margin when reported ([`margin_cutoff`](Self::margin_cutoff)),
+    /// and a clock never goes back — across a restart neither, as nothing cut
+    /// at a reading leaves the node before a clock bound past it is persisted
+    /// ([`bound_clock_past`](Self::bound_clock_past)) — so the fence is above
+    /// all of them.
+    fn vote_fence(&self) -> Timestamp {
+        Timestamp {
+            micros: self
+                .clock
+                .reading_micros()
+                .saturating_sub(self.settings.compaction_margin.as_micros() as u64),
             logical: 0,
             node: NodeId(0),
         }
@@ -1836,6 +1881,12 @@ impl Node {
             .copied()
             .filter(|&n| n != self.id)
             .collect();
+        // A peer may compact up to `mine` past what this node does not hold,
+        // trusting its vote fence: persist the clock bound that keeps the
+        // fence above `mine` across a restart first.
+        if !self.bound_clock().await {
+            return;
+        }
         self.broadcast(
             &peers,
             Message::Watermark {
@@ -2010,6 +2061,11 @@ impl Node {
             | Message::SnapshotRequest { .. }
             | Message::SnapshotPageRequest { .. }
             | Message::JoinKeepalive => return Screen::Pass,
+            // Its recovery of a transaction it alone holds gathers the vote
+            // fences that let it invalidate one no one else can commit (see
+            // `Node::never_commits`); answered, never counted as a sign the
+            // peer is back.
+            Message::BeginRecovery { .. } => return Screen::Pass,
             Message::Watermark { applied_through } => match state.rejoin_above {
                 Some(bound) if *applied_through <= bound => Some(bound),
                 _ => None,
@@ -2049,6 +2105,9 @@ impl Node {
                 ?mine,
                 "told to rejoin but holding everything compacted; reporting instead"
             );
+            if !self.bound_clock().await {
+                return;
+            }
             self.send(
                 from,
                 Message::Watermark {
@@ -2058,7 +2117,6 @@ impl Node {
             .await;
             return;
         }
-        self.metrics.record_rejoin_required();
         tracing::error!(
             node = self.id.0,
             peer = from.0,
@@ -2066,6 +2124,15 @@ impl Node {
             ?mine,
             "behind the peers' compaction; this node must rejoin the group from a snapshot"
         );
+        self.require_rejoin(from);
+    }
+
+    /// Stops this node taking part until its host rejoins it through
+    /// `contact`, a peer that compacted past what it holds (see
+    /// [`rejoin_contact`](Self::rejoin_contact)).
+    fn require_rejoin(&self, contact: NodeId) {
+        self.metrics.record_rejoin_required();
+        *self.rejoin_from.lock().expect("rejoin poisoned") = Some(contact);
         self.rejoin_required.send_replace(true);
     }
 
@@ -2221,11 +2288,12 @@ impl Node {
                     return out;
                 }
                 let events = self.owned_events(events);
-                let vote = self
-                    .replica
-                    .lock()
-                    .expect("replica poisoned")
-                    .preaccept(txn, keys, events);
+                let fence = self.vote_fence();
+                let vote = {
+                    let mut replica = self.replica.lock().expect("replica poisoned");
+                    replica.set_vote_fence(fence);
+                    replica.preaccept(txn, keys, events)
+                };
                 match vote {
                     Ok((execute_at, deps)) => {
                         // A vote the journal did not take is not sent.
@@ -2247,6 +2315,7 @@ impl Node {
                         out.push((from, Message::Nack { txn, promised }))
                     }
                     Err(Refusal::Compacted) => {}
+                    Err(Refusal::Fenced) => self.metrics.record_vote_fenced(),
                 }
             }
             Message::Accept {
@@ -2263,12 +2332,17 @@ impl Node {
                 if self.not_a_replica_of(txn, carried, &keys) {
                     return out;
                 }
-                let reply = self
-                    .replica
-                    .lock()
-                    .expect("replica poisoned")
-                    .accept(txn, ballot, execute_at, deps, keys);
+                let fence = self.vote_fence();
+                let reply = {
+                    let mut replica = self.replica.lock().expect("replica poisoned");
+                    replica.set_vote_fence(fence);
+                    replica.accept(txn, ballot, execute_at, deps, keys)
+                };
                 if reply == Err(Refusal::Compacted) {
+                    return out;
+                }
+                if reply == Err(Refusal::Fenced) {
+                    self.metrics.record_vote_fenced();
                     return out;
                 }
                 let route_kept = reply.is_err() || self.keep_route(txn, route.as_deref()).await;
@@ -2280,7 +2354,7 @@ impl Node {
                     Err(Refusal::Promised(promised)) => {
                         out.push((from, Message::Nack { txn, promised }))
                     }
-                    Err(Refusal::Compacted) => {}
+                    Err(Refusal::Compacted | Refusal::Fenced) => {}
                 }
             }
             Message::Commit {
@@ -2400,8 +2474,10 @@ impl Node {
             } => {
                 let keys = self.owned_keys(keys);
                 let events = self.owned_events(events);
+                let fence = self.vote_fence();
                 let reply = {
                     let mut replica = self.replica.lock().expect("replica poisoned");
+                    replica.set_vote_fence(fence);
                     match &route {
                         // Routed: never pre-accept what this replica never
                         // witnessed (see `Replica::recover_routed`).
@@ -2409,6 +2485,18 @@ impl Node {
                         None => replica.recover_unrouted(txn, ballot, keys, events),
                     }
                 };
+                // An unrouted recovery is told "never witnessed" only below the
+                // vote fence: an answer a recovery may count as this replica's
+                // refusal for good, so the fence it rests on must survive a
+                // restart (`bound_clock`).
+                let fenced = route.is_none()
+                    && matches!(reply, Ok(RoutedRecovery::NotWitnessed { redundant: false }));
+                if fenced {
+                    self.metrics.record_vote_fenced();
+                    if !self.bound_clock().await {
+                        return out;
+                    }
+                }
                 let route_kept = !matches!(reply, Ok(RoutedRecovery::Known(_)))
                     || self.keep_route(txn, route.as_deref()).await;
                 // Durable before the reply, like any promise or vote — the
@@ -2483,6 +2571,10 @@ impl Node {
                     return out;
                 }
                 let (watermark, coverage, commands) = self.export_bootstrap(known.as_ref());
+                // The coverage vouches for what a peer may compact past.
+                if !self.bound_clock().await {
+                    return out;
+                }
                 // A bootstrapping joiner on the legacy protocol (before
                 // `SnapshotRequest`) may be below our truncation watermark, so
                 // it also needs the materialised state command replay no
@@ -2548,6 +2640,10 @@ impl Node {
                 };
                 let (watermark, coverage, commands, epoch, vouched) =
                     self.export_join_header(inline);
+                // The coverage and the vouch let peers compact past them.
+                if !self.bound_clock().await {
+                    return out;
+                }
                 // Hold this node's report at the vouch until the joiner's
                 // first report (see `JoinHold`). Only a same-shard joiner's
                 // report is ever compared against this shard's compaction.
@@ -4051,6 +4147,30 @@ impl Node {
             }
         }
 
+        let (plans, union) = self.plan(&all_keys, &all_events);
+        if self.never_commits(&plans, &resp) {
+            tracing::debug!(
+                node = self.id.0,
+                ?txn,
+                "invalidating a transaction its replicas' vote fences rule out"
+            );
+            self.broadcast(&union, Message::Invalidate { txn }).await;
+            return Ok(Attempt::Done(CommitOutcome {
+                txn,
+                conflict: true,
+            }));
+        }
+        if let Some(contact) = self.stranded_below(&plans, &resp) {
+            tracing::error!(
+                node = self.id.0,
+                peer = contact.0,
+                ?txn,
+                "holding a transaction a peer compacted past, which no recovery can decide; \
+                 this node must rejoin the group from a snapshot"
+            );
+            self.require_rejoin(contact);
+            anyhow::bail!("{txn:?} lies below a peer's compaction: this node must rejoin");
+        }
         let known: Vec<(NodeId, RecoverFields)> = resp
             .into_iter()
             .filter_map(|(from, r)| match r {
@@ -4061,7 +4181,16 @@ impl Node {
         if known.is_empty() {
             anyhow::bail!("transaction unknown to recovery quorum");
         }
-        let (plans, _union) = self.plan(&all_keys, &all_events);
+        // An invalidated report: a recovery decided it was never committed,
+        // and this replica's report shows it. Finish that recovery's job on
+        // any replica that missed its Invalidate, rather than retry for ever.
+        if known.iter().any(|(_, f)| f.invalidated()) {
+            self.broadcast(&union, Message::Invalidate { txn }).await;
+            return Ok(Attempt::Done(CommitOutcome {
+                txn,
+                conflict: true,
+            }));
+        }
 
         // Recovery-quorum gate: the decision must rest on a slow quorum of
         // every touched shard's replicas — each one's report and vote — so
@@ -4082,6 +4211,100 @@ impl Node {
         }
         self.drive_recovery(rx, txn, ballot, &plans, None, known)
             .await
+    }
+
+    /// Whether an unrouted recovery's reports prove `txn` never committed and
+    /// never will (#310), so it can be invalidated. A replica that answers
+    /// "never witnessed" to an unrouted recovery does so only below its vote
+    /// fence (see [`Replica::fenced`]): it never voted for the transaction,
+    /// and never will. Per shard of `slow_q` out of `n`:
+    ///
+    /// - **More than `n − slow_q` fenced:** every commit needs `slow_q`
+    ///   voters, and too few replicas are left that ever could vote.
+    /// - **A replica compacted past it, and more than `n − slow_q` fenced or
+    ///   holding it uncommitted:** the compacted replica's floor rests on a
+    ///   counted set `S` of at least `slow_q` replicas, each of which reported
+    ///   above the transaction's `t0`. A replica holding it uncommitted
+    ///   reported below it, so it is not in `S`. With too few replicas
+    ///   outside the fenced and the holders to contain `S`, a fenced replica
+    ///   is in `S`. A member of `S` that never held the transaction proves it
+    ///   had no voter in any majority, or that member's sync coverage would
+    ///   have brought it in. So it never committed. This rests on every
+    ///   replica fencing its votes, so it needs
+    ///   [`NodeConfig::fence_invalidation`].
+    ///
+    /// A report of the transaction committed anywhere rules both out: a
+    /// decision exists.
+    fn never_commits(&self, plans: &[ShardPlan], resp: &[(NodeId, RecoverResp)]) -> bool {
+        if resp.iter().any(
+            |(_, r)| matches!(r, RecoverResp::Ok(f) if f.known && f.status >= Status::Committed),
+        ) {
+            return false;
+        }
+        plans.iter().any(|plan| {
+            let (mut fenced, mut redundant, mut holders) = (0, 0, 0);
+            for (from, report) in resp {
+                if !plan.replicas.contains(from) {
+                    continue;
+                }
+                match report {
+                    RecoverResp::NotWitnessed { redundant: false } => fenced += 1,
+                    RecoverResp::NotWitnessed { redundant: true } => redundant += 1,
+                    RecoverResp::Ok(f) if f.known => holders += 1,
+                    _ => {}
+                }
+            }
+            let spare = plan.replicas.len() - plan.slow_q;
+            fenced > spare
+                || (self.settings.fence_invalidation && redundant > 0 && fenced + holders > spare)
+        })
+    }
+
+    /// Whether this node holds a transaction no recovery can decide again,
+    /// because a replica compacted past it (#310): the replica to rejoin
+    /// through, if so.
+    ///
+    /// A replica that reports it from below its floor ("redundant") never
+    /// votes for it, nor does a fenced one. With fewer than `slow_q` replicas
+    /// of a shard left that could, no recovery gathers the quorum it needs;
+    /// and [`never_commits`](Self::never_commits) found no proof it never
+    /// committed — the compacted replica may have applied it and dropped it.
+    /// Below that replica's floor it was applied on every replica the floor
+    /// counted, or can no longer commit (see `Replica::forget_below`). Either
+    /// way this node, holding it undecided, is stale. Rejoining through that
+    /// replica forgets it, and the snapshot carries its effect if it had one.
+    ///
+    /// This needs the transaction held here. A node recovering only a
+    /// dependency is not stuck: its own floor follows its peers' past it.
+    fn stranded_below(
+        &self,
+        plans: &[ShardPlan],
+        resp: &[(NodeId, RecoverResp)],
+    ) -> Option<NodeId> {
+        let held = resp
+            .iter()
+            .any(|(from, r)| *from == self.id && matches!(r, RecoverResp::Ok(f) if f.known));
+        if !held {
+            return None;
+        }
+        plans.iter().find_map(|plan| {
+            let (mut fenced, mut compacted) = (0, None::<(usize, NodeId)>);
+            for (from, report) in resp {
+                if !plan.replicas.contains(from) {
+                    continue;
+                }
+                match report {
+                    RecoverResp::NotWitnessed { redundant: false } => fenced += 1,
+                    RecoverResp::NotWitnessed { redundant: true } => {
+                        let (count, first) = compacted.unwrap_or((0, *from));
+                        compacted = Some((count + 1, first));
+                    }
+                    _ => {}
+                }
+            }
+            let (redundant, contact) = compacted?;
+            (plan.replicas.len() - fenced - redundant < plan.slow_q).then_some(contact)
+        })
     }
 
     /// One recovery attempt for a multi-shard transaction, by its `route`.
@@ -4679,13 +4902,15 @@ impl Node {
             .into_iter()
             .filter(|&n| n != self.id)
             .collect();
-        self.broadcast(
-            &peers,
-            Message::Watermark {
-                applied_through: mine,
-            },
-        )
-        .await;
+        if self.bound_clock().await {
+            self.broadcast(
+                &peers,
+                Message::Watermark {
+                    applied_through: mine,
+                },
+            )
+            .await;
+        }
 
         // Resume normal processing and replay anything buffered during bootstrap.
         // Flag flip and drain happen under the buffer lock (see `handle_staged`)
@@ -5961,19 +6186,29 @@ impl Node {
             .redundant_before();
         self.clock.restore(floor);
         let stamp = self.clock.now();
-        if stamp.micros < self.clock_bound.load(Ordering::Acquire) {
-            return Ok(stamp);
+        self.bound_clock_past(stamp.micros).await?;
+        Ok(stamp)
+    }
+
+    /// Persists a clock bound past `reading` (microseconds), unless one is
+    /// already: restarted from its journal, the node starts its clock there,
+    /// so nothing cut at that reading — a minted id, a redundancy point it
+    /// reported, the vote fence a refusal relied on — is ever ahead of its
+    /// clock again. Raised a skew window ahead, so the journal sees one write
+    /// per window at most.
+    async fn bound_clock_past(&self, reading: u64) -> anyhow::Result<()> {
+        if reading < self.clock_bound.load(Ordering::Acquire) {
+            return Ok(());
         }
         let _raising = self.clock_bound_lock.lock().await;
         if self.retired.load(Ordering::Acquire) {
             return Err(NodeClosed.into());
         }
-        if stamp.micros < self.clock_bound.load(Ordering::Acquire) {
-            return Ok(stamp);
+        if reading < self.clock_bound.load(Ordering::Acquire) {
+            return Ok(());
         }
         let ahead = self.clock.max_skew_micros().saturating_mul(2);
-        let bound = stamp
-            .micros
+        let bound = reading
             .saturating_add(1)
             .max(self.clock.physical_micros().saturating_add(ahead));
         self.journal
@@ -5981,7 +6216,16 @@ impl Node {
             .await
             .map_err(|err| err.context("cannot persist the clock bound"))?;
         self.clock_bound.store(bound, Ordering::Release);
-        Ok(stamp)
+        Ok(())
+    }
+
+    /// [`bound_clock_past`](Self::bound_clock_past) this node's current
+    /// reading, before a value cut at an earlier one leaves it. `false` when
+    /// the bound cannot be persisted: the value must not be sent then.
+    async fn bound_clock(&self) -> bool {
+        self.bound_clock_past(self.clock.reading_micros())
+            .await
+            .is_ok()
     }
 
     /// Stops this node minting, for good: its host closed it, and the node
@@ -6280,9 +6524,23 @@ mod tests {
         }
     }
 
+    thread_local! {
+        /// When this test built its first synthetic message. Transactions
+        /// are stamped just after it, so they arrive within the compaction
+        /// margin of the node's wall clock — not decades old, which the
+        /// vote fence refuses.
+        static BASE: u64 = crate::clock::system_micros();
+    }
+
+    /// `micros` after this test's [`BASE`]: a recent `t0`, the same on every
+    /// call within the test.
+    fn recent(micros: u64) -> u64 {
+        BASE.with(|base| base + micros)
+    }
+
     fn preaccept(i: u64) -> Message {
         let txn = TxnId(Timestamp {
-            micros: i + 1,
+            micros: recent(i + 1),
             logical: 0,
             node: NodeId(9),
         });
@@ -7233,7 +7491,7 @@ mod tests {
             .clone();
         let key = Key::of(&event);
         let txn = TxnId(Timestamp {
-            micros: 1_000,
+            micros: recent(1_000),
             logical: 0,
             node: NodeId(9),
         });
