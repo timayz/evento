@@ -1589,6 +1589,23 @@ impl Replica {
         self.blocked.contains_key(&txn)
     }
 
+    /// The transactions this replica never witnessed that a command committed
+    /// here waits on (see `blocked`), with `t0` before `cutoff`, oldest first.
+    /// Anti-entropy brings such a dependency in only once it is applied
+    /// somewhere, which may itself wait on this replica (#330).
+    pub fn missing_deps(&self, cutoff: Timestamp) -> Vec<TxnId> {
+        let mut missing: Vec<TxnId> = self
+            .waiters
+            .keys()
+            .copied()
+            .filter(|dep| {
+                dep.0 < cutoff && dep.0 >= self.redundant_before && !self.commands.contains_key(dep)
+            })
+            .collect();
+        missing.sort_unstable();
+        missing
+    }
+
     /// The largest watermark `<= cutoff` that is *locally* safe: no transaction
     /// this replica holds below the result is still un-applied. (Below it, every
     /// command here is `Applied`, so its effect is durable in the data store.)
@@ -1978,6 +1995,39 @@ mod tests {
         replica.compact(txn(15).0);
         assert!(!replica.is_blocked(b));
         assert_eq!(replica.next_apply().expect("B is ready").txn, b);
+    }
+
+    /// A dependency a parked command waits on, never witnessed here, is
+    /// missing once older than the cutoff — the node then learns its decision
+    /// from its holders (#330) — and no longer once it is held.
+    #[test]
+    fn a_parked_command_reports_the_dependency_it_never_witnessed() {
+        let mut replica = Replica::new();
+        let key = Key("k".into());
+        let (a, b) = (txn(10), txn(20));
+        replica.commit(
+            b,
+            b.0,
+            vec![a],
+            vec![event("k", 2)],
+            vec![key.clone()],
+            NodeId(0),
+        );
+        assert!(replica.next_read().is_none(), "B waits for A");
+        assert!(replica.missing_deps(txn(5).0).is_empty(), "A is too recent");
+        assert_eq!(replica.missing_deps(txn(15).0), vec![a]);
+
+        // A's decision, learned: it executes after B.
+        replica.commit(
+            a,
+            txn(30).0,
+            vec![b],
+            vec![event("k", 1)],
+            vec![key],
+            NodeId(0),
+        );
+        assert!(replica.missing_deps(txn(15).0).is_empty());
+        assert_eq!(replica.next_read().expect("B is ready").txn, b);
     }
 
     /// A replica that first learns a transaction via Accept (it missed
