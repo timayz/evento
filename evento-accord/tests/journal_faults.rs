@@ -10,165 +10,17 @@
 //! restart. The test asserts the invariant directly (no restart needed): if a write
 //! returns committed, at least a slow quorum holds it durably.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+mod common;
+
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use async_trait::async_trait;
+use common::journal::FaultJournal;
 use evento_accord::{
-    AcceptorRecord, CommandState, DataStore, DecisionRecord, DynamicTopology, HybridLogicalClock,
-    InMemoryDataStore, InMemoryJournal, InMemoryNetwork, Journal, MessageSink, Node, NodeConfig,
-    NodeId, StaticTopology, Timestamp, Topology, TxnId,
+    DataStore, DynamicTopology, HybridLogicalClock, InMemoryDataStore, InMemoryNetwork, Journal,
+    MessageSink, Node, NodeConfig, NodeId, StaticTopology, Timestamp, Topology, TxnId,
 };
 use evento_core::Event;
-
-/// A journal whose `flush` (fsync) can be made to fail. A `stage`d record is held in
-/// a pending buffer and only becomes **durable** (loadable, survives a restart) once
-/// a flush succeeds; while `failing`, flush errors and the pending records stay
-/// non-durable — exactly what a disk failure / crash would lose.
-struct FaultJournal {
-    durable: InMemoryJournal,
-    pending: Mutex<Vec<CommandState>>,
-    failing: AtomicBool,
-    /// `truncate` calls, successful or not.
-    truncates: AtomicUsize,
-    /// While set, `truncate` fails without touching the durable journal.
-    truncate_failing: AtomicBool,
-    /// While set, every config-acceptor record fails.
-    acceptor_failing: AtomicBool,
-    /// While set, a config-acceptor record holding an accepted layout fails.
-    accept_failing: AtomicBool,
-    /// While set, appending to the metadata log fails.
-    metadata_failing: AtomicBool,
-    /// While set, persisting the clock bound fails.
-    clock_bound_failing: AtomicBool,
-}
-
-impl FaultJournal {
-    fn new() -> Self {
-        Self {
-            durable: InMemoryJournal::new(),
-            pending: Mutex::new(Vec::new()),
-            failing: AtomicBool::new(false),
-            truncates: AtomicUsize::new(0),
-            truncate_failing: AtomicBool::new(false),
-            acceptor_failing: AtomicBool::new(false),
-            accept_failing: AtomicBool::new(false),
-            metadata_failing: AtomicBool::new(false),
-            clock_bound_failing: AtomicBool::new(false),
-        }
-    }
-
-    fn set_failing(&self, v: bool) {
-        self.failing.store(v, Ordering::SeqCst);
-    }
-
-    fn set_truncate_failing(&self, v: bool) {
-        self.truncate_failing.store(v, Ordering::SeqCst);
-    }
-
-    fn set_acceptor_failing(&self, v: bool) {
-        self.acceptor_failing.store(v, Ordering::SeqCst);
-    }
-
-    fn set_accept_failing(&self, v: bool) {
-        self.accept_failing.store(v, Ordering::SeqCst);
-    }
-
-    fn set_metadata_failing(&self, v: bool) {
-        self.metadata_failing.store(v, Ordering::SeqCst);
-    }
-
-    fn set_clock_bound_failing(&self, v: bool) {
-        self.clock_bound_failing.store(v, Ordering::SeqCst);
-    }
-
-    fn truncates(&self) -> usize {
-        self.truncates.load(Ordering::SeqCst)
-    }
-
-    /// Whether `txn` is **durably** recorded (survived a flush) — the real
-    /// post-crash state, ignoring any non-durable pending writes.
-    async fn durable_has(&self, txn: TxnId) -> bool {
-        self.durable.load(txn).await.unwrap().is_some()
-    }
-}
-
-#[async_trait]
-impl Journal for FaultJournal {
-    async fn record(&self, state: &CommandState) -> anyhow::Result<()> {
-        self.stage(state).await?;
-        self.flush().await
-    }
-    async fn stage(&self, state: &CommandState) -> anyhow::Result<()> {
-        self.pending.lock().unwrap().push(state.clone());
-        Ok(())
-    }
-    async fn flush(&self) -> anyhow::Result<()> {
-        if self.failing.load(Ordering::SeqCst) {
-            anyhow::bail!("simulated fsync failure");
-        }
-        let batch = std::mem::take(&mut *self.pending.lock().unwrap());
-        for state in batch {
-            self.durable.record(&state).await?;
-        }
-        Ok(())
-    }
-    async fn load(&self, txn: TxnId) -> anyhow::Result<Option<CommandState>> {
-        self.durable.load(txn).await
-    }
-    async fn load_all(&self) -> anyhow::Result<Vec<CommandState>> {
-        self.durable.load_all().await
-    }
-    async fn truncate(&self, before: Timestamp) -> anyhow::Result<()> {
-        self.truncates.fetch_add(1, Ordering::SeqCst);
-        if self.truncate_failing.load(Ordering::SeqCst) {
-            anyhow::bail!("simulated truncate failure");
-        }
-        self.durable.truncate(before).await
-    }
-    async fn load_watermark(&self) -> anyhow::Result<Option<Timestamp>> {
-        self.durable.load_watermark().await
-    }
-    async fn append_metadata(&self, epoch: u64, layout: &[Vec<NodeId>]) -> anyhow::Result<()> {
-        if self.metadata_failing.load(Ordering::SeqCst) {
-            anyhow::bail!("simulated metadata-log write failure");
-        }
-        self.durable.append_metadata(epoch, layout).await
-    }
-    async fn load_metadata(&self) -> anyhow::Result<Vec<(u64, Vec<Vec<NodeId>>)>> {
-        self.durable.load_metadata().await
-    }
-    async fn record_acceptor(&self, epoch: u64, state: &AcceptorRecord) -> anyhow::Result<()> {
-        if self.acceptor_failing.load(Ordering::SeqCst)
-            || (state.accepted.is_some() && self.accept_failing.load(Ordering::SeqCst))
-        {
-            anyhow::bail!("simulated acceptor-state write failure");
-        }
-        self.durable.record_acceptor(epoch, state).await
-    }
-    async fn load_acceptors(&self) -> anyhow::Result<Vec<(u64, AcceptorRecord)>> {
-        self.durable.load_acceptors().await
-    }
-    async fn save_clock_bound(&self, micros: u64) -> anyhow::Result<()> {
-        if self.clock_bound_failing.load(Ordering::SeqCst) {
-            anyhow::bail!("simulated clock-bound write failure");
-        }
-        self.durable.save_clock_bound(micros).await
-    }
-    async fn load_clock_bound(&self) -> anyhow::Result<Option<u64>> {
-        self.durable.load_clock_bound().await
-    }
-    async fn save_decision(&self, record: &DecisionRecord) -> anyhow::Result<()> {
-        self.durable.save_decision(record).await
-    }
-    async fn load_decisions(&self) -> anyhow::Result<Vec<DecisionRecord>> {
-        self.durable.load_decisions().await
-    }
-    async fn drop_decisions(&self, txns: &[TxnId]) -> anyhow::Result<()> {
-        self.durable.drop_decisions(txns).await
-    }
-}
 
 fn event(aggregate_id: &str, version: u16, name: &str) -> Event {
     Event {

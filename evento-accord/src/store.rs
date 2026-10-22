@@ -96,9 +96,32 @@ impl DataStore for InMemoryDataStore {
         // append, advancing each aggregate's version; on abort we record the
         // no-op so the global order is still observable.
         if commit {
+            // As a store keyed by version would: an event already in place
+            // (a restart replaying its journal over a store that kept it) is
+            // a no-op, a version never goes back down, and another event at
+            // a taken version is refused — before anything is applied.
+            for event in &events {
+                let at = (
+                    event.aggregate_type.clone(),
+                    event.aggregate_id.clone(),
+                    event.version,
+                );
+                if let Some(existing) = state.committed.get(&at) {
+                    anyhow::ensure!(
+                        existing.id == event.id,
+                        "version {} of {}/{} already holds event {}, not {}",
+                        event.version,
+                        event.aggregate_type,
+                        event.aggregate_id,
+                        existing.id,
+                        event.id
+                    );
+                }
+            }
             for event in &events {
                 let key = (event.aggregate_type.clone(), event.aggregate_id.clone());
-                state.versions.insert(key.clone(), event.version);
+                let version = state.versions.entry(key.clone()).or_default();
+                *version = (*version).max(event.version);
                 state
                     .committed
                     .insert((key.0, key.1, event.version), event.clone());
