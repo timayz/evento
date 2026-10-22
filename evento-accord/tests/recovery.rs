@@ -1301,3 +1301,101 @@ async fn a_replica_reads_its_own_forgotten_write_as_holding() {
         }
     }
 }
+
+/// The vote fence survives a restart — even one whose wall clock stepped
+/// back. A node vouches for a sync coverage cut at its clock less the
+/// compaction margin; a peer may compact past a transaction below it the node
+/// does not hold, trusting the node never to vote for it (#310). So before
+/// that coverage leaves the node, the node persists a clock bound past the
+/// reading it was cut at: restarted, its clock starts there, and its fence
+/// still refuses the transaction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_vote_fence_outlives_a_restart_with_a_clock_stepped_back() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let net = InMemoryNetwork::new();
+    let journal = Arc::new(InMemoryJournal::new());
+    let physical = Arc::new(AtomicU64::new(10_000_000));
+    let mut peer = net.register(NodeId(1));
+    let node = |net: &Arc<InMemoryNetwork>| {
+        let physical = Arc::clone(&physical);
+        let ids = vec![NodeId(0), NodeId(1), NodeId(2)];
+        Node::new(
+            NodeId(0),
+            Arc::new(StaticTopology::new(NodeId(0), ids)),
+            Arc::new(HybridLogicalClock::with_physical(NodeId(0), move || {
+                physical.load(Ordering::SeqCst)
+            })),
+            Arc::new(net.sink(NodeId(0))) as Arc<dyn MessageSink>,
+            Arc::new(InMemoryDataStore::new()) as Arc<dyn DataStore>,
+            Arc::clone(&journal) as Arc<dyn Journal>,
+        )
+    };
+
+    // The node answers an anti-entropy round: it vouches for a coverage cut
+    // at its clock (10 s) less the compaction margin (1 s).
+    let first = node(&net);
+    let task = first.start(net.register(NodeId(0)));
+    net.sink(NodeId(1))
+        .send(
+            NodeId(0),
+            Message::SyncRequest {
+                id: 1,
+                snapshot: false,
+                known: None,
+            },
+        )
+        .await
+        .unwrap();
+    let coverage = loop {
+        if let Message::SyncData { coverage, .. } = next(&mut peer).await {
+            break coverage;
+        }
+    };
+    assert!(coverage.micros >= 8_000_000, "coverage {coverage:?}");
+    task.abort();
+
+    // It restarts over its journal with its wall clock 5 s back.
+    physical.store(5_000_000, Ordering::SeqCst);
+    let restarted = node(&net);
+    restarted.recover_state().await.unwrap();
+    let _task = restarted.start(net.register(NodeId(0)));
+
+    // A transaction just below that coverage, which the node never held: a
+    // recovery asks it for its vote. It must refuse, as before the restart.
+    let txn = TxnId(Timestamp {
+        micros: coverage.micros - 1,
+        logical: 0,
+        node: NodeId(2),
+    });
+    net.sink(NodeId(1))
+        .send(
+            NodeId(0),
+            Message::BeginRecovery {
+                txn,
+                ballot: Ballot(Timestamp {
+                    micros: coverage.micros + 1,
+                    logical: 0,
+                    node: NodeId(1),
+                }),
+                keys: vec![Key("acc".into())],
+                events: vec![event("acc", 1)],
+            },
+        )
+        .await
+        .unwrap();
+    loop {
+        match next(&mut peer).await {
+            Message::NotWitnessed {
+                txn: t, redundant, ..
+            } if t == txn => {
+                assert!(!redundant, "fenced, not compacted");
+                break;
+            }
+            Message::BeginRecoveryOk { txn: t, .. } if t == txn => {
+                panic!("the restarted node voted below what it vouched for")
+            }
+            _ => {}
+        }
+    }
+}

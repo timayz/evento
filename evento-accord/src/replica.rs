@@ -72,6 +72,12 @@ pub struct Replica {
     /// dependency below it counts as already satisfied (its effect is in the data
     /// store). Advances monotonically via [`compact`](Replica::compact).
     redundant_before: Timestamp,
+    /// The vote fence: a transaction this replica does not hold, with `t0`
+    /// below it, gets no vote here — no PreAccept, no Accept, no recovery's
+    /// pre-accept (see [`fenced`](Replica::fenced)). The node keeps it at its
+    /// clock less the compaction margin, at or above every redundancy point it
+    /// has reported. Monotonic.
+    vote_fence: Timestamp,
     /// Transactions handed out by [`next_apply`](Replica::next_apply) whose apply
     /// is in flight (the node performs it outside the lock). Excluded from
     /// further `next_apply` picks so two concurrent drivers cannot double-apply
@@ -143,6 +149,7 @@ impl Default for Replica {
             blocked: HashMap::new(),
             waiters: HashMap::new(),
             redundant_before: Timestamp::MIN,
+            vote_fence: Timestamp::MIN,
             applying: HashSet::new(),
             unapplied_bounds: HashMap::new(),
             unapplied_by_bound: BTreeSet::new(),
@@ -237,6 +244,9 @@ pub enum Refusal {
     /// The transaction is below the redundancy watermark and not held (see
     /// [`Replica::compacted`]): nothing is recorded, and nothing answered.
     Compacted,
+    /// The transaction is below the vote fence and not held (see
+    /// [`Replica::fenced`]): nothing is recorded, and nothing answered.
+    Fenced,
 }
 
 /// What a replica answers a routed recovery (`Message::Routed` around a
@@ -531,6 +541,9 @@ impl Replica {
         if let Some(promised) = self.promise_of(txn).filter(|p| *p > Ballot(txn.0)) {
             return Err(Refusal::Promised(promised));
         }
+        if self.fenced(txn) {
+            return Err(Refusal::Fenced);
+        }
         Ok(self.witness(txn, Ballot(txn.0), keys, events))
     }
 
@@ -540,6 +553,25 @@ impl Replica {
     /// must not be re-created — an applied one would execute a second time.
     pub fn compacted(&self, txn: TxnId) -> bool {
         txn.0 < self.redundant_before && !self.commands.contains_key(&txn)
+    }
+
+    /// Raises the [vote fence](Replica::fenced) to `fence` (never lowers it).
+    pub fn set_vote_fence(&mut self, fence: Timestamp) {
+        self.vote_fence = self.vote_fence.max(fence);
+    }
+
+    /// Whether `txn`, not held here, is below the vote fence: this replica
+    /// never votes for it — it records no PreAccept or Accept of it, and
+    /// answers a recovery that it never witnessed it, promising the ballot.
+    ///
+    /// Every redundancy point this replica reports lies below the fence: a
+    /// peer may compact up to such a point, past a transaction this replica
+    /// does not hold, trusting that it never will (#310). The fence is what
+    /// keeps that true when a replica a peer gave up recovers the transaction
+    /// through this one. It also turns the rule that no coordinator's message
+    /// outlives the compaction margin into one a replica enforces.
+    pub fn fenced(&self, txn: TxnId) -> bool {
+        txn.0 < self.vote_fence && !self.commands.contains_key(&txn)
     }
 
     /// The ballot this replica has promised for `txn`, known or not.
@@ -665,6 +697,9 @@ impl Replica {
                 if ballot < promised {
                     return Err(Refusal::Promised(promised));
                 }
+            }
+            if self.fenced(txn) {
+                return Err(Refusal::Fenced);
             }
             self.unknown_promises.remove(&txn);
             // The replica missed PreAccept; record what it was told — including
@@ -850,6 +885,19 @@ impl Replica {
     ) -> Result<RoutedRecovery, Ballot> {
         if self.compacted(txn) {
             return Ok(self.recorded(txn));
+        }
+        // Below the vote fence, a transaction never witnessed here is not
+        // pre-accepted now: the replica promises the ballot and says so, as a
+        // routed recovery's blind replica does — it never voted, and never
+        // will.
+        if self.fenced(txn) && !keys.is_empty() {
+            if let Some(&promised) = self.unknown_promises.get(&txn) {
+                if ballot < promised {
+                    return Err(promised);
+                }
+            }
+            self.unknown_promises.insert(txn, ballot);
+            return Ok(RoutedRecovery::NotWitnessed { redundant: false });
         }
         self.recover(txn, ballot, keys, events)
             .map(RoutedRecovery::Known)

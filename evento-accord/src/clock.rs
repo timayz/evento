@@ -155,6 +155,15 @@ impl HybridLogicalClock {
         self.physical_now()
     }
 
+    /// The clock's reading, without advancing it: the later of the last
+    /// timestamp it issued or witnessed and the physical time. Every
+    /// [`now`](Clock::now) issued so far is at or below it.
+    pub fn reading_micros(&self) -> u64 {
+        let phys = self.physical_now();
+        let guard = self.state.lock().expect("clock poisoned");
+        guard.0.max(phys)
+    }
+
     /// Advances the clock to at least `floor`, so every later
     /// [`now`](Clock::now) is strictly past it. Unlike
     /// [`witness`](Clock::witness), it is not capped at the skew bound: it is

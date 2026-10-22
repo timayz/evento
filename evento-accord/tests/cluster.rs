@@ -440,7 +440,16 @@ async fn a_write_dropped_mid_flight_leaves_nothing_pinned() {
         "the abandoned transaction must be finished and compacted everywhere"
     );
     assert!(!cluster.nodes[0].sweep_pressure().busy);
-    cluster.assert_identical_order(1).await;
+    // Node 0 alone pre-accepted it, and its recovery reaches the peers only
+    // after the compaction margin (shorter here than the recovery timeout):
+    // never having witnessed it, they refuse it below their vote fences, and
+    // the recovery invalidates it (#310). No replica holds the write.
+    for (i, store) in cluster.stores.iter().enumerate() {
+        assert!(
+            store.committed_events().is_empty(),
+            "replica {i} applied a write no quorum ever saw"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

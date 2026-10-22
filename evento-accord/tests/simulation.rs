@@ -50,7 +50,7 @@ use common::store::{FaultStore, Outcomes};
 use evento_accord::{
     DataStore, DynamicTopology, ExecutorDataStore, HybridLogicalClock, InMemoryDataStore,
     InMemoryNetwork, Journal, Key, Message, MessageFaults, MessageSink, Node, NodeConfig, NodeId,
-    StaticTopology, Topology, TraceEntry,
+    StaticTopology, Status, Timestamp, Topology, TraceEntry, TxnId,
 };
 use evento_core::metadata::Metadata;
 use evento_core::Event;
@@ -1188,6 +1188,31 @@ impl Sim {
         self.clear_storage_faults();
     }
 
+    /// Rejoins every node told to rejoin, as its host would: through the
+    /// peer that told it to ([`Node::rejoin_contact`]), else through any not
+    /// told to.
+    async fn rejoin_told(&mut self, since: tokio::time::Instant) -> Result<(), String> {
+        if !self.dynamic.is_empty() {
+            return Ok(());
+        }
+        for i in 0..self.ids.len() {
+            if !self.nodes[i].rejoin_required() {
+                continue;
+            }
+            let told_by = self.nodes[i]
+                .rejoin_contact()
+                .and_then(|peer| self.ids.iter().position(|&id| id == peer))
+                .filter(|&j| !self.nodes[j].rejoin_required());
+            let Some(contact) =
+                told_by.or_else(|| (0..self.ids.len()).find(|&j| !self.nodes[j].rejoin_required()))
+            else {
+                return Err(self.stalled(i, "rejoin", "every node was told to rejoin", since));
+            };
+            self.rejoin(i, self.ids[contact], self.config).await;
+        }
+        Ok(())
+    }
+
     /// A liveness failure: which node stalled at which step, and every node's
     /// state.
     fn stalled(&self, node: usize, step: &str, what: &str, since: tokio::time::Instant) -> String {
@@ -1243,18 +1268,7 @@ async fn assert_live(sim: &mut Sim, acked: &BTreeMap<String, u16>) -> Result<(),
             * 3;
     let start = tokio::time::Instant::now();
 
-    // A node told to rejoin is rejoined by its host, through one that was not.
-    if sim.dynamic.is_empty() {
-        for i in 0..sim.ids.len() {
-            if sim.nodes[i].rejoin_required() {
-                let Some(contact) = (0..sim.ids.len()).find(|&j| !sim.nodes[j].rejoin_required())
-                else {
-                    return Err(sim.stalled(i, "rejoin", "every node was told to rejoin", start));
-                };
-                sim.rejoin(i, sim.ids[contact], config).await;
-            }
-        }
-    }
+    sim.rejoin_told(start).await?;
 
     // 1. Each node coordinates a write that commits. An attempt that fails
     //    (a quorum not reached while the healed cluster settles) is retried,
@@ -1284,6 +1298,10 @@ async fn assert_live(sim: &mut Sim, acked: &BTreeMap<String, u16>) -> Result<(),
             if tokio::time::Instant::now() >= deadline {
                 return Err(sim.stalled(i, "write", &what, start));
             }
+            // A refusal can come at once (told to rejoin meanwhile): let the
+            // cluster move before the next attempt.
+            tokio::time::sleep(config.recovery_interval).await;
+            sim.rejoin_told(start).await?;
             attempt += 1;
         }
     }
@@ -1304,6 +1322,8 @@ async fn assert_live(sim: &mut Sim, acked: &BTreeMap<String, u16>) -> Result<(),
                 if tokio::time::Instant::now() >= deadline {
                     return Err(sim.stalled(i, "read barrier", &failed, start));
                 }
+                tokio::time::sleep(config.recovery_interval).await;
+                sim.rejoin_told(start).await?;
             }
             let stored = version_of(&sim.stores[i], agg).await;
             if stored < *version {
@@ -1330,6 +1350,9 @@ async fn assert_live(sim: &mut Sim, acked: &BTreeMap<String, u16>) -> Result<(),
             return Err(sim.stalled(laggard, "compaction", &what, start));
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
+        // A node can be told to rejoin while the others compact: a peer
+        // given up meanwhile must be rejoined before it counts again.
+        sim.rejoin_told(start).await?;
     }
 }
 
@@ -1838,6 +1861,10 @@ async fn every_scenario_kind_replays_its_trace() {
         .await;
         assert_replays("membership churn", seed, |s| async move {
             run_churn(s).await.trace
+        })
+        .await;
+        assert_replays("absence +faults", seed, |s| async move {
+            run_absence(s, Faults::ALL).await.trace
         })
         .await;
     }
@@ -2654,6 +2681,12 @@ async fn sweep_for_bugs() {
                     .await
                     .assert_ok(&format!("restarts {label} {store:?} seed {seed}"));
             }
+        }
+        // Absences: silent peers given up, compacted past, and back (#310).
+        for (label, faults) in [("", Faults::default()), (" +faults", Faults::ALL)] {
+            run_absence(seed, faults)
+                .await
+                .assert_ok(&format!("absence{label} seed {seed}"));
         }
         // Compaction boundedness + clock skew.
         if let Err(v) = run_bounded(seed).await {
@@ -3543,4 +3576,380 @@ async fn a_joiner_falls_back_to_the_inline_header_of_a_contact_predating_pages()
         .expect("a write coordinated by the rejoined node");
     assert!(converge(&sim.stores).await);
     await_compacted(&sim, &all, "after the rejoin").await;
+}
+
+// ---------------------------------------------------------------------------
+// Absences under load (#310): peers give up silent ones and compact past them.
+// ---------------------------------------------------------------------------
+
+/// How long a peer must be silent before it is given up, in
+/// [`run_absence`].
+const ABSENCE_LIMIT: Duration = Duration::from_secs(2);
+
+/// The outside coordinator of [`run_absence`]'s orphan votes.
+const ORPHAN_COORDINATOR: NodeId = NodeId(9);
+
+/// Event ids of [`run_absence`]'s orphan writes, clear of every workload's.
+const ORPHAN_SEQ: u64 = 2_000_000;
+
+/// Pre-accepts `event` at node `to` alone, as [`ORPHAN_COORDINATOR`], which
+/// then vanishes — as a coordinator that crashed before its own vote was
+/// durable would — and returns the transaction. The caller registers the
+/// coordinator's inbox first.
+async fn orphan_vote(
+    net: &Arc<InMemoryNetwork>,
+    base: tokio::time::Instant,
+    to: usize,
+    event: Event,
+    logical: u32,
+) -> TxnId {
+    let txn = TxnId(Timestamp {
+        micros: (tokio::time::Instant::now() - base).as_micros() as u64,
+        logical,
+        node: ORPHAN_COORDINATOR,
+    });
+    let _ = net
+        .sink(ORPHAN_COORDINATOR)
+        .send(
+            NodeId(to as u64),
+            Message::PreAccept {
+                txn,
+                keys: vec![Key(event.aggregate_id.clone())],
+                events: vec![event],
+            },
+        )
+        .await;
+    txn
+}
+
+/// The minority nodes go silent past [`ABSENCE_LIMIT`] while the majority
+/// keeps writing — crashed, or cut one way so they still hear the others —
+/// and come back. Their peers give them up and compact past them, so a
+/// returning node lone-holding a transaction may recover it: the vote fence
+/// must keep it from committing what a peer compacted past (#310). A node
+/// left behind the others' compaction is told to rejoin, which
+/// [`assert_live`] does as its host would.
+///
+/// The lone holders come from orphan votes: an outside coordinator
+/// pre-accepts a write at one node and vanishes, as one that crashed before
+/// its own vote was durable would. A minority node may get one shortly
+/// before its absence, so its recovery of it fails until it is back. The
+/// orphan writes the next version of a workload aggregate: committed by some
+/// replicas and not others, it splits a later write's decision, which the
+/// safety oracle reports.
+async fn run_absence(seed: u64, faults: Faults) -> Adversarial {
+    const N: u64 = 5;
+    const AGGS: usize = 4;
+    const WRITERS: usize = 4;
+    const WRITES_EACH: usize = 12;
+
+    let config = NodeConfig {
+        peer_absence_limit: Some(ABSENCE_LIMIT),
+        // Above the recovery timeout plus twice the skew bound, as
+        // OPERATIONS.md asks of a margin.
+        compaction_margin: Duration::from_millis(700),
+        // Well below the absence limit, as OPERATIONS.md asks: a recovery
+        // blocks the sweep that sends a node's heartbeats for up to this
+        // long, and a live node silent past the limit is given up.
+        collect_timeout: Duration::from_millis(500),
+        ..NodeConfig::default()
+    };
+    let mut sim = Sim::build_with_config(N, config);
+    faults.arm(&mut sim, seed);
+    let history: History = Arc::new(Mutex::new(Vec::new()));
+
+    let mut rng = StdRng::seed_from_u64(seed);
+    // Writes through the majority, spaced so the run outlasts the absences.
+    let writer_plans: Vec<Vec<(usize, usize, u64)>> = (0..WRITERS)
+        .map(|_| {
+            (0..WRITES_EACH)
+                .map(|_| {
+                    (
+                        rng.random_range(0..AGGS),
+                        MAJORITY[rng.random_range(0..MAJORITY.len())],
+                        rng.random_range(50..400),
+                    )
+                })
+                .collect()
+        })
+        .collect();
+    // One absence per minority node: when it starts, how long it lasts (past
+    // the limit), and whether it crashes or only stops being heard.
+    let absences: Vec<(usize, u64, u64, bool)> = MINORITY
+        .iter()
+        .map(|&node| {
+            (
+                node,
+                rng.random_range(0..1_500),
+                rng.random_range(2_500..4_500),
+                rng.random_bool(0.5),
+            )
+        })
+        .collect();
+    // Orphan votes: which node, when — inside the recovery timeout before
+    // the node's absence — and on which aggregate.
+    let mut orphans: Vec<(usize, u64, usize)> = Vec::new();
+    for &(node, start, _, _) in &absences {
+        if rng.random_bool(0.5) {
+            let lead = rng.random_range(0..config.recovery_timeout.as_millis() as u64);
+            orphans.push((node, start.saturating_sub(lead), rng.random_range(0..AGGS)));
+        }
+    }
+
+    let _orphan_inbox = sim.net.register(ORPHAN_COORDINATOR);
+    let mut orphaned = Vec::new();
+    for (k, (node, at, agg_idx)) in orphans.into_iter().enumerate() {
+        let net = Arc::clone(&sim.net);
+        let store0 = sim.stores[0].clone();
+        let base = sim.base;
+        orphaned.push(tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(at)).await;
+            let agg = format!("a{agg_idx}");
+            let version = store0.version(AGG_TYPE, &agg).await.unwrap_or(0) + 1;
+            let orphan = event(&agg, version, ORPHAN_SEQ + k as u64);
+            orphan_vote(&net, base, node, orphan, k as u32).await;
+        }));
+    }
+
+    let mut absent = Vec::new();
+    for (node, start, length, crash) in absences {
+        let net = Arc::clone(&sim.net);
+        let ids = sim.ids.clone();
+        absent.push(tokio::spawn(async move {
+            let me = NodeId(node as u64);
+            tokio::time::sleep(Duration::from_millis(start)).await;
+            if crash {
+                net.crash(me);
+            } else {
+                for &peer in ids.iter().filter(|&&id| id != me) {
+                    net.cut(me, peer);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(length)).await;
+            if crash {
+                net.heal(me);
+            } else {
+                for &peer in ids.iter().filter(|&&id| id != me) {
+                    net.restore(me, peer);
+                }
+            }
+        }));
+    }
+
+    let nodes = sim.nodes.clone();
+    let store0 = sim.stores[0].clone();
+    let ids = Arc::new(AtomicU64::new(1));
+    let mut writers = Vec::new();
+    for plan in writer_plans {
+        let nodes = nodes.clone();
+        let store0 = store0.clone();
+        let history = Arc::clone(&history);
+        let ids = Arc::clone(&ids);
+        writers.push(tokio::spawn(async move {
+            for (agg_idx, coord, pause) in plan {
+                tokio::time::sleep(Duration::from_millis(pause)).await;
+                let agg = format!("a{agg_idx}");
+                let version = store0.version(AGG_TYPE, &agg).await.unwrap_or(0) + 1;
+                let seq = ids.fetch_add(1, Ordering::Relaxed);
+                if let Ok(Ok(outcome)) = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    nodes[coord].write(vec![event(&agg, version, seq)]),
+                )
+                .await
+                {
+                    history.lock().unwrap().push(WriteRecord {
+                        agg,
+                        version,
+                        committed: !outcome.conflict,
+                    });
+                }
+            }
+        }));
+    }
+    for w in writers {
+        let _ = w.await;
+    }
+    for a in absent.into_iter().chain(orphaned) {
+        let _ = a.await;
+    }
+
+    sim.net.heal_all_partitions();
+    sim.net.clear_message_faults();
+    let records = history.lock().unwrap().clone();
+    let safety = safety_violation(&sim, &records);
+    // The returning nodes may need a rejoin before they converge: the
+    // liveness check does it, then requires the stores to agree.
+    let liveness = assert_live(&mut sim, &acked_versions(&records)).await.err();
+    let converged = liveness.is_none();
+    Adversarial {
+        safety: safety.or_else(|| safety_violation(&sim, &records)),
+        converged,
+        liveness,
+        trace: sim.trace(),
+    }
+}
+
+/// Safety and liveness hold while silent peers are given up, compacted past,
+/// and come back (#310).
+#[tokio::test(start_paused = true)]
+async fn safety_and_liveness_hold_under_absences() {
+    for seed in 0..10 {
+        run_absence(seed, Faults::default())
+            .await
+            .assert_ok(&format!("absence seed {seed}"));
+    }
+}
+
+/// [`safety_and_liveness_hold_under_absences`] over lossy links.
+#[tokio::test(start_paused = true)]
+async fn safety_and_liveness_hold_under_absences_and_message_faults() {
+    for seed in 0..10 {
+        run_absence(seed, Faults::ALL)
+            .await
+            .assert_ok(&format!("absence +faults seed {seed}"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The vote fence (#310): a replica never votes for a transaction it does not
+// hold below its clock less the compaction margin, so a peer that compacted
+// past it, trusting its reports, is never contradicted.
+// ---------------------------------------------------------------------------
+
+/// The issue's flow. Only R (node 2) pre-accepts T, its coordinator gone. P
+/// (node 0) compacts past T, as it may once it gave R up; Q (node 1)'s floor
+/// lags. R recovers T through Q: without the fence Q pre-accepts it, R and Q
+/// commit it, and P — which ignores a Commit below its floor — never applies
+/// it. With the fence Q refuses it ("never witnessed"), and P's "compacted"
+/// plus Q's refusal plus R's uncommitted report prove T never committed: the
+/// recovery invalidates it, on every replica alike.
+#[tokio::test(start_paused = true)]
+async fn a_lone_holder_cannot_commit_what_a_peer_compacted_past() {
+    let config = NodeConfig {
+        compaction_margin: Duration::from_millis(300),
+        // Only the explicit recovery below recovers T.
+        recovery_timeout: Duration::from_secs(3600),
+        ..NodeConfig::default()
+    };
+    let sim = Sim::build_with_config(3, config);
+    let _coordinator = sim.net.register(ORPHAN_COORDINATOR);
+    let txn = orphan_vote(&sim.net, sim.base, 2, event("acc", 1, 1), 0).await;
+    // Past the compaction margin, P compacts past T, which it never held.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(sim.nodes[2].command_status(txn), Some(Status::PreAccepted));
+    sim.nodes[0]
+        .compact(Timestamp {
+            micros: txn.0.micros + 1,
+            logical: 0,
+            node: NodeId(0),
+        })
+        .await;
+
+    let outcome = sim.nodes[2].recover(txn).await.expect("a decided recovery");
+    assert!(outcome.conflict, "T must not commit past P's compaction");
+    assert_eq!(
+        sim.nodes[1].command_status(txn),
+        None,
+        "Q never voted for T"
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    for (i, store) in sim.stores.iter().enumerate() {
+        assert!(store.committed_events().is_empty(), "replica {i} applied T");
+    }
+    assert!(sim.nodes[1].metrics().votes_fenced >= 1);
+}
+
+/// Waits until node `i` has given up exactly `peers`.
+async fn await_absent(sim: &Sim, i: usize, peers: &[NodeId]) {
+    for _ in 0..500 {
+        if sim.nodes[i].absent_peers() == peers {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!(
+        "node {i} gave up {:?}, not {peers:?}",
+        sim.nodes[i].absent_peers()
+    );
+}
+
+/// The partition flow. R (node 2) lone-holds T. P (node 0), cut off from R,
+/// gives it up and compacts past T; Q (node 1) still hears R, whose report
+/// keeps Q's floor below T. R recovers T through Q alone: without the fence Q
+/// pre-accepts it, R and Q commit it, and P — compacted past it — never
+/// applies it, so the stores diverge. With the fence Q refuses it, and R
+/// cannot decide it until it hears P: P's "compacted" with Q's refusal and
+/// R's uncommitted report prove it never committed.
+#[tokio::test(start_paused = true)]
+async fn a_lone_holder_cut_off_from_a_compacted_peer_cannot_commit() {
+    let config = NodeConfig {
+        compaction_margin: Duration::from_millis(300),
+        peer_absence_limit: Some(Duration::from_millis(500)),
+        // Only the explicit recoveries below recover T.
+        recovery_timeout: Duration::from_secs(3600),
+        collect_timeout: Duration::from_millis(200),
+        ..NodeConfig::default()
+    };
+    let sim = Sim::build_with_config(3, config);
+    let _coordinator = sim.net.register(ORPHAN_COORDINATOR);
+    let txn = orphan_vote(&sim.net, sim.base, 2, event("acc", 1, 1), 0).await;
+    sim.net.cut(NodeId(0), NodeId(2));
+    sim.net.cut(NodeId(2), NodeId(0));
+    await_absent(&sim, 0, &[NodeId(2)]).await;
+    // Past the margin, P's sweep compacts past T.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(sim.nodes[1].absent_peers().is_empty());
+
+    let through_q = sim.nodes[2].recover(txn).await;
+    assert!(through_q.is_err(), "T decided without P: {through_q:?}");
+    assert_eq!(sim.nodes[1].command_status(txn), None, "Q voted for T");
+
+    sim.net.restore(NodeId(0), NodeId(2));
+    sim.net.restore(NodeId(2), NodeId(0));
+    let outcome = sim.nodes[2].recover(txn).await.expect("a decided recovery");
+    assert!(outcome.conflict, "T must not commit past P's compaction");
+    // P answered "compacted", not "fenced": it had compacted past T.
+    assert_eq!(sim.nodes[0].metrics().votes_fenced, 0);
+    await_compacted(&sim, &[0, 1, 2], "after T's invalidation").await;
+    for (i, store) in sim.stores.iter().enumerate() {
+        assert!(store.committed_events().is_empty(), "replica {i} applied T");
+    }
+}
+
+/// A lone holder stranded below its peers' compaction. R (node 2) lone-holds
+/// T and goes silent; P and Q give it up and compact past T. They never held
+/// T, so they dropped nothing R lacks and do not tell it to rejoin. Back, R
+/// cannot decide T: both answer "compacted", which proves nothing — they
+/// might have applied it and dropped it — and neither votes for it. Held for
+/// ever, T would pin every replica's compaction. R rejoins through a peer
+/// that compacted past T instead: the rejoin forgets T, and the snapshot
+/// carries T's effect if it had one.
+#[tokio::test(start_paused = true)]
+async fn a_lone_holder_stranded_below_its_peers_compaction_rejoins() {
+    let config = NodeConfig {
+        compaction_margin: Duration::from_millis(300),
+        peer_absence_limit: Some(Duration::from_millis(500)),
+        collect_timeout: Duration::from_millis(200),
+        ..NodeConfig::default()
+    };
+    let mut sim = Sim::build_with_config(3, config);
+    let _coordinator = sim.net.register(ORPHAN_COORDINATOR);
+    let txn = orphan_vote(&sim.net, sim.base, 2, event("acc", 1, 1), 0).await;
+    sim.net.crash(NodeId(2));
+    await_absent(&sim, 0, &[NodeId(2)]).await;
+    await_absent(&sim, 1, &[NodeId(2)]).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    sim.net.heal(NodeId(2));
+
+    await_rejoin_required(&sim.nodes[2]).await;
+    let contact = sim.nodes[2]
+        .rejoin_contact()
+        .expect("the peer it rejoins through");
+    assert!([NodeId(0), NodeId(1)].contains(&contact), "{contact:?}");
+    sim.rejoin(2, contact, config).await;
+    assert_eq!(sim.nodes[2].command_status(txn), None);
+    await_compacted(&sim, &[0, 1, 2], "after the rejoin").await;
+    for (i, store) in sim.stores.iter().enumerate() {
+        assert!(store.committed_events().is_empty(), "replica {i} applied T");
+    }
 }
