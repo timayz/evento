@@ -764,9 +764,40 @@ backend (sql/fjall). Phases, in order:
   transaction was applied on every counted replica or can no longer commit (a
   counted slow quorum intersects any commit quorum, and a counted replica holding
   it un-applied would have held the watermark below it), and an un-applied command
-  there would otherwise clamp the floor for good (`tests/rejoin.rs`). A replica
-  whose journal is lost or rolled back is amnesiac, and comes back as a new member
-  under a new node id (OPERATIONS §7). Validated by the deterministic simulation: a **bound oracle**
+  there would otherwise clamp the floor for good (`tests/rejoin.rs`). **A replica
+  whose journal is lost is amnesiac** (#312): it forgot its votes, promises,
+  config-Paxos state, watermark reports and minted ids. Fencing only the old `t0`s
+  is not enough — voting on new writes, it would leave what it forgot out of their
+  dependencies (T' commits on {A, R}; R and B then commit a conflicting T without
+  it), and its last report, still counted by its peers, lets them compact what it no
+  longer holds. So it comes back **by joining, gated**: opened joining over an
+  empty journal (`recover_state_for_join`), it journals an `AmnesiaFence` at its
+  wall clock plus three skews — above every `t0` it can have voted on (no replica
+  votes past its clock's reading plus two skews), every ballot it promised and
+  every report it made — floors its clock one skew past the wall clock, above every
+  id it minted, and joins only through a same-shard, same-epoch contact whose own
+  report passed the fence and whose `JoinProof` vouches past it. That vouch rests on
+  the contact and `slow_q − 1` peers whose coverage passed the fence: every write
+  that committed below it is applied in the state the joiner copies, and none that
+  did not can commit any more (those `slow_q` replicas hold nothing un-applied
+  below it, and their #310 vote fences refuse it; the forgotten vote leaves fewer
+  than a quorum). Its stale reports lie below the fence too. Once joined it is an
+  ordinary replica that never votes below its fence for what it does not hold, and
+  it abstains from config Paxos for good — an epoch's promises have no bound in
+  time to fence. While it waits, it answers a recovery of a transaction below its
+  fence with `Message::Amnesiac` (holds nothing, may have voted, never will): a
+  write minted during the rejoin and held only by a minority would otherwise stay
+  undecided once the other replicas' vote fences passed it, pinning the very
+  report the join waits on; a recovery invalidates on it only when, counting every
+  replica not heard from as one that may have voted, too few may have accepted it,
+  too few of the electorate pre-accepted it, and too few can still vote — a holder
+  that accepted it may hold half a decision, and keeps it undecided. A plain open
+  over an empty journal and a non-empty store is refused (`LostJournal`), and a
+  fresh one leaves its clock bound as a birth mark. One case stays undecided for
+  good: a transaction accepted by the lost replica and by fewer than a slow quorum
+  of the others, while the rest passed their vote fence for it — the join never
+  finds a contact past it (OPERATIONS §7). See `tests/amnesia.rs` and the
+  simulator's `run_amnesia`. Validated by the deterministic simulation: a **bound oracle**
   (`consensus_state_stays_bounded`) proves `command_count` returns to zero after a
   workload while committed state is preserved, and safety/convergence/bit-
   reproducibility hold across all seeds with compaction live (churn, partitions,
@@ -1042,6 +1073,14 @@ backend (sql/fjall). Phases, in order:
         its in-flight votes, recovery promises, config-Paxos promises and clock
         bound; a rejoin now keeps the journal and rebuilds only the store
         (#287, see Phase B).
+        A replica that lost its journal had to come back under a new node id —
+        under a `GroupHost`, a new identity for the whole host. Rejoining under
+        its old id over an empty journal, it voted with what it remembered
+        (a new write could commit without the forgotten one among its
+        dependencies, and a recovery invalidate a decided write on its
+        "never witnessed"), and its stale report let peers compact what it no
+        longer held. Its join now waits for a contact vouching past an
+        amnesia fence (#312, see Phase B).
         **Open** (confirmed or plausible, not yet fixed):
         an epoch change can remap a route's keys onto replicas that never
         witnessed an in-flight txn, which then answer "never witnessed"; the
