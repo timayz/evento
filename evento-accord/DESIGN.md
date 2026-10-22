@@ -335,7 +335,55 @@ control plane, everything else is Accord.
   epoch is still on this one), so reconfiguration keeps working after the founders
   have left (`config_changes_outlive_the_founders` removes a founder majority and
   still reconfigures). *Remaining:* garbage-collecting a moved range from its old
-  owners, and multi-shard read routing for the executor.
+  owners, multi-shard read routing for the executor, and handing in-flight
+  transactions over across an epoch change (below).
+
+  **Range movement with transactions in flight (#288; designed, guards shipped).**
+  Nothing on the data path knows epochs yet. There is no epoch on `TxnId`, on
+  messages or on `CommandState`; ownership filters and recovery plans use the
+  installed layout; `DynamicTopology` keeps only the current layout, and the
+  metadata log lacks the starting one. A write in flight while its keys move is
+  therefore exposed three ways:
+  (i) a replica that no longer owns a key voted `t0` with no dependencies on an
+  empty command, so the write could report success with its events applied
+  nowhere;
+  (ii) new owners answer "never witnessed", and routed recovery can invalidate a
+  committed transaction (its blind check precedes the committed check);
+  (iii) new owners bootstrap before old owners finish the in-flight writes.
+  The design:
+  1. *Every transaction carries its coordination epoch*: a trailing
+     `Message::Epoched` wrapper like `Routed` (additive on the wire), and a journal
+     record kind like `Route`, so a restart keeps it. (accord-core: the epoch is
+     part of every `TxnId`.)
+  2. *Every decided layout is kept*, the starting one included (`layout_at(epoch)`),
+     and a coordination plans, collects and recovers against one layout snapshot.
+     (accord-core: a coordination's `Topologies` span the epochs from the
+     transaction's to its execution's.)
+  3. *Replicas filter ownership by the transaction's epoch*, so old owners keep
+     voting, applying and answering recovery for it after installing `E+1`.
+  4. *Fence*: after installing `E+1`, a replica refuses PreAccept for a new
+     epoch-`E` transaction on a range that moved.
+  5. *Drain*: new owners buffer like a joiner and bootstrap only once a slow quorum
+     of old owners has fenced and the contact's proven coverage passes the fence,
+     so the snapshot holds every epoch-`E` transaction that could commit.
+     (accord-core: a range is bootstrapped behind an exclusive sync point.)
+  6. *Recovery plans by the transaction's epoch*: "never witnessed" from a replica
+     outside that epoch's shard is no evidence.
+  7. *Old owners keep the range* until the bootstrap completes; garbage-collecting
+     it stays separate.
+
+  Shipped now, as guards:
+  - **G1**: a coordinator counts replies (votes, reads, apply acks, recovery
+    reports) for the shard it *planned* their sender in, never by the layout
+    installed when they land. A routed recovery whose layout changed between
+    gathering reports and driving the decision retries.
+  - **G2**: a replica that owns none of the keys a PreAccept, Accept or Commit
+    carries, under the layout it installed, and holds nothing of the transaction,
+    casts no vote, answers nothing and records nothing (it is no replica of that
+    shard any more). A transaction it already holds is finished as before.
+
+  Until the handoff ships, an operator rule (OPERATIONS §6) keeps transactions out
+  of flight across a layout change.
 - **M5 — Executor wiring.** ✅ `AccordExecutor` is a real `evento_core::Executor`:
   **writes** are coordinated through the Accord cluster (mapping the outcome to
   `Ok(())` / `WriteError::InvalidOriginalVersion`); **reads, subscriptions, and
@@ -871,7 +919,9 @@ backend (sql/fjall). Phases, in order:
         (#287, see Phase B).
         **Open** (confirmed or plausible, not yet fixed):
         an epoch change can remap a route's keys onto replicas that never
-        witnessed an in-flight txn, which then answer "never witnessed".
+        witnessed an in-flight txn, which then answer "never witnessed"; the
+        handoff is designed, two guards and an operator rule cover it until it
+        ships (#288, see M4).
   - [ ] **Real-cluster soak + chaos** over days (kills, partitions, clock skew,
         disk pressure, slow disks/links) on actual hardware — zero production
         mileage today.
