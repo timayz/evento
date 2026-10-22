@@ -314,7 +314,9 @@ control plane, everything else is Accord.
   data-store snapshot page by page through `SnapshotPageRequest` / `SnapshotPage`), imports each command into its conflict graph
   (`Replica::import_applied`) and applies its events, then **replays the buffered
   messages** — so a transaction that commits *during* the join still lands
-  (sync-point-style). A node drives an epoch change with `Node::change_topology`,
+  (sync-point-style). A node rejoining after it was given up on, or with a lost
+  store, keeps its journal and recovers it first (`Node::recover_state_for_join`,
+  see Phase B). A node drives an epoch change with `Node::change_topology`,
   which runs **single-decree Paxos** over the current members (`ConfigPrepare` /
   `ConfigPromise` / `ConfigAccept` / `ConfigAccepted` / `ConfigCommit`) so the
   layout decision is durable; `Node::recover_topology` lets any node complete a
@@ -576,7 +578,7 @@ backend (sql/fjall). Phases, in order:
   there (an idempotent re-apply). A page overlapping existing events would be
   skipped whole, so `join` refuses a non-empty store, and a join that fails once a
   page is installed is tagged `PartialSnapshot` and not retried on another contact:
-  the host wipes the store and joins again. `recover_state` restores the floor
+  the host wipes the store (not the journal) and joins again. `recover_state` restores the floor
   and trusts the durable data store for the prefix, replaying only the journal
   tail. A replica that lost its store (new disk, deleted
   file) is a joiner too: `GroupHost::open_joining` calls `begin_join` before the
@@ -584,7 +586,25 @@ backend (sql/fjall). Phases, in order:
   joining stays silent, so a half-bootstrapped replica never hands out a partial
   snapshot); `join` fails if the snapshot cannot be installed, and persists the
   adopted floor so a restart keeps dependencies on compacted transactions
-  satisfied. Validated by the deterministic simulation: a **bound oracle**
+  satisfied. **A rejoin keeps the journal** (#287): a replica told to rejoin, or
+  that lost its store, rebuilds only the store. Its journal holds its votes and
+  ballots, blind recovery promises, config-Paxos acceptor state and clock bound;
+  forgetting them would let it vote against a recovery's fence, accept a config
+  ballot below one it promised, or mint an id it minted before. `open_joining`
+  therefore recovers the journal with `Node::recover_state_for_join`: everything
+  `recover_state` restores, but nothing replayed into the empty store, and each
+  transaction the journal holds applied as a commit restored decided but
+  un-applied. The contact ships the ones it applied too (imported applied again),
+  those below its floor are dropped, and the rest are applied again once the join
+  completes, since no snapshot page holds their events. Adopting the contact's
+  floor `W`, the joiner first drops everything it holds below `W`, whatever its
+  status (`Replica::forget_below`): the shard's watermark passed `W`, so each such
+  transaction was applied on every counted replica or can no longer commit (a
+  counted slow quorum intersects any commit quorum, and a counted replica holding
+  it un-applied would have held the watermark below it), and an un-applied command
+  there would otherwise clamp the floor for good (`tests/rejoin.rs`). A replica
+  whose journal is lost or rolled back is amnesiac, and comes back as a new member
+  under a new node id (OPERATIONS §7). Validated by the deterministic simulation: a **bound oracle**
   (`consensus_state_stays_bounded`) proves `command_count` returns to zero after a
   workload while committed state is preserved, and safety/convergence/bit-
   reproducibility hold across all seeds with compaction live (churn, partitions,
@@ -845,8 +865,11 @@ backend (sql/fjall). Phases, in order:
         stayed undecided on its other shards, pinning their watermark and
         backlog; compaction now keeps its decision until every route shard
         applied it (#286, see M2).
+        A rejoin discarded the journal with the store, so the replica forgot
+        its in-flight votes, recovery promises, config-Paxos promises and clock
+        bound; a rejoin now keeps the journal and rebuilds only the store
+        (#287, see Phase B).
         **Open** (confirmed or plausible, not yet fixed):
-        a rejoin (wiped store) forgets the replica's in-flight votes and promises;
         an epoch change can remap a route's keys onto replicas that never
         witnessed an in-flight txn, which then answer "never witnessed".
   - [ ] **Real-cluster soak + chaos** over days (kills, partitions, clock skew,

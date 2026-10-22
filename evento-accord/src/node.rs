@@ -269,7 +269,8 @@ impl std::error::Error for NodeClosed {}
 /// [`Node::join`] failed after at least one snapshot page was installed, so
 /// the store holds a prefix no other contact can complete: a page that
 /// overlaps existing events is skipped whole as an idempotent re-apply, which
-/// would leave a gap. Empty the store (and journal) before joining again.
+/// would leave a gap. Empty the store before joining again — keep the
+/// journal: the join wrote nothing there that a retry cannot redo.
 /// Attached as context on the error; downcast to tell it apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PartialSnapshot {
@@ -741,8 +742,9 @@ pub struct Node {
     /// wherever both are held.
     absent: Arc<Mutex<HashMap<NodeId, AbsentPeer>>>,
     /// True once a peer told this node to rejoin: it then drops every message
-    /// and refuses writes until its host replaces its store and opens the
-    /// group by joining (`GroupHost::open_joining`).
+    /// and refuses writes until its host discards its event store (keeping
+    /// the journal) and opens the group by joining
+    /// (`GroupHost::open_joining`).
     rejoin_required: Arc<tokio::sync::watch::Sender<bool>>,
     /// Bumped whenever local applied state advances (an apply or an
     /// anti-entropy import). Waiters (`read_barrier`, read-your-writes) select
@@ -898,7 +900,8 @@ impl Node {
     /// Whether a peer told this node to rejoin the group from a snapshot: it
     /// was absent while transactions it never applied were compacted, so it
     /// can no longer catch up. The node drops every message and refuses writes
-    /// from then on; the host closes it, discards its store and journal, and
+    /// from then on; the host closes it, discards its event store — keeping
+    /// its journal, whose votes and promises the node must not forget — and
     /// opens the group by joining (`GroupHost::open_joining`).
     pub fn rejoin_required(&self) -> bool {
         *self.rejoin_required.borrow()
@@ -1071,6 +1074,59 @@ impl Node {
     /// startup before [`start`](Node::start). In-flight (unapplied) transactions
     /// resume via the recovery sweep.
     pub async fn recover_state(&self) -> anyhow::Result<()> {
+        let commands = self.restore_journal(false).await?;
+        // Replay the retained (post-truncation) applied tail into the data store.
+        // The truncated prefix is not in the journal; a durable data store already
+        // holds it, and re-applying the tail is idempotent. A replay the store
+        // fails fails the restart: the journal says these are applied, so a node
+        // starting without them would never apply them again. The events are
+        // stamped from `execute_at` as at the first apply, so a replay over a
+        // store that already holds them is an exact duplicate.
+        for cmd in &commands {
+            if cmd.status == Status::Applied && cmd.applied_conflict == Some(false) {
+                let mut events = cmd.events.clone();
+                stamp_events(cmd.execute_at, &mut events);
+                self.datastore
+                    .apply(cmd.txn, cmd.execute_at, events, true)
+                    .await
+                    .map_err(|err| {
+                        err.context(format!(
+                            "replaying applied transaction {:?} into the data store",
+                            cmd.txn
+                        ))
+                    })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Rebuilds this node's state from its journal for a **rejoin**: its
+    /// host discarded the event store but kept the journal, and
+    /// [`join`](Self::join) rebuilds the store from a contact's snapshot.
+    /// Restores everything [`recover_state`](Self::recover_state) does —
+    /// each command's votes and ballots, the blind promises, routes and
+    /// decision records, the config-Paxos acceptor state, the metadata log,
+    /// the rejoin bounds and the clock bound — so the node never votes
+    /// against what it voted or promised before, and never mints an id it
+    /// minted before. But nothing is replayed into the store, which must
+    /// stay empty for the snapshot. A transaction the journal holds applied
+    /// as a commit is restored decided but un-applied, since its events are
+    /// in the snapshot only if the contact applied it too: the contact then
+    /// ships it applied (or it lies below the contact's floor, and is
+    /// dropped); otherwise it is applied again once the join completes. Call
+    /// once, before [`begin_join`](Self::begin_join) and
+    /// [`start`](Self::start).
+    pub async fn recover_state_for_join(&self) -> anyhow::Result<()> {
+        self.restore_journal(true).await.map(|_| ())
+    }
+
+    /// Restores the replica and the control plane from the journal, for
+    /// [`recover_state`](Self::recover_state) and
+    /// [`recover_state_for_join`](Self::recover_state_for_join). Returns the
+    /// journaled commands in execution order. `joining`: the data store was
+    /// discarded, so a transaction applied as a commit is restored decided
+    /// but un-applied.
+    async fn restore_journal(&self, joining: bool) -> anyhow::Result<Vec<CommandState>> {
         let watermark = self.journal.load_watermark().await?;
         self.journal_mark
             .lock()
@@ -1105,7 +1161,16 @@ impl Node {
         {
             let mut replica = self.replica.lock().expect("replica poisoned");
             for cmd in &commands {
-                replica.restore(cmd.clone());
+                let mut cmd = cmd.clone();
+                if joining && cmd.status == Status::Applied && cmd.applied_conflict == Some(false) {
+                    // Its events went with the store: decided, to be applied
+                    // again unless the join brings them back. An abort, or an
+                    // invalidation, changed nothing and stays applied.
+                    cmd.status = Status::Committed;
+                    cmd.decision = Some(true);
+                    cmd.applied_conflict = None;
+                }
+                replica.restore(cmd);
             }
             // Restore the redundancy floor so a dependency on a transaction that
             // was compacted away before the restart (and is therefore absent from
@@ -1143,29 +1208,7 @@ impl Node {
                 );
             }
         }
-        // Replay the retained (post-truncation) applied tail into the data store.
-        // The truncated prefix is not in the journal; a durable data store already
-        // holds it, and re-applying the tail is idempotent. A replay the store
-        // fails fails the restart: the journal says these are applied, so a node
-        // starting without them would never apply them again. The events are
-        // stamped from `execute_at` as at the first apply, so a replay over a
-        // store that already holds them is an exact duplicate.
-        for cmd in &commands {
-            if cmd.status == Status::Applied && cmd.applied_conflict == Some(false) {
-                let mut events = cmd.events.clone();
-                stamp_events(cmd.execute_at, &mut events);
-                self.datastore
-                    .apply(cmd.txn, cmd.execute_at, events, true)
-                    .await
-                    .map_err(|err| {
-                        err.context(format!(
-                            "replaying applied transaction {:?} into the data store",
-                            cmd.txn
-                        ))
-                    })?;
-            }
-        }
-        Ok(())
+        Ok(commands)
     }
 
     /// Compacts consensus state below `before`: drops redundant commands from the
@@ -4454,6 +4497,12 @@ impl Node {
     /// messages buffered since [`begin_join`](Node::begin_join) — so a transaction
     /// committed during the join still lands. Returns how many were imported.
     ///
+    /// A node rejoining over its kept journal
+    /// ([`recover_state_for_join`](Self::recover_state_for_join)) keeps its
+    /// votes and promises at or above the contact's floor, drops what it holds
+    /// below it ([`Replica::forget_below`]), and applies again, once joined,
+    /// what it had applied that the snapshot lacks.
+    ///
     /// Coordinating the epoch change across the cluster (rather than each node
     /// installing an agreed layout) remains future work.
     pub async fn join(&self, contact: NodeId) -> anyhow::Result<usize> {
@@ -4529,6 +4578,10 @@ impl Node {
         for env in buffered {
             Box::pin(self.handle(env)).await;
         }
+        // A node rejoining over its kept journal applies again what it had
+        // applied but the snapshot lacks (see `recover_state_for_join`),
+        // without waiting for a message or a sweep to drive it.
+        self.redrive().await;
 
         Ok(imported.commands)
     }
@@ -5062,11 +5115,15 @@ impl Node {
         // A bootstrapping node adopts the contact's (cluster-agreed) redundancy
         // floor. Anti-entropy must not: its peer's watermark is not the cluster
         // min, so advancing here could be premature — that is the sweep's job.
+        // A node rejoining over its kept journal first drops what it holds
+        // below that floor (see `Replica::forget_below`): an un-applied
+        // command there would otherwise clamp the floor, and nothing would
+        // ever apply it.
         if want_snapshot {
-            self.replica
-                .lock()
-                .expect("replica poisoned")
-                .compact(watermark);
+            let mut replica = self.replica.lock().expect("replica poisoned");
+            replica.forget_below(watermark);
+            replica.compact(watermark);
+            drop(replica);
             // Every page is installed: this node now holds what the contact
             // vouched for, if it shares the contact's shard and epoch.
             let proof = proof_slot.take().and_then(PendingProof::take);

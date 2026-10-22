@@ -1469,6 +1469,52 @@ impl Replica {
         true
     }
 
+    /// Drops everything held below `before`, whatever its status — the
+    /// commands, their routes and read results — and every blind promise
+    /// below it, so a following [`compact`](Self::compact) adopts `before`
+    /// as the floor, unclamped. For a node rejoining over its kept journal
+    /// that adopts its contact's floor: the shard's watermark passed
+    /// `before`, so each transaction below it was applied on every replica
+    /// the watermark counted (its effect is in the snapshot), or can no
+    /// longer commit — a counted slow quorum intersects any commit quorum,
+    /// and a counted replica holding it un-applied would have held the
+    /// watermark below it. A vote or promise kept for it guards nothing.
+    /// Decision records are kept: they are decisions, not votes.
+    pub fn forget_below(&mut self, before: Timestamp) {
+        let drop: Vec<TxnId> = self
+            .commands
+            .keys()
+            .copied()
+            .filter(|txn| txn.0 < before)
+            .collect();
+        for txn in &drop {
+            let Some(cmd) = self.commands.remove(txn) else {
+                continue;
+            };
+            if awaiting_execution(cmd.status) {
+                self.leave_queue(cmd.execute_at, *txn);
+            }
+            for key in &cmd.keys {
+                if let Some(set) = self.by_key.get_mut(key) {
+                    set.remove(txn);
+                    if set.is_empty() {
+                        self.by_key.remove(key);
+                    }
+                }
+            }
+            self.read_results.remove(txn);
+            self.applying.remove(txn);
+            self.reindex_unapplied(*txn);
+        }
+        self.unknown_promises.retain(|txn, _| txn.0 >= before);
+        self.routes.retain(|txn, _| txn.0 >= before);
+        // What waited on a dropped transaction is re-checked: once the floor
+        // passes it, it counts as satisfied.
+        for txn in drop {
+            self.wake(txn);
+        }
+    }
+
     /// The current redundancy watermark (see the field docs).
     pub fn redundant_before(&self) -> Timestamp {
         self.redundant_before
