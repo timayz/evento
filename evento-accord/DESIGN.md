@@ -503,7 +503,14 @@ backend (sql/fjall). Phases, in order:
   or cut one way — while the majority writes and compacts past them, then come back
   (rejoined if told to); an outside coordinator pre-accepts a write at a node just
   before its absence and vanishes, so it may come back holding a transaction alone.
-  Across all
+  The workloads **read** too (#318): readers on any node — crashed, cut off,
+  restarted or rejoined — fence each read with a read barrier and read the node's
+  store, as `AccordExecutor` does with `linearizable_reads` on, and a read oracle
+  checks every read per key: none sees fewer events than one that ended before it
+  started, misses a write acknowledged before it started, or shows a write that
+  returned a conflict or was invoked after it ended, and each is a prefix of the
+  converged history. With the barrier switched off it reports stale reads, and the
+  violation replays from its seed. Across all
   seeds, **safety holds** — no split-brain, no double-commit — and after healing
   the cluster **converges**. The harness already paid off: it found two real gaps
   (non-convergence from stalled transactions and from missed transactions), both
