@@ -34,6 +34,14 @@
 //!   commit; an excess = a phantom).
 //! - **No split-brain on churned nodes:** a churned replica never stores a
 //!   version beyond the quorum's (it may only lag).
+//! - **Linearizable reads** (#318): readers on any node — a crashed, cut-off,
+//!   restarted or rejoined one too — fence each read with a read barrier,
+//!   then read the node's store, as `AccordExecutor` does with
+//!   `linearizable_reads` on. Per key, no read sees fewer events than one
+//!   that ended before it started, misses a write acknowledged before it
+//!   started, or shows a write that returned a conflict or was invoked after
+//!   it ended; and every read is a prefix of the converged history
+//!   ([`read_violation`]).
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -246,6 +254,18 @@ impl SimStore {
         }
     }
 
+    /// The ids of `agg`'s committed events here, in version order.
+    fn events_of(&self, agg: &str) -> Vec<u64> {
+        let mut events: Vec<(u16, u64)> = self
+            .committed_events()
+            .into_iter()
+            .filter(|((_, id, _), _)| id == agg)
+            .map(|((_, _, version), event)| (version, u128::from(event) as u64))
+            .collect();
+        events.sort_unstable();
+        events.into_iter().map(|(_, id)| id).collect()
+    }
+
     /// The aggregate's version as the backend holds it, faults aside.
     async fn version(&self, aggregate_type: &str, aggregate_id: &str) -> anyhow::Result<u16> {
         match &self.backend {
@@ -297,6 +317,33 @@ impl SimOptions {
     }
 }
 
+/// Every node and its store as they are now. A restart or a rejoin swaps a
+/// node's in, so a task that looks one up per operation reaches the live
+/// node: a clone held across a restart would wait for replies on an inbox
+/// no loop drains any more.
+#[derive(Clone, Default)]
+struct Live(Arc<Mutex<Vec<(Node, SimStore)>>>);
+
+impl Live {
+    /// Node `i` and its store.
+    fn get(&self, i: usize) -> (Node, SimStore) {
+        self.0.lock().unwrap()[i].clone()
+    }
+
+    fn node(&self, i: usize) -> Node {
+        self.get(i).0
+    }
+
+    fn set(&self, i: usize, node: Node, store: SimStore) {
+        let mut live = self.0.lock().unwrap();
+        if i == live.len() {
+            live.push((node, store));
+        } else {
+            live[i] = (node, store);
+        }
+    }
+}
+
 struct Sim {
     ids: Vec<NodeId>,
     nodes: Vec<Node>,
@@ -323,6 +370,8 @@ struct Sim {
     storage: Option<(u64, StorageFaults)>,
     /// Every transaction's outcome as each node's store enacted it.
     outcomes: Arc<Outcomes>,
+    /// The nodes and stores as they are now, for tasks that outlive a restart.
+    live: Live,
 }
 
 /// A dropped sim stops its nodes: left running, every finished scenario's
@@ -443,6 +492,10 @@ impl Sim {
             stores.push(store);
             journals.push(journal);
         }
+        let live = Live::default();
+        for (i, (node, store)) in nodes.iter().zip(&stores).enumerate() {
+            live.set(i, node.clone(), store.clone());
+        }
         Sim {
             ids,
             nodes,
@@ -457,6 +510,7 @@ impl Sim {
             store_kind,
             storage: None,
             outcomes,
+            live,
         }
     }
 
@@ -570,6 +624,8 @@ impl Sim {
         self.tasks[i] = vec![node.start(inbox), node.start_recovery()];
         self.nodes[i] = node;
         self.stores[i] = store;
+        self.live
+            .set(i, self.nodes[i].clone(), self.stores[i].clone());
     }
 }
 
@@ -655,6 +711,232 @@ struct WriteRecord {
 }
 
 type History = Arc<Mutex<Vec<WriteRecord>>>;
+
+/// A read that returned: on which node, when (virtual time since the sim's
+/// base), and the ids of the key's committed events it saw, in version order.
+#[derive(Clone, Debug)]
+struct ReadObs {
+    agg: String,
+    node: usize,
+    start: Duration,
+    end: Duration,
+    ids: Vec<u64>,
+}
+
+/// A client write: when it was invoked, and — if it returned — when, and
+/// whether it committed.
+#[derive(Clone, Debug)]
+struct WriteObs {
+    agg: String,
+    start: Duration,
+    end: Option<(Duration, bool)>,
+}
+
+/// Every read a workload made and every write it invoked, by event id.
+#[derive(Default)]
+struct Ops {
+    reads: Vec<ReadObs>,
+    writes: BTreeMap<u64, WriteObs>,
+}
+
+/// Readers per workload, and the reads each makes.
+const READERS: usize = 3;
+const READS_EACH: usize = 12;
+
+/// How long a read's barrier may take before the read counts as unavailable.
+const READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+const READ_SALT: u64 = 0x7265_6164_6572_7321;
+
+thread_local! {
+    /// Whether reads fence with a read barrier: off, they read the node's
+    /// store as it stands, which the read oracle must catch.
+    static READ_BARRIER: Cell<bool> = const { Cell::new(true) };
+}
+
+/// What a workload's clients record: each write's outcome, for the write
+/// oracles, and every operation with its timing, for the read oracle.
+#[derive(Clone)]
+struct Clients {
+    history: History,
+    ops: Arc<Mutex<Ops>>,
+    base: tokio::time::Instant,
+}
+
+impl Clients {
+    fn new(sim: &Sim) -> Self {
+        Clients {
+            history: Arc::new(Mutex::new(Vec::new())),
+            ops: Arc::default(),
+            base: sim.base,
+        }
+    }
+
+    fn now(&self) -> Duration {
+        tokio::time::Instant::now() - self.base
+    }
+
+    /// Writes `agg` at `version` through `node`. The invocation is logged —
+    /// an unanswered write may still commit — and, if the write returns
+    /// within `timeout`, its outcome.
+    async fn write(&self, node: &Node, agg: &str, version: u16, seq: u64, timeout: Duration) {
+        let start = self.now();
+        self.ops.lock().unwrap().writes.insert(
+            seq,
+            WriteObs {
+                agg: agg.to_string(),
+                start,
+                end: None,
+            },
+        );
+        let write = node.write(vec![event(agg, version, seq)]);
+        if let Ok(Ok(outcome)) = tokio::time::timeout(timeout, write).await {
+            let committed = !outcome.conflict;
+            let end = self.now();
+            if let Some(w) = self.ops.lock().unwrap().writes.get_mut(&seq) {
+                w.end = Some((end, committed));
+            }
+            self.history.lock().unwrap().push(WriteRecord {
+                agg: agg.to_string(),
+                version,
+                committed,
+            });
+        }
+    }
+
+    /// Reads `agg` on node `i` as `AccordExecutor` does with
+    /// `linearizable_reads` on: a read barrier, then the node's store. A
+    /// barrier that fails or times out observes nothing, like Jepsen's `:info`.
+    async fn read(&self, live: &Live, i: usize, agg: &str) {
+        let start = self.now();
+        let (node, store) = live.get(i);
+        if READ_BARRIER.with(Cell::get) {
+            let barrier = node.read_barrier(Key(agg.to_string()));
+            if !matches!(
+                tokio::time::timeout(READ_TIMEOUT, barrier).await,
+                Ok(Ok(()))
+            ) {
+                return;
+            }
+        }
+        let ids = store.events_of(agg);
+        let end = self.now();
+        self.ops.lock().unwrap().reads.push(ReadObs {
+            agg: agg.to_string(),
+            node: i,
+            start,
+            end,
+            ids,
+        });
+    }
+}
+
+/// Spawns the workload's readers. Each reads a seeded aggregate (of `aggs`)
+/// on a seeded node — any node, a crashed or cut-off one too — after a seeded
+/// pause, all drawn from its own generator so the scenario's plan is
+/// unchanged.
+fn spawn_readers(
+    sim: &Sim,
+    clients: &Clients,
+    seed: u64,
+    aggs: usize,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    let mut rng = StdRng::seed_from_u64(seed ^ READ_SALT);
+    let n = sim.ids.len();
+    (0..READERS)
+        .map(|_| {
+            let plan: Vec<(usize, usize, u64)> = (0..READS_EACH)
+                .map(|_| {
+                    (
+                        rng.random_range(0..aggs),
+                        rng.random_range(0..n),
+                        rng.random_range(5..80),
+                    )
+                })
+                .collect();
+            let live = sim.live.clone();
+            let clients = clients.clone();
+            tokio::spawn(async move {
+                for (agg_idx, node, pause) in plan {
+                    tokio::time::sleep(Duration::from_millis(pause)).await;
+                    clients.read(&live, node, &format!("a{agg_idx}")).await;
+                }
+            })
+        })
+        .collect()
+}
+
+/// The read oracle (#318), a seeded form of `linearizable_stress.rs`'s, over
+/// every read that returned. A key's events only grow, so per key:
+/// - **stale:** no read sees fewer events than one that ended before it
+///   started;
+/// - **lost:** no read misses a write acknowledged as committed before it
+///   started;
+/// - **aborted:** no read shows a write that returned as a conflict;
+/// - **premature:** no read shows a write invoked after it ended;
+/// - **not a prefix:** every read is the start of the key's history in
+///   `converged`, a store the cluster converged on.
+fn read_violation(clients: &Clients, converged: Option<&SimStore>) -> Option<String> {
+    let ops = clients.ops.lock().unwrap();
+    let show = |r: &ReadObs| {
+        format!(
+            "the read of {} on node {} from {:?} to {:?} saw {} events",
+            r.agg,
+            r.node,
+            r.start,
+            r.end,
+            r.ids.len()
+        )
+    };
+    for b in &ops.reads {
+        let earlier = ops
+            .reads
+            .iter()
+            .find(|a| a.agg == b.agg && a.end < b.start && a.ids.len() > b.ids.len());
+        if let Some(a) = earlier {
+            return Some(format!("stale read: {}; {}", show(b), show(a)));
+        }
+        for (id, w) in ops.writes.iter().filter(|(_, w)| w.agg == b.agg) {
+            if let Some((end, true)) = w.end {
+                if end < b.start && !b.ids.contains(id) {
+                    return Some(format!(
+                        "lost write: {} misses event {id}, acknowledged as committed at {end:?}",
+                        show(b)
+                    ));
+                }
+            }
+        }
+        for id in &b.ids {
+            let Some(w) = ops.writes.get(id) else {
+                continue;
+            };
+            if let Some((end, false)) = w.end {
+                return Some(format!(
+                    "aborted write read: {} shows event {id}, which returned as a conflict at {end:?}",
+                    show(b)
+                ));
+            }
+            if w.start > b.end {
+                return Some(format!(
+                    "premature read: {} shows event {id}, written from {:?}",
+                    show(b),
+                    w.start
+                ));
+            }
+        }
+        if let Some(store) = converged {
+            let history = store.events_of(&b.agg);
+            if !history.starts_with(&b.ids) {
+                return Some(format!(
+                    "not a prefix: {} ({:?}), the converged history is {history:?}",
+                    show(b),
+                    b.ids
+                ));
+            }
+        }
+    }
+    None
+}
 
 /// Runs one seeded scenario; returns its trace, or an error string describing
 /// any oracle violation.
@@ -854,13 +1136,16 @@ struct Adversarial {
     /// Why the healed cluster did not serve again, if it did not
     /// ([`assert_live`]).
     liveness: Option<String>,
+    /// How many reads returned, all checked by [`read_violation`].
+    reads: usize,
     /// The run's execution trace.
     trace: RunTrace,
 }
 
 impl Adversarial {
-    /// Panics on any oracle the run broke, `what` naming the scenario and seed.
-    fn assert_ok(&self, what: &str) {
+    /// Panics on any oracle the run broke, `what` naming the scenario and
+    /// seed; returns how many reads it checked.
+    fn assert_ok(&self, what: &str) -> usize {
         if let Some(v) = &self.safety {
             panic!("SAFETY VIOLATION ({what}): {v}");
         }
@@ -871,6 +1156,7 @@ impl Adversarial {
         if let Some(stall) = &self.liveness {
             panic!("{what}: {stall}");
         }
+        self.reads
     }
 }
 
@@ -887,7 +1173,7 @@ async fn run_adversarial(seed: u64, faults: Faults) -> Adversarial {
 
     let mut sim = Sim::build(N);
     faults.arm(&mut sim, seed);
-    let history: History = Arc::new(Mutex::new(Vec::new()));
+    let clients = Clients::new(&sim);
 
     let mut rng = StdRng::seed_from_u64(seed);
     let writer_plans: Vec<Vec<(usize, usize)>> = (0..WRITERS)
@@ -917,36 +1203,28 @@ async fn run_adversarial(seed: u64, faults: Faults) -> Adversarial {
         }
     });
 
-    let nodes = sim.nodes.clone();
     let store0 = sim.stores[0].clone();
     let ids = Arc::new(AtomicU64::new(1));
     let mut writers = Vec::new();
     for plan in writer_plans {
-        let nodes = nodes.clone();
+        let live = sim.live.clone();
         let store0 = store0.clone();
-        let history = Arc::clone(&history);
+        let clients = clients.clone();
         let ids = Arc::clone(&ids);
         writers.push(tokio::spawn(async move {
             for (agg_idx, coord) in plan {
                 let agg = format!("a{agg_idx}");
                 let version = store0.version(AGG_TYPE, &agg).await.unwrap_or(0) + 1;
                 let seq = ids.fetch_add(1, Ordering::Relaxed);
-                if let Ok(Ok(outcome)) = tokio::time::timeout(
-                    Duration::from_secs(2),
-                    nodes[coord].write(vec![event(&agg, version, seq)]),
-                )
-                .await
-                {
-                    history.lock().unwrap().push(WriteRecord {
-                        agg,
-                        version,
-                        committed: !outcome.conflict,
-                    });
-                }
-                // Timeouts (a crashed coordinator) are intentionally not recorded.
+                let node = live.node(coord);
+                clients
+                    .write(&node, &agg, version, seq, Duration::from_secs(2))
+                    .await;
+                // A timeout (a crashed coordinator) records no outcome.
             }
         }));
     }
+    writers.extend(spawn_readers(&sim, &clients, seed, AGGS));
     for w in writers {
         let _ = w.await;
     }
@@ -958,13 +1236,17 @@ async fn run_adversarial(seed: u64, faults: Faults) -> Adversarial {
     sim.net.clear_message_faults();
     let converged = converge(&sim.stores).await;
 
-    let records = history.lock().unwrap().clone();
+    let records = clients.history.lock().unwrap().clone();
     let safety = safety_violation(&sim, &records);
     let liveness = assert_live(&mut sim, &acked_versions(&records)).await.err();
+    let converged_store = liveness.is_none().then(|| &sim.stores[0]);
+    let safety = safety.or_else(|| read_violation(&clients, converged_store));
+    let reads = clients.ops.lock().unwrap().reads.len();
     Adversarial {
         safety,
         converged,
         liveness,
+        reads,
         trace: sim.trace(),
     }
 }
@@ -1050,7 +1332,7 @@ async fn run_partition(seed: u64, electorate: Option<Vec<NodeId>>, faults: Fault
         None => Sim::build(N),
     };
     faults.arm(&mut sim, seed);
-    let history: History = Arc::new(Mutex::new(Vec::new()));
+    let clients = Clients::new(&sim);
 
     let mut rng = StdRng::seed_from_u64(seed);
     // Writers coordinate through majority nodes only (never stranded out of quorum).
@@ -1104,35 +1386,27 @@ async fn run_partition(seed: u64, electorate: Option<Vec<NodeId>>, faults: Fault
         }
     });
 
-    let nodes = sim.nodes.clone();
     let store0 = sim.stores[0].clone();
     let ids = Arc::new(AtomicU64::new(1));
     let mut writers = Vec::new();
     for plan in writer_plans {
-        let nodes = nodes.clone();
+        let live = sim.live.clone();
         let store0 = store0.clone();
-        let history = Arc::clone(&history);
+        let clients = clients.clone();
         let ids = Arc::clone(&ids);
         writers.push(tokio::spawn(async move {
             for (agg_idx, coord) in plan {
                 let agg = format!("a{agg_idx}");
                 let version = store0.version(AGG_TYPE, &agg).await.unwrap_or(0) + 1;
                 let seq = ids.fetch_add(1, Ordering::Relaxed);
-                if let Ok(Ok(outcome)) = tokio::time::timeout(
-                    Duration::from_secs(2),
-                    nodes[coord].write(vec![event(&agg, version, seq)]),
-                )
-                .await
-                {
-                    history.lock().unwrap().push(WriteRecord {
-                        agg,
-                        version,
-                        committed: !outcome.conflict,
-                    });
-                }
+                let node = live.node(coord);
+                clients
+                    .write(&node, &agg, version, seq, Duration::from_secs(2))
+                    .await;
             }
         }));
     }
+    writers.extend(spawn_readers(&sim, &clients, seed, AGGS));
     for w in writers {
         let _ = w.await;
     }
@@ -1142,16 +1416,20 @@ async fn run_partition(seed: u64, electorate: Option<Vec<NodeId>>, faults: Fault
     sim.net.clear_message_faults();
     let converged = converge(&sim.stores).await;
 
-    let records = history.lock().unwrap().clone();
+    let records = clients.history.lock().unwrap().clone();
     let safety = match safety_violation(&sim, &records) {
         Some(v) => Some(v),
         None => minority_never_ahead(&sim, &records).await,
     };
     let liveness = assert_live(&mut sim, &acked_versions(&records)).await.err();
+    let converged_store = liveness.is_none().then(|| &sim.stores[0]);
+    let safety = safety.or_else(|| read_violation(&clients, converged_store));
+    let reads = clients.ops.lock().unwrap().reads.len();
     Adversarial {
         safety,
         converged,
         liveness,
+        reads,
         trace: sim.trace(),
     }
 }
@@ -1427,11 +1705,10 @@ async fn safety_holds_under_partitions_with_a_shrunk_electorate() {
 /// must never resurrect a stale/phantom commit (safety), and recovery +
 /// anti-entropy must bring it fully up to date (convergence).
 ///
-/// Restart targets are restricted to the minority {3,4} and writers coordinate
-/// only through the never-restarted majority {0,1,2}: a writer holds a `Node`
-/// clone for the run, and restarting a node replaces its inbox — so coordinating
-/// through a just-restarted node would route replies to the new inbox and hang
-/// the old clone's write. Keeping coordinators stable sidesteps that hazard.
+/// Restart targets are the minority {3,4}. Writers and readers go through any
+/// node, looked up per operation in [`Live`]: a restart replaces the node's
+/// inbox, so a clone held across it would wait on replies no loop delivers.
+/// An operation in flight on the old node times out, its outcome unknown.
 async fn run_with_restarts(seed: u64, faults: Faults, store: StoreKind) -> Adversarial {
     const N: u64 = 5;
     const AGGS: usize = 4;
@@ -1443,18 +1720,13 @@ async fn run_with_restarts(seed: u64, faults: Faults, store: StoreKind) -> Adver
         ..SimOptions::new(N)
     });
     faults.arm(&mut sim, seed);
-    let history: History = Arc::new(Mutex::new(Vec::new()));
+    let clients = Clients::new(&sim);
 
     let mut rng = StdRng::seed_from_u64(seed);
     let writer_plans: Vec<Vec<(usize, usize)>> = (0..WRITERS)
         .map(|_| {
             (0..WRITES_EACH)
-                .map(|_| {
-                    (
-                        rng.random_range(0..AGGS),
-                        MAJORITY[rng.random_range(0..MAJORITY.len())],
-                    )
-                })
+                .map(|_| (rng.random_range(0..AGGS), rng.random_range(0..N as usize)))
                 .collect()
         })
         .collect();
@@ -1487,36 +1759,29 @@ async fn run_with_restarts(seed: u64, faults: Faults, store: StoreKind) -> Adver
         })
         .collect();
 
-    // node 0 is never restarted, so its store handle stays valid for version reads.
-    let nodes = sim.nodes.clone();
+    // Node 0 is never restarted, so its store handle stays valid for the
+    // writers' version guesses.
     let store0 = sim.stores[0].clone();
     let ids = Arc::new(AtomicU64::new(1));
     let mut writers = Vec::new();
     for plan in writer_plans {
-        let nodes = nodes.clone();
+        let live = sim.live.clone();
         let store0 = store0.clone();
-        let history = Arc::clone(&history);
+        let clients = clients.clone();
         let ids = Arc::clone(&ids);
         writers.push(tokio::spawn(async move {
             for (agg_idx, coord) in plan {
                 let agg = format!("a{agg_idx}");
                 let version = store0.version(AGG_TYPE, &agg).await.unwrap_or(0) + 1;
                 let seq = ids.fetch_add(1, Ordering::Relaxed);
-                if let Ok(Ok(outcome)) = tokio::time::timeout(
-                    Duration::from_secs(2),
-                    nodes[coord].write(vec![event(&agg, version, seq)]),
-                )
-                .await
-                {
-                    history.lock().unwrap().push(WriteRecord {
-                        agg,
-                        version,
-                        committed: !outcome.conflict,
-                    });
-                }
+                let node = live.node(coord);
+                clients
+                    .write(&node, &agg, version, seq, Duration::from_secs(2))
+                    .await;
             }
         }));
     }
+    writers.extend(spawn_readers(&sim, &clients, seed, AGGS));
 
     // Drive restarts on the main task (Sim::restart needs &mut self), interleaved
     // with the writers running on their own tasks.
@@ -1532,13 +1797,17 @@ async fn run_with_restarts(seed: u64, faults: Faults, store: StoreKind) -> Adver
     sim.clear_storage_faults();
     let converged = converge(&sim.stores).await;
 
-    let records = history.lock().unwrap().clone();
+    let records = clients.history.lock().unwrap().clone();
     let safety = safety_violation(&sim, &records);
     let liveness = assert_live(&mut sim, &acked_versions(&records)).await.err();
+    let converged_store = liveness.is_none().then(|| &sim.stores[0]);
+    let safety = safety.or_else(|| read_violation(&clients, converged_store));
+    let reads = clients.ops.lock().unwrap().reads.len();
     Adversarial {
         safety,
         converged,
         liveness,
+        reads,
         trace: sim.trace(),
     }
 }
@@ -1646,6 +1915,32 @@ async fn safety_holds_under_restarts_and_storage_faults() {
             }
         }
     }
+}
+
+/// The read oracle bites, and a violation replays from its seed (#318). With
+/// the read barrier off, a read takes the node's store as it stands: a node
+/// that lags behind lossy links, or a partition, serves a stale read.
+#[tokio::test(start_paused = true)]
+async fn the_read_oracle_catches_reads_without_a_barrier() {
+    READ_BARRIER.with(|b| b.set(false));
+    let caught = 'seeds: {
+        for seed in 0..20 {
+            let run = run_partition(seed, None, Faults::ALL).await;
+            assert!(run.reads > 0, "seed {seed}: no read returned");
+            if let Some(violation) = run.safety {
+                break 'seeds Some((seed, violation));
+            }
+        }
+        None
+    };
+    let (seed, violation) = caught.expect("reads without a barrier went unnoticed");
+    let again = run_partition(seed, None, Faults::ALL).await.safety;
+    READ_BARRIER.with(|b| b.set(true));
+    assert_eq!(
+        again.as_deref(),
+        Some(violation.as_str()),
+        "seed {seed} did not replay its violation"
+    );
 }
 
 /// The seeds of the restart scenario, over failing storage on the production
@@ -2639,6 +2934,7 @@ async fn membership_churn_is_bit_reproducible() {
 async fn sweep_for_bugs() {
     const COUNT: u64 = 250;
     let electorate = vec![NodeId(0), NodeId(1), NodeId(2)];
+    let mut reads = 0;
 
     for seed in 0..COUNT {
         // Chaos (crash/heal minority, coordinators crash mid-write) — strong oracle.
@@ -2649,18 +2945,18 @@ async fn sweep_for_bugs() {
         // restarts — each also over lossy, duplicating, reordering links with
         // one-way cuts.
         for (label, faults) in [("", Faults::default()), (" +faults", Faults::ALL)] {
-            run_adversarial(seed, faults)
+            reads += run_adversarial(seed, faults)
                 .await
                 .assert_ok(&format!("adversarial{label} seed {seed}"));
             for (kind, e) in [
                 ("partition", None),
                 ("partition+electorate", Some(electorate.clone())),
             ] {
-                run_partition(seed, e, faults)
+                reads += run_partition(seed, e, faults)
                     .await
                     .assert_ok(&format!("{kind}{label} seed {seed}"));
             }
-            run_with_restarts(seed, faults, StoreKind::Memory)
+            reads += run_with_restarts(seed, faults, StoreKind::Memory)
                 .await
                 .assert_ok(&format!("restarts{label} seed {seed}"));
         }
@@ -2677,14 +2973,14 @@ async fn sweep_for_bugs() {
                     },
                 ),
             ] {
-                run_with_restarts(seed, faults, store)
+                reads += run_with_restarts(seed, faults, store)
                     .await
                     .assert_ok(&format!("restarts {label} {store:?} seed {seed}"));
             }
         }
         // Absences: silent peers given up, compacted past, and back (#310).
         for (label, faults) in [("", Faults::default()), (" +faults", Faults::ALL)] {
-            run_absence(seed, faults)
+            reads += run_absence(seed, faults)
                 .await
                 .assert_ok(&format!("absence{label} seed {seed}"));
         }
@@ -2725,7 +3021,7 @@ async fn sweep_for_bugs() {
             eprintln!("swept {seed}/{COUNT}");
         }
     }
-    eprintln!("swept all {COUNT} seeds with no violation");
+    eprintln!("swept all {COUNT} seeds with no violation ({reads} reads checked)");
 }
 
 // ---------------------------------------------------------------------------
@@ -2783,6 +3079,8 @@ impl Sim {
         self.nodes[i] = node;
         self.stores[i] = store;
         self.journals[i] = journal;
+        self.live
+            .set(i, self.nodes[i].clone(), self.stores[i].clone());
     }
 }
 
@@ -3656,7 +3954,7 @@ async fn run_absence(seed: u64, faults: Faults) -> Adversarial {
     };
     let mut sim = Sim::build_with_config(N, config);
     faults.arm(&mut sim, seed);
-    let history: History = Arc::new(Mutex::new(Vec::new()));
+    let clients = Clients::new(&sim);
 
     let mut rng = StdRng::seed_from_u64(seed);
     // Writes through the majority, spaced so the run outlasts the absences.
@@ -3736,14 +4034,13 @@ async fn run_absence(seed: u64, faults: Faults) -> Adversarial {
         }));
     }
 
-    let nodes = sim.nodes.clone();
     let store0 = sim.stores[0].clone();
     let ids = Arc::new(AtomicU64::new(1));
     let mut writers = Vec::new();
     for plan in writer_plans {
-        let nodes = nodes.clone();
+        let live = sim.live.clone();
         let store0 = store0.clone();
-        let history = Arc::clone(&history);
+        let clients = clients.clone();
         let ids = Arc::clone(&ids);
         writers.push(tokio::spawn(async move {
             for (agg_idx, coord, pause) in plan {
@@ -3751,21 +4048,14 @@ async fn run_absence(seed: u64, faults: Faults) -> Adversarial {
                 let agg = format!("a{agg_idx}");
                 let version = store0.version(AGG_TYPE, &agg).await.unwrap_or(0) + 1;
                 let seq = ids.fetch_add(1, Ordering::Relaxed);
-                if let Ok(Ok(outcome)) = tokio::time::timeout(
-                    Duration::from_secs(2),
-                    nodes[coord].write(vec![event(&agg, version, seq)]),
-                )
-                .await
-                {
-                    history.lock().unwrap().push(WriteRecord {
-                        agg,
-                        version,
-                        committed: !outcome.conflict,
-                    });
-                }
+                let node = live.node(coord);
+                clients
+                    .write(&node, &agg, version, seq, Duration::from_secs(2))
+                    .await;
             }
         }));
     }
+    writers.extend(spawn_readers(&sim, &clients, seed, AGGS));
     for w in writers {
         let _ = w.await;
     }
@@ -3775,16 +4065,21 @@ async fn run_absence(seed: u64, faults: Faults) -> Adversarial {
 
     sim.net.heal_all_partitions();
     sim.net.clear_message_faults();
-    let records = history.lock().unwrap().clone();
+    let records = clients.history.lock().unwrap().clone();
     let safety = safety_violation(&sim, &records);
     // The returning nodes may need a rejoin before they converge: the
     // liveness check does it, then requires the stores to agree.
     let liveness = assert_live(&mut sim, &acked_versions(&records)).await.err();
     let converged = liveness.is_none();
+    let safety = safety
+        .or_else(|| safety_violation(&sim, &records))
+        .or_else(|| read_violation(&clients, converged.then(|| &sim.stores[0])));
+    let reads = clients.ops.lock().unwrap().reads.len();
     Adversarial {
-        safety: safety.or_else(|| safety_violation(&sim, &records)),
+        safety,
         converged,
         liveness,
+        reads,
         trace: sim.trace(),
     }
 }
