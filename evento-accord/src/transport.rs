@@ -337,6 +337,12 @@ impl InMemoryNetwork {
             .insert((from, to), latency);
     }
 
+    /// Drops every link latency set by [`set_latency`](Self::set_latency):
+    /// messages are delivered inline again.
+    pub fn clear_latency(&self) {
+        self.latency.lock().expect("network poisoned").clear();
+    }
+
     /// Sets the delivery latency on the link between `a` and `b` in both
     /// directions. Convenience over two [`set_latency`](Self::set_latency) calls.
     pub fn set_link_latency(&self, a: NodeId, b: NodeId, latency: Duration) {

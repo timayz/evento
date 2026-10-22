@@ -36,7 +36,7 @@
 //!   version beyond the quorum's (it may only lag).
 
 use std::cell::Cell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -664,7 +664,7 @@ async fn run_scenario(seed: u64) -> Result<RunTrace, String> {
     const WRITERS: usize = 4;
     const WRITES_EACH: usize = 12;
 
-    let sim = Sim::build(N);
+    let mut sim = Sim::build(N);
     let history: History = Arc::new(Mutex::new(Vec::new()));
 
     // Pre-generate the seeded plans so the scenario is seed-derived.
@@ -748,8 +748,11 @@ async fn run_scenario(seed: u64) -> Result<RunTrace, String> {
     let records = history.lock().unwrap().clone();
     check_oracles(&sim, &records)
         .await
-        .map(|()| sim.trace())
-        .map_err(|e| format!("seed {seed}: {e}"))
+        .map_err(|e| format!("seed {seed}: {e}"))?;
+    assert_live(&mut sim, &acked_versions(&records))
+        .await
+        .map_err(|e| format!("seed {seed}: {e}"))?;
+    Ok(sim.trace())
 }
 
 /// The set of `(type, id, version) -> event` commits at a store. Two replicas
@@ -848,8 +851,27 @@ struct Adversarial {
     safety: Option<String>,
     /// Whether all nodes converged to the same committed set after healing.
     converged: bool,
+    /// Why the healed cluster did not serve again, if it did not
+    /// ([`assert_live`]).
+    liveness: Option<String>,
     /// The run's execution trace.
     trace: RunTrace,
+}
+
+impl Adversarial {
+    /// Panics on any oracle the run broke, `what` naming the scenario and seed.
+    fn assert_ok(&self, what: &str) {
+        if let Some(v) = &self.safety {
+            panic!("SAFETY VIOLATION ({what}): {v}");
+        }
+        assert!(
+            self.converged,
+            "{what}: cluster failed to converge after healing"
+        );
+        if let Some(stall) = &self.liveness {
+            panic!("{what}: {stall}");
+        }
+    }
 }
 
 /// Full chaos: writers pick random coordinators while a minority of *any* nodes
@@ -937,9 +959,12 @@ async fn run_adversarial(seed: u64, faults: Faults) -> Adversarial {
     let converged = converge(&sim.stores).await;
 
     let records = history.lock().unwrap().clone();
+    let safety = safety_violation(&sim, &records);
+    let liveness = assert_live(&mut sim, &acked_versions(&records)).await.err();
     Adversarial {
-        safety: safety_violation(&sim, &records),
+        safety,
         converged,
+        liveness,
         trace: sim.trace(),
     }
 }
@@ -999,6 +1024,9 @@ async fn adversarial_safety_holds_and_measures_convergence() {
             result.converged,
             "seed {seed}: cluster failed to converge after healing"
         );
+        if let Some(stall) = result.liveness {
+            panic!("seed {seed}: {stall}");
+        }
     }
 }
 
@@ -1119,10 +1147,189 @@ async fn run_partition(seed: u64, electorate: Option<Vec<NodeId>>, faults: Fault
         Some(v) => Some(v),
         None => minority_never_ahead(&sim, &records).await,
     };
+    let liveness = assert_live(&mut sim, &acked_versions(&records)).await.err();
     Adversarial {
         safety,
         converged,
+        liveness,
         trace: sim.trace(),
+    }
+}
+
+/// The highest committed version of each aggregate, as the clients saw them.
+fn acked_versions(history: &[WriteRecord]) -> BTreeMap<String, u16> {
+    let mut acked = BTreeMap::new();
+    for r in history {
+        let version = acked.entry(r.agg.clone()).or_insert(0);
+        if r.committed {
+            *version = (*version).max(r.version);
+        }
+    }
+    acked
+}
+
+/// Event ids of [`assert_live`]'s writes, clear of every workload's.
+const LIVE_SEQ: u64 = 1_000_000;
+
+/// How many `collect_timeout` rounds a healed cluster may take to recover
+/// what it left stalled before it must serve again (see #326).
+const SETTLE_ROUNDS: u32 = 20;
+
+impl Sim {
+    /// Heals everything a scenario may have broken: crashed nodes, partitions
+    /// and cuts, link latency, and the message and storage faults.
+    fn heal_all(&mut self) {
+        for &id in &self.ids {
+            self.net.heal(id);
+        }
+        self.net.heal_all_partitions();
+        self.net.clear_latency();
+        self.net.clear_message_faults();
+        self.clear_storage_faults();
+    }
+
+    /// A liveness failure: which node stalled at which step, and every node's
+    /// state.
+    fn stalled(&self, node: usize, step: &str, what: &str, since: tokio::time::Instant) -> String {
+        let mut out = format!(
+            "not live: node {node} stalled at the {step} step, {:?} after the heal: {what}",
+            tokio::time::Instant::now() - since
+        );
+        for (i, n) in self.nodes.iter().enumerate() {
+            let m = n.metrics();
+            out.push_str(&format!(
+                "\n  node {i}: commands={} absent={:?} rejoin_required={} recoveries={} \
+                 execution_failures={} committed={}",
+                n.command_count(),
+                n.absent_peers(),
+                n.rejoin_required(),
+                m.recoveries,
+                m.execution_failures,
+                self.stores[i].committed_events().len()
+            ));
+        }
+        out
+    }
+}
+
+/// Liveness once every fault is healed (#317): the cluster serves again. A
+/// node dark after a heal (#291), or one whose store stopped growing (#309),
+/// can pass every safety oracle; it fails here.
+///
+/// After [`heal_all`](Sim::heal_all), and rejoining any node told to (as its
+/// host would), within bounds derived from the cluster's [`NodeConfig`]:
+/// 1. a write each node coordinates commits;
+/// 2. a read barrier on every key returns on every node, whose store then
+///    holds at least the highest acknowledged version;
+/// 3. every node compacts its consensus state away, and the stores agree.
+///
+/// The bounds are ceilings in virtual time: a live cluster passes at once.
+async fn assert_live(sim: &mut Sim, acked: &BTreeMap<String, u16>) -> Result<(), String> {
+    sim.heal_all();
+    let config = sim.config;
+    let n = sim.ids.len() as u32;
+    // After a heal, the transactions left stalled are recovered one attempt
+    // per `collect_timeout` at worst, and concurrent recoverers can take
+    // several rounds to settle one: up to ~50 s of virtual time under
+    // message faults (#326). The bounds allow for that, and catch a cluster
+    // that never serves again.
+    let serve = config.collect_timeout * SETTLE_ROUNDS
+        + config.recovery_timeout * 4
+        + config.anti_entropy_interval * n;
+    let compact = serve
+        + (config.compaction_margin
+            + config.anti_entropy_interval * (2 * n)
+            + config.recovery_interval * 10)
+            * 3;
+    let start = tokio::time::Instant::now();
+
+    // A node told to rejoin is rejoined by its host, through one that was not.
+    if sim.dynamic.is_empty() {
+        for i in 0..sim.ids.len() {
+            if sim.nodes[i].rejoin_required() {
+                let Some(contact) = (0..sim.ids.len()).find(|&j| !sim.nodes[j].rejoin_required())
+                else {
+                    return Err(sim.stalled(i, "rejoin", "every node was told to rejoin", start));
+                };
+                sim.rejoin(i, sim.ids[contact], config).await;
+            }
+        }
+    }
+
+    // 1. Each node coordinates a write that commits. An attempt that fails
+    //    (a quorum not reached while the healed cluster settles) is retried,
+    //    each on an aggregate of its own, so a retry never conflicts with an
+    //    attempt that committed after all.
+    let mut keys: Vec<(String, u16)> = acked
+        .iter()
+        .map(|(agg, version)| (agg.clone(), *version))
+        .collect();
+    for i in 0..sim.ids.len() {
+        let deadline = tokio::time::Instant::now() + serve;
+        let mut attempt = 0;
+        loop {
+            let agg = format!("live-{i}-{attempt}");
+            let seq = LIVE_SEQ + 1000 * i as u64 + attempt;
+            let write = sim.nodes[i].write(vec![event(&agg, 1, seq)]);
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let what = match tokio::time::timeout(left, write).await {
+                Ok(Ok(outcome)) if !outcome.conflict => {
+                    keys.push((agg, 1));
+                    break;
+                }
+                Ok(Ok(_)) => "a fresh aggregate conflicted".to_string(),
+                Ok(Err(err)) => format!("{err:#}"),
+                Err(_) => format!("no outcome within {serve:?}"),
+            };
+            if tokio::time::Instant::now() >= deadline {
+                return Err(sim.stalled(i, "write", &what, start));
+            }
+            attempt += 1;
+        }
+    }
+
+    // 2. A read barrier on every key, on every node — retried while its own
+    //    wait (`collect_timeout`) is shorter than the bound.
+    for i in 0..sim.ids.len() {
+        for (agg, version) in &keys {
+            let deadline = tokio::time::Instant::now() + serve;
+            loop {
+                let barrier = sim.nodes[i].read_barrier(Key(agg.clone()));
+                let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                let failed = match tokio::time::timeout(left, barrier).await {
+                    Ok(Ok(())) => break,
+                    Ok(Err(err)) => format!("on {agg}: {err:#}"),
+                    Err(_) => format!("on {agg}: no answer within {serve:?}"),
+                };
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(sim.stalled(i, "read barrier", &failed, start));
+                }
+            }
+            let stored = version_of(&sim.stores[i], agg).await;
+            if stored < *version {
+                let what = format!("{agg} at version {stored} after a barrier, acked {version}");
+                return Err(sim.stalled(i, "read", &what, start));
+            }
+        }
+    }
+
+    // 3. Consensus state compacts away everywhere, and the stores agree.
+    let deadline = tokio::time::Instant::now() + compact;
+    loop {
+        let first = committed_set(&sim.stores[0]);
+        if sim.nodes.iter().all(|n| n.command_count() == 0)
+            && sim.stores.iter().all(|s| committed_set(s) == first)
+        {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let laggard = (0..sim.ids.len())
+                .find(|&i| sim.nodes[i].command_count() > 0)
+                .unwrap_or(0);
+            let what = format!("not compacted, or the stores apart, within {compact:?}");
+            return Err(sim.stalled(laggard, "compaction", &what, start));
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -1161,6 +1368,9 @@ async fn safety_holds_under_partitions() {
             result.converged,
             "seed {seed}: cluster failed to converge after partition heal"
         );
+        if let Some(stall) = result.liveness {
+            panic!("seed {seed}: {stall}");
+        }
     }
 }
 
@@ -1182,6 +1392,9 @@ async fn safety_holds_under_partitions_with_a_shrunk_electorate() {
             result.converged,
             "seed {seed}: cluster failed to converge after partition heal (electorate)"
         );
+        if let Some(stall) = result.liveness {
+            panic!("seed {seed}: {stall}");
+        }
     }
 }
 
@@ -1297,9 +1510,12 @@ async fn run_with_restarts(seed: u64, faults: Faults, store: StoreKind) -> Adver
     let converged = converge(&sim.stores).await;
 
     let records = history.lock().unwrap().clone();
+    let safety = safety_violation(&sim, &records);
+    let liveness = assert_live(&mut sim, &acked_versions(&records)).await.err();
     Adversarial {
-        safety: safety_violation(&sim, &records),
+        safety,
         converged,
+        liveness,
         trace: sim.trace(),
     }
 }
@@ -1316,6 +1532,9 @@ async fn safety_holds_under_restarts() {
             result.converged,
             "seed {seed}: cluster failed to converge after restarts"
         );
+        if let Some(stall) = result.liveness {
+            panic!("seed {seed}: {stall}");
+        }
     }
 }
 
@@ -1335,6 +1554,9 @@ async fn adversarial_safety_holds_under_message_faults() {
             result.converged,
             "seed {seed}: cluster failed to converge after healing (message faults)"
         );
+        if let Some(stall) = result.liveness {
+            panic!("seed {seed}: {stall}");
+        }
     }
 }
 
@@ -1353,6 +1575,9 @@ async fn safety_holds_under_partitions_and_message_faults() {
                 result.converged,
                 "seed {seed}: cluster failed to converge after partition heal ({label} faults)"
             );
+            if let Some(stall) = result.liveness {
+                panic!("seed {seed}: {stall}");
+            }
         }
     }
 }
@@ -1369,6 +1594,9 @@ async fn safety_holds_under_restarts_and_message_faults() {
             result.converged,
             "seed {seed}: cluster failed to converge after restarts (message faults)"
         );
+        if let Some(stall) = result.liveness {
+            panic!("seed {seed}: {stall}");
+        }
     }
 }
 
@@ -1390,6 +1618,9 @@ async fn safety_holds_under_restarts_and_storage_faults() {
                 result.converged,
                 "seed {seed}: cluster failed to converge after restarts (storage faults, {store:?})"
             );
+            if let Some(stall) = result.liveness {
+                panic!("seed {seed}: {stall}");
+            }
         }
     }
 }
@@ -1413,6 +1644,9 @@ async fn a_store_that_lost_its_tail_catches_up() {
             result.converged,
             "seed {seed}: a replica's store froze behind the others (#309)"
         );
+        if let Some(stall) = result.liveness {
+            panic!("seed {seed}: {stall}");
+        }
     }
 }
 
@@ -1622,7 +1856,7 @@ async fn run_bounded(seed: u64) -> Result<RunTrace, String> {
     const WRITERS: usize = 4;
     const WRITES_EACH: usize = 12;
 
-    let sim = Sim::build(N);
+    let mut sim = Sim::build(N);
     let history: History = Arc::new(Mutex::new(Vec::new()));
 
     let mut rng = StdRng::seed_from_u64(seed);
@@ -1674,38 +1908,18 @@ async fn run_bounded(seed: u64) -> Result<RunTrace, String> {
     converge(&sim.stores).await;
 
     // Idle: virtual time advances via the recovery sweep until the watermark
-    // passes every write (+ margin) and all commands compact away.
-    let mut bounded = false;
-    for _ in 0..4000 {
-        let max = sim
-            .nodes
-            .iter()
-            .map(|n| n.command_count())
-            .max()
-            .unwrap_or(0);
-        if max == 0 {
-            bounded = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    if !bounded {
-        let counts: Vec<usize> = sim.nodes.iter().map(|n| n.command_count()).collect();
-        return Err(format!(
-            "seed {seed}: consensus state not bounded after {total_writes} writes: {counts:?}"
-        ));
-    }
+    // passes every write (+ margin) and all commands compact away — the third
+    // step of the liveness check, which also requires the cluster to keep
+    // serving and the stores to agree.
+    let records = history.lock().unwrap().clone();
+    assert_live(&mut sim, &acked_versions(&records))
+        .await
+        .map_err(|e| format!("seed {seed}: after {total_writes} writes, {e}"))?;
 
     // Compaction dropped consensus state but not the committed data: the cluster
     // still holds every committed event, and safety was never violated.
-    let records = history.lock().unwrap().clone();
     if let Some(v) = safety_violation(&sim, &records) {
         return Err(format!("seed {seed}: {v}"));
-    }
-    if !converge(&sim.stores).await {
-        return Err(format!(
-            "seed {seed}: committed state lost after compaction"
-        ));
     }
     Ok(sim.trace())
 }
@@ -1846,7 +2060,7 @@ async fn run_skew(seed: u64) -> Result<RunTrace, String> {
     const SKEW_MICROS: u64 = 150_000; // 150ms, within MAX_SKEW (200ms)
     const SKEWED: usize = 2;
 
-    let sim = Sim::build_with_skew(N, SKEWED, SKEW_MICROS);
+    let mut sim = Sim::build_with_skew(N, SKEWED, SKEW_MICROS);
     let history: History = Arc::new(Mutex::new(Vec::new()));
 
     let mut rng = StdRng::seed_from_u64(seed);
@@ -1897,29 +2111,12 @@ async fn run_skew(seed: u64) -> Result<RunTrace, String> {
         return Err(format!("seed {seed}: cluster did not converge under skew"));
     }
 
-    // Despite the skew, recovery/compaction stay healthy: state compacts away.
-    let mut bounded = false;
-    for _ in 0..4000 {
-        let max = sim
-            .nodes
-            .iter()
-            .map(|n| n.command_count())
-            .max()
-            .unwrap_or(0);
-        if max == 0 {
-            bounded = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    if !bounded {
-        let counts: Vec<usize> = sim.nodes.iter().map(|n| n.command_count()).collect();
-        return Err(format!(
-            "seed {seed}: state not bounded under skew (skew stalled compaction): {counts:?}"
-        ));
-    }
-
+    // Despite the skew, recovery/compaction stay healthy: the cluster serves,
+    // and its state compacts away.
     let records = history.lock().unwrap().clone();
+    assert_live(&mut sim, &acked_versions(&records))
+        .await
+        .map_err(|e| format!("seed {seed}: under skew, {e}"))?;
     if let Some(v) = safety_violation(&sim, &records) {
         return Err(format!("seed {seed}: {v}"));
     }
@@ -1950,7 +2147,7 @@ async fn run_healthy_high_timeout(seed: u64) -> Result<u64, String> {
         recovery_timeout: Duration::from_secs(3600),
         ..NodeConfig::default()
     };
-    let sim = Sim::build_with_config(N, config);
+    let mut sim = Sim::build_with_config(N, config);
     let history: History = Arc::new(Mutex::new(Vec::new()));
 
     let mut rng = StdRng::seed_from_u64(seed);
@@ -2002,7 +2199,11 @@ async fn run_healthy_high_timeout(seed: u64) -> Result<u64, String> {
     if let Some(v) = safety_violation(&sim, &records) {
         return Err(format!("seed {seed}: {v}"));
     }
-    Ok(sim.nodes.iter().map(|n| n.recovery_count()).sum())
+    let recoveries = sim.nodes.iter().map(|n| n.recovery_count()).sum();
+    assert_live(&mut sim, &acked_versions(&records))
+        .await
+        .map_err(|e| format!("seed {seed}: {e}"))?;
+    Ok(recoveries)
 }
 
 /// The detector does not false-positive: a healthy cluster (regular heartbeats,
@@ -2186,6 +2387,8 @@ struct ChurnProbe {
     per_node_committed: Vec<Vec<Commit>>,
     per_node_epoch: Vec<u64>,
     history: Vec<(String, u16, bool)>,
+    /// Why the healed cluster did not serve again, if it did not.
+    liveness: Option<String>,
     /// The run's execution trace.
     trace: RunTrace,
 }
@@ -2198,7 +2401,7 @@ async fn run_churn(seed: u64) -> ChurnProbe {
 
     // One shard with every node, identical across epochs — only the epoch
     // advances. The recovery loop drives the metadata-log catch-up sweep.
-    let sim = Sim::build_dynamic(N);
+    let mut sim = Sim::build_dynamic(N);
     let layout = vec![sim.ids.clone()];
     let net = Arc::clone(&sim.net);
     let nodes = &sim.nodes;
@@ -2320,18 +2523,19 @@ async fn run_churn(seed: u64) -> ChurnProbe {
         })
         .collect();
     let per_node_epoch = topos.iter().map(|t| t.epoch()).collect();
-    let mut history: Vec<(String, u16, bool)> = history
-        .lock()
-        .unwrap()
+    let records = history.lock().unwrap().clone();
+    let mut history: Vec<(String, u16, bool)> = records
         .iter()
         .map(|r| (r.agg.clone(), r.version, r.committed))
         .collect();
     history.sort();
+    let liveness = assert_live(&mut sim, &acked_versions(&records)).await.err();
 
     ChurnProbe {
         per_node_committed,
         per_node_epoch,
         history,
+        liveness,
         trace: sim.trace(),
     }
 }
@@ -2344,6 +2548,9 @@ async fn run_churn(seed: u64) -> ChurnProbe {
 async fn membership_churn_converges() {
     for seed in 0..8 {
         let probe = run_churn(seed).await;
+        if let Some(stall) = &probe.liveness {
+            panic!("seed {seed}: {stall}");
+        }
 
         // Control plane: all nodes reach the same, highest epoch.
         let max_epoch = *probe.per_node_epoch.iter().max().unwrap();
@@ -2415,35 +2622,20 @@ async fn sweep_for_bugs() {
         // restarts — each also over lossy, duplicating, reordering links with
         // one-way cuts.
         for (label, faults) in [("", Faults::default()), (" +faults", Faults::ALL)] {
-            let a = run_adversarial(seed, faults).await;
-            assert!(
-                a.safety.is_none(),
-                "adversarial{label} seed {seed}: {:?}",
-                a.safety
-            );
-            assert!(
-                a.converged,
-                "adversarial{label} seed {seed}: did not converge"
-            );
+            run_adversarial(seed, faults)
+                .await
+                .assert_ok(&format!("adversarial{label} seed {seed}"));
             for (kind, e) in [
                 ("partition", None),
                 ("partition+electorate", Some(electorate.clone())),
             ] {
-                let p = run_partition(seed, e, faults).await;
-                assert!(
-                    p.safety.is_none(),
-                    "{kind}{label} seed {seed}: {:?}",
-                    p.safety
-                );
-                assert!(p.converged, "{kind}{label} seed {seed}: did not converge");
+                run_partition(seed, e, faults)
+                    .await
+                    .assert_ok(&format!("{kind}{label} seed {seed}"));
             }
-            let r = run_with_restarts(seed, faults, StoreKind::Memory).await;
-            assert!(
-                r.safety.is_none(),
-                "restarts{label} seed {seed}: {:?}",
-                r.safety
-            );
-            assert!(r.converged, "restarts{label} seed {seed}: did not converge");
+            run_with_restarts(seed, faults, StoreKind::Memory)
+                .await
+                .assert_ok(&format!("restarts{label} seed {seed}"));
         }
         // Restarts over failing storage, on both stores, alone and with every
         // network fault on top.
@@ -2458,16 +2650,9 @@ async fn sweep_for_bugs() {
                     },
                 ),
             ] {
-                let r = run_with_restarts(seed, faults, store).await;
-                assert!(
-                    r.safety.is_none(),
-                    "restarts {label} {store:?} seed {seed}: {:?}",
-                    r.safety
-                );
-                assert!(
-                    r.converged,
-                    "restarts {label} {store:?} seed {seed}: did not converge"
-                );
+                run_with_restarts(seed, faults, store)
+                    .await
+                    .assert_ok(&format!("restarts {label} {store:?} seed {seed}"));
             }
         }
         // Compaction boundedness + clock skew.
@@ -2479,6 +2664,9 @@ async fn sweep_for_bugs() {
         }
         // Membership churn (concurrent reconfiguration + writes + minority churn).
         let probe = run_churn(seed).await;
+        if let Some(stall) = &probe.liveness {
+            panic!("churn seed {seed}: {stall}");
+        }
         let max_epoch = *probe.per_node_epoch.iter().max().unwrap();
         for (node, &e) in probe.per_node_epoch.iter().enumerate() {
             assert_eq!(
