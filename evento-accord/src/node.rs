@@ -1191,12 +1191,13 @@ impl Node {
                     // The store neither holds it nor takes it now: it lost
                     // the write (a store that acknowledged before it
                     // persisted, then crashed), or misses an earlier one the
-                    // journal never recorded (an anti-entropy import). Hand
-                    // the transaction back decided but un-applied, as a join
-                    // does: execution applies it again once what precedes it
-                    // is in place — anti-entropy brings a missing import back
-                    // — rather than the node running on a store that lacks
-                    // it, or not starting at all.
+                    // journal never recorded (an anti-entropy import, which
+                    // went unrecorded before #331). Hand the transaction back
+                    // decided but un-applied, as a join does: execution
+                    // applies it again once what precedes it is in place —
+                    // anti-entropy brings a missing import back — rather than
+                    // the node running on a store that lacks it, or not
+                    // starting at all.
                     tracing::warn!(
                         node = self.id.0,
                         txn = ?cmd.txn,
@@ -1912,9 +1913,9 @@ impl Node {
             .filter(|&n| n != self.id)
             .collect();
         // A peer may compact up to `mine` past what this node does not hold,
-        // trusting its vote fence: persist the clock bound that keeps the
-        // fence above `mine` across a restart first.
-        if !self.bound_clock().await {
+        // trusting its vote fence, and past what it imported: make both
+        // survive a restart first.
+        if !self.vouch_durably().await {
             return;
         }
         self.broadcast(
@@ -2135,7 +2136,7 @@ impl Node {
                 ?mine,
                 "told to rejoin but holding everything compacted; reporting instead"
             );
-            if !self.bound_clock().await {
+            if !self.vouch_durably().await {
                 return;
             }
             self.send(
@@ -3119,6 +3120,39 @@ impl Node {
             // Prefer enacting a decided, ready transaction.
             let apply = self.replica.lock().expect("replica poisoned").next_apply();
             if let Some(mut apply) = apply {
+                // Journaled first (#331): from the mark below on, a report may
+                // count it as applied, and a restart that lost its record would
+                // bring it back committed, its decision lost with it —
+                // undecidable once its peers compacted it. Staged ahead of the
+                // store, which keeps the store and the mark adjacent: a record
+                // ahead of a failed apply is replayed into the store on a
+                // restart, as any applied record is, and staged again by the
+                // retry meanwhile.
+                let applied = self
+                    .replica
+                    .lock()
+                    .expect("replica poisoned")
+                    .snapshot(apply.txn)
+                    .map(|mut state| {
+                        state.status = Status::Applied;
+                        state.applied_conflict = Some(!apply.commit);
+                        state
+                    });
+                let staged = match applied {
+                    Some(state) => match self.journal.stage(&state).await {
+                        Ok(()) => true,
+                        Err(err) => {
+                            tracing::warn!(
+                                node = self.id.0,
+                                txn = ?apply.txn,
+                                %err,
+                                "cannot stage a transaction's state; withholding its reply"
+                            );
+                            false
+                        }
+                    },
+                    None => true,
+                };
                 // The events carry their writer's provisional stamps; the
                 // store gets the agreed ones (see `stamp_events`). The journal
                 // keeps the provisional ones — every apply re-derives the same.
@@ -3155,7 +3189,7 @@ impl Node {
                 self.applied.bump();
                 // An apply the journal did not take is not acknowledged; a
                 // restart re-applies it (idempotently) from its commit.
-                if self.journal_stage(apply.txn).await {
+                if staged {
                     out.push((apply.reply_to, Message::Applied { txn: apply.txn }));
                 }
                 continue;
@@ -4996,7 +5030,7 @@ impl Node {
             .into_iter()
             .filter(|&n| n != self.id)
             .collect();
-        if self.bound_clock().await {
+        if self.vouch_durably().await {
             self.broadcast(
                 &peers,
                 Message::Watermark {
@@ -5513,6 +5547,20 @@ impl Node {
                 continue;
             }
             let (txn, execute_at, mut events) = (cmd.txn, cmd.execute_at, cmd.events.clone());
+            // Journaled first (#331): once recorded here, a report of this node
+            // may count it as applied, and a peer compact it away on that
+            // report. A restart that forgot it would restore only what the
+            // journal held of it — nothing, or a Commit — and a command
+            // waiting on it would wait for good. Staged ahead of the store,
+            // as a local apply is, and only staged: a report flushes the
+            // journal before it leaves (`vouch_durably`).
+            let mut applied = cmd.clone();
+            applied.status = Status::Applied;
+            if let Err(err) = self.journal.stage(&applied).await {
+                tracing::warn!(node = self.id.0, ?txn, %err, "cannot journal an import");
+                apply_failed = true;
+                break;
+            }
             // Shipped with the provisional stamps; applied with the agreed
             // ones, exactly as the contact applied them.
             stamp_events(execute_at, &mut events);
@@ -6320,6 +6368,30 @@ impl Node {
         self.bound_clock_past(self.clock.reading_micros())
             .await
             .is_ok()
+    }
+
+    /// Readies a report this node sends on its own — not with a handled
+    /// batch, whose journal is flushed before its sends — for a peer to
+    /// compact on: [`bound_clock`](Self::bound_clock), and the journal
+    /// flushed, so everything the report counts as applied (an anti-entropy
+    /// import, or a commit applied since the last batch) is held across a
+    /// restart (#331). A peer that compacted past it would otherwise ship it
+    /// no more, and this node, restarted without it, could wait on it for
+    /// good.
+    async fn vouch_durably(&self) -> bool {
+        if !self.bound_clock().await {
+            return false;
+        }
+        match self.journal.flush().await {
+            Ok(()) => {
+                self.metrics.record_flush();
+                true
+            }
+            Err(err) => {
+                tracing::warn!(node = self.id.0, %err, "journal flush failed; withholding a report");
+                false
+            }
+        }
     }
 
     /// Stops this node minting, for good: its host closed it, and the node

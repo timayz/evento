@@ -4809,3 +4809,91 @@ async fn a_replica_recovers_a_dependency_it_never_witnessed() {
         sim.nodes[2].command_status(u)
     );
 }
+
+// ---------------------------------------------------------------------------
+// Durable imports (#331): a node's reports vouch for what it imported, so a
+// restart must not forget it.
+// ---------------------------------------------------------------------------
+
+/// `T` commits everywhere with `D` among its dependencies; `D`, an orphan
+/// node 0 alone pre-accepted, is invalidated. Node 2, cut off meanwhile,
+/// later imports both from anti-entropy — `D` invalidated, `T` applied — and
+/// its reports let nodes 0 and 1 compact them away. It restarts, keeping its
+/// store or over an empty one. Its journal must still hold what it imported:
+/// otherwise it restores `T` only as committed, from the Commit it
+/// journaled, and waits for good on `D`, which no one holds any more — and
+/// over an empty store, `T`'s write is lost, and no peer can ship it back.
+/// Its journal is not truncated meanwhile (a crash within
+/// `truncate_interval`), and nothing recovers on its own
+/// (`recovery_timeout`), so the import is the only way in.
+#[tokio::test(start_paused = true)]
+async fn a_restart_keeps_what_anti_entropy_imported() {
+    for mode in [Restart::KeepStore, Restart::EmptyStore] {
+        restart_after_an_import(mode).await;
+    }
+}
+
+async fn restart_after_an_import(mode: Restart) {
+    let config = NodeConfig {
+        recovery_timeout: Duration::from_secs(3600),
+        truncate_interval: Duration::from_secs(3600),
+        ..NodeConfig::default()
+    };
+    let mut sim = Sim::build_with_config(3, config);
+    let _coordinator = sim.net.register(ORPHAN_COORDINATOR);
+    let d = orphan_vote(&sim.net, sim.base, 0, event("acc", 1, 1), 0).await;
+    let t = TxnId(Timestamp {
+        micros: d.0.micros + 1_000,
+        logical: 0,
+        node: ORPHAN_COORDINATOR,
+    });
+    let sink = sim.net.sink(ORPHAN_COORDINATOR);
+    for to in [0, 1, 2] {
+        let commit = Message::Commit {
+            txn: t,
+            execute_at: t.0,
+            deps: vec![d],
+            keys: vec![Key("acc".into())],
+            events: vec![event("acc", 1, 2)],
+            reply_to: ORPHAN_COORDINATOR,
+        };
+        sink.send(NodeId(to), commit).await.unwrap();
+    }
+    // Past the margin, nodes 1 and 2 are fenced for D: it is invalidated.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let outcome = sim.nodes[0].recover(d).await.expect("D decided");
+    assert!(outcome.conflict, "D invalidated");
+
+    // T applies on nodes 0 and 1 while node 2 is cut off.
+    sim.net.partition(NodeId(0), NodeId(2));
+    sim.net.partition(NodeId(1), NodeId(2));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let outcome = sim.nodes[0].recover(t).await.expect("T decided");
+    assert!(!outcome.conflict, "T committed");
+    sim.net.heal_all_partitions();
+
+    // Node 2 imports both; its reports let nodes 0 and 1 compact them away.
+    await_compacted(&sim, &[0, 1], "behind node 2's import").await;
+    assert_eq!(
+        version_of(&sim.stores[2], "acc").await,
+        1,
+        "node 2 imported T"
+    );
+
+    sim.restart_as(2, config, mode).await;
+    await_compacted(
+        &sim,
+        &[0, 1, 2],
+        &format!("after node 2's restart ({mode:?})"),
+    )
+    .await;
+    sim.nodes[2]
+        .read_barrier(Key("acc".into()))
+        .await
+        .expect("node 2 serves reads");
+    assert_eq!(
+        version_of(&sim.stores[2], "acc").await,
+        1,
+        "node 2 lost T's write ({mode:?})"
+    );
+}

@@ -199,13 +199,15 @@ impl Journal for FaultJournal {
         // A flusher arriving during another's fsync waits for it: it returns
         // only once everything staged before it is durable.
         let _guard = self.flush_lock.lock().await;
+        // Nothing staged, nothing to fsync: as a real journal, an empty flush
+        // returns at once, and never fails.
+        if self.pending.lock().unwrap().is_empty() {
+            return Ok(());
+        }
         if self.failing.load(Ordering::SeqCst) || self.draw(|f| f.flush) {
             anyhow::bail!("simulated fsync failure");
         }
         let batch = std::mem::take(&mut *self.pending.lock().unwrap());
-        if batch.is_empty() {
-            return Ok(());
-        }
         let delay = *self.fsync_delay.lock().unwrap();
         if !delay.is_zero() {
             // A crash meanwhile (the node's tasks aborted) drops this future,

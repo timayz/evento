@@ -482,8 +482,8 @@ backend (sql/fjall). Phases, in order:
   executor, come back **behind** it, having lost writes it had not persisted.
   That reproduced #309 deterministically, and showed what it is: a **split
   decision**. A replica whose kept store already held a transaction's own events
-  — its apply forgotten across a restart, or brought by an import, which is not
-  journaled — read that write as a version conflict, and recovery ANDed that read
+  — its apply forgotten across a restart, or brought by an import, which was not
+  journaled then (it is since #331) — read that write as a version conflict, and recovery ANDed that read
   with the applied replicas' "commit": the replicas yet to apply it enacted an
   abort the others had committed, and the aborting store froze, every later event
   past the gap swallowed as "already present". Now recovery adopts the decision an
@@ -669,7 +669,20 @@ backend (sql/fjall). Phases, in order:
   or restarted replica re-proves coverage it reports `MIN`, holding cluster
   compaction back (`accord_watermark_clamps_total` counts this), which keeps the
   missing commands exportable and truncating always safe (regression:
-  `partitioned_minority_cannot_unblock_compaction_and_diverge`). **The vote fence**
+  `partitioned_minority_cannot_unblock_compaction_and_diverge`). **Durable
+  reports** (#331): a peer may compact past what a report vouches for, and ship it
+  no more, so the reporting node must hold it across a restart too. Everything a
+  report can count as applied is journaled first: an anti-entropy import is staged
+  before it is recorded (unjournaled, a restart restored only the Commit a command
+  had been journaled with, and the command waited for good on a dependency the
+  node had imported and its peers had since compacted); a local apply's record is
+  staged ahead of its store apply, so the store and the in-memory mark stay
+  adjacent (a record ahead of a failed apply is only replayed into the store on a
+  restart, as any applied record is); and a report the node sends on its own —
+  the periodic watermark, a report answering `Rejoin`, a joiner's first report —
+  flushes the journal before it leaves (`Node::vouch_durably`). A reply to a
+  handled batch already waits for the batch's flush
+  (`a_restart_keeps_what_anti_entropy_imported`). **The vote fence**
   (#310): a report — and the floor and coverage built on it — stays true only if
   the replica never votes below it later. Without that, a transaction only R holds
   is compacted past by P, which gave R up; Q, whose floor lags, pre-accepts it on
