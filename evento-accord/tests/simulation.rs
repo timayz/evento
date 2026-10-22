@@ -3,8 +3,9 @@
 //! A seeded fault-injection harness that runs a chaotic workload against a
 //! cluster and then checks correctness oracles. The scenario (workload + fault
 //! schedule) is derived from a seed; faults are crash/heal, network partitions,
-//! and node restarts. A pass validates the harness and the oracles, and any
-//! failure is a real bug.
+//! and node restarts — and, per message, drops, duplicates and delays that
+//! reorder a link, with one-way cuts in the partition plan ([`Faults`]). A pass
+//! validates the harness and the oracles, and any failure is a real bug.
 //!
 //! **Deterministic runtime.** The tests run under `#[tokio::test(start_paused =
 //! true)]`: a single-threaded runtime with *virtual* time that advances only
@@ -39,8 +40,8 @@ use std::time::Duration;
 
 use evento_accord::{
     DataStore, DynamicTopology, HybridLogicalClock, InMemoryDataStore, InMemoryJournal,
-    InMemoryNetwork, Journal, Key, Message, MessageSink, Node, NodeConfig, NodeId, StaticTopology,
-    Topology, TraceEntry,
+    InMemoryNetwork, Journal, Key, Message, MessageFaults, MessageSink, Node, NodeConfig, NodeId,
+    StaticTopology, Topology, TraceEntry,
 };
 use evento_core::metadata::Metadata;
 use evento_core::Event;
@@ -89,6 +90,46 @@ thread_local! {
 struct RunTrace {
     hash: u64,
     steps: Vec<TraceEntry>,
+}
+
+/// The faults a seeded scenario injects on top of its crash, partition or
+/// restart plan (#315). Off by default, so the existing seeds replay as they
+/// always have.
+#[derive(Clone, Copy, Default)]
+struct Faults {
+    /// Per-message drop, duplication and delay.
+    messages: Option<MessageFaults>,
+    /// Whether the partition plan also severs single directions.
+    one_way: bool,
+}
+
+/// A few percent of messages lost or doubled, and every message held back up
+/// to 30 ms: below `fast_timeout` (50 ms), so some fast paths miss and the
+/// slow path and recovery run, without starving the workload.
+const MESSAGE_FAULTS: MessageFaults = MessageFaults {
+    drop: 0.03,
+    duplicate: 0.03,
+    max_delay: Duration::from_millis(30),
+};
+
+/// Salts that derive each fault generator from the scenario seed, so turning
+/// one on never shifts the draws of the plan, or of another.
+const MESSAGE_SALT: u64 = 0x6d65_7373_6167_6573;
+const ONE_WAY_SALT: u64 = 0x6f6e_652d_7761_7973;
+
+impl Faults {
+    /// Message faults at [`MESSAGE_FAULTS`], and one-way cuts.
+    const ALL: Faults = Faults {
+        messages: Some(MESSAGE_FAULTS),
+        one_way: true,
+    };
+
+    /// Turns the message faults on in `sim`, drawn from `seed`.
+    fn arm(&self, sim: &Sim, seed: u64) {
+        if let Some(faults) = self.messages {
+            sim.net.set_message_faults(seed ^ MESSAGE_SALT, faults);
+        }
+    }
 }
 
 struct Sim {
@@ -551,7 +592,7 @@ struct Adversarial {
 /// crash and heal — so coordinators themselves fail mid-write. Safety must hold,
 /// and the cluster must converge after healing (via automatic recovery +
 /// anti-entropy repair).
-async fn run_adversarial(seed: u64) -> Adversarial {
+async fn run_adversarial(seed: u64, faults: Faults) -> Adversarial {
     const N: u64 = 5;
     const AGGS: usize = 4;
     const WRITERS: usize = 5;
@@ -559,6 +600,7 @@ async fn run_adversarial(seed: u64) -> Adversarial {
     const MAX_DOWN: usize = 2; // keep a quorum (3 of 5) alive
 
     let sim = Sim::build(N);
+    faults.arm(&sim, seed);
     let history: History = Arc::new(Mutex::new(Vec::new()));
 
     let mut rng = StdRng::seed_from_u64(seed);
@@ -627,6 +669,7 @@ async fn run_adversarial(seed: u64) -> Adversarial {
     for id in 0..N {
         sim.net.heal(NodeId(id));
     }
+    sim.net.clear_message_faults();
     let converged = converge(&sim.stores).await;
 
     let records = history.lock().unwrap().clone();
@@ -672,7 +715,7 @@ fn safety_violation(sim: &Sim, history: &[WriteRecord]) -> Option<String> {
 async fn adversarial_safety_holds_and_measures_convergence() {
     const TOTAL: u64 = 20;
     for seed in 0..TOTAL {
-        let result = run_adversarial(seed).await;
+        let result = run_adversarial(seed, Faults::default()).await;
         if let Some(v) = result.safety {
             panic!("SAFETY VIOLATION at seed {seed}: {v}");
         }
@@ -694,7 +737,7 @@ const MINORITY: [usize; 2] = [3, 4];
 /// healed. Writers coordinate only through the majority so the scenario tests
 /// whether a stranded minority can cause split-brain or phantom commits — it must
 /// not. Safety must hold throughout, and the cluster must converge after healing.
-async fn run_partition(seed: u64, electorate: Option<Vec<NodeId>>) -> Adversarial {
+async fn run_partition(seed: u64, electorate: Option<Vec<NodeId>>, faults: Faults) -> Adversarial {
     const N: u64 = 5;
     const AGGS: usize = 4;
     const WRITERS: usize = 5;
@@ -704,6 +747,7 @@ async fn run_partition(seed: u64, electorate: Option<Vec<NodeId>>) -> Adversaria
         Some(e) => Sim::build_with_electorate(N, e),
         None => Sim::build(N),
     };
+    faults.arm(&sim, seed);
     let history: History = Arc::new(Mutex::new(Vec::new()));
 
     let mut rng = StdRng::seed_from_u64(seed);
@@ -724,18 +768,34 @@ async fn run_partition(seed: u64, electorate: Option<Vec<NodeId>>) -> Adversaria
     let partition_plan: Vec<(u64, bool)> = (0..16)
         .map(|_| (rng.random_range(2..25), rng.random_bool(0.5)))
         .collect();
+    // With one-way faults, each cut severs both directions, only majority →
+    // minority, or only minority → majority — drawn from its own generator,
+    // so the plan above is unchanged.
+    let mut directions = StdRng::seed_from_u64(seed ^ ONE_WAY_SALT);
+    let directions: Vec<u8> = partition_plan
+        .iter()
+        .map(|_| {
+            if faults.one_way {
+                directions.random_range(0..3)
+            } else {
+                0
+            }
+        })
+        .collect();
 
     // Fault task: toggle the partition between {0,1,2} and {3,4}.
     let net = Arc::clone(&sim.net);
     let fault_task = tokio::spawn(async move {
-        for (delay, cut) in partition_plan {
+        for ((delay, cut), direction) in partition_plan.into_iter().zip(directions) {
             tokio::time::sleep(Duration::from_millis(delay)).await;
             for &a in &MAJORITY {
                 for &b in &MINORITY {
-                    if cut {
-                        net.partition(NodeId(a as u64), NodeId(b as u64));
-                    } else {
-                        net.heal_partition(NodeId(a as u64), NodeId(b as u64));
+                    let (a, b) = (NodeId(a as u64), NodeId(b as u64));
+                    match (cut, direction) {
+                        (false, _) => net.heal_partition(a, b),
+                        (true, 1) => net.cut(a, b),
+                        (true, 2) => net.cut(b, a),
+                        (true, _) => net.partition(a, b),
                     }
                 }
             }
@@ -777,6 +837,7 @@ async fn run_partition(seed: u64, electorate: Option<Vec<NodeId>>) -> Adversaria
     let _ = fault_task.await;
 
     sim.net.heal_all_partitions();
+    sim.net.clear_message_faults();
     let converged = converge(&sim.stores).await;
 
     let records = history.lock().unwrap().clone();
@@ -818,7 +879,7 @@ async fn minority_never_ahead(sim: &Sim, history: &[WriteRecord]) -> Option<Stri
 async fn safety_holds_under_partitions() {
     const TOTAL: u64 = 20;
     for seed in 0..TOTAL {
-        let result = run_partition(seed, None).await;
+        let result = run_partition(seed, None, Faults::default()).await;
         if let Some(v) = result.safety {
             panic!("SAFETY VIOLATION (partition) at seed {seed}: {v}");
         }
@@ -839,7 +900,7 @@ async fn safety_holds_under_partitions_with_a_shrunk_electorate() {
     const TOTAL: u64 = 20;
     let electorate = vec![NodeId(0), NodeId(1), NodeId(2)];
     for seed in 0..TOTAL {
-        let result = run_partition(seed, Some(electorate.clone())).await;
+        let result = run_partition(seed, Some(electorate.clone()), Faults::default()).await;
         if let Some(v) = result.safety {
             panic!("SAFETY VIOLATION (partition+electorate) at seed {seed}: {v}");
         }
@@ -861,13 +922,14 @@ async fn safety_holds_under_partitions_with_a_shrunk_electorate() {
 /// clone for the run, and restarting a node replaces its inbox — so coordinating
 /// through a just-restarted node would route replies to the new inbox and hang
 /// the old clone's write. Keeping coordinators stable sidesteps that hazard.
-async fn run_with_restarts(seed: u64) -> Adversarial {
+async fn run_with_restarts(seed: u64, faults: Faults) -> Adversarial {
     const N: u64 = 5;
     const AGGS: usize = 4;
     const WRITERS: usize = 5;
     const WRITES_EACH: usize = 12;
 
     let mut sim = Sim::build(N);
+    faults.arm(&sim, seed);
     let history: History = Arc::new(Mutex::new(Vec::new()));
 
     let mut rng = StdRng::seed_from_u64(seed);
@@ -934,6 +996,7 @@ async fn run_with_restarts(seed: u64) -> Adversarial {
         let _ = w.await;
     }
 
+    sim.net.clear_message_faults();
     let converged = converge(&sim.stores).await;
 
     let records = history.lock().unwrap().clone();
@@ -948,13 +1011,66 @@ async fn run_with_restarts(seed: u64) -> Adversarial {
 async fn safety_holds_under_restarts() {
     const TOTAL: u64 = 20;
     for seed in 0..TOTAL {
-        let result = run_with_restarts(seed).await;
+        let result = run_with_restarts(seed, Faults::default()).await;
         if let Some(v) = result.safety {
             panic!("SAFETY VIOLATION (restart) at seed {seed}: {v}");
         }
         assert!(
             result.converged,
             "seed {seed}: cluster failed to converge after restarts"
+        );
+    }
+}
+
+/// The adversarial, partition and restart scenarios once more, over links that
+/// lose, duplicate and reorder messages, with one-way cuts in the partition
+/// plan (#315): the paths whole-node faults barely reach — a late or doubled
+/// PreAccept, Accept, Commit or Apply, a reply arriving after its ballot moved
+/// on, a recovery racing a slow original coordinator. The same oracles hold.
+#[tokio::test(start_paused = true)]
+async fn adversarial_safety_holds_under_message_faults() {
+    for seed in 0..20 {
+        let result = run_adversarial(seed, Faults::ALL).await;
+        if let Some(v) = result.safety {
+            panic!("SAFETY VIOLATION (adversarial +faults) at seed {seed}: {v}");
+        }
+        assert!(
+            result.converged,
+            "seed {seed}: cluster failed to converge after healing (message faults)"
+        );
+    }
+}
+
+/// [`adversarial_safety_holds_under_message_faults`] for the partition
+/// scenario, under both electorates.
+#[tokio::test(start_paused = true)]
+async fn safety_holds_under_partitions_and_message_faults() {
+    let electorate = vec![NodeId(0), NodeId(1), NodeId(2)];
+    for seed in 0..20 {
+        for (label, e) in [("", None), ("+electorate", Some(electorate.clone()))] {
+            let result = run_partition(seed, e, Faults::ALL).await;
+            if let Some(v) = result.safety {
+                panic!("SAFETY VIOLATION (partition{label} +faults) at seed {seed}: {v}");
+            }
+            assert!(
+                result.converged,
+                "seed {seed}: cluster failed to converge after partition heal ({label} faults)"
+            );
+        }
+    }
+}
+
+/// [`adversarial_safety_holds_under_message_faults`] for the restart scenario.
+#[tokio::test(start_paused = true)]
+async fn safety_holds_under_restarts_and_message_faults() {
+    for seed in 0..20 {
+        let result = run_with_restarts(seed, Faults::ALL).await;
+        if let Some(v) = result.safety {
+            panic!("SAFETY VIOLATION (restart +faults) at seed {seed}: {v}");
+        }
+        assert!(
+            result.converged,
+            "seed {seed}: cluster failed to converge after restarts (message faults)"
         );
     }
 }
@@ -1109,23 +1225,25 @@ async fn every_scenario_kind_replays_its_trace() {
             run_scenario(s).await.expect("replica churn oracles")
         })
         .await;
-        assert_replays("adversarial", seed, |s| async move {
-            run_adversarial(s).await.trace
-        })
-        .await;
-        assert_replays("partition", seed, |s| async move {
-            run_partition(s, None).await.trace
-        })
-        .await;
-        assert_replays("partition+electorate", seed, |s| {
-            let electorate = electorate.clone();
-            async move { run_partition(s, Some(electorate)).await.trace }
-        })
-        .await;
-        assert_replays("restarts", seed, |s| async move {
-            run_with_restarts(s).await.trace
-        })
-        .await;
+        for (label, faults) in [("", Faults::default()), (" +faults", Faults::ALL)] {
+            assert_replays(&format!("adversarial{label}"), seed, |s| async move {
+                run_adversarial(s, faults).await.trace
+            })
+            .await;
+            assert_replays(&format!("partition{label}"), seed, |s| async move {
+                run_partition(s, None, faults).await.trace
+            })
+            .await;
+            assert_replays(&format!("partition+electorate{label}"), seed, |s| {
+                let electorate = electorate.clone();
+                async move { run_partition(s, Some(electorate), faults).await.trace }
+            })
+            .await;
+            assert_replays(&format!("restarts{label}"), seed, |s| async move {
+                run_with_restarts(s, faults).await.trace
+            })
+            .await;
+        }
         assert_replays("probe", seed, |s| async move { run_probe(s).await.trace }).await;
         assert_replays("bounded", seed, |s| async move {
             run_bounded(s).await.expect("bound oracle")
@@ -1944,27 +2062,40 @@ async fn sweep_for_bugs() {
         if let Err(v) = run_scenario(seed).await {
             panic!("chaos seed {seed}: {v}");
         }
-        // Full chaos + convergence measurement.
-        let a = run_adversarial(seed).await;
-        assert!(
-            a.safety.is_none(),
-            "adversarial seed {seed}: {:?}",
-            a.safety
-        );
-        assert!(a.converged, "adversarial seed {seed}: did not converge");
-        // Partitions — default electorate and the shrunk {0,1,2} electorate.
-        for (label, e) in [
-            ("partition", None),
-            ("partition+electorate", Some(electorate.clone())),
-        ] {
-            let p = run_partition(seed, e).await;
-            assert!(p.safety.is_none(), "{label} seed {seed}: {:?}", p.safety);
-            assert!(p.converged, "{label} seed {seed}: did not converge");
+        // Full chaos, partitions (default and shrunk {0,1,2} electorate) and
+        // restarts — each also over lossy, duplicating, reordering links with
+        // one-way cuts.
+        for (label, faults) in [("", Faults::default()), (" +faults", Faults::ALL)] {
+            let a = run_adversarial(seed, faults).await;
+            assert!(
+                a.safety.is_none(),
+                "adversarial{label} seed {seed}: {:?}",
+                a.safety
+            );
+            assert!(
+                a.converged,
+                "adversarial{label} seed {seed}: did not converge"
+            );
+            for (kind, e) in [
+                ("partition", None),
+                ("partition+electorate", Some(electorate.clone())),
+            ] {
+                let p = run_partition(seed, e, faults).await;
+                assert!(
+                    p.safety.is_none(),
+                    "{kind}{label} seed {seed}: {:?}",
+                    p.safety
+                );
+                assert!(p.converged, "{kind}{label} seed {seed}: did not converge");
+            }
+            let r = run_with_restarts(seed, faults).await;
+            assert!(
+                r.safety.is_none(),
+                "restarts{label} seed {seed}: {:?}",
+                r.safety
+            );
+            assert!(r.converged, "restarts{label} seed {seed}: did not converge");
         }
-        // Restarts from the durable journal mid-workload.
-        let r = run_with_restarts(seed).await;
-        assert!(r.safety.is_none(), "restarts seed {seed}: {:?}", r.safety);
-        assert!(r.converged, "restarts seed {seed}: did not converge");
         // Compaction boundedness + clock skew.
         if let Err(v) = run_bounded(seed).await {
             panic!("bounded seed {seed}: {v}");

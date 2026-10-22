@@ -23,7 +23,7 @@ use evento_core::{
     cursor::{Args, Edge, ReadResult, Value},
     Event, EventFilter, RoutingKey,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant};
 
@@ -532,6 +532,52 @@ enum Verdict {
 /// responses `(responder, message)`.
 type Pending = Arc<Mutex<HashMap<TxnId, mpsc::UnboundedSender<(NodeId, Message)>>>>;
 
+/// Signals that local applied state advanced: an apply, an invalidation, or
+/// an anti-entropy import. A [`Notify`] rather than a `watch` channel: a
+/// `watch` parks each waiter on one of several internal notifiers picked by
+/// tokio's unseeded RNG, so waiters woken by one apply would resume in a
+/// random order — several writes waiting on one coordinator would then
+/// complete in a different order run to run, and the deterministic
+/// simulation could no longer replay a seed.
+#[derive(Default)]
+struct AppliedSignal {
+    generation: AtomicU64,
+    notify: Notify,
+}
+
+impl AppliedSignal {
+    /// Records an advance and wakes every waiter, in a fixed order.
+    fn bump(&self) {
+        self.generation.fetch_add(1, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    /// How many advances there have been.
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Waits until `ready` holds, re-checking it after every advance, or
+    /// until `deadline`. Returns whether it held.
+    async fn wait_until(&self, deadline: Instant, mut ready: impl FnMut() -> bool) -> bool {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            // Registered before the check, so an advance between the check
+            // and the wait still wakes this waiter.
+            notified.as_mut().enable();
+            if ready() {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let _ = tokio::time::timeout(deadline - now, notified).await;
+        }
+    }
+}
+
 /// An acceptor's single-decree-Paxos state for one config epoch.
 #[derive(Clone)]
 struct ConfigAcceptor {
@@ -749,9 +795,9 @@ pub struct Node {
     /// (`GroupHost::open_joining`).
     rejoin_required: Arc<tokio::sync::watch::Sender<bool>>,
     /// Bumped whenever local applied state advances (an apply or an
-    /// anti-entropy import). Waiters (`read_barrier`, read-your-writes) select
+    /// anti-entropy import). Waiters (`read_barrier`, read-your-writes) wait
     /// on it instead of polling the replica lock every millisecond.
-    applied_gen: Arc<tokio::sync::watch::Sender<u64>>,
+    applied: Arc<AppliedSignal>,
     /// When the last anti-entropy round ran, pacing it on
     /// [`NodeConfig::anti_entropy_interval`] independent of the recovery sweep.
     last_anti_entropy: Arc<Mutex<Option<Instant>>>,
@@ -809,7 +855,7 @@ impl Node {
             started_at: Instant::now(),
             absent: Arc::new(Mutex::new(HashMap::new())),
             rejoin_required: Arc::new(tokio::sync::watch::channel(false).0),
-            applied_gen: Arc::new(tokio::sync::watch::channel(0).0),
+            applied: Arc::new(AppliedSignal::default()),
             last_anti_entropy: Arc::new(Mutex::new(None)),
             metrics: Arc::new(Metrics::new()),
             settings: NodeConfig::default(),
@@ -1066,7 +1112,7 @@ impl Node {
             || !self.pending.lock().expect("pending poisoned").is_empty();
         SweepPressure {
             busy,
-            activity: *self.applied_gen.borrow(),
+            activity: self.applied.generation(),
         }
     }
 
@@ -2399,7 +2445,7 @@ impl Node {
                     .invalidate(txn);
                 if invalidated {
                     tracing::debug!(node = self.id.0, ?txn, "invalidated a transaction");
-                    self.applied_gen.send_modify(|v| *v += 1);
+                    self.applied.bump();
                     // No reply rides on it; the next stage of `txn` retries.
                     self.journal_stage(txn).await;
                     // Its dependents may be free to execute now.
@@ -2965,7 +3011,7 @@ impl Node {
                     .mark_applied(apply.txn, !apply.commit);
                 // Wake read barriers / read-your-writes waiters instead of
                 // letting them poll the replica lock.
-                self.applied_gen.send_modify(|v| *v += 1);
+                self.applied.bump();
                 // An apply the journal did not take is not acknowledged; a
                 // restart re-applies it (idempotently) from its commit.
                 if self.journal_stage(apply.txn).await {
@@ -3270,29 +3316,22 @@ impl Node {
         // dependency's timestamp, so a "orders after the read" escape computed
         // from probe data can skip a write that committed before the read
         // began — a real stale read observed under contention + churn.
+        // Woken by every apply (local or imported); the deadline only bounds
+        // a genuinely stuck dependency.
         let deadline = Self::after(self.settings.collect_timeout);
-        let mut applied_rx = self.applied_gen.subscribe();
-        loop {
-            if self
-                .replica
-                .lock()
-                .expect("replica poisoned")
-                .deps_applied(&deps)
-            {
-                return Ok(());
-            }
-            let now = Instant::now();
-            if now >= deadline {
-                anyhow::bail!("read barrier timed out: {} deps unapplied", deps.len());
-            }
-            // Woken by the next apply (local or imported); the timeout arm only
-            // bounds a genuinely stuck dependency.
-            if let Ok(Err(_)) = tokio::time::timeout(deadline - now, applied_rx.changed()).await {
-                // Sender dropped (cannot happen while `self` lives) — degrade
-                // to a bounded poll rather than busy-looping.
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
+        let applied = self
+            .applied
+            .wait_until(deadline, || {
+                self.replica
+                    .lock()
+                    .expect("replica poisoned")
+                    .deps_applied(&deps)
+            })
+            .await;
+        if !applied {
+            anyhow::bail!("read barrier timed out: {} deps unapplied", deps.len());
         }
+        Ok(())
     }
 
     /// The shared PreAccept → (Accept) → Commit → Read → Apply coordination for a
@@ -3611,25 +3650,15 @@ impl Node {
         // own local apply so a subsequent read on this node sees the write.
         if union.contains(&self.id) {
             let deadline = Self::after(self.settings.collect_timeout);
-            let mut applied_rx = self.applied_gen.subscribe();
-            while self
-                .replica
-                .lock()
-                .expect("replica poisoned")
-                .applied_result(txn)
-                .is_none()
-            {
-                let now = Instant::now();
-                if now >= deadline {
-                    break;
-                }
-                // Woken by the next apply instead of polling the replica lock
-                // every millisecond.
-                if let Ok(Err(_)) = tokio::time::timeout(deadline - now, applied_rx.changed()).await
-                {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                }
-            }
+            self.applied
+                .wait_until(deadline, || {
+                    self.replica
+                        .lock()
+                        .expect("replica poisoned")
+                        .applied_result(txn)
+                        .is_some()
+                })
+                .await;
         }
 
         Ok(!commit)
@@ -3706,19 +3735,19 @@ impl Node {
             }
         }
         let deadline = Self::after(self.settings.collect_timeout);
-        let mut applied_rx = self.applied_gen.subscribe();
-        loop {
-            if let Some(conflict) = self.local_outcome(txn) {
+        let mut outcome = None;
+        self.applied
+            .wait_until(deadline, || {
+                outcome = self.local_outcome(txn);
+                outcome.is_some()
+            })
+            .await;
+        match outcome {
+            Some(conflict) => {
                 tracing::debug!(node = self.id.0, ?txn, error = %failure, "write settled by another node");
-                return Ok(CommitOutcome { txn, conflict });
+                Ok(CommitOutcome { txn, conflict })
             }
-            let now = Instant::now();
-            if now >= deadline {
-                return Err(failure);
-            }
-            if let Ok(Err(_)) = tokio::time::timeout(deadline - now, applied_rx.changed()).await {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
+            None => Err(failure),
         }
     }
 
@@ -5246,7 +5275,7 @@ impl Node {
 
         if imported.commands > 0 || imported.events > 0 {
             // Imported applies advance local applied state too.
-            self.applied_gen.send_modify(|v| *v += 1);
+            self.applied.bump();
         }
 
         Ok(imported)

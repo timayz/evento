@@ -61,5 +61,6 @@ pub use tcp::{
     TlsClient, UnroutedHandler,
 };
 pub use transport::{
-    Envelope, GroupId, InMemoryNetwork, InMemorySink, MessageFate, MessageFilter, TraceEntry,
+    Envelope, GroupId, InMemoryNetwork, InMemorySink, MessageFate, MessageFaults, MessageFilter,
+    TraceEntry,
 };

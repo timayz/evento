@@ -465,7 +465,14 @@ backend (sql/fjall). Phases, in order:
   minority must never invent a phantom commit, checked by a `minority_never_ahead`
   oracle); and **node restarts** (minority nodes are torn down and rebuilt from
   their durable journal mid-workload, so a restart must never resurrect a stale
-  commit and recovery + anti-entropy must catch the node back up). Across all
+  commit and recovery + anti-entropy must catch the node back up). The chaos,
+  partition and restart scenarios also run over **lossy links** (#315): the
+  in-memory network drops, duplicates and delays individual messages from a
+  seeded generator of its own (`InMemoryNetwork::set_message_faults`), so
+  messages on a link overtake each other, and the partition plan also cuts
+  single directions (`InMemoryNetwork::cut`). That reaches the paths whole-node
+  faults barely touch — a late or doubled PreAccept, Accept, Commit or Apply, a
+  reply after its ballot moved on, a recovery racing a slow coordinator. Across all
   seeds, **safety holds** — no split-brain, no double-commit — and after healing
   the cluster **converges**. The harness already paid off: it found two real gaps
   (non-convergence from stalled transactions and from missed transactions), both
@@ -486,6 +493,11 @@ backend (sql/fjall). Phases, in order:
   hash order, a multi-shard retry took the first Nack in hash order, and the
   sim's events carried random metadata ids — and planting either kind back (a
   random payload, a hash-ordered broadcast) fails the check at its first step.
+  The message faults of #315 then surfaced one more, inside tokio: a `watch`
+  channel parks each waiter on one of eight notifiers picked by an unseeded RNG,
+  so writes waiting on one coordinator's applied state resumed in a random
+  order; that signal is now a `Notify`, which wakes its waiters in a fixed
+  order.
   Virtual time also made the suite ~85×
   faster (no real sleeping). *Possible future step:* `madsim` for a contractually
   guaranteed deterministic scheduler + simulated network, if the in-process
