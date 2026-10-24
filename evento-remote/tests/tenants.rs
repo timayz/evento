@@ -1,7 +1,8 @@
 //! Tenants over one shared store: the host application's resolver maps each
 //! token to a tenant and serves the connection in it (`Session::tenant`), and
 //! a client — whatever it sends — reaches nothing of another tenant's events
-//! or snapshots, while its own code stays tenant-agnostic.
+//! or snapshots, while its own code stays tenant-agnostic: it reads its events
+//! in the default tenant, as from a store of its own.
 
 use std::sync::{Arc, Mutex};
 
@@ -97,13 +98,13 @@ async fn a_client_reaches_only_its_own_tenant() {
         "the store holds both tenants' streams"
     );
 
-    // Whatever a asks for, it reads its own stream.
+    // Whatever a asks for, it reads its own stream, in the default tenant.
     for asked in [
         TenantFilter::All,
         TenantFilter::Only("b".to_owned()),
         TenantFilter::Only(String::new()),
     ] {
-        assert_eq!(read(&a, "acc", asked).await, [("a".to_owned(), 1)]);
+        assert_eq!(read(&a, "acc", asked).await, [(String::new(), 1)]);
     }
     assert_eq!(
         a.latest_version("b".to_owned(), AGGREGATE.to_owned(), "acc".to_owned())
@@ -219,6 +220,11 @@ async fn on_account_opened<E: Executor>(
     context: &Context<'_, E>,
     event: Typed<AccountOpened>,
 ) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        event.tenant.is_empty(),
+        "a tenant session reads its events in the default tenant, not {:?}",
+        event.tenant
+    );
     let opened = context.extract::<Opened>();
     opened.0.lock().unwrap().push(event.aggregate_id.clone());
     Ok(())
@@ -240,8 +246,9 @@ async fn open_account<E: Executor>(executor: E, owner: &str) -> String {
 /// A tenant application follows the shared store through a `Sidecar` — the
 /// remote client as its events source, its own store for everything else —
 /// over a session the server serves in its tenant. Its code names no tenant:
-/// it reads, loads and subscribes to its tenant's events only, its writes
-/// land in its tenant, and its cursors and snapshots stay in its own store.
+/// it reads, loads and subscribes to its tenant's events only — in the
+/// default tenant — its writes land in its tenant, and its cursors and
+/// snapshots stay in its own store.
 #[tokio::test]
 async fn a_sidecar_follows_only_its_tenant() {
     let store = Fjall::temporary().unwrap();
