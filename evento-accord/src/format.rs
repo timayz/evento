@@ -64,7 +64,10 @@ pub const MAGIC: [u8; 2] = *b"Ac";
 /// Current record format version. Bump on any breaking change to a tagged payload's
 /// layout (a new/reordered [`CommandState`](crate::message::CommandState) or
 /// [`Message`](crate::message::Message) field); add the matching decode branch then.
-pub const FORMAT_VERSION: u8 = 1;
+///
+/// 2: events carry their tenant. No reader for version 1: evento-accord has not
+/// been released, so a journal of it is wiped and the node re-bootstrapped.
+pub const FORMAT_VERSION: u8 = 2;
 
 /// Length of the fixed header: `MAGIC (2) + version (1) + kind (1)`.
 const HEADER_LEN: usize = 4;
@@ -179,6 +182,8 @@ pub fn decode_tagged<T: DeserializeOwned>(expected: RecordKind, bytes: &[u8]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::Timestamp;
+    use crate::message::CommandState;
 
     #[test]
     fn round_trips_each_kind() {
@@ -201,6 +206,49 @@ mod tests {
             assert_eq!(back, value);
             assert_eq!(peek_kind(&bytes), Some(kind));
         }
+    }
+
+    fn command(tenant: &str) -> CommandState {
+        use crate::clock::{Ballot, NodeId, TxnId};
+        use crate::message::{Key, Status};
+
+        let txn = TxnId(Timestamp {
+            micros: 7,
+            logical: 0,
+            node: NodeId(1),
+        });
+        CommandState {
+            txn,
+            status: Status::Applied,
+            promised: Ballot(txn.0),
+            accepted: Ballot(txn.0),
+            execute_at: txn.0,
+            deps: vec![],
+            keys: vec![Key::in_tenant(tenant, "acc")],
+            events: vec![evento_core::Event {
+                aggregate_type: "test/Account".into(),
+                aggregate_id: "acc".into(),
+                version: 1,
+                name: "Opened".into(),
+                tenant: tenant.into(),
+                data: vec![1, 2, 3],
+                ..Default::default()
+            }],
+            reply_to: NodeId(1),
+            decision: Some(false),
+            applied_conflict: Some(false),
+        }
+    }
+
+    /// A journaled command keeps its events' tenants.
+    #[test]
+    fn a_command_record_keeps_its_tenants() {
+        let state = command("acme");
+        let bytes = encode_tagged(RecordKind::Command, &state).unwrap();
+        let back: CommandState = decode_tagged(RecordKind::Command, &bytes).unwrap();
+        assert_eq!(back.events, state.events);
+        assert_eq!(back.events[0].tenant, "acme");
+        assert_eq!(back.keys, state.keys);
     }
 
     #[test]

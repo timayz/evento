@@ -267,8 +267,9 @@ impl SimStore {
         Arc::clone(&self.node) as Arc<dyn DataStore>
     }
 
-    /// Every `(type, id, version)` committed here and the id of its event.
-    fn committed_events(&self) -> Vec<((String, String, u16), ulid::Ulid)> {
+    /// Every `(tenant, type, id, version)` committed here and the id of its
+    /// event.
+    fn committed_events(&self) -> Vec<((String, String, String, u16), ulid::Ulid)> {
         match &self.backend {
             Backend::Memory(memory) => memory.committed_events(),
             Backend::Executor(executor) => executor.committed_events(),
@@ -280,8 +281,8 @@ impl SimStore {
         let mut events: Vec<(u16, u64)> = self
             .committed_events()
             .into_iter()
-            .filter(|((_, id, _), _)| id == agg)
-            .map(|((_, _, version), event)| (version, u128::from(event) as u64))
+            .filter(|((_, _, id, _), _)| id == agg)
+            .map(|((_, _, _, version), event)| (version, u128::from(event) as u64))
             .collect();
         events.sort_unstable();
         events.into_iter().map(|(_, id)| id).collect()
@@ -290,7 +291,7 @@ impl SimStore {
     /// The aggregate's version as the backend holds it, faults aside.
     async fn version(&self, aggregate_type: &str, aggregate_id: &str) -> anyhow::Result<u16> {
         match &self.backend {
-            Backend::Memory(memory) => memory.version(aggregate_type, aggregate_id).await,
+            Backend::Memory(memory) => memory.version("", aggregate_type, aggregate_id).await,
             Backend::Executor(executor) => Ok(executor.version_of(aggregate_type, aggregate_id)),
         }
     }
@@ -1066,11 +1067,11 @@ async fn run_scenario(seed: u64) -> Result<RunTrace, String> {
     Ok(sim.trace())
 }
 
-/// The set of `(type, id, version) -> event` commits at a store. Two replicas
+/// The set of `(tenant, type, id, version) -> event` commits at a store. Two replicas
 /// have converged when these sets are identical (the applied *log* length differs
 /// legitimately — it also records aborts, which vary per replica — so it is not a
 /// convergence signal; the committed set is).
-fn committed_set(store: &SimStore) -> BTreeSet<((String, String, u16), ulid::Ulid)> {
+fn committed_set(store: &SimStore) -> BTreeSet<((String, String, String, u16), ulid::Ulid)> {
     store.committed_events().into_iter().collect()
 }
 
@@ -1294,7 +1295,8 @@ fn safety_violation(sim: &Sim, history: &[WriteRecord]) -> Option<String> {
         ));
     }
     use std::collections::HashMap;
-    let mut by_version: HashMap<(String, String, u16), BTreeSet<ulid::Ulid>> = HashMap::new();
+    let mut by_version: HashMap<(String, String, String, u16), BTreeSet<ulid::Ulid>> =
+        HashMap::new();
     for store in &sim.stores {
         for (key, event_id) in store.committed_events() {
             by_version.entry(key).or_default().insert(event_id);
@@ -2149,9 +2151,9 @@ async fn a_store_that_lost_its_tail_catches_up() {
     }
 }
 
-/// One committed event in a fingerprint: its `(type, id, version)` key and the
-/// (deterministic) event id that committed it.
-type Commit = ((String, String, u16), u128);
+/// One committed event in a fingerprint: its `(tenant, type, id, version)` key
+/// and the (deterministic) event id that committed it.
+type Commit = ((String, String, String, u16), u128);
 
 /// A reproducibility fingerprint of a finished run: each node's committed set
 /// (with the deterministic event ids) plus the client history, all canonically
@@ -4118,8 +4120,15 @@ struct SlowStore {
 
 #[async_trait::async_trait]
 impl DataStore for SlowStore {
-    async fn version(&self, aggregate_type: &str, aggregate_id: &str) -> anyhow::Result<u16> {
-        self.inner.version(aggregate_type, aggregate_id).await
+    async fn version(
+        &self,
+        tenant: &str,
+        aggregate_type: &str,
+        aggregate_id: &str,
+    ) -> anyhow::Result<u16> {
+        self.inner
+            .version(tenant, aggregate_type, aggregate_id)
+            .await
     }
 
     async fn apply(
@@ -4143,11 +4152,12 @@ impl DataStore for SlowStore {
         &self,
         aggregators: Option<Arc<[evento_core::EventFilter]>>,
         routing_key: Option<evento_core::RoutingKey>,
+        tenant: evento_core::TenantFilter,
         args: evento_core::cursor::Args,
         to_micros: Option<u64>,
     ) -> anyhow::Result<evento_core::cursor::ReadResult<Event>> {
         self.inner
-            .read(aggregators, routing_key, args, to_micros)
+            .read(aggregators, routing_key, tenant, args, to_micros)
             .await
     }
 

@@ -494,6 +494,12 @@ through `AccordExecutor`) — split it into several writes.
   If a rolling upgrade let both builds apply, pick one upgraded replica and rejoin
   every other from an empty store, keeping its journal, against it (§7, lost
   store), so all share its stamps.
+- **Tenants** (record format 2): events carry their tenant, a stream is
+  `(tenant, type, id)`, and a key lives in its tenant — the default tenant's keys
+  are the bare routing key or aggregate id. A node of format 2 refuses journals and
+  frames of format 1: evento-accord is unreleased, so a cluster of an older build is
+  wiped and re-bootstrapped. A replica applies — and a joiner copies — every
+  tenant's events.
 - **Joining across versions** (paged joins): a joiner asks for the paged header
   first; a contact predating command pages sheds the request, and the joiner asks
   again for the inline header after `collect_timeout` — so a join against an old

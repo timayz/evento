@@ -164,7 +164,7 @@ impl Cluster {
             .read(
                 Some([EventFilter::by_id_raw("test/Account", aggregate_id)].into()),
                 None,
-                evento_core::TenantFilter::All,
+                evento_core::TenantFilter::Only(String::new()),
                 Args::forward(50, None),
                 None,
             )

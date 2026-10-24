@@ -20,18 +20,27 @@ struct Log {
     /// How many of `events` are persisted: a [crash](SimExecutor::crash)
     /// keeps only these.
     persisted: usize,
-    /// Each aggregate's latest version.
-    versions: HashMap<(String, String), u16>,
+    /// Each stream's latest version, by `(tenant, type, id)`.
+    versions: HashMap<(String, String, String), u16>,
     /// When a write persists everything so far: a seeded generator and the
     /// probability per write. `None` persists every write at once.
     persist: Option<(StdRng, f64)>,
+}
+
+/// The stream `event` belongs to: `(tenant, type, id)`.
+fn stream_of(event: &Event) -> (String, String, String) {
+    (
+        event.tenant.clone(),
+        event.aggregate_type.clone(),
+        event.aggregate_id.clone(),
+    )
 }
 
 impl Log {
     fn rebuild_versions(&mut self) {
         self.versions.clear();
         for event in &self.events {
-            let key = (event.aggregate_type.clone(), event.aggregate_id.clone());
+            let key = stream_of(event);
             let version = self.versions.entry(key).or_default();
             *version = (*version).max(event.version);
         }
@@ -71,9 +80,9 @@ impl SimExecutor {
         log.rebuild_versions();
     }
 
-    /// Every stored event's `(type, id, version)` and id — what the
+    /// Every stored event's `(tenant, type, id, version)` and id — what the
     /// simulation's oracles compare across replicas.
-    pub fn committed_events(&self) -> Vec<((String, String, u16), Ulid)> {
+    pub fn committed_events(&self) -> Vec<((String, String, String, u16), Ulid)> {
         self.log
             .lock()
             .unwrap()
@@ -81,20 +90,35 @@ impl SimExecutor {
             .iter()
             .map(|e| {
                 (
-                    (e.aggregate_type.clone(), e.aggregate_id.clone(), e.version),
+                    (
+                        e.tenant.clone(),
+                        e.aggregate_type.clone(),
+                        e.aggregate_id.clone(),
+                        e.version,
+                    ),
                     e.id,
                 )
             })
             .collect()
     }
 
-    /// `aggregate`'s latest version, 0 if it has none.
+    /// `aggregate`'s latest version in the default tenant, 0 if it has none.
     pub fn version_of(&self, aggregate_type: &str, aggregate_id: &str) -> u16 {
+        self.version_in("", aggregate_type, aggregate_id)
+    }
+
+    /// The latest version of the stream `(tenant, type, id)`, 0 if it has
+    /// none.
+    pub fn version_in(&self, tenant: &str, aggregate_type: &str, aggregate_id: &str) -> u16 {
         self.log
             .lock()
             .unwrap()
             .versions
-            .get(&(aggregate_type.to_owned(), aggregate_id.to_owned()))
+            .get(&(
+                tenant.to_owned(),
+                aggregate_type.to_owned(),
+                aggregate_id.to_owned(),
+            ))
             .copied()
             .unwrap_or(0)
     }
@@ -140,9 +164,9 @@ impl Executor for SimExecutor {
     async fn replicate(&self, events: Vec<Event>) -> Result<(), WriteError> {
         let mut log = self.log.lock().unwrap();
         // All or nothing: every event checked before any is kept.
-        let mut next: HashMap<(String, String), u16> = HashMap::new();
+        let mut next: HashMap<(String, String, String), u16> = HashMap::new();
         for event in &events {
-            let key = (event.aggregate_type.clone(), event.aggregate_id.clone());
+            let key = stream_of(event);
             let current = next
                 .get(&key)
                 .or_else(|| log.versions.get(&key))
@@ -167,11 +191,11 @@ impl Executor for SimExecutor {
 
     async fn latest_version(
         &self,
-        _tenant: String,
+        tenant: String,
         aggregate_type: String,
         aggregate_id: String,
     ) -> anyhow::Result<u16> {
-        Ok(self.version_of(&aggregate_type, &aggregate_id))
+        Ok(self.version_in(&tenant, &aggregate_type, &aggregate_id))
     }
 
     async fn read(

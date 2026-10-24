@@ -7,31 +7,59 @@
 //! (it was slow or down) can still apply, and the per-shard dependency set for
 //! that shard's execution barrier.
 
+use std::borrow::Cow;
+
 use evento_core::{
     cursor::{Args, PageInfo, Value},
-    Event, EventFilter, RoutingKey,
+    Event, EventFilter, RoutingKey, TenantFilter,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::clock::{Ballot, NodeId, Timestamp, TxnId};
 
 /// Sharding / ownership unit. Derived from an event's routing key (falling back
-/// to its aggregate id), this is what the [`Topology`](crate::api::Topology)
-/// maps to a replica set. Two transactions *conflict* when they share a key.
+/// to its aggregate id), in its tenant, this is what the
+/// [`Topology`](crate::api::Topology) maps to a replica set. Two transactions
+/// *conflict* when they share a key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Key(pub String);
 
+/// Separates a tenant from the routing key or aggregate id in a [`Key`].
+const TENANT_SEPARATOR: char = '\u{1f}';
+
 impl Key {
     /// The key a write touches: its routing key, or the aggregate id when no
-    /// routing key is set.
+    /// routing key is set — in the event's tenant (see [`in_tenant`](Key::in_tenant)).
     pub fn of(event: &Event) -> Self {
-        Key(Self::str_of(event).to_string())
+        Key(Self::str_of(event).into_owned())
     }
 
-    /// [`of`](Key::of) without the allocation — for hashing/grouping hot paths
-    /// that only need to compare or bucket by the key string.
-    pub fn str_of(event: &Event) -> &str {
-        event.routing_key.as_deref().unwrap_or(&event.aggregate_id)
+    /// [`of`](Key::of), borrowed whenever it can be — for hashing/grouping hot
+    /// paths that only need to compare or bucket by the key string.
+    pub fn str_of(event: &Event) -> Cow<'_, str> {
+        Self::str_in(
+            &event.tenant,
+            event.routing_key.as_deref().unwrap_or(&event.aggregate_id),
+        )
+    }
+
+    /// The key of `base` (a routing key or an aggregate id) in `tenant`. The
+    /// default tenant's keys are the bare `base`, as before tenants existed;
+    /// another tenant's carry it in front, so the same aggregate id in two
+    /// tenants is two keys — two transactions that do not conflict. (A
+    /// tenant and an id that spell the same key only add a false conflict:
+    /// over-ordering, never a missed one.)
+    pub fn in_tenant(tenant: &str, base: &str) -> Self {
+        Key(Self::str_in(tenant, base).into_owned())
+    }
+
+    /// [`in_tenant`](Key::in_tenant), borrowed in the default tenant.
+    fn str_in<'a>(tenant: &str, base: &'a str) -> Cow<'a, str> {
+        if tenant.is_empty() {
+            Cow::Borrowed(base)
+        } else {
+            Cow::Owned(format!("{tenant}{TENANT_SEPARATOR}{base}"))
+        }
     }
 }
 
@@ -324,6 +352,7 @@ pub enum Message {
         id: u64,
         aggregators: Option<Vec<EventFilter>>,
         routing_key: Option<RoutingKey>,
+        tenant: TenantFilter,
         args: Args,
         to_micros: Option<u64>,
     },
@@ -559,6 +588,7 @@ mod wire_events {
         metadata: Vec<u8>,
         timestamp: u64,
         timestamp_subsec: u32,
+        tenant: String,
     }
 
     impl From<&Event> for WireEvent {
@@ -574,6 +604,7 @@ mod wire_events {
                 metadata: bitcode::encode(&e.metadata),
                 timestamp: e.timestamp,
                 timestamp_subsec: e.timestamp_subsec,
+                tenant: e.tenant.clone(),
             }
         }
     }
@@ -589,9 +620,7 @@ mod wire_events {
                 version: w.version,
                 name: w.name,
                 routing_key: w.routing_key,
-                // Not on the wire yet: `AccordExecutor` refuses every tenant
-                // but the default one.
-                tenant: String::new(),
+                tenant: w.tenant,
                 data: w.data,
                 metadata: bitcode::decode::<Metadata>(&w.metadata)?,
                 timestamp: w.timestamp,
@@ -627,6 +656,32 @@ mod tests {
             data: vec![1, 2, 3],
             ..Default::default()
         }
+    }
+
+    /// A key lives in its tenant: the default tenant's keys are the bare
+    /// routing key or aggregate id, as before tenants existed; the same id in
+    /// two tenants is two keys, so their writes never conflict.
+    #[test]
+    fn keys_are_scoped_by_tenant() {
+        let event = |tenant: &str, routing_key: Option<&str>| Event {
+            aggregate_id: "acc".into(),
+            routing_key: routing_key.map(str::to_owned),
+            tenant: tenant.into(),
+            ..Default::default()
+        };
+        assert_eq!(Key::of(&event("", None)), Key("acc".into()));
+        assert_eq!(Key::of(&event("", Some("eu"))), Key("eu".into()));
+        assert!(matches!(
+            Key::str_of(&event("", None)),
+            Cow::Borrowed("acc")
+        ));
+
+        let a = Key::of(&event("a", None));
+        let b = Key::of(&event("b", None));
+        assert_ne!(a, b);
+        assert_ne!(a, Key("acc".into()));
+        assert_eq!(a, Key::in_tenant("a", "acc"));
+        assert_eq!(Key::of(&event("a", Some("eu"))), Key::in_tenant("a", "eu"));
     }
 
     /// The snapshot variants cross the wire with their cursor and events

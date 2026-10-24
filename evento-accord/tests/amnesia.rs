@@ -68,7 +68,7 @@ fn holds(store: &InMemoryDataStore, event: &Event) -> bool {
     store
         .committed_events()
         .iter()
-        .any(|((_, id, version), ulid)| {
+        .any(|((_, _, id, version), ulid)| {
             *id == event.aggregate_id && *version == event.version && *ulid == event.id
         })
 }

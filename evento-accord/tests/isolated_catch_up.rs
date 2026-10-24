@@ -38,7 +38,7 @@ fn load(
             i += 1;
             let key = i % KEYS;
             let version = store
-                .version("test/Reg", &key.to_string())
+                .version("", "test/Reg", &key.to_string())
                 .await
                 .unwrap_or(0);
             let write = tokio::time::timeout(

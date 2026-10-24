@@ -175,7 +175,7 @@ async fn a_joining_node_bootstraps_and_then_participates() {
 
     // D now holds the pre-join state, materialised from the bootstrap snapshot.
     assert_eq!(
-        d.store.version("test/Account", "acc").await.unwrap(),
+        d.store.version("", "test/Account", "acc").await.unwrap(),
         2,
         "D must hold the pre-join aggregate version"
     );
@@ -1204,7 +1204,14 @@ async fn a_joining_node_refuses_a_forwarded_read_until_it_has_joined() {
     d.node.begin_join();
     let err = nodes[0]
         .node
-        .forward_read(NodeId(3), None, None, Args::forward(10, None), None)
+        .forward_read(
+            NodeId(3),
+            None,
+            None,
+            evento_core::TenantFilter::All,
+            Args::forward(10, None),
+            None,
+        )
         .await
         .expect_err("a joining node served a read from a partial store");
     assert!(format!("{err:#}").contains("bootstrapping"), "{err:#}");
@@ -1218,7 +1225,14 @@ async fn a_joining_node_refuses_a_forwarded_read_until_it_has_joined() {
     d.node.join(NodeId(0)).await.unwrap();
     nodes[0]
         .node
-        .forward_read(NodeId(3), None, None, Args::forward(10, None), None)
+        .forward_read(
+            NodeId(3),
+            None,
+            None,
+            evento_core::TenantFilter::All,
+            Args::forward(10, None),
+            None,
+        )
         .await
         .expect("a joined node serves reads");
 }
@@ -1275,7 +1289,14 @@ async fn a_node_told_to_rejoin_refuses_a_forwarded_read_at_once() {
     let started = std::time::Instant::now();
     let err = nodes[0]
         .node
-        .forward_read(NodeId(2), None, None, Args::forward(10, None), None)
+        .forward_read(
+            NodeId(2),
+            None,
+            None,
+            evento_core::TenantFilter::All,
+            Args::forward(10, None),
+            None,
+        )
         .await
         .expect_err("a node told to rejoin served a read");
     assert!(format!("{err:#}").contains("rejoin"), "{err:#}");
