@@ -9,11 +9,12 @@
 //! created, at runtime, with no config push.
 //!
 //! **Registry** — per process: which tenants exist (a mirror of the catalog), which
-//! are *open* here (its SQLite file + consensus group + executor), and an LRU cap on
+//! are *open* here (its SQLite files + consensus group + executor), and an LRU cap on
 //! how many are open at once. A tenant is opened when it is created, when a request
 //! names it, or when a peer's frame for its group arrives while it is evicted (the
 //! transport's unrouted hook) — but **only** if the catalog knows it: the wire can
-//! never create a database.
+//! never create a database. Where a group's files live, and how a group comes back
+//! when one of them was lost, is [`crate::storage`]'s business.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -22,16 +23,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use evento::cursor::{Args, Value};
 use evento::metadata::Event;
-use evento::migrator::{Migrate, Plan};
 use evento::subscription::{Context, Subscription, SubscriptionBuilder};
 use evento::{EventFilter, Executor, WriteError};
 use evento_accord::{
-    AccordExecutor, DataStore, ExecutorDataStore, GroupHost, GroupId, Journal, NodeConfig, NodeId,
-    StaticTopology, Topology,
+    AccordExecutor, GroupHost, GroupId, NodeConfig, NodeId, StaticTopology, Topology,
 };
-use evento_sql::{Sql, SqlJournal};
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
-use sqlx::{Sqlite, SqlitePool};
+use evento_sql::Sql;
+use sqlx::Sqlite;
+
+use crate::storage::{GroupDbs, RejoinFailed, Storage};
 
 /// The catalog aggregate. Its id is the tenant's slug.
 #[evento::aggregate(name = "tenants/Tenant")]
@@ -68,7 +68,7 @@ pub enum CreateError {
 
 struct OpenTenant {
     executor: TenantExecutor,
-    pool: SqlitePool,
+    dbs: GroupDbs,
     last_used: Instant,
 }
 
@@ -76,11 +76,13 @@ struct OpenTenant {
 pub struct TenantRegistry {
     host: Arc<GroupHost>,
     ids: Vec<NodeId>,
-    data_dir: PathBuf,
+    storage: Storage,
     /// Most tenants open at once on this host (LRU beyond it).
     cap: usize,
     system: TenantExecutor,
-    system_pool: SqlitePool,
+    system_dbs: GroupDbs,
+    /// Set once the catalog was told to rejoin (see `rejoin`).
+    catalog_rejoin: tokio::sync::watch::Sender<bool>,
     tenants: RwLock<HashMap<String, TenantInfo>>,
     by_group: RwLock<HashMap<GroupId, String>>,
     open: Mutex<HashMap<GroupId, OpenTenant>>,
@@ -97,31 +99,59 @@ pub struct TenantRegistry {
 /// ones (the catalog replay at boot) are only *learned*, and open on first use.
 const FRESH_SECS: u64 = 60;
 
+/// The catalog group's name: its files are `system.db` and `system.journal.db`.
+const CATALOG: &str = "system";
+
+/// A tenant group's name: its files are `tenants/{slug}.db` and
+/// `tenants/{slug}.journal.db`.
+fn tenant_name(slug: &str) -> String {
+    format!("tenants/{slug}")
+}
+
 impl TenantRegistry {
     /// Opens the system group (the catalog) on this host and returns the registry.
+    /// A catalog that must rejoin waits for a peer that can vouch for it,
+    /// retrying until one does.
     pub async fn new(
         host: Arc<GroupHost>,
         ids: Vec<NodeId>,
         data_dir: PathBuf,
         cap: usize,
     ) -> anyhow::Result<Arc<Self>> {
-        let (sql, pool) = open_db(&data_dir.join("system.db")).await?;
-        let node = host
-            .open(
-                GroupId::DEFAULT,
-                topology(host.id(), &ids),
-                Arc::new(ExecutorDataStore::new(sql.clone())) as Arc<dyn DataStore>,
-                Arc::new(SqlJournal::<Sqlite>::new(pool.clone())) as Arc<dyn Journal>,
-                node_config(),
-            )
-            .await?;
+        let storage = Storage::open(data_dir.clone(), || groups_on_disk(&data_dir)).await?;
+        let (node, system_dbs) = loop {
+            match storage
+                .open_group(
+                    &host,
+                    GroupId::DEFAULT,
+                    CATALOG,
+                    topology(host.id(), &ids),
+                    node_config(),
+                )
+                .await
+            {
+                Ok(opened) => break opened,
+                Err(err) if err.downcast_ref::<RejoinFailed>().is_some() => {
+                    tracing::warn!(
+                        error = format!("{err:#}"),
+                        "the catalog could not rejoin yet: retrying"
+                    );
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                Err(err) => {
+                    storage.close().await;
+                    return Err(err);
+                }
+            }
+        };
         Ok(Arc::new(Self {
             host,
             ids,
-            data_dir,
+            storage,
             cap: cap.max(1),
-            system: AccordExecutor::new(node, sql),
-            system_pool: pool,
+            system: AccordExecutor::new(node, system_dbs.sql.clone()),
+            system_dbs,
+            catalog_rejoin: tokio::sync::watch::Sender::new(false),
             tenants: RwLock::new(HashMap::new()),
             by_group: RwLock::new(HashMap::new()),
             open: Mutex::new(HashMap::new()),
@@ -307,9 +337,9 @@ impl TenantRegistry {
         Ok(Some(self.ensure_open(&info).await?))
     }
 
-    /// Opens the tenant's SQLite file (migrating it) and its consensus group on this
-    /// host, or returns the already-open executor. Evicts the least recently used
-    /// tenants beyond the cap.
+    /// Opens the tenant's SQLite files (migrating them) and its consensus group on
+    /// this host, or returns the already-open executor. Evicts the least recently
+    /// used tenants beyond the cap.
     pub async fn ensure_open(&self, info: &TenantInfo) -> anyhow::Result<TenantExecutor> {
         if let Some(executor) = self.touch(info.group) {
             return Ok(executor);
@@ -331,31 +361,26 @@ impl TenantRegistry {
         if let Some(executor) = self.touch(info.group) {
             return Ok(executor);
         }
-        let path = self
-            .data_dir
-            .join("tenants")
-            .join(format!("{}.db", info.slug));
-        let (sql, pool) = open_db(&path).await?;
-        let node = self
-            .host
-            .open(
+        let (node, dbs) = self
+            .storage
+            .open_group(
+                &self.host,
                 info.group,
+                &tenant_name(&info.slug),
                 topology(self.host.id(), &self.ids),
-                Arc::new(ExecutorDataStore::new(sql.clone())) as Arc<dyn DataStore>,
-                Arc::new(SqlJournal::<Sqlite>::new(pool.clone())) as Arc<dyn Journal>,
                 node_config(),
             )
             .await?;
-        let executor = AccordExecutor::new(node, sql);
+        let executor = AccordExecutor::new(node, dbs.sql.clone());
         self.open.lock().expect("open poisoned").insert(
             info.group,
             OpenTenant {
                 executor: executor.clone(),
-                pool,
+                dbs,
                 last_used: Instant::now(),
             },
         );
-        tracing::info!(tenant = %info.slug, group = info.group.0, path = %path.display(), "tenant opened");
+        tracing::info!(tenant = %info.slug, group = info.group.0, "tenant opened");
         Ok(executor)
     }
 
@@ -378,7 +403,7 @@ impl TenantRegistry {
             };
             if let Some(tenant) = tenant {
                 self.host.close(group).await;
-                tenant.pool.close().await;
+                tenant.dbs.close().await;
                 tracing::info!(group = group.0, "tenant evicted (LRU)");
             }
         }
@@ -415,15 +440,74 @@ impl TenantRegistry {
     }
 
     /// Closes a tenant's group on this host (it is re-opened on demand), then
-    /// its database: `GroupHost::close` returns once nothing writes to it.
+    /// its databases: `GroupHost::close` returns once nothing writes to them.
     async fn close(&self, group: GroupId) {
         let open_lock = self.open_lock(group);
         let _closing = open_lock.lock().await;
+        self.close_locked(group).await;
+    }
+
+    /// [`close`](Self::close)'s work, under the tenant's lock.
+    async fn close_locked(&self, group: GroupId) {
         let removed = self.open.lock().expect("open poisoned").remove(&group);
         if let Some(tenant) = removed {
             self.host.close(group).await;
-            tenant.pool.close().await;
+            tenant.dbs.close().await;
         }
+    }
+
+    /// The host's rejoin hook (`GroupHost::with_rejoin_handler`). A peer told
+    /// this host's replica of `group` to rejoin: it was away while its peers
+    /// compacted what it never applied. A tenant is closed, marked in the
+    /// ledger, and opened again, which rebuilds its event file from a peer
+    /// over its kept journal. The catalog cannot be swapped under a running
+    /// registry, so it is only marked: the next start rebuilds it, and
+    /// [`catalog_rejoin_required`](Self::catalog_rejoin_required) resolves.
+    pub fn rejoin(self: &Arc<Self>, group: GroupId) {
+        let registry = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Err(err) = registry.rejoin_now(group).await {
+                tracing::warn!(group = group.0, error = format!("{err:#}"), "rejoin failed");
+            }
+        });
+    }
+
+    async fn rejoin_now(&self, group: GroupId) -> anyhow::Result<()> {
+        if group == GroupId::DEFAULT {
+            self.storage.set_hosted(group, CATALOG, true).await?;
+            self.catalog_rejoin.send_replace(true);
+            tracing::error!("the catalog was told to rejoin: start this host again to rebuild it");
+            return Ok(());
+        }
+        let Some(slug) = self.slug_of(group) else {
+            return Ok(());
+        };
+        {
+            // Marked under the tenant's lock, so no open in between finds it
+            // closed and opens it plainly.
+            let open_lock = self.open_lock(group);
+            let _closing = open_lock.lock().await;
+            self.close_locked(group).await;
+            self.storage
+                .set_hosted(group, &tenant_name(&slug), true)
+                .await?;
+        }
+        if let Some(info) = self.info(&slug).filter(|info| !info.suspended) {
+            self.ensure_open(&info).await?;
+        }
+        Ok(())
+    }
+
+    /// Resolves once the catalog was told to rejoin (see [`rejoin`](Self::rejoin)).
+    /// The host should then stop and start again.
+    pub async fn catalog_rejoin_required(&self) {
+        let mut required = self.catalog_rejoin.subscribe();
+        let _ = required.wait_for(|&required| required).await;
+    }
+
+    /// Whether the catalog was told to rejoin.
+    pub fn catalog_rejoin_pending(&self) -> bool {
+        *self.catalog_rejoin.borrow()
     }
 
     /// Closes every group open here, the tenants and then the catalog, and
@@ -441,7 +525,8 @@ impl TenantRegistry {
             self.close(group).await;
         }
         self.host.close(GroupId::DEFAULT).await;
-        self.system_pool.close().await;
+        self.system_dbs.close().await;
+        self.storage.close().await;
     }
 
     fn slug_of(&self, group: GroupId) -> Option<String> {
@@ -610,37 +695,38 @@ pub fn valid_slug(slug: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
 }
 
-/// Opens (creating and migrating) one SQLite file holding a store's events,
-/// projections **and** consensus journal — the migrator's `accord` feature registers
-/// the journal tables alongside the event schema. Pool bounds matter at scale:
-/// sqlx-sqlite runs one OS thread per open connection, so keep `max_connections`
-/// small and let idle connections close. `synchronous(Full)` because this file is
-/// also the consensus journal (an acked write must survive power loss).
-async fn open_db(path: &Path) -> anyhow::Result<(Sql<Sqlite>, SqlitePool)> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+/// The groups whose files are in `data_dir`, by id and name: the seed of a new
+/// host ledger (see [`crate::storage`]).
+fn groups_on_disk(data_dir: &Path) -> anyhow::Result<Vec<(GroupId, String)>> {
+    let mut found = Vec::new();
+    if data_dir.join(format!("{CATALOG}.db")).exists()
+        || data_dir.join(format!("{CATALOG}.journal.db")).exists()
+    {
+        found.push((GroupId::DEFAULT, CATALOG.to_owned()));
     }
-    let options = SqliteConnectOptions::new()
-        .filename(path)
-        .create_if_missing(true)
-        .journal_mode(SqliteJournalMode::Wal)
-        .synchronous(SqliteSynchronous::Full)
-        .busy_timeout(Duration::from_secs(5));
-    let pool = SqlitePoolOptions::new()
-        .max_connections(3)
-        .min_connections(0)
-        .idle_timeout(Some(Duration::from_secs(30)))
-        .connect_with(options)
-        .await?;
-    let mut conn = pool.acquire().await?;
-    evento_sql_migrator::new::<Sqlite>()?
-        .run(&mut *conn, &Plan::apply_all())
-        .await?;
-    drop(conn);
-    // One `Sql` for both the data-store bridge and the executor: two `.into()`s from
-    // the same pool would not share the write-wake channel subscriptions rely on.
-    let sql: Sql<Sqlite> = pool.clone().into();
-    Ok((sql, pool))
+    let tenants = data_dir.join("tenants");
+    if !tenants.exists() {
+        return Ok(found);
+    }
+    let mut slugs = std::collections::BTreeSet::new();
+    for entry in std::fs::read_dir(&tenants)? {
+        let file = entry?.file_name();
+        let Some(file) = file.to_str() else {
+            continue;
+        };
+        let slug = file
+            .strip_suffix(".journal.db")
+            .or_else(|| file.strip_suffix(".db"));
+        if let Some(slug) = slug.filter(|slug| valid_slug(slug)) {
+            slugs.insert(slug.to_owned());
+        }
+    }
+    found.extend(
+        slugs
+            .into_iter()
+            .map(|slug| (TenantRegistry::group_of(&slug), tenant_name(&slug))),
+    );
+    Ok(found)
 }
 
 #[cfg(test)]
@@ -650,6 +736,8 @@ mod tests {
 
     use bank::{AccountType, Command, OpenAccount};
     use evento_accord::{MuxTransport, SweepConfig, SweepScheduler};
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use sqlx::SqlitePool;
     use tokio::net::TcpListener;
 
     struct Host {
@@ -841,11 +929,10 @@ mod tests {
     /// The host ledger in `dir`: each group, and whether a rejoin is pending.
     async fn ledger(dir: &Path) -> HashMap<GroupId, bool> {
         let pool = sqlite(&dir.join("host.db")).await;
-        let rows: Vec<(i64, i64)> =
-            sqlx::query_as("SELECT group_id, rejoining FROM hosted_groups")
-                .fetch_all(&pool)
-                .await
-                .unwrap();
+        let rows: Vec<(i64, i64)> = sqlx::query_as("SELECT group_id, rejoining FROM hosted_groups")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
         pool.close().await;
         rows.into_iter()
             .map(|(group, rejoining)| (GroupId(group as u64), rejoining != 0))
@@ -1134,18 +1221,13 @@ mod tests {
         b.reopen(GroupId(0xdead_beef));
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(b.open_count(), 1);
-        assert_eq!(
-            std::fs::read_dir(hosts[1].dir.join("tenants"))
-                .unwrap()
-                .filter(|e| e
-                    .as_ref()
-                    .unwrap()
-                    .path()
-                    .extension()
-                    .is_some_and(|x| x == "db"))
-                .count(),
-            1
-        );
+        let mut files: Vec<String> = std::fs::read_dir(hosts[1].dir.join("tenants"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".db"))
+            .collect();
+        files.sort();
+        assert_eq!(files, ["acme.db", "acme.journal.db"]);
 
         for h in &hosts {
             let _ = std::fs::remove_dir_all(&h.dir);

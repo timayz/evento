@@ -26,6 +26,7 @@
 //! `system.db` and `tenants/*.db`.
 
 mod catalog;
+mod storage;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -124,7 +125,14 @@ async fn main() -> anyhow::Result<()> {
     );
     let scheduler = SweepScheduler::new(SweepConfig::default());
     scheduler.start();
-    let host = Arc::new(GroupHost::new(mux, scheduler));
+    let rejoin_hook = Arc::clone(&registry_slot);
+    let host = Arc::new(
+        GroupHost::new(mux, scheduler).with_rejoin_handler(move |group| {
+            if let Some(registry) = rejoin_hook.get() {
+                registry.rejoin(group);
+            }
+        }),
+    );
 
     // --- The catalog (system group) and the tenant registry. -------------------
     let registry = TenantRegistry::new(host, ids, data_dir, MAX_OPEN_TENANTS).await?;
@@ -155,13 +163,22 @@ async fn main() -> anyhow::Result<()> {
     let web_addr = format!("127.0.0.1:{}", WEB_BASE_PORT + node_id as u16);
     let listener = tokio::net::TcpListener::bind(&web_addr).await?;
     println!("Listening on http://{web_addr}");
+    let stopping = Arc::clone(&registry);
     axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
+        .with_graceful_shutdown(async move {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                () = stopping.catalog_rejoin_required() => {}
+            }
         })
         .await?;
     catalog.stop();
     registry.shutdown().await;
+    // The next start rebuilds the catalog from a peer (the host ledger says so).
+    anyhow::ensure!(
+        !registry.catalog_rejoin_pending(),
+        "the catalog was told to rejoin: start this host again to rebuild it from a peer"
+    );
     Ok(())
 }
 
