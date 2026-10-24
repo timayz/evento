@@ -647,7 +647,6 @@ async fn open_db(path: &Path) -> anyhow::Result<(Sql<Sqlite>, SqlitePool)> {
 mod tests {
     use super::*;
     use std::net::SocketAddr;
-    use std::sync::OnceLock;
 
     use bank::{AccountType, Command, OpenAccount};
     use evento_accord::{MuxTransport, SweepConfig, SweepScheduler};
@@ -655,8 +654,37 @@ mod tests {
 
     struct Host {
         registry: Arc<TenantRegistry>,
+        host: Arc<GroupHost>,
+        /// The registry the transport's unrouted hook reaches, if one runs.
+        slot: Arc<RwLock<Option<Arc<TenantRegistry>>>>,
+        ids: Vec<NodeId>,
+        cap: usize,
         dir: PathBuf,
         _tasks: Vec<tokio::task::JoinHandle<()>>,
+    }
+
+    impl Host {
+        /// Shuts the registry down, as the process would on exit. The
+        /// transport keeps running: this host's frames are unrouted until
+        /// [`start`](Self::start).
+        async fn stop(&self) {
+            *self.slot.write().unwrap() = None;
+            self.registry.shutdown().await;
+        }
+
+        /// Starts a registry again over the same data directory.
+        async fn start(&mut self) {
+            let registry = TenantRegistry::new(
+                Arc::clone(&self.host),
+                self.ids.clone(),
+                self.dir.clone(),
+                self.cap,
+            )
+            .await
+            .unwrap();
+            *self.slot.write().unwrap() = Some(Arc::clone(&registry));
+            self.registry = registry;
+        }
     }
 
     /// `n` hosts over localhost TCP, each with its catalog group open and **no**
@@ -678,11 +706,12 @@ mod tests {
         }
         let mut hosts = Vec::new();
         for (id, listener) in listeners {
-            let slot: Arc<OnceLock<Arc<TenantRegistry>>> = Arc::new(OnceLock::new());
+            let slot: Arc<RwLock<Option<Arc<TenantRegistry>>>> = Arc::new(RwLock::new(None));
             let hook = Arc::clone(&slot);
             let mux = Arc::new(MuxTransport::new(id, peers.clone()).with_unrouted_handler(
                 move |group| {
-                    if let Some(registry) = hook.get() {
+                    let registry = hook.read().unwrap().clone();
+                    if let Some(registry) = registry {
                         registry.reopen(group);
                     }
                 },
@@ -696,17 +725,366 @@ mod tests {
                 ulid::Ulid::generate(),
                 id.0
             ));
-            let registry = TenantRegistry::new(host, ids.clone(), dir.clone(), cap)
+            let registry = TenantRegistry::new(Arc::clone(&host), ids.clone(), dir.clone(), cap)
                 .await
                 .unwrap();
-            let _ = slot.set(Arc::clone(&registry));
+            *slot.write().unwrap() = Some(Arc::clone(&registry));
             hosts.push(Host {
                 registry,
+                host,
+                slot,
+                ids: ids.clone(),
+                cap,
                 dir,
                 _tasks: tasks,
             });
         }
         hosts
+    }
+
+    /// Opens an account holding 100 in `slug`, through `registry`.
+    async fn open_account(registry: &TenantRegistry, slug: &str) -> String {
+        let executor = registry.executor(slug).await.unwrap().unwrap();
+        Command(executor)
+            .open_account(OpenAccount {
+                owner_id: "o".into(),
+                owner_name: "Ann".into(),
+                account_type: AccountType::Checking,
+                currency: "EUR".into(),
+                initial_balance: 100,
+            })
+            .await
+            .unwrap()
+    }
+
+    /// Waits until `registry` reads `account` of `slug`, holding 100. Opening
+    /// the tenant may take a rejoin, which waits for a peer's report.
+    async fn sees_account(registry: &TenantRegistry, slug: &str, account: &str) {
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            match registry.executor(slug).await {
+                Ok(Some(executor)) => {
+                    if let Ok(Some(view)) = bank::load_account_details(&executor, account, "").await
+                    {
+                        assert_eq!(view.balance, 100);
+                        return;
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => tracing::debug!(error = format!("{err:#}"), "open failed"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{slug}'s account never showed up"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Waits until every host has `slug` open.
+    async fn open_everywhere(hosts: &[Host], slug: &str) {
+        let group = TenantRegistry::group_of(slug);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !hosts.iter().all(|h| h.registry.host().is_open(group)) {
+            assert!(Instant::now() < deadline, "{slug} never opened everywhere");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// A tenant created on the first host, with an account every host reads.
+    async fn tenant_with_an_account(hosts: &[Host], slug: &str) -> (GroupId, String) {
+        let info = hosts[0].registry.create(slug, slug).await.unwrap();
+        let account = open_account(&hosts[0].registry, slug).await;
+        open_everywhere(hosts, slug).await;
+        for h in hosts {
+            sees_account(&h.registry, slug, &account).await;
+        }
+        (info.group, account)
+    }
+
+    /// A connection to the SQLite file at `path`, which must exist.
+    async fn sqlite(path: &Path) -> SqlitePool {
+        SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(SqliteConnectOptions::new().filename(path))
+            .await
+            .unwrap_or_else(|err| panic!("{}: {err}", path.display()))
+    }
+
+    /// How many rows `table` holds in the SQLite file at `path`.
+    async fn rows(path: &Path, table: &str) -> i64 {
+        let pool = sqlite(path).await;
+        let count = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {table}"
+        )))
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|err| panic!("{table} in {}: {err}", path.display()));
+        pool.close().await;
+        count
+    }
+
+    /// How many journal rows the SQLite file at `path` holds.
+    async fn journal_rows(path: &Path) -> i64 {
+        let mut total = 0;
+        for table in [
+            "accord_commands",
+            "accord_meta",
+            "accord_metadata_log",
+            "accord_acceptors",
+        ] {
+            total += rows(path, table).await;
+        }
+        total
+    }
+
+    /// The host ledger in `dir`: each group, and whether a rejoin is pending.
+    async fn ledger(dir: &Path) -> HashMap<GroupId, bool> {
+        let pool = sqlite(&dir.join("host.db")).await;
+        let rows: Vec<(i64, i64)> =
+            sqlx::query_as("SELECT group_id, rejoining FROM hosted_groups")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        pool.close().await;
+        rows.into_iter()
+            .map(|(group, rejoining)| (GroupId(group as u64), rejoining != 0))
+            .collect()
+    }
+
+    /// Deletes a SQLite file and its `-wal` and `-shm` files.
+    fn remove_db(path: &Path) {
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    /// The amnesia fence of `group`'s node on `registry`'s host.
+    fn fence(registry: &TenantRegistry, group: GroupId) -> Option<evento_accord::AmnesiaFence> {
+        registry
+            .host()
+            .get(group)
+            .expect("the group is open")
+            .amnesia_fence()
+    }
+
+    fn cleanup(hosts: &[Host]) {
+        for h in hosts {
+            let _ = std::fs::remove_dir_all(&h.dir);
+        }
+    }
+
+    /// Every group keeps two files: its events, and its journal. The ledger
+    /// lists each group a host opened, and a brand-new group opens without a
+    /// fence everywhere (a fenced one would wait for a peer to vouch for it).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn each_group_keeps_its_journal_in_a_file_of_its_own() {
+        let hosts = hosts(3).await;
+        let (group, _) = tenant_with_an_account(&hosts, "acme").await;
+
+        for h in &hosts {
+            for name in ["system", "tenants/acme"] {
+                let events = h.dir.join(format!("{name}.db"));
+                let journal = h.dir.join(format!("{name}.journal.db"));
+                assert!(journal.exists(), "no {}", journal.display());
+                assert!(journal_rows(&journal).await > 0, "{name}: empty journal");
+                assert_eq!(journal_rows(&events).await, 0, "{name}: journal rows");
+            }
+            assert!(rows(&h.dir.join("tenants/acme.db"), "event").await > 0);
+            assert_eq!(
+                ledger(&h.dir).await,
+                HashMap::from([(GroupId::DEFAULT, false), (group, false)])
+            );
+            assert_eq!(h.registry.system().node().amnesia_fence(), None);
+            assert_eq!(fence(&h.registry, group), None);
+        }
+        cleanup(&hosts);
+    }
+
+    /// A tenant whose journal file was lost comes back under the host's node
+    /// id: its events are dropped and it rejoins from a peer, fenced.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_lost_journal_file_rejoins_under_the_same_node_id() {
+        let mut hosts = hosts(3).await;
+        let (group, account) = tenant_with_an_account(&hosts, "acme").await;
+
+        hosts[2].stop().await;
+        remove_db(&hosts[2].dir.join("tenants/acme.journal.db"));
+        hosts[2].start().await;
+        sees_account(&hosts[2].registry, "acme", &account).await;
+
+        let fence = fence(&hosts[2].registry, group).expect("no amnesia fence");
+        assert!(fence.joined);
+        assert_eq!(ledger(&hosts[2].dir).await.get(&group), Some(&false));
+        cleanup(&hosts);
+    }
+
+    /// A journal file emptied in place leaves events without the votes that
+    /// went with them: the plain open refuses them (`LostJournal`), and the
+    /// tenant rejoins, fenced.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_emptied_journal_file_is_refused_and_rejoins() {
+        let mut hosts = hosts(3).await;
+        let (group, account) = tenant_with_an_account(&hosts, "acme").await;
+
+        hosts[2].stop().await;
+        let journal = hosts[2].dir.join("tenants/acme.journal.db");
+        remove_db(&journal);
+        std::fs::File::create(&journal).unwrap();
+        hosts[2].start().await;
+        sees_account(&hosts[2].registry, "acme", &account).await;
+
+        let fence = fence(&hosts[2].registry, group).expect("no amnesia fence");
+        assert!(fence.joined);
+        cleanup(&hosts);
+    }
+
+    /// A tenant whose event file was lost is rebuilt from a peer over its kept
+    /// journal: it forgot nothing it voted, so it is not fenced.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_lost_event_file_is_rebuilt_from_a_peer() {
+        let mut hosts = hosts(3).await;
+        let (group, account) = tenant_with_an_account(&hosts, "acme").await;
+        let journal = hosts[2].dir.join("tenants/acme.journal.db");
+        assert!(journal.exists(), "no {}", journal.display());
+
+        hosts[2].stop().await;
+        remove_db(&hosts[2].dir.join("tenants/acme.db"));
+        hosts[2].start().await;
+        sees_account(&hosts[2].registry, "acme", &account).await;
+
+        assert_eq!(fence(&hosts[2].registry, group), None);
+        assert_eq!(ledger(&hosts[2].dir).await.get(&group), Some(&false));
+        cleanup(&hosts);
+    }
+
+    /// With both of a tenant's files gone, the ledger still says the host had
+    /// it: it rejoins, fenced, rather than start afresh and vote at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_group_whose_files_were_both_lost_rejoins_from_the_ledger() {
+        let mut hosts = hosts(3).await;
+        let (group, account) = tenant_with_an_account(&hosts, "acme").await;
+
+        hosts[2].stop().await;
+        remove_db(&hosts[2].dir.join("tenants/acme.db"));
+        remove_db(&hosts[2].dir.join("tenants/acme.journal.db"));
+        hosts[2].start().await;
+        sees_account(&hosts[2].registry, "acme", &account).await;
+
+        let fence = fence(&hosts[2].registry, group).expect("no amnesia fence");
+        assert!(fence.joined);
+        cleanup(&hosts);
+    }
+
+    /// The catalog's journal is a group's journal like any other: lost, the
+    /// catalog rejoins when the host starts, and still knows every tenant.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_lost_catalog_journal_rejoins_at_start() {
+        let mut hosts = hosts(3).await;
+        let (_, account) = tenant_with_an_account(&hosts, "acme").await;
+
+        hosts[2].stop().await;
+        remove_db(&hosts[2].dir.join("system.journal.db"));
+        hosts[2].start().await;
+
+        let fence = hosts[2]
+            .registry
+            .system()
+            .node()
+            .amnesia_fence()
+            .expect("no amnesia fence");
+        assert!(fence.joined);
+        sees_account(&hosts[2].registry, "acme", &account).await;
+        cleanup(&hosts);
+    }
+
+    /// A crash in the middle of a rejoin leaves files that look whole: a
+    /// fresh journal file and an empty event file. The ledger's mark sends
+    /// the next open through the rejoin again, fenced, not afresh.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_rejoin_cut_short_by_a_crash_resumes() {
+        let mut hosts = hosts(3).await;
+        let (group, account) = tenant_with_an_account(&hosts, "acme").await;
+
+        hosts[2].stop().await;
+        for name in ["tenants/acme.db", "tenants/acme.journal.db"] {
+            let path = hosts[2].dir.join(name);
+            remove_db(&path);
+            std::fs::File::create(&path).unwrap();
+        }
+        let pool = sqlite(&hosts[2].dir.join("host.db")).await;
+        sqlx::query("UPDATE hosted_groups SET rejoining = 1 WHERE group_id = ?")
+            .bind(group.0 as i64)
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        hosts[2].start().await;
+        sees_account(&hosts[2].registry, "acme", &account).await;
+
+        let fence = fence(&hosts[2].registry, group).expect("no amnesia fence");
+        assert!(fence.joined);
+        assert_eq!(ledger(&hosts[2].dir).await.get(&group), Some(&false));
+        cleanup(&hosts);
+    }
+
+    /// A data directory from before the split — each journal inside its
+    /// group's event file, and no ledger — is moved to the new layout on
+    /// start, journal and all: no group comes back fenced.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_single_file_group_moves_its_journal_into_a_file_of_its_own() {
+        let mut hosts = hosts(3).await;
+        let (group, account) = tenant_with_an_account(&hosts, "acme").await;
+
+        hosts[2].stop().await;
+        let dir = hosts[2].dir.clone();
+        for name in ["system", "tenants/acme"] {
+            let events = dir.join(format!("{name}.db"));
+            let journal = dir.join(format!("{name}.journal.db"));
+            let pool = sqlite(&events).await;
+            let mut conn = pool.acquire().await.unwrap();
+            sqlx::query("ATTACH DATABASE ? AS j")
+                .bind(journal.to_string_lossy().into_owned())
+                .execute(&mut *conn)
+                .await
+                .unwrap();
+            for table in [
+                "accord_commands",
+                "accord_meta",
+                "accord_metadata_log",
+                "accord_acceptors",
+            ] {
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "INSERT INTO main.{table} SELECT * FROM j.{table}"
+                )))
+                .execute(&mut *conn)
+                .await
+                .unwrap();
+            }
+            sqlx::query("DETACH DATABASE j")
+                .execute(&mut *conn)
+                .await
+                .unwrap();
+            drop(conn);
+            pool.close().await;
+            assert!(journal_rows(&events).await > 0);
+            remove_db(&journal);
+        }
+        remove_db(&dir.join("host.db"));
+        hosts[2].start().await;
+        sees_account(&hosts[2].registry, "acme", &account).await;
+
+        for name in ["system", "tenants/acme"] {
+            assert!(journal_rows(&dir.join(format!("{name}.journal.db"))).await > 0);
+            assert_eq!(journal_rows(&dir.join(format!("{name}.db"))).await, 0);
+        }
+        assert_eq!(hosts[2].registry.system().node().amnesia_fence(), None);
+        assert_eq!(fence(&hosts[2].registry, group), None);
+        assert_eq!(
+            ledger(&dir).await,
+            HashMap::from([(GroupId::DEFAULT, false), (group, false)])
+        );
+        cleanup(&hosts);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
