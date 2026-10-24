@@ -27,9 +27,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 
-use evento_accord::format::{
-    decode_command, decode_tagged, encode_command, encode_tagged, RecordKind,
-};
+use evento_accord::format::{decode_tagged, encode_tagged, RecordKind};
 use evento_accord::{
     AcceptorRecord, AmnesiaFence, Ballot, CommandState, DecisionRecord, Journal, Key, NodeId,
     Timestamp, TxnId,
@@ -186,7 +184,7 @@ impl Journal for FjallJournal {
         // Keys stay bare (their `TxnId` ordering drives the truncation scan); only the
         // value is version-tagged, since that is the schema that evolves.
         let key = bitcode::serialize(&state.txn)?;
-        let value = encode_command(state)?;
+        let value = encode_tagged(RecordKind::Command, state)?;
         let commands = self.commands.clone();
         // Insert into the keyspace (write-ahead) but do not fsync; the next
         // `flush` makes this — and every other staged write — durable at once.
@@ -429,7 +427,7 @@ impl Journal for FjallJournal {
         let commands = self.commands.clone();
         let bytes = tokio::task::spawn_blocking(move || commands.get(key)).await??;
         match bytes {
-            Some(bytes) => Ok(Some(decode_command(&bytes)?)),
+            Some(bytes) => Ok(Some(decode_tagged(RecordKind::Command, &bytes)?)),
             None => Ok(None),
         }
     }
@@ -440,7 +438,7 @@ impl Journal for FjallJournal {
             let mut out = Vec::new();
             for guard in commands.iter() {
                 let (_, value) = guard.into_inner()?;
-                out.push(decode_command(&value)?);
+                out.push(decode_tagged(RecordKind::Command, &value)?);
             }
             Ok(out)
         })

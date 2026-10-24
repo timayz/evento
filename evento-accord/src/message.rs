@@ -642,108 +642,6 @@ mod wire_events {
     }
 }
 
-/// A [`CommandState`] as journaled before events carried their tenant
-/// (record kind [`Command`](crate::format::RecordKind::Command)): the same
-/// fields, its events in the earlier layout — every one in the default tenant.
-#[derive(Serialize, Deserialize)]
-pub(crate) struct CommandStateV1 {
-    pub(crate) txn: TxnId,
-    pub(crate) status: Status,
-    pub(crate) promised: Ballot,
-    pub(crate) accepted: Ballot,
-    pub(crate) execute_at: Timestamp,
-    pub(crate) deps: Vec<TxnId>,
-    pub(crate) keys: Vec<Key>,
-    #[serde(with = "wire_events_v1")]
-    pub(crate) events: Vec<Event>,
-    pub(crate) reply_to: NodeId,
-    pub(crate) decision: Option<bool>,
-    pub(crate) applied_conflict: Option<bool>,
-}
-
-impl From<CommandStateV1> for CommandState {
-    fn from(v1: CommandStateV1) -> Self {
-        CommandState {
-            txn: v1.txn,
-            status: v1.status,
-            promised: v1.promised,
-            accepted: v1.accepted,
-            execute_at: v1.execute_at,
-            deps: v1.deps,
-            keys: v1.keys,
-            events: v1.events,
-            reply_to: v1.reply_to,
-            decision: v1.decision,
-            applied_conflict: v1.applied_conflict,
-        }
-    }
-}
-
-/// [`wire_events`] in the layout before events carried their tenant: an
-/// event reads back in the default tenant (and serializes without its
-/// tenant, for tests building a record of that layout).
-mod wire_events_v1 {
-    use evento_core::{metadata::Metadata, Event};
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-    use ulid::Ulid;
-
-    #[derive(Serialize, Deserialize)]
-    struct WireEventV1 {
-        id: Ulid,
-        aggregate_id: String,
-        aggregate_type: String,
-        version: u16,
-        name: String,
-        routing_key: Option<String>,
-        data: Vec<u8>,
-        /// bitcode-encoded [`Metadata`].
-        metadata: Vec<u8>,
-        timestamp: u64,
-        timestamp_subsec: u32,
-    }
-
-    pub fn serialize<S: Serializer>(events: &[Event], s: S) -> Result<S::Ok, S::Error> {
-        let wire: Vec<WireEventV1> = events
-            .iter()
-            .map(|e| WireEventV1 {
-                id: e.id,
-                aggregate_id: e.aggregate_id.clone(),
-                aggregate_type: e.aggregate_type.clone(),
-                version: e.version,
-                name: e.name.clone(),
-                routing_key: e.routing_key.clone(),
-                data: e.data.clone(),
-                metadata: bitcode::encode(&e.metadata),
-                timestamp: e.timestamp,
-                timestamp_subsec: e.timestamp_subsec,
-            })
-            .collect();
-        wire.serialize(s)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Event>, D::Error> {
-        Vec::<WireEventV1>::deserialize(d)?
-            .into_iter()
-            .map(|w| {
-                Ok(Event {
-                    id: w.id,
-                    aggregate_id: w.aggregate_id,
-                    aggregate_type: w.aggregate_type,
-                    version: w.version,
-                    name: w.name,
-                    routing_key: w.routing_key,
-                    tenant: String::new(),
-                    data: w.data,
-                    metadata: bitcode::decode::<Metadata>(&w.metadata)
-                        .map_err(serde::de::Error::custom)?,
-                    timestamp: w.timestamp,
-                    timestamp_subsec: w.timestamp_subsec,
-                })
-            })
-            .collect()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -803,8 +701,8 @@ mod tests {
             },
         ];
         for message in messages {
-            let bytes = encode_tagged(RecordKind::WireFrameV2, &message).unwrap();
-            let back: Message = decode_tagged(RecordKind::WireFrameV2, &bytes).unwrap();
+            let bytes = encode_tagged(RecordKind::WireFrame, &message).unwrap();
+            let back: Message = decode_tagged(RecordKind::WireFrame, &bytes).unwrap();
             match (&message, &back) {
                 (Message::SnapshotRequest { id }, Message::SnapshotRequest { id: b }) => {
                     assert_eq!(id, b)
@@ -840,8 +738,8 @@ mod tests {
             reason: "disk full".into(),
         };
         assert_eq!(message.txn(), None);
-        let bytes = encode_tagged(RecordKind::WireFrameV2, &message).unwrap();
-        match decode_tagged(RecordKind::WireFrameV2, &bytes).unwrap() {
+        let bytes = encode_tagged(RecordKind::WireFrame, &message).unwrap();
+        match decode_tagged(RecordKind::WireFrame, &bytes).unwrap() {
             Message::ReadFailed { id, reason } => {
                 assert_eq!((id, reason.as_str()), (9, "disk full"))
             }
@@ -854,8 +752,8 @@ mod tests {
     fn join_keepalive_round_trips_tagged() {
         let message = Message::JoinKeepalive;
         assert_eq!(message.txn(), None);
-        let bytes = encode_tagged(RecordKind::WireFrameV2, &message).unwrap();
-        match decode_tagged(RecordKind::WireFrameV2, &bytes).unwrap() {
+        let bytes = encode_tagged(RecordKind::WireFrame, &message).unwrap();
+        match decode_tagged(RecordKind::WireFrame, &bytes).unwrap() {
             Message::JoinKeepalive => {}
             other => panic!("variant changed on the wire: {other:?}"),
         }
@@ -898,8 +796,8 @@ mod tests {
             },
         ];
         for message in messages {
-            let bytes = encode_tagged(RecordKind::WireFrameV2, &message).unwrap();
-            let back: Message = decode_tagged(RecordKind::WireFrameV2, &bytes).unwrap();
+            let bytes = encode_tagged(RecordKind::WireFrame, &message).unwrap();
+            let back: Message = decode_tagged(RecordKind::WireFrame, &bytes).unwrap();
             match (&message, &back) {
                 (Message::JoinHeaderRequest { id }, Message::JoinHeaderRequest { id: b }) => {
                     assert_eq!(id, b)
@@ -948,8 +846,8 @@ mod tests {
             epoch: 4,
             vouched,
         };
-        let bytes = encode_tagged(RecordKind::WireFrameV2, &proof).unwrap();
-        match decode_tagged(RecordKind::WireFrameV2, &bytes).unwrap() {
+        let bytes = encode_tagged(RecordKind::WireFrame, &proof).unwrap();
+        match decode_tagged(RecordKind::WireFrame, &bytes).unwrap() {
             Message::JoinProof {
                 id,
                 epoch,
@@ -983,8 +881,8 @@ mod tests {
             }),
         };
         assert_eq!(routed.txn(), Some(txn));
-        let bytes = encode_tagged(RecordKind::WireFrameV2, &routed).unwrap();
-        match decode_tagged::<Message>(RecordKind::WireFrameV2, &bytes).unwrap() {
+        let bytes = encode_tagged(RecordKind::WireFrame, &routed).unwrap();
+        match decode_tagged::<Message>(RecordKind::WireFrame, &bytes).unwrap() {
             Message::Routed { route: r, inner } => {
                 assert_eq!(r, route);
                 match *inner {
@@ -1012,8 +910,8 @@ mod tests {
             Message::Amnesiac { txn, ballot },
         ] {
             assert_eq!(message.txn(), Some(txn));
-            let bytes = encode_tagged(RecordKind::WireFrameV2, &message).unwrap();
-            let back: Message = decode_tagged(RecordKind::WireFrameV2, &bytes).unwrap();
+            let bytes = encode_tagged(RecordKind::WireFrame, &message).unwrap();
+            let back: Message = decode_tagged(RecordKind::WireFrame, &bytes).unwrap();
             assert_eq!(format!("{back:?}"), format!("{message:?}"));
         }
     }

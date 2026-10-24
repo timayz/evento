@@ -494,13 +494,11 @@ through `AccordExecutor`) — split it into several writes.
   If a rolling upgrade let both builds apply, pick one upgraded replica and rejoin
   every other from an empty store, keeping its journal, against it (§7, lost
   store), so all share its stamps.
-- **Upgrading to tenants** (release note): events carry their tenant, a stream
-  is `(tenant, type, id)`, and a key lives in its tenant — the default tenant's
-  keys are unchanged. A journal written before keeps its records (kind `Command`),
-  read back with every event in the default tenant, and a node writes `CommandV2`
-  records from then on. The wire moved to `WireFrameV2`, and an older node and a
-  newer one shed each other's frames: upgrade drain-and-replace, a quorum on one
-  build at a time — or stop all, upgrade, start. Scope a tenant through
+- **Tenants** (record format 2): events carry their tenant, a stream is
+  `(tenant, type, id)`, and a key lives in its tenant — the default tenant's keys
+  are the bare routing key or aggregate id. A node of format 2 refuses journals and
+  frames of format 1: evento-accord is unreleased, so a cluster of an older build is
+  wiped and re-bootstrapped. Scope a tenant through
   `Evento::new(accord_executor).tenant(t)`; the local store under
   `ExecutorDataStore` stays unscoped (`new` refuses a scoped one), since a replica
   applies — and a joiner copies — every tenant's events.

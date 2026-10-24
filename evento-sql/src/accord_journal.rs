@@ -38,9 +38,7 @@ use sqlx::{Database, Pool};
 
 use async_trait::async_trait;
 
-use evento_accord::format::{
-    decode_command, decode_tagged, encode_command, encode_tagged, RecordKind,
-};
+use evento_accord::format::{decode_tagged, encode_tagged, RecordKind};
 use evento_accord::{
     AcceptorRecord, AmnesiaFence, Ballot, CommandState, DecisionRecord, Journal, Key, NodeId,
     Timestamp, TxnId,
@@ -330,7 +328,7 @@ where
 
     async fn stage(&self, state: &CommandState) -> anyhow::Result<()> {
         let key = txn_key(state.txn);
-        let value = encode_command(state)?;
+        let value = encode_tagged(RecordKind::Command, state)?;
         self.staged
             .lock()
             .expect("journal poisoned")
@@ -692,7 +690,7 @@ where
                 .fetch_optional(&self.pool)
                 .await?;
         match row {
-            Some((bytes,)) => Ok(Some(decode_command(&bytes)?)),
+            Some((bytes,)) => Ok(Some(decode_tagged(RecordKind::Command, &bytes)?)),
             None => Ok(None),
         }
     }
@@ -708,7 +706,7 @@ where
                 .fetch_all(&self.pool)
                 .await?;
         rows.into_iter()
-            .map(|(bytes,)| decode_command(&bytes))
+            .map(|(bytes,)| decode_tagged(RecordKind::Command, &bytes))
             .collect()
     }
 

@@ -1194,11 +1194,8 @@ backend (sql/fjall). Phases, in order:
         bump (the version byte is shared with the journal, so bumping it for a wire-only
         addition would invalidate every journal on disk): `GroupFrame` (kind 6, the
         multiplexed wire frame of the many-groups transport, since removed) was added
-        this way, and its byte stays reserved so it is never reused. A changed layout
-        can go the same way when old journals must stay readable: events gained their
-        tenant, so commands moved to `CommandV2` (13) — a journal's `Command` records
-        still decode, every event in the default tenant — and frames to `WireFrameV2`
-        (14), an older node's `WireFrame` shed like any unknown kind.
+        this way, and its byte stays reserved so it is never reused. Format 2: events
+        carry their tenant (unreleased, so no reader for format 1).
   - [x] **Snapshot-at-scale** — `ExecutorDataStore::snapshot_page` reads the backend
         one `SNAPSHOT_PAGE_SIZE`-event page at a time and trims it to a byte budget,
         and a joiner pulls those pages one request at a time

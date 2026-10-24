@@ -54,18 +54,8 @@
 //!   existing variant keeps its encoding and an older node fails to decode — and
 //!   sheds — only the new one. Never insert a variant in the middle, and never
 //!   add a field to an existing one.
-//! - **A changed payload layout gets a new kind too**, when the version byte must
-//!   stay: events gained their tenant, which changed the layout of every
-//!   [`CommandState`] and [`Message`](crate::message::Message) that carries
-//!   them, so they moved to [`RecordKind::CommandV2`] and
-//!   [`RecordKind::WireFrameV2`]. A journal written before keeps its
-//!   [`RecordKind::Command`] records, which [`decode_command`] still reads (every
-//!   event in the default tenant); a `WireFrame` from an older node is shed, as
-//!   an older node sheds a `WireFrameV2` — a cluster upgrades drain-and-replace.
 
 use serde::{de::DeserializeOwned, Serialize};
-
-use crate::message::{CommandState, CommandStateV1};
 
 /// Identifies an evento-accord record. Guards against decoding an unrelated byte
 /// stream (a misconfigured port, a different protocol) as a valid frame.
@@ -74,7 +64,10 @@ pub const MAGIC: [u8; 2] = *b"Ac";
 /// Current record format version. Bump on any breaking change to a tagged payload's
 /// layout (a new/reordered [`CommandState`](crate::message::CommandState) or
 /// [`Message`](crate::message::Message) field); add the matching decode branch then.
-pub const FORMAT_VERSION: u8 = 1;
+///
+/// 2: events carry their tenant. No reader for version 1: evento-accord has not
+/// been released, so a journal of it is wiped and the node re-bootstrapped.
+pub const FORMAT_VERSION: u8 = 2;
 
 /// Length of the fixed header: `MAGIC (2) + version (1) + kind (1)`.
 const HEADER_LEN: usize = 4;
@@ -118,13 +111,6 @@ pub enum RecordKind {
     /// (`Journal::save_amnesia_fence`), as an
     /// [`AmnesiaFence`](crate::api::AmnesiaFence).
     AmnesiaFence = 12,
-    /// A journal [`CommandState`] whose events carry their tenant — what a
-    /// journal writes since; [`Command`](Self::Command) records are still read
-    /// ([`decode_command`]).
-    CommandV2 = 13,
-    /// A [`crate::tcp`] wire frame whose events carry their tenant — what a
-    /// node sends since; it sheds a [`WireFrame`](Self::WireFrame).
-    WireFrameV2 = 14,
 }
 
 impl RecordKind {
@@ -141,27 +127,8 @@ impl RecordKind {
             10 => Some(Self::ClockBound),
             11 => Some(Self::Decision),
             12 => Some(Self::AmnesiaFence),
-            13 => Some(Self::CommandV2),
-            14 => Some(Self::WireFrameV2),
             _ => None,
         }
-    }
-}
-
-/// Serializes a journal command record, as [`RecordKind::CommandV2`].
-pub fn encode_command(state: &CommandState) -> anyhow::Result<Vec<u8>> {
-    encode_tagged(RecordKind::CommandV2, state)
-}
-
-/// Deserializes a journal command record: a [`RecordKind::CommandV2`], or a
-/// [`RecordKind::Command`] written before events carried their tenant — its
-/// events read back in the default tenant.
-pub fn decode_command(bytes: &[u8]) -> anyhow::Result<CommandState> {
-    match peek_kind(bytes) {
-        Some(RecordKind::Command) => {
-            Ok(decode_tagged::<CommandStateV1>(RecordKind::Command, bytes)?.into())
-        }
-        _ => decode_tagged(RecordKind::CommandV2, bytes),
     }
 }
 
@@ -216,6 +183,7 @@ pub fn decode_tagged<T: DeserializeOwned>(expected: RecordKind, bytes: &[u8]) ->
 mod tests {
     use super::*;
     use crate::clock::Timestamp;
+    use crate::message::CommandState;
 
     #[test]
     fn round_trips_each_kind() {
@@ -231,8 +199,6 @@ mod tests {
             RecordKind::ClockBound,
             RecordKind::Decision,
             RecordKind::AmnesiaFence,
-            RecordKind::CommandV2,
-            RecordKind::WireFrameV2,
         ] {
             let value = (42u64, "hello".to_string());
             let bytes = encode_tagged(kind, &value).unwrap();
@@ -274,39 +240,15 @@ mod tests {
         }
     }
 
-    /// A journal record keeps its events' tenants; one written before events
-    /// carried them (kind `Command`) still reads, every event in the default
-    /// tenant.
+    /// A journaled command keeps its events' tenants.
     #[test]
-    fn command_records_of_either_layout_decode() {
+    fn a_command_record_keeps_its_tenants() {
         let state = command("acme");
-        let bytes = encode_command(&state).unwrap();
-        assert_eq!(peek_kind(&bytes), Some(RecordKind::CommandV2));
-        let back = decode_command(&bytes).unwrap();
+        let bytes = encode_tagged(RecordKind::Command, &state).unwrap();
+        let back: CommandState = decode_tagged(RecordKind::Command, &bytes).unwrap();
         assert_eq!(back.events, state.events);
         assert_eq!(back.events[0].tenant, "acme");
-
-        let older = command("");
-        let v1 = CommandStateV1 {
-            txn: older.txn,
-            status: older.status,
-            promised: older.promised,
-            accepted: older.accepted,
-            execute_at: older.execute_at,
-            deps: older.deps.clone(),
-            keys: older.keys.clone(),
-            events: older.events.clone(),
-            reply_to: older.reply_to,
-            decision: older.decision,
-            applied_conflict: older.applied_conflict,
-        };
-        let bytes = encode_tagged(RecordKind::Command, &v1).unwrap();
-        let back = decode_command(&bytes).unwrap();
-        assert_eq!((back.txn, back.status), (older.txn, older.status));
-        assert_eq!(back.keys, older.keys);
-        assert_eq!(back.events, older.events);
-        assert_eq!(back.events[0].tenant, "");
-        assert_eq!(back.decision, older.decision);
+        assert_eq!(back.keys, state.keys);
     }
 
     #[test]

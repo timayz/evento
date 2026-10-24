@@ -116,14 +116,12 @@ struct Frame {
 }
 
 fn encode(frame: &Frame) -> anyhow::Result<Vec<u8>> {
-    encode_tagged(RecordKind::WireFrameV2, frame)
+    encode_tagged(RecordKind::WireFrame, frame)
 }
 
-/// Decodes an inbound wire frame into `(from, message)`. A
-/// [`RecordKind::WireFrame`] from a node that predates tenants is shed: its
-/// events lack the field this build reads.
+/// Decodes an inbound wire frame into `(from, message)`.
 fn decode_wire(bytes: &[u8]) -> anyhow::Result<(NodeId, Message)> {
-    let frame: Frame = decode_tagged(RecordKind::WireFrameV2, bytes)?;
+    let frame: Frame = decode_tagged(RecordKind::WireFrame, bytes)?;
     Ok((frame.from, frame.message))
 }
 
@@ -657,16 +655,5 @@ mod tests {
 
         let journal_record = encode_tagged(RecordKind::Command, &1u64).unwrap();
         assert!(decode_wire(&journal_record).is_err());
-
-        // A frame from a node that predates tenants is shed.
-        let older = encode_tagged(
-            RecordKind::WireFrame,
-            &Frame {
-                from: NodeId(4),
-                message: applied(1),
-            },
-        )
-        .unwrap();
-        assert!(decode_wire(&older).is_err());
     }
 }
