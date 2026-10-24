@@ -29,13 +29,11 @@ pub mod clock;
 pub mod executor;
 pub mod failure_detector;
 pub mod format;
-pub mod group;
 pub mod message;
 pub mod metrics;
 pub mod node;
 pub mod replica;
 pub mod store;
-pub mod sweep;
 pub mod tcp;
 pub mod transport;
 
@@ -47,20 +45,15 @@ pub use api::{
 pub use clock::{Ballot, Clock, HybridLogicalClock, NodeId, Timestamp, TxnId, MAX_SKEW_MICROS};
 pub use executor::{AccordExecutor, ExecutorDataStore};
 pub use failure_detector::FailureDetector;
-pub use group::{GroupHost, RejoinHandler};
 pub use message::{CommandState, Key, Message, Status};
 pub use metrics::{Metrics, MetricsSnapshot};
 pub use node::{
     BacklogAtCap, CommandTooLarge, CommitOutcome, FenceNotCovered, LostJournal, Node, NodeClosed,
-    NodeConfig, PartialSnapshot, RejoinRequired, MAX_COMMAND_BYTES,
+    NodeConfig, PartialSnapshot, RejoinRequired, SweepPressure, MAX_COMMAND_BYTES,
 };
 pub use store::{AppliedEntry, InMemoryDataStore, InMemoryJournal};
-pub use sweep::{SweepConfig, SweepPressure, SweepScheduler, SweepStats, Sweepable};
-pub use tcp::{
-    serve, serve_tls, serve_tls_verified, GroupSink, MuxTransport, PeerCerts, TcpTransport,
-    TlsClient, UnroutedHandler,
-};
+pub use tcp::{serve, serve_tls, serve_tls_verified, PeerCerts, TcpTransport, TlsClient};
 pub use transport::{
-    Envelope, GroupId, InMemoryNetwork, InMemorySink, LinkFilter, MessageFate, MessageFaults,
-    MessageFilter, TraceEntry,
+    Envelope, InMemoryNetwork, InMemorySink, LinkFilter, MessageFate, MessageFaults, MessageFilter,
+    TraceEntry,
 };

@@ -44,10 +44,11 @@
 //!   version byte is shared by the wire and the journal, so bumping it for a wire-only
 //!   addition would needlessly invalidate every journal on disk. An older build sheds
 //!   the unknown kind (`decode_tagged` fails on it), which is loss the consensus layer
-//!   tolerates. [`RecordKind::GroupFrame`] (the multiplexed wire frame of
-//!   `crate::tcp::MuxTransport`) was added this way, and so were
-//!   [`RecordKind::Route`] / [`RecordKind::Promise`] / [`RecordKind::ClockBound`]
-//!   (journal-only). The same
+//!   tolerates. [`RecordKind::Route`] / [`RecordKind::Promise`] /
+//!   [`RecordKind::ClockBound`] (journal-only) were added this way. A retired kind's
+//!   byte stays reserved and is never reused (6, the multiplexed wire frame of the
+//!   removed many-groups transport), so an old record can never be read as a
+//!   different payload. The same
 //!   holds for a new [`Message`](crate::message::Message) variant appended at the
 //!   end (`Message::Routed`): bitcode numbers variants positionally, so every
 //!   existing variant keeps its encoding and an older node fails to decode — and
@@ -84,10 +85,8 @@ pub enum RecordKind {
     MetadataEntry = 4,
     /// A config-Paxos acceptor's durable state for one epoch.
     AcceptorState = 5,
-    /// A multiplexed [`crate::tcp`] wire frame: sender id + group id +
-    /// [`Message`](crate::message::Message), emitted by `MuxTransport` so one
-    /// connection set can carry many independent consensus groups.
-    GroupFrame = 6,
+    // 6 is reserved: the multiplexed wire frame of the removed many-groups
+    // transport. Never reuse it.
     /// The journal's persisted rejoin bounds: per peer this node stopped
     /// waiting for, the compacted `t0` it must report above to be counted
     /// again (`Journal::save_rejoin_bounds`).
@@ -119,7 +118,6 @@ impl RecordKind {
             3 => Some(Self::Watermark),
             4 => Some(Self::MetadataEntry),
             5 => Some(Self::AcceptorState),
-            6 => Some(Self::GroupFrame),
             7 => Some(Self::RejoinBounds),
             8 => Some(Self::Route),
             9 => Some(Self::Promise),
@@ -190,7 +188,6 @@ mod tests {
             RecordKind::Watermark,
             RecordKind::MetadataEntry,
             RecordKind::AcceptorState,
-            RecordKind::GroupFrame,
             RecordKind::RejoinBounds,
             RecordKind::Route,
             RecordKind::Promise,
@@ -208,11 +205,13 @@ mod tests {
 
     #[test]
     fn peek_kind_rejects_foreign_or_unknown_headers() {
-        let mut bytes = encode_tagged(RecordKind::GroupFrame, &7u64).unwrap();
-        assert_eq!(peek_kind(&bytes), Some(RecordKind::GroupFrame));
+        let mut bytes = encode_tagged(RecordKind::WireFrame, &7u64).unwrap();
+        assert_eq!(peek_kind(&bytes), Some(RecordKind::WireFrame));
         bytes[3] = 200; // unknown kind
         assert_eq!(peek_kind(&bytes), None);
-        bytes[3] = RecordKind::GroupFrame as u8;
+        bytes[3] = 6; // reserved: the retired multiplexed wire frame
+        assert_eq!(peek_kind(&bytes), None);
+        bytes[3] = RecordKind::WireFrame as u8;
         bytes[2] = FORMAT_VERSION + 1; // another format version
         assert_eq!(peek_kind(&bytes), None);
         bytes[2] = FORMAT_VERSION;

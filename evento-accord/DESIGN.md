@@ -115,21 +115,6 @@ trait** (recommended over gRPC/QUIC) — ✅ implemented in `tcp.rs`:
 
 The trait isolates the choice; `tonic` stays a swap-in if we later want TLS/codegen.
 
-**Many groups per process (`MuxTransport`).** A process hosting one consensus group
-per tenant (one `Node`, one data store, one journal each — the per-tenant-database
-shape) multiplexes them over **one** connection set: a `GroupFrame` (its own additive
-`RecordKind`, so a legacy `Frame` still decodes and a pre-upgrade reader simply sheds
-it) carries a `GroupId` next to `from`, `mux.sink(group)` stamps it, and the single
-accept loop demuxes into per-group inboxes. `Envelope`, `Node`, and the protocol are
-untouched — a `TxnId`/`Ballot`/watermark is only ever compared within one group, so
-every group reuses the same `NodeId`s. Frames for a group not yet registered are
-parked briefly and replayed on `register` (a tenant being opened keeps its first
-write's fast path); a hook reports unrouted groups so an evicted tenant can be
-re-opened, while the wire can never create one. The companion `SweepScheduler` drives
-every node's recovery sweep from one task, at full cadence only while a node is busy
-or its applied state recently moved — idle groups sweep every few seconds, staggered —
-so a thousand idle groups do not gossip tens of thousands of frames a second.
-
 Membership for the first milestones is **static config** (fixed node-id ↔
 address list). Dynamic membership / gossip is deferred to M4.
 
@@ -625,7 +610,7 @@ backend (sql/fjall). Phases, in order:
   A message from a peer under such a bound is answered with `Message::Rejoin`
   rather than handled — a stale replica recovering a compacted transaction would
   find no one who knows it and invalidate it — and the told node stops taking
-  part (`Node::rejoin_required`, the `GroupHost` rejoin hook) until its host
+  part (`Node::rejoin_required`, `Node::rejoin_signal`) until its host
   rejoins it from a snapshot; a node that can prove it holds everything (its own
   report is above the bound) answers with that report instead. A peer that was
   silent while nothing was compacted past it is simply counted again
@@ -743,8 +728,8 @@ backend (sql/fjall). Phases, in order:
   the host wipes the store (not the journal) and joins again. `recover_state` restores the floor
   and trusts the durable data store for the prefix, replaying only the journal
   tail. A replica that lost its store (new disk, deleted
-  file) is a joiner too: `GroupHost::open_joining` calls `begin_join` before the
-  inbox loop starts and `join`s the first contact that answers (a contact still
+  file) is a joiner too: its host calls `begin_join` before the inbox loop starts
+  and `join`s the first contact that answers (a contact still
   joining stays silent, so a half-bootstrapped replica never hands out a partial
   snapshot); `join` fails if the snapshot cannot be installed, and persists the
   adopted floor so a restart keeps dependencies on compacted transactions
@@ -1073,8 +1058,8 @@ backend (sql/fjall). Phases, in order:
         its in-flight votes, recovery promises, config-Paxos promises and clock
         bound; a rejoin now keeps the journal and rebuilds only the store
         (#287, see Phase B).
-        A replica that lost its journal had to come back under a new node id —
-        under a `GroupHost`, a new identity for the whole host. Rejoining under
+        A replica that lost its journal had to come back under a new node id.
+        Rejoining under
         its old id over an empty journal, it voted with what it remembered
         (a new write could commit without the forgotten one among its
         dependencies, and a recovery invalidate a decided write on its
@@ -1208,8 +1193,8 @@ backend (sql/fjall). Phases, in order:
         A new payload *type* is **additive** instead — a fresh `RecordKind`, no version
         bump (the version byte is shared with the journal, so bumping it for a wire-only
         addition would invalidate every journal on disk): `GroupFrame` (kind 6, the
-        multiplexed wire frame) was added this way, `TcpTransport` still emits kind 1,
-        and an older build sheds kind 6 as an unknown kind.
+        multiplexed wire frame of the many-groups transport, since removed) was added
+        this way, and its byte stays reserved so it is never reused.
   - [x] **Snapshot-at-scale** — `ExecutorDataStore::snapshot_page` reads the backend
         one `SNAPSHOT_PAGE_SIZE`-event page at a time and trims it to a byte budget,
         and a joiner pulls those pages one request at a time

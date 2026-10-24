@@ -11,7 +11,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::api::{stable_hash_extend, MessageSink, STABLE_HASH_SEED};
@@ -27,22 +26,6 @@ pub struct Envelope {
     pub from: NodeId,
     /// The delivered message.
     pub message: Message,
-}
-
-/// Identifies one independent consensus group (one `Node` per host, one data store,
-/// one journal) among the many a single process can host over a shared
-/// multiplexed transport (`crate::tcp::MuxTransport`). Groups never share consensus
-/// state: a `TxnId`, `Ballot`, or watermark is only ever compared within one group,
-/// so two groups can safely reuse the same `NodeId`s on the same hosts. A natural
-/// use is one group per tenant, each with its own database.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct GroupId(pub u64);
-
-impl GroupId {
-    /// The group a legacy single-group transport (`TcpTransport`, `serve`) speaks for.
-    /// A multiplexed listener delivers un-grouped frames here, so a classic node and a
-    /// multiplexed host interoperate as long as the classic node is in group zero.
-    pub const DEFAULT: GroupId = GroupId(0);
 }
 
 /// Inbox channel capacity — the backpressure bound. A node that falls far enough
@@ -439,7 +422,7 @@ impl InMemoryNetwork {
             .is_some();
         // An encoding error still leaves a digest: the trace records that
         // the message was handed over, whatever it held.
-        let digest = encode_tagged(RecordKind::GroupFrame, message)
+        let digest = encode_tagged(RecordKind::WireFrame, message)
             .map_or(0, |bytes| stable_hash_extend(STABLE_HASH_SEED, &bytes));
         let kind = record.then(|| {
             let debug = format!("{message:?}");
@@ -499,7 +482,7 @@ impl InMemoryNetwork {
         let Some(cap) = *self.frame_cap.lock().expect("network poisoned") else {
             return true;
         };
-        encode_tagged(RecordKind::GroupFrame, message).is_ok_and(|bytes| bytes.len() <= cap)
+        encode_tagged(RecordKind::WireFrame, message).is_ok_and(|bytes| bytes.len() <= cap)
     }
 
     /// The configured delivery latency on `from → to` (zero if unset).

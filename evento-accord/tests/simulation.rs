@@ -3681,8 +3681,7 @@ async fn sweep_for_bugs() {
 impl Sim {
     /// What a host does when node `i` is told to rejoin: tears it down, builds
     /// a fresh node over an **empty** store and its **kept** journal, and
-    /// joins through `contact` before its sweeps start (as
-    /// `GroupHost::open_joining` does).
+    /// joins through `contact` before its sweeps start.
     async fn rejoin(&mut self, i: usize, contact: NodeId, config: NodeConfig) {
         let store = SimStore::new(self.store_kind, &self.outcomes);
         self.arm_store(i, &store);
@@ -3691,10 +3690,9 @@ impl Sim {
     }
 
     /// What a host does when node `i` lost its journal along with its store
-    /// — a dead disk (#312): retires the node, as `GroupHost::close` does (a
-    /// writer still holding it mints nothing more under its id), gives it an
-    /// empty store and journal, and opens it **joining** under its old id (as
-    /// `GroupHost::open_joining` does). The node fences itself: until a
+    /// — a dead disk (#312): retires the node (a writer still holding it
+    /// mints nothing more under its id), gives it an empty store and journal,
+    /// and opens it **joining** under its old id. The node fences itself: until a
     /// contact vouches past the fence ([`join_amnesiac`](Self::join_amnesiac))
     /// it votes on nothing and refuses reads, though it serves writers and
     /// readers ([`Live`]) at once.
@@ -3742,8 +3740,7 @@ impl Sim {
     }
 
     /// Tears node `i` down and reopens it joining over its journal and an
-    /// empty store, as `GroupHost::open_joining` does — its inbox running,
-    /// its join and sweeps to come.
+    /// empty store — its inbox running, its join and sweeps to come.
     async fn reopen_joining(&mut self, i: usize) -> Result<(), String> {
         for t in &self.tasks[i] {
             t.abort();

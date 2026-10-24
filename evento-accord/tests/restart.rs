@@ -449,3 +449,41 @@ async fn repeated_restarts_keep_the_clock_within_the_skew_bound() {
         nodes[0] = restarted;
     }
 }
+
+/// A retired node mints nothing more: a write through it — a clone the
+/// application still holds — fails with `NodeClosed`, so it can never mint an
+/// id the node reopened over the same journal mints too. That node writes on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retired_node_refuses_to_write_and_the_reopened_one_writes_on() {
+    use evento_accord::NodeClosed;
+
+    let id = NodeId(0);
+    let net = InMemoryNetwork::new();
+    let journal = Arc::new(InMemoryJournal::new());
+    let store = Arc::new(InMemoryDataStore::new());
+    let open = |inbox| {
+        let node = Node::new(
+            id,
+            Arc::new(StaticTopology::new(id, vec![id])) as Arc<dyn Topology>,
+            Arc::new(HybridLogicalClock::new(id)),
+            Arc::new(net.sink(id)),
+            Arc::clone(&store) as Arc<dyn DataStore>,
+            Arc::clone(&journal) as Arc<dyn Journal>,
+        );
+        let task = node.start(inbox);
+        (node, task)
+    };
+
+    let (node, task) = open(net.register(id));
+    node.write(vec![event("acc", 1)]).await.unwrap();
+
+    node.retire().await;
+    task.abort();
+    let err = node.write(vec![event("acc", 2)]).await.unwrap_err();
+    assert!(err.is::<NodeClosed>(), "unexpected error: {err:#}");
+
+    let (reopened, _task) = open(net.register(id));
+    reopened.recover_state().await.unwrap();
+    reopened.write(vec![event("acc", 2)]).await.unwrap();
+    assert_eq!(store.version("test/Account", "acc").await.unwrap(), 2);
+}
