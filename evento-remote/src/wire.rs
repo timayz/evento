@@ -26,8 +26,7 @@ pub const MAGIC: [u8; 2] = *b"Er";
 /// connection; the server requires `Hello` as the first frame.
 /// v5: tenants — events carry their tenant, every scan request a
 /// `TenantFilter` and every identity, subscriber and snapshot request a
-/// tenant; `HelloOk` names the session's tenant, and write errors the tenant
-/// refusals.
+/// tenant, and write errors the tenant refusals.
 pub const FORMAT_VERSION: u8 = 5;
 
 /// Length of the fixed header: `MAGIC (2) + version (1) + kind (1)`.
@@ -255,10 +254,6 @@ impl std::fmt::Debug for Token {
 pub struct HelloOk {
     /// The served executor's default routing key, fixed for the connection.
     pub default_routing_key: Option<String>,
-    /// The tenant the served executor is scoped to, fixed for the connection:
-    /// a resolver confining a client to its tenant serves it a scoped
-    /// executor, which acts in that tenant whatever the client's requests say.
-    pub tenant: Option<String>,
 }
 
 /// Why a server refused a connection at `Hello`.
@@ -551,7 +546,6 @@ mod tests {
         for response in [
             Response::Hello(Ok(HelloOk {
                 default_routing_key: Some("eu".to_owned()),
-                tenant: Some("acme".to_owned()),
             })),
             Response::Hello(Err(Rejection::Unavailable("down".to_owned()))),
         ] {
@@ -570,10 +564,7 @@ mod tests {
                 panic!("wrong frame");
             };
             match reply {
-                Ok(ok) => {
-                    assert_eq!(ok.default_routing_key.as_deref(), Some("eu"));
-                    assert_eq!(ok.tenant.as_deref(), Some("acme"));
-                }
+                Ok(ok) => assert_eq!(ok.default_routing_key.as_deref(), Some("eu")),
                 Err(err) => assert_eq!(err.to_string(), "unavailable: down"),
             }
         }

@@ -1,7 +1,15 @@
-//! Tenants over one shared store: the resolver serves each token the store
-//! scoped to its tenant, and a client — whatever it sends — reaches nothing
-//! of another tenant's events, snapshots or subscriptions.
+//! Tenants over one shared store: the host application's resolver maps each
+//! token to a tenant and serves the store scoped to it, and a client —
+//! whatever it sends — reaches nothing of another tenant's events, snapshots
+//! or subscriptions, while its own code stays tenant-agnostic.
 
+use std::sync::{Arc, Mutex};
+
+use bank::aggregator::AccountOpened;
+use bank::{AccountType, OpenAccount};
+use evento::metadata::Event as Typed;
+use evento::subscription::{Context, SubscriptionBuilder};
+use evento::Sidecar;
 use evento_core::cursor::{Args, Value};
 use evento_core::{Event, EventFilter, Evento, Executor, TenantFilter, WriteError};
 use evento_fjall::Fjall;
@@ -78,7 +86,7 @@ async fn a_client_reaches_only_its_own_tenant() {
     let _server = serve_with(listener, ByTenant(store.clone()));
     let a = connect(addr, "a").await;
     let b = connect(addr, "b").await;
-    assert_eq!(a.tenant(), Some("a"), "Hello names the session's tenant");
+    assert_eq!(a.tenant(), None, "the client itself names no tenant");
 
     // Tenant-agnostic writes land in each client's tenant: one aggregate id,
     // two streams.
@@ -177,5 +185,97 @@ async fn a_bad_tenant_token_is_refused() {
                 .is_some_and(|rejection| *rejection == Rejection::Unauthorized),
             "{token}: {err:#}"
         );
+    }
+}
+
+/// The accounts a subscription saw opened, in order.
+#[derive(Clone, Default)]
+struct Opened(Arc<Mutex<Vec<String>>>);
+
+#[evento::subscription]
+async fn on_account_opened<E: Executor>(
+    context: &Context<'_, E>,
+    event: Typed<AccountOpened>,
+) -> anyhow::Result<()> {
+    let opened = context.extract::<Opened>();
+    opened.0.lock().unwrap().push(event.aggregate_id.clone());
+    Ok(())
+}
+
+async fn open_account<E: Executor>(executor: E, owner: &str) -> String {
+    bank::Command(executor)
+        .open_account(OpenAccount {
+            owner_id: owner.to_owned(),
+            owner_name: owner.to_owned(),
+            account_type: AccountType::Checking,
+            currency: "USD".to_owned(),
+            initial_balance: 100,
+        })
+        .await
+        .unwrap()
+}
+
+/// A tenant application follows the shared store through a `Sidecar` — the
+/// remote client as its events source, its own store for everything else —
+/// over a session the server scoped to its tenant. Its code names no tenant:
+/// it reads, loads and subscribes to its tenant's events only, its writes
+/// land in its tenant, and its cursors and snapshots stay in its own store,
+/// under the default tenant.
+#[tokio::test]
+async fn a_sidecar_follows_only_its_tenant() {
+    let store = Fjall::temporary().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let _server = serve_with(listener, ByTenant(store.clone()));
+
+    let theirs = open_account(connect(addr, "b").await, "owner-b").await;
+    let local = Fjall::temporary().unwrap();
+    let app = Sidecar::from((connect(addr, "a").await, local.clone()));
+    let ours = open_account(app.clone(), "owner-a").await;
+
+    let opened = Opened::default();
+    SubscriptionBuilder::new("accounts")
+        .data(opened.clone())
+        .handler(on_account_opened())
+        .run_once(&app)
+        .await
+        .unwrap();
+    assert_eq!(*opened.0.lock().unwrap(), [ours.clone()]);
+
+    let command = bank::Command(app.clone());
+    assert!(command.load(&ours).await.unwrap().is_some());
+    assert!(
+        command.load(&theirs).await.unwrap().is_none(),
+        "another tenant's account is out of reach"
+    );
+
+    // On the server, the app's account landed in its tenant.
+    let filter = Some([EventFilter::by_id_raw("bank/BankAccount", ours.clone())].into());
+    for (tenant, expected) in [("a", 1), ("", 0), ("b", 0)] {
+        let read = store
+            .read(
+                filter.clone(),
+                None,
+                TenantFilter::Only(tenant.to_owned()),
+                Args::forward(10, None),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.edges.len(), expected, "tenant {tenant:?}");
+    }
+
+    // The bookkeeping is local, in the default tenant, as before tenants.
+    assert!(local
+        .get_subscriber_cursor(String::new(), "accounts".to_owned())
+        .await
+        .unwrap()
+        .is_some());
+    for tenant in ["", "a"] {
+        assert!(store
+            .get_subscriber_cursor(tenant.to_owned(), "accounts".to_owned())
+            .await
+            .unwrap()
+            .is_none());
     }
 }
