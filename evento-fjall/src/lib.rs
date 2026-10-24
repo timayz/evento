@@ -47,10 +47,12 @@
 //! NUL — without one aggregate's keys colliding with or shadowing another's:
 //!
 //! - `events` - Primary storage: `ULID -> Event`
-//! - `agg_index` - Aggregate version index: `enc(type, id) + {version BE}` -> `ULID`
-//! - `subscribers` - Subscription state: `{key}` -> `SubscriberState`
-//! - `projection_snapshots` - Projection snapshots:
-//!   `enc(type, projection, id)` -> `StoredSnapshot`
+//! - `agg_index` - Aggregate version index: `enc(type, id, tenant) + {version
+//!   BE}` -> `ULID` (a stream is identified by its tenant, type and id)
+//! - `tenant_subscribers` - Subscription state: `enc(tenant, key)` ->
+//!   `SubscriberState`
+//! - `tenant_snapshots` - Projection snapshots:
+//!   `enc(tenant, type, projection, id)` -> `StoredSnapshot`
 //! - `meta` - Store metadata: the monotonic commit clock (`last_stamp`) and the
 //!   on-disk index-layout version (`index_version`)
 //!
@@ -61,15 +63,25 @@
 //! whole-prefix scan:
 //!
 //! - `cursor_all` - `{cursor_key}` -> `()`
-//! - `cursor_agg` - `enc(type, id) + {cursor_key}` -> `()`
-//! - `cursor_agg_name` - `enc(type, id, name) + {cursor_key}` -> `()`
+//! - `cursor_agg` - `enc(type, id, tenant) + {cursor_key}` -> `()`
+//! - `cursor_agg_name` - `enc(type, id, tenant, name) + {cursor_key}` -> `()`
 //! - `cursor_type` - `enc(type) + {cursor_key}` -> `()`
 //! - `cursor_type_name` - `enc(type, name) + {cursor_key}` -> `()`
+//! - `cursor_type_tenant` - `enc(type, tenant) + {cursor_key}` -> `()`
+//! - `cursor_type_name_tenant` - `enc(type, tenant, name) + {cursor_key}` -> `()`
 //! - `cursor_routing` - `{0x01}enc(routing_key) + {cursor_key}` (or
 //!   `{0x00} + {cursor_key}` for events without a routing key) -> `()`
 //!
+//! A read of one tenant uses the keyspaces keyed by tenant; a read of every
+//! tenant uses `cursor_type`/`cursor_type_name` (a read of one aggregate in
+//! every tenant too, filtering on the id). Every loaded event is checked
+//! against the whole read filter, so a source only has to hold a superset of
+//! the matches, in cursor order.
+//!
 //! Opening a database whose `index_version` predates this layout rebuilds the
-//! cursor keyspaces from `events` (one O(total events) pass, then never again).
+//! index keyspaces from `events` (one O(total events) pass, then never again),
+//! moves the subscribers of a store that predates tenants into the default
+//! tenant (`""`), and drops its snapshots (a cache).
 //!
 //! # Ordering
 //!
@@ -117,6 +129,12 @@ struct StoredSnapshot {
 }
 
 /// Stored event in fjall format.
+///
+/// `tenant` is the last field: an event stored before tenants existed
+/// ([`StoredEventV1`]) is its prefix, so it never decodes as this layout
+/// (bitcode runs out of input) and this layout never decodes as the old one
+/// (bitcode refuses leftover bytes) — [`StoredEvent::decode`] tells them
+/// apart without rewriting the old events.
 #[derive(Debug, Clone, bitcode::Encode, bitcode::Decode)]
 struct StoredEvent {
     id: String,
@@ -129,6 +147,46 @@ struct StoredEvent {
     metadata: Metadata,
     timestamp: u64,
     timestamp_subsec: u32,
+    tenant: String,
+}
+
+/// An event stored before tenants existed: in the default tenant.
+#[derive(Debug, Clone, bitcode::Encode, bitcode::Decode)]
+struct StoredEventV1 {
+    id: String,
+    aggregate_id: String,
+    aggregate_type: String,
+    version: u16,
+    name: String,
+    routing_key: Option<String>,
+    data: Vec<u8>,
+    metadata: Metadata,
+    timestamp: u64,
+    timestamp_subsec: u32,
+}
+
+impl StoredEvent {
+    /// Decodes a stored event of either layout.
+    fn decode(bytes: &[u8]) -> anyhow::Result<Self> {
+        if let Ok(stored) = bitcode::decode::<StoredEvent>(bytes) {
+            return Ok(stored);
+        }
+        let v1: StoredEventV1 = bitcode::decode(bytes)
+            .map_err(|e| anyhow::anyhow!("Failed to deserialize event: {}", e))?;
+        Ok(StoredEvent {
+            id: v1.id,
+            aggregate_id: v1.aggregate_id,
+            aggregate_type: v1.aggregate_type,
+            version: v1.version,
+            name: v1.name,
+            routing_key: v1.routing_key,
+            data: v1.data,
+            metadata: v1.metadata,
+            timestamp: v1.timestamp,
+            timestamp_subsec: v1.timestamp_subsec,
+            tenant: String::new(),
+        })
+    }
 }
 
 impl From<&Event> for StoredEvent {
@@ -144,6 +202,7 @@ impl From<&Event> for StoredEvent {
             metadata: event.metadata.clone(),
             timestamp: event.timestamp,
             timestamp_subsec: event.timestamp_subsec,
+            tenant: event.tenant.clone(),
         }
     }
 }
@@ -159,9 +218,7 @@ impl TryFrom<StoredEvent> for Event {
             version: stored.version,
             name: stored.name,
             routing_key: stored.routing_key,
-            // Not stored yet: the executor refuses every tenant but the
-            // default one.
-            tenant: String::new(),
+            tenant: stored.tenant,
             data: stored.data,
             metadata: stored.metadata,
             timestamp: stored.timestamp,
@@ -205,6 +262,8 @@ pub struct Fjall {
     cursor_agg_name: Keyspace,
     cursor_type: Keyspace,
     cursor_type_name: Keyspace,
+    cursor_type_tenant: Keyspace,
+    cursor_type_name_tenant: Keyspace,
     cursor_routing: Keyspace,
     subscribers: Keyspace,
     snapshots: Keyspace,
@@ -246,29 +305,43 @@ const LAST_STAMP_KEY: &[u8] = b"last_stamp";
 /// Absent (version 0) means the legacy ULID-ordered index layout.
 const INDEX_VERSION_KEY: &[u8] = b"index_version";
 
-/// The current index layout: cursor-ordered `cursor_*` keyspaces. Opening a
-/// database stamped with a different version rebuilds them from `events`.
-const INDEX_VERSION: u64 = 2;
+/// The current index layout: cursor-ordered `cursor_*` keyspaces and the
+/// aggregate index, keyed by tenant (3). Opening a database stamped with a
+/// different version rebuilds them from `events`.
+const INDEX_VERSION: u64 = 3;
 
 /// Length of the cursor-ordered key suffix:
 /// `{timestamp BE u64}{subsec BE u32}{version BE u16}{ULID bytes}`.
 const CURSOR_KEY_LEN: usize = 8 + 4 + 2 + 16;
 
-/// Names of the cursor-index keyspaces plus the legacy (pre-`INDEX_VERSION` 2)
+/// Keyspace holding projection snapshots, keyed
+/// `enc(tenant, type, projection, id)`.
+const SNAPSHOTS_KEYSPACE: &str = "tenant_snapshots";
+
+/// Keyspaces that held snapshots before they were keyed by tenant — keyed
+/// `enc(type, projection, id)`, and before that `enc(type, id)`. They are a
+/// cache, dropped on open.
+const LEGACY_SNAPSHOTS_KEYSPACES: &[&str] = &["projection_snapshots", "snapshots"];
+
+/// Keyspace holding subscriber state, keyed `enc(tenant, key)`.
+const SUBSCRIBERS_KEYSPACE: &str = "tenant_subscribers";
+
+/// Keyspace that held subscriber state keyed by the bare key, before tenants:
+/// its rows move into the default tenant on open.
+const LEGACY_SUBSCRIBERS_KEYSPACE: &str = "subscribers";
+
+/// Names of the index keyspaces plus the legacy (pre-`INDEX_VERSION` 2)
 /// index keyspaces — everything a rebuild deletes before re-indexing. Legacy
 /// names stay listed so an upgraded database reclaims their space.
-/// Keyspace holding projection snapshots, keyed `enc(type, projection, id)`.
-const SNAPSHOTS_KEYSPACE: &str = "projection_snapshots";
-
-/// Keyspace that held snapshots keyed `enc(type, id)`; dropped on open.
-const LEGACY_SNAPSHOTS_KEYSPACE: &str = "snapshots";
-
 const REBUILT_KEYSPACES: &[&str] = &[
+    "agg_index",
     "cursor_all",
     "cursor_agg",
     "cursor_agg_name",
     "cursor_type",
     "cursor_type_name",
+    "cursor_type_tenant",
+    "cursor_type_name_tenant",
     "cursor_routing",
     // Legacy ULID-ordered indexes, superseded by the cursor keyspaces.
     "agg_name_index",
@@ -287,6 +360,8 @@ impl Clone for Fjall {
             cursor_agg_name: self.cursor_agg_name.clone(),
             cursor_type: self.cursor_type.clone(),
             cursor_type_name: self.cursor_type_name.clone(),
+            cursor_type_tenant: self.cursor_type_tenant.clone(),
+            cursor_type_name_tenant: self.cursor_type_name_tenant.clone(),
             cursor_routing: self.cursor_routing.clone(),
             subscribers: self.subscribers.clone(),
             snapshots: self.snapshots.clone(),
@@ -357,8 +432,10 @@ impl Fjall {
     /// Use this when you need custom database configuration.
     ///
     /// The first open of a database written by an older layout rebuilds the
-    /// cursor-index keyspaces from `events` — one O(total events) pass, made
-    /// durable before this returns; subsequent opens skip it.
+    /// index keyspaces from `events` — one O(total events) pass, made durable
+    /// before this returns; subsequent opens skip it. Subscribers of a store
+    /// that predates tenants move into the default tenant, and its snapshots
+    /// (a cache) are dropped.
     ///
     /// # Example
     ///
@@ -411,15 +488,18 @@ impl Fjall {
             }
         }
 
-        // Snapshots used to be keyed `enc(type, id)` in a `snapshots` keyspace,
-        // with nothing telling two projections of one aggregate apart. They
-        // are a cache, so the legacy keyspace is dropped rather than migrated;
-        // every projection rebuilds from events on its next load.
-        if db.keyspace_exists(LEGACY_SNAPSHOTS_KEYSPACE) {
-            let keyspace =
-                db.keyspace(LEGACY_SNAPSHOTS_KEYSPACE, KeyspaceCreateOptions::default)?;
-            db.delete_keyspace(keyspace)?;
+        // Snapshots used to be keyed without the tenant (and, before that,
+        // without the projection). They are a cache, so the legacy keyspaces
+        // are dropped rather than migrated; every projection rebuilds from
+        // events on its next load.
+        for name in LEGACY_SNAPSHOTS_KEYSPACES {
+            if db.keyspace_exists(name) {
+                let keyspace = db.keyspace(name, KeyspaceCreateOptions::default)?;
+                db.delete_keyspace(keyspace)?;
+            }
         }
+        let subscribers = db.keyspace(SUBSCRIBERS_KEYSPACE, KeyspaceCreateOptions::default)?;
+        Self::move_legacy_subscribers(&db, &subscribers)?;
 
         let executor = Self {
             events: db.keyspace("events", KeyspaceCreateOptions::default)?,
@@ -429,8 +509,12 @@ impl Fjall {
             cursor_agg_name: db.keyspace("cursor_agg_name", KeyspaceCreateOptions::default)?,
             cursor_type: db.keyspace("cursor_type", KeyspaceCreateOptions::default)?,
             cursor_type_name: db.keyspace("cursor_type_name", KeyspaceCreateOptions::default)?,
+            cursor_type_tenant: db
+                .keyspace("cursor_type_tenant", KeyspaceCreateOptions::default)?,
+            cursor_type_name_tenant: db
+                .keyspace("cursor_type_name_tenant", KeyspaceCreateOptions::default)?,
             cursor_routing: db.keyspace("cursor_routing", KeyspaceCreateOptions::default)?,
-            subscribers: db.keyspace("subscribers", KeyspaceCreateOptions::default)?,
+            subscribers,
             snapshots: db.keyspace(SNAPSHOTS_KEYSPACE, KeyspaceCreateOptions::default)?,
             meta,
             write_lock: Arc::new(Mutex::new(())),
@@ -442,7 +526,7 @@ impl Fjall {
         };
 
         if index_version != INDEX_VERSION {
-            executor.rebuild_cursor_indexes()?;
+            executor.rebuild_indexes()?;
             // Stamp + fsync last: a crash mid-rebuild leaves the version
             // absent, so the next open simply redoes the (idempotent) rebuild.
             executor
@@ -454,18 +538,52 @@ impl Fjall {
         Ok(executor)
     }
 
-    /// Re-derives every cursor-index entry from the `events` keyspace, in
-    /// batched (unsynced) commits; the caller persists once afterwards.
-    fn rebuild_cursor_indexes(&self) -> anyhow::Result<()> {
+    /// Moves the subscribers of a store that predates tenants — keyed by the
+    /// bare subscription key — into the default tenant, then drops their
+    /// keyspace. Idempotent: a crash before the drop copies the same rows
+    /// again on the next open, before anything else could have changed them.
+    fn move_legacy_subscribers(db: &Database, subscribers: &Keyspace) -> anyhow::Result<()> {
+        if !db.keyspace_exists(LEGACY_SUBSCRIBERS_KEYSPACE) {
+            return Ok(());
+        }
+        let legacy = db.keyspace(LEGACY_SUBSCRIBERS_KEYSPACE, KeyspaceCreateOptions::default)?;
+        let mut batch = db.batch();
+        for guard in legacy.iter() {
+            let (key, value) = guard.into_inner()?;
+            batch.insert(
+                subscribers,
+                Self::encode_components(&[b"", key.as_ref()]),
+                value.as_ref(),
+            );
+        }
+        batch.commit()?;
+        db.persist(PersistMode::SyncAll)?;
+        db.delete_keyspace(legacy)?;
+        Ok(())
+    }
+
+    /// Re-derives every index entry (the aggregate index and the cursor
+    /// indexes) from the `events` keyspace, in batched (unsynced) commits; the
+    /// caller persists once afterwards.
+    fn rebuild_indexes(&self) -> anyhow::Result<()> {
         const REBUILD_BATCH: usize = 8_192;
 
         let mut batch = self.db.batch();
         let mut pending = 0usize;
         for guard in self.events.iter() {
             let (_, value) = guard.into_inner()?;
-            let stored: StoredEvent = bitcode::decode(value.as_ref())
-                .map_err(|e| anyhow::anyhow!("Failed to deserialize event: {}", e))?;
+            let stored = StoredEvent::decode(value.as_ref())?;
             let id = Ulid::from_string(&stored.id)?;
+            batch.insert(
+                &self.agg_index,
+                Self::agg_key(
+                    &stored.aggregate_type,
+                    &stored.aggregate_id,
+                    &stored.tenant,
+                    stored.version,
+                ),
+                id.to_bytes(),
+            );
             let suffix = Self::cursor_key_suffix(
                 stored.timestamp,
                 stored.timestamp_subsec,
@@ -476,6 +594,7 @@ impl Fjall {
                 &mut batch,
                 &stored.aggregate_type,
                 &stored.aggregate_id,
+                &stored.tenant,
                 &stored.name,
                 stored.routing_key.as_deref(),
                 &suffix,
@@ -510,8 +629,14 @@ impl Fjall {
     /// A disabled subscription reports "not running" to its worker, which
     /// stops without processing further events. Missing subscribers are
     /// ignored.
-    pub async fn set_subscriber_enabled(&self, key: String, enabled: bool) -> anyhow::Result<()> {
+    pub async fn set_subscriber_enabled(
+        &self,
+        tenant: String,
+        key: String,
+        enabled: bool,
+    ) -> anyhow::Result<()> {
         let executor = self.clone();
+        let key = Self::subscriber_key(&tenant, &key);
 
         tokio::task::spawn_blocking(move || {
             let _guard = executor
@@ -524,9 +649,7 @@ impl Fjall {
             let mut state: SubscriberState = bitcode::decode(bytes.as_ref())
                 .map_err(|e| anyhow::anyhow!("Failed to deserialize subscriber: {}", e))?;
             state.enabled = enabled;
-            executor
-                .subscribers
-                .insert(key.as_bytes(), bitcode::encode(&state))?;
+            executor.subscribers.insert(key, bitcode::encode(&state))?;
             Ok(())
         })
         .await?
@@ -564,24 +687,56 @@ impl Fjall {
     }
 
     /// Builds the aggregate index key.
-    fn agg_key(aggregate_type: &str, aggregate_id: &str, version: u16) -> Vec<u8> {
-        let mut key = Self::agg_prefix(aggregate_type, aggregate_id);
+    fn agg_key(aggregate_type: &str, aggregate_id: &str, tenant: &str, version: u16) -> Vec<u8> {
+        let mut key = Self::agg_prefix(aggregate_type, aggregate_id, tenant);
         key.extend_from_slice(&version.to_be_bytes());
         key
     }
 
-    /// Builds the aggregate index prefix (without version).
-    fn agg_prefix(aggregate_type: &str, aggregate_id: &str) -> Vec<u8> {
-        Self::encode_components(&[aggregate_type.as_bytes(), aggregate_id.as_bytes()])
-    }
-
-    /// Builds the aggregate-name cursor-index prefix: `enc(type, id, name)`.
-    fn agg_name_prefix(aggregate_type: &str, aggregate_id: &str, name: &str) -> Vec<u8> {
+    /// Builds the aggregate index prefix (without version), also the
+    /// aggregate cursor-index prefix: `enc(type, id, tenant)`.
+    fn agg_prefix(aggregate_type: &str, aggregate_id: &str, tenant: &str) -> Vec<u8> {
         Self::encode_components(&[
             aggregate_type.as_bytes(),
             aggregate_id.as_bytes(),
+            tenant.as_bytes(),
+        ])
+    }
+
+    /// Builds the aggregate-name cursor-index prefix: `enc(type, id, tenant,
+    /// name)`.
+    fn agg_name_prefix(
+        aggregate_type: &str,
+        aggregate_id: &str,
+        tenant: &str,
+        name: &str,
+    ) -> Vec<u8> {
+        Self::encode_components(&[
+            aggregate_type.as_bytes(),
+            aggregate_id.as_bytes(),
+            tenant.as_bytes(),
             name.as_bytes(),
         ])
+    }
+
+    /// Builds the type-tenant cursor-index prefix: `enc(type, tenant)`.
+    fn type_tenant_prefix(aggregate_type: &str, tenant: &str) -> Vec<u8> {
+        Self::encode_components(&[aggregate_type.as_bytes(), tenant.as_bytes()])
+    }
+
+    /// Builds the type-tenant-name cursor-index prefix: `enc(type, tenant,
+    /// name)`.
+    fn type_tenant_name_prefix(aggregate_type: &str, tenant: &str, name: &str) -> Vec<u8> {
+        Self::encode_components(&[
+            aggregate_type.as_bytes(),
+            tenant.as_bytes(),
+            name.as_bytes(),
+        ])
+    }
+
+    /// Builds a subscriber key: `enc(tenant, key)`.
+    fn subscriber_key(tenant: &str, key: &str) -> Vec<u8> {
+        Self::encode_components(&[tenant.as_bytes(), key.as_bytes()])
     }
 
     /// Builds the type-name cursor-index prefix: `enc(type, name)`.
@@ -635,11 +790,13 @@ impl Fjall {
     }
 
     /// Stages one event's entry into each cursor-index keyspace.
+    #[allow(clippy::too_many_arguments)]
     fn insert_cursor_entries(
         &self,
         batch: &mut fjall::OwnedWriteBatch,
         aggregate_type: &str,
         aggregate_id: &str,
+        tenant: &str,
         name: &str,
         routing_key: Option<&str>,
         suffix: &[u8; CURSOR_KEY_LEN],
@@ -647,13 +804,29 @@ impl Fjall {
         batch.insert(&self.cursor_all, *suffix, []);
         batch.insert(
             &self.cursor_agg,
-            Self::with_suffix(Self::agg_prefix(aggregate_type, aggregate_id), suffix),
+            Self::with_suffix(
+                Self::agg_prefix(aggregate_type, aggregate_id, tenant),
+                suffix,
+            ),
             [],
         );
         batch.insert(
             &self.cursor_agg_name,
             Self::with_suffix(
-                Self::agg_name_prefix(aggregate_type, aggregate_id, name),
+                Self::agg_name_prefix(aggregate_type, aggregate_id, tenant, name),
+                suffix,
+            ),
+            [],
+        );
+        batch.insert(
+            &self.cursor_type_tenant,
+            Self::with_suffix(Self::type_tenant_prefix(aggregate_type, tenant), suffix),
+            [],
+        );
+        batch.insert(
+            &self.cursor_type_name_tenant,
+            Self::with_suffix(
+                Self::type_tenant_name_prefix(aggregate_type, tenant, name),
                 suffix,
             ),
             [],
@@ -675,22 +848,24 @@ impl Fjall {
         );
     }
 
-    /// Builds the snapshot key.
-    fn snapshot_key(aggregate_type: &str, projection: &str, id: &str) -> Vec<u8> {
+    /// Builds the snapshot key: `enc(tenant, type, projection, id)`.
+    fn snapshot_key(tenant: &str, aggregate_type: &str, projection: &str, id: &str) -> Vec<u8> {
         Self::encode_components(&[
+            tenant.as_bytes(),
             aggregate_type.as_bytes(),
             projection.as_bytes(),
             id.as_bytes(),
         ])
     }
 
-    /// Gets the last version for an aggregate.
+    /// Gets the last version of the stream `(tenant, type, id)`.
     fn get_last_version(
         &self,
+        tenant: &str,
         aggregate_type: &str,
         aggregate_id: &str,
     ) -> anyhow::Result<Option<u16>> {
-        let prefix = Self::agg_prefix(aggregate_type, aggregate_id);
+        let prefix = Self::agg_prefix(aggregate_type, aggregate_id, tenant);
 
         if let Some(guard) = self.agg_index.prefix(&prefix).next_back() {
             let (key, _) = guard.into_inner()?;
@@ -708,65 +883,106 @@ impl Fjall {
     /// Loads an event by its ULID.
     fn load_event(&self, id: &Ulid) -> anyhow::Result<Option<Event>> {
         match self.events.get(id.to_bytes())? {
-            Some(bytes) => {
-                let stored: StoredEvent = bitcode::decode(bytes.as_ref())
-                    .map_err(|e| anyhow::anyhow!("Failed to deserialize event: {}", e))?;
-                Ok(Some(stored.try_into()?))
-            }
+            Some(bytes) => Ok(Some(StoredEvent::decode(bytes.as_ref())?.try_into()?)),
             None => Ok(None),
         }
     }
 
     /// Resolves the read filters to cursor-index scan sources — `(keyspace,
-    /// prefix)` pairs whose keys under `prefix` are in cursor order. The flag
-    /// says whether the routing key must still be checked per loaded event
-    /// (the aggregator indexes don't encode it).
+    /// prefix)` pairs whose keys under `prefix` are in cursor order and hold
+    /// at least every match. Every loaded event is checked against the whole
+    /// filter ([`Fjall::matches`]), so a source may hold more: the routing key
+    /// is in no aggregator index, and a read of every tenant falls back to the
+    /// keyspaces without the tenant.
     fn cursor_sources(
         &self,
         aggregators: &Option<Arc<[EventFilter]>>,
         routing_key: &Option<RoutingKey>,
-    ) -> (Vec<(&Keyspace, Vec<u8>)>, bool) {
+        tenant: &TenantFilter,
+    ) -> Vec<(&Keyspace, Vec<u8>)> {
         match (aggregators, routing_key) {
-            (Some(aggs), routing) => {
+            (Some(aggs), _) => {
                 // Subscriptions emit one filter per handler, and those often
-                // collapse to identical values (e.g. `by_type` once per
-                // handler): scan each distinct filter once, not once per
-                // handler.
-                let mut seen_filters = std::collections::HashSet::new();
-                let mut sources = Vec::new();
+                // collapse to one source (e.g. `by_type` once per handler):
+                // scan each distinct source once, not once per handler.
+                let mut sources: Vec<(&Keyspace, Vec<u8>)> = Vec::new();
                 for agg in aggs.iter() {
-                    if !seen_filters.insert(agg) {
-                        continue;
-                    }
-                    sources.push(match (&agg.aggregate_id, &agg.name) {
-                        (Some(id), Some(name)) => (
+                    let t = &agg.aggregate_type;
+                    let source = match (tenant, &agg.aggregate_id, &agg.name) {
+                        (TenantFilter::Only(tenant), Some(id), Some(name)) => (
                             &self.cursor_agg_name,
-                            Self::agg_name_prefix(&agg.aggregate_type, id, name),
+                            Self::agg_name_prefix(t, id, tenant, name),
                         ),
-                        (Some(id), None) => {
-                            (&self.cursor_agg, Self::agg_prefix(&agg.aggregate_type, id))
+                        (TenantFilter::Only(tenant), Some(id), None) => {
+                            (&self.cursor_agg, Self::agg_prefix(t, id, tenant))
                         }
-                        (None, Some(name)) => (
-                            &self.cursor_type_name,
-                            Self::type_prefix(&agg.aggregate_type, name),
+                        (TenantFilter::Only(tenant), None, Some(name)) => (
+                            &self.cursor_type_name_tenant,
+                            Self::type_tenant_name_prefix(t, tenant, name),
                         ),
-                        (None, None) => (
-                            &self.cursor_type,
-                            Self::type_only_prefix(&agg.aggregate_type),
+                        (TenantFilter::Only(tenant), None, None) => (
+                            &self.cursor_type_tenant,
+                            Self::type_tenant_prefix(t, tenant),
                         ),
+                        // Every tenant: the aggregate keyspaces are keyed by
+                        // tenant after the id, so a prefix of one aggregate
+                        // would not come out in cursor order — scan the type,
+                        // filtering on the id.
+                        (TenantFilter::All, _, Some(name)) => {
+                            (&self.cursor_type_name, Self::type_prefix(t, name))
+                        }
+                        (TenantFilter::All, _, None) => {
+                            (&self.cursor_type, Self::type_only_prefix(t))
+                        }
+                    };
+                    let seen = sources.iter().any(|(keyspace, prefix)| {
+                        std::ptr::eq(*keyspace, source.0) && *prefix == source.1
                     });
+                    if !seen {
+                        sources.push(source);
+                    }
                 }
-                (sources, matches!(routing, Some(RoutingKey::Value(_))))
+                sources
             }
-            (None, Some(RoutingKey::Value(key))) => (
-                vec![(
-                    &self.cursor_routing,
-                    Self::routing_cursor_prefix(key.as_deref()),
-                )],
-                false,
-            ),
-            (None, Some(RoutingKey::All) | None) => (vec![(&self.cursor_all, Vec::new())], false),
+            (None, Some(RoutingKey::Value(key))) => vec![(
+                &self.cursor_routing,
+                Self::routing_cursor_prefix(key.as_deref()),
+            )],
+            (None, Some(RoutingKey::All) | None) => vec![(&self.cursor_all, Vec::new())],
         }
+    }
+
+    /// Whether `event` passes the whole read filter: its tenant, its routing
+    /// key, one of the aggregator filters, and the stamp bound.
+    fn matches(
+        event: &Event,
+        aggregators: &Option<Arc<[EventFilter]>>,
+        routing_key: &Option<RoutingKey>,
+        tenant: &TenantFilter,
+        to_micros: Option<u64>,
+    ) -> bool {
+        let aggregate = aggregators.as_deref().is_none_or(|filters| {
+            filters.iter().any(|f| {
+                f.aggregate_type == event.aggregate_type
+                    && f.aggregate_id
+                        .as_ref()
+                        .is_none_or(|id| *id == event.aggregate_id)
+                    && f.name.as_ref().is_none_or(|name| *name == event.name)
+            })
+        });
+        let routing = match routing_key {
+            Some(RoutingKey::Value(Some(key))) => event.routing_key.as_ref() == Some(key),
+            Some(RoutingKey::Value(None)) => event.routing_key.is_none(),
+            Some(RoutingKey::All) | None => true,
+        };
+        let below = to_micros.is_none_or(|bound| {
+            event
+                .timestamp
+                .saturating_mul(1_000_000)
+                .saturating_add(u64::from(event.timestamp_subsec) * 1_000)
+                < bound
+        });
+        aggregate && routing && tenant.matches(&event.tenant) && below
     }
 
     /// Serves a `read` off the cursor-ordered indexes: seek each distinct
@@ -777,6 +993,7 @@ impl Fjall {
         &self,
         aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<RoutingKey>,
+        tenant: TenantFilter,
         args: Args,
         to_micros: Option<u64>,
     ) -> anyhow::Result<ReadResult<Event>> {
@@ -825,7 +1042,7 @@ impl Fjall {
             None => None,
         };
 
-        let (sources, check_routing) = self.cursor_sources(&aggregators, &routing_key);
+        let sources = self.cursor_sources(&aggregators, &routing_key, &tenant);
 
         let mut picked: HashSet<Ulid> = HashSet::new();
         let mut rejected: HashSet<Ulid> = HashSet::new();
@@ -888,25 +1105,10 @@ impl Fjall {
                     continue;
                 };
 
-                let routing_matches = !check_routing
-                    || match &routing_key {
-                        Some(RoutingKey::Value(Some(key))) => {
-                            event.routing_key.as_ref() == Some(key)
-                        }
-                        Some(RoutingKey::Value(None)) => event.routing_key.is_none(),
-                        Some(RoutingKey::All) | None => true,
-                    };
-                // Defensive re-check of the stamp bound (the range's upper
-                // bound already enforces it).
-                let below_bound = to_micros.is_none_or(|bound| {
-                    event
-                        .timestamp
-                        .saturating_mul(1_000_000)
-                        .saturating_add(u64::from(event.timestamp_subsec) * 1_000)
-                        < bound
-                });
-
-                if routing_matches && below_bound {
+                // The source holds a superset of the matches; the stamp bound
+                // is re-checked defensively (the range's upper bound already
+                // enforces it).
+                if Self::matches(&event, &aggregators, &routing_key, &tenant, to_micros) {
                     picked.insert(ulid);
                     events.push(event);
                     matches += 1;
@@ -964,14 +1166,18 @@ impl Fjall {
         // Validate versions first (optimistic concurrency). `seen` tracks the
         // version assigned earlier in THIS batch so multiple events for the same
         // aggregate (e.g. a create() committing several events) validate correctly.
-        let mut seen: std::collections::HashMap<(String, String), u16> =
+        let mut seen: std::collections::HashMap<(String, String, String), u16> =
             std::collections::HashMap::new();
         for event in &events {
-            let agg = (event.aggregate_type.clone(), event.aggregate_id.clone());
+            let agg = (
+                event.tenant.clone(),
+                event.aggregate_type.clone(),
+                event.aggregate_id.clone(),
+            );
             let last_version = match seen.get(&agg) {
                 Some(v) => Some(*v),
                 None => self
-                    .get_last_version(&event.aggregate_type, &event.aggregate_id)
+                    .get_last_version(&event.tenant, &event.aggregate_type, &event.aggregate_id)
                     .map_err(WriteError::Unknown)?,
             };
 
@@ -1013,8 +1219,13 @@ impl Fjall {
             // Primary: ULID -> Event
             batch.insert(&self.events, id_bytes, event_bytes);
 
-            // Aggregate version index: enc(type, id) + version -> ULID
-            let agg_key = Fjall::agg_key(&event.aggregate_type, &event.aggregate_id, event.version);
+            // Aggregate version index: enc(type, id, tenant) + version -> ULID
+            let agg_key = Fjall::agg_key(
+                &event.aggregate_type,
+                &event.aggregate_id,
+                &event.tenant,
+                event.version,
+            );
             batch.insert(&self.agg_index, agg_key, id_bytes);
 
             // Cursor-ordered indexes (uses the final stamp, so entries land in
@@ -1029,6 +1240,7 @@ impl Fjall {
                 &mut batch,
                 &event.aggregate_type,
                 &event.aggregate_id,
+                &event.tenant,
                 &event.name,
                 event.routing_key.as_deref(),
                 &suffix,
@@ -1056,40 +1268,12 @@ impl Fjall {
     }
 }
 
-/// Refuses a tenant other than the default one: the store does not yet keep
-/// the tenant, so a tenant's call is refused rather than served from — or
-/// written into — the default tenant.
-fn default_tenant_only(tenant: &str) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        tenant.is_empty(),
-        "evento-fjall does not support tenants yet (tenant {tenant:?})"
-    );
-    Ok(())
-}
-
-/// [`default_tenant_only`] for a scan: every tenant, or the default one.
-fn default_tenant_filter_only(tenant: &TenantFilter) -> anyhow::Result<()> {
-    match tenant {
-        TenantFilter::All => Ok(()),
-        TenantFilter::Only(tenant) => default_tenant_only(tenant),
-    }
-}
-
-/// [`default_tenant_only`] for every event of a write.
-fn default_tenant_events_only(events: &[Event]) -> Result<(), WriteError> {
-    for event in events {
-        default_tenant_only(&event.tenant).map_err(WriteError::Unknown)?;
-    }
-    Ok(())
-}
-
 #[async_trait::async_trait]
 impl Executor for Fjall {
     async fn write(&self, events: Vec<Event>) -> Result<(), WriteError> {
         if events.is_empty() {
             return Ok(());
         }
-        default_tenant_events_only(&events)?;
         let executor = self.clone();
 
         tokio::task::spawn_blocking(move || executor.write_events(events, true))
@@ -1107,7 +1291,6 @@ impl Executor for Fjall {
         if events.is_empty() {
             return Ok(());
         }
-        default_tenant_events_only(&events)?;
         let executor = self.clone();
 
         // Replication layers own ordering: persist caller timestamps verbatim.
@@ -1132,30 +1315,52 @@ impl Executor for Fjall {
         args: Args,
         to_micros: Option<u64>,
     ) -> anyhow::Result<ReadResult<Event>> {
-        default_tenant_filter_only(&tenant)?;
         let executor = self.clone();
 
         tokio::task::spawn_blocking(move || {
-            executor.read_indexed(aggregators, routing_key, args, to_micros)
+            executor.read_indexed(aggregators, routing_key, tenant, args, to_micros)
         })
         .await?
     }
 
     async fn latest_timestamp(
         &self,
-        _aggregators: Option<Arc<[EventFilter]>>,
-        _routing_key: Option<RoutingKey>,
+        aggregators: Option<Arc<[EventFilter]>>,
+        routing_key: Option<RoutingKey>,
         tenant: TenantFilter,
     ) -> anyhow::Result<u64> {
-        default_tenant_filter_only(&tenant)?;
-        // The commit clock is the max timestamp over ALL events. Using it
-        // instead of a filtered lookup makes this O(1) rather than a full
-        // load-and-sort of every matching event on every subscription poll;
-        // the cost is that lag reported for a quiet stream can reflect writes
-        // to other streams (an upper bound, never an undercount). Lock-free:
-        // this must never wait on a writer's critical section from the async
-        // runtime.
-        Ok(self.last_stamp.load(std::sync::atomic::Ordering::Acquire) / 1000)
+        if tenant == TenantFilter::All {
+            // The commit clock is the max timestamp over ALL events. Using it
+            // instead of a filtered lookup makes this O(1) rather than a full
+            // load-and-sort of every matching event on every subscription poll;
+            // the cost is that lag reported for a quiet stream can reflect
+            // writes to other streams (an upper bound, never an undercount).
+            // Lock-free: this must never wait on a writer's critical section
+            // from the async runtime.
+            return Ok(self.last_stamp.load(std::sync::atomic::Ordering::Acquire) / 1000);
+        }
+        // One tenant's: the global clock would tell its reader when the other
+        // tenants last wrote. The newest match of each source instead.
+        let executor = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut latest = 0;
+            for (keyspace, prefix) in executor.cursor_sources(&aggregators, &routing_key, &tenant) {
+                for guard in keyspace.prefix(&prefix).rev() {
+                    let (key, _) = guard.into_inner()?;
+                    let key = key.as_ref();
+                    let ulid_bytes: [u8; 16] = key[key.len() - 16..].try_into()?;
+                    let Some(event) = executor.load_event(&Ulid::from_bytes(ulid_bytes))? else {
+                        continue;
+                    };
+                    if Fjall::matches(&event, &aggregators, &routing_key, &tenant, None) {
+                        latest = latest.max(event.timestamp);
+                        break;
+                    }
+                }
+            }
+            Ok(latest)
+        })
+        .await?
     }
 
     async fn get_subscriber_cursor(
@@ -1163,8 +1368,8 @@ impl Executor for Fjall {
         tenant: String,
         key: String,
     ) -> anyhow::Result<Option<Value>> {
-        default_tenant_only(&tenant)?;
         let executor = self.clone();
+        let key = Fjall::subscriber_key(&tenant, &key);
 
         tokio::task::spawn_blocking(move || match executor.subscribers.get(&key)? {
             Some(bytes) => {
@@ -1183,8 +1388,8 @@ impl Executor for Fjall {
         key: String,
         worker_id: Ulid,
     ) -> anyhow::Result<bool> {
-        default_tenant_only(&tenant)?;
         let executor = self.clone();
+        let key = Fjall::subscriber_key(&tenant, &key);
 
         tokio::task::spawn_blocking(move || match executor.subscribers.get(&key)? {
             Some(bytes) => {
@@ -1203,8 +1408,8 @@ impl Executor for Fjall {
         key: String,
         worker_id: Ulid,
     ) -> anyhow::Result<SubscriberStatus> {
-        default_tenant_only(&tenant)?;
         let executor = self.clone();
+        let key = Fjall::subscriber_key(&tenant, &key);
 
         tokio::task::spawn_blocking(move || match executor.subscribers.get(&key)? {
             Some(bytes) => {
@@ -1226,7 +1431,6 @@ impl Executor for Fjall {
         aggregate_type: String,
         aggregate_id: String,
     ) -> anyhow::Result<u16> {
-        default_tenant_only(&tenant)?;
         let executor = self.clone();
 
         // A single reverse seek on the version-ordered aggregate index —
@@ -1234,7 +1438,7 @@ impl Executor for Fjall {
         // timestamp.
         tokio::task::spawn_blocking(move || {
             Ok(executor
-                .get_last_version(&aggregate_type, &aggregate_id)?
+                .get_last_version(&tenant, &aggregate_type, &aggregate_id)?
                 .unwrap_or(0))
         })
         .await?
@@ -1246,13 +1450,12 @@ impl Executor for Fjall {
         aggregate_type: String,
         aggregate_id: String,
     ) -> anyhow::Result<Option<Option<String>>> {
-        default_tenant_only(&tenant)?;
         let executor = self.clone();
 
         // Version 1 is the stream's first event and carries the routing key
         // the stream was created with: one index point-get + one event load.
         tokio::task::spawn_blocking(move || {
-            let key = Fjall::agg_key(&aggregate_type, &aggregate_id, 1);
+            let key = Fjall::agg_key(&aggregate_type, &aggregate_id, &tenant, 1);
             let Some(id_bytes) = executor.agg_index.get(&key)? else {
                 return Ok(None);
             };
@@ -1273,8 +1476,8 @@ impl Executor for Fjall {
         key: String,
         worker_id: Ulid,
     ) -> anyhow::Result<()> {
-        default_tenant_only(&tenant)?;
         let executor = self.clone();
+        let key = Fjall::subscriber_key(&tenant, &key);
 
         tokio::task::spawn_blocking(move || {
             // Read-modify-write under the write lock so a concurrent upsert or
@@ -1301,9 +1504,7 @@ impl Executor for Fjall {
                 },
             };
 
-            executor
-                .subscribers
-                .insert(key.as_bytes(), bitcode::encode(&state))?;
+            executor.subscribers.insert(key, bitcode::encode(&state))?;
             Ok(())
         })
         .await?
@@ -1317,8 +1518,8 @@ impl Executor for Fjall {
         cursor: Value,
         lag: u64,
     ) -> anyhow::Result<bool> {
-        default_tenant_only(&tenant)?;
         let executor = self.clone();
+        let key = Fjall::subscriber_key(&tenant, &key);
 
         tokio::task::spawn_blocking(move || {
             // Fenced read-modify-write under the write lock: a superseded
@@ -1343,9 +1544,7 @@ impl Executor for Fjall {
             state.cursor = Some(cursor.0);
             state.lag = lag;
 
-            executor
-                .subscribers
-                .insert(key.as_bytes(), bitcode::encode(&state))?;
+            executor.subscribers.insert(key, bitcode::encode(&state))?;
             Ok(true)
         })
         .await?
@@ -1359,11 +1558,10 @@ impl Executor for Fjall {
         aggregate_revision: String,
         id: String,
     ) -> anyhow::Result<Option<(Vec<u8>, Value)>> {
-        default_tenant_only(&tenant)?;
         let executor = self.clone();
 
         tokio::task::spawn_blocking(move || {
-            let key = Fjall::snapshot_key(&aggregate_type, &projection, &id);
+            let key = Fjall::snapshot_key(&tenant, &aggregate_type, &projection, &id);
             match executor.snapshots.get(&key)? {
                 Some(bytes) => {
                     // A snapshot is a cache: an unreadable one is a miss (the
@@ -1406,11 +1604,10 @@ impl Executor for Fjall {
         data: Vec<u8>,
         cursor: Value,
     ) -> anyhow::Result<()> {
-        default_tenant_only(&tenant)?;
         let executor = self.clone();
 
         tokio::task::spawn_blocking(move || {
-            let key = Fjall::snapshot_key(&aggregate_type, &projection, &id);
+            let key = Fjall::snapshot_key(&tenant, &aggregate_type, &projection, &id);
             let stored = StoredSnapshot {
                 revision: aggregate_revision,
                 data,
@@ -1430,11 +1627,10 @@ impl Executor for Fjall {
         projection: String,
         id: String,
     ) -> anyhow::Result<()> {
-        default_tenant_only(&tenant)?;
         let executor = self.clone();
 
         tokio::task::spawn_blocking(move || {
-            let key = Fjall::snapshot_key(&aggregate_type, &projection, &id);
+            let key = Fjall::snapshot_key(&tenant, &aggregate_type, &projection, &id);
             executor.snapshots.remove(key)?;
             Ok(())
         })
@@ -1637,7 +1833,7 @@ mod tests {
 
         // Disabling the subscription reports "not running"
         executor
-            .set_subscriber_enabled(key.clone(), false)
+            .set_subscriber_enabled(String::new(), key.clone(), false)
             .await
             .unwrap();
         assert!(!executor
@@ -1923,26 +2119,173 @@ mod tests {
         }
     }
 
-    /// Opening a database that still has the `enc(type, id)`-keyed `snapshots`
-    /// keyspace drops it: those snapshots cannot be attributed to a projection.
+    /// Opening a database that still has a legacy snapshots keyspace drops it:
+    /// those snapshots are keyed without the tenant (or the projection).
     #[tokio::test]
     async fn test_open_drops_legacy_snapshots_keyspace() {
         let temp_dir = tempfile::tempdir().unwrap();
 
         {
             let db = Database::builder(temp_dir.path()).open().unwrap();
-            let legacy = db
-                .keyspace(LEGACY_SNAPSHOTS_KEYSPACE, KeyspaceCreateOptions::default)
-                .unwrap();
-            legacy.insert("stale", [1u8, 2, 3]).unwrap();
+            for name in LEGACY_SNAPSHOTS_KEYSPACES {
+                let legacy = db.keyspace(name, KeyspaceCreateOptions::default).unwrap();
+                legacy.insert("stale", [1u8, 2, 3]).unwrap();
+            }
             db.persist(PersistMode::SyncAll).unwrap();
         }
 
         let db = Database::builder(temp_dir.path()).open().unwrap();
-        assert!(db.keyspace_exists(LEGACY_SNAPSHOTS_KEYSPACE));
         let _executor = Fjall::from_database(db.clone()).unwrap();
-        assert!(!db.keyspace_exists(LEGACY_SNAPSHOTS_KEYSPACE));
+        for name in LEGACY_SNAPSHOTS_KEYSPACES {
+            assert!(!db.keyspace_exists(name), "{name} survived the open");
+        }
         assert!(db.keyspace_exists(SNAPSHOTS_KEYSPACE));
+    }
+
+    fn sample_v1(id: &str, data: Vec<u8>) -> StoredEventV1 {
+        StoredEventV1 {
+            id: Ulid::generate().to_string(),
+            aggregate_id: id.to_owned(),
+            aggregate_type: "test/Account".to_owned(),
+            version: 1,
+            name: "Opened".to_owned(),
+            routing_key: None,
+            data,
+            metadata: Metadata::default(),
+            timestamp: 1_700_000_000,
+            timestamp_subsec: 7,
+        }
+    }
+
+    /// An event stored before tenants and one stored with a tenant never
+    /// decode as each other's layout, whatever their fields hold: the old one
+    /// reads back in the default tenant, the new one with its tenant.
+    #[test]
+    fn stored_event_layouts_are_told_apart() {
+        for (id, data, tenant) in [
+            ("a", vec![], ""),
+            ("", vec![0u8; 1], "acme"),
+            ("agg-1", vec![7u8; 300], "t"),
+            ("ünïcode", (0..=255u8).collect(), "a-much-longer-tenant-id"),
+        ] {
+            let v1 = sample_v1(id, data.clone());
+            let v1_bytes = bitcode::encode(&v1);
+            assert!(bitcode::decode::<StoredEvent>(&v1_bytes).is_err());
+            let read = StoredEvent::decode(&v1_bytes).unwrap();
+            assert_eq!((read.aggregate_id.as_str(), read.tenant.as_str()), (id, ""));
+            assert_eq!(read.data, data);
+
+            let v2 = StoredEvent {
+                tenant: tenant.to_owned(),
+                ..StoredEvent::decode(&v1_bytes).unwrap()
+            };
+            let v2_bytes = bitcode::encode(&v2);
+            assert!(bitcode::decode::<StoredEventV1>(&v2_bytes).is_err());
+            let read = StoredEvent::decode(&v2_bytes).unwrap();
+            assert_eq!(
+                (read.aggregate_id.as_str(), read.tenant.as_str()),
+                (id, tenant)
+            );
+            assert_eq!(read.data, data);
+        }
+    }
+
+    /// A store written before tenants opens: its events read back in the
+    /// default tenant off rebuilt indexes, its subscribers keep their cursors
+    /// there, and the keyspaces it no longer uses are gone.
+    #[tokio::test]
+    async fn test_open_upgrades_a_store_that_predates_tenants() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let legacy_state = SubscriberState {
+            worker_id: Ulid::nil().to_string(),
+            cursor: Some("cursor-1".to_owned()),
+            lag: 3,
+            enabled: true,
+        };
+
+        {
+            let db = Database::builder(temp_dir.path()).open().unwrap();
+            let events = db
+                .keyspace("events", KeyspaceCreateOptions::default)
+                .unwrap();
+            for version in 1..=2 {
+                let mut v1 = sample_v1("old-agg", vec![version as u8]);
+                v1.version = version;
+                v1.timestamp += u64::from(version);
+                let id = Ulid::from_string(&v1.id).unwrap();
+                events.insert(id.to_bytes(), bitcode::encode(&v1)).unwrap();
+            }
+            let subscribers = db
+                .keyspace(LEGACY_SUBSCRIBERS_KEYSPACE, KeyspaceCreateOptions::default)
+                .unwrap();
+            subscribers
+                .insert("billing", bitcode::encode(&legacy_state))
+                .unwrap();
+            let meta = db.keyspace("meta", KeyspaceCreateOptions::default).unwrap();
+            meta.insert(INDEX_VERSION_KEY, 2u64.to_be_bytes()).unwrap();
+            db.persist(PersistMode::SyncAll).unwrap();
+        }
+
+        let db = Database::builder(temp_dir.path()).open().unwrap();
+        let executor = Fjall::from_database(db.clone()).unwrap();
+        assert!(!db.keyspace_exists(LEGACY_SUBSCRIBERS_KEYSPACE));
+
+        let read = executor
+            .read(
+                Some([EventFilter::by_id_raw("test/Account", "old-agg")].into()),
+                None,
+                TenantFilter::Only(String::new()),
+                Args::forward(10, None),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.edges.len(), 2);
+        assert!(read.edges.iter().all(|e| e.node.tenant.is_empty()));
+        assert_eq!(
+            executor
+                .latest_version(
+                    String::new(),
+                    "test/Account".to_owned(),
+                    "old-agg".to_owned()
+                )
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            executor
+                .get_subscriber_cursor(String::new(), "billing".to_owned())
+                .await
+                .unwrap(),
+            Some(Value("cursor-1".to_owned()))
+        );
+        assert!(executor
+            .is_subscriber_running(String::new(), "billing".to_owned(), Ulid::nil())
+            .await
+            .unwrap());
+
+        // The stream keeps growing in the default tenant, and a tenant's
+        // stream of the same id starts at version 1.
+        let mut next = create_test_event("old-agg", 3, "Deposited");
+        next.routing_key = None;
+        executor.write(vec![next]).await.unwrap();
+        let mut theirs = create_test_event("old-agg", 1, "Opened");
+        theirs.tenant = "acme".to_owned();
+        executor.write(vec![theirs]).await.unwrap();
+        for (tenant, version) in [("", 3), ("acme", 1)] {
+            assert_eq!(
+                executor
+                    .latest_version(
+                        tenant.to_owned(),
+                        "test/Account".to_owned(),
+                        "old-agg".to_owned()
+                    )
+                    .await
+                    .unwrap(),
+                version
+            );
+        }
     }
 
     /// Opening a database stamped with an older index layout rebuilds the
