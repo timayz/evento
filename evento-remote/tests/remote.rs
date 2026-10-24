@@ -542,12 +542,6 @@ async fn remote_tenant_streams_are_isolated() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn remote_tenant_scope_is_enforced() -> anyhow::Result<()> {
-    let server = setup().await?;
-    evento_test::tenant_scope_is_enforced(&server.client).await
-}
-
-#[tokio::test]
 async fn remote_tenant_subscriptions() -> anyhow::Result<()> {
     let server = setup().await?;
     evento_test::tenant_subscriptions(&server.client).await

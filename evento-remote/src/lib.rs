@@ -38,17 +38,17 @@
 //!
 //! Which tenant a client belongs to is the host application's decision — its
 //! resolver maps the token (an API key, say) to one. To confine the client to
-//! that tenant over a store shared by every tenant, serve the store scoped to
-//! it, `Evento::new(store.clone()).tenant(tenant)?`
-//! ([`Evento::tenant`](evento_core::Evento::tenant)): the scoped executor acts
-//! in that tenant whatever the client's requests say — what it reads and loads,
-//! the tenant its writes are stamped with — and refuses `replicate`, so the
-//! client never reaches another tenant's data. The client itself stays
-//! tenant-agnostic: a tenant application following the store through a
-//! `Sidecar` (evento-core's `rw` feature) keeps its cursors and snapshots in its own
-//! store as before. What a session still shares: the write notifications every
-//! client is pushed, which carry a store-wide counter — a client sees when, and
-//! how often, the store is written, never what.
+//! that tenant over a store shared by every tenant, serve the connection in it,
+//! `Session::new(store.clone()).tenant(tenant)?` ([`Session::tenant`]): every
+//! request then acts in that tenant whatever it names — what it reads and
+//! loads, the tenant its writes are stamped with — and `replicate` and the
+//! subscriber calls are refused, so the client never reaches another tenant's
+//! data. The client itself stays tenant-agnostic: a tenant application
+//! following the store through a `Sidecar` (evento-core's `rw` feature) keeps
+//! its subscriptions' cursors and its snapshots in its own store. What a
+//! session still shares: the write notifications every client is pushed, which
+//! carry a store-wide counter — a client sees when, and how often, the store is
+//! written, never what.
 //!
 //! **Addresses.** A client names its server by an [`Address`]: an IP and port,
 //! or a `host:port` looked up again on every connection attempt, so a

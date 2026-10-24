@@ -78,23 +78,6 @@ pub enum WriteError {
     #[error("aggregate version overflow")]
     VersionOverflow,
 
-    /// An event names a tenant other than the one the executor is scoped to
-    /// ([`Evento::tenant`](crate::Evento::tenant)). Nothing was written.
-    #[error("an event of tenant {found:?} cannot be written through an executor scoped to tenant {expected:?}")]
-    ForeignTenant {
-        /// The tenant the executor is scoped to.
-        expected: String,
-        /// The tenant the event names.
-        found: String,
-    },
-
-    /// `replicate` through an executor scoped to a tenant
-    /// ([`Evento::tenant`](crate::Evento::tenant)): it persists the caller's
-    /// timestamps and skips the version-contiguity check, which only a
-    /// trusted, unscoped replication layer may do. Nothing was written.
-    #[error("replicate is refused through an executor scoped to a tenant")]
-    ReplicateRefused,
-
     /// The store is not taking writes right now and will again on its own:
     /// a replicated executor whose backlog for a node that is away reached
     /// its cap, or a node told to rejoin its group. Nothing about the write
@@ -388,15 +371,11 @@ impl WriteBuilder {
         self
     }
 
-    /// Commits in `tenant` instead of the executor's (see
-    /// [`Executor::tenant`]; unscoped executors act in the default tenant,
-    /// `""`).
+    /// Commits in `tenant` instead of the default tenant (`""`).
     ///
     /// The tenant is part of the stream's identity: the same aggregate id in
-    /// two tenants names two streams. An executor scoped to another tenant
-    /// refuses the commit ([`WriteError::ForeignTenant`]). Useful in a
-    /// handler of a subscription over every tenant, which writes in the
-    /// tenant of the event it handles.
+    /// two tenants names two streams. A subscription handler writes in the
+    /// tenant of the event it handles with `.tenant(&event.tenant)`.
     pub fn tenant(&mut self, v: impl Into<String>) -> &mut Self {
         self.tenant = Some(v.into());
         self
@@ -476,11 +455,7 @@ impl WriteBuilder {
         if let Some((expected, got)) = self.mixed_types {
             return Err(WriteError::MixedAggregateTypes { expected, got });
         }
-        let tenant = self
-            .tenant
-            .clone()
-            .or_else(|| executor.tenant().map(str::to_owned))
-            .unwrap_or_default();
+        let tenant = self.tenant.clone().unwrap_or_default();
         if tenant.len() > crate::MAX_TENANT_LEN {
             return Err(WriteError::Unknown(
                 crate::TenantError::TooLong(tenant.len()).into(),
@@ -594,7 +569,8 @@ pub fn append(id: impl Into<String>) -> WriteBuilder {
 }
 
 /// Convenience queries about an aggregate's event stream, implemented for
-/// every [`Executor`].
+/// every [`Executor`]. They read the default tenant's stream; read another
+/// tenant's with [`ReadBuilder::tenant`](crate::ReadBuilder::tenant).
 pub trait AggregateExt<E: Executor> {
     /// Returns `true` if the aggregate `id` has at least one event of type `A`
     /// — or of an older event that [upcasts](AggregateEvent::upcasters) into it.
@@ -625,9 +601,14 @@ impl<E: Executor> AggregateExt<E> for E {
                 .map(|name| EventFilter::exact_raw(A::aggregate_type(), id.clone(), name))
                 .collect::<Arc<[EventFilter]>>();
 
-            let tenant = TenantFilter::Only(self.tenant().unwrap_or_default().to_owned());
             let result = self
-                .read(Some(filters), None, tenant, Args::backward(1, None), None)
+                .read(
+                    Some(filters),
+                    None,
+                    TenantFilter::Only(String::new()),
+                    Args::backward(1, None),
+                    None,
+                )
                 .await?;
 
             Ok(!result.edges.is_empty())
@@ -640,12 +621,11 @@ impl<E: Executor> AggregateExt<E> for E {
     ) -> impl std::future::Future<Output = anyhow::Result<Option<u16>>> + Send {
         let id = id.into();
         Box::pin(async {
-            let tenant = TenantFilter::Only(self.tenant().unwrap_or_default().to_owned());
             let result = self
                 .read(
                     Some(Arc::from([EventFilter::by_id::<A>(id)])),
                     None,
-                    tenant,
+                    TenantFilter::Only(String::new()),
                     Args::backward(1, None),
                     None,
                 )
@@ -683,32 +663,21 @@ pub(crate) mod tests {
         async fn write(&self, _events: Vec<Event>) -> Result<(), WriteError> {
             unreachable!()
         }
-        async fn get_subscriber_cursor(
-            &self,
-            _tenant: String,
-            _key: String,
-        ) -> anyhow::Result<Option<Value>> {
+        async fn get_subscriber_cursor(&self, _key: String) -> anyhow::Result<Option<Value>> {
             unreachable!()
         }
         async fn is_subscriber_running(
             &self,
-            _tenant: String,
             _key: String,
             _worker_id: Ulid,
         ) -> anyhow::Result<bool> {
             unreachable!()
         }
-        async fn upsert_subscriber(
-            &self,
-            _tenant: String,
-            _key: String,
-            _worker_id: Ulid,
-        ) -> anyhow::Result<()> {
+        async fn upsert_subscriber(&self, _key: String, _worker_id: Ulid) -> anyhow::Result<()> {
             unreachable!()
         }
         async fn acknowledge(
             &self,
-            _tenant: String,
             _key: String,
             _worker_id: Ulid,
             _cursor: Value,

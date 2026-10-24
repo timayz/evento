@@ -371,33 +371,17 @@ impl Executor for Client {
         }
     }
 
-    async fn get_subscriber_cursor(
-        &self,
-        tenant: String,
-        key: String,
-    ) -> anyhow::Result<Option<Value>> {
-        match self
-            .request(Request::GetSubscriberCursor { tenant, key })
-            .await?
-        {
+    async fn get_subscriber_cursor(&self, key: String) -> anyhow::Result<Option<Value>> {
+        match self.request(Request::GetSubscriberCursor { key }).await? {
             Response::SubscriberCursor(Ok(v)) => Ok(v),
             Response::SubscriberCursor(Err(msg)) => Err(anyhow::anyhow!(msg)),
             _ => Err(protocol_err("get_subscriber_cursor")),
         }
     }
 
-    async fn is_subscriber_running(
-        &self,
-        tenant: String,
-        key: String,
-        worker_id: Ulid,
-    ) -> anyhow::Result<bool> {
+    async fn is_subscriber_running(&self, key: String, worker_id: Ulid) -> anyhow::Result<bool> {
         match self
-            .request(Request::IsSubscriberRunning {
-                tenant,
-                key,
-                worker_id,
-            })
+            .request(Request::IsSubscriberRunning { key, worker_id })
             .await?
         {
             Response::SubscriberRunning(Ok(v)) => Ok(v),
@@ -408,16 +392,11 @@ impl Executor for Client {
 
     async fn subscriber_status(
         &self,
-        tenant: String,
         key: String,
         worker_id: Ulid,
     ) -> anyhow::Result<evento_core::SubscriberStatus> {
         match self
-            .request(Request::SubscriberStatus {
-                tenant,
-                key,
-                worker_id,
-            })
+            .request(Request::SubscriberStatus { key, worker_id })
             .await?
         {
             Response::SubscriberStatus(Ok(v)) => Ok(v),
@@ -466,18 +445,9 @@ impl Executor for Client {
         }
     }
 
-    async fn upsert_subscriber(
-        &self,
-        tenant: String,
-        key: String,
-        worker_id: Ulid,
-    ) -> anyhow::Result<()> {
+    async fn upsert_subscriber(&self, key: String, worker_id: Ulid) -> anyhow::Result<()> {
         match self
-            .request(Request::UpsertSubscriber {
-                tenant,
-                key,
-                worker_id,
-            })
+            .request(Request::UpsertSubscriber { key, worker_id })
             .await?
         {
             Response::Unit(Ok(())) => Ok(()),
@@ -488,7 +458,6 @@ impl Executor for Client {
 
     async fn acknowledge(
         &self,
-        tenant: String,
         key: String,
         worker_id: Ulid,
         cursor: Value,
@@ -496,7 +465,6 @@ impl Executor for Client {
     ) -> anyhow::Result<bool> {
         match self
             .request(Request::Acknowledge {
-                tenant,
                 key,
                 worker_id,
                 cursor,

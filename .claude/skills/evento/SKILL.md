@@ -81,8 +81,9 @@ let client = evento::RemoteClient::connect("127.0.0.1:4321").await?;
   `Err(Rejection)`, which the client sees as its `connect` error.
   Pass it to `serve_with(listener, resolver)`. It runs again on every reconnect.
   To confine a client to its tenant over one shared store, serve
-  `Session::new(Evento::new(store.clone()).tenant(tenant)?)`: the scoped executor
-  replaces every tenant the client sends and refuses `replicate`.
+  `Session::new(store.clone()).tenant(tenant)?`: every request on the connection
+  acts in that tenant whatever it names, and `replicate` and the subscriber calls
+  are refused — a tenant's app keeps its subscriptions local (`Sidecar`).
 - **TLS:** `serve_tls(listener, acceptor, exec)` / `serve_tls_with(listener, acceptor, resolver)`
   take a `tokio_rustls::TlsAcceptor`; the client side is
   `.builder(addr).tls(connector, server_name)`. Plain TCP is for trusted networks —
@@ -393,11 +394,12 @@ aggregate type as a string; it has no `.decode()`.
   routing key is NULL. `.any_routing_key()` subscriptions are stored per
   executor-default-routing-key.
 - **Tenants are part of stream identity** (`(tenant, type, id)`, default tenant `""`).
-  `Evento::new(exec).tenant("acme")?` scopes every write, load, read, snapshot and
-  cursor; builders take `.tenant(t)` (writes, `Projection::load`, `evento::read`,
-  subscriptions). A subscription reads only the default tenant unless
-  `.all_tenants()` — one subscription for every tenant — or `.tenant(t)`;
-  a projection subscription over every tenant loads each event in its own tenant.
+  Writes, loads and reads act in the default tenant unless the builder says
+  `.tenant(t)` (writes, `Projection::load`, `evento::read`); `has_event` /
+  `original_version` read the default tenant. Subscriptions have no tenant option:
+  they read every tenant, handlers see `event.tenant` (write back with
+  `.tenant(&event.tenant)`), and a projection subscription loads each event in its
+  own tenant.
 - **The subscription key is the cursor identity.** Reusing a key across two different
   subscriptions makes them share (and corrupt) one cursor. Keep keys unique — except under
   `.ephemeral()`, where nothing is stored under the key and any number of subscriptions may

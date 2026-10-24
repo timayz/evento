@@ -64,9 +64,8 @@
 //! - [`M0007`] - Keys snapshots by projection: recreates `snapshot` with primary key
 //!   `(type, projection, id)` (existing snapshots are discarded; they are a cache)
 //! - [`M0008`] - Adds the tenant: `event.tenant` joins the stream's identity (unique
-//!   `(type, id, tenant, version)`) and gets a `(type, tenant, …cursor)` index,
-//!   `snapshot` is keyed by `(tenant, type, projection, id)` (snapshots discarded) and
-//!   `subscriber` by `(tenant, key)` (rows kept, in the default tenant `''`)
+//!   `(type, id, tenant, version)`) and gets a `(type, tenant, …cursor)` index, and
+//!   `snapshot` is keyed by `(tenant, type, projection, id)` (snapshots discarded)
 //!
 //! # Database Schema
 //!
@@ -108,12 +107,11 @@
 //!
 //! ## Subscriber Table
 //!
-//! Tracks event subscription progress; primary key `(tenant, key)`:
+//! Tracks event subscription progress:
 //!
 //! | Column | Type | Description |
 //! |--------|------|-------------|
-//! | `tenant` | VARCHAR(255) | Tenant the subscription belongs to |
-//! | `key` | VARCHAR(255) | Subscriber identifier |
+//! | `key` | VARCHAR(255) | Subscriber identifier (primary key) |
 //! | `worker_id` | VARCHAR(26) | Associated worker ID |
 //! | `cursor` | TEXT | Current event stream position |
 //! | `lag` | INTEGER | Seconds behind the newest matching event |

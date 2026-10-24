@@ -138,8 +138,7 @@ pub enum Snapshot {
 ///
 /// # Columns
 ///
-/// - `Tenant` - The tenant the subscription belongs to (primary key, with `Key`)
-/// - `Key` - Subscriber identifier (primary key, with `Tenant`)
+/// - `Key` - Subscriber identifier (primary key)
 /// - `WorkerId` - ULID of the current worker processing events
 /// - `Cursor` - Current position in the event stream
 /// - `Lag` - Seconds behind the newest matching event (not an event count)
@@ -149,9 +148,7 @@ pub enum Snapshot {
 pub enum Subscriber {
     /// The table name: `subscriber`
     Table,
-    /// The tenant the subscription belongs to (primary key, with `Key`)
-    Tenant,
-    /// Subscriber key (primary key, with `Tenant`)
+    /// Subscriber key (primary key)
     Key,
     /// Current worker ID (ULID)
     WorkerId,
@@ -545,15 +542,10 @@ where
         Ok(ts.map(|v| if v < 0 { 0 } else { v as u64 }).unwrap_or(0))
     }
 
-    async fn get_subscriber_cursor(
-        &self,
-        tenant: String,
-        key: String,
-    ) -> anyhow::Result<Option<Value>> {
+    async fn get_subscriber_cursor(&self, key: String) -> anyhow::Result<Option<Value>> {
         let statement = Query::select()
             .columns([Subscriber::Cursor])
             .from(Subscriber::Table)
-            .and_where(Expr::col(Subscriber::Tenant).eq(Expr::value(tenant)))
             .and_where(Expr::col(Subscriber::Key).eq(Expr::value(key)))
             .limit(1)
             .to_owned();
@@ -573,16 +565,10 @@ where
         Ok(cursor.map(|c| c.into()))
     }
 
-    async fn is_subscriber_running(
-        &self,
-        tenant: String,
-        key: String,
-        worker_id: Ulid,
-    ) -> anyhow::Result<bool> {
+    async fn is_subscriber_running(&self, key: String, worker_id: Ulid) -> anyhow::Result<bool> {
         let statement = Query::select()
             .columns([Subscriber::WorkerId, Subscriber::Enabled])
             .from(Subscriber::Table)
-            .and_where(Expr::col(Subscriber::Tenant).eq(Expr::value(tenant)))
             .and_where(Expr::col(Subscriber::Key).eq(Expr::value(key)))
             .limit(1)
             .to_owned();
@@ -604,7 +590,6 @@ where
 
     async fn subscriber_status(
         &self,
-        tenant: String,
         key: String,
         worker_id: Ulid,
     ) -> anyhow::Result<SubscriberStatus> {
@@ -615,7 +600,6 @@ where
                 Subscriber::Cursor,
             ])
             .from(Subscriber::Table)
-            .and_where(Expr::col(Subscriber::Tenant).eq(Expr::value(tenant)))
             .and_where(Expr::col(Subscriber::Key).eq(Expr::value(key)))
             .limit(1)
             .to_owned();
@@ -703,28 +687,13 @@ where
         Ok(row.map(|(routing_key,)| routing_key))
     }
 
-    async fn upsert_subscriber(
-        &self,
-        tenant: String,
-        key: String,
-        worker_id: Ulid,
-    ) -> anyhow::Result<()> {
+    async fn upsert_subscriber(&self, key: String, worker_id: Ulid) -> anyhow::Result<()> {
         let statement = Query::insert()
             .into_table(Subscriber::Table)
-            .columns([
-                Subscriber::Tenant,
-                Subscriber::Key,
-                Subscriber::WorkerId,
-                Subscriber::Lag,
-            ])
-            .values_panic([
-                tenant.into(),
-                key.into(),
-                worker_id.to_string().into(),
-                0.into(),
-            ])
+            .columns([Subscriber::Key, Subscriber::WorkerId, Subscriber::Lag])
+            .values_panic([key.into(), worker_id.to_string().into(), 0.into()])
             .on_conflict(
-                OnConflict::columns([Subscriber::Tenant, Subscriber::Key])
+                OnConflict::column(Subscriber::Key)
                     .update_columns([Subscriber::WorkerId])
                     .value(Subscriber::UpdatedAt, Expr::current_timestamp())
                     .to_owned(),
@@ -837,7 +806,6 @@ where
 
     async fn acknowledge(
         &self,
-        tenant: String,
         key: String,
         worker_id: Ulid,
         cursor: Value,
@@ -850,7 +818,6 @@ where
                 (Subscriber::Lag, lag.into()),
                 (Subscriber::UpdatedAt, Expr::current_timestamp()),
             ])
-            .and_where(Expr::col(Subscriber::Tenant).eq(tenant.as_str()))
             .and_where(Expr::col(Subscriber::Key).eq(key.as_str()))
             // Fenced on the worker id: a superseded worker's ack must not
             // rewind the cursor the new owner is advancing. The enabled
