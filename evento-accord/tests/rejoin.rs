@@ -124,7 +124,9 @@ impl Trio {
         let store = Arc::new(InMemoryDataStore::new());
         let clock = Arc::new(HybridLogicalClock::new(NodeId(R as u64)));
         let node = self.build(R, &store, &self.journals[R], clock);
-        node.recover_state().await.expect("recover the kept journal");
+        node.recover_state()
+            .await
+            .expect("recover the kept journal");
         self.loops[R] = node.start(inbox);
         self.nodes[R] = node;
         self.stores[R] = store;
