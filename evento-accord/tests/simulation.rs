@@ -3575,6 +3575,29 @@ async fn swarm() {
     eprintln!("swarm: {runs} seeds with no violation");
 }
 
+/// Swarm seeds whose healed cluster served again too late (#326), one from
+/// the nightly run and two from earlier swarm runs: the sweeps' recoveries
+/// kept waiting out `collect_timeout` for a read quorum, so serving again
+/// took more than [`SETTLE_ROUNDS`] rounds.
+const SLOW_HEAL_SEEDS: [u64; 3] = [
+    12498532817691066228,
+    11045260470284367390,
+    2014812038337545728,
+];
+
+#[tokio::test(start_paused = true)]
+async fn a_healed_cluster_serves_again_in_time() {
+    for seed in SLOW_HEAL_SEEDS {
+        let _replay = Replay {
+            test: "swarm",
+            seed,
+        };
+        run_swarm(seed, &SwarmConfig::from_seed(seed))
+            .await
+            .assert_ok(&format!("swarm seed {seed}"));
+    }
+}
+
 /// Aggressive bug-hunt: run **every** scenario across a wide seed range and fail on
 /// the first oracle violation (printing the seed, so it replays exactly). Ignored by
 /// default — it's a soak, not a CI gate:
