@@ -534,3 +534,27 @@ async fn remote_subscription_ephemeral_run_once() -> anyhow::Result<()> {
     let server = setup().await?;
     evento_test::subscription_ephemeral_run_once(&server.client).await
 }
+
+#[tokio::test]
+async fn remote_tenant_streams_are_isolated() -> anyhow::Result<()> {
+    let server = setup().await?;
+    evento_test::tenant_streams_are_isolated(&server.client).await
+}
+
+#[tokio::test]
+async fn remote_tenant_subscriptions() -> anyhow::Result<()> {
+    let server = setup().await?;
+    evento_test::tenant_subscriptions(&server.client).await
+}
+
+#[tokio::test]
+async fn remote_tenant_projection_subscription() -> anyhow::Result<()> {
+    let server = setup().await?;
+    evento_test::tenant_projection_subscription(&server.client).await
+}
+
+#[tokio::test]
+async fn remote_tenant_snapshots_are_isolated() -> anyhow::Result<()> {
+    let server = setup().await?;
+    evento_test::tenant_snapshots_are_isolated(&server.client).await
+}

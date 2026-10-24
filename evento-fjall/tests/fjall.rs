@@ -311,3 +311,27 @@ async fn fjall_replicate_large_batch() -> anyhow::Result<()> {
     let executor = Fjall::temporary()?;
     evento_test::replicate_large_batch(&executor).await
 }
+
+#[tokio::test]
+async fn fjall_tenant_streams_are_isolated() -> anyhow::Result<()> {
+    let executor = Fjall::temporary()?;
+    evento_test::tenant_streams_are_isolated(&executor).await
+}
+
+#[tokio::test]
+async fn fjall_tenant_subscriptions() -> anyhow::Result<()> {
+    let executor = Fjall::temporary()?;
+    evento_test::tenant_subscriptions(&executor).await
+}
+
+#[tokio::test]
+async fn fjall_tenant_projection_subscription() -> anyhow::Result<()> {
+    let executor = Fjall::temporary()?;
+    evento_test::tenant_projection_subscription(&executor).await
+}
+
+#[tokio::test]
+async fn fjall_tenant_snapshots_are_isolated() -> anyhow::Result<()> {
+    let executor = Fjall::temporary()?;
+    evento_test::tenant_snapshots_are_isolated(&executor).await
+}
