@@ -30,9 +30,8 @@ pub const MAX_TENANT_LEN: usize = 255;
 /// A stream belongs to one tenant: its identity is `(tenant, aggregate_type,
 /// aggregate_id)`, and [`Event::tenant`] is `""` for the **default tenant**,
 /// where every single-tenant application lives. A read of one aggregate
-/// always names its tenant; only a scan across aggregates — a subscription
-/// that opted into [`all_tenants`](crate::subscription::SubscriptionBuilder::all_tenants)
-/// — reads every tenant.
+/// always names its tenant; a scan across aggregates — what a subscription
+/// reads — covers every tenant.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum TenantFilter {
     /// Every tenant.
@@ -51,15 +50,30 @@ impl TenantFilter {
     }
 }
 
-/// A tenant id an executor cannot be scoped to (see [`Evento::tenant`]).
+/// A tenant id that cannot name a tenant (see [`TenantError::check`]).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TenantError {
-    /// The empty tenant is the default one, which unscoped callers act in.
+    /// The empty tenant is the default one, where callers that name no tenant
+    /// act.
     #[error("a tenant id must not be empty: the empty tenant is the default one")]
     Empty,
     /// Longer than [`MAX_TENANT_LEN`] bytes.
     #[error("a tenant id of {0} bytes is longer than the {MAX_TENANT_LEN} a store keeps")]
     TooLong(usize),
+}
+
+impl TenantError {
+    /// Checks that `tenant` names a tenant other than the default one, and
+    /// that a store can keep it.
+    pub fn check(tenant: &str) -> Result<(), TenantError> {
+        if tenant.is_empty() {
+            return Err(TenantError::Empty);
+        }
+        if tenant.len() > MAX_TENANT_LEN {
+            return Err(TenantError::TooLong(tenant.len()));
+        }
+        Ok(())
+    }
 }
 
 /// Filter for querying events by aggregate.
@@ -228,18 +242,6 @@ pub trait Executor: Send + Sync + 'static {
         None
     }
 
-    /// The tenant this executor is scoped to, if any.
-    ///
-    /// Most backends return `None`: unscoped, they write, load and checkpoint
-    /// in whatever tenant a call names — the default tenant (`""`) unless a
-    /// builder says otherwise — and a subscription opting into
-    /// [`all_tenants`](crate::subscription::SubscriptionBuilder::all_tenants)
-    /// reads every tenant. [`Evento::tenant`] returns a scoped executor, which
-    /// confines every call to its tenant.
-    fn tenant(&self) -> Option<&str> {
-        None
-    }
-
     /// Persists events atomically.
     ///
     /// Backends that own event ordering (SQL, Fjall) re-stamp
@@ -298,22 +300,10 @@ pub trait Executor: Send + Sync + 'static {
     }
 
     /// Gets the current cursor position for a subscription.
-    ///
-    /// A subscriber row is keyed by `(tenant, key)`: the same key in two
-    /// tenants names two subscriptions.
-    async fn get_subscriber_cursor(
-        &self,
-        tenant: String,
-        key: String,
-    ) -> anyhow::Result<Option<Value>>;
+    async fn get_subscriber_cursor(&self, key: String) -> anyhow::Result<Option<Value>>;
 
     /// Checks if a subscription is running with the given worker ID.
-    async fn is_subscriber_running(
-        &self,
-        tenant: String,
-        key: String,
-        worker_id: Ulid,
-    ) -> anyhow::Result<bool>;
+    async fn is_subscriber_running(&self, key: String, worker_id: Ulid) -> anyhow::Result<bool>;
 
     /// Fetches subscriber fencing state and cursor together.
     ///
@@ -323,20 +313,16 @@ pub trait Executor: Send + Sync + 'static {
     /// the default skips fetching it for a fenced-out worker.
     async fn subscriber_status(
         &self,
-        tenant: String,
         key: String,
         worker_id: Ulid,
     ) -> anyhow::Result<SubscriberStatus> {
-        if !self
-            .is_subscriber_running(tenant.clone(), key.clone(), worker_id)
-            .await?
-        {
+        if !self.is_subscriber_running(key.clone(), worker_id).await? {
             return Ok(SubscriberStatus {
                 running: false,
                 cursor: None,
             });
         }
-        let cursor = self.get_subscriber_cursor(tenant, key).await?;
+        let cursor = self.get_subscriber_cursor(key).await?;
         Ok(SubscriberStatus {
             running: true,
             cursor,
@@ -419,12 +405,7 @@ pub trait Executor: Send + Sync + 'static {
     }
 
     /// Creates or updates a subscription record.
-    async fn upsert_subscriber(
-        &self,
-        tenant: String,
-        key: String,
-        worker_id: Ulid,
-    ) -> anyhow::Result<()>;
+    async fn upsert_subscriber(&self, key: String, worker_id: Ulid) -> anyhow::Result<()>;
 
     /// Updates the subscription cursor after processing an event, fenced by
     /// `worker_id`.
@@ -436,7 +417,6 @@ pub trait Executor: Send + Sync + 'static {
     /// mid-chunk. Returns `Ok(true)` when the cursor was updated.
     async fn acknowledge(
         &self,
-        tenant: String,
         key: String,
         worker_id: Ulid,
         cursor: Value,
@@ -545,18 +525,9 @@ pub trait Executor: Send + Sync + 'static {
 /// # Ok(())
 /// # }
 /// ```
-///
-/// # Tenants
-///
-/// [`tenant`](Evento::tenant) scopes the wrapper to one tenant. Every call
-/// through it then acts in that tenant, whatever its arguments say, so a
-/// scoped `Evento` can be handed to an untrusted caller — an `evento-remote`
-/// session, for instance — that must reach only its own tenant's events,
-/// snapshots and subscriptions.
 pub struct Evento {
     inner: Arc<Box<dyn Executor>>,
     default_routing_key: Option<String>,
-    tenant: Option<String>,
 }
 
 impl Clone for Evento {
@@ -564,7 +535,6 @@ impl Clone for Evento {
         Self {
             inner: self.inner.clone(),
             default_routing_key: self.default_routing_key.clone(),
-            tenant: self.tenant.clone(),
         }
     }
 }
@@ -575,28 +545,16 @@ impl Executor for Evento {
         self.default_routing_key.as_deref()
     }
 
-    fn tenant(&self) -> Option<&str> {
-        self.tenant.as_deref()
-    }
-
     async fn write(&self, events: Vec<Event>) -> Result<(), WriteError> {
         // The default routing key is applied by `WriteBuilder::commit` (which
         // consults `default_routing_key()` only for a brand-new aggregate, so
         // an existing stream keeps its original key even when that key is
         // `None`). Filling it in here would split such a stream across two
         // routing keys.
-        let events = self.scope_events(events)?;
         self.inner.write(events).await
     }
 
     async fn replicate(&self, events: Vec<Event>) -> Result<(), WriteError> {
-        // `replicate` keeps the caller's timestamps and skips the version
-        // contiguity check: a scoped caller could backdate events behind a
-        // subscription's cursor. Only a trusted replication layer, unscoped,
-        // may replicate.
-        if self.tenant.is_some() {
-            return Err(WriteError::ReplicateRefused);
-        }
         self.inner.replicate(events).await
     }
 
@@ -617,13 +575,7 @@ impl Executor for Evento {
         to_micros: Option<u64>,
     ) -> anyhow::Result<ReadResult<Event>> {
         self.inner
-            .read(
-                aggregators,
-                routing_key,
-                self.scope_filter(tenant),
-                args,
-                to_micros,
-            )
+            .read(aggregators, routing_key, tenant, args, to_micros)
             .await
     }
 
@@ -634,42 +586,26 @@ impl Executor for Evento {
         tenant: TenantFilter,
     ) -> anyhow::Result<u64> {
         self.inner
-            .latest_timestamp(aggregators, routing_key, self.scope_filter(tenant))
+            .latest_timestamp(aggregators, routing_key, tenant)
             .await
     }
 
-    async fn get_subscriber_cursor(
-        &self,
-        tenant: String,
-        key: String,
-    ) -> anyhow::Result<Option<Value>> {
-        self.inner
-            .get_subscriber_cursor(self.scope(tenant), key)
-            .await
+    async fn get_subscriber_cursor(&self, key: String) -> anyhow::Result<Option<Value>> {
+        self.inner.get_subscriber_cursor(key).await
     }
 
-    async fn is_subscriber_running(
-        &self,
-        tenant: String,
-        key: String,
-        worker_id: Ulid,
-    ) -> anyhow::Result<bool> {
-        self.inner
-            .is_subscriber_running(self.scope(tenant), key, worker_id)
-            .await
+    async fn is_subscriber_running(&self, key: String, worker_id: Ulid) -> anyhow::Result<bool> {
+        self.inner.is_subscriber_running(key, worker_id).await
     }
 
     // Explicitly forwarded (not left to the trait default) so the inner
     // backend's single-round-trip overrides are reached through the wrapper.
     async fn subscriber_status(
         &self,
-        tenant: String,
         key: String,
         worker_id: Ulid,
     ) -> anyhow::Result<SubscriberStatus> {
-        self.inner
-            .subscriber_status(self.scope(tenant), key, worker_id)
-            .await
+        self.inner.subscriber_status(key, worker_id).await
     }
 
     async fn latest_version(
@@ -679,7 +615,7 @@ impl Executor for Evento {
         aggregate_id: String,
     ) -> anyhow::Result<u16> {
         self.inner
-            .latest_version(self.scope(tenant), aggregate_type, aggregate_id)
+            .latest_version(tenant, aggregate_type, aggregate_id)
             .await
     }
 
@@ -690,32 +626,22 @@ impl Executor for Evento {
         aggregate_id: String,
     ) -> anyhow::Result<Option<Option<String>>> {
         self.inner
-            .stream_routing_key(self.scope(tenant), aggregate_type, aggregate_id)
+            .stream_routing_key(tenant, aggregate_type, aggregate_id)
             .await
     }
 
-    async fn upsert_subscriber(
-        &self,
-        tenant: String,
-        key: String,
-        worker_id: Ulid,
-    ) -> anyhow::Result<()> {
-        self.inner
-            .upsert_subscriber(self.scope(tenant), key, worker_id)
-            .await
+    async fn upsert_subscriber(&self, key: String, worker_id: Ulid) -> anyhow::Result<()> {
+        self.inner.upsert_subscriber(key, worker_id).await
     }
 
     async fn acknowledge(
         &self,
-        tenant: String,
         key: String,
         worker_id: Ulid,
         cursor: Value,
         lag: u64,
     ) -> anyhow::Result<bool> {
-        self.inner
-            .acknowledge(self.scope(tenant), key, worker_id, cursor, lag)
-            .await
+        self.inner.acknowledge(key, worker_id, cursor, lag).await
     }
 
     async fn get_snapshot(
@@ -727,13 +653,7 @@ impl Executor for Evento {
         id: String,
     ) -> anyhow::Result<Option<(Vec<u8>, Value)>> {
         self.inner
-            .get_snapshot(
-                self.scope(tenant),
-                aggregate_type,
-                projection,
-                aggregate_revision,
-                id,
-            )
+            .get_snapshot(tenant, aggregate_type, projection, aggregate_revision, id)
             .await
     }
 
@@ -749,7 +669,7 @@ impl Executor for Evento {
     ) -> anyhow::Result<()> {
         self.inner
             .save_snapshot(
-                self.scope(tenant),
+                tenant,
                 aggregate_type,
                 projection,
                 aggregate_revision,
@@ -768,7 +688,7 @@ impl Executor for Evento {
         id: String,
     ) -> anyhow::Result<()> {
         self.inner
-            .delete_snapshot(self.scope(tenant), aggregate_type, projection, id)
+            .delete_snapshot(tenant, aggregate_type, projection, id)
             .await
     }
 }
@@ -779,7 +699,6 @@ impl Evento {
         Self {
             inner: Arc::new(Box::new(executor)),
             default_routing_key: None,
-            tenant: None,
         }
     }
 
@@ -792,73 +711,6 @@ impl Evento {
     pub fn default_routing_key(mut self, key: impl Into<String>) -> Self {
         self.default_routing_key = Some(key.into());
         self
-    }
-
-    /// Scopes this executor to `tenant`.
-    ///
-    /// Every call through the scoped executor acts in `tenant`, whatever its
-    /// arguments say: reads see only `tenant`'s events (a read of every tenant
-    /// is narrowed to it), loads, snapshots and subscription cursors resolve in
-    /// it, and a write stamps `tenant` on events that name none and refuses
-    /// one that names another ([`WriteError::ForeignTenant`]). `replicate` is
-    /// refused ([`WriteError::ReplicateRefused`]): it trusts the caller's
-    /// timestamps and versions. A scoped `Evento` is therefore what to hand an
-    /// untrusted caller confined to one tenant — an `evento-remote` session,
-    /// for instance — while the store stays shared by every tenant.
-    ///
-    /// Scoping an already-scoped executor rescopes it.
-    ///
-    /// # Errors
-    ///
-    /// [`TenantError::Empty`] for `""` — the default tenant, which unscoped
-    /// callers act in — and [`TenantError::TooLong`] past
-    /// [`MAX_TENANT_LEN`] bytes.
-    pub fn tenant(mut self, tenant: impl Into<String>) -> Result<Self, TenantError> {
-        let tenant = tenant.into();
-        if tenant.is_empty() {
-            return Err(TenantError::Empty);
-        }
-        if tenant.len() > MAX_TENANT_LEN {
-            return Err(TenantError::TooLong(tenant.len()));
-        }
-        self.tenant = Some(tenant);
-        Ok(self)
-    }
-
-    /// The tenant a call acts in: this executor's when scoped, else the
-    /// caller's.
-    fn scope(&self, tenant: String) -> String {
-        match &self.tenant {
-            Some(scoped) => scoped.clone(),
-            None => tenant,
-        }
-    }
-
-    /// The tenants a scan covers: this executor's alone when scoped.
-    fn scope_filter(&self, tenant: TenantFilter) -> TenantFilter {
-        match &self.tenant {
-            Some(scoped) => TenantFilter::Only(scoped.clone()),
-            None => tenant,
-        }
-    }
-
-    /// Stamps this executor's tenant on events that name none, and refuses
-    /// any that names another.
-    fn scope_events(&self, mut events: Vec<Event>) -> Result<Vec<Event>, WriteError> {
-        let Some(scoped) = &self.tenant else {
-            return Ok(events);
-        };
-        for event in &mut events {
-            if event.tenant.is_empty() {
-                event.tenant = scoped.clone();
-            } else if &event.tenant != scoped {
-                return Err(WriteError::ForeignTenant {
-                    expected: scoped.clone(),
-                    found: event.tenant.clone(),
-                });
-            }
-        }
-        Ok(events)
     }
 }
 
@@ -902,10 +754,6 @@ impl EventoGroup {
 impl Executor for EventoGroup {
     fn default_routing_key(&self) -> Option<&str> {
         self.first().default_routing_key()
-    }
-
-    fn tenant(&self) -> Option<&str> {
-        self.first().tenant()
     }
 
     async fn write(&self, events: Vec<Event>) -> Result<(), WriteError> {
@@ -992,23 +840,12 @@ impl Executor for EventoGroup {
         Ok(max)
     }
 
-    async fn get_subscriber_cursor(
-        &self,
-        tenant: String,
-        key: String,
-    ) -> anyhow::Result<Option<Value>> {
-        self.first().get_subscriber_cursor(tenant, key).await
+    async fn get_subscriber_cursor(&self, key: String) -> anyhow::Result<Option<Value>> {
+        self.first().get_subscriber_cursor(key).await
     }
 
-    async fn is_subscriber_running(
-        &self,
-        tenant: String,
-        key: String,
-        worker_id: Ulid,
-    ) -> anyhow::Result<bool> {
-        self.first()
-            .is_subscriber_running(tenant, key, worker_id)
-            .await
+    async fn is_subscriber_running(&self, key: String, worker_id: Ulid) -> anyhow::Result<bool> {
+        self.first().is_subscriber_running(key, worker_id).await
     }
 
     // Subscriber state lives on the first executor. `latest_version` and
@@ -1017,33 +854,24 @@ impl Executor for EventoGroup {
     // `first()` would miss events held by the other executors.
     async fn subscriber_status(
         &self,
-        tenant: String,
         key: String,
         worker_id: Ulid,
     ) -> anyhow::Result<SubscriberStatus> {
-        self.first().subscriber_status(tenant, key, worker_id).await
+        self.first().subscriber_status(key, worker_id).await
     }
 
-    async fn upsert_subscriber(
-        &self,
-        tenant: String,
-        key: String,
-        worker_id: Ulid,
-    ) -> anyhow::Result<()> {
-        self.first().upsert_subscriber(tenant, key, worker_id).await
+    async fn upsert_subscriber(&self, key: String, worker_id: Ulid) -> anyhow::Result<()> {
+        self.first().upsert_subscriber(key, worker_id).await
     }
 
     async fn acknowledge(
         &self,
-        tenant: String,
         key: String,
         worker_id: Ulid,
         cursor: Value,
         lag: u64,
     ) -> anyhow::Result<bool> {
-        self.first()
-            .acknowledge(tenant, key, worker_id, cursor, lag)
-            .await
+        self.first().acknowledge(key, worker_id, cursor, lag).await
     }
 
     async fn get_snapshot(
@@ -1132,10 +960,6 @@ impl<R: Executor, W: Executor> Executor for Rw<R, W> {
         self.w.default_routing_key()
     }
 
-    fn tenant(&self) -> Option<&str> {
-        self.w.tenant()
-    }
-
     async fn write(&self, events: Vec<Event>) -> Result<(), WriteError> {
         self.w.write(events).await
     }
@@ -1182,32 +1006,22 @@ impl<R: Executor, W: Executor> Executor for Rw<R, W> {
             .await
     }
 
-    async fn get_subscriber_cursor(
-        &self,
-        tenant: String,
-        key: String,
-    ) -> anyhow::Result<Option<Value>> {
-        self.r.get_subscriber_cursor(tenant, key).await
+    async fn get_subscriber_cursor(&self, key: String) -> anyhow::Result<Option<Value>> {
+        self.r.get_subscriber_cursor(key).await
     }
 
-    async fn is_subscriber_running(
-        &self,
-        tenant: String,
-        key: String,
-        worker_id: Ulid,
-    ) -> anyhow::Result<bool> {
-        self.r.is_subscriber_running(tenant, key, worker_id).await
+    async fn is_subscriber_running(&self, key: String, worker_id: Ulid) -> anyhow::Result<bool> {
+        self.r.is_subscriber_running(key, worker_id).await
     }
 
     // Forwarded to the same sides the constituent calls already use (reads
     // from `r`), so the backends' single-round-trip overrides are reached.
     async fn subscriber_status(
         &self,
-        tenant: String,
         key: String,
         worker_id: Ulid,
     ) -> anyhow::Result<SubscriberStatus> {
-        self.r.subscriber_status(tenant, key, worker_id).await
+        self.r.subscriber_status(key, worker_id).await
     }
 
     async fn latest_version(
@@ -1232,26 +1046,18 @@ impl<R: Executor, W: Executor> Executor for Rw<R, W> {
             .await
     }
 
-    async fn upsert_subscriber(
-        &self,
-        tenant: String,
-        key: String,
-        worker_id: Ulid,
-    ) -> anyhow::Result<()> {
-        self.w.upsert_subscriber(tenant, key, worker_id).await
+    async fn upsert_subscriber(&self, key: String, worker_id: Ulid) -> anyhow::Result<()> {
+        self.w.upsert_subscriber(key, worker_id).await
     }
 
     async fn acknowledge(
         &self,
-        tenant: String,
         key: String,
         worker_id: Ulid,
         cursor: Value,
         lag: u64,
     ) -> anyhow::Result<bool> {
-        self.w
-            .acknowledge(tenant, key, worker_id, cursor, lag)
-            .await
+        self.w.acknowledge(key, worker_id, cursor, lag).await
     }
 
     async fn get_snapshot(
@@ -1322,9 +1128,8 @@ impl<R: Executor, W: Executor> From<(R, W)> for Rw<R, W> {
 ///
 /// `local` must belong to exactly one process: two processes sharing it would
 /// share cursors again. Cursor keys are still prefixed by the routing key of
-/// `events` (`{routing_key}.{name}`), and cursors and snapshots are kept under
-/// the tenant of `events`, so one local store may follow several event stores
-/// with distinct routing keys or tenants.
+/// `events` (`{routing_key}.{name}`), so one local store may follow several
+/// event stores with distinct routing keys.
 ///
 /// # Example
 ///
@@ -1376,12 +1181,6 @@ impl<E: Executor, L: Executor> Executor for Sidecar<E, L> {
         // The events' key: it scopes new aggregates and prefixes the cursor
         // keys, so a local store following two event stores keeps them apart.
         self.events.default_routing_key()
-    }
-
-    fn tenant(&self) -> Option<&str> {
-        // The events' tenant: it scopes what is read and written, and the
-        // subscriber rows and snapshots kept in `local` are keyed by it.
-        self.events.tenant()
     }
 
     async fn write(&self, events: Vec<Event>) -> Result<(), WriteError> {
@@ -1452,55 +1251,35 @@ impl<E: Executor, L: Executor> Executor for Sidecar<E, L> {
             .await
     }
 
-    async fn get_subscriber_cursor(
-        &self,
-        tenant: String,
-        key: String,
-    ) -> anyhow::Result<Option<Value>> {
-        self.local.get_subscriber_cursor(tenant, key).await
+    async fn get_subscriber_cursor(&self, key: String) -> anyhow::Result<Option<Value>> {
+        self.local.get_subscriber_cursor(key).await
     }
 
-    async fn is_subscriber_running(
-        &self,
-        tenant: String,
-        key: String,
-        worker_id: Ulid,
-    ) -> anyhow::Result<bool> {
-        self.local
-            .is_subscriber_running(tenant, key, worker_id)
-            .await
+    async fn is_subscriber_running(&self, key: String, worker_id: Ulid) -> anyhow::Result<bool> {
+        self.local.is_subscriber_running(key, worker_id).await
     }
 
     // One local round trip instead of the default's two.
     async fn subscriber_status(
         &self,
-        tenant: String,
         key: String,
         worker_id: Ulid,
     ) -> anyhow::Result<SubscriberStatus> {
-        self.local.subscriber_status(tenant, key, worker_id).await
+        self.local.subscriber_status(key, worker_id).await
     }
 
-    async fn upsert_subscriber(
-        &self,
-        tenant: String,
-        key: String,
-        worker_id: Ulid,
-    ) -> anyhow::Result<()> {
-        self.local.upsert_subscriber(tenant, key, worker_id).await
+    async fn upsert_subscriber(&self, key: String, worker_id: Ulid) -> anyhow::Result<()> {
+        self.local.upsert_subscriber(key, worker_id).await
     }
 
     async fn acknowledge(
         &self,
-        tenant: String,
         key: String,
         worker_id: Ulid,
         cursor: Value,
         lag: u64,
     ) -> anyhow::Result<bool> {
-        self.local
-            .acknowledge(tenant, key, worker_id, cursor, lag)
-            .await
+        self.local.acknowledge(key, worker_id, cursor, lag).await
     }
 
     async fn get_snapshot(

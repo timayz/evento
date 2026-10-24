@@ -132,12 +132,12 @@ async fn sidecar_keeps_bookkeeping_local() -> anyhow::Result<()> {
     // The cursor is in the local store only.
     assert!(t
         .local
-        .get_subscriber_cursor(String::new(), key.to_owned())
+        .get_subscriber_cursor(key.to_owned())
         .await?
         .is_some());
     assert!(t
         .server
-        .get_subscriber_cursor(String::new(), key.to_owned())
+        .get_subscriber_cursor(key.to_owned())
         .await?
         .is_none());
     assert!(

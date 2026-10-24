@@ -1158,12 +1158,7 @@ impl Executor for Fjall {
         Ok(self.last_stamp.load(std::sync::atomic::Ordering::Acquire) / 1000)
     }
 
-    async fn get_subscriber_cursor(
-        &self,
-        tenant: String,
-        key: String,
-    ) -> anyhow::Result<Option<Value>> {
-        default_tenant_only(&tenant)?;
+    async fn get_subscriber_cursor(&self, key: String) -> anyhow::Result<Option<Value>> {
         let executor = self.clone();
 
         tokio::task::spawn_blocking(move || match executor.subscribers.get(&key)? {
@@ -1177,13 +1172,7 @@ impl Executor for Fjall {
         .await?
     }
 
-    async fn is_subscriber_running(
-        &self,
-        tenant: String,
-        key: String,
-        worker_id: Ulid,
-    ) -> anyhow::Result<bool> {
-        default_tenant_only(&tenant)?;
+    async fn is_subscriber_running(&self, key: String, worker_id: Ulid) -> anyhow::Result<bool> {
         let executor = self.clone();
 
         tokio::task::spawn_blocking(move || match executor.subscribers.get(&key)? {
@@ -1199,11 +1188,9 @@ impl Executor for Fjall {
 
     async fn subscriber_status(
         &self,
-        tenant: String,
         key: String,
         worker_id: Ulid,
     ) -> anyhow::Result<SubscriberStatus> {
-        default_tenant_only(&tenant)?;
         let executor = self.clone();
 
         tokio::task::spawn_blocking(move || match executor.subscribers.get(&key)? {
@@ -1267,13 +1254,7 @@ impl Executor for Fjall {
         .await?
     }
 
-    async fn upsert_subscriber(
-        &self,
-        tenant: String,
-        key: String,
-        worker_id: Ulid,
-    ) -> anyhow::Result<()> {
-        default_tenant_only(&tenant)?;
+    async fn upsert_subscriber(&self, key: String, worker_id: Ulid) -> anyhow::Result<()> {
         let executor = self.clone();
 
         tokio::task::spawn_blocking(move || {
@@ -1311,13 +1292,11 @@ impl Executor for Fjall {
 
     async fn acknowledge(
         &self,
-        tenant: String,
         key: String,
         worker_id: Ulid,
         cursor: Value,
         lag: u64,
     ) -> anyhow::Result<bool> {
-        default_tenant_only(&tenant)?;
         let executor = self.clone();
 
         tokio::task::spawn_blocking(move || {
@@ -1587,39 +1566,32 @@ mod tests {
 
         // Create subscriber
         executor
-            .upsert_subscriber(String::new(), key.clone(), worker_id)
+            .upsert_subscriber(key.clone(), worker_id)
             .await
             .unwrap();
 
         // Check if running
         assert!(executor
-            .is_subscriber_running(String::new(), key.clone(), worker_id)
+            .is_subscriber_running(key.clone(), worker_id)
             .await
             .unwrap());
 
         // Check cursor is None initially
         assert!(executor
-            .get_subscriber_cursor(String::new(), key.clone())
+            .get_subscriber_cursor(key.clone())
             .await
             .unwrap()
             .is_none());
 
         // Acknowledge with cursor (fenced on the owning worker id)
         assert!(executor
-            .acknowledge(
-                String::new(),
-                key.clone(),
-                worker_id,
-                Value("test-cursor".to_string()),
-                0
-            )
+            .acknowledge(key.clone(), worker_id, Value("test-cursor".to_string()), 0)
             .await
             .unwrap());
 
         // A superseded worker's ack is rejected and does not move the cursor
         assert!(!executor
             .acknowledge(
-                String::new(),
                 key.clone(),
                 Ulid::generate(),
                 Value("stale-cursor".to_string()),
@@ -1629,10 +1601,7 @@ mod tests {
             .unwrap());
 
         // Check cursor is updated
-        let cursor = executor
-            .get_subscriber_cursor(String::new(), key.clone())
-            .await
-            .unwrap();
+        let cursor = executor.get_subscriber_cursor(key.clone()).await.unwrap();
         assert_eq!(cursor.unwrap().0, "test-cursor");
 
         // Disabling the subscription reports "not running"
@@ -1641,7 +1610,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!executor
-            .is_subscriber_running(String::new(), key, worker_id)
+            .is_subscriber_running(key, worker_id)
             .await
             .unwrap());
     }

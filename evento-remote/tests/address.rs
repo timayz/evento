@@ -132,45 +132,26 @@ impl Executor for Lagging {
         Ok(Some(self.stable.load(Ordering::Acquire)))
     }
 
-    async fn get_subscriber_cursor(
-        &self,
-        tenant: String,
-        key: String,
-    ) -> anyhow::Result<Option<Value>> {
-        self.inner.get_subscriber_cursor(tenant, key).await
+    async fn get_subscriber_cursor(&self, key: String) -> anyhow::Result<Option<Value>> {
+        self.inner.get_subscriber_cursor(key).await
     }
 
-    async fn is_subscriber_running(
-        &self,
-        tenant: String,
-        key: String,
-        worker_id: Ulid,
-    ) -> anyhow::Result<bool> {
-        self.inner
-            .is_subscriber_running(tenant, key, worker_id)
-            .await
+    async fn is_subscriber_running(&self, key: String, worker_id: Ulid) -> anyhow::Result<bool> {
+        self.inner.is_subscriber_running(key, worker_id).await
     }
 
-    async fn upsert_subscriber(
-        &self,
-        tenant: String,
-        key: String,
-        worker_id: Ulid,
-    ) -> anyhow::Result<()> {
-        self.inner.upsert_subscriber(tenant, key, worker_id).await
+    async fn upsert_subscriber(&self, key: String, worker_id: Ulid) -> anyhow::Result<()> {
+        self.inner.upsert_subscriber(key, worker_id).await
     }
 
     async fn acknowledge(
         &self,
-        tenant: String,
         key: String,
         worker_id: Ulid,
         cursor: Value,
         lag: u64,
     ) -> anyhow::Result<bool> {
-        self.inner
-            .acknowledge(tenant, key, worker_id, cursor, lag)
-            .await
+        self.inner.acknowledge(key, worker_id, cursor, lag).await
     }
 
     async fn read(

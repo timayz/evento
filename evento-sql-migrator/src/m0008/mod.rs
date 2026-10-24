@@ -1,4 +1,4 @@
-//! Adds the tenant to the `event`, `snapshot` and `subscriber` tables.
+//! Adds the tenant to the `event` and `snapshot` tables.
 //!
 //! A stream is identified by `(tenant, aggregator_type, aggregator_id)`: the
 //! same aggregate id in two tenants names two streams, so one store can hold
@@ -9,15 +9,14 @@
 //! index, which would stop the version index from catching a conflict.
 //!
 //! Index plan. A read of one aggregate always names its tenant; a scan across
-//! aggregates names one tenant, or every tenant for a subscription that opted
-//! into all of them:
+//! aggregates names one tenant, or every tenant for a subscription:
 //!
 //! - the version index and the aggregate cursor index gain the tenant after the
 //!   aggregate id, so a per-tenant singleton id (`"settings"` in every tenant)
 //!   still seeks exactly, and a by-id read of every tenant still seeks on
 //!   `(type, id)`;
 //! - a new `(aggregator_type, tenant, …cursor)` index serves one tenant's
-//!   scans — every evento-remote client of a tenant-scoped session reads
+//!   scans — every evento-remote client of a session serving a tenant reads
 //!   through it — with the routing key and event name as residual filters;
 //! - the routing-key and type cursor indexes are unchanged: they serve the
 //!   scans of every tenant, which the tenant in front would turn into sorts.
@@ -40,11 +39,12 @@ use sqlx_migrator::vec_box;
 /// 5. Recreates the `snapshot` table with a `tenant` column and the primary
 ///    key `(tenant, type, projection, id)`. Existing snapshots are discarded:
 ///    they are a cache, rebuilt from events on the next load.
-/// 6. Adds `subscriber.tenant` and makes `(tenant, key)` its primary key,
-///    keeping every row (and so every cursor) in the default tenant.
 ///
-/// Reverting refuses while a tenant other than the default one holds events or
-/// subscriptions: the previous schema cannot tell them apart.
+/// The `subscriber` table is unchanged: a subscription reads every tenant, so
+/// its row stays keyed by the subscription key alone.
+///
+/// Reverting refuses while a tenant other than the default one holds events:
+/// the previous schema cannot tell them apart.
 ///
 /// ## Dependencies
 ///
@@ -64,7 +64,6 @@ sqlx_migrator::sqlite_migration!(
         event::RecreateTypeIdCursorIdx,
         event::CreateTypeTenantCursorIdx,
         snapshot::RecreateWithTenant,
-        subscriber::KeyByTenant,
         guard::RevertGuard,
     ]
 );
@@ -82,7 +81,6 @@ sqlx_migrator::mysql_migration!(
         event::RecreateTypeIdCursorIdx,
         event::CreateTypeTenantCursorIdx,
         snapshot::RecreateWithTenant,
-        subscriber::KeyByTenant,
         guard::RevertGuard,
     ]
 );
@@ -100,7 +98,6 @@ sqlx_migrator::postgres_migration!(
         event::RecreateTypeIdCursorIdx,
         event::CreateTypeTenantCursorIdx,
         snapshot::RecreateWithTenant,
-        subscriber::KeyByTenant,
         guard::RevertGuard,
     ]
 );
@@ -119,20 +116,6 @@ enum Backend {
 impl Backend {
     /// Renders a schema statement (table or index DDL) for this backend.
     fn schema(self, statement: &impl sea_query::SchemaStatementBuilder) -> String {
-        match self {
-            #[cfg(feature = "sqlite")]
-            Backend::Sqlite => statement.to_string(sea_query::SqliteQueryBuilder),
-            #[cfg(feature = "mysql")]
-            Backend::MySql => statement.to_string(sea_query::MysqlQueryBuilder),
-            #[cfg(feature = "postgres")]
-            Backend::Postgres => statement.to_string(sea_query::PostgresQueryBuilder),
-        }
-    }
-
-    /// Renders a data statement for this backend (only the SQLite rebuild of
-    /// `subscriber` needs one).
-    #[cfg(feature = "sqlite")]
-    fn query(self, statement: &impl sea_query::QueryStatementWriter) -> String {
         match self {
             #[cfg(feature = "sqlite")]
             Backend::Sqlite => statement.to_string(sea_query::SqliteQueryBuilder),
@@ -246,4 +229,3 @@ macro_rules! step_operation {
 mod event;
 mod guard;
 mod snapshot;
-mod subscriber;

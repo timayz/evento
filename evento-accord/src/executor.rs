@@ -459,37 +459,22 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
             .await
     }
 
-    async fn get_subscriber_cursor(
-        &self,
-        tenant: String,
-        key: String,
-    ) -> anyhow::Result<Option<Value>> {
-        default_tenant_only(&tenant)?;
-        self.local.get_subscriber_cursor(tenant, key).await
+    async fn get_subscriber_cursor(&self, key: String) -> anyhow::Result<Option<Value>> {
+        self.local.get_subscriber_cursor(key).await
     }
 
-    async fn is_subscriber_running(
-        &self,
-        tenant: String,
-        key: String,
-        worker_id: Ulid,
-    ) -> anyhow::Result<bool> {
-        default_tenant_only(&tenant)?;
-        self.local
-            .is_subscriber_running(tenant, key, worker_id)
-            .await
+    async fn is_subscriber_running(&self, key: String, worker_id: Ulid) -> anyhow::Result<bool> {
+        self.local.is_subscriber_running(key, worker_id).await
     }
 
     // Explicitly forwarded (not left to the trait defaults) so the local
     // backend's single-round-trip overrides are reached through the wrapper.
     async fn subscriber_status(
         &self,
-        tenant: String,
         key: String,
         worker_id: Ulid,
     ) -> anyhow::Result<evento_core::SubscriberStatus> {
-        default_tenant_only(&tenant)?;
-        self.local.subscriber_status(tenant, key, worker_id).await
+        self.local.subscriber_status(key, worker_id).await
     }
 
     async fn latest_version(
@@ -516,28 +501,18 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
             .await
     }
 
-    async fn upsert_subscriber(
-        &self,
-        tenant: String,
-        key: String,
-        worker_id: Ulid,
-    ) -> anyhow::Result<()> {
-        default_tenant_only(&tenant)?;
-        self.local.upsert_subscriber(tenant, key, worker_id).await
+    async fn upsert_subscriber(&self, key: String, worker_id: Ulid) -> anyhow::Result<()> {
+        self.local.upsert_subscriber(key, worker_id).await
     }
 
     async fn acknowledge(
         &self,
-        tenant: String,
         key: String,
         worker_id: Ulid,
         cursor: Value,
         lag: u64,
     ) -> anyhow::Result<bool> {
-        default_tenant_only(&tenant)?;
-        self.local
-            .acknowledge(tenant, key, worker_id, cursor, lag)
-            .await
+        self.local.acknowledge(key, worker_id, cursor, lag).await
     }
 
     async fn get_snapshot(

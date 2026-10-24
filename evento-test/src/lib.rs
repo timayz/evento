@@ -535,12 +535,12 @@ pub async fn subscriber_running<E: Executor + Clone>(executor: &E) -> anyhow::Re
 
     assert!(
         !executor
-            .is_subscriber_running(String::new(), "simple".to_owned(), sub1.id)
+            .is_subscriber_running("simple".to_owned(), sub1.id)
             .await?
     );
     assert!(
         executor
-            .is_subscriber_running(String::new(), "simple".to_owned(), sub2.id)
+            .is_subscriber_running("simple".to_owned(), sub2.id)
             .await?
     );
 
@@ -3978,10 +3978,7 @@ pub async fn subscription_shutdown_acknowledges_in_flight<E: Executor + Clone>(
     let gate = in_flight::Gate::default();
     let running = in_flight::subscription(&key, &gate).start(executor).await?;
     assert!(
-        executor
-            .get_subscriber_cursor(String::new(), key.clone())
-            .await?
-            .is_none(),
+        executor.get_subscriber_cursor(key.clone()).await?.is_none(),
         "nothing acknowledged yet"
     );
 
@@ -4016,10 +4013,7 @@ pub async fn subscription_shutdown_acknowledges_in_flight<E: Executor + Clone>(
     running.shutdown().await?;
 
     assert!(
-        executor
-            .get_subscriber_cursor(String::new(), key)
-            .await?
-            .is_some(),
+        executor.get_subscriber_cursor(key).await?.is_some(),
         "the event handled during shutdown must be acknowledged, or a restart replays it"
     );
 
@@ -4124,7 +4118,7 @@ pub async fn subscription_start_from_latest<E: Executor + Clone>(
 
     assert!(
         executor
-            .get_subscriber_cursor(String::new(), key_empty.clone())
+            .get_subscriber_cursor(key_empty.clone())
             .await?
             .is_none(),
         "with no matching event there is no head to seed from, and cursor zero \
@@ -4174,10 +4168,7 @@ pub async fn subscription_start_from_latest<E: Executor + Clone>(
 
     // `start()` seeds before it spawns the worker, so this needs no polling.
     assert!(
-        executor
-            .get_subscriber_cursor(String::new(), key.clone())
-            .await?
-            .is_some(),
+        executor.get_subscriber_cursor(key.clone()).await?.is_some(),
         "a fresh key must be seeded at the head before the worker can read"
     );
 
@@ -4280,16 +4271,11 @@ pub async fn subscription_ephemeral<E: Executor + Clone>(executor: &E) -> anyhow
     // proves the event was handled *and* acknowledged, so an ack that was going
     // to reach the store would already be there.
     assert!(
-        executor
-            .get_subscriber_cursor(String::new(), key.clone())
-            .await?
-            .is_none(),
+        executor.get_subscriber_cursor(key.clone()).await?.is_none(),
         "an ephemeral subscription must not persist a cursor"
     );
     assert!(
-        !executor
-            .is_subscriber_running(String::new(), key.clone(), sub.id)
-            .await?,
+        !executor.is_subscriber_running(key.clone(), sub.id).await?,
         "an ephemeral subscription must not register a subscriber row"
     );
 
@@ -4349,10 +4335,7 @@ pub async fn subscription_ephemeral_start_from_latest<E: Executor + Clone>(
 
     // `start()` seeds before it spawns the worker, so this needs no polling.
     assert!(
-        executor
-            .get_subscriber_cursor(String::new(), key.clone())
-            .await?
-            .is_none(),
+        executor.get_subscriber_cursor(key.clone()).await?.is_none(),
         "seeding at the head must not write a cursor when ephemeral"
     );
 
@@ -4377,10 +4360,7 @@ pub async fn subscription_ephemeral_start_from_latest<E: Executor + Clone>(
         "history must not be delivered"
     );
     assert!(
-        executor
-            .get_subscriber_cursor(String::new(), key)
-            .await?
-            .is_none(),
+        executor.get_subscriber_cursor(key).await?.is_none(),
         "nothing may reach the store, not even after acknowledging events"
     );
     assert!(
@@ -4450,10 +4430,7 @@ pub async fn subscription_ephemeral_concurrent_same_key<E: Executor + Clone>(
         sub_b.stop_reason()
     );
     assert!(
-        executor
-            .get_subscriber_cursor(String::new(), key)
-            .await?
-            .is_none(),
+        executor.get_subscriber_cursor(key).await?.is_none(),
         "neither worker may have written a cursor"
     );
 
@@ -4600,10 +4577,7 @@ pub async fn subscription_live<E: Executor + Clone>(executor: &E) -> anyhow::Res
 
     // `live()` seeds before it spawns the worker, so this needs no polling.
     assert!(
-        executor
-            .get_subscriber_cursor(String::new(), key.clone())
-            .await?
-            .is_none(),
+        executor.get_subscriber_cursor(key.clone()).await?.is_none(),
         "live() must imply ephemeral: seeding at the head may not write a cursor"
     );
 
@@ -4636,10 +4610,7 @@ pub async fn subscription_live<E: Executor + Clone>(executor: &E) -> anyhow::Res
         "the pre-start account must never be delivered"
     );
     assert!(
-        executor
-            .get_subscriber_cursor(String::new(), key)
-            .await?
-            .is_none(),
+        executor.get_subscriber_cursor(key).await?.is_none(),
         "a stopped live bridge leaves nothing behind"
     );
 
@@ -4702,10 +4673,7 @@ pub async fn subscription_ephemeral_run_once<E: Executor + Clone>(
     assert_eq!(seen.snapshot(), vec![first, second]);
 
     assert!(
-        executor
-            .get_subscriber_cursor(String::new(), key)
-            .await?
-            .is_none(),
+        executor.get_subscriber_cursor(key).await?.is_none(),
         "run_once must not register a subscriber either"
     );
 
@@ -4863,24 +4831,15 @@ pub async fn replicate_large_batch<E: Executor>(executor: &E) -> anyhow::Result<
 // Tenants
 // ---------------------------------------------------------------------------
 
-/// `executor` scoped to `tenant`.
-fn scoped<E: Executor + Clone>(executor: &E, tenant: &str) -> anyhow::Result<evento::Evento> {
-    Ok(evento::Evento::new(executor.clone()).tenant(tenant)?)
-}
-
-/// Opens account `id` in the tenant `executor` acts in, or the one `tenant`
-/// names.
+/// Opens account `id` in `tenant`.
 async fn open_in<E: Executor>(
     executor: &E,
-    tenant: Option<&str>,
+    tenant: &str,
     id: &str,
     initial_balance: i64,
 ) -> Result<String, evento::WriteError> {
-    let mut builder = evento::append(id);
-    if let Some(tenant) = tenant {
-        builder.tenant(tenant);
-    }
-    builder
+    evento::append(id)
+        .tenant(tenant)
         .event(&bank::aggregator::AccountOpened {
             owner_id: "owner".to_owned(),
             owner_name: "Owner".to_owned(),
@@ -4892,20 +4851,16 @@ async fn open_in<E: Executor>(
         .await
 }
 
-/// Deposits `amount` on account `id` at `version`, in the tenant `executor`
-/// acts in, or the one `tenant` names.
+/// Deposits `amount` on account `id` of `tenant`, at `version`.
 async fn deposit_in<E: Executor>(
     executor: &E,
-    tenant: Option<&str>,
+    tenant: &str,
     id: &str,
     version: u16,
     amount: i64,
 ) -> Result<String, evento::WriteError> {
-    let mut builder = evento::append(id);
-    if let Some(tenant) = tenant {
-        builder.tenant(tenant);
-    }
-    builder
+    evento::append(id)
+        .tenant(tenant)
         .original_version(version)
         .event(&MoneyDeposited {
             amount,
@@ -4948,31 +4903,38 @@ fn raw_opened(id: &str, tenant: &str) -> Event {
 /// aggregate id opens an independent stream in each tenant — its own versions,
 /// loads and reads — and the default tenant holds none of them.
 pub async fn tenant_streams_are_isolated<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
-    let a = scoped(executor, "tenant-a")?;
-    let b = scoped(executor, "tenant-b")?;
     let id = Ulid::generate().to_string();
 
-    open_in(&a, None, &id, 100).await?;
-    open_in(&b, None, &id, 200).await?;
-    deposit_in(&a, None, &id, 1, 50).await?;
+    open_in(executor, "tenant-a", &id, 100).await?;
+    open_in(executor, "tenant-b", &id, 200).await?;
+    deposit_in(executor, "tenant-a", &id, 1, 50).await?;
 
-    let in_a = bank::Command(a.clone())
-        .load(&id)
-        .await?
-        .expect("a's account");
-    assert_eq!((in_a.balance, in_a.aggregate_version()?), (150, 2));
-    let in_b = bank::Command(b.clone())
-        .load(&id)
-        .await?
-        .expect("b's account");
-    assert_eq!((in_b.balance, in_b.aggregate_version()?), (200, 1));
+    let load = |tenant: &'static str| {
+        let id = id.clone();
+        async move {
+            tenant_view::projection::<E>()
+                .load(id)
+                .tenant(tenant)
+                .execute(executor)
+                .await
+        }
+    };
+    let in_a = load("tenant-a").await?.expect("a's account");
+    assert_eq!((in_a.balance, in_a.aggregate_version), (150, 2));
+    let in_b = load("tenant-b").await?.expect("b's account");
+    assert_eq!((in_b.balance, in_b.aggregate_version), (200, 1));
     assert!(
-        bank::Command(executor.clone()).load(&id).await?.is_none(),
+        load("").await?.is_none(),
         "the default tenant holds no such stream"
     );
+    assert!(bank::Command(executor.clone()).load(&id).await?.is_none());
 
-    // A read of one stream names one tenant: the executor's, or the builder's.
-    let events = evento::read::<BankAccount>(&id).execute(&a).await?;
+    // A read of one stream names one tenant: the default one unless the
+    // builder names another.
+    let events = evento::read::<BankAccount>(&id)
+        .tenant("tenant-a")
+        .execute(executor)
+        .await?;
     assert_eq!(events.iter().map(|e| e.version).collect::<Vec<_>>(), [1, 2]);
     assert!(events.iter().all(|e| e.tenant == "tenant-a"));
     let events = evento::read::<BankAccount>(&id)
@@ -4981,189 +4943,77 @@ pub async fn tenant_streams_are_isolated<E: Executor + Clone>(executor: &E) -> a
         .await?;
     assert_eq!(events.iter().map(|e| e.version).collect::<Vec<_>>(), [1]);
     assert!(events.iter().all(|e| e.tenant == "tenant-b"));
-
-    assert!(a.has_event::<MoneyDeposited>(&id).await?);
-    assert!(!b.has_event::<MoneyDeposited>(&id).await?);
+    assert!(evento::read::<BankAccount>(&id)
+        .execute(executor)
+        .await?
+        .is_empty());
+    assert!(!executor.has_event::<MoneyDeposited>(&id).await?);
     assert_eq!(
-        b.original_version::<bank::aggregator::AccountOpened>(&id)
+        executor
+            .original_version::<bank::aggregator::AccountOpened>(&id)
             .await?,
-        Some(1)
+        None
     );
 
     // A version conflict is per stream: b is at version 1, whatever a holds.
     assert!(matches!(
-        deposit_in(&b, None, &id, 2, 1).await,
+        deposit_in(executor, "tenant-b", &id, 2, 1).await,
         Err(evento::WriteError::InvalidOriginalVersion)
     ));
     assert!(matches!(
-        open_in(&b, None, &id, 1).await,
+        open_in(executor, "tenant-b", &id, 1).await,
         Err(evento::WriteError::InvalidOriginalVersion)
     ));
+    deposit_in(executor, "tenant-b", &id, 1, 25).await?;
+    let in_b = load("tenant-b").await?.expect("b's account");
+    assert_eq!((in_b.balance, in_b.aggregate_version), (225, 2));
 
-    // An unscoped executor writes in the tenant the builder names.
-    deposit_in(executor, Some("tenant-b"), &id, 1, 25).await?;
-    let in_b = bank::Command(b.clone())
-        .load(&id)
-        .await?
-        .expect("b's account");
-    assert_eq!((in_b.balance, in_b.aggregate_version()?), (225, 2));
-
-    Ok(())
-}
-
-/// Scenario: an executor scoped to a tenant confines every call to it. It
-/// stamps its tenant on events that name none, refuses one naming another and
-/// any `replicate`, and replaces the tenant arguments it is given — so a scoped
-/// executor can be handed to an untrusted caller.
-pub async fn tenant_scope_is_enforced<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
-    use evento::{Aggregate, TenantError, WriteError};
-
-    assert!(matches!(
-        evento::Evento::new(executor.clone()).tenant(""),
-        Err(TenantError::Empty)
-    ));
-    assert!(matches!(
-        evento::Evento::new(executor.clone()).tenant("x".repeat(256)),
-        Err(TenantError::TooLong(256))
-    ));
-
-    let a = scoped(executor, "scope-a")?;
-    let b = scoped(executor, "scope-b")?;
-    let id = Ulid::generate().to_string();
-
-    // An event that names no tenant is stamped with the scope's.
-    a.write(vec![raw_opened(&id, "")]).await?;
-    let stored = evento::read::<BankAccount>(&id)
-        .tenant("scope-a")
+    // A raw event keeps the tenant it names.
+    let raw = Ulid::generate().to_string();
+    executor.write(vec![raw_opened(&raw, "tenant-c")]).await?;
+    let events = evento::read::<BankAccount>(&raw)
+        .tenant("tenant-c")
         .execute(executor)
         .await?;
-    assert_eq!(stored.len(), 1);
-    assert_eq!(stored[0].tenant, "scope-a");
-
-    // One that names another tenant is refused, from a builder too.
-    let other = Ulid::generate().to_string();
-    assert!(matches!(
-        a.write(vec![raw_opened(&other, "scope-b")]).await,
-        Err(WriteError::ForeignTenant { .. })
-    ));
-    assert!(matches!(
-        open_in(&a, Some("scope-b"), &other, 1).await,
-        Err(WriteError::ForeignTenant { .. })
-    ));
-    assert!(matches!(
-        a.replicate(vec![raw_opened(&other, "")]).await,
-        Err(WriteError::ReplicateRefused)
-    ));
-    assert!(evento::read::<BankAccount>(&other)
-        .tenant("scope-b")
-        .execute(executor)
-        .await?
-        .is_empty());
-
-    // The arguments are replaced: asking `a` for b's stream, or for every
-    // tenant, still answers with a's.
-    open_in(&b, None, &id, 1).await?;
-    deposit_in(&b, None, &id, 1, 1).await?;
-    let filters: std::sync::Arc<[EventFilter]> = [EventFilter::by_id::<BankAccount>(&id)].into();
-    for tenant in [TenantFilter::All, TenantFilter::Only("scope-b".to_owned())] {
-        let read = a
-            .read(
-                Some(filters.clone()),
-                None,
-                tenant,
-                Args::forward(10, None),
-                None,
-            )
-            .await?;
-        assert_eq!(read.edges.len(), 1);
-        assert_eq!(read.edges[0].node.tenant, "scope-a");
-    }
-    assert_eq!(
-        a.latest_version(
-            "scope-b".to_owned(),
-            BankAccount::aggregate_type().to_owned(),
-            id.clone()
-        )
-        .await?,
-        1
-    );
-    assert_eq!(
-        b.latest_version(
-            String::new(),
-            BankAccount::aggregate_type().to_owned(),
-            id.clone()
-        )
-        .await?,
-        2
-    );
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].tenant, "tenant-c");
 
     Ok(())
 }
 
-/// Scenario: a subscription reads the default tenant unless told otherwise;
-/// `.all_tenants()` serves every tenant from one cursor, and a subscription
-/// of one tenant — on a scoped executor, or `.tenant(..)` — keeps its own
-/// cursor, apart from the same key in another tenant.
+/// Scenario: a subscription processes the events of every tenant from one
+/// cursor, each event carrying its tenant.
 pub async fn tenant_subscriptions<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
-    let a = scoped(executor, "sub-a")?;
     let id = Ulid::generate().to_string();
-    open_in(executor, None, &id, 1).await?;
-    open_in(&a, None, &id, 2).await?;
-    open_in(executor, Some("sub-b"), &id, 3).await?;
+    open_in(executor, "", &id, 1).await?;
+    open_in(executor, "sub-a", &id, 2).await?;
+    open_in(executor, "sub-b", &id, 3).await?;
 
     let key = format!("tenants-{id}");
-    let seen = |key: &str| tenant_seen::take(key, &id);
-
     tenant_seen::subscription(&key).run_once(executor).await?;
-    assert_eq!(seen(&key), [String::new()], "the default tenant only");
+    assert_eq!(tenant_seen::take(&key, &id), ["", "sub-a", "sub-b"]);
 
-    let all = format!("{key}-all");
-    tenant_seen::subscription(&all)
-        .all_tenants()
-        .run_once(executor)
-        .await?;
-    assert_eq!(seen(&all), ["", "sub-a", "sub-b"]);
-
-    // Same key as the default tenant's subscription, which already consumed
-    // its events: a scoped executor's row is its own.
-    tenant_seen::subscription(&key).run_once(&a).await?;
-    assert_eq!(seen(&key), ["sub-a"]);
-
-    let only_b = format!("{key}-b");
-    tenant_seen::subscription(&only_b)
-        .tenant("sub-b")
-        .run_once(executor)
-        .await?;
-    assert_eq!(seen(&only_b), ["sub-b"]);
-
-    // Every cursor moved past what it delivered.
-    tenant_seen::subscription(&key).run_once(&a).await?;
-    tenant_seen::subscription(&all)
-        .all_tenants()
-        .run_once(executor)
-        .await?;
-    assert!(seen(&key).is_empty());
-    assert!(seen(&all).is_empty());
+    // The cursor moved past what it delivered, whatever the tenant.
+    open_in(executor, "sub-c", &id, 4).await?;
+    tenant_seen::subscription(&key).run_once(executor).await?;
+    assert_eq!(tenant_seen::take(&key, &id), ["sub-c"]);
 
     Ok(())
 }
 
-/// Scenario: a projection subscription over every tenant loads each event's
-/// aggregate in the event's own tenant — the same id in two tenants projects
-/// to two rows — and the snapshots it persists stay in their tenant.
+/// Scenario: a projection subscription loads each event's aggregate in the
+/// event's own tenant — the same id in two tenants projects to two rows — and
+/// the snapshots it persists stay in their tenant.
 pub async fn tenant_projection_subscription<E: Executor + Clone>(
     executor: &E,
 ) -> anyhow::Result<()> {
-    let a = scoped(executor, "proj-a")?;
-    let b = scoped(executor, "proj-b")?;
     let id = Ulid::generate().to_string();
-    open_in(&a, None, &id, 10).await?;
-    open_in(&b, None, &id, 20).await?;
-    deposit_in(&a, None, &id, 1, 5).await?;
+    open_in(executor, "proj-a", &id, 10).await?;
+    open_in(executor, "proj-b", &id, 20).await?;
+    deposit_in(executor, "proj-a", &id, 1, 5).await?;
 
     tenant_view::projection()
         .subscription(format!("tenant-view-{id}"))
-        .all_tenants()
         .no_retry()
         .run_once(executor)
         .await?;
@@ -5197,31 +5047,24 @@ pub async fn tenant_projection_subscription<E: Executor + Clone>(
     Ok(())
 }
 
-/// Scenario: snapshots are kept per tenant. A scoped executor reads, writes
-/// and deletes its own tenant's snapshot only, whatever tenant it is asked for.
+/// Scenario: snapshots are kept per tenant. The same key in two tenants names
+/// two snapshots, and deleting one leaves the other.
 pub async fn tenant_snapshots_are_isolated<E: Executor + Clone>(
     executor: &E,
 ) -> anyhow::Result<()> {
     use evento::cursor::Value;
 
-    let a = scoped(executor, "snap-a")?;
-    let b = scoped(executor, "snap-b")?;
     let (agg, view, id) = ("evento/TenantSnap", "view::T", "snap-1");
-    let save = |executor: &evento::Evento, data: Vec<u8>| {
-        let executor = executor.clone();
-        async move {
-            executor
-                .save_snapshot(
-                    String::new(),
-                    agg.to_owned(),
-                    view.to_owned(),
-                    "0".to_owned(),
-                    id.to_owned(),
-                    data,
-                    Value(String::new()),
-                )
-                .await
-        }
+    let save_in = |tenant: &str, data: Vec<u8>| {
+        executor.save_snapshot(
+            tenant.to_owned(),
+            agg.to_owned(),
+            view.to_owned(),
+            "0".to_owned(),
+            id.to_owned(),
+            data,
+            Value(String::new()),
+        )
     };
     let get_in = |tenant: &str| {
         executor.get_snapshot(
@@ -5233,30 +5076,20 @@ pub async fn tenant_snapshots_are_isolated<E: Executor + Clone>(
         )
     };
 
-    save(&a, vec![1]).await?;
-    save(&b, vec![2, 2]).await?;
+    save_in("snap-a", vec![1]).await?;
+    save_in("snap-b", vec![2, 2]).await?;
     assert_eq!(get_in("snap-a").await?.map(|s| s.0), Some(vec![1]));
     assert_eq!(get_in("snap-b").await?.map(|s| s.0), Some(vec![2, 2]));
     assert!(get_in("").await?.is_none(), "the default tenant has none");
 
-    // `a` asked for b's snapshot answers with its own, and deletes its own.
-    let asked = a
-        .get_snapshot(
-            "snap-b".to_owned(),
+    executor
+        .delete_snapshot(
+            "snap-a".to_owned(),
             agg.to_owned(),
             view.to_owned(),
-            "0".to_owned(),
             id.to_owned(),
         )
         .await?;
-    assert_eq!(asked.map(|s| s.0), Some(vec![1]));
-    a.delete_snapshot(
-        "snap-b".to_owned(),
-        agg.to_owned(),
-        view.to_owned(),
-        id.to_owned(),
-    )
-    .await?;
     assert!(get_in("snap-a").await?.is_none());
     assert_eq!(get_in("snap-b").await?.map(|s| s.0), Some(vec![2, 2]));
 
