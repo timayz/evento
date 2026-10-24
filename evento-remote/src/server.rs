@@ -105,7 +105,12 @@ impl<E> Session<E> {
     /// `tenant`, and the version, routing-key and snapshot lookups are
     /// `tenant`'s. A host that maps a client's credential to a tenant in its
     /// [`Resolver`] confines the client this way, over one store shared by
-    /// every tenant, while the client itself stays tenant-agnostic.
+    /// every tenant.
+    ///
+    /// The client sees a store of its own: the events it reads come back in
+    /// the default tenant (`""`), so it names no tenant anywhere — its
+    /// projections, snapshots and cursors are kept as against a store of a
+    /// single tenant.
     ///
     /// Requests that would reach past the tenant are refused: `replicate`,
     /// which keeps the caller's timestamps (an event backdated behind the
@@ -576,12 +581,32 @@ fn confine(request: &mut Request, tenant: &str) -> Option<Response> {
     }
 }
 
+/// What a client of a session serving a tenant reads: that tenant's events, in
+/// the default tenant (see [`Session::tenant`]).
+fn present(response: &mut Response) {
+    if let Response::Read(Ok(page)) = response {
+        for event in &mut page.events {
+            event.tenant.clear();
+        }
+    }
+}
+
 /// Serves one request with the session's executor, in the session's tenant
-/// when it serves one (see [`confine`]).
+/// when it serves one (see [`confine`] and [`present`]).
 async fn handle<E: Executor>(executor: &E, tenant: Option<&str>, mut request: Request) -> Response {
-    if let Some(refusal) = tenant.and_then(|tenant| confine(&mut request, tenant)) {
+    let Some(tenant) = tenant else {
+        return dispatch(executor, request).await;
+    };
+    if let Some(refusal) = confine(&mut request, tenant) {
         return refusal;
     }
+    let mut response = dispatch(executor, request).await;
+    present(&mut response);
+    response
+}
+
+/// Serves one request with the session's executor, its tenants as given.
+async fn dispatch<E: Executor>(executor: &E, request: Request) -> Response {
     match request {
         Request::Hello { .. } => unreachable!("Hello is answered inline by the read loop"),
         Request::Write { events } => Response::Write(
@@ -727,8 +752,8 @@ mod tests {
     use evento_core::{Event, TenantFilter};
     use ulid::Ulid;
 
-    use super::confine;
-    use crate::wire::{Request, Response, WireWriteError};
+    use super::{confine, present};
+    use crate::wire::{Request, Response, WireReadResult, WireWriteError};
 
     fn acme() -> String {
         "acme".to_owned()
@@ -821,6 +846,24 @@ mod tests {
             };
             assert_eq!(*tenant, acme(), "{request:?}");
         }
+    }
+
+    #[test]
+    fn a_tenant_session_reads_its_events_in_the_default_tenant() {
+        let event = |tenant: &str| Event {
+            tenant: tenant.to_owned(),
+            ..Default::default()
+        };
+        let mut response = Response::Read(Ok(WireReadResult {
+            cursors: vec![Value(String::new()), Value(String::new())],
+            events: vec![event("acme"), event("acme")],
+            page_info: Default::default(),
+        }));
+        present(&mut response);
+        let Response::Read(Ok(page)) = response else {
+            unreachable!()
+        };
+        assert!(page.events.iter().all(|e| e.tenant.is_empty()));
     }
 
     #[test]
