@@ -202,7 +202,7 @@ impl Cluster {
 
     /// What a host does once node `i` lost its journal and its store: stops
     /// it, gives it an empty store and journal, and opens it **joining**
-    /// through `contact` (as `GroupHost::open_joining` does). Returns the
+    /// through `contact` (`recover_state_for_join`, `begin_join`, `join`). Returns the
     /// join in flight; once joined, the node runs its recovery sweep.
     async fn reopen_amnesiac(&mut self, i: u64, contact: u64) -> JoinHandle<anyhow::Result<usize>> {
         let journal = Arc::new(InMemoryJournal::new());

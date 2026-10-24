@@ -98,10 +98,8 @@ let executor = evento::Sidecar::from((client, local));        // events: client;
 - `evento::Evento::new(exec)` type-erases any executor (`Arc<Box<dyn Executor>>`) —
   use it when a struct must hold "some executor" without a generic parameter.
 - **Accord (consensus-replicated, alpha):** `evento-accord` replicates writes
-  leaderlessly with any local backend serving reads. One process can host many
-  consensus groups (one SQLite DB per tenant) via `MuxTransport` + `SweepScheduler`
-  + `GroupHost`; see `evento-accord/OPERATIONS.md` §10 and
-  `examples/bank-axum-accord-tenants/`.
+  leaderlessly with any local backend serving reads; one process runs one node of
+  one cluster (`examples/bank-axum-accord/`, `evento-accord/OPERATIONS.md`).
 
 ## 1. Define aggregates & events
 
@@ -420,8 +418,7 @@ Canonical, compiling usage lives in this repo:
   (one per snapshot mode), co-keyed `Owner` aggregate.
 - `examples/bank-axum-sqlite/` and `examples/bank-axum-fjall/` — web wiring,
   migrations, projection subscriptions; `bank-axum-remote/` (client/server split)
-  and `bank-axum-accord/` (consensus cluster); `bank-axum-accord-tenants/` (many
-  consensus groups per process, one SQLite DB per tenant).
+  and `bank-axum-accord/` (consensus cluster).
 - `evento-remote/README.md` — resolver, `Hello` token, TLS; `evento-accord/OPERATIONS.md`.
 - `evento-macro/README.md` — full macro reference (all options).
 - `evento-test/src/lib.rs` — the behavioral contract suite (load, routing isolation,

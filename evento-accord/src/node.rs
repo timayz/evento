@@ -36,7 +36,6 @@ use crate::failure_detector::FailureDetector;
 use crate::message::{CommandState, Key, Message, Status, SyncKnown, INVALIDATED_AT};
 use crate::metrics::{Metrics, MetricsSnapshot};
 use crate::replica::{command_size, Refusal, Replica, RoutedRecovery};
-use crate::sweep::SweepPressure;
 use crate::transport::Envelope;
 
 /// Tunable timing/sizing parameters for a [`Node`]. [`Default`] reproduces the
@@ -126,9 +125,8 @@ pub struct NodeConfig {
     /// Byte budget of one snapshot page (the sum of the events' wire sizes,
     /// [`snapshot_event_size`]); a single event larger than it still crosses
     /// alone. Keep it far below the transport's frame cap (64 MiB on the
-    /// TCP transport), and small enough that one group's bootstrap does not
-    /// hold the link it shares with every other group for long: the default
-    /// 4 MiB leaves sixteen times the headroom.
+    /// TCP transport), and small enough that a bootstrap does not hold the
+    /// link for long: the default 4 MiB leaves sixteen times the headroom.
     pub snapshot_page_bytes: usize,
     /// Control-plane anti-dueling delay. An automatic config-change recovery defers
     /// by `rank * config_defer_step` (the **distinguished proposer** for an epoch has
@@ -148,10 +146,8 @@ pub struct NodeConfig {
     /// watermark report to pass its amnesia fence before it gives up with
     /// [`FenceNotCovered`] (#312). The report passes the fence about
     /// `compaction_margin` + three clock skews after the node reopened, plus
-    /// the anti-entropy rounds the contact needs to prove its coverage — and,
-    /// for a contact whose group is idle under a
-    /// [`SweepScheduler`](crate::SweepScheduler), its idle interval between
-    /// reports. Default 30 s.
+    /// the anti-entropy rounds the contact needs to prove its coverage.
+    /// Default 30 s.
     pub amnesia_join_timeout: Duration,
 }
 
@@ -270,9 +266,18 @@ impl std::fmt::Display for RejoinRequired {
 
 impl std::error::Error for RejoinRequired {}
 
-/// The node was closed by its host ([`GroupHost::close`](crate::GroupHost::close)):
-/// it mints no timestamps any more, so it coordinates nothing — the group's
-/// reopened node does. Returned through `anyhow`.
+/// A node's liveness signal ([`Node::sweep_pressure`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SweepPressure {
+    /// Un-applied or in-flight transactions exist.
+    pub busy: bool,
+    /// A monotone counter that moves only when applied state advances.
+    pub activity: u64,
+}
+
+/// The node was retired by its host ([`Node::retire`]): it mints no
+/// timestamps any more, so it coordinates nothing — the node reopened over its
+/// journal does. Returned through `anyhow`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NodeClosed;
 
@@ -316,8 +321,8 @@ impl std::error::Error for PartialSnapshot {}
 /// or deleted — or a join it started over a lost journal never completed
 /// (`join_pending: true`). Over a lost journal the node forgot the votes,
 /// promises and reports it made, so it may only come back by **joining**
-/// (`GroupHost::open_joining`, or [`Node::recover_state_for_join`] +
-/// [`begin_join`](Node::begin_join) + [`join`](Node::join)) over an empty
+/// ([`Node::recover_state_for_join`] + [`begin_join`](Node::begin_join) +
+/// [`join`](Node::join)) over an empty
 /// data store: the join waits for a contact that vouches past everything it
 /// may have forgotten (#312). Returned through `anyhow`; downcast to tell it
 /// apart.
@@ -910,8 +915,8 @@ pub struct Node {
     absent: Arc<Mutex<HashMap<NodeId, AbsentPeer>>>,
     /// True once a peer told this node to rejoin: it then drops every message
     /// and refuses writes until its host discards its event store (keeping
-    /// the journal) and opens the group by joining
-    /// (`GroupHost::open_joining`).
+    /// the journal) and opens it again by joining
+    /// ([`recover_state_for_join`](Self::recover_state_for_join)).
     rejoin_required: Arc<tokio::sync::watch::Sender<bool>>,
     /// The peer whose `Rejoin` set `rejoin_required` (see
     /// [`rejoin_contact`](Self::rejoin_contact)).
@@ -1080,10 +1085,12 @@ impl Node {
     /// compacted; or its own recovery found it holding a transaction its peers
     /// compacted past, which no recovery can decide any more (see
     /// `stranded_below`). Either way it can no longer catch up. The node drops
-    /// every message and refuses writes from then on; the host closes it,
+    /// every message and refuses writes from then on; the host
+    /// [retires](Self::retire) it, stops its inbox loop and recovery task,
     /// discards its event store — keeping its journal, whose votes and
-    /// promises the node must not forget — and opens the group by joining
-    /// (`GroupHost::open_joining`).
+    /// promises the node must not forget — and opens it again by joining
+    /// ([`recover_state_for_join`](Self::recover_state_for_join),
+    /// [`begin_join`](Self::begin_join), [`join`](Self::join)).
     pub fn rejoin_required(&self) -> bool {
         *self.rejoin_required.borrow()
     }
@@ -1279,20 +1286,16 @@ impl Node {
 
     /// One iteration of the loop [`start_recovery`](Node::start_recovery) runs:
     /// recover stalled transactions, one anti-entropy round, watermark gossip +
-    /// compaction, metadata catch-up. For a process hosting **many** nodes (one
-    /// consensus group per tenant), drive this from a shared
-    /// [`SweepScheduler`](crate::sweep::SweepScheduler) instead of starting a
-    /// recovery task per node — it sweeps idle groups far less often. Not
-    /// re-entrant: do not run two sweeps of one node concurrently.
+    /// compaction, metadata catch-up. Not re-entrant: do not run two sweeps
+    /// of one node concurrently.
     pub async fn sweep(&self) {
         self.recovery_sweep().await;
     }
 
-    /// Cheap liveness signal for a shared [`SweepScheduler`](crate::sweep::SweepScheduler):
-    /// whether this node has un-applied or in-flight work (must be swept at full
-    /// cadence), and a monotone counter that moves only when applied state
-    /// advances (an apply or an anti-entropy import — *not* on sweep gossip, so
-    /// idle peers cannot keep each other awake).
+    /// Cheap liveness signal: whether this node has un-applied or in-flight
+    /// work, and a monotone counter that moves only when applied state
+    /// advances (an apply or an anti-entropy import — *not* on sweep gossip).
+    /// A node that is not busy and whose counter stands still is quiescent.
     pub fn sweep_pressure(&self) -> SweepPressure {
         let busy = self
             .replica
@@ -5416,10 +5419,9 @@ impl Node {
     /// `contact`'s own watermark report (gossiped to every node, and heard
     /// while joining) reaches `fence`: only then is its join header asked
     /// for, since the header installs a [`JoinHold`] that would pin the
-    /// contact's report at an earlier vouch. A keepalive wakes a contact
-    /// whose group is closed; under a topology that changes, the contact's
-    /// decided epochs are fetched meanwhile, since a vouch counts only under
-    /// the epoch this node has installed.
+    /// contact's report at an earlier vouch. Under a topology that changes,
+    /// the contact's decided epochs are fetched meanwhile, since a vouch
+    /// counts only under the epoch this node has installed.
     async fn await_report_past(&self, contact: NodeId, fence: Timestamp) -> anyhow::Result<()> {
         let deadline = Instant::now() + self.settings.amnesia_join_timeout;
         let mut reported = None;
@@ -5442,7 +5444,6 @@ impl Node {
                 }
                 .into());
             }
-            self.send(contact, Message::JoinKeepalive).await;
             if self.topology.dynamic() {
                 self.send(
                     contact,
@@ -6852,10 +6853,9 @@ impl Node {
     /// Taken under the lock that raises the bound, so a bound being raised is
     /// persisted before this returns, and every later id or ballot it would
     /// mint fails with [`NodeClosed`] — a clone the application still holds can
-    /// never mint an id the reopened node mints too. [`GroupHost::close`]
-    /// does this; a host managing bare nodes calls it before reopening one.
-    ///
-    /// [`GroupHost::close`]: crate::GroupHost::close
+    /// never mint an id the reopened node mints too. A host calls it before
+    /// reopening the node over the same journal, then stops the node's inbox
+    /// loop and recovery task before it discards the event store.
     pub async fn retire(&self) {
         let _raising = self.clock_bound_lock.lock().await;
         self.retired.store(true, Ordering::Release);
@@ -6978,8 +6978,7 @@ impl Node {
     /// minted: its wall clock plus one skew (the clock is never pushed
     /// further by a peer, and a restart waits out any more), persisted as
     /// the clock bound. Not the fence itself: three skews ahead, its ids
-    /// would run ahead of the wall clock past what peers accept, and a clock
-    /// a [`GroupHost`](crate::GroupHost) shares would push every group's.
+    /// would run ahead of the wall clock past what peers accept.
     async fn floor_clock_after_loss(&self) -> anyhow::Result<()> {
         let floor = self
             .clock

@@ -96,8 +96,10 @@ impl Trio {
 
     /// What a host does once node `R` is told to rejoin: stops it, keeps
     /// its journal, discards its event store, and opens it again by joining
-    /// through [`CONTACT`] (as `GroupHost::open_joining` does), on `clock`.
+    /// through [`CONTACT`] (`recover_state_for_join`, `begin_join`, `join`),
+    /// on `clock`.
     async fn rejoin(&mut self, clock: Arc<HybridLogicalClock>) {
+        self.nodes[R].retire().await;
         self.loops[R].abort();
         let inbox = self.net.register(NodeId(R as u64));
         let store = Arc::new(InMemoryDataStore::new());
@@ -108,6 +110,24 @@ impl Trio {
         node.begin_join();
         self.loops[R] = node.start(inbox);
         node.join(CONTACT).await.expect("rejoin from a snapshot");
+        self.nodes[R] = node;
+        self.stores[R] = store;
+    }
+
+    /// What a host that missed the loss of node `R`'s event store does: a
+    /// plain reopen ([`Node::recover_state`]) over its kept journal and an
+    /// empty store.
+    async fn reopen_over_empty_store(&mut self) {
+        self.nodes[R].retire().await;
+        self.loops[R].abort();
+        let inbox = self.net.register(NodeId(R as u64));
+        let store = Arc::new(InMemoryDataStore::new());
+        let clock = Arc::new(HybridLogicalClock::new(NodeId(R as u64)));
+        let node = self.build(R, &store, &self.journals[R], clock);
+        node.recover_state()
+            .await
+            .expect("recover the kept journal");
+        self.loops[R] = node.start(inbox);
         self.nodes[R] = node;
         self.stores[R] = store;
     }
@@ -421,4 +441,76 @@ async fn a_rejoined_replica_drops_what_its_contact_compacted() {
         "nothing un-applied is left"
     );
     assert!(holds(&t.stores[R], "base", 1), "the snapshot is installed");
+}
+
+/// A replica that lost its event store after its peers compacted cannot catch
+/// up through anti-entropy — the prefix is no longer held as commands
+/// anywhere — so a plain reopen over an empty store recovers nothing. Joining
+/// installs a contact's snapshot and floor, the floor is persisted for the
+/// next restart, and writes that depend on compacted transactions land on it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replica_with_a_lost_store_rejoins_after_compaction() {
+    let mut t = Trio::start();
+    for i in 0..3 {
+        t.nodes[0]
+            .write(vec![event(&format!("acc-{i}"), 1)])
+            .await
+            .expect("write");
+    }
+    for id in 0..3 {
+        for i in 0..3 {
+            await_event(&t.stores[id], &format!("acc-{i}"), 1).await;
+        }
+    }
+    // Not beyond the wall clock: a node mints above its floor, and peers
+    // refuse a `t0` past their clock's skew bound.
+    let floor = Timestamp {
+        micros: system_micros(),
+        logical: 0,
+        node: NodeId(0),
+    };
+    for node in &t.nodes {
+        node.compact(floor).await;
+        assert_eq!(node.command_count(), 0, "every command compacted away");
+    }
+
+    t.reopen_over_empty_store().await;
+    for _ in 0..3 {
+        for node in &t.nodes {
+            node.sweep().await;
+        }
+    }
+    assert!(
+        t.stores[R].committed_events().is_empty(),
+        "anti-entropy shipped a compacted command"
+    );
+
+    t.rejoin_now().await;
+    let committed = |store: &InMemoryDataStore| {
+        let mut events = store.committed_events();
+        events.sort();
+        events
+    };
+    assert_eq!(committed(&t.stores[R]), committed(&t.stores[0]));
+    let adopted = t.journals[R]
+        .load_watermark()
+        .await
+        .unwrap()
+        .expect("the adopted floor is persisted");
+    assert!(adopted > Timestamp::MIN);
+
+    // A write that depends on a compacted transaction lands on the joiner,
+    // and the joiner can coordinate one too.
+    t.nodes[0]
+        .write(vec![event("acc-0", 2)])
+        .await
+        .expect("a write after the join");
+    t.nodes[R]
+        .write(vec![event("acc-1", 2)])
+        .await
+        .expect("a write the joiner coordinates");
+    for id in 0..3 {
+        await_event(&t.stores[id], "acc-0", 2).await;
+        await_event(&t.stores[id], "acc-1", 2).await;
+    }
 }
