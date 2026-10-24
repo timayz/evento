@@ -146,9 +146,6 @@ struct Inner {
     /// Fixed at server executor construction; snapshotted once from the first
     /// connection's `Hello` (it is borrowed as `&str`, so it must stay fixed).
     default_routing_key: Option<String>,
-    /// The tenant the server scoped this client's session to, snapshotted
-    /// like `default_routing_key`.
-    tenant: Option<String>,
     stable: Stable,
     request_timeout: Duration,
 }
@@ -207,13 +204,11 @@ impl ClientBuilder {
 
         let mut lanes = Vec::with_capacity(self.connections);
         let mut default_routing_key = None;
-        let mut tenant = None;
         for lane in 0..self.connections {
             let (framed, hello) =
                 connect_and_hello(&self.dial, &stable, self.request_timeout).await?;
             if lane == 0 {
                 default_routing_key = hello.default_routing_key;
-                tenant = hello.tenant;
             }
             let (req_tx, req_rx) = mpsc::channel(REQ_CAPACITY);
             tokio::spawn(
@@ -238,7 +233,6 @@ impl ClientBuilder {
                 next_id: AtomicU64::new(HELLO_ID + 1),
                 watch_tx,
                 default_routing_key,
-                tenant,
                 stable,
                 request_timeout: self.request_timeout,
             }),
@@ -299,10 +293,6 @@ fn protocol_err(what: &str) -> anyhow::Error {
 impl Executor for Client {
     fn default_routing_key(&self) -> Option<&str> {
         self.inner.default_routing_key.as_deref()
-    }
-
-    fn tenant(&self) -> Option<&str> {
-        self.inner.tenant.as_deref()
     }
 
     fn write_watch(&self) -> Option<watch::Receiver<u64>> {
@@ -712,9 +702,9 @@ impl Actor {
                 return None;
             }
             match connect_and_hello(&self.dial, &self.stable, self.request_timeout).await {
-                // The routing key and tenant from a re-Hello are ignored: they
-                // are fixed per session, and the cached ones must stay stable
-                // for the lifetime of this Client (they are borrowed as &str).
+                // The routing key from a re-Hello is ignored: it is fixed at
+                // server construction, and the cached one must stay stable for
+                // the lifetime of this Client (it is borrowed as &str).
                 Ok((framed, _)) => return Some(framed),
                 Err(err) => {
                     // A refusal is the server's decision (the credential was
@@ -742,8 +732,8 @@ impl Actor {
 
 /// Establishes one connection (TLS handshake included) and performs the
 /// `Hello` exchange, returning the framed stream and what the server answered
-/// (its `default_routing_key`, the session's tenant). Seeds the stable
-/// watermark from the reply. Frames
+/// (its `default_routing_key`). Seeds the stable watermark from the reply.
+/// Frames
 /// pushed before the reply (notifies) only update the watermark. A refusal
 /// comes back as an error whose source is the [`Rejection`].
 async fn connect_and_hello(
