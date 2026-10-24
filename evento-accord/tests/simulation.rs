@@ -1502,7 +1502,10 @@ impl Sim {
 
     /// Rejoins every node told to rejoin, as its host would: through the
     /// peer that told it to ([`Node::rejoin_contact`]), else through any not
-    /// told to.
+    /// told to. A join that fails — its contact told to rejoin meanwhile
+    /// answers nothing more (#348) — is made again through the next contact;
+    /// one that fails through every contact leaves the node told to rejoin,
+    /// for the next call.
     async fn rejoin_told(&mut self, since: tokio::time::Instant) -> Result<(), String> {
         if !self.dynamic.is_empty() {
             return Ok(());
@@ -1513,14 +1516,22 @@ impl Sim {
             }
             let told_by = self.nodes[i]
                 .rejoin_contact()
-                .and_then(|peer| self.ids.iter().position(|&id| id == peer))
-                .filter(|&j| !self.nodes[j].rejoin_required());
-            let Some(contact) =
-                told_by.or_else(|| (0..self.ids.len()).find(|&j| !self.nodes[j].rejoin_required()))
-            else {
+                .and_then(|peer| self.ids.iter().position(|&id| id == peer));
+            let mut contacts: Vec<usize> = told_by.into_iter().collect();
+            contacts.extend((0..self.ids.len()).filter(|&j| Some(j) != told_by));
+            let mut tried = false;
+            for j in contacts {
+                if self.nodes[j].rejoin_required() {
+                    continue;
+                }
+                tried = true;
+                if self.try_rejoin(i, self.ids[j], self.config).await.is_ok() {
+                    break;
+                }
+            }
+            if !tried {
                 return Err(self.stalled(i, "rejoin", "every node was told to rejoin", since));
-            };
-            self.rejoin(i, self.ids[contact], self.config).await;
+            }
         }
         Ok(())
     }
@@ -1577,11 +1588,11 @@ async fn assert_live(sim: &mut Sim, acked: &BTreeMap<String, u16>) -> Result<(),
     let config = sim.config;
     let n = sim.ids.len() as u32;
     // After a heal, the transactions left stalled are recovered within a few
-    // `collect_timeout` rounds, what each one's read waits on first (#326).
-    // A replica that missed many applied transactions takes longer: it
-    // catches up one anti-entropy page per round, up to ~18 rounds with the
-    // smallest pages. The bounds allow for that, and catch a cluster that
-    // never serves again.
+    // `collect_timeout` rounds, what each one's read waits on first (#326),
+    // and a replica that missed applied transactions catches up through
+    // anti-entropy, up to 16 pages a round (#348). Over 60,000 swarm seeds,
+    // the slowest serves again within 11 rounds. The bounds allow for more,
+    // and catch a cluster that never serves again.
     let serve = config.collect_timeout * SETTLE_ROUNDS
         + config.recovery_timeout * 4
         + config.anti_entropy_interval * n;
@@ -3604,15 +3615,7 @@ const SLOW_HEAL_SEEDS: [u64; 3] = [
 
 #[tokio::test(start_paused = true)]
 async fn a_healed_cluster_serves_again_in_time() {
-    for seed in SLOW_HEAL_SEEDS {
-        let _replay = Replay {
-            test: "swarm",
-            seed,
-        };
-        run_swarm(seed, &SwarmConfig::from_seed(seed))
-            .await
-            .assert_ok(&format!("swarm seed {seed}"));
-    }
+    swarm_seeds_pass(&SLOW_HEAL_SEEDS).await;
 }
 
 /// Swarm seeds (#349) where a replica given up while absent rejoined
@@ -3624,7 +3627,23 @@ const REJOIN_LOOP_SEEDS: [u64; 2] = [142649, 135462];
 
 #[tokio::test(start_paused = true)]
 async fn a_replica_rejoining_through_a_restarted_contact_is_counted_in() {
-    for seed in REJOIN_LOOP_SEEDS {
+    swarm_seeds_pass(&REJOIN_LOOP_SEEDS).await;
+}
+
+/// A swarm seed (#348) whose rejoin went through a contact that was told
+/// to rejoin itself mid-join, and answered nothing from then on: the
+/// harness makes the join again through another contact, as a host would.
+const CONTACT_TOLD_TO_REJOIN_SEEDS: [u64; 1] = [109900];
+
+#[tokio::test(start_paused = true)]
+async fn a_rejoin_whose_contact_is_told_to_rejoin_goes_through_another() {
+    swarm_seeds_pass(&CONTACT_TOLD_TO_REJOIN_SEEDS).await;
+}
+
+/// Runs each swarm seed of `seeds`, failing on the first that breaks an
+/// oracle.
+async fn swarm_seeds_pass(seeds: &[u64]) {
+    for &seed in seeds {
         let _replay = Replay {
             test: "swarm",
             seed,
@@ -3746,10 +3765,24 @@ impl Sim {
     /// a fresh node over an **empty** store and its **kept** journal, and
     /// joins through `contact` before its sweeps start.
     async fn rejoin(&mut self, i: usize, contact: NodeId, config: NodeConfig) {
+        self.try_rejoin(i, contact, config)
+            .await
+            .expect("rejoin from a snapshot");
+    }
+
+    /// [`rejoin`](Self::rejoin), handing a failed join back: node `i` then
+    /// stays the stopped node told to rejoin, for its host to rejoin through
+    /// another contact (see [`rejoin_told`](Self::rejoin_told)).
+    async fn try_rejoin(
+        &mut self,
+        i: usize,
+        contact: NodeId,
+        config: NodeConfig,
+    ) -> anyhow::Result<()> {
         let store = SimStore::new(self.store_kind, &self.outcomes);
         self.arm_store(i, &store);
-        self.rejoin_over(i, contact, config, store.data_store(), store)
-            .await;
+        self.try_rejoin_over(i, contact, config, store.data_store(), store)
+            .await
     }
 
     /// What a host does when node `i` lost its journal along with its store
@@ -3850,6 +3883,21 @@ impl Sim {
         backend: Arc<dyn DataStore>,
         store: SimStore,
     ) {
+        self.try_rejoin_over(i, contact, config, backend, store)
+            .await
+            .expect("rejoin from a snapshot");
+    }
+
+    /// [`try_rejoin`](Self::try_rejoin) over `backend`, a store wrapping
+    /// `store`.
+    async fn try_rejoin_over(
+        &mut self,
+        i: usize,
+        contact: NodeId,
+        config: NodeConfig,
+        backend: Arc<dyn DataStore>,
+        store: SimStore,
+    ) -> anyhow::Result<()> {
         for t in &self.tasks[i] {
             t.abort();
         }
@@ -3873,13 +3921,17 @@ impl Sim {
             .expect("recover the kept journal");
         node.begin_join();
         let inbox_task = node.start(inbox);
-        node.join(contact).await.expect("rejoin from a snapshot");
+        if let Err(err) = node.join(contact).await {
+            inbox_task.abort();
+            return Err(err);
+        }
         self.tasks[i] = vec![inbox_task, node.start_recovery()];
         self.nodes[i] = node;
         self.stores[i] = store;
         self.journals[i] = journal;
         self.live
             .set(i, self.nodes[i].clone(), self.stores[i].clone());
+        Ok(())
     }
 }
 
@@ -4671,6 +4723,47 @@ async fn a_healed_peer_repairs_a_backlog_over_the_frame_cap() {
     }
     // Coverage re-proved over the repair: the cluster compacts it all.
     await_compacted(&sim, &[0, 1, 2], "after the repair").await;
+}
+
+/// A peer back from a partition catches up within a few anti-entropy
+/// rounds, however small the pages (#348): a round goes on pulling pages
+/// from its peer while each brings something in. At one page a round, a
+/// backlog of one write a page took a round a write — [`BACKLOG`] rounds of
+/// `anti_entropy_interval` here, 25 s.
+#[tokio::test(start_paused = true)]
+async fn a_healed_peer_catches_up_a_backlog_in_a_few_rounds() {
+    let config = NodeConfig {
+        snapshot_page_events: 1,
+        ..paged_config()
+    };
+    let sim = Sim::build_with_config(3, config);
+    sim.nodes[0]
+        .write(vec![event("baseline", 1, 1)])
+        .await
+        .expect("baseline write");
+    assert!(converge(&sim.stores).await);
+
+    write_backlog(&sim, 2).await;
+    sim.net.heal(NodeId(2));
+    // Every write of the backlog, in node 2's store.
+    let held = || async {
+        let mut held = 0;
+        for agg in 0..5 {
+            held += version_of(&sim.stores[2], &format!("acc-{agg}")).await as u64;
+        }
+        held
+    };
+    let deadline = tokio::time::Instant::now() + config.anti_entropy_interval * 20;
+    while held().await < BACKLOG && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        held().await,
+        BACKLOG,
+        "the healed node holds the whole backlog within 20 anti-entropy rounds"
+    );
+    assert!(converge(&sim.stores).await);
+    await_compacted(&sim, &[0, 1, 2], "after the catch-up").await;
 }
 
 /// A join from a contact holding a command backlog three times the frame

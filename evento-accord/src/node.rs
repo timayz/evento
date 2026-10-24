@@ -403,7 +403,14 @@ struct Imported {
     events: usize,
     /// Wire size of the snapshot events installed (bootstrap only).
     bytes: usize,
+    /// An import failed to journal or apply (anti-entropy only): the round
+    /// stopped there, and the next one ships the rest again.
+    stopped: bool,
 }
+
+/// How many pages an anti-entropy round pulls from its peer at most, while
+/// each brings something in (see `Node::anti_entropy`).
+const ANTI_ENTROPY_PAGES: usize = 16;
 
 /// A same-shard peer this node stopped waiting for; see
 /// [`NodeConfig::peer_absence_limit`].
@@ -2114,6 +2121,13 @@ impl Node {
     /// this node's shard has that this node missed (e.g. while it was briefly down). Recovery alone
     /// can't fix this — a transaction that completed on a quorum without this
     /// node is "stuck" nowhere — so a healed node converges via this sweep.
+    ///
+    /// The peer answers with a page of what this node misses, within its
+    /// snapshot page budget (see [`export_bootstrap`](Self::export_bootstrap)).
+    /// While a page brings something in, the round asks the same peer for
+    /// the next at once, up to [`ANTI_ENTROPY_PAGES`] pages and for one
+    /// `anti_entropy_interval`: at one page a round, a replica back from an
+    /// absence took a round for every page it missed (#348).
     async fn anti_entropy(&self) {
         // Paced on its own interval, independent of the (faster) recovery
         // sweep that hosts it.
@@ -2143,21 +2157,33 @@ impl Node {
         }
         let next = self.anti_entropy_turn.fetch_add(1, Ordering::Relaxed) as usize;
         let peer = peers[next % peers.len()];
-        // The digest lets the peer answer with only the commands this node is
-        // missing, instead of its full applied set every round.
-        let known = {
-            let replica = self.replica.lock().expect("replica poisoned");
-            let (since, txns) = replica.applied_digest();
-            SyncKnown { since, txns }
-        };
-        let _ = self
-            .import_from(
-                peer,
-                self.settings.anti_entropy_interval,
-                false,
-                Some(known),
-            )
-            .await;
+        let started = Instant::now();
+        for _ in 0..ANTI_ENTROPY_PAGES {
+            // The digest lets the peer answer with only the commands this
+            // node is missing, instead of its full applied set every page.
+            let known = {
+                let replica = self.replica.lock().expect("replica poisoned");
+                let (since, txns) = replica.applied_digest();
+                SyncKnown { since, txns }
+            };
+            match self
+                .import_from(
+                    peer,
+                    self.settings.anti_entropy_interval,
+                    false,
+                    Some(known),
+                )
+                .await
+            {
+                Ok(imported) if imported.commands > 0 && !imported.stopped => {}
+                _ => break,
+            }
+            // A slow link or disk must not hold the sweep's recoveries back
+            // for more than about a round.
+            if started.elapsed() >= self.settings.anti_entropy_interval {
+                break;
+            }
+        }
     }
 
     /// Records `peer`'s proven sync coverage after a successful sync round:
@@ -5767,9 +5793,10 @@ impl Node {
     /// back from a long partition would otherwise be sent its whole backlog
     /// in one frame — over the transport's cap, shed, and asked for again
     /// every round, forever. It gets an execution-order prefix instead, and
-    /// its next digest asks for the rest. The coverage then stops below the
-    /// oldest `t0` left out: the requester records it as proof it holds
-    /// everything this node applied below it.
+    /// its next digest — in the same round, while pages bring something in
+    /// ([`anti_entropy`](Self::anti_entropy)) — asks for the rest. The
+    /// coverage then stops below the oldest `t0` left out: the requester
+    /// records it as proof it holds everything this node applied below it.
     fn export_bootstrap(
         &self,
         known: Option<&SyncKnown>,
@@ -6374,6 +6401,7 @@ impl Node {
             self.applied.bump();
         }
 
+        imported.stopped = apply_failed;
         Ok(imported)
     }
 
