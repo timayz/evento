@@ -3598,6 +3598,26 @@ async fn a_healed_cluster_serves_again_in_time() {
     }
 }
 
+/// Swarm seeds (#349) where a replica given up while absent rejoined
+/// through a contact that had restarted and vouched for it below the
+/// contact's own bound, then was told to rejoin on every rejoin: the hold
+/// the contact kept on its report for the first join capped the vouch for
+/// every next one (see `a_rejoin_through_a_contact_that_vouched_too_low_is_counted_next_time`).
+const REJOIN_LOOP_SEEDS: [u64; 2] = [142649, 135462];
+
+#[tokio::test(start_paused = true)]
+async fn a_replica_rejoining_through_a_restarted_contact_is_counted_in() {
+    for seed in REJOIN_LOOP_SEEDS {
+        let _replay = Replay {
+            test: "swarm",
+            seed,
+        };
+        run_swarm(seed, &SwarmConfig::from_seed(seed))
+            .await
+            .assert_ok(&format!("swarm seed {seed}"));
+    }
+}
+
 /// Aggressive bug-hunt: run **every** scenario across a wide seed range and fail on
 /// the first oracle violation (printing the seed, so it replays exactly). Ignored by
 /// default — it's a soak, not a CI gate:
@@ -4452,6 +4472,106 @@ async fn rejoin_bounds_survive_a_restart() {
 
     sim.net.heal(NodeId(2));
     await_rejoin_required(&sim.nodes[2]).await;
+}
+
+/// A contact can report below what it compacted past an absent peer (#349):
+/// restarted over a journal that kept the writes since its last truncate,
+/// with a store that fails their replay, it holds them decided but
+/// un-applied. Its vouch for that peer's rejoin is that report, so the
+/// joiner's first report is below the bound and it is told to rejoin once
+/// more. Once the contact has applied them again, the next rejoin through it
+/// must count the peer in. The hold the contact kept on its report for the
+/// first join (see `JoinHold`) must not cap the vouch for the next, or the
+/// peer is told to rejoin again on every rejoin, for good.
+#[tokio::test(start_paused = true)]
+async fn a_rejoin_through_a_contact_that_vouched_too_low_is_counted_next_time() {
+    const HOT: &str = "hot";
+    // The journal truncates once, after the baseline: node 0's restart
+    // replays every write since. And node 0's sweep never takes its own
+    // writes over here: they are decided, only their apply waits.
+    let config = NodeConfig {
+        truncate_interval: Duration::from_secs(600),
+        recovery_timeout: Duration::from_secs(600),
+        ..absence_config(Duration::from_secs(2))
+    };
+    let mut sim = Sim::build_with_config(4, config);
+    let all = [0, 1, 2, 3];
+
+    for version in 1..=3u16 {
+        sim.nodes[0]
+            .write(vec![event(HOT, version, version as u64)])
+            .await
+            .expect("baseline write");
+    }
+    assert!(converge(&sim.stores).await);
+    await_compacted(&sim, &all, "baseline").await;
+
+    sim.net.crash(NodeId(3));
+    for version in 4..=8u16 {
+        sim.nodes[0]
+            .write(vec![event(HOT, version, 100 + version as u64)])
+            .await
+            .expect("write with node 3 down");
+    }
+    await_compacted(&sim, &[0, 1, 2], "with node 3 down").await;
+
+    // Node 0 comes back holding versions 4 to 8 decided but un-applied: its
+    // report stays below them, below its bound for node 3, while its sync
+    // coverage, re-proven with nodes 1 and 2, is past them.
+    sim.stores[0]
+        .node
+        .apply_failing
+        .store(true, Ordering::SeqCst);
+    sim.restart_as(0, config, Restart::KeepStore).await;
+    tokio::time::sleep(config.anti_entropy_interval * 4).await;
+
+    sim.net.heal(NodeId(3));
+    await_rejoin_required(&sim.nodes[3]).await;
+    sim.rejoin(3, NodeId(0), config).await;
+    await_rejoin_required(&sim.nodes[3]).await;
+
+    // Node 0 applies them again, and its own report passes the bound.
+    sim.stores[0]
+        .node
+        .apply_failing
+        .store(false, Ordering::SeqCst);
+    for _ in 0..500 {
+        if !sim.nodes[0].sweep_pressure().busy {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!sim.nodes[0].sweep_pressure().busy, "node 0 applied again");
+    tokio::time::sleep(config.compaction_margin).await;
+
+    // Rejoined through node 0 again, as its host would (node 0 told it to),
+    // node 3 is counted in.
+    assert_eq!(sim.nodes[3].rejoin_contact(), Some(NodeId(0)));
+    sim.rejoin(3, NodeId(0), config).await;
+    for _ in 0..500 {
+        if (0..3).all(|i| sim.nodes[i].absent_peers().is_empty()) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        !sim.nodes[3].rejoin_required(),
+        "the second rejoin through node 0 counts node 3 in"
+    );
+    for i in all {
+        assert!(
+            sim.nodes[i].absent_peers().is_empty(),
+            "node {i} counts node 3 again: {:?}",
+            sim.nodes[i].absent_peers()
+        );
+    }
+    sim.nodes[3]
+        .write(vec![event(HOT, 9, 900)])
+        .await
+        .expect("a write coordinated by the rejoined node");
+    assert!(converge(&sim.stores).await);
+    assert_eq!(version_of(&sim.stores[3], HOT).await, 9);
+    await_compacted(&sim, &all, "after the rejoin").await;
 }
 
 // ---------------------------------------------------------------------------
