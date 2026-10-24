@@ -4673,6 +4673,47 @@ async fn a_healed_peer_repairs_a_backlog_over_the_frame_cap() {
     await_compacted(&sim, &[0, 1, 2], "after the repair").await;
 }
 
+/// A peer back from a partition catches up within a few anti-entropy
+/// rounds, however small the pages (#348): a round goes on pulling pages
+/// from its peer while each brings something in. At one page a round, a
+/// backlog of one write a page took a round a write — [`BACKLOG`] rounds of
+/// `anti_entropy_interval` here, 25 s.
+#[tokio::test(start_paused = true)]
+async fn a_healed_peer_catches_up_a_backlog_in_a_few_rounds() {
+    let config = NodeConfig {
+        snapshot_page_events: 1,
+        ..paged_config()
+    };
+    let sim = Sim::build_with_config(3, config);
+    sim.nodes[0]
+        .write(vec![event("baseline", 1, 1)])
+        .await
+        .expect("baseline write");
+    assert!(converge(&sim.stores).await);
+
+    write_backlog(&sim, 2).await;
+    sim.net.heal(NodeId(2));
+    // Every write of the backlog, in node 2's store.
+    let held = || async {
+        let mut held = 0;
+        for agg in 0..5 {
+            held += version_of(&sim.stores[2], &format!("acc-{agg}")).await as u64;
+        }
+        held
+    };
+    let deadline = tokio::time::Instant::now() + config.anti_entropy_interval * 20;
+    while held().await < BACKLOG && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        held().await,
+        BACKLOG,
+        "the healed node holds the whole backlog within 20 anti-entropy rounds"
+    );
+    assert!(converge(&sim.stores).await);
+    await_compacted(&sim, &[0, 1, 2], "after the catch-up").await;
+}
+
 /// A join from a contact holding a command backlog three times the frame
 /// cap: the header carries none of it, the commands follow page by page.
 /// Unbounded, the header would be shed and the join time out against every
