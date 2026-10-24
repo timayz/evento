@@ -1549,6 +1549,17 @@ impl Sim {
     }
 }
 
+/// What a step of [`assert_live`] failed with: its last attempt's failure,
+/// and the one before's, if any. The last attempt only had what was left of
+/// the bound; when each one is refused at once — a node told to rejoin on
+/// every rejoin (#349) — the one before says why.
+fn tried(last: String, attempt: u64, before: Option<String>) -> String {
+    match before {
+        Some(before) => format!("{last} (attempt {}; the one before: {before})", attempt + 1),
+        None => last,
+    }
+}
+
 /// Liveness once every fault is healed (#317): the cluster serves again. A
 /// node dark after a heal (#291), or one whose store stopped growing (#309),
 /// can pass every safety oracle; it fails here.
@@ -1594,6 +1605,7 @@ async fn assert_live(sim: &mut Sim, acked: &BTreeMap<String, u16>) -> Result<(),
     for i in 0..sim.ids.len() {
         let deadline = tokio::time::Instant::now() + serve;
         let mut attempt = 0;
+        let mut before = None;
         loop {
             let agg = format!("live-{i}-{attempt}");
             let seq = LIVE_SEQ + 1000 * i as u64 + attempt;
@@ -1606,11 +1618,12 @@ async fn assert_live(sim: &mut Sim, acked: &BTreeMap<String, u16>) -> Result<(),
                 }
                 Ok(Ok(_)) => "a fresh aggregate conflicted".to_string(),
                 Ok(Err(err)) => format!("{err:#}"),
-                Err(_) => format!("no outcome within {serve:?}"),
+                Err(_) => format!("no outcome within {left:?}"),
             };
             if tokio::time::Instant::now() >= deadline {
-                return Err(sim.stalled(i, "write", &what, start));
+                return Err(sim.stalled(i, "write", &tried(what, attempt, before), start));
             }
+            before = Some(what);
             // A refusal can come at once (told to rejoin meanwhile): let the
             // cluster move before the next attempt.
             tokio::time::sleep(config.recovery_interval).await;
@@ -1624,17 +1637,21 @@ async fn assert_live(sim: &mut Sim, acked: &BTreeMap<String, u16>) -> Result<(),
     for i in 0..sim.ids.len() {
         for (agg, version) in &keys {
             let deadline = tokio::time::Instant::now() + serve;
+            let (mut attempt, mut before) = (0, None);
             loop {
                 let barrier = sim.nodes[i].read_barrier(Key(agg.clone()));
                 let left = deadline.saturating_duration_since(tokio::time::Instant::now());
                 let failed = match tokio::time::timeout(left, barrier).await {
                     Ok(Ok(())) => break,
                     Ok(Err(err)) => format!("on {agg}: {err:#}"),
-                    Err(_) => format!("on {agg}: no answer within {serve:?}"),
+                    Err(_) => format!("on {agg}: no answer within {left:?}"),
                 };
                 if tokio::time::Instant::now() >= deadline {
+                    let failed = tried(failed, attempt, before);
                     return Err(sim.stalled(i, "read barrier", &failed, start));
                 }
+                before = Some(failed);
+                attempt += 1;
                 tokio::time::sleep(config.recovery_interval).await;
                 sim.rejoin_told(start).await?;
             }
