@@ -241,9 +241,11 @@ async fn a_joining_node_bootstraps_from_a_compacted_contact() {
 
     // Compact the contact (A) above every committed transaction: its in-memory
     // commands and journal records for the pre-join writes are now gone — only its
-    // data store retains the materialised state.
+    // data store retains the materialised state. At the wall clock, not beyond:
+    // a node mints above its floor, and peers refuse a `t0` past their clock's
+    // skew bound.
     let high = Timestamp {
-        micros: u64::MAX,
+        micros: evento_accord::clock::system_micros(),
         logical: 0,
         node: NodeId(0),
     };
@@ -321,8 +323,10 @@ async fn a_joining_node_bootstraps_page_by_page() {
     for n in &nodes {
         await_committed(&n.store, 4).await;
     }
+    // At the wall clock: above every committed transaction, and a floor the
+    // node's next id may sit on without its peers refusing it as future-dated.
     let high = Timestamp {
-        micros: u64::MAX,
+        micros: evento_accord::clock::system_micros(),
         logical: 0,
         node: NodeId(0),
     };

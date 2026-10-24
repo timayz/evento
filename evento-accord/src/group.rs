@@ -168,7 +168,10 @@ impl GroupHost {
     /// schedules its sweeps. Idempotent: an already-open group's node is returned
     /// as is, and concurrent opens of one group are serialized — the later
     /// ones wait and return the node the first opened. On a recovery error
-    /// nothing is left registered.
+    /// nothing is left registered — among them
+    /// [`LostJournal`](crate::LostJournal): the journal is empty but the store
+    /// holds events, so the journal that went with them was lost; discard the
+    /// store and open the group with [`open_joining`](Self::open_joining).
     pub async fn open(
         &self,
         group: GroupId,
@@ -190,9 +193,16 @@ impl GroupHost {
     /// only the journal tail and leave the prefix its peers already compacted
     /// missing for good.
     ///
-    /// Keep the journal: only the event store is discarded. A node that lost
-    /// its journal, or got an older one back, forgot votes and promises it
-    /// made — it must come back as a new member under a new node id (see
+    /// Keep the journal: only the event store is discarded. A node whose
+    /// journal was lost too opens joining over an empty one, under its own
+    /// node id (#312): it forgot the votes, promises and reports it made, so
+    /// it fences itself, and its join waits for a contact that vouches past
+    /// everything it may have forgotten — up to
+    /// [`NodeConfig::amnesia_join_timeout`], then
+    /// [`FenceNotCovered`](crate::FenceNotCovered) with nothing installed and
+    /// nothing left registered: open joining again. A new member's empty
+    /// journal is fenced the same way, at no cost but that wait. A journal
+    /// restored from a backup is not detected: delete it instead (see
     /// `OPERATIONS.md` §7).
     ///
     /// `contacts` are tried in order until one answers; a contact that is

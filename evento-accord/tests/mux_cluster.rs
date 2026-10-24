@@ -378,11 +378,16 @@ async fn await_committed(store: &InMemoryDataStore, expected_len: usize) {
     );
 }
 
-const COMPACT_ALL: Timestamp = Timestamp {
-    micros: u64::MAX,
-    logical: 0,
-    node: NodeId(0),
-};
+/// A floor above every transaction committed so far: the wall clock. Not
+/// beyond it — a node mints above its floor, and peers refuse a `t0` past
+/// their clock's skew bound.
+fn compact_all() -> Timestamp {
+    Timestamp {
+        micros: evento_accord::clock::system_micros(),
+        logical: 0,
+        node: NodeId(0),
+    }
+}
 
 impl MuxCluster {
     async fn open_joining(
@@ -421,7 +426,7 @@ async fn a_group_with_a_lost_store_rejoins_after_compaction() {
         await_committed(store, 3).await;
     }
     for node in &nodes {
-        node.compact(COMPACT_ALL).await;
+        node.compact(compact_all()).await;
         assert_eq!(node.command_count(), 0, "every command compacted away");
     }
 
@@ -483,7 +488,7 @@ async fn a_large_group_joins_page_by_page_over_tcp() {
         await_committed(store, 6).await;
     }
     for node in &nodes {
-        node.compact(COMPACT_ALL).await;
+        node.compact(compact_all()).await;
     }
 
     cluster.hosts[2].close(g.id).await.expect("open on host 2");
@@ -578,12 +583,15 @@ async fn a_join_that_breaks_after_a_page_stops_and_names_the_partial_install() {
         .open(
             g.id,
             cluster.topology(0),
-            breaking as Arc<dyn DataStore>,
+            Arc::clone(&breaking) as Arc<dyn DataStore>,
             Arc::clone(&g.journals[0]) as Arc<dyn Journal>,
             config,
         )
         .await
         .expect("open host 0");
+    // The open over an empty journal probed the store with a page read: the
+    // backend breaks after the first page a joiner pulls, not that one.
+    breaking.pages.store(0, std::sync::atomic::Ordering::SeqCst);
     let node1 = cluster.open_with(&g, 1, config).await;
     let node2 = cluster.open_with(&g, 2, config).await;
     for i in 0..3 {
@@ -593,7 +601,7 @@ async fn a_join_that_breaks_after_a_page_stops_and_names_the_partial_install() {
         await_committed(store, 3).await;
     }
     for node in [&node0, &node1, &node2] {
-        node.compact(COMPACT_ALL).await;
+        node.compact(compact_all()).await;
     }
 
     cluster.hosts[2].close(g.id).await.expect("open on host 2");
@@ -689,7 +697,7 @@ async fn a_join_moves_on_when_a_contact_does_not_answer() {
         await_committed(store, 1).await;
     }
     for node in &nodes {
-        node.compact(COMPACT_ALL).await;
+        node.compact(compact_all()).await;
     }
 
     cluster.hosts[1].close(g.id).await.expect("open on host 1");

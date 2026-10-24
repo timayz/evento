@@ -345,6 +345,7 @@ dependencies = [
  "evento-sql-migrator",
  "serde",
  "sqlx",
+ "sqlx_migrator",
  "tokio",
  "tracing",
  "tracing-subscriber",

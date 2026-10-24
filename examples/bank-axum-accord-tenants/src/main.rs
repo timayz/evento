@@ -1,12 +1,14 @@
 //! Multi-tenant bank on the **Accord consensus** executor with **one SQLite database
-//! per tenant** — and one Accord consensus group per tenant, all hosted in this
-//! process over a single multiplexed transport.
+//! per tenant** (its consensus journal in a file beside it) — and one Accord consensus
+//! group per tenant, all hosted in this process over a single multiplexed transport.
 //!
 //! Tenants are created at runtime by users of the application (`POST /tenants`), not
 //! by configuration: the catalog is itself an Accord group (`system.db`), so every
 //! host learns of a new tenant through replication and opens its database. Writes
 //! for `/t/{slug}/…` are coordinated in that tenant's group and land only in
 //! `tenants/{slug}.db`; cold tenants are evicted (LRU) and re-opened on demand.
+//! A tenant whose event file or journal file was lost comes back by rejoining from
+//! a peer, under this host's node id (see `storage.rs`).
 //!
 //! Single node (no peers to coordinate):
 //!
@@ -22,10 +24,13 @@
 //! make tenants.cluster       # = CLUSTER_SIZE=3 NODE_ID={0,1,2} cargo run -p bank-axum-accord-tenants
 //! ```
 //!
-//! `DATA_DIR` (default: a per-node directory under the system temp dir) holds
-//! `system.db` and `tenants/*.db`.
+//! `DATA_DIR` (default: a per-node directory under the system temp dir) holds two
+//! files per group, `system.db` + `system.journal.db` for the catalog and
+//! `tenants/{slug}.db` + `tenants/{slug}.journal.db` per tenant, and `host.db`, the
+//! ledger of the groups this host has opened.
 
 mod catalog;
+mod storage;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -124,7 +129,14 @@ async fn main() -> anyhow::Result<()> {
     );
     let scheduler = SweepScheduler::new(SweepConfig::default());
     scheduler.start();
-    let host = Arc::new(GroupHost::new(mux, scheduler));
+    let rejoin_hook = Arc::clone(&registry_slot);
+    let host = Arc::new(
+        GroupHost::new(mux, scheduler).with_rejoin_handler(move |group| {
+            if let Some(registry) = rejoin_hook.get() {
+                registry.rejoin(group);
+            }
+        }),
+    );
 
     // --- The catalog (system group) and the tenant registry. -------------------
     let registry = TenantRegistry::new(host, ids, data_dir, MAX_OPEN_TENANTS).await?;
@@ -132,7 +144,7 @@ async fn main() -> anyhow::Result<()> {
     let catalog = registry.start_catalog_subscription().await?;
 
     let state = AppState {
-        registry,
+        registry: Arc::clone(&registry),
         node_id: id,
     };
     let app = Router::new()
@@ -155,12 +167,22 @@ async fn main() -> anyhow::Result<()> {
     let web_addr = format!("127.0.0.1:{}", WEB_BASE_PORT + node_id as u16);
     let listener = tokio::net::TcpListener::bind(&web_addr).await?;
     println!("Listening on http://{web_addr}");
+    let stopping = Arc::clone(&registry);
     axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
+        .with_graceful_shutdown(async move {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                () = stopping.catalog_rejoin_required() => {}
+            }
         })
         .await?;
     catalog.stop();
+    registry.shutdown().await;
+    // The next start rebuilds the catalog from a peer (the host ledger says so).
+    anyhow::ensure!(
+        !registry.catalog_rejoin_pending(),
+        "the catalog was told to rejoin: start this host again to rebuild it from a peer"
+    );
     Ok(())
 }
 

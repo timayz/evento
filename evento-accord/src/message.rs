@@ -474,6 +474,16 @@ pub enum Message {
     /// only refreshes a live hold, never re-creates a lapsed one. A contact
     /// predating this variant sheds it, and its hold lapses as before.
     JoinKeepalive,
+    /// Replica → recovery coordinator, answering a `BeginRecovery` (routed
+    /// or not) while it joins over a lost journal (#312), for a transaction
+    /// below its amnesia fence: it holds nothing of it, may have voted for
+    /// it before the loss — any vote, promise or accept — and never votes
+    /// for it again, so it promises nothing. An unrouted recovery counts it
+    /// as a replica that may have voted but will not: with the reports of
+    /// replicas that never witnessed the transaction, it can prove one
+    /// never committed and never will (`Node::never_commits`). A recovery
+    /// predating this variant sheds the frame, as it would no answer.
+    Amnesiac { txn: TxnId, ballot: Ballot },
 }
 
 impl Message {
@@ -522,6 +532,7 @@ impl Message {
             | Message::BeginRecovery { txn, .. }
             | Message::BeginRecoveryOk { txn, .. }
             | Message::NotWitnessed { txn, .. }
+            | Message::Amnesiac { txn, .. }
             | Message::Invalidate { txn }
             | Message::ReadProbeOk { txn, .. } => Some(*txn),
             Message::Routed { inner, .. } => inner.txn(),
@@ -874,6 +885,7 @@ mod tests {
                 redundant: true,
             },
             Message::Invalidate { txn },
+            Message::Amnesiac { txn, ballot },
         ] {
             assert_eq!(message.txn(), Some(txn));
             let bytes = encode_tagged(RecordKind::GroupFrame, &message).unwrap();

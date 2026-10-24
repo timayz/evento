@@ -105,6 +105,10 @@ pub enum RecordKind {
     /// (`Journal::save_decision`), as a
     /// [`DecisionRecord`](crate::api::DecisionRecord).
     Decision = 11,
+    /// The fence of a replica that came back over an empty journal
+    /// (`Journal::save_amnesia_fence`), as an
+    /// [`AmnesiaFence`](crate::api::AmnesiaFence).
+    AmnesiaFence = 12,
 }
 
 impl RecordKind {
@@ -121,6 +125,7 @@ impl RecordKind {
             9 => Some(Self::Promise),
             10 => Some(Self::ClockBound),
             11 => Some(Self::Decision),
+            12 => Some(Self::AmnesiaFence),
             _ => None,
         }
     }
@@ -191,6 +196,7 @@ mod tests {
             RecordKind::Promise,
             RecordKind::ClockBound,
             RecordKind::Decision,
+            RecordKind::AmnesiaFence,
         ] {
             let value = (42u64, "hello".to_string());
             let bytes = encode_tagged(kind, &value).unwrap();

@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use evento_accord::{
-    AcceptorRecord, Ballot, CommandState, DecisionRecord, InMemoryJournal, Journal, Key, NodeId,
-    Timestamp, TxnId,
+    AcceptorRecord, AmnesiaFence, Ballot, CommandState, DecisionRecord, InMemoryJournal, Journal,
+    Key, NodeId, Timestamp, TxnId,
 };
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -161,6 +161,24 @@ impl FaultJournal {
         self.durable.load(txn).await.unwrap().is_some()
     }
 
+    /// Whether nothing at all is durable here — what a restart over this
+    /// journal finds after a crash: the node never made anything durable
+    /// (it never voted, reported or minted), or this is a lost journal's
+    /// replacement.
+    pub async fn durable_is_pristine(&self) -> bool {
+        let d = &self.durable;
+        d.load_all().await.unwrap().is_empty()
+            && d.load_watermark().await.unwrap().is_none()
+            && d.load_clock_bound().await.unwrap().is_none()
+            && d.load_amnesia_fence().await.unwrap().is_none()
+            && d.load_acceptors().await.unwrap().is_empty()
+            && d.load_metadata().await.unwrap().is_empty()
+            && d.load_routes().await.unwrap().is_empty()
+            && d.load_promises().await.unwrap().is_empty()
+            && d.load_decisions().await.unwrap().is_empty()
+            && d.load_rejoin_bounds().await.unwrap().is_empty()
+    }
+
     /// Whether a seeded fault fails this write, `pick` choosing its rate.
     fn draw(&self, pick: impl Fn(&JournalFaults) -> f64) -> bool {
         let mut faults = self.faults.lock().unwrap();
@@ -302,5 +320,14 @@ impl Journal for FaultJournal {
     }
     async fn load_clock_bound(&self) -> anyhow::Result<Option<u64>> {
         self.durable.load_clock_bound().await
+    }
+    async fn save_amnesia_fence(&self, fence: &AmnesiaFence) -> anyhow::Result<()> {
+        if self.draw(|f| f.metadata) {
+            anyhow::bail!("simulated amnesia-fence write failure");
+        }
+        self.durable.save_amnesia_fence(fence).await
+    }
+    async fn load_amnesia_fence(&self) -> anyhow::Result<Option<AmnesiaFence>> {
+        self.durable.load_amnesia_fence().await
     }
 }

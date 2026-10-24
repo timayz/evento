@@ -11,9 +11,9 @@ This is the *ops* companion to [`DESIGN.md`](./DESIGN.md) (which covers the prot
 Worked, copy-pasteable deployments live in the examples:
 - `examples/bank-axum-accord` — a node over TCP (single-node or a 3-node localhost
   cluster), with `/metrics` and `/health` endpoints.
-- `examples/bank-axum-accord-tenants` — **many consensus groups per process**: one
-  SQLite file and one Accord group per tenant, tenants created at runtime through a
-  replicated catalog, over one multiplexed transport (§10).
+- `examples/bank-axum-accord-tenants` — **many consensus groups per process**: two
+  SQLite files (events, journal) and one Accord group per tenant, tenants created at
+  runtime through a replicated catalog, over one multiplexed transport (§10).
 - `examples/jepsen-node` — a node over real TCP with a durable `FjallJournal`.
 
 ---
@@ -85,13 +85,14 @@ timeouts for geo/WAN** deployments.
 | `max_journal_batch` | 128 | Messages drained per group-commit fsync (latency vs. fsync amortization). |
 | `phi_threshold` | 8.0 | Phi-accrual suspicion level; higher tolerates more latency variance before suspecting a coordinator. |
 | `acceptable_pause` | 500 ms | How long a live peer may go quiet beyond its usual heartbeat interval (scheduler stall, slow fsync, loaded host) before suspicion starts to rise. |
-| `linearizable_reads` | false | Opt-in linearizable reads (§10) — one consensus round per read. |
+| `linearizable_reads` | false | Opt-in linearizable reads (§9) — one consensus round per read. |
 | `max_commands` | 100 000 | Backpressure: refuse *new* local writes (`BacklogAtCap`; `WriteError::Unavailable` through `AccordExecutor`) once the un-compacted backlog hits this (e.g. compaction stalled under a partition, or a peer down with `peer_absence_limit` unset). |
 | `peer_absence_limit` | none | Stop waiting for a same-shard peer silent this long: compaction then proceeds without it (§7, down node). Set it well above any restart or maintenance window; a peer given up on while writes went through must rejoin from a snapshot on return. Never leaves fewer than a slow quorum counted. |
 | `snapshot_page_events` | 4096 | Most events this node puts in one snapshot page when a joiner bootstraps from it (§7, lost store). |
 | `snapshot_page_bytes` | 4 MiB | Byte budget of one snapshot page, command page or anti-entropy reply (a single larger event or command still crosses alone). Keep it far below the transport's 64 MiB frame cap and small enough that one group's bootstrap does not hold the link it shares with every other group for long. |
 | `config_defer_step` | 100 ms | Control-plane anti-dueling delay for concurrent reconfigurations. |
 | `fence_invalidation` | true | Lets a recovery invalidate a transaction one replica compacted past while the others fenced it or hold it uncommitted. Sound only when every replica fences its votes: during a rolling upgrade from a build without the vote fence, set it `false` until the last node is upgraded. |
+| `amnesia_join_timeout` | 30 s | How long a node joining over a lost journal waits for its contact's watermark report to pass its amnesia fence before the join gives up with `FenceNotCovered` (§7, lost journal). Allow `compaction_margin` + three clock skews + a few anti-entropy rounds, and the idle interval of a `SweepScheduler`. |
 
 Clock-skew tolerance is on the clock: `HybridLogicalClock::with_max_skew(..)` (default
 `MAX_SKEW_MICROS`); keep `recovery_timeout`/`compaction_margin` above it. The node
@@ -102,7 +103,11 @@ or ballot across a restart, even if its wall clock stepped back. A restart withi
 `max_skew` of the last write waits out at most `max_skew`; after a backward step the
 node logs that its wall clock is behind its clock bound and its stamps lead the wall
 clock until it catches up. Writes fail rather than use an id the bound does not cover
-(the journal refused it).
+(the journal refused it). A node votes for no transaction whose `t0` lies more than two
+skews past its clock (`accord_votes_future_dated_total`): an honest coordinator's ids
+never do, and the bound is what lets a node that lost its journal fence everything it
+voted on (§7). A node whose clock runs further ahead than the bound gets no votes for its
+writes until the others' clocks catch up.
 
 ---
 
@@ -136,7 +141,7 @@ Serve it on an HTTP endpoint (see `bank-axum-accord`'s `/metrics`). Counters:
 | `recoveries` | should be ~0 in a healthy cluster; sustained > 0 = a coordinator is flapping/dead. |
 | `compactions` | should advance over time; **flat** = compaction stalled (a partitioned/behind peer holds the watermark) → backlog grows toward `max_commands`. |
 | `watermark_clamps` | > 0 while a node re-proves sync coverage (post partition-heal/restart — compaction waits for anti-entropy to repair it); **sustained** growth = coverage never accrues (anti-entropy rounds failing) and compaction stays stalled. |
-| `journal_flushes` | group-commit activity; **0 while writing** = the journal can't fsync (see §9). |
+| `journal_flushes` | group-commit activity; **0 while writing** = the journal can't fsync (see §8). |
 | `messages_handled` | liveness/traffic. |
 | `messages_shed` | inbound backpressure drops; sustained > 0 = a node is overloaded or a peer is flooding. |
 | `messages_unrouted` | (`MuxTransport` only) inbound frames for a group this host has not registered that were dropped — parked past the pending-buffer TTL or over its bounds. Steady > 0 = peers address groups this host never opens (a tenant evicted here and never re-opened, or a stale/unknown group id). |
@@ -144,6 +149,10 @@ Serve it on an HTTP endpoint (see `bank-axum-accord`'s `/metrics`). Counters:
 | `rejoins_required` | this node must rejoin: a peer told it to, having given it up while writes it never applied were compacted; or its own recovery found it holding a transaction its peers compacted past, which no recovery can decide any more. The node is stale until its host rejoins it (§7) — through `Node::rejoin_contact()`, the peer that compacted past what it holds. |
 | `votes_fenced` | votes refused for a transaction this node never witnessed, older than its compaction margin: a late coordinator message, or a recovery by a replica that alone holds the transaction (§3, `compaction_margin`). Spikes after a partition heals are expected; a steady rate means coordinators slower than the margin. |
 | `dependencies_learned` | decisions this node learned from its peers for a transaction it never witnessed, but a command committed here waited on (missed while it was cut off or restarting). Counts after a partition heals are expected; it keeps a stalled execution from waiting on anti-entropy for a transaction no replica can apply yet. |
+| `votes_future_dated` | votes refused for a transaction dated more than two clock skews past this node's clock: its coordinator's clock runs beyond the skew bound (§3). Any count = a clock out of bounds; fix its time source. |
+| `amnesia_fences` | times this node opened joining over an empty journal and fenced itself (§7, lost journal). |
+| `amnesia_joins_refused` | joins over a lost journal that found no contact vouching past the fence (`FenceNotCovered`, nothing installed). A few while the contact's report catches up; **steadily rising** = a transaction below the fence no replica can decide any more (§7). |
+| `config_votes_withheld` | config-Paxos promises and accepts this node withheld: it lost a journal under its node id, and abstains from config Paxos for good. |
 | `snapshot_pages` | snapshot pages this node served to joining peers; a joiner pulls one per `snapshot_page_events` / `snapshot_page_bytes` of the contact's store. |
 | `command_pages` | command pages this node served to joining peers: a joiner pulls the contact's un-compacted applied commands one page at a time, before its snapshot pages. |
 | `joins_partial` | joins of this node that failed after a page was installed: the store holds a prefix no contact can complete, and must be emptied before the next join (§7). Steady > 0 = a contact that cannot read its backend, or a link losing pages faster than the per-page retries cover. |
@@ -154,7 +163,7 @@ Serve it on an HTTP endpoint (see `bank-axum-accord`'s `/metrics`). Counters:
 - *Readiness* (is this node caught up enough to serve fresh reads?): derive from
   metrics — `recoveries` not climbing, `compactions` advancing, `messages_shed` ~0, and
   the local backend's applied version tracking the cluster. For strict freshness, use
-  `linearizable_reads` (§10) rather than a readiness gate.
+  `linearizable_reads` (§9) rather than a readiness gate.
 
 **Subscription lag.** A node's subscriptions process events below its *stability
 watermark*: the present less `compaction_margin`, below any un-applied transaction it
@@ -310,10 +319,11 @@ refuses anything else before a vote, and a node never installs it.
   buffered meanwhile, and applies again what it had applied that the contact had
   not. The journal keeps the node's votes, recovery promises, config-Paxos
   promises and clock bound, so the rejoined node never votes against them. When
-  the store and journal share a database (one SQLite file per tenant through
-  `evento-sql`, or Fjall through `FjallJournal::from_database`), empty only the
-  event store — with `evento-sql`, its `event`, `snapshot` and `subscriber`
-  tables; the `accord_*` tables are the journal. Contacts are tried in order; one
+  the store and journal share a database (one SQLite file through `evento-sql`, or
+  Fjall through `FjallJournal::from_database`), empty only the event store — with
+  `evento-sql`, its `event`, `snapshot` and `subscriber` tables; the `accord_*`
+  tables are the journal. Kept in files of their own (§10), the store goes with
+  its file and the journal stays. Contacts are tried in order; one
   that is itself joining does not answer. Join only over an empty store (`join`
   refuses otherwise): a page that overlaps existing events is skipped whole as an
   idempotent re-apply, which would leave a gap. For the same reason a join that
@@ -321,16 +331,69 @@ refuses anything else before a vote, and a node never installs it.
   that keeps losing pages) is not retried on the next contact: the error carries
   `PartialSnapshot` (`accord_joins_partial_total`), nothing is left registered, and
   the store (not the journal) must be emptied before opening again.
-- **Node back with a lost or rolled-back journal** (a dead disk that held it, a
-  deleted file holding both store and journal, a journal restored from a backup):
-  the node has forgotten votes, recovery promises and config-Paxos promises it
-  made, and ids it minted. Back under its old node id it could vote against them,
-  breaking the quorum intersection recovery and reconfiguration rely on. It must
-  come back as a **new member under a new node id**: remove the old id from the
-  topology (`change_topology`) and add the new one, which joins with an empty store
-  and journal (`open_joining`). Under a `GroupHost` the node id is the host's (its
-  `MuxTransport` id), shared by every group it hosts, so a new id means a new host
-  identity.
+- **Node back with a lost journal** (a dead disk that held it, a deleted or corrupt
+  journal file, with or without its store): the node forgot the votes, recovery
+  promises, config-Paxos promises and watermark reports it made, and the ids it
+  minted. Voting again on what it forgot, or on new writes without what it forgot
+  among their dependencies, it could split the stores. It comes back **under its own
+  node id, by joining** (#312): empty its event store and open it with
+  `GroupHost::open_joining(…, contacts)` (or `recover_state_for_join` + `join` on a
+  bare `Node`). Over an empty journal the node sets an **amnesia fence**: its wall
+  clock plus three clock skews, above everything it voted on, promised or reported
+  before, journaled before anything else (`Journal::save_amnesia_fence`; the fjall and
+  SQL journals keep it — a custom journal on the default no-op is refused, and such a
+  node must come back under a new node id), with its clock floored past every id it
+  can have minted (`accord_amnesia_fences_total`).
+  - **The join waits for a contact past the fence.** It asks for a contact's header
+    only once the contact's own watermark report passes the fence, and installs
+    nothing unless the vouch that comes with the header does too, under the same
+    epoch and from the same shard: every write that committed before the loss is
+    then in the state it copies, and none that did not can commit any more. That
+    takes about `compaction_margin` plus three skews and a few anti-entropy rounds; a
+    contact that cannot vouch within `amnesia_join_timeout` fails the join with
+    `FenceNotCovered`, nothing installed — open joining again, through it or another
+    (`accord_amnesia_joins_refused_total`).
+  - **Until then it takes no part**: it votes on nothing and serves no read. A
+    recovery of a transaction below its fence gets `Message::Amnesiac` — it holds
+    nothing of it, may have voted for it before, and never will — which lets the
+    recovery rule out a transaction only the lost replica could have helped decide
+    (a write that reached only a minority while the replica was away).
+  - **Once joined it is an ordinary replica**, and a restart opens it plainly. It never
+    votes for a transaction below its fence that it does not hold, and it **abstains
+    from config Paxos for good** under this node id (`accord_config_votes_withheld_total`):
+    config changes then need a majority of the other acceptors. A group whose
+    acceptors, one after another, lost a majority of their journals can no longer
+    change its membership.
+  - **A plain open refuses a lost journal**: `open` / `recover_state` over an empty
+    journal and a store that holds events fails with `LostJournal`, nothing left
+    registered (or `LostJournal { join_pending: true }` after a join over a lost
+    journal that never completed) — empty the store and open joining. A cluster of a
+    single node is exempt: no peer holds its votes, and it reopens over its store.
+  - **What the node cannot tell**: an empty journal over an empty store, opened
+    plainly, is a fresh replica (its first open leaves its clock bound in the journal,
+    so the journal is never empty again while the store holds anything). A host that
+    lost a group's journal *and* store must therefore know, from elsewhere, that it
+    hosted the group, and open it joining (the tenants example keeps a ledger of the
+    groups each host opened, §10) — or bring the node back under a new node id,
+    as before: remove the old id from the topology (`change_topology`) and add the new
+    one, which joins with an empty store and journal. Under a `GroupHost` the node id
+    is the host's (its `MuxTransport` id), shared by every group it hosts, so a new id
+    is a new host identity.
+  - **Stuck below the fence**: a transaction still undecided at the loss — accepted by
+    the lost replica and by fewer than a slow quorum of the others, while every other
+    replica is past its compaction margin for it and refuses it a vote (§3) — can no
+    longer be decided. The join then never finds a contact past its fence
+    (`accord_amnesia_joins_refused_total` keeps rising), and the transaction holds
+    compaction back. It takes a recovery slower than the margin (a partition that
+    outlived it) at the moment of the loss; bringing the node back under a new id
+    leaves the transaction just as undecided.
+  - **Assumes** the host's wall clock did not step back across the loss by more than
+    the skew bound (NTP), and that every clock stays within `max_skew` of the others
+    (a node votes for no transaction dated past its clock's bound, §3).
+- **Node back with a rolled-back journal** (restored from a backup or a VM snapshot, or
+  a disk that lost writes it had acknowledged): nothing detects it, and the node would
+  vote against what it forgot. **Delete it**, and bring the node back as above (lost
+  journal).
 
 ---
 
@@ -357,8 +420,9 @@ refuses anything else before a vote, and a node never installs it.
   compacted past the backup, in which case empty it and rejoin over the node's
   journal (§7, lost store). **Never restore the journal** (Fjall `accord_*`
   keyspaces, or the `accord_*` SQL tables) from a backup: an older journal forgets
-  the votes and promises the node made since, so a node whose journal was rolled
-  back comes back as a new member (§7, lost journal). The journal is bounded by
+  the votes and promises the node made since, and nothing detects it. Delete it
+  instead, and bring the node back over an empty journal by joining (§7, lost
+  journal). The journal is bounded by
   compaction; the event store grows with history.
 - **SQL backend:** run the schema via `evento-sql-migrator` with its `accord` feature
   (the `accord_commands/meta/metadata_log/acceptors` tables), alongside your event
@@ -368,7 +432,7 @@ refuses anything else before a vote, and a node never installs it.
   id it minted before, even after its wall clock stepped back. A journal written
   before the bound existed starts the clock past the node's own journaled
   transactions on its first restart. (A journal restored from a backup holds an
-  older bound, among everything else it forgets: §7, lost journal.)
+  older bound, among everything else it forgets: delete it, §7.)
 - **Upgrading past the apply-time re-stamp** (release note; the journal and wire
   formats are unchanged): a build before it stored each event with the stamp its
   writing host gave it, and later builds stamp it from the transaction's agreed
@@ -425,7 +489,8 @@ thousand-plus groups per process; none of them changes the protocol or the `Node
   `AccordExecutor`). An open of the same group waits for a close in progress. Never
   close a group from one of its own tasks. `open_joining(…, contacts)` opens a group
   whose store was lost, or that was told to rejoin, by bootstrapping it from a peer's
-  snapshot over its kept journal (§7).
+  snapshot over its kept journal — or, behind an amnesia fence, one whose journal was
+  lost (§7).
 
 ```rust
 let mux = Arc::new(MuxTransport::new(id, peer_addrs).with_unrouted_handler(reopen));
@@ -459,13 +524,48 @@ a contact that has it closed. The pages it is answered with are, so a page arriv
 late, after a failed join unregistered the group, does not reopen it.
 
 **SQLite footprint.** sqlx-sqlite runs one OS thread per *open* connection, so bound
-each tenant pool (`max_connections(2–3)`, `min_connections(0)`, an `idle_timeout`) and
-cap the number of tenants open per process (LRU; `host.close(group).await`, then
-`pool.close()`, on eviction — under the tenant's open lock, so a request for it waits
-and opens it afresh; a closed tenant catches up via anti-entropy when re-opened). The tenant
-file is also the consensus journal, so keep `synchronous(Full)` under WAL. Build
-**one** `Sql` per tenant and clone it into both `ExecutorDataStore` and
-`AccordExecutor` — two `.into()`s from one pool do not share the write-wake channel.
+each tenant pool (`max_connections(2–3)` for the events, 1–2 for the journal,
+`min_connections(0)`, an `idle_timeout`) and cap the number of tenants open per
+process (LRU; `host.close(group).await`, then close its pools, on eviction — under the
+tenant's open lock, so a request for it waits and opens it afresh; a closed tenant
+catches up via anti-entropy when re-opened). Keep `synchronous(Full)` under WAL on both
+files: a journaled vote must survive a power loss, and so must an event the journal
+records as applied. Build **one** `Sql` per tenant and clone it into both
+`ExecutorDataStore` and `AccordExecutor` — two `.into()`s from one pool do not share
+the write-wake channel.
+
+**Two files per tenant.** Keep a tenant's consensus journal in a file of its own
+beside its event file — the example's `tenants/{slug}.db` and
+`tenants/{slug}.journal.db` (`system.db` and `system.journal.db` for the catalog), the
+journal file migrated with `AccordMigration` alone. Losing one file then costs only
+that file:
+- a lost **event file** is rebuilt from a peer over the kept journal
+  (`open_joining`), as a group told to rejoin is;
+- a lost **journal file** — or one emptied in place, which a plain open refuses with
+  `LostJournal` — means deleting the event file and opening joining under the host's
+  own node id, behind the amnesia fence (§7).
+
+Over one shared file, every loss is a lost journal.
+
+**Remember which groups the host had.** With both files lost, nothing on disk says the
+host ever had the group, and a plain open would start it afresh, voting at once with
+every earlier vote forgotten. The example lists each group a host opens in a ledger,
+`host.db`, and opens a listed group with a missing file by joining:
+- A group is listed once its files exist and before its first open, while it has voted
+  nothing yet. Listed any earlier, a crash in between would leave a brand-new group
+  that every host waits to rejoin, with no host to vouch for it.
+- A rejoin is marked in the ledger before it deletes anything and cleared once the
+  join is done, so a crash midway resumes it rather than open plainly over the files
+  it left.
+- A lone node always opens plainly: no peer holds its votes.
+- A new ledger is seeded from the files on disk. A group lost together with `host.db`
+  is remembered by nothing: bring the host back under a new node id (§7).
+
+A data directory from before this layout, with each journal inside its event file, is
+moved on each group's first open. The journal is copied to a temporary file that is
+renamed into place, then cleared from the event file. A binary from before the split
+then refuses that file (`LostJournal`) instead of reading a stale journal. The
+example's `storage.rs` holds the routing, the ledger and the move.
 
 **Knobs and bounds.**
 

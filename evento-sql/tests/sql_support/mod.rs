@@ -4,8 +4,8 @@
 #![allow(dead_code)]
 
 use evento_accord::{
-    AcceptorRecord, Ballot, CommandState, DecisionRecord, Journal, Key, NodeId, Status, Timestamp,
-    TxnId,
+    AcceptorRecord, AmnesiaFence, Ballot, CommandState, DecisionRecord, Journal, Key, NodeId,
+    Status, Timestamp, TxnId,
 };
 use evento_core::Event;
 use evento_sql::SqlJournal;
@@ -358,4 +358,31 @@ where
     journal.save_clock_bound(900).await.unwrap();
     journal.truncate(timestamp(1_000, 0)).await.unwrap();
     assert_eq!(journal.load_clock_bound().await.unwrap(), Some(900));
+}
+
+/// The amnesia fence round-trips, keeps the last value written (a join marks
+/// it joined), and is not touched by truncation.
+pub async fn amnesia_fence<DB>(journal: &SqlJournal<DB>)
+where
+    DB: Database,
+    for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
+    sea_query_sqlx::SqlxValues: sqlx::IntoArguments<DB>,
+    Vec<u8>: for<'r> sqlx::Decode<'r, DB> + sqlx::Type<DB>,
+    i64: for<'r> sqlx::Decode<'r, DB> + sqlx::Type<DB>,
+    usize: sqlx::ColumnIndex<DB::Row>,
+{
+    assert_eq!(journal.load_amnesia_fence().await.unwrap(), None);
+    let pending = AmnesiaFence {
+        fence_micros: 500,
+        joined: false,
+    };
+    journal.save_amnesia_fence(&pending).await.unwrap();
+    assert_eq!(journal.load_amnesia_fence().await.unwrap(), Some(pending));
+    let joined = AmnesiaFence {
+        joined: true,
+        ..pending
+    };
+    journal.save_amnesia_fence(&joined).await.unwrap();
+    journal.truncate(timestamp(1_000, 0)).await.unwrap();
+    assert_eq!(journal.load_amnesia_fence().await.unwrap(), Some(joined));
 }

@@ -78,7 +78,8 @@ use common::store::{FaultStore, Outcomes};
 use evento_accord::{
     DataStore, DynamicTopology, ExecutorDataStore, HybridLogicalClock, InMemoryDataStore,
     InMemoryNetwork, Journal, Key, Message, MessageFaults, MessageSink, Node, NodeConfig, NodeId,
-    StaticTopology, Status, Timestamp, Topology, TraceEntry, TxnId, MAX_SKEW_MICROS,
+    PartialSnapshot, StaticTopology, Status, Timestamp, Topology, TraceEntry, TxnId,
+    MAX_SKEW_MICROS,
 };
 use evento_core::metadata::Metadata;
 use evento_core::Event;
@@ -601,6 +602,14 @@ impl Sim {
             t.abort();
         }
         self.journals[i].crash();
+        // Nothing durable survived: the node never voted, reported or minted
+        // (each makes its journal durable first), so it starts afresh — a
+        // store it kept would read as a lost journal's (#312).
+        let mode = if self.journals[i].durable_is_pristine().await {
+            Restart::EmptyStore
+        } else {
+            mode
+        };
         let store = match mode {
             Restart::EmptyStore => {
                 let store = SimStore::new(self.store_kind, &self.outcomes);
@@ -1856,6 +1865,152 @@ async fn safety_holds_under_restarts() {
     }
 }
 
+/// A replica that lost its journal comes back under its own node id (#312):
+/// while writers and readers run, a node loses its journal and its store — a
+/// dead disk — and is reopened joining, one node at a time. Fenced, it takes
+/// no part until a contact vouches past everything it may have voted on or
+/// reported before; it answers a recovery of a transaction below its fence
+/// that it holds nothing of. Safety, the read oracle and liveness after the
+/// heal must hold.
+///
+/// Under message faults the node is wiped only when nothing is in flight:
+/// writers pause, and every node holds every transaction it knows applied.
+/// A transaction whose recovery is slow (#326) can outlive the compaction
+/// margin, past which the replicas that never witnessed it refuse it a vote
+/// (#310), leaving a slow quorum that must all take part; wiping one of
+/// those leaves it undecided for good — OPERATIONS §7, which no contact can
+/// then vouch past. Writes resume while the node rejoins.
+async fn run_amnesia(seed: u64, faults: Faults) -> Adversarial {
+    const N: u64 = 5;
+    const AGGS: usize = 4;
+    const WRITERS: usize = 5;
+    const WRITES_EACH: usize = 12;
+    /// The longest a rejoin may take before the run counts it stalled.
+    const REJOIN_LIMIT: Duration = Duration::from_secs(120);
+    /// The longest a wipe waits for nothing to be in flight.
+    const QUIESCE_LIMIT: Duration = Duration::from_secs(60);
+
+    let mut sim = Sim::build(N);
+    faults.arm(&mut sim, seed);
+    let clients = Clients::new(&sim);
+    let quiesce = faults.messages.is_some();
+
+    let mut rng = StdRng::seed_from_u64(seed);
+    let writer_plans: Vec<Vec<(usize, usize)>> = (0..WRITERS)
+        .map(|_| {
+            (0..WRITES_EACH)
+                .map(|_| (rng.random_range(0..AGGS), rng.random_range(0..N as usize)))
+                .collect()
+        })
+        .collect();
+    // Which node loses its journal, after what delay. Never node 0: its
+    // store serves the writers' version guesses.
+    let amnesia_plan: Vec<(u64, usize)> = (0..3)
+        .map(|_| (rng.random_range(20..80), rng.random_range(1..N as usize)))
+        .collect();
+
+    // Writers hold this open while they write; a wipe waiting for quiet
+    // closes it.
+    let gate = Arc::new(tokio::sync::RwLock::new(()));
+    let store0 = sim.stores[0].clone();
+    let ids = Arc::new(AtomicU64::new(1));
+    let mut writers = Vec::new();
+    for plan in writer_plans {
+        let live = sim.live.clone();
+        let store0 = store0.clone();
+        let clients = clients.clone();
+        let ids = Arc::clone(&ids);
+        let gate = Arc::clone(&gate);
+        writers.push(tokio::spawn(async move {
+            for (agg_idx, coord) in plan {
+                let _open = gate.read().await;
+                let agg = format!("a{agg_idx}");
+                let version = store0.version(AGG_TYPE, &agg).await.unwrap_or(0) + 1;
+                let seq = ids.fetch_add(1, Ordering::Relaxed);
+                let node = live.node(coord);
+                clients
+                    .write(&node, &agg, version, seq, Duration::from_secs(2))
+                    .await;
+            }
+        }));
+    }
+    writers.extend(spawn_readers(&sim, &clients, seed, AGGS));
+
+    let mut stalled = None;
+    for (delay, node) in amnesia_plan {
+        tokio::time::sleep(Duration::from_millis(delay)).await;
+        let paused = if quiesce {
+            let paused = gate.write().await;
+            let deadline = tokio::time::Instant::now() + QUIESCE_LIMIT;
+            while sim.nodes.iter().any(|n| n.sweep_pressure().busy)
+                && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(sim.config.recovery_interval).await;
+            }
+            if sim.nodes.iter().any(|n| n.sweep_pressure().busy) {
+                continue;
+            }
+            Some(paused)
+        } else {
+            None
+        };
+        if let Err(err) = sim.lose_journal(node).await {
+            stalled = Some(err);
+            break;
+        }
+        drop(paused);
+        if let Err(err) = sim.join_amnesiac(node, REJOIN_LIMIT).await {
+            stalled = Some(err);
+            break;
+        }
+    }
+    for w in writers {
+        let _ = w.await;
+    }
+
+    sim.net.clear_message_faults();
+    sim.clear_storage_faults();
+    let converged = converge(&sim.stores).await;
+
+    let records = clients.history.lock().unwrap().clone();
+    let safety = safety_violation(&sim, &records);
+    let liveness = match stalled {
+        Some(stall) => Some(stall),
+        None => assert_live(&mut sim, &acked_versions(&records)).await.err(),
+    };
+    let converged_store = liveness.is_none().then(|| &sim.stores[0]);
+    let safety = safety.or_else(|| read_violation(&clients, converged_store));
+    let reads = clients.ops.lock().unwrap().reads.len();
+    Adversarial {
+        safety,
+        converged,
+        liveness,
+        reads,
+        trace: sim.trace(),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn safety_and_liveness_hold_under_amnesia() {
+    for (seed, _replay) in sim_seeds("safety_and_liveness_hold_under_amnesia", 0..20) {
+        run_amnesia(seed, Faults::default())
+            .await
+            .assert_ok(&format!("amnesia at seed {seed}"));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn safety_and_liveness_hold_under_amnesia_and_message_faults() {
+    for (seed, _replay) in sim_seeds(
+        "safety_and_liveness_hold_under_amnesia_and_message_faults",
+        0..20,
+    ) {
+        run_amnesia(seed, Faults::ALL)
+            .await
+            .assert_ok(&format!("amnesia +faults at seed {seed}"));
+    }
+}
+
 /// The adversarial, partition and restart scenarios once more, over links that
 /// lose, duplicate and reorder messages, with one-way cuts in the partition
 /// plan (#315): the paths whole-node faults barely reach — a late or doubled
@@ -2160,6 +2315,10 @@ async fn every_scenario_kind_replays_its_trace() {
             .await;
             assert_replays(&format!("restarts{label}"), seed, |s| async move {
                 run_with_restarts(s, faults, StoreKind::Memory).await.trace
+            })
+            .await;
+            assert_replays(&format!("amnesia{label}"), seed, |s| async move {
+                run_amnesia(s, faults).await.trace
             })
             .await;
         }
@@ -3529,6 +3688,97 @@ impl Sim {
         self.arm_store(i, &store);
         self.rejoin_over(i, contact, config, store.data_store(), store)
             .await;
+    }
+
+    /// What a host does when node `i` lost its journal along with its store
+    /// — a dead disk (#312): retires the node, as `GroupHost::close` does (a
+    /// writer still holding it mints nothing more under its id), gives it an
+    /// empty store and journal, and opens it **joining** under its old id (as
+    /// `GroupHost::open_joining` does). The node fences itself: until a
+    /// contact vouches past the fence ([`join_amnesiac`](Self::join_amnesiac))
+    /// it votes on nothing and refuses reads, though it serves writers and
+    /// readers ([`Live`]) at once.
+    async fn lose_journal(&mut self, i: usize) -> Result<(), String> {
+        assert!(
+            self.dynamic.is_empty(),
+            "a restart over a dynamic topology is not modelled"
+        );
+        self.nodes[i].retire().await;
+        self.journals[i] = Arc::new(FaultJournal::new());
+        self.arm_journal(i);
+        self.reopen_joining(i).await
+    }
+
+    /// Joins node `i`, reopened joining after it lost its journal, as its
+    /// host would: through each other node in turn, again and again, until
+    /// one vouches past its fence or `limit` passes. A join that broke after
+    /// installing a page is retried over an emptied store.
+    async fn join_amnesiac(&mut self, i: usize, limit: Duration) -> Result<(), String> {
+        let deadline = tokio::time::Instant::now() + limit;
+        let n = self.ids.len();
+        let mut tried = 0;
+        loop {
+            let node = self.nodes[i].clone();
+            let contact = self.ids[(i + 1 + tried % (n - 1)) % n];
+            tried += 1;
+            match node.join(contact).await {
+                Ok(_) => {
+                    self.tasks[i].push(node.start_recovery());
+                    return Ok(());
+                }
+                Err(err) if tokio::time::Instant::now() >= deadline => {
+                    return Err(format!(
+                        "node {i} found no contact to vouch past its fence: {err:#}"
+                    ));
+                }
+                // The store holds a prefix no contact can complete: emptied,
+                // the node joins again over its fenced journal.
+                Err(err) if err.downcast_ref::<PartialSnapshot>().is_some() => {
+                    self.reopen_joining(i).await?;
+                }
+                Err(_) => tokio::time::sleep(self.config.recovery_interval).await,
+            }
+        }
+    }
+
+    /// Tears node `i` down and reopens it joining over its journal and an
+    /// empty store, as `GroupHost::open_joining` does — its inbox running,
+    /// its join and sweeps to come.
+    async fn reopen_joining(&mut self, i: usize) -> Result<(), String> {
+        for t in &self.tasks[i] {
+            t.abort();
+        }
+        let id = self.ids[i];
+        let inbox = self.net.register(id);
+        let store = SimStore::new(self.store_kind, &self.outcomes);
+        self.arm_store(i, &store);
+        // A recovery its storage fails fails the open, and its host opens
+        // the node again: the faults are seeded rates, so one soon passes.
+        let mut attempts = 0;
+        let node = loop {
+            let node = Node::new(
+                id,
+                Arc::new(Self::topology(id, &self.ids, &self.electorate)),
+                Arc::new(HybridLogicalClock::with_physical(
+                    id,
+                    virtual_micros(self.base),
+                )),
+                Arc::new(self.net.sink(id)),
+                store.data_store(),
+                Arc::clone(&self.journals[i]) as Arc<dyn Journal>,
+            )
+            .with_config(self.config);
+            match node.recover_state_for_join().await {
+                Ok(()) => break node,
+                Err(_) if attempts < 100 => attempts += 1,
+                Err(err) => return Err(format!("node {i} could not reopen joining: {err:#}")),
+            }
+        };
+        self.tasks[i] = vec![node.start(inbox)];
+        self.nodes[i] = node.clone();
+        self.stores[i] = store.clone();
+        self.live.set(i, node, store);
+        Ok(())
     }
 
     /// [`rejoin`](Self::rejoin) over `backend`, a store wrapping `store`.

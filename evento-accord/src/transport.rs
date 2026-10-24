@@ -83,6 +83,10 @@ pub struct InMemoryNetwork {
     /// Messages a receiver cannot read (see
     /// [`set_unreadable`](InMemoryNetwork::set_unreadable)); `None` by default.
     unreadable: Mutex<Option<MessageFilter>>,
+    /// Messages lost on their link (see
+    /// [`set_link_filter`](InMemoryNetwork::set_link_filter)); `None` by
+    /// default.
+    link_filter: Mutex<Option<LinkFilter>>,
     /// The execution trace (see [`enable_trace`](InMemoryNetwork::enable_trace));
     /// `None` by default, so nothing is encoded.
     trace: Mutex<Option<Trace>>,
@@ -146,6 +150,10 @@ struct Draw {
 
 /// A predicate over messages, for [`InMemoryNetwork::set_unreadable`].
 pub type MessageFilter = Arc<dyn Fn(&Message) -> bool + Send + Sync>;
+
+/// A predicate over a message and its link `(from, to)`, for
+/// [`InMemoryNetwork::set_link_filter`].
+pub type LinkFilter = Arc<dyn Fn(NodeId, NodeId, &Message) -> bool + Send + Sync>;
 
 /// What became of one message the network was handed, as its
 /// [trace](InMemoryNetwork::enable_trace) records it.
@@ -364,6 +372,22 @@ impl InMemoryNetwork {
         *self.unreadable.lock().expect("network poisoned") = filter;
     }
 
+    /// Loses every message `filter` matches on its link `(from, to)` from now
+    /// on (`None` delivers everything again) — one kind of message lost on
+    /// some links only, which a whole-link [partition](Self::partition)
+    /// cannot express. Draws nothing from the fault generator, so a seeded
+    /// run stays reproducible.
+    pub fn set_link_filter(&self, filter: Option<LinkFilter>) {
+        *self.link_filter.lock().expect("network poisoned") = filter;
+    }
+
+    /// Whether the [link filter](Self::set_link_filter) loses `message` on
+    /// `from → to`.
+    fn link_drops(&self, from: NodeId, to: NodeId, message: &Message) -> bool {
+        let filter = self.link_filter.lock().expect("network poisoned").clone();
+        filter.is_some_and(|filter| filter(from, to, message))
+    }
+
     /// Starts tracing this network's execution: from now on every message it
     /// is handed — its virtual send time, its ends, its wire encoding, and
     /// what became of it ([`MessageFate`]) — is folded into one stable hash,
@@ -533,6 +557,7 @@ impl MessageSink for InMemorySink {
         if self.net.is_crashed(self.from)
             || self.net.is_crashed(to)
             || self.net.is_partitioned(self.from, to)
+            || self.net.link_drops(self.from, to, &message)
         {
             self.net
                 .note(self.from, to, MessageFate::Dropped, stamp.as_ref());

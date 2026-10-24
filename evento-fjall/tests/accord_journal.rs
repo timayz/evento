@@ -5,8 +5,8 @@
 #![cfg(feature = "accord")]
 
 use evento_accord::{
-    AcceptorRecord, Ballot, CommandState, DecisionRecord, Journal, Key, NodeId, Status, Timestamp,
-    TxnId,
+    AcceptorRecord, AmnesiaFence, Ballot, CommandState, DecisionRecord, Journal, Key, NodeId,
+    Status, Timestamp, TxnId,
 };
 use evento_core::Event;
 use evento_fjall::FjallJournal;
@@ -309,4 +309,31 @@ async fn clock_bound_survives_close_reopen_and_truncate() {
     assert_eq!(journal.load_clock_bound().await.unwrap(), Some(900));
     journal.truncate(timestamp(1_000, 0)).await.unwrap();
     assert_eq!(journal.load_clock_bound().await.unwrap(), Some(900));
+}
+
+#[tokio::test]
+async fn amnesia_fence_survives_close_reopen_and_truncate() {
+    let temp = tempfile::Builder::new()
+        .prefix("evento_accord_journal_amnesia")
+        .tempdir()
+        .unwrap();
+    let pending = AmnesiaFence {
+        fence_micros: 500,
+        joined: false,
+    };
+    let joined = AmnesiaFence {
+        joined: true,
+        ..pending
+    };
+    {
+        let journal = FjallJournal::open(temp.path()).unwrap();
+        assert_eq!(journal.load_amnesia_fence().await.unwrap(), None);
+        journal.save_amnesia_fence(&pending).await.unwrap();
+        assert_eq!(journal.load_amnesia_fence().await.unwrap(), Some(pending));
+        journal.save_amnesia_fence(&joined).await.unwrap();
+    }
+    let journal = FjallJournal::open(temp.path()).unwrap();
+    assert_eq!(journal.load_amnesia_fence().await.unwrap(), Some(joined));
+    journal.truncate(timestamp(1_000, 0)).await.unwrap();
+    assert_eq!(journal.load_amnesia_fence().await.unwrap(), Some(joined));
 }
