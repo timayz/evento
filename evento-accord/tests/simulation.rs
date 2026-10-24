@@ -4556,11 +4556,10 @@ async fn rejoin_bounds_survive_a_restart() {
 async fn a_rejoin_through_a_contact_that_vouched_too_low_is_counted_next_time() {
     const HOT: &str = "hot";
     // The journal truncates once, after the baseline: node 0's restart
-    // replays every write since. And node 0's sweep never takes its own
-    // writes over here: they are decided, only their apply waits.
+    // replays every write since. Its sweep never takes them over: they are
+    // decided, only their apply waits (#351).
     let config = NodeConfig {
         truncate_interval: Duration::from_secs(600),
-        recovery_timeout: Duration::from_secs(600),
         ..absence_config(Duration::from_secs(2))
     };
     let mut sim = Sim::build_with_config(4, config);
