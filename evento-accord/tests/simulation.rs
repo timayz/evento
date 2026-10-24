@@ -4643,6 +4643,133 @@ async fn a_rejoin_through_a_contact_that_vouched_too_low_is_counted_next_time() 
     await_compacted(&sim, &all, "after the rejoin").await;
 }
 
+/// The aggregate the #351 tests write.
+const REPLAYED: &str = "replayed";
+
+/// Restarts node 0 of three over a journal that kept every write since its
+/// last truncate and a store that fails their replay (#351): it holds them
+/// decided but un-applied, and its peers compacted past them. Returns those
+/// writes, oldest first.
+async fn restart_over_a_failing_store(sim: &mut Sim, config: NodeConfig) -> Vec<TxnId> {
+    let all = [0, 1, 2];
+    // The journal truncates once, after the baseline (`truncate_interval`):
+    // the restart replays every write since.
+    for version in 1..=3u16 {
+        sim.nodes[0]
+            .write(vec![event(REPLAYED, version, version as u64)])
+            .await
+            .expect("baseline write");
+    }
+    assert!(converge(&sim.stores).await);
+    await_compacted(sim, &all, "baseline").await;
+    let mut writes = Vec::new();
+    for version in 4..=8u16 {
+        let outcome = sim.nodes[0]
+            .write(vec![event(REPLAYED, version, 100 + version as u64)])
+            .await
+            .expect("write before the restart");
+        writes.push(outcome.txn);
+    }
+    assert!(converge(&sim.stores).await);
+    await_compacted(sim, &all, "before the restart").await;
+
+    sim.stores[0]
+        .node
+        .apply_failing
+        .store(true, Ordering::SeqCst);
+    sim.restart_as(0, config, Restart::KeepStore).await;
+    for &txn in &writes {
+        assert_eq!(
+            sim.nodes[0].command_status(txn),
+            Some(Status::Committed),
+            "{txn:?} handed back decided but un-applied"
+        );
+    }
+    writes
+}
+
+/// Lets node 0's store take its applies again, and waits for it to apply
+/// what it held: one more write then reaches every replica, and every
+/// replica compacts it.
+async fn store_works_again(sim: &Sim) {
+    sim.stores[0]
+        .node
+        .apply_failing
+        .store(false, Ordering::SeqCst);
+    for _ in 0..500 {
+        if !sim.nodes[0].sweep_pressure().busy {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!sim.nodes[0].sweep_pressure().busy, "node 0 applied them");
+    sim.nodes[0]
+        .write(vec![event(REPLAYED, 9, 900)])
+        .await
+        .expect("a write once the store works again");
+    assert!(converge(&sim.stores).await);
+    assert_eq!(version_of(&sim.stores[0], REPLAYED).await, 9);
+    await_compacted(sim, &[0, 1, 2], "once the store works again").await;
+}
+
+/// A replica's sweep never takes over a write it holds decided (#351). Its
+/// peers compacted past the replayed writes, so a recovery would find too
+/// few replicas left that could vote and send the node to rejoin, when all
+/// the node lacks is their apply. The redrive retries it every sweep, and
+/// the store takes it once it works again.
+#[tokio::test(start_paused = true)]
+async fn a_replayed_write_held_decided_waits_for_its_store() {
+    let config = NodeConfig {
+        truncate_interval: Duration::from_secs(600),
+        ..NodeConfig::default()
+    };
+    let mut sim = Sim::build_with_config(3, config);
+    restart_over_a_failing_store(&mut sim, config).await;
+
+    // Every write is past `recovery_timeout`, many sweeps over.
+    tokio::time::sleep(config.recovery_timeout * 10).await;
+    assert!(
+        sim.nodes[0].sweep_pressure().busy,
+        "the store still fails them"
+    );
+    let metrics = sim.nodes[0].metrics();
+    assert!(metrics.execution_failures > 1, "the redrive retries them");
+    assert_eq!(metrics.recoveries, 0, "the sweep took a decided write over");
+    assert!(
+        !sim.nodes[0].rejoin_required(),
+        "node 0 holds every decision it lacks an apply of: nothing to rejoin for"
+    );
+    assert_eq!(metrics.rejoins_required, 0);
+    store_works_again(&sim).await;
+}
+
+/// A recovery of a write the node holds decided, not the sweep's (#351),
+/// finds its peers compacted past the write, and too few replicas left that
+/// could vote. It fails, but it must not send the node to rejoin: holding
+/// the decision, the node is not stale, and lacks only the apply.
+#[tokio::test(start_paused = true)]
+async fn a_recovery_of_a_write_held_decided_never_sends_its_node_to_rejoin() {
+    // The sweep never takes the writes over within the test either way.
+    let config = NodeConfig {
+        truncate_interval: Duration::from_secs(600),
+        recovery_timeout: Duration::from_secs(600),
+        ..NodeConfig::default()
+    };
+    let mut sim = Sim::build_with_config(3, config);
+    let writes = restart_over_a_failing_store(&mut sim, config).await;
+
+    let err = sim.nodes[0]
+        .recover(writes[0])
+        .await
+        .expect_err("too few replicas left that could vote for it");
+    assert!(
+        !sim.nodes[0].rejoin_required(),
+        "a recovery of a decided write sent node 0 to rejoin: {err:#}"
+    );
+    assert_eq!(sim.nodes[0].metrics().rejoins_required, 0);
+    store_works_again(&sim).await;
+}
+
 // ---------------------------------------------------------------------------
 // The transport's frame cap: a backlog too big for one frame still crosses,
 // a page at a time — through anti-entropy and through a join.
