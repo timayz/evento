@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use evento_core::{
     cursor::{Args, Edge, ReadResult, Value},
-    Event, EventFilter, RoutingKey,
+    Event, EventFilter, RoutingKey, TenantFilter,
 };
 use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
@@ -3229,6 +3229,7 @@ impl Node {
                 id,
                 aggregators,
                 routing_key,
+                tenant,
                 args,
                 to_micros,
             } => {
@@ -3246,7 +3247,13 @@ impl Node {
                 }
                 let reply = match self
                     .datastore
-                    .read(aggregators.map(Arc::from), routing_key, args, to_micros)
+                    .read(
+                        aggregators.map(Arc::from),
+                        routing_key,
+                        tenant,
+                        args,
+                        to_micros,
+                    )
                     .await
                 {
                     Ok(result) => {
@@ -3468,7 +3475,7 @@ impl Node {
         for event in owned_events {
             let current = self
                 .datastore
-                .version(&event.aggregate_type, &event.aggregate_id)
+                .version(&event.tenant, &event.aggregate_type, &event.aggregate_id)
                 .await?;
             if event.version <= current {
                 // Its own events already in place, the transaction was
@@ -6517,6 +6524,7 @@ impl Node {
         to: NodeId,
         aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<RoutingKey>,
+        tenant: TenantFilter,
         args: Args,
         to_micros: Option<u64>,
     ) -> anyhow::Result<ReadResult<Event>> {
@@ -6532,6 +6540,7 @@ impl Node {
                 id,
                 aggregators: aggregators.map(|a| a.to_vec()),
                 routing_key,
+                tenant,
                 args,
                 to_micros,
             },
@@ -6635,7 +6644,7 @@ impl Node {
             // Every event's key is in `keys` (they are derived from the events,
             // or reassembled alongside them in recovery); compute defensively
             // for one that is not.
-            let shard = match shard_of.get(Key::str_of(event)) {
+            let shard = match shard_of.get(Key::str_of(event).as_ref()) {
                 Some(shard) => *shard,
                 None => self.topology.shard_of(&Key::of(event)),
             };
@@ -6693,11 +6702,11 @@ impl Node {
             .into_iter()
             .filter(|e| {
                 let key = Key::str_of(e);
-                match owned.get(key) {
+                match owned.get(key.as_ref()) {
                     Some(&v) => v,
                     None => {
                         let v = self.topology.owns(self.id, &Key(key.to_string()));
-                        owned.insert(key.to_string(), v);
+                        owned.insert(key.into_owned(), v);
                         v
                     }
                 }
@@ -6714,12 +6723,13 @@ impl Node {
 
     /// The distinct keys a set of events touches.
     fn keys_of(events: &[Event]) -> Vec<Key> {
-        let mut seen: HashSet<&str> = HashSet::new();
+        let mut seen: HashSet<std::borrow::Cow<'_, str>> = HashSet::new();
         let mut keys: Vec<Key> = Vec::new();
         for event in events {
             let key = Key::str_of(event);
-            if seen.insert(key) {
+            if !seen.contains(&key) {
                 keys.push(Key(key.to_string()));
+                seen.insert(key);
             }
         }
         keys

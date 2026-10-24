@@ -9,7 +9,7 @@ use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 use evento_core::{
     cursor::{Args, ReadResult, Value},
-    Event, EventFilter, RoutingKey,
+    Event, EventFilter, RoutingKey, TenantFilter,
 };
 use serde::{Deserialize, Serialize};
 
@@ -413,10 +413,16 @@ pub trait Journal: Send + Sync + 'static {
 /// subscriptions, and snapshots are served.
 #[async_trait]
 pub trait DataStore: Send + Sync + 'static {
-    /// Current version of an aggregate. Returns 0 for an aggregate with no
-    /// events. Used during the Read phase to evaluate the optimistic-version
-    /// condition before any shard appends.
-    async fn version(&self, aggregate_type: &str, aggregate_id: &str) -> anyhow::Result<u16>;
+    /// Current version of the stream `(tenant, aggregate_type,
+    /// aggregate_id)`. Returns 0 for a stream with no events. Used during the
+    /// Read phase to evaluate the optimistic-version condition before any
+    /// shard appends.
+    async fn version(
+        &self,
+        tenant: &str,
+        aggregate_type: &str,
+        aggregate_id: &str,
+    ) -> anyhow::Result<u16>;
 
     /// Records a decided transaction at its execution timestamp. When
     /// `commit` is true the `events` are appended (advancing versions);
@@ -440,8 +446,8 @@ pub trait DataStore: Send + Sync + 'static {
 
     /// Whether this store already holds every event of `events`: each
     /// aggregate's event at that version is that very event: the same id,
-    /// aggregate, version, name, routing key, data and metadata (only its
-    /// stamps may differ). It tells a transaction this replica applied before —
+    /// tenant, aggregate, version, name, routing key, data and metadata (only
+    /// its stamps may differ). It tells a transaction this replica applied before —
     /// and forgot: its
     /// journal record lost across a restart, or applied by an anti-entropy
     /// import, which is not journaled — from a conflict. Its own events in
@@ -460,6 +466,7 @@ pub trait DataStore: Send + Sync + 'static {
         &self,
         _aggregators: Option<Arc<[EventFilter]>>,
         _routing_key: Option<RoutingKey>,
+        _tenant: TenantFilter,
         _args: Args,
         _to_micros: Option<u64>,
     ) -> anyhow::Result<ReadResult<Event>> {
@@ -543,6 +550,7 @@ pub fn snapshot_event_size(event: &Event) -> usize {
         + event.aggregate_type.len()
         + event.name.len()
         + event.routing_key.as_ref().map_or(0, String::len)
+        + event.tenant.len()
         + event.data.len()
         + bitcode::encode(&event.metadata).len()
 }
@@ -615,12 +623,13 @@ pub(crate) fn stable_hash_extend(mut hash: u64, bytes: &[u8]) -> u64 {
     hash
 }
 
-/// Whether `stored` is `event` as a store keeps it: the same id, aggregate,
-/// version, name, routing key, data and metadata. Only the stamps may
-/// differ: a replica stamps a transaction's events from its agreed
+/// Whether `stored` is `event` as a store keeps it: the same id, tenant,
+/// aggregate, version, name, routing key, data and metadata. Only the stamps
+/// may differ: a replica stamps a transaction's events from its agreed
 /// `execute_at` as it applies them (see [`stamp_events`]).
 pub(crate) fn same_event(stored: &Event, event: &Event) -> bool {
     stored.id == event.id
+        && stored.tenant == event.tenant
         && stored.aggregate_type == event.aggregate_type
         && stored.aggregate_id == event.aggregate_id
         && stored.version == event.version

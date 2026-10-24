@@ -208,7 +208,7 @@ fn holds(store: &InMemoryDataStore, aggregate_id: &str, version: u16) -> bool {
     store
         .committed_events()
         .iter()
-        .any(|((_, id, v), _)| id == aggregate_id && *v == version)
+        .any(|((_, _, id, v), _)| id == aggregate_id && *v == version)
 }
 
 async fn await_event(store: &InMemoryDataStore, aggregate_id: &str, version: u16) {

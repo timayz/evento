@@ -53,8 +53,15 @@ impl GatedStore {
 
 #[async_trait]
 impl DataStore for GatedStore {
-    async fn version(&self, aggregate_type: &str, aggregate_id: &str) -> anyhow::Result<u16> {
-        self.inner.version(aggregate_type, aggregate_id).await
+    async fn version(
+        &self,
+        tenant: &str,
+        aggregate_type: &str,
+        aggregate_id: &str,
+    ) -> anyhow::Result<u16> {
+        self.inner
+            .version(tenant, aggregate_type, aggregate_id)
+            .await
     }
 
     async fn apply(
@@ -183,7 +190,11 @@ async fn read_barrier_waits_until_imported_events_are_in_the_store() {
         .expect("read barrier succeeds");
     assert_eq!(gated.inner.applied_log().len(), 1);
     assert_eq!(
-        gated.inner.version("test/Account", "acct").await.unwrap(),
+        gated
+            .inner
+            .version("", "test/Account", "acct")
+            .await
+            .unwrap(),
         1
     );
 

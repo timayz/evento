@@ -422,7 +422,7 @@ impl InMemoryNetwork {
             .is_some();
         // An encoding error still leaves a digest: the trace records that
         // the message was handed over, whatever it held.
-        let digest = encode_tagged(RecordKind::WireFrame, message)
+        let digest = encode_tagged(RecordKind::WireFrameV2, message)
             .map_or(0, |bytes| stable_hash_extend(STABLE_HASH_SEED, &bytes));
         let kind = record.then(|| {
             let debug = format!("{message:?}");
@@ -482,7 +482,7 @@ impl InMemoryNetwork {
         let Some(cap) = *self.frame_cap.lock().expect("network poisoned") else {
             return true;
         };
-        encode_tagged(RecordKind::WireFrame, message).is_ok_and(|bytes| bytes.len() <= cap)
+        encode_tagged(RecordKind::WireFrameV2, message).is_ok_and(|bytes| bytes.len() <= cap)
     }
 
     /// The configured delivery latency on `from → to` (zero if unset).
