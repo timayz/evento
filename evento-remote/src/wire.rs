@@ -8,7 +8,7 @@
 //! accord port fails immediately.
 
 use evento_core::cursor::{Args, PageInfo, Value};
-use evento_core::{Event, EventFilter, RoutingKey, WriteError};
+use evento_core::{Event, EventFilter, RoutingKey, TenantFilter, WriteError};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -24,7 +24,10 @@ pub const MAGIC: [u8; 2] = *b"Er";
 /// projection name).
 /// v4: `Hello` carries an optional token and its reply may refuse the
 /// connection; the server requires `Hello` as the first frame.
-pub const FORMAT_VERSION: u8 = 4;
+/// v5: tenants — events carry their tenant, every scan request a
+/// `TenantFilter` and every identity, subscriber and snapshot request a
+/// tenant, and write errors the tenant refusals.
+pub const FORMAT_VERSION: u8 = 5;
 
 /// Length of the fixed header: `MAGIC (2) + version (1) + kind (1)`.
 const HEADER_LEN: usize = 4;
@@ -139,6 +142,7 @@ pub enum Request {
     Read {
         aggregators: Option<Vec<EventFilter>>,
         routing_key: Option<RoutingKey>,
+        tenant: TenantFilter,
         args: Args,
         /// Exclusive stamp bound (see `Executor::read`).
         to_micros: Option<u64>,
@@ -146,47 +150,57 @@ pub enum Request {
     LatestTimestamp {
         aggregators: Option<Vec<EventFilter>>,
         routing_key: Option<RoutingKey>,
+        tenant: TenantFilter,
     },
     GetSubscriberCursor {
+        tenant: String,
         key: String,
     },
     IsSubscriberRunning {
+        tenant: String,
         key: String,
         worker_id: Ulid,
     },
     /// Fencing state + cursor in one round trip (see
     /// `Executor::subscriber_status`).
     SubscriberStatus {
+        tenant: String,
         key: String,
         worker_id: Ulid,
     },
     /// Highest committed version of a stream (see `Executor::latest_version`).
     LatestVersion {
+        tenant: String,
         aggregate_type: String,
         aggregate_id: String,
     },
     /// Routing key of an existing stream (see `Executor::stream_routing_key`).
     StreamRoutingKey {
+        tenant: String,
         aggregate_type: String,
         aggregate_id: String,
     },
     UpsertSubscriber {
+        tenant: String,
         key: String,
         worker_id: Ulid,
     },
     Acknowledge {
+        tenant: String,
         key: String,
         worker_id: Ulid,
         cursor: Value,
         lag: u64,
     },
     GetSnapshot {
+        tenant: String,
         aggregate_type: String,
         projection: String,
         aggregate_revision: String,
         id: String,
     },
     SaveSnapshot {
+        tenant: String,
         aggregate_type: String,
         projection: String,
         aggregate_revision: String,
@@ -195,6 +209,7 @@ pub enum Request {
         cursor: Value,
     },
     DeleteSnapshot {
+        tenant: String,
         aggregate_type: String,
         projection: String,
         id: String,
@@ -301,7 +316,8 @@ impl From<WireReadResult> for evento_core::cursor::ReadResult<Event> {
 /// `InvalidOriginalVersion` and `MissingData` map 1:1 — `WriteBuilder`'s
 /// retry-on-conflict matches on the variant, so fidelity matters — and so
 /// does `Unavailable`, which a client shows as a transient refusal rather
-/// than a failure (its cause travels as its `Display` string);
+/// than a failure (its cause travels as its `Display` string), and so do the
+/// tenant refusals of a scoped session;
 /// `Unknown`/`SystemTime` collapse to their `Display` strings.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum WireWriteError {
@@ -309,6 +325,8 @@ pub enum WireWriteError {
     MissingData,
     Other(String),
     Unavailable(String),
+    ForeignTenant { expected: String, found: String },
+    ReplicateRefused,
 }
 
 impl From<&WriteError> for WireWriteError {
@@ -317,6 +335,11 @@ impl From<&WriteError> for WireWriteError {
             WriteError::InvalidOriginalVersion => WireWriteError::InvalidOriginalVersion,
             WriteError::MissingData => WireWriteError::MissingData,
             WriteError::Unavailable(cause) => WireWriteError::Unavailable(cause.to_string()),
+            WriteError::ForeignTenant { expected, found } => WireWriteError::ForeignTenant {
+                expected: expected.clone(),
+                found: found.clone(),
+            },
+            WriteError::ReplicateRefused => WireWriteError::ReplicateRefused,
             other => WireWriteError::Other(other.to_string()),
         }
     }
@@ -329,6 +352,10 @@ impl From<WireWriteError> for WriteError {
             WireWriteError::MissingData => WriteError::MissingData,
             WireWriteError::Other(msg) => WriteError::Unknown(anyhow::anyhow!(msg)),
             WireWriteError::Unavailable(cause) => WriteError::Unavailable(anyhow::anyhow!(cause)),
+            WireWriteError::ForeignTenant { expected, found } => {
+                WriteError::ForeignTenant { expected, found }
+            }
+            WireWriteError::ReplicateRefused => WriteError::ReplicateRefused,
         }
     }
 }
@@ -352,6 +379,7 @@ mod wire_events {
         version: u16,
         name: String,
         routing_key: Option<String>,
+        tenant: String,
         data: Vec<u8>,
         /// bitcode-encoded [`Metadata`].
         metadata: Vec<u8>,
@@ -368,6 +396,7 @@ mod wire_events {
                 version: e.version,
                 name: e.name.clone(),
                 routing_key: e.routing_key.clone(),
+                tenant: e.tenant.clone(),
                 data: e.data.clone(),
                 metadata: bitcode::encode(&e.metadata),
                 timestamp: e.timestamp,
@@ -387,6 +416,7 @@ mod wire_events {
                 version: w.version,
                 name: w.name,
                 routing_key: w.routing_key,
+                tenant: w.tenant,
                 data: w.data,
                 metadata: bitcode::decode::<Metadata>(&w.metadata)?,
                 timestamp: w.timestamp,
@@ -423,6 +453,7 @@ mod tests {
             version: 7,
             name: "opened".to_owned(),
             routing_key: Some("eu".to_owned()),
+            tenant: "acme".to_owned(),
             data: vec![1, 2, 3],
             metadata,
             timestamp: 1_700_000_000,

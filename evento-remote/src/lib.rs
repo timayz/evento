@@ -28,13 +28,27 @@
 //! piggybacks on every frame, so fronting a replicated backend (Accord) keeps
 //! subscription safety intact.
 //!
-//! **Many stores, credentials.** A host serving one store per tenant implements
+//! **Credentials, tenants.** A host authenticating its clients implements
 //! [`Resolver`]: each connection opens with a `Hello` carrying the token the
 //! client was built with ([`ClientBuilder::token`]), and the resolver answers
 //! with the [`Session`] to serve it — the executor, something to keep alive
-//! for the connection's lifetime (a tenant lease), a signal to end it (a
-//! revoked credential) — or a [`Rejection`]. [`serve_with`] takes the
-//! resolver; [`serve`] is the open single-store case.
+//! for the connection's lifetime, a signal to end it (a revoked credential) —
+//! or a [`Rejection`]. [`serve_with`] takes the resolver; [`serve`] is the open
+//! single-store case.
+//!
+//! Which tenant a client belongs to is the host application's decision — its
+//! resolver maps the token (an API key, say) to one. To confine the client to
+//! that tenant over a store shared by every tenant, serve the store scoped to
+//! it, `Evento::new(store.clone()).tenant(tenant)?`
+//! ([`Evento::tenant`](evento_core::Evento::tenant)): the scoped executor acts
+//! in that tenant whatever the client's requests say — what it reads and loads,
+//! the tenant its writes are stamped with — and refuses `replicate`, so the
+//! client never reaches another tenant's data. The client itself stays
+//! tenant-agnostic: a tenant application following the store through a
+//! `Sidecar` (evento-core's `rw` feature) keeps its cursors and snapshots in its own
+//! store as before. What a session still shares: the write notifications every
+//! client is pushed, which carry a store-wide counter — a client sees when, and
+//! how often, the store is written, never what.
 //!
 //! **Addresses.** A client names its server by an [`Address`]: an IP and port,
 //! or a `host:port` looked up again on every connection attempt, so a

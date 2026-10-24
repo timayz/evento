@@ -1,7 +1,7 @@
 use evento::{
     cursor::{Args, Order, ReadResult},
     sql::Reader,
-    sql_migrator::{InitMigration, M0002, M0003, M0004, M0005, M0006, M0007},
+    sql_migrator::{InitMigration, M0002, M0003, M0004, M0005, M0006, M0007, M0008},
     Event,
 };
 use evento_test::assert_read_result;
@@ -230,6 +230,7 @@ where
     M0005: sqlx_migrator::Migration<DB>,
     M0006: sqlx_migrator::Migration<DB>,
     M0007: sqlx_migrator::Migration<DB>,
+    M0008: sqlx_migrator::Migration<DB>,
     sqlx_migrator::Migrator<DB>: sqlx_migrator::migrator::DatabaseOperation<DB>,
 {
     install_default_drivers();
@@ -245,4 +246,153 @@ where
     migrator.run(&mut *conn, &Plan::apply_all()).await?;
 
     Ok(pool)
+}
+
+/// Runs `statement` on `pool`, rendered for its backend.
+async fn execute<DB>(pool: &Pool<DB>, statement: impl SqlxBinder) -> anyhow::Result<()>
+where
+    DB: Database,
+    for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
+    sea_query_sqlx::SqlxValues: sqlx::IntoArguments<DB>,
+{
+    let (sql, values) = match DB::NAME {
+        "SQLite" => statement.build_sqlx(SqliteQueryBuilder),
+        "MySQL" => statement.build_sqlx(MysqlQueryBuilder),
+        "PostgreSQL" => statement.build_sqlx(PostgresQueryBuilder),
+        name => panic!("'{name}' not supported, consider using SQLite, PostgreSQL or MySQL"),
+    };
+    sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// The tenants of the subscriber rows keyed `key`.
+async fn subscriber_tenants<DB>(pool: &Pool<DB>, key: &str) -> anyhow::Result<Vec<String>>
+where
+    DB: Database,
+    for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
+    sea_query_sqlx::SqlxValues: sqlx::IntoArguments<DB>,
+    String: for<'r> sqlx::Decode<'r, DB> + sqlx::Type<DB>,
+    usize: sqlx::ColumnIndex<DB::Row>,
+{
+    use evento::sql::Subscriber;
+    use sea_query::{Expr, ExprTrait};
+
+    let statement = Query::select()
+        .column(Subscriber::Tenant)
+        .from(Subscriber::Table)
+        .and_where(Expr::col(Subscriber::Key).eq(key))
+        .to_owned();
+    let (sql, values) = match DB::NAME {
+        "SQLite" => statement.build_sqlx(SqliteQueryBuilder),
+        "MySQL" => statement.build_sqlx(MysqlQueryBuilder),
+        "PostgreSQL" => statement.build_sqlx(PostgresQueryBuilder),
+        name => panic!("'{name}' not supported, consider using SQLite, PostgreSQL or MySQL"),
+    };
+    let rows: Vec<(String,)> =
+        sqlx::query_as_with::<DB, (String,), _>(sqlx::AssertSqlSafe(sql.as_str()), values)
+            .fetch_all(pool)
+            .await?;
+    Ok(rows.into_iter().map(|(tenant,)| tenant).collect())
+}
+
+/// `m0008` reverts and re-applies around a subscriber row of the default
+/// tenant, which survives both; once a tenant other than the default one holds
+/// an event, the revert is refused and nothing is reverted.
+pub async fn m0008_round_trip<DB>(pool: Pool<DB>) -> anyhow::Result<()>
+where
+    DB: Database,
+    for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
+    sea_query_sqlx::SqlxValues: sqlx::IntoArguments<DB>,
+    String: for<'r> sqlx::Decode<'r, DB> + sqlx::Type<DB>,
+    usize: sqlx::ColumnIndex<DB::Row>,
+    InitMigration: sqlx_migrator::Migration<DB>,
+    M0002: sqlx_migrator::Migration<DB>,
+    M0003: sqlx_migrator::Migration<DB>,
+    M0004: sqlx_migrator::Migration<DB>,
+    M0005: sqlx_migrator::Migration<DB>,
+    M0006: sqlx_migrator::Migration<DB>,
+    M0007: sqlx_migrator::Migration<DB>,
+    M0008: sqlx_migrator::Migration<DB>,
+    sqlx_migrator::Migrator<DB>: sqlx_migrator::migrator::DatabaseOperation<DB>,
+{
+    use evento::sql::{Event as EventTable, Subscriber};
+
+    execute(
+        &pool,
+        Query::insert()
+            .into_table(Subscriber::Table)
+            .columns([Subscriber::Key, Subscriber::WorkerId, Subscriber::Lag])
+            .values_panic([
+                "kept".into(),
+                ulid::Ulid::nil().to_string().into(),
+                0.into(),
+            ])
+            .to_owned(),
+    )
+    .await?;
+
+    let migrator = evento::sql_migrator::new::<DB>()?;
+    let mut conn = pool.acquire().await?;
+    migrator
+        .run(&mut *conn, &Plan::revert_name("main", Some("m0008")))
+        .await?;
+    migrator.run(&mut *conn, &Plan::apply_all()).await?;
+    drop(conn);
+    assert_eq!(
+        subscriber_tenants(&pool, "kept").await?,
+        vec![String::new()],
+        "the subscriber row survives the revert and the re-apply, in the default tenant"
+    );
+
+    execute(
+        &pool,
+        Query::insert()
+            .into_table(EventTable::Table)
+            .columns([
+                EventTable::Id,
+                EventTable::Name,
+                EventTable::Data,
+                EventTable::Metadata,
+                EventTable::AggregatorType,
+                EventTable::AggregatorId,
+                EventTable::Version,
+                EventTable::Tenant,
+                EventTable::Timestamp,
+                EventTable::TimestampSubsec,
+            ])
+            .values_panic([
+                ulid::Ulid::generate().to_string().into(),
+                "Opened".into(),
+                Vec::<u8>::new().into(),
+                Vec::<u8>::new().into(),
+                "test/Account".into(),
+                "a-1".into(),
+                1.into(),
+                "acme".into(),
+                0.into(),
+                0.into(),
+            ])
+            .to_owned(),
+    )
+    .await?;
+
+    let mut conn = pool.acquire().await?;
+    let err = migrator
+        .run(&mut *conn, &Plan::revert_name("main", Some("m0008")))
+        .await
+        .expect_err("a tenant's event blocks the revert");
+    drop(conn);
+    assert!(
+        err.to_string().contains("cannot be reverted"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(
+        subscriber_tenants(&pool, "kept").await?,
+        vec![String::new()],
+        "the refused revert changed nothing"
+    );
+
+    Ok(())
 }

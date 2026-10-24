@@ -490,6 +490,11 @@ fn err_string<T>(result: anyhow::Result<T>) -> Result<T, String> {
     result.map_err(|e| format!("{e:#}"))
 }
 
+/// Serves one request with the session's executor. Tenant arguments are
+/// passed through as the client sent them: a session confined to a tenant is
+/// served a scoped executor (`Evento::tenant`), which replaces them with its
+/// own tenant, so a client cannot reach another tenant's events, snapshots or
+/// subscriptions whatever it sends.
 async fn handle<E: Executor>(executor: &E, request: Request) -> Response {
     match request {
         Request::Hello { .. } => unreachable!("Hello is answered inline by the read loop"),
@@ -508,6 +513,7 @@ async fn handle<E: Executor>(executor: &E, request: Request) -> Response {
         Request::Read {
             aggregators,
             routing_key,
+            tenant,
             args,
             to_micros,
         } => {
@@ -526,7 +532,13 @@ async fn handle<E: Executor>(executor: &E, request: Request) -> Response {
             };
             Response::Read(err_string(
                 executor
-                    .read(aggregators.map(Arc::from), routing_key, args, to_micros)
+                    .read(
+                        aggregators.map(Arc::from),
+                        routing_key,
+                        tenant,
+                        args,
+                        to_micros,
+                    )
                     .await
                     .map(WireReadResult::from),
             ))
@@ -534,56 +546,78 @@ async fn handle<E: Executor>(executor: &E, request: Request) -> Response {
         Request::LatestTimestamp {
             aggregators,
             routing_key,
+            tenant,
         } => Response::LatestTimestamp(err_string(
             executor
-                .latest_timestamp(aggregators.map(Arc::from), routing_key)
+                .latest_timestamp(aggregators.map(Arc::from), routing_key, tenant)
                 .await,
         )),
-        Request::GetSubscriberCursor { key } => {
-            Response::SubscriberCursor(err_string(executor.get_subscriber_cursor(key).await))
-        }
-        Request::IsSubscriberRunning { key, worker_id } => Response::SubscriberRunning(err_string(
-            executor.is_subscriber_running(key, worker_id).await,
+        Request::GetSubscriberCursor { tenant, key } => Response::SubscriberCursor(err_string(
+            executor.get_subscriber_cursor(tenant, key).await,
         )),
-        Request::SubscriberStatus { key, worker_id } => {
-            Response::SubscriberStatus(err_string(executor.subscriber_status(key, worker_id).await))
-        }
+        Request::IsSubscriberRunning {
+            tenant,
+            key,
+            worker_id,
+        } => Response::SubscriberRunning(err_string(
+            executor.is_subscriber_running(tenant, key, worker_id).await,
+        )),
+        Request::SubscriberStatus {
+            tenant,
+            key,
+            worker_id,
+        } => Response::SubscriberStatus(err_string(
+            executor.subscriber_status(tenant, key, worker_id).await,
+        )),
         Request::LatestVersion {
+            tenant,
             aggregate_type,
             aggregate_id,
         } => Response::LatestVersion(err_string(
-            executor.latest_version(aggregate_type, aggregate_id).await,
+            executor
+                .latest_version(tenant, aggregate_type, aggregate_id)
+                .await,
         )),
         Request::StreamRoutingKey {
+            tenant,
             aggregate_type,
             aggregate_id,
         } => Response::StreamRoutingKey(err_string(
             executor
-                .stream_routing_key(aggregate_type, aggregate_id)
+                .stream_routing_key(tenant, aggregate_type, aggregate_id)
                 .await,
         )),
-        Request::UpsertSubscriber { key, worker_id } => {
-            Response::Unit(err_string(executor.upsert_subscriber(key, worker_id).await))
-        }
+        Request::UpsertSubscriber {
+            tenant,
+            key,
+            worker_id,
+        } => Response::Unit(err_string(
+            executor.upsert_subscriber(tenant, key, worker_id).await,
+        )),
         Request::Acknowledge {
+            tenant,
             key,
             worker_id,
             cursor,
             lag,
         } => Response::Acknowledge(err_string(
-            executor.acknowledge(key, worker_id, cursor, lag).await,
+            executor
+                .acknowledge(tenant, key, worker_id, cursor, lag)
+                .await,
         )),
         Request::GetSnapshot {
+            tenant,
             aggregate_type,
             projection,
             aggregate_revision,
             id,
         } => Response::Snapshot(err_string(
             executor
-                .get_snapshot(aggregate_type, projection, aggregate_revision, id)
+                .get_snapshot(tenant, aggregate_type, projection, aggregate_revision, id)
                 .await,
         )),
         Request::SaveSnapshot {
+            tenant,
             aggregate_type,
             projection,
             aggregate_revision,
@@ -593,6 +627,7 @@ async fn handle<E: Executor>(executor: &E, request: Request) -> Response {
         } => Response::Unit(err_string(
             executor
                 .save_snapshot(
+                    tenant,
                     aggregate_type,
                     projection,
                     aggregate_revision,
@@ -603,12 +638,13 @@ async fn handle<E: Executor>(executor: &E, request: Request) -> Response {
                 .await,
         )),
         Request::DeleteSnapshot {
+            tenant,
             aggregate_type,
             projection,
             id,
         } => Response::Unit(err_string(
             executor
-                .delete_snapshot(aggregate_type, projection, id)
+                .delete_snapshot(tenant, aggregate_type, projection, id)
                 .await,
         )),
     }

@@ -24,7 +24,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use evento_core::{
     cursor::{Args, ReadResult, Value},
-    Event, EventFilter, Executor, RoutingKey, WriteError,
+    Event, EventFilter, Executor, RoutingKey, TenantFilter, WriteError,
 };
 use ulid::Ulid;
 
@@ -149,7 +149,11 @@ impl<E: Executor> DataStore for ExecutorDataStore<E> {
         // The default trait impl still pages for backends without an
         // override, so correctness never depends on the fast path.
         self.local
-            .latest_version(aggregate_type.to_owned(), aggregate_id.to_owned())
+            .latest_version(
+                String::new(),
+                aggregate_type.to_owned(),
+                aggregate_id.to_owned(),
+            )
             .await
     }
 
@@ -206,6 +210,7 @@ impl<E: Executor> DataStore for ExecutorDataStore<E> {
                     .read(
                         Some(Arc::clone(&filter)),
                         None,
+                        TenantFilter::Only(event.tenant.clone()),
                         Args::backward(HOLDS_PAGE_SIZE, before),
                         None,
                     )
@@ -240,8 +245,11 @@ impl<E: Executor> DataStore for ExecutorDataStore<E> {
         args: Args,
         to_micros: Option<u64>,
     ) -> anyhow::Result<ReadResult<Event>> {
+        // Every tenant: the requester narrowed the query itself (a tenant's
+        // read is refused before it gets here until replicas tell tenants
+        // apart).
         self.local
-            .read(aggregators, routing_key, args, to_micros)
+            .read(aggregators, routing_key, TenantFilter::All, args, to_micros)
             .await
     }
 
@@ -279,6 +287,8 @@ impl<E: Executor> DataStore for ExecutorDataStore<E> {
             .read(
                 None,
                 None,
+                // The whole log, every tenant's events: a joiner copies it all.
+                TenantFilter::All,
                 Args::forward(max_events.clamp(1, SNAPSHOT_PAGE_SIZE), after),
                 None,
             )
@@ -332,6 +342,25 @@ impl<E: Executor + Clone> AccordExecutor<E> {
     }
 }
 
+/// Refuses a tenant other than the default one: replicas do not yet tell
+/// tenants apart (their version check and conflict key would mix two
+/// tenants' streams), so a tenant's call is refused rather than served wrong.
+fn default_tenant_only(tenant: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        tenant.is_empty(),
+        "evento-accord does not support tenants yet (tenant {tenant:?})"
+    );
+    Ok(())
+}
+
+/// [`default_tenant_only`] for a scan: every tenant, or the default one.
+fn default_tenant_filter_only(tenant: &TenantFilter) -> anyhow::Result<()> {
+    match tenant {
+        TenantFilter::All => Ok(()),
+        TenantFilter::Only(tenant) => default_tenant_only(tenant),
+    }
+}
+
 #[async_trait]
 impl<E: Executor + Clone> Executor for AccordExecutor<E> {
     fn default_routing_key(&self) -> Option<&str> {
@@ -341,6 +370,11 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
     async fn write(&self, events: Vec<Event>) -> Result<(), WriteError> {
         if events.is_empty() {
             return Err(WriteError::MissingData);
+        }
+        if let Some(event) = events.iter().find(|e| !e.tenant.is_empty()) {
+            return Err(WriteError::Unknown(
+                default_tenant_only(&event.tenant).unwrap_err(),
+            ));
         }
         // A refusal that clears on its own (the backlog cap, a rejoin in
         // progress, a node retired until its host reopens it) is `Unavailable`,
@@ -382,9 +416,11 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
         &self,
         aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<RoutingKey>,
+        tenant: TenantFilter,
         args: Args,
         to_micros: Option<u64>,
     ) -> anyhow::Result<ReadResult<Event>> {
+        default_tenant_filter_only(&tenant)?;
         // A single-shard read for a key this node does not own is forwarded to an
         // owner. Everything else (owned keys, and broad scans that can't be pinned
         // to one shard) is served from the local backend.
@@ -407,7 +443,7 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
             }
         }
         self.local
-            .read(aggregators, routing_key, args, to_micros)
+            .read(aggregators, routing_key, tenant, args, to_micros)
             .await
     }
 
@@ -415,76 +451,112 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
         &self,
         aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<RoutingKey>,
+        tenant: TenantFilter,
     ) -> anyhow::Result<u64> {
-        self.local.latest_timestamp(aggregators, routing_key).await
+        default_tenant_filter_only(&tenant)?;
+        self.local
+            .latest_timestamp(aggregators, routing_key, tenant)
+            .await
     }
 
-    async fn get_subscriber_cursor(&self, key: String) -> anyhow::Result<Option<Value>> {
-        self.local.get_subscriber_cursor(key).await
+    async fn get_subscriber_cursor(
+        &self,
+        tenant: String,
+        key: String,
+    ) -> anyhow::Result<Option<Value>> {
+        default_tenant_only(&tenant)?;
+        self.local.get_subscriber_cursor(tenant, key).await
     }
 
-    async fn is_subscriber_running(&self, key: String, worker_id: Ulid) -> anyhow::Result<bool> {
-        self.local.is_subscriber_running(key, worker_id).await
+    async fn is_subscriber_running(
+        &self,
+        tenant: String,
+        key: String,
+        worker_id: Ulid,
+    ) -> anyhow::Result<bool> {
+        default_tenant_only(&tenant)?;
+        self.local
+            .is_subscriber_running(tenant, key, worker_id)
+            .await
     }
 
     // Explicitly forwarded (not left to the trait defaults) so the local
     // backend's single-round-trip overrides are reached through the wrapper.
     async fn subscriber_status(
         &self,
+        tenant: String,
         key: String,
         worker_id: Ulid,
     ) -> anyhow::Result<evento_core::SubscriberStatus> {
-        self.local.subscriber_status(key, worker_id).await
+        default_tenant_only(&tenant)?;
+        self.local.subscriber_status(tenant, key, worker_id).await
     }
 
     async fn latest_version(
         &self,
+        tenant: String,
         aggregate_type: String,
         aggregate_id: String,
     ) -> anyhow::Result<u16> {
+        default_tenant_only(&tenant)?;
         self.local
-            .latest_version(aggregate_type, aggregate_id)
+            .latest_version(tenant, aggregate_type, aggregate_id)
             .await
     }
 
     async fn stream_routing_key(
         &self,
+        tenant: String,
         aggregate_type: String,
         aggregate_id: String,
     ) -> anyhow::Result<Option<Option<String>>> {
+        default_tenant_only(&tenant)?;
         self.local
-            .stream_routing_key(aggregate_type, aggregate_id)
+            .stream_routing_key(tenant, aggregate_type, aggregate_id)
             .await
     }
 
-    async fn upsert_subscriber(&self, key: String, worker_id: Ulid) -> anyhow::Result<()> {
-        self.local.upsert_subscriber(key, worker_id).await
+    async fn upsert_subscriber(
+        &self,
+        tenant: String,
+        key: String,
+        worker_id: Ulid,
+    ) -> anyhow::Result<()> {
+        default_tenant_only(&tenant)?;
+        self.local.upsert_subscriber(tenant, key, worker_id).await
     }
 
     async fn acknowledge(
         &self,
+        tenant: String,
         key: String,
         worker_id: Ulid,
         cursor: Value,
         lag: u64,
     ) -> anyhow::Result<bool> {
-        self.local.acknowledge(key, worker_id, cursor, lag).await
+        default_tenant_only(&tenant)?;
+        self.local
+            .acknowledge(tenant, key, worker_id, cursor, lag)
+            .await
     }
 
     async fn get_snapshot(
         &self,
+        tenant: String,
         aggregate_type: String,
         projection: String,
         aggregator_revision: String,
         id: String,
     ) -> anyhow::Result<Option<(Vec<u8>, Value)>> {
+        default_tenant_only(&tenant)?;
         self.local
-            .get_snapshot(aggregate_type, projection, aggregator_revision, id)
+            .get_snapshot(tenant, aggregate_type, projection, aggregator_revision, id)
             .await
     }
 
     async fn save_snapshot(
         &self,
+        tenant: String,
         aggregate_type: String,
         projection: String,
         aggregator_revision: String,
@@ -492,8 +564,10 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
         data: Vec<u8>,
         cursor: Value,
     ) -> anyhow::Result<()> {
+        default_tenant_only(&tenant)?;
         self.local
             .save_snapshot(
+                tenant,
                 aggregate_type,
                 projection,
                 aggregator_revision,
@@ -506,12 +580,14 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
 
     async fn delete_snapshot(
         &self,
+        tenant: String,
         aggregate_type: String,
         projection: String,
         id: String,
     ) -> anyhow::Result<()> {
+        default_tenant_only(&tenant)?;
         self.local
-            .delete_snapshot(aggregate_type, projection, id)
+            .delete_snapshot(tenant, aggregate_type, projection, id)
             .await
     }
 }

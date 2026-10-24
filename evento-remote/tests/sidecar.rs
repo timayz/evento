@@ -132,17 +132,23 @@ async fn sidecar_keeps_bookkeeping_local() -> anyhow::Result<()> {
     // The cursor is in the local store only.
     assert!(t
         .local
-        .get_subscriber_cursor(key.to_owned())
+        .get_subscriber_cursor(String::new(), key.to_owned())
         .await?
         .is_some());
     assert!(t
         .server
-        .get_subscriber_cursor(key.to_owned())
+        .get_subscriber_cursor(String::new(), key.to_owned())
         .await?
         .is_none());
     assert!(
         t.server
-            .read(None, None, evento::cursor::Args::forward(10, None), None)
+            .read(
+                None,
+                None,
+                evento_core::TenantFilter::All,
+                evento::cursor::Args::forward(10, None),
+                None
+            )
             .await?
             .edges
             .len()
@@ -163,6 +169,7 @@ async fn sidecar_keeps_bookkeeping_local() -> anyhow::Result<()> {
     ) -> anyhow::Result<Option<(Vec<u8>, evento::cursor::Value)>> {
         store
             .get_snapshot(
+                String::new(),
                 "bank/BankAccount".to_owned(),
                 account_balance::AccountBalanceView::projection_name().to_owned(),
                 "0".to_owned(),

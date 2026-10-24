@@ -37,7 +37,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::{cursor::Args, metadata::Metadata, Event, EventFilter, Executor};
+use crate::{cursor::Args, metadata::Metadata, Event, EventFilter, Executor, TenantFilter};
 
 /// Derives a stable aggregate ID from a set of IDs by hashing them.
 ///
@@ -77,6 +77,23 @@ pub enum WriteError {
     /// The aggregate reached the maximum representable version (`u16::MAX`)
     #[error("aggregate version overflow")]
     VersionOverflow,
+
+    /// An event names a tenant other than the one the executor is scoped to
+    /// ([`Evento::tenant`](crate::Evento::tenant)). Nothing was written.
+    #[error("an event of tenant {found:?} cannot be written through an executor scoped to tenant {expected:?}")]
+    ForeignTenant {
+        /// The tenant the executor is scoped to.
+        expected: String,
+        /// The tenant the event names.
+        found: String,
+    },
+
+    /// `replicate` through an executor scoped to a tenant
+    /// ([`Evento::tenant`](crate::Evento::tenant)): it persists the caller's
+    /// timestamps and skips the version-contiguity check, which only a
+    /// trusted, unscoped replication layer may do. Nothing was written.
+    #[error("replicate is refused through an executor scoped to a tenant")]
+    ReplicateRefused,
 
     /// The store is not taking writes right now and will again on its own:
     /// a replicated executor whose backlog for a node that is away reached
@@ -312,6 +329,7 @@ pub struct WriteBuilder {
     aggregate_type: &'static str,
     routing_key: Option<String>,
     routing_key_locked: bool,
+    tenant: Option<String>,
     original_version: u16,
     data: Vec<(&'static str, Vec<u8>)>,
     metadata: Metadata,
@@ -326,6 +344,7 @@ impl WriteBuilder {
             aggregate_type: "",
             routing_key: None,
             routing_key_locked: false,
+            tenant: None,
             original_version: 0,
             data: Vec::default(),
             metadata: Default::default(),
@@ -366,6 +385,20 @@ impl WriteBuilder {
             self.routing_key_locked = true;
         }
 
+        self
+    }
+
+    /// Commits in `tenant` instead of the executor's (see
+    /// [`Executor::tenant`]; unscoped executors act in the default tenant,
+    /// `""`).
+    ///
+    /// The tenant is part of the stream's identity: the same aggregate id in
+    /// two tenants names two streams. An executor scoped to another tenant
+    /// refuses the commit ([`WriteError::ForeignTenant`]). Useful in a
+    /// handler of a subscription over every tenant, which writes in the
+    /// tenant of the event it handles.
+    pub fn tenant(&mut self, v: impl Into<String>) -> &mut Self {
+        self.tenant = Some(v.into());
         self
     }
 
@@ -443,6 +476,16 @@ impl WriteBuilder {
         if let Some((expected, got)) = self.mixed_types {
             return Err(WriteError::MixedAggregateTypes { expected, got });
         }
+        let tenant = self
+            .tenant
+            .clone()
+            .or_else(|| executor.tenant().map(str::to_owned))
+            .unwrap_or_default();
+        if tenant.len() > crate::MAX_TENANT_LEN {
+            return Err(WriteError::Unknown(
+                crate::TenantError::TooLong(tenant.len()).into(),
+            ));
+        }
 
         // An existing stream keeps the routing key of its first event — even
         // when that key is `None` — so one aggregate never spans two keys. Only
@@ -455,7 +498,11 @@ impl WriteBuilder {
             None
         } else {
             executor
-                .stream_routing_key(self.aggregate_type.to_owned(), self.aggregate_id.to_owned())
+                .stream_routing_key(
+                    tenant.clone(),
+                    self.aggregate_type.to_owned(),
+                    self.aggregate_id.to_owned(),
+                )
                 .await
                 .map_err(WriteError::Unknown)?
         };
@@ -489,6 +536,7 @@ impl WriteBuilder {
                 aggregate_type: self.aggregate_type.to_owned(),
                 version,
                 routing_key: routing_key.to_owned(),
+                tenant: tenant.clone(),
             };
 
             events.push(event);
@@ -577,8 +625,9 @@ impl<E: Executor> AggregateExt<E> for E {
                 .map(|name| EventFilter::exact_raw(A::aggregate_type(), id.clone(), name))
                 .collect::<Arc<[EventFilter]>>();
 
+            let tenant = TenantFilter::Only(self.tenant().unwrap_or_default().to_owned());
             let result = self
-                .read(Some(filters), None, Args::backward(1, None), None)
+                .read(Some(filters), None, tenant, Args::backward(1, None), None)
                 .await?;
 
             Ok(!result.edges.is_empty())
@@ -591,10 +640,12 @@ impl<E: Executor> AggregateExt<E> for E {
     ) -> impl std::future::Future<Output = anyhow::Result<Option<u16>>> + Send {
         let id = id.into();
         Box::pin(async {
+            let tenant = TenantFilter::Only(self.tenant().unwrap_or_default().to_owned());
             let result = self
                 .read(
                     Some(Arc::from([EventFilter::by_id::<A>(id)])),
                     None,
+                    tenant,
                     Args::backward(1, None),
                     None,
                 )
@@ -609,7 +660,7 @@ impl<E: Executor> AggregateExt<E> for E {
 pub(crate) mod tests {
     use super::*;
     use crate::cursor::{Args, ReadResult, Value};
-    use crate::{EventFilter, RoutingKey};
+    use crate::{EventFilter, RoutingKey, TenantFilter};
 
     #[test]
     fn hash_ids_is_collision_free_across_boundaries() {
@@ -632,21 +683,32 @@ pub(crate) mod tests {
         async fn write(&self, _events: Vec<Event>) -> Result<(), WriteError> {
             unreachable!()
         }
-        async fn get_subscriber_cursor(&self, _key: String) -> anyhow::Result<Option<Value>> {
+        async fn get_subscriber_cursor(
+            &self,
+            _tenant: String,
+            _key: String,
+        ) -> anyhow::Result<Option<Value>> {
             unreachable!()
         }
         async fn is_subscriber_running(
             &self,
+            _tenant: String,
             _key: String,
             _worker_id: Ulid,
         ) -> anyhow::Result<bool> {
             unreachable!()
         }
-        async fn upsert_subscriber(&self, _key: String, _worker_id: Ulid) -> anyhow::Result<()> {
+        async fn upsert_subscriber(
+            &self,
+            _tenant: String,
+            _key: String,
+            _worker_id: Ulid,
+        ) -> anyhow::Result<()> {
             unreachable!()
         }
         async fn acknowledge(
             &self,
+            _tenant: String,
             _key: String,
             _worker_id: Ulid,
             _cursor: Value,
@@ -658,6 +720,7 @@ pub(crate) mod tests {
             &self,
             _aggregators: Option<Arc<[EventFilter]>>,
             _routing_key: Option<RoutingKey>,
+            _tenant: TenantFilter,
             _args: Args,
             _to_micros: Option<u64>,
         ) -> anyhow::Result<ReadResult<Event>> {
@@ -667,11 +730,13 @@ pub(crate) mod tests {
             &self,
             _aggregators: Option<Arc<[EventFilter]>>,
             _routing_key: Option<RoutingKey>,
+            _tenant: TenantFilter,
         ) -> anyhow::Result<u64> {
             unreachable!()
         }
         async fn get_snapshot(
             &self,
+            _tenant: String,
             _aggregate_type: String,
             _projection: String,
             _aggregate_revision: String,
@@ -681,6 +746,7 @@ pub(crate) mod tests {
         }
         async fn save_snapshot(
             &self,
+            _tenant: String,
             _aggregate_type: String,
             _projection: String,
             _aggregate_revision: String,
@@ -692,6 +758,7 @@ pub(crate) mod tests {
         }
         async fn delete_snapshot(
             &self,
+            _tenant: String,
             _aggregate_type: String,
             _projection: String,
             _id: String,
