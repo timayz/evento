@@ -105,7 +105,7 @@ accord.node2:
 accord.cluster:
 	$(MAKE) accord.node0 accord.node1 accord.node2 -j3
 
-# bank-axum-accord-tenants: one SQLite file + one Accord group per tenant, created at
+# bank-axum-accord-tenants: SQLite files + one Accord group per tenant, created at
 # runtime, hosted over one multiplexed transport. Single node by default; CLUSTER_SIZE=3
 # with NODE_ID=0..2 for a localhost cluster (Accord port 7100+id, web port 3100+id).
 tenants:

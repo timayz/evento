@@ -1,12 +1,14 @@
 //! Multi-tenant bank on the **Accord consensus** executor with **one SQLite database
-//! per tenant** — and one Accord consensus group per tenant, all hosted in this
-//! process over a single multiplexed transport.
+//! per tenant** (its consensus journal in a file beside it) — and one Accord consensus
+//! group per tenant, all hosted in this process over a single multiplexed transport.
 //!
 //! Tenants are created at runtime by users of the application (`POST /tenants`), not
 //! by configuration: the catalog is itself an Accord group (`system.db`), so every
 //! host learns of a new tenant through replication and opens its database. Writes
 //! for `/t/{slug}/…` are coordinated in that tenant's group and land only in
 //! `tenants/{slug}.db`; cold tenants are evicted (LRU) and re-opened on demand.
+//! A tenant whose event file or journal file was lost comes back by rejoining from
+//! a peer, under this host's node id (see `storage.rs`).
 //!
 //! Single node (no peers to coordinate):
 //!
@@ -22,8 +24,10 @@
 //! make tenants.cluster       # = CLUSTER_SIZE=3 NODE_ID={0,1,2} cargo run -p bank-axum-accord-tenants
 //! ```
 //!
-//! `DATA_DIR` (default: a per-node directory under the system temp dir) holds
-//! `system.db` and `tenants/*.db`.
+//! `DATA_DIR` (default: a per-node directory under the system temp dir) holds two
+//! files per group, `system.db` + `system.journal.db` for the catalog and
+//! `tenants/{slug}.db` + `tenants/{slug}.journal.db` per tenant, and `host.db`, the
+//! ledger of the groups this host has opened.
 
 mod catalog;
 mod storage;
