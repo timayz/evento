@@ -80,6 +80,7 @@ pub struct TenantRegistry {
     /// Most tenants open at once on this host (LRU beyond it).
     cap: usize,
     system: TenantExecutor,
+    system_pool: SqlitePool,
     tenants: RwLock<HashMap<String, TenantInfo>>,
     by_group: RwLock<HashMap<GroupId, String>>,
     open: Mutex<HashMap<GroupId, OpenTenant>>,
@@ -110,7 +111,7 @@ impl TenantRegistry {
                 GroupId::DEFAULT,
                 topology(host.id(), &ids),
                 Arc::new(ExecutorDataStore::new(sql.clone())) as Arc<dyn DataStore>,
-                Arc::new(SqlJournal::<Sqlite>::new(pool)) as Arc<dyn Journal>,
+                Arc::new(SqlJournal::<Sqlite>::new(pool.clone())) as Arc<dyn Journal>,
                 node_config(),
             )
             .await?;
@@ -120,6 +121,7 @@ impl TenantRegistry {
             data_dir,
             cap: cap.max(1),
             system: AccordExecutor::new(node, sql),
+            system_pool: pool,
             tenants: RwLock::new(HashMap::new()),
             by_group: RwLock::new(HashMap::new()),
             open: Mutex::new(HashMap::new()),
@@ -422,6 +424,24 @@ impl TenantRegistry {
             self.host.close(group).await;
             tenant.pool.close().await;
         }
+    }
+
+    /// Closes every group open here, the tenants and then the catalog, and
+    /// their databases. Nothing is served after that. Stop the catalog
+    /// subscription first.
+    pub async fn shutdown(&self) {
+        let groups: Vec<GroupId> = self
+            .open
+            .lock()
+            .expect("open poisoned")
+            .keys()
+            .copied()
+            .collect();
+        for group in groups {
+            self.close(group).await;
+        }
+        self.host.close(GroupId::DEFAULT).await;
+        self.system_pool.close().await;
     }
 
     fn slug_of(&self, group: GroupId) -> Option<String> {

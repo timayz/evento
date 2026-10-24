@@ -132,7 +132,7 @@ async fn main() -> anyhow::Result<()> {
     let catalog = registry.start_catalog_subscription().await?;
 
     let state = AppState {
-        registry,
+        registry: Arc::clone(&registry),
         node_id: id,
     };
     let app = Router::new()
@@ -161,6 +161,7 @@ async fn main() -> anyhow::Result<()> {
         })
         .await?;
     catalog.stop();
+    registry.shutdown().await;
     Ok(())
 }
 
