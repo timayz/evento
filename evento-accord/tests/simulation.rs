@@ -1502,7 +1502,10 @@ impl Sim {
 
     /// Rejoins every node told to rejoin, as its host would: through the
     /// peer that told it to ([`Node::rejoin_contact`]), else through any not
-    /// told to.
+    /// told to. A join that fails — its contact told to rejoin meanwhile
+    /// answers nothing more (#348) — is made again through the next contact;
+    /// one that fails through every contact leaves the node told to rejoin,
+    /// for the next call.
     async fn rejoin_told(&mut self, since: tokio::time::Instant) -> Result<(), String> {
         if !self.dynamic.is_empty() {
             return Ok(());
@@ -1513,14 +1516,22 @@ impl Sim {
             }
             let told_by = self.nodes[i]
                 .rejoin_contact()
-                .and_then(|peer| self.ids.iter().position(|&id| id == peer))
-                .filter(|&j| !self.nodes[j].rejoin_required());
-            let Some(contact) =
-                told_by.or_else(|| (0..self.ids.len()).find(|&j| !self.nodes[j].rejoin_required()))
-            else {
+                .and_then(|peer| self.ids.iter().position(|&id| id == peer));
+            let mut contacts: Vec<usize> = told_by.into_iter().collect();
+            contacts.extend((0..self.ids.len()).filter(|&j| Some(j) != told_by));
+            let mut tried = false;
+            for j in contacts {
+                if self.nodes[j].rejoin_required() {
+                    continue;
+                }
+                tried = true;
+                if self.try_rejoin(i, self.ids[j], self.config).await.is_ok() {
+                    break;
+                }
+            }
+            if !tried {
                 return Err(self.stalled(i, "rejoin", "every node was told to rejoin", since));
-            };
-            self.rejoin(i, self.ids[contact], self.config).await;
+            }
         }
         Ok(())
     }
@@ -3604,15 +3615,7 @@ const SLOW_HEAL_SEEDS: [u64; 3] = [
 
 #[tokio::test(start_paused = true)]
 async fn a_healed_cluster_serves_again_in_time() {
-    for seed in SLOW_HEAL_SEEDS {
-        let _replay = Replay {
-            test: "swarm",
-            seed,
-        };
-        run_swarm(seed, &SwarmConfig::from_seed(seed))
-            .await
-            .assert_ok(&format!("swarm seed {seed}"));
-    }
+    swarm_seeds_pass(&SLOW_HEAL_SEEDS).await;
 }
 
 /// Swarm seeds (#349) where a replica given up while absent rejoined
@@ -3624,7 +3627,23 @@ const REJOIN_LOOP_SEEDS: [u64; 2] = [142649, 135462];
 
 #[tokio::test(start_paused = true)]
 async fn a_replica_rejoining_through_a_restarted_contact_is_counted_in() {
-    for seed in REJOIN_LOOP_SEEDS {
+    swarm_seeds_pass(&REJOIN_LOOP_SEEDS).await;
+}
+
+/// A swarm seed (#348) whose rejoin went through a contact that was told
+/// to rejoin itself mid-join, and answered nothing from then on: the
+/// harness makes the join again through another contact, as a host would.
+const CONTACT_TOLD_TO_REJOIN_SEEDS: [u64; 1] = [109900];
+
+#[tokio::test(start_paused = true)]
+async fn a_rejoin_whose_contact_is_told_to_rejoin_goes_through_another() {
+    swarm_seeds_pass(&CONTACT_TOLD_TO_REJOIN_SEEDS).await;
+}
+
+/// Runs each swarm seed of `seeds`, failing on the first that breaks an
+/// oracle.
+async fn swarm_seeds_pass(seeds: &[u64]) {
+    for &seed in seeds {
         let _replay = Replay {
             test: "swarm",
             seed,
@@ -3746,10 +3765,24 @@ impl Sim {
     /// a fresh node over an **empty** store and its **kept** journal, and
     /// joins through `contact` before its sweeps start.
     async fn rejoin(&mut self, i: usize, contact: NodeId, config: NodeConfig) {
+        self.try_rejoin(i, contact, config)
+            .await
+            .expect("rejoin from a snapshot");
+    }
+
+    /// [`rejoin`](Self::rejoin), handing a failed join back: node `i` then
+    /// stays the stopped node told to rejoin, for its host to rejoin through
+    /// another contact (see [`rejoin_told`](Self::rejoin_told)).
+    async fn try_rejoin(
+        &mut self,
+        i: usize,
+        contact: NodeId,
+        config: NodeConfig,
+    ) -> anyhow::Result<()> {
         let store = SimStore::new(self.store_kind, &self.outcomes);
         self.arm_store(i, &store);
-        self.rejoin_over(i, contact, config, store.data_store(), store)
-            .await;
+        self.try_rejoin_over(i, contact, config, store.data_store(), store)
+            .await
     }
 
     /// What a host does when node `i` lost its journal along with its store
@@ -3850,6 +3883,21 @@ impl Sim {
         backend: Arc<dyn DataStore>,
         store: SimStore,
     ) {
+        self.try_rejoin_over(i, contact, config, backend, store)
+            .await
+            .expect("rejoin from a snapshot");
+    }
+
+    /// [`try_rejoin`](Self::try_rejoin) over `backend`, a store wrapping
+    /// `store`.
+    async fn try_rejoin_over(
+        &mut self,
+        i: usize,
+        contact: NodeId,
+        config: NodeConfig,
+        backend: Arc<dyn DataStore>,
+        store: SimStore,
+    ) -> anyhow::Result<()> {
         for t in &self.tasks[i] {
             t.abort();
         }
@@ -3873,13 +3921,17 @@ impl Sim {
             .expect("recover the kept journal");
         node.begin_join();
         let inbox_task = node.start(inbox);
-        node.join(contact).await.expect("rejoin from a snapshot");
+        if let Err(err) = node.join(contact).await {
+            inbox_task.abort();
+            return Err(err);
+        }
         self.tasks[i] = vec![inbox_task, node.start_recovery()];
         self.nodes[i] = node;
         self.stores[i] = store;
         self.journals[i] = journal;
         self.live
             .set(i, self.nodes[i].clone(), self.stores[i].clone());
+        Ok(())
     }
 }
 
