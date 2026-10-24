@@ -11,9 +11,6 @@ This is the *ops* companion to [`DESIGN.md`](./DESIGN.md) (which covers the prot
 Worked, copy-pasteable deployments live in the examples:
 - `examples/bank-axum-accord` — a node over TCP (single-node or a 3-node localhost
   cluster), with `/metrics` and `/health` endpoints.
-- `examples/bank-axum-accord-tenants` — **many consensus groups per process**: two
-  SQLite files (events, journal) and one Accord group per tenant, tenants created at
-  runtime through a replicated catalog, over one multiplexed transport (§10).
 - `examples/jepsen-node` — a node over real TCP with a durable `FjallJournal`.
 
 ---
@@ -62,8 +59,8 @@ let executor = AccordExecutor::new(node, fjall);                // drop-in event
 - **The sweep is required, not optional:** besides recovery and compaction, it runs
   the anti-entropy rounds that prove what a node holds, and a node's subscriptions
   only process events below the window it has proven (§5). A node that never sweeps
-  (`start_recovery`, or a `SweepScheduler` for many groups) never releases events
-  to its subscriptions. A single-node group needs no proof.
+  (`start_recovery`) never releases events to its subscriptions. A single-node
+  cluster needs no proof.
 - **Static vs dynamic membership:** use `StaticTopology` for a fixed cluster;
   `DynamicTopology` if you need online membership/shard changes (§6).
 
@@ -89,10 +86,10 @@ timeouts for geo/WAN** deployments.
 | `max_commands` | 100 000 | Backpressure: refuse *new* local writes (`BacklogAtCap`; `WriteError::Unavailable` through `AccordExecutor`) once the un-compacted backlog hits this (e.g. compaction stalled under a partition, or a peer down with `peer_absence_limit` unset). |
 | `peer_absence_limit` | none | Stop waiting for a same-shard peer silent this long: compaction then proceeds without it (§7, down node). Set it well above any restart or maintenance window; a peer given up on while writes went through must rejoin from a snapshot on return. Never leaves fewer than a slow quorum counted. |
 | `snapshot_page_events` | 4096 | Most events this node puts in one snapshot page when a joiner bootstraps from it (§7, lost store). |
-| `snapshot_page_bytes` | 4 MiB | Byte budget of one snapshot page, command page or anti-entropy reply (a single larger event or command still crosses alone). Keep it far below the transport's 64 MiB frame cap and small enough that one group's bootstrap does not hold the link it shares with every other group for long. |
+| `snapshot_page_bytes` | 4 MiB | Byte budget of one snapshot page, command page or anti-entropy reply (a single larger event or command still crosses alone). Keep it far below the transport's 64 MiB frame cap and small enough that a bootstrap does not hold the link for long. |
 | `config_defer_step` | 100 ms | Control-plane anti-dueling delay for concurrent reconfigurations. |
 | `fence_invalidation` | true | Lets a recovery invalidate a transaction one replica compacted past while the others fenced it or hold it uncommitted. Sound only when every replica fences its votes: during a rolling upgrade from a build without the vote fence, set it `false` until the last node is upgraded. |
-| `amnesia_join_timeout` | 30 s | How long a node joining over a lost journal waits for its contact's watermark report to pass its amnesia fence before the join gives up with `FenceNotCovered` (§7, lost journal). Allow `compaction_margin` + three clock skews + a few anti-entropy rounds, and the idle interval of a `SweepScheduler`. |
+| `amnesia_join_timeout` | 30 s | How long a node joining over a lost journal waits for its contact's watermark report to pass its amnesia fence before the join gives up with `FenceNotCovered` (§7, lost journal). Allow `compaction_margin` + three clock skews + a few anti-entropy rounds. |
 
 Clock-skew tolerance is on the clock: `HybridLogicalClock::with_max_skew(..)` (default
 `MAX_SKEW_MICROS`); keep `recovery_timeout`/`compaction_margin` above it. The node
@@ -144,7 +141,6 @@ Serve it on an HTTP endpoint (see `bank-axum-accord`'s `/metrics`). Counters:
 | `journal_flushes` | group-commit activity; **0 while writing** = the journal can't fsync (see §8). |
 | `messages_handled` | liveness/traffic. |
 | `messages_shed` | inbound backpressure drops; sustained > 0 = a node is overloaded or a peer is flooding. |
-| `messages_unrouted` | (`MuxTransport` only) inbound frames for a group this host has not registered that were dropped — parked past the pending-buffer TTL or over its bounds. Steady > 0 = peers address groups this host never opens (a tenant evicted here and never re-opened, or a stale/unknown group id). |
 | `peers_absent` | shard peers this node stopped waiting for (`peer_absence_limit`); each is a node that was silent for that long. |
 | `rejoins_required` | this node must rejoin: a peer told it to, having given it up while writes it never applied were compacted; or its own recovery found it holding a transaction its peers compacted past, which no recovery can decide any more. The node is stale until its host rejoins it (§7) — through `Node::rejoin_contact()`, the peer that compacted past what it holds. |
 | `votes_fenced` | votes refused for a transaction this node never witnessed, older than its compaction margin: a late coordinator message, or a recovery by a replica that alone holds the transaction (§3, `compaction_margin`). Spikes after a partition heals are expected; a steady rate means coordinators slower than the margin. |
@@ -203,7 +199,7 @@ refuses anything else before a vote, and a node never installs it.
   change does not yet hand over the transactions in flight across it: replicas judge
   ownership, and recoveries plan, by the layout installed when a message lands, not
   by the one the transaction was coordinated under. So, before `change_topology`:
-  1. stop writes to the keys that move (for a group, its writes);
+  1. stop writes to the keys that move;
   2. let compaction pass them: every replica's `command_count()` back to zero;
   3. change the layout, then resume writes.
 
@@ -238,8 +234,8 @@ refuses anything else before a vote, and a node never installs it.
   payloads), which then read as already applied: the retry commits, changing
   nothing.
 - **A coordinator overtaken by recovery:** a node can take over a write whose
-  coordinator is alive but slow or wrongly suspected, or which reached it late (a
-  group it had not opened yet). The coordinator's own rounds then fail, but the write
+  coordinator is alive but slow or wrongly suspected, or which reached it late. The
+  coordinator's own rounds then fail, but the write
   may still commit. Before `Node::write` reports such a failure, the coordinator
   recovers its own transaction, or failing that waits for it to apply locally, and
   returns the outcome the cluster decided. An error from `write` therefore means the
@@ -289,19 +285,22 @@ refuses anything else before a vote, and a node never installs it.
   never applied were compacted meanwhile, every message it sends is answered with
   `Message::Rejoin` instead: it logs an error, drops every message, refuses writes
   (`RejoinRequired`; `WriteError::Unavailable` through `AccordExecutor`) and stays
-  like that until its host rejoins it — the `GroupHost`
-  `with_rejoin_handler` hook is told, and should `close(group).await` the group (it
-  returns once nothing touches its store or journal), discard its event store —
-  **keep its journal** — and `open_joining` it over that journal (next item),
-  listing `Node::rejoin_contact()` first among the contacts: the peer that told it
+  like that until its host rejoins it. Watch `Node::rejoin_signal()` (or poll
+  `rejoin_required()`); when it turns `true`, `retire()` the node, abort **and await**
+  its inbox loop and recovery task (the handles `start` and `start_recovery`
+  returned), so nothing touches its store or journal any more, discard its event
+  store — **keep its journal** — and open it by joining over that journal
+  ([below](#opening-a-node-by-joining)), listing `Node::rejoin_contact()` first among
+  the contacts: the peer that told it
   to rejoin (or that its recovery found compacted past a transaction it holds)
   compacted past what it holds, so joining through it drops everything
   below that floor, where a contact whose floor lags could leave the node holding a
   transaction the others compacted past (and have it told to rejoin again). The bound a given-up peer must
   report above is persisted (`Journal::save_rejoin_bounds`), so it holds across a
   restart of the node that gave it up. A rejoin streams the snapshot in pages
-  (`snapshot_page_bytes`), so a group of any size can be given up on and rejoined.
-  The rejoined node is counted again from its first report, at any group size: the
+  (`snapshot_page_bytes`), so a node of any store size can be given up on and
+  rejoined. The rejoined node is counted again from its first report, at any store
+  size: the
   contact vouches for the state it copied. While the joiner pulls pages, the contact
   holds its own watermark report at that vouch, so the shard's compaction pauses
   for the length of the join (it resumes on the joiner's first report, or a few
@@ -311,9 +310,8 @@ refuses anything else before a vote, and a node never installs it.
   backup older than its peers' compaction), its journal intact: anti-entropy can
   ship only the commands peers still hold, and the compacted prefix never comes
   back — the `sync contact truncated above this node's proven coverage` warning
-  names this case. Empty the store, **keep the journal**, and open the group by
-  **joining** instead: `GroupHost::open_joining(…, contacts)` (or
-  `recover_state_for_join` + `begin_join` + `join` on a bare `Node`) recovers the
+  names this case. Empty the store, **keep the journal**, and open the node by
+  **joining** instead ([below](#opening-a-node-by-joining)): it recovers the
   journal without replaying it into the store, installs a contact's data-store
   snapshot page by page, adopts and persists its floor, replays the traffic
   buffered meanwhile, and applies again what it had applied that the contact had
@@ -322,23 +320,24 @@ refuses anything else before a vote, and a node never installs it.
   the store and journal share a database (one SQLite file through `evento-sql`, or
   Fjall through `FjallJournal::from_database`), empty only the event store — with
   `evento-sql`, its `event`, `snapshot` and `subscriber` tables; the `accord_*`
-  tables are the journal. Kept in files of their own (§10), the store goes with
-  its file and the journal stays. Contacts are tried in order; one
+  tables are the journal. Kept in files of their own (the events in one SQLite
+  file, the journal through `SqlJournal` in another), the store goes with its file
+  and the journal stays. Contacts are tried in order; one
   that is itself joining does not answer. Join only over an empty store (`join`
   refuses otherwise): a page that overlaps existing events is skipped whole as an
   idempotent re-apply, which would leave a gap. For the same reason a join that
   fails after a page was installed (a contact that cannot read its backend, a link
   that keeps losing pages) is not retried on the next contact: the error carries
-  `PartialSnapshot` (`accord_joins_partial_total`), nothing is left registered, and
-  the store (not the journal) must be emptied before opening again.
+  `PartialSnapshot` (`accord_joins_partial_total`), and the store (not the journal)
+  must be emptied before joining again.
 - **Node back with a lost journal** (a dead disk that held it, a deleted or corrupt
   journal file, with or without its store): the node forgot the votes, recovery
   promises, config-Paxos promises and watermark reports it made, and the ids it
   minted. Voting again on what it forgot, or on new writes without what it forgot
   among their dependencies, it could split the stores. It comes back **under its own
-  node id, by joining** (#312): empty its event store and open it with
-  `GroupHost::open_joining(…, contacts)` (or `recover_state_for_join` + `join` on a
-  bare `Node`). Over an empty journal the node sets an **amnesia fence**: its wall
+  node id, by joining** (#312): empty its event store and open it by joining
+  ([below](#opening-a-node-by-joining)). Over an empty journal the node sets an
+  **amnesia fence**: its wall
   clock plus three clock skews, above everything it voted on, promised or reported
   before, journaled before anything else (`Journal::save_amnesia_fence`; the fjall and
   SQL journals keep it — a custom journal on the default no-op is refused, and such a
@@ -364,21 +363,18 @@ refuses anything else before a vote, and a node never installs it.
     config changes then need a majority of the other acceptors. A group whose
     acceptors, one after another, lost a majority of their journals can no longer
     change its membership.
-  - **A plain open refuses a lost journal**: `open` / `recover_state` over an empty
-    journal and a store that holds events fails with `LostJournal`, nothing left
-    registered (or `LostJournal { join_pending: true }` after a join over a lost
+  - **A plain open refuses a lost journal**: `recover_state` over an empty
+    journal and a store that holds events fails with `LostJournal`
+    (or `LostJournal { join_pending: true }` after a join over a lost
     journal that never completed) — empty the store and open joining. A cluster of a
     single node is exempt: no peer holds its votes, and it reopens over its store.
   - **What the node cannot tell**: an empty journal over an empty store, opened
     plainly, is a fresh replica (its first open leaves its clock bound in the journal,
     so the journal is never empty again while the store holds anything). A host that
-    lost a group's journal *and* store must therefore know, from elsewhere, that it
-    hosted the group, and open it joining (the tenants example keeps a ledger of the
-    groups each host opened, §10) — or bring the node back under a new node id,
+    lost a node's journal *and* store must therefore know, from elsewhere, that it
+    was a member, and open it joining — or bring the node back under a new node id,
     as before: remove the old id from the topology (`change_topology`) and add the new
-    one, which joins with an empty store and journal. Under a `GroupHost` the node id
-    is the host's (its `MuxTransport` id), shared by every group it hosts, so a new id
-    is a new host identity.
+    one, which joins with an empty store and journal.
   - **Stuck below the fence**: a transaction still undecided at the loss — accepted by
     the lost replica and by fewer than a slow quorum of the others, while every other
     replica is past its compaction margin for it and refuses it a vote (§3) — can no
@@ -394,6 +390,59 @@ refuses anything else before a vote, and a node never installs it.
   a disk that lost writes it had acknowledged): nothing detects it, and the node would
   vote against what it forgot. **Delete it**, and bring the node back as above (lost
   journal).
+
+### Opening a node by joining
+
+A node that rejoins, or comes back with a lost store or journal, is built over its
+kept (or empty) journal and an **empty** event store, and opened by joining instead
+of `recover_state`:
+
+```rust,ignore
+let node = Node::new(id, topology, clock, sink, store, journal).with_config(config);
+node.recover_state_for_join().await?; // the journal, without replaying it into the store
+node.begin_join(); // before the inbox loop: nothing is processed ahead of the snapshot
+let inbox_task = node.start(inbox);
+let mut outcome = Err(anyhow::anyhow!("no contact to join through"));
+for &contact in &contacts {
+    outcome = node.join(contact).await;
+    match &outcome {
+        Ok(_) => break,
+        // Part of the snapshot is installed: another contact's pages would overlap
+        // it and be skipped, leaving a gap. Stop here.
+        Err(err) if err.is::<PartialSnapshot>() => break,
+        // FenceNotCovered, an unreachable contact, a contact itself joining: next.
+        Err(_) => {}
+    }
+}
+if let Err(err) = outcome {
+    inbox_task.abort();
+    let _ = inbox_task.await;
+    // Retry later; after a PartialSnapshot, empty the store first (keep the journal).
+    return Err(err);
+}
+let recovery_task = node.start_recovery();
+```
+
+To rejoin a node that is running (told to rejoin, or a store found lost), first
+`retire()` it, abort and await `inbox_task` and `recovery_task` — once both
+returned, nothing touches its store or journal — then empty the store and open it as
+above. A retired node mints nothing more: a clone the application still holds fails
+to write with `NodeClosed` (`WriteError::Unavailable` through `AccordExecutor`), so it
+can never mint an id the reopened node mints too.
+
+**Sizes.** A join pulls the contact's un-compacted commands as `CommandPage`s and
+then its log as `SnapshotPage`s, each of at most `snapshot_page_events` /
+`snapshot_page_bytes` (4096 / 4 MiB), far below the transport's 64 MiB frame cap, and
+an anti-entropy reply is bounded the same way (a peer back from a long partition
+repairs its backlog over several rounds, its proven coverage trailing what is still on
+its way), so a store of any size — and any backlog — can be bootstrapped and repaired,
+a page at a time. A frame over the cap is shed and counted (`messages_shed`, with a
+warning) instead of being handed to the codec, whose refusal would tear the connection
+down and take the frames batched with it. (A write that fails on a stale connection —
+the peer restarted — is retried once over a fresh one.) The one unit no page can split
+is a single transaction: `Node::write` refuses one whose events weigh more than
+`MAX_COMMAND_BYTES` (half the frame cap) with `CommandTooLarge` (`WriteError::Unknown`
+through `AccordExecutor`) — split it into several writes.
 
 ---
 
@@ -439,12 +488,20 @@ refuses anything else before a vote, and a node never installs it.
   execution time. Events a store already holds keep their old stamps — so an
   aggregate written by skewed hosts before the upgrade can still read with versions
   out of stamp order — and nothing re-stamps them, not even a rejoin (a join copies
-  the contact's stamps). Do not mix builds in one group: an old and a new replica
+  the contact's stamps). Do not mix builds in one cluster: an old and a new replica
   applying the same transaction stamp it differently, and their subscription cursors
-  stop lining up for good. Upgrade a group's nodes together (stop all, upgrade, start).
+  stop lining up for good. Upgrade a cluster's nodes together (stop all, upgrade, start).
   If a rolling upgrade let both builds apply, pick one upgraded replica and rejoin
   every other from an empty store, keeping its journal, against it (§7, lost
   store), so all share its stamps.
+- **Joining across versions** (paged joins): a joiner asks for the paged header
+  first; a contact predating command pages sheds the request, and the joiner asks
+  again for the inline header after `collect_timeout` — so a join against an old
+  contact takes that long longer, and its whole command backlog must still fit one
+  frame. A joiner predating command pages asks a current contact for the inline
+  header, as before; one predating snapshot pages (`SyncRequest { snapshot: true }`)
+  still gets its snapshot inline, read a page at a time and not answered at all once
+  it outgrows a frame.
 
 ---
 
@@ -461,166 +518,7 @@ real-time guarantees across nodes.
 
 ---
 
-## 10. Many groups per process (multi-tenant)
-
-One `Node` is one consensus group over one data store and one journal. To give every
-tenant its own database (hard isolation) you run **one group per tenant**, and a
-process hosts *all* of its tenants' groups at once. Three pieces make that cheap at a
-thousand-plus groups per process; none of them changes the protocol or the `Node`:
-
-- **`MuxTransport`** — one connection set per process shared by every group. Each
-  frame carries a `GroupId` (an additive wire record kind; a classic `TcpTransport`
-  node still interoperates in `GroupId::DEFAULT`). `mux.sink(group)` is a group's
-  `MessageSink`; `mux.register(group)` its inbox; `mux.serve(listener)` the single
-  accept loop (`serve_tls` / `serve_tls_verified` for mTLS — the pinned identity
-  applies to every group on a connection).
-- **`SweepScheduler`** — one task drives every node's recovery/anti-entropy/
-  compaction sweep instead of a 100 ms task per node. A node with un-applied work, or
-  whose applied state moved within `active_hold`, sweeps every tick (the recovery
-  bound is unchanged); an idle one sweeps once per `idle_interval`, staggered. Without
-  it, 1000 idle groups at N=3 gossip ~28k frames/s per process; with the defaults,
-  ~800.
-- **`GroupHost`** — `open(group, topology, datastore, journal, config)` does the
-  per-group wiring (register → sink → `Node::new` → `recover_state` → `start` →
-  schedule) and `close(group).await` undoes it: it returns once the group's sweep and
-  inbox loop have stopped (whatever they were doing is dropped, as a crash would drop
-  it), so its store and journal may be closed or discarded right after, and the
-  returned node mints nothing more (`NodeClosed`; `WriteError::Unavailable` through
-  `AccordExecutor`). An open of the same group waits for a close in progress. Never
-  close a group from one of its own tasks. `open_joining(…, contacts)` opens a group
-  whose store was lost, or that was told to rejoin, by bootstrapping it from a peer's
-  snapshot over its kept journal — or, behind an amnesia fence, one whose journal was
-  lost (§7).
-
-```rust
-let mux = Arc::new(MuxTransport::new(id, peer_addrs).with_unrouted_handler(reopen));
-mux.serve(listener);
-let scheduler = SweepScheduler::new(SweepConfig::default());
-scheduler.start();
-let host = GroupHost::new(Arc::clone(&mux), scheduler);
-// per tenant:
-let node = host.open(group, topology, store, journal, cfg).await?;
-let executor = AccordExecutor::new(node, sql);
-```
-
-**Tenants created at runtime.** Every host must learn about a new tenant on its own,
-and the wire must never be able to *create* one. The example does this with a
-**catalog group** (`GroupId::DEFAULT`, its own `system.db`) holding a `Tenant`
-aggregate: creating a tenant is a replicated write (duplicate slugs are rejected
-cluster-wide by the version condition), and each host runs a subscription on the
-catalog that opens the tenant's database + group when it sees `TenantCreated`. The
-**pending-register buffer** (`with_pending_buffer`, default 64 frames × 1024 groups ×
-5 s) parks frames for a group that is still being opened and replays them on
-`register`, so the first write to a brand-new tenant keeps its fast path. The
-**unrouted handler** (`with_unrouted_handler`) is told (rate-limited) about frames for
-an unregistered group — use it to re-open an *evicted* tenant from your catalog; ignore
-ids the catalog does not know. Sweep gossip (`Message::is_sweep`: watermarks and
-anti-entropy, which an idle group's peers keep emitting every `idle_interval`) never
-reaches the handler, so a tenant closed for inactivity on one host is not reopened by
-its peers' heartbeats; the next real write or read wakes it. A joining replica's requests
-(`JoinHeaderRequest`, `CommandPageRequest`, `SnapshotRequest`, `SnapshotPageRequest`)
-are not sweep gossip: they wake the group on
-a contact that has it closed. The pages it is answered with are, so a page arriving
-late, after a failed join unregistered the group, does not reopen it.
-
-**SQLite footprint.** sqlx-sqlite runs one OS thread per *open* connection, so bound
-each tenant pool (`max_connections(2–3)` for the events, 1–2 for the journal,
-`min_connections(0)`, an `idle_timeout`) and cap the number of tenants open per
-process (LRU; `host.close(group).await`, then close its pools, on eviction — under the
-tenant's open lock, so a request for it waits and opens it afresh; a closed tenant
-catches up via anti-entropy when re-opened). Keep `synchronous(Full)` under WAL on both
-files: a journaled vote must survive a power loss, and so must an event the journal
-records as applied. Build **one** `Sql` per tenant and clone it into both
-`ExecutorDataStore` and `AccordExecutor` — two `.into()`s from one pool do not share
-the write-wake channel.
-
-**Two files per tenant.** Keep a tenant's consensus journal in a file of its own
-beside its event file — the example's `tenants/{slug}.db` and
-`tenants/{slug}.journal.db` (`system.db` and `system.journal.db` for the catalog), the
-journal file migrated with `AccordMigration` alone. Losing one file then costs only
-that file:
-- a lost **event file** is rebuilt from a peer over the kept journal
-  (`open_joining`), as a group told to rejoin is;
-- a lost **journal file** — or one emptied in place, which a plain open refuses with
-  `LostJournal` — means deleting the event file and opening joining under the host's
-  own node id, behind the amnesia fence (§7).
-
-Over one shared file, every loss is a lost journal.
-
-**Remember which groups the host had.** With both files lost, nothing on disk says the
-host ever had the group, and a plain open would start it afresh, voting at once with
-every earlier vote forgotten. The example lists each group a host opens in a ledger,
-`host.db`, and opens a listed group with a missing file by joining:
-- A group is listed once its files exist and before its first open, while it has voted
-  nothing yet. Listed any earlier, a crash in between would leave a brand-new group
-  that every host waits to rejoin, with no host to vouch for it.
-- A rejoin is marked in the ledger before it deletes anything and cleared once the
-  join is done, so a crash midway resumes it rather than open plainly over the files
-  it left.
-- A lone node always opens plainly: no peer holds its votes.
-- A new ledger is seeded from the files on disk. A group lost together with `host.db`
-  is remembered by nothing: bring the host back under a new node id (§7).
-
-A data directory from before this layout, with each journal inside its event file, is
-moved on each group's first open. The journal is copied to a temporary file that is
-renamed into place, then cleared from the event file. A binary from before the split
-then refuses that file (`LostJournal`) instead of reading a stale journal. The
-example's `storage.rs` holds the routing, the ledger and the move.
-
-**Knobs and bounds.**
-
-| | Default | Meaning |
-|-|---------|---------|
-| `SweepConfig.tick` | 100 ms | Busy/active cadence; match `recovery_interval`. |
-| `SweepConfig.active_hold` | 3 s | Full cadence after applied state moved; must cover `compaction_margin` + a few anti-entropy rounds so a burst compacts before backing off. |
-| `SweepConfig.idle_interval` | 5 s | Idle cadence; bounds an idle group's anti-entropy convergence and metadata catch-up. |
-| `SweepConfig.max_concurrent` | 64 | Sweeps in flight at once; a due node that finds no slot is retried next tick (`SweepStats.sweeps_deferred`). Size above your simultaneously-active tenants. |
-| `MuxTransport::with_queue_capacity` | 1024 | Per-peer outbound queue, shared by all groups — raise for many groups bursting at once (a full queue sheds for all of them). |
-| `MuxTransport::with_inbox_capacity` | 1024 | Per-group inbound inbox. |
-
-A join pulls the contact's un-compacted commands as `CommandPage`s and then its log as
-`SnapshotPage`s, each of at most `snapshot_page_events` / `snapshot_page_bytes`
-(4096 / 4 MiB), far below the transport's 64 MiB frame cap, and an anti-entropy reply
-is bounded the same way (a peer back from a long partition repairs its backlog over
-several rounds, its proven coverage trailing what is still on its way), so a group of
-any size — and any backlog — can be bootstrapped and repaired — and, since a per-peer connection and
-queue are shared, one group's bootstrap holds the link for a page at a time rather
-than for its whole log. A frame over the cap is shed and counted (`messages_shed`,
-with a warning) instead of being handed to the codec, whose refusal would tear the
-connection down and take the frames batched with it. (A write that fails on a stale
-connection — the peer restarted — is retried once over a fresh one, so one dead
-connection does not cost every group a frame.) The one unit no page can split is a
-single transaction: `Node::write` refuses one whose events weigh more than
-`MAX_COMMAND_BYTES` (half the frame cap) with `CommandTooLarge`
-(`WriteError::Unknown` through `AccordExecutor`) — split it into several writes.
-
-**Rolling upgrade.** A joiner asks for the paged header first; a contact predating
-command pages sheds the request, and the joiner asks again for the inline header
-after `collect_timeout` — so a join against an old contact takes that long longer,
-and its whole command backlog must still fit one frame. A joiner predating command
-pages asks a current contact for the inline header, as before; one predating
-snapshot pages (`SyncRequest { snapshot: true }`) still gets its snapshot inline,
-read a page at a time and not answered at all once it outgrows a frame.
-
-**A tenant's first write races its peers' opens.** The creating host opens the group
-and writes at once; a peer that has not opened it yet parks the frames. If the peer's
-open (file create + migrate) outlasts `fast_timeout` the write takes the slow path; if
-it outlasts `collect_timeout` (5 s) on enough peers the write fails. So peers must learn
-of a new tenant *fast*: the example's unrouted hook re-reads the catalog stream from the
-local system store (applied within milliseconds of the commit) before deciding a group
-is unknown, instead of waiting for the catalog subscription (which trails the stability
-watermark by about a second). Keep per-tenant opens cheap, or raise `collect_timeout`.
-
-**CPU-bound test rigs.** Every committed write is two fsynced SQLite transactions per
-replica (journal flush, event apply), and a debug build multiplies the encode and
-query-building cost roughly tenfold — six or more replicas in one debug process can
-exceed `collect_timeout` under load. Measure in release before tuning; for a load-test
-project, `[profile.dev.package."*"] opt-level = 2` builds dependencies optimized while
-your own code stays debuggable.
-
----
-
-## 11. Pre-production checklist
+## 10. Pre-production checklist
 
 - [ ] Odd `N` (3 or 5); replicas in independent failure domains.
 - [ ] **Durable** journal (`FjallJournal`/`SqlJournal`), not `InMemoryJournal`.
@@ -629,7 +527,8 @@ your own code stays debuggable.
 - [ ] `/metrics` scraped + alerts on recoveries / compaction-stall / shed / backlog.
 - [ ] `peer_absence_limit` decided: unset keeps a down node's writes shippable on
       return but lets the backlog grow toward `max_commands`; set, a node away
-      longer rejoins from a snapshot (host hook `with_rejoin_handler` in place).
+      longer rejoins from a snapshot (the host watches `rejoin_signal` and rejoins
+      it, §7).
 - [ ] `snapshot_page_bytes` sized for the link (default 4 MiB): a rejoin moves a
       page per round trip, so a WAN link wants larger pages and a shared, busy
       link smaller ones.
@@ -637,3 +536,10 @@ your own code stays debuggable.
 - [ ] `linearizable_reads` decision made (freshness vs. read latency).
 - [ ] Load/soak test on representative hardware before trusting it — and note the
       project's verdict: independent review + multi-day soak are still outstanding.
+
+**CPU-bound test rigs.** Every committed write is two fsynced SQLite transactions per
+replica (journal flush, event apply) on the SQL backends, and a debug build multiplies
+the encode and query-building cost roughly tenfold — six or more replicas in one debug
+process can exceed `collect_timeout` under load. Measure in release before tuning; for
+a load-test project, `[profile.dev.package."*"] opt-level = 2` builds dependencies
+optimized while your own code stays debuggable.

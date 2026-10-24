@@ -343,7 +343,7 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
             return Err(WriteError::MissingData);
         }
         // A refusal that clears on its own (the backlog cap, a rejoin in
-        // progress, a node closed until its group reopens) is `Unavailable`,
+        // progress, a node retired until its host reopens it) is `Unavailable`,
         // so a caller can tell a transient condition from a failure and keep
         // the typed cause.
         let outcome = self.node.write(events).await.map_err(|err| {

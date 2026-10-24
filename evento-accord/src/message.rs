@@ -265,8 +265,6 @@ pub enum Message {
     /// materialised events follow page by page through
     /// [`SnapshotPageRequest`](Message::SnapshotPageRequest), so a store of
     /// any size crosses the wire in frames far under the transport's cap.
-    /// Not sweep gossip: it must open the group on a contact that has it
-    /// closed, or the join would time out.
     SnapshotRequest { id: u64 },
     /// Joining node → the contact: the page of its snapshot after `after`
     /// (`None` for the first). Idempotent, so a lost reply is simply asked
@@ -443,7 +441,6 @@ pub enum Message {
     /// only then the snapshot pages, so a backlog of any size crosses in
     /// frames far under the transport's cap. A contact predating it sheds it
     /// and the joiner, hearing nothing, asks again with a `SnapshotRequest`.
-    /// Not sweep gossip (see `SnapshotRequest`).
     JoinHeaderRequest { id: u64 },
     /// Joining node → the contact: the page of its applied commands after
     /// `t0` `after` (`None` for the first), bounded like a snapshot page.
@@ -487,33 +484,6 @@ pub enum Message {
 }
 
 impl Message {
-    /// Periodic background traffic an idle group keeps emitting — watermark
-    /// gossip and anti-entropy. Unlike every other message, it is never a
-    /// reason for a host to open a group it has closed: a `MuxTransport` does
-    /// not tell its unrouted handler about these frames, otherwise a tenant
-    /// closed for inactivity on one host would be reopened by its peers'
-    /// heartbeats a moment later, forever. A joining replica's requests
-    /// (`JoinHeaderRequest`, `CommandPageRequest`, `SnapshotRequest`,
-    /// `SnapshotPageRequest`, and the legacy `SyncRequest { snapshot: true }`)
-    /// are not: they must open the group on a contact that has it closed, or
-    /// the join would time out. A `SnapshotPage`, `CommandPage` or
-    /// `JoinProof` is: a reply arriving late, after a failed join
-    /// unregistered the group, must not reopen it.
-    pub fn is_sweep(&self) -> bool {
-        matches!(
-            self,
-            Message::Watermark { .. }
-                | Message::SyncRequest {
-                    snapshot: false,
-                    ..
-                }
-                | Message::SyncData { .. }
-                | Message::SnapshotPage { .. }
-                | Message::JoinProof { .. }
-                | Message::CommandPage { .. }
-        )
-    }
-
     /// The transaction this message concerns, used to route responses to the
     /// in-flight coordination. `None` for cluster-management messages (sync).
     pub fn txn(&self) -> Option<TxnId> {
@@ -673,8 +643,8 @@ mod tests {
             },
         ];
         for message in messages {
-            let bytes = encode_tagged(RecordKind::GroupFrame, &message).unwrap();
-            let back: Message = decode_tagged(RecordKind::GroupFrame, &bytes).unwrap();
+            let bytes = encode_tagged(RecordKind::WireFrame, &message).unwrap();
+            let back: Message = decode_tagged(RecordKind::WireFrame, &bytes).unwrap();
             match (&message, &back) {
                 (Message::SnapshotRequest { id }, Message::SnapshotRequest { id: b }) => {
                     assert_eq!(id, b)
@@ -701,9 +671,8 @@ mod tests {
         }
     }
 
-    /// A failed forwarded read crosses the wire with its reason, belongs to no
-    /// transaction, and is not sweep gossip (a reply to a read, which may wake
-    /// a closed group like any other).
+    /// A failed forwarded read crosses the wire with its reason and belongs to
+    /// no transaction.
     #[test]
     fn read_failed_round_trips_tagged() {
         let message = Message::ReadFailed {
@@ -711,9 +680,8 @@ mod tests {
             reason: "disk full".into(),
         };
         assert_eq!(message.txn(), None);
-        assert!(!message.is_sweep());
-        let bytes = encode_tagged(RecordKind::GroupFrame, &message).unwrap();
-        match decode_tagged(RecordKind::GroupFrame, &bytes).unwrap() {
+        let bytes = encode_tagged(RecordKind::WireFrame, &message).unwrap();
+        match decode_tagged(RecordKind::WireFrame, &bytes).unwrap() {
             Message::ReadFailed { id, reason } => {
                 assert_eq!((id, reason.as_str()), (9, "disk full"))
             }
@@ -721,16 +689,13 @@ mod tests {
         }
     }
 
-    /// A join keepalive crosses the wire, belongs to no transaction, and is
-    /// not sweep gossip: like the page requests it keeps alive, it may open a
-    /// group its contact has closed.
+    /// A join keepalive crosses the wire and belongs to no transaction.
     #[test]
     fn join_keepalive_round_trips_tagged() {
         let message = Message::JoinKeepalive;
         assert_eq!(message.txn(), None);
-        assert!(!message.is_sweep());
-        let bytes = encode_tagged(RecordKind::GroupFrame, &message).unwrap();
-        match decode_tagged(RecordKind::GroupFrame, &bytes).unwrap() {
+        let bytes = encode_tagged(RecordKind::WireFrame, &message).unwrap();
+        match decode_tagged(RecordKind::WireFrame, &bytes).unwrap() {
             Message::JoinKeepalive => {}
             other => panic!("variant changed on the wire: {other:?}"),
         }
@@ -773,8 +738,8 @@ mod tests {
             },
         ];
         for message in messages {
-            let bytes = encode_tagged(RecordKind::GroupFrame, &message).unwrap();
-            let back: Message = decode_tagged(RecordKind::GroupFrame, &bytes).unwrap();
+            let bytes = encode_tagged(RecordKind::WireFrame, &message).unwrap();
+            let back: Message = decode_tagged(RecordKind::WireFrame, &bytes).unwrap();
             match (&message, &back) {
                 (Message::JoinHeaderRequest { id }, Message::JoinHeaderRequest { id: b }) => {
                     assert_eq!(id, b)
@@ -823,8 +788,8 @@ mod tests {
             epoch: 4,
             vouched,
         };
-        let bytes = encode_tagged(RecordKind::GroupFrame, &proof).unwrap();
-        match decode_tagged(RecordKind::GroupFrame, &bytes).unwrap() {
+        let bytes = encode_tagged(RecordKind::WireFrame, &proof).unwrap();
+        match decode_tagged(RecordKind::WireFrame, &bytes).unwrap() {
             Message::JoinProof {
                 id,
                 epoch,
@@ -858,7 +823,6 @@ mod tests {
             }),
         };
         assert_eq!(routed.txn(), Some(txn));
-        assert!(!routed.is_sweep());
         let bytes = encode_tagged(RecordKind::WireFrame, &routed).unwrap();
         match decode_tagged::<Message>(RecordKind::WireFrame, &bytes).unwrap() {
             Message::Routed { route: r, inner } => {
@@ -888,8 +852,8 @@ mod tests {
             Message::Amnesiac { txn, ballot },
         ] {
             assert_eq!(message.txn(), Some(txn));
-            let bytes = encode_tagged(RecordKind::GroupFrame, &message).unwrap();
-            let back: Message = decode_tagged(RecordKind::GroupFrame, &bytes).unwrap();
+            let bytes = encode_tagged(RecordKind::WireFrame, &message).unwrap();
+            let back: Message = decode_tagged(RecordKind::WireFrame, &bytes).unwrap();
             assert_eq!(format!("{back:?}"), format!("{message:?}"));
         }
     }
@@ -936,10 +900,9 @@ mod tests {
         assert_eq!(bitcode::deserialize::<After>(&bytes).unwrap(), appended);
     }
 
-    /// A joiner's requests must wake a closed contact; a page must not wake
-    /// a joiner that gave up. None of them concerns a transaction.
+    /// None of a join's requests or pages concerns a transaction.
     #[test]
-    fn snapshot_variants_sweep_and_route_as_control() {
+    fn snapshot_variants_route_as_control() {
         let request = Message::SnapshotRequest { id: 1 };
         let page_request = Message::SnapshotPageRequest { id: 2, after: None };
         let page = Message::SnapshotPage {
@@ -952,10 +915,6 @@ mod tests {
             epoch: 0,
             vouched: Timestamp::MIN,
         };
-        assert!(!request.is_sweep());
-        assert!(!page_request.is_sweep());
-        assert!(page.is_sweep());
-        assert!(proof.is_sweep());
         let header_request = Message::JoinHeaderRequest { id: 1 };
         let command_request = Message::CommandPageRequest { id: 1, after: None };
         let command_page = Message::CommandPage {
@@ -964,9 +923,6 @@ mod tests {
             commands: Vec::new(),
             next: None,
         };
-        assert!(!header_request.is_sweep());
-        assert!(!command_request.is_sweep());
-        assert!(command_page.is_sweep());
         for message in [
             request,
             page_request,

@@ -32,10 +32,6 @@ pub struct Metrics {
     pub messages_handled: AtomicU64,
     /// Outbound messages shed because a peer's queue was full (backpressure).
     pub messages_shed: AtomicU64,
-    /// Inbound frames for a consensus group with no registered inbox on this host
-    /// that could not be parked for it (buffer full) or expired before it registered
-    /// — a multiplexed transport (`MuxTransport`) counter.
-    pub messages_unrouted: AtomicU64,
     /// Same-shard peers this node stopped waiting for because they were silent
     /// past `NodeConfig::peer_absence_limit` (compaction then proceeds without
     /// them).
@@ -144,11 +140,6 @@ impl Metrics {
         self.messages_shed.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Records one inbound frame dropped for want of a registered group.
-    pub fn record_unrouted(&self) {
-        self.messages_unrouted.fetch_add(1, Ordering::Relaxed);
-    }
-
     /// Records one snapshot page served to a joining peer.
     pub fn record_snapshot_page(&self) {
         self.snapshot_pages.fetch_add(1, Ordering::Relaxed);
@@ -212,7 +203,6 @@ impl Metrics {
             journal_flushes: self.journal_flushes.load(Ordering::Relaxed),
             messages_handled: self.messages_handled.load(Ordering::Relaxed),
             messages_shed: self.messages_shed.load(Ordering::Relaxed),
-            messages_unrouted: self.messages_unrouted.load(Ordering::Relaxed),
             peers_absent: self.peers_absent.load(Ordering::Relaxed),
             rejoins_required: self.rejoins_required.load(Ordering::Relaxed),
             snapshot_pages: self.snapshot_pages.load(Ordering::Relaxed),
@@ -244,7 +234,6 @@ pub struct MetricsSnapshot {
     pub journal_flushes: u64,
     pub messages_handled: u64,
     pub messages_shed: u64,
-    pub messages_unrouted: u64,
     pub peers_absent: u64,
     pub rejoins_required: u64,
     pub snapshot_pages: u64,
@@ -264,7 +253,7 @@ impl MetricsSnapshot {
     /// source of truth for both [`to_prometheus`](Self::to_prometheus) and
     /// [`to_prometheus_labeled`](Self::to_prometheus_labeled); add a counter here and
     /// both renderings pick it up.
-    fn counters(&self) -> [(&'static str, &'static str, u64); 23] {
+    fn counters(&self) -> [(&'static str, &'static str, u64); 22] {
         [
             (
                 "accord_writes_committed_total",
@@ -315,11 +304,6 @@ impl MetricsSnapshot {
                 "accord_messages_shed_total",
                 "Outbound messages shed because a peer's queue was full.",
                 self.messages_shed,
-            ),
-            (
-                "accord_messages_unrouted_total",
-                "Inbound frames for a group with no registered inbox that were dropped.",
-                self.messages_unrouted,
             ),
             (
                 "accord_peers_absent_total",

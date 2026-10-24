@@ -325,6 +325,32 @@ async fn a_backlog_at_its_cap_is_a_transient_refusal() {
     assert!(err.to_string().contains("not taking writes right now"));
 }
 
+/// A retired node mints nothing more, so the executor over it refuses writes
+/// as a transient refusal — the node reopened over its journal takes them —
+/// and the typed `NodeClosed` cause is still there to downcast.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retired_node_is_a_transient_refusal() {
+    use evento_accord::NodeClosed;
+
+    let cluster = ExecCluster::start(1);
+    cluster.execs[0]
+        .write(vec![event("acc", 1, "Opened")])
+        .await
+        .unwrap();
+    cluster.execs[0].node().retire().await;
+    let err = cluster.execs[0]
+        .write(vec![event("acc", 2, "Deposited")])
+        .await
+        .expect_err("a retired node refuses the write");
+    match &err {
+        WriteError::Unavailable(cause) => assert!(
+            cause.is::<NodeClosed>(),
+            "the cause is the typed retire error: {cause:#}"
+        ),
+        other => panic!("expected Unavailable, got {other:?}"),
+    }
+}
+
 /// `ExecutorDataStore::version`/`snapshot` paginate the backend, so an aggregate with
 /// more than one page of events (> `SNAPSHOT_PAGE_SIZE`, 4096) is handled fully — not
 /// capped at a single page. Seeds the Fjall backend directly (bypassing consensus,
