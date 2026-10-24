@@ -375,7 +375,6 @@ async fn connection<R: Resolver>(
     } = session;
     let hello_ok = HelloOk {
         default_routing_key: executor.default_routing_key().map(str::to_owned),
-        tenant: executor.tenant().map(str::to_owned),
     };
     let frame = ServerFrame::Response {
         id: hello_id,
