@@ -620,7 +620,8 @@ backend (sql/fjall). Phases, in order:
   (`an_absent_peer_stops_holding_compaction_back`,
   `a_minority_never_drops_its_way_to_compaction`, `rejoin_bounds_survive_a_restart`).
   A rejoined node is counted again by its first report: the contact follows the
-  join header with `Message::JoinProof` — its own report, taken in the same cut as
+  join header with `Message::JoinProof` — its own report before the holds it keeps
+  for joiners (below), taken in the same cut as
   the exported commands — which the joiner, once every page is installed, counts as
   proven coverage (it now holds what the contact held below it; same shard and
   epoch only, never persisted). Without it the joiner's first report would precede
@@ -630,7 +631,12 @@ backend (sql/fjall). Phases, in order:
   `JoinKeepalive` the joiner sends every `collect_timeout` while its join runs,
   and lapsing a few page timeouts after the last), so no peer's compaction — and
   bound — passes the joiner's first report while pages cross the wire under a
-  write load or install on a slow disk. A node still joining ignores `Rejoin`,
+  write load or install on a slow disk. A hold says nothing of what the contact
+  holds, so its vouch ignores them: capped by the hold kept for a joiner's last
+  join, the vouch for its next could never rise above the last one, and a joiner
+  vouched for below a bound — by a contact that restarted and had not yet applied
+  or re-proven what it had compacted past — was told to rejoin again on every
+  rejoin (#349). A node still joining ignores `Rejoin`,
   sweeps nothing (a report it gossiped would end its contact's hold), and answers
   no anti-entropy and no read-barrier probe (its coverage and its conflict graph
   lack what the join is importing). Once joined, the coverage it hands an
@@ -642,6 +648,7 @@ backend (sql/fjall). Phases, in order:
   (`a_rejoined_peer_is_counted_again_in_a_group_of_four`/`_five`,
   `a_peer_rejoining_under_writes_is_counted_again`,
   `a_joiner_with_a_slow_disk_keeps_its_contact_holding`,
+  `a_rejoin_through_a_contact_that_vouched_too_low_is_counted_next_time`,
   `a_joined_node_vouches_for_no_more_than_its_join_proved`,
   `a_stale_replica_cannot_sync_its_way_back_in`).
   `applied_through` alone is not enough, though: a replica partitioned *during*
@@ -1086,6 +1093,16 @@ backend (sql/fjall). Phases, in order:
         for the acks too: of two recoveries racing, one heard nothing
         (`tests/stalled_recovery.rs`). Over 60 000 swarm seeds, those needing
         more than 20 `collect_timeout`s to serve again went from 30 to none.
+        A replica given up while absent could be told to rejoin on every
+        rejoin, for good (#349). Its contact had restarted: its sync coverage
+        re-proven through a peer still applying again an old transaction, or
+        its store failing what its journal replayed, it reported below its own
+        bound for the joiner, so it vouched that, and told the joiner to rejoin
+        once more. The hold it kept on its report for that join then capped
+        the vouch for every next one, as the vouch was the report, holds
+        included. A join header now vouches for the contact's report before
+        its holds (`Node::vouch_locked`). The two swarm seeds that stalled this
+        way are pinned (`a_replica_rejoining_through_a_restarted_contact_is_counted_in`).
         **Open** (confirmed or plausible, not yet fixed):
         an epoch change can remap a route's keys onto replicas that never
         witnessed an in-flight txn, which then answer "never witnessed"; the
