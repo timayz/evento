@@ -82,8 +82,10 @@ let client = evento::RemoteClient::connect("127.0.0.1:4321").await?;
   Pass it to `serve_with(listener, resolver)`. It runs again on every reconnect.
   To confine a client to its tenant over one shared store, serve
   `Session::new(store.clone()).tenant(tenant)?`: every request on the connection
-  acts in that tenant whatever it names, and `replicate` and the subscriber calls
-  are refused — a tenant's app keeps its subscriptions local (`Sidecar`).
+  acts in that tenant whatever it names, the events it reads come back in the
+  default tenant (the client sees a store of its own), and `replicate` and the
+  subscriber calls are refused — a tenant's app keeps its subscriptions local
+  (`Sidecar`).
 - **TLS:** `serve_tls(listener, acceptor, exec)` / `serve_tls_with(listener, acceptor, resolver)`
   take a `tokio_rustls::TlsAcceptor`; the client side is
   `.builder(addr).tls(connector, server_name)`. Plain TCP is for trusted networks —

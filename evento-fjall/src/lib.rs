@@ -72,10 +72,11 @@
 //!   `{0x00} + {cursor_key}` for events without a routing key) -> `()`
 //!
 //! A read of one tenant uses the keyspaces keyed by tenant; a read of every
-//! tenant uses `cursor_type`/`cursor_type_name` (a read of one aggregate in
-//! every tenant too, filtering on the id). Every loaded event is checked
-//! against the whole read filter, so a source only has to hold a superset of
-//! the matches, in cursor order.
+//! tenant uses `cursor_type`/`cursor_type_name`, except a read of one
+//! aggregate, which merges that aggregate's stream in each tenant holding one
+//! (found by a skip scan of `agg_index`, one seek per tenant). Every loaded
+//! event is checked against the whole read filter, so a source only has to
+//! hold a superset of the matches, in cursor order.
 //!
 //! Opening a database whose `index_version` predates this layout rebuilds the
 //! index keyspaces from `events` (one O(total events) pass, then never again)
@@ -851,50 +852,68 @@ impl Fjall {
     /// keyspaces without the tenant.
     fn cursor_sources(
         &self,
+        snapshot: &fjall::Snapshot,
         aggregators: &Option<Arc<[EventFilter]>>,
         routing_key: &Option<RoutingKey>,
         tenant: &TenantFilter,
-    ) -> Vec<(&Keyspace, Vec<u8>)> {
-        match (aggregators, routing_key) {
+    ) -> anyhow::Result<Vec<(&Keyspace, Vec<u8>)>> {
+        let sources = match (aggregators, routing_key) {
             (Some(aggs), _) => {
                 // Subscriptions emit one filter per handler, and those often
                 // collapse to one source (e.g. `by_type` once per handler):
                 // scan each distinct source once, not once per handler.
-                let mut sources: Vec<(&Keyspace, Vec<u8>)> = Vec::new();
-                for agg in aggs.iter() {
-                    let t = &agg.aggregate_type;
-                    let source = match (tenant, &agg.aggregate_id, &agg.name) {
-                        (TenantFilter::Only(tenant), Some(id), Some(name)) => (
-                            &self.cursor_agg_name,
-                            Self::agg_name_prefix(t, id, tenant, name),
-                        ),
-                        (TenantFilter::Only(tenant), Some(id), None) => {
-                            (&self.cursor_agg, Self::agg_prefix(t, id, tenant))
-                        }
-                        (TenantFilter::Only(tenant), None, Some(name)) => (
-                            &self.cursor_type_name_tenant,
-                            Self::type_tenant_name_prefix(t, tenant, name),
-                        ),
-                        (TenantFilter::Only(tenant), None, None) => (
-                            &self.cursor_type_tenant,
-                            Self::type_tenant_prefix(t, tenant),
-                        ),
-                        // Every tenant: the aggregate keyspaces are keyed by
-                        // tenant after the id, so a prefix of one aggregate
-                        // would not come out in cursor order — scan the type,
-                        // filtering on the id.
-                        (TenantFilter::All, _, Some(name)) => {
-                            (&self.cursor_type_name, Self::type_prefix(t, name))
-                        }
-                        (TenantFilter::All, _, None) => {
-                            (&self.cursor_type, Self::type_only_prefix(t))
-                        }
-                    };
+                fn add<'k>(
+                    sources: &mut Vec<(&'k Keyspace, Vec<u8>)>,
+                    source: (&'k Keyspace, Vec<u8>),
+                ) {
                     let seen = sources.iter().any(|(keyspace, prefix)| {
                         std::ptr::eq(*keyspace, source.0) && *prefix == source.1
                     });
                     if !seen {
                         sources.push(source);
+                    }
+                }
+                let mut sources: Vec<(&Keyspace, Vec<u8>)> = Vec::new();
+                for agg in aggs.iter() {
+                    let t = &agg.aggregate_type;
+                    match (tenant, &agg.aggregate_id, &agg.name) {
+                        (TenantFilter::Only(tenant), Some(id), name) => add(
+                            &mut sources,
+                            self.agg_source(t, id, tenant, name.as_deref()),
+                        ),
+                        (TenantFilter::Only(tenant), None, Some(name)) => add(
+                            &mut sources,
+                            (
+                                &self.cursor_type_name_tenant,
+                                Self::type_tenant_name_prefix(t, tenant, name),
+                            ),
+                        ),
+                        (TenantFilter::Only(tenant), None, None) => add(
+                            &mut sources,
+                            (
+                                &self.cursor_type_tenant,
+                                Self::type_tenant_prefix(t, tenant),
+                            ),
+                        ),
+                        // One aggregate in every tenant: its stream in each
+                        // tenant holding one. A prefix of the aggregate alone
+                        // would not come out in cursor order, the tenant
+                        // following the id in the key.
+                        (TenantFilter::All, Some(id), name) => {
+                            for tenant in self.stream_tenants(snapshot, t, id)? {
+                                add(
+                                    &mut sources,
+                                    self.agg_source(t, id, &tenant, name.as_deref()),
+                                );
+                            }
+                        }
+                        (TenantFilter::All, None, Some(name)) => add(
+                            &mut sources,
+                            (&self.cursor_type_name, Self::type_prefix(t, name)),
+                        ),
+                        (TenantFilter::All, None, None) => {
+                            add(&mut sources, (&self.cursor_type, Self::type_only_prefix(t)))
+                        }
                     }
                 }
                 sources
@@ -904,7 +923,73 @@ impl Fjall {
                 Self::routing_cursor_prefix(key.as_deref()),
             )],
             (None, Some(RoutingKey::All) | None) => vec![(&self.cursor_all, Vec::new())],
+        };
+        Ok(sources)
+    }
+
+    /// The cursor-index source of the stream `(tenant, type, id)`, or of its
+    /// events named `name`.
+    fn agg_source(
+        &self,
+        aggregate_type: &str,
+        aggregate_id: &str,
+        tenant: &str,
+        name: Option<&str>,
+    ) -> (&Keyspace, Vec<u8>) {
+        match name {
+            Some(name) => (
+                &self.cursor_agg_name,
+                Self::agg_name_prefix(aggregate_type, aggregate_id, tenant, name),
+            ),
+            None => (
+                &self.cursor_agg,
+                Self::agg_prefix(aggregate_type, aggregate_id, tenant),
+            ),
         }
+    }
+
+    /// The tenants holding a stream of aggregate `(type, id)` in `snapshot`:
+    /// a skip scan of `agg_index`, one seek per tenant — its keys are
+    /// `enc(type, id, tenant)` followed by a 2-byte version.
+    fn stream_tenants(
+        &self,
+        snapshot: &fjall::Snapshot,
+        aggregate_type: &str,
+        aggregate_id: &str,
+    ) -> anyhow::Result<Vec<String>> {
+        use fjall::Readable;
+        use std::ops::Bound;
+
+        let prefix = Self::encode_components(&[aggregate_type.as_bytes(), aggregate_id.as_bytes()]);
+        let mut tenants = Vec::new();
+        let mut lower = Bound::Included(prefix.clone());
+        loop {
+            let Some(guard) = snapshot
+                .range(&self.agg_index, (lower, Bound::Unbounded))
+                .next()
+            else {
+                break;
+            };
+            let (key, _) = guard.into_inner()?;
+            let Some(rest) = key.as_ref().strip_prefix(prefix.as_slice()) else {
+                break;
+            };
+            let len_bytes: [u8; 4] = rest
+                .get(..4)
+                .and_then(|b| b.try_into().ok())
+                .ok_or_else(|| anyhow::anyhow!("corrupt aggregate index key"))?;
+            let len = u32::from_be_bytes(len_bytes) as usize;
+            let tenant = rest
+                .get(4..4 + len)
+                .ok_or_else(|| anyhow::anyhow!("corrupt aggregate index key"))?;
+            let tenant = String::from_utf8(tenant.to_vec())?;
+            // Past every version of this tenant's stream.
+            let mut past = Self::agg_prefix(aggregate_type, aggregate_id, &tenant);
+            past.extend_from_slice(&[0xFF; 2]);
+            lower = Bound::Excluded(past);
+            tenants.push(tenant);
+        }
+        Ok(tenants)
     }
 
     /// Whether `event` passes the whole read filter: its tenant, its routing
@@ -944,6 +1029,11 @@ impl Fjall {
     /// filter's range past the cursor, take `limit + 1` matches, merge. Cost is
     /// O(sources × limit) key steps plus one point-get per returned event —
     /// never a whole-prefix scan.
+    ///
+    /// Every source is read from one snapshot. Writes commit in stamp order,
+    /// so the snapshot holds a prefix of the cursor order, and a page never
+    /// holds an event while missing an earlier one of another source — which
+    /// a subscription's cursor would then pass for good.
     fn read_indexed(
         &self,
         aggregators: Option<Arc<[EventFilter]>>,
@@ -952,6 +1042,7 @@ impl Fjall {
         args: Args,
         to_micros: Option<u64>,
     ) -> anyhow::Result<ReadResult<Event>> {
+        use fjall::Readable;
         use std::collections::HashSet;
         use std::ops::Bound;
 
@@ -997,7 +1088,8 @@ impl Fjall {
             None => None,
         };
 
-        let sources = self.cursor_sources(&aggregators, &routing_key, &tenant);
+        let snapshot = self.db.snapshot();
+        let sources = self.cursor_sources(&snapshot, &aggregators, &routing_key, &tenant)?;
 
         let mut picked: HashSet<Ulid> = HashSet::new();
         let mut rejected: HashSet<Ulid> = HashSet::new();
@@ -1028,7 +1120,7 @@ impl Fjall {
                 )
             };
 
-            let mut range = keyspace.range((lower, upper));
+            let mut range = snapshot.range(keyspace, (lower, upper));
             let mut matches = 0usize;
             loop {
                 let guard = if backward {
@@ -1298,9 +1390,14 @@ impl Executor for Fjall {
         // tenants last wrote. The newest match of each source instead.
         let executor = self.clone();
         tokio::task::spawn_blocking(move || {
+            use fjall::Readable;
+
+            let snapshot = executor.db.snapshot();
             let mut latest = 0;
-            for (keyspace, prefix) in executor.cursor_sources(&aggregators, &routing_key, &tenant) {
-                for guard in keyspace.prefix(&prefix).rev() {
+            for (keyspace, prefix) in
+                executor.cursor_sources(&snapshot, &aggregators, &routing_key, &tenant)?
+            {
+                for guard in snapshot.prefix(keyspace, &prefix).rev() {
                     let (key, _) = guard.into_inner()?;
                     let key = key.as_ref();
                     let ulid_bytes: [u8; 16] = key[key.len() - 16..].try_into()?;
@@ -2356,6 +2453,103 @@ mod tests {
                 .unwrap();
             assert_eq!(backward.edges.len(), expect, "backward, bound {bound:?}");
         }
+    }
+
+    /// A read of one aggregate in every tenant merges that aggregate's stream
+    /// in each tenant holding one — in cursor order, page after page, backward
+    /// and by event name — and reads nothing of the other aggregates.
+    #[tokio::test]
+    async fn test_one_aggregate_read_in_every_tenant_merges_its_streams() {
+        let executor = Fjall::temporary().unwrap();
+        // "acc" in three tenants (one with a NUL byte), interleaved by stamp;
+        // "other" shares the type and two of the tenants.
+        for (agg, tenant, version, stamp, name) in [
+            ("acc", "b", 1, 10, "Opened"),
+            ("acc", "", 1, 20, "Opened"),
+            ("other", "b", 1, 25, "Opened"),
+            ("acc", "a\0x", 1, 30, "Opened"),
+            ("acc", "b", 2, 40, "Deposited"),
+            ("other", "", 1, 45, "Opened"),
+            ("acc", "", 2, 50, "Deposited"),
+            ("acc", "a\0x", 2, 60, "Deposited"),
+        ] {
+            let mut event = stamped_event(agg, version, stamp, 0, None);
+            event.tenant = tenant.to_owned();
+            event.name = name.to_owned();
+            executor.replicate(vec![event]).await.unwrap();
+        }
+        let read = |id: &str, name: Option<&str>, args: Args| {
+            let filter = match name {
+                Some(name) => EventFilter::exact_raw("test/Account", id, name),
+                None => EventFilter::by_id_raw("test/Account", id),
+            };
+            executor.read(Some([filter].into()), None, TenantFilter::All, args, None)
+        };
+        let seen = |page: &ReadResult<Event>| {
+            page.edges
+                .iter()
+                .map(|e| {
+                    assert_eq!(e.node.aggregate_id, "acc");
+                    (e.node.timestamp, e.node.tenant.clone())
+                })
+                .collect::<Vec<_>>()
+        };
+        let all = [
+            (10, "b".to_owned()),
+            (20, String::new()),
+            (30, "a\0x".to_owned()),
+            (40, "b".to_owned()),
+            (50, String::new()),
+            (60, "a\0x".to_owned()),
+        ];
+
+        let mut forward = Vec::new();
+        let mut after = None;
+        loop {
+            let page = read("acc", None, Args::forward(2, after)).await.unwrap();
+            forward.extend(seen(&page));
+            if !page.page_info.has_next_page {
+                break;
+            }
+            after = page.page_info.end_cursor;
+        }
+        assert_eq!(forward, all);
+
+        let mut backward = seen(&read("acc", None, Args::backward(4, None)).await.unwrap());
+        backward.sort();
+        let mut newest = all[2..].to_vec();
+        newest.sort();
+        assert_eq!(backward, newest);
+
+        let deposits = read("acc", Some("Deposited"), Args::forward(10, None))
+            .await
+            .unwrap();
+        assert_eq!(seen(&deposits), all[3..]);
+
+        assert!(read("missing", None, Args::forward(10, None))
+            .await
+            .unwrap()
+            .edges
+            .is_empty());
+
+        // Served off the aggregate's stream in each tenant, not a type scan.
+        let filters = Some([EventFilter::by_id_raw("test/Account", "acc")].into());
+        let snapshot = executor.db.snapshot();
+        let mut sources = executor
+            .cursor_sources(&snapshot, &filters, &None, &TenantFilter::All)
+            .unwrap()
+            .into_iter()
+            .map(|(keyspace, prefix)| {
+                assert!(std::ptr::eq(keyspace, &executor.cursor_agg));
+                prefix
+            })
+            .collect::<Vec<_>>();
+        sources.sort();
+        let mut streams = ["", "a\0x", "b"]
+            .map(|tenant| Fjall::agg_prefix("test/Account", "acc", tenant))
+            .to_vec();
+        streams.sort();
+        assert_eq!(sources, streams);
     }
 
     /// Routing-only reads: the null range (`0x00` discriminator) pages
