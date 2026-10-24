@@ -29,7 +29,7 @@ fn event(aggregate_id: &str, version: u16) -> Event {
 
 async fn await_version(store: &InMemoryDataStore, agg: &str, want: u16) {
     for _ in 0..1000 {
-        if store.version("test/Account", agg).await.unwrap_or(0) >= want {
+        if store.version("", "test/Account", agg).await.unwrap_or(0) >= want {
             return;
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -93,7 +93,10 @@ async fn a_node_restarts_from_its_journal() {
     // Rebuild from the journal before serving.
     restarted.recover_state().await.unwrap();
     assert_eq!(
-        fresh_store.version("test/Account", "acc").await.unwrap(),
+        fresh_store
+            .version("", "test/Account", "acc")
+            .await
+            .unwrap(),
         3,
         "the restarted node rebuilt its data from the journal"
     );
@@ -141,7 +144,7 @@ async fn a_node_restarts_while_writes_are_in_flight() {
     let writer = tokio::spawn(async move {
         for _ in 0..30 {
             let v = writer_store
-                .version("test/Account", "acc")
+                .version("", "test/Account", "acc")
                 .await
                 .unwrap_or(0)
                 + 1;
@@ -177,9 +180,9 @@ async fn a_node_restarts_while_writes_are_in_flight() {
     // After the dust settles, all three nodes converge on the same final version
     // (recovery + anti-entropy bring the restarted node fully up to date).
     for _ in 0..1000 {
-        let v0 = stores[0].version("test/Account", "acc").await.unwrap();
-        let v1 = stores[1].version("test/Account", "acc").await.unwrap();
-        let v2 = stores[2].version("test/Account", "acc").await.unwrap();
+        let v0 = stores[0].version("", "test/Account", "acc").await.unwrap();
+        let v1 = stores[1].version("", "test/Account", "acc").await.unwrap();
+        let v2 = stores[2].version("", "test/Account", "acc").await.unwrap();
         if v0 == v1 && v1 == v2 && v0 > 0 {
             return;
         }
@@ -192,7 +195,7 @@ async fn a_node_restarts_while_writes_are_in_flight() {
 async fn futures_versions(stores: &[Arc<InMemoryDataStore>]) -> Vec<u16> {
     let mut out = Vec::new();
     for s in stores {
-        out.push(s.version("test/Account", "acc").await.unwrap_or(0));
+        out.push(s.version("", "test/Account", "acc").await.unwrap_or(0));
     }
     out
 }
@@ -288,7 +291,7 @@ async fn a_node_restarts_after_compaction() {
     // Rebuilt from the durable store + persisted watermark: state intact, no stale
     // consensus commands replayed (the journal was truncated).
     assert_eq!(
-        stores[1].version("test/Account", "acc").await.unwrap(),
+        stores[1].version("", "test/Account", "acc").await.unwrap(),
         3,
         "the durable store retained the compacted state"
     );
@@ -485,5 +488,5 @@ async fn a_retired_node_refuses_to_write_and_the_reopened_one_writes_on() {
     let (reopened, _task) = open(net.register(id));
     reopened.recover_state().await.unwrap();
     reopened.write(vec![event("acc", 2)]).await.unwrap();
-    assert_eq!(store.version("test/Account", "acc").await.unwrap(), 2);
+    assert_eq!(store.version("", "test/Account", "acc").await.unwrap(), 2);
 }

@@ -134,11 +134,18 @@ impl FaultStore {
 
 #[async_trait]
 impl DataStore for FaultStore {
-    async fn version(&self, aggregate_type: &str, aggregate_id: &str) -> anyhow::Result<u16> {
+    async fn version(
+        &self,
+        tenant: &str,
+        aggregate_type: &str,
+        aggregate_id: &str,
+    ) -> anyhow::Result<u16> {
         if self.version_failing.load(Ordering::SeqCst) {
             anyhow::bail!("simulated read failure");
         }
-        self.inner.version(aggregate_type, aggregate_id).await
+        self.inner
+            .version(tenant, aggregate_type, aggregate_id)
+            .await
     }
 
     async fn apply(
@@ -176,6 +183,7 @@ impl DataStore for FaultStore {
         &self,
         aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<RoutingKey>,
+        tenant: evento_core::TenantFilter,
         args: Args,
         to_micros: Option<u64>,
     ) -> anyhow::Result<ReadResult<Event>> {
@@ -183,7 +191,7 @@ impl DataStore for FaultStore {
             anyhow::bail!("simulated query failure");
         }
         self.inner
-            .read(aggregators, routing_key, args, to_micros)
+            .read(aggregators, routing_key, tenant, args, to_micros)
             .await
     }
 

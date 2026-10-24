@@ -13,6 +13,14 @@
 //! (it is `Clone`/`Arc`-backed) between the two so a node's writes are visible to
 //! its reads.
 //!
+//! ## Tenants
+//!
+//! A stream is `(tenant, type, id)`, and a key lives in its tenant
+//! ([`Key::in_tenant`]): the same aggregate id in two tenants is two keys, so
+//! their writes never conflict. Scope a tenant by wrapping the executor —
+//! `Evento::new(accord).tenant(t)` — never the local backend, which applies and
+//! serves every tenant's events.
+//!
 //! ## Scope
 //!
 //! This targets a **single-shard** cluster (every node replicates everything),
@@ -46,8 +54,9 @@ const HOLDS_PAGE_SIZE: u16 = 64;
 /// The single key a read targets, if it can be pinned to one shard: an explicit
 /// routing key, or a query for one aggregate by id — however many filters spell
 /// it out (a projection load issues one filter per handled event type, all for
-/// the same id). Broad scans (several aggregate ids, or by event type alone)
-/// return `None` and are served locally.
+/// the same id) — in the one tenant it reads ([`Key::in_tenant`]). Broad scans
+/// (several aggregate ids, by event type alone, or every tenant) return `None`
+/// and are served locally.
 ///
 /// **Caveat:** the write side derives the shard key from `routing_key` falling
 /// back to the aggregate id ([`Key::of`]). A by-id pin is therefore only
@@ -58,21 +67,30 @@ const HOLDS_PAGE_SIZE: u16 = 64;
 fn target_key(
     aggregators: &Option<Arc<[EventFilter]>>,
     routing_key: &Option<RoutingKey>,
+    tenant: &TenantFilter,
 ) -> Option<Key> {
+    // A key belongs to one tenant: a read of every tenant spans many.
+    let TenantFilter::Only(tenant) = tenant else {
+        return None;
+    };
     if let Some(RoutingKey::Value(Some(key))) = routing_key {
-        return Some(Key(key.clone()));
+        return Some(Key::in_tenant(tenant, key));
     }
     let filters = aggregators.as_deref()?;
     let (first, rest) = filters.split_first()?;
     let id = first.aggregate_id.as_deref()?;
     rest.iter()
         .all(|f| f.aggregate_id.as_deref() == Some(id))
-        .then(|| Key(id.to_owned()))
+        .then(|| Key::in_tenant(tenant, id))
 }
 
 #[cfg(test)]
 mod target_key_tests {
     use super::*;
+
+    fn default_tenant() -> TenantFilter {
+        TenantFilter::Only(String::new())
+    }
 
     fn filter(id: Option<&str>, name: Option<&str>) -> EventFilter {
         EventFilter {
@@ -85,29 +103,35 @@ mod target_key_tests {
     #[test]
     fn pins_one_aggregate_however_many_filters_name_it() {
         let one: Arc<[EventFilter]> = Arc::from(vec![filter(Some("a"), None)]);
-        assert_eq!(target_key(&Some(one), &None), Some(Key("a".into())));
+        assert_eq!(
+            target_key(&Some(one), &None, &default_tenant()),
+            Some(Key("a".into()))
+        );
         // A projection load: one filter per handled event, same id.
         let many: Arc<[EventFilter]> = Arc::from(vec![
             filter(Some("a"), Some("Opened")),
             filter(Some("a"), Some("Deposited")),
             filter(Some("a"), None),
         ]);
-        assert_eq!(target_key(&Some(many), &None), Some(Key("a".into())));
+        assert_eq!(
+            target_key(&Some(many), &None, &default_tenant()),
+            Some(Key("a".into()))
+        );
     }
 
     #[test]
     fn broad_scans_are_not_pinned() {
         let by_type: Arc<[EventFilter]> = Arc::from(vec![filter(None, Some("Opened"))]);
-        assert_eq!(target_key(&Some(by_type), &None), None);
+        assert_eq!(target_key(&Some(by_type), &None, &default_tenant()), None);
         let two_ids: Arc<[EventFilter]> =
             Arc::from(vec![filter(Some("a"), None), filter(Some("b"), None)]);
-        assert_eq!(target_key(&Some(two_ids), &None), None);
+        assert_eq!(target_key(&Some(two_ids), &None, &default_tenant()), None);
         let mixed: Arc<[EventFilter]> =
             Arc::from(vec![filter(Some("a"), None), filter(None, Some("Opened"))]);
-        assert_eq!(target_key(&Some(mixed), &None), None);
+        assert_eq!(target_key(&Some(mixed), &None, &default_tenant()), None);
         let empty: Arc<[EventFilter]> = Arc::from(Vec::<EventFilter>::new());
-        assert_eq!(target_key(&Some(empty), &None), None);
-        assert_eq!(target_key(&None, &None), None);
+        assert_eq!(target_key(&Some(empty), &None, &default_tenant()), None);
+        assert_eq!(target_key(&None, &None, &default_tenant()), None);
     }
 
     #[test]
@@ -117,9 +141,34 @@ mod target_key_tests {
         assert_eq!(
             target_key(
                 &Some(two_ids),
-                &Some(RoutingKey::Value(Some("tenant".into())))
+                &Some(RoutingKey::Value(Some("region".into()))),
+                &default_tenant(),
             ),
-            Some(Key("tenant".into()))
+            Some(Key("region".into()))
+        );
+    }
+
+    /// A read of one tenant pins the key in that tenant, as the write side
+    /// derives it; a read of every tenant spans many keys and is not pinned.
+    #[test]
+    fn a_tenant_read_pins_the_key_in_its_tenant() {
+        let one: Arc<[EventFilter]> = Arc::from(vec![filter(Some("a"), None)]);
+        let acme = TenantFilter::Only("acme".to_owned());
+        let pinned = target_key(&Some(one.clone()), &None, &acme);
+        let written = Key::of(&Event {
+            aggregate_id: "a".into(),
+            tenant: "acme".into(),
+            ..Default::default()
+        });
+        assert_eq!(pinned, Some(written.clone()));
+        assert_ne!(
+            Some(written),
+            target_key(&Some(one.clone()), &None, &default_tenant())
+        );
+        assert_eq!(target_key(&Some(one), &None, &TenantFilter::All), None);
+        assert_eq!(
+            target_key(&None, &Some(RoutingKey::Value(Some("r".into()))), &acme),
+            Some(Key::in_tenant("acme", "r"))
         );
     }
 }
@@ -135,14 +184,29 @@ pub struct ExecutorDataStore<E: Executor> {
 
 impl<E: Executor> ExecutorDataStore<E> {
     /// Wraps a local evento backend as an Accord data store.
+    ///
+    /// # Panics
+    ///
+    /// If `local` is scoped to a tenant ([`Executor::tenant`]): a replica
+    /// applies every tenant's events, and a joiner copies them all. Scope the
+    /// [`AccordExecutor`] instead (`Evento::new(executor).tenant(t)`).
     pub fn new(local: E) -> Self {
+        assert!(
+            local.tenant().is_none(),
+            "an Accord data store must not be scoped to a tenant"
+        );
         Self { local }
     }
 }
 
 #[async_trait]
 impl<E: Executor> DataStore for ExecutorDataStore<E> {
-    async fn version(&self, aggregate_type: &str, aggregate_id: &str) -> anyhow::Result<u16> {
+    async fn version(
+        &self,
+        tenant: &str,
+        aggregate_type: &str,
+        aggregate_id: &str,
+    ) -> anyhow::Result<u16> {
         // The aggregate's current version is the highest among its events —
         // an indexed lookup on every backend (`MAX(version)` on SQL, a
         // reverse index seek on fjall) instead of paging the whole stream.
@@ -150,7 +214,7 @@ impl<E: Executor> DataStore for ExecutorDataStore<E> {
         // override, so correctness never depends on the fast path.
         self.local
             .latest_version(
-                String::new(),
+                tenant.to_owned(),
                 aggregate_type.to_owned(),
                 aggregate_id.to_owned(),
             )
@@ -242,14 +306,12 @@ impl<E: Executor> DataStore for ExecutorDataStore<E> {
         &self,
         aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<RoutingKey>,
+        tenant: TenantFilter,
         args: Args,
         to_micros: Option<u64>,
     ) -> anyhow::Result<ReadResult<Event>> {
-        // Every tenant: the requester narrowed the query itself (a tenant's
-        // read is refused before it gets here until replicas tell tenants
-        // apart).
         self.local
-            .read(aggregators, routing_key, TenantFilter::All, args, to_micros)
+            .read(aggregators, routing_key, tenant, args, to_micros)
             .await
     }
 
@@ -342,25 +404,6 @@ impl<E: Executor + Clone> AccordExecutor<E> {
     }
 }
 
-/// Refuses a tenant other than the default one: replicas do not yet tell
-/// tenants apart (their version check and conflict key would mix two
-/// tenants' streams), so a tenant's call is refused rather than served wrong.
-fn default_tenant_only(tenant: &str) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        tenant.is_empty(),
-        "evento-accord does not support tenants yet (tenant {tenant:?})"
-    );
-    Ok(())
-}
-
-/// [`default_tenant_only`] for a scan: every tenant, or the default one.
-fn default_tenant_filter_only(tenant: &TenantFilter) -> anyhow::Result<()> {
-    match tenant {
-        TenantFilter::All => Ok(()),
-        TenantFilter::Only(tenant) => default_tenant_only(tenant),
-    }
-}
-
 #[async_trait]
 impl<E: Executor + Clone> Executor for AccordExecutor<E> {
     fn default_routing_key(&self) -> Option<&str> {
@@ -370,11 +413,6 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
     async fn write(&self, events: Vec<Event>) -> Result<(), WriteError> {
         if events.is_empty() {
             return Err(WriteError::MissingData);
-        }
-        if let Some(event) = events.iter().find(|e| !e.tenant.is_empty()) {
-            return Err(WriteError::Unknown(
-                default_tenant_only(&event.tenant).unwrap_err(),
-            ));
         }
         // A refusal that clears on its own (the backlog cap, a rejoin in
         // progress, a node retired until its host reopens it) is `Unavailable`,
@@ -420,11 +458,10 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
         args: Args,
         to_micros: Option<u64>,
     ) -> anyhow::Result<ReadResult<Event>> {
-        default_tenant_filter_only(&tenant)?;
         // A single-shard read for a key this node does not own is forwarded to an
         // owner. Everything else (owned keys, and broad scans that can't be pinned
         // to one shard) is served from the local backend.
-        if let Some(key) = target_key(&aggregators, &routing_key) {
+        if let Some(key) = target_key(&aggregators, &routing_key, &tenant) {
             if self.node.owns_key(&key) {
                 // Linearizable reads: fence the local backend with a read barrier
                 // (a read-only consensus round) so it reflects every write that
@@ -438,7 +475,7 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
                 // linearized — the owner would need to barrier before serving.
                 return self
                     .node
-                    .forward_read(owner, aggregators, routing_key, args, to_micros)
+                    .forward_read(owner, aggregators, routing_key, tenant, args, to_micros)
                     .await;
             }
         }
@@ -453,7 +490,6 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
         routing_key: Option<RoutingKey>,
         tenant: TenantFilter,
     ) -> anyhow::Result<u64> {
-        default_tenant_filter_only(&tenant)?;
         self.local
             .latest_timestamp(aggregators, routing_key, tenant)
             .await
@@ -464,7 +500,6 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
         tenant: String,
         key: String,
     ) -> anyhow::Result<Option<Value>> {
-        default_tenant_only(&tenant)?;
         self.local.get_subscriber_cursor(tenant, key).await
     }
 
@@ -474,7 +509,6 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
         key: String,
         worker_id: Ulid,
     ) -> anyhow::Result<bool> {
-        default_tenant_only(&tenant)?;
         self.local
             .is_subscriber_running(tenant, key, worker_id)
             .await
@@ -488,7 +522,6 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
         key: String,
         worker_id: Ulid,
     ) -> anyhow::Result<evento_core::SubscriberStatus> {
-        default_tenant_only(&tenant)?;
         self.local.subscriber_status(tenant, key, worker_id).await
     }
 
@@ -498,7 +531,6 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
         aggregate_type: String,
         aggregate_id: String,
     ) -> anyhow::Result<u16> {
-        default_tenant_only(&tenant)?;
         self.local
             .latest_version(tenant, aggregate_type, aggregate_id)
             .await
@@ -510,7 +542,6 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
         aggregate_type: String,
         aggregate_id: String,
     ) -> anyhow::Result<Option<Option<String>>> {
-        default_tenant_only(&tenant)?;
         self.local
             .stream_routing_key(tenant, aggregate_type, aggregate_id)
             .await
@@ -522,7 +553,6 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
         key: String,
         worker_id: Ulid,
     ) -> anyhow::Result<()> {
-        default_tenant_only(&tenant)?;
         self.local.upsert_subscriber(tenant, key, worker_id).await
     }
 
@@ -534,7 +564,6 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
         cursor: Value,
         lag: u64,
     ) -> anyhow::Result<bool> {
-        default_tenant_only(&tenant)?;
         self.local
             .acknowledge(tenant, key, worker_id, cursor, lag)
             .await
@@ -548,7 +577,6 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
         aggregator_revision: String,
         id: String,
     ) -> anyhow::Result<Option<(Vec<u8>, Value)>> {
-        default_tenant_only(&tenant)?;
         self.local
             .get_snapshot(tenant, aggregate_type, projection, aggregator_revision, id)
             .await
@@ -564,7 +592,6 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
         data: Vec<u8>,
         cursor: Value,
     ) -> anyhow::Result<()> {
-        default_tenant_only(&tenant)?;
         self.local
             .save_snapshot(
                 tenant,
@@ -585,7 +612,6 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
         projection: String,
         id: String,
     ) -> anyhow::Result<()> {
-        default_tenant_only(&tenant)?;
         self.local
             .delete_snapshot(tenant, aggregate_type, projection, id)
             .await

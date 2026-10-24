@@ -74,7 +74,7 @@ impl ExecCluster {
             .read(
                 Some([EventFilter::by_id_raw("test/Account", id)].into()),
                 None,
-                evento_core::TenantFilter::All,
+                evento_core::TenantFilter::Only(String::new()),
                 Args::forward(50, None),
                 None,
             )
@@ -352,6 +352,72 @@ async fn a_retired_node_is_a_transient_refusal() {
     }
 }
 
+/// The same aggregate id in two tenants is two streams through Accord too:
+/// both open at version 1 — concurrently, on two coordinators — and each
+/// keeps its own versions and conflicts, on every replica.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_tenants_write_one_aggregate_id_independently() {
+    use evento_core::{Evento, TenantFilter};
+
+    let cluster = ExecCluster::start(3);
+    let scoped = |node: usize, tenant: &str| {
+        Evento::new(cluster.execs[node].clone())
+            .tenant(tenant)
+            .unwrap()
+    };
+    let (a0, b1) = (scoped(0, "a"), scoped(1, "b"));
+
+    let (in_a, in_b) = tokio::join!(
+        a0.write(vec![event("acc", 1, "Opened")]),
+        b1.write(vec![event("acc", 1, "Opened")]),
+    );
+    in_a.expect("a's stream opens");
+    in_b.expect("b's stream opens, on the same id");
+    scoped(2, "a")
+        .write(vec![event("acc", 2, "Deposited")])
+        .await
+        .expect("a's stream extends through another coordinator");
+    // b's stream is at version 1, whatever a's holds: its version 2 commits,
+    // and a second version 1 conflicts.
+    b1.write(vec![event("acc", 2, "Deposited")])
+        .await
+        .expect("b's own version 2");
+    assert!(matches!(
+        b1.write(vec![event("acc", 1, "Opened")]).await,
+        Err(WriteError::InvalidOriginalVersion)
+    ));
+
+    for node in 0..3 {
+        for (tenant, versions) in [("a", vec![1, 2]), ("b", vec![1, 2])] {
+            let mut seen = Vec::new();
+            for _ in 0..200 {
+                seen = scoped(node, tenant)
+                    .read(
+                        Some([EventFilter::by_id_raw("test/Account", "acc")].into()),
+                        None,
+                        TenantFilter::All,
+                        Args::forward(10, None),
+                        None,
+                    )
+                    .await
+                    .unwrap()
+                    .edges
+                    .into_iter()
+                    .map(|edge| {
+                        assert_eq!(edge.node.tenant, tenant);
+                        edge.node.version
+                    })
+                    .collect::<Vec<_>>();
+                if seen == versions {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            assert_eq!(seen, versions, "node {node}, tenant {tenant}");
+        }
+    }
+}
+
 /// `ExecutorDataStore::version`/`snapshot` paginate the backend, so an aggregate with
 /// more than one page of events (> `SNAPSHOT_PAGE_SIZE`, 4096) is handled fully — not
 /// capped at a single page. Seeds the Fjall backend directly (bypassing consensus,
@@ -368,7 +434,7 @@ async fn data_store_paginates_beyond_one_page() {
     let store = ExecutorDataStore::new(fjall);
 
     // `version` must return the true max, which lives past the first page boundary.
-    let version = store.version("test/Account", "big").await.unwrap();
+    let version = store.version("", "test/Account", "big").await.unwrap();
     assert_eq!(version, count);
 
     // `snapshot` must return every event across all pages.
@@ -496,7 +562,7 @@ async fn a_version_conflict_is_a_duplicate_only_if_the_events_are_stored() {
         "an apply across a gap is refused, not taken for present"
     );
     assert!(!store.holds(std::slice::from_ref(&v4)).await.unwrap());
-    assert_eq!(store.version("test/Account", "acc").await.unwrap(), 2);
+    assert_eq!(store.version("", "test/Account", "acc").await.unwrap(), 2);
 
     apply(3, &v3).await.unwrap();
     apply(4, &v4).await.expect("the gap filled, it applies");

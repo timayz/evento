@@ -115,7 +115,7 @@ fn build(
 
 async fn await_version(store: &InMemoryDataStore, agg: &str, want: u16) {
     for _ in 0..500 {
-        if store.version("test/Account", agg).await.unwrap_or(0) >= want {
+        if store.version("", "test/Account", agg).await.unwrap_or(0) >= want {
             return;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;

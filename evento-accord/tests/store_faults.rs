@@ -206,7 +206,14 @@ async fn a_forwarded_read_the_store_failed_is_an_error() {
     cluster.stores[1].read_failing.store(true, Ordering::SeqCst);
 
     let result = cluster.nodes[0]
-        .forward_read(NodeId(1), None, None, Args::forward(10, None), None)
+        .forward_read(
+            NodeId(1),
+            None,
+            None,
+            evento_core::TenantFilter::All,
+            Args::forward(10, None),
+            None,
+        )
         .await;
     let err = result.expect_err("a failed read came back as a page");
     // The owner's own failure, not a timeout.
@@ -219,7 +226,14 @@ async fn a_forwarded_read_the_store_failed_is_an_error() {
         .read_failing
         .store(false, Ordering::SeqCst);
     cluster.nodes[0]
-        .forward_read(NodeId(1), None, None, Args::forward(10, None), None)
+        .forward_read(
+            NodeId(1),
+            None,
+            None,
+            evento_core::TenantFilter::All,
+            Args::forward(10, None),
+            None,
+        )
         .await
         .expect("a healthy owner serves the read");
 }
@@ -243,7 +257,14 @@ async fn a_requester_that_cannot_decode_the_failure_still_fails_the_read() {
     cluster.stores[1].read_failing.store(true, Ordering::SeqCst);
 
     let result = cluster.nodes[0]
-        .forward_read(NodeId(1), None, None, Args::forward(10, None), None)
+        .forward_read(
+            NodeId(1),
+            None,
+            None,
+            evento_core::TenantFilter::All,
+            Args::forward(10, None),
+            None,
+        )
         .await;
     assert!(
         result.is_err(),

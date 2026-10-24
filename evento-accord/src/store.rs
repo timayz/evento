@@ -1,8 +1,8 @@
 //! In-memory [`DataStore`] and [`Journal`] for tests and the simulation harness.
 //!
 //! The data store mirrors evento's optimistic-concurrency rule — a unique
-//! constraint on `(aggregate_type, aggregate_id, version)` — by rejecting an
-//! append whose version is already taken for that aggregate. Because the node
+//! constraint on `(tenant, aggregate_type, aggregate_id, version)` — by
+//! rejecting an append whose version is already taken for that stream. Because the node
 //! applies committed transactions strictly in execution-timestamp order, two
 //! racing same-version appends deterministically resolve to one winner.
 
@@ -30,12 +30,12 @@ pub struct AppliedEntry {
 
 #[derive(Default)]
 struct StoreState {
-    /// Highest version appended per `(aggregate_type, aggregate_id)`.
-    versions: HashMap<(String, String), u16>,
-    /// The event that committed each `(type, id, version)` — for the simulation's
-    /// split-brain oracle (no two distinct events at one version) and to serve the
-    /// bootstrap [`snapshot`](DataStore::snapshot).
-    committed: HashMap<(String, String, u16), Event>,
+    /// Highest version appended per `(tenant, aggregate_type, aggregate_id)`.
+    versions: HashMap<(String, String, String), u16>,
+    /// The event that committed each `(tenant, type, id, version)` — for the
+    /// simulation's split-brain oracle (no two distinct events at one version)
+    /// and to serve the bootstrap [`snapshot`](DataStore::snapshot).
+    committed: HashMap<(String, String, String, u16), Event>,
     /// Applied transactions, in the order this replica executed them.
     log: Vec<AppliedEntry>,
 }
@@ -58,9 +58,9 @@ impl InMemoryDataStore {
         self.state.lock().expect("store poisoned").log.clone()
     }
 
-    /// Every `(type, id, version)` committed here and the id of the event that did
-    /// it.
-    pub fn committed_events(&self) -> Vec<((String, String, u16), ulid::Ulid)> {
+    /// Every `(tenant, type, id, version)` committed here and the id of the
+    /// event that did it.
+    pub fn committed_events(&self) -> Vec<((String, String, String, u16), ulid::Ulid)> {
         self.state
             .lock()
             .expect("store poisoned")
@@ -73,11 +73,20 @@ impl InMemoryDataStore {
 
 #[async_trait]
 impl DataStore for InMemoryDataStore {
-    async fn version(&self, aggregate_type: &str, aggregate_id: &str) -> anyhow::Result<u16> {
+    async fn version(
+        &self,
+        tenant: &str,
+        aggregate_type: &str,
+        aggregate_id: &str,
+    ) -> anyhow::Result<u16> {
         let state = self.state.lock().expect("store poisoned");
         Ok(state
             .versions
-            .get(&(aggregate_type.to_owned(), aggregate_id.to_owned()))
+            .get(&(
+                tenant.to_owned(),
+                aggregate_type.to_owned(),
+                aggregate_id.to_owned(),
+            ))
             .copied()
             .unwrap_or(0))
     }
@@ -102,6 +111,7 @@ impl DataStore for InMemoryDataStore {
             // a taken version is refused — before anything is applied.
             for event in &events {
                 let at = (
+                    event.tenant.clone(),
                     event.aggregate_type.clone(),
                     event.aggregate_id.clone(),
                     event.version,
@@ -119,12 +129,16 @@ impl DataStore for InMemoryDataStore {
                 }
             }
             for event in &events {
-                let key = (event.aggregate_type.clone(), event.aggregate_id.clone());
+                let key = (
+                    event.tenant.clone(),
+                    event.aggregate_type.clone(),
+                    event.aggregate_id.clone(),
+                );
                 let version = state.versions.entry(key.clone()).or_default();
                 *version = (*version).max(event.version);
                 state
                     .committed
-                    .insert((key.0, key.1, event.version), event.clone());
+                    .insert((key.0, key.1, key.2, event.version), event.clone());
             }
         }
 
@@ -143,6 +157,7 @@ impl DataStore for InMemoryDataStore {
             state
                 .committed
                 .get(&(
+                    event.tenant.clone(),
                     event.aggregate_type.clone(),
                     event.aggregate_id.clone(),
                     event.version,
@@ -152,12 +167,13 @@ impl DataStore for InMemoryDataStore {
     }
 
     async fn snapshot(&self) -> anyhow::Result<Vec<Event>> {
-        // Every committed event, ordered by (type, id, version) so a consumer that
-        // re-applies them sees each aggregate's versions ascending.
+        // Every committed event, ordered by (tenant, type, id, version) so a
+        // consumer that re-applies them sees each stream's versions ascending.
         let state = self.state.lock().expect("store poisoned");
         let mut events: Vec<Event> = state.committed.values().cloned().collect();
         events.sort_by(|a, b| {
-            (&a.aggregate_type, &a.aggregate_id, a.version).cmp(&(
+            (&a.tenant, &a.aggregate_type, &a.aggregate_id, a.version).cmp(&(
+                &b.tenant,
                 &b.aggregate_type,
                 &b.aggregate_id,
                 b.version,
