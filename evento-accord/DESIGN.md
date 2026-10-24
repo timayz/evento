@@ -484,9 +484,8 @@ backend (sql/fjall). Phases, in order:
   state away, within bounds derived from its `NodeConfig`. It holds everywhere.
   A healed cluster used to take up to ~50 s of virtual time under message faults to
   recover the transactions left stalled, one `collect_timeout` at a time; it now
-  recovers them within a few (#326). What takes longer is a replica catching up on
-  applied transactions it missed, one anti-entropy page per round, which the bounds
-  allow. An **absence**
+  recovers them within a few (#326). A replica that missed applied transactions
+  catches up through anti-entropy, up to 16 pages a round (#348). An **absence**
   scenario (#310) has minority nodes go silent past `peer_absence_limit` — crashed,
   or cut one way — while the majority writes and compacts past them, then come back
   (rejoined if told to); an outside coordinator pre-accepts a write at a node just
@@ -1103,6 +1102,12 @@ backend (sql/fjall). Phases, in order:
         included. A join header now vouches for the contact's report before
         its holds (`Node::vouch_locked`). The two swarm seeds that stalled this
         way are pinned (`a_replica_rejoining_through_a_restarted_contact_is_counted_in`).
+        A replica back from an absence caught up one anti-entropy page per
+        round (#348): with the smallest pages, a round for each write it
+        missed, the slowest heals the swarm found. A round now asks its peer
+        for the next page at once while each brings something in, up to 16
+        pages and for one `anti_entropy_interval`
+        (`a_healed_peer_catches_up_a_backlog_in_a_few_rounds`).
         **Open** (confirmed or plausible, not yet fixed):
         an epoch change can remap a route's keys onto replicas that never
         witnessed an in-flight txn, which then answer "never witnessed"; the
