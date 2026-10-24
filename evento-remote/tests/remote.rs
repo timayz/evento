@@ -303,13 +303,25 @@ async fn remote_requests_fail_after_shutdown() -> anyhow::Result<()> {
         .await?;
 
     client
-        .read(None, None, Args::forward(1, None), None)
+        .read(
+            None,
+            None,
+            evento_core::TenantFilter::All,
+            Args::forward(1, None),
+            None,
+        )
         .await?;
 
     handle.shutdown().await;
 
     let err = client
-        .read(None, None, Args::forward(1, None), None)
+        .read(
+            None,
+            None,
+            evento_core::TenantFilter::All,
+            Args::forward(1, None),
+            None,
+        )
         .await
         .expect_err("request against a stopped server must fail");
     let msg = format!("{err:#}");
@@ -393,6 +405,7 @@ async fn pooled_concurrent_requests() -> anyhow::Result<()> {
             .read(
                 Some([evento_core::EventFilter::by_type_raw("remote/Concurrent")].into()),
                 None,
+                evento_core::TenantFilter::All,
                 PoolArgs::forward(50, after),
                 None,
             )
@@ -423,7 +436,13 @@ async fn pooled_reconnect_recovers_all_connections() -> anyhow::Result<()> {
         .await?;
 
     client
-        .read(None, None, PoolArgs::forward(1, None), None)
+        .read(
+            None,
+            None,
+            evento_core::TenantFilter::All,
+            PoolArgs::forward(1, None),
+            None,
+        )
         .await?;
     handle.shutdown().await;
 
@@ -431,7 +450,13 @@ async fn pooled_reconnect_recovers_all_connections() -> anyhow::Result<()> {
     // none of them hangs past the timeout.
     for _ in 0..6 {
         let err = client
-            .read(None, None, PoolArgs::forward(1, None), None)
+            .read(
+                None,
+                None,
+                evento_core::TenantFilter::All,
+                PoolArgs::forward(1, None),
+                None,
+            )
             .await
             .expect_err("request against a stopped server must fail");
         let msg = format!("{err:#}");
@@ -448,7 +473,13 @@ async fn pooled_reconnect_recovers_all_connections() -> anyhow::Result<()> {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             match client
-                .read(None, None, PoolArgs::forward(1, None), None)
+                .read(
+                    None,
+                    None,
+                    evento_core::TenantFilter::All,
+                    PoolArgs::forward(1, None),
+                    None,
+                )
                 .await
             {
                 Ok(_) => break,

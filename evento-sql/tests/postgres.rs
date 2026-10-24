@@ -358,3 +358,39 @@ async fn postgres_replicate_large_batch() -> anyhow::Result<()> {
 
     evento_test::replicate_large_batch(&executor).await
 }
+
+#[tokio::test]
+async fn postgres_m0008_round_trip() -> anyhow::Result<()> {
+    let pool = create_postgres_pool("m0008_round_trip").await?;
+    pool::m0008_round_trip(pool).await
+}
+
+#[tokio::test]
+async fn postgres_tenant_streams_are_isolated() -> anyhow::Result<()> {
+    let executor = create_postgres_executor("tenant_streams_are_isolated").await?;
+    evento_test::tenant_streams_are_isolated(&executor).await
+}
+
+#[tokio::test]
+async fn postgres_tenant_scope_is_enforced() -> anyhow::Result<()> {
+    let executor = create_postgres_executor("tenant_scope_is_enforced").await?;
+    evento_test::tenant_scope_is_enforced(&executor).await
+}
+
+#[tokio::test]
+async fn postgres_tenant_subscriptions() -> anyhow::Result<()> {
+    let executor = create_postgres_executor("tenant_subscriptions").await?;
+    evento_test::tenant_subscriptions(&executor).await
+}
+
+#[tokio::test]
+async fn postgres_tenant_projection_subscription() -> anyhow::Result<()> {
+    let executor = create_postgres_executor("tenant_projection_subscription").await?;
+    evento_test::tenant_projection_subscription(&executor).await
+}
+
+#[tokio::test]
+async fn postgres_tenant_snapshots_are_isolated() -> anyhow::Result<()> {
+    let executor = create_postgres_executor("tenant_snapshots_are_isolated").await?;
+    evento_test::tenant_snapshots_are_isolated(&executor).await
+}

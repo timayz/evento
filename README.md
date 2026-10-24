@@ -433,8 +433,18 @@ throwaway in-memory index rebuilt from the whole stream on every boot, and
 *first* start and resumes normally after.
 
 Each subscription is its own poller. One per connection earns its cost when each wants a
-different slice (`.aggregate::<A>(id)`, `.routing_key(tenant)`); for an unfiltered global
+different slice (`.aggregate::<A>(id)`, `.routing_key(key)`); for an unfiltered global
 feed run **one** of them fanning out over a broadcast channel, as above.
+
+**Tenants.** Every event belongs to a tenant (`event.tenant`, `""` by default), and a
+stream is identified by its tenant, type and id — the same id in two tenants names two
+streams. Scope an executor with `Evento::new(executor).tenant("acme")?` and every write,
+load, read, snapshot and subscription cursor through it stays in that tenant; hand that
+scoped executor to code — or an `evento-remote` session — that must not reach other
+tenants. A subscription reads the default tenant unless told otherwise; `.all_tenants()`
+makes **one** subscription serve every tenant of a shared store (its handlers see
+`event.tenant`, and write back with `.tenant(&event.tenant)` on the builder), and
+`.tenant("acme")` one tenant only.
 `examples/bank-axum-fjall` serves a per-account SSE feed this way.
 
 To drain currently-pending events once instead of running a background loop, use

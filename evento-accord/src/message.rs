@@ -589,6 +589,9 @@ mod wire_events {
                 version: w.version,
                 name: w.name,
                 routing_key: w.routing_key,
+                // Not on the wire yet: `AccordExecutor` refuses every tenant
+                // but the default one.
+                tenant: String::new(),
                 data: w.data,
                 metadata: bitcode::decode::<Metadata>(&w.metadata)?,
                 timestamp: w.timestamp,

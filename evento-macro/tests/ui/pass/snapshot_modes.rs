@@ -19,7 +19,7 @@ fn _assert_impls<E: evento::Executor>() {
 
 fn main() {
     MemView::snapshot_rows().write().unwrap().insert(
-        "account-1".into(),
+        (String::new(), "account-1".into()),
         MemView {
             id: "account-1".into(),
             balance: 42,
@@ -28,5 +28,6 @@ fn main() {
     );
 
     let rows = MemView::snapshot_rows().read().unwrap();
-    assert_eq!(rows.get("account-1").unwrap().balance, 42);
+    let key = (String::new(), "account-1".to_owned());
+    assert_eq!(rows.get(&key).unwrap().balance, 42);
 }

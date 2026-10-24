@@ -77,7 +77,7 @@ use crate::{
     cursor::{self, Args},
     subscription::{self, RoutingKey, Subscription, SubscriptionBuilder},
     upcast::Aliases,
-    Aggregate, AggregateEvent, EventFilter, Executor, WriteBuilder,
+    Aggregate, AggregateEvent, EventFilter, Executor, TenantFilter, WriteBuilder,
 };
 
 /// Handler context providing access to executor and shared data.
@@ -89,6 +89,10 @@ pub struct Context<'a, E: Executor> {
     context: context::RwContext,
     /// Reference to the executor for database operations
     pub executor: &'a E,
+    /// The tenant the projection is loaded in (`""` is the default tenant).
+    /// Hand-written [`Snapshot`] impls backed by a custom table key their
+    /// rows by it as well as by [`id`](Self::id).
+    pub tenant: String,
     /// The projection id the current event resolves to (the aggregate id, or
     /// the co-key for secondary aggregates).
     pub id: String,
@@ -121,6 +125,7 @@ impl<'a, E: Executor> Context<'a, E> {
         let Some((data, cursor)) = self
             .executor
             .get_snapshot(
+                self.tenant.to_owned(),
                 self.aggregate_type.to_owned(),
                 self.projection.to_owned(),
                 self.revision.to_string(),
@@ -161,6 +166,7 @@ impl<'a, E: Executor> Context<'a, E> {
 
         self.executor
             .save_snapshot(
+                self.tenant.to_owned(),
                 self.aggregate_type.to_owned(),
                 self.projection.to_owned(),
                 self.revision.to_string(),
@@ -177,6 +183,7 @@ impl<'a, E: Executor> Context<'a, E> {
     pub async fn drop_snapshot(&self) -> anyhow::Result<()> {
         self.executor
             .delete_snapshot(
+                self.tenant.to_owned(),
                 self.aggregate_type.to_owned(),
                 self.projection.to_owned(),
                 self.id.to_owned(),
@@ -425,9 +432,10 @@ pub struct Projection<E: Executor, P: Default + 'static> {
     /// Per-aggregate position (cursor order key) the persisted snapshot
     /// already reflects. Lets [`ProjectionAutoHandler`] skip events an earlier
     /// same-chunk reload has already folded, instead of re-loading the whole
-    /// aggregate once per event. Only populated through a subscription's
+    /// aggregate once per event. Keyed by `(tenant, id)`: the same id in two
+    /// tenants is two aggregates. Only populated through a subscription's
     /// `Arc<Projection>`.
-    recent: Mutex<HashMap<String, EventOrderKey>>,
+    recent: Mutex<HashMap<(String, String), EventOrderKey>>,
     executor: PhantomData<E>,
 }
 
@@ -476,34 +484,36 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
         }
     }
 
-    /// Whether the persisted snapshot for `id` already reflects the event at
-    /// `key` (its position is at or below the recorded persisted position).
-    fn covered(&self, id: &str, key: &EventOrderKey) -> bool {
+    /// Whether the persisted snapshot for `id` in `tenant` already reflects
+    /// the event at `key` (its position is at or below the recorded persisted
+    /// position).
+    fn covered(&self, tenant: &str, id: &str, key: &EventOrderKey) -> bool {
         self.recent
             .lock()
             .expect("recent cache poisoned")
-            .get(id)
+            .get(&(tenant.to_owned(), id.to_owned()))
             .is_some_and(|persisted| key <= persisted)
     }
 
-    /// Records how far the persisted snapshot for `id` reaches.
-    fn record_persisted(&self, id: &str, cursor: &cursor::Value) {
+    /// Records how far the persisted snapshot for `id` in `tenant` reaches.
+    fn record_persisted(&self, tenant: &str, id: &str, cursor: &cursor::Value) {
         let Ok(c) = <crate::Event as cursor::Cursor>::deserialize_cursor(cursor) else {
             return;
         };
+        let key = (tenant.to_owned(), id.to_owned());
         let mut recent = self.recent.lock().expect("recent cache poisoned");
-        if recent.len() >= RECENT_CACHE_MAX && !recent.contains_key(id) {
+        if recent.len() >= RECENT_CACHE_MAX && !recent.contains_key(&key) {
             recent.clear();
         }
-        recent.insert(id.to_owned(), (c.t, c.s, c.v, c.i));
+        recent.insert(key, (c.t, c.s, c.v, c.i));
     }
 
-    /// Drops the recorded position for `id` (e.g. on tombstone).
-    fn invalidate_recent(&self, id: &str) {
+    /// Drops the recorded position for `id` in `tenant` (e.g. on tombstone).
+    fn invalidate_recent(&self, tenant: &str, id: &str) {
         self.recent
             .lock()
             .expect("recent cache poisoned")
-            .remove(id);
+            .remove(&(tenant.to_owned(), id.to_owned()));
     }
 
     /// Sets the snapshot revision.
@@ -613,6 +623,7 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
         LoadBuilder {
             projection: self,
             id,
+            tenant: None,
             aggregators,
         }
     }
@@ -630,6 +641,7 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
             projection: self,
             key: key.into(),
             routing_key: None,
+            tenant: None,
             chunk_size: 300,
             retry: Some(30),
             delay: None,
@@ -644,16 +656,25 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
     async fn load_aggregator(
         &self,
         executor: &E,
+        tenant: &str,
         id: &str,
         extra_aggregators: &HashMap<String, String>,
     ) -> anyhow::Result<(Option<P>, Option<cursor::Value>)> {
+        // The aggregate lives in one tenant, and so do the co-keyed ones.
+        let tenant_filter = TenantFilter::Only(tenant.to_owned());
         if let Some((tombstone_type, tombstone_events)) = &self.tombstone {
             let filters = tombstone_events
                 .iter()
                 .map(|name| EventFilter::exact_raw(*tombstone_type, id.to_owned(), *name))
                 .collect::<Arc<[EventFilter]>>();
             let res = executor
-                .read(Some(filters), None, Args::backward(1, None), None)
+                .read(
+                    Some(filters),
+                    None,
+                    tenant_filter.clone(),
+                    Args::backward(1, None),
+                    None,
+                )
                 .await?;
             if !res.edges.is_empty() {
                 return Ok((None, None));
@@ -669,6 +690,7 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
         let context = Context {
             context: self.context.clone(),
             executor,
+            tenant: tenant.to_owned(),
             id: id.to_owned(),
             aggregate_type: self.aggregate_type.to_string(),
             aggregators: &aggregators,
@@ -736,6 +758,7 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
                 .read(
                     Some(read_aggregators.clone()),
                     None,
+                    tenant_filter.clone(),
                     Args::forward(100, page_cursor.clone()),
                     // Deliberately unbounded: gated events are folded into the
                     // returned in-memory state (read-your-writes) and only
@@ -827,6 +850,7 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
 pub struct LoadBuilder<E: Executor, P: Default + 'static> {
     projection: Projection<E, P>,
     id: String,
+    tenant: Option<String>,
     aggregators: HashMap<String, String>,
 }
 
@@ -847,6 +871,17 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> LoadBuilder<E, P> {
         self
     }
 
+    /// Loads the aggregate of `tenant` instead of the executor's
+    /// ([`Executor::tenant`]; the default tenant, `""`, for an unscoped
+    /// executor).
+    ///
+    /// The same id in two tenants names two aggregates. An executor scoped to
+    /// another tenant loads in its own tenant regardless.
+    pub fn tenant(mut self, v: impl Into<String>) -> Self {
+        self.tenant = Some(v.into());
+        self
+    }
+
     /// Executes the load, returning the rebuilt state.
     ///
     /// Replays events in pages of 100, restoring from a snapshot when one is
@@ -854,8 +889,13 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> LoadBuilder<E, P> {
     /// tombstone was registered via [`Projection::tombstone`] and the
     /// corresponding event has been committed for this id.
     pub async fn execute(&self, executor: &E) -> anyhow::Result<Option<P>> {
+        let tenant = self
+            .tenant
+            .clone()
+            .or_else(|| executor.tenant().map(str::to_owned))
+            .unwrap_or_default();
         self.projection
-            .load_aggregator(executor, &self.id, &self.aggregators)
+            .load_aggregator(executor, &tenant, &self.id, &self.aggregators)
             .await
             .map(|(state, _persisted)| state)
     }
@@ -890,6 +930,7 @@ pub struct ProjectionSubscription<E: Executor, P: Default + 'static> {
     projection: Projection<E, P>,
     key: String,
     routing_key: Option<RoutingKey>,
+    tenant: Option<TenantFilter>,
     chunk_size: u16,
     retry: Option<u8>,
     delay: Option<Duration>,
@@ -915,6 +956,20 @@ where
     /// executor-level default.
     pub fn any_routing_key(mut self) -> Self {
         self.routing_key = Some(RoutingKey::All);
+        self
+    }
+
+    /// Keeps the projection of `tenant` up to date instead of the
+    /// executor's; see [`SubscriptionBuilder::tenant`].
+    pub fn tenant(mut self, v: impl Into<String>) -> Self {
+        self.tenant = Some(TenantFilter::Only(v.into()));
+        self
+    }
+
+    /// Keeps the projection up to date in every tenant, each aggregate
+    /// loaded in its own; see [`SubscriptionBuilder::all_tenants`].
+    pub fn all_tenants(mut self) -> Self {
+        self.tenant = Some(TenantFilter::All);
         self
     }
 
@@ -979,6 +1034,7 @@ where
             projection,
             key,
             routing_key,
+            tenant,
             chunk_size,
             retry,
             delay,
@@ -1022,6 +1078,11 @@ where
             Some(RoutingKey::All) => builder.any_routing_key(),
             Some(RoutingKey::Value(Some(v))) => builder.routing_key(v),
             Some(RoutingKey::Value(None)) | None => builder,
+        };
+        builder = match tenant {
+            Some(TenantFilter::All) => builder.all_tenants(),
+            Some(TenantFilter::Only(v)) => builder.tenant(v),
+            None => builder,
         };
         builder = builder.chunk_size(chunk_size);
         builder = match retry {
@@ -1089,19 +1150,29 @@ where
                 event.version,
                 event.id.to_string(),
             );
-            if self.projection.covered(&event.aggregate_id, &key) {
+            if self
+                .projection
+                .covered(&event.tenant, &event.aggregate_id, &key)
+            {
                 return Ok(());
             }
 
             // `load_aggregator` auto-keys every co-keyed secondary aggregate to
             // this event's id, so no extra aggregators need to be supplied here.
+            // The aggregate is loaded in the event's tenant: a subscription
+            // over every tenant reloads each aggregate in its own.
             let (_, persisted) = self
                 .projection
-                .load_aggregator(context.executor, &event.aggregate_id, &HashMap::new())
+                .load_aggregator(
+                    context.executor,
+                    &event.tenant,
+                    &event.aggregate_id,
+                    &HashMap::new(),
+                )
                 .await?;
             if let Some(cursor) = persisted {
                 self.projection
-                    .record_persisted(&event.aggregate_id, &cursor);
+                    .record_persisted(&event.tenant, &event.aggregate_id, &cursor);
             }
             Ok(())
         })
@@ -1138,6 +1209,7 @@ where
             let ctx = Context {
                 context: self.projection.context.clone(),
                 executor: context.executor,
+                tenant: event.tenant.clone(),
                 id: event.aggregate_id.clone(),
                 aggregate_type: self.projection.aggregate_type.to_string(),
                 aggregators: &aggregators,
@@ -1145,7 +1217,8 @@ where
                 projection: P::projection_name(),
             };
             P::drop_snapshot(&ctx).await?;
-            self.projection.invalidate_recent(&event.aggregate_id);
+            self.projection
+                .invalidate_recent(&event.tenant, &event.aggregate_id);
             Ok(())
         })
     }

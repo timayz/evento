@@ -723,7 +723,8 @@ pub fn derive_cursor(input: TokenStream) -> TokenStream {
 ///   a bitcode-encodable view from persisting snapshots.
 /// - `#[evento::snapshot(memory)]` — an in-memory snapshot store. Generates a
 ///   `snapshot_rows()` associated function returning a
-///   `&'static RwLock<HashMap<String, Self>>` keyed by aggregate id, and a
+///   `&'static RwLock<HashMap<(String, String), Self>>` keyed by
+///   `(tenant, aggregate id)` (`""` is the default tenant), and a
 ///   `Snapshot` impl whose `restore`/`take_snapshot`/`drop_snapshot` read,
 ///   insert, and remove entries in it.
 ///

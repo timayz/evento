@@ -73,13 +73,16 @@ let client = evento::RemoteClient::connect("127.0.0.1:4321").await?;
   on every (re)connect, so a client behind a load balancer or DNS failover follows
   it. The server clamps a bounded `read` to its own `stable_timestamp`, so a
   client that reconnects to a lagging node never skips events.
-- **One store per tenant / authentication:** implement `evento::remote::Resolver`.
+- **Tenants / authentication:** implement `evento::remote::Resolver`.
   Every connection opens with a `Hello { token, peer }` (client side:
   `RemoteClient::builder(addr).token("…").connect().await?`); `resolve` answers
   `Session::new(executor)` — optionally `.keep(guard)` (dropped when the connection
-  ends, e.g. a tenant lease) and `.close_when(watch_rx)` (server-side kick on
-  revocation) — or `Err(Rejection)`, which the client sees as its `connect` error.
+  ends) and `.close_when(watch_rx)` (server-side kick on revocation) — or
+  `Err(Rejection)`, which the client sees as its `connect` error.
   Pass it to `serve_with(listener, resolver)`. It runs again on every reconnect.
+  To confine a client to its tenant over one shared store, serve
+  `Session::new(Evento::new(store.clone()).tenant(tenant)?)`: the scoped executor
+  replaces every tenant the client sends and refuses `replicate`.
 - **TLS:** `serve_tls(listener, acceptor, exec)` / `serve_tls_with(listener, acceptor, resolver)`
   take a `tokio_rustls::TlsAcceptor`; the client side is
   `.builder(addr).tls(connector, server_name)`. Plain TCP is for trusted networks —
@@ -388,7 +391,13 @@ aggregate type as a string; it has no `.decode()`.
   no `.routing_key()` reads **every** routing key; narrow it with `.no_routing_key()`.
   A subscription with no `.routing_key()`/`.any_routing_key()` only sees events whose
   routing key is NULL. `.any_routing_key()` subscriptions are stored per
-  executor-default-routing-key, so multi-tenant setups stay isolated.
+  executor-default-routing-key.
+- **Tenants are part of stream identity** (`(tenant, type, id)`, default tenant `""`).
+  `Evento::new(exec).tenant("acme")?` scopes every write, load, read, snapshot and
+  cursor; builders take `.tenant(t)` (writes, `Projection::load`, `evento::read`,
+  subscriptions). A subscription reads only the default tenant unless
+  `.all_tenants()` — one subscription for every tenant — or `.tenant(t)`;
+  a projection subscription over every tenant loads each event in its own tenant.
 - **The subscription key is the cursor identity.** Reusing a key across two different
   subscriptions makes them share (and corrupt) one cursor. Keep keys unique — except under
   `.ephemeral()`, where nothing is stored under the key and any number of subscriptions may

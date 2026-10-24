@@ -63,6 +63,10 @@
 //!   the redundant `(type, id)` prefix index, adds `id` to the routing cursor index)
 //! - [`M0007`] - Keys snapshots by projection: recreates `snapshot` with primary key
 //!   `(type, projection, id)` (existing snapshots are discarded; they are a cache)
+//! - [`M0008`] - Adds the tenant: `event.tenant` joins the stream's identity (unique
+//!   `(type, id, tenant, version)`) and gets a `(type, tenant, …cursor)` index,
+//!   `snapshot` is keyed by `(tenant, type, projection, id)` (snapshots discarded) and
+//!   `subscriber` by `(tenant, key)` (rows kept, in the default tenant `''`)
 //!
 //! # Database Schema
 //!
@@ -81,16 +85,18 @@
 //! | `version` | INTEGER | Event sequence number |
 //! | `data` | BLOB | Serialized event data |
 //! | `metadata` | BLOB | Serialized event metadata |
-//! | `routing_key` | VARCHAR(50) | Optional routing key |
+//! | `routing_key` | VARCHAR(255) | Optional routing key |
+//! | `tenant` | VARCHAR(255) | Tenant the aggregate belongs to (`''` = default tenant) |
 //! | `timestamp` | BIGINT | Event timestamp (seconds) |
 //! | `timestamp_subsec` | BIGINT | Sub-second precision |
 //!
 //! ## Snapshot Table
 //!
-//! Caches projection state; primary key `(type, projection, id)`:
+//! Caches projection state; primary key `(tenant, type, projection, id)`:
 //!
 //! | Column | Type | Description |
 //! |--------|------|-------------|
+//! | `tenant` | VARCHAR(255) | Tenant the aggregate belongs to |
 //! | `type` | VARCHAR(50) | Aggregate root type |
 //! | `projection` | VARCHAR(255) | Name of the projection the snapshot belongs to |
 //! | `id` | VARCHAR(64) | Aggregate root instance ID |
@@ -102,11 +108,12 @@
 //!
 //! ## Subscriber Table
 //!
-//! Tracks event subscription progress:
+//! Tracks event subscription progress; primary key `(tenant, key)`:
 //!
 //! | Column | Type | Description |
 //! |--------|------|-------------|
-//! | `key` | VARCHAR(255) | Subscriber identifier (primary key) |
+//! | `tenant` | VARCHAR(255) | Tenant the subscription belongs to |
+//! | `key` | VARCHAR(255) | Subscriber identifier |
 //! | `worker_id` | VARCHAR(26) | Associated worker ID |
 //! | `cursor` | TEXT | Current event stream position |
 //! | `lag` | INTEGER | Seconds behind the newest matching event |
@@ -125,6 +132,7 @@ mod m0004;
 mod m0005;
 mod m0006;
 mod m0007;
+mod m0008;
 
 #[cfg(feature = "accord")]
 pub use accord::AccordMigration;
@@ -135,6 +143,7 @@ pub use m0004::M0004;
 pub use m0005::M0005;
 pub use m0006::M0006;
 pub use m0007::M0007;
+pub use m0008::M0008;
 
 /// Creates a new [`Migrator`] instance with all Evento migrations registered.
 ///
@@ -180,6 +189,7 @@ where
     M0005: sqlx_migrator::Migration<DB>,
     M0006: sqlx_migrator::Migration<DB>,
     M0007: sqlx_migrator::Migration<DB>,
+    M0008: sqlx_migrator::Migration<DB>,
 {
     let mut migrator = Migrator::default();
     migrator.add_migration(Box::new(InitMigration))?;
@@ -189,6 +199,7 @@ where
     migrator.add_migration(Box::new(M0005))?;
     migrator.add_migration(Box::new(M0006))?;
     migrator.add_migration(Box::new(M0007))?;
+    migrator.add_migration(Box::new(M0008))?;
     Ok(migrator)
 }
 
@@ -234,6 +245,7 @@ where
     M0005: sqlx_migrator::Migration<DB>,
     M0006: sqlx_migrator::Migration<DB>,
     M0007: sqlx_migrator::Migration<DB>,
+    M0008: sqlx_migrator::Migration<DB>,
     AccordMigration: sqlx_migrator::Migration<DB>,
 {
     let mut migrator = Migrator::default();
@@ -244,6 +256,7 @@ where
     migrator.add_migration(Box::new(M0005))?;
     migrator.add_migration(Box::new(M0006))?;
     migrator.add_migration(Box::new(M0007))?;
+    migrator.add_migration(Box::new(M0008))?;
     // The optional evento-accord consensus-journal tables.
     migrator.add_migration(Box::new(AccordMigration))?;
     Ok(migrator)

@@ -151,7 +151,7 @@ use crate::{
     context,
     cursor::{Args, Value},
     upcast::Aliases,
-    Aggregate, AggregateEvent, EventFilter, Executor,
+    Aggregate, AggregateEvent, EventFilter, Executor, TenantFilter,
 };
 
 /// Bounds on the adaptive retry delay after a `Gated` pass. The lower bound
@@ -193,7 +193,7 @@ pub enum RoutingKey {
 /// use evento::cursor::Args;
 /// use evento::metadata::Event;
 /// use evento::subscription::{Context, SubscriptionBuilder};
-/// use evento::Executor;
+/// use evento::{Executor, TenantFilter};
 ///
 /// # #[evento::aggregate]
 /// # pub enum Account {
@@ -216,7 +216,7 @@ pub enum RoutingKey {
 ///     // Use executor for queries
 ///     let events = context
 ///         .executor
-///         .read(None, None, Args::forward(10, None), None)
+///         .read(None, None, TenantFilter::All, Args::forward(10, None), None)
 ///         .await?;
 ///     Ok(())
 /// }
@@ -366,9 +366,16 @@ pub struct SubscriptionBuilder<E: Executor> {
     context: context::RwContext,
     routing_key: Option<RoutingKey>,
     prefix_key: Option<String>,
-    /// The storage key with its routing/tenant prefix applied — computed once
+    /// The storage key with its routing-key prefix applied — computed once
     /// in `resolve_routing_key` so the hot paths never re-format it.
     resolved_key: String,
+    /// The tenants asked for: `.tenant(..)`, `.all_tenants()`, or unset.
+    tenant: Option<TenantFilter>,
+    /// The tenants read, resolved once by `resolve_tenant`.
+    read_tenant: TenantFilter,
+    /// The tenant the subscriber row lives in, resolved once by
+    /// `resolve_tenant`.
+    row_tenant: String,
     delay: Option<Duration>,
     poll_interval: Duration,
     chunk_size: u16,
@@ -457,6 +464,9 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             continue_on_error: false,
             routing_key: None,
             prefix_key: None,
+            tenant: None,
+            read_tenant: TenantFilter::Only(String::new()),
+            row_tenant: String::new(),
             aggregators: Default::default(),
             shutdown_rx: None,
             ack_every: None,
@@ -815,6 +825,33 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
         self
     }
 
+    /// Processes the events of `tenant` instead of the executor's.
+    ///
+    /// By default a subscription processes the events of the executor's
+    /// tenant ([`Executor::tenant`]) — the default tenant, `""`, for an
+    /// unscoped executor. Its cursor is kept under `tenant` too, so the same
+    /// key in two tenants names two subscriptions. An executor scoped to
+    /// another tenant keeps its own tenant regardless.
+    pub fn tenant(mut self, v: impl Into<String>) -> Self {
+        self.tenant = Some(TenantFilter::Only(v.into()));
+
+        self
+    }
+
+    /// Processes the events of every tenant, instead of one.
+    ///
+    /// The counterpart to [`tenant`](Self::tenant), and how one subscription
+    /// serves every tenant of a shared store: each event carries its
+    /// [`tenant`](crate::Event::tenant), and a handler that writes or loads
+    /// does so in that tenant (`.tenant(&event.tenant)` on the builder). The
+    /// cursor is kept in the default tenant. An executor scoped to a tenant
+    /// reads only that tenant regardless.
+    pub fn all_tenants(mut self) -> Self {
+        self.tenant = Some(TenantFilter::All);
+
+        self
+    }
+
     /// Sets the maximum number of retries on failure.
     ///
     /// Uses exponential backoff. Default is 30.
@@ -887,8 +924,9 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
     ///
     /// `prefix_key` is captured from `executor.default_routing_key()` even
     /// when the user has already called `.any_routing_key()`, so the storage key
-    /// remains scoped to the executor's tenant — otherwise two executors with
-    /// different defaults would share one row in the subscriber table.
+    /// remains scoped to the executor's default routing key — otherwise two
+    /// executors with different defaults would share one row in the subscriber
+    /// table.
     fn resolve_routing_key(&mut self, executor: &E) {
         if self.prefix_key.is_none() {
             self.prefix_key = executor.default_routing_key().map(|s| s.to_owned());
@@ -912,6 +950,26 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
 
     fn effective_routing_key(&self) -> RoutingKey {
         self.routing_key.clone().unwrap_or(RoutingKey::Value(None))
+    }
+
+    /// Resolves the tenants read and the tenant the subscriber row lives in.
+    ///
+    /// Called once at the top of `start()` / `run_once()`, beside
+    /// `resolve_routing_key`. A scoped executor pins its tenant (it would
+    /// replace any other anyway); otherwise `.tenant(..)` or `.all_tenants()`
+    /// decides, and an unset subscription reads the default tenant. One
+    /// tenant's subscription keeps its row in that tenant; one over every
+    /// tenant, in the default tenant.
+    fn resolve_tenant(&mut self, executor: &E) {
+        self.read_tenant = match (executor.tenant(), &self.tenant) {
+            (Some(scoped), _) => TenantFilter::Only(scoped.to_owned()),
+            (None, Some(tenant)) => tenant.clone(),
+            (None, None) => TenantFilter::Only(String::new()),
+        };
+        self.row_tenant = match &self.read_tenant {
+            TenantFilter::Only(tenant) => tenant.clone(),
+            TenantFilter::All => String::new(),
+        };
     }
 
     #[tracing::instrument(
@@ -963,6 +1021,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                 .read(
                     Some(aggregators.clone()),
                     Some(self.effective_routing_key()),
+                    self.read_tenant.clone(),
                     Args::forward(self.chunk_size, cursor.clone()),
                     stable,
                 )
@@ -1157,7 +1216,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             )),
             CursorStore::Persisted => {
                 let status = executor
-                    .subscriber_status(self.resolved_key().to_owned(), *id)
+                    .subscriber_status(self.row_tenant.clone(), self.resolved_key().to_owned(), *id)
                     .await?;
                 Ok(match status.running {
                     true => CursorRead::At(status.cursor),
@@ -1202,6 +1261,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
         let latest = self.cached_latest_timestamp(executor, aggregators).await?;
         executor
             .acknowledge(
+                self.row_tenant.clone(),
                 self.resolved_key().to_owned(),
                 *id,
                 cursor,
@@ -1231,6 +1291,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             .latest_timestamp(
                 Some(aggregators.clone()),
                 Some(self.effective_routing_key()),
+                self.read_tenant.clone(),
             )
             .await?;
         *self.latest_ts_cache.lock().expect("latest_ts poisoned") = Some((Instant::now(), v));
@@ -1258,6 +1319,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             .read(
                 Some(aggregators.clone()),
                 Some(self.effective_routing_key()),
+                self.read_tenant.clone(),
                 Args::forward(1, after),
                 None,
             )
@@ -1321,6 +1383,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             .read(
                 Some(aggregators.clone()),
                 Some(self.effective_routing_key()),
+                self.read_tenant.clone(),
                 Args::backward(1, None),
                 stable,
             )
@@ -1384,6 +1447,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
         E: Clone,
     {
         self.resolve_routing_key(executor);
+        self.resolve_tenant(executor);
         tracing::Span::current().record("subscription", self.resolved_key());
         let executor = executor.clone();
         let id = Ulid::generate();
@@ -1400,7 +1464,11 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
         // An ephemeral subscription claims nothing: no row, no fence.
         if !self.cursor_store.is_ephemeral() {
             executor
-                .upsert_subscriber(self.resolved_key().to_owned(), id.to_owned())
+                .upsert_subscriber(
+                    self.row_tenant.clone(),
+                    self.resolved_key().to_owned(),
+                    id.to_owned(),
+                )
                 .await?;
         }
 
@@ -1639,13 +1707,18 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
     ))]
     pub async fn run_once(&mut self, executor: &E) -> anyhow::Result<()> {
         self.resolve_routing_key(executor);
+        self.resolve_tenant(executor);
         tracing::Span::current().record("subscription", self.resolved_key());
         let id = Ulid::generate();
 
         // An ephemeral subscription claims nothing: no row, no fence.
         if !self.cursor_store.is_ephemeral() {
             executor
-                .upsert_subscriber(self.resolved_key().to_owned(), id.to_owned())
+                .upsert_subscriber(
+                    self.row_tenant.clone(),
+                    self.resolved_key().to_owned(),
+                    id.to_owned(),
+                )
                 .await?;
         }
 
@@ -1660,6 +1733,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             .latest_timestamp(
                 Some(read_aggregators.clone()),
                 Some(self.effective_routing_key()),
+                self.read_tenant.clone(),
             )
             .await?
             .saturating_add(1)

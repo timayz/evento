@@ -32,7 +32,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use bytes::Bytes;
 use evento_core::cursor::{Args, ReadResult, Value};
-use evento_core::{Event, EventFilter, Executor, RoutingKey, WriteError};
+use evento_core::{Event, EventFilter, Executor, RoutingKey, TenantFilter, WriteError};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -43,7 +43,7 @@ use tokio_util::either::Either;
 use ulid::Ulid;
 
 use crate::wire::{
-    decode_tagged, encode_tagged, ClientFrame, RecordKind, Rejection, Request, Response,
+    decode_tagged, encode_tagged, ClientFrame, HelloOk, RecordKind, Rejection, Request, Response,
     ServerFrame, Token, MAX_FRAME_LENGTH,
 };
 
@@ -146,6 +146,9 @@ struct Inner {
     /// Fixed at server executor construction; snapshotted once from the first
     /// connection's `Hello` (it is borrowed as `&str`, so it must stay fixed).
     default_routing_key: Option<String>,
+    /// The tenant the server scoped this client's session to, snapshotted
+    /// like `default_routing_key`.
+    tenant: Option<String>,
     stable: Stable,
     request_timeout: Duration,
 }
@@ -204,11 +207,13 @@ impl ClientBuilder {
 
         let mut lanes = Vec::with_capacity(self.connections);
         let mut default_routing_key = None;
+        let mut tenant = None;
         for lane in 0..self.connections {
-            let (framed, routing_key) =
+            let (framed, hello) =
                 connect_and_hello(&self.dial, &stable, self.request_timeout).await?;
             if lane == 0 {
-                default_routing_key = routing_key;
+                default_routing_key = hello.default_routing_key;
+                tenant = hello.tenant;
             }
             let (req_tx, req_rx) = mpsc::channel(REQ_CAPACITY);
             tokio::spawn(
@@ -233,6 +238,7 @@ impl ClientBuilder {
                 next_id: AtomicU64::new(HELLO_ID + 1),
                 watch_tx,
                 default_routing_key,
+                tenant,
                 stable,
                 request_timeout: self.request_timeout,
             }),
@@ -295,6 +301,10 @@ impl Executor for Client {
         self.inner.default_routing_key.as_deref()
     }
 
+    fn tenant(&self) -> Option<&str> {
+        self.inner.tenant.as_deref()
+    }
+
     fn write_watch(&self) -> Option<watch::Receiver<u64>> {
         Some(self.inner.watch_tx.subscribe())
     }
@@ -331,6 +341,7 @@ impl Executor for Client {
         &self,
         aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<RoutingKey>,
+        tenant: TenantFilter,
         args: Args,
         to_micros: Option<u64>,
     ) -> anyhow::Result<ReadResult<Event>> {
@@ -338,6 +349,7 @@ impl Executor for Client {
             .request(Request::Read {
                 aggregators: aggregators.map(|a| a.to_vec()),
                 routing_key,
+                tenant,
                 args,
                 to_micros,
             })
@@ -353,11 +365,13 @@ impl Executor for Client {
         &self,
         aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<RoutingKey>,
+        tenant: TenantFilter,
     ) -> anyhow::Result<u64> {
         match self
             .request(Request::LatestTimestamp {
                 aggregators: aggregators.map(|a| a.to_vec()),
                 routing_key,
+                tenant,
             })
             .await?
         {
@@ -367,17 +381,33 @@ impl Executor for Client {
         }
     }
 
-    async fn get_subscriber_cursor(&self, key: String) -> anyhow::Result<Option<Value>> {
-        match self.request(Request::GetSubscriberCursor { key }).await? {
+    async fn get_subscriber_cursor(
+        &self,
+        tenant: String,
+        key: String,
+    ) -> anyhow::Result<Option<Value>> {
+        match self
+            .request(Request::GetSubscriberCursor { tenant, key })
+            .await?
+        {
             Response::SubscriberCursor(Ok(v)) => Ok(v),
             Response::SubscriberCursor(Err(msg)) => Err(anyhow::anyhow!(msg)),
             _ => Err(protocol_err("get_subscriber_cursor")),
         }
     }
 
-    async fn is_subscriber_running(&self, key: String, worker_id: Ulid) -> anyhow::Result<bool> {
+    async fn is_subscriber_running(
+        &self,
+        tenant: String,
+        key: String,
+        worker_id: Ulid,
+    ) -> anyhow::Result<bool> {
         match self
-            .request(Request::IsSubscriberRunning { key, worker_id })
+            .request(Request::IsSubscriberRunning {
+                tenant,
+                key,
+                worker_id,
+            })
             .await?
         {
             Response::SubscriberRunning(Ok(v)) => Ok(v),
@@ -388,11 +418,16 @@ impl Executor for Client {
 
     async fn subscriber_status(
         &self,
+        tenant: String,
         key: String,
         worker_id: Ulid,
     ) -> anyhow::Result<evento_core::SubscriberStatus> {
         match self
-            .request(Request::SubscriberStatus { key, worker_id })
+            .request(Request::SubscriberStatus {
+                tenant,
+                key,
+                worker_id,
+            })
             .await?
         {
             Response::SubscriberStatus(Ok(v)) => Ok(v),
@@ -403,11 +438,13 @@ impl Executor for Client {
 
     async fn latest_version(
         &self,
+        tenant: String,
         aggregate_type: String,
         aggregate_id: String,
     ) -> anyhow::Result<u16> {
         match self
             .request(Request::LatestVersion {
+                tenant,
                 aggregate_type,
                 aggregate_id,
             })
@@ -421,11 +458,13 @@ impl Executor for Client {
 
     async fn stream_routing_key(
         &self,
+        tenant: String,
         aggregate_type: String,
         aggregate_id: String,
     ) -> anyhow::Result<Option<Option<String>>> {
         match self
             .request(Request::StreamRoutingKey {
+                tenant,
                 aggregate_type,
                 aggregate_id,
             })
@@ -437,9 +476,18 @@ impl Executor for Client {
         }
     }
 
-    async fn upsert_subscriber(&self, key: String, worker_id: Ulid) -> anyhow::Result<()> {
+    async fn upsert_subscriber(
+        &self,
+        tenant: String,
+        key: String,
+        worker_id: Ulid,
+    ) -> anyhow::Result<()> {
         match self
-            .request(Request::UpsertSubscriber { key, worker_id })
+            .request(Request::UpsertSubscriber {
+                tenant,
+                key,
+                worker_id,
+            })
             .await?
         {
             Response::Unit(Ok(())) => Ok(()),
@@ -450,6 +498,7 @@ impl Executor for Client {
 
     async fn acknowledge(
         &self,
+        tenant: String,
         key: String,
         worker_id: Ulid,
         cursor: Value,
@@ -457,6 +506,7 @@ impl Executor for Client {
     ) -> anyhow::Result<bool> {
         match self
             .request(Request::Acknowledge {
+                tenant,
                 key,
                 worker_id,
                 cursor,
@@ -472,6 +522,7 @@ impl Executor for Client {
 
     async fn get_snapshot(
         &self,
+        tenant: String,
         aggregate_type: String,
         projection: String,
         aggregate_revision: String,
@@ -479,6 +530,7 @@ impl Executor for Client {
     ) -> anyhow::Result<Option<(Vec<u8>, Value)>> {
         match self
             .request(Request::GetSnapshot {
+                tenant,
                 aggregate_type,
                 projection,
                 aggregate_revision,
@@ -494,6 +546,7 @@ impl Executor for Client {
 
     async fn save_snapshot(
         &self,
+        tenant: String,
         aggregate_type: String,
         projection: String,
         aggregate_revision: String,
@@ -503,6 +556,7 @@ impl Executor for Client {
     ) -> anyhow::Result<()> {
         match self
             .request(Request::SaveSnapshot {
+                tenant,
                 aggregate_type,
                 projection,
                 aggregate_revision,
@@ -520,12 +574,14 @@ impl Executor for Client {
 
     async fn delete_snapshot(
         &self,
+        tenant: String,
         aggregate_type: String,
         projection: String,
         id: String,
     ) -> anyhow::Result<()> {
         match self
             .request(Request::DeleteSnapshot {
+                tenant,
                 aggregate_type,
                 projection,
                 id,
@@ -656,9 +712,9 @@ impl Actor {
                 return None;
             }
             match connect_and_hello(&self.dial, &self.stable, self.request_timeout).await {
-                // The routing key from a re-Hello is ignored: it is fixed at
-                // server construction, and the cached one must stay stable for
-                // the lifetime of this Client (it is borrowed as &str).
+                // The routing key and tenant from a re-Hello are ignored: they
+                // are fixed per session, and the cached ones must stay stable
+                // for the lifetime of this Client (they are borrowed as &str).
                 Ok((framed, _)) => return Some(framed),
                 Err(err) => {
                     // A refusal is the server's decision (the credential was
@@ -685,15 +741,16 @@ impl Actor {
 }
 
 /// Establishes one connection (TLS handshake included) and performs the
-/// `Hello` exchange, returning the framed stream and the server's
-/// `default_routing_key`. Seeds the stable watermark from the reply. Frames
+/// `Hello` exchange, returning the framed stream and what the server answered
+/// (its `default_routing_key`, the session's tenant). Seeds the stable
+/// watermark from the reply. Frames
 /// pushed before the reply (notifies) only update the watermark. A refusal
 /// comes back as an error whose source is the [`Rejection`].
 async fn connect_and_hello(
     dial: &Dial,
     stable: &AtomicU64,
     timeout: Duration,
-) -> anyhow::Result<(Framed<ClientStream, LengthDelimitedCodec>, Option<String>)> {
+) -> anyhow::Result<(Framed<ClientStream, LengthDelimitedCodec>, HelloOk)> {
     // A host name is looked up here, on every attempt, and each address it
     // resolves to is tried in turn; an IP is used as is.
     let stream = TcpStream::connect(dial.addr.0.as_str())
@@ -723,7 +780,7 @@ async fn connect_and_hello(
         .send(Bytes::from(encode_tagged(RecordKind::ClientFrame, &hello)?))
         .await?;
 
-    let default_routing_key = tokio::time::timeout(timeout, async {
+    let hello = tokio::time::timeout(timeout, async {
         loop {
             let Some(item) = framed.next().await else {
                 anyhow::bail!("connection closed during hello");
@@ -740,7 +797,7 @@ async fn connect_and_hello(
                     let ok = reply
                         .map_err(anyhow::Error::new)
                         .context("the server refused the connection")?;
-                    return Ok(ok.default_routing_key);
+                    return Ok(ok);
                 }
                 ServerFrame::Notify {
                     stable_timestamp, ..
@@ -756,5 +813,5 @@ async fn connect_and_hello(
     .await
     .map_err(|_| anyhow::anyhow!("hello timed out after {timeout:?}"))??;
 
-    Ok((framed, default_routing_key))
+    Ok((framed, hello))
 }

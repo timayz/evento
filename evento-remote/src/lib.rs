@@ -28,13 +28,24 @@
 //! piggybacks on every frame, so fronting a replicated backend (Accord) keeps
 //! subscription safety intact.
 //!
-//! **Many stores, credentials.** A host serving one store per tenant implements
-//! [`Resolver`]: each connection opens with a `Hello` carrying the token the
-//! client was built with ([`ClientBuilder::token`]), and the resolver answers
-//! with the [`Session`] to serve it — the executor, something to keep alive
-//! for the connection's lifetime (a tenant lease), a signal to end it (a
-//! revoked credential) — or a [`Rejection`]. [`serve_with`] takes the
-//! resolver; [`serve`] is the open single-store case.
+//! **Tenants, credentials.** A host confining each client to its tenant
+//! implements [`Resolver`]: each connection opens with a `Hello` carrying the
+//! token the client was built with ([`ClientBuilder::token`]), and the resolver
+//! answers with the [`Session`] to serve it — the executor, something to keep
+//! alive for the connection's lifetime, a signal to end it (a revoked
+//! credential) — or a [`Rejection`]. [`serve_with`] takes the resolver;
+//! [`serve`] is the open single-store case.
+//!
+//! Every tenant can share one store: serve each session the store scoped to the
+//! client's tenant, `Evento::new(store.clone()).tenant(tenant)?`
+//! ([`Evento::tenant`](evento_core::Evento::tenant)). The scoped executor acts in
+//! that tenant whatever the client's requests say — its reads, writes, loads,
+//! snapshots and subscription cursors — and refuses `replicate`, so a client
+//! never reaches another tenant's data. The client learns its tenant at `Hello`
+//! ([`Executor::tenant`](evento_core::Executor::tenant)) and needs no
+//! tenant-aware code. What a session still shares: the write notifications every
+//! client is pushed, which carry a store-wide counter — a client sees when, and
+//! how often, the store is written, never what.
 //!
 //! **Addresses.** A client names its server by an [`Address`]: an IP and port,
 //! or a `host:port` looked up again on every connection attempt, so a

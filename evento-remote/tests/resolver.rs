@@ -79,7 +79,13 @@ fn event(aggregate_id: &str, version: u16) -> Event {
 
 async fn count(client: &Client) -> usize {
     client
-        .read(None, None, Args::forward(100, None), None)
+        .read(
+            None,
+            None,
+            evento_core::TenantFilter::All,
+            Args::forward(100, None),
+            None,
+        )
         .await
         .unwrap()
         .edges
@@ -187,7 +193,16 @@ async fn the_server_can_end_a_connection() {
     close_tx.send(true).unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
-        match client.read(None, None, Args::forward(1, None), None).await {
+        match client
+            .read(
+                None,
+                None,
+                evento_core::TenantFilter::All,
+                Args::forward(1, None),
+                None,
+            )
+            .await
+        {
             Ok(_) => assert!(tokio::time::Instant::now() < deadline, "still served"),
             Err(err) => {
                 let msg = format!("{err:#}");
