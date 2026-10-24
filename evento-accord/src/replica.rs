@@ -1589,6 +1589,13 @@ impl Replica {
         self.blocked.contains_key(&txn)
     }
 
+    /// The dependency `txn` is known to be waiting on here (see `blocked`),
+    /// if any: the first one found neither applied nor committed to execute
+    /// after it.
+    pub fn blocker(&self, txn: TxnId) -> Option<TxnId> {
+        self.blocked.get(&txn).copied()
+    }
+
     /// The transactions this replica never witnessed that a command committed
     /// here waits on (see `blocked`), with `t0` before `cutoff`, oldest first.
     /// Anti-entropy brings such a dependency in only once it is applied

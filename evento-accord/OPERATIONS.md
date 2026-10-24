@@ -215,8 +215,9 @@ refuses anything else before a vote, and a node never installs it.
 
 - **Automatic:** `start_recovery()` runs a sweep that (a) takes over any transaction
   stalled past `recovery_timeout` or whose coordinator the phi-accrual detector
-  suspects, (b) pulls committed transactions a peer missed (anti-entropy), and (c)
-  compacts redundant state. A healthy cluster recovers nothing.
+  suspects, and first any stalled one its read waits on, (b) pulls committed
+  transactions a peer missed (anti-entropy), and (c) compacts redundant state. A
+  healthy cluster recovers nothing.
 - **Restart a crashed node:** rebuild the `Node` against the **same durable journal**
   and call `node.recover_state().await?` *before* serving — it restores the replica
   (status/ballots/decision), replays committed transactions into the data store, and

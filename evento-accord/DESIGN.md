@@ -481,9 +481,12 @@ backend (sql/fjall). Phases, in order:
   (#317, `assert_live`): everything healed and any node told to rejoin rejoined,
   each node must coordinate a write that commits, pass a read barrier on every key
   (its store then at the highest acknowledged version), and compact its consensus
-  state away, within bounds derived from its `NodeConfig`. It holds everywhere;
-  under message faults a healed cluster takes up to ~50 s of virtual time to recover
-  the transactions left stalled (#326), which the bounds allow. An **absence**
+  state away, within bounds derived from its `NodeConfig`. It holds everywhere.
+  A healed cluster used to take up to ~50 s of virtual time under message faults to
+  recover the transactions left stalled, one `collect_timeout` at a time; it now
+  recovers them within a few (#326). What takes longer is a replica catching up on
+  applied transactions it missed, one anti-entropy page per round, which the bounds
+  allow. An **absence**
   scenario (#310) has minority nodes go silent past `peer_absence_limit` — crashed,
   or cut one way — while the majority writes and compacts past them, then come back
   (rejoined if told to); an outside coordinator pre-accepts a write at a node just
@@ -1066,6 +1069,23 @@ backend (sql/fjall). Phases, in order:
         "never witnessed"), and its stale report let peers compact what it no
         longer held. Its join now waits for a contact vouching past an
         amnesia fence (#312, see Phase B).
+        A healed cluster with transactions in flight took tens of seconds to
+        serve again (#326). Each node's sweep recovered them one at a time,
+        in `t0` order, and a recovery whose read a replica held back on a
+        dependency still stalled waited out `collect_timeout` for it: often
+        one the slow path had placed before it with a higher `t0`, or one read
+        and never applied, its coordinator gone. Each link of such a chain
+        cost a `collect_timeout` (5 s by default), and a read taken once the
+        chain cleared reached a recovery that had given up. Now a sweep
+        recovery gives a read up as soon as this replica holds it back on a
+        stalled transaction, takes that one over first (recovered, or its
+        decision learned if never witnessed here), then comes back
+        (`Node::recover_stalled`). And as a replica answers the reads and the
+        apply to whoever committed last, a coordinator or a recovery waits for
+        the reads only until this node applied the transaction, and a recovery
+        for the acks too: of two recoveries racing, one heard nothing
+        (`tests/stalled_recovery.rs`). Over 60 000 swarm seeds, those needing
+        more than 20 `collect_timeout`s to serve again went from 30 to none.
         **Open** (confirmed or plausible, not yet fixed):
         an epoch change can remap a route's keys onto replicas that never
         witnessed an in-flight txn, which then answer "never witnessed"; the
