@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use evento_core::cursor::{Args, ReadResult, Value};
-use evento_core::{Event, EventFilter, Executor, RoutingKey, WriteError};
+use evento_core::{Event, EventFilter, Executor, RoutingKey, TenantFilter, WriteError};
 use evento_remote::{serve, Address, Client};
 use ulid::Ulid;
 
@@ -31,7 +31,13 @@ async fn read_eventually(client: &Client) -> anyhow::Result<ReadResult<Event>> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         match client
-            .read(filter(), None, Args::forward(10, None), None)
+            .read(
+                filter(),
+                None,
+                evento_core::TenantFilter::All,
+                Args::forward(10, None),
+                None,
+            )
             .await
         {
             Ok(page) => return Ok(page),
@@ -72,7 +78,13 @@ async fn host_name_is_looked_up_on_every_connection() -> anyhow::Result<()> {
         .connect()
         .await?;
     let page = client
-        .read(filter(), None, Args::forward(10, None), None)
+        .read(
+            filter(),
+            None,
+            evento_core::TenantFilter::All,
+            Args::forward(10, None),
+            None,
+        )
         .await?;
     assert_eq!(page.edges.len(), 1);
     assert_eq!(page.edges[0].node.aggregate_id, "first");
@@ -146,11 +158,12 @@ impl Executor for Lagging {
         &self,
         aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<RoutingKey>,
+        tenant: TenantFilter,
         args: Args,
         to_micros: Option<u64>,
     ) -> anyhow::Result<ReadResult<Event>> {
         self.inner
-            .read(aggregators, routing_key, args, to_micros)
+            .read(aggregators, routing_key, tenant, args, to_micros)
             .await
     }
 
@@ -158,24 +171,29 @@ impl Executor for Lagging {
         &self,
         aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<RoutingKey>,
+        tenant: TenantFilter,
     ) -> anyhow::Result<u64> {
-        self.inner.latest_timestamp(aggregators, routing_key).await
+        self.inner
+            .latest_timestamp(aggregators, routing_key, tenant)
+            .await
     }
 
     async fn get_snapshot(
         &self,
+        tenant: String,
         aggregate_type: String,
         projection: String,
         aggregate_revision: String,
         id: String,
     ) -> anyhow::Result<Option<(Vec<u8>, Value)>> {
         self.inner
-            .get_snapshot(aggregate_type, projection, aggregate_revision, id)
+            .get_snapshot(tenant, aggregate_type, projection, aggregate_revision, id)
             .await
     }
 
     async fn save_snapshot(
         &self,
+        tenant: String,
         aggregate_type: String,
         projection: String,
         aggregate_revision: String,
@@ -185,6 +203,7 @@ impl Executor for Lagging {
     ) -> anyhow::Result<()> {
         self.inner
             .save_snapshot(
+                tenant,
                 aggregate_type,
                 projection,
                 aggregate_revision,
@@ -197,12 +216,13 @@ impl Executor for Lagging {
 
     async fn delete_snapshot(
         &self,
+        tenant: String,
         aggregate_type: String,
         projection: String,
         id: String,
     ) -> anyhow::Result<()> {
         self.inner
-            .delete_snapshot(aggregate_type, projection, id)
+            .delete_snapshot(tenant, aggregate_type, projection, id)
             .await
     }
 }
@@ -225,7 +245,13 @@ async fn bounded_read_stops_at_the_servers_own_watermark() -> anyhow::Result<()>
     let client = Client::connect(addr).await?;
 
     let bounded = client
-        .read(filter(), None, Args::forward(10, None), Some(u64::MAX))
+        .read(
+            filter(),
+            None,
+            evento_core::TenantFilter::All,
+            Args::forward(10, None),
+            Some(u64::MAX),
+        )
         .await?;
     assert!(
         bounded.edges.is_empty(),
@@ -233,13 +259,25 @@ async fn bounded_read_stops_at_the_servers_own_watermark() -> anyhow::Result<()>
     );
 
     let unbounded = client
-        .read(filter(), None, Args::forward(10, None), None)
+        .read(
+            filter(),
+            None,
+            evento_core::TenantFilter::All,
+            Args::forward(10, None),
+            None,
+        )
         .await?;
     assert_eq!(unbounded.edges.len(), 2, "an unbounded read is left alone");
 
     store.stable.store(u64::MAX, Ordering::Release);
     let caught_up = client
-        .read(filter(), None, Args::forward(10, None), Some(u64::MAX))
+        .read(
+            filter(),
+            None,
+            evento_core::TenantFilter::All,
+            Args::forward(10, None),
+            Some(u64::MAX),
+        )
         .await?;
     assert_eq!(caught_up.edges.len(), 2, "the node caught up");
     Ok(())

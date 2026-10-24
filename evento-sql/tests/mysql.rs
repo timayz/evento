@@ -357,3 +357,33 @@ async fn mysql_replicate_large_batch() -> anyhow::Result<()> {
 
     evento_test::replicate_large_batch(&executor).await
 }
+
+#[tokio::test]
+async fn mysql_m0008_round_trip() -> anyhow::Result<()> {
+    let pool = create_mysql_pool("m0008_round_trip").await?;
+    pool::m0008_round_trip(pool).await
+}
+
+#[tokio::test]
+async fn mysql_tenant_streams_are_isolated() -> anyhow::Result<()> {
+    let executor = create_mysql_executor("tenant_streams_are_isolated").await?;
+    evento_test::tenant_streams_are_isolated(&executor).await
+}
+
+#[tokio::test]
+async fn mysql_tenant_subscriptions() -> anyhow::Result<()> {
+    let executor = create_mysql_executor("tenant_subscriptions").await?;
+    evento_test::tenant_subscriptions(&executor).await
+}
+
+#[tokio::test]
+async fn mysql_tenant_projection_subscription() -> anyhow::Result<()> {
+    let executor = create_mysql_executor("tenant_projection_subscription").await?;
+    evento_test::tenant_projection_subscription(&executor).await
+}
+
+#[tokio::test]
+async fn mysql_tenant_snapshots_are_isolated() -> anyhow::Result<()> {
+    let executor = create_mysql_executor("tenant_snapshots_are_isolated").await?;
+    evento_test::tenant_snapshots_are_isolated(&executor).await
+}

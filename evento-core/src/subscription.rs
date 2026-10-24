@@ -151,7 +151,7 @@ use crate::{
     context,
     cursor::{Args, Value},
     upcast::Aliases,
-    Aggregate, AggregateEvent, EventFilter, Executor,
+    Aggregate, AggregateEvent, EventFilter, Executor, TenantFilter,
 };
 
 /// Bounds on the adaptive retry delay after a `Gated` pass. The lower bound
@@ -193,7 +193,7 @@ pub enum RoutingKey {
 /// use evento::cursor::Args;
 /// use evento::metadata::Event;
 /// use evento::subscription::{Context, SubscriptionBuilder};
-/// use evento::Executor;
+/// use evento::{Executor, TenantFilter};
 ///
 /// # #[evento::aggregate]
 /// # pub enum Account {
@@ -216,7 +216,7 @@ pub enum RoutingKey {
 ///     // Use executor for queries
 ///     let events = context
 ///         .executor
-///         .read(None, None, Args::forward(10, None), None)
+///         .read(None, None, TenantFilter::All, Args::forward(10, None), None)
 ///         .await?;
 ///     Ok(())
 /// }
@@ -339,6 +339,10 @@ pub trait Handler<E: Executor>: Sync + Send {
 /// a continuous event processing subscription with retry logic,
 /// routing key filtering, and graceful shutdown support.
 ///
+/// A subscription processes the events of every tenant. Each event carries
+/// its [`tenant`](crate::Event::tenant), and a handler that loads or writes
+/// does so in that tenant (`.tenant(&event.tenant)` on the builder).
+///
 /// # Example
 ///
 /// ```rust,no_run
@@ -366,7 +370,7 @@ pub struct SubscriptionBuilder<E: Executor> {
     context: context::RwContext,
     routing_key: Option<RoutingKey>,
     prefix_key: Option<String>,
-    /// The storage key with its routing/tenant prefix applied — computed once
+    /// The storage key with its routing-key prefix applied — computed once
     /// in `resolve_routing_key` so the hot paths never re-format it.
     resolved_key: String,
     delay: Option<Duration>,
@@ -887,8 +891,9 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
     ///
     /// `prefix_key` is captured from `executor.default_routing_key()` even
     /// when the user has already called `.any_routing_key()`, so the storage key
-    /// remains scoped to the executor's tenant — otherwise two executors with
-    /// different defaults would share one row in the subscriber table.
+    /// remains scoped to the executor's default routing key — otherwise two
+    /// executors with different defaults would share one row in the subscriber
+    /// table.
     fn resolve_routing_key(&mut self, executor: &E) {
         if self.prefix_key.is_none() {
             self.prefix_key = executor.default_routing_key().map(|s| s.to_owned());
@@ -963,6 +968,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                 .read(
                     Some(aggregators.clone()),
                     Some(self.effective_routing_key()),
+                    TenantFilter::All,
                     Args::forward(self.chunk_size, cursor.clone()),
                     stable,
                 )
@@ -1231,6 +1237,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             .latest_timestamp(
                 Some(aggregators.clone()),
                 Some(self.effective_routing_key()),
+                TenantFilter::All,
             )
             .await?;
         *self.latest_ts_cache.lock().expect("latest_ts poisoned") = Some((Instant::now(), v));
@@ -1258,6 +1265,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             .read(
                 Some(aggregators.clone()),
                 Some(self.effective_routing_key()),
+                TenantFilter::All,
                 Args::forward(1, after),
                 None,
             )
@@ -1321,6 +1329,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             .read(
                 Some(aggregators.clone()),
                 Some(self.effective_routing_key()),
+                TenantFilter::All,
                 Args::backward(1, None),
                 stable,
             )
@@ -1660,6 +1669,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             .latest_timestamp(
                 Some(read_aggregators.clone()),
                 Some(self.effective_routing_key()),
+                TenantFilter::All,
             )
             .await?
             .saturating_add(1)

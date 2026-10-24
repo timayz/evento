@@ -319,7 +319,7 @@ fn get_all_accounts() -> Vec<AccountView> {
     let rows = AccountDetailsView::snapshot_rows().read().unwrap();
     let mut accounts: Vec<AccountView> = rows
         .iter()
-        .map(|(id, view)| AccountView {
+        .map(|((_tenant, id), view)| AccountView {
             id: id.to_owned(),
             balance: view.balance,
             currency: view.currency.to_owned(),

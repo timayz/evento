@@ -85,7 +85,7 @@ use std::sync::{Arc, Mutex};
 use evento_core::{
     cursor::{Args, ReadResult, Value},
     metadata::Metadata,
-    Event, EventFilter, Executor, RoutingKey, SubscriberStatus, WriteError,
+    Event, EventFilter, Executor, RoutingKey, SubscriberStatus, TenantFilter, WriteError,
 };
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 use ulid::Ulid;
@@ -159,6 +159,9 @@ impl TryFrom<StoredEvent> for Event {
             version: stored.version,
             name: stored.name,
             routing_key: stored.routing_key,
+            // Not stored yet: the executor refuses every tenant but the
+            // default one.
+            tenant: String::new(),
             data: stored.data,
             metadata: stored.metadata,
             timestamp: stored.timestamp,
@@ -1053,12 +1056,40 @@ impl Fjall {
     }
 }
 
+/// Refuses a tenant other than the default one: the store does not yet keep
+/// the tenant, so a tenant's call is refused rather than served from — or
+/// written into — the default tenant.
+fn default_tenant_only(tenant: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        tenant.is_empty(),
+        "evento-fjall does not support tenants yet (tenant {tenant:?})"
+    );
+    Ok(())
+}
+
+/// [`default_tenant_only`] for a scan: every tenant, or the default one.
+fn default_tenant_filter_only(tenant: &TenantFilter) -> anyhow::Result<()> {
+    match tenant {
+        TenantFilter::All => Ok(()),
+        TenantFilter::Only(tenant) => default_tenant_only(tenant),
+    }
+}
+
+/// [`default_tenant_only`] for every event of a write.
+fn default_tenant_events_only(events: &[Event]) -> Result<(), WriteError> {
+    for event in events {
+        default_tenant_only(&event.tenant).map_err(WriteError::Unknown)?;
+    }
+    Ok(())
+}
+
 #[async_trait::async_trait]
 impl Executor for Fjall {
     async fn write(&self, events: Vec<Event>) -> Result<(), WriteError> {
         if events.is_empty() {
             return Ok(());
         }
+        default_tenant_events_only(&events)?;
         let executor = self.clone();
 
         tokio::task::spawn_blocking(move || executor.write_events(events, true))
@@ -1076,6 +1107,7 @@ impl Executor for Fjall {
         if events.is_empty() {
             return Ok(());
         }
+        default_tenant_events_only(&events)?;
         let executor = self.clone();
 
         // Replication layers own ordering: persist caller timestamps verbatim.
@@ -1096,9 +1128,11 @@ impl Executor for Fjall {
         &self,
         aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<RoutingKey>,
+        tenant: TenantFilter,
         args: Args,
         to_micros: Option<u64>,
     ) -> anyhow::Result<ReadResult<Event>> {
+        default_tenant_filter_only(&tenant)?;
         let executor = self.clone();
 
         tokio::task::spawn_blocking(move || {
@@ -1111,7 +1145,9 @@ impl Executor for Fjall {
         &self,
         _aggregators: Option<Arc<[EventFilter]>>,
         _routing_key: Option<RoutingKey>,
+        tenant: TenantFilter,
     ) -> anyhow::Result<u64> {
+        default_tenant_filter_only(&tenant)?;
         // The commit clock is the max timestamp over ALL events. Using it
         // instead of a filtered lookup makes this O(1) rather than a full
         // load-and-sort of every matching event on every subscription poll;
@@ -1173,9 +1209,11 @@ impl Executor for Fjall {
 
     async fn latest_version(
         &self,
+        tenant: String,
         aggregate_type: String,
         aggregate_id: String,
     ) -> anyhow::Result<u16> {
+        default_tenant_only(&tenant)?;
         let executor = self.clone();
 
         // A single reverse seek on the version-ordered aggregate index —
@@ -1191,9 +1229,11 @@ impl Executor for Fjall {
 
     async fn stream_routing_key(
         &self,
+        tenant: String,
         aggregate_type: String,
         aggregate_id: String,
     ) -> anyhow::Result<Option<Option<String>>> {
+        default_tenant_only(&tenant)?;
         let executor = self.clone();
 
         // Version 1 is the stream's first event and carries the routing key
@@ -1292,11 +1332,13 @@ impl Executor for Fjall {
 
     async fn get_snapshot(
         &self,
+        tenant: String,
         aggregate_type: String,
         projection: String,
         aggregate_revision: String,
         id: String,
     ) -> anyhow::Result<Option<(Vec<u8>, Value)>> {
+        default_tenant_only(&tenant)?;
         let executor = self.clone();
 
         tokio::task::spawn_blocking(move || {
@@ -1335,6 +1377,7 @@ impl Executor for Fjall {
 
     async fn save_snapshot(
         &self,
+        tenant: String,
         aggregate_type: String,
         projection: String,
         aggregate_revision: String,
@@ -1342,6 +1385,7 @@ impl Executor for Fjall {
         data: Vec<u8>,
         cursor: Value,
     ) -> anyhow::Result<()> {
+        default_tenant_only(&tenant)?;
         let executor = self.clone();
 
         tokio::task::spawn_blocking(move || {
@@ -1360,10 +1404,12 @@ impl Executor for Fjall {
 
     async fn delete_snapshot(
         &self,
+        tenant: String,
         aggregate_type: String,
         projection: String,
         id: String,
     ) -> anyhow::Result<()> {
+        default_tenant_only(&tenant)?;
         let executor = self.clone();
 
         tokio::task::spawn_blocking(move || {
@@ -1402,6 +1448,7 @@ mod tests {
             version,
             name: name.to_string(),
             routing_key: Some("test-routing".to_string()),
+            tenant: String::new(),
             data: vec![1, 2, 3],
             metadata: Metadata::default(),
             timestamp: now.as_secs(),
@@ -1454,6 +1501,7 @@ mod tests {
                 .read(
                     Some([EventFilter::by_id_raw("test/Account", "agg-1")].into()),
                     None,
+                    TenantFilter::All,
                     Args::forward(10, None),
                     None,
                 )
@@ -1483,6 +1531,7 @@ mod tests {
             .read(
                 Some([EventFilter::by_id_raw("test/Account", "agg-1")].into()),
                 None,
+                TenantFilter::All,
                 Args::forward(10, None),
                 None,
             )
@@ -1583,6 +1632,7 @@ mod tests {
             .read(
                 Some([EventFilter::by_id_raw("test/Account", "a")].into()),
                 None,
+                TenantFilter::All,
                 Args::forward(10, None),
                 None,
             )
@@ -1615,6 +1665,7 @@ mod tests {
                 .read(
                     Some([EventFilter::by_id_raw("test/Account", "agg-mono")].into()),
                     None,
+                    TenantFilter::All,
                     Args::forward(10, None),
                     None,
                 )
@@ -1633,6 +1684,7 @@ mod tests {
             .read(
                 Some([EventFilter::by_id_raw("test/Account", "agg-mono")].into()),
                 None,
+                TenantFilter::All,
                 Args::forward(10, None),
                 None,
             )
@@ -1665,6 +1717,7 @@ mod tests {
             .read(
                 Some([EventFilter::by_id_raw("test/Account", "agg-restamp")].into()),
                 None,
+                TenantFilter::All,
                 Args::forward(1, None),
                 None,
             )
@@ -1679,6 +1732,7 @@ mod tests {
             .read(
                 Some([EventFilter::by_id_raw("test/Account", "agg-verbatim")].into()),
                 None,
+                TenantFilter::All,
                 Args::forward(1, None),
                 None,
             )
@@ -1702,6 +1756,7 @@ mod tests {
         // Initially: no snapshot
         let result = executor
             .get_snapshot(
+                String::new(),
                 aggregate_type.clone(),
                 projection.clone(),
                 revision.clone(),
@@ -1714,6 +1769,7 @@ mod tests {
         // Save snapshot
         executor
             .save_snapshot(
+                String::new(),
                 aggregate_type.clone(),
                 projection.clone(),
                 revision.clone(),
@@ -1727,6 +1783,7 @@ mod tests {
         // Get matching revision returns the snapshot
         let (got_data, got_cursor) = executor
             .get_snapshot(
+                String::new(),
                 aggregate_type.clone(),
                 projection.clone(),
                 revision.clone(),
@@ -1741,6 +1798,7 @@ mod tests {
         // Get with different revision returns None (revision invalidation)
         let result = executor
             .get_snapshot(
+                String::new(),
                 aggregate_type.clone(),
                 projection.clone(),
                 "2".to_string(),
@@ -1755,6 +1813,7 @@ mod tests {
         let new_cursor = Value("cursor-2".to_string());
         executor
             .save_snapshot(
+                String::new(),
                 aggregate_type.clone(),
                 projection.clone(),
                 "2".to_string(),
@@ -1767,6 +1826,7 @@ mod tests {
 
         let (got_data, got_cursor) = executor
             .get_snapshot(
+                String::new(),
                 aggregate_type.clone(),
                 projection.clone(),
                 "2".to_string(),
@@ -1780,12 +1840,18 @@ mod tests {
 
         // Delete snapshot
         executor
-            .delete_snapshot(aggregate_type.clone(), projection.clone(), id.clone())
+            .delete_snapshot(
+                String::new(),
+                aggregate_type.clone(),
+                projection.clone(),
+                id.clone(),
+            )
             .await
             .unwrap();
 
         let result = executor
             .get_snapshot(
+                String::new(),
                 aggregate_type,
                 projection.clone(),
                 "2".to_string(),
@@ -1797,7 +1863,7 @@ mod tests {
 
         // Delete is idempotent
         executor
-            .delete_snapshot("test/Account".to_string(), projection, id)
+            .delete_snapshot(String::new(), "test/Account".to_string(), projection, id)
             .await
             .unwrap();
     }
@@ -1818,6 +1884,7 @@ mod tests {
             version,
             name: "Stamped".to_string(),
             routing_key: routing_key.map(str::to_string),
+            tenant: String::new(),
             data: vec![],
             metadata: Metadata::default(),
             timestamp,
@@ -1890,7 +1957,7 @@ mod tests {
 
         // Paged read across all events comes back in cursor (stamp) order.
         let page = executor
-            .read(None, None, Args::forward(2, None), None)
+            .read(None, None, TenantFilter::All, Args::forward(2, None), None)
             .await
             .unwrap();
         assert_eq!(page.edges.len(), 2);
@@ -1901,6 +1968,7 @@ mod tests {
             .read(
                 None,
                 None,
+                TenantFilter::All,
                 Args::forward(2, page.page_info.end_cursor.clone()),
                 None,
             )
@@ -1915,6 +1983,7 @@ mod tests {
             .read(
                 Some([EventFilter::by_id_raw("test/Account", "agg-m")].into()),
                 None,
+                TenantFilter::All,
                 Args::forward(10, None),
                 None,
             )
@@ -1925,6 +1994,7 @@ mod tests {
             .read(
                 None,
                 Some(RoutingKey::Value(None)),
+                TenantFilter::All,
                 Args::forward(10, None),
                 None,
             )
@@ -1937,7 +2007,7 @@ mod tests {
         drop(executor);
         let executor = Fjall::open(temp_dir.path()).unwrap();
         let all = executor
-            .read(None, None, Args::forward(10, None), None)
+            .read(None, None, TenantFilter::All, Args::forward(10, None), None)
             .await
             .unwrap();
         assert_eq!(all.edges.len(), 3);
@@ -1966,6 +2036,7 @@ mod tests {
                 .read(
                     Some([EventFilter::by_id_raw("test/Account", "agg-b")].into()),
                     None,
+                    TenantFilter::All,
                     Args::forward(10, None),
                     bound,
                 )
@@ -1976,6 +2047,7 @@ mod tests {
                 .read(
                     Some([EventFilter::by_id_raw("test/Account", "agg-b")].into()),
                     None,
+                    TenantFilter::All,
                     Args::backward(10, None),
                     bound,
                 )
@@ -2011,6 +2083,7 @@ mod tests {
             .read(
                 None,
                 Some(RoutingKey::Value(None)),
+                TenantFilter::All,
                 Args::forward(1, None),
                 None,
             )
@@ -2023,6 +2096,7 @@ mod tests {
             .read(
                 None,
                 Some(RoutingKey::Value(None)),
+                TenantFilter::All,
                 Args::forward(1, first.page_info.end_cursor.clone()),
                 None,
             )
@@ -2042,6 +2116,7 @@ mod tests {
                 .read(
                     None,
                     Some(RoutingKey::Value(routing.map(str::to_string))),
+                    TenantFilter::All,
                     Args::forward(10, None),
                     None,
                 )
@@ -2081,6 +2156,7 @@ mod tests {
             .read(
                 Some([EventFilter::by_id_raw("test/Account", "agg-s")].into()),
                 Some(RoutingKey::Value(Some("hot".to_string()))),
+                TenantFilter::All,
                 Args::forward(2, None),
                 None,
             )
@@ -2095,6 +2171,7 @@ mod tests {
             .read(
                 Some([EventFilter::by_id_raw("test/Account", "agg-s")].into()),
                 Some(RoutingKey::Value(Some("hot".to_string()))),
+                TenantFilter::All,
                 Args::forward(2, page.page_info.end_cursor.clone()),
                 None,
             )

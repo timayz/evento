@@ -28,13 +28,29 @@
 //! piggybacks on every frame, so fronting a replicated backend (Accord) keeps
 //! subscription safety intact.
 //!
-//! **Many stores, credentials.** A host serving one store per tenant implements
+//! **Credentials, tenants.** A host authenticating its clients implements
 //! [`Resolver`]: each connection opens with a `Hello` carrying the token the
 //! client was built with ([`ClientBuilder::token`]), and the resolver answers
 //! with the [`Session`] to serve it — the executor, something to keep alive
-//! for the connection's lifetime (a tenant lease), a signal to end it (a
-//! revoked credential) — or a [`Rejection`]. [`serve_with`] takes the
-//! resolver; [`serve`] is the open single-store case.
+//! for the connection's lifetime, a signal to end it (a revoked credential) —
+//! or a [`Rejection`]. [`serve_with`] takes the resolver; [`serve`] is the open
+//! single-store case.
+//!
+//! Which tenant a client belongs to is the host application's decision — its
+//! resolver maps the token (an API key, say) to one. To confine the client to
+//! that tenant over a store shared by every tenant, serve the connection in it,
+//! `Session::new(store.clone()).tenant(tenant)?` ([`Session::tenant`]): every
+//! request then acts in that tenant whatever it names — what it reads and
+//! loads, the tenant its writes are stamped with — and `replicate` and the
+//! subscriber calls are refused, so the client never reaches another tenant's
+//! data. The client itself stays tenant-agnostic: the events it reads come
+//! back in the default tenant, as from a store of its own, and a tenant
+//! application following the store through a `Sidecar` (evento-core's `rw`
+//! feature) keeps its subscriptions' cursors and its snapshots in its own
+//! store. What a
+//! session still shares: the write notifications every client is pushed, which
+//! carry a store-wide counter — a client sees when, and how often, the store is
+//! written, never what.
 //!
 //! **Addresses.** A client names its server by an [`Address`]: an IP and port,
 //! or a `host:port` looked up again on every connection attempt, so a

@@ -211,6 +211,7 @@ pub struct EventCursor {
 /// - `version` - Sequence number within the aggregate (for optimistic concurrency)
 /// - `name` - Event type name like `"AccountOpened"`
 /// - `routing_key` - Optional key for event distribution/partitioning
+/// - `tenant` - The tenant the aggregate belongs to (`""` = default tenant)
 /// - `data` - Serialized event payload (bitcode format)
 /// - `metadata` - Event metadata (see [`metadata::Metadata`])
 /// - `timestamp` - When the event occurred (Unix seconds)
@@ -234,6 +235,14 @@ pub struct Event {
     pub name: String,
     /// Optional routing key for event distribution
     pub routing_key: Option<String>,
+    /// The tenant the aggregate belongs to; `""` is the default tenant.
+    ///
+    /// Part of the stream's identity: `(tenant, aggregate_type,
+    /// aggregate_id)` names one stream, so the same aggregate id in two
+    /// tenants names two independent streams. Stamped by
+    /// [`WriteBuilder::commit`] from the builder's
+    /// [`tenant`](WriteBuilder::tenant), else `""`.
+    pub tenant: String,
     /// Serialized event data (bitcode format)
     pub data: Vec<u8>,
     /// Event metadata

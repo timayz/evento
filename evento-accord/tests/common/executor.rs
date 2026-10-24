@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use evento_core::cursor::{Args, ReadResult, Reader, Value};
-use evento_core::{Event, EventFilter, Executor, RoutingKey, WriteError};
+use evento_core::{Event, EventFilter, Executor, RoutingKey, TenantFilter, WriteError};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use ulid::Ulid;
@@ -167,6 +167,7 @@ impl Executor for SimExecutor {
 
     async fn latest_version(
         &self,
+        _tenant: String,
         aggregate_type: String,
         aggregate_id: String,
     ) -> anyhow::Result<u16> {
@@ -177,6 +178,7 @@ impl Executor for SimExecutor {
         &self,
         aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<RoutingKey>,
+        tenant: TenantFilter,
         args: Args,
         to_micros: Option<u64>,
     ) -> anyhow::Result<ReadResult<Event>> {
@@ -186,7 +188,9 @@ impl Executor for SimExecutor {
             .unwrap()
             .events
             .iter()
-            .filter(|e| matches(e, &aggregators, &routing_key, to_micros))
+            .filter(|e| {
+                tenant.matches(&e.tenant) && matches(e, &aggregators, &routing_key, to_micros)
+            })
             .cloned()
             .collect();
         Ok(Reader::new(events).args(args).execute()?)
@@ -196,6 +200,7 @@ impl Executor for SimExecutor {
         &self,
         aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<RoutingKey>,
+        tenant: TenantFilter,
     ) -> anyhow::Result<u64> {
         Ok(self
             .log
@@ -203,7 +208,7 @@ impl Executor for SimExecutor {
             .unwrap()
             .events
             .iter()
-            .filter(|e| matches(e, &aggregators, &routing_key, None))
+            .filter(|e| tenant.matches(&e.tenant) && matches(e, &aggregators, &routing_key, None))
             .map(|e| {
                 e.timestamp
                     .saturating_mul(1_000_000)
@@ -239,6 +244,7 @@ impl Executor for SimExecutor {
 
     async fn get_snapshot(
         &self,
+        _tenant: String,
         _aggregate_type: String,
         _projection: String,
         _aggregate_revision: String,
@@ -249,6 +255,7 @@ impl Executor for SimExecutor {
 
     async fn save_snapshot(
         &self,
+        _tenant: String,
         _aggregate_type: String,
         _projection: String,
         _aggregate_revision: String,
@@ -261,6 +268,7 @@ impl Executor for SimExecutor {
 
     async fn delete_snapshot(
         &self,
+        _tenant: String,
         _aggregate_type: String,
         _projection: String,
         _id: String,

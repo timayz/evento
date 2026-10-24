@@ -25,6 +25,7 @@ use std::{marker::PhantomData, sync::Arc};
 use crate::{
     cursor::{Args, ReadResult, Value},
     Aggregate, AggregateEvent, AggregateEvents, Event, EventFilter, Executor, RoutingKey,
+    TenantFilter,
 };
 
 /// Events fetched per backend round trip while draining a stream.
@@ -93,9 +94,15 @@ pub fn read_raw(aggregate_type: impl Into<String>, id: impl Into<String>) -> Rea
 /// a reader with no routing filter reads events under **every** routing key.
 /// Narrow it with [`routing_key`](Self::routing_key) or
 /// [`no_routing_key`](Self::no_routing_key).
+///
+/// # Tenants
+///
+/// The stream read is the default tenant's (`""`), or the one
+/// [`tenant`](Self::tenant) names.
 pub struct ReadBuilder<A = ()> {
     filter: EventFilter,
     routing_key: Option<RoutingKey>,
+    tenant: Option<String>,
     limit: Option<u16>,
     after: Option<Value>,
     before: Option<Value>,
@@ -108,6 +115,7 @@ impl<A> ReadBuilder<A> {
         Self {
             filter,
             routing_key: None,
+            tenant: None,
             limit: None,
             after: None,
             before: None,
@@ -144,6 +152,12 @@ impl<A> ReadBuilder<A> {
     /// The default — no routing filter at all — reads every key instead.
     pub fn no_routing_key(mut self) -> Self {
         self.routing_key = Some(RoutingKey::Value(None));
+        self
+    }
+
+    /// Reads the stream of `tenant` instead of the default tenant's.
+    pub fn tenant(mut self, v: impl Into<String>) -> Self {
+        self.tenant = Some(v.into());
         self
     }
 
@@ -201,6 +215,12 @@ impl<A> ReadBuilder<A> {
         Arc::from([self.filter.clone()])
     }
 
+    /// The one tenant the stream is read in: never every tenant, since a
+    /// stream belongs to one.
+    fn tenant_filter(&self) -> TenantFilter {
+        TenantFilter::Only(self.tenant.clone().unwrap_or_default())
+    }
+
     fn args_for(&self, page_size: u16, cursor: Option<Value>) -> Args {
         if self.backward {
             Args::backward(page_size, cursor)
@@ -223,7 +243,13 @@ impl<A> ReadBuilder<A> {
         let args = self.args_for(self.limit.unwrap_or(DEFAULT_PAGE), cursor);
 
         executor
-            .read(Some(self.filters()), self.routing_key.clone(), args, None)
+            .read(
+                Some(self.filters()),
+                self.routing_key.clone(),
+                self.tenant_filter(),
+                args,
+                None,
+            )
             .await
     }
 
@@ -234,6 +260,7 @@ impl<A> ReadBuilder<A> {
     /// returned.
     pub async fn execute<E: Executor>(&self, executor: &E) -> anyhow::Result<Vec<Event>> {
         let filters = self.filters();
+        let tenant = self.tenant_filter();
         let mut cursor = if self.backward {
             self.before.clone()
         } else {
@@ -257,6 +284,7 @@ impl<A> ReadBuilder<A> {
                 .read(
                     Some(filters.clone()),
                     self.routing_key.clone(),
+                    tenant.clone(),
                     // `to_micros` is deliberately unbounded: the stability
                     // watermark exists to hold back a *persisted* subscription
                     // cursor, and a one-shot read wants read-your-writes.

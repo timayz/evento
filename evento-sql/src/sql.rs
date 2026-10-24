@@ -21,7 +21,7 @@ use ulid::Ulid;
 
 use evento_core::{
     cursor::{self, Args, Cursor, Edge, PageInfo, ReadResult, Value},
-    EventFilter, Executor, SubscriberStatus, WriteError,
+    EventFilter, Executor, SubscriberStatus, TenantFilter, WriteError,
 };
 
 /// Dialect-agnostic access to a statement's affected-row count.
@@ -70,7 +70,9 @@ impl RowsAffected for sqlx::postgres::PgQueryResult {
 /// - `Version` - Event sequence number within the aggregate
 /// - `Data` - Serialized event payload (BLOB, bitcode format)
 /// - `Metadata` - Serialized event metadata (BLOB, bitcode format)
-/// - `RoutingKey` - Optional routing key for partitioning (VARCHAR(50))
+/// - `RoutingKey` - Optional routing key for partitioning (VARCHAR(255))
+/// - `Tenant` - The tenant the aggregate belongs to; `''` is the default
+///   tenant (VARCHAR(255), part of the stream's identity)
 /// - `Timestamp` - Event timestamp in seconds (BIGINT)
 /// - `TimestampSubsec` - Sub-second precision (BIGINT)
 #[derive(Iden, Clone)]
@@ -93,6 +95,8 @@ pub enum Event {
     Metadata,
     /// Optional routing key
     RoutingKey,
+    /// The tenant the aggregate belongs to (`''` = default tenant)
+    Tenant,
     /// Timestamp in seconds
     Timestamp,
     /// Sub-second precision
@@ -108,6 +112,8 @@ pub enum Event {
 pub enum Snapshot {
     /// The table name: `snapshot`
     Table,
+    /// The tenant the snapshotted aggregate belongs to
+    Tenant,
     /// Snapshot ID
     Id,
     /// Snapshot type
@@ -264,7 +270,7 @@ const DEFAULT_STABLE_MARGIN: Duration = Duration::from_secs(1);
 /// being refreshed with a round trip. Must stay well under any configured
 /// [`Sql::stable_margin`], which already absorbs far more skew than a
 /// TTL-stale sample introduces.
-/// Rows per `INSERT` into the event table: ten bound values each keeps a
+/// Rows per `INSERT` into the event table: eleven bound values each keeps a
 /// statement well under every backend's bound-value cap (SQLite: 32766).
 const INSERT_CHUNK: usize = 1000;
 
@@ -354,6 +360,7 @@ where
         &self,
         aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<evento_core::RoutingKey>,
+        tenant: TenantFilter,
         args: Args,
         to_micros: Option<u64>,
     ) -> anyhow::Result<ReadResult<evento_core::Event>> {
@@ -367,6 +374,7 @@ where
                 Event::Data,
                 Event::Metadata,
                 Event::RoutingKey,
+                Event::Tenant,
                 Event::Timestamp,
                 Event::TimestampSubsec,
             ])
@@ -417,6 +425,15 @@ where
                 |_q| {},
             )
             .conditions(
+                matches!(tenant, TenantFilter::Only(_)),
+                |q| {
+                    if let TenantFilter::Only(ref tenant) = tenant {
+                        q.and_where(Expr::col(Event::Tenant).eq(tenant));
+                    }
+                },
+                |_q| {},
+            )
+            .conditions(
                 to_micros.is_some(),
                 |q| {
                     let Some(bound) = to_micros else {
@@ -454,6 +471,7 @@ where
         &self,
         aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<evento_core::RoutingKey>,
+        tenant: TenantFilter,
     ) -> anyhow::Result<u64> {
         let statement = Query::select()
             .expr(Func::max(Expr::col(Event::Timestamp)))
@@ -499,6 +517,15 @@ where
 
                     if let Some(evento_core::RoutingKey::Value(None)) = routing_key {
                         q.and_where(Expr::col(Event::RoutingKey).is_null());
+                    }
+                },
+                |_q| {},
+            )
+            .conditions(
+                matches!(tenant, TenantFilter::Only(_)),
+                |q| {
+                    if let TenantFilter::Only(ref tenant) = tenant {
+                        q.and_where(Expr::col(Event::Tenant).eq(tenant));
                     }
                 },
                 |_q| {},
@@ -600,6 +627,7 @@ where
 
     async fn latest_version(
         &self,
+        tenant: String,
         aggregate_type: String,
         aggregate_id: String,
     ) -> anyhow::Result<u16> {
@@ -615,6 +643,7 @@ where
             .from(Event::Table)
             .and_where(Expr::col(Event::AggregatorType).eq(aggregate_type))
             .and_where(Expr::col(Event::AggregatorId).eq(aggregate_id))
+            .and_where(Expr::col(Event::Tenant).eq(tenant))
             .to_owned();
         let (sql, values) = Self::build_sqlx(statement);
         let (last,): (Option<i64>,) =
@@ -629,17 +658,19 @@ where
 
     async fn stream_routing_key(
         &self,
+        tenant: String,
         aggregate_type: String,
         aggregate_id: String,
     ) -> anyhow::Result<Option<Option<String>>> {
-        // Seek on the unique `(type, id, version)` index: version 1 is the
-        // stream's first event and carries the routing key the stream was
-        // created with — no full event row (data/metadata blobs) needed.
+        // Seek on the unique `(type, id, tenant, version)` index: version 1
+        // is the stream's first event and carries the routing key the stream
+        // was created with — no full event row (data/metadata blobs) needed.
         let statement = Query::select()
             .columns([Event::RoutingKey])
             .from(Event::Table)
             .and_where(Expr::col(Event::AggregatorType).eq(aggregate_type))
             .and_where(Expr::col(Event::AggregatorId).eq(aggregate_id))
+            .and_where(Expr::col(Event::Tenant).eq(tenant))
             .and_where(Expr::col(Event::Version).eq(1))
             .limit(1)
             .to_owned();
@@ -683,7 +714,7 @@ where
             return Ok(());
         }
 
-        // Contiguity check: the unique `(type, id, version)` index only catches
+        // Contiguity check: the unique `(type, id, tenant, version)` index only catches
         // duplicate versions, not a gap (e.g. writing version 11 when the
         // aggregate is at 5). A concurrent writer that advances the version
         // after this check can only cause the batch to collide on the unique
@@ -694,7 +725,11 @@ where
         if let Some(first) = events.first() {
             if first.version != 1 {
                 let last = self
-                    .latest_version(first.aggregate_type.clone(), first.aggregate_id.clone())
+                    .latest_version(
+                        first.tenant.clone(),
+                        first.aggregate_type.clone(),
+                        first.aggregate_id.clone(),
+                    )
                     .await
                     .map_err(WriteError::Unknown)?;
 
@@ -808,6 +843,7 @@ where
 
     async fn get_snapshot(
         &self,
+        tenant: String,
         aggregate_type: String,
         projection: String,
         aggregate_revision: String,
@@ -816,6 +852,7 @@ where
         let statement = Query::select()
             .columns([Snapshot::Data, Snapshot::Cursor])
             .from(Snapshot::Table)
+            .and_where(Expr::col(Snapshot::Tenant).eq(Expr::value(tenant)))
             .and_where(Expr::col(Snapshot::Type).eq(Expr::value(aggregate_type)))
             .and_where(Expr::col(Snapshot::Projection).eq(Expr::value(projection)))
             .and_where(Expr::col(Snapshot::Id).eq(Expr::value(id)))
@@ -836,6 +873,7 @@ where
 
     async fn save_snapshot(
         &self,
+        tenant: String,
         aggregate_type: String,
         projection: String,
         aggregate_revision: String,
@@ -846,6 +884,7 @@ where
         let statement = Query::insert()
             .into_table(Snapshot::Table)
             .columns([
+                Snapshot::Tenant,
                 Snapshot::Type,
                 Snapshot::Projection,
                 Snapshot::Id,
@@ -854,6 +893,7 @@ where
                 Snapshot::Data,
             ])
             .values_panic([
+                tenant.into(),
                 aggregate_type.into(),
                 projection.into(),
                 id.to_string().into(),
@@ -862,10 +902,15 @@ where
                 data.into(),
             ])
             .on_conflict(
-                OnConflict::columns([Snapshot::Type, Snapshot::Projection, Snapshot::Id])
-                    .update_columns([Snapshot::Data, Snapshot::Cursor, Snapshot::Revision])
-                    .value(Snapshot::UpdatedAt, Expr::current_timestamp())
-                    .to_owned(),
+                OnConflict::columns([
+                    Snapshot::Tenant,
+                    Snapshot::Type,
+                    Snapshot::Projection,
+                    Snapshot::Id,
+                ])
+                .update_columns([Snapshot::Data, Snapshot::Cursor, Snapshot::Revision])
+                .value(Snapshot::UpdatedAt, Expr::current_timestamp())
+                .to_owned(),
             )
             .to_owned();
 
@@ -880,12 +925,14 @@ where
 
     async fn delete_snapshot(
         &self,
+        tenant: String,
         aggregate_type: String,
         projection: String,
         id: String,
     ) -> anyhow::Result<()> {
         let statement = Query::delete()
             .from_table(Snapshot::Table)
+            .and_where(Expr::col(Snapshot::Tenant).eq(Expr::value(tenant)))
             .and_where(Expr::col(Snapshot::Type).eq(Expr::value(aggregate_type)))
             .and_where(Expr::col(Snapshot::Projection).eq(Expr::value(projection)))
             .and_where(Expr::col(Snapshot::Id).eq(Expr::value(id)))
@@ -915,7 +962,7 @@ where
         events: Vec<evento_core::Event>,
         restamp: bool,
     ) -> Result<(), WriteError> {
-        // One statement binds ten values per row, and every backend caps the
+        // One statement binds eleven values per row, and every backend caps the
         // bound values of a statement (SQLite at 32766): a large batch — a
         // joining replica's snapshot — goes in chunks, inside one transaction
         // so the batch stays all-or-nothing.
@@ -933,6 +980,7 @@ where
                     Event::AggregatorId,
                     Event::Version,
                     Event::RoutingKey,
+                    Event::Tenant,
                     Event::Timestamp,
                     Event::TimestampSubsec,
                 ])
@@ -954,6 +1002,7 @@ where
                     event.aggregate_id.into(),
                     event.version.into(),
                     event.routing_key.into(),
+                    event.tenant.into(),
                     timestamp,
                     timestamp_subsec,
                 ]);
@@ -992,7 +1041,7 @@ where
         // (Postgres `lc_messages`, MySQL locale) and matching them silently
         // breaks optimistic concurrency on non-English servers. The only
         // unique constraints on `event` are the primary key (random ULID,
-        // collision-free in practice) and the `(type, id, version)` index,
+        // collision-free in practice) and the `(type, id, tenant, version)` index,
         // so a unique violation means a version conflict.
         let is_unique = err
             .as_database_error()
@@ -1475,6 +1524,13 @@ where
             version,
             name: sqlx::Row::try_get(row, "name")?,
             routing_key: sqlx::Row::try_get(row, "routing_key")?,
+            // A hand-built select without the column reads as the default
+            // tenant, as every row stored before the column existed.
+            tenant: match sqlx::Row::try_get(row, "tenant") {
+                Ok(tenant) => tenant,
+                Err(sqlx::Error::ColumnNotFound(_)) => String::new(),
+                Err(err) => return Err(err),
+            },
             data: sqlx::Row::try_get(row, "data")?,
             timestamp,
             timestamp_subsec,

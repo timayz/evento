@@ -63,6 +63,7 @@ impl ShardExec {
             .read(
                 Some([EventFilter::by_id_raw("test/Account", id)].into()),
                 None,
+                evento_core::TenantFilter::All,
                 Args::forward(50, None),
                 None,
             )

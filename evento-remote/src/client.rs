@@ -32,7 +32,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use bytes::Bytes;
 use evento_core::cursor::{Args, ReadResult, Value};
-use evento_core::{Event, EventFilter, Executor, RoutingKey, WriteError};
+use evento_core::{Event, EventFilter, Executor, RoutingKey, TenantFilter, WriteError};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -43,7 +43,7 @@ use tokio_util::either::Either;
 use ulid::Ulid;
 
 use crate::wire::{
-    decode_tagged, encode_tagged, ClientFrame, RecordKind, Rejection, Request, Response,
+    decode_tagged, encode_tagged, ClientFrame, HelloOk, RecordKind, Rejection, Request, Response,
     ServerFrame, Token, MAX_FRAME_LENGTH,
 };
 
@@ -205,10 +205,10 @@ impl ClientBuilder {
         let mut lanes = Vec::with_capacity(self.connections);
         let mut default_routing_key = None;
         for lane in 0..self.connections {
-            let (framed, routing_key) =
+            let (framed, hello) =
                 connect_and_hello(&self.dial, &stable, self.request_timeout).await?;
             if lane == 0 {
-                default_routing_key = routing_key;
+                default_routing_key = hello.default_routing_key;
             }
             let (req_tx, req_rx) = mpsc::channel(REQ_CAPACITY);
             tokio::spawn(
@@ -331,6 +331,7 @@ impl Executor for Client {
         &self,
         aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<RoutingKey>,
+        tenant: TenantFilter,
         args: Args,
         to_micros: Option<u64>,
     ) -> anyhow::Result<ReadResult<Event>> {
@@ -338,6 +339,7 @@ impl Executor for Client {
             .request(Request::Read {
                 aggregators: aggregators.map(|a| a.to_vec()),
                 routing_key,
+                tenant,
                 args,
                 to_micros,
             })
@@ -353,11 +355,13 @@ impl Executor for Client {
         &self,
         aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<RoutingKey>,
+        tenant: TenantFilter,
     ) -> anyhow::Result<u64> {
         match self
             .request(Request::LatestTimestamp {
                 aggregators: aggregators.map(|a| a.to_vec()),
                 routing_key,
+                tenant,
             })
             .await?
         {
@@ -403,11 +407,13 @@ impl Executor for Client {
 
     async fn latest_version(
         &self,
+        tenant: String,
         aggregate_type: String,
         aggregate_id: String,
     ) -> anyhow::Result<u16> {
         match self
             .request(Request::LatestVersion {
+                tenant,
                 aggregate_type,
                 aggregate_id,
             })
@@ -421,11 +427,13 @@ impl Executor for Client {
 
     async fn stream_routing_key(
         &self,
+        tenant: String,
         aggregate_type: String,
         aggregate_id: String,
     ) -> anyhow::Result<Option<Option<String>>> {
         match self
             .request(Request::StreamRoutingKey {
+                tenant,
                 aggregate_type,
                 aggregate_id,
             })
@@ -472,6 +480,7 @@ impl Executor for Client {
 
     async fn get_snapshot(
         &self,
+        tenant: String,
         aggregate_type: String,
         projection: String,
         aggregate_revision: String,
@@ -479,6 +488,7 @@ impl Executor for Client {
     ) -> anyhow::Result<Option<(Vec<u8>, Value)>> {
         match self
             .request(Request::GetSnapshot {
+                tenant,
                 aggregate_type,
                 projection,
                 aggregate_revision,
@@ -494,6 +504,7 @@ impl Executor for Client {
 
     async fn save_snapshot(
         &self,
+        tenant: String,
         aggregate_type: String,
         projection: String,
         aggregate_revision: String,
@@ -503,6 +514,7 @@ impl Executor for Client {
     ) -> anyhow::Result<()> {
         match self
             .request(Request::SaveSnapshot {
+                tenant,
                 aggregate_type,
                 projection,
                 aggregate_revision,
@@ -520,12 +532,14 @@ impl Executor for Client {
 
     async fn delete_snapshot(
         &self,
+        tenant: String,
         aggregate_type: String,
         projection: String,
         id: String,
     ) -> anyhow::Result<()> {
         match self
             .request(Request::DeleteSnapshot {
+                tenant,
                 aggregate_type,
                 projection,
                 id,
@@ -685,15 +699,16 @@ impl Actor {
 }
 
 /// Establishes one connection (TLS handshake included) and performs the
-/// `Hello` exchange, returning the framed stream and the server's
-/// `default_routing_key`. Seeds the stable watermark from the reply. Frames
+/// `Hello` exchange, returning the framed stream and what the server answered
+/// (its `default_routing_key`). Seeds the stable watermark from the reply.
+/// Frames
 /// pushed before the reply (notifies) only update the watermark. A refusal
 /// comes back as an error whose source is the [`Rejection`].
 async fn connect_and_hello(
     dial: &Dial,
     stable: &AtomicU64,
     timeout: Duration,
-) -> anyhow::Result<(Framed<ClientStream, LengthDelimitedCodec>, Option<String>)> {
+) -> anyhow::Result<(Framed<ClientStream, LengthDelimitedCodec>, HelloOk)> {
     // A host name is looked up here, on every attempt, and each address it
     // resolves to is tried in turn; an IP is used as is.
     let stream = TcpStream::connect(dial.addr.0.as_str())
@@ -723,7 +738,7 @@ async fn connect_and_hello(
         .send(Bytes::from(encode_tagged(RecordKind::ClientFrame, &hello)?))
         .await?;
 
-    let default_routing_key = tokio::time::timeout(timeout, async {
+    let hello = tokio::time::timeout(timeout, async {
         loop {
             let Some(item) = framed.next().await else {
                 anyhow::bail!("connection closed during hello");
@@ -740,7 +755,7 @@ async fn connect_and_hello(
                     let ok = reply
                         .map_err(anyhow::Error::new)
                         .context("the server refused the connection")?;
-                    return Ok(ok.default_routing_key);
+                    return Ok(ok);
                 }
                 ServerFrame::Notify {
                     stable_timestamp, ..
@@ -756,5 +771,5 @@ async fn connect_and_hello(
     .await
     .map_err(|_| anyhow::anyhow!("hello timed out after {timeout:?}"))??;
 
-    Ok((framed, default_routing_key))
+    Ok((framed, hello))
 }

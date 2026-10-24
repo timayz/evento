@@ -22,6 +22,10 @@
 //! `write_watch` backend documents). A connection without a `write_watch`
 //! may thus be woken by a write to another executor; the watch is
 //! level-triggered, so a spurious wakeup costs one empty poll.
+//!
+//! A session may serve one tenant ([`Session::tenant`]): every request on the
+//! connection then acts in that tenant, whatever tenant it names, and the
+//! requests that would reach past it are refused.
 
 use std::any::Any;
 use std::net::SocketAddr;
@@ -29,7 +33,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use evento_core::Executor;
+use evento_core::{Executor, TenantError, TenantFilter};
 use futures_util::stream::SplitStream;
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -80,6 +84,7 @@ pub struct Hello {
 /// What a connection is served with, as a [`Resolver`] builds it.
 pub struct Session<E> {
     executor: E,
+    tenant: Option<Arc<str>>,
     guard: Option<Box<dyn Any + Send + Sync>>,
     close: Option<watch::Receiver<bool>>,
 }
@@ -89,9 +94,42 @@ impl<E> Session<E> {
     pub fn new(executor: E) -> Self {
         Self {
             executor,
+            tenant: None,
             guard: None,
             close: None,
         }
+    }
+
+    /// Serves the connection in `tenant` alone, whatever tenant its requests
+    /// name: reads and loads see only `tenant`'s events, writes land in
+    /// `tenant`, and the version, routing-key and snapshot lookups are
+    /// `tenant`'s. A host that maps a client's credential to a tenant in its
+    /// [`Resolver`] confines the client this way, over one store shared by
+    /// every tenant.
+    ///
+    /// The client sees a store of its own: the events it reads come back in
+    /// the default tenant (`""`), so it names no tenant anywhere — its
+    /// projections, snapshots and cursors are kept as against a store of a
+    /// single tenant.
+    ///
+    /// Requests that would reach past the tenant are refused: `replicate`,
+    /// which keeps the caller's timestamps (an event backdated behind the
+    /// cursor of a subscription over the shared store would never reach it),
+    /// and the subscriber calls, since a subscriber row belongs to no tenant.
+    /// A tenant's application keeps its subscriptions in a store of its own:
+    /// a `Sidecar` (evento-core's `rw` feature) with the client as its events
+    /// source.
+    ///
+    /// # Errors
+    ///
+    /// [`TenantError`] for `""` — the default tenant, which a session serving
+    /// no tenant reaches along with every other — or for a tenant id longer
+    /// than a store keeps.
+    pub fn tenant(mut self, tenant: impl Into<String>) -> Result<Self, TenantError> {
+        let tenant = tenant.into();
+        TenantError::check(&tenant)?;
+        self.tenant = Some(tenant.into());
+        Ok(self)
     }
 
     /// Keeps `guard` alive until the connection ends, then drops it. A host
@@ -370,6 +408,7 @@ async fn connection<R: Resolver>(
     };
     let Session {
         executor,
+        tenant,
         guard: _guard,
         mut close,
     } = session;
@@ -463,12 +502,13 @@ async fn connection<R: Resolver>(
             break;
         };
         let executor = executor.clone();
+        let tenant = tenant.clone();
         let out_tx = out_tx.clone();
         let bump_tx = bump_tx.clone();
         tokio::spawn(async move {
             let _permit = permit;
             let is_write = matches!(request, Request::Write { .. } | Request::Replicate { .. });
-            let response = handle(&executor, request).await;
+            let response = handle(&executor, tenant.as_deref(), request).await;
             if bump_on_write && is_write && matches!(response, Response::Write(Ok(()))) {
                 bump_tx.send_modify(|g| *g += 1);
             }
@@ -490,7 +530,83 @@ fn err_string<T>(result: anyhow::Result<T>) -> Result<T, String> {
     result.map_err(|e| format!("{e:#}"))
 }
 
-async fn handle<E: Executor>(executor: &E, request: Request) -> Response {
+/// Why a session serving a tenant refuses `replicate`.
+const REPLICATE_REFUSED: &str = "replicate is refused on a connection serving a tenant";
+
+/// The answer a session serving a tenant gives the subscriber calls.
+fn subscribers_refused<T>() -> Result<T, String> {
+    Err(
+        "subscriptions are not served on a connection serving a tenant: keep their \
+         cursors in a store of your own (a Sidecar)"
+            .to_owned(),
+    )
+}
+
+/// Puts a request of a session serving `tenant` in that tenant, whatever
+/// tenant it names, or answers it with a refusal when it would reach past the
+/// tenant (see [`Session::tenant`]).
+fn confine(request: &mut Request, tenant: &str) -> Option<Response> {
+    match request {
+        Request::Hello { .. } => None,
+        Request::Write { events } => {
+            for event in events {
+                event.tenant = tenant.to_owned();
+            }
+            None
+        }
+        Request::Replicate { .. } => Some(Response::Write(Err(WireWriteError::Other(
+            REPLICATE_REFUSED.to_owned(),
+        )))),
+        Request::Read { tenant: named, .. } | Request::LatestTimestamp { tenant: named, .. } => {
+            *named = TenantFilter::Only(tenant.to_owned());
+            None
+        }
+        Request::LatestVersion { tenant: named, .. }
+        | Request::StreamRoutingKey { tenant: named, .. }
+        | Request::GetSnapshot { tenant: named, .. }
+        | Request::SaveSnapshot { tenant: named, .. }
+        | Request::DeleteSnapshot { tenant: named, .. } => {
+            *named = tenant.to_owned();
+            None
+        }
+        Request::GetSubscriberCursor { .. } => {
+            Some(Response::SubscriberCursor(subscribers_refused()))
+        }
+        Request::IsSubscriberRunning { .. } => {
+            Some(Response::SubscriberRunning(subscribers_refused()))
+        }
+        Request::SubscriberStatus { .. } => Some(Response::SubscriberStatus(subscribers_refused())),
+        Request::UpsertSubscriber { .. } => Some(Response::Unit(subscribers_refused())),
+        Request::Acknowledge { .. } => Some(Response::Acknowledge(subscribers_refused())),
+    }
+}
+
+/// What a client of a session serving a tenant reads: that tenant's events, in
+/// the default tenant (see [`Session::tenant`]).
+fn present(response: &mut Response) {
+    if let Response::Read(Ok(page)) = response {
+        for event in &mut page.events {
+            event.tenant.clear();
+        }
+    }
+}
+
+/// Serves one request with the session's executor, in the session's tenant
+/// when it serves one (see [`confine`] and [`present`]).
+async fn handle<E: Executor>(executor: &E, tenant: Option<&str>, mut request: Request) -> Response {
+    let Some(tenant) = tenant else {
+        return dispatch(executor, request).await;
+    };
+    if let Some(refusal) = confine(&mut request, tenant) {
+        return refusal;
+    }
+    let mut response = dispatch(executor, request).await;
+    present(&mut response);
+    response
+}
+
+/// Serves one request with the session's executor, its tenants as given.
+async fn dispatch<E: Executor>(executor: &E, request: Request) -> Response {
     match request {
         Request::Hello { .. } => unreachable!("Hello is answered inline by the read loop"),
         Request::Write { events } => Response::Write(
@@ -508,6 +624,7 @@ async fn handle<E: Executor>(executor: &E, request: Request) -> Response {
         Request::Read {
             aggregators,
             routing_key,
+            tenant,
             args,
             to_micros,
         } => {
@@ -526,7 +643,13 @@ async fn handle<E: Executor>(executor: &E, request: Request) -> Response {
             };
             Response::Read(err_string(
                 executor
-                    .read(aggregators.map(Arc::from), routing_key, args, to_micros)
+                    .read(
+                        aggregators.map(Arc::from),
+                        routing_key,
+                        tenant,
+                        args,
+                        to_micros,
+                    )
                     .await
                     .map(WireReadResult::from),
             ))
@@ -534,9 +657,10 @@ async fn handle<E: Executor>(executor: &E, request: Request) -> Response {
         Request::LatestTimestamp {
             aggregators,
             routing_key,
+            tenant,
         } => Response::LatestTimestamp(err_string(
             executor
-                .latest_timestamp(aggregators.map(Arc::from), routing_key)
+                .latest_timestamp(aggregators.map(Arc::from), routing_key, tenant)
                 .await,
         )),
         Request::GetSubscriberCursor { key } => {
@@ -549,17 +673,21 @@ async fn handle<E: Executor>(executor: &E, request: Request) -> Response {
             Response::SubscriberStatus(err_string(executor.subscriber_status(key, worker_id).await))
         }
         Request::LatestVersion {
+            tenant,
             aggregate_type,
             aggregate_id,
         } => Response::LatestVersion(err_string(
-            executor.latest_version(aggregate_type, aggregate_id).await,
+            executor
+                .latest_version(tenant, aggregate_type, aggregate_id)
+                .await,
         )),
         Request::StreamRoutingKey {
+            tenant,
             aggregate_type,
             aggregate_id,
         } => Response::StreamRoutingKey(err_string(
             executor
-                .stream_routing_key(aggregate_type, aggregate_id)
+                .stream_routing_key(tenant, aggregate_type, aggregate_id)
                 .await,
         )),
         Request::UpsertSubscriber { key, worker_id } => {
@@ -574,16 +702,18 @@ async fn handle<E: Executor>(executor: &E, request: Request) -> Response {
             executor.acknowledge(key, worker_id, cursor, lag).await,
         )),
         Request::GetSnapshot {
+            tenant,
             aggregate_type,
             projection,
             aggregate_revision,
             id,
         } => Response::Snapshot(err_string(
             executor
-                .get_snapshot(aggregate_type, projection, aggregate_revision, id)
+                .get_snapshot(tenant, aggregate_type, projection, aggregate_revision, id)
                 .await,
         )),
         Request::SaveSnapshot {
+            tenant,
             aggregate_type,
             projection,
             aggregate_revision,
@@ -593,6 +723,7 @@ async fn handle<E: Executor>(executor: &E, request: Request) -> Response {
         } => Response::Unit(err_string(
             executor
                 .save_snapshot(
+                    tenant,
                     aggregate_type,
                     projection,
                     aggregate_revision,
@@ -603,13 +734,183 @@ async fn handle<E: Executor>(executor: &E, request: Request) -> Response {
                 .await,
         )),
         Request::DeleteSnapshot {
+            tenant,
             aggregate_type,
             projection,
             id,
         } => Response::Unit(err_string(
             executor
-                .delete_snapshot(aggregate_type, projection, id)
+                .delete_snapshot(tenant, aggregate_type, projection, id)
                 .await,
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use evento_core::cursor::{Args, Value};
+    use evento_core::{Event, TenantFilter};
+    use ulid::Ulid;
+
+    use super::{confine, present};
+    use crate::wire::{Request, Response, WireReadResult, WireWriteError};
+
+    fn acme() -> String {
+        "acme".to_owned()
+    }
+
+    #[test]
+    fn a_tenant_session_acts_in_its_tenant_whatever_a_request_names() {
+        let mut write = Request::Write {
+            events: vec![
+                Event::default(),
+                Event {
+                    tenant: "other".to_owned(),
+                    ..Default::default()
+                },
+            ],
+        };
+        assert!(confine(&mut write, "acme").is_none());
+        let Request::Write { events } = write else {
+            unreachable!()
+        };
+        assert!(events.iter().all(|e| e.tenant == "acme"));
+
+        for tenant in [TenantFilter::All, TenantFilter::Only("other".to_owned())] {
+            let mut read = Request::Read {
+                aggregators: None,
+                routing_key: None,
+                tenant: tenant.clone(),
+                args: Args::forward(1, None),
+                to_micros: None,
+            };
+            assert!(confine(&mut read, "acme").is_none());
+            assert!(
+                matches!(&read, Request::Read { tenant: TenantFilter::Only(t), .. } if *t == acme())
+            );
+            let mut latest = Request::LatestTimestamp {
+                aggregators: None,
+                routing_key: None,
+                tenant,
+            };
+            assert!(confine(&mut latest, "acme").is_none());
+            assert!(
+                matches!(&latest, Request::LatestTimestamp { tenant: TenantFilter::Only(t), .. } if *t == acme())
+            );
+        }
+
+        let other = || "other".to_owned();
+        let mut requests = [
+            Request::LatestVersion {
+                tenant: other(),
+                aggregate_type: other(),
+                aggregate_id: other(),
+            },
+            Request::StreamRoutingKey {
+                tenant: other(),
+                aggregate_type: other(),
+                aggregate_id: other(),
+            },
+            Request::GetSnapshot {
+                tenant: other(),
+                aggregate_type: other(),
+                projection: other(),
+                aggregate_revision: other(),
+                id: other(),
+            },
+            Request::SaveSnapshot {
+                tenant: other(),
+                aggregate_type: other(),
+                projection: other(),
+                aggregate_revision: other(),
+                id: other(),
+                data: vec![],
+                cursor: Value(String::new()),
+            },
+            Request::DeleteSnapshot {
+                tenant: other(),
+                aggregate_type: other(),
+                projection: other(),
+                id: other(),
+            },
+        ];
+        for request in &mut requests {
+            assert!(confine(request, "acme").is_none());
+            let (Request::LatestVersion { tenant, .. }
+            | Request::StreamRoutingKey { tenant, .. }
+            | Request::GetSnapshot { tenant, .. }
+            | Request::SaveSnapshot { tenant, .. }
+            | Request::DeleteSnapshot { tenant, .. }) = &*request
+            else {
+                unreachable!()
+            };
+            assert_eq!(*tenant, acme(), "{request:?}");
+        }
+    }
+
+    #[test]
+    fn a_tenant_session_reads_its_events_in_the_default_tenant() {
+        let event = |tenant: &str| Event {
+            tenant: tenant.to_owned(),
+            ..Default::default()
+        };
+        let mut response = Response::Read(Ok(WireReadResult {
+            cursors: vec![Value(String::new()), Value(String::new())],
+            events: vec![event("acme"), event("acme")],
+            page_info: Default::default(),
+        }));
+        present(&mut response);
+        let Response::Read(Ok(page)) = response else {
+            unreachable!()
+        };
+        assert!(page.events.iter().all(|e| e.tenant.is_empty()));
+    }
+
+    #[test]
+    fn a_tenant_session_refuses_replicate_and_the_subscriber_calls() {
+        let key = || "key".to_owned();
+        let worker_id = Ulid::nil();
+        let refusal = |mut request: Request| confine(&mut request, "acme");
+
+        assert!(matches!(
+            refusal(Request::Replicate {
+                events: vec![Event::default()]
+            }),
+            Some(Response::Write(Err(WireWriteError::Other(_))))
+        ));
+        assert!(matches!(
+            refusal(Request::GetSubscriberCursor { key: key() }),
+            Some(Response::SubscriberCursor(Err(_)))
+        ));
+        assert!(matches!(
+            refusal(Request::IsSubscriberRunning {
+                key: key(),
+                worker_id
+            }),
+            Some(Response::SubscriberRunning(Err(_)))
+        ));
+        assert!(matches!(
+            refusal(Request::SubscriberStatus {
+                key: key(),
+                worker_id
+            }),
+            Some(Response::SubscriberStatus(Err(_)))
+        ));
+        assert!(matches!(
+            refusal(Request::UpsertSubscriber {
+                key: key(),
+                worker_id
+            }),
+            Some(Response::Unit(Err(_)))
+        ));
+        assert!(matches!(
+            refusal(Request::Acknowledge {
+                key: key(),
+                worker_id,
+                cursor: Value(String::new()),
+                lag: 0
+            }),
+            Some(Response::Acknowledge(Err(_)))
+        ));
     }
 }

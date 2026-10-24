@@ -73,13 +73,19 @@ let client = evento::RemoteClient::connect("127.0.0.1:4321").await?;
   on every (re)connect, so a client behind a load balancer or DNS failover follows
   it. The server clamps a bounded `read` to its own `stable_timestamp`, so a
   client that reconnects to a lagging node never skips events.
-- **One store per tenant / authentication:** implement `evento::remote::Resolver`.
+- **Tenants / authentication:** implement `evento::remote::Resolver`.
   Every connection opens with a `Hello { token, peer }` (client side:
   `RemoteClient::builder(addr).token("…").connect().await?`); `resolve` answers
   `Session::new(executor)` — optionally `.keep(guard)` (dropped when the connection
-  ends, e.g. a tenant lease) and `.close_when(watch_rx)` (server-side kick on
-  revocation) — or `Err(Rejection)`, which the client sees as its `connect` error.
+  ends) and `.close_when(watch_rx)` (server-side kick on revocation) — or
+  `Err(Rejection)`, which the client sees as its `connect` error.
   Pass it to `serve_with(listener, resolver)`. It runs again on every reconnect.
+  To confine a client to its tenant over one shared store, serve
+  `Session::new(store.clone()).tenant(tenant)?`: every request on the connection
+  acts in that tenant whatever it names, the events it reads come back in the
+  default tenant (the client sees a store of its own), and `replicate` and the
+  subscriber calls are refused — a tenant's app keeps its subscriptions local
+  (`Sidecar`).
 - **TLS:** `serve_tls(listener, acceptor, exec)` / `serve_tls_with(listener, acceptor, resolver)`
   take a `tokio_rustls::TlsAcceptor`; the client side is
   `.builder(addr).tls(connector, server_name)`. Plain TCP is for trusted networks —
@@ -388,7 +394,14 @@ aggregate type as a string; it has no `.decode()`.
   no `.routing_key()` reads **every** routing key; narrow it with `.no_routing_key()`.
   A subscription with no `.routing_key()`/`.any_routing_key()` only sees events whose
   routing key is NULL. `.any_routing_key()` subscriptions are stored per
-  executor-default-routing-key, so multi-tenant setups stay isolated.
+  executor-default-routing-key.
+- **Tenants are part of stream identity** (`(tenant, type, id)`, default tenant `""`).
+  Writes, loads and reads act in the default tenant unless the builder says
+  `.tenant(t)` (writes, `Projection::load`, `evento::read`); `has_event` /
+  `original_version` read the default tenant. Subscriptions have no tenant option:
+  they read every tenant, handlers see `event.tenant` (write back with
+  `.tenant(&event.tenant)`), and a projection subscription loads each event in its
+  own tenant.
 - **The subscription key is the cursor identity.** Reusing a key across two different
   subscriptions makes them share (and corrupt) one cursor. Keep keys unique — except under
   `.ephemeral()`, where nothing is stored under the key and any number of subscriptions may

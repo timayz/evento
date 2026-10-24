@@ -37,7 +37,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::{cursor::Args, metadata::Metadata, Event, EventFilter, Executor};
+use crate::{cursor::Args, metadata::Metadata, Event, EventFilter, Executor, TenantFilter};
 
 /// Derives a stable aggregate ID from a set of IDs by hashing them.
 ///
@@ -312,6 +312,7 @@ pub struct WriteBuilder {
     aggregate_type: &'static str,
     routing_key: Option<String>,
     routing_key_locked: bool,
+    tenant: Option<String>,
     original_version: u16,
     data: Vec<(&'static str, Vec<u8>)>,
     metadata: Metadata,
@@ -326,6 +327,7 @@ impl WriteBuilder {
             aggregate_type: "",
             routing_key: None,
             routing_key_locked: false,
+            tenant: None,
             original_version: 0,
             data: Vec::default(),
             metadata: Default::default(),
@@ -366,6 +368,16 @@ impl WriteBuilder {
             self.routing_key_locked = true;
         }
 
+        self
+    }
+
+    /// Commits in `tenant` instead of the default tenant (`""`).
+    ///
+    /// The tenant is part of the stream's identity: the same aggregate id in
+    /// two tenants names two streams. A subscription handler writes in the
+    /// tenant of the event it handles with `.tenant(&event.tenant)`.
+    pub fn tenant(&mut self, v: impl Into<String>) -> &mut Self {
+        self.tenant = Some(v.into());
         self
     }
 
@@ -443,6 +455,12 @@ impl WriteBuilder {
         if let Some((expected, got)) = self.mixed_types {
             return Err(WriteError::MixedAggregateTypes { expected, got });
         }
+        let tenant = self.tenant.clone().unwrap_or_default();
+        if tenant.len() > crate::MAX_TENANT_LEN {
+            return Err(WriteError::Unknown(
+                crate::TenantError::TooLong(tenant.len()).into(),
+            ));
+        }
 
         // An existing stream keeps the routing key of its first event — even
         // when that key is `None` — so one aggregate never spans two keys. Only
@@ -455,7 +473,11 @@ impl WriteBuilder {
             None
         } else {
             executor
-                .stream_routing_key(self.aggregate_type.to_owned(), self.aggregate_id.to_owned())
+                .stream_routing_key(
+                    tenant.clone(),
+                    self.aggregate_type.to_owned(),
+                    self.aggregate_id.to_owned(),
+                )
                 .await
                 .map_err(WriteError::Unknown)?
         };
@@ -489,6 +511,7 @@ impl WriteBuilder {
                 aggregate_type: self.aggregate_type.to_owned(),
                 version,
                 routing_key: routing_key.to_owned(),
+                tenant: tenant.clone(),
             };
 
             events.push(event);
@@ -546,7 +569,8 @@ pub fn append(id: impl Into<String>) -> WriteBuilder {
 }
 
 /// Convenience queries about an aggregate's event stream, implemented for
-/// every [`Executor`].
+/// every [`Executor`]. They read the default tenant's stream; read another
+/// tenant's with [`ReadBuilder::tenant`](crate::ReadBuilder::tenant).
 pub trait AggregateExt<E: Executor> {
     /// Returns `true` if the aggregate `id` has at least one event of type `A`
     /// — or of an older event that [upcasts](AggregateEvent::upcasters) into it.
@@ -578,7 +602,13 @@ impl<E: Executor> AggregateExt<E> for E {
                 .collect::<Arc<[EventFilter]>>();
 
             let result = self
-                .read(Some(filters), None, Args::backward(1, None), None)
+                .read(
+                    Some(filters),
+                    None,
+                    TenantFilter::Only(String::new()),
+                    Args::backward(1, None),
+                    None,
+                )
                 .await?;
 
             Ok(!result.edges.is_empty())
@@ -595,6 +625,7 @@ impl<E: Executor> AggregateExt<E> for E {
                 .read(
                     Some(Arc::from([EventFilter::by_id::<A>(id)])),
                     None,
+                    TenantFilter::Only(String::new()),
                     Args::backward(1, None),
                     None,
                 )
@@ -609,7 +640,7 @@ impl<E: Executor> AggregateExt<E> for E {
 pub(crate) mod tests {
     use super::*;
     use crate::cursor::{Args, ReadResult, Value};
-    use crate::{EventFilter, RoutingKey};
+    use crate::{EventFilter, RoutingKey, TenantFilter};
 
     #[test]
     fn hash_ids_is_collision_free_across_boundaries() {
@@ -658,6 +689,7 @@ pub(crate) mod tests {
             &self,
             _aggregators: Option<Arc<[EventFilter]>>,
             _routing_key: Option<RoutingKey>,
+            _tenant: TenantFilter,
             _args: Args,
             _to_micros: Option<u64>,
         ) -> anyhow::Result<ReadResult<Event>> {
@@ -667,11 +699,13 @@ pub(crate) mod tests {
             &self,
             _aggregators: Option<Arc<[EventFilter]>>,
             _routing_key: Option<RoutingKey>,
+            _tenant: TenantFilter,
         ) -> anyhow::Result<u64> {
             unreachable!()
         }
         async fn get_snapshot(
             &self,
+            _tenant: String,
             _aggregate_type: String,
             _projection: String,
             _aggregate_revision: String,
@@ -681,6 +715,7 @@ pub(crate) mod tests {
         }
         async fn save_snapshot(
             &self,
+            _tenant: String,
             _aggregate_type: String,
             _projection: String,
             _aggregate_revision: String,
@@ -692,6 +727,7 @@ pub(crate) mod tests {
         }
         async fn delete_snapshot(
             &self,
+            _tenant: String,
             _aggregate_type: String,
             _projection: String,
             _id: String,

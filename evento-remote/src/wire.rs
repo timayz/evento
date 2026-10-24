@@ -8,7 +8,7 @@
 //! accord port fails immediately.
 
 use evento_core::cursor::{Args, PageInfo, Value};
-use evento_core::{Event, EventFilter, RoutingKey, WriteError};
+use evento_core::{Event, EventFilter, RoutingKey, TenantFilter, WriteError};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -24,7 +24,9 @@ pub const MAGIC: [u8; 2] = *b"Er";
 /// projection name).
 /// v4: `Hello` carries an optional token and its reply may refuse the
 /// connection; the server requires `Hello` as the first frame.
-pub const FORMAT_VERSION: u8 = 4;
+/// v5: tenants — events carry their tenant, every scan request a
+/// `TenantFilter`, and every identity and snapshot request a tenant.
+pub const FORMAT_VERSION: u8 = 5;
 
 /// Length of the fixed header: `MAGIC (2) + version (1) + kind (1)`.
 const HEADER_LEN: usize = 4;
@@ -139,6 +141,7 @@ pub enum Request {
     Read {
         aggregators: Option<Vec<EventFilter>>,
         routing_key: Option<RoutingKey>,
+        tenant: TenantFilter,
         args: Args,
         /// Exclusive stamp bound (see `Executor::read`).
         to_micros: Option<u64>,
@@ -146,6 +149,7 @@ pub enum Request {
     LatestTimestamp {
         aggregators: Option<Vec<EventFilter>>,
         routing_key: Option<RoutingKey>,
+        tenant: TenantFilter,
     },
     GetSubscriberCursor {
         key: String,
@@ -162,11 +166,13 @@ pub enum Request {
     },
     /// Highest committed version of a stream (see `Executor::latest_version`).
     LatestVersion {
+        tenant: String,
         aggregate_type: String,
         aggregate_id: String,
     },
     /// Routing key of an existing stream (see `Executor::stream_routing_key`).
     StreamRoutingKey {
+        tenant: String,
         aggregate_type: String,
         aggregate_id: String,
     },
@@ -181,12 +187,14 @@ pub enum Request {
         lag: u64,
     },
     GetSnapshot {
+        tenant: String,
         aggregate_type: String,
         projection: String,
         aggregate_revision: String,
         id: String,
     },
     SaveSnapshot {
+        tenant: String,
         aggregate_type: String,
         projection: String,
         aggregate_revision: String,
@@ -195,6 +203,7 @@ pub enum Request {
         cursor: Value,
     },
     DeleteSnapshot {
+        tenant: String,
         aggregate_type: String,
         projection: String,
         id: String,
@@ -352,6 +361,7 @@ mod wire_events {
         version: u16,
         name: String,
         routing_key: Option<String>,
+        tenant: String,
         data: Vec<u8>,
         /// bitcode-encoded [`Metadata`].
         metadata: Vec<u8>,
@@ -368,6 +378,7 @@ mod wire_events {
                 version: e.version,
                 name: e.name.clone(),
                 routing_key: e.routing_key.clone(),
+                tenant: e.tenant.clone(),
                 data: e.data.clone(),
                 metadata: bitcode::encode(&e.metadata),
                 timestamp: e.timestamp,
@@ -387,6 +398,7 @@ mod wire_events {
                 version: w.version,
                 name: w.name,
                 routing_key: w.routing_key,
+                tenant: w.tenant,
                 data: w.data,
                 metadata: bitcode::decode::<Metadata>(&w.metadata)?,
                 timestamp: w.timestamp,
@@ -423,6 +435,7 @@ mod tests {
             version: 7,
             name: "opened".to_owned(),
             routing_key: Some("eu".to_owned()),
+            tenant: "acme".to_owned(),
             data: vec![1, 2, 3],
             metadata,
             timestamp: 1_700_000_000,

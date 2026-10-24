@@ -11,6 +11,7 @@
 //! - [`EventoGroup`] - Multi-executor aggregation (feature: `group`)
 //! - [`Rw`] - Read-write split executor (feature: `rw`)
 //! - [`EventFilter`] - Query filter for reading events
+//! - [`TenantFilter`] - Which tenants a scan covers
 
 use std::{hash::Hash, sync::Arc};
 use ulid::Ulid;
@@ -19,6 +20,61 @@ use crate::{
     cursor::{Args, ReadResult, Value},
     Aggregate, AggregateEvent, Event, RoutingKey, WriteError,
 };
+
+/// Longest tenant id a store keeps: SQL backends hold it in a `VARCHAR(255)`.
+pub const MAX_TENANT_LEN: usize = 255;
+
+/// Which tenants a scan ([`Executor::read`], [`Executor::latest_timestamp`])
+/// covers.
+///
+/// A stream belongs to one tenant: its identity is `(tenant, aggregate_type,
+/// aggregate_id)`, and [`Event::tenant`] is `""` for the **default tenant**,
+/// where every single-tenant application lives. A read of one aggregate
+/// always names its tenant; a scan across aggregates — what a subscription
+/// reads — covers every tenant.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum TenantFilter {
+    /// Every tenant.
+    All,
+    /// One tenant; `""` is the default tenant.
+    Only(String),
+}
+
+impl TenantFilter {
+    /// Whether an event of `tenant` passes this filter.
+    pub fn matches(&self, tenant: &str) -> bool {
+        match self {
+            TenantFilter::All => true,
+            TenantFilter::Only(only) => only == tenant,
+        }
+    }
+}
+
+/// A tenant id that cannot name a tenant (see [`TenantError::check`]).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TenantError {
+    /// The empty tenant is the default one, where callers that name no tenant
+    /// act.
+    #[error("a tenant id must not be empty: the empty tenant is the default one")]
+    Empty,
+    /// Longer than [`MAX_TENANT_LEN`] bytes.
+    #[error("a tenant id of {0} bytes is longer than the {MAX_TENANT_LEN} a store keeps")]
+    TooLong(usize),
+}
+
+impl TenantError {
+    /// Checks that `tenant` names a tenant other than the default one, and
+    /// that a store can keep it.
+    pub fn check(tenant: &str) -> Result<(), TenantError> {
+        if tenant.is_empty() {
+            return Err(TenantError::Empty);
+        }
+        if tenant.len() > MAX_TENANT_LEN {
+            return Err(TenantError::TooLong(tenant.len()));
+        }
+        Ok(())
+    }
+}
 
 /// Filter for querying events by aggregate.
 ///
@@ -284,12 +340,14 @@ pub trait Executor: Send + Sync + 'static {
     /// but O(stream length); backends should override with an indexed lookup.
     async fn latest_version(
         &self,
+        tenant: String,
         aggregate_type: String,
         aggregate_id: String,
     ) -> anyhow::Result<u16> {
         const PAGE_SIZE: u16 = 4096;
         let filters: Arc<[EventFilter]> =
             Arc::from([EventFilter::by_id_raw(aggregate_type, aggregate_id)]);
+        let tenant = TenantFilter::Only(tenant);
         let mut max = 0u16;
         let mut after = None;
         loop {
@@ -297,6 +355,7 @@ pub trait Executor: Send + Sync + 'static {
                 .read(
                     Some(filters.clone()),
                     None,
+                    tenant.clone(),
                     Args::forward(PAGE_SIZE, after),
                     None,
                 )
@@ -326,6 +385,7 @@ pub trait Executor: Send + Sync + 'static {
     /// a narrow lookup of the version-1 event.
     async fn stream_routing_key(
         &self,
+        tenant: String,
         aggregate_type: String,
         aggregate_id: String,
     ) -> anyhow::Result<Option<Option<String>>> {
@@ -336,6 +396,7 @@ pub trait Executor: Send + Sync + 'static {
                     aggregate_id,
                 )])),
                 None,
+                TenantFilter::Only(tenant),
                 Args::forward(1, None),
                 None,
             )
@@ -364,6 +425,9 @@ pub trait Executor: Send + Sync + 'static {
 
     /// Queries events with filtering and pagination.
     ///
+    /// `tenant` narrows the read to one tenant's events, or covers every
+    /// tenant ([`TenantFilter::All`]).
+    ///
     /// `to_micros` is an optional **exclusive** upper bound on event stamps,
     /// in microseconds since the Unix epoch: events at or above it are
     /// excluded, ideally by the backend itself (SQL adds a sargable predicate;
@@ -375,6 +439,7 @@ pub trait Executor: Send + Sync + 'static {
         &self,
         aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<RoutingKey>,
+        tenant: TenantFilter,
         args: Args,
         to_micros: Option<u64>,
     ) -> anyhow::Result<ReadResult<Event>>;
@@ -389,11 +454,12 @@ pub trait Executor: Send + Sync + 'static {
         &self,
         aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<RoutingKey>,
+        tenant: TenantFilter,
     ) -> anyhow::Result<u64>;
 
     /// Retrieves the snapshot a projection stored for an aggregate.
     ///
-    /// Snapshots are keyed by `(aggregate_type, projection, id)`: `projection`
+    /// Snapshots are keyed by `(tenant, aggregate_type, projection, id)`: `projection`
     /// is the name of the view the bytes belong to (see
     /// [`ProjectionCursor::projection_name`](crate::projection::ProjectionCursor::projection_name)),
     /// so several snapshotted projections of one aggregate never share a slot.
@@ -402,6 +468,7 @@ pub trait Executor: Send + Sync + 'static {
     /// if no snapshot exists under that key at `aggregate_revision`.
     async fn get_snapshot(
         &self,
+        tenant: String,
         aggregate_type: String,
         projection: String,
         aggregate_revision: String,
@@ -412,8 +479,12 @@ pub trait Executor: Send + Sync + 'static {
     ///
     /// Snapshots cache aggregate state to avoid replaying all events.
     /// The `cursor` indicates the event position up to which the snapshot is valid.
+    // One argument per part of the snapshot key — tenant, aggregate type,
+    // projection, id — plus the revision and the payload.
+    #[allow(clippy::too_many_arguments)]
     async fn save_snapshot(
         &self,
+        tenant: String,
         aggregate_type: String,
         projection: String,
         aggregate_revision: String,
@@ -426,10 +497,11 @@ pub trait Executor: Send + Sync + 'static {
     ///
     /// Idempotent: deleting a snapshot that does not exist is not an error.
     /// Revision is intentionally omitted — `save_snapshot` upserts on
-    /// `(type, projection, id)` so there is only ever one row per projection
-    /// of an aggregate.
+    /// `(tenant, type, projection, id)` so there is only ever one row per
+    /// projection of an aggregate.
     async fn delete_snapshot(
         &self,
+        tenant: String,
         aggregate_type: String,
         projection: String,
         id: String,
@@ -498,11 +570,12 @@ impl Executor for Evento {
         &self,
         aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<RoutingKey>,
+        tenant: TenantFilter,
         args: Args,
         to_micros: Option<u64>,
     ) -> anyhow::Result<ReadResult<Event>> {
         self.inner
-            .read(aggregators, routing_key, args, to_micros)
+            .read(aggregators, routing_key, tenant, args, to_micros)
             .await
     }
 
@@ -510,8 +583,11 @@ impl Executor for Evento {
         &self,
         aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<RoutingKey>,
+        tenant: TenantFilter,
     ) -> anyhow::Result<u64> {
-        self.inner.latest_timestamp(aggregators, routing_key).await
+        self.inner
+            .latest_timestamp(aggregators, routing_key, tenant)
+            .await
     }
 
     async fn get_subscriber_cursor(&self, key: String) -> anyhow::Result<Option<Value>> {
@@ -534,21 +610,23 @@ impl Executor for Evento {
 
     async fn latest_version(
         &self,
+        tenant: String,
         aggregate_type: String,
         aggregate_id: String,
     ) -> anyhow::Result<u16> {
         self.inner
-            .latest_version(aggregate_type, aggregate_id)
+            .latest_version(tenant, aggregate_type, aggregate_id)
             .await
     }
 
     async fn stream_routing_key(
         &self,
+        tenant: String,
         aggregate_type: String,
         aggregate_id: String,
     ) -> anyhow::Result<Option<Option<String>>> {
         self.inner
-            .stream_routing_key(aggregate_type, aggregate_id)
+            .stream_routing_key(tenant, aggregate_type, aggregate_id)
             .await
     }
 
@@ -568,18 +646,20 @@ impl Executor for Evento {
 
     async fn get_snapshot(
         &self,
+        tenant: String,
         aggregate_type: String,
         projection: String,
         aggregate_revision: String,
         id: String,
     ) -> anyhow::Result<Option<(Vec<u8>, Value)>> {
         self.inner
-            .get_snapshot(aggregate_type, projection, aggregate_revision, id)
+            .get_snapshot(tenant, aggregate_type, projection, aggregate_revision, id)
             .await
     }
 
     async fn save_snapshot(
         &self,
+        tenant: String,
         aggregate_type: String,
         projection: String,
         aggregate_revision: String,
@@ -589,6 +669,7 @@ impl Executor for Evento {
     ) -> anyhow::Result<()> {
         self.inner
             .save_snapshot(
+                tenant,
                 aggregate_type,
                 projection,
                 aggregate_revision,
@@ -601,12 +682,13 @@ impl Executor for Evento {
 
     async fn delete_snapshot(
         &self,
+        tenant: String,
         aggregate_type: String,
         projection: String,
         id: String,
     ) -> anyhow::Result<()> {
         self.inner
-            .delete_snapshot(aggregate_type, projection, id)
+            .delete_snapshot(tenant, aggregate_type, projection, id)
             .await
     }
 }
@@ -694,6 +776,7 @@ impl Executor for EventoGroup {
         &self,
         aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<RoutingKey>,
+        tenant: TenantFilter,
         args: Args,
         to_micros: Option<u64>,
     ) -> anyhow::Result<ReadResult<Event>> {
@@ -702,6 +785,7 @@ impl Executor for EventoGroup {
             e.read(
                 aggregators.to_owned(),
                 routing_key.to_owned(),
+                tenant.clone(),
                 args.clone(),
                 to_micros,
             )
@@ -734,11 +818,15 @@ impl Executor for EventoGroup {
         &self,
         aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<RoutingKey>,
+        tenant: TenantFilter,
     ) -> anyhow::Result<u64> {
-        let futures = self
-            .executors
-            .iter()
-            .map(|e| e.latest_timestamp(aggregators.to_owned(), routing_key.to_owned()));
+        let futures = self.executors.iter().map(|e| {
+            e.latest_timestamp(
+                aggregators.to_owned(),
+                routing_key.to_owned(),
+                tenant.clone(),
+            )
+        });
 
         let results = futures_util::future::join_all(futures).await;
         let mut max = 0u64;
@@ -788,18 +876,20 @@ impl Executor for EventoGroup {
 
     async fn get_snapshot(
         &self,
+        tenant: String,
         aggregate_type: String,
         projection: String,
         aggregate_revision: String,
         id: String,
     ) -> anyhow::Result<Option<(Vec<u8>, Value)>> {
         self.first()
-            .get_snapshot(aggregate_type, projection, aggregate_revision, id)
+            .get_snapshot(tenant, aggregate_type, projection, aggregate_revision, id)
             .await
     }
 
     async fn save_snapshot(
         &self,
+        tenant: String,
         aggregate_type: String,
         projection: String,
         aggregate_revision: String,
@@ -809,6 +899,7 @@ impl Executor for EventoGroup {
     ) -> anyhow::Result<()> {
         self.first()
             .save_snapshot(
+                tenant,
                 aggregate_type,
                 projection,
                 aggregate_revision,
@@ -821,12 +912,13 @@ impl Executor for EventoGroup {
 
     async fn delete_snapshot(
         &self,
+        tenant: String,
         aggregate_type: String,
         projection: String,
         id: String,
     ) -> anyhow::Result<()> {
         self.first()
-            .delete_snapshot(aggregate_type, projection, id)
+            .delete_snapshot(tenant, aggregate_type, projection, id)
             .await
     }
 }
@@ -894,18 +986,24 @@ impl<R: Executor, W: Executor> Executor for Rw<R, W> {
         &self,
         aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<RoutingKey>,
+        tenant: TenantFilter,
         args: Args,
         to_micros: Option<u64>,
     ) -> anyhow::Result<ReadResult<Event>> {
-        self.r.read(aggregators, routing_key, args, to_micros).await
+        self.r
+            .read(aggregators, routing_key, tenant, args, to_micros)
+            .await
     }
 
     async fn latest_timestamp(
         &self,
         aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<RoutingKey>,
+        tenant: TenantFilter,
     ) -> anyhow::Result<u64> {
-        self.r.latest_timestamp(aggregators, routing_key).await
+        self.r
+            .latest_timestamp(aggregators, routing_key, tenant)
+            .await
     }
 
     async fn get_subscriber_cursor(&self, key: String) -> anyhow::Result<Option<Value>> {
@@ -928,19 +1026,23 @@ impl<R: Executor, W: Executor> Executor for Rw<R, W> {
 
     async fn latest_version(
         &self,
+        tenant: String,
         aggregate_type: String,
         aggregate_id: String,
     ) -> anyhow::Result<u16> {
-        self.r.latest_version(aggregate_type, aggregate_id).await
+        self.r
+            .latest_version(tenant, aggregate_type, aggregate_id)
+            .await
     }
 
     async fn stream_routing_key(
         &self,
+        tenant: String,
         aggregate_type: String,
         aggregate_id: String,
     ) -> anyhow::Result<Option<Option<String>>> {
         self.r
-            .stream_routing_key(aggregate_type, aggregate_id)
+            .stream_routing_key(tenant, aggregate_type, aggregate_id)
             .await
     }
 
@@ -960,18 +1062,20 @@ impl<R: Executor, W: Executor> Executor for Rw<R, W> {
 
     async fn get_snapshot(
         &self,
+        tenant: String,
         aggregate_type: String,
         projection: String,
         aggregate_revision: String,
         id: String,
     ) -> anyhow::Result<Option<(Vec<u8>, Value)>> {
         self.r
-            .get_snapshot(aggregate_type, projection, aggregate_revision, id)
+            .get_snapshot(tenant, aggregate_type, projection, aggregate_revision, id)
             .await
     }
 
     async fn save_snapshot(
         &self,
+        tenant: String,
         aggregate_type: String,
         projection: String,
         aggregate_revision: String,
@@ -981,6 +1085,7 @@ impl<R: Executor, W: Executor> Executor for Rw<R, W> {
     ) -> anyhow::Result<()> {
         self.w
             .save_snapshot(
+                tenant,
                 aggregate_type,
                 projection,
                 aggregate_revision,
@@ -993,11 +1098,14 @@ impl<R: Executor, W: Executor> Executor for Rw<R, W> {
 
     async fn delete_snapshot(
         &self,
+        tenant: String,
         aggregate_type: String,
         projection: String,
         id: String,
     ) -> anyhow::Result<()> {
-        self.w.delete_snapshot(aggregate_type, projection, id).await
+        self.w
+            .delete_snapshot(tenant, aggregate_type, projection, id)
+            .await
     }
 }
 
@@ -1099,11 +1207,12 @@ impl<E: Executor, L: Executor> Executor for Sidecar<E, L> {
         &self,
         aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<RoutingKey>,
+        tenant: TenantFilter,
         args: Args,
         to_micros: Option<u64>,
     ) -> anyhow::Result<ReadResult<Event>> {
         self.events
-            .read(aggregators, routing_key, args, to_micros)
+            .read(aggregators, routing_key, tenant, args, to_micros)
             .await
     }
 
@@ -1111,29 +1220,34 @@ impl<E: Executor, L: Executor> Executor for Sidecar<E, L> {
         &self,
         aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<RoutingKey>,
+        tenant: TenantFilter,
     ) -> anyhow::Result<u64> {
-        self.events.latest_timestamp(aggregators, routing_key).await
+        self.events
+            .latest_timestamp(aggregators, routing_key, tenant)
+            .await
     }
 
     // Forwarded explicitly so the backends' indexed overrides are reached
     // instead of the trait defaults paging through `read`.
     async fn latest_version(
         &self,
+        tenant: String,
         aggregate_type: String,
         aggregate_id: String,
     ) -> anyhow::Result<u16> {
         self.events
-            .latest_version(aggregate_type, aggregate_id)
+            .latest_version(tenant, aggregate_type, aggregate_id)
             .await
     }
 
     async fn stream_routing_key(
         &self,
+        tenant: String,
         aggregate_type: String,
         aggregate_id: String,
     ) -> anyhow::Result<Option<Option<String>>> {
         self.events
-            .stream_routing_key(aggregate_type, aggregate_id)
+            .stream_routing_key(tenant, aggregate_type, aggregate_id)
             .await
     }
 
@@ -1170,18 +1284,20 @@ impl<E: Executor, L: Executor> Executor for Sidecar<E, L> {
 
     async fn get_snapshot(
         &self,
+        tenant: String,
         aggregate_type: String,
         projection: String,
         aggregate_revision: String,
         id: String,
     ) -> anyhow::Result<Option<(Vec<u8>, Value)>> {
         self.local
-            .get_snapshot(aggregate_type, projection, aggregate_revision, id)
+            .get_snapshot(tenant, aggregate_type, projection, aggregate_revision, id)
             .await
     }
 
     async fn save_snapshot(
         &self,
+        tenant: String,
         aggregate_type: String,
         projection: String,
         aggregate_revision: String,
@@ -1191,6 +1307,7 @@ impl<E: Executor, L: Executor> Executor for Sidecar<E, L> {
     ) -> anyhow::Result<()> {
         self.local
             .save_snapshot(
+                tenant,
                 aggregate_type,
                 projection,
                 aggregate_revision,
@@ -1203,12 +1320,13 @@ impl<E: Executor, L: Executor> Executor for Sidecar<E, L> {
 
     async fn delete_snapshot(
         &self,
+        tenant: String,
         aggregate_type: String,
         projection: String,
         id: String,
     ) -> anyhow::Result<()> {
         self.local
-            .delete_snapshot(aggregate_type, projection, id)
+            .delete_snapshot(tenant, aggregate_type, projection, id)
             .await
     }
 }

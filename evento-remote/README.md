@@ -34,12 +34,22 @@ let client = evento_remote::Client::connect("127.0.0.1:4321").await?;
 Writes through the server are pushed to every connected client, so client-side
 subscriptions wake with the same low latency as a local `write_watch`.
 
-A host serving one store per tenant implements `Resolver`: every connection opens
+A host authenticating its clients implements `Resolver`: every connection opens
 with a `Hello` carrying the client's token (`Client::builder(addr).token(..)`), and
 the resolver answers with the `Session` to serve it — the executor, a guard kept
 for the connection's lifetime, a signal that ends it — or a `Rejection` the client
 sees as its `connect` error. `serve_with(listener, resolver)` takes it; `serve` is
-the open single-store case. `serve_tls` / `serve_tls_with` and
+the open single-store case.
+
+Which tenant a client belongs to is the host application's decision: its resolver
+maps the token (an API key, say) to one and serves the connection in it,
+`Session::new(store.clone()).tenant(tenant)?`. Every request on the connection then
+acts in that tenant whatever it names — what it reads and loads, the tenant its
+writes are stamped with — and `replicate` and the subscriber calls are refused, so a
+client never reaches another tenant's data. The client stays tenant-agnostic: the
+events it reads come back in the default tenant, as from a store of its own, and a
+tenant application following the store through a `Sidecar` keeps its subscriptions'
+cursors and its snapshots in its own store. `serve_tls` / `serve_tls_with` and
 `ClientBuilder::tls` wrap connections in rustls; plain TCP is for trusted networks,
 where a token travels in clear text.
 

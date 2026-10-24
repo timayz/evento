@@ -22,7 +22,9 @@ use bank::{
 };
 use evento::cursor::{self, Order, ReadResult};
 use evento::Event;
-use evento::{cursor::Args, Aggregate, AggregateExt, EventFilter, Executor, ProjectionAggregate};
+use evento::{
+    cursor::Args, Aggregate, AggregateExt, EventFilter, Executor, ProjectionAggregate, TenantFilter,
+};
 use rand::seq::IndexedRandom;
 use rand::RngExt;
 use ulid::Ulid;
@@ -35,6 +37,7 @@ async fn last_routing_key<E: Executor>(
         .read(
             Some([EventFilter::by_id::<BankAccount>(id)].into()),
             None,
+            TenantFilter::All,
             Args::backward(1, None),
             None,
         )
@@ -55,7 +58,7 @@ async fn wait_for_stable_watermark<E: Executor>(executor: &E) -> anyhow::Result<
     // `latest_timestamp` has whole-second resolution, so cover the entire
     // latest second — the same bound `run_once` uses.
     let target = executor
-        .latest_timestamp(None, None)
+        .latest_timestamp(None, None, TenantFilter::All)
         .await?
         .saturating_add(1)
         .saturating_mul(1_000_000);
@@ -422,7 +425,7 @@ pub async fn load_with_snapshot<E: Executor + Clone>(executor: &E) -> anyhow::Re
     // This simulates a snapshot taken after AccountOpened
     {
         let mut rows = bank::BankAccount::snapshot_rows().write().unwrap();
-        rows.insert(account_id.clone(), data1);
+        rows.insert((String::new(), account_id.clone()), data1);
     }
 
     // Load - should restore from snapshot (version 1, balance 1000)
@@ -435,7 +438,7 @@ pub async fn load_with_snapshot<E: Executor + Clone>(executor: &E) -> anyhow::Re
     // Test with a snapshot at version 2
     {
         let mut rows = bank::BankAccount::snapshot_rows().write().unwrap();
-        rows.insert(account_id.clone(), data2);
+        rows.insert((String::new(), account_id.clone()), data2);
     }
 
     // Load - should restore from snapshot (version 2, balance 1200)
@@ -448,7 +451,7 @@ pub async fn load_with_snapshot<E: Executor + Clone>(executor: &E) -> anyhow::Re
     // Test with snapshot at latest version (no events to apply)
     {
         let mut rows = bank::BankAccount::snapshot_rows().write().unwrap();
-        rows.insert(account_id.clone(), account.clone());
+        rows.insert((String::new(), account_id.clone()), account.clone());
     }
 
     // Load - should restore from snapshot (version 3), no events to apply
@@ -1137,7 +1140,7 @@ pub async fn subscribe_multiple_aggregator<E: Executor + Clone>(
     // Remove this test's account from projection
     {
         let mut rows = AccountDetailsView::snapshot_rows().write().unwrap();
-        rows.remove(&account_id);
+        rows.remove(&(String::new(), account_id.clone()));
     }
 
     // Run account_details subscription (handles both BankAccount and Owner events)
@@ -2086,6 +2089,7 @@ pub async fn read_order_timestamp<E: Executor + Clone>(executor: &E) -> anyhow::
         version: 1,
         name: "Tick".to_owned(),
         routing_key: None,
+        tenant: String::new(),
         data: vec![],
         metadata: Default::default(),
         timestamp: t,
@@ -2106,7 +2110,11 @@ pub async fn read_order_timestamp<E: Executor + Clone>(executor: &E) -> anyhow::
     let ids = |r: &ReadResult<Event>| r.edges.iter().map(|e| e.node.id).collect::<Vec<_>>();
     let read = |args| {
         let f = EventFilter::by_type_raw(agg_type);
-        async move { executor.read(Some([f].into()), None, args, None).await }
+        async move {
+            executor
+                .read(Some([f].into()), None, TenantFilter::All, args, None)
+                .await
+        }
     };
 
     // Full forward read.
@@ -2145,6 +2153,7 @@ pub async fn write_restamps_client_clock<E: Executor + Clone>(executor: &E) -> a
         version: 1,
         name: "Stamped".to_owned(),
         routing_key: None,
+        tenant: String::new(),
         data: vec![],
         metadata: Default::default(),
         // A stale client stamp, long in the past.
@@ -2159,6 +2168,7 @@ pub async fn write_restamps_client_clock<E: Executor + Clone>(executor: &E) -> a
         .read(
             Some([EventFilter::by_id_raw(agg_type, "restamped")].into()),
             None,
+            TenantFilter::All,
             Args::forward(1, None),
             None,
         )
@@ -2173,6 +2183,7 @@ pub async fn write_restamps_client_clock<E: Executor + Clone>(executor: &E) -> a
         .read(
             Some([EventFilter::by_id_raw(agg_type, "verbatim")].into()),
             None,
+            TenantFilter::All,
             Args::forward(1, None),
             None,
         )
@@ -2196,6 +2207,7 @@ pub async fn exact_filter<E: Executor + Clone>(executor: &E) -> anyhow::Result<(
         version: v,
         name: name.to_owned(),
         routing_key: None,
+        tenant: String::new(),
         data: vec![],
         metadata: Default::default(),
         timestamp: 100 + v as u64,
@@ -2209,6 +2221,7 @@ pub async fn exact_filter<E: Executor + Clone>(executor: &E) -> anyhow::Result<(
         .read(
             Some([EventFilter::exact_raw(agg_type, &id, "Alpha")].into()),
             None,
+            TenantFilter::All,
             Args::forward(10, None),
             None,
         )
@@ -2224,6 +2237,7 @@ pub async fn exact_filter<E: Executor + Clone>(executor: &E) -> anyhow::Result<(
         .read(
             Some([EventFilter::exact_raw(agg_type, &id, "Beta")].into()),
             None,
+            TenantFilter::All,
             Args::forward(10, None),
             None,
         )
@@ -2418,6 +2432,7 @@ pub async fn snapshot_revision_scope<E: Executor + Clone>(executor: &E) -> anyho
 
     executor
         .save_snapshot(
+            String::new(),
             agg.to_owned(),
             view.to_owned(),
             "0".to_owned(),
@@ -2429,6 +2444,7 @@ pub async fn snapshot_revision_scope<E: Executor + Clone>(executor: &E) -> anyho
 
     let same = executor
         .get_snapshot(
+            String::new(),
             agg.to_owned(),
             view.to_owned(),
             "0".to_owned(),
@@ -2440,6 +2456,7 @@ pub async fn snapshot_revision_scope<E: Executor + Clone>(executor: &E) -> anyho
 
     let other = executor
         .get_snapshot(
+            String::new(),
             agg.to_owned(),
             view.to_owned(),
             "1".to_owned(),
@@ -2452,11 +2469,17 @@ pub async fn snapshot_revision_scope<E: Executor + Clone>(executor: &E) -> anyho
     );
 
     executor
-        .delete_snapshot(agg.to_owned(), view.to_owned(), id.to_owned())
+        .delete_snapshot(
+            String::new(),
+            agg.to_owned(),
+            view.to_owned(),
+            id.to_owned(),
+        )
         .await?;
     assert!(
         executor
             .get_snapshot(
+                String::new(),
                 agg.to_owned(),
                 view.to_owned(),
                 "0".to_owned(),
@@ -2482,6 +2505,7 @@ pub async fn snapshot_projection_scope<E: Executor + Clone>(executor: &E) -> any
     for (view, data) in [("view::A", vec![1u8]), ("view::B", vec![2u8, 2])] {
         executor
             .save_snapshot(
+                String::new(),
                 agg.to_owned(),
                 view.to_owned(),
                 "0".to_owned(),
@@ -2494,6 +2518,7 @@ pub async fn snapshot_projection_scope<E: Executor + Clone>(executor: &E) -> any
 
     let get = |view: &'static str| {
         executor.get_snapshot(
+            String::new(),
             agg.to_owned(),
             view.to_owned(),
             "0".to_owned(),
@@ -2508,7 +2533,12 @@ pub async fn snapshot_projection_scope<E: Executor + Clone>(executor: &E) -> any
     );
 
     executor
-        .delete_snapshot(agg.to_owned(), "view::A".to_owned(), id.to_owned())
+        .delete_snapshot(
+            String::new(),
+            agg.to_owned(),
+            "view::A".to_owned(),
+            id.to_owned(),
+        )
         .await?;
     assert!(get("view::A").await?.is_none());
     assert_eq!(
@@ -2566,6 +2596,7 @@ pub async fn snapshot_projection_scope<E: Executor + Clone>(executor: &E) -> any
     b.owner_name = "Marked".to_owned();
     executor
         .save_snapshot(
+            String::new(),
             bank_account.clone(),
             proj_scope_a::View::projection_name().to_owned(),
             "0".to_owned(),
@@ -2576,6 +2607,7 @@ pub async fn snapshot_projection_scope<E: Executor + Clone>(executor: &E) -> any
         .await?;
     executor
         .save_snapshot(
+            String::new(),
             bank_account.clone(),
             proj_scope_b::View::projection_name().to_owned(),
             "0".to_owned(),
@@ -2607,6 +2639,7 @@ pub async fn snapshot_projection_scope<E: Executor + Clone>(executor: &E) -> any
     // A stored snapshot that does not decode is a cache miss, not an error.
     executor
         .save_snapshot(
+            String::new(),
             bank_account,
             proj_scope_a::View::projection_name().to_owned(),
             "0".to_owned(),
@@ -2803,6 +2836,7 @@ pub async fn upcast_skip<E: Executor + Clone>(executor: &E) -> anyhow::Result<()
         .read(
             Some([EventFilter::by_id::<upcast::Refund>(&id)].into()),
             None,
+            TenantFilter::All,
             Args::forward(1, None),
             None,
         )
@@ -3402,6 +3436,7 @@ pub fn get_data() -> Vec<Event> {
             aggregate_type: aggregate_type.to_owned(),
             version: *version,
             routing_key,
+            tenant: String::new(),
             timestamp: timestamp as u64,
             timestamp_subsec: 0,
             data: Default::default(),
@@ -4766,6 +4801,7 @@ pub async fn replicate_large_batch<E: Executor>(executor: &E) -> anyhow::Result<
                 .read(
                     Some(vec![filter.clone()].into()),
                     None,
+                    TenantFilter::All,
                     Args::forward(1000, after),
                     None,
                 )
@@ -4789,4 +4825,379 @@ pub async fn replicate_large_batch<E: Executor>(executor: &E) -> anyhow::Result<
     assert_eq!(count().await?, usize::from(LEN));
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tenants
+// ---------------------------------------------------------------------------
+
+/// Opens account `id` in `tenant`.
+async fn open_in<E: Executor>(
+    executor: &E,
+    tenant: &str,
+    id: &str,
+    initial_balance: i64,
+) -> Result<String, evento::WriteError> {
+    evento::append(id)
+        .tenant(tenant)
+        .event(&bank::aggregator::AccountOpened {
+            owner_id: "owner".to_owned(),
+            owner_name: "Owner".to_owned(),
+            account_type: AccountType::Checking,
+            currency: "USD".to_owned(),
+            initial_balance,
+        })
+        .commit(executor)
+        .await
+}
+
+/// Deposits `amount` on account `id` of `tenant`, at `version`.
+async fn deposit_in<E: Executor>(
+    executor: &E,
+    tenant: &str,
+    id: &str,
+    version: u16,
+    amount: i64,
+) -> Result<String, evento::WriteError> {
+    evento::append(id)
+        .tenant(tenant)
+        .original_version(version)
+        .event(&MoneyDeposited {
+            amount,
+            transaction_id: Ulid::generate().to_string(),
+            description: "deposit".to_owned(),
+        })
+        .commit(executor)
+        .await
+}
+
+/// A raw `AccountOpened` of account `id`, naming `tenant`.
+fn raw_opened(id: &str, tenant: &str) -> Event {
+    use evento::{Aggregate, AggregateEvent};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+    let opened = bank::aggregator::AccountOpened {
+        owner_id: "owner".to_owned(),
+        owner_name: "Owner".to_owned(),
+        account_type: AccountType::Checking,
+        currency: "USD".to_owned(),
+        initial_balance: 1,
+    };
+    Event {
+        id: Ulid::generate(),
+        aggregate_id: id.to_owned(),
+        aggregate_type: bank::aggregator::AccountOpened::aggregate_type().to_owned(),
+        version: 1,
+        name: bank::aggregator::AccountOpened::event_name().to_owned(),
+        routing_key: None,
+        tenant: tenant.to_owned(),
+        data: bitcode::encode(&opened),
+        metadata: Default::default(),
+        timestamp: now.as_secs(),
+        timestamp_subsec: now.subsec_millis(),
+    }
+}
+
+/// Scenario: a stream is identified by `(tenant, type, id)`. The same
+/// aggregate id opens an independent stream in each tenant — its own versions,
+/// loads and reads — and the default tenant holds none of them.
+pub async fn tenant_streams_are_isolated<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
+    let id = Ulid::generate().to_string();
+
+    open_in(executor, "tenant-a", &id, 100).await?;
+    open_in(executor, "tenant-b", &id, 200).await?;
+    deposit_in(executor, "tenant-a", &id, 1, 50).await?;
+
+    let load = |tenant: &'static str| {
+        let id = id.clone();
+        async move {
+            tenant_view::projection::<E>()
+                .load(id)
+                .tenant(tenant)
+                .execute(executor)
+                .await
+        }
+    };
+    let in_a = load("tenant-a").await?.expect("a's account");
+    assert_eq!((in_a.balance, in_a.aggregate_version), (150, 2));
+    let in_b = load("tenant-b").await?.expect("b's account");
+    assert_eq!((in_b.balance, in_b.aggregate_version), (200, 1));
+    assert!(
+        load("").await?.is_none(),
+        "the default tenant holds no such stream"
+    );
+    assert!(bank::Command(executor.clone()).load(&id).await?.is_none());
+
+    // A read of one stream names one tenant: the default one unless the
+    // builder names another.
+    let events = evento::read::<BankAccount>(&id)
+        .tenant("tenant-a")
+        .execute(executor)
+        .await?;
+    assert_eq!(events.iter().map(|e| e.version).collect::<Vec<_>>(), [1, 2]);
+    assert!(events.iter().all(|e| e.tenant == "tenant-a"));
+    let events = evento::read::<BankAccount>(&id)
+        .tenant("tenant-b")
+        .execute(executor)
+        .await?;
+    assert_eq!(events.iter().map(|e| e.version).collect::<Vec<_>>(), [1]);
+    assert!(events.iter().all(|e| e.tenant == "tenant-b"));
+    assert!(evento::read::<BankAccount>(&id)
+        .execute(executor)
+        .await?
+        .is_empty());
+    assert!(!executor.has_event::<MoneyDeposited>(&id).await?);
+    assert_eq!(
+        executor
+            .original_version::<bank::aggregator::AccountOpened>(&id)
+            .await?,
+        None
+    );
+
+    // A version conflict is per stream: b is at version 1, whatever a holds.
+    assert!(matches!(
+        deposit_in(executor, "tenant-b", &id, 2, 1).await,
+        Err(evento::WriteError::InvalidOriginalVersion)
+    ));
+    assert!(matches!(
+        open_in(executor, "tenant-b", &id, 1).await,
+        Err(evento::WriteError::InvalidOriginalVersion)
+    ));
+    deposit_in(executor, "tenant-b", &id, 1, 25).await?;
+    let in_b = load("tenant-b").await?.expect("b's account");
+    assert_eq!((in_b.balance, in_b.aggregate_version), (225, 2));
+
+    // A raw event keeps the tenant it names.
+    let raw = Ulid::generate().to_string();
+    executor.write(vec![raw_opened(&raw, "tenant-c")]).await?;
+    let events = evento::read::<BankAccount>(&raw)
+        .tenant("tenant-c")
+        .execute(executor)
+        .await?;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].tenant, "tenant-c");
+
+    Ok(())
+}
+
+/// Scenario: a subscription processes the events of every tenant from one
+/// cursor, each event carrying its tenant.
+pub async fn tenant_subscriptions<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
+    let id = Ulid::generate().to_string();
+    open_in(executor, "", &id, 1).await?;
+    open_in(executor, "sub-a", &id, 2).await?;
+    open_in(executor, "sub-b", &id, 3).await?;
+
+    let key = format!("tenants-{id}");
+    tenant_seen::subscription(&key).run_once(executor).await?;
+    assert_eq!(tenant_seen::take(&key, &id), ["", "sub-a", "sub-b"]);
+
+    // The cursor moved past what it delivered, whatever the tenant.
+    open_in(executor, "sub-c", &id, 4).await?;
+    tenant_seen::subscription(&key).run_once(executor).await?;
+    assert_eq!(tenant_seen::take(&key, &id), ["sub-c"]);
+
+    Ok(())
+}
+
+/// Scenario: a projection subscription loads each event's aggregate in the
+/// event's own tenant — the same id in two tenants projects to two rows — and
+/// the snapshots it persists stay in their tenant.
+pub async fn tenant_projection_subscription<E: Executor + Clone>(
+    executor: &E,
+) -> anyhow::Result<()> {
+    let id = Ulid::generate().to_string();
+    open_in(executor, "proj-a", &id, 10).await?;
+    open_in(executor, "proj-b", &id, 20).await?;
+    deposit_in(executor, "proj-a", &id, 1, 5).await?;
+
+    tenant_view::projection()
+        .subscription(format!("tenant-view-{id}"))
+        .no_retry()
+        .run_once(executor)
+        .await?;
+
+    let balance_in = |tenant: &str| {
+        tenant_view::ROWS
+            .read()
+            .unwrap()
+            .get(&(tenant.to_owned(), id.clone()))
+            .copied()
+    };
+    assert_eq!(balance_in("proj-a"), Some(15));
+    assert_eq!(balance_in("proj-b"), Some(20));
+    assert_eq!(balance_in(""), None);
+
+    // Loads read back each tenant's own snapshot and events.
+    let load = |tenant: &'static str| {
+        let id = id.clone();
+        async move {
+            tenant_view::projection::<E>()
+                .load(id)
+                .tenant(tenant)
+                .execute(executor)
+                .await
+        }
+    };
+    assert_eq!(load("proj-a").await?.map(|v| v.balance), Some(15));
+    assert_eq!(load("proj-b").await?.map(|v| v.balance), Some(20));
+    assert!(load("").await?.is_none());
+
+    Ok(())
+}
+
+/// Scenario: snapshots are kept per tenant. The same key in two tenants names
+/// two snapshots, and deleting one leaves the other.
+pub async fn tenant_snapshots_are_isolated<E: Executor + Clone>(
+    executor: &E,
+) -> anyhow::Result<()> {
+    use evento::cursor::Value;
+
+    let (agg, view, id) = ("evento/TenantSnap", "view::T", "snap-1");
+    let save_in = |tenant: &str, data: Vec<u8>| {
+        executor.save_snapshot(
+            tenant.to_owned(),
+            agg.to_owned(),
+            view.to_owned(),
+            "0".to_owned(),
+            id.to_owned(),
+            data,
+            Value(String::new()),
+        )
+    };
+    let get_in = |tenant: &str| {
+        executor.get_snapshot(
+            tenant.to_owned(),
+            agg.to_owned(),
+            view.to_owned(),
+            "0".to_owned(),
+            id.to_owned(),
+        )
+    };
+
+    save_in("snap-a", vec![1]).await?;
+    save_in("snap-b", vec![2, 2]).await?;
+    assert_eq!(get_in("snap-a").await?.map(|s| s.0), Some(vec![1]));
+    assert_eq!(get_in("snap-b").await?.map(|s| s.0), Some(vec![2, 2]));
+    assert!(get_in("").await?.is_none(), "the default tenant has none");
+
+    executor
+        .delete_snapshot(
+            "snap-a".to_owned(),
+            agg.to_owned(),
+            view.to_owned(),
+            id.to_owned(),
+        )
+        .await?;
+    assert!(get_in("snap-a").await?.is_none());
+    assert_eq!(get_in("snap-b").await?.map(|s| s.0), Some(vec![2, 2]));
+
+    Ok(())
+}
+
+/// What [`tenant_subscriptions`] observes: per subscription key, the tenant of
+/// every `AccountOpened` delivered.
+mod tenant_seen {
+    use std::collections::HashMap;
+    use std::sync::RwLock;
+
+    use bank::aggregator::AccountOpened;
+    use evento::{
+        metadata::Event,
+        subscription::{Context, SubscriptionBuilder},
+        Executor,
+    };
+    use once_cell::sync::Lazy;
+
+    /// `(tenant, aggregate id)` of a delivered event.
+    type Delivered = (String, String);
+
+    /// Subscription key -> what it was delivered.
+    static SEEN: Lazy<RwLock<HashMap<String, Vec<Delivered>>>> = Lazy::new(Default::default);
+
+    /// A subscription under `key` recording what it is delivered.
+    pub fn subscription<E: Executor>(key: &str) -> SubscriptionBuilder<E> {
+        SubscriptionBuilder::new(key)
+            .data(Key(key.to_owned()))
+            .handler(on_opened())
+            .no_retry()
+    }
+
+    /// Drains the tenants `key` saw for aggregate `id`, sorted.
+    pub fn take(key: &str, id: &str) -> Vec<String> {
+        let mut seen: Vec<String> = SEEN
+            .write()
+            .unwrap()
+            .remove(key)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(_, aggregate_id)| aggregate_id == id)
+            .map(|(tenant, _)| tenant)
+            .collect();
+        seen.sort();
+        seen
+    }
+
+    #[derive(Clone)]
+    struct Key(String);
+
+    #[evento::subscription]
+    async fn on_opened<E: Executor>(
+        context: &Context<'_, E>,
+        event: Event<AccountOpened>,
+    ) -> anyhow::Result<()> {
+        let Key(key) = context.extract();
+        SEEN.write()
+            .unwrap()
+            .entry(key)
+            .or_default()
+            .push((event.tenant.clone(), event.aggregate_id.clone()));
+        Ok(())
+    }
+}
+
+/// The projection of [`tenant_projection_subscription`]: an account's balance,
+/// per `(tenant, id)`.
+mod tenant_view {
+    use std::collections::HashMap;
+    use std::sync::RwLock;
+
+    use bank::aggregator::{AccountOpened, BankAccount, MoneyDeposited};
+    use evento::{metadata::Event, projection::Projection, Executor};
+    use once_cell::sync::Lazy;
+
+    /// `(tenant, id)` -> balance, as the handlers last saw it.
+    pub static ROWS: Lazy<RwLock<HashMap<(String, String), i64>>> = Lazy::new(Default::default);
+
+    #[evento::projection(bitcode::Encode, bitcode::Decode)]
+    pub struct View {
+        pub balance: i64,
+    }
+
+    #[evento::handler]
+    async fn on_opened(event: Event<AccountOpened>, view: &mut View) -> anyhow::Result<()> {
+        view.balance = event.data.initial_balance;
+        ROWS.write().unwrap().insert(
+            (event.tenant.clone(), event.aggregate_id.clone()),
+            view.balance,
+        );
+        Ok(())
+    }
+
+    #[evento::handler]
+    async fn on_deposited(event: Event<MoneyDeposited>, view: &mut View) -> anyhow::Result<()> {
+        view.balance += event.data.amount;
+        ROWS.write().unwrap().insert(
+            (event.tenant.clone(), event.aggregate_id.clone()),
+            view.balance,
+        );
+        Ok(())
+    }
+
+    pub fn projection<E: Executor>() -> Projection<E, View> {
+        Projection::new::<BankAccount>()
+            .handler(on_opened())
+            .handler(on_deposited())
+    }
 }
