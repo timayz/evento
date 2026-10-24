@@ -49,8 +49,7 @@
 //! - `events` - Primary storage: `ULID -> Event`
 //! - `agg_index` - Aggregate version index: `enc(type, id, tenant) + {version
 //!   BE}` -> `ULID` (a stream is identified by its tenant, type and id)
-//! - `tenant_subscribers` - Subscription state: `enc(tenant, key)` ->
-//!   `SubscriberState`
+//! - `subscribers` - Subscription state: `{key}` -> `SubscriberState`
 //! - `tenant_snapshots` - Projection snapshots:
 //!   `enc(tenant, type, projection, id)` -> `StoredSnapshot`
 //! - `meta` - Store metadata: the monotonic commit clock (`last_stamp`) and the
@@ -79,9 +78,8 @@
 //! the matches, in cursor order.
 //!
 //! Opening a database whose `index_version` predates this layout rebuilds the
-//! index keyspaces from `events` (one O(total events) pass, then never again),
-//! moves the subscribers of a store that predates tenants into the default
-//! tenant (`""`), and drops its snapshots (a cache).
+//! index keyspaces from `events` (one O(total events) pass, then never again)
+//! and drops the snapshots of a store that predates tenants (a cache).
 //!
 //! # Ordering
 //!
@@ -323,13 +321,6 @@ const SNAPSHOTS_KEYSPACE: &str = "tenant_snapshots";
 /// cache, dropped on open.
 const LEGACY_SNAPSHOTS_KEYSPACES: &[&str] = &["projection_snapshots", "snapshots"];
 
-/// Keyspace holding subscriber state, keyed `enc(tenant, key)`.
-const SUBSCRIBERS_KEYSPACE: &str = "tenant_subscribers";
-
-/// Keyspace that held subscriber state keyed by the bare key, before tenants:
-/// its rows move into the default tenant on open.
-const LEGACY_SUBSCRIBERS_KEYSPACE: &str = "subscribers";
-
 /// Names of the index keyspaces plus the legacy (pre-`INDEX_VERSION` 2)
 /// index keyspaces — everything a rebuild deletes before re-indexing. Legacy
 /// names stay listed so an upgraded database reclaims their space.
@@ -433,9 +424,8 @@ impl Fjall {
     ///
     /// The first open of a database written by an older layout rebuilds the
     /// index keyspaces from `events` — one O(total events) pass, made durable
-    /// before this returns; subsequent opens skip it. Subscribers of a store
-    /// that predates tenants move into the default tenant, and its snapshots
-    /// (a cache) are dropped.
+    /// before this returns; subsequent opens skip it. The snapshots of a store
+    /// that predates tenants (a cache) are dropped.
     ///
     /// # Example
     ///
@@ -498,8 +488,6 @@ impl Fjall {
                 db.delete_keyspace(keyspace)?;
             }
         }
-        let subscribers = db.keyspace(SUBSCRIBERS_KEYSPACE, KeyspaceCreateOptions::default)?;
-        Self::move_legacy_subscribers(&db, &subscribers)?;
 
         let executor = Self {
             events: db.keyspace("events", KeyspaceCreateOptions::default)?,
@@ -514,7 +502,7 @@ impl Fjall {
             cursor_type_name_tenant: db
                 .keyspace("cursor_type_name_tenant", KeyspaceCreateOptions::default)?,
             cursor_routing: db.keyspace("cursor_routing", KeyspaceCreateOptions::default)?,
-            subscribers,
+            subscribers: db.keyspace("subscribers", KeyspaceCreateOptions::default)?,
             snapshots: db.keyspace(SNAPSHOTS_KEYSPACE, KeyspaceCreateOptions::default)?,
             meta,
             write_lock: Arc::new(Mutex::new(())),
@@ -536,30 +524,6 @@ impl Fjall {
         }
 
         Ok(executor)
-    }
-
-    /// Moves the subscribers of a store that predates tenants — keyed by the
-    /// bare subscription key — into the default tenant, then drops their
-    /// keyspace. Idempotent: a crash before the drop copies the same rows
-    /// again on the next open, before anything else could have changed them.
-    fn move_legacy_subscribers(db: &Database, subscribers: &Keyspace) -> anyhow::Result<()> {
-        if !db.keyspace_exists(LEGACY_SUBSCRIBERS_KEYSPACE) {
-            return Ok(());
-        }
-        let legacy = db.keyspace(LEGACY_SUBSCRIBERS_KEYSPACE, KeyspaceCreateOptions::default)?;
-        let mut batch = db.batch();
-        for guard in legacy.iter() {
-            let (key, value) = guard.into_inner()?;
-            batch.insert(
-                subscribers,
-                Self::encode_components(&[b"", key.as_ref()]),
-                value.as_ref(),
-            );
-        }
-        batch.commit()?;
-        db.persist(PersistMode::SyncAll)?;
-        db.delete_keyspace(legacy)?;
-        Ok(())
     }
 
     /// Re-derives every index entry (the aggregate index and the cursor
@@ -629,14 +593,8 @@ impl Fjall {
     /// A disabled subscription reports "not running" to its worker, which
     /// stops without processing further events. Missing subscribers are
     /// ignored.
-    pub async fn set_subscriber_enabled(
-        &self,
-        tenant: String,
-        key: String,
-        enabled: bool,
-    ) -> anyhow::Result<()> {
+    pub async fn set_subscriber_enabled(&self, key: String, enabled: bool) -> anyhow::Result<()> {
         let executor = self.clone();
-        let key = Self::subscriber_key(&tenant, &key);
 
         tokio::task::spawn_blocking(move || {
             let _guard = executor
@@ -649,7 +607,9 @@ impl Fjall {
             let mut state: SubscriberState = bitcode::decode(bytes.as_ref())
                 .map_err(|e| anyhow::anyhow!("Failed to deserialize subscriber: {}", e))?;
             state.enabled = enabled;
-            executor.subscribers.insert(key, bitcode::encode(&state))?;
+            executor
+                .subscribers
+                .insert(key.as_bytes(), bitcode::encode(&state))?;
             Ok(())
         })
         .await?
@@ -732,11 +692,6 @@ impl Fjall {
             tenant.as_bytes(),
             name.as_bytes(),
         ])
-    }
-
-    /// Builds a subscriber key: `enc(tenant, key)`.
-    fn subscriber_key(tenant: &str, key: &str) -> Vec<u8> {
-        Self::encode_components(&[tenant.as_bytes(), key.as_bytes()])
     }
 
     /// Builds the type-name cursor-index prefix: `enc(type, name)`.
@@ -1363,13 +1318,8 @@ impl Executor for Fjall {
         .await?
     }
 
-    async fn get_subscriber_cursor(
-        &self,
-        tenant: String,
-        key: String,
-    ) -> anyhow::Result<Option<Value>> {
+    async fn get_subscriber_cursor(&self, key: String) -> anyhow::Result<Option<Value>> {
         let executor = self.clone();
-        let key = Fjall::subscriber_key(&tenant, &key);
 
         tokio::task::spawn_blocking(move || match executor.subscribers.get(&key)? {
             Some(bytes) => {
@@ -1382,14 +1332,8 @@ impl Executor for Fjall {
         .await?
     }
 
-    async fn is_subscriber_running(
-        &self,
-        tenant: String,
-        key: String,
-        worker_id: Ulid,
-    ) -> anyhow::Result<bool> {
+    async fn is_subscriber_running(&self, key: String, worker_id: Ulid) -> anyhow::Result<bool> {
         let executor = self.clone();
-        let key = Fjall::subscriber_key(&tenant, &key);
 
         tokio::task::spawn_blocking(move || match executor.subscribers.get(&key)? {
             Some(bytes) => {
@@ -1404,12 +1348,10 @@ impl Executor for Fjall {
 
     async fn subscriber_status(
         &self,
-        tenant: String,
         key: String,
         worker_id: Ulid,
     ) -> anyhow::Result<SubscriberStatus> {
         let executor = self.clone();
-        let key = Fjall::subscriber_key(&tenant, &key);
 
         tokio::task::spawn_blocking(move || match executor.subscribers.get(&key)? {
             Some(bytes) => {
@@ -1470,14 +1412,8 @@ impl Executor for Fjall {
         .await?
     }
 
-    async fn upsert_subscriber(
-        &self,
-        tenant: String,
-        key: String,
-        worker_id: Ulid,
-    ) -> anyhow::Result<()> {
+    async fn upsert_subscriber(&self, key: String, worker_id: Ulid) -> anyhow::Result<()> {
         let executor = self.clone();
-        let key = Fjall::subscriber_key(&tenant, &key);
 
         tokio::task::spawn_blocking(move || {
             // Read-modify-write under the write lock so a concurrent upsert or
@@ -1504,7 +1440,9 @@ impl Executor for Fjall {
                 },
             };
 
-            executor.subscribers.insert(key, bitcode::encode(&state))?;
+            executor
+                .subscribers
+                .insert(key.as_bytes(), bitcode::encode(&state))?;
             Ok(())
         })
         .await?
@@ -1512,14 +1450,12 @@ impl Executor for Fjall {
 
     async fn acknowledge(
         &self,
-        tenant: String,
         key: String,
         worker_id: Ulid,
         cursor: Value,
         lag: u64,
     ) -> anyhow::Result<bool> {
         let executor = self.clone();
-        let key = Fjall::subscriber_key(&tenant, &key);
 
         tokio::task::spawn_blocking(move || {
             // Fenced read-modify-write under the write lock: a superseded
@@ -1544,7 +1480,9 @@ impl Executor for Fjall {
             state.cursor = Some(cursor.0);
             state.lag = lag;
 
-            executor.subscribers.insert(key, bitcode::encode(&state))?;
+            executor
+                .subscribers
+                .insert(key.as_bytes(), bitcode::encode(&state))?;
             Ok(true)
         })
         .await?
@@ -1783,39 +1721,32 @@ mod tests {
 
         // Create subscriber
         executor
-            .upsert_subscriber(String::new(), key.clone(), worker_id)
+            .upsert_subscriber(key.clone(), worker_id)
             .await
             .unwrap();
 
         // Check if running
         assert!(executor
-            .is_subscriber_running(String::new(), key.clone(), worker_id)
+            .is_subscriber_running(key.clone(), worker_id)
             .await
             .unwrap());
 
         // Check cursor is None initially
         assert!(executor
-            .get_subscriber_cursor(String::new(), key.clone())
+            .get_subscriber_cursor(key.clone())
             .await
             .unwrap()
             .is_none());
 
         // Acknowledge with cursor (fenced on the owning worker id)
         assert!(executor
-            .acknowledge(
-                String::new(),
-                key.clone(),
-                worker_id,
-                Value("test-cursor".to_string()),
-                0
-            )
+            .acknowledge(key.clone(), worker_id, Value("test-cursor".to_string()), 0)
             .await
             .unwrap());
 
         // A superseded worker's ack is rejected and does not move the cursor
         assert!(!executor
             .acknowledge(
-                String::new(),
                 key.clone(),
                 Ulid::generate(),
                 Value("stale-cursor".to_string()),
@@ -1825,19 +1756,16 @@ mod tests {
             .unwrap());
 
         // Check cursor is updated
-        let cursor = executor
-            .get_subscriber_cursor(String::new(), key.clone())
-            .await
-            .unwrap();
+        let cursor = executor.get_subscriber_cursor(key.clone()).await.unwrap();
         assert_eq!(cursor.unwrap().0, "test-cursor");
 
         // Disabling the subscription reports "not running"
         executor
-            .set_subscriber_enabled(String::new(), key.clone(), false)
+            .set_subscriber_enabled(key.clone(), false)
             .await
             .unwrap();
         assert!(!executor
-            .is_subscriber_running(String::new(), key, worker_id)
+            .is_subscriber_running(key, worker_id)
             .await
             .unwrap());
     }
@@ -2191,8 +2119,8 @@ mod tests {
     }
 
     /// A store written before tenants opens: its events read back in the
-    /// default tenant off rebuilt indexes, its subscribers keep their cursors
-    /// there, and the keyspaces it no longer uses are gone.
+    /// default tenant off rebuilt indexes, and its subscribers keep their
+    /// cursors.
     #[tokio::test]
     async fn test_open_upgrades_a_store_that_predates_tenants() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -2216,7 +2144,7 @@ mod tests {
                 events.insert(id.to_bytes(), bitcode::encode(&v1)).unwrap();
             }
             let subscribers = db
-                .keyspace(LEGACY_SUBSCRIBERS_KEYSPACE, KeyspaceCreateOptions::default)
+                .keyspace("subscribers", KeyspaceCreateOptions::default)
                 .unwrap();
             subscribers
                 .insert("billing", bitcode::encode(&legacy_state))
@@ -2227,8 +2155,7 @@ mod tests {
         }
 
         let db = Database::builder(temp_dir.path()).open().unwrap();
-        let executor = Fjall::from_database(db.clone()).unwrap();
-        assert!(!db.keyspace_exists(LEGACY_SUBSCRIBERS_KEYSPACE));
+        let executor = Fjall::from_database(db).unwrap();
 
         let read = executor
             .read(
@@ -2255,13 +2182,13 @@ mod tests {
         );
         assert_eq!(
             executor
-                .get_subscriber_cursor(String::new(), "billing".to_owned())
+                .get_subscriber_cursor("billing".to_owned())
                 .await
                 .unwrap(),
             Some(Value("cursor-1".to_owned()))
         );
         assert!(executor
-            .is_subscriber_running(String::new(), "billing".to_owned(), Ulid::nil())
+            .is_subscriber_running("billing".to_owned(), Ulid::nil())
             .await
             .unwrap());
 

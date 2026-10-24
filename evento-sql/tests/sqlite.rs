@@ -568,12 +568,6 @@ async fn sqlite_tenant_streams_are_isolated() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn sqlite_tenant_scope_is_enforced() -> anyhow::Result<()> {
-    let executor = create_sqlite_executor("tenant_scope_is_enforced").await?;
-    evento_test::tenant_scope_is_enforced(&executor).await
-}
-
-#[tokio::test]
 async fn sqlite_tenant_subscriptions() -> anyhow::Result<()> {
     let executor = create_sqlite_executor("tenant_subscriptions").await?;
     evento_test::tenant_subscriptions(&executor).await

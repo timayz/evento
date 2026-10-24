@@ -17,9 +17,8 @@
 //!
 //! A stream is `(tenant, type, id)`, and a key lives in its tenant
 //! ([`Key::in_tenant`]): the same aggregate id in two tenants is two keys, so
-//! their writes never conflict. Scope a tenant by wrapping the executor —
-//! `Evento::new(accord).tenant(t)` — never the local backend, which applies and
-//! serves every tenant's events.
+//! their writes never conflict. The local backend applies and serves every
+//! tenant's events.
 //!
 //! ## Scope
 //!
@@ -184,17 +183,7 @@ pub struct ExecutorDataStore<E: Executor> {
 
 impl<E: Executor> ExecutorDataStore<E> {
     /// Wraps a local evento backend as an Accord data store.
-    ///
-    /// # Panics
-    ///
-    /// If `local` is scoped to a tenant ([`Executor::tenant`]): a replica
-    /// applies every tenant's events, and a joiner copies them all. Scope the
-    /// [`AccordExecutor`] instead (`Evento::new(executor).tenant(t)`).
     pub fn new(local: E) -> Self {
-        assert!(
-            local.tenant().is_none(),
-            "an Accord data store must not be scoped to a tenant"
-        );
         Self { local }
     }
 }
@@ -495,34 +484,22 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
             .await
     }
 
-    async fn get_subscriber_cursor(
-        &self,
-        tenant: String,
-        key: String,
-    ) -> anyhow::Result<Option<Value>> {
-        self.local.get_subscriber_cursor(tenant, key).await
+    async fn get_subscriber_cursor(&self, key: String) -> anyhow::Result<Option<Value>> {
+        self.local.get_subscriber_cursor(key).await
     }
 
-    async fn is_subscriber_running(
-        &self,
-        tenant: String,
-        key: String,
-        worker_id: Ulid,
-    ) -> anyhow::Result<bool> {
-        self.local
-            .is_subscriber_running(tenant, key, worker_id)
-            .await
+    async fn is_subscriber_running(&self, key: String, worker_id: Ulid) -> anyhow::Result<bool> {
+        self.local.is_subscriber_running(key, worker_id).await
     }
 
     // Explicitly forwarded (not left to the trait defaults) so the local
     // backend's single-round-trip overrides are reached through the wrapper.
     async fn subscriber_status(
         &self,
-        tenant: String,
         key: String,
         worker_id: Ulid,
     ) -> anyhow::Result<evento_core::SubscriberStatus> {
-        self.local.subscriber_status(tenant, key, worker_id).await
+        self.local.subscriber_status(key, worker_id).await
     }
 
     async fn latest_version(
@@ -547,26 +524,18 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
             .await
     }
 
-    async fn upsert_subscriber(
-        &self,
-        tenant: String,
-        key: String,
-        worker_id: Ulid,
-    ) -> anyhow::Result<()> {
-        self.local.upsert_subscriber(tenant, key, worker_id).await
+    async fn upsert_subscriber(&self, key: String, worker_id: Ulid) -> anyhow::Result<()> {
+        self.local.upsert_subscriber(key, worker_id).await
     }
 
     async fn acknowledge(
         &self,
-        tenant: String,
         key: String,
         worker_id: Ulid,
         cursor: Value,
         lag: u64,
     ) -> anyhow::Result<bool> {
-        self.local
-            .acknowledge(tenant, key, worker_id, cursor, lag)
-            .await
+        self.local.acknowledge(key, worker_id, cursor, lag).await
     }
 
     async fn get_snapshot(

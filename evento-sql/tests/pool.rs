@@ -267,8 +267,8 @@ where
     Ok(())
 }
 
-/// The tenants of the subscriber rows keyed `key`.
-async fn subscriber_tenants<DB>(pool: &Pool<DB>, key: &str) -> anyhow::Result<Vec<String>>
+/// The tenants of the events of aggregate `aggregate_id`.
+async fn event_tenants<DB>(pool: &Pool<DB>, aggregate_id: &str) -> anyhow::Result<Vec<String>>
 where
     DB: Database,
     for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
@@ -276,13 +276,13 @@ where
     String: for<'r> sqlx::Decode<'r, DB> + sqlx::Type<DB>,
     usize: sqlx::ColumnIndex<DB::Row>,
 {
-    use evento::sql::Subscriber;
+    use evento::sql::Event as EventTable;
     use sea_query::{Expr, ExprTrait};
 
     let statement = Query::select()
-        .column(Subscriber::Tenant)
-        .from(Subscriber::Table)
-        .and_where(Expr::col(Subscriber::Key).eq(key))
+        .column(EventTable::Tenant)
+        .from(EventTable::Table)
+        .and_where(Expr::col(EventTable::AggregatorId).eq(aggregate_id))
         .to_owned();
     let (sql, values) = match DB::NAME {
         "SQLite" => statement.build_sqlx(SqliteQueryBuilder),
@@ -297,9 +297,46 @@ where
     Ok(rows.into_iter().map(|(tenant,)| tenant).collect())
 }
 
-/// `m0008` reverts and re-applies around a subscriber row of the default
-/// tenant, which survives both; once a tenant other than the default one holds
-/// an event, the revert is refused and nothing is reverted.
+/// An `event` row, in `tenant` when given (else the column's default).
+fn event_row(aggregate_id: &str, tenant: Option<&str>) -> sea_query::InsertStatement {
+    use evento::sql::Event as EventTable;
+
+    let mut columns = vec![
+        EventTable::Id,
+        EventTable::Name,
+        EventTable::Data,
+        EventTable::Metadata,
+        EventTable::AggregatorType,
+        EventTable::AggregatorId,
+        EventTable::Version,
+        EventTable::Timestamp,
+        EventTable::TimestampSubsec,
+    ];
+    let mut values: Vec<sea_query::Expr> = vec![
+        ulid::Ulid::generate().to_string().into(),
+        "Opened".into(),
+        Vec::<u8>::new().into(),
+        Vec::<u8>::new().into(),
+        "test/Account".into(),
+        aggregate_id.into(),
+        1.into(),
+        0.into(),
+        0.into(),
+    ];
+    if let Some(tenant) = tenant {
+        columns.push(EventTable::Tenant);
+        values.push(tenant.into());
+    }
+    Query::insert()
+        .into_table(EventTable::Table)
+        .columns(columns)
+        .values_panic(values)
+        .to_owned()
+}
+
+/// `m0008` reverts and re-applies around an event of the default tenant,
+/// which survives both; once a tenant other than the default one holds an
+/// event, the revert is refused and nothing is reverted.
 pub async fn m0008_round_trip<DB>(pool: Pool<DB>) -> anyhow::Result<()>
 where
     DB: Database,
@@ -317,21 +354,7 @@ where
     M0008: sqlx_migrator::Migration<DB>,
     sqlx_migrator::Migrator<DB>: sqlx_migrator::migrator::DatabaseOperation<DB>,
 {
-    use evento::sql::{Event as EventTable, Subscriber};
-
-    execute(
-        &pool,
-        Query::insert()
-            .into_table(Subscriber::Table)
-            .columns([Subscriber::Key, Subscriber::WorkerId, Subscriber::Lag])
-            .values_panic([
-                "kept".into(),
-                ulid::Ulid::nil().to_string().into(),
-                0.into(),
-            ])
-            .to_owned(),
-    )
-    .await?;
+    execute(&pool, event_row("kept", None)).await?;
 
     let migrator = evento::sql_migrator::new::<DB>()?;
     let mut conn = pool.acquire().await?;
@@ -341,42 +364,12 @@ where
     migrator.run(&mut *conn, &Plan::apply_all()).await?;
     drop(conn);
     assert_eq!(
-        subscriber_tenants(&pool, "kept").await?,
+        event_tenants(&pool, "kept").await?,
         vec![String::new()],
-        "the subscriber row survives the revert and the re-apply, in the default tenant"
+        "the event survives the revert and the re-apply, in the default tenant"
     );
 
-    execute(
-        &pool,
-        Query::insert()
-            .into_table(EventTable::Table)
-            .columns([
-                EventTable::Id,
-                EventTable::Name,
-                EventTable::Data,
-                EventTable::Metadata,
-                EventTable::AggregatorType,
-                EventTable::AggregatorId,
-                EventTable::Version,
-                EventTable::Tenant,
-                EventTable::Timestamp,
-                EventTable::TimestampSubsec,
-            ])
-            .values_panic([
-                ulid::Ulid::generate().to_string().into(),
-                "Opened".into(),
-                Vec::<u8>::new().into(),
-                Vec::<u8>::new().into(),
-                "test/Account".into(),
-                "a-1".into(),
-                1.into(),
-                "acme".into(),
-                0.into(),
-                0.into(),
-            ])
-            .to_owned(),
-    )
-    .await?;
+    execute(&pool, event_row("a-1", Some("acme"))).await?;
 
     let mut conn = pool.acquire().await?;
     let err = migrator
@@ -389,8 +382,8 @@ where
         "unexpected error: {err}"
     );
     assert_eq!(
-        subscriber_tenants(&pool, "kept").await?,
-        vec![String::new()],
+        event_tenants(&pool, "a-1").await?,
+        vec!["acme".to_owned()],
         "the refused revert changed nothing"
     );
 

@@ -1,7 +1,7 @@
 //! Tenants over one shared store: the host application's resolver maps each
-//! token to a tenant and serves the store scoped to it, and a client —
-//! whatever it sends — reaches nothing of another tenant's events, snapshots
-//! or subscriptions, while its own code stays tenant-agnostic.
+//! token to a tenant and serves the connection in it (`Session::tenant`), and
+//! a client — whatever it sends — reaches nothing of another tenant's events
+//! or snapshots, while its own code stays tenant-agnostic.
 
 use std::sync::{Arc, Mutex};
 
@@ -11,29 +11,28 @@ use evento::metadata::Event as Typed;
 use evento::subscription::{Context, SubscriptionBuilder};
 use evento::Sidecar;
 use evento_core::cursor::{Args, Value};
-use evento_core::{Event, EventFilter, Evento, Executor, TenantFilter, WriteError};
+use evento_core::{Event, EventFilter, Executor, TenantFilter, WriteError};
 use evento_fjall::Fjall;
 use evento_remote::{serve_with, Client, Hello, Rejection, Resolver, Session};
 use tokio::net::TcpListener;
 use ulid::Ulid;
 
-/// Serves the shared store scoped to the tenant a `tenant:<id>` token names.
+/// Serves the shared store in the tenant a `tenant:<id>` token names.
 struct ByTenant(Fjall);
 
 #[async_trait::async_trait]
 impl Resolver for ByTenant {
-    type Executor = Evento;
+    type Executor = Fjall;
 
-    async fn resolve(&self, hello: &Hello) -> Result<Session<Evento>, Rejection> {
+    async fn resolve(&self, hello: &Hello) -> Result<Session<Fjall>, Rejection> {
         let tenant = hello
             .token
             .as_deref()
             .and_then(|token| token.strip_prefix("tenant:"))
             .ok_or(Rejection::Unauthorized)?;
-        let scoped = Evento::new(self.0.clone())
+        Session::new(self.0.clone())
             .tenant(tenant)
-            .map_err(|_| Rejection::Unauthorized)?;
-        Ok(Session::new(scoped))
+            .map_err(|_| Rejection::Unauthorized)
     }
 }
 
@@ -86,7 +85,6 @@ async fn a_client_reaches_only_its_own_tenant() {
     let _server = serve_with(listener, ByTenant(store.clone()));
     let a = connect(addr, "a").await;
     let b = connect(addr, "b").await;
-    assert_eq!(a.tenant(), None, "the client itself names no tenant");
 
     // Tenant-agnostic writes land in each client's tenant: one aggregate id,
     // two streams.
@@ -114,21 +112,23 @@ async fn a_client_reaches_only_its_own_tenant() {
         1
     );
 
-    // It writes nothing into b's tenant, and cannot replicate.
-    assert!(matches!(
-        a.write(vec![event("acc", 3, "b")]).await,
-        Err(WriteError::ForeignTenant { .. })
-    ));
-    assert!(matches!(
-        a.replicate(vec![event("other", 1, "")]).await,
-        Err(WriteError::ReplicateRefused)
-    ));
+    // An event naming b's tenant lands in a's, and replicate is refused.
+    a.write(vec![event("acc", 2, "b")]).await.unwrap();
+    let Err(WriteError::Unknown(refused)) = a.replicate(vec![event("other", 1, "")]).await else {
+        panic!("replicate was not refused");
+    };
+    assert!(refused.to_string().contains("refused"), "{refused:#}");
+    assert_eq!(
+        read(&store, "acc", TenantFilter::Only("a".to_owned())).await,
+        [("a".to_owned(), 1), ("a".to_owned(), 2)]
+    );
     assert_eq!(
         read(&store, "acc", TenantFilter::Only("b".to_owned())).await,
         [("b".to_owned(), 1), ("b".to_owned(), 2)]
     );
+    assert!(read(&store, "other", TenantFilter::All).await.is_empty());
 
-    // Snapshots and subscriber rows land in a's tenant, whatever it names.
+    // Snapshots land in a's tenant, whatever it names.
     a.save_snapshot(
         "b".to_owned(),
         AGGREGATE.to_owned(),
@@ -153,22 +153,44 @@ async fn a_client_reaches_only_its_own_tenant() {
             .unwrap();
         assert_eq!(snapshot.map(|s| s.0), expected);
     }
+}
+
+/// A subscriber row belongs to no tenant, so a connection serving one refuses
+/// every subscriber call: a subscription run straight on the client fails
+/// before it reads anything, and the store keeps no row of it.
+#[tokio::test]
+async fn a_tenant_connection_refuses_the_subscriber_calls() {
+    let store = Fjall::temporary().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let _server = serve_with(listener, ByTenant(store.clone()));
+    let a = connect(addr, "a").await;
+    let key = || "projector".to_owned();
     let worker = Ulid::generate();
-    a.upsert_subscriber("b".to_owned(), "projector".to_owned(), worker)
-        .await
-        .unwrap();
-    assert!(store
-        .is_subscriber_running("a".to_owned(), "projector".to_owned(), worker)
-        .await
-        .unwrap());
-    assert!(!store
-        .is_subscriber_running("b".to_owned(), "projector".to_owned(), worker)
-        .await
-        .unwrap());
-    assert!(!b
-        .is_subscriber_running(String::new(), "projector".to_owned(), worker)
-        .await
-        .unwrap());
+
+    let refused = |result: anyhow::Result<()>| {
+        let err = result.expect_err("the subscriber call was served");
+        assert!(err.to_string().contains("not served"), "{err:#}");
+    };
+    refused(a.upsert_subscriber(key(), worker).await);
+    refused(a.get_subscriber_cursor(key()).await.map(drop));
+    refused(a.is_subscriber_running(key(), worker).await.map(drop));
+    refused(a.subscriber_status(key(), worker).await.map(drop));
+    refused(
+        a.acknowledge(key(), worker, Value(String::new()), 0)
+            .await
+            .map(drop),
+    );
+    refused(
+        SubscriptionBuilder::new("projector")
+            .handler(on_account_opened())
+            .no_retry()
+            .run_once(&a)
+            .await,
+    );
+
+    assert!(store.get_subscriber_cursor(key()).await.unwrap().is_none());
+    assert!(!store.is_subscriber_running(key(), worker).await.unwrap());
 }
 
 #[tokio::test]
@@ -217,10 +239,9 @@ async fn open_account<E: Executor>(executor: E, owner: &str) -> String {
 
 /// A tenant application follows the shared store through a `Sidecar` — the
 /// remote client as its events source, its own store for everything else —
-/// over a session the server scoped to its tenant. Its code names no tenant:
+/// over a session the server serves in its tenant. Its code names no tenant:
 /// it reads, loads and subscribes to its tenant's events only, its writes
-/// land in its tenant, and its cursors and snapshots stay in its own store,
-/// under the default tenant.
+/// land in its tenant, and its cursors and snapshots stay in its own store.
 #[tokio::test]
 async fn a_sidecar_follows_only_its_tenant() {
     let store = Fjall::temporary().unwrap();
@@ -240,7 +261,7 @@ async fn a_sidecar_follows_only_its_tenant() {
         .run_once(&app)
         .await
         .unwrap();
-    assert_eq!(*opened.0.lock().unwrap(), [ours.clone()]);
+    assert_eq!(*opened.0.lock().unwrap(), std::slice::from_ref(&ours));
 
     let command = bank::Command(app.clone());
     assert!(command.load(&ours).await.unwrap().is_some());
@@ -265,17 +286,15 @@ async fn a_sidecar_follows_only_its_tenant() {
         assert_eq!(read.edges.len(), expected, "tenant {tenant:?}");
     }
 
-    // The bookkeeping is local, in the default tenant, as before tenants.
+    // The bookkeeping is local, as before tenants.
     assert!(local
-        .get_subscriber_cursor(String::new(), "accounts".to_owned())
+        .get_subscriber_cursor("accounts".to_owned())
         .await
         .unwrap()
         .is_some());
-    for tenant in ["", "a"] {
-        assert!(store
-            .get_subscriber_cursor(tenant.to_owned(), "accounts".to_owned())
-            .await
-            .unwrap()
-            .is_none());
-    }
+    assert!(store
+        .get_subscriber_cursor("accounts".to_owned())
+        .await
+        .unwrap()
+        .is_none());
 }

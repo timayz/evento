@@ -498,10 +498,8 @@ through `AccordExecutor`) — split it into several writes.
   `(tenant, type, id)`, and a key lives in its tenant — the default tenant's keys
   are the bare routing key or aggregate id. A node of format 2 refuses journals and
   frames of format 1: evento-accord is unreleased, so a cluster of an older build is
-  wiped and re-bootstrapped. Scope a tenant through
-  `Evento::new(accord_executor).tenant(t)`; the local store under
-  `ExecutorDataStore` stays unscoped (`new` refuses a scoped one), since a replica
-  applies — and a joiner copies — every tenant's events.
+  wiped and re-bootstrapped. A replica applies — and a joiner copies — every
+  tenant's events.
 - **Joining across versions** (paged joins): a joiner asks for the paged header
   first; a contact predating command pages sheds the request, and the joiner asks
   again for the inline header after `collect_timeout` — so a join against an old

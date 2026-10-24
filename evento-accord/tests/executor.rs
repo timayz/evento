@@ -357,33 +357,34 @@ async fn a_retired_node_is_a_transient_refusal() {
 /// keeps its own versions and conflicts, on every replica.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_tenants_write_one_aggregate_id_independently() {
-    use evento_core::{Evento, TenantFilter};
+    use evento_core::TenantFilter;
 
     let cluster = ExecCluster::start(3);
-    let scoped = |node: usize, tenant: &str| {
-        Evento::new(cluster.execs[node].clone())
-            .tenant(tenant)
-            .unwrap()
+    let in_tenant = |tenant: &str, version: u16, name: &str| Event {
+        tenant: tenant.to_owned(),
+        ..event("acc", version, name)
     };
-    let (a0, b1) = (scoped(0, "a"), scoped(1, "b"));
 
     let (in_a, in_b) = tokio::join!(
-        a0.write(vec![event("acc", 1, "Opened")]),
-        b1.write(vec![event("acc", 1, "Opened")]),
+        cluster.execs[0].write(vec![in_tenant("a", 1, "Opened")]),
+        cluster.execs[1].write(vec![in_tenant("b", 1, "Opened")]),
     );
     in_a.expect("a's stream opens");
     in_b.expect("b's stream opens, on the same id");
-    scoped(2, "a")
-        .write(vec![event("acc", 2, "Deposited")])
+    cluster.execs[2]
+        .write(vec![in_tenant("a", 2, "Deposited")])
         .await
         .expect("a's stream extends through another coordinator");
     // b's stream is at version 1, whatever a's holds: its version 2 commits,
     // and a second version 1 conflicts.
-    b1.write(vec![event("acc", 2, "Deposited")])
+    cluster.execs[1]
+        .write(vec![in_tenant("b", 2, "Deposited")])
         .await
         .expect("b's own version 2");
     assert!(matches!(
-        b1.write(vec![event("acc", 1, "Opened")]).await,
+        cluster.execs[1]
+            .write(vec![in_tenant("b", 1, "Opened")])
+            .await,
         Err(WriteError::InvalidOriginalVersion)
     ));
 
@@ -391,11 +392,11 @@ async fn two_tenants_write_one_aggregate_id_independently() {
         for (tenant, versions) in [("a", vec![1, 2]), ("b", vec![1, 2])] {
             let mut seen = Vec::new();
             for _ in 0..200 {
-                seen = scoped(node, tenant)
+                seen = cluster.execs[node]
                     .read(
                         Some([EventFilter::by_id_raw("test/Account", "acc")].into()),
                         None,
-                        TenantFilter::All,
+                        TenantFilter::Only(tenant.to_owned()),
                         Args::forward(10, None),
                         None,
                     )

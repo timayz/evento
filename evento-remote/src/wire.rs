@@ -25,8 +25,7 @@ pub const MAGIC: [u8; 2] = *b"Er";
 /// v4: `Hello` carries an optional token and its reply may refuse the
 /// connection; the server requires `Hello` as the first frame.
 /// v5: tenants — events carry their tenant, every scan request a
-/// `TenantFilter` and every identity, subscriber and snapshot request a
-/// tenant, and write errors the tenant refusals.
+/// `TenantFilter`, and every identity and snapshot request a tenant.
 pub const FORMAT_VERSION: u8 = 5;
 
 /// Length of the fixed header: `MAGIC (2) + version (1) + kind (1)`.
@@ -153,18 +152,15 @@ pub enum Request {
         tenant: TenantFilter,
     },
     GetSubscriberCursor {
-        tenant: String,
         key: String,
     },
     IsSubscriberRunning {
-        tenant: String,
         key: String,
         worker_id: Ulid,
     },
     /// Fencing state + cursor in one round trip (see
     /// `Executor::subscriber_status`).
     SubscriberStatus {
-        tenant: String,
         key: String,
         worker_id: Ulid,
     },
@@ -181,12 +177,10 @@ pub enum Request {
         aggregate_id: String,
     },
     UpsertSubscriber {
-        tenant: String,
         key: String,
         worker_id: Ulid,
     },
     Acknowledge {
-        tenant: String,
         key: String,
         worker_id: Ulid,
         cursor: Value,
@@ -316,8 +310,7 @@ impl From<WireReadResult> for evento_core::cursor::ReadResult<Event> {
 /// `InvalidOriginalVersion` and `MissingData` map 1:1 — `WriteBuilder`'s
 /// retry-on-conflict matches on the variant, so fidelity matters — and so
 /// does `Unavailable`, which a client shows as a transient refusal rather
-/// than a failure (its cause travels as its `Display` string), and so do the
-/// tenant refusals of a scoped session;
+/// than a failure (its cause travels as its `Display` string);
 /// `Unknown`/`SystemTime` collapse to their `Display` strings.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum WireWriteError {
@@ -325,8 +318,6 @@ pub enum WireWriteError {
     MissingData,
     Other(String),
     Unavailable(String),
-    ForeignTenant { expected: String, found: String },
-    ReplicateRefused,
 }
 
 impl From<&WriteError> for WireWriteError {
@@ -335,11 +326,6 @@ impl From<&WriteError> for WireWriteError {
             WriteError::InvalidOriginalVersion => WireWriteError::InvalidOriginalVersion,
             WriteError::MissingData => WireWriteError::MissingData,
             WriteError::Unavailable(cause) => WireWriteError::Unavailable(cause.to_string()),
-            WriteError::ForeignTenant { expected, found } => WireWriteError::ForeignTenant {
-                expected: expected.clone(),
-                found: found.clone(),
-            },
-            WriteError::ReplicateRefused => WireWriteError::ReplicateRefused,
             other => WireWriteError::Other(other.to_string()),
         }
     }
@@ -352,10 +338,6 @@ impl From<WireWriteError> for WriteError {
             WireWriteError::MissingData => WriteError::MissingData,
             WireWriteError::Other(msg) => WriteError::Unknown(anyhow::anyhow!(msg)),
             WireWriteError::Unavailable(cause) => WriteError::Unavailable(anyhow::anyhow!(cause)),
-            WireWriteError::ForeignTenant { expected, found } => {
-                WriteError::ForeignTenant { expected, found }
-            }
-            WireWriteError::ReplicateRefused => WriteError::ReplicateRefused,
         }
     }
 }

@@ -244,35 +244,20 @@ impl Executor for SimExecutor {
 
     // The simulation never subscribes nor snapshots projections.
 
-    async fn get_subscriber_cursor(
-        &self,
-        _tenant: String,
-        _key: String,
-    ) -> anyhow::Result<Option<Value>> {
+    async fn get_subscriber_cursor(&self, _key: String) -> anyhow::Result<Option<Value>> {
         Ok(None)
     }
 
-    async fn is_subscriber_running(
-        &self,
-        _tenant: String,
-        _key: String,
-        _worker_id: Ulid,
-    ) -> anyhow::Result<bool> {
+    async fn is_subscriber_running(&self, _key: String, _worker_id: Ulid) -> anyhow::Result<bool> {
         Ok(false)
     }
 
-    async fn upsert_subscriber(
-        &self,
-        _tenant: String,
-        _key: String,
-        _worker_id: Ulid,
-    ) -> anyhow::Result<()> {
+    async fn upsert_subscriber(&self, _key: String, _worker_id: Ulid) -> anyhow::Result<()> {
         Ok(())
     }
 
     async fn acknowledge(
         &self,
-        _tenant: String,
         _key: String,
         _worker_id: Ulid,
         _cursor: Value,

@@ -641,7 +641,6 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
             projection: self,
             key: key.into(),
             routing_key: None,
-            tenant: None,
             chunk_size: 300,
             retry: Some(30),
             delay: None,
@@ -871,12 +870,10 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> LoadBuilder<E, P> {
         self
     }
 
-    /// Loads the aggregate of `tenant` instead of the executor's
-    /// ([`Executor::tenant`]; the default tenant, `""`, for an unscoped
-    /// executor).
+    /// Loads the aggregate of `tenant` instead of the default tenant's
+    /// (`""`).
     ///
-    /// The same id in two tenants names two aggregates. An executor scoped to
-    /// another tenant loads in its own tenant regardless.
+    /// The same id in two tenants names two aggregates.
     pub fn tenant(mut self, v: impl Into<String>) -> Self {
         self.tenant = Some(v.into());
         self
@@ -889,13 +886,9 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> LoadBuilder<E, P> {
     /// tombstone was registered via [`Projection::tombstone`] and the
     /// corresponding event has been committed for this id.
     pub async fn execute(&self, executor: &E) -> anyhow::Result<Option<P>> {
-        let tenant = self
-            .tenant
-            .clone()
-            .or_else(|| executor.tenant().map(str::to_owned))
-            .unwrap_or_default();
+        let tenant = self.tenant.as_deref().unwrap_or_default();
         self.projection
-            .load_aggregator(executor, &tenant, &self.id, &self.aggregators)
+            .load_aggregator(executor, tenant, &self.id, &self.aggregators)
             .await
             .map(|(state, _persisted)| state)
     }
@@ -930,7 +923,6 @@ pub struct ProjectionSubscription<E: Executor, P: Default + 'static> {
     projection: Projection<E, P>,
     key: String,
     routing_key: Option<RoutingKey>,
-    tenant: Option<TenantFilter>,
     chunk_size: u16,
     retry: Option<u8>,
     delay: Option<Duration>,
@@ -956,20 +948,6 @@ where
     /// executor-level default.
     pub fn any_routing_key(mut self) -> Self {
         self.routing_key = Some(RoutingKey::All);
-        self
-    }
-
-    /// Keeps the projection of `tenant` up to date instead of the
-    /// executor's; see [`SubscriptionBuilder::tenant`].
-    pub fn tenant(mut self, v: impl Into<String>) -> Self {
-        self.tenant = Some(TenantFilter::Only(v.into()));
-        self
-    }
-
-    /// Keeps the projection up to date in every tenant, each aggregate
-    /// loaded in its own; see [`SubscriptionBuilder::all_tenants`].
-    pub fn all_tenants(mut self) -> Self {
-        self.tenant = Some(TenantFilter::All);
         self
     }
 
@@ -1034,7 +1012,6 @@ where
             projection,
             key,
             routing_key,
-            tenant,
             chunk_size,
             retry,
             delay,
@@ -1078,11 +1055,6 @@ where
             Some(RoutingKey::All) => builder.any_routing_key(),
             Some(RoutingKey::Value(Some(v))) => builder.routing_key(v),
             Some(RoutingKey::Value(None)) | None => builder,
-        };
-        builder = match tenant {
-            Some(TenantFilter::All) => builder.all_tenants(),
-            Some(TenantFilter::Only(v)) => builder.tenant(v),
-            None => builder,
         };
         builder = builder.chunk_size(chunk_size);
         builder = match retry {
@@ -1159,8 +1131,8 @@ where
 
             // `load_aggregator` auto-keys every co-keyed secondary aggregate to
             // this event's id, so no extra aggregators need to be supplied here.
-            // The aggregate is loaded in the event's tenant: a subscription
-            // over every tenant reloads each aggregate in its own.
+            // The aggregate is loaded in the event's tenant: the subscription
+            // reads every tenant and reloads each aggregate in its own.
             let (_, persisted) = self
                 .projection
                 .load_aggregator(

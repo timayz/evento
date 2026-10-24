@@ -241,8 +241,7 @@ pub struct Event {
     /// aggregate_id)` names one stream, so the same aggregate id in two
     /// tenants names two independent streams. Stamped by
     /// [`WriteBuilder::commit`] from the builder's
-    /// [`tenant`](WriteBuilder::tenant), else the executor's
-    /// ([`Executor::tenant`]).
+    /// [`tenant`](WriteBuilder::tenant), else `""`.
     pub tenant: String,
     /// Serialized event data (bitcode format)
     pub data: Vec<u8>,

@@ -42,13 +42,13 @@ sees as its `connect` error. `serve_with(listener, resolver)` takes it; `serve` 
 the open single-store case.
 
 Which tenant a client belongs to is the host application's decision: its resolver
-maps the token (an API key, say) to one and serves the shared store scoped to it,
-`Session::new(Evento::new(store.clone()).tenant(tenant)?)`. That executor acts in
-the tenant whatever the client sends — what it reads and loads, the tenant its
-writes are stamped with — and refuses `replicate`, so a client never reaches
-another tenant's data. The client stays tenant-agnostic: a tenant application
-following the store through a `Sidecar` keeps its cursors and snapshots locally,
-as before. `serve_tls` / `serve_tls_with` and
+maps the token (an API key, say) to one and serves the connection in it,
+`Session::new(store.clone()).tenant(tenant)?`. Every request on the connection then
+acts in that tenant whatever it names — what it reads and loads, the tenant its
+writes are stamped with — and `replicate` and the subscriber calls are refused, so a
+client never reaches another tenant's data. The client stays tenant-agnostic: a
+tenant application following the store through a `Sidecar` keeps its subscriptions'
+cursors and its snapshots in its own store. `serve_tls` / `serve_tls_with` and
 `ClientBuilder::tls` wrap connections in rustls; plain TCP is for trusted networks,
 where a token travels in clear text.
 

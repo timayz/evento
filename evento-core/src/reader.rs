@@ -97,9 +97,8 @@ pub fn read_raw(aggregate_type: impl Into<String>, id: impl Into<String>) -> Rea
 ///
 /// # Tenants
 ///
-/// The stream read is the one in the executor's tenant
-/// ([`Executor::tenant`]; the default tenant, `""`, for an unscoped
-/// executor), or the one [`tenant`](Self::tenant) names.
+/// The stream read is the default tenant's (`""`), or the one
+/// [`tenant`](Self::tenant) names.
 pub struct ReadBuilder<A = ()> {
     filter: EventFilter,
     routing_key: Option<RoutingKey>,
@@ -156,9 +155,7 @@ impl<A> ReadBuilder<A> {
         self
     }
 
-    /// Reads the stream of `tenant` instead of the executor's.
-    ///
-    /// An executor scoped to another tenant reads its own tenant regardless.
+    /// Reads the stream of `tenant` instead of the default tenant's.
     pub fn tenant(mut self, v: impl Into<String>) -> Self {
         self.tenant = Some(v.into());
         self
@@ -220,13 +217,8 @@ impl<A> ReadBuilder<A> {
 
     /// The one tenant the stream is read in: never every tenant, since a
     /// stream belongs to one.
-    fn tenant_filter<E: Executor>(&self, executor: &E) -> TenantFilter {
-        TenantFilter::Only(
-            self.tenant
-                .clone()
-                .or_else(|| executor.tenant().map(str::to_owned))
-                .unwrap_or_default(),
-        )
+    fn tenant_filter(&self) -> TenantFilter {
+        TenantFilter::Only(self.tenant.clone().unwrap_or_default())
     }
 
     fn args_for(&self, page_size: u16, cursor: Option<Value>) -> Args {
@@ -254,7 +246,7 @@ impl<A> ReadBuilder<A> {
             .read(
                 Some(self.filters()),
                 self.routing_key.clone(),
-                self.tenant_filter(executor),
+                self.tenant_filter(),
                 args,
                 None,
             )
@@ -268,7 +260,7 @@ impl<A> ReadBuilder<A> {
     /// returned.
     pub async fn execute<E: Executor>(&self, executor: &E) -> anyhow::Result<Vec<Event>> {
         let filters = self.filters();
-        let tenant = self.tenant_filter(executor);
+        let tenant = self.tenant_filter();
         let mut cursor = if self.backward {
             self.before.clone()
         } else {
