@@ -11,9 +11,9 @@ This is the *ops* companion to [`DESIGN.md`](./DESIGN.md) (which covers the prot
 Worked, copy-pasteable deployments live in the examples:
 - `examples/bank-axum-accord` — a node over TCP (single-node or a 3-node localhost
   cluster), with `/metrics` and `/health` endpoints.
-- `examples/bank-axum-accord-tenants` — **many consensus groups per process**: one
-  SQLite file and one Accord group per tenant, tenants created at runtime through a
-  replicated catalog, over one multiplexed transport (§10).
+- `examples/bank-axum-accord-tenants` — **many consensus groups per process**: two
+  SQLite files (events, journal) and one Accord group per tenant, tenants created at
+  runtime through a replicated catalog, over one multiplexed transport (§10).
 - `examples/jepsen-node` — a node over real TCP with a durable `FjallJournal`.
 
 ---
@@ -319,10 +319,11 @@ refuses anything else before a vote, and a node never installs it.
   buffered meanwhile, and applies again what it had applied that the contact had
   not. The journal keeps the node's votes, recovery promises, config-Paxos
   promises and clock bound, so the rejoined node never votes against them. When
-  the store and journal share a database (one SQLite file per tenant through
-  `evento-sql`, or Fjall through `FjallJournal::from_database`), empty only the
-  event store — with `evento-sql`, its `event`, `snapshot` and `subscriber`
-  tables; the `accord_*` tables are the journal. Contacts are tried in order; one
+  the store and journal share a database (one SQLite file through `evento-sql`, or
+  Fjall through `FjallJournal::from_database`), empty only the event store — with
+  `evento-sql`, its `event`, `snapshot` and `subscriber` tables; the `accord_*`
+  tables are the journal. Kept in files of their own (§10), the store goes with
+  its file and the journal stays. Contacts are tried in order; one
   that is itself joining does not answer. Join only over an empty store (`join`
   refuses otherwise): a page that overlaps existing events is skipped whole as an
   idempotent re-apply, which would leave a gap. For the same reason a join that
@@ -372,7 +373,8 @@ refuses anything else before a vote, and a node never installs it.
     plainly, is a fresh replica (its first open leaves its clock bound in the journal,
     so the journal is never empty again while the store holds anything). A host that
     lost a group's journal *and* store must therefore know, from elsewhere, that it
-    hosted the group, and open it joining — or bring the node back under a new node id,
+    hosted the group, and open it joining (the tenants example keeps a ledger of the
+    groups each host opened, §10) — or bring the node back under a new node id,
     as before: remove the old id from the topology (`change_topology`) and add the new
     one, which joins with an empty store and journal. Under a `GroupHost` the node id
     is the host's (its `MuxTransport` id), shared by every group it hosts, so a new id
@@ -487,7 +489,8 @@ thousand-plus groups per process; none of them changes the protocol or the `Node
   `AccordExecutor`). An open of the same group waits for a close in progress. Never
   close a group from one of its own tasks. `open_joining(…, contacts)` opens a group
   whose store was lost, or that was told to rejoin, by bootstrapping it from a peer's
-  snapshot over its kept journal (§7).
+  snapshot over its kept journal — or, behind an amnesia fence, one whose journal was
+  lost (§7).
 
 ```rust
 let mux = Arc::new(MuxTransport::new(id, peer_addrs).with_unrouted_handler(reopen));
@@ -521,13 +524,48 @@ a contact that has it closed. The pages it is answered with are, so a page arriv
 late, after a failed join unregistered the group, does not reopen it.
 
 **SQLite footprint.** sqlx-sqlite runs one OS thread per *open* connection, so bound
-each tenant pool (`max_connections(2–3)`, `min_connections(0)`, an `idle_timeout`) and
-cap the number of tenants open per process (LRU; `host.close(group).await`, then
-`pool.close()`, on eviction — under the tenant's open lock, so a request for it waits
-and opens it afresh; a closed tenant catches up via anti-entropy when re-opened). The tenant
-file is also the consensus journal, so keep `synchronous(Full)` under WAL. Build
-**one** `Sql` per tenant and clone it into both `ExecutorDataStore` and
-`AccordExecutor` — two `.into()`s from one pool do not share the write-wake channel.
+each tenant pool (`max_connections(2–3)` for the events, 1–2 for the journal,
+`min_connections(0)`, an `idle_timeout`) and cap the number of tenants open per
+process (LRU; `host.close(group).await`, then close its pools, on eviction — under the
+tenant's open lock, so a request for it waits and opens it afresh; a closed tenant
+catches up via anti-entropy when re-opened). Keep `synchronous(Full)` under WAL on both
+files: a journaled vote must survive a power loss, and so must an event the journal
+records as applied. Build **one** `Sql` per tenant and clone it into both
+`ExecutorDataStore` and `AccordExecutor` — two `.into()`s from one pool do not share
+the write-wake channel.
+
+**Two files per tenant.** Keep a tenant's consensus journal in a file of its own
+beside its event file — the example's `tenants/{slug}.db` and
+`tenants/{slug}.journal.db` (`system.db` and `system.journal.db` for the catalog), the
+journal file migrated with `AccordMigration` alone. Losing one file then costs only
+that file:
+- a lost **event file** is rebuilt from a peer over the kept journal
+  (`open_joining`), as a group told to rejoin is;
+- a lost **journal file** — or one emptied in place, which a plain open refuses with
+  `LostJournal` — means deleting the event file and opening joining under the host's
+  own node id, behind the amnesia fence (§7).
+
+Over one shared file, every loss is a lost journal.
+
+**Remember which groups the host had.** With both files lost, nothing on disk says the
+host ever had the group, and a plain open would start it afresh, voting at once with
+every earlier vote forgotten. The example lists each group a host opens in a ledger,
+`host.db`, and opens a listed group with a missing file by joining:
+- A group is listed once its files exist and before its first open, while it has voted
+  nothing yet. Listed any earlier, a crash in between would leave a brand-new group
+  that every host waits to rejoin, with no host to vouch for it.
+- A rejoin is marked in the ledger before it deletes anything and cleared once the
+  join is done, so a crash midway resumes it rather than open plainly over the files
+  it left.
+- A lone node always opens plainly: no peer holds its votes.
+- A new ledger is seeded from the files on disk. A group lost together with `host.db`
+  is remembered by nothing: bring the host back under a new node id (§7).
+
+A data directory from before this layout, with each journal inside its event file, is
+moved on each group's first open. The journal is copied to a temporary file that is
+renamed into place, then cleared from the event file. A binary from before the split
+then refuses that file (`LostJournal`) instead of reading a stale journal. The
+example's `storage.rs` holds the routing, the ledger and the move.
 
 **Knobs and bounds.**
 
