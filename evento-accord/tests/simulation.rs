@@ -1588,11 +1588,11 @@ async fn assert_live(sim: &mut Sim, acked: &BTreeMap<String, u16>) -> Result<(),
     let config = sim.config;
     let n = sim.ids.len() as u32;
     // After a heal, the transactions left stalled are recovered within a few
-    // `collect_timeout` rounds, what each one's read waits on first (#326).
-    // A replica that missed many applied transactions takes longer: it
-    // catches up one anti-entropy page per round, up to ~18 rounds with the
-    // smallest pages. The bounds allow for that, and catch a cluster that
-    // never serves again.
+    // `collect_timeout` rounds, what each one's read waits on first (#326),
+    // and a replica that missed applied transactions catches up through
+    // anti-entropy, up to 16 pages a round (#348). Over 60,000 swarm seeds,
+    // the slowest serves again within 11 rounds. The bounds allow for more,
+    // and catch a cluster that never serves again.
     let serve = config.collect_timeout * SETTLE_ROUNDS
         + config.recovery_timeout * 4
         + config.anti_entropy_interval * n;
