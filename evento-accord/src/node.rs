@@ -617,6 +617,36 @@ enum Attempt {
     Route(Vec<Key>),
 }
 
+/// What drives a transaction through Commit → Read → Apply
+/// ([`Node::execute`]), which decides when it stops waiting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Driver {
+    /// Its coordinator: it reports the outcome once a quorum of every shard
+    /// acknowledged the apply.
+    Coordinator,
+    /// A recovery that reports an outcome, to the caller of
+    /// [`Node::recover`] or to a coordinator settling its own write: done
+    /// once this node applied the transaction, whoever collected the acks.
+    Recovery,
+    /// A recovery the sweep started: like [`Recovery`](Self::Recovery), but
+    /// it gives up a read this replica holds back on a stalled transaction
+    /// ([`ReadWaitsOn`]), for the sweep to take that one over first.
+    Sweep,
+}
+
+/// A sweep recovery's read, held back on this replica by a stalled
+/// transaction it depends on (see [`Node::recover_stalled`]).
+#[derive(Debug)]
+struct ReadWaitsOn(TxnId);
+
+impl std::fmt::Display for ReadWaitsOn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the read waits on the stalled {:?}", self.0)
+    }
+}
+
+impl std::error::Error for ReadWaitsOn {}
+
 /// One route shard's replies to a routed recovery, by kind.
 #[derive(Default)]
 struct ShardReports {
@@ -784,6 +814,15 @@ const READ_FAILURE_MAX: usize = 256;
 /// stalled execution hangs on, while a replica that fell behind, missing
 /// thousands, catches up through anti-entropy, run between them.
 const MISSING_DEPENDENCY_LOOKUPS: usize = 4;
+
+/// How many recoveries the sweep makes for one stalled transaction, its own
+/// and those of what its read turns out to wait on, at most (see
+/// [`Node::recover_stalled`]).
+const STALLED_CHAIN_ATTEMPTS: usize = 16;
+
+/// How far down a chain of stalled transactions, each waiting on the next,
+/// the sweep follows one before it gives up on it until its next pass.
+const STALLED_CHAIN_DEPTH: usize = 8;
 
 /// `err` as a [`Message::ReadFailed`] reason: its chain, cut to
 /// [`READ_FAILURE_MAX`] bytes on a character boundary.
@@ -1765,7 +1804,9 @@ impl Node {
     /// coordinator's heartbeats stop, ahead of the fixed timeout on a slow link),
     /// or when it has been stalled past `recovery_timeout` (the fixed fallback,
     /// which guarantees liveness even with no liveness history). Both paths are
-    /// idempotent and ballot-fenced, so concurrent recoveries are safe.
+    /// idempotent and ballot-fenced, so concurrent recoveries are safe. What a
+    /// recovered transaction's read waits on is recovered first
+    /// ([`recover_stalled`](Self::recover_stalled)).
     async fn recovery_sweep(&self) {
         // A node told to rejoin holds state its peers compacted past: it
         // recovers, repairs and gossips nothing until its host rejoins it.
@@ -1814,27 +1855,8 @@ impl Node {
             {
                 continue;
             }
-            let suspected = coordinator != self.id
-                && self.failure_detector.suspect(
-                    coordinator,
-                    self.settings.phi_threshold,
-                    self.settings.acceptable_pause,
-                );
-            let timed_out = txn.0 < timeout;
-            if suspected || timed_out {
-                self.metrics.record_recovery();
-                tracing::debug!(
-                    node = self.id.0,
-                    ?txn,
-                    suspected,
-                    timed_out,
-                    "recovering stalled transaction"
-                );
-                // A recovery can wait out `collect_timeout`; anti-entropy
-                // (paced on its own interval) must not wait for them all, or a
-                // replica that fell behind never gets back what it missed.
-                self.anti_entropy().await;
-                let _ = self.recover(txn).await;
+            if self.stalled(txn, timeout) {
+                self.recover_stalled(txn).await;
             }
         }
         // A dependency this replica never witnessed (#330): anti-entropy
@@ -1863,6 +1885,137 @@ impl Node {
         self.anti_entropy().await;
         self.advance_watermark().await;
         self.metadata_sweep().await;
+    }
+
+    /// Whether `txn`'s coordinator is presumed gone, so that this node takes
+    /// the transaction over: it began before `timeout`, `recovery_timeout`
+    /// ago, or its coordinator is a peer the failure detector suspects.
+    fn stalled(&self, txn: TxnId, timeout: Timestamp) -> bool {
+        let coordinator = txn.0.node;
+        txn.0 < timeout
+            || (coordinator != self.id
+                && self.failure_detector.suspect(
+                    coordinator,
+                    self.settings.phi_threshold,
+                    self.settings.acceptable_pause,
+                ))
+    }
+
+    /// Recovers `txn`, a transaction the sweep found stalled, and first what
+    /// its read turns out to wait on (#326).
+    ///
+    /// Once committed, a transaction is read on each replica only after
+    /// everything it depends on is applied there, or committed to execute
+    /// after it. A dependency can still be stalled itself: its coordinator
+    /// gone with it undecided, or read and never applied. And it is not
+    /// always recovered first: the sweep goes by `t0`, and a transaction
+    /// whose `t0` the slow path raised depends on others above its own.
+    /// Waiting for such a read, a recovery would only end at
+    /// `collect_timeout`, one transaction at a time, while what it waits on
+    /// stays stalled.
+    ///
+    /// So a sweep recovery gives up a read this replica holds back on a
+    /// stalled transaction ([`ReadWaitsOn`]), and that one is taken over
+    /// first: recovered if held here, its decision learned from its holders
+    /// if never witnessed here (see [`learn_decision`](Self::learn_decision)).
+    /// Then the recovery that waited is made again. Each transaction is
+    /// followed once per chain, so a cycle ends; a chain longer than
+    /// [`STALLED_CHAIN_DEPTH`], or recoveries past
+    /// [`STALLED_CHAIN_ATTEMPTS`], wait for the next pass.
+    async fn recover_stalled(&self, txn: TxnId) {
+        let mut chain = vec![txn];
+        let mut followed = HashSet::from([txn]);
+        for _ in 0..STALLED_CHAIN_ATTEMPTS {
+            let Some(&next) = chain.last() else {
+                break;
+            };
+            // A recovery can wait out `collect_timeout`; anti-entropy (paced
+            // on its own interval) must not wait for them all, or a replica
+            // that fell behind never gets back what it missed.
+            self.anti_entropy().await;
+            let waits_on = match self.command_status(next) {
+                // Applied meanwhile: by another recovery, or imported.
+                Some(Status::Applied) => None,
+                Some(_) => {
+                    self.metrics.record_recovery();
+                    tracing::debug!(node = self.id.0, txn = ?next, "recovering stalled transaction");
+                    match self.recover_driven(next, Driver::Sweep).await {
+                        Ok(_) => None,
+                        Err(err) => {
+                            tracing::debug!(node = self.id.0, txn = ?next, %err, "cannot recover a stalled transaction");
+                            err.downcast_ref::<ReadWaitsOn>().map(|waits| waits.0)
+                        }
+                    }
+                }
+                // A dependency never witnessed here.
+                None if next != txn
+                    && !self
+                        .replica
+                        .lock()
+                        .expect("replica poisoned")
+                        .compacted(next) =>
+                {
+                    if let Err(err) = self.learn_decision(next).await {
+                        tracing::debug!(node = self.id.0, dep = ?next, %err, "cannot learn a stalled dependency");
+                    }
+                    None
+                }
+                // Compacted meanwhile: applied here, and on its way out.
+                None => None,
+            };
+            match waits_on {
+                Some(dep) if chain.len() < STALLED_CHAIN_DEPTH && followed.insert(dep) => {
+                    chain.push(dep);
+                }
+                _ => {
+                    chain.pop();
+                }
+            }
+        }
+    }
+
+    /// The transaction this replica holds `txn`'s read back on, if it is
+    /// stalled ([`stalled`](Self::stalled)) and not in this node's hands.
+    fn stalled_dependency(&self, txn: TxnId) -> Option<TxnId> {
+        let dep = self
+            .replica
+            .lock()
+            .expect("replica poisoned")
+            .blocker(txn)?;
+        if self
+            .pending
+            .lock()
+            .expect("pending poisoned")
+            .contains_key(&dep)
+        {
+            return None;
+        }
+        let timeout = Timestamp {
+            micros: self
+                .clock
+                .now()
+                .micros
+                .saturating_sub(self.settings.recovery_timeout.as_micros() as u64),
+            logical: 0,
+            node: NodeId(0),
+        };
+        self.stalled(dep, timeout).then_some(dep)
+    }
+
+    /// Waits until this replica holds `txn`'s read back on a stalled
+    /// transaction, and returns it; `None` at `deadline`. Checked every
+    /// `fast_timeout`, the time a replica that can read takes to answer.
+    async fn stalled_dependency_by(&self, txn: TxnId, deadline: Instant) -> Option<TxnId> {
+        loop {
+            let next = Instant::now() + self.settings.fast_timeout;
+            if next >= deadline {
+                return None;
+            }
+            tokio::time::sleep_until(next).await;
+            if let Some(dep) = self.stalled_dependency(txn) {
+                return Some(dep);
+            }
+        }
     }
 
     /// Retries local execution the inbox loop left behind: an apply or a read
@@ -3783,6 +3936,7 @@ impl Node {
                 execute_at,
                 shard_deps,
                 &[],
+                Driver::Coordinator,
             )
             .await?;
         self.deregister(txn);
@@ -3984,6 +4138,14 @@ impl Node {
     /// An applied replica outside every plan therefore decides for its shard:
     /// it is sent the Commit, and its answer is waited for and counted like a
     /// read, but its shard needs no read quorum and is sent no Apply.
+    ///
+    /// A replica answers the reads and the apply to whoever committed the
+    /// transaction last: a coordinator a recovery took over from, or one of
+    /// two recoveries racing, may hear none of them. So the reads are waited
+    /// for only until this node applies the transaction — another driver
+    /// decided it then, final — and, for a recovery, the acks too. A sweep
+    /// recovery stops waiting as well once this replica holds the read back on
+    /// a stalled transaction (see [`Driver::Sweep`]).
     #[allow(clippy::too_many_arguments)]
     async fn execute(
         &self,
@@ -3994,6 +4156,7 @@ impl Node {
         execute_at: Timestamp,
         shard_deps: HashMap<ShardId, BTreeSet<TxnId>>,
         applied: &[NodeId],
+        driver: Driver,
     ) -> anyhow::Result<bool> {
         let union = Self::union_of(plans);
         // A shard skipped as compacted: its applied replicas heard from stand
@@ -4030,19 +4193,39 @@ impl Node {
             let mut here = applied.iter().filter(|n| p.replicas.contains(n)).peekable();
             here.peek().is_none() || here.any(|n| got.iter().any(|(from, _)| from == n))
         };
-        let reads = self
-            .collect_by_shard_tagged(
-                rx,
-                &read_plans,
-                |p, got| got.len() >= p.slow_q && heard_applied(p, got),
-                Self::after(self.settings.collect_timeout),
-                HashSet::new(),
-                |m| match m {
-                    Message::ReadOk { ok, .. } => Some(ok),
-                    _ => None,
-                },
-            )
-            .await;
+        let deadline = Self::after(self.settings.collect_timeout);
+        let collect = self.collect_by_shard_tagged(
+            rx,
+            &read_plans,
+            |p, got| got.len() >= p.slow_q && heard_applied(p, got),
+            deadline,
+            HashSet::new(),
+            |m| match m {
+                Message::ReadOk { ok, .. } => Some(ok),
+                _ => None,
+            },
+        );
+        let decided_here = self
+            .applied
+            .wait_until(deadline, || self.local_outcome(txn).is_some());
+        let held_back = async {
+            match driver {
+                Driver::Sweep => self.stalled_dependency_by(txn, deadline).await,
+                Driver::Coordinator | Driver::Recovery => None,
+            }
+        };
+        // Biased: a replay runs the branches in one order.
+        let reads = tokio::select! {
+            biased;
+            reads = collect => reads,
+            true = decided_here => {
+                let conflict = self.local_outcome(txn).expect("applied here");
+                // Again, for a replica the decision's Apply missed.
+                self.broadcast(&union, Message::Apply { txn, commit: !conflict }).await;
+                return Ok(conflict);
+            }
+            Some(dep) = held_back => return Err(ReadWaitsOn(dep).into()),
+        };
         for plan in &read_plans {
             let got = &reads[&plan.shard];
             if got.len() < plan.slow_q || !heard_applied(plan, got) {
@@ -4076,18 +4259,32 @@ impl Node {
 
         // Apply: enact the decision and wait for a slow quorum per shard.
         self.broadcast(&union, Message::Apply { txn, commit }).await;
-        let acks = self
-            .collect_by_shard(
-                rx,
-                plans,
-                |p| p.slow_q,
-                Self::after(self.settings.collect_timeout),
-                |m| match m {
-                    Message::Applied { .. } => Some(()),
-                    _ => None,
-                },
-            )
-            .await;
+        let deadline = Self::after(self.settings.collect_timeout);
+        let collect = self.collect_by_shard(
+            rx,
+            plans,
+            |p| p.slow_q,
+            deadline,
+            |m| match m {
+                Message::Applied { .. } => Some(()),
+                _ => None,
+            },
+        );
+        let applied_here = async {
+            match driver {
+                Driver::Recovery | Driver::Sweep => {
+                    self.applied
+                        .wait_until(deadline, || self.local_outcome(txn).is_some())
+                        .await
+                }
+                Driver::Coordinator => false,
+            }
+        };
+        let acks = tokio::select! {
+            biased;
+            acks = collect => acks,
+            true = applied_here => return Ok(!commit),
+        };
         for plan in plans {
             if acks[&plan.shard].len() < plan.slow_q {
                 anyhow::bail!("apply quorum not reached for shard {}", plan.shard);
@@ -4173,7 +4370,10 @@ impl Node {
         if let Some(conflict) = self.local_outcome(txn) {
             return Ok(CommitOutcome { txn, conflict });
         }
-        match self.recover_with(txn, keys.to_vec(), events.to_vec()).await {
+        match self
+            .recover_with(txn, keys.to_vec(), events.to_vec(), Driver::Recovery)
+            .await
+        {
             Ok(outcome) => {
                 tracing::debug!(node = self.id.0, ?txn, error = %failure, "write settled by recovery");
                 return Ok(outcome);
@@ -4210,6 +4410,11 @@ impl Node {
     /// Recovers `txn`: takes it over under a fresh ballot and drives it to an
     /// applied outcome consistent with whatever its failed coordinator decided.
     pub async fn recover(&self, txn: TxnId) -> anyhow::Result<CommitOutcome> {
+        self.recover_driven(txn, Driver::Recovery).await
+    }
+
+    /// [`recover`](Self::recover), driven by `driver`.
+    async fn recover_driven(&self, txn: TxnId, driver: Driver) -> anyhow::Result<CommitOutcome> {
         // What this node holds of the transaction (its owned part) is what it
         // can hand to replicas that never witnessed it.
         let (keys, events) = self
@@ -4219,7 +4424,7 @@ impl Node {
             .snapshot(txn)
             .map(|cmd| (cmd.keys, cmd.events))
             .unwrap_or_default();
-        self.recover_with(txn, keys, events).await
+        self.recover_with(txn, keys, events, driver).await
     }
 
     /// Learns the decision of `txn`, a transaction this replica never
@@ -4375,6 +4580,7 @@ impl Node {
         txn: TxnId,
         keys: Vec<Key>,
         events: Vec<Event>,
+        driver: Driver,
     ) -> anyhow::Result<CommitOutcome> {
         // A transaction this node is actively coordinating must not be
         // recovered by the same node: `register` would replace the live
@@ -4401,11 +4607,11 @@ impl Node {
             let mut rx = self.register(txn);
             let attempt = match &route {
                 Some(route) => {
-                    self.recover_routed(&mut rx, txn, ballot, route, &keys, &events)
+                    self.recover_routed(&mut rx, txn, ballot, route, &keys, &events, driver)
                         .await
                 }
                 None => {
-                    self.recover_unrouted(&mut rx, txn, ballot, &keys, &events)
+                    self.recover_unrouted(&mut rx, txn, ballot, &keys, &events, driver)
                         .await
                 }
             };
@@ -4433,6 +4639,7 @@ impl Node {
         ballot: Ballot,
         keys: &[Key],
         events: &[Event],
+        driver: Driver,
     ) -> anyhow::Result<Attempt> {
         let all_nodes = self.topology.nodes();
         // Every replica gets what this node holds: one that never
@@ -4583,7 +4790,7 @@ impl Node {
                 anyhow::bail!("recovery quorum not reached for shard {}", plan.shard);
             }
         }
-        self.drive_recovery(rx, txn, ballot, &plans, None, known)
+        self.drive_recovery(rx, txn, ballot, &plans, None, known, driver)
             .await
     }
 
@@ -4732,6 +4939,7 @@ impl Node {
     /// decides: invalidate — a shard never witnessed the transaction, so it
     /// never committed (abort it everywhere, [`Message::Invalidate`]) — or
     /// recover it as usual over the route's shards.
+    #[allow(clippy::too_many_arguments)]
     async fn recover_routed(
         &self,
         rx: &mut mpsc::UnboundedReceiver<(NodeId, Message)>,
@@ -4740,6 +4948,7 @@ impl Node {
         route: &[Key],
         keys: &[Key],
         events: &[Event],
+        driver: Driver,
     ) -> anyhow::Result<Attempt> {
         let (shards, targets) = self.plan(route, &[]);
         self.broadcast(
@@ -4810,7 +5019,7 @@ impl Node {
                     || Self::planned_shard(&plans, *from).is_some_and(|s| planned.contains(&s))
             })
             .collect();
-        self.drive_recovery(rx, txn, ballot, &plans, Some(route), known)
+        self.drive_recovery(rx, txn, ballot, &plans, Some(route), known, driver)
             .await
     }
 
@@ -5020,6 +5229,7 @@ impl Node {
     /// Decides a recovered transaction from the `known` reports — a slow
     /// quorum of every shard in `plans` — and drives it: re-propose under
     /// `ballot` (unless already committed), then Commit → Read → Apply.
+    #[allow(clippy::too_many_arguments)]
     async fn drive_recovery(
         &self,
         rx: &mut mpsc::UnboundedReceiver<(NodeId, Message)>,
@@ -5028,6 +5238,7 @@ impl Node {
         plans: &[ShardPlan],
         route: Option<&[Key]>,
         known: Vec<(NodeId, RecoverFields)>,
+        driver: Driver,
     ) -> anyhow::Result<Attempt> {
         // An invalidated report is decided by the routed path; the
         // timestamp it carries is no position to commit at.
@@ -5170,7 +5381,9 @@ impl Node {
         }
 
         let conflict = self
-            .execute(rx, plans, route, txn, execute_at, shard_deps, &applied)
+            .execute(
+                rx, plans, route, txn, execute_at, shard_deps, &applied, driver,
+            )
             .await?;
         Ok(Attempt::Done(CommitOutcome { txn, conflict }))
     }

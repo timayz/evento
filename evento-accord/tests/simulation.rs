@@ -1483,8 +1483,8 @@ fn acked_versions(history: &[WriteRecord]) -> BTreeMap<String, u16> {
 /// Event ids of [`assert_live`]'s writes, clear of every workload's.
 const LIVE_SEQ: u64 = 1_000_000;
 
-/// How many `collect_timeout` rounds a healed cluster may take to recover
-/// what it left stalled before it must serve again (see #326).
+/// How many `collect_timeout` rounds a healed cluster may take before it
+/// must serve again (see [`assert_live`]).
 const SETTLE_ROUNDS: u32 = 20;
 
 impl Sim {
@@ -1565,11 +1565,12 @@ async fn assert_live(sim: &mut Sim, acked: &BTreeMap<String, u16>) -> Result<(),
     sim.heal_all();
     let config = sim.config;
     let n = sim.ids.len() as u32;
-    // After a heal, the transactions left stalled are recovered one attempt
-    // per `collect_timeout` at worst, and concurrent recoverers can take
-    // several rounds to settle one: up to ~50 s of virtual time under
-    // message faults (#326). The bounds allow for that, and catch a cluster
-    // that never serves again.
+    // After a heal, the transactions left stalled are recovered within a few
+    // `collect_timeout` rounds, what each one's read waits on first (#326).
+    // A replica that missed many applied transactions takes longer: it
+    // catches up one anti-entropy page per round, up to ~18 rounds with the
+    // smallest pages. The bounds allow for that, and catch a cluster that
+    // never serves again.
     let serve = config.collect_timeout * SETTLE_ROUNDS
         + config.recovery_timeout * 4
         + config.anti_entropy_interval * n;
