@@ -478,6 +478,10 @@ impl Drop for PendingProof<'_> {
 /// compaction, and so its bound, below that first report however long the
 /// pages take; otherwise a write load during a long join would have the
 /// joiner told to rejoin again, every time.
+///
+/// What this node vouches for ignores its holds (`Node::vouch_locked`): a
+/// joiner that joins again, its last join's hold still in place, is vouched
+/// for afresh, and its new hold replaces the old one.
 struct JoinHold {
     vouched: Timestamp,
     /// The joiner's last header or page request. A joiner that stops asking
@@ -2325,17 +2329,33 @@ impl Node {
     /// by the compaction margin, clamped to its proven coverage, to the
     /// oldest transaction it is still coordinating (see
     /// [`advance_watermark`](Self::advance_watermark)) and to what it vouched
-    /// for a joiner it is still serving ([`JoinHold`]).
+    /// for a joiner it is still serving ([`JoinHold`]). Takes the hold lock
+    /// under the replica lock, never held while the replica lock is taken.
     fn report(&self, shard_peers: &[NodeId]) -> Timestamp {
         let replica = self.replica.lock().expect("replica poisoned");
-        self.report_locked(&replica, shard_peers)
+        let mine = self.vouch_locked(&replica, shard_peers);
+        // Never past what this node vouched for a joiner still pulling its
+        // snapshot (see `JoinHold`); a lapsed hold is dropped here.
+        let lapse = self.settings.collect_timeout * JOIN_HOLD_PAGE_INTERVALS;
+        let mut holds = self.join_holds.lock().expect("join holds poisoned");
+        holds.retain(|_, hold| hold.refreshed.elapsed() < lapse);
+        holds
+            .values()
+            .map(|hold| hold.vouched)
+            .fold(mine, Timestamp::min)
     }
 
-    /// [`report`](Self::report) over an already-locked replica, so a join
-    /// header can vouch for exactly the state it exports. Takes the coverage,
-    /// join-proof, coordinating and hold locks under the replica lock —
-    /// none of them is ever held while the replica lock is taken.
-    fn report_locked(&self, replica: &Replica, shard_peers: &[NodeId]) -> Timestamp {
+    /// What this node vouches it holds, over an already-locked replica, so
+    /// a join header vouches for exactly the state it exports: its
+    /// [`report`](Self::report) before the holds it keeps for joiners. A
+    /// hold keeps the peers from compacting past a joiner's first report;
+    /// it says nothing of what this node holds. Capped by the hold kept for
+    /// a joiner's last join, the vouch for its next could never rise above
+    /// the last one, and a joiner vouched for below a peer's bound would be
+    /// told to rejoin on every rejoin (#349). Takes the coverage,
+    /// join-proof and coordinating locks under the replica lock — none of
+    /// them is ever held while the replica lock is taken.
+    fn vouch_locked(&self, replica: &Replica, shard_peers: &[NodeId]) -> Timestamp {
         let local = replica.applied_through(self.margin_cutoff());
 
         let mine = match self.proven_coverage(shard_peers) {
@@ -2354,7 +2374,7 @@ impl Node {
         // Never past a transaction this node is still coordinating: if its
         // coordination fails, the node recovers it to learn the outcome, and
         // that needs every replica to still hold it.
-        let mine = match self
+        match self
             .coordinating
             .lock()
             .expect("coordinating poisoned")
@@ -2362,16 +2382,7 @@ impl Node {
         {
             Some(oldest) if oldest.0 < mine => oldest.0,
             _ => mine,
-        };
-        // Never past what this node vouched for a joiner still pulling its
-        // snapshot (see `JoinHold`); a lapsed hold is dropped here.
-        let lapse = self.settings.collect_timeout * JOIN_HOLD_PAGE_INTERVALS;
-        let mut holds = self.join_holds.lock().expect("join holds poisoned");
-        holds.retain(|_, hold| hold.refreshed.elapsed() < lapse);
-        holds
-            .values()
-            .map(|hold| hold.vouched)
-            .fold(mine, Timestamp::min)
+        }
     }
 
     /// Stops waiting for same-shard peers silent past
@@ -5792,6 +5803,7 @@ impl Node {
     /// A join header ([`export_bootstrap`](Self::export_bootstrap) without a
     /// digest; with every applied command if `inline`, with none otherwise)
     /// plus what this node vouches for the joiner: its own watermark report
+    /// before the holds it keeps for joiners ([`vouch_locked`](Self::vouch_locked))
     /// and the epoch it holds under ([`Message::JoinProof`]). Both are
     /// taken under one replica lock — and a sync round records its coverage
     /// only after importing its commands — so every applied command below
@@ -5816,7 +5828,7 @@ impl Node {
         } else {
             Vec::new()
         };
-        let vouched = self.report_locked(&replica, &shard_peers);
+        let vouched = self.vouch_locked(&replica, &shard_peers);
         let header = (
             replica.redundant_before(),
             replica.applied_through(cutoff),
