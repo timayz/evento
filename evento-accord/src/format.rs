@@ -75,10 +75,12 @@ pub const MAGIC: [u8; 2] = *b"Ac";
 /// `ShardMap` (replica sets and a slot table), and `Message::Watermark`
 /// carries the sender's copy report. 7: `Message::SyncData` carries the epoch
 /// the responder's live layout became live at. 8: so does
-/// `Message::Watermark`, for its sender. No reader for older versions:
-/// evento-accord has not been released, so a journal of one is wiped and the
-/// node re-bootstrapped.
-pub const FORMAT_VERSION: u8 = 8;
+/// `Message::Watermark`, for its sender. 9: `Message::Watermark` carries the
+/// sender's applied-through unclamped by its coverage (`applied`), and the
+/// journal keeps the vote fence (`RecordKind::VoteFence`). No reader for
+/// older versions: evento-accord has not been released, so a journal of one
+/// is wiped and the node re-bootstrapped.
+pub const FORMAT_VERSION: u8 = 9;
 
 /// Length of the fixed header: `MAGIC (2) + version (1) + kind (1)`.
 const HEADER_LEN: usize = 4;
@@ -127,6 +129,9 @@ pub enum RecordKind {
     /// (`Journal::save_fences`), as a `Vec` of
     /// [`FenceRecord`](crate::api::FenceRecord).
     Fences = 13,
+    /// The replica's vote fence (`Journal::save_vote_fence`), as a
+    /// [`Timestamp`](crate::clock::Timestamp).
+    VoteFence = 14,
 }
 
 impl RecordKind {
@@ -144,6 +149,7 @@ impl RecordKind {
             11 => Some(Self::Decision),
             12 => Some(Self::AmnesiaFence),
             13 => Some(Self::Fences),
+            14 => Some(Self::VoteFence),
             _ => None,
         }
     }
@@ -216,6 +222,8 @@ mod tests {
             RecordKind::ClockBound,
             RecordKind::Decision,
             RecordKind::AmnesiaFence,
+            RecordKind::Fences,
+            RecordKind::VoteFence,
         ] {
             let value = (42u64, "hello".to_string());
             let bytes = encode_tagged(kind, &value).unwrap();

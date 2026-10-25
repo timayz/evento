@@ -9,7 +9,9 @@
 //! command and truncated with the commands. A compacted multi-shard
 //! transaction's decision record lives under `decision/`, staged the same way
 //! but kept by `truncate` until the node drops it. The node's clock bound is the
-//! `meta` key `clock_bound`, persisted on its own and never truncated.
+//! `meta` key `clock_bound`, persisted on its own and never truncated. The
+//! replica's vote fence is the `meta` key `vote_fence`, staged like a command
+//! and never truncated.
 //!
 //! **Group commit.** [`stage`](Journal::stage) inserts a record without an fsync;
 //! [`flush`](Journal::flush) does a single `persist(SyncAll)` covering every staged
@@ -45,6 +47,9 @@ const AMNESIA_FENCE_KEY: &[u8] = b"amnesia_fence";
 /// Meta key under which the replica's transition fences are stored. Untouched
 /// by `truncate`.
 const FENCES_KEY: &[u8] = b"fences";
+/// Meta key under which the replica's vote fence is stored. Staged; untouched
+/// by `truncate`.
+const VOTE_FENCE_KEY: &[u8] = b"vote_fence";
 /// Prefix for metadata-log entry keys (`mlog/` + 8-byte big-endian epoch).
 const METADATA_PREFIX: &[u8] = b"mlog/";
 /// Prefix for acceptor-state keys (`acc/` + 8-byte big-endian epoch).
@@ -330,6 +335,20 @@ impl Journal for FjallJournal {
         let bytes = tokio::task::spawn_blocking(move || meta.get(CLOCK_BOUND_KEY)).await??;
         match bytes {
             Some(bytes) => Ok(Some(decode_tagged(RecordKind::ClockBound, &bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn save_vote_fence(&self, fence: Timestamp) -> anyhow::Result<()> {
+        let value = encode_tagged(RecordKind::VoteFence, &fence)?;
+        self.stage_meta(VOTE_FENCE_KEY.to_vec(), value).await
+    }
+
+    async fn load_vote_fence(&self) -> anyhow::Result<Option<Timestamp>> {
+        let meta = self.meta.clone();
+        let bytes = tokio::task::spawn_blocking(move || meta.get(VOTE_FENCE_KEY)).await??;
+        match bytes {
+            Some(bytes) => Ok(Some(decode_tagged(RecordKind::VoteFence, &bytes)?)),
             None => Ok(None),
         }
     }

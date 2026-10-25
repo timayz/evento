@@ -697,6 +697,28 @@ pub trait Journal: Send + Sync + 'static {
         Ok(None)
     }
 
+    /// Buffers this replica's **vote fence**, durable no later than the next
+    /// [`flush`](Journal::flush) (like [`stage`](Journal::stage)), replacing
+    /// the previous one: the replica votes for no transaction below it that
+    /// it does not hold, and it is at or above everything the replica
+    /// vouched for — watermark reports, sync coverage, join vouches, the
+    /// stable point its subscriptions read (#337). The node stages it, and
+    /// flushes, before any of those leaves it. Only ever raised; survives
+    /// [`truncate`](Journal::truncate). The default is a no-op: a restarted
+    /// node then fences everything below its clock bound less its compaction
+    /// margin, as the fence stood before it was journaled — safe, but a
+    /// transaction only a slow quorum held may then wait for good on the
+    /// node's vote.
+    async fn save_vote_fence(&self, fence: Timestamp) -> anyhow::Result<()> {
+        let _ = fence;
+        Ok(())
+    }
+
+    /// The persisted vote fence, if any. The default returns none.
+    async fn load_vote_fence(&self) -> anyhow::Result<Option<Timestamp>> {
+        Ok(None)
+    }
+
     /// Durably persists the [`AmnesiaFence`] of a replica that came back over
     /// an empty journal (#312), replacing any previous one. Durable by the
     /// time it returns, and **never** discarded by

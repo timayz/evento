@@ -415,3 +415,37 @@ where
     journal.truncate(timestamp(1_000, 0)).await.unwrap();
     assert_eq!(journal.load_fences().await.unwrap(), vec![first, second]);
 }
+
+/// The vote fence is staged like a command: invisible until a flush, then
+/// it round-trips, keeps the last value staged, and a truncate — between a
+/// stage and its flush too — never drops it (#337).
+pub async fn vote_fence<DB>(journal: &SqlJournal<DB>)
+where
+    DB: Database,
+    for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
+    sea_query_sqlx::SqlxValues: sqlx::IntoArguments<DB>,
+    Vec<u8>: for<'r> sqlx::Decode<'r, DB> + sqlx::Type<DB>,
+    i64: for<'r> sqlx::Decode<'r, DB> + sqlx::Type<DB>,
+    usize: sqlx::ColumnIndex<DB::Row>,
+{
+    assert_eq!(journal.load_vote_fence().await.unwrap(), None);
+    journal.save_vote_fence(timestamp(400, 0)).await.unwrap();
+    assert_eq!(
+        journal.load_vote_fence().await.unwrap(),
+        None,
+        "staged, not durable before a flush"
+    );
+    journal.flush().await.unwrap();
+    assert_eq!(
+        journal.load_vote_fence().await.unwrap(),
+        Some(timestamp(400, 0))
+    );
+    journal.save_vote_fence(timestamp(900, 1)).await.unwrap();
+    journal.truncate(timestamp(1_000, 0)).await.unwrap();
+    journal.flush().await.unwrap();
+    assert_eq!(
+        journal.load_vote_fence().await.unwrap(),
+        Some(timestamp(900, 1)),
+        "a truncate between a stage and its flush keeps the fence"
+    );
+}

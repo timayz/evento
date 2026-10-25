@@ -68,6 +68,11 @@ async fn fences() {
 }
 
 #[tokio::test]
+async fn vote_fence() {
+    sql_support::vote_fence(&fresh("accord_pg_vote_fence").await).await;
+}
+
+#[tokio::test]
 async fn survives_reconnect() {
     let name = "accord_pg_reconnect";
     let b = command(200, 2);

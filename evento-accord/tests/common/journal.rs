@@ -21,6 +21,7 @@ enum Staged {
     Promise(TxnId, Ballot),
     Decision(DecisionRecord),
     DropDecisions(Vec<TxnId>),
+    VoteFence(Timestamp),
 }
 
 impl Staged {
@@ -31,7 +32,7 @@ impl Staged {
         match self {
             Staged::Command(state) => state.txn.0 < before,
             Staged::Route(txn, _) | Staged::Promise(txn, _) => txn.0 < before,
-            Staged::Decision(_) | Staged::DropDecisions(_) => false,
+            Staged::Decision(_) | Staged::DropDecisions(_) | Staged::VoteFence(_) => false,
         }
     }
 }
@@ -58,7 +59,7 @@ pub struct JournalFaults {
 /// the SQL journal's `flush_lock`, a second flusher waits for one in
 /// progress (with an optional virtual fsync delay, so they do overlap).
 /// Everything `InMemoryJournal` persists is staged the same way: commands,
-/// routes, promises and decision records.
+/// routes, promises, decision records and the vote fence.
 pub struct FaultJournal {
     durable: InMemoryJournal,
     pending: Mutex<Vec<Staged>>,
@@ -178,6 +179,7 @@ impl FaultJournal {
             && d.load_promises().await.unwrap().is_empty()
             && d.load_decisions().await.unwrap().is_empty()
             && d.load_rejoin_bounds().await.unwrap().is_empty()
+            && d.load_vote_fence().await.unwrap().is_none()
     }
 
     /// Whether a seeded fault fails this write, `pick` choosing its rate.
@@ -200,6 +202,7 @@ impl FaultJournal {
             Staged::Promise(txn, ballot) => self.durable.save_promise(txn, ballot).await,
             Staged::Decision(record) => self.durable.save_decision(&record).await,
             Staged::DropDecisions(txns) => self.durable.drop_decisions(&txns).await,
+            Staged::VoteFence(fence) => self.durable.save_vote_fence(fence).await,
         }
     }
 }
@@ -330,6 +333,13 @@ impl Journal for FaultJournal {
     }
     async fn load_clock_bound(&self) -> anyhow::Result<Option<u64>> {
         self.durable.load_clock_bound().await
+    }
+    async fn save_vote_fence(&self, fence: Timestamp) -> anyhow::Result<()> {
+        self.stage_write(Staged::VoteFence(fence));
+        Ok(())
+    }
+    async fn load_vote_fence(&self) -> anyhow::Result<Option<Timestamp>> {
+        self.durable.load_vote_fence().await
     }
     async fn save_amnesia_fence(&self, fence: &AmnesiaFence) -> anyhow::Result<()> {
         if self.draw(|f| f.metadata) {

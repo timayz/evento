@@ -34,7 +34,9 @@ use crate::api::{
 };
 use crate::clock::{Ballot, Clock, HybridLogicalClock, NodeId, Timestamp, TxnId};
 use crate::failure_detector::FailureDetector;
-use crate::message::{CommandState, Key, Message, Status, SyncKnown, INVALIDATED_AT};
+use crate::message::{
+    CommandState, Key, Message, RecoveryRound, Status, SyncKnown, INVALIDATED_AT,
+};
 use crate::metrics::{Metrics, MetricsSnapshot};
 use crate::reconfig::{self, Fence, Floor, Transition};
 use crate::replica::{Refusal, Replica, RoutedRecovery};
@@ -68,6 +70,10 @@ pub struct NodeConfig {
     /// How far behind the present a node's reported redundancy point lags, so a
     /// not-yet-propagated commit is never skipped when state below the watermark is
     /// compacted away. Keep it above the clock-skew bound and propagation latency.
+    /// Also the original coordinator's deadline: past it, its PreAccept, or its
+    /// Accept at the transaction's own ballot, gets no vote from a replica that
+    /// never witnessed the transaction (see `Replica::late`), and a recovery
+    /// settles such a replica in two rounds (see [`RecoveryRound`]).
     pub compaction_margin: Duration,
     /// Least time between two journal truncations. The replica compacts in
     /// memory on every sweep, but a journal truncate is a write transaction
@@ -631,6 +637,7 @@ struct ShardPlan {
 }
 
 /// One replica's recovery report, extracted from a `RecoverOk`.
+#[derive(Clone)]
 struct RecoverFields {
     /// The epoch the replica holds the transaction under.
     epoch: u64,
@@ -655,9 +662,10 @@ impl RecoverFields {
     }
 }
 
-/// A response to a `Recover`: a report, a "never witnessed" (routed recovery
-/// only), a replica that lost its journal ([`Message::Amnesiac`]), or a
-/// ballot rejection.
+/// A response to a `Recover`: a report, a "never witnessed", a replica that
+/// lost its journal ([`Message::Amnesiac`]), one past the original
+/// coordinator's deadline that neither votes nor refuses yet
+/// ([`Message::Late`]), or a ballot rejection.
 enum RecoverResp {
     Ok(RecoverFields),
     NotWitnessed {
@@ -666,6 +674,10 @@ enum RecoverResp {
     /// The replica holds nothing of it, may have voted for it before it lost
     /// its journal, and never votes for it again.
     Amnesiac,
+    /// The replica never witnessed it, is past its original coordinator's
+    /// deadline, and neither voted for it nor refused it ([`Message::Late`]):
+    /// it may still do either.
+    Late,
     Nack(Ballot),
 }
 
@@ -881,17 +893,36 @@ struct PeerReports {
     /// The epoch the live layout the reports were made under became live at.
     live_since: u64,
     by_node: HashMap<NodeId, Timestamp>,
+    /// The applied-through each peer gossiped with its report
+    /// ([`Message::Watermark`]'s `applied`), under the same layout: what
+    /// the shard's applied floor is drawn from (see
+    /// [`Node::applied_floor`]).
+    applied: HashMap<NodeId, Timestamp>,
 }
 
 impl PeerReports {
     /// The reports made under the live layout that became live at
     /// `live_since`: any made under another are dropped first.
     fn under(&mut self, live_since: u64) -> &mut HashMap<NodeId, Timestamp> {
+        self.made_under(live_since);
+        &mut self.by_node
+    }
+
+    /// The applied-throughs gossiped under the live layout that became live
+    /// at `live_since`, as [`under`](Self::under).
+    fn applied_under(&mut self, live_since: u64) -> &mut HashMap<NodeId, Timestamp> {
+        self.made_under(live_since);
+        &mut self.applied
+    }
+
+    /// Drops everything gossiped under another live layout than the one
+    /// that became live at `live_since`.
+    fn made_under(&mut self, live_since: u64) {
         if self.live_since != live_since {
             self.live_since = live_since;
             self.by_node.clear();
+            self.applied.clear();
         }
-        &mut self.by_node
     }
 }
 
@@ -1103,6 +1134,13 @@ pub struct Node {
     /// it vouched, so no peer compacts past the joiner's first report while
     /// its pages cross the wire (see [`JoinHold`]).
     join_holds: Arc<Mutex<HashMap<NodeId, JoinHold>>>,
+    /// Serializes staging the vote fence ([`stage_vote_fence`](Node::stage_vote_fence)):
+    /// each stager stages the fence as it stands once it holds this, so the
+    /// journal never ends on an older fence than one staged before it.
+    vote_fence_lock: Arc<tokio::sync::Mutex<()>>,
+    /// The highest vote fence this node staged (see
+    /// [`Journal::save_vote_fence`]).
+    staged_fence: Arc<Mutex<Timestamp>>,
     /// Phi-accrual liveness estimator: every inbound message is a heartbeat, and a
     /// coordinator suspected dead has its stalled transactions recovered.
     failure_detector: Arc<FailureDetector>,
@@ -1197,6 +1235,8 @@ impl Node {
             join_proof: Arc::new(Mutex::new(None)),
             proof_pending: Arc::new(Mutex::new(HashMap::new())),
             join_holds: Arc::new(Mutex::new(HashMap::new())),
+            vote_fence_lock: Arc::new(tokio::sync::Mutex::new(())),
+            staged_fence: Arc::new(Mutex::new(Timestamp::MIN)),
             failure_detector: Arc::new(FailureDetector::new()),
             started_at: Instant::now(),
             absent: Arc::new(Mutex::new(HashMap::new())),
@@ -1363,20 +1403,47 @@ impl Node {
     /// stamped with: a transaction drawing `t0 = 1.5 ms` just above the bound
     /// still lands at `1.0 ms`, so an unfloored `1.5 ms` watermark would have
     /// let a subscription pass it.
+    ///
+    /// Nor does it pass the journaled vote fence (see [`Replica::fenced`]):
+    /// a subscription that read past a point relies on this node never
+    /// voting below it for a transaction it does not hold (#337). The sweep
+    /// raises the fence to the point it computes, so the stable point trails
+    /// it by a sweep at most. A cluster of this node alone is exempt: every
+    /// transaction is its own, and it holds each one it votes for.
     pub fn stable_micros(&self) -> u64 {
+        let shard_peers = self.shard_peers();
+        let alone = self.topology.nodes() == [self.id];
         let cutoff = self.margin_cutoff();
-        let local = self
-            .replica
-            .lock()
-            .expect("replica poisoned")
-            .stable_event_micros(cutoff);
-        let bound = match self.proven_coverage(&self.shard_peers()) {
+        let replica = self.replica.lock().expect("replica poisoned");
+        let bound = self.stable_locked(&replica, cutoff, &shard_peers);
+        // Read under the same lock as the store's bound: a fence raised past
+        // a transaction held unapplied here never lets the point pass it.
+        let fence = replica.durable_fence().micros;
+        drop(replica);
+        floor_millis(if alone { bound } else { bound.min(fence) })
+    }
+
+    /// The stable point over an already-locked replica, before the vote
+    /// fence caps it (see [`stable_micros`](Self::stable_micros)), unfloored.
+    /// Takes the coverage and join-proof locks under the replica lock.
+    fn stable_locked(&self, replica: &Replica, cutoff: Timestamp, shard_peers: &[NodeId]) -> u64 {
+        let local = replica.stable_event_micros(cutoff);
+        match self.proven_coverage(shard_peers) {
             Some(coverage) => {
                 local.min(coverage.micros.saturating_sub(self.clock.max_skew_micros()))
             }
             None => local,
-        };
-        floor_millis(bound)
+        }
+    }
+
+    /// This node's vote fence, as far as its journal holds it: no vote for a
+    /// transaction it does not hold below it, and no vouch past it (see
+    /// [`Replica::fenced`]). For tests and observability.
+    pub fn vote_fence(&self) -> Timestamp {
+        self.replica
+            .lock()
+            .expect("replica poisoned")
+            .durable_fence()
     }
 
     /// The present lagged by [`compaction_margin`](NodeConfig::compaction_margin):
@@ -1391,14 +1458,15 @@ impl Node {
         }
     }
 
-    /// The vote fence (see [`Replica::fenced`]): this node's clock less the
-    /// compaction margin. Every redundancy point it reports is cut at its
-    /// clock less the margin when reported ([`margin_cutoff`](Self::margin_cutoff)),
-    /// and a clock never goes back — across a restart neither, as nothing cut
-    /// at a reading leaves the node before a clock bound past it is persisted
-    /// ([`bound_clock_past`](Self::bound_clock_past)) — so the fence is above
-    /// all of them.
-    fn vote_fence(&self) -> Timestamp {
+    /// The original coordinator's deadline (see [`Replica::late`]): this
+    /// node's clock less the compaction margin. Its PreAccept, and its
+    /// Accept at `Ballot(t0)`, for a transaction this node does not hold, get
+    /// no vote past it — so a replica that voted for a transaction on its
+    /// coordinator's word did so within the margin, while its applied-through
+    /// still lay below the transaction, and its gossip says it holds it (see
+    /// [`applied_floor`](Self::applied_floor)). Read under the replica lock,
+    /// against the fence a report raises there.
+    fn coordinator_cutoff(&self) -> Timestamp {
         Timestamp {
             micros: self
                 .clock
@@ -1407,6 +1475,65 @@ impl Node {
             logical: 0,
             node: NodeId(0),
         }
+    }
+
+    /// The applied-through each peer last gossiped (see
+    /// [`Message::Watermark`]'s `applied`), under the live layout.
+    fn gossiped_applied(&self) -> HashMap<NodeId, Timestamp> {
+        let live_since = self.live_since();
+        self.peer_watermarks
+            .lock()
+            .expect("watermarks poisoned")
+            .applied_under(live_since)
+            .clone()
+    }
+
+    /// The shard's **applied floor**: the slow-quorum-th lowest
+    /// applied-through among the replicas of `shard_peers` — this node's
+    /// `own`, and what the others gossiped (`gossiped`), a replica not
+    /// heard from counting as nothing applied. While a slow quorum holds a
+    /// transaction unapplied — one that may have committed — the floor stays
+    /// below it, and this node hands no peer sync coverage past it: its vote
+    /// fence, which covers that coverage, stays below the transaction, and a
+    /// recovery that needs its vote still gets it (#337). Coverage itself
+    /// never clamps an applied-through, so the floor rises with the shard
+    /// from its very first gossip. In a healthy shard it trails the
+    /// applied-through of its slowest quorum by one gossip round, and so do
+    /// the reports and stable points built on the coverage it caps.
+    fn applied_floor(
+        &self,
+        own: Timestamp,
+        shard_peers: &[NodeId],
+        gossiped: &HashMap<NodeId, Timestamp>,
+    ) -> Timestamp {
+        if shard_peers.is_empty() {
+            return own;
+        }
+        let mut applied: Vec<Timestamp> = shard_peers
+            .iter()
+            .map(|peer| {
+                if *peer == self.id {
+                    own
+                } else {
+                    gossiped.get(peer).copied().unwrap_or(Timestamp::MIN)
+                }
+            })
+            .collect();
+        applied.sort_unstable();
+        applied[crate::api::slow_quorum_size(applied.len()) - 1]
+    }
+
+    /// The most sync coverage this node may hand a peer now, over an
+    /// already-locked replica: its applied-through, never past the shard's
+    /// [applied floor](Self::applied_floor). Before its vote fence covers it.
+    fn export_ceiling(
+        &self,
+        replica: &Replica,
+        shard_peers: &[NodeId],
+        gossiped: &HashMap<NodeId, Timestamp>,
+    ) -> Timestamp {
+        let own = replica.applied_through(self.margin_cutoff());
+        own.min(self.applied_floor(own, shard_peers, gossiped))
     }
 
     /// Whether `txn` is dated more than two clock skews past this node's
@@ -1637,6 +1764,7 @@ impl Node {
         let bounds = self.journal.load_rejoin_bounds().await?;
         let fence = self.journal.load_amnesia_fence().await?;
         let fences = self.journal.load_fences().await?;
+        let vote_fence = self.journal.load_vote_fence().await?;
         // Nothing durable at all: the node never voted, promised, reported
         // or minted anything under this journal — a new member's, or a
         // replacement for one that was lost.
@@ -1650,7 +1778,26 @@ impl Node {
             && metadata.is_empty()
             && bounds.is_empty()
             && fence.is_none()
-            && fences.is_empty();
+            && fences.is_empty()
+            && vote_fence.is_none();
+        // The vote fence comes back where the journal left it (#337). A
+        // journal that keeps none restarts it at the clock bound less the
+        // margin, where the fence stood before it was journaled: the bound is
+        // persisted past every reading a vouch was cut at.
+        let margin = self.settings.compaction_margin.as_micros() as u64;
+        let vote_fence = vote_fence.or_else(|| {
+            clock_bound.filter(|_| !pristine).map(|bound| Timestamp {
+                micros: bound.saturating_sub(margin),
+                logical: 0,
+                node: NodeId(0),
+            })
+        });
+        if let Some(vote_fence) = vote_fence {
+            let mut replica = self.replica.lock().expect("replica poisoned");
+            replica.raise_vote_fence(vote_fence);
+            replica.fence_durable(vote_fence);
+            *self.staged_fence.lock().expect("fence poisoned") = vote_fence;
+        }
         let fence = match fence {
             Some(fence) if !fence.joined && !joining => {
                 return Err(LostJournal { join_pending: true }.into());
@@ -2542,7 +2689,7 @@ impl Node {
         // The disjoint replica set this node belongs to.
         let mut all_nodes = self.topology.nodes();
         let shard_peers = self.shard_peers();
-        let mine = self.report(&shard_peers);
+        let (mine, applied) = self.report(&shard_peers);
         self.give_up_on_silent_peers(&shard_peers);
 
         // Watermarks go to EVERY peer, not just shard peers: compaction only
@@ -2584,6 +2731,7 @@ impl Node {
             &peers,
             Message::Watermark {
                 applied_through: mine,
+                applied,
                 fenced,
                 copied,
                 live_since,
@@ -2594,9 +2742,14 @@ impl Node {
         let watermark = {
             let mut absent = self.absent.lock().expect("absent poisoned");
             let mut reports = self.peer_watermarks.lock().expect("watermarks poisoned");
-            let watermarks = reports.under(live_since);
             // Evict reports from nodes no longer in the topology, or a removed
             // peer's last (stale) watermark would hold compaction back forever.
+            // A peer merely silent keeps its last applied-through: what it
+            // held unapplied then may still need a vote (see `applied_floor`).
+            reports
+                .applied_under(live_since)
+                .retain(|node, _| all_nodes.contains(node));
+            let watermarks = reports.under(live_since);
             watermarks.retain(|node, _| all_nodes.contains(node));
             absent.retain(|node, _| all_nodes.contains(node));
             watermarks.insert(self.id, mine);
@@ -2654,20 +2807,44 @@ impl Node {
     /// by the compaction margin, clamped to its proven coverage, to the
     /// oldest transaction it is still coordinating (see
     /// [`advance_watermark`](Self::advance_watermark)) and to what it vouched
-    /// for a joiner it is still serving ([`JoinHold`]). Takes the hold lock
-    /// under the replica lock, never held while the replica lock is taken.
-    fn report(&self, shard_peers: &[NodeId]) -> Timestamp {
-        let replica = self.replica.lock().expect("replica poisoned");
-        let mine = self.vouch_locked(&replica, shard_peers);
+    /// for a joiner it is still serving ([`JoinHold`]) — and its
+    /// applied-through unclamped, which its report gossips too (the shard's
+    /// [applied floor](Self::applied_floor) is drawn from those). Takes the
+    /// hold lock under the replica lock, never held while the replica lock
+    /// is taken.
+    ///
+    /// Raises the vote fence, in the same critical section, to the report
+    /// and to what this node may hand out until its next one: the stable
+    /// point its subscriptions read and the sync coverage it exports, which
+    /// are capped at the fence once it is journaled (#337). A vote decided
+    /// after this lock is released sees the raised fence, so none slips in
+    /// below the report. The caller makes the fence durable
+    /// ([`vouch_durably`](Self::vouch_durably)) before the report leaves.
+    fn report(&self, shard_peers: &[NodeId]) -> (Timestamp, Timestamp) {
+        let gossiped = self.gossiped_applied();
+        let cutoff = self.margin_cutoff();
+        let mut replica = self.replica.lock().expect("replica poisoned");
+        let applied = replica.applied_through(cutoff);
+        let vouched = self.vouch_locked(&replica, shard_peers);
         // Never past what this node vouched for a joiner still pulling its
         // snapshot (see `JoinHold`); a lapsed hold is dropped here.
         let lapse = self.settings.collect_timeout * JOIN_HOLD_PAGE_INTERVALS;
-        let mut holds = self.join_holds.lock().expect("join holds poisoned");
-        holds.retain(|_, hold| hold.refreshed.elapsed() < lapse);
-        holds
-            .values()
-            .map(|hold| hold.vouched)
-            .fold(mine, Timestamp::min)
+        let mine = {
+            let mut holds = self.join_holds.lock().expect("join holds poisoned");
+            holds.retain(|_, hold| hold.refreshed.elapsed() < lapse);
+            holds
+                .values()
+                .map(|hold| hold.vouched)
+                .fold(vouched, Timestamp::min)
+        };
+        let stable = Timestamp {
+            micros: self.stable_locked(&replica, cutoff, shard_peers),
+            logical: 0,
+            node: NodeId(0),
+        };
+        let exported = applied.min(self.applied_floor(applied, shard_peers, &gossiped));
+        replica.raise_vote_fence(vouched.max(stable).max(exported));
+        (mine, applied)
     }
 
     /// What this node vouches it holds, over an already-locked replica, so
@@ -2825,7 +3002,7 @@ impl Node {
         if self.rejoin_required() {
             return;
         }
-        let mine = self.report(&self.shard_peers());
+        let (mine, applied) = self.report(&self.shard_peers());
         if mine > above {
             tracing::debug!(
                 node = self.id.0,
@@ -2841,6 +3018,7 @@ impl Node {
                 from,
                 Message::Watermark {
                     applied_through: mine,
+                    applied,
                     fenced: self.reportable_fence(),
                     copied: self.copied_report(),
                     live_since: self.live_since(),
@@ -3044,7 +3222,6 @@ impl Node {
                     return out;
                 }
                 let events = self.owned_events(&layout, events);
-                let fence = self.vote_fence();
                 let vote = {
                     let mut replica = self.replica.lock().expect("replica poisoned");
                     if self
@@ -3053,7 +3230,10 @@ impl Node {
                     {
                         return out;
                     }
-                    replica.set_vote_fence(fence);
+                    // Read under the lock a report raises the vote fence
+                    // under: a vote decided here comes after it, or before
+                    // it was cut.
+                    replica.set_coordinator_cutoff(self.coordinator_cutoff());
                     replica.preaccept(txn, epoch, keys, events)
                 };
                 match vote {
@@ -3078,6 +3258,7 @@ impl Node {
                     }
                     Err(Refusal::Compacted) => {}
                     Err(Refusal::Fenced) => self.metrics.record_vote_fenced(),
+                    Err(Refusal::Late) => self.metrics.record_vote_late(),
                 }
             }
             Message::Accept {
@@ -3102,7 +3283,6 @@ impl Node {
                 if self.not_a_replica_of(txn, carried, &keys) {
                     return out;
                 }
-                let fence = self.vote_fence();
                 let reply = {
                     let mut replica = self.replica.lock().expect("replica poisoned");
                     if self
@@ -3111,7 +3291,10 @@ impl Node {
                     {
                         return out;
                     }
-                    replica.set_vote_fence(fence);
+                    // The original coordinator's own Accept is held to its
+                    // deadline; a recovery's, which decided to commit, to the
+                    // vote fence alone.
+                    replica.set_coordinator_cutoff(self.coordinator_cutoff());
                     replica.accept(txn, ballot, epoch, execute_at, deps, keys)
                 };
                 if reply == Err(Refusal::Compacted) {
@@ -3119,6 +3302,10 @@ impl Node {
                 }
                 if reply == Err(Refusal::Fenced) {
                     self.metrics.record_vote_fenced();
+                    return out;
+                }
+                if reply == Err(Refusal::Late) {
+                    self.metrics.record_vote_late();
                     return out;
                 }
                 let route_kept = reply.is_err() || self.keep_route(txn, route.as_deref()).await;
@@ -3130,7 +3317,7 @@ impl Node {
                     Err(Refusal::Promised(promised)) => {
                         out.push((from, Message::Nack { txn, promised }))
                     }
-                    Err(Refusal::Compacted | Refusal::Fenced) => {}
+                    Err(Refusal::Compacted | Refusal::Fenced | Refusal::Late) => {}
                 }
             }
             Message::Commit {
@@ -3260,6 +3447,7 @@ impl Node {
                 epoch,
                 keys,
                 events,
+                round,
             } => {
                 if self.future_dated(txn) {
                     return out;
@@ -3270,7 +3458,6 @@ impl Node {
                 let touched = route.clone().unwrap_or_else(|| keys.clone());
                 let keys = self.owned_keys(&layout, keys);
                 let events = self.owned_events(&layout, events);
-                let fence = self.vote_fence();
                 let reply = {
                     let mut replica = self.replica.lock().expect("replica poisoned");
                     // A layout change's fence: no pre-accept either, and the
@@ -3283,12 +3470,18 @@ impl Node {
                         Some(false) => return out,
                         Some(true) => replica.refuse_blind(txn, ballot),
                         None => {
-                            replica.set_vote_fence(fence);
+                            // Past the original coordinator's deadline, a
+                            // transaction this replica does not hold gets no
+                            // vote on a first round: the recovery, once it
+                            // heard every reply, asks for one or for a
+                            // refusal (#337, `settle_late`).
+                            replica.set_coordinator_cutoff(self.coordinator_cutoff());
                             match &route {
                                 // Routed: never pre-accept what this replica
                                 // never witnessed (see `Replica::recover_routed`).
                                 Some(_) => replica.recover_routed(txn, ballot, epoch, keys, events),
-                                None => replica.recover_unrouted(txn, ballot, epoch, keys, events),
+                                None => replica
+                                    .recover_unrouted(txn, ballot, epoch, keys, events, round),
                             }
                         }
                     }
@@ -3296,12 +3489,14 @@ impl Node {
                 // An unrouted recovery is told "never witnessed" only below the
                 // vote fence: an answer a recovery may count as this replica's
                 // refusal for good, so the fence it rests on must survive a
-                // restart (`bound_clock`).
+                // restart — journaled with this batch, before the answer leaves
+                // (`stage_vote_fence`), and under the clock bound a journal
+                // that keeps no fence restarts it from (`bound_clock`).
                 let fenced = route.is_none()
                     && matches!(reply, Ok(RoutedRecovery::NotWitnessed { redundant: false }));
                 if fenced {
                     self.metrics.record_vote_fenced();
-                    if !self.bound_clock().await {
+                    if !self.bound_clock().await || self.stage_vote_fence().await.is_none() {
                         return out;
                     }
                 }
@@ -3345,16 +3540,18 @@ impl Node {
                         ballot,
                         redundant,
                     },
+                    Ok(RoutedRecovery::Late) => Message::Late { txn, ballot },
                     Err(promised) => Message::Nack { txn, promised },
                 };
                 out.push((from, message));
             }
             Message::Invalidate { txn } => {
+                let epoch = self.topology.epoch();
                 let invalidated = self
                     .replica
                     .lock()
                     .expect("replica poisoned")
-                    .invalidate(txn);
+                    .invalidate(txn, epoch);
                 if invalidated {
                     tracing::debug!(node = self.id.0, ?txn, "invalidated a transaction");
                     self.applied.bump();
@@ -3609,6 +3806,7 @@ impl Node {
             }
             Message::Watermark {
                 applied_through,
+                applied,
                 fenced,
                 copied,
                 live_since,
@@ -3624,11 +3822,9 @@ impl Node {
                 // activation, for none.
                 let mine = self.live_since();
                 if live_since == mine {
-                    self.peer_watermarks
-                        .lock()
-                        .expect("watermarks poisoned")
-                        .under(mine)
-                        .insert(from, applied_through);
+                    let mut reports = self.peer_watermarks.lock().expect("watermarks poisoned");
+                    reports.under(mine).insert(from, applied_through);
+                    reports.applied_under(mine).insert(from, applied);
                 }
                 let mut reconfig = self.reconfig.lock().expect("reconfig poisoned");
                 if let Some(fenced) = fenced {
@@ -4915,8 +5111,19 @@ impl Node {
     /// learned. A transaction no peer reports committed is left to the
     /// replicas holding it, which recover it; one invalidated is applied
     /// there, so anti-entropy brings it in.
+    ///
+    /// One no replica heard from holds at all was held only by a replica
+    /// that lost its journal since (#337): nobody recovers it, and what waits
+    /// on it would wait for good. The dependency was scoped to this node's
+    /// shard, so its replicas answer for it there without its keys
+    /// ([`RecoveryRound::Dependency`]); if, with those past the deadline
+    /// refusing it ([`settle_late`](Self::settle_late)), they prove it never
+    /// committed ([`never_commits`](Self::never_commits)), every replica of
+    /// the shard records it aborted, held or not, and what waits on it goes
+    /// on.
     async fn learn_decision(&self, txn: TxnId) -> anyhow::Result<bool> {
         let ballot = Ballot(self.mint().await?);
+        let layout = self.topology.layout();
         let peers = self.shard_peers();
         let mut rx = self.register(txn);
         // With nothing to pre-accept, the epoch only has to be one the peers
@@ -4926,29 +5133,34 @@ impl Node {
             Message::BeginRecovery {
                 txn,
                 ballot,
-                epoch: self.topology.epoch(),
+                epoch: layout.epoch(),
                 keys: Vec::new(),
                 events: Vec::new(),
+                round: RecoveryRound::Dependency,
             },
         )
         .await;
-        let reports = Self::collect_tagged(
+        let mut reports = Self::collect_tagged(
             &mut rx,
             peers.len(),
             Self::after(self.settings.fast_timeout),
             |m| Self::recover_report(m, ballot),
         )
         .await;
-        self.deregister(txn);
-        let decided = reports.into_iter().find_map(|(_, report)| match report {
+        let decided = reports.iter().find_map(|(_, report)| match report {
             RecoverResp::Ok(f) if f.status >= Status::Committed && f.known && !f.invalidated() => {
-                Some(f)
+                Some(f.clone())
             }
             _ => None,
         });
         let Some(f) = decided else {
-            return Ok(false);
+            let orphaned = self
+                .invalidate_orphan(&mut rx, &layout, txn, ballot, &peers, &mut reports)
+                .await;
+            self.deregister(txn);
+            return Ok(orphaned);
         };
+        self.deregister(txn);
         self.metrics.record_dependency_learned();
         tracing::debug!(
             node = self.id.0,
@@ -4971,6 +5183,60 @@ impl Node {
         self.send(self.id, Self::routed(f.route.as_deref(), commit))
             .await;
         Ok(true)
+    }
+
+    /// The part of [`learn_decision`](Self::learn_decision) for a dependency
+    /// `txn` no shard peer heard from (`reports`) holds: invalidates it on
+    /// every one of them, `peers`, if they prove it never committed. Returns
+    /// whether it was.
+    async fn invalidate_orphan(
+        &self,
+        rx: &mut mpsc::UnboundedReceiver<(NodeId, Message)>,
+        layout: &Layout,
+        txn: TxnId,
+        ballot: Ballot,
+        peers: &[NodeId],
+        reports: &mut [(NodeId, RecoverResp)],
+    ) -> bool {
+        if reports
+            .iter()
+            .any(|(_, r)| matches!(r, RecoverResp::Ok(f) if f.known))
+        {
+            // A holder recovers it.
+            return false;
+        }
+        let Some(shard) = layout.node_shard(self.id) else {
+            return false;
+        };
+        let plan = ShardPlan {
+            epoch: layout.epoch(),
+            shard,
+            replicas: peers.to_vec(),
+            electorate: layout.electorate_of(shard).to_vec(),
+            fast_q: layout.fast_quorum_of(shard),
+            slow_q: layout.slow_quorum_of(shard),
+            keys: Vec::new(),
+            events: Vec::new(),
+        };
+        let plans = [plan];
+        // Even refused by those past the deadline, it may have committed:
+        // nothing to do without its keys.
+        if !self.never_commits(&plans, reports, true)
+            || self
+                .settle_late(rx, layout, txn, ballot, &plans, &[], &[], reports)
+                .await
+                .is_some()
+            || !self.never_commits(&plans, reports, false)
+        {
+            return false;
+        }
+        tracing::debug!(
+            node = self.id.0,
+            ?txn,
+            "invalidating a dependency no replica holds, which never committed"
+        );
+        self.broadcast(peers, Message::Invalidate { txn }).await;
+        true
     }
 
     /// The recovery reports a message carries, if it answers `ballot`.
@@ -5045,6 +5311,7 @@ impl Node {
                 ..
             } if b == ballot => Some(RecoverResp::NotWitnessed { redundant }),
             Message::Amnesiac { ballot: b, .. } if b == ballot => Some(RecoverResp::Amnesiac),
+            Message::Late { ballot: b, .. } if b == ballot => Some(RecoverResp::Late),
             Message::Nack { promised, .. } => Some(RecoverResp::Nack(promised)),
             _ => None,
         }
@@ -5151,6 +5418,7 @@ impl Node {
                 epoch: layout.epoch(),
                 keys: keys.to_vec(),
                 events: events.to_vec(),
+                round: RecoveryRound::Ask,
             },
         )
         .await;
@@ -5207,6 +5475,7 @@ impl Node {
                     epoch: layout.epoch(),
                     keys: all_keys.clone(),
                     events: all_events.clone(),
+                    round: RecoveryRound::Ask,
                 },
             )
             .await;
@@ -5228,7 +5497,26 @@ impl Node {
         }
 
         let (plans, union) = Self::plan(layout, &all_keys, &all_events);
-        if self.never_commits(&plans, &resp) {
+        // Replicas past the original coordinator's deadline that never
+        // witnessed it said so, and neither voted nor refused: ask them to
+        // refuse it for good if that proves it never committed, or to vote
+        // for it if it may have (#337).
+        if let Some(promised) = self
+            .settle_late(
+                rx,
+                layout,
+                txn,
+                ballot,
+                &plans,
+                &all_keys,
+                &all_events,
+                &mut resp,
+            )
+            .await
+        {
+            return Ok(Attempt::Retry(promised));
+        }
+        if self.never_commits(&plans, &resp, false) {
             tracing::debug!(
                 node = self.id.0,
                 ?txn,
@@ -5293,6 +5581,111 @@ impl Node {
             .await
     }
 
+    /// Asks the replicas that answered [`Late`](RecoverResp::Late) — past
+    /// the original coordinator's deadline, never witnessing `txn` — to
+    /// settle (#337), and puts their answers in `resp`. Were they to refuse
+    /// it for good, would the reports prove it never committed
+    /// ([`never_commits`](Self::never_commits))? Then they are asked to
+    /// refuse ([`RecoveryRound::Refuse`]), and the recovery invalidates it at
+    /// once, as it did when every replica past the deadline refused. If the
+    /// reports show it may have committed instead
+    /// ([`may_have_committed`](Self::may_have_committed)) — a replica that
+    /// accepted it lost its journal — their votes may be what deciding it
+    /// takes: they are asked to vote ([`RecoveryRound::Vote`]), which each
+    /// does unless it vouched past it. Either way they are asked with every
+    /// key and event the reports revealed. Otherwise what the replicas not
+    /// heard from hold decides it, and a next attempt hears them: the late
+    /// ones are asked nothing, so a write too few replicas hold is not
+    /// committed on their votes. The promise a Nack names, if one came back.
+    #[allow(clippy::too_many_arguments)]
+    async fn settle_late(
+        &self,
+        rx: &mut mpsc::UnboundedReceiver<(NodeId, Message)>,
+        layout: &Layout,
+        txn: TxnId,
+        ballot: Ballot,
+        plans: &[ShardPlan],
+        keys: &[Key],
+        events: &[Event],
+        resp: &mut [(NodeId, RecoverResp)],
+    ) -> Option<Ballot> {
+        let late: Vec<NodeId> = resp
+            .iter()
+            .filter(|(_, r)| matches!(r, RecoverResp::Late))
+            .map(|(from, _)| *from)
+            .collect();
+        if late.is_empty() {
+            return None;
+        }
+        let round = if self.never_commits(plans, resp, true) {
+            RecoveryRound::Refuse
+        } else if self.may_have_committed(plans, resp) {
+            RecoveryRound::Vote
+        } else {
+            return None;
+        };
+        tracing::debug!(
+            node = self.id.0,
+            ?txn,
+            ?round,
+            late = late.len(),
+            "settling replicas past the deadline"
+        );
+        self.broadcast(
+            &late,
+            Message::BeginRecovery {
+                txn,
+                ballot,
+                epoch: layout.epoch(),
+                keys: keys.to_vec(),
+                events: events.to_vec(),
+                round,
+            },
+        )
+        .await;
+        let again = Self::collect_tagged(
+            rx,
+            late.len(),
+            Self::after(self.settings.fast_timeout),
+            |m| Self::recover_report(m, ballot),
+        )
+        .await;
+        if let Some(promised) = Self::nack_in(&again) {
+            return Some(promised);
+        }
+        for (from, report) in again {
+            if let Some(slot) = resp.iter_mut().find(|(n, _)| *n == from) {
+                slot.1 = report;
+            }
+        }
+        None
+    }
+
+    /// Whether the reports show `txn` may have committed: in a shard, the
+    /// replicas that accepted it make a slow quorum, or the electors that
+    /// pre-accepted it a fast one — a replica that lost its journal counted
+    /// as one that did ([`RecoverResp::Amnesiac`]). One past the deadline
+    /// never witnessed it, and one not heard from is heard on a next
+    /// attempt: neither counts.
+    fn may_have_committed(&self, plans: &[ShardPlan], resp: &[(NodeId, RecoverResp)]) -> bool {
+        plans.iter().any(|plan| {
+            let (mut accepted, mut electors) = (0, 0);
+            for (from, report) in resp {
+                if !plan.replicas.contains(from) {
+                    continue;
+                }
+                let (accepts, holds) = match report {
+                    RecoverResp::Ok(f) if f.known => (f.status >= Status::Accepted, true),
+                    RecoverResp::Amnesiac => (true, true),
+                    _ => continue,
+                };
+                accepted += usize::from(accepts);
+                electors += usize::from(holds && plan.electorate.contains(from));
+            }
+            accepted >= plan.slow_q || electors >= plan.fast_q
+        })
+    }
+
     /// Whether an unrouted recovery's reports prove `txn` never committed and
     /// never will (#310), so it can be invalidated. A replica that answers
     /// "never witnessed" to an unrouted recovery does so only below its vote
@@ -5328,7 +5721,17 @@ impl Node {
     ///
     /// A report of the transaction committed anywhere rules all of them out:
     /// a decision exists.
-    fn never_commits(&self, plans: &[ShardPlan], resp: &[(NodeId, RecoverResp)]) -> bool {
+    ///
+    /// A replica that answered [`Late`](RecoverResp::Late) neither voted nor
+    /// refused yet: it counts as one that may vote, unless `late_refuse` —
+    /// what the reports would prove were it to refuse for good (see
+    /// [`settle_late`](Self::settle_late)).
+    fn never_commits(
+        &self,
+        plans: &[ShardPlan],
+        resp: &[(NodeId, RecoverResp)],
+        late_refuse: bool,
+    ) -> bool {
         if resp.iter().any(
             |(_, r)| matches!(r, RecoverResp::Ok(f) if f.known && f.status >= Status::Committed),
         ) {
@@ -5346,6 +5749,7 @@ impl Node {
                 let elector = plan.electorate.contains(from);
                 match report {
                     RecoverResp::NotWitnessed { redundant: false } => fenced += 1,
+                    RecoverResp::Late if late_refuse => fenced += 1,
                     RecoverResp::NotWitnessed { redundant: true } => redundant += 1,
                     RecoverResp::Ok(f) if f.known => {
                         holders += 1;
@@ -5466,6 +5870,7 @@ impl Node {
                     epoch: layout.epoch(),
                     keys: keys.to_vec(),
                     events: events.to_vec(),
+                    round: RecoveryRound::Ask,
                 },
             ),
         )
@@ -6070,7 +6475,7 @@ impl Node {
         // its hold kept every peer's compaction below meanwhile — however
         // many peers' coverage a report of this shard needs.
         let live_since = self.live_since();
-        let mine = self.report(&self.shard_peers());
+        let (mine, applied) = self.report(&self.shard_peers());
         let peers: Vec<NodeId> = self
             .topology
             .nodes()
@@ -6082,6 +6487,7 @@ impl Node {
                 &peers,
                 Message::Watermark {
                     applied_through: mine,
+                    applied,
                     fenced: self.reportable_fence(),
                     copied: self.copied_report(),
                     live_since,
@@ -6151,14 +6557,15 @@ impl Node {
     /// anything below it that committed is in its store. It answers such a
     /// recovery "never witnessed": one that can still commit is held here.
     fn floor_votes_at(&self, fence: AmnesiaFence) {
-        self.replica
-            .lock()
-            .expect("replica poisoned")
-            .set_vote_fence(Timestamp {
-                micros: fence.fence_micros,
-                logical: 0,
-                node: NodeId(0),
-            });
+        let fence = Timestamp {
+            micros: fence.fence_micros,
+            logical: 0,
+            node: NodeId(0),
+        };
+        let mut replica = self.replica.lock().expect("replica poisoned");
+        replica.raise_vote_fence(fence);
+        // Journaled with the amnesia fence itself.
+        replica.fence_durable(fence);
     }
 
     /// Asks `contact`, which this node stopped waiting for and compacted past
@@ -6364,8 +6771,13 @@ impl Node {
     /// ([`anti_entropy`](Self::anti_entropy)) — asks for the rest. The
     /// coverage then stops below the oldest `t0` left out: the requester
     /// records it as proof it holds everything this node applied below it.
+    ///
+    /// The coverage is a vouch: it never passes the shard's
+    /// [applied floor](Self::applied_floor), nor the journaled vote fence
+    /// that covers it (#337).
     fn export_missing(&self, known: &SyncKnown) -> (Timestamp, Timestamp, Vec<CommandState>) {
-        let cutoff = self.margin_cutoff();
+        let shard_peers = self.shard_peers();
+        let gossiped = self.gossiped_applied();
         let have: HashSet<TxnId> = known.txns.iter().copied().collect();
         let replica = self.replica.lock().expect("replica poisoned");
         let (commands, omitted) = replica.export_applied_missing(
@@ -6378,11 +6790,12 @@ impl Node {
         // is applied — and, with `commands`, on its way to the requester,
         // which records it as sync coverage — except what the budget left
         // out, all at or above `omitted`.
-        let coverage = replica.applied_through(cutoff);
+        let coverage = self.export_ceiling(&replica, &shard_peers, &gossiped);
         let coverage = omitted.map_or(coverage, |oldest| coverage.min(oldest));
+        let coverage = coverage.min(replica.durable_fence());
         let floor = replica.redundant_before();
         drop(replica);
-        let coverage = self.exportable_coverage(coverage, &self.shard_peers());
+        let coverage = self.exportable_coverage(coverage, &shard_peers);
         (floor, coverage, commands)
     }
 
@@ -6401,14 +6814,20 @@ impl Node {
     /// between is no longer walked, but it is then below the page's floor,
     /// which the joiner adopts, and its events are in the snapshot pages it
     /// pulls after the last command page — so the vouch still holds. An
-    /// epoch change meanwhile voids the vouch (`MIN`).
+    /// epoch change meanwhile voids the vouch (`MIN`). Like every vouch,
+    /// neither the coverage nor the vouch passes the journaled vote fence
+    /// (#337), nor the coverage the shard's [applied floor](Self::applied_floor).
     fn export_join_header(&self) -> (Timestamp, Timestamp, u64, Timestamp) {
         let epoch = self.live_since();
         let shard_peers = self.shard_peers();
-        let cutoff = self.margin_cutoff();
+        let gossiped = self.gossiped_applied();
         let replica = self.replica.lock().expect("replica poisoned");
-        let vouched = self.vouch_locked(&replica, &shard_peers);
-        let (watermark, applied) = (replica.redundant_before(), replica.applied_through(cutoff));
+        let fence = replica.durable_fence();
+        let vouched = self.vouch_locked(&replica, &shard_peers).min(fence);
+        let watermark = replica.redundant_before();
+        let applied = self
+            .export_ceiling(&replica, &shard_peers, &gossiped)
+            .min(fence);
         drop(replica);
         let coverage = self.exportable_coverage(applied, &shard_peers);
         let vouched = if self.live_since() == epoch {
@@ -6657,6 +7076,7 @@ impl Node {
                         contact,
                         Message::Watermark {
                             applied_through: Timestamp::MIN,
+                            applied: Timestamp::MIN,
                             fenced: None,
                             copied: None,
                             live_since: self.live_since(),
@@ -7714,7 +8134,7 @@ impl Node {
                     if planned < epoch
                         && txn.0 > drained.point
                         && keys.iter().any(|key| transition.moves(key))
-                        && replica.invalidate(txn)
+                        && replica.invalidate(txn, planned)
                     {
                         installed.invalidated.push(txn);
                     }
@@ -8350,24 +8770,57 @@ impl Node {
 
     /// Readies a report this node sends on its own — not with a handled
     /// batch, whose journal is flushed before its sends — for a peer to
-    /// compact on: [`bound_clock`](Self::bound_clock), and the journal
-    /// flushed, so everything the report counts as applied (an anti-entropy
-    /// import, or a commit applied since the last batch) is held across a
-    /// restart (#331). A peer that compacted past it would otherwise ship it
-    /// no more, and this node, restarted without it, could wait on it for
-    /// good.
+    /// compact on: [`bound_clock`](Self::bound_clock), the vote fence its
+    /// [`report`](Self::report) raised staged
+    /// ([`stage_vote_fence`](Self::stage_vote_fence)), and the journal
+    /// flushed, so the fence and everything the report counts as applied (an
+    /// anti-entropy import, or a commit applied since the last batch) are
+    /// held across a restart (#331, #337). A peer that compacted past it
+    /// would otherwise ship it no more, and this node, restarted without it,
+    /// could wait on it for good — or vote below it.
     async fn vouch_durably(&self) -> bool {
         if !self.bound_clock().await {
             return false;
         }
+        let Some(fence) = self.stage_vote_fence().await else {
+            return false;
+        };
         match self.journal.flush().await {
             Ok(()) => {
                 self.metrics.record_flush();
+                self.replica
+                    .lock()
+                    .expect("replica poisoned")
+                    .fence_durable(fence);
                 true
             }
             Err(err) => {
                 tracing::warn!(node = self.id.0, %err, "journal flush failed; withholding a report");
                 false
+            }
+        }
+    }
+
+    /// Stages this node's vote fence as it stands for the next journal
+    /// flush, unless it was staged already, and returns it: once that flush
+    /// succeeds, the fence is durable up to it. Serialized, staging the
+    /// fence read once the turn comes, so a stager that read an older fence
+    /// can never be the last one staged. `None` when the journal refused it:
+    /// nothing resting on the fence may leave the node then.
+    async fn stage_vote_fence(&self) -> Option<Timestamp> {
+        let _staging = self.vote_fence_lock.lock().await;
+        let fence = self.replica.lock().expect("replica poisoned").vote_fence();
+        if fence <= *self.staged_fence.lock().expect("fence poisoned") {
+            return Some(fence);
+        }
+        match self.journal.save_vote_fence(fence).await {
+            Ok(()) => {
+                *self.staged_fence.lock().expect("fence poisoned") = fence;
+                Some(fence)
+            }
+            Err(err) => {
+                tracing::warn!(node = self.id.0, %err, "cannot stage the vote fence");
+                None
             }
         }
     }
@@ -9568,6 +10021,7 @@ mod tests {
                 logical: 0,
                 node: NodeId(micros),
             },
+            applied: Timestamp::MIN,
             fenced: None,
             copied: None,
             live_since: 0,

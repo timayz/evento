@@ -8,7 +8,7 @@ use std::time::Duration;
 use evento_accord::{
     Ballot, Clock, DataStore, Envelope, HybridLogicalClock, InMemoryDataStore, InMemoryJournal,
     InMemoryNetwork, InMemorySink, Journal, Key, Message, MessageSink, Node, NodeConfig, NodeId,
-    ShardedTopology, StaticTopology, Status, Timestamp, Topology, TxnId,
+    RecoveryRound, ShardedTopology, StaticTopology, Status, Timestamp, Topology, TxnId,
 };
 use evento_core::Event;
 use tokio::sync::mpsc;
@@ -916,10 +916,10 @@ async fn recovery_aborts_a_transaction_a_shard_never_witnessed() {
         assert!(!c.committed(id, txn), "node {id} must not apply its events");
     }
     for id in 3..6 {
-        assert_eq!(
-            c.nodes[id].command_status(txn),
-            None,
-            "shard B never holds the transaction"
+        let status = c.nodes[id].command_status(txn);
+        assert!(
+            matches!(status, None | Some(Status::Applied)),
+            "shard B holds the transaction invalidated, if at all: {status:?}"
         );
     }
 }
@@ -1024,14 +1024,16 @@ async fn a_restarted_replica_keeps_its_recovery_promise() {
     assert!(promised, "node 3 journals its recovery promise");
     c.restart(3).await;
 
-    // The late PreAccept reaches every shard-B replica, the restarted one too.
+    // The late PreAccept reaches every shard-B replica, the restarted one
+    // too: none records it, whether it recorded the recovery's invalidation
+    // or only its promise.
     let _ = slow.await;
     tokio::time::sleep(Duration::from_millis(700)).await;
     for id in 3..6 {
-        assert_eq!(
-            c.nodes[id].command_status(txn),
-            None,
-            "node {id} must refuse the original coordinator's late PreAccept"
+        let status = c.nodes[id].command_status(txn);
+        assert!(
+            matches!(status, None | Some(Status::Applied)),
+            "node {id} must refuse the original coordinator's late PreAccept: {status:?}"
         );
     }
 }
@@ -1309,66 +1311,563 @@ async fn a_replica_reads_its_own_forgotten_write_as_holding() {
     }
 }
 
-/// The vote fence survives a restart — even one whose wall clock stepped
-/// back. A node vouches for a sync coverage cut at its clock less the
-/// compaction margin; a peer may compact past a transaction below it the node
-/// does not hold, trusting the node never to vote for it (#310). So before
-/// that coverage leaves the node, the node persists a clock bound past the
-/// reading it was cut at: restarted, its clock starts there, and its fence
-/// still refuses the transaction.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_vote_fence_outlives_a_restart_with_a_clock_stepped_back() {
-    use std::sync::atomic::{AtomicU64, Ordering};
+/// Node 0 of the shard `{0, 1, 2}`, its inbox loop and sweep running, with
+/// nodes 1 and 2 played by the test: each tells node 0 the applied-through
+/// it chooses, as its gossip would, and receives whatever node 0 sends it
+/// (#337).
+struct Vouching {
+    net: Arc<InMemoryNetwork>,
+    node: Node,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// Node 0's messages to node 1 (replies to what node 1 sends included).
+    peer: mpsc::Receiver<Envelope>,
+    /// Node 0's messages to node 2.
+    other: mpsc::Receiver<Envelope>,
+    /// An outside coordinator (node 9).
+    coordinator: mpsc::Receiver<Envelope>,
+}
 
-    let net = InMemoryNetwork::new();
-    let journal = Arc::new(InMemoryJournal::new());
-    let physical = Arc::new(AtomicU64::new(10_000_000));
-    let mut peer = net.register(NodeId(1));
-    let node = |net: &Arc<InMemoryNetwork>| {
-        let physical = Arc::clone(&physical);
-        let ids = vec![NodeId(0), NodeId(1), NodeId(2)];
-        Node::new(
+/// A short margin and a fast sweep, so a fence moves within the test.
+fn vouching_config() -> NodeConfig {
+    NodeConfig {
+        fast_timeout: Duration::from_millis(20),
+        recovery_interval: Duration::from_millis(20),
+        anti_entropy_interval: Duration::from_millis(25),
+        recovery_timeout: Duration::from_secs(60),
+        compaction_margin: Duration::from_millis(200),
+        ..NodeConfig::default()
+    }
+}
+
+impl Vouching {
+    /// Opens node 0 over `journal` (`recover_state`) and starts it.
+    async fn start(journal: Arc<dyn Journal>, clock: Arc<HybridLogicalClock>) -> Self {
+        let net = InMemoryNetwork::new();
+        let peer = net.register(NodeId(1));
+        let other = net.register(NodeId(2));
+        let coordinator = net.register(NodeId(9));
+        let inbox = net.register(NodeId(0));
+        let node = Node::new(
             NodeId(0),
-            Arc::new(StaticTopology::new(NodeId(0), ids)),
-            Arc::new(HybridLogicalClock::with_physical(NodeId(0), move || {
-                physical.load(Ordering::SeqCst)
-            })),
+            Arc::new(StaticTopology::new(
+                NodeId(0),
+                vec![NodeId(0), NodeId(1), NodeId(2)],
+            )),
+            clock,
             Arc::new(net.sink(NodeId(0))) as Arc<dyn MessageSink>,
             Arc::new(InMemoryDataStore::new()) as Arc<dyn DataStore>,
-            Arc::clone(&journal) as Arc<dyn Journal>,
+            journal,
         )
-    };
+        .with_config(vouching_config());
+        node.recover_state().await.expect("open node 0");
+        let tasks = vec![node.start(inbox), node.start_recovery()];
+        Self {
+            net,
+            node,
+            tasks,
+            peer,
+            other,
+            coordinator,
+        }
+    }
 
-    // The node answers an anti-entropy round: it vouches for a coverage cut
-    // at its clock (10 s) less the compaction margin (1 s).
-    let first = node(&net);
-    let task = first.start(net.register(NodeId(0)));
-    net.sink(NodeId(1))
-        .send(
-            NodeId(0),
+    async fn send(&self, from: u64, message: Message) {
+        self.net
+            .sink(NodeId(from))
+            .send(NodeId(0), message)
+            .await
+            .unwrap();
+    }
+
+    /// Nodes 1 and 2 gossip that everything below `applied` is applied
+    /// there, and nothing more.
+    async fn gossip(&self, applied: Timestamp) {
+        for from in [1, 2] {
+            self.send(
+                from,
+                Message::Watermark {
+                    applied_through: applied,
+                    applied,
+                    fenced: None,
+                    copied: None,
+                    live_since: 0,
+                },
+            )
+            .await;
+        }
+    }
+
+    /// The sync coverage node 0 hands node 1 in an anti-entropy round.
+    async fn coverage(&mut self, id: u64) -> Timestamp {
+        self.send(
+            1,
             Message::SyncRequest {
-                id: 1,
+                id,
                 known: evento_accord::message::SyncKnown {
-                    since: evento_accord::Timestamp::MIN,
+                    since: Timestamp::MIN,
                     txns: Vec::new(),
                 },
             },
         )
+        .await;
+        loop {
+            if let Message::SyncData {
+                id: reply,
+                coverage,
+                ..
+            } = next(&mut self.peer).await
+            {
+                if reply == id {
+                    return coverage;
+                }
+            }
+        }
+    }
+
+    /// Keeps nodes 1 and 2 gossiping `applied` for `long`.
+    async fn gossip_for(&self, applied: Timestamp, long: Duration) {
+        let deadline = tokio::time::Instant::now() + long;
+        while tokio::time::Instant::now() < deadline {
+            self.gossip(applied).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+}
+
+impl Drop for Vouching {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
+/// A transaction coordinated by node 9 at the present, of one event on
+/// `acc`.
+fn outside_txn() -> TxnId {
+    TxnId(Timestamp {
+        micros: HybridLogicalClock::new(NodeId(9)).now().micros,
+        logical: 0,
+        node: NodeId(9),
+    })
+}
+
+/// A recovery's ballot for `txn`, above its own, owned by node 1.
+fn recovery_ballot(txn: TxnId) -> Ballot {
+    Ballot(Timestamp {
+        micros: txn.0.micros + 1_000,
+        logical: 0,
+        node: NodeId(1),
+    })
+}
+
+/// Nodes 1 and 2 hold T unapplied — their applied-through stays at its `t0`
+/// — while node 0 never saw it. Node 0 hands out no sync coverage past T,
+/// however long ago the margin passed: once its vote fence covered that
+/// coverage, it could never vote for T, and a recovery of T after one of the
+/// two lost its journal would wait for good on node 0's vote (#337). Once
+/// they applied T, the coverage moves on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replica_vouches_no_coverage_past_a_write_a_slow_quorum_holds() {
+    let mut f = Vouching::start(
+        Arc::new(InMemoryJournal::new()),
+        Arc::new(HybridLogicalClock::new(NodeId(0))),
+    )
+    .await;
+    let txn = outside_txn();
+    f.gossip_for(txn.0, Duration::from_millis(600)).await;
+    let coverage = f.coverage(1).await;
+    assert!(
+        coverage <= txn.0,
+        "node 0 vouched for {coverage:?}, past {txn:?}, which a slow quorum holds unapplied"
+    );
+    assert!(f.node.vote_fence() <= txn.0, "its vote fence stays below T");
+
+    let applied = Timestamp {
+        micros: HybridLogicalClock::new(NodeId(1)).now().micros,
+        logical: 0,
+        node: NodeId(0),
+    };
+    f.gossip_for(applied, Duration::from_millis(300)).await;
+    let coverage = f.coverage(2).await;
+    assert!(
+        coverage > txn.0,
+        "once T is applied the coverage moves past it: {coverage:?}"
+    );
+}
+
+/// T's coordinator, slower than the compaction margin, gets no vote from
+/// node 0, which never saw T: no coordinator's message outlives the margin.
+/// A recovery's first round gets no vote either — node 0 says it is late,
+/// and neither votes nor refuses — but nodes 1 and 2 hold T unapplied, so
+/// node 0 never vouched past it, and a recovery that asks it to vote gets
+/// that vote (#337).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_coordinator_gets_no_vote_where_a_recovery_does() {
+    let mut f = Vouching::start(
+        Arc::new(InMemoryJournal::new()),
+        Arc::new(HybridLogicalClock::new(NodeId(0))),
+    )
+    .await;
+    let txn = outside_txn();
+    f.gossip_for(txn.0, Duration::from_millis(600)).await;
+
+    f.send(
+        9,
+        Message::PreAccept {
+            epoch: 0,
+            txn,
+            keys: vec![Key("acc".into())],
+            events: vec![event("acc", 1)],
+        },
+    )
+    .await;
+    let answer = tokio::time::timeout(Duration::from_millis(300), f.coordinator.recv()).await;
+    assert!(
+        answer.is_err(),
+        "a PreAccept older than the margin got an answer: {answer:?}"
+    );
+    assert_eq!(f.node.metrics().votes_late, 1);
+
+    let ballot = recovery_ballot(txn);
+    let recover = |round: RecoveryRound| Message::BeginRecovery {
+        epoch: 0,
+        txn,
+        ballot,
+        keys: vec![Key("acc".into())],
+        events: vec![event("acc", 1)],
+        round,
+    };
+    f.send(1, recover(RecoveryRound::Ask)).await;
+    loop {
+        match next(&mut f.peer).await {
+            Message::Late { txn: t, .. } if t == txn => break,
+            Message::BeginRecoveryOk { txn: t, .. } | Message::NotWitnessed { txn: t, .. }
+                if t == txn =>
+            {
+                panic!("node 0 settled a late transaction on a first round")
+            }
+            _ => {}
+        }
+    }
+    f.send(1, recover(RecoveryRound::Vote)).await;
+    loop {
+        match next(&mut f.peer).await {
+            Message::BeginRecoveryOk { txn: t, known, .. } if t == txn => {
+                assert!(known, "node 0 pre-accepts T for the recovery");
+                break;
+            }
+            Message::NotWitnessed { txn: t, .. } if t == txn => {
+                panic!("node 0 refused a recovery a vote it never vouched past")
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(f.node.metrics().votes_fenced, 0);
+}
+
+/// The ballot and round of the next recovery of `txn` node 0 sends to the
+/// node whose inbox this is.
+async fn asked(inbox: &mut mpsc::Receiver<Envelope>, txn: TxnId) -> (Ballot, RecoveryRound) {
+    loop {
+        if let Message::BeginRecovery {
+            txn: t,
+            ballot,
+            round,
+            ..
+        } = next(inbox).await
+        {
+            if t == txn {
+                return (ballot, round);
+            }
+        }
+    }
+}
+
+/// The rounds of `txn`'s recovery the node whose inbox this is receives
+/// within `wait`.
+async fn rounds(
+    inbox: &mut mpsc::Receiver<Envelope>,
+    txn: TxnId,
+    wait: Duration,
+) -> Vec<(Ballot, RecoveryRound)> {
+    let mut rounds = Vec::new();
+    let deadline = tokio::time::Instant::now() + wait;
+    while let Ok(Some(envelope)) = tokio::time::timeout_at(deadline, inbox.recv()).await {
+        if let Message::BeginRecovery {
+            txn: t,
+            ballot,
+            round,
+            ..
+        } = envelope.message
+        {
+            if t == txn {
+                rounds.push((ballot, round));
+            }
+        }
+    }
+    rounds
+}
+
+/// Node 0 alone pre-accepted T, whose coordinator is long gone. Nodes 1
+/// and 2, past its deadline, answer node 0's recovery that they are late:
+/// they never vouched past T, yet T never committed if they refuse it. So
+/// node 0 asks them to refuse it for good, and invalidates it — without
+/// waiting for their vote fences to pass it (#337).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recovery_has_late_replicas_refuse_what_too_few_hold() {
+    let mut f = Vouching::start(
+        Arc::new(InMemoryJournal::new()),
+        Arc::new(HybridLogicalClock::new(NodeId(0))),
+    )
+    .await;
+    let txn = outside_txn();
+    f.send(
+        9,
+        Message::PreAccept {
+            epoch: 0,
+            txn,
+            keys: vec![Key("acc".into())],
+            events: vec![event("acc", 1)],
+        },
+    )
+    .await;
+    assert!(matches!(
+        next(&mut f.coordinator).await,
+        Message::PreAcceptOk { txn: t, .. } if t == txn
+    ));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let node = f.node.clone();
+    let recovery = tokio::spawn(async move { node.recover(txn).await });
+    for from in [1, 2] {
+        let inbox = if from == 1 { &mut f.peer } else { &mut f.other };
+        let (ballot, round) = asked(inbox, txn).await;
+        assert_eq!(round, RecoveryRound::Ask);
+        f.send(from, Message::Late { txn, ballot }).await;
+    }
+    for from in [1, 2] {
+        let inbox = if from == 1 { &mut f.peer } else { &mut f.other };
+        let (ballot, round) = asked(inbox, txn).await;
+        assert_eq!(
+            round,
+            RecoveryRound::Refuse,
+            "only node 0 holds T: it never committed if the late replicas refuse it"
+        );
+        f.send(
+            from,
+            Message::NotWitnessed {
+                txn,
+                ballot,
+                redundant: false,
+            },
+        )
+        .await;
+    }
+    let outcome = tokio::time::timeout(Duration::from_secs(5), recovery)
         .await
+        .expect("the recovery ends")
+        .unwrap()
+        .expect("the recovery decides");
+    assert!(outcome.conflict, "T is invalidated");
+    // Node 0's own copy too, through its inbox.
+    for _ in 0..200 {
+        if f.node.command_status(txn) == Some(Status::Applied) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(f.node.command_status(txn), Some(Status::Applied));
+}
+
+/// Node 0 alone pre-accepted T, whose coordinator is long gone; node 1 is
+/// past T's deadline, and node 2 is not heard from. Nothing node 0 heard
+/// shows T may have committed, and node 1's refusal alone would not prove
+/// it never did: node 0 asks node 1 for neither a vote, which would commit
+/// a write too few replicas hold, nor a refusal. Once it hears node 2 late
+/// too, it has both refuse T for good, and invalidates it (#337).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recovery_asks_no_late_vote_for_what_may_not_have_committed() {
+    let mut f = Vouching::start(
+        Arc::new(InMemoryJournal::new()),
+        Arc::new(HybridLogicalClock::new(NodeId(0))),
+    )
+    .await;
+    let txn = outside_txn();
+    f.send(
+        9,
+        Message::PreAccept {
+            epoch: 0,
+            txn,
+            keys: vec![Key("acc".into())],
+            events: vec![event("acc", 1)],
+        },
+    )
+    .await;
+    assert!(matches!(
+        next(&mut f.coordinator).await,
+        Message::PreAcceptOk { txn: t, .. } if t == txn
+    ));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Node 2 says nothing: the recovery cannot decide T.
+    let node = f.node.clone();
+    let recovery = tokio::spawn(async move { node.recover(txn).await });
+    let (ballot, round) = asked(&mut f.peer, txn).await;
+    assert_eq!(round, RecoveryRound::Ask);
+    f.send(1, Message::Late { txn, ballot }).await;
+    let outcome = tokio::time::timeout(Duration::from_secs(5), recovery)
+        .await
+        .expect("the recovery ends")
         .unwrap();
-    let coverage = loop {
-        if let Message::SyncData { coverage, .. } = next(&mut peer).await {
-            break coverage;
+    assert!(outcome.is_err(), "one holder decides nothing: {outcome:?}");
+    let more = rounds(&mut f.peer, txn, Duration::from_millis(200)).await;
+    assert!(more.is_empty(), "node 1 is asked nothing more: {more:?}");
+    let unanswered = rounds(&mut f.other, txn, Duration::from_millis(10)).await;
+    assert_eq!(unanswered.len(), 1, "node 2 was asked once: {unanswered:?}");
+
+    // Node 2 is heard, late as well: both refuse T for good.
+    let node = f.node.clone();
+    let recovery = tokio::spawn(async move { node.recover(txn).await });
+    for refuse in [false, true] {
+        for from in [1, 2] {
+            let inbox = if from == 1 { &mut f.peer } else { &mut f.other };
+            let (ballot, round) = asked(inbox, txn).await;
+            let reply = if refuse {
+                assert_eq!(round, RecoveryRound::Refuse, "T never committed if refused");
+                Message::NotWitnessed {
+                    txn,
+                    ballot,
+                    redundant: false,
+                }
+            } else {
+                assert_eq!(round, RecoveryRound::Ask);
+                Message::Late { txn, ballot }
+            };
+            f.send(from, reply).await;
+        }
+    }
+    let outcome = tokio::time::timeout(Duration::from_secs(5), recovery)
+        .await
+        .expect("the recovery ends")
+        .unwrap()
+        .expect("the recovery decides");
+    assert!(outcome.conflict, "T is invalidated");
+}
+
+/// A recovery that finds a transaction never committed if the replicas past
+/// the deadline refuse it asks them to: node 0 refuses it for good. A
+/// recovery that later asks it to vote — after a restart too — gets the
+/// same refusal, so the invalidation the first one made stands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_for_good_outlives_a_restart() {
+    let journal = Arc::new(InMemoryJournal::new());
+    let mut f = Vouching::start(
+        Arc::clone(&journal) as Arc<dyn Journal>,
+        Arc::new(HybridLogicalClock::new(NodeId(0))),
+    )
+    .await;
+    let txn = outside_txn();
+    f.gossip_for(txn.0, Duration::from_millis(600)).await;
+    let recover = |round: RecoveryRound, micros: u64| Message::BeginRecovery {
+        epoch: 0,
+        txn,
+        ballot: Ballot(Timestamp {
+            micros: txn.0.micros + micros,
+            logical: 0,
+            node: NodeId(1),
+        }),
+        keys: vec![Key("acc".into())],
+        events: vec![event("acc", 1)],
+        round,
+    };
+    f.send(1, recover(RecoveryRound::Refuse, 1_000)).await;
+    loop {
+        match next(&mut f.peer).await {
+            Message::NotWitnessed {
+                txn: t, redundant, ..
+            } if t == txn => {
+                assert!(!redundant, "refused, not compacted");
+                break;
+            }
+            Message::BeginRecoveryOk { txn: t, .. } if t == txn => {
+                panic!("node 0 voted when asked to refuse")
+            }
+            _ => {}
+        }
+    }
+    drop(f);
+
+    let mut restarted = Vouching::start(
+        Arc::clone(&journal) as Arc<dyn Journal>,
+        Arc::new(HybridLogicalClock::new(NodeId(0))),
+    )
+    .await;
+    restarted
+        .gossip_for(txn.0, Duration::from_millis(100))
+        .await;
+    restarted.send(1, recover(RecoveryRound::Vote, 2_000)).await;
+    loop {
+        match next(&mut restarted.peer).await {
+            Message::NotWitnessed {
+                txn: t, redundant, ..
+            } if t == txn => {
+                assert!(!redundant, "refused, not compacted");
+                break;
+            }
+            Message::BeginRecoveryOk { txn: t, .. } if t == txn => {
+                panic!("node 0 voted for a transaction it refused for good")
+            }
+            Message::Nack { txn: t, promised } if t == txn => {
+                panic!("a refusal answered with a Nack at {promised:?}")
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The vote fence survives a restart — even one whose wall clock stepped
+/// back. Node 0 vouches for sync coverage; a peer may count it as proof node
+/// 0 holds everything below it, and compact past a transaction there node 0
+/// does not hold, trusting it never to vote for it (#310). So the fence
+/// covering it is journaled before the coverage leaves (#337): restarted
+/// over its journal with its clock five seconds back, node 0 still refuses
+/// the transaction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_vote_fence_outlives_a_restart_with_a_clock_stepped_back() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let journal = Arc::new(InMemoryJournal::new());
+    let physical = Arc::new(AtomicU64::new(10_000_000));
+    let clock = {
+        let physical = Arc::clone(&physical);
+        move || {
+            let physical = Arc::clone(&physical);
+            Arc::new(HybridLogicalClock::with_physical(NodeId(0), move || {
+                physical.load(Ordering::SeqCst)
+            }))
         }
     };
+    let mut first = Vouching::start(Arc::clone(&journal) as Arc<dyn Journal>, clock()).await;
+    // Nodes 1 and 2 applied everything below 9.5 s: no transaction holds
+    // node 0's coverage back.
+    let applied = Timestamp {
+        micros: 9_500_000,
+        logical: 0,
+        node: NodeId(0),
+    };
+    first.gossip_for(applied, Duration::from_millis(300)).await;
+    let coverage = first.coverage(1).await;
     assert!(coverage.micros >= 8_000_000, "coverage {coverage:?}");
-    task.abort();
+    drop(first);
 
     // It restarts over its journal with its wall clock 5 s back.
     physical.store(5_000_000, Ordering::SeqCst);
-    let restarted = node(&net);
-    restarted.recover_state().await.unwrap();
-    let _task = restarted.start(net.register(NodeId(0)));
+    let mut restarted = Vouching::start(Arc::clone(&journal) as Arc<dyn Journal>, clock()).await;
+    assert!(
+        restarted.node.vote_fence() >= coverage,
+        "the journaled fence covers the coverage"
+    );
 
     // A transaction just below that coverage, which the node never held: a
     // recovery asks it for its vote. It must refuse, as before the restart.
@@ -1377,9 +1876,9 @@ async fn a_vote_fence_outlives_a_restart_with_a_clock_stepped_back() {
         logical: 0,
         node: NodeId(2),
     });
-    net.sink(NodeId(1))
+    restarted
         .send(
-            NodeId(0),
+            1,
             Message::BeginRecovery {
                 epoch: 0,
                 txn,
@@ -1390,12 +1889,12 @@ async fn a_vote_fence_outlives_a_restart_with_a_clock_stepped_back() {
                 }),
                 keys: vec![Key("acc".into())],
                 events: vec![event("acc", 1)],
+                round: RecoveryRound::Ask,
             },
         )
-        .await
-        .unwrap();
+        .await;
     loop {
-        match next(&mut peer).await {
+        match next(&mut restarted.peer).await {
             Message::NotWitnessed {
                 txn: t, redundant, ..
             } if t == txn => {
@@ -1404,6 +1903,106 @@ async fn a_vote_fence_outlives_a_restart_with_a_clock_stepped_back() {
             }
             Message::BeginRecoveryOk { txn: t, .. } if t == txn => {
                 panic!("the restarted node voted below what it vouched for")
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A journal that can refuse to stage the vote fence.
+struct FenceRefusingJournal {
+    inner: InMemoryJournal,
+    refusing: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl Journal for FenceRefusingJournal {
+    async fn record(&self, state: &evento_accord::CommandState) -> anyhow::Result<()> {
+        self.inner.record(state).await
+    }
+
+    async fn load(&self, txn: TxnId) -> anyhow::Result<Option<evento_accord::CommandState>> {
+        self.inner.load(txn).await
+    }
+
+    async fn save_vote_fence(&self, fence: Timestamp) -> anyhow::Result<()> {
+        if self.refusing.load(std::sync::atomic::Ordering::SeqCst) {
+            anyhow::bail!("simulated vote-fence write failure");
+        }
+        self.inner.save_vote_fence(fence).await
+    }
+
+    async fn load_vote_fence(&self) -> anyhow::Result<Option<Timestamp>> {
+        self.inner.load_vote_fence().await
+    }
+}
+
+/// Node 0 answers a recovery "never witnessed" — its word that it never
+/// votes for the transaction — only once the fence that word rests on is
+/// journaled: a restart that forgot it could vote below it after all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fenced_answer_waits_for_its_fence_to_be_journaled() {
+    let journal = Arc::new(FenceRefusingJournal {
+        inner: InMemoryJournal::new(),
+        refusing: std::sync::atomic::AtomicBool::new(true),
+    });
+    let mut f = Vouching::start(
+        Arc::clone(&journal) as Arc<dyn Journal>,
+        Arc::new(HybridLogicalClock::new(NodeId(0))),
+    )
+    .await;
+    // An old transaction no replica holds: nodes 1 and 2 applied everything.
+    let txn = outside_txn();
+    let applied = Timestamp {
+        micros: txn.0.micros + 400_000,
+        logical: 0,
+        node: NodeId(0),
+    };
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    f.gossip_for(applied, Duration::from_millis(100)).await;
+    let recover = |ballot: Ballot| Message::BeginRecovery {
+        epoch: 0,
+        txn,
+        ballot,
+        keys: vec![Key("acc".into())],
+        events: vec![event("acc", 1)],
+        round: RecoveryRound::Ask,
+    };
+    f.send(1, recover(recovery_ballot(txn))).await;
+    let withheld = tokio::time::timeout(Duration::from_millis(300), async {
+        loop {
+            if let Message::NotWitnessed { txn: t, .. } = next(&mut f.peer).await {
+                if t == txn {
+                    break;
+                }
+            }
+        }
+    })
+    .await;
+    assert!(
+        withheld.is_err(),
+        "node 0 promised never to vote on a fence its journal refused"
+    );
+
+    journal
+        .refusing
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let higher = Ballot(Timestamp {
+        micros: txn.0.micros + 2_000,
+        logical: 0,
+        node: NodeId(1),
+    });
+    f.send(1, recover(higher)).await;
+    loop {
+        match next(&mut f.peer).await {
+            Message::NotWitnessed {
+                txn: t, redundant, ..
+            } if t == txn => {
+                assert!(!redundant, "fenced, not compacted");
+                break;
+            }
+            Message::BeginRecoveryOk { txn: t, .. } if t == txn => {
+                panic!("node 0 voted for an old transaction it could vouch past")
             }
             _ => {}
         }

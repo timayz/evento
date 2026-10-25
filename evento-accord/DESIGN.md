@@ -760,14 +760,61 @@ backend (sql/fjall). Phases, in order:
   R's recovery; R and Q commit it, and P, which ignores a commit below its floor,
   never applies it. So a replica **never newly votes** — PreAccept, Accept, or the
   pre-accept an unrouted recovery asks for — for a transaction it does not hold
-  whose `t0` is below its clock less `compaction_margin` (`Replica::fenced`,
+  whose `t0` is below its **vote fence** (`Replica::fenced`,
   `accord_votes_fenced_total`): to a recovery it answers "never witnessed"
-  (`NotWitnessed { redundant: false }`) and journals the ballot. Every report is
-  cut at the clock less that margin when sent, and the clock never goes back, so
-  the fence is above every report the replica made: none goes stale. Across a
-  restart neither — before a report, sync coverage, join vouch or fenced reply
-  leaves the node, its persisted clock bound is raised past the reading it came
-  from (the `mint` path, at most one write per `max_skew`). A coordinator's
+  (`NotWitnessed { redundant: false }`) and journals the ballot. The fence is
+  **what the replica vouched for** (#337): every report, every sync coverage it
+  hands a peer (a peer counts it as proof the replica holds everything below,
+  and a subscription reads past it), every join it vouches for and the stable
+  point its subscriptions read lies at or below it. Raised under the replica
+  lock in the same critical section as the vouch — so no vote slips in below a
+  report already cut — it is journaled (`Journal::save_vote_fence`, staged and
+  flushed with the report or batch it gates) before the vouch leaves, and a
+  restart restores it: none goes stale, a wall clock stepped back included. A
+  journal that keeps no fence restarts it at the clock bound less the margin,
+  where it stood before it was journaled. The fence is no higher than that:
+  pinned at its clock less the margin, a replica that never saw a transaction
+  fenced it a margin after its `t0`, and once the replica that lost its journal
+  was one of the slow quorum that accepted it, nothing could decide it any more
+  (#337) — its coordinator gone, the others fenced. So a replica also **vouches
+  nothing past a transaction a slow quorum of its shard holds unapplied**: each
+  report gossips the sender's applied-through unclamped by coverage
+  (`Watermark::applied`), and the sync coverage a replica hands out never passes
+  the shard's **applied floor**, the slow-quorum-th lowest of them (a replica not
+  heard from counting as nothing applied; `Node::applied_floor`). A replica that
+  never saw such a transaction can then still vote for it, however late, and a
+  recovery decides it. Coverage never clamps an applied-through, so the floor
+  rises with the shard from its first gossip; every replica's reports and stable
+  points trail it by one gossip round at most (`min(applied, coverage) ≤ floor`
+  for any node). Before deciding a recovery's vote for a transaction it does not
+  hold, a replica raises its fence to what it could vouch for now — its
+  applied-through, capped at the floor — so it votes late only for one a slow
+  quorum may hold, and fences the rest. The original coordinator is held to a
+  deadline instead: its PreAccept, and its Accept at `Ballot(t0)`, get no vote
+  from a replica that does not hold the transaction past the clock less
+  `compaction_margin` (`Replica::late`, `accord_votes_late_total`). No
+  coordinator's message outlives the margin, and a replica that voted on its
+  coordinator's word did so while its applied-through still lay below the
+  transaction — so its gossip shows it holding it. Past that deadline, and
+  below no fence, a replica settles a recovery in **two rounds**
+  (`RecoveryRound`): to the first it answers `Late`, promising the ballot, and
+  neither votes nor refuses. The recovery, which sees every reply, then asks
+  it to **refuse** the transaction for good if that proves it never committed
+  (`never_commits`, the late replies counted as fenced) — a promise at the
+  reserved `REFUSED` ballot, journaled like any promise, that no ballot
+  outbids — and invalidates it. If the replies show the transaction may have
+  committed instead — a slow quorum accepted it, a replica that lost its
+  journal counted as one that did (`Node::may_have_committed`) — it asks it
+  to **vote**, and decides it. Otherwise what the replicas it did not hear
+  from hold decides it, and a next attempt hears them: no write too few
+  replicas hold is committed on late votes. So a write too few replicas hold
+  is invalidated once its deadline passes, not once the vote fences pass it
+  — across a partition, the gossip that moves them waits for the heal — and
+  one an amnesiac and fewer than a slow quorum of the others accepted is
+  decided with the late votes
+  (`a_recovery_has_late_replicas_refuse_what_too_few_hold`,
+  `a_recovery_asks_no_late_vote_for_what_may_not_have_committed`,
+  `a_refusal_for_good_outlives_a_restart`). A coordinator's
   messages, and recoveries of a transaction still in flight, land within the
   margin (OPERATIONS: margin ≥ `recovery_timeout` + 2 × skew + delay). Past it, a
   transaction only a minority holds can no longer gather a quorum, and a recovery
@@ -792,7 +839,10 @@ backend (sql/fjall). Phases, in order:
   (`a_lone_holder_cannot_commit_what_a_peer_compacted_past`,
   `a_lone_holder_cut_off_from_a_compacted_peer_cannot_commit`,
   `a_lone_holder_stranded_below_its_peers_compaction_rejoins`,
-  `a_vote_fence_outlives_a_restart_with_a_clock_stepped_back`, and the simulator's
+  `a_vote_fence_outlives_a_restart_with_a_clock_stepped_back`,
+  `a_replica_vouches_no_coverage_past_a_write_a_slow_quorum_holds`,
+  `a_late_coordinator_gets_no_vote_where_a_recovery_does`,
+  `a_fenced_answer_waits_for_its_fence_to_be_journaled`, and the simulator's
   absence scenario with orphan votes). **Catch-up:**
   only a brand-new joining node can be
   below the watermark, so `join` transfers a **data-store snapshot** for the
@@ -866,11 +916,26 @@ backend (sql/fjall). Phases, in order:
   too few of the electorate pre-accepted it, and too few can still vote — a holder
   that accepted it may hold half a decision, and keeps it undecided. A plain open
   over an empty journal and a non-empty store is refused (`LostJournal`), and a
-  fresh one leaves its clock bound as a birth mark. One case stays undecided for
-  good: a transaction accepted by the lost replica and by fewer than a slow quorum
-  of the others, while the rest passed their vote fence for it — the join never
-  finds a contact past it (OPERATIONS §7). See `tests/amnesia.rs` and the
-  simulator's `run_amnesia`. Validated by the deterministic simulation: a **bound oracle**
+  fresh one leaves its clock bound as a birth mark. A transaction accepted by the
+  lost replica and by fewer than a slow quorum of the others needs the vote of a
+  replica that never saw it: the lost replica's journal held it unapplied, so
+  its last gossip still pins the shard's applied floor below it, none of the
+  others vouched past it, and their vote fences let a recovery decide it (#337,
+  `a_recovery_decides_what_an_amnesiac_and_one_replica_accepted`). A
+  transaction only the lost replica held is no one's to recover, yet a write
+  committed with it as a dependency waits on it: the replicas that wait learn
+  its decision with a keyless round on their own shard
+  (`RecoveryRound::Dependency`, `Node::learn_decision`), which nothing can vote
+  for once its deadline passed, so it never committed. They invalidate it, and
+  an `Invalidate` records it aborted on a replica that never witnessed it,
+  keeping the ballot it promised, so what waits on it goes on
+  (`a_dependency_only_an_amnesiac_held_is_invalidated`). Two cases
+  still stay undecided for good, and the join never finds a contact past them
+  (OPERATIONS §7): a **multi-shard** transaction of that shape — a routed
+  recovery never lets a replica that never witnessed it pre-accept it (#377) —
+  and a replica whose only vote for it was a recovery's late pre-accept, lost
+  before its next gossip showed it holding the transaction. See `tests/amnesia.rs` and
+  the simulator's `run_amnesia`, which wipes a node at any moment. Validated by the deterministic simulation: a **bound oracle**
   (`consensus_state_stays_bounded`) proves `command_count` returns to zero after a
   workload while committed state is preserved, and safety/convergence/bit-
   reproducibility hold across all seeds with compaction live (churn, partitions,

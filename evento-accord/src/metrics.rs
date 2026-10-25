@@ -55,9 +55,14 @@ pub struct Metrics {
     pub command_pages: AtomicU64,
     /// Votes refused below the vote fence: a PreAccept, an Accept or a
     /// recovery's pre-accept of a transaction this node never witnessed,
-    /// older than its compaction margin. A steady rate means coordinators
-    /// slower than the margin.
+    /// below what it vouched for — a watermark report, sync coverage, a
+    /// join's vouch, its stable point — or could vouch for now (#337).
     pub votes_fenced: AtomicU64,
+    /// Votes refused to an original coordinator past its deadline: its
+    /// PreAccept, or its Accept at the transaction's own ballot, for a
+    /// transaction this node never witnessed, older than its compaction
+    /// margin. A steady rate means coordinators slower than the margin.
+    pub votes_late: AtomicU64,
     /// Decisions learned from peers for transactions this node never
     /// witnessed, but a command committed here waits on (#330).
     pub dependencies_learned: AtomicU64,
@@ -171,6 +176,11 @@ impl Metrics {
         self.votes_fenced.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records a vote refused to an original coordinator past its deadline.
+    pub fn record_vote_late(&self) {
+        self.votes_late.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Records a decision learned for a dependency never witnessed here.
     pub fn record_dependency_learned(&self) {
         self.dependencies_learned.fetch_add(1, Ordering::Relaxed);
@@ -247,6 +257,7 @@ impl Metrics {
             execution_failures: self.execution_failures.load(Ordering::Relaxed),
             command_pages: self.command_pages.load(Ordering::Relaxed),
             votes_fenced: self.votes_fenced.load(Ordering::Relaxed),
+            votes_late: self.votes_late.load(Ordering::Relaxed),
             dependencies_learned: self.dependencies_learned.load(Ordering::Relaxed),
             amnesia_fences: self.amnesia_fences.load(Ordering::Relaxed),
             amnesia_joins_refused: self.amnesia_joins_refused.load(Ordering::Relaxed),
@@ -282,6 +293,7 @@ pub struct MetricsSnapshot {
     pub execution_failures: u64,
     pub command_pages: u64,
     pub votes_fenced: u64,
+    pub votes_late: u64,
     pub dependencies_learned: u64,
     pub amnesia_fences: u64,
     pub amnesia_joins_refused: u64,
@@ -298,7 +310,7 @@ impl MetricsSnapshot {
     /// source of truth for both [`to_prometheus`](Self::to_prometheus) and
     /// [`to_prometheus_labeled`](Self::to_prometheus_labeled); add a counter here and
     /// both renderings pick it up.
-    fn counters(&self) -> [(&'static str, &'static str, u64); 26] {
+    fn counters(&self) -> [(&'static str, &'static str, u64); 27] {
         [
             (
                 "accord_writes_committed_total",
@@ -382,8 +394,13 @@ impl MetricsSnapshot {
             ),
             (
                 "accord_votes_fenced_total",
-                "Votes refused for transactions older than the compaction margin, never witnessed here.",
+                "Votes refused for transactions never witnessed here, below what this node vouched for.",
                 self.votes_fenced,
+            ),
+            (
+                "accord_votes_late_total",
+                "Votes refused to original coordinators older than the compaction margin, for transactions never witnessed here.",
+                self.votes_late,
             ),
             (
                 "accord_dependencies_learned_total",

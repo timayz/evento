@@ -22,7 +22,8 @@
 //! transaction's decision record is a `decision/` row, staged the same way but
 //! kept by `truncate` until the node drops it. The node's clock bound is the
 //! `accord_meta` row `clock_bound`, written durably on its own and never
-//! truncated.
+//! truncated. The replica's vote fence is the `accord_meta` row `vote_fence`,
+//! staged and flushed with the commands and never truncated.
 
 use std::sync::Mutex;
 
@@ -56,6 +57,9 @@ const AMNESIA_FENCE_KEY: &str = "amnesia_fence";
 /// `k` value under which the replica's transition fences are stored in
 /// `accord_meta`. Untouched by `truncate`.
 const FENCES_KEY: &str = "fences";
+/// `k` value under which the replica's vote fence is stored in
+/// `accord_meta`. Staged like a command; untouched by `truncate`.
+const VOTE_FENCE_KEY: &str = "vote_fence";
 /// `k` prefix of a multi-shard transaction's route in `accord_meta`.
 const ROUTE_PREFIX: &str = "route/";
 /// `k` prefix of a blind recovery promise in `accord_meta`.
@@ -133,6 +137,10 @@ pub struct SqlJournal<DB: Database> {
     /// `accord_meta` rows (routes, promises, decision records) staged since
     /// the last flush, as `(txn, k, v)`.
     staged_meta: Mutex<Vec<(TxnId, String, Vec<u8>)>>,
+    /// The vote fence staged since the last flush, encoded: a slot of its
+    /// own, since `truncate` purges the per-transaction rows of
+    /// `staged_meta` below its bound.
+    staged_fence: Mutex<Option<Vec<u8>>>,
     /// Serializes flushes so staged entries are only drained once their
     /// transaction has committed — a failed flush must leave them staged.
     flush_lock: tokio::sync::Mutex<()>,
@@ -146,6 +154,7 @@ impl<DB: Database> SqlJournal<DB> {
             pool,
             staged: Mutex::new(Vec::new()),
             staged_meta: Mutex::new(Vec::new()),
+            staged_fence: Mutex::new(None),
             flush_lock: tokio::sync::Mutex::new(()),
         }
     }
@@ -348,7 +357,8 @@ where
 
         let batch = self.staged.lock().expect("journal poisoned").clone();
         let meta_batch = self.staged_meta.lock().expect("journal poisoned").clone();
-        if batch.is_empty() && meta_batch.is_empty() {
+        let fence = self.staged_fence.lock().expect("journal poisoned").clone();
+        if batch.is_empty() && meta_batch.is_empty() && fence.is_none() {
             return Ok(());
         }
 
@@ -414,6 +424,22 @@ where
                 .execute(&mut *tx)
                 .await?;
         }
+        if let Some(value) = &fence {
+            let upsert = Query::insert()
+                .into_table(AccordMeta::Table)
+                .columns([AccordMeta::K, AccordMeta::V])
+                .values_panic([VOTE_FENCE_KEY.into(), value.clone().into()])
+                .on_conflict(
+                    OnConflict::column(AccordMeta::K)
+                        .update_column(AccordMeta::V)
+                        .to_owned(),
+                )
+                .to_owned();
+            let (sql, values) = Self::build_sqlx(&upsert);
+            sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
+                .execute(&mut *tx)
+                .await?;
+        }
         tx.commit().await?;
 
         // Drop exactly what was flushed; entries staged mid-transaction stay.
@@ -432,6 +458,11 @@ where
             .lock()
             .expect("journal poisoned")
             .retain(|entry| !flushed.contains(entry));
+        // A fence staged while the transaction ran is a newer one: it stays.
+        let mut staged_fence = self.staged_fence.lock().expect("journal poisoned");
+        if *staged_fence == fence {
+            *staged_fence = None;
+        }
         Ok(())
     }
 
@@ -574,6 +605,19 @@ where
     async fn load_clock_bound(&self) -> anyhow::Result<Option<u64>> {
         match self.load_meta(CLOCK_BOUND_KEY).await? {
             Some(bytes) => Ok(Some(decode_tagged(RecordKind::ClockBound, &bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn save_vote_fence(&self, fence: Timestamp) -> anyhow::Result<()> {
+        let value = encode_tagged(RecordKind::VoteFence, &fence)?;
+        *self.staged_fence.lock().expect("journal poisoned") = Some(value);
+        Ok(())
+    }
+
+    async fn load_vote_fence(&self) -> anyhow::Result<Option<Timestamp>> {
+        match self.load_meta(VOTE_FENCE_KEY).await? {
+            Some(bytes) => Ok(Some(decode_tagged(RecordKind::VoteFence, &bytes)?)),
             None => Ok(None),
         }
     }

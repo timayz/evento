@@ -34,7 +34,20 @@ use evento_core::Event;
 
 use crate::api::{floor_millis, snapshot_event_size, DecisionRecord};
 use crate::clock::{Ballot, NodeId, Timestamp, TxnId};
-use crate::message::{CommandState, Key, Status};
+use crate::message::{CommandState, Key, RecoveryRound, Status};
+
+/// The promise of a replica that refused a transaction it never witnessed
+/// for good, when a recovery asked it to (see [`RecoveryRound::Refuse`]):
+/// no ballot outbids it, and a refused transaction gets no vote here again.
+/// Journaled like any recovery promise (`Journal::save_promise`), and kept
+/// until the redundancy watermark passes the transaction. Never sent: a
+/// clock that witnessed it would overflow, and a recovery Nacked with it
+/// would retry for good.
+pub(crate) const REFUSED: Ballot = Ballot(Timestamp {
+    micros: u64::MAX,
+    logical: u32::MAX,
+    node: NodeId(u64::MAX),
+});
 
 /// Per-replica consensus state.
 pub struct Replica {
@@ -74,10 +87,22 @@ pub struct Replica {
     redundant_before: Timestamp,
     /// The vote fence: a transaction this replica does not hold, with `t0`
     /// below it, gets no vote here — no PreAccept, no Accept, no recovery's
-    /// pre-accept (see [`fenced`](Replica::fenced)). The node keeps it at its
-    /// clock less the compaction margin, at or above every redundancy point it
-    /// has reported. Monotonic.
+    /// pre-accept (see [`fenced`](Replica::fenced)). The node raises it to
+    /// everything it vouches for — a watermark report, the sync coverage it
+    /// hands a peer, a join's vouch, the stable point its subscriptions read
+    /// — before the vouch leaves it, and journals it (#337). Monotonic.
     vote_fence: Timestamp,
+    /// The part of [`vote_fence`](Self::vote_fence) the journal is known to
+    /// hold: what a vouch may reach, since a restart restores the fence from
+    /// there. Monotonic, never above `vote_fence`.
+    durable_fence: Timestamp,
+    /// The original coordinator's deadline: its PreAccept, and its Accept at
+    /// `Ballot(t0)`, for a transaction this replica does not hold, get no
+    /// vote below this — the node keeps it at its clock less the compaction
+    /// margin, so no coordinator's message outlives the margin (see
+    /// [`late`](Replica::late)). Unlike the vote fence it promises nothing,
+    /// and a recovery is not held to it. Monotonic.
+    coordinator_cutoff: Timestamp,
     /// Transactions handed out by [`next_apply`](Replica::next_apply) whose apply
     /// is in flight (the node performs it outside the lock). Excluded from
     /// further `next_apply` picks so two concurrent drivers cannot double-apply
@@ -154,6 +179,8 @@ impl Default for Replica {
             waiters: HashMap::new(),
             redundant_before: Timestamp::MIN,
             vote_fence: Timestamp::MIN,
+            durable_fence: Timestamp::MIN,
+            coordinator_cutoff: Timestamp::MIN,
             applying: HashSet::new(),
             unapplied_bounds: HashMap::new(),
             unapplied_by_bound: BTreeSet::new(),
@@ -252,6 +279,10 @@ pub enum Refusal {
     /// The transaction is below the vote fence and not held (see
     /// [`Replica::fenced`]): nothing is recorded, and nothing answered.
     Fenced,
+    /// The original coordinator's message for a transaction not held here
+    /// outlived the compaction margin (see [`Replica::late`]): nothing is
+    /// recorded, and nothing answered.
+    Late,
 }
 
 /// What a replica answers a routed recovery (`Message::Routed` around a
@@ -269,6 +300,11 @@ pub enum RoutedRecovery {
         /// Whether `t0` is below this replica's redundancy watermark.
         redundant: bool,
     },
+    /// The replica never witnessed the transaction, is past its original
+    /// coordinator's deadline, and is not below its vote fence: it promised
+    /// the ballot, and neither votes nor refuses until the recovery asks it
+    /// to (see [`RecoveryRound`]).
+    Late,
 }
 
 /// What a replica reports when asked to recover a transaction.
@@ -412,6 +448,9 @@ impl Replica {
     /// never votes for, "never witnessed", promising `ballot` (the node
     /// journals it) — or `Err(promised)` if it already promised a higher one.
     pub fn refuse_blind(&mut self, txn: TxnId, ballot: Ballot) -> Result<RoutedRecovery, Ballot> {
+        if self.refused(txn) {
+            return Ok(RoutedRecovery::NotWitnessed { redundant: false });
+        }
         if let Some(&promised) = self.unknown_promises.get(&txn) {
             if ballot < promised {
                 return Err(promised);
@@ -573,7 +612,8 @@ impl Replica {
     /// for one this replica answered "unknown" — it is refused with
     /// `Err(promised)`, so that coordinator can no longer gather a vote the
     /// recovery did not see. A [`compacted`](Self::compacted) transaction is
-    /// refused too.
+    /// refused too, and so is one below the vote fence, or past the
+    /// coordinator's deadline (see [`late`](Self::late)).
     pub fn preaccept(
         &mut self,
         txn: TxnId,
@@ -584,11 +624,17 @@ impl Replica {
         if self.compacted(txn) {
             return Err(Refusal::Compacted);
         }
+        if self.refused(txn) {
+            return Err(Refusal::Fenced);
+        }
         if let Some(promised) = self.promise_of(txn).filter(|p| *p > Ballot(txn.0)) {
             return Err(Refusal::Promised(promised));
         }
         if self.fenced(txn) {
             return Err(Refusal::Fenced);
+        }
+        if self.late(txn) {
+            return Err(Refusal::Late);
         }
         Ok(self.witness(txn, epoch, Ballot(txn.0), keys, events))
     }
@@ -602,22 +648,66 @@ impl Replica {
     }
 
     /// Raises the [vote fence](Replica::fenced) to `fence` (never lowers it).
-    pub fn set_vote_fence(&mut self, fence: Timestamp) {
+    /// Returns the fence.
+    pub fn raise_vote_fence(&mut self, fence: Timestamp) -> Timestamp {
         self.vote_fence = self.vote_fence.max(fence);
+        self.vote_fence
+    }
+
+    /// The [vote fence](Replica::fenced).
+    pub fn vote_fence(&self) -> Timestamp {
+        self.vote_fence
+    }
+
+    /// Records that the journal holds the vote fence up to `fence` (a value
+    /// it was raised to and staged, then flushed).
+    pub fn fence_durable(&mut self, fence: Timestamp) {
+        self.durable_fence = self.durable_fence.max(fence.min(self.vote_fence));
+    }
+
+    /// What the journal is known to hold of the vote fence: the most this
+    /// replica may vouch for.
+    pub fn durable_fence(&self) -> Timestamp {
+        self.durable_fence
+    }
+
+    /// Raises the [original coordinator's deadline](Replica::late) to
+    /// `cutoff` (never lowers it).
+    pub fn set_coordinator_cutoff(&mut self, cutoff: Timestamp) {
+        self.coordinator_cutoff = self.coordinator_cutoff.max(cutoff);
     }
 
     /// Whether `txn`, not held here, is below the vote fence: this replica
     /// never votes for it — it records no PreAccept or Accept of it, and
     /// answers a recovery that it never witnessed it, promising the ballot.
     ///
-    /// Every redundancy point this replica reports lies below the fence: a
-    /// peer may compact up to such a point, past a transaction this replica
-    /// does not hold, trusting that it never will (#310). The fence is what
-    /// keeps that true when a replica a peer gave up recovers the transaction
-    /// through this one. It also turns the rule that no coordinator's message
-    /// outlives the compaction margin into one a replica enforces.
+    /// Every redundancy point this replica reports, every sync coverage it
+    /// hands a peer, every join it vouches for and the stable point its
+    /// subscriptions read lie below the fence: a peer may compact up to
+    /// such a point, or count it as proof this replica holds everything
+    /// below, past a transaction this replica does not hold, trusting that
+    /// it never will (#310). The fence is what keeps that true when a
+    /// replica a peer gave up recovers the transaction through this one. It
+    /// is no higher than what this replica vouched for, so a transaction a
+    /// slow quorum held unapplied all along — one this replica never vouched
+    /// past — can still get its vote, however late (#337).
     pub fn fenced(&self, txn: TxnId) -> bool {
-        txn.0 < self.vote_fence && !self.commands.contains_key(&txn)
+        !self.commands.contains_key(&txn) && (txn.0 < self.vote_fence || self.refused(txn))
+    }
+
+    /// Whether this replica refused `txn`, which it does not hold, for good
+    /// (see [`REFUSED`]).
+    pub fn refused(&self, txn: TxnId) -> bool {
+        self.unknown_promises.get(&txn) == Some(&REFUSED) && !self.commands.contains_key(&txn)
+    }
+
+    /// Whether `txn`, not held here and not [fenced](Self::fenced), is past
+    /// the original coordinator's deadline: its PreAccept, or its Accept at
+    /// `Ballot(t0)`, outlived the compaction margin. Refused like a fenced
+    /// vote, but nothing rests on the refusal: a recovery may still get
+    /// this replica's vote.
+    pub fn late(&self, txn: TxnId) -> bool {
+        txn.0 < self.coordinator_cutoff && !self.commands.contains_key(&txn)
     }
 
     /// The ballot this replica has promised for `txn`, known or not.
@@ -744,6 +834,9 @@ impl Replica {
             self.index_keys(txn, &keys);
             self.wake(txn);
         } else {
+            if self.refused(txn) {
+                return Err(Refusal::Fenced);
+            }
             if let Some(&promised) = self.unknown_promises.get(&txn) {
                 if ballot < promised {
                     return Err(Refusal::Promised(promised));
@@ -751,6 +844,11 @@ impl Replica {
             }
             if self.fenced(txn) {
                 return Err(Refusal::Fenced);
+            }
+            // The original coordinator's own Accept is held to its deadline;
+            // a recovery's, at a higher ballot, to the vote fence alone.
+            if ballot == Ballot(txn.0) && self.late(txn) {
+                return Err(Refusal::Late);
             }
             self.unknown_promises.remove(&txn);
             // The replica missed PreAccept; record what it was told — including
@@ -885,13 +983,20 @@ impl Replica {
         keys: Vec<Key>,
         events: Vec<Event>,
     ) -> Result<RecoverState, Ballot> {
-        if let Some(promised) = self.promise_of(txn) {
-            if ballot < promised {
-                return Err(promised);
+        // Refused for good: no ballot outbids that, and nothing is
+        // pre-accepted — it answers as if it owned none of it.
+        let refused = self.refused(txn);
+        if !refused {
+            if let Some(promised) = self.promise_of(txn) {
+                if ballot < promised {
+                    return Err(promised);
+                }
             }
         }
-        if !self.commands.contains_key(&txn) && keys.is_empty() {
-            self.unknown_promises.insert(txn, ballot);
+        if !self.commands.contains_key(&txn) && (keys.is_empty() || refused) {
+            if !refused {
+                self.unknown_promises.insert(txn, ballot);
+            }
             return Ok(RecoverState {
                 known: false,
                 epoch,
@@ -929,11 +1034,23 @@ impl Replica {
         })
     }
 
-    /// Handles an unrouted `BeginRecovery` under `ballot`: as
+    /// Handles an unrouted `BeginRecovery` under `ballot`, of `round`: as
     /// [`recover`](Self::recover), but a [`compacted`](Self::compacted)
     /// transaction is answered from below the watermark, as
     /// [`recover_routed`](Self::recover_routed) does, rather than
-    /// pre-accepted afresh.
+    /// pre-accepted afresh. A transaction this replica does not hold, and
+    /// owns a part of (`keys`), or is asked about as a dependency of its
+    /// shard ([`RecoveryRound::Dependency`]):
+    ///
+    /// - below its vote fence, or refused for good, gets "never witnessed":
+    ///   it never voted for it, and never will;
+    /// - past its original coordinator's deadline ([`late`](Self::late)),
+    ///   on a first round, gets [`RoutedRecovery::Late`], the ballot
+    ///   promised: the recovery then asks it to vote, or to refuse;
+    /// - asked to refuse it ([`RecoveryRound::Refuse`]) refuses it for good
+    ///   (see [`REFUSED`]);
+    /// - otherwise is pre-accepted, as [`recover`](Self::recover) does —
+    ///   past the deadline too when asked to vote.
     pub fn recover_unrouted(
         &mut self,
         txn: TxnId,
@@ -941,19 +1058,61 @@ impl Replica {
         epoch: u64,
         keys: Vec<Key>,
         events: Vec<Event>,
+        round: RecoveryRound,
     ) -> Result<RoutedRecovery, Ballot> {
         if self.compacted(txn) {
             return Ok(self.recorded(txn));
         }
-        // Below the vote fence, a transaction never witnessed here is not
-        // pre-accepted now: the replica promises the ballot and says so, as a
-        // routed recovery's blind replica does — it never voted, and never
-        // will.
-        if self.fenced(txn) && !keys.is_empty() {
-            return self.refuse_blind(txn, ballot);
+        let answers = !keys.is_empty() || round == RecoveryRound::Dependency;
+        if answers && !self.commands.contains_key(&txn) {
+            // It never voted for it, and never will.
+            if self.fenced(txn) {
+                return self.refuse_blind(txn, ballot);
+            }
+            match round {
+                RecoveryRound::Refuse => return self.refuse_for_good(txn, ballot),
+                RecoveryRound::Ask | RecoveryRound::Dependency if self.late(txn) => {
+                    return self.promise_late(txn, ballot);
+                }
+                _ => {}
+            }
         }
         self.recover(txn, ballot, epoch, keys, events)
             .map(RoutedRecovery::Known)
+    }
+
+    /// Refuses `txn`, which this replica does not hold, for good: a
+    /// recovery found it never committed if the late replicas refuse it, and
+    /// asked this one to (see [`RecoveryRound::Refuse`]). The node journals
+    /// the refusal before the answer leaves. `Err(promised)` if a higher
+    /// ballot was promised.
+    fn refuse_for_good(&mut self, txn: TxnId, ballot: Ballot) -> Result<RoutedRecovery, Ballot> {
+        if self.refused(txn) {
+            return Ok(RoutedRecovery::NotWitnessed { redundant: false });
+        }
+        if let Some(&promised) = self.unknown_promises.get(&txn) {
+            if ballot < promised {
+                return Err(promised);
+            }
+        }
+        self.unknown_promises.insert(txn, REFUSED);
+        Ok(RoutedRecovery::NotWitnessed { redundant: false })
+    }
+
+    /// Promises `ballot` for `txn`, which this replica does not hold and is
+    /// past its original coordinator's deadline for, voting for it no more
+    /// than refusing it (see [`RoutedRecovery::Late`]).
+    fn promise_late(&mut self, txn: TxnId, ballot: Ballot) -> Result<RoutedRecovery, Ballot> {
+        if self.refused(txn) {
+            return Ok(RoutedRecovery::NotWitnessed { redundant: false });
+        }
+        if let Some(&promised) = self.unknown_promises.get(&txn) {
+            if ballot < promised {
+                return Err(promised);
+            }
+        }
+        self.unknown_promises.insert(txn, ballot);
+        Ok(RoutedRecovery::Late)
     }
 
     /// What a replica answers a recovery of a [`compacted`](Self::compacted)
@@ -1001,6 +1160,9 @@ impl Replica {
                 .recover(txn, ballot, epoch, keys, events)
                 .map(RoutedRecovery::Known);
         }
+        if self.refused(txn) {
+            return Ok(RoutedRecovery::NotWitnessed { redundant: false });
+        }
         if let Some(&promised) = self.unknown_promises.get(&txn) {
             if ballot < promised {
                 return Err(promised);
@@ -1025,8 +1187,45 @@ impl Replica {
     /// superseding check never reads its (un-agreed, local) dependencies as
     /// evidence. Only a command not yet committed is invalidated — a committed
     /// one has a decision of its own (none can exist for a transaction a shard
-    /// never witnessed). Returns whether `txn` was invalidated now.
-    pub fn invalidate(&mut self, txn: TxnId) -> bool {
+    /// never witnessed). One never witnessed here is recorded invalidated
+    /// under `epoch`, keeping the ballot this replica promised for it.
+    /// Returns whether `txn` was invalidated now.
+    pub fn invalidate(&mut self, txn: TxnId, epoch: u64) -> bool {
+        if !self.commands.contains_key(&txn) {
+            // Never witnessed here — a dependency only a lost journal held
+            // (#337), or a transaction one shard never saw: recorded aborted,
+            // so what waits on it here proceeds.
+            if self.compacted(txn) {
+                return false;
+            }
+            // The promise this replica made the recovery stays: the
+            // original coordinator's late PreAccept must still be refused. A
+            // refusal for good becomes the lowest ballot above the
+            // coordinator's own, which a later recovery outbids.
+            let promised = match self.unknown_promises.remove(&txn) {
+                Some(REFUSED) => Ballot(Timestamp {
+                    node: NodeId(u64::MAX),
+                    ..txn.0
+                }),
+                Some(promised) => promised.max(Ballot(txn.0)),
+                None => Ballot(txn.0),
+            };
+            self.insert(CommandState {
+                txn,
+                epoch,
+                status: Status::Applied,
+                promised,
+                accepted: Ballot(txn.0),
+                execute_at: crate::message::INVALIDATED_AT,
+                deps: Vec::new(),
+                keys: Vec::new(),
+                events: Vec::new(),
+                reply_to: txn.0.node,
+                decision: Some(false),
+                applied_conflict: Some(true),
+            });
+            return true;
+        }
         let Some(cmd) = self.commands.get_mut(&txn) else {
             return false;
         };
@@ -2518,7 +2717,14 @@ mod tests {
         assert_eq!(replica.status(t), None, "nothing was re-created");
         assert_eq!(replica.applied_result(t), None);
         assert!(matches!(
-            replica.recover_unrouted(t, ballot(50, 1), 0, vec![key], vec![event("k", 1)]),
+            replica.recover_unrouted(
+                t,
+                ballot(50, 1),
+                0,
+                vec![key],
+                vec![event("k", 1)],
+                RecoveryRound::Ask,
+            ),
             Ok(RoutedRecovery::NotWitnessed { redundant: true })
         ));
         assert_eq!(replica.status(t), None, "recovery pre-accepted nothing");
@@ -2560,7 +2766,14 @@ mod tests {
 
         for report in [
             replica.recover_routed(routed, ballot(50, 1), 0, vec![], vec![]),
-            replica.recover_unrouted(routed, ballot(50, 1), 0, vec![key.clone()], vec![]),
+            replica.recover_unrouted(
+                routed,
+                ballot(50, 1),
+                0,
+                vec![key.clone()],
+                vec![],
+                RecoveryRound::Ask,
+            ),
         ] {
             let Ok(RoutedRecovery::Known(state)) = report else {
                 panic!("a recorded decision is reported");
@@ -2605,7 +2818,7 @@ mod tests {
             .preaccept(t, 0, vec![key.clone()], vec![event("k", 1)])
             .unwrap();
         assert!(replica.set_route(t, &route));
-        assert!(replica.invalidate(t));
+        assert!(replica.invalidate(t, 0));
         replica.compact(txn(10).0);
         let Ok(RoutedRecovery::Known(state)) =
             replica.recover_routed(t, ballot(50, 1), 0, vec![], vec![])
@@ -2650,6 +2863,70 @@ mod tests {
         }
     }
 
+    /// An Invalidate reaching a replica that never witnessed the transaction
+    /// records it invalidated, so what waits on it here proceeds (#337). The
+    /// ballot the replica promised the invalidating recovery stays, so the
+    /// original coordinator's late PreAccept is still refused.
+    #[test]
+    fn an_invalidated_unwitnessed_transaction_keeps_its_promise() {
+        let mut replica = Replica::new();
+        let key = Key("k".into());
+        let t = txn(20);
+        assert!(matches!(
+            replica.recover_routed(t, ballot(50, 1), 0, vec![key.clone()], vec![event("k", 1)]),
+            Ok(RoutedRecovery::NotWitnessed { redundant: false })
+        ));
+        assert_eq!(replica.unknown_promise(t), Some(ballot(50, 1)));
+
+        assert!(replica.invalidate(t, 0));
+        let cmd = replica.snapshot(t).expect("recorded");
+        assert!(cmd.invalidated());
+        assert_eq!(cmd.applied_conflict, Some(true));
+        assert!(cmd.keys.is_empty() && cmd.events.is_empty());
+        assert_eq!(cmd.promised, ballot(50, 1));
+        assert_eq!(
+            replica.preaccept(t, 0, vec![key.clone()], vec![event("k", 1)]),
+            Err(Refusal::Promised(ballot(50, 1)))
+        );
+        assert!(!replica.invalidate(t, 0), "invalidated once");
+
+        // One no recovery asked here is recorded at its own ballot.
+        let u = txn(30);
+        assert!(replica.invalidate(u, 0));
+        assert_eq!(replica.snapshot(u).expect("recorded").promised, Ballot(u.0));
+
+        // One refused for good keeps refusing the original coordinator, and
+        // no answer names the refusal's ballot.
+        let v = txn(40);
+        assert!(matches!(
+            replica.recover_unrouted(
+                v,
+                ballot(60, 1),
+                0,
+                vec![key.clone()],
+                vec![event("k", 1)],
+                RecoveryRound::Refuse,
+            ),
+            Ok(RoutedRecovery::NotWitnessed { redundant: false })
+        ));
+        assert!(replica.refused(v));
+        assert!(replica.invalidate(v, 0));
+        let promised = replica.snapshot(v).expect("recorded").promised;
+        assert!(Ballot(v.0) < promised && promised < ballot(41, 0));
+        assert_eq!(
+            replica.preaccept(v, 0, vec![key.clone()], vec![event("k", 1)]),
+            Err(Refusal::Promised(promised))
+        );
+        assert_eq!(
+            replica.accept(v, Ballot(v.0), 0, v.0, vec![], vec![key.clone()]),
+            Err(Refusal::Promised(promised))
+        );
+        assert!(matches!(
+            replica.recover(v, ballot(70, 1), 0, vec![], vec![]),
+            Ok(state) if state.known && state.execute_at == crate::message::INVALIDATED_AT
+        ));
+    }
+
     /// An invalidated command is applied as an abort without executing, is
     /// recognizable by its timestamp, and is no evidence in another
     /// transaction's recovery: its deps were never agreed.
@@ -2672,7 +2949,7 @@ mod tests {
             "kept once"
         );
 
-        assert!(replica.invalidate(t));
+        assert!(replica.invalidate(t, 0));
         let cmd = replica.snapshot(t).unwrap();
         assert!(cmd.invalidated());
         assert_eq!(cmd.applied_conflict, Some(true));
@@ -2692,7 +2969,7 @@ mod tests {
 
         // A committed command is never invalidated.
         replica.commit(x, 0, x.0, vec![], vec![event("k", 1)], vec![], NodeId(0));
-        assert!(!replica.invalidate(x));
+        assert!(!replica.invalidate(x, 0));
 
         // The route leaves with the command, into its decision record.
         replica.record_decision(x, true);
