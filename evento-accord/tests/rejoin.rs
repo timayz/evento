@@ -32,6 +32,8 @@ fn event(aggregate_id: &str, version: u16) -> Event {
 const R: usize = 2;
 /// The node it rejoins through.
 const CONTACT: NodeId = NodeId(0);
+/// Every replica's `collect_timeout`.
+const COLLECT_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Three real replicas `{0, 1, 2}` of one shard, each with a journal kept
 /// across a rejoin, plus the inboxes of an outside coordinator (node 9) and
@@ -89,7 +91,7 @@ impl Trio {
             Arc::clone(journal) as Arc<dyn Journal>,
         )
         .with_config(NodeConfig {
-            collect_timeout: Duration::from_secs(1),
+            collect_timeout: COLLECT_TIMEOUT,
             ..NodeConfig::default()
         })
     }
@@ -99,6 +101,14 @@ impl Trio {
     /// through [`CONTACT`] (`recover_state_for_join`, `begin_join`, `join`),
     /// on `clock`.
     async fn rejoin(&mut self, clock: Arc<HybridLogicalClock>) {
+        let node = self.reopen_joining(clock).await;
+        node.join(CONTACT).await.expect("rejoin from a snapshot");
+    }
+
+    /// [`rejoin`](Self::rejoin) up to the join itself, which the caller
+    /// makes: node `R` reopened joining over its kept journal and an empty
+    /// event store.
+    async fn reopen_joining(&mut self, clock: Arc<HybridLogicalClock>) -> Node {
         self.nodes[R].retire().await;
         self.loops[R].abort();
         let inbox = self.net.register(NodeId(R as u64));
@@ -109,9 +119,9 @@ impl Trio {
             .expect("recover the kept journal");
         node.begin_join();
         self.loops[R] = node.start(inbox);
-        node.join(CONTACT).await.expect("rejoin from a snapshot");
-        self.nodes[R] = node;
+        self.nodes[R] = node.clone();
         self.stores[R] = store;
+        node
     }
 
     /// What a host that missed the loss of node `R`'s event store does: a
@@ -513,4 +523,87 @@ async fn a_replica_with_a_lost_store_rejoins_after_compaction() {
         await_event(&t.stores[id], "acc-0", 2).await;
         await_event(&t.stores[id], "acc-1", 2).await;
     }
+}
+
+/// `R` had stopped waiting for the contact and compacted past it, then was
+/// told to rejoin before it heard the contact again: its kept journal still
+/// holds the contact absent, with that bound. The contact has caught up
+/// since. The join asks it to prove it holds what `R` compacted, and goes
+/// through it at once. Before, the join header's answer was taken for a
+/// message from a peer still behind: answered with `Rejoin` and dropped, the
+/// attempt timed out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rejoin_through_a_contact_it_gave_up_on_asks_it_for_proof_first() {
+    let mut t = Trio::start();
+    t.applied_baseline().await;
+    // Anti-entropy rounds: the contact's report is past its sync coverage.
+    for _ in 0..3 {
+        for node in &t.nodes {
+            node.sweep().await;
+        }
+    }
+    let compacted = Timestamp {
+        micros: 1,
+        logical: 0,
+        node: NodeId(1),
+    };
+    t.journals[R]
+        .save_rejoin_bounds(&[(CONTACT, compacted)])
+        .await
+        .unwrap();
+
+    let node = t
+        .reopen_joining(Arc::new(HybridLogicalClock::new(NodeId(R as u64))))
+        .await;
+    assert_eq!(node.absent_peers(), [CONTACT], "the kept journal's bound");
+    let started = std::time::Instant::now();
+    node.join(CONTACT)
+        .await
+        .expect("join through the contact it gave up on");
+    assert!(
+        started.elapsed() < COLLECT_TIMEOUT,
+        "the join waited out a timeout: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        node.absent_peers().is_empty(),
+        "the contact is counted again"
+    );
+    assert!(holds(&t.stores[R], "base", 1), "the snapshot is installed");
+}
+
+/// The same, but the contact cannot prove it: it reports nothing above what
+/// `R` compacted past it, so it may lack a write `R` dropped. `R`, which has
+/// discarded its store, must not copy the contact's — the write would be
+/// gone for good, held as a command nowhere — and joins through a replica it
+/// never gave up on instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rejoin_never_copies_a_contact_that_cannot_prove_what_was_compacted() {
+    let mut t = Trio::start();
+    t.applied_baseline().await;
+    let unprovable = Timestamp {
+        micros: system_micros() + 3_600_000_000,
+        logical: 0,
+        node: NodeId(1),
+    };
+    t.journals[R]
+        .save_rejoin_bounds(&[(CONTACT, unprovable)])
+        .await
+        .unwrap();
+
+    let node = t
+        .reopen_joining(Arc::new(HybridLogicalClock::new(NodeId(R as u64))))
+        .await;
+    let err = node
+        .join(CONTACT)
+        .await
+        .expect_err("a contact that cannot prove what was compacted past it");
+    assert!(
+        t.stores[R].committed_events().is_empty(),
+        "nothing of the contact's is installed: {err:#}"
+    );
+    node.join(NodeId(1))
+        .await
+        .expect("join through a replica it never gave up on");
+    assert!(holds(&t.stores[R], "base", 1), "the snapshot is installed");
 }
