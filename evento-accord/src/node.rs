@@ -2025,11 +2025,16 @@ impl Node {
         // Nor does a node still joining: it holds part of its state, and a
         // report it gossips would end its contact's hold on compaction — but
         // one a layout transition gives slots copies them meanwhile, and so
-        // joins.
+        // joins. It keeps learning the decided epochs: a new node hears of
+        // the change that adds it from a commit, which a lost frame takes
+        // away for good.
         if self.rejoin_required() {
             return;
         }
         if !self.bootstrapped.load(Ordering::Acquire) {
+            if self.topology.dynamic() {
+                self.fetch_metadata().await;
+            }
             self.copy_if_gaining().await;
             return;
         }
@@ -2271,6 +2276,30 @@ impl Node {
         }
     }
 
+    /// Metadata anti-entropy: pulls any entries above the installed epoch from
+    /// a rotating peer. Covers a node that missed the latest epochs entirely
+    /// (no local gap to detect) as well as one holding an uninstallable future
+    /// entry; the peer replies only if it has something newer.
+    async fn fetch_metadata(&self) {
+        let peers: Vec<NodeId> = self
+            .topology
+            .nodes()
+            .into_iter()
+            .filter(|&n| n != self.id)
+            .collect();
+        if !peers.is_empty() {
+            let next = self.metadata_turn.fetch_add(1, Ordering::Relaxed) as usize;
+            let peer = peers[next % peers.len()];
+            self.send(
+                peer,
+                Message::MetadataFetch {
+                    after_epoch: self.installed_epoch(),
+                },
+            )
+            .await;
+        }
+    }
+
     /// Control-plane sweep: converge the metadata log without operator action.
     ///
     /// 1. **Gap-fill** — if this node holds a decided entry it cannot install
@@ -2291,27 +2320,8 @@ impl Node {
             return;
         }
 
-        // (1) Metadata anti-entropy: pull any entries above our installed epoch from
-        // a rotating peer. Covers a node that missed the latest epochs entirely (no
-        // local gap to detect) as well as one holding an uninstallable future entry;
-        // the peer replies only if it has something newer.
-        let peers: Vec<NodeId> = self
-            .topology
-            .nodes()
-            .into_iter()
-            .filter(|&n| n != self.id)
-            .collect();
-        if !peers.is_empty() {
-            let next = self.metadata_turn.fetch_add(1, Ordering::Relaxed) as usize;
-            let peer = peers[next % peers.len()];
-            self.send(
-                peer,
-                Message::MetadataFetch {
-                    after_epoch: self.installed_epoch(),
-                },
-            )
-            .await;
-        }
+        // (1) Metadata anti-entropy.
+        self.fetch_metadata().await;
 
         // (2) Drive-to-completion: complete any accepted-but-uncommitted epoch.
         // Sort epochs so the order is deterministic (the in-memory map is a HashMap).
