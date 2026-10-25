@@ -410,7 +410,13 @@ refuses anything else before a vote, and a node never installs it.
     recovery of a transaction below its fence gets `Message::Amnesiac` — it holds
     nothing of it, may have voted for it before, and never will — which lets the
     recovery rule out a transaction only the lost replica could have helped decide
-    (a write that reached only a minority while the replica was away).
+    (a write that reached only a minority while the replica was away). One of a
+    transaction above the fence that it does not hold it answers at once as a
+    **late** replica would, as does any node still joining (#390): a journaled
+    promise and `Late` when asked, a refusal for good (`NotWitnessed`) when the
+    recovery asks for one, and a vote only once joined (a `Vote` round waits for
+    the snapshot). Buffered until the join, the question would wait on the
+    watermark the transaction pins, which the join itself waits on.
   - **Once joined it is an ordinary replica**, and a restart opens it plainly. It never
     votes for a transaction below its fence that it does not hold, and it **abstains
     from config Paxos** under this node id (`accord_config_votes_withheld_total`)

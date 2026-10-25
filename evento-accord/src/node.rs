@@ -3674,6 +3674,7 @@ impl Node {
         // While bootstrapping, buffer consensus messages for replay after the
         // snapshot is imported. Cluster-management messages (bootstrap + epoch
         // changes) pass through so the node can still sync and learn its layout.
+        let mut joiner_answers = false;
         if !Self::is_control(&env.message) {
             // A node joining over a lost journal answers a recovery of a
             // transaction below its fence at once: it holds nothing of it,
@@ -3683,13 +3684,20 @@ impl Node {
             if let Some(answer) = self.amnesiac_answer(&env.message) {
                 return vec![(env.from, answer)];
             }
-            // Flag check and push under one lock: `join` flips the flag and
-            // drains the buffer while holding it, so a message can never slip
-            // into the buffer after the drain (it would be lost forever).
-            let mut buffer = self.join_buffer.lock().expect("buffer poisoned");
-            if !self.bootstrapped.load(Ordering::Acquire) {
-                buffer.push(env);
-                return Vec::new();
+            // And one of a transaction it does not hold, above the fence or
+            // over a kept journal, as a late replica would (#390): handled
+            // below, not buffered — a vote excepted, which waits for the join.
+            joiner_answers = self.joiner_answers(&env.message);
+            if !joiner_answers {
+                // Flag check and push under one lock: `join` flips the flag
+                // and drains the buffer while holding it, so a message can
+                // never slip into the buffer after the drain (it would be
+                // lost forever).
+                let mut buffer = self.join_buffer.lock().expect("buffer poisoned");
+                if !self.bootstrapped.load(Ordering::Acquire) {
+                    buffer.push(env);
+                    return Vec::new();
+                }
             }
         }
 
@@ -4007,15 +4015,22 @@ impl Node {
                             // refusal (#337, `settle_late`) — a routed one
                             // handing it its shard's part (#377).
                             replica.set_coordinator_cutoff(self.coordinator_cutoff());
-                            replica.recover_round(
-                                txn,
-                                ballot,
-                                epoch,
-                                keys,
-                                events,
-                                round,
-                                route.is_some(),
-                            )
+                            if joiner_answers {
+                                // Still joining, this node answers for a
+                                // transaction it does not hold as a late
+                                // replica (#390).
+                                replica.recover_round_joining(txn, ballot, round)
+                            } else {
+                                replica.recover_round(
+                                    txn,
+                                    ballot,
+                                    epoch,
+                                    keys,
+                                    events,
+                                    round,
+                                    route.is_some(),
+                                )
+                            }
                         }
                     }
                 };
@@ -7280,6 +7295,44 @@ impl Node {
                 Some(Message::Amnesiac { txn, ballot })
             }
             _ => None,
+        }
+    }
+
+    /// Whether this node, still joining, answers `message` — a recovery of a
+    /// transaction it does not hold, routed or not — now, rather than
+    /// buffering the question until its join ends (#390). It has not voted
+    /// for the transaction (a node joining votes on nothing), so it answers
+    /// as a replica past the coordinator's deadline does
+    /// ([`Replica::recover_round_joining`]): asked, it promises the ballot
+    /// and says it is late, which the recovery settles with the shard's
+    /// other replicas — a refusal for good where that proves the transaction
+    /// never committed, which it gives at once, the PreAccept it may replay
+    /// after the join then meeting a fenced vote. Buffered, the question
+    /// would wait on the join; the join on the shard's watermark; and the
+    /// watermark on that very transaction, or on one whose read waits for
+    /// it. A vote is deferred: a `Vote` round is buffered, and pre-accepts
+    /// once the snapshot is in, as the buffered PreAccept would — refusing
+    /// for good instead would cost the shard a voter it may need, should
+    /// another replica lose its journal meanwhile. A transaction this node
+    /// holds — a rejoin over a kept journal voted for it — is buffered as
+    /// before, and reported once joined. One below an amnesia fence is
+    /// answered first (`amnesiac_answer`).
+    fn joiner_answers(&self, message: &Message) -> bool {
+        if !self.is_joining() {
+            return false;
+        }
+        let recovery = match message {
+            Message::Routed { inner, .. } => inner.as_ref(),
+            message => message,
+        };
+        match recovery {
+            Message::BeginRecovery { txn, round, .. } if *round != RecoveryRound::Vote => self
+                .replica
+                .lock()
+                .expect("replica poisoned")
+                .status(*txn)
+                .is_none(),
+            _ => false,
         }
     }
 

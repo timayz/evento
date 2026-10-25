@@ -1089,6 +1089,38 @@ impl Replica {
             .map(RoutedRecovery::Known)
     }
 
+    /// [`recover_round`](Self::recover_round) at a node still joining, for
+    /// `txn`, which it does not hold (#390). It has not voted for it, and
+    /// votes on nothing until joined, so it answers as a replica past the
+    /// deadline does: asked, it promises `ballot` and answers
+    /// [`Late`](RoutedRecovery::Late) — the recovery settles it with the
+    /// others of its shard, never waiting on the join; asked to refuse, it
+    /// refuses for good. A `Vote` round is not its to answer yet: the node
+    /// buffers it, and the replayed round pre-accepts once joined, as for a
+    /// late replica. A compacted transaction, or one below its vote fence, is
+    /// answered as usual.
+    pub fn recover_round_joining(
+        &mut self,
+        txn: TxnId,
+        ballot: Ballot,
+        round: RecoveryRound,
+    ) -> Result<RoutedRecovery, Ballot> {
+        if self.compacted(txn) {
+            return Ok(self.recorded(txn));
+        }
+        debug_assert!(
+            !self.commands.contains_key(&txn),
+            "a joiner answers for what it holds once joined"
+        );
+        if self.fenced(txn) {
+            return self.refuse_blind(txn, ballot);
+        }
+        match round {
+            RecoveryRound::Refuse => self.refuse_for_good(txn, ballot),
+            _ => self.promise_late(txn, ballot),
+        }
+    }
+
     /// Refuses `txn`, which this replica does not hold, for good: a
     /// recovery found it never committed if the late replicas refuse it, and
     /// asked this one to (see [`RecoveryRound::Refuse`]). The node journals

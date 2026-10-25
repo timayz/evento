@@ -25,7 +25,8 @@ use evento_accord::{
     AcceptorRecord, AmnesiaFence, Ballot, Clock, DataStore, DurableMark, DynamicTopology, Envelope,
     FenceNotCovered, HybridLogicalClock, InMemoryDataStore, InMemoryJournal, InMemoryNetwork,
     Joining, Journal, JournalRolledBack, Key, LostJournal, Message, MessageSink, Node, NodeConfig,
-    NodeId, OpenUnconfirmed, ShardedTopology, StaticTopology, Status, Timestamp, Topology, TxnId,
+    NodeId, OpenUnconfirmed, RecoveryRound, ShardedTopology, StaticTopology, Status, Timestamp,
+    Topology, TxnId,
 };
 use evento_core::Event;
 use tokio::sync::mpsc;
@@ -2089,6 +2090,181 @@ async fn a_joining_node_refuses_a_write() {
         Err(err) => assert!(err.is::<Joining>(), "refused for another reason: {err:#}"),
         Ok(outcome) => panic!("a joining node coordinated a write: {outcome:?}"),
     }
+}
+
+/// A node still joining answers a recovery of a transaction it does not
+/// hold at once, as a late replica would, rather than buffering the question
+/// until its join ends (#390): asked, it promises the ballot and says it is
+/// late; asked to refuse, it refuses for good, and the PreAccept it buffered,
+/// replayed after the join, is refused. Buffered, the question would wait on
+/// a join that may wait on the shard's watermark, which the transaction
+/// pins. Here T is above R's amnesia fence, so no `Amnesiac` answers for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joining_node_answers_a_recovery_of_what_it_never_witnessed() {
+    let mut c = Cluster::start(3);
+    c.baseline().await;
+    let join = c.reopen_amnesiac(R, A).await;
+    // A's report never reaches R: its join waits, as it would for a vouch
+    // the transaction below pins.
+    c.cut_off(A);
+    // Past the fence (three skews).
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        c.nodes[R as usize].is_joining(),
+        "R joined before T was asked about"
+    );
+    let e = event("acc", 1);
+    let txn = TxnId(Timestamp {
+        micros: system_micros(),
+        logical: 0,
+        node: NodeId(9),
+    });
+    let fence = c.nodes[R as usize]
+        .amnesia_fence()
+        .expect("R is fenced")
+        .fence_micros;
+    assert!(txn.0.micros > fence, "T is above the fence");
+    let ballot = Ballot(Timestamp {
+        logical: 1,
+        ..txn.0
+    });
+    let recovery = |round| Message::BeginRecovery {
+        txn,
+        ballot,
+        epoch: 0,
+        keys: vec![Key::of(&e)],
+        events: vec![e.clone()],
+        round,
+    };
+    // T's PreAccept reaches R first, buffered until its join ends.
+    c.send(
+        9,
+        R,
+        Message::PreAccept {
+            epoch: 0,
+            txn,
+            keys: vec![Key::of(&e)],
+            events: vec![e.clone()],
+        },
+    )
+    .await;
+    // A recovery asks R about T: late, at once — a promise, no vote.
+    c.send(9, R, recovery(RecoveryRound::Ask)).await;
+    c.expect_replies(1, "a late answer", |m| matches!(m, Message::Late { .. }))
+        .await;
+    assert!(
+        c.nodes[R as usize].is_joining(),
+        "the answer waited for the join"
+    );
+    // Asked to refuse T for good, it does, at once.
+    c.send(9, R, recovery(RecoveryRound::Refuse)).await;
+    c.expect_replies(1, "a refusal for good", |m| {
+        matches!(
+            m,
+            Message::NotWitnessed {
+                redundant: false,
+                ..
+            }
+        )
+    })
+    .await;
+    assert!(
+        c.nodes[R as usize].is_joining(),
+        "the refusal waited for the join"
+    );
+    // Joined, R replays the PreAccept, and refuses it: it never votes for T.
+    c.heal();
+    tokio::time::timeout(Duration::from_secs(20), join)
+        .await
+        .expect("R's join completes")
+        .unwrap()
+        .expect("joined");
+    let node = c.nodes[R as usize].clone();
+    await_until(
+        "the replayed PreAccept is refused as fenced",
+        Duration::from_secs(5),
+        move || node.metrics().votes_fenced >= 1,
+    )
+    .await;
+    assert_eq!(
+        c.nodes[R as usize].command_status(txn),
+        None,
+        "R voted for T after refusing it"
+    );
+    assert!(
+        next_within(&mut c.coordinator, Duration::from_millis(300))
+            .await
+            .is_none(),
+        "R answered T's PreAccept"
+    );
+}
+
+/// A recovery that asks a node still joining to vote for a transaction it
+/// never witnessed waits: the vote needs the snapshot the join installs
+/// first. The round is buffered, and once joined the node pre-accepts the
+/// part it was handed (#390) — a refusal for good instead would cost the
+/// shard a voter it may need, should another replica lose its journal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joining_node_votes_once_joined() {
+    // A wide skew bound, and a margin covering it: room to date T above the
+    // vouch R joins with — its contact's report, which lags the clock by
+    // the margin and passes R's fence (three skews) at the join — yet within
+    // the horizon a vote accepts (two skews ahead of the clock).
+    const SKEW: u64 = 200_000;
+    let mut c = Cluster::start_with(
+        3,
+        NodeConfig {
+            compaction_margin: Duration::from_millis(700),
+            ..config()
+        },
+        |id| Arc::new(HybridLogicalClock::new(id).with_max_skew(SKEW)),
+    );
+    c.baseline().await;
+    let join = c.reopen_amnesiac(R, A).await;
+    tokio::time::sleep(Duration::from_micros(2 * SKEW)).await;
+    assert!(c.nodes[R as usize].is_joining());
+    let e = event("acc", 1);
+    let txn = TxnId(Timestamp {
+        micros: system_micros() + SKEW + SKEW / 2,
+        logical: 0,
+        node: NodeId(9),
+    });
+    c.send(
+        9,
+        R,
+        Message::BeginRecovery {
+            txn,
+            ballot: Ballot(Timestamp {
+                logical: 1,
+                ..txn.0
+            }),
+            epoch: 0,
+            keys: vec![Key::of(&e)],
+            events: vec![e.clone()],
+            round: RecoveryRound::Vote,
+        },
+    )
+    .await;
+    assert!(
+        next_within(&mut c.coordinator, Duration::from_millis(100))
+            .await
+            .is_none(),
+        "R voted while joining"
+    );
+    assert!(c.nodes[R as usize].is_joining(), "R joined already");
+    tokio::time::timeout(Duration::from_secs(20), join)
+        .await
+        .expect("R's join completes")
+        .unwrap()
+        .expect("joined");
+    c.expect_replies(1, "a vote once joined", |m| {
+        matches!(m, Message::BeginRecoveryOk { known: true, .. })
+    })
+    .await;
+    assert!(
+        c.nodes[R as usize].command_status(txn) >= Some(Status::PreAccepted),
+        "R holds T"
+    );
 }
 
 /// R's disk is rolled back to an older copy of its journal, which lacks
