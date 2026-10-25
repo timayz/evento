@@ -74,6 +74,10 @@ pub struct Metrics {
     /// installed. A count that keeps rising means a transaction below the
     /// fence no replica can decide any more (see OPERATIONS §7).
     pub amnesia_joins_refused: AtomicU64,
+    /// Times a peer found this node's journal rolled back to an older copy
+    /// (#339): the node stops taking part until its host opens it again
+    /// over an empty journal and store, joining.
+    pub journals_rolled_back: AtomicU64,
     /// Votes refused for a transaction whose `t0` lies more than two clock
     /// skews past this node's clock: its coordinator's clock runs beyond the
     /// skew bound.
@@ -191,6 +195,11 @@ impl Metrics {
         self.amnesia_fences.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records a journal a peer found rolled back.
+    pub fn record_journal_rolled_back(&self) {
+        self.journals_rolled_back.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Records a join over a lost journal that no contact vouched for.
     pub fn record_amnesia_join_refused(&self) {
         self.amnesia_joins_refused.fetch_add(1, Ordering::Relaxed);
@@ -261,6 +270,7 @@ impl Metrics {
             dependencies_learned: self.dependencies_learned.load(Ordering::Relaxed),
             amnesia_fences: self.amnesia_fences.load(Ordering::Relaxed),
             amnesia_joins_refused: self.amnesia_joins_refused.load(Ordering::Relaxed),
+            journals_rolled_back: self.journals_rolled_back.load(Ordering::Relaxed),
             votes_future_dated: self.votes_future_dated.load(Ordering::Relaxed),
             config_votes_withheld: self.config_votes_withheld.load(Ordering::Relaxed),
             votes_retired: self.votes_retired.load(Ordering::Relaxed),
@@ -297,6 +307,7 @@ pub struct MetricsSnapshot {
     pub dependencies_learned: u64,
     pub amnesia_fences: u64,
     pub amnesia_joins_refused: u64,
+    pub journals_rolled_back: u64,
     pub votes_future_dated: u64,
     pub config_votes_withheld: u64,
     pub votes_retired: u64,
@@ -310,7 +321,7 @@ impl MetricsSnapshot {
     /// source of truth for both [`to_prometheus`](Self::to_prometheus) and
     /// [`to_prometheus_labeled`](Self::to_prometheus_labeled); add a counter here and
     /// both renderings pick it up.
-    fn counters(&self) -> [(&'static str, &'static str, u64); 27] {
+    fn counters(&self) -> [(&'static str, &'static str, u64); 28] {
         [
             (
                 "accord_writes_committed_total",
@@ -416,6 +427,11 @@ impl MetricsSnapshot {
                 "accord_amnesia_joins_refused_total",
                 "Joins over a lost journal that no contact vouched past the fence (nothing installed).",
                 self.amnesia_joins_refused,
+            ),
+            (
+                "accord_journals_rolled_back_total",
+                "Times a peer found this node's journal rolled back to an older copy.",
+                self.journals_rolled_back,
             ),
             (
                 "accord_votes_future_dated_total",

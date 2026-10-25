@@ -6,9 +6,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use evento_accord::{
-    Ballot, Clock, DataStore, Envelope, HybridLogicalClock, InMemoryDataStore, InMemoryJournal,
-    InMemoryNetwork, InMemorySink, Journal, Key, Message, MessageSink, Node, NodeConfig, NodeId,
-    RecoveryRound, ShardedTopology, StaticTopology, Status, Timestamp, Topology, TxnId,
+    Ballot, Clock, DataStore, DurableMark, Envelope, HybridLogicalClock, InMemoryDataStore,
+    InMemoryJournal, InMemoryNetwork, InMemorySink, Journal, Key, Message, MessageSink, Node,
+    NodeConfig, NodeId, RecoveryRound, ShardedTopology, StaticTopology, Status, Timestamp,
+    Topology, TxnId,
 };
 use evento_core::Event;
 use tokio::sync::mpsc;
@@ -1388,6 +1389,7 @@ impl Vouching {
                 Message::Watermark {
                     applied_through: applied,
                     applied,
+                    mark: DurableMark::default(),
                     fenced: None,
                     copied: None,
                     live_since: 0,

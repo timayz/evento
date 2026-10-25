@@ -40,8 +40,9 @@ pub mod transport;
 
 pub use api::{
     slot_of, snapshot_event_size, validate_layout, AcceptorRecord, AmnesiaFence, ConfigEntry,
-    DataStore, DecisionRecord, Drained, DynamicTopology, FenceRecord, Journal, Layout, MessageSink,
-    RegionId, ShardId, ShardMap, ShardedTopology, SnapshotPage, StaticTopology, Topology, SLOTS,
+    DataStore, DecisionRecord, Drained, DurableMark, DynamicTopology, FenceRecord, Journal, Layout,
+    MessageSink, RegionId, ShardId, ShardMap, ShardedTopology, SnapshotPage, StaticTopology,
+    Topology, SLOTS,
 };
 pub use clock::{Ballot, Clock, HybridLogicalClock, NodeId, Timestamp, TxnId, MAX_SKEW_MICROS};
 pub use executor::{AccordExecutor, ExecutorDataStore};
@@ -49,9 +50,9 @@ pub use failure_detector::FailureDetector;
 pub use message::{CommandState, Key, Message, RecoveryRound, Status};
 pub use metrics::{Metrics, MetricsSnapshot};
 pub use node::{
-    BacklogAtCap, CommandTooLarge, CommitOutcome, FenceNotCovered, LostJournal, Node, NodeClosed,
-    NodeConfig, PartialSnapshot, RejoinRequired, SweepPressure, TopologyChanging,
-    MAX_COMMAND_BYTES,
+    BacklogAtCap, CommandTooLarge, CommitOutcome, FenceNotCovered, JournalRolledBack, LostJournal,
+    Node, NodeClosed, NodeConfig, OpenUnconfirmed, PartialSnapshot, RejoinRequired, SweepPressure,
+    TopologyChanging, MAX_COMMAND_BYTES,
 };
 pub use store::{AppliedEntry, InMemoryDataStore, InMemoryJournal};
 pub use tcp::{serve, serve_tls, serve_tls_verified, PeerCerts, TcpTransport, TlsClient};

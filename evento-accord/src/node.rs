@@ -29,8 +29,8 @@ use tokio::time::{Duration, Instant};
 
 use crate::api::{
     floor_millis, slot_of, snapshot_event_size, stamp_events, validate_layout, AcceptorRecord,
-    AmnesiaFence, ConfigEntry, DataStore, Drained, FenceRecord, Journal, Layout, MessageSink,
-    ShardId, ShardMap, Topology,
+    AmnesiaFence, ConfigEntry, DataStore, Drained, DurableMark, FenceRecord, Journal, Layout,
+    MessageSink, ShardId, ShardMap, Topology,
 };
 use crate::clock::{Ballot, Clock, HybridLogicalClock, NodeId, Timestamp, TxnId};
 use crate::failure_detector::FailureDetector;
@@ -296,6 +296,40 @@ impl std::fmt::Display for RejoinRequired {
 }
 
 impl std::error::Error for RejoinRequired {}
+
+/// [`Node::write`] refused a new write: the node opened over a journal that
+/// holds something, and its peers have not confirmed yet that the journal is
+/// not an older copy of itself (#339, [`Node::confirmed`]). It takes no part
+/// meanwhile. Returned through `anyhow`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenUnconfirmed;
+
+impl std::fmt::Display for OpenUnconfirmed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("this node's peers have not confirmed its journal yet")
+    }
+}
+
+impl std::error::Error for OpenUnconfirmed {}
+
+/// [`Node::write`] refused a new write: a peer saw more of this node's
+/// journal than it holds — the journal was rolled back to an older copy
+/// (#339, [`Node::rolled_back`]). The node takes no part any more; its host
+/// opens it again over an empty journal and store, joining. Returned through
+/// `anyhow`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JournalRolledBack;
+
+impl std::fmt::Display for JournalRolledBack {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "this node's journal was rolled back to an older copy; \
+             it must be opened again over an empty journal and store, joining",
+        )
+    }
+}
+
+impl std::error::Error for JournalRolledBack {}
 
 /// A node's liveness signal ([`Node::sweep_pressure`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1370,6 +1404,48 @@ impl Node {
     /// does.
     pub fn rejoin_signal(&self) -> tokio::sync::watch::Receiver<bool> {
         self.rejoin_required.subscribe()
+    }
+
+    /// Whether a peer found this node's journal rolled back to an older copy
+    /// of itself (#339). Not detected yet.
+    pub fn rolled_back(&self) -> bool {
+        false
+    }
+
+    /// A watch that turns `true` when [`rolled_back`](Self::rolled_back)
+    /// does.
+    pub fn rolled_back_signal(&self) -> tokio::sync::watch::Receiver<bool> {
+        tokio::sync::watch::channel(false).1
+    }
+
+    /// Whether this node takes part (#339). Every open is, for now.
+    pub fn confirmed(&self) -> bool {
+        true
+    }
+
+    /// The highest [`DurableMark`] `peer` reported to this node (#339). None
+    /// is kept yet.
+    pub fn peer_mark(&self, _peer: NodeId) -> Option<DurableMark> {
+        None
+    }
+
+    /// What this node's journal durably holds (see [`DurableMark`]), as its
+    /// watermark reports carry it.
+    pub fn durable_mark(&self) -> DurableMark {
+        let life = self
+            .amnesia
+            .lock()
+            .expect("amnesia poisoned")
+            .map_or(0, |fence| fence.fence_micros);
+        DurableMark {
+            life,
+            clock_bound: self.clock_bound.load(Ordering::Acquire),
+            vote_fence: self
+                .replica
+                .lock()
+                .expect("replica poisoned")
+                .durable_fence(),
+        }
     }
 
     /// Locally-safe subscription watermark, in microseconds since the Unix epoch:
@@ -2732,6 +2808,7 @@ impl Node {
             Message::Watermark {
                 applied_through: mine,
                 applied,
+                mark: self.durable_mark(),
                 fenced,
                 copied,
                 live_since,
@@ -3019,6 +3096,7 @@ impl Node {
                 Message::Watermark {
                     applied_through: mine,
                     applied,
+                    mark: self.durable_mark(),
                     fenced: self.reportable_fence(),
                     copied: self.copied_report(),
                     live_since: self.live_since(),
@@ -3807,6 +3885,7 @@ impl Node {
             Message::Watermark {
                 applied_through,
                 applied,
+                mark: _,
                 fenced,
                 copied,
                 live_since,
@@ -6488,6 +6567,7 @@ impl Node {
                 Message::Watermark {
                     applied_through: mine,
                     applied,
+                    mark: self.durable_mark(),
                     fenced: self.reportable_fence(),
                     copied: self.copied_report(),
                     live_since,
@@ -7077,6 +7157,7 @@ impl Node {
                         Message::Watermark {
                             applied_through: Timestamp::MIN,
                             applied: Timestamp::MIN,
+                            mark: self.durable_mark(),
                             fenced: None,
                             copied: None,
                             live_since: self.live_since(),
@@ -10022,6 +10103,7 @@ mod tests {
                 node: NodeId(micros),
             },
             applied: Timestamp::MIN,
+            mark: crate::api::DurableMark::default(),
             fenced: None,
             copied: None,
             live_since: 0,

@@ -552,6 +552,69 @@ pub struct AmnesiaFence {
     pub joined: bool,
 }
 
+/// What a replica's journal durably holds that only ever rises (#339): its
+/// clock bound and its vote fence. Each is journaled before anything cut
+/// below it leaves the replica, and every watermark report carries both, so
+/// a journal reopened as it was left is never below a mark its peers saw. A
+/// lower one is a journal rolled back to an older copy: the replica forgot
+/// votes and promises it made since, and must not take part again under
+/// that journal.
+///
+/// A replica that lost its journal starts a new **life** under its node id
+/// (#312), whose bound and fence start over: its mark supersedes every mark
+/// of an earlier life, and a journal of an earlier life is rolled back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DurableMark {
+    /// The replica's life: its [`AmnesiaFence`]'s `fence_micros`, or 0
+    /// before it ever lost a journal.
+    pub life: u64,
+    /// The persisted clock bound, in microseconds (see
+    /// [`Journal::save_clock_bound`]).
+    pub clock_bound: u64,
+    /// The persisted vote fence (see [`Journal::save_vote_fence`]).
+    pub vote_fence: Timestamp,
+}
+
+impl Default for DurableMark {
+    /// The mark of a journal that holds nothing.
+    fn default() -> Self {
+        Self {
+            life: 0,
+            clock_bound: 0,
+            vote_fence: Timestamp::MIN,
+        }
+    }
+}
+
+impl DurableMark {
+    /// Whether a journal holding this mark lost nothing a peer saw of it as
+    /// `seen`: it is of a later life, or of the same and at or above it in
+    /// both parts.
+    pub fn covers(&self, seen: &DurableMark) -> bool {
+        match self.life.cmp(&seen.life) {
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Less => false,
+            std::cmp::Ordering::Equal => {
+                self.clock_bound >= seen.clock_bound && self.vote_fence >= seen.vote_fence
+            }
+        }
+    }
+
+    /// The highest of both marks: the later life's, or, of one life, the
+    /// highest part by part.
+    pub fn max(self, other: DurableMark) -> DurableMark {
+        match self.life.cmp(&other.life) {
+            std::cmp::Ordering::Greater => self,
+            std::cmp::Ordering::Less => other,
+            std::cmp::Ordering::Equal => DurableMark {
+                life: self.life,
+                clock_bound: self.clock_bound.max(other.clock_bound),
+                vote_fence: self.vote_fence.max(other.vote_fence),
+            },
+        }
+    }
+}
+
 /// Durable command log. Each replica persists its [`CommandState`] per
 /// transaction so it survives restarts and can be replayed during recovery.
 ///
@@ -717,6 +780,24 @@ pub trait Journal: Send + Sync + 'static {
     /// The persisted vote fence, if any. The default returns none.
     async fn load_vote_fence(&self) -> anyhow::Result<Option<Timestamp>> {
         Ok(None)
+    }
+
+    /// Buffers the highest [`DurableMark`] this replica saw from each peer
+    /// (#339), durable no later than the next [`flush`](Journal::flush),
+    /// replacing the previous set; survives [`truncate`](Journal::truncate).
+    /// A restarted replica answers a peer's open from them, so a peer that
+    /// reopens over an older copy of its journal is told it rolled back even
+    /// when every replica restarted. The default is a no-op: a restarted
+    /// replica then knows no peer's mark until it hears from it again, and
+    /// confirms any open it is asked about meanwhile.
+    async fn save_peer_marks(&self, marks: &[(NodeId, DurableMark)]) -> anyhow::Result<()> {
+        let _ = marks;
+        Ok(())
+    }
+
+    /// The persisted peer marks. The default returns none.
+    async fn load_peer_marks(&self) -> anyhow::Result<Vec<(NodeId, DurableMark)>> {
+        Ok(Vec::new())
     }
 
     /// Durably persists the [`AmnesiaFence`] of a replica that came back over
@@ -1380,6 +1461,35 @@ impl Topology for DynamicTopology {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A journal's mark covers what a peer saw only if it holds as much of
+    /// both parts, within one life; a later life covers every mark of an
+    /// earlier one, and an earlier life none of a later one (#339).
+    #[test]
+    fn a_durable_mark_covers_what_its_journal_held_within_a_life() {
+        let at = |micros| Timestamp {
+            micros,
+            logical: 0,
+            node: NodeId(0),
+        };
+        let mark = |life, clock_bound, fence| DurableMark {
+            life,
+            clock_bound,
+            vote_fence: at(fence),
+        };
+        let seen = mark(0, 500, 300);
+        assert!(seen.covers(&seen));
+        assert!(mark(0, 600, 300).covers(&seen));
+        assert!(!mark(0, 400, 900).covers(&seen), "a lower clock bound");
+        assert!(!mark(0, 900, 200).covers(&seen), "a lower vote fence");
+        assert!(mark(7, 1, 1).covers(&seen), "a later life");
+        assert!(!mark(0, 900, 900).covers(&mark(7, 1, 1)), "an earlier life");
+        assert!(DurableMark::default().covers(&DurableMark::default()));
+
+        assert_eq!(mark(0, 400, 900).max(seen), mark(0, 500, 900));
+        assert_eq!(seen.max(mark(7, 1, 1)), mark(7, 1, 1));
+        assert_eq!(mark(7, 1, 1).max(seen), mark(7, 1, 1));
+    }
 
     /// The default `snapshot_page` pages `snapshot()` with an offset cursor:
     /// stable pages, a `next` while anything remains, and a refusal of a
