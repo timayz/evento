@@ -3971,7 +3971,9 @@ impl Node {
                     // A layout change's fence: no pre-accept either, and the
                     // answer it makes ("never witnessed", for good) is a
                     // promise only a journaled fence keeps across a restart.
-                    let refused = (route.is_none() && !keys.is_empty())
+                    // Handed none of its keys, a replica pre-accepts nothing
+                    // whatever the fence.
+                    let refused = (!keys.is_empty())
                         .then(|| self.change_refusal(&replica, txn, epoch, &touched))
                         .flatten();
                     match refused {
@@ -3982,7 +3984,8 @@ impl Node {
                             // transaction this replica does not hold gets no
                             // vote on a first round: the recovery, once it
                             // heard every reply, asks for one or for a
-                            // refusal (#337, `settle_late`).
+                            // refusal (#337, `settle_late`) — a routed one
+                            // handing it its shard's part (#377).
                             replica.set_coordinator_cutoff(self.coordinator_cutoff());
                             replica.recover_round(
                                 txn,
@@ -3996,14 +3999,14 @@ impl Node {
                         }
                     }
                 };
-                // An unrouted recovery is told "never witnessed" only below the
-                // vote fence: an answer a recovery may count as this replica's
-                // refusal for good, so the fence it rests on must survive a
-                // restart — journaled with this batch, before the answer leaves
-                // (`stage_vote_fence`), and under the clock bound a journal
-                // that keeps no fence restarts it from (`bound_clock`).
-                let fenced = route.is_none()
-                    && matches!(reply, Ok(RoutedRecovery::NotWitnessed { redundant: false }));
+                // A recovery is told "never witnessed" only below the vote
+                // fence, or once refused for good: an answer a recovery counts
+                // as this replica's refusal for good, so the fence it rests on
+                // must survive a restart — journaled with this batch, before
+                // the answer leaves (`stage_vote_fence`), and under the clock
+                // bound a journal that keeps no fence restarts it from
+                // (`bound_clock`).
+                let fenced = matches!(reply, Ok(RoutedRecovery::NotWitnessed { redundant: false }));
                 if fenced {
                     self.metrics.record_vote_fenced();
                     if !self.bound_clock().await || self.stage_vote_fence().await.is_none() {
@@ -5753,7 +5756,7 @@ impl Node {
         txn: TxnId,
         ballot: Ballot,
         peers: &[NodeId],
-        reports: &mut [(NodeId, RecoverResp)],
+        reports: &mut Vec<(NodeId, RecoverResp)>,
     ) -> bool {
         if reports
             .iter()
@@ -5780,7 +5783,7 @@ impl Node {
         // nothing to do without its keys.
         if !self.never_commits(&plans, reports, true)
             || self
-                .settle_late(rx, layout, txn, ballot, &plans, &[], &[], reports)
+                .settle_late(rx, layout, txn, ballot, &plans, &[], &[], reports, None)
                 .await
                 .is_some()
             || !self.never_commits(&plans, reports, false)
@@ -6036,21 +6039,13 @@ impl Node {
                 },
             )
             .await;
-            let again = Self::collect_tagged(
-                rx,
-                blind.len(),
-                Self::after(self.settings.fast_timeout),
-                |m| Self::recover_report(m, ballot),
-            )
-            .await;
+            let again =
+                Self::collect_asked(rx, &blind, Self::after(self.settings.fast_timeout), ballot)
+                    .await;
             if let Some(promised) = Self::nack_in(&again) {
                 return Ok(Attempt::Retry(promised));
             }
-            for (from, report) in again {
-                if let Some(slot) = resp.iter_mut().find(|(n, _)| *n == from) {
-                    slot.1 = report;
-                }
-            }
+            Self::merge_reports(&mut resp, again);
         }
 
         let (plans, union) = Self::plan(layout, &all_keys, &all_events);
@@ -6068,6 +6063,7 @@ impl Node {
                 &all_keys,
                 &all_events,
                 &mut resp,
+                None,
             )
             .await
         {
@@ -6150,10 +6146,13 @@ impl Node {
     /// accepted it lost its journal — their votes may be what deciding it
     /// takes: they are asked to vote ([`RecoveryRound::Vote`]), which each
     /// does unless it vouched past it. Either way they are asked with every
-    /// key and event the reports revealed. Otherwise what the replicas not
-    /// heard from hold decides it, and a next attempt hears them: the late
-    /// ones are asked nothing, so a write too few replicas hold is not
-    /// committed on their votes. The promise a Nack names, if one came back.
+    /// key and event the reports revealed — wrapped in `route` for a
+    /// multi-shard transaction (#377), each replica taking its shard's
+    /// part; one whose shard's part no holder reported has nothing to vote
+    /// for, and is not asked to. Otherwise what the replicas not heard from
+    /// hold decides it, and a next attempt hears them: the late ones are
+    /// asked nothing, so a write too few replicas hold is not committed on
+    /// their votes. The promise a Nack names, if one came back.
     #[allow(clippy::too_many_arguments)]
     async fn settle_late(
         &self,
@@ -6164,9 +6163,10 @@ impl Node {
         plans: &[ShardPlan],
         keys: &[Key],
         events: &[Event],
-        resp: &mut [(NodeId, RecoverResp)],
+        resp: &mut Vec<(NodeId, RecoverResp)>,
+        route: Option<&[Key]>,
     ) -> Option<Ballot> {
-        let late: Vec<NodeId> = resp
+        let mut late: Vec<NodeId> = resp
             .iter()
             .filter(|(_, r)| matches!(r, RecoverResp::Late))
             .map(|(from, _)| *from)
@@ -6181,6 +6181,17 @@ impl Node {
         } else {
             return None;
         };
+        if round == RecoveryRound::Vote {
+            let (parts, _) = Self::plan(layout, keys, events);
+            late.retain(|node| {
+                parts
+                    .iter()
+                    .any(|part| part.replicas.contains(node) && !part.events.is_empty())
+            });
+            if late.is_empty() {
+                return None;
+            }
+        }
         tracing::debug!(
             node = self.id.0,
             ?txn,
@@ -6190,42 +6201,83 @@ impl Node {
         );
         self.broadcast(
             &late,
-            Message::BeginRecovery {
-                txn,
-                ballot,
-                epoch: layout.epoch(),
-                keys: keys.to_vec(),
-                events: events.to_vec(),
-                round,
-            },
+            Self::routed(
+                route,
+                Message::BeginRecovery {
+                    txn,
+                    ballot,
+                    epoch: layout.epoch(),
+                    keys: keys.to_vec(),
+                    events: events.to_vec(),
+                    round,
+                },
+            ),
         )
         .await;
-        let again = Self::collect_tagged(
-            rx,
-            late.len(),
-            Self::after(self.settings.fast_timeout),
-            |m| Self::recover_report(m, ballot),
-        )
-        .await;
+        // A routed round crosses shards: the slow-path budget, as its
+        // reports had.
+        let window = if route.is_some() {
+            self.settings.collect_timeout
+        } else {
+            self.settings.fast_timeout
+        };
+        let again = Self::collect_asked(rx, &late, Self::after(window), ballot).await;
         if let Some(promised) = Self::nack_in(&again) {
             return Some(promised);
         }
-        for (from, report) in again {
-            if let Some(slot) = resp.iter_mut().find(|(n, _)| *n == from) {
-                slot.1 = report;
-            }
-        }
+        Self::merge_reports(resp, again);
         None
     }
 
-    /// Whether the reports show `txn` may have committed: in a shard, the
-    /// replicas that accepted it make a slow quorum, or the electors that
-    /// pre-accepted it a fast one — a replica that lost its journal counted
-    /// as one that did ([`RecoverResp::Amnesiac`]). One past the deadline
-    /// never witnessed it, and one not heard from is heard on a next
-    /// attempt: neither counts.
+    /// Collects the reports answering `ballot` until every node in `asked`
+    /// answered, or `deadline` passed: one per responder, a straggler's to
+    /// an earlier round of the same attempt included (the first round may
+    /// have ended before it answered; counting it as an answer to this one
+    /// would leave the answer asked for unread).
+    async fn collect_asked(
+        rx: &mut mpsc::UnboundedReceiver<(NodeId, Message)>,
+        asked: &[NodeId],
+        deadline: Instant,
+        ballot: Ballot,
+    ) -> Vec<(NodeId, RecoverResp)> {
+        let mut out: Vec<(NodeId, RecoverResp)> = Vec::new();
+        let mut pending: HashSet<NodeId> = asked.iter().copied().collect();
+        while !pending.is_empty() {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some((from, message))) => {
+                    if let Some(report) = Self::recover_report(message, ballot) {
+                        if out.iter().all(|(n, _)| *n != from) {
+                            pending.remove(&from);
+                            out.push((from, report));
+                        }
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+        out
+    }
+
+    /// Puts a later round's reports in `resp`: a responder's newest answer
+    /// replaces its earlier one, a straggler's is added.
+    fn merge_reports(resp: &mut Vec<(NodeId, RecoverResp)>, again: Vec<(NodeId, RecoverResp)>) {
+        for (from, report) in again {
+            match resp.iter_mut().find(|(n, _)| *n == from) {
+                Some(slot) => slot.1 = report,
+                None => resp.push((from, report)),
+            }
+        }
+    }
+
+    /// Whether the reports show `txn` may have committed: in every shard it
+    /// touches (a commit needs a quorum of each), the replicas that
+    /// accepted it make a slow quorum, or the electors that pre-accepted it
+    /// a fast one — a replica that lost its journal counted as one that did
+    /// ([`RecoverResp::Amnesiac`]). One past the deadline never witnessed
+    /// it, one that promised the ballot holding nothing neither, and one
+    /// not heard from is heard on a next attempt: none counts.
     fn may_have_committed(&self, plans: &[ShardPlan], resp: &[(NodeId, RecoverResp)]) -> bool {
-        plans.iter().any(|plan| {
+        plans.iter().all(|plan| {
             let (mut accepted, mut electors) = (0, 0);
             for (from, report) in resp {
                 if !plan.replicas.contains(from) {
@@ -6432,12 +6484,80 @@ impl Node {
             ),
         )
         .await;
-        let resp = self.collect_route_reports(rx, &shards, ballot).await;
+        let mut resp = self.collect_route_reports(rx, &shards, ballot).await;
         if let Some(promised) = Self::nack_in(&resp) {
             return Ok(Attempt::Retry(promised));
         }
+        let mut verdict = self.route_verdict(&shards, &resp);
+        if matches!(verdict, Verdict::Undecided(_)) {
+            // Too few holders of some shard answered. The replicas that
+            // never witnessed it were handed none of its part — this node
+            // holds its own shard's at most — so they promised the ballot
+            // and hold nothing, or, past the deadline, are late. Hand each
+            // its shard's part, taken from a holder's report, so it votes
+            // (#377): the promised ones now, the late ones through the
+            // rounds the unrouted recovery settles them with (#337).
+            let (_, all_events) = self.reassemble(keys, events, &resp);
+            let (parts, _) = Self::plan(layout, route, &all_events);
+            let has_part = |node: NodeId| {
+                parts
+                    .iter()
+                    .any(|part| part.replicas.contains(&node) && !part.events.is_empty())
+            };
+            let promised: Vec<NodeId> = resp
+                .iter()
+                .filter(|(_, r)| matches!(r, RecoverResp::Ok(f) if !f.known))
+                .map(|(from, _)| *from)
+                .filter(|&node| has_part(node))
+                .collect();
+            if !promised.is_empty() {
+                self.broadcast(
+                    &promised,
+                    Self::routed(
+                        Some(route),
+                        Message::BeginRecovery {
+                            txn,
+                            ballot,
+                            epoch: layout.epoch(),
+                            keys: route.to_vec(),
+                            events: all_events.clone(),
+                            round: RecoveryRound::Ask,
+                        },
+                    ),
+                )
+                .await;
+                let again = Self::collect_asked(
+                    rx,
+                    &promised,
+                    Self::after(self.settings.collect_timeout),
+                    ballot,
+                )
+                .await;
+                if let Some(promised) = Self::nack_in(&again) {
+                    return Ok(Attempt::Retry(promised));
+                }
+                Self::merge_reports(&mut resp, again);
+            }
+            if let Some(promised) = self
+                .settle_late(
+                    rx,
+                    layout,
+                    txn,
+                    ballot,
+                    &parts,
+                    route,
+                    &all_events,
+                    &mut resp,
+                    Some(route),
+                )
+                .await
+            {
+                return Ok(Attempt::Retry(promised));
+            }
+            verdict = self.route_verdict(&shards, &resp);
+        }
 
-        let planned = match self.route_verdict(&shards, &resp) {
+        let planned = match verdict {
             Verdict::Undecided(why) => anyhow::bail!("recovery of {txn:?} undecided: {why}"),
             Verdict::Invalidate => {
                 tracing::debug!(
@@ -6544,8 +6664,15 @@ impl Node {
     /// for. A shard a known report shows committed is excepted: the
     /// decision exists, and a replica that applied it carries it.
     fn unreported_part(plans: &[ShardPlan], known: &[(NodeId, RecoverFields)]) -> Option<ShardId> {
-        let _ = (plans, known);
-        None
+        plans
+            .iter()
+            .find(|plan| {
+                plan.events.is_empty()
+                    && !known.iter().any(|(from, f)| {
+                        plan.replicas.contains(from) && f.status >= Status::Committed
+                    })
+            })
+            .map(|plan| plan.shard)
     }
 
     /// Whether a routed recovery has heard enough to decide: an invalidation

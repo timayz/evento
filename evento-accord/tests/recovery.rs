@@ -1008,6 +1008,10 @@ async fn a_restarted_replica_keeps_its_recovery_promise() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     let txn = txn.expect("shard A pre-accepted it");
+    // Past the coordinator's deadline, still a second before its frames
+    // land on shard B: its replicas there refuse the transaction for good
+    // (#377), each journaling the promise it rests on.
+    tokio::time::sleep(Duration::from_millis(400)).await;
 
     let outcome = tokio::time::timeout(Duration::from_secs(10), c.nodes[1].recover(txn))
         .await
