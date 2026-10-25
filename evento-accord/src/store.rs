@@ -210,6 +210,9 @@ pub struct InMemoryJournal {
     decisions: Mutex<BTreeMap<TxnId, DecisionRecord>>,
     /// The persisted clock bound (see [`Journal::save_clock_bound`]).
     clock_bound: Mutex<Option<u64>>,
+    /// The persisted vote fence (see [`Journal::save_vote_fence`]) — kept
+    /// across `truncate`.
+    vote_fence: Mutex<Option<Timestamp>>,
     /// The persisted amnesia fence (see [`Journal::save_amnesia_fence`]) —
     /// kept across `truncate`.
     amnesia_fence: Mutex<Option<AmnesiaFence>>,
@@ -291,6 +294,16 @@ impl Journal for InMemoryJournal {
 
     async fn load_clock_bound(&self) -> anyhow::Result<Option<u64>> {
         Ok(*self.clock_bound.lock().expect("journal poisoned"))
+    }
+
+    async fn save_vote_fence(&self, fence: Timestamp) -> anyhow::Result<()> {
+        let mut kept = self.vote_fence.lock().expect("journal poisoned");
+        *kept = Some(kept.map_or(fence, |kept| kept.max(fence)));
+        Ok(())
+    }
+
+    async fn load_vote_fence(&self) -> anyhow::Result<Option<Timestamp>> {
+        Ok(*self.vote_fence.lock().expect("journal poisoned"))
     }
 
     async fn save_amnesia_fence(&self, fence: &AmnesiaFence) -> anyhow::Result<()> {
