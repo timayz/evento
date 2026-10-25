@@ -618,6 +618,15 @@ backend (sql/fjall). Phases, in order:
   silent while nothing was compacted past it is simply counted again
   (`an_absent_peer_stops_holding_compaction_back`,
   `a_minority_never_drops_its_way_to_compaction`, `rejoin_bounds_survive_a_restart`).
+  A node that rejoins over its kept journal still holds its own bounds, so a
+  contact it gave up on must prove it before the join copies its state: the
+  joiner, about to discard its store, would otherwise take a store without a write
+  compacted past the contact, which no peer holds as a command any more. It sends
+  the contact `Message::Rejoin` first and waits for the report that counts it
+  again (`Node::await_reinstated`); asked straight for the join header, it would
+  screen the answer as a stale peer's and time out
+  (`a_rejoin_through_a_contact_it_gave_up_on_asks_it_for_proof_first`,
+  `a_rejoin_never_copies_a_contact_that_cannot_prove_what_was_compacted`).
   A rejoined node is counted again by its first report: the contact follows the
   join header with `Message::JoinProof` — its own report before the holds it keeps
   for joiners (below), taken in the same cut as
