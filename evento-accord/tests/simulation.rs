@@ -77,9 +77,9 @@ use common::journal::{FaultJournal, JournalFaults};
 use common::store::{FaultStore, Outcomes};
 use evento_accord::{
     DataStore, DynamicTopology, ExecutorDataStore, HybridLogicalClock, InMemoryDataStore,
-    InMemoryNetwork, Journal, Key, LinkFilter, Message, MessageFaults, MessageSink, Node,
+    InMemoryNetwork, Journal, Key, Layout, LinkFilter, Message, MessageFaults, MessageSink, Node,
     NodeConfig, NodeId, PartialSnapshot, StaticTopology, Status, Timestamp, Topology, TraceEntry,
-    TxnId, MAX_SKEW_MICROS,
+    TxnId, MAX_SKEW_MICROS, SLOTS,
 };
 use evento_core::metadata::Metadata;
 use evento_core::Event;
@@ -3842,7 +3842,9 @@ impl Sim {
     }
 
     /// Tears node `i` down and reopens it joining over its journal and an
-    /// empty store — its inbox running, its join and sweeps to come.
+    /// empty store — its inbox running, its join and sweeps to come. Over a
+    /// dynamic topology, the node keeps its own: the journal restores the
+    /// epochs it had installed.
     async fn reopen_joining(&mut self, i: usize) -> Result<(), String> {
         for t in &self.tasks[i] {
             t.abort();
@@ -3855,9 +3857,13 @@ impl Sim {
         // the node again: the faults are seeded rates, so one soon passes.
         let mut attempts = 0;
         let node = loop {
+            let topology: Arc<dyn Topology> = match self.dynamic.get(i) {
+                Some(topology) => Arc::clone(topology) as Arc<dyn Topology>,
+                None => Arc::new(Self::topology(id, &self.ids, &self.electorate)),
+            };
             let node = Node::new(
                 id,
-                Arc::new(Self::topology(id, &self.ids, &self.electorate)),
+                topology,
                 Arc::new(HybridLogicalClock::with_physical(
                     id,
                     virtual_micros(self.base),
@@ -5473,6 +5479,654 @@ async fn restart_after_an_import(mode: Restart) {
         version_of(&sim.stores[2], "acc").await,
         1,
         "node 2 lost T's write ({mode:?})"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Re-sharding under writes and faults (#288): replicas replaced, added and
+// removed, shards split and merged, members moved between shards — one
+// change after another, while clients write and nodes crash or are cut off.
+// ---------------------------------------------------------------------------
+
+const RESHARD_SALT: u64 = 0x7265_7368_6172_6421;
+
+/// A re-sharding run's shape, drawn from its seed.
+#[derive(Clone, Debug)]
+struct ReshardConfig {
+    /// The starting layout: this many shards of three.
+    shards: usize,
+    /// Nodes outside the starting layout, there to be added.
+    spares: usize,
+    /// How many changes the run drives, one after the other.
+    changes: usize,
+    /// A node crashes and heals, one at a time.
+    crash: bool,
+    /// A node is cut off and healed, one at a time.
+    partition: bool,
+    messages: Option<MessageFaults>,
+    aggs: usize,
+    clients: usize,
+    /// The fewest writes a client makes; it goes on while changes are
+    /// driven.
+    ops_each: usize,
+    /// The longest pause, in milliseconds, a client takes between writes.
+    max_pause: u64,
+    /// Within OPERATIONS.md's constraints.
+    config: NodeConfig,
+}
+
+impl ReshardConfig {
+    fn from_seed(seed: u64) -> Self {
+        let mut rng = StdRng::seed_from_u64(seed ^ RESHARD_SALT);
+        let messages = rng.random_bool(0.3).then(|| MessageFaults {
+            drop: rng.random_range(0.0..0.04),
+            duplicate: rng.random_range(0.0..0.04),
+            max_delay: Duration::from_millis(rng.random_range(0..30)),
+        });
+        let recovery_timeout = Duration::from_millis(rng.random_range(200..600));
+        let compaction_margin = recovery_timeout
+            + Duration::from_micros(2 * MAX_SKEW_MICROS)
+            + messages.map_or(Duration::ZERO, |m| m.max_delay)
+            + Duration::from_millis(rng.random_range(0..500));
+        let config = NodeConfig {
+            fast_timeout: Duration::from_millis(rng.random_range(30..100)),
+            collect_timeout: Duration::from_millis([500, 1000][rng.random_range(0..2)]),
+            recovery_interval: Duration::from_millis(rng.random_range(50..150)),
+            anti_entropy_interval: Duration::from_millis(rng.random_range(100..300))
+                .min(compaction_margin / 2),
+            recovery_timeout,
+            compaction_margin,
+            snapshot_page_events: [16, 4096][rng.random_range(0..2)],
+            ..NodeConfig::default()
+        };
+        ReshardConfig {
+            shards: rng.random_range(1..=2),
+            spares: rng.random_range(3..=6),
+            changes: rng.random_range(1..=3),
+            crash: rng.random_bool(0.4),
+            partition: rng.random_bool(0.4),
+            messages,
+            aggs: rng.random_range(2..=8),
+            clients: rng.random_range(1..=4),
+            ops_each: rng.random_range(6..=14),
+            max_pause: [20, 100, 300][rng.random_range(0..3)],
+            config,
+        }
+    }
+}
+
+/// A layout as a change names it: each shard's replicas.
+type Shards = Vec<Vec<NodeId>>;
+
+/// The layouts one change can move `layout` to, by kind of change: a replica
+/// replaced by a spare; a spare added; a replica removed from a shard of
+/// more than three; a shard of three spares split off; the last shard merged
+/// away, its slots going to the others; a replica moved to the next shard, a
+/// spare backfilling a shard of three it leaves. A node a change adds is the
+/// first of `spares`.
+fn reshard_options(layout: &[Vec<NodeId>], spares: &[NodeId]) -> Vec<Vec<Shards>> {
+    let shards = layout.len();
+    let (mut replace, mut add, mut remove, mut moves) = (vec![], vec![], vec![], vec![]);
+    for (shard, replicas) in layout.iter().enumerate() {
+        let to = (shard + 1) % shards;
+        for i in 0..replicas.len() {
+            if let Some(&spare) = spares.first() {
+                let mut next = layout.to_vec();
+                next[shard][i] = spare;
+                replace.push(next);
+            }
+            if replicas.len() > 3 {
+                let mut next = layout.to_vec();
+                next[shard].remove(i);
+                remove.push(next);
+            }
+            if to != shard && layout[to].len() < 5 && (replicas.len() > 3 || !spares.is_empty()) {
+                let mut next = layout.to_vec();
+                let moved = next[shard].remove(i);
+                next[to].push(moved);
+                if next[shard].len() < 3 {
+                    next[shard].push(spares[0]);
+                }
+                moves.push(next);
+            }
+        }
+        if let Some(&spare) = spares.first().filter(|_| replicas.len() < 5) {
+            let mut next = layout.to_vec();
+            next[shard].push(spare);
+            add.push(next);
+        }
+    }
+    let split = if spares.len() >= 3 && shards < 3 {
+        let mut next = layout.to_vec();
+        next.push(spares[..3].to_vec());
+        vec![next]
+    } else {
+        vec![]
+    };
+    let merge = if shards > 1 {
+        vec![layout[..shards - 1].to_vec()]
+    } else {
+        vec![]
+    };
+    vec![replace, add, remove, split, merge, moves]
+}
+
+/// Whether a change from `live` to `next` gives a node back a slot it
+/// replicated under a layout of `history` — a change refused until old
+/// owners collect the slots they give up.
+fn regains(live: &Layout, history: &[Arc<Layout>], next: &[Vec<NodeId>]) -> bool {
+    let map = live.map().rebalanced(next.to_vec());
+    (0..SLOTS).any(|slot| {
+        let before = &live.shards()[live.slots()[slot] as usize];
+        map.shards[map.slots[slot] as usize]
+            .iter()
+            .filter(|node| !before.contains(node))
+            .any(|node| {
+                history
+                    .iter()
+                    .any(|old| old.shards()[old.slots()[slot] as usize].contains(node))
+            })
+    })
+}
+
+/// The layout a seeded change moves `live` to: a kind of change drawn among
+/// those that apply, then one of its layouts, none that `regains` a slot.
+/// Takes the spares it adds from `spares`; a node it removes never comes
+/// back. `None` when no change applies.
+fn next_layout(
+    rng: &mut StdRng,
+    live: &Layout,
+    history: &[Arc<Layout>],
+    spares: &mut Vec<NodeId>,
+) -> Option<Shards> {
+    let mut options = reshard_options(live.shards(), spares);
+    for nexts in &mut options {
+        nexts.retain(|next| !regains(live, history, next));
+    }
+    options.retain(|nexts| !nexts.is_empty());
+    if options.is_empty() {
+        return None;
+    }
+    let nexts = &options[rng.random_range(0..options.len())];
+    let next = nexts[rng.random_range(0..nexts.len())].clone();
+    spares.retain(|spare| !next.iter().flatten().any(|node| node == spare));
+    Some(next)
+}
+
+/// What a re-sharding run found.
+#[derive(Debug, PartialEq, Eq)]
+struct ReshardRun {
+    /// A safety oracle's finding.
+    safety: Option<String>,
+    /// Why the healed cluster did not serve again, or did not converge.
+    liveness: Option<String>,
+    /// The changes that installed, of those drawn.
+    installed: usize,
+    /// The writes the clients saw commit.
+    acked: usize,
+    /// The run's execution trace.
+    hash: u64,
+}
+
+/// One re-sharding run of `seed` in `shape`: clients write while a driver
+/// moves the layout through the drawn changes and faults come and go; then,
+/// healed, the oracles: no split decision, split brain or double commit
+/// ([`safety_violation`]); every replica of the final layout holds each
+/// aggregate's committed versions, contiguous, the same events, stamped in
+/// version order, and none fewer than the clients saw commit; and a write to
+/// every aggregate goes through.
+async fn run_reshard(seed: u64, shape: &ReshardConfig) -> ReshardRun {
+    let start: Vec<Vec<NodeId>> = (0..shape.shards)
+        .map(|s| (0..3).map(|i| NodeId((3 * s + i) as u64)).collect())
+        .collect();
+    let n = (3 * shape.shards + shape.spares) as u64;
+    let mut sim = Sim::build_with(SimOptions {
+        config: shape.config,
+        dynamic: true,
+        layout: Some(start.clone()),
+        ..SimOptions::new(n)
+    });
+    let faults = Faults {
+        messages: shape.messages,
+        one_way: false,
+        storage: None,
+    };
+    faults.arm(&mut sim, seed);
+    let spares: Vec<NodeId> = (3 * shape.shards as u64..n).map(NodeId).collect();
+    for spare in &spares {
+        sim.nodes[spare.0 as usize].begin_join();
+    }
+    let layout = Arc::new(Mutex::new(start.clone()));
+    let down: Arc<Mutex<Option<NodeId>>> = Arc::new(Mutex::new(None));
+    let done = Arc::new(AtomicBool::new(false));
+    let driving = Arc::new(AtomicBool::new(true));
+    let mut rng = StdRng::seed_from_u64(seed);
+
+    // The driver: each change through a member that is up, then the new
+    // replicas join (a no-op for one that copied its slots).
+    let driver = {
+        let live = sim.live.clone();
+        let topologies = sim.dynamic.clone();
+        let layout = Arc::clone(&layout);
+        let down = Arc::clone(&down);
+        let mut rng = StdRng::seed_from_u64(rng.random());
+        let driving = Arc::clone(&driving);
+        let mut spares = spares.clone();
+        let changes = shape.changes;
+        tokio::spawn(async move {
+            let mut installed = 0;
+            for _ in 0..changes {
+                tokio::time::sleep(Duration::from_millis(rng.random_range(50..500))).await;
+                let known: Vec<NodeId> = layout.lock().unwrap().iter().flatten().copied().collect();
+                let up = *down.lock().unwrap();
+                let Some(driver) = known.into_iter().find(|&m| Some(m) != up) else {
+                    continue;
+                };
+                // The layout as the driver has it installed: a change the
+                // sweep completed after the driver gave up waiting is in.
+                let topology = &topologies[driver.0 as usize];
+                let current = topology.layout();
+                *layout.lock().unwrap() = current.shards().to_vec();
+                let history: Vec<Arc<Layout>> = (0..current.epoch())
+                    .filter_map(|epoch| topology.layout_at(epoch))
+                    .collect();
+                let Some(next) = next_layout(&mut rng, &current, &history, &mut spares) else {
+                    continue;
+                };
+                let members = current.nodes();
+                let epoch = current.epoch() + 1;
+                let node = live.node(driver.0 as usize);
+                match tokio::time::timeout(
+                    Duration::from_secs(60),
+                    node.change_topology(epoch, next.clone()),
+                )
+                .await
+                {
+                    Ok(Ok(layout_now)) => {
+                        installed += 1;
+                        *layout.lock().unwrap() = layout_now.clone();
+                        for (shard, replicas) in layout_now.iter().enumerate() {
+                            for &new in replicas.iter().filter(|r| !members.contains(r)) {
+                                let contacts: Vec<NodeId> = layout_now[shard]
+                                    .iter()
+                                    .copied()
+                                    .filter(|c| members.contains(c))
+                                    .collect();
+                                // Through each contact in turn: one may be
+                                // down. Settling joins it if all of them
+                                // fail, or one fails it partway.
+                                let joiner = live.node(new.0 as usize);
+                                for attempt in 0..6 {
+                                    if !joiner.is_joining() {
+                                        break;
+                                    }
+                                    let contact = contacts
+                                        .get(attempt % contacts.len().max(1))
+                                        .copied()
+                                        .unwrap_or(new);
+                                    match joiner.join(contact).await {
+                                        Ok(_) => break,
+                                        Err(err) if err.is::<PartialSnapshot>() => break,
+                                        Err(_) => {}
+                                    }
+                                    tokio::time::sleep(Duration::from_millis(200)).await;
+                                }
+                            }
+                        }
+                    }
+                    // Not decided (a quorum cut off), or still draining:
+                    // the sweep installs it, which the next change waits
+                    // for, so as not to replace it at once.
+                    Ok(Err(_)) | Err(_) => {
+                        for _ in 0..3_000 {
+                            if topology.layout().shards() == next.as_slice() {
+                                installed += 1;
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    }
+                }
+            }
+            driving.store(false, Ordering::Relaxed);
+            installed
+        })
+    };
+
+    // Faults: one node at a time crashes, or is cut off, and comes back.
+    let faulting = (shape.crash || shape.partition).then(|| {
+        let net = Arc::clone(&sim.net);
+        let layout = Arc::clone(&layout);
+        let down = Arc::clone(&down);
+        let done = Arc::clone(&done);
+        let mut rng = StdRng::seed_from_u64(rng.random());
+        let (crash, partition) = (shape.crash, shape.partition);
+        tokio::spawn(async move {
+            while !done.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(rng.random_range(100..800))).await;
+                let members: Vec<NodeId> =
+                    layout.lock().unwrap().iter().flatten().copied().collect();
+                let victim = members[rng.random_range(0..members.len())];
+                let cut = partition && (!crash || rng.random_bool(0.5));
+                *down.lock().unwrap() = Some(victim);
+                if cut {
+                    for &other in &members {
+                        if other != victim {
+                            net.partition(victim, other);
+                        }
+                    }
+                } else {
+                    net.crash(victim);
+                }
+                tokio::time::sleep(Duration::from_millis(rng.random_range(100..1500))).await;
+                if cut {
+                    net.heal_all_partitions();
+                } else {
+                    net.heal(victim);
+                }
+                *down.lock().unwrap() = None;
+            }
+        })
+    });
+
+    // Clients: each writes a seeded aggregate through a seeded member, at its
+    // next version as that member sees it, until the driver is done; a write
+    // that spans two aggregates now and then crosses shards.
+    let history: History = Arc::new(Mutex::new(Vec::new()));
+    let seq = Arc::new(AtomicU64::new(1));
+    let mut clients = Vec::new();
+    for _ in 0..shape.clients {
+        let live = sim.live.clone();
+        let layout = Arc::clone(&layout);
+        let history = Arc::clone(&history);
+        let seq = Arc::clone(&seq);
+        let driving = Arc::clone(&driving);
+        let mut rng = StdRng::seed_from_u64(rng.random());
+        let (aggs, ops, max_pause) = (shape.aggs, shape.ops_each, shape.max_pause);
+        clients.push(tokio::spawn(async move {
+            for op in 0.. {
+                if op >= ops && !driving.load(Ordering::Relaxed) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(rng.random_range(0..=max_pause))).await;
+                let members: Vec<NodeId> =
+                    layout.lock().unwrap().iter().flatten().copied().collect();
+                let at = members[rng.random_range(0..members.len())].0 as usize;
+                let (node, store) = live.get(at);
+                let mut targets = vec![format!("a{}", rng.random_range(0..aggs))];
+                if rng.random_bool(0.3) {
+                    let other = format!("a{}", rng.random_range(0..aggs));
+                    if !targets.contains(&other) {
+                        targets.push(other);
+                    }
+                }
+                let mut events = Vec::new();
+                let mut versions = Vec::new();
+                for agg in &targets {
+                    let version = version_of(&store, agg).await + 1;
+                    events.push(event(agg, version, seq.fetch_add(1, Ordering::Relaxed)));
+                    versions.push((agg.clone(), version));
+                }
+                if let Ok(Ok(outcome)) =
+                    tokio::time::timeout(Duration::from_secs(3), node.write(events)).await
+                {
+                    let mut history = history.lock().unwrap();
+                    for (agg, version) in versions {
+                        history.push(WriteRecord {
+                            agg,
+                            version,
+                            committed: !outcome.conflict,
+                        });
+                    }
+                }
+            }
+        }));
+    }
+    for client in clients {
+        let _ = client.await;
+    }
+    let installed = driver.await.unwrap_or(0);
+    done.store(true, Ordering::Relaxed);
+    if let Some(faulting) = faulting {
+        let _ = faulting.await;
+    }
+    sim.heal_all();
+
+    let records = history.lock().unwrap().clone();
+    let mut run = ReshardRun {
+        safety: None,
+        liveness: None,
+        installed,
+        acked: records.iter().filter(|r| r.committed).count(),
+        hash: 0,
+    };
+    // The cluster settles: a change left draining installs, and every
+    // replica of the layout it ends on reaches its epoch — but one still
+    // joining, which learns no epoch until it joins, below. Settled once the
+    // highest epoch has held for five seconds — longer than a drain.
+    let mut final_layout: Option<Vec<Vec<NodeId>>> = None;
+    let mut held = (0u64, tokio::time::Instant::now());
+    for _ in 0..3_000 {
+        let (top, at) = (0..sim.dynamic.len())
+            .map(|i| (sim.dynamic[i].epoch(), i))
+            .max()
+            .expect("nodes");
+        let installed = sim.dynamic[at].layout().shards().to_vec();
+        let all_there = installed
+            .iter()
+            .flatten()
+            .filter(|m| !sim.nodes[m.0 as usize].is_joining())
+            .all(|m| sim.dynamic[m.0 as usize].epoch() == top);
+        if top != held.0 {
+            held = (top, tokio::time::Instant::now());
+        } else if all_there && held.1.elapsed() >= Duration::from_secs(5) {
+            final_layout = Some(installed);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let Some(final_layout) = final_layout else {
+        run.liveness = Some("the cluster never settled on one epoch".into());
+        run.hash = sim.trace().hash;
+        return run;
+    };
+    // A replica added at once whose joins failed, or that a change the
+    // sweep completed added, joins now — through each replica of its shard
+    // in turn, reopened over an empty store first if a join left part of a
+    // snapshot in it (`PartialSnapshot`), as its host would.
+    for replicas in &final_layout {
+        for &m in replicas {
+            let i = m.0 as usize;
+            let contacts: Vec<NodeId> = replicas.iter().copied().filter(|&c| c != m).collect();
+            let mut reopened = false;
+            for attempt in 0..2 * contacts.len() {
+                if !sim.nodes[i].is_joining() {
+                    break;
+                }
+                if !sim.stores[i].committed_events().is_empty() {
+                    if let Err(err) = sim.reopen_joining(i).await {
+                        run.liveness = Some(err);
+                        run.hash = sim.trace().hash;
+                        return run;
+                    }
+                    reopened = true;
+                }
+                let node = sim.nodes[i].clone();
+                if node.join(contacts[attempt % contacts.len()]).await.is_ok() && reopened {
+                    sim.tasks[i].push(node.start_recovery());
+                }
+            }
+            if sim.nodes[i].is_joining() {
+                run.liveness = Some(format!("{m:?} never joined, through any of {replicas:?}"));
+                run.hash = sim.trace().hash;
+                return run;
+            }
+        }
+    }
+
+    run.safety = safety_violation(&sim, &records);
+    if run.safety.is_none() {
+        run.safety = reshard_violation(&sim, &final_layout, &records).await;
+    }
+    if run.safety.is_none() {
+        run.liveness = reshard_live(&sim, &final_layout, shape.aggs).await.err();
+    }
+    run.hash = sim.trace().hash;
+    run
+}
+
+/// Every replica of the final layout holds each aggregate's committed
+/// versions — contiguous from 1, none fewer than the clients saw commit —
+/// as the same events, stamped in version order. Waits for anti-entropy to
+/// bring a lagging replica in first.
+async fn reshard_violation(
+    sim: &Sim,
+    layout: &[Vec<NodeId>],
+    history: &[WriteRecord],
+) -> Option<String> {
+    // The final layout's slot table is its members': read it from one.
+    let probe = sim.dynamic[layout[0][0].0 as usize].layout();
+    let acked = acked_versions(history);
+    for (agg, &max) in &acked {
+        let owners = probe.replicas(&Key(agg.clone())).to_vec();
+        let mut last = String::new();
+        let mut agreed = false;
+        for _ in 0..1_500 {
+            let mut held: Vec<Vec<u64>> = Vec::new();
+            for owner in &owners {
+                held.push(sim.stores[owner.0 as usize].events_of(agg));
+            }
+            let first = &held[0];
+            if held.iter().all(|h| h == first) && first.len() >= max as usize {
+                agreed = true;
+                break;
+            }
+            last = format!("{agg}: owners {owners:?} hold {held:?}, {max} acked");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        if !agreed {
+            return Some(format!(
+                "a replica of the final layout lacks writes: {last}"
+            ));
+        }
+        for owner in &owners {
+            let store = &sim.stores[owner.0 as usize];
+            let events = match store.data_store().snapshot().await {
+                Ok(events) => events,
+                Err(err) => return Some(format!("{owner:?}'s store: {err:#}")),
+            };
+            let mut mine: Vec<&Event> = events.iter().filter(|e| &e.aggregate_id == agg).collect();
+            mine.sort_by_key(|e| e.version);
+            for (i, e) in mine.iter().enumerate() {
+                if e.version as usize != i + 1 {
+                    return Some(format!(
+                        "{owner:?}: {agg} versions not contiguous at {}",
+                        e.version
+                    ));
+                }
+            }
+            for pair in mine.windows(2) {
+                let stamp = |e: &Event| (e.timestamp, e.timestamp_subsec);
+                if stamp(pair[1]) < stamp(pair[0]) {
+                    return Some(format!(
+                        "{owner:?}: {agg} v{} stamped before v{}",
+                        pair[1].version, pair[0].version
+                    ));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Healed, a write to every aggregate goes through a replica of the final
+/// layout.
+async fn reshard_live(sim: &Sim, layout: &[Vec<NodeId>], aggs: usize) -> Result<(), String> {
+    let members: Vec<NodeId> = layout.iter().flatten().copied().collect();
+    for i in 0..aggs {
+        let agg = format!("a{i}");
+        let mut last = String::from("no attempt");
+        let mut wrote = false;
+        for attempt in 0..20u64 {
+            let at = members[(attempt as usize + i) % members.len()].0 as usize;
+            let (node, store) = sim.live.get(at);
+            let version = version_of(&store, &agg).await + 1;
+            match tokio::time::timeout(
+                Duration::from_secs(3),
+                node.write(vec![event(
+                    &agg,
+                    version,
+                    3_000_000 + 100 * i as u64 + attempt,
+                )]),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {
+                    wrote = true;
+                    break;
+                }
+                Ok(Err(err)) => last = format!("{err:#}"),
+                Err(_) => last = "timed out".into(),
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        if !wrote {
+            return Err(format!("no write to {agg} went through: {last}"));
+        }
+    }
+    Ok(())
+}
+
+/// Re-sharding under writes and faults, over a fixed range of seeds.
+#[tokio::test(start_paused = true)]
+async fn resharding_keeps_every_write() {
+    for (seed, _replay) in sim_seeds("resharding_keeps_every_write", 0..6) {
+        let shape = ReshardConfig::from_seed(seed);
+        let run = run_reshard(seed, &shape).await;
+        eprintln!(
+            "reshard seed {seed}: {} of {} changes installed, {} writes acked \
+             ({} shards, {} spares)",
+            run.installed, shape.changes, run.acked, shape.shards, shape.spares
+        );
+        assert!(
+            run.safety.is_none() && run.liveness.is_none(),
+            "seed {seed} ({shape:?}): {run:?}"
+        );
+    }
+}
+
+/// A re-sharding run is bit-reproducible: two runs of a seed take the same
+/// execution trace.
+#[tokio::test(start_paused = true)]
+async fn resharding_is_bit_reproducible() {
+    for (seed, _replay) in sim_seeds("resharding_is_bit_reproducible", 0..2) {
+        let shape = ReshardConfig::from_seed(seed);
+        let first = run_reshard(seed, &shape).await;
+        let second = run_reshard(seed, &shape).await;
+        assert_eq!(first, second, "seed {seed}: two runs diverged");
+    }
+}
+
+/// Fresh re-sharding seeds, for the nightly job (`SIM_SEEDS`, `SIM_DURATION`).
+#[tokio::test(start_paused = true)]
+#[ignore = "re-sharding swarm: run explicitly, with SIM_SEEDS or SIM_DURATION for fresh seeds"]
+async fn reshard_swarm() {
+    let (mut runs, mut drawn, mut installed, mut acked) = (0, 0, 0, 0);
+    for (seed, _replay) in sim_seeds("reshard_swarm", 0..64) {
+        let shape = ReshardConfig::from_seed(seed);
+        let run = run_reshard(seed, &shape).await;
+        assert!(
+            run.safety.is_none() && run.liveness.is_none(),
+            "reshard seed {seed} ({shape:?}): {run:?}"
+        );
+        runs += 1;
+        drawn += shape.changes;
+        installed += run.installed;
+        acked += run.acked;
+    }
+    eprintln!(
+        "reshard swarm: {runs} seeds with no violation, {installed} of {drawn} changes \
+         installed, {acked} writes acked"
     );
 }
 

@@ -2,8 +2,11 @@ name: Nightly
 
 # Swarm testing of evento-accord's deterministic simulator (#319): fresh
 # random seeds, each drawing its own cluster, faults, store, workload and
-# NodeConfig, for a fixed time. A failing seed is reported on an issue with
-# the one line that replays it locally.
+# NodeConfig, for a fixed time — then the re-sharding swarm (#288), whose
+# seeds move the layout through replacements, additions, removals, splits,
+# merges and members moving between shards under writes and faults. A
+# failing seed is reported on an issue with the one line that replays it
+# locally.
 
 on:
   schedule:
@@ -13,6 +16,9 @@ on:
       duration:
         description: Seconds of fresh seeds
         default: "2700"
+      reshard_duration:
+        description: Seconds of fresh re-sharding seeds
+        default: "900"
       plant_failure:
         description: A seed to run first and fail on purpose, to exercise the reporting (opens or comments on the issue)
         default: ""
@@ -28,7 +34,7 @@ concurrency:
 jobs:
   swarm:
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
 
@@ -49,15 +55,24 @@ jobs:
           cargo test -p evento-accord --release --test simulation swarm \
             -- --exact --ignored --nocapture 2>&1 | tee swarm.log
 
+      - name: Re-sharding swarm
+        id: reshard
+        env:
+          SIM_DURATION: ${{ inputs.reshard_duration || '900' }}
+        run: |
+          set -o pipefail
+          cargo test -p evento-accord --release --test simulation reshard_swarm \
+            -- --exact --ignored --nocapture 2>&1 | tee -a swarm.log
+
       - name: Report the failing seed
-        if: failure() && steps.swarm.outcome == 'failure'
+        if: failure() && (steps.swarm.outcome == 'failure' || steps.reshard.outcome == 'failure')
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           title="accord: nightly simulation failure"
           replay=$(grep -m1 '^replay: ' swarm.log | sed 's/^replay: //' || true)
-          config=$(grep -m1 '^swarm config: ' swarm.log || true)
+          config=$(grep -m1 '^swarm config: \|^reshard seed ' swarm.log || true)
           {
             echo "The nightly swarm failed: $RUN_URL"
             echo

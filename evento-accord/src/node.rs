@@ -5958,6 +5958,13 @@ impl Node {
         Ok(txn)
     }
 
+    /// Whether this node is still joining: opened with
+    /// [`begin_join`](Node::begin_join), and neither joined yet nor holding
+    /// the slots a layout transition gave it.
+    pub fn is_joining(&self) -> bool {
+        !self.bootstrapped.load(Ordering::Acquire)
+    }
+
     /// Marks this node as joining: until [`join`](Node::join) completes,
     /// consensus messages are buffered rather than processed. Call this before
     /// the epoch that adds this node is installed, so nothing is lost in the gap.
