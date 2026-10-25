@@ -9913,7 +9913,8 @@ mod tests {
     use crate::{api::MessageSink, Envelope, StaticTopology};
     use tokio::time::Duration;
 
-    use super::{Node, NodeConfig};
+    use super::{Node, NodeConfig, RecoverFields, RecoverResp};
+    use crate::clock::Ballot;
 
     /// A failed read's reason is cut short on a character boundary, keeping
     /// the start of the error chain.
@@ -10886,6 +10887,168 @@ mod tests {
             matches!(node.route_verdict(&plans, &resp), Verdict::Invalidate),
             "a slow quorum of the planned shard never witnessed it"
         );
+    }
+
+    /// A report builder for the routed tallies below: a replica holding
+    /// the transaction at `status`, with `events` as its shard's part.
+    fn holder(status: Status, events: Vec<Event>) -> RecoverResp {
+        RecoverResp::Ok(fields(status, events))
+    }
+
+    /// [`holder`]'s report.
+    fn fields(status: Status, events: Vec<Event>) -> RecoverFields {
+        RecoverFields {
+            epoch: 0,
+            known: true,
+            status,
+            accepted: Ballot(Timestamp::MIN),
+            execute_at: Timestamp::MIN,
+            deps: Vec::new(),
+            superseding_rejects: false,
+            wait: false,
+            keys: events.iter().map(Key::of).collect(),
+            events,
+            route: None,
+        }
+    }
+
+    /// A replica that holds nothing of the transaction and promised the
+    /// ballot, waiting to be handed its part (#377).
+    fn promised() -> RecoverResp {
+        RecoverResp::Ok(RecoverFields {
+            epoch: 0,
+            known: false,
+            status: Status::PreAccepted,
+            accepted: Ballot(Timestamp::MIN),
+            execute_at: Timestamp::MIN,
+            deps: Vec::new(),
+            superseding_rejects: false,
+            wait: false,
+            keys: Vec::new(),
+            events: Vec::new(),
+            route: None,
+        })
+    }
+
+    /// Two replicas of a shard that promised the ballot and hold nothing
+    /// are no proof the transaction never committed: each can still vote
+    /// once handed its part (#377). Only a fenced or refused answer counts.
+    #[tokio::test]
+    async fn a_promised_replica_never_rules_a_commit_out() {
+        use super::Verdict;
+
+        let (node, _topology, events) = reshardable_node();
+        let keys = Node::keys_of(&events);
+        let (plans, _) = Node::plan(&node.topology.layout(), &keys, &[]);
+        let resp = vec![
+            (NodeId(0), holder(Status::PreAccepted, Vec::new())),
+            (NodeId(1), promised()),
+            (NodeId(2), promised()),
+            (NodeId(3), holder(Status::PreAccepted, Vec::new())),
+            (NodeId(4), holder(Status::PreAccepted, Vec::new())),
+            (NodeId(5), holder(Status::PreAccepted, Vec::new())),
+        ];
+        assert!(node.route_settled(&plans, &resp), "every replica answered");
+        assert!(
+            matches!(node.route_verdict(&plans, &resp), Verdict::Undecided(_)),
+            "a promise alone proves nothing"
+        );
+        assert!(!node.never_commits(&plans, &resp, true));
+    }
+
+    /// Two late replicas of a shard of three would, refusing for good,
+    /// prove the transaction never committed there: the recovery asks them
+    /// to (#377). Until they did, nothing is decided.
+    #[tokio::test]
+    async fn late_replicas_are_refused_when_that_proves_no_commit() {
+        use super::Verdict;
+
+        let (node, _topology, events) = reshardable_node();
+        let keys = Node::keys_of(&events);
+        let (plans, _) = Node::plan(&node.topology.layout(), &keys, &[]);
+        let mut resp = vec![
+            (NodeId(0), holder(Status::PreAccepted, Vec::new())),
+            (NodeId(1), RecoverResp::Late),
+            (NodeId(2), RecoverResp::Late),
+            (NodeId(3), holder(Status::PreAccepted, Vec::new())),
+            (NodeId(4), holder(Status::PreAccepted, Vec::new())),
+            (NodeId(5), holder(Status::PreAccepted, Vec::new())),
+        ];
+        assert!(node.route_settled(&plans, &resp));
+        assert!(matches!(
+            node.route_verdict(&plans, &resp),
+            Verdict::Undecided(_)
+        ));
+        assert!(!node.never_commits(&plans, &resp, false));
+        assert!(
+            node.never_commits(&plans, &resp, true),
+            "refused, the late replicas meet every quorum of their shard"
+        );
+        assert!(!node.may_have_committed(&plans, &resp));
+        for (_, report) in resp
+            .iter_mut()
+            .filter(|(_, r)| matches!(r, RecoverResp::Late))
+        {
+            *report = RecoverResp::NotWitnessed { redundant: false };
+        }
+        assert!(matches!(
+            node.route_verdict(&plans, &resp),
+            Verdict::Invalidate
+        ));
+    }
+
+    /// A replica that accepted the transaction and one that lost its
+    /// journal make a slow quorum that may have committed it: the late
+    /// replica of their shard is asked to vote, not to refuse (#377).
+    #[tokio::test]
+    async fn an_amnesiac_and_an_accept_let_a_late_replica_vote() {
+        let (node, _topology, events) = reshardable_node();
+        let keys = Node::keys_of(&events);
+        let (plans, _) = Node::plan(&node.topology.layout(), &keys, &[]);
+        let resp = vec![
+            (NodeId(0), holder(Status::Accepted, Vec::new())),
+            (NodeId(1), RecoverResp::Amnesiac),
+            (NodeId(2), RecoverResp::Late),
+            (NodeId(3), holder(Status::Accepted, Vec::new())),
+            (NodeId(4), holder(Status::Accepted, Vec::new())),
+            (NodeId(5), holder(Status::Accepted, Vec::new())),
+        ];
+        assert!(!node.never_commits(&plans, &resp, true));
+        assert!(node.may_have_committed(&plans, &resp));
+    }
+
+    /// A planned shard whose part no holder reported is never committed on
+    /// its voters alone: they were handed nothing to vote for (#377). One a
+    /// report shows committed carries its decision instead.
+    #[tokio::test]
+    async fn no_part_is_committed_that_no_holder_reported() {
+        let (node, topology, events) = reshardable_node();
+        let keys = Node::keys_of(&events);
+        let first: Vec<Event> = events
+            .iter()
+            .filter(|e| topology.shard_of(&Key::of(e)) == 0)
+            .cloned()
+            .collect();
+        let (plans, _) = Node::plan(&node.topology.layout(), &keys, &first);
+        let second = plans
+            .iter()
+            .find(|p| p.events.is_empty())
+            .expect("a shard with no part");
+        let known = vec![
+            (NodeId(0), fields(Status::PreAccepted, first.clone())),
+            (NodeId(1), fields(Status::PreAccepted, first.clone())),
+            (NodeId(3), fields(Status::PreAccepted, Vec::new())),
+            (NodeId(4), fields(Status::PreAccepted, Vec::new())),
+        ];
+        assert_eq!(Node::unreported_part(&plans, &known), Some(second.shard));
+        let (plans, _) = Node::plan(&node.topology.layout(), &keys, &events);
+        assert_eq!(Node::unreported_part(&plans, &known), None);
+        let (plans, _) = Node::plan(&node.topology.layout(), &keys, &first);
+        let decided = vec![
+            (NodeId(0), fields(Status::PreAccepted, first.clone())),
+            (NodeId(3), fields(Status::Applied, Vec::new())),
+        ];
+        assert_eq!(Node::unreported_part(&plans, &decided), None);
     }
 
     /// A shard of four commits through three of its replicas: two that never

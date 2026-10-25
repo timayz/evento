@@ -826,6 +826,9 @@ impl Sharded {
         )
         .with_config(NodeConfig {
             collect_timeout: Duration::from_secs(1),
+            // A short deadline for the original coordinator: a replica that
+            // never witnessed a transaction can be refused for good past it.
+            compaction_margin: Duration::from_millis(200),
             ..NodeConfig::default()
         })
     }
@@ -902,6 +905,10 @@ async fn recovery_aborts_a_transaction_a_shard_never_witnessed() {
     assert!(preaccepted.is_err(), "shard B never answers");
     let txn = c.journaled_txn(1).await;
     c.net.crash(NodeId(0));
+    // Past the coordinator's deadline: shard B's replicas, which never saw
+    // it, can be asked to refuse it for good (#377) — within it, they
+    // would only promise the ballot and wait to be handed its part.
+    tokio::time::sleep(Duration::from_millis(400)).await;
 
     let outcome = tokio::time::timeout(Duration::from_secs(10), c.nodes[1].recover(txn))
         .await

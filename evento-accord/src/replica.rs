@@ -2669,39 +2669,126 @@ mod tests {
         assert!(replica.unknown_promises.is_empty());
     }
 
-    /// A routed recovery never pre-accepts what this replica never witnessed:
-    /// it promises the ballot (refusing the original coordinator below it) and
-    /// says so — unless the transaction is below the watermark, where "not
-    /// held" proves nothing and nothing is promised.
+    /// A routed recovery hands a replica that never witnessed the
+    /// transaction nothing of it on a first round: it promises the ballot
+    /// (refusing the original coordinator below it), holds nothing, and
+    /// pre-accepts its part once handed it (#377). Past the coordinator's
+    /// deadline it answers late instead, and votes or refuses for good when
+    /// asked; below its vote fence it never witnessed it, for good; below
+    /// the watermark "not held" proves nothing, and nothing is promised.
     #[test]
-    fn a_routed_recovery_reports_never_witnessed_without_preaccepting() {
+    fn a_routed_recovery_promises_without_a_part_and_votes_given_one() {
         let mut replica = Replica::new();
         let key = Key("k".into());
         let t = txn(20);
         let b = ballot(50, 1);
 
-        let report = replica
-            .recover_routed(t, b, 0, vec![key.clone()], vec![event("k", 1)])
-            .expect("promised");
-        assert!(matches!(
-            report,
-            RoutedRecovery::NotWitnessed { redundant: false }
-        ));
+        // No part: a promise, nothing pre-accepted, nothing refused for good.
+        match replica
+            .recover_round(t, b, 0, vec![], vec![], RecoveryRound::Ask, true)
+            .expect("promised")
+        {
+            RoutedRecovery::Known(state) => assert!(!state.known, "it holds nothing"),
+            _ => panic!("not a blind promise"),
+        }
         assert_eq!(replica.status(t), None, "nothing was pre-accepted");
         assert_eq!(replica.unknown_promise(t), Some(b));
+        assert!(!replica.refused(t));
         assert_eq!(
             replica.preaccept(t, 0, vec![key.clone()], vec![event("k", 1)]),
             Err(Refusal::Promised(b))
         );
         assert!(matches!(
-            replica.recover_routed(t, ballot(40, 2), 0, vec![], vec![]),
+            replica.recover_round(t, ballot(40, 2), 0, vec![], vec![], RecoveryRound::Ask, true),
             Err(promised) if promised == b
         ));
+        // Handed its part: pre-accepted under the ballot.
+        match replica
+            .recover_round(
+                t,
+                b,
+                0,
+                vec![key.clone()],
+                vec![event("k", 1)],
+                RecoveryRound::Ask,
+                true,
+            )
+            .expect("voted")
+        {
+            RoutedRecovery::Known(state) => {
+                assert!(state.known);
+                assert_eq!(state.status, Status::PreAccepted);
+            }
+            _ => panic!("not a vote"),
+        }
+        assert_eq!(replica.status(t), Some(Status::PreAccepted));
 
+        // Past the deadline: late, until asked to vote.
+        let late = txn(30);
+        replica.set_coordinator_cutoff(txn(35).0);
+        assert!(matches!(
+            replica.recover_round(late, b, 0, vec![], vec![], RecoveryRound::Ask, true),
+            Ok(RoutedRecovery::Late)
+        ));
+        assert_eq!(replica.unknown_promise(late), Some(b));
+        assert!(matches!(
+            replica.recover_round(
+                late,
+                b,
+                0,
+                vec![key.clone()],
+                vec![event("k", 2)],
+                RecoveryRound::Vote,
+                true
+            ),
+            Ok(RoutedRecovery::Known(state)) if state.known
+        ));
+        // Or to refuse, for good.
+        let refused = txn(31);
+        assert!(matches!(
+            replica.recover_round(refused, b, 0, vec![], vec![], RecoveryRound::Ask, true),
+            Ok(RoutedRecovery::Late)
+        ));
+        assert!(matches!(
+            replica.recover_round(refused, b, 0, vec![], vec![], RecoveryRound::Refuse, true),
+            Ok(RoutedRecovery::NotWitnessed { redundant: false })
+        ));
+        assert!(replica.refused(refused));
+        assert!(matches!(
+            replica.recover_round(
+                refused,
+                ballot(60, 1),
+                0,
+                vec![key.clone()],
+                vec![event("k", 3)],
+                RecoveryRound::Vote,
+                true
+            ),
+            Ok(RoutedRecovery::NotWitnessed { redundant: false })
+        ));
+        assert_eq!(replica.status(refused), None, "refused for good: no vote");
+
+        // Below the vote fence: never witnessed, for good.
+        let fenced = txn(36);
+        replica.raise_vote_fence(txn(37).0);
+        assert!(matches!(
+            replica.recover_round(
+                fenced,
+                b,
+                0,
+                vec![key.clone()],
+                vec![],
+                RecoveryRound::Ask,
+                true
+            ),
+            Ok(RoutedRecovery::NotWitnessed { redundant: false })
+        ));
+
+        // Below the watermark: nothing is promised.
         let old = txn(5);
         replica.compact(txn(10).0);
         assert!(matches!(
-            replica.recover_routed(old, b, 0, vec![key], vec![]),
+            replica.recover_round(old, b, 0, vec![key], vec![], RecoveryRound::Ask, true),
             Ok(RoutedRecovery::NotWitnessed { redundant: true })
         ));
         assert_eq!(replica.unknown_promise(old), None);

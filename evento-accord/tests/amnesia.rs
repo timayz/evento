@@ -25,7 +25,7 @@ use evento_accord::{
     AcceptorRecord, AmnesiaFence, Ballot, Clock, DataStore, DurableMark, DynamicTopology, Envelope,
     FenceNotCovered, HybridLogicalClock, InMemoryDataStore, InMemoryJournal, InMemoryNetwork,
     Journal, JournalRolledBack, Key, LostJournal, Message, MessageSink, Node, NodeConfig, NodeId,
-    OpenUnconfirmed, StaticTopology, Timestamp, Topology, TxnId,
+    OpenUnconfirmed, ShardedTopology, StaticTopology, Status, Timestamp, Topology, TxnId,
 };
 use evento_core::Event;
 use tokio::sync::mpsc;
@@ -128,12 +128,20 @@ fn expect_nack(reply: Option<Message>, promised: Ballot) {
 /// recovery sweep it starts once joined.
 type Tasks = Arc<Mutex<Vec<JoinHandle<()>>>>;
 
-/// How a cluster's nodes know their layout: fixed, or decided by config
-/// Paxos and the metadata log (a `DynamicTopology` at epoch 0).
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// How a cluster's nodes know their layout: fixed, decided by config
+/// Paxos and the metadata log (a `DynamicTopology` at epoch 0), or fixed
+/// over several shards.
+#[derive(Clone, PartialEq, Eq)]
 enum Kind {
     Static,
     Dynamic,
+    Sharded(Vec<Vec<NodeId>>),
+}
+
+/// Two shards of three: `{0, 1, 2}`, the one R, A and B are in, and
+/// `{3, 4, 5}`.
+fn two_shards() -> Vec<Vec<NodeId>> {
+    vec![(0..3).map(NodeId).collect(), (3..6).map(NodeId).collect()]
 }
 
 /// `n` real replicas `{0..n}` of one shard, each running its inbox loop and
@@ -164,6 +172,22 @@ impl Cluster {
 
     fn start_dynamic_with(n: u64, config: NodeConfig) -> Self {
         Self::start_as(Kind::Dynamic, n, config, clock)
+    }
+
+    /// Six replicas over [`two_shards`], with no sweep recovering a stuck
+    /// transaction on its own: the tests decide when one is recovered.
+    fn start_sharded() -> Self {
+        let layout = two_shards();
+        let n = layout.iter().map(Vec::len).sum::<usize>() as u64;
+        Self::start_as(
+            Kind::Sharded(layout),
+            n,
+            NodeConfig {
+                recovery_timeout: Duration::from_secs(60),
+                ..config()
+            },
+            clock,
+        )
     }
 
     fn start_with(
@@ -219,9 +243,10 @@ impl Cluster {
     ) -> Node {
         let id = NodeId(i);
         let nodes: Vec<NodeId> = (0..self.n).map(NodeId).collect();
-        let topology: Arc<dyn Topology> = match self.kind {
+        let topology: Arc<dyn Topology> = match &self.kind {
             Kind::Static => Arc::new(StaticTopology::new(id, nodes)),
             Kind::Dynamic => Arc::new(DynamicTopology::new(id, 0, vec![nodes])),
+            Kind::Sharded(layout) => Arc::new(ShardedTopology::new(id, layout.clone())),
         };
         Node::new(
             id,
@@ -428,21 +453,86 @@ impl Cluster {
             .expect("joined");
     }
 
-    /// A write every replica applies.
+    /// A write every replica applies: one per shard.
     async fn baseline(&self) {
-        let base = event("base", 1);
-        self.nodes[0]
-            .write(vec![base.clone()])
-            .await
-            .expect("baseline write");
-        for store in &self.stores {
-            await_until(
-                "every store holds the baseline",
-                Duration::from_secs(5),
-                || holds(store, &base),
-            )
-            .await;
+        let shards: Vec<Vec<NodeId>> = match &self.kind {
+            Kind::Sharded(layout) => layout.clone(),
+            _ => vec![(0..self.n).map(NodeId).collect()],
+        };
+        for (shard, replicas) in shards.iter().enumerate() {
+            let base = event(&self.id_in_shard(shard, "base"), 1);
+            self.nodes[replicas[0].0 as usize]
+                .write(vec![base.clone()])
+                .await
+                .expect("baseline write");
+            for replica in replicas {
+                let store = &self.stores[replica.0 as usize];
+                await_until(
+                    "every store holds the baseline",
+                    Duration::from_secs(5),
+                    || holds(store, &base),
+                )
+                .await;
+            }
         }
+    }
+
+    /// An aggregate id whose key `shard` owns: any, on one shard.
+    fn id_in_shard(&self, shard: usize, prefix: &str) -> String {
+        let Kind::Sharded(layout) = &self.kind else {
+            return prefix.to_string();
+        };
+        let probe = ShardedTopology::new(NodeId(0), layout.clone());
+        (0..10_000)
+            .map(|i| format!("{prefix}-{i}"))
+            .find(|id| probe.shard_of(&Key(id.clone())) == shard)
+            .expect("an id in the shard")
+    }
+
+    /// The stores of `shard`'s replicas.
+    fn shard_stores(&self, shard: usize) -> Vec<Arc<InMemoryDataStore>> {
+        let Kind::Sharded(layout) = &self.kind else {
+            return self.stores.clone();
+        };
+        layout[shard]
+            .iter()
+            .map(|id| Arc::clone(&self.stores[id.0 as usize]))
+            .collect()
+    }
+
+    /// Sends `inner` about a transaction over `route` to `to`, as its
+    /// coordinator (node 9) would.
+    async fn send_routed(&self, to: u64, route: &[Key], inner: Message) {
+        self.send(
+            9,
+            to,
+            Message::Routed {
+                route: route.to_vec(),
+                inner: Box::new(inner),
+            },
+        )
+        .await;
+    }
+
+    /// Expects `n` replies of the kind `is` names from the cluster.
+    async fn expect_replies(&mut self, n: usize, what: &str, is: impl Fn(&Message) -> bool) {
+        for _ in 0..n {
+            match next_within(&mut self.coordinator, Duration::from_secs(5)).await {
+                Some(reply) if is(&reply) => {}
+                other => panic!("expected {what}: {other:?}"),
+            }
+        }
+    }
+
+    /// Waits until node `i` holds `txn` at `status` or beyond.
+    async fn await_status(&self, i: u64, txn: TxnId, status: Status) {
+        let node = self.nodes[i as usize].clone();
+        await_until(
+            "the node holds the transaction at the status",
+            Duration::from_secs(5),
+            || node.command_status(txn).is_some_and(|s| s >= status),
+        )
+        .await;
     }
 }
 
@@ -1466,6 +1556,247 @@ async fn a_recovery_decides_what_an_amnesiac_and_one_replica_accepted() {
     })
     .await;
     assert!(stores_agree(&c.stores), "the stores agree");
+}
+
+/// #377, the multi-shard shape of #337: T spans both shards. It was accepted
+/// at R and A on the first shard and at every replica of the second, and
+/// its Commit reached R alone before its coordinator vanished. B never
+/// witnessed it, and the compaction margin passed long ago. R loses its
+/// journal. A routed recovery then hears A (accepted), R (forgot it) and B
+/// (late: it never saw it, and is past the deadline) on the first shard: T
+/// may have committed, so only committing it is safe, and that takes B's
+/// vote — for its shard's part, which A's report carries. B gives it, T
+/// commits on both shards, and R's join goes through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_routed_recovery_decides_what_an_amnesiac_and_one_replica_accepted() {
+    let mut c = Cluster::start_sharded();
+    c.baseline().await;
+    let (ea, eb) = (
+        event(&c.id_in_shard(0, "a"), 1),
+        event(&c.id_in_shard(1, "b"), 1),
+    );
+    let route = vec![Key::of(&ea), Key::of(&eb)];
+    let txn = TxnId(Timestamp {
+        micros: system_micros(),
+        logical: 0,
+        node: NodeId(9),
+    });
+    let voters = [R, A, 3, 4, 5];
+    for to in voters {
+        c.send_routed(
+            to,
+            &route,
+            Message::PreAccept {
+                epoch: 0,
+                txn,
+                keys: route.clone(),
+                events: vec![ea.clone(), eb.clone()],
+            },
+        )
+        .await;
+    }
+    c.expect_replies(voters.len(), "a pre-accept", |m| {
+        matches!(m, Message::PreAcceptOk { .. })
+    })
+    .await;
+    for to in voters {
+        c.send_routed(
+            to,
+            &route,
+            Message::Accept {
+                epoch: 0,
+                txn,
+                ballot: Ballot(txn.0),
+                execute_at: txn.0,
+                deps: Vec::new(),
+                keys: route.clone(),
+            },
+        )
+        .await;
+    }
+    c.expect_replies(voters.len(), "an accept", |m| {
+        matches!(m, Message::AcceptOk { .. })
+    })
+    .await;
+    // The Commit reaches R alone.
+    c.send_routed(
+        R,
+        &route,
+        Message::Commit {
+            epoch: 0,
+            txn,
+            execute_at: txn.0,
+            deps: Vec::new(),
+            keys: route.clone(),
+            events: vec![ea.clone(), eb.clone()],
+            reply_to: NodeId(9),
+        },
+    )
+    .await;
+    c.await_status(R, txn, Status::Committed).await;
+    // Well past the margin: B's clock less the margin passed T long ago.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let join = c.reopen_amnesiac(R, A).await;
+    let recovered = tokio::time::timeout(Duration::from_secs(10), c.nodes[A as usize].recover(txn))
+        .await
+        .expect("the recovery ends");
+    match recovered {
+        Ok(outcome) => assert!(!outcome.conflict, "T may have committed: {outcome:?}"),
+        Err(err) => panic!("no recovery decided T, which pins every report below it: {err:#}"),
+    }
+    tokio::time::timeout(Duration::from_secs(20), join)
+        .await
+        .expect("R's join completes once T is decided")
+        .unwrap()
+        .expect("joined");
+    for (shard, decided) in [(0, &ea), (1, &eb)] {
+        await_until(
+            "every store of the shard holds T",
+            Duration::from_secs(10),
+            || {
+                c.shard_stores(shard)
+                    .iter()
+                    .all(|store| holds(store, decided))
+            },
+        )
+        .await;
+        assert!(stores_agree(&c.shard_stores(shard)), "the stores agree");
+    }
+}
+
+/// T spans both shards, and was pre-accepted at R alone on the first and
+/// at every replica of the second; its coordinator vanished. R loses its
+/// journal. A routed recovery from the second shard hears R (forgot it) and
+/// A and B (late): were they to refuse it, no quorum of the first shard
+/// could ever have committed it. So they are asked to refuse it for good,
+/// and T is invalidated on both shards, rather than left undecided (#377).
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_routed_recovery_invalidates_what_only_an_amnesiac_held_on_its_shard() {
+    let mut c = Cluster::start_sharded();
+    c.baseline().await;
+    let (ea, eb) = (
+        event(&c.id_in_shard(0, "a"), 1),
+        event(&c.id_in_shard(1, "b"), 1),
+    );
+    let route = vec![Key::of(&ea), Key::of(&eb)];
+    let txn = TxnId(Timestamp {
+        micros: system_micros(),
+        logical: 0,
+        node: NodeId(9),
+    });
+    let voters = [R, 3, 4, 5];
+    for to in voters {
+        c.send_routed(
+            to,
+            &route,
+            Message::PreAccept {
+                epoch: 0,
+                txn,
+                keys: route.clone(),
+                events: vec![ea.clone(), eb.clone()],
+            },
+        )
+        .await;
+    }
+    c.expect_replies(voters.len(), "a pre-accept", |m| {
+        matches!(m, Message::PreAcceptOk { .. })
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let join = c.reopen_amnesiac(R, A).await;
+    let recovered = tokio::time::timeout(Duration::from_secs(10), c.nodes[3].recover(txn))
+        .await
+        .expect("the recovery ends");
+    match recovered {
+        Ok(outcome) => assert!(outcome.conflict, "T never committed: {outcome:?}"),
+        Err(err) => panic!("no recovery decided T: {err:#}"),
+    }
+    for i in [A, B, 3, 4, 5] {
+        c.await_status(i, txn, Status::Applied).await;
+    }
+    tokio::time::timeout(Duration::from_secs(20), join)
+        .await
+        .expect("R's join completes")
+        .unwrap()
+        .expect("joined");
+    for shard in 0..2 {
+        assert!(
+            c.shard_stores(shard)
+                .iter()
+                .all(|store| !holds(store, &ea) && !holds(store, &eb)),
+            "T was invalidated: no store holds its events"
+        );
+    }
+}
+
+/// T spans both shards, pre-accepted everywhere on the first and at one
+/// replica of the second, and its coordinator is gone. A recovery within
+/// the coordinator's deadline hears the second shard's two other replicas
+/// promise the ballot, holding nothing: they are handed their shard's part
+/// from the holder's report, pre-accept it, and T commits — without
+/// waiting for the deadline (#377).
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_routed_recovery_gives_a_blind_replica_its_part_within_the_deadline() {
+    let mut c = Cluster::start_sharded();
+    c.baseline().await;
+    let (ea, eb) = (
+        event(&c.id_in_shard(0, "a"), 1),
+        event(&c.id_in_shard(1, "b"), 1),
+    );
+    let route = vec![Key::of(&ea), Key::of(&eb)];
+    let txn = TxnId(Timestamp {
+        micros: system_micros(),
+        logical: 0,
+        node: NodeId(9),
+    });
+    let voters = [A, B, R, 3];
+    for to in voters {
+        c.send_routed(
+            to,
+            &route,
+            Message::PreAccept {
+                epoch: 0,
+                txn,
+                keys: route.clone(),
+                events: vec![ea.clone(), eb.clone()],
+            },
+        )
+        .await;
+    }
+    c.expect_replies(voters.len(), "a pre-accept", |m| {
+        matches!(m, Message::PreAcceptOk { .. })
+    })
+    .await;
+
+    let recovered = tokio::time::timeout(Duration::from_secs(10), c.nodes[A as usize].recover(txn))
+        .await
+        .expect("the recovery ends");
+    match recovered {
+        Ok(outcome) => assert!(!outcome.conflict, "T commits: {outcome:?}"),
+        Err(err) => panic!("no recovery decided T within the deadline: {err:#}"),
+    }
+    for i in [4, 5] {
+        c.await_status(i, txn, Status::Applied).await;
+        assert_eq!(
+            c.nodes[i as usize].metrics().votes_fenced,
+            0,
+            "node {i} was handed its part, not refused"
+        );
+    }
+    for (shard, decided) in [(0, &ea), (1, &eb)] {
+        await_until(
+            "every store of the shard holds T",
+            Duration::from_secs(10),
+            || {
+                c.shard_stores(shard)
+                    .iter()
+                    .all(|store| holds(store, decided))
+            },
+        )
+        .await;
+    }
 }
 
 /// D was pre-accepted at R alone, and W, a write on the same key, committed
