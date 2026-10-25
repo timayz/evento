@@ -685,20 +685,21 @@ enum Verdict {
 /// responses `(responder, message)`.
 type Pending = Arc<Mutex<HashMap<TxnId, mpsc::UnboundedSender<(NodeId, Message)>>>>;
 
-/// Signals that local applied state advanced: an apply, an invalidation, or
-/// an anti-entropy import. A [`Notify`] rather than a `watch` channel: a
+/// Signals that some local state advanced — applied state (an apply, an
+/// invalidation, or an anti-entropy import), or an absent peer counted
+/// again. A [`Notify`] rather than a `watch` channel: a
 /// `watch` parks each waiter on one of several internal notifiers picked by
 /// tokio's unseeded RNG, so waiters woken by one apply would resume in a
 /// random order — several writes waiting on one coordinator would then
 /// complete in a different order run to run, and the deterministic
 /// simulation could no longer replay a seed.
 #[derive(Default)]
-struct AppliedSignal {
+struct Signal {
     generation: AtomicU64,
     notify: Notify,
 }
 
-impl AppliedSignal {
+impl Signal {
     /// Records an advance and wakes every waiter, in a fixed order.
     fn bump(&self) {
         self.generation.fetch_add(1, Ordering::Release);
@@ -974,7 +975,11 @@ pub struct Node {
     /// Bumped whenever local applied state advances (an apply or an
     /// anti-entropy import). Waiters (`read_barrier`, read-your-writes) wait
     /// on it instead of polling the replica lock every millisecond.
-    applied: Arc<AppliedSignal>,
+    applied: Arc<Signal>,
+    /// Bumped whenever an absent peer is counted again (see
+    /// [`screen_absent`](Self::screen_absent)): a join waits on it for its
+    /// contact's proof ([`await_reinstated`](Self::await_reinstated)).
+    reinstated: Arc<Signal>,
     /// When the last anti-entropy round ran, pacing it on
     /// [`NodeConfig::anti_entropy_interval`] independent of the recovery sweep.
     last_anti_entropy: Arc<Mutex<Option<Instant>>>,
@@ -1034,7 +1039,8 @@ impl Node {
             absent: Arc::new(Mutex::new(HashMap::new())),
             rejoin_required: Arc::new(tokio::sync::watch::channel(false).0),
             rejoin_from: Arc::new(Mutex::new(None)),
-            applied: Arc::new(AppliedSignal::default()),
+            applied: Arc::new(Signal::default()),
+            reinstated: Arc::new(Signal::default()),
             last_anti_entropy: Arc::new(Mutex::new(None)),
             metrics: Arc::new(Metrics::new()),
             settings: NodeConfig::default(),
@@ -2508,6 +2514,7 @@ impl Node {
             None => {
                 let persist = state.rejoin_above.is_some();
                 absent.remove(&from);
+                self.reinstated.bump();
                 tracing::info!(
                     node = self.id.0,
                     peer = from.0,
@@ -5464,11 +5471,22 @@ impl Node {
     /// ([`recover_state_for_join`](Self::recover_state_for_join)) keeps its
     /// votes and promises at or above the contact's floor, drops what it holds
     /// below it ([`Replica::forget_below`]), and applies again, once joined,
-    /// what it had applied that the snapshot lacks.
+    /// what it had applied that the snapshot lacks. If that journal holds the
+    /// contact absent past a compaction, the contact must first prove it holds
+    /// what was compacted ([`await_reinstated`](Self::await_reinstated)).
     ///
     /// Coordinating the epoch change across the cluster (rather than each node
     /// installing an agreed layout) remains future work.
     pub async fn join(&self, contact: NodeId) -> anyhow::Result<usize> {
+        let bound = self
+            .absent
+            .lock()
+            .expect("absent poisoned")
+            .get(&contact)
+            .and_then(|state| state.rejoin_above);
+        if let Some(bound) = bound {
+            self.await_reinstated(contact, bound).await?;
+        }
         if let Some(fence) = self.pending_fence() {
             self.await_report_past(contact, fence).await?;
         }
@@ -5613,6 +5631,39 @@ impl Node {
                 logical: 0,
                 node: NodeId(0),
             });
+    }
+
+    /// Asks `contact`, which this node stopped waiting for and compacted past
+    /// `bound` without, to prove it holds what was compacted, and waits up to
+    /// [`collect_timeout`](NodeConfig::collect_timeout) for the proof: its
+    /// report above `bound`, which counts it again
+    /// ([`screen_absent`](Self::screen_absent)). Until then, whatever it
+    /// answers the join with is answered with [`Message::Rejoin`] instead —
+    /// rightly so: this node is about to copy its state, and a contact
+    /// lacking a write compacted past it would hand over a store without
+    /// it, which no peer holds as a command any more. The `Rejoin` sent here
+    /// has it report at once ([`on_rejoin`](Self::on_rejoin)), or rejoin
+    /// itself if it cannot; then the attempt fails, and the host tries its
+    /// next contact.
+    async fn await_reinstated(&self, contact: NodeId, bound: Timestamp) -> anyhow::Result<()> {
+        self.send(contact, Message::Rejoin { above: bound }).await;
+        let deadline = Instant::now() + self.settings.collect_timeout;
+        let proven = self
+            .reinstated
+            .wait_until(deadline, || {
+                !self
+                    .absent
+                    .lock()
+                    .expect("absent poisoned")
+                    .contains_key(&contact)
+            })
+            .await;
+        anyhow::ensure!(
+            proven,
+            "join contact {} reported nothing above {bound:?}, which this node compacted past it",
+            contact.0
+        );
+        Ok(())
     }
 
     /// This node's amnesia fence while its join is pending (#312): a

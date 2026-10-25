@@ -618,6 +618,15 @@ backend (sql/fjall). Phases, in order:
   silent while nothing was compacted past it is simply counted again
   (`an_absent_peer_stops_holding_compaction_back`,
   `a_minority_never_drops_its_way_to_compaction`, `rejoin_bounds_survive_a_restart`).
+  A node that rejoins over its kept journal still holds its own bounds, so a
+  contact it gave up on must prove it before the join copies its state: the
+  joiner, about to discard its store, would otherwise take a store without a write
+  compacted past the contact, which no peer holds as a command any more. It sends
+  the contact `Message::Rejoin` first and waits for the report that counts it
+  again (`Node::await_reinstated`); asked straight for the join header, it would
+  screen the answer as a stale peer's and time out
+  (`a_rejoin_through_a_contact_it_gave_up_on_asks_it_for_proof_first`,
+  `a_rejoin_never_copies_a_contact_that_cannot_prove_what_was_compacted`).
   A rejoined node is counted again by its first report: the contact follows the
   join header with `Message::JoinProof` — its own report before the holds it keeps
   for joiners (below), taken in the same cut as
@@ -1121,6 +1130,19 @@ backend (sql/fjall). Phases, in order:
         leaves it to the retried apply, and follows a read waiting on one to
         what that one waits on, and no recovery of one sends its holder to
         rejoin (`a_replayed_write_held_decided_waits_for_its_store`).
+        A node rejoining over its kept journal through a contact it had given
+        up on lost the contact's join header (found while retiring the inline
+        join paths, #296). The journal still held the contact under a rejoin
+        bound, so the joiner screened the header's answer as a stale peer's:
+        answered `Rejoin` and dropped it. The contact's report then counted it
+        again, but only after the attempt had timed out (`collect_timeout`,
+        5 s by default); until #296 an inline-header retry to the same
+        contact hid it. The join now asks such a contact for that report
+        first (`Node::await_reinstated`): one round trip for a contact that
+        caught up, and nothing copied from one that cannot prove it holds
+        what was compacted
+        (`a_rejoin_through_a_contact_it_gave_up_on_asks_it_for_proof_first`).
+        Over 60 000 swarm seeds, headers lost this way went from 38 to none.
         **Open** (confirmed or plausible, not yet fixed):
         an epoch change can remap a route's keys onto replicas that never
         witnessed an in-flight txn, which then answer "never witnessed"; the

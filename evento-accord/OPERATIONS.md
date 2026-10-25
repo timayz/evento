@@ -300,7 +300,12 @@ refuses anything else before a vote, and a node never installs it.
   below that floor, where a contact whose floor lags could leave the node holding a
   transaction the others compacted past (and have it told to rejoin again). The bound a given-up peer must
   report above is persisted (`Journal::save_rejoin_bounds`), so it holds across a
-  restart of the node that gave it up. A rejoin streams the snapshot in pages
+  restart of the node that gave it up — and across its own rejoin: a node joining
+  over its kept journal through a contact it still holds under a bound first asks
+  that contact to prove it holds what was compacted (a `Message::Rejoin`; a contact
+  that caught up answers with its report at once, a round trip). It copies nothing
+  from a contact that cannot: that one is told to rejoin, and the join fails within
+  `collect_timeout`, so the host goes on to its next contact. A rejoin streams the snapshot in pages
   (`snapshot_page_bytes`), so a node of any store size can be given up on and
   rejoined. The rejoined node is counted again from its first report, at any store
   size: the
