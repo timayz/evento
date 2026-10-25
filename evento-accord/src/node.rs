@@ -716,10 +716,24 @@ struct ShardReports {
     known: usize,
     /// Replicas that never witnessed it and promised the ballot.
     blind: usize,
+    /// How many of `blind` are in the shard's fast-path electorate.
+    blind_electorate: usize,
     /// Replicas holding nothing of it below their redundancy watermark.
     redundant: usize,
     /// Replies of any kind.
     heard: usize,
+}
+
+impl ShardReports {
+    /// Whether the replicas of `shard` that never witnessed the transaction
+    /// meet every quorum that could have committed it — every slow quorum,
+    /// and every fast quorum of the electorate: then it never committed, and
+    /// with their promises it never will. A slow quorum of them in a shard of
+    /// odd size; two of a shard of four, whose quorums are three.
+    fn rule_out_a_commit(&self, shard: &ShardPlan) -> bool {
+        self.blind + shard.slow_q > shard.replicas.len()
+            && self.blind_electorate + shard.fast_q > shard.electorate.len()
+    }
 }
 
 /// What a routed recovery's reports prove (see [`Node::route_verdict`]).
@@ -5457,14 +5471,19 @@ impl Node {
     /// recovery planned for it (see [`planned_shard`](Self::planned_shard)).
     fn shard_reports(shard: &ShardPlan, resp: &[(NodeId, RecoverResp)]) -> ShardReports {
         let mut counts = ShardReports::default();
-        for (_, report) in resp
+        for (from, report) in resp
             .iter()
             .filter(|(from, _)| shard.replicas.contains(from))
         {
             counts.heard += 1;
             match report {
                 RecoverResp::Ok(f) if f.known => counts.known += 1,
-                RecoverResp::NotWitnessed { redundant: false } => counts.blind += 1,
+                RecoverResp::NotWitnessed { redundant: false } => {
+                    counts.blind += 1;
+                    if shard.electorate.contains(from) {
+                        counts.blind_electorate += 1;
+                    }
+                }
                 RecoverResp::NotWitnessed { redundant: true } => counts.redundant += 1,
                 _ => {}
             }
@@ -5473,12 +5492,13 @@ impl Node {
     }
 
     /// Whether a routed recovery has heard enough to decide: an invalidation
-    /// is already proven (an invalidated report, or a slow quorum of one shard
-    /// that never witnessed the transaction), or every route shard has a slow
-    /// quorum of reports, a report from below its watermark, or has answered
-    /// in full. A decided transaction one shard compacted needs a report from
-    /// a replica that applied it (see [`route_verdict`](Self::route_verdict)):
-    /// until one arrives, every other shard is heard out in full.
+    /// is already proven (an invalidated report, or replicas of one shard
+    /// that never witnessed the transaction ruling out its commit), or every
+    /// route shard has a slow quorum of reports, a report from below its
+    /// watermark, or has answered in full. A decided transaction one shard
+    /// compacted needs a report from a replica that applied it (see
+    /// [`route_verdict`](Self::route_verdict)): until one arrives, every
+    /// other shard is heard out in full.
     fn route_settled(&self, shards: &[ShardPlan], resp: &[(NodeId, RecoverResp)]) -> bool {
         let known = || {
             resp.iter().filter_map(|(_, r)| match r {
@@ -5489,7 +5509,7 @@ impl Node {
         if known().any(RecoverFields::invalidated)
             || shards
                 .iter()
-                .any(|s| Self::shard_reports(s, resp).blind >= s.slow_q)
+                .any(|s| Self::shard_reports(s, resp).rule_out_a_commit(s))
         {
             return true;
         }
@@ -5511,12 +5531,14 @@ impl Node {
     ///
     /// 1. **Invalidated** somewhere — a recovery already proved the
     ///    transaction never committed: abort it again.
-    /// 2. A slow quorum of one shard **never witnessed** it, each having
-    ///    durably promised this ballot: it never committed (a commit needs a
-    ///    PreAccept quorum on every shard, which would meet that quorum), and
-    ///    never will (those replicas refuse the original coordinator below the
-    ///    promise, and no recovery can gather a witnessed quorum there either).
-    ///    Invalidate.
+    /// 2. Replicas of one shard that **never witnessed** it, each having
+    ///    durably promised this ballot, meet every quorum that could commit it
+    ///    there ([`ShardReports::rule_out_a_commit`]: a slow quorum of them in
+    ///    a shard of odd size, two in a shard of four): it never committed (a
+    ///    commit needs a PreAccept quorum on every shard, which would meet
+    ///    them), and never will (those replicas refuse the original
+    ///    coordinator below the promise, and no recovery can gather a
+    ///    witnessed quorum there either). Invalidate.
     /// 3. A report at `Committed` or beyond: the decision exists. Recover it
     ///    on every shard still holding it — a shard reporting from below its
     ///    watermark applied it and compacted it away — gated on a slow quorum
@@ -5546,7 +5568,7 @@ impl Node {
             .iter()
             .map(|s| (s, Self::shard_reports(s, resp)))
             .collect();
-        if counts.iter().any(|(s, c)| c.blind >= s.slow_q) {
+        if counts.iter().any(|(s, c)| c.rule_out_a_commit(s)) {
             return Verdict::Invalidate;
         }
         let lacking = |s: &ShardPlan, c: &ShardReports| {
@@ -9533,6 +9555,60 @@ mod tests {
         assert!(
             matches!(node.route_verdict(&plans, &resp), Verdict::Invalidate),
             "a slow quorum of the planned shard never witnessed it"
+        );
+    }
+
+    /// A shard of four commits through three of its replicas: two that never
+    /// witnessed a transaction meet every such quorum, and rule its commit
+    /// out as a slow quorum of them would. Two holding it and two blind is
+    /// an invalidation; counting slow quorums only, it was undecided for
+    /// good, and the transaction held back every write after it on its keys.
+    #[tokio::test]
+    async fn two_blind_replicas_of_four_rule_out_a_commit() {
+        use super::{RecoverFields, RecoverResp, Verdict};
+        use crate::clock::Ballot;
+
+        let (node, _topology, events) = reshardable_node();
+        let keys = Node::keys_of(&events);
+        let layout = crate::api::Layout::new(
+            0,
+            vec![(0..4).map(NodeId).collect(), (4..7).map(NodeId).collect()],
+        );
+        let (plans, _) = Node::plan(&layout, &keys, &[]);
+        assert!(plans.iter().any(|p| p.replicas.len() == 4));
+
+        let held = || {
+            RecoverResp::Ok(RecoverFields {
+                epoch: 0,
+                known: true,
+                status: Status::PreAccepted,
+                accepted: Ballot(Timestamp::MIN),
+                execute_at: Timestamp::MIN,
+                deps: Vec::new(),
+                superseding_rejects: false,
+                wait: false,
+                keys: Vec::new(),
+                events: Vec::new(),
+                route: None,
+            })
+        };
+        let blind = || RecoverResp::NotWitnessed { redundant: false };
+        let mut resp = vec![
+            (NodeId(0), held()),
+            (NodeId(1), held()),
+            (NodeId(2), blind()),
+            (NodeId(4), held()),
+            (NodeId(5), held()),
+        ];
+        assert!(
+            !matches!(node.route_verdict(&plans, &resp), Verdict::Invalidate),
+            "one blind replica of four rules nothing out"
+        );
+        resp.push((NodeId(3), blind()));
+        assert!(node.route_settled(&plans, &resp));
+        assert!(
+            matches!(node.route_verdict(&plans, &resp), Verdict::Invalidate),
+            "two blind replicas of four rule the commit out"
         );
     }
 
