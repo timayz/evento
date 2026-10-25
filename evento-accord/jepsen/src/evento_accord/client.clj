@@ -6,6 +6,8 @@
 
     * HTTP 200  -> :ok   (committed; reads filled in)
     * HTTP 409  -> :fail (optimistic-concurrency conflict; definitely NOT applied)
+    * HTTP 503  -> :fail (the node is not serving — joining, unconfirmed, or not
+                  taking writes right now; nothing was submitted)
     * anything else / timeout / connection error -> :info (INDETERMINATE)
 
   An indeterminate append may still have committed on the cluster, so it must be
@@ -62,7 +64,8 @@
                   out    (mapv merge-mop txn (:ops parsed))]
               (assoc op :type :ok :value out))
         409 (assoc op :type :fail :error :conflict)
-        ;; -1/-2/500/503/... : indeterminate
+        503 (assoc op :type :fail :error :not-serving)
+        ;; -1/-2/500/... : indeterminate
         (assoc op :type :info :error (str "status " (:status resp))))))
 
   (teardown! [_this _test])

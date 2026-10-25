@@ -19,14 +19,22 @@
 
   Faults (--faults, default partition,kill,pause): `jepsen.nemesis.combined` bundles
   network partitions, process kill (SIGKILL + restart, exercising journal recovery),
-  and process pause (SIGSTOP/SIGCONT) with a unified schedule. Clock skew (:clock) is
-  *available* but excluded by default — it bumps the kernel's wall clock, which a
-  shared-kernel Docker cluster cannot isolate from the host, so it belongs on real
-  VMs (and needs a C compiler on the node image for jepsen's time helper)."
+  and process pause (SIGSTOP/SIGCONT) with a unified schedule. `journal` (off by
+  default, #340) loses a node's journal, its whole disk, or rolls its journal back
+  to an older copy, one node at a time; the node comes back joining. Clock skew
+  (:clock) is *available* but excluded by default — it bumps the kernel's wall clock,
+  which a shared-kernel Docker cluster cannot isolate from the host, so it belongs on
+  real VMs (and needs a C compiler on the node image for jepsen's time helper).
+
+  Before the final reads, the test waits until every node's `/health` reads `ready`
+  (`:await-ready`, which reports the nodes that never got back)."
   (:require [clojure.string :as str]
+            [clj-http.client :as http]
             [jepsen [cli :as cli]
                     [checker :as checker]
+                    [control :as c]
                     [generator :as gen]
+                    [nemesis :as n]
                     [tests :as tests]]
             [jepsen.nemesis.combined :as nc]
             [jepsen.os :as os]
@@ -52,6 +60,113 @@
        :f     :txn
        :value (mapv (fn [k] [:append k (swap! value-counter inc)]) ks)})))
 
+(defn- ready?
+  "Whether `node`'s `/health` reads `ready`, asked with a `timeout-ms` timeout."
+  [node timeout-ms]
+  (try
+    (let [resp (http/get (str "http://" node ":" ec-db/http-port "/health")
+                         {:socket-timeout     timeout-ms
+                          :connection-timeout timeout-ms
+                          :throw-exceptions   false})]
+      (= "ready" (str/trim (str (:body resp)))))
+    (catch Exception _ false)))
+
+(defn- not-ready
+  "The nodes whose `/health` does not read `ready`, asked all at once."
+  [test timeout-ms]
+  (let [nodes (vec (:nodes test))]
+    (vec (keep identity (pmap (fn [node] (when-not (ready? node timeout-ms) node)) nodes)))))
+
+(defn- await-ready
+  "Waits, at most `limit-ms`, until every node's `/health` reads `ready`. Returns
+  nil once they all do, or the nodes that never did."
+  [test limit-ms]
+  (let [deadline (+ (System/currentTimeMillis) limit-ms)]
+    (loop []
+      (let [waiting (not-ready test 2000)]
+        (cond (empty? waiting)                        nil
+              (> (System/currentTimeMillis) deadline) waiting
+              :else                                   (do (Thread/sleep 1000) (recur)))))))
+
+(defn- ready-package
+  "Answers `:await-ready`: waits, at most 180 s, until every node's `/health`
+  reads `ready`, and records the nodes that never did."
+  []
+  {:nemesis (reify
+              n/Reflection
+              (fs [_] #{:await-ready})
+              n/Nemesis
+              (setup! [this _test] this)
+              (invoke! [_ test op]
+                (if-let [waiting (await-ready test 180000)]
+                  (assoc op :value {:never-ready waiting})
+                  (assoc op :value :all-ready)))
+              (teardown! [_ _test]))})
+
+(defn- journal-fault!
+  "Runs the journal fault `op` names on a node, `copied` holding the node whose
+  journal was copied aside. Returns the node it hit, or nil."
+  [test op copied]
+  (case (:f op)
+    :restore-journal
+    (when-let [node @copied]
+      (reset! copied nil)
+      (when (get (c/on-nodes test [node] ec-db/restore-journal!) node)
+        node))
+    (let [node  (rand-nth (vec (:nodes test)))
+          fault (case (:f op)
+                  :lose-journal     ec-db/lose-journal!
+                  :lose-disk        ec-db/lose-disk!
+                  :snapshot-journal ec-db/snapshot-journal!)]
+      (c/on-nodes test [node] fault)
+      (when (= :snapshot-journal (:f op))
+        (reset! copied node))
+      node)))
+
+(defn- journal-nemesis
+  "Loses or rolls back one node's journal at a time (#340):
+    * `:lose-journal` deletes its journal and keeps its store;
+    * `:lose-disk` deletes both, and has it come back joining;
+    * `:snapshot-journal` copies its journal aside, and `:restore-journal` puts
+      that copy back later, rolling the journal back.
+  Each kills the node first and starts it after. Returns the node it hit."
+  []
+  (let [copied (atom nil)
+        ;; The node the last fault hit.
+        last-hit (atom nil)]
+    (reify
+      n/Reflection
+      (fs [_] #{:lose-journal :lose-disk :snapshot-journal :restore-journal})
+      n/Nemesis
+      (setup! [this _test] this)
+      (invoke! [_ test op]
+        ;; One journal at a time: while the node the last fault hit is not back
+        ;; yet, the fault is skipped. Losing more journals at once than a shard
+        ;; tolerates would leave no contact to vouch for any of them (#312).
+        ;; Never waited for: the nemeses share one worker, and a wait here would
+        ;; hold back the others' heals.
+        (let [back (or (nil? @last-hit) (ready? @last-hit 500))]
+          (if-not back
+            (assoc op :value {:skipped @last-hit})
+            (let [hit (journal-fault! test op copied)]
+              (when hit (reset! last-hit hit))
+              (assoc op :value (or hit :no-copy))))))
+      (teardown! [_ _test]))))
+
+(defn- journal-package
+  "The journal faults (#340), one every 25 s, in turn: a copy taken, a journal
+  lost, the copy put back, a disk lost."
+  []
+  {:nemesis   (journal-nemesis)
+   :generator (gen/delay 25
+                         (cycle [{:type :info, :f :snapshot-journal}
+                                 {:type :info, :f :lose-journal}
+                                 {:type :info, :f :restore-journal}
+                                 {:type :info, :f :lose-disk}]))
+   :perf      #{{:name  "journal"
+                 :fs    #{:lose-journal :lose-disk :snapshot-journal :restore-journal}
+                 :color "#C9A0E5"}}})
+
 (defn- parse-faults
   "Parse a comma-separated fault list into a set of keywords."
   [s]
@@ -64,7 +179,7 @@
     :default :strict-serializable
     :parse-fn keyword]
    [nil "--faults FAULTS"
-    "Comma-separated nemesis faults: partition,kill,pause,clock (clock needs real VMs)."
+    "Comma-separated nemesis faults: partition,kill,pause,journal,clock (clock needs real VMs)."
     :default #{:partition :kill :pause}
     :parse-fn parse-faults]
    [nil "--linearizable-reads"
@@ -111,9 +226,10 @@
                      :pause     {:targets [:one :all]}
                      :interval  10})
         nem     (nc/compose-packages
-                  (cond-> []
+                  (cond-> [(ready-package)]
                     (faults :partition)                  (conj (nc/partition-package npkg))
                     (some faults [:kill :pause])          (conj (nc/db-package npkg))
+                    (faults :journal)                     (conj (journal-package))
                     (faults :clock)                       (conj (nc/clock-package npkg))))]
     (merge tests/noop-test
            opts
@@ -133,9 +249,11 @@
                               (gen/stagger 1/50)
                               (gen/nemesis (:generator nem))
                               (gen/time-limit (:time-limit opts)))
-                         ;; Resolve every outstanding fault, then let it converge
-                         ;; before the final reads.
+                         ;; Resolve every outstanding fault, wait until every node
+                         ;; serves again, then let it converge before the final
+                         ;; reads.
                          (gen/nemesis (:final-generator nem))
+                         (gen/nemesis (gen/once {:type :info, :f :await-ready}))
                          (gen/sleep 15))})))
 
 (defn -main
