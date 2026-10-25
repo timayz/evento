@@ -66,10 +66,12 @@ pub const MAGIC: [u8; 2] = *b"Ac";
 /// [`Message`](crate::message::Message) field); add the matching decode branch then.
 ///
 /// 2: events carry their tenant. 3: the inline join paths are gone
-/// (`SnapshotRequest`, `SyncRequest::snapshot`, `SyncData::snapshot`). No
-/// reader for older versions: evento-accord has not been released, so a
-/// journal of one is wiped and the node re-bootstrapped.
-pub const FORMAT_VERSION: u8 = 3;
+/// (`SnapshotRequest`, `SyncRequest::snapshot`, `SyncData::snapshot`). 4: a
+/// transaction carries the epoch it was coordinated under
+/// (`CommandState::epoch`, `DecisionRecord::epoch`, and the `epoch` of every
+/// message about it). No reader for older versions: evento-accord has not
+/// been released, so a journal of one is wiped and the node re-bootstrapped.
+pub const FORMAT_VERSION: u8 = 4;
 
 /// Length of the fixed header: `MAGIC (2) + version (1) + kind (1)`.
 const HEADER_LEN: usize = 4;
@@ -220,6 +222,7 @@ mod tests {
             node: NodeId(1),
         });
         CommandState {
+            epoch: 0,
             txn,
             status: Status::Applied,
             promised: Ballot(txn.0),

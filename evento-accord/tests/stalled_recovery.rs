@@ -100,6 +100,7 @@ async fn the_sweep_recovers_what_a_stalled_read_waits_on_first() {
     tokio::time::sleep(Duration::from_millis(10)).await;
     let first = mint(base);
     let preaccept = |txn, version| Message::PreAccept {
+        epoch: 0,
         txn,
         keys: vec![acc()],
         events: vec![event("acc", version)],
@@ -109,6 +110,7 @@ async fn the_sweep_recovers_what_a_stalled_read_waits_on_first() {
     let second = mint(base);
     send_all(&gone, &ids, preaccept(second, 1)).await;
     let accept = Message::Accept {
+        epoch: 0,
         txn: first,
         ballot: Ballot(first.0),
         execute_at: Timestamp {
@@ -166,6 +168,7 @@ fn scripted(
         while let Some(env) = inbox.recv().await {
             let reply = match env.message {
                 Message::BeginRecovery { txn, ballot, .. } => Some(Message::BeginRecoveryOk {
+                    epoch: 0,
                     txn,
                     ballot,
                     known: true,
@@ -216,7 +219,12 @@ async fn recover_against(peers: Peers) {
         .collect();
     // The outside coordinator pre-accepted it here before it was gone.
     let _replies = net.register(GONE);
-    let message = Message::PreAccept { txn, keys, events };
+    let message = Message::PreAccept {
+        epoch: 0,
+        txn,
+        keys,
+        events,
+    };
     send_all(&net.sink(GONE), &[NodeId(0)], message).await;
 
     let outcome = tokio::time::timeout(Duration::from_secs(1), node.recover(txn))

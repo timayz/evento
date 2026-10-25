@@ -47,78 +47,100 @@ pub trait MessageSink: Send + Sync + 'static {
     }
 }
 
-/// Cluster membership and key→replica-set mapping for the current epoch.
+/// Cluster membership and key→replica-set mapping.
 ///
-/// Implementations: [`StaticTopology`] (a fixed node list, single shard) and
-/// [`ShardedTopology`] (disjoint, hash-partitioned shards). Epochs and dynamic
-/// membership arrive in M4.
+/// A topology hands out its current shard [`Layout`] as an immutable `Arc`
+/// snapshot ([`layout`](Topology::layout)), and the layout it installed for
+/// an earlier epoch ([`layout_at`](Topology::layout_at)). A coordination
+/// reads one snapshot for its whole life, and a transaction is planned,
+/// voted on and recovered under the layout of the epoch it was coordinated
+/// in, however many epochs are installed meanwhile. The per-key methods read
+/// the current layout, one snapshot per call.
+///
+/// Implementations: [`StaticTopology`] (a fixed node list, single shard),
+/// [`ShardedTopology`] (disjoint, hash-partitioned shards) and
+/// [`DynamicTopology`] (epoch-versioned layouts).
 pub trait Topology: Send + Sync + 'static {
-    /// Monotonic topology version. Bumped on every membership change.
-    fn epoch(&self) -> u64;
-
     /// The node this process is running as.
     fn this_node(&self) -> NodeId;
 
+    /// The current layout, as an immutable snapshot.
+    fn layout(&self) -> Arc<Layout>;
+
+    /// The layout installed for `epoch`, if this topology holds it — the
+    /// current one, or for a [`DynamicTopology`] any it installed before.
+    /// `None` for an epoch this node never installed (it starts later, or
+    /// the epoch is still to come).
+    fn layout_at(&self, epoch: u64) -> Option<Arc<Layout>> {
+        let layout = self.layout();
+        (layout.epoch() == epoch).then_some(layout)
+    }
+
+    /// Monotonic topology version. Bumped on every membership change.
+    fn epoch(&self) -> u64 {
+        self.layout().epoch()
+    }
+
     /// All nodes in the cluster.
-    fn nodes(&self) -> Vec<NodeId>;
+    fn nodes(&self) -> Vec<NodeId> {
+        self.layout().nodes()
+    }
 
     /// Replicas that own `key` — the set a transaction touching `key` must reach
     /// quorum within.
-    fn replicas(&self, key: &Key) -> Vec<NodeId>;
+    fn replicas(&self, key: &Key) -> Vec<NodeId> {
+        self.layout().replicas(key).to_vec()
+    }
 
     /// The **fast-path electorate** for `key`'s shard — the subset of
     /// [`replicas`](Topology::replicas) whose `PreAccept` votes decide the
-    /// one-round-trip fast path. It is a *fixed, cluster-agreed* property of the
-    /// shard (every coordinator of the shard uses the same set), placed in one
-    /// region so a co-located coordinator commits in a single local round-trip.
-    ///
-    /// The default is the whole replica set (no region favouring — the classic
-    /// `⌈3f/2⌉ + 1` fast path). A configured electorate must be a subset of
-    /// `replicas(key)` with `f + 1 ≤ |E| ≤ N` (asserted at construction): that
-    /// bound keeps recovery sound — a recovery quorum (`f + 1`) always intersects
-    /// a fast quorum, and any two fast quorums of the shared electorate intersect.
+    /// one-round-trip fast path (see [`Layout::electorate_of`]).
     fn fast_electorate(&self, key: &Key) -> Vec<NodeId> {
-        self.replicas(key)
+        let layout = self.layout();
+        layout.electorate_of(layout.shard_of(key)).to_vec()
     }
 
     /// Number of replicas owning `key` — [`replicas`](Topology::replicas)
-    /// `.len()` without the `Vec`. Implementations should override it so hot
-    /// paths that only need the size never allocate.
+    /// `.len()` without the `Vec`.
     fn replica_count(&self, key: &Key) -> usize {
-        self.replicas(key).len()
+        self.layout().replicas(key).len()
     }
 
-    /// Size of `key`'s [`fast_electorate`](Topology::fast_electorate) — again,
-    /// override to avoid materialising the set just to count it.
+    /// Size of `key`'s [`fast_electorate`](Topology::fast_electorate), without
+    /// materialising the set.
     fn fast_electorate_size(&self, key: &Key) -> usize {
-        self.fast_electorate(key).len()
+        let layout = self.layout();
+        layout.electorate_of(layout.shard_of(key)).len()
     }
 
-    /// Fast-path quorum size for `key`: `⌊(e + f)/2⌋ + 1` where `e` is the
-    /// [`fast_electorate`](Topology::fast_electorate) size and the replica set has
-    /// size `N = 2f + 1`. Reduces to `⌈3f/2⌉ + 1` when the electorate is the whole
-    /// replica set (`e = N`).
-    fn fast_quorum(&self, key: &Key) -> usize;
+    /// Fast-path quorum size for `key` (see [`Layout::fast_quorum_of`]).
+    fn fast_quorum(&self, key: &Key) -> usize {
+        let layout = self.layout();
+        layout.fast_quorum_of(layout.shard_of(key))
+    }
 
     /// Slow-path / recovery quorum size for `key`'s replica set: a strict
     /// majority, `⌊N/2⌋ + 1` (equal to `f + 1` for odd `N = 2f + 1`).
-    fn slow_quorum(&self, key: &Key) -> usize;
+    fn slow_quorum(&self, key: &Key) -> usize {
+        let layout = self.layout();
+        layout.slow_quorum_of(layout.shard_of(key))
+    }
 
     /// The shard that owns `key`. Single-shard topologies return `0`.
-    fn shard_of(&self, _key: &Key) -> ShardId {
-        0
+    fn shard_of(&self, key: &Key) -> ShardId {
+        self.layout().shard_of(key)
     }
 
     /// The shard `node` replicates, if any. Shards are disjoint, so a node
-    /// belongs to at most one. Single-shard topologies return `Some(0)`.
-    fn node_shard(&self, _node: NodeId) -> Option<ShardId> {
-        Some(0)
+    /// belongs to at most one.
+    fn node_shard(&self, node: NodeId) -> Option<ShardId> {
+        self.layout().node_shard(node)
     }
 
     /// Whether `node` replicates `key` (i.e. owns its shard). Determines which
     /// events of a multi-shard transaction a replica reads and applies.
     fn owns(&self, node: NodeId, key: &Key) -> bool {
-        self.node_shard(node) == Some(self.shard_of(key))
+        self.layout().owns(node, key)
     }
 
     /// The region / datacenter `node` lives in, if regions are configured. Used to
@@ -128,7 +150,9 @@ pub trait Topology: Send + Sync + 'static {
         None
     }
 
-    /// Installs a later epoch's shard layout. The default is a no-op (fixed
+    /// Installs a decided epoch's shard layout. The newest installed epoch is
+    /// the current layout; an older one is only kept for
+    /// [`layout_at`](Topology::layout_at). The default is a no-op (fixed
     /// topologies do not change); [`DynamicTopology`] overrides it.
     fn install(&self, _epoch: u64, _shards: Vec<Vec<NodeId>>) {}
 
@@ -138,6 +162,129 @@ pub trait Topology: Send + Sync + 'static {
     /// fixed-membership cluster issues no control-plane traffic.
     fn dynamic(&self) -> bool {
         false
+    }
+}
+
+/// One epoch's shard layout, immutable once built: the replica set of every
+/// shard, each shard's fast-path electorate, and the quorum sizes they imply.
+/// Shards are disjoint, and a key's shard is a stable hash of the key modulo
+/// the shard count, so every node holding the same layout maps every key the
+/// same way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Layout {
+    epoch: u64,
+    shards: Vec<Vec<NodeId>>,
+    /// Shard id → its fast-path electorate, a subset of its replicas.
+    electorates: Vec<Vec<NodeId>>,
+}
+
+impl Layout {
+    /// A layout at `epoch` whose electorates are the whole shards.
+    pub fn new(epoch: u64, shards: Vec<Vec<NodeId>>) -> Self {
+        let electorates = shards.clone();
+        Self {
+            epoch,
+            shards,
+            electorates,
+        }
+    }
+
+    /// A layout with `electorates[shard]` as each shard's fast-path
+    /// electorate (asserted well-formed by whoever configured it).
+    fn with_electorates(
+        epoch: u64,
+        shards: Vec<Vec<NodeId>>,
+        electorates: Vec<Vec<NodeId>>,
+    ) -> Self {
+        debug_assert_eq!(shards.len(), electorates.len());
+        Self {
+            epoch,
+            shards,
+            electorates,
+        }
+    }
+
+    /// The epoch this layout was decided for.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Shard id → replica set.
+    pub fn shards(&self) -> &[Vec<NodeId>] {
+        &self.shards
+    }
+
+    /// Every node of every shard.
+    pub fn nodes(&self) -> Vec<NodeId> {
+        self.shards.iter().flatten().copied().collect()
+    }
+
+    /// Whether `node` is in some shard of this layout.
+    pub fn contains(&self, node: NodeId) -> bool {
+        self.shards.iter().any(|shard| shard.contains(&node))
+    }
+
+    /// The shard that owns `key`.
+    pub fn shard_of(&self, key: &Key) -> ShardId {
+        if self.shards.len() <= 1 {
+            return 0;
+        }
+        // Stable across nodes AND toolchains (unlike DefaultHasher).
+        (stable_hash(key.0.as_bytes()) as usize) % self.shards.len()
+    }
+
+    /// `shard`'s replica set.
+    pub fn replicas_of(&self, shard: ShardId) -> &[NodeId] {
+        &self.shards[shard]
+    }
+
+    /// The replica set of `key`'s shard.
+    pub fn replicas(&self, key: &Key) -> &[NodeId] {
+        self.replicas_of(self.shard_of(key))
+    }
+
+    /// `shard`'s fast-path electorate: the subset of its replicas whose
+    /// `PreAccept` votes decide the one-round-trip fast path. It is a fixed,
+    /// cluster-agreed property of the shard, every coordinator of the shard
+    /// uses the same set, with `f + 1 ≤ |E| ≤ N`: that bound keeps recovery
+    /// sound — a recovery quorum (`f + 1`) always intersects a fast quorum,
+    /// and any two fast quorums of the shared electorate intersect.
+    pub fn electorate_of(&self, shard: ShardId) -> &[NodeId] {
+        &self.electorates[shard]
+    }
+
+    /// `shard`'s fast-path quorum size: `⌊(e + f)/2⌋ + 1` where `e` is its
+    /// electorate's size and its replica set has size `N = 2f + 1`. Reduces
+    /// to `⌈3f/2⌉ + 1` when the electorate is the whole replica set.
+    pub fn fast_quorum_of(&self, shard: ShardId) -> usize {
+        let f = self.shards[shard].len().saturating_sub(1) / 2;
+        fast_quorum_size(self.electorates[shard].len(), f)
+    }
+
+    /// `shard`'s slow-path / recovery quorum size: a strict majority.
+    pub fn slow_quorum_of(&self, shard: ShardId) -> usize {
+        slow_quorum_size(self.shards[shard].len())
+    }
+
+    /// The shard `node` replicates, if any.
+    pub fn node_shard(&self, node: NodeId) -> Option<ShardId> {
+        self.shards.iter().position(|shard| shard.contains(&node))
+    }
+
+    /// Whether `node` replicates `key`.
+    pub fn owns(&self, node: NodeId, key: &Key) -> bool {
+        self.replicas(key).contains(&node)
+    }
+
+    /// Whether `key` has the same replica set here and in `other`: the same
+    /// nodes vote on, apply and answer for it under both layouts, whatever
+    /// its shard's index.
+    pub fn same_replicas(&self, other: &Layout, key: &Key) -> bool {
+        let mut here = self.replicas(key).to_vec();
+        let mut there = other.replicas(key).to_vec();
+        here.sort_unstable();
+        there.sort_unstable();
+        here == there
     }
 }
 
@@ -164,6 +311,9 @@ pub struct AcceptorRecord {
 pub struct DecisionRecord {
     /// The transaction.
     pub txn: TxnId,
+    /// The epoch it was coordinated under: its route's shards are that
+    /// epoch's.
+    pub epoch: u64,
     /// Its execution timestamp — [`INVALIDATED_AT`](crate::message::INVALIDATED_AT)
     /// for one a recovery invalidated.
     pub execute_at: Timestamp,
@@ -683,9 +833,8 @@ pub(crate) fn assert_valid_electorate(electorate: &[NodeId], replicas: &[NodeId]
 /// starting point for M1; superseded by sharded/epoch-aware topologies in M3/M4.
 pub struct StaticTopology {
     this: NodeId,
-    nodes: Vec<NodeId>,
-    /// Optional fast-path electorate (a subset of `nodes`); `None` ⇒ all nodes.
-    electorate: Option<Vec<NodeId>>,
+    /// The one layout, at epoch 0: a single shard of every node.
+    layout: Arc<Layout>,
 }
 
 impl StaticTopology {
@@ -699,65 +848,28 @@ impl StaticTopology {
         );
         Self {
             this,
-            nodes,
-            electorate: None,
+            layout: Arc::new(Layout::new(0, vec![nodes])),
         }
     }
 
     /// Sets the fast-path electorate — the subset of nodes whose `PreAccept` votes
-    /// decide the one-round-trip fast path (see [`Topology::fast_electorate`]).
+    /// decide the one-round-trip fast path (see [`Layout::electorate_of`]).
     /// Panics unless it is a subset of the nodes with `f + 1 ≤ |E| ≤ N`.
     pub fn with_fast_electorate(mut self, electorate: Vec<NodeId>) -> Self {
-        assert_valid_electorate(&electorate, &self.nodes);
-        self.electorate = Some(electorate);
+        let nodes = self.layout.shards()[0].clone();
+        assert_valid_electorate(&electorate, &nodes);
+        self.layout = Arc::new(Layout::with_electorates(0, vec![nodes], vec![electorate]));
         self
-    }
-
-    /// Failures tolerated: for `N = 2f + 1`, `f = (N - 1) / 2`.
-    fn faults(&self) -> usize {
-        self.nodes.len().saturating_sub(1) / 2
     }
 }
 
 impl Topology for StaticTopology {
-    fn epoch(&self) -> u64 {
-        0
-    }
-
     fn this_node(&self) -> NodeId {
         self.this
     }
 
-    fn nodes(&self) -> Vec<NodeId> {
-        self.nodes.clone()
-    }
-
-    fn replicas(&self, _key: &Key) -> Vec<NodeId> {
-        // Single shard: every node owns every key.
-        self.nodes.clone()
-    }
-
-    fn fast_electorate(&self, _key: &Key) -> Vec<NodeId> {
-        self.electorate
-            .clone()
-            .unwrap_or_else(|| self.nodes.clone())
-    }
-
-    fn replica_count(&self, _key: &Key) -> usize {
-        self.nodes.len()
-    }
-
-    fn fast_electorate_size(&self, _key: &Key) -> usize {
-        self.electorate.as_ref().map_or(self.nodes.len(), Vec::len)
-    }
-
-    fn fast_quorum(&self, key: &Key) -> usize {
-        // ⌊(e + f)/2⌋ + 1; ⌈3f/2⌉ + 1 when the electorate is the whole set.
-        fast_quorum_size(self.fast_electorate_size(key), self.faults())
-    }
-
-    fn slow_quorum(&self, _key: &Key) -> usize {
-        slow_quorum_size(self.nodes.len())
+    fn layout(&self) -> Arc<Layout> {
+        Arc::clone(&self.layout)
     }
 }
 
@@ -767,11 +879,8 @@ impl Topology for StaticTopology {
 /// must reach a quorum in each. Used for M3 multi-shard transactions.
 pub struct ShardedTopology {
     this: NodeId,
-    /// Shard id → replica set. Replica sets are disjoint.
-    shards: Vec<Vec<NodeId>>,
-    /// Shard id → optional fast-path electorate (a subset of that shard's
-    /// replicas); `None` ⇒ the whole shard.
-    electorates: Vec<Option<Vec<NodeId>>>,
+    /// The one layout, at epoch 0.
+    layout: Arc<Layout>,
     /// Optional node → region map for region-aware routing (empty ⇒ no regions).
     regions: std::collections::HashMap<NodeId, RegionId>,
 }
@@ -794,11 +903,9 @@ impl ShardedTopology {
             seen.contains(&this),
             "this node {this:?} must belong to a shard"
         );
-        let electorates = vec![None; shards.len()];
         Self {
             this,
-            shards,
-            electorates,
+            layout: Arc::new(Layout::new(0, shards)),
             regions: std::collections::HashMap::new(),
         }
     }
@@ -812,71 +919,25 @@ impl ShardedTopology {
 
     /// Sets `shard`'s fast-path electorate — the subset of its replicas whose
     /// `PreAccept` votes decide the one-round-trip fast path (see
-    /// [`Topology::fast_electorate`]). Panics unless it is a subset of the shard's
+    /// [`Layout::electorate_of`]). Panics unless it is a subset of the shard's
     /// replicas with `f + 1 ≤ |E| ≤ N`.
     pub fn with_fast_electorate(mut self, shard: ShardId, electorate: Vec<NodeId>) -> Self {
-        assert_valid_electorate(&electorate, &self.shards[shard]);
-        self.electorates[shard] = Some(electorate);
+        let shards = self.layout.shards().to_vec();
+        assert_valid_electorate(&electorate, &shards[shard]);
+        let mut electorates = self.layout.electorates.clone();
+        electorates[shard] = electorate;
+        self.layout = Arc::new(Layout::with_electorates(0, shards, electorates));
         self
-    }
-
-    /// Failures a replica set of size `n = 2f + 1` tolerates.
-    fn faults(n: usize) -> usize {
-        n.saturating_sub(1) / 2
     }
 }
 
 impl Topology for ShardedTopology {
-    fn epoch(&self) -> u64 {
-        0
-    }
-
     fn this_node(&self) -> NodeId {
         self.this
     }
 
-    fn nodes(&self) -> Vec<NodeId> {
-        self.shards.iter().flatten().copied().collect()
-    }
-
-    fn replicas(&self, key: &Key) -> Vec<NodeId> {
-        self.shards[self.shard_of(key)].clone()
-    }
-
-    fn fast_electorate(&self, key: &Key) -> Vec<NodeId> {
-        let shard = self.shard_of(key);
-        self.electorates[shard]
-            .clone()
-            .unwrap_or_else(|| self.shards[shard].clone())
-    }
-
-    fn replica_count(&self, key: &Key) -> usize {
-        self.shards[self.shard_of(key)].len()
-    }
-
-    fn fast_electorate_size(&self, key: &Key) -> usize {
-        let shard = self.shard_of(key);
-        self.electorates[shard]
-            .as_ref()
-            .map_or(self.shards[shard].len(), Vec::len)
-    }
-
-    fn fast_quorum(&self, key: &Key) -> usize {
-        let f = Self::faults(self.shards[self.shard_of(key)].len());
-        fast_quorum_size(self.fast_electorate_size(key), f)
-    }
-
-    fn slow_quorum(&self, key: &Key) -> usize {
-        slow_quorum_size(self.shards[self.shard_of(key)].len())
-    }
-
-    fn shard_of(&self, key: &Key) -> ShardId {
-        // Stable across nodes AND toolchains (unlike DefaultHasher).
-        (stable_hash(key.0.as_bytes()) as usize) % self.shards.len()
-    }
-
-    fn node_shard(&self, node: NodeId) -> Option<ShardId> {
-        self.shards.iter().position(|shard| shard.contains(&node))
+    fn layout(&self) -> Arc<Layout> {
+        Arc::clone(&self.layout)
     }
 
     fn region(&self, node: NodeId) -> Option<RegionId> {
@@ -885,19 +946,22 @@ impl Topology for ShardedTopology {
 }
 
 /// A [`Topology`] whose shard layout can be replaced atomically as the cluster
-/// grows. Each layout is tagged with a monotonically increasing **epoch**.
+/// grows. Each layout is tagged with a monotonically increasing **epoch**, and
+/// every layout installed is kept ([`layout_at`](Topology::layout_at)), the
+/// starting one included, so a transaction coordinated under an earlier epoch
+/// is still planned, voted on and recovered under its own layout.
 ///
 /// Unlike [`ShardedTopology`], the running node need not yet belong to any shard
 /// (a joining node holds the current layout to find a peer to bootstrap from,
 /// then [`install`](DynamicTopology::install)s the new epoch that includes it).
-/// Coordinating the epoch change across the cluster — and handling transactions
-/// in flight across it — is future work; callers install an agreed layout.
+/// Coordinating the epoch change across the cluster is the node's job; callers
+/// install an agreed layout.
 pub struct DynamicTopology {
     this: NodeId,
-    /// The installed layout, swapped atomically as an `Arc` snapshot: readers
-    /// take the read lock only long enough to clone the handle, so a whole
-    /// coordination reads one consistent layout without serialising on a lock.
-    state: RwLock<Arc<DynamicState>>,
+    /// The installed layouts. Readers take the read lock only long enough to
+    /// clone a layout's `Arc`, so a whole coordination reads one consistent
+    /// layout without serialising on a lock.
+    state: RwLock<DynamicState>,
     /// Optional node → region map for region-aware routing and the region-derived
     /// fast-path electorate (empty ⇒ no regions ⇒ the classic whole-set fast path).
     /// Static cluster config — the operator supplies the **same** map to every node,
@@ -906,13 +970,15 @@ pub struct DynamicTopology {
 }
 
 struct DynamicState {
-    epoch: u64,
-    shards: Vec<Vec<NodeId>>,
+    /// The newest installed layout.
+    current: Arc<Layout>,
+    /// Every installed layout by epoch, `current` included.
+    history: std::collections::BTreeMap<u64, Arc<Layout>>,
 }
 
 impl DynamicTopology {
-    /// Builds a topology at `epoch` from disjoint shard replica sets. `this` need
-    /// not be a member yet.
+    /// Builds a topology at `epoch` from disjoint shard replica sets. `this`
+    /// need not be a member yet.
     ///
     /// Panics if the layout is invalid (see [`validate_layout`]) — a
     /// configuration error.
@@ -920,16 +986,16 @@ impl DynamicTopology {
         if let Err(err) = validate_layout(&shards) {
             panic!("invalid shard layout: {err}");
         }
+        let regions = std::collections::HashMap::new();
+        let current = Arc::new(Self::derive(epoch, shards, &regions));
         Self {
             this,
-            state: RwLock::new(Arc::new(DynamicState { epoch, shards })),
-            regions: std::collections::HashMap::new(),
+            state: RwLock::new(DynamicState {
+                history: std::collections::BTreeMap::from([(epoch, Arc::clone(&current))]),
+                current,
+            }),
+            regions,
         }
-    }
-
-    /// The current layout snapshot (a cheap `Arc` clone).
-    fn snapshot(&self) -> Arc<DynamicState> {
-        self.state.read().expect("topology poisoned").clone()
     }
 
     /// Tags nodes with regions, enabling region-aware read routing and the
@@ -937,12 +1003,29 @@ impl DynamicTopology {
     /// region). The map must be identical on every node.
     pub fn with_regions(mut self, regions: std::collections::HashMap<NodeId, RegionId>) -> Self {
         self.regions = regions;
+        let state = self.state.get_mut().expect("topology poisoned");
+        for layout in state.history.values_mut() {
+            *layout = Arc::new(Self::derive(
+                layout.epoch(),
+                layout.shards().to_vec(),
+                &self.regions,
+            ));
+        }
+        state.current = Arc::clone(state.history.values().next_back().expect("one layout"));
         self
     }
 
-    fn shard_index(shards: &[Vec<NodeId>], key: &Key) -> ShardId {
-        // Stable across nodes AND toolchains (unlike DefaultHasher).
-        (stable_hash(key.0.as_bytes()) as usize) % shards.len()
+    /// The layout of `shards` at `epoch`, with each shard's electorate
+    /// derived from the region tags (see `DynamicTopology::electorate_for`).
+    fn derive(
+        epoch: u64,
+        shards: Vec<Vec<NodeId>>,
+        regions: &std::collections::HashMap<NodeId, RegionId>,
+    ) -> Layout {
+        let electorates = (0..shards.len())
+            .map(|idx| Self::electorate_for(&shards, idx, regions))
+            .collect();
+        Layout::with_electorates(epoch, shards, electorates)
     }
 
     /// Derives shard `idx`'s fast-path electorate from the layout + region tags:
@@ -951,6 +1034,8 @@ impl DynamicTopology {
     /// the same set). Used iff that group has size in `[f+1, N]` (a recovery-sound
     /// electorate; `== N` when one region holds the shard, i.e. no shrink);
     /// otherwise (no regions, or the largest region is below `f+1`) the whole shard.
+    /// A pure function of the layout + region tags, so it is recomputed
+    /// correctly for every epoch with no extra state crossing consensus.
     fn electorate_for(
         shards: &[Vec<NodeId>],
         idx: usize,
@@ -964,23 +1049,6 @@ impl DynamicTopology {
                 .filter(|n| regions.get(n) == Some(&r))
                 .collect(),
             None => replicas.clone(),
-        }
-    }
-
-    /// [`electorate_for`](DynamicTopology::electorate_for)'s size, without
-    /// materialising the set.
-    fn electorate_size_for(
-        shards: &[Vec<NodeId>],
-        idx: usize,
-        regions: &std::collections::HashMap<NodeId, RegionId>,
-    ) -> usize {
-        let replicas = &shards[idx];
-        match Self::electorate_region(replicas, regions) {
-            Some(r) => replicas
-                .iter()
-                .filter(|n| regions.get(n) == Some(&r))
-                .count(),
-            None => replicas.len(),
         }
     }
 
@@ -1022,80 +1090,38 @@ impl DynamicTopology {
 }
 
 impl Topology for DynamicTopology {
-    fn epoch(&self) -> u64 {
-        self.snapshot().epoch
-    }
-
     fn this_node(&self) -> NodeId {
         self.this
     }
 
-    fn nodes(&self) -> Vec<NodeId> {
-        self.snapshot().shards.iter().flatten().copied().collect()
+    fn layout(&self) -> Arc<Layout> {
+        Arc::clone(&self.state.read().expect("topology poisoned").current)
     }
 
-    fn replicas(&self, key: &Key) -> Vec<NodeId> {
-        let state = self.snapshot();
-        state.shards[Self::shard_index(&state.shards, key)].clone()
-    }
-
-    /// The **region-derived** electorate for `key`'s shard (see
-    /// `DynamicTopology::electorate_for`). A pure function of the
-    /// installed layout + region tags, so it is recomputed correctly after every
-    /// epoch change with no extra state crossing consensus.
-    fn fast_electorate(&self, key: &Key) -> Vec<NodeId> {
-        let state = self.snapshot();
-        let idx = Self::shard_index(&state.shards, key);
-        Self::electorate_for(&state.shards, idx, &self.regions)
-    }
-
-    fn replica_count(&self, key: &Key) -> usize {
-        let state = self.snapshot();
-        state.shards[Self::shard_index(&state.shards, key)].len()
-    }
-
-    fn fast_electorate_size(&self, key: &Key) -> usize {
-        let state = self.snapshot();
-        let idx = Self::shard_index(&state.shards, key);
-        Self::electorate_size_for(&state.shards, idx, &self.regions)
-    }
-
-    fn fast_quorum(&self, key: &Key) -> usize {
-        let state = self.snapshot();
-        let idx = Self::shard_index(&state.shards, key);
-        let f = state.shards[idx].len().saturating_sub(1) / 2;
-        let e = Self::electorate_size_for(&state.shards, idx, &self.regions);
-        fast_quorum_size(e, f)
-    }
-
-    fn slow_quorum(&self, key: &Key) -> usize {
-        let state = self.snapshot();
-        let n = state.shards[Self::shard_index(&state.shards, key)].len();
-        slow_quorum_size(n)
-    }
-
-    fn shard_of(&self, key: &Key) -> ShardId {
-        let state = self.snapshot();
-        Self::shard_index(&state.shards, key)
-    }
-
-    fn node_shard(&self, node: NodeId) -> Option<ShardId> {
-        self.snapshot()
-            .shards
-            .iter()
-            .position(|shard| shard.contains(&node))
+    fn layout_at(&self, epoch: u64) -> Option<Arc<Layout>> {
+        self.state
+            .read()
+            .expect("topology poisoned")
+            .history
+            .get(&epoch)
+            .cloned()
     }
 
     fn region(&self, node: NodeId) -> Option<RegionId> {
         self.regions.get(&node).copied()
     }
 
-    /// Atomically replaces the layout with a later `epoch`. Ignored if `epoch`
-    /// is not newer than the current one.
+    /// Keeps `epoch`'s layout (the first one installed for an epoch wins) and
+    /// makes it the current layout if it is newer than the current one.
     fn install(&self, epoch: u64, shards: Vec<Vec<NodeId>>) {
         let mut state = self.state.write().expect("topology poisoned");
-        if epoch > state.epoch {
-            *state = Arc::new(DynamicState { epoch, shards });
+        if state.history.contains_key(&epoch) {
+            return;
+        }
+        let layout = Arc::new(Self::derive(epoch, shards, &self.regions));
+        state.history.insert(epoch, Arc::clone(&layout));
+        if epoch > state.current.epoch() {
+            state.current = layout;
         }
     }
 

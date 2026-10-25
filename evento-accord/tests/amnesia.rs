@@ -819,6 +819,7 @@ async fn no_vote_for_a_future_dated_transaction() {
         })
     };
     let preaccept = |txn: TxnId, aggregate_id: &str| Message::PreAccept {
+        epoch: 0,
         txn,
         keys: vec![key(aggregate_id)],
         events: vec![event(aggregate_id, 1)],
@@ -868,6 +869,7 @@ async fn an_amnesiac_never_lets_a_recovery_drop_what_may_have_committed() {
             9,
             to,
             Message::PreAccept {
+                epoch: 0,
                 txn,
                 keys: vec![key("acc")],
                 events: vec![decided.clone()],
@@ -886,6 +888,7 @@ async fn an_amnesiac_never_lets_a_recovery_drop_what_may_have_committed() {
             9,
             to,
             Message::Accept {
+                epoch: 0,
                 txn,
                 ballot: Ballot(txn.0),
                 execute_at: txn.0,
@@ -923,6 +926,7 @@ async fn an_amnesiac_never_lets_a_recovery_drop_what_may_have_committed() {
         9,
         B,
         Message::Commit {
+            epoch: 0,
             txn,
             execute_at: txn.0,
             deps: Vec::new(),

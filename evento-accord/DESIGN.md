@@ -323,52 +323,56 @@ control plane, everything else is Accord.
   owners, multi-shard read routing for the executor, and handing in-flight
   transactions over across an epoch change (below).
 
-  **Range movement with transactions in flight (#288; designed, guards shipped).**
-  Nothing on the data path knows epochs yet. There is no epoch on `TxnId`, on
-  messages or on `CommandState`; ownership filters and recovery plans use the
-  installed layout; `DynamicTopology` keeps only the current layout, and the
-  metadata log lacks the starting one. A write in flight while its keys move is
-  therefore exposed three ways:
-  (i) a replica that no longer owns a key voted `t0` with no dependencies on an
+  **Range movement with transactions in flight (#288, #359; epochs shipped,
+  handoff next).** A write in flight while its keys change replicas was exposed
+  four ways:
+  (i) a replica that no longer owned a key voted `t0` with no dependencies on an
   empty command, so the write could report success with its events applied
   nowhere;
-  (ii) new owners answer "never witnessed", and routed recovery can invalidate a
-  committed transaction (its blind check precedes the committed check);
-  (iii) new owners bootstrap before old owners finish the in-flight writes.
-  The design:
-  1. *Every transaction carries its coordination epoch*: a trailing
-     `Message::Epoched` wrapper like `Routed` (additive on the wire), and a journal
-     record kind like `Route`, so a restart keeps it. (accord-core: the epoch is
-     part of every `TxnId`.)
-  2. *Every decided layout is kept*, the starting one included (`layout_at(epoch)`),
-     and a coordination plans, collects and recovers against one layout snapshot.
-     (accord-core: a coordination's `Topologies` span the epochs from the
-     transaction's to its execution's.)
-  3. *Replicas filter ownership by the transaction's epoch*, so old owners keep
-     voting, applying and answering recovery for it after installing `E+1`.
-  4. *Fence*: after installing `E+1`, a replica refuses PreAccept for a new
-     epoch-`E` transaction on a range that moved.
-  5. *Drain*: new owners buffer like a joiner and bootstrap only once a slow quorum
-     of old owners has fenced and the contact's proven coverage passes the fence,
-     so the snapshot holds every epoch-`E` transaction that could commit.
-     (accord-core: a range is bootstrapped behind an exclusive sync point.)
-  6. *Recovery plans by the transaction's epoch*: "never witnessed" from a replica
-     outside that epoch's shard is no evidence.
-  7. *Old owners keep the range* until the bootstrap completes; garbage-collecting
-     it stays separate.
+  (ii) new owners answer "never witnessed", and routed recovery could invalidate
+  a committed transaction (its blind check precedes the committed check);
+  (ii′) the same inside one shard (#359): recovery counted the replicas of the
+  installed layout, so after `{1,2,3}` became `{1,2,4}` it could count 2 and 4 as
+  fenced and invalidate a transaction `{1,3}` committed, or re-commit it at
+  another timestamp;
+  (iii) new owners bootstrap before old owners finish the writes in flight, and a
+  quorum of the new layout need not intersect a commit quorum of the old one.
 
-  Shipped now, as guards:
-  - **G1**: a coordinator counts replies (votes, reads, apply acks, recovery
-    reports) for the shard it *planned* their sender in, never by the layout
-    installed when they land. A routed recovery whose layout changed between
-    gathering reports and driving the decision retries.
-  - **G2**: a replica that owns none of the keys a PreAccept, Accept or Commit
-    carries, under the layout it installed, and holds nothing of the transaction,
-    casts no vote, answers nothing and records nothing (it is no replica of that
-    shard any more). A transaction it already holds is finished as before.
+  *Shipped: transactions carry their epoch.*
+  - Every PreAccept, Accept, Commit, BeginRecovery and read probe carries the
+    epoch of the layout its coordinator planned under, and `CommandState` and
+    `DecisionRecord` journal it (format 4). A coordination reads one `Layout`
+    snapshot for its whole life. (accord-core: the epoch is part of every
+    `TxnId`.)
+  - Every installed layout is kept (`Topology::layout_at`), the starting one
+    included: the metadata log journals it with the first epoch decided after it,
+    so a node rebuilt on a later layout after a restart still holds it.
+  - A replica judges ownership by the transaction's epoch, so old owners keep
+    voting, applying and answering recovery for it after a change, and a recovery
+    plans, collects and counts by the transaction's epoch. This fixes (i), (ii)
+    and (ii′).
+  - A PreAccept or read probe planned under a layout retired since for one of its
+    keys (the key's replica set changed), for a transaction this replica never
+    saw, gets no answer: a coordinator that planned before a change cannot commit
+    through the old replicas once a quorum of them installed it. A message
+    planned under an epoch not installed yet is not answered either; the replica
+    fetches the metadata it misses from the sender first.
+  - A change for an epoch past the next one is refused before any vote.
+  - G1 from #313 stays: a coordinator counts replies (votes, reads, apply acks,
+    recovery reports) for the shard it *planned* their sender in. G2 now reads
+    ownership under the transaction's epoch: a replica that owns none of the keys
+    a PreAccept, Accept or Commit carries there, and holds nothing of the
+    transaction, casts no vote, answers nothing and records nothing.
 
-  Until the handoff ships, an operator rule (OPERATIONS §6) keeps transactions out
-  of flight across a layout change.
+  *Next: two-phase layout changes,* for (iii). A change decides a *transition*
+  first: the old layout stays live, the keys whose replica set changes take no
+  new writes and no votes above a fence point, and the writes in flight on them
+  drain under the old layout. Once every shard has a slow quorum past the drain
+  point and the new owners copied the keys they gain, an *activation* installs the
+  new layout. Each key has one live layout at any time, so watermarks, coverage,
+  anti-entropy, compaction and recovery never mix epochs. Until it ships, an
+  operator rule (OPERATIONS §6) keeps transactions out of flight across a layout
+  change.
 - **M5 — Executor wiring.** ✅ `AccordExecutor` is a real `evento_core::Executor`:
   **writes** are coordinated through the Accord cluster (mapping the outcome to
   `Ok(())` / `WriteError::InvalidOriginalVersion`); **reads, subscriptions, and
@@ -1143,11 +1147,17 @@ backend (sql/fjall). Phases, in order:
         what was compacted
         (`a_rejoin_through_a_contact_it_gave_up_on_asks_it_for_proof_first`).
         Over 60 000 swarm seeds, headers lost this way went from 38 to none.
+        A transaction carries the epoch it was coordinated under, and is
+        voted on and recovered under that epoch's layout: before, a recovery
+        after a layout change counted the replicas installed since, and could
+        invalidate a committed transaction, across shards (#288) or within one
+        (#359) (`recovery_asks_the_replicas_a_transaction_was_coordinated_under`,
+        `a_routed_recovery_counts_shards_under_the_transactions_epoch`).
         **Open** (confirmed or plausible, not yet fixed):
-        an epoch change can remap a route's keys onto replicas that never
-        witnessed an in-flight txn, which then answer "never witnessed"; the
-        handoff is designed, two guards and an operator rule cover it until it
-        ships (#288, see M4).
+        an epoch change does not drain the transactions in flight across it,
+        so new owners can bootstrap before old owners finish them; two-phase
+        changes are next, and an operator rule covers it until they ship (#288,
+        see M4).
   - [ ] **Real-cluster soak + chaos** over days (kills, partitions, clock skew,
         disk pressure, slow disks/links) on actual hardware — zero production
         mileage today.

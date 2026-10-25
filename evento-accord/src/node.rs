@@ -29,7 +29,7 @@ use tokio::time::{Duration, Instant};
 
 use crate::api::{
     floor_millis, snapshot_event_size, stamp_events, validate_layout, AcceptorRecord, AmnesiaFence,
-    DataStore, Journal, MessageSink, ShardId, Topology,
+    DataStore, Journal, Layout, MessageSink, ShardId, Topology,
 };
 use crate::clock::{Ballot, Clock, HybridLogicalClock, NodeId, Timestamp, TxnId};
 use crate::failure_detector::FailureDetector;
@@ -566,6 +566,9 @@ pub struct CommitOutcome {
 /// The replica set and quorum sizes for one shard a transaction touches.
 #[derive(Clone)]
 struct ShardPlan {
+    /// The epoch of the layout this plan was drawn from: every message the
+    /// plan sends carries it.
+    epoch: u64,
     shard: ShardId,
     replicas: Vec<NodeId>,
     /// The fast-path electorate — the subset of `replicas` whose `PreAccept` votes
@@ -583,6 +586,8 @@ struct ShardPlan {
 
 /// One replica's recovery report, extracted from a `RecoverOk`.
 struct RecoverFields {
+    /// The epoch the replica holds the transaction under.
+    epoch: u64,
     known: bool,
     status: Status,
     accepted: Ballot,
@@ -788,11 +793,20 @@ type ConfigSender = mpsc::UnboundedSender<(NodeId, Message)>;
 /// that drives `topology.install` in **strict, contiguous** epoch order — an entry
 /// for a future epoch is held until every intervening epoch arrives, so no epoch is
 /// ever skipped (the gap a behind node fills via [`Message::MetadataFetch`]).
+///
+/// It holds the layout the node started from too (`start_epoch`), journaled
+/// with the first entry decided after it: a transaction coordinated under it
+/// is recovered under it, and the node's topology may be rebuilt from a later
+/// layout after a restart.
 struct MetadataLog {
     /// Decided entries by epoch (`BTreeMap` → deterministic ascending iteration).
     entries: BTreeMap<u64, Vec<Vec<NodeId>>>,
     /// Highest epoch installed into the topology so far (`== topology.epoch()`).
     installed_epoch: u64,
+    /// The epoch the node started from, whose layout it was built with.
+    start_epoch: u64,
+    /// Whether the journal holds the starting layout's entry.
+    start_persisted: bool,
 }
 
 /// Shared metadata log.
@@ -999,7 +1013,9 @@ impl Node {
         datastore: Arc<dyn DataStore>,
         journal: Arc<dyn Journal>,
     ) -> Self {
-        let start_epoch = topology.epoch();
+        let start = topology.layout();
+        let start_epoch = start.epoch();
+        let start_layout = start.shards().to_vec();
         Self {
             id,
             clock,
@@ -1020,8 +1036,10 @@ impl Node {
             config: Arc::new(Mutex::new(HashMap::new())),
             config_inbox: Arc::new(Mutex::new(HashMap::new())),
             meta_log: Arc::new(Mutex::new(MetadataLog {
-                entries: BTreeMap::new(),
+                entries: BTreeMap::from([(start_epoch, start_layout)]),
                 installed_epoch: start_epoch,
+                start_epoch,
+                start_persisted: false,
             })),
             correlation_seq: Arc::new(AtomicU64::new(0)),
             anti_entropy_turn: Arc::new(AtomicU64::new(0)),
@@ -1523,12 +1541,19 @@ impl Node {
                 config.insert(epoch, ConfigAcceptor::from_record(record));
             }
         }
-        for (epoch, layout) in metadata {
-            self.meta_log
-                .lock()
-                .expect("meta_log poisoned")
-                .entries
-                .insert(epoch, layout);
+        {
+            let mut log = self.meta_log.lock().expect("meta_log poisoned");
+            for (epoch, layout) in metadata {
+                if epoch == log.start_epoch {
+                    log.start_persisted = true;
+                }
+                // Below the epoch the topology was built at, the layout is
+                // history only: kept to recover what was planned under it.
+                if epoch < log.installed_epoch && validate_layout(&layout).is_ok() {
+                    self.topology.install(epoch, layout.clone());
+                }
+                log.entries.insert(epoch, layout);
+            }
         }
         self.apply_log();
 
@@ -1672,15 +1697,16 @@ impl Node {
 
     /// Drops the decision records no route shard needs any more: for every
     /// route shard but this node's own (which compacted the transaction, so
-    /// every replica counted there applied it), every current replica has
-    /// reported a watermark above the transaction — each applied it, so no
-    /// recovery there will ask for its decision. Reports come from the
-    /// watermark gossip every node sends every other. A replica that never
-    /// reports again (permanently down) keeps its shard's records until it
-    /// leaves the topology.
+    /// every replica counted there applied it), every replica has reported a
+    /// watermark above the transaction — each applied it, so no recovery
+    /// there will ask for its decision. The shards are those of the layout the
+    /// transaction was coordinated under, the ones its recoveries ask.
+    /// Reports come from the watermark gossip every node sends every other. A
+    /// replica that never reports again (permanently down) keeps its shard's
+    /// records until it leaves the topology.
     async fn prune_decisions(&self) {
         let dropped = {
-            let my_shard = self.topology.node_shard(self.id);
+            let current = self.topology.layout();
             let watermarks = self
                 .peer_watermarks
                 .lock()
@@ -1690,11 +1716,16 @@ impl Node {
                 .lock()
                 .expect("replica poisoned")
                 .prune_decisions(|record| {
+                    let layout = self
+                        .topology
+                        .layout_at(record.epoch)
+                        .unwrap_or_else(|| Arc::clone(&current));
+                    let my_shard = layout.node_shard(self.id);
                     record
                         .route
                         .iter()
-                        .filter(|key| Some(self.topology.shard_of(key)) != my_shard)
-                        .flat_map(|key| self.topology.replicas(key))
+                        .filter(|key| Some(layout.shard_of(key)) != my_shard)
+                        .flat_map(|key| layout.replicas(key).to_vec())
                         .all(|node| watermarks.get(&node).is_some_and(|w| *w > record.txn.0))
                 })
         };
@@ -1767,13 +1798,44 @@ impl Node {
     /// the epoch retired every member of that one, nobody this node asks for
     /// the entry is left. The commit or the metadata sweep retries it.
     async fn persist_metadata(&self, entries: &[(u64, Vec<Vec<NodeId>>)]) -> bool {
+        if entries.is_empty() {
+            return true;
+        }
+        // The starting layout goes with the first entry decided after it, so a
+        // restart rebuilt on a later layout still holds it.
+        let start = {
+            let log = self.meta_log.lock().expect("meta_log poisoned");
+            (!log.start_persisted)
+                .then(|| {
+                    log.entries
+                        .get(&log.start_epoch)
+                        .map(|l| (log.start_epoch, l.clone()))
+                })
+                .flatten()
+                .filter(|(epoch, _)| entries.iter().all(|(e, _)| e != epoch))
+        };
+        let batch: Vec<(u64, Vec<Vec<NodeId>>)>;
+        let entries = match start {
+            Some(start) => {
+                batch = std::iter::once(start)
+                    .chain(entries.iter().cloned())
+                    .collect();
+                &batch[..]
+            }
+            None => entries,
+        };
         let persisted = match entries {
-            [] => return true,
             [(epoch, layout)] => self.journal.append_metadata(*epoch, layout).await,
             entries => self.journal.append_metadata_batch(entries).await,
         };
         match persisted {
-            Ok(()) => true,
+            Ok(()) => {
+                self.meta_log
+                    .lock()
+                    .expect("meta_log poisoned")
+                    .start_persisted = true;
+                true
+            }
             Err(err) => {
                 tracing::warn!(
                     node = self.id.0,
@@ -2354,14 +2416,14 @@ impl Node {
         self.prune_decisions().await;
     }
 
-    /// The nodes of this node's shard, itself included.
+    /// The nodes of this node's shard, itself included (none while it is in
+    /// no shard), read from one layout.
     fn shard_peers(&self) -> Vec<NodeId> {
-        let my_shard = self.topology.node_shard(self.id);
-        self.topology
-            .nodes()
-            .into_iter()
-            .filter(|&n| self.topology.node_shard(n) == my_shard)
-            .collect()
+        let layout = self.topology.layout();
+        layout
+            .node_shard(self.id)
+            .map(|shard| layout.replicas_of(shard).to_vec())
+            .unwrap_or_default()
     }
 
     /// The redundancy point this node vouches for: its applied-through lagged
@@ -2725,22 +2787,34 @@ impl Node {
             return out;
         }
         match message {
-            Message::PreAccept { txn, keys, events } => {
+            Message::PreAccept {
+                txn,
+                epoch,
+                keys,
+                events,
+            } => {
                 if self.future_dated(txn) {
                     return out;
                 }
-                // Only handle the keys/events this node owns.
+                let Some(layout) = self.layout_for(epoch, from, &mut out) else {
+                    return out;
+                };
+                if self.retired(txn, &layout, route.as_deref().unwrap_or(&keys)) {
+                    return out;
+                }
+                // Only handle the keys/events this node owns, under the
+                // layout the transaction was planned under.
                 let carried = !keys.is_empty();
-                let keys = self.owned_keys(keys);
+                let keys = self.owned_keys(&layout, keys);
                 if self.not_a_replica_of(txn, carried, &keys) {
                     return out;
                 }
-                let events = self.owned_events(events);
+                let events = self.owned_events(&layout, events);
                 let fence = self.vote_fence();
                 let vote = {
                     let mut replica = self.replica.lock().expect("replica poisoned");
                     replica.set_vote_fence(fence);
-                    replica.preaccept(txn, keys, events)
+                    replica.preaccept(txn, epoch, keys, events)
                 };
                 match vote {
                     Ok((execute_at, deps)) => {
@@ -2769,6 +2843,7 @@ impl Node {
             Message::Accept {
                 txn,
                 ballot,
+                epoch,
                 execute_at,
                 deps,
                 keys,
@@ -2778,8 +2853,11 @@ impl Node {
                 }
                 // A slow-path `execute_at` can exceed `t0`; witness it too.
                 self.clock.witness(execute_at);
+                let Some(layout) = self.layout_for(epoch, from, &mut out) else {
+                    return out;
+                };
                 let carried = !keys.is_empty();
-                let keys = self.owned_keys(keys);
+                let keys = self.owned_keys(&layout, keys);
                 if self.not_a_replica_of(txn, carried, &keys) {
                     return out;
                 }
@@ -2787,7 +2865,7 @@ impl Node {
                 let reply = {
                     let mut replica = self.replica.lock().expect("replica poisoned");
                     replica.set_vote_fence(fence);
-                    replica.accept(txn, ballot, execute_at, deps, keys)
+                    replica.accept(txn, ballot, epoch, execute_at, deps, keys)
                 };
                 if reply == Err(Refusal::Compacted) {
                     return out;
@@ -2810,6 +2888,7 @@ impl Node {
             }
             Message::Commit {
                 txn,
+                epoch,
                 execute_at,
                 deps,
                 keys,
@@ -2817,20 +2896,24 @@ impl Node {
                 reply_to,
             } => {
                 self.clock.witness(execute_at);
+                let Some(layout) = self.layout_for(epoch, from, &mut out) else {
+                    return out;
+                };
                 // The coordinator ships this shard's keys explicitly, so a
                 // replica that missed PreAccept still indexes this transaction
-                // in its conflict graph. The owned filters stay as defense
-                // against a stale-epoch coordinator's view of ownership.
+                // in its conflict graph. The owned filters, under the layout
+                // the transaction was planned under, stay as defense against
+                // a misrouted Commit.
                 let carried = !keys.is_empty();
-                let keys = self.owned_keys(keys);
+                let keys = self.owned_keys(&layout, keys);
                 if self.not_a_replica_of(txn, carried, &keys) {
                     return out;
                 }
-                let events = self.owned_events(events);
+                let events = self.owned_events(&layout, events);
                 self.replica
                     .lock()
                     .expect("replica poisoned")
-                    .commit(txn, execute_at, deps, events, keys, reply_to);
+                    .commit(txn, epoch, execute_at, deps, events, keys, reply_to);
                 let route_kept = self.keep_route(txn, route.as_deref()).await;
                 // A commit the journal did not take is not answered for; what
                 // it unblocks still executes (each apply gates its own ack).
@@ -2892,9 +2975,12 @@ impl Node {
                 if self.future_dated(txn) {
                     return out;
                 }
+                // Nothing to pre-accept, so no layout to judge by: a known
+                // command keeps its own epoch.
                 let reply = self.replica.lock().expect("replica poisoned").recover(
                     txn,
                     ballot,
+                    self.topology.epoch(),
                     Vec::new(),
                     Vec::new(),
                 );
@@ -2907,6 +2993,7 @@ impl Node {
                     Ok(state) => Message::RecoverOk {
                         txn,
                         ballot,
+                        epoch: state.epoch,
                         known: state.known,
                         status: state.status,
                         accepted: state.accepted,
@@ -2923,14 +3010,18 @@ impl Node {
             Message::BeginRecovery {
                 txn,
                 ballot,
+                epoch,
                 keys,
                 events,
             } => {
                 if self.future_dated(txn) {
                     return out;
                 }
-                let keys = self.owned_keys(keys);
-                let events = self.owned_events(events);
+                let Some(layout) = self.layout_for(epoch, from, &mut out) else {
+                    return out;
+                };
+                let keys = self.owned_keys(&layout, keys);
+                let events = self.owned_events(&layout, events);
                 let fence = self.vote_fence();
                 let reply = {
                     let mut replica = self.replica.lock().expect("replica poisoned");
@@ -2938,8 +3029,8 @@ impl Node {
                     match &route {
                         // Routed: never pre-accept what this replica never
                         // witnessed (see `Replica::recover_routed`).
-                        Some(_) => replica.recover_routed(txn, ballot, keys, events),
-                        None => replica.recover_unrouted(txn, ballot, keys, events),
+                        Some(_) => replica.recover_routed(txn, ballot, epoch, keys, events),
+                        None => replica.recover_unrouted(txn, ballot, epoch, keys, events),
                     }
                 };
                 // An unrouted recovery is told "never witnessed" only below the
@@ -2966,6 +3057,7 @@ impl Node {
                         let report = Message::BeginRecoveryOk {
                             txn,
                             ballot,
+                            epoch: state.epoch,
                             known: state.known,
                             status: state.status,
                             accepted: state.accepted,
@@ -3436,8 +3528,16 @@ impl Node {
             // commands the join is importing, so its deps could miss a
             // transaction, and the barrier counts only the replicas that
             // answer.
-            Message::ReadProbe { txn, key } => {
+            Message::ReadProbe { txn, epoch, key } => {
                 if !self.bootstrapped.load(Ordering::Acquire) {
+                    return out;
+                }
+                // A coordinator that probed under a layout retired since for
+                // `key` counts a quorum of replicas that no longer all hold it.
+                let Some(layout) = self.layout_for(epoch, from, &mut out) else {
+                    return out;
+                };
+                if self.retired(txn, &layout, std::slice::from_ref(&key)) {
                     return out;
                 }
                 let (execute_at, deps) = self
@@ -3780,6 +3880,9 @@ impl Node {
         }
 
         let keys = Self::keys_of(&events);
+        // One layout for the whole coordination: an epoch installed meanwhile
+        // changes neither the replicas it counts nor those it recovers through.
+        let layout = self.topology.layout();
         let txn = TxnId(self.mint().await?);
         self.coordinating
             .lock()
@@ -3790,10 +3893,10 @@ impl Node {
         // entry would pin this node's watermark report, and the response
         // channel would hide the transaction from its own recovery sweep.
         let _coordinating = Coordinating { node: self, txn };
-        let (outcome, all_fast) = match self.coordinate(txn, &keys, &events).await {
+        let (outcome, all_fast) = match self.coordinate(&layout, txn, &keys, &events).await {
             Ok(done) => Ok(done),
             Err(err) => self
-                .settle(txn, err, &keys, &events)
+                .settle(txn, err, layout.epoch(), &keys, &events)
                 .await
                 .map(|outcome| (outcome, false)),
         }?;
@@ -3835,8 +3938,12 @@ impl Node {
             self.bootstrapped.load(Ordering::Acquire),
             "this node is joining: its store is partial"
         );
-        let replicas = self.topology.replicas(&key);
-        let slow_q = self.topology.slow_quorum(&key);
+        // One layout for the probe: the replicas it asks are the ones it
+        // counts, and a replica that installed a change to `key` since does
+        // not answer it (see `retired`).
+        let layout = self.topology.layout();
+        let replicas = layout.replicas(&key).to_vec();
+        let slow_q = layout.slow_quorum_of(layout.shard_of(&key));
         let t0 = self.mint().await?;
         let txn = TxnId(t0);
         let mut rx = self.register(txn);
@@ -3845,6 +3952,7 @@ impl Node {
             &replicas,
             Message::ReadProbe {
                 txn,
+                epoch: layout.epoch(),
                 key: key.clone(),
             },
         )
@@ -3914,11 +4022,12 @@ impl Node {
     /// Returns the outcome and whether it took the one-round fast path.
     async fn coordinate(
         &self,
+        layout: &Layout,
         txn: TxnId,
         keys: &[Key],
         events: &[Event],
     ) -> anyhow::Result<(CommitOutcome, bool)> {
-        let (plans, _union) = self.plan(keys, events);
+        let (plans, _union) = Self::plan(layout, keys, events);
         let route = Self::route_of(&plans, keys);
         let mut rx = self.register(txn);
         let (execute_at, shard_deps, all_fast) =
@@ -3926,6 +4035,7 @@ impl Node {
         let conflict = self
             .execute(
                 &mut rx,
+                layout,
                 &plans,
                 route.as_deref(),
                 txn,
@@ -3960,6 +4070,7 @@ impl Node {
                     route,
                     Message::PreAccept {
                         txn,
+                        epoch: plan.epoch,
                         keys: plan.keys.clone(),
                         events: plan.events.clone(),
                     },
@@ -4082,6 +4193,7 @@ impl Node {
                         Message::Accept {
                             txn,
                             ballot: Ballot(t0),
+                            epoch: plan.epoch,
                             execute_at,
                             deps,
                             keys: plan.keys.clone(),
@@ -4146,6 +4258,7 @@ impl Node {
     async fn execute(
         &self,
         rx: &mut mpsc::UnboundedReceiver<(NodeId, Message)>,
+        layout: &Layout,
         plans: &[ShardPlan],
         route: Option<&[Key]>,
         txn: TxnId,
@@ -4163,12 +4276,13 @@ impl Node {
             .iter()
             .filter(|n| !plans.iter().any(|p| p.replicas.contains(n)))
         {
-            let Some(shard) = self.topology.node_shard(*n) else {
+            let Some(shard) = layout.node_shard(*n) else {
                 continue;
             };
             match skipped.iter_mut().find(|p| p.shard == shard) {
                 Some(p) => p.replicas.push(*n),
                 None => skipped.push(ShardPlan {
+                    epoch: layout.epoch(),
                     shard,
                     replicas: vec![*n],
                     electorate: vec![*n],
@@ -4329,6 +4443,7 @@ impl Node {
                     route,
                     Message::Commit {
                         txn,
+                        epoch: plan.epoch,
                         execute_at,
                         deps,
                         keys: plan.keys.clone(),
@@ -4359,6 +4474,7 @@ impl Node {
         &self,
         txn: TxnId,
         failure: anyhow::Error,
+        epoch: u64,
         keys: &[Key],
         events: &[Event],
     ) -> anyhow::Result<CommitOutcome> {
@@ -4367,7 +4483,7 @@ impl Node {
             return Ok(CommitOutcome { txn, conflict });
         }
         match self
-            .recover_with(txn, keys.to_vec(), events.to_vec(), Driver::Recovery)
+            .recover_with(txn, epoch, keys.to_vec(), events.to_vec(), Driver::Recovery)
             .await
         {
             Ok(outcome) => {
@@ -4413,14 +4529,15 @@ impl Node {
     async fn recover_driven(&self, txn: TxnId, driver: Driver) -> anyhow::Result<CommitOutcome> {
         // What this node holds of the transaction (its owned part) is what it
         // can hand to replicas that never witnessed it.
-        let (keys, events) = self
+        // It is recovered under the layout it was planned under.
+        let (epoch, keys, events) = self
             .replica
             .lock()
             .expect("replica poisoned")
             .snapshot(txn)
-            .map(|cmd| (cmd.keys, cmd.events))
-            .unwrap_or_default();
-        self.recover_with(txn, keys, events, driver).await
+            .map(|cmd| (cmd.epoch, cmd.keys, cmd.events))
+            .unwrap_or_else(|| (self.topology.epoch(), Vec::new(), Vec::new()));
+        self.recover_with(txn, epoch, keys, events, driver).await
     }
 
     /// Learns the decision of `txn`, a transaction this replica never
@@ -4437,11 +4554,14 @@ impl Node {
         let ballot = Ballot(self.mint().await?);
         let peers = self.shard_peers();
         let mut rx = self.register(txn);
+        // With nothing to pre-accept, the epoch only has to be one the peers
+        // hold; each report carries the epoch its holder planned under.
         self.broadcast(
             &peers,
             Message::BeginRecovery {
                 txn,
                 ballot,
+                epoch: self.topology.epoch(),
                 keys: Vec::new(),
                 events: Vec::new(),
             },
@@ -4476,6 +4596,7 @@ impl Node {
         // `txn` later gets it from the recorded read.
         let commit = Message::Commit {
             txn,
+            epoch: f.epoch,
             execute_at: f.execute_at,
             deps: f.deps,
             keys: f.keys,
@@ -4504,6 +4625,7 @@ impl Node {
             // Commit/Accept).
             Message::BeginRecoveryOk {
                 ballot: b,
+                epoch,
                 known,
                 status,
                 accepted,
@@ -4515,6 +4637,7 @@ impl Node {
                 events,
                 ..
             } if b == ballot => Some(RecoverResp::Ok(RecoverFields {
+                epoch,
                 known,
                 status,
                 accepted,
@@ -4528,6 +4651,7 @@ impl Node {
             })),
             Message::RecoverOk {
                 ballot: b,
+                epoch,
                 known,
                 status,
                 accepted,
@@ -4538,6 +4662,7 @@ impl Node {
                 events,
                 ..
             } if b == ballot => Some(RecoverResp::Ok(RecoverFields {
+                epoch,
                 known,
                 status,
                 accepted,
@@ -4574,6 +4699,7 @@ impl Node {
     async fn recover_with(
         &self,
         txn: TxnId,
+        epoch: u64,
         keys: Vec<Key>,
         events: Vec<Event>,
         driver: Driver,
@@ -4591,23 +4717,31 @@ impl Node {
             anyhow::bail!("transaction {txn:?} is locally in flight; not recovering it");
         }
 
+        // Planned, counted and decided under the layout the transaction was
+        // coordinated under: its replicas then are those that voted for it,
+        // whatever this node installed since (#288).
+        let Some(layout) = self.topology.layout_at(epoch) else {
+            anyhow::bail!("no layout for epoch {epoch} to recover {txn:?} under");
+        };
         let mut route = self
             .replica
             .lock()
             .expect("replica poisoned")
             .route(txn)
-            .or_else(|| self.spans_shards(&keys).then(|| keys.clone()));
+            .or_else(|| Self::spans_shards(&layout, &keys).then(|| keys.clone()));
         let mut ballot = Ballot(self.mint().await?);
 
         for _attempt in 0..3 {
             let mut rx = self.register(txn);
             let attempt = match &route {
                 Some(route) => {
-                    self.recover_routed(&mut rx, txn, ballot, route, &keys, &events, driver)
-                        .await
+                    self.recover_routed(
+                        &mut rx, &layout, txn, ballot, route, &keys, &events, driver,
+                    )
+                    .await
                 }
                 None => {
-                    self.recover_unrouted(&mut rx, txn, ballot, &keys, &events, driver)
+                    self.recover_unrouted(&mut rx, &layout, txn, ballot, &keys, &events, driver)
                         .await
                 }
             };
@@ -4628,16 +4762,18 @@ impl Node {
 
     /// One recovery attempt for a transaction without a known route: the
     /// touched shards are reassembled from the reports.
+    #[allow(clippy::too_many_arguments)]
     async fn recover_unrouted(
         &self,
         rx: &mut mpsc::UnboundedReceiver<(NodeId, Message)>,
+        layout: &Layout,
         txn: TxnId,
         ballot: Ballot,
         keys: &[Key],
         events: &[Event],
         driver: Driver,
     ) -> anyhow::Result<Attempt> {
-        let all_nodes = self.topology.nodes();
+        let all_nodes = layout.nodes();
         // Every replica gets what this node holds: one that never
         // witnessed the transaction pre-accepts it under this ballot, so
         // its vote counts here and the original coordinator, its PreAccept
@@ -4647,6 +4783,7 @@ impl Node {
             Message::BeginRecovery {
                 txn,
                 ballot,
+                epoch: layout.epoch(),
                 keys: keys.to_vec(),
                 events: events.to_vec(),
             },
@@ -4673,7 +4810,7 @@ impl Node {
                 RecoverResp::Ok(f) => f.route.clone(),
                 _ => None,
             })
-            .filter(|route| self.spans_shards(route))
+            .filter(|route| Self::spans_shards(layout, route))
         {
             return Ok(Attempt::Route(route));
         }
@@ -4693,7 +4830,7 @@ impl Node {
             .filter(|&node| {
                 all_keys
                     .iter()
-                    .any(|k| !keys.contains(k) && self.topology.owns(node, k))
+                    .any(|k| !keys.contains(k) && layout.owns(node, k))
             })
             .collect();
         if !blind.is_empty() {
@@ -4702,6 +4839,7 @@ impl Node {
                 Message::BeginRecovery {
                     txn,
                     ballot,
+                    epoch: layout.epoch(),
                     keys: all_keys.clone(),
                     events: all_events.clone(),
                 },
@@ -4724,7 +4862,7 @@ impl Node {
             }
         }
 
-        let (plans, union) = self.plan(&all_keys, &all_events);
+        let (plans, union) = Self::plan(layout, &all_keys, &all_events);
         if self.never_commits(&plans, &resp) {
             tracing::debug!(
                 node = self.id.0,
@@ -4786,7 +4924,7 @@ impl Node {
                 anyhow::bail!("recovery quorum not reached for shard {}", plan.shard);
             }
         }
-        self.drive_recovery(rx, txn, ballot, &plans, None, known, driver)
+        self.drive_recovery(rx, layout, txn, ballot, &plans, None, known, driver)
             .await
     }
 
@@ -4944,6 +5082,7 @@ impl Node {
     async fn recover_routed(
         &self,
         rx: &mut mpsc::UnboundedReceiver<(NodeId, Message)>,
+        layout: &Layout,
         txn: TxnId,
         ballot: Ballot,
         route: &[Key],
@@ -4951,7 +5090,7 @@ impl Node {
         events: &[Event],
         driver: Driver,
     ) -> anyhow::Result<Attempt> {
-        let (shards, targets) = self.plan(route, &[]);
+        let (shards, targets) = Self::plan(layout, route, &[]);
         self.broadcast(
             &targets,
             Self::routed(
@@ -4959,6 +5098,7 @@ impl Node {
                 Message::BeginRecovery {
                     txn,
                     ballot,
+                    epoch: layout.epoch(),
                     keys: keys.to_vec(),
                     events: events.to_vec(),
                 },
@@ -4990,23 +5130,11 @@ impl Node {
         let (_, all_events) = self.reassemble(keys, events, &resp);
         let planned_keys: Vec<Key> = route
             .iter()
-            .filter(|k| planned.contains(&self.topology.shard_of(k)))
+            .filter(|k| planned.contains(&layout.shard_of(k)))
             .cloned()
             .collect();
-        let (plans, _union) = self.plan(&planned_keys, &all_events);
-        // One attempt, one layout: an epoch installed since the reports were
-        // gathered may have moved replicas between shards, and the reports
-        // were counted for the shards they were planned in. The sweep
-        // retries under the new layout.
-        let moved = plans.iter().any(|p| {
-            shards
-                .iter()
-                .find(|s| s.shard == p.shard)
-                .is_none_or(|s| s.replicas != p.replicas)
-        });
-        if moved {
-            anyhow::bail!("the layout changed while recovering {txn:?}; retrying");
-        }
+        // The same layout the reports were gathered and counted under.
+        let (plans, _union) = Self::plan(layout, &planned_keys, &all_events);
         let known: Vec<(NodeId, RecoverFields)> = resp
             .into_iter()
             .filter_map(|(from, r)| match r {
@@ -5020,7 +5148,7 @@ impl Node {
                     || Self::planned_shard(&plans, *from).is_some_and(|s| planned.contains(&s))
             })
             .collect();
-        self.drive_recovery(rx, txn, ballot, &plans, Some(route), known, driver)
+        self.drive_recovery(rx, layout, txn, ballot, &plans, Some(route), known, driver)
             .await
     }
 
@@ -5234,6 +5362,7 @@ impl Node {
     async fn drive_recovery(
         &self,
         rx: &mut mpsc::UnboundedReceiver<(NodeId, Message)>,
+        layout: &Layout,
         txn: TxnId,
         ballot: Ballot,
         plans: &[ShardPlan],
@@ -5327,6 +5456,7 @@ impl Node {
                         Message::Accept {
                             txn,
                             ballot,
+                            epoch: plan.epoch,
                             execute_at,
                             deps,
                             keys: plan.keys.clone(),
@@ -5383,7 +5513,7 @@ impl Node {
 
         let conflict = self
             .execute(
-                rx, plans, route, txn, execute_at, shard_deps, &applied, driver,
+                rx, layout, plans, route, txn, execute_at, shard_deps, &applied, driver,
             )
             .await?;
         Ok(Attempt::Done(CommitOutcome { txn, conflict }))
@@ -5394,7 +5524,7 @@ impl Node {
     /// [`recover`](Self::recover).
     pub async fn coordinate_preaccept(&self, events: Vec<Event>) -> anyhow::Result<TxnId> {
         let keys = Self::keys_of(&events);
-        let (plans, _union) = self.plan(&keys, &events);
+        let (plans, _union) = Self::plan(&self.topology.layout(), &keys, &events);
         let route = Self::route_of(&plans, &keys);
         let txn = TxnId(self.mint().await?);
 
@@ -5406,6 +5536,7 @@ impl Node {
                     route.as_deref(),
                     Message::PreAccept {
                         txn,
+                        epoch: plan.epoch,
                         keys: plan.keys.clone(),
                         events: plan.events.clone(),
                     },
@@ -5442,7 +5573,7 @@ impl Node {
     /// decides the transaction. For tests of [`recover`](Self::recover).
     pub async fn coordinate_through_commit(&self, events: Vec<Event>) -> anyhow::Result<TxnId> {
         let keys = Self::keys_of(&events);
-        let (plans, _union) = self.plan(&keys, &events);
+        let (plans, _union) = Self::plan(&self.topology.layout(), &keys, &events);
         let route = Self::route_of(&plans, &keys);
         let txn = TxnId(self.mint().await?);
         let mut rx = self.register(txn);
@@ -6296,13 +6427,7 @@ impl Node {
                     replica.redundant_before(),
                 )
             };
-            let my_shard = self.topology.node_shard(self.id);
-            let shard_peers: Vec<NodeId> = self
-                .topology
-                .nodes()
-                .into_iter()
-                .filter(|&n| self.topology.node_shard(n) == my_shard)
-                .collect();
+            let shard_peers = self.shard_peers();
             let vouched = match self.proven_coverage(&shard_peers) {
                 Some(coverage) => coverage.min(applied),
                 None => applied,
@@ -6343,6 +6468,7 @@ impl Node {
         shards: Vec<Vec<NodeId>>,
     ) -> anyhow::Result<Vec<Vec<NodeId>>> {
         validate_layout(&shards)?;
+        self.ensure_next_epoch(epoch)?;
         let acceptors = self.topology.nodes();
         let decided = self.run_config_paxos(epoch, shards, &acceptors).await?;
         self.commit_topology(epoch, &decided, &acceptors).await;
@@ -6358,8 +6484,22 @@ impl Node {
         proposed: Vec<Vec<NodeId>>,
     ) -> anyhow::Result<Vec<Vec<NodeId>>> {
         validate_layout(&proposed)?;
+        self.ensure_next_epoch(epoch)?;
         let acceptors = self.topology.nodes();
         self.run_config_paxos(epoch, proposed, &acceptors).await
+    }
+
+    /// Refuses a change for an epoch past the next one. Its acceptors would
+    /// be the members of the installed epoch, not of the one before it, and
+    /// its entry would wait for good for the epochs it skips. An epoch already
+    /// decided is not refused: the change returns its decided layout.
+    fn ensure_next_epoch(&self, epoch: u64) -> anyhow::Result<()> {
+        let next = self.installed_epoch() + 1;
+        anyhow::ensure!(
+            epoch <= next,
+            "epoch {epoch} skips past the next one, {next}: install the epochs before it first"
+        );
+        Ok(())
     }
 
     /// The committed layout for `epoch`, if it is already in the metadata log.
@@ -6542,6 +6682,7 @@ impl Node {
     /// then commits it. Any node can call this after the original coordinator
     /// fails.
     pub async fn recover_topology(&self, epoch: u64) -> anyhow::Result<Vec<Vec<NodeId>>> {
+        self.ensure_next_epoch(epoch)?;
         let acceptors = self.topology.nodes();
         // Anti-dueling deference (this is the automatic path, run by the sweep on
         // every node): the distinguished proposer for `epoch` (rank 0) drives first;
@@ -6570,6 +6711,11 @@ impl Node {
     fn ingest_entry(&self, epoch: u64, layout: Vec<Vec<NodeId>>) {
         {
             let mut log = self.meta_log.lock().expect("meta_log poisoned");
+            // Below the installed epoch an entry is history only (one the
+            // node started past): kept to recover what was planned under it.
+            if epoch < log.installed_epoch && validate_layout(&layout).is_ok() {
+                self.topology.install(epoch, layout.clone());
+            }
             log.entries.entry(epoch).or_insert(layout);
         }
         self.apply_log();
@@ -6792,24 +6938,25 @@ impl Node {
         (all_keys, all_events)
     }
 
-    /// The shards a key set touches — replica sets, quorum sizes, and each
-    /// shard's slice of `keys`/`events` (one partition pass, so PreAccept /
-    /// Accept / Commit ship each shard only what it owns) — plus the
-    /// deduplicated union of all their replicas.
-    fn plan(&self, keys: &[Key], events: &[Event]) -> (Vec<ShardPlan>, Vec<NodeId>) {
+    /// The shards a key set touches under `layout` — replica sets, quorum
+    /// sizes, and each shard's slice of `keys`/`events` (one partition pass,
+    /// so PreAccept / Accept / Commit ship each shard only what it owns) —
+    /// plus the deduplicated union of all their replicas.
+    fn plan(layout: &Layout, keys: &[Key], events: &[Event]) -> (Vec<ShardPlan>, Vec<NodeId>) {
         let mut shards: BTreeMap<ShardId, ShardPlan> = BTreeMap::new();
         let mut shard_of: HashMap<&str, ShardId> = HashMap::with_capacity(keys.len());
         for key in keys {
-            let shard = self.topology.shard_of(key);
+            let shard = layout.shard_of(key);
             shard_of.insert(key.0.as_str(), shard);
             shards
                 .entry(shard)
                 .or_insert_with(|| ShardPlan {
+                    epoch: layout.epoch(),
                     shard,
-                    replicas: self.topology.replicas(key),
-                    electorate: self.topology.fast_electorate(key),
-                    fast_q: self.topology.fast_quorum(key),
-                    slow_q: self.topology.slow_quorum(key),
+                    replicas: layout.replicas_of(shard).to_vec(),
+                    electorate: layout.electorate_of(shard).to_vec(),
+                    fast_q: layout.fast_quorum_of(shard),
+                    slow_q: layout.slow_quorum_of(shard),
                     keys: Vec::new(),
                     events: Vec::new(),
                 })
@@ -6822,7 +6969,7 @@ impl Node {
             // for one that is not.
             let shard = match shard_of.get(Key::str_of(event).as_ref()) {
                 Some(shard) => *shard,
-                None => self.topology.shard_of(&Key::of(event)),
+                None => layout.shard_of(&Key::of(event)),
             };
             if let Some(plan) = shards.get_mut(&shard) {
                 plan.events.push(event.clone());
@@ -6850,9 +6997,9 @@ impl Node {
         }
     }
 
-    /// Whether `keys` span more than one shard.
-    fn spans_shards(&self, keys: &[Key]) -> bool {
-        let mut shards = keys.iter().map(|k| self.topology.shard_of(k));
+    /// Whether `keys` span more than one shard of `layout`.
+    fn spans_shards(layout: &Layout, keys: &[Key]) -> bool {
+        let mut shards = keys.iter().map(|k| layout.shard_of(k));
         shards
             .next()
             .is_some_and(|first| shards.any(|shard| shard != first))
@@ -6870,9 +7017,9 @@ impl Node {
         union
     }
 
-    /// The events this node owns (keys in this node's shard). Ownership is
-    /// resolved once per distinct key, not once per event.
-    fn owned_events(&self, events: Vec<Event>) -> Vec<Event> {
+    /// The events this node owns under `layout` (keys in this node's shard
+    /// there). Ownership is resolved once per distinct key, not once per event.
+    fn owned_events(&self, layout: &Layout, events: Vec<Event>) -> Vec<Event> {
         let mut owned: HashMap<String, bool> = HashMap::new();
         events
             .into_iter()
@@ -6881,7 +7028,7 @@ impl Node {
                 match owned.get(key.as_ref()) {
                     Some(&v) => v,
                     None => {
-                        let v = self.topology.owns(self.id, &Key(key.to_string()));
+                        let v = layout.owns(self.id, &Key(key.to_string()));
                         owned.insert(key.into_owned(), v);
                         v
                     }
@@ -6890,11 +7037,80 @@ impl Node {
             .collect()
     }
 
-    /// The keys this node owns.
-    fn owned_keys(&self, keys: Vec<Key>) -> Vec<Key> {
+    /// The keys this node owns under `layout`.
+    fn owned_keys(&self, layout: &Layout, keys: Vec<Key>) -> Vec<Key> {
         keys.into_iter()
-            .filter(|k| self.topology.owns(self.id, k))
+            .filter(|k| layout.owns(self.id, k))
             .collect()
+    }
+
+    /// The layout a message about a transaction planned under `epoch` is
+    /// judged by: that epoch's, which the topology keeps. `None`, and the
+    /// message goes unanswered, when this node does not hold it: an epoch
+    /// still to come here, for which it asks `from` (which planned under it,
+    /// so holds it) for the metadata it misses, or one from before this node
+    /// started, when it was no replica of anything.
+    fn layout_for(
+        &self,
+        epoch: u64,
+        from: NodeId,
+        out: &mut Vec<(NodeId, Message)>,
+    ) -> Option<Arc<Layout>> {
+        if let Some(layout) = self.topology.layout_at(epoch) {
+            return Some(layout);
+        }
+        if epoch > self.topology.epoch() {
+            self.metrics.record_message_future_epoch();
+            tracing::debug!(
+                node = self.id.0,
+                from = from.0,
+                epoch,
+                "a message planned under an epoch not installed here; fetching it"
+            );
+            out.push((
+                from,
+                Message::MetadataFetch {
+                    after_epoch: self.installed_epoch(),
+                },
+            ));
+        }
+        None
+    }
+
+    /// Whether `txn`, which this node does not hold, was planned under
+    /// `layout`, an epoch since retired for one of `keys` (its route, when it
+    /// has one): a key whose replica set changed after. Its coordinator planned
+    /// before it installed the change, so it counts a quorum of replicas that
+    /// no longer all hold the key — a commit it reached through them would
+    /// miss the key's new replicas. Such a PreAccept, or read probe, gets no
+    /// answer (counted); the coordinator retries under the new layout. A
+    /// transaction this node already holds was proposed before the change,
+    /// and is finished under its own layout as before.
+    fn retired(&self, txn: TxnId, layout: &Layout, keys: &[Key]) -> bool {
+        let current = self.topology.layout();
+        if current.epoch() == layout.epoch()
+            || !keys.iter().any(|k| !layout.same_replicas(&current, k))
+        {
+            return false;
+        }
+        if self
+            .replica
+            .lock()
+            .expect("replica poisoned")
+            .status(txn)
+            .is_some()
+        {
+            return false;
+        }
+        self.metrics.record_vote_retired();
+        tracing::debug!(
+            node = self.id.0,
+            ?txn,
+            epoch = layout.epoch(),
+            current = current.epoch(),
+            "refusing a transaction planned under a layout retired since"
+        );
+        true
     }
 
     /// The distinct keys a set of events touches.
@@ -7449,6 +7665,7 @@ mod tests {
             ..Default::default()
         };
         Message::PreAccept {
+            epoch: 0,
             txn,
             keys: vec![Key(agg)],
             events: vec![event],
@@ -7490,7 +7707,7 @@ mod tests {
             "test aggregates must span both shards"
         );
 
-        let (plans, union) = node.plan(&keys, &events);
+        let (plans, union) = Node::plan(&node.topology.layout(), &keys, &events);
 
         assert_eq!(plans.len(), 2, "both shards are planned");
         let mut keys_covered = 0;
@@ -7551,11 +7768,12 @@ mod tests {
                 Arc::new(InMemoryDataStore::new()) as Arc<dyn DataStore>,
                 Arc::new(InMemoryJournal::new()) as Arc<dyn Journal>,
             );
-            let (plans, _) = node.plan(std::slice::from_ref(&key), &[]);
+            let (plans, _) = Node::plan(&node.topology.layout(), std::slice::from_ref(&key), &[]);
             let known: Vec<(NodeId, RecoverFields)> = votes
                 .iter()
                 .map(|&(id, vote)| {
                     let report = RecoverFields {
+                        epoch: 0,
                         known: true,
                         status: Status::PreAccepted,
                         accepted: Ballot(txn.0),
@@ -7624,6 +7842,7 @@ mod tests {
         sink.send(
             id,
             Message::Commit {
+                epoch: 0,
                 txn,
                 execute_at: txn.0,
                 deps: vec![],
@@ -7887,13 +8106,17 @@ mod tests {
         let journal = Arc::new(StageFailJournal::default());
         let node = stage_fail_node(&journal);
         let coord = NodeId(1);
-        let Message::PreAccept { txn, keys, events } = preaccept(0) else {
+        let Message::PreAccept {
+            txn, keys, events, ..
+        } = preaccept(0)
+        else {
             unreachable!()
         };
         let out = node
             .handle_staged(Envelope {
                 from: coord,
                 message: Message::Commit {
+                    epoch: 0,
                     txn,
                     execute_at: txn.0,
                     deps: Vec::new(),
@@ -8204,7 +8427,7 @@ mod tests {
 
         let (node, topology, events) = reshardable_node();
         let keys = Node::keys_of(&events);
-        let (plans, _) = node.plan(&keys, &events);
+        let (plans, _) = Node::plan(&node.topology.layout(), &keys, &events);
         let planned = |n: u64| {
             plans
                 .iter()
@@ -8276,11 +8499,12 @@ mod tests {
 
         let (node, topology, events) = reshardable_node();
         let keys = Node::keys_of(&events);
-        let (plans, _) = node.plan(&keys, &[]);
+        let (plans, _) = Node::plan(&node.topology.layout(), &keys, &[]);
         topology.install(1, swapped());
 
         let held = || {
             RecoverResp::Ok(RecoverFields {
+                epoch: 0,
                 known: true,
                 status: Status::PreAccepted,
                 accepted: Ballot(Timestamp::MIN),
@@ -8308,9 +8532,10 @@ mod tests {
     }
 
     /// A replica that holds nothing of a transaction and, under the layout
-    /// it installed, owns none of the keys a message carries is not that
-    /// shard's replica any more: it casts no vote, answers nothing and
-    /// records nothing — a stale-epoch coordinator must not count it.
+    /// the transaction was planned under, owns none of the keys a message
+    /// carries is no replica of the shard it was sent as: it casts no vote,
+    /// answers nothing and records nothing — a misrouted message must not be
+    /// counted.
     #[tokio::test]
     async fn a_replica_that_owns_none_of_the_keys_casts_no_vote() {
         use crate::clock::Ballot;
@@ -8333,17 +8558,20 @@ mod tests {
         assert!(!topology.owns(NodeId(0), &key));
 
         let txn = TxnId(Timestamp {
-            micros: 1_000,
+            micros: recent(1_000),
             logical: 0,
             node: NodeId(9),
         });
+        // Planned under epoch 1, where node 0 owns none of the key.
         let messages = [
             Message::PreAccept {
+                epoch: 1,
                 txn,
                 keys: vec![key.clone()],
                 events: vec![event.clone()],
             },
             Message::Accept {
+                epoch: 1,
                 txn,
                 ballot: Ballot(txn.0),
                 execute_at: txn.0,
@@ -8351,6 +8579,7 @@ mod tests {
                 keys: vec![key.clone()],
             },
             Message::Commit {
+                epoch: 1,
                 txn,
                 execute_at: txn.0,
                 deps: Vec::new(),
@@ -8369,6 +8598,102 @@ mod tests {
             assert!(out.is_empty(), "no vote and no answer: {out:?}");
             assert_eq!(node.command_status(txn), None, "nothing recorded");
         }
+    }
+
+    /// A replica a layout moved off a key still takes part in a transaction
+    /// planned before the move, as one of the replicas it was planned for: a
+    /// decision reached under that layout is applied, and an Accept a
+    /// recovery of it sends is answered. Only a new vote — a PreAccept from
+    /// a coordinator that planned before the change — is refused.
+    #[tokio::test]
+    async fn an_old_owner_finishes_a_transaction_planned_before_the_move() {
+        use crate::clock::Ballot;
+        use crate::message::Status;
+
+        let (node, topology, events) = reshardable_node();
+        let event = events
+            .iter()
+            .find(|e| topology.owns(NodeId(0), &Key::of(e)))
+            .expect("an event node 0 owns")
+            .clone();
+        let key = Key::of(&event);
+        topology.install(
+            1,
+            vec![
+                vec![NodeId(3), NodeId(1), NodeId(2)],
+                vec![NodeId(0), NodeId(4), NodeId(5)],
+            ],
+        );
+
+        let stale = TxnId(Timestamp {
+            micros: recent(1_000),
+            logical: 0,
+            node: NodeId(9),
+        });
+        let out = node
+            .handle_staged(Envelope {
+                from: NodeId(9),
+                message: Message::PreAccept {
+                    epoch: 0,
+                    txn: stale,
+                    keys: vec![key.clone()],
+                    events: vec![event.clone()],
+                },
+            })
+            .await;
+        assert!(
+            out.is_empty(),
+            "no new vote under a retired layout: {out:?}"
+        );
+
+        let accepted = TxnId(Timestamp {
+            micros: recent(2_000),
+            logical: 0,
+            node: NodeId(9),
+        });
+        let out = node
+            .handle_staged(Envelope {
+                from: NodeId(9),
+                message: Message::Accept {
+                    epoch: 0,
+                    txn: accepted,
+                    ballot: Ballot(accepted.0),
+                    execute_at: accepted.0,
+                    deps: Vec::new(),
+                    keys: vec![key.clone()],
+                },
+            })
+            .await;
+        assert!(
+            matches!(out.as_slice(), [(_, Message::AcceptOk { .. })]),
+            "{out:?}"
+        );
+
+        let committed = TxnId(Timestamp {
+            micros: recent(3_000),
+            logical: 0,
+            node: NodeId(9),
+        });
+        let out = node
+            .handle_staged(Envelope {
+                from: NodeId(9),
+                message: Message::Commit {
+                    epoch: 0,
+                    txn: committed,
+                    execute_at: committed.0,
+                    deps: Vec::new(),
+                    keys: vec![key.clone()],
+                    events: vec![event.clone()],
+                    reply_to: NodeId(9),
+                },
+            })
+            .await;
+        assert!(
+            out.iter()
+                .any(|(_, m)| matches!(m, Message::ReadOk { ok: true, .. })),
+            "{out:?}"
+        );
+        assert!(node.command_status(committed) >= Some(Status::Committed));
     }
 
     /// A replica that witnessed a transaction while it owned its keys still
@@ -8394,6 +8719,7 @@ mod tests {
             .handle_staged(Envelope {
                 from: NodeId(9),
                 message: Message::PreAccept {
+                    epoch: 0,
                     txn,
                     keys: vec![key.clone()],
                     events: vec![event.clone()],
@@ -8413,6 +8739,7 @@ mod tests {
             .handle_staged(Envelope {
                 from: NodeId(9),
                 message: Message::Accept {
+                    epoch: 0,
                     txn,
                     ballot: Ballot(txn.0),
                     execute_at: txn.0,

@@ -365,7 +365,9 @@ async fn a_config_vote_the_journal_did_not_persist_is_not_sent() {
     // Promises persist but accepts do not: no accept quorum.
     cluster.journals[1].set_accept_failing(true);
     cluster.journals[2].set_accept_failing(true);
-    let result = cluster.nodes[0].propose_topology(2, layout.clone()).await;
+    // The same epoch under a higher ballot: a change only ever proposes the
+    // next epoch.
+    let result = cluster.nodes[0].propose_topology(1, layout.clone()).await;
     assert!(
         result.is_err(),
         "decided on accepts that were never persisted: {result:?}"
@@ -375,7 +377,7 @@ async fn a_config_vote_the_journal_did_not_persist_is_not_sent() {
 
     // Healthy journals: the change is decided.
     cluster.nodes[0]
-        .propose_topology(3, layout)
+        .propose_topology(1, layout)
         .await
         .expect("acceptors that persist their votes decide");
 }
@@ -421,7 +423,15 @@ async fn an_epoch_the_journal_did_not_persist_is_not_installed() {
 
     cluster.journals[2].set_metadata_failing(false);
     await_epoch(cluster.topologies[2].as_ref(), 1).await;
-    assert_eq!(cluster.journals[2].load_metadata().await.unwrap().len(), 1);
+    // Epoch 1, and the starting layout journaled with it.
+    let epochs: Vec<u64> = cluster.journals[2]
+        .load_metadata()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(epoch, _)| epoch)
+        .collect();
+    assert_eq!(epochs, vec![0, 1]);
 }
 
 /// A node that cannot persist its clock bound must not use a timestamp past

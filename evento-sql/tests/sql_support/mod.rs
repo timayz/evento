@@ -22,6 +22,7 @@ pub fn timestamp(micros: u64, node: u64) -> Timestamp {
 pub fn command(micros: u64, version: u16) -> CommandState {
     let txn = TxnId(timestamp(micros, 0));
     CommandState {
+        epoch: 0,
         txn,
         status: Status::Applied,
         promised: Ballot(txn.0),
@@ -280,6 +281,7 @@ where
     journal.save_promise(new, low).await.unwrap();
     journal.save_promise(new, high).await.unwrap();
     let decision = |txn: TxnId, conflict: bool| DecisionRecord {
+        epoch: 0,
         txn,
         execute_at: timestamp(txn.0.micros + 1, 0),
         conflict,

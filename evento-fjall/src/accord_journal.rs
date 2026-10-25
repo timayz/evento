@@ -566,6 +566,7 @@ mod tests {
             node: NodeId(0),
         });
         CommandState {
+            epoch: 0,
             txn,
             status: Status::PreAccepted,
             promised: Ballot(txn.0),

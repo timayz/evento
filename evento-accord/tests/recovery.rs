@@ -61,6 +61,7 @@ impl Scripted {
                     Message::BeginRecovery { txn, ballot, .. } => {
                         tokio::time::sleep(report.delay).await;
                         Some(Message::BeginRecoveryOk {
+                            epoch: 0,
                             txn,
                             ballot,
                             known: report.known,
@@ -154,6 +155,7 @@ async fn setup() -> Setup {
         .send(
             NodeId(0),
             Message::PreAccept {
+                epoch: 0,
                 txn,
                 keys: keys.clone(),
                 events: events.clone(),
@@ -328,6 +330,7 @@ async fn votes(n: u64) -> Votes {
             .send(
                 NodeId(0),
                 Message::PreAccept {
+                    epoch: 0,
                     txn,
                     keys: keys.clone(),
                     events,
@@ -527,6 +530,7 @@ impl Fence {
 
     fn preaccept(&self) -> Message {
         Message::PreAccept {
+            epoch: 0,
             txn: self.txn,
             keys: self.keys.clone(),
             events: self.events.clone(),
@@ -535,6 +539,7 @@ impl Fence {
 
     fn accept(&self) -> Message {
         Message::Accept {
+            epoch: 0,
             txn: self.txn,
             ballot: Ballot(self.txn.0),
             execute_at: self.txn.0,
@@ -654,6 +659,7 @@ async fn recovery_preaccepts_at_replicas_that_never_saw_the_transaction() {
         node: NodeId(9),
     });
     let preaccept = Message::PreAccept {
+        epoch: 0,
         txn,
         keys: vec![Key("acc".into())],
         events: vec![event("acc", 1)],
@@ -1282,6 +1288,7 @@ async fn a_replica_reads_its_own_forgotten_write_as_holding() {
         .send(
             NodeId(0),
             Message::Commit {
+                epoch: 0,
                 txn,
                 execute_at: txn.0,
                 deps: Vec::new(),
@@ -1374,6 +1381,7 @@ async fn a_vote_fence_outlives_a_restart_with_a_clock_stepped_back() {
         .send(
             NodeId(0),
             Message::BeginRecovery {
+                epoch: 0,
                 txn,
                 ballot: Ballot(Timestamp {
                     micros: coverage.micros + 1,
