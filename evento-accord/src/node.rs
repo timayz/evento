@@ -34,7 +34,9 @@ use crate::api::{
 };
 use crate::clock::{Ballot, Clock, HybridLogicalClock, NodeId, Timestamp, TxnId};
 use crate::failure_detector::FailureDetector;
-use crate::message::{CommandState, Key, Message, Status, SyncKnown, INVALIDATED_AT};
+use crate::message::{
+    CommandState, Key, Message, RecoveryRound, Status, SyncKnown, INVALIDATED_AT,
+};
 use crate::metrics::{Metrics, MetricsSnapshot};
 use crate::reconfig::{self, Fence, Floor, Transition};
 use crate::replica::{Refusal, Replica, RoutedRecovery};
@@ -1398,7 +1400,7 @@ impl Node {
     /// at a reading leaves the node before a clock bound past it is persisted
     /// ([`bound_clock_past`](Self::bound_clock_past)) — so the fence is above
     /// all of them.
-    fn vote_fence(&self) -> Timestamp {
+    pub fn vote_fence(&self) -> Timestamp {
         Timestamp {
             micros: self
                 .clock
@@ -2584,6 +2586,7 @@ impl Node {
             &peers,
             Message::Watermark {
                 applied_through: mine,
+                applied: Timestamp::MIN,
                 fenced,
                 copied,
                 live_since,
@@ -2841,6 +2844,7 @@ impl Node {
                 from,
                 Message::Watermark {
                     applied_through: mine,
+                    applied: Timestamp::MIN,
                     fenced: self.reportable_fence(),
                     copied: self.copied_report(),
                     live_since: self.live_since(),
@@ -3260,6 +3264,7 @@ impl Node {
                 epoch,
                 keys,
                 events,
+                round: _,
             } => {
                 if self.future_dated(txn) {
                     return out;
@@ -3609,6 +3614,7 @@ impl Node {
             }
             Message::Watermark {
                 applied_through,
+                applied: _,
                 fenced,
                 copied,
                 live_since,
@@ -4929,6 +4935,7 @@ impl Node {
                 epoch: self.topology.epoch(),
                 keys: Vec::new(),
                 events: Vec::new(),
+                round: RecoveryRound::Ask,
             },
         )
         .await;
@@ -5151,6 +5158,7 @@ impl Node {
                 epoch: layout.epoch(),
                 keys: keys.to_vec(),
                 events: events.to_vec(),
+                round: RecoveryRound::Ask,
             },
         )
         .await;
@@ -5207,6 +5215,7 @@ impl Node {
                     epoch: layout.epoch(),
                     keys: all_keys.clone(),
                     events: all_events.clone(),
+                    round: RecoveryRound::Ask,
                 },
             )
             .await;
@@ -5466,6 +5475,7 @@ impl Node {
                     epoch: layout.epoch(),
                     keys: keys.to_vec(),
                     events: events.to_vec(),
+                    round: RecoveryRound::Ask,
                 },
             ),
         )
@@ -6082,6 +6092,7 @@ impl Node {
                 &peers,
                 Message::Watermark {
                     applied_through: mine,
+                    applied: Timestamp::MIN,
                     fenced: self.reportable_fence(),
                     copied: self.copied_report(),
                     live_since,
@@ -6657,6 +6668,7 @@ impl Node {
                         contact,
                         Message::Watermark {
                             applied_through: Timestamp::MIN,
+                            applied: Timestamp::MIN,
                             fenced: None,
                             copied: None,
                             live_since: self.live_since(),
@@ -9568,6 +9580,7 @@ mod tests {
                 logical: 0,
                 node: NodeId(micros),
             },
+            applied: Timestamp::MIN,
             fenced: None,
             copied: None,
             live_since: 0,

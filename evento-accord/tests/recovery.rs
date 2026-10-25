@@ -8,7 +8,7 @@ use std::time::Duration;
 use evento_accord::{
     Ballot, Clock, DataStore, Envelope, HybridLogicalClock, InMemoryDataStore, InMemoryJournal,
     InMemoryNetwork, InMemorySink, Journal, Key, Message, MessageSink, Node, NodeConfig, NodeId,
-    ShardedTopology, StaticTopology, Status, Timestamp, Topology, TxnId,
+    RecoveryRound, ShardedTopology, StaticTopology, Status, Timestamp, Topology, TxnId,
 };
 use evento_core::Event;
 use tokio::sync::mpsc;
@@ -1390,6 +1390,7 @@ async fn a_vote_fence_outlives_a_restart_with_a_clock_stepped_back() {
                 }),
                 keys: vec![Key("acc".into())],
                 events: vec![event("acc", 1)],
+                round: RecoveryRound::Ask,
             },
         )
         .await

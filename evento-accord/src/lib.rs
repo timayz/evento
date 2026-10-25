@@ -46,7 +46,7 @@ pub use api::{
 pub use clock::{Ballot, Clock, HybridLogicalClock, NodeId, Timestamp, TxnId, MAX_SKEW_MICROS};
 pub use executor::{AccordExecutor, ExecutorDataStore};
 pub use failure_detector::FailureDetector;
-pub use message::{CommandState, Key, Message, Status};
+pub use message::{CommandState, Key, Message, RecoveryRound, Status};
 pub use metrics::{Metrics, MetricsSnapshot};
 pub use node::{
     BacklogAtCap, CommandTooLarge, CommitOutcome, FenceNotCovered, LostJournal, Node, NodeClosed,

@@ -11,8 +11,8 @@ use std::time::Duration;
 use evento_accord::clock::system_micros;
 use evento_accord::{
     Ballot, Clock, DataStore, Envelope, HybridLogicalClock, InMemoryDataStore, InMemoryJournal,
-    InMemoryNetwork, Journal, Key, Message, MessageSink, Node, NodeConfig, NodeId, StaticTopology,
-    Status, Timestamp, TxnId,
+    InMemoryNetwork, Journal, Key, Message, MessageSink, Node, NodeConfig, NodeId, RecoveryRound,
+    StaticTopology, Status, Timestamp, TxnId,
 };
 use evento_core::Event;
 use tokio::sync::mpsc;
@@ -301,6 +301,7 @@ async fn a_rejoined_replica_keeps_its_preaccept_vote() {
             ballot: b,
             keys: vec![acc_key()],
             events: vec![event("acc", 1)],
+            round: RecoveryRound::Ask,
         },
     )
     .await;

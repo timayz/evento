@@ -277,6 +277,13 @@ pub enum Message {
     /// on, with these reports, before it installs the new layout.
     Watermark {
         applied_through: Timestamp,
+        /// The sender's applied-through, lagged by its compaction margin but
+        /// not clamped by its sync coverage: below it, every transaction the
+        /// sender holds is applied. A transaction a slow quorum of a shard
+        /// holds unapplied keeps the shard's applied floor (the slow-quorum-th
+        /// lowest of these) below it, and no replica of the shard exports sync
+        /// coverage past that floor (#337).
+        applied: Timestamp,
         fenced: Option<FenceRecord>,
         /// The transition (its `since`) for which the sender copied every
         /// slot it gains, if one is in progress: what its activation waits on
@@ -416,6 +423,9 @@ pub enum Message {
         keys: Vec<Key>,
         #[serde(with = "wire_events")]
         events: Vec<Event>,
+        /// What a replica that never witnessed the transaction, past its
+        /// coordinator's deadline, does (see [`RecoveryRound`]).
+        round: RecoveryRound,
     },
     /// Replica → recovery coordinator: a [`RecoverOk`](Message::RecoverOk) plus
     /// `wait` — an earlier conflict was accepted to execute after `txn`'s `t0`
@@ -540,6 +550,43 @@ pub enum Message {
         slots: Vec<u16>,
         after: Option<Value>,
     },
+    /// Replica → recovery coordinator, answering an unrouted
+    /// [`BeginRecovery`](Message::BeginRecovery) of a transaction it never
+    /// witnessed, past its original coordinator's deadline (its clock less
+    /// the compaction margin), and not below its vote fence: it promised the
+    /// ballot, and neither votes for the transaction nor refuses it yet. The
+    /// recovery, which sees every reply, then asks it to vote — the replies
+    /// show the transaction may have committed, and deciding it may take this
+    /// vote (#337) — or to refuse it for good, which lets the recovery
+    /// invalidate a transaction too few replicas hold (see
+    /// [`RecoveryRound`]); or, while the replicas it did not hear from decide
+    /// which, nothing yet.
+    Late { txn: TxnId, ballot: Ballot },
+}
+
+/// What a [`BeginRecovery`](Message::BeginRecovery) asks of a replica that
+/// never witnessed the transaction, is past its original coordinator's
+/// deadline (its clock less the compaction margin), and is not below its
+/// vote fence (#337). Within the deadline such a replica pre-accepts
+/// whatever the round; below its vote fence it refuses whatever the round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RecoveryRound {
+    /// The first round: it answers [`Late`](Message::Late).
+    Ask,
+    /// The recovery found the transaction may have committed: it
+    /// pre-accepts it, and its vote helps decide it.
+    Vote,
+    /// The recovery found the transaction never committed if the late
+    /// replicas refuse it: it refuses it for good — journaled, it never votes
+    /// for it again — and answers [`NotWitnessed`](Message::NotWitnessed).
+    Refuse,
+    /// A dependency this node never witnessed, which a command committed
+    /// here waits on, and which no replica it heard holds: asked of its
+    /// shard's replicas without keys. A replica that holds nothing of it
+    /// answers as for [`Ask`](Self::Ask) — though it may own the
+    /// transaction's keys without being told them, it is a replica of the
+    /// shard the dependency was scoped to.
+    Dependency,
 }
 
 impl Message {
@@ -562,6 +609,7 @@ impl Message {
             | Message::BeginRecoveryOk { txn, .. }
             | Message::NotWitnessed { txn, .. }
             | Message::Amnesiac { txn, .. }
+            | Message::Late { txn, .. }
             | Message::Invalidate { txn }
             | Message::ReadProbeOk { txn, .. } => Some(*txn),
             Message::Routed { inner, .. } => inner.txn(),
@@ -942,6 +990,15 @@ mod tests {
             },
             Message::Invalidate { txn },
             Message::Amnesiac { txn, ballot },
+            Message::Late { txn, ballot },
+            Message::BeginRecovery {
+                txn,
+                ballot,
+                epoch: 0,
+                keys: Vec::new(),
+                events: Vec::new(),
+                round: RecoveryRound::Refuse,
+            },
         ] {
             assert_eq!(message.txn(), Some(txn));
             let bytes = encode_tagged(RecordKind::WireFrame, &message).unwrap();
