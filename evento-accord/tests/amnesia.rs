@@ -7,7 +7,8 @@
 //! that did not can commit any more. A plain open over an empty journal but
 //! a store holding events is refused. Whatever the journal, a replica never
 //! votes for a transaction dated past its clock's skew bound, and one that
-//! lost a journal under its node id abstains from config Paxos for good.
+//! lost a journal under its node id abstains from config Paxos until it read
+//! the other acceptors' state back from a majority of them (#338).
 //!
 //! A journal rolled back to an older copy of itself forgot the votes and
 //! promises made since (#339). A replica opened over a journal that holds
@@ -21,10 +22,10 @@ use std::time::Duration;
 
 use evento_accord::clock::system_micros;
 use evento_accord::{
-    AmnesiaFence, Ballot, Clock, DataStore, DurableMark, Envelope, FenceNotCovered,
-    HybridLogicalClock, InMemoryDataStore, InMemoryJournal, InMemoryNetwork, Journal,
-    JournalRolledBack, Key, LostJournal, Message, MessageSink, Node, NodeConfig, NodeId,
-    OpenUnconfirmed, StaticTopology, Timestamp, TxnId,
+    AcceptorRecord, AmnesiaFence, Ballot, Clock, DataStore, DurableMark, DynamicTopology, Envelope,
+    FenceNotCovered, HybridLogicalClock, InMemoryDataStore, InMemoryJournal, InMemoryNetwork,
+    Journal, JournalRolledBack, Key, LostJournal, Message, MessageSink, Node, NodeConfig, NodeId,
+    OpenUnconfirmed, StaticTopology, Timestamp, Topology, TxnId,
 };
 use evento_core::Event;
 use tokio::sync::mpsc;
@@ -112,9 +113,28 @@ async fn next_within(inbox: &mut mpsc::Receiver<Envelope>, wait: Duration) -> Op
         .map(|envelope| envelope.message)
 }
 
+/// Asserts `reply` refuses a config ballot for epoch 1, naming `promised`.
+fn expect_nack(reply: Option<Message>, promised: Ballot) {
+    match reply {
+        Some(Message::ConfigNack {
+            epoch: 1,
+            promised: named,
+        }) => assert_eq!(named, promised, "the refusal names another promise"),
+        other => panic!("not a refusal naming the promise: {other:?}"),
+    }
+}
+
 /// A node's running tasks, shared with a join in flight so it can add the
 /// recovery sweep it starts once joined.
 type Tasks = Arc<Mutex<Vec<JoinHandle<()>>>>;
+
+/// How a cluster's nodes know their layout: fixed, or decided by config
+/// Paxos and the metadata log (a `DynamicTopology` at epoch 0).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Static,
+    Dynamic,
+}
 
 /// `n` real replicas `{0..n}` of one shard, each running its inbox loop and
 /// recovery sweep over an in-memory store and journal, plus the inbox of an
@@ -122,6 +142,7 @@ type Tasks = Arc<Mutex<Vec<JoinHandle<()>>>>;
 struct Cluster {
     net: Arc<InMemoryNetwork>,
     n: u64,
+    kind: Kind,
     config: NodeConfig,
     nodes: Vec<Node>,
     stores: Vec<Arc<InMemoryDataStore>>,
@@ -136,7 +157,25 @@ impl Cluster {
         Self::start_with(n, config(), clock)
     }
 
+    /// A cluster whose layout config Paxos decides, at epoch 0.
+    fn start_dynamic(n: u64) -> Self {
+        Self::start_dynamic_with(n, config())
+    }
+
+    fn start_dynamic_with(n: u64, config: NodeConfig) -> Self {
+        Self::start_as(Kind::Dynamic, n, config, clock)
+    }
+
     fn start_with(
+        n: u64,
+        config: NodeConfig,
+        clocks: impl Fn(NodeId) -> Arc<HybridLogicalClock>,
+    ) -> Self {
+        Self::start_as(Kind::Static, n, config, clocks)
+    }
+
+    fn start_as(
+        kind: Kind,
         n: u64,
         config: NodeConfig,
         clocks: impl Fn(NodeId) -> Arc<HybridLogicalClock>,
@@ -146,6 +185,7 @@ impl Cluster {
             coordinator: net.register(NodeId(9)),
             net,
             n,
+            kind,
             config,
             nodes: Vec::new(),
             stores: Vec::new(),
@@ -178,9 +218,14 @@ impl Cluster {
         clock: &Arc<HybridLogicalClock>,
     ) -> Node {
         let id = NodeId(i);
+        let nodes: Vec<NodeId> = (0..self.n).map(NodeId).collect();
+        let topology: Arc<dyn Topology> = match self.kind {
+            Kind::Static => Arc::new(StaticTopology::new(id, nodes)),
+            Kind::Dynamic => Arc::new(DynamicTopology::new(id, 0, vec![nodes])),
+        };
         Node::new(
             id,
-            Arc::new(StaticTopology::new(id, (0..self.n).map(NodeId).collect())),
+            topology,
             Arc::clone(clock),
             Arc::new(self.net.sink(id)) as Arc<dyn MessageSink>,
             Arc::clone(store) as Arc<dyn DataStore>,
@@ -346,6 +391,41 @@ impl Cluster {
             .send(NodeId(to), message)
             .await
             .unwrap();
+    }
+
+    /// The one shard every node is in: the layout a config change repeats.
+    fn layout(&self) -> Vec<Vec<NodeId>> {
+        vec![(0..self.n).map(NodeId).collect()]
+    }
+
+    /// Node `i`'s journaled config-acceptor state for `epoch`.
+    async fn acceptor(&self, i: u64, epoch: u64) -> Option<AcceptorRecord> {
+        self.journals[i as usize]
+            .load_acceptors()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|(e, _)| *e == epoch)
+            .map(|(_, record)| record)
+    }
+
+    /// Whether node `i`, back over a lost journal, restored its config
+    /// votes (#338).
+    fn votes_restored(&self, i: u64) -> bool {
+        self.nodes[i as usize]
+            .amnesia_fence()
+            .is_some_and(|fence| fence.votes_restored)
+    }
+
+    /// Reopens node `i` over a lost journal through `contact`, and waits
+    /// for its join.
+    async fn lose_and_rejoin(&mut self, i: u64, contact: u64) {
+        let join = self.reopen_amnesiac(i, contact).await;
+        tokio::time::timeout(Duration::from_secs(20), join)
+            .await
+            .expect("the join completes")
+            .unwrap()
+            .expect("joined");
     }
 
     /// A write every replica applies.
@@ -815,19 +895,21 @@ async fn a_journal_that_cannot_keep_the_fence_refuses_an_amnesiac_open() {
         .expect_err("a journal that cannot keep the fence must refuse");
 }
 
-/// A replica that lost its journal forgot its config-Paxos promises and
-/// accepts: it never answers config Paxos again under its node id — not
-/// after its join, not after a restart.
+/// A replica that lost its journal forgot the config-Paxos promises and
+/// accepts it made. It abstains — a prepare or accept gets no answer, and
+/// a read of its state says so — until it read the others' state back from
+/// a majority of all the acceptors (#338): then it holds what they hold,
+/// and votes again only above it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_amnesiac_acceptor_never_answers_config_paxos_again() {
-    let mut c = Cluster::start(3);
+async fn an_amnesiac_acceptor_answers_config_paxos_again_once_restored() {
+    let mut c = Cluster::start_dynamic(3);
     c.baseline().await;
-    let join = c.reopen_amnesiac(R, B).await;
-    tokio::time::timeout(Duration::from_secs(20), join)
+    c.nodes[A as usize]
+        .change_topology(1, c.layout())
         .await
-        .expect("the join completes")
-        .unwrap()
-        .expect("joined");
+        .expect("epoch 1");
+    let held = c.acceptor(A, 1).await.expect("A accepted epoch 1");
+    let (decided, entry) = held.accepted.clone().expect("A accepted a value");
     let ballot = |micros: u64| {
         Ballot(Timestamp {
             micros,
@@ -835,47 +917,294 @@ async fn an_amnesiac_acceptor_never_answers_config_paxos_again() {
             node: NodeId(9),
         })
     };
-    let layout = vec![(0..3).map(NodeId).collect::<Vec<_>>()];
-    let now = system_micros();
 
+    let join = c.reopen_amnesiac(R, B).await;
+    // Still joining: it answers the read with nothing, abstaining.
+    c.send(9, R, Message::ConfigRead { id: 7 }).await;
+    match next_within(&mut c.coordinator, Duration::from_secs(2)).await {
+        Some(Message::ConfigReadReply {
+            id: 7,
+            acceptors,
+            voting: false,
+        }) => assert!(acceptors.is_empty(), "it forgot everything: {acceptors:?}"),
+        other => panic!("not an abstaining answer: {other:?}"),
+    }
     c.send(
         9,
         R,
         Message::ConfigPrepare {
             epoch: 1,
-            ballot: ballot(now),
+            ballot: ballot(decided.0.micros - 1),
         },
     )
     .await;
+    let reply = next_within(&mut c.coordinator, Duration::from_millis(300)).await;
+    assert!(
+        reply.is_none(),
+        "R answered config Paxos unrestored: {reply:?}"
+    );
+    assert_eq!(c.nodes[R as usize].metrics().config_votes_withheld, 1);
+    tokio::time::timeout(Duration::from_secs(20), join)
+        .await
+        .expect("the join completes")
+        .unwrap()
+        .expect("joined");
+
+    await_until(
+        "R restores its config votes",
+        Duration::from_secs(10),
+        || c.votes_restored(R),
+    )
+    .await;
+    assert_eq!(c.nodes[R as usize].metrics().config_votes_restored, 1);
+    assert_eq!(
+        c.acceptor(R, 1).await,
+        Some(held.clone()),
+        "R journaled what A holds for epoch 1"
+    );
+    // Below what the others promised: refused, naming it.
+    c.send(
+        9,
+        R,
+        Message::ConfigPrepare {
+            epoch: 1,
+            ballot: ballot(decided.0.micros - 1),
+        },
+    )
+    .await;
+    expect_nack(
+        next_within(&mut c.coordinator, Duration::from_secs(2)).await,
+        held.promised,
+    );
     c.send(
         9,
         R,
         Message::ConfigAccept {
             epoch: 1,
-            ballot: ballot(now + 1),
-            entry: evento_accord::ConfigEntry::active(layout.clone()),
+            ballot: ballot(decided.0.micros - 1),
+            entry: entry.clone(),
         },
     )
     .await;
-    let reply = next_within(&mut c.coordinator, Duration::from_millis(500)).await;
-    assert!(reply.is_none(), "R answered config Paxos: {reply:?}");
-    assert_eq!(c.nodes[R as usize].metrics().config_votes_withheld, 2);
-
-    c.restart(R).await;
+    expect_nack(
+        next_within(&mut c.coordinator, Duration::from_secs(2)).await,
+        held.promised,
+    );
+    // Above it: promised, reporting the value the others accepted.
+    let above = ballot(system_micros());
     c.send(
         9,
         R,
         Message::ConfigPrepare {
-            epoch: 2,
-            ballot: ballot(now + 2),
+            epoch: 1,
+            ballot: above,
         },
     )
     .await;
-    let reply = next_within(&mut c.coordinator, Duration::from_millis(500)).await;
+    match next_within(&mut c.coordinator, Duration::from_secs(2)).await {
+        Some(Message::ConfigPromise {
+            epoch: 1,
+            ballot,
+            accepted_ballot,
+            accepted_entry,
+        }) => {
+            assert_eq!(ballot, above);
+            assert_eq!(accepted_ballot, decided);
+            assert_eq!(accepted_entry, Some(entry));
+        }
+        other => panic!("not a promise of the value the others accepted: {other:?}"),
+    }
+    assert_eq!(c.nodes[R as usize].metrics().config_votes_withheld, 1);
+}
+
+/// A read that hears fewer voting acceptors than a majority of all of
+/// them restores nothing: the node keeps abstaining, and reads again each
+/// sweep until it hears enough (#338).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_that_hears_too_few_acceptors_waits_for_them() {
+    // Long collection windows: the read waits that long past the fence,
+    // which leaves time to cut a node off once the join is done.
+    let mut c = Cluster::start_dynamic_with(
+        3,
+        NodeConfig {
+            collect_timeout: Duration::from_secs(3),
+            ..config()
+        },
+    );
+    c.baseline().await;
+    c.nodes[A as usize]
+        .change_topology(1, c.layout())
+        .await
+        .expect("epoch 1");
+    c.lose_and_rejoin(R, B).await;
+    assert!(!c.votes_restored(R), "restored before the read could run");
+    c.cut_off(A);
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert!(
+        !c.votes_restored(R),
+        "restored on B's answer alone: one of three acceptors is no majority"
+    );
+    c.send(
+        9,
+        R,
+        Message::ConfigPrepare {
+            epoch: 1,
+            ballot: Ballot(Timestamp {
+                micros: system_micros(),
+                logical: 0,
+                node: NodeId(9),
+            }),
+        },
+    )
+    .await;
+    let reply = next_within(&mut c.coordinator, Duration::from_millis(300)).await;
     assert!(
         reply.is_none(),
-        "R answered config Paxos after a restart: {reply:?}"
+        "R answered config Paxos unrestored: {reply:?}"
     );
+    assert_eq!(c.nodes[R as usize].metrics().config_votes_withheld, 1);
+
+    c.heal();
+    await_until(
+        "R restores its config votes",
+        Duration::from_secs(15),
+        || c.votes_restored(R),
+    )
+    .await;
+    assert_eq!(
+        c.acceptor(R, 1).await,
+        c.acceptor(A, 1).await,
+        "R journaled what A holds for epoch 1"
+    );
+}
+
+/// In a group of three, each of two replicas that lost their journals
+/// before either restored its votes needs the other's answer, which counts
+/// for nothing: neither restores, and the group's config is frozen (#338,
+/// OPERATIONS §7). The way out is a new node id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_overlapping_losses_in_a_group_of_three_never_restore() {
+    let mut c = Cluster::start_dynamic_with(
+        3,
+        NodeConfig {
+            collect_timeout: Duration::from_secs(3),
+            ..config()
+        },
+    );
+    c.baseline().await;
+    c.nodes[A as usize]
+        .change_topology(1, c.layout())
+        .await
+        .expect("epoch 1");
+    c.lose_and_rejoin(R, B).await;
+    c.lose_and_rejoin(B, A).await;
+    assert!(!c.votes_restored(R) && !c.votes_restored(B));
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    assert!(
+        !c.votes_restored(R) && !c.votes_restored(B),
+        "an abstaining acceptor's answer counted"
+    );
+    for i in [R, B] {
+        c.send(
+            9,
+            i,
+            Message::ConfigPrepare {
+                epoch: 1,
+                ballot: Ballot(Timestamp {
+                    micros: system_micros(),
+                    logical: 0,
+                    node: NodeId(9),
+                }),
+            },
+        )
+        .await;
+        let reply = next_within(&mut c.coordinator, Duration::from_millis(300)).await;
+        assert!(
+            reply.is_none(),
+            "node {i} answered config Paxos unrestored: {reply:?}"
+        );
+        assert_eq!(c.nodes[i as usize].metrics().config_votes_withheld, 1);
+    }
+}
+
+/// The restored votes are journaled before the fence records them: a plain
+/// restart keeps both (#338).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restored_config_vote_outlives_a_restart() {
+    let mut c = Cluster::start_dynamic(3);
+    c.baseline().await;
+    c.nodes[A as usize]
+        .change_topology(1, c.layout())
+        .await
+        .expect("epoch 1");
+    let held = c.acceptor(A, 1).await.expect("A accepted epoch 1");
+    c.lose_and_rejoin(R, B).await;
+    await_until(
+        "R restores its config votes",
+        Duration::from_secs(10),
+        || c.votes_restored(R),
+    )
+    .await;
+
+    c.restart(R).await;
+    let node = c.nodes[R as usize].clone();
+    await_until("R's restart is confirmed", Duration::from_secs(5), || {
+        node.confirmed()
+    })
+    .await;
+    assert!(c.votes_restored(R), "the restart forgot the restoration");
+    c.send(
+        9,
+        R,
+        Message::ConfigPrepare {
+            epoch: 1,
+            ballot: Ballot(Timestamp {
+                micros: held.promised.0.micros - 1,
+                logical: 0,
+                node: NodeId(9),
+            }),
+        },
+    )
+    .await;
+    expect_nack(
+        next_within(&mut c.coordinator, Duration::from_secs(2)).await,
+        held.promised,
+    );
+    assert_eq!(c.nodes[R as usize].metrics().config_votes_withheld, 0);
+}
+
+/// Every acceptor loses its journal in turn, each restoring its votes
+/// before the next: a restored acceptor's answer counts, so each read
+/// hears a majority, and the group still changes its layout (#338).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn acceptors_that_lose_their_journals_one_after_another_still_change_the_topology() {
+    let mut c = Cluster::start_dynamic(3);
+    c.baseline().await;
+    c.nodes[A as usize]
+        .change_topology(1, c.layout())
+        .await
+        .expect("epoch 1");
+    for i in [R, A, B] {
+        c.lose_and_rejoin(i, (i + 1) % 3).await;
+        await_until(
+            "the node restores its config votes",
+            Duration::from_secs(10),
+            || c.votes_restored(i),
+        )
+        .await;
+    }
+    c.nodes[A as usize]
+        .change_topology(2, c.layout())
+        .await
+        .expect("epoch 2, decided by acceptors that all lost a journal");
+    for i in 0..3 {
+        assert!(
+            c.acceptor(i, 2)
+                .await
+                .is_some_and(|acc| acc.accepted.is_some()),
+            "node {i} holds no accept for epoch 2"
+        );
+    }
 }
 
 /// A transaction dated more than two skews past a replica's clock comes from

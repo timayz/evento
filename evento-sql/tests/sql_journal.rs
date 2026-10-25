@@ -195,6 +195,7 @@ async fn amnesia_fence_survives_close_and_reopen() {
     let fence = evento_accord::AmnesiaFence {
         fence_micros: 1_234,
         joined: true,
+        votes_restored: true,
     };
     {
         let journal = at(&path).await;

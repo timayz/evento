@@ -148,7 +148,9 @@ gaps:
   take is not installed, and the commit or the metadata sweep retries it, so a
   restart never falls back below an epoch the node acted on; `recover_state`
   restores both, so a restarted acceptor keeps its promised ballots (Paxos
-  crash-safety) and re-installs its epoch prefix.
+  crash-safety) and re-installs its epoch prefix. A proposer counts no reply older
+  than `collect_timeout` (each phase collects until then): an acceptor that lost
+  its journal relies on it to vote again (#338, below).
 - **Automatic completion.** The recovery sweep finishes any accepted-but-uncommitted
   epoch itself (the automatic equivalent of `recover_topology`).
 - **Valid layouts only** (`validate_layout`): at least one shard, none empty, every
@@ -906,8 +908,28 @@ backend (sql/fjall). Phases, in order:
   below it, and their #310 vote fences refuse it; the forgotten vote leaves fewer
   than a quorum). Its stale reports lie below the fence too. Once joined it is an
   ordinary replica that never votes below its fence for what it does not hold, and
-  it abstains from config Paxos for good — an epoch's promises have no bound in
-  time to fence. While it waits, it answers a recovery of a transaction below its
+  it abstains from config Paxos — an epoch's promises have no bound in time to
+  fence — until it **read the other acceptors' state back** (#338,
+  `Message::ConfigRead`, `AmnesiaFence::votes_restored`): what plays for config
+  Paxos the role the fence plays for transactions. It asks every other acceptor
+  for every epoch's promised ballot and accepted value, and needs answers from a
+  majority of *all* the acceptors among those that vote themselves — one that lost
+  its journal and has not restored its votes answers `voting: false`, and counts
+  for nothing: counting it would let two such replicas each read past the other's
+  forgotten promise. Any majority that promised or accepted a ballot meets those
+  answers in a sound acceptor, so the merged state (per epoch, the highest ballot
+  promised or accepted, and the value accepted under the highest ballot, adopted
+  as this node's own) lies above everything it forgot as part of a majority. A
+  vote of its own that no majority yet shared is covered by *when* it reads: no
+  earlier than `collect_timeout` past its fence, since a proposer counts no reply
+  older than that, so every round that counted a reply made before the loss ended
+  before the read, and whatever it accepted is journaled at a sound acceptor the
+  read meets. The adopted state is journaled before the fence records the
+  restoration, so a restart keeps it. The metadata sweep retries the read until
+  enough voting acceptors answer; a group that lost a majority of its journals at
+  once never restores (two overlapping losses in a group of three: each needs the
+  other's answer), and those nodes come back under new ids. While it waits, it
+  answers a recovery of a transaction below its
   fence with `Message::Amnesiac` (holds nothing, may have voted, never will): a
   write minted during the rejoin and held only by a minority would otherwise stay
   undecided once the other replicas' vote fences passed it, pinning the very

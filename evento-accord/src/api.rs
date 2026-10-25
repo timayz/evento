@@ -540,7 +540,8 @@ pub struct DecisionRecord {
 /// joins again only through a contact that vouches past them. Journaled
 /// ([`Journal::save_amnesia_fence`]) before the replica does anything, and
 /// kept for good — it also marks the replica as an acceptor that abstains
-/// from config Paxos under this id.
+/// from config Paxos under this id until it read the other acceptors'
+/// state back (#338, `votes_restored`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AmnesiaFence {
     /// Microseconds above every timestamp the replica can have voted on,
@@ -550,6 +551,11 @@ pub struct AmnesiaFence {
     /// Whether the replica has joined through a contact that vouched at or
     /// above the fence. Until then it takes no part, and must open joining.
     pub joined: bool,
+    /// Whether the replica read, from a majority of all the acceptors among
+    /// the other voting ones, every epoch's promised ballot and accepted
+    /// value, and adopted them: it votes in config Paxos again, above
+    /// everything it may have forgotten (#338). Until then it abstains.
+    pub votes_restored: bool,
 }
 
 /// What a replica's journal durably holds that only ever rises (#339): its

@@ -15,7 +15,7 @@ use evento_core::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::api::{ConfigEntry, DurableMark, FenceRecord};
+use crate::api::{AcceptorRecord, ConfigEntry, DurableMark, FenceRecord};
 use crate::clock::{Ballot, NodeId, Timestamp, TxnId};
 
 /// Sharding / ownership unit. Derived from an event's routing key (falling back
@@ -364,6 +364,19 @@ pub enum Message {
     ConfigCommit { epoch: u64, entry: ConfigEntry },
     /// Acceptor → coordinator: a config ballot was too low for `epoch`.
     ConfigNack { epoch: u64, promised: Ballot },
+    /// An acceptor that lost its journal (#338) → every other acceptor: send
+    /// your whole acceptor state, every epoch's promised ballot and accepted
+    /// value, so I can vote again above everything I forgot.
+    ConfigRead { id: u64 },
+    /// An acceptor → the reader: its acceptor state, every epoch it holds
+    /// one for. `voting` is false from an acceptor that itself abstains
+    /// (it lost its journal and has not restored its votes yet): its state
+    /// bounds nothing, and the reader does not count it.
+    ConfigReadReply {
+        id: u64,
+        acceptors: Vec<(u64, AcceptorRecord)>,
+        voting: bool,
+    },
     /// A behind node → any peer: send every decided metadata-log entry strictly
     /// after `after_epoch`, so this node can fill a gap in its topology history.
     MetadataFetch { after_epoch: u64 },
@@ -649,6 +662,8 @@ impl Message {
             | Message::ConfigAccepted { .. }
             | Message::ConfigCommit { .. }
             | Message::ConfigNack { .. }
+            | Message::ConfigRead { .. }
+            | Message::ConfigReadReply { .. }
             | Message::MetadataFetch { .. }
             | Message::MetadataEntries { .. }
             | Message::ReadForward { .. }
