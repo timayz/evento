@@ -77,9 +77,9 @@ use common::journal::{FaultJournal, JournalFaults};
 use common::store::{FaultStore, Outcomes};
 use evento_accord::{
     DataStore, DynamicTopology, ExecutorDataStore, HybridLogicalClock, InMemoryDataStore,
-    InMemoryNetwork, Journal, Key, Message, MessageFaults, MessageSink, Node, NodeConfig, NodeId,
-    PartialSnapshot, StaticTopology, Status, Timestamp, Topology, TraceEntry, TxnId,
-    MAX_SKEW_MICROS,
+    InMemoryNetwork, Journal, Key, LinkFilter, Message, MessageFaults, MessageSink, Node,
+    NodeConfig, NodeId, PartialSnapshot, StaticTopology, Status, Timestamp, Topology, TraceEntry,
+    TxnId, MAX_SKEW_MICROS,
 };
 use evento_core::metadata::Metadata;
 use evento_core::Event;
@@ -323,6 +323,9 @@ struct SimOptions {
     electorate: Option<Vec<NodeId>>,
     /// Over [`DynamicTopology`] (not restartable).
     dynamic: bool,
+    /// The dynamic topology's starting layout; `None` ⇒ one shard of every
+    /// node. A node outside it starts as a spare, to be added.
+    layout: Option<Vec<Vec<NodeId>>>,
     store: StoreKind,
 }
 
@@ -334,6 +337,7 @@ impl SimOptions {
             config: NodeConfig::default(),
             electorate: None,
             dynamic: false,
+            layout: None,
             store: StoreKind::Memory,
         }
     }
@@ -470,6 +474,7 @@ impl Sim {
             config,
             electorate,
             dynamic,
+            layout,
             store: store_kind,
         } = options;
         let ids: Vec<NodeId> = (0..n).map(NodeId).collect();
@@ -494,7 +499,8 @@ impl Sim {
             let store = SimStore::new(store_kind, &outcomes);
             let journal = Arc::new(FaultJournal::new());
             let topology: Arc<dyn Topology> = if dynamic {
-                let topology = Arc::new(DynamicTopology::new(id, 0, vec![ids.clone()]));
+                let layout = layout.clone().unwrap_or_else(|| vec![ids.clone()]);
+                let topology = Arc::new(DynamicTopology::new(id, 0, layout));
                 topologies.push(Arc::clone(&topology));
                 topology
             } else {
@@ -5468,4 +5474,63 @@ async fn restart_after_an_import(mode: Restart) {
         1,
         "node 2 lost T's write ({mode:?})"
     );
+}
+
+/// A replica that keeps a moved slot gets no copy of it: a change waits for
+/// its report past the drain point too. Activated without it, a replica
+/// that lagged would have to catch up under the new layout — where the
+/// replica that copied the slot holds its writes as events, with no command
+/// to ship, and vouches for them all the same. Node 2, cut off while T
+/// commits through 0 and 1 and while node 3 replaces node 1, comes back
+/// unable to sync with node 0 for a while.
+#[tokio::test(start_paused = true)]
+async fn a_change_waits_for_every_replica_that_keeps_a_moved_slot() {
+    let sim = Sim::build_with(SimOptions {
+        dynamic: true,
+        layout: Some(vec![vec![NodeId(0), NodeId(1), NodeId(2)]]),
+        ..SimOptions::new(4)
+    });
+    sim.nodes[3].begin_join();
+    for other in [0, 1, 3] {
+        sim.net.partition(NodeId(2), NodeId(other));
+    }
+    sim.nodes[0]
+        .write(vec![event("acc", 1, 1)])
+        .await
+        .expect("T commits through 0 and 1");
+    let replaced = vec![vec![NodeId(0), NodeId(2), NodeId(3)]];
+    let driver = sim.nodes[0].clone();
+    let change = {
+        let replaced = replaced.clone();
+        tokio::spawn(async move { driver.change_topology(1, replaced).await })
+    };
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Node 2 comes back, syncing with anyone but node 0 for a while.
+    let not_with_zero: LinkFilter = Arc::new(|from, to, message| {
+        let link = [from, to];
+        link.contains(&NodeId(2))
+            && link.contains(&NodeId(0))
+            && matches!(
+                message,
+                Message::SyncRequest { .. } | Message::SyncData { .. }
+            )
+    });
+    sim.net.set_link_filter(Some(not_with_zero));
+    sim.net.heal_all_partitions();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    sim.net.set_link_filter(None);
+    let installed = change.await.unwrap().expect("node 3 replaces node 1");
+    assert_eq!(installed, replaced);
+    assert_eq!(sim.stores[3].events_of("acc"), vec![1], "node 3 copied T");
+
+    let mut held = Vec::new();
+    for _ in 0..1_000 {
+        held = sim.stores[2].events_of("acc");
+        if !held.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(held, vec![1], "node 2 holds T");
 }

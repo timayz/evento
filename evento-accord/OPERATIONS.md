@@ -220,9 +220,11 @@ refuses anything else before a vote, and a node never installs it.
   `anti_entropy_interval`s — about 2 s with the defaults — plus the copies. The
   transition is driven by the recovery sweep's watermark gossip, anti-entropy and
   copies: run `start_recovery` on every node, new ones included. It waits for a slow
-  quorum of every shard (a dead node does not hold it back, with the default
-  `peer_absence_limit` too) and for every node that gains slots (a dead one does:
-  replace it with another change). `change_topology` returns once the new layout is
+  quorum of every shard, for every node that gains slots, and for every node that
+  keeps a slot the change moves (a replacement's other replicas). A dead node the new
+  layout drops does not hold it back, with the default `peer_absence_limit` too; a
+  dead one it gives or keeps slots does: replace it too, with another change.
+  `change_topology` returns once the new layout is
   installed, or fails after a while, leaving the sweep to install it. While a
   transition drains, a change to another layout replaces it, and a change back to the
   live layout cancels it.

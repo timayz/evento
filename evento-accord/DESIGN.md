@@ -393,7 +393,11 @@ control plane, everything else is Accord.
      fence, and the reporter holds nothing unapplied below it, so every write on
      a moved key that ever commits is applied there, and no other will. Every
      shard is waited for, so a write that also touches an unchanged shard is
-     applied there too.
+     applied there too. So is every replica that keeps a moved slot (a
+     replacement's other replicas): one that lagged would catch up through
+     anti-entropy under the new layout, where a replica that copied the slot holds
+     its writes as events, with no command to ship, and vouches for them all the
+     same.
   5. An *activation* entry installs the new layout, with the drain point and a
      clock floor: the proposer's reading plus three skews, which it waits past,
      and which every replica raises its clock to as it installs the entry. A

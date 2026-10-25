@@ -6959,8 +6959,9 @@ impl Node {
     }
 
     /// The drain point of the transition first decided at `since`, once it is
-    /// in progress here, has drained (see [`reconfig::drained`]), and every
-    /// node gaining slots reported it copied them.
+    /// in progress here, has drained (see [`reconfig::drained`]), every node
+    /// keeping a moved slot reported past it, and every node gaining slots
+    /// reported it copied them.
     fn ready_to_activate(&self, since: u64) -> Option<Timestamp> {
         let reports = self
             .peer_watermarks
@@ -6977,7 +6978,11 @@ impl Node {
                 reconfig.copies.get(node) == Some(&since)
             }
         });
-        (copied && reconfig::drained(&transition.live, point, &reports)).then_some(point)
+        let kept = transition
+            .keepers
+            .iter()
+            .all(|node| reports.get(node).is_some_and(|&report| report > point));
+        (copied && kept && reconfig::drained(&transition.live, point, &reports)).then_some(point)
     }
 
     /// Copies the slots this node gains in the transition in progress, if it
