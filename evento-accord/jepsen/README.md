@@ -122,6 +122,7 @@ cd evento-accord/jepsen
 TIME_LIMIT=600 ./run.sh                     # longer
 ./run.sh --consistency-model serializable   # check serializable instead of strict
 ./run.sh --faults partition                 # just one fault ("" for none)
+./run.sh --faults partition,kill,pause,journal  # add lost and rolled-back journals
 ./run.sh --linearizable-reads               # enable read barriers (linearizable reads)
 ./run.sh --concurrency 20                   # any extra arg passes through to lein run test
 ```
@@ -144,10 +145,50 @@ downloads a tool and fails offline):
   journal (`db/Kill` → `evento-accord.db`, `pkill -KILL` + `start-daemon!`). Exercises
   restart/journal recovery.
 * **`pause`** — SIGSTOP/SIGCONT one or all nodes (`db/Pause`).
+* **`journal`** — *off by default* (#340). One node at a time, every 25 s, in turn —
+  a fault is skipped while the node the last one hit does not read `ready` yet (more
+  journals lost at once than a shard tolerates would leave no contact to vouch for any
+  of them, #312; and it never waits, since the nemeses share one worker and a wait
+  would hold back the others' heals):
+  * `:snapshot-journal`: the node is killed, its `journal/` copied aside, and
+    started;
+  * `:lose-journal`: killed, its `journal/` deleted, its store kept, and started —
+    a plain open over a store holding events is refused (`LostJournal`);
+  * `:restore-journal`: killed, the copy put back as its `journal/`, and started —
+    its peers find the journal rolled back to an older copy (#339);
+  * `:lose-disk`: killed, `journal/` and `store/` deleted, and started joining.
+
+  Each one ends with the node coming back over an empty journal by joining, as
+  OPERATIONS §7 tells a host to (see *Opening a node* below).
 * **`clock`** — *available but off by default.* Jepsen's clock nemesis bumps the
   kernel wall clock; a shared-kernel Docker cluster can't isolate that from the host,
   so it belongs on real VMs (and needs a C compiler on the node image for jepsen's
   time helper). Pair with raised `NodeConfig` timeouts on `jepsen-node` for geo runs.
+
+### Opening a node
+
+`jepsen-node` opens its node the way a host does (OPERATIONS §7), and leaves process
+restarts to the launcher (`db/install-launcher!`), which runs the binary again
+whenever it exits with 75 (`EX_TEMPFAIL`). Any other exit ends the launcher, so a
+SIGKILLed node stays down until the kill nemesis starts it.
+
+* `DATA_DIR/join` present: the store is emptied and the node opened joining
+  (`recover_state_for_join`, `begin_join`), then joined through each other node in
+  turn, retried every second, until one vouches for it. A join that broke mid-snapshot
+  exits 75. Joined, the marker goes.
+* `DATA_DIR/member` present and `journal/` gone: the plain open is refused
+  (`LostJournal`) when the store holds events; either way the binary leaves the join
+  marker and exits 75. `member` is written after the first successful open: the
+  host's knowledge, out of band, that the node was a member.
+* Otherwise: `recover_state`.
+
+Running, a node told to rejoin or found rolled back (#339) is retired; the binary
+deletes `journal/` if it was rolled back, leaves the join marker, and exits 75.
+`/health` reads `joining` until the node serves — opened, joined, and confirmed by
+its peers — then `ready`; `/txn` answers `503 {"type":"fail"}` meanwhile (nothing was
+submitted, so the client records `:fail`). Before the final reads the test waits up
+to 180 s for every node to read `ready` (`:await-ready`, whose value names the nodes
+that never did).
 
 A run with `--faults partition,kill,pause --consistency-model serializable` was
 **valid** — the history stayed serializable even through full-cluster kills (all five
