@@ -18,8 +18,8 @@ use std::time::Duration;
 
 use evento_accord::{
     AppliedEntry, DataStore, DynamicTopology, HybridLogicalClock, InMemoryDataStore,
-    InMemoryJournal, InMemoryNetwork, Journal, MessageSink, Node, NodeConfig, NodeId, RegionId,
-    Topology,
+    InMemoryJournal, InMemoryNetwork, Journal, LinkFilter, Message, MessageSink, Node, NodeConfig,
+    NodeId, RegionId, Topology,
 };
 use evento_core::Event;
 
@@ -385,7 +385,10 @@ async fn a_join_refuses_a_non_empty_store() {
         await_committed(&n.store, 1).await;
     }
 
-    let d = spawn_node(NodeId(3), 0, vec![abc.clone()], &net);
+    // Node 3 holds the layout that adds it already: what refuses the join
+    // is its store.
+    let abcd = vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3)];
+    let d = spawn_node(NodeId(3), 0, vec![abcd], &net);
     let stale = evento_accord::TxnId(evento_accord::Timestamp::MIN);
     d.store
         .apply(
@@ -408,6 +411,53 @@ async fn a_join_refuses_a_non_empty_store() {
         "nothing was fetched or installed"
     );
     assert_eq!(nodes[0].node.metrics().snapshot_pages, 0);
+}
+
+/// A join started before the joiner installed the layout that adds it — a
+/// host joining it as soon as `change_topology` returns, the epoch still on
+/// its way — waits for that layout. Under the one before, the joiner would
+/// own no key: it would install none of the contact's state, adopt the
+/// contact's floor, and serve without every write from before it joined.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_join_waits_for_the_layout_that_adds_the_joiner() {
+    let net = InMemoryNetwork::new();
+    let abc = vec![NodeId(0), NodeId(1), NodeId(2)];
+    let abcd = vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3)];
+    let nodes: Vec<TestNode> = abc
+        .iter()
+        .map(|&id| spawn_node(id, 0, vec![abc.clone()], &net))
+        .collect();
+    nodes[0]
+        .node
+        .write(vec![event("acc", 1, "Opened")])
+        .await
+        .unwrap();
+    for n in &nodes {
+        await_committed(&n.store, 1).await;
+    }
+
+    let d = spawn_node(NodeId(3), 0, vec![abc.clone()], &net);
+    d.node.begin_join();
+    // Node 3 learns of epoch 1 only by asking for it.
+    let no_commit: LinkFilter = Arc::new(|_, to, message| {
+        to == NodeId(3) && matches!(message, Message::ConfigCommit { .. })
+    });
+    net.set_link_filter(Some(no_commit));
+    nodes[0]
+        .node
+        .change_topology(1, vec![abcd.clone()])
+        .await
+        .unwrap();
+    assert_eq!(d.topology.epoch(), 0, "node 3 has not installed epoch 1");
+
+    d.node.join(NodeId(0)).await.expect("joins under epoch 1");
+    net.set_link_filter(None);
+    assert_eq!(
+        d.store.committed_events().len(),
+        1,
+        "node 3 holds the write from before it joined"
+    );
+    assert_eq!(d.topology.epoch(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

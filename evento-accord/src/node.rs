@@ -5867,21 +5867,21 @@ impl Node {
     /// what was compacted ([`await_reinstated`](Self::await_reinstated)).
     ///
     /// `contact` must be a replica of this node's shard: only it holds what
-    /// this node is to copy, and its floor is this node's shard's (#360). A
-    /// node that already copied its slots during the layout transition that
-    /// made it a replica has nothing to join: `Ok(0)`.
+    /// this node is to copy, and its floor is this node's shard's (#360). The
+    /// join waits for the layout that makes this node a replica
+    /// ([`await_membership`](Self::await_membership)). A node that already
+    /// copied its slots during the layout transition that made it a replica
+    /// has nothing to join: `Ok(0)`.
     pub async fn join(&self, contact: NodeId) -> anyhow::Result<usize> {
+        let (layout, shard) = self.await_membership(contact).await?;
         if self.copied_for_live() {
             return Ok(0);
         }
-        let layout = self.topology.layout();
-        if let Some(shard) = layout.node_shard(self.id) {
-            anyhow::ensure!(
-                layout.node_shard(contact) == Some(shard),
-                "{contact:?} is no replica of this node's shard under epoch {}: join through one",
-                layout.epoch()
-            );
-        }
+        anyhow::ensure!(
+            layout.node_shard(contact) == Some(shard),
+            "{contact:?} is no replica of this node's shard under epoch {}: join through one",
+            layout.epoch()
+        );
         let bound = self
             .absent
             .lock()
@@ -6070,6 +6070,37 @@ impl Node {
             contact.0
         );
         Ok(())
+    }
+
+    /// Waits, for at most [`TRANSITION_ROUNDS`] collect timeouts, until the
+    /// installed layout makes this node a replica — the epoch that adds it
+    /// may still be on its way when the join starts, or wait on a transition
+    /// draining — fetching `contact`'s decided epochs meanwhile. Returns that
+    /// layout and this node's shard in it. A join under a layout without this
+    /// node would own no key: it would install none of the contact's state,
+    /// adopt its floor, and then serve without everything below it.
+    async fn await_membership(&self, contact: NodeId) -> anyhow::Result<(Arc<Layout>, ShardId)> {
+        let deadline = Self::after(self.settings.collect_timeout * TRANSITION_ROUNDS);
+        loop {
+            let layout = self.topology.layout();
+            if let Some(shard) = layout.node_shard(self.id) {
+                return Ok((layout, shard));
+            }
+            anyhow::ensure!(
+                self.topology.dynamic() && Instant::now() < deadline,
+                "{:?} is no replica under epoch {}: join once a layout that adds it is installed",
+                self.id,
+                layout.epoch()
+            );
+            self.send(
+                contact,
+                Message::MetadataFetch {
+                    after_epoch: self.installed_epoch(),
+                },
+            )
+            .await;
+            tokio::time::sleep(self.settings.recovery_interval).await;
+        }
     }
 
     /// This node's amnesia fence while its join is pending (#312): a

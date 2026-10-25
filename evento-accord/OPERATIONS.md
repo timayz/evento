@@ -186,7 +186,9 @@ refuses anything else before a vote, and a node never installs it.
 - **Add a node:** start the new process (with `start_recovery`) and `begin_join()` it
   (it buffers consensus messages), drive `change_topology(epoch, new_layout)` from any
   current member, then, once that returns, call `join(contact)` on the new node with a
-  contact of its shard. A node the change gave slots to copies them while the change
+  contact of its shard. The new node may not have installed the new epoch yet: `join`
+  fetches it from the contact and waits, failing if the node is still no replica after
+  a few `collect_timeout`s. A node the change gave slots to copies them while the change
   drains, and its `join` then returns `Ok(0)`: call it either way. (See
   `tests/membership.rs`, `tests/transitions.rs`, `tests/resharding.rs`.)
 - **Remove a node:** `change_topology(epoch, smaller_layout)`; the smaller cluster keeps
