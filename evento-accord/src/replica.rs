@@ -137,6 +137,10 @@ pub struct Replica {
     /// The records in `decisions` not yet journaled: the node holds back the
     /// journal truncate until they are.
     unsaved_decisions: BTreeSet<TxnId>,
+    /// The highest `t0` this replica ever recorded a command for — one it
+    /// voted for, or learned of: a layout transition's fence point must be
+    /// above every vote it cast (see `reconfig`).
+    highest_t0: Timestamp,
 }
 
 impl Default for Replica {
@@ -160,6 +164,7 @@ impl Default for Replica {
             routes: HashMap::new(),
             decisions: BTreeMap::new(),
             unsaved_decisions: BTreeSet::new(),
+            highest_t0: Timestamp::MIN,
         }
     }
 }
@@ -374,9 +379,46 @@ impl Replica {
             self.enter_queue(cmd.execute_at, cmd.txn);
         }
         let txn = cmd.txn;
+        self.highest_t0 = self.highest_t0.max(txn.0);
         self.commands.insert(txn, cmd);
         self.reindex_unapplied(txn);
         self.wake(txn);
+    }
+
+    /// The highest `t0` this replica ever recorded a command for, or compacted
+    /// past: above every vote it cast.
+    pub fn highest_t0(&self) -> Timestamp {
+        self.highest_t0.max(self.redundant_before)
+    }
+
+    /// Every command not committed yet, with the epoch it was planned under and
+    /// the keys it touches — its route when it has one.
+    pub fn uncommitted(&self) -> Vec<(TxnId, u64, Vec<Key>)> {
+        self.commands
+            .values()
+            .filter(|cmd| cmd.status < Status::Committed)
+            .map(|cmd| {
+                let keys = self
+                    .routes
+                    .get(&cmd.txn)
+                    .cloned()
+                    .unwrap_or_else(|| cmd.keys.clone());
+                (cmd.txn, cmd.epoch, keys)
+            })
+            .collect()
+    }
+
+    /// Answers a recovery of `txn`, which this replica never witnessed and
+    /// never votes for, "never witnessed", promising `ballot` (the node
+    /// journals it) — or `Err(promised)` if it already promised a higher one.
+    pub fn refuse_blind(&mut self, txn: TxnId, ballot: Ballot) -> Result<RoutedRecovery, Ballot> {
+        if let Some(&promised) = self.unknown_promises.get(&txn) {
+            if ballot < promised {
+                return Err(promised);
+            }
+        }
+        self.unknown_promises.insert(txn, ballot);
+        Ok(RoutedRecovery::NotWitnessed { redundant: false })
     }
 
     /// Adds `txn` to the execution queue at `at`, as runnable.
@@ -908,13 +950,7 @@ impl Replica {
         // routed recovery's blind replica does — it never voted, and never
         // will.
         if self.fenced(txn) && !keys.is_empty() {
-            if let Some(&promised) = self.unknown_promises.get(&txn) {
-                if ballot < promised {
-                    return Err(promised);
-                }
-            }
-            self.unknown_promises.insert(txn, ballot);
-            return Ok(RoutedRecovery::NotWitnessed { redundant: false });
+            return self.refuse_blind(txn, ballot);
         }
         self.recover(txn, ballot, epoch, keys, events)
             .map(RoutedRecovery::Known)

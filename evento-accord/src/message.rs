@@ -15,6 +15,7 @@ use evento_core::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::api::{ConfigEntry, FenceRecord};
 use crate::clock::{Ballot, NodeId, Timestamp, TxnId};
 
 /// Sharding / ownership unit. Derived from an event's routing key (falling back
@@ -271,7 +272,13 @@ pub enum Message {
     /// Periodic gossip between shard replicas: the sender has applied every
     /// transaction below `applied_through`. The cluster compacts (drops redundant
     /// consensus state and truncates the log) below the per-shard minimum of these.
-    Watermark { applied_through: Timestamp },
+    /// `fenced` is the fence the sender installed for the layout transition in
+    /// progress, if one is (journaled before it is sent): what the change waits
+    /// on, with these reports, before it installs the new layout.
+    Watermark {
+        applied_through: Timestamp,
+        fenced: Option<FenceRecord>,
+    },
     /// Existing replica → joining node (or anti-entropy requester): the
     /// committed state to import.
     SyncData {
@@ -309,7 +316,7 @@ pub enum Message {
         events: Vec<Event>,
         next: Option<Value>,
     },
-    /// Config coordinator → acceptors: Paxos phase 1 for `epoch`'s layout.
+    /// Config coordinator → acceptors: Paxos phase 1 for `epoch`'s entry.
     ConfigPrepare { epoch: u64, ballot: Ballot },
     /// Acceptor → coordinator: promised `ballot`, reporting any value it has
     /// already accepted (which the coordinator must adopt). `ballot` names the
@@ -318,33 +325,28 @@ pub enum Message {
         epoch: u64,
         ballot: Ballot,
         accepted_ballot: Ballot,
-        accepted_layout: Option<Vec<Vec<NodeId>>>,
+        accepted_entry: Option<ConfigEntry>,
     },
-    /// Config coordinator → acceptors: Paxos phase 2 — accept this layout.
+    /// Config coordinator → acceptors: Paxos phase 2 — accept this entry.
     ConfigAccept {
         epoch: u64,
         ballot: Ballot,
-        layout: Vec<Vec<NodeId>>,
+        entry: ConfigEntry,
     },
     /// Acceptor → coordinator: accepted under `ballot` (named so a coordinator
     /// can drop stale replies from an earlier attempt or another proposer).
     ConfigAccepted { epoch: u64, ballot: Ballot },
-    /// Config coordinator → all nodes: the layout is decided; install it.
-    ConfigCommit {
-        epoch: u64,
-        layout: Vec<Vec<NodeId>>,
-    },
+    /// Config coordinator → all nodes: the entry is decided; install it.
+    ConfigCommit { epoch: u64, entry: ConfigEntry },
     /// Acceptor → coordinator: a config ballot was too low for `epoch`.
     ConfigNack { epoch: u64, promised: Ballot },
     /// A behind node → any peer: send every decided metadata-log entry strictly
     /// after `after_epoch`, so this node can fill a gap in its topology history.
     MetadataFetch { after_epoch: u64 },
-    /// A peer → the requester: contiguous decided `(epoch, layout)` entries in
+    /// A peer → the requester: contiguous decided `(epoch, entry)` entries in
     /// ascending order (all `> after_epoch`). Fire-and-forget; the requester ingests
     /// them, installing each now-contiguous epoch. May be empty.
-    MetadataEntries {
-        entries: Vec<(u64, Vec<Vec<NodeId>>)>,
-    },
+    MetadataEntries { entries: Vec<(u64, ConfigEntry)> },
     /// A node → an owner of the queried key range: serve this read locally.
     /// `to_micros` forwards the exclusive stamp bound (see
     /// `evento_core::Executor::read`).

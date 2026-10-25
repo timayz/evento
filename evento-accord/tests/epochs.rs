@@ -6,9 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use evento_accord::{
-    Ballot, Clock, DataStore, DynamicTopology, Envelope, HybridLogicalClock, InMemoryDataStore,
-    InMemoryJournal, InMemoryNetwork, InMemorySink, Journal, Key, Message, MessageSink, Node,
-    NodeConfig, NodeId, Status, Timestamp, Topology, TxnId,
+    Ballot, Clock, ConfigEntry, DataStore, DynamicTopology, Envelope, HybridLogicalClock,
+    InMemoryDataStore, InMemoryJournal, InMemoryNetwork, InMemorySink, Journal, Key, Message,
+    MessageSink, Node, NodeConfig, NodeId, Status, Timestamp, Topology, TxnId,
 };
 use evento_core::Event;
 use tokio::sync::mpsc;
@@ -203,9 +203,11 @@ impl Setup {
             .map(|env| env.message)
     }
 
-    /// Node 0 installs `layout` as epoch `epoch`, decided elsewhere.
+    /// Node 0 installs `layout` as epoch `epoch`, decided elsewhere — at
+    /// once, as a change whose quorums meet would be.
     async fn install(&self, epoch: u64, layout: Vec<Vec<NodeId>>) {
-        self.send(1, Message::ConfigCommit { epoch, layout }).await;
+        let entry = ConfigEntry::active(layout);
+        self.send(1, Message::ConfigCommit { epoch, entry }).await;
         for _ in 0..200 {
             if self.topology.epoch() >= epoch {
                 return;
@@ -478,7 +480,10 @@ async fn the_starting_layout_survives_a_restart_on_a_later_layout() {
     let journaled = s.journal.load_metadata().await.unwrap();
     assert_eq!(
         journaled,
-        vec![(0, vec![ids(&[0, 1, 2])]), (1, vec![ids(&[0, 1, 3])])]
+        vec![
+            (0, ConfigEntry::active(vec![ids(&[0, 1, 2])])),
+            (1, ConfigEntry::active(vec![ids(&[0, 1, 3])]))
+        ]
     );
 
     let net = InMemoryNetwork::new();

@@ -81,6 +81,11 @@ async fn amnesia_fence() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fences() {
+    sql_support::fences(&memory().await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn survives_close_and_reopen() {
     let temp = tempfile::Builder::new()
         .prefix("accord_sql_reopen")

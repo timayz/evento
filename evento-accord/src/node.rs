@@ -29,12 +29,13 @@ use tokio::time::{Duration, Instant};
 
 use crate::api::{
     floor_millis, snapshot_event_size, stamp_events, validate_layout, AcceptorRecord, AmnesiaFence,
-    DataStore, Journal, Layout, MessageSink, ShardId, Topology,
+    ConfigEntry, DataStore, Drained, FenceRecord, Journal, Layout, MessageSink, ShardId, Topology,
 };
 use crate::clock::{Ballot, Clock, HybridLogicalClock, NodeId, Timestamp, TxnId};
 use crate::failure_detector::FailureDetector;
 use crate::message::{CommandState, Key, Message, Status, SyncKnown, INVALIDATED_AT};
 use crate::metrics::{Metrics, MetricsSnapshot};
+use crate::reconfig::{self, Fence, Floor, Transition};
 use crate::replica::{Refusal, Replica, RoutedRecovery};
 use crate::transport::Envelope;
 
@@ -219,6 +220,29 @@ impl std::fmt::Display for BacklogAtCap {
 }
 
 impl std::error::Error for BacklogAtCap {}
+
+/// [`Node::write`] refused a write: a key it touches is moving to other
+/// replicas — a layout transition first decided at epoch `since` is draining
+/// (see [`Node::change_topology`]). Transient: the change installs its layout
+/// within about the compaction margin and a few anti-entropy rounds. Returned
+/// through `anyhow`; downcast to tell it apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TopologyChanging {
+    /// The epoch the transition was first decided at.
+    pub since: u64,
+}
+
+impl std::fmt::Display for TopologyChanging {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "a key this write touches is moving (layout transition since epoch {}); retry",
+            self.since
+        )
+    }
+}
+
+impl std::error::Error for TopologyChanging {}
 
 /// The most a single transaction's events may weigh on the wire
 /// ([`snapshot_event_size`] summed): half the TCP transport's frame cap
@@ -411,6 +435,22 @@ struct Imported {
 /// How many pages an anti-entropy round pulls from its peer at most, while
 /// each brings something in (see `Node::anti_entropy`).
 const ANTI_ENTROPY_PAGES: usize = 16;
+
+/// How many [`collect_timeout`](NodeConfig::collect_timeout)s
+/// [`change_topology`](Node::change_topology) waits for a transition to drain
+/// before it returns, leaving the recovery sweep to complete it: a drain takes
+/// about the compaction margin and a few anti-entropy rounds.
+const TRANSITION_ROUNDS: u32 = 6;
+
+/// How a layout transition stands on a node (see [`reconfig`]).
+enum TransitionOutcome {
+    /// In progress: its moved keys are draining.
+    Draining,
+    /// Ended by installing its layout.
+    Installed(Vec<Vec<NodeId>>),
+    /// Ended by another change.
+    Replaced,
+}
 
 /// A same-shard peer this node stopped waiting for; see
 /// [`NodeConfig::peer_absence_limit`].
@@ -741,7 +781,7 @@ impl Signal {
 #[derive(Clone)]
 struct ConfigAcceptor {
     promised: Ballot,
-    accepted: Option<(Ballot, Vec<Vec<NodeId>>)>,
+    accepted: Option<(Ballot, ConfigEntry)>,
 }
 
 impl Default for ConfigAcceptor {
@@ -800,7 +840,7 @@ type ConfigSender = mpsc::UnboundedSender<(NodeId, Message)>;
 /// layout after a restart.
 struct MetadataLog {
     /// Decided entries by epoch (`BTreeMap` → deterministic ascending iteration).
-    entries: BTreeMap<u64, Vec<Vec<NodeId>>>,
+    entries: BTreeMap<u64, ConfigEntry>,
     /// Highest epoch installed into the topology so far (`== topology.epoch()`).
     installed_epoch: u64,
     /// The epoch the node started from, whose layout it was built with.
@@ -811,6 +851,46 @@ struct MetadataLog {
 
 /// Shared metadata log.
 type MetaLog = Arc<Mutex<MetadataLog>>;
+
+/// What a node knows of layout transitions (see [`reconfig`]). Locked after
+/// the replica lock wherever both are held: a fence is installed, and a vote
+/// checked against the fences, under the replica lock, so no vote slips
+/// between a fence point and its fence.
+#[derive(Default)]
+struct Reconfig {
+    /// The transition installed and not ended yet.
+    transition: Option<Transition>,
+    /// Every fence installed, oldest first. Never lifted.
+    fences: Vec<Fence>,
+    /// The clock floors of the activations that ended a transition.
+    floors: Vec<Floor>,
+    /// The fence each node, this one included, last reported.
+    reported: HashMap<NodeId, FenceRecord>,
+    /// The fences the journal held at restart, by `since`.
+    restored: HashMap<u64, Timestamp>,
+    /// The epoch the live layout became live at: proven coverage, join
+    /// proofs and vouches hold for as long as it stays live, transitions
+    /// included.
+    live_since: u64,
+}
+
+impl Reconfig {
+    /// Ends the fence of the transition first decided at `since`, at `epoch`.
+    fn end_fence(&mut self, since: u64, epoch: u64) {
+        for fence in self.fences.iter_mut().filter(|f| f.since == since) {
+            fence.end.get_or_insert(epoch);
+        }
+    }
+}
+
+/// What installing decided entries left to make durable
+/// ([`persist_installed`](Node::persist_installed)): the commands an
+/// activation invalidated. Fences are journaled with them.
+#[derive(Default)]
+#[must_use]
+struct Installed {
+    invalidated: Vec<TxnId>,
+}
 
 /// A [`SyncData`](Message::SyncData) payload handed to an in-flight sync: the
 /// contact's `(watermark, coverage, recent commands)`.
@@ -917,6 +997,9 @@ pub struct Node {
     /// The committed metadata log — decided topology entries, installed in strict
     /// epoch order (drives [`Topology::install`]).
     meta_log: MetaLog,
+    /// Layout transitions: the one in progress, the fences and floors
+    /// installed, the fences peers reported.
+    reconfig: Arc<Mutex<Reconfig>>,
     /// Monotonic correlation-id source, shared by forwarded reads, sync
     /// requests and snapshot pages (each consumer only needs unique — not
     /// gap-free — values).
@@ -948,9 +1031,10 @@ pub struct Node {
     /// reports — a replica must not vouch for a window it wasn't connected for
     /// (it cannot know what it never witnessed), only for one it has provably
     /// re-covered with enough peers to intersect every commit quorum.
-    /// Max-merged per peer, keyed to the topology epoch it was accrued under
-    /// (cleared on epoch change); never persisted — a restarted node re-proves
-    /// its coverage, which is conservative.
+    /// Max-merged per peer, keyed to the epoch the live layout became live at
+    /// ([`live_since`](Node::live_since); cleared when another layout goes
+    /// live); never persisted — a restarted node re-proves its coverage, which
+    /// is conservative.
     sync_coverage: Arc<Mutex<(u64, HashMap<NodeId, Timestamp>)>>,
     /// What the contact of this node's [`join`](Node::join) vouched for
     /// ([`Message::JoinProof`]), with the topology epoch it holds under: the
@@ -1036,10 +1120,14 @@ impl Node {
             config: Arc::new(Mutex::new(HashMap::new())),
             config_inbox: Arc::new(Mutex::new(HashMap::new())),
             meta_log: Arc::new(Mutex::new(MetadataLog {
-                entries: BTreeMap::from([(start_epoch, start_layout)]),
+                entries: BTreeMap::from([(start_epoch, ConfigEntry::active(start_layout))]),
                 installed_epoch: start_epoch,
                 start_epoch,
                 start_persisted: false,
+            })),
+            reconfig: Arc::new(Mutex::new(Reconfig {
+                live_since: start_epoch,
+                ..Reconfig::default()
             })),
             correlation_seq: Arc::new(AtomicU64::new(0)),
             anti_entropy_turn: Arc::new(AtomicU64::new(0)),
@@ -1491,6 +1579,7 @@ impl Node {
         let metadata = self.journal.load_metadata().await?;
         let bounds = self.journal.load_rejoin_bounds().await?;
         let fence = self.journal.load_amnesia_fence().await?;
+        let fences = self.journal.load_fences().await?;
         // Nothing durable at all: the node never voted, promised, reported
         // or minted anything under this journal — a new member's, or a
         // replacement for one that was lost.
@@ -1503,7 +1592,8 @@ impl Node {
             && acceptors.is_empty()
             && metadata.is_empty()
             && bounds.is_empty()
-            && fence.is_none();
+            && fence.is_none()
+            && fences.is_empty();
         let fence = match fence {
             Some(fence) if !fence.joined && !joining => {
                 return Err(LostJournal { join_pending: true }.into());
@@ -1541,21 +1631,27 @@ impl Node {
                 config.insert(epoch, ConfigAcceptor::from_record(record));
             }
         }
+        // A transition's fence comes back at the point it was journaled at:
+        // a point recomputed now could lie below votes it refused.
+        self.reconfig
+            .lock()
+            .expect("reconfig poisoned")
+            .restored
+            .extend(fences.into_iter().map(|f| (f.since, f.cap)));
         {
             let mut log = self.meta_log.lock().expect("meta_log poisoned");
-            for (epoch, layout) in metadata {
+            for (epoch, entry) in metadata {
                 if epoch == log.start_epoch {
                     log.start_persisted = true;
                 }
                 // Below the epoch the topology was built at, the layout is
                 // history only: kept to recover what was planned under it.
-                if epoch < log.installed_epoch && validate_layout(&layout).is_ok() {
-                    self.topology.install(epoch, layout.clone());
+                if epoch < log.installed_epoch && entry.validate().is_ok() {
+                    self.topology.install(epoch, entry.live().to_vec());
                 }
-                log.entries.insert(epoch, layout);
+                log.entries.insert(epoch, entry);
             }
         }
-        self.apply_log();
 
         {
             let mut replica = self.replica.lock().expect("replica poisoned");
@@ -1592,6 +1688,10 @@ impl Node {
                 replica.restore_decision(record);
             }
         }
+        // Installed over the restored commands: a fence point covers every
+        // vote they hold, and an activation sees what it invalidates.
+        let installed = self.apply_log();
+        self.persist_installed(installed).await;
         // Peers this node had stopped waiting for stay excluded until they
         // report above what was compacted past them (or rejoin).
         if !bounds.is_empty() {
@@ -1797,7 +1897,7 @@ impl Node {
     /// is acted on, yet a restart would fall back to the epoch before — and if
     /// the epoch retired every member of that one, nobody this node asks for
     /// the entry is left. The commit or the metadata sweep retries it.
-    async fn persist_metadata(&self, entries: &[(u64, Vec<Vec<NodeId>>)]) -> bool {
+    async fn persist_metadata(&self, entries: &[(u64, ConfigEntry)]) -> bool {
         if entries.is_empty() {
             return true;
         }
@@ -1814,7 +1914,7 @@ impl Node {
                 .flatten()
                 .filter(|(epoch, _)| entries.iter().all(|(e, _)| e != epoch))
         };
-        let batch: Vec<(u64, Vec<Vec<NodeId>>)>;
+        let batch: Vec<(u64, ConfigEntry)>;
         let entries = match start {
             Some(start) => {
                 batch = std::iter::once(start)
@@ -1825,7 +1925,7 @@ impl Node {
             None => entries,
         };
         let persisted = match entries {
-            [(epoch, layout)] => self.journal.append_metadata(*epoch, layout).await,
+            [(epoch, entry)] => self.journal.append_metadata(*epoch, entry).await,
             entries => self.journal.append_metadata_batch(entries).await,
         };
         match persisted {
@@ -2142,6 +2242,9 @@ impl Node {
     ///    was never committed (its coordinator died after the value was durable but
     ///    before commit), finish the change itself — the automatic equivalent of a
     ///    manual [`recover_topology`](Self::recover_topology).
+    /// 3. **Activation** — once the layout transition in progress has drained,
+    ///    decide the entry that installs its layout (the distinguished proposer
+    ///    first), whether or not the node that decided the transition is alive.
     ///
     /// A no-op for static topologies (no epochs are ever decided), so a
     /// fixed-membership cluster issues no control-plane traffic.
@@ -2195,6 +2298,10 @@ impl Node {
         for epoch in pending {
             let _ = self.recover_topology(epoch).await;
         }
+
+        // (3) Activation: a transition in progress that drained installs its
+        // layout, even if the node that decided it is gone.
+        self.sweep_transition().await;
     }
 
     /// Anti-entropy repair: pull any committed transactions a rotating peer of
@@ -2263,11 +2370,11 @@ impl Node {
 
     /// Records `peer`'s proven sync coverage after a successful sync round:
     /// every transaction `peer` had applied below `coverage` is now in this
-    /// node's store. Max-merged; the map is reset when the topology epoch
-    /// changes, since coverage accrued under an old layout says nothing about
-    /// the keys this node owns under the new one.
+    /// node's store. Max-merged; the map is reset when another layout goes
+    /// live, since coverage accrued under an old layout says nothing about the
+    /// keys this node owns under the new one.
     fn record_sync_coverage(&self, peer: NodeId, coverage: Timestamp) {
-        let epoch = self.topology.epoch();
+        let epoch = self.live_since();
         let mut guard = self.sync_coverage.lock().expect("coverage poisoned");
         let (at, map) = &mut *guard;
         if *at != epoch {
@@ -2293,7 +2400,7 @@ impl Node {
         if needed == 0 {
             return None;
         }
-        let epoch = self.topology.epoch();
+        let epoch = self.live_since();
         let guard = self.sync_coverage.lock().expect("coverage poisoned");
         let (at, map) = &*guard;
         if *at != epoch {
@@ -2318,9 +2425,7 @@ impl Node {
     fn proven_coverage(&self, shard_peers: &[NodeId]) -> Option<Timestamp> {
         let coverage = self.quorum_sync_coverage(shard_peers)?;
         match *self.join_proof.lock().expect("join proof poisoned") {
-            Some(proof) if proof.epoch == self.topology.epoch() => {
-                Some(coverage.max(proof.vouched))
-            }
+            Some(proof) if proof.epoch == self.live_since() => Some(coverage.max(proof.vouched)),
             _ => Some(coverage),
         }
     }
@@ -2334,7 +2439,7 @@ impl Node {
         let Some(proof) = *self.join_proof.lock().expect("join proof poisoned") else {
             return coverage;
         };
-        if proof.epoch != self.topology.epoch() {
+        if proof.epoch != self.live_since() {
             return coverage;
         }
         match self.quorum_sync_coverage(shard_peers) {
@@ -2378,10 +2483,14 @@ impl Node {
         if !self.vouch_durably().await {
             return;
         }
+        // A fence not journaled yet is retried here, and reported once it is.
+        self.persist_fences().await;
+        let fenced = self.reportable_fence();
         self.broadcast(
             &peers,
             Message::Watermark {
                 applied_through: mine,
+                fenced,
             },
         )
         .await;
@@ -2565,7 +2674,9 @@ impl Node {
             // `Node::never_commits`); answered, never counted as a sign the
             // peer is back.
             Message::BeginRecovery { .. } => return Screen::Pass,
-            Message::Watermark { applied_through } => match state.rejoin_above {
+            Message::Watermark {
+                applied_through, ..
+            } => match state.rejoin_above {
                 Some(bound) if *applied_through <= bound => Some(bound),
                 _ => None,
             },
@@ -2612,6 +2723,7 @@ impl Node {
                 from,
                 Message::Watermark {
                     applied_through: mine,
+                    fenced: self.reportable_fence(),
                 },
             )
             .await;
@@ -2799,7 +2911,8 @@ impl Node {
                 let Some(layout) = self.layout_for(epoch, from, &mut out) else {
                     return out;
                 };
-                if self.retired(txn, &layout, route.as_deref().unwrap_or(&keys)) {
+                let touched = route.clone().unwrap_or_else(|| keys.clone());
+                if self.retired(txn, &layout, &touched) {
                     return out;
                 }
                 // Only handle the keys/events this node owns, under the
@@ -2813,6 +2926,12 @@ impl Node {
                 let fence = self.vote_fence();
                 let vote = {
                     let mut replica = self.replica.lock().expect("replica poisoned");
+                    if self
+                        .change_refusal(&replica, txn, epoch, &touched)
+                        .is_some()
+                    {
+                        return out;
+                    }
                     replica.set_vote_fence(fence);
                     replica.preaccept(txn, epoch, keys, events)
                 };
@@ -2856,6 +2975,7 @@ impl Node {
                 let Some(layout) = self.layout_for(epoch, from, &mut out) else {
                     return out;
                 };
+                let touched = route.clone().unwrap_or_else(|| keys.clone());
                 let carried = !keys.is_empty();
                 let keys = self.owned_keys(&layout, keys);
                 if self.not_a_replica_of(txn, carried, &keys) {
@@ -2864,6 +2984,12 @@ impl Node {
                 let fence = self.vote_fence();
                 let reply = {
                     let mut replica = self.replica.lock().expect("replica poisoned");
+                    if self
+                        .change_refusal(&replica, txn, epoch, &touched)
+                        .is_some()
+                    {
+                        return out;
+                    }
                     replica.set_vote_fence(fence);
                     replica.accept(txn, ballot, epoch, execute_at, deps, keys)
                 };
@@ -3020,17 +3146,30 @@ impl Node {
                 let Some(layout) = self.layout_for(epoch, from, &mut out) else {
                     return out;
                 };
+                let touched = route.clone().unwrap_or_else(|| keys.clone());
                 let keys = self.owned_keys(&layout, keys);
                 let events = self.owned_events(&layout, events);
                 let fence = self.vote_fence();
                 let reply = {
                     let mut replica = self.replica.lock().expect("replica poisoned");
-                    replica.set_vote_fence(fence);
-                    match &route {
-                        // Routed: never pre-accept what this replica never
-                        // witnessed (see `Replica::recover_routed`).
-                        Some(_) => replica.recover_routed(txn, ballot, epoch, keys, events),
-                        None => replica.recover_unrouted(txn, ballot, epoch, keys, events),
+                    // A layout change's fence: no pre-accept either, and the
+                    // answer it makes ("never witnessed", for good) is a
+                    // promise only a journaled fence keeps across a restart.
+                    let refused = (route.is_none() && !keys.is_empty())
+                        .then(|| self.change_refusal(&replica, txn, epoch, &touched))
+                        .flatten();
+                    match refused {
+                        Some(false) => return out,
+                        Some(true) => replica.refuse_blind(txn, ballot),
+                        None => {
+                            replica.set_vote_fence(fence);
+                            match &route {
+                                // Routed: never pre-accept what this replica
+                                // never witnessed (see `Replica::recover_routed`).
+                                Some(_) => replica.recover_routed(txn, ballot, epoch, keys, events),
+                                None => replica.recover_unrouted(txn, ballot, epoch, keys, events),
+                            }
+                        }
                     }
                 };
                 // An unrouted recovery is told "never witnessed" only below the
@@ -3272,7 +3411,10 @@ impl Node {
                     *slot = Some((epoch, vouched));
                 }
             }
-            Message::Watermark { applied_through } => {
+            Message::Watermark {
+                applied_through,
+                fenced,
+            } => {
                 // A joiner's first report ends the hold its contact kept for
                 // it (see `JoinHold`): from here on it is counted itself.
                 self.join_holds
@@ -3283,6 +3425,13 @@ impl Node {
                     .lock()
                     .expect("watermarks poisoned")
                     .insert(from, applied_through);
+                if let Some(fenced) = fenced {
+                    self.reconfig
+                        .lock()
+                        .expect("reconfig poisoned")
+                        .reported
+                        .insert(from, fenced);
+                }
             }
             // Config Paxos — acceptor side.
             Message::ConfigPrepare { epoch, ballot } => {
@@ -3302,8 +3451,8 @@ impl Node {
                         )
                     } else {
                         acc.promised = ballot;
-                        let (accepted_ballot, accepted_layout) = match &acc.accepted {
-                            Some((b, l)) => (*b, Some(l.clone())),
+                        let (accepted_ballot, accepted_entry) = match &acc.accepted {
+                            Some((b, e)) => (*b, Some(e.clone())),
                             None => (ConfigAcceptor::default().promised, None),
                         };
                         (
@@ -3311,7 +3460,7 @@ impl Node {
                                 epoch,
                                 ballot,
                                 accepted_ballot,
-                                accepted_layout,
+                                accepted_entry,
                             },
                             Some(acc.to_record()),
                         )
@@ -3331,7 +3480,7 @@ impl Node {
             Message::ConfigAccept {
                 epoch,
                 ballot,
-                layout,
+                entry,
             } => {
                 if self.abstains_from_config() {
                     return out;
@@ -3339,7 +3488,7 @@ impl Node {
                 // Never vote for a layout that would break the cluster, so a
                 // majority of current nodes can never choose one (an older
                 // proposer validates nothing).
-                if let Err(err) = validate_layout(&layout) {
+                if let Err(err) = entry.validate() {
                     tracing::warn!(node = self.id.0, epoch, %err, "refusing an invalid layout");
                     return out;
                 }
@@ -3356,7 +3505,7 @@ impl Node {
                         )
                     } else {
                         acc.promised = ballot;
-                        acc.accepted = Some((ballot, layout));
+                        acc.accepted = Some((ballot, entry));
                         (
                             Message::ConfigAccepted { epoch, ballot },
                             Some(acc.to_record()),
@@ -3370,10 +3519,10 @@ impl Node {
                 }
                 out.push((from, reply));
             }
-            Message::ConfigCommit { epoch, layout } => {
+            Message::ConfigCommit { epoch, entry } => {
                 // Checked before the append: the log keeps the first entry per
                 // epoch, so a persisted invalid one would shut out the real one.
-                if let Err(err) = validate_layout(&layout) {
+                if let Err(err) = entry.validate() {
                     tracing::warn!(node = self.id.0, epoch, %err, "ignoring an invalid layout");
                     return out;
                 }
@@ -3382,10 +3531,11 @@ impl Node {
                 // sender (which decided it, so holds the full prefix) to fill the gap.
                 // An epoch the log did not take is not installed (see
                 // `persist_metadata`); the metadata sweep fetches it again.
-                if !self.persist_metadata(&[(epoch, layout.clone())]).await {
+                if !self.persist_metadata(&[(epoch, entry.clone())]).await {
                     return out;
                 }
-                self.ingest_entry(epoch, layout);
+                let installed = self.ingest_entry(epoch, entry);
+                self.persist_installed(installed).await;
                 if self.has_metadata_gap() {
                     out.push((
                         from,
@@ -3403,8 +3553,8 @@ impl Node {
                     let log = self.meta_log.lock().expect("meta_log poisoned");
                     let mut entries = Vec::new();
                     let mut next = after_epoch + 1;
-                    while let Some(layout) = log.entries.get(&next) {
-                        entries.push((next, layout.clone()));
+                    while let Some(entry) = log.entries.get(&next) {
+                        entries.push((next, entry.clone()));
                         next += 1;
                     }
                     entries
@@ -3420,7 +3570,7 @@ impl Node {
                 let mut entries = entries;
                 if let Some(bad) = entries
                     .iter()
-                    .position(|(_, layout)| validate_layout(layout).is_err())
+                    .position(|(_, entry)| entry.validate().is_err())
                 {
                     tracing::warn!(
                         node = self.id.0,
@@ -3436,9 +3586,13 @@ impl Node {
                 if !self.persist_metadata(&entries).await {
                     return out;
                 }
-                for (epoch, layout) in entries {
-                    self.ingest_entry(epoch, layout);
+                let mut installed = Installed::default();
+                for (epoch, entry) in entries {
+                    installed
+                        .invalidated
+                        .extend(self.ingest_entry(epoch, entry).invalidated);
                 }
+                self.persist_installed(installed).await;
             }
             // Config Paxos responses — route to the in-flight epoch change.
             response @ (Message::ConfigPromise { .. }
@@ -3880,6 +4034,12 @@ impl Node {
         }
 
         let keys = Self::keys_of(&events);
+        // A key moving to other replicas takes no new write until its
+        // transition installed the layout it moves to (see `reconfig`).
+        if let Some(since) = self.moving(&keys) {
+            self.metrics.record_write_topology_changing();
+            return Err(TopologyChanging { since }.into());
+        }
         // One layout for the whole coordination: an epoch installed meanwhile
         // changes neither the replicas it counts nor those it recovers through.
         let layout = self.topology.layout();
@@ -5688,6 +5848,7 @@ impl Node {
                 &peers,
                 Message::Watermark {
                     applied_through: mine,
+                    fenced: self.reportable_fence(),
                 },
             )
             .await;
@@ -5973,7 +6134,7 @@ impl Node {
     /// pulls after the last command page — so the vouch still holds. An
     /// epoch change meanwhile voids the vouch (`MIN`).
     fn export_join_header(&self) -> (Timestamp, Timestamp, u64, Timestamp) {
-        let epoch = self.topology.epoch();
+        let epoch = self.live_since();
         let shard_peers = self.shard_peers();
         let cutoff = self.margin_cutoff();
         let replica = self.replica.lock().expect("replica poisoned");
@@ -5981,7 +6142,7 @@ impl Node {
         let (watermark, applied) = (replica.redundant_before(), replica.applied_through(cutoff));
         drop(replica);
         let coverage = self.exportable_coverage(applied, &shard_peers);
-        let vouched = if self.topology.epoch() == epoch {
+        let vouched = if self.live_since() == epoch {
             vouched
         } else {
             Timestamp::MIN
@@ -6215,7 +6376,7 @@ impl Node {
             if let Some(fence) = self.pending_fence() {
                 let vouch = proof_slot.as_ref().and_then(PendingProof::peek);
                 let covered = vouch.is_some_and(|(epoch, vouched)| {
-                    epoch == self.topology.epoch()
+                    epoch == self.live_since()
                         && self.topology.node_shard(contact) == self.topology.node_shard(self.id)
                         && vouched >= fence
                 });
@@ -6227,6 +6388,7 @@ impl Node {
                         contact,
                         Message::Watermark {
                             applied_through: Timestamp::MIN,
+                            fenced: None,
                         },
                     )
                     .await;
@@ -6386,7 +6548,7 @@ impl Node {
             // vouched for, if it shares the contact's shard and epoch.
             let proof = proof_slot.take().and_then(PendingProof::take);
             if let Some((epoch, vouched)) = proof {
-                if epoch == self.topology.epoch()
+                if epoch == self.live_since()
                     && self.topology.node_shard(contact) == self.topology.node_shard(self.id)
                 {
                     // A transaction minted elsewhere before the inbox started
@@ -6453,11 +6615,27 @@ impl Node {
         Ok(imported)
     }
 
-    /// Coordinates installing `shards` as the new `epoch`'s layout, fault
-    /// tolerantly: runs single-decree Paxos over the **current members** so the
-    /// decision survives this coordinator failing, then commits it cluster-wide.
-    /// Returns the decided layout (which differs from `shards` only if a prior,
-    /// interrupted change for this epoch had already been accepted).
+    /// Changes the layout to `shards`, starting at `epoch` (the next one),
+    /// fault tolerantly: each step is decided by single-decree Paxos over the
+    /// **current members**, so it survives this coordinator failing, then
+    /// committed cluster-wide. Returns the layout installed in the end (which
+    /// differs from `shards` only if an interrupted change had already been
+    /// decided for `epoch`).
+    ///
+    /// A change after which a quorum of the new replicas of a shard could miss
+    /// a quorum of the old ones (replacing a replica, adding two, shrinking five
+    /// to three) takes two epochs (see `reconfig`): `epoch` decides a
+    /// transition, during which writes to the keys it moves are refused with
+    /// [`TopologyChanging`] while the writes in flight on them drain, and the
+    /// next epoch installs `shards` once they have — after about the compaction
+    /// margin and a few anti-entropy rounds, run by the recovery sweep
+    /// ([`start_recovery`](Node::start_recovery)). Any other change installs
+    /// `shards` at `epoch`. A change while a transition is in progress
+    /// replaces it; one back to the live layout cancels it.
+    ///
+    /// For now a change keeps the shard count, keeps a replica of every shard,
+    /// and moves no replica to another shard: new replicas join through the
+    /// ones their shard keeps.
     ///
     /// The acceptor set is the members of the current epoch (a node proposing the
     /// next epoch is still on this one), so it tracks membership: changes keep
@@ -6469,24 +6647,214 @@ impl Node {
     ) -> anyhow::Result<Vec<Vec<NodeId>>> {
         validate_layout(&shards)?;
         self.ensure_next_epoch(epoch)?;
+        let decided = match self.committed_entry(epoch) {
+            Some(decided) => decided,
+            None => {
+                let live = self.topology.layout();
+                reconfig::validate_change(live.shards(), &shards)?;
+                // The change already in progress is carried through, not
+                // decided again: its fence and drain stand.
+                if let Some(since) = self.transition_to(&shards) {
+                    return self.complete_transition(since).await;
+                }
+                let acceptors = self.topology.nodes();
+                let proposal = Self::change_entry(epoch, &live, shards);
+                let decided = self.run_config_paxos(epoch, proposal, &acceptors).await?;
+                self.commit_topology(epoch, &decided, &acceptors).await;
+                decided
+            }
+        };
+        match decided {
+            ConfigEntry::Active { layout, .. } => Ok(layout),
+            ConfigEntry::Transition { since, .. } => self.complete_transition(since).await,
+        }
+    }
+
+    /// The entry a change from `live` to `shards` decides at `epoch`: a
+    /// transition when a quorum of the new replicas of a shard could miss a
+    /// quorum of the old ones, the new layout at once otherwise.
+    fn change_entry(epoch: u64, live: &Layout, shards: Vec<Vec<NodeId>>) -> ConfigEntry {
+        let next = Layout::new(epoch, shards.clone());
+        if reconfig::quorums_intersect(live, &next) {
+            ConfigEntry::active(shards)
+        } else {
+            ConfigEntry::Transition {
+                active: live.shards().to_vec(),
+                pending: shards,
+                since: epoch,
+            }
+        }
+    }
+
+    /// The `since` of the transition in progress, if it installs `shards`.
+    fn transition_to(&self, shards: &[Vec<NodeId>]) -> Option<u64> {
+        let reconfig = self.reconfig.lock().expect("reconfig poisoned");
+        reconfig
+            .transition
+            .as_ref()
+            .filter(|t| t.pending.shards() == shards)
+            .map(|t| t.since)
+    }
+
+    /// Carries the transition first decided at `since` through: waits until it
+    /// drained, decides the entry that installs its layout, and returns that
+    /// layout — or fails if another change replaced it, or if it is still
+    /// draining after a while (the recovery sweep then completes it).
+    async fn complete_transition(&self, since: u64) -> anyhow::Result<Vec<Vec<NodeId>>> {
+        let deadline = Self::after(self.settings.collect_timeout * TRANSITION_ROUNDS);
+        loop {
+            match self.transition_outcome(since) {
+                TransitionOutcome::Draining => {}
+                TransitionOutcome::Installed(layout) => return Ok(layout),
+                TransitionOutcome::Replaced => {
+                    anyhow::bail!(
+                        "the transition decided at epoch {since} was replaced by another change"
+                    )
+                }
+            }
+            if let Some(point) = self.drain_reached(since) {
+                if let Err(err) = self.activate(since, point).await {
+                    tracing::debug!(node = self.id.0, since, %err, "activation not decided yet");
+                }
+                continue;
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!(
+                    "the transition decided at epoch {since} is still draining; the recovery sweep completes it"
+                );
+            }
+            tokio::time::sleep(self.settings.recovery_interval).await;
+        }
+    }
+
+    /// How the transition first decided at `since` stands on this node.
+    fn transition_outcome(&self, since: u64) -> TransitionOutcome {
+        let ended = {
+            let reconfig = self.reconfig.lock().expect("reconfig poisoned");
+            if reconfig
+                .transition
+                .as_ref()
+                .is_some_and(|t| t.since == since)
+            {
+                return TransitionOutcome::Draining;
+            }
+            reconfig
+                .fences
+                .iter()
+                .find(|f| f.since == since)
+                .and_then(|f| f.end)
+        };
+        let log = self.meta_log.lock().expect("meta_log poisoned");
+        let pending = match log.entries.get(&since) {
+            Some(ConfigEntry::Transition { pending, .. }) => pending,
+            _ => return TransitionOutcome::Replaced,
+        };
+        match ended.and_then(|end| log.entries.get(&end)) {
+            Some(ConfigEntry::Active { layout, .. }) if layout == pending => {
+                TransitionOutcome::Installed(layout.clone())
+            }
+            _ => TransitionOutcome::Replaced,
+        }
+    }
+
+    /// The drain point of the transition first decided at `since`, once it is
+    /// in progress here and has drained (see [`reconfig::drained`]).
+    fn drain_reached(&self, since: u64) -> Option<Timestamp> {
+        let reports = self
+            .peer_watermarks
+            .lock()
+            .expect("watermarks poisoned")
+            .clone();
+        let reconfig = self.reconfig.lock().expect("reconfig poisoned");
+        let transition = reconfig.transition.as_ref().filter(|t| t.since == since)?;
+        let point = reconfig::drain_point(transition, &reconfig.reported)?;
+        reconfig::drained(&transition.live, point, &reports).then_some(point)
+    }
+
+    /// Decides, and commits, the entry that ends the transition first decided
+    /// at `since` by installing its layout, drained at `point`: its clock floor
+    /// is this node's reading plus three skews, rounded up to a millisecond, and
+    /// this node waits for its clock to pass it first (every node raises its
+    /// clock to it as it installs the entry).
+    async fn activate(&self, since: u64, point: Timestamp) -> anyhow::Result<()> {
+        let skew = self.clock.max_skew_micros();
+        let floor_micros = (self.clock.reading_micros() + 3 * skew).div_ceil(1_000) * 1_000;
+        loop {
+            let reading = self.clock.reading_micros();
+            if reading >= floor_micros {
+                break;
+            }
+            tokio::time::sleep(Duration::from_micros(floor_micros - reading)).await;
+        }
+        let pending = {
+            let reconfig = self.reconfig.lock().expect("reconfig poisoned");
+            match reconfig.transition.as_ref().filter(|t| t.since == since) {
+                Some(t) => t.pending.shards().to_vec(),
+                None => return Ok(()),
+            }
+        };
+        let entry = ConfigEntry::Active {
+            layout: pending,
+            drained: Some(Drained {
+                point,
+                floor: Timestamp {
+                    micros: floor_micros,
+                    logical: 0,
+                    node: NodeId(0),
+                },
+            }),
+        };
+        let epoch = self.installed_epoch() + 1;
         let acceptors = self.topology.nodes();
-        let decided = self.run_config_paxos(epoch, shards, &acceptors).await?;
+        let decided = self.run_config_paxos(epoch, entry, &acceptors).await?;
         self.commit_topology(epoch, &decided, &acceptors).await;
-        Ok(decided)
+        Ok(())
+    }
+
+    /// Activates the transition in progress once it has drained, if this node
+    /// is the distinguished proposer of the next epoch — or no proposer before
+    /// it did so in time (the sweep's half of [`complete_transition`](Self::complete_transition)).
+    async fn sweep_transition(&self) {
+        let since = {
+            let reconfig = self.reconfig.lock().expect("reconfig poisoned");
+            match reconfig.transition.as_ref() {
+                Some(t) => t.since,
+                None => return,
+            }
+        };
+        let Some(point) = self.drain_reached(since) else {
+            return;
+        };
+        let next = self.installed_epoch() + 1;
+        let acceptors = self.topology.nodes();
+        let rank = self.config_rank(next, &acceptors);
+        if rank > 0 {
+            tokio::time::sleep(self.settings.config_defer_step * rank as u32).await;
+            if self.committed_entry(next).is_some() {
+                return;
+            }
+        }
+        if let Err(err) = self.activate(since, point).await {
+            tracing::debug!(node = self.id.0, since, %err, "activation not decided yet");
+        }
     }
 
     /// Drives Paxos phases 1–2 for `epoch` (no commit), returning the decided
-    /// layout. Exposed so tests can simulate a coordinator that fails after the
-    /// decision is durable but before committing.
+    /// entry: what [`change_topology`](Self::change_topology) would decide for
+    /// `proposed` first. Exposed so tests can simulate a coordinator that fails
+    /// after the decision is durable but before committing.
     pub async fn propose_topology(
         &self,
         epoch: u64,
         proposed: Vec<Vec<NodeId>>,
-    ) -> anyhow::Result<Vec<Vec<NodeId>>> {
+    ) -> anyhow::Result<ConfigEntry> {
         validate_layout(&proposed)?;
         self.ensure_next_epoch(epoch)?;
+        let live = self.topology.layout();
+        reconfig::validate_change(live.shards(), &proposed)?;
         let acceptors = self.topology.nodes();
-        self.run_config_paxos(epoch, proposed, &acceptors).await
+        let proposal = Self::change_entry(epoch, &live, proposed);
+        self.run_config_paxos(epoch, proposal, &acceptors).await
     }
 
     /// Refuses a change for an epoch past the next one. Its acceptors would
@@ -6502,8 +6870,8 @@ impl Node {
         Ok(())
     }
 
-    /// The committed layout for `epoch`, if it is already in the metadata log.
-    fn committed_layout(&self, epoch: u64) -> Option<Vec<Vec<NodeId>>> {
+    /// The committed entry for `epoch`, if it is already in the metadata log.
+    fn committed_entry(&self, epoch: u64) -> Option<ConfigEntry> {
         self.meta_log
             .lock()
             .expect("meta_log poisoned")
@@ -6544,19 +6912,19 @@ impl Node {
     async fn run_config_paxos(
         &self,
         epoch: u64,
-        proposed: Vec<Vec<NodeId>>,
+        proposed: ConfigEntry,
         acceptors: &[NodeId],
-    ) -> anyhow::Result<Vec<Vec<NodeId>>> {
+    ) -> anyhow::Result<ConfigEntry> {
         let need = acceptors.len() / 2 + 1;
         let rank = self.config_rank(epoch, acceptors);
         let mut ballot = Ballot(self.mint().await?);
 
         for attempt in 0..6 {
             // Yield: if the epoch committed (this round or while we were backing off
-            // from a duel), adopt that decided layout — never our own `proposed`,
+            // from a duel), adopt that decided entry — never our own `proposed`,
             // which may differ from the chosen value.
-            if let Some(layout) = self.committed_layout(epoch) {
-                return Ok(layout);
+            if let Some(entry) = self.committed_entry(epoch) {
+                return Ok(entry);
             }
             // This attempt's replies, until it ends; another proposal for the
             // epoch on this node has a round of its own.
@@ -6571,7 +6939,7 @@ impl Node {
             // fresh connection) must not complete a quorum of fewer acceptors.
             let mut promisers: HashSet<NodeId> = HashSet::new();
             let mut nack: Option<Ballot> = None;
-            let mut adopted: Option<(Ballot, Vec<Vec<NodeId>>)> = None;
+            let mut adopted: Option<(Ballot, ConfigEntry)> = None;
             let deadline = Self::after(self.settings.collect_timeout);
             while promisers.len() < need {
                 match tokio::time::timeout_at(deadline, rx.recv()).await {
@@ -6583,16 +6951,16 @@ impl Node {
                         Message::ConfigPromise {
                             ballot: b,
                             accepted_ballot,
-                            accepted_layout,
+                            accepted_entry,
                             ..
                         },
                     ))) if b == ballot => {
                         if !promisers.insert(from) {
                             continue;
                         }
-                        if let Some(layout) = accepted_layout {
+                        if let Some(entry) = accepted_entry {
                             if adopted.as_ref().is_none_or(|(b, _)| accepted_ballot > *b) {
-                                adopted = Some((accepted_ballot, layout));
+                                adopted = Some((accepted_ballot, entry));
                             }
                         }
                     }
@@ -6619,21 +6987,21 @@ impl Node {
                 anyhow::bail!("config prepare quorum not reached for epoch {epoch}");
             }
 
-            let layout = adopted.map(|(_, l)| l).unwrap_or(proposed.clone());
+            let entry = adopted.map(|(_, e)| e).unwrap_or(proposed.clone());
             // The adopted value (an older proposer's) or a recovery's fallback
             // was never checked; an invalid one is not carried to a decision.
-            if let Err(err) = validate_layout(&layout) {
+            if let Err(err) = entry.validate() {
                 return Err(err.context(format!("refusing to decide epoch {epoch}")));
             }
 
-            // Phase 2: Accept the chosen layout.
+            // Phase 2: Accept the chosen entry.
             for &node in acceptors {
                 self.send(
                     node,
                     Message::ConfigAccept {
                         epoch,
                         ballot,
-                        layout: layout.clone(),
+                        entry: entry.clone(),
                     },
                 )
                 .await;
@@ -6668,20 +7036,21 @@ impl Node {
             if accepters.len() < need {
                 anyhow::bail!("config accept quorum not reached for epoch {epoch}");
             }
-            return Ok(layout);
+            return Ok(entry);
         }
         // A winner may have committed during our final backoff — adopt it.
-        if let Some(layout) = self.committed_layout(epoch) {
-            return Ok(layout);
+        if let Some(entry) = self.committed_entry(epoch) {
+            return Ok(entry);
         }
         anyhow::bail!("config change for epoch {epoch} exhausted its ballots")
     }
 
     /// Recovers a possibly-interrupted change for `epoch`: completes whatever
-    /// layout was already accepted (or, if none was, keeps the current layout),
-    /// then commits it. Any node can call this after the original coordinator
-    /// fails.
-    pub async fn recover_topology(&self, epoch: u64) -> anyhow::Result<Vec<Vec<NodeId>>> {
+    /// entry was already accepted (or, if none was, repeats the installed one,
+    /// changing nothing), then commits it, and returns it. Any node can call
+    /// this after the original coordinator fails; a transition it commits is
+    /// then completed by the recovery sweep.
+    pub async fn recover_topology(&self, epoch: u64) -> anyhow::Result<ConfigEntry> {
         self.ensure_next_epoch(epoch)?;
         let acceptors = self.topology.nodes();
         // Anti-dueling deference (this is the automatic path, run by the sweep on
@@ -6692,11 +7061,20 @@ impl Node {
         let rank = self.config_rank(epoch, &acceptors);
         if rank > 0 {
             tokio::time::sleep(self.settings.config_defer_step * rank as u32).await;
-            if let Some(layout) = self.committed_layout(epoch) {
-                return Ok(layout);
+            if let Some(entry) = self.committed_entry(epoch) {
+                return Ok(entry);
             }
         }
-        let fallback = self.current_layout();
+        // Never an activation: one is decided only once its transition
+        // drained (`activate`).
+        let fallback = {
+            let log = self.meta_log.lock().expect("meta_log poisoned");
+            let installed = log
+                .entries
+                .get(&log.installed_epoch)
+                .expect("the installed epoch's entry is in the log");
+            reconfig::repeat(installed)
+        };
         let decided = self.run_config_paxos(epoch, fallback, &acceptors).await?;
         self.commit_topology(epoch, &decided, &acceptors).await;
         Ok(decided)
@@ -6708,34 +7086,36 @@ impl Node {
     /// [`Topology`] once **every** intervening epoch is present — so a node that
     /// receives epoch N+2 before N+1 holds it until N+1 arrives, never skipping an
     /// epoch. Idempotent: re-ingesting a known entry is a no-op.
-    fn ingest_entry(&self, epoch: u64, layout: Vec<Vec<NodeId>>) {
+    fn ingest_entry(&self, epoch: u64, entry: ConfigEntry) -> Installed {
         {
             let mut log = self.meta_log.lock().expect("meta_log poisoned");
             // Below the installed epoch an entry is history only (one the
             // node started past): kept to recover what was planned under it.
-            if epoch < log.installed_epoch && validate_layout(&layout).is_ok() {
-                self.topology.install(epoch, layout.clone());
+            if epoch < log.installed_epoch && entry.validate().is_ok() {
+                self.topology.install(epoch, entry.live().to_vec());
             }
-            log.entries.entry(epoch).or_insert(layout);
+            log.entries.entry(epoch).or_insert(entry);
         }
-        self.apply_log();
+        self.apply_log()
     }
 
     /// Installs each contiguous metadata-log entry above the installed epoch, in
     /// order. Only ever calls `install(installed_epoch + 1, …)`, so no epoch is
-    /// skipped even if a far-future entry is already in the log.
-    fn apply_log(&self) {
+    /// skipped even if a far-future entry is already in the log. The caller
+    /// makes what it returns durable ([`persist_installed`](Self::persist_installed)).
+    fn apply_log(&self) -> Installed {
+        let mut installed = Installed::default();
         loop {
             let next = {
                 let log = self.meta_log.lock().expect("meta_log poisoned");
                 let next = log.installed_epoch + 1;
-                log.entries.get(&next).map(|layout| (next, layout.clone()))
+                log.entries.get(&next).map(|entry| (next, entry.clone()))
             };
-            let Some((next, layout)) = next else { break };
+            let Some((next, entry)) = next else { break };
             // An entry persisted before layouts were checked: installing it
             // would break every key (no shard) or strand some (an empty one).
             // Stay on the last good epoch instead.
-            if let Err(err) = validate_layout(&layout) {
+            if let Err(err) = entry.validate() {
                 tracing::error!(
                     node = self.id.0,
                     epoch = next,
@@ -6744,11 +7124,156 @@ impl Node {
                 );
                 break;
             }
-            self.topology.install(next, layout);
+            // An activation's clock floor is in place before anything is
+            // planned under the layout it installs.
+            if let ConfigEntry::Active {
+                drained: Some(drained),
+                ..
+            } = &entry
+            {
+                self.clock.restore(drained.floor);
+            }
+            self.topology.install(next, entry.live().to_vec());
+            self.install_entry(next, &entry, &mut installed);
             self.meta_log
                 .lock()
                 .expect("meta_log poisoned")
                 .installed_epoch = next;
+        }
+        installed
+    }
+
+    /// What installing `entry` at `epoch` changes besides the topology: a
+    /// transition installs its fence (computed under the replica lock, so no
+    /// vote slips between the fence point and the fence), and ends a
+    /// different one still in progress; an activation ends the transition,
+    /// sets its clock floor, and invalidates what can never commit (see
+    /// [`reconfig`]).
+    fn install_entry(&self, epoch: u64, entry: &ConfigEntry, installed: &mut Installed) {
+        let live = self.topology.layout_at(epoch).expect("installed just now");
+        match entry {
+            ConfigEntry::Transition { pending, since, .. } => {
+                let transition =
+                    Transition::new(*since, live, Arc::new(Layout::new(epoch, pending.clone())));
+                let replica = self.replica.lock().expect("replica poisoned");
+                let mut reconfig = self.reconfig.lock().expect("reconfig poisoned");
+                if let Some(old) = reconfig.transition.take().filter(|old| old.since != *since) {
+                    // Replaced by another change: it ends here.
+                    reconfig.end_fence(old.since, epoch);
+                }
+                if !reconfig.fences.iter().any(|f| f.since == *since) {
+                    let (cap, journaled) = match reconfig.restored.get(since) {
+                        Some(&cap) => (cap, true),
+                        None => (
+                            Fence::cap_for(
+                                replica.highest_t0(),
+                                self.vote_horizon_micros(),
+                                self.amnesia_fence_micros(),
+                            ),
+                            false,
+                        ),
+                    };
+                    tracing::info!(
+                        node = self.id.0,
+                        epoch,
+                        since,
+                        ?cap,
+                        "fenced the keys a layout transition moves"
+                    );
+                    reconfig
+                        .fences
+                        .push(Fence::new(&transition, cap, journaled));
+                }
+                reconfig.transition = Some(transition);
+            }
+            ConfigEntry::Active { layout, drained } => {
+                let mut replica = self.replica.lock().expect("replica poisoned");
+                let mut reconfig = self.reconfig.lock().expect("reconfig poisoned");
+                let previous = self
+                    .topology
+                    .layout_at(epoch.saturating_sub(1))
+                    .map(|l| l.shards().to_vec());
+                if previous.as_deref() != Some(layout.as_slice()) {
+                    reconfig.live_since = epoch;
+                }
+                let Some(transition) = reconfig.transition.take() else {
+                    return;
+                };
+                reconfig.end_fence(transition.since, epoch);
+                let Some(drained) = drained else {
+                    // Ended without a move (the change went back to the live
+                    // layout): nothing changed replicas, nothing to drain.
+                    return;
+                };
+                reconfig
+                    .floors
+                    .push(Floor::new(epoch, drained.floor, &transition));
+                // A transaction on a moved key above the drain point never
+                // commits: no fenced replica votes for it.
+                for (txn, planned, keys) in replica.uncommitted() {
+                    if planned < epoch
+                        && txn.0 > drained.point
+                        && keys.iter().any(|key| transition.moves(key))
+                        && replica.invalidate(txn)
+                    {
+                        installed.invalidated.push(txn);
+                    }
+                }
+                tracing::info!(
+                    node = self.id.0,
+                    epoch,
+                    since = transition.since,
+                    point = ?drained.point,
+                    invalidated = installed.invalidated.len(),
+                    "installed the layout a transition drained for"
+                );
+            }
+        }
+    }
+
+    /// Makes what installing entries left durable: stages the commands an
+    /// activation invalidated, and journals the fences not journaled yet.
+    async fn persist_installed(&self, installed: Installed) {
+        if !installed.invalidated.is_empty() {
+            for txn in &installed.invalidated {
+                self.journal_stage(*txn).await;
+            }
+            if self.journal.flush().await.is_ok() {
+                self.metrics.record_flush();
+            }
+            self.applied.bump();
+        }
+        self.persist_fences().await;
+    }
+
+    /// Journals the fences, if one is not journaled yet, then reads them
+    /// back: only a fence the journal keeps is reported (a journal that
+    /// cannot keep them holds every change that moves a key at its
+    /// transition). Retried by the sweep until it succeeds.
+    async fn persist_fences(&self) {
+        let records: Vec<FenceRecord> = {
+            let reconfig = self.reconfig.lock().expect("reconfig poisoned");
+            if reconfig.fences.iter().all(|f| f.journaled) {
+                return;
+            }
+            reconfig.fences.iter().map(Fence::record).collect()
+        };
+        if let Err(err) = self.journal.save_fences(&records).await {
+            tracing::warn!(node = self.id.0, %err, "cannot journal a transition fence; not reporting it");
+            return;
+        }
+        let kept = match self.journal.load_fences().await {
+            Ok(kept) => kept,
+            Err(err) => {
+                tracing::warn!(node = self.id.0, %err, "cannot read back the transition fences");
+                return;
+            }
+        };
+        let mut reconfig = self.reconfig.lock().expect("reconfig poisoned");
+        for fence in reconfig.fences.iter_mut() {
+            if kept.contains(&fence.record()) {
+                fence.journaled = true;
+            }
         }
     }
 
@@ -6772,14 +7297,21 @@ impl Node {
 
     /// Installs the decided layout locally and broadcasts it to the acceptors and
     /// the new members so they install it too.
-    async fn commit_topology(&self, epoch: u64, layout: &[Vec<NodeId>], acceptors: &[NodeId]) {
+    async fn commit_topology(&self, epoch: u64, entry: &ConfigEntry, acceptors: &[NodeId]) {
         // Not installed here if the log did not take it: the commit sent to
         // this node with the others, or the metadata sweep, retries it.
-        if self.persist_metadata(&[(epoch, layout.to_vec())]).await {
-            self.ingest_entry(epoch, layout.to_vec());
+        if self.persist_metadata(&[(epoch, entry.clone())]).await {
+            let installed = self.ingest_entry(epoch, entry.clone());
+            self.persist_installed(installed).await;
         }
         let mut recipients = acceptors.to_vec();
-        for node in layout.iter().flatten() {
+        let named = match entry {
+            ConfigEntry::Active { layout, .. } => vec![layout],
+            ConfigEntry::Transition {
+                active, pending, ..
+            } => vec![active, pending],
+        };
+        for node in named.into_iter().flatten().flatten() {
             if !recipients.contains(node) {
                 recipients.push(*node);
             }
@@ -6789,32 +7321,11 @@ impl Node {
                 node,
                 Message::ConfigCommit {
                     epoch,
-                    layout: layout.to_vec(),
+                    entry: entry.clone(),
                 },
             )
             .await;
         }
-    }
-
-    /// This node's current shard layout, recovered shard-by-shard from the
-    /// topology (used as the no-op fallback when recovering a config change).
-    fn current_layout(&self) -> Vec<Vec<NodeId>> {
-        // Rebuild the REAL per-shard layout: proposing a single flattened shard
-        // here would remap every key's owner if it won (the exact opposite of a
-        // no-op fallback).
-        let mut shards: BTreeMap<ShardId, Vec<NodeId>> = BTreeMap::new();
-        let mut unsharded: Vec<NodeId> = Vec::new();
-        for node in self.topology.nodes() {
-            match self.topology.node_shard(node) {
-                Some(shard) => shards.entry(shard).or_default().push(node),
-                None => unsharded.push(node),
-            }
-        }
-        let mut layout: Vec<Vec<NodeId>> = shards.into_values().collect();
-        if layout.is_empty() {
-            layout.push(unsharded);
-        }
-        layout
     }
 
     // ----- read routing ---------------------------------------------------
@@ -7075,6 +7586,91 @@ impl Node {
             ));
         }
         None
+    }
+
+    /// The fence this node reports for the transition in progress, once the
+    /// journal keeps it — recorded as its own report too.
+    fn reportable_fence(&self) -> Option<FenceRecord> {
+        let mut reconfig = self.reconfig.lock().expect("reconfig poisoned");
+        let since = reconfig.transition.as_ref()?.since;
+        let record = reconfig
+            .fences
+            .iter()
+            .find(|f| f.since == since && f.journaled)?
+            .record();
+        reconfig.reported.insert(self.id, record);
+        Some(record)
+    }
+
+    /// The `since` of the transition in progress, if it moves one of `keys`.
+    fn moving(&self, keys: &[Key]) -> Option<u64> {
+        let reconfig = self.reconfig.lock().expect("reconfig poisoned");
+        reconfig
+            .transition
+            .as_ref()
+            .filter(|t| keys.iter().any(|k| t.moves(k)))
+            .map(|t| t.since)
+    }
+
+    /// The epoch the live layout became live at: sync coverage, join proofs
+    /// and vouches hold for as long as it stays live — through a transition
+    /// too, which changes no replicas until it ends.
+    fn live_since(&self) -> u64 {
+        self.reconfig.lock().expect("reconfig poisoned").live_since
+    }
+
+    /// The highest `t0` a coordinator may date a transaction this node votes
+    /// for at (see [`future_dated`](Self::future_dated)), in microseconds.
+    fn vote_horizon_micros(&self) -> u64 {
+        self.clock
+            .reading_micros()
+            .saturating_add(self.clock.max_skew_micros().saturating_mul(2))
+    }
+
+    /// This node's amnesia fence, if it came back over a lost journal: above
+    /// everything it may have voted on before (#312).
+    fn amnesia_fence_micros(&self) -> Option<u64> {
+        self.amnesia
+            .lock()
+            .expect("amnesia poisoned")
+            .map(|fence| fence.fence_micros)
+    }
+
+    /// Whether a layout change refuses this node's vote for `txn`, which
+    /// `replica` (locked by the caller, so no fence goes in meanwhile) does not
+    /// hold, planned under `epoch`, touching `keys` (its route when it has
+    /// one): a transition's fence, or an activation's clock floor (see
+    /// [`reconfig`]). `Some(journaled)` when refused: whether the refusal
+    /// rests on what the journal keeps (a fence not journaled yet could be
+    /// recomputed after a restart, at another point).
+    fn change_refusal(
+        &self,
+        replica: &Replica,
+        txn: TxnId,
+        epoch: u64,
+        keys: &[Key],
+    ) -> Option<bool> {
+        if replica.status(txn).is_some() {
+            return None;
+        }
+        let reconfig = self.reconfig.lock().expect("reconfig poisoned");
+        let refused = if reconfig
+            .floors
+            .iter()
+            .any(|f| f.refuses(epoch, txn.0, keys))
+        {
+            Some(true)
+        } else {
+            reconfig
+                .fences
+                .iter()
+                .find(|f| f.refuses(epoch, txn.0, keys))
+                .map(|f| f.journaled)
+        };
+        if refused.is_some() {
+            self.metrics.record_vote_change_fenced();
+        }
+        refused
     }
 
     /// Whether `txn`, which this node does not hold, was planned under
@@ -7554,12 +8150,15 @@ mod tests {
     use async_trait::async_trait;
     use evento_core::Event;
 
-    use crate::api::{DataStore, Journal, ShardedTopology, Topology};
+    use crate::api::{
+        ConfigEntry, DataStore, Drained, FenceRecord, Journal, ShardedTopology, Topology,
+    };
     use crate::clock::{HybridLogicalClock, NodeId, Timestamp, TxnId};
-    use crate::message::{CommandState, Key, Message};
+    use crate::message::{CommandState, Key, Message, Status};
     use crate::store::{InMemoryDataStore, InMemoryJournal};
     use crate::transport::InMemoryNetwork;
     use crate::{api::MessageSink, Envelope, StaticTopology};
+    use tokio::time::Duration;
 
     use super::{Node, NodeConfig};
 
@@ -7744,7 +8343,6 @@ mod tests {
     async fn the_fast_path_is_ruled_out_past_the_electorates_slack() {
         use super::RecoverFields;
         use crate::clock::Ballot;
-        use crate::message::Status;
 
         let txn = TxnId(Timestamp {
             micros: 10,
@@ -8444,9 +9042,12 @@ mod tests {
                 logical: 0,
                 node: NodeId(micros),
             },
+            fenced: None,
         };
         let micros_of = |m: Message| match m {
-            Message::Watermark { applied_through } => Some(applied_through.micros),
+            Message::Watermark {
+                applied_through, ..
+            } => Some(applied_through.micros),
             _ => None,
         };
 
@@ -8495,7 +9096,6 @@ mod tests {
     async fn routed_recovery_counts_reports_by_the_plan_not_the_live_layout() {
         use super::{RecoverFields, RecoverResp, Verdict};
         use crate::clock::Ballot;
-        use crate::message::Status;
 
         let (node, topology, events) = reshardable_node();
         let keys = Node::keys_of(&events);
@@ -8608,7 +9208,6 @@ mod tests {
     #[tokio::test]
     async fn an_old_owner_finishes_a_transaction_planned_before_the_move() {
         use crate::clock::Ballot;
-        use crate::message::Status;
 
         let (node, topology, events) = reshardable_node();
         let event = events
@@ -8752,5 +9351,286 @@ mod tests {
             matches!(out.as_slice(), [(_, Message::AcceptOk { .. })]),
             "{out:?}"
         );
+    }
+
+    /// Node 0 of a single shard `{0, 1, 2}` over a dynamic topology at epoch
+    /// 0, with its journal, not started: messages are injected.
+    fn replaceable_node(journal: Arc<InMemoryJournal>) -> (Node, Arc<crate::api::DynamicTopology>) {
+        let id = NodeId(0);
+        let topology = Arc::new(crate::api::DynamicTopology::new(
+            id,
+            0,
+            vec![(0..3).map(NodeId).collect()],
+        ));
+        let net = InMemoryNetwork::new();
+        let node = Node::new(
+            id,
+            Arc::clone(&topology) as Arc<dyn Topology>,
+            Arc::new(HybridLogicalClock::new(id)),
+            Arc::new(net.sink(id)) as Arc<dyn MessageSink>,
+            Arc::new(InMemoryDataStore::new()) as Arc<dyn DataStore>,
+            journal as Arc<dyn Journal>,
+        );
+        (node, topology)
+    }
+
+    /// The transition that replaces node 2 with node 3, decided at epoch 1.
+    fn replacing_two() -> ConfigEntry {
+        ConfigEntry::Transition {
+            active: vec![(0..3).map(NodeId).collect()],
+            pending: vec![vec![NodeId(0), NodeId(1), NodeId(3)]],
+            since: 1,
+        }
+    }
+
+    fn preaccept_at(micros: u64, epoch: u64) -> (TxnId, Message) {
+        let txn = TxnId(Timestamp {
+            micros,
+            logical: 0,
+            node: NodeId(9),
+        });
+        let event = Event {
+            id: ulid::Ulid::generate(),
+            aggregate_type: "test/Account".into(),
+            aggregate_id: "acc".into(),
+            version: 1,
+            name: "Opened".into(),
+            ..Default::default()
+        };
+        let message = Message::PreAccept {
+            txn,
+            epoch,
+            keys: vec![Key::of(&event)],
+            events: vec![event],
+        };
+        (txn, message)
+    }
+
+    async fn commit_entry(node: &Node, epoch: u64, entry: ConfigEntry) {
+        node.handle_staged(Envelope {
+            from: NodeId(1),
+            message: Message::ConfigCommit { epoch, entry },
+        })
+        .await;
+    }
+
+    /// The fence point a replica takes as it installs a transition is above
+    /// every vote it cast, one for a `t0` its coordinator dated up to two skews
+    /// past this replica's clock included. Above the point, it votes for no
+    /// transaction it never witnessed on a moved key; below, it does.
+    #[tokio::test]
+    async fn a_transition_fence_covers_a_vote_dated_past_the_clock() {
+        let (node, _topology) = replaceable_node(Arc::new(InMemoryJournal::new()));
+        let skew = node.clock.max_skew_micros();
+        let (ahead, message) = preaccept_at(node.clock.reading_micros() + skew * 3 / 2, 0);
+        let out = node
+            .handle_staged(Envelope {
+                from: NodeId(9),
+                message,
+            })
+            .await;
+        assert!(
+            matches!(out.as_slice(), [(_, Message::PreAcceptOk { .. })]),
+            "{out:?}"
+        );
+
+        commit_entry(&node, 1, replacing_two()).await;
+        let cap = {
+            let reconfig = node.reconfig.lock().unwrap();
+            assert!(reconfig.transition.is_some());
+            let fence = &reconfig.fences[0];
+            assert!(fence.journaled, "journaled before it is reported");
+            fence.cap
+        };
+        assert!(cap > ahead.0, "{cap:?} <= {ahead:?}");
+
+        // Once the clock moved on, a coordinator may date a vote past the
+        // cap: refused, as is any never-witnessed vote above it.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let (late, message) = preaccept_at(cap.micros + 1, 0);
+        let out = node
+            .handle_staged(Envelope {
+                from: NodeId(9),
+                message,
+            })
+            .await;
+        assert!(out.is_empty(), "no vote above the fence point: {out:?}");
+        assert_eq!(node.command_status(late), None);
+        assert_eq!(node.metrics().votes_change_fenced, 1);
+        // Below the point, a transaction never witnessed is voted for.
+        let (early, message) = preaccept_at(ahead.0.micros + 1, 0);
+        let out = node
+            .handle_staged(Envelope {
+                from: NodeId(9),
+                message,
+            })
+            .await;
+        assert!(
+            matches!(out.as_slice(), [(_, Message::PreAcceptOk { .. })]),
+            "{out:?}"
+        );
+        assert!(node.command_status(early).is_some());
+    }
+
+    /// A replica restarted mid-transition comes back with the fence point it
+    /// journaled, not one recomputed from its restarted clock.
+    #[tokio::test]
+    async fn a_restarted_replica_keeps_its_fence() {
+        let journal = Arc::new(InMemoryJournal::new());
+        let (node, _topology) = replaceable_node(Arc::clone(&journal));
+        commit_entry(&node, 1, replacing_two()).await;
+        let cap = node.reconfig.lock().unwrap().fences[0].cap;
+        assert_eq!(
+            journal.load_fences().await.unwrap(),
+            vec![FenceRecord { since: 1, cap }]
+        );
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let (restarted, topology) = replaceable_node(Arc::clone(&journal));
+        restarted.recover_state().await.unwrap();
+        assert_eq!(topology.epoch(), 1);
+        let reconfig = restarted.reconfig.lock().unwrap();
+        assert_eq!(reconfig.transition.as_ref().map(|t| t.since), Some(1));
+        assert_eq!(reconfig.fences.len(), 1);
+        assert_eq!(reconfig.fences[0].cap, cap, "the journaled point");
+        assert!(reconfig.fences[0].journaled);
+    }
+
+    /// An activation invalidates what a replica holds unapplied on a moved key
+    /// above the drain point — no fenced replica votes for it, so it never
+    /// commits — and keeps what lies below, which drained elsewhere.
+    #[tokio::test]
+    async fn activation_invalidates_what_can_never_commit() {
+        let (node, topology) = replaceable_node(Arc::new(InMemoryJournal::new()));
+        let now = node.clock.reading_micros();
+        let (below, message) = preaccept_at(now, 0);
+        node.handle_staged(Envelope {
+            from: NodeId(9),
+            message,
+        })
+        .await;
+        let (above, message) = preaccept_at(now + 10, 0);
+        node.handle_staged(Envelope {
+            from: NodeId(9),
+            message,
+        })
+        .await;
+        commit_entry(&node, 1, replacing_two()).await;
+        let point = Timestamp {
+            micros: now + 5,
+            logical: 0,
+            node: NodeId(0),
+        };
+        commit_entry(
+            &node,
+            2,
+            ConfigEntry::Active {
+                layout: vec![vec![NodeId(0), NodeId(1), NodeId(3)]],
+                drained: Some(Drained {
+                    point,
+                    floor: Timestamp {
+                        micros: now + 1_000,
+                        logical: 0,
+                        node: NodeId(0),
+                    },
+                }),
+            },
+        )
+        .await;
+        assert_eq!(topology.epoch(), 2);
+        assert_eq!(node.command_status(below), Some(Status::PreAccepted));
+        let invalidated = node.replica.lock().unwrap().snapshot(above).unwrap();
+        assert!(invalidated.invalidated(), "{invalidated:?}");
+        {
+            let reconfig = node.reconfig.lock().unwrap();
+            assert!(reconfig.transition.is_none());
+            assert_eq!(reconfig.fences[0].end, Some(2));
+            assert_eq!(reconfig.live_since, 2);
+        }
+        assert!(
+            node.clock.reading_micros() >= now + 1_000,
+            "the clock floor"
+        );
+
+        // Planned under the new layout below the floor: no vote.
+        let (low, message) = preaccept_at(now + 500, 2);
+        let out = node
+            .handle_staged(Envelope {
+                from: NodeId(9),
+                message,
+            })
+            .await;
+        assert!(out.is_empty(), "{out:?}");
+        assert_eq!(node.command_status(low), None);
+    }
+
+    /// A transition replaced by another change keeps its fence for what was
+    /// planned before it ended — a vote it refused stays refused — and fences
+    /// nothing planned after: the replacing change moves other keys.
+    #[tokio::test]
+    async fn a_superseded_transition_keeps_refusing_what_it_fenced() {
+        let (node, topology, events) = reshardable_node();
+        let in_shard = |shard: usize| {
+            events
+                .iter()
+                .find(|e| topology.shard_of(&Key::of(e)) == shard)
+                .expect("an event per shard")
+                .clone()
+        };
+        let (zero, one) = (in_shard(0), in_shard(1));
+        let shards =
+            |a: [u64; 3], b: [u64; 3]| vec![a.map(NodeId).to_vec(), b.map(NodeId).to_vec()];
+        // Epoch 1 moves shard 1 (5 replaced by 6); epoch 2 replaces that
+        // change by one moving shard 0 (2 replaced by 7) only.
+        commit_entry(
+            &node,
+            1,
+            ConfigEntry::Transition {
+                active: shards([0, 1, 2], [3, 4, 5]),
+                pending: shards([0, 1, 2], [3, 4, 6]),
+                since: 1,
+            },
+        )
+        .await;
+        commit_entry(
+            &node,
+            2,
+            ConfigEntry::Transition {
+                active: shards([0, 1, 2], [3, 4, 5]),
+                pending: shards([0, 1, 7], [3, 4, 5]),
+                since: 2,
+            },
+        )
+        .await;
+        let (first, second) = {
+            let reconfig = node.reconfig.lock().unwrap();
+            assert_eq!(reconfig.transition.as_ref().map(|t| t.since), Some(2));
+            assert_eq!(
+                reconfig.fences[0].end,
+                Some(2),
+                "ended by the replacing change"
+            );
+            (reconfig.fences[0].cap, reconfig.fences[1].cap)
+        };
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let past = |cap: Timestamp| {
+            TxnId(Timestamp {
+                micros: cap.micros + 1,
+                logical: 0,
+                node: NodeId(9),
+            })
+        };
+        let refuses = |txn: TxnId, epoch: u64, event: &Event| {
+            let replica = node.replica.lock().unwrap();
+            node.change_refusal(&replica, txn, epoch, &[Key::of(event)])
+                .is_some()
+        };
+        // Planned before the first change ended, on the key it moved: refused
+        // for good.
+        assert!(refuses(past(first), 1, &one));
+        // Planned after it ended, on that key: the replacing change keeps it.
+        assert!(!refuses(past(first.max(second)), 2, &one));
+        // The replacing change fences the key it moves.
+        assert!(refuses(past(second), 2, &zero));
     }
 }

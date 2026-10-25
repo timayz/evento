@@ -323,9 +323,9 @@ control plane, everything else is Accord.
   owners, multi-shard read routing for the executor, and handing in-flight
   transactions over across an epoch change (below).
 
-  **Range movement with transactions in flight (#288, #359; epochs shipped,
-  handoff next).** A write in flight while its keys change replicas was exposed
-  four ways:
+  **Range movement with transactions in flight (#288, #359; epochs and
+  two-phase changes shipped, moves between shards next).** A write in flight
+  while its keys change replicas was exposed four ways:
   (i) a replica that no longer owned a key voted `t0` with no dependencies on an
   empty command, so the write could report success with its events applied
   nowhere;
@@ -364,15 +364,53 @@ control plane, everything else is Accord.
     a PreAccept, Accept or Commit carries there, and holds nothing of the
     transaction, casts no vote, answers nothing and records nothing.
 
-  *Next: two-phase layout changes,* for (iii). A change decides a *transition*
-  first: the old layout stays live, the keys whose replica set changes take no
-  new writes and no votes above a fence point, and the writes in flight on them
-  drain under the old layout. Once every shard has a slow quorum past the drain
-  point and the new owners copied the keys they gain, an *activation* installs the
-  new layout. Each key has one live layout at any time, so watermarks, coverage,
-  anti-entropy, compaction and recovery never mix epochs. Until it ships, an
-  operator rule (OPERATIONS §6) keeps transactions out of flight across a layout
-  change.
+  *Shipped: two-phase layout changes,* for (iii) (`reconfig.rs`). A change
+  after which every quorum of each changed shard still meets every quorum it had
+  (one replica added to a shard of three, one removed) installs at once: the
+  epochs above suffice, and a joiner catches up through the replicas its shard
+  kept. Any other change (replacing a replica, adding two, shrinking five to
+  three) takes two decided entries, so that each key has one live layout at any
+  time:
+  1. A *transition* keeps the old layout live — for ownership, watermarks,
+     coverage, anti-entropy, compaction and recovery — and names the new one.
+     Coordinators refuse writes to the keys whose replica set changes
+     (`TopologyChanging`).
+  2. Installing it, a replica computes a *fence point* under its replica lock:
+     above every `t0` it holds or compacted, its clock reading plus two skews
+     (a coordinator may date a transaction that far ahead), and its amnesia fence
+     if it lost a journal. From then on it never votes for a transaction it never
+     witnessed, planned before the transition ended, on a moved key, above that
+     point; below it, it votes as before, so a write only a dead replica and one
+     live replica hold is still recovered. The fence is journaled before it is
+     reported (in `Watermark` gossip), and never lifted.
+  3. The *drain point* is the highest fence reported by a slow quorum of every
+     changing shard: no write on a moved key above it ever commits.
+  4. The change has *drained* once every shard has a slow quorum whose watermark
+     reports are past the drain point. A report is below the reporter's vote
+     fence, and the reporter holds nothing unapplied below it, so every write on
+     a moved key that ever commits is applied there, and no other will. Every
+     shard is waited for, so a write that also touches an unchanged shard is
+     applied there too.
+  5. An *activation* entry installs the new layout, with the drain point and a
+     clock floor: the proposer's reading plus three skews, which it waits past,
+     and which every replica raises its clock to as it installs the entry. A
+     replica votes for no transaction planned under the new layout on a moved
+     key below the floor, so the new writes' events stamp after the moved ones';
+     and it invalidates what it holds unapplied on a moved key above the drain
+     point, which never commits.
+  `change_topology` decides the transition, waits for the drain (about the
+  compaction margin plus a few anti-entropy rounds, run by the recovery sweep),
+  and decides the activation; the sweep activates a drained transition whose
+  driver is gone. A recovery of an epoch nobody accepted a value for repeats the
+  installed entry, so it never activates anything. A change while a transition
+  is in progress replaces it; a change back to the live layout cancels it. Sync
+  coverage, join proofs and vouches are keyed by the epoch the live layout became
+  live at, so a transition does not reset them.
+
+  For now a change keeps the shard count, keeps a replica of every shard, and
+  moves no replica to another shard: new replicas join through the replicas their
+  shard kept. Moving keys between shards (a slot table, splits, members gaining
+  keys) comes next.
 - **M5 — Executor wiring.** ✅ `AccordExecutor` is a real `evento_core::Executor`:
   **writes** are coordinated through the Accord cluster (mapping the outcome to
   `Ok(())` / `WriteError::InvalidOriginalVersion`); **reads, subscriptions, and
@@ -1153,11 +1191,14 @@ backend (sql/fjall). Phases, in order:
         invalidate a committed transaction, across shards (#288) or within one
         (#359) (`recovery_asks_the_replicas_a_transaction_was_coordinated_under`,
         `a_routed_recovery_counts_shards_under_the_transactions_epoch`).
+        A change after which a new quorum could miss an old commit quorum
+        drains the writes in flight on the keys it moves before it installs
+        the new layout (two-phase changes, #359;
+        `replacing_a_dead_replica_drains_a_write_in_flight`).
         **Open** (confirmed or plausible, not yet fixed):
-        an epoch change does not drain the transactions in flight across it,
-        so new owners can bootstrap before old owners finish them; two-phase
-        changes are next, and an operator rule covers it until they ship (#288,
-        see M4).
+        keys cannot move between shards yet (a change keeps the shard count
+        and every replica's shard); a joiner of a new shard adopting its
+        cross-shard contact's floor (#360) waits on that (#288, see M4).
   - [ ] **Real-cluster soak + chaos** over days (kills, partitions, clock skew,
         disk pressure, slow disks/links) on actual hardware — zero production
         mileage today.

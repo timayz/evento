@@ -91,6 +91,7 @@ fn id_in_shard(layout: &[Vec<NodeId>], shard: usize, prefix: &str) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "keys cannot move between shards until the next #288 step: the change is refused"]
 async fn a_key_range_moves_to_a_new_shard() {
     let net = InMemoryNetwork::new();
     let abc = vec![NodeId(0), NodeId(1), NodeId(2)];

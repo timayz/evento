@@ -1,0 +1,293 @@
+//! Two-phase layout changes (#288, #359): a change that gives a key replicas
+//! a quorum of which could miss a quorum of the old ones drains the writes in
+//! flight on it under the old layout, refusing new ones, before the new
+//! layout is installed. These nodes run the recovery sweep, whose watermark
+//! gossip and anti-entropy the drain waits on.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use evento_accord::{
+    DataStore, DynamicTopology, HybridLogicalClock, InMemoryDataStore, InMemoryJournal,
+    InMemoryNetwork, Journal, LinkFilter, Message, MessageSink, Node, NodeId, Status, Topology,
+    TopologyChanging, TxnId,
+};
+use evento_core::Event;
+
+fn ids(nodes: &[u64]) -> Vec<NodeId> {
+    nodes.iter().copied().map(NodeId).collect()
+}
+
+fn event(aggregate_id: &str, version: u16) -> Event {
+    Event {
+        id: ulid::Ulid::generate(),
+        aggregate_type: "test/Account".into(),
+        aggregate_id: aggregate_id.into(),
+        version,
+        name: "Opened".into(),
+        ..Default::default()
+    }
+}
+
+struct TestNode {
+    node: Node,
+    store: Arc<InMemoryDataStore>,
+    topology: Arc<DynamicTopology>,
+    _loop: tokio::task::JoinHandle<()>,
+}
+
+impl TestNode {
+    fn sweep(&self) -> tokio::task::JoinHandle<()> {
+        self.node.start_recovery()
+    }
+}
+
+fn spawn(net: &Arc<InMemoryNetwork>, id: u64, shards: Vec<Vec<NodeId>>) -> TestNode {
+    let id = NodeId(id);
+    let inbox = net.register(id);
+    let store = Arc::new(InMemoryDataStore::new());
+    let topology = Arc::new(DynamicTopology::new(id, 0, shards));
+    let node = Node::new(
+        id,
+        Arc::clone(&topology) as Arc<dyn Topology>,
+        Arc::new(HybridLogicalClock::new(id)),
+        Arc::new(net.sink(id)) as Arc<dyn MessageSink>,
+        Arc::clone(&store) as Arc<dyn DataStore>,
+        Arc::new(InMemoryJournal::new()) as Arc<dyn Journal>,
+    );
+    let _loop = node.start(inbox);
+    TestNode {
+        node,
+        store,
+        topology,
+        _loop,
+    }
+}
+
+async fn await_epoch(topology: &DynamicTopology, epoch: u64) {
+    for _ in 0..2_000 {
+        if topology.epoch() >= epoch {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("topology did not reach epoch {epoch}");
+}
+
+/// Waits until `node` applied `txn` as a commit.
+async fn await_committed(node: &Node, store: &InMemoryDataStore, txn: TxnId) {
+    for _ in 0..2_000 {
+        if node.command_status(txn) == Some(Status::Applied)
+            || store.applied_log().iter().any(|entry| entry.txn == txn)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let applied = store
+        .applied_log()
+        .into_iter()
+        .find(|entry| entry.txn == txn)
+        .unwrap_or_else(|| panic!("{txn:?} never applied"));
+    assert!(!applied.conflict, "{txn:?} applied as an abort");
+}
+
+/// #359 end to end. T was accepted and committed by replicas 0 and 2 only:
+/// replica 1 never heard of it, and nobody applied it. Replica 2 dies, and
+/// the layout replaces it with node 3. Recovered under the layout it was
+/// coordinated under, T is committed through 0 and 1 as decided — a recovery
+/// under the new layout could have counted 1 and 3 as fenced and invalidated
+/// it. The change installs the new layout only once T drained, so node 3,
+/// joining through a replica the shard kept, holds it too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn replacing_a_dead_replica_drains_a_write_in_flight() {
+    let net = InMemoryNetwork::new();
+    let old = ids(&[0, 1, 2]);
+    let new = ids(&[0, 1, 3]);
+    let nodes: Vec<TestNode> = (0..3)
+        .map(|id| spawn(&net, id, vec![old.clone()]))
+        .collect();
+    let joiner = spawn(&net, 3, vec![old.clone()]);
+    joiner.node.begin_join();
+
+    // Replica 1 hears nothing of what node 0 coordinates.
+    let to_one: LinkFilter = Arc::new(|from, to, message| {
+        from == NodeId(0)
+            && to == NodeId(1)
+            && matches!(
+                message,
+                Message::PreAccept { .. } | Message::Accept { .. } | Message::Commit { .. }
+            )
+    });
+    net.set_link_filter(Some(to_one));
+    let txn = nodes[0]
+        .node
+        .coordinate_through_commit(vec![event("acc", 1)])
+        .await
+        .expect("committed through replicas 0 and 2");
+    net.set_link_filter(None);
+    assert_eq!(
+        nodes[1].node.command_status(txn),
+        None,
+        "replica 1 never saw T"
+    );
+    net.crash(NodeId(2));
+
+    let _sweeps: Vec<_> = nodes.iter().chain([&joiner]).map(TestNode::sweep).collect();
+    let installed = tokio::time::timeout(
+        Duration::from_secs(30),
+        nodes[0].node.change_topology(1, vec![new.clone()]),
+    )
+    .await
+    .expect("the change ends in bounded time")
+    .expect("the change installs");
+    assert_eq!(installed, vec![new.clone()]);
+    // Epoch 1 drained the moved keys, epoch 2 installed the new layout.
+    assert_eq!(nodes[0].topology.epoch(), 2);
+    assert_eq!(nodes[0].topology.nodes(), new);
+
+    await_epoch(&joiner.topology, 2).await;
+    joiner.node.join(NodeId(0)).await.expect("joins through 0");
+    await_committed(&nodes[0].node, &nodes[0].store, txn).await;
+    await_committed(&nodes[1].node, &nodes[1].store, txn).await;
+    for _ in 0..2_000 {
+        if !joiner.store.committed_events().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        joiner.store.committed_events().len(),
+        1,
+        "the new replica holds T"
+    );
+
+    // The new layout serves writes, with node 3 among its replicas.
+    nodes[0]
+        .node
+        .write(vec![event("acc", 2)])
+        .await
+        .expect("a write after the change");
+}
+
+/// A key whose replicas change takes no new write while the change drains:
+/// the write fails as `TopologyChanging` (`Unavailable` through the
+/// executor), and succeeds once the new layout is installed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_write_to_a_moving_key_is_unavailable_until_the_change_installs() {
+    let net = InMemoryNetwork::new();
+    let old = ids(&[0, 1, 2]);
+    let new = ids(&[0, 1, 3]);
+    let nodes: Vec<TestNode> = (0..3)
+        .map(|id| spawn(&net, id, vec![old.clone()]))
+        .collect();
+    let joiner = spawn(&net, 3, vec![old.clone()]);
+    joiner.node.begin_join();
+    let _sweeps: Vec<_> = nodes.iter().chain([&joiner]).map(TestNode::sweep).collect();
+    nodes[0]
+        .node
+        .write(vec![event("acc", 1)])
+        .await
+        .expect("a write before the change");
+
+    let driver = nodes[0].node.clone();
+    let change =
+        tokio::spawn(async move { driver.change_topology(1, vec![ids(&[0, 1, 3])]).await });
+    await_epoch(&nodes[1].topology, 1).await;
+    let err = nodes[1]
+        .node
+        .write(vec![event("acc", 2)])
+        .await
+        .expect_err("the key is moving");
+    let refused = err
+        .downcast_ref::<TopologyChanging>()
+        .unwrap_or_else(|| panic!("not refused as moving: {err:#}"));
+    assert_eq!(refused.since, 1);
+    assert!(nodes[1].node.metrics().writes_topology_changing >= 1);
+
+    let installed = tokio::time::timeout(Duration::from_secs(30), change)
+        .await
+        .expect("the change ends in bounded time")
+        .unwrap()
+        .expect("the change installs");
+    assert_eq!(installed, vec![new]);
+    await_epoch(&nodes[1].topology, 2).await;
+    nodes[1]
+        .node
+        .write(vec![event("acc", 2)])
+        .await
+        .expect("a write once the layout is installed");
+}
+
+/// A change back to the live layout while a transition is in progress
+/// cancels it: nothing changes replicas, so it installs at once, and the keys
+/// the transition fenced take writes again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_change_back_to_the_live_layout_cancels_a_transition() {
+    let net = InMemoryNetwork::new();
+    let old = ids(&[0, 1, 2]);
+    // No sweep runs: no fence or watermark is reported, so the transition
+    // never drains on its own.
+    let nodes: Vec<TestNode> = (0..3)
+        .map(|id| spawn(&net, id, vec![old.clone()]))
+        .collect();
+    let decided = nodes[0]
+        .node
+        .propose_topology(1, vec![ids(&[0, 1, 3])])
+        .await
+        .expect("a transition is decided");
+    assert!(
+        matches!(
+            decided,
+            evento_accord::ConfigEntry::Transition { since: 1, .. }
+        ),
+        "{decided:?}"
+    );
+    nodes[0].node.recover_topology(1).await.expect("committed");
+    await_epoch(&nodes[0].topology, 1).await;
+    let err = nodes[0]
+        .node
+        .write(vec![event("acc", 1)])
+        .await
+        .expect_err("the key is moving");
+    assert!(err.is::<TopologyChanging>(), "{err:#}");
+
+    let installed = nodes[0]
+        .node
+        .change_topology(2, vec![old.clone()])
+        .await
+        .expect("the change back installs at once");
+    assert_eq!(installed, vec![old]);
+    assert_eq!(nodes[0].topology.epoch(), 2);
+    nodes[0]
+        .node
+        .write(vec![event("acc", 1)])
+        .await
+        .expect("the key takes writes again");
+}
+
+/// A change whose new quorums all meet the old ones — one replica added to
+/// a shard of three — needs no drain: it installs at once, and writes go on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn adding_one_replica_installs_at_once() {
+    let net = InMemoryNetwork::new();
+    let old = ids(&[0, 1, 2]);
+    let new = ids(&[0, 1, 2, 3]);
+    let nodes: Vec<TestNode> = (0..3)
+        .map(|id| spawn(&net, id, vec![old.clone()]))
+        .collect();
+    let joiner = spawn(&net, 3, vec![old.clone()]);
+    joiner.node.begin_join();
+    let installed = nodes[0]
+        .node
+        .change_topology(1, vec![new.clone()])
+        .await
+        .unwrap();
+    assert_eq!(installed, vec![new]);
+    assert_eq!(nodes[0].topology.epoch(), 1, "one epoch, no transition");
+    nodes[0]
+        .node
+        .write(vec![event("acc", 1)])
+        .await
+        .expect("writes go on");
+}
