@@ -8,6 +8,12 @@
 //! a store holding events is refused. Whatever the journal, a replica never
 //! votes for a transaction dated past its clock's skew bound, and one that
 //! lost a journal under its node id abstains from config Paxos for good.
+//!
+//! A journal rolled back to an older copy of itself forgot the votes and
+//! promises made since (#339). A replica opened over a journal that holds
+//! something takes part only once its peers confirm the journal holds at
+//! least the mark they last saw from it; one they find below it stops, and
+//! comes back the way a lost journal does.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
@@ -15,9 +21,10 @@ use std::time::Duration;
 
 use evento_accord::clock::system_micros;
 use evento_accord::{
-    AmnesiaFence, Ballot, Clock, DataStore, Envelope, FenceNotCovered, HybridLogicalClock,
-    InMemoryDataStore, InMemoryJournal, InMemoryNetwork, Journal, Key, LostJournal, Message,
-    MessageSink, Node, NodeConfig, NodeId, StaticTopology, Timestamp, TxnId,
+    AmnesiaFence, Ballot, Clock, DataStore, DurableMark, Envelope, FenceNotCovered,
+    HybridLogicalClock, InMemoryDataStore, InMemoryJournal, InMemoryNetwork, Journal,
+    JournalRolledBack, Key, LostJournal, Message, MessageSink, Node, NodeConfig, NodeId,
+    OpenUnconfirmed, StaticTopology, Timestamp, TxnId,
 };
 use evento_core::Event;
 use tokio::sync::mpsc;
@@ -266,6 +273,71 @@ impl Cluster {
         tasks.push(node.start_recovery());
         drop(tasks);
         self.nodes[i as usize] = node;
+    }
+
+    /// What a host does that restores node `i`'s journal from `copy`, an
+    /// older backup of it: stops the node and opens it again, plainly, over
+    /// the copy and its kept store.
+    async fn reopen_over(&mut self, i: u64, copy: InMemoryJournal) {
+        self.stop(i);
+        self.journals[i as usize] = Arc::new(copy);
+        let inbox = self.net.register(NodeId(i));
+        let node = self.build(
+            i,
+            &self.stores[i as usize],
+            &self.journals[i as usize],
+            &self.clocks[i as usize],
+        );
+        node.recover_state()
+            .await
+            .expect("a plain open over the copy");
+        let mut tasks = self.tasks[i as usize].lock().unwrap();
+        tasks.push(node.start(inbox));
+        tasks.push(node.start_recovery());
+        drop(tasks);
+        self.nodes[i as usize] = node;
+    }
+
+    /// A backup of node `i`'s journal taken now, once it is moving past
+    /// it: writes go on, and its peers hear a mark from it the backup does
+    /// not hold.
+    async fn backup_left_behind(&self, i: u64) -> InMemoryJournal {
+        // Taken from a node at work: one that never reported nor minted has
+        // left no clock bound in its journal yet.
+        while self.journals[i as usize]
+            .load_clock_bound()
+            .await
+            .unwrap()
+            .is_none()
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let backup = self.journals[i as usize].snapshot();
+        let held = DurableMark {
+            life: 0,
+            clock_bound: backup.load_clock_bound().await.unwrap().unwrap_or(0),
+            vote_fence: backup
+                .load_vote_fence()
+                .await
+                .unwrap()
+                .unwrap_or(Timestamp::MIN),
+        };
+        for version in 1..=3 {
+            self.nodes[A as usize]
+                .write(vec![event("later", version)])
+                .await
+                .expect("a write after the backup");
+        }
+        let node = &self.nodes[i as usize];
+        await_until(
+            "the journal moves past the backup",
+            Duration::from_secs(5),
+            || !held.covers(&node.durable_mark()),
+        )
+        .await;
+        // Reports go out every sweep.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        backup
     }
 
     async fn send(&self, from: u64, to: u64, message: Message) {
@@ -1274,4 +1346,243 @@ async fn a_joining_node_refuses_a_read_barrier() {
         read.is_err(),
         "a read barrier passed on a joining node, which holds part of its store"
     );
+}
+
+/// R's disk is rolled back to an older copy of its journal, which lacks
+/// votes and promises it made since. Its peers saw a mark from it above the
+/// copy's: they tell it so, and it takes no part — it votes on nothing and
+/// takes no write (#339).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_reopened_over_an_older_copy_of_its_journal_takes_no_part() {
+    let mut c = Cluster::start(3);
+    c.baseline().await;
+    let backup = c.backup_left_behind(R).await;
+
+    c.reopen_over(R, backup).await;
+    let node = c.nodes[R as usize].clone();
+    await_until(
+        "R hears its journal rolled back",
+        Duration::from_secs(5),
+        || node.rolled_back(),
+    )
+    .await;
+    assert!(!node.confirmed());
+    assert_eq!(node.metrics().journals_rolled_back, 1);
+
+    let txn = TxnId(Timestamp {
+        micros: system_micros(),
+        logical: 0,
+        node: NodeId(9),
+    });
+    c.send(
+        9,
+        R,
+        Message::PreAccept {
+            epoch: 0,
+            txn,
+            keys: vec![key("acc")],
+            events: vec![event("acc", 1)],
+        },
+    )
+    .await;
+    let vote = next_within(&mut c.coordinator, Duration::from_millis(300)).await;
+    assert!(
+        vote.is_none(),
+        "R voted over a rolled-back journal: {vote:?}"
+    );
+    let write = node.write(vec![event("acc", 1)]).await;
+    assert!(
+        write
+            .as_ref()
+            .is_err_and(|err| err.downcast_ref::<JournalRolledBack>().is_some()),
+        "R took a write over a rolled-back journal: {write:?}"
+    );
+}
+
+/// A plain restart over the journal as it was left is confirmed, and the
+/// node takes part again (#339).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_plain_restart_is_confirmed() {
+    let mut c = Cluster::start(3);
+    c.baseline().await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    c.restart(R).await;
+    let node = c.nodes[R as usize].clone();
+    await_until("R's restart is confirmed", Duration::from_secs(5), || {
+        node.confirmed()
+    })
+    .await;
+    assert!(!node.rolled_back());
+    let written = event("acc", 1);
+    node.write(vec![written.clone()])
+        .await
+        .expect("R takes writes again");
+    await_until(
+        "every store holds the write",
+        Duration::from_secs(5),
+        || c.stores.iter().all(|store| holds(store, &written)),
+    )
+    .await;
+}
+
+/// Every node restarts at once: each answers the others from the marks its
+/// own journal kept, and all are confirmed (#339).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_full_cluster_restart_confirms_every_node() {
+    let mut c = Cluster::start(3);
+    c.baseline().await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    for i in 0..3 {
+        c.stop(i);
+    }
+    for i in 0..3 {
+        c.restart(i).await;
+    }
+    for i in 0..3 {
+        let node = c.nodes[i].clone();
+        await_until("every restart is confirmed", Duration::from_secs(5), || {
+            node.confirmed()
+        })
+        .await;
+        assert!(!node.rolled_back(), "node {i} was found rolled back");
+    }
+    let written = event("acc", 1);
+    c.nodes[R as usize]
+        .write(vec![written.clone()])
+        .await
+        .expect("the cluster takes writes again");
+    await_until(
+        "every store holds the write",
+        Duration::from_secs(5),
+        || c.stores.iter().all(|store| holds(store, &written)),
+    )
+    .await;
+}
+
+/// A and B restart while R is down, so they know R's mark only from their
+/// journals; R then comes back over an older copy of its own. They still
+/// tell it its journal rolled back (#339).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peers_keep_the_marks_they_saw_across_their_own_restart() {
+    let mut c = Cluster::start(3);
+    c.baseline().await;
+    let backup = c.backup_left_behind(R).await;
+    c.stop(R);
+    for i in [A, B] {
+        c.restart(i).await;
+    }
+    c.reopen_over(R, backup).await;
+    let node = c.nodes[R as usize].clone();
+    await_until(
+        "R hears its journal rolled back",
+        Duration::from_secs(5),
+        || node.rolled_back(),
+    )
+    .await;
+}
+
+/// R found rolled back is opened again the way a lost journal is: over an
+/// empty journal and store, joining. It gets back every write, and takes
+/// part again (#339, #312).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rolled_back_node_comes_back_through_a_lost_journals_path() {
+    let mut c = Cluster::start(3);
+    c.baseline().await;
+    let backup = c.backup_left_behind(R).await;
+    c.reopen_over(R, backup).await;
+    let node = c.nodes[R as usize].clone();
+    await_until(
+        "R hears its journal rolled back",
+        Duration::from_secs(5),
+        || node.rolled_back(),
+    )
+    .await;
+
+    node.retire().await;
+    let join = c.reopen_amnesiac(R, A).await;
+    tokio::time::timeout(Duration::from_secs(20), join)
+        .await
+        .expect("R's join completes")
+        .unwrap()
+        .expect("joined");
+    let node = c.nodes[R as usize].clone();
+    assert!(node.confirmed() && !node.rolled_back());
+    let written = event("acc", 1);
+    node.write(vec![written.clone()])
+        .await
+        .expect("R takes writes again");
+    await_until(
+        "every store holds the write",
+        Duration::from_secs(5),
+        || c.stores.iter().all(|store| holds(store, &written)),
+    )
+    .await;
+    assert!(stores_agree(&c.stores), "the stores agree");
+}
+
+/// R restarts cut off from A and B: no node can confirm its journal. It
+/// takes no write, raises no clock bound, and keeps a vote it is asked for
+/// until it is confirmed (#339).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unconfirmed_node_mints_nothing_and_votes_once_confirmed() {
+    // A margin past the wait below: the buffered vote is still due when R
+    // is confirmed.
+    let mut c = Cluster::start_with(
+        3,
+        NodeConfig {
+            compaction_margin: Duration::from_secs(2),
+            ..config()
+        },
+        clock,
+    );
+    c.baseline().await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    c.cut_off(R);
+    c.restart(R).await;
+    let node = c.nodes[R as usize].clone();
+    let bound = c.journals[R as usize].load_clock_bound().await.unwrap();
+
+    let txn = TxnId(Timestamp {
+        micros: system_micros(),
+        logical: 0,
+        node: NodeId(9),
+    });
+    c.send(
+        9,
+        R,
+        Message::PreAccept {
+            epoch: 0,
+            txn,
+            keys: vec![key("acc")],
+            events: vec![event("acc", 1)],
+        },
+    )
+    .await;
+    // Well past two skews, after which a node taking part raises its bound.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!node.confirmed());
+    let vote = next_within(&mut c.coordinator, Duration::from_millis(10)).await;
+    assert!(vote.is_none(), "R voted before it was confirmed: {vote:?}");
+    let write = node.write(vec![event("acc", 1)]).await;
+    assert!(
+        write
+            .as_ref()
+            .is_err_and(|err| err.downcast_ref::<OpenUnconfirmed>().is_some()),
+        "R took a write before it was confirmed: {write:?}"
+    );
+    assert_eq!(
+        c.journals[R as usize].load_clock_bound().await.unwrap(),
+        bound,
+        "R raised its clock bound before it was confirmed"
+    );
+
+    c.heal();
+    await_until("R is confirmed", Duration::from_secs(5), || {
+        node.confirmed()
+    })
+    .await;
+    match next_within(&mut c.coordinator, Duration::from_secs(5)).await {
+        Some(Message::PreAcceptOk { txn: t, .. }) if t == txn => {}
+        other => panic!("R votes once confirmed: {other:?}"),
+    }
 }

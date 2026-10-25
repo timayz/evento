@@ -352,6 +352,46 @@ async fn a_retired_node_is_a_transient_refusal() {
     }
 }
 
+/// A node opened over a journal that holds something takes no write until
+/// the other nodes confirm the journal is no older copy of itself (#339) —
+/// here they never answer. The refusal is transient: the executor answers
+/// `WriteError::Unavailable`, and the typed `OpenUnconfirmed` cause is still
+/// there to downcast.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unconfirmed_open_is_a_transient_refusal() {
+    use evento_accord::OpenUnconfirmed;
+
+    let net = InMemoryNetwork::new();
+    let id = NodeId(0);
+    let inbox = net.register(id);
+    // The journal holds something: the node left a clock bound in it.
+    let journal = Arc::new(InMemoryJournal::new());
+    journal.save_clock_bound(1).await.unwrap();
+    let fjall = Fjall::temporary().unwrap();
+    let node = Node::new(
+        id,
+        Arc::new(StaticTopology::new(id, (0..3).map(NodeId).collect())),
+        Arc::new(HybridLogicalClock::new(id)),
+        Arc::new(net.sink(id)) as Arc<dyn MessageSink>,
+        Arc::new(ExecutorDataStore::new(fjall.clone())) as Arc<dyn DataStore>,
+        journal as Arc<dyn Journal>,
+    );
+    node.recover_state().await.unwrap();
+    let _inbox = node.start(inbox);
+    let exec = AccordExecutor::new(node, fjall);
+    let err = exec
+        .write(vec![event("acc", 1, "Opened")])
+        .await
+        .expect_err("an unconfirmed node refuses the write");
+    match &err {
+        WriteError::Unavailable(cause) => assert!(
+            cause.is::<OpenUnconfirmed>(),
+            "the cause is the typed open error: {cause:#}"
+        ),
+        other => panic!("expected Unavailable, got {other:?}"),
+    }
+}
+
 /// The same aggregate id in two tenants is two streams through Accord too:
 /// both open at version 1 — concurrently, on two coordinators — and each
 /// keeps its own versions and conflicts, on every replica.

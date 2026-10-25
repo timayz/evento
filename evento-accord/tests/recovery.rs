@@ -1362,14 +1362,44 @@ impl Vouching {
         .with_config(vouching_config());
         node.recover_state().await.expect("open node 0");
         let tasks = vec![node.start(inbox), node.start_recovery()];
-        Self {
+        let mut vouching = Self {
             net,
             node,
             tasks,
             peer,
             other,
             coordinator,
+        };
+        // Over a journal that holds something, node 0 asks nodes 1 and 2 to
+        // confirm it is no older copy (#339): they do.
+        if !vouching.node.confirmed() {
+            vouching.confirm_open().await;
         }
+        vouching
+    }
+
+    /// Nodes 1 and 2 confirm node 0's open (#339).
+    async fn confirm_open(&mut self) {
+        for from in [1, 2] {
+            let inbox = if from == 1 {
+                &mut self.peer
+            } else {
+                &mut self.other
+            };
+            let mark = loop {
+                if let Message::Opened { mark } = next(inbox).await {
+                    break mark;
+                }
+            };
+            self.send(from, Message::OpenedOk { mark }).await;
+        }
+        for _ in 0..400 {
+            if self.node.confirmed() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("node 0's open is confirmed");
     }
 
     async fn send(&self, from: u64, message: Message) {

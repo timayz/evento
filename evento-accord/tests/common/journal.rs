@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use evento_accord::{
-    AcceptorRecord, AmnesiaFence, Ballot, CommandState, ConfigEntry, DecisionRecord, FenceRecord,
-    InMemoryJournal, Journal, Key, NodeId, Timestamp, TxnId,
+    AcceptorRecord, AmnesiaFence, Ballot, CommandState, ConfigEntry, DecisionRecord, DurableMark,
+    FenceRecord, InMemoryJournal, Journal, Key, NodeId, Timestamp, TxnId,
 };
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -22,6 +22,7 @@ enum Staged {
     Decision(DecisionRecord),
     DropDecisions(Vec<TxnId>),
     VoteFence(Timestamp),
+    PeerMarks(Vec<(NodeId, DurableMark)>),
 }
 
 impl Staged {
@@ -32,7 +33,10 @@ impl Staged {
         match self {
             Staged::Command(state) => state.txn.0 < before,
             Staged::Route(txn, _) | Staged::Promise(txn, _) => txn.0 < before,
-            Staged::Decision(_) | Staged::DropDecisions(_) | Staged::VoteFence(_) => false,
+            Staged::Decision(_)
+            | Staged::DropDecisions(_)
+            | Staged::VoteFence(_)
+            | Staged::PeerMarks(_) => false,
         }
     }
 }
@@ -59,7 +63,7 @@ pub struct JournalFaults {
 /// the SQL journal's `flush_lock`, a second flusher waits for one in
 /// progress (with an optional virtual fsync delay, so they do overlap).
 /// Everything `InMemoryJournal` persists is staged the same way: commands,
-/// routes, promises, decision records and the vote fence.
+/// routes, promises, decision records, the vote fence and the peer marks.
 pub struct FaultJournal {
     durable: InMemoryJournal,
     pending: Mutex<Vec<Staged>>,
@@ -90,6 +94,20 @@ impl Default for FaultJournal {
 }
 
 impl FaultJournal {
+    /// A journal restored from `backup`: what a host's restore leaves.
+    pub fn restored(backup: InMemoryJournal) -> Self {
+        Self {
+            durable: backup,
+            ..Self::new()
+        }
+    }
+
+    /// A copy of what this journal holds durably, as a backup taken now
+    /// would hold it (see [`InMemoryJournal::snapshot`]).
+    pub fn snapshot(&self) -> InMemoryJournal {
+        self.durable.snapshot()
+    }
+
     pub fn new() -> Self {
         Self {
             durable: InMemoryJournal::new(),
@@ -180,6 +198,7 @@ impl FaultJournal {
             && d.load_decisions().await.unwrap().is_empty()
             && d.load_rejoin_bounds().await.unwrap().is_empty()
             && d.load_vote_fence().await.unwrap().is_none()
+            && d.load_peer_marks().await.unwrap().is_empty()
     }
 
     /// Whether a seeded fault fails this write, `pick` choosing its rate.
@@ -203,6 +222,7 @@ impl FaultJournal {
             Staged::Decision(record) => self.durable.save_decision(&record).await,
             Staged::DropDecisions(txns) => self.durable.drop_decisions(&txns).await,
             Staged::VoteFence(fence) => self.durable.save_vote_fence(fence).await,
+            Staged::PeerMarks(marks) => self.durable.save_peer_marks(&marks).await,
         }
     }
 }
@@ -340,6 +360,13 @@ impl Journal for FaultJournal {
     }
     async fn load_vote_fence(&self) -> anyhow::Result<Option<Timestamp>> {
         self.durable.load_vote_fence().await
+    }
+    async fn save_peer_marks(&self, marks: &[(NodeId, DurableMark)]) -> anyhow::Result<()> {
+        self.stage_write(Staged::PeerMarks(marks.to_vec()));
+        Ok(())
+    }
+    async fn load_peer_marks(&self) -> anyhow::Result<Vec<(NodeId, DurableMark)>> {
+        self.durable.load_peer_marks().await
     }
     async fn save_amnesia_fence(&self, fence: &AmnesiaFence) -> anyhow::Result<()> {
         if self.draw(|f| f.metadata) {

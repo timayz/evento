@@ -384,6 +384,7 @@ async fn a_restarted_coordinator_never_reuses_a_transaction_id() {
     );
     restarted.recover_state().await.unwrap();
     tasks[0] = restarted.start(inbox);
+    await_confirmed(&restarted).await;
 
     let new = tokio::time::timeout(
         Duration::from_secs(10),
@@ -449,6 +450,7 @@ async fn repeated_restarts_keep_the_clock_within_the_skew_bound() {
             "restart {version}: the clock leads the wall clock by {lead}µs"
         );
         tasks[0] = restarted.start(inbox);
+        await_confirmed(&restarted).await;
         nodes[0] = restarted;
     }
 }
@@ -489,4 +491,16 @@ async fn a_retired_node_refuses_to_write_and_the_reopened_one_writes_on() {
     reopened.recover_state().await.unwrap();
     reopened.write(vec![event("acc", 2)]).await.unwrap();
     assert_eq!(store.version("", "test/Account", "acc").await.unwrap(), 2);
+}
+
+/// Waits until `node`, restarted over a journal that holds something, is
+/// confirmed by its peers (#339): until then it takes no write.
+async fn await_confirmed(node: &Node) {
+    for _ in 0..1_000 {
+        if node.confirmed() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("the restarted node is confirmed");
 }
