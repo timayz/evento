@@ -1590,9 +1590,13 @@ async fn a_joined_node_vouches_for_no_more_than_its_join_proved() {
         "a joined node vouched past its join proof: {coverage:?}"
     );
 
-    // Its own anti-entropy covers the join: the cap lifts.
+    // Its own anti-entropy covers the join: the cap lifts — once the shard
+    // gossips what it applied, which caps every replica's coverage (#337).
     let joined = system_micros();
     for _ in 0..200 {
+        for n in &nodes {
+            n.node.sweep().await;
+        }
         d.node.sweep().await;
         if coverage_of(&net, NodeId(3), NodeId(1)).await.micros > joined {
             return;

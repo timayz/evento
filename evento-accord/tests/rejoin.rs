@@ -539,10 +539,16 @@ async fn a_replica_with_a_lost_store_rejoins_after_compaction() {
 async fn a_rejoin_through_a_contact_it_gave_up_on_asks_it_for_proof_first() {
     let mut t = Trio::start();
     t.applied_baseline().await;
-    // Anti-entropy rounds: the contact's report is past its sync coverage.
-    for _ in 0..3 {
+    // Anti-entropy rounds, one interval apart (a sweep runs one at most per
+    // interval): the contact's report is past its sync coverage once its
+    // stable point, clamped the same way, moves.
+    for _ in 0..20 {
+        tokio::time::sleep(NodeConfig::default().anti_entropy_interval).await;
         for node in &t.nodes {
             node.sweep().await;
+        }
+        if t.nodes[CONTACT.0 as usize].stable_micros() > 0 {
+            break;
         }
     }
     let compacted = Timestamp {

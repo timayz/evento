@@ -844,8 +844,9 @@ async fn no_vote_for_a_future_dated_transaction() {
 /// replica knows — and A never saw it. R loses its journal. A recovery of T'
 /// then hears A, which never witnessed it, B, which accepted it, and R,
 /// which forgot it: T' may have committed, so it must not be invalidated on
-/// R's word. Once its coordinator commits it at B, R's join goes through,
-/// with T'.
+/// R's word. A never vouched past T' — R and B held it unapplied — so A
+/// votes, and the recovery commits it (#337). Its coordinator's late Commit
+/// finds it decided, and R's join goes through, with T'.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_amnesiac_never_lets_a_recovery_drop_what_may_have_committed() {
     // No sweep recovers T' on its own: this test drives every recovery.
@@ -904,24 +905,20 @@ async fn an_amnesiac_never_lets_a_recovery_drop_what_may_have_committed() {
             other => panic!("R and B accept: {other:?}"),
         }
     }
-    // A's vote fence passes T', which it never saw: it never votes for it.
+    // Long past the compaction margin, which A's clock passed for T'.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     let join = c.reopen_amnesiac(R, B).await;
     let recovered =
         tokio::time::timeout(Duration::from_secs(5), c.nodes[B as usize].recover(txn)).await;
     assert!(
-        !matches!(recovered, Ok(Ok(ref outcome)) if outcome.conflict),
-        "T' was invalidated on the word of a replica that may have accepted it: {recovered:?}"
-    );
-    assert_eq!(
-        c.nodes[B as usize].command_status(txn),
-        Some(evento_accord::Status::Accepted),
-        "B still holds T' undecided"
+        matches!(recovered, Ok(Ok(ref outcome)) if !outcome.conflict),
+        "T' may have committed, and A never vouched past it: a recovery commits it, \
+         never invalidating it on the word of a replica that may have accepted it: {recovered:?}"
     );
 
-    // Its coordinator commits it at B: decided, it applies, and R's join
-    // goes through with it.
+    // Its coordinator's late Commit finds it decided at B, and R's join goes
+    // through with it.
     c.send(
         9,
         B,
@@ -956,6 +953,243 @@ async fn an_amnesiac_never_lets_a_recovery_drop_what_may_have_committed() {
         c.stores.iter().all(|store| holds(store, &decided))
     })
     .await;
+}
+
+/// #337: T was accepted at R and A, and its Commit reached R alone before its
+/// coordinator vanished. B never witnessed it, and the compaction margin
+/// passed long ago. R loses its journal. A recovery then hears A, which
+/// accepted T, R, which forgot it, and B, which never saw it: T may have
+/// committed, so only committing it is safe, and that takes B's vote. B never
+/// vouched past T — A and R held it unapplied all along — so B gives it, and
+/// R's join, which waits for a report past T, goes through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recovery_decides_what_an_amnesiac_and_one_replica_accepted() {
+    // No sweep recovers T before R loses its journal: R, holding the
+    // Commit, would decide it at once.
+    let mut c = Cluster::start_with(
+        3,
+        NodeConfig {
+            recovery_timeout: Duration::from_secs(60),
+            ..config()
+        },
+        clock,
+    );
+    c.baseline().await;
+    let txn = TxnId(Timestamp {
+        micros: system_micros(),
+        logical: 0,
+        node: NodeId(9),
+    });
+    let decided = event("acc", 1);
+    for to in [R, A] {
+        c.send(
+            9,
+            to,
+            Message::PreAccept {
+                epoch: 0,
+                txn,
+                keys: vec![key("acc")],
+                events: vec![decided.clone()],
+            },
+        )
+        .await;
+    }
+    for _ in 0..2 {
+        match next_within(&mut c.coordinator, Duration::from_secs(5)).await {
+            Some(Message::PreAcceptOk { .. }) => {}
+            other => panic!("R and A pre-accept: {other:?}"),
+        }
+    }
+    for to in [R, A] {
+        c.send(
+            9,
+            to,
+            Message::Accept {
+                epoch: 0,
+                txn,
+                ballot: Ballot(txn.0),
+                execute_at: txn.0,
+                deps: Vec::new(),
+                keys: vec![key("acc")],
+            },
+        )
+        .await;
+    }
+    for _ in 0..2 {
+        match next_within(&mut c.coordinator, Duration::from_secs(5)).await {
+            Some(Message::AcceptOk { .. }) => {}
+            other => panic!("R and A accept: {other:?}"),
+        }
+    }
+    // The Commit reaches R alone; R reads and waits for a decision that
+    // never comes.
+    c.send(
+        9,
+        R,
+        Message::Commit {
+            epoch: 0,
+            txn,
+            execute_at: txn.0,
+            deps: Vec::new(),
+            keys: vec![key("acc")],
+            events: vec![decided.clone()],
+            reply_to: NodeId(9),
+        },
+    )
+    .await;
+    loop {
+        match next_within(&mut c.coordinator, Duration::from_secs(5)).await {
+            Some(Message::ReadOk { .. }) => break,
+            Some(_) => continue,
+            None => panic!("R reads T once it is committed"),
+        }
+    }
+    // Well past the margin: B's clock less the margin passed T long ago.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let join = c.reopen_amnesiac(R, A).await;
+    let recovered = tokio::time::timeout(Duration::from_secs(10), c.nodes[A as usize].recover(txn))
+        .await
+        .expect("the recovery ends");
+    match recovered {
+        Ok(outcome) => assert!(!outcome.conflict, "T may have committed: {outcome:?}"),
+        Err(err) => panic!("no recovery decided T, which pins every report below it: {err:#}"),
+    }
+    tokio::time::timeout(Duration::from_secs(20), join)
+        .await
+        .expect("R's join completes once T is decided")
+        .unwrap()
+        .expect("joined");
+    await_until("every store holds T", Duration::from_secs(10), || {
+        c.stores.iter().all(|store| holds(store, &decided))
+    })
+    .await;
+    assert!(stores_agree(&c.stores), "the stores agree");
+}
+
+/// D was pre-accepted at R alone, and W, a write on the same key, committed
+/// with D as a dependency: R's vote saw it. R loses its journal before
+/// anything decided D, so no replica holds D any more, and W waits on it at
+/// A and B. Their dependency round finds that nothing can vote for D: it
+/// never committed, and is invalidated. W applies, and R's join, which
+/// waits for a report past W, goes through (#337).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dependency_only_an_amnesiac_held_is_invalidated() {
+    let mut c = Cluster::start(3);
+    c.baseline().await;
+    // R hears the outside coordinator alone, so no recovery decides D
+    // through it before it loses its journal.
+    c.cut_off(R);
+    let now = system_micros();
+    let orphan = TxnId(Timestamp {
+        micros: now,
+        logical: 0,
+        node: NodeId(9),
+    });
+    let txn = TxnId(Timestamp {
+        micros: now + 1_000,
+        logical: 0,
+        node: NodeId(9),
+    });
+    let (forgotten, write) = (event("acc", 1), event("acc", 1));
+    c.send(
+        9,
+        R,
+        Message::PreAccept {
+            epoch: 0,
+            txn: orphan,
+            keys: vec![key("acc")],
+            events: vec![forgotten.clone()],
+        },
+    )
+    .await;
+    match next_within(&mut c.coordinator, Duration::from_secs(5)).await {
+        Some(Message::PreAcceptOk { txn: t, .. }) if t == orphan => {}
+        other => panic!("R pre-accepts D: {other:?}"),
+    }
+    for to in [A, R] {
+        c.send(
+            9,
+            to,
+            Message::PreAccept {
+                epoch: 0,
+                txn,
+                keys: vec![key("acc")],
+                events: vec![write.clone()],
+            },
+        )
+        .await;
+    }
+    let mut deps = Vec::new();
+    for _ in 0..2 {
+        match next_within(&mut c.coordinator, Duration::from_secs(5)).await {
+            Some(Message::PreAcceptOk {
+                txn: t, deps: vote, ..
+            }) if t == txn => {
+                deps.extend(vote);
+            }
+            other => panic!("A and R pre-accept W: {other:?}"),
+        }
+    }
+    deps.sort();
+    deps.dedup();
+    assert!(deps.contains(&orphan), "R's vote has D as a dependency");
+    for to in [A, R] {
+        c.send(
+            9,
+            to,
+            Message::Accept {
+                epoch: 0,
+                txn,
+                ballot: Ballot(txn.0),
+                execute_at: txn.0,
+                deps: deps.clone(),
+                keys: vec![key("acc")],
+            },
+        )
+        .await;
+    }
+    for _ in 0..2 {
+        match next_within(&mut c.coordinator, Duration::from_secs(5)).await {
+            Some(Message::AcceptOk { .. }) => {}
+            other => panic!("A and R accept W: {other:?}"),
+        }
+    }
+    for to in [A, B] {
+        c.send(
+            9,
+            to,
+            Message::Commit {
+                epoch: 0,
+                txn,
+                execute_at: txn.0,
+                deps: deps.clone(),
+                keys: vec![key("acc")],
+                events: vec![write.clone()],
+                reply_to: NodeId(9),
+            },
+        )
+        .await;
+    }
+
+    // R loses its journal and its store with D undecided.
+    c.stop(R);
+    c.heal();
+    let join = c.reopen_amnesiac(R, A).await;
+    tokio::time::timeout(Duration::from_secs(20), join)
+        .await
+        .expect("R's join completes once W is decided")
+        .unwrap()
+        .expect("joined");
+    await_until("every store holds W", Duration::from_secs(10), || {
+        c.stores.iter().all(|store| holds(store, &write))
+    })
+    .await;
+    assert!(
+        c.stores.iter().all(|store| !holds(store, &forgotten)),
+        "D never committed"
+    );
+    assert!(stores_agree(&c.stores), "the stores agree");
 }
 
 /// Under a topology that changes epochs, the node that lost its journal

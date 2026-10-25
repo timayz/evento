@@ -1910,13 +1910,11 @@ async fn safety_holds_under_restarts() {
 /// that it holds nothing of. Safety, the read oracle and liveness after the
 /// heal must hold.
 ///
-/// Under message faults the node is wiped only when nothing is in flight:
-/// writers pause, and every node holds every transaction it knows applied.
-/// A transaction whose recovery is slow (#326) can outlive the compaction
-/// margin, past which the replicas that never witnessed it refuse it a vote
-/// (#310), leaving a slow quorum that must all take part; wiping one of
-/// those leaves it undecided for good — OPERATIONS §7, which no contact can
-/// then vouch past. Writes resume while the node rejoins.
+/// A node is wiped at any moment, writes and message faults included. A
+/// transaction whose recovery is slow (#326) can outlive the compaction
+/// margin with a slow quorum that must all take part, the wiped node among
+/// them: the others never vouched past it, so they still vote for it, and a
+/// recovery decides it — the contact's report then passes the fence (#337).
 async fn run_amnesia(seed: u64, faults: Faults) -> Adversarial {
     const N: u64 = 5;
     const AGGS: usize = 4;
@@ -1924,13 +1922,10 @@ async fn run_amnesia(seed: u64, faults: Faults) -> Adversarial {
     const WRITES_EACH: usize = 12;
     /// The longest a rejoin may take before the run counts it stalled.
     const REJOIN_LIMIT: Duration = Duration::from_secs(120);
-    /// The longest a wipe waits for nothing to be in flight.
-    const QUIESCE_LIMIT: Duration = Duration::from_secs(60);
 
     let mut sim = Sim::build(N);
     faults.arm(&mut sim, seed);
     let clients = Clients::new(&sim);
-    let quiesce = faults.messages.is_some();
 
     let mut rng = StdRng::seed_from_u64(seed);
     let writer_plans: Vec<Vec<(usize, usize)>> = (0..WRITERS)
@@ -1946,9 +1941,6 @@ async fn run_amnesia(seed: u64, faults: Faults) -> Adversarial {
         .map(|_| (rng.random_range(20..80), rng.random_range(1..N as usize)))
         .collect();
 
-    // Writers hold this open while they write; a wipe waiting for quiet
-    // closes it.
-    let gate = Arc::new(tokio::sync::RwLock::new(()));
     let store0 = sim.stores[0].clone();
     let ids = Arc::new(AtomicU64::new(1));
     let mut writers = Vec::new();
@@ -1957,10 +1949,8 @@ async fn run_amnesia(seed: u64, faults: Faults) -> Adversarial {
         let store0 = store0.clone();
         let clients = clients.clone();
         let ids = Arc::clone(&ids);
-        let gate = Arc::clone(&gate);
         writers.push(tokio::spawn(async move {
             for (agg_idx, coord) in plan {
-                let _open = gate.read().await;
                 let agg = format!("a{agg_idx}");
                 let version = store0.version(AGG_TYPE, &agg).await.unwrap_or(0) + 1;
                 let seq = ids.fetch_add(1, Ordering::Relaxed);
@@ -1976,26 +1966,10 @@ async fn run_amnesia(seed: u64, faults: Faults) -> Adversarial {
     let mut stalled = None;
     for (delay, node) in amnesia_plan {
         tokio::time::sleep(Duration::from_millis(delay)).await;
-        let paused = if quiesce {
-            let paused = gate.write().await;
-            let deadline = tokio::time::Instant::now() + QUIESCE_LIMIT;
-            while sim.nodes.iter().any(|n| n.sweep_pressure().busy)
-                && tokio::time::Instant::now() < deadline
-            {
-                tokio::time::sleep(sim.config.recovery_interval).await;
-            }
-            if sim.nodes.iter().any(|n| n.sweep_pressure().busy) {
-                continue;
-            }
-            Some(paused)
-        } else {
-            None
-        };
         if let Err(err) = sim.lose_journal(node).await {
             stalled = Some(err);
             break;
         }
-        drop(paused);
         if let Err(err) = sim.join_amnesiac(node, REJOIN_LIMIT).await {
             stalled = Some(err);
             break;
@@ -2045,6 +2019,117 @@ async fn safety_and_liveness_hold_under_amnesia_and_message_faults() {
         run_amnesia(seed, Faults::ALL)
             .await
             .assert_ok(&format!("amnesia +faults at seed {seed}"));
+    }
+}
+
+/// #337 on virtual time: T is accepted at A (node 1) and R (node 2), its
+/// Commit reaches R alone, and its coordinator vanishes. B (node 0) never
+/// sees it, and the compaction margin passes. R loses its journal. A
+/// recovery of T hears A's acceptance, R's amnesia and B: B never vouched
+/// past T — A and R held it unapplied — so it votes, T commits, every
+/// report moves past R's fence, and R's join goes through.
+#[tokio::test(start_paused = true)]
+async fn a_recovery_decides_what_only_an_amnesiac_and_one_replica_accepted() {
+    let config = NodeConfig {
+        compaction_margin: Duration::from_millis(300),
+        // Only the explicit recovery below recovers T: R, holding its
+        // Commit, would decide it at once.
+        recovery_timeout: Duration::from_secs(3600),
+        ..NodeConfig::default()
+    };
+    let mut sim = Sim::build_with_config(3, config);
+    let mut coordinator = sim.net.register(ORPHAN_COORDINATOR);
+    let txn = TxnId(Timestamp {
+        micros: (tokio::time::Instant::now() - sim.base).as_micros() as u64,
+        logical: 0,
+        node: ORPHAN_COORDINATOR,
+    });
+    let written = event("acc", 1, ORPHAN_SEQ);
+    let key = Key(written.aggregate_id.clone());
+    async fn replies(
+        inbox: &mut tokio::sync::mpsc::Receiver<evento_accord::Envelope>,
+        want: usize,
+    ) {
+        for got in 0..want {
+            match tokio::time::timeout(Duration::from_secs(5), inbox.recv()).await {
+                Ok(Some(_)) => {}
+                other => panic!("{got} of {want} replies: {other:?}"),
+            }
+        }
+    }
+    for to in [1u64, 2] {
+        let _ = sim
+            .net
+            .sink(ORPHAN_COORDINATOR)
+            .send(
+                NodeId(to),
+                Message::PreAccept {
+                    epoch: 0,
+                    txn,
+                    keys: vec![key.clone()],
+                    events: vec![written.clone()],
+                },
+            )
+            .await;
+    }
+    replies(&mut coordinator, 2).await;
+    for to in [1u64, 2] {
+        let _ = sim
+            .net
+            .sink(ORPHAN_COORDINATOR)
+            .send(
+                NodeId(to),
+                Message::Accept {
+                    epoch: 0,
+                    txn,
+                    ballot: evento_accord::Ballot(txn.0),
+                    execute_at: txn.0,
+                    deps: Vec::new(),
+                    keys: vec![key.clone()],
+                },
+            )
+            .await;
+    }
+    replies(&mut coordinator, 2).await;
+    let _ = sim
+        .net
+        .sink(ORPHAN_COORDINATOR)
+        .send(
+            NodeId(2),
+            Message::Commit {
+                epoch: 0,
+                txn,
+                execute_at: txn.0,
+                deps: Vec::new(),
+                keys: vec![key.clone()],
+                events: vec![written.clone()],
+                reply_to: ORPHAN_COORDINATOR,
+            },
+        )
+        .await;
+    replies(&mut coordinator, 1).await;
+    // Long past the margin: B's clock less the margin passed T long ago.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(sim.nodes[0].command_status(txn), None, "B never saw T");
+
+    sim.lose_journal(2).await.expect("R reopens joining");
+    let outcome = sim.nodes[1]
+        .recover(txn)
+        .await
+        .expect("a recovery decides T");
+    assert!(!outcome.conflict, "T may have committed: it commits");
+    sim.join_amnesiac(2, Duration::from_secs(60))
+        .await
+        .expect("R's join goes through once T is decided");
+    assert!(converge(&sim.stores).await, "the stores converge");
+    for (i, store) in sim.stores.iter().enumerate() {
+        assert!(
+            store
+                .committed_events()
+                .iter()
+                .any(|((_, _, id, version), _)| id == "acc" && *version == 1),
+            "replica {i} holds T"
+        );
     }
 }
 
@@ -3644,6 +3729,17 @@ const CONTACT_TOLD_TO_REJOIN_SEEDS: [u64; 1] = [109900];
 #[tokio::test(start_paused = true)]
 async fn a_rejoin_whose_contact_is_told_to_rejoin_goes_through_another() {
     swarm_seeds_pass(&CONTACT_TOLD_TO_REJOIN_SEEDS).await;
+}
+
+/// Swarm seeds (#337) where a replica refused a transaction for good, then
+/// recorded it invalidated: had its record kept the refusal's ballot, a
+/// later message would have been Nacked with it, and the recovery that
+/// witnessed it would have overflowed its clock.
+const REFUSED_THEN_INVALIDATED_SEEDS: [u64; 2] = [100012, 105022];
+
+#[tokio::test(start_paused = true)]
+async fn a_refusal_for_good_is_never_named_in_a_nack() {
+    swarm_seeds_pass(&REFUSED_THEN_INVALIDATED_SEEDS).await;
 }
 
 /// Runs each swarm seed of `seeds`, failing on the first that breaks an

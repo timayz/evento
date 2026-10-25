@@ -370,3 +370,30 @@ async fn fences_survive_close_reopen_and_truncate() {
     journal.truncate(timestamp(1_000, 0)).await.unwrap();
     assert_eq!(journal.load_fences().await.unwrap(), vec![first, second]);
 }
+
+/// The vote fence is staged like a command: durable at the next flush, it
+/// survives a close and reopen, and a truncate never drops it (#337).
+#[tokio::test]
+async fn vote_fence_survives_close_reopen_and_truncate() {
+    let temp = tempfile::Builder::new()
+        .prefix("evento_accord_journal_vote_fence")
+        .tempdir()
+        .unwrap();
+    {
+        let journal = FjallJournal::open(temp.path()).unwrap();
+        assert_eq!(journal.load_vote_fence().await.unwrap(), None);
+        journal.save_vote_fence(timestamp(400, 0)).await.unwrap();
+        journal.save_vote_fence(timestamp(900, 1)).await.unwrap();
+        journal.flush().await.unwrap();
+    }
+    let journal = FjallJournal::open(temp.path()).unwrap();
+    assert_eq!(
+        journal.load_vote_fence().await.unwrap(),
+        Some(timestamp(900, 1))
+    );
+    journal.truncate(timestamp(1_000, 0)).await.unwrap();
+    assert_eq!(
+        journal.load_vote_fence().await.unwrap(),
+        Some(timestamp(900, 1))
+    );
+}
