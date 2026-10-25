@@ -945,7 +945,11 @@ backend (sql/fjall). Phases, in order:
   once never restores (two overlapping losses in a group of three: each needs the
   other's answer), and those nodes come back under new ids. While it waits, it
   answers a recovery of a transaction below its
-  fence with `Message::Amnesiac` (holds nothing, may have voted, never will): a
+  fence with `Message::Amnesiac` (holds nothing, may have voted, never will) — and
+  one of a transaction above it that it does not hold as a late replica would, as
+  any node still joining does (#390: `Late` and a promise at once, a refusal for
+  good when asked, a vote only once joined; buffered until the join, the question
+  would wait on the watermark the transaction pins, which the join waits on): a
   write minted during the rejoin and held only by a minority would otherwise stay
   undecided once the other replicas' vote fences passed it, pinning the very
   report the join waits on; a recovery invalidates on it only when, counting every
@@ -1381,6 +1385,22 @@ backend (sql/fjall). Phases, in order:
         transactions pinned. `Node::write` now refuses a joining node
         (`Joining`), as `read_barrier` does
         (`a_joining_node_refuses_a_write`).
+        A node still joining buffered a recovery's question about a
+        transaction it never witnessed (#390, the same simulation): above
+        its amnesia fence no `Amnesiac` answered, so the recovery counted it
+        as a replica that may have voted and may vote, and with one other
+        replica late could decide nothing — while the join waited on the
+        shard's watermark, pinned by a committed transaction whose read
+        waited on that one. A joiner now answers for a transaction it does
+        not hold at once, as a late replica (`Node::joiner_answers`,
+        `Replica::recover_round_joining`): a promise, a refusal for good
+        when the recovery asks for one — the PreAccept it replays after the
+        join is then refused — and a vote only once joined, since a refusal
+        at the first ask cost the shard a voter it needed when another
+        replica lost its journal right after (the simulation found that
+        too)
+        (`a_joining_node_answers_a_recovery_of_what_it_never_witnessed`,
+        `a_joining_node_votes_once_joined`).
   - [ ] **Real-cluster soak + chaos** over days (kills, partitions, clock skew,
         disk pressure, slow disks/links) on actual hardware — zero production
         mileage today.
