@@ -31,6 +31,7 @@ evento-fjall = { path = "../evento-fjall" }
 rand = { workspace = true }
 rcgen = "0.14"
 criterion = "0.8"
+tracing-subscriber = { workspace = true }
 
 [[bench]]
 name = "throughput"

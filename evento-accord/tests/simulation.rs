@@ -43,6 +43,10 @@
 //!   it ended; and every read is a prefix of the converged history
 //!   ([`read_violation`]).
 //!
+//! Over a layout of several shards ([`run_sharded_amnesia`]), each shard's
+//! replicas agree among themselves, and a read goes to a replica of its
+//! key's shard.
+//!
 //! ## Seeds
 //!
 //! Every seeded test runs a fixed range by default, the one CI runs. The
@@ -51,7 +55,9 @@
 //! - `SIM_SEEDS=<count>` runs that many fresh seeds, and
 //!   `SIM_DURATION=<secs>` fresh seeds for that long.
 //!
-//! A failing seed prints the one line that replays it. The `swarm` test
+//! A failing seed prints the one line that replays it; with `RUST_LOG` set
+//! (`RUST_LOG=evento_accord=debug`), the replay traces the nodes
+//! ([`init_tracing`]). The `swarm` test
 //! (ignored) draws each seed's whole shape — cluster size, which faults are
 //! on and how hard, the store, the workload and the `NodeConfig`
 //! ([`SwarmConfig`]); the nightly workflow runs it on fresh seeds, and
@@ -87,6 +93,18 @@ use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
 const AGG_TYPE: &str = "sim/Account";
+
+/// A tracing subscriber over `RUST_LOG`, to debug a seed; nothing without it.
+fn init_tracing() {
+    if std::env::var_os("RUST_LOG").is_none() {
+        return;
+    }
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .without_time()
+        .with_writer(std::io::stderr)
+        .try_init();
+}
 
 /// A virtual physical-time source for the HLC: microseconds of *virtual* time
 /// elapsed since `base`. The tests run under `#[tokio::test(start_paused = true)]`,
@@ -389,6 +407,11 @@ struct Sim {
     /// Each node's epoch-versioned topology, for a cluster built by
     /// [`build_dynamic`](Sim::build_dynamic); empty otherwise.
     dynamic: Vec<Arc<DynamicTopology>>,
+    /// The starting layout, at epoch 0: the shards whose replicas the oracles
+    /// compare among themselves and a node joins through, and which own each
+    /// key. One shard of every node over a static cluster. A scenario that
+    /// changes its layout keeps its own oracles ([`run_reshard`]).
+    layout: Layout,
     /// The data store every node runs on, kept for the ones rebuilt later.
     store_kind: StoreKind,
     /// Seeded storage faults and their seed, kept so a rebuilt node's fresh
@@ -467,7 +490,76 @@ impl Sim {
         }
     }
 
+    /// The topology a rebuilt node `i` runs on: its own epoch-versioned one
+    /// over a dynamic cluster, else the static one.
+    fn topology_for(&self, i: usize) -> Arc<dyn Topology> {
+        match self.dynamic.get(i) {
+            Some(topology) => Arc::clone(topology) as Arc<dyn Topology>,
+            None => Arc::new(Self::topology(self.ids[i], &self.ids, &self.electorate)),
+        }
+    }
+
+    /// The shards of the starting layout, as node indexes.
+    fn shards(&self) -> Vec<Vec<usize>> {
+        self.layout
+            .shards()
+            .iter()
+            .map(|shard| shard.iter().map(|id| id.0 as usize).collect())
+            .collect()
+    }
+
+    /// The replicas of node `i`'s shard, `i` among them, in order.
+    fn shard_members(&self, i: usize) -> Vec<usize> {
+        self.shards()
+            .into_iter()
+            .find(|shard| shard.contains(&i))
+            .unwrap_or_default()
+    }
+
+    /// The replicas of `agg`'s shard: the nodes a read of it goes to.
+    fn owners(&self, agg: &str) -> Vec<usize> {
+        self.layout
+            .replicas(&Key(agg.to_string()))
+            .iter()
+            .map(|id| id.0 as usize)
+            .collect()
+    }
+
+    /// The store of `agg`'s first replica: `agg`'s history once its shard
+    /// converged.
+    fn store_of(&self, agg: &str) -> &SimStore {
+        &self.stores[self.owners(agg)[0]]
+    }
+
+    /// Whether each shard's replicas hold the same committed set.
+    fn shards_agree(&self) -> bool {
+        self.shards().iter().all(|shard| {
+            let first = committed_set(&self.stores[shard[0]]);
+            shard
+                .iter()
+                .all(|&i| committed_set(&self.stores[i]) == first)
+        })
+    }
+
+    /// `count` aggregate ids each shard of the starting layout owns, named
+    /// `a<n>` as the single-shard workloads name theirs.
+    fn aggs_per_shard(&self, count: usize) -> Vec<String> {
+        let mut found: Vec<Vec<String>> = vec![Vec::new(); self.layout.shards().len()];
+        for i in 0.. {
+            if found.iter().all(|aggs| aggs.len() == count) {
+                break;
+            }
+            let agg = format!("a{i}");
+            let shard = self.layout.shard_of(&Key(agg.clone()));
+            if found[shard].len() < count {
+                found[shard].push(agg);
+            }
+        }
+        found.into_iter().flatten().collect()
+    }
+
     fn build_with(options: SimOptions) -> Self {
+        init_tracing();
         let SimOptions {
             n,
             skew,
@@ -487,6 +579,7 @@ impl Sim {
         let mut journals = Vec::new();
         let mut tasks = Vec::new();
         let mut topologies = Vec::new();
+        let shards = layout.unwrap_or_else(|| vec![ids.clone()]);
         for &id in &ids {
             let inbox = net.register(id);
             let clock = match skew {
@@ -499,8 +592,7 @@ impl Sim {
             let store = SimStore::new(store_kind, &outcomes);
             let journal = Arc::new(FaultJournal::new());
             let topology: Arc<dyn Topology> = if dynamic {
-                let layout = layout.clone().unwrap_or_else(|| vec![ids.clone()]);
-                let topology = Arc::new(DynamicTopology::new(id, 0, layout));
+                let topology = Arc::new(DynamicTopology::new(id, 0, shards.clone()));
                 topologies.push(Arc::clone(&topology));
                 topology
             } else {
@@ -535,6 +627,7 @@ impl Sim {
             electorate,
             config,
             dynamic: topologies,
+            layout: Layout::new(0, shards),
             store_kind,
             storage: None,
             outcomes,
@@ -812,31 +905,56 @@ impl Clients {
         tokio::time::Instant::now() - self.base
     }
 
-    /// Writes `agg` at `version` through `node`. The invocation is logged —
-    /// an unanswered write may still commit — and, if the write returns
-    /// within `timeout`, its outcome.
+    /// Writes `agg` at `version` through `node`, as the event `seq` (see
+    /// [`write_events`](Self::write_events)).
     async fn write(&self, node: &Node, agg: &str, version: u16, seq: u64, timeout: Duration) {
+        self.write_events(node, &[(agg.to_string(), version, seq)], timeout)
+            .await;
+    }
+
+    /// Writes each of `writes` — an aggregate at a version, as the event
+    /// `seq` — through `node`, as one transaction. The invocation is logged
+    /// — an unanswered write may still commit — and, if the write returns
+    /// within `timeout`, its outcome, for every aggregate it wrote.
+    async fn write_events(&self, node: &Node, writes: &[(String, u16, u64)], timeout: Duration) {
         let start = self.now();
-        self.ops.lock().unwrap().writes.insert(
-            seq,
-            WriteObs {
-                agg: agg.to_string(),
-                start,
-                end: None,
-            },
-        );
-        let write = node.write(vec![event(agg, version, seq)]);
+        {
+            let mut ops = self.ops.lock().unwrap();
+            for (agg, _, seq) in writes {
+                ops.writes.insert(
+                    *seq,
+                    WriteObs {
+                        agg: agg.clone(),
+                        start,
+                        end: None,
+                    },
+                );
+            }
+        }
+        let events = writes
+            .iter()
+            .map(|(agg, version, seq)| event(agg, *version, *seq))
+            .collect();
+        let write = node.write(events);
         if let Ok(Ok(outcome)) = tokio::time::timeout(timeout, write).await {
             let committed = !outcome.conflict;
             let end = self.now();
-            if let Some(w) = self.ops.lock().unwrap().writes.get_mut(&seq) {
-                w.end = Some((end, committed));
+            {
+                let mut ops = self.ops.lock().unwrap();
+                for (_, _, seq) in writes {
+                    if let Some(w) = ops.writes.get_mut(seq) {
+                        w.end = Some((end, committed));
+                    }
+                }
             }
-            self.history.lock().unwrap().push(WriteRecord {
-                agg: agg.to_string(),
-                version,
-                committed,
-            });
+            let mut history = self.history.lock().unwrap();
+            for (agg, version, _) in writes {
+                history.push(WriteRecord {
+                    agg: agg.clone(),
+                    version: *version,
+                    committed,
+                });
+            }
         }
     }
 
@@ -867,35 +985,39 @@ impl Clients {
     }
 }
 
+/// The aggregates a single-shard workload writes: `a0..a<n>`.
+fn agg_names(n: usize) -> Vec<String> {
+    (0..n).map(|i| format!("a{i}")).collect()
+}
+
 /// Spawns the workload's readers. Each reads a seeded aggregate (of `aggs`)
-/// on a seeded node — any node, a crashed or cut-off one too — after a seeded
-/// pause, all drawn from its own generator so the scenario's plan is
-/// unchanged.
+/// on a seeded replica of its shard — any, a crashed or cut-off one too —
+/// after a seeded pause, all drawn from its own generator so the scenario's
+/// plan is unchanged.
 fn spawn_readers(
     sim: &Sim,
     clients: &Clients,
     seed: u64,
-    aggs: usize,
+    aggs: &[String],
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let mut rng = StdRng::seed_from_u64(seed ^ READ_SALT);
-    let n = sim.ids.len();
     (0..READERS)
         .map(|_| {
             let plan: Vec<(usize, usize, u64)> = (0..READS_EACH)
                 .map(|_| {
-                    (
-                        rng.random_range(0..aggs),
-                        rng.random_range(0..n),
-                        rng.random_range(5..80),
-                    )
+                    let agg = rng.random_range(0..aggs.len());
+                    let owners = sim.owners(&aggs[agg]);
+                    let node = owners[rng.random_range(0..owners.len())];
+                    (agg, node, rng.random_range(5..80))
                 })
                 .collect();
             let live = sim.live.clone();
             let clients = clients.clone();
+            let aggs = aggs.to_vec();
             tokio::spawn(async move {
-                for (agg_idx, node, pause) in plan {
+                for (agg, node, pause) in plan {
                     tokio::time::sleep(Duration::from_millis(pause)).await;
-                    clients.read(&live, node, &format!("a{agg_idx}")).await;
+                    clients.read(&live, node, &aggs[agg]).await;
                 }
             })
         })
@@ -910,9 +1032,9 @@ fn spawn_readers(
 ///   started;
 /// - **aborted:** no read shows a write that returned as a conflict;
 /// - **premature:** no read shows a write invoked after it ended;
-/// - **not a prefix:** every read is the start of the key's history in
-///   `converged`, a store the cluster converged on.
-fn read_violation(clients: &Clients, converged: Option<&SimStore>) -> Option<String> {
+/// - **not a prefix:** every read is the start of the key's history at a
+///   replica of its shard in `converged`, a cluster that converged.
+fn read_violation(clients: &Clients, converged: Option<&Sim>) -> Option<String> {
     let ops = clients.ops.lock().unwrap();
     let show = |r: &ReadObs| {
         format!(
@@ -960,8 +1082,8 @@ fn read_violation(clients: &Clients, converged: Option<&SimStore>) -> Option<Str
                 ));
             }
         }
-        if let Some(store) = converged {
-            let history = store.events_of(&b.agg);
+        if let Some(sim) = converged {
+            let history = sim.store_of(&b.agg).events_of(&b.agg);
             if !history.starts_with(&b.ids) {
                 return Some(format!(
                     "not a prefix: {} ({:?}), the converged history is {history:?}",
@@ -1260,7 +1382,7 @@ async fn run_adversarial(seed: u64, faults: Faults) -> Adversarial {
             }
         }));
     }
-    writers.extend(spawn_readers(&sim, &clients, seed, AGGS));
+    writers.extend(spawn_readers(&sim, &clients, seed, &agg_names(AGGS)));
     for w in writers {
         let _ = w.await;
     }
@@ -1275,8 +1397,8 @@ async fn run_adversarial(seed: u64, faults: Faults) -> Adversarial {
     let records = clients.history.lock().unwrap().clone();
     let safety = safety_violation(&sim, &records);
     let liveness = assert_live(&mut sim, &acked_versions(&records)).await.err();
-    let converged_store = liveness.is_none().then(|| &sim.stores[0]);
-    let safety = safety.or_else(|| read_violation(&clients, converged_store));
+    let converged_sim = liveness.is_none().then_some(&sim);
+    let safety = safety.or_else(|| read_violation(&clients, converged_sim));
     let reads = clients.ops.lock().unwrap().reads.len();
     Adversarial {
         safety,
@@ -1446,7 +1568,7 @@ async fn run_partition(seed: u64, electorate: Option<Vec<NodeId>>, faults: Fault
             }
         }));
     }
-    writers.extend(spawn_readers(&sim, &clients, seed, AGGS));
+    writers.extend(spawn_readers(&sim, &clients, seed, &agg_names(AGGS)));
     for w in writers {
         let _ = w.await;
     }
@@ -1462,8 +1584,8 @@ async fn run_partition(seed: u64, electorate: Option<Vec<NodeId>>, faults: Fault
         None => minority_never_ahead(&sim, &records).await,
     };
     let liveness = assert_live(&mut sim, &acked_versions(&records)).await.err();
-    let converged_store = liveness.is_none().then(|| &sim.stores[0]);
-    let safety = safety.or_else(|| read_violation(&clients, converged_store));
+    let converged_sim = liveness.is_none().then_some(&sim);
+    let safety = safety.or_else(|| read_violation(&clients, converged_sim));
     let reads = clients.ops.lock().unwrap().reads.len();
     Adversarial {
         safety,
@@ -1507,15 +1629,12 @@ impl Sim {
     }
 
     /// Rejoins every node told to rejoin, as its host would: through the
-    /// peer that told it to ([`Node::rejoin_contact`]), else through any not
-    /// told to. A join that fails — its contact told to rejoin meanwhile
-    /// answers nothing more (#348) — is made again through the next contact;
-    /// one that fails through every contact leaves the node told to rejoin,
-    /// for the next call.
+    /// peer that told it to ([`Node::rejoin_contact`]), else through any
+    /// replica of its shard not told to. A join that fails — its contact
+    /// told to rejoin meanwhile answers nothing more (#348) — is made again
+    /// through the next contact; one that fails through every contact leaves
+    /// the node told to rejoin, for the next call.
     async fn rejoin_told(&mut self, since: tokio::time::Instant) -> Result<(), String> {
-        if !self.dynamic.is_empty() {
-            return Ok(());
-        }
         for i in 0..self.ids.len() {
             if !self.nodes[i].rejoin_required() {
                 continue;
@@ -1524,7 +1643,11 @@ impl Sim {
                 .rejoin_contact()
                 .and_then(|peer| self.ids.iter().position(|&id| id == peer));
             let mut contacts: Vec<usize> = told_by.into_iter().collect();
-            contacts.extend((0..self.ids.len()).filter(|&j| Some(j) != told_by));
+            contacts.extend(
+                self.shard_members(i)
+                    .into_iter()
+                    .filter(|&j| j != i && Some(j) != told_by),
+            );
             let mut tried = false;
             for j in contacts {
                 if self.nodes[j].rejoin_required() {
@@ -1546,7 +1669,7 @@ impl Sim {
     /// state.
     fn stalled(&self, node: usize, step: &str, what: &str, since: tokio::time::Instant) -> String {
         let mut out = format!(
-            "not live: node {node} stalled at the {step} step, {:?} after the heal: {what}",
+            "not live: node {node} stalled at the {step} step after {:?}: {what}",
             tokio::time::Instant::now() - since
         );
         for (i, n) in self.nodes.iter().enumerate() {
@@ -1584,9 +1707,10 @@ fn tried(last: String, attempt: u64, before: Option<String>) -> String {
 /// After [`heal_all`](Sim::heal_all), and rejoining any node told to (as its
 /// host would), within bounds derived from the cluster's [`NodeConfig`]:
 /// 1. a write each node coordinates commits;
-/// 2. a read barrier on every key returns on every node, whose store then
-///    holds at least the highest acknowledged version;
-/// 3. every node compacts its consensus state away, and the stores agree.
+/// 2. a read barrier on every key returns on every replica of its shard,
+///    whose store then holds at least the highest acknowledged version;
+/// 3. every node compacts its consensus state away, and each shard's stores
+///    agree.
 ///
 /// The bounds are ceilings in virtual time: a live cluster passes at once.
 async fn assert_live(sim: &mut Sim, acked: &BTreeMap<String, u16>) -> Result<(), String> {
@@ -1649,10 +1773,14 @@ async fn assert_live(sim: &mut Sim, acked: &BTreeMap<String, u16>) -> Result<(),
         }
     }
 
-    // 2. A read barrier on every key, on every node — retried while its own
-    //    wait (`collect_timeout`) is shorter than the bound.
+    // 2. A read barrier on every key, on every replica of its shard —
+    //    retried while its own wait (`collect_timeout`) is shorter than the
+    //    bound.
     for i in 0..sim.ids.len() {
         for (agg, version) in &keys {
+            if !sim.owners(agg).contains(&i) {
+                continue;
+            }
             let deadline = tokio::time::Instant::now() + serve;
             let (mut attempt, mut before) = (0, None);
             loop {
@@ -1680,13 +1808,11 @@ async fn assert_live(sim: &mut Sim, acked: &BTreeMap<String, u16>) -> Result<(),
         }
     }
 
-    // 3. Consensus state compacts away everywhere, and the stores agree.
+    // 3. Consensus state compacts away everywhere, and each shard's stores
+    //    agree.
     let deadline = tokio::time::Instant::now() + compact;
     loop {
-        let first = committed_set(&sim.stores[0]);
-        if sim.nodes.iter().all(|n| n.command_count() == 0)
-            && sim.stores.iter().all(|s| committed_set(s) == first)
-        {
+        if sim.nodes.iter().all(|n| n.command_count() == 0) && sim.shards_agree() {
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
@@ -1853,7 +1979,7 @@ async fn run_with_restarts(seed: u64, faults: Faults, store: StoreKind) -> Adver
             }
         }));
     }
-    writers.extend(spawn_readers(&sim, &clients, seed, AGGS));
+    writers.extend(spawn_readers(&sim, &clients, seed, &agg_names(AGGS)));
 
     // Drive restarts on the main task (Sim::restart needs &mut self), interleaved
     // with the writers running on their own tasks.
@@ -1872,8 +1998,8 @@ async fn run_with_restarts(seed: u64, faults: Faults, store: StoreKind) -> Adver
     let records = clients.history.lock().unwrap().clone();
     let safety = safety_violation(&sim, &records);
     let liveness = assert_live(&mut sim, &acked_versions(&records)).await.err();
-    let converged_store = liveness.is_none().then(|| &sim.stores[0]);
-    let safety = safety.or_else(|| read_violation(&clients, converged_store));
+    let converged_sim = liveness.is_none().then_some(&sim);
+    let safety = safety.or_else(|| read_violation(&clients, converged_sim));
     let reads = clients.ops.lock().unwrap().reads.len();
     Adversarial {
         safety,
@@ -1961,7 +2087,7 @@ async fn run_amnesia(seed: u64, faults: Faults) -> Adversarial {
             }
         }));
     }
-    writers.extend(spawn_readers(&sim, &clients, seed, AGGS));
+    writers.extend(spawn_readers(&sim, &clients, seed, &agg_names(AGGS)));
 
     let mut stalled = None;
     for (delay, node) in amnesia_plan {
@@ -1989,8 +2115,8 @@ async fn run_amnesia(seed: u64, faults: Faults) -> Adversarial {
         Some(stall) => Some(stall),
         None => assert_live(&mut sim, &acked_versions(&records)).await.err(),
     };
-    let converged_store = liveness.is_none().then(|| &sim.stores[0]);
-    let safety = safety.or_else(|| read_violation(&clients, converged_store));
+    let converged_sim = liveness.is_none().then_some(&sim);
+    let safety = safety.or_else(|| read_violation(&clients, converged_sim));
     let reads = clients.ops.lock().unwrap().reads.len();
     Adversarial {
         safety,
@@ -2019,6 +2145,248 @@ async fn safety_and_liveness_hold_under_amnesia_and_message_faults() {
         run_amnesia(seed, Faults::ALL)
             .await
             .assert_ok(&format!("amnesia +faults at seed {seed}"));
+    }
+}
+
+/// The two shards of [`run_sharded_amnesia`]: `{0, 1, 2}` and `{3, 4, 5}`.
+fn two_shards() -> Vec<Vec<NodeId>> {
+    vec![(0..3).map(NodeId).collect(), (3..6).map(NodeId).collect()]
+}
+
+/// [`run_amnesia`] over [`two_shards`] under [`DynamicTopology`] (#384): the
+/// paths one static shard never reaches. A write in three spans an
+/// aggregate of each shard, so a transaction an amnesiac forgot may be
+/// recovered through its route from the other shard (#377). And each
+/// amnesiac, once joined, reads the config-Paxos state it forgot back from
+/// the other acceptors and votes again (#338): the cluster moved to epoch 1
+/// before the losses, so there is state to read back, and a change to epoch
+/// 2 after the run counts every vote — none withheld — and reaches every
+/// node.
+///
+/// Two nodes lose their journals, up to three times between them: never the
+/// first replica of a shard, whose store serves the writers' version
+/// guesses, and no more than two, as a restoration reads from a majority of
+/// all six acceptors among the voting others.
+async fn run_sharded_amnesia(seed: u64, faults: Faults) -> Adversarial {
+    const N: u64 = 6;
+    const AGGS_PER_SHARD: usize = 2;
+    const WRITERS: usize = 5;
+    const WRITES_EACH: usize = 12;
+    /// The longest a rejoin may take before the run counts it stalled.
+    const REJOIN_LIMIT: Duration = Duration::from_secs(120);
+    /// The longest a change of epoch may take after the heal.
+    const CHANGE_LIMIT: Duration = Duration::from_secs(60);
+
+    let layout = two_shards();
+    let mut sim = Sim::build_with(SimOptions {
+        dynamic: true,
+        layout: Some(layout.clone()),
+        ..SimOptions::new(N)
+    });
+    // Epoch 1 before anything else: config-Paxos state the amnesiacs must
+    // read back, decided over sound links.
+    sim.nodes[0]
+        .change_topology(1, layout.clone())
+        .await
+        .expect("the cluster moves to epoch 1");
+    faults.arm(&mut sim, seed);
+    let clients = Clients::new(&sim);
+    let aggs = sim.aggs_per_shard(AGGS_PER_SHARD);
+    let shard_of: Vec<usize> = aggs
+        .iter()
+        .map(|agg| sim.layout.shard_of(&Key(agg.clone())))
+        .collect();
+    // Each aggregate's version guesses come from its shard's first replica,
+    // which never loses its journal.
+    let anchors: Vec<SimStore> = aggs.iter().map(|agg| sim.store_of(agg).clone()).collect();
+
+    let mut rng = StdRng::seed_from_u64(seed);
+    // Each write: an aggregate, through a node, and — one time in three — an
+    // aggregate of the other shard with it.
+    let writer_plans: Vec<Vec<(usize, usize, Option<usize>)>> = (0..WRITERS)
+        .map(|_| {
+            (0..WRITES_EACH)
+                .map(|_| {
+                    let agg = rng.random_range(0..aggs.len());
+                    let coord = rng.random_range(0..N as usize);
+                    let other = rng.random_bool(1.0 / 3.0).then(|| {
+                        let others: Vec<usize> = (0..aggs.len())
+                            .filter(|&o| shard_of[o] != shard_of[agg])
+                            .collect();
+                        others[rng.random_range(0..others.len())]
+                    });
+                    (agg, coord, other)
+                })
+                .collect()
+        })
+        .collect();
+    // The two nodes that may lose their journals, and which does, after
+    // what delay, each time.
+    let candidates: Vec<usize> = (0..N as usize)
+        .filter(|&i| !layout.iter().any(|shard| shard[0].0 as usize == i))
+        .collect();
+    let first = candidates[rng.random_range(0..candidates.len())];
+    let rest: Vec<usize> = candidates.into_iter().filter(|&c| c != first).collect();
+    let wiped = [first, rest[rng.random_range(0..rest.len())]];
+    let amnesia_plan: Vec<(u64, usize)> = (0..3)
+        .map(|_| (rng.random_range(20..80), wiped[rng.random_range(0..2)]))
+        .collect();
+
+    let ids = Arc::new(AtomicU64::new(1));
+    let mut writers = Vec::new();
+    for plan in writer_plans {
+        let live = sim.live.clone();
+        let aggs = aggs.clone();
+        let anchors = anchors.clone();
+        let clients = clients.clone();
+        let ids = Arc::clone(&ids);
+        writers.push(tokio::spawn(async move {
+            for (agg, coord, other) in plan {
+                let mut writes = Vec::new();
+                for a in std::iter::once(agg).chain(other) {
+                    let version = version_of(&anchors[a], &aggs[a]).await + 1;
+                    let seq = ids.fetch_add(1, Ordering::Relaxed);
+                    writes.push((aggs[a].clone(), version, seq));
+                }
+                let node = live.node(coord);
+                clients
+                    .write_events(&node, &writes, Duration::from_secs(2))
+                    .await;
+            }
+        }));
+    }
+    writers.extend(spawn_readers(&sim, &clients, seed, &aggs));
+
+    let mut stalled = None;
+    let mut lost: BTreeSet<usize> = BTreeSet::new();
+    for (delay, node) in amnesia_plan {
+        tokio::time::sleep(Duration::from_millis(delay)).await;
+        lost.insert(node);
+        if let Err(err) = sim.lose_journal(node).await {
+            stalled = Some(err);
+            break;
+        }
+        if let Err(err) = sim.join_amnesiac(node, REJOIN_LIMIT).await {
+            stalled = Some(err);
+            break;
+        }
+    }
+    for w in writers {
+        let _ = w.await;
+    }
+
+    sim.net.clear_message_faults();
+    sim.clear_storage_faults();
+
+    // Each amnesiac restores its config votes at a sweep once joined, no
+    // earlier than `collect_timeout` past its fence — its clock at the loss
+    // plus three skews (#338).
+    if stalled.is_none() {
+        let bound = Duration::from_micros(3 * MAX_SKEW_MICROS)
+            + sim.config.collect_timeout
+            + sim.config.recovery_interval * 50;
+        let deadline = tokio::time::Instant::now() + bound;
+        for &i in &lost {
+            while !sim.nodes[i]
+                .amnesia_fence()
+                .is_some_and(|fence| fence.votes_restored)
+            {
+                if tokio::time::Instant::now() >= deadline {
+                    stalled = Some(format!(
+                        "node {i} never restored its config votes within {bound:?} of the run's end"
+                    ));
+                    break;
+                }
+                tokio::time::sleep(sim.config.recovery_interval).await;
+            }
+            if stalled.is_some() {
+                break;
+            }
+        }
+    }
+    // Restored, they vote: a change to epoch 2 goes through with none of
+    // their votes withheld, and reaches every node.
+    if stalled.is_none() {
+        let withheld: Vec<u64> = lost
+            .iter()
+            .map(|&i| sim.nodes[i].metrics().config_votes_withheld)
+            .collect();
+        let change = sim.nodes[0].change_topology(2, layout.clone());
+        stalled = match tokio::time::timeout(CHANGE_LIMIT, change).await {
+            Ok(Ok(_)) => None,
+            Ok(Err(err)) => Some(format!("no change to epoch 2 after the losses: {err:#}")),
+            Err(_) => Some(format!("no change to epoch 2 within {CHANGE_LIMIT:?}")),
+        };
+        for (k, &i) in lost.iter().enumerate() {
+            let now = sim.nodes[i].metrics().config_votes_withheld;
+            if stalled.is_none() && now > withheld[k] {
+                stalled = Some(format!(
+                    "node {i} withheld {} config vote(s) after restoring its votes",
+                    now - withheld[k]
+                ));
+            }
+        }
+        for _ in 0..1500 {
+            if sim.dynamic.iter().all(|topology| topology.epoch() >= 2) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        if stalled.is_none() {
+            if let Some(i) = (0..N as usize).find(|&i| sim.dynamic[i].epoch() < 2) {
+                stalled = Some(format!(
+                    "node {i} never installed epoch 2 (at {})",
+                    sim.dynamic[i].epoch()
+                ));
+            }
+        }
+    }
+
+    let mut converged = true;
+    for shard in sim.shards() {
+        let stores: Vec<SimStore> = shard.iter().map(|&i| sim.stores[i].clone()).collect();
+        converged &= converge(&stores).await;
+    }
+
+    let records = clients.history.lock().unwrap().clone();
+    let safety = safety_violation(&sim, &records);
+    let liveness = match stalled {
+        Some(stall) => Some(stall),
+        None => assert_live(&mut sim, &acked_versions(&records)).await.err(),
+    };
+    let converged_sim = liveness.is_none().then_some(&sim);
+    let safety = safety.or_else(|| read_violation(&clients, converged_sim));
+    let reads = clients.ops.lock().unwrap().reads.len();
+    Adversarial {
+        safety,
+        converged,
+        liveness,
+        reads,
+        trace: sim.trace(),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn safety_and_liveness_hold_under_amnesia_over_two_shards() {
+    for (seed, _replay) in sim_seeds(
+        "safety_and_liveness_hold_under_amnesia_over_two_shards",
+        0..12,
+    ) {
+        run_sharded_amnesia(seed, Faults::default())
+            .await
+            .assert_ok(&format!("sharded amnesia at seed {seed}"));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn safety_and_liveness_hold_under_amnesia_over_two_shards_and_message_faults() {
+    for (seed, _replay) in sim_seeds(
+        "safety_and_liveness_hold_under_amnesia_over_two_shards_and_message_faults",
+        0..12,
+    ) {
+        run_sharded_amnesia(seed, Faults::ALL)
+            .await
+            .assert_ok(&format!("sharded amnesia +faults at seed {seed}"));
     }
 }
 
@@ -2078,7 +2446,7 @@ async fn run_rollback(seed: u64, faults: Faults) -> Adversarial {
             }
         }));
     }
-    writers.extend(spawn_readers(&sim, &clients, seed, AGGS));
+    writers.extend(spawn_readers(&sim, &clients, seed, &agg_names(AGGS)));
 
     let mut stalled = None;
     for (delay, i) in rollback_plan {
@@ -2146,8 +2514,8 @@ async fn run_rollback(seed: u64, faults: Faults) -> Adversarial {
         Some(stall) => Some(stall),
         None => assert_live(&mut sim, &acked_versions(&records)).await.err(),
     };
-    let converged_store = liveness.is_none().then(|| &sim.stores[0]);
-    let safety = safety.or_else(|| read_violation(&clients, converged_store));
+    let converged_sim = liveness.is_none().then_some(&sim);
+    let safety = safety.or_else(|| read_violation(&clients, converged_sim));
     let reads = clients.ops.lock().unwrap().reads.len();
     Adversarial {
         safety,
@@ -2601,6 +2969,10 @@ async fn every_scenario_kind_replays_its_trace() {
             .await;
             assert_replays(&format!("amnesia{label}"), seed, |s| async move {
                 run_amnesia(s, faults).await.trace
+            })
+            .await;
+            assert_replays(&format!("sharded amnesia{label}"), seed, |s| async move {
+                run_sharded_amnesia(s, faults).await.trace
             })
             .await;
         }
@@ -3812,7 +4184,7 @@ async fn run_swarm(seed: u64, shape: &SwarmConfig) -> Adversarial {
         None => assert_live(&mut sim, &acked_versions(&records)).await.err(),
     };
     let converged = liveness.is_none();
-    let safety = safety.or_else(|| read_violation(&clients, converged.then(|| &sim.stores[0])));
+    let safety = safety.or_else(|| read_violation(&clients, converged.then_some(&sim)));
     let reads = clients.ops.lock().unwrap().reads.len();
     Adversarial {
         safety,
@@ -4060,16 +4432,23 @@ impl Sim {
     /// mints nothing more under its id), gives it an empty store and journal,
     /// and opens it **joining** under its old id. The node fences itself: until a
     /// contact vouches past the fence ([`join_amnesiac`](Self::join_amnesiac))
-    /// it votes on nothing and refuses reads, though it serves writers and
-    /// readers ([`Live`]) at once.
+    /// it votes on nothing and refuses reads and writes, though [`Live`]
+    /// hands it to readers and writers at once.
+    ///
+    /// Over a dynamic topology, the node comes back built at epoch 0 over
+    /// the starting layout, as its host would build it, and its join catches
+    /// its epoch up.
     async fn lose_journal(&mut self, i: usize) -> Result<(), String> {
-        assert!(
-            self.dynamic.is_empty(),
-            "a restart over a dynamic topology is not modelled"
-        );
         self.nodes[i].retire().await;
         self.journals[i] = Arc::new(FaultJournal::new());
         self.arm_journal(i);
+        if let Some(topology) = self.dynamic.get_mut(i) {
+            *topology = Arc::new(DynamicTopology::new(
+                self.ids[i],
+                0,
+                self.layout.shards().to_vec(),
+            ));
+        }
         self.reopen_joining(i).await
     }
 
@@ -4083,16 +4462,22 @@ impl Sim {
     }
 
     /// Joins node `i`, reopened joining after it lost its journal, as its
-    /// host would: through each other node in turn, again and again, until
-    /// one vouches past its fence or `limit` passes. A join that broke after
-    /// installing a page is retried over an emptied store.
+    /// host would: through each other replica of its shard in turn, from the
+    /// one after it round, again and again, until one vouches past its fence
+    /// or `limit` passes. A join that broke after installing a page is
+    /// retried over an emptied store.
     async fn join_amnesiac(&mut self, i: usize, limit: Duration) -> Result<(), String> {
         let deadline = tokio::time::Instant::now() + limit;
         let n = self.ids.len();
+        let members = self.shard_members(i);
+        let contacts: Vec<usize> = (1..n)
+            .map(|k| (i + k) % n)
+            .filter(|j| members.contains(j))
+            .collect();
         let mut tried = 0;
         loop {
             let node = self.nodes[i].clone();
-            let contact = self.ids[(i + 1 + tried % (n - 1)) % n];
+            let contact = self.ids[contacts[tried % contacts.len()]];
             tried += 1;
             match node.join(contact).await {
                 Ok(_) => {
@@ -4100,9 +4485,8 @@ impl Sim {
                     return Ok(());
                 }
                 Err(err) if tokio::time::Instant::now() >= deadline => {
-                    return Err(format!(
-                        "node {i} found no contact to vouch past its fence: {err:#}"
-                    ));
+                    let what = format!("no contact vouched past its fence: {err:#}");
+                    return Err(self.stalled(i, "join", &what, deadline - limit));
                 }
                 // The store holds a prefix no contact can complete: emptied,
                 // the node joins again over its fenced journal.
@@ -4117,7 +4501,8 @@ impl Sim {
     /// Tears node `i` down and reopens it joining over its journal and an
     /// empty store — its inbox running, its join and sweeps to come. Over a
     /// dynamic topology, the node keeps its own: the journal restores the
-    /// epochs it had installed.
+    /// epochs it had installed, and one that lost its journal was given a
+    /// fresh one at epoch 0 ([`lose_journal`](Self::lose_journal)).
     async fn reopen_joining(&mut self, i: usize) -> Result<(), String> {
         for t in &self.tasks[i] {
             t.abort();
@@ -4130,13 +4515,9 @@ impl Sim {
         // the node again: the faults are seeded rates, so one soon passes.
         let mut attempts = 0;
         let node = loop {
-            let topology: Arc<dyn Topology> = match self.dynamic.get(i) {
-                Some(topology) => Arc::clone(topology) as Arc<dyn Topology>,
-                None => Arc::new(Self::topology(id, &self.ids, &self.electorate)),
-            };
             let node = Node::new(
                 id,
-                topology,
+                self.topology_for(i),
                 Arc::new(HybridLogicalClock::with_physical(
                     id,
                     virtual_micros(self.base),
@@ -4191,7 +4572,7 @@ impl Sim {
         let journal = Arc::clone(&self.journals[i]);
         let node = Node::new(
             id,
-            Arc::new(Self::topology(id, &self.ids, &self.electorate)),
+            self.topology_for(i),
             Arc::new(HybridLogicalClock::with_physical(
                 id,
                 virtual_micros(self.base),
@@ -5399,7 +5780,7 @@ async fn run_absence(seed: u64, faults: Faults) -> Adversarial {
             }
         }));
     }
-    writers.extend(spawn_readers(&sim, &clients, seed, AGGS));
+    writers.extend(spawn_readers(&sim, &clients, seed, &agg_names(AGGS)));
     for w in writers {
         let _ = w.await;
     }
@@ -5417,7 +5798,7 @@ async fn run_absence(seed: u64, faults: Faults) -> Adversarial {
     let converged = liveness.is_none();
     let safety = safety
         .or_else(|| safety_violation(&sim, &records))
-        .or_else(|| read_violation(&clients, converged.then(|| &sim.stores[0])));
+        .or_else(|| read_violation(&clients, converged.then_some(&sim)));
     let reads = clients.ops.lock().unwrap().reads.len();
     Adversarial {
         safety,
