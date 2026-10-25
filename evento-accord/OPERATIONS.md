@@ -142,7 +142,7 @@ Serve it on an HTTP endpoint (see `bank-axum-accord`'s `/metrics`). Counters:
 | `messages_handled` | liveness/traffic. |
 | `messages_shed` | inbound backpressure drops; sustained > 0 = a node is overloaded or a peer is flooding. |
 | `peers_absent` | shard peers this node stopped waiting for (`peer_absence_limit`); each is a node that was silent for that long. |
-| `rejoins_required` | this node must rejoin: a peer told it to, having given it up while writes it never applied were compacted; or its own recovery found it holding a transaction its peers compacted past, which no recovery can decide any more. The node is stale until its host rejoins it (§7) — through `Node::rejoin_contact()`, the peer that compacted past what it holds. |
+| `rejoins_required` | this node must rejoin: a peer told it to, having given it up while writes it never applied were compacted; or its own recovery found it holding a transaction its peers compacted past, undecided, which no recovery can decide any more. The node is stale until its host rejoins it (§7) — through `Node::rejoin_contact()`, the peer that compacted past what it holds. |
 | `votes_fenced` | votes refused for a transaction this node never witnessed, older than its compaction margin: a late coordinator message, or a recovery by a replica that alone holds the transaction (§3, `compaction_margin`). Spikes after a partition heals are expected; a steady rate means coordinators slower than the margin. |
 | `dependencies_learned` | decisions this node learned from its peers for a transaction it never witnessed, but a command committed here waited on (missed while it was cut off or restarting). Counts after a partition heals are expected; it keeps a stalled execution from waiting on anti-entropy for a transaction no replica can apply yet. |
 | `votes_future_dated` | votes refused for a transaction dated more than two clock skews past this node's clock: its coordinator's clock runs beyond the skew bound (§3). Any count = a clock out of bounds; fix its time source. |
@@ -226,7 +226,9 @@ refuses anything else before a vote, and a node never installs it.
   anti-entropy catches the node up. A replayed transaction the store neither holds
   nor can take — it lost the write (§8), or misses an earlier one the journal never
   recorded — is handed back decided but un-applied and applied again once what
-  precedes it is in place. (See `tests/restart.rs`.)
+  precedes it is in place. The sweep retries that apply, and never takes the
+  transaction over: its peers may have compacted past it, and the node holds
+  their decision (#351). (See `tests/restart.rs`.)
 - **A write the caller abandons** (a client that hung up, a `timeout`) is not undone:
   its coordinator may already have reached the replicas. The node stops coordinating
   it, and the transaction is finished by recovery, like one whose coordinator

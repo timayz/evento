@@ -706,7 +706,10 @@ backend (sql/fjall). Phases, in order:
   it — no recovery can decide it, since a compacted replica may have applied it and
   dropped it. Its holder is then **stale**, and requires a rejoin through that
   replica (`Node::rejoin_contact`): its floor is past `t0`, so `forget_below`
-  drops the transaction, and the snapshot carries its effect if it had one. A peer
+  drops the transaction, and the snapshot carries its effect if it had one. A
+  holder that holds it committed and decided is not stale, as a replay its
+  store refused leaves it (#351): the decision its peers applied before they
+  compacted it is here, and only the apply is left. A peer
   that never held what it compacted past sets no rejoin bound, so this is how a
   holder the others gave up and compacted past gets back
   (`a_lone_holder_cannot_commit_what_a_peer_compacted_past`,
@@ -1108,6 +1111,17 @@ backend (sql/fjall). Phases, in order:
         for the next page at once while each brings something in, up to 16
         pages and for one `anti_entropy_interval`
         (`a_healed_peer_catches_up_a_backlog_in_a_few_rounds`).
+        A replica restarted over a store that refused its journal's replay
+        was sent to rejoin by its own sweep (#351). The replay hands such a
+        write back decided but un-applied. Once it was older than
+        `recovery_timeout`, the sweep took it over, and with the peers
+        compacted past it the recovery found too few replicas left that could
+        vote, and required a rejoin: a full snapshot transfer, when all the
+        node lacked was the apply. A transaction held committed and decided
+        needs nothing a recovery brings (`Replica::decided`): the sweep now
+        leaves it to the retried apply, and follows a read waiting on one to
+        what that one waits on, and no recovery of one sends its holder to
+        rejoin (`a_replayed_write_held_decided_waits_for_its_store`).
         **Open** (confirmed or plausible, not yet fixed):
         an epoch change can remap a route's keys onto replicas that never
         witnessed an in-flight txn, which then answer "never witnessed"; the

@@ -1817,7 +1817,8 @@ impl Node {
     /// which guarantees liveness even with no liveness history). Both paths are
     /// idempotent and ballot-fenced, so concurrent recoveries are safe. What a
     /// recovered transaction's read waits on is recovered first
-    /// ([`recover_stalled`](Self::recover_stalled)).
+    /// ([`recover_stalled`](Self::recover_stalled)). One this node holds
+    /// decided is left to the redrive (see [`stalled`](Self::stalled)).
     async fn recovery_sweep(&self) {
         // A node told to rejoin holds state its peers compacted past: it
         // recovers, repairs and gossips nothing until its host rejoins it.
@@ -1901,7 +1902,14 @@ impl Node {
     /// Whether `txn`'s coordinator is presumed gone, so that this node takes
     /// the transaction over: it began before `timeout`, `recovery_timeout`
     /// ago, or its coordinator is a peer the failure detector suspects.
+    /// Never one this node holds [decided](Replica::decided), such as a
+    /// replayed write its store refused (#351): only its apply is left,
+    /// which the redrive retries on every sweep, and a recovery decides
+    /// nothing more.
     fn stalled(&self, txn: TxnId, timeout: Timestamp) -> bool {
+        if self.replica.lock().expect("replica poisoned").decided(txn) {
+            return false;
+        }
         let coordinator = txn.0.node;
         txn.0 < timeout
             || (coordinator != self.id
@@ -1947,6 +1955,8 @@ impl Node {
             let waits_on = match self.command_status(next) {
                 // Applied meanwhile: by another recovery, or imported.
                 Some(Status::Applied) => None,
+                // Decided meanwhile: only its apply is left (see `stalled`).
+                Some(_) if self.replica.lock().expect("replica poisoned").decided(next) => None,
                 Some(_) => {
                     self.metrics.record_recovery();
                     tracing::debug!(node = self.id.0, txn = ?next, "recovering stalled transaction");
@@ -1987,12 +1997,14 @@ impl Node {
 
     /// The transaction this replica holds `txn`'s read back on, if it is
     /// stalled ([`stalled`](Self::stalled)) and not in this node's hands.
+    /// Past a dependency decided here, never stalled itself, it is what that
+    /// one waits on ([`Replica::undecided_blocker`]).
     fn stalled_dependency(&self, txn: TxnId) -> Option<TxnId> {
         let dep = self
             .replica
             .lock()
             .expect("replica poisoned")
-            .blocker(txn)?;
+            .undecided_blocker(txn)?;
         if self
             .pending
             .lock()
@@ -4778,7 +4790,7 @@ impl Node {
                 conflict: true,
             }));
         }
-        if let Some(contact) = self.stranded_below(&plans, &resp) {
+        if let Some(contact) = self.stranded_below(txn, &plans, &resp) {
             tracing::error!(
                 node = self.id.0,
                 peer = contact.0,
@@ -4931,17 +4943,22 @@ impl Node {
     /// way this node, holding it undecided, is stale. Rejoining through that
     /// replica forgets it, and the snapshot carries its effect if it had one.
     ///
-    /// This needs the transaction held here. A node recovering only a
-    /// dependency is not stuck: its own floor follows its peers' past it.
+    /// This needs the transaction held here, undecided. A node recovering
+    /// only a dependency is not stuck: its own floor follows its peers' past
+    /// it. Nor is one holding the transaction [decided](Replica::decided),
+    /// such as a replayed write its store refused (#351): the decision its
+    /// peers applied before they compacted it is here, and all it lacks is
+    /// the apply.
     fn stranded_below(
         &self,
+        txn: TxnId,
         plans: &[ShardPlan],
         resp: &[(NodeId, RecoverResp)],
     ) -> Option<NodeId> {
         let held = resp
             .iter()
             .any(|(from, r)| *from == self.id && matches!(r, RecoverResp::Ok(f) if f.known));
-        if !held {
+        if !held || self.replica.lock().expect("replica poisoned").decided(txn) {
             return None;
         }
         plans.iter().find_map(|plan| {

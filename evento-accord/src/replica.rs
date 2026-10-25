@@ -1596,6 +1596,31 @@ impl Replica {
         self.blocked.get(&txn).copied()
     }
 
+    /// Whether `txn` is held here committed and decided, not yet applied:
+    /// all its execution still needs is its dependencies and the data
+    /// store, so no recovery of it decides anything more, nor brings this
+    /// replica anything it waits on (#351). One decided before it committed
+    /// here is not: it still waits on its Commit, which a recovery brings.
+    pub fn decided(&self, txn: TxnId) -> bool {
+        self.commands
+            .get(&txn)
+            .is_some_and(|cmd| awaiting_execution(cmd.status) && cmd.decision.is_some())
+    }
+
+    /// What `txn` is known to be waiting on here, past every dependency
+    /// [`decided`](Self::decided) here: its [`blocker`](Self::blocker) or,
+    /// if that one is decided, what it waits on in turn. `None` if the wait
+    /// ends at a decided one that waits on nothing but its apply. A
+    /// committed command waits only on one ordered before it, or not yet
+    /// committed, so the walk descends the execution order, and ends.
+    pub fn undecided_blocker(&self, txn: TxnId) -> Option<TxnId> {
+        let mut dep = self.blocker(txn)?;
+        while self.decided(dep) {
+            dep = self.blocker(dep)?;
+        }
+        Some(dep)
+    }
+
     /// The transactions this replica never witnessed that a command committed
     /// here waits on (see `blocked`), with `t0` before `cutoff`, oldest first.
     /// Anti-entropy brings such a dependency in only once it is applied
@@ -1751,6 +1776,47 @@ mod tests {
             .expect("B becomes ready after A applies");
         assert_eq!(ready_b.txn, b);
         assert!(ready_b.commit);
+    }
+
+    /// A transaction committed and decided here waits only on its
+    /// dependencies and its apply (#351), so what a read held back on it
+    /// waits on is looked for past it. One decided before it committed here
+    /// still waits on its Commit.
+    #[test]
+    fn a_read_held_back_on_a_decided_dependency_waits_on_what_that_one_waits_on() {
+        let mut replica = Replica::new();
+        let key = Key("k".into());
+        let (e, d, t) = (txn(10), txn(20), txn(30));
+        for (x, version) in [(e, 1), (d, 2), (t, 3)] {
+            replica
+                .preaccept(x, vec![key.clone()], vec![event("k", version)])
+                .unwrap();
+        }
+
+        // D's Apply arrives before its Commit.
+        replica.record_decision(d, true);
+        assert!(!replica.decided(d), "not committed here yet");
+        replica.commit(d, d.0, vec![e], vec![event("k", 2)], vec![], NodeId(0));
+        assert!(replica.decided(d));
+
+        // T's read waits on D, D's apply on E, which only pre-accepted.
+        replica.commit(t, t.0, vec![d], vec![event("k", 3)], vec![], NodeId(0));
+        assert!(replica.next_apply().is_none());
+        assert!(replica.next_read().is_none());
+        assert_eq!(replica.blocker(t), Some(d));
+        assert_eq!(replica.undecided_blocker(t), Some(e), "past D, to E");
+
+        // E applies; D's apply then fails: T's read waits on that alone.
+        replica.commit(e, e.0, vec![], vec![event("k", 1)], vec![], NodeId(0));
+        replica.record_decision(e, true);
+        assert_eq!(replica.next_apply().map(|ready| ready.txn), Some(e));
+        replica.mark_applied(e, false);
+        assert!(!replica.decided(e), "applied");
+        assert_eq!(replica.next_apply().map(|ready| ready.txn), Some(d));
+        replica.release_apply(d);
+        assert!(replica.next_read().is_none());
+        assert_eq!(replica.blocker(t), Some(d));
+        assert_eq!(replica.undecided_blocker(t), None);
     }
 
     /// An un-applied command bounds the watermark by its `t0` floored to the
