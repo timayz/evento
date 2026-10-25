@@ -22,6 +22,7 @@ fn timestamp(micros: u64, node: u64) -> Timestamp {
 fn command(micros: u64, version: u16) -> CommandState {
     let txn = TxnId(timestamp(micros, 0));
     CommandState {
+        epoch: 0,
         txn,
         status: Status::Applied,
         promised: Ballot(txn.0),
@@ -281,6 +282,7 @@ async fn routes_and_promises_survive_close_and_reopen_and_truncate() {
 
 fn decision(txn: TxnId, route: &[Key]) -> DecisionRecord {
     DecisionRecord {
+        epoch: 0,
         txn,
         execute_at: timestamp(txn.0.micros + 1, 0),
         conflict: txn.0.micros % 200 == 100,

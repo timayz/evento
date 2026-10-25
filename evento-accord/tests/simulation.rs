@@ -4969,6 +4969,7 @@ async fn orphan_vote(
         .send(
             NodeId(to as u64),
             Message::PreAccept {
+                epoch: 0,
                 txn,
                 keys: vec![Key(event.aggregate_id.clone())],
                 events: vec![event],
@@ -5337,6 +5338,7 @@ async fn a_replica_recovers_a_dependency_it_never_witnessed() {
     };
     let (u, t) = (TxnId(stamp(now)), TxnId(stamp(now + 1_000)));
     let commit = |txn: TxnId, execute_at, dep, version, seq| Message::Commit {
+        epoch: 0,
         txn,
         execute_at,
         deps: vec![dep],
@@ -5419,6 +5421,7 @@ async fn restart_after_an_import(mode: Restart) {
     let sink = sim.net.sink(ORPHAN_COORDINATOR);
     for to in [0, 1, 2] {
         let commit = Message::Commit {
+            epoch: 0,
             txn: t,
             execute_at: t.0,
             deps: vec![d],

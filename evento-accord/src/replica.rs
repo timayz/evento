@@ -270,6 +270,9 @@ pub enum RoutedRecovery {
 pub struct RecoverState {
     /// False when this replica never witnessed the transaction.
     pub known: bool,
+    /// The epoch the replica holds the transaction under (its
+    /// [`CommandState::epoch`]); the recovery's own when not `known`.
+    pub epoch: u64,
     /// Phase the replica had reached.
     pub status: Status,
     /// Ballot at which its execute-at/deps were accepted.
@@ -532,6 +535,7 @@ impl Replica {
     pub fn preaccept(
         &mut self,
         txn: TxnId,
+        epoch: u64,
         keys: Vec<Key>,
         events: Vec<Event>,
     ) -> Result<(Timestamp, Vec<TxnId>), Refusal> {
@@ -544,7 +548,7 @@ impl Replica {
         if self.fenced(txn) {
             return Err(Refusal::Fenced);
         }
-        Ok(self.witness(txn, Ballot(txn.0), keys, events))
+        Ok(self.witness(txn, epoch, Ballot(txn.0), keys, events))
     }
 
     /// Whether `txn` is below the redundancy watermark and not held: applied
@@ -584,10 +588,13 @@ impl Replica {
 
     /// Records `txn` as pre-accepted under `promised` (or repairs the keys and
     /// events of a command already known) and returns its vote: the execution
-    /// timestamp and dependencies this replica witnesses.
+    /// timestamp and dependencies this replica witnesses. A new command is
+    /// recorded under `epoch`; a known one keeps the epoch it was first
+    /// recorded under.
     fn witness(
         &mut self,
         txn: TxnId,
+        epoch: u64,
         promised: Ballot,
         keys: Vec<Key>,
         events: Vec<Event>,
@@ -635,6 +642,7 @@ impl Replica {
         self.unknown_promises.remove(&txn);
         self.insert(CommandState {
             txn,
+            epoch,
             status: Status::PreAccepted,
             promised,
             accepted: Ballot(txn.0),
@@ -666,6 +674,7 @@ impl Replica {
         &mut self,
         txn: TxnId,
         ballot: Ballot,
+        epoch: u64,
         execute_at: Timestamp,
         deps: Vec<TxnId>,
         keys: Vec<Key>,
@@ -707,6 +716,7 @@ impl Replica {
             // still see this transaction (events arrive with Commit).
             self.insert(CommandState {
                 txn,
+                epoch,
                 status: Status::Accepted,
                 promised: ballot,
                 accepted: ballot,
@@ -745,9 +755,11 @@ impl Replica {
     /// Committed or Applied its decision is not downgraded, but `reply_to` is
     /// refreshed so a recoverer can still collect the outcome. A
     /// [`compacted`](Self::compacted) transaction is ignored.
+    #[allow(clippy::too_many_arguments)]
     pub fn commit(
         &mut self,
         txn: TxnId,
+        epoch: u64,
         execute_at: Timestamp,
         deps: Vec<TxnId>,
         events: Vec<Event>,
@@ -786,6 +798,7 @@ impl Replica {
         } else {
             self.insert(CommandState {
                 txn,
+                epoch,
                 status: Status::Committed,
                 promised: Ballot(txn.0),
                 accepted: Ballot(txn.0),
@@ -826,6 +839,7 @@ impl Replica {
         &mut self,
         txn: TxnId,
         ballot: Ballot,
+        epoch: u64,
         keys: Vec<Key>,
         events: Vec<Event>,
     ) -> Result<RecoverState, Ballot> {
@@ -838,6 +852,7 @@ impl Replica {
             self.unknown_promises.insert(txn, ballot);
             return Ok(RecoverState {
                 known: false,
+                epoch,
                 status: Status::PreAccepted,
                 accepted: Ballot(txn.0),
                 execute_at: txn.0,
@@ -851,7 +866,7 @@ impl Replica {
 
         // Pre-accepts an unknown transaction (or repairs a known one's keys
         // and events), then promises the ballot.
-        self.witness(txn, ballot, keys, events);
+        self.witness(txn, epoch, ballot, keys, events);
         if let Some(cmd) = self.commands.get_mut(&txn) {
             cmd.promised = ballot;
         }
@@ -860,6 +875,7 @@ impl Replica {
         let cmd = &self.commands[&txn];
         Ok(RecoverState {
             known: true,
+            epoch: cmd.epoch,
             status: cmd.status,
             accepted: cmd.accepted,
             execute_at: cmd.execute_at,
@@ -880,6 +896,7 @@ impl Replica {
         &mut self,
         txn: TxnId,
         ballot: Ballot,
+        epoch: u64,
         keys: Vec<Key>,
         events: Vec<Event>,
     ) -> Result<RoutedRecovery, Ballot> {
@@ -899,7 +916,7 @@ impl Replica {
             self.unknown_promises.insert(txn, ballot);
             return Ok(RoutedRecovery::NotWitnessed { redundant: false });
         }
-        self.recover(txn, ballot, keys, events)
+        self.recover(txn, ballot, epoch, keys, events)
             .map(RoutedRecovery::Known)
     }
 
@@ -911,6 +928,7 @@ impl Replica {
         match self.decisions.get(&txn) {
             Some(record) => RoutedRecovery::Known(RecoverState {
                 known: true,
+                epoch: record.epoch,
                 status: Status::Applied,
                 accepted: Ballot(txn.0),
                 execute_at: record.execute_at,
@@ -938,12 +956,13 @@ impl Replica {
         &mut self,
         txn: TxnId,
         ballot: Ballot,
+        epoch: u64,
         keys: Vec<Key>,
         events: Vec<Event>,
     ) -> Result<RoutedRecovery, Ballot> {
         if self.commands.contains_key(&txn) {
             return self
-                .recover(txn, ballot, keys, events)
+                .recover(txn, ballot, epoch, keys, events)
                 .map(RoutedRecovery::Known);
         }
         if let Some(&promised) = self.unknown_promises.get(&txn) {
@@ -1668,6 +1687,7 @@ impl Replica {
                         *txn,
                         DecisionRecord {
                             txn: *txn,
+                            epoch: cmd.epoch,
                             execute_at: cmd.execute_at,
                             conflict,
                             route,
@@ -1736,14 +1756,14 @@ mod tests {
         let b = txn(20);
 
         replica
-            .preaccept(a, vec![key.clone()], vec![event("k", 1)])
+            .preaccept(a, 0, vec![key.clone()], vec![event("k", 1)])
             .unwrap();
         replica
-            .preaccept(b, vec![key.clone()], vec![event("k", 2)])
+            .preaccept(b, 0, vec![key.clone()], vec![event("k", 2)])
             .unwrap();
 
         // B commits and its decision arrives while A is still unapplied.
-        replica.commit(b, b.0, vec![a], vec![event("k", 2)], vec![], NodeId(0));
+        replica.commit(b, 0, b.0, vec![a], vec![event("k", 2)], vec![], NodeId(0));
         replica.record_decision(b, true);
         assert!(
             replica.next_apply().is_none(),
@@ -1751,7 +1771,7 @@ mod tests {
         );
 
         // A commits, decides, and applies.
-        replica.commit(a, a.0, vec![], vec![event("k", 1)], vec![], NodeId(0));
+        replica.commit(a, 0, a.0, vec![], vec![event("k", 1)], vec![], NodeId(0));
         replica.record_decision(a, true);
         let ready_a = replica.next_apply().expect("A is ready");
         assert_eq!(ready_a.txn, a);
@@ -1776,25 +1796,25 @@ mod tests {
         let (e, d, t) = (txn(10), txn(20), txn(30));
         for (x, version) in [(e, 1), (d, 2), (t, 3)] {
             replica
-                .preaccept(x, vec![key.clone()], vec![event("k", version)])
+                .preaccept(x, 0, vec![key.clone()], vec![event("k", version)])
                 .unwrap();
         }
 
         // D's Apply arrives before its Commit.
         replica.record_decision(d, true);
         assert!(!replica.decided(d), "not committed here yet");
-        replica.commit(d, d.0, vec![e], vec![event("k", 2)], vec![], NodeId(0));
+        replica.commit(d, 0, d.0, vec![e], vec![event("k", 2)], vec![], NodeId(0));
         assert!(replica.decided(d));
 
         // T's read waits on D, D's apply on E, which only pre-accepted.
-        replica.commit(t, t.0, vec![d], vec![event("k", 3)], vec![], NodeId(0));
+        replica.commit(t, 0, t.0, vec![d], vec![event("k", 3)], vec![], NodeId(0));
         assert!(replica.next_apply().is_none());
         assert!(replica.next_read().is_none());
         assert_eq!(replica.blocker(t), Some(d));
         assert_eq!(replica.undecided_blocker(t), Some(e), "past D, to E");
 
         // E applies; D's apply then fails: T's read waits on that alone.
-        replica.commit(e, e.0, vec![], vec![event("k", 1)], vec![], NodeId(0));
+        replica.commit(e, 0, e.0, vec![], vec![event("k", 1)], vec![], NodeId(0));
         replica.record_decision(e, true);
         assert_eq!(replica.next_apply().map(|ready| ready.txn), Some(e));
         replica.mark_applied(e, false);
@@ -1824,11 +1844,11 @@ mod tests {
         };
 
         replica
-            .preaccept(t, vec![key.clone()], vec![provisional.clone()])
+            .preaccept(t, 0, vec![key.clone()], vec![provisional.clone()])
             .unwrap();
         assert_eq!(replica.stable_event_micros(cutoff), 1_000);
 
-        replica.commit(t, t.0, vec![], vec![provisional], vec![], NodeId(0));
+        replica.commit(t, 0, t.0, vec![], vec![provisional], vec![], NodeId(0));
         replica.record_decision(t, true);
         let ready = replica.next_apply().expect("ready to apply");
         replica.mark_applied(ready.txn, false);
@@ -1838,9 +1858,17 @@ mod tests {
     /// Applies `txn` end to end (preaccept → commit → decide → apply) on `key`.
     fn apply(replica: &mut Replica, t: TxnId, key: &Key, version: u16) {
         replica
-            .preaccept(t, vec![key.clone()], vec![event("k", version)])
+            .preaccept(t, 0, vec![key.clone()], vec![event("k", version)])
             .unwrap();
-        replica.commit(t, t.0, vec![], vec![event("k", version)], vec![], NodeId(0));
+        replica.commit(
+            t,
+            0,
+            t.0,
+            vec![],
+            vec![event("k", version)],
+            vec![],
+            NodeId(0),
+        );
         replica.record_decision(t, true);
         let ready = replica.next_apply().expect("ready to apply");
         assert_eq!(ready.txn, t);
@@ -1871,7 +1899,7 @@ mod tests {
         // conflict from the compacted-away one.
         let b = txn(30);
         let (_, deps) = replica
-            .preaccept(b, vec![key.clone()], vec![event("k", 2)])
+            .preaccept(b, 0, vec![key.clone()], vec![event("k", 2)])
             .unwrap();
         assert!(
             deps.is_empty(),
@@ -1890,7 +1918,7 @@ mod tests {
         // A second transaction stays un-applied, below the requested watermark.
         let pending = txn(10);
         replica
-            .preaccept(pending, vec![key.clone()], vec![event("k", 2)])
+            .preaccept(pending, 0, vec![key.clone()], vec![event("k", 2)])
             .unwrap();
 
         replica.compact(txn(20).0);
@@ -1920,14 +1948,14 @@ mod tests {
         let c = txn(10);
         let d = txn(20);
         replica
-            .preaccept(c, vec![key.clone()], vec![event("k", 1)])
+            .preaccept(c, 0, vec![key.clone()], vec![event("k", 1)])
             .unwrap();
         replica
-            .preaccept(d, vec![key.clone()], vec![event("k", 2)])
+            .preaccept(d, 0, vec![key.clone()], vec![event("k", 2)])
             .unwrap();
 
         // Apply and compact away C.
-        replica.commit(c, c.0, vec![], vec![event("k", 1)], vec![], NodeId(0));
+        replica.commit(c, 0, c.0, vec![], vec![event("k", 1)], vec![], NodeId(0));
         replica.record_decision(c, true);
         assert_eq!(replica.next_apply().expect("C ready").txn, c);
         replica.mark_applied(c, false);
@@ -1935,7 +1963,7 @@ mod tests {
         assert!(replica.snapshot(c).is_none());
 
         // D commits with C still in its deps (the quorum union); it must apply.
-        replica.commit(d, d.0, vec![c], vec![event("k", 2)], vec![], NodeId(0));
+        replica.commit(d, 0, d.0, vec![c], vec![event("k", 2)], vec![], NodeId(0));
         replica.record_decision(d, true);
         let ready = replica
             .next_apply()
@@ -1953,6 +1981,7 @@ mod tests {
         let (a, b) = (txn(10), txn(20));
         replica.commit(
             b,
+            0,
             b.0,
             vec![a],
             vec![event("k", 2)],
@@ -1964,6 +1993,7 @@ mod tests {
         assert!(replica.is_blocked(b));
 
         let imported = CommandState {
+            epoch: 0,
             txn: a,
             status: Status::Applied,
             promised: Ballot(a.0),
@@ -1990,6 +2020,7 @@ mod tests {
         let (a, b) = (txn(10), txn(20));
         replica.commit(
             b,
+            0,
             b.0,
             vec![a],
             vec![event("k", 2)],
@@ -1999,7 +2030,7 @@ mod tests {
         assert!(replica.next_read().is_none(), "B waits for A");
         assert!(replica.is_blocked(b));
 
-        replica.commit(a, a.0, vec![], vec![event("k", 1)], vec![key], NodeId(0));
+        replica.commit(a, 0, a.0, vec![], vec![event("k", 1)], vec![key], NodeId(0));
         replica.record_decision(a, true);
         assert_eq!(replica.next_apply().expect("A is ready").txn, a);
         replica.mark_applied(a, false);
@@ -2014,10 +2045,11 @@ mod tests {
         let key = Key("k".into());
         let (a, b) = (txn(10), txn(20));
         replica
-            .preaccept(a, vec![key.clone()], vec![event("k", 1)])
+            .preaccept(a, 0, vec![key.clone()], vec![event("k", 1)])
             .unwrap();
         replica.commit(
             b,
+            0,
             b.0,
             vec![a],
             vec![event("k", 2)],
@@ -2031,6 +2063,7 @@ mod tests {
         // A's slow path raised it past B.
         replica.commit(
             a,
+            0,
             txn(30).0,
             vec![b],
             vec![event("k", 1)],
@@ -2047,7 +2080,15 @@ mod tests {
         let mut replica = Replica::new();
         let key = Key("k".into());
         let (a, b) = (txn(10), txn(20));
-        replica.commit(b, b.0, vec![a], vec![event("k", 2)], vec![key], NodeId(0));
+        replica.commit(
+            b,
+            0,
+            b.0,
+            vec![a],
+            vec![event("k", 2)],
+            vec![key],
+            NodeId(0),
+        );
         replica.record_decision(b, true);
         assert!(replica.next_apply().is_none(), "B waits for A");
         assert!(replica.is_blocked(b));
@@ -2067,6 +2108,7 @@ mod tests {
         let (a, b) = (txn(10), txn(20));
         replica.commit(
             b,
+            0,
             b.0,
             vec![a],
             vec![event("k", 2)],
@@ -2080,6 +2122,7 @@ mod tests {
         // A's decision, learned: it executes after B.
         replica.commit(
             a,
+            0,
             txn(30).0,
             vec![b],
             vec![event("k", 1)],
@@ -2103,12 +2146,12 @@ mod tests {
 
         // A arrives via Accept only — with its keys.
         replica
-            .accept(a, Ballot(a.0), a.0, vec![], vec![key.clone()])
+            .accept(a, Ballot(a.0), 0, a.0, vec![], vec![key.clone()])
             .expect("accepted");
 
         // A later conflicting transaction must witness A as a dependency.
         let (_, deps) = replica
-            .preaccept(b, vec![key.clone()], vec![event("k", 1)])
+            .preaccept(b, 0, vec![key.clone()], vec![event("k", 1)])
             .unwrap();
         assert_eq!(
             deps,
@@ -2128,10 +2171,11 @@ mod tests {
         let b = txn(20);
 
         replica
-            .accept(a, Ballot(a.0), a.0, vec![], vec![])
+            .accept(a, Ballot(a.0), 0, a.0, vec![], vec![])
             .expect("accepted");
         replica.commit(
             a,
+            0,
             a.0,
             vec![],
             vec![event("k", 1)],
@@ -2140,7 +2184,7 @@ mod tests {
         );
 
         let (_, deps) = replica
-            .preaccept(b, vec![key.clone()], vec![event("k", 2)])
+            .preaccept(b, 0, vec![key.clone()], vec![event("k", 2)])
             .unwrap();
         assert_eq!(deps, vec![a], "Commit must index the keys it carries");
     }
@@ -2153,9 +2197,9 @@ mod tests {
         let key = Key("k".into());
         let a = txn(10);
         replica
-            .preaccept(a, vec![key.clone()], vec![event("k", 1)])
+            .preaccept(a, 0, vec![key.clone()], vec![event("k", 1)])
             .unwrap();
-        replica.commit(a, a.0, vec![], vec![event("k", 1)], vec![], NodeId(0));
+        replica.commit(a, 0, a.0, vec![], vec![event("k", 1)], vec![], NodeId(0));
         replica.record_decision(a, true);
 
         assert_eq!(replica.next_apply().expect("ready").txn, a);
@@ -2177,16 +2221,16 @@ mod tests {
         let x = txn(10);
         let t = txn(20);
         replica
-            .preaccept(x, vec![key.clone()], vec![event("k", 1)])
+            .preaccept(x, 0, vec![key.clone()], vec![event("k", 1)])
             .unwrap();
         let (t_at, t_deps) = replica
-            .preaccept(t, vec![key.clone()], vec![event("k", 1)])
+            .preaccept(t, 0, vec![key.clone()], vec![event("k", 1)])
             .unwrap();
         assert_eq!((t_at, t_deps), (t.0, vec![x]), "T stands at its own t0");
 
         let raised = txn(31).0;
         let deps = replica
-            .accept(x, Ballot(x.0), raised, vec![], vec![key.clone()])
+            .accept(x, Ballot(x.0), 0, raised, vec![], vec![key.clone()])
             .expect("accepted");
         assert_eq!(
             deps,
@@ -2195,8 +2239,8 @@ mod tests {
         );
 
         // Committed as agreed, T (at 20) executes first and X waits for it.
-        replica.commit(t, t.0, vec![x], vec![event("k", 1)], vec![], NodeId(0));
-        replica.commit(x, raised, deps, vec![event("k", 1)], vec![], NodeId(0));
+        replica.commit(t, 0, t.0, vec![x], vec![event("k", 1)], vec![], NodeId(0));
+        replica.commit(x, 0, raised, deps, vec![event("k", 1)], vec![], NodeId(0));
         assert_eq!(replica.next_read().expect("T is ready").txn, t);
         assert!(replica.next_read().is_none(), "X waits for T to apply");
         replica.record_decision(t, true);
@@ -2214,14 +2258,14 @@ mod tests {
         let t = txn(20);
         let later = txn(40);
         replica
-            .preaccept(t, vec![key.clone()], vec![event("k", 1)])
+            .preaccept(t, 0, vec![key.clone()], vec![event("k", 1)])
             .unwrap();
         replica
-            .preaccept(later, vec![key.clone()], vec![event("k", 1)])
+            .preaccept(later, 0, vec![key.clone()], vec![event("k", 1)])
             .unwrap();
 
         let deps = replica
-            .accept(x, Ballot(x.0), txn(31).0, vec![], vec![key.clone()])
+            .accept(x, Ballot(x.0), 0, txn(31).0, vec![], vec![key.clone()])
             .expect("accepted");
         assert_eq!(
             deps,
@@ -2248,26 +2292,26 @@ mod tests {
         let t = txn(20);
         let b = ballot(50, 1);
 
-        let report = replica.recover(t, b, vec![], vec![]).expect("promised");
+        let report = replica.recover(t, b, 0, vec![], vec![]).expect("promised");
         assert!(!report.known);
         assert_eq!(
-            replica.preaccept(t, vec![key.clone()], vec![event("k", 1)]),
+            replica.preaccept(t, 0, vec![key.clone()], vec![event("k", 1)]),
             Err(Refusal::Promised(b)),
             "the original PreAccept must not get a vote the recovery did not see"
         );
         assert_eq!(
-            replica.accept(t, Ballot(t.0), t.0, vec![], vec![key.clone()]),
+            replica.accept(t, Ballot(t.0), 0, t.0, vec![], vec![key.clone()]),
             Err(Refusal::Promised(b)),
             "nor can its Accept win here"
         );
         assert_eq!(
-            replica.recover(t, ballot(40, 2), vec![], vec![]).err(),
+            replica.recover(t, ballot(40, 2), 0, vec![], vec![]).err(),
             Some(b),
             "a lower recovery is refused too"
         );
         // The recovery's own Accept, at its ballot, goes through.
         replica
-            .accept(t, b, t.0, vec![], vec![key])
+            .accept(t, b, 0, t.0, vec![], vec![key])
             .expect("the recovery's own Accept");
         assert_eq!(replica.status(t), Some(Status::Accepted));
     }
@@ -2283,13 +2327,13 @@ mod tests {
         let b = ballot(50, 1);
 
         let report = replica
-            .recover(t, b, vec![key.clone()], vec![event("k", 1)])
+            .recover(t, b, 0, vec![key.clone()], vec![event("k", 1)])
             .expect("promised");
         assert!(report.known);
         assert_eq!(report.status, Status::PreAccepted);
         assert_eq!(report.execute_at, t.0, "no conflict here: the vote is t0");
         assert_eq!(
-            replica.preaccept(t, vec![key], vec![event("k", 1)]),
+            replica.preaccept(t, 0, vec![key], vec![event("k", 1)]),
             Err(Refusal::Promised(b))
         );
     }
@@ -2304,14 +2348,24 @@ mod tests {
         let x = txn(10);
         let t = txn(20);
         replica
-            .preaccept(x, vec![key.clone()], vec![event("k", 1)])
+            .preaccept(x, 0, vec![key.clone()], vec![event("k", 1)])
             .unwrap();
-        replica.commit(x, txn(31).0, vec![], vec![event("k", 1)], vec![], NodeId(0));
+        replica.commit(
+            x,
+            0,
+            txn(31).0,
+            vec![],
+            vec![event("k", 1)],
+            vec![],
+            NodeId(0),
+        );
         replica
-            .preaccept(t, vec![key.clone()], vec![event("k", 2)])
+            .preaccept(t, 0, vec![key.clone()], vec![event("k", 2)])
             .unwrap();
 
-        let report = replica.recover(t, ballot(50, 1), vec![], vec![]).unwrap();
+        let report = replica
+            .recover(t, ballot(50, 1), 0, vec![], vec![])
+            .unwrap();
         assert!(report.superseding_rejects);
         assert!(!report.wait);
     }
@@ -2326,16 +2380,18 @@ mod tests {
         let x = txn(10);
         let t = txn(20);
         replica
-            .preaccept(x, vec![key.clone()], vec![event("k", 1)])
+            .preaccept(x, 0, vec![key.clone()], vec![event("k", 1)])
             .unwrap();
         replica
-            .accept(x, Ballot(x.0), txn(31).0, vec![], vec![key.clone()])
+            .accept(x, Ballot(x.0), 0, txn(31).0, vec![], vec![key.clone()])
             .unwrap();
         replica
-            .preaccept(t, vec![key.clone()], vec![event("k", 2)])
+            .preaccept(t, 0, vec![key.clone()], vec![event("k", 2)])
             .unwrap();
 
-        let report = replica.recover(t, ballot(50, 1), vec![], vec![]).unwrap();
+        let report = replica
+            .recover(t, ballot(50, 1), 0, vec![], vec![])
+            .unwrap();
         assert!(!report.superseding_rejects);
         assert!(report.wait);
     }
@@ -2347,7 +2403,9 @@ mod tests {
     fn blind_promises_are_dropped_below_the_watermark() {
         let mut replica = Replica::new();
         let t = txn(20);
-        replica.recover(t, ballot(50, 1), vec![], vec![]).unwrap();
+        replica
+            .recover(t, ballot(50, 1), 0, vec![], vec![])
+            .unwrap();
         assert!(!replica.has_unapplied());
         assert_eq!(replica.applied_through(txn(100).0), txn(100).0);
 
@@ -2367,7 +2425,7 @@ mod tests {
         let b = ballot(50, 1);
 
         let report = replica
-            .recover_routed(t, b, vec![key.clone()], vec![event("k", 1)])
+            .recover_routed(t, b, 0, vec![key.clone()], vec![event("k", 1)])
             .expect("promised");
         assert!(matches!(
             report,
@@ -2376,18 +2434,18 @@ mod tests {
         assert_eq!(replica.status(t), None, "nothing was pre-accepted");
         assert_eq!(replica.unknown_promise(t), Some(b));
         assert_eq!(
-            replica.preaccept(t, vec![key.clone()], vec![event("k", 1)]),
+            replica.preaccept(t, 0, vec![key.clone()], vec![event("k", 1)]),
             Err(Refusal::Promised(b))
         );
         assert!(matches!(
-            replica.recover_routed(t, ballot(40, 2), vec![], vec![]),
+            replica.recover_routed(t, ballot(40, 2), 0, vec![], vec![]),
             Err(promised) if promised == b
         ));
 
         let old = txn(5);
         replica.compact(txn(10).0);
         assert!(matches!(
-            replica.recover_routed(old, b, vec![key], vec![]),
+            replica.recover_routed(old, b, 0, vec![key], vec![]),
             Ok(RoutedRecovery::NotWitnessed { redundant: true })
         ));
         assert_eq!(replica.unknown_promise(old), None);
@@ -2405,15 +2463,16 @@ mod tests {
         assert!(replica.compacted(t));
 
         assert_eq!(
-            replica.preaccept(t, vec![key.clone()], vec![event("k", 1)]),
+            replica.preaccept(t, 0, vec![key.clone()], vec![event("k", 1)]),
             Err(Refusal::Compacted)
         );
         assert_eq!(
-            replica.accept(t, ballot(50, 1), t.0, vec![], vec![key.clone()]),
+            replica.accept(t, ballot(50, 1), 0, t.0, vec![], vec![key.clone()]),
             Err(Refusal::Compacted)
         );
         replica.commit(
             t,
+            0,
             t.0,
             vec![],
             vec![event("k", 1)],
@@ -2423,7 +2482,7 @@ mod tests {
         assert_eq!(replica.status(t), None, "nothing was re-created");
         assert_eq!(replica.applied_result(t), None);
         assert!(matches!(
-            replica.recover_unrouted(t, ballot(50, 1), vec![key], vec![event("k", 1)]),
+            replica.recover_unrouted(t, ballot(50, 1), 0, vec![key], vec![event("k", 1)]),
             Ok(RoutedRecovery::NotWitnessed { redundant: true })
         ));
         assert_eq!(replica.status(t), None, "recovery pre-accepted nothing");
@@ -2453,6 +2512,7 @@ mod tests {
         assert_eq!(
             replica.unsaved_decisions(),
             vec![DecisionRecord {
+                epoch: 0,
                 txn: routed,
                 execute_at: routed.0,
                 conflict: false,
@@ -2463,8 +2523,8 @@ mod tests {
         assert!(replica.unsaved_decisions().is_empty());
 
         for report in [
-            replica.recover_routed(routed, ballot(50, 1), vec![], vec![]),
-            replica.recover_unrouted(routed, ballot(50, 1), vec![key.clone()], vec![]),
+            replica.recover_routed(routed, ballot(50, 1), 0, vec![], vec![]),
+            replica.recover_unrouted(routed, ballot(50, 1), 0, vec![key.clone()], vec![]),
         ] {
             let Ok(RoutedRecovery::Known(state)) = report else {
                 panic!("a recorded decision is reported");
@@ -2474,11 +2534,12 @@ mod tests {
             assert!(state.events.is_empty() && state.deps.is_empty());
         }
         assert!(matches!(
-            replica.recover_routed(single, ballot(50, 1), vec![], vec![]),
+            replica.recover_routed(single, ballot(50, 1), 0, vec![], vec![]),
             Ok(RoutedRecovery::NotWitnessed { redundant: true })
         ));
         replica.commit(
             routed,
+            0,
             routed.0,
             vec![],
             vec![event("k", 1)],
@@ -2505,13 +2566,13 @@ mod tests {
         let route = vec![key.clone(), Key("other".into())];
         let t = txn(5);
         replica
-            .preaccept(t, vec![key.clone()], vec![event("k", 1)])
+            .preaccept(t, 0, vec![key.clone()], vec![event("k", 1)])
             .unwrap();
         assert!(replica.set_route(t, &route));
         assert!(replica.invalidate(t));
         replica.compact(txn(10).0);
         let Ok(RoutedRecovery::Known(state)) =
-            replica.recover_routed(t, ballot(50, 1), vec![], vec![])
+            replica.recover_routed(t, ballot(50, 1), 0, vec![], vec![])
         else {
             panic!("a recorded decision is reported");
         };
@@ -2538,6 +2599,7 @@ mod tests {
 
     fn applied_command(t: TxnId, key: &Key) -> CommandState {
         CommandState {
+            epoch: 0,
             txn: t,
             status: Status::Applied,
             promised: Ballot(t.0),
@@ -2563,10 +2625,10 @@ mod tests {
         let t = txn(20);
         // T is witnessed before X here, so T's (local) deps lack X.
         replica
-            .preaccept(t, vec![key.clone()], vec![event("k", 1)])
+            .preaccept(t, 0, vec![key.clone()], vec![event("k", 1)])
             .unwrap();
         replica
-            .preaccept(x, vec![key.clone()], vec![event("k", 1)])
+            .preaccept(x, 0, vec![key.clone()], vec![event("k", 1)])
             .unwrap();
         assert!(replica.set_route(t, &[key.clone(), Key("other".into())]));
         assert!(
@@ -2584,14 +2646,16 @@ mod tests {
             "T no longer awaits recovery"
         );
 
-        let report = replica.recover(x, ballot(50, 1), vec![], vec![]).unwrap();
+        let report = replica
+            .recover(x, ballot(50, 1), 0, vec![], vec![])
+            .unwrap();
         assert!(
             !report.superseding_rejects,
             "an invalidated command proves nothing about X's fast path"
         );
 
         // A committed command is never invalidated.
-        replica.commit(x, x.0, vec![], vec![event("k", 1)], vec![], NodeId(0));
+        replica.commit(x, 0, x.0, vec![], vec![event("k", 1)], vec![], NodeId(0));
         assert!(!replica.invalidate(x));
 
         // The route leaves with the command, into its decision record.
@@ -2615,13 +2679,13 @@ mod tests {
         let b = ballot(50, 1);
         replica.restore_promise(t, b);
         assert_eq!(
-            replica.preaccept(t, vec![key.clone()], vec![event("k", 1)]),
+            replica.preaccept(t, 0, vec![key.clone()], vec![event("k", 1)]),
             Err(Refusal::Promised(b))
         );
 
         let known = txn(30);
         replica
-            .preaccept(known, vec![key], vec![event("k", 2)])
+            .preaccept(known, 0, vec![key], vec![event("k", 2)])
             .unwrap();
         replica.restore_promise(known, b);
         assert_eq!(replica.unknown_promise(known), None);
@@ -2640,9 +2704,9 @@ mod tests {
         let key = Key("k".into());
         let a = txn(10);
         replica
-            .preaccept(a, vec![key.clone()], vec![event("k", 1)])
+            .preaccept(a, 0, vec![key.clone()], vec![event("k", 1)])
             .unwrap();
-        replica.commit(a, a.0, vec![], vec![event("k", 1)], vec![], NodeId(0));
+        replica.commit(a, 0, a.0, vec![], vec![event("k", 1)], vec![], NodeId(0));
         assert_eq!(replica.read_result(a), None, "not read yet");
 
         assert_eq!(replica.next_read().expect("ready to read").txn, a);
@@ -2673,6 +2737,7 @@ mod tests {
         let key = Key("k".into());
         let a = txn(10);
         replica.restore(CommandState {
+            epoch: 0,
             txn: a,
             status: Status::Reading,
             promised: Ballot(a.0),
@@ -2711,9 +2776,9 @@ mod tests {
         let mut ev = event(&key.0, 1);
         ev.data = vec![0; data];
         replica
-            .preaccept(t, vec![key.clone()], vec![ev.clone()])
+            .preaccept(t, 0, vec![key.clone()], vec![ev.clone()])
             .unwrap();
-        replica.commit(t, execute_at.0, vec![], vec![ev], vec![key], NodeId(0));
+        replica.commit(t, 0, execute_at.0, vec![], vec![ev], vec![key], NodeId(0));
         replica.record_decision(t, true);
         while let Some(ready) = replica.next_apply() {
             replica.mark_applied(ready.txn, false);

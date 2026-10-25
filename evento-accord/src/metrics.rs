@@ -76,6 +76,15 @@ pub struct Metrics {
     /// Config-Paxos promises and accepts this node withheld because it lost
     /// a journal under this node id: it abstains from config Paxos for good.
     pub config_votes_withheld: AtomicU64,
+    /// PreAccepts and read probes refused because the coordinator planned
+    /// them under an older layout and a key they touch changed replicas
+    /// since: it planned before it installed the change (it retries under
+    /// the new layout).
+    pub votes_retired: AtomicU64,
+    /// Messages about a transaction planned under an epoch this node has not
+    /// installed yet: left unanswered while it fetches the metadata it is
+    /// missing from the sender.
+    pub messages_future_epoch: AtomicU64,
 }
 
 impl Metrics {
@@ -175,6 +184,16 @@ impl Metrics {
         self.votes_future_dated.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records a PreAccept or read probe refused for a layout retired since.
+    pub fn record_vote_retired(&self) {
+        self.votes_retired.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a message left unanswered for a future epoch.
+    pub fn record_message_future_epoch(&self) {
+        self.messages_future_epoch.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Records a config-Paxos vote withheld after a lost journal.
     pub fn record_config_vote_withheld(&self) {
         self.config_votes_withheld.fetch_add(1, Ordering::Relaxed);
@@ -215,6 +234,8 @@ impl Metrics {
             amnesia_joins_refused: self.amnesia_joins_refused.load(Ordering::Relaxed),
             votes_future_dated: self.votes_future_dated.load(Ordering::Relaxed),
             config_votes_withheld: self.config_votes_withheld.load(Ordering::Relaxed),
+            votes_retired: self.votes_retired.load(Ordering::Relaxed),
+            messages_future_epoch: self.messages_future_epoch.load(Ordering::Relaxed),
         }
     }
 }
@@ -246,6 +267,8 @@ pub struct MetricsSnapshot {
     pub amnesia_joins_refused: u64,
     pub votes_future_dated: u64,
     pub config_votes_withheld: u64,
+    pub votes_retired: u64,
+    pub messages_future_epoch: u64,
 }
 
 impl MetricsSnapshot {
@@ -253,7 +276,7 @@ impl MetricsSnapshot {
     /// source of truth for both [`to_prometheus`](Self::to_prometheus) and
     /// [`to_prometheus_labeled`](Self::to_prometheus_labeled); add a counter here and
     /// both renderings pick it up.
-    fn counters(&self) -> [(&'static str, &'static str, u64); 22] {
+    fn counters(&self) -> [(&'static str, &'static str, u64); 24] {
         [
             (
                 "accord_writes_committed_total",
@@ -364,6 +387,16 @@ impl MetricsSnapshot {
                 "accord_config_votes_withheld_total",
                 "Config-Paxos votes withheld by a node that lost a journal under its node id.",
                 self.config_votes_withheld,
+            ),
+            (
+                "accord_votes_retired_total",
+                "PreAccepts and read probes refused: planned under a layout whose keys changed replicas since.",
+                self.votes_retired,
+            ),
+            (
+                "accord_messages_future_epoch_total",
+                "Messages about a transaction planned under an epoch not installed here yet (metadata fetched).",
+                self.messages_future_epoch,
             ),
         ]
     }

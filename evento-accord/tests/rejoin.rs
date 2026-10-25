@@ -200,6 +200,7 @@ fn acc_key() -> Key {
 
 fn preaccept(txn: TxnId) -> Message {
     Message::PreAccept {
+        epoch: 0,
         txn,
         keys: vec![acc_key()],
         events: vec![event("acc", 1)],
@@ -295,6 +296,7 @@ async fn a_rejoined_replica_keeps_its_preaccept_vote() {
     t.send(
         8,
         Message::BeginRecovery {
+            epoch: 0,
             txn,
             ballot: b,
             keys: vec![acc_key()],

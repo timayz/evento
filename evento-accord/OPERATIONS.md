@@ -195,13 +195,19 @@ refuses anything else before a vote, and a node never installs it.
   nodes bootstrap only their range. *Note:* GC of a moved range from old owners is not
   implemented (evento's event store is append-only) — old replicas simply stop being
   contacted for it.
-- **No transaction in flight across a layout change (until #288 ships).** An epoch
-  change does not yet hand over the transactions in flight across it: replicas judge
-  ownership, and recoveries plan, by the layout installed when a message lands, not
-  by the one the transaction was coordinated under. So, before `change_topology`:
-  1. stop writes to the keys that move;
+- **No transaction in flight across a layout change (until #288 ships).** A
+  transaction is voted on and recovered under the layout it was coordinated under,
+  but an epoch change does not yet drain the transactions in flight across it: new
+  owners can bootstrap before the old ones finish them, and a quorum of the new
+  layout need not meet a commit quorum of the old one. The keys concerned are those
+  whose replica set changes: the keys that move to another shard, and every key of
+  a shard that gains or loses a node. So, before `change_topology`:
+  1. stop writes to those keys;
   2. let compaction pass them: every replica's `command_count()` back to zero;
   3. change the layout, then resume writes.
+
+  A change must be for the next epoch: `change_topology` refuses one that skips
+  an epoch.
 
   Re-sharding among existing members (a member gaining a range it did not hold) is
   unsupported: only a joining node bootstraps, so the member gets no data for the

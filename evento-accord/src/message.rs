@@ -96,6 +96,10 @@ pub enum Status {
 pub struct CommandState {
     /// Transaction identity (`t0`); its node component is the coordinator.
     pub txn: TxnId,
+    /// The topology epoch the transaction was coordinated under: its keys are
+    /// owned, its quorums counted and its recovery planned by that epoch's
+    /// layout, whatever this replica installed since.
+    pub epoch: u64,
     /// Phase reached on this replica.
     pub status: Status,
     /// Highest ballot promised (advanced by Accept and Recover); rejects any
@@ -163,8 +167,12 @@ pub struct SyncKnown {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Message {
     /// Coordinator → replicas: propose `txn` (= `t0`) for the given keys/events.
+    /// `epoch` is the layout the coordinator planned the transaction under
+    /// (every message about it carries the same one): replicas judge
+    /// ownership, and recoveries plan, by that layout.
     PreAccept {
         txn: TxnId,
+        epoch: u64,
         keys: Vec<Key>,
         #[serde(with = "wire_events")]
         events: Vec<Event>,
@@ -185,6 +193,7 @@ pub enum Message {
     Accept {
         txn: TxnId,
         ballot: Ballot,
+        epoch: u64,
         execute_at: Timestamp,
         deps: Vec<TxnId>,
         keys: Vec<Key>,
@@ -206,6 +215,7 @@ pub enum Message {
     /// commit (original coordinator or recoverer).
     Commit {
         txn: TxnId,
+        epoch: u64,
         execute_at: Timestamp,
         deps: Vec<TxnId>,
         keys: Vec<Key>,
@@ -232,6 +242,9 @@ pub enum Message {
         /// The ballot this report answers, so the recovery coordinator can drop
         /// stale responses from an earlier attempt.
         ballot: Ballot,
+        /// The epoch the replica holds the transaction under (see
+        /// [`BeginRecoveryOk`](Message::BeginRecoveryOk)).
+        epoch: u64,
         /// False when this replica never witnessed the transaction.
         known: bool,
         status: Status,
@@ -355,7 +368,9 @@ pub enum Message {
     /// execution timestamp and dependencies a read at `txn`'s timestamp would
     /// witness over `key`. Unlike `PreAccept`, the replica stores **nothing** —
     /// it is a pure query of the conflict graph (a read-index probe).
-    ReadProbe { txn: TxnId, key: Key },
+    /// `epoch` is the layout the read coordinator probed under: a replica
+    /// for which `key`'s replica set changed since does not answer.
+    ReadProbe { txn: TxnId, epoch: u64, key: Key },
     /// Replica → read coordinator: the probe's witnessed `(execute_at, deps)`.
     ReadProbeOk {
         txn: TxnId,
@@ -382,6 +397,7 @@ pub enum Message {
     BeginRecovery {
         txn: TxnId,
         ballot: Ballot,
+        epoch: u64,
         keys: Vec<Key>,
         #[serde(with = "wire_events")]
         events: Vec<Event>,
@@ -389,10 +405,13 @@ pub enum Message {
     /// Replica → recovery coordinator: a [`RecoverOk`](Message::RecoverOk) plus
     /// `wait` — an earlier conflict was accepted to execute after `txn`'s `t0`
     /// without witnessing it, so until that conflict commits nobody can tell
-    /// whether `txn` could have taken the fast path.
+    /// whether `txn` could have taken the fast path. `epoch` is the layout
+    /// the replica holds the transaction under (meaningful when `known`), so
+    /// a node that learns the decision from it records it under that layout.
     BeginRecoveryOk {
         txn: TxnId,
         ballot: Ballot,
+        epoch: u64,
         known: bool,
         status: Status,
         accepted: Ballot,
@@ -755,6 +774,7 @@ mod tests {
             node: NodeId(2),
         });
         let command = CommandState {
+            epoch: 0,
             txn,
             status: Status::Applied,
             promised: Ballot(txn.0),
@@ -860,6 +880,7 @@ mod tests {
         let routed = Message::Routed {
             route: route.clone(),
             inner: Box::new(Message::PreAccept {
+                epoch: 0,
                 txn,
                 keys: vec![Key("a".into())],
                 events: vec![page_event()],
@@ -873,10 +894,12 @@ mod tests {
                 match *inner {
                     Message::PreAccept {
                         txn: t,
+                        epoch,
                         keys,
                         events,
                     } => {
                         assert_eq!(t, txn);
+                        assert_eq!(epoch, 0);
                         assert_eq!(keys, vec![Key("a".into())]);
                         assert_eq!(events[0].data, page_event().data);
                     }
