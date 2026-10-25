@@ -150,11 +150,17 @@ pub trait Topology: Send + Sync + 'static {
         None
     }
 
+    /// Installs `shards` as `epoch`'s layout, the slots spread evenly over
+    /// them ([`ShardMap::even`]): [`install_map`](Topology::install_map).
+    fn install(&self, epoch: u64, shards: Vec<Vec<NodeId>>) {
+        self.install_map(epoch, ShardMap::even(shards));
+    }
+
     /// Installs a decided epoch's shard layout. The newest installed epoch is
     /// the current layout; an older one is only kept for
     /// [`layout_at`](Topology::layout_at). The default is a no-op (fixed
     /// topologies do not change); [`DynamicTopology`] overrides it.
-    fn install(&self, _epoch: u64, _shards: Vec<Vec<NodeId>>) {}
+    fn install_map(&self, _epoch: u64, _map: ShardMap) {}
 
     /// Whether this topology can change epoch (reconfigure). The default is
     /// `false` (fixed topologies); [`DynamicTopology`] overrides it to `true`. The
@@ -165,43 +171,156 @@ pub trait Topology: Send + Sync + 'static {
     }
 }
 
+/// How many slots the key space is cut into: a key's slot is a stable hash
+/// of it modulo `SLOTS`, and a layout's slot table names each slot's shard
+/// ([`ShardMap`]). A change that adds or removes shards moves whole slots,
+/// as few as it can.
+pub const SLOTS: usize = 4096;
+
+/// The slot of `key`: a stable hash of it modulo [`SLOTS`].
+pub fn slot_of(key: &Key) -> usize {
+    // Stable across nodes AND toolchains (unlike DefaultHasher).
+    (stable_hash(key.0.as_bytes()) % SLOTS as u64) as usize
+}
+
+/// A shard layout as config Paxos decides it: each shard's replica set, and
+/// the slot table that maps keys to shards — `slots[slot]` is the shard of
+/// the keys in `slot` (see [`slot_of`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShardMap {
+    /// Shard id → replica set.
+    pub shards: Vec<Vec<NodeId>>,
+    /// Slot → shard id, [`SLOTS`] entries.
+    pub slots: Vec<u16>,
+}
+
+impl ShardMap {
+    /// `shards` with the slots spread evenly over them, in contiguous runs.
+    pub fn even(shards: Vec<Vec<NodeId>>) -> Self {
+        let n = shards.len().max(1);
+        let slots = (0..SLOTS).map(|slot| (slot * n / SLOTS) as u16).collect();
+        Self { shards, slots }
+    }
+
+    /// `shards` taking over this map's slots. With as many shards, every slot
+    /// stays in its shard. With another count, each shard ends with an even
+    /// share, keeping as many of its slots as that share allows (the first in
+    /// slot order); the slots it gives up, and a removed shard's, go to the
+    /// shards short of their share, lowest first. So only the slots a new shard
+    /// needs, or a removed one leaves, move.
+    pub fn rebalanced(&self, shards: Vec<Vec<NodeId>>) -> Self {
+        let n = shards.len();
+        if n == self.shards.len() || n == 0 {
+            return Self {
+                shards,
+                slots: self.slots.clone(),
+            };
+        }
+        let share = |shard: usize| SLOTS / n + usize::from(shard < SLOTS % n);
+        let mut slots = self.slots.clone();
+        let mut held = vec![0usize; n];
+        let mut free = Vec::new();
+        for (slot, &shard) in slots.iter().enumerate() {
+            let shard = shard as usize;
+            if shard < n && held[shard] < share(shard) {
+                held[shard] += 1;
+            } else {
+                free.push(slot);
+            }
+        }
+        let mut free = free.into_iter();
+        for (shard, count) in held.iter_mut().enumerate() {
+            while *count < share(shard) {
+                let slot = free.next().expect("the shares add up to every slot");
+                slots[slot] = shard as u16;
+                *count += 1;
+            }
+        }
+        Self { shards, slots }
+    }
+
+    /// Checks the layout ([`validate_layout`]) and its slot table: one entry
+    /// per slot, each naming a shard, and every shard owning a slot.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        validate_layout(&self.shards)?;
+        anyhow::ensure!(
+            self.slots.len() == SLOTS,
+            "a slot table has {SLOTS} entries, not {}",
+            self.slots.len()
+        );
+        let mut owns = vec![false; self.shards.len()];
+        for &shard in &self.slots {
+            let shard = shard as usize;
+            anyhow::ensure!(
+                shard < owns.len(),
+                "a slot names shard {shard}, of {}",
+                owns.len()
+            );
+            owns[shard] = true;
+        }
+        if let Some(idle) = owns.iter().position(|&owns| !owns) {
+            anyhow::bail!("shard {idle} owns no slot");
+        }
+        Ok(())
+    }
+}
+
 /// One epoch's shard layout, immutable once built: the replica set of every
-/// shard, each shard's fast-path electorate, and the quorum sizes they imply.
-/// Shards are disjoint, and a key's shard is a stable hash of the key modulo
-/// the shard count, so every node holding the same layout maps every key the
-/// same way.
+/// shard, each shard's fast-path electorate, the quorum sizes they imply, and
+/// the slot table mapping keys to shards ([`ShardMap`]). Shards are disjoint,
+/// so every node holding the same layout maps every key the same way.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Layout {
     epoch: u64,
     shards: Vec<Vec<NodeId>>,
     /// Shard id → its fast-path electorate, a subset of its replicas.
     electorates: Vec<Vec<NodeId>>,
+    /// Slot → shard id.
+    slots: Arc<[u16]>,
 }
 
 impl Layout {
-    /// A layout at `epoch` whose electorates are the whole shards.
+    /// A layout at `epoch` whose electorates are the whole shards, the slots
+    /// spread evenly over them ([`ShardMap::even`]).
     pub fn new(epoch: u64, shards: Vec<Vec<NodeId>>) -> Self {
-        let electorates = shards.clone();
+        Self::from_map(epoch, ShardMap::even(shards))
+    }
+
+    /// The layout `map` describes at `epoch`, whose electorates are the whole
+    /// shards.
+    pub fn from_map(epoch: u64, map: ShardMap) -> Self {
+        let electorates = map.shards.clone();
         Self {
             epoch,
-            shards,
+            shards: map.shards,
             electorates,
+            slots: map.slots.into(),
         }
     }
 
     /// A layout with `electorates[shard]` as each shard's fast-path
     /// electorate (asserted well-formed by whoever configured it).
-    fn with_electorates(
-        epoch: u64,
-        shards: Vec<Vec<NodeId>>,
-        electorates: Vec<Vec<NodeId>>,
-    ) -> Self {
-        debug_assert_eq!(shards.len(), electorates.len());
+    fn with_electorates(epoch: u64, map: ShardMap, electorates: Vec<Vec<NodeId>>) -> Self {
+        debug_assert_eq!(map.shards.len(), electorates.len());
         Self {
             epoch,
-            shards,
+            shards: map.shards,
             electorates,
+            slots: map.slots.into(),
         }
+    }
+
+    /// The shard map this layout was built from.
+    pub fn map(&self) -> ShardMap {
+        ShardMap {
+            shards: self.shards.clone(),
+            slots: self.slots.to_vec(),
+        }
+    }
+
+    /// Slot → shard id.
+    pub fn slots(&self) -> &[u16] {
+        &self.slots
     }
 
     /// The epoch this layout was decided for.
@@ -224,13 +343,12 @@ impl Layout {
         self.shards.iter().any(|shard| shard.contains(&node))
     }
 
-    /// The shard that owns `key`.
+    /// The shard that owns `key`: its slot's.
     pub fn shard_of(&self, key: &Key) -> ShardId {
         if self.shards.len() <= 1 {
             return 0;
         }
-        // Stable across nodes AND toolchains (unlike DefaultHasher).
-        (stable_hash(key.0.as_bytes()) as usize) % self.shards.len()
+        self.slots[slot_of(key)] as ShardId
     }
 
     /// `shard`'s replica set.
@@ -299,7 +417,7 @@ pub enum ConfigEntry {
     /// transition: what the change waited for before it installed `layout`.
     Active {
         /// The live layout.
-        layout: Vec<Vec<NodeId>>,
+        layout: ShardMap,
         /// The transition this entry ends, drained.
         drained: Option<Drained>,
     },
@@ -309,9 +427,9 @@ pub enum ConfigEntry {
     /// that installs `pending` follows once they have.
     Transition {
         /// The live layout, unchanged.
-        active: Vec<Vec<NodeId>>,
+        active: ShardMap,
         /// The layout the change installs next.
-        pending: Vec<Vec<NodeId>>,
+        pending: ShardMap,
         /// The epoch the change to `pending` was first decided at: a
         /// transition repeated at a later epoch keeps it.
         since: u64,
@@ -350,32 +468,33 @@ pub struct Drained {
 }
 
 impl ConfigEntry {
-    /// An entry that installs `layout`, with nothing to drain.
-    pub fn active(layout: Vec<Vec<NodeId>>) -> Self {
+    /// An entry that installs `shards`, the slots spread evenly over them
+    /// ([`ShardMap::even`]), with nothing to drain.
+    pub fn active(shards: Vec<Vec<NodeId>>) -> Self {
         Self::Active {
-            layout,
+            layout: ShardMap::even(shards),
             drained: None,
         }
     }
 
     /// The layout the transactions planned under this epoch are owned, voted
     /// on and recovered under: during a transition, the layout it keeps live.
-    pub fn live(&self) -> &[Vec<NodeId>] {
+    pub fn live(&self) -> &ShardMap {
         match self {
             Self::Active { layout, .. } => layout,
             Self::Transition { active, .. } => active,
         }
     }
 
-    /// Checks every layout the entry names (see [`validate_layout`]).
+    /// Checks every layout the entry names (see [`ShardMap::validate`]).
     pub fn validate(&self) -> anyhow::Result<()> {
         match self {
-            Self::Active { layout, .. } => validate_layout(layout),
+            Self::Active { layout, .. } => layout.validate(),
             Self::Transition {
                 active, pending, ..
             } => {
-                validate_layout(active)?;
-                validate_layout(pending)
+                active.validate()?;
+                pending.validate()
             }
         }
     }
@@ -964,7 +1083,11 @@ impl StaticTopology {
     pub fn with_fast_electorate(mut self, electorate: Vec<NodeId>) -> Self {
         let nodes = self.layout.shards()[0].clone();
         assert_valid_electorate(&electorate, &nodes);
-        self.layout = Arc::new(Layout::with_electorates(0, vec![nodes], vec![electorate]));
+        self.layout = Arc::new(Layout::with_electorates(
+            0,
+            ShardMap::even(vec![nodes]),
+            vec![electorate],
+        ));
         self
     }
 }
@@ -1032,7 +1155,7 @@ impl ShardedTopology {
         assert_valid_electorate(&electorate, &shards[shard]);
         let mut electorates = self.layout.electorates.clone();
         electorates[shard] = electorate;
-        self.layout = Arc::new(Layout::with_electorates(0, shards, electorates));
+        self.layout = Arc::new(Layout::with_electorates(0, self.layout.map(), electorates));
         self
     }
 }
@@ -1093,7 +1216,7 @@ impl DynamicTopology {
             panic!("invalid shard layout: {err}");
         }
         let regions = std::collections::HashMap::new();
-        let current = Arc::new(Self::derive(epoch, shards, &regions));
+        let current = Arc::new(Self::derive(epoch, ShardMap::even(shards), &regions));
         Self {
             this,
             state: RwLock::new(DynamicState {
@@ -1111,27 +1234,23 @@ impl DynamicTopology {
         self.regions = regions;
         let state = self.state.get_mut().expect("topology poisoned");
         for layout in state.history.values_mut() {
-            *layout = Arc::new(Self::derive(
-                layout.epoch(),
-                layout.shards().to_vec(),
-                &self.regions,
-            ));
+            *layout = Arc::new(Self::derive(layout.epoch(), layout.map(), &self.regions));
         }
         state.current = Arc::clone(state.history.values().next_back().expect("one layout"));
         self
     }
 
-    /// The layout of `shards` at `epoch`, with each shard's electorate
-    /// derived from the region tags (see `DynamicTopology::electorate_for`).
+    /// The layout of `map` at `epoch`, with each shard's electorate derived
+    /// from the region tags (see `DynamicTopology::electorate_for`).
     fn derive(
         epoch: u64,
-        shards: Vec<Vec<NodeId>>,
+        map: ShardMap,
         regions: &std::collections::HashMap<NodeId, RegionId>,
     ) -> Layout {
-        let electorates = (0..shards.len())
-            .map(|idx| Self::electorate_for(&shards, idx, regions))
+        let electorates = (0..map.shards.len())
+            .map(|idx| Self::electorate_for(&map.shards, idx, regions))
             .collect();
-        Layout::with_electorates(epoch, shards, electorates)
+        Layout::with_electorates(epoch, map, electorates)
     }
 
     /// Derives shard `idx`'s fast-path electorate from the layout + region tags:
@@ -1219,12 +1338,12 @@ impl Topology for DynamicTopology {
 
     /// Keeps `epoch`'s layout (the first one installed for an epoch wins) and
     /// makes it the current layout if it is newer than the current one.
-    fn install(&self, epoch: u64, shards: Vec<Vec<NodeId>>) {
+    fn install_map(&self, epoch: u64, map: ShardMap) {
         let mut state = self.state.write().expect("topology poisoned");
         if state.history.contains_key(&epoch) {
             return;
         }
-        let layout = Arc::new(Self::derive(epoch, shards, &self.regions));
+        let layout = Arc::new(Self::derive(epoch, map, &self.regions));
         state.history.insert(epoch, Arc::clone(&layout));
         if epoch > state.current.epoch() {
             state.current = layout;

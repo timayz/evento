@@ -39,9 +39,9 @@ pub mod tcp;
 pub mod transport;
 
 pub use api::{
-    snapshot_event_size, validate_layout, AcceptorRecord, AmnesiaFence, ConfigEntry, DataStore,
-    DecisionRecord, Drained, DynamicTopology, FenceRecord, Journal, Layout, MessageSink, RegionId,
-    ShardId, ShardedTopology, SnapshotPage, StaticTopology, Topology,
+    slot_of, snapshot_event_size, validate_layout, AcceptorRecord, AmnesiaFence, ConfigEntry,
+    DataStore, DecisionRecord, Drained, DynamicTopology, FenceRecord, Journal, Layout, MessageSink,
+    RegionId, ShardId, ShardMap, ShardedTopology, SnapshotPage, StaticTopology, Topology, SLOTS,
 };
 pub use clock::{Ballot, Clock, HybridLogicalClock, NodeId, Timestamp, TxnId, MAX_SKEW_MICROS};
 pub use executor::{AccordExecutor, ExecutorDataStore};

@@ -183,39 +183,50 @@ metadata log (config-Paxos); concurrent reconfigurations converge without a lead
 shard, and every node in exactly one shard (`validate_layout`): `change_topology`
 refuses anything else before a vote, and a node never installs it.
 
-- **Add a node:** start the new process with `begin_join()` (it buffers consensus
-  messages), drive `change_topology(epoch, new_layout)` from any current member, then
-  the joiner calls `join(contact)` with a contact of its shard to pull a snapshot +
-  recent commands and replay the buffer. (See `tests/membership.rs`,
-  `tests/transitions.rs`.)
+- **Add a node:** start the new process (with `start_recovery`) and `begin_join()` it
+  (it buffers consensus messages), drive `change_topology(epoch, new_layout)` from any
+  current member, then, once that returns, call `join(contact)` on the new node with a
+  contact of its shard. A node the change gave slots to copies them while the change
+  drains, and its `join` then returns `Ok(0)`: call it either way. (See
+  `tests/membership.rs`, `tests/transitions.rs`, `tests/resharding.rs`.)
 - **Remove a node:** `change_topology(epoch, smaller_layout)`; the smaller cluster keeps
   serving. Reconfiguration survives the coordinator crashing mid-change (another node
   completes it via `recover_topology`, and the recovery sweep) and works after founders
   have left (the acceptor set tracks current membership).
 - **Replace a node** (a dead one included): one change, `change_topology(epoch,
-  layout)`, with the new node joining as above once the change returns.
+  layout)`.
+- **Re-shard:** add or remove shards, or move a node to another shard, with one change.
+  Keys map to 4096 slots, and the layout's slot table maps slots to shards: a change
+  rebalances it, moving only the slots a new shard needs or a removed one leaves (a
+  split from two shards to three moves a third of the slots). Every node that gains
+  slots copies their events while the change drains, from a replica that held them:
+  plan for the copy's time on top of the drain. A change that would give a node back a
+  slot it replicated before is refused (its store still holds that slot's old events;
+  GC of a moved range from its old owners is not implemented — evento's event store is
+  append-only — so old replicas simply stop being contacted for it). A node that gains
+  slots copies their events with their original stamps: its own subscriptions do not
+  see them if they already read past those stamps.
 - **What a change does with writes in flight.** Every transaction is voted on and
-  recovered under the layout it was coordinated under. A change after which every
-  quorum of a shard still meets every quorum it had — one node added to a shard of
-  three, or one removed — installs at once, and writes go on. Any other change —
-  replacing a node, adding two at once, shrinking five to three — takes two epochs: a
-  *transition* keeps the old layout live while the writes in flight on the shard
-  drain, then the next epoch installs the new layout. While it drains, writes to that
-  shard's keys fail with `TopologyChanging` (`WriteError::Unavailable` through
+  recovered under the layout it was coordinated under. A change that only adds a node
+  to a shard of three, or removes one, installs at once, and writes go on. Any other
+  change — replacing a node, adding two at once, shrinking five to three, moving slots
+  or nodes between shards — takes two epochs: a *transition* keeps the old layout live
+  while the writes in flight on the keys it moves drain, and the nodes that gain slots
+  copy them; then the next epoch installs the new layout. Meanwhile, writes to the
+  moving keys fail with `TopologyChanging` (`WriteError::Unavailable` through
   `AccordExecutor`): plan for about `compaction_margin` + two clock skews + a few
-  `anti_entropy_interval`s — about 2 s with the defaults. The drain is driven by the
-  recovery sweep's watermark gossip and anti-entropy: run `start_recovery` on every
-  node. It waits for a slow quorum of every shard (a dead node does not hold it back,
-  with the default `peer_absence_limit` too). `change_topology` returns once the new
-  layout is installed, or fails after a while, leaving the sweep to install it. While
-  a transition drains, a change to another layout replaces it, and a change back to
-  the live layout cancels it.
-- **For now** a change keeps the shard count, keeps at least one node of every shard,
-  and moves no node to another shard (`change_topology` refuses anything else before a
-  vote): keys do not move between shards yet (#288). *Note:* GC of a moved range from
-  old owners is not implemented (evento's event store is append-only).
+  `anti_entropy_interval`s — about 2 s with the defaults — plus the copies. The
+  transition is driven by the recovery sweep's watermark gossip, anti-entropy and
+  copies: run `start_recovery` on every node, new ones included. It waits for a slow
+  quorum of every shard (a dead node does not hold it back, with the default
+  `peer_absence_limit` too) and for every node that gains slots (a dead one does:
+  replace it with another change). `change_topology` returns once the new layout is
+  installed, or fails after a while, leaving the sweep to install it. While a
+  transition drains, a change to another layout replaces it, and a change back to the
+  live layout cancels it.
 - A change must be for the next epoch: `change_topology` refuses one that skips an
   epoch.
+- A `join` goes through a replica of the joiner's own shard only.
 
 ---
 

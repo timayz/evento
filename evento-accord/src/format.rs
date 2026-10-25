@@ -71,10 +71,12 @@ pub const MAGIC: [u8; 2] = *b"Ac";
 /// (`CommandState::epoch`, `DecisionRecord::epoch`, and the `epoch` of every
 /// message about it). 5: a metadata-log entry, and every config-Paxos value,
 /// is a `ConfigEntry` (a layout change takes a transition and an activation),
-/// and `Message::Watermark` carries the sender's fence. No reader for older
-/// versions: evento-accord has not been released, so a journal of one is
-/// wiped and the node re-bootstrapped.
-pub const FORMAT_VERSION: u8 = 5;
+/// and `Message::Watermark` carries the sender's fence. 6: a layout is a
+/// `ShardMap` (replica sets and a slot table), and `Message::Watermark`
+/// carries the sender's copy report. No reader for older versions:
+/// evento-accord has not been released, so a journal of one is wiped and the
+/// node re-bootstrapped.
+pub const FORMAT_VERSION: u8 = 6;
 
 /// Length of the fixed header: `MAGIC (2) + version (1) + kind (1)`.
 const HEADER_LEN: usize = 4;

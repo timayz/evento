@@ -31,15 +31,25 @@
 //! waited for, so a transaction that also touches an unchanged shard is
 //! applied there too.
 //!
-//! **No drain needed.** A change after which every quorum of each changed
-//! shard still holds a replica of every quorum it had ([`quorums_intersect`]:
-//! adding one replica to a shard of three, or removing one) is installed at
-//! once. A transaction planned before it is voted on and recovered under its
-//! own layout, a coordinator that planned before it gets no new vote from a
-//! replica that installed it, and the two layouts' quorums meet: a
-//! transaction planned under the new layout witnesses, through a replica the
-//! two share, every one the old layout committed, and a replica that joins
-//! catches up through the replicas its shard kept.
+//! **No drain needed.** A change after which no slot moves to another shard,
+//! no replica gains a slot, and every quorum of each changed shard still holds
+//! a replica of every quorum it had ([`installs_at_once`]: adding a replica to
+//! a shard of three, or removing one) is installed at once. A transaction
+//! planned before it is voted on and recovered under its own layout, a
+//! coordinator that planned before it gets no new vote from a replica that
+//! installed it, and the two layouts' quorums meet: a transaction planned
+//! under the new layout witnesses, through a replica the two share, every one
+//! the old layout committed, and a new replica joins through one its shard
+//! kept (`Node::join`).
+//!
+//! **Copying the moved slots.** In a transition, every node that gains slots
+//! ([`gainers`]) copies them before the change installs its layout: from each
+//! shard that holds some, it picks a replica whose watermark report is past
+//! that shard's own drain point (the highest fence a slow quorum of it
+//! reported) and copies those slots' events. The keys are drained there and
+//! take no new write, so the copy is final: every write on them that commits
+//! is applied at that replica, and no other will. The activation waits until
+//! every gainer has its slots.
 //!
 //! **Activation.** The [`Active`](ConfigEntry::Active) entry carries the drain
 //! point and a clock floor above every moved write's execution
@@ -51,76 +61,101 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::api::{ConfigEntry, FenceRecord, Layout};
+use crate::api::{slot_of, ConfigEntry, FenceRecord, Layout};
 use crate::clock::{NodeId, Timestamp};
 use crate::message::Key;
 
-/// Shard index → whether its replica set differs in `next`: a key changes
-/// replicas between the two layouts exactly when its shard does. Both layouts
-/// have as many shards (see [`validate_change`]); if not, every shard counts
-/// as changed.
-pub(crate) fn changed_shards(live: &Layout, next: &Layout) -> Vec<bool> {
-    if live.shards().len() != next.shards().len() {
-        return vec![true; live.shards().len()];
-    }
-    live.shards()
+/// Whether `a` and `b` name the same replicas, in any order.
+fn same_replicas(a: &[NodeId], b: &[NodeId]) -> bool {
+    a.len() == b.len() && a.iter().all(|node| b.contains(node))
+}
+
+/// The distinct `(live shard, next shard)` pairs some slot goes between.
+fn slot_moves(live: &Layout, next: &Layout) -> Vec<(usize, usize)> {
+    let mut pairs: Vec<(usize, usize)> = live
+        .slots()
         .iter()
-        .zip(next.shards())
+        .zip(next.slots())
+        .map(|(&a, &b)| (a as usize, b as usize))
+        .collect();
+    pairs.sort_unstable();
+    pairs.dedup();
+    pairs
+}
+
+/// Slot → whether its replica set differs in `next`: a key changes replicas
+/// between the two layouts exactly when its slot does.
+pub(crate) fn changed_slots(live: &Layout, next: &Layout) -> Vec<bool> {
+    let changed: HashMap<(usize, usize), bool> = slot_moves(live, next)
+        .into_iter()
         .map(|(a, b)| {
-            let mut a = a.clone();
-            let mut b = b.clone();
-            a.sort_unstable();
-            b.sort_unstable();
-            a != b
+            let changed = !same_replicas(live.replicas_of(a), next.replicas_of(b));
+            ((a, b), changed)
         })
+        .collect();
+    live.slots()
+        .iter()
+        .zip(next.slots())
+        .map(|(&a, &b)| changed[&(a as usize, b as usize)])
         .collect()
 }
 
-/// Whether, for every shard, each slow quorum of `next` holds a replica of
-/// each slow quorum of `live`: a quorum of the new replica set holds at least
-/// `slow_q(next) − added` of the old replicas, and two subsets of the old set
-/// meet when their sizes add up past it. Then a change needs no drain (see
-/// the module docs). Both layouts have as many shards (see
-/// [`validate_change`]); if not, they do not intersect.
+/// Whether, for every slot, each slow quorum of its replicas in `next` holds
+/// a replica of each slow quorum of its replicas in `live`: a quorum of the
+/// new replica set holds at least `slow_q(next) − added` of the old replicas,
+/// and two subsets of the old set meet when their sizes add up past it. Then
+/// a change needs no drain (see the module docs).
 pub(crate) fn quorums_intersect(live: &Layout, next: &Layout) -> bool {
-    if live.shards().len() != next.shards().len() {
-        return false;
-    }
-    (0..live.shards().len()).all(|shard| {
-        let before = live.replicas_of(shard);
-        let after = next.replicas_of(shard);
+    slot_moves(live, next).into_iter().all(|(a, b)| {
+        let before = live.replicas_of(a);
+        let after = next.replicas_of(b);
         let added = after.iter().filter(|node| !before.contains(node)).count();
-        next.slow_quorum_of(shard).saturating_sub(added) + live.slow_quorum_of(shard) > before.len()
+        next.slow_quorum_of(b).saturating_sub(added) + live.slow_quorum_of(a) > before.len()
     })
 }
 
-/// Checks that a change from the `live` layout to `next` can be carried out:
-/// the shard count stays, every shard keeps a replica it already had, and no
-/// replica moves to another shard. A shard that kept a replica is joined
-/// through it, and nothing moves between shards.
-pub(crate) fn validate_change(live: &[Vec<NodeId>], next: &[Vec<NodeId>]) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        live.len() == next.len(),
-        "a change cannot move keys between shards yet: {} shards would become {}",
-        live.len(),
-        next.len()
-    );
-    for (shard, (before, after)) in live.iter().zip(next).enumerate() {
-        anyhow::ensure!(
-            after.iter().any(|node| before.contains(node)),
-            "shard {shard} would keep none of its replicas {before:?}: it could not be joined"
-        );
-        for node in after {
-            if let Some(other) = live.iter().position(|replicas| replicas.contains(node)) {
-                anyhow::ensure!(
-                    other == shard,
-                    "{node:?} would move from shard {other} to shard {shard}: \
-                     a member cannot gain another shard's keys yet"
-                );
-            }
+/// Whether a change from `live` to `next` can install at once: no slot
+/// moves to another shard, no replica of `live` gains a slot, and the
+/// quorums meet ([`quorums_intersect`]). Every replica that gains slots is
+/// then a new one joining a shard that kept a replica (see `Node::join`).
+pub(crate) fn installs_at_once(live: &Layout, next: &Layout) -> bool {
+    live.slots() == next.slots()
+        && gainers(live, next).iter().all(|node| !live.contains(*node))
+        && quorums_intersect(live, next)
+}
+
+/// The slots `node` replicates in `next` but not in `live`, by the shard of
+/// `live` that holds them.
+pub(crate) fn gained_slots(
+    live: &Layout,
+    next: &Layout,
+    node: NodeId,
+) -> HashMap<usize, Vec<usize>> {
+    let mut gained: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (slot, (&a, &b)) in live.slots().iter().zip(next.slots()).enumerate() {
+        let (a, b) = (a as usize, b as usize);
+        if next.replicas_of(b).contains(&node) && !live.replicas_of(a).contains(&node) {
+            gained.entry(a).or_default().push(slot);
         }
     }
-    Ok(())
+    gained
+}
+
+/// Every node that replicates some slot in `next` it does not in `live`.
+pub(crate) fn gainers(live: &Layout, next: &Layout) -> Vec<NodeId> {
+    let mut gainers: Vec<NodeId> = slot_moves(live, next)
+        .into_iter()
+        .flat_map(|(a, b)| {
+            next.replicas_of(b)
+                .iter()
+                .copied()
+                .filter(|node| !live.replicas_of(a).contains(node))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    gainers.sort_unstable();
+    gainers.dedup();
+    gainers
 }
 
 /// The layout transition a node has installed and not ended yet.
@@ -131,33 +166,43 @@ pub(crate) struct Transition {
     pub live: Arc<Layout>,
     /// The layout the change installs.
     pub pending: Arc<Layout>,
-    /// Shard index (of `live`) → whether its replica set changes.
+    /// Slot → whether its replica set changes.
     changed: Vec<bool>,
+    /// The nodes that gain slots, which copy them before the change installs
+    /// its layout.
+    pub gainers: Vec<NodeId>,
 }
 
 impl Transition {
     pub fn new(since: u64, live: Arc<Layout>, pending: Arc<Layout>) -> Self {
-        let changed = changed_shards(&live, &pending);
+        let changed = changed_slots(&live, &pending);
+        let gainers = gainers(&live, &pending);
         Self {
             since,
             live,
             pending,
             changed,
+            gainers,
         }
     }
 
     /// Whether `key`'s replica set changes.
     pub fn moves(&self, key: &Key) -> bool {
-        self.changed[self.live.shard_of(key)]
+        self.changed[slot_of(key)]
     }
 
-    /// The replicas of a changing shard, by shard.
-    fn changing_shards(&self) -> impl Iterator<Item = usize> + '_ {
-        self.changed
+    /// The shards of the live layout a changing slot is in.
+    fn changing_shards(&self) -> Vec<usize> {
+        let mut shards: Vec<usize> = self
+            .changed
             .iter()
-            .enumerate()
-            .filter(|(_, &changed)| changed)
-            .map(|(shard, _)| shard)
+            .zip(self.live.slots())
+            .filter(|(&changed, _)| changed)
+            .map(|(_, &shard)| shard as usize)
+            .collect();
+        shards.sort_unstable();
+        shards.dedup();
+        shards
     }
 }
 
@@ -173,8 +218,7 @@ pub(crate) struct Fence {
     pub cap: Timestamp,
     /// Whether the journal holds it: only then is it reported.
     pub journaled: bool,
-    /// The layout live during the transition, and which of its shards change.
-    live: Arc<Layout>,
+    /// Slot → whether the transition moves it.
     changed: Vec<bool>,
 }
 
@@ -185,7 +229,6 @@ impl Fence {
             end: None,
             cap,
             journaled,
-            live: Arc::clone(&transition.live),
             changed: transition.changed.clone(),
         }
     }
@@ -218,7 +261,7 @@ impl Fence {
     pub fn refuses(&self, epoch: u64, t0: Timestamp, keys: &[Key]) -> bool {
         self.end.is_none_or(|end| epoch < end)
             && t0 > self.cap
-            && keys.iter().any(|key| self.changed[self.live.shard_of(key)])
+            && keys.iter().any(|key| self.changed[slot_of(key)])
     }
 
     /// The record the journal keeps.
@@ -235,7 +278,7 @@ impl Fence {
 pub(crate) struct Floor {
     pub epoch: u64,
     pub floor: Timestamp,
-    live: Arc<Layout>,
+    /// Slot → whether the activation moved it.
     changed: Vec<bool>,
 }
 
@@ -245,7 +288,6 @@ impl Floor {
         Self {
             epoch,
             floor,
-            live: Arc::clone(&transition.live),
             changed: transition.changed.clone(),
         }
     }
@@ -253,33 +295,44 @@ impl Floor {
     /// Whether a vote for a transaction planned under `epoch`, at `t0`,
     /// touching `keys`, is refused.
     pub fn refuses(&self, epoch: u64, t0: Timestamp, keys: &[Key]) -> bool {
-        epoch >= self.epoch
-            && t0 < self.floor
-            && keys.iter().any(|key| self.changed[self.live.shard_of(key)])
+        epoch >= self.epoch && t0 < self.floor && keys.iter().any(|key| self.changed[slot_of(key)])
     }
+}
+
+/// The drain point of `shard` of the live layout in the transition first
+/// decided at `since`: `None` until a slow quorum of its replicas reported
+/// their fence for it; then the highest of their fences. Every write on the
+/// shard's moved keys that can still commit has a `t0` at or below it.
+pub(crate) fn shard_drain_point(
+    live: &Layout,
+    shard: usize,
+    since: u64,
+    fences: &HashMap<NodeId, FenceRecord>,
+) -> Option<Timestamp> {
+    let caps: Vec<Timestamp> = live
+        .replicas_of(shard)
+        .iter()
+        .filter_map(|node| fences.get(node))
+        .filter(|fence| fence.since == since)
+        .map(|fence| fence.cap)
+        .collect();
+    if caps.len() < live.slow_quorum_of(shard) {
+        return None;
+    }
+    caps.into_iter().max()
 }
 
 /// The drain point of `transition` from the fence reports gathered so far:
 /// `None` until a slow quorum of every changing shard reported its fence for
-/// it; then the highest fence reported by a replica of a changing shard.
+/// it; then the highest of their drain points ([`shard_drain_point`]).
 pub(crate) fn drain_point(
     transition: &Transition,
     fences: &HashMap<NodeId, FenceRecord>,
 ) -> Option<Timestamp> {
     let mut point = Timestamp::MIN;
     for shard in transition.changing_shards() {
-        let caps: Vec<Timestamp> = transition
-            .live
-            .replicas_of(shard)
-            .iter()
-            .filter_map(|node| fences.get(node))
-            .filter(|fence| fence.since == transition.since)
-            .map(|fence| fence.cap)
-            .collect();
-        if caps.len() < transition.live.slow_quorum_of(shard) {
-            return None;
-        }
-        point = caps.into_iter().fold(point, Timestamp::max);
+        let shard_point = shard_drain_point(&transition.live, shard, transition.since, fences)?;
+        point = point.max(shard_point);
     }
     Some(point)
 }
@@ -305,7 +358,10 @@ pub(crate) fn drained(
 /// recovery of an epoch nobody accepted a value for decides.
 pub(crate) fn repeat(entry: &ConfigEntry) -> ConfigEntry {
     match entry {
-        ConfigEntry::Active { layout, .. } => ConfigEntry::active(layout.clone()),
+        ConfigEntry::Active { layout, .. } => ConfigEntry::Active {
+            layout: layout.clone(),
+            drained: None,
+        },
         transition @ ConfigEntry::Transition { .. } => transition.clone(),
     }
 }
@@ -333,12 +389,99 @@ mod tests {
         }
     }
 
-    /// Replacing a node changes its shard only; a shard keeps its index.
+    /// Replacing a node changes its shard's slots only; reordering a replica
+    /// set changes nothing.
     #[test]
-    fn only_the_shards_whose_replicas_change_move() {
+    fn only_the_slots_whose_replicas_change_move() {
         let live = Layout::new(0, vec![ids(&[0, 1, 2]), ids(&[3, 4, 5])]);
         let next = Layout::new(1, vec![ids(&[2, 1, 0]), ids(&[3, 4, 6])]);
-        assert_eq!(changed_shards(&live, &next), vec![false, true]);
+        let changed = changed_slots(&live, &next);
+        for (slot, &shard) in live.slots().iter().enumerate() {
+            assert_eq!(changed[slot], shard == 1, "slot {slot}");
+        }
+    }
+
+    /// A split moves only the slots the new shard takes, from both old
+    /// shards; with as many shards, nothing moves; a merge moves only the
+    /// removed shard's slots.
+    #[test]
+    fn a_rebalance_moves_only_the_slots_it_must() {
+        let two = crate::api::ShardMap::even(vec![ids(&[0, 1, 2]), ids(&[3, 4, 5])]);
+        let three = two.rebalanced(vec![ids(&[0, 1, 2]), ids(&[3, 4, 5]), ids(&[6, 7, 8])]);
+        three.validate().unwrap();
+        let moved: Vec<usize> = (0..crate::api::SLOTS)
+            .filter(|&slot| two.slots[slot] != three.slots[slot])
+            .collect();
+        assert_eq!(moved.len(), crate::api::SLOTS / 3);
+        assert!(
+            moved.iter().all(|&slot| three.slots[slot] == 2),
+            "only to the new shard"
+        );
+        assert!(moved.iter().any(|&slot| two.slots[slot] == 0));
+        assert!(moved.iter().any(|&slot| two.slots[slot] == 1));
+
+        let same = three.rebalanced(vec![ids(&[0, 1, 9]), ids(&[3, 4, 5]), ids(&[6, 7, 8])]);
+        assert_eq!(same.slots, three.slots, "a replacement moves no slot");
+
+        let merged = three.rebalanced(vec![ids(&[0, 1, 2]), ids(&[3, 4, 5])]);
+        merged.validate().unwrap();
+        for slot in 0..crate::api::SLOTS {
+            if three.slots[slot] != 2 {
+                assert_eq!(merged.slots[slot], three.slots[slot], "slot {slot} stays");
+            }
+        }
+    }
+
+    /// The nodes that gain slots, and from which shard: a new replica of a
+    /// shard gains all of its slots, a split's new shard the slots it takes.
+    #[test]
+    fn a_change_names_what_each_node_gains() {
+        let live = Layout::new(0, vec![ids(&[0, 1, 2])]);
+        let next = Layout::new(1, vec![ids(&[0, 1, 2, 3])]);
+        assert_eq!(gainers(&live, &next), ids(&[3]));
+        assert_eq!(
+            gained_slots(&live, &next, NodeId(3))[&0].len(),
+            crate::api::SLOTS
+        );
+        assert!(gained_slots(&live, &next, NodeId(0)).is_empty());
+
+        let split = Layout::from_map(
+            1,
+            live.map()
+                .rebalanced(vec![ids(&[0, 1, 2]), ids(&[3, 4, 5])]),
+        );
+        assert_eq!(gainers(&live, &split), ids(&[3, 4, 5]));
+        assert_eq!(
+            gained_slots(&live, &split, NodeId(4))[&0].len(),
+            crate::api::SLOTS / 2
+        );
+    }
+
+    /// A change installs at once only when no slot changes shard, no member
+    /// gains a slot, and the quorums meet.
+    #[test]
+    fn only_new_replicas_of_kept_shards_join_without_a_transition() {
+        let live = Layout::new(0, vec![ids(&[0, 1, 2]), ids(&[3, 4, 5])]);
+        let at_once = |shards: Vec<Vec<NodeId>>| {
+            installs_at_once(&live, &Layout::from_map(1, live.map().rebalanced(shards)))
+        };
+        assert!(
+            at_once(vec![ids(&[0, 1, 2, 6]), ids(&[3, 4, 5])]),
+            "a new replica"
+        );
+        assert!(at_once(vec![ids(&[0, 1]), ids(&[3, 4, 5])]), "one removed");
+        assert!(
+            !at_once(vec![ids(&[0, 1, 6]), ids(&[3, 4, 5])]),
+            "a replacement"
+        );
+        assert!(
+            !at_once(vec![ids(&[0, 1, 2, 3]), ids(&[4, 5])]),
+            "a member moving shards"
+        );
+        assert!(
+            !at_once(vec![ids(&[0, 1, 2]), ids(&[3, 4, 5]), ids(&[6, 7, 8])]),
+            "a split"
+        );
     }
 
     /// One replica added to a shard of three, or one removed, keeps every
@@ -362,19 +505,6 @@ mod tests {
             &five,
             &Layout::new(1, vec![ids(&[0, 1, 2, 3])])
         ));
-    }
-
-    #[test]
-    fn a_change_keeps_shards_and_a_replica_of_each() {
-        let live = vec![ids(&[0, 1, 2]), ids(&[3, 4, 5])];
-        assert!(validate_change(&live, &[ids(&[0, 1, 6]), ids(&[3, 4, 5])]).is_ok());
-        assert!(validate_change(&live, &[ids(&[0, 1, 2, 6]), ids(&[3, 4])]).is_ok());
-        // A shard more: keys would move between shards.
-        assert!(validate_change(&live, &[ids(&[0, 1]), ids(&[2, 3]), ids(&[4, 5])]).is_err());
-        // A shard of new nodes only: nobody to join through.
-        assert!(validate_change(&live, &[ids(&[0, 1, 2]), ids(&[6, 7, 8])]).is_err());
-        // A member moving to the other shard would gain its keys.
-        assert!(validate_change(&live, &[ids(&[0, 1]), ids(&[2, 3, 4, 5])]).is_err());
     }
 
     /// The fence refuses only what it is about: never-witnessed votes for a

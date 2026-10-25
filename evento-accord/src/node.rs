@@ -28,8 +28,9 @@ use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant};
 
 use crate::api::{
-    floor_millis, snapshot_event_size, stamp_events, validate_layout, AcceptorRecord, AmnesiaFence,
-    ConfigEntry, DataStore, Drained, FenceRecord, Journal, Layout, MessageSink, ShardId, Topology,
+    floor_millis, slot_of, snapshot_event_size, stamp_events, validate_layout, AcceptorRecord,
+    AmnesiaFence, ConfigEntry, DataStore, Drained, FenceRecord, Journal, Layout, MessageSink,
+    ShardId, ShardMap, Topology,
 };
 use crate::clock::{Ballot, Clock, HybridLogicalClock, NodeId, Timestamp, TxnId};
 use crate::failure_detector::FailureDetector;
@@ -435,6 +436,11 @@ struct Imported {
 /// How many pages an anti-entropy round pulls from its peer at most, while
 /// each brings something in (see `Node::anti_entropy`).
 const ANTI_ENTROPY_PAGES: usize = 16;
+
+/// How many store pages a node reads at most to answer one
+/// [`RangePageRequest`](Message::RangePageRequest): a reply waits for no more
+/// than that, however sparse the slots asked for.
+const RANGE_PAGE_SCANS: usize = 8;
 
 /// How many [`collect_timeout`](NodeConfig::collect_timeout)s
 /// [`change_topology`](Node::change_topology) waits for a transition to drain
@@ -872,6 +878,12 @@ struct Reconfig {
     /// proofs and vouches hold for as long as it stays live, transitions
     /// included.
     live_since: u64,
+    /// The transition (its `since`) for which this node copied every slot it
+    /// gains (see [`copy_gained_slots`](Node::copy_gained_slots)).
+    copied: Option<u64>,
+    /// The transition each node, this one included, last reported it copied
+    /// its gained slots for.
+    copies: HashMap<NodeId, u64>,
 }
 
 impl Reconfig {
@@ -1099,7 +1111,7 @@ impl Node {
     ) -> Self {
         let start = topology.layout();
         let start_epoch = start.epoch();
-        let start_layout = start.shards().to_vec();
+        let start_layout = start.map();
         Self {
             id,
             clock,
@@ -1120,7 +1132,13 @@ impl Node {
             config: Arc::new(Mutex::new(HashMap::new())),
             config_inbox: Arc::new(Mutex::new(HashMap::new())),
             meta_log: Arc::new(Mutex::new(MetadataLog {
-                entries: BTreeMap::from([(start_epoch, ConfigEntry::active(start_layout))]),
+                entries: BTreeMap::from([(
+                    start_epoch,
+                    ConfigEntry::Active {
+                        layout: start_layout,
+                        drained: None,
+                    },
+                )]),
                 installed_epoch: start_epoch,
                 start_epoch,
                 start_persisted: false,
@@ -1647,7 +1665,7 @@ impl Node {
                 // Below the epoch the topology was built at, the layout is
                 // history only: kept to recover what was planned under it.
                 if epoch < log.installed_epoch && entry.validate().is_ok() {
-                    self.topology.install(epoch, entry.live().to_vec());
+                    self.topology.install_map(epoch, entry.live().clone());
                 }
                 log.entries.insert(epoch, entry);
             }
@@ -1991,8 +2009,14 @@ impl Node {
         // A node told to rejoin holds state its peers compacted past: it
         // recovers, repairs and gossips nothing until its host rejoins it.
         // Nor does a node still joining: it holds part of its state, and a
-        // report it gossips would end its contact's hold on compaction.
-        if self.rejoin_required() || !self.bootstrapped.load(Ordering::Acquire) {
+        // report it gossips would end its contact's hold on compaction — but
+        // one a layout transition gives slots copies them meanwhile, and so
+        // joins.
+        if self.rejoin_required() {
+            return;
+        }
+        if !self.bootstrapped.load(Ordering::Acquire) {
+            self.copy_if_gaining().await;
             return;
         }
         let now = self.clock.now().micros;
@@ -2463,7 +2487,7 @@ impl Node {
     /// compaction entirely), so dropping that state is safe.
     async fn advance_watermark(&self) {
         // The disjoint replica set this node belongs to.
-        let all_nodes = self.topology.nodes();
+        let mut all_nodes = self.topology.nodes();
         let shard_peers = self.shard_peers();
         let mine = self.report(&shard_peers);
         self.give_up_on_silent_peers(&shard_peers);
@@ -2472,6 +2496,22 @@ impl Node {
         // consumes same-shard reports, but the message doubles as the periodic
         // heartbeat the phi-accrual failure detector needs — without it a quiet
         // cross-shard coordinator would be falsely suspected between writes.
+        // During a layout transition, to the nodes of the layout it installs
+        // too: a node gaining slots picks the replica it copies them from by
+        // these reports and fences, and reports its copy to the others.
+        if let Some(transition) = self
+            .reconfig
+            .lock()
+            .expect("reconfig poisoned")
+            .transition
+            .as_ref()
+        {
+            for node in transition.pending.nodes() {
+                if !all_nodes.contains(&node) {
+                    all_nodes.push(node);
+                }
+            }
+        }
         let peers: Vec<NodeId> = all_nodes
             .iter()
             .copied()
@@ -2486,11 +2526,13 @@ impl Node {
         // A fence not journaled yet is retried here, and reported once it is.
         self.persist_fences().await;
         let fenced = self.reportable_fence();
+        let copied = self.copied_report();
         self.broadcast(
             &peers,
             Message::Watermark {
                 applied_through: mine,
                 fenced,
+                copied,
             },
         )
         .await;
@@ -2667,6 +2709,7 @@ impl Node {
             Message::JoinHeaderRequest { .. }
             | Message::CommandPageRequest { .. }
             | Message::SnapshotPageRequest { .. }
+            | Message::RangePageRequest { .. }
             | Message::MetadataFetch { .. }
             | Message::JoinKeepalive => return Screen::Pass,
             // Its recovery of a transaction it alone holds gathers the vote
@@ -2724,6 +2767,7 @@ impl Node {
                 Message::Watermark {
                     applied_through: mine,
                     fenced: self.reportable_fence(),
+                    copied: self.copied_report(),
                 },
             )
             .await;
@@ -2826,6 +2870,7 @@ impl Node {
             Message::SyncRequest { .. }
                 | Message::SyncData { .. }
                 | Message::SnapshotPageRequest { .. }
+                | Message::RangePageRequest { .. }
                 | Message::SnapshotPage { .. }
                 | Message::JoinProof { .. }
                 | Message::JoinHeaderRequest { .. }
@@ -3335,6 +3380,60 @@ impl Node {
                     },
                 ));
             }
+            // A node gaining slots in a transition copies them through this
+            // one: its store's next page, holding only those slots' events.
+            // At most `RANGE_PAGE_SCANS` store pages are read for one reply,
+            // so sparse slots cannot hold a request past its timeout; a reply
+            // may then come back empty, with the cursor to go on from.
+            Message::RangePageRequest { id, slots, after } => {
+                if !self.bootstrapped.load(Ordering::Acquire) {
+                    return out;
+                }
+                let mut wanted = vec![false; crate::api::SLOTS];
+                for slot in slots {
+                    if let Some(wanted) = wanted.get_mut(slot as usize) {
+                        *wanted = true;
+                    }
+                }
+                let mut after = after;
+                let mut events = Vec::new();
+                let mut bytes = 0usize;
+                let mut next = None;
+                for _ in 0..RANGE_PAGE_SCANS {
+                    let page = match self
+                        .datastore
+                        .snapshot_page(
+                            after.take(),
+                            self.settings.snapshot_page_events,
+                            self.settings.snapshot_page_bytes,
+                        )
+                        .await
+                    {
+                        Ok(page) => page,
+                        // Not answered: the copier asks again.
+                        Err(err) => {
+                            tracing::warn!(node = self.id.0, from = from.0, %err, "cannot serve a range page");
+                            return out;
+                        }
+                    };
+                    for event in page.events {
+                        if wanted[slot_of(&Key::of(&event))] {
+                            bytes += snapshot_event_size(&event);
+                            events.push(event);
+                        }
+                    }
+                    next = page.next;
+                    if next.is_none()
+                        || events.len() >= self.settings.snapshot_page_events as usize
+                        || bytes >= self.settings.snapshot_page_bytes
+                    {
+                        break;
+                    }
+                    after = next.clone();
+                }
+                self.metrics.record_snapshot_page();
+                out.push((from, Message::SnapshotPage { id, events, next }));
+            }
             Message::SnapshotPageRequest { id, after } => {
                 if !self.bootstrapped.load(Ordering::Acquire) {
                     return out;
@@ -3414,6 +3513,7 @@ impl Node {
             Message::Watermark {
                 applied_through,
                 fenced,
+                copied,
             } => {
                 // A joiner's first report ends the hold its contact kept for
                 // it (see `JoinHold`): from here on it is counted itself.
@@ -3425,12 +3525,12 @@ impl Node {
                     .lock()
                     .expect("watermarks poisoned")
                     .insert(from, applied_through);
+                let mut reconfig = self.reconfig.lock().expect("reconfig poisoned");
                 if let Some(fenced) = fenced {
-                    self.reconfig
-                        .lock()
-                        .expect("reconfig poisoned")
-                        .reported
-                        .insert(from, fenced);
+                    reconfig.reported.insert(from, fenced);
+                }
+                if let Some(copied) = copied {
+                    reconfig.copies.insert(from, copied);
                 }
             }
             // Config Paxos — acceptor side.
@@ -5766,9 +5866,22 @@ impl Node {
     /// contact absent past a compaction, the contact must first prove it holds
     /// what was compacted ([`await_reinstated`](Self::await_reinstated)).
     ///
-    /// Coordinating the epoch change across the cluster (rather than each node
-    /// installing an agreed layout) remains future work.
+    /// `contact` must be a replica of this node's shard: only it holds what
+    /// this node is to copy, and its floor is this node's shard's (#360). A
+    /// node that already copied its slots during the layout transition that
+    /// made it a replica has nothing to join: `Ok(0)`.
     pub async fn join(&self, contact: NodeId) -> anyhow::Result<usize> {
+        if self.copied_for_live() {
+            return Ok(0);
+        }
+        let layout = self.topology.layout();
+        if let Some(shard) = layout.node_shard(self.id) {
+            anyhow::ensure!(
+                layout.node_shard(contact) == Some(shard),
+                "{contact:?} is no replica of this node's shard under epoch {}: join through one",
+                layout.epoch()
+            );
+        }
         let bound = self
             .absent
             .lock()
@@ -5849,6 +5962,7 @@ impl Node {
                 Message::Watermark {
                     applied_through: mine,
                     fenced: self.reportable_fence(),
+                    copied: self.copied_report(),
                 },
             )
             .await;
@@ -6389,6 +6503,7 @@ impl Node {
                         Message::Watermark {
                             applied_through: Timestamp::MIN,
                             fenced: None,
+                            copied: None,
                         },
                     )
                     .await;
@@ -6622,20 +6737,25 @@ impl Node {
     /// differs from `shards` only if an interrupted change had already been
     /// decided for `epoch`).
     ///
-    /// A change after which a quorum of the new replicas of a shard could miss
-    /// a quorum of the old ones (replacing a replica, adding two, shrinking five
-    /// to three) takes two epochs (see `reconfig`): `epoch` decides a
-    /// transition, during which writes to the keys it moves are refused with
-    /// [`TopologyChanging`] while the writes in flight on them drain, and the
-    /// next epoch installs `shards` once they have — after about the compaction
-    /// margin and a few anti-entropy rounds, run by the recovery sweep
-    /// ([`start_recovery`](Node::start_recovery)). Any other change installs
-    /// `shards` at `epoch`. A change while a transition is in progress
-    /// replaces it; one back to the live layout cancels it.
+    /// `shards` is each shard's replica set; the slots move as little as they
+    /// can ([`ShardMap::rebalanced`]): none with as many shards, only those a
+    /// new shard needs, or a removed one leaves, otherwise.
     ///
-    /// For now a change keeps the shard count, keeps a replica of every shard,
-    /// and moves no replica to another shard: new replicas join through the
-    /// ones their shard keeps.
+    /// A change that adds a replica to a shard of three, or removes one,
+    /// installs `shards` at `epoch`: a new replica then joins through one its
+    /// shard kept ([`join`](Node::join)). Any other change — replacing a
+    /// replica, adding two, shrinking five to three, adding or removing shards,
+    /// moving a replica to another shard — takes two epochs (see `reconfig`):
+    /// `epoch` decides a transition, during which writes to the keys it moves
+    /// are refused with [`TopologyChanging`] while the writes in flight on them
+    /// drain and every node gaining slots copies them; the next epoch installs
+    /// `shards` once that is done — after about the compaction margin, a few
+    /// anti-entropy rounds and the copies, all run by the recovery sweep
+    /// ([`start_recovery`](Node::start_recovery)) of every node, the new ones
+    /// included. A change while a transition is in progress replaces it; one
+    /// back to the live layout cancels it. A change that gives a node a slot it
+    /// replicated before is refused (its store still holds that slot's events
+    /// from then).
     ///
     /// The acceptor set is the members of the current epoch (a node proposing the
     /// next epoch is still on this one), so it tracks membership: changes keep
@@ -6651,48 +6771,86 @@ impl Node {
             Some(decided) => decided,
             None => {
                 let live = self.topology.layout();
-                reconfig::validate_change(live.shards(), &shards)?;
+                let map = self.change_map(&live, shards)?;
                 // The change already in progress is carried through, not
                 // decided again: its fence and drain stand.
-                if let Some(since) = self.transition_to(&shards) {
+                if let Some(since) = self.transition_to(&map) {
                     return self.complete_transition(since).await;
                 }
                 let acceptors = self.topology.nodes();
-                let proposal = Self::change_entry(epoch, &live, shards);
+                let proposal = Self::change_entry(epoch, &live, map);
                 let decided = self.run_config_paxos(epoch, proposal, &acceptors).await?;
                 self.commit_topology(epoch, &decided, &acceptors).await;
                 decided
             }
         };
         match decided {
-            ConfigEntry::Active { layout, .. } => Ok(layout),
+            ConfigEntry::Active { layout, .. } => Ok(layout.shards),
             ConfigEntry::Transition { since, .. } => self.complete_transition(since).await,
         }
     }
 
-    /// The entry a change from `live` to `shards` decides at `epoch`: a
-    /// transition when a quorum of the new replicas of a shard could miss a
-    /// quorum of the old ones, the new layout at once otherwise.
-    fn change_entry(epoch: u64, live: &Layout, shards: Vec<Vec<NodeId>>) -> ConfigEntry {
-        let next = Layout::new(epoch, shards.clone());
-        if reconfig::quorums_intersect(live, &next) {
-            ConfigEntry::active(shards)
+    /// The shard map a change from `live` to `shards` installs: `live`'s slot
+    /// table rebalanced over `shards` ([`ShardMap::rebalanced`]: with another
+    /// shard count, only the slots a new shard needs, or a removed one leaves,
+    /// move). Refused when a node would gain a slot it replicated before and
+    /// gave up: its store still holds that slot's events from then, and
+    /// nothing drops them yet.
+    fn change_map(&self, live: &Layout, shards: Vec<Vec<NodeId>>) -> anyhow::Result<ShardMap> {
+        let map = live.map().rebalanced(shards);
+        map.validate()?;
+        let next = Layout::from_map(live.epoch() + 1, map.clone());
+        let start = self.meta_log.lock().expect("meta_log poisoned").start_epoch;
+        for node in reconfig::gainers(live, &next) {
+            let gained: Vec<usize> = reconfig::gained_slots(live, &next, node)
+                .into_values()
+                .flatten()
+                .collect();
+            for epoch in start..live.epoch() {
+                let Some(before) = self.topology.layout_at(epoch) else {
+                    continue;
+                };
+                if let Some(&slot) = gained.iter().find(|&&slot| {
+                    before
+                        .replicas_of(before.slots()[slot] as usize)
+                        .contains(&node)
+                }) {
+                    anyhow::bail!(
+                        "{node:?} would regain slot {slot}, which it replicated at epoch {epoch}: \
+                         its store still holds that slot's events from then"
+                    );
+                }
+            }
+        }
+        Ok(map)
+    }
+
+    /// The entry a change from `live` to `map` decides at `epoch`: the new
+    /// layout at once when it can be installed so ([`reconfig::installs_at_once`]),
+    /// a transition otherwise.
+    fn change_entry(epoch: u64, live: &Layout, map: ShardMap) -> ConfigEntry {
+        let next = Layout::from_map(epoch, map.clone());
+        if reconfig::installs_at_once(live, &next) {
+            ConfigEntry::Active {
+                layout: map,
+                drained: None,
+            }
         } else {
             ConfigEntry::Transition {
-                active: live.shards().to_vec(),
-                pending: shards,
+                active: live.map(),
+                pending: map,
                 since: epoch,
             }
         }
     }
 
-    /// The `since` of the transition in progress, if it installs `shards`.
-    fn transition_to(&self, shards: &[Vec<NodeId>]) -> Option<u64> {
+    /// The `since` of the transition in progress, if it installs `map`.
+    fn transition_to(&self, map: &ShardMap) -> Option<u64> {
         let reconfig = self.reconfig.lock().expect("reconfig poisoned");
         reconfig
             .transition
             .as_ref()
-            .filter(|t| t.pending.shards() == shards)
+            .filter(|t| t.pending.map() == *map)
             .map(|t| t.since)
     }
 
@@ -6712,7 +6870,7 @@ impl Node {
                     )
                 }
             }
-            if let Some(point) = self.drain_reached(since) {
+            if let Some(point) = self.ready_to_activate(since) {
                 if let Err(err) = self.activate(since, point).await {
                     tracing::debug!(node = self.id.0, since, %err, "activation not decided yet");
                 }
@@ -6751,15 +6909,16 @@ impl Node {
         };
         match ended.and_then(|end| log.entries.get(&end)) {
             Some(ConfigEntry::Active { layout, .. }) if layout == pending => {
-                TransitionOutcome::Installed(layout.clone())
+                TransitionOutcome::Installed(layout.shards.clone())
             }
             _ => TransitionOutcome::Replaced,
         }
     }
 
     /// The drain point of the transition first decided at `since`, once it is
-    /// in progress here and has drained (see [`reconfig::drained`]).
-    fn drain_reached(&self, since: u64) -> Option<Timestamp> {
+    /// in progress here, has drained (see [`reconfig::drained`]), and every
+    /// node gaining slots reported it copied them.
+    fn ready_to_activate(&self, since: u64) -> Option<Timestamp> {
         let reports = self
             .peer_watermarks
             .lock()
@@ -6768,7 +6927,179 @@ impl Node {
         let reconfig = self.reconfig.lock().expect("reconfig poisoned");
         let transition = reconfig.transition.as_ref().filter(|t| t.since == since)?;
         let point = reconfig::drain_point(transition, &reconfig.reported)?;
-        reconfig::drained(&transition.live, point, &reports).then_some(point)
+        let copied = transition.gainers.iter().all(|node| {
+            if *node == self.id {
+                reconfig.copied == Some(since)
+            } else {
+                reconfig.copies.get(node) == Some(&since)
+            }
+        });
+        (copied && reconfig::drained(&transition.live, point, &reports)).then_some(point)
+    }
+
+    /// Copies the slots this node gains in the transition in progress, if it
+    /// gains any and has not copied them yet. The transition's `since` once
+    /// this node holds every slot it gains (or gains none); `None` while there
+    /// is no transition, or the copy is not done.
+    async fn copy_if_gaining(&self) -> Option<u64> {
+        let (since, copying) = {
+            let reconfig = self.reconfig.lock().expect("reconfig poisoned");
+            let transition = reconfig.transition.as_ref()?;
+            (
+                transition.since,
+                transition.gainers.contains(&self.id) && reconfig.copied != Some(transition.since),
+            )
+        };
+        if copying && !self.copy_gained_slots(since).await {
+            return None;
+        }
+        Some(since)
+    }
+
+    /// Copies the slots this node gains in the transition first decided at
+    /// `since` (see `reconfig`): from each shard of the live layout that holds
+    /// some, those slots' events, through a replica whose watermark report is
+    /// past that shard's own drain point ([`reconfig::shard_drain_point`]).
+    /// The keys take no new write while the transition drains, so the copy is
+    /// final. Installed like a join's snapshot, under a synthetic id at that
+    /// point, without what the store already holds (a copy interrupted, or
+    /// one for a transition replaced since). Returns whether every gained slot
+    /// is in; a shard not drained yet, or a contact that failed, is retried by
+    /// the next sweep.
+    async fn copy_gained_slots(&self, since: u64) -> bool {
+        let (live, pending, fences) = {
+            let reconfig = self.reconfig.lock().expect("reconfig poisoned");
+            let Some(transition) = reconfig.transition.as_ref().filter(|t| t.since == since) else {
+                return false;
+            };
+            (
+                Arc::clone(&transition.live),
+                Arc::clone(&transition.pending),
+                reconfig.reported.clone(),
+            )
+        };
+        let reports = self
+            .peer_watermarks
+            .lock()
+            .expect("watermarks poisoned")
+            .clone();
+        let mut gained: Vec<(usize, Vec<usize>)> = reconfig::gained_slots(&live, &pending, self.id)
+            .into_iter()
+            .collect();
+        gained.sort_unstable();
+        for (source, slots) in gained {
+            let Some(point) = reconfig::shard_drain_point(&live, source, since, &fences) else {
+                return false;
+            };
+            let Some(contact) = live
+                .replicas_of(source)
+                .iter()
+                .copied()
+                .filter(|&node| node != self.id)
+                .find(|node| reports.get(node).is_some_and(|&report| report > point))
+            else {
+                return false;
+            };
+            let slots: Vec<u16> = slots.into_iter().map(|slot| slot as u16).collect();
+            let mut after = None;
+            let mut copied = 0usize;
+            loop {
+                let page = self
+                    .fetch_page(contact, self.settings.collect_timeout, "range page", |id| {
+                        Message::RangePageRequest {
+                            id,
+                            slots: slots.clone(),
+                            after: after.clone(),
+                        }
+                    })
+                    .await;
+                let (events, next) = match page {
+                    Ok(Message::SnapshotPage { events, next, .. }) => (events, next),
+                    Ok(other) => {
+                        tracing::warn!(node = self.id.0, ?other, "not a range page");
+                        return false;
+                    }
+                    Err(err) => {
+                        tracing::debug!(node = self.id.0, contact = contact.0, %err, "cannot copy a range yet");
+                        return false;
+                    }
+                };
+                let events = match self.not_held(events).await {
+                    Ok(events) => events,
+                    Err(err) => {
+                        tracing::warn!(node = self.id.0, %err, "cannot read the store's versions");
+                        return false;
+                    }
+                };
+                if !events.is_empty() {
+                    copied += events.len();
+                    if let Err(err) = self
+                        .datastore
+                        .apply(TxnId(point), point, events, true)
+                        .await
+                    {
+                        tracing::warn!(node = self.id.0, %err, "cannot install a copied range");
+                        return false;
+                    }
+                }
+                match next {
+                    Some(cursor) => after = Some(cursor),
+                    None => break,
+                }
+            }
+            tracing::info!(
+                node = self.id.0,
+                since,
+                source,
+                contact = contact.0,
+                slots = slots.len(),
+                events = copied,
+                "copied the slots a transition moves here"
+            );
+        }
+        self.reconfig.lock().expect("reconfig poisoned").copied = Some(since);
+        // A new node opened joining holds its slots now: it serves, and what
+        // it buffered meanwhile is handled.
+        if !self.bootstrapped.load(Ordering::Acquire) && self.pending_fence().is_none() {
+            let buffered = {
+                let mut buffer = self.join_buffer.lock().expect("buffer poisoned");
+                self.bootstrapped.store(true, Ordering::Release);
+                std::mem::take(&mut *buffer)
+            };
+            for env in buffered {
+                Box::pin(self.handle(env)).await;
+            }
+        }
+        true
+    }
+
+    /// `events` without those the store already holds: a stream's events at
+    /// or below its current version (the store applied them, verbatim).
+    async fn not_held(&self, events: Vec<Event>) -> anyhow::Result<Vec<Event>> {
+        let mut versions: HashMap<(String, String, String), u16> = HashMap::new();
+        let mut kept = Vec::with_capacity(events.len());
+        for event in events {
+            let stream = (
+                event.tenant.clone(),
+                event.aggregate_type.clone(),
+                event.aggregate_id.clone(),
+            );
+            let version = match versions.get(&stream) {
+                Some(&version) => version,
+                None => {
+                    let version = self
+                        .datastore
+                        .version(&stream.0, &stream.1, &stream.2)
+                        .await?;
+                    versions.insert(stream, version);
+                    version
+                }
+            };
+            if event.version > version {
+                kept.push(event);
+            }
+        }
+        Ok(kept)
     }
 
     /// Decides, and commits, the entry that ends the transition first decided
@@ -6789,7 +7120,7 @@ impl Node {
         let pending = {
             let reconfig = self.reconfig.lock().expect("reconfig poisoned");
             match reconfig.transition.as_ref().filter(|t| t.since == since) {
-                Some(t) => t.pending.shards().to_vec(),
+                Some(t) => t.pending.map(),
                 None => return Ok(()),
             }
         };
@@ -6815,14 +7146,10 @@ impl Node {
     /// is the distinguished proposer of the next epoch — or no proposer before
     /// it did so in time (the sweep's half of [`complete_transition`](Self::complete_transition)).
     async fn sweep_transition(&self) {
-        let since = {
-            let reconfig = self.reconfig.lock().expect("reconfig poisoned");
-            match reconfig.transition.as_ref() {
-                Some(t) => t.since,
-                None => return,
-            }
+        let Some(since) = self.copy_if_gaining().await else {
+            return;
         };
-        let Some(point) = self.drain_reached(since) else {
+        let Some(point) = self.ready_to_activate(since) else {
             return;
         };
         let next = self.installed_epoch() + 1;
@@ -6851,9 +7178,9 @@ impl Node {
         validate_layout(&proposed)?;
         self.ensure_next_epoch(epoch)?;
         let live = self.topology.layout();
-        reconfig::validate_change(live.shards(), &proposed)?;
+        let map = self.change_map(&live, proposed)?;
         let acceptors = self.topology.nodes();
-        let proposal = Self::change_entry(epoch, &live, proposed);
+        let proposal = Self::change_entry(epoch, &live, map);
         self.run_config_paxos(epoch, proposal, &acceptors).await
     }
 
@@ -7092,7 +7419,7 @@ impl Node {
             // Below the installed epoch an entry is history only (one the
             // node started past): kept to recover what was planned under it.
             if epoch < log.installed_epoch && entry.validate().is_ok() {
-                self.topology.install(epoch, entry.live().to_vec());
+                self.topology.install_map(epoch, entry.live().clone());
             }
             log.entries.entry(epoch).or_insert(entry);
         }
@@ -7133,7 +7460,7 @@ impl Node {
             {
                 self.clock.restore(drained.floor);
             }
-            self.topology.install(next, entry.live().to_vec());
+            self.topology.install_map(next, entry.live().clone());
             self.install_entry(next, &entry, &mut installed);
             self.meta_log
                 .lock()
@@ -7153,8 +7480,11 @@ impl Node {
         let live = self.topology.layout_at(epoch).expect("installed just now");
         match entry {
             ConfigEntry::Transition { pending, since, .. } => {
-                let transition =
-                    Transition::new(*since, live, Arc::new(Layout::new(epoch, pending.clone())));
+                let transition = Transition::new(
+                    *since,
+                    live,
+                    Arc::new(Layout::from_map(epoch, pending.clone())),
+                );
                 let replica = self.replica.lock().expect("replica poisoned");
                 let mut reconfig = self.reconfig.lock().expect("reconfig poisoned");
                 if let Some(old) = reconfig.transition.take().filter(|old| old.since != *since) {
@@ -7192,8 +7522,8 @@ impl Node {
                 let previous = self
                     .topology
                     .layout_at(epoch.saturating_sub(1))
-                    .map(|l| l.shards().to_vec());
-                if previous.as_deref() != Some(layout.as_slice()) {
+                    .map(|l| l.map());
+                if previous.as_ref() != Some(layout) {
                     reconfig.live_since = epoch;
                 }
                 let Some(transition) = reconfig.transition.take() else {
@@ -7311,7 +7641,10 @@ impl Node {
                 active, pending, ..
             } => vec![active, pending],
         };
-        for node in named.into_iter().flatten().flatten() {
+        for node in named
+            .into_iter()
+            .flat_map(|map| map.shards.iter().flatten())
+        {
             if !recipients.contains(node) {
                 recipients.push(*node);
             }
@@ -7600,6 +7933,29 @@ impl Node {
             .record();
         reconfig.reported.insert(self.id, record);
         Some(record)
+    }
+
+    /// Whether this node copied its slots during the transition the live
+    /// layout ended.
+    fn copied_for_live(&self) -> bool {
+        let reconfig = self.reconfig.lock().expect("reconfig poisoned");
+        reconfig.copied.is_some_and(|since| {
+            reconfig
+                .fences
+                .iter()
+                .any(|f| f.since == since && f.end == Some(reconfig.live_since))
+        })
+    }
+
+    /// The transition in progress this node copied its gained slots for, if
+    /// it did — recorded as its own report too.
+    fn copied_report(&self) -> Option<u64> {
+        let mut reconfig = self.reconfig.lock().expect("reconfig poisoned");
+        let since = reconfig.transition.as_ref()?.since;
+        (reconfig.copied == Some(since)).then(|| {
+            reconfig.copies.insert(self.id, since);
+            since
+        })
     }
 
     /// The `since` of the transition in progress, if it moves one of `keys`.
@@ -8151,7 +8507,7 @@ mod tests {
     use evento_core::Event;
 
     use crate::api::{
-        ConfigEntry, DataStore, Drained, FenceRecord, Journal, ShardedTopology, Topology,
+        ConfigEntry, DataStore, Drained, FenceRecord, Journal, ShardMap, ShardedTopology, Topology,
     };
     use crate::clock::{HybridLogicalClock, NodeId, Timestamp, TxnId};
     use crate::message::{CommandState, Key, Message, Status};
@@ -9043,6 +9399,7 @@ mod tests {
                 node: NodeId(micros),
             },
             fenced: None,
+            copied: None,
         };
         let micros_of = |m: Message| match m {
             Message::Watermark {
@@ -9377,8 +9734,8 @@ mod tests {
     /// The transition that replaces node 2 with node 3, decided at epoch 1.
     fn replacing_two() -> ConfigEntry {
         ConfigEntry::Transition {
-            active: vec![(0..3).map(NodeId).collect()],
-            pending: vec![vec![NodeId(0), NodeId(1), NodeId(3)]],
+            active: ShardMap::even(vec![(0..3).map(NodeId).collect()]),
+            pending: ShardMap::even(vec![vec![NodeId(0), NodeId(1), NodeId(3)]]),
             since: 1,
         }
     }
@@ -9525,7 +9882,7 @@ mod tests {
             &node,
             2,
             ConfigEntry::Active {
-                layout: vec![vec![NodeId(0), NodeId(1), NodeId(3)]],
+                layout: ShardMap::even(vec![vec![NodeId(0), NodeId(1), NodeId(3)]]),
                 drained: Some(Drained {
                     point,
                     floor: Timestamp {
@@ -9578,8 +9935,9 @@ mod tests {
                 .clone()
         };
         let (zero, one) = (in_shard(0), in_shard(1));
-        let shards =
-            |a: [u64; 3], b: [u64; 3]| vec![a.map(NodeId).to_vec(), b.map(NodeId).to_vec()];
+        let shards = |a: [u64; 3], b: [u64; 3]| {
+            ShardMap::even(vec![a.map(NodeId).to_vec(), b.map(NodeId).to_vec()])
+        };
         // Epoch 1 moves shard 1 (5 replaced by 6); epoch 2 replaces that
         // change by one moving shard 0 (2 replaced by 7) only.
         commit_entry(
@@ -9632,5 +9990,62 @@ mod tests {
         assert!(!refuses(past(first.max(second)), 2, &one));
         // The replacing change fences the key it moves.
         assert!(refuses(past(second), 2, &zero));
+    }
+
+    /// A range page holds only the slots asked for, from the store's order.
+    #[tokio::test]
+    async fn a_range_page_holds_only_the_slots_asked_for() {
+        let (node, _topology) = replaceable_node(Arc::new(InMemoryJournal::new()));
+        let events: Vec<Event> = (0..64)
+            .map(|i| Event {
+                id: ulid::Ulid::generate(),
+                aggregate_type: "test/Account".into(),
+                aggregate_id: format!("acc{i}"),
+                version: 1,
+                name: "Opened".into(),
+                ..Default::default()
+            })
+            .collect();
+        node.datastore
+            .apply(TxnId(Timestamp::MIN), Timestamp::MIN, events.clone(), true)
+            .await
+            .unwrap();
+        let wanted: Vec<u16> = events
+            .iter()
+            .take(3)
+            .map(|e| crate::api::slot_of(&Key::of(e)) as u16)
+            .collect();
+        let out = node
+            .handle_staged(Envelope {
+                from: NodeId(9),
+                message: Message::RangePageRequest {
+                    id: 7,
+                    slots: wanted.clone(),
+                    after: None,
+                },
+            })
+            .await;
+        let [(
+            to,
+            Message::SnapshotPage {
+                id,
+                events: page,
+                next,
+            },
+        )] = out.as_slice()
+        else {
+            panic!("{out:?}");
+        };
+        assert_eq!((*to, *id), (NodeId(9), 7));
+        assert!(next.is_none(), "the store fits a page");
+        let expected = events
+            .iter()
+            .filter(|e| wanted.contains(&(crate::api::slot_of(&Key::of(e)) as u16)))
+            .count();
+        assert!(expected >= 3);
+        assert_eq!(page.len(), expected);
+        assert!(page
+            .iter()
+            .all(|e| wanted.contains(&(crate::api::slot_of(&Key::of(e)) as u16))));
     }
 }
