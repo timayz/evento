@@ -935,7 +935,32 @@ backend (sql/fjall). Phases, in order:
   recovery never lets a replica that never witnessed it pre-accept it (#377) —
   and a replica whose only vote for it was a recovery's late pre-accept, lost
   before its next gossip showed it holding the transaction. See `tests/amnesia.rs` and
-  the simulator's `run_amnesia`, which wipes a node at any moment. Validated by the deterministic simulation: a **bound oracle**
+  the simulator's `run_amnesia`, which wipes a node at any moment. **A journal rolled
+  back to an older copy** (#339) — a backup or VM snapshot restored, a disk that lost
+  writes it acknowledged — forgot the votes and promises made since, like a lost one,
+  yet holds something, so no amnesia fence covers it. Every watermark report carries
+  its sender's **durable mark** (`DurableMark`): its journaled clock bound and vote
+  fence, which only rise and are journaled before anything cut below them leaves the
+  node, so a journal reopened as it was left never holds less than a peer saw — a
+  journal that keeps no fence restarts it at the bound less the margin, still above
+  every fence it reported. Each node keeps the highest mark it saw from each peer,
+  journaled with its reports (`Journal::save_peer_marks`). A node opened over a
+  journal that holds something, in a group of more than one node, asks every other
+  node to confirm it (`Message::Opened`): until a slow quorum of its shard, itself
+  included, did, and every other node answered or `collect_timeout` passed, it
+  buffers consensus messages and mints, votes and vouches for nothing
+  (`Node::confirmed`; the guard sits in `bound_clock_past`, which every mint, vote and
+  vouch passes). Nodes answer from the marks their journals kept, confirmed or not,
+  so a full-cluster restart confirms them all. A peer that saw more answers
+  `RolledBack`, however late, and the node stops (`Node::rolled_back`): its host
+  opens it again over an empty journal and store, joining, as a lost journal comes
+  back. A replica that lost its journal starts a new life, and its mark (the life is
+  its amnesia fence) supersedes every mark of an earlier one. A copy that lost only
+  what followed the last report its peers heard escapes, and so does one taken before
+  the node first journaled its fence that lost only what followed the bound's last
+  rise: the restored fence covers every fence the node reported. See the rollback tests in
+  `tests/amnesia.rs` and the simulator's `run_rollback`; the swarm counts any node
+  found rolled back as a false alarm. Validated by the deterministic simulation: a **bound oracle**
   (`consensus_state_stays_bounded`) proves `command_count` returns to zero after a
   workload while committed state is preserved, and safety/convergence/bit-
   reproducibility hold across all seeds with compaction live (churn, partitions,

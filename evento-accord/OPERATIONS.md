@@ -151,6 +151,7 @@ Serve it on an HTTP endpoint (see `bank-axum-accord`'s `/metrics`). Counters:
 | `votes_future_dated` | votes refused for a transaction dated more than two clock skews past this node's clock: its coordinator's clock runs beyond the skew bound (§3). Any count = a clock out of bounds; fix its time source. |
 | `amnesia_fences` | times this node opened joining over an empty journal and fenced itself (§7, lost journal). |
 | `amnesia_joins_refused` | joins over a lost journal that found no contact vouching past the fence (`FenceNotCovered`, nothing installed). A few while the contact's report catches up; **steadily rising** = a transaction below the fence no replica can decide any more (§7). |
+| `journals_rolled_back` | times a peer found this node's journal rolled back to an older copy at its open (§7). Any count = the node stopped: delete its journal and store, and open it joining. |
 | `config_votes_withheld` | config-Paxos promises and accepts this node withheld: it lost a journal under its node id, and abstains from config Paxos for good. |
 | `snapshot_pages` | snapshot pages this node served to joining peers; a joiner pulls one per `snapshot_page_events` / `snapshot_page_bytes` of the contact's store. |
 | `command_pages` | command pages this node served to joining peers: a joiner pulls the contact's un-compacted applied commands one page at a time, before its snapshot pages. |
@@ -256,7 +257,15 @@ refuses anything else before a vote, and a node never installs it.
   recorded — is handed back decided but un-applied and applied again once what
   precedes it is in place. The sweep retries that apply, and never takes the
   transaction over: its peers may have compacted past it, and the node holds
-  their decision (#351). (See `tests/restart.rs`.)
+  their decision (#351). (See `tests/restart.rs`.) Over a journal that holds
+  something, in a group of more than one node, the node first asks every other node
+  to confirm the journal is no older copy of itself (#339, below): until a slow
+  quorum of its shard, itself included, confirmed it, and every other node answered
+  or `collect_timeout` passed, it buffers consensus messages, refuses writes
+  (`OpenUnconfirmed`), and mints, votes and vouches for nothing (`Node::confirmed()`).
+  A node whose peers are down stays unconfirmed until enough of them are back; a
+  full-cluster restart confirms every node, each answering the others from the marks
+  its own journal kept.
 - **A write the caller abandons** (a client that hung up, a `timeout`) is not undone:
   its coordinator may already have reached the replicas. The node stops coordinating
   it, and the transaction is finished by recovery, like one whose coordinator
@@ -433,9 +442,21 @@ refuses anything else before a vote, and a node never installs it.
     the skew bound (NTP), and that every clock stays within `max_skew` of the others
     (a node votes for no transaction dated past its clock's bound, §3).
 - **Node back with a rolled-back journal** (restored from a backup or a VM snapshot, or
-  a disk that lost writes it had acknowledged): nothing detects it, and the node would
-  vote against what it forgot. **Delete it**, and bring the node back as above (lost
-  journal).
+  a disk that lost writes it had acknowledged): its peers catch it at its open (#339).
+  Every watermark report carries the node's **durable mark** — its journaled clock
+  bound and vote fence, which only rise — and every node keeps the highest it saw
+  from each peer, journaled with its reports. Reopened over a journal below the mark
+  a peer saw, the node is told so (`RolledBack`) and stops taking part:
+  `Node::rolled_back()` and `rolled_back_signal()` turn on, writes fail with
+  `JournalRolledBack`, and `accord_journals_rolled_back_total` counts it. **Retire it,
+  delete its journal and its store**, and bring it back as above (lost journal).
+  - **What escapes it:** a copy that lost only what the node did after the last
+    report its peers heard — about a sweep (`recovery_interval`); a copy taken before
+    the node first journaled its vote fence, which a restore puts back at the clock
+    bound less the margin, that lost only what followed the bound's last rise (two
+    clock skews at most); and any copy when the journal keeps no clock bound
+    (`Journal::save_clock_bound` on its default; the node logs it at open). So
+    `fsync` must stay honest (§8), and a journal is never restored on purpose.
 
 ### Opening a node by joining
 
@@ -515,9 +536,11 @@ through `AccordExecutor`) — split it into several writes.
   compacted past the backup, in which case empty it and rejoin over the node's
   journal (§7, lost store). **Never restore the journal** (Fjall `accord_*`
   keyspaces, or the `accord_*` SQL tables) from a backup: an older journal forgets
-  the votes and promises the node made since, and nothing detects it. Delete it
-  instead, and bring the node back over an empty journal by joining (§7, lost
-  journal). The journal is bounded by
+  the votes and promises the node made since. Its peers catch it at the node's next
+  open and stop it (§7, rolled-back journal) — unless it lost only the node's last
+  moments, which go unnoticed — and it must come back over an empty journal anyway.
+  Delete it instead, and bring the node back over an empty journal by joining (§7,
+  lost journal). The journal is bounded by
   compaction; the event store grows with history.
 - **SQL backend:** run the schema via `evento-sql-migrator` with its `accord` feature
   (the `accord_commands/meta/metadata_log/acceptors` tables), alongside your event
@@ -527,7 +550,8 @@ through `AccordExecutor`) — split it into several writes.
   id it minted before, even after its wall clock stepped back. A journal written
   before the bound existed starts the clock past the node's own journaled
   transactions on its first restart. (A journal restored from a backup holds an
-  older bound, among everything else it forgets: delete it, §7.)
+  older bound, among everything else it forgets: its peers catch it, and it must be
+  deleted, §7.)
 - **Upgrading past the apply-time re-stamp** (release note; the journal and wire
   formats are unchanged): a build before it stored each event with the stamp its
   writing host gave it, and later builds stamp it from the transaction's agreed
@@ -558,6 +582,12 @@ through `AccordExecutor`) — split it into several writes.
   a new `Late` answer; a refusal for good is a journaled promise at the highest
   ballot). A node of format 9 refuses journals and frames of format 8: wipe and
   re-bootstrap, as for format 2.
+- **A confirmed open** (record format 10): each watermark report carries its sender's
+  durable mark, every node journals the highest mark it saw from each peer
+  (`accord_meta` row / Fjall `meta` key `peer_marks`, no migration), and a node opened
+  over a journal that holds something asks the others to confirm it (`Opened`,
+  answered `OpenedOk` or `RolledBack`). A node of format 10 refuses journals and
+  frames of format 9: wipe and re-bootstrap, as for format 2.
 
 ---
 
