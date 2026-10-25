@@ -1034,24 +1034,31 @@ impl Replica {
         })
     }
 
-    /// Handles an unrouted `BeginRecovery` under `ballot`, of `round`: as
+    /// Handles a `BeginRecovery` under `ballot`, of `round`, `routed` when
+    /// it came wrapped in the transaction's route: as
     /// [`recover`](Self::recover), but a [`compacted`](Self::compacted)
-    /// transaction is answered from below the watermark, as
-    /// [`recover_routed`](Self::recover_routed) does, rather than
+    /// transaction is answered from below the watermark rather than
     /// pre-accepted afresh. A transaction this replica does not hold, and
-    /// owns a part of (`keys`), or is asked about as a dependency of its
-    /// shard ([`RecoveryRound::Dependency`]):
+    /// answers for — it owns a part of it (`keys`), is a replica of a shard
+    /// its route names (`routed`), or is asked about it as a dependency of
+    /// its shard ([`RecoveryRound::Dependency`]):
     ///
     /// - below its vote fence, or refused for good, gets "never witnessed":
-    ///   it never voted for it, and never will;
+    ///   it never voted for it, and never will — the one answer a recovery
+    ///   counts as proof the transaction never committed;
     /// - past its original coordinator's deadline ([`late`](Self::late)),
     ///   on a first round, gets [`RoutedRecovery::Late`], the ballot
     ///   promised: the recovery then asks it to vote, or to refuse;
     /// - asked to refuse it ([`RecoveryRound::Refuse`]) refuses it for good
     ///   (see [`REFUSED`]);
     /// - otherwise is pre-accepted, as [`recover`](Self::recover) does —
-    ///   past the deadline too when asked to vote.
-    pub fn recover_unrouted(
+    ///   past the deadline too when asked to vote. Handed no part of it (a
+    ///   routed recovery's first round carries only what its coordinator
+    ///   holds), it promises the ballot and reports it holds nothing, and
+    ///   pre-accepts its part once the recovery hands it one from a
+    ///   holder's report (#377).
+    #[allow(clippy::too_many_arguments)]
+    pub fn recover_round(
         &mut self,
         txn: TxnId,
         ballot: Ballot,
@@ -1059,11 +1066,12 @@ impl Replica {
         keys: Vec<Key>,
         events: Vec<Event>,
         round: RecoveryRound,
+        routed: bool,
     ) -> Result<RoutedRecovery, Ballot> {
         if self.compacted(txn) {
             return Ok(self.recorded(txn));
         }
-        let answers = !keys.is_empty() || round == RecoveryRound::Dependency;
+        let answers = routed || !keys.is_empty() || round == RecoveryRound::Dependency;
         if answers && !self.commands.contains_key(&txn) {
             // It never voted for it, and never will.
             if self.fenced(txn) {
@@ -1135,47 +1143,6 @@ impl Replica {
             }),
             None => RoutedRecovery::NotWitnessed { redundant: true },
         }
-    }
-
-    /// Handles a **routed** recovery under `ballot`: like
-    /// [`recover`](Self::recover) for a transaction held here, but a replica
-    /// that never witnessed it does not pre-accept it — the route tells the
-    /// recovery coordinator which shards to hear from, and a slow quorum of
-    /// one shard answering "never witnessed" (each having durably promised
-    /// the ballot, so the original coordinator can no longer win a vote
-    /// there) proves the transaction never committed. Pre-accepting instead
-    /// would let a later recovery that learned the missing shard's part from
-    /// a straggler turn that proof into a commit after it was acted on.
-    /// `Err(promised)` if a higher ballot was already promised.
-    pub fn recover_routed(
-        &mut self,
-        txn: TxnId,
-        ballot: Ballot,
-        epoch: u64,
-        keys: Vec<Key>,
-        events: Vec<Event>,
-    ) -> Result<RoutedRecovery, Ballot> {
-        if self.commands.contains_key(&txn) {
-            return self
-                .recover(txn, ballot, epoch, keys, events)
-                .map(RoutedRecovery::Known);
-        }
-        if self.refused(txn) {
-            return Ok(RoutedRecovery::NotWitnessed { redundant: false });
-        }
-        if let Some(&promised) = self.unknown_promises.get(&txn) {
-            if ballot < promised {
-                return Err(promised);
-            }
-        }
-        // Below the watermark an absent command may have been applied and
-        // compacted: "not held" is no proof of "never witnessed". A decision
-        // record still tells how it ended.
-        if txn.0 < self.redundant_before {
-            return Ok(self.recorded(txn));
-        }
-        self.unknown_promises.insert(txn, ballot);
-        Ok(RoutedRecovery::NotWitnessed { redundant: false })
     }
 
     /// Records `txn` as applied **as an abort** without executing it: a
@@ -2648,39 +2615,126 @@ mod tests {
         assert!(replica.unknown_promises.is_empty());
     }
 
-    /// A routed recovery never pre-accepts what this replica never witnessed:
-    /// it promises the ballot (refusing the original coordinator below it) and
-    /// says so — unless the transaction is below the watermark, where "not
-    /// held" proves nothing and nothing is promised.
+    /// A routed recovery hands a replica that never witnessed the
+    /// transaction nothing of it on a first round: it promises the ballot
+    /// (refusing the original coordinator below it), holds nothing, and
+    /// pre-accepts its part once handed it (#377). Past the coordinator's
+    /// deadline it answers late instead, and votes or refuses for good when
+    /// asked; below its vote fence it never witnessed it, for good; below
+    /// the watermark "not held" proves nothing, and nothing is promised.
     #[test]
-    fn a_routed_recovery_reports_never_witnessed_without_preaccepting() {
+    fn a_routed_recovery_promises_without_a_part_and_votes_given_one() {
         let mut replica = Replica::new();
         let key = Key("k".into());
         let t = txn(20);
         let b = ballot(50, 1);
 
-        let report = replica
-            .recover_routed(t, b, 0, vec![key.clone()], vec![event("k", 1)])
-            .expect("promised");
-        assert!(matches!(
-            report,
-            RoutedRecovery::NotWitnessed { redundant: false }
-        ));
+        // No part: a promise, nothing pre-accepted, nothing refused for good.
+        match replica
+            .recover_round(t, b, 0, vec![], vec![], RecoveryRound::Ask, true)
+            .expect("promised")
+        {
+            RoutedRecovery::Known(state) => assert!(!state.known, "it holds nothing"),
+            _ => panic!("not a blind promise"),
+        }
         assert_eq!(replica.status(t), None, "nothing was pre-accepted");
         assert_eq!(replica.unknown_promise(t), Some(b));
+        assert!(!replica.refused(t));
         assert_eq!(
             replica.preaccept(t, 0, vec![key.clone()], vec![event("k", 1)]),
             Err(Refusal::Promised(b))
         );
         assert!(matches!(
-            replica.recover_routed(t, ballot(40, 2), 0, vec![], vec![]),
+            replica.recover_round(t, ballot(40, 2), 0, vec![], vec![], RecoveryRound::Ask, true),
             Err(promised) if promised == b
         ));
+        // Handed its part: pre-accepted under the ballot.
+        match replica
+            .recover_round(
+                t,
+                b,
+                0,
+                vec![key.clone()],
+                vec![event("k", 1)],
+                RecoveryRound::Ask,
+                true,
+            )
+            .expect("voted")
+        {
+            RoutedRecovery::Known(state) => {
+                assert!(state.known);
+                assert_eq!(state.status, Status::PreAccepted);
+            }
+            _ => panic!("not a vote"),
+        }
+        assert_eq!(replica.status(t), Some(Status::PreAccepted));
 
+        // Past the deadline: late, until asked to vote.
+        let late = txn(30);
+        replica.set_coordinator_cutoff(txn(35).0);
+        assert!(matches!(
+            replica.recover_round(late, b, 0, vec![], vec![], RecoveryRound::Ask, true),
+            Ok(RoutedRecovery::Late)
+        ));
+        assert_eq!(replica.unknown_promise(late), Some(b));
+        assert!(matches!(
+            replica.recover_round(
+                late,
+                b,
+                0,
+                vec![key.clone()],
+                vec![event("k", 2)],
+                RecoveryRound::Vote,
+                true
+            ),
+            Ok(RoutedRecovery::Known(state)) if state.known
+        ));
+        // Or to refuse, for good.
+        let refused = txn(31);
+        assert!(matches!(
+            replica.recover_round(refused, b, 0, vec![], vec![], RecoveryRound::Ask, true),
+            Ok(RoutedRecovery::Late)
+        ));
+        assert!(matches!(
+            replica.recover_round(refused, b, 0, vec![], vec![], RecoveryRound::Refuse, true),
+            Ok(RoutedRecovery::NotWitnessed { redundant: false })
+        ));
+        assert!(replica.refused(refused));
+        assert!(matches!(
+            replica.recover_round(
+                refused,
+                ballot(60, 1),
+                0,
+                vec![key.clone()],
+                vec![event("k", 3)],
+                RecoveryRound::Vote,
+                true
+            ),
+            Ok(RoutedRecovery::NotWitnessed { redundant: false })
+        ));
+        assert_eq!(replica.status(refused), None, "refused for good: no vote");
+
+        // Below the vote fence: never witnessed, for good.
+        let fenced = txn(36);
+        replica.raise_vote_fence(txn(37).0);
+        assert!(matches!(
+            replica.recover_round(
+                fenced,
+                b,
+                0,
+                vec![key.clone()],
+                vec![],
+                RecoveryRound::Ask,
+                true
+            ),
+            Ok(RoutedRecovery::NotWitnessed { redundant: false })
+        ));
+
+        // Below the watermark: nothing is promised.
         let old = txn(5);
         replica.compact(txn(10).0);
         assert!(matches!(
-            replica.recover_routed(old, b, 0, vec![key], vec![]),
+            replica.recover_round(old, b, 0, vec![key], vec![], RecoveryRound::Ask, true),
             Ok(RoutedRecovery::NotWitnessed { redundant: true })
         ));
         assert_eq!(replica.unknown_promise(old), None);
@@ -2717,13 +2771,14 @@ mod tests {
         assert_eq!(replica.status(t), None, "nothing was re-created");
         assert_eq!(replica.applied_result(t), None);
         assert!(matches!(
-            replica.recover_unrouted(
+            replica.recover_round(
                 t,
                 ballot(50, 1),
                 0,
                 vec![key],
                 vec![event("k", 1)],
                 RecoveryRound::Ask,
+                false,
             ),
             Ok(RoutedRecovery::NotWitnessed { redundant: true })
         ));
@@ -2765,14 +2820,23 @@ mod tests {
         assert!(replica.unsaved_decisions().is_empty());
 
         for report in [
-            replica.recover_routed(routed, ballot(50, 1), 0, vec![], vec![]),
-            replica.recover_unrouted(
+            replica.recover_round(
+                routed,
+                ballot(50, 1),
+                0,
+                vec![],
+                vec![],
+                RecoveryRound::Ask,
+                true,
+            ),
+            replica.recover_round(
                 routed,
                 ballot(50, 1),
                 0,
                 vec![key.clone()],
                 vec![],
                 RecoveryRound::Ask,
+                false,
             ),
         ] {
             let Ok(RoutedRecovery::Known(state)) = report else {
@@ -2783,7 +2847,15 @@ mod tests {
             assert!(state.events.is_empty() && state.deps.is_empty());
         }
         assert!(matches!(
-            replica.recover_routed(single, ballot(50, 1), 0, vec![], vec![]),
+            replica.recover_round(
+                single,
+                ballot(50, 1),
+                0,
+                vec![],
+                vec![],
+                RecoveryRound::Ask,
+                true
+            ),
             Ok(RoutedRecovery::NotWitnessed { redundant: true })
         ));
         replica.commit(
@@ -2820,9 +2892,15 @@ mod tests {
         assert!(replica.set_route(t, &route));
         assert!(replica.invalidate(t, 0));
         replica.compact(txn(10).0);
-        let Ok(RoutedRecovery::Known(state)) =
-            replica.recover_routed(t, ballot(50, 1), 0, vec![], vec![])
-        else {
+        let Ok(RoutedRecovery::Known(state)) = replica.recover_round(
+            t,
+            ballot(50, 1),
+            0,
+            vec![],
+            vec![],
+            RecoveryRound::Ask,
+            true,
+        ) else {
             panic!("a recorded decision is reported");
         };
         assert_eq!(state.execute_at, crate::message::INVALIDATED_AT);
@@ -2872,9 +2950,11 @@ mod tests {
         let mut replica = Replica::new();
         let key = Key("k".into());
         let t = txn(20);
+        // A routed recovery's first round hands it none of its part: it
+        // promises the ballot, holding nothing.
         assert!(matches!(
-            replica.recover_routed(t, ballot(50, 1), 0, vec![key.clone()], vec![event("k", 1)]),
-            Ok(RoutedRecovery::NotWitnessed { redundant: false })
+            replica.recover_round(t, ballot(50, 1), 0, vec![], vec![], RecoveryRound::Ask, true),
+            Ok(RoutedRecovery::Known(state)) if !state.known
         ));
         assert_eq!(replica.unknown_promise(t), Some(ballot(50, 1)));
 
@@ -2899,13 +2979,14 @@ mod tests {
         // no answer names the refusal's ballot.
         let v = txn(40);
         assert!(matches!(
-            replica.recover_unrouted(
+            replica.recover_round(
                 v,
                 ballot(60, 1),
                 0,
                 vec![key.clone()],
                 vec![event("k", 1)],
                 RecoveryRound::Refuse,
+                false,
             ),
             Ok(RoutedRecovery::NotWitnessed { redundant: false })
         ));
