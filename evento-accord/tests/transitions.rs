@@ -170,6 +170,47 @@ async fn replacing_a_dead_replica_drains_a_write_in_flight() {
         .expect("a write after the change");
 }
 
+/// A new node a transition gives slots that no commit reaches — still
+/// joining, it handles nothing else that would tell it — learns of the
+/// transition from the metadata its sweep fetches, copies its slots, and the
+/// change installs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_new_replica_no_commit_reaches_learns_of_its_transition() {
+    let net = InMemoryNetwork::new();
+    let old = ids(&[0, 1, 2]);
+    let new = ids(&[0, 1, 3]);
+    let nodes: Vec<TestNode> = (0..3)
+        .map(|id| spawn(&net, id, vec![old.clone()]))
+        .collect();
+    let joiner = spawn(&net, 3, vec![old.clone()]);
+    joiner.node.begin_join();
+    let no_commit: LinkFilter = Arc::new(|_, to, message| {
+        to == NodeId(3) && matches!(message, Message::ConfigCommit { .. })
+    });
+    net.set_link_filter(Some(no_commit));
+    let _sweeps: Vec<_> = nodes.iter().chain([&joiner]).map(TestNode::sweep).collect();
+    nodes[0]
+        .node
+        .write(vec![event("acc", 1)])
+        .await
+        .expect("a write before the change");
+
+    let installed = tokio::time::timeout(
+        Duration::from_secs(20),
+        nodes[0].node.change_topology(1, vec![new.clone()]),
+    )
+    .await
+    .expect("the change ends in bounded time")
+    .expect("the change installs");
+    assert_eq!(installed, vec![new]);
+    await_epoch(&joiner.topology, 2).await;
+    assert_eq!(
+        joiner.store.committed_events().len(),
+        1,
+        "node 3 copied the write"
+    );
+}
+
 /// A key whose replicas change takes no new write while the change drains:
 /// the write fails as `TopologyChanging` (`Unavailable` through the
 /// executor), and succeeds once the new layout is installed.

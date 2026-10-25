@@ -716,10 +716,24 @@ struct ShardReports {
     known: usize,
     /// Replicas that never witnessed it and promised the ballot.
     blind: usize,
+    /// How many of `blind` are in the shard's fast-path electorate.
+    blind_electorate: usize,
     /// Replicas holding nothing of it below their redundancy watermark.
     redundant: usize,
     /// Replies of any kind.
     heard: usize,
+}
+
+impl ShardReports {
+    /// Whether the replicas of `shard` that never witnessed the transaction
+    /// meet every quorum that could have committed it — every slow quorum,
+    /// and every fast quorum of the electorate: then it never committed, and
+    /// with their promises it never will. A slow quorum of them in a shard of
+    /// odd size; two of a shard of four, whose quorums are three.
+    fn rule_out_a_commit(&self, shard: &ShardPlan) -> bool {
+        self.blind + shard.slow_q > shard.replicas.len()
+            && self.blind_electorate + shard.fast_q > shard.electorate.len()
+    }
 }
 
 /// What a routed recovery's reports prove (see [`Node::route_verdict`]).
@@ -858,6 +872,29 @@ struct MetadataLog {
 /// Shared metadata log.
 type MetaLog = Arc<Mutex<MetadataLog>>;
 
+/// The watermark reports peers gossiped, under the live layout they were
+/// made under ([`Message::Watermark`]'s `live_since`): a report vouches for
+/// its sender's keys under that layout only, so one made under another is
+/// dropped, and never counted.
+#[derive(Default)]
+struct PeerReports {
+    /// The epoch the live layout the reports were made under became live at.
+    live_since: u64,
+    by_node: HashMap<NodeId, Timestamp>,
+}
+
+impl PeerReports {
+    /// The reports made under the live layout that became live at
+    /// `live_since`: any made under another are dropped first.
+    fn under(&mut self, live_since: u64) -> &mut HashMap<NodeId, Timestamp> {
+        if self.live_since != live_since {
+            self.live_since = live_since;
+            self.by_node.clear();
+        }
+        &mut self.by_node
+    }
+}
+
 /// What a node knows of layout transitions (see [`reconfig`]). Locked after
 /// the replica lock wherever both are held: a fence is installed, and a vote
 /// checked against the fences, under the replica lock, so no vote slips
@@ -906,7 +943,9 @@ struct Installed {
 
 /// A [`SyncData`](Message::SyncData) payload handed to an in-flight sync: the
 /// contact's `(watermark, coverage, recent commands)`.
-type SyncPayload = (Timestamp, Timestamp, Vec<CommandState>);
+/// A [`SyncData`](Message::SyncData) reply: `(watermark, coverage,
+/// live_since, commands)`.
+type SyncPayload = (Timestamp, Timestamp, u64, Vec<CommandState>);
 
 /// A join contact's vouch ([`Message::JoinProof`]): `(epoch, vouched)`.
 type Vouch = (u64, Timestamp);
@@ -1029,7 +1068,7 @@ pub struct Node {
     snapshot_pending: Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<Message>>>>,
     /// Latest `applied_through` gossiped by each shard peer (and self); the
     /// recovery sweep compacts below the per-shard minimum of these.
-    peer_watermarks: Arc<Mutex<HashMap<NodeId, Timestamp>>>,
+    peer_watermarks: Arc<Mutex<PeerReports>>,
     /// What the journal has been asked to truncate: the sweep calls
     /// [`compact`](Node::compact) continuously, and a journal's `truncate` is
     /// a write transaction (an fsync, and on SQLite the writer lock) even when
@@ -1152,7 +1191,7 @@ impl Node {
             metadata_turn: Arc::new(AtomicU64::new(0)),
             read_pending: Arc::new(Mutex::new(HashMap::new())),
             snapshot_pending: Arc::new(Mutex::new(HashMap::new())),
-            peer_watermarks: Arc::new(Mutex::new(HashMap::new())),
+            peer_watermarks: Arc::new(Mutex::new(PeerReports::default())),
             journal_mark: Arc::new(Mutex::new(JournalMark::default())),
             sync_coverage: Arc::new(Mutex::new((start_epoch, HashMap::new()))),
             join_proof: Arc::new(Mutex::new(None)),
@@ -1825,10 +1864,12 @@ impl Node {
     async fn prune_decisions(&self) {
         let dropped = {
             let current = self.topology.layout();
+            let live_since = self.live_since();
             let watermarks = self
                 .peer_watermarks
                 .lock()
                 .expect("watermarks poisoned")
+                .under(live_since)
                 .clone();
             self.replica
                 .lock()
@@ -2011,11 +2052,16 @@ impl Node {
         // Nor does a node still joining: it holds part of its state, and a
         // report it gossips would end its contact's hold on compaction — but
         // one a layout transition gives slots copies them meanwhile, and so
-        // joins.
+        // joins. It keeps learning the decided epochs: a new node hears of
+        // the change that adds it from a commit, which a lost frame takes
+        // away for good.
         if self.rejoin_required() {
             return;
         }
         if !self.bootstrapped.load(Ordering::Acquire) {
+            if self.topology.dynamic() {
+                self.fetch_metadata().await;
+            }
             self.copy_if_gaining().await;
             return;
         }
@@ -2257,6 +2303,30 @@ impl Node {
         }
     }
 
+    /// Metadata anti-entropy: pulls any entries above the installed epoch from
+    /// a rotating peer. Covers a node that missed the latest epochs entirely
+    /// (no local gap to detect) as well as one holding an uninstallable future
+    /// entry; the peer replies only if it has something newer.
+    async fn fetch_metadata(&self) {
+        let peers: Vec<NodeId> = self
+            .topology
+            .nodes()
+            .into_iter()
+            .filter(|&n| n != self.id)
+            .collect();
+        if !peers.is_empty() {
+            let next = self.metadata_turn.fetch_add(1, Ordering::Relaxed) as usize;
+            let peer = peers[next % peers.len()];
+            self.send(
+                peer,
+                Message::MetadataFetch {
+                    after_epoch: self.installed_epoch(),
+                },
+            )
+            .await;
+        }
+    }
+
     /// Control-plane sweep: converge the metadata log without operator action.
     ///
     /// 1. **Gap-fill** — if this node holds a decided entry it cannot install
@@ -2277,27 +2347,8 @@ impl Node {
             return;
         }
 
-        // (1) Metadata anti-entropy: pull any entries above our installed epoch from
-        // a rotating peer. Covers a node that missed the latest epochs entirely (no
-        // local gap to detect) as well as one holding an uninstallable future entry;
-        // the peer replies only if it has something newer.
-        let peers: Vec<NodeId> = self
-            .topology
-            .nodes()
-            .into_iter()
-            .filter(|&n| n != self.id)
-            .collect();
-        if !peers.is_empty() {
-            let next = self.metadata_turn.fetch_add(1, Ordering::Relaxed) as usize;
-            let peer = peers[next % peers.len()];
-            self.send(
-                peer,
-                Message::MetadataFetch {
-                    after_epoch: self.installed_epoch(),
-                },
-            )
-            .await;
-        }
+        // (1) Metadata anti-entropy.
+        self.fetch_metadata().await;
 
         // (2) Drive-to-completion: complete any accepted-but-uncommitted epoch.
         // Sort epochs so the order is deterministic (the in-memory map is a HashMap).
@@ -2486,6 +2537,8 @@ impl Node {
     /// partitioned peer holds the min down, and an unheard-from peer blocks
     /// compaction entirely), so dropping that state is safe.
     async fn advance_watermark(&self) {
+        // The live layout the report is made, and the reports counted, under.
+        let live_since = self.live_since();
         // The disjoint replica set this node belongs to.
         let mut all_nodes = self.topology.nodes();
         let shard_peers = self.shard_peers();
@@ -2533,13 +2586,15 @@ impl Node {
                 applied_through: mine,
                 fenced,
                 copied,
+                live_since,
             },
         )
         .await;
 
         let watermark = {
             let mut absent = self.absent.lock().expect("absent poisoned");
-            let mut watermarks = self.peer_watermarks.lock().expect("watermarks poisoned");
+            let mut reports = self.peer_watermarks.lock().expect("watermarks poisoned");
+            let watermarks = reports.under(live_since);
             // Evict reports from nodes no longer in the topology, or a removed
             // peer's last (stale) watermark would hold compaction back forever.
             watermarks.retain(|node, _| all_nodes.contains(node));
@@ -2561,7 +2616,25 @@ impl Node {
             }
             complete.then_some(wm)
         };
-        if let Some(watermark) = watermark {
+        // Below its floor a write counts as applied, and anti-entropy ships
+        // none. A node the transition in progress gives slots holds, of them,
+        // every write up to the drain point once it copied them, and none
+        // after the activation, which it may install late: it compacts no
+        // further than the drain point, and not at all before that is known.
+        // A node in no shard of its live layout (dropped) compacts nothing.
+        let ceiling = {
+            let reconfig = self.reconfig.lock().expect("reconfig poisoned");
+            match reconfig
+                .transition
+                .as_ref()
+                .filter(|t| t.gainers.contains(&self.id))
+            {
+                Some(transition) => reconfig::drain_point(transition, &reconfig.reported),
+                None if shard_peers.is_empty() => None,
+                None => watermark,
+            }
+        };
+        if let Some(watermark) = watermark.zip(ceiling).map(|(w, c)| w.min(c)) {
             self.compact(watermark).await;
         }
         self.prune_decisions().await;
@@ -2649,8 +2722,10 @@ impl Node {
         };
         let now = Instant::now();
         let quorum = crate::api::slow_quorum_size(shard_peers.len());
+        let live_since = self.live_since();
         let mut absent = self.absent.lock().expect("absent poisoned");
-        let mut watermarks = self.peer_watermarks.lock().expect("watermarks poisoned");
+        let mut reports = self.peer_watermarks.lock().expect("watermarks poisoned");
+        let watermarks = reports.under(live_since);
         for &peer in shard_peers {
             if peer == self.id || absent.contains_key(&peer) {
                 continue;
@@ -2768,6 +2843,7 @@ impl Node {
                     applied_through: mine,
                     fenced: self.reportable_fence(),
                     copied: self.copied_report(),
+                    live_since: self.live_since(),
                 },
             )
             .await;
@@ -3297,7 +3373,25 @@ impl Node {
                 if !self.bootstrapped.load(Ordering::Acquire) {
                     return out;
                 }
+                // Nor does a node the requester is no shard peer of under
+                // this node's layout: dropped from the layout, or moved to
+                // another shard, it compacts without the requester's
+                // reports, and may have compacted away what the requester
+                // lacks — which its coverage would then vouch for.
+                let layout = self.topology.layout();
+                if layout
+                    .node_shard(self.id)
+                    .is_none_or(|shard| layout.node_shard(from) != Some(shard))
+                {
+                    return out;
+                }
+                // Under one live layout: one that goes live meanwhile leaves
+                // the requester to ask again.
+                let live_since = self.live_since();
                 let (watermark, coverage, commands) = self.export_missing(&known);
+                if self.live_since() != live_since {
+                    return out;
+                }
                 // The coverage vouches for what a peer may compact past.
                 if !self.bound_clock().await {
                     return out;
@@ -3308,6 +3402,7 @@ impl Node {
                         id,
                         watermark,
                         coverage,
+                        live_since,
                         commands,
                     },
                 ));
@@ -3347,6 +3442,7 @@ impl Node {
                         id,
                         watermark,
                         coverage,
+                        live_since: epoch,
                         commands: Vec::new(),
                     },
                 ));
@@ -3488,6 +3584,7 @@ impl Node {
                 id,
                 watermark,
                 coverage,
+                live_since,
                 commands,
             } => {
                 let tx = self
@@ -3497,7 +3594,7 @@ impl Node {
                     .get(&id)
                     .cloned();
                 if let Some(tx) = tx {
-                    let _ = tx.send((watermark, coverage, commands));
+                    let _ = tx.send((watermark, coverage, live_since, commands));
                 }
             }
             Message::JoinProof { id, epoch, vouched } => {
@@ -3514,6 +3611,7 @@ impl Node {
                 applied_through,
                 fenced,
                 copied,
+                live_since,
             } => {
                 // A joiner's first report ends the hold its contact kept for
                 // it (see `JoinHold`): from here on it is counted itself.
@@ -3521,10 +3619,17 @@ impl Node {
                     .lock()
                     .expect("join holds poisoned")
                     .remove(&from);
-                self.peer_watermarks
-                    .lock()
-                    .expect("watermarks poisoned")
-                    .insert(from, applied_through);
+                // Counted under this node's live layout only: one made under
+                // another vouches for other keys — a gainer's, before the
+                // activation, for none.
+                let mine = self.live_since();
+                if live_since == mine {
+                    self.peer_watermarks
+                        .lock()
+                        .expect("watermarks poisoned")
+                        .under(mine)
+                        .insert(from, applied_through);
+                }
                 let mut reconfig = self.reconfig.lock().expect("reconfig poisoned");
                 if let Some(fenced) = fenced {
                     reconfig.reported.insert(from, fenced);
@@ -5445,14 +5550,19 @@ impl Node {
     /// recovery planned for it (see [`planned_shard`](Self::planned_shard)).
     fn shard_reports(shard: &ShardPlan, resp: &[(NodeId, RecoverResp)]) -> ShardReports {
         let mut counts = ShardReports::default();
-        for (_, report) in resp
+        for (from, report) in resp
             .iter()
             .filter(|(from, _)| shard.replicas.contains(from))
         {
             counts.heard += 1;
             match report {
                 RecoverResp::Ok(f) if f.known => counts.known += 1,
-                RecoverResp::NotWitnessed { redundant: false } => counts.blind += 1,
+                RecoverResp::NotWitnessed { redundant: false } => {
+                    counts.blind += 1;
+                    if shard.electorate.contains(from) {
+                        counts.blind_electorate += 1;
+                    }
+                }
                 RecoverResp::NotWitnessed { redundant: true } => counts.redundant += 1,
                 _ => {}
             }
@@ -5461,12 +5571,13 @@ impl Node {
     }
 
     /// Whether a routed recovery has heard enough to decide: an invalidation
-    /// is already proven (an invalidated report, or a slow quorum of one shard
-    /// that never witnessed the transaction), or every route shard has a slow
-    /// quorum of reports, a report from below its watermark, or has answered
-    /// in full. A decided transaction one shard compacted needs a report from
-    /// a replica that applied it (see [`route_verdict`](Self::route_verdict)):
-    /// until one arrives, every other shard is heard out in full.
+    /// is already proven (an invalidated report, or replicas of one shard
+    /// that never witnessed the transaction ruling out its commit), or every
+    /// route shard has a slow quorum of reports, a report from below its
+    /// watermark, or has answered in full. A decided transaction one shard
+    /// compacted needs a report from a replica that applied it (see
+    /// [`route_verdict`](Self::route_verdict)): until one arrives, every
+    /// other shard is heard out in full.
     fn route_settled(&self, shards: &[ShardPlan], resp: &[(NodeId, RecoverResp)]) -> bool {
         let known = || {
             resp.iter().filter_map(|(_, r)| match r {
@@ -5477,7 +5588,7 @@ impl Node {
         if known().any(RecoverFields::invalidated)
             || shards
                 .iter()
-                .any(|s| Self::shard_reports(s, resp).blind >= s.slow_q)
+                .any(|s| Self::shard_reports(s, resp).rule_out_a_commit(s))
         {
             return true;
         }
@@ -5499,12 +5610,14 @@ impl Node {
     ///
     /// 1. **Invalidated** somewhere — a recovery already proved the
     ///    transaction never committed: abort it again.
-    /// 2. A slow quorum of one shard **never witnessed** it, each having
-    ///    durably promised this ballot: it never committed (a commit needs a
-    ///    PreAccept quorum on every shard, which would meet that quorum), and
-    ///    never will (those replicas refuse the original coordinator below the
-    ///    promise, and no recovery can gather a witnessed quorum there either).
-    ///    Invalidate.
+    /// 2. Replicas of one shard that **never witnessed** it, each having
+    ///    durably promised this ballot, meet every quorum that could commit it
+    ///    there ([`ShardReports::rule_out_a_commit`]: a slow quorum of them in
+    ///    a shard of odd size, two in a shard of four): it never committed (a
+    ///    commit needs a PreAccept quorum on every shard, which would meet
+    ///    them), and never will (those replicas refuse the original
+    ///    coordinator below the promise, and no recovery can gather a
+    ///    witnessed quorum there either). Invalidate.
     /// 3. A report at `Committed` or beyond: the decision exists. Recover it
     ///    on every shard still holding it — a shard reporting from below its
     ///    watermark applied it and compacted it away — gated on a slow quorum
@@ -5534,7 +5647,7 @@ impl Node {
             .iter()
             .map(|s| (s, Self::shard_reports(s, resp)))
             .collect();
-        if counts.iter().any(|(s, c)| c.blind >= s.slow_q) {
+        if counts.iter().any(|(s, c)| c.rule_out_a_commit(s)) {
             return Verdict::Invalidate;
         }
         let lacking = |s: &ShardPlan, c: &ShardReports| {
@@ -5845,6 +5958,13 @@ impl Node {
         Ok(txn)
     }
 
+    /// Whether this node is still joining: opened with
+    /// [`begin_join`](Node::begin_join), and neither joined yet nor holding
+    /// the slots a layout transition gave it.
+    pub fn is_joining(&self) -> bool {
+        !self.bootstrapped.load(Ordering::Acquire)
+    }
+
     /// Marks this node as joining: until [`join`](Node::join) completes,
     /// consensus messages are buffered rather than processed. Call this before
     /// the epoch that adds this node is installed, so nothing is lost in the gap.
@@ -5867,21 +5987,21 @@ impl Node {
     /// what was compacted ([`await_reinstated`](Self::await_reinstated)).
     ///
     /// `contact` must be a replica of this node's shard: only it holds what
-    /// this node is to copy, and its floor is this node's shard's (#360). A
-    /// node that already copied its slots during the layout transition that
-    /// made it a replica has nothing to join: `Ok(0)`.
+    /// this node is to copy, and its floor is this node's shard's (#360). The
+    /// join waits for the layout that makes this node a replica
+    /// ([`await_membership`](Self::await_membership)). A node that already
+    /// copied its slots during the layout transition that made it a replica
+    /// has nothing to join: `Ok(0)`.
     pub async fn join(&self, contact: NodeId) -> anyhow::Result<usize> {
+        let (layout, shard) = self.await_membership(contact).await?;
         if self.copied_for_live() {
             return Ok(0);
         }
-        let layout = self.topology.layout();
-        if let Some(shard) = layout.node_shard(self.id) {
-            anyhow::ensure!(
-                layout.node_shard(contact) == Some(shard),
-                "{contact:?} is no replica of this node's shard under epoch {}: join through one",
-                layout.epoch()
-            );
-        }
+        anyhow::ensure!(
+            layout.node_shard(contact) == Some(shard),
+            "{contact:?} is no replica of this node's shard under epoch {}: join through one",
+            layout.epoch()
+        );
         let bound = self
             .absent
             .lock()
@@ -5949,6 +6069,7 @@ impl Node {
         // It is at least what the contact vouched for (`JoinProof`), which
         // its hold kept every peer's compaction below meanwhile — however
         // many peers' coverage a report of this shard needs.
+        let live_since = self.live_since();
         let mine = self.report(&self.shard_peers());
         let peers: Vec<NodeId> = self
             .topology
@@ -5963,6 +6084,7 @@ impl Node {
                     applied_through: mine,
                     fenced: self.reportable_fence(),
                     copied: self.copied_report(),
+                    live_since,
                 },
             )
             .await;
@@ -6072,6 +6194,37 @@ impl Node {
         Ok(())
     }
 
+    /// Waits, for at most [`TRANSITION_ROUNDS`] collect timeouts, until the
+    /// installed layout makes this node a replica — the epoch that adds it
+    /// may still be on its way when the join starts, or wait on a transition
+    /// draining — fetching `contact`'s decided epochs meanwhile. Returns that
+    /// layout and this node's shard in it. A join under a layout without this
+    /// node would own no key: it would install none of the contact's state,
+    /// adopt its floor, and then serve without everything below it.
+    async fn await_membership(&self, contact: NodeId) -> anyhow::Result<(Arc<Layout>, ShardId)> {
+        let deadline = Self::after(self.settings.collect_timeout * TRANSITION_ROUNDS);
+        loop {
+            let layout = self.topology.layout();
+            if let Some(shard) = layout.node_shard(self.id) {
+                return Ok((layout, shard));
+            }
+            anyhow::ensure!(
+                self.topology.dynamic() && Instant::now() < deadline,
+                "{:?} is no replica under epoch {}: join once a layout that adds it is installed",
+                self.id,
+                layout.epoch()
+            );
+            self.send(
+                contact,
+                Message::MetadataFetch {
+                    after_epoch: self.installed_epoch(),
+                },
+            )
+            .await;
+            tokio::time::sleep(self.settings.recovery_interval).await;
+        }
+    }
+
     /// This node's amnesia fence while its join is pending (#312): a
     /// contact must vouch at or above it before the join installs anything.
     fn pending_fence(&self) -> Option<Timestamp> {
@@ -6097,10 +6250,12 @@ impl Node {
         let deadline = Instant::now() + self.settings.amnesia_join_timeout;
         let mut reported = None;
         loop {
+            let live_since = self.live_since();
             reported = self
                 .peer_watermarks
                 .lock()
                 .expect("watermarks poisoned")
+                .under(live_since)
                 .get(&contact)
                 .copied()
                 .or(reported);
@@ -6449,7 +6604,7 @@ impl Node {
         let mut imported = Imported::default();
         let mut apply_failed = false;
         let mut proof_slot: Option<PendingProof<'_>> = None;
-        let (watermark, coverage, commands) = if let Some(known) = known {
+        let (watermark, coverage, live_since, commands) = if let Some(known) = known {
             self.sync_round(contact, timeout, |id| Message::SyncRequest { id, known })
                 .await?
         } else {
@@ -6463,7 +6618,7 @@ impl Node {
             );
             // The contact's vouch follows its header on the same link
             // ([`Message::JoinProof`]).
-            let ((mut watermark, coverage, mut commands), slot) =
+            let ((mut watermark, coverage, live_since, mut commands), slot) =
                 self.fetch_join_header(contact, timeout).await?;
             proof_slot = Some(slot);
             // Then the applied commands, page by page, before any snapshot
@@ -6504,6 +6659,7 @@ impl Node {
                             applied_through: Timestamp::MIN,
                             fenced: None,
                             copied: None,
+                            live_since: self.live_since(),
                         },
                     )
                     .await;
@@ -6560,7 +6716,7 @@ impl Node {
                     None => break,
                 }
             }
-            (watermark, coverage, commands)
+            (watermark, coverage, live_since, commands)
         };
 
         // A transaction this node minted, shipped back by a peer (a node that
@@ -6685,9 +6841,14 @@ impl Node {
         // A completed round (even one that shipped nothing — the strongest
         // evidence) proves this node holds everything the contact had applied
         // below its reported coverage, clamping this node's watermark reports.
-        // Only a same-shard contact witnesses this shard's transactions, and a
-        // failed local apply voids the claim for this round.
-        if !apply_failed && self.topology.node_shard(contact) == self.topology.node_shard(self.id) {
+        // Only a same-shard contact under the same live layout witnesses this
+        // shard's transactions: under another, this node skipped those on keys
+        // it does not own here, and may own one next. A failed local apply
+        // voids the claim for this round.
+        if !apply_failed
+            && live_since == self.live_since()
+            && self.topology.node_shard(contact) == self.topology.node_shard(self.id)
+        {
             self.record_sync_coverage(contact, coverage);
         }
         // Tripwire: an anti-entropy contact that already truncated above what
@@ -6741,11 +6902,11 @@ impl Node {
     /// can ([`ShardMap::rebalanced`]): none with as many shards, only those a
     /// new shard needs, or a removed one leaves, otherwise.
     ///
-    /// A change that adds a replica to a shard of three, or removes one,
-    /// installs `shards` at `epoch`: a new replica then joins through one its
-    /// shard kept ([`join`](Node::join)). Any other change — replacing a
-    /// replica, adding two, shrinking five to three, adding or removing shards,
-    /// moving a replica to another shard — takes two epochs (see `reconfig`):
+    /// A change that adds a replica to a shard of three installs `shards` at
+    /// `epoch`: a new replica then joins through one its shard kept
+    /// ([`join`](Node::join)). Any other change — removing or replacing a
+    /// replica, adding two, adding or removing shards, moving a replica to
+    /// another shard — takes two epochs (see `reconfig`):
     /// `epoch` decides a transition, during which writes to the keys it moves
     /// are refused with [`TopologyChanging`] while the writes in flight on them
     /// drain and every node gaining slots copies them; the next epoch installs
@@ -6916,13 +7077,16 @@ impl Node {
     }
 
     /// The drain point of the transition first decided at `since`, once it is
-    /// in progress here, has drained (see [`reconfig::drained`]), and every
-    /// node gaining slots reported it copied them.
+    /// in progress here, has drained (see [`reconfig::drained`]), every node
+    /// keeping a moved slot reported past it, and every node gaining slots
+    /// reported it copied them.
     fn ready_to_activate(&self, since: u64) -> Option<Timestamp> {
+        let live_since = self.live_since();
         let reports = self
             .peer_watermarks
             .lock()
             .expect("watermarks poisoned")
+            .under(live_since)
             .clone();
         let reconfig = self.reconfig.lock().expect("reconfig poisoned");
         let transition = reconfig.transition.as_ref().filter(|t| t.since == since)?;
@@ -6934,7 +7098,11 @@ impl Node {
                 reconfig.copies.get(node) == Some(&since)
             }
         });
-        (copied && reconfig::drained(&transition.live, point, &reports)).then_some(point)
+        let kept = transition
+            .keepers
+            .iter()
+            .all(|node| reports.get(node).is_some_and(|&report| report > point));
+        (copied && kept && reconfig::drained(&transition.live, point, &reports)).then_some(point)
     }
 
     /// Copies the slots this node gains in the transition in progress, if it
@@ -6978,10 +7146,12 @@ impl Node {
                 reconfig.reported.clone(),
             )
         };
+        let live_since = self.live_since();
         let reports = self
             .peer_watermarks
             .lock()
             .expect("watermarks poisoned")
+            .under(live_since)
             .clone();
         let mut gained: Vec<(usize, Vec<usize>)> = reconfig::gained_slots(&live, &pending, self.id)
             .into_iter()
@@ -9400,6 +9570,7 @@ mod tests {
             },
             fenced: None,
             copied: None,
+            live_since: 0,
         };
         let micros_of = |m: Message| match m {
             Message::Watermark {
@@ -9485,6 +9656,60 @@ mod tests {
         assert!(
             matches!(node.route_verdict(&plans, &resp), Verdict::Invalidate),
             "a slow quorum of the planned shard never witnessed it"
+        );
+    }
+
+    /// A shard of four commits through three of its replicas: two that never
+    /// witnessed a transaction meet every such quorum, and rule its commit
+    /// out as a slow quorum of them would. Two holding it and two blind is
+    /// an invalidation; counting slow quorums only, it was undecided for
+    /// good, and the transaction held back every write after it on its keys.
+    #[tokio::test]
+    async fn two_blind_replicas_of_four_rule_out_a_commit() {
+        use super::{RecoverFields, RecoverResp, Verdict};
+        use crate::clock::Ballot;
+
+        let (node, _topology, events) = reshardable_node();
+        let keys = Node::keys_of(&events);
+        let layout = crate::api::Layout::new(
+            0,
+            vec![(0..4).map(NodeId).collect(), (4..7).map(NodeId).collect()],
+        );
+        let (plans, _) = Node::plan(&layout, &keys, &[]);
+        assert!(plans.iter().any(|p| p.replicas.len() == 4));
+
+        let held = || {
+            RecoverResp::Ok(RecoverFields {
+                epoch: 0,
+                known: true,
+                status: Status::PreAccepted,
+                accepted: Ballot(Timestamp::MIN),
+                execute_at: Timestamp::MIN,
+                deps: Vec::new(),
+                superseding_rejects: false,
+                wait: false,
+                keys: Vec::new(),
+                events: Vec::new(),
+                route: None,
+            })
+        };
+        let blind = || RecoverResp::NotWitnessed { redundant: false };
+        let mut resp = vec![
+            (NodeId(0), held()),
+            (NodeId(1), held()),
+            (NodeId(2), blind()),
+            (NodeId(4), held()),
+            (NodeId(5), held()),
+        ];
+        assert!(
+            !matches!(node.route_verdict(&plans, &resp), Verdict::Invalidate),
+            "one blind replica of four rules nothing out"
+        );
+        resp.push((NodeId(3), blind()));
+        assert!(node.route_settled(&plans, &resp));
+        assert!(
+            matches!(node.route_verdict(&plans, &resp), Verdict::Invalidate),
+            "two blind replicas of four rule the commit out"
         );
     }
 

@@ -368,12 +368,14 @@ control plane, everything else is Accord.
     transaction, casts no vote, answers nothing and records nothing.
 
   *Shipped: two-phase layout changes,* for (iii) (`reconfig.rs`). A change
-  after which every quorum of each changed shard still meets every quorum it had
-  (one replica added to a shard of three, one removed) installs at once: the
-  epochs above suffice, and a joiner catches up through the replicas its shard
-  kept. Any other change (replacing a replica, adding two, shrinking five to
-  three) takes two decided entries, so that each key has one live layout at any
-  time:
+  that only adds replicas, after which every quorum of each changed shard still
+  meets every quorum it had (one replica added to a shard of three), installs at
+  once: the epochs above suffice, and a joiner catches up through the replicas
+  its shard kept. Any other change (removing or replacing a replica, adding two)
+  takes two decided entries, so that each key has one live layout at any time —
+  a removal too: two installed at once in a row could leave a transaction in
+  flight from before them without a read quorum of replicas that stay, its
+  execution waiting on writes the replicas that left never get (#370):
   1. A *transition* keeps the old layout live — for ownership, watermarks,
      coverage, anti-entropy, compaction and recovery — and names the new one.
      Coordinators refuse writes to the keys whose replica set changes
@@ -393,7 +395,11 @@ control plane, everything else is Accord.
      fence, and the reporter holds nothing unapplied below it, so every write on
      a moved key that ever commits is applied there, and no other will. Every
      shard is waited for, so a write that also touches an unchanged shard is
-     applied there too.
+     applied there too. So is every replica that keeps a moved slot (a
+     replacement's other replicas): one that lagged would catch up through
+     anti-entropy under the new layout, where a replica that copied the slot holds
+     its writes as events, with no command to ship, and vouches for them all the
+     same.
   5. An *activation* entry installs the new layout, with the drain point and a
      clock floor: the proposer's reading plus three skews, which it waits past,
      and which every replica raises its clock to as it installs the entry. A

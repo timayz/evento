@@ -18,8 +18,8 @@ use std::time::Duration;
 
 use evento_accord::{
     AppliedEntry, DataStore, DynamicTopology, HybridLogicalClock, InMemoryDataStore,
-    InMemoryJournal, InMemoryNetwork, Journal, MessageSink, Node, NodeConfig, NodeId, RegionId,
-    Topology,
+    InMemoryJournal, InMemoryNetwork, Journal, LinkFilter, Message, MessageSink, Node, NodeConfig,
+    NodeId, RegionId, Topology,
 };
 use evento_core::Event;
 
@@ -385,7 +385,10 @@ async fn a_join_refuses_a_non_empty_store() {
         await_committed(&n.store, 1).await;
     }
 
-    let d = spawn_node(NodeId(3), 0, vec![abc.clone()], &net);
+    // Node 3 holds the layout that adds it already: what refuses the join
+    // is its store.
+    let abcd = vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3)];
+    let d = spawn_node(NodeId(3), 0, vec![abcd], &net);
     let stale = evento_accord::TxnId(evento_accord::Timestamp::MIN);
     d.store
         .apply(
@@ -408,6 +411,53 @@ async fn a_join_refuses_a_non_empty_store() {
         "nothing was fetched or installed"
     );
     assert_eq!(nodes[0].node.metrics().snapshot_pages, 0);
+}
+
+/// A join started before the joiner installed the layout that adds it — a
+/// host joining it as soon as `change_topology` returns, the epoch still on
+/// its way — waits for that layout. Under the one before, the joiner would
+/// own no key: it would install none of the contact's state, adopt the
+/// contact's floor, and serve without every write from before it joined.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_join_waits_for_the_layout_that_adds_the_joiner() {
+    let net = InMemoryNetwork::new();
+    let abc = vec![NodeId(0), NodeId(1), NodeId(2)];
+    let abcd = vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3)];
+    let nodes: Vec<TestNode> = abc
+        .iter()
+        .map(|&id| spawn_node(id, 0, vec![abc.clone()], &net))
+        .collect();
+    nodes[0]
+        .node
+        .write(vec![event("acc", 1, "Opened")])
+        .await
+        .unwrap();
+    for n in &nodes {
+        await_committed(&n.store, 1).await;
+    }
+
+    let d = spawn_node(NodeId(3), 0, vec![abc.clone()], &net);
+    d.node.begin_join();
+    // Node 3 learns of epoch 1 only by asking for it.
+    let no_commit: LinkFilter = Arc::new(|_, to, message| {
+        to == NodeId(3) && matches!(message, Message::ConfigCommit { .. })
+    });
+    net.set_link_filter(Some(no_commit));
+    nodes[0]
+        .node
+        .change_topology(1, vec![abcd.clone()])
+        .await
+        .unwrap();
+    assert_eq!(d.topology.epoch(), 0, "node 3 has not installed epoch 1");
+
+    d.node.join(NodeId(0)).await.expect("joins under epoch 1");
+    net.set_link_filter(None);
+    assert_eq!(
+        d.store.committed_events().len(),
+        1,
+        "node 3 holds the write from before it joined"
+    );
+    assert_eq!(d.topology.epoch(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -523,11 +573,13 @@ async fn a_node_leaves_and_the_cluster_continues() {
     let abc = vec![NodeId(0), NodeId(1), NodeId(2)];
     let abcd = vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3)];
 
-    // A 4-node cluster at epoch 0.
+    // A 4-node cluster at epoch 0. A removal drains the writes in flight
+    // first, through the recovery sweep's watermark gossip.
     let nodes: Vec<TestNode> = abcd
         .iter()
         .map(|&id| spawn_node(id, 0, vec![abcd.clone()], &net))
         .collect();
+    let _sweeps: Vec<_> = nodes.iter().map(|n| n.node.start_recovery()).collect();
     nodes[0]
         .node
         .write(vec![event("acc", 1, "Opened")])
@@ -537,13 +589,14 @@ async fn a_node_leaves_and_the_cluster_continues() {
         await_len(&n.store, 1).await;
     }
 
-    // Node D leaves: A coordinates epoch 1 with the smaller layout.
+    // Node D leaves: A coordinates the smaller layout, a transition at epoch 1
+    // that epoch 2 ends.
     nodes[0]
         .node
         .change_topology(1, vec![abc.clone()])
         .await
         .unwrap();
-    await_epoch(&nodes[3].topology, 1).await; // the departing node learns it is out
+    await_epoch(&nodes[3].topology, 2).await; // the departing node learns it is out
 
     // The remaining three continue serving writes over the smaller quorum.
     nodes[0]
@@ -608,17 +661,20 @@ async fn concurrent_recovery_of_one_epoch_converges() {
     // the preferred proposer commits and the rest adopt that decision.
     let net = InMemoryNetwork::new();
     let abcde = vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
-    let abcd = vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3)];
+    let abcdef: Vec<NodeId> = (0..6).map(NodeId).collect();
 
-    let nodes: Vec<TestNode> = abcde
+    let mut nodes: Vec<TestNode> = abcde
         .iter()
         .map(|&id| spawn_node(id, 0, vec![abcde.clone()], &net))
         .collect();
+    let f = spawn_node(NodeId(5), 0, vec![abcde.clone()], &net);
+    f.node.begin_join();
 
-    // Node 0 makes epoch 1 durable (a quorum accepts) but crashes before committing.
+    // Node 0 makes epoch 1 — node F added — durable (a quorum accepts) but
+    // crashes before committing.
     nodes[0]
         .node
-        .propose_topology(1, vec![abcd.clone()])
+        .propose_topology(1, vec![abcdef.clone()])
         .await
         .unwrap();
     net.crash(NodeId(0));
@@ -637,14 +693,15 @@ async fn concurrent_recovery_of_one_epoch_converges() {
             .expect("recovery converges, not duels to failure");
         assert_eq!(
             decided,
-            evento_accord::ConfigEntry::active(vec![abcd.clone()]),
+            evento_accord::ConfigEntry::active(vec![abcdef.clone()]),
             "all recover the same layout"
         );
     }
 
+    nodes.push(f);
     for n in &nodes[1..] {
         await_epoch(&n.topology, 1).await;
-        assert_eq!(n.topology.nodes(), abcd);
+        assert_eq!(n.topology.nodes(), abcdef);
     }
 }
 
@@ -655,18 +712,25 @@ async fn racing_operator_changes_converge() {
     // report that same committed layout rather than erroring out under a ballot duel.
     let net = InMemoryNetwork::new();
     let abcde = vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
-    let drop_e = vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3)];
-    let drop_d = vec![NodeId(0), NodeId(1), NodeId(2), NodeId(4)];
+    let add_f = [abcde.clone(), vec![NodeId(5)]].concat();
+    let add_g = [abcde.clone(), vec![NodeId(6)]].concat();
 
     let nodes: Vec<TestNode> = abcde
         .iter()
         .map(|&id| spawn_node(id, 0, vec![abcde.clone()], &net))
         .collect();
+    let spares: Vec<TestNode> = [5, 6]
+        .into_iter()
+        .map(|id| spawn_node(NodeId(id), 0, vec![abcde.clone()], &net))
+        .collect();
+    for spare in &spares {
+        spare.node.begin_join();
+    }
 
     let n1 = nodes[1].node.clone();
     let n2 = nodes[2].node.clone();
-    let x = drop_e.clone();
-    let y = drop_d.clone();
+    let x = add_f.clone();
+    let y = add_g.clone();
     let w1 = tokio::spawn(async move { n1.change_topology(1, vec![x]).await });
     let w2 = tokio::spawn(async move { n2.change_topology(1, vec![y]).await });
 
@@ -682,7 +746,7 @@ async fn racing_operator_changes_converge() {
         .expect("operator change 2 converges");
     assert_eq!(d1, d2, "both operators converge on the one chosen layout");
     assert!(
-        d1 == vec![drop_e.clone()] || d1 == vec![drop_d.clone()],
+        d1 == vec![add_f.clone()] || d1 == vec![add_g.clone()],
         "the chosen layout is one of the two proposed: {d1:?}"
     );
 
@@ -702,18 +766,25 @@ async fn concurrent_changes_on_one_node_converge() {
     // own replies, so neither starves the other into a quorum timeout.
     let net = InMemoryNetwork::new();
     let abcde = vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
-    let drop_e = vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3)];
-    let drop_d = vec![NodeId(0), NodeId(1), NodeId(2), NodeId(4)];
+    let add_f = [abcde.clone(), vec![NodeId(5)]].concat();
+    let add_g = [abcde.clone(), vec![NodeId(6)]].concat();
 
     let nodes: Vec<TestNode> = abcde
         .iter()
         .map(|&id| spawn_node(id, 0, vec![abcde.clone()], &net))
         .collect();
+    let spares: Vec<TestNode> = [5, 6]
+        .into_iter()
+        .map(|id| spawn_node(NodeId(id), 0, vec![abcde.clone()], &net))
+        .collect();
+    for spare in &spares {
+        spare.node.begin_join();
+    }
 
     let a = nodes[1].node.clone();
     let b = nodes[1].node.clone();
-    let x = drop_e.clone();
-    let y = drop_d.clone();
+    let x = add_f.clone();
+    let y = add_g.clone();
     let w1 = tokio::spawn(async move { a.change_topology(1, vec![x]).await });
     let w2 = tokio::spawn(async move { b.change_topology(1, vec![y]).await });
 
@@ -729,7 +800,7 @@ async fn concurrent_changes_on_one_node_converge() {
         .expect("change 2 converges");
     assert_eq!(d1, d2, "both proposals report the one chosen layout");
     assert!(
-        d1 == vec![drop_e.clone()] || d1 == vec![drop_d.clone()],
+        d1 == vec![add_f.clone()] || d1 == vec![add_g.clone()],
         "the chosen layout is one of the two proposed: {d1:?}"
     );
     for n in &nodes {
@@ -849,7 +920,8 @@ async fn metadata_log_survives_restart() {
     let ids = vec![NodeId(0), NodeId(1), NodeId(2)];
     let abc = ids.clone();
     let abcd = vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3)];
-    let abc_only = vec![NodeId(0), NodeId(1)];
+    let abcde: Vec<NodeId> = (0..5).map(NodeId).collect();
+    let abcdef: Vec<NodeId> = (0..6).map(NodeId).collect();
 
     // Build nodes keeping the journal handles, so node 0 can be rebuilt over its
     // durable journal (mirrors tests/restart.rs).
@@ -874,17 +946,18 @@ async fn metadata_log_survives_restart() {
         nodes.push(node);
     }
 
-    // Drive three epoch changes; node 0 records each in its durable journal.
+    // Drive three epoch changes, each an addition that installs at once;
+    // node 0 records each in its durable journal.
     nodes[0]
         .change_topology(1, vec![abcd.clone()])
         .await
         .unwrap();
     nodes[0]
-        .change_topology(2, vec![abc.clone()])
+        .change_topology(2, vec![abcde.clone()])
         .await
         .unwrap();
     nodes[0]
-        .change_topology(3, vec![abc_only.clone()])
+        .change_topology(3, vec![abcdef.clone()])
         .await
         .unwrap();
     await_epoch(&topos[0], 3).await;
@@ -908,11 +981,7 @@ async fn metadata_log_survives_restart() {
         3,
         "the restarted node re-installs the committed metadata log up to epoch 3"
     );
-    assert_eq!(
-        fresh_topo.nodes(),
-        abc_only,
-        "and ends at the epoch-3 layout"
-    );
+    assert_eq!(fresh_topo.nodes(), abcdef, "and ends at the epoch-3 layout");
 }
 
 /// One-way latency between two same-region nodes (a local hop).
@@ -1373,21 +1442,46 @@ async fn a_joining_node_does_not_count_toward_a_read_barrier() {
         .expect("a joined node counts toward the barrier");
 }
 
-/// Asks `node` for anti-entropy as `probe` would, and returns the coverage it
-/// answers with: what a requester records as proof `node` holds everything
-/// it applied below.
+/// Asks `node` for anti-entropy as its shard peer `peer` would, and returns
+/// the coverage it answers with: what a requester records as proof `node`
+/// holds everything it applied below. The reply is taken off the link before
+/// `peer` sees it.
 async fn coverage_of(
     net: &Arc<InMemoryNetwork>,
-    probe: &mut tokio::sync::mpsc::Receiver<evento_accord::Envelope>,
     node: NodeId,
+    peer: NodeId,
 ) -> evento_accord::Timestamp {
-    use evento_accord::Message;
+    sync_reply(net, node, peer, Duration::from_secs(5))
+        .await
+        .expect("no anti-entropy reply")
+}
 
-    net.sink(NodeId(9))
+/// [`coverage_of`], or `None` if `node` does not answer within `wait`.
+async fn sync_reply(
+    net: &Arc<InMemoryNetwork>,
+    node: NodeId,
+    peer: NodeId,
+    wait: Duration,
+) -> Option<evento_accord::Timestamp> {
+    const PROBE: u64 = u64::MAX;
+    let reply: Arc<std::sync::Mutex<Option<evento_accord::Timestamp>>> = Arc::default();
+    let seen = Arc::clone(&reply);
+    net.set_link_filter(Some(Arc::new(move |from, to, message| match message {
+        Message::SyncData {
+            id: PROBE,
+            coverage,
+            ..
+        } if from == node && to == peer => {
+            *seen.lock().unwrap() = Some(*coverage);
+            true
+        }
+        _ => false,
+    })));
+    net.sink(peer)
         .send(
             node,
             Message::SyncRequest {
-                id: 1,
+                id: PROBE,
                 known: evento_accord::message::SyncKnown {
                     since: evento_accord::Timestamp::MIN,
                     txns: Vec::new(),
@@ -1396,15 +1490,55 @@ async fn coverage_of(
         )
         .await
         .unwrap();
-    loop {
-        let env = tokio::time::timeout(Duration::from_secs(5), probe.recv())
-            .await
-            .expect("no anti-entropy reply")
-            .expect("probe inbox closed");
-        if let Message::SyncData { coverage, .. } = env.message {
-            return coverage;
+    let deadline = tokio::time::Instant::now() + wait;
+    while tokio::time::Instant::now() < deadline {
+        let answered = *reply.lock().unwrap();
+        if answered.is_some() {
+            net.set_link_filter(None);
+            return answered;
         }
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
+    net.set_link_filter(None);
+    None
+}
+
+/// A node the layout drops has no shard peer left to wait for: it compacts
+/// below its own report alone, and holds none of the writes after it. It
+/// answers no anti-entropy request — from a former peer that has not
+/// installed the change yet either — since its coverage would vouch for
+/// writes it compacted away, or never held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dropped_node_answers_no_sync() {
+    let net = InMemoryNetwork::new();
+    let abcd = vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3)];
+    let bcd = vec![NodeId(1), NodeId(2), NodeId(3)];
+    let nodes: Vec<TestNode> = abcd
+        .iter()
+        .map(|&id| spawn_node(id, 0, vec![abcd.clone()], &net))
+        .collect();
+    let _sweeps: Vec<_> = nodes.iter().map(|n| n.node.start_recovery()).collect();
+    let wait = Duration::from_millis(500);
+    assert!(
+        sync_reply(&net, NodeId(0), NodeId(2), wait).await.is_some(),
+        "a replica answers its shard peer"
+    );
+
+    nodes[1]
+        .node
+        .change_topology(1, vec![bcd.clone()])
+        .await
+        .expect("node 0 is dropped");
+    for _ in 0..1_000 {
+        if !nodes[0].topology.layout().contains(NodeId(0)) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        sync_reply(&net, NodeId(0), NodeId(2), wait).await.is_none(),
+        "the dropped node answers no sync"
+    );
 }
 
 /// A freshly joined node holds provably only what its contact vouched for:
@@ -1435,7 +1569,6 @@ async fn a_joined_node_vouches_for_no_more_than_its_join_proved() {
     for n in &nodes {
         await_len(&n.store, 1).await;
     }
-    let mut probe = net.register(NodeId(9));
 
     // No anti-entropy has run: the contact can vouch for nothing yet.
     let before_join = system_micros();
@@ -1451,7 +1584,7 @@ async fn a_joined_node_vouches_for_no_more_than_its_join_proved() {
     d.node.join(NodeId(0)).await.unwrap();
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    let coverage = coverage_of(&net, &mut probe, NodeId(3)).await;
+    let coverage = coverage_of(&net, NodeId(3), NodeId(1)).await;
     assert!(
         coverage.micros < before_join,
         "a joined node vouched past its join proof: {coverage:?}"
@@ -1461,7 +1594,7 @@ async fn a_joined_node_vouches_for_no_more_than_its_join_proved() {
     let joined = system_micros();
     for _ in 0..200 {
         d.node.sweep().await;
-        if coverage_of(&net, &mut probe, NodeId(3)).await.micros > joined {
+        if coverage_of(&net, NodeId(3), NodeId(1)).await.micros > joined {
             return;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
