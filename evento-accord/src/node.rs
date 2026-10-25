@@ -6459,7 +6459,10 @@ impl Node {
     /// for, never left out), then [`route_verdict`](Self::route_verdict)
     /// decides: invalidate — a shard never witnessed the transaction, so it
     /// never committed (abort it everywhere, [`Message::Invalidate`]) — or
-    /// recover it as usual over the route's shards.
+    /// recover it as usual over the route's shards. What it leaves undecided
+    /// once the late replicas settled, their vote fences may rule out
+    /// ([`never_commits`](Self::never_commits)), as for an unrouted recovery
+    /// (#386).
     #[allow(clippy::too_many_arguments)]
     async fn recover_routed(
         &self,
@@ -6560,6 +6563,14 @@ impl Node {
             }
             verdict = self.route_verdict(&shards, &resp);
         }
+        // What the verdict leaves undecided, the replicas' vote fences may
+        // rule out (#386), as for an unrouted recovery: one refusal meets no
+        // quorum of a shard of three by itself, but beside a replica that
+        // lost its journal and a holder that never accepted, it proves no
+        // commit — the refusal `settle_late` asked for on that very proof.
+        if matches!(verdict, Verdict::Undecided(_)) && self.never_commits(&shards, &resp, false) {
+            verdict = Verdict::Invalidate;
+        }
 
         let planned = match verdict {
             Verdict::Undecided(why) => anyhow::bail!("recovery of {txn:?} undecided: {why}"),
@@ -6567,7 +6578,7 @@ impl Node {
                 tracing::debug!(
                     node = self.id.0,
                     ?txn,
-                    "invalidating a transaction a shard never witnessed"
+                    "invalidating a transaction its route's replicas rule out"
                 );
                 self.broadcast(&targets, Message::Invalidate { txn }).await;
                 return Ok(Attempt::Done(CommitOutcome {
@@ -11126,6 +11137,54 @@ mod tests {
             node.route_verdict(&plans, &resp),
             Verdict::Invalidate
         ));
+    }
+
+    /// In a shard of three, a holder that only pre-accepted the
+    /// transaction, a replica that lost its journal and one late replica:
+    /// were the late one to refuse for good, no quorum could have committed
+    /// it — a fast one needs the late replica, a slow one an accept the
+    /// holder never gave — nor ever will, so it is asked to refuse (#377).
+    /// Refused, the verdict alone is still undecided, one refusal meeting no
+    /// quorum by itself; the fence rule beside the amnesiac and the holder
+    /// decides it (#386).
+    #[tokio::test]
+    async fn an_amnesiac_a_holder_and_one_refusal_rule_a_commit_out() {
+        use super::Verdict;
+
+        let (node, _topology, events) = reshardable_node();
+        let keys = Node::keys_of(&events);
+        let (plans, _) = Node::plan(&node.topology.layout(), &keys, &[]);
+        let mut resp = vec![
+            (NodeId(0), holder(Status::PreAccepted, Vec::new())),
+            (NodeId(1), RecoverResp::Amnesiac),
+            (NodeId(2), RecoverResp::Late),
+            (NodeId(3), holder(Status::PreAccepted, Vec::new())),
+            (NodeId(4), holder(Status::PreAccepted, Vec::new())),
+            (NodeId(5), holder(Status::PreAccepted, Vec::new())),
+        ];
+        assert!(node.route_settled(&plans, &resp));
+        assert!(matches!(
+            node.route_verdict(&plans, &resp),
+            Verdict::Undecided(_)
+        ));
+        assert!(
+            !node.never_commits(&plans, &resp, false),
+            "the late replica may still vote"
+        );
+        assert!(
+            node.never_commits(&plans, &resp, true),
+            "refused, it leaves no quorum that could have committed or could vote"
+        );
+        assert!(!node.may_have_committed(&plans, &resp));
+        resp[2].1 = RecoverResp::NotWitnessed { redundant: false };
+        assert!(
+            matches!(node.route_verdict(&plans, &resp), Verdict::Undecided(_)),
+            "one refusal meets no quorum by itself"
+        );
+        assert!(
+            node.never_commits(&plans, &resp, false),
+            "beside the amnesiac and a holder that never accepted, it rules a commit out"
+        );
     }
 
     /// A replica that accepted the transaction and one that lost its

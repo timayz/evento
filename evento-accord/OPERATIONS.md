@@ -295,7 +295,9 @@ refuses anything else before a vote, and a node never installs it.
   transaction (its coordinator died mid-broadcast), it never committed: past the
   deadline, the recovery has that shard's replicas refuse it for good and
   **invalidates** it — every replica records it aborted, and the write reports a
-  conflict. A recovery that cannot hear a slow quorum of every route shard decides
+  conflict. Fewer refusals do the same beside a replica of that shard that lost
+  its journal and a holder that never accepted the transaction: no quorum could
+  have committed it, and none can ever vote for it (#386). A recovery that cannot hear a slow quorum of every route shard decides
   nothing and the sweep retries — a multi-shard transaction whose coordinator died
   waits for the shard's replicas to come back rather than guessing. A replica's
   promise and refusal are journaled (`Journal::save_promise`), so after a restart it
