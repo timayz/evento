@@ -1401,6 +1401,15 @@ backend (sql/fjall). Phases, in order:
         too)
         (`a_joining_node_answers_a_recovery_of_what_it_never_witnessed`,
         `a_joining_node_votes_once_joined`).
+        A dependency only a lost journal held was never invalidated (#392,
+        the same simulation, one seed in a thousand): its rounds carry no
+        keys and no route, and a replica answered for such a question on
+        the `Dependency` round alone — the `Refuse` round that followed fell
+        through to a plain promise, so the refusals `never_commits` waited
+        for never came, and what waited on the dependency, and the join
+        waiting on that, waited for good. A replica now answers a `Refuse`
+        round for a transaction it does not hold, keys or none
+        (`a_keyless_refuse_round_is_a_refusal`).
   - [ ] **Real-cluster soak + chaos** over days (kills, partitions, clock skew,
         disk pressure, slow disks/links) on actual hardware — zero production
         mileage today.
