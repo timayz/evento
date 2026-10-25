@@ -278,6 +278,10 @@ pub enum Message {
     Watermark {
         applied_through: Timestamp,
         fenced: Option<FenceRecord>,
+        /// The transition (its `since`) for which the sender copied every
+        /// slot it gains, if one is in progress: what its activation waits on
+        /// too.
+        copied: Option<u64>,
     },
     /// Existing replica → joining node (or anti-entropy requester): the
     /// committed state to import.
@@ -517,6 +521,16 @@ pub enum Message {
     /// never committed and never will (`Node::never_commits`). A recovery
     /// predating this variant sheds the frame, as it would no answer.
     Amnesiac { txn: TxnId, ballot: Ballot },
+    /// A node gaining `slots` in a layout transition → a replica of the shard
+    /// that holds them: the page of its store after `after` (a cursor of its
+    /// own, as for [`SnapshotPageRequest`](Message::SnapshotPageRequest)),
+    /// holding only those slots' events. Answered with a
+    /// [`SnapshotPage`](Message::SnapshotPage) of the same `id`.
+    RangePageRequest {
+        id: u64,
+        slots: Vec<u16>,
+        after: Option<Value>,
+    },
 }
 
 impl Message {
@@ -547,6 +561,7 @@ impl Message {
             Message::SyncRequest { .. }
             | Message::SyncData { .. }
             | Message::SnapshotPageRequest { .. }
+            | Message::RangePageRequest { .. }
             | Message::SnapshotPage { .. }
             | Message::Watermark { .. }
             | Message::ConfigPrepare { .. }

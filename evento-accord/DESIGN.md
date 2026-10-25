@@ -313,19 +313,22 @@ control plane, everything else is Accord.
   cluster keeps serving; and a config change surviving the coordinator crashing
   after the value is durable but before commit (another node recovers it).
   **Range movement** composes from these: re-sharding into more shards is a config
-  change, and the new shard's nodes bootstrap *only their key range* (the join's
-  ownership filter); `tests/resharding.rs` moves a key to a new 3-node shard and
-  shows writes route to — and version state is enforced by — its new owners. The
+  change, and the new shard's nodes copy *only the slots they gain* while the
+  change drains (below); `tests/resharding.rs` moves a key to a new 3-node shard
+  and shows writes route to — and version state is enforced by — its new owners,
+  and an existing member moving to another shard copies that shard's keys. The
   config-Paxos **acceptor set is the current members** (a node proposing the next
   epoch is still on this one), so reconfiguration keeps working after the founders
   have left (`config_changes_outlive_the_founders` removes a founder majority and
   still reconfigures). *Remaining:* garbage-collecting a moved range from its old
-  owners, multi-shard read routing for the executor, and handing in-flight
-  transactions over across an epoch change (below).
+  owners (and so giving a node back slots it replicated before), and multi-shard
+  read routing for the executor. A node that gains slots copies their events with
+  their original stamps, so its subscriptions, if they already read past those
+  stamps, do not see them (as broad scans on a multi-shard cluster are local
+  today, a subscription that must see every key runs on a single-shard cluster).
 
-  **Range movement with transactions in flight (#288, #359; epochs and
-  two-phase changes shipped, moves between shards next).** A write in flight
-  while its keys change replicas was exposed four ways:
+  **Range movement with transactions in flight (#288, #359, #360; shipped).**
+  A write in flight while its keys change replicas was exposed four ways:
   (i) a replica that no longer owned a key voted `t0` with no dependencies on an
   empty command, so the write could report success with its events applied
   nowhere;
@@ -407,10 +410,27 @@ control plane, everything else is Accord.
   coverage, join proofs and vouches are keyed by the epoch the live layout became
   live at, so a transition does not reset them.
 
-  For now a change keeps the shard count, keeps a replica of every shard, and
-  moves no replica to another shard: new replicas join through the replicas their
-  shard kept. Moving keys between shards (a slot table, splits, members gaining
-  keys) comes next.
+  *Shipped: moving keys between shards.* A key's shard is its slot's: a stable
+  hash of the key modulo 4096 slots, and a slot table in the layout
+  (`ShardMap`). `change_topology` rebalances the live table over the new shards:
+  with as many shards no slot moves; with another count each shard keeps as many
+  of its slots as its even share allows, and only the slots a new shard needs, or
+  a removed one leaves, move. A change that moves a slot, or gives a replica of
+  the old layout a slot (a replica moving to another shard), is a transition, and
+  every node that gains slots — new or not — copies them during it: from each
+  shard that holds some, through a replica whose watermark report is past that
+  shard's own drain point, it copies those slots' events (`RangePageRequest`, a
+  store page filtered by slot), leaving out what its store already holds. The
+  keys are drained there and take no new write, so the copy is final: every
+  write on them that commits is applied at that replica, and no other will. The
+  activation waits for every gainer to report its copy (`Watermark::copied`),
+  so a new layout goes live with every replica holding its keys. A change that
+  only adds a replica to a shard that keeps others installs at once, and the new
+  replica joins through one of them; `join` refuses a contact of another shard
+  (#360: a joiner adopted such a contact's floor, its own shard's, and treated
+  its new shard's later writes below it as compacted). A change that would give a
+  node a slot it replicated before is refused: its store still holds that slot's
+  events from then, and nothing drops them yet.
 - **M5 — Executor wiring.** ✅ `AccordExecutor` is a real `evento_core::Executor`:
   **writes** are coordinated through the Accord cluster (mapping the outcome to
   `Ok(())` / `WriteError::InvalidOriginalVersion`); **reads, subscriptions, and
@@ -1195,10 +1215,13 @@ backend (sql/fjall). Phases, in order:
         drains the writes in flight on the keys it moves before it installs
         the new layout (two-phase changes, #359;
         `replacing_a_dead_replica_drains_a_write_in_flight`).
-        **Open** (confirmed or plausible, not yet fixed):
-        keys cannot move between shards yet (a change keeps the shard count
-        and every replica's shard); a joiner of a new shard adopting its
-        cross-shard contact's floor (#360) waits on that (#288, see M4).
+        Keys move between shards: a slot table places them, a split moves
+        only the slots the new shard takes, and every node gaining slots
+        copies them while the transition drains
+        (`a_key_range_moves_to_a_new_shard`,
+        `an_existing_member_gains_a_range_with_its_versions`); a join goes
+        through a replica of the joiner's own shard only (#360). #288 is
+        closed.
   - [ ] **Real-cluster soak + chaos** over days (kills, partitions, clock skew,
         disk pressure, slow disks/links) on actual hardware — zero production
         mileage today.
