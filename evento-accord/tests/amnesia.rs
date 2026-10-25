@@ -1731,6 +1731,74 @@ async fn a_routed_recovery_invalidates_what_only_an_amnesiac_held_on_its_shard()
     }
 }
 
+/// T spans both shards, pre-accepted at R and A on the first and at every
+/// replica of the second; its coordinator vanished. R loses its journal. A
+/// routed recovery hears A holding T pre-accepted, R (forgot it) and B
+/// (late): were B to refuse it, no quorum of the first shard could have
+/// committed T — a fast one needs B, a slow one an accept A never gave —
+/// nor ever will. B is asked to refuse for good, and T is invalidated on
+/// both shards, though one refusal meets no quorum of its shard by itself
+/// (#386).
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_routed_recovery_invalidates_what_an_amnesiac_and_a_holder_pre_accepted() {
+    let mut c = Cluster::start_sharded();
+    c.baseline().await;
+    let (ea, eb) = (
+        event(&c.id_in_shard(0, "a"), 1),
+        event(&c.id_in_shard(1, "b"), 1),
+    );
+    let route = vec![Key::of(&ea), Key::of(&eb)];
+    let txn = TxnId(Timestamp {
+        micros: system_micros(),
+        logical: 0,
+        node: NodeId(9),
+    });
+    let voters = [R, A, 3, 4, 5];
+    for to in voters {
+        c.send_routed(
+            to,
+            &route,
+            Message::PreAccept {
+                epoch: 0,
+                txn,
+                keys: route.clone(),
+                events: vec![ea.clone(), eb.clone()],
+            },
+        )
+        .await;
+    }
+    c.expect_replies(voters.len(), "a pre-accept", |m| {
+        matches!(m, Message::PreAcceptOk { .. })
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let join = c.reopen_amnesiac(R, A).await;
+    let recovered = tokio::time::timeout(Duration::from_secs(10), c.nodes[3].recover(txn))
+        .await
+        .expect("the recovery ends");
+    match recovered {
+        Ok(outcome) => assert!(outcome.conflict, "T never committed: {outcome:?}"),
+        Err(err) => panic!("no recovery decided T: {err:#}"),
+    }
+    for i in [A, B, 3, 4, 5] {
+        c.await_status(i, txn, Status::Applied).await;
+    }
+    tokio::time::timeout(Duration::from_secs(20), join)
+        .await
+        .expect("R's join completes")
+        .unwrap()
+        .expect("joined");
+    for shard in 0..2 {
+        assert!(
+            c.shard_stores(shard)
+                .iter()
+                .all(|store| !holds(store, &ea) && !holds(store, &eb)),
+            "T was invalidated: no store holds its events"
+        );
+    }
+}
+
 /// T spans both shards, pre-accepted everywhere on the first and at one
 /// replica of the second, and its coordinator is gone. A recovery within
 /// the coordinator's deadline hears the second shard's two other replicas

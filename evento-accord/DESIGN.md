@@ -255,7 +255,11 @@ control plane, everything else is Accord.
   recovery that handed S's part to the promisers turn the proof into a commit after
   it was acted on. The cost: a routed txn a shard truly never saw is invalidated only
   past the coordinator's deadline, where that shard's replicas can be refused for
-  good. The recovery then **invalidates** the txn (`Message::Invalidate`): every replica holding it
+  good. Fewer refusals than a quorum rule a commit out beside a replica that lost its
+  journal and a holder that never accepted — the amnesia rule of `never_commits`
+  (#312), the very proof `settle_late` asked the refusal on; a routed recovery once
+  took its verdict from the quorum rule alone and left such a txn undecided for good
+  (#386). The recovery then **invalidates** the txn (`Message::Invalidate`): every replica holding it
   un-committed records it applied as an abort without executing it (an abort changes
   nothing, so needs no place in the order), marked by `execute_at = INVALIDATED_AT`
   (`Timestamp::MIN` — no field added to `CommandState`), which a later recovery
@@ -1353,6 +1357,20 @@ backend (sql/fjall). Phases, in order:
         `an_existing_member_gains_a_range_with_its_versions`); a join goes
         through a replica of the joiner's own shard only (#360). #288 is
         closed.
+        A routed recovery left undecided for good what its own late-settle
+        round had proved never committed (#386, found by the two-shard
+        amnesia simulation of #384): one replica of a shard of three held the
+        transaction pre-accepted, one never witnessed it, one had lost its
+        journal. `settle_late` had the blind replica refuse it for good,
+        since with the amnesiac counted as a voter that never votes again no
+        quorum could have committed it or ever vote for it (`never_commits`);
+        but the routed verdict knew only the quorum rule — refusers meeting
+        every quorum by themselves, which one of three never does. The
+        holder's watermark stayed pinned, its shard compacted nothing, and an
+        amnesiac of that shard was never vouched past its fence. A routed
+        recovery now invalidates what `never_commits` rules out once the late
+        replicas settled, as an unrouted one does
+        (`a_routed_recovery_invalidates_what_an_amnesiac_and_a_holder_pre_accepted`).
   - [ ] **Real-cluster soak + chaos** over days (kills, partitions, clock skew,
         disk pressure, slow disks/links) on actual hardware — zero production
         mileage today.
