@@ -1040,8 +1040,10 @@ impl Replica {
     /// transaction is answered from below the watermark rather than
     /// pre-accepted afresh. A transaction this replica does not hold, and
     /// answers for — it owns a part of it (`keys`), is a replica of a shard
-    /// its route names (`routed`), or is asked about it as a dependency of
-    /// its shard ([`RecoveryRound::Dependency`]):
+    /// its route names (`routed`), is asked about it as a dependency of its
+    /// shard ([`RecoveryRound::Dependency`]), or is asked to refuse it
+    /// ([`RecoveryRound::Refuse`]: a dependency's rounds carry no keys, and a
+    /// refusal needs none, #392):
     ///
     /// - below its vote fence, or refused for good, gets "never witnessed":
     ///   it never voted for it, and never will — the one answer a recovery
@@ -1071,7 +1073,9 @@ impl Replica {
         if self.compacted(txn) {
             return Ok(self.recorded(txn));
         }
-        let answers = routed || !keys.is_empty() || round == RecoveryRound::Dependency;
+        let answers = routed
+            || !keys.is_empty()
+            || matches!(round, RecoveryRound::Dependency | RecoveryRound::Refuse);
         if answers && !self.commands.contains_key(&txn) {
             // It never voted for it, and never will.
             if self.fenced(txn) {
@@ -2645,6 +2649,29 @@ mod tests {
 
         replica.compact(txn(30).0);
         assert!(replica.unknown_promises.is_empty());
+    }
+
+    /// A dependency only a lost journal held is learned with keyless rounds
+    /// on its shard (#337): past the deadline a replica that never witnessed
+    /// it answers late, and asked to refuse it — with the same empty keys and
+    /// no route — refuses it for good (#392), rather than promising once more.
+    #[test]
+    fn a_keyless_refuse_round_is_a_refusal() {
+        let mut replica = Replica::new();
+        let d = txn(20);
+        let b = ballot(50, 1);
+        replica.set_coordinator_cutoff(txn(40).0);
+        assert!(matches!(
+            replica.recover_round(d, b, 0, vec![], vec![], RecoveryRound::Dependency, false),
+            Ok(RoutedRecovery::Late)
+        ));
+        assert!(!replica.refused(d));
+        assert!(matches!(
+            replica.recover_round(d, b, 0, vec![], vec![], RecoveryRound::Refuse, false),
+            Ok(RoutedRecovery::NotWitnessed { redundant: false })
+        ));
+        assert!(replica.refused(d), "refused for good");
+        assert_eq!(replica.status(d), None, "no vote");
     }
 
     /// A routed recovery hands a replica that never witnessed the
