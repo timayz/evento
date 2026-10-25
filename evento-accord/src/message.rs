@@ -299,6 +299,11 @@ pub enum Message {
         /// coverage, which clamps its own compaction-watermark reports.
         #[serde(default = "min_timestamp")]
         coverage: Timestamp,
+        /// The epoch the responder's live layout became live at. Coverage
+        /// holds only between two nodes under the same live layout: a
+        /// requester under another one skips the commands on keys it does not
+        /// own there — some it may own under the responder's, and does next.
+        live_since: u64,
         /// The un-truncated applied commands (`t0 >= watermark`) the requester
         /// is missing, for the conflict graph and dependency barriers. Empty
         /// in a join header: a joiner pulls them through

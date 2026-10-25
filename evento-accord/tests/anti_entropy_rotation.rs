@@ -52,6 +52,7 @@ async fn rounds(ids: Vec<NodeId>, topology: Arc<dyn Topology>) -> Vec<NodeId> {
                                 id: request,
                                 watermark: Timestamp::MIN,
                                 coverage: Timestamp::MIN,
+                                live_since: 0,
                                 commands: Vec::new(),
                             },
                         )

@@ -5476,6 +5476,70 @@ async fn restart_after_an_import(mode: Restart) {
     );
 }
 
+/// Sync coverage holds only between two nodes under the same live layout.
+/// Node 2 copies the slots a merge gives it, then hears nothing of the
+/// activation that ends it: under the layout before, the moved keys are not
+/// its own, and it skips W, a write on one that its peers ship it from under
+/// the new layout. Were it to take their coverage, it would report — and
+/// compact — past W, then own the key and never get W.
+#[tokio::test(start_paused = true)]
+async fn coverage_counts_only_under_one_live_layout() {
+    let sim = Sim::build_with(SimOptions {
+        dynamic: true,
+        layout: Some(vec![
+            vec![NodeId(0), NodeId(1), NodeId(2)],
+            vec![NodeId(3), NodeId(4), NodeId(5)],
+        ]),
+        ..SimOptions::new(6)
+    });
+    let moved = (0..)
+        .map(|i| format!("m{i}"))
+        .find(|agg| sim.dynamic[0].layout().shard_of(&Key(agg.clone())) == 1)
+        .expect("a key of shard 1");
+    // Node 2 hears of no epoch past the transition, nor decides one.
+    let late = |message: &Message| match message {
+        Message::ConfigPrepare { epoch, .. }
+        | Message::ConfigPromise { epoch, .. }
+        | Message::ConfigAccept { epoch, .. }
+        | Message::ConfigAccepted { epoch, .. }
+        | Message::ConfigNack { epoch, .. }
+        | Message::ConfigCommit { epoch, .. } => *epoch >= 2,
+        Message::MetadataEntries { entries } => entries.iter().any(|(epoch, _)| *epoch >= 2),
+        _ => false,
+    };
+    sim.net
+        .set_link_filter(Some(Arc::new(move |_, to, message| {
+            to == NodeId(2) && late(message)
+        })));
+    let merged = vec![vec![NodeId(0), NodeId(1), NodeId(2)]];
+    let installed = sim.nodes[0]
+        .change_topology(1, merged.clone())
+        .await
+        .expect("the merge installs");
+    assert_eq!(installed, merged);
+    assert_eq!(
+        sim.dynamic[2].epoch(),
+        1,
+        "node 2 is still in the transition"
+    );
+    sim.nodes[0]
+        .write(vec![event(&moved, 1, 1)])
+        .await
+        .expect("W commits through 0 and 1");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    sim.net.set_link_filter(None);
+
+    let mut held = Vec::new();
+    for _ in 0..1_000 {
+        held = sim.stores[2].events_of(&moved);
+        if !held.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(held, vec![1], "node 2 holds W");
+}
+
 /// A replica that keeps a moved slot gets no copy of it: a change waits for
 /// its report past the drain point too. Activated without it, a replica
 /// that lagged would have to catch up under the new layout — where the

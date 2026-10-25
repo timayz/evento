@@ -920,7 +920,9 @@ struct Installed {
 
 /// A [`SyncData`](Message::SyncData) payload handed to an in-flight sync: the
 /// contact's `(watermark, coverage, recent commands)`.
-type SyncPayload = (Timestamp, Timestamp, Vec<CommandState>);
+/// A [`SyncData`](Message::SyncData) reply: `(watermark, coverage,
+/// live_since, commands)`.
+type SyncPayload = (Timestamp, Timestamp, u64, Vec<CommandState>);
 
 /// A join contact's vouch ([`Message::JoinProof`]): `(epoch, vouched)`.
 type Vouch = (u64, Timestamp);
@@ -3333,7 +3335,13 @@ impl Node {
                 {
                     return out;
                 }
+                // Under one live layout: one that goes live meanwhile leaves
+                // the requester to ask again.
+                let live_since = self.live_since();
                 let (watermark, coverage, commands) = self.export_missing(&known);
+                if self.live_since() != live_since {
+                    return out;
+                }
                 // The coverage vouches for what a peer may compact past.
                 if !self.bound_clock().await {
                     return out;
@@ -3344,6 +3352,7 @@ impl Node {
                         id,
                         watermark,
                         coverage,
+                        live_since,
                         commands,
                     },
                 ));
@@ -3383,6 +3392,7 @@ impl Node {
                         id,
                         watermark,
                         coverage,
+                        live_since: epoch,
                         commands: Vec::new(),
                     },
                 ));
@@ -3524,6 +3534,7 @@ impl Node {
                 id,
                 watermark,
                 coverage,
+                live_since,
                 commands,
             } => {
                 let tx = self
@@ -3533,7 +3544,7 @@ impl Node {
                     .get(&id)
                     .cloned();
                 if let Some(tx) = tx {
-                    let _ = tx.send((watermark, coverage, commands));
+                    let _ = tx.send((watermark, coverage, live_since, commands));
                 }
             }
             Message::JoinProof { id, epoch, vouched } => {
@@ -6524,7 +6535,7 @@ impl Node {
         let mut imported = Imported::default();
         let mut apply_failed = false;
         let mut proof_slot: Option<PendingProof<'_>> = None;
-        let (watermark, coverage, commands) = if let Some(known) = known {
+        let (watermark, coverage, live_since, commands) = if let Some(known) = known {
             self.sync_round(contact, timeout, |id| Message::SyncRequest { id, known })
                 .await?
         } else {
@@ -6538,7 +6549,7 @@ impl Node {
             );
             // The contact's vouch follows its header on the same link
             // ([`Message::JoinProof`]).
-            let ((mut watermark, coverage, mut commands), slot) =
+            let ((mut watermark, coverage, live_since, mut commands), slot) =
                 self.fetch_join_header(contact, timeout).await?;
             proof_slot = Some(slot);
             // Then the applied commands, page by page, before any snapshot
@@ -6635,7 +6646,7 @@ impl Node {
                     None => break,
                 }
             }
-            (watermark, coverage, commands)
+            (watermark, coverage, live_since, commands)
         };
 
         // A transaction this node minted, shipped back by a peer (a node that
@@ -6760,9 +6771,14 @@ impl Node {
         // A completed round (even one that shipped nothing — the strongest
         // evidence) proves this node holds everything the contact had applied
         // below its reported coverage, clamping this node's watermark reports.
-        // Only a same-shard contact witnesses this shard's transactions, and a
-        // failed local apply voids the claim for this round.
-        if !apply_failed && self.topology.node_shard(contact) == self.topology.node_shard(self.id) {
+        // Only a same-shard contact under the same live layout witnesses this
+        // shard's transactions: under another, this node skipped those on keys
+        // it does not own here, and may own one next. A failed local apply
+        // voids the claim for this round.
+        if !apply_failed
+            && live_since == self.live_since()
+            && self.topology.node_shard(contact) == self.topology.node_shard(self.id)
+        {
             self.record_sync_coverage(contact, coverage);
         }
         // Tripwire: an anti-entropy contact that already truncated above what
