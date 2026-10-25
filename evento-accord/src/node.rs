@@ -312,6 +312,22 @@ impl std::fmt::Display for OpenUnconfirmed {
 
 impl std::error::Error for OpenUnconfirmed {}
 
+/// [`Node::write`] refused a new write: the node is still joining
+/// ([`Node::is_joining`]). It buffers every reply a coordination of its own
+/// would need until its join ends, so the write could not complete — and
+/// what it left pre-accepted on a minority of a shard no recovery could
+/// decide while it stays silent (#388). Returned through `anyhow`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Joining;
+
+impl std::fmt::Display for Joining {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("this node is joining: it coordinates nothing until its snapshot is in")
+    }
+}
+
+impl std::error::Error for Joining {}
+
 /// [`Node::write`] refused a new write: a peer saw more of this node's
 /// journal than it holds — the journal was rolled back to an older copy
 /// (#339, [`Node::rolled_back`]). The node takes no part any more; its host
@@ -4966,6 +4982,15 @@ impl Node {
         }
         if !self.confirmed() {
             return Err(OpenUnconfirmed.into());
+        }
+        // A node still joining coordinates nothing (#388): it buffers the
+        // replies its coordination would need until its join ends, so the
+        // write could not complete, and what it left pre-accepted on a
+        // minority of a shard no recovery could decide — it buffers the
+        // recovery's question too — while the shard's watermark, which its
+        // own join may wait on, stayed pinned below it.
+        if self.is_joining() {
+            return Err(Joining.into());
         }
         // A command is the unit no page can split: one over the cap could
         // never be repaired onto a replica that missed it.

@@ -50,9 +50,9 @@ pub use failure_detector::FailureDetector;
 pub use message::{CommandState, Key, Message, RecoveryRound, Status};
 pub use metrics::{Metrics, MetricsSnapshot};
 pub use node::{
-    BacklogAtCap, CommandTooLarge, CommitOutcome, FenceNotCovered, JournalRolledBack, LostJournal,
-    Node, NodeClosed, NodeConfig, OpenUnconfirmed, PartialSnapshot, RejoinRequired, SweepPressure,
-    TopologyChanging, MAX_COMMAND_BYTES,
+    BacklogAtCap, CommandTooLarge, CommitOutcome, FenceNotCovered, Joining, JournalRolledBack,
+    LostJournal, Node, NodeClosed, NodeConfig, OpenUnconfirmed, PartialSnapshot, RejoinRequired,
+    SweepPressure, TopologyChanging, MAX_COMMAND_BYTES,
 };
 pub use store::{AppliedEntry, InMemoryDataStore, InMemoryJournal};
 pub use tcp::{serve, serve_tls, serve_tls_verified, PeerCerts, TcpTransport, TlsClient};

@@ -404,7 +404,9 @@ refuses anything else before a vote, and a node never installs it.
     contact that cannot vouch within `amnesia_join_timeout` fails the join with
     `FenceNotCovered`, nothing installed — open joining again, through it or another
     (`accord_amnesia_joins_refused_total`).
-  - **Until then it takes no part**: it votes on nothing and serves no read. A
+  - **Until then it takes no part**: it votes on nothing, serves no read and
+    coordinates no write (`Joining`; `WriteError::Unavailable` through
+    `AccordExecutor`), as any node still joining (#388). A
     recovery of a transaction below its fence gets `Message::Amnesiac` — it holds
     nothing of it, may have voted for it before, and never will — which lets the
     recovery rule out a transaction only the lost replica could have helped decide

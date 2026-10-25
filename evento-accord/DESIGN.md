@@ -1371,6 +1371,16 @@ backend (sql/fjall). Phases, in order:
         recovery now invalidates what `never_commits` rules out once the late
         replicas settled, as an unrouted one does
         (`a_routed_recovery_invalidates_what_an_amnesiac_and_a_holder_pre_accepted`).
+        A node still joining coordinated writes it could never complete
+        (#388, the same simulation): it buffers every consensus message
+        until its join ends, the replies to its own coordination among them,
+        so the write waited out its timeouts and left what it pre-accepted
+        behind — undecidable where it reached one replica of a shard of
+        three, since the joiner, a replica of that shard, answered no
+        recovery either, and its own join waited on the watermark those
+        transactions pinned. `Node::write` now refuses a joining node
+        (`Joining`), as `read_barrier` does
+        (`a_joining_node_refuses_a_write`).
   - [ ] **Real-cluster soak + chaos** over days (kills, partitions, clock skew,
         disk pressure, slow disks/links) on actual hardware — zero production
         mileage today.
