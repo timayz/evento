@@ -5476,6 +5476,75 @@ async fn restart_after_an_import(mode: Restart) {
     );
 }
 
+/// A change that takes a replica off a key drains first, as does every
+/// change but an addition. Two such changes installed at once, one after
+/// the other, could leave a write in flight from before them without a read
+/// quorum among the replicas that stay. T1, coordinated by node 1 and
+/// pre-accepted by nodes 0 and 1 only, is in flight while node 4 replaces
+/// node 1 and node 0 leaves; recovered after T2, a later write on its key,
+/// it would depend on T2 — which nodes 0 and 1, replicas of T1 but not of
+/// T2, never get — and hold back every write on its key.
+#[tokio::test(start_paused = true)]
+async fn a_write_in_flight_outlives_two_removals() {
+    let sim = Sim::build_with(SimOptions {
+        dynamic: true,
+        layout: Some(vec![vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3)]]),
+        ..SimOptions::new(5)
+    });
+    sim.nodes[4].begin_join();
+    let to_two_three: LinkFilter = Arc::new(|from, to, message| {
+        from == NodeId(1)
+            && (to == NodeId(2) || to == NodeId(3))
+            && matches!(message, Message::PreAccept { .. })
+    });
+    sim.net.set_link_filter(Some(to_two_three));
+    let coordinator = sim.nodes[1].clone();
+    let t1 = tokio::spawn(async move { coordinator.write(vec![event("acc", 1, 1)]).await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    sim.net.set_link_filter(None);
+
+    let replaced = vec![vec![NodeId(0), NodeId(4), NodeId(2), NodeId(3)]];
+    let epoch = sim.dynamic[0].epoch() + 1;
+    sim.nodes[0]
+        .change_topology(epoch, replaced)
+        .await
+        .expect("node 4 replaces node 1");
+    sim.nodes[4].join(NodeId(0)).await.expect("node 4 joins");
+    let shrunk = vec![vec![NodeId(4), NodeId(2), NodeId(3)]];
+    let epoch = sim.dynamic[0].epoch() + 1;
+    for _ in 0..1_000 {
+        if sim.dynamic[2].epoch() + 1 == epoch {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    sim.nodes[2]
+        .change_topology(epoch, shrunk.clone())
+        .await
+        .expect("node 0 leaves");
+
+    // T2, then one more once T1 is recovered: the key takes writes.
+    for seq in [2, 3] {
+        if seq == 3 {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        let mut wrote = false;
+        for _ in 0..50 {
+            let version = version_of(&sim.stores[2], "acc").await + 1;
+            let write = sim.nodes[2].write(vec![event("acc", version, seq)]);
+            if let Ok(Ok(outcome)) = tokio::time::timeout(Duration::from_secs(3), write).await {
+                if !outcome.conflict {
+                    wrote = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(wrote, "write {seq} to the key never went through");
+    }
+    let _ = t1.await;
+}
+
 /// Sync coverage holds only between two nodes under the same live layout.
 /// Node 2 copies the slots a merge gives it, then hears nothing of the
 /// activation that ends it: under the layout before, the moved keys are not

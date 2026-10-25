@@ -573,11 +573,13 @@ async fn a_node_leaves_and_the_cluster_continues() {
     let abc = vec![NodeId(0), NodeId(1), NodeId(2)];
     let abcd = vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3)];
 
-    // A 4-node cluster at epoch 0.
+    // A 4-node cluster at epoch 0. A removal drains the writes in flight
+    // first, through the recovery sweep's watermark gossip.
     let nodes: Vec<TestNode> = abcd
         .iter()
         .map(|&id| spawn_node(id, 0, vec![abcd.clone()], &net))
         .collect();
+    let _sweeps: Vec<_> = nodes.iter().map(|n| n.node.start_recovery()).collect();
     nodes[0]
         .node
         .write(vec![event("acc", 1, "Opened")])
@@ -587,13 +589,14 @@ async fn a_node_leaves_and_the_cluster_continues() {
         await_len(&n.store, 1).await;
     }
 
-    // Node D leaves: A coordinates epoch 1 with the smaller layout.
+    // Node D leaves: A coordinates the smaller layout, a transition at epoch 1
+    // that epoch 2 ends.
     nodes[0]
         .node
         .change_topology(1, vec![abc.clone()])
         .await
         .unwrap();
-    await_epoch(&nodes[3].topology, 1).await; // the departing node learns it is out
+    await_epoch(&nodes[3].topology, 2).await; // the departing node learns it is out
 
     // The remaining three continue serving writes over the smaller quorum.
     nodes[0]
@@ -658,17 +661,20 @@ async fn concurrent_recovery_of_one_epoch_converges() {
     // the preferred proposer commits and the rest adopt that decision.
     let net = InMemoryNetwork::new();
     let abcde = vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
-    let abcd = vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3)];
+    let abcdef: Vec<NodeId> = (0..6).map(NodeId).collect();
 
-    let nodes: Vec<TestNode> = abcde
+    let mut nodes: Vec<TestNode> = abcde
         .iter()
         .map(|&id| spawn_node(id, 0, vec![abcde.clone()], &net))
         .collect();
+    let f = spawn_node(NodeId(5), 0, vec![abcde.clone()], &net);
+    f.node.begin_join();
 
-    // Node 0 makes epoch 1 durable (a quorum accepts) but crashes before committing.
+    // Node 0 makes epoch 1 — node F added — durable (a quorum accepts) but
+    // crashes before committing.
     nodes[0]
         .node
-        .propose_topology(1, vec![abcd.clone()])
+        .propose_topology(1, vec![abcdef.clone()])
         .await
         .unwrap();
     net.crash(NodeId(0));
@@ -687,14 +693,15 @@ async fn concurrent_recovery_of_one_epoch_converges() {
             .expect("recovery converges, not duels to failure");
         assert_eq!(
             decided,
-            evento_accord::ConfigEntry::active(vec![abcd.clone()]),
+            evento_accord::ConfigEntry::active(vec![abcdef.clone()]),
             "all recover the same layout"
         );
     }
 
+    nodes.push(f);
     for n in &nodes[1..] {
         await_epoch(&n.topology, 1).await;
-        assert_eq!(n.topology.nodes(), abcd);
+        assert_eq!(n.topology.nodes(), abcdef);
     }
 }
 
@@ -705,18 +712,25 @@ async fn racing_operator_changes_converge() {
     // report that same committed layout rather than erroring out under a ballot duel.
     let net = InMemoryNetwork::new();
     let abcde = vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
-    let drop_e = vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3)];
-    let drop_d = vec![NodeId(0), NodeId(1), NodeId(2), NodeId(4)];
+    let add_f = [abcde.clone(), vec![NodeId(5)]].concat();
+    let add_g = [abcde.clone(), vec![NodeId(6)]].concat();
 
     let nodes: Vec<TestNode> = abcde
         .iter()
         .map(|&id| spawn_node(id, 0, vec![abcde.clone()], &net))
         .collect();
+    let spares: Vec<TestNode> = [5, 6]
+        .into_iter()
+        .map(|id| spawn_node(NodeId(id), 0, vec![abcde.clone()], &net))
+        .collect();
+    for spare in &spares {
+        spare.node.begin_join();
+    }
 
     let n1 = nodes[1].node.clone();
     let n2 = nodes[2].node.clone();
-    let x = drop_e.clone();
-    let y = drop_d.clone();
+    let x = add_f.clone();
+    let y = add_g.clone();
     let w1 = tokio::spawn(async move { n1.change_topology(1, vec![x]).await });
     let w2 = tokio::spawn(async move { n2.change_topology(1, vec![y]).await });
 
@@ -732,7 +746,7 @@ async fn racing_operator_changes_converge() {
         .expect("operator change 2 converges");
     assert_eq!(d1, d2, "both operators converge on the one chosen layout");
     assert!(
-        d1 == vec![drop_e.clone()] || d1 == vec![drop_d.clone()],
+        d1 == vec![add_f.clone()] || d1 == vec![add_g.clone()],
         "the chosen layout is one of the two proposed: {d1:?}"
     );
 
@@ -752,18 +766,25 @@ async fn concurrent_changes_on_one_node_converge() {
     // own replies, so neither starves the other into a quorum timeout.
     let net = InMemoryNetwork::new();
     let abcde = vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
-    let drop_e = vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3)];
-    let drop_d = vec![NodeId(0), NodeId(1), NodeId(2), NodeId(4)];
+    let add_f = [abcde.clone(), vec![NodeId(5)]].concat();
+    let add_g = [abcde.clone(), vec![NodeId(6)]].concat();
 
     let nodes: Vec<TestNode> = abcde
         .iter()
         .map(|&id| spawn_node(id, 0, vec![abcde.clone()], &net))
         .collect();
+    let spares: Vec<TestNode> = [5, 6]
+        .into_iter()
+        .map(|id| spawn_node(NodeId(id), 0, vec![abcde.clone()], &net))
+        .collect();
+    for spare in &spares {
+        spare.node.begin_join();
+    }
 
     let a = nodes[1].node.clone();
     let b = nodes[1].node.clone();
-    let x = drop_e.clone();
-    let y = drop_d.clone();
+    let x = add_f.clone();
+    let y = add_g.clone();
     let w1 = tokio::spawn(async move { a.change_topology(1, vec![x]).await });
     let w2 = tokio::spawn(async move { b.change_topology(1, vec![y]).await });
 
@@ -779,7 +800,7 @@ async fn concurrent_changes_on_one_node_converge() {
         .expect("change 2 converges");
     assert_eq!(d1, d2, "both proposals report the one chosen layout");
     assert!(
-        d1 == vec![drop_e.clone()] || d1 == vec![drop_d.clone()],
+        d1 == vec![add_f.clone()] || d1 == vec![add_g.clone()],
         "the chosen layout is one of the two proposed: {d1:?}"
     );
     for n in &nodes {
@@ -899,7 +920,8 @@ async fn metadata_log_survives_restart() {
     let ids = vec![NodeId(0), NodeId(1), NodeId(2)];
     let abc = ids.clone();
     let abcd = vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3)];
-    let abc_only = vec![NodeId(0), NodeId(1)];
+    let abcde: Vec<NodeId> = (0..5).map(NodeId).collect();
+    let abcdef: Vec<NodeId> = (0..6).map(NodeId).collect();
 
     // Build nodes keeping the journal handles, so node 0 can be rebuilt over its
     // durable journal (mirrors tests/restart.rs).
@@ -924,17 +946,18 @@ async fn metadata_log_survives_restart() {
         nodes.push(node);
     }
 
-    // Drive three epoch changes; node 0 records each in its durable journal.
+    // Drive three epoch changes, each an addition that installs at once;
+    // node 0 records each in its durable journal.
     nodes[0]
         .change_topology(1, vec![abcd.clone()])
         .await
         .unwrap();
     nodes[0]
-        .change_topology(2, vec![abc.clone()])
+        .change_topology(2, vec![abcde.clone()])
         .await
         .unwrap();
     nodes[0]
-        .change_topology(3, vec![abc_only.clone()])
+        .change_topology(3, vec![abcdef.clone()])
         .await
         .unwrap();
     await_epoch(&topos[0], 3).await;
@@ -958,11 +981,7 @@ async fn metadata_log_survives_restart() {
         3,
         "the restarted node re-installs the committed metadata log up to epoch 3"
     );
-    assert_eq!(
-        fresh_topo.nodes(),
-        abc_only,
-        "and ends at the epoch-3 layout"
-    );
+    assert_eq!(fresh_topo.nodes(), abcdef, "and ends at the epoch-3 layout");
 }
 
 /// One-way latency between two same-region nodes (a local hop).

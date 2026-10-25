@@ -368,12 +368,14 @@ control plane, everything else is Accord.
     transaction, casts no vote, answers nothing and records nothing.
 
   *Shipped: two-phase layout changes,* for (iii) (`reconfig.rs`). A change
-  after which every quorum of each changed shard still meets every quorum it had
-  (one replica added to a shard of three, one removed) installs at once: the
-  epochs above suffice, and a joiner catches up through the replicas its shard
-  kept. Any other change (replacing a replica, adding two, shrinking five to
-  three) takes two decided entries, so that each key has one live layout at any
-  time:
+  that only adds replicas, after which every quorum of each changed shard still
+  meets every quorum it had (one replica added to a shard of three), installs at
+  once: the epochs above suffice, and a joiner catches up through the replicas
+  its shard kept. Any other change (removing or replacing a replica, adding two)
+  takes two decided entries, so that each key has one live layout at any time —
+  a removal too: two installed at once in a row could leave a transaction in
+  flight from before them without a read quorum of replicas that stay, its
+  execution waiting on writes the replicas that left never get (#370):
   1. A *transition* keeps the old layout live — for ownership, watermarks,
      coverage, anti-entropy, compaction and recovery — and names the new one.
      Coordinators refuse writes to the keys whose replica set changes

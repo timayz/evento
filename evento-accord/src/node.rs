@@ -6832,11 +6832,11 @@ impl Node {
     /// can ([`ShardMap::rebalanced`]): none with as many shards, only those a
     /// new shard needs, or a removed one leaves, otherwise.
     ///
-    /// A change that adds a replica to a shard of three, or removes one,
-    /// installs `shards` at `epoch`: a new replica then joins through one its
-    /// shard kept ([`join`](Node::join)). Any other change — replacing a
-    /// replica, adding two, shrinking five to three, adding or removing shards,
-    /// moving a replica to another shard — takes two epochs (see `reconfig`):
+    /// A change that adds a replica to a shard of three installs `shards` at
+    /// `epoch`: a new replica then joins through one its shard kept
+    /// ([`join`](Node::join)). Any other change — removing or replacing a
+    /// replica, adding two, adding or removing shards, moving a replica to
+    /// another shard — takes two epochs (see `reconfig`):
     /// `epoch` decides a transition, during which writes to the keys it moves
     /// are refused with [`TopologyChanging`] while the writes in flight on them
     /// drain and every node gaining slots copies them; the next epoch installs

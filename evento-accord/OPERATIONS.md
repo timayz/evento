@@ -192,7 +192,8 @@ refuses anything else before a vote, and a node never installs it.
   drains, and its `join` then returns `Ok(0)`: call it either way. (See
   `tests/membership.rs`, `tests/transitions.rs`, `tests/resharding.rs`.)
 - **Remove a node:** `change_topology(epoch, smaller_layout)`; the smaller cluster keeps
-  serving. Reconfiguration survives the coordinator crashing mid-change (another node
+  serving, once the change drained the writes in flight on the node's shard (below).
+  Reconfiguration survives the coordinator crashing mid-change (another node
   completes it via `recover_topology`, and the recovery sweep) and works after founders
   have left (the acceptor set tracks current membership).
 - **Replace a node** (a dead one included): one change, `change_topology(epoch,
@@ -210,9 +211,10 @@ refuses anything else before a vote, and a node never installs it.
   see them if they already read past those stamps.
 - **What a change does with writes in flight.** Every transaction is voted on and
   recovered under the layout it was coordinated under. A change that only adds a node
-  to a shard of three, or removes one, installs at once, and writes go on. Any other
-  change — replacing a node, adding two at once, shrinking five to three, moving slots
-  or nodes between shards — takes two epochs: a *transition* keeps the old layout live
+  to a shard of three or four installs at once, and writes go on. Any other change —
+  removing or replacing a node, adding two at once, moving slots or nodes between shards
+  — takes two epochs (two removals at once in a row could leave a write in flight from
+  before them without a read quorum of the replicas that stay): a *transition* keeps the old layout live
   while the writes in flight on the keys it moves drain, and the nodes that gain slots
   copy them; then the next epoch installs the new layout. Meanwhile, writes to the
   moving keys fail with `TopologyChanging` (`WriteError::Unavailable` through

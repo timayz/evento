@@ -36,9 +36,9 @@
 //! them all the same.
 //!
 //! **No drain needed.** A change after which no slot moves to another shard,
-//! no replica gains a slot, and every quorum of each changed shard still holds
-//! a replica of every quorum it had ([`installs_at_once`]: adding a replica to
-//! a shard of three, or removing one) is installed at once. A transaction
+//! no replica gains or loses a slot, and every quorum of each changed shard
+//! still holds a replica of every quorum it had ([`installs_at_once`]: adding
+//! a replica to a shard of three) is installed at once. A transaction
 //! planned before it is voted on and recovered under its own layout, a
 //! coordinator that planned before it gets no new vote from a replica that
 //! installed it, and the two layouts' quorums meet: a transaction planned
@@ -119,12 +119,22 @@ pub(crate) fn quorums_intersect(live: &Layout, next: &Layout) -> bool {
 }
 
 /// Whether a change from `live` to `next` can install at once: no slot
-/// moves to another shard, no replica of `live` gains a slot, and the
-/// quorums meet ([`quorums_intersect`]). Every replica that gains slots is
-/// then a new one joining a shard that kept a replica (see `Node::join`).
+/// moves to another shard, no replica of `live` gains a slot or loses one,
+/// and the quorums meet ([`quorums_intersect`]). Every replica that gains
+/// slots is then a new one joining a shard that kept a replica (see
+/// `Node::join`), and every transaction planned before is finished by
+/// replicas that all stay. Not so after a removal: a second one could
+/// leave such a transaction without a read quorum of replicas that stay —
+/// a replica that left gets none of the writes after it, on which the
+/// transaction's execution may come to depend.
 pub(crate) fn installs_at_once(live: &Layout, next: &Layout) -> bool {
     live.slots() == next.slots()
         && gainers(live, next).iter().all(|node| !live.contains(*node))
+        && slot_moves(live, next).into_iter().all(|(a, b)| {
+            live.replicas_of(a)
+                .iter()
+                .all(|node| next.replicas_of(b).contains(node))
+        })
         && quorums_intersect(live, next)
 }
 
@@ -501,7 +511,7 @@ mod tests {
     }
 
     /// A change installs at once only when no slot changes shard, no member
-    /// gains a slot, and the quorums meet.
+    /// gains or loses a slot, and the quorums meet.
     #[test]
     fn only_new_replicas_of_kept_shards_join_without_a_transition() {
         let live = Layout::new(0, vec![ids(&[0, 1, 2]), ids(&[3, 4, 5])]);
@@ -512,7 +522,7 @@ mod tests {
             at_once(vec![ids(&[0, 1, 2, 6]), ids(&[3, 4, 5])]),
             "a new replica"
         );
-        assert!(at_once(vec![ids(&[0, 1]), ids(&[3, 4, 5])]), "one removed");
+        assert!(!at_once(vec![ids(&[0, 1]), ids(&[3, 4, 5])]), "a removal");
         assert!(
             !at_once(vec![ids(&[0, 1, 6]), ids(&[3, 4, 5])]),
             "a replacement"
@@ -529,9 +539,10 @@ mod tests {
 
     /// One replica added to a shard of three, or one removed, keeps every
     /// new quorum meeting every old one; a replacement, two additions, or a
-    /// shrink from five to three do not.
+    /// shrink from five to three do not. (Only the addition skips the drain:
+    /// see `installs_at_once`.)
     #[test]
-    fn only_a_change_whose_quorums_meet_skips_the_drain() {
+    fn only_some_changes_keep_every_quorum_meeting() {
         let live = Layout::new(0, vec![ids(&[0, 1, 2])]);
         let meets = |next: &[u64]| quorums_intersect(&live, &Layout::new(1, vec![ids(next)]));
         assert!(meets(&[0, 1, 2]));
