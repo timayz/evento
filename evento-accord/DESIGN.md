@@ -232,19 +232,30 @@ control plane, everything else is Accord.
   with the command (`Replica.routes`, `Journal::save_route`, record kind `Route`,
   dropped with the command). A **routed** recovery asks every replica of every route
   shard and waits (up to `collect_timeout`) until each shard is accounted for. A
-  replica that never witnessed the txn does **not** pre-accept it there (unlike the
-  unrouted path): it journals a promise (`Journal::save_promise`, record kind
-  `Promise` — the blind promise is no longer in-memory only) and answers
-  `NotWitnessed`. This is what makes the decision sound, after Accord's
-  *invalidation*: a slow quorum of shard S answering "never witnessed" under ballot b
-  proves the txn never committed (a commit needs a PreAccept quorum on S, which meets
-  it — a witness journals before it votes and keeps the command until it is applied,
-  when it reports "below the watermark", not "never witnessed") and never will (those
-  replicas refuse the original coordinator below b, and no recovery can assemble a
-  witnessed quorum on S, since nothing but a PreAccept makes a replica witness before
-  a decision). Pre-accepting instead would let a later recovery that learned S's part
-  from a straggler turn the proof into a commit after it was acted on. The recovery
-  then **invalidates** the txn (`Message::Invalidate`): every replica holding it
+  replica that never witnessed the txn is handed none of its part on that first
+  round (the coordinator holds its own shard's at most): it journals a promise
+  (`Journal::save_promise`, record kind `Promise` — the blind promise is no longer
+  in-memory only) and reports it holds nothing; past the coordinator's deadline it
+  answers `Late` (#337) instead. The recovery then hands each its shard's part,
+  reassembled from a holder's report, and it pre-accepts — the promised ones at once,
+  the late ones when asked to vote because the replies show the txn may have
+  committed on *every* shard, or asked to refuse it for good because refusing proves
+  one shard never committed its part (#377, `settle_late`; a later round collects the
+  answers of the replicas it asked, a straggler's to the first round merged rather
+  than mistaken for one). A part no holder reported is never committed on its voters
+  alone. What makes the decision sound, after Accord's *invalidation*, is the
+  **permanence** of a `NotWitnessed` answer: a replica gives it only below its vote
+  fence, refused for good, or below its watermark — never as a mere promise. A slow
+  quorum of shard S answering "never witnessed" under ballot b then proves the txn
+  never committed (a commit needs a PreAccept quorum on S, which meets it — a witness
+  journals before it votes and keeps the command until it is applied, when it reports
+  "below the watermark", not "never witnessed") and never will (those replicas refuse
+  the original coordinator below b and every recovery's vote, so no recovery can
+  assemble a witnessed quorum on S). Counting a plain promise would let a later
+  recovery that handed S's part to the promisers turn the proof into a commit after
+  it was acted on. The cost: a routed txn a shard truly never saw is invalidated only
+  past the coordinator's deadline, where that shard's replicas can be refused for
+  good. The recovery then **invalidates** the txn (`Message::Invalidate`): every replica holding it
   un-committed records it applied as an abort without executing it (an abort changes
   nothing, so needs no place in the order), marked by `execute_at = INVALIDATED_AT`
   (`Timestamp::MIN` — no field added to `CommandState`), which a later recovery
@@ -951,12 +962,14 @@ backend (sql/fjall). Phases, in order:
   for once its deadline passed, so it never committed. They invalidate it, and
   an `Invalidate` records it aborted on a replica that never witnessed it,
   keeping the ballot it promised, so what waits on it goes on
-  (`a_dependency_only_an_amnesiac_held_is_invalidated`). Two cases
-  still stay undecided for good, and the join never finds a contact past them
-  (OPERATIONS §7): a **multi-shard** transaction of that shape — a routed
-  recovery never lets a replica that never witnessed it pre-accept it (#377) —
-  and a replica whose only vote for it was a recovery's late pre-accept, lost
-  before its next gossip showed it holding the transaction. See `tests/amnesia.rs` and
+  (`a_dependency_only_an_amnesiac_held_is_invalidated`). A **multi-shard**
+  transaction of that shape is decided the same way (#377,
+  `a_routed_recovery_decides_what_an_amnesiac_and_one_replica_accepted`): the
+  routed recovery hands the late replica its shard's part from a holder's report,
+  and it votes. One case still stays undecided for good, and the join never finds a
+  contact past it (OPERATIONS §7): a replica whose only vote for it was a recovery's
+  late pre-accept, lost before its next gossip showed it holding the transaction.
+  See `tests/amnesia.rs` and
   the simulator's `run_amnesia`, which wipes a node at any moment. **A journal rolled
   back to an older copy** (#339) — a backup or VM snapshot restored, a disk that lost
   writes it acknowledged — forgot the votes and promises made since, like a lost one,

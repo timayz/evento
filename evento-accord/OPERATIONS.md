@@ -78,7 +78,7 @@ timeouts for geo/WAN** deployments.
 | `recovery_interval` | 100 ms | How often the recovery/anti-entropy/compaction sweep runs. |
 | `recovery_timeout` | 300 ms | A txn unapplied this long is presumed stalled and recovered. Keep well above normal write latency. |
 | `anti_entropy_interval` | 250 ms | Pace of the anti-entropy rounds (one peer per round, in turn; while each page of what the node misses brings something in, a round pulls the next from it, up to 16 pages and for one interval). Each round also proves the window a node holds, which both its compaction report and its subscriptions wait for: subscriptions trail the present by about `compaction_margin` plus `(slow quorum − 1)` rounds. Keep it well below `compaction_margin`. |
-| `compaction_margin` | 1 s | Lag on the redundancy watermark, and the original coordinator's **deadline**: a node never votes for a coordinator's PreAccept, or its Accept at the transaction's own ballot, for a transaction it never witnessed whose `t0` is older than its clock less this margin (`votes_late`). A recovery past the deadline asks such a node twice: first, it answers that it is late; then the recovery asks it to refuse the transaction for good, when that proves it never committed — one only a minority holds, which the recovery then invalidates — or to vote, when the replies show it may have committed (a replica that accepted it lost its journal, §7). It votes unless the transaction is below its **vote fence**, what it vouched for (§5, `votes_fenced`), so one a slow quorum of its shard held unapplied all along is still decided, however late (#337). Keep it ≥ `recovery_timeout` + 2 × the clock-skew bound + worst-case message delay, so a coordinator's messages and a recovery of a transaction still in flight land inside it. |
+| `compaction_margin` | 1 s | Lag on the redundancy watermark, and the original coordinator's **deadline**: a node never votes for a coordinator's PreAccept, or its Accept at the transaction's own ballot, for a transaction it never witnessed whose `t0` is older than its clock less this margin (`votes_late`). A recovery past the deadline asks such a node twice: first, it answers that it is late; then the recovery asks it to refuse the transaction for good, when that proves it never committed — one only a minority holds, which the recovery then invalidates — or to vote, when the replies show it may have committed (a replica that accepted it lost its journal, §7). It votes unless the transaction is below its **vote fence**, what it vouched for (§5, `votes_fenced`), so one a slow quorum of its shard held unapplied all along is still decided, however late (#337). A multi-shard transaction a shard never saw is invalidated only past the deadline too, where that shard's replicas can be refused for good (#377): within it they only promise the ballot and wait to be handed its part. Keep it ≥ `recovery_timeout` + 2 × the clock-skew bound + worst-case message delay, so a coordinator's messages and a recovery of a transaction still in flight land inside it. |
 | `max_journal_batch` | 128 | Messages drained per group-commit fsync (latency vs. fsync amortization). |
 | `phi_threshold` | 8.0 | Phi-accrual suspicion level; higher tolerates more latency variance before suspecting a coordinator. |
 | `acceptable_pause` | 500 ms | How long a live peer may go quiet beyond its usual heartbeat interval (scheduler stall, slow fsync, loaded host) before suspicion starts to rise. |
@@ -287,15 +287,19 @@ refuses anything else before a vote, and a node never installs it.
   recovery (`Message::Routed`), and each replica journals it with the command
   (`Journal::save_route`). A recovery therefore hears from every shard the
   transaction touches, waiting up to `collect_timeout` for a slow one rather than
-  deciding on the shards that answered first. If a slow quorum of some shard never
-  witnessed the transaction (its coordinator died mid-broadcast), it never committed:
-  recovery **invalidates** it — every replica records it aborted, and the write
-  reports a conflict. A recovery that cannot hear a slow quorum of every route shard
-  (or that quorum is split between "witnessed" and "never witnessed") decides nothing
-  and the sweep retries — a multi-shard transaction whose coordinator died waits
-  for the shard's replicas to come back rather than guessing. A replica answering
-  "never witnessed" journals its promise (`Journal::save_promise`), so after a
-  restart it still refuses the original coordinator's late PreAccept. A shard can
+  deciding on the shards that answered first. A replica that never witnessed the
+  transaction promises the recovery's ballot and, handed its shard's part from a
+  holder's report, votes for it — past the coordinator's deadline
+  (`compaction_margin`) only once the recovery asks it to, as for a single-shard
+  transaction (#337, #377). If a slow quorum of some shard never witnessed the
+  transaction (its coordinator died mid-broadcast), it never committed: past the
+  deadline, the recovery has that shard's replicas refuse it for good and
+  **invalidates** it — every replica records it aborted, and the write reports a
+  conflict. A recovery that cannot hear a slow quorum of every route shard decides
+  nothing and the sweep retries — a multi-shard transaction whose coordinator died
+  waits for the shard's replicas to come back rather than guessing. A replica's
+  promise and refusal are journaled (`Journal::save_promise`), so after a restart it
+  still refuses the original coordinator's late PreAccept. A shard can
   compact a transaction its other shards have not applied yet (each shard's
   watermark is its own), so compaction keeps a small **decision record** of every
   applied multi-shard transaction (`Journal::save_decision`, journaled before the
@@ -438,11 +442,11 @@ refuses anything else before a vote, and a node never installs it.
     lost replica held, which a write committed with as a dependency, is invalidated by
     the replicas that wait on it: past its deadline nothing can vote for it, so it never
     committed.
-  - **Stuck below the fence**: two cases can still never be decided — a
-    **multi-shard** transaction of that shape (a routed recovery never lets a replica
-    that never witnessed it pre-accept it, #377), and one whose lost replica voted for it
-    only in a recovery and lost its journal before its next report showed it holding
-    the transaction. The join then never finds a contact past its fence
+  - **Stuck below the fence**: one case can still never be decided — a transaction
+    whose lost replica voted for it only in a recovery and lost its journal before its
+    next report showed it holding the transaction. (A **multi-shard** transaction of
+    the decided shape is decided too: the routed recovery hands the late replica its
+    shard's part, #377.) The join then never finds a contact past its fence
     (`accord_amnesia_joins_refused_total` keeps rising), and the transaction holds
     compaction back; bringing the node back under a new id leaves it just as
     undecided.

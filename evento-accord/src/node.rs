@@ -725,12 +725,16 @@ impl RecoverFields {
     }
 }
 
-/// A response to a `Recover`: a report, a "never witnessed", a replica that
-/// lost its journal ([`Message::Amnesiac`]), one past the original
-/// coordinator's deadline that neither votes nor refuses yet
-/// ([`Message::Late`]), or a ballot rejection.
+/// A response to a `Recover`: a report (`known` false: the replica holds
+/// nothing of it and promised the ballot, and votes once handed its shard's
+/// part), a "never witnessed" for good, a replica that lost its journal
+/// ([`Message::Amnesiac`]), one past the original coordinator's deadline
+/// that neither votes nor refuses yet ([`Message::Late`]), or a ballot
+/// rejection.
 enum RecoverResp {
     Ok(RecoverFields),
+    /// The replica never witnessed it and never votes for it: below its
+    /// vote fence, refused for good, or (`redundant`) below its watermark.
     NotWitnessed {
         redundant: bool,
     },

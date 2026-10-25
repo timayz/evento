@@ -492,14 +492,18 @@ pub enum Message {
         route: Vec<Key>,
         inner: Box<Message>,
     },
-    /// Replica → recovery coordinator, answering a routed `BeginRecovery`
-    /// for a transaction this replica holds nothing of. `redundant` false: it
-    /// never witnessed it, and has durably promised `ballot` — so it never
-    /// will at a lower one (a slow quorum of a shard answering this proves the
-    /// transaction never committed: it needs a PreAccept quorum on every
-    /// shard). `redundant` true: `txn` is below this replica's redundancy
+    /// Replica → recovery coordinator, answering a `BeginRecovery` for a
+    /// transaction this replica holds nothing of, and never will — for good.
+    /// `redundant` false: it never witnessed it, and never votes for it:
+    /// it is below the replica's vote fence (what it vouched for, journaled),
+    /// or the replica refused it for good when a recovery asked it to
+    /// ([`RecoveryRound::Refuse`]). A slow quorum of a shard answering this
+    /// proves the transaction never committed (it needs a PreAccept quorum
+    /// on every shard) and never will — the one answer a recovery counts as
+    /// such proof, since nothing a later recovery asks turns it into a vote
+    /// (#377). `redundant` true: `txn` is below this replica's redundancy
     /// watermark, so it may also have applied it and compacted it away — no
-    /// evidence either way.
+    /// evidence either way, and no promise kept.
     NotWitnessed {
         txn: TxnId,
         ballot: Ballot,
@@ -567,17 +571,19 @@ pub enum Message {
         slots: Vec<u16>,
         after: Option<Value>,
     },
-    /// Replica → recovery coordinator, answering an unrouted
-    /// [`BeginRecovery`](Message::BeginRecovery) of a transaction it never
-    /// witnessed, past its original coordinator's deadline (its clock less
-    /// the compaction margin), and not below its vote fence: it promised the
-    /// ballot, and neither votes for the transaction nor refuses it yet. The
-    /// recovery, which sees every reply, then asks it to vote — the replies
-    /// show the transaction may have committed, and deciding it may take this
-    /// vote (#337) — or to refuse it for good, which lets the recovery
-    /// invalidate a transaction too few replicas hold (see
-    /// [`RecoveryRound`]); or, while the replicas it did not hear from decide
-    /// which, nothing yet.
+    /// Replica → recovery coordinator, answering a
+    /// [`BeginRecovery`](Message::BeginRecovery), routed or not, of a
+    /// transaction it never witnessed, past its original coordinator's
+    /// deadline (its clock less the compaction margin), and not below its
+    /// vote fence: it promised the ballot, and neither votes for the
+    /// transaction nor refuses it yet. The recovery, which sees every reply,
+    /// then asks it to vote — the replies show the transaction may have
+    /// committed, and deciding it may take this vote (#337) — or to refuse
+    /// it for good, which lets the recovery invalidate a transaction too few
+    /// replicas hold (see [`RecoveryRound`]); or, while the replicas it did
+    /// not hear from decide which, nothing yet. A routed recovery asks with
+    /// the transaction's route and every part a holder reported, so the
+    /// replica votes for its shard's (#377).
     Late { txn: TxnId, ballot: Ballot },
     /// Replica → every other node, from a replica opened over a journal that
     /// holds something (#339): the [`DurableMark`] that journal holds. Until
@@ -603,7 +609,10 @@ pub enum Message {
 /// never witnessed the transaction, is past its original coordinator's
 /// deadline (its clock less the compaction margin), and is not below its
 /// vote fence (#337). Within the deadline such a replica pre-accepts
-/// whatever the round; below its vote fence it refuses whatever the round.
+/// whatever the round — handed none of its part (a routed recovery's
+/// first round carries only what its coordinator holds), it promises the
+/// ballot, reports it holds nothing, and pre-accepts once handed one
+/// (#377); below its vote fence it refuses whatever the round.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RecoveryRound {
     /// The first round: it answers [`Late`](Message::Late).
