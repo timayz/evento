@@ -24,8 +24,8 @@ use evento_accord::clock::system_micros;
 use evento_accord::{
     AcceptorRecord, AmnesiaFence, Ballot, Clock, DataStore, DurableMark, DynamicTopology, Envelope,
     FenceNotCovered, HybridLogicalClock, InMemoryDataStore, InMemoryJournal, InMemoryNetwork,
-    Journal, JournalRolledBack, Key, LostJournal, Message, MessageSink, Node, NodeConfig, NodeId,
-    OpenUnconfirmed, ShardedTopology, StaticTopology, Status, Timestamp, Topology, TxnId,
+    Joining, Journal, JournalRolledBack, Key, LostJournal, Message, MessageSink, Node, NodeConfig,
+    NodeId, OpenUnconfirmed, ShardedTopology, StaticTopology, Status, Timestamp, Topology, TxnId,
 };
 use evento_core::Event;
 use tokio::sync::mpsc;
@@ -2074,6 +2074,21 @@ async fn a_joining_node_refuses_a_read_barrier() {
         read.is_err(),
         "a read barrier passed on a joining node, which holds part of its store"
     );
+}
+
+/// Nor does a joining node coordinate a write: it buffers the replies its
+/// coordination would need until its join ends, so the write could not
+/// complete, and what it left pre-accepted on a minority of a shard no
+/// recovery could decide while it stays silent (#388).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joining_node_refuses_a_write() {
+    let c = Cluster::start(3);
+    c.baseline().await;
+    c.nodes[R as usize].begin_join();
+    match c.nodes[R as usize].write(vec![event("acc", 1)]).await {
+        Err(err) => assert!(err.is::<Joining>(), "refused for another reason: {err:#}"),
+        Ok(outcome) => panic!("a joining node coordinated a write: {outcome:?}"),
+    }
 }
 
 /// R's disk is rolled back to an older copy of its journal, which lacks
