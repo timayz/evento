@@ -40,8 +40,8 @@ use async_trait::async_trait;
 
 use evento_accord::format::{decode_tagged, encode_tagged, RecordKind};
 use evento_accord::{
-    AcceptorRecord, AmnesiaFence, Ballot, CommandState, DecisionRecord, Journal, Key, NodeId,
-    Timestamp, TxnId,
+    AcceptorRecord, AmnesiaFence, Ballot, CommandState, ConfigEntry, DecisionRecord, FenceRecord,
+    Journal, Key, NodeId, Timestamp, TxnId,
 };
 
 /// `k` value under which the truncation watermark is stored in `accord_meta`.
@@ -53,6 +53,9 @@ const CLOCK_BOUND_KEY: &str = "clock_bound";
 /// `k` value under which the replica's amnesia fence is stored in
 /// `accord_meta`. Untouched by `truncate`.
 const AMNESIA_FENCE_KEY: &str = "amnesia_fence";
+/// `k` value under which the replica's transition fences are stored in
+/// `accord_meta`. Untouched by `truncate`.
+const FENCES_KEY: &str = "fences";
 /// `k` prefix of a multi-shard transaction's route in `accord_meta`.
 const ROUTE_PREFIX: &str = "route/";
 /// `k` prefix of a blind recovery promise in `accord_meta`.
@@ -601,6 +604,32 @@ where
         }
     }
 
+    async fn save_fences(&self, fences: &[FenceRecord]) -> anyhow::Result<()> {
+        let value = encode_tagged(RecordKind::Fences, &fences.to_vec())?;
+        let upsert = Query::insert()
+            .into_table(AccordMeta::Table)
+            .columns([AccordMeta::K, AccordMeta::V])
+            .values_panic([FENCES_KEY.into(), value.into()])
+            .on_conflict(
+                OnConflict::column(AccordMeta::K)
+                    .update_column(AccordMeta::V)
+                    .to_owned(),
+            )
+            .to_owned();
+        let (sql, values) = Self::build_sqlx(&upsert);
+        sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn load_fences(&self) -> anyhow::Result<Vec<FenceRecord>> {
+        match self.load_meta(FENCES_KEY).await? {
+            Some(bytes) => Ok(decode_tagged(RecordKind::Fences, &bytes)?),
+            None => Ok(Vec::new()),
+        }
+    }
+
     async fn save_route(&self, txn: TxnId, route: &[Key]) -> anyhow::Result<()> {
         let value = encode_tagged(RecordKind::Route, &(txn, route.to_vec()))?;
         self.staged_meta.lock().expect("journal poisoned").push((
@@ -710,9 +739,9 @@ where
             .collect()
     }
 
-    async fn append_metadata(&self, epoch: u64, layout: &[Vec<NodeId>]) -> anyhow::Result<()> {
-        let value = encode_tagged(RecordKind::MetadataEntry, &layout.to_vec())?;
-        // Idempotent: the first decided layout for an epoch wins.
+    async fn append_metadata(&self, epoch: u64, entry: &ConfigEntry) -> anyhow::Result<()> {
+        let value = encode_tagged(RecordKind::MetadataEntry, entry)?;
+        // Idempotent: the first decided entry for an epoch wins.
         let statement = Query::insert()
             .into_table(AccordMetadataLog::Table)
             .columns([AccordMetadataLog::Epoch, AccordMetadataLog::Layout])
@@ -733,10 +762,7 @@ where
         Ok(())
     }
 
-    async fn append_metadata_batch(
-        &self,
-        entries: &[(u64, Vec<Vec<NodeId>>)],
-    ) -> anyhow::Result<()> {
+    async fn append_metadata_batch(&self, entries: &[(u64, ConfigEntry)]) -> anyhow::Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
@@ -754,11 +780,11 @@ where
                     .to_owned(),
             )
             .to_owned();
-        for (epoch, layout) in entries {
+        for (epoch, entry) in entries {
             if !seen.insert(*epoch) {
                 continue;
             }
-            let value = encode_tagged(RecordKind::MetadataEntry, &layout.to_vec())?;
+            let value = encode_tagged(RecordKind::MetadataEntry, entry)?;
             statement.values_panic([(*epoch as i64).into(), value.into()]);
         }
         let (sql, values) = Self::build_sqlx(&statement);
@@ -768,7 +794,7 @@ where
         Ok(())
     }
 
-    async fn load_metadata(&self) -> anyhow::Result<Vec<(u64, Vec<Vec<NodeId>>)>> {
+    async fn load_metadata(&self) -> anyhow::Result<Vec<(u64, ConfigEntry)>> {
         let statement = Query::select()
             .columns([AccordMetadataLog::Epoch, AccordMetadataLog::Layout])
             .from(AccordMetadataLog::Table)

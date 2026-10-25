@@ -589,7 +589,7 @@ async fn a_config_change_survives_a_coordinator_crash() {
     let decided = nodes[1].node.recover_topology(1).await.unwrap();
     assert_eq!(
         decided,
-        vec![abcd.clone()],
+        evento_accord::ConfigEntry::active(vec![abcd.clone()]),
         "the accepted layout is recovered"
     );
 
@@ -635,7 +635,11 @@ async fn concurrent_recovery_of_one_epoch_converges() {
             .expect("recovery timed out")
             .unwrap()
             .expect("recovery converges, not duels to failure");
-        assert_eq!(decided, vec![abcd.clone()], "all recover the same layout");
+        assert_eq!(
+            decided,
+            evento_accord::ConfigEntry::active(vec![abcd.clone()]),
+            "all recover the same layout"
+        );
     }
 
     for n in &nodes[1..] {
@@ -742,30 +746,34 @@ async fn config_changes_outlive_the_founders() {
     let cde = vec![NodeId(2), NodeId(3), NodeId(4)];
     let cdef = vec![NodeId(2), NodeId(3), NodeId(4), NodeId(5)];
 
-    // Founders A, B, C. D, E, F are spawned but not yet members.
+    // Founders A, B, C. D, E, F are spawned but not yet members. Growing by
+    // two, and shrinking five to three, drain under the old layout first:
+    // the recovery sweep's gossip carries what the drain waits on.
     let all: Vec<TestNode> = (0..6)
         .map(|id| spawn_node(NodeId(id), 0, vec![abc.clone()], &net))
         .collect();
+    let _sweeps: Vec<_> = all.iter().map(|n| n.node.start_recovery()).collect();
 
-    // Grow to {A,B,C,D,E} (acceptors = the founders {A,B,C}) ...
+    // Grow to {A,B,C,D,E} (acceptors = the founders {A,B,C}): a transition at
+    // epoch 1, the new layout at epoch 2 ...
     all[0]
         .node
         .change_topology(1, vec![abcde.clone()])
         .await
         .unwrap();
     for n in &all[0..5] {
-        await_epoch(&n.topology, 1).await;
+        await_epoch(&n.topology, 2).await;
     }
 
     // ... then to {C,D,E}, removing founders A and B. This change is decided by
-    // the epoch-1 members {A,B,C,D,E} (a majority of 3), not just the founders.
+    // the epoch-2 members {A,B,C,D,E} (a majority of 3), not just the founders.
     all[0]
         .node
-        .change_topology(2, vec![cde.clone()])
+        .change_topology(3, vec![cde.clone()])
         .await
         .unwrap();
     for n in &all[2..5] {
-        await_epoch(&n.topology, 2).await;
+        await_epoch(&n.topology, 4).await;
     }
 
     // A majority of the *founders* is now gone.
@@ -774,14 +782,15 @@ async fn config_changes_outlive_the_founders() {
 
     // C can still reconfigure (add F): the acceptor set has evolved to the
     // current members {C,D,E}, so the dead founders no longer matter. With a
-    // fixed founder acceptor set this would deadlock.
+    // fixed founder acceptor set this would deadlock. One replica added to a
+    // shard of three: installed at once.
     all[2]
         .node
-        .change_topology(3, vec![cdef.clone()])
+        .change_topology(5, vec![cdef.clone()])
         .await
         .expect("reconfiguration succeeds without the founders");
     for n in &all[2..6] {
-        await_epoch(&n.topology, 3).await;
+        await_epoch(&n.topology, 5).await;
     }
     assert_eq!(
         all[5].topology.nodes(),
@@ -1046,7 +1055,7 @@ async fn a_duplicated_config_promise_never_completes_a_quorum() {
                         epoch,
                         ballot,
                         accepted_ballot: evento_accord::Ballot(evento_accord::Timestamp::MIN),
-                        accepted_layout: None,
+                        accepted_entry: None,
                     },
                     Message::ConfigAccept { epoch, ballot, .. } => {
                         Message::ConfigAccepted { epoch, ballot }
@@ -1140,7 +1149,7 @@ async fn a_commit_of_an_invalid_layout_is_neither_installed_nor_persisted() {
             NodeId(0),
             Message::ConfigCommit {
                 epoch: 1,
-                layout: vec![],
+                entry: evento_accord::ConfigEntry::active(vec![]),
             },
         )
         .await
@@ -1170,7 +1179,7 @@ async fn a_commit_of_an_invalid_layout_is_neither_installed_nor_persisted() {
             NodeId(0),
             Message::ConfigCommit {
                 epoch: 1,
-                layout: vec![abc.clone()],
+                entry: evento_accord::ConfigEntry::active(vec![abc.clone()]),
             },
         )
         .await

@@ -38,7 +38,7 @@ use ulid::Ulid;
 use crate::api::{same_event, snapshot_event_size, DataStore, SnapshotPage};
 use crate::clock::{Timestamp, TxnId};
 use crate::message::Key;
-use crate::node::{BacklogAtCap, Node, NodeClosed, RejoinRequired};
+use crate::node::{BacklogAtCap, Node, NodeClosed, RejoinRequired, TopologyChanging};
 
 /// Most events one backend read returns for the scans behind
 /// [`ExecutorDataStore::snapshot_page`] and [`ExecutorDataStore::snapshot`].
@@ -404,11 +404,16 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
             return Err(WriteError::MissingData);
         }
         // A refusal that clears on its own (the backlog cap, a rejoin in
-        // progress, a node retired until its host reopens it) is `Unavailable`,
+        // progress, a node retired until its host reopens it, a key moving to
+        // other replicas) is `Unavailable`,
         // so a caller can tell a transient condition from a failure and keep
         // the typed cause.
         let outcome = self.node.write(events).await.map_err(|err| {
-            if err.is::<BacklogAtCap>() || err.is::<RejoinRequired>() || err.is::<NodeClosed>() {
+            if err.is::<BacklogAtCap>()
+                || err.is::<RejoinRequired>()
+                || err.is::<NodeClosed>()
+                || err.is::<TopologyChanging>()
+            {
                 WriteError::Unavailable(err)
             } else {
                 WriteError::Unknown(err)

@@ -781,7 +781,7 @@ async fn an_amnesiac_acceptor_never_answers_config_paxos_again() {
         Message::ConfigAccept {
             epoch: 1,
             ballot: ballot(now + 1),
-            layout: layout.clone(),
+            entry: evento_accord::ConfigEntry::active(layout.clone()),
         },
     )
     .await;

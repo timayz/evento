@@ -85,6 +85,13 @@ pub struct Metrics {
     /// installed yet: left unanswered while it fetches the metadata it is
     /// missing from the sender.
     pub messages_future_epoch: AtomicU64,
+    /// Votes a layout change refused: for a transaction this node never
+    /// witnessed, on a key a transition moves, above this node's fence point
+    /// — or planned under the new layout below its activation's clock floor.
+    pub votes_change_fenced: AtomicU64,
+    /// Writes this node refused to coordinate because a key they touch is
+    /// moving ([`TopologyChanging`](crate::TopologyChanging)).
+    pub writes_topology_changing: AtomicU64,
 }
 
 impl Metrics {
@@ -194,6 +201,17 @@ impl Metrics {
         self.messages_future_epoch.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records a vote a layout change refused.
+    pub fn record_vote_change_fenced(&self) {
+        self.votes_change_fenced.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a write refused while a key it touches moves.
+    pub fn record_write_topology_changing(&self) {
+        self.writes_topology_changing
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Records a config-Paxos vote withheld after a lost journal.
     pub fn record_config_vote_withheld(&self) {
         self.config_votes_withheld.fetch_add(1, Ordering::Relaxed);
@@ -236,6 +254,8 @@ impl Metrics {
             config_votes_withheld: self.config_votes_withheld.load(Ordering::Relaxed),
             votes_retired: self.votes_retired.load(Ordering::Relaxed),
             messages_future_epoch: self.messages_future_epoch.load(Ordering::Relaxed),
+            votes_change_fenced: self.votes_change_fenced.load(Ordering::Relaxed),
+            writes_topology_changing: self.writes_topology_changing.load(Ordering::Relaxed),
         }
     }
 }
@@ -269,6 +289,8 @@ pub struct MetricsSnapshot {
     pub config_votes_withheld: u64,
     pub votes_retired: u64,
     pub messages_future_epoch: u64,
+    pub votes_change_fenced: u64,
+    pub writes_topology_changing: u64,
 }
 
 impl MetricsSnapshot {
@@ -276,7 +298,7 @@ impl MetricsSnapshot {
     /// source of truth for both [`to_prometheus`](Self::to_prometheus) and
     /// [`to_prometheus_labeled`](Self::to_prometheus_labeled); add a counter here and
     /// both renderings pick it up.
-    fn counters(&self) -> [(&'static str, &'static str, u64); 24] {
+    fn counters(&self) -> [(&'static str, &'static str, u64); 26] {
         [
             (
                 "accord_writes_committed_total",
@@ -397,6 +419,16 @@ impl MetricsSnapshot {
                 "accord_messages_future_epoch_total",
                 "Messages about a transaction planned under an epoch not installed here yet (metadata fetched).",
                 self.messages_future_epoch,
+            ),
+            (
+                "accord_votes_change_fenced_total",
+                "Votes a layout change refused: never witnessed, on a moved key, past the fence (or below the floor).",
+                self.votes_change_fenced,
+            ),
+            (
+                "accord_writes_topology_changing_total",
+                "Writes refused while a key they touch moves to other replicas.",
+                self.writes_topology_changing,
             ),
         ]
     }

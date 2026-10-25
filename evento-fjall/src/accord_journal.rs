@@ -29,8 +29,8 @@ use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 
 use evento_accord::format::{decode_tagged, encode_tagged, RecordKind};
 use evento_accord::{
-    AcceptorRecord, AmnesiaFence, Ballot, CommandState, DecisionRecord, Journal, Key, NodeId,
-    Timestamp, TxnId,
+    AcceptorRecord, AmnesiaFence, Ballot, CommandState, ConfigEntry, DecisionRecord, FenceRecord,
+    Journal, Key, NodeId, Timestamp, TxnId,
 };
 
 /// Key under which the truncation watermark is stored in the `meta` keyspace.
@@ -42,6 +42,9 @@ const CLOCK_BOUND_KEY: &[u8] = b"clock_bound";
 /// Meta key under which the replica's amnesia fence is stored. Untouched by
 /// `truncate`.
 const AMNESIA_FENCE_KEY: &[u8] = b"amnesia_fence";
+/// Meta key under which the replica's transition fences are stored. Untouched
+/// by `truncate`.
+const FENCES_KEY: &[u8] = b"fences";
 /// Prefix for metadata-log entry keys (`mlog/` + 8-byte big-endian epoch).
 const METADATA_PREFIX: &[u8] = b"mlog/";
 /// Prefix for acceptor-state keys (`acc/` + 8-byte big-endian epoch).
@@ -353,6 +356,28 @@ impl Journal for FjallJournal {
         }
     }
 
+    async fn save_fences(&self, fences: &[FenceRecord]) -> anyhow::Result<()> {
+        let value = encode_tagged(RecordKind::Fences, &fences.to_vec())?;
+        let meta = self.meta.clone();
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            meta.insert(FENCES_KEY, value)?;
+            db.persist(PersistMode::SyncAll)?;
+            Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    async fn load_fences(&self) -> anyhow::Result<Vec<FenceRecord>> {
+        let meta = self.meta.clone();
+        let bytes = tokio::task::spawn_blocking(move || meta.get(FENCES_KEY)).await??;
+        match bytes {
+            Some(bytes) => Ok(decode_tagged(RecordKind::Fences, &bytes)?),
+            None => Ok(Vec::new()),
+        }
+    }
+
     async fn save_route(&self, txn: TxnId, route: &[Key]) -> anyhow::Result<()> {
         self.stage_meta(
             txn_key(ROUTE_PREFIX, txn),
@@ -445,13 +470,13 @@ impl Journal for FjallJournal {
         .await?
     }
 
-    async fn append_metadata(&self, epoch: u64, layout: &[Vec<NodeId>]) -> anyhow::Result<()> {
+    async fn append_metadata(&self, epoch: u64, entry: &ConfigEntry) -> anyhow::Result<()> {
         let key = epoch_key(METADATA_PREFIX, epoch);
-        let value = encode_tagged(RecordKind::MetadataEntry, &layout.to_vec())?;
+        let value = encode_tagged(RecordKind::MetadataEntry, entry)?;
         let meta = self.meta.clone();
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            // Idempotent: the first decided layout for an epoch wins; a re-commit is a
+            // Idempotent: the first decided entry for an epoch wins; a re-commit is a
             // no-op (never overwrite the durable chosen value).
             if meta.contains_key(&key)? {
                 return Ok(());
@@ -464,19 +489,16 @@ impl Journal for FjallJournal {
         Ok(())
     }
 
-    async fn append_metadata_batch(
-        &self,
-        entries: &[(u64, Vec<Vec<NodeId>>)],
-    ) -> anyhow::Result<()> {
+    async fn append_metadata_batch(&self, entries: &[(u64, ConfigEntry)]) -> anyhow::Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
         let encoded = entries
             .iter()
-            .map(|(epoch, layout)| {
+            .map(|(epoch, entry)| {
                 Ok((
                     epoch_key(METADATA_PREFIX, *epoch),
-                    encode_tagged(RecordKind::MetadataEntry, layout)?,
+                    encode_tagged(RecordKind::MetadataEntry, entry)?,
                 ))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
@@ -503,9 +525,9 @@ impl Journal for FjallJournal {
         Ok(())
     }
 
-    async fn load_metadata(&self) -> anyhow::Result<Vec<(u64, Vec<Vec<NodeId>>)>> {
+    async fn load_metadata(&self) -> anyhow::Result<Vec<(u64, ConfigEntry)>> {
         let meta = self.meta.clone();
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<(u64, Vec<Vec<NodeId>>)>> {
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<(u64, ConfigEntry)>> {
             let mut out = Vec::new();
             // Big-endian epoch keys sort ascending, so the prefix scan already
             // yields entries in epoch order.

@@ -4,8 +4,8 @@
 #![allow(dead_code)]
 
 use evento_accord::{
-    AcceptorRecord, AmnesiaFence, Ballot, CommandState, DecisionRecord, Journal, Key, NodeId,
-    Status, Timestamp, TxnId,
+    AcceptorRecord, AmnesiaFence, Ballot, CommandState, ConfigEntry, DecisionRecord, FenceRecord,
+    Journal, Key, NodeId, Status, Timestamp, TxnId,
 };
 use evento_core::Event;
 use evento_sql::SqlJournal;
@@ -44,8 +44,8 @@ pub fn command(micros: u64, version: u16) -> CommandState {
     }
 }
 
-pub fn layout(nodes: &[u64]) -> Vec<Vec<NodeId>> {
-    vec![nodes.iter().map(|&n| NodeId(n)).collect()]
+pub fn layout(nodes: &[u64]) -> ConfigEntry {
+    ConfigEntry::active(vec![nodes.iter().map(|&n| NodeId(n)).collect()])
 }
 
 /// Round-trips commands (incl. upsert), the metadata log (idempotent, ascending),
@@ -387,4 +387,31 @@ where
     journal.save_amnesia_fence(&joined).await.unwrap();
     journal.truncate(timestamp(1_000, 0)).await.unwrap();
     assert_eq!(journal.load_amnesia_fence().await.unwrap(), Some(joined));
+}
+
+/// The transition fences round-trip, a save replaces the set, and a
+/// truncate keeps them.
+pub async fn fences<DB>(journal: &SqlJournal<DB>)
+where
+    DB: Database,
+    for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
+    sea_query_sqlx::SqlxValues: sqlx::IntoArguments<DB>,
+    Vec<u8>: for<'r> sqlx::Decode<'r, DB> + sqlx::Type<DB>,
+    i64: for<'r> sqlx::Decode<'r, DB> + sqlx::Type<DB>,
+    usize: sqlx::ColumnIndex<DB::Row>,
+{
+    assert!(journal.load_fences().await.unwrap().is_empty());
+    let first = FenceRecord {
+        since: 1,
+        cap: timestamp(500, 0),
+    };
+    journal.save_fences(&[first]).await.unwrap();
+    assert_eq!(journal.load_fences().await.unwrap(), vec![first]);
+    let second = FenceRecord {
+        since: 3,
+        cap: timestamp(900, 1),
+    };
+    journal.save_fences(&[first, second]).await.unwrap();
+    journal.truncate(timestamp(1_000, 0)).await.unwrap();
+    assert_eq!(journal.load_fences().await.unwrap(), vec![first, second]);
 }

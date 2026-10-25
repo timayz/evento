@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use evento_accord::{
-    AcceptorRecord, AmnesiaFence, Ballot, CommandState, DecisionRecord, InMemoryJournal, Journal,
-    Key, NodeId, Timestamp, TxnId,
+    AcceptorRecord, AmnesiaFence, Ballot, CommandState, ConfigEntry, DecisionRecord, FenceRecord,
+    InMemoryJournal, Journal, Key, NodeId, Timestamp, TxnId,
 };
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -173,6 +173,7 @@ impl FaultJournal {
             && d.load_amnesia_fence().await.unwrap().is_none()
             && d.load_acceptors().await.unwrap().is_empty()
             && d.load_metadata().await.unwrap().is_empty()
+            && d.load_fences().await.unwrap().is_empty()
             && d.load_routes().await.unwrap().is_empty()
             && d.load_promises().await.unwrap().is_empty()
             && d.load_decisions().await.unwrap().is_empty()
@@ -291,14 +292,23 @@ impl Journal for FaultJournal {
         self.stage_write(Staged::DropDecisions(txns.to_vec()));
         Ok(())
     }
-    async fn append_metadata(&self, epoch: u64, layout: &[Vec<NodeId>]) -> anyhow::Result<()> {
+    async fn append_metadata(&self, epoch: u64, entry: &ConfigEntry) -> anyhow::Result<()> {
         if self.metadata_failing.load(Ordering::SeqCst) || self.draw(|f| f.metadata) {
             anyhow::bail!("simulated metadata-log write failure");
         }
-        self.durable.append_metadata(epoch, layout).await
+        self.durable.append_metadata(epoch, entry).await
     }
-    async fn load_metadata(&self) -> anyhow::Result<Vec<(u64, Vec<Vec<NodeId>>)>> {
+    async fn load_metadata(&self) -> anyhow::Result<Vec<(u64, ConfigEntry)>> {
         self.durable.load_metadata().await
+    }
+    async fn save_fences(&self, fences: &[FenceRecord]) -> anyhow::Result<()> {
+        if self.draw(|f| f.metadata) {
+            anyhow::bail!("simulated fence write failure");
+        }
+        self.durable.save_fences(fences).await
+    }
+    async fn load_fences(&self) -> anyhow::Result<Vec<FenceRecord>> {
+        self.durable.load_fences().await
     }
     async fn record_acceptor(&self, epoch: u64, state: &AcceptorRecord) -> anyhow::Result<()> {
         if self.acceptor_failing.load(Ordering::SeqCst)

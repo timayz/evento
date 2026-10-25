@@ -63,6 +63,11 @@ async fn amnesia_fence() {
 }
 
 #[tokio::test]
+async fn fences() {
+    sql_support::fences(&fresh("accord_my_fences").await).await;
+}
+
+#[tokio::test]
 async fn survives_reconnect() {
     let name = "accord_my_reconnect";
     let b = command(200, 2);

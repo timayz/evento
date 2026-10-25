@@ -185,35 +185,37 @@ refuses anything else before a vote, and a node never installs it.
 
 - **Add a node:** start the new process with `begin_join()` (it buffers consensus
   messages), drive `change_topology(epoch, new_layout)` from any current member, then
-  the joiner calls `join(contact)` to pull a snapshot + recent commands and replay the
-  buffer. (See `tests/membership.rs`, `tests/resharding.rs`.)
+  the joiner calls `join(contact)` with a contact of its shard to pull a snapshot +
+  recent commands and replay the buffer. (See `tests/membership.rs`,
+  `tests/transitions.rs`.)
 - **Remove a node:** `change_topology(epoch, smaller_layout)`; the smaller cluster keeps
   serving. Reconfiguration survives the coordinator crashing mid-change (another node
-  completes it via `recover_topology`) and works after founders have left (the acceptor
-  set tracks current membership).
-- **Re-shard (move a key range):** a config change into more shards; the new shard's
-  nodes bootstrap only their range. *Note:* GC of a moved range from old owners is not
-  implemented (evento's event store is append-only) — old replicas simply stop being
-  contacted for it.
-- **No transaction in flight across a layout change (until #288 ships).** A
-  transaction is voted on and recovered under the layout it was coordinated under,
-  but an epoch change does not yet drain the transactions in flight across it: new
-  owners can bootstrap before the old ones finish them, and a quorum of the new
-  layout need not meet a commit quorum of the old one. The keys concerned are those
-  whose replica set changes: the keys that move to another shard, and every key of
-  a shard that gains or loses a node. So, before `change_topology`:
-  1. stop writes to those keys;
-  2. let compaction pass them: every replica's `command_count()` back to zero;
-  3. change the layout, then resume writes.
-
-  A change must be for the next epoch: `change_topology` refuses one that skips
-  an epoch.
-
-  Re-sharding among existing members (a member gaining a range it did not hold) is
-  unsupported: only a joining node bootstraps, so the member gets no data for the
-  range. Meanwhile two guards narrow the exposure: a coordinator counts replies for
-  the shards it planned their senders in, and a replica that owns none of a
-  message's keys, and holds nothing of the transaction, casts no vote.
+  completes it via `recover_topology`, and the recovery sweep) and works after founders
+  have left (the acceptor set tracks current membership).
+- **Replace a node** (a dead one included): one change, `change_topology(epoch,
+  layout)`, with the new node joining as above once the change returns.
+- **What a change does with writes in flight.** Every transaction is voted on and
+  recovered under the layout it was coordinated under. A change after which every
+  quorum of a shard still meets every quorum it had — one node added to a shard of
+  three, or one removed — installs at once, and writes go on. Any other change —
+  replacing a node, adding two at once, shrinking five to three — takes two epochs: a
+  *transition* keeps the old layout live while the writes in flight on the shard
+  drain, then the next epoch installs the new layout. While it drains, writes to that
+  shard's keys fail with `TopologyChanging` (`WriteError::Unavailable` through
+  `AccordExecutor`): plan for about `compaction_margin` + two clock skews + a few
+  `anti_entropy_interval`s — about 2 s with the defaults. The drain is driven by the
+  recovery sweep's watermark gossip and anti-entropy: run `start_recovery` on every
+  node. It waits for a slow quorum of every shard (a dead node does not hold it back,
+  with the default `peer_absence_limit` too). `change_topology` returns once the new
+  layout is installed, or fails after a while, leaving the sweep to install it. While
+  a transition drains, a change to another layout replaces it, and a change back to
+  the live layout cancels it.
+- **For now** a change keeps the shard count, keeps at least one node of every shard,
+  and moves no node to another shard (`change_topology` refuses anything else before a
+  vote): keys do not move between shards yet (#288). *Note:* GC of a moved range from
+  old owners is not implemented (evento's event store is append-only).
+- A change must be for the next epoch: `change_topology` refuses one that skips an
+  epoch.
 
 ---
 

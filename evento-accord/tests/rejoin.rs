@@ -354,7 +354,7 @@ async fn a_rejoined_acceptor_keeps_its_config_promise() {
         Message::ConfigAccept {
             epoch: 1,
             ballot: ballot(1),
-            layout: vec![(0..3).map(NodeId).collect()],
+            entry: evento_accord::ConfigEntry::active(vec![(0..3).map(NodeId).collect()]),
         },
     )
     .await;

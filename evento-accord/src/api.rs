@@ -288,6 +288,99 @@ impl Layout {
     }
 }
 
+/// What one epoch of the metadata log installs: the value config Paxos
+/// decides for it. A change that gives a key another replica set takes two
+/// epochs — a [`Transition`](ConfigEntry::Transition), then the
+/// [`Active`](ConfigEntry::Active) entry that ends it — so that at any time
+/// one layout is live for each key; any other change takes one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConfigEntry {
+    /// `layout` is live from this epoch on. `drained` is set when it ends a
+    /// transition: what the change waited for before it installed `layout`.
+    Active {
+        /// The live layout.
+        layout: Vec<Vec<NodeId>>,
+        /// The transition this entry ends, drained.
+        drained: Option<Drained>,
+    },
+    /// `active` stays live while the keys whose replica set differs in
+    /// `pending` drain: they take no new writes, and the writes in flight on
+    /// them finish under `active`. The [`Active`](ConfigEntry::Active) entry
+    /// that installs `pending` follows once they have.
+    Transition {
+        /// The live layout, unchanged.
+        active: Vec<Vec<NodeId>>,
+        /// The layout the change installs next.
+        pending: Vec<Vec<NodeId>>,
+        /// The epoch the change to `pending` was first decided at: a
+        /// transition repeated at a later epoch keeps it.
+        since: u64,
+    },
+}
+
+/// A fence a replica installed for a layout transition
+/// ([`ConfigEntry::Transition`]): it votes for no transaction it never
+/// witnessed, planned before the transition ended, on a key the change moves,
+/// with a `t0` above `cap`. `cap` is above every `t0` it had voted for, so a
+/// slow quorum of a shard reporting their fences bounds every write on the
+/// moved keys that can still commit. Journaled
+/// ([`Journal::save_fences`]) before the replica reports it, and kept for good.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FenceRecord {
+    /// The epoch the transition was first decided at
+    /// ([`ConfigEntry::Transition::since`]).
+    pub since: u64,
+    /// The fence point.
+    pub cap: Timestamp,
+}
+
+/// What a transition drained before the [`ConfigEntry::Active`] entry that
+/// ends it: every transaction on a key the change moved that could still
+/// commit had a `t0` at or below `point`, and a slow quorum of every shard
+/// had applied every one of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Drained {
+    /// The drain point: the highest fence point a slow quorum of a changed
+    /// shard reported.
+    pub point: Timestamp,
+    /// A clock reading past every moved write's execution: a transaction
+    /// planned under the new layout on a key it moved is voted for only
+    /// above it, so its events stamp after theirs.
+    pub floor: Timestamp,
+}
+
+impl ConfigEntry {
+    /// An entry that installs `layout`, with nothing to drain.
+    pub fn active(layout: Vec<Vec<NodeId>>) -> Self {
+        Self::Active {
+            layout,
+            drained: None,
+        }
+    }
+
+    /// The layout the transactions planned under this epoch are owned, voted
+    /// on and recovered under: during a transition, the layout it keeps live.
+    pub fn live(&self) -> &[Vec<NodeId>] {
+        match self {
+            Self::Active { layout, .. } => layout,
+            Self::Transition { active, .. } => active,
+        }
+    }
+
+    /// Checks every layout the entry names (see [`validate_layout`]).
+    pub fn validate(&self) -> anyhow::Result<()> {
+        match self {
+            Self::Active { layout, .. } => validate_layout(layout),
+            Self::Transition {
+                active, pending, ..
+            } => {
+                validate_layout(active)?;
+                validate_layout(pending)
+            }
+        }
+    }
+}
+
 /// A config-Paxos acceptor's durable state for one epoch — the highest ballot it
 /// has promised and the highest-ballot layout it has accepted, if any. Persisted
 /// (via [`Journal::record_acceptor`]) **before** the matching promise/accept reply
@@ -297,8 +390,8 @@ impl Layout {
 pub struct AcceptorRecord {
     /// Highest ballot ever promised for this epoch.
     pub promised: Ballot,
-    /// The highest-ballot `(ballot, layout)` accepted for this epoch, if any.
-    pub accepted: Option<(Ballot, Vec<Vec<NodeId>>)>,
+    /// The highest-ballot `(ballot, entry)` accepted for this epoch, if any.
+    pub accepted: Option<(Ballot, ConfigEntry)>,
 }
 
 /// What a replica keeps of an applied **multi-shard** transaction once it
@@ -511,12 +604,12 @@ pub trait Journal: Send + Sync + 'static {
         Ok(Vec::new())
     }
 
-    /// Durably appends a decided metadata-log entry — one `epoch`'s committed
-    /// topology `layout`. Durable by the time it returns. Idempotent: re-appending
-    /// an epoch already present with the same layout is a no-op. The default is a
-    /// no-op (a journal that does not back dynamic membership).
-    async fn append_metadata(&self, epoch: u64, layout: &[Vec<NodeId>]) -> anyhow::Result<()> {
-        let _ = (epoch, layout);
+    /// Durably appends a decided metadata-log entry — what one `epoch`
+    /// installs. Durable by the time it returns. Idempotent: the first entry
+    /// appended for an epoch is kept. The default is a no-op (a journal that
+    /// does not back dynamic membership).
+    async fn append_metadata(&self, epoch: u64, entry: &ConfigEntry) -> anyhow::Result<()> {
+        let _ = (epoch, entry);
         Ok(())
     }
 
@@ -525,19 +618,32 @@ pub trait Journal: Send + Sync + 'static {
     /// Journals that batch their fsync should override this to make the whole run
     /// durable with one sync instead of one per entry. The default loops
     /// [`append_metadata`](Journal::append_metadata).
-    async fn append_metadata_batch(
-        &self,
-        entries: &[(u64, Vec<Vec<NodeId>>)],
-    ) -> anyhow::Result<()> {
-        for (epoch, layout) in entries {
-            self.append_metadata(*epoch, layout).await?;
+    async fn append_metadata_batch(&self, entries: &[(u64, ConfigEntry)]) -> anyhow::Result<()> {
+        for (epoch, entry) in entries {
+            self.append_metadata(*epoch, entry).await?;
         }
         Ok(())
     }
 
     /// All persisted metadata-log entries, ascending by epoch, for replaying the
     /// committed topology sequence after a restart. The default returns nothing.
-    async fn load_metadata(&self) -> anyhow::Result<Vec<(u64, Vec<Vec<NodeId>>)>> {
+    async fn load_metadata(&self) -> anyhow::Result<Vec<(u64, ConfigEntry)>> {
+        Ok(Vec::new())
+    }
+
+    /// Durably persists the fences this replica installed for layout
+    /// transitions ([`FenceRecord`]), replacing the previous set. Durable by
+    /// the time it returns, and **never** discarded by
+    /// [`truncate`](Journal::truncate). The default is a no-op: the node reads
+    /// the fences back before it reports one, so a journal that cannot keep
+    /// them holds every change that moves a key at its transition.
+    async fn save_fences(&self, fences: &[FenceRecord]) -> anyhow::Result<()> {
+        let _ = fences;
+        Ok(())
+    }
+
+    /// The persisted fences. The default returns none.
+    async fn load_fences(&self) -> anyhow::Result<Vec<FenceRecord>> {
         Ok(Vec::new())
     }
 

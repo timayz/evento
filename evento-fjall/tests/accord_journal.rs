@@ -5,8 +5,8 @@
 #![cfg(feature = "accord")]
 
 use evento_accord::{
-    AcceptorRecord, AmnesiaFence, Ballot, CommandState, DecisionRecord, Journal, Key, NodeId,
-    Status, Timestamp, TxnId,
+    AcceptorRecord, AmnesiaFence, Ballot, CommandState, ConfigEntry, DecisionRecord, FenceRecord,
+    Journal, Key, NodeId, Status, Timestamp, TxnId,
 };
 use evento_core::Event;
 use evento_fjall::FjallJournal;
@@ -118,7 +118,9 @@ async fn metadata_log_and_acceptor_state_survive_close_and_reopen() {
         .tempdir()
         .unwrap();
 
-    let layout = |nodes: &[u64]| vec![nodes.iter().map(|&n| NodeId(n)).collect::<Vec<_>>()];
+    let layout = |nodes: &[u64]| {
+        ConfigEntry::active(vec![nodes.iter().map(|&n| NodeId(n)).collect::<Vec<_>>()])
+    };
 
     {
         let journal = FjallJournal::open(temp.path()).unwrap();
@@ -170,7 +172,9 @@ async fn metadata_batch_append_keeps_first_decided_layout() {
         .tempdir()
         .unwrap();
 
-    let layout = |nodes: &[u64]| vec![nodes.iter().map(|&n| NodeId(n)).collect::<Vec<_>>()];
+    let layout = |nodes: &[u64]| {
+        ConfigEntry::active(vec![nodes.iter().map(|&n| NodeId(n)).collect::<Vec<_>>()])
+    };
 
     {
         let journal = FjallJournal::open(temp.path()).unwrap();
@@ -338,4 +342,31 @@ async fn amnesia_fence_survives_close_reopen_and_truncate() {
     assert_eq!(journal.load_amnesia_fence().await.unwrap(), Some(joined));
     journal.truncate(timestamp(1_000, 0)).await.unwrap();
     assert_eq!(journal.load_amnesia_fence().await.unwrap(), Some(joined));
+}
+
+#[tokio::test]
+async fn fences_survive_close_reopen_and_truncate() {
+    let temp = tempfile::Builder::new()
+        .prefix("evento_accord_journal_fences")
+        .tempdir()
+        .unwrap();
+    let first = FenceRecord {
+        since: 1,
+        cap: timestamp(500, 0),
+    };
+    let second = FenceRecord {
+        since: 3,
+        cap: timestamp(900, 1),
+    };
+    {
+        let journal = FjallJournal::open(temp.path()).unwrap();
+        assert!(journal.load_fences().await.unwrap().is_empty());
+        journal.save_fences(&[first]).await.unwrap();
+        assert_eq!(journal.load_fences().await.unwrap(), vec![first]);
+        journal.save_fences(&[first, second]).await.unwrap();
+    }
+    let journal = FjallJournal::open(temp.path()).unwrap();
+    assert_eq!(journal.load_fences().await.unwrap(), vec![first, second]);
+    journal.truncate(timestamp(1_000, 0)).await.unwrap();
+    assert_eq!(journal.load_fences().await.unwrap(), vec![first, second]);
 }

@@ -12,7 +12,10 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use evento_core::Event;
 
-use crate::api::{same_event, AcceptorRecord, AmnesiaFence, DataStore, DecisionRecord, Journal};
+use crate::api::{
+    same_event, AcceptorRecord, AmnesiaFence, ConfigEntry, DataStore, DecisionRecord, FenceRecord,
+    Journal,
+};
 use crate::clock::{Ballot, NodeId, Timestamp, TxnId};
 use crate::message::{CommandState, Key};
 
@@ -193,9 +196,9 @@ pub struct InMemoryJournal {
     watermark: Mutex<Option<Timestamp>>,
     /// The persisted rejoin bounds (see [`Journal::save_rejoin_bounds`]).
     rejoin_bounds: Mutex<Vec<(NodeId, Timestamp)>>,
-    /// Decided metadata-log entries (epoch → layout). `BTreeMap` so iteration is
-    /// ascending and deterministic.
-    metadata: Mutex<BTreeMap<u64, Vec<Vec<NodeId>>>>,
+    /// Decided metadata-log entries (epoch → entry). `BTreeMap` so iteration
+    /// is ascending and deterministic.
+    metadata: Mutex<BTreeMap<u64, ConfigEntry>>,
     /// Config-Paxos acceptor state per epoch.
     acceptors: Mutex<HashMap<u64, AcceptorRecord>>,
     /// Multi-shard routes (see [`Journal::save_route`]).
@@ -210,6 +213,9 @@ pub struct InMemoryJournal {
     /// The persisted amnesia fence (see [`Journal::save_amnesia_fence`]) —
     /// kept across `truncate`.
     amnesia_fence: Mutex<Option<AmnesiaFence>>,
+    /// The persisted transition fences (see [`Journal::save_fences`]) — kept
+    /// across `truncate`.
+    fences: Mutex<Vec<FenceRecord>>,
 }
 
 impl InMemoryJournal {
@@ -357,25 +363,34 @@ impl Journal for InMemoryJournal {
         Ok(())
     }
 
-    async fn append_metadata(&self, epoch: u64, layout: &[Vec<NodeId>]) -> anyhow::Result<()> {
-        // Idempotent: the first decided layout for an epoch wins (Paxos guarantees it
+    async fn append_metadata(&self, epoch: u64, entry: &ConfigEntry) -> anyhow::Result<()> {
+        // Idempotent: the first decided entry for an epoch wins (Paxos guarantees it
         // is the chosen value); a re-commit never overwrites it.
         self.metadata
             .lock()
             .expect("journal poisoned")
             .entry(epoch)
-            .or_insert_with(|| layout.to_vec());
+            .or_insert_with(|| entry.clone());
         Ok(())
     }
 
-    async fn load_metadata(&self) -> anyhow::Result<Vec<(u64, Vec<Vec<NodeId>>)>> {
+    async fn load_metadata(&self) -> anyhow::Result<Vec<(u64, ConfigEntry)>> {
         Ok(self
             .metadata
             .lock()
             .expect("journal poisoned")
             .iter()
-            .map(|(&epoch, layout)| (epoch, layout.clone()))
+            .map(|(&epoch, entry)| (epoch, entry.clone()))
             .collect())
+    }
+
+    async fn save_fences(&self, fences: &[FenceRecord]) -> anyhow::Result<()> {
+        *self.fences.lock().expect("journal poisoned") = fences.to_vec();
+        Ok(())
+    }
+
+    async fn load_fences(&self) -> anyhow::Result<Vec<FenceRecord>> {
+        Ok(self.fences.lock().expect("journal poisoned").clone())
     }
 
     async fn record_acceptor(&self, epoch: u64, state: &AcceptorRecord) -> anyhow::Result<()> {
@@ -470,7 +485,8 @@ mod tests {
     #[tokio::test]
     async fn in_memory_metadata_and_acceptors_round_trip_ascending() {
         let journal = InMemoryJournal::new();
-        let layout = |n: &[u64]| vec![n.iter().map(|&i| NodeId(i)).collect::<Vec<_>>()];
+        let layout =
+            |n: &[u64]| ConfigEntry::active(vec![n.iter().map(|&i| NodeId(i)).collect::<Vec<_>>()]);
 
         // Append out of order; load_metadata must return ascending by epoch.
         journal

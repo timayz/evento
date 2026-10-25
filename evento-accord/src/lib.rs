@@ -32,15 +32,16 @@ pub mod format;
 pub mod message;
 pub mod metrics;
 pub mod node;
+mod reconfig;
 pub mod replica;
 pub mod store;
 pub mod tcp;
 pub mod transport;
 
 pub use api::{
-    snapshot_event_size, validate_layout, AcceptorRecord, AmnesiaFence, DataStore, DecisionRecord,
-    DynamicTopology, Journal, Layout, MessageSink, RegionId, ShardId, ShardedTopology,
-    SnapshotPage, StaticTopology, Topology,
+    snapshot_event_size, validate_layout, AcceptorRecord, AmnesiaFence, ConfigEntry, DataStore,
+    DecisionRecord, Drained, DynamicTopology, FenceRecord, Journal, Layout, MessageSink, RegionId,
+    ShardId, ShardedTopology, SnapshotPage, StaticTopology, Topology,
 };
 pub use clock::{Ballot, Clock, HybridLogicalClock, NodeId, Timestamp, TxnId, MAX_SKEW_MICROS};
 pub use executor::{AccordExecutor, ExecutorDataStore};
@@ -49,7 +50,8 @@ pub use message::{CommandState, Key, Message, Status};
 pub use metrics::{Metrics, MetricsSnapshot};
 pub use node::{
     BacklogAtCap, CommandTooLarge, CommitOutcome, FenceNotCovered, LostJournal, Node, NodeClosed,
-    NodeConfig, PartialSnapshot, RejoinRequired, SweepPressure, MAX_COMMAND_BYTES,
+    NodeConfig, PartialSnapshot, RejoinRequired, SweepPressure, TopologyChanging,
+    MAX_COMMAND_BYTES,
 };
 pub use store::{AppliedEntry, InMemoryDataStore, InMemoryJournal};
 pub use tcp::{serve, serve_tls, serve_tls_verified, PeerCerts, TcpTransport, TlsClient};

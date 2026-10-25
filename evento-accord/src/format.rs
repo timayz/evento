@@ -69,9 +69,12 @@ pub const MAGIC: [u8; 2] = *b"Ac";
 /// (`SnapshotRequest`, `SyncRequest::snapshot`, `SyncData::snapshot`). 4: a
 /// transaction carries the epoch it was coordinated under
 /// (`CommandState::epoch`, `DecisionRecord::epoch`, and the `epoch` of every
-/// message about it). No reader for older versions: evento-accord has not
-/// been released, so a journal of one is wiped and the node re-bootstrapped.
-pub const FORMAT_VERSION: u8 = 4;
+/// message about it). 5: a metadata-log entry, and every config-Paxos value,
+/// is a `ConfigEntry` (a layout change takes a transition and an activation),
+/// and `Message::Watermark` carries the sender's fence. No reader for older
+/// versions: evento-accord has not been released, so a journal of one is
+/// wiped and the node re-bootstrapped.
+pub const FORMAT_VERSION: u8 = 5;
 
 /// Length of the fixed header: `MAGIC (2) + version (1) + kind (1)`.
 const HEADER_LEN: usize = 4;
@@ -88,7 +91,8 @@ pub enum RecordKind {
     Command = 2,
     /// The journal truncation watermark.
     Watermark = 3,
-    /// A decided metadata-log entry — one epoch's committed topology layout.
+    /// A decided metadata-log entry — what one epoch installs, as a
+    /// [`ConfigEntry`](crate::api::ConfigEntry).
     MetadataEntry = 4,
     /// A config-Paxos acceptor's durable state for one epoch.
     AcceptorState = 5,
@@ -115,6 +119,10 @@ pub enum RecordKind {
     /// (`Journal::save_amnesia_fence`), as an
     /// [`AmnesiaFence`](crate::api::AmnesiaFence).
     AmnesiaFence = 12,
+    /// The fences a replica installed for layout transitions
+    /// (`Journal::save_fences`), as a `Vec` of
+    /// [`FenceRecord`](crate::api::FenceRecord).
+    Fences = 13,
 }
 
 impl RecordKind {
@@ -131,6 +139,7 @@ impl RecordKind {
             10 => Some(Self::ClockBound),
             11 => Some(Self::Decision),
             12 => Some(Self::AmnesiaFence),
+            13 => Some(Self::Fences),
             _ => None,
         }
     }
