@@ -152,7 +152,8 @@ Serve it on an HTTP endpoint (see `bank-axum-accord`'s `/metrics`). Counters:
 | `amnesia_fences` | times this node opened joining over an empty journal and fenced itself (§7, lost journal). |
 | `amnesia_joins_refused` | joins over a lost journal that found no contact vouching past the fence (`FenceNotCovered`, nothing installed). A few while the contact's report catches up; **steadily rising** = a transaction below the fence no replica can decide any more (§7). |
 | `journals_rolled_back` | times a peer found this node's journal rolled back to an older copy at its open (§7). Any count = the node stopped: delete its journal and store, and open it joining. |
-| `config_votes_withheld` | config-Paxos promises and accepts this node withheld: it lost a journal under its node id, and abstains from config Paxos for good. |
+| `config_votes_withheld` | config-Paxos promises and accepts this node withheld: it lost a journal under its node id, and abstains from config Paxos until it restored its votes (§7). **Still rising** long after its join = it cannot hear a majority of the voting acceptors (a partition, or too many acceptors lost their journals at once). |
+| `config_votes_restored` | times this node, back over a lost journal, read a majority of the other acceptors' state and voted in config Paxos again (§7). One per loss. |
 | `snapshot_pages` | snapshot pages this node served to joining peers; a joiner pulls one per `snapshot_page_events` / `snapshot_page_bytes` of the contact's store. |
 | `command_pages` | command pages this node served to joining peers: a joiner pulls the contact's un-compacted applied commands one page at a time, before its snapshot pages. |
 | `joins_partial` | joins of this node that failed after a page was installed: the store holds a prefix no contact can complete, and must be emptied before the next join (§7). Steady > 0 = a contact that cannot read its backend, or a link losing pages faster than the per-page retries cover. |
@@ -404,10 +405,17 @@ refuses anything else before a vote, and a node never installs it.
     (a write that reached only a minority while the replica was away).
   - **Once joined it is an ordinary replica**, and a restart opens it plainly. It never
     votes for a transaction below its fence that it does not hold, and it **abstains
-    from config Paxos for good** under this node id (`accord_config_votes_withheld_total`):
-    config changes then need a majority of the other acceptors. A group whose
-    acceptors, one after another, lost a majority of their journals can no longer
-    change its membership.
+    from config Paxos** under this node id (`accord_config_votes_withheld_total`)
+    **until it restored its votes** (`accord_config_votes_restored_total`, #338): a
+    `collect_timeout` after its fence, it reads every other acceptor's state and
+    adopts it, once a majority of all the acceptors among the *voting* ones
+    answered — about a `collect_timeout` plus a sweep after the join. Config
+    changes meanwhile need a majority of the other acceptors. An acceptor that
+    itself lost a journal and has not restored its votes counts for nothing in that
+    read, so **acceptors that lose their journals at once** — a majority of them,
+    or two of three — never restore: bring those back under new node ids (the
+    withheld counter keeps rising on every config change). Losses one after
+    another, each restored before the next, cost nothing.
   - **A plain open refuses a lost journal**: `recover_state` over an empty
     journal and a store that holds events fails with `LostJournal`
     (or `LostJournal { join_pending: true }` after a join over a lost

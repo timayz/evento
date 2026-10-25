@@ -1922,8 +1922,8 @@ impl Node {
     /// past every id it can have minted. Its [`join`](Self::join) then waits
     /// for a contact that vouches past the fence — every write that committed
     /// below it is in that contact's state, and none that did not can commit
-    /// any more — and it abstains from config Paxos for good. It begins the
-    /// join itself.
+    /// any more — and it abstains from config Paxos until it restored its
+    /// votes (#338). It begins the join itself.
     pub async fn recover_state_for_join(&self) -> anyhow::Result<()> {
         self.restore_journal(true).await.map(|_| ())
     }
