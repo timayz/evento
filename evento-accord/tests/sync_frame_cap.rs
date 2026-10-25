@@ -3,8 +3,7 @@
 //! coverage the reply proves stays below every command it left out — it is
 //! what the requester's watermark report and subscriptions trust, so it must
 //! never vouch for a transaction still on its way. A write too large for any
-//! page to carry is refused up front. A joiner predating snapshot pages still
-//! gets its inline snapshot.
+//! page to carry is refused up front.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -110,11 +109,10 @@ async fn anti_entropy_ships_a_budgeted_prefix_and_never_covers_what_it_left_out(
             NodeId(0),
             Message::SyncRequest {
                 id,
-                snapshot: false,
-                known: Some(SyncKnown {
+                known: SyncKnown {
                     since: Timestamp::MIN,
                     txns: held.clone(),
-                }),
+                },
             },
         )
         .await
@@ -195,61 +193,4 @@ async fn a_write_over_the_command_cap_is_refused() {
     node.write(vec![event("big", 1, 1024)])
         .await
         .expect("a write under the cap commits");
-}
-
-/// A joiner predating snapshot pages asks for its snapshot inline
-/// (`SyncRequest { snapshot: true }`) and still gets it, with every command
-/// — read a page at a time on the contact, and only while it fits a frame.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_legacy_joiner_still_gets_its_inline_snapshot() {
-    let (net, nodes, _tasks) = two_of_three(NodeConfig {
-        snapshot_page_events: 2,
-        ..NodeConfig::default()
-    });
-    for version in 1..=5u16 {
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            nodes[0].write(vec![event("acc", version, 64)]),
-        )
-        .await
-        .expect("write timed out")
-        .expect("write");
-    }
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let mut inbox = net.register(NodeId(2));
-    net.sink(NodeId(2))
-        .send(
-            NodeId(0),
-            Message::SyncRequest {
-                id: 1,
-                snapshot: true,
-                known: None,
-            },
-        )
-        .await
-        .unwrap();
-    let (snapshot, commands) = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let env = inbox.recv().await.expect("inbox open");
-            if let Message::SyncData {
-                id: 1,
-                snapshot,
-                commands,
-                ..
-            } = env.message
-            {
-                return (snapshot, commands);
-            }
-        }
-    })
-    .await
-    .expect("node 0 answers the legacy join");
-    let versions: Vec<u16> = snapshot.iter().map(|event| event.version).collect();
-    assert_eq!(
-        versions,
-        [1, 2, 3, 4, 5],
-        "the whole store, in order, over three pages"
-    );
-    assert_eq!(commands.len(), 5, "every applied command inline");
 }

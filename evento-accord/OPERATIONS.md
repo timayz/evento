@@ -503,14 +503,11 @@ through `AccordExecutor`) — split it into several writes.
   frames of format 1: evento-accord is unreleased, so a cluster of an older build is
   wiped and re-bootstrapped. A replica applies — and a joiner copies — every
   tenant's events.
-- **Joining across versions** (paged joins): a joiner asks for the paged header
-  first; a contact predating command pages sheds the request, and the joiner asks
-  again for the inline header after `collect_timeout` — so a join against an old
-  contact takes that long longer, and its whole command backlog must still fit one
-  frame. A joiner predating command pages asks a current contact for the inline
-  header, as before; one predating snapshot pages (`SyncRequest { snapshot: true }`)
-  still gets its snapshot inline, read a page at a time and not answered at all once
-  it outgrows a frame.
+- **Paged joins only** (record format 3): the inline join paths are gone. A join
+  is always the paged header followed by command pages and snapshot pages, so no
+  join frame grows with the store or the backlog. A node of format 3 refuses
+  journals and frames of format 2, so upgrade a cluster's nodes together, or wipe
+  and re-bootstrap it as for format 2.
 
 ---
 

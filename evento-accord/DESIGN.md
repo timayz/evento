@@ -729,10 +729,9 @@ backend (sql/fjall). Phases, in order:
   command pages before the snapshot pages means every command listed has its events
   in a page. The contact may compact between two command pages: each carries its
   floor, the joiner adopts the highest and drops the commands below it, whose events
-  the later snapshot pages hold — so the header's vouch (`JoinProof`) stays sound. A
-  contact predating command pages sheds `JoinHeaderRequest`; hearing nothing, the
-  joiner asks again with `SnapshotRequest`, answered with every command inline (what
-  a joiner predating them asks a current contact for). A transaction the contact applies
+  the later snapshot pages hold — so the header's vouch (`JoinProof`) stays sound.
+  No join path ships commands or events inline, and anti-entropy replies are
+  bounded the same way, so no frame grows with the store. A transaction the contact applies
   meanwhile is in the joiner's buffer too, and its replay finds the events already
   there (an idempotent re-apply). A page overlapping existing events would be
   skipped whole, so `join` refuses a non-empty store, and a join that fails once a

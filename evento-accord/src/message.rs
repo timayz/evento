@@ -248,27 +248,22 @@ pub enum Message {
     /// Replica → coordinator: a ballot was too low; `promised` is the ballot the
     /// replica has already promised, so the sender can retry above it.
     Nack { txn: TxnId, promised: Ballot },
-    /// Joining node → an existing replica: send me your committed state so I can
-    /// bootstrap. `snapshot` requests the materialized data-store snapshot too
-    /// (set by a bootstrapping join, whose state may be below the contact's
-    /// truncation watermark); anti-entropy clears it (it only needs recent
-    /// commands). `known` is the anti-entropy digest — when present, the
-    /// responder ships only the applied commands the requester is missing;
-    /// bootstrap sends `None` (ship everything). `id` correlates the reply
-    /// with the in-flight request, so a concurrent join and anti-entropy round
-    /// cannot steal each other's data.
-    SyncRequest {
-        id: u64,
-        snapshot: bool,
-        known: Option<SyncKnown>,
-    },
+    /// Anti-entropy, replica → a shard peer: send me the applied commands I
+    /// am missing. `known` is the digest of what the requester holds; the
+    /// responder ships only what it lacks, bounded like a snapshot page.
+    /// `id` correlates the reply with the in-flight request, so a concurrent
+    /// join and anti-entropy round cannot steal each other's data. A join asks
+    /// with [`JoinHeaderRequest`](Message::JoinHeaderRequest) instead.
+    SyncRequest { id: u64, known: SyncKnown },
     /// Periodic gossip between shard replicas: the sender has applied every
     /// transaction below `applied_through`. The cluster compacts (drops redundant
     /// consensus state and truncates the log) below the per-shard minimum of these.
     Watermark { applied_through: Timestamp },
-    /// Existing replica → joining node: the committed state to import.
+    /// Existing replica → joining node (or anti-entropy requester): the
+    /// committed state to import.
     SyncData {
-        /// Correlates with the [`SyncRequest`](Message::SyncRequest) `id`.
+        /// Correlates with the [`SyncRequest`](Message::SyncRequest) or
+        /// [`JoinHeaderRequest`](Message::JoinHeaderRequest) `id`.
         id: u64,
         /// The contact's redundancy watermark; the joiner adopts it as its floor,
         /// so a dependency on a compacted-away transaction counts as satisfied.
@@ -280,20 +275,12 @@ pub enum Message {
         /// coverage, which clamps its own compaction-watermark reports.
         #[serde(default = "min_timestamp")]
         coverage: Timestamp,
-        /// Materialized applied events (the state below the watermark that command
-        /// replay no longer covers). Empty unless a snapshot was requested.
-        #[serde(with = "wire_events")]
-        snapshot: Vec<Event>,
-        /// The un-truncated applied commands (`t0 >= watermark`), for the conflict
-        /// graph and dependency barriers.
+        /// The un-truncated applied commands (`t0 >= watermark`) the requester
+        /// is missing, for the conflict graph and dependency barriers. Empty
+        /// in a join header: a joiner pulls them through
+        /// [`CommandPageRequest`](Message::CommandPageRequest).
         commands: Vec<CommandState>,
     },
-    /// Joining node → an existing replica: the bootstrap header — answered
-    /// with a [`SyncData`](Message::SyncData) whose `snapshot` is empty; the
-    /// materialised events follow page by page through
-    /// [`SnapshotPageRequest`](Message::SnapshotPageRequest), so a store of
-    /// any size crosses the wire in frames far under the transport's cap.
-    SnapshotRequest { id: u64 },
     /// Joining node → the contact: the page of its snapshot after `after`
     /// (`None` for the first). Idempotent, so a lost reply is simply asked
     /// for again; the contact bounds the page by
@@ -418,7 +405,7 @@ pub enum Message {
         events: Vec<Event>,
     },
     /// Contact → joining node, right after the [`SyncData`](Message::SyncData)
-    /// answering its [`SnapshotRequest`](Message::SnapshotRequest) (same `id`):
+    /// answering its [`JoinHeaderRequest`](Message::JoinHeaderRequest) (same `id`):
     /// the contact's own watermark report `vouched`, taken in the same cut as
     /// that header under topology `epoch`. The contact holds every committed
     /// transaction below it, and the joiner copies that state, so once the
@@ -462,14 +449,13 @@ pub enum Message {
     /// it un-committed records it applied as an abort, without executing it
     /// — an abort changes nothing, so it needs no place in the order.
     Invalidate { txn: TxnId },
-    /// Joining node → an existing replica: the bootstrap header, like
-    /// [`SnapshotRequest`](Message::SnapshotRequest) but answered with a
-    /// [`SyncData`](Message::SyncData) carrying **no** commands (then the
-    /// [`JoinProof`](Message::JoinProof)): the applied commands follow page by
-    /// page through [`CommandPageRequest`](Message::CommandPageRequest), and
-    /// only then the snapshot pages, so a backlog of any size crosses in
-    /// frames far under the transport's cap. A contact predating it sheds it
-    /// and the joiner, hearing nothing, asks again with a `SnapshotRequest`.
+    /// Joining node → an existing replica: the bootstrap header, answered
+    /// with a [`SyncData`](Message::SyncData) carrying **no** commands (then
+    /// the [`JoinProof`](Message::JoinProof)): the applied commands follow
+    /// page by page through [`CommandPageRequest`](Message::CommandPageRequest),
+    /// and only then the materialised events through
+    /// [`SnapshotPageRequest`](Message::SnapshotPageRequest), so a store and a
+    /// backlog of any size cross in frames far under the transport's cap.
     JoinHeaderRequest { id: u64 },
     /// Joining node → the contact: the page of its applied commands after
     /// `t0` `after` (`None` for the first), bounded like a snapshot page.
@@ -539,7 +525,6 @@ impl Message {
             Message::ReadProbe { .. } => None,
             Message::SyncRequest { .. }
             | Message::SyncData { .. }
-            | Message::SnapshotRequest { .. }
             | Message::SnapshotPageRequest { .. }
             | Message::SnapshotPage { .. }
             | Message::Watermark { .. }
@@ -689,7 +674,7 @@ mod tests {
     #[test]
     fn snapshot_variants_round_trip_tagged() {
         let messages = [
-            Message::SnapshotRequest { id: 7 },
+            Message::JoinHeaderRequest { id: 7 },
             Message::SnapshotPageRequest {
                 id: 8,
                 after: Some(Value("cursor".into())),
@@ -704,7 +689,7 @@ mod tests {
             let bytes = encode_tagged(RecordKind::WireFrame, &message).unwrap();
             let back: Message = decode_tagged(RecordKind::WireFrame, &bytes).unwrap();
             match (&message, &back) {
-                (Message::SnapshotRequest { id }, Message::SnapshotRequest { id: b }) => {
+                (Message::JoinHeaderRequest { id }, Message::JoinHeaderRequest { id: b }) => {
                     assert_eq!(id, b)
                 }
                 (
@@ -961,7 +946,6 @@ mod tests {
     /// None of a join's requests or pages concerns a transaction.
     #[test]
     fn snapshot_variants_route_as_control() {
-        let request = Message::SnapshotRequest { id: 1 };
         let page_request = Message::SnapshotPageRequest { id: 2, after: None };
         let page = Message::SnapshotPage {
             id: 2,
@@ -982,7 +966,6 @@ mod tests {
             next: None,
         };
         for message in [
-            request,
             page_request,
             page,
             proof,

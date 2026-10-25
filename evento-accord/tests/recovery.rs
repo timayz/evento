@@ -1341,8 +1341,10 @@ async fn a_vote_fence_outlives_a_restart_with_a_clock_stepped_back() {
             NodeId(0),
             Message::SyncRequest {
                 id: 1,
-                snapshot: false,
-                known: None,
+                known: evento_accord::message::SyncKnown {
+                    since: evento_accord::Timestamp::MIN,
+                    txns: Vec::new(),
+                },
             },
         )
         .await
