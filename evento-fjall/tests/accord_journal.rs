@@ -5,8 +5,8 @@
 #![cfg(feature = "accord")]
 
 use evento_accord::{
-    AcceptorRecord, AmnesiaFence, Ballot, CommandState, ConfigEntry, DecisionRecord, FenceRecord,
-    Journal, Key, NodeId, Status, Timestamp, TxnId,
+    AcceptorRecord, AmnesiaFence, Ballot, CommandState, ConfigEntry, DecisionRecord, DurableMark,
+    FenceRecord, Journal, Key, NodeId, Status, Timestamp, TxnId,
 };
 use evento_core::Event;
 use evento_fjall::FjallJournal;
@@ -396,4 +396,38 @@ async fn vote_fence_survives_close_reopen_and_truncate() {
         journal.load_vote_fence().await.unwrap(),
         Some(timestamp(900, 1))
     );
+}
+
+/// The marks a replica saw from its peers are staged like a command:
+/// durable at the next flush, the last set staged replaces the one before,
+/// and they survive a close and reopen and a truncate (#339).
+#[tokio::test]
+async fn peer_marks_survive_close_reopen_and_truncate() {
+    let temp = tempfile::Builder::new()
+        .prefix("evento_accord_journal_peer_marks")
+        .tempdir()
+        .unwrap();
+    let mark = |life: u64, clock_bound: u64| DurableMark {
+        life,
+        clock_bound,
+        vote_fence: timestamp(clock_bound / 2, 0),
+    };
+    {
+        let journal = FjallJournal::open(temp.path()).unwrap();
+        assert!(journal.load_peer_marks().await.unwrap().is_empty());
+        journal
+            .save_peer_marks(&[(NodeId(1), mark(0, 400))])
+            .await
+            .unwrap();
+        journal
+            .save_peer_marks(&[(NodeId(1), mark(0, 900)), (NodeId(2), mark(7, 300))])
+            .await
+            .unwrap();
+        journal.flush().await.unwrap();
+    }
+    let journal = FjallJournal::open(temp.path()).unwrap();
+    let kept = vec![(NodeId(1), mark(0, 900)), (NodeId(2), mark(7, 300))];
+    assert_eq!(journal.load_peer_marks().await.unwrap(), kept);
+    journal.truncate(timestamp(1_000, 0)).await.unwrap();
+    assert_eq!(journal.load_peer_marks().await.unwrap(), kept);
 }

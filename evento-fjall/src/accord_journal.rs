@@ -10,8 +10,9 @@
 //! transaction's decision record lives under `decision/`, staged the same way
 //! but kept by `truncate` until the node drops it. The node's clock bound is the
 //! `meta` key `clock_bound`, persisted on its own and never truncated. The
-//! replica's vote fence is the `meta` key `vote_fence`, staged like a command
-//! and never truncated.
+//! replica's vote fence is the `meta` key `vote_fence`, and the marks it saw
+//! from its peers the `meta` key `peer_marks`, both staged like a command and
+//! never truncated.
 //!
 //! **Group commit.** [`stage`](Journal::stage) inserts a record without an fsync;
 //! [`flush`](Journal::flush) does a single `persist(SyncAll)` covering every staged
@@ -31,8 +32,8 @@ use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 
 use evento_accord::format::{decode_tagged, encode_tagged, RecordKind};
 use evento_accord::{
-    AcceptorRecord, AmnesiaFence, Ballot, CommandState, ConfigEntry, DecisionRecord, FenceRecord,
-    Journal, Key, NodeId, Timestamp, TxnId,
+    AcceptorRecord, AmnesiaFence, Ballot, CommandState, ConfigEntry, DecisionRecord, DurableMark,
+    FenceRecord, Journal, Key, NodeId, Timestamp, TxnId,
 };
 
 /// Key under which the truncation watermark is stored in the `meta` keyspace.
@@ -50,6 +51,9 @@ const FENCES_KEY: &[u8] = b"fences";
 /// Meta key under which the replica's vote fence is stored. Staged; untouched
 /// by `truncate`.
 const VOTE_FENCE_KEY: &[u8] = b"vote_fence";
+/// Meta key under which the marks the replica saw from its peers are stored.
+/// Staged; untouched by `truncate`.
+const PEER_MARKS_KEY: &[u8] = b"peer_marks";
 /// Prefix for metadata-log entry keys (`mlog/` + 8-byte big-endian epoch).
 const METADATA_PREFIX: &[u8] = b"mlog/";
 /// Prefix for acceptor-state keys (`acc/` + 8-byte big-endian epoch).
@@ -350,6 +354,20 @@ impl Journal for FjallJournal {
         match bytes {
             Some(bytes) => Ok(Some(decode_tagged(RecordKind::VoteFence, &bytes)?)),
             None => Ok(None),
+        }
+    }
+
+    async fn save_peer_marks(&self, marks: &[(NodeId, DurableMark)]) -> anyhow::Result<()> {
+        let value = encode_tagged(RecordKind::PeerMarks, &marks.to_vec())?;
+        self.stage_meta(PEER_MARKS_KEY.to_vec(), value).await
+    }
+
+    async fn load_peer_marks(&self) -> anyhow::Result<Vec<(NodeId, DurableMark)>> {
+        let meta = self.meta.clone();
+        let bytes = tokio::task::spawn_blocking(move || meta.get(PEER_MARKS_KEY)).await??;
+        match bytes {
+            Some(bytes) => Ok(decode_tagged(RecordKind::PeerMarks, &bytes)?),
+            None => Ok(Vec::new()),
         }
     }
 

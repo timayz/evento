@@ -77,10 +77,14 @@ pub const MAGIC: [u8; 2] = *b"Ac";
 /// the responder's live layout became live at. 8: so does
 /// `Message::Watermark`, for its sender. 9: `Message::Watermark` carries the
 /// sender's applied-through unclamped by its coverage (`applied`), and the
-/// journal keeps the vote fence (`RecordKind::VoteFence`). No reader for
-/// older versions: evento-accord has not been released, so a journal of one
-/// is wiped and the node re-bootstrapped.
-pub const FORMAT_VERSION: u8 = 9;
+/// journal keeps the vote fence (`RecordKind::VoteFence`). 10:
+/// `Message::Watermark` carries the sender's durable mark, a node opened
+/// over a journal that holds something asks its peers to confirm it
+/// (`Message::Opened`), and the journal keeps the marks it saw from its
+/// peers (`RecordKind::PeerMarks`). No reader for older versions:
+/// evento-accord has not been released, so a journal of one is wiped and the
+/// node re-bootstrapped.
+pub const FORMAT_VERSION: u8 = 10;
 
 /// Length of the fixed header: `MAGIC (2) + version (1) + kind (1)`.
 const HEADER_LEN: usize = 4;
@@ -132,6 +136,10 @@ pub enum RecordKind {
     /// The replica's vote fence (`Journal::save_vote_fence`), as a
     /// [`Timestamp`](crate::clock::Timestamp).
     VoteFence = 14,
+    /// The highest mark the replica saw from each peer
+    /// (`Journal::save_peer_marks`), as a `Vec` of
+    /// ([`NodeId`](crate::clock::NodeId), [`DurableMark`](crate::api::DurableMark)).
+    PeerMarks = 15,
 }
 
 impl RecordKind {
@@ -150,6 +158,7 @@ impl RecordKind {
             12 => Some(Self::AmnesiaFence),
             13 => Some(Self::Fences),
             14 => Some(Self::VoteFence),
+            15 => Some(Self::PeerMarks),
             _ => None,
         }
     }
@@ -224,6 +233,7 @@ mod tests {
             RecordKind::AmnesiaFence,
             RecordKind::Fences,
             RecordKind::VoteFence,
+            RecordKind::PeerMarks,
         ] {
             let value = (42u64, "hello".to_string());
             let bytes = encode_tagged(kind, &value).unwrap();

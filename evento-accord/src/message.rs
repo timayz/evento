@@ -15,7 +15,7 @@ use evento_core::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::api::{ConfigEntry, FenceRecord};
+use crate::api::{ConfigEntry, DurableMark, FenceRecord};
 use crate::clock::{Ballot, NodeId, Timestamp, TxnId};
 
 /// Sharding / ownership unit. Derived from an event's routing key (falling back
@@ -284,6 +284,10 @@ pub enum Message {
         /// lowest of these) below it, and no replica of the shard exports sync
         /// coverage past that floor (#337).
         applied: Timestamp,
+        /// What the sender's journal durably holds (#339): every peer keeps
+        /// the highest it saw, and tells the sender it rolled back if it ever
+        /// reopens over a journal holding less ([`Opened`](Message::Opened)).
+        mark: DurableMark,
         fenced: Option<FenceRecord>,
         /// The transition (its `since`) for which the sender copied every
         /// slot it gains, if one is in progress: what its activation waits on
@@ -562,6 +566,24 @@ pub enum Message {
     /// [`RecoveryRound`]); or, while the replicas it did not hear from decide
     /// which, nothing yet.
     Late { txn: TxnId, ballot: Ballot },
+    /// Replica → every other node, from a replica opened over a journal that
+    /// holds something (#339): the [`DurableMark`] that journal holds. Until
+    /// its peers confirm it, the replica takes no part — it votes, vouches
+    /// and mints nothing — since an older copy of its journal would have it
+    /// forget votes and promises it made. Sent again every sweep until
+    /// confirmed.
+    Opened { mark: DurableMark },
+    /// Peer → a replica that [opened](Message::Opened) with `mark`: it is at
+    /// or above every mark the peer saw from it.
+    OpenedOk { mark: DurableMark },
+    /// Peer → a replica that [opened](Message::Opened) with `mark`, below
+    /// what the peer saw from it, `seen`: the journal was rolled back to an
+    /// older copy. The replica stops taking part, and its host opens it
+    /// again over an empty journal and store, joining (#312).
+    RolledBack {
+        mark: DurableMark,
+        seen: DurableMark,
+    },
 }
 
 /// What a [`BeginRecovery`](Message::BeginRecovery) asks of a replica that
@@ -637,7 +659,10 @@ impl Message {
             | Message::JoinHeaderRequest { .. }
             | Message::CommandPageRequest { .. }
             | Message::CommandPage { .. }
-            | Message::JoinKeepalive => None,
+            | Message::JoinKeepalive
+            | Message::Opened { .. }
+            | Message::OpenedOk { .. }
+            | Message::RolledBack { .. } => None,
         }
     }
 }
@@ -1001,6 +1026,21 @@ mod tests {
             },
         ] {
             assert_eq!(message.txn(), Some(txn));
+            let bytes = encode_tagged(RecordKind::WireFrame, &message).unwrap();
+            let back: Message = decode_tagged(RecordKind::WireFrame, &bytes).unwrap();
+            assert_eq!(format!("{back:?}"), format!("{message:?}"));
+        }
+        let mark = DurableMark {
+            life: 3,
+            clock_bound: 7,
+            vote_fence: ballot.0,
+        };
+        for message in [
+            Message::Opened { mark },
+            Message::OpenedOk { mark },
+            Message::RolledBack { mark, seen: mark },
+        ] {
+            assert_eq!(message.txn(), None);
             let bytes = encode_tagged(RecordKind::WireFrame, &message).unwrap();
             let back: Message = decode_tagged(RecordKind::WireFrame, &bytes).unwrap();
             assert_eq!(format!("{back:?}"), format!("{message:?}"));

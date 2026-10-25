@@ -77,9 +77,9 @@ use common::journal::{FaultJournal, JournalFaults};
 use common::store::{FaultStore, Outcomes};
 use evento_accord::{
     DataStore, DynamicTopology, ExecutorDataStore, HybridLogicalClock, InMemoryDataStore,
-    InMemoryNetwork, Journal, Key, Layout, LinkFilter, Message, MessageFaults, MessageSink, Node,
-    NodeConfig, NodeId, PartialSnapshot, StaticTopology, Status, Timestamp, Topology, TraceEntry,
-    TxnId, MAX_SKEW_MICROS, SLOTS,
+    InMemoryJournal, InMemoryNetwork, Journal, Key, Layout, LinkFilter, Message, MessageFaults,
+    MessageSink, Node, NodeConfig, NodeId, PartialSnapshot, StaticTopology, Status, Timestamp,
+    Topology, TraceEntry, TxnId, MAX_SKEW_MICROS, SLOTS,
 };
 use evento_core::metadata::Metadata;
 use evento_core::Event;
@@ -2022,6 +2022,166 @@ async fn safety_and_liveness_hold_under_amnesia_and_message_faults() {
     }
 }
 
+/// A node's disk is rolled back to an older copy of its journal (#339),
+/// with writes and, under `faults`, message and storage faults going on. The
+/// copy was taken earlier, and the node went on voting and reporting until
+/// every peer saw it past the copy. Reopened over the copy, it is told so,
+/// stops, and its host brings it back over an empty journal and store,
+/// joining, as a lost journal comes back. Safety, the read oracle and
+/// liveness after the heal must hold.
+async fn run_rollback(seed: u64, faults: Faults) -> Adversarial {
+    const N: u64 = 5;
+    const AGGS: usize = 4;
+    const WRITERS: usize = 5;
+    const WRITES_EACH: usize = 12;
+    /// The longest a rejoin may take before the run counts it stalled.
+    const REJOIN_LIMIT: Duration = Duration::from_secs(120);
+    /// The longest a node may take to move past its backup in every peer's
+    /// view, or to hear it rolled back.
+    const NOTICE_LIMIT: Duration = Duration::from_secs(60);
+
+    let mut sim = Sim::build(N);
+    faults.arm(&mut sim, seed);
+    let clients = Clients::new(&sim);
+
+    let mut rng = StdRng::seed_from_u64(seed);
+    let writer_plans: Vec<Vec<(usize, usize)>> = (0..WRITERS)
+        .map(|_| {
+            (0..WRITES_EACH)
+                .map(|_| (rng.random_range(0..AGGS), rng.random_range(0..N as usize)))
+                .collect()
+        })
+        .collect();
+    // Which node's journal is copied, after what delay. Never node 0: its
+    // store serves the writers' version guesses.
+    let rollback_plan: Vec<(u64, usize)> = (0..2)
+        .map(|_| (rng.random_range(20..80), rng.random_range(1..N as usize)))
+        .collect();
+
+    let store0 = sim.stores[0].clone();
+    let ids = Arc::new(AtomicU64::new(1));
+    let mut writers = Vec::new();
+    for plan in writer_plans {
+        let live = sim.live.clone();
+        let store0 = store0.clone();
+        let clients = clients.clone();
+        let ids = Arc::clone(&ids);
+        writers.push(tokio::spawn(async move {
+            for (agg_idx, coord) in plan {
+                let agg = format!("a{agg_idx}");
+                let version = store0.version(AGG_TYPE, &agg).await.unwrap_or(0) + 1;
+                let seq = ids.fetch_add(1, Ordering::Relaxed);
+                let node = live.node(coord);
+                clients
+                    .write(&node, &agg, version, seq, Duration::from_secs(2))
+                    .await;
+            }
+        }));
+    }
+    writers.extend(spawn_readers(&sim, &clients, seed, AGGS));
+
+    let mut stalled = None;
+    for (delay, i) in rollback_plan {
+        tokio::time::sleep(Duration::from_millis(delay)).await;
+        // Copied from a node at work: one that never reported nor minted has
+        // left no clock bound in its journal yet.
+        while sim.journals[i].load_clock_bound().await.unwrap().is_none() {
+            tokio::time::sleep(sim.config.recovery_interval).await;
+        }
+        let backup = sim.journals[i].snapshot();
+        let held = backup.load_clock_bound().await.unwrap().unwrap_or(0);
+        // The node goes on until every peer saw its clock bound past the
+        // copy's. A copy a peer saw no further than goes unnoticed, and so
+        // can one taken before the node first journaled its vote fence,
+        // which a restore puts back at the bound less the margin
+        // (OPERATIONS §7): the bound, which a restore never makes up, tells.
+        let id = sim.ids[i];
+        let deadline = tokio::time::Instant::now() + NOTICE_LIMIT;
+        while !(0..N as usize).filter(|&peer| peer != i).all(|peer| {
+            sim.nodes[peer]
+                .peer_mark(id)
+                .is_some_and(|seen| seen.clock_bound > held)
+        }) {
+            if tokio::time::Instant::now() >= deadline {
+                stalled = Some(format!("node {i} never moved past its backup"));
+                break;
+            }
+            tokio::time::sleep(sim.config.recovery_interval).await;
+        }
+        if stalled.is_some() {
+            break;
+        }
+        sim.roll_back(i, backup).await;
+        let deadline = tokio::time::Instant::now() + NOTICE_LIMIT;
+        while !sim.nodes[i].rolled_back() {
+            if tokio::time::Instant::now() >= deadline {
+                stalled = Some(format!("node {i} never heard its journal rolled back"));
+                break;
+            }
+            tokio::time::sleep(sim.config.recovery_interval).await;
+        }
+        if stalled.is_some() {
+            break;
+        }
+        if let Err(err) = sim.lose_journal(i).await {
+            stalled = Some(err);
+            break;
+        }
+        if let Err(err) = sim.join_amnesiac(i, REJOIN_LIMIT).await {
+            stalled = Some(err);
+            break;
+        }
+    }
+    for w in writers {
+        let _ = w.await;
+    }
+
+    sim.net.clear_message_faults();
+    sim.clear_storage_faults();
+    let converged = converge(&sim.stores).await;
+
+    let records = clients.history.lock().unwrap().clone();
+    let safety = safety_violation(&sim, &records);
+    let liveness = match stalled {
+        Some(stall) => Some(stall),
+        None => assert_live(&mut sim, &acked_versions(&records)).await.err(),
+    };
+    let converged_store = liveness.is_none().then(|| &sim.stores[0]);
+    let safety = safety.or_else(|| read_violation(&clients, converged_store));
+    let reads = clients.ops.lock().unwrap().reads.len();
+    Adversarial {
+        safety,
+        converged,
+        liveness,
+        reads,
+        trace: sim.trace(),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_rolled_back_journal_is_caught_and_its_node_comes_back() {
+    for (seed, _replay) in sim_seeds(
+        "a_rolled_back_journal_is_caught_and_its_node_comes_back",
+        0..10,
+    ) {
+        run_rollback(seed, Faults::default())
+            .await
+            .assert_ok(&format!("rollback at seed {seed}"));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_rolled_back_journal_is_caught_under_message_faults() {
+    for (seed, _replay) in sim_seeds(
+        "a_rolled_back_journal_is_caught_under_message_faults",
+        0..10,
+    ) {
+        run_rollback(seed, Faults::ALL)
+            .await
+            .assert_ok(&format!("rollback +faults at seed {seed}"));
+    }
+}
+
 /// #337 on virtual time: T is accepted at A (node 1) and R (node 2), its
 /// Commit reaches R alone, and its coordinator vanishes. B (node 0) never
 /// sees it, and the compaction margin passes. R loses its journal. A
@@ -3642,7 +3802,15 @@ async fn run_swarm(seed: u64, shape: &SwarmConfig) -> Adversarial {
 
     let records = clients.history.lock().unwrap().clone();
     let safety = safety_violation(&sim, &records);
-    let liveness = assert_live(&mut sim, &acked_versions(&records)).await.err();
+    // No journal here is ever rolled back: a node found so is a false
+    // alarm (#339).
+    let rolled_back = (0..sim.nodes.len())
+        .find(|&i| sim.nodes[i].rolled_back())
+        .map(|i| format!("node {i} was found rolled back over the journal it was left with"));
+    let liveness = match rolled_back {
+        Some(alarm) => Some(alarm),
+        None => assert_live(&mut sim, &acked_versions(&records)).await.err(),
+    };
     let converged = liveness.is_none();
     let safety = safety.or_else(|| read_violation(&clients, converged.then(|| &sim.stores[0])));
     let reads = clients.ops.lock().unwrap().reads.len();
@@ -3903,6 +4071,15 @@ impl Sim {
         self.journals[i] = Arc::new(FaultJournal::new());
         self.arm_journal(i);
         self.reopen_joining(i).await
+    }
+
+    /// What a host does that restores node `i`'s journal from `backup`, an
+    /// older copy of it (#339): crashes the node and opens it again, plainly,
+    /// over the copy and its kept store.
+    async fn roll_back(&mut self, i: usize, backup: InMemoryJournal) {
+        self.journals[i] = Arc::new(FaultJournal::restored(backup));
+        self.arm_journal(i);
+        self.restart_as(i, self.config, Restart::KeepStore).await;
     }
 
     /// Joins node `i`, reopened joining after it lost its journal, as its

@@ -13,8 +13,8 @@ use async_trait::async_trait;
 use evento_core::Event;
 
 use crate::api::{
-    same_event, AcceptorRecord, AmnesiaFence, ConfigEntry, DataStore, DecisionRecord, FenceRecord,
-    Journal,
+    same_event, AcceptorRecord, AmnesiaFence, ConfigEntry, DataStore, DecisionRecord, DurableMark,
+    FenceRecord, Journal,
 };
 use crate::clock::{Ballot, NodeId, Timestamp, TxnId};
 use crate::message::{CommandState, Key};
@@ -219,12 +219,39 @@ pub struct InMemoryJournal {
     /// The persisted transition fences (see [`Journal::save_fences`]) — kept
     /// across `truncate`.
     fences: Mutex<Vec<FenceRecord>>,
+    /// The persisted peer marks (see [`Journal::save_peer_marks`]) — kept
+    /// across `truncate`.
+    peer_marks: Mutex<Vec<(NodeId, DurableMark)>>,
 }
 
 impl InMemoryJournal {
     /// Creates an empty journal.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A copy of everything this journal holds, as a backup taken now would
+    /// hold it: reopening a node over it later is reopening it over an older
+    /// copy of its journal (#339).
+    pub fn snapshot(&self) -> Self {
+        fn copy<T: Clone>(kept: &Mutex<T>) -> Mutex<T> {
+            Mutex::new(kept.lock().expect("journal poisoned").clone())
+        }
+        Self {
+            entries: copy(&self.entries),
+            watermark: copy(&self.watermark),
+            rejoin_bounds: copy(&self.rejoin_bounds),
+            metadata: copy(&self.metadata),
+            acceptors: copy(&self.acceptors),
+            routes: copy(&self.routes),
+            promises: copy(&self.promises),
+            decisions: copy(&self.decisions),
+            clock_bound: copy(&self.clock_bound),
+            vote_fence: copy(&self.vote_fence),
+            amnesia_fence: copy(&self.amnesia_fence),
+            fences: copy(&self.fences),
+            peer_marks: copy(&self.peer_marks),
+        }
     }
 }
 
@@ -304,6 +331,15 @@ impl Journal for InMemoryJournal {
 
     async fn load_vote_fence(&self) -> anyhow::Result<Option<Timestamp>> {
         Ok(*self.vote_fence.lock().expect("journal poisoned"))
+    }
+
+    async fn save_peer_marks(&self, marks: &[(NodeId, DurableMark)]) -> anyhow::Result<()> {
+        *self.peer_marks.lock().expect("journal poisoned") = marks.to_vec();
+        Ok(())
+    }
+
+    async fn load_peer_marks(&self) -> anyhow::Result<Vec<(NodeId, DurableMark)>> {
+        Ok(self.peer_marks.lock().expect("journal poisoned").clone())
     }
 
     async fn save_amnesia_fence(&self, fence: &AmnesiaFence) -> anyhow::Result<()> {
@@ -493,6 +529,48 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(journal.load_clock_bound().await.unwrap(), Some(900));
+    }
+
+    /// The peer marks round-trip, the last set saved replaces the one
+    /// before, and a truncate keeps them; a snapshot holds what the journal
+    /// held when taken, and nothing saved after (#339).
+    #[tokio::test]
+    async fn in_memory_peer_marks_and_snapshots() {
+        let journal = InMemoryJournal::new();
+        assert!(journal.load_peer_marks().await.unwrap().is_empty());
+        let mark = |clock_bound| DurableMark {
+            life: 0,
+            clock_bound,
+            vote_fence: Timestamp::MIN,
+        };
+        journal
+            .save_peer_marks(&[(NodeId(1), mark(400))])
+            .await
+            .unwrap();
+        journal.save_clock_bound(400).await.unwrap();
+        journal.record(&command(10)).await.unwrap();
+        let backup = journal.snapshot();
+
+        let kept = vec![(NodeId(1), mark(900)), (NodeId(2), mark(300))];
+        journal.save_peer_marks(&kept).await.unwrap();
+        journal.save_clock_bound(900).await.unwrap();
+        journal.record(&command(20)).await.unwrap();
+        journal
+            .truncate(Timestamp {
+                micros: 1,
+                logical: 0,
+                node: NodeId(0),
+            })
+            .await
+            .unwrap();
+        assert_eq!(journal.load_peer_marks().await.unwrap(), kept);
+
+        assert_eq!(
+            backup.load_peer_marks().await.unwrap(),
+            vec![(NodeId(1), mark(400))]
+        );
+        assert_eq!(backup.load_clock_bound().await.unwrap(), Some(400));
+        assert_eq!(backup.load_all().await.unwrap().len(), 1);
     }
 
     #[tokio::test]

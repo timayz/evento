@@ -73,6 +73,11 @@ async fn vote_fence() {
 }
 
 #[tokio::test]
+async fn peer_marks() {
+    sql_support::peer_marks(&fresh("accord_pg_peer_marks").await).await;
+}
+
+#[tokio::test]
 async fn survives_reconnect() {
     let name = "accord_pg_reconnect";
     let b = command(200, 2);

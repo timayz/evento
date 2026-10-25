@@ -4,8 +4,8 @@
 #![allow(dead_code)]
 
 use evento_accord::{
-    AcceptorRecord, AmnesiaFence, Ballot, CommandState, ConfigEntry, DecisionRecord, FenceRecord,
-    Journal, Key, NodeId, Status, Timestamp, TxnId,
+    AcceptorRecord, AmnesiaFence, Ballot, CommandState, ConfigEntry, DecisionRecord, DurableMark,
+    FenceRecord, Journal, Key, NodeId, Status, Timestamp, TxnId,
 };
 use evento_core::Event;
 use evento_sql::SqlJournal;
@@ -447,5 +447,58 @@ where
         journal.load_vote_fence().await.unwrap(),
         Some(timestamp(900, 1)),
         "a truncate between a stage and its flush keeps the fence"
+    );
+}
+
+/// The marks a replica saw from its peers are staged like a command:
+/// invisible until a flush, then they round-trip, the last set staged
+/// replaces the one before, and a truncate — between a stage and its flush
+/// too — never drops them (#339). Staged with the vote fence, each keeps its
+/// own row.
+pub async fn peer_marks<DB>(journal: &SqlJournal<DB>)
+where
+    DB: Database,
+    for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
+    sea_query_sqlx::SqlxValues: sqlx::IntoArguments<DB>,
+    Vec<u8>: for<'r> sqlx::Decode<'r, DB> + sqlx::Type<DB>,
+    i64: for<'r> sqlx::Decode<'r, DB> + sqlx::Type<DB>,
+    usize: sqlx::ColumnIndex<DB::Row>,
+{
+    let mark = |life: u64, clock_bound: u64| DurableMark {
+        life,
+        clock_bound,
+        vote_fence: timestamp(clock_bound / 2, 0),
+    };
+    assert!(journal.load_peer_marks().await.unwrap().is_empty());
+    journal
+        .save_peer_marks(&[(NodeId(1), mark(0, 400))])
+        .await
+        .unwrap();
+    journal.save_vote_fence(timestamp(200, 0)).await.unwrap();
+    assert!(
+        journal.load_peer_marks().await.unwrap().is_empty(),
+        "staged, not durable before a flush"
+    );
+    journal.flush().await.unwrap();
+    assert_eq!(
+        journal.load_peer_marks().await.unwrap(),
+        vec![(NodeId(1), mark(0, 400))]
+    );
+    assert_eq!(
+        journal.load_vote_fence().await.unwrap(),
+        Some(timestamp(200, 0))
+    );
+    let kept = vec![(NodeId(1), mark(0, 900)), (NodeId(2), mark(7, 300))];
+    journal.save_peer_marks(&kept).await.unwrap();
+    journal.truncate(timestamp(1_000, 0)).await.unwrap();
+    journal.flush().await.unwrap();
+    assert_eq!(
+        journal.load_peer_marks().await.unwrap(),
+        kept,
+        "a truncate between a stage and its flush keeps the marks"
+    );
+    assert_eq!(
+        journal.load_vote_fence().await.unwrap(),
+        Some(timestamp(200, 0))
     );
 }
