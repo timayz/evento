@@ -81,10 +81,13 @@ pub const MAGIC: [u8; 2] = *b"Ac";
 /// `Message::Watermark` carries the sender's durable mark, a node opened
 /// over a journal that holds something asks its peers to confirm it
 /// (`Message::Opened`), and the journal keeps the marks it saw from its
-/// peers (`RecordKind::PeerMarks`). No reader for older versions:
-/// evento-accord has not been released, so a journal of one is wiped and the
-/// node re-bootstrapped.
-pub const FORMAT_VERSION: u8 = 10;
+/// peers (`RecordKind::PeerMarks`). 11: the amnesia fence records whether
+/// the replica restored its config votes, and an acceptor that lost its
+/// journal reads the others' state back (`Message::ConfigRead`,
+/// `Message::ConfigReadReply`). No reader for older versions: evento-accord
+/// has not been released, so a journal of one is wiped and the node
+/// re-bootstrapped.
+pub const FORMAT_VERSION: u8 = 11;
 
 /// Length of the fixed header: `MAGIC (2) + version (1) + kind (1)`.
 const HEADER_LEN: usize = 4;

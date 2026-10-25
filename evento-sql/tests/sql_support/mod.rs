@@ -377,6 +377,7 @@ where
     let pending = AmnesiaFence {
         fence_micros: 500,
         joined: false,
+        votes_restored: false,
     };
     journal.save_amnesia_fence(&pending).await.unwrap();
     assert_eq!(journal.load_amnesia_fence().await.unwrap(), Some(pending));

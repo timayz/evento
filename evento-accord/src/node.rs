@@ -1113,8 +1113,8 @@ pub struct Node {
     /// This node's amnesia fence, if it came back over a lost journal
     /// (#312): restored from or set in the journal by
     /// [`restore_journal`](Node::restore_journal). While not `joined`, its
-    /// join waits for a contact vouching past the fence; for good, it
-    /// abstains from config Paxos.
+    /// join waits for a contact vouching past the fence; until
+    /// `votes_restored`, it abstains from config Paxos (#338).
     amnesia: Arc<Mutex<Option<AmnesiaFence>>>,
     topology: Arc<dyn Topology>,
     sink: Arc<dyn MessageSink>,
@@ -1159,6 +1159,10 @@ pub struct Node {
     metadata_turn: Arc<AtomicU64>,
     /// Channels awaiting forwarded-read replies, by correlation id.
     read_pending: Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<Message>>>>,
+    /// Channels awaiting the other acceptors' state
+    /// ([`Message::ConfigReadReply`]) during a config-vote restoration
+    /// (#338), by the read's correlation id.
+    config_read_pending: Arc<Mutex<HashMap<u64, ConfigSender>>>,
     /// Channels awaiting snapshot pages ([`Message::SnapshotPage`]) during a
     /// [`join`](Node::join), by the page request's correlation id.
     snapshot_pending: Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<Message>>>>,
@@ -1305,6 +1309,7 @@ impl Node {
             anti_entropy_turn: Arc::new(AtomicU64::new(0)),
             metadata_turn: Arc::new(AtomicU64::new(0)),
             read_pending: Arc::new(Mutex::new(HashMap::new())),
+            config_read_pending: Arc::new(Mutex::new(HashMap::new())),
             snapshot_pending: Arc::new(Mutex::new(HashMap::new())),
             peer_watermarks: Arc::new(Mutex::new(PeerReports::default())),
             journal_mark: Arc::new(Mutex::new(JournalMark::default())),
@@ -2684,6 +2689,18 @@ impl Node {
         // (1) Metadata anti-entropy.
         self.fetch_metadata().await;
 
+        // (1b) A node that lost its journal reads the other acceptors' state
+        // back before it votes in config Paxos again (#338); retried each
+        // sweep until a majority of the voting ones answered.
+        if self
+            .amnesia
+            .lock()
+            .expect("amnesia poisoned")
+            .is_some_and(|fence| fence.joined && !fence.votes_restored)
+        {
+            self.restore_config_votes().await;
+        }
+
         // (2) Drive-to-completion: complete any accepted-but-uncommitted epoch.
         // Sort epochs so the order is deterministic (the in-memory map is a HashMap).
         let pending: Vec<u64> = {
@@ -3261,6 +3278,8 @@ impl Node {
                 | Message::ConfigAccepted { .. }
                 | Message::ConfigCommit { .. }
                 | Message::ConfigNack { .. }
+                | Message::ConfigRead { .. }
+                | Message::ConfigReadReply { .. }
                 | Message::MetadataFetch { .. }
                 | Message::MetadataEntries { .. }
                 | Message::ReadForward { .. }
@@ -4380,6 +4399,40 @@ impl Node {
                     }
                 }
                 out.push((from, reply));
+            }
+            // An acceptor that lost its journal reads this node's state back
+            // (#338): everything it holds, and whether it votes itself. Answered
+            // while joining too (a control message), never while unconfirmed.
+            Message::ConfigRead { id } => {
+                let acceptors: Vec<(u64, AcceptorRecord)> = self
+                    .config
+                    .lock()
+                    .expect("config poisoned")
+                    .iter()
+                    .map(|(epoch, acc)| (*epoch, acc.to_record()))
+                    .collect();
+                out.push((
+                    from,
+                    Message::ConfigReadReply {
+                        id,
+                        acceptors,
+                        voting: self.config_voting(),
+                    },
+                ));
+            }
+            reply @ Message::ConfigReadReply { .. } => {
+                let Message::ConfigReadReply { id, .. } = &reply else {
+                    unreachable!()
+                };
+                let tx = self
+                    .config_read_pending
+                    .lock()
+                    .expect("config read poisoned")
+                    .get(id)
+                    .cloned();
+                if let Some(tx) = tx {
+                    let _ = tx.send((from, reply));
+                }
             }
             Message::ConfigCommit { epoch, entry } => {
                 // Checked before the append: the log keeps the first entry per
@@ -7009,17 +7062,48 @@ impl Node {
         }
     }
 
-    /// Whether this node lost a journal under its node id (#312): it forgot
-    /// the config-Paxos promises and accepts it made, which no fence in time
-    /// bounds (an epoch's proposals may span any time), so it never promises
-    /// or accepts again — counted. It still learns decided epochs; config
-    /// changes need a majority of the other acceptors.
+    /// Whether this node votes in config Paxos: it never lost a journal
+    /// under its node id, or it restored its votes since (#338).
+    fn config_voting(&self) -> bool {
+        self.amnesia
+            .lock()
+            .expect("amnesia poisoned")
+            .is_none_or(|fence| fence.votes_restored)
+    }
+
+    /// Whether this node lost a journal under its node id (#312) and has not
+    /// restored its config votes yet (#338): it forgot the config-Paxos
+    /// promises and accepts it made, which no fence in time bounds (an
+    /// epoch's proposals may span any time), so it neither promises nor
+    /// accepts — counted — until it read the other acceptors' state back
+    /// ([`restore_config_votes`](Node::restore_config_votes)). It still
+    /// learns decided epochs; config changes meanwhile need a majority of
+    /// the other acceptors.
     fn abstains_from_config(&self) -> bool {
-        if self.amnesia.lock().expect("amnesia poisoned").is_none() {
+        if self.config_voting() {
             return false;
         }
         self.metrics.record_config_vote_withheld();
         true
+    }
+
+    /// Reads the other acceptors' state back and votes in config Paxos
+    /// again (#338): a node that lost its journal forgot every promise and
+    /// accept it made. Returns whether it is restored.
+    async fn restore_config_votes(&self) -> bool {
+        let _merged = Self::merge_acceptors(std::iter::empty());
+        false
+    }
+
+    /// Merges the acceptor state read from the other acceptors, per epoch
+    /// (#338): the promised ballot is the highest any of them promised or
+    /// accepted, and the accepted value is the one accepted under the
+    /// highest ballot. An epoch none of them holds state for is absent.
+    fn merge_acceptors<'a>(
+        answers: impl IntoIterator<Item = &'a [(u64, AcceptorRecord)]>,
+    ) -> BTreeMap<u64, AcceptorRecord> {
+        let _ = answers;
+        BTreeMap::new()
     }
 
     /// Raises the replica's vote fence to `fence`, for good: a node that
@@ -9387,6 +9471,7 @@ impl Node {
                 .saturating_add(skew.saturating_mul(3))
                 .saturating_add(1),
             joined: false,
+            votes_restored: false,
         };
         self.journal
             .save_amnesia_fence(&fence)

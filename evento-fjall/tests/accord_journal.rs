@@ -326,6 +326,7 @@ async fn amnesia_fence_survives_close_reopen_and_truncate() {
     let pending = AmnesiaFence {
         fence_micros: 500,
         joined: false,
+        votes_restored: false,
     };
     let joined = AmnesiaFence {
         joined: true,
