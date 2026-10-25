@@ -23,7 +23,8 @@
 //! kept by `truncate` until the node drops it. The node's clock bound is the
 //! `accord_meta` row `clock_bound`, written durably on its own and never
 //! truncated. The replica's vote fence is the `accord_meta` row `vote_fence`,
-//! staged and flushed with the commands and never truncated.
+//! and the marks it saw from its peers the row `peer_marks`, both staged and
+//! flushed with the commands and never truncated.
 
 use std::sync::Mutex;
 
@@ -41,8 +42,8 @@ use async_trait::async_trait;
 
 use evento_accord::format::{decode_tagged, encode_tagged, RecordKind};
 use evento_accord::{
-    AcceptorRecord, AmnesiaFence, Ballot, CommandState, ConfigEntry, DecisionRecord, FenceRecord,
-    Journal, Key, NodeId, Timestamp, TxnId,
+    AcceptorRecord, AmnesiaFence, Ballot, CommandState, ConfigEntry, DecisionRecord, DurableMark,
+    FenceRecord, Journal, Key, NodeId, Timestamp, TxnId,
 };
 
 /// `k` value under which the truncation watermark is stored in `accord_meta`.
@@ -60,6 +61,9 @@ const FENCES_KEY: &str = "fences";
 /// `k` value under which the replica's vote fence is stored in
 /// `accord_meta`. Staged like a command; untouched by `truncate`.
 const VOTE_FENCE_KEY: &str = "vote_fence";
+/// `k` value under which the marks the replica saw from its peers are stored
+/// in `accord_meta`. Staged like a command; untouched by `truncate`.
+const PEER_MARKS_KEY: &str = "peer_marks";
 /// `k` prefix of a multi-shard transaction's route in `accord_meta`.
 const ROUTE_PREFIX: &str = "route/";
 /// `k` prefix of a blind recovery promise in `accord_meta`.
@@ -137,10 +141,11 @@ pub struct SqlJournal<DB: Database> {
     /// `accord_meta` rows (routes, promises, decision records) staged since
     /// the last flush, as `(txn, k, v)`.
     staged_meta: Mutex<Vec<(TxnId, String, Vec<u8>)>>,
-    /// The vote fence staged since the last flush, encoded: a slot of its
-    /// own, since `truncate` purges the per-transaction rows of
+    /// The `accord_meta` rows `truncate` keeps (the vote fence, the peer
+    /// marks) staged since the last flush, as `(k, v)`, one per `k`: slots
+    /// of their own, since `truncate` purges the per-transaction rows of
     /// `staged_meta` below its bound.
-    staged_fence: Mutex<Option<Vec<u8>>>,
+    staged_kept: Mutex<Vec<(&'static str, Vec<u8>)>>,
     /// Serializes flushes so staged entries are only drained once their
     /// transaction has committed — a failed flush must leave them staged.
     flush_lock: tokio::sync::Mutex<()>,
@@ -154,9 +159,17 @@ impl<DB: Database> SqlJournal<DB> {
             pool,
             staged: Mutex::new(Vec::new()),
             staged_meta: Mutex::new(Vec::new()),
-            staged_fence: Mutex::new(None),
+            staged_kept: Mutex::new(Vec::new()),
             flush_lock: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// Stages `value` as the `accord_meta` row `key`, one `truncate` keeps,
+    /// replacing whatever was staged for it.
+    fn stage_kept(&self, key: &'static str, value: Vec<u8>) {
+        let mut kept = self.staged_kept.lock().expect("journal poisoned");
+        kept.retain(|(k, _)| *k != key);
+        kept.push((key, value));
     }
 
     /// Closes the underlying pool, waiting for connections to finish — a clean
@@ -357,8 +370,8 @@ where
 
         let batch = self.staged.lock().expect("journal poisoned").clone();
         let meta_batch = self.staged_meta.lock().expect("journal poisoned").clone();
-        let fence = self.staged_fence.lock().expect("journal poisoned").clone();
-        if batch.is_empty() && meta_batch.is_empty() && fence.is_none() {
+        let kept = self.staged_kept.lock().expect("journal poisoned").clone();
+        if batch.is_empty() && meta_batch.is_empty() && kept.is_empty() {
             return Ok(());
         }
 
@@ -424,11 +437,11 @@ where
                 .execute(&mut *tx)
                 .await?;
         }
-        if let Some(value) = &fence {
+        for (key, value) in &kept {
             let upsert = Query::insert()
                 .into_table(AccordMeta::Table)
                 .columns([AccordMeta::K, AccordMeta::V])
-                .values_panic([VOTE_FENCE_KEY.into(), value.clone().into()])
+                .values_panic([(*key).into(), value.clone().into()])
                 .on_conflict(
                     OnConflict::column(AccordMeta::K)
                         .update_column(AccordMeta::V)
@@ -458,11 +471,12 @@ where
             .lock()
             .expect("journal poisoned")
             .retain(|entry| !flushed.contains(entry));
-        // A fence staged while the transaction ran is a newer one: it stays.
-        let mut staged_fence = self.staged_fence.lock().expect("journal poisoned");
-        if *staged_fence == fence {
-            *staged_fence = None;
-        }
+        // A row staged again while the transaction ran is a newer one: it
+        // stays.
+        self.staged_kept
+            .lock()
+            .expect("journal poisoned")
+            .retain(|entry| !kept.contains(entry));
         Ok(())
     }
 
@@ -611,7 +625,7 @@ where
 
     async fn save_vote_fence(&self, fence: Timestamp) -> anyhow::Result<()> {
         let value = encode_tagged(RecordKind::VoteFence, &fence)?;
-        *self.staged_fence.lock().expect("journal poisoned") = Some(value);
+        self.stage_kept(VOTE_FENCE_KEY, value);
         Ok(())
     }
 
@@ -619,6 +633,19 @@ where
         match self.load_meta(VOTE_FENCE_KEY).await? {
             Some(bytes) => Ok(Some(decode_tagged(RecordKind::VoteFence, &bytes)?)),
             None => Ok(None),
+        }
+    }
+
+    async fn save_peer_marks(&self, marks: &[(NodeId, DurableMark)]) -> anyhow::Result<()> {
+        let value = encode_tagged(RecordKind::PeerMarks, &marks.to_vec())?;
+        self.stage_kept(PEER_MARKS_KEY, value);
+        Ok(())
+    }
+
+    async fn load_peer_marks(&self) -> anyhow::Result<Vec<(NodeId, DurableMark)>> {
+        match self.load_meta(PEER_MARKS_KEY).await? {
+            Some(bytes) => Ok(decode_tagged(RecordKind::PeerMarks, &bytes)?),
+            None => Ok(Vec::new()),
         }
     }
 

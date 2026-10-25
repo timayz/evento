@@ -960,6 +960,37 @@ impl PeerReports {
     }
 }
 
+/// The highest [`DurableMark`] each peer reported (#339): what this node
+/// answers a peer's [open](Message::Opened) from.
+#[derive(Default)]
+struct PeerMarks {
+    by_node: HashMap<NodeId, DurableMark>,
+    /// Raised since last staged (`Journal::save_peer_marks`).
+    unsaved: bool,
+}
+
+impl PeerMarks {
+    /// Raises `node`'s mark to `mark` (see [`DurableMark::max`]).
+    fn observe(&mut self, node: NodeId, mark: DurableMark) {
+        let seen = self.by_node.entry(node).or_default();
+        let raised = seen.max(mark);
+        if raised != *seen {
+            *seen = raised;
+            self.unsaved = true;
+        }
+    }
+}
+
+/// A node's open over a journal that holds something (#339): what the
+/// journal held, and the peers that confirmed it.
+struct Opening {
+    mark: DurableMark,
+    /// When the node first asked.
+    since: Instant,
+    /// The peers that answered [`OpenedOk`](Message::OpenedOk).
+    confirmed_by: HashSet<NodeId>,
+}
+
 /// What a node knows of layout transitions (see [`reconfig`]). Locked after
 /// the replica lock wherever both are held: a fence is installed, and a vote
 /// checked against the fences, under the replica lock, so no vote slips
@@ -1193,6 +1224,18 @@ pub struct Node {
     /// The peer whose `Rejoin` set `rejoin_required` (see
     /// [`rejoin_contact`](Self::rejoin_contact)).
     rejoin_from: Arc<Mutex<Option<NodeId>>>,
+    /// False while an open over a journal that holds something awaits its
+    /// peers' confirmation (#339, see [`confirmed`](Self::confirmed)).
+    confirmed: Arc<AtomicBool>,
+    /// The open this node asked its peers to confirm, kept once confirmed:
+    /// a [`RolledBack`](Message::RolledBack) answering it, however late,
+    /// still stops the node.
+    opening: Arc<Mutex<Option<Opening>>>,
+    /// The highest durable mark each peer reported (#339).
+    peer_marks: Arc<Mutex<PeerMarks>>,
+    /// True once a peer found this node's journal rolled back (#339, see
+    /// [`rolled_back`](Self::rolled_back)).
+    rolled_back: Arc<tokio::sync::watch::Sender<bool>>,
     /// Bumped whenever local applied state advances (an apply or an
     /// anti-entropy import). Waiters (`read_barrier`, read-your-writes) wait
     /// on it instead of polling the replica lock every millisecond.
@@ -1276,6 +1319,10 @@ impl Node {
             absent: Arc::new(Mutex::new(HashMap::new())),
             rejoin_required: Arc::new(tokio::sync::watch::channel(false).0),
             rejoin_from: Arc::new(Mutex::new(None)),
+            confirmed: Arc::new(AtomicBool::new(true)),
+            opening: Arc::new(Mutex::new(None)),
+            peer_marks: Arc::new(Mutex::new(PeerMarks::default())),
+            rolled_back: Arc::new(tokio::sync::watch::channel(false).0),
             applied: Arc::new(Signal::default()),
             reinstated: Arc::new(Signal::default()),
             last_anti_entropy: Arc::new(Mutex::new(None)),
@@ -1407,26 +1454,47 @@ impl Node {
     }
 
     /// Whether a peer found this node's journal rolled back to an older copy
-    /// of itself (#339). Not detected yet.
+    /// of itself (#339): it saw a [`DurableMark`] from this node above the
+    /// one the journal held when the node opened. The node forgot votes and
+    /// promises it made since, so it drops every message and refuses writes
+    /// from then on ([`JournalRolledBack`]). The host [retires](Self::retire)
+    /// it, discards its journal and its event store, and opens it again over
+    /// empty ones by joining ([`recover_state_for_join`](Self::recover_state_for_join),
+    /// [`begin_join`](Self::begin_join), [`join`](Self::join)): the path of
+    /// a lost journal (#312).
     pub fn rolled_back(&self) -> bool {
-        false
+        *self.rolled_back.borrow()
     }
 
     /// A watch that turns `true` when [`rolled_back`](Self::rolled_back)
     /// does.
     pub fn rolled_back_signal(&self) -> tokio::sync::watch::Receiver<bool> {
-        tokio::sync::watch::channel(false).1
+        self.rolled_back.subscribe()
     }
 
-    /// Whether this node takes part (#339). Every open is, for now.
+    /// Whether this node takes part. One opened over a journal that holds
+    /// something, in a group of more than one node, first asks every other
+    /// node whether the journal is at or above the [`DurableMark`] it last
+    /// saw from it ([`Message::Opened`]): a journal rolled back to an older
+    /// copy would have it forget votes and promises it made (#339). Until a
+    /// slow quorum of its shard, itself included, confirmed it, and every
+    /// other node answered or `collect_timeout` passed, the node buffers
+    /// consensus messages, refuses writes ([`OpenUnconfirmed`]), and votes,
+    /// vouches and mints nothing.
     pub fn confirmed(&self) -> bool {
-        true
+        self.confirmed.load(Ordering::Acquire)
     }
 
-    /// The highest [`DurableMark`] `peer` reported to this node (#339). None
-    /// is kept yet.
-    pub fn peer_mark(&self, _peer: NodeId) -> Option<DurableMark> {
-        None
+    /// The highest [`DurableMark`] `peer` reported to this node, if any: what
+    /// this node confirms an open of `peer` against (#339). For tests and
+    /// observability.
+    pub fn peer_mark(&self, peer: NodeId) -> Option<DurableMark> {
+        self.peer_marks
+            .lock()
+            .expect("peer marks poisoned")
+            .by_node
+            .get(&peer)
+            .copied()
     }
 
     /// What this node's journal durably holds (see [`DurableMark`]), as its
@@ -1660,6 +1728,11 @@ impl Node {
     pub fn start(&self, mut inbox: mpsc::Receiver<Envelope>) -> JoinHandle<()> {
         let node = self.clone();
         tokio::spawn(async move {
+            // An open over a journal that holds something asks the other
+            // nodes to confirm it at once (#339); the sweep asks again.
+            if !node.confirmed() {
+                node.ask_to_confirm().await;
+            }
             while let Some(first) = inbox.recv().await {
                 let mut sends = node.handle_staged(first).await;
                 let mut batched = 1;
@@ -1841,6 +1914,7 @@ impl Node {
         let fence = self.journal.load_amnesia_fence().await?;
         let fences = self.journal.load_fences().await?;
         let vote_fence = self.journal.load_vote_fence().await?;
+        let peer_marks = self.journal.load_peer_marks().await?;
         // Nothing durable at all: the node never voted, promised, reported
         // or minted anything under this journal — a new member's, or a
         // replacement for one that was lost.
@@ -1855,7 +1929,8 @@ impl Node {
             && bounds.is_empty()
             && fence.is_none()
             && fences.is_empty()
-            && vote_fence.is_none();
+            && vote_fence.is_none()
+            && peer_marks.is_empty();
         // The vote fence comes back where the journal left it (#337). A
         // journal that keeps none restarts it at the clock bound less the
         // margin, where the fence stood before it was journaled: the bound is
@@ -1972,6 +2047,33 @@ impl Node {
         // vote they hold, and an activation sees what it invalidates.
         let installed = self.apply_log();
         self.persist_installed(installed).await;
+        // The marks this node saw from its peers, which it answers their
+        // opens from (#339).
+        {
+            let mut marks = self.peer_marks.lock().expect("peer marks poisoned");
+            for (peer, mark) in peer_marks {
+                marks.observe(peer, mark);
+            }
+            marks.unsaved = false;
+        }
+        // An open over a journal that holds something waits for the other
+        // nodes to confirm the journal is no older copy of itself (#339).
+        if !pristine && self.topology.nodes().len() > 1 {
+            if clock_bound.is_some() {
+                *self.opening.lock().expect("opening poisoned") = Some(Opening {
+                    mark: self.durable_mark(),
+                    since: Instant::now(),
+                    confirmed_by: HashSet::new(),
+                });
+                self.confirmed.store(false, Ordering::Release);
+            } else {
+                tracing::warn!(
+                    node = self.id.0,
+                    "this journal keeps no clock bound (Journal::save_clock_bound): \
+                     an older copy of it would go unnoticed"
+                );
+            }
+        }
         // Peers this node had stopped waiting for stay excluded until they
         // report above what was compacted past them (or rejoin).
         if !bounds.is_empty() {
@@ -2270,6 +2372,15 @@ impl Node {
     /// ([`recover_stalled`](Self::recover_stalled)). One this node holds
     /// decided is left to the redrive (see [`stalled`](Self::stalled)).
     async fn recovery_sweep(&self) {
+        // A node whose journal was rolled back takes no part (#339); one whose
+        // journal is not confirmed yet asks again, and does nothing else.
+        if self.rolled_back() {
+            return;
+        }
+        if !self.confirmed() {
+            self.ask_to_confirm().await;
+            return;
+        }
         // A node told to rejoin holds state its peers compacted past: it
         // recovers, repairs and gossips nothing until its host rejoins it.
         // Nor does a node still joining: it holds part of its state, and a
@@ -2793,6 +2904,8 @@ impl Node {
             .copied()
             .filter(|&n| n != self.id)
             .collect();
+        // The marks its peers reported ride the same flush (#339).
+        self.stage_peer_marks(&all_nodes).await;
         // A peer may compact up to `mine` past what this node does not hold,
         // trusting its vote fence, and past what it imported: make both
         // survive a restart first.
@@ -3124,6 +3237,236 @@ impl Node {
         self.rejoin_required.send_replace(true);
     }
 
+    /// Whether `message` manages the cluster — a join, an anti-entropy round,
+    /// a report, config Paxos, the metadata log, a forwarded read — rather
+    /// than taking part in a transaction's consensus. A node joining handles
+    /// those at once and buffers the rest until it joined.
+    fn is_control(message: &Message) -> bool {
+        matches!(
+            message,
+            Message::SyncRequest { .. }
+                | Message::SyncData { .. }
+                | Message::SnapshotPageRequest { .. }
+                | Message::RangePageRequest { .. }
+                | Message::SnapshotPage { .. }
+                | Message::JoinProof { .. }
+                | Message::JoinHeaderRequest { .. }
+                | Message::CommandPageRequest { .. }
+                | Message::CommandPage { .. }
+                | Message::JoinKeepalive
+                | Message::Watermark { .. }
+                | Message::ConfigPrepare { .. }
+                | Message::ConfigPromise { .. }
+                | Message::ConfigAccept { .. }
+                | Message::ConfigAccepted { .. }
+                | Message::ConfigCommit { .. }
+                | Message::ConfigNack { .. }
+                | Message::MetadataFetch { .. }
+                | Message::MetadataEntries { .. }
+                | Message::ReadForward { .. }
+                | Message::ReadReply { .. }
+                | Message::ReadFailed { .. }
+                | Message::ReadProbe { .. }
+                | Message::ReadProbeOk { .. }
+        )
+    }
+
+    /// Answers `from`'s open over a journal holding `mark` (#339): at or
+    /// above the highest mark this node saw from it, the journal lost
+    /// nothing it saw, and the open is confirmed; below it, the journal was
+    /// rolled back to an older copy. Answered from the marks this node's own
+    /// journal kept, whether it is confirmed itself or not: when every node
+    /// restarted, they confirm one another.
+    fn on_opened(&self, from: NodeId, mark: DurableMark) -> Message {
+        let mut marks = self.peer_marks.lock().expect("peer marks poisoned");
+        match marks.by_node.get(&from).copied() {
+            Some(seen) if !mark.covers(&seen) => {
+                tracing::error!(
+                    node = self.id.0,
+                    peer = from.0,
+                    ?mark,
+                    ?seen,
+                    "a peer opened over a journal holding less than it reported: \
+                     an older copy of its journal"
+                );
+                Message::RolledBack { mark, seen }
+            }
+            _ => {
+                marks.observe(from, mark);
+                Message::OpenedOk { mark }
+            }
+        }
+    }
+
+    /// `from` confirmed this node's open over a journal holding `mark`
+    /// (#339).
+    async fn on_opened_ok(&self, from: NodeId, mark: DurableMark) {
+        match self.opening.lock().expect("opening poisoned").as_mut() {
+            Some(opening) if opening.mark == mark => {
+                opening.confirmed_by.insert(from);
+            }
+            _ => return,
+        }
+        self.confirm_if_due().await;
+    }
+
+    /// `from` saw `seen` from this node, above the `mark` of its open (#339):
+    /// the journal it opened over is an older copy of itself. However late,
+    /// the node stops taking part (see [`rolled_back`](Self::rolled_back)).
+    fn on_rolled_back(&self, from: NodeId, mark: DurableMark, seen: DurableMark) {
+        let opened = self
+            .opening
+            .lock()
+            .expect("opening poisoned")
+            .as_ref()
+            .map(|opening| opening.mark);
+        // An answer to another open: an earlier one of this node's id.
+        if opened != Some(mark) || self.rolled_back.send_replace(true) {
+            return;
+        }
+        self.metrics.record_journal_rolled_back();
+        tracing::error!(
+            node = self.id.0,
+            peer = from.0,
+            ?mark,
+            ?seen,
+            "a peer saw more of this node's journal than it holds: an older copy of it. \
+             This node takes no part any more; open it again over an empty journal and \
+             store, joining"
+        );
+    }
+
+    /// Asks every other node to confirm this node's open (#339), unless it
+    /// is confirmed already — or now is (see [`confirmed`](Self::confirmed)).
+    async fn ask_to_confirm(&self) {
+        self.confirm_if_due().await;
+        if self.confirmed() || self.rolled_back() {
+            return;
+        }
+        let Some(mark) = self
+            .opening
+            .lock()
+            .expect("opening poisoned")
+            .as_ref()
+            .map(|opening| opening.mark)
+        else {
+            return;
+        };
+        let others: Vec<NodeId> = self
+            .topology
+            .nodes()
+            .into_iter()
+            .filter(|&node| node != self.id)
+            .collect();
+        self.broadcast(&others, Message::Opened { mark }).await;
+    }
+
+    /// Confirms this node's open if enough nodes confirmed it (see
+    /// [`confirmed`](Self::confirmed)), and handles what it buffered
+    /// meanwhile — unless it still joins, whose join does.
+    async fn confirm_if_due(&self) {
+        if self.confirmed() || self.rolled_back() {
+            return;
+        }
+        let due = self
+            .opening
+            .lock()
+            .expect("opening poisoned")
+            .as_ref()
+            .is_some_and(|opening| self.open_confirmed(opening));
+        if !due {
+            return;
+        }
+        // Flag flip and drain under the buffer lock (see `handle_staged`).
+        let buffered = {
+            let mut buffer = self.join_buffer.lock().expect("buffer poisoned");
+            self.confirmed.store(true, Ordering::Release);
+            if self.bootstrapped.load(Ordering::Acquire) {
+                std::mem::take(&mut *buffer)
+            } else {
+                Vec::new()
+            }
+        };
+        tracing::info!(
+            node = self.id.0,
+            "the other nodes confirmed this node's journal"
+        );
+        for env in buffered {
+            Box::pin(self.handle(env)).await;
+        }
+    }
+
+    /// Whether `opening` is confirmed: a slow quorum of this node's shard,
+    /// itself included, confirmed it, and every other node did or
+    /// `collect_timeout` passed — time for one that saw a higher mark to
+    /// say so.
+    fn open_confirmed(&self, opening: &Opening) -> bool {
+        let layout = self.topology.layout();
+        let quorum = layout.node_shard(self.id).is_none_or(|shard| {
+            let confirmed = layout
+                .replicas_of(shard)
+                .iter()
+                .filter(|&&node| node != self.id && opening.confirmed_by.contains(&node))
+                .count();
+            confirmed + 1 >= layout.slow_quorum_of(shard)
+        });
+        quorum
+            && (opening.since.elapsed() >= self.settings.collect_timeout
+                || self
+                    .topology
+                    .nodes()
+                    .iter()
+                    .all(|&node| node == self.id || opening.confirmed_by.contains(&node)))
+    }
+
+    /// Waits, for at most [`NodeConfig::amnesia_join_timeout`], until this
+    /// node's open is confirmed (#339), asking again meanwhile.
+    async fn await_confirmed(&self) -> anyhow::Result<()> {
+        let deadline = Instant::now() + self.settings.amnesia_join_timeout;
+        loop {
+            if self.rolled_back() {
+                return Err(JournalRolledBack.into());
+            }
+            if self.confirmed() {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(OpenUnconfirmed.into());
+            }
+            self.ask_to_confirm().await;
+            tokio::time::sleep(self.settings.recovery_interval).await;
+        }
+    }
+
+    /// Stages the marks this node saw from its peers (#339), if any rose
+    /// since they were last staged, for the next journal flush. Nodes that
+    /// left the topology are forgotten first.
+    async fn stage_peer_marks(&self, nodes: &[NodeId]) {
+        let marks = {
+            let mut marks = self.peer_marks.lock().expect("peer marks poisoned");
+            let before = marks.by_node.len();
+            marks.by_node.retain(|node, _| nodes.contains(node));
+            if marks.by_node.len() != before {
+                marks.unsaved = true;
+            }
+            if !marks.unsaved {
+                return;
+            }
+            marks.unsaved = false;
+            let mut kept: Vec<(NodeId, DurableMark)> = marks
+                .by_node
+                .iter()
+                .map(|(node, mark)| (*node, *mark))
+                .collect();
+            kept.sort_unstable_by_key(|(node, _)| *node);
+            kept
+        };
+        if let Err(err) = self.journal.save_peer_marks(&marks).await {
+            tracing::warn!(node = self.id.0, %err, "cannot stage the peers' marks");
+            self.peer_marks.lock().expect("peer marks poisoned").unsaved = true;
+        }
+    }
+
     // ----- inbox handling -------------------------------------------------
 
     /// Processes one inbound message in full: stages its durable writes, flushes
@@ -3157,6 +3500,34 @@ impl Node {
         // Every inbound message is a liveness heartbeat from its sender.
         self.failure_detector.heartbeat(env.from);
 
+        // Its journal rolled back to an older copy (#339): this node takes no
+        // part any more. A forwarded read is still refused out loud.
+        if self.rolled_back() {
+            if let Message::ReadForward { id, .. } = env.message {
+                return vec![(
+                    env.from,
+                    Message::ReadFailed {
+                        id,
+                        reason: "the owner's journal was rolled back".into(),
+                    },
+                )];
+            }
+            return Vec::new();
+        }
+        // The open handshake (#339) is answered and heard whatever else this
+        // node is doing.
+        match env.message {
+            Message::Opened { mark } => return vec![(env.from, self.on_opened(env.from, mark))],
+            Message::OpenedOk { mark } => {
+                self.on_opened_ok(env.from, mark).await;
+                return Vec::new();
+            }
+            Message::RolledBack { mark, seen } => {
+                self.on_rolled_back(env.from, mark, seen);
+                return Vec::new();
+            }
+            _ => {}
+        }
         // Told to rejoin: this node's state is stale, so it takes no part until
         // its host rejoins it (see `NodeConfig::peer_absence_limit`). A
         // forwarded read is still refused out loud: unanswered, its requester
@@ -3172,6 +3543,38 @@ impl Node {
                 )];
             }
             return Vec::new();
+        }
+        // Its journal not confirmed yet (#339): a consensus message waits for
+        // the confirmation, the rest — which their senders repeat — are
+        // dropped. A forwarded read is refused out loud, and a report still
+        // tells the sender's mark.
+        if !self.confirmed() {
+            match &env.message {
+                Message::ReadForward { id, .. } => {
+                    return vec![(
+                        env.from,
+                        Message::ReadFailed {
+                            id: *id,
+                            reason: "the owner's journal is not confirmed yet".into(),
+                        },
+                    )];
+                }
+                Message::Watermark { mark, .. } => self
+                    .peer_marks
+                    .lock()
+                    .expect("peer marks poisoned")
+                    .observe(env.from, *mark),
+                _ => {}
+            }
+            if Self::is_control(&env.message) {
+                return Vec::new();
+            }
+            // Flag check and push under one lock, as for a join (see below).
+            let mut buffer = self.join_buffer.lock().expect("buffer poisoned");
+            if !self.confirmed() {
+                buffer.push(env);
+                return Vec::new();
+            }
         }
         if let Message::Rejoin { above } = env.message {
             // A node still joining is rejoining already: a peer that has it
@@ -3197,34 +3600,7 @@ impl Node {
         // While bootstrapping, buffer consensus messages for replay after the
         // snapshot is imported. Cluster-management messages (bootstrap + epoch
         // changes) pass through so the node can still sync and learn its layout.
-        let control = matches!(
-            env.message,
-            Message::SyncRequest { .. }
-                | Message::SyncData { .. }
-                | Message::SnapshotPageRequest { .. }
-                | Message::RangePageRequest { .. }
-                | Message::SnapshotPage { .. }
-                | Message::JoinProof { .. }
-                | Message::JoinHeaderRequest { .. }
-                | Message::CommandPageRequest { .. }
-                | Message::CommandPage { .. }
-                | Message::JoinKeepalive
-                | Message::Watermark { .. }
-                | Message::ConfigPrepare { .. }
-                | Message::ConfigPromise { .. }
-                | Message::ConfigAccept { .. }
-                | Message::ConfigAccepted { .. }
-                | Message::ConfigCommit { .. }
-                | Message::ConfigNack { .. }
-                | Message::MetadataFetch { .. }
-                | Message::MetadataEntries { .. }
-                | Message::ReadForward { .. }
-                | Message::ReadReply { .. }
-                | Message::ReadFailed { .. }
-                | Message::ReadProbe { .. }
-                | Message::ReadProbeOk { .. }
-        );
-        if !control {
+        if !Self::is_control(&env.message) {
             // A node joining over a lost journal answers a recovery of a
             // transaction below its fence at once: it holds nothing of it,
             // and never votes for it (see `Message::Amnesiac`). Silence
@@ -3885,11 +4261,17 @@ impl Node {
             Message::Watermark {
                 applied_through,
                 applied,
-                mark: _,
+                mark,
                 fenced,
                 copied,
                 live_since,
             } => {
+                // What the sender's journal holds, which it must hold again
+                // when it reopens (#339).
+                self.peer_marks
+                    .lock()
+                    .expect("peer marks poisoned")
+                    .observe(from, mark);
                 // A joiner's first report ends the hold its contact kept for
                 // it (see `JoinHold`): from here on it is counted itself.
                 self.join_holds
@@ -4481,6 +4863,12 @@ impl Node {
         // refused (gated only here, the local coordinator's entry point).
         if self.rejoin_required() {
             return Err(RejoinRequired.into());
+        }
+        if self.rolled_back() {
+            return Err(JournalRolledBack.into());
+        }
+        if !self.confirmed() {
+            return Err(OpenUnconfirmed.into());
         }
         // A command is the unit no page can split: one over the cap could
         // never be repaired onto a replica that missed it.
@@ -6477,6 +6865,9 @@ impl Node {
     /// copied its slots during the layout transition that made it a replica
     /// has nothing to join: `Ok(0)`.
     pub async fn join(&self, contact: NodeId) -> anyhow::Result<usize> {
+        // A rejoin over a kept journal waits until the other nodes confirmed
+        // that journal (#339).
+        self.await_confirmed().await?;
         let (layout, shard) = self.await_membership(contact).await?;
         if self.copied_for_live() {
             return Ok(0);
@@ -8818,6 +9209,15 @@ impl Node {
     /// clock again. Raised a skew window ahead, so the journal sees one write
     /// per window at most.
     async fn bound_clock_past(&self, reading: u64) -> anyhow::Result<()> {
+        // A node whose journal its peers did not confirm (#339) mints, votes
+        // and vouches for nothing, all of which pass here: an older copy of
+        // its journal would have it mint ids it minted before.
+        if self.rolled_back() {
+            return Err(JournalRolledBack.into());
+        }
+        if !self.confirmed() {
+            return Err(OpenUnconfirmed.into());
+        }
         if reading < self.clock_bound.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -8932,6 +9332,11 @@ impl Node {
         commands: &[CommandState],
         bound: Option<u64>,
     ) -> anyhow::Result<()> {
+        // The bound the journal holds, which this node's reports carry
+        // (#339) and which no reading below it needs raised.
+        if let Some(bound) = bound {
+            self.clock_bound.fetch_max(bound, Ordering::AcqRel);
+        }
         let bound = bound.map(|micros| Timestamp {
             micros,
             logical: 0,
