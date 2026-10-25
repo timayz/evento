@@ -3297,6 +3297,18 @@ impl Node {
                 if !self.bootstrapped.load(Ordering::Acquire) {
                     return out;
                 }
+                // Nor does a node the requester is no shard peer of under
+                // this node's layout: dropped from the layout, or moved to
+                // another shard, it compacts without the requester's
+                // reports, and may have compacted away what the requester
+                // lacks — which its coverage would then vouch for.
+                let layout = self.topology.layout();
+                if layout
+                    .node_shard(self.id)
+                    .is_none_or(|shard| layout.node_shard(from) != Some(shard))
+                {
+                    return out;
+                }
                 let (watermark, coverage, commands) = self.export_missing(&known);
                 // The coverage vouches for what a peer may compact past.
                 if !self.bound_clock().await {

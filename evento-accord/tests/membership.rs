@@ -1423,21 +1423,46 @@ async fn a_joining_node_does_not_count_toward_a_read_barrier() {
         .expect("a joined node counts toward the barrier");
 }
 
-/// Asks `node` for anti-entropy as `probe` would, and returns the coverage it
-/// answers with: what a requester records as proof `node` holds everything
-/// it applied below.
+/// Asks `node` for anti-entropy as its shard peer `peer` would, and returns
+/// the coverage it answers with: what a requester records as proof `node`
+/// holds everything it applied below. The reply is taken off the link before
+/// `peer` sees it.
 async fn coverage_of(
     net: &Arc<InMemoryNetwork>,
-    probe: &mut tokio::sync::mpsc::Receiver<evento_accord::Envelope>,
     node: NodeId,
+    peer: NodeId,
 ) -> evento_accord::Timestamp {
-    use evento_accord::Message;
+    sync_reply(net, node, peer, Duration::from_secs(5))
+        .await
+        .expect("no anti-entropy reply")
+}
 
-    net.sink(NodeId(9))
+/// [`coverage_of`], or `None` if `node` does not answer within `wait`.
+async fn sync_reply(
+    net: &Arc<InMemoryNetwork>,
+    node: NodeId,
+    peer: NodeId,
+    wait: Duration,
+) -> Option<evento_accord::Timestamp> {
+    const PROBE: u64 = u64::MAX;
+    let reply: Arc<std::sync::Mutex<Option<evento_accord::Timestamp>>> = Arc::default();
+    let seen = Arc::clone(&reply);
+    net.set_link_filter(Some(Arc::new(move |from, to, message| match message {
+        Message::SyncData {
+            id: PROBE,
+            coverage,
+            ..
+        } if from == node && to == peer => {
+            *seen.lock().unwrap() = Some(*coverage);
+            true
+        }
+        _ => false,
+    })));
+    net.sink(peer)
         .send(
             node,
             Message::SyncRequest {
-                id: 1,
+                id: PROBE,
                 known: evento_accord::message::SyncKnown {
                     since: evento_accord::Timestamp::MIN,
                     txns: Vec::new(),
@@ -1446,15 +1471,55 @@ async fn coverage_of(
         )
         .await
         .unwrap();
-    loop {
-        let env = tokio::time::timeout(Duration::from_secs(5), probe.recv())
-            .await
-            .expect("no anti-entropy reply")
-            .expect("probe inbox closed");
-        if let Message::SyncData { coverage, .. } = env.message {
-            return coverage;
+    let deadline = tokio::time::Instant::now() + wait;
+    while tokio::time::Instant::now() < deadline {
+        let answered = *reply.lock().unwrap();
+        if answered.is_some() {
+            net.set_link_filter(None);
+            return answered;
         }
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
+    net.set_link_filter(None);
+    None
+}
+
+/// A node the layout drops has no shard peer left to wait for: it compacts
+/// below its own report alone, and holds none of the writes after it. It
+/// answers no anti-entropy request — from a former peer that has not
+/// installed the change yet either — since its coverage would vouch for
+/// writes it compacted away, or never held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dropped_node_answers_no_sync() {
+    let net = InMemoryNetwork::new();
+    let abcd = vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3)];
+    let bcd = vec![NodeId(1), NodeId(2), NodeId(3)];
+    let nodes: Vec<TestNode> = abcd
+        .iter()
+        .map(|&id| spawn_node(id, 0, vec![abcd.clone()], &net))
+        .collect();
+    let _sweeps: Vec<_> = nodes.iter().map(|n| n.node.start_recovery()).collect();
+    let wait = Duration::from_millis(500);
+    assert!(
+        sync_reply(&net, NodeId(0), NodeId(2), wait).await.is_some(),
+        "a replica answers its shard peer"
+    );
+
+    nodes[1]
+        .node
+        .change_topology(1, vec![bcd.clone()])
+        .await
+        .expect("node 0 is dropped");
+    for _ in 0..1_000 {
+        if !nodes[0].topology.layout().contains(NodeId(0)) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        sync_reply(&net, NodeId(0), NodeId(2), wait).await.is_none(),
+        "the dropped node answers no sync"
+    );
 }
 
 /// A freshly joined node holds provably only what its contact vouched for:
@@ -1485,7 +1550,6 @@ async fn a_joined_node_vouches_for_no_more_than_its_join_proved() {
     for n in &nodes {
         await_len(&n.store, 1).await;
     }
-    let mut probe = net.register(NodeId(9));
 
     // No anti-entropy has run: the contact can vouch for nothing yet.
     let before_join = system_micros();
@@ -1501,7 +1565,7 @@ async fn a_joined_node_vouches_for_no_more_than_its_join_proved() {
     d.node.join(NodeId(0)).await.unwrap();
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    let coverage = coverage_of(&net, &mut probe, NodeId(3)).await;
+    let coverage = coverage_of(&net, NodeId(3), NodeId(1)).await;
     assert!(
         coverage.micros < before_join,
         "a joined node vouched past its join proof: {coverage:?}"
@@ -1511,7 +1575,7 @@ async fn a_joined_node_vouches_for_no_more_than_its_join_proved() {
     let joined = system_micros();
     for _ in 0..200 {
         d.node.sweep().await;
-        if coverage_of(&net, &mut probe, NodeId(3)).await.micros > joined {
+        if coverage_of(&net, NodeId(3), NodeId(1)).await.micros > joined {
             return;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
