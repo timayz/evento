@@ -622,6 +622,35 @@ impl Drop for ConfigRound<'_> {
     }
 }
 
+/// The [`Message::ConfigReadReply`] slot of a config-vote restoration
+/// (#338), dropped from `Node::config_read_pending` however it ends.
+struct PendingConfigRead<'a> {
+    node: &'a Node,
+    id: u64,
+}
+
+impl<'a> PendingConfigRead<'a> {
+    fn open(node: &'a Node) -> (Self, mpsc::UnboundedReceiver<(NodeId, Message)>) {
+        let id = node.correlation_seq.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::unbounded_channel();
+        node.config_read_pending
+            .lock()
+            .expect("config read poisoned")
+            .insert(id, tx);
+        (Self { node, id }, rx)
+    }
+}
+
+impl Drop for PendingConfigRead<'_> {
+    fn drop(&mut self) {
+        self.node
+            .config_read_pending
+            .lock()
+            .expect("config read poisoned")
+            .remove(&self.id);
+    }
+}
+
 /// Ends a write's coordination when dropped (see [`Node::write`]).
 struct Coordinating<'a> {
     node: &'a Node,
@@ -7090,9 +7119,138 @@ impl Node {
     /// Reads the other acceptors' state back and votes in config Paxos
     /// again (#338): a node that lost its journal forgot every promise and
     /// accept it made. Returns whether it is restored.
+    ///
+    /// It asks every other acceptor for its whole state, and needs answers
+    /// from a majority of **all** the acceptors among those that vote
+    /// themselves (one that lost its journal and has not restored its votes
+    /// answers `voting: false`, and bounds nothing: counting it would let
+    /// two such replicas each read past the other's forgotten promise). Any
+    /// majority that promised or accepted a ballot meets those answers in a
+    /// sound acceptor, so the merged state
+    /// ([`merge_acceptors`](Self::merge_acceptors)) lies above everything
+    /// this node forgot as part of a majority — and a vote of its own that
+    /// no majority yet shared is covered by **when** it reads: no earlier
+    /// than `collect_timeout` past its fence, since a proposer counts no
+    /// reply older than that ([`run_config_paxos`](Self::run_config_paxos)),
+    /// so every round that counted a reply this node made before the loss
+    /// ended before the read, and whatever it accepted is journaled at a
+    /// sound acceptor the read meets. The adopted state is journaled before
+    /// the fence records the restoration, so a restart keeps it. Retried
+    /// by the metadata sweep until a majority of the voting others answer;
+    /// a group that lost a majority of its journals at once never restores
+    /// (those nodes come back under new ids), nor does one of two nodes.
     async fn restore_config_votes(&self) -> bool {
-        let _merged = Self::merge_acceptors(std::iter::empty());
-        false
+        let Some(fence) = *self.amnesia.lock().expect("amnesia poisoned") else {
+            return true;
+        };
+        if fence.votes_restored {
+            return true;
+        }
+        if !fence.joined {
+            return false;
+        }
+        let collect_micros = self.settings.collect_timeout.as_micros() as u64;
+        if self.clock.physical_micros() < fence.fence_micros.saturating_add(collect_micros) {
+            return false;
+        }
+        let acceptors = self.topology.nodes();
+        let need = acceptors.len() / 2 + 1;
+        let others: Vec<NodeId> = acceptors
+            .iter()
+            .copied()
+            .filter(|&node| node != self.id)
+            .collect();
+        if others.len() < need {
+            tracing::warn!(
+                node = self.id.0,
+                acceptors = acceptors.len(),
+                "too few other acceptors to restore config votes from: abstaining for good"
+            );
+            return false;
+        }
+
+        let (pending, mut rx) = PendingConfigRead::open(self);
+        self.broadcast(&others, Message::ConfigRead { id: pending.id })
+            .await;
+        let deadline = Self::after(self.settings.collect_timeout);
+        // One answer per acceptor (a frame resent over a fresh connection
+        // must not fill the majority twice over).
+        let mut heard: HashSet<NodeId> = HashSet::new();
+        let mut voting: Vec<Vec<(u64, AcceptorRecord)>> = Vec::new();
+        let mut abstaining = 0usize;
+        while voting.len() < need {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some((
+                    from,
+                    Message::ConfigReadReply {
+                        acceptors,
+                        voting: votes,
+                        ..
+                    },
+                ))) => {
+                    if !others.contains(&from) || !heard.insert(from) {
+                        continue;
+                    }
+                    if votes {
+                        voting.push(acceptors);
+                    } else {
+                        abstaining += 1;
+                    }
+                }
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
+            }
+        }
+        drop(pending);
+        if voting.len() < need {
+            tracing::warn!(
+                node = self.id.0,
+                heard = heard.len(),
+                abstaining,
+                need,
+                "too few voting acceptors answered to restore config votes; retrying"
+            );
+            return false;
+        }
+
+        let merged = Self::merge_acceptors(voting.iter().map(Vec::as_slice));
+        for (epoch, read) in merged {
+            let record = {
+                let mut config = self.config.lock().expect("config poisoned");
+                let acc = config.entry(epoch).or_default();
+                acc.promised = acc.promised.max(read.promised);
+                if let Some((ballot, entry)) = read.accepted {
+                    if acc.accepted.as_ref().is_none_or(|(b, _)| ballot > *b) {
+                        acc.accepted = Some((ballot, entry));
+                    }
+                }
+                acc.to_record()
+            };
+            if !self.persist_acceptor(epoch, &record).await {
+                return false;
+            }
+        }
+        let restored = AmnesiaFence {
+            votes_restored: true,
+            ..fence
+        };
+        if let Err(err) = self.journal.flush().await {
+            tracing::warn!(node = self.id.0, %err, "cannot flush the journal before recording the restored config votes");
+            return false;
+        }
+        self.metrics.record_flush();
+        if let Err(err) = self.journal.save_amnesia_fence(&restored).await {
+            tracing::warn!(node = self.id.0, %err, "cannot record the restored config votes");
+            return false;
+        }
+        *self.amnesia.lock().expect("amnesia poisoned") = Some(restored);
+        self.metrics.record_config_votes_restored();
+        tracing::info!(
+            node = self.id.0,
+            read_from = heard.len(),
+            "restored the config votes lost with the journal"
+        );
+        true
     }
 
     /// Merges the acceptor state read from the other acceptors, per epoch
@@ -7102,8 +7260,22 @@ impl Node {
     fn merge_acceptors<'a>(
         answers: impl IntoIterator<Item = &'a [(u64, AcceptorRecord)]>,
     ) -> BTreeMap<u64, AcceptorRecord> {
-        let _ = answers;
-        BTreeMap::new()
+        let mut merged: BTreeMap<u64, AcceptorRecord> = BTreeMap::new();
+        for answer in answers {
+            for (epoch, record) in answer {
+                let state = merged
+                    .entry(*epoch)
+                    .or_insert_with(|| ConfigAcceptor::default().to_record());
+                state.promised = state.promised.max(record.promised);
+                if let Some((ballot, entry)) = &record.accepted {
+                    state.promised = state.promised.max(*ballot);
+                    if state.accepted.as_ref().is_none_or(|(b, _)| *ballot > *b) {
+                        state.accepted = Some((*ballot, entry.clone()));
+                    }
+                }
+            }
+        }
+        merged
     }
 
     /// Raises the replica's vote fence to `fence`, for good: a node that
@@ -8382,6 +8554,12 @@ impl Node {
     }
 
     /// The config-Paxos coordinator over an explicit `acceptors` set.
+    ///
+    /// Each phase counts only the replies that reach it within
+    /// `collect_timeout` of its start: a reply older than that fills no
+    /// quorum. An acceptor that lost its journal relies on it
+    /// ([`restore_config_votes`](Self::restore_config_votes)): a vote it
+    /// made before the loss can complete no round once that long has passed.
     async fn run_config_paxos(
         &self,
         epoch: u64,
@@ -11298,5 +11476,84 @@ mod tests {
         assert!(page
             .iter()
             .all(|e| wanted.contains(&(crate::api::slot_of(&Key::of(e)) as u16))));
+    }
+
+    /// The state an acceptor that lost its journal adopts from the others
+    /// (#338): per epoch, the highest ballot any of them promised or
+    /// accepted, and the value accepted under the highest ballot.
+    #[test]
+    fn merged_acceptor_state_takes_the_highest_ballots() {
+        use crate::api::AcceptorRecord;
+        use crate::clock::Ballot;
+
+        let ballot = |micros: u64, node: u64| {
+            Ballot(Timestamp {
+                micros,
+                logical: 0,
+                node: NodeId(node),
+            })
+        };
+        let layout = |n: u64| ConfigEntry::active(vec![(0..n).map(NodeId).collect()]);
+        let x: Vec<(u64, AcceptorRecord)> = vec![
+            (
+                1,
+                AcceptorRecord {
+                    promised: ballot(10, 0),
+                    accepted: Some((ballot(10, 0), layout(3))),
+                },
+            ),
+            (
+                2,
+                AcceptorRecord {
+                    promised: ballot(50, 1),
+                    accepted: None,
+                },
+            ),
+        ];
+        let y: Vec<(u64, AcceptorRecord)> = vec![
+            (
+                1,
+                AcceptorRecord {
+                    promised: ballot(12, 1),
+                    accepted: Some((ballot(12, 1), layout(4))),
+                },
+            ),
+            (
+                2,
+                AcceptorRecord {
+                    promised: ballot(40, 2),
+                    accepted: Some((ballot(40, 2), layout(5))),
+                },
+            ),
+            (
+                3,
+                AcceptorRecord {
+                    promised: ballot(1, 1),
+                    accepted: None,
+                },
+            ),
+        ];
+        let merged = Node::merge_acceptors([x.as_slice(), y.as_slice()]);
+        assert_eq!(merged.len(), 3);
+        // Epoch 1: Y accepted under the higher ballot.
+        assert_eq!(merged[&1].promised, ballot(12, 1));
+        assert_eq!(merged[&1].accepted, Some((ballot(12, 1), layout(4))));
+        // Epoch 2: X's promise is above Y's acceptance, which stands.
+        assert_eq!(merged[&2].promised, ballot(50, 1));
+        assert_eq!(merged[&2].accepted, Some((ballot(40, 2), layout(5))));
+        // Epoch 3: a promise alone.
+        assert_eq!(merged[&3].promised, ballot(1, 1));
+        assert_eq!(merged[&3].accepted, None);
+        // An acceptance above every promise raises the promised ballot too.
+        let z: Vec<(u64, AcceptorRecord)> = vec![(
+            1,
+            AcceptorRecord {
+                promised: ballot(5, 0),
+                accepted: Some((ballot(20, 2), layout(3))),
+            },
+        )];
+        let merged = Node::merge_acceptors([z.as_slice()]);
+        assert_eq!(merged[&1].promised, ballot(20, 2));
+        assert!(Node::merge_acceptors(std::iter::empty()).is_empty());
     }
 }
