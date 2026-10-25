@@ -282,6 +282,10 @@ pub enum Message {
         /// slot it gains, if one is in progress: what its activation waits on
         /// too.
         copied: Option<u64>,
+        /// The epoch the sender's live layout became live at.
+        /// `applied_through` vouches for the sender's keys under it: a node
+        /// under another live layout counts it for nothing.
+        live_since: u64,
     },
     /// Existing replica → joining node (or anti-entropy requester): the
     /// committed state to import.

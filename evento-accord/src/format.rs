@@ -74,10 +74,11 @@ pub const MAGIC: [u8; 2] = *b"Ac";
 /// and `Message::Watermark` carries the sender's fence. 6: a layout is a
 /// `ShardMap` (replica sets and a slot table), and `Message::Watermark`
 /// carries the sender's copy report. 7: `Message::SyncData` carries the epoch
-/// the responder's live layout became live at. No reader for older versions:
+/// the responder's live layout became live at. 8: so does
+/// `Message::Watermark`, for its sender. No reader for older versions:
 /// evento-accord has not been released, so a journal of one is wiped and the
 /// node re-bootstrapped.
-pub const FORMAT_VERSION: u8 = 7;
+pub const FORMAT_VERSION: u8 = 8;
 
 /// Length of the fixed header: `MAGIC (2) + version (1) + kind (1)`.
 const HEADER_LEN: usize = 4;

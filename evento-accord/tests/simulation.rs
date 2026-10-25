@@ -5545,6 +5545,77 @@ async fn a_write_in_flight_outlives_two_removals() {
     let _ = t1.await;
 }
 
+/// A watermark report vouches for its sender's keys under the live layout
+/// it was made under. A node gaining slots in a transition is in no shard of
+/// the live layout: it owns nothing, and reports past everything. Counted
+/// once the activation made it a replica, such a report would let its new
+/// peers compact past writes it never got. Node 3, replacing node 2, hears
+/// nothing of the activation for a while, nor of T, which commits through
+/// nodes 0 and 1; its reports meanwhile are made under the layout before.
+#[tokio::test(start_paused = true)]
+async fn a_report_counts_only_under_the_layout_it_was_made_under() {
+    let sim = Sim::build_with(SimOptions {
+        // Node 3's own activation attempts, which hear nothing back, give up
+        // soon, and its sweep goes on reporting.
+        config: NodeConfig {
+            collect_timeout: Duration::from_millis(300),
+            ..NodeConfig::default()
+        },
+        dynamic: true,
+        layout: Some(vec![vec![NodeId(0), NodeId(1), NodeId(2)]]),
+        ..SimOptions::new(4)
+    });
+    sim.nodes[3].begin_join();
+    let late = |message: &Message| match message {
+        Message::ConfigPrepare { epoch, .. }
+        | Message::ConfigPromise { epoch, .. }
+        | Message::ConfigAccept { epoch, .. }
+        | Message::ConfigAccepted { epoch, .. }
+        | Message::ConfigNack { epoch, .. }
+        | Message::ConfigCommit { epoch, .. } => *epoch >= 2,
+        Message::MetadataEntries { entries } => entries.iter().any(|(epoch, _)| *epoch >= 2),
+        Message::PreAccept { .. }
+        | Message::Accept { .. }
+        | Message::Commit { .. }
+        | Message::Apply { .. } => true,
+        _ => false,
+    };
+    sim.net
+        .set_link_filter(Some(Arc::new(move |_, to, message| {
+            to == NodeId(3) && late(message)
+        })));
+    let replaced = vec![vec![NodeId(0), NodeId(1), NodeId(3)]];
+    let _ = sim.nodes[0].change_topology(1, replaced.clone()).await;
+    for _ in 0..3_000 {
+        if sim.dynamic[0].layout().shards() == replaced.as_slice() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(sim.dynamic[0].layout().shards(), replaced.as_slice());
+    assert_eq!(
+        sim.dynamic[3].epoch(),
+        1,
+        "node 3 is still in the transition"
+    );
+    sim.nodes[0]
+        .write(vec![event("acc", 1, 1)])
+        .await
+        .expect("T commits through 0 and 1");
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    sim.net.set_link_filter(None);
+
+    let mut held = Vec::new();
+    for _ in 0..1_000 {
+        held = sim.stores[3].events_of("acc");
+        if !held.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(held, vec![1], "node 3 holds T");
+}
+
 /// Sync coverage holds only between two nodes under the same live layout.
 /// Node 2 copies the slots a merge gives it, then hears nothing of the
 /// activation that ends it: under the layout before, the moved keys are not

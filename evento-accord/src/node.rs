@@ -872,6 +872,29 @@ struct MetadataLog {
 /// Shared metadata log.
 type MetaLog = Arc<Mutex<MetadataLog>>;
 
+/// The watermark reports peers gossiped, under the live layout they were
+/// made under ([`Message::Watermark`]'s `live_since`): a report vouches for
+/// its sender's keys under that layout only, so one made under another is
+/// dropped, and never counted.
+#[derive(Default)]
+struct PeerReports {
+    /// The epoch the live layout the reports were made under became live at.
+    live_since: u64,
+    by_node: HashMap<NodeId, Timestamp>,
+}
+
+impl PeerReports {
+    /// The reports made under the live layout that became live at
+    /// `live_since`: any made under another are dropped first.
+    fn under(&mut self, live_since: u64) -> &mut HashMap<NodeId, Timestamp> {
+        if self.live_since != live_since {
+            self.live_since = live_since;
+            self.by_node.clear();
+        }
+        &mut self.by_node
+    }
+}
+
 /// What a node knows of layout transitions (see [`reconfig`]). Locked after
 /// the replica lock wherever both are held: a fence is installed, and a vote
 /// checked against the fences, under the replica lock, so no vote slips
@@ -1045,7 +1068,7 @@ pub struct Node {
     snapshot_pending: Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<Message>>>>,
     /// Latest `applied_through` gossiped by each shard peer (and self); the
     /// recovery sweep compacts below the per-shard minimum of these.
-    peer_watermarks: Arc<Mutex<HashMap<NodeId, Timestamp>>>,
+    peer_watermarks: Arc<Mutex<PeerReports>>,
     /// What the journal has been asked to truncate: the sweep calls
     /// [`compact`](Node::compact) continuously, and a journal's `truncate` is
     /// a write transaction (an fsync, and on SQLite the writer lock) even when
@@ -1168,7 +1191,7 @@ impl Node {
             metadata_turn: Arc::new(AtomicU64::new(0)),
             read_pending: Arc::new(Mutex::new(HashMap::new())),
             snapshot_pending: Arc::new(Mutex::new(HashMap::new())),
-            peer_watermarks: Arc::new(Mutex::new(HashMap::new())),
+            peer_watermarks: Arc::new(Mutex::new(PeerReports::default())),
             journal_mark: Arc::new(Mutex::new(JournalMark::default())),
             sync_coverage: Arc::new(Mutex::new((start_epoch, HashMap::new()))),
             join_proof: Arc::new(Mutex::new(None)),
@@ -1841,10 +1864,12 @@ impl Node {
     async fn prune_decisions(&self) {
         let dropped = {
             let current = self.topology.layout();
+            let live_since = self.live_since();
             let watermarks = self
                 .peer_watermarks
                 .lock()
                 .expect("watermarks poisoned")
+                .under(live_since)
                 .clone();
             self.replica
                 .lock()
@@ -2512,6 +2537,8 @@ impl Node {
     /// partitioned peer holds the min down, and an unheard-from peer blocks
     /// compaction entirely), so dropping that state is safe.
     async fn advance_watermark(&self) {
+        // The live layout the report is made, and the reports counted, under.
+        let live_since = self.live_since();
         // The disjoint replica set this node belongs to.
         let mut all_nodes = self.topology.nodes();
         let shard_peers = self.shard_peers();
@@ -2559,13 +2586,15 @@ impl Node {
                 applied_through: mine,
                 fenced,
                 copied,
+                live_since,
             },
         )
         .await;
 
         let watermark = {
             let mut absent = self.absent.lock().expect("absent poisoned");
-            let mut watermarks = self.peer_watermarks.lock().expect("watermarks poisoned");
+            let mut reports = self.peer_watermarks.lock().expect("watermarks poisoned");
+            let watermarks = reports.under(live_since);
             // Evict reports from nodes no longer in the topology, or a removed
             // peer's last (stale) watermark would hold compaction back forever.
             watermarks.retain(|node, _| all_nodes.contains(node));
@@ -2587,7 +2616,25 @@ impl Node {
             }
             complete.then_some(wm)
         };
-        if let Some(watermark) = watermark {
+        // Below its floor a write counts as applied, and anti-entropy ships
+        // none. A node the transition in progress gives slots holds, of them,
+        // every write up to the drain point once it copied them, and none
+        // after the activation, which it may install late: it compacts no
+        // further than the drain point, and not at all before that is known.
+        // A node in no shard of its live layout (dropped) compacts nothing.
+        let ceiling = {
+            let reconfig = self.reconfig.lock().expect("reconfig poisoned");
+            match reconfig
+                .transition
+                .as_ref()
+                .filter(|t| t.gainers.contains(&self.id))
+            {
+                Some(transition) => reconfig::drain_point(transition, &reconfig.reported),
+                None if shard_peers.is_empty() => None,
+                None => watermark,
+            }
+        };
+        if let Some(watermark) = watermark.zip(ceiling).map(|(w, c)| w.min(c)) {
             self.compact(watermark).await;
         }
         self.prune_decisions().await;
@@ -2675,8 +2722,10 @@ impl Node {
         };
         let now = Instant::now();
         let quorum = crate::api::slow_quorum_size(shard_peers.len());
+        let live_since = self.live_since();
         let mut absent = self.absent.lock().expect("absent poisoned");
-        let mut watermarks = self.peer_watermarks.lock().expect("watermarks poisoned");
+        let mut reports = self.peer_watermarks.lock().expect("watermarks poisoned");
+        let watermarks = reports.under(live_since);
         for &peer in shard_peers {
             if peer == self.id || absent.contains_key(&peer) {
                 continue;
@@ -2794,6 +2843,7 @@ impl Node {
                     applied_through: mine,
                     fenced: self.reportable_fence(),
                     copied: self.copied_report(),
+                    live_since: self.live_since(),
                 },
             )
             .await;
@@ -3561,6 +3611,7 @@ impl Node {
                 applied_through,
                 fenced,
                 copied,
+                live_since,
             } => {
                 // A joiner's first report ends the hold its contact kept for
                 // it (see `JoinHold`): from here on it is counted itself.
@@ -3568,10 +3619,17 @@ impl Node {
                     .lock()
                     .expect("join holds poisoned")
                     .remove(&from);
-                self.peer_watermarks
-                    .lock()
-                    .expect("watermarks poisoned")
-                    .insert(from, applied_through);
+                // Counted under this node's live layout only: one made under
+                // another vouches for other keys — a gainer's, before the
+                // activation, for none.
+                let mine = self.live_since();
+                if live_since == mine {
+                    self.peer_watermarks
+                        .lock()
+                        .expect("watermarks poisoned")
+                        .under(mine)
+                        .insert(from, applied_through);
+                }
                 let mut reconfig = self.reconfig.lock().expect("reconfig poisoned");
                 if let Some(fenced) = fenced {
                     reconfig.reported.insert(from, fenced);
@@ -6004,6 +6062,7 @@ impl Node {
         // It is at least what the contact vouched for (`JoinProof`), which
         // its hold kept every peer's compaction below meanwhile — however
         // many peers' coverage a report of this shard needs.
+        let live_since = self.live_since();
         let mine = self.report(&self.shard_peers());
         let peers: Vec<NodeId> = self
             .topology
@@ -6018,6 +6077,7 @@ impl Node {
                     applied_through: mine,
                     fenced: self.reportable_fence(),
                     copied: self.copied_report(),
+                    live_since,
                 },
             )
             .await;
@@ -6183,10 +6243,12 @@ impl Node {
         let deadline = Instant::now() + self.settings.amnesia_join_timeout;
         let mut reported = None;
         loop {
+            let live_since = self.live_since();
             reported = self
                 .peer_watermarks
                 .lock()
                 .expect("watermarks poisoned")
+                .under(live_since)
                 .get(&contact)
                 .copied()
                 .or(reported);
@@ -6590,6 +6652,7 @@ impl Node {
                             applied_through: Timestamp::MIN,
                             fenced: None,
                             copied: None,
+                            live_since: self.live_since(),
                         },
                     )
                     .await;
@@ -7011,10 +7074,12 @@ impl Node {
     /// keeping a moved slot reported past it, and every node gaining slots
     /// reported it copied them.
     fn ready_to_activate(&self, since: u64) -> Option<Timestamp> {
+        let live_since = self.live_since();
         let reports = self
             .peer_watermarks
             .lock()
             .expect("watermarks poisoned")
+            .under(live_since)
             .clone();
         let reconfig = self.reconfig.lock().expect("reconfig poisoned");
         let transition = reconfig.transition.as_ref().filter(|t| t.since == since)?;
@@ -7074,10 +7139,12 @@ impl Node {
                 reconfig.reported.clone(),
             )
         };
+        let live_since = self.live_since();
         let reports = self
             .peer_watermarks
             .lock()
             .expect("watermarks poisoned")
+            .under(live_since)
             .clone();
         let mut gained: Vec<(usize, Vec<usize>)> = reconfig::gained_slots(&live, &pending, self.id)
             .into_iter()
@@ -9496,6 +9563,7 @@ mod tests {
             },
             fenced: None,
             copied: None,
+            live_since: 0,
         };
         let micros_of = |m: Message| match m {
             Message::Watermark {
