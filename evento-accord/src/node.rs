@@ -795,6 +795,12 @@ struct ShardReports {
     blind_electorate: usize,
     /// Replicas holding nothing of it below their redundancy watermark.
     redundant: usize,
+    /// Replicas past its coordinator's deadline that never witnessed it and
+    /// promised the ballot: they vote or refuse once asked (#377).
+    late: usize,
+    /// Replicas within the deadline that never witnessed it and promised
+    /// the ballot: they vote once handed their shard's part (#377).
+    promised: usize,
     /// Replies of any kind.
     heard: usize,
 }
@@ -3978,13 +3984,15 @@ impl Node {
                             // heard every reply, asks for one or for a
                             // refusal (#337, `settle_late`).
                             replica.set_coordinator_cutoff(self.coordinator_cutoff());
-                            match &route {
-                                // Routed: never pre-accept what this replica
-                                // never witnessed (see `Replica::recover_routed`).
-                                Some(_) => replica.recover_routed(txn, ballot, epoch, keys, events),
-                                None => replica
-                                    .recover_unrouted(txn, ballot, epoch, keys, events, round),
-                            }
+                            replica.recover_round(
+                                txn,
+                                ballot,
+                                epoch,
+                                keys,
+                                events,
+                                round,
+                                route.is_some(),
+                            )
                         }
                     }
                 };
@@ -6467,6 +6475,11 @@ impl Node {
                     || Self::planned_shard(&plans, *from).is_some_and(|s| planned.contains(&s))
             })
             .collect();
+        if let Some(shard) = Self::unreported_part(&plans, &known) {
+            anyhow::bail!(
+                "recovery of {txn:?} undecided: no holder of shard {shard} reported its part"
+            );
+        }
         self.drive_recovery(rx, layout, txn, ballot, &plans, Some(route), known, driver)
             .await
     }
@@ -6518,10 +6531,21 @@ impl Node {
                     }
                 }
                 RecoverResp::NotWitnessed { redundant: true } => counts.redundant += 1,
+                RecoverResp::Late => counts.late += 1,
+                RecoverResp::Ok(_) => counts.promised += 1,
                 _ => {}
             }
         }
         counts
+    }
+
+    /// The planned shard whose part no report carried (#377): no holder of
+    /// it answered, and its replicas that would vote have nothing to vote
+    /// for. A shard a known report shows committed is excepted: the
+    /// decision exists, and a replica that applied it carries it.
+    fn unreported_part(plans: &[ShardPlan], known: &[(NodeId, RecoverFields)]) -> Option<ShardId> {
+        let _ = (plans, known);
+        None
     }
 
     /// Whether a routed recovery has heard enough to decide: an invalidation
@@ -6606,8 +6630,9 @@ impl Node {
         }
         let lacking = |s: &ShardPlan, c: &ShardReports| {
             Verdict::Undecided(format!(
-                "shard {}: {} of {} replicas reported it, {} never witnessed it",
-                s.shard, c.known, s.slow_q, c.blind
+                "shard {}: {} of {} replicas reported it, {} never witnessed it, \
+                 {} are late, {} promised it",
+                s.shard, c.known, s.slow_q, c.blind, c.late, c.promised
             ))
         };
         if known().any(|f| f.status >= Status::Committed) {

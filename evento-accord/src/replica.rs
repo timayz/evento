@@ -1034,6 +1034,27 @@ impl Replica {
         })
     }
 
+    /// Handles a `BeginRecovery` under `ballot`, of `round`, `routed` when
+    /// it came wrapped in the transaction's route: an unrouted one as
+    /// [`recover_unrouted`](Self::recover_unrouted), a routed one as
+    /// [`recover_routed`](Self::recover_routed).
+    #[allow(clippy::too_many_arguments)]
+    pub fn recover_round(
+        &mut self,
+        txn: TxnId,
+        ballot: Ballot,
+        epoch: u64,
+        keys: Vec<Key>,
+        events: Vec<Event>,
+        round: RecoveryRound,
+        routed: bool,
+    ) -> Result<RoutedRecovery, Ballot> {
+        if routed {
+            return self.recover_routed(txn, ballot, epoch, keys, events);
+        }
+        self.recover_unrouted(txn, ballot, epoch, keys, events, round)
+    }
+
     /// Handles an unrouted `BeginRecovery` under `ballot`, of `round`: as
     /// [`recover`](Self::recover), but a [`compacted`](Self::compacted)
     /// transaction is answered from below the watermark, as
