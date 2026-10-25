@@ -411,9 +411,9 @@ pub enum Message {
     /// transaction below it, and the joiner copies that state, so once the
     /// snapshot is installed the joiner may report it too — without it, its
     /// first report predates the coverage proof a shard of four or more
-    /// replicas needs, and peers that gave it up keep telling it to rejoin. A
-    /// separate message rather than a field of `SyncData`, so a joiner that
-    /// predates it simply sheds it and joins as before.
+    /// replicas needs, and peers that gave it up keep telling it to rejoin. It
+    /// follows the header on the same link, so it is in by the time the joiner
+    /// installs the snapshot; an anti-entropy `SyncData` has no vouch to carry.
     JoinProof {
         id: u64,
         epoch: u64,
