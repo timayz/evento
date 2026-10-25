@@ -1377,19 +1377,6 @@ impl Replica {
             .collect()
     }
 
-    /// Every applied command, in execution-timestamp order — the committed state
-    /// a joining node bootstraps from.
-    pub fn export_applied(&self) -> Vec<CommandState> {
-        let mut applied: Vec<CommandState> = self
-            .commands
-            .values()
-            .filter(|cmd| cmd.status == Status::Applied)
-            .cloned()
-            .collect();
-        applied.sort_by_key(|cmd| (cmd.execute_at, cmd.txn));
-        applied
-    }
-
     /// The anti-entropy digest of this replica's applied state: its redundancy
     /// floor plus the ids of every applied (un-compacted) command. A peer ships
     /// back only the applied commands the digest is missing, instead of its

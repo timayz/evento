@@ -65,9 +65,11 @@ pub const MAGIC: [u8; 2] = *b"Ac";
 /// layout (a new/reordered [`CommandState`](crate::message::CommandState) or
 /// [`Message`](crate::message::Message) field); add the matching decode branch then.
 ///
-/// 2: events carry their tenant. No reader for version 1: evento-accord has not
-/// been released, so a journal of it is wiped and the node re-bootstrapped.
-pub const FORMAT_VERSION: u8 = 2;
+/// 2: events carry their tenant. 3: the inline join paths are gone
+/// (`SnapshotRequest`, `SyncRequest::snapshot`, `SyncData::snapshot`). No
+/// reader for older versions: evento-accord has not been released, so a
+/// journal of one is wiped and the node re-bootstrapped.
+pub const FORMAT_VERSION: u8 = 3;
 
 /// Length of the fixed header: `MAGIC (2) + version (1) + kind (1)`.
 const HEADER_LEN: usize = 4;

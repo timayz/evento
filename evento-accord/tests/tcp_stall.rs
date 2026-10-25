@@ -27,11 +27,9 @@ fn applied(n: u64) -> Message {
 
 /// A frame of about `bytes`, to fill the socket buffers quickly.
 fn bulky(bytes: usize) -> Message {
-    Message::SyncData {
+    Message::SnapshotPage {
         id: 0,
-        watermark: Timestamp::MIN,
-        coverage: Timestamp::MIN,
-        snapshot: vec![Event {
+        events: vec![Event {
             aggregate_type: "test/Account".into(),
             aggregate_id: "a".into(),
             version: 1,
@@ -39,7 +37,7 @@ fn bulky(bytes: usize) -> Message {
             data: vec![7; bytes],
             ..Default::default()
         }],
-        commands: Vec::new(),
+        next: None,
     }
 }
 

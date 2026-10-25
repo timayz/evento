@@ -348,9 +348,9 @@ impl InMemoryNetwork {
         *self.frame_cap.lock().expect("network poisoned") = cap;
     }
 
-    /// Drops every message `filter` matches from now on (`None` delivers
-    /// everything again) — a peer on an older build, which sheds a variant
-    /// it cannot decode. For rolling-upgrade tests.
+    /// Drops every message `filter` matches from now on, on every link
+    /// (`None` delivers everything again) — one kind of message lost
+    /// everywhere, as a peer that cannot decode it sheds it.
     pub fn set_unreadable(&self, filter: Option<MessageFilter>) {
         *self.unreadable.lock().expect("network poisoned") = filter;
     }

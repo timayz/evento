@@ -1379,8 +1379,10 @@ async fn coverage_of(
             node,
             Message::SyncRequest {
                 id: 1,
-                snapshot: false,
-                known: None,
+                known: evento_accord::message::SyncKnown {
+                    since: evento_accord::Timestamp::MIN,
+                    txns: Vec::new(),
+                },
             },
         )
         .await
