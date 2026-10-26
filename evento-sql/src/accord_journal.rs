@@ -204,6 +204,36 @@ where
         Ok(row.map(|(bytes,)| bytes))
     }
 
+    /// Upserts `rows` (`k`, `v`) into `accord_meta` in one statement, on the
+    /// pool or inside a transaction. Each key at most once per call: a
+    /// multi-row `ON CONFLICT DO UPDATE` may not touch one row twice on
+    /// Postgres.
+    async fn upsert_meta<'e, E>(executor: E, rows: &[(&str, &[u8])]) -> anyhow::Result<()>
+    where
+        E: sqlx::Executor<'e, Database = DB>,
+    {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut statement = Query::insert()
+            .into_table(AccordMeta::Table)
+            .columns([AccordMeta::K, AccordMeta::V])
+            .on_conflict(
+                OnConflict::column(AccordMeta::K)
+                    .update_column(AccordMeta::V)
+                    .to_owned(),
+            )
+            .to_owned();
+        for (key, value) in rows {
+            statement.values_panic([(*key).into(), (*value).into()]);
+        }
+        let (sql, values) = build_sqlx::<DB, _>(&statement);
+        sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
+            .execute(executor)
+            .await?;
+        Ok(())
+    }
+
     /// The values of every `accord_meta` row whose key starts with `prefix`.
     async fn load_meta_prefixed(
         conn: &mut DB::Connection,
@@ -394,39 +424,15 @@ where
             .filter(|(_, key, _)| seen.insert(key.as_str()))
             .collect();
         meta_rows.reverse();
-        for chunk in meta_rows.chunks(ROWS_PER_STATEMENT) {
-            let mut statement = Query::insert()
-                .into_table(AccordMeta::Table)
-                .columns([AccordMeta::K, AccordMeta::V])
-                .on_conflict(
-                    OnConflict::column(AccordMeta::K)
-                        .update_column(AccordMeta::V)
-                        .to_owned(),
-                )
-                .to_owned();
-            for (_, key, value) in chunk {
-                statement.values_panic([key.clone().into(), value.clone().into()]);
-            }
-            let (sql, values) = build_sqlx::<DB, _>(&statement);
-            sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
-                .execute(&mut *tx)
-                .await?;
-        }
-        for (key, value) in &kept {
-            let upsert = Query::insert()
-                .into_table(AccordMeta::Table)
-                .columns([AccordMeta::K, AccordMeta::V])
-                .values_panic([(*key).into(), value.clone().into()])
-                .on_conflict(
-                    OnConflict::column(AccordMeta::K)
-                        .update_column(AccordMeta::V)
-                        .to_owned(),
-                )
-                .to_owned();
-            let (sql, values) = build_sqlx::<DB, _>(&upsert);
-            sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
-                .execute(&mut *tx)
-                .await?;
+        // The kept rows (one per `k`, keys disjoint from the per-transaction
+        // prefixes) ride in the same multi-row statements.
+        let rows: Vec<(&str, &[u8])> = meta_rows
+            .iter()
+            .map(|(_, key, value)| (key.as_str(), value.as_slice()))
+            .chain(kept.iter().map(|(key, value)| (*key, value.as_slice())))
+            .collect();
+        for chunk in rows.chunks(ROWS_PER_STATEMENT) {
+            Self::upsert_meta(&mut *tx, chunk).await?;
         }
         tx.commit().await?;
 
@@ -503,20 +509,7 @@ where
                 .await?;
         }
 
-        let upsert = Query::insert()
-            .into_table(AccordMeta::Table)
-            .columns([AccordMeta::K, AccordMeta::V])
-            .values_panic([WATERMARK_KEY.into(), watermark.into()])
-            .on_conflict(
-                OnConflict::column(AccordMeta::K)
-                    .update_column(AccordMeta::V)
-                    .to_owned(),
-            )
-            .to_owned();
-        let (sql, values) = build_sqlx::<DB, _>(&upsert);
-        sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
-            .execute(&mut *tx)
-            .await?;
+        Self::upsert_meta(&mut *tx, &[(WATERMARK_KEY, watermark.as_slice())]).await?;
 
         tx.commit().await?;
 
@@ -556,20 +549,7 @@ where
             return Ok(());
         }
         let value = encode_tagged(RecordKind::RejoinBounds, &bounds.to_vec())?;
-        let upsert = Query::insert()
-            .into_table(AccordMeta::Table)
-            .columns([AccordMeta::K, AccordMeta::V])
-            .values_panic([REJOIN_BOUNDS_KEY.into(), value.into()])
-            .on_conflict(
-                OnConflict::column(AccordMeta::K)
-                    .update_column(AccordMeta::V)
-                    .to_owned(),
-            )
-            .to_owned();
-        let (sql, values) = build_sqlx::<DB, _>(&upsert);
-        sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
-            .execute(&self.pool)
-            .await?;
+        Self::upsert_meta(&self.pool, &[(REJOIN_BOUNDS_KEY, value.as_slice())]).await?;
         Ok(())
     }
 
@@ -582,20 +562,7 @@ where
 
     async fn save_clock_bound(&self, micros: u64) -> anyhow::Result<()> {
         let value = encode_tagged(RecordKind::ClockBound, &micros)?;
-        let upsert = Query::insert()
-            .into_table(AccordMeta::Table)
-            .columns([AccordMeta::K, AccordMeta::V])
-            .values_panic([CLOCK_BOUND_KEY.into(), value.into()])
-            .on_conflict(
-                OnConflict::column(AccordMeta::K)
-                    .update_column(AccordMeta::V)
-                    .to_owned(),
-            )
-            .to_owned();
-        let (sql, values) = build_sqlx::<DB, _>(&upsert);
-        sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
-            .execute(&self.pool)
-            .await?;
+        Self::upsert_meta(&self.pool, &[(CLOCK_BOUND_KEY, value.as_slice())]).await?;
         Ok(())
     }
 
@@ -660,20 +627,7 @@ where
 
     async fn save_amnesia_fence(&self, fence: &AmnesiaFence) -> anyhow::Result<()> {
         let value = encode_tagged(RecordKind::AmnesiaFence, fence)?;
-        let upsert = Query::insert()
-            .into_table(AccordMeta::Table)
-            .columns([AccordMeta::K, AccordMeta::V])
-            .values_panic([AMNESIA_FENCE_KEY.into(), value.into()])
-            .on_conflict(
-                OnConflict::column(AccordMeta::K)
-                    .update_column(AccordMeta::V)
-                    .to_owned(),
-            )
-            .to_owned();
-        let (sql, values) = build_sqlx::<DB, _>(&upsert);
-        sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
-            .execute(&self.pool)
-            .await?;
+        Self::upsert_meta(&self.pool, &[(AMNESIA_FENCE_KEY, value.as_slice())]).await?;
         Ok(())
     }
 
@@ -686,20 +640,7 @@ where
 
     async fn save_fences(&self, fences: &[FenceRecord]) -> anyhow::Result<()> {
         let value = encode_tagged(RecordKind::Fences, &fences.to_vec())?;
-        let upsert = Query::insert()
-            .into_table(AccordMeta::Table)
-            .columns([AccordMeta::K, AccordMeta::V])
-            .values_panic([FENCES_KEY.into(), value.into()])
-            .on_conflict(
-                OnConflict::column(AccordMeta::K)
-                    .update_column(AccordMeta::V)
-                    .to_owned(),
-            )
-            .to_owned();
-        let (sql, values) = build_sqlx::<DB, _>(&upsert);
-        sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
-            .execute(&self.pool)
-            .await?;
+        Self::upsert_meta(&self.pool, &[(FENCES_KEY, value.as_slice())]).await?;
         Ok(())
     }
 
