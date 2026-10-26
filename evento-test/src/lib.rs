@@ -5255,6 +5255,12 @@ pub async fn delete_stream<E: Executor + Clone>(executor: &E) -> anyhow::Result<
         .await?;
 
     let ids = |r: ReadResult<Event>| r.edges.into_iter().map(|e| e.node.id).collect::<Vec<_>>();
+    // `kept` and `other_tenant` share a stamp and a version, so a read orders
+    // them by their random ids: compare those two as a set.
+    let sorted = |mut ids: Vec<Ulid>| {
+        ids.sort();
+        ids
+    };
     let read = |filters: Vec<EventFilter>, routing: Option<RoutingKey>, tenant: TenantFilter| {
         let executor = executor.clone();
         async move {
@@ -5304,13 +5310,15 @@ pub async fn delete_stream<E: Executor + Clone>(executor: &E) -> anyhow::Result<
         "by aggregate id and name"
     );
     assert_eq!(
-        read(
-            vec![EventFilter::by_type_raw(agg_type)],
-            None,
-            TenantFilter::All
-        )
-        .await?,
-        vec![kept.id, other_tenant.id],
+        sorted(
+            read(
+                vec![EventFilter::by_type_raw(agg_type)],
+                None,
+                TenantFilter::All
+            )
+            .await?
+        ),
+        sorted(vec![kept.id, other_tenant.id]),
         "by type: only the survivors"
     );
     assert_eq!(
@@ -5324,13 +5332,15 @@ pub async fn delete_stream<E: Executor + Clone>(executor: &E) -> anyhow::Result<
         "by type, in the default tenant"
     );
     assert_eq!(
-        read(
-            vec![EventFilter::by_event_raw(agg_type, "Opened")],
-            None,
-            TenantFilter::All
-        )
-        .await?,
-        vec![kept.id, other_tenant.id],
+        sorted(
+            read(
+                vec![EventFilter::by_event_raw(agg_type, "Opened")],
+                None,
+                TenantFilter::All
+            )
+            .await?
+        ),
+        sorted(vec![kept.id, other_tenant.id]),
         "by type and name"
     );
     assert_eq!(
