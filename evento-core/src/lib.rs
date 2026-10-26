@@ -337,6 +337,28 @@ mod tests {
     use super::*;
     use crate::cursor::Bind;
 
+    /// `check` and `check_len` share the one length bound; they differ only
+    /// on the empty tenant, which a write may name (the default tenant) and
+    /// a session may not.
+    #[test]
+    fn tenant_checks_share_the_length_bound() {
+        let at_bound = "t".repeat(MAX_TENANT_LEN);
+        let past_bound = "t".repeat(MAX_TENANT_LEN + 1);
+
+        assert_eq!(TenantError::check(""), Err(TenantError::Empty));
+        assert_eq!(TenantError::check_len(""), Ok(()));
+        assert_eq!(TenantError::check(&at_bound), Ok(()));
+        assert_eq!(TenantError::check_len(&at_bound), Ok(()));
+        assert_eq!(
+            TenantError::check(&past_bound),
+            Err(TenantError::TooLong(MAX_TENANT_LEN + 1))
+        );
+        assert_eq!(
+            TenantError::check_len(&past_bound),
+            Err(TenantError::TooLong(MAX_TENANT_LEN + 1))
+        );
+    }
+
     fn event_at(timestamp: u64, timestamp_subsec: u32) -> Event {
         Event {
             id: Ulid::generate(),
