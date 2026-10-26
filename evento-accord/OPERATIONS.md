@@ -228,7 +228,14 @@ refuses anything else before a vote, and a node never installs it.
   copy them; then the next epoch installs the new layout. Meanwhile, writes to the
   moving keys fail with `TopologyChanging` (`WriteError::Unavailable` through
   `AccordExecutor`): plan for about `compaction_margin` + two clock skews + a few
-  `anti_entropy_interval`s — about 2 s with the defaults — plus the copies. The
+  `anti_entropy_interval`s — about 2 s with the defaults — plus the tail of the
+  copies. Before it proposes the change, `change_topology` has every node that
+  gains slots copy them while writes still flow (a *pre-seed*, up to
+  `preseed_timeout`, 10 s by default: raise it for a large range), so the copy under
+  the fence brings only what landed since, from the sources' stable point on. A
+  gainer that does not answer in time does not hold the change back: the fenced copy
+  brings its slots whole. Watch `accord_preseed_events_total` against
+  `accord_range_copy_events_total`. The
   transition is driven by the recovery sweep's watermark gossip, anti-entropy and
   copies: run `start_recovery` on every node, new ones included. It waits for a slow
   quorum of every shard, for every node that gains slots, and for every node that

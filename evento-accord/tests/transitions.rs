@@ -331,4 +331,12 @@ async fn adding_one_replica_installs_at_once() {
         .write(vec![event("acc", 1)])
         .await
         .expect("writes go on");
+    // The new replica was not pre-seeded (#373): it joins, over an empty
+    // store.
+    assert_eq!(joiner.node.metrics().preseed_passes, 0);
+    joiner
+        .node
+        .join(NodeId(0))
+        .await
+        .expect("joins over an empty store");
 }
