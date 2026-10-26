@@ -28,18 +28,12 @@
 
 use std::sync::Mutex;
 
-#[cfg(feature = "mysql")]
-use sea_query::MysqlQueryBuilder;
-#[cfg(feature = "postgres")]
-use sea_query::PostgresQueryBuilder;
-#[cfg(feature = "sqlite")]
-use sea_query::SqliteQueryBuilder;
 use sea_query::{ColumnDef, Expr, ExprTrait, Iden, OnConflict, Query, Table};
-use sea_query_sqlx::SqlxBinder;
 use sqlx::{Database, Pool};
 
 use async_trait::async_trait;
 
+use crate::dialect::{build_ddl, build_sqlx};
 use evento_accord::format::{decode_tagged, encode_tagged, RecordKind};
 use evento_accord::{
     AcceptorRecord, AmnesiaFence, Ballot, CommandState, ConfigEntry, CopyState, DecisionRecord,
@@ -184,32 +178,6 @@ impl<DB: Database> SqlJournal<DB> {
     pub async fn close(&self) {
         self.pool.close().await;
     }
-
-    /// Renders a value-bound statement for this pool's dialect.
-    fn build_sqlx<S: SqlxBinder>(statement: &S) -> (String, sea_query_sqlx::SqlxValues) {
-        match DB::NAME {
-            #[cfg(feature = "sqlite")]
-            "SQLite" => statement.build_sqlx(SqliteQueryBuilder),
-            #[cfg(feature = "mysql")]
-            "MySQL" => statement.build_sqlx(MysqlQueryBuilder),
-            #[cfg(feature = "postgres")]
-            "PostgreSQL" => statement.build_sqlx(PostgresQueryBuilder),
-            name => panic!("'{name}' not supported, consider using SQLite, PostgreSQL or MySQL"),
-        }
-    }
-
-    /// Renders a (value-free) schema statement for this pool's dialect.
-    fn build_ddl(statement: &sea_query::TableCreateStatement) -> String {
-        match DB::NAME {
-            #[cfg(feature = "sqlite")]
-            "SQLite" => statement.to_string(SqliteQueryBuilder),
-            #[cfg(feature = "mysql")]
-            "MySQL" => statement.to_string(MysqlQueryBuilder),
-            #[cfg(feature = "postgres")]
-            "PostgreSQL" => statement.to_string(PostgresQueryBuilder),
-            name => panic!("'{name}' not supported, consider using SQLite, PostgreSQL or MySQL"),
-        }
-    }
 }
 
 impl<DB> SqlJournal<DB>
@@ -228,7 +196,7 @@ where
             .from(AccordMeta::Table)
             .and_where(Expr::col(AccordMeta::K).eq(Expr::value(key)))
             .to_owned();
-        let (sql, values) = Self::build_sqlx(&statement);
+        let (sql, values) = build_sqlx::<DB, _>(&statement);
         let row =
             sqlx::query_as_with::<DB, (Vec<u8>,), _>(sqlx::AssertSqlSafe(sql.as_str()), values)
                 .fetch_optional(&self.pool)
@@ -246,7 +214,7 @@ where
             .from(AccordMeta::Table)
             .and_where(Expr::col(AccordMeta::K).like(like_prefix(prefix)))
             .to_owned();
-        let (sql, values) = Self::build_sqlx(&statement);
+        let (sql, values) = build_sqlx::<DB, _>(&statement);
         let rows =
             sqlx::query_as_with::<DB, (Vec<u8>,), _>(sqlx::AssertSqlSafe(sql.as_str()), values)
                 .fetch_all(&mut *conn)
@@ -334,7 +302,7 @@ where
                 .to_owned(),
         ];
         for table in &tables {
-            let sql = Self::build_ddl(table);
+            let sql = build_ddl::<DB>(table);
             sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
                 .execute(&self.pool)
                 .await?;
@@ -413,7 +381,7 @@ where
             for (key, value) in chunk {
                 statement.values_panic([key.clone().into(), value.clone().into()]);
             }
-            let (sql, values) = Self::build_sqlx(&statement);
+            let (sql, values) = build_sqlx::<DB, _>(&statement);
             sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
                 .execute(&mut *tx)
                 .await?;
@@ -439,7 +407,7 @@ where
             for (_, key, value) in chunk {
                 statement.values_panic([key.clone().into(), value.clone().into()]);
             }
-            let (sql, values) = Self::build_sqlx(&statement);
+            let (sql, values) = build_sqlx::<DB, _>(&statement);
             sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
                 .execute(&mut *tx)
                 .await?;
@@ -455,7 +423,7 @@ where
                         .to_owned(),
                 )
                 .to_owned();
-            let (sql, values) = Self::build_sqlx(&upsert);
+            let (sql, values) = build_sqlx::<DB, _>(&upsert);
             sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
                 .execute(&mut *tx)
                 .await?;
@@ -505,7 +473,7 @@ where
             .from_table(AccordCommands::Table)
             .and_where(Expr::col(AccordCommands::Txn).lt(Expr::value(bound.clone())))
             .to_owned();
-        let (sql, values) = Self::build_sqlx(&delete);
+        let (sql, values) = build_sqlx::<DB, _>(&delete);
         sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
             .execute(&mut *tx)
             .await?;
@@ -529,7 +497,7 @@ where
                 .from_table(AccordMeta::Table)
                 .and_where(Expr::col(AccordMeta::K).is_in(chunk.iter().cloned()))
                 .to_owned();
-            let (sql, values) = Self::build_sqlx(&delete);
+            let (sql, values) = build_sqlx::<DB, _>(&delete);
             sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
                 .execute(&mut *tx)
                 .await?;
@@ -545,7 +513,7 @@ where
                     .to_owned(),
             )
             .to_owned();
-        let (sql, values) = Self::build_sqlx(&upsert);
+        let (sql, values) = build_sqlx::<DB, _>(&upsert);
         sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
             .execute(&mut *tx)
             .await?;
@@ -581,7 +549,7 @@ where
                 .from_table(AccordMeta::Table)
                 .and_where(Expr::col(AccordMeta::K).eq(Expr::value(REJOIN_BOUNDS_KEY)))
                 .to_owned();
-            let (sql, values) = Self::build_sqlx(&delete);
+            let (sql, values) = build_sqlx::<DB, _>(&delete);
             sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
                 .execute(&self.pool)
                 .await?;
@@ -598,7 +566,7 @@ where
                     .to_owned(),
             )
             .to_owned();
-        let (sql, values) = Self::build_sqlx(&upsert);
+        let (sql, values) = build_sqlx::<DB, _>(&upsert);
         sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
             .execute(&self.pool)
             .await?;
@@ -624,7 +592,7 @@ where
                     .to_owned(),
             )
             .to_owned();
-        let (sql, values) = Self::build_sqlx(&upsert);
+        let (sql, values) = build_sqlx::<DB, _>(&upsert);
         sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
             .execute(&self.pool)
             .await?;
@@ -702,7 +670,7 @@ where
                     .to_owned(),
             )
             .to_owned();
-        let (sql, values) = Self::build_sqlx(&upsert);
+        let (sql, values) = build_sqlx::<DB, _>(&upsert);
         sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
             .execute(&self.pool)
             .await?;
@@ -728,7 +696,7 @@ where
                     .to_owned(),
             )
             .to_owned();
-        let (sql, values) = Self::build_sqlx(&upsert);
+        let (sql, values) = build_sqlx::<DB, _>(&upsert);
         sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
             .execute(&self.pool)
             .await?;
@@ -811,7 +779,7 @@ where
                 .from_table(AccordMeta::Table)
                 .and_where(Expr::col(AccordMeta::K).is_in(chunk.iter().cloned()))
                 .to_owned();
-            let (sql, values) = Self::build_sqlx(&delete);
+            let (sql, values) = build_sqlx::<DB, _>(&delete);
             sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
                 .execute(&self.pool)
                 .await?;
@@ -825,7 +793,7 @@ where
             .from(AccordCommands::Table)
             .and_where(Expr::col(AccordCommands::Txn).eq(Expr::value(txn_key(txn))))
             .to_owned();
-        let (sql, values) = Self::build_sqlx(&statement);
+        let (sql, values) = build_sqlx::<DB, _>(&statement);
         let row =
             sqlx::query_as_with::<DB, (Vec<u8>,), _>(sqlx::AssertSqlSafe(sql.as_str()), values)
                 .fetch_optional(&self.pool)
@@ -841,7 +809,7 @@ where
             .column(AccordCommands::Data)
             .from(AccordCommands::Table)
             .to_owned();
-        let (sql, values) = Self::build_sqlx(&statement);
+        let (sql, values) = build_sqlx::<DB, _>(&statement);
         let rows =
             sqlx::query_as_with::<DB, (Vec<u8>,), _>(sqlx::AssertSqlSafe(sql.as_str()), values)
                 .fetch_all(&self.pool)
@@ -867,7 +835,7 @@ where
                     .to_owned(),
             )
             .to_owned();
-        let (sql, values) = Self::build_sqlx(&statement);
+        let (sql, values) = build_sqlx::<DB, _>(&statement);
         sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
             .execute(&self.pool)
             .await?;
@@ -899,7 +867,7 @@ where
             let value = encode_tagged(RecordKind::MetadataEntry, entry)?;
             statement.values_panic([(*epoch as i64).into(), value.into()]);
         }
-        let (sql, values) = Self::build_sqlx(&statement);
+        let (sql, values) = build_sqlx::<DB, _>(&statement);
         sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
             .execute(&self.pool)
             .await?;
@@ -912,7 +880,7 @@ where
             .from(AccordMetadataLog::Table)
             .order_by(AccordMetadataLog::Epoch, sea_query::Order::Asc)
             .to_owned();
-        let (sql, values) = Self::build_sqlx(&statement);
+        let (sql, values) = build_sqlx::<DB, _>(&statement);
         let rows =
             sqlx::query_as_with::<DB, (i64, Vec<u8>), _>(sqlx::AssertSqlSafe(sql.as_str()), values)
                 .fetch_all(&self.pool)
@@ -939,7 +907,7 @@ where
                     .to_owned(),
             )
             .to_owned();
-        let (sql, values) = Self::build_sqlx(&statement);
+        let (sql, values) = build_sqlx::<DB, _>(&statement);
         sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
             .execute(&self.pool)
             .await?;
@@ -952,7 +920,7 @@ where
             .from(AccordAcceptors::Table)
             .order_by(AccordAcceptors::Epoch, sea_query::Order::Asc)
             .to_owned();
-        let (sql, values) = Self::build_sqlx(&statement);
+        let (sql, values) = build_sqlx::<DB, _>(&statement);
         let rows =
             sqlx::query_as_with::<DB, (i64, Vec<u8>), _>(sqlx::AssertSqlSafe(sql.as_str()), values)
                 .fetch_all(&self.pool)
