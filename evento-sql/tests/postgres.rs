@@ -388,3 +388,10 @@ async fn postgres_tenant_snapshots_are_isolated() -> anyhow::Result<()> {
     let executor = create_postgres_executor("tenant_snapshots_are_isolated").await?;
     evento_test::tenant_snapshots_are_isolated(&executor).await
 }
+
+#[tokio::test]
+async fn postgres_delete_stream() -> anyhow::Result<()> {
+    let executor = create_postgres_executor("delete_stream").await?;
+
+    evento_test::delete_stream(&executor).await
+}

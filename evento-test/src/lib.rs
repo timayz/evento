@@ -5201,3 +5201,200 @@ mod tenant_view {
             .handler(on_deposited())
     }
 }
+
+/// Scenario: `delete_stream` removes one stream — its events and every index
+/// entry that led to them — and nothing else, so the stream can be written
+/// again from its first version.
+///
+/// The stream's projection snapshots stay: events are immutable, so a snapshot
+/// at version N is still a valid prefix of a stream copied back in.
+pub async fn delete_stream<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
+    use evento::RoutingKey;
+
+    let agg_type = "evento/DeleteStreamTest";
+    let mk = |tenant: &str, id: &str, version: u16, name: &str, routing_key: Option<&str>| Event {
+        id: Ulid::generate(),
+        aggregate_id: id.to_owned(),
+        aggregate_type: agg_type.to_owned(),
+        version,
+        name: name.to_owned(),
+        routing_key: routing_key.map(str::to_owned),
+        tenant: tenant.to_owned(),
+        data: vec![],
+        metadata: Default::default(),
+        timestamp: 1_000 + u64::from(version),
+        timestamp_subsec: 0,
+    };
+    let gone = vec![
+        mk("", "gone", 1, "Opened", Some("rk")),
+        mk("", "gone", 2, "Opened", Some("rk")),
+        mk("", "gone", 3, "Closed", Some("rk")),
+    ];
+    // Survivors: another stream under the same key, and the same aggregate id
+    // in another tenant (a different stream).
+    let kept = mk("", "kept", 1, "Opened", Some("rk"));
+    let other_tenant = mk("t2", "gone", 1, "Opened", None);
+    executor.replicate(gone.clone()).await?;
+    executor
+        .replicate(vec![kept.clone(), other_tenant.clone()])
+        .await?;
+    executor
+        .save_snapshot(
+            String::new(),
+            agg_type.to_owned(),
+            "balance".to_owned(),
+            "1".to_owned(),
+            "gone".to_owned(),
+            vec![1, 2, 3],
+            cursor::Value("snap".to_owned()),
+        )
+        .await?;
+
+    executor
+        .delete_stream(String::new(), agg_type.to_owned(), "gone".to_owned())
+        .await?;
+
+    let ids = |r: ReadResult<Event>| r.edges.into_iter().map(|e| e.node.id).collect::<Vec<_>>();
+    let read = |filters: Vec<EventFilter>, routing: Option<RoutingKey>, tenant: TenantFilter| {
+        let executor = executor.clone();
+        async move {
+            executor
+                .read(
+                    (!filters.is_empty()).then(|| filters.into()),
+                    routing,
+                    tenant,
+                    Args::forward(100, None),
+                    None,
+                )
+                .await
+                .map(ids)
+        }
+    };
+
+    // Every way of reaching the stream finds nothing — only the other
+    // tenant's stream of the same id, where a read of every tenant looks too.
+    assert_eq!(
+        read(
+            vec![EventFilter::by_id_raw(agg_type, "gone")],
+            None,
+            TenantFilter::All
+        )
+        .await?,
+        vec![other_tenant.id],
+        "by aggregate id"
+    );
+    assert!(
+        read(
+            vec![EventFilter::by_id_raw(agg_type, "gone")],
+            None,
+            TenantFilter::Only(String::new())
+        )
+        .await?
+        .is_empty(),
+        "by aggregate id, in its tenant"
+    );
+    assert!(
+        read(
+            vec![EventFilter::exact_raw(agg_type, "gone", "Closed")],
+            None,
+            TenantFilter::All
+        )
+        .await?
+        .is_empty(),
+        "by aggregate id and name"
+    );
+    assert_eq!(
+        read(
+            vec![EventFilter::by_type_raw(agg_type)],
+            None,
+            TenantFilter::All
+        )
+        .await?,
+        vec![kept.id, other_tenant.id],
+        "by type: only the survivors"
+    );
+    assert_eq!(
+        read(
+            vec![EventFilter::by_type_raw(agg_type)],
+            None,
+            TenantFilter::Only(String::new())
+        )
+        .await?,
+        vec![kept.id],
+        "by type, in the default tenant"
+    );
+    assert_eq!(
+        read(
+            vec![EventFilter::by_event_raw(agg_type, "Opened")],
+            None,
+            TenantFilter::All
+        )
+        .await?,
+        vec![kept.id, other_tenant.id],
+        "by type and name"
+    );
+    assert_eq!(
+        read(
+            vec![EventFilter::by_type_raw(agg_type)],
+            Some(RoutingKey::Value(Some("rk".to_owned()))),
+            TenantFilter::All
+        )
+        .await?,
+        vec![kept.id],
+        "by routing key"
+    );
+    assert_eq!(
+        executor
+            .latest_version(String::new(), agg_type.to_owned(), "gone".to_owned())
+            .await?,
+        0,
+        "the stream has no version left"
+    );
+    assert_eq!(
+        executor
+            .latest_version("t2".to_owned(), agg_type.to_owned(), "gone".to_owned())
+            .await?,
+        1,
+        "the same id in another tenant is another stream"
+    );
+    assert!(
+        executor
+            .get_snapshot(
+                String::new(),
+                agg_type.to_owned(),
+                "balance".to_owned(),
+                "1".to_owned(),
+                "gone".to_owned(),
+            )
+            .await?
+            .is_some(),
+        "snapshots stay"
+    );
+
+    // Deleting what is not there is not an error.
+    executor
+        .delete_stream(String::new(), agg_type.to_owned(), "gone".to_owned())
+        .await?;
+
+    // The stream can come back from its first version — what a replica that
+    // regains a key range does.
+    executor.replicate(gone.clone()).await?;
+    assert_eq!(
+        read(
+            vec![EventFilter::by_id_raw(agg_type, "gone")],
+            None,
+            TenantFilter::Only(String::new())
+        )
+        .await?,
+        gone.iter().map(|e| e.id).collect::<Vec<_>>(),
+        "written again"
+    );
+    assert_eq!(
+        executor
+            .latest_version(String::new(), agg_type.to_owned(), "gone".to_owned())
+            .await?,
+        3
+    );
+
+    Ok(())
+}

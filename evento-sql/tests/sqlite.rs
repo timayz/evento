@@ -584,3 +584,10 @@ async fn sqlite_tenant_snapshots_are_isolated() -> anyhow::Result<()> {
     let executor = create_sqlite_executor("tenant_snapshots_are_isolated").await?;
     evento_test::tenant_snapshots_are_isolated(&executor).await
 }
+
+#[tokio::test]
+async fn sqlite_delete_stream() -> anyhow::Result<()> {
+    let executor = create_sqlite_executor("delete_stream").await?;
+
+    evento_test::delete_stream(&executor).await
+}

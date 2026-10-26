@@ -946,6 +946,28 @@ where
 
         Ok(())
     }
+
+    async fn delete_stream(
+        &self,
+        tenant: String,
+        aggregate_type: String,
+        aggregate_id: String,
+    ) -> anyhow::Result<()> {
+        let statement = Query::delete()
+            .from_table(Event::Table)
+            .and_where(Expr::col(Event::Tenant).eq(Expr::value(tenant)))
+            .and_where(Expr::col(Event::AggregatorType).eq(Expr::value(aggregate_type)))
+            .and_where(Expr::col(Event::AggregatorId).eq(Expr::value(aggregate_id)))
+            .to_owned();
+
+        let (sql, values) = Self::build_sqlx(statement);
+
+        sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
 }
 
 impl<DB> Sql<DB>

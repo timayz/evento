@@ -598,4 +598,17 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
             .delete_snapshot(tenant, aggregate_type, projection, id)
             .await
     }
+
+    async fn delete_stream(
+        &self,
+        tenant: String,
+        aggregate_type: String,
+        aggregate_id: String,
+    ) -> anyhow::Result<()> {
+        // A maintenance call on this node's own store, not a replicated
+        // write (see `Node`'s range drops).
+        self.local
+            .delete_stream(tenant, aggregate_type, aggregate_id)
+            .await
+    }
 }

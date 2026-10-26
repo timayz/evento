@@ -335,3 +335,9 @@ async fn fjall_tenant_snapshots_are_isolated() -> anyhow::Result<()> {
     let executor = Fjall::temporary()?;
     evento_test::tenant_snapshots_are_isolated(&executor).await
 }
+
+#[tokio::test]
+async fn fjall_delete_stream() -> anyhow::Result<()> {
+    let executor = Fjall::temporary()?;
+    evento_test::delete_stream(&executor).await
+}
