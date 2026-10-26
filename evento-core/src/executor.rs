@@ -69,6 +69,16 @@ impl TenantError {
         if tenant.is_empty() {
             return Err(TenantError::Empty);
         }
+        Self::check_len(tenant)
+    }
+
+    /// Checks only that a store can keep `tenant`: the empty tenant passes,
+    /// since a write that names no tenant lands in the default one.
+    ///
+    /// The one definition of the length bound, shared with
+    /// [`check`](Self::check), so a write and a session can never disagree
+    /// on [`MAX_TENANT_LEN`].
+    pub fn check_len(tenant: &str) -> Result<(), TenantError> {
         if tenant.len() > MAX_TENANT_LEN {
             return Err(TenantError::TooLong(tenant.len()));
         }

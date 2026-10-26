@@ -81,6 +81,12 @@ pub enum WriteError {
     #[error("aggregate version overflow")]
     VersionOverflow,
 
+    /// The tenant named on the builder is one no store can keep (see
+    /// [`TenantError`](crate::TenantError)). A programmer error, caught
+    /// before the executor is reached: nothing was written.
+    #[error("invalid tenant: {0}")]
+    InvalidTenant(#[from] crate::TenantError),
+
     /// The store is not taking writes right now and will again on its own:
     /// a replicated executor whose backlog for a node that is away reached
     /// its cap, or a node told to rejoin its group. Nothing about the write
@@ -448,6 +454,7 @@ impl WriteBuilder {
     /// # Errors
     ///
     /// - [`WriteError::MissingData`] - No events were added
+    /// - [`WriteError::InvalidTenant`] - The tenant is longer than a store keeps
     /// - [`WriteError::InvalidOriginalVersion`] - Version conflict occurred
     /// - [`WriteError::Unavailable`] - The store is not taking writes right now
     /// - [`WriteError::Unknown`] - Executor error
@@ -459,11 +466,7 @@ impl WriteBuilder {
             return Err(WriteError::MixedAggregateTypes { expected, got });
         }
         let tenant = self.tenant.clone().unwrap_or_default();
-        if tenant.len() > crate::MAX_TENANT_LEN {
-            return Err(WriteError::Unknown(
-                crate::TenantError::TooLong(tenant.len()).into(),
-            ));
-        }
+        crate::TenantError::check_len(&tenant)?;
 
         // An existing stream keeps the routing key of its first event — even
         // when that key is `None` — so one aggregate never spans two keys. Only
@@ -870,6 +873,28 @@ pub(crate) mod tests {
                 got: "test/Beta",
             })
         ));
+    }
+
+    /// A tenant longer than a store keeps is a programmer error with its own
+    /// variant, so a caller matching on `WriteError` can tell it from a
+    /// backend failure without downcasting; it is caught before the executor
+    /// is reached.
+    #[tokio::test]
+    async fn commit_rejects_a_too_long_tenant() {
+        let too_long = "t".repeat(crate::MAX_TENANT_LEN + 1);
+        let result = create()
+            .event(&AlphaOpened)
+            .tenant(too_long)
+            .commit(&UnreachableExecutor)
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(WriteError::InvalidTenant(crate::TenantError::TooLong(n))) if n == crate::MAX_TENANT_LEN + 1
+            ),
+            "{result:?}"
+        );
     }
 
     /// An empty builder fails with `MissingData` before touching the executor.
