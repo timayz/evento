@@ -278,6 +278,13 @@ async fn sqlite_backward_desc() -> anyhow::Result<()> {
     pool::backward_desc(pool).await
 }
 
+#[tokio::test]
+async fn sqlite_reader_reuse() -> anyhow::Result<()> {
+    let pool = create_sqlite_pool("reader_reuse").await?;
+
+    pool::reader_reuse(pool).await
+}
+
 async fn create_rw_sqlite_executor(
     key: impl Into<String>,
 ) -> anyhow::Result<evento::Rw<evento::Sqlite, evento::Sqlite>> {

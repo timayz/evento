@@ -137,6 +137,13 @@ async fn postgres_backward_desc() -> anyhow::Result<()> {
     pool::backward_desc(pool).await
 }
 
+#[tokio::test]
+async fn postgres_reader_reuse() -> anyhow::Result<()> {
+    let pool = create_postgres_pool("reader_reuse").await?;
+
+    pool::reader_reuse(pool).await
+}
+
 async fn create_postgres_executor(key: impl Into<String>) -> anyhow::Result<Sql<sqlx::Postgres>> {
     Ok(create_postgres_pool(key).await?.into())
 }
