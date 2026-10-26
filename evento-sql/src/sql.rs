@@ -261,14 +261,14 @@ pub struct Sql<DB: Database> {
 /// Default stability margin for [`Sql::stable_margin`].
 const DEFAULT_STABLE_MARGIN: Duration = Duration::from_secs(1);
 
-/// How long a DB-clock sample may serve [`Executor::stable_timestamp`] before
-/// being refreshed with a round trip. Must stay well under any configured
-/// [`Sql::stable_margin`], which already absorbs far more skew than a
-/// TTL-stale sample introduces.
 /// Rows per `INSERT` into the event table: eleven bound values each keeps a
 /// statement well under every backend's bound-value cap (SQLite: 32766).
 const INSERT_CHUNK: usize = 1000;
 
+/// How long a DB-clock sample may serve [`Executor::stable_timestamp`] before
+/// being refreshed with a round trip. Must stay well under any configured
+/// [`Sql::stable_margin`], which already absorbs far more skew than a
+/// TTL-stale sample introduces.
 const CLOCK_SAMPLE_TTL: Duration = Duration::from_secs(1);
 
 impl<DB: Database> Sql<DB> {
