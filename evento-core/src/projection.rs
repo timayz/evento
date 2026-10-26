@@ -453,19 +453,66 @@ pub struct Projection<E: Executor, P: Default + 'static> {
     /// aggregate once per event. Keyed by `(tenant, id)`: the same id in two
     /// tenants is two aggregates. Only populated through a subscription's
     /// `Arc<Projection>`.
-    recent: Mutex<HashMap<(String, String), EventOrderKey>>,
+    recent: Mutex<RecentCache>,
     executor: PhantomData<E>,
 }
 
 /// An event's position in cursor order: `(timestamp, subsec, version, id)`.
-/// ULID strings are lexicographically ordered, so tuple comparison matches the
-/// store's cursor ordering exactly.
-type EventOrderKey = (u64, u32, u16, String);
+/// A ULID orders as its 128-bit value, which is the order of its canonical
+/// string, so tuple comparison matches the store's cursor ordering exactly.
+type EventOrderKey = (u64, u32, u16, ulid::Ulid);
 
 /// Bound on the [`Projection::recent`] cache. On overflow the cache resets —
 /// the worst case is a few redundant reloads after a burst of distinct
 /// aggregates, never a correctness issue.
 const RECENT_CACHE_MAX: usize = 1024;
+
+/// The [`Projection::recent`] cache: the persisted position per `(tenant,
+/// id)`, nested so a lookup is two borrowed `&str` probes.
+///
+/// Every delivered event asks "already covered?" before anything else, under
+/// the cache mutex; a flat `(String, String)` key would allocate twice per
+/// event just to ask, so a 300-event chunk of one aggregate paid 600
+/// allocations to say "skip" 299 times.
+#[derive(Default)]
+struct RecentCache {
+    by_tenant: HashMap<String, HashMap<String, EventOrderKey>>,
+    /// Entries across every tenant, kept for the [`RECENT_CACHE_MAX`] bound.
+    len: usize,
+}
+
+impl RecentCache {
+    fn get(&self, tenant: &str, id: &str) -> Option<&EventOrderKey> {
+        self.by_tenant.get(tenant)?.get(id)
+    }
+
+    fn insert(&mut self, tenant: &str, id: &str, key: EventOrderKey) {
+        let present = self.get(tenant, id).is_some();
+        if !present && self.len >= RECENT_CACHE_MAX {
+            self.by_tenant.clear();
+            self.len = 0;
+        }
+        let ids = match self.by_tenant.get_mut(tenant) {
+            Some(ids) => ids,
+            None => self.by_tenant.entry(tenant.to_owned()).or_default(),
+        };
+        if ids.insert(id.to_owned(), key).is_none() {
+            self.len += 1;
+        }
+    }
+
+    fn remove(&mut self, tenant: &str, id: &str) {
+        let Some(ids) = self.by_tenant.get_mut(tenant) else {
+            return;
+        };
+        if ids.remove(id).is_some() {
+            self.len -= 1;
+        }
+        if ids.is_empty() {
+            self.by_tenant.remove(tenant);
+        }
+    }
+}
 
 /// Longest [`ProjectionCursor::projection_name`] a snapshot key can hold (the
 /// SQL `snapshot.projection` column is a `VARCHAR(255)`).
@@ -496,7 +543,7 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
             aliases: Aliases::default(),
             safety_disabled: true,
             tombstone: None,
-            recent: Mutex::new(HashMap::new()),
+            recent: Mutex::new(RecentCache::default()),
             executor: PhantomData,
             revision: 0,
         }
@@ -509,7 +556,7 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
         self.recent
             .lock()
             .expect("recent cache poisoned")
-            .get(&(tenant.to_owned(), id.to_owned()))
+            .get(tenant, id)
             .is_some_and(|persisted| key <= persisted)
     }
 
@@ -518,12 +565,14 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
         let Ok(c) = <crate::Event as cursor::Cursor>::deserialize_cursor(cursor) else {
             return;
         };
-        let key = (tenant.to_owned(), id.to_owned());
-        let mut recent = self.recent.lock().expect("recent cache poisoned");
-        if recent.len() >= RECENT_CACHE_MAX && !recent.contains_key(&key) {
-            recent.clear();
-        }
-        recent.insert(key, (c.t, c.s, c.v, c.i));
+        let Ok(id_at) = ulid::Ulid::from_string(&c.i) else {
+            return;
+        };
+        self.recent.lock().expect("recent cache poisoned").insert(
+            tenant,
+            id,
+            (c.t, c.s, c.v, id_at),
+        );
     }
 
     /// Drops the recorded position for `id` in `tenant` (e.g. on tombstone).
@@ -531,7 +580,7 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
         self.recent
             .lock()
             .expect("recent cache poisoned")
-            .remove(&(tenant.to_owned(), id.to_owned()));
+            .remove(tenant, id);
     }
 
     /// Sets the snapshot revision.
@@ -1165,7 +1214,7 @@ where
                 event.timestamp,
                 event.timestamp_subsec,
                 event.version,
-                event.id.to_string(),
+                event.id,
             );
             if self
                 .projection
@@ -1270,5 +1319,70 @@ impl<P: 'static, EV: AggregateEvent + Send + Sync> Handler<P> for SkipHandler<EV
 
     fn upcasters(&self) -> &'static [crate::Upcaster] {
         EV::upcasters()
+    }
+}
+
+#[cfg(test)]
+mod recent_cache_tests {
+    use super::{EventOrderKey, RecentCache, RECENT_CACHE_MAX};
+
+    fn at(version: u16) -> EventOrderKey {
+        (1_000, 0, version, ulid::Ulid::nil())
+    }
+
+    /// The same id in two tenants is two aggregates, and removing one leaves
+    /// the other.
+    #[test]
+    fn entries_are_keyed_by_tenant_and_id() {
+        let mut cache = RecentCache::default();
+        cache.insert("", "a", at(1));
+        cache.insert("t2", "a", at(2));
+
+        assert_eq!(cache.get("", "a"), Some(&at(1)));
+        assert_eq!(cache.get("t2", "a"), Some(&at(2)));
+        assert_eq!(cache.get("t3", "a"), None);
+        assert_eq!(cache.get("", "b"), None);
+
+        cache.remove("", "a");
+        assert_eq!(cache.get("", "a"), None);
+        assert_eq!(cache.get("t2", "a"), Some(&at(2)));
+        assert!(
+            !cache.by_tenant.contains_key(""),
+            "an emptied tenant map is dropped"
+        );
+    }
+
+    /// Re-recording an id moves its position without counting it twice, so
+    /// the bound counts aggregates, not updates.
+    #[test]
+    fn an_update_does_not_count_as_a_new_entry() {
+        let mut cache = RecentCache::default();
+        cache.insert("", "a", at(1));
+        cache.insert("", "a", at(5));
+
+        assert_eq!(cache.len, 1);
+        assert_eq!(cache.get("", "a"), Some(&at(5)));
+    }
+
+    /// Past the bound the cache resets across every tenant, and a known id
+    /// never triggers the reset.
+    #[test]
+    fn the_bound_counts_entries_across_tenants() {
+        let mut cache = RecentCache::default();
+        for i in 0..RECENT_CACHE_MAX {
+            cache.insert(if i % 2 == 0 { "" } else { "t2" }, &i.to_string(), at(1));
+        }
+        assert_eq!(cache.len, RECENT_CACHE_MAX);
+
+        // A known id updates in place: no reset.
+        cache.insert("", "0", at(2));
+        assert_eq!(cache.len, RECENT_CACHE_MAX);
+        assert_eq!(cache.get("", "0"), Some(&at(2)));
+
+        // One more aggregate: everything goes, the newcomer stays.
+        cache.insert("t3", "new", at(1));
+        assert_eq!(cache.len, 1);
+        assert_eq!(cache.get("", "0"), None);
+        assert_eq!(cache.get("t3", "new"), Some(&at(1)));
     }
 }
