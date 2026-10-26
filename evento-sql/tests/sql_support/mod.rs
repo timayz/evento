@@ -343,14 +343,18 @@ where
     usize: sqlx::ColumnIndex<DB::Row>,
 {
     let old = TxnId(timestamp(100, 1));
+    // Exactly the truncation bound below: `txn < before` keeps it.
+    let at = TxnId(timestamp(200, 0));
     let new = TxnId(timestamp(300, 2));
     let route = vec![Key("a".into()), Key("b".into())];
     let low = Ballot(timestamp(400, 3));
     let high = Ballot(timestamp(500, 4));
 
     journal.save_route(old, &route).await.unwrap();
+    journal.save_route(at, &route).await.unwrap();
     journal.save_route(new, &route).await.unwrap();
     journal.save_promise(old, low).await.unwrap();
+    journal.save_promise(at, low).await.unwrap();
     journal.save_promise(new, low).await.unwrap();
     journal.save_promise(new, high).await.unwrap();
     let decision = |txn: TxnId, conflict: bool| DecisionRecord {
@@ -375,10 +379,21 @@ where
 
     let mut routes = journal.load_routes().await.unwrap();
     routes.sort_by_key(|(txn, _)| *txn);
-    assert_eq!(routes, vec![(old, route.clone()), (new, route.clone())]);
+    assert_eq!(
+        routes,
+        vec![
+            (old, route.clone()),
+            (at, route.clone()),
+            (new, route.clone())
+        ]
+    );
     let mut promises = journal.load_promises().await.unwrap();
     promises.sort_by_key(|(txn, _)| *txn);
-    assert_eq!(promises, vec![(old, low), (new, high)], "last write wins");
+    assert_eq!(
+        promises,
+        vec![(old, low), (at, low), (new, high)],
+        "last write wins"
+    );
 
     let decisions = || async {
         let mut records = journal.load_decisions().await.unwrap();
@@ -397,13 +412,18 @@ where
         .save_decision(&decision(staged, false))
         .await
         .unwrap();
-    journal.truncate(timestamp(200, 0)).await.unwrap();
+    journal.truncate(at.0).await.unwrap();
     journal.flush().await.unwrap();
+    let mut routes = journal.load_routes().await.unwrap();
+    routes.sort_by_key(|(txn, _)| *txn);
     assert_eq!(
-        journal.load_routes().await.unwrap(),
-        vec![(new, route.clone())]
+        routes,
+        vec![(at, route.clone()), (new, route.clone())],
+        "below the bound goes, at and above the bound stay"
     );
-    assert_eq!(journal.load_promises().await.unwrap(), vec![(new, high)]);
+    let mut promises = journal.load_promises().await.unwrap();
+    promises.sort_by_key(|(txn, _)| *txn);
+    assert_eq!(promises, vec![(at, low), (new, high)]);
     assert_eq!(
         decisions().await,
         vec![

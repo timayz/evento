@@ -484,24 +484,20 @@ where
             .execute(&mut *tx)
             .await?;
 
-        // Routes and blind promises go with the commands — selected by key
-        // prefix, compared by the transaction their value carries (never by
-        // the column's collation).
-        let mut redundant: Vec<String> = Vec::new();
-        for (txn, _) in self.load_routes_in(&mut *tx).await? {
-            if txn.0 < before {
-                redundant.push(meta_txn_key(ROUTE_PREFIX, txn));
-            }
-        }
-        for (txn, _) in self.load_promises_in(&mut *tx).await? {
-            if txn.0 < before {
-                redundant.push(meta_txn_key(PROMISE_PREFIX, txn));
-            }
-        }
-        for chunk in redundant.chunks(8_000) {
+        // Routes and blind promises go with the commands. Their keys are the
+        // prefix + the hex of the order-preserving transaction key, so
+        // `txn < before` is `k < prefix + hex(bound)`: one range delete per
+        // prefix, nothing read back or decoded. The LIKE keeps the range
+        // inside the prefix whatever the column's collation makes of
+        // neighbouring keys; within it the keys are lowercase hex of one
+        // width, which every collation orders numerically.
+        for prefix in [ROUTE_PREFIX, PROMISE_PREFIX] {
             let delete = Query::delete()
                 .from_table(AccordMeta::Table)
-                .and_where(Expr::col(AccordMeta::K).is_in(chunk.iter().cloned()))
+                .and_where(Expr::col(AccordMeta::K).like(like_prefix(prefix)))
+                .and_where(
+                    Expr::col(AccordMeta::K).lt(Expr::value(meta_txn_key(prefix, TxnId(before)))),
+                )
                 .to_owned();
             let (sql, values) = build_sqlx::<DB, _>(&delete);
             sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
