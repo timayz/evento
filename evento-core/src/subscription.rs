@@ -1021,11 +1021,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                     }
                 }
 
-                if self
-                    .shutdown_rx
-                    .as_ref()
-                    .is_some_and(|rx| *rx.borrow() || rx.has_changed().is_err())
-                {
+                if self.shutdown_rx.as_ref().is_some_and(shutdown_requested) {
                     tracing::info!(
                         key = self.resolved_key(),
                         "Subscription received shutdown signal, stopping gracefully"
@@ -1484,6 +1480,13 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                 // attempts ends early on shutdown and no further attempt is
                 // made once it was requested: `Subscription::shutdown` stays
                 // responsive even while a failing pass is backing off.
+                //
+                // A dropped handle closes the channel without ever sending
+                // `true`, and that must count as a shutdown here as much as
+                // in the per-event check inside `process`: the sleep below
+                // returns at once on a closed channel, so a `when` that only
+                // read the value would turn the backoff into back-to-back
+                // attempts against a store that is already failing.
                 let sleep_rx = shutdown_rx.clone();
                 let when_rx = shutdown_rx.clone();
                 let process_fut = async {
@@ -1504,7 +1507,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                                         }
                                     }
                                 })
-                                .when(move |_| !*when_rx.borrow())
+                                .when(move |_| !shutdown_requested(&when_rx))
                                 .notify(|err, dur| {
                                     tracing::error!(
                                         error = %err,
@@ -1897,6 +1900,16 @@ impl Subscription {
     }
 }
 
+/// Whether the worker should stop: `shutdown()` sent `true`, or the
+/// `Subscription` handle was dropped and the channel closed without a value.
+///
+/// Every shutdown check that reads the channel's value rather than awaiting
+/// `changed()` goes through here, so the two ways of stopping a worker are
+/// never told apart by one check and not another.
+fn shutdown_requested(rx: &tokio::sync::watch::Receiver<bool>) -> bool {
+    *rx.borrow() || rx.has_changed().is_err()
+}
+
 /// Reads a recorded stop reason without blocking.
 ///
 /// Shared with the unit tests, which exercise it without a live worker.
@@ -1956,16 +1969,183 @@ impl<E: Executor, EV: AggregateEvent + Send + Sync> Handler<E> for SkipHandler<E
 #[cfg(test)]
 mod tests {
     use super::{
-        await_stop_reason, context, peek_stop_reason, AtomicBool, Context, CursorStore, Ordering,
-        StopReason, Value,
+        await_stop_reason, context, peek_stop_reason, shutdown_requested, AtomicBool, Context,
+        CursorStore, Ordering, StopReason, SubscriptionBuilder, Value,
     };
+    use crate::cursor::{Args, ReadResult};
+    use crate::{Event, EventFilter, Executor, RoutingKey, TenantFilter, WriteError};
+    use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use ulid::Ulid;
 
     fn channel() -> (
         tokio::sync::watch::Sender<Option<StopReason>>,
         tokio::sync::watch::Receiver<Option<StopReason>>,
     ) {
         tokio::sync::watch::channel(None)
+    }
+
+    #[test]
+    fn shutdown_is_requested_by_a_sent_true_or_a_dropped_sender() {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        assert!(!shutdown_requested(&rx));
+
+        tx.send(true).unwrap();
+        assert!(shutdown_requested(&rx));
+
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        drop(tx);
+        assert!(shutdown_requested(&rx), "a dropped handle is a shutdown");
+    }
+
+    /// A store whose every read fails, after reporting that it was entered and
+    /// waiting to be released, so a test can drop the `Subscription` handle
+    /// while a pass is inside the read.
+    #[derive(Clone)]
+    struct FailingReads(Arc<FailingReadsInner>);
+
+    struct FailingReadsInner {
+        reads: AtomicUsize,
+        entered: tokio::sync::Notify,
+        released: tokio::sync::watch::Sender<bool>,
+    }
+
+    impl FailingReads {
+        fn new() -> Self {
+            Self(Arc::new(FailingReadsInner {
+                reads: AtomicUsize::new(0),
+                entered: tokio::sync::Notify::new(),
+                released: tokio::sync::watch::Sender::new(false),
+            }))
+        }
+
+        fn reads(&self) -> usize {
+            self.0.reads.load(Ordering::SeqCst)
+        }
+
+        /// Resolves once the worker task has ended: the task owns the only
+        /// other clone of this executor, and drops it on the way out.
+        async fn worker_gone(&self) {
+            while Arc::strong_count(&self.0) > 1 {
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Executor for FailingReads {
+        async fn write(&self, _events: Vec<Event>) -> Result<(), WriteError> {
+            unreachable!()
+        }
+        async fn get_subscriber_cursor(&self, _key: String) -> anyhow::Result<Option<Value>> {
+            unreachable!()
+        }
+        async fn is_subscriber_running(
+            &self,
+            _key: String,
+            _worker_id: Ulid,
+        ) -> anyhow::Result<bool> {
+            unreachable!()
+        }
+        async fn upsert_subscriber(&self, _key: String, _worker_id: Ulid) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        async fn acknowledge(
+            &self,
+            _key: String,
+            _worker_id: Ulid,
+            _cursor: Value,
+            _lag: u64,
+        ) -> anyhow::Result<bool> {
+            unreachable!()
+        }
+        async fn read(
+            &self,
+            _aggregators: Option<Arc<[EventFilter]>>,
+            _routing_key: Option<RoutingKey>,
+            _tenant: TenantFilter,
+            _args: Args,
+            _to_micros: Option<u64>,
+        ) -> anyhow::Result<ReadResult<Event>> {
+            self.0.reads.fetch_add(1, Ordering::SeqCst);
+            self.0.entered.notify_one();
+            let mut released = self.0.released.subscribe();
+            released
+                .wait_for(|released| *released)
+                .await
+                .expect("the test holds the sender");
+            Err(anyhow::anyhow!("store unreachable"))
+        }
+        async fn latest_timestamp(
+            &self,
+            _aggregators: Option<Arc<[EventFilter]>>,
+            _routing_key: Option<RoutingKey>,
+            _tenant: TenantFilter,
+        ) -> anyhow::Result<u64> {
+            unreachable!()
+        }
+        async fn get_snapshot(
+            &self,
+            _tenant: String,
+            _aggregate_type: String,
+            _projection: String,
+            _aggregate_revision: String,
+            _id: String,
+        ) -> anyhow::Result<Option<(Vec<u8>, Value)>> {
+            unreachable!()
+        }
+        async fn save_snapshot(
+            &self,
+            _tenant: String,
+            _aggregate_type: String,
+            _projection: String,
+            _aggregate_revision: String,
+            _id: String,
+            _data: Vec<u8>,
+            _cursor: Value,
+        ) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        async fn delete_snapshot(
+            &self,
+            _tenant: String,
+            _aggregate_type: String,
+            _projection: String,
+            _id: String,
+        ) -> anyhow::Result<()> {
+            unreachable!()
+        }
+    }
+
+    /// Dropping the handle mid-pass closes the shutdown channel without a
+    /// value. The retry guard must read that as "stop", like the per-event
+    /// check does: the backoff sleep returns at once on a closed channel, so a
+    /// guard that let the retry through would re-read a failing store
+    /// `retry` times back to back, with no delay between attempts.
+    #[tokio::test]
+    async fn a_dropped_handle_does_not_retry_a_failing_pass() {
+        let executor = FailingReads::new();
+        let subscription = SubscriptionBuilder::<FailingReads>::new("dropped")
+            .ephemeral()
+            .retry(5)
+            .start(&executor)
+            .await
+            .unwrap();
+
+        // The first pass is inside its read when the handle goes away.
+        executor.0.entered.notified().await;
+        drop(subscription);
+        executor.0.released.send(true).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), executor.worker_gone())
+            .await
+            .expect("the worker stops after the failed pass");
+        assert_eq!(
+            executor.reads(),
+            1,
+            "the failed read is not retried once the handle is gone"
+        );
     }
 
     #[test]
