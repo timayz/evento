@@ -506,6 +506,32 @@ control plane, everything else is Accord.
   journaled pre-seed for the next epoch brought in. A gainer's pre-seed and its
   fenced copy never interleave (`copying`). The record format moved to 12:
   `RangePageRequest` gained `since`.
+
+  **Backfilling subscriptions after a copy (#374; open).** A copy keeps the
+  events' original stamps — they must: the stamp is the subscription cursor,
+  the same on every replica, and the stability watermark is computed from
+  them; a gainer that re-stamped its copy would hold a history its peers do
+  not, and a cursor carried from one replica to another would skip or repeat.
+  So a subscription on the gainer that already read past the copied stamps
+  never sees the gained history; writes after the activation are stamped
+  above the clock floor, so the gap is the history alone. Today this is
+  observed, not closed: each copy counts the events below the node's stable
+  point (`accord_copied_below_stable_total`) and warns with their stamp range.
+  Closing it belongs with cross-shard subscriptions, where a subscription
+  must see every key of a multi-shard cluster rather than its node's shard.
+  Two designs fit: (a) a *per-range cursor rewind* — on an activation, each
+  subscription on a gainer opens a second cursor over the gained slots only,
+  from the lowest copied stamp, and drains it before (or interleaved with) its
+  main cursor, which needs `Executor::read` to filter by slot (a key predicate
+  the backends can index: the slot is a stable hash of the routing key); or
+  (b) *out-of-band delivery* — the copy hands the copied pages to the
+  node's subscriptions as a backfill stream, ordered per aggregate but not
+  against the main cursor, which keeps `read` as it is but makes delivery
+  order per-key only. Either way the catch-up must be persisted with the
+  subscription (a crash mid-backfill must resume it), and a regain (#372)
+  must not redeliver the prefix the subscription saw before the node left —
+  which (a) handles by starting the range cursor at the dropped stream's last
+  delivered stamp, and (b) only by deduplicating per aggregate version.
 - **M5 — Executor wiring.** ✅ `AccordExecutor` is a real `evento_core::Executor`:
   **writes** are coordinated through the Accord cluster (mapping the outcome to
   `Ok(())` / `WriteError::InvalidOriginalVersion`); **reads, subscriptions, and

@@ -124,6 +124,10 @@ pub struct Metrics {
     /// Pre-seeds a change this node drove did not wait out: the change went
     /// on, the fenced copy bringing the rest.
     pub preseeds_timed_out: AtomicU64,
+    /// Copied events stamped below this node's stable point when they
+    /// landed: history its subscriptions already read past and will not see
+    /// (#374).
+    pub copied_below_stable: AtomicU64,
 }
 
 impl Metrics {
@@ -283,6 +287,12 @@ impl Metrics {
         self.preseeds_timed_out.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records `events` copied below this node's stable point.
+    pub fn record_copied_below_stable(&self, events: usize) {
+        self.copied_below_stable
+            .fetch_add(events as u64, Ordering::Relaxed);
+    }
+
     /// Records a config-Paxos vote withheld after a lost journal.
     pub fn record_config_vote_withheld(&self) {
         self.config_votes_withheld.fetch_add(1, Ordering::Relaxed);
@@ -341,6 +351,7 @@ impl Metrics {
             preseed_passes: self.preseed_passes.load(Ordering::Relaxed),
             preseed_events: self.preseed_events.load(Ordering::Relaxed),
             preseeds_timed_out: self.preseeds_timed_out.load(Ordering::Relaxed),
+            copied_below_stable: self.copied_below_stable.load(Ordering::Relaxed),
         }
     }
 }
@@ -385,6 +396,7 @@ pub struct MetricsSnapshot {
     pub preseed_passes: u64,
     pub preseed_events: u64,
     pub preseeds_timed_out: u64,
+    pub copied_below_stable: u64,
 }
 
 impl MetricsSnapshot {
@@ -392,7 +404,7 @@ impl MetricsSnapshot {
     /// source of truth for both [`to_prometheus`](Self::to_prometheus) and
     /// [`to_prometheus_labeled`](Self::to_prometheus_labeled); add a counter here and
     /// both renderings pick it up.
-    fn counters(&self) -> [(&'static str, &'static str, u64); 35] {
+    fn counters(&self) -> [(&'static str, &'static str, u64); 36] {
         [
             (
                 "accord_writes_committed_total",
@@ -568,6 +580,11 @@ impl MetricsSnapshot {
                 "accord_preseeds_timed_out_total",
                 "Pre-seeds a change this node drove did not wait out.",
                 self.preseeds_timed_out,
+            ),
+            (
+                "accord_copied_below_stable_total",
+                "Copied events stamped below this node's stable point: history its subscriptions will not see.",
+                self.copied_below_stable,
             ),
         ]
     }
