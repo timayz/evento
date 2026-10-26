@@ -1,6 +1,6 @@
 [package]
 name = "quickstart"
-version = "2.0.0-alpha.35"
+version = "2.0.0-alpha.36"
 edition.workspace = true
 publish = false
 
