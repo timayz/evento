@@ -1123,7 +1123,7 @@ pub struct SnapshotPage {
 /// An event's stamp in microseconds since the Unix epoch, as the stable
 /// point counts: seconds and milliseconds, floored.
 pub fn stamp_micros(event: &Event) -> u64 {
-    event.timestamp * 1_000_000 + u64::from(event.timestamp_subsec) * 1_000
+    event.timestamp_micros()
 }
 
 /// The store cursor just below every event stamped at or above `micros`:
@@ -1726,10 +1726,7 @@ mod tests {
         for event in &events {
             assert_eq!(event.timestamp, 1_700_000_123);
             assert_eq!(event.timestamp_subsec, 456);
-            assert_eq!(
-                event.timestamp * 1_000_000 + u64::from(event.timestamp_subsec) * 1_000,
-                floor_millis(execute_at.micros)
-            );
+            assert_eq!(event.timestamp_micros(), floor_millis(execute_at.micros));
         }
         assert_eq!(floor_millis(1_999), 1_000);
         assert_eq!(floor_millis(2_000), 2_000);

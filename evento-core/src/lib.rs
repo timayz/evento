@@ -253,6 +253,22 @@ pub struct Event {
     pub timestamp_subsec: u32,
 }
 
+impl Event {
+    /// The event's stamp in microseconds since the Unix epoch: the unit the
+    /// stability watermark ([`Executor::stable_timestamp`]) and `read`'s
+    /// `to_micros` bound count in.
+    ///
+    /// The one definition of that conversion, so every comparison against
+    /// the watermark — in the subscription worker, in a projection load, in
+    /// a backend's own `read` bound — agrees on it. Saturating: a stamp too
+    /// large to hold compares as "after everything" rather than wrapping.
+    pub fn timestamp_micros(&self) -> u64 {
+        self.timestamp
+            .saturating_mul(1_000_000)
+            .saturating_add(u64::from(self.timestamp_subsec) * 1_000)
+    }
+}
+
 impl Cursor for Event {
     type T = EventCursor;
 
@@ -366,6 +382,20 @@ mod tests {
             timestamp_subsec,
             ..Default::default()
         }
+    }
+
+    /// Seconds and milliseconds land in microseconds, and a stamp past what
+    /// `u64` holds saturates instead of wrapping to "before everything".
+    #[test]
+    fn timestamp_micros_counts_seconds_and_millis() {
+        assert_eq!(event_at(0, 0).timestamp_micros(), 0);
+        assert_eq!(event_at(1, 0).timestamp_micros(), 1_000_000);
+        assert_eq!(event_at(1, 999).timestamp_micros(), 1_999_000);
+        assert_eq!(
+            event_at(1_700_000_123, 456).timestamp_micros(),
+            1_700_000_123_456_000
+        );
+        assert_eq!(event_at(u64::MAX, 999).timestamp_micros(), u64::MAX);
     }
 
     /// Cursor strings persisted by earlier releases (hand-built base64
