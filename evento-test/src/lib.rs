@@ -23,7 +23,8 @@ use bank::{
 use evento::cursor::{self, Order, ReadResult};
 use evento::Event;
 use evento::{
-    cursor::Args, Aggregate, AggregateExt, EventFilter, Executor, ProjectionAggregate, TenantFilter,
+    cursor::Args, Aggregate, AggregateExt, EventFilter, Executor, ProjectionAggregate,
+    TenantFilter, WriteError,
 };
 use rand::seq::IndexedRandom;
 use rand::RngExt;
@@ -2190,6 +2191,63 @@ pub async fn write_restamps_client_clock<E: Executor + Clone>(executor: &E) -> a
         .await?;
     assert_eq!(verbatim.edges[0].node.timestamp, 42);
     assert_eq!(verbatim.edges[0].node.timestamp_subsec, 7);
+
+    Ok(())
+}
+
+/// Scenario: `write` validates every event of a batch against its stream's
+/// current version, not only the first. A batch with a gap inside one stream,
+/// or with a second stream at the wrong version behind a valid first event,
+/// is rejected whole; a contiguous multi-stream batch is accepted.
+pub async fn write_validates_every_event<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
+    let agg_type = "evento/BatchContiguity";
+    let mk = |id: &str, version: u16| Event {
+        id: Ulid::generate(),
+        aggregate_id: id.to_owned(),
+        aggregate_type: agg_type.to_owned(),
+        version,
+        name: "Bumped".to_owned(),
+        routing_key: None,
+        tenant: String::new(),
+        data: vec![],
+        metadata: Default::default(),
+        timestamp: 0,
+        timestamp_subsec: 0,
+    };
+    let latest =
+        |id: &str| executor.latest_version(String::new(), agg_type.to_owned(), id.to_owned());
+
+    executor.write(vec![mk("a", 1)]).await?;
+    executor.write(vec![mk("b", 1), mk("b", 2)]).await?;
+
+    // A gap inside one stream, behind a valid first event.
+    let err = executor
+        .write(vec![mk("a", 2), mk("a", 4)])
+        .await
+        .expect_err("a gap inside the batch must be rejected");
+    assert!(
+        matches!(err, WriteError::InvalidOriginalVersion),
+        "expected InvalidOriginalVersion, got {err:?}"
+    );
+    // A second stream at the wrong version, behind a valid first event.
+    let err = executor
+        .write(vec![mk("a", 2), mk("b", 4)])
+        .await
+        .expect_err("a second stream's gap must be rejected");
+    assert!(
+        matches!(err, WriteError::InvalidOriginalVersion),
+        "expected InvalidOriginalVersion, got {err:?}"
+    );
+    // A rejected batch leaves nothing behind.
+    assert_eq!(latest("a").await?, 1);
+    assert_eq!(latest("b").await?, 2);
+
+    // A contiguous batch over several streams is accepted whole.
+    executor
+        .write(vec![mk("a", 2), mk("a", 3), mk("b", 3)])
+        .await?;
+    assert_eq!(latest("a").await?, 3);
+    assert_eq!(latest("b").await?, 3);
 
     Ok(())
 }

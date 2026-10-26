@@ -167,6 +167,12 @@ async fn postgres_write_restamps_client_clock() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn postgres_write_validates_every_event() -> anyhow::Result<()> {
+    let executor = create_postgres_executor("write_validates_every_event").await?;
+    evento_test::write_validates_every_event(&executor).await
+}
+
+#[tokio::test]
 async fn postgres_concurrent_append() -> anyhow::Result<()> {
     let executor = create_postgres_executor("concurrent_append").await?;
     evento_test::concurrent_append(&executor).await

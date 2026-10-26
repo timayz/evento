@@ -714,29 +714,42 @@ where
             return Ok(());
         }
 
-        // Contiguity check: the unique `(type, id, tenant, version)` index only catches
-        // duplicate versions, not a gap (e.g. writing version 11 when the
-        // aggregate is at 5). A concurrent writer that advances the version
-        // after this check can only cause the batch to collide on the unique
-        // index — never to create a gap — so check + index together enforce
-        // contiguity. A brand-new stream (version 1) needs no pre-check: no
-        // gap is possible below version 1, and if the stream already exists
-        // the unique index turns the insert into `InvalidOriginalVersion`.
-        if let Some(first) = events.first() {
-            if first.version != 1 {
-                let last = self
+        // Contiguity check, per event: the unique `(type, id, tenant, version)`
+        // index only catches duplicate versions, not a gap (e.g. writing
+        // version 11 when the aggregate is at 5), and a batch may carry
+        // several events of one stream or several streams at once. `seen`
+        // carries the version assigned earlier in THIS batch, so each stream
+        // costs one `latest_version` round trip. A concurrent writer that
+        // advances a version after its check can only make the batch collide
+        // on the unique index — never create a gap — so check + index together
+        // enforce contiguity. A brand-new stream (version 1) needs no lookup:
+        // no gap is possible below version 1, and if the stream already
+        // exists the unique index turns the insert into
+        // `InvalidOriginalVersion`.
+        let mut seen: std::collections::HashMap<(&str, &str, &str), u16> =
+            std::collections::HashMap::new();
+        for event in &events {
+            let stream = (
+                event.tenant.as_str(),
+                event.aggregate_type.as_str(),
+                event.aggregate_id.as_str(),
+            );
+            let last = match seen.get(&stream) {
+                Some(last) => *last,
+                None if event.version == 1 => 0,
+                None => self
                     .latest_version(
-                        first.tenant.clone(),
-                        first.aggregate_type.clone(),
-                        first.aggregate_id.clone(),
+                        event.tenant.clone(),
+                        event.aggregate_type.clone(),
+                        event.aggregate_id.clone(),
                     )
                     .await
-                    .map_err(WriteError::Unknown)?;
-
-                if u64::from(first.version) != u64::from(last) + 1 {
-                    return Err(WriteError::InvalidOriginalVersion);
-                }
+                    .map_err(WriteError::Unknown)?,
+            };
+            if u64::from(event.version) != u64::from(last) + 1 {
+                return Err(WriteError::InvalidOriginalVersion);
             }
+            seen.insert(stream, event.version);
         }
 
         self.insert_events(events, true).await?;

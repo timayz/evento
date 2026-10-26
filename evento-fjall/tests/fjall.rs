@@ -241,6 +241,12 @@ async fn fjall_read_drains_pages() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn fjall_write_validates_every_event() -> anyhow::Result<()> {
+    let executor = Fjall::temporary()?;
+    evento_test::write_validates_every_event(&executor).await
+}
+
+#[tokio::test]
 async fn fjall_read_limit() -> anyhow::Result<()> {
     let executor = Fjall::temporary()?;
     evento_test::read_limit(&executor).await
