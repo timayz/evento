@@ -1012,9 +1012,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                 // `read`'s `to_micros` bound. Edges arrive in ascending cursor
                 // order, so everything from here on is gated too.
                 if let Some(w) = stable {
-                    let event_micros = (event.node.timestamp)
-                        .saturating_mul(1_000_000)
-                        .saturating_add(event.node.timestamp_subsec as u64 * 1_000);
+                    let event_micros = event.node.timestamp_micros();
                     if event_micros >= w {
                         if !self
                             .flush_ack(executor, id, aggregators, &mut pending_ack, &mut since_ack)
@@ -1277,10 +1275,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             return Ok(ProcessOutcome::Drained);
         };
 
-        let event_micros = (edge.node.timestamp)
-            .saturating_mul(1_000_000)
-            .saturating_add(edge.node.timestamp_subsec as u64 * 1_000);
-        let wait = Duration::from_micros(event_micros.saturating_sub(stable))
+        let wait = Duration::from_micros(edge.node.timestamp_micros().saturating_sub(stable))
             .clamp(GATED_RETRY_MIN, GATED_RETRY_MAX);
         Ok(ProcessOutcome::Gated { wait })
     }

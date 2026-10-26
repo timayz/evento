@@ -145,13 +145,7 @@ fn matches(
         Some(RoutingKey::Value(None)) => event.routing_key.is_none(),
         Some(RoutingKey::All) | None => true,
     };
-    let below = to_micros.is_none_or(|bound| {
-        event
-            .timestamp
-            .saturating_mul(1_000_000)
-            .saturating_add(u64::from(event.timestamp_subsec) * 1_000)
-            < bound
-    });
+    let below = to_micros.is_none_or(|bound| event.timestamp_micros() < bound);
     aggregate && routing && below
 }
 
@@ -233,11 +227,7 @@ impl Executor for SimExecutor {
             .events
             .iter()
             .filter(|e| tenant.matches(&e.tenant) && matches(e, &aggregators, &routing_key, None))
-            .map(|e| {
-                e.timestamp
-                    .saturating_mul(1_000_000)
-                    .saturating_add(u64::from(e.timestamp_subsec) * 1_000)
-            })
+            .map(Event::timestamp_micros)
             .max()
             .unwrap_or(0))
     }

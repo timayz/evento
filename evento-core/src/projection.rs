@@ -802,10 +802,7 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
             for event in events.edges.iter() {
                 if !gated {
                     if let Some(w) = stable {
-                        let event_micros = (event.node.timestamp)
-                            .saturating_mul(1_000_000)
-                            .saturating_add(event.node.timestamp_subsec as u64 * 1_000);
-                        if event_micros >= w {
+                        if event.node.timestamp_micros() >= w {
                             // Persist the stable prefix before folding events
                             // that could still be reordered.
                             if dirty {
