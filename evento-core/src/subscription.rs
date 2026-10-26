@@ -1482,11 +1482,10 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                 // advances on its own — no write signal will fire for them — so
                 // after a `Gated` pass, re-check on a short cadence instead of
                 // waiting out the full poll interval.
-                let mut shutdown = false;
                 if let Some(wait) = gated {
                     tokio::select! {
                         _ = tokio::time::sleep(wait) => {}
-                        _ = shutdown_rx.changed() => { shutdown = true; }
+                        _ = shutdown_rx.changed() => break StopReason::Shutdown,
                     }
                 } else {
                     match write_watch.as_mut() {
@@ -1497,17 +1496,13 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                                     rx.borrow_and_update();
                                 }
                             }
-                            _ = shutdown_rx.changed() => { shutdown = true; }
+                            _ = shutdown_rx.changed() => break StopReason::Shutdown,
                         },
                         None => tokio::select! {
                             _ = interval.tick() => {}
-                            _ = shutdown_rx.changed() => { shutdown = true; }
+                            _ = shutdown_rx.changed() => break StopReason::Shutdown,
                         },
                     }
-                }
-
-                if shutdown {
-                    break StopReason::Shutdown;
                 }
 
                 // The retry backoff can span minutes, so the sleep between
@@ -1570,12 +1565,14 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                 // and an unbounded wait would hang `shutdown()` and with it
                 // the process. Past the grace the pass is abandoned and its
                 // unacknowledged events are redelivered on the next start.
-                let mut shutdown = false;
-                let result = tokio::select! {
-                    res = &mut process_fut => res,
+                //
+                // `shutdown` records that the signal landed while the pass
+                // was running: the pass's own outcome then decides only when
+                // it is terminal on its own.
+                let (result, shutdown) = tokio::select! {
+                    res = &mut process_fut => (res, false),
                     _ = shutdown_rx.changed() => {
-                        shutdown = true;
-                        match self.shutdown_grace {
+                        let res = match self.shutdown_grace {
                             None => (&mut process_fut).await,
                             Some(grace) => match tokio::time::timeout(grace, &mut process_fut).await {
                                 Ok(res) => res,
@@ -1590,32 +1587,32 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                                     break StopReason::Shutdown;
                                 }
                             },
-                        }
+                        };
+                        (res, true)
                     }
                 };
 
+                if let Err(err) = &result {
+                    tracing::error!(error = %err, "Failed to process event");
+                }
                 match result {
+                    // A shutdown that landed mid-pass wins over a pass that
+                    // would otherwise go on — and over one that failed:
+                    // `process` flushed the successfully-processed prefix
+                    // before propagating, so there is nothing left to lose,
+                    // and a worker asked to stop is not reported as `Failed`.
+                    Ok(ProcessOutcome::Drained | ProcessOutcome::Gated { .. }) | Err(_)
+                        if shutdown =>
+                    {
+                        break StopReason::Shutdown
+                    }
                     Ok(ProcessOutcome::Drained) => gated = None,
                     Ok(ProcessOutcome::Gated { wait }) => gated = Some(wait),
                     Ok(ProcessOutcome::ShutdownRequested) => break StopReason::Shutdown,
                     Ok(ProcessOutcome::LostOwnership) => break StopReason::LostOwnership,
                     Ok(ProcessOutcome::StoppedByHandler) => break StopReason::StoppedByHandler,
-                    Err(err) => {
-                        tracing::error!(error = %err, "Failed to process event");
-
-                        // `process` flushed the successfully-processed prefix
-                        // before propagating, so a pass that failed while a
-                        // shutdown was pending has nothing left to lose.
-                        if shutdown {
-                            break StopReason::Shutdown;
-                        }
-                        if !self.continue_on_error {
-                            break StopReason::Failed(Arc::new(err));
-                        }
-                    }
-                };
-                if shutdown {
-                    break StopReason::Shutdown;
+                    Err(err) if !self.continue_on_error => break StopReason::Failed(Arc::new(err)),
+                    Err(_) => {}
                 }
             };
 
