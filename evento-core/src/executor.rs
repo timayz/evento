@@ -506,6 +506,30 @@ pub trait Executor: Send + Sync + 'static {
         projection: String,
         id: String,
     ) -> anyhow::Result<()>;
+
+    /// Removes one stream — the events of `(tenant, aggregate_type,
+    /// aggregate_id)` and every index entry that leads to them — so the
+    /// stream can be written again from its first version.
+    ///
+    /// A maintenance primitive for replication layers, not an application
+    /// API: a replica that stops owning a key range drops its streams, and
+    /// one that gains a range back copies them in afresh. Projection
+    /// snapshots and subscriber cursors stay — events are immutable, so a
+    /// snapshot at version N is still a valid prefix of a stream copied back
+    /// in, and a cursor is a position, not an offset.
+    ///
+    /// Idempotent: deleting a stream that does not exist is not an error.
+    /// The default refuses; backends that own their storage (SQL, Fjall)
+    /// implement it.
+    async fn delete_stream(
+        &self,
+        tenant: String,
+        aggregate_type: String,
+        aggregate_id: String,
+    ) -> anyhow::Result<()> {
+        let _ = (tenant, aggregate_type, aggregate_id);
+        anyhow::bail!("delete_stream is not supported by this executor")
+    }
 }
 
 /// Type-erased wrapper around any [`Executor`] implementation.
@@ -689,6 +713,17 @@ impl Executor for Evento {
     ) -> anyhow::Result<()> {
         self.inner
             .delete_snapshot(tenant, aggregate_type, projection, id)
+            .await
+    }
+
+    async fn delete_stream(
+        &self,
+        tenant: String,
+        aggregate_type: String,
+        aggregate_id: String,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .delete_stream(tenant, aggregate_type, aggregate_id)
             .await
     }
 }
@@ -921,6 +956,17 @@ impl Executor for EventoGroup {
             .delete_snapshot(tenant, aggregate_type, projection, id)
             .await
     }
+
+    async fn delete_stream(
+        &self,
+        tenant: String,
+        aggregate_type: String,
+        aggregate_id: String,
+    ) -> anyhow::Result<()> {
+        self.first()
+            .delete_stream(tenant, aggregate_type, aggregate_id)
+            .await
+    }
 }
 
 /// Read-write split executor (requires `rw` feature).
@@ -1105,6 +1151,17 @@ impl<R: Executor, W: Executor> Executor for Rw<R, W> {
     ) -> anyhow::Result<()> {
         self.w
             .delete_snapshot(tenant, aggregate_type, projection, id)
+            .await
+    }
+
+    async fn delete_stream(
+        &self,
+        tenant: String,
+        aggregate_type: String,
+        aggregate_id: String,
+    ) -> anyhow::Result<()> {
+        self.w
+            .delete_stream(tenant, aggregate_type, aggregate_id)
             .await
     }
 }
@@ -1327,6 +1384,17 @@ impl<E: Executor, L: Executor> Executor for Sidecar<E, L> {
     ) -> anyhow::Result<()> {
         self.local
             .delete_snapshot(tenant, aggregate_type, projection, id)
+            .await
+    }
+
+    async fn delete_stream(
+        &self,
+        tenant: String,
+        aggregate_type: String,
+        aggregate_id: String,
+    ) -> anyhow::Result<()> {
+        self.events
+            .delete_stream(tenant, aggregate_type, aggregate_id)
             .await
     }
 }

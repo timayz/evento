@@ -804,6 +804,114 @@ impl Fjall {
         );
     }
 
+    /// Stages the removal of one event's entry from each cursor-index
+    /// keyspace: the exact twin of [`insert_cursor_entries`](Self::insert_cursor_entries).
+    #[allow(clippy::too_many_arguments)]
+    fn remove_cursor_entries(
+        &self,
+        batch: &mut fjall::OwnedWriteBatch,
+        aggregate_type: &str,
+        aggregate_id: &str,
+        tenant: &str,
+        name: &str,
+        routing_key: Option<&str>,
+        suffix: &[u8; CURSOR_KEY_LEN],
+    ) {
+        batch.remove(&self.cursor_all, *suffix);
+        batch.remove(
+            &self.cursor_agg,
+            Self::with_suffix(
+                Self::agg_prefix(aggregate_type, aggregate_id, tenant),
+                suffix,
+            ),
+        );
+        batch.remove(
+            &self.cursor_agg_name,
+            Self::with_suffix(
+                Self::agg_name_prefix(aggregate_type, aggregate_id, tenant, name),
+                suffix,
+            ),
+        );
+        batch.remove(
+            &self.cursor_type_tenant,
+            Self::with_suffix(Self::type_tenant_prefix(aggregate_type, tenant), suffix),
+        );
+        batch.remove(
+            &self.cursor_type_name_tenant,
+            Self::with_suffix(
+                Self::type_tenant_name_prefix(aggregate_type, tenant, name),
+                suffix,
+            ),
+        );
+        batch.remove(
+            &self.cursor_type,
+            Self::with_suffix(Self::type_only_prefix(aggregate_type), suffix),
+        );
+        batch.remove(
+            &self.cursor_type_name,
+            Self::with_suffix(Self::type_prefix(aggregate_type, name), suffix),
+        );
+        batch.remove(
+            &self.cursor_routing,
+            Self::with_suffix(Self::routing_cursor_prefix(routing_key), suffix),
+        );
+    }
+
+    /// Removes the stream `(tenant, type, id)`: every event the aggregate
+    /// index lists for it, from the primary keyspace, the aggregate index and
+    /// each cursor index, in one batch. Under the write lock, so no append to
+    /// the stream interleaves with its removal. The commit clock is left
+    /// alone: it only ever moves forward.
+    fn delete_stream_blocking(
+        &self,
+        tenant: &str,
+        aggregate_type: &str,
+        aggregate_id: &str,
+    ) -> anyhow::Result<()> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("write lock poisoned"))?;
+        let prefix = Self::agg_prefix(aggregate_type, aggregate_id, tenant);
+        let mut batch = self.db.batch();
+        let mut removed = 0usize;
+        for guard in self.agg_index.prefix(&prefix) {
+            let (agg_key, id_bytes) = guard.into_inner()?;
+            let id = Ulid::from_bytes(
+                id_bytes
+                    .as_ref()
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("malformed aggregate index value"))?,
+            );
+            if let Some(event) = self.load_event(&id)? {
+                let suffix = Self::cursor_key_suffix(
+                    event.timestamp,
+                    event.timestamp_subsec,
+                    event.version,
+                    &event.id,
+                );
+                self.remove_cursor_entries(
+                    &mut batch,
+                    &event.aggregate_type,
+                    &event.aggregate_id,
+                    &event.tenant,
+                    &event.name,
+                    event.routing_key.as_deref(),
+                    &suffix,
+                );
+                batch.remove(&self.events, id.to_bytes());
+            }
+            batch.remove(&self.agg_index, agg_key);
+            removed += 1;
+        }
+        if removed == 0 {
+            return Ok(());
+        }
+        batch.commit()?;
+        self.db.persist(self.write_persist_mode)?;
+        Ok(())
+    }
+
     /// Builds the snapshot key: `enc(tenant, type, projection, id)`.
     fn snapshot_key(tenant: &str, aggregate_type: &str, projection: &str, id: &str) -> Vec<u8> {
         Self::encode_components(&[
@@ -1668,6 +1776,20 @@ impl Executor for Fjall {
             let key = Fjall::snapshot_key(&tenant, &aggregate_type, &projection, &id);
             executor.snapshots.remove(key)?;
             Ok(())
+        })
+        .await?
+    }
+
+    async fn delete_stream(
+        &self,
+        tenant: String,
+        aggregate_type: String,
+        aggregate_id: String,
+    ) -> anyhow::Result<()> {
+        let executor = self.clone();
+
+        tokio::task::spawn_blocking(move || {
+            executor.delete_stream_blocking(&tenant, &aggregate_type, &aggregate_id)
         })
         .await?
     }

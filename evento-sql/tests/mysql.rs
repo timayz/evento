@@ -387,3 +387,10 @@ async fn mysql_tenant_snapshots_are_isolated() -> anyhow::Result<()> {
     let executor = create_mysql_executor("tenant_snapshots_are_isolated").await?;
     evento_test::tenant_snapshots_are_isolated(&executor).await
 }
+
+#[tokio::test]
+async fn mysql_delete_stream() -> anyhow::Result<()> {
+    let executor = create_mysql_executor("delete_stream").await?;
+
+    evento_test::delete_stream(&executor).await
+}

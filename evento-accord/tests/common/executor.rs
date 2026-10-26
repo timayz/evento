@@ -299,4 +299,25 @@ impl Executor for SimExecutor {
     ) -> anyhow::Result<()> {
         Ok(())
     }
+
+    async fn delete_stream(
+        &self,
+        tenant: String,
+        aggregate_type: String,
+        aggregate_id: String,
+    ) -> anyhow::Result<()> {
+        let mut log = self.log.lock().unwrap();
+        let stream = (tenant, aggregate_type, aggregate_id);
+        // `persisted` is a prefix length: every removed event below it
+        // shortens the prefix by one, so a crash still keeps exactly the
+        // events that were persisted.
+        let removed_persisted = log.events[..log.persisted]
+            .iter()
+            .filter(|e| stream_of(e) == stream)
+            .count();
+        log.events.retain(|e| stream_of(e) != stream);
+        log.persisted -= removed_persisted;
+        log.rebuild_versions();
+        Ok(())
+    }
 }
