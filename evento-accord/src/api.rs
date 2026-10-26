@@ -806,6 +806,37 @@ pub trait Journal: Send + Sync + 'static {
         Ok(Vec::new())
     }
 
+    /// Buffers this node's [`CopyState`] — how far it got copying the slots a
+    /// layout transition gives it — durable no later than the next
+    /// [`flush`](Journal::flush). Replaces the previous one: a node copies
+    /// for one transition at a time. Survives [`truncate`](Journal::truncate).
+    /// The default is a no-op: a restarted node then drops its gained slots
+    /// and copies them again, and reports a copy only once that is done.
+    async fn save_copy_state(&self, state: &CopyState) -> anyhow::Result<()> {
+        let _ = state;
+        Ok(())
+    }
+
+    /// The persisted copy state, if any. The default returns none.
+    async fn load_copy_state(&self) -> anyhow::Result<Option<CopyState>> {
+        Ok(None)
+    }
+
+    /// Buffers the epoch through which this node dropped the slots it does
+    /// not own under the installed layout ([`DataStore::drop_slots`]),
+    /// durable no later than the next [`flush`](Journal::flush). Only ever
+    /// raised; survives [`truncate`](Journal::truncate). The default is a
+    /// no-op: a restarted node then drops them again (idempotent).
+    async fn save_slot_gc(&self, epoch: u64) -> anyhow::Result<()> {
+        let _ = epoch;
+        Ok(())
+    }
+
+    /// The persisted slot GC epoch, if any. The default returns none.
+    async fn load_slot_gc(&self) -> anyhow::Result<Option<u64>> {
+        Ok(None)
+    }
+
     /// Durably persists the [`AmnesiaFence`] of a replica that came back over
     /// an empty journal (#312), replacing any previous one. Durable by the
     /// time it returns, and **never** discarded by
@@ -1012,6 +1043,41 @@ pub trait DataStore: Send + Sync + 'static {
         let next = (total > taken).then(|| Value(taken.to_string()));
         Ok(SnapshotPage { events, next })
     }
+
+    /// Drops every stream whose key is in one of `slots` ([`slot_of`]):
+    /// their events and the versions they set, so the slots can be copied
+    /// in afresh. Returns how many streams went. A node drops the slots a
+    /// layout change takes from it, and the slots it gains before copying
+    /// them (what it holds for a slot it does not own is stale). Idempotent.
+    /// The default drops nothing and reports so (a store that holds no
+    /// queryable events).
+    async fn drop_slots(&self, _slots: &[u16]) -> anyhow::Result<usize> {
+        Ok(0)
+    }
+}
+
+/// A node's copy of the slots a layout transition gives it, as its journal
+/// keeps it ([`Journal::save_copy_state`]): which transition — its `since`
+/// and the map it installs — and how far the copy got.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CopyState {
+    /// The epoch the transition was first decided at.
+    pub since: u64,
+    /// The layout the transition installs.
+    pub map: ShardMap,
+    /// How far the copy got.
+    pub phase: CopyPhase,
+}
+
+/// How far a node's copy of its gained slots got (see [`CopyState`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CopyPhase {
+    /// The gained slots were dropped from the store: whatever it held for
+    /// them was stale. The copy may have started; what landed is a
+    /// contiguous prefix of each stream, to be resumed, not dropped again.
+    Dropped,
+    /// Every gained slot is in, and may be reported.
+    Copied,
 }
 
 /// One page of a [`DataStore::snapshot_page`] bootstrap snapshot.

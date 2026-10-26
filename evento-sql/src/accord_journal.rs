@@ -42,8 +42,8 @@ use async_trait::async_trait;
 
 use evento_accord::format::{decode_tagged, encode_tagged, RecordKind};
 use evento_accord::{
-    AcceptorRecord, AmnesiaFence, Ballot, CommandState, ConfigEntry, DecisionRecord, DurableMark,
-    FenceRecord, Journal, Key, NodeId, Timestamp, TxnId,
+    AcceptorRecord, AmnesiaFence, Ballot, CommandState, ConfigEntry, CopyState, DecisionRecord,
+    DurableMark, FenceRecord, Journal, Key, NodeId, Timestamp, TxnId,
 };
 
 /// `k` value under which the truncation watermark is stored in `accord_meta`.
@@ -64,6 +64,10 @@ const VOTE_FENCE_KEY: &str = "vote_fence";
 /// `k` value under which the marks the replica saw from its peers are stored
 /// in `accord_meta`. Staged like a command; untouched by `truncate`.
 const PEER_MARKS_KEY: &str = "peer_marks";
+/// `accord_meta` key of the replica's copy state (`Journal::save_copy_state`).
+const COPY_STATE_KEY: &str = "copy_state";
+/// `accord_meta` key of the replica's slot GC epoch (`Journal::save_slot_gc`).
+const SLOT_GC_KEY: &str = "slot_gc";
 /// `k` prefix of a multi-shard transaction's route in `accord_meta`.
 const ROUTE_PREFIX: &str = "route/";
 /// `k` prefix of a blind recovery promise in `accord_meta`.
@@ -646,6 +650,32 @@ where
         match self.load_meta(PEER_MARKS_KEY).await? {
             Some(bytes) => Ok(decode_tagged(RecordKind::PeerMarks, &bytes)?),
             None => Ok(Vec::new()),
+        }
+    }
+
+    async fn save_copy_state(&self, state: &CopyState) -> anyhow::Result<()> {
+        let value = encode_tagged(RecordKind::CopyState, state)?;
+        self.stage_kept(COPY_STATE_KEY, value);
+        Ok(())
+    }
+
+    async fn load_copy_state(&self) -> anyhow::Result<Option<CopyState>> {
+        match self.load_meta(COPY_STATE_KEY).await? {
+            Some(bytes) => Ok(Some(decode_tagged(RecordKind::CopyState, &bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn save_slot_gc(&self, epoch: u64) -> anyhow::Result<()> {
+        let value = encode_tagged(RecordKind::SlotGc, &epoch)?;
+        self.stage_kept(SLOT_GC_KEY, value);
+        Ok(())
+    }
+
+    async fn load_slot_gc(&self) -> anyhow::Result<Option<u64>> {
+        match self.load_meta(SLOT_GC_KEY).await? {
+            Some(bytes) => Ok(Some(decode_tagged(RecordKind::SlotGc, &bytes)?)),
+            None => Ok(None),
         }
     }
 

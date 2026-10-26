@@ -337,8 +337,9 @@ control plane, everything else is Accord.
   config-Paxos **acceptor set is the current members** (a node proposing the next
   epoch is still on this one), so reconfiguration keeps working after the founders
   have left (`config_changes_outlive_the_founders` removes a founder majority and
-  still reconfigures). *Remaining:* garbage-collecting a moved range from its old
-  owners (and so giving a node back slots it replicated before), and multi-shard
+  still reconfigures). A node drops a moved range once the change installs, and
+  drops what it holds for a range it gains before copying it, so a change may give
+  a node back slots it replicated before (#372, below). *Remaining:* multi-shard
   read routing for the executor. A node that gains slots copies their events with
   their original stamps, so its subscriptions, if they already read past those
   stamps, do not see them (as broad scans on a multi-shard cluster are local
@@ -451,9 +452,37 @@ control plane, everything else is Accord.
   only adds a replica to a shard that keeps others installs at once, and the new
   replica joins through one of them; `join` refuses a contact of another shard
   (#360: a joiner adopted such a contact's floor, its own shard's, and treated
-  its new shard's later writes below it as compacted). A change that would give a
-  node a slot it replicated before is refused: its store still holds that slot's
-  events from then, and nothing drops them yet.
+  its new shard's later writes below it as compacted).
+
+  **Dropping moved slots (#372; shipped).** A node's store holds the slots it
+  owns under its installed layout, and the slots it is copying for the pending
+  one — nothing else. Before its first range page, a gainer drops the slots it
+  gains (`DataStore::drop_slots`, over `Executor::delete_stream`): it does not
+  own them under the live layout, so whatever it holds for them is stale (the
+  events from when it replicated them before, or a copy for a transition
+  replaced since), and a copy over a stale prefix would skip it. Once an
+  activation installs, every node drops the slots it no longer owns
+  (`gc_lost_slots`, once per installed epoch, journaled as `SlotGc` and redone
+  after a restart). The drops stick because the store is written only for the
+  keys the node owns under its *installed* layout — at an apply, an anti-entropy
+  import and a restart's replay alike (`owned_now`): a late apply, a peer behind
+  on the layout, or the journal's own applied tail can bring no fragment of a
+  dropped slot back. The transaction is still marked applied (its status is what
+  the watermark and the barriers go by), and every committed write on a moved
+  key is applied at the new owners before the layout installs. A forwarded read
+  of a key the node no longer owns fails (`ReadFailed`) instead of answering
+  from the dropped slot. The copy's state is journaled (`CopyState`): the drop
+  once done — so a copy interrupted by a failed page or a restart resumes over
+  the contiguous prefix it left, and drops nothing again — and the copy once
+  complete, flushed *before* it is reported: the activation goes by the report
+  and the sources drop the slots once it installs, so a restarted gainer must
+  never drop and copy again what it reported (with the in-memory `copied` that
+  stood before, a report-crash-restart would have wiped the only copy). The
+  range copy keeps only each stream's contiguous continuation (`not_held`),
+  never an event past a gap. So a change may give a node back slots it
+  replicated before: a merge after a split, a replica moved back; the
+  re-sharding nemesis draws both, and its oracle checks that no member of the
+  final layout holds an aggregate it does not own.
 - **M5 — Executor wiring.** ✅ `AccordExecutor` is a real `evento_core::Executor`:
   **writes** are coordinated through the Accord cluster (mapping the outcome to
   `Ok(())` / `WriteError::InvalidOriginalVersion`); **reads, subscriptions, and

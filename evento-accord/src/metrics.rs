@@ -106,6 +106,13 @@ pub struct Metrics {
     /// Writes this node refused to coordinate because a key they touch is
     /// moving ([`TopologyChanging`](crate::TopologyChanging)).
     pub writes_topology_changing: AtomicU64,
+    /// Streams dropped from the store: the slots a layout change took from
+    /// this node, or gave it and that it held stale events for (#372).
+    pub streams_dropped: AtomicU64,
+    /// Applies that left events out of the store, their keys no longer this
+    /// node's under the installed layout (a late apply, an import from a peer
+    /// behind on the layout, or a restart's replay of a dropped slot).
+    pub applies_not_owned: AtomicU64,
 }
 
 impl Metrics {
@@ -236,6 +243,17 @@ impl Metrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records `streams` dropped from the store.
+    pub fn record_streams_dropped(&self, streams: usize) {
+        self.streams_dropped
+            .fetch_add(streams as u64, Ordering::Relaxed);
+    }
+
+    /// Records an apply that left events of keys this node no longer owns out.
+    pub fn record_applies_not_owned(&self) {
+        self.applies_not_owned.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Records a config-Paxos vote withheld after a lost journal.
     pub fn record_config_vote_withheld(&self) {
         self.config_votes_withheld.fetch_add(1, Ordering::Relaxed);
@@ -288,6 +306,8 @@ impl Metrics {
             messages_future_epoch: self.messages_future_epoch.load(Ordering::Relaxed),
             votes_change_fenced: self.votes_change_fenced.load(Ordering::Relaxed),
             writes_topology_changing: self.writes_topology_changing.load(Ordering::Relaxed),
+            streams_dropped: self.streams_dropped.load(Ordering::Relaxed),
+            applies_not_owned: self.applies_not_owned.load(Ordering::Relaxed),
         }
     }
 }
@@ -326,6 +346,8 @@ pub struct MetricsSnapshot {
     pub messages_future_epoch: u64,
     pub votes_change_fenced: u64,
     pub writes_topology_changing: u64,
+    pub streams_dropped: u64,
+    pub applies_not_owned: u64,
 }
 
 impl MetricsSnapshot {
@@ -333,7 +355,7 @@ impl MetricsSnapshot {
     /// source of truth for both [`to_prometheus`](Self::to_prometheus) and
     /// [`to_prometheus_labeled`](Self::to_prometheus_labeled); add a counter here and
     /// both renderings pick it up.
-    fn counters(&self) -> [(&'static str, &'static str, u64); 29] {
+    fn counters(&self) -> [(&'static str, &'static str, u64); 31] {
         [
             (
                 "accord_writes_committed_total",
@@ -479,6 +501,16 @@ impl MetricsSnapshot {
                 "accord_writes_topology_changing_total",
                 "Writes refused while a key they touch moves to other replicas.",
                 self.writes_topology_changing,
+            ),
+            (
+                "accord_streams_dropped_total",
+                "Streams dropped from the store: slots a layout change took from this node, or gave it back.",
+                self.streams_dropped,
+            ),
+            (
+                "accord_applies_not_owned_total",
+                "Applies that left events out of the store, their keys no longer this node's.",
+                self.applies_not_owned,
             ),
         ]
     }

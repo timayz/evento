@@ -4899,6 +4899,10 @@ struct SlowStore {
 
 #[async_trait::async_trait]
 impl DataStore for SlowStore {
+    async fn drop_slots(&self, slots: &[u16]) -> anyhow::Result<usize> {
+        self.inner.drop_slots(slots).await
+    }
+
     async fn version(
         &self,
         tenant: &str,
@@ -6266,8 +6270,8 @@ fn reshard_options(layout: &[Vec<NodeId>], spares: &[NodeId]) -> Vec<Vec<Shards>
 }
 
 /// Whether a change from `live` to `next` gives a node back a slot it
-/// replicated under a layout of `history` — a change refused until old
-/// owners collect the slots they give up.
+/// replicated under a layout of `history` (#372): a merge after a split, or
+/// a replica moved back. Counted, so a run says how many it exercised.
 fn regains(live: &Layout, history: &[Arc<Layout>], next: &[Vec<NodeId>]) -> bool {
     let map = live.map().rebalanced(next.to_vec());
     (0..SLOTS).any(|slot| {
@@ -6284,19 +6288,11 @@ fn regains(live: &Layout, history: &[Arc<Layout>], next: &[Vec<NodeId>]) -> bool
 }
 
 /// The layout a seeded change moves `live` to: a kind of change drawn among
-/// those that apply, then one of its layouts, none that `regains` a slot.
-/// Takes the spares it adds from `spares`; a node it removes never comes
-/// back. `None` when no change applies.
-fn next_layout(
-    rng: &mut StdRng,
-    live: &Layout,
-    history: &[Arc<Layout>],
-    spares: &mut Vec<NodeId>,
-) -> Option<Shards> {
+/// those that apply, then one of its layouts. Takes the spares it adds from
+/// `spares`; a node it removes never comes back. `None` when no change
+/// applies.
+fn next_layout(rng: &mut StdRng, live: &Layout, spares: &mut Vec<NodeId>) -> Option<Shards> {
     let mut options = reshard_options(live.shards(), spares);
-    for nexts in &mut options {
-        nexts.retain(|next| !regains(live, history, next));
-    }
     options.retain(|nexts| !nexts.is_empty());
     if options.is_empty() {
         return None;
@@ -6305,6 +6301,38 @@ fn next_layout(
     let next = nexts[rng.random_range(0..nexts.len())].clone();
     spares.retain(|spare| !next.iter().flatten().any(|node| node == spare));
     Some(next)
+}
+
+/// Joins the replicas `layout_now` added, those not among `members`: through
+/// each replica their shard kept in turn (one may be down). Settling joins a
+/// replica if all of them fail, or one fails it partway. A no-op for a
+/// replica that copied its slots during the change.
+async fn join_new(live: &Live, layout_now: &[Vec<NodeId>], members: &[NodeId]) {
+    for (shard, replicas) in layout_now.iter().enumerate() {
+        for &new in replicas.iter().filter(|r| !members.contains(r)) {
+            let contacts: Vec<NodeId> = layout_now[shard]
+                .iter()
+                .copied()
+                .filter(|c| members.contains(c))
+                .collect();
+            let joiner = live.node(new.0 as usize);
+            for attempt in 0..6 {
+                if !joiner.is_joining() {
+                    break;
+                }
+                let contact = contacts
+                    .get(attempt % contacts.len().max(1))
+                    .copied()
+                    .unwrap_or(new);
+                match joiner.join(contact).await {
+                    Ok(_) => break,
+                    Err(err) if err.is::<PartialSnapshot>() => break,
+                    Err(_) => {}
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+    }
 }
 
 /// What a re-sharding run found.
@@ -6316,6 +6344,8 @@ struct ReshardRun {
     liveness: Option<String>,
     /// The changes that installed, of those drawn.
     installed: usize,
+    /// The changes drawn that gave a node back a slot it replicated before.
+    regained: usize,
     /// The writes the clients saw commit.
     acked: usize,
     /// The run's execution trace.
@@ -6368,7 +6398,7 @@ async fn run_reshard(seed: u64, shape: &ReshardConfig) -> ReshardRun {
         let mut spares = spares.clone();
         let changes = shape.changes;
         tokio::spawn(async move {
-            let mut installed = 0;
+            let (mut installed, mut regained) = (0, 0);
             for _ in 0..changes {
                 tokio::time::sleep(Duration::from_millis(rng.random_range(50..500))).await;
                 let known: Vec<NodeId> = layout.lock().unwrap().iter().flatten().copied().collect();
@@ -6381,12 +6411,15 @@ async fn run_reshard(seed: u64, shape: &ReshardConfig) -> ReshardRun {
                 let topology = &topologies[driver.0 as usize];
                 let current = topology.layout();
                 *layout.lock().unwrap() = current.shards().to_vec();
+                let Some(next) = next_layout(&mut rng, &current, &mut spares) else {
+                    continue;
+                };
                 let history: Vec<Arc<Layout>> = (0..current.epoch())
                     .filter_map(|epoch| topology.layout_at(epoch))
                     .collect();
-                let Some(next) = next_layout(&mut rng, &current, &history, &mut spares) else {
-                    continue;
-                };
+                if regains(&current, &history, &next) {
+                    regained += 1;
+                }
                 let members = current.nodes();
                 let epoch = current.epoch() + 1;
                 let node = live.node(driver.0 as usize);
@@ -6399,42 +6432,20 @@ async fn run_reshard(seed: u64, shape: &ReshardConfig) -> ReshardRun {
                     Ok(Ok(layout_now)) => {
                         installed += 1;
                         *layout.lock().unwrap() = layout_now.clone();
-                        for (shard, replicas) in layout_now.iter().enumerate() {
-                            for &new in replicas.iter().filter(|r| !members.contains(r)) {
-                                let contacts: Vec<NodeId> = layout_now[shard]
-                                    .iter()
-                                    .copied()
-                                    .filter(|c| members.contains(c))
-                                    .collect();
-                                // Through each contact in turn: one may be
-                                // down. Settling joins it if all of them
-                                // fail, or one fails it partway.
-                                let joiner = live.node(new.0 as usize);
-                                for attempt in 0..6 {
-                                    if !joiner.is_joining() {
-                                        break;
-                                    }
-                                    let contact = contacts
-                                        .get(attempt % contacts.len().max(1))
-                                        .copied()
-                                        .unwrap_or(new);
-                                    match joiner.join(contact).await {
-                                        Ok(_) => break,
-                                        Err(err) if err.is::<PartialSnapshot>() => break,
-                                        Err(_) => {}
-                                    }
-                                    tokio::time::sleep(Duration::from_millis(200)).await;
-                                }
-                            }
-                        }
+                        join_new(&live, &layout_now, &members).await;
                     }
                     // Not decided (a quorum cut off), or still draining:
                     // the sweep installs it, which the next change waits
-                    // for, so as not to replace it at once.
+                    // for, so as not to replace it at once. Its new
+                    // replicas join then: left joining, their reports never
+                    // move, and the next change that keeps a slot on one of
+                    // them would wait for good.
                     Ok(Err(_)) | Err(_) => {
                         for _ in 0..3_000 {
                             if topology.layout().shards() == next.as_slice() {
                                 installed += 1;
+                                *layout.lock().unwrap() = next.clone();
+                                join_new(&live, &next, &members).await;
                                 break;
                             }
                             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -6443,7 +6454,7 @@ async fn run_reshard(seed: u64, shape: &ReshardConfig) -> ReshardRun {
                 }
             }
             driving.store(false, Ordering::Relaxed);
-            installed
+            (installed, regained)
         })
     };
 
@@ -6539,7 +6550,7 @@ async fn run_reshard(seed: u64, shape: &ReshardConfig) -> ReshardRun {
     for client in clients {
         let _ = client.await;
     }
-    let installed = driver.await.unwrap_or(0);
+    let (installed, regained) = driver.await.unwrap_or((0, 0));
     done.store(true, Ordering::Relaxed);
     if let Some(faulting) = faulting {
         let _ = faulting.await;
@@ -6551,6 +6562,7 @@ async fn run_reshard(seed: u64, shape: &ReshardConfig) -> ReshardRun {
         safety: None,
         liveness: None,
         installed,
+        regained,
         acked: records.iter().filter(|r| r.committed).count(),
         hash: 0,
     };
@@ -6631,21 +6643,33 @@ async fn run_reshard(seed: u64, shape: &ReshardConfig) -> ReshardRun {
 
 /// Every replica of the final layout holds each aggregate's committed
 /// versions — contiguous from 1, none fewer than the clients saw commit —
-/// as the same events, stamped in version order. Waits for anti-entropy to
-/// bring a lagging replica in first.
+/// as the same events, stamped in version order; and no other member of the
+/// final layout holds any of them (a slot a change took from a node is
+/// dropped once the change installed, #372). Waits for anti-entropy to bring
+/// a lagging replica in, and for the drops, first.
 async fn reshard_violation(
     sim: &Sim,
     layout: &[Vec<NodeId>],
     history: &[WriteRecord],
 ) -> Option<String> {
-    // The final layout's slot table is its members': read it from one.
-    let probe = sim.dynamic[layout[0][0].0 as usize].layout();
+    // The final layout's slot table is its members': read it from one — and
+    // read it again while waiting: a change left draining when the cluster
+    // settled (its new replicas joined only now) may install meanwhile, and
+    // its gainers hold what they copied before they own it.
+    let member = layout[0][0].0 as usize;
     let acked = acked_versions(history);
     for (agg, &max) in &acked {
-        let owners = probe.replicas(&Key(agg.clone())).to_vec();
+        let key = Key(agg.clone());
+        let mut probe = sim.dynamic[member].layout();
+        let mut owners = probe.replicas(&key).to_vec();
         let mut last = String::new();
         let mut agreed = false;
         for _ in 0..1_500 {
+            let now = sim.dynamic[member].layout();
+            if now.epoch() != probe.epoch() {
+                probe = now;
+                owners = probe.replicas(&key).to_vec();
+            }
             let mut held: Vec<Vec<u64>> = Vec::new();
             for owner in &owners {
                 held.push(sim.stores[owner.0 as usize].events_of(agg));
@@ -6661,6 +6685,31 @@ async fn reshard_violation(
         if !agreed {
             return Some(format!(
                 "a replica of the final layout lacks writes: {last}"
+            ));
+        }
+        let mut stale = String::new();
+        for _ in 0..1_500 {
+            let now = sim.dynamic[member].layout();
+            if now.epoch() != probe.epoch() {
+                probe = now;
+                owners = probe.replicas(&key).to_vec();
+            }
+            stale.clear();
+            for other in probe.nodes().iter().filter(|m| !owners.contains(m)) {
+                let held = sim.stores[other.0 as usize].events_of(agg);
+                if !held.is_empty() {
+                    stale = format!("{agg}: {other:?} is no owner but holds {held:?}");
+                    break;
+                }
+            }
+            if stale.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        if !stale.is_empty() {
+            return Some(format!(
+                "a member of the final layout kept a slot it lost (or a change never installed): {stale}"
             ));
         }
         for owner in &owners {
@@ -6738,9 +6787,9 @@ async fn resharding_keeps_every_write() {
         let shape = ReshardConfig::from_seed(seed);
         let run = run_reshard(seed, &shape).await;
         eprintln!(
-            "reshard seed {seed}: {} of {} changes installed, {} writes acked \
-             ({} shards, {} spares)",
-            run.installed, shape.changes, run.acked, shape.shards, shape.spares
+            "reshard seed {seed}: {} of {} changes installed ({} regained slots), {} writes \
+             acked ({} shards, {} spares)",
+            run.installed, shape.changes, run.regained, run.acked, shape.shards, shape.spares
         );
         assert!(
             run.safety.is_none() && run.liveness.is_none(),
@@ -6765,7 +6814,7 @@ async fn resharding_is_bit_reproducible() {
 #[tokio::test(start_paused = true)]
 #[ignore = "re-sharding swarm: run explicitly, with SIM_SEEDS or SIM_DURATION for fresh seeds"]
 async fn reshard_swarm() {
-    let (mut runs, mut drawn, mut installed, mut acked) = (0, 0, 0, 0);
+    let (mut runs, mut drawn, mut installed, mut regained, mut acked) = (0, 0, 0, 0, 0);
     for (seed, _replay) in sim_seeds("reshard_swarm", 0..64) {
         let shape = ReshardConfig::from_seed(seed);
         let run = run_reshard(seed, &shape).await;
@@ -6776,11 +6825,12 @@ async fn reshard_swarm() {
         runs += 1;
         drawn += shape.changes;
         installed += run.installed;
+        regained += run.regained;
         acked += run.acked;
     }
     eprintln!(
         "reshard swarm: {runs} seeds with no violation, {installed} of {drawn} changes \
-         installed, {acked} writes acked"
+         installed ({regained} regained slots), {acked} writes acked"
     );
 }
 

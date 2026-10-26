@@ -143,6 +143,12 @@ pub enum RecordKind {
     /// (`Journal::save_peer_marks`), as a `Vec` of
     /// ([`NodeId`](crate::clock::NodeId), [`DurableMark`](crate::api::DurableMark)).
     PeerMarks = 15,
+    /// How far the replica got copying the slots a layout transition gives
+    /// it (`Journal::save_copy_state`), as a [`CopyState`](crate::api::CopyState).
+    CopyState = 16,
+    /// The epoch through which the replica dropped the slots it does not own
+    /// (`Journal::save_slot_gc`), as a `u64`.
+    SlotGc = 17,
 }
 
 impl RecordKind {
@@ -162,6 +168,8 @@ impl RecordKind {
             13 => Some(Self::Fences),
             14 => Some(Self::VoteFence),
             15 => Some(Self::PeerMarks),
+            16 => Some(Self::CopyState),
+            17 => Some(Self::SlotGc),
             _ => None,
         }
     }
@@ -237,6 +245,8 @@ mod tests {
             RecordKind::Fences,
             RecordKind::VoteFence,
             RecordKind::PeerMarks,
+            RecordKind::CopyState,
+            RecordKind::SlotGc,
         ] {
             let value = (42u64, "hello".to_string());
             let bytes = encode_tagged(kind, &value).unwrap();

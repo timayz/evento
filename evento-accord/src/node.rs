@@ -29,8 +29,8 @@ use tokio::time::{Duration, Instant};
 
 use crate::api::{
     floor_millis, slot_of, snapshot_event_size, stamp_events, validate_layout, AcceptorRecord,
-    AmnesiaFence, ConfigEntry, DataStore, Drained, DurableMark, FenceRecord, Journal, Layout,
-    MessageSink, ShardId, ShardMap, Topology,
+    AmnesiaFence, ConfigEntry, CopyPhase, CopyState, DataStore, Drained, DurableMark, FenceRecord,
+    Journal, Layout, MessageSink, ShardId, ShardMap, Topology, SLOTS,
 };
 use crate::clock::{Ballot, Clock, HybridLogicalClock, NodeId, Timestamp, TxnId};
 use crate::failure_detector::FailureDetector;
@@ -1072,6 +1072,13 @@ struct Reconfig {
     /// The transition each node, this one included, last reported it copied
     /// its gained slots for.
     copies: HashMap<NodeId, u64>,
+    /// How far this node got copying the slots a transition gives it, as
+    /// the journal keeps it ([`Journal::save_copy_state`]): `copied` is set
+    /// once it says `Copied`, and no sooner.
+    copy_state: Option<CopyState>,
+    /// The epoch through which this node dropped the slots it does not own
+    /// under the installed layout ([`gc_lost_slots`](Node::gc_lost_slots)).
+    slot_gc: Option<u64>,
 }
 
 impl Reconfig {
@@ -1889,7 +1896,7 @@ impl Node {
         // store that already holds them is an exact duplicate.
         for cmd in &commands {
             if cmd.status == Status::Applied && cmd.applied_conflict == Some(false) {
-                let mut events = cmd.events.clone();
+                let mut events = self.owned_now(cmd.events.clone());
                 stamp_events(cmd.execute_at, &mut events);
                 if let Err(err) = self
                     .datastore
@@ -1920,6 +1927,9 @@ impl Node {
                 }
             }
         }
+        // After the replay: a slot the node lost before it went down, whose
+        // drop it did not finish (or record), goes now.
+        self.gc_lost_slots().await;
         Ok(())
     }
 
@@ -1975,6 +1985,8 @@ impl Node {
         let fences = self.journal.load_fences().await?;
         let vote_fence = self.journal.load_vote_fence().await?;
         let peer_marks = self.journal.load_peer_marks().await?;
+        let copy_state = self.journal.load_copy_state().await?;
+        let slot_gc = self.journal.load_slot_gc().await?;
         // Nothing durable at all: the node never voted, promised, reported
         // or minted anything under this journal — a new member's, or a
         // replacement for one that was lost.
@@ -2048,11 +2060,22 @@ impl Node {
         }
         // A transition's fence comes back at the point it was journaled at:
         // a point recomputed now could lie below votes it refused.
-        self.reconfig
-            .lock()
-            .expect("reconfig poisoned")
-            .restored
-            .extend(fences.into_iter().map(|f| (f.since, f.cap)));
+        {
+            let mut reconfig = self.reconfig.lock().expect("reconfig poisoned");
+            reconfig
+                .restored
+                .extend(fences.into_iter().map(|f| (f.since, f.cap)));
+            // A copy the journal holds complete is complete: the store took
+            // every page before it was recorded. One it holds started is
+            // resumed, not dropped again (`copy_gained_slots`).
+            if let Some(state) = &copy_state {
+                if state.phase == CopyPhase::Copied {
+                    reconfig.copied = Some(state.since);
+                }
+            }
+            reconfig.copy_state = copy_state;
+            reconfig.slot_gc = slot_gc;
+        }
         {
             let mut log = self.meta_log.lock().expect("meta_log poisoned");
             for (epoch, entry) in metadata {
@@ -2743,6 +2766,9 @@ impl Node {
 
         // (1) Metadata anti-entropy.
         self.fetch_metadata().await;
+
+        // (1a) The slots a change took from this node go, once it installed.
+        self.gc_lost_slots().await;
 
         // (1b) A node that lost its journal reads the other acceptors' state
         // back before it votes in config Paxos again (#338); retried each
@@ -4630,6 +4656,31 @@ impl Node {
                     ));
                     return out;
                 }
+                // A key this node does not own under the layout it installed
+                // is not here: a change took it away and its slot was
+                // dropped (or is about to be). A requester behind on the
+                // layout gets a failure, not a page that reads as "no such
+                // events".
+                let filters: Option<Arc<[EventFilter]>> = aggregators.as_deref().map(Arc::from);
+                let routed = crate::executor::target_key(&filters, &routing_key, &tenant);
+                if let Some(key) = routed.filter(|key| !self.topology.owns(self.id, key)) {
+                    let epoch = self.topology.epoch();
+                    tracing::debug!(
+                        node = self.id.0,
+                        from = from.0,
+                        ?key,
+                        epoch,
+                        "a forwarded read of a key this node does not own"
+                    );
+                    out.push((
+                        from,
+                        Message::ReadFailed {
+                            id,
+                            reason: format!("not an owner of the key under epoch {epoch}"),
+                        },
+                    ));
+                    return out;
+                }
                 let reply = match self
                     .datastore
                     .read(
@@ -4787,6 +4838,9 @@ impl Node {
                 // The events carry their writer's provisional stamps; the
                 // store gets the agreed ones (see `stamp_events`). The journal
                 // keeps the provisional ones — every apply re-derives the same.
+                // Only the keys this node owns now land in the store: a key a
+                // layout change took from it was dropped, and stays dropped.
+                apply.events = self.owned_now(apply.events);
                 stamp_events(apply.execute_at, &mut apply.events);
                 if let Err(err) = self
                     .datastore
@@ -8123,9 +8177,30 @@ impl Node {
         {
             self.clock.restore(minted);
         }
+        let installed = self.installed_epoch();
         for cmd in commands {
             if !cmd.keys.iter().any(|k| self.topology.owns(self.id, k)) {
                 continue;
+            }
+            // Planned under a layout this node has not installed: which of
+            // its keys this node owns, it cannot tell yet — judged under the
+            // layout it has, a key it is about to own would be left out of
+            // the store, and the command marked applied never shipped again.
+            // The round stops here, as at a failed apply: what follows is in
+            // execution order, and may be planned under that epoch too, and
+            // a round that stops proves no coverage (the peer would compact
+            // what was not imported). The metadata sweep installs the epoch,
+            // and the next round ships the command again.
+            if cmd.epoch > installed {
+                tracing::debug!(
+                    node = self.id.0,
+                    txn = ?cmd.txn,
+                    epoch = cmd.epoch,
+                    installed,
+                    "an import planned under an epoch not installed here waits"
+                );
+                apply_failed = true;
+                break;
             }
             // Already applied here (or compacted away below the floor): nothing
             // to ship. A cheap pre-check; `import_applied` re-checks under the
@@ -8139,7 +8214,7 @@ impl Node {
             {
                 continue;
             }
-            let (txn, execute_at, mut events) = (cmd.txn, cmd.execute_at, cmd.events.clone());
+            let (txn, execute_at, events) = (cmd.txn, cmd.execute_at, cmd.events.clone());
             // Journaled first (#331): once recorded here, a report of this node
             // may count it as applied, and a peer compact it away on that
             // report. A restart that forgot it would restore only what the
@@ -8155,7 +8230,10 @@ impl Node {
                 break;
             }
             // Shipped with the provisional stamps; applied with the agreed
-            // ones, exactly as the contact applied them.
+            // ones, exactly as the contact applied them — for the keys this
+            // node owns now: a peer behind on the layout may still ship a
+            // key this node dropped.
+            let mut events = self.owned_now(events);
             stamp_events(execute_at, &mut events);
             let commit = cmd.applied_conflict == Some(false);
             // Materialise the events in the data store **before** recording the
@@ -8307,9 +8385,10 @@ impl Node {
     /// anti-entropy rounds and the copies, all run by the recovery sweep
     /// ([`start_recovery`](Node::start_recovery)) of every node, the new ones
     /// included. A change while a transition is in progress replaces it; one
-    /// back to the live layout cancels it. A change that gives a node a slot it
-    /// replicated before is refused (its store still holds that slot's events
-    /// from then).
+    /// back to the live layout cancels it. A change may give a node a slot it
+    /// replicated before: the node drops what it still holds for it before
+    /// copying it, and a node drops the slots a change takes from it once
+    /// the change installs.
     ///
     /// The acceptor set is the members of the current epoch (a node proposing the
     /// next epoch is still on this one), so it tracks membership: changes keep
@@ -8347,35 +8426,11 @@ impl Node {
     /// The shard map a change from `live` to `shards` installs: `live`'s slot
     /// table rebalanced over `shards` ([`ShardMap::rebalanced`]: with another
     /// shard count, only the slots a new shard needs, or a removed one leaves,
-    /// move). Refused when a node would gain a slot it replicated before and
-    /// gave up: its store still holds that slot's events from then, and
-    /// nothing drops them yet.
+    /// move). A node may get a slot back it replicated before: it drops what
+    /// it holds for the slot before copying it ([`copy_gained_slots`](Self::copy_gained_slots)).
     fn change_map(&self, live: &Layout, shards: Vec<Vec<NodeId>>) -> anyhow::Result<ShardMap> {
         let map = live.map().rebalanced(shards);
         map.validate()?;
-        let next = Layout::from_map(live.epoch() + 1, map.clone());
-        let start = self.meta_log.lock().expect("meta_log poisoned").start_epoch;
-        for node in reconfig::gainers(live, &next) {
-            let gained: Vec<usize> = reconfig::gained_slots(live, &next, node)
-                .into_values()
-                .flatten()
-                .collect();
-            for epoch in start..live.epoch() {
-                let Some(before) = self.topology.layout_at(epoch) else {
-                    continue;
-                };
-                if let Some(&slot) = gained.iter().find(|&&slot| {
-                    before
-                        .replicas_of(before.slots()[slot] as usize)
-                        .contains(&node)
-                }) {
-                    anyhow::bail!(
-                        "{node:?} would regain slot {slot}, which it replicated at epoch {epoch}: \
-                         its store still holds that slot's events from then"
-                    );
-                }
-            }
-        }
         Ok(map)
     }
 
@@ -8523,22 +8578,41 @@ impl Node {
     /// past that shard's own drain point ([`reconfig::shard_drain_point`]).
     /// The keys take no new write while the transition drains, so the copy is
     /// final. Installed like a join's snapshot, under a synthetic id at that
-    /// point, without what the store already holds (a copy interrupted, or
-    /// one for a transition replaced since). Returns whether every gained slot
-    /// is in; a shard not drained yet, or a contact that failed, is retried by
-    /// the next sweep.
+    /// point, as the continuation of what the store holds.
+    ///
+    /// Before the first page, the gained slots are dropped from the store:
+    /// this node does not own them under the live layout, so whatever it
+    /// holds for them is stale — the events from when it replicated them
+    /// before, or a copy for a transition replaced since — and a copy over a
+    /// stale prefix would skip it (#372). The drop is journaled once done
+    /// ([`CopyPhase::Dropped`]), so a copy interrupted — by a failed page,
+    /// or a restart — resumes over the contiguous prefix it left, and drops
+    /// nothing again. The copy is journaled complete, and flushed, before it
+    /// is reported ([`CopyPhase::Copied`]): the activation goes by the
+    /// report, and the sources drop the slots once it installs, so a
+    /// restarted gainer must never drop and copy again what it reported.
+    /// Returns whether every gained slot is in; a shard not drained yet, or a
+    /// contact that failed, is retried by the next sweep.
     async fn copy_gained_slots(&self, since: u64) -> bool {
-        let (live, pending, fences) = {
+        let (live, pending, fences, dropped) = {
             let reconfig = self.reconfig.lock().expect("reconfig poisoned");
             let Some(transition) = reconfig.transition.as_ref().filter(|t| t.since == since) else {
                 return false;
             };
+            let dropped = reconfig
+                .copy_state
+                .as_ref()
+                .is_some_and(|state| state.since == since && state.map == transition.pending.map());
             (
                 Arc::clone(&transition.live),
                 Arc::clone(&transition.pending),
                 reconfig.reported.clone(),
+                dropped,
             )
         };
+        if !dropped && !self.drop_gained_slots(since, &live, &pending).await {
+            return false;
+        }
         let live_since = self.live_since();
         let reports = self
             .peer_watermarks
@@ -8620,7 +8694,25 @@ impl Node {
                 "copied the slots a transition moves here"
             );
         }
-        self.reconfig.lock().expect("reconfig poisoned").copied = Some(since);
+        let state = CopyState {
+            since,
+            map: pending.map().clone(),
+            phase: CopyPhase::Copied,
+        };
+        if let Err(err) = self.journal.save_copy_state(&state).await {
+            tracing::warn!(node = self.id.0, since, %err, "cannot journal a finished copy; not reporting it");
+            return false;
+        }
+        if let Err(err) = self.journal.flush().await {
+            tracing::warn!(node = self.id.0, since, %err, "cannot flush a finished copy; not reporting it");
+            return false;
+        }
+        self.metrics.record_flush();
+        {
+            let mut reconfig = self.reconfig.lock().expect("reconfig poisoned");
+            reconfig.copy_state = Some(state);
+            reconfig.copied = Some(since);
+        }
         // A new node opened joining holds its slots now: it serves, and what
         // it buffered meanwhile is handled.
         if !self.bootstrapped.load(Ordering::Acquire) && self.pending_fence().is_none() {
@@ -8636,8 +8728,54 @@ impl Node {
         true
     }
 
-    /// `events` without those the store already holds: a stream's events at
-    /// or below its current version (the store applied them, verbatim).
+    /// Drops from the store the slots this node gains in the transition
+    /// first decided at `since`, and journals that it did
+    /// ([`CopyPhase::Dropped`]). Returns whether both are done; a failure is
+    /// retried by the next sweep, the drop first again (what a drop that
+    /// failed partway left is dropped again).
+    async fn drop_gained_slots(&self, since: u64, live: &Layout, pending: &Layout) -> bool {
+        let mut gained: Vec<u16> = reconfig::gained_slots(live, pending, self.id)
+            .into_values()
+            .flatten()
+            .map(|slot| slot as u16)
+            .collect();
+        gained.sort_unstable();
+        let dropped = match self.datastore.drop_slots(&gained).await {
+            Ok(dropped) => dropped,
+            Err(err) => {
+                tracing::warn!(node = self.id.0, since, %err, "cannot drop the slots a transition gives this node");
+                return false;
+            }
+        };
+        if dropped > 0 {
+            self.metrics.record_streams_dropped(dropped);
+            tracing::info!(
+                node = self.id.0,
+                since,
+                slots = gained.len(),
+                streams = dropped,
+                "dropped what the store held for the slots a transition gives this node"
+            );
+        }
+        let state = CopyState {
+            since,
+            map: pending.map().clone(),
+            phase: CopyPhase::Dropped,
+        };
+        if let Err(err) = self.journal.save_copy_state(&state).await {
+            tracing::warn!(node = self.id.0, since, %err, "cannot journal a drop; the copy waits");
+            return false;
+        }
+        self.reconfig.lock().expect("reconfig poisoned").copy_state = Some(state);
+        true
+    }
+
+    /// `events` without those the store already holds, and without a gap: a
+    /// stream's events continue its current version, each the next (the
+    /// store applied the ones at or below it, verbatim). An event past a gap
+    /// is left out too — a page that ran ahead of a late apply at its source
+    /// — rather than put into the store ahead of what precedes it; the gap is
+    /// filled by a later page.
     async fn not_held(&self, events: Vec<Event>) -> anyhow::Result<Vec<Event>> {
         let mut versions: HashMap<(String, String, String), u16> = HashMap::new();
         let mut kept = Vec::with_capacity(events.len());
@@ -8654,15 +8792,80 @@ impl Node {
                         .datastore
                         .version(&stream.0, &stream.1, &stream.2)
                         .await?;
-                    versions.insert(stream, version);
+                    versions.insert(stream.clone(), version);
                     version
                 }
             };
-            if event.version > version {
+            if event.version == version + 1 {
+                versions.insert(stream, event.version);
                 kept.push(event);
             }
         }
         Ok(kept)
+    }
+
+    /// Drops from the store the slots this node does not own under the
+    /// layout it has installed — the slots a layout change took from it, or
+    /// gave it and then went back on — once, per installed epoch, and
+    /// journals the epoch ([`Journal::save_slot_gc`]). The slots this node is
+    /// copying for a transition in progress are not its own yet and stay. A
+    /// drop that fails, or a node that goes down partway, drops again at the
+    /// next sweep or restart: dropping what is already gone is a no-op. Only
+    /// after an activation installed does a node stop owning a slot, and by
+    /// then every write on it that committed is applied at its new owners
+    /// (`reconfig`): nothing a replica alone holds goes.
+    async fn gc_lost_slots(&self) {
+        let layout = self.topology.layout();
+        let epoch = layout.epoch();
+        let copying: Vec<usize> = {
+            let reconfig = self.reconfig.lock().expect("reconfig poisoned");
+            if reconfig.slot_gc.is_some_and(|through| through >= epoch) {
+                return;
+            }
+            reconfig
+                .transition
+                .as_ref()
+                .filter(|t| t.gainers.contains(&self.id))
+                .map(|t| {
+                    reconfig::gained_slots(&t.live, &t.pending, self.id)
+                        .into_values()
+                        .flatten()
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let unowned: Vec<u16> = (0..SLOTS)
+            .filter(|&slot| {
+                !layout
+                    .replicas_of(layout.slots()[slot] as usize)
+                    .contains(&self.id)
+                    && !copying.contains(&slot)
+            })
+            .map(|slot| slot as u16)
+            .collect();
+        let dropped = match self.datastore.drop_slots(&unowned).await {
+            Ok(dropped) => dropped,
+            Err(err) => {
+                tracing::warn!(node = self.id.0, epoch, %err, "cannot drop the slots this node no longer owns");
+                return;
+            }
+        };
+        if dropped > 0 {
+            self.metrics.record_streams_dropped(dropped);
+            tracing::info!(
+                node = self.id.0,
+                epoch,
+                slots = unowned.len(),
+                streams = dropped,
+                "dropped the slots this node does not own under the installed layout"
+            );
+        }
+        if let Err(err) = self.journal.save_slot_gc(epoch).await {
+            tracing::warn!(node = self.id.0, epoch, %err, "cannot journal the slot drop; it runs again");
+            return;
+        }
+        let mut reconfig = self.reconfig.lock().expect("reconfig poisoned");
+        reconfig.slot_gc = Some(reconfig.slot_gc.map_or(epoch, |through| through.max(epoch)));
     }
 
     /// Decides, and commits, the entry that ends the transition first decided
@@ -9143,6 +9346,7 @@ impl Node {
             self.applied.bump();
         }
         self.persist_fences().await;
+        self.gc_lost_slots().await;
     }
 
     /// Journals the fences, if one is not journaled yet, then reads them
@@ -9448,6 +9652,26 @@ impl Node {
                 }
             })
             .collect()
+    }
+
+    /// The events this node owns under the layout it has installed — what
+    /// may land in its store. A transaction is voted on and recovered under
+    /// the layout it was planned under ([`owned_events`](Self::owned_events)),
+    /// but its events are stored under the installed one: a key a layout
+    /// change took from this node was dropped from its store
+    /// ([`gc_lost_slots`](Self::gc_lost_slots)), and a late apply, an
+    /// anti-entropy import from a peer behind on the layout, or a restart's
+    /// replay must not bring a fragment of it back. The transaction is still
+    /// marked applied: its status is what the watermark, the read barrier
+    /// and anti-entropy go by, and every committed write on a moved key is
+    /// applied at its new owners before the layout that moves it installs.
+    fn owned_now(&self, events: Vec<Event>) -> Vec<Event> {
+        let before = events.len();
+        let owned = self.owned_events(&self.topology.layout(), events);
+        if owned.len() < before {
+            self.metrics.record_applies_not_owned();
+        }
+        owned
     }
 
     /// The keys this node owns under `layout`.

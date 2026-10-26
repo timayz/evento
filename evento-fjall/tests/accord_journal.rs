@@ -5,8 +5,9 @@
 #![cfg(feature = "accord")]
 
 use evento_accord::{
-    AcceptorRecord, AmnesiaFence, Ballot, CommandState, ConfigEntry, DecisionRecord, DurableMark,
-    FenceRecord, Journal, Key, NodeId, Status, Timestamp, TxnId,
+    AcceptorRecord, AmnesiaFence, Ballot, CommandState, ConfigEntry, CopyPhase, CopyState,
+    DecisionRecord, DurableMark, FenceRecord, Journal, Key, NodeId, ShardMap, Status, Timestamp,
+    TxnId,
 };
 use evento_core::Event;
 use evento_fjall::FjallJournal;
@@ -223,6 +224,47 @@ async fn rejoin_bounds_survive_close_and_reopen() {
     assert_eq!(journal.load_rejoin_bounds().await.unwrap(), bounds);
     journal.save_rejoin_bounds(&[]).await.unwrap();
     assert!(journal.load_rejoin_bounds().await.unwrap().is_empty());
+}
+
+/// The copy state and the slot GC epoch are staged like a command: durable
+/// at a flush, kept across a truncate and a reopen; the copy state is
+/// replaced, the GC epoch only raised (#372).
+#[tokio::test]
+async fn copy_state_and_slot_gc_survive_close_and_reopen_and_truncate() {
+    let temp = tempfile::Builder::new()
+        .prefix("evento_accord_journal_copy")
+        .tempdir()
+        .unwrap();
+    let map = ShardMap::even(vec![
+        vec![evento_accord::NodeId(0)],
+        vec![evento_accord::NodeId(1)],
+    ]);
+    let dropped = CopyState {
+        since: 3,
+        map: map.clone(),
+        phase: CopyPhase::Dropped,
+    };
+    let copied = CopyState {
+        phase: CopyPhase::Copied,
+        ..dropped.clone()
+    };
+    {
+        let journal = FjallJournal::open(temp.path()).unwrap();
+        assert_eq!(journal.load_copy_state().await.unwrap(), None);
+        assert_eq!(journal.load_slot_gc().await.unwrap(), None);
+        journal.save_copy_state(&dropped).await.unwrap();
+        journal.save_slot_gc(4).await.unwrap();
+        journal.flush().await.unwrap();
+    }
+    let journal = FjallJournal::open(temp.path()).unwrap();
+    assert_eq!(journal.load_copy_state().await.unwrap(), Some(dropped));
+    assert_eq!(journal.load_slot_gc().await.unwrap(), Some(4));
+    journal.save_copy_state(&copied).await.unwrap();
+    journal.save_slot_gc(6).await.unwrap();
+    journal.truncate(timestamp(1_000, 0)).await.unwrap();
+    journal.flush().await.unwrap();
+    assert_eq!(journal.load_copy_state().await.unwrap(), Some(copied));
+    assert_eq!(journal.load_slot_gc().await.unwrap(), Some(6));
 }
 
 #[tokio::test]
