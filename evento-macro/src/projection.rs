@@ -223,6 +223,19 @@ pub fn projection_cursor_impl(attr: TokenStream, input: &DeriveInput) -> Result<
         }
     });
 
+    // The tenant is set at load time and the snapshot key already names it,
+    // so it stays out of bitcode snapshots. The helper attribute only exists
+    // when a bitcode derive is present.
+    let derives_bitcode = existing_derives
+        .iter()
+        .chain(custom_derives.iter())
+        .any(|path| {
+            path.segments
+                .last()
+                .is_some_and(|s| s.ident == "Encode" || s.ident == "Decode")
+        });
+    let tenant_attr = derives_bitcode.then(|| quote! { #[bitcode(skip)] });
+
     let projection_aggregate = args.id.as_ref().map(|id| {
         quote! {
             impl #impl_generics ::evento::projection::ProjectionAggregate for #struct_name #ty_generics #where_clause {
@@ -240,6 +253,8 @@ pub fn projection_cursor_impl(attr: TokenStream, input: &DeriveInput) -> Result<
             #(#existing_fields,)*
             pub cursor: #cursor_ty,
             pub aggregate_version: u16,
+            #tenant_attr
+            pub tenant: String,
         }
 
         impl #impl_generics ::evento::ProjectionCursor for #struct_name #ty_generics #where_clause {
@@ -251,6 +266,14 @@ pub fn projection_cursor_impl(attr: TokenStream, input: &DeriveInput) -> Result<
 
             fn get_aggregate_version(&self) -> u16 {
                 self.aggregate_version
+            }
+
+            fn set_tenant(&mut self, v: &str) {
+                self.tenant = v.to_owned();
+            }
+
+            fn get_tenant(&self) -> &str {
+                &self.tenant
             }
 
             #projection_name

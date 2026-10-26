@@ -262,8 +262,8 @@ Projections backed by a custom table (SQL, …) implement `Snapshot` by hand.
 
 The write model is a projection with `id = <field>` (this implements
 `ProjectionAggregate`, whose `write()` returns a `WriteBuilder` pre-filled with
-the aggregate id + the version the load observed — optimistic concurrency for
-free). `#[evento::command]` on an impl block turns each method with a trailing
+the aggregate id, the version the load observed and the tenant it was loaded in
+— optimistic concurrency for free, in the right stream). `#[evento::command]` on an impl block turns each method with a trailing
 `routing_key: Option<String>` parameter into three wrappers: `x(..)`,
 `x_with_routing(.., key)`, `x_opt(.., Option<String>)`.
 
@@ -386,7 +386,8 @@ aggregate type as a string; it has no `.decode()`.
   `by_type::<A>()`, `by_id::<A>(id)`, `by_event::<Ev>()`, `exact::<Ev>(id)` — each with
   a `*_raw` string form (`by_id_raw(type, id)`, …) for runtime types.
 - The ext trait `AggregateExt` adds `executor.has_event::<Ev>(id)` and
-  `executor.original_version::<Ev>(id)`.
+  `executor.original_version::<Ev>(id)`; both read the default tenant unless
+  `.tenant(t)` is chained before the `.await`.
 
 ## Gotchas
 

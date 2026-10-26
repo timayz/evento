@@ -32,6 +32,9 @@
 //! ```
 
 use sha3::{Digest, Sha3_256};
+use std::future::{Future, IntoFuture};
+use std::marker::PhantomData;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -569,43 +572,103 @@ pub fn append(id: impl Into<String>) -> WriteBuilder {
 }
 
 /// Convenience queries about an aggregate's event stream, implemented for
-/// every [`Executor`]. They read the default tenant's stream; read another
-/// tenant's with [`ReadBuilder::tenant`](crate::ReadBuilder::tenant).
+/// every [`Executor`]. Each returns a query that reads the default tenant's
+/// stream when awaited as is, or another tenant's after `.tenant(..)`:
+///
+/// ```rust,no_run
+/// # use evento::{AggregateExt, Executor};
+/// # #[evento::aggregate]
+/// # pub enum Account { AccountOpened { owner: String } }
+/// # async fn run<E: Executor>(executor: &E, id: &str) -> anyhow::Result<()> {
+/// let version = executor.original_version::<AccountOpened>(id).await?;
+/// let in_acme = executor
+///     .original_version::<AccountOpened>(id)
+///     .tenant("acme")
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
 pub trait AggregateExt<E: Executor> {
     /// Returns `true` if the aggregate `id` has at least one event of type `A`
     /// — or of an older event that [upcasts](AggregateEvent::upcasters) into it.
-    fn has_event<A: AggregateEvent>(
-        &self,
-        id: impl Into<String>,
-    ) -> impl std::future::Future<Output = anyhow::Result<bool>> + Send;
+    fn has_event<A: AggregateEvent>(&self, id: impl Into<String>) -> HasEvent<'_, E, A>;
 
     /// Returns the current version of the aggregate `id`'s stream (the version
     /// of its most recent event), or `None` when the stream is empty. Useful
-    /// as input to `WriteBuilder::original_version` for optimistic concurrency.
+    /// as input to `WriteBuilder::original_version` for optimistic concurrency;
+    /// ask in the tenant the write will name, since the same id in two tenants
+    /// is two streams.
     fn original_version<A: AggregateEvent>(
         &self,
         id: impl Into<String>,
-    ) -> impl std::future::Future<Output = anyhow::Result<Option<u16>>> + Send;
+    ) -> OriginalVersion<'_, E, A>;
 }
 
 impl<E: Executor> AggregateExt<E> for E {
-    fn has_event<A: AggregateEvent>(
+    fn has_event<A: AggregateEvent>(&self, id: impl Into<String>) -> HasEvent<'_, E, A> {
+        HasEvent {
+            executor: self,
+            id: id.into(),
+            tenant: String::new(),
+            _event: PhantomData,
+        }
+    }
+
+    fn original_version<A: AggregateEvent>(
         &self,
         id: impl Into<String>,
-    ) -> impl std::future::Future<Output = anyhow::Result<bool>> + Send {
-        let id = id.into();
-        Box::pin(async move {
-            // Older events that upcast into `A` count as `A`.
-            let filters = std::iter::once(A::event_name())
-                .chain(A::upcasters().iter().map(|u| u.from))
-                .map(|name| EventFilter::exact_raw(A::aggregate_type(), id.clone(), name))
-                .collect::<Arc<[EventFilter]>>();
+    ) -> OriginalVersion<'_, E, A> {
+        OriginalVersion {
+            executor: self,
+            id: id.into(),
+            tenant: String::new(),
+            _event: PhantomData,
+        }
+    }
+}
 
-            let result = self
+/// A pending [`AggregateExt::has_event`] query: `.await` it for the default
+/// tenant, or name a [`tenant`](Self::tenant) first.
+#[must_use = "a query does nothing until awaited"]
+pub struct HasEvent<'a, E, A> {
+    executor: &'a E,
+    id: String,
+    tenant: String,
+    _event: PhantomData<fn() -> A>,
+}
+
+impl<E: Executor, A: AggregateEvent> HasEvent<'_, E, A> {
+    /// Asks about the stream of `tenant` instead of the default tenant's
+    /// (`""`).
+    pub fn tenant(mut self, v: impl Into<String>) -> Self {
+        self.tenant = v.into();
+        self
+    }
+}
+
+impl<'a, E: Executor, A: AggregateEvent> IntoFuture for HasEvent<'a, E, A> {
+    type Output = anyhow::Result<bool>;
+    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        let Self {
+            executor,
+            id,
+            tenant,
+            ..
+        } = self;
+        // Older events that upcast into `A` count as `A`.
+        let filters = std::iter::once(A::event_name())
+            .chain(A::upcasters().iter().map(|u| u.from))
+            .map(|name| EventFilter::exact_raw(A::aggregate_type(), id.clone(), name))
+            .collect::<Arc<[EventFilter]>>();
+
+        Box::pin(async move {
+            let result = executor
                 .read(
                     Some(filters),
                     None,
-                    TenantFilter::Only(String::new()),
+                    TenantFilter::Only(tenant),
                     Args::backward(1, None),
                     None,
                 )
@@ -614,18 +677,46 @@ impl<E: Executor> AggregateExt<E> for E {
             Ok(!result.edges.is_empty())
         })
     }
+}
 
-    fn original_version<A: AggregateEvent>(
-        &self,
-        id: impl Into<String>,
-    ) -> impl std::future::Future<Output = anyhow::Result<Option<u16>>> + Send {
-        let id = id.into();
-        Box::pin(async {
-            let result = self
+/// A pending [`AggregateExt::original_version`] query: `.await` it for the
+/// default tenant, or name a [`tenant`](Self::tenant) first.
+#[must_use = "a query does nothing until awaited"]
+pub struct OriginalVersion<'a, E, A> {
+    executor: &'a E,
+    id: String,
+    tenant: String,
+    _event: PhantomData<fn() -> A>,
+}
+
+impl<E: Executor, A: AggregateEvent> OriginalVersion<'_, E, A> {
+    /// Asks about the stream of `tenant` instead of the default tenant's
+    /// (`""`).
+    pub fn tenant(mut self, v: impl Into<String>) -> Self {
+        self.tenant = v.into();
+        self
+    }
+}
+
+impl<'a, E: Executor, A: AggregateEvent> IntoFuture for OriginalVersion<'a, E, A> {
+    type Output = anyhow::Result<Option<u16>>;
+    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        let Self {
+            executor,
+            id,
+            tenant,
+            ..
+        } = self;
+        let filters = Arc::from([EventFilter::by_id::<A>(id)]);
+
+        Box::pin(async move {
+            let result = executor
                 .read(
-                    Some(Arc::from([EventFilter::by_id::<A>(id)])),
+                    Some(filters),
                     None,
-                    TenantFilter::Only(String::new()),
+                    TenantFilter::Only(tenant),
                     Args::backward(1, None),
                     None,
                 )

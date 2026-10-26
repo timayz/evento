@@ -383,6 +383,12 @@ async fn mysql_tenant_projection_subscription() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn mysql_tenant_projection_write_gateway() -> anyhow::Result<()> {
+    let executor = create_mysql_executor("tenant_projection_write_gateway").await?;
+    evento_test::tenant_projection_write_gateway(&executor).await
+}
+
+#[tokio::test]
 async fn mysql_tenant_snapshots_are_isolated() -> anyhow::Result<()> {
     let executor = create_mysql_executor("tenant_snapshots_are_isolated").await?;
     evento_test::tenant_snapshots_are_isolated(&executor).await

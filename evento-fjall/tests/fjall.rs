@@ -331,6 +331,12 @@ async fn fjall_tenant_projection_subscription() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn fjall_tenant_projection_write_gateway() -> anyhow::Result<()> {
+    let executor = Fjall::temporary()?;
+    evento_test::tenant_projection_write_gateway(&executor).await
+}
+
+#[tokio::test]
 async fn fjall_tenant_snapshots_are_isolated() -> anyhow::Result<()> {
     let executor = Fjall::temporary()?;
     evento_test::tenant_snapshots_are_isolated(&executor).await
