@@ -342,6 +342,50 @@ impl<DB: Database> Sql<DB> {
     }
 }
 
+/// Adds the aggregator, routing-key and tenant filters to `statement`.
+///
+/// Shared by [`Executor::read`] and [`Executor::latest_timestamp`], so a
+/// subscription's reads and its lag `MAX(timestamp)` always cover the same
+/// rows. `aggregators` is `None` for every aggregate; an empty slice matches
+/// nothing (sea-query renders an empty `Cond::any()` as `FALSE`).
+fn apply_filters(
+    statement: &mut SelectStatement,
+    aggregators: Option<&[EventFilter]>,
+    routing_key: Option<&evento_core::RoutingKey>,
+    tenant: &TenantFilter,
+) {
+    if let Some(aggregators) = aggregators {
+        let mut cond = Cond::any();
+        for aggregator in aggregators {
+            let mut aggregator_cond = Cond::all()
+                .add(Expr::col(Event::AggregatorType).eq(aggregator.aggregate_type.clone()));
+            if let Some(id) = &aggregator.aggregate_id {
+                aggregator_cond =
+                    aggregator_cond.add(Expr::col(Event::AggregatorId).eq(id.clone()));
+            }
+            if let Some(name) = &aggregator.name {
+                aggregator_cond = aggregator_cond.add(Expr::col(Event::Name).eq(name.clone()));
+            }
+            cond = cond.add(aggregator_cond);
+        }
+        statement.and_where(cond.into());
+    }
+
+    match routing_key {
+        Some(evento_core::RoutingKey::Value(Some(key))) => {
+            statement.and_where(Expr::col(Event::RoutingKey).eq(key));
+        }
+        Some(evento_core::RoutingKey::Value(None)) => {
+            statement.and_where(Expr::col(Event::RoutingKey).is_null());
+        }
+        Some(evento_core::RoutingKey::All) | None => {}
+    }
+
+    if let TenantFilter::Only(tenant) = tenant {
+        statement.and_where(Expr::col(Event::Tenant).eq(tenant));
+    }
+}
+
 #[async_trait::async_trait]
 impl<DB> Executor for Sql<DB>
 where
@@ -364,7 +408,7 @@ where
         args: Args,
         to_micros: Option<u64>,
     ) -> anyhow::Result<ReadResult<evento_core::Event>> {
-        let statement = Query::select()
+        let mut statement = Query::select()
             .columns([
                 Event::Id,
                 Event::Name,
@@ -379,86 +423,31 @@ where
                 Event::TimestampSubsec,
             ])
             .from(Event::Table)
-            .conditions(
-                aggregators.is_some(),
-                |q| {
-                    let Some(aggregators) = aggregators else {
-                        return;
-                    };
-
-                    let mut cond = Cond::any();
-
-                    for aggregator in aggregators.iter() {
-                        let mut aggregator_cond = Cond::all().add(
-                            Expr::col(Event::AggregatorType).eq(aggregator.aggregate_type.clone()),
-                        );
-
-                        if let Some(id) = &aggregator.aggregate_id {
-                            aggregator_cond =
-                                aggregator_cond.add(Expr::col(Event::AggregatorId).eq(id.clone()));
-                        }
-
-                        if let Some(name) = &aggregator.name {
-                            aggregator_cond =
-                                aggregator_cond.add(Expr::col(Event::Name).eq(name.clone()));
-                        }
-
-                        cond = cond.add(aggregator_cond);
-                    }
-
-                    q.and_where(cond.into());
-                },
-                |_| {},
-            )
-            .conditions(
-                matches!(routing_key, Some(evento_core::RoutingKey::Value(_))),
-                |q| {
-                    if let Some(evento_core::RoutingKey::Value(Some(ref routing_key))) = routing_key
-                    {
-                        q.and_where(Expr::col(Event::RoutingKey).eq(routing_key));
-                    }
-
-                    if let Some(evento_core::RoutingKey::Value(None)) = routing_key {
-                        q.and_where(Expr::col(Event::RoutingKey).is_null());
-                    }
-                },
-                |_q| {},
-            )
-            .conditions(
-                matches!(tenant, TenantFilter::Only(_)),
-                |q| {
-                    if let TenantFilter::Only(ref tenant) = tenant {
-                        q.and_where(Expr::col(Event::Tenant).eq(tenant));
-                    }
-                },
-                |_q| {},
-            )
-            .conditions(
-                to_micros.is_some(),
-                |q| {
-                    let Some(bound) = to_micros else {
-                        return;
-                    };
-
-                    // Exclusive bound on the event stamp (`ts` seconds +
-                    // `subsec` milliseconds): stamp < bound ⇔
-                    // ts < bound_secs, or ts = bound_secs and
-                    // subsec·1000 < bound_rem_micros — the latter rewritten as
-                    // an integer comparison (subsec < ceil(rem / 1000)). The
-                    // leading `timestamp <` term keeps the predicate sargable.
-                    let secs = (bound / 1_000_000) as i64;
-                    let subsec_bound = ((bound % 1_000_000).div_ceil(1_000)) as i64;
-                    q.and_where(
-                        Expr::col(Event::Timestamp)
-                            .lt(secs)
-                            .or(Expr::col(Event::Timestamp)
-                                .eq(secs)
-                                .and(Expr::col(Event::TimestampSubsec).lt(subsec_bound))),
-                    );
-                },
-                |_q| {},
-            )
             .to_owned();
+        apply_filters(
+            &mut statement,
+            aggregators.as_deref(),
+            routing_key.as_ref(),
+            &tenant,
+        );
+
+        if let Some(bound) = to_micros {
+            // Exclusive bound on the event stamp (`ts` seconds +
+            // `subsec` milliseconds): stamp < bound ⇔
+            // ts < bound_secs, or ts = bound_secs and
+            // subsec·1000 < bound_rem_micros — the latter rewritten as
+            // an integer comparison (subsec < ceil(rem / 1000)). The
+            // leading `timestamp <` term keeps the predicate sargable.
+            let secs = (bound / 1_000_000) as i64;
+            let subsec_bound = ((bound % 1_000_000).div_ceil(1_000)) as i64;
+            statement.and_where(
+                Expr::col(Event::Timestamp)
+                    .lt(secs)
+                    .or(Expr::col(Event::Timestamp)
+                        .eq(secs)
+                        .and(Expr::col(Event::TimestampSubsec).lt(subsec_bound))),
+            );
+        }
 
         Ok(Reader::new(statement)
             .args(args)
@@ -473,64 +462,16 @@ where
         routing_key: Option<evento_core::RoutingKey>,
         tenant: TenantFilter,
     ) -> anyhow::Result<u64> {
-        let statement = Query::select()
+        let mut statement = Query::select()
             .expr(Func::max(Expr::col(Event::Timestamp)))
             .from(Event::Table)
-            .conditions(
-                aggregators.is_some(),
-                |q| {
-                    let Some(aggregators) = aggregators else {
-                        return;
-                    };
-
-                    let mut cond = Cond::any();
-
-                    for aggregator in aggregators.iter() {
-                        let mut aggregator_cond = Cond::all().add(
-                            Expr::col(Event::AggregatorType).eq(aggregator.aggregate_type.clone()),
-                        );
-
-                        if let Some(id) = &aggregator.aggregate_id {
-                            aggregator_cond =
-                                aggregator_cond.add(Expr::col(Event::AggregatorId).eq(id.clone()));
-                        }
-
-                        if let Some(name) = &aggregator.name {
-                            aggregator_cond =
-                                aggregator_cond.add(Expr::col(Event::Name).eq(name.clone()));
-                        }
-
-                        cond = cond.add(aggregator_cond);
-                    }
-
-                    q.and_where(cond.into());
-                },
-                |_| {},
-            )
-            .conditions(
-                matches!(routing_key, Some(evento_core::RoutingKey::Value(_))),
-                |q| {
-                    if let Some(evento_core::RoutingKey::Value(Some(ref routing_key))) = routing_key
-                    {
-                        q.and_where(Expr::col(Event::RoutingKey).eq(routing_key));
-                    }
-
-                    if let Some(evento_core::RoutingKey::Value(None)) = routing_key {
-                        q.and_where(Expr::col(Event::RoutingKey).is_null());
-                    }
-                },
-                |_q| {},
-            )
-            .conditions(
-                matches!(tenant, TenantFilter::Only(_)),
-                |q| {
-                    if let TenantFilter::Only(ref tenant) = tenant {
-                        q.and_where(Expr::col(Event::Tenant).eq(tenant));
-                    }
-                },
-                |_q| {},
-            )
             .to_owned();
+        apply_filters(
+            &mut statement,
+            aggregators.as_deref(),
+            routing_key.as_ref(),
+            &tenant,
+        );
 
         let (sql, values) = Self::build_sqlx(statement);
 
