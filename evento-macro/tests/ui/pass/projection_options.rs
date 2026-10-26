@@ -18,6 +18,9 @@ fn main() {
     view.set_aggregate_version(3);
     assert_eq!(view.get_aggregate_version(), 3);
 
+    view.set_tenant("acme");
+    assert_eq!(view.get_tenant(), "acme");
+
     assert_eq!(view.aggregate_id(), "account-1");
 
     let builder = view.write().unwrap();

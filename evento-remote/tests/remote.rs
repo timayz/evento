@@ -554,6 +554,12 @@ async fn remote_tenant_projection_subscription() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn remote_tenant_projection_write_gateway() -> anyhow::Result<()> {
+    let server = setup().await?;
+    evento_test::tenant_projection_write_gateway(&server.client).await
+}
+
+#[tokio::test]
 async fn remote_tenant_snapshots_are_isolated() -> anyhow::Result<()> {
     let server = setup().await?;
     evento_test::tenant_snapshots_are_isolated(&server.client).await

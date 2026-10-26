@@ -4954,6 +4954,33 @@ pub async fn tenant_streams_are_isolated<E: Executor + Clone>(executor: &E) -> a
             .await?,
         None
     );
+    // The helpers answer for the tenant they are asked about.
+    assert!(
+        executor
+            .has_event::<MoneyDeposited>(&id)
+            .tenant("tenant-a")
+            .await?
+    );
+    assert!(
+        !executor
+            .has_event::<MoneyDeposited>(&id)
+            .tenant("tenant-b")
+            .await?
+    );
+    assert_eq!(
+        executor
+            .original_version::<bank::aggregator::AccountOpened>(&id)
+            .tenant("tenant-a")
+            .await?,
+        Some(2)
+    );
+    assert_eq!(
+        executor
+            .original_version::<bank::aggregator::AccountOpened>(&id)
+            .tenant("tenant-b")
+            .await?,
+        Some(1)
+    );
 
     // A version conflict is per stream: b is at version 1, whatever a holds.
     assert!(matches!(
@@ -5043,6 +5070,74 @@ pub async fn tenant_projection_subscription<E: Executor + Clone>(
     assert_eq!(load("proj-a").await?.map(|v| v.balance), Some(15));
     assert_eq!(load("proj-b").await?.map(|v| v.balance), Some(20));
     assert!(load("").await?.is_none());
+
+    Ok(())
+}
+
+/// Scenario: a projection loaded in a tenant writes back into that tenant.
+/// `write()` carries the tenant along with the id and the version, so a
+/// command built on a tenant's view appends to the tenant's stream — never to
+/// the default tenant's — and its version check is against that stream.
+pub async fn tenant_projection_write_gateway<E: Executor + Clone>(
+    executor: &E,
+) -> anyhow::Result<()> {
+    use evento::{ProjectionAggregate, ProjectionCursor};
+
+    let id = Ulid::generate().to_string();
+    open_in(executor, "gw-a", &id, 100).await?;
+    open_in(executor, "gw-b", &id, 200).await?;
+    deposit_in(executor, "gw-a", &id, 1, 50).await?;
+
+    let load = |tenant: &'static str| {
+        let id = id.clone();
+        async move {
+            tenant_view::projection::<E>()
+                .load(id)
+                .tenant(tenant)
+                .execute(executor)
+                .await
+        }
+    };
+    let view = load("gw-a").await?.expect("a's account");
+    assert_eq!(view.get_tenant(), "gw-a");
+    assert_eq!((view.balance, view.aggregate_version), (150, 2));
+
+    let deposit = MoneyDeposited {
+        amount: 7,
+        transaction_id: Ulid::generate().to_string(),
+        description: "through the gateway".to_owned(),
+    };
+    view.write()?.event(&deposit).commit(executor).await?;
+
+    let version_in = |tenant: &'static str| {
+        executor
+            .original_version::<bank::aggregator::AccountOpened>(&id)
+            .tenant(tenant)
+    };
+    assert_eq!(version_in("gw-a").await?, Some(3), "the write landed in a");
+    assert_eq!(version_in("gw-b").await?, Some(1), "b is untouched");
+    assert_eq!(
+        version_in("").await?,
+        None,
+        "the default tenant stays empty"
+    );
+    let in_a = load("gw-a").await?.expect("a's account");
+    assert_eq!((in_a.balance, in_a.aggregate_version), (157, 3));
+
+    // The version check is against the tenant's own stream: the view loaded
+    // at version 2 is stale now that a is at 3, whatever b holds.
+    assert!(matches!(
+        view.write()?.event(&deposit).commit(executor).await,
+        Err(evento::WriteError::InvalidOriginalVersion)
+    ));
+
+    // A view the default tenant hands out writes to the default tenant.
+    open_in(executor, "", &id, 1).await?;
+    let in_default = load("").await?.expect("the default tenant's account");
+    assert_eq!(in_default.get_tenant(), "");
+    in_default.write()?.event(&deposit).commit(executor).await?;
+    assert_eq!(version_in("").await?, Some(2));
+    assert_eq!(version_in("gw-a").await?, Some(3));
 
     Ok(())
 }
@@ -5170,13 +5265,15 @@ mod tenant_view {
     /// `(tenant, id)` -> balance, as the handlers last saw it.
     pub static ROWS: Lazy<RwLock<HashMap<(String, String), i64>>> = Lazy::new(Default::default);
 
-    #[evento::projection(bitcode::Encode, bitcode::Decode)]
+    #[evento::projection(id = id, bitcode::Encode, bitcode::Decode)]
     pub struct View {
+        pub id: String,
         pub balance: i64,
     }
 
     #[evento::handler]
     async fn on_opened(event: Event<AccountOpened>, view: &mut View) -> anyhow::Result<()> {
+        view.id = event.aggregate_id.clone();
         view.balance = event.data.initial_balance;
         ROWS.write().unwrap().insert(
             (event.tenant.clone(), event.aggregate_id.clone()),

@@ -168,7 +168,9 @@ pub struct AccountBalanceView {
 }
 
 // Generates:
-// - Adds `pub cursor: String` and `pub aggregate_version: u16` fields
+// - Adds `pub cursor: String`, `pub aggregate_version: u16` and `pub tenant: String`
+//   fields (the tenant is set when the projection is loaded and, when the struct
+//   derives `bitcode::Encode`/`Decode`, is left out of the snapshot)
 // - Implements `ProjectionCursor`
 // - Adds `Default` and `Clone` derives
 ```
@@ -180,7 +182,7 @@ Options, which may be combined in any order:
   (`evento::cursor::Value` itself qualifies).
 - `id = <field>` — additionally implement `ProjectionAggregate`, returning the
   named field as the aggregate id. This enables `view.write()` for emitting
-  events from the projection.
+  events from the projection, in the tenant the view was loaded in.
 - `name = "..."` — pin the projection name that snapshots are keyed by, instead
   of the default `"<module path>::<Struct>"` (see [Snapshots](#snapshots-with-eventosnapshot)).
 - any path (e.g. `bitcode::Encode`, `serde::Serialize`) — added to the derive

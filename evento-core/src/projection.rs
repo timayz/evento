@@ -271,6 +271,20 @@ pub trait ProjectionCursor {
     /// Records the version of the primary aggregate.
     fn set_aggregate_version(&mut self, v: u16);
 
+    /// Returns the tenant the projection is loaded in (`""` is the default
+    /// tenant).
+    ///
+    /// Maintained by `Projection::load_aggregator` like the aggregate version:
+    /// a load names its tenant, and a subscription reloads each aggregate in
+    /// the tenant of the event it handles. [`ProjectionAggregate::write`]
+    /// commits in it. It is not part of the snapshot (the snapshot key already
+    /// names the tenant); `#[evento::projection]` keeps the field out of the
+    /// bitcode encoding.
+    fn get_tenant(&self) -> &str;
+
+    /// Records the tenant the projection is loaded in.
+    fn set_tenant(&mut self, v: &str);
+
     /// Name identifying this projection in the snapshot key
     /// `(aggregate_type, projection, id)`, so several snapshotted views of one
     /// aggregate each get their own slot.
@@ -308,12 +322,16 @@ pub trait ProjectionAggregate: ProjectionCursor {
         Ok(self.get_aggregate_version())
     }
 
-    /// Creates a [`WriteBuilder`] pre-configured with this projection's ID and version.
+    /// Creates a [`WriteBuilder`] pre-configured with this projection's ID,
+    /// version and [tenant](ProjectionCursor::get_tenant).
     ///
-    /// Use this to emit new events from a projection (the write gateway).
+    /// Use this to emit new events from a projection (the write gateway). The
+    /// commit lands in the stream the projection was loaded from: the same id
+    /// in another tenant is another stream, with its own versions.
     fn write(&self) -> anyhow::Result<WriteBuilder> {
         Ok(WriteBuilder::new(self.aggregate_id())
             .original_version(self.aggregate_version()?)
+            .tenant(self.get_tenant())
             .to_owned())
     }
 }
@@ -696,7 +714,11 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
             revision: self.revision,
             projection: P::projection_name(),
         };
-        let snapshot = P::restore(&context).await?;
+        let mut snapshot = P::restore(&context).await?;
+        // Like the cursor, the tenant comes from the load, not the bytes.
+        if let Some(state) = snapshot.as_mut() {
+            state.set_tenant(tenant);
+        }
         let cursor = snapshot.as_ref().map(|s| s.get_cursor());
         // Position the persisted snapshot reaches; advanced after every
         // `take_snapshot` below.
@@ -770,7 +792,11 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
                 break;
             }
             any_events = true;
-            let state = snapshot_state.get_or_insert_with(Default::default);
+            let state = snapshot_state.get_or_insert_with(|| {
+                let mut state = P::default();
+                state.set_tenant(tenant);
+                state
+            });
 
             for event in events.edges.iter() {
                 if !gated {
