@@ -130,6 +130,59 @@ where
     Ok(())
 }
 
+/// One `Reader` serves a retry, the next page and the opposite direction:
+/// `execute` must not leave its cursor predicate, ORDER BY or LIMIT on the
+/// stored statement.
+pub async fn reader_reuse<DB>(pool: Pool<DB>) -> anyhow::Result<()>
+where
+    DB: Database,
+    for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
+    sea_query_sqlx::SqlxValues: sqlx::IntoArguments<DB>,
+    usize: sqlx::ColumnIndex<DB::Row>,
+    evento_sql::SqlEvent: for<'r> sqlx::FromRow<'r, DB::Row>,
+{
+    let data = get_data(&pool).await?;
+    let order = Order::Asc;
+    let mut reader = reader(order.to_owned());
+
+    // A retry: the same page twice.
+    let args = Args::forward(4, None);
+    let first = reader
+        .args(args.clone())
+        .execute::<_, evento_sql::SqlEvent, _>(&pool)
+        .await?
+        .map(|e| e.0);
+    let again = reader
+        .args(args.clone())
+        .execute::<_, evento_sql::SqlEvent, _>(&pool)
+        .await?
+        .map(|e| e.0);
+    assert_eq!(first.edges.len(), again.edges.len());
+    assert_eq!(first.page_info, again.page_info);
+    assert_read_result(args, order.to_owned(), data.clone(), again)?;
+
+    // The next page, on the same reader.
+    let args = Args::forward(4, first.page_info.end_cursor.clone());
+    let second = reader
+        .args(args.clone())
+        .execute::<_, evento_sql::SqlEvent, _>(&pool)
+        .await?
+        .map(|e| e.0);
+    let second_start = second.page_info.start_cursor.clone();
+    assert_read_result(args, order.to_owned(), data.clone(), second)?;
+
+    // Back to the first page from the second one, still on the same reader.
+    let args = Args::backward(4, second_start);
+    let back = reader
+        .args(args.clone())
+        .execute::<_, evento_sql::SqlEvent, _>(&pool)
+        .await?
+        .map(|e| e.0);
+    assert_read_result(args, order, data, back)?;
+
+    Ok(())
+}
+
 pub async fn read<DB>(
     pool: &Pool<DB>,
     args: Args,
@@ -142,6 +195,15 @@ where
     usize: sqlx::ColumnIndex<DB::Row>,
     evento_sql::SqlEvent: for<'r> sqlx::FromRow<'r, DB::Row>,
 {
+    Ok(reader(order)
+        .args(args)
+        .execute::<_, evento_sql::SqlEvent, _>(pool)
+        .await?
+        .map(|e| e.0))
+}
+
+/// A reader over every event column, in `order`, with no args yet.
+fn reader(order: Order) -> Reader {
     let statement = Query::select()
         .columns([
             evento::sql::Event::Id,
@@ -157,13 +219,9 @@ where
         ])
         .from(evento::sql::Event::Table)
         .to_owned();
-
-    Ok(Reader::new(statement)
-        .args(args)
-        .order(order)
-        .execute::<_, evento_sql::SqlEvent, _>(pool)
-        .await?
-        .map(|e| e.0))
+    let mut reader = Reader::new(statement);
+    reader.order(order);
+    reader
 }
 
 pub async fn get_data<DB>(pool: &Pool<DB>) -> anyhow::Result<Vec<Event>>

@@ -1140,7 +1140,8 @@ impl<D: Database> From<Pool<D>> for Sql<D> {
 ///     .from(Event::Table)
 ///     .to_owned();
 ///
-/// let result = Reader::new(statement.clone())
+/// let mut reader = Reader::new(statement);
+/// let result = reader
 ///     .forward(10, None)  // First 10 events
 ///     .execute::<_, SqlEvent, _>(&pool)
 ///     .await?;
@@ -1149,9 +1150,10 @@ impl<D: Database> From<Pool<D>> for Sql<D> {
 ///     println!("Event: {:?}, Cursor: {:?}", edge.node, edge.cursor);
 /// }
 ///
-/// // Continue with next page
+/// // Continue with the next page on the same reader: each `execute` applies
+/// // the cursor, order and limit to a copy of the statement.
 /// if result.page_info.has_next_page {
-///     let next_result = Reader::new(statement)
+///     let next_result = reader
 ///         .forward(10, result.page_info.end_cursor)
 ///         .execute::<_, SqlEvent, _>(&pool)
 ///         .await?;
@@ -1255,15 +1257,20 @@ impl Reader {
         <<O as Bind>::V as IntoIterator>::IntoIter: DoubleEndedIterator,
         sea_query_sqlx::SqlxValues: sqlx::IntoArguments<DB>,
     {
-        let limit = self.build_reader::<O, O>()?;
+        // The keyset predicate, the ORDER BY and the LIMIT go on a copy: the
+        // stored statement stays the caller's base query, so the same reader
+        // can be executed again (a retry, the next page, the other direction)
+        // without stacking a second cursor bound on the first.
+        let mut statement = self.statement.clone();
+        let limit = self.build_reader::<O, O>(&mut statement)?;
 
         let (sql, values) = match DB::NAME {
             #[cfg(feature = "sqlite")]
-            "SQLite" => self.statement.build_sqlx(SqliteQueryBuilder),
+            "SQLite" => statement.build_sqlx(SqliteQueryBuilder),
             #[cfg(feature = "mysql")]
-            "MySQL" => self.build_sqlx(MysqlQueryBuilder),
+            "MySQL" => statement.build_sqlx(MysqlQueryBuilder),
             #[cfg(feature = "postgres")]
-            "PostgreSQL" => self.build_sqlx(PostgresQueryBuilder),
+            "PostgreSQL" => statement.build_sqlx(PostgresQueryBuilder),
             name => panic!("'{name}' not supported, consider using SQLite, PostgreSQL or MySQL"),
         };
 
@@ -1313,7 +1320,12 @@ impl Reader {
         Ok(ReadResult { edges, page_info })
     }
 
-    fn build_reader<O: Cursor, B: Bind<Cursor = O>>(&mut self) -> Result<u16, cursor::CursorError>
+    /// Adds the keyset predicate, the ORDER BY and the LIMIT (+1 probe row)
+    /// for the configured args to `statement`; returns the page size.
+    fn build_reader<O: Cursor, B: Bind<Cursor = O>>(
+        &self,
+        statement: &mut SelectStatement,
+    ) -> Result<u16, cursor::CursorError>
     where
         B::T: Clone,
         <<B as Bind>::I as IntoIterator>::IntoIter: DoubleEndedIterator,
@@ -1322,16 +1334,20 @@ impl Reader {
         let (limit, cursor) = self.args.get_info();
 
         if let Some(cursor) = cursor.as_ref() {
-            self.build_reader_where::<O, B>(cursor)?;
+            self.build_reader_where::<O, B>(statement, cursor)?;
         }
 
-        self.build_reader_order::<B>();
-        self.limit(limit as u64 + 1);
+        self.build_reader_order::<B>(statement);
+        statement.limit(limit as u64 + 1);
 
         Ok(limit)
     }
 
-    fn build_reader_where<O, B>(&mut self, cursor: &Value) -> Result<(), cursor::CursorError>
+    fn build_reader_where<O, B>(
+        &self,
+        statement: &mut SelectStatement,
+        cursor: &Value,
+    ) -> Result<(), cursor::CursorError>
     where
         O: Cursor,
         B: Bind<Cursor = O>,
@@ -1364,13 +1380,13 @@ impl Reader {
         // a cursor cannot constrain anything, so leave the query unfiltered
         // rather than panicking on a public-trait misuse.
         if let Some(expr) = expr {
-            self.and_where(expr);
+            statement.and_where(expr);
         }
 
         Ok(())
     }
 
-    fn build_reader_order<O: Bind>(&mut self) {
+    fn build_reader_order<O: Bind>(&self, statement: &mut SelectStatement) {
         let order = if self.is_order_desc() {
             sea_query::Order::Desc
         } else {
@@ -1379,7 +1395,7 @@ impl Reader {
 
         let columns = O::columns();
         for col in columns {
-            self.order_by(col, order.clone());
+            statement.order_by(col, order.clone());
         }
     }
 

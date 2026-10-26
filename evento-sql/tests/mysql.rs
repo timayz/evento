@@ -148,6 +148,13 @@ async fn mysql_backward_desc() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn mysql_reader_reuse() -> anyhow::Result<()> {
+    let pool = create_mysql_pool("reader_reuse").await?;
+
+    pool::reader_reuse(pool).await
+}
+
+#[tokio::test]
 async fn mysql_read_order_timestamp() -> anyhow::Result<()> {
     let executor = create_mysql_executor("read_order_timestamp").await?;
     evento_test::read_order_timestamp(&executor).await
