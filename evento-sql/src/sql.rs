@@ -6,16 +6,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(feature = "mysql")]
-use sea_query::MysqlQueryBuilder;
-#[cfg(feature = "postgres")]
-use sea_query::PostgresQueryBuilder;
-#[cfg(feature = "sqlite")]
-use sea_query::SqliteQueryBuilder;
 use sea_query::{
     Cond, Expr, ExprTrait, Func, Iden, IntoColumnRef, OnConflict, Query, SelectStatement,
 };
-use sea_query_sqlx::SqlxBinder;
 use sqlx::{Database, Pool};
 use ulid::Ulid;
 
@@ -23,6 +16,8 @@ use evento_core::{
     cursor::{self, Args, Cursor, Edge, PageInfo, ReadResult, Value},
     EventFilter, Executor, SubscriberStatus, TenantFilter, WriteError,
 };
+
+use crate::dialect::{build_sqlx, unsupported};
 
 /// Dialect-agnostic access to a statement's affected-row count.
 ///
@@ -288,18 +283,6 @@ impl<DB: Database> Sql<DB> {
         self
     }
 
-    fn build_sqlx<S: SqlxBinder>(statement: S) -> (String, sea_query_sqlx::SqlxValues) {
-        match DB::NAME {
-            #[cfg(feature = "sqlite")]
-            "SQLite" => statement.build_sqlx(SqliteQueryBuilder),
-            #[cfg(feature = "mysql")]
-            "MySQL" => statement.build_sqlx(MysqlQueryBuilder),
-            #[cfg(feature = "postgres")]
-            "PostgreSQL" => statement.build_sqlx(PostgresQueryBuilder),
-            name => panic!("'{name}' not supported, consider using SQLite, PostgreSQL or MySQL"),
-        }
-    }
-
     /// Per-dialect SQL expressions evaluating to the DB server's current time
     /// as `(whole seconds, milliseconds-within-second)`.
     ///
@@ -324,7 +307,7 @@ impl<DB: Database> Sql<DB> {
                 Expr::cust("FLOOR(EXTRACT(EPOCH FROM now()))::BIGINT"),
                 Expr::cust("MOD(FLOOR(EXTRACT(EPOCH FROM now()) * 1000)::BIGINT, 1000)"),
             ),
-            name => panic!("'{name}' not supported, consider using SQLite, PostgreSQL or MySQL"),
+            name => unsupported(name),
         }
     }
 
@@ -337,7 +320,7 @@ impl<DB: Database> Sql<DB> {
             "MySQL" => "CAST(UNIX_TIMESTAMP(NOW(6)) * 1000000 AS SIGNED)",
             #[cfg(feature = "postgres")]
             "PostgreSQL" => "(EXTRACT(EPOCH FROM now()) * 1000000)::BIGINT",
-            name => panic!("'{name}' not supported, consider using SQLite, PostgreSQL or MySQL"),
+            name => unsupported(name),
         }
     }
 }
@@ -473,7 +456,7 @@ where
             &tenant,
         );
 
-        let (sql, values) = Self::build_sqlx(statement);
+        let (sql, values) = build_sqlx::<DB, _>(&statement);
 
         let (ts,): (Option<i64>,) =
             sqlx::query_as_with::<DB, (Option<i64>,), _>(sqlx::AssertSqlSafe(sql.as_str()), values)
@@ -491,7 +474,7 @@ where
             .limit(1)
             .to_owned();
 
-        let (sql, values) = Self::build_sqlx(statement);
+        let (sql, values) = build_sqlx::<DB, _>(&statement);
 
         let Some((cursor,)) = sqlx::query_as_with::<DB, (Option<String>,), _>(
             sqlx::AssertSqlSafe(sql.as_str()),
@@ -514,7 +497,7 @@ where
             .limit(1)
             .to_owned();
 
-        let (sql, values) = Self::build_sqlx(statement);
+        let (sql, values) = build_sqlx::<DB, _>(&statement);
 
         // A missing row (e.g. an operator deleted the subscriber to stop it)
         // means "not running", not an error.
@@ -545,7 +528,7 @@ where
             .limit(1)
             .to_owned();
 
-        let (sql, values) = Self::build_sqlx(statement);
+        let (sql, values) = build_sqlx::<DB, _>(&statement);
 
         // A missing row (e.g. an operator deleted the subscriber to stop it)
         // means "not running", not an error.
@@ -586,7 +569,7 @@ where
             .and_where(Expr::col(Event::AggregatorId).eq(aggregate_id))
             .and_where(Expr::col(Event::Tenant).eq(tenant))
             .to_owned();
-        let (sql, values) = Self::build_sqlx(statement);
+        let (sql, values) = build_sqlx::<DB, _>(&statement);
         let (last,): (Option<i64>,) =
             sqlx::query_as_with::<DB, (Option<i64>,), _>(sqlx::AssertSqlSafe(sql.as_str()), values)
                 .fetch_one(&self.pool)
@@ -616,7 +599,7 @@ where
             .limit(1)
             .to_owned();
 
-        let (sql, values) = Self::build_sqlx(statement);
+        let (sql, values) = build_sqlx::<DB, _>(&statement);
 
         let row = sqlx::query_as_with::<DB, (Option<String>,), _>(
             sqlx::AssertSqlSafe(sql.as_str()),
@@ -641,7 +624,7 @@ where
             )
             .to_owned();
 
-        let (sql, values) = Self::build_sqlx(statement);
+        let (sql, values) = build_sqlx::<DB, _>(&statement);
 
         sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
             .execute(&self.pool)
@@ -740,7 +723,7 @@ where
                 let statement = Query::select()
                     .expr(Expr::cust(Self::server_time_micros_expr()))
                     .to_owned();
-                let (sql, values) = Self::build_sqlx(statement);
+                let (sql, values) = build_sqlx::<DB, _>(&statement);
                 let (now_micros,): (i64,) =
                     sqlx::query_as_with::<DB, (i64,), _>(sqlx::AssertSqlSafe(sql.as_str()), values)
                         .fetch_one(&self.pool)
@@ -781,7 +764,7 @@ where
             .and_where(Expr::col(Subscriber::Enabled).eq(true))
             .to_owned();
 
-        let (sql, values) = Self::build_sqlx(statement);
+        let (sql, values) = build_sqlx::<DB, _>(&statement);
 
         // Zero matched rows means the fenced update was a no-op: the key is
         // owned by another worker, disabled, or gone. `affected_rows` counts
@@ -814,7 +797,7 @@ where
             .limit(1)
             .to_owned();
 
-        let (sql, values) = Self::build_sqlx(statement);
+        let (sql, values) = build_sqlx::<DB, _>(&statement);
 
         Ok(sqlx::query_as_with::<DB, (Vec<u8>, String), _>(
             sqlx::AssertSqlSafe(sql.as_str()),
@@ -868,7 +851,7 @@ where
             )
             .to_owned();
 
-        let (sql, values) = Self::build_sqlx(statement);
+        let (sql, values) = build_sqlx::<DB, _>(&statement);
 
         sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
             .execute(&self.pool)
@@ -892,7 +875,7 @@ where
             .and_where(Expr::col(Snapshot::Id).eq(Expr::value(id)))
             .to_owned();
 
-        let (sql, values) = Self::build_sqlx(statement);
+        let (sql, values) = build_sqlx::<DB, _>(&statement);
 
         sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
             .execute(&self.pool)
@@ -914,7 +897,7 @@ where
             .and_where(Expr::col(Event::AggregatorId).eq(Expr::value(aggregate_id)))
             .to_owned();
 
-        let (sql, values) = Self::build_sqlx(statement);
+        let (sql, values) = build_sqlx::<DB, _>(&statement);
 
         sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
             .execute(&self.pool)
@@ -983,7 +966,7 @@ where
                     timestamp_subsec,
                 ]);
             }
-            statements.push(Self::build_sqlx(statement));
+            statements.push(build_sqlx::<DB, _>(&statement));
         }
 
         // A single statement needs no transaction. Taken by value: the bound
@@ -1209,15 +1192,7 @@ impl Reader {
         let mut statement = self.statement.clone();
         let limit = self.build_reader::<O, O>(&mut statement)?;
 
-        let (sql, values) = match DB::NAME {
-            #[cfg(feature = "sqlite")]
-            "SQLite" => statement.build_sqlx(SqliteQueryBuilder),
-            #[cfg(feature = "mysql")]
-            "MySQL" => statement.build_sqlx(MysqlQueryBuilder),
-            #[cfg(feature = "postgres")]
-            "PostgreSQL" => statement.build_sqlx(PostgresQueryBuilder),
-            name => panic!("'{name}' not supported, consider using SQLite, PostgreSQL or MySQL"),
-        };
+        let (sql, values) = build_sqlx::<DB, _>(&statement);
 
         let mut rows = sqlx::query_as_with::<DB, O, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
             .fetch_all(executor)

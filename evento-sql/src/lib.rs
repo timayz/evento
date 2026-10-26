@@ -70,6 +70,7 @@
 //! `Bitcode` wrapper for compact binary serialization of event data using the
 //! bitcode format.
 
+mod dialect;
 mod sql;
 #[cfg(feature = "sqlite")]
 pub mod sql_types;
