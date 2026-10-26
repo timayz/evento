@@ -29,9 +29,9 @@ use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant};
 
 use crate::api::{
-    floor_millis, slot_of, snapshot_event_size, stamp_events, validate_layout, AcceptorRecord,
-    AmnesiaFence, ConfigEntry, CopyPhase, CopyState, DataStore, Drained, DurableMark, FenceRecord,
-    Journal, Layout, MessageSink, ShardId, ShardMap, Topology, SLOTS,
+    floor_millis, slot_of, snapshot_event_size, stamp_events, stamp_micros, validate_layout,
+    AcceptorRecord, AmnesiaFence, ConfigEntry, CopyPhase, CopyState, DataStore, Drained,
+    DurableMark, FenceRecord, Journal, Layout, MessageSink, ShardId, ShardMap, Topology, SLOTS,
 };
 use crate::clock::{Ballot, Clock, HybridLogicalClock, NodeId, Timestamp, TxnId};
 use crate::failure_detector::FailureDetector;
@@ -525,6 +525,32 @@ struct CopyOutcome {
     events: usize,
     /// The contact's stable point before its first page, if it reported one.
     stable: Option<u64>,
+    /// The lowest and highest stamps (microseconds) among the events
+    /// installed, if any.
+    stamps: Option<(u64, u64)>,
+    /// How many of the events installed are stamped below this node's
+    /// stable point as it stood when they landed: history this node's
+    /// subscriptions, which read forward from a stamp cursor, already read
+    /// past and will not see (#374).
+    below_stable: usize,
+}
+
+impl CopyOutcome {
+    /// Folds `other` into this outcome.
+    fn add(&mut self, other: CopyOutcome) {
+        self.events += other.events;
+        self.below_stable += other.below_stable;
+        self.stable = match (self.stable, other.stable) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, None) => a,
+            (None, b) => b,
+        };
+        self.stamps = match (self.stamps, other.stamps) {
+            (Some((lo, hi)), Some((l, h))) => Some((lo.min(l), hi.max(h))),
+            (a, None) => a,
+            (None, b) => b,
+        };
+    }
 }
 
 /// How a layout transition stands on a node (see [`reconfig`]).
@@ -8763,9 +8789,11 @@ impl Node {
                 contact = contact.0,
                 slots = slots.len(),
                 events = copied.events,
+                stamps = ?copied.stamps,
                 preseeded = resume.is_some(),
                 "copied the slots a transition moves here"
             );
+            self.note_copied_history(since, &copied);
         }
         let state = CopyState {
             since,
@@ -8889,6 +8917,18 @@ impl Node {
                 .context("cannot read the store's versions")?;
             if !events.is_empty() {
                 outcome.events += events.len();
+                // What this node's subscriptions already read past (#374).
+                let point = self.stable_micros();
+                for event in &events {
+                    let stamp = stamp_micros(event);
+                    outcome.stamps = Some(match outcome.stamps {
+                        Some((lo, hi)) => (lo.min(stamp), hi.max(stamp)),
+                        None => (stamp, stamp),
+                    });
+                    if stamp < point {
+                        outcome.below_stable += 1;
+                    }
+                }
                 self.datastore
                     .apply(txn, txn.0, events, true)
                     .await
@@ -8899,6 +8939,29 @@ impl Node {
                 None => return Ok(outcome),
             }
         }
+    }
+
+    /// Notes what a copy for the transition first decided at `since` brought
+    /// in that this node's subscriptions will not see (#374): copied events
+    /// keep their original stamps, and a subscription reads forward from a
+    /// stamp cursor, so history stamped below the stable point it already
+    /// passed is never delivered to it. Counted
+    /// (`accord_copied_below_stable_total`) and warned about; a projection
+    /// on this node that must hold the gained range is rebuilt, or its
+    /// cursor rewound, by its operator (OPERATIONS §6).
+    fn note_copied_history(&self, since: u64, copied: &CopyOutcome) {
+        if copied.below_stable == 0 {
+            return;
+        }
+        self.metrics.record_copied_below_stable(copied.below_stable);
+        tracing::warn!(
+            node = self.id.0,
+            since,
+            events = copied.events,
+            below_stable = copied.below_stable,
+            stamps = ?copied.stamps,
+            "copied history lies below this node's stable point: its subscriptions already read past it (#374)"
+        );
     }
 
     /// Copies the slots the change to `map` would give this node, before
@@ -8946,8 +9009,7 @@ impl Node {
         let txn = TxnId(Timestamp::MIN);
         let mut resume: Option<u64> = None;
         for pass in 1..=PRESEED_PASSES {
-            let mut copied = 0usize;
-            let mut stable: Option<u64> = None;
+            let mut pass_outcome = CopyOutcome::default();
             for (source, slots) in &gained {
                 let contacts: Vec<NodeId> = live
                     .replicas_of(*source)
@@ -8959,12 +9021,7 @@ impl Node {
                 for contact in contacts {
                     match self.copy_slots(contact, slots, resume, txn).await {
                         Ok(outcome) => {
-                            copied += outcome.events;
-                            stable = match (stable, outcome.stable) {
-                                (Some(a), Some(b)) => Some(a.min(b)),
-                                (None, b) => b,
-                                (a, None) => a,
-                            };
+                            pass_outcome.add(outcome);
                             done = true;
                             break;
                         }
@@ -8982,18 +9039,21 @@ impl Node {
                     return;
                 }
             }
+            let copied = pass_outcome.events;
             self.metrics.record_preseed_pass(copied);
             tracing::info!(
                 node = self.id.0,
                 since,
                 pass,
                 events = copied,
-                ?stable,
+                stamps = ?pass_outcome.stamps,
+                stable = ?pass_outcome.stable,
                 "pre-seeded the slots a change would give this node"
             );
+            self.note_copied_history(since, &pass_outcome);
             // Nothing to resume from: the fenced copy starts over, skipping
             // what is held.
-            let Some(stable) = stable else {
+            let Some(stable) = pass_outcome.stable else {
                 resume = None;
                 break;
             };

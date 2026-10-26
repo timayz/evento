@@ -217,7 +217,7 @@ refuses anything else before a vote, and a node never installs it.
   lost into its store (`accord_applies_not_owned_total` counts the applies that left
   such events out). A node that gains slots copies their events with their original
   stamps: its own subscriptions do not see them if they already read past those
-  stamps.
+  stamps (below).
 - **What a change does with writes in flight.** Every transaction is voted on and
   recovered under the layout it was coordinated under. A change that only adds a node
   to a shard of three or four installs at once, and writes go on. Any other change —
@@ -235,7 +235,17 @@ refuses anything else before a vote, and a node never installs it.
   the fence brings only what landed since, from the sources' stable point on. A
   gainer that does not answer in time does not hold the change back: the fenced copy
   brings its slots whole. Watch `accord_preseed_events_total` against
-  `accord_range_copy_events_total`. The
+  `accord_range_copy_events_total`.
+- **Subscriptions on a node that gains slots.** The copied events keep their
+  original stamps, and a subscription reads forward from a stamp cursor: one on the
+  gainer that already read past those stamps never sees the gained history (writes
+  after the activation are stamped above it, so the gap is the history alone). The
+  node warns at each copy (`copied history lies below this node's stable point`) and
+  counts the events in `accord_copied_below_stable_total`. A projection on that node
+  that must hold the gained range is rebuilt, or its cursor rewound below the lowest
+  copied stamp (the log line gives the range) and run again. Today a subscription
+  that must see every key runs on a single-shard cluster, where no node gains slots;
+  this is settled with cross-shard subscriptions (#374). The
   transition is driven by the recovery sweep's watermark gossip, anti-entropy and
   copies: run `start_recovery` on every node, new ones included. It waits for a slow
   quorum of every shard, for every node that gains slots, and for every node that
