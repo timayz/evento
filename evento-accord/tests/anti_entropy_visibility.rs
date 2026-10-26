@@ -53,6 +53,10 @@ impl GatedStore {
 
 #[async_trait]
 impl DataStore for GatedStore {
+    async fn drop_slots(&self, slots: &[u16]) -> anyhow::Result<usize> {
+        self.inner.drop_slots(slots).await
+    }
+
     async fn version(
         &self,
         tenant: &str,

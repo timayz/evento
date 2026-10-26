@@ -172,6 +172,10 @@ impl DataStore for FaultStore {
         Ok(())
     }
 
+    async fn drop_slots(&self, slots: &[u16]) -> anyhow::Result<usize> {
+        self.inner.drop_slots(slots).await
+    }
+
     async fn holds(&self, events: &[Event]) -> anyhow::Result<bool> {
         if self.version_failing.load(Ordering::SeqCst) {
             anyhow::bail!("simulated read failure");

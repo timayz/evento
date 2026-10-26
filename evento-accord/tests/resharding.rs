@@ -3,34 +3,62 @@
 //! moves drain under the old layout, every node gaining slots copies their
 //! events from a replica of the shard that held them, and only then does the
 //! new layout go live. The slot table moves only the slots the change needs.
-//! Garbage-collecting a moved range from its old owners is future work; the old
-//! replicas simply stop being contacted for it.
+//! A node drops the slots a change takes from it once the change installs,
+//! and drops what it still holds for a slot a change gives it before copying
+//! it — so a change may give a node back slots it replicated before (#372).
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use evento_accord::{
     DataStore, DynamicTopology, HybridLogicalClock, InMemoryDataStore, InMemoryJournal,
-    InMemoryNetwork, Journal, Key, MessageSink, Node, NodeId, ShardMap, Topology,
+    InMemoryNetwork, Journal, Key, Message, MessageSink, Node, NodeId, ShardMap, Topology,
 };
-use evento_core::Event;
+use evento_core::cursor::Args;
+use evento_core::{Event, EventFilter, TenantFilter};
 
 struct TestNode {
     node: Node,
     store: Arc<InMemoryDataStore>,
+    journal: Arc<InMemoryJournal>,
     topology: Arc<DynamicTopology>,
-    _loop: tokio::task::JoinHandle<()>,
-    _sweep: tokio::task::JoinHandle<()>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl TestNode {
+    /// Stops the node's tasks, as a crash would, keeping its store and
+    /// journal for a restart.
+    fn stop(&self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
 }
 
 /// A node over `shards` at epoch 0, running the recovery sweep the drain and
 /// the copies are driven by.
 fn spawn_node(id: NodeId, shards: Vec<Vec<NodeId>>, net: &Arc<InMemoryNetwork>) -> TestNode {
-    let inbox = net.register(id);
+    spawn_node_over(
+        id,
+        shards,
+        net,
+        Arc::new(InMemoryDataStore::new()),
+        Arc::new(InMemoryJournal::new()),
+    )
+}
+
+/// A node over `shards` at epoch 0, over `store` and `journal` — a restart,
+/// when they held a node before. Not recovered: call `recover_state` before
+/// `start_tasks` when the journal holds something.
+fn spawn_node_over(
+    id: NodeId,
+    shards: Vec<Vec<NodeId>>,
+    net: &Arc<InMemoryNetwork>,
+    store: Arc<InMemoryDataStore>,
+    journal: Arc<InMemoryJournal>,
+) -> TestNode {
     let clock = Arc::new(HybridLogicalClock::new(id));
     let sink: Arc<dyn MessageSink> = Arc::new(net.sink(id));
-    let store = Arc::new(InMemoryDataStore::new());
-    let journal: Arc<dyn Journal> = Arc::new(InMemoryJournal::new());
     let topology = Arc::new(DynamicTopology::new(id, 0, shards));
     let node = Node::new(
         id,
@@ -38,16 +66,16 @@ fn spawn_node(id: NodeId, shards: Vec<Vec<NodeId>>, net: &Arc<InMemoryNetwork>) 
         clock,
         sink,
         Arc::clone(&store) as Arc<dyn DataStore>,
-        journal,
+        Arc::clone(&journal) as Arc<dyn Journal>,
     );
-    let _loop = node.start(inbox);
-    let _sweep = node.start_recovery();
+    let inbox = net.register(id);
+    let tasks = vec![node.start(inbox), node.start_recovery()];
     TestNode {
         node,
         store,
+        journal,
         topology,
-        _loop,
-        _sweep,
+        tasks,
     }
 }
 
@@ -328,6 +356,8 @@ async fn an_existing_member_gains_a_range_with_its_versions() {
     assert!(!nodes[2].node.owns_key(&Key(left.clone())));
     await_versions(&nodes[2].store, &right, &[1, 2]).await;
     await_versions(&nodes[6].store, &left, &[1]).await;
+    // The slot node 2 left goes from its store once the change installed.
+    await_versions(&nodes[2].store, &left, &[]).await;
 
     let stale = nodes[2]
         .node
@@ -346,16 +376,31 @@ async fn an_existing_member_gains_a_range_with_its_versions() {
     }
 }
 
-/// A node that would get back a slot it replicated before is refused: its
-/// store still holds that slot's events from then, and nothing drops them.
+/// A node gets back a slot it replicated before (#372): what it still held
+/// for the slot was dropped when the change that took it installed, and it
+/// drops whatever is left before copying, so the copy brings the slot's
+/// whole history — the writes from after it left included — and the
+/// versions it enforces are the slot's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn a_change_that_gives_a_node_back_its_slots_is_refused() {
+async fn a_node_regains_its_slots() {
     let net = InMemoryNetwork::new();
     let before = vec![ids(&[0, 1, 2]), ids(&[3, 4, 5])];
+    let map = ShardMap::even(before.clone());
+    let left = id_in_shard(&map, 0, "left");
+    let right = id_in_shard(&map, 1, "right");
     let nodes: Vec<TestNode> = (0..7)
         .map(|id| spawn_node(NodeId(id), before.clone(), &net))
         .collect();
     nodes[6].node.begin_join();
+    for (id, version) in [(&left, 1), (&right, 1)] {
+        nodes[0]
+            .node
+            .write(vec![event(id, version, "Bumped")])
+            .await
+            .unwrap();
+    }
+
+    // Node 2 moves to the second shard, replacing 5; node 6 takes its place.
     let moved = vec![ids(&[0, 1, 6]), ids(&[3, 4, 2])];
     tokio::time::timeout(
         Duration::from_secs(30),
@@ -364,12 +409,180 @@ async fn a_change_that_gives_a_node_back_its_slots_is_refused() {
     .await
     .expect("the change ends in bounded time")
     .expect("node 2 moves");
-    let err = nodes[0]
+    await_epoch(&nodes[2].topology, 2).await;
+    await_versions(&nodes[2].store, &right, &[1]).await;
+    await_versions(&nodes[2].store, &left, &[]).await;
+    // The slot moves on without node 2.
+    nodes[0]
         .node
-        .change_topology(3, vec![ids(&[0, 1, 2]), ids(&[3, 4, 6])])
+        .write(vec![event(&left, 2, "Bumped")])
         .await
-        .expect_err("node 2 would regain shard 0's slots");
-    assert!(err.to_string().contains("regain"), "{err:#}");
+        .unwrap();
+    await_versions(&nodes[6].store, &left, &[1, 2]).await;
+
+    // Node 2 comes back to the first shard, and node 6 goes to the second.
+    let back = vec![ids(&[0, 1, 2]), ids(&[3, 4, 6])];
+    let installed = tokio::time::timeout(
+        Duration::from_secs(30),
+        nodes[0].node.change_topology(3, back.clone()),
+    )
+    .await
+    .expect("the change ends in bounded time")
+    .expect("node 2 regains shard 0's slots");
+    assert_eq!(installed, back);
+    await_epoch(&nodes[2].topology, 4).await;
+    assert!(nodes[2].node.owns_key(&Key(left.clone())));
+    await_versions(&nodes[2].store, &left, &[1, 2]).await;
+    await_versions(&nodes[2].store, &right, &[]).await;
+    await_versions(&nodes[6].store, &right, &[1]).await;
+    await_versions(&nodes[6].store, &left, &[]).await;
+
+    let stale = nodes[2]
+        .node
+        .write(vec![event(&left, 2, "Again")])
+        .await
+        .unwrap();
+    assert!(stale.conflict, "the regained versions are enforced");
+    let fresh = nodes[2]
+        .node
+        .write(vec![event(&left, 3, "Bumped")])
+        .await
+        .unwrap();
+    assert!(!fresh.conflict);
+    for n in [0usize, 1, 2] {
+        await_versions(&nodes[n].store, &left, &[1, 2, 3]).await;
+    }
+}
+
+/// A read forwarded to a node for a key a change took from it fails, rather
+/// than answering from a store that dropped the key (an empty page would
+/// read as "no such events").
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_forwarded_read_of_a_key_this_node_lost_fails() {
+    let net = InMemoryNetwork::new();
+    let before = vec![ids(&[0, 1, 2]), ids(&[3, 4, 5])];
+    let map = ShardMap::even(before.clone());
+    let left = id_in_shard(&map, 0, "left");
+    let nodes: Vec<TestNode> = (0..7)
+        .map(|id| spawn_node(NodeId(id), before.clone(), &net))
+        .collect();
+    nodes[6].node.begin_join();
+    nodes[0]
+        .node
+        .write(vec![event(&left, 1, "Bumped")])
+        .await
+        .unwrap();
+    let moved = vec![ids(&[0, 1, 6]), ids(&[3, 4, 2])];
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        nodes[0].node.change_topology(1, moved),
+    )
+    .await
+    .expect("the change ends in bounded time")
+    .expect("node 2 moves");
+    await_epoch(&nodes[2].topology, 2).await;
+    await_versions(&nodes[2].store, &left, &[]).await;
+
+    let mut reader = net.register(NodeId(9));
+    let forward = |id| Message::ReadForward {
+        id,
+        aggregators: Some(vec![EventFilter::by_id_raw("test/Account", left.clone())]),
+        routing_key: None,
+        tenant: TenantFilter::Only(String::new()),
+        args: Args::forward(10, None),
+        to_micros: None,
+    };
+    for (to, id) in [(2u64, 1u64), (0, 2)] {
+        net.sink(NodeId(9))
+            .send(NodeId(to), forward(id))
+            .await
+            .unwrap();
+    }
+    let mut replies = Vec::new();
+    for _ in 0..2 {
+        let env = tokio::time::timeout(Duration::from_secs(5), reader.recv())
+            .await
+            .expect("a reply comes")
+            .expect("the network is up");
+        replies.push((env.from, env.message));
+    }
+    replies.sort_by_key(|(from, _)| from.0);
+    assert!(
+        matches!(&replies[0], (NodeId(0), Message::ReadReply { id: 2, .. })),
+        "an owner answers the read: {:?}",
+        replies[0]
+    );
+    match &replies[1] {
+        (NodeId(2), Message::ReadFailed { id: 1, reason }) => {
+            assert!(reason.contains("not an owner"), "{reason}");
+        }
+        other => panic!("node 2 should refuse the read: {other:?}"),
+    }
+}
+
+/// A node restarted over its journal after a change took a slot from it does
+/// not replay the slot's writes into its store: the journal still holds them
+/// applied, the store dropped them, and only the keys the node owns under
+/// the layout it restored land in the store again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_restarted_loser_does_not_replay_dropped_slots() {
+    let net = InMemoryNetwork::new();
+    let before = vec![ids(&[0, 1, 2]), ids(&[3, 4, 5])];
+    let map = ShardMap::even(before.clone());
+    let left = id_in_shard(&map, 0, "left");
+    let right = id_in_shard(&map, 1, "right");
+    let mut nodes: Vec<TestNode> = (0..7)
+        .map(|id| spawn_node(NodeId(id), before.clone(), &net))
+        .collect();
+    nodes[6].node.begin_join();
+    for (id, version) in [(&left, 1), (&right, 1)] {
+        nodes[0]
+            .node
+            .write(vec![event(id, version, "Bumped")])
+            .await
+            .unwrap();
+    }
+    await_versions(&nodes[2].store, &left, &[1]).await;
+    let moved = vec![ids(&[0, 1, 6]), ids(&[3, 4, 2])];
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        nodes[0].node.change_topology(1, moved),
+    )
+    .await
+    .expect("the change ends in bounded time")
+    .expect("node 2 moves");
+    await_epoch(&nodes[2].topology, 2).await;
+    await_versions(&nodes[2].store, &right, &[1]).await;
+    await_versions(&nodes[2].store, &left, &[]).await;
+    for _ in 0..2_000 {
+        if nodes[2].journal.load_slot_gc().await.unwrap() == Some(2) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        nodes[2].journal.load_slot_gc().await.unwrap(),
+        Some(2),
+        "the drop is journaled with the epoch it ran for"
+    );
+
+    // Node 2 restarts over its store and journal.
+    nodes[2].stop();
+    let store = Arc::clone(&nodes[2].store);
+    let journal = Arc::clone(&nodes[2].journal);
+    let restarted = spawn_node_over(NodeId(2), before.clone(), &net, store, journal);
+    for task in &restarted.tasks {
+        task.abort();
+    }
+    restarted.node.recover_state().await.expect("recovers");
+    assert_eq!(restarted.topology.epoch(), 2, "the layout comes back");
+    assert_eq!(
+        versions_of(&restarted.store, &left),
+        Vec::<u16>::new(),
+        "the dropped slot stays dropped after the replay"
+    );
+    assert_eq!(versions_of(&restarted.store, &right), vec![1]);
+    nodes[2] = restarted;
 }
 
 /// A join goes through a replica of the joiner's own shard only (#360): a

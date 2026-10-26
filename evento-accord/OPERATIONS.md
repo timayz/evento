@@ -208,12 +208,16 @@ refuses anything else before a vote, and a node never installs it.
   rebalances it, moving only the slots a new shard needs or a removed one leaves (a
   split from two shards to three moves a third of the slots). Every node that gains
   slots copies their events while the change drains, from a replica that held them:
-  plan for the copy's time on top of the drain. A change that would give a node back a
-  slot it replicated before is refused (its store still holds that slot's old events;
-  GC of a moved range from its old owners is not implemented — evento's event store is
-  append-only — so old replicas simply stop being contacted for it). A node that gains
-  slots copies their events with their original stamps: its own subscriptions do not
-  see them if they already read past those stamps.
+  plan for the copy's time on top of the drain. A node drops the slots a change takes
+  from it once the change installs (`Executor::delete_stream`, stream by stream: watch
+  `accord_streams_dropped_total`), and before copying a slot it gains, drops whatever
+  it still holds for it — so a change may give a node back slots it replicated before
+  (a merge after a split, a replica moved back). A node restarted over its journal
+  drops again what it had not finished dropping, and replays no write of a slot it
+  lost into its store (`accord_applies_not_owned_total` counts the applies that left
+  such events out). A node that gains slots copies their events with their original
+  stamps: its own subscriptions do not see them if they already read past those
+  stamps.
 - **What a change does with writes in flight.** Every transaction is voted on and
   recovered under the layout it was coordinated under. A change that only adds a node
   to a shard of three or four installs at once, and writes go on. Any other change —

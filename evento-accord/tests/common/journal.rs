@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use evento_accord::{
-    AcceptorRecord, AmnesiaFence, Ballot, CommandState, ConfigEntry, DecisionRecord, DurableMark,
-    FenceRecord, InMemoryJournal, Journal, Key, NodeId, Timestamp, TxnId,
+    AcceptorRecord, AmnesiaFence, Ballot, CommandState, ConfigEntry, CopyState, DecisionRecord,
+    DurableMark, FenceRecord, InMemoryJournal, Journal, Key, NodeId, Timestamp, TxnId,
 };
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -23,6 +23,8 @@ enum Staged {
     DropDecisions(Vec<TxnId>),
     VoteFence(Timestamp),
     PeerMarks(Vec<(NodeId, DurableMark)>),
+    CopyState(CopyState),
+    SlotGc(u64),
 }
 
 impl Staged {
@@ -36,7 +38,9 @@ impl Staged {
             Staged::Decision(_)
             | Staged::DropDecisions(_)
             | Staged::VoteFence(_)
-            | Staged::PeerMarks(_) => false,
+            | Staged::PeerMarks(_)
+            | Staged::CopyState(_)
+            | Staged::SlotGc(_) => false,
         }
     }
 }
@@ -223,6 +227,8 @@ impl FaultJournal {
             Staged::DropDecisions(txns) => self.durable.drop_decisions(&txns).await,
             Staged::VoteFence(fence) => self.durable.save_vote_fence(fence).await,
             Staged::PeerMarks(marks) => self.durable.save_peer_marks(&marks).await,
+            Staged::CopyState(state) => self.durable.save_copy_state(&state).await,
+            Staged::SlotGc(epoch) => self.durable.save_slot_gc(epoch).await,
         }
     }
 }
@@ -367,6 +373,20 @@ impl Journal for FaultJournal {
     }
     async fn load_peer_marks(&self) -> anyhow::Result<Vec<(NodeId, DurableMark)>> {
         self.durable.load_peer_marks().await
+    }
+    async fn save_copy_state(&self, state: &CopyState) -> anyhow::Result<()> {
+        self.stage_write(Staged::CopyState(state.clone()));
+        Ok(())
+    }
+    async fn load_copy_state(&self) -> anyhow::Result<Option<CopyState>> {
+        self.durable.load_copy_state().await
+    }
+    async fn save_slot_gc(&self, epoch: u64) -> anyhow::Result<()> {
+        self.stage_write(Staged::SlotGc(epoch));
+        Ok(())
+    }
+    async fn load_slot_gc(&self) -> anyhow::Result<Option<u64>> {
+        self.durable.load_slot_gc().await
     }
     async fn save_amnesia_fence(&self, fence: &AmnesiaFence) -> anyhow::Result<()> {
         if self.draw(|f| f.metadata) {

@@ -4,8 +4,9 @@
 #![allow(dead_code)]
 
 use evento_accord::{
-    AcceptorRecord, AmnesiaFence, Ballot, CommandState, ConfigEntry, DecisionRecord, DurableMark,
-    FenceRecord, Journal, Key, NodeId, Status, Timestamp, TxnId,
+    AcceptorRecord, AmnesiaFence, Ballot, CommandState, ConfigEntry, CopyPhase, CopyState,
+    DecisionRecord, DurableMark, FenceRecord, Journal, Key, NodeId, ShardMap, Status, Timestamp,
+    TxnId,
 };
 use evento_core::Event;
 use evento_sql::SqlJournal;
@@ -449,6 +450,53 @@ where
         Some(timestamp(900, 1)),
         "a truncate between a stage and its flush keeps the fence"
     );
+}
+
+/// The copy state and the slot GC epoch are staged like a command: invisible
+/// until a flush, then they round-trip, the copy state replaced by the last
+/// one staged, and a truncate — between a stage and its flush too — never
+/// drops them (#372).
+pub async fn copy_state_and_slot_gc<DB>(journal: &SqlJournal<DB>)
+where
+    DB: Database,
+    for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
+    sea_query_sqlx::SqlxValues: sqlx::IntoArguments<DB>,
+    Vec<u8>: for<'r> sqlx::Decode<'r, DB> + sqlx::Type<DB>,
+    i64: for<'r> sqlx::Decode<'r, DB> + sqlx::Type<DB>,
+    usize: sqlx::ColumnIndex<DB::Row>,
+{
+    let map = ShardMap::even(vec![vec![NodeId(0)], vec![NodeId(1)]]);
+    let dropped = CopyState {
+        since: 3,
+        map,
+        phase: CopyPhase::Dropped,
+    };
+    let copied = CopyState {
+        phase: CopyPhase::Copied,
+        ..dropped.clone()
+    };
+    assert_eq!(journal.load_copy_state().await.unwrap(), None);
+    assert_eq!(journal.load_slot_gc().await.unwrap(), None);
+    journal.save_copy_state(&dropped).await.unwrap();
+    journal.save_slot_gc(4).await.unwrap();
+    assert_eq!(
+        journal.load_copy_state().await.unwrap(),
+        None,
+        "staged, not durable before a flush"
+    );
+    journal.flush().await.unwrap();
+    assert_eq!(journal.load_copy_state().await.unwrap(), Some(dropped));
+    assert_eq!(journal.load_slot_gc().await.unwrap(), Some(4));
+    journal.save_copy_state(&copied).await.unwrap();
+    journal.save_slot_gc(6).await.unwrap();
+    journal.truncate(timestamp(1_000, 0)).await.unwrap();
+    journal.flush().await.unwrap();
+    assert_eq!(
+        journal.load_copy_state().await.unwrap(),
+        Some(copied),
+        "a truncate between a stage and its flush keeps the copy state"
+    );
+    assert_eq!(journal.load_slot_gc().await.unwrap(), Some(6));
 }
 
 /// The marks a replica saw from its peers are staged like a command:

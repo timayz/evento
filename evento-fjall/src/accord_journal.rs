@@ -32,8 +32,8 @@ use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 
 use evento_accord::format::{decode_tagged, encode_tagged, RecordKind};
 use evento_accord::{
-    AcceptorRecord, AmnesiaFence, Ballot, CommandState, ConfigEntry, DecisionRecord, DurableMark,
-    FenceRecord, Journal, Key, NodeId, Timestamp, TxnId,
+    AcceptorRecord, AmnesiaFence, Ballot, CommandState, ConfigEntry, CopyState, DecisionRecord,
+    DurableMark, FenceRecord, Journal, Key, NodeId, Timestamp, TxnId,
 };
 
 /// Key under which the truncation watermark is stored in the `meta` keyspace.
@@ -54,6 +54,10 @@ const VOTE_FENCE_KEY: &[u8] = b"vote_fence";
 /// Meta key under which the marks the replica saw from its peers are stored.
 /// Staged; untouched by `truncate`.
 const PEER_MARKS_KEY: &[u8] = b"peer_marks";
+/// `meta` key of the replica's copy state (`Journal::save_copy_state`).
+const COPY_STATE_KEY: &[u8] = b"copy_state";
+/// `meta` key of the replica's slot GC epoch (`Journal::save_slot_gc`).
+const SLOT_GC_KEY: &[u8] = b"slot_gc";
 /// Prefix for metadata-log entry keys (`mlog/` + 8-byte big-endian epoch).
 const METADATA_PREFIX: &[u8] = b"mlog/";
 /// Prefix for acceptor-state keys (`acc/` + 8-byte big-endian epoch).
@@ -368,6 +372,34 @@ impl Journal for FjallJournal {
         match bytes {
             Some(bytes) => Ok(decode_tagged(RecordKind::PeerMarks, &bytes)?),
             None => Ok(Vec::new()),
+        }
+    }
+
+    async fn save_copy_state(&self, state: &CopyState) -> anyhow::Result<()> {
+        let value = encode_tagged(RecordKind::CopyState, state)?;
+        self.stage_meta(COPY_STATE_KEY.to_vec(), value).await
+    }
+
+    async fn load_copy_state(&self) -> anyhow::Result<Option<CopyState>> {
+        let meta = self.meta.clone();
+        let bytes = tokio::task::spawn_blocking(move || meta.get(COPY_STATE_KEY)).await??;
+        match bytes {
+            Some(bytes) => Ok(Some(decode_tagged(RecordKind::CopyState, &bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn save_slot_gc(&self, epoch: u64) -> anyhow::Result<()> {
+        let value = encode_tagged(RecordKind::SlotGc, &epoch)?;
+        self.stage_meta(SLOT_GC_KEY.to_vec(), value).await
+    }
+
+    async fn load_slot_gc(&self) -> anyhow::Result<Option<u64>> {
+        let meta = self.meta.clone();
+        let bytes = tokio::task::spawn_blocking(move || meta.get(SLOT_GC_KEY)).await??;
+        match bytes {
+            Some(bytes) => Ok(Some(decode_tagged(RecordKind::SlotGc, &bytes)?)),
+            None => Ok(None),
         }
     }
 

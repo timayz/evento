@@ -91,6 +91,11 @@ async fn vote_fence() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn copy_state_and_slot_gc() {
+    sql_support::copy_state_and_slot_gc(&memory().await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn peer_marks() {
     sql_support::peer_marks(&memory().await).await;
 }

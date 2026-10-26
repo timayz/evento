@@ -26,6 +26,7 @@
 //! so a node's local backend holds the whole log and serves complete reads.
 //! Routing reads to owning shards in a multi-shard cluster is a later layer.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -35,7 +36,7 @@ use evento_core::{
 };
 use ulid::Ulid;
 
-use crate::api::{same_event, snapshot_event_size, DataStore, SnapshotPage};
+use crate::api::{same_event, slot_of, snapshot_event_size, DataStore, SnapshotPage, SLOTS};
 use crate::clock::{Timestamp, TxnId};
 use crate::message::Key;
 use crate::node::{
@@ -66,7 +67,7 @@ const HOLDS_PAGE_SIZE: u16 = 64;
 /// *routed* aggregate must pass its routing key too, or the pin lands on the
 /// wrong key — a forwarded read goes to the wrong shard, and a read barrier
 /// fences the wrong conflict set.
-fn target_key(
+pub(crate) fn target_key(
     aggregators: &Option<Arc<[EventFilter]>>,
     routing_key: &Option<RoutingKey>,
     tenant: &TenantFilter,
@@ -371,6 +372,39 @@ impl<E: Executor> DataStore for ExecutorDataStore<E> {
             None
         };
         Ok(SnapshotPage { events, next })
+    }
+
+    async fn drop_slots(&self, slots: &[u16]) -> anyhow::Result<usize> {
+        let mut wanted = vec![false; SLOTS];
+        for &slot in slots {
+            if let Some(wanted) = wanted.get_mut(usize::from(slot)) {
+                *wanted = true;
+            }
+        }
+        // The store has no index by slot: one pass over it finds the streams
+        // in the slots, then each goes. Reading in pages while deleting is
+        // sound: a cursor is a position in stamp order, not an offset.
+        let mut streams: HashSet<(String, String, String)> = HashSet::new();
+        let mut after = None;
+        loop {
+            let page = self.snapshot_page(after.take(), 4096, usize::MAX).await?;
+            for event in page.events {
+                if wanted[slot_of(&Key::of(&event))] {
+                    streams.insert((event.tenant, event.aggregate_type, event.aggregate_id));
+                }
+            }
+            match page.next {
+                Some(next) => after = Some(next),
+                None => break,
+            }
+        }
+        let dropped = streams.len();
+        for (tenant, aggregate_type, aggregate_id) in streams {
+            self.local
+                .delete_stream(tenant, aggregate_type, aggregate_id)
+                .await?;
+        }
+        Ok(dropped)
     }
 }
 

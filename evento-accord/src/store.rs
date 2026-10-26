@@ -6,15 +6,15 @@
 //! applies committed transactions strictly in execution-timestamp order, two
 //! racing same-version appends deterministically resolve to one winner.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
 use evento_core::Event;
 
 use crate::api::{
-    same_event, AcceptorRecord, AmnesiaFence, ConfigEntry, DataStore, DecisionRecord, DurableMark,
-    FenceRecord, Journal,
+    same_event, slot_of, AcceptorRecord, AmnesiaFence, ConfigEntry, CopyState, DataStore,
+    DecisionRecord, DurableMark, FenceRecord, Journal, SLOTS,
 };
 use crate::clock::{Ballot, NodeId, Timestamp, TxnId};
 use crate::message::{CommandState, Key};
@@ -184,6 +184,29 @@ impl DataStore for InMemoryDataStore {
         });
         Ok(events)
     }
+
+    async fn drop_slots(&self, slots: &[u16]) -> anyhow::Result<usize> {
+        let mut wanted = vec![false; SLOTS];
+        for &slot in slots {
+            if let Some(wanted) = wanted.get_mut(usize::from(slot)) {
+                *wanted = true;
+            }
+        }
+        let mut state = self.state.lock().expect("store poisoned");
+        let mut dropped: HashSet<(String, String, String)> = HashSet::new();
+        state
+            .committed
+            .retain(|(tenant, aggregate_type, aggregate_id, _), event| {
+                if wanted[slot_of(&Key::of(event))] {
+                    dropped.insert((tenant.clone(), aggregate_type.clone(), aggregate_id.clone()));
+                    false
+                } else {
+                    true
+                }
+            });
+        state.versions.retain(|stream, _| !dropped.contains(stream));
+        Ok(dropped.len())
+    }
 }
 
 /// In-memory [`Journal`]. Records each command's durable state as it advances;
@@ -222,6 +245,12 @@ pub struct InMemoryJournal {
     /// The persisted peer marks (see [`Journal::save_peer_marks`]) — kept
     /// across `truncate`.
     peer_marks: Mutex<Vec<(NodeId, DurableMark)>>,
+    /// The persisted copy state (see [`Journal::save_copy_state`]) — kept
+    /// across `truncate`.
+    copy_state: Mutex<Option<CopyState>>,
+    /// The persisted slot GC epoch (see [`Journal::save_slot_gc`]) — kept
+    /// across `truncate`.
+    slot_gc: Mutex<Option<u64>>,
 }
 
 impl InMemoryJournal {
@@ -251,6 +280,8 @@ impl InMemoryJournal {
             amnesia_fence: copy(&self.amnesia_fence),
             fences: copy(&self.fences),
             peer_marks: copy(&self.peer_marks),
+            copy_state: copy(&self.copy_state),
+            slot_gc: copy(&self.slot_gc),
         }
     }
 }
@@ -340,6 +371,25 @@ impl Journal for InMemoryJournal {
 
     async fn load_peer_marks(&self) -> anyhow::Result<Vec<(NodeId, DurableMark)>> {
         Ok(self.peer_marks.lock().expect("journal poisoned").clone())
+    }
+
+    async fn save_copy_state(&self, state: &CopyState) -> anyhow::Result<()> {
+        *self.copy_state.lock().expect("journal poisoned") = Some(state.clone());
+        Ok(())
+    }
+
+    async fn load_copy_state(&self) -> anyhow::Result<Option<CopyState>> {
+        Ok(self.copy_state.lock().expect("journal poisoned").clone())
+    }
+
+    async fn save_slot_gc(&self, epoch: u64) -> anyhow::Result<()> {
+        let mut kept = self.slot_gc.lock().expect("journal poisoned");
+        *kept = Some(kept.map_or(epoch, |kept| kept.max(epoch)));
+        Ok(())
+    }
+
+    async fn load_slot_gc(&self) -> anyhow::Result<Option<u64>> {
+        Ok(*self.slot_gc.lock().expect("journal poisoned"))
     }
 
     async fn save_amnesia_fence(&self, fence: &AmnesiaFence) -> anyhow::Result<()> {
@@ -487,6 +537,58 @@ mod tests {
             decision: Some(true),
             applied_conflict: Some(false),
         }
+    }
+
+    /// `drop_slots` removes the streams in the named slots, their versions
+    /// with them, and nothing else; dropping again removes nothing.
+    #[tokio::test]
+    async fn drop_slots_removes_only_the_named_slots_streams() {
+        use crate::api::slot_of;
+        use evento_core::Event;
+
+        let store = InMemoryDataStore::new();
+        let event = |id: &str, version: u16| Event {
+            id: ulid::Ulid::generate(),
+            aggregate_type: "test/Account".into(),
+            aggregate_id: id.into(),
+            version,
+            name: "Bumped".into(),
+            ..Default::default()
+        };
+        // Two aggregates in different slots.
+        let a = "a".to_string();
+        let b = (0..10_000)
+            .map(|i| format!("b{i}"))
+            .find(|b| slot_of(&Key(b.clone())) != slot_of(&Key(a.clone())))
+            .unwrap();
+        let txn = TxnId(Timestamp {
+            micros: 1,
+            logical: 0,
+            node: NodeId(0),
+        });
+        store
+            .apply(
+                txn,
+                txn.0,
+                vec![event(&a, 1), event(&a, 2), event(&b, 1)],
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.version("", "test/Account", &a).await.unwrap(), 2);
+
+        let slot = slot_of(&Key(a.clone())) as u16;
+        assert_eq!(store.drop_slots(&[slot]).await.unwrap(), 1);
+        assert_eq!(store.version("", "test/Account", &a).await.unwrap(), 0);
+        assert_eq!(store.version("", "test/Account", &b).await.unwrap(), 1);
+        assert_eq!(store.snapshot().await.unwrap().len(), 1);
+        assert_eq!(store.drop_slots(&[slot]).await.unwrap(), 0);
+        // The stream starts over from its first version.
+        store
+            .apply(txn, txn.0, vec![event(&a, 1)], true)
+            .await
+            .unwrap();
+        assert_eq!(store.version("", "test/Account", &a).await.unwrap(), 1);
     }
 
     #[tokio::test]

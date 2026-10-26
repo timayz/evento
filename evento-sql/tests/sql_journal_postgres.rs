@@ -72,6 +72,11 @@ async fn vote_fence() {
     sql_support::vote_fence(&fresh("accord_pg_vote_fence").await).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn copy_state_and_slot_gc() {
+    sql_support::copy_state_and_slot_gc(&fresh("accord_pg_copy_state").await).await;
+}
+
 #[tokio::test]
 async fn peer_marks() {
     sql_support::peer_marks(&fresh("accord_pg_peer_marks").await).await;
