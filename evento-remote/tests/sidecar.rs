@@ -129,12 +129,22 @@ async fn sidecar_keeps_bookkeeping_local() -> anyhow::Result<()> {
     })
     .await;
 
-    // The cursor is in the local store only.
-    assert!(t
+    // The cursor is in the local store only. The handler's effect shows before
+    // the cursor is acknowledged (acks follow the handler, once per batch), so
+    // wait for it rather than assert it at once.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while t
         .local
         .get_subscriber_cursor(key.to_owned())
         .await?
-        .is_some());
+        .is_none()
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out: the cursor reaches the local store"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert!(t
         .server
         .get_subscriber_cursor(key.to_owned())
