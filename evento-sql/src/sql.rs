@@ -986,8 +986,12 @@ where
             statements.push(Self::build_sqlx(statement));
         }
 
-        if let [(sql, values)] = statements.as_slice() {
-            sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values.clone())
+        // A single statement needs no transaction. Taken by value: the bound
+        // values carry every row's data and metadata blobs, and a copy of
+        // them on the hot write path is pure waste.
+        if statements.len() == 1 {
+            let (sql, values) = statements.pop().expect("one statement");
+            sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
                 .execute(&self.pool)
                 .await
                 .map_err(Self::insert_error)?;
