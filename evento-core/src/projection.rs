@@ -661,6 +661,7 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
             routing_key: None,
             chunk_size: 300,
             retry: Some(30),
+            shutdown_grace: None,
             delay: None,
             continue_on_error: false,
         }
@@ -951,6 +952,7 @@ pub struct ProjectionSubscription<E: Executor, P: Default + 'static> {
     routing_key: Option<RoutingKey>,
     chunk_size: u16,
     retry: Option<u8>,
+    shutdown_grace: Option<Option<Duration>>,
     delay: Option<Duration>,
     continue_on_error: bool,
 }
@@ -992,6 +994,20 @@ where
     /// Disables retries.
     pub fn no_retry(mut self) -> Self {
         self.retry = None;
+        self
+    }
+
+    /// Sets how long shutdown waits for the pass in flight before abandoning
+    /// it (default 30 seconds); see [`SubscriptionBuilder::shutdown_grace`].
+    pub fn shutdown_grace(mut self, v: Duration) -> Self {
+        self.shutdown_grace = Some(Some(v));
+        self
+    }
+
+    /// Makes shutdown wait for the pass in flight with no bound; see
+    /// [`SubscriptionBuilder::no_shutdown_grace`].
+    pub fn no_shutdown_grace(mut self) -> Self {
+        self.shutdown_grace = Some(None);
         self
     }
 
@@ -1040,6 +1056,7 @@ where
             routing_key,
             chunk_size,
             retry,
+            shutdown_grace,
             delay,
             continue_on_error,
         } = self;
@@ -1086,6 +1103,11 @@ where
         builder = match retry {
             Some(n) => builder.retry(n),
             None => builder.no_retry(),
+        };
+        builder = match shutdown_grace {
+            Some(Some(grace)) => builder.shutdown_grace(grace),
+            Some(None) => builder.no_shutdown_grace(),
+            None => builder,
         };
         if let Some(d) = delay {
             builder = builder.delay(d);
