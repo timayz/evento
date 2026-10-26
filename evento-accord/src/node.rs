@@ -8822,6 +8822,23 @@ impl Node {
             if reconfig.slot_gc.is_some_and(|through| through >= epoch) {
                 return;
             }
+            // The layout is installed before the transition it belongs to
+            // is (`apply_log`): seen in between, from the sweep, a transition
+            // entry has its layout up and its gainers not yet known, and the
+            // slots they copy would go. Wait for the install to finish.
+            let installing = {
+                let log = self.meta_log.lock().expect("meta_log poisoned");
+                matches!(
+                    log.entries.get(&epoch),
+                    Some(ConfigEntry::Transition { .. })
+                )
+            } && reconfig
+                .transition
+                .as_ref()
+                .is_none_or(|t| t.live.epoch() != epoch);
+            if installing {
+                return;
+            }
             reconfig
                 .transition
                 .as_ref()
