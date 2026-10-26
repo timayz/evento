@@ -752,7 +752,11 @@ impl Evento {
 /// Multi-executor aggregation (requires `group` feature).
 ///
 /// `EventoGroup` combines multiple executors into one. Reads query all executors
-/// and merge results; writes go only to the first executor.
+/// and merge results; writes go only to the first executor. [`delete_stream`]
+/// is the one mutation that reaches every executor, so a deleted stream is
+/// gone from the merged read as well.
+///
+/// [`delete_stream`]: Executor::delete_stream
 ///
 /// Useful for aggregating events from multiple sources.
 #[cfg(feature = "group")]
@@ -957,15 +961,322 @@ impl Executor for EventoGroup {
             .await
     }
 
+    // Fanned out like `read`: the group's reads merge every child, so a
+    // delete that only reached the first one would leave the stream visible
+    // through the group — and a replication layer that drops then recopies
+    // would end up with the stream twice. Every child is asked even when an
+    // earlier one failed, so one refusing child (a backend without
+    // `delete_stream`) does not leave the others holding the stream.
     async fn delete_stream(
         &self,
         tenant: String,
         aggregate_type: String,
         aggregate_id: String,
     ) -> anyhow::Result<()> {
-        self.first()
-            .delete_stream(tenant, aggregate_type, aggregate_id)
+        let futures = self
+            .executors
+            .iter()
+            .map(|e| e.delete_stream(tenant.clone(), aggregate_type.clone(), aggregate_id.clone()));
+
+        futures_util::future::join_all(futures)
             .await
+            .into_iter()
+            .collect()
+    }
+}
+
+#[cfg(all(test, feature = "group"))]
+mod group_tests {
+    use super::*;
+    use crate::cursor;
+    use crate::TenantFilter;
+    use std::sync::Mutex;
+
+    /// An in-memory store that answers `read` and `delete_stream` and nothing
+    /// else, so a group can be exercised without a backend.
+    #[derive(Clone, Default)]
+    struct MemoryStore(Arc<Mutex<Vec<Event>>>);
+
+    impl MemoryStore {
+        fn holding(events: Vec<Event>) -> Self {
+            Self(Arc::new(Mutex::new(events)))
+        }
+
+        fn ids(&self) -> Vec<Ulid> {
+            self.0.lock().unwrap().iter().map(|e| e.id).collect()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Executor for MemoryStore {
+        async fn write(&self, _events: Vec<Event>) -> Result<(), WriteError> {
+            unreachable!()
+        }
+        async fn get_subscriber_cursor(&self, _key: String) -> anyhow::Result<Option<Value>> {
+            unreachable!()
+        }
+        async fn is_subscriber_running(
+            &self,
+            _key: String,
+            _worker_id: Ulid,
+        ) -> anyhow::Result<bool> {
+            unreachable!()
+        }
+        async fn upsert_subscriber(&self, _key: String, _worker_id: Ulid) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        async fn acknowledge(
+            &self,
+            _key: String,
+            _worker_id: Ulid,
+            _cursor: Value,
+            _lag: u64,
+        ) -> anyhow::Result<bool> {
+            unreachable!()
+        }
+        async fn read(
+            &self,
+            _aggregators: Option<Arc<[EventFilter]>>,
+            _routing_key: Option<RoutingKey>,
+            _tenant: TenantFilter,
+            args: Args,
+            _to_micros: Option<u64>,
+        ) -> anyhow::Result<ReadResult<Event>> {
+            let events = self.0.lock().unwrap().clone();
+            Ok(cursor::Reader::new(events).args(args).execute()?)
+        }
+        async fn latest_timestamp(
+            &self,
+            _aggregators: Option<Arc<[EventFilter]>>,
+            _routing_key: Option<RoutingKey>,
+            _tenant: TenantFilter,
+        ) -> anyhow::Result<u64> {
+            unreachable!()
+        }
+        async fn get_snapshot(
+            &self,
+            _tenant: String,
+            _aggregate_type: String,
+            _projection: String,
+            _aggregate_revision: String,
+            _id: String,
+        ) -> anyhow::Result<Option<(Vec<u8>, Value)>> {
+            unreachable!()
+        }
+        async fn save_snapshot(
+            &self,
+            _tenant: String,
+            _aggregate_type: String,
+            _projection: String,
+            _aggregate_revision: String,
+            _id: String,
+            _data: Vec<u8>,
+            _cursor: Value,
+        ) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        async fn delete_snapshot(
+            &self,
+            _tenant: String,
+            _aggregate_type: String,
+            _projection: String,
+            _id: String,
+        ) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        async fn delete_stream(
+            &self,
+            tenant: String,
+            aggregate_type: String,
+            aggregate_id: String,
+        ) -> anyhow::Result<()> {
+            self.0.lock().unwrap().retain(|e| {
+                (
+                    e.tenant.as_str(),
+                    e.aggregate_type.as_str(),
+                    e.aggregate_id.as_str(),
+                ) != (
+                    tenant.as_str(),
+                    aggregate_type.as_str(),
+                    aggregate_id.as_str(),
+                )
+            });
+            Ok(())
+        }
+    }
+
+    /// A store that refuses `delete_stream`, as the trait default does.
+    #[derive(Clone)]
+    struct Refusing(MemoryStore);
+
+    #[async_trait::async_trait]
+    impl Executor for Refusing {
+        async fn write(&self, events: Vec<Event>) -> Result<(), WriteError> {
+            self.0.write(events).await
+        }
+        async fn get_subscriber_cursor(&self, key: String) -> anyhow::Result<Option<Value>> {
+            self.0.get_subscriber_cursor(key).await
+        }
+        async fn is_subscriber_running(
+            &self,
+            key: String,
+            worker_id: Ulid,
+        ) -> anyhow::Result<bool> {
+            self.0.is_subscriber_running(key, worker_id).await
+        }
+        async fn upsert_subscriber(&self, key: String, worker_id: Ulid) -> anyhow::Result<()> {
+            self.0.upsert_subscriber(key, worker_id).await
+        }
+        async fn acknowledge(
+            &self,
+            key: String,
+            worker_id: Ulid,
+            cursor: Value,
+            lag: u64,
+        ) -> anyhow::Result<bool> {
+            self.0.acknowledge(key, worker_id, cursor, lag).await
+        }
+        async fn read(
+            &self,
+            aggregators: Option<Arc<[EventFilter]>>,
+            routing_key: Option<RoutingKey>,
+            tenant: TenantFilter,
+            args: Args,
+            to_micros: Option<u64>,
+        ) -> anyhow::Result<ReadResult<Event>> {
+            self.0
+                .read(aggregators, routing_key, tenant, args, to_micros)
+                .await
+        }
+        async fn latest_timestamp(
+            &self,
+            aggregators: Option<Arc<[EventFilter]>>,
+            routing_key: Option<RoutingKey>,
+            tenant: TenantFilter,
+        ) -> anyhow::Result<u64> {
+            self.0
+                .latest_timestamp(aggregators, routing_key, tenant)
+                .await
+        }
+        async fn get_snapshot(
+            &self,
+            tenant: String,
+            aggregate_type: String,
+            projection: String,
+            aggregate_revision: String,
+            id: String,
+        ) -> anyhow::Result<Option<(Vec<u8>, Value)>> {
+            self.0
+                .get_snapshot(tenant, aggregate_type, projection, aggregate_revision, id)
+                .await
+        }
+        async fn save_snapshot(
+            &self,
+            tenant: String,
+            aggregate_type: String,
+            projection: String,
+            aggregate_revision: String,
+            id: String,
+            data: Vec<u8>,
+            cursor: Value,
+        ) -> anyhow::Result<()> {
+            self.0
+                .save_snapshot(
+                    tenant,
+                    aggregate_type,
+                    projection,
+                    aggregate_revision,
+                    id,
+                    data,
+                    cursor,
+                )
+                .await
+        }
+        async fn delete_snapshot(
+            &self,
+            tenant: String,
+            aggregate_type: String,
+            projection: String,
+            id: String,
+        ) -> anyhow::Result<()> {
+            self.0
+                .delete_snapshot(tenant, aggregate_type, projection, id)
+                .await
+        }
+    }
+
+    fn event(id: &str, version: u16) -> Event {
+        Event {
+            id: Ulid::generate(),
+            aggregate_id: id.to_owned(),
+            aggregate_type: "test/Group".to_owned(),
+            version,
+            name: "Opened".to_owned(),
+            routing_key: None,
+            tenant: String::new(),
+            data: vec![],
+            metadata: Default::default(),
+            timestamp: 1_000 + u64::from(version),
+            timestamp_subsec: 0,
+        }
+    }
+
+    async fn group_ids(group: &EventoGroup) -> Vec<Ulid> {
+        group
+            .read(None, None, TenantFilter::All, Args::forward(10, None), None)
+            .await
+            .unwrap()
+            .edges
+            .into_iter()
+            .map(|e| e.node.id)
+            .collect()
+    }
+
+    /// The group's reads merge every child, so a delete through the group
+    /// must reach every child: a stream held only by the second one is gone
+    /// from the merged read afterwards, and other streams are untouched.
+    #[tokio::test]
+    async fn delete_stream_reaches_every_child() {
+        let first = MemoryStore::holding(vec![event("kept", 1)]);
+        let second =
+            MemoryStore::holding(vec![event("gone", 1), event("gone", 2), event("kept", 2)]);
+        let group = EventoGroup::default()
+            .executor(Evento::new(first.clone()))
+            .executor(Evento::new(second.clone()));
+        assert_eq!(group_ids(&group).await.len(), 4);
+
+        group
+            .delete_stream(String::new(), "test/Group".to_owned(), "gone".to_owned())
+            .await
+            .unwrap();
+
+        let kept: Vec<Ulid> = first.ids().into_iter().chain(second.ids()).collect();
+        assert_eq!(kept.len(), 2, "only the `kept` stream survives");
+        let mut seen = group_ids(&group).await;
+        seen.sort();
+        let mut kept = kept;
+        kept.sort();
+        assert_eq!(seen, kept, "the merged read no longer sees `gone`");
+    }
+
+    /// One child refusing the delete does not leave the others holding the
+    /// stream: every child is asked, and the refusal is still reported.
+    #[tokio::test]
+    async fn a_refusing_child_does_not_shield_the_others() {
+        let refusing = MemoryStore::holding(vec![event("gone", 1)]);
+        let willing = MemoryStore::holding(vec![event("gone", 1)]);
+        let group = EventoGroup::default()
+            .executor(Evento::new(Refusing(refusing.clone())))
+            .executor(Evento::new(willing.clone()));
+
+        let err = group
+            .delete_stream(String::new(), "test/Group".to_owned(), "gone".to_owned())
+            .await
+            .expect_err("the refusing child's error is reported");
+        assert!(err.to_string().contains("not supported"), "{err}");
+
+        assert_eq!(refusing.ids().len(), 1, "the refusing child keeps its copy");
+        assert!(willing.ids().is_empty(), "the willing child still deleted");
     }
 }
 
