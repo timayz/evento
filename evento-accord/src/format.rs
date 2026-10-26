@@ -87,7 +87,7 @@ pub const MAGIC: [u8; 2] = *b"Ac";
 /// `Message::ConfigReadReply`). No reader for older versions: evento-accord
 /// has not been released, so a journal of one is wiped and the node
 /// re-bootstrapped.
-pub const FORMAT_VERSION: u8 = 11;
+pub const FORMAT_VERSION: u8 = 12;
 
 /// Length of the fixed header: `MAGIC (2) + version (1) + kind (1)`.
 const HEADER_LEN: usize = 4;

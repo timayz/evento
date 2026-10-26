@@ -113,6 +113,17 @@ pub struct Metrics {
     /// node's under the installed layout (a late apply, an import from a peer
     /// behind on the layout, or a restart's replay of a dropped slot).
     pub applies_not_owned: AtomicU64,
+    /// Events a range copy under the write fence installed: what the slots a
+    /// change gave this node held, less what a pre-seed brought first (#373).
+    pub range_copy_events: AtomicU64,
+    /// Pre-seed passes this node ran: copies of the slots a change would
+    /// give it, before the change was decided (#373).
+    pub preseed_passes: AtomicU64,
+    /// Events the pre-seed passes installed.
+    pub preseed_events: AtomicU64,
+    /// Pre-seeds a change this node drove did not wait out: the change went
+    /// on, the fenced copy bringing the rest.
+    pub preseeds_timed_out: AtomicU64,
 }
 
 impl Metrics {
@@ -254,6 +265,24 @@ impl Metrics {
         self.applies_not_owned.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records `events` a range copy under the fence installed.
+    pub fn record_range_copy_events(&self, events: usize) {
+        self.range_copy_events
+            .fetch_add(events as u64, Ordering::Relaxed);
+    }
+
+    /// Records a pre-seed pass that installed `events`.
+    pub fn record_preseed_pass(&self, events: usize) {
+        self.preseed_passes.fetch_add(1, Ordering::Relaxed);
+        self.preseed_events
+            .fetch_add(events as u64, Ordering::Relaxed);
+    }
+
+    /// Records a pre-seed a change did not wait out.
+    pub fn record_preseed_timed_out(&self) {
+        self.preseeds_timed_out.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Records a config-Paxos vote withheld after a lost journal.
     pub fn record_config_vote_withheld(&self) {
         self.config_votes_withheld.fetch_add(1, Ordering::Relaxed);
@@ -308,6 +337,10 @@ impl Metrics {
             writes_topology_changing: self.writes_topology_changing.load(Ordering::Relaxed),
             streams_dropped: self.streams_dropped.load(Ordering::Relaxed),
             applies_not_owned: self.applies_not_owned.load(Ordering::Relaxed),
+            range_copy_events: self.range_copy_events.load(Ordering::Relaxed),
+            preseed_passes: self.preseed_passes.load(Ordering::Relaxed),
+            preseed_events: self.preseed_events.load(Ordering::Relaxed),
+            preseeds_timed_out: self.preseeds_timed_out.load(Ordering::Relaxed),
         }
     }
 }
@@ -348,6 +381,10 @@ pub struct MetricsSnapshot {
     pub writes_topology_changing: u64,
     pub streams_dropped: u64,
     pub applies_not_owned: u64,
+    pub range_copy_events: u64,
+    pub preseed_passes: u64,
+    pub preseed_events: u64,
+    pub preseeds_timed_out: u64,
 }
 
 impl MetricsSnapshot {
@@ -355,7 +392,7 @@ impl MetricsSnapshot {
     /// source of truth for both [`to_prometheus`](Self::to_prometheus) and
     /// [`to_prometheus_labeled`](Self::to_prometheus_labeled); add a counter here and
     /// both renderings pick it up.
-    fn counters(&self) -> [(&'static str, &'static str, u64); 31] {
+    fn counters(&self) -> [(&'static str, &'static str, u64); 35] {
         [
             (
                 "accord_writes_committed_total",
@@ -511,6 +548,26 @@ impl MetricsSnapshot {
                 "accord_applies_not_owned_total",
                 "Applies that left events out of the store, their keys no longer this node's.",
                 self.applies_not_owned,
+            ),
+            (
+                "accord_range_copy_events_total",
+                "Events a range copy under the write fence installed.",
+                self.range_copy_events,
+            ),
+            (
+                "accord_preseed_passes_total",
+                "Pre-seed passes: copies of the slots a change would give this node, before it was decided.",
+                self.preseed_passes,
+            ),
+            (
+                "accord_preseed_events_total",
+                "Events the pre-seed passes installed.",
+                self.preseed_events,
+            ),
+            (
+                "accord_preseeds_timed_out_total",
+                "Pre-seeds a change this node drove did not wait out.",
+                self.preseeds_timed_out,
             ),
         ]
     }

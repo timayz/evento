@@ -36,7 +36,9 @@ use evento_core::{
 };
 use ulid::Ulid;
 
-use crate::api::{same_event, slot_of, snapshot_event_size, DataStore, SnapshotPage, SLOTS};
+use crate::api::{
+    cursor_at, same_event, slot_of, snapshot_event_size, DataStore, SnapshotPage, SLOTS,
+};
 use crate::clock::{Timestamp, TxnId};
 use crate::message::Key;
 use crate::node::{
@@ -372,6 +374,19 @@ impl<E: Executor> DataStore for ExecutorDataStore<E> {
             None
         };
         Ok(SnapshotPage { events, next })
+    }
+
+    async fn snapshot_page_since(
+        &self,
+        after: Option<Value>,
+        since: Option<u64>,
+        max_events: u16,
+        max_bytes: usize,
+    ) -> anyhow::Result<SnapshotPage> {
+        // The backend's cursor order is the stamp order: the first page seeks
+        // to `since` instead of paging up to it.
+        let after = after.or_else(|| since.map(cursor_at));
+        self.snapshot_page(after, max_events, max_bytes).await
     }
 
     async fn drop_slots(&self, slots: &[u16]) -> anyhow::Result<usize> {

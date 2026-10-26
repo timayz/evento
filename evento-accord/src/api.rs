@@ -1044,6 +1044,26 @@ pub trait DataStore: Send + Sync + 'static {
         Ok(SnapshotPage { events, next })
     }
 
+    /// [`snapshot_page`](Self::snapshot_page), keeping only the events
+    /// stamped at or above `since` microseconds (every event, with `None`).
+    /// A range copy made while writes still flow resumes from the sources'
+    /// stable point this way (#373). The default pages the whole store and
+    /// filters; a store with a cursor order by stamp seeks to `since` instead
+    /// (as [`ExecutorDataStore`](crate::ExecutorDataStore) does).
+    async fn snapshot_page_since(
+        &self,
+        after: Option<Value>,
+        since: Option<u64>,
+        max_events: u16,
+        max_bytes: usize,
+    ) -> anyhow::Result<SnapshotPage> {
+        let mut page = self.snapshot_page(after, max_events, max_bytes).await?;
+        if let Some(since) = since {
+            page.events.retain(|event| stamp_micros(event) >= since);
+        }
+        Ok(page)
+    }
+
     /// Drops every stream whose key is in one of `slots` ([`slot_of`]):
     /// their events and the versions they set, so the slots can be copied
     /// in afresh. Returns how many streams went. A node drops the slots a
@@ -1059,7 +1079,7 @@ pub trait DataStore: Send + Sync + 'static {
 /// A node's copy of the slots a layout transition gives it, as its journal
 /// keeps it ([`Journal::save_copy_state`]): which transition — its `since`
 /// and the map it installs — and how far the copy got.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CopyState {
     /// The epoch the transition was first decided at.
     pub since: u64,
@@ -1070,7 +1090,7 @@ pub struct CopyState {
 }
 
 /// How far a node's copy of its gained slots got (see [`CopyState`]).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum CopyPhase {
     /// The gained slots were dropped from the store: whatever it held for
     /// them was stale. The copy may have started; what landed is a
@@ -1078,6 +1098,17 @@ pub enum CopyPhase {
     Dropped,
     /// Every gained slot is in, and may be reported.
     Copied,
+    /// The gained slots were dropped and copied **before** the transition
+    /// was decided, while writes still flowed (#373): every event the
+    /// sources held below `resume` is in, and the copy under the fence
+    /// starts there, as the continuation of what the store holds. `None`
+    /// when the sources reported no stable point to resume from: the fenced
+    /// copy then starts from the beginning, skipping what is held.
+    Preseeded {
+        /// The stamp (microseconds) the fenced copy resumes from: every event
+        /// the sources held below it is in.
+        resume: Option<u64>,
+    },
 }
 
 /// One page of a [`DataStore::snapshot_page`] bootstrap snapshot.
@@ -1087,6 +1118,30 @@ pub struct SnapshotPage {
     pub events: Vec<Event>,
     /// The cursor to pass as `after` for the next page; `None` after the last.
     pub next: Option<Value>,
+}
+
+/// An event's stamp in microseconds since the Unix epoch, as the stable
+/// point counts: seconds and milliseconds, floored.
+pub fn stamp_micros(event: &Event) -> u64 {
+    event.timestamp * 1_000_000 + u64::from(event.timestamp_subsec) * 1_000
+}
+
+/// The store cursor just below every event stamped at or above `micros`:
+/// the stamp floored to the millisecond, version 0, the nil id — below any
+/// real event at that stamp in the cursor order `(timestamp, subsec,
+/// version, id)`, and a valid id for every backend.
+pub fn cursor_at(micros: u64) -> Value {
+    use evento_core::cursor::Cursor as _;
+    let probe = Event {
+        id: ulid::Ulid::nil(),
+        version: 0,
+        timestamp: micros / 1_000_000,
+        timestamp_subsec: ((micros % 1_000_000) / 1_000) as u32,
+        ..Default::default()
+    };
+    probe
+        .serialize_cursor()
+        .expect("an event cursor always serializes")
 }
 
 /// The approximate size of `event` on the wire inside a
@@ -1533,6 +1588,39 @@ impl Topology for DynamicTopology {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The cursor at a stamp lies below every event stamped at or above it,
+    /// and above every event stamped below it, in the store's cursor order
+    /// (#373).
+    #[test]
+    fn the_cursor_at_a_stamp_sorts_below_every_event_at_it() {
+        let cursor = <Event as evento_core::cursor::Cursor>::deserialize_cursor(&cursor_at(
+            1_700_000_000_123_456,
+        ))
+        .unwrap();
+        assert_eq!((cursor.t, cursor.s, cursor.v), (1_700_000_000, 123, 0));
+        assert_eq!(cursor.i, ulid::Ulid::nil().to_string());
+        let at = |secs, millis, version| Event {
+            id: ulid::Ulid::generate(),
+            version,
+            timestamp: secs,
+            timestamp_subsec: millis,
+            ..Default::default()
+        };
+        // Forward from the cursor keeps what is at or above the stamp.
+        let mut events = vec![
+            at(1_700_000_000, 122, 9),
+            at(1_700_000_000, 123, 1),
+            at(1_700_000_001, 0, 1),
+        ];
+        let ids: Vec<_> = events[1..].iter().map(|e| e.id).collect();
+        <Event as evento_core::cursor::Bind>::retain(&mut events, cursor, false);
+        assert_eq!(events.iter().map(|e| e.id).collect::<Vec<_>>(), ids);
+        assert_eq!(
+            stamp_micros(&at(1_700_000_000, 123, 1)),
+            1_700_000_000_123_000
+        );
+    }
 
     /// A journal's mark covers what a peer saw only if it holds as much of
     /// both parts, within one life; a later life covers every mark of an

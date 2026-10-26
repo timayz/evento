@@ -483,6 +483,29 @@ control plane, everything else is Accord.
   replicated before: a merge after a split, a replica moved back; the
   re-sharding nemesis draws both, and its oracle checks that no member of the
   final layout holds an aggregate it does not own.
+
+  **Pre-seeding the moved slots (#373; shipped).** The copy ran under the write
+  fence, after the source shard's drain point, so a change's pause was the drain
+  plus the whole copy, one after the other. Now `change_topology` asks every node
+  the change gives slots to copy them *before* it proposes the change
+  (`Preseed`/`Preseeded`, waited for up to `preseed_timeout`), while writes
+  still flow. A pre-seed drops the gained slots first, as under the fence, then
+  copies in passes: the first from the start, each later one only what is
+  stamped at or above the sources' stable point as it stood before the previous
+  pass (`RangePageRequest::since`, served by `DataStore::snapshot_page_since`,
+  which the executor store seeks to) — an event applied late at a source lands
+  below a page already read, but never below the point every transaction
+  stamped under it was applied at — until a pass brings nothing or three ran.
+  The copy keeps only each stream's contiguous continuation, so a page that ran
+  ahead of a late apply never leaves a gap. The outcome is journaled
+  (`CopyPhase::Preseeded { resume }`); the fenced copy for the same map skips
+  the drop and starts at `resume`, and installs only the tail. A pre-seed is
+  not run for a change that installs at once (its replica joins, over an empty
+  store); one for a change that never came is replaced by the next copy's
+  state or dropped at the next activation, and the slot GC spares the slots a
+  journaled pre-seed for the next epoch brought in. A gainer's pre-seed and its
+  fenced copy never interleave (`copying`). The record format moved to 12:
+  `RangePageRequest` gained `since`.
 - **M5 — Executor wiring.** ✅ `AccordExecutor` is a real `evento_core::Executor`:
   **writes** are coordinated through the Accord cluster (mapping the outcome to
   `Ok(())` / `WriteError::InvalidOriginalVersion`); **reads, subscriptions, and

@@ -19,6 +19,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use anyhow::Context as _;
 use evento_core::{
     cursor::{Args, Edge, ReadResult, Value},
     Event, EventFilter, RoutingKey, TenantFilter,
@@ -157,6 +158,13 @@ pub struct NodeConfig {
     /// the anti-entropy rounds the contact needs to prove its coverage.
     /// Default 30 s.
     pub amnesia_join_timeout: Duration,
+    /// How long [`change_topology`](Node::change_topology) waits for the
+    /// nodes a change gives slots to copy them **before** it proposes the
+    /// change (#373), while writes still flow, so the copy under the write
+    /// fence has only the tail left. Past it the change is proposed anyway:
+    /// the pre-seed only shortens the pause, the fenced copy brings whatever
+    /// is left. Default 10 s; raise it for a large range.
+    pub preseed_timeout: Duration,
 }
 
 impl Default for NodeConfig {
@@ -180,6 +188,7 @@ impl Default for NodeConfig {
             config_defer_step: Duration::from_millis(100),
             fence_invalidation: true,
             amnesia_join_timeout: Duration::from_secs(30),
+            preseed_timeout: Duration::from_secs(10),
         }
     }
 }
@@ -503,6 +512,20 @@ const RANGE_PAGE_SCANS: usize = 8;
 /// before it returns, leaving the recovery sweep to complete it: a drain takes
 /// about the compaction margin and a few anti-entropy rounds.
 const TRANSITION_ROUNDS: u32 = 6;
+
+/// How many passes a pre-seed makes at most (see `Node::preseed`): each
+/// copies what landed at the sources since the previous one, and they shrink
+/// fast; what is left after the last is copied under the fence.
+const PRESEED_PASSES: u32 = 3;
+
+/// What a range copy brought in (`Node::copy_slots`).
+#[derive(Debug, Default, Clone, Copy)]
+struct CopyOutcome {
+    /// The events installed.
+    events: usize,
+    /// The contact's stable point before its first page, if it reported one.
+    stable: Option<u64>,
+}
 
 /// How a layout transition stands on a node (see [`reconfig`]).
 enum TransitionOutcome {
@@ -1079,6 +1102,11 @@ struct Reconfig {
     /// The epoch through which this node dropped the slots it does not own
     /// under the installed layout ([`gc_lost_slots`](Node::gc_lost_slots)).
     slot_gc: Option<u64>,
+    /// Until when a pre-seed ([`CopyPhase::Preseeded`]) is waited out: the
+    /// change it was for is expected by then; past it, the slots it brought
+    /// in go like any this node does not own. `None` with no pre-seed
+    /// pending — or after a restart, which forgets when it was made.
+    preseed_expires: Option<Instant>,
 }
 
 impl Reconfig {
@@ -1228,6 +1256,10 @@ pub struct Node {
     /// Channels awaiting snapshot pages ([`Message::SnapshotPage`]) during a
     /// [`join`](Node::join), by the page request's correlation id.
     snapshot_pending: Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<Message>>>>,
+    /// Held while this node copies a range into its store — a pre-seed, or
+    /// the copy under the fence — so the two never interleave: the fenced
+    /// copy waits for a pre-seed still running, then resumes where it ended.
+    copying: Arc<tokio::sync::Mutex<()>>,
     /// Latest `applied_through` gossiped by each shard peer (and self); the
     /// recovery sweep compacts below the per-shard minimum of these.
     peer_watermarks: Arc<Mutex<PeerReports>>,
@@ -1373,6 +1405,7 @@ impl Node {
             read_pending: Arc::new(Mutex::new(HashMap::new())),
             config_read_pending: Arc::new(Mutex::new(HashMap::new())),
             snapshot_pending: Arc::new(Mutex::new(HashMap::new())),
+            copying: Arc::new(tokio::sync::Mutex::new(())),
             peer_watermarks: Arc::new(Mutex::new(PeerReports::default())),
             journal_mark: Arc::new(Mutex::new(JournalMark::default())),
             sync_coverage: Arc::new(Mutex::new((start_epoch, HashMap::new()))),
@@ -2478,6 +2511,11 @@ impl Node {
         if !self.bootstrapped.load(Ordering::Acquire) {
             if self.topology.dynamic() {
                 self.fetch_metadata().await;
+                // What it holds for slots it does not own goes here too: a
+                // pre-seed for a change that never came (#373) would
+                // otherwise stand in the way of its join, which needs an
+                // empty store.
+                self.gc_lost_slots().await;
             }
             self.copy_if_gaining().await;
             return;
@@ -3251,7 +3289,9 @@ impl Node {
             | Message::SnapshotPageRequest { .. }
             | Message::RangePageRequest { .. }
             | Message::MetadataFetch { .. }
-            | Message::JoinKeepalive => return Screen::Pass,
+            | Message::JoinKeepalive
+            | Message::Preseed { .. }
+            | Message::Preseeded { .. } => return Screen::Pass,
             // Its recovery of a transaction it alone holds gathers the vote
             // fences that let it invalidate one no one else can commit (see
             // `Node::never_commits`); answered, never counted as a sign the
@@ -3368,6 +3408,9 @@ impl Node {
                 | Message::ReadFailed { .. }
                 | Message::ReadProbe { .. }
                 | Message::ReadProbeOk { .. }
+                | Message::Preseed { .. }
+                | Message::Preseeded { .. }
+                | Message::RangePage { .. }
         )
     }
 
@@ -4252,10 +4295,19 @@ impl Node {
             // At most `RANGE_PAGE_SCANS` store pages are read for one reply,
             // so sparse slots cannot hold a request past its timeout; a reply
             // may then come back empty, with the cursor to go on from.
-            Message::RangePageRequest { id, slots, after } => {
+            Message::RangePageRequest {
+                id,
+                slots,
+                after,
+                since,
+            } => {
                 if !self.bootstrapped.load(Ordering::Acquire) {
                     return out;
                 }
+                // Read before the page: every transaction stamped below it
+                // was applied here when the page was read, so a copy that
+                // runs while writes flow may resume from it (#373).
+                let stable = self.stable_micros();
                 let mut wanted = vec![false; crate::api::SLOTS];
                 for slot in slots {
                     if let Some(wanted) = wanted.get_mut(slot as usize) {
@@ -4269,8 +4321,9 @@ impl Node {
                 for _ in 0..RANGE_PAGE_SCANS {
                     let page = match self
                         .datastore
-                        .snapshot_page(
+                        .snapshot_page_since(
                             after.take(),
+                            since,
                             self.settings.snapshot_page_events,
                             self.settings.snapshot_page_bytes,
                         )
@@ -4299,7 +4352,42 @@ impl Node {
                     after = next.clone();
                 }
                 self.metrics.record_snapshot_page();
-                out.push((from, Message::SnapshotPage { id, events, next }));
+                out.push((
+                    from,
+                    Message::RangePage {
+                        id,
+                        events,
+                        next,
+                        stable: Some(stable),
+                    },
+                ));
+            }
+            // A node the change gives slots copies them now, while writes
+            // still flow (#373), off the inbox: a copy takes as long as the
+            // range is large. Answered when it ends, done or not.
+            Message::Preseed {
+                id,
+                live_epoch,
+                map,
+            } => {
+                let node = self.clone();
+                tokio::spawn(async move {
+                    if node.installed_epoch() == live_epoch {
+                        node.preseed(map).await;
+                    }
+                    node.send(from, Message::Preseeded { id }).await;
+                });
+            }
+            Message::Preseeded { id } => {
+                let tx = self
+                    .snapshot_pending
+                    .lock()
+                    .expect("snapshot poisoned")
+                    .get(&id)
+                    .cloned();
+                if let Some(tx) = tx {
+                    let _ = tx.send(Message::Preseeded { id });
+                }
             }
             Message::SnapshotPageRequest { id, after } => {
                 if !self.bootstrapped.load(Ordering::Acquire) {
@@ -4336,9 +4424,13 @@ impl Node {
                     ),
                 }
             }
-            page @ (Message::SnapshotPage { .. } | Message::CommandPage { .. }) => {
+            page @ (Message::SnapshotPage { .. }
+            | Message::CommandPage { .. }
+            | Message::RangePage { .. }) => {
                 let id = match &page {
-                    Message::SnapshotPage { id, .. } | Message::CommandPage { id, .. } => *id,
+                    Message::SnapshotPage { id, .. }
+                    | Message::CommandPage { id, .. }
+                    | Message::RangePage { id, .. } => *id,
                     _ => unreachable!(),
                 };
                 let tx = self
@@ -8410,6 +8502,14 @@ impl Node {
                 if let Some(since) = self.transition_to(&map) {
                     return self.complete_transition(since).await;
                 }
+                // The nodes the change gives slots copy them first, while
+                // writes still flow (#373), so the copy under the fence has
+                // only the tail left. Not for a change that installs at
+                // once: its new replica joins, over an empty store.
+                let next = Layout::from_map(epoch, map.clone());
+                if !reconfig::installs_at_once(&live, &next) {
+                    self.preseed_gainers(&live, &next).await;
+                }
                 let acceptors = self.topology.nodes();
                 let proposal = Self::change_entry(epoch, &live, map);
                 let decided = self.run_config_paxos(epoch, proposal, &acceptors).await?;
@@ -8610,6 +8710,16 @@ impl Node {
                 dropped,
             )
         };
+        // Not while a pre-seed is still copying: it ends, and the copy below
+        // resumes where it did.
+        let _copying = self.copying.lock().await;
+        let resume = {
+            let reconfig = self.reconfig.lock().expect("reconfig poisoned");
+            match reconfig.copy_state.as_ref().map(|state| &state.phase) {
+                Some(CopyPhase::Preseeded { resume }) if dropped => *resume,
+                _ => None,
+            }
+        };
         if !dropped && !self.drop_gained_slots(since, &live, &pending).await {
             return false;
         }
@@ -8638,59 +8748,22 @@ impl Node {
                 return false;
             };
             let slots: Vec<u16> = slots.into_iter().map(|slot| slot as u16).collect();
-            let mut after = None;
-            let mut copied = 0usize;
-            loop {
-                let page = self
-                    .fetch_page(contact, self.settings.collect_timeout, "range page", |id| {
-                        Message::RangePageRequest {
-                            id,
-                            slots: slots.clone(),
-                            after: after.clone(),
-                        }
-                    })
-                    .await;
-                let (events, next) = match page {
-                    Ok(Message::SnapshotPage { events, next, .. }) => (events, next),
-                    Ok(other) => {
-                        tracing::warn!(node = self.id.0, ?other, "not a range page");
-                        return false;
-                    }
-                    Err(err) => {
-                        tracing::debug!(node = self.id.0, contact = contact.0, %err, "cannot copy a range yet");
-                        return false;
-                    }
-                };
-                let events = match self.not_held(events).await {
-                    Ok(events) => events,
-                    Err(err) => {
-                        tracing::warn!(node = self.id.0, %err, "cannot read the store's versions");
-                        return false;
-                    }
-                };
-                if !events.is_empty() {
-                    copied += events.len();
-                    if let Err(err) = self
-                        .datastore
-                        .apply(TxnId(point), point, events, true)
-                        .await
-                    {
-                        tracing::warn!(node = self.id.0, %err, "cannot install a copied range");
-                        return false;
-                    }
+            let copied = match self.copy_slots(contact, &slots, resume, TxnId(point)).await {
+                Ok(copied) => copied,
+                Err(err) => {
+                    tracing::debug!(node = self.id.0, contact = contact.0, %err, "cannot copy a range yet");
+                    return false;
                 }
-                match next {
-                    Some(cursor) => after = Some(cursor),
-                    None => break,
-                }
-            }
+            };
+            self.metrics.record_range_copy_events(copied.events);
             tracing::info!(
                 node = self.id.0,
                 since,
                 source,
                 contact = contact.0,
                 slots = slots.len(),
-                events = copied,
+                events = copied.events,
+                preseeded = resume.is_some(),
                 "copied the slots a transition moves here"
             );
         }
@@ -8770,6 +8843,239 @@ impl Node {
         true
     }
 
+    /// Copies `slots`' events from `contact`, page by page — those stamped
+    /// at or above `since`, every one with `None`
+    /// ([`Message::RangePageRequest`]) — into the store as the continuation
+    /// of what it holds ([`not_held`](Self::not_held)), under the synthetic
+    /// id `txn`. Returns how many events landed, and the contact's stable
+    /// point as it stood before the first page.
+    async fn copy_slots(
+        &self,
+        contact: NodeId,
+        slots: &[u16],
+        since: Option<u64>,
+        txn: TxnId,
+    ) -> anyhow::Result<CopyOutcome> {
+        let mut after: Option<Value> = None;
+        let mut outcome = CopyOutcome::default();
+        let mut first = true;
+        loop {
+            let page = self
+                .fetch_page(contact, self.settings.collect_timeout, "range page", |id| {
+                    Message::RangePageRequest {
+                        id,
+                        slots: slots.to_vec(),
+                        after: after.clone(),
+                        since,
+                    }
+                })
+                .await?;
+            let (events, next, stable) = match page {
+                Message::RangePage {
+                    events,
+                    next,
+                    stable,
+                    ..
+                } => (events, next, stable),
+                other => anyhow::bail!("not a range page: {other:?}"),
+            };
+            if first {
+                outcome.stable = stable;
+                first = false;
+            }
+            let events = self
+                .not_held(events)
+                .await
+                .context("cannot read the store's versions")?;
+            if !events.is_empty() {
+                outcome.events += events.len();
+                self.datastore
+                    .apply(txn, txn.0, events, true)
+                    .await
+                    .context("cannot install a copied range")?;
+            }
+            match next {
+                Some(cursor) => after = Some(cursor),
+                None => return Ok(outcome),
+            }
+        }
+    }
+
+    /// Copies the slots the change to `map` would give this node, before
+    /// the change is decided and while writes still flow (#373), so the copy
+    /// under the write fence has only the tail left. In passes: the first
+    /// from the start, each later one from the sources' stable point as it
+    /// stood before the previous pass — an event applied late at a source
+    /// lands below a page already read, but never below the point every
+    /// transaction stamped under it was applied at — until a pass brings
+    /// nothing new, or [`PRESEED_PASSES`] ran. The gained slots are dropped
+    /// first, as under the fence, unless this node pre-seeded this very map
+    /// already. Journaled as [`CopyPhase::Preseeded`] with the point the
+    /// fenced copy resumes from. A source that fails is skipped: the fenced
+    /// copy brings whatever is left.
+    async fn preseed(&self, map: ShardMap) {
+        let _copying = self.copying.lock().await;
+        let live = self.topology.layout();
+        let since = live.epoch() + 1;
+        let pending = Layout::from_map(since, map.clone());
+        let mut gained: Vec<(usize, Vec<u16>)> = reconfig::gained_slots(&live, &pending, self.id)
+            .into_iter()
+            .map(|(source, slots)| (source, slots.into_iter().map(|s| s as u16).collect()))
+            .collect();
+        gained.sort_unstable();
+        if gained.is_empty() {
+            return;
+        }
+        let state = self
+            .reconfig
+            .lock()
+            .expect("reconfig poisoned")
+            .copy_state
+            .clone()
+            .filter(|state| state.since == since && state.map == map);
+        match state.as_ref().map(|state| &state.phase) {
+            // Done before, for this very change.
+            Some(CopyPhase::Preseeded { .. }) | Some(CopyPhase::Copied) => return,
+            Some(CopyPhase::Dropped) => {}
+            None => {
+                if !self.drop_gained_slots(since, &live, &pending).await {
+                    return;
+                }
+            }
+        }
+        let txn = TxnId(Timestamp::MIN);
+        let mut resume: Option<u64> = None;
+        for pass in 1..=PRESEED_PASSES {
+            let mut copied = 0usize;
+            let mut stable: Option<u64> = None;
+            for (source, slots) in &gained {
+                let contacts: Vec<NodeId> = live
+                    .replicas_of(*source)
+                    .iter()
+                    .copied()
+                    .filter(|&node| node != self.id)
+                    .collect();
+                let mut done = false;
+                for contact in contacts {
+                    match self.copy_slots(contact, slots, resume, txn).await {
+                        Ok(outcome) => {
+                            copied += outcome.events;
+                            stable = match (stable, outcome.stable) {
+                                (Some(a), Some(b)) => Some(a.min(b)),
+                                (None, b) => b,
+                                (a, None) => a,
+                            };
+                            done = true;
+                            break;
+                        }
+                        Err(err) => {
+                            tracing::debug!(node = self.id.0, contact = contact.0, %err, "a pre-seed source failed");
+                        }
+                    }
+                }
+                if !done {
+                    tracing::info!(
+                        node = self.id.0,
+                        source,
+                        "no source answered a pre-seed; the fenced copy brings the rest"
+                    );
+                    return;
+                }
+            }
+            self.metrics.record_preseed_pass(copied);
+            tracing::info!(
+                node = self.id.0,
+                since,
+                pass,
+                events = copied,
+                ?stable,
+                "pre-seeded the slots a change would give this node"
+            );
+            // Nothing to resume from: the fenced copy starts over, skipping
+            // what is held.
+            let Some(stable) = stable else {
+                resume = None;
+                break;
+            };
+            resume = Some(stable);
+            if copied == 0 {
+                break;
+            }
+        }
+        let state = CopyState {
+            since,
+            map,
+            phase: CopyPhase::Preseeded { resume },
+        };
+        if let Err(err) = self.journal.save_copy_state(&state).await {
+            tracing::warn!(node = self.id.0, since, %err, "cannot journal a pre-seed; the fenced copy starts over");
+            return;
+        }
+        let mut reconfig = self.reconfig.lock().expect("reconfig poisoned");
+        reconfig.copy_state = Some(state);
+        reconfig.preseed_expires = Some(Self::after(self.preseed_grace()));
+    }
+
+    /// How long a pre-seed is kept for the change it was made for: the
+    /// driver proposes once every gainer answered or
+    /// [`preseed_timeout`](NodeConfig::preseed_timeout) passed, and the
+    /// transition reaches this node within a round or two of that.
+    fn preseed_grace(&self) -> Duration {
+        self.settings.preseed_timeout + 2 * self.settings.collect_timeout
+    }
+
+    /// Asks every node the change from `live` to `next` gives slots to copy
+    /// them now ([`Message::Preseed`]), and waits for their answers up to
+    /// [`preseed_timeout`](NodeConfig::preseed_timeout). This node, if it
+    /// gains slots, copies them inline. Past the timeout the change goes on:
+    /// the fenced copy brings whatever is left.
+    async fn preseed_gainers(&self, live: &Layout, next: &Layout) {
+        let gainers = reconfig::gainers(live, next);
+        if gainers.is_empty() {
+            return;
+        }
+        let map = next.map();
+        let deadline = Self::after(self.settings.preseed_timeout);
+        if gainers.contains(&self.id) {
+            self.preseed(map.clone()).await;
+        }
+        let mut waits = Vec::new();
+        for &gainer in gainers.iter().filter(|&&g| g != self.id) {
+            let id = self.correlation_seq.fetch_add(1, Ordering::Relaxed);
+            let (tx, rx) = mpsc::unbounded_channel();
+            self.snapshot_pending
+                .lock()
+                .expect("snapshot poisoned")
+                .insert(id, tx);
+            self.send(
+                gainer,
+                Message::Preseed {
+                    id,
+                    live_epoch: live.epoch(),
+                    map: map.clone(),
+                },
+            )
+            .await;
+            waits.push((id, gainer, rx));
+        }
+        for (id, gainer, mut rx) in waits {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let answered = tokio::time::timeout(left, rx.recv()).await.is_ok();
+            self.snapshot_pending
+                .lock()
+                .expect("snapshot poisoned")
+                .remove(&id);
+            if !answered {
+                self.metrics.record_preseed_timed_out();
+                tracing::info!(
+                    node = self.id.0,
+                    gainer = gainer.0,
+                    "a pre-seed did not answer in time; the change goes on"
+                );
+            }
+        }
+    }
+
     /// `events` without those the store already holds, and without a gap: a
     /// stream's events continue its current version, each the next (the
     /// store applied the ones at or below it, verbatim). An event past a gap
@@ -8808,7 +9114,8 @@ impl Node {
     /// layout it has installed — the slots a layout change took from it, or
     /// gave it and then went back on — once, per installed epoch, and
     /// journals the epoch ([`Journal::save_slot_gc`]). The slots this node is
-    /// copying for a transition in progress are not its own yet and stay. A
+    /// copying for a transition in progress, or pre-seeded for the change
+    /// about to be proposed, are not its own yet and stay. A
     /// drop that fails, or a node that goes down partway, drops again at the
     /// next sweep or restart: dropping what is already gone is a no-op. Only
     /// after an activation installed does a node stop owning a slot, and by
@@ -8817,9 +9124,22 @@ impl Node {
     async fn gc_lost_slots(&self) {
         let layout = self.topology.layout();
         let epoch = layout.epoch();
-        let copying: Vec<usize> = {
+        let (copying, expired): (Vec<usize>, Option<CopyState>) = {
             let reconfig = self.reconfig.lock().expect("reconfig poisoned");
-            if reconfig.slot_gc.is_some_and(|through| through >= epoch) {
+            // A pre-seed for the next change, waited out: the change never
+            // came (or is late enough to copy under the fence instead), and
+            // what it brought in goes with the rest.
+            let preseeded = reconfig.copy_state.as_ref().filter(|state| {
+                state.since == epoch + 1 && matches!(state.phase, CopyPhase::Preseeded { .. })
+            });
+            let expired = preseeded
+                .filter(|_| {
+                    reconfig
+                        .preseed_expires
+                        .is_none_or(|until| Instant::now() >= until)
+                })
+                .cloned();
+            if expired.is_none() && reconfig.slot_gc.is_some_and(|through| through >= epoch) {
                 return;
             }
             // The layout is installed before the transition it belongs to
@@ -8839,7 +9159,7 @@ impl Node {
             if installing {
                 return;
             }
-            reconfig
+            let mut copying: Vec<usize> = reconfig
                 .transition
                 .as_ref()
                 .filter(|t| t.gainers.contains(&self.id))
@@ -8849,7 +9169,19 @@ impl Node {
                         .flatten()
                         .collect()
                 })
-                .unwrap_or_default()
+                .unwrap_or_default();
+            // The slots a pre-seed for the next change brought in (#373) are
+            // not this node's yet either, and stay while the change is
+            // expected: it is about to be proposed. Waited out, they go.
+            if let Some(state) = preseeded.filter(|_| expired.is_none()) {
+                let next = Layout::from_map(state.since, state.map.clone());
+                copying.extend(
+                    reconfig::gained_slots(&layout, &next, self.id)
+                        .into_values()
+                        .flatten(),
+                );
+            }
+            (copying, expired)
         };
         let unowned: Vec<u16> = (0..SLOTS)
             .filter(|&slot| {
@@ -8876,6 +9208,26 @@ impl Node {
                 streams = dropped,
                 "dropped the slots this node does not own under the installed layout"
             );
+        }
+        if let Some(state) = expired {
+            // Dropped, for that change: should it come after all, its copy
+            // starts over under the fence, without dropping again.
+            let state = CopyState {
+                phase: CopyPhase::Dropped,
+                ..state
+            };
+            if let Err(err) = self.journal.save_copy_state(&state).await {
+                tracing::warn!(node = self.id.0, epoch, %err, "cannot journal an expired pre-seed; it is dropped again");
+                return;
+            }
+            tracing::info!(
+                node = self.id.0,
+                since = state.since,
+                "dropped a pre-seed for a change that did not come in time"
+            );
+            let mut reconfig = self.reconfig.lock().expect("reconfig poisoned");
+            reconfig.copy_state = Some(state);
+            reconfig.preseed_expires = None;
         }
         if let Err(err) = self.journal.save_slot_gc(epoch).await {
             tracing::warn!(node = self.id.0, epoch, %err, "cannot journal the slot drop; it runs again");
@@ -12145,6 +12497,7 @@ mod tests {
             .handle_staged(Envelope {
                 from: NodeId(9),
                 message: Message::RangePageRequest {
+                    since: None,
                     id: 7,
                     slots: wanted.clone(),
                     after: None,
@@ -12153,10 +12506,11 @@ mod tests {
             .await;
         let [(
             to,
-            Message::SnapshotPage {
+            Message::RangePage {
                 id,
                 events: page,
                 next,
+                stable,
             },
         )] = out.as_slice()
         else {
@@ -12164,6 +12518,7 @@ mod tests {
         };
         assert_eq!((*to, *id), (NodeId(9), 7));
         assert!(next.is_none(), "the store fits a page");
+        assert!(stable.is_some(), "the page carries the stable point (#373)");
         let expected = events
             .iter()
             .filter(|e| wanted.contains(&(crate::api::slot_of(&Key::of(e)) as u16)))

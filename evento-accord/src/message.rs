@@ -15,7 +15,7 @@ use evento_core::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::api::{AcceptorRecord, ConfigEntry, DurableMark, FenceRecord};
+use crate::api::{AcceptorRecord, ConfigEntry, DurableMark, FenceRecord, ShardMap};
 use crate::clock::{Ballot, NodeId, Timestamp, TxnId};
 
 /// Sharding / ownership unit. Derived from an event's routing key (falling back
@@ -564,12 +564,15 @@ pub enum Message {
     /// A node gaining `slots` in a layout transition → a replica of the shard
     /// that holds them: the page of its store after `after` (a cursor of its
     /// own, as for [`SnapshotPageRequest`](Message::SnapshotPageRequest)),
-    /// holding only those slots' events. Answered with a
-    /// [`SnapshotPage`](Message::SnapshotPage) of the same `id`.
+    /// holding only those slots' events — and, with `since`, only those
+    /// stamped at or above these microseconds: what landed since a copy made
+    /// while writes still flowed (#373). Answered with a
+    /// [`RangePage`](Message::RangePage) of the same `id`.
     RangePageRequest {
         id: u64,
         slots: Vec<u16>,
         after: Option<Value>,
+        since: Option<u64>,
     },
     /// Replica → recovery coordinator, answering a
     /// [`BeginRecovery`](Message::BeginRecovery), routed or not, of a
@@ -602,6 +605,32 @@ pub enum Message {
     RolledBack {
         mark: DurableMark,
         seen: DurableMark,
+    },
+    /// The node driving a layout change → a node the change gives slots,
+    /// before the change is decided (#373): copy the slots `map` gives you
+    /// now, while writes still flow, so the copy under the fence has only
+    /// the tail left. `live_epoch` is the epoch the change is proposed on;
+    /// a node not on it answers at once, having done nothing. Answered with
+    /// a [`Preseeded`](Message::Preseeded) of the same `id`, done or not.
+    Preseed {
+        id: u64,
+        live_epoch: u64,
+        map: ShardMap,
+    },
+    /// Gainer → driving node: its pre-seed ended (see
+    /// [`Preseed`](Message::Preseed)).
+    Preseeded { id: u64 },
+    /// Replica → a node copying a range, answering a
+    /// [`RangePageRequest`](Message::RangePageRequest): the page, and the
+    /// replica's stable point as it stood before the page was read
+    /// (microseconds; every transaction stamped below it was applied there
+    /// when the page was read, so a later copy may resume from it).
+    RangePage {
+        id: u64,
+        #[serde(with = "wire_events")]
+        events: Vec<Event>,
+        next: Option<Value>,
+        stable: Option<u64>,
     },
 }
 
@@ -686,7 +715,10 @@ impl Message {
             | Message::JoinKeepalive
             | Message::Opened { .. }
             | Message::OpenedOk { .. }
-            | Message::RolledBack { .. } => None,
+            | Message::RolledBack { .. }
+            | Message::Preseed { .. }
+            | Message::Preseeded { .. }
+            | Message::RangePage { .. } => None,
         }
     }
 }
@@ -851,6 +883,93 @@ mod tests {
                     assert_eq!(events[0].data, e[0].data);
                     assert_eq!(events[0].aggregate_id, e[0].aggregate_id);
                 }
+                other => panic!("variant changed on the wire: {other:?}"),
+            }
+        }
+    }
+
+    /// The pre-seed messages and the range page cross the wire whole and
+    /// belong to no transaction (#373).
+    #[test]
+    fn preseed_messages_round_trip_tagged() {
+        let map = crate::api::ShardMap::even(vec![vec![NodeId(0)], vec![NodeId(1)]]);
+        let event = Event {
+            id: ulid::Ulid::generate(),
+            aggregate_type: "test/Account".into(),
+            aggregate_id: "acc".into(),
+            version: 1,
+            name: "Bumped".into(),
+            ..Default::default()
+        };
+        let messages = [
+            Message::Preseed {
+                id: 3,
+                live_epoch: 7,
+                map: map.clone(),
+            },
+            Message::Preseeded { id: 3 },
+            Message::RangePage {
+                id: 4,
+                events: vec![event.clone()],
+                next: Some(Value("12".into())),
+                stable: Some(1_234_000),
+            },
+            Message::RangePageRequest {
+                id: 5,
+                slots: vec![1, 2],
+                after: None,
+                since: Some(1_234_000),
+            },
+        ];
+        for message in messages {
+            assert_eq!(message.txn(), None);
+            let bytes = encode_tagged(RecordKind::WireFrame, &message).unwrap();
+            let back: Message = decode_tagged(RecordKind::WireFrame, &bytes).unwrap();
+            match (&message, &back) {
+                (
+                    Message::Preseed {
+                        id,
+                        live_epoch,
+                        map,
+                    },
+                    Message::Preseed {
+                        id: b,
+                        live_epoch: e,
+                        map: m,
+                    },
+                ) => assert_eq!((id, live_epoch, map), (b, e, m)),
+                (Message::Preseeded { id }, Message::Preseeded { id: b }) => assert_eq!(id, b),
+                (
+                    Message::RangePage {
+                        id,
+                        events,
+                        next,
+                        stable,
+                    },
+                    Message::RangePage {
+                        id: b,
+                        events: e,
+                        next: n,
+                        stable: s,
+                    },
+                ) => {
+                    assert_eq!((id, next, stable), (b, n, s));
+                    assert_eq!(events[0].id, e[0].id);
+                }
+                (
+                    Message::RangePageRequest {
+                        id,
+                        slots,
+                        after,
+                        since,
+                    },
+                    Message::RangePageRequest {
+                        id: b,
+                        slots: s,
+                        after: a,
+                        since: c,
+                    },
+                ) => assert_eq!((id, slots, after, since), (b, s, a, c)),
                 other => panic!("variant changed on the wire: {other:?}"),
             }
         }
