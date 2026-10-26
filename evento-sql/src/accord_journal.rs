@@ -150,8 +150,11 @@ pub struct SqlJournal<DB: Database> {
     /// of their own, since `truncate` purges the per-transaction rows of
     /// `staged_meta` below its bound.
     staged_kept: Mutex<Vec<(&'static str, Vec<u8>)>>,
-    /// Serializes flushes so staged entries are only drained once their
-    /// transaction has committed — a failed flush must leave them staged.
+    /// Serializes flushes — and truncations — so staged entries are only
+    /// drained once their transaction has committed (a failed flush must
+    /// leave them staged) and a truncation never commits between a flush's
+    /// snapshot of the batch and its commit (the flush would re-insert what
+    /// the truncation deleted).
     flush_lock: tokio::sync::Mutex<()>,
 }
 
@@ -460,9 +463,9 @@ where
         tx.commit().await?;
 
         // Drop exactly what was flushed; entries staged mid-transaction stay.
-        // By entry, not by position: a concurrent `truncate` may have purged
-        // part of `staged` while the transaction ran, so the batch is no
-        // longer a prefix of it (and draining `batch.len()` entries would
+        // By entry, not by position: `drop_decisions` may have purged part of
+        // `staged_meta` while the transaction ran, so a batch is not always a
+        // prefix of its buffer (and draining `batch.len()` entries would
         // overrun — or worse, drop entries never flushed).
         let flushed: std::collections::HashSet<&(Vec<u8>, Vec<u8>)> = batch.iter().collect();
         self.staged
@@ -485,20 +488,14 @@ where
     }
 
     async fn truncate(&self, before: Timestamp) -> anyhow::Result<()> {
+        // Under `flush_lock`: a flush in flight cloned its batch before this
+        // truncation and would re-insert the rows it deletes once the delete
+        // committed. Waiting for that flush to commit (and holding the lock
+        // against any later one) keeps the two serial.
+        let _guard = self.flush_lock.lock().await;
+
         let bound = ts_key(before);
         let watermark = encode_tagged(RecordKind::Watermark, &before)?;
-
-        // Also purge staged (unflushed) commands below the bound, or a later
-        // flush would resurrect rows this truncation just deleted.
-        self.staged
-            .lock()
-            .expect("journal poisoned")
-            .retain(|(key, _)| key.as_slice() >= bound.as_slice());
-        // Decision records outlive their commands.
-        self.staged_meta
-            .lock()
-            .expect("journal poisoned")
-            .retain(|(txn, key, _)| txn.0 >= before || key.starts_with(DECISION_PREFIX));
 
         let mut tx = self.pool.begin().await?;
 
@@ -506,7 +503,7 @@ where
         // a byte-wise comparison the database can do directly.
         let delete = Query::delete()
             .from_table(AccordCommands::Table)
-            .and_where(Expr::col(AccordCommands::Txn).lt(Expr::value(bound)))
+            .and_where(Expr::col(AccordCommands::Txn).lt(Expr::value(bound.clone())))
             .to_owned();
         let (sql, values) = Self::build_sqlx(&delete);
         sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
@@ -554,6 +551,20 @@ where
             .await?;
 
         tx.commit().await?;
+
+        // Only now purge the staged (unflushed) commands below the bound, or a
+        // later flush would resurrect rows this truncation just deleted. After
+        // the commit, not before: a truncation that fails leaves them for the
+        // next flush, as nothing below the bound was deleted.
+        self.staged
+            .lock()
+            .expect("journal poisoned")
+            .retain(|(key, _)| key.as_slice() >= bound.as_slice());
+        // Decision records outlive their commands.
+        self.staged_meta
+            .lock()
+            .expect("journal poisoned")
+            .retain(|(txn, key, _)| txn.0 >= before || key.starts_with(DECISION_PREFIX));
         Ok(())
     }
 

@@ -7,21 +7,26 @@ use std::path::Path;
 use evento_accord::{Ballot, Journal, Key, NodeId, TxnId};
 use evento_sql::SqlJournal;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::Sqlite;
+use sqlx::{Sqlite, SqlitePool};
 
 mod sql_support;
 use sql_support::{command, layout, timestamp};
 
 /// A fresh in-memory journal (single connection so the in-memory DB is shared).
 async fn memory() -> SqlJournal<Sqlite> {
+    memory_with_pool().await.0
+}
+
+/// [`memory`], plus a handle on the journal's (one-connection) pool.
+async fn memory_with_pool() -> (SqlJournal<Sqlite>, SqlitePool) {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
         .await
         .unwrap();
-    let journal = SqlJournal::new(pool);
+    let journal = SqlJournal::new(pool.clone());
     journal.migrate().await.unwrap();
-    journal
+    (journal, pool)
 }
 
 /// A fresh journal at `path` (for the close/reopen durability test).
@@ -68,6 +73,27 @@ async fn metadata_batch_append() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn routes_and_promises() {
     sql_support::routes_and_promises(&memory().await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_truncate_keeps_staged() {
+    let (journal, pool) = memory_with_pool().await;
+    sql_support::failed_truncate_keeps_staged(&journal, async {
+        sqlx::query("DROP TABLE accord_meta")
+            .execute(&pool)
+            .await
+            .unwrap();
+    })
+    .await;
+}
+
+/// On a file-backed journal with a multi-connection pool, so the flush and
+/// the truncation can really overlap on the database side.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn truncate_races_flush() {
+    let temp = tempfile::tempdir().unwrap();
+    let journal = at(&temp.path().join("journal.db")).await;
+    sql_support::truncate_races_flush(&journal).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

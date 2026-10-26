@@ -257,6 +257,78 @@ where
     );
 }
 
+/// A truncation that fails (here: `accord_meta` is gone, so the watermark
+/// upsert errors and the transaction rolls back) leaves the staged commands
+/// below its bound for the next flush — nothing was deleted, so nothing may
+/// be forgotten.
+pub async fn failed_truncate_keeps_staged<DB>(
+    journal: &SqlJournal<DB>,
+    drop_meta_table: impl std::future::Future<Output = ()>,
+) where
+    DB: Database,
+    for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
+    sea_query_sqlx::SqlxValues: sqlx::IntoArguments<DB>,
+    Vec<u8>: for<'r> sqlx::Decode<'r, DB> + sqlx::Type<DB>,
+    i64: for<'r> sqlx::Decode<'r, DB> + sqlx::Type<DB>,
+    usize: sqlx::ColumnIndex<DB::Row>,
+{
+    let old = command(100, 1);
+    let new = command(300, 2);
+    journal.stage(&old).await.unwrap();
+    journal.stage(&new).await.unwrap();
+
+    drop_meta_table.await;
+    journal
+        .truncate(timestamp(200, 0))
+        .await
+        .expect_err("the watermark upsert has no table to go to");
+
+    // Commands only, so the flush does not need `accord_meta`.
+    journal.flush().await.unwrap();
+    let mut all = journal.load_all().await.unwrap();
+    all.sort_by_key(|state| state.txn);
+    assert_eq!(
+        all.iter().map(|state| state.txn).collect::<Vec<_>>(),
+        vec![old.txn, new.txn],
+        "a failed truncation must not have dropped the staged command below its bound"
+    );
+}
+
+/// A flush and a truncation racing: whichever order they commit in, no
+/// command below the persisted watermark survives (the flush must not
+/// re-insert what the truncation deleted).
+pub async fn truncate_races_flush<DB>(journal: &SqlJournal<DB>)
+where
+    DB: Database,
+    for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
+    sea_query_sqlx::SqlxValues: sqlx::IntoArguments<DB>,
+    Vec<u8>: for<'r> sqlx::Decode<'r, DB> + sqlx::Type<DB>,
+    i64: for<'r> sqlx::Decode<'r, DB> + sqlx::Type<DB>,
+    usize: sqlx::ColumnIndex<DB::Row>,
+{
+    for round in 1..=100u64 {
+        let below = command(round * 10, 1);
+        let bound = timestamp(round * 10 + 5, 0);
+        journal.stage(&below).await.unwrap();
+        let (flushed, truncated) = tokio::join!(journal.flush(), journal.truncate(bound));
+        flushed.unwrap();
+        truncated.unwrap();
+
+        let survivors: Vec<_> = journal
+            .load_all()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|state| state.txn)
+            .filter(|txn| txn.0 < bound)
+            .collect();
+        assert!(
+            survivors.is_empty(),
+            "round {round}: {survivors:?} below the watermark {bound:?} after a flush raced a truncate"
+        );
+    }
+}
+
 /// Routes, blind promises and decision records are staged (invisible until
 /// the flush), round-trip after it, and keep the last value written per
 /// transaction. Routes and promises are truncated with the commands; decision
