@@ -14,12 +14,18 @@ const BASE: &str = "postgres://postgres:postgres@localhost:5432";
 
 /// A freshly-created, migrated journal in its own database `name`.
 async fn fresh(name: &str) -> SqlJournal<Postgres> {
+    fresh_with_pool(name).await.0
+}
+
+/// [`fresh`], plus a handle on the journal's pool.
+async fn fresh_with_pool(name: &str) -> (SqlJournal<Postgres>, PgPool) {
     let url = format!("{BASE}/{name}");
     let _ = Postgres::drop_database(&url).await;
     Postgres::create_database(&url).await.unwrap();
-    let journal = SqlJournal::new(PgPool::connect(&url).await.unwrap());
+    let pool = PgPool::connect(&url).await.unwrap();
+    let journal = SqlJournal::new(pool.clone());
     journal.migrate().await.unwrap();
-    journal
+    (journal, pool)
 }
 
 #[tokio::test]
@@ -50,6 +56,23 @@ async fn metadata_batch_append() {
 #[tokio::test]
 async fn routes_and_promises() {
     sql_support::routes_and_promises(&fresh("accord_pg_routes").await).await;
+}
+
+#[tokio::test]
+async fn failed_truncate_keeps_staged() {
+    let (journal, pool) = fresh_with_pool("accord_pg_failed_truncate").await;
+    sql_support::failed_truncate_keeps_staged(&journal, async {
+        sqlx::query("DROP TABLE accord_meta")
+            .execute(&pool)
+            .await
+            .unwrap();
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn truncate_races_flush() {
+    sql_support::truncate_races_flush(&fresh("accord_pg_truncate_race").await).await;
 }
 
 #[tokio::test]
