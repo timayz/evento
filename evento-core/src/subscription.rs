@@ -154,6 +154,9 @@ use crate::{
     Aggregate, AggregateEvent, EventFilter, Executor, TenantFilter,
 };
 
+/// Default bound on how long a shutdown waits for the pass in flight.
+const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
+
 /// Bounds on the adaptive retry delay after a `Gated` pass. The lower bound
 /// keeps a nearly-stable event from spinning the loop; the upper bound keeps
 /// the subscription responsive while the watermark advances.
@@ -378,6 +381,9 @@ pub struct SubscriptionBuilder<E: Executor> {
     chunk_size: u16,
     continue_on_error: bool,
     retry: Option<u8>,
+    /// How long `shutdown` waits for the in-flight pass before abandoning
+    /// it; `None` waits for as long as the pass takes.
+    shutdown_grace: Option<Duration>,
     aggregators: HashMap<String, String>,
     safety_disabled: bool,
     shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
@@ -457,6 +463,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             delay: None,
             poll_interval: Duration::from_millis(250),
             retry: Some(30),
+            shutdown_grace: Some(DEFAULT_SHUTDOWN_GRACE),
             chunk_size: 300,
             continue_on_error: false,
             routing_key: None,
@@ -1369,6 +1376,38 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
         self
     }
 
+    /// Sets how long [`Subscription::shutdown`] waits for the pass in flight
+    /// before abandoning it. Default is 30 seconds.
+    ///
+    /// A shutdown that lands mid-pass lets the pass run on, so the handlers
+    /// that already ran in it get their cursor acknowledged: the pass stops
+    /// at the next event boundary. This bounds that wait for the case where
+    /// the pass cannot reach a boundary — a store call that never returns
+    /// (a peer that vanished without closing the connection), or a handler
+    /// that hangs. Once the grace elapses the pass is dropped: the events it
+    /// handled since its last acknowledge are redelivered on the next start,
+    /// which at-least-once delivery already allows for.
+    ///
+    /// [`no_shutdown_grace`](Self::no_shutdown_grace) waits for as long as
+    /// the pass takes.
+    pub fn shutdown_grace(mut self, v: Duration) -> Self {
+        self.shutdown_grace = Some(v);
+
+        self
+    }
+
+    /// Makes [`Subscription::shutdown`] wait for the pass in flight for as
+    /// long as it takes, with no bound.
+    ///
+    /// Only sound when every store call and every handler is bounded on its
+    /// own; otherwise a shutdown can hang the process. See
+    /// [`shutdown_grace`](Self::shutdown_grace).
+    pub fn no_shutdown_grace(mut self) -> Self {
+        self.shutdown_grace = None;
+
+        self
+    }
+
     /// Starts a continuous background subscription.
     ///
     /// Returns a [`Subscription`] handle that can be used for graceful shutdown.
@@ -1529,12 +1568,34 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                 // would lose that acknowledge and replay those events after a
                 // restart — with a remote store, where every read is a network
                 // await, almost every shutdown would land there.
+                //
+                // The wait is bounded by the grace, though: a pass stuck in a
+                // store call that never returns, or in a handler that hangs,
+                // never reaches the boundary where it would see the signal,
+                // and an unbounded wait would hang `shutdown()` and with it
+                // the process. Past the grace the pass is abandoned and its
+                // unacknowledged events are redelivered on the next start.
                 let mut shutdown = false;
                 let result = tokio::select! {
                     res = &mut process_fut => res,
                     _ = shutdown_rx.changed() => {
                         shutdown = true;
-                        (&mut process_fut).await
+                        match self.shutdown_grace {
+                            None => (&mut process_fut).await,
+                            Some(grace) => match tokio::time::timeout(grace, &mut process_fut).await {
+                                Ok(res) => res,
+                                Err(_) => {
+                                    tracing::warn!(
+                                        key = self.resolved_key(),
+                                        grace = ?grace,
+                                        "Subscription shutdown grace elapsed: the pass in \
+                                         flight was abandoned, and the events it handled \
+                                         since its last acknowledge will be redelivered"
+                                    );
+                                    break StopReason::Shutdown;
+                                }
+                            },
+                        }
                     }
                 };
 
@@ -1843,6 +1904,10 @@ impl Subscription {
     /// processing the current event before returning. The signal also
     /// interrupts a retry backoff in progress, so shutdown stays prompt even
     /// while the subscription is failing.
+    ///
+    /// The wait is bounded by the builder's
+    /// [`shutdown_grace`](SubscriptionBuilder::shutdown_grace): a pass that
+    /// is stuck past it is abandoned rather than waited on forever.
     pub async fn shutdown(self) -> Result<(), tokio::task::JoinError> {
         self.stop();
 
@@ -2146,6 +2211,61 @@ mod tests {
             1,
             "the failed read is not retried once the handle is gone"
         );
+    }
+
+    /// A pass stuck in a store call never reaches the event boundary where it
+    /// would see the shutdown signal. The grace bounds the wait: once it has
+    /// elapsed the pass is abandoned and `shutdown()` resolves, instead of
+    /// hanging the process behind a read that never returns.
+    #[tokio::test]
+    async fn shutdown_abandons_a_stuck_pass_after_the_grace() {
+        let executor = FailingReads::new();
+        let subscription = SubscriptionBuilder::<FailingReads>::new("stuck")
+            .ephemeral()
+            .shutdown_grace(Duration::from_millis(50))
+            .start(&executor)
+            .await
+            .unwrap();
+
+        // The read is never released: the pass is stuck inside it.
+        executor.0.entered.notified().await;
+        let reason = subscription.stop_reason();
+        assert!(reason.is_none(), "{reason:?}");
+
+        tokio::time::timeout(Duration::from_secs(5), subscription.shutdown())
+            .await
+            .expect("shutdown resolves once the grace has elapsed")
+            .unwrap();
+        executor.worker_gone().await;
+        assert_eq!(executor.reads(), 1);
+    }
+
+    /// Without a grace the worker waits for the pass however long it takes:
+    /// the behaviour a caller opts into with `no_shutdown_grace`.
+    #[tokio::test]
+    async fn without_a_grace_shutdown_waits_for_the_pass() {
+        let executor = FailingReads::new();
+        let subscription = SubscriptionBuilder::<FailingReads>::new("unbounded")
+            .ephemeral()
+            .no_retry()
+            .no_shutdown_grace()
+            .start(&executor)
+            .await
+            .unwrap();
+
+        executor.0.entered.notified().await;
+        subscription.stop();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !subscription.is_finished(),
+            "the worker keeps waiting on the pass in flight"
+        );
+
+        executor.0.released.send(true).unwrap();
+        let reason = tokio::time::timeout(Duration::from_secs(5), subscription.stopped())
+            .await
+            .expect("the worker ends once the pass returns");
+        assert!(matches!(reason, StopReason::Shutdown), "{reason:?}");
     }
 
     #[test]

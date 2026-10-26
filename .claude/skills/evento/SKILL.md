@@ -326,6 +326,7 @@ let sub = SubscriptionBuilder::<evento::Sqlite>::new("notifier") // unique key =
     .routing_key("accounts")   // .any_routing_key() for every key; default = only NULL routing key
     .chunk_size(100)
     .retry(5)                  // exponential backoff; .no_retry() to disable
+    .shutdown_grace(Duration::from_secs(10)) // bound on waiting for the pass in flight (default 30s); .no_shutdown_grace() waits forever
     .start(&executor)          // background task; returns a handle
     .await?;
 // ...later:
