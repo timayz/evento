@@ -1488,6 +1488,20 @@ backend (sql/fjall). Phases, in order:
         waiting on that, waited for good. A replica now answers a `Refuse`
         round for a transaction it does not hold, keys or none
         (`a_keyless_refuse_round_is_a_refusal`).
+        Two sweeps that took one stalled transaction over at the same
+        instant outbid each other for good (#441, the nightly swarm): a
+        recovery refused for a higher ballot retried above it at once, so
+        each one's retry outbid the other's Accept, until both had used
+        their attempts, and the next sweeps, in step, began again — while a
+        third node's read barrier waited on the transaction. A late Nack of
+        an earlier attempt also ended a later one that was winning. A
+        recovery outbid by another node's now leaves the transaction to that
+        one, the ballot witnessed so that a later recovery here outbids it
+        on its first attempt, and a Nack naming a ballot at or below the
+        attempt's refuses nothing
+        (`a_recovery_outbid_by_another_node_leaves_the_transaction_to_it`,
+        `a_nack_below_the_ballot_does_not_end_a_recovery`; the seed is
+        pinned, `sweeps_recovering_one_transaction_at_once_do_not_duel`).
   - [ ] **Real-cluster soak + chaos** over days (kills, partitions, clock skew,
         disk pressure, slow disks/links) on actual hardware — zero production
         mileage today.

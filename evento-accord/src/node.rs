@@ -817,7 +817,8 @@ enum RecoverResp {
 enum Attempt {
     /// Decided: the outcome.
     Done(CommitOutcome),
-    /// A higher ballot was promised: retry above it.
+    /// A higher ballot was promised: retry above it, if it is this node's
+    /// own, else leave the transaction to the node that holds it.
     Retry(Ballot),
     /// A report revealed the transaction's multi-shard route: retry routed.
     Route(Vec<Key>),
@@ -6088,7 +6089,12 @@ impl Node {
             } if b == ballot => Some(RecoverResp::NotWitnessed { redundant }),
             Message::Amnesiac { ballot: b, .. } if b == ballot => Some(RecoverResp::Amnesiac),
             Message::Late { ballot: b, .. } if b == ballot => Some(RecoverResp::Late),
-            Message::Nack { promised, .. } => Some(RecoverResp::Nack(promised)),
+            // A replica refuses a ballot only for a higher one it promised:
+            // a Nack naming one at or below this attempt's answers an
+            // earlier attempt late, and refuses nothing here (#441).
+            Message::Nack { promised, .. } if promised > ballot => {
+                Some(RecoverResp::Nack(promised))
+            }
             _ => None,
         }
     }
@@ -6157,8 +6163,34 @@ impl Node {
             // sweep take this node's own transaction for locally in flight,
             // and never recover it.
             self.deregister(txn);
+            let what = match &attempt {
+                Ok(Attempt::Done(o)) => format!("done conflict={}", o.conflict),
+                Ok(Attempt::Retry(p)) => format!("retry promised={p:?}"),
+                Ok(Attempt::Route(_)) => "route".to_string(),
+                Err(e) => format!("err {e:#}"),
+            };
+            tracing::trace!(node = self.id.0, ?txn, ?ballot, ?driver, %what, "recovery attempt");
             match attempt? {
                 Attempt::Done(outcome) => return Ok(outcome),
+                // Outbid by another node's recovery: that one holds the
+                // higher ballot, and decides the transaction. Outbidding
+                // it back would have it outbid this one again, and two
+                // sweeps in step would go on like that for ever (#441).
+                // Its ballot is witnessed, so a later recovery here, should
+                // that one not finish, outbids it on its first attempt.
+                // (The transaction's own ballot, its coordinator's, is no
+                // recovery's: a mint below it is outbid at once.)
+                Attempt::Retry(promised)
+                    if promised.0.node != self.id && promised != Ballot(txn.0) =>
+                {
+                    self.clock.witness(promised.0);
+                    anyhow::bail!(
+                        "recovery of {txn:?} outbid by node {}'s, under {promised:?}",
+                        promised.0.node.0
+                    );
+                }
+                // Outbid by a ballot this node minted, an earlier attempt's
+                // promised late: retry above it.
                 Attempt::Retry(promised) => ballot = self.higher_ballot(promised).await?,
                 // The replicas already promised `ballot`: ask again under it.
                 Attempt::Route(found) => route = Some(found),
@@ -7181,7 +7213,9 @@ impl Node {
                         Message::AcceptOk {
                             ballot: b, deps, ..
                         } if b == ballot => Some(Ok(deps)),
-                        Message::Nack { promised, .. } => Some(Err(promised)),
+                        // One below this ballot answers an earlier attempt
+                        // (see `recover_report`).
+                        Message::Nack { promised, .. } if promised > ballot => Some(Err(promised)),
                         _ => None,
                     },
                 )
