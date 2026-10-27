@@ -5885,9 +5885,16 @@ impl Node {
     /// dependencies, keys and events. The peers are asked as a recovery asks
     /// them, under a fresh ballot, with nothing to pre-accept: one that never
     /// witnessed it only promises the ballot. Returns whether a decision was
-    /// learned. A transaction no peer reports committed is left to the
-    /// replicas holding it, which recover it; one invalidated is applied
-    /// there, so anti-entropy brings it in.
+    /// learned. One invalidated is applied where it is held, so
+    /// anti-entropy brings it in.
+    ///
+    /// A transaction a peer reports held but undecided is recovered here,
+    /// under that holder's keys and events (#441). Its holders recover it
+    /// too, but the ballot this node asked under is promised wherever it
+    /// reached, and a holder's recovery under a lower one is outbid by it
+    /// and leaves the transaction to this node (see
+    /// [`recover_with`](Self::recover_with)): having taken the ballot, this
+    /// node decides it.
     ///
     /// One no replica heard from holds at all was held only by a replica
     /// that lost its journal since (#337): nobody recovers it, and what waits
@@ -5931,6 +5938,22 @@ impl Node {
             _ => None,
         });
         let Some(f) = decided else {
+            let held = reports.iter().find_map(|(_, report)| match report {
+                RecoverResp::Ok(f) if f.known => Some(f.clone()),
+                _ => None,
+            });
+            if let Some(f) = held {
+                self.deregister(txn);
+                self.metrics.record_recovery();
+                tracing::debug!(
+                    node = self.id.0,
+                    ?txn,
+                    "recovering a dependency a holder reports undecided"
+                );
+                self.recover_with(txn, f.epoch, f.keys, f.events, Driver::Sweep)
+                    .await?;
+                return Ok(true);
+            }
             let orphaned = self
                 .invalidate_orphan(&mut rx, &layout, txn, ballot, &peers, &mut reports)
                 .await;

@@ -4294,6 +4294,18 @@ async fn sweeps_recovering_one_transaction_at_once_do_not_duel() {
     swarm_seeds_pass(&DUELING_SWEEPS_SEEDS).await;
 }
 
+/// A swarm seed (#441) where a node learning the decision of a dependency
+/// it never witnessed asked its holders every sweep, under a fresh ballot
+/// each time, and a holder's recovery of it, outbid by that ballot, left
+/// the transaction to the learner — which decided nothing. The learner now
+/// recovers what a holder reports undecided.
+const LEARNER_OUTBIDS_HOLDER_SEEDS: [u64; 1] = [150141];
+
+#[tokio::test(start_paused = true)]
+async fn a_learner_recovers_a_dependency_its_holders_leave_to_it() {
+    swarm_seeds_pass(&LEARNER_OUTBIDS_HOLDER_SEEDS).await;
+}
+
 /// Runs each swarm seed of `seeds`, failing on the first that breaks an
 /// oracle.
 async fn swarm_seeds_pass(seeds: &[u64]) {

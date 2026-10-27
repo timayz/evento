@@ -1502,6 +1502,13 @@ backend (sql/fjall). Phases, in order:
         (`a_recovery_outbid_by_another_node_leaves_the_transaction_to_it`,
         `a_nack_below_the_ballot_does_not_end_a_recovery`; the seed is
         pinned, `sweeps_recovering_one_transaction_at_once_do_not_duel`).
+        Whoever takes a ballot then has to decide: a node learning the
+        decision of a dependency it never witnessed (#330) asked its holders
+        under a fresh ballot every sweep, and left one they reported
+        undecided to them — whose recoveries, outbid by that ballot, now
+        left it to the learner. It recovers such a transaction itself,
+        under the holder's keys and events
+        (`a_learner_recovers_a_dependency_its_holders_leave_to_it`).
   - [ ] **Real-cluster soak + chaos** over days (kills, partitions, clock skew,
         disk pressure, slow disks/links) on actual hardware — zero production
         mileage today.
