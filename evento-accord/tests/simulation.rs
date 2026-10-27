@@ -4282,6 +4282,18 @@ async fn a_refusal_for_good_is_never_named_in_a_nack() {
     swarm_seeds_pass(&REFUSED_THEN_INVALIDATED_SEEDS).await;
 }
 
+/// A swarm seed (#441, the nightly run) whose healed cluster never served
+/// again: two nodes' sweeps took the same stalled transaction over at the
+/// same instant, every sweep, and each recovery was outbid by the other's
+/// retry under a higher ballot, so neither decided it, while a third node's
+/// read barrier waited on it.
+const DUELING_SWEEPS_SEEDS: [u64; 1] = [732519294375331478];
+
+#[tokio::test(start_paused = true)]
+async fn sweeps_recovering_one_transaction_at_once_do_not_duel() {
+    swarm_seeds_pass(&DUELING_SWEEPS_SEEDS).await;
+}
+
 /// Runs each swarm seed of `seeds`, failing on the first that breaks an
 /// oracle.
 async fn swarm_seeds_pass(seeds: &[u64]) {
