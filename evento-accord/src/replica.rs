@@ -1840,6 +1840,14 @@ impl Replica {
         self.blocked.get(&txn).copied()
     }
 
+    /// The keys of the oldest command here known to be waiting on `dep`
+    /// (see `blocked`), if one is. A dependency is scoped to a replica's
+    /// part of the command that waits on it, so `dep` touches one of them.
+    pub fn keys_waiting_on(&self, dep: TxnId) -> Option<Vec<Key>> {
+        let waiter = self.waiters.get(&dep)?.iter().min()?;
+        self.commands.get(waiter).map(|cmd| cmd.keys.clone())
+    }
+
     /// Whether `txn` is held here committed and decided, not yet applied:
     /// all its execution still needs is its dependencies and the data
     /// store, so no recovery of it decides anything more, nor brings this
