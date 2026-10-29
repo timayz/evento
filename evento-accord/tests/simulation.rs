@@ -6834,6 +6834,30 @@ async fn resharding_is_bit_reproducible() {
     }
 }
 
+/// A re-sharding seed (#443, the nightly run) where a node learning the
+/// decision of a dependency it never witnessed proved the dependency never
+/// committed from its own refusal and that of a replica added at once since,
+/// counted against the layout it had installed — and invalidated a write two
+/// replicas had committed under the layout before. It and the new replica,
+/// which had joined through it, never applied the write.
+const ORPHAN_PLANNED_BEFORE_AN_ADDITION_SEEDS: [u64; 1] = [8074025478916997991];
+
+#[tokio::test(start_paused = true)]
+async fn a_dependency_is_judged_under_every_layout_it_may_have_been_planned_under() {
+    for &seed in &ORPHAN_PLANNED_BEFORE_AN_ADDITION_SEEDS {
+        let _replay = Replay {
+            test: "reshard_swarm",
+            seed,
+        };
+        let shape = ReshardConfig::from_seed(seed);
+        let run = run_reshard(seed, &shape).await;
+        assert!(
+            run.safety.is_none() && run.liveness.is_none(),
+            "reshard seed {seed} ({shape:?}): {run:?}"
+        );
+    }
+}
+
 /// Fresh re-sharding seeds, for the nightly job (`SIM_SEEDS`, `SIM_DURATION`).
 #[tokio::test(start_paused = true)]
 #[ignore = "re-sharding swarm: run explicitly, with SIM_SEEDS or SIM_DURATION for fresh seeds"]

@@ -4,13 +4,13 @@
 //! layout is installed. These nodes run the recovery sweep, whose watermark
 //! gossip and anti-entropy the drain waits on.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use evento_accord::{
     DataStore, DynamicTopology, HybridLogicalClock, InMemoryDataStore, InMemoryJournal,
-    InMemoryNetwork, Journal, LinkFilter, Message, MessageSink, Node, NodeId, Status, Topology,
-    TopologyChanging, TxnId,
+    InMemoryNetwork, Journal, LinkFilter, Message, MessageSink, Node, NodeConfig, NodeId, Status,
+    Topology, TopologyChanging, TxnId,
 };
 use evento_core::Event;
 
@@ -43,6 +43,16 @@ impl TestNode {
 }
 
 fn spawn(net: &Arc<InMemoryNetwork>, id: u64, shards: Vec<Vec<NodeId>>) -> TestNode {
+    spawn_with(net, id, shards, NodeConfig::default())
+}
+
+/// [`spawn`], with `config`.
+fn spawn_with(
+    net: &Arc<InMemoryNetwork>,
+    id: u64,
+    shards: Vec<Vec<NodeId>>,
+    config: NodeConfig,
+) -> TestNode {
     let id = NodeId(id);
     let inbox = net.register(id);
     let store = Arc::new(InMemoryDataStore::new());
@@ -54,7 +64,8 @@ fn spawn(net: &Arc<InMemoryNetwork>, id: u64, shards: Vec<Vec<NodeId>>) -> TestN
         Arc::new(net.sink(id)) as Arc<dyn MessageSink>,
         Arc::clone(&store) as Arc<dyn DataStore>,
         Arc::new(InMemoryJournal::new()) as Arc<dyn Journal>,
-    );
+    )
+    .with_config(config);
     let _loop = node.start(inbox);
     TestNode {
         node,
@@ -339,4 +350,136 @@ async fn adding_one_replica_installs_at_once() {
         .join(NodeId(0))
         .await
         .expect("joins over an empty store");
+}
+
+/// Whether `store` holds `event`, at its version.
+fn holds(store: &InMemoryDataStore, event: &Event) -> bool {
+    store
+        .committed_events()
+        .iter()
+        .any(|((_, _, id, version), ulid)| {
+            *id == event.aggregate_id && *version == event.version && *ulid == event.id
+        })
+}
+
+/// #443, the nightly re-sharding swarm. T was committed through replicas 1
+/// and 2 of `{0, 1, 2}`: node 0 never heard of it. Node 3 is added at once
+/// and joins through node 0, so it holds nothing of T either, and W, a
+/// later write on T's key, commits with T as a dependency. Cut off from 1
+/// and 2, nodes 0 and 3 learn T's decision from each other alone. Counted
+/// under the layout they installed, their two refusals leave no quorum of
+/// three of `{0, 1, 2, 3}`; but T was planned under `{0, 1, 2}`, where 1
+/// and 2 are a quorum — they committed it. Neither may invalidate it, and
+/// healed, every replica holds T and W.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_dependency_planned_before_a_replica_was_added_is_not_invalidated() {
+    let net = InMemoryNetwork::new();
+    let old = ids(&[0, 1, 2]);
+    let new = ids(&[0, 1, 2, 3]);
+    let config = NodeConfig {
+        fast_timeout: Duration::from_millis(20),
+        collect_timeout: Duration::from_millis(500),
+        recovery_interval: Duration::from_millis(20),
+        anti_entropy_interval: Duration::from_millis(25),
+        recovery_timeout: Duration::from_millis(100),
+        compaction_margin: Duration::from_millis(200),
+        ..NodeConfig::default()
+    };
+    let nodes: Vec<TestNode> = (0..3)
+        .map(|id| spawn_with(&net, id, vec![old.clone()], config))
+        .collect();
+    let joiner = spawn_with(&net, 3, vec![old.clone()], config);
+    joiner.node.begin_join();
+    let _sweeps: Vec<_> = nodes.iter().chain([&joiner]).map(TestNode::sweep).collect();
+
+    // Nodes 0 and 3 hear nothing of T from 1 and 2, nor anything they
+    // could import it from.
+    let t: Arc<Mutex<Option<TxnId>>> = Arc::default();
+    let blind: LinkFilter = {
+        let t = Arc::clone(&t);
+        let outside = |node: NodeId| node != NodeId(0) && node != NodeId(3);
+        Arc::new(move |from, to, message| {
+            if outside(to) || !outside(from) {
+                return false;
+            }
+            if matches!(message, Message::SyncData { .. }) {
+                return true;
+            }
+            match *t.lock().unwrap() {
+                // T in flight: no transaction at all.
+                None => message.txn().is_some(),
+                Some(t) => message.txn() == Some(t),
+            }
+        })
+    };
+    net.set_link_filter(Some(blind));
+    let first = event("acc", 1);
+    let committed = nodes[1]
+        .node
+        .write(vec![first.clone()])
+        .await
+        .expect("T commits through replicas 1 and 2");
+    assert!(!committed.conflict);
+    let txn = committed.txn;
+    *t.lock().unwrap() = Some(txn);
+    assert_eq!(
+        nodes[0].node.command_status(txn),
+        None,
+        "node 0 never saw T"
+    );
+
+    let installed = nodes[1]
+        .node
+        .change_topology(1, vec![new.clone()])
+        .await
+        .expect("node 3 is added");
+    assert_eq!(installed, vec![new]);
+    await_epoch(&nodes[0].topology, 1).await;
+    joiner.node.join(NodeId(0)).await.expect("joins through 0");
+    // Committed only: nodes 0 and 3 cannot read it before T is decided
+    // there, and a read quorum needs one of them.
+    let second = event("acc", 2);
+    nodes[1]
+        .node
+        .coordinate_through_commit(vec![second.clone()])
+        .await
+        .expect("W commits, after T");
+
+    net.partition(NodeId(0), NodeId(1));
+    net.partition(NodeId(0), NodeId(2));
+    for _ in 0..200 {
+        for (i, node) in [(0, &nodes[0].node), (3, &joiner.node)] {
+            assert_eq!(
+                node.command_status(txn),
+                None,
+                "node {i} decided T, which it never witnessed, alone with a replica added since"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        !holds(&nodes[0].store, &second),
+        "node 0 applied W without T"
+    );
+
+    net.set_link_filter(None);
+    net.heal_all_partitions();
+    let stores: Vec<&InMemoryDataStore> = nodes
+        .iter()
+        .chain([&joiner])
+        .map(|n| n.store.as_ref())
+        .collect();
+    for _ in 0..2_000 {
+        if stores
+            .iter()
+            .all(|store| holds(store, &first) && holds(store, &second))
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    for (i, store) in stores.iter().enumerate() {
+        assert!(holds(store, &first), "node {i} lacks T");
+        assert!(holds(store, &second), "node {i} lacks W");
+    }
 }
