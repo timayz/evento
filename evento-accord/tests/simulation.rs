@@ -2390,6 +2390,27 @@ async fn safety_and_liveness_hold_under_amnesia_over_two_shards_and_message_faul
     }
 }
 
+/// Two-shard amnesia seeds with message faults (#449) where a replica waiting
+/// on an orphan dependency missed its `Invalidate` — its own copy was lost —
+/// and never learned it: the one replica that recorded it held no keys of it,
+/// so anti-entropy never shipped it, and a recovery of it from that record
+/// reached no replica. A write reading behind it stayed undecided below an
+/// amnesiac's fence, and the join never went through.
+const MISSED_INVALIDATION_SEEDS: [u64; 3] = [802586, 805228, 817115];
+
+#[tokio::test(start_paused = true)]
+async fn a_replica_that_missed_an_invalidation_learns_it_from_its_record() {
+    for &seed in &MISSED_INVALIDATION_SEEDS {
+        let _replay = Replay {
+            test: "safety_and_liveness_hold_under_amnesia_over_two_shards_and_message_faults",
+            seed,
+        };
+        run_sharded_amnesia(seed, Faults::ALL)
+            .await
+            .assert_ok(&format!("sharded amnesia +faults at seed {seed}"));
+    }
+}
+
 /// A node's disk is rolled back to an older copy of its journal (#339),
 /// with writes and, under `faults`, message and storage faults going on. The
 /// copy was taken earlier, and the node went on voting and reporting until

@@ -411,3 +411,60 @@ async fn a_recovery_outbid_by_another_node_leaves_the_transaction_to_it() {
         "the next recovery begins below the ballot that outbid the last: {again:?}"
     );
 }
+
+/// A dependency invalidated on one replica alone (#449): its `Invalidate`
+/// reached node 1 and was lost on its way to node 0, where a write committed
+/// with it as a dependency waits on it. Node 1 never witnessed it either, so
+/// its record holds no keys: anti-entropy, which imports what holds this
+/// node's keys, never brings it to node 0, and a recovery of it from that
+/// record would reach no replica. Node 0 learns it from node 1's report and
+/// records it invalidated, and the write goes on.
+#[tokio::test(start_paused = true)]
+async fn a_dependency_invalidated_elsewhere_is_learned_from_its_record() {
+    init_tracing();
+    let net = InMemoryNetwork::new();
+    let base = tokio::time::Instant::now();
+    let ids = [NodeId(0), NodeId(1), NodeId(2)];
+    let (mut nodes, mut tasks) = (Vec::new(), Vec::new());
+    for id in ids {
+        let (node, _store) = node(&net, id, base);
+        tasks.push(node.start(net.register(id)));
+        // Node 0's sweep alone: it is the one waiting on the dependency.
+        if id == NodeId(0) {
+            tasks.push(node.start_recovery());
+        }
+        nodes.push(node);
+    }
+    let _replies = net.register(GONE);
+    let gone = net.sink(GONE);
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let orphan = mint(base);
+    send_all(&gone, &[NodeId(1)], Message::Invalidate { txn: orphan }).await;
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    let write = mint(base);
+    let commit = Message::Commit {
+        epoch: 0,
+        txn: write,
+        execute_at: write.0,
+        deps: vec![orphan],
+        keys: vec![acc()],
+        events: vec![event("acc", 1)],
+        reply_to: GONE,
+    };
+    send_all(&gone, &ids, commit).await;
+
+    let applied = async {
+        while nodes[0].command_status(write) != Some(Status::Applied) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(2), applied)
+        .await
+        .expect("node 0 applies the write well within one collect_timeout");
+    assert_eq!(
+        nodes[0].command_status(orphan),
+        Some(Status::Applied),
+        "node 0 holds the dependency invalidated"
+    );
+}
