@@ -1048,7 +1048,11 @@ backend (sql/fjall). Phases, in order:
   for once its deadline passed, so it never committed. They invalidate it, and
   an `Invalidate` records it aborted on a replica that never witnessed it,
   keeping the ballot it promised, so what waits on it goes on
-  (`a_dependency_only_an_amnesiac_held_is_invalidated`). A **multi-shard**
+  (`a_dependency_only_an_amnesiac_held_is_invalidated`). Its epoch is not
+  known to them, so the refusals must rule a commit out under every layout it
+  may have been planned under: those of the waiting write's keys back from the
+  installed one, for as long as each key only gained replicas (#443,
+  `Node::orphan_plans`). A **multi-shard**
   transaction of that shape is decided the same way (#377,
   `a_routed_recovery_decides_what_an_amnesiac_and_one_replica_accepted`): the
   routed recovery hands the late replica its shard's part from a holder's report,
@@ -1509,6 +1513,26 @@ backend (sql/fjall). Phases, in order:
         left it to the learner. It recovers such a transaction itself,
         under the holder's keys and events
         (`a_learner_recovers_a_dependency_its_holders_leave_to_it`).
+        A node learning the decision of a dependency no replica it heard
+        from holds counted the refusals under the layout it had installed
+        (#443, the nightly re-sharding swarm). After a replica was added at
+        once, its own refusal and the new replica's left no quorum of three
+        of four — but the write was planned under the three before, where
+        the two replicas it did not hear from are a quorum, and they had
+        committed it: the learner invalidated it, and it and the new
+        replica, which had joined through it, never applied it. The
+        dependency's key is one of the waiting command's, and the layouts it
+        may still commit under are that key's back from the installed one,
+        for as long as the key only gained replicas: one where it had a
+        replica it lost since lies behind a drain, which left every write
+        planned before it that ever committed at every replica the key has
+        now. The refusals must rule a commit out under each; a node that
+        cannot tell — no command it holds is known to wait on the
+        dependency, or the dependency may predate the first layout it knows
+        — leaves it to its holders
+        (`a_dependency_planned_before_a_replica_was_added_is_not_invalidated`;
+        the seed is pinned,
+        `a_dependency_is_judged_under_every_layout_it_may_have_been_planned_under`).
   - [ ] **Real-cluster soak + chaos** over days (kills, partitions, clock skew,
         disk pressure, slow disks/links) on actual hardware — zero production
         mileage today.

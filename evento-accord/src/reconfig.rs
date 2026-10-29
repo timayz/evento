@@ -44,7 +44,9 @@
 //! installed it, and the two layouts' quorums meet: a transaction planned
 //! under the new layout witnesses, through a replica the two share, every one
 //! the old layout committed, and a new replica joins through one its shard
-//! kept (`Node::join`).
+//! kept (`Node::join`). Quorums that meet prove nothing of refusals, though:
+//! a dependency a node never witnessed, its layout unknown, is proven never
+//! committed under each of the two (`Node::orphan_plans`, #443).
 //!
 //! **Copying the moved slots.** In a transition, every node that gains slots
 //! ([`gainers`]) copies them before the change installs its layout: from each

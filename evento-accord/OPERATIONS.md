@@ -472,7 +472,10 @@ refuses anything else before a vote, and a node never installs it.
     gets its vote and decides the transaction, and the join goes through. One only the
     lost replica held, which a write committed with as a dependency, is invalidated by
     the replicas that wait on it: past its deadline nothing can vote for it, so it never
-    committed.
+    committed. They prove it under every layout it may have been planned under — after a
+    replica was added to their shard at once, the replicas it had before must refuse it
+    too — and a node that does not know those layouts (its `DynamicTopology` was built
+    past epoch 0) leaves it to its holders instead (#443).
   - **Stuck below the fence**: one case can still never be decided — a transaction
     whose lost replica voted for it only in a recovery and lost its journal before its
     next report showed it holding the transaction. (A **multi-shard** transaction of
