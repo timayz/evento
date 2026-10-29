@@ -784,10 +784,22 @@ struct Sharded {
     stores: Vec<Arc<InMemoryDataStore>>,
     journals: Vec<Arc<InMemoryJournal>>,
     loops: Vec<tokio::task::JoinHandle<()>>,
+    config: NodeConfig,
 }
 
 impl Sharded {
     fn start() -> Self {
+        Self::start_with(NodeConfig {
+            collect_timeout: Duration::from_secs(1),
+            // A short deadline for the original coordinator: a replica that
+            // never witnessed a transaction can be refused for good past it.
+            compaction_margin: Duration::from_millis(200),
+            ..NodeConfig::default()
+        })
+    }
+
+    /// [`start`](Self::start), every node under `config`.
+    fn start_with(config: NodeConfig) -> Self {
         let mut cluster = Self {
             net: InMemoryNetwork::new(),
             layout: vec![(0..3).map(NodeId).collect(), (3..6).map(NodeId).collect()],
@@ -795,6 +807,7 @@ impl Sharded {
             stores: Vec::new(),
             journals: Vec::new(),
             loops: Vec::new(),
+            config,
         };
         for id in 0..6 {
             let journal = Arc::new(InMemoryJournal::new());
@@ -824,13 +837,7 @@ impl Sharded {
             Arc::clone(store) as Arc<dyn DataStore>,
             Arc::clone(journal) as Arc<dyn Journal>,
         )
-        .with_config(NodeConfig {
-            collect_timeout: Duration::from_secs(1),
-            // A short deadline for the original coordinator: a replica that
-            // never witnessed a transaction can be refused for good past it.
-            compaction_margin: Duration::from_millis(200),
-            ..NodeConfig::default()
-        })
+        .with_config(self.config)
     }
 
     /// Restarts node `id` from its journal, over a fresh data store.
@@ -976,6 +983,119 @@ async fn recovery_waits_for_a_slow_shard_before_deciding() {
     c.await_applied(0..6, txn).await;
     for id in 0..6 {
         assert!(!c.committed(id, txn), "node {id} must not apply its events");
+    }
+}
+
+/// Node 1 as the one holder of shard A's part of `txn`, undecided: it
+/// answers a node learning `txn`'s decision with that part and `txn`'s
+/// `route`, and answers nothing more — no recovery round.
+fn undecided_holder(
+    mut inbox: mpsc::Receiver<Envelope>,
+    sink: InMemorySink,
+    txn: TxnId,
+    route: Vec<Key>,
+    part: Vec<Event>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(env) = inbox.recv().await {
+            let Message::BeginRecovery {
+                txn: asked,
+                ballot,
+                round: RecoveryRound::Dependency,
+                ..
+            } = env.message
+            else {
+                continue;
+            };
+            if asked != txn {
+                continue;
+            }
+            let report = Message::BeginRecoveryOk {
+                epoch: 0,
+                txn,
+                ballot,
+                known: true,
+                status: Status::PreAccepted,
+                accepted: Ballot(txn.0),
+                execute_at: txn.0,
+                deps: Vec::new(),
+                superseding_rejects: false,
+                wait: false,
+                keys: part.iter().map(Key::of).collect(),
+                events: part.clone(),
+            };
+            let routed = Message::Routed {
+                route: route.clone(),
+                inner: Box::new(report),
+            };
+            let _ = sink.send(env.from, routed).await;
+        }
+    })
+}
+
+/// Node 2 holds a write committed to execute after T, a transaction spanning
+/// both shards it never witnessed, so it learns T's decision from T's holders
+/// (#330). Node 1, played by the test, holds shard A's part undecided: it
+/// reports that part with T's route, then answers nothing. Node 2 recovers T
+/// itself (#441), and must do so by that route (#445): shard B never
+/// witnessed T, so T never committed, and is aborted once shard B refuses it.
+/// Recovered over shard A's part alone, T was committed on shard A's read,
+/// and shard B was never asked for its part.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_learner_recovers_a_dependency_by_the_route_its_holder_reports() {
+    let c = Sharded::start_with(NodeConfig {
+        collect_timeout: Duration::from_secs(1),
+        // The original coordinator's deadline outlasts node 2's first
+        // recovery of T, so shard A's replicas that never witnessed T vote
+        // for it there rather than answer late: shard A alone can commit it.
+        compaction_margin: Duration::from_secs(2),
+        ..NodeConfig::default()
+    });
+    let a = c.id_in_shard(0, "a");
+    let b = c.id_in_shard(1, "b");
+    let w = c.id_in_shard(0, "w");
+    let txn = outside_txn();
+    c.loops[1].abort();
+    let _holder = undecided_holder(
+        c.net.register(NodeId(1)),
+        c.net.sink(NodeId(1)),
+        txn,
+        vec![Key(a.clone()), Key(b)],
+        vec![event(&a, 1)],
+    );
+
+    // The write T's coordinator, node 9, committed to execute after T.
+    let waiting = TxnId(Timestamp {
+        micros: txn.0.micros + 1_000,
+        logical: 0,
+        node: NodeId(9),
+    });
+    let _replies = c.net.register(NodeId(9));
+    let commit = Message::Commit {
+        txn: waiting,
+        epoch: 0,
+        execute_at: waiting.0,
+        deps: vec![txn],
+        keys: vec![Key(w.clone())],
+        events: vec![event(&w, 1)],
+        reply_to: NodeId(9),
+    };
+    c.net.sink(NodeId(9)).send(NodeId(2), commit).await.unwrap();
+    let _sweep = c.nodes[2].start_recovery();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while c.nodes[2].command_status(txn) != Some(Status::Applied) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "node 2 settles T once shard B refuses it"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    for id in [0, 2, 3, 4, 5] {
+        assert!(
+            !c.committed(id, txn),
+            "node {id} applied T, which shard B never witnessed"
+        );
     }
 }
 
