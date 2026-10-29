@@ -5901,10 +5901,11 @@ impl Node {
     /// on it would wait for good. The dependency was scoped to this node's
     /// shard, so its replicas answer for it there without its keys
     /// ([`RecoveryRound::Dependency`]); if, with those past the deadline
-    /// refusing it ([`settle_late`](Self::settle_late)), they prove it never
-    /// committed ([`never_commits`](Self::never_commits)), every replica of
-    /// the shard records it aborted, held or not, and what waits on it goes
-    /// on.
+    /// refusing it, they prove it never committed
+    /// ([`never_commits`](Self::never_commits)) under every layout it may
+    /// have been planned under ([`orphan_plans`](Self::orphan_plans), #443),
+    /// every replica of the shard records it aborted, held or not, and what
+    /// waits on it goes on.
     async fn learn_decision(&self, txn: TxnId) -> anyhow::Result<bool> {
         let ballot = Ballot(self.mint().await?);
         let layout = self.topology.layout();
@@ -5987,8 +5988,9 @@ impl Node {
 
     /// The part of [`learn_decision`](Self::learn_decision) for a dependency
     /// `txn` no shard peer heard from (`reports`) holds: invalidates it on
-    /// every one of them, `peers`, if they prove it never committed. Returns
-    /// whether it was.
+    /// every one of them, `peers`, if they prove it never committed under
+    /// every layout it may have been planned under
+    /// ([`orphan_plans`](Self::orphan_plans)). Returns whether it was.
     async fn invalidate_orphan(
         &self,
         rx: &mut mpsc::UnboundedReceiver<(NodeId, Message)>,
@@ -6005,28 +6007,34 @@ impl Node {
             // A holder recovers it.
             return false;
         }
-        let Some(shard) = layout.node_shard(self.id) else {
+        let Some(plans) = self.orphan_plans(txn) else {
             return false;
         };
-        let plan = ShardPlan {
-            epoch: layout.epoch(),
-            shard,
-            replicas: peers.to_vec(),
-            electorate: layout.electorate_of(shard).to_vec(),
-            fast_q: layout.fast_quorum_of(shard),
-            slow_q: layout.slow_quorum_of(shard),
-            keys: Vec::new(),
-            events: Vec::new(),
+        // Planned under one of them, it commits there, or nowhere: each
+        // must rule a commit out on its own.
+        let proven = |reports: &[(NodeId, RecoverResp)], late_refuse: bool| {
+            plans
+                .iter()
+                .all(|plan| self.never_commits(std::slice::from_ref(plan), reports, late_refuse))
         };
-        let plans = [plan];
         // Even refused by those past the deadline, it may have committed:
         // nothing to do without its keys.
-        if !self.never_commits(&plans, reports, true)
+        if !proven(reports, true)
             || self
-                .settle_late(rx, layout, txn, ballot, &plans, &[], &[], reports, None)
+                .ask_late(
+                    rx,
+                    layout,
+                    txn,
+                    ballot,
+                    RecoveryRound::Refuse,
+                    &[],
+                    &[],
+                    reports,
+                    None,
+                )
                 .await
                 .is_some()
-            || !self.never_commits(&plans, reports, false)
+            || !proven(reports, false)
         {
             return false;
         }
@@ -6037,6 +6045,72 @@ impl Node {
         );
         self.broadcast(peers, Message::Invalidate { txn }).await;
         true
+    }
+
+    /// The plans `txn` may have been voted under, one per replica set: a
+    /// dependency of a command waiting here, which this node never
+    /// witnessed (see [`invalidate_orphan`](Self::invalidate_orphan)). Its
+    /// epoch is not known, and the layout installed here may not be its
+    /// own: after a replica was added at once, two refusals of four rule out
+    /// every quorum of the new layout, but not one of the three it was
+    /// planned under (#443).
+    ///
+    /// Its key is one of the waiting command's: a dependency is scoped to
+    /// this replica's part of what waits on it. And the layouts it may
+    /// still commit under are those of that key back from the one installed
+    /// here, for as long as the key only gained replicas, down to epoch 0.
+    /// One where the key had a replica it lost since lies behind a drain:
+    /// only additions install at once (see [`reconfig`]), so a write planned
+    /// before the change that ever committed was applied at every replica
+    /// the key kept, copied to every one it gained, and is in every store
+    /// joined through them since — this node's among them.
+    ///
+    /// `None`, so no proof, when no command here is known to wait on it, or
+    /// it may have been planned under a layout from before this node's
+    /// first.
+    fn orphan_plans(&self, txn: TxnId) -> Option<Vec<ShardPlan>> {
+        let keys = self
+            .replica
+            .lock()
+            .expect("replica poisoned")
+            .keys_waiting_on(txn)
+            .filter(|keys| !keys.is_empty())?;
+        let mut plans: Vec<ShardPlan> = Vec::new();
+        for key in &keys {
+            let mut layout = self.topology.layout();
+            loop {
+                let shard = layout.shard_of(key);
+                let replicas = layout.replicas_of(shard);
+                if !plans.iter().any(|plan| {
+                    plan.replicas.len() == replicas.len()
+                        && replicas.iter().all(|node| plan.replicas.contains(node))
+                }) {
+                    plans.push(ShardPlan {
+                        epoch: layout.epoch(),
+                        shard,
+                        replicas: replicas.to_vec(),
+                        electorate: layout.electorate_of(shard).to_vec(),
+                        fast_q: layout.fast_quorum_of(shard),
+                        slow_q: layout.slow_quorum_of(shard),
+                        keys: Vec::new(),
+                        events: Vec::new(),
+                    });
+                }
+                let Some(epoch) = layout.epoch().checked_sub(1) else {
+                    break;
+                };
+                let before = self.topology.layout_at(epoch)?;
+                if !before
+                    .replicas(key)
+                    .iter()
+                    .all(|node| replicas.contains(node))
+                {
+                    break;
+                }
+                layout = before;
+            }
+        }
+        Some(plans)
     }
 
     /// The recovery reports a message carries, if it answers `ballot`.
@@ -6416,14 +6490,11 @@ impl Node {
     /// ([`may_have_committed`](Self::may_have_committed)) — a replica that
     /// accepted it lost its journal — their votes may be what deciding it
     /// takes: they are asked to vote ([`RecoveryRound::Vote`]), which each
-    /// does unless it vouched past it. Either way they are asked with every
-    /// key and event the reports revealed — wrapped in `route` for a
-    /// multi-shard transaction (#377), each replica taking its shard's
-    /// part; one whose shard's part no holder reported has nothing to vote
-    /// for, and is not asked to. Otherwise what the replicas not heard from
-    /// hold decides it, and a next attempt hears them: the late ones are
-    /// asked nothing, so a write too few replicas hold is not committed on
-    /// their votes. The promise a Nack names, if one came back.
+    /// does unless it vouched past it. Otherwise what the replicas not heard
+    /// from hold decides it, and a next attempt hears them: the late ones
+    /// are asked nothing, so a write too few replicas hold is not committed
+    /// on their votes. The promise a Nack names, if one came back (see
+    /// [`ask_late`](Self::ask_late)).
     #[allow(clippy::too_many_arguments)]
     async fn settle_late(
         &self,
@@ -6437,12 +6508,7 @@ impl Node {
         resp: &mut Vec<(NodeId, RecoverResp)>,
         route: Option<&[Key]>,
     ) -> Option<Ballot> {
-        let mut late: Vec<NodeId> = resp
-            .iter()
-            .filter(|(_, r)| matches!(r, RecoverResp::Late))
-            .map(|(from, _)| *from)
-            .collect();
-        if late.is_empty() {
+        if !resp.iter().any(|(_, r)| matches!(r, RecoverResp::Late)) {
             return None;
         }
         let round = if self.never_commits(plans, resp, true) {
@@ -6452,6 +6518,35 @@ impl Node {
         } else {
             return None;
         };
+        self.ask_late(rx, layout, txn, ballot, round, keys, events, resp, route)
+            .await
+    }
+
+    /// Asks the replicas that answered [`Late`](RecoverResp::Late) for
+    /// `txn` to settle in `round`, and puts their answers in `resp`: with
+    /// every key and event the reports revealed — wrapped in `route` for a
+    /// multi-shard transaction (#377), each replica taking its shard's
+    /// part; asked to vote, one whose shard's part no holder reported has
+    /// nothing to vote for, and is not asked. The promise a Nack names, if
+    /// one came back.
+    #[allow(clippy::too_many_arguments)]
+    async fn ask_late(
+        &self,
+        rx: &mut mpsc::UnboundedReceiver<(NodeId, Message)>,
+        layout: &Layout,
+        txn: TxnId,
+        ballot: Ballot,
+        round: RecoveryRound,
+        keys: &[Key],
+        events: &[Event],
+        resp: &mut Vec<(NodeId, RecoverResp)>,
+        route: Option<&[Key]>,
+    ) -> Option<Ballot> {
+        let mut late: Vec<NodeId> = resp
+            .iter()
+            .filter(|(_, r)| matches!(r, RecoverResp::Late))
+            .map(|(from, _)| *from)
+            .collect();
         if round == RecoveryRound::Vote {
             let (parts, _) = Self::plan(layout, keys, events);
             late.retain(|node| {
@@ -6459,9 +6554,9 @@ impl Node {
                     .iter()
                     .any(|part| part.replicas.contains(node) && !part.events.is_empty())
             });
-            if late.is_empty() {
-                return None;
-            }
+        }
+        if late.is_empty() {
+            return None;
         }
         tracing::debug!(
             node = self.id.0,
