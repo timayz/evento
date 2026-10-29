@@ -6858,6 +6858,30 @@ async fn a_dependency_is_judged_under_every_layout_it_may_have_been_planned_unde
     }
 }
 
+/// Re-sharding seeds (#445) where a node learning the decision of a
+/// multi-shard dependency it never witnessed recovered it from a holder's
+/// report without the route that report carried: planned over the one shard
+/// the holder's keys span, it committed on that shard's read, and no replica
+/// of the other shard ever read or applied its part — a client
+/// double-commit.
+const LEARNER_DROPS_ROUTE_SEEDS: [u64; 2] = [204365, 257254];
+
+#[tokio::test(start_paused = true)]
+async fn a_learner_recovers_a_dependency_by_its_holders_route() {
+    for &seed in &LEARNER_DROPS_ROUTE_SEEDS {
+        let _replay = Replay {
+            test: "reshard_swarm",
+            seed,
+        };
+        let shape = ReshardConfig::from_seed(seed);
+        let run = run_reshard(seed, &shape).await;
+        assert!(
+            run.safety.is_none() && run.liveness.is_none(),
+            "reshard seed {seed} ({shape:?}): {run:?}"
+        );
+    }
+}
+
 /// Fresh re-sharding seeds, for the nightly job (`SIM_SEEDS`, `SIM_DURATION`).
 #[tokio::test(start_paused = true)]
 #[ignore = "re-sharding swarm: run explicitly, with SIM_SEEDS or SIM_DURATION for fresh seeds"]

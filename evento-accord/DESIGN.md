@@ -1533,6 +1533,17 @@ backend (sql/fjall). Phases, in order:
         (`a_dependency_planned_before_a_replica_was_added_is_not_invalidated`;
         the seed is pinned,
         `a_dependency_is_judged_under_every_layout_it_may_have_been_planned_under`).
+        The learner's recovery of a dependency a holder reports undecided
+        dropped the route the report carried (#445, the re-sharding swarm).
+        The holder's keys are its own shard's part, so a multi-shard
+        dependency was recovered as a single-shard one, over that shard
+        alone, and committed on its read when the replicas that answered in
+        time held no route: the other shard never read or applied its part,
+        and two writes were acked at one version. It is recovered by the
+        reported route now, so every shard of the route is heard from
+        (`a_learner_recovers_a_dependency_by_the_route_its_holder_reports`;
+        the seeds are pinned,
+        `a_learner_recovers_a_dependency_by_its_holders_route`).
   - [ ] **Real-cluster soak + chaos** over days (kills, partitions, clock skew,
         disk pressure, slow disks/links) on actual hardware — zero production
         mileage today.
