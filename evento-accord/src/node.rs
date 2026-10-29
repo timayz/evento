@@ -6813,7 +6813,10 @@ impl Node {
     /// it. Nor is one holding the transaction [decided](Replica::decided),
     /// such as a replayed write its store refused (#351): the decision its
     /// peers applied before they compacted it is here, and all it lacks is
-    /// the apply.
+    /// the apply. Nor, least of all, one that applied it — a node learning
+    /// the decision of a dependency it never witnessed recovers it from a
+    /// report its holder sent before the decision reached this node, which
+    /// may have applied it since (#449).
     fn stranded_below(
         &self,
         txn: TxnId,
@@ -6823,9 +6826,11 @@ impl Node {
         let held = resp
             .iter()
             .any(|(from, r)| *from == self.id && matches!(r, RecoverResp::Ok(f) if f.known));
-        if !held || self.replica.lock().expect("replica poisoned").decided(txn) {
+        let replica = self.replica.lock().expect("replica poisoned");
+        if !held || replica.decided(txn) || replica.status(txn) == Some(Status::Applied) {
             return None;
         }
+        drop(replica);
         plans.iter().find_map(|plan| {
             let (mut fenced, mut compacted) = (0, None::<(usize, NodeId)>);
             for (from, report) in resp {
