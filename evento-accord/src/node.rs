@@ -5893,8 +5893,14 @@ impl Node {
     /// dependencies, keys and events. The peers are asked as a recovery asks
     /// them, under a fresh ballot, with nothing to pre-accept: one that never
     /// witnessed it only promises the ballot. Returns whether a decision was
-    /// learned. One invalidated is applied where it is held, so
-    /// anti-entropy brings it in.
+    /// learned.
+    ///
+    /// One a peer reports invalidated is recorded aborted here, as an
+    /// [`Invalidate`](Message::Invalidate) would have (#449): this replica
+    /// missed it. Nothing else brings it: a peer that never witnessed the
+    /// transaction records it without keys, and anti-entropy imports no
+    /// command that holds none of this node's; and a recovery from such a
+    /// record would plan no shard, and reach no replica.
     ///
     /// A transaction a peer reports held but undecided is recovered here,
     /// under that holder's keys and events (#441), and by the route it
@@ -5950,6 +5956,22 @@ impl Node {
             _ => None,
         });
         let Some(f) = decided else {
+            if reports
+                .iter()
+                .any(|(_, report)| matches!(report, RecoverResp::Ok(f) if f.invalidated()))
+            {
+                self.deregister(txn);
+                self.metrics.record_dependency_learned();
+                tracing::debug!(
+                    node = self.id.0,
+                    ?txn,
+                    "learned a dependency never witnessed here was invalidated"
+                );
+                // Handled as any Invalidate is, by the inbox loop. Should it
+                // be lost, the next sweep learns it again.
+                self.send(self.id, Message::Invalidate { txn }).await;
+                return Ok(true);
+            }
             let held = reports.iter().find_map(|(_, report)| match report {
                 RecoverResp::Ok(f) if f.known => Some(f.clone()),
                 _ => None,
@@ -6791,7 +6813,10 @@ impl Node {
     /// it. Nor is one holding the transaction [decided](Replica::decided),
     /// such as a replayed write its store refused (#351): the decision its
     /// peers applied before they compacted it is here, and all it lacks is
-    /// the apply.
+    /// the apply. Nor, least of all, one that applied it — a node learning
+    /// the decision of a dependency it never witnessed recovers it from a
+    /// report its holder sent before the decision reached this node, which
+    /// may have applied it since (#449).
     fn stranded_below(
         &self,
         txn: TxnId,
@@ -6801,9 +6826,11 @@ impl Node {
         let held = resp
             .iter()
             .any(|(from, r)| *from == self.id && matches!(r, RecoverResp::Ok(f) if f.known));
-        if !held || self.replica.lock().expect("replica poisoned").decided(txn) {
+        let replica = self.replica.lock().expect("replica poisoned");
+        if !held || replica.decided(txn) || replica.status(txn) == Some(Status::Applied) {
             return None;
         }
+        drop(replica);
         plans.iter().find_map(|plan| {
             let (mut fenced, mut compacted) = (0, None::<(usize, NodeId)>);
             for (from, report) in resp {
@@ -11192,6 +11219,71 @@ mod tests {
         let shrunk = || five().with_fast_electorate(vec![NodeId(0), NodeId(1), NodeId(2)]);
         assert!(rejects(shrunk(), &[(1, raised), (3, txn.0), (4, txn.0)]));
         assert!(!rejects(shrunk(), &[(3, raised), (4, raised), (0, txn.0)]));
+    }
+
+    /// Two of three replicas compacted past a transaction: a node holding
+    /// it undecided is stranded below their floor, and must rejoin. One that
+    /// applied it is not (#449) — a learner recovers a dependency from a
+    /// report its holder sent before the dependency's `Invalidate` reached
+    /// the learner, which applied it meanwhile.
+    #[test]
+    fn a_transaction_applied_here_is_never_stranded() {
+        use super::{RecoverFields, RecoverResp};
+        use crate::clock::Ballot;
+
+        let txn = TxnId(Timestamp {
+            micros: 10,
+            logical: 0,
+            node: NodeId(9),
+        });
+        let key = Key("acc".into());
+        let net = InMemoryNetwork::new();
+        let node = Node::new(
+            NodeId(0),
+            Arc::new(StaticTopology::new(NodeId(0), (0..3).map(NodeId).collect()))
+                as Arc<dyn Topology>,
+            Arc::new(HybridLogicalClock::new(NodeId(0))),
+            Arc::new(net.sink(NodeId(0))) as Arc<dyn MessageSink>,
+            Arc::new(InMemoryDataStore::new()) as Arc<dyn DataStore>,
+            Arc::new(InMemoryJournal::new()) as Arc<dyn Journal>,
+        );
+        let (plans, _) = Node::plan(&node.topology.layout(), std::slice::from_ref(&key), &[]);
+        let resp = |status: Status, execute_at: Timestamp| {
+            let own = RecoverFields {
+                epoch: 0,
+                known: true,
+                status,
+                accepted: Ballot(txn.0),
+                execute_at,
+                deps: Vec::new(),
+                superseding_rejects: false,
+                wait: false,
+                keys: Vec::new(),
+                events: Vec::new(),
+                route: None,
+            };
+            vec![
+                (NodeId(0), RecoverResp::Ok(own)),
+                (NodeId(1), RecoverResp::NotWitnessed { redundant: true }),
+                (NodeId(2), RecoverResp::NotWitnessed { redundant: true }),
+            ]
+        };
+
+        assert_eq!(
+            node.stranded_below(txn, &plans, &resp(Status::PreAccepted, txn.0)),
+            Some(NodeId(1)),
+            "held undecided, it is stranded"
+        );
+        assert!(node.replica.lock().unwrap().invalidate(txn, 0));
+        assert_eq!(
+            node.stranded_below(
+                txn,
+                &plans,
+                &resp(Status::Applied, crate::message::INVALIDATED_AT)
+            ),
+            None,
+            "applied here, it is not"
+        );
     }
 
     /// A replica that never saw PreAccept indexes the transaction from the

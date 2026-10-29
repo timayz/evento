@@ -1048,7 +1048,10 @@ backend (sql/fjall). Phases, in order:
   for once its deadline passed, so it never committed. They invalidate it, and
   an `Invalidate` records it aborted on a replica that never witnessed it,
   keeping the ballot it promised, so what waits on it goes on
-  (`a_dependency_only_an_amnesiac_held_is_invalidated`). Its epoch is not
+  (`a_dependency_only_an_amnesiac_held_is_invalidated`). That record holds no
+  keys, so anti-entropy never ships it: a replica that waits and missed the
+  `Invalidate` learns it from a peer's report of that record in its dependency
+  round, and records it too (#449). Its epoch is not
   known to them, so the refusals must rule a commit out under every layout it
   may have been planned under: those of the waiting write's keys back from the
   installed one, for as long as each key only gained replicas (#443,
@@ -1544,6 +1547,33 @@ backend (sql/fjall). Phases, in order:
         (`a_learner_recovers_a_dependency_by_the_route_its_holder_reports`;
         the seeds are pinned,
         `a_learner_recovers_a_dependency_by_its_holders_route`).
+        A replica waiting on an orphan dependency that missed its
+        `Invalidate` never learned it (#449, the two-shard amnesia swarm with
+        message faults, where its own copy was lost). The replica that did
+        record it had never witnessed it either, so its record holds no keys.
+        Anti-entropy, which imports only commands holding this node's keys,
+        never shipped it, and the learner took the invalidated report for a
+        holder's undecided state and recovered the dependency from it, with
+        no keys: the recovery planned no shard, and the `Invalidate` it sent
+        on finding the report reached no replica, though it returned done.
+        A write reading behind the dependency stayed undecided, and held the
+        shard's coverage below a rejoining amnesiac's fence, whose join never
+        went through: the *stuck below the fence* symptom (OPERATIONS §7),
+        in 21 of the 22 such seeds of 30,000. The learner now records an
+        invalidated report as the decision it is
+        (`a_dependency_invalidated_elsewhere_is_learned_from_its_record`; the
+        seeds are pinned,
+        `a_replica_that_missed_an_invalidation_learns_it_from_its_record`).
+        That uncovered a node told to rejoin over a transaction it had
+        applied (the re-sharding swarm). A learner recovered a dependency from
+        a report its holder sent before the dependency was invalidated, and
+        recorded the invalidation meanwhile; two replicas had compacted past
+        it since. `stranded_below` skipped a transaction held committed, not
+        one applied, so it took the node for stranded below their floor, and
+        the node stopped taking part. A transaction applied here never
+        strands a node (`a_transaction_applied_here_is_never_stranded`; the
+        seed is pinned,
+        `a_node_that_applied_a_dependency_is_never_stranded_on_it`).
   - [ ] **Real-cluster soak + chaos** over days (kills, partitions, clock skew,
         disk pressure, slow disks/links) on actual hardware — zero production
         mileage today.
