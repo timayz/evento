@@ -5821,7 +5821,14 @@ impl Node {
             return Ok(CommitOutcome { txn, conflict });
         }
         match self
-            .recover_with(txn, epoch, keys.to_vec(), events.to_vec(), Driver::Recovery)
+            .recover_with(
+                txn,
+                epoch,
+                keys.to_vec(),
+                events.to_vec(),
+                None,
+                Driver::Recovery,
+            )
             .await
         {
             Ok(outcome) => {
@@ -5875,7 +5882,8 @@ impl Node {
             .snapshot(txn)
             .map(|cmd| (cmd.epoch, cmd.keys, cmd.events))
             .unwrap_or_else(|| (self.topology.epoch(), Vec::new(), Vec::new()));
-        self.recover_with(txn, epoch, keys, events, driver).await
+        self.recover_with(txn, epoch, keys, events, None, driver)
+            .await
     }
 
     /// Learns the decision of `txn`, a transaction this replica never
@@ -5889,7 +5897,10 @@ impl Node {
     /// anti-entropy brings it in.
     ///
     /// A transaction a peer reports held but undecided is recovered here,
-    /// under that holder's keys and events (#441). Its holders recover it
+    /// under that holder's keys and events (#441), and by the route it
+    /// reports (#445): the holder's keys are its own shard's part, so,
+    /// without the route, a multi-shard transaction would be planned over
+    /// that shard alone, and decided on its read. Its holders recover it
     /// too, but the ballot this node asked under is promised wherever it
     /// reached, and a holder's recovery under a lower one is outbid by it
     /// and leaves the transaction to this node (see
@@ -5951,7 +5962,7 @@ impl Node {
                     ?txn,
                     "recovering a dependency a holder reports undecided"
                 );
-                self.recover_with(txn, f.epoch, f.keys, f.events, Driver::Sweep)
+                self.recover_with(txn, f.epoch, f.keys, f.events, f.route, Driver::Sweep)
                     .await?;
                 return Ok(true);
             }
@@ -6201,8 +6212,9 @@ impl Node {
     /// write knows all of it).
     ///
     /// A multi-shard transaction is recovered **by its route** — kept with
-    /// the command, carried by any report, or, for the coordinator settling
-    /// its own write, its keys — so every shard it touches is heard from,
+    /// the command, carried by any report (`reported`, one taken before this
+    /// recovery), or, for the coordinator settling its own write, its keys —
+    /// so every shard it touches is heard from,
     /// including one that never witnessed it or answers late
     /// ([`recover_routed`](Self::recover_routed)). Without a route (a
     /// single-shard transaction) the touched shards are those the reports
@@ -6213,6 +6225,7 @@ impl Node {
         epoch: u64,
         keys: Vec<Key>,
         events: Vec<Event>,
+        reported: Option<Vec<Key>>,
         driver: Driver,
     ) -> anyhow::Result<CommitOutcome> {
         // A transaction this node is actively coordinating must not be
@@ -6239,6 +6252,7 @@ impl Node {
             .lock()
             .expect("replica poisoned")
             .route(txn)
+            .or_else(|| reported.filter(|route| Self::spans_shards(&layout, route)))
             .or_else(|| Self::spans_shards(&layout, &keys).then(|| keys.clone()));
         let mut ballot = Ballot(self.mint().await?);
 
