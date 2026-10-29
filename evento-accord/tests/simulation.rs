@@ -6903,6 +6903,30 @@ async fn a_learner_recovers_a_dependency_by_its_holders_route() {
     }
 }
 
+/// A re-sharding seed (#449) where a node learning the decision of a
+/// dependency recovered it from a report its holder sent before the
+/// dependency was invalidated, and applied the `Invalidate` meanwhile. Two
+/// replicas had compacted past the dependency since, so the recovery took
+/// the node for stranded below their floor, and had it rejoin: it stopped
+/// taking part, and lacked every write after.
+const APPLIED_DURING_THE_LEARNING_SEEDS: [u64; 1] = [219685];
+
+#[tokio::test(start_paused = true)]
+async fn a_node_that_applied_a_dependency_is_never_stranded_on_it() {
+    for &seed in &APPLIED_DURING_THE_LEARNING_SEEDS {
+        let _replay = Replay {
+            test: "reshard_swarm",
+            seed,
+        };
+        let shape = ReshardConfig::from_seed(seed);
+        let run = run_reshard(seed, &shape).await;
+        assert!(
+            run.safety.is_none() && run.liveness.is_none(),
+            "reshard seed {seed} ({shape:?}): {run:?}"
+        );
+    }
+}
+
 /// Fresh re-sharding seeds, for the nightly job (`SIM_SEEDS`, `SIM_DURATION`).
 #[tokio::test(start_paused = true)]
 #[ignore = "re-sharding swarm: run explicitly, with SIM_SEEDS or SIM_DURATION for fresh seeds"]

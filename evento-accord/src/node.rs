@@ -11216,6 +11216,71 @@ mod tests {
         assert!(!rejects(shrunk(), &[(3, raised), (4, raised), (0, txn.0)]));
     }
 
+    /// Two of three replicas compacted past a transaction: a node holding
+    /// it undecided is stranded below their floor, and must rejoin. One that
+    /// applied it is not (#449) — a learner recovers a dependency from a
+    /// report its holder sent before the dependency's `Invalidate` reached
+    /// the learner, which applied it meanwhile.
+    #[test]
+    fn a_transaction_applied_here_is_never_stranded() {
+        use super::{RecoverFields, RecoverResp};
+        use crate::clock::Ballot;
+
+        let txn = TxnId(Timestamp {
+            micros: 10,
+            logical: 0,
+            node: NodeId(9),
+        });
+        let key = Key("acc".into());
+        let net = InMemoryNetwork::new();
+        let node = Node::new(
+            NodeId(0),
+            Arc::new(StaticTopology::new(NodeId(0), (0..3).map(NodeId).collect()))
+                as Arc<dyn Topology>,
+            Arc::new(HybridLogicalClock::new(NodeId(0))),
+            Arc::new(net.sink(NodeId(0))) as Arc<dyn MessageSink>,
+            Arc::new(InMemoryDataStore::new()) as Arc<dyn DataStore>,
+            Arc::new(InMemoryJournal::new()) as Arc<dyn Journal>,
+        );
+        let (plans, _) = Node::plan(&node.topology.layout(), std::slice::from_ref(&key), &[]);
+        let resp = |status: Status, execute_at: Timestamp| {
+            let own = RecoverFields {
+                epoch: 0,
+                known: true,
+                status,
+                accepted: Ballot(txn.0),
+                execute_at,
+                deps: Vec::new(),
+                superseding_rejects: false,
+                wait: false,
+                keys: Vec::new(),
+                events: Vec::new(),
+                route: None,
+            };
+            vec![
+                (NodeId(0), RecoverResp::Ok(own)),
+                (NodeId(1), RecoverResp::NotWitnessed { redundant: true }),
+                (NodeId(2), RecoverResp::NotWitnessed { redundant: true }),
+            ]
+        };
+
+        assert_eq!(
+            node.stranded_below(txn, &plans, &resp(Status::PreAccepted, txn.0)),
+            Some(NodeId(1)),
+            "held undecided, it is stranded"
+        );
+        assert!(node.replica.lock().unwrap().invalidate(txn, 0));
+        assert_eq!(
+            node.stranded_below(
+                txn,
+                &plans,
+                &resp(Status::Applied, crate::message::INVALIDATED_AT)
+            ),
+            None,
+            "applied here, it is not"
+        );
+    }
+
     /// A replica that never saw PreAccept indexes the transaction from the
     /// explicit `keys` on Commit and still applies it — the conflict-graph
     /// guarantee the coordinator's per-shard subsetting must preserve.
