@@ -5893,8 +5893,14 @@ impl Node {
     /// dependencies, keys and events. The peers are asked as a recovery asks
     /// them, under a fresh ballot, with nothing to pre-accept: one that never
     /// witnessed it only promises the ballot. Returns whether a decision was
-    /// learned. One invalidated is applied where it is held, so
-    /// anti-entropy brings it in.
+    /// learned.
+    ///
+    /// One a peer reports invalidated is recorded aborted here, as an
+    /// [`Invalidate`](Message::Invalidate) would have (#449): this replica
+    /// missed it. Nothing else brings it: a peer that never witnessed the
+    /// transaction records it without keys, and anti-entropy imports no
+    /// command that holds none of this node's; and a recovery from such a
+    /// record would plan no shard, and reach no replica.
     ///
     /// A transaction a peer reports held but undecided is recovered here,
     /// under that holder's keys and events (#441), and by the route it
@@ -5950,6 +5956,22 @@ impl Node {
             _ => None,
         });
         let Some(f) = decided else {
+            if reports
+                .iter()
+                .any(|(_, report)| matches!(report, RecoverResp::Ok(f) if f.invalidated()))
+            {
+                self.deregister(txn);
+                self.metrics.record_dependency_learned();
+                tracing::debug!(
+                    node = self.id.0,
+                    ?txn,
+                    "learned a dependency never witnessed here was invalidated"
+                );
+                // Handled as any Invalidate is, by the inbox loop. Should it
+                // be lost, the next sweep learns it again.
+                self.send(self.id, Message::Invalidate { txn }).await;
+                return Ok(true);
+            }
             let held = reports.iter().find_map(|(_, report)| match report {
                 RecoverResp::Ok(f) if f.known => Some(f.clone()),
                 _ => None,
