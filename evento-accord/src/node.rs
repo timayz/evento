@@ -6840,11 +6840,11 @@ impl Node {
         })
     }
 
-    /// Whether an unrouted recovery's reports prove `txn` never committed and
-    /// never will (#310), so it can be invalidated. A replica that answers
-    /// "never witnessed" to an unrouted recovery does so only below its vote
-    /// fence (see [`Replica::fenced`]): it never voted for the transaction,
-    /// and never will. Per shard of `slow_q` out of `n`:
+    /// Whether a recovery's reports prove `txn` never committed and never
+    /// will (#310), so it can be invalidated. A replica that answers "never
+    /// witnessed" does so only below its vote fence (see
+    /// [`Replica::fenced`]): it never voted for the transaction, and never
+    /// will. Per shard of `slow_q` out of `n`:
     ///
     /// - **More than `n − slow_q` fenced:** every commit needs `slow_q`
     ///   voters, and too few replicas are left that ever could vote.
@@ -6860,18 +6860,32 @@ impl Node {
     ///   replica fencing its votes, so it needs
     ///   [`NodeConfig::fence_invalidation`].
     ///
-    /// - **A replica that lost its journal answered, and no replica compacted
-    ///   past it** (#312, [`Message::Amnesiac`]): that replica may have
-    ///   voted for the transaction before the loss, but never votes for it
-    ///   again, nor does a fenced one. Counting every replica not heard from
-    ///   as one that may have voted, and may vote: if too few may have
-    ///   accepted it for a slow commit, too few of the electorate may have
-    ///   pre-accepted it for a fast one, and too few replicas are left that
-    ///   could vote for it, it never committed and never will. A holder that
-    ///   accepted it may hold half a decision, so it counts among those that
-    ///   accepted; one that only pre-accepted it promised this recovery's
-    ///   ballot, so the original coordinator can no longer complete an
-    ///   accept there. Needs [`NodeConfig::fence_invalidation`] too.
+    /// Otherwise the proof has two halves, which a multi-shard transaction
+    /// may take from different shards (#451), a commit needing a quorum of
+    /// every shard it touches:
+    ///
+    /// - **It never committed:** some shard, none of whose replicas compacted
+    ///   past it, had no quorum that could have committed it. Counting every
+    ///   replica not heard from as one that may have voted, and a replica
+    ///   that lost its journal as one that did (#312,
+    ///   [`Message::Amnesiac`]): too few may have accepted it for a slow
+    ///   commit, and too few of the electorate may have pre-accepted it for a
+    ///   fast one. A holder that accepted it may hold half a decision, so it
+    ///   counts among those that accepted; one that only pre-accepted it
+    ///   promised this recovery's ballot, so the original coordinator can no
+    ///   longer complete an accept there.
+    /// - **It never will:** some shard is left too few replicas that could
+    ///   ever vote for it, the holders and those not heard from: the rest
+    ///   are fenced, or lost their journal and never vote for it again.
+    ///
+    /// Both halves in one shard are the amnesia rule of #312: a replica that
+    /// lost its journal answered, beside a late or fenced replica and a holder
+    /// that never accepted. Split across two, they settle a transaction whose
+    /// accept beside the amnesiac may have made a quorum in one shard — so
+    /// that shard's late replica is not asked to vote — while the other shard
+    /// never had one, yet keeps a quorum of holders that could vote: neither
+    /// shard proves both, and nothing more is ever heard. Needs
+    /// [`NodeConfig::fence_invalidation`] too.
     ///
     /// A report of the transaction committed anywhere rules all of them out:
     /// a decision exists.
@@ -6891,7 +6905,9 @@ impl Node {
         ) {
             return false;
         }
-        plans.iter().any(|plan| {
+        // The two halves of the split proof, each from any shard.
+        let (mut never_committed, mut never_will) = (false, false);
+        for plan in plans {
             let (mut fenced, mut redundant, mut holders) = (0, 0, 0);
             let (mut accepted, mut amnesiac) = (0, 0);
             // The same, among the fast-path electorate.
@@ -6926,15 +6942,21 @@ impl Node {
                 .len()
                 .saturating_sub(fenced + redundant + holders + amnesiac);
             let silent_e = plan.electorate.len().saturating_sub(answered_e);
-            let amnesia_rules_it_out = amnesiac > 0
-                && redundant == 0
-                && accepted + amnesiac + silent < plan.slow_q
-                && holders_e + amnesiac_e + silent_e < plan.fast_q
-                && holders + silent < plan.slow_q;
-            fenced > spare
+            if fenced > spare
                 || (self.settings.fence_invalidation && redundant > 0 && fenced + holders > spare)
-                || (self.settings.fence_invalidation && amnesia_rules_it_out)
-        })
+            {
+                return true;
+            }
+            if redundant > 0 {
+                // A compacted replica may have applied it, and never votes
+                // again: it proves neither half here.
+                continue;
+            }
+            never_committed |= accepted + amnesiac + silent < plan.slow_q
+                && holders_e + amnesiac_e + silent_e < plan.fast_q;
+            never_will |= holders + silent < plan.slow_q;
+        }
+        self.settings.fence_invalidation && never_committed && never_will
     }
 
     /// Whether this node holds a transaction no recovery can decide again,
