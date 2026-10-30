@@ -1094,7 +1094,13 @@ backend (sql/fjall). Phases, in order:
   fence, which only rise and are journaled before anything cut below them leaves the
   node, so a journal reopened as it was left never holds less than a peer saw — a
   journal that keeps no fence restarts it at the bound less the margin, still above
-  every fence it reported. Each node keeps the highest mark it saw from each peer,
+  every fence it reported — and the journal's **identity** (`born`, the clock at
+  its first open, `Journal::save_born`, #453): two journals of one node id and
+  life are told apart by it alone, their bounds and fences both being cut from
+  the wall clock. A report from another journal than the one seen under that id
+  is answered `RolledBack` like an open below the mark — a node started plainly
+  over an empty journal asks nobody at its open — while a late report of the
+  same journal, reordered behind a newer one, is merely not counted. Each node keeps the highest mark it saw from each peer,
   journaled with its reports (`Journal::save_peer_marks`). A node opened over a
   journal that holds something, in a group of more than one node, asks every other
   node to confirm it (`Message::Opened`): until a slow quorum of its shard, itself
@@ -1650,6 +1656,24 @@ backend (sql/fjall). Phases, in order:
         (`a_whole_group_restart_raises_no_truncation_alarm`), and a report
         trailing its coverage by an anti-entropy round is no clamp
         (`a_report_trailing_its_coverage_within_the_margin_is_not_a_clamp`).
+        In the same load test, two nodes reopened over files that lacked
+        events they had taken part in committing were confirmed and served
+        a stream with a hole (#453): a test script had left the nodes of
+        one run serving over deleted files while the next run started
+        fresh ones under the same ids. The marks of the two journals of an
+        id were indistinguishable — bound and fence are cut from the wall
+        clock — and a node opened plainly over an empty journal asks nobody.
+        The mark now carries the journal's identity
+        (`a_fresh_journal_under_a_known_node_id_is_found_rolled_back`); a
+        store refuses a version more than one past what it holds and the
+        node asks for a rejoin instead of serving over the hole
+        (`a_store_behind_by_a_version_is_not_served_over_the_hole`). An
+        anti-entropy contact truncated above what the node vouched for
+        stays a counted warning: made to act, it had 184 of 24,000
+        re-sharding seeds rejoin a replica that had copied its slots, whose
+        fence — raised by its own reports alone — lay below the contact's
+        floor while it held everything
+        (`a_contact_truncated_above_the_vouch_is_counted_not_a_rejoin`).
   - [ ] **Real-cluster soak + chaos** over days (kills, partitions, clock skew,
         disk pressure, slow disks/links) on actual hardware — zero production
         mileage today.
