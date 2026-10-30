@@ -499,6 +499,22 @@ impl Sim {
         }
     }
 
+    /// Gives node `i` the topology its host builds at every start: over a
+    /// dynamic one, a fresh `DynamicTopology` at epoch 0 over the starting
+    /// layout. The journal brings it to the epoch the node had installed, a
+    /// transition in progress included — one kept at its installed epoch
+    /// would restore no transition, and never copy the slots the transition
+    /// gives it (#446).
+    fn rebuild_topology(&mut self, i: usize) {
+        if let Some(topology) = self.dynamic.get_mut(i) {
+            *topology = Arc::new(DynamicTopology::new(
+                self.ids[i],
+                0,
+                self.layout.shards().to_vec(),
+            ));
+        }
+    }
+
     /// The shards of the starting layout, as node indexes.
     fn shards(&self) -> Vec<Vec<usize>> {
         self.layout
@@ -4487,13 +4503,6 @@ impl Sim {
         self.nodes[i].retire().await;
         self.journals[i] = Arc::new(FaultJournal::new());
         self.arm_journal(i);
-        if let Some(topology) = self.dynamic.get_mut(i) {
-            *topology = Arc::new(DynamicTopology::new(
-                self.ids[i],
-                0,
-                self.layout.shards().to_vec(),
-            ));
-        }
         self.reopen_joining(i).await
     }
 
@@ -4545,14 +4554,15 @@ impl Sim {
 
     /// Tears node `i` down and reopens it joining over its journal and an
     /// empty store — its inbox running, its join and sweeps to come. Over a
-    /// dynamic topology, the node keeps its own: the journal restores the
-    /// epochs it had installed, and one that lost its journal was given a
-    /// fresh one at epoch 0 ([`lose_journal`](Self::lose_journal)).
+    /// dynamic topology, the node is built as its host builds it at every
+    /// start ([`rebuild_topology`](Self::rebuild_topology)); one that lost
+    /// its journal ([`lose_journal`](Self::lose_journal)) starts over.
     async fn reopen_joining(&mut self, i: usize) -> Result<(), String> {
         for t in &self.tasks[i] {
             t.abort();
         }
         let id = self.ids[i];
+        self.rebuild_topology(i);
         let inbox = self.net.register(id);
         let store = SimStore::new(self.store_kind, &self.outcomes);
         self.arm_store(i, &store);
@@ -4613,6 +4623,7 @@ impl Sim {
             t.abort();
         }
         let id = self.ids[i];
+        self.rebuild_topology(i);
         let inbox = self.net.register(id);
         let journal = Arc::clone(&self.journals[i]);
         let node = Node::new(

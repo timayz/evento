@@ -8929,6 +8929,21 @@ impl Node {
                 dropped,
             )
         };
+        // A replica still joining copies nothing: its join needs an empty
+        // store, and brings its own shard's slots, which the copy would
+        // not — a copy that ended its join left it without the part of its
+        // shard a join that failed partway had not brought (#446). The
+        // activation waits for its copy, so for its join. A new node that
+        // owns nothing under the live layout gains every slot it will own:
+        // its copy is its join (below).
+        if !self.bootstrapped.load(Ordering::Acquire) && live.node_shard(self.id).is_some() {
+            tracing::debug!(
+                node = self.id.0,
+                since,
+                "a replica still joining copies nothing: its join first"
+            );
+            return false;
+        }
         // Not while a pre-seed is still copying: it ends, and the copy below
         // resumes where it did.
         let _copying = self.copying.lock().await;
@@ -9007,8 +9022,9 @@ impl Node {
             reconfig.copy_state = Some(state);
             reconfig.copied = Some(since);
         }
-        // A new node opened joining holds its slots now: it serves, and what
-        // it buffered meanwhile is handled.
+        // A new node opened joining holds its slots now — every slot it owns
+        // is gained (a replica still joining returned above): it serves, and
+        // what it buffered meanwhile is handled.
         if !self.bootstrapped.load(Ordering::Acquire) && self.pending_fence().is_none() {
             let buffered = {
                 let mut buffer = self.join_buffer.lock().expect("buffer poisoned");
@@ -9180,6 +9196,17 @@ impl Node {
             .collect();
         gained.sort_unstable();
         if gained.is_empty() {
+            return;
+        }
+        // A replica still joining pre-seeds nothing, as it copies nothing
+        // (#446): its join needs an empty store. Answered as done either
+        // way; the fenced copy, after its join, brings its slots whole.
+        if !self.bootstrapped.load(Ordering::Acquire) && live.node_shard(self.id).is_some() {
+            tracing::debug!(
+                node = self.id.0,
+                since,
+                "a replica still joining pre-seeds nothing: its join first"
+            );
             return;
         }
         let state = self

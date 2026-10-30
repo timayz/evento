@@ -880,3 +880,89 @@ async fn a_pre_seed_for_a_change_that_never_came_expires() {
     await_epoch(&nodes[6].topology, 2).await;
     await_versions(&nodes[6].store, &left, &[1]).await;
 }
+
+/// A replica added at once whose join failed partway is still joining when
+/// a change gives its shard more slots (#446). It copies nothing until it
+/// joins: a copy would fill the store its join needs empty, and a copy that
+/// ended its join left it without the part of its own shard the join had not
+/// brought. The change waits for its join, then its copy, and the node then
+/// holds both the slots it joined for and the ones it gained.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_replica_still_joining_copies_once_it_joined() {
+    let net = InMemoryNetwork::new();
+    let before = vec![ids(&[0, 1, 2]), ids(&[3, 4, 5])];
+    let map = ShardMap::even(before.clone());
+    let left = id_in_shard(&map, 0, "left");
+    let right = id_in_shard(&map, 1, "right");
+    let nodes: Vec<TestNode> = (0..7)
+        .map(|id| spawn_node_cfg(NodeId(id), before.clone(), &net, quick()))
+        .collect();
+    nodes[6].node.begin_join();
+    for (id, version) in [(&left, 1), (&left, 2), (&right, 1)] {
+        nodes[0]
+            .node
+            .write(vec![event(id, version, "Bumped")])
+            .await
+            .unwrap();
+    }
+
+    // Node 6 is added to the first shard at once. Its join is still to come:
+    // one that failed partway left it joining, over an emptied store.
+    let added = vec![ids(&[0, 1, 2, 6]), ids(&[3, 4, 5])];
+    let installed = tokio::time::timeout(
+        Duration::from_secs(30),
+        nodes[0].node.change_topology(1, added.clone()),
+    )
+    .await
+    .expect("the addition ends in bounded time")
+    .expect("the addition installs");
+    assert_eq!(installed, added);
+    assert!(nodes[6].node.is_joining());
+
+    // The second shard merges into the first: node 6 gains its slots.
+    let merged = vec![ids(&[0, 1, 2, 6, 3, 4, 5])];
+    let proposer = nodes[0].node.clone();
+    let proposed = merged.clone();
+    let change = tokio::spawn(async move { proposer.change_topology(2, proposed).await });
+    await_epoch(&nodes[0].topology, 2).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        nodes[6].node.is_joining(),
+        "a copy must not end a join that is not done"
+    );
+    assert!(
+        nodes[6].store.committed_events().is_empty(),
+        "a replica still joining copies nothing: its join needs an empty store"
+    );
+    assert_eq!(
+        nodes[0].topology.epoch(),
+        2,
+        "the change waits for node 6's join"
+    );
+
+    // Joined, node 6 copies what it gains, and the change installs — by the
+    // proposer, or by the sweep once the proposer gave up waiting.
+    nodes[6].node.join(NodeId(0)).await.expect("node 6 joins");
+    assert!(!nodes[6].node.is_joining());
+    let _ = tokio::time::timeout(Duration::from_secs(30), change).await;
+    for n in &nodes {
+        await_epoch(&n.topology, 3).await;
+    }
+    assert_eq!(nodes[6].topology.layout().shards(), merged.as_slice());
+    await_versions(&nodes[6].store, &left, &[1, 2]).await;
+    await_versions(&nodes[6].store, &right, &[1]).await;
+
+    let fresh = nodes[6]
+        .node
+        .write(vec![event(&right, 2, "Bumped")])
+        .await
+        .unwrap();
+    assert!(!fresh.conflict);
+    await_versions(&nodes[0].store, &right, &[1, 2]).await;
+    let stale = nodes[6]
+        .node
+        .write(vec![event(&left, 2, "Again")])
+        .await
+        .unwrap();
+    assert!(stale.conflict, "the joined versions are enforced");
+}
