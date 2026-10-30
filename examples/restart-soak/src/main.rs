@@ -150,6 +150,12 @@ impl<J: Journal> Journal for TimedJournal<J> {
     async fn load_clock_bound(&self) -> anyhow::Result<Option<u64>> {
         self.inner.load_clock_bound().await
     }
+    async fn save_born(&self, micros: u64) -> anyhow::Result<()> {
+        timed!(self.node, "journal.save_born", self.inner.save_born(micros))
+    }
+    async fn load_born(&self) -> anyhow::Result<Option<u64>> {
+        self.inner.load_born().await
+    }
     async fn save_vote_fence(&self, fence: evento_accord::Timestamp) -> anyhow::Result<()> {
         timed!(
             self.node,
