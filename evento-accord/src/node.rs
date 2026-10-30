@@ -5921,6 +5921,8 @@ impl Node {
     /// refusing it, they prove it never committed
     /// ([`never_commits`](Self::never_commits)) under every layout it may
     /// have been planned under ([`orphan_plans`](Self::orphan_plans), #443),
+    /// and no epoch above the one installed here was decided
+    /// ([`newer_epoch_ruled_out`](Self::newer_epoch_ruled_out), #447),
     /// every replica of the shard records it aborted, held or not, and what
     /// waits on it goes on.
     async fn learn_decision(&self, txn: TxnId) -> anyhow::Result<bool> {
@@ -6023,7 +6025,10 @@ impl Node {
     /// `txn` no shard peer heard from (`reports`) holds: invalidates it on
     /// every one of them, `peers`, if they prove it never committed under
     /// every layout it may have been planned under
-    /// ([`orphan_plans`](Self::orphan_plans)). Returns whether it was.
+    /// ([`orphan_plans`](Self::orphan_plans)), and no epoch above the one
+    /// installed here was decided
+    /// ([`newer_epoch_ruled_out`](Self::newer_epoch_ruled_out)). Returns
+    /// whether it was.
     async fn invalidate_orphan(
         &self,
         rx: &mut mpsc::UnboundedReceiver<(NodeId, Message)>,
@@ -6071,6 +6076,12 @@ impl Node {
         {
             return false;
         }
+        // Proven under every layout up to the installed one: planned under
+        // a later one, it may have committed where the refusals rule
+        // nothing out (#447).
+        if !self.newer_epoch_ruled_out(txn).await {
+            return false;
+        }
         tracing::debug!(
             node = self.id.0,
             ?txn,
@@ -6100,7 +6111,8 @@ impl Node {
     ///
     /// `None`, so no proof, when no command here is known to wait on it, or
     /// it may have been planned under a layout from before this node's
-    /// first.
+    /// first. A layout from after the installed one is ruled out apart
+    /// ([`newer_epoch_ruled_out`](Self::newer_epoch_ruled_out), #447).
     fn orphan_plans(&self, txn: TxnId) -> Option<Vec<ShardPlan>> {
         let keys = self
             .replica
@@ -6144,6 +6156,137 @@ impl Node {
             }
         }
         Some(plans)
+    }
+
+    /// Whether no epoch above the one installed here was decided, shown by
+    /// a config-Paxos read (#447), before a dependency `txn` no replica
+    /// holds is invalidated. Its epoch is not known, and may be **later**
+    /// than this node's: after a replica was added at once to the shard of
+    /// its key, which this node has not installed yet, the refusals counted
+    /// under the layout installed here rule out no quorum of the larger one
+    /// — two refusals of four block every quorum of three of four, not one
+    /// of three of five. The layouts [`orphan_plans`](Self::orphan_plans)
+    /// walks back from the installed one cover it only if that is the
+    /// newest decided.
+    ///
+    /// An epoch is decided once a majority of its acceptors accepted its
+    /// entry; they are the members of the epoch before it (see
+    /// [`change_topology`](Self::change_topology)), so for the epoch after
+    /// the installed one, this node's own. The state read from a majority
+    /// of them meets one that accepted it: this node asks every other
+    /// acceptor ([`Message::ConfigRead`]) and counts, with its own state,
+    /// the answers of a majority of **all** the acceptors among those that
+    /// vote themselves (one that lost its journal and has not restored its
+    /// votes forgot what it accepted, see
+    /// [`restore_config_votes`](Self::restore_config_votes)). The
+    /// dependency was planned before the command waiting on it here
+    /// committed, so before the read: an epoch decided before it was
+    /// planned is accepted at a majority by then, and one decided since
+    /// cannot be its own. Any epoch above the installed one accepted
+    /// anywhere, decided or not, defers the judgment: this node fetches
+    /// the metadata it misses, and judges the dependency under the layout
+    /// it installs, or leaves it to the holders it reaches from there. Too
+    /// few answers prove nothing either. False in both cases; the next
+    /// sweep tries again.
+    async fn newer_epoch_ruled_out(&self, txn: TxnId) -> bool {
+        let installed = self.installed_epoch();
+        let acceptors = self.topology.nodes();
+        let need = acceptors.len() / 2 + 1;
+        let above = |state: &[(u64, AcceptorRecord)]| {
+            state
+                .iter()
+                .filter(|(epoch, record)| *epoch > installed && record.accepted.is_some())
+                .map(|(epoch, _)| *epoch)
+                .min()
+        };
+        // This node's own state counts, when it votes. Its accepted entry for
+        // a later epoch is driven to a decision by its metadata sweep.
+        let mut counted = 0usize;
+        let mut newer: Option<(NodeId, u64)> = None;
+        if self.config_voting() {
+            counted += 1;
+            let own: Vec<(u64, AcceptorRecord)> = self
+                .config
+                .lock()
+                .expect("config poisoned")
+                .iter()
+                .map(|(epoch, acc)| (*epoch, acc.to_record()))
+                .collect();
+            if let Some(epoch) = above(&own) {
+                newer = Some((self.id, epoch));
+            }
+        }
+        let others: Vec<NodeId> = acceptors
+            .iter()
+            .copied()
+            .filter(|&node| node != self.id)
+            .collect();
+        if newer.is_none() && counted < need {
+            let (pending, mut rx) = PendingConfigRead::open(self);
+            self.broadcast(&others, Message::ConfigRead { id: pending.id })
+                .await;
+            let deadline = Self::after(self.settings.collect_timeout);
+            // One answer per acceptor (a frame resent over a fresh connection
+            // must not fill the majority twice over).
+            let mut heard: HashSet<NodeId> = HashSet::new();
+            while counted < need && newer.is_none() {
+                match tokio::time::timeout_at(deadline, rx.recv()).await {
+                    Ok(Some((
+                        from,
+                        Message::ConfigReadReply {
+                            acceptors: state,
+                            voting,
+                            ..
+                        },
+                    ))) => {
+                        if !others.contains(&from) || !heard.insert(from) || !voting {
+                            continue;
+                        }
+                        counted += 1;
+                        if let Some(epoch) = above(&state) {
+                            newer = Some((from, epoch));
+                        }
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(_) => break,
+                }
+            }
+        }
+        if let Some((holder, epoch)) = newer {
+            self.metrics.record_orphan_judgment_deferred();
+            tracing::debug!(
+                node = self.id.0,
+                ?txn,
+                installed,
+                epoch,
+                holder = holder.0,
+                "an epoch above the installed one was accepted: a dependency no replica \
+                 holds waits for it to install here"
+            );
+            if holder != self.id {
+                self.send(
+                    holder,
+                    Message::MetadataFetch {
+                        after_epoch: installed,
+                    },
+                )
+                .await;
+            }
+            return false;
+        }
+        if counted < need {
+            self.metrics.record_orphan_judgment_deferred();
+            tracing::debug!(
+                node = self.id.0,
+                ?txn,
+                counted,
+                need,
+                "too few acceptors answered to rule a newer epoch out: a dependency no \
+                 replica holds waits"
+            );
+            return false;
+        }
+        true
     }
 
     /// The recovery reports a message carries, if it answers `ballot`.

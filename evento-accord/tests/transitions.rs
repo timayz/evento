@@ -5,12 +5,12 @@
 //! gossip and anti-entropy the drain waits on.
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use evento_accord::{
     DataStore, DynamicTopology, HybridLogicalClock, InMemoryDataStore, InMemoryJournal,
     InMemoryNetwork, Journal, LinkFilter, Message, MessageSink, Node, NodeConfig, NodeId, Status,
-    Topology, TopologyChanging, TxnId,
+    Timestamp, Topology, TopologyChanging, TxnId,
 };
 use evento_core::Event;
 
@@ -482,4 +482,187 @@ async fn a_dependency_planned_before_a_replica_was_added_is_not_invalidated() {
         assert!(holds(store, &first), "node {i} lacks T");
         assert!(holds(store, &second), "node {i} lacks W");
     }
+}
+
+/// #447. Node 0 is a replica of `{0, 1, 2, 3}` that never installs epoch 1,
+/// which adds node 4 at once: it hears nothing of the change. X, a write
+/// planned under epoch 1, commits through 1, 2 and 4, and 0 and 3 never see
+/// it. W, a write on X's key planned under epoch 0, is committed at node 0
+/// with X as a dependency, so node 0 learns X's decision from its shard
+/// peers under epoch 0: 1 and 2 hold X but cannot be heard about it, and
+/// node 3 refuses it, as node 0 does itself. Counted under the layout it
+/// installed, two refusals leave no quorum of three of four — but X was
+/// planned under five, where 1, 2 and 4 are a quorum, and they committed
+/// it. Node 0 reads the acceptors' state before invalidating, sees epoch 1
+/// accepted, and leaves X alone; healed, every replica holds X, and node 0
+/// applies W behind it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_dependency_planned_under_an_epoch_the_learner_lacks_is_not_invalidated() {
+    let net = InMemoryNetwork::new();
+    let old = ids(&[0, 1, 2, 3]);
+    let new = ids(&[0, 1, 2, 3, 4]);
+    let config = NodeConfig {
+        fast_timeout: Duration::from_millis(20),
+        collect_timeout: Duration::from_millis(500),
+        recovery_interval: Duration::from_millis(20),
+        anti_entropy_interval: Duration::from_millis(25),
+        recovery_timeout: Duration::from_millis(100),
+        compaction_margin: Duration::from_millis(200),
+        ..NodeConfig::default()
+    };
+    let nodes: Vec<TestNode> = (0..4)
+        .map(|id| spawn_with(&net, id, vec![old.clone()], config))
+        .collect();
+    let joiner = spawn_with(&net, 4, vec![old.clone()], config);
+    joiner.node.begin_join();
+    let _sweeps: Vec<_> = nodes.iter().chain([&joiner]).map(TestNode::sweep).collect();
+    const OUTSIDE: NodeId = NodeId(9);
+    let mut outside_inbox = net.register(OUTSIDE);
+    let outside = net.sink(OUTSIDE);
+
+    // Node 0 hears nothing of epoch 1: neither its proposal nor its
+    // decision, nor the metadata it asks for. Nodes 0 and 3 hear nothing of
+    // X from the others, nor anything they could import it from.
+    let x: Arc<Mutex<Option<TxnId>>> = Arc::default();
+    let blind: LinkFilter = {
+        let x = Arc::clone(&x);
+        let behind = |node: NodeId| node == NodeId(0) || node == NodeId(3);
+        Arc::new(move |from, to, message| {
+            if to == NodeId(0)
+                && matches!(
+                    message,
+                    Message::ConfigPrepare { .. }
+                        | Message::ConfigAccept { .. }
+                        | Message::ConfigCommit { .. }
+                        | Message::MetadataEntries { .. }
+                )
+            {
+                return true;
+            }
+            if !behind(to) || behind(from) {
+                return false;
+            }
+            if matches!(message, Message::SyncData { .. }) {
+                return true;
+            }
+            match *x.lock().unwrap() {
+                // X in flight: no transaction at all.
+                None => message.txn().is_some(),
+                Some(x) => message.txn() == Some(x),
+            }
+        })
+    };
+    net.set_link_filter(Some(blind));
+
+    let installed = nodes[1]
+        .node
+        .change_topology(1, vec![new.clone()])
+        .await
+        .expect("node 4 is added");
+    assert_eq!(installed, vec![new]);
+    for node in &nodes[1..] {
+        await_epoch(&node.topology, 1).await;
+    }
+    joiner.node.join(NodeId(1)).await.expect("joins through 1");
+    assert_eq!(nodes[0].topology.epoch(), 0, "node 0 installed epoch 1");
+
+    let first = event("acc", 1);
+    let committed = nodes[1]
+        .node
+        .write(vec![first.clone()])
+        .await
+        .expect("X commits through replicas 1, 2 and 4");
+    assert!(!committed.conflict);
+    let txn = committed.txn;
+    *x.lock().unwrap() = Some(txn);
+    for (i, node) in [(0, &nodes[0].node), (3, &nodes[3].node)] {
+        assert_eq!(node.command_status(txn), None, "node {i} saw X");
+    }
+
+    // W, planned under epoch 0 by a coordinator gone since, committed at
+    // node 0 alone, after X.
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_micros() as u64;
+    let write = TxnId(Timestamp {
+        micros: now,
+        logical: 0,
+        node: OUTSIDE,
+    });
+    let second = event("acc", 2);
+    outside
+        .send(
+            NodeId(0),
+            Message::Commit {
+                epoch: 0,
+                txn: write,
+                execute_at: write.0,
+                deps: vec![txn],
+                keys: vec![evento_accord::Key::of(&second)],
+                events: vec![second.clone()],
+                reply_to: OUTSIDE,
+            },
+        )
+        .await
+        .expect("W reaches node 0");
+
+    for _ in 0..200 {
+        assert_eq!(
+            nodes[0].node.command_status(txn),
+            None,
+            "node 0 decided X, which it never witnessed, under a layout smaller than its own"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        !holds(&nodes[0].store, &second),
+        "node 0 applied W without X"
+    );
+    assert!(
+        nodes[0].node.metrics().orphan_judgments_deferred > 0,
+        "node 0 never read the acceptors' state before judging X"
+    );
+
+    net.set_link_filter(None);
+    // Healed, node 0 learns X's decision and reads W behind it; its
+    // coordinator decides W.
+    let read = async {
+        loop {
+            match outside_inbox.recv().await.map(|envelope| envelope.message) {
+                Some(Message::ReadOk { txn, ok }) if txn == write => return ok,
+                Some(_) => {}
+                None => panic!("the outside inbox closed"),
+            }
+        }
+    };
+    let ok = tokio::time::timeout(Duration::from_secs(10), read)
+        .await
+        .expect("node 0 reads W once it holds X");
+    assert!(ok, "W's version condition fails behind X");
+    outside
+        .send(
+            NodeId(0),
+            Message::Apply {
+                txn: write,
+                commit: true,
+            },
+        )
+        .await
+        .expect("W's decision reaches node 0");
+    let stores: Vec<&InMemoryDataStore> = nodes
+        .iter()
+        .chain([&joiner])
+        .map(|n| n.store.as_ref())
+        .collect();
+    for _ in 0..2_000 {
+        if stores.iter().all(|store| holds(store, &first)) && holds(stores[0], &second) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    for (i, store) in stores.iter().enumerate() {
+        assert!(holds(store, &first), "node {i} lacks X");
+    }
+    assert!(holds(stores[0], &second), "node 0 lacks W");
 }

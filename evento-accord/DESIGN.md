@@ -1062,7 +1062,11 @@ backend (sql/fjall). Phases, in order:
   known to them, so the refusals must rule a commit out under every layout it
   may have been planned under: those of the waiting write's keys back from the
   installed one, for as long as each key only gained replicas (#443,
-  `Node::orphan_plans`). A **multi-shard**
+  `Node::orphan_plans`) — and the installed one must be the newest decided,
+  which a config-Paxos read from a majority of the acceptors shows before the
+  invalidation (#447, `Node::newer_epoch_ruled_out`): planned under a later
+  epoch, after a replica was added at once, the dependency may have committed
+  in a quorum the refusals rule nothing out of. A **multi-shard**
   transaction of that shape is decided the same way (#377,
   `a_routed_recovery_decides_what_an_amnesiac_and_one_replica_accepted`): the
   routed recovery hands the late replica its shard's part from a holder's report,
@@ -1543,6 +1547,23 @@ backend (sql/fjall). Phases, in order:
         (`a_dependency_planned_before_a_replica_was_added_is_not_invalidated`;
         the seed is pinned,
         `a_dependency_is_judged_under_every_layout_it_may_have_been_planned_under`).
+        The layouts it walks back to end at the installed one, and the
+        dependency may have been planned under a **later** epoch (#447,
+        found by reasoning while fixing #443; no seed hit it). A learner
+        still on epoch E while its shard installed E+1, which added a
+        replica at once, counts the refusals under four replicas, and two
+        of them leave no quorum of three of four — but three of the five
+        the dependency was planned under may have committed it. Before
+        invalidating, the learner now reads the acceptors' state
+        (`ConfigRead`, from a majority of the members of its installed
+        epoch, which are the acceptors of the next): an epoch is decided
+        once a majority of them accepted it, and the dependency was planned
+        before the command waiting on it committed here, so an epoch above
+        the installed one accepted anywhere defers the judgment, and the
+        learner fetches the metadata it misses and judges under the layout
+        it installs, or leaves the dependency to the holders it reaches
+        from there (`accord_orphan_judgments_deferred_total`;
+        `a_dependency_planned_under_an_epoch_the_learner_lacks_is_not_invalidated`).
         The learner's recovery of a dependency a holder reports undecided
         dropped the route the report carried (#445, the re-sharding swarm).
         The holder's keys are its own shard's part, so a multi-shard

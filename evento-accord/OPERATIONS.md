@@ -148,6 +148,7 @@ Serve it on an HTTP endpoint (see `bank-axum-accord`'s `/metrics`). Counters:
 | `votes_fenced` | votes refused for a transaction this node never witnessed, below its vote fence — what it vouched for (a watermark report, sync coverage, a join's vouch, its subscriptions' stable point) or could vouch for now: typically a recovery by a replica that alone holds the transaction (§3, `compaction_margin`). It never vouches past a transaction a slow quorum of its shard holds unapplied, so such a one still gets its vote (#337). Spikes after a partition heals are expected. |
 | `votes_late` | votes refused to an original coordinator older than the compaction margin, for a transaction this node never witnessed (§3, `compaction_margin`). Spikes after a partition heals are expected; a steady rate means coordinators slower than the margin. |
 | `dependencies_learned` | decisions this node learned from its peers for a transaction it never witnessed, but a command committed here waited on (missed while it was cut off or restarting). Counts after a partition heals are expected; it keeps a stalled execution from waiting on anti-entropy for a transaction no replica can apply yet. |
+| `orphan_judgments_deferred` | invalidations of a dependency no replica holds that this node put off (#447): before invalidating one, it reads the acceptors' state, and an epoch above the one it installed was accepted — the dependency may have been planned under a layout larger than the one the refusals were counted against — or too few acceptors answered. The next sweep tries again, once the epoch is installed here. A few while a node catches up on a layout change are expected; **steadily rising** = the node cannot install the epoch (its metadata fetches go unanswered) or hear a majority of the acceptors. |
 | `votes_future_dated` | votes refused for a transaction dated more than two clock skews past this node's clock: its coordinator's clock runs beyond the skew bound (§3). Any count = a clock out of bounds; fix its time source. |
 | `amnesia_fences` | times this node opened joining over an empty journal and fenced itself (§7, lost journal). |
 | `amnesia_joins_refused` | joins over a lost journal that found no contact vouching past the fence (`FenceNotCovered`, nothing installed). A few while the contact's report catches up; **steadily rising** = a transaction below the fence no replica can decide any more (§7). |
@@ -483,7 +484,10 @@ refuses anything else before a vote, and a node never installs it.
     committed. They prove it under every layout it may have been planned under — after a
     replica was added to their shard at once, the replicas it had before must refuse it
     too — and a node that does not know those layouts (its `DynamicTopology` was built
-    past epoch 0) leaves it to its holders instead (#443).
+    past epoch 0) leaves it to its holders instead (#443). The layout it installed must
+    also be the newest decided: it reads the acceptors' state first, and an epoch above
+    its own accepted anywhere puts the invalidation off until it installs that epoch
+    (#447, `orphan_judgments_deferred`).
   - **Stuck below the fence**: one case can still never be decided — a transaction
     whose lost replica voted for it only in a recovery and lost its journal before its
     next report showed it holding the transaction. (A **multi-shard** transaction of
