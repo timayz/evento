@@ -42,7 +42,7 @@ pub use api::{
     slot_of, snapshot_event_size, validate_layout, AcceptorRecord, AmnesiaFence, ConfigEntry,
     CopyPhase, CopyState, DataStore, DecisionRecord, Drained, DurableMark, DynamicTopology,
     FenceRecord, Journal, Layout, MessageSink, RegionId, ShardId, ShardMap, ShardedTopology,
-    SnapshotPage, StaticTopology, Topology, SLOTS,
+    SnapshotPage, StaticTopology, StoreBehind, Topology, SLOTS,
 };
 pub use clock::{Ballot, Clock, HybridLogicalClock, NodeId, Timestamp, TxnId, MAX_SKEW_MICROS};
 pub use executor::{AccordExecutor, ExecutorDataStore};

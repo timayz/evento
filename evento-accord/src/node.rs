@@ -1706,6 +1706,7 @@ impl Node {
                 .lock()
                 .expect("replica poisoned")
                 .durable_fence(),
+            born: 0,
         }
     }
 

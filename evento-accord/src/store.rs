@@ -644,6 +644,7 @@ mod tests {
             life: 0,
             clock_bound,
             vote_fence: Timestamp::MIN,
+            born: 0,
         };
         journal
             .save_peer_marks(&[(NodeId(1), mark(400))])
