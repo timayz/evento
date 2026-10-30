@@ -259,7 +259,9 @@ control plane, everything else is Accord.
   journal and a holder that never accepted — the amnesia rule of `never_commits`
   (#312), the very proof `settle_late` asked the refusal on; a routed recovery once
   took its verdict from the quorum rule alone and left such a txn undecided for good
-  (#386). The recovery then **invalidates** the txn (`Message::Invalidate`): every replica holding it
+  (#386). The two halves of that proof — no quorum could have committed it, too few
+  replicas are left that could ever vote for it — may come from different shards of a
+  routed txn, a commit needing a quorum of every shard (#451). The recovery then **invalidates** the txn (`Message::Invalidate`): every replica holding it
   un-committed records it applied as an abort without executing it (an abort changes
   nothing, so needs no place in the order), marked by `execute_at = INVALIDATED_AT`
   (`Timestamp::MIN` — no field added to `CommandState`), which a later recovery
@@ -1602,6 +1604,24 @@ backend (sql/fjall). Phases, in order:
         strands a node (`a_transaction_applied_here_is_never_stranded`; the
         seed is pinned,
         `a_node_that_applied_a_dependency_is_never_stranded_on_it`).
+        A routed transaction whose never-commit proof was split across its
+        shards was never settled (#451, the one stall #450 left in the same
+        swarm). A recovery of it had one replica of each shard accept it,
+        and the recovering replica lost its journal. In its shard the accept
+        beside the amnesiac may have made a quorum, so the late replica
+        there could not be asked to refuse by that shard's counts; in the
+        other, one accept and a late replica showed no quorum had committed
+        it, while its two holders could still vote for it. `never_commits`
+        looked for both halves in one shard, and `may_have_committed` needs
+        every shard: the late replicas were asked neither to vote nor to
+        refuse, every replica had answered, and the next attempt heard the
+        same. The transaction held its shard's coverage below the
+        amnesiac's fence, and the join never went through. The two halves
+        are now gathered across the shards: the late replicas are asked to
+        refuse, and refused, the transaction is invalidated
+        (`a_never_commit_proof_split_across_shards_refuses_the_late_replicas`,
+        `a_split_proof_needs_a_shard_that_rules_out_each_half`; the seed is
+        pinned, `a_never_commit_proof_split_across_shards_is_settled`).
   - [ ] **Real-cluster soak + chaos** over days (kills, partitions, clock skew,
         disk pressure, slow disks/links) on actual hardware — zero production
         mileage today.

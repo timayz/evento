@@ -2427,6 +2427,30 @@ async fn a_replica_that_missed_an_invalidation_learns_it_from_its_record() {
     }
 }
 
+/// A multi-shard transaction whose never-commit proof is split across its
+/// shards was never decided (#451, the two-shard amnesia swarm with message
+/// faults): a recovery of it had one replica of each shard accept it, and
+/// the recovering replica lost its journal. In its shard, the accept beside
+/// the amnesiac may have made a quorum, so the late replica there was not
+/// asked to refuse; in the other, one accept and a late replica prove no
+/// quorum committed it, but its two holders could still vote. Each shard
+/// alone proved nothing, and the transaction held the shard's coverage below
+/// the amnesiac's fence: its join never went through.
+const SPLIT_PROOF_SEEDS: [u64; 1] = [809441];
+
+#[tokio::test(start_paused = true)]
+async fn a_never_commit_proof_split_across_shards_is_settled() {
+    for &seed in &SPLIT_PROOF_SEEDS {
+        let _replay = Replay {
+            test: "safety_and_liveness_hold_under_amnesia_over_two_shards_and_message_faults",
+            seed,
+        };
+        run_sharded_amnesia(seed, Faults::ALL)
+            .await
+            .assert_ok(&format!("sharded amnesia +faults at seed {seed}"));
+    }
+}
+
 /// A node's disk is rolled back to an older copy of its journal (#339),
 /// with writes and, under `faults`, message and storage faults going on. The
 /// copy was taken earlier, and the node went on voting and reporting until
