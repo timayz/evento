@@ -8818,6 +8818,7 @@ impl Node {
                 None => applied,
             };
             if watermark > vouched.max(floor) {
+                self.metrics.record_sync_contact_truncated();
                 tracing::warn!(
                     node = self.id.0,
                     contact = contact.0,

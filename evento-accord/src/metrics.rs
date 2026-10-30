@@ -28,6 +28,11 @@ pub struct Metrics {
     pub watermark_clamps: AtomicU64,
     /// Group-commit journal flushes performed.
     pub journal_flushes: AtomicU64,
+    /// Anti-entropy contacts found truncated above what this node vouched
+    /// for: the window in between can no longer be shipped to it, so it
+    /// cannot be repaired by anti-entropy (compaction outran repair, or an
+    /// operator compacted by hand).
+    pub sync_contact_truncated: AtomicU64,
     /// Inbound messages handled.
     pub messages_handled: AtomicU64,
     /// Outbound messages shed because a peer's queue was full (backpressure).
@@ -188,6 +193,12 @@ impl Metrics {
         self.journal_flushes.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records an anti-entropy contact found truncated above what this node
+    /// vouched for.
+    pub fn record_sync_contact_truncated(&self) {
+        self.sync_contact_truncated.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Records one inbound message handled.
     pub fn record_message(&self) {
         self.messages_handled.fetch_add(1, Ordering::Relaxed);
@@ -337,6 +348,7 @@ impl Metrics {
             compactions: self.compactions.load(Ordering::Relaxed),
             watermark_clamps: self.watermark_clamps.load(Ordering::Relaxed),
             journal_flushes: self.journal_flushes.load(Ordering::Relaxed),
+            sync_contact_truncated: self.sync_contact_truncated.load(Ordering::Relaxed),
             messages_handled: self.messages_handled.load(Ordering::Relaxed),
             messages_shed: self.messages_shed.load(Ordering::Relaxed),
             peers_absent: self.peers_absent.load(Ordering::Relaxed),
@@ -383,6 +395,7 @@ pub struct MetricsSnapshot {
     pub compactions: u64,
     pub watermark_clamps: u64,
     pub journal_flushes: u64,
+    pub sync_contact_truncated: u64,
     pub messages_handled: u64,
     pub messages_shed: u64,
     pub peers_absent: u64,
@@ -419,7 +432,7 @@ impl MetricsSnapshot {
     /// source of truth for both [`to_prometheus`](Self::to_prometheus) and
     /// [`to_prometheus_labeled`](Self::to_prometheus_labeled); add a counter here and
     /// both renderings pick it up.
-    fn counters(&self) -> [(&'static str, &'static str, u64); 37] {
+    fn counters(&self) -> [(&'static str, &'static str, u64); 38] {
         [
             (
                 "accord_writes_committed_total",
@@ -460,6 +473,11 @@ impl MetricsSnapshot {
                 "accord_journal_flushes_total",
                 "Group-commit journal flushes performed.",
                 self.journal_flushes,
+            ),
+            (
+                "accord_sync_contact_truncated_total",
+                "Anti-entropy contacts found truncated above what this node vouched for.",
+                self.sync_contact_truncated,
             ),
             (
                 "accord_messages_handled_total",
