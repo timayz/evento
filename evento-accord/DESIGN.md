@@ -452,7 +452,14 @@ control plane, everything else is Accord.
   only adds a replica to a shard that keeps others installs at once, and the new
   replica joins through one of them; `join` refuses a contact of another shard
   (#360: a joiner adopted such a contact's floor, its own shard's, and treated
-  its new shard's later writes below it as compacted).
+  its new shard's later writes below it as compacted). A new node whose every
+  slot is gained has nothing to join: its copy ends its join. A replica that is
+  still joining when a change gives its shard slots (an at-once addition whose
+  join failed partway) copies and pre-seeds nothing until it joins (#446): a
+  copy would fill the store its join needs empty, and a copy that ended its
+  join left the node without the part of its own shard the join had not
+  brought — its peers compacted past it meanwhile, so anti-entropy could not
+  bring it either. The activation waits for the copy, so for the join.
 
   **Dropping moved slots (#372; shipped).** A node's store holds the slots it
   owns under its installed layout, and the slots it is copying for the pending

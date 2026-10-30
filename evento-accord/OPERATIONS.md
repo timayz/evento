@@ -194,8 +194,12 @@ refuses anything else before a vote, and a node never installs it.
   contact of its shard. The new node may not have installed the new epoch yet: `join`
   fetches it from the contact and waits, failing if the node is still no replica after
   a few `collect_timeout`s. A node the change gave slots to copies them while the change
-  drains, and its `join` then returns `Ok(0)`: call it either way. (See
-  `tests/membership.rs`, `tests/transitions.rs`, `tests/resharding.rs`.)
+  drains, and its `join` then returns `Ok(0)`: call it either way. A replica that is
+  still joining when a change gives its shard more slots — an addition installed at
+  once whose `join` failed partway — copies nothing until it joins (#446): the change
+  waits for its join, then its copy. Finish the join (over an emptied store after a
+  `PartialSnapshot`, below) and the change goes on. (See `tests/membership.rs`,
+  `tests/transitions.rs`, `tests/resharding.rs`.)
 - **Remove a node:** `change_topology(epoch, smaller_layout)`; the smaller cluster keeps
   serving, once the change drained the writes in flight on the node's shard (below).
   Reconfiguration survives the coordinator crashing mid-change (another node
@@ -273,8 +277,12 @@ refuses anything else before a vote, and a node never installs it.
   and call `node.recover_state().await?` *before* serving — it restores the replica
   (status/ballots/decision), replays committed transactions into the data store, and
   restores the metadata-log/acceptor state and redundancy watermark. Then
-  `start()`/`start_recovery()`. In-flight transactions resume via the sweep, and
-  anti-entropy catches the node up. A replayed transaction the store neither holds
+  `start()`/`start_recovery()`. Build a `DynamicTopology` as at the first start, with
+  the same start epoch and layout: the metadata log the journal holds brings it to the
+  epoch the node had installed, a transition in progress included. Built at the
+  installed epoch instead, the node restores that epoch's layout but no transition in
+  progress: it copies nothing for it, and the change never installs (#446). In-flight
+  transactions resume via the sweep, and anti-entropy catches the node up. A replayed transaction the store neither holds
   nor can take — it lost the write (§8), or misses an earlier one the journal never
   recorded — is handed back decided but un-applied and applied again once what
   precedes it is in place. The sweep retries that apply, and never takes the
