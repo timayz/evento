@@ -478,7 +478,10 @@ refuses anything else before a vote, and a node never installs it.
     compaction margin passed. That replica never vouched past it: the replicas holding
     it unapplied, the lost one's last gossip included, keep their shard's applied floor
     below it, and no replica hands out sync coverage past that floor (#337). A recovery
-    gets its vote and decides the transaction, and the join goes through. One only the
+    gets its vote and decides the transaction, and the join goes through. One no
+    quorum could have committed in some shard, and too few replicas could ever vote for
+    in some other, is invalidated — the proof may be split across the shards of a
+    multi-shard transaction, a commit needing a quorum of every shard (#451). One only the
     lost replica held, which a write committed with as a dependency, is invalidated by
     the replicas that wait on it: past its deadline nothing can vote for it, so it never
     committed. They prove it under every layout it may have been planned under — after a
