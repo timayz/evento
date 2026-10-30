@@ -42,6 +42,8 @@ const WATERMARK_KEY: &[u8] = b"redundant_before";
 const REJOIN_BOUNDS_KEY: &[u8] = b"rejoin_above";
 /// Meta key under which the node's clock bound is stored.
 const CLOCK_BOUND_KEY: &[u8] = b"clock_bound";
+/// `meta` key of the journal's identity (`Journal::save_born`).
+const BORN_KEY: &[u8] = b"born";
 /// Meta key under which the replica's amnesia fence is stored. Untouched by
 /// `truncate`.
 const AMNESIA_FENCE_KEY: &[u8] = b"amnesia_fence";
@@ -343,6 +345,28 @@ impl Journal for FjallJournal {
         let bytes = tokio::task::spawn_blocking(move || meta.get(CLOCK_BOUND_KEY)).await??;
         match bytes {
             Some(bytes) => Ok(Some(decode_tagged(RecordKind::ClockBound, &bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn save_born(&self, micros: u64) -> anyhow::Result<()> {
+        let value = encode_tagged(RecordKind::Born, &micros)?;
+        let meta = self.meta.clone();
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            meta.insert(BORN_KEY, value)?;
+            db.persist(PersistMode::SyncAll)?;
+            Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    async fn load_born(&self) -> anyhow::Result<Option<u64>> {
+        let meta = self.meta.clone();
+        let bytes = tokio::task::spawn_blocking(move || meta.get(BORN_KEY)).await??;
+        match bytes {
+            Some(bytes) => Ok(Some(decode_tagged(RecordKind::Born, &bytes)?)),
             None => Ok(None),
         }
     }

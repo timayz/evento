@@ -31,7 +31,8 @@ use tokio::time::{Duration, Instant};
 use crate::api::{
     floor_millis, slot_of, snapshot_event_size, stamp_events, stamp_micros, validate_layout,
     AcceptorRecord, AmnesiaFence, ConfigEntry, CopyPhase, CopyState, DataStore, Drained,
-    DurableMark, FenceRecord, Journal, Layout, MessageSink, ShardId, ShardMap, Topology, SLOTS,
+    DurableMark, FenceRecord, Journal, Layout, MessageSink, ShardId, ShardMap, StoreBehind,
+    Topology, SLOTS,
 };
 use crate::clock::{Ballot, Clock, HybridLogicalClock, NodeId, Timestamp, TxnId};
 use crate::failure_detector::FailureDetector;
@@ -1288,6 +1289,12 @@ pub struct Node {
     /// the journal holds them ([`Journal::save_clock_bound`]); raised by
     /// [`mint`](Node::mint) before a stamp reaches them. 0 until the first.
     clock_bound: Arc<AtomicU64>,
+    /// The journal's identity (see [`Journal::save_born`]): the microseconds
+    /// at which it was first opened, 0 until it is loaded or minted at open,
+    /// or for good when the journal keeps none. Part of the node's
+    /// [`DurableMark`]: a different journal under this node's id is told
+    /// apart from the one its peers saw by it (#453).
+    born: Arc<AtomicU64>,
     /// Serializes raising [`clock_bound`](Self::clock_bound), and
     /// [`retire`](Node::retire) against it.
     clock_bound_lock: Arc<tokio::sync::Mutex<()>>,
@@ -1461,6 +1468,7 @@ impl Node {
             id,
             clock,
             clock_bound: Arc::new(AtomicU64::new(0)),
+            born: Arc::new(AtomicU64::new(0)),
             clock_bound_lock: Arc::new(tokio::sync::Mutex::new(())),
             retired: Arc::new(AtomicBool::new(false)),
             amnesia: Arc::new(Mutex::new(None)),
@@ -1706,7 +1714,7 @@ impl Node {
                 .lock()
                 .expect("replica poisoned")
                 .durable_fence(),
-            born: 0,
+            born: self.born.load(Ordering::Acquire),
         }
     }
 
@@ -2130,6 +2138,30 @@ impl Node {
             && fences.is_empty()
             && vote_fence.is_none()
             && peer_marks.is_empty();
+        // The journal's identity (#453): kept from its first open, or minted
+        // now — this node's clock, which no other journal of this node's id
+        // was first opened under — and read back, so a journal that keeps
+        // none (`Journal::save_born` on its default) stays without one.
+        let born = match self.journal.load_born().await? {
+            Some(born) => born,
+            None => {
+                let minted = self.clock.now().micros.max(1);
+                self.journal
+                    .save_born(minted)
+                    .await
+                    .map_err(|err| err.context("cannot persist the journal's identity"))?;
+                let kept = self.journal.load_born().await?.unwrap_or(0);
+                if kept == 0 {
+                    tracing::warn!(
+                        node = self.id.0,
+                        "this journal keeps no identity (Journal::save_born): another journal \
+                         under this node's id would go unnoticed"
+                    );
+                }
+                kept
+            }
+        };
+        self.born.store(born, Ordering::Release);
         // The vote fence comes back where the journal left it (#337). A
         // journal that keeps none restarts it at the clock bound less the
         // margin, where the fence stood before it was journaled: the bound is
@@ -3477,6 +3509,24 @@ impl Node {
         self.require_rejoin(from);
     }
 
+    /// Whether `err`, an apply the store refused, says the store is behind
+    /// this node's journal ([`StoreBehind`], #453): the versions in between
+    /// come from no journal of this node, so the node stops taking part
+    /// until its host rejoins it — through any shard peer — rather than
+    /// retry the apply for ever, or serve the aggregate with a hole.
+    fn store_behind(&self, err: &anyhow::Error) -> bool {
+        if err.downcast_ref::<StoreBehind>().is_none() {
+            return false;
+        }
+        let contact = self
+            .shard_peers()
+            .into_iter()
+            .find(|&peer| peer != self.id)
+            .unwrap_or(self.id);
+        self.require_rejoin(contact);
+        true
+    }
+
     /// Stops this node taking part until its host rejoins it through
     /// `contact`, a peer that compacted past what it holds (see
     /// [`rejoin_contact`](Self::rejoin_contact)).
@@ -3574,8 +3624,19 @@ impl Node {
             .expect("opening poisoned")
             .as_ref()
             .map(|opening| opening.mark);
-        // An answer to another open: an earlier one of this node's id.
-        if opened != Some(mark) || self.rolled_back.send_replace(true) {
+        // An answer to this node's open, or one that names this very journal
+        // as another than the one the peer knew under its id (#453: a plain
+        // open over a fresh journal asks nobody, and is told at its first
+        // report) — not to another open of this node's id: an `Opened` of an
+        // earlier incarnation, delivered late, is answered below the mark the
+        // peer saw since, and that answer is not for this one. The identity
+        // conflict is for good, so even a late answer about it is.
+        let mine = self.durable_mark();
+        let identity = mark.born != 0
+            && !mark.same_journal(&seen)
+            && mark.born == mine.born
+            && mark.life == mine.life;
+        if !(opened == Some(mark) || identity) || self.rolled_back.send_replace(true) {
             return;
         }
         self.metrics.record_journal_rolled_back();
@@ -4590,11 +4651,39 @@ impl Node {
                 live_since,
             } => {
                 // What the sender's journal holds, which it must hold again
-                // when it reopens (#339).
-                self.peer_marks
-                    .lock()
-                    .expect("peer marks poisoned")
-                    .observe(from, mark);
+                // when it reopens (#339) — and which journal that is: a
+                // report of one life from another journal than the one this
+                // node saw under that id is a node opened plainly over a
+                // fresh journal (a directory emptied while another process
+                // of its id served, #453), never asked to confirm, since a
+                // journal that holds nothing asks nobody. It is told so, as
+                // at an open, and not counted. Only the identity is held
+                // against a report: a late one of the same journal, reordered
+                // behind a newer, legitimately holds less.
+                let other = {
+                    let mut marks = self.peer_marks.lock().expect("peer marks poisoned");
+                    match marks.by_node.get(&from).copied() {
+                        Some(seen) if seen.life == mark.life && !mark.same_journal(&seen) => {
+                            Some(seen)
+                        }
+                        _ => {
+                            marks.observe(from, mark);
+                            None
+                        }
+                    }
+                };
+                if let Some(seen) = other {
+                    tracing::error!(
+                        node = self.id.0,
+                        peer = from.0,
+                        ?mark,
+                        ?seen,
+                        "a peer reports from another journal than the one it ran under: \
+                         a fresh journal under a known node id"
+                    );
+                    out.push((from, Message::RolledBack { mark, seen }));
+                    return out;
+                }
                 // A joiner's first report ends the hold its contact kept for
                 // it (see `JoinHold`): from here on it is counted itself.
                 self.join_holds
@@ -5060,12 +5149,22 @@ impl Node {
                         .expect("replica poisoned")
                         .release_apply(apply.txn);
                     self.metrics.record_execution_failure();
-                    tracing::warn!(
-                        node = self.id.0,
-                        txn = ?apply.txn,
-                        %err,
-                        "cannot apply a decided transaction; retrying"
-                    );
+                    if self.store_behind(&err) {
+                        tracing::error!(
+                            node = self.id.0,
+                            txn = ?apply.txn,
+                            %err,
+                            "the store is behind this node's journal; this node must rejoin \
+                             the group from a snapshot"
+                        );
+                    } else {
+                        tracing::warn!(
+                            node = self.id.0,
+                            txn = ?apply.txn,
+                            %err,
+                            "cannot apply a decided transaction; retrying"
+                        );
+                    }
                     break;
                 }
                 self.replica
@@ -8990,16 +9089,21 @@ impl Node {
             // commands arrive in execution order, and one applied past a gap
             // would put a later version in the store ahead of an earlier one.
             // An invalidated command never executes: nothing to apply.
-            if !want_snapshot
-                && !cmd.invalidated()
-                && self
-                    .datastore
-                    .apply(txn, execute_at, events, commit)
-                    .await
-                    .is_err()
-            {
-                apply_failed = true;
-                break;
+            if !want_snapshot && !cmd.invalidated() {
+                if let Err(err) = self.datastore.apply(txn, execute_at, events, commit).await {
+                    if self.store_behind(&err) {
+                        tracing::error!(
+                            node = self.id.0,
+                            contact = contact.0,
+                            ?txn,
+                            %err,
+                            "the store is behind this node's journal; this node must rejoin \
+                             the group from a snapshot"
+                        );
+                    }
+                    apply_failed = true;
+                    break;
+                }
             }
             let inserted = self
                 .replica
@@ -9085,6 +9189,12 @@ impl Node {
                 None => applied,
             }
             .max(fence);
+            // A smell, not a proof: under a layout change a replica that
+            // copied its slots holds everything below the contact's floor
+            // while its fence, which only its own reports raise, lies below
+            // it. So it is counted and logged, never acted on; a gap that is
+            // real surfaces at the next apply on the aggregate
+            // ([`StoreBehind`], #453).
             if watermark > vouched.max(floor) {
                 self.metrics.record_sync_contact_truncated();
                 tracing::warn!(
@@ -9092,8 +9202,8 @@ impl Node {
                     contact = contact.0,
                     ?watermark,
                     ?vouched,
-                    "sync contact truncated above this node's proven coverage — \
-                     possible unrepairable divergence"
+                    "sync contact truncated above what this node vouched for — \
+                     possible unrepairable divergence, unless this node copied its slots"
                 );
             }
         }

@@ -599,16 +599,29 @@ impl Default for DurableMark {
 
 impl DurableMark {
     /// Whether a journal holding this mark lost nothing a peer saw of it as
-    /// `seen`: it is of a later life, or of the same and at or above it in
-    /// both parts.
+    /// `seen`: it is of a later life, or of the same life, the same journal
+    /// ([`same_journal`](Self::same_journal)) and at or above it in both
+    /// parts.
     pub fn covers(&self, seen: &DurableMark) -> bool {
         match self.life.cmp(&seen.life) {
             std::cmp::Ordering::Greater => true,
             std::cmp::Ordering::Less => false,
             std::cmp::Ordering::Equal => {
-                self.clock_bound >= seen.clock_bound && self.vote_fence >= seen.vote_fence
+                self.same_journal(seen)
+                    && self.clock_bound >= seen.clock_bound
+                    && self.vote_fence >= seen.vote_fence
             }
         }
+    }
+
+    /// Whether this mark and `seen`, of one life, come from one journal: a
+    /// different `born` names another journal under the same node id — a
+    /// fresh file, or another run's — which no bound or fence can tell
+    /// apart from the one before, both being cut from the wall clock
+    /// (#453). A journal that keeps no identity (`born` 0) is given the
+    /// benefit of the doubt.
+    pub fn same_journal(&self, seen: &DurableMark) -> bool {
+        self.born == 0 || seen.born == 0 || self.born == seen.born
     }
 
     /// The highest of both marks: the later life's, or, of one life, the
@@ -621,7 +634,11 @@ impl DurableMark {
                 life: self.life,
                 clock_bound: self.clock_bound.max(other.clock_bound),
                 vote_fence: self.vote_fence.max(other.vote_fence),
-                born: self.born,
+                born: if self.born == 0 {
+                    other.born
+                } else {
+                    self.born
+                },
             },
         }
     }

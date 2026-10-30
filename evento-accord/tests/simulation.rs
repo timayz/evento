@@ -5283,9 +5283,13 @@ async fn rejoin_bounds_survive_a_restart() {
     );
 
     // Both survivors restart (with the default config: no absence limit), so
-    // only the persisted bound can keep node 2 out.
-    sim.restart_with(0, NodeConfig::default()).await;
-    sim.restart_with(1, NodeConfig::default()).await;
+    // only the persisted bound can keep node 2 out. Over the stores they
+    // had: emptied, a store would be behind the journal, which compacted
+    // past the baseline, and the survivors would ask to rejoin (#453).
+    sim.restart_as(0, NodeConfig::default(), Restart::KeepStore)
+        .await;
+    sim.restart_as(1, NodeConfig::default(), Restart::KeepStore)
+        .await;
     assert_eq!(sim.nodes[0].absent_peers(), vec![NodeId(2)]);
     assert_eq!(sim.nodes[1].absent_peers(), vec![NodeId(2)]);
 
