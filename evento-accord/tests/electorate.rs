@@ -207,8 +207,10 @@ async fn recovery_requires_a_quorum_under_a_shrunk_electorate() {
     );
 
     // Heal: node 3 can now reach {1,2,3,4} — a quorum — and recovers safely.
+    // Its own sweep may be in a round begun under the partition, which waits
+    // out `collect_timeout` for a quorum (#452); this recovery waits for it.
     cluster.net.heal_all_partitions();
-    let outcome = tokio::time::timeout(Duration::from_secs(5), cluster.nodes[3].recover(txn))
+    let outcome = tokio::time::timeout(Duration::from_secs(15), cluster.nodes[3].recover(txn))
         .await
         .expect("recovery timed out")
         .expect("recovery completes once a quorum is reachable");
