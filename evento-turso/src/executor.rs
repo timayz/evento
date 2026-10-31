@@ -34,6 +34,15 @@ const INSERT_CHUNK: usize = 1000;
 /// How many connections [`Turso::transaction`] keeps for the next calls.
 const APP_CONNECTIONS: usize = 16;
 
+/// Which write connection a statement goes through.
+#[derive(Clone, Copy)]
+enum Durability {
+    /// `synchronous = FULL`: the events.
+    Durable,
+    /// `synchronous = NORMAL`: the subscription cursors and the snapshots.
+    Relaxed,
+}
+
 /// The clock a [`Turso`] stamps its writes with: unix time in milliseconds.
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
 
@@ -70,6 +79,16 @@ fn system_millis() -> u64 {
 /// two write statements never race on a connection (Turso returns `Busy` for
 /// the second).
 ///
+/// # Durability
+///
+/// Events are written with `synchronous = FULL`: an acknowledged write is on
+/// disk. Subscription cursors and snapshots go through a second connection
+/// with `synchronous = NORMAL`: a power cut may lose the last of them, never
+/// corrupt the file, and a subscription then takes a few events again (it
+/// delivers at least once) while a snapshot is rebuilt from the events. Every
+/// subscription acknowledges each event it takes; an fsync apiece would make
+/// the store's event writes queue behind them.
+///
 /// # Sharing the database
 ///
 /// Opened with [`open`](Self::open), the store expects to be the only writer
@@ -98,8 +117,11 @@ pub struct Turso {
     db: turso::Database,
     /// How the database takes its writes; read from the file when opened.
     mode: WriteMode,
-    /// The single writer; holds `BEGIN … COMMIT`.
+    /// The single writer of events; holds `BEGIN … COMMIT`.
     write: Arc<Mutex<turso::Connection>>,
+    /// The writer of subscription cursors and snapshots, `synchronous =
+    /// NORMAL` (see "Durability" above).
+    relaxed: Arc<Mutex<turso::Connection>>,
     /// The monotonic commit clock, in milliseconds; only ever written under
     /// `write`, persisted under [`LAST_STAMP_KEY`] with each stamped batch.
     last_stamp: Arc<AtomicU64>,
@@ -131,6 +153,7 @@ impl Clone for Turso {
             db: self.db.clone(),
             mode: self.mode,
             write: Arc::clone(&self.write),
+            relaxed: Arc::clone(&self.relaxed),
             last_stamp: Arc::clone(&self.last_stamp),
             clock: Arc::clone(&self.clock),
             write_watch: self.write_watch.clone(),
@@ -226,6 +249,8 @@ impl Turso {
     pub async fn from_database(db: turso::Database) -> anyhow::Result<Self> {
         let write = db.connect()?;
         let mode = write::write_mode_of(&write).await?;
+        let relaxed = db.connect()?;
+        relaxed.pragma_update("synchronous", "NORMAL").await?;
         let q = query::prepare(
             &Query::select()
                 .column(MetaTable::V)
@@ -248,6 +273,7 @@ impl Turso {
             db,
             mode,
             write: Arc::new(Mutex::new(write)),
+            relaxed: Arc::new(Mutex::new(relaxed)),
             last_stamp: Arc::new(AtomicU64::new(last_stamp)),
             clock: Arc::new(system_millis),
             write_watch: watch::channel(0).0,
@@ -330,11 +356,15 @@ impl Turso {
         i64::try_from((self.clock)() / 1000).unwrap_or(i64::MAX)
     }
 
-    /// Runs one statement on the write connection: on its own in
+    /// Runs one statement on a write connection — the durable one, or the
+    /// relaxed one for cursors and snapshots: on its own in
     /// [`WriteMode::Serial`], as a concurrent transaction (retried on a
     /// conflict) in [`WriteMode::Concurrent`]. The rows affected.
-    async fn write_one(&self, q: Prepared) -> anyhow::Result<u64> {
-        let mut write = self.write.lock().await;
+    async fn write_one(&self, durability: Durability, q: Prepared) -> anyhow::Result<u64> {
+        let mut write = match durability {
+            Durability::Durable => self.write.lock().await,
+            Durability::Relaxed => self.relaxed.lock().await,
+        };
         match self.mode {
             WriteMode::Serial => Ok(query::execute_prepared(&write, &q).await?),
             WriteMode::Concurrent => {
@@ -720,7 +750,7 @@ impl Executor for Turso {
                 )
                 .to_owned(),
         );
-        self.write_one(q).await?;
+        self.write_one(Durability::Relaxed, q).await?;
         Ok(())
     }
 
@@ -750,7 +780,7 @@ impl Executor for Turso {
         );
         // Zero matched rows means the fenced update was a no-op: the key is
         // owned by another worker, disabled, or gone.
-        let affected = self.write_one(q).await?;
+        let affected = self.write_one(Durability::Relaxed, q).await?;
         Ok(affected > 0)
     }
 
@@ -835,7 +865,7 @@ impl Executor for Turso {
                 )
                 .to_owned(),
         );
-        self.write_one(q).await?;
+        self.write_one(Durability::Relaxed, q).await?;
         Ok(())
     }
 
@@ -855,7 +885,7 @@ impl Executor for Turso {
                 .and_where(Expr::col(SnapshotTable::Id).eq(id))
                 .to_owned(),
         );
-        self.write_one(q).await?;
+        self.write_one(Durability::Relaxed, q).await?;
         Ok(())
     }
 
@@ -873,7 +903,7 @@ impl Executor for Turso {
                 .and_where(Expr::col(EventTable::AggregatorId).eq(aggregate_id))
                 .to_owned(),
         );
-        self.write_one(q).await?;
+        self.write_one(Durability::Durable, q).await?;
         Ok(())
     }
 }

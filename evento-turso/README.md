@@ -30,6 +30,10 @@ let ephemeral = evento_turso::Turso::in_memory().await?;
 Like the fjall backend, a `Turso` serializes its writes on one connection and stamps
 them with a monotonic commit clock, so events are totally ordered without a stability
 watermark. The clock is injectable (`Turso::with_clock`) for deterministic simulations.
+Events are committed with `synchronous = FULL`; subscription cursors and snapshots go
+through a second connection with `synchronous = NORMAL` (a power cut may lose the last
+of them: a subscription then takes a few events again, a snapshot is rebuilt), so the
+acknowledgement every subscription makes per event costs no fsync.
 Other writers of the same database (your read models, the accord journal) need the
 store opened in [concurrent mode](#concurrent-writes-several-writers-one-database).
 
