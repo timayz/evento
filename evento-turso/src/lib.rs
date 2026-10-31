@@ -6,9 +6,11 @@
 //! - [`Turso`] — the [`Executor`](evento_core::Executor): events, snapshots,
 //!   subscriptions, keyset-paginated reads.
 //! - [`MIGRATIONS`] / [`migrate`] — the schema, applied by [`Turso::open`] or
-//!   by hand, tracked in the database's `PRAGMA user_version`.
+//!   by hand, recorded per app so an application's own migrations can share
+//!   the database.
 //! - [`TursoJournal`] (feature `accord`) — the accord consensus journal, in the
-//!   same database as the events or in one of its own.
+//!   same database as the events or in one of its own, with its own
+//!   [`ACCORD_MIGRATIONS`].
 //!
 //! ```rust,no_run
 //! # async fn run() -> anyhow::Result<()> {
@@ -21,7 +23,7 @@
 //! # Features
 //!
 //! - `rw` (default) — `evento_core::Rw` / `Sidecar` wrappers and [`RwTurso`].
-//! - `accord` — [`TursoJournal`], and the accord tables in [`MIGRATIONS`].
+//! - `accord` — [`TursoJournal`] and [`ACCORD_MIGRATIONS`].
 //! - `tracing` — logs from the migration runner.
 
 #![forbid(unsafe_code)]
@@ -51,31 +53,19 @@ pub type RwTurso = evento_core::Rw<Turso, Turso>;
 /// The event store schema: `event`, `snapshot`, `subscriber` and `meta`.
 const INIT: Migration<'static> = up_file!("../migrations/0001_init.sql");
 
-/// The accord journal's tables, as a migration (feature `accord`).
+/// The accord journal's tables (feature `accord`).
 #[cfg(feature = "accord")]
 const ACCORD: Migration<'static> = up_file!("../migrations/0002_accord.sql");
 
-/// The accord journal's DDL (`IF NOT EXISTS`), run by
-/// [`TursoJournal::migrate`] on its own.
-#[cfg(feature = "accord")]
-pub(crate) const ACCORD_DDL: &str = include_str!("../migrations/0002_accord.sql");
+/// The event store's schema migrations, under the app name `evento`;
+/// [`Turso::open`] applies the pending ones. Each applied migration is
+/// recorded in [`migrate::MIGRATIONS_TABLE`], so an application's own
+/// [`Migrations`] (under its own name) can share the database.
+pub const MIGRATIONS: Migrations<'static> = Migrations::new("evento", &[INIT]);
 
-/// The schema migrations, in order; [`Turso::open`] applies the pending ones.
-/// Each one is tracked in the database's `PRAGMA user_version`.
-///
-/// With the `accord` feature the list also holds the consensus journal's
-/// tables, so a database migrated by an `accord` build is at `user_version`
-/// 2: opening it from a build without the feature fails with
-/// [`MigrationError::InvalidUserVersion`](migrate::MigrationError::InvalidUserVersion).
-#[cfg(not(feature = "accord"))]
-pub const MIGRATIONS: Migrations<'static> = Migrations::new(&[INIT]);
-
-/// The schema migrations, in order; [`Turso::open`] applies the pending ones.
-/// Each one is tracked in the database's `PRAGMA user_version`.
-///
-/// With the `accord` feature the list also holds the consensus journal's
-/// tables, so a database migrated by an `accord` build is at `user_version`
-/// 2: opening it from a build without the feature fails with
-/// [`MigrationError::InvalidUserVersion`](migrate::MigrationError::InvalidUserVersion).
+/// The accord journal's schema migrations, under the app name
+/// `evento-accord`; every [`TursoJournal`] constructor applies the pending
+/// ones. Independent of [`MIGRATIONS`], so a journal can live in the store's
+/// database or in one of its own.
 #[cfg(feature = "accord")]
-pub const MIGRATIONS: Migrations<'static> = Migrations::new(&[INIT, ACCORD]);
+pub const ACCORD_MIGRATIONS: Migrations<'static> = Migrations::new("evento-accord", &[ACCORD]);

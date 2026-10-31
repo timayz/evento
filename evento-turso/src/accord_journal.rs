@@ -165,12 +165,18 @@ impl std::fmt::Debug for TursoJournal {
 }
 
 impl TursoJournal {
-    /// Wraps a database as a journal: one shared with a
-    /// [`Turso`](crate::Turso) store (`TursoJournal::new(store.database().clone())`,
-    /// whose [`MIGRATIONS`](crate::MIGRATIONS) created the tables), or one
-    /// whose tables [`migrate`](Self::migrate) creates.
-    pub fn new(db: turso::Database) -> anyhow::Result<Self> {
-        let write = db.connect()?;
+    /// Wraps a database as a journal and applies its pending
+    /// [`ACCORD_MIGRATIONS`](crate::ACCORD_MIGRATIONS): one shared with a
+    /// [`Turso`](crate::Turso) store (`TursoJournal::new(store.database().clone())`)
+    /// or one of its own.
+    pub async fn new(db: turso::Database) -> anyhow::Result<Self> {
+        let mut write = db.connect()?;
+        crate::ACCORD_MIGRATIONS
+            .to_latest(&mut write)
+            .await
+            .map_err(|(applied, err)| {
+                anyhow::anyhow!("journal migration failed after {applied} applied: {err}")
+            })?;
         Ok(Self {
             db,
             write: tokio::sync::Mutex::new(write),
@@ -181,37 +187,20 @@ impl TursoJournal {
         })
     }
 
-    /// Opens (creating if absent) a journal of its own at `path`, with its
-    /// tables.
+    /// Opens (creating if absent) a journal of its own at `path`.
     pub async fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path
             .as_ref()
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("journal path is not UTF-8"))?;
         let db = turso::Builder::new_local(path).build().await?;
-        let journal = Self::new(db)?;
-        journal.migrate().await?;
-        Ok(journal)
+        Self::new(db).await
     }
 
-    /// A fresh in-memory journal, with its tables: for tests and simulations.
+    /// A fresh in-memory journal: for tests and simulations.
     pub async fn in_memory() -> anyhow::Result<Self> {
         let db = turso::Builder::new_local(":memory:").build().await?;
-        let journal = Self::new(db)?;
-        journal.migrate().await?;
-        Ok(journal)
-    }
-
-    /// Creates the journal's tables if absent (idempotent): the same DDL the
-    /// `accord` migration of [`MIGRATIONS`](crate::MIGRATIONS) applies, for a
-    /// journal in a database of its own.
-    pub async fn migrate(&self) -> anyhow::Result<()> {
-        self.write
-            .lock()
-            .await
-            .execute_batch(crate::ACCORD_DDL)
-            .await?;
-        Ok(())
+        Self::new(db).await
     }
 
     /// The underlying database.
