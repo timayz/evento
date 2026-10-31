@@ -8,8 +8,12 @@
 //! storage: a restart loses its journal's unflushed tail, fsyncs, truncates
 //! and applies fail at seeded rates, and a restarted node may keep its data
 //! store — the production `ExecutorDataStore`, over [`SimExecutor`], may come
-//! back behind its journal ([`Faults`]). A pass validates the harness and the
-//! oracles, and any failure is a real bug.
+//! back behind its journal ([`Faults`]). A node's store and journal are
+//! in-memory doubles, or ([`StoreKind::Turso`]) the real SQL store and SQL
+//! journal of `evento-turso` on in-memory Turso databases — pure Rust and
+//! in-process, so the SQL paths run under the faults and the seed still
+//! replays. A pass validates the harness and the oracles, and any failure is
+//! a real bug.
 //!
 //! **Deterministic runtime.** The tests run under `#[tokio::test(start_paused =
 //! true)]`: a single-threaded runtime with *virtual* time that advances only
@@ -79,6 +83,7 @@ use std::time::Duration;
 mod common;
 
 use common::executor::SimExecutor;
+use common::inline::block_inline;
 use common::journal::{FaultJournal, JournalFaults};
 use common::store::{FaultStore, Outcomes};
 use evento_accord::{
@@ -87,8 +92,10 @@ use evento_accord::{
     MessageSink, Node, NodeConfig, NodeId, PartialSnapshot, StaticTopology, Status, Timestamp,
     Topology, TraceEntry, TxnId, MAX_SKEW_MICROS, SLOTS,
 };
+use evento_core::cursor::Args;
 use evento_core::metadata::Metadata;
-use evento_core::Event;
+use evento_core::{Event, Executor, TenantFilter};
+use evento_turso::{Turso, TursoJournal};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
@@ -242,6 +249,10 @@ enum StoreKind {
     Memory,
     /// The production `ExecutorDataStore`, over a [`SimExecutor`] (#316).
     Executor,
+    /// The production `ExecutorDataStore` over the real SQL store, a
+    /// [`Turso`] on an in-memory database — and the real SQL journal, a
+    /// [`TursoJournal`] on another: the SQL paths under the faults.
+    Turso,
 }
 
 /// A node's data store: what the node writes through — the backend behind
@@ -256,11 +267,13 @@ struct SimStore {
 enum Backend {
     Memory(Arc<InMemoryDataStore>),
     Executor(SimExecutor),
+    Turso(Turso),
 }
 
 impl SimStore {
-    /// A store of `kind` recording its outcomes in `outcomes`.
-    fn new(kind: StoreKind, outcomes: &Arc<Outcomes>) -> Self {
+    /// A store of `kind` recording its outcomes in `outcomes`; a Turso store
+    /// stamps from the virtual clock over `base`.
+    async fn new(kind: StoreKind, outcomes: &Arc<Outcomes>, base: tokio::time::Instant) -> Self {
         let (node, backend): (Arc<dyn DataStore>, _) = match kind {
             StoreKind::Memory => {
                 let memory = Arc::new(InMemoryDataStore::new());
@@ -271,6 +284,17 @@ impl SimStore {
                 (
                     Arc::new(ExecutorDataStore::new(executor.clone())),
                     Backend::Executor(executor),
+                )
+            }
+            StoreKind::Turso => {
+                let micros = virtual_micros(base);
+                let turso = Turso::in_memory()
+                    .await
+                    .expect("an in-memory Turso store opens")
+                    .with_clock(move || micros() / 1000);
+                (
+                    Arc::new(ExecutorDataStore::new(turso.clone())),
+                    Backend::Turso(turso),
                 )
             }
         };
@@ -291,6 +315,7 @@ impl SimStore {
         match &self.backend {
             Backend::Memory(memory) => memory.committed_events(),
             Backend::Executor(executor) => executor.committed_events(),
+            Backend::Turso(turso) => block_inline(turso_committed_events(turso)),
         }
     }
 
@@ -311,7 +336,47 @@ impl SimStore {
         match &self.backend {
             Backend::Memory(memory) => memory.version("", aggregate_type, aggregate_id).await,
             Backend::Executor(executor) => Ok(executor.version_of(aggregate_type, aggregate_id)),
+            Backend::Turso(turso) => {
+                turso
+                    .latest_version(String::new(), aggregate_type.into(), aggregate_id.into())
+                    .await
+            }
         }
+    }
+}
+
+/// Every `(tenant, type, id, version)` a Turso store holds and the id of its
+/// event, read through the executor a page at a time.
+async fn turso_committed_events(turso: &Turso) -> Vec<((String, String, String, u16), ulid::Ulid)> {
+    let mut events = Vec::new();
+    let mut after = None;
+    loop {
+        let page = turso
+            .read(
+                None,
+                None,
+                TenantFilter::All,
+                Args::forward(1_000, after),
+                None,
+            )
+            .await
+            .expect("an in-memory Turso store reads");
+        events.extend(page.edges.iter().map(|edge| {
+            let e = &edge.node;
+            (
+                (
+                    e.tenant.clone(),
+                    e.aggregate_type.clone(),
+                    e.aggregate_id.clone(),
+                    e.version,
+                ),
+                e.id,
+            )
+        }));
+        if !page.page_info.has_next_page {
+            return events;
+        }
+        after = page.page_info.end_cursor;
     }
 }
 
@@ -322,8 +387,9 @@ enum Restart {
     /// Empty: the node replays its journal into a fresh store — a store that
     /// is not durable (in memory); a durable one lost is a rejoin.
     EmptyStore,
-    /// As it was: a SQLite or fjall store survives a restart — possibly
-    /// ahead of the journal, holding an apply whose record was not flushed.
+    /// As it was: a Turso, SQLite or fjall store survives a restart —
+    /// possibly ahead of the journal, holding an apply whose record was not
+    /// flushed.
     KeepStore,
     /// As it was, less what it had not persisted (a [`SimExecutor`] store
     /// only): a store **behind** its journal, the case #309 suspects.
@@ -434,43 +500,47 @@ impl Drop for Sim {
 }
 
 impl Sim {
-    fn build(n: u64) -> Self {
-        Self::build_with(SimOptions::new(n))
+    async fn build(n: u64) -> Self {
+        Self::build_with(SimOptions::new(n)).await
     }
 
     /// Builds a cluster where node `skewed`'s clock runs `skew` microseconds ahead
     /// of the others — to exercise bounded clock-skew handling.
-    fn build_with_skew(n: u64, skewed: usize, skew: u64) -> Self {
+    async fn build_with_skew(n: u64, skewed: usize, skew: u64) -> Self {
         Self::build_with(SimOptions {
             skew: Some((skewed, skew)),
             ..SimOptions::new(n)
         })
+        .await
     }
 
     /// Builds a cluster with a custom [`NodeConfig`] on every node.
-    fn build_with_config(n: u64, config: NodeConfig) -> Self {
+    async fn build_with_config(n: u64, config: NodeConfig) -> Self {
         Self::build_with(SimOptions {
             config,
             ..SimOptions::new(n)
         })
+        .await
     }
 
     /// Builds a cluster with a shared fast-path electorate, to exercise the
     /// shrunk-electorate consensus & recovery paths under the oracles.
-    fn build_with_electorate(n: u64, electorate: Vec<NodeId>) -> Self {
+    async fn build_with_electorate(n: u64, electorate: Vec<NodeId>) -> Self {
         Self::build_with(SimOptions {
             electorate: Some(electorate),
             ..SimOptions::new(n)
         })
+        .await
     }
 
     /// Builds a cluster over [`DynamicTopology`] — one shard of every node,
     /// at epoch 0 — whose epochs the scenario changes. Not restartable.
-    fn build_dynamic(n: u64) -> Self {
+    async fn build_dynamic(n: u64) -> Self {
         Self::build_with(SimOptions {
             dynamic: true,
             ..SimOptions::new(n)
         })
+        .await
     }
 
     /// The execution trace so far (see [`RunTrace`]).
@@ -574,7 +644,7 @@ impl Sim {
         found.into_iter().flatten().collect()
     }
 
-    fn build_with(options: SimOptions) -> Self {
+    async fn build_with(options: SimOptions) -> Self {
         init_tracing();
         let SimOptions {
             n,
@@ -605,8 +675,8 @@ impl Sim {
                 _ => Arc::new(HybridLogicalClock::with_physical(id, virtual_micros(base))),
             };
             let sink: Arc<dyn MessageSink> = Arc::new(net.sink(id));
-            let store = SimStore::new(store_kind, &outcomes);
-            let journal = Arc::new(FaultJournal::new());
+            let store = SimStore::new(store_kind, &outcomes, base).await;
+            let journal = Arc::new(Self::new_journal(store_kind).await);
             let topology: Arc<dyn Topology> = if dynamic {
                 let topology = Arc::new(DynamicTopology::new(id, 0, shards.clone()));
                 topologies.push(Arc::clone(&topology));
@@ -648,6 +718,20 @@ impl Sim {
             storage: None,
             outcomes,
             live,
+        }
+    }
+
+    /// A node's journal for stores of `kind`: the in-memory journal, or — with
+    /// a Turso store — the real SQL journal on an in-memory Turso database of
+    /// its own (a node's journal and store are lost and kept independently).
+    async fn new_journal(kind: StoreKind) -> FaultJournal {
+        match kind {
+            StoreKind::Memory | StoreKind::Executor => FaultJournal::new(),
+            StoreKind::Turso => FaultJournal::over_turso(
+                TursoJournal::in_memory()
+                    .await
+                    .expect("an in-memory Turso journal opens"),
+            ),
         }
     }
 
@@ -728,7 +812,7 @@ impl Sim {
         };
         let store = match mode {
             Restart::EmptyStore => {
-                let store = SimStore::new(self.store_kind, &self.outcomes);
+                let store = SimStore::new(self.store_kind, &self.outcomes, self.base).await;
                 self.arm_store(i, &store);
                 store
             }
@@ -737,7 +821,9 @@ impl Sim {
                 let store = self.stores[i].clone();
                 match &store.backend {
                     Backend::Executor(executor) => executor.crash(),
-                    Backend::Memory(_) => panic!("only an executor store loses a tail"),
+                    Backend::Memory(_) | Backend::Turso(_) => {
+                        panic!("only an executor store loses a tail")
+                    }
                 }
                 store
             }
@@ -1120,7 +1206,7 @@ async fn run_scenario(seed: u64) -> Result<RunTrace, String> {
     const WRITERS: usize = 4;
     const WRITES_EACH: usize = 12;
 
-    let mut sim = Sim::build(N);
+    let mut sim = Sim::build(N).await;
     let history: History = Arc::new(Mutex::new(Vec::new()));
 
     // Pre-generate the seeded plans so the scenario is seed-derived.
@@ -1345,7 +1431,7 @@ async fn run_adversarial(seed: u64, faults: Faults) -> Adversarial {
     const WRITES_EACH: usize = 12;
     const MAX_DOWN: usize = 2; // keep a quorum (3 of 5) alive
 
-    let mut sim = Sim::build(N);
+    let mut sim = Sim::build(N).await;
     faults.arm(&mut sim, seed);
     let clients = Clients::new(&sim);
 
@@ -1506,8 +1592,8 @@ async fn run_partition(seed: u64, electorate: Option<Vec<NodeId>>, faults: Fault
     const WRITES_EACH: usize = 12;
 
     let mut sim = match electorate {
-        Some(e) => Sim::build_with_electorate(N, e),
-        None => Sim::build(N),
+        Some(e) => Sim::build_with_electorate(N, e).await,
+        None => Sim::build(N).await,
     };
     faults.arm(&mut sim, seed);
     let clients = Clients::new(&sim);
@@ -1932,7 +2018,8 @@ async fn run_with_restarts(seed: u64, faults: Faults, store: StoreKind) -> Adver
     let mut sim = Sim::build_with(SimOptions {
         store,
         ..SimOptions::new(N)
-    });
+    })
+    .await;
     faults.arm(&mut sim, seed);
     let clients = Clients::new(&sim);
 
@@ -1963,13 +2050,16 @@ async fn run_with_restarts(seed: u64, faults: Faults, store: StoreKind) -> Adver
         .iter()
         .map(|_| match (faults.storage.is_some(), store) {
             (false, StoreKind::Memory) => Restart::EmptyStore,
-            (false, StoreKind::Executor) => Restart::KeepStore,
+            (false, StoreKind::Executor | StoreKind::Turso) => Restart::KeepStore,
             (true, StoreKind::Memory) => {
                 [Restart::EmptyStore, Restart::KeepStore][modes.random_range(0..2)]
             }
             (true, StoreKind::Executor) => {
                 [Restart::KeepStore, Restart::KeepStoreLoseTail][modes.random_range(0..2)]
             }
+            // A Turso store is durable and commits whole: it comes back as it
+            // was.
+            (true, StoreKind::Turso) => Restart::KeepStore,
         })
         .collect();
 
@@ -2065,7 +2155,7 @@ async fn run_amnesia(seed: u64, faults: Faults) -> Adversarial {
     /// The longest a rejoin may take before the run counts it stalled.
     const REJOIN_LIMIT: Duration = Duration::from_secs(120);
 
-    let mut sim = Sim::build(N);
+    let mut sim = Sim::build(N).await;
     faults.arm(&mut sim, seed);
     let clients = Clients::new(&sim);
 
@@ -2198,7 +2288,8 @@ async fn run_sharded_amnesia(seed: u64, faults: Faults) -> Adversarial {
         dynamic: true,
         layout: Some(layout.clone()),
         ..SimOptions::new(N)
-    });
+    })
+    .await;
     // Epoch 1 before anything else: config-Paxos state the amnesiacs must
     // read back, decided over sound links.
     sim.nodes[0]
@@ -2469,7 +2560,7 @@ async fn run_rollback(seed: u64, faults: Faults) -> Adversarial {
     /// view, or to hear it rolled back.
     const NOTICE_LIMIT: Duration = Duration::from_secs(60);
 
-    let mut sim = Sim::build(N);
+    let mut sim = Sim::build(N).await;
     faults.arm(&mut sim, seed);
     let clients = Clients::new(&sim);
 
@@ -2626,7 +2717,7 @@ async fn a_recovery_decides_what_only_an_amnesiac_and_one_replica_accepted() {
         recovery_timeout: Duration::from_secs(3600),
         ..NodeConfig::default()
     };
-    let mut sim = Sim::build_with_config(3, config);
+    let mut sim = Sim::build_with_config(3, config).await;
     let mut coordinator = sim.net.register(ORPHAN_COORDINATOR);
     let txn = TxnId(Timestamp {
         micros: (tokio::time::Instant::now() - sim.base).as_micros() as u64,
@@ -2792,7 +2883,7 @@ async fn safety_holds_under_restarts_and_message_faults() {
 /// unpersisted tail and come back behind its journal.
 #[tokio::test(start_paused = true)]
 async fn safety_holds_under_restarts_and_storage_faults() {
-    for store in [StoreKind::Memory, StoreKind::Executor] {
+    for store in [StoreKind::Memory, StoreKind::Executor, StoreKind::Turso] {
         for (seed, _replay) in sim_seeds("safety_holds_under_restarts_and_storage_faults", 0..20) {
             let result = run_with_restarts(seed, Faults::STORAGE, store).await;
             if let Some(v) = result.safety {
@@ -2885,7 +2976,7 @@ async fn run_probe(seed: u64) -> Probe {
     const WRITES_EACH: usize = 10;
     const MAX_DOWN: usize = 2;
 
-    let sim = Sim::build(N);
+    let sim = Sim::build(N).await;
     let history: History = Arc::new(Mutex::new(Vec::new()));
 
     let mut rng = StdRng::seed_from_u64(seed);
@@ -3037,7 +3128,7 @@ async fn every_scenario_kind_replays_its_trace() {
             })
             .await;
         }
-        for store in [StoreKind::Memory, StoreKind::Executor] {
+        for store in [StoreKind::Memory, StoreKind::Executor, StoreKind::Turso] {
             assert_replays(
                 &format!("restarts +storage {store:?}"),
                 seed,
@@ -3078,7 +3169,7 @@ async fn run_bounded(seed: u64) -> Result<RunTrace, String> {
     const WRITERS: usize = 4;
     const WRITES_EACH: usize = 12;
 
-    let mut sim = Sim::build(N);
+    let mut sim = Sim::build(N).await;
     let history: History = Arc::new(Mutex::new(Vec::new()));
 
     let mut rng = StdRng::seed_from_u64(seed);
@@ -3182,7 +3273,8 @@ async fn partitioned_minority_cannot_unblock_compaction_and_diverge() {
             anti_entropy_interval: Duration::from_secs(2),
             ..NodeConfig::default()
         },
-    );
+    )
+    .await;
 
     // Baseline: healthy-cluster writes still compact away with the coverage
     // clamp in place (liveness of the fix itself).
@@ -3282,7 +3374,7 @@ async fn run_skew(seed: u64) -> Result<RunTrace, String> {
     const SKEW_MICROS: u64 = 150_000; // 150ms, within MAX_SKEW (200ms)
     const SKEWED: usize = 2;
 
-    let mut sim = Sim::build_with_skew(N, SKEWED, SKEW_MICROS);
+    let mut sim = Sim::build_with_skew(N, SKEWED, SKEW_MICROS).await;
     let history: History = Arc::new(Mutex::new(Vec::new()));
 
     let mut rng = StdRng::seed_from_u64(seed);
@@ -3369,7 +3461,7 @@ async fn run_healthy_high_timeout(seed: u64) -> Result<u64, String> {
         recovery_timeout: Duration::from_secs(3600),
         ..NodeConfig::default()
     };
-    let mut sim = Sim::build_with_config(N, config);
+    let mut sim = Sim::build_with_config(N, config).await;
     let history: History = Arc::new(Mutex::new(Vec::new()));
 
     let mut rng = StdRng::seed_from_u64(seed);
@@ -3454,7 +3546,7 @@ async fn failure_detector_recovers_a_crashed_coordinator() {
         recovery_timeout: Duration::from_secs(3600),
         ..NodeConfig::default()
     };
-    let sim = Sim::build_with_config(5, config);
+    let sim = Sim::build_with_config(5, config).await;
 
     // Warm up: several gossip rounds give the peers a heartbeat baseline for node 0.
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -3500,7 +3592,7 @@ async fn suspicion_rig() -> Sim {
         recovery_timeout: Duration::from_secs(3600),
         ..NodeConfig::default()
     };
-    let sim = Sim::build_with_config(3, config);
+    let sim = Sim::build_with_config(3, config).await;
     for seq in 1..=9u64 {
         let coord = (seq % 3) as usize;
         sim.nodes[coord]
@@ -3553,7 +3645,7 @@ async fn a_node_that_hears_from_no_one_suspects_no_one() {
 /// write conflicts, and the transport/journal counters advance.
 #[tokio::test(start_paused = true)]
 async fn metrics_track_cluster_activity() {
-    let sim = Sim::build(5);
+    let sim = Sim::build(5).await;
 
     // Three clean, non-conflicting writes through node 0.
     for v in 1..=3u16 {
@@ -3623,7 +3715,7 @@ async fn run_churn(seed: u64) -> ChurnProbe {
 
     // One shard with every node, identical across epochs — only the epoch
     // advances. The recovery loop drives the metadata-log catch-up sweep.
-    let mut sim = Sim::build_dynamic(N);
+    let mut sim = Sim::build_dynamic(N).await;
     let layout = vec![sim.ids.clone()];
     let net = Arc::clone(&sim.net);
     let nodes = &sim.nodes;
@@ -3993,10 +4085,10 @@ impl SwarmConfig {
             messages,
             storage,
             skew,
-            store: if rng.random_bool(0.5) {
-                StoreKind::Executor
-            } else {
-                StoreKind::Memory
+            store: match rng.random_range(0..3) {
+                0 => StoreKind::Executor,
+                1 => StoreKind::Turso,
+                _ => StoreKind::Memory,
             },
             aggs: rng.random_range(1..=8),
             clients: rng.random_range(1..=8),
@@ -4023,7 +4115,8 @@ async fn run_swarm(seed: u64, shape: &SwarmConfig) -> Adversarial {
         config: shape.config,
         store: shape.store,
         ..SimOptions::new(shape.n)
-    });
+    })
+    .await;
     let faults = Faults {
         messages: shape.messages,
         one_way: false,
@@ -4225,6 +4318,7 @@ async fn run_swarm(seed: u64, shape: &SwarmConfig) -> Adversarial {
             (false, _) => Restart::KeepStore,
             (true, StoreKind::Memory) => Restart::EmptyStore,
             (true, StoreKind::Executor) => Restart::KeepStoreLoseTail,
+            (true, StoreKind::Turso) => Restart::KeepStore,
         };
         sim.restart_as(node, shape.config, mode).await;
     }
@@ -4418,7 +4512,7 @@ async fn sweep_for_bugs() {
         }
         // Restarts over failing storage, on both stores, alone and with every
         // network fault on top.
-        for store in [StoreKind::Memory, StoreKind::Executor] {
+        for store in [StoreKind::Memory, StoreKind::Executor, StoreKind::Turso] {
             for (label, faults) in [
                 ("+storage", Faults::STORAGE),
                 (
@@ -4506,7 +4600,7 @@ impl Sim {
         contact: NodeId,
         config: NodeConfig,
     ) -> anyhow::Result<()> {
-        let store = SimStore::new(self.store_kind, &self.outcomes);
+        let store = SimStore::new(self.store_kind, &self.outcomes, self.base).await;
         self.arm_store(i, &store);
         self.try_rejoin_over(i, contact, config, store.data_store(), store)
             .await
@@ -4525,7 +4619,7 @@ impl Sim {
     /// its epoch up.
     async fn lose_journal(&mut self, i: usize) -> Result<(), String> {
         self.nodes[i].retire().await;
-        self.journals[i] = Arc::new(FaultJournal::new());
+        self.journals[i] = Arc::new(Self::new_journal(self.store_kind).await);
         self.arm_journal(i);
         self.reopen_joining(i).await
     }
@@ -4588,7 +4682,7 @@ impl Sim {
         let id = self.ids[i];
         self.rebuild_topology(i);
         let inbox = self.net.register(id);
-        let store = SimStore::new(self.store_kind, &self.outcomes);
+        let store = SimStore::new(self.store_kind, &self.outcomes, self.base).await;
         self.arm_store(i, &store);
         // A recovery its storage fails fails the open, and its host opens
         // the node again: the faults are seeded rates, so one soon passes.
@@ -4736,7 +4830,7 @@ async fn an_absent_peer_stops_holding_compaction_back() {
 async fn absent_peer_rejoins() -> RunTrace {
     const HOT: &str = "hot";
     let config = absence_config(Duration::from_secs(2));
-    let mut sim = Sim::build_with_config(3, config);
+    let mut sim = Sim::build_with_config(3, config).await;
 
     for version in 1..=3u16 {
         sim.nodes[0]
@@ -4808,7 +4902,7 @@ async fn absent_peer_rejoins() -> RunTrace {
 async fn a_rejoined_peer_is_counted_again(n: u64) {
     const HOT: &str = "hot";
     let config = absence_config(Duration::from_secs(2));
-    let mut sim = Sim::build_with_config(n, config);
+    let mut sim = Sim::build_with_config(n, config).await;
     let all: Vec<usize> = (0..n as usize).collect();
     let gone = n as usize - 1;
     let survivors: Vec<usize> = (0..gone).collect();
@@ -4903,7 +4997,7 @@ async fn a_peer_rejoining_under_writes_is_counted_again() {
     const HOT: &str = "hot";
     const COLD: &str = "cold";
     let config = absence_config(Duration::from_secs(2));
-    let mut sim = Sim::build_with_config(4, config);
+    let mut sim = Sim::build_with_config(4, config).await;
     let all = [0, 1, 2, 3];
 
     for version in 1..=3u16 {
@@ -5048,7 +5142,7 @@ async fn a_joiner_with_a_slow_disk_keeps_its_contact_holding() {
     const HOT: &str = "hot";
     const COLD: &str = "cold";
     let config = absence_config(Duration::from_secs(2));
-    let mut sim = Sim::build_with_config(4, config);
+    let mut sim = Sim::build_with_config(4, config).await;
     let all = [0, 1, 2, 3];
 
     for version in 1..=3u16 {
@@ -5072,7 +5166,7 @@ async fn a_joiner_with_a_slow_disk_keeps_its_contact_holding() {
     await_rejoin_required(&sim.nodes[3]).await;
 
     let lapse = config.collect_timeout * 4;
-    let store = SimStore::new(StoreKind::Memory, &sim.outcomes);
+    let store = SimStore::new(StoreKind::Memory, &sim.outcomes, sim.base).await;
     let slow = Arc::new(SlowStore {
         inner: store.data_store(),
         delay: lapse + Duration::from_secs(5),
@@ -5126,7 +5220,7 @@ async fn a_joiner_with_a_slow_disk_keeps_its_contact_holding() {
 async fn a_stale_replica_cannot_sync_its_way_back_in() {
     const HOT: &str = "hot";
     let config = absence_config(Duration::from_secs(2));
-    let sim = Sim::build_with_config(4, config);
+    let sim = Sim::build_with_config(4, config).await;
     let all = [0, 1, 2, 3];
 
     for version in 1..=2u16 {
@@ -5165,7 +5259,7 @@ async fn a_stale_replica_cannot_sync_its_way_back_in() {
 #[tokio::test(start_paused = true)]
 async fn a_peer_back_before_anything_compacted_past_it_is_reinstated() {
     const HOT: &str = "hot";
-    let sim = Sim::build_with_config(3, absence_config(Duration::from_secs(2)));
+    let sim = Sim::build_with_config(3, absence_config(Duration::from_secs(2))).await;
 
     for version in 1..=3u16 {
         sim.nodes[0]
@@ -5215,7 +5309,7 @@ async fn a_peer_back_before_anything_compacted_past_it_is_reinstated() {
 async fn a_minority_never_drops_its_way_to_compaction() {
     const HOT: &str = "hot";
     let config = absence_config(Duration::from_secs(2));
-    let mut sim = Sim::build_with_config(3, config);
+    let mut sim = Sim::build_with_config(3, config).await;
 
     for version in 1..=2u16 {
         sim.nodes[0]
@@ -5257,7 +5351,7 @@ async fn a_minority_never_drops_its_way_to_compaction() {
 async fn rejoin_bounds_survive_a_restart() {
     const HOT: &str = "hot";
     let config = absence_config(Duration::from_secs(2));
-    let mut sim = Sim::build_with_config(3, config);
+    let mut sim = Sim::build_with_config(3, config).await;
 
     for version in 1..=2u16 {
         sim.nodes[0]
@@ -5316,7 +5410,7 @@ async fn a_rejoin_through_a_contact_that_vouched_too_low_is_counted_next_time() 
         truncate_interval: Duration::from_secs(600),
         ..absence_config(Duration::from_secs(2))
     };
-    let mut sim = Sim::build_with_config(4, config);
+    let mut sim = Sim::build_with_config(4, config).await;
     let all = [0, 1, 2, 3];
 
     for version in 1..=3u16 {
@@ -5476,7 +5570,7 @@ async fn a_replayed_write_held_decided_waits_for_its_store() {
         truncate_interval: Duration::from_secs(600),
         ..NodeConfig::default()
     };
-    let mut sim = Sim::build_with_config(3, config);
+    let mut sim = Sim::build_with_config(3, config).await;
     restart_over_a_failing_store(&mut sim, config).await;
 
     // Every write is past `recovery_timeout`, many sweeps over.
@@ -5508,7 +5602,7 @@ async fn a_recovery_of_a_write_held_decided_never_sends_its_node_to_rejoin() {
         recovery_timeout: Duration::from_secs(600),
         ..NodeConfig::default()
     };
-    let mut sim = Sim::build_with_config(3, config);
+    let mut sim = Sim::build_with_config(3, config).await;
     let writes = restart_over_a_failing_store(&mut sim, config).await;
 
     let err = sim.nodes[0]
@@ -5574,7 +5668,7 @@ async fn write_backlog(sim: &Sim, down: usize) {
 /// stalled for good.
 #[tokio::test(start_paused = true)]
 async fn a_healed_peer_repairs_a_backlog_over_the_frame_cap() {
-    let sim = Sim::build_with_config(3, paged_config());
+    let sim = Sim::build_with_config(3, paged_config()).await;
     sim.net.set_frame_cap(Some(FRAME_CAP));
     sim.nodes[0]
         .write(vec![event("baseline", 1, 1)])
@@ -5616,7 +5710,7 @@ async fn a_healed_peer_catches_up_a_backlog_in_a_few_rounds() {
         snapshot_page_events: 1,
         ..paged_config()
     };
-    let sim = Sim::build_with_config(3, config);
+    let sim = Sim::build_with_config(3, config).await;
     sim.nodes[0]
         .write(vec![event("baseline", 1, 1)])
         .await
@@ -5653,7 +5747,7 @@ async fn a_healed_peer_catches_up_a_backlog_in_a_few_rounds() {
 #[tokio::test(start_paused = true)]
 async fn a_join_pages_a_command_backlog_over_the_frame_cap() {
     let config = paged_config();
-    let mut sim = Sim::build_with_config(3, config);
+    let mut sim = Sim::build_with_config(3, config).await;
     sim.net.set_frame_cap(Some(FRAME_CAP));
     sim.nodes[0]
         .write(vec![event("baseline", 1, 1)])
@@ -5765,7 +5859,7 @@ async fn run_absence(seed: u64, faults: Faults) -> Adversarial {
         collect_timeout: Duration::from_millis(500),
         ..NodeConfig::default()
     };
-    let mut sim = Sim::build_with_config(N, config);
+    let mut sim = Sim::build_with_config(N, config).await;
     faults.arm(&mut sim, seed);
     let clients = Clients::new(&sim);
 
@@ -5942,7 +6036,7 @@ async fn a_lone_holder_cannot_commit_what_a_peer_compacted_past() {
         recovery_timeout: Duration::from_secs(3600),
         ..NodeConfig::default()
     };
-    let sim = Sim::build_with_config(3, config);
+    let sim = Sim::build_with_config(3, config).await;
     let _coordinator = sim.net.register(ORPHAN_COORDINATOR);
     let txn = orphan_vote(&sim.net, sim.base, 2, event("acc", 1, 1), 0).await;
     // Past the compaction margin, P compacts past T, which it never held.
@@ -6001,7 +6095,7 @@ async fn a_lone_holder_cut_off_from_a_compacted_peer_cannot_commit() {
         collect_timeout: Duration::from_millis(200),
         ..NodeConfig::default()
     };
-    let sim = Sim::build_with_config(3, config);
+    let sim = Sim::build_with_config(3, config).await;
     let _coordinator = sim.net.register(ORPHAN_COORDINATOR);
     let txn = orphan_vote(&sim.net, sim.base, 2, event("acc", 1, 1), 0).await;
     sim.net.cut(NodeId(0), NodeId(2));
@@ -6043,7 +6137,7 @@ async fn a_lone_holder_stranded_below_its_peers_compaction_rejoins() {
         collect_timeout: Duration::from_millis(200),
         ..NodeConfig::default()
     };
-    let mut sim = Sim::build_with_config(3, config);
+    let mut sim = Sim::build_with_config(3, config).await;
     let _coordinator = sim.net.register(ORPHAN_COORDINATOR);
     let txn = orphan_vote(&sim.net, sim.base, 2, event("acc", 1, 1), 0).await;
     sim.net.crash(NodeId(2));
@@ -6082,7 +6176,7 @@ async fn a_lone_holder_stranded_below_its_peers_compaction_rejoins() {
 /// decision.
 #[tokio::test(start_paused = true)]
 async fn a_replica_recovers_a_dependency_it_never_witnessed() {
-    let sim = Sim::build(3);
+    let sim = Sim::build(3).await;
     let _coordinator = sim.net.register(ORPHAN_COORDINATOR);
     let now = (tokio::time::Instant::now() - sim.base).as_micros() as u64;
     let stamp = |micros| Timestamp {
@@ -6164,7 +6258,7 @@ async fn restart_after_an_import(mode: Restart) {
         truncate_interval: Duration::from_secs(3600),
         ..NodeConfig::default()
     };
-    let mut sim = Sim::build_with_config(3, config);
+    let mut sim = Sim::build_with_config(3, config).await;
     let _coordinator = sim.net.register(ORPHAN_COORDINATOR);
     let d = orphan_vote(&sim.net, sim.base, 0, event("acc", 1, 1), 0).await;
     let t = TxnId(Timestamp {
@@ -6453,7 +6547,8 @@ async fn run_reshard(seed: u64, shape: &ReshardConfig) -> ReshardRun {
         dynamic: true,
         layout: Some(start.clone()),
         ..SimOptions::new(n)
-    });
+    })
+    .await;
     let faults = Faults {
         messages: shape.messages,
         one_way: false,
@@ -7004,7 +7099,8 @@ async fn a_write_in_flight_outlives_two_removals() {
         dynamic: true,
         layout: Some(vec![vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3)]]),
         ..SimOptions::new(5)
-    });
+    })
+    .await;
     sim.nodes[4].begin_join();
     let to_two_three: LinkFilter = Arc::new(|from, to, message| {
         from == NodeId(1)
@@ -7078,7 +7174,8 @@ async fn a_report_counts_only_under_the_layout_it_was_made_under() {
         dynamic: true,
         layout: Some(vec![vec![NodeId(0), NodeId(1), NodeId(2)]]),
         ..SimOptions::new(4)
-    });
+    })
+    .await;
     sim.nodes[3].begin_join();
     let late = |message: &Message| match message {
         Message::ConfigPrepare { epoch, .. }
@@ -7145,7 +7242,8 @@ async fn coverage_counts_only_under_one_live_layout() {
             vec![NodeId(3), NodeId(4), NodeId(5)],
         ]),
         ..SimOptions::new(6)
-    });
+    })
+    .await;
     let moved = (0..)
         .map(|i| format!("m{i}"))
         .find(|agg| sim.dynamic[0].layout().shard_of(&Key(agg.clone())) == 1)
@@ -7207,7 +7305,8 @@ async fn a_change_waits_for_every_replica_that_keeps_a_moved_slot() {
         dynamic: true,
         layout: Some(vec![vec![NodeId(0), NodeId(1), NodeId(2)]]),
         ..SimOptions::new(4)
-    });
+    })
+    .await;
     sim.nodes[3].begin_join();
     for other in [0, 1, 3] {
         sim.net.partition(NodeId(2), NodeId(other));
