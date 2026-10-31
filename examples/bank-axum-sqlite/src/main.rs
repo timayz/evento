@@ -29,10 +29,10 @@ use bank::{
     account_details, AccountDetailsView, AccountType, BankAccountError, Command, DepositMoney,
     OpenAccount, TransferMoney, WithdrawMoney,
 };
+use evento::migrator::{Migrate, Plan};
 use evento::sql::Sql;
 use serde::Deserialize;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx_migrator::{Migrate, Plan};
 use ulid::Ulid;
 
 type Executor = Sql<sqlx::Sqlite>;

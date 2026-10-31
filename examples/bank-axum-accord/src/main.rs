@@ -45,11 +45,11 @@ use bank::{
     account_details, AccountDetailsView, AccountType, Command, DepositMoney, OpenAccount,
     ReceiveMoney, TransferMoney, WithdrawMoney,
 };
-use evento::Fjall;
-use evento_accord::{
+use evento::accord::{
     serve, AccordExecutor, DataStore, ExecutorDataStore, HybridLogicalClock, InMemoryJournal,
     InMemoryNetwork, Journal, MessageSink, Node, NodeId, StaticTopology, TcpTransport, Topology,
 };
+use evento::Fjall;
 use serde::Deserialize;
 use tokio::sync::mpsc;
 use ulid::Ulid;

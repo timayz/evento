@@ -28,6 +28,8 @@
 //! - `turso` - Embedded SQL storage with Turso (in-process, async SQLite rewrite)
 //! - `turso-fts` - Turso's full-text search (`CREATE INDEX … USING fts`, `MATCH`, `fts_score`)
 //! - `remote` - Client/server executor over framed TCP
+//! - `accord` - Accord consensus replicated executor (alpha); also turns on the
+//!   consensus journal of every enabled local backend (`fjall`, `sqlite`/…, `turso`)
 //! - `lock` - `events.lock` checker that keeps persisted shapes append-only (usually enabled on a dev-dependency)
 //!
 //! # Quick Start
@@ -219,3 +221,15 @@ pub use evento_remote::Address as RemoteAddress;
 /// (requires `lock` feature).
 #[cfg(feature = "lock")]
 pub use evento_lock as lock;
+
+/// Accord consensus protocol: node, transports, journal and data-store traits
+/// (requires `accord` feature). The journals the local backends implement live
+/// next to their executor: `fjall::FjallJournal`, `sql::SqlJournal`,
+/// `turso::TursoJournal`.
+#[cfg(feature = "accord")]
+pub use evento_accord as accord;
+
+/// Replicated executor: writes go through Accord consensus, reads are served
+/// by the local backend.
+#[cfg(feature = "accord")]
+pub use evento_accord::AccordExecutor;

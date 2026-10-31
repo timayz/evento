@@ -69,13 +69,13 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use evento::{Event, Executor, Fjall, WriteError};
-use evento_accord::{
+use evento::accord::{
     serve, AccordExecutor, DataStore, ExecutorDataStore, HybridLogicalClock, Journal,
     JournalRolledBack, LostJournal, MessageSink, Node, NodeConfig, NodeId, PartialSnapshot,
     StaticTopology, TcpTransport, Topology,
 };
-use evento_fjall::FjallJournal;
+use evento::fjall::FjallJournal;
+use evento::{Event, Executor, Fjall, WriteError};
 use serde_json::{json, Value as JsonValue};
 use tokio::sync::mpsc;
 use ulid::Ulid;

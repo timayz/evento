@@ -26,6 +26,7 @@ evento-fjall = { path = "../evento-fjall", optional = true, version = "2.0.0-alp
 evento-turso = { path = "../evento-turso", optional = true, version = "2.0.0-alpha.36" }
 evento-remote = { path = "../evento-remote", optional = true, version = "2.0.0-alpha.36" }
 evento-lock = { path = "../evento-lock", optional = true, version = "2.0.0-alpha.36" }
+evento-accord = { path = "../evento-accord", optional = true, version = "2.0.0-alpha.36" }
 sqlx_migrator = { workspace = true, optional = true }
 
 [dev-dependencies]
@@ -51,6 +52,16 @@ turso = ["evento-turso", "evento-turso/rw", "rw"]
 turso-fts = ["turso", "evento-turso/fts"]
 remote = ["evento-remote"]
 lock = ["evento-lock"]
+# The Accord consensus executor, plus the consensus journal of whichever local
+# backends are enabled (`evento::fjall::FjallJournal`, `evento::sql::SqlJournal`,
+# `evento::turso::TursoJournal`, and the SQL migration for its tables).
+accord = [
+    "dep:evento-accord",
+    "evento-fjall?/accord",
+    "evento-sql?/accord",
+    "evento-sql-migrator?/accord",
+    "evento-turso?/accord",
+]
 
 [lints]
 workspace = true
