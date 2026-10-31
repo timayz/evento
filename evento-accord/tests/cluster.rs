@@ -375,11 +375,12 @@ async fn recovers_a_transaction_whose_coordinator_crashed_after_commit() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn recovery_is_idempotent_with_a_late_original_commit() {
     // A transaction is recovered by node 1; then node 2 also recovers it. The
-    // second recovery must agree on the same outcome, not double-apply.
+    // second recovery must agree on the same outcome, not double-apply. (The
+    // aggregate's first version: a store refuses one past that, #453.)
     let cluster = Cluster::start(3);
 
     let txn = cluster.nodes[0]
-        .coordinate_preaccept(vec![event("acc", 7, "Opened")])
+        .coordinate_preaccept(vec![event("acc", 1, "Opened")])
         .await
         .expect("preaccept reached a quorum");
 

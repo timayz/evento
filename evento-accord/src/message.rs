@@ -1177,6 +1177,7 @@ mod tests {
             life: 3,
             clock_bound: 7,
             vote_fence: ballot.0,
+            born: 0,
         };
         for message in [
             Message::Opened { mark },

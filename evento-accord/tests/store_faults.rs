@@ -119,6 +119,48 @@ async fn an_apply_the_store_failed_is_retried_not_marked_applied() {
     assert_eq!(cluster.nodes[2].command_status(txn), Some(Status::Applied));
 }
 
+/// A store that lost an apply it acknowledged — or was reopened over an
+/// older copy of itself — is behind: the next apply on that aggregate brings
+/// a version more than one past what it holds (#453). The store refuses it
+/// (`StoreBehind`), so nothing is served over the hole, and the node asks to
+/// be rejoined: the missing versions can no longer come from its journal,
+/// and a peer may have compacted them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_store_behind_by_a_version_is_not_served_over_the_hole() {
+    let cluster = start(3, NodeConfig::default());
+    cluster.stores[2]
+        .lose_next_apply
+        .store(true, Ordering::SeqCst);
+
+    let first = cluster.nodes[0]
+        .write(vec![event("acc", 1)])
+        .await
+        .expect("a quorum applied the write")
+        .txn;
+    // Node 2's store acknowledged the apply and kept nothing.
+    assert!(
+        eventually(|| cluster.nodes[2].command_status(first) == Some(Status::Applied)).await,
+        "node 2 never applied the first write"
+    );
+    assert!(cluster.stores[2].applied().is_empty());
+
+    let second = cluster.nodes[0]
+        .write(vec![event("acc", 2)])
+        .await
+        .expect("a quorum applied the write")
+        .txn;
+    assert!(
+        eventually(|| cluster.nodes[2].rejoin_required()).await,
+        "node 2 never asked for a rejoin"
+    );
+    assert_ne!(
+        cluster.nodes[2].command_status(second),
+        Some(Status::Applied),
+        "version 2 was applied over the hole"
+    );
+    assert!(cluster.stores[2].applied().is_empty());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_version_read_the_store_failed_is_not_a_vote() {
     let config = NodeConfig {

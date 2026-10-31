@@ -235,7 +235,7 @@ async fn recovery_under_an_electorate_is_idempotent() {
     let cluster = Cluster::start(5, Some(vec![NodeId(0), NodeId(1), NodeId(2)]));
 
     let txn = cluster.nodes[0]
-        .coordinate_preaccept(vec![event("acc", 7, "Opened")])
+        .coordinate_preaccept(vec![event("acc", 1, "Opened")])
         .await
         .expect("preaccept reached a quorum");
 

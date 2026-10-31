@@ -33,8 +33,10 @@ pub struct Metrics {
     pub journal_flushes: AtomicU64,
     /// Anti-entropy contacts found truncated above what this node vouched
     /// for: the window in between can no longer be shipped to it, so it
-    /// cannot be repaired by anti-entropy (compaction outran repair, or an
-    /// operator compacted by hand).
+    /// cannot be repaired by anti-entropy (compaction outran repair, a
+    /// journal was rolled back unnoticed, or an operator compacted by
+    /// hand). Counted, not acted on: a replica that copied its slots under
+    /// a layout change is in that position legitimately (#453).
     pub sync_contact_truncated: AtomicU64,
     /// Inbound messages handled.
     pub messages_handled: AtomicU64,
@@ -83,8 +85,10 @@ pub struct Metrics {
     /// fence no replica can decide any more (see OPERATIONS §7).
     pub amnesia_joins_refused: AtomicU64,
     /// Times a peer found this node's journal rolled back to an older copy
-    /// (#339): the node stops taking part until its host opens it again
-    /// over an empty journal and store, joining.
+    /// (#339), or found it reporting from another journal than the one it
+    /// ran under — a fresh journal under a known node id (#453): the node
+    /// stops taking part until its host opens it again over an empty
+    /// journal and store, joining.
     pub journals_rolled_back: AtomicU64,
     /// Votes refused for a transaction whose `t0` lies more than two clock
     /// skews past this node's clock: its coordinator's clock runs beyond the

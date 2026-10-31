@@ -609,6 +609,7 @@ where
         life,
         clock_bound,
         vote_fence: timestamp(clock_bound / 2, 0),
+        born: 0,
     };
     assert!(journal.load_peer_marks().await.unwrap().is_empty());
     journal

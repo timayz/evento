@@ -454,6 +454,7 @@ async fn peer_marks_survive_close_reopen_and_truncate() {
         life,
         clock_bound,
         vote_fence: timestamp(clock_bound / 2, 0),
+        born: 0,
     };
     {
         let journal = FjallJournal::open(temp.path()).unwrap();

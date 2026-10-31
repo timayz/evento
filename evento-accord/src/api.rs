@@ -579,6 +579,10 @@ pub struct DurableMark {
     pub clock_bound: u64,
     /// The persisted vote fence (see [`Journal::save_vote_fence`]).
     pub vote_fence: Timestamp,
+    /// The journal's identity: the microseconds at which it was first
+    /// opened (see [`Journal::save_born`]), or 0 for a journal that keeps
+    /// none. Two journals of one node id are told apart by it (#453).
+    pub born: u64,
 }
 
 impl Default for DurableMark {
@@ -588,22 +592,36 @@ impl Default for DurableMark {
             life: 0,
             clock_bound: 0,
             vote_fence: Timestamp::MIN,
+            born: 0,
         }
     }
 }
 
 impl DurableMark {
     /// Whether a journal holding this mark lost nothing a peer saw of it as
-    /// `seen`: it is of a later life, or of the same and at or above it in
-    /// both parts.
+    /// `seen`: it is of a later life, or of the same life, the same journal
+    /// ([`same_journal`](Self::same_journal)) and at or above it in both
+    /// parts.
     pub fn covers(&self, seen: &DurableMark) -> bool {
         match self.life.cmp(&seen.life) {
             std::cmp::Ordering::Greater => true,
             std::cmp::Ordering::Less => false,
             std::cmp::Ordering::Equal => {
-                self.clock_bound >= seen.clock_bound && self.vote_fence >= seen.vote_fence
+                self.same_journal(seen)
+                    && self.clock_bound >= seen.clock_bound
+                    && self.vote_fence >= seen.vote_fence
             }
         }
+    }
+
+    /// Whether this mark and `seen`, of one life, come from one journal: a
+    /// different `born` names another journal under the same node id — a
+    /// fresh file, or another run's — which no bound or fence can tell
+    /// apart from the one before, both being cut from the wall clock
+    /// (#453). A journal that keeps no identity (`born` 0) is given the
+    /// benefit of the doubt.
+    pub fn same_journal(&self, seen: &DurableMark) -> bool {
+        self.born == 0 || seen.born == 0 || self.born == seen.born
     }
 
     /// The highest of both marks: the later life's, or, of one life, the
@@ -616,6 +634,11 @@ impl DurableMark {
                 life: self.life,
                 clock_bound: self.clock_bound.max(other.clock_bound),
                 vote_fence: self.vote_fence.max(other.vote_fence),
+                born: if self.born == 0 {
+                    other.born
+                } else {
+                    self.born
+                },
             },
         }
     }
@@ -759,6 +782,18 @@ pub trait Journal: Send + Sync + 'static {
     async fn save_clock_bound(&self, micros: u64) -> anyhow::Result<()> {
         let _ = micros;
         Ok(())
+    }
+    /// Persists the journal's identity: the microseconds at which it was
+    /// first opened, written once, kept across `truncate` (#453). A journal
+    /// that keeps none (this default) has no identity, and a different
+    /// journal under its node's id goes unnoticed.
+    async fn save_born(&self, micros: u64) -> anyhow::Result<()> {
+        let _ = micros;
+        Ok(())
+    }
+    /// The persisted journal identity, if any (see [`save_born`](Self::save_born)).
+    async fn load_born(&self) -> anyhow::Result<Option<u64>> {
+        Ok(None)
     }
 
     /// The persisted clock bound, if any. The default returns none.
@@ -921,6 +956,41 @@ pub trait Journal: Send + Sync + 'static {
         Ok(Vec::new())
     }
 }
+
+/// A [`DataStore`] refused an apply whose first version of an aggregate is
+/// more than one past the version it holds: the store is **behind** — it
+/// lost an apply it acknowledged, or it was reopened over an older copy of
+/// itself — and the versions in between can no longer come from the
+/// replica's own journal (#453). Returned through `anyhow` by
+/// [`DataStore::apply`]; a node that meets it asks to be rejoined
+/// ([`Node::rejoin_required`](crate::Node::rejoin_required)): anti-entropy
+/// could ship the gap only while a peer still holds it as a command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreBehind {
+    /// The aggregate's tenant.
+    pub tenant: String,
+    /// The aggregate's type.
+    pub aggregate_type: String,
+    /// The aggregate's id.
+    pub aggregate_id: String,
+    /// The version the store holds.
+    pub held: u16,
+    /// The first version the apply brought.
+    pub applied: u16,
+}
+
+impl std::fmt::Display for StoreBehind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the store holds {}/{} (tenant {:?}) at version {} and is handed version {}: it is behind, \
+             and must be rejoined over its journal",
+            self.aggregate_type, self.aggregate_id, self.tenant, self.held, self.applied
+        )
+    }
+}
+
+impl std::error::Error for StoreBehind {}
 
 /// Applied state — the materialised event store on a replica. Backed by an
 /// existing evento backend (`Fjall` / `Sql`). This is where committed
@@ -1636,6 +1706,7 @@ mod tests {
             life,
             clock_bound,
             vote_fence: at(fence),
+            born: 0,
         };
         let seen = mark(0, 500, 300);
         assert!(seen.covers(&seen));

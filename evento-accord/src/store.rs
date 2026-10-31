@@ -14,7 +14,7 @@ use evento_core::Event;
 
 use crate::api::{
     same_event, slot_of, AcceptorRecord, AmnesiaFence, ConfigEntry, CopyState, DataStore,
-    DecisionRecord, DurableMark, FenceRecord, Journal, SLOTS,
+    DecisionRecord, DurableMark, FenceRecord, Journal, StoreBehind, SLOTS,
 };
 use crate::clock::{Ballot, NodeId, Timestamp, TxnId};
 use crate::message::{CommandState, Key};
@@ -110,9 +110,30 @@ impl DataStore for InMemoryDataStore {
         if commit {
             // As a store keyed by version would: an event already in place
             // (a restart replaying its journal over a store that kept it) is
-            // a no-op, a version never goes back down, and another event at
-            // a taken version is refused — before anything is applied.
+            // a no-op, a version never goes back down, another event at a
+            // taken version is refused, and so is a version more than one
+            // past the aggregate's — the store is behind (#453) — before
+            // anything is applied.
+            let mut next: HashMap<(String, String, String), u16> = HashMap::new();
             for event in &events {
+                let key = (
+                    event.tenant.clone(),
+                    event.aggregate_type.clone(),
+                    event.aggregate_id.clone(),
+                );
+                let held = state.versions.get(&key).copied().unwrap_or(0);
+                let expected = next.entry(key).or_insert(held.saturating_add(1));
+                if event.version > *expected {
+                    return Err(StoreBehind {
+                        tenant: event.tenant.clone(),
+                        aggregate_type: event.aggregate_type.clone(),
+                        aggregate_id: event.aggregate_id.clone(),
+                        held,
+                        applied: event.version,
+                    }
+                    .into());
+                }
+                *expected = (*expected).max(event.version.saturating_add(1));
                 let at = (
                     event.tenant.clone(),
                     event.aggregate_type.clone(),
@@ -251,6 +272,9 @@ pub struct InMemoryJournal {
     /// The persisted slot GC epoch (see [`Journal::save_slot_gc`]) — kept
     /// across `truncate`.
     slot_gc: Mutex<Option<u64>>,
+    /// The persisted journal identity (see [`Journal::save_born`]) — kept
+    /// across `truncate`.
+    born: Mutex<Option<u64>>,
 }
 
 impl InMemoryJournal {
@@ -282,6 +306,7 @@ impl InMemoryJournal {
             peer_marks: copy(&self.peer_marks),
             copy_state: copy(&self.copy_state),
             slot_gc: copy(&self.slot_gc),
+            born: copy(&self.born),
         }
     }
 }
@@ -352,6 +377,15 @@ impl Journal for InMemoryJournal {
 
     async fn load_clock_bound(&self) -> anyhow::Result<Option<u64>> {
         Ok(*self.clock_bound.lock().expect("journal poisoned"))
+    }
+
+    async fn save_born(&self, micros: u64) -> anyhow::Result<()> {
+        *self.born.lock().expect("journal poisoned") = Some(micros);
+        Ok(())
+    }
+
+    async fn load_born(&self) -> anyhow::Result<Option<u64>> {
+        Ok(*self.born.lock().expect("journal poisoned"))
     }
 
     async fn save_vote_fence(&self, fence: Timestamp) -> anyhow::Result<()> {
@@ -644,6 +678,7 @@ mod tests {
             life: 0,
             clock_bound,
             vote_fence: Timestamp::MIN,
+            born: 0,
         };
         journal
             .save_peer_marks(&[(NodeId(1), mark(400))])

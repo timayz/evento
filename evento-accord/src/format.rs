@@ -87,7 +87,7 @@ pub const MAGIC: [u8; 2] = *b"Ac";
 /// `Message::ConfigReadReply`). No reader for older versions: evento-accord
 /// has not been released, so a journal of one is wiped and the node
 /// re-bootstrapped.
-pub const FORMAT_VERSION: u8 = 12;
+pub const FORMAT_VERSION: u8 = 13;
 
 /// Length of the fixed header: `MAGIC (2) + version (1) + kind (1)`.
 const HEADER_LEN: usize = 4;
@@ -149,6 +149,9 @@ pub enum RecordKind {
     /// The epoch through which the replica dropped the slots it does not own
     /// (`Journal::save_slot_gc`), as a `u64`.
     SlotGc = 17,
+    /// The journal's identity (`Journal::save_born`): the microseconds at
+    /// which it was first opened, as a `u64`.
+    Born = 18,
 }
 
 impl RecordKind {
@@ -170,6 +173,7 @@ impl RecordKind {
             15 => Some(Self::PeerMarks),
             16 => Some(Self::CopyState),
             17 => Some(Self::SlotGc),
+            18 => Some(Self::Born),
             _ => None,
         }
     }

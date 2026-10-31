@@ -46,6 +46,8 @@ const WATERMARK_KEY: &str = "redundant_before";
 const REJOIN_BOUNDS_KEY: &str = "rejoin_above";
 /// `k` value under which the node's clock bound is stored in `accord_meta`.
 const CLOCK_BOUND_KEY: &str = "clock_bound";
+/// `accord_meta` key of the journal's identity (`Journal::save_born`).
+const BORN_KEY: &str = "born";
 /// `k` value under which the replica's amnesia fence is stored in
 /// `accord_meta`. Untouched by `truncate`.
 const AMNESIA_FENCE_KEY: &str = "amnesia_fence";
@@ -565,6 +567,19 @@ where
     async fn load_clock_bound(&self) -> anyhow::Result<Option<u64>> {
         match self.load_meta(CLOCK_BOUND_KEY).await? {
             Some(bytes) => Ok(Some(decode_tagged(RecordKind::ClockBound, &bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn save_born(&self, micros: u64) -> anyhow::Result<()> {
+        let value = encode_tagged(RecordKind::Born, &micros)?;
+        Self::upsert_meta(&self.pool, &[(BORN_KEY, value.as_slice())]).await?;
+        Ok(())
+    }
+
+    async fn load_born(&self) -> anyhow::Result<Option<u64>> {
+        match self.load_meta(BORN_KEY).await? {
+            Some(bytes) => Ok(Some(decode_tagged(RecordKind::Born, &bytes)?)),
             None => Ok(None),
         }
     }

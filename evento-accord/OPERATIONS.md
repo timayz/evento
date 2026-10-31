@@ -140,12 +140,12 @@ Serve it on an HTTP endpoint (see `bank-axum-accord`'s `/metrics`). Counters:
 | `recoveries` | should be ~0 in a healthy cluster; sustained > 0 = a coordinator is flapping/dead. |
 | `compactions` | should advance over time; **flat** = compaction stalled (a partitioned/behind peer holds the watermark) → backlog grows toward `max_commands`. |
 | `watermark_clamps` | reports held back by sync coverage: by more than `compaction_margin`, or by no coverage proven at all — > 0 while a node re-proves its window (post partition-heal/restart — compaction waits for anti-entropy to repair it); **sustained** growth = coverage never accrues (anti-entropy rounds failing) and compaction stays stalled. A report trailing its coverage by an anti-entropy round, as every report in a healthy cluster does, is not counted (#452). |
-| `sync_contact_truncated` | anti-entropy contacts found truncated above what this node vouched for (its proven coverage, and everything below its durable vote fence): the window in between can no longer be shipped to it, and anti-entropy cannot repair it — compaction outran repair, a journal was rolled back unnoticed (§7), or an operator compacted by hand. Any count = rejoin the node (§7). Never after a healthy restart, whole-group restarts included: what a node vouched for is in its journal, and a peer compacts no further than the reports it heard (#452). |
+| `sync_contact_truncated` | anti-entropy contacts found truncated above what this node vouched for (its proven coverage, and everything below its durable vote fence): the window in between can no longer be shipped to it, and anti-entropy cannot repair it — compaction outran repair, a journal was rolled back unnoticed (§7), or an operator compacted by hand. Counted and logged, not acted on (#453): under a layout change a replica that copied its slots is in that position legitimately — it holds everything below the contact's floor while its fence, raised by its own reports alone, lies below it. A gap that is real surfaces at the next apply on the aggregate (`StoreBehind`, below), which does ask for a rejoin. Outside a layout change, any count = look at the node. Never after a healthy restart, whole-group restarts included: what a node vouched for is in its journal, and a peer compacts no further than the reports it heard (#452). |
 | `journal_flushes` | group-commit activity; **0 while writing** = the journal can't fsync (see §8). |
 | `messages_handled` | liveness/traffic. |
 | `messages_shed` | inbound backpressure drops; sustained > 0 = a node is overloaded or a peer is flooding. |
 | `peers_absent` | shard peers this node stopped waiting for (`peer_absence_limit`); each is a node that was silent for that long. |
-| `rejoins_required` | this node must rejoin: a peer told it to, having given it up while writes it never applied were compacted; or its own recovery found it holding a transaction its peers compacted past, undecided, which no recovery can decide any more. The node is stale until its host rejoins it (§7) — through `Node::rejoin_contact()`, the peer that compacted past what it holds. |
+| `rejoins_required` | this node must rejoin: a peer told it to, having given it up while writes it never applied were compacted; its own recovery found it holding a transaction its peers compacted past, undecided, which no recovery can decide any more; or its store refused an apply as **behind** its journal — a version more than one past what it holds (`StoreBehind`, #453: an apply the store acknowledged and lost, or a store reopened over an older copy of itself). The node is stale until its host rejoins it (§7) — through `Node::rejoin_contact()`, the peer that compacted past what it holds, or any shard peer for a store behind. |
 | `votes_fenced` | votes refused for a transaction this node never witnessed, below its vote fence — what it vouched for (a watermark report, sync coverage, a join's vouch, its subscriptions' stable point) or could vouch for now: typically a recovery by a replica that alone holds the transaction (§3, `compaction_margin`). It never vouches past a transaction a slow quorum of its shard holds unapplied, so such a one still gets its vote (#337). Spikes after a partition heals are expected. |
 | `votes_late` | votes refused to an original coordinator older than the compaction margin, for a transaction this node never witnessed (§3, `compaction_margin`). Spikes after a partition heals are expected; a steady rate means coordinators slower than the margin. |
 | `dependencies_learned` | decisions this node learned from its peers for a transaction it never witnessed, but a command committed here waited on (missed while it was cut off or restarting). Counts after a partition heals are expected; it keeps a stalled execution from waiting on anti-entropy for a transaction no replica can apply yet. |
@@ -153,7 +153,7 @@ Serve it on an HTTP endpoint (see `bank-axum-accord`'s `/metrics`). Counters:
 | `votes_future_dated` | votes refused for a transaction dated more than two clock skews past this node's clock: its coordinator's clock runs beyond the skew bound (§3). Any count = a clock out of bounds; fix its time source. |
 | `amnesia_fences` | times this node opened joining over an empty journal and fenced itself (§7, lost journal). |
 | `amnesia_joins_refused` | joins over a lost journal that found no contact vouching past the fence (`FenceNotCovered`, nothing installed). A few while the contact's report catches up; **steadily rising** = a transaction below the fence no replica can decide any more (§7). |
-| `journals_rolled_back` | times a peer found this node's journal rolled back to an older copy at its open (§7). Any count = the node stopped: delete its journal and store, and open it joining. |
+| `journals_rolled_back` | times a peer found this node's journal rolled back to an older copy at its open, or found it reporting from another journal than the one it ran under — a fresh journal under a known node id (§7, #453). Any count = the node stopped: delete its journal and store, and open it joining. |
 | `config_votes_withheld` | config-Paxos promises and accepts this node withheld: it lost a journal under its node id, and abstains from config Paxos until it restored its votes (§7). **Still rising** long after its join = it cannot hear a majority of the voting acceptors (a partition, or too many acceptors lost their journals at once). |
 | `config_votes_restored` | times this node, back over a lost journal, read a majority of the other acceptors' state and voted in config Paxos again (§7). One per loss. |
 | `snapshot_pages` | snapshot pages this node served to joining peers; a joiner pulls one per `snapshot_page_events` / `snapshot_page_bytes` of the contact's store. |
@@ -535,12 +535,33 @@ refuses anything else before a vote, and a node never installs it.
 - **Node back with a rolled-back journal** (restored from a backup or a VM snapshot, or
   a disk that lost writes it had acknowledged): its peers catch it at its open (#339).
   Every watermark report carries the node's **durable mark** — its journaled clock
-  bound and vote fence, which only rise — and every node keeps the highest it saw
-  from each peer, journaled with its reports. Reopened over a journal below the mark
-  a peer saw, the node is told so (`RolledBack`) and stops taking part:
+  bound and vote fence, which only rise, and the journal's **identity**, the moment
+  it was first opened (`Journal::save_born`, #453) — and every node keeps the highest
+  it saw from each peer, journaled with its reports. Reopened over a journal below the
+  mark a peer saw, the node is told so (`RolledBack`) and stops taking part:
   `Node::rolled_back()` and `rolled_back_signal()` turn on, writes fail with
   `JournalRolledBack`, and `accord_journals_rolled_back_total` counts it. **Retire it,
   delete its journal and its store**, and bring it back as above (lost journal).
+  - **Another journal under the node's id** is caught the same way, at its first
+    report (#453): a node started plainly over an empty journal and store takes
+    itself for a fresh replica and asks nobody, but its mark names a journal its
+    peers never saw under that id, of the same life — a bound and a fence, both
+    cut from the wall clock, could not tell it apart. It happens when a directory
+    is emptied and the node started again while a process of that id still
+    serves over the deleted files (timada's load test, #453): two processes
+    under one id, the orphan holding the group's history and the newcomer none
+    of it. The newcomer is stopped; find and stop the orphan. Never run two
+    processes under one node id; a journal that locks its files (fjall) refuses
+    the second, one that does not (SQLite over deleted files) cannot.
+  - **A store behind its journal** — the files a node reopened over hold the
+    journal but not every apply it made (a store that acknowledged before it
+    persisted, an older copy of the store beside the journal) — is caught at the
+    next apply on an aggregate with a hole: the store refuses a version more than
+    one past what it holds (`StoreBehind`), nothing is served over the hole, and
+    the node asks to be rejoined (`rejoins_required`, through any shard peer).
+    An anti-entropy contact found truncated above what the node vouched for
+    (`sync_contact_truncated`) is only a sign of it: a replica that copied its
+    slots under a layout change is in that position too, holding everything.
   - **What escapes it:** a copy that lost only what the node did after the last
     report its peers heard — about a sweep (`recovery_interval`); a copy taken before
     the node first journaled its vote fence, which a restore puts back at the clock
@@ -632,9 +653,10 @@ through `AccordExecutor`) — split it into several writes.
   the node's promise that the effect is stored. A store that acknowledges first
   (`Fjall::persist_mode(PersistMode::Buffer)`) can come back from a crash behind its
   journal: the node applies again what its journal still holds, and what
-  anti-entropy can ship, but a gap older than both leaves it stalled on that
-  aggregate (a store refuses an event past a missing version) — rejoin it over its
-  journal (§7, lost store).
+  anti-entropy can ship, but a gap older than both is found at the next apply on
+  that aggregate — the store refuses a version more than one past what it holds
+  (`StoreBehind`, #453), nothing is served over the hole, and the node asks to be
+  rejoined over its journal (§7, lost store).
 - **What to back up:** the **event store** (Fjall dir / SQL `event` table — the
   materialized state and read source), per node. A store restored from a backup
   re-syncs its missing tail from peers via anti-entropy — unless its peers have

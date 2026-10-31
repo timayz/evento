@@ -598,6 +598,85 @@ async fn a_whole_group_restart_raises_no_truncation_alarm() {
     assert!(!nodes[1].rejoin_required());
 }
 
+/// A journal that is not the one this node id ran under — a fresh file
+/// under a known id, as a node started over a directory emptied while
+/// another process of that id still served (#453) — is found out at its
+/// first report instead of being taken for a fresh replica: its mark names
+/// another journal of the same life, and the peers saw more of the one
+/// before. The node stops, as over a rolled-back journal, and comes back
+/// joining over an empty journal and store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fresh_journal_under_a_known_node_id_is_found_rolled_back() {
+    use evento_accord::JournalRolledBack;
+
+    let net = InMemoryNetwork::new();
+    let ids: Vec<NodeId> = (0..3).map(NodeId).collect();
+    let open = |id: NodeId, store: Arc<InMemoryDataStore>, journal: Arc<InMemoryJournal>| {
+        let node = Node::new(
+            id,
+            Arc::new(StaticTopology::new(id, ids.clone())) as Arc<dyn Topology>,
+            Arc::new(HybridLogicalClock::new(id)),
+            Arc::new(net.sink(id)),
+            store as Arc<dyn DataStore>,
+            journal as Arc<dyn Journal>,
+        );
+        let tasks = vec![node.start(net.register(id)), node.start_recovery()];
+        (node, tasks)
+    };
+    let stores: Vec<Arc<InMemoryDataStore>> =
+        (0..3).map(|_| Arc::new(InMemoryDataStore::new())).collect();
+    let mut nodes = Vec::new();
+    let mut tasks = Vec::new();
+    for &id in &ids {
+        let (node, node_tasks) = open(
+            id,
+            Arc::clone(&stores[id.0 as usize]),
+            Arc::new(InMemoryJournal::new()),
+        );
+        // As a host opens a node: over its journal, which gets its identity.
+        node.recover_state().await.unwrap();
+        nodes.push(node);
+        tasks.push(node_tasks);
+    }
+    for v in 1..=3 {
+        nodes[0].write(vec![event("acc", v)]).await.unwrap();
+    }
+    for store in &stores {
+        await_version(store, "acc", 3).await;
+    }
+    // The peers heard node 1's reports, and the mark of its journal with them.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Node 1 stops; its files are gone; it is started again plainly, over
+    // an empty journal and store — a fresh replica, as far as it knows.
+    nodes[1].retire().await;
+    for task in &tasks[1] {
+        task.abort();
+    }
+    let (fresh, fresh_tasks) = open(
+        NodeId(1),
+        Arc::new(InMemoryDataStore::new()),
+        Arc::new(InMemoryJournal::new()),
+    );
+    fresh.recover_state().await.unwrap();
+    tasks[1] = fresh_tasks;
+    nodes[1] = fresh;
+
+    // Its first report tells its peers of another journal under its id.
+    for _ in 0..400 {
+        if nodes[1].rolled_back() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        nodes[1].rolled_back(),
+        "a fresh journal under a known node id was taken for a fresh replica"
+    );
+    let err = nodes[1].write(vec![event("acc", 4)]).await.unwrap_err();
+    assert!(err.is::<JournalRolledBack>(), "unexpected error: {err:#}");
+}
+
 /// Waits until `node`, restarted over a journal that holds something, is
 /// confirmed by its peers (#339): until then it takes no write.
 async fn await_confirmed(node: &Node) {

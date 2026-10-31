@@ -59,6 +59,9 @@ pub struct FaultStore {
     pub apply_failing: AtomicBool,
     /// Fails this many applies, then works again.
     pub applies_to_fail: AtomicUsize,
+    /// Loses the next apply: acknowledges it without storing anything, as a
+    /// store that acknowledged before it persisted and then crashed (#453).
+    pub lose_next_apply: AtomicBool,
     pub version_failing: AtomicBool,
     /// Fails every query (`DataStore::read`), as a forwarded read runs one.
     pub read_failing: AtomicBool,
@@ -87,6 +90,7 @@ impl FaultStore {
             memory: None,
             apply_failing: AtomicBool::new(false),
             applies_to_fail: AtomicUsize::new(0),
+            lose_next_apply: AtomicBool::new(false),
             version_failing: AtomicBool::new(false),
             read_failing: AtomicBool::new(false),
             faults: Mutex::new(None),
@@ -163,6 +167,9 @@ impl DataStore for FaultStore {
             || self.seeded_failure()
         {
             anyhow::bail!("simulated write failure");
+        }
+        if self.lose_next_apply.swap(false, Ordering::SeqCst) {
+            return Ok(());
         }
         let recorded = self.outcomes.as_ref().map(|_| events.clone());
         self.inner.apply(txn, execute_at, events, commit).await?;

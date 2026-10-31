@@ -37,7 +37,8 @@ use evento_core::{
 use ulid::Ulid;
 
 use crate::api::{
-    cursor_at, same_event, slot_of, snapshot_event_size, DataStore, SnapshotPage, SLOTS,
+    cursor_at, same_event, slot_of, snapshot_event_size, DataStore, SnapshotPage, StoreBehind,
+    SLOTS,
 };
 use crate::clock::{Timestamp, TxnId};
 use crate::message::Key;
@@ -225,6 +226,37 @@ impl<E: Executor> DataStore for ExecutorDataStore<E> {
     ) -> anyhow::Result<()> {
         if !commit || events.is_empty() {
             return Ok(());
+        }
+        // Each aggregate's first version here is at most one past what the
+        // store holds: Accord applies a key's transactions in their serial
+        // order, so a wider step means the store is behind — it lost an
+        // apply it acknowledged, or is an older copy of itself — and must
+        // not be served over the hole (#453). One indexed read per
+        // aggregate; a version at or below the held one is the idempotent
+        // re-apply checked below.
+        let mut checked: HashSet<(&str, &str, &str)> = HashSet::new();
+        for event in &events {
+            let key = (
+                event.tenant.as_str(),
+                event.aggregate_type.as_str(),
+                event.aggregate_id.as_str(),
+            );
+            if !checked.insert(key) {
+                continue;
+            }
+            let held = self
+                .version(&event.tenant, &event.aggregate_type, &event.aggregate_id)
+                .await?;
+            if event.version > held.saturating_add(1) {
+                return Err(StoreBehind {
+                    tenant: event.tenant.clone(),
+                    aggregate_type: event.aggregate_type.clone(),
+                    aggregate_id: event.aggregate_id.clone(),
+                    held,
+                    applied: event.version,
+                }
+                .into());
+            }
         }
         // `replicate`, not `write`: the node has already stamped the events
         // from the transaction's agreed `execute_at` — the same on every

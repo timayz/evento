@@ -360,6 +360,12 @@ impl Journal for FaultJournal {
     async fn load_clock_bound(&self) -> anyhow::Result<Option<u64>> {
         self.durable.load_clock_bound().await
     }
+    async fn save_born(&self, micros: u64) -> anyhow::Result<()> {
+        self.durable.save_born(micros).await
+    }
+    async fn load_born(&self) -> anyhow::Result<Option<u64>> {
+        self.durable.load_born().await
+    }
     async fn save_vote_fence(&self, fence: Timestamp) -> anyhow::Result<()> {
         self.stage_write(Staged::VoteFence(fence));
         Ok(())
