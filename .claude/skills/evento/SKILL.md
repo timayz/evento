@@ -76,6 +76,9 @@ for a non-column field; `evento::turso::Text<T>` for an enum stored as text) and
 `#[cursor(by_name, Col::X, n)]` wrappers; `evento::turso::Reader::new(select).args(args)
 .execute::<ViewByName>(&conn)` pages them; `evento::turso::{execute, fetch_all,
 fetch_optional, fetch_one}` run sea-query statements on a `conn = executor.connect()?`.
+Full-text search needs the `turso-fts` feature: it is an index, not an FTS5 table —
+`CREATE INDEX t_fts ON t USING fts(a, b)`, `WHERE (a, b) MATCH ?`, and
+`fts_score(a, b, ?1)` / `fts_match(a, b, ?1)` naming every index column, then the query.
 
 ### Remote (client/server split) and executor combinators
 

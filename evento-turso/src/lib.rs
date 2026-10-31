@@ -31,7 +31,17 @@
 //!
 //! - `rw` (default) — `evento_core::Rw` / `Sidecar` wrappers and [`RwTurso`].
 //! - `macro` (default) — the [`FromRow`](derive@FromRow) derive.
+//! - `fts` — Turso's full-text search: `CREATE INDEX … USING fts(cols)` on a
+//!   table, `WHERE (cols) MATCH ?` to filter, `fts_match(cols…, ?)` and
+//!   `fts_score(cols…, ?)` (every column of the index, then the query) to
+//!   filter and rank. Databases this crate opens then have Turso's
+//!   index-method support switched on (see [`Turso::builder`]).
 //! - `macro` (default) — the [`FromRow`](derive@FromRow) derive.
+//! - `fts` — Turso's full-text search: `CREATE INDEX … USING fts(cols)` on a
+//!   table, `WHERE (cols) MATCH ?` to filter, `fts_match(cols…, ?)` and
+//!   `fts_score(cols…, ?)` (every column of the index, then the query) to
+//!   filter and rank. Databases this crate opens then have Turso's
+//!   index-method support switched on (see [`Turso::builder`]).
 //! - `accord` — [`TursoJournal`] and [`ACCORD_MIGRATIONS`].
 //! - `tracing` — logs from the migration runner.
 

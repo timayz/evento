@@ -88,6 +88,19 @@ let page = Reader::new(statement)
 let one: Option<AdminView> = turso::fetch_optional(&conn, &by_id).await?;
 ```
 
+## Full-text search (feature `fts`)
+
+Turso's full-text search is a [tantivy](https://crates.io/crates/tantivy)-backed index on
+a regular table, not an FTS5 virtual table: `CREATE INDEX user_admin_fts ON user_admin
+USING fts(email, full_name)`, then `WHERE (email, full_name) MATCH ?` to filter (as a
+subquery inside a `Reader` select, for a searched page) and
+`SELECT fts_score(email, full_name, ?1) AS score … WHERE fts_match(email, full_name, ?1)
+ORDER BY score DESC` to rank. `fts_match` / `fts_score` name every column of the index,
+then the query: a subset of the columns still matches but scores nothing. The `fts`
+feature (`turso-fts` on the `evento` facade) compiles it in and switches on Turso's
+index-method support for every database this crate opens; a database you build
+yourself goes through `Turso::builder(path)` to get the same.
+
 ## Accord journal
 
 With the `accord` feature the crate also provides `TursoJournal`, the

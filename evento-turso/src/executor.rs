@@ -114,6 +114,19 @@ impl Clone for Turso {
 }
 
 impl Turso {
+    /// A Turso [`Builder`](turso::Builder) for the database at `path`
+    /// (`":memory:"` for an in-memory one) with this crate's defaults: with
+    /// the `fts` feature, Turso's index-method support (which its full-text
+    /// indexes need) is switched on. [`open`](Self::open) and
+    /// [`in_memory`](Self::in_memory) use it; call it yourself to set more
+    /// Turso options before [`from_database`](Self::from_database).
+    pub fn builder(path: &str) -> turso::Builder {
+        let builder = turso::Builder::new_local(path);
+        #[cfg(feature = "fts")]
+        let builder = builder.experimental_index_method(true);
+        builder
+    }
+
     /// Opens (creating if absent) the database at `path` and applies the
     /// pending [`MIGRATIONS`](crate::MIGRATIONS).
     pub async fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
@@ -121,7 +134,7 @@ impl Turso {
             .as_ref()
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("database path is not UTF-8"))?;
-        let db = turso::Builder::new_local(path).build().await?;
+        let db = Self::builder(path).build().await?;
         Self::migrated(db).await
     }
 
@@ -130,7 +143,7 @@ impl Turso {
     /// [`database`](Self::database)) sees the same data; the data goes when
     /// the last handle does.
     pub async fn in_memory() -> anyhow::Result<Self> {
-        let db = turso::Builder::new_local(":memory:").build().await?;
+        let db = Self::builder(":memory:").build().await?;
         Self::migrated(db).await
     }
 

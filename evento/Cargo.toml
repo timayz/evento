@@ -48,6 +48,7 @@ mysql = ["evento-sql/mysql", "evento-sql-migrator/mysql", "sqlx_migrator/mysql"]
 postgres = ["evento-sql/postgres", "evento-sql-migrator/postgres", "sqlx_migrator/postgres"]
 fjall = ["evento-fjall", "evento-fjall/rw", "rw"]
 turso = ["evento-turso", "evento-turso/rw", "rw"]
+turso-fts = ["turso", "evento-turso/fts"]
 remote = ["evento-remote"]
 lock = ["evento-lock"]
 

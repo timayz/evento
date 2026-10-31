@@ -193,13 +193,13 @@ impl TursoJournal {
             .as_ref()
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("journal path is not UTF-8"))?;
-        let db = turso::Builder::new_local(path).build().await?;
+        let db = crate::Turso::builder(path).build().await?;
         Self::new(db).await
     }
 
     /// A fresh in-memory journal: for tests and simulations.
     pub async fn in_memory() -> anyhow::Result<Self> {
-        let db = turso::Builder::new_local(":memory:").build().await?;
+        let db = crate::Turso::builder(":memory:").build().await?;
         Self::new(db).await
     }
 

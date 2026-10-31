@@ -26,6 +26,7 @@
 //! - `postgres` - PostgreSQL support via sqlx
 //! - `fjall` - Embedded key-value storage with Fjall
 //! - `turso` - Embedded SQL storage with Turso (in-process, async SQLite rewrite)
+//! - `turso-fts` - Turso's full-text search (`CREATE INDEX … USING fts`, `MATCH`, `fts_score`)
 //! - `remote` - Client/server executor over framed TCP
 //! - `lock` - `events.lock` checker that keeps persisted shapes append-only (usually enabled on a dev-dependency)
 //!
