@@ -4,7 +4,7 @@ description: >-
   Build event-sourcing / CQRS / DDD features in Rust with the `evento` crate.
   Use when defining aggregates and events, writing commands that commit events,
   building projections/read models, wiring subscriptions, or setting up the
-  SQL/Fjall/remote executor and migrations. Triggers on `#[evento::aggregate]`,
+  SQL/Fjall/Turso/remote executor and migrations. Triggers on `#[evento::aggregate]`,
   `evento::create`/`evento::append`, `Projection`, `SubscriptionBuilder`,
   `Executor`, or a Cargo dependency on `evento`.
 ---
@@ -12,9 +12,9 @@ description: >-
 # Evento — event sourcing in Rust
 
 Evento stores state changes as immutable events and folds them into read models.
-Backends: SQLite / PostgreSQL / MySQL (via `sqlx`), embedded Fjall, a remote
-client/server executor (`remote`), and a consensus-replicated executor
-(`evento-accord`, alpha). Events are serialized with `bitcode`.
+Backends: SQLite / PostgreSQL / MySQL (via `sqlx`), embedded Fjall, embedded Turso
+(SQLite's schema in a pure-Rust async engine, `turso`), a remote client/server
+executor (`remote`), and a consensus-replicated executor (`evento-accord`, alpha). Events are serialized with `bitcode`.
 
 ## Setup
 
@@ -22,13 +22,13 @@ client/server executor (`remote`), and a consensus-replicated executor
 
 ```toml
 [dependencies]
-evento = { version = "2.0.0-alpha.35", features = ["sqlite"] }  # or "postgres", "mysql", "fjall", "remote"
+evento = { version = "2.0.0-alpha.35", features = ["sqlite"] }  # or "postgres", "mysql", "fjall", "turso", "remote"
 bitcode = "0.6"
 anyhow = "1"
 tokio = { version = "1", features = ["full"] }
 ```
 
-Feature flags: `sqlite` / `postgres` / `mysql` / `fjall` / `remote`, `sql` (all SQL),
+Feature flags: `sqlite` / `postgres` / `mysql` / `fjall` / `turso` / `remote`, `sql` (all SQL),
 `macro` (default, the proc-macros), `group` (multi-executor), `rw` (executor combinators:
 `Rw` read/write split and `Sidecar`; implied by `fjall`).
 
@@ -53,6 +53,32 @@ let executor = evento::Fjall::open("./events.db")?;
 // Tests/examples: a temp store, removed when the last clone of the executor drops.
 let executor = evento::Fjall::temporary()?;
 ```
+
+### Executor (Turso, embedded SQL — migrations run on open)
+
+```rust
+let executor = evento::Turso::open("./events.db").await?;
+
+// Tests/simulations: an in-memory database, gone when the last clone drops.
+let executor = evento::Turso::in_memory().await?;
+
+// Your own migrations share the database under your app name
+// (evento's are the app "evento"):
+const APP: evento::turso::migrate::Migrations = evento::turso::migrate::Migrations::new(
+    "my-app", &[evento::turso::migrate::Migration::up("001_views", "CREATE TABLE ...")]);
+let mut conn = executor.connect()?;
+APP.to_latest(&mut conn).await.map_err(|(_, e)| e)?;
+```
+
+Read models on Turso mirror the SQL ones: `#[evento::projection(backend = turso,
+evento::turso::FromRow, Cursor, Debug)]` derives the row decoding (`#[turso(default)]`
+for a non-column field; `evento::turso::Text<T>` for an enum stored as text) and the
+`#[cursor(by_name, Col::X, n)]` wrappers; `evento::turso::Reader::new(select).args(args)
+.execute::<ViewByName>(&conn)` pages them; `evento::turso::{execute, fetch_all,
+fetch_optional, fetch_one}` run sea-query statements on a `conn = executor.connect()?`.
+Full-text search needs the `turso-fts` feature: it is an index, not an FTS5 table —
+`CREATE INDEX t_fts ON t USING fts(a, b)`, `WHERE (a, b) MATCH ?`, and
+`fts_score(a, b, ?1)` / `fts_match(a, b, ?1)` naming every index column, then the query.
 
 ### Remote (client/server split) and executor combinators
 

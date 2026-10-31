@@ -23,6 +23,7 @@ evento-core = { path = "../evento-core", version = "2.0.0-alpha.36" }
 evento-sql = { path = "../evento-sql", optional = true, version = "2.0.0-alpha.36" }
 evento-sql-migrator = { path = "../evento-sql-migrator", optional = true, version = "2.0.0-alpha.36" }
 evento-fjall = { path = "../evento-fjall", optional = true, version = "2.0.0-alpha.36" }
+evento-turso = { path = "../evento-turso", optional = true, version = "2.0.0-alpha.36" }
 evento-remote = { path = "../evento-remote", optional = true, version = "2.0.0-alpha.36" }
 evento-lock = { path = "../evento-lock", optional = true, version = "2.0.0-alpha.36" }
 sqlx_migrator = { workspace = true, optional = true }
@@ -46,6 +47,8 @@ sqlite = ["evento-sql/sqlite", "evento-sql-migrator/sqlite", "sqlx_migrator/sqli
 mysql = ["evento-sql/mysql", "evento-sql-migrator/mysql", "sqlx_migrator/mysql"]
 postgres = ["evento-sql/postgres", "evento-sql-migrator/postgres", "sqlx_migrator/postgres"]
 fjall = ["evento-fjall", "evento-fjall/rw", "rw"]
+turso = ["evento-turso", "evento-turso/rw", "rw"]
+turso-fts = ["turso", "evento-turso/fts"]
 remote = ["evento-remote"]
 lock = ["evento-lock"]
 

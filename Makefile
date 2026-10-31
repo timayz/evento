@@ -11,7 +11,7 @@ reset: down up
 
 check: test fmt lint machete check.examples
 
-test: test.sql test.core test.fjall test.accord test.remote test.migrator test.macro test.lock test.doc
+test: test.sql test.core test.fjall test.turso test.accord test.remote test.migrator test.macro test.lock test.doc
 
 test.sql:
 	cargo test --all-features -p evento-sql
@@ -21,6 +21,11 @@ test.core:
 
 test.fjall:
 	cargo test --all-features -p evento-fjall
+
+# The Turso backend: the shared conformance suite, the migration runner and
+# (via its `accord` feature) the Turso consensus journal.
+test.turso:
+	cargo test --all-features -p evento-turso
 
 # The Accord consensus crate (simulation, cluster, membership, electorate, TCP/mTLS,
 # recovery, …). The fjall/sql journal tests live with their backends (test.fjall /

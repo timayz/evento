@@ -21,6 +21,7 @@ One `Executor` trait, many backends:
 |---------|---------|-------|-------|
 | SQLite / PostgreSQL / MySQL | `sqlite` / `postgres` / `mysql` | [evento-sql](evento-sql) | via sqlx, with [built-in migrations](evento-sql-migrator) |
 | Fjall (embedded LSM-tree) | `fjall` | [evento-fjall](evento-fjall) | no external server; `Fjall::temporary()` for tests |
+| Turso (embedded SQL, pure Rust) | `turso` | [evento-turso](evento-turso) | SQLite's schema in-process and async, no sqlx; `Turso::in_memory()` for tests |
 | Remote (client/server TCP) | `remote` | [evento-remote](evento-remote) | serve any executor over framed TCP |
 | Accord (consensus, alpha) | — | [evento-accord](evento-accord) | leaderless replicated store, strictly serializable ([design](evento-accord/DESIGN.md)) |
 
@@ -37,7 +38,7 @@ anyhow = "1"
 tracing-subscriber = "0.3"
 ```
 
-Swap `sqlite` for `postgres`, `mysql`, `fjall`, or `remote` as needed (see
+Swap `sqlite` for `postgres`, `mysql`, `fjall`, `turso`, or `remote` as needed (see
 [Feature flags](#feature-flags)).
 
 Evento reports itself through [`tracing`](https://crates.io/crates/tracing), which does
@@ -619,6 +620,19 @@ let ephemeral = evento::Fjall::temporary()?;
 # }
 ```
 
+### Turso (embedded SQL, migrations run on open)
+
+```rust,no_run
+# async fn run() -> anyhow::Result<()> {
+let executor = evento::Turso::open("./events.db").await?;
+
+// Tests and simulations: an in-memory database, gone with its last clone.
+let ephemeral = evento::Turso::in_memory().await?;
+# let _ = (executor, ephemeral);
+# Ok(())
+# }
+```
+
 ### SQLite (or PostgreSQL/MySQL) with migrations
 
 ```rust,no_run
@@ -724,6 +738,7 @@ Full macro reference: [evento-macro/README.md](evento-macro/README.md).
 - `sql` - Enable all SQL database backends
 - `sqlite` / `postgres` / `mysql` - Individual SQL backends with migrations
 - `fjall` - Embedded key-value storage with Fjall
+- `turso` - Embedded SQL storage with Turso (in-process, async, pure Rust)
 - `remote` - Client/server executor over framed TCP
 - `lock` - `evento::lock`, the `events.lock` checker (enable it on a dev-dependency)
 - `group` - Multi-executor support for querying across databases
@@ -739,6 +754,7 @@ Full macro reference: [evento-macro/README.md](evento-macro/README.md).
 | [evento-sql](evento-sql) | SQLite/MySQL/PostgreSQL executor (sqlx) |
 | [evento-sql-migrator](evento-sql-migrator) | Schema migrations for the SQL backend |
 | [evento-fjall](evento-fjall) | Embedded LSM-tree executor |
+| [evento-turso](evento-turso) | Embedded SQL executor on Turso, with migrations and the accord journal |
 | [evento-remote](evento-remote) | Client/server executor over framed TCP |
 | [evento-accord](evento-accord) | Accord consensus replicated executor (alpha) |
 | [evento-lock](evento-lock) | `events.lock`: test that persisted shapes only grow |
