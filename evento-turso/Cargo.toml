@@ -1,0 +1,51 @@
+[package]
+name = "evento-turso"
+version = "2.0.0-alpha.36"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = true
+description = "Turso (in-process, async SQLite) executor and accord journal for the evento event sourcing library"
+documentation = "https://docs.rs/evento-turso"
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[package.metadata.cargo-machete]
+ignored = ["evento"]
+
+[dependencies]
+evento-core = { path = "../evento-core", version = "2.0.0-alpha.36" }
+anyhow.workspace = true
+async-trait.workspace = true
+bitcode.workspace = true
+ulid.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+sea-query = { workspace = true, features = ["backend-sqlite"] }
+turso.workspace = true
+tempfile = "3.27"
+tracing = { workspace = true, optional = true }
+evento-accord = { path = "../evento-accord", version = "2.0.0-alpha.36", optional = true }
+
+[dev-dependencies]
+evento-test = { path = "../evento-test" }
+evento = { workspace = true, features = ["turso"] }
+tempfile = "3.27"
+
+[features]
+default = ["rw"]
+rw = ["evento-core/rw"]
+accord = ["dep:evento-accord"]
+tracing = ["dep:tracing"]
+
+[[test]]
+name = "accord_journal"
+required-features = ["accord"]
+
+[lints]
+workspace = true

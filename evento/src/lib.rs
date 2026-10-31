@@ -25,6 +25,7 @@
 //! - `mysql` - MySQL support via sqlx
 //! - `postgres` - PostgreSQL support via sqlx
 //! - `fjall` - Embedded key-value storage with Fjall
+//! - `turso` - Embedded SQL storage with Turso (in-process, async SQLite rewrite)
 //! - `remote` - Client/server executor over framed TCP
 //! - `lock` - `events.lock` checker that keeps persisted shapes append-only (usually enabled on a dev-dependency)
 //!
@@ -191,6 +192,14 @@ pub use evento_fjall as fjall;
 /// Fjall executor type alias.
 #[cfg(feature = "fjall")]
 pub use evento_fjall::Fjall;
+
+/// Turso executor and types (requires `turso` feature).
+#[cfg(feature = "turso")]
+pub use evento_turso as turso;
+
+/// Turso executor type alias.
+#[cfg(feature = "turso")]
+pub use evento_turso::Turso;
 
 /// Remote client/server executor (requires `remote` feature).
 #[cfg(feature = "remote")]

@@ -9,6 +9,7 @@ members = [
     "./evento-sql-migrator",
     "./evento-macro",
     "./evento-fjall",
+    "./evento-turso",
     "./evento-accord",
     "./evento-remote",
     "./evento-lock",
@@ -37,6 +38,7 @@ evento-sql = { path = "./evento-sql" }
 evento-sql-migrator = { path = "./evento-sql-migrator" }
 evento-macro = { path = "./evento-macro" }
 evento-fjall = { path = "./evento-fjall" }
+evento-turso = { path = "./evento-turso" }
 evento-accord = { path = "./evento-accord" }
 evento-remote = { path = "./evento-remote" }
 evento-lock = { path = "./evento-lock" }
@@ -70,6 +72,7 @@ sqlx_migrator = "0.20"
 sea-query = { version = "1.0.1", default-features = false, features = ["derive", "audit"] }
 sea-query-sqlx = { version = "0.9.1", features = ["runtime-tokio"] }
 fjall = "3.1"
+turso = { version = "0.8.3", default-features = false }
 
 # Proc macro
 quote = "1.0"

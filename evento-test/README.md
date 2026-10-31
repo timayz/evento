@@ -1,7 +1,7 @@
 # evento-test
 
 Shared conformance test suite for [evento](https://github.com/timayz/evento) executor
-backends. Not published; used as a dev-dependency by `evento-sql`, `evento-fjall`, and
+backends. Not published; used as a dev-dependency by `evento-sql`, `evento-fjall`, `evento-turso`, and
 `evento-remote` so every backend runs the exact same scenarios (writes, optimistic
 concurrency, routing keys, subscriptions, snapshots, tombstones, commands, …).
 
