@@ -22,9 +22,12 @@ pub struct Metrics {
     pub recoveries: AtomicU64,
     /// Compaction rounds that advanced the redundancy watermark.
     pub compactions: AtomicU64,
-    /// Watermark reports clamped below the local applied-through point because
-    /// sync coverage hadn't (yet) proven the window — e.g. after a partition
-    /// heal or restart, until anti-entropy re-covers it.
+    /// Watermark reports held back below the local applied-through point by
+    /// sync coverage: by more than the compaction margin, or by no coverage
+    /// proven at all — e.g. after a partition heal or restart, until
+    /// anti-entropy re-covers the window. A report trailing its coverage by
+    /// an anti-entropy round, as every report in a healthy cluster does, is
+    /// not counted (#452).
     pub watermark_clamps: AtomicU64,
     /// Group-commit journal flushes performed.
     pub journal_flushes: AtomicU64,
@@ -466,7 +469,7 @@ impl MetricsSnapshot {
             ),
             (
                 "accord_watermark_clamps_total",
-                "Watermark reports clamped below local applied-through by missing sync coverage.",
+                "Watermark reports held back by missing sync coverage: by more than the compaction margin, or by none proven at all.",
                 self.watermark_clamps,
             ),
             (

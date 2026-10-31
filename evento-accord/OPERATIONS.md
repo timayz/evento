@@ -73,10 +73,10 @@ timeouts for geo/WAN** deployments.
 
 | Field | Default | Raise when / meaning |
 |-------|---------|----------------------|
-| `fast_timeout` | 50 ms | Wait for the fast-path quorum before falling back to slow path. Keep ≳ one cross-region RTT for WAN. |
-| `collect_timeout` | 5 s | Cap on the later phases (Accept/Read/Apply). Only bounds a genuinely stuck phase. |
+| `fast_timeout` | 50 ms | Wait for the fast-path quorum before falling back to slow path. Keep ≳ one cross-region RTT for WAN. Also how much longer a recovery's first round waits for the replicas still to answer once a slow quorum has (§7). |
+| `collect_timeout` | 5 s | Cap on the later phases (Accept/Read/Apply) and on a recovery's first round, which waits for the answers of a slow quorum (#452). Only bounds a genuinely stuck phase: a round whose quorum the refusals for a higher ballot put out of reach ends at once (§7, a coordinator overtaken). |
 | `recovery_interval` | 100 ms | How often the recovery/anti-entropy/compaction sweep runs. |
-| `recovery_timeout` | 300 ms | A txn unapplied this long is presumed stalled and recovered. Keep well above normal write latency. |
+| `recovery_timeout` | 300 ms | A txn unapplied this long is presumed stalled and recovered. Keep well above normal write latency — the journal's fsync tail included: a replica flushes its vote before it answers, so on a disk whose fsync stalls the peers' sweeps take live writes over (§8, write latency), each a round of recovery on top of the stall. |
 | `anti_entropy_interval` | 250 ms | Pace of the anti-entropy rounds (one peer per round, in turn; while each page of what the node misses brings something in, a round pulls the next from it, up to 16 pages and for one interval). Each round also proves the window a node holds, which both its compaction report and its subscriptions wait for: subscriptions trail the present by about `compaction_margin` plus `(slow quorum − 1)` rounds. Keep it well below `compaction_margin`. |
 | `compaction_margin` | 1 s | Lag on the redundancy watermark, and the original coordinator's **deadline**: a node never votes for a coordinator's PreAccept, or its Accept at the transaction's own ballot, for a transaction it never witnessed whose `t0` is older than its clock less this margin (`votes_late`). A recovery past the deadline asks such a node twice: first, it answers that it is late; then the recovery asks it to refuse the transaction for good, when that proves it never committed — one only a minority holds, which the recovery then invalidates — or to vote, when the replies show it may have committed (a replica that accepted it lost its journal, §7). It votes unless the transaction is below its **vote fence**, what it vouched for (§5, `votes_fenced`), so one a slow quorum of its shard held unapplied all along is still decided, however late (#337). A multi-shard transaction a shard never saw is invalidated only past the deadline too, where that shard's replicas can be refused for good (#377): within it they only promise the ballot and wait to be handed its part. Keep it ≥ `recovery_timeout` + 2 × the clock-skew bound + worst-case message delay, so a coordinator's messages and a recovery of a transaction still in flight land inside it. |
 | `max_journal_batch` | 128 | Messages drained per group-commit fsync (latency vs. fsync amortization). |
@@ -139,7 +139,8 @@ Serve it on an HTTP endpoint (see `bank-axum-accord`'s `/metrics`). Counters:
 | `fast_path` / `slow_path` | a rising `slow_path` share = conflicts or an electorate that can't form a local fast quorum (check placement/latency). |
 | `recoveries` | should be ~0 in a healthy cluster; sustained > 0 = a coordinator is flapping/dead. |
 | `compactions` | should advance over time; **flat** = compaction stalled (a partitioned/behind peer holds the watermark) → backlog grows toward `max_commands`. |
-| `watermark_clamps` | > 0 while a node re-proves sync coverage (post partition-heal/restart — compaction waits for anti-entropy to repair it); **sustained** growth = coverage never accrues (anti-entropy rounds failing) and compaction stays stalled. |
+| `watermark_clamps` | reports held back by sync coverage: by more than `compaction_margin`, or by no coverage proven at all — > 0 while a node re-proves its window (post partition-heal/restart — compaction waits for anti-entropy to repair it); **sustained** growth = coverage never accrues (anti-entropy rounds failing) and compaction stays stalled. A report trailing its coverage by an anti-entropy round, as every report in a healthy cluster does, is not counted (#452). |
+| `sync_contact_truncated` | anti-entropy contacts found truncated above what this node vouched for (its proven coverage, and everything below its durable vote fence): the window in between can no longer be shipped to it, and anti-entropy cannot repair it — compaction outran repair, a journal was rolled back unnoticed (§7), or an operator compacted by hand. Any count = rejoin the node (§7). Never after a healthy restart, whole-group restarts included: what a node vouched for is in its journal, and a peer compacts no further than the reports it heard (#452). |
 | `journal_flushes` | group-commit activity; **0 while writing** = the journal can't fsync (see §8). |
 | `messages_handled` | liveness/traffic. |
 | `messages_shed` | inbound backpressure drops; sustained > 0 = a node is overloaded or a peer is flooding. |
@@ -273,7 +274,17 @@ refuses anything else before a vote, and a node never installs it.
   stalled past `recovery_timeout` or whose coordinator the phi-accrual detector
   suspects, and first any stalled one its read waits on, (b) pulls committed
   transactions a peer missed (anti-entropy), and (c) compacts redundant state. A
-  healthy cluster recovers nothing.
+  healthy cluster recovers nothing. A recovery's first round waits for the answers
+  of a slow quorum of the shards it asks — up to `collect_timeout`, like every
+  later phase, asking the replicas yet to answer again every `recovery_interval`
+  under the same ballot, so a partition healed meanwhile is used at once — then
+  `fast_timeout` more for the rest (#452): a replica flushes its promise before it
+  answers, and a round that gave up at `fast_timeout` decided nothing on a cluster
+  whose disks take longer, while leaving a higher promise on the replicas that
+  answered late. `recovery quorum not reached for shard N` is
+  the error of a round too few replicas answered; `transaction unknown to recovery
+  quorum`, of one that a quorum answered without any of them holding the
+  transaction.
 - **Restart a crashed node:** rebuild the `Node` against the **same durable journal**
   and call `node.recover_state().await?` *before* serving — it restores the replica
   (status/ballots/decision), replays committed transactions into the data store, and
@@ -297,6 +308,18 @@ refuses anything else before a vote, and a node never installs it.
   A node whose peers are down stays unconfirmed until enough of them are back; a
   full-cluster restart confirms every node, each answering the others from the marks
   its own journal kept.
+- **Whole-group restart** (every node stopped, then every node started — or a cold
+  copy of the whole group restored, §8): nothing to do but the above on each node.
+  The nodes confirm one another within a round trip of the last one starting. Each
+  node's sync coverage starts over, so its reports are clamped (`watermark_clamps`)
+  and compaction waits until its first anti-entropy rounds re-prove its window —
+  about a second, not minutes. The transactions in flight at the stop are decided
+  by the sweep. What a node vouched for before the stop is in its journal: a peer
+  whose floor is above its own is no divergence (`sync_contact_truncated` stays 0,
+  #452). A tail of slow writes longer than a few seconds after the restart is the
+  disks, not the protocol: the restarted processes (and whatever else restarts with
+  them — read models catching up, a WAL checkpoint) load the disk, and the journal
+  flushes every vote waits on stall with it (§8, write latency).
 - **A write the caller abandons** (a client that hung up, a `timeout`) is not undone:
   its coordinator may already have reached the replicas. The node stops coordinating
   it, and the transaction is finished by recovery, like one whose coordinator
@@ -306,9 +329,16 @@ refuses anything else before a vote, and a node never installs it.
   nothing.
 - **A coordinator overtaken by recovery:** a node can take over a write whose
   coordinator is alive but slow or wrongly suspected, or which reached it late. The
-  coordinator's own rounds then fail, but the write
+  coordinator's own rounds then fail — and end as soon as the replicas yet to
+  answer can no longer make the quorum: a PreAccept or Accept the replicas a
+  recovery took over refuse (`Nack`) is not waited out for `collect_timeout`
+  (#452), while a quorum that still accepts at the coordinator's ballot commits
+  the write whatever one replica promised — but the write
   may still commit. Before `Node::write` reports such a failure, the coordinator
-  recovers its own transaction, or failing that waits for it to apply locally, and
+  waits for the recovery that outbid it to land its decision here (where it holds
+  the transaction, as a replica of its shard; a second recovery racing the first
+  was itself load), failing that recovers its own transaction, or failing that
+  waits for it to apply locally, and
   returns the outcome the cluster decided. An error from `write` therefore means the
   outcome could not be established, not that a decided write was lost. No replica
   compacts a transaction while its coordinator is still settling it.
@@ -582,6 +612,20 @@ through `AccordExecutor`) — split it into several writes.
   flush **fails** (disk error/full disk) the node *withholds* that batch's acks — it
   never claims durability it doesn't have — so a node that can't fsync stops acking
   (treat a node logging `journal flush failed` as failed; investigate its disk).
+- **Write latency is the journal's:** every step of a write on a replica — its
+  vote, its promise to a recovery, its commit — is staged and **flushed** (one
+  fsync) before the reply leaves, and the sweep adds a flush per
+  `recovery_interval` (the vote fence its report rests on) and a clock-bound save
+  about every two clock skews (§3). On SQLite one writer connection carries all of
+  it, and the store's applies. A disk whose fsync stalls stalls every write with
+  it; past `recovery_timeout` the peers' sweeps take the stalled writes over, each
+  a round of recovery on top of the stall — correct, and what the 3–10 s writes
+  of #452 were. Keep the journal on a disk whose fsync tail stays under
+  `recovery_timeout`, away from what else restarts or rebuilds beside it; measure
+  (`journal_flushes` against the write rate, and the backend's own statement
+  timings). `synchronous = NORMAL` on SQLite cuts the fsyncs but lets a power loss
+  take acknowledged writes back (a crash of the process alone does not): weigh it
+  against `f` — the group acknowledges a write once `f + 1` journals hold it.
 - **The event store must persist an apply before it returns:** evento-fjall's
   default (`PersistMode::SyncAll` per write), SQL with synchronous commits. The
   journal records a transaction applied once the store took it, and that record is
@@ -601,7 +645,13 @@ through `AccordExecutor`) — split it into several writes.
   open and stop it (§7, rolled-back journal) — unless it lost only the node's last
   moments, which go unnoticed — and it must come back over an empty journal anyway.
   Delete it instead, and bring the node back over an empty journal by joining (§7,
-  lost journal). The journal is bounded by
+  lost journal). **The one copy that may be restored is a cold copy of the whole
+  group**: every node's store and journal copied while every node is stopped, and
+  all of them put back before any node starts (a load test starting over from one
+  state, #452). It is the group as it was at the stop — a whole-group restart (§7)
+  — and what it forgets, every node forgets alike; a node that ran on after the
+  copy and is then put back alone, or a copy of some nodes only, is the rolled-back
+  journal above. The journal is bounded by
   compaction; the event store grows with history.
 - **SQL backend:** run the schema via `evento-sql-migrator` with its `accord` feature
   (the `accord_commands/meta/metadata_log/acceptors` tables), alongside your event
