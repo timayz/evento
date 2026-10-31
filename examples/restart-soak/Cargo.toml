@@ -5,12 +5,8 @@ edition.workspace = true
 publish = false
 
 [dependencies]
-evento = { workspace = true, features = ["sqlite"] }
-evento-sql = { workspace = true, features = ["sqlite", "accord"] }
-evento-sql-migrator = { workspace = true, features = ["sqlite", "accord"] }
-evento-accord.workspace = true
+evento = { workspace = true, features = ["sqlite", "accord"] }
 sqlx = { workspace = true, features = ["runtime-tokio", "sqlite"] }
-sqlx_migrator.workspace = true
 tokio.workspace = true
 ulid.workspace = true
 anyhow.workspace = true

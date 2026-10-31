@@ -9,9 +9,7 @@ name = "jepsen-node"
 path = "src/main.rs"
 
 [dependencies]
-evento = { workspace = true, features = ["fjall"] }
-evento-accord.workspace = true
-evento-fjall = { workspace = true, features = ["accord"] }
+evento = { workspace = true, features = ["fjall", "accord"] }
 axum.workspace = true
 tokio.workspace = true
 serde_json = "1.0"

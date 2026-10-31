@@ -129,9 +129,11 @@ let executor = evento::Sidecar::from((client, local));        // events: client;
 - `Rw::from((read_exec, write_exec))` splits reads from writes (CQRS with two databases).
 - `evento::Evento::new(exec)` type-erases any executor (`Arc<Box<dyn Executor>>`) —
   use it when a struct must hold "some executor" without a generic parameter.
-- **Accord (consensus-replicated, alpha):** `evento-accord` replicates writes
-  leaderlessly with any local backend serving reads; one process runs one node of
-  one cluster (`examples/bank-axum-accord/`, `evento-accord/OPERATIONS.md`).
+- **Accord (consensus-replicated, alpha):** the `accord` feature (`evento::accord`)
+  replicates writes leaderlessly with any local backend serving reads, whose
+  consensus journal it also enables (`evento::fjall::FjallJournal`, `evento::sql::SqlJournal`,
+  `evento::turso::TursoJournal`); one process runs one node of one cluster
+  (`examples/bank-axum-accord/`, `evento-accord/OPERATIONS.md`).
 
 ## 1. Define aggregates & events
 

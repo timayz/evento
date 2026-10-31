@@ -6,8 +6,7 @@ publish = false
 
 [dependencies]
 bank.workspace = true
-evento = { workspace = true, features = ["fjall"] }
-evento-accord.workspace = true
+evento = { workspace = true, features = ["fjall", "accord"] }
 axum.workspace = true
 askama.workspace = true
 tokio.workspace = true

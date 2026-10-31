@@ -23,7 +23,7 @@ One `Executor` trait, many backends:
 | Fjall (embedded LSM-tree) | `fjall` | [evento-fjall](evento-fjall) | no external server; `Fjall::temporary()` for tests |
 | Turso (embedded SQL, pure Rust) | `turso` | [evento-turso](evento-turso) | SQLite's schema in-process and async, no sqlx; `Turso::in_memory()` for tests |
 | Remote (client/server TCP) | `remote` | [evento-remote](evento-remote) | serve any executor over framed TCP |
-| Accord (consensus, alpha) | — | [evento-accord](evento-accord) | leaderless replicated store, strictly serializable ([design](evento-accord/DESIGN.md)) |
+| Accord (consensus, alpha) | `accord` | [evento-accord](evento-accord) | leaderless replicated store, strictly serializable ([design](evento-accord/DESIGN.md)); journals on Fjall/SQL/Turso |
 
 ## Installation
 
@@ -698,7 +698,10 @@ let executor = evento::Evento::new(evento::Sidecar::from((client, local)));
 
 [evento-accord](evento-accord) replicates writes through the Accord consensus protocol
 (Cassandra CEP-15): leaderless, strictly serializable, highly available, with any local
-backend (Fjall/SQL) serving reads. See its [README](evento-accord/README.md),
+backend (Fjall/SQL/Turso) serving reads. Enable the `accord` feature on `evento`: it
+exposes the protocol as `evento::accord` and turns on the consensus journal of every
+enabled local backend (`evento::fjall::FjallJournal`, `evento::sql::SqlJournal`,
+`evento::turso::TursoJournal`). See its [README](evento-accord/README.md),
 [DESIGN.md](evento-accord/DESIGN.md), and [OPERATIONS.md](evento-accord/OPERATIONS.md),
 plus the [`bank-axum-accord`](examples/bank-axum-accord) 3-node demo.
 
