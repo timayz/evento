@@ -587,6 +587,13 @@ pub enum Message {
     /// not hear from decide which, nothing yet. A routed recovery asks with
     /// the transaction's route and every part a holder reported, so the
     /// replica votes for its shard's (#377).
+    ///
+    /// At `ballot == Ballot(t0)`, replica → the original coordinator: its
+    /// PreAccept, or its Accept at that ballot, outlived the deadline on a
+    /// replica that never witnessed the transaction (#466). Nothing is
+    /// recorded or promised, but the vote is refused for good, so the
+    /// coordinator settles the write as soon as its quorum is out of reach
+    /// instead of waiting out `collect_timeout` for votes that never come.
     Late { txn: TxnId, ballot: Ballot },
     /// Replica → every other node, from a replica opened over a journal that
     /// holds something (#339): the [`DurableMark`] that journal holds. Until
