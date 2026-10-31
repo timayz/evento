@@ -229,7 +229,7 @@ impl TursoJournal {
                 .and_where(Expr::col(AccordMeta::K).eq(key))
                 .to_owned(),
         );
-        match query::fetch_optional(&self.reader()?, q).await? {
+        match query::fetch_optional_prepared(&self.reader()?, q).await? {
             Some(row) => Ok(Some(query::blob(&row, 0)?)),
             None => Ok(None),
         }
@@ -256,7 +256,7 @@ impl TursoJournal {
     /// Upserts one `accord_meta` row durably, on its own.
     async fn save_meta(&self, key: &str, value: &[u8]) -> anyhow::Result<()> {
         let q = Self::upsert_meta(&[(key, value)]);
-        query::execute(&*self.write.lock().await, q).await?;
+        query::execute_prepared(&*self.write.lock().await, q).await?;
         Ok(())
     }
 
@@ -269,7 +269,7 @@ impl TursoJournal {
                 .and_where(Expr::col(AccordMeta::K).like(like_prefix(prefix)))
                 .to_owned(),
         );
-        query::fetch_all(&self.reader()?, q)
+        query::fetch_rows_only(&self.reader()?, q)
             .await?
             .iter()
             .map(|row| query::blob(row, 0))
@@ -290,7 +290,7 @@ impl TursoJournal {
                 .order_by(key, sea_query::Order::Asc)
                 .to_owned(),
         );
-        query::fetch_all(&self.reader()?, q)
+        query::fetch_rows_only(&self.reader()?, q)
             .await?
             .iter()
             .map(|row| Ok((query::int(row, 0)? as u64, query::blob(row, 1)?)))
@@ -385,7 +385,7 @@ impl Journal for TursoJournal {
             let mut write = self.write.lock().await;
             let tx = write.transaction().await?;
             for q in statements {
-                query::execute(&tx, q).await?;
+                query::execute_prepared(&tx, q).await?;
             }
             tx.commit().await?;
         }
@@ -457,7 +457,7 @@ impl Journal for TursoJournal {
             let mut write = self.write.lock().await;
             let tx = write.transaction().await?;
             for q in statements {
-                query::execute(&tx, q).await?;
+                query::execute_prepared(&tx, q).await?;
             }
             tx.commit().await?;
         }
@@ -493,7 +493,7 @@ impl Journal for TursoJournal {
                     .and_where(Expr::col(AccordMeta::K).eq(REJOIN_BOUNDS_KEY))
                     .to_owned(),
             );
-            query::execute(&*self.write.lock().await, q).await?;
+            query::execute_prepared(&*self.write.lock().await, q).await?;
             return Ok(());
         }
         let value = encode_tagged(RecordKind::RejoinBounds, &bounds.to_vec())?;
@@ -689,7 +689,7 @@ impl Journal for TursoJournal {
             .collect();
         let write = self.write.lock().await;
         for q in statements {
-            query::execute(&write, q).await?;
+            query::execute_prepared(&write, q).await?;
         }
         Ok(())
     }
@@ -702,7 +702,7 @@ impl Journal for TursoJournal {
                 .and_where(Expr::col(AccordCommands::Txn).eq(txn_key(txn)))
                 .to_owned(),
         );
-        match query::fetch_optional(&self.reader()?, q).await? {
+        match query::fetch_optional_prepared(&self.reader()?, q).await? {
             Some(row) => Ok(Some(decode_tagged(
                 RecordKind::Command,
                 &query::blob(&row, 0)?,
@@ -718,7 +718,7 @@ impl Journal for TursoJournal {
                 .from(AccordCommands::Table)
                 .to_owned(),
         );
-        query::fetch_all(&self.reader()?, q)
+        query::fetch_rows_only(&self.reader()?, q)
             .await?
             .iter()
             .map(|row| decode_tagged(RecordKind::Command, &query::blob(row, 0)?))
@@ -756,7 +756,7 @@ impl Journal for TursoJournal {
             }
             query::prepare(&statement)
         };
-        query::execute(&*self.write.lock().await, q).await?;
+        query::execute_prepared(&*self.write.lock().await, q).await?;
         Ok(())
     }
 
@@ -786,7 +786,7 @@ impl Journal for TursoJournal {
                 )
                 .to_owned(),
         );
-        query::execute(&*self.write.lock().await, q).await?;
+        query::execute_prepared(&*self.write.lock().await, q).await?;
         Ok(())
     }
 

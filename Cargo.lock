@@ -1515,6 +1515,7 @@ dependencies = [
  "evento",
  "evento-accord",
  "evento-core",
+ "evento-macro",
  "evento-test",
  "sea-query",
  "tempfile",

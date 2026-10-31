@@ -12,6 +12,41 @@ struct CursorField {
     order: usize,
 }
 
+/// The backend a `Cursor` derive binds to: which `Bind` trait and row type its
+/// impls name. Selected by a struct-level `#[cursor(backend = turso)]`
+/// (`sql`, the default, is `evento::sql::Bind` over sqlx).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    Sql,
+    Turso,
+}
+
+/// Parses a struct-level `#[cursor(backend = <sql|turso>)]`.
+fn parse_backend_attr(attr: &syn::Attribute) -> Result<Option<Backend>> {
+    if !attr.path().is_ident("cursor") {
+        return Ok(None);
+    }
+    let mut backend = None;
+    attr.parse_nested_meta(|meta| {
+        if meta.path.is_ident("backend") {
+            let value: syn::Ident = meta.value()?.parse()?;
+            backend = Some(match value.to_string().as_str() {
+                "sql" => Backend::Sql,
+                "turso" => Backend::Turso,
+                other => {
+                    return Err(meta.error(format!(
+                        "unknown cursor backend `{other}`; expected `sql` or `turso`"
+                    )));
+                }
+            });
+            Ok(())
+        } else {
+            Err(meta.error("expected `backend = sql` or `backend = turso`"))
+        }
+    })?;
+    Ok(backend)
+}
+
 /// Parse the #[cursor(...)] attribute
 /// Supports two formats:
 /// - Named: #[cursor(name, Column::Variant, order)]
@@ -170,7 +205,14 @@ fn generate_cursor_code(
     struct_name: &syn::Ident,
     cursor_name: &str,
     cursor_fields: &mut [CursorField],
+    backend: Backend,
 ) -> Result<TokenStream> {
+    // The `Bind` trait the impls target, and the row decoding a named
+    // cursor's wrapper forwards.
+    let bind_trait = match backend {
+        Backend::Sql => quote! { evento::sql::Bind },
+        Backend::Turso => quote! { evento::turso::Bind },
+    };
     // Sort by order (ascending) for the cursor struct
     cursor_fields.sort_by_key(|f| f.order);
 
@@ -249,7 +291,7 @@ fn generate_cursor_code(
                 }
             }
 
-            impl evento::sql::Bind for #struct_name {
+            impl #bind_trait for #struct_name {
                 type T = #column_enum_type;
                 type I = [Self::T; #field_count];
                 type V = [sea_query::Expr; #field_count];
@@ -260,7 +302,7 @@ fn generate_cursor_code(
                 }
 
                 fn values(
-                    cursor: <<Self as evento::sql::Bind>::Cursor as evento::cursor::Cursor>::T,
+                    cursor: <<Self as #bind_trait>::Cursor as evento::cursor::Cursor>::T,
                 ) -> Self::V {
                     [#(#values),*]
                 }
@@ -287,6 +329,31 @@ fn generate_cursor_code(
             })
             .collect();
 
+        // The wrapper decodes as the struct does: sqlx's `FromRow` on the
+        // SQL backend, `evento::turso::FromRow` on Turso.
+        let from_row_impl = match backend {
+            Backend::Sql => quote! {
+                impl<'r, R: sqlx::Row> sqlx::FromRow<'r, R> for #wrapper_name
+                where
+                    #struct_name: ::sqlx::FromRow<'r, R>,
+                {
+                    fn from_row(row: &'r R) -> ::sqlx::Result<Self> {
+                        Ok(#wrapper_name(#struct_name::from_row(row)?))
+                    }
+                }
+            },
+            Backend::Turso => quote! {
+                impl evento::turso::FromRow for #wrapper_name
+                where
+                    #struct_name: evento::turso::FromRow,
+                {
+                    fn from_row(row: &evento::turso::Row<'_>) -> ::anyhow::Result<Self> {
+                        Ok(#wrapper_name(<#struct_name as evento::turso::FromRow>::from_row(row)?))
+                    }
+                }
+            },
+        };
+
         Ok(quote! {
             // Newtype wrapper
             #[derive(Debug, Clone)]
@@ -300,14 +367,7 @@ fn generate_cursor_code(
                 }
             }
 
-            impl<'r, R: sqlx::Row> sqlx::FromRow<'r, R> for #wrapper_name
-            where
-                #struct_name: ::sqlx::FromRow<'r, R>,
-            {
-                fn from_row(row: &'r R) -> ::sqlx::Result<Self> {
-                    Ok(#wrapper_name(#struct_name::from_row(row)?))
-                }
-            }
+            #from_row_impl
 
             // Cursor struct
             #[derive(Debug, Clone, bitcode::Encode, bitcode::Decode)]
@@ -325,7 +385,7 @@ fn generate_cursor_code(
                 }
             }
 
-            impl evento::sql::Bind for #wrapper_name {
+            impl #bind_trait for #wrapper_name {
                 type T = #column_enum_type;
                 type I = [Self::T; #field_count];
                 type V = [sea_query::Expr; #field_count];
@@ -336,7 +396,7 @@ fn generate_cursor_code(
                 }
 
                 fn values(
-                    cursor: <<Self as evento::sql::Bind>::Cursor as evento::cursor::Cursor>::T,
+                    cursor: <<Self as #bind_trait>::Cursor as evento::cursor::Cursor>::T,
                 ) -> Self::V {
                     [#(#values),*]
                 }
@@ -349,6 +409,15 @@ fn generate_cursor_code(
 /// Main implementation for the Cursor derive macro
 pub fn cursor_impl(input: &DeriveInput) -> Result<TokenStream> {
     let struct_name = &input.ident;
+
+    // The backend, from a struct-level `#[cursor(backend = ...)]`; sqlx by
+    // default.
+    let mut backend = Backend::Sql;
+    for attr in &input.attrs {
+        if let Some(selected) = parse_backend_attr(attr)? {
+            backend = selected;
+        }
+    }
 
     // Extract fields with #[cursor] attribute
     let fields = match &input.data {
@@ -411,7 +480,7 @@ pub fn cursor_impl(input: &DeriveInput) -> Result<TokenStream> {
     let mut all_tokens = TokenStream::new();
 
     for (cursor_name, mut fields) in cursor_groups {
-        let tokens = generate_cursor_code(struct_name, &cursor_name, &mut fields)?;
+        let tokens = generate_cursor_code(struct_name, &cursor_name, &mut fields, backend)?;
         all_tokens.extend(tokens);
     }
 

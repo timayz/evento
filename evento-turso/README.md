@@ -58,6 +58,36 @@ APP_MIGRATIONS.to_latest(&mut conn).await.map_err(|(_, err)| err)?;
 # }
 ```
 
+## Read models
+
+Your own tables live in the same database. `Reader` pages any sea-query select by a
+cursor, `#[evento::projection(backend = turso, FromRow, Cursor, ..)]` derives the row
+decoding and the named cursors, and `execute` / `fetch_all` / `fetch_optional` run
+statements — the Turso counterparts of `evento::sql::Reader` and sqlx's `FromRow`:
+
+```rust,ignore
+use evento::turso::{self, Reader, Text};
+use evento::Cursor;
+
+#[evento::projection(backend = turso, turso::FromRow, Cursor, Debug)]
+pub struct AdminView {
+    #[cursor(by_name, UserAdmin::Id, 1)]
+    pub id: String,
+    #[cursor(by_name, UserAdmin::Email, 2)]
+    pub email: String,
+    pub role: Text<Role>,          // an enum stored as text
+    #[turso(default)]
+    pub deleted: bool,             // not a column
+}
+
+let conn = store.connect()?;
+let page = Reader::new(statement)
+    .args(args)
+    .execute::<AdminViewByName>(&conn)
+    .await?;
+let one: Option<AdminView> = turso::fetch_optional(&conn, &by_id).await?;
+```
+
 ## Accord journal
 
 With the `accord` feature the crate also provides `TursoJournal`, the

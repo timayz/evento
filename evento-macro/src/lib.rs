@@ -192,6 +192,7 @@ mod projection;
 mod snapshot;
 mod subscription;
 mod subscription_all;
+mod turso_row;
 mod util;
 
 use proc_macro::TokenStream;
@@ -709,6 +710,34 @@ pub fn derive_cursor(input: TokenStream) -> TokenStream {
     match cursor::cursor_impl(&input) {
         Ok(tokens) => tokens,
         Err(e) => e.to_compile_error().into(),
+    }
+}
+
+/// Derives `evento::turso::FromRow` for a read-model struct: one field per
+/// column of the same name, each read with `evento::turso::FromValue`.
+///
+/// Re-exported as `evento::turso::FromRow`, next to the trait of that name.
+/// A field marked `#[turso(default)]` takes its `Default` when the select
+/// does not include its column (a flag set by handlers, not stored).
+///
+/// ```rust,ignore
+/// #[evento::projection(backend = turso, evento::turso::FromRow, Cursor, Debug)]
+/// pub struct AdminView {
+///     #[cursor(by_name, UserAdmin::Id, 1)]
+///     pub id: String,
+///     #[cursor(by_name, UserAdmin::Email, 2)]
+///     pub email: String,
+///     pub role: evento::turso::Text<Role>,
+///     #[turso(default)]
+///     pub deleted: bool,
+/// }
+/// ```
+#[proc_macro_derive(TursoFromRow, attributes(turso))]
+pub fn derive_turso_from_row(input: TokenStream) -> TokenStream {
+    let input = syn::parse_macro_input!(input as syn::DeriveInput);
+    match turso_row::from_row_impl(&input) {
+        Ok(tokens) => tokens,
+        Err(err) => err.to_compile_error().into(),
     }
 }
 

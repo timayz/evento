@@ -20,13 +20,14 @@ ignored = ["evento"]
 
 [dependencies]
 evento-core = { path = "../evento-core", version = "2.0.0-alpha.36" }
+evento-macro = { path = "../evento-macro", version = "2.0.0-alpha.36", optional = true }
 anyhow.workspace = true
 async-trait.workspace = true
 bitcode.workspace = true
 ulid.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
-sea-query = { workspace = true, features = ["backend-sqlite"] }
+sea-query = { workspace = true, features = ["backend-sqlite", "thread-safe"] }
 turso.workspace = true
 tempfile = "3.27"
 tracing = { workspace = true, optional = true }
@@ -38,8 +39,9 @@ evento = { workspace = true, features = ["turso"] }
 tempfile = "3.27"
 
 [features]
-default = ["rw"]
+default = ["rw", "macro"]
 rw = ["evento-core/rw"]
+macro = ["dep:evento-macro"]
 accord = ["dep:evento-accord"]
 tracing = ["dep:tracing"]
 
