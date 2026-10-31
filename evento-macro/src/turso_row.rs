@@ -2,27 +2,42 @@ use proc_macro::TokenStream;
 use quote::quote;
 use syn::{Data, DeriveInput, Fields, Result};
 
-/// Whether a field carries `#[turso(default)]`: it defaults when its column
-/// is not selected.
-fn defaults_when_missing(field: &syn::Field) -> Result<bool> {
-    let mut default = false;
+/// What a field's `#[turso(...)]` options say: the column it reads
+/// (`rename = "..."`, else the field's name) and whether it defaults when
+/// that column is not selected (`default`).
+struct FieldOptions {
+    column: Option<String>,
+    default: bool,
+}
+
+fn field_options(field: &syn::Field) -> Result<FieldOptions> {
+    let mut options = FieldOptions {
+        column: None,
+        default: false,
+    };
     for attr in &field.attrs {
         if !attr.path().is_ident("turso") {
             continue;
         }
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("default") {
-                default = true;
+                options.default = true;
+                Ok(())
+            } else if meta.path.is_ident("rename") {
+                let value: syn::LitStr = meta.value()?.parse()?;
+                options.column = Some(value.value());
                 Ok(())
             } else {
-                Err(meta.error("unknown `turso` option; expected `default`"))
+                Err(meta
+                    .error("unknown `turso` option; expected `default` or `rename = \"column\"`"))
             }
         })?;
     }
-    Ok(default)
+    Ok(options)
 }
 
-/// `impl evento::turso::FromRow`: one field per column of the same name.
+/// `impl evento::turso::FromRow`: one field per column of the same name (or
+/// the one `rename` gives).
 pub fn from_row_impl(input: &DeriveInput) -> Result<TokenStream> {
     let struct_name = &input.ident;
     let fields = match &input.data {
@@ -46,8 +61,9 @@ pub fn from_row_impl(input: &DeriveInput) -> Result<TokenStream> {
     let mut reads = Vec::with_capacity(fields.len());
     for field in fields {
         let name = field.ident.as_ref().expect("named field");
-        let column = name.to_string();
-        reads.push(if defaults_when_missing(field)? {
+        let options = field_options(field)?;
+        let column = options.column.unwrap_or_else(|| name.to_string());
+        reads.push(if options.default {
             quote! {
                 #name: row.try_get(#column)?.unwrap_or_default()
             }

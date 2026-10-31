@@ -104,6 +104,7 @@ pub enum MetaTable {
 
 /// A rendered statement: SQL text and its parameters. Built synchronously so
 /// no sea-query value (not `Send`) is held across an `await`.
+#[derive(Clone)]
 pub(crate) struct Prepared {
     sql: String,
     params: Vec<turso::Value>,
@@ -184,9 +185,12 @@ fn param(value: sea_query::Value) -> turso::Value {
 }
 
 /// Runs a rendered statement that returns no rows; the rows affected.
-pub(crate) async fn execute_prepared(conn: &Connection, query: Prepared) -> turso::Result<u64> {
-    conn.execute(query.sql, turso::params_from_iter(query.params))
-        .await
+pub(crate) async fn execute_prepared(conn: &Connection, query: &Prepared) -> turso::Result<u64> {
+    conn.execute(
+        &query.sql,
+        turso::params_from_iter(query.params.iter().cloned()),
+    )
+    .await
 }
 
 /// Every row a rendered statement returns, with the column names.
@@ -241,7 +245,7 @@ pub async fn execute<S: Statement + ?Sized>(
     statement: &S,
 ) -> anyhow::Result<u64> {
     let prepared = prepare(statement);
-    Ok(execute_prepared(conn, prepared).await?)
+    Ok(execute_prepared(conn, &prepared).await?)
 }
 
 /// Every row `statement` returns on `conn`, decoded as `O`.

@@ -18,9 +18,10 @@ use evento_core::{
 };
 
 use crate::query::{
-    self, apply_filters, EventRow, EventTable, MetaTable, SnapshotTable, SubscriberTable,
+    self, apply_filters, EventRow, EventTable, MetaTable, Prepared, SnapshotTable, SubscriberTable,
     EVENT_COLUMNS,
 };
+use crate::write::{self, Body, WriteMode};
 use crate::Reader;
 
 /// The `meta` key of the monotonic commit clock.
@@ -29,6 +30,9 @@ const LAST_STAMP_KEY: &str = "last_stamp";
 /// Rows per `INSERT` into the event table: eleven bound values each keeps a
 /// statement well under SQLite's bound-value cap (32766).
 const INSERT_CHUNK: usize = 1000;
+
+/// How many connections [`Turso::transaction`] keeps for the next calls.
+const APP_CONNECTIONS: usize = 16;
 
 /// The clock a [`Turso`] stamps its writes with: unix time in milliseconds.
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
@@ -66,6 +70,20 @@ fn system_millis() -> u64 {
 /// two write statements never race on a connection (Turso returns `Busy` for
 /// the second).
 ///
+/// # Sharing the database
+///
+/// Opened with [`open`](Self::open), the store expects to be the only writer
+/// of its database ([`WriteMode::Serial`]): another connection writing at
+/// the same time — the application's own tables, a
+/// [`TursoJournal`](crate::TursoJournal) in the same file — gets `Busy`.
+/// Opened with [`open_concurrent`](Self::open_concurrent) the database is in
+/// Turso's MVCC mode ([`WriteMode::Concurrent`]): the store's writes are
+/// `BEGIN CONCURRENT` transactions that run alongside other writers, retried
+/// on a conflict (see [`transaction`](crate::transaction)), and the
+/// application writes its tables the same way through
+/// [`transaction`](Self::transaction). The mode is recorded in the file;
+/// [`from_database`](Self::from_database) reads it back.
+///
 /// # Example
 ///
 /// ```rust,no_run
@@ -78,6 +96,8 @@ fn system_millis() -> u64 {
 /// ```
 pub struct Turso {
     db: turso::Database,
+    /// How the database takes its writes; read from the file when opened.
+    mode: WriteMode,
     /// The single writer; holds `BEGIN … COMMIT`.
     write: Arc<Mutex<turso::Connection>>,
     /// The monotonic commit clock, in milliseconds; only ever written under
@@ -86,6 +106,10 @@ pub struct Turso {
     clock: Clock,
     /// Bumped after every in-process write (`write_watch`); clones share it.
     write_watch: watch::Sender<u64>,
+    /// Connections [`transaction`](Self::transaction) ran on, kept for the
+    /// next: a connection's first `BEGIN CONCURRENT` costs milliseconds
+    /// (Turso sets its MVCC state up), the next ones microseconds.
+    app: Arc<std::sync::Mutex<Vec<turso::Connection>>>,
     /// Keeps a [`temporary`](Self::temporary) database's directory alive.
     _temp: Option<Arc<tempfile::TempDir>>,
 }
@@ -93,6 +117,7 @@ pub struct Turso {
 impl std::fmt::Debug for Turso {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Turso")
+            .field("mode", &self.mode)
             .field("last_stamp", &self.last_stamp.load(Ordering::Relaxed))
             .finish_non_exhaustive()
     }
@@ -104,10 +129,12 @@ impl Clone for Turso {
         // clone notifies the same subscriptions and stamps the same sequence.
         Self {
             db: self.db.clone(),
+            mode: self.mode,
             write: Arc::clone(&self.write),
             last_stamp: Arc::clone(&self.last_stamp),
             clock: Arc::clone(&self.clock),
             write_watch: self.write_watch.clone(),
+            app: Arc::clone(&self.app),
             _temp: self._temp.clone(),
         }
     }
@@ -128,13 +155,20 @@ impl Turso {
     }
 
     /// Opens (creating if absent) the database at `path` and applies the
-    /// pending [`MIGRATIONS`](crate::MIGRATIONS).
+    /// pending [`MIGRATIONS`](crate::MIGRATIONS). The database stays in the
+    /// mode it is in: Turso's default for a new file ([`WriteMode::Serial`]),
+    /// MVCC for one [`open_concurrent`](Self::open_concurrent) created.
     pub async fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let path = path
-            .as_ref()
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("database path is not UTF-8"))?;
-        let db = Self::builder(path).build().await?;
+        let db = Self::builder(path_str(path.as_ref())?).build().await?;
+        Self::migrated(db).await
+    }
+
+    /// Opens (creating if absent) the database at `path` for several writers
+    /// ([`WriteMode::Concurrent`], see [`enable_concurrent_writes`](crate::enable_concurrent_writes))
+    /// and applies the pending [`MIGRATIONS`](crate::MIGRATIONS).
+    pub async fn open_concurrent(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let db = Self::builder(path_str(path.as_ref())?).build().await?;
+        write::enable_concurrent_writes(&db).await?;
         Self::migrated(db).await
     }
 
@@ -147,11 +181,28 @@ impl Turso {
         Self::migrated(db).await
     }
 
+    /// [`in_memory`](Self::in_memory) for several writers
+    /// ([`WriteMode::Concurrent`]).
+    pub async fn in_memory_concurrent() -> anyhow::Result<Self> {
+        let db = Self::builder(":memory:").build().await?;
+        write::enable_concurrent_writes(&db).await?;
+        Self::migrated(db).await
+    }
+
     /// A migrated database in a temporary directory, deleted with the last
     /// clone: for tests that need a file (a close/reopen).
     pub async fn temporary() -> anyhow::Result<Self> {
         let dir = tempfile::Builder::new().prefix("evento-turso-").tempdir()?;
         let mut turso = Self::open(dir.path().join("events.db")).await?;
+        turso._temp = Some(Arc::new(dir));
+        Ok(turso)
+    }
+
+    /// [`temporary`](Self::temporary) for several writers
+    /// ([`WriteMode::Concurrent`]).
+    pub async fn temporary_concurrent() -> anyhow::Result<Self> {
+        let dir = tempfile::Builder::new().prefix("evento-turso-").tempdir()?;
+        let mut turso = Self::open_concurrent(dir.path().join("events.db")).await?;
         turso._temp = Some(Arc::new(dir));
         Ok(turso)
     }
@@ -170,9 +221,11 @@ impl Turso {
     }
 
     /// Wraps a database whose schema the caller already migrated (see
-    /// [`MIGRATIONS`](crate::MIGRATIONS)); loads the commit clock.
+    /// [`MIGRATIONS`](crate::MIGRATIONS)); loads the commit clock and reads
+    /// the [`WriteMode`] the database is in.
     pub async fn from_database(db: turso::Database) -> anyhow::Result<Self> {
         let write = db.connect()?;
+        let mode = write::write_mode_of(&write).await?;
         let q = query::prepare(
             &Query::select()
                 .column(MetaTable::V)
@@ -193,10 +246,12 @@ impl Turso {
         };
         Ok(Self {
             db,
+            mode,
             write: Arc::new(Mutex::new(write)),
             last_stamp: Arc::new(AtomicU64::new(last_stamp)),
             clock: Arc::new(system_millis),
             write_watch: watch::channel(0).0,
+            app: Arc::new(std::sync::Mutex::new(Vec::new())),
             _temp: None,
         })
     }
@@ -212,6 +267,43 @@ impl Turso {
     /// [`TursoJournal`](crate::TursoJournal) or for ad-hoc queries.
     pub fn database(&self) -> &turso::Database {
         &self.db
+    }
+
+    /// How the database takes its writes: what the store's writes run as,
+    /// and what the application's should (see [`transaction`](Self::transaction)).
+    pub fn write_mode(&self) -> WriteMode {
+        self.mode
+    }
+
+    /// Runs `body` over `env` as one transaction of the application's own,
+    /// committed, in the store's [`write_mode`](Self::write_mode):
+    /// `BEGIN CONCURRENT` and a retry on conflict when the database is shared
+    /// ([`WriteMode::Concurrent`]), a plain transaction otherwise. What a
+    /// subscription handler writes its read-model rows through. See
+    /// [`transaction`](crate::transaction) for the body's contract.
+    ///
+    /// Runs on a connection of the store's own, kept from one call to the
+    /// next (a connection's first concurrent transaction is slow, the next
+    /// ones are not); calls at the same time each get one.
+    pub async fn transaction<T, E, F>(&self, env: &E, body: F) -> anyhow::Result<T>
+    where
+        E: ?Sized + Sync,
+        F: for<'c> FnMut(&'c turso::Connection, &'c E) -> Body<'c, T>,
+    {
+        let pooled = self.app.lock().expect("connection pool poisoned").pop();
+        let mut conn = match pooled {
+            Some(conn) => conn,
+            None => self.connect()?,
+        };
+        let outcome = write::transaction(&mut conn, self.mode, env, body).await;
+        // Only a connection left outside any transaction goes back.
+        if conn.is_autocommit().unwrap_or(false) {
+            let mut pool = self.app.lock().expect("connection pool poisoned");
+            if pool.len() < APP_CONNECTIONS {
+                pool.push(conn);
+            }
+        }
+        outcome
     }
 
     /// The commit clock as the store last stamped it, in milliseconds.
@@ -236,6 +328,22 @@ impl Turso {
     /// The clock's time in whole seconds (for `created_at` / `updated_at`).
     fn now_secs(&self) -> i64 {
         i64::try_from((self.clock)() / 1000).unwrap_or(i64::MAX)
+    }
+
+    /// Runs one statement on the write connection: on its own in
+    /// [`WriteMode::Serial`], as a concurrent transaction (retried on a
+    /// conflict) in [`WriteMode::Concurrent`]. The rows affected.
+    async fn write_one(&self, q: Prepared) -> anyhow::Result<u64> {
+        let mut write = self.write.lock().await;
+        match self.mode {
+            WriteMode::Serial => Ok(query::execute_prepared(&write, &q).await?),
+            WriteMode::Concurrent => {
+                write::transaction(&mut write, self.mode, &q, |tx, q| {
+                    Box::pin(async move { Ok(query::execute_prepared(tx, q).await?) })
+                })
+                .await
+            }
+        }
     }
 
     /// Inserts a batch of events in one transaction; with `restamp`,
@@ -288,14 +396,8 @@ impl Turso {
             statements.push(query::prepare(&statement));
         }
 
-        let tx = write.transaction().await.map_err(unknown)?;
-        for q in statements {
-            query::execute_prepared(&tx, q)
-                .await
-                .map_err(insert_error)?;
-        }
-        if let Some(stamp) = stamp {
-            let q = query::prepare(
+        let stamp_statement = stamp.map(|stamp| {
+            query::prepare(
                 &Query::insert()
                     .into_table(MetaTable::Table)
                     .columns([MetaTable::K, MetaTable::V])
@@ -306,10 +408,29 @@ impl Turso {
                             .to_owned(),
                     )
                     .to_owned(),
-            );
-            query::execute_prepared(&tx, q).await.map_err(unknown)?;
-        }
-        tx.commit().await.map_err(unknown)?;
+            )
+        });
+
+        // One transaction, run again as a whole if another writer's commit
+        // conflicts with it (only possible in a shared database); the unique
+        // index still reports a version conflict as a constraint error.
+        let env = (statements, stamp_statement);
+        write::transaction(&mut write, self.mode, &env, |tx, (statements, stamp)| {
+            Box::pin(async move {
+                for q in statements {
+                    query::execute_prepared(tx, q).await?;
+                }
+                if let Some(q) = stamp {
+                    query::execute_prepared(tx, q).await?;
+                }
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|err| match err.downcast::<turso::Error>() {
+            Ok(err) => insert_error(err),
+            Err(err) => WriteError::Unknown(err),
+        })?;
 
         if let Some(stamp) = stamp {
             // After the commit: a failed batch leaves the clock where it was.
@@ -317,10 +438,6 @@ impl Turso {
         }
         Ok(())
     }
-}
-
-fn unknown(err: turso::Error) -> WriteError {
-    WriteError::Unknown(err.into())
 }
 
 /// Structured detection of a version conflict. The only unique constraints on
@@ -603,7 +720,7 @@ impl Executor for Turso {
                 )
                 .to_owned(),
         );
-        query::execute_prepared(&*self.write.lock().await, q).await?;
+        self.write_one(q).await?;
         Ok(())
     }
 
@@ -633,7 +750,7 @@ impl Executor for Turso {
         );
         // Zero matched rows means the fenced update was a no-op: the key is
         // owned by another worker, disabled, or gone.
-        let affected = query::execute_prepared(&*self.write.lock().await, q).await?;
+        let affected = self.write_one(q).await?;
         Ok(affected > 0)
     }
 
@@ -718,7 +835,7 @@ impl Executor for Turso {
                 )
                 .to_owned(),
         );
-        query::execute_prepared(&*self.write.lock().await, q).await?;
+        self.write_one(q).await?;
         Ok(())
     }
 
@@ -738,7 +855,7 @@ impl Executor for Turso {
                 .and_where(Expr::col(SnapshotTable::Id).eq(id))
                 .to_owned(),
         );
-        query::execute_prepared(&*self.write.lock().await, q).await?;
+        self.write_one(q).await?;
         Ok(())
     }
 
@@ -756,9 +873,15 @@ impl Executor for Turso {
                 .and_where(Expr::col(EventTable::AggregatorId).eq(aggregate_id))
                 .to_owned(),
         );
-        query::execute_prepared(&*self.write.lock().await, q).await?;
+        self.write_one(q).await?;
         Ok(())
     }
+}
+
+/// `path` as the string Turso's builder takes.
+fn path_str(path: &Path) -> anyhow::Result<&str> {
+    path.to_str()
+        .ok_or_else(|| anyhow::anyhow!("database path is not UTF-8"))
 }
 
 impl From<Turso> for evento_core::Evento {

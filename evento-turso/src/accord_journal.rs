@@ -17,6 +17,13 @@
 //! contract; recovery reads via [`load_all`](Journal::load_all) only after a
 //! restart, i.e. post-flush.)
 //!
+//! **Sharing the database.** The journal writes in the [`WriteMode`] its
+//! database is in (read when it opens): plain transactions when the store's
+//! connection and this one are the only writers and never write at once,
+//! `BEGIN CONCURRENT` transactions retried on a conflict when the database is
+//! shared with a store opened with `Turso::open_concurrent` and the
+//! application's tables.
+//!
 //! A multi-shard transaction's route and a recovery promise for a transaction
 //! never witnessed are rows of `accord_meta` keyed `route/` / `promise/` + the
 //! hex of the order-preserving transaction key, staged and flushed with the
@@ -40,6 +47,7 @@ use evento_accord::{
 };
 
 use crate::query::{self, Prepared};
+use crate::write::{self, WriteMode};
 
 /// `k` value under which the truncation watermark is stored in `accord_meta`.
 const WATERMARK_KEY: &str = "redundant_before";
@@ -140,6 +148,8 @@ fn like_prefix(prefix: &str) -> String {
 /// A [`Journal`] persisting consensus state to a Turso database.
 pub struct TursoJournal {
     db: turso::Database,
+    /// How the database takes its writes; read from it when the journal opens.
+    mode: WriteMode,
     /// The single writer; holds the flush and truncate transactions.
     write: tokio::sync::Mutex<turso::Connection>,
     /// Commands staged since the last [`flush`](Journal::flush), as `(key, value)`.
@@ -160,7 +170,9 @@ pub struct TursoJournal {
 
 impl std::fmt::Debug for TursoJournal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TursoJournal").finish_non_exhaustive()
+        f.debug_struct("TursoJournal")
+            .field("mode", &self.mode)
+            .finish_non_exhaustive()
     }
 }
 
@@ -177,8 +189,10 @@ impl TursoJournal {
             .map_err(|(applied, err)| {
                 anyhow::anyhow!("journal migration failed after {applied} applied: {err}")
             })?;
+        let mode = write::write_mode_of(&write).await?;
         Ok(Self {
             db,
+            mode,
             write: tokio::sync::Mutex::new(write),
             staged: Mutex::new(Vec::new()),
             staged_meta: Mutex::new(Vec::new()),
@@ -187,7 +201,8 @@ impl TursoJournal {
         })
     }
 
-    /// Opens (creating if absent) a journal of its own at `path`.
+    /// Opens (creating if absent) a journal of its own at `path`, in the
+    /// mode the file is in (Turso's default for a new one).
     pub async fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path
             .as_ref()
@@ -201,6 +216,46 @@ impl TursoJournal {
     pub async fn in_memory() -> anyhow::Result<Self> {
         let db = crate::Turso::builder(":memory:").build().await?;
         Self::new(db).await
+    }
+
+    /// [`in_memory`](Self::in_memory) in [`WriteMode::Concurrent`].
+    pub async fn in_memory_concurrent() -> anyhow::Result<Self> {
+        let db = crate::Turso::builder(":memory:").build().await?;
+        write::enable_concurrent_writes(&db).await?;
+        Self::new(db).await
+    }
+
+    /// How the database takes its writes.
+    pub fn write_mode(&self) -> WriteMode {
+        self.mode
+    }
+
+    /// Runs `statements` in one transaction on the write connection, in the
+    /// journal's mode (retried as a whole on a conflict).
+    async fn write_all(&self, statements: &[Prepared]) -> anyhow::Result<()> {
+        let mut write = self.write.lock().await;
+        write::transaction(&mut write, self.mode, statements, |tx, statements| {
+            Box::pin(async move {
+                for q in statements {
+                    query::execute_prepared(tx, q).await?;
+                }
+                Ok(())
+            })
+        })
+        .await
+    }
+
+    /// Runs one statement on the write connection: on its own in
+    /// [`WriteMode::Serial`], as a concurrent transaction in
+    /// [`WriteMode::Concurrent`].
+    async fn write_one(&self, q: Prepared) -> anyhow::Result<()> {
+        match self.mode {
+            WriteMode::Serial => {
+                query::execute_prepared(&*self.write.lock().await, &q).await?;
+                Ok(())
+            }
+            WriteMode::Concurrent => self.write_all(std::slice::from_ref(&q)).await,
+        }
     }
 
     /// The underlying database.
@@ -255,9 +310,7 @@ impl TursoJournal {
 
     /// Upserts one `accord_meta` row durably, on its own.
     async fn save_meta(&self, key: &str, value: &[u8]) -> anyhow::Result<()> {
-        let q = Self::upsert_meta(&[(key, value)]);
-        query::execute_prepared(&*self.write.lock().await, q).await?;
-        Ok(())
+        self.write_one(Self::upsert_meta(&[(key, value)])).await
     }
 
     /// The values of every `accord_meta` row whose key starts with `prefix`.
@@ -381,14 +434,7 @@ impl Journal for TursoJournal {
             statements
         };
 
-        {
-            let mut write = self.write.lock().await;
-            let tx = write.transaction().await?;
-            for q in statements {
-                query::execute_prepared(&tx, q).await?;
-            }
-            tx.commit().await?;
-        }
+        self.write_all(&statements).await?;
 
         // Drop exactly what was flushed; entries staged mid-transaction stay.
         // By entry, not by position: `drop_decisions` may have purged part of
@@ -453,14 +499,7 @@ impl Journal for TursoJournal {
             statements
         };
 
-        {
-            let mut write = self.write.lock().await;
-            let tx = write.transaction().await?;
-            for q in statements {
-                query::execute_prepared(&tx, q).await?;
-            }
-            tx.commit().await?;
-        }
+        self.write_all(&statements).await?;
 
         // Only now purge the staged (unflushed) commands below the bound, or a
         // later flush would resurrect rows this truncation just deleted. After
@@ -493,7 +532,7 @@ impl Journal for TursoJournal {
                     .and_where(Expr::col(AccordMeta::K).eq(REJOIN_BOUNDS_KEY))
                     .to_owned(),
             );
-            query::execute_prepared(&*self.write.lock().await, q).await?;
+            self.write_one(q).await?;
             return Ok(());
         }
         let value = encode_tagged(RecordKind::RejoinBounds, &bounds.to_vec())?;
@@ -687,11 +726,7 @@ impl Journal for TursoJournal {
                 )
             })
             .collect();
-        let write = self.write.lock().await;
-        for q in statements {
-            query::execute_prepared(&write, q).await?;
-        }
-        Ok(())
+        self.write_all(&statements).await
     }
 
     async fn load(&self, txn: TxnId) -> anyhow::Result<Option<CommandState>> {
@@ -756,8 +791,7 @@ impl Journal for TursoJournal {
             }
             query::prepare(&statement)
         };
-        query::execute_prepared(&*self.write.lock().await, q).await?;
-        Ok(())
+        self.write_one(q).await
     }
 
     async fn load_metadata(&self) -> anyhow::Result<Vec<(u64, ConfigEntry)>> {
@@ -786,8 +820,7 @@ impl Journal for TursoJournal {
                 )
                 .to_owned(),
         );
-        query::execute_prepared(&*self.write.lock().await, q).await?;
-        Ok(())
+        self.write_one(q).await
     }
 
     async fn load_acceptors(&self) -> anyhow::Result<Vec<(u64, AcceptorRecord)>> {

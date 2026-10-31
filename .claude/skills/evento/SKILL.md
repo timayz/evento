@@ -70,9 +70,21 @@ let mut conn = executor.connect()?;
 APP.to_latest(&mut conn).await.map_err(|(_, e)| e)?;
 ```
 
+Several writers in one database (the store, its accord journal, your read models) need
+the store opened in concurrent mode — `evento::Turso::open_concurrent(path)` /
+`in_memory_concurrent()` — which puts the file in Turso's MVCC mode (recorded in it; a
+later plain `open` finds it, `store.write_mode()` tells). The store's and journal's writes
+are then `BEGIN CONCURRENT` transactions retried on a write-write conflict, and your own
+writes go through `store.transaction(&env, |tx, env| Box::pin(async move { … Ok(()) }))`:
+the body is lent the transaction's connection and `env`, and must be repeatable (it is run
+again whole on a conflict). A plain `open` keeps Turso's single-writer WAL mode, where a
+second writer gets `Busy`. DDL needs a plain transaction even in MVCC mode: run migrations
+before the writers start.
+
 Read models on Turso mirror the SQL ones: `#[evento::projection(backend = turso,
 evento::turso::FromRow, Cursor, Debug)]` derives the row decoding (`#[turso(default)]`
-for a non-column field; `evento::turso::Text<T>` for an enum stored as text) and the
+for a non-column field, `#[turso(rename = "col")]` for another column name; tuples such as
+`(String, i64)` decode by position; `evento::turso::Text<T>` for an enum stored as text) and the
 `#[cursor(by_name, Col::X, n)]` wrappers; `evento::turso::Reader::new(select).args(args)
 .execute::<ViewByName>(&conn)` pages them; `evento::turso::{execute, fetch_all,
 fetch_optional, fetch_one}` run sea-query statements on a `conn = executor.connect()?`.

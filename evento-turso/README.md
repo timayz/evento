@@ -27,10 +27,11 @@ let ephemeral = evento_turso::Turso::in_memory().await?;
 # }
 ```
 
-Like the fjall backend, a `Turso` is the single writer of its database: writes are
-serialized on one connection and stamped with a monotonic commit clock, so events
-are totally ordered without a stability watermark. The clock is injectable
-(`Turso::with_clock`) for deterministic simulations.
+Like the fjall backend, a `Turso` serializes its writes on one connection and stamps
+them with a monotonic commit clock, so events are totally ordered without a stability
+watermark. The clock is injectable (`Turso::with_clock`) for deterministic simulations.
+Other writers of the same database (your read models, the accord journal) need the
+store opened in [concurrent mode](#concurrent-writes-several-writers-one-database).
 
 ## Migrations
 
@@ -101,13 +102,57 @@ feature (`turso-fts` on the `evento` facade) compiles it in and switches on Turs
 index-method support for every database this crate opens; a database you build
 yourself goes through `Turso::builder(path)` to get the same.
 
+## Concurrent writes (several writers, one database)
+
+A `Turso` opened with `open` is the one writer of its file: Turso's default journal
+(WAL) gives a second connection that writes at the same time `Busy` at once. When the
+application's own tables (read models written by subscriptions) and the accord journal
+live in the same database as the events, open the store with `open_concurrent` (or
+`in_memory_concurrent` / `temporary_concurrent` in tests): the database is switched to
+Turso's MVCC mode (`PRAGMA journal_mode = 'mvcc'`, recorded in the file, so a later
+plain `open` finds it), and every write the store and the journal make is a
+`BEGIN CONCURRENT` transaction that runs alongside the others and only collides with
+one that changed the same rows — a conflict, reported on the statement or at the
+commit, after which the transaction is run again (`transaction`, up to `MAX_ATTEMPTS`).
+
+The application writes its tables the same way, through `Turso::transaction`: a body
+over an environment it is lent (the rows to write), so it can be run again whole:
+
+```rust,no_run
+# async fn run(store: evento_turso::Turso, email: String) -> anyhow::Result<()> {
+store
+    .transaction(&email, |tx, email| {
+        Box::pin(async move {
+            tx.execute(
+                "INSERT INTO user_admin (id, email) VALUES (?1, ?2)
+                 ON CONFLICT (id) DO UPDATE SET email = excluded.email",
+                ("u1", email.as_str()),
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await?;
+# Ok(())
+# }
+```
+
+`store.write_mode()` tells which mode the database is in (`WriteMode::Serial` or
+`WriteMode::Concurrent`); `evento_turso::transaction(&mut conn, mode, &env, body)` is
+the same loop on a connection of yours, and `is_retryable(&err)` the test it applies
+(`Busy`, a stale snapshot, a write-write conflict). DDL (`CREATE TABLE`, `CREATE INDEX`)
+still needs a plain transaction in MVCC mode: the migration runner uses one, which is
+why migrations run before the writers start.
+
 ## Accord journal
 
 With the `accord` feature the crate also provides `TursoJournal`, the
 [evento-accord](../evento-accord) consensus journal on Turso — in the same database
 as the events (`TursoJournal::new(store.database().clone()).await`) or in one of its
 own (`TursoJournal::open(path)`); its constructors apply the journal's own
-migrations (`ACCORD_MIGRATIONS`, app `evento-accord`).
+migrations (`ACCORD_MIGRATIONS`, app `evento-accord`). The journal writes in the mode
+its database is in: concurrent transactions next to a store opened with
+`open_concurrent`, plain ones otherwise.
 
 ## Learn more
 
