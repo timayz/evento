@@ -2241,11 +2241,6 @@ impl Node {
                 if epoch == log.start_epoch {
                     log.start_persisted = true;
                 }
-                // Below the epoch the topology was built at, the layout is
-                // history only: kept to recover what was planned under it.
-                if epoch < log.installed_epoch && entry.validate().is_ok() {
-                    self.topology.install_map(epoch, entry.live().clone());
-                }
                 log.entries.insert(epoch, entry);
             }
         }
@@ -2286,8 +2281,12 @@ impl Node {
             }
         }
         // Installed over the restored commands: a fence point covers every
-        // vote they hold, and an activation sees what it invalidates.
-        let installed = self.apply_log();
+        // vote they hold, and an activation sees what it invalidates. The
+        // entries at and below the epoch the topology was built at first
+        // (#455), then those above it.
+        let mut installed = Installed::default();
+        self.replay_log(&mut installed);
+        installed.invalidated.extend(self.apply_log().invalidated);
         self.persist_installed(installed).await;
         // The marks this node saw from its peers, which it answers their
         // opens from (#339).
@@ -10416,23 +10415,99 @@ impl Node {
                 );
                 break;
             }
-            // An activation's clock floor is in place before anything is
-            // planned under the layout it installs.
-            if let ConfigEntry::Active {
-                drained: Some(drained),
-                ..
-            } = &entry
-            {
-                self.clock.restore(drained.floor);
-            }
-            self.topology.install_map(next, entry.live().clone());
-            self.install_entry(next, &entry, &mut installed);
+            self.install_decided(next, &entry, &mut installed);
             self.meta_log
                 .lock()
                 .expect("meta_log poisoned")
                 .installed_epoch = next;
         }
         installed
+    }
+
+    /// Replays the journaled entries at and below the epoch the topology was
+    /// built at, in epoch order, at a restart (#455): the node comes back as
+    /// one built at its first start would, whatever epoch its
+    /// `DynamicTopology` was built at. The layouts below the build epoch are
+    /// kept as history, to recover what was planned under them; the
+    /// transition in progress at the build epoch comes back with its fence,
+    /// at the point the journal holds it at; the epoch the live layout became
+    /// live at, the ended fences and the activations' clock floors come back
+    /// from the entries below. Kept as history alone, a node built at a
+    /// transition's epoch had the transition's layout but no transition: it
+    /// copied nothing for it, answered votes on the moved keys without its
+    /// fence, and the change never installed (#446).
+    ///
+    /// Run over the restored commands, as [`apply_log`](Self::apply_log) is,
+    /// and before it: an activation replayed invalidates what the original
+    /// install did, which the journal holds decided already.
+    fn replay_log(&self, installed: &mut Installed) {
+        if !self.topology.dynamic() {
+            return;
+        }
+        let (built, entries) = {
+            let log = self.meta_log.lock().expect("meta_log poisoned");
+            let entries: Vec<(u64, ConfigEntry)> = log
+                .entries
+                .range(..=log.installed_epoch)
+                .map(|(epoch, entry)| (*epoch, entry.clone()))
+                .collect();
+            (log.installed_epoch, entries)
+        };
+        let Some(&(first, _)) = entries.first() else {
+            return;
+        };
+        // The live layout became live no later than the first journaled
+        // epoch: the replay moves it up at each activation that changed it,
+        // as the installs did.
+        {
+            let mut reconfig = self.reconfig.lock().expect("reconfig poisoned");
+            reconfig.live_since = reconfig.live_since.min(first);
+        }
+        for (epoch, entry) in &entries {
+            if let Err(err) = entry.validate() {
+                tracing::warn!(
+                    node = self.id.0,
+                    epoch,
+                    %err,
+                    "not replaying an invalid layout the journal holds"
+                );
+                continue;
+            }
+            if *epoch == built
+                && self
+                    .topology
+                    .layout_at(built)
+                    .is_some_and(|layout| layout.map() != *entry.live())
+            {
+                // The built layout stays: the host's word on what this node
+                // runs over. The transition in progress, if any, is restored
+                // over it.
+                tracing::warn!(
+                    node = self.id.0,
+                    epoch,
+                    "the topology was built over another layout than the one decided for \
+                     its epoch; build it as at the first start, or over the decided layout"
+                );
+            }
+            self.install_decided(*epoch, entry, installed);
+        }
+    }
+
+    /// Installs `entry`, decided at `epoch`, into the topology and the
+    /// reconfiguration state ([`install_entry`](Self::install_entry)). An
+    /// activation's clock floor is in place before anything is planned under
+    /// the layout it installs. A layout the topology already holds for
+    /// `epoch` — the one it was built at — is kept.
+    fn install_decided(&self, epoch: u64, entry: &ConfigEntry, installed: &mut Installed) {
+        if let ConfigEntry::Active {
+            drained: Some(drained),
+            ..
+        } = entry
+        {
+            self.clock.restore(drained.floor);
+        }
+        self.topology.install_map(epoch, entry.live().clone());
+        self.install_entry(epoch, entry, installed);
     }
 
     /// What installing `entry` at `epoch` changes besides the topology: a

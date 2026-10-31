@@ -503,8 +503,8 @@ impl Sim {
     /// dynamic one, a fresh `DynamicTopology` at epoch 0 over the starting
     /// layout. The journal brings it to the epoch the node had installed, a
     /// transition in progress included — one kept at its installed epoch
-    /// would restore no transition, and never copy the slots the transition
-    /// gives it (#446).
+    /// restored no transition before #455, and never copied the slots the
+    /// transition gives it (#446).
     fn rebuild_topology(&mut self, i: usize) {
         if let Some(topology) = self.dynamic.get_mut(i) {
             *topology = Arc::new(DynamicTopology::new(

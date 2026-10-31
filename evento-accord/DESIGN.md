@@ -469,7 +469,13 @@ control plane, everything else is Accord.
   copy would fill the store its join needs empty, and a copy that ended its
   join left the node without the part of its own shard the join had not
   brought — its peers compacted past it meanwhile, so anti-entropy could not
-  bring it either. The activation waits for the copy, so for the join.
+  bring it either. The activation waits for the copy, so for the join. A node
+  restarted over its journal replays the metadata entries at and below the
+  epoch its `DynamicTopology` was built at (#455), so a transition in progress
+  comes back, with its fence and its layout's `live_since`, whatever epoch the
+  host built the topology at — kept as history alone, a node built at the
+  transition's epoch had its layout but no transition, copied nothing, and the
+  change never installed.
 
   **Dropping moved slots (#372; shipped).** A node's store holds the slots it
   owns under its installed layout, and the slots it is copying for the pending
