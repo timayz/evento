@@ -235,7 +235,18 @@ fn scripted(
 /// Node 0 recovers a write its scripted peers hold committed, treated as
 /// `peers` says: it must end once node 0 applied the write.
 async fn recover_against(peers: Peers) {
+    recover_against_with(peers, Duration::ZERO).await;
+}
+
+/// [`recover_against`], with `latency` each way on the links between node 0
+/// and its peers: a reply comes back two latencies after the question.
+async fn recover_against_with(peers: Peers, latency: Duration) {
+    init_tracing();
     let net = InMemoryNetwork::new();
+    for id in [NodeId(1), NodeId(2)] {
+        net.set_latency(NodeId(0), id, latency);
+        net.set_latency(id, NodeId(0), latency);
+    }
     let base = tokio::time::Instant::now();
     let (node, store) = node(&net, NodeId(0), base);
     let _loop = node.start(net.register(NodeId(0)));
@@ -293,6 +304,126 @@ async fn a_recovery_ends_once_another_node_decided_the_write() {
 #[tokio::test(start_paused = true)]
 async fn a_nack_below_the_ballot_does_not_end_a_recovery() {
     recover_against(Peers::NackBelowBallotFirst).await;
+}
+
+/// A recovery's first round waits for the reports of a slow quorum, up to
+/// `collect_timeout`, like every later phase (#452). Peers slower than
+/// `fast_timeout` to answer — a loaded disk flushing the promise, a long
+/// link — used to leave it with no report at all, "unknown to recovery
+/// quorum", once a sweep, each attempt leaving a higher promise on the
+/// replicas that answered late, and the coordinator refused by it.
+#[tokio::test(start_paused = true)]
+async fn a_recovery_waits_for_the_reports_of_a_slow_quorum() {
+    recover_against_with(Peers::ApplyElsewhere, Duration::from_millis(40)).await;
+}
+
+/// Plays a replica a recovery of node 1's already took over: it refuses the
+/// original coordinator's PreAccept for that recovery's higher ballot, then
+/// hands the coordinator the recovery's decision — the Commit and the
+/// Apply the recovery sends every replica, the coordinator included — and
+/// answers a recovery of the coordinator's own, should it start one, as a
+/// holder of the transaction committed.
+fn taken_over(
+    mut inbox: mpsc::Receiver<Envelope>,
+    sink: InMemorySink,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(env) = inbox.recv().await {
+            let mut replies = Vec::new();
+            let reply = match env.message {
+                Message::PreAccept {
+                    txn,
+                    epoch,
+                    keys,
+                    events,
+                } => {
+                    replies.push(Message::Commit {
+                        txn,
+                        epoch,
+                        execute_at: txn.0,
+                        deps: Vec::new(),
+                        keys,
+                        events,
+                        reply_to: NodeId(1),
+                    });
+                    replies.push(Message::Apply { txn, commit: true });
+                    Some(Message::Nack {
+                        txn,
+                        promised: Ballot(Timestamp {
+                            micros: txn.0.micros + 1,
+                            logical: 0,
+                            node: NodeId(1),
+                        }),
+                    })
+                }
+                Message::BeginRecovery {
+                    txn,
+                    ballot,
+                    keys,
+                    events,
+                    ..
+                } => Some(Message::BeginRecoveryOk {
+                    epoch: 0,
+                    txn,
+                    ballot,
+                    known: true,
+                    status: Status::Committed,
+                    accepted: Ballot(txn.0),
+                    execute_at: txn.0,
+                    deps: Vec::new(),
+                    superseding_rejects: false,
+                    wait: false,
+                    keys,
+                    events,
+                }),
+                Message::Commit { txn, .. } => Some(Message::ReadOk { txn, ok: true }),
+                _ => None,
+            };
+            if let Some(reply) = reply {
+                let _ = sink.send(env.from, reply).await;
+            }
+            for reply in replies {
+                let _ = sink.send(env.from, reply).await;
+            }
+        }
+    })
+}
+
+/// A coordinator whose PreAccept a replica refuses for a higher ballot — a
+/// recovery took the write over, as a peer's sweep does past
+/// `recovery_timeout` — ends its round at once and takes that recovery's
+/// decision as it lands here, instead of waiting out `collect_timeout` for
+/// a quorum that votes at its ballot no more (#452): on a loaded cluster,
+/// that wait was the write's latency.
+#[tokio::test(start_paused = true)]
+async fn a_write_refused_for_a_higher_ballot_settles_without_waiting_out_the_collect_timeout() {
+    init_tracing();
+    let net = InMemoryNetwork::new();
+    let base = tokio::time::Instant::now();
+    let (node, store) = node(&net, NodeId(0), base);
+    let _loop = node.start(net.register(NodeId(0)));
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let _peers: Vec<_> = [NodeId(1), NodeId(2)]
+        .into_iter()
+        .map(|id| taken_over(net.register(id), net.sink(id)))
+        .collect();
+
+    let started = tokio::time::Instant::now();
+    let outcome = tokio::time::timeout(Duration::from_secs(20), node.write(vec![event("acc", 1)]))
+        .await
+        .expect("the write ends")
+        .expect("the write is settled by the recovery");
+    assert!(!outcome.conflict);
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_secs(1),
+        "the write took {took:?}: it waited out the collect timeout for votes at a ballot the replicas refused"
+    );
+    assert_eq!(
+        store.applied_log().len(),
+        1,
+        "the settled write is applied here"
+    );
 }
 
 /// Plays replica `id` of a write it holds pre-accepted, which another node's

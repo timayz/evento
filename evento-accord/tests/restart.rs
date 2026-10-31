@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use evento_accord::{
     DataStore, HybridLogicalClock, InMemoryDataStore, InMemoryJournal, InMemoryNetwork, Journal,
-    Key, Node, NodeId, ShardedTopology, StaticTopology, Status, Timestamp, Topology,
+    Key, Node, NodeConfig, NodeId, ShardedTopology, StaticTopology, Status, Timestamp, Topology,
     MAX_SKEW_MICROS,
 };
 use evento_core::Event;
@@ -491,6 +491,111 @@ async fn a_retired_node_refuses_to_write_and_the_reopened_one_writes_on() {
     reopened.recover_state().await.unwrap();
     reopened.write(vec![event("acc", 2)]).await.unwrap();
     assert_eq!(store.version("", "test/Account", "acc").await.unwrap(), 2);
+}
+
+/// Every node stopped, then reopened over its journal and store — a
+/// whole-group restart, or a cold copy of the whole group restored (#452):
+/// no node takes a contact for "truncated above its proven coverage". Its
+/// sync coverage starts over at the restart, but what it vouched for is in
+/// its journal, and a peer compacts no further than the reports it heard.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_whole_group_restart_raises_no_truncation_alarm() {
+    if std::env::var_os("RUST_LOG").is_some() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .without_time()
+            .with_writer(std::io::stderr)
+            .try_init();
+    }
+    let net = InMemoryNetwork::new();
+    let ids: Vec<NodeId> = (0..3).map(NodeId).collect();
+    let journals: Vec<Arc<InMemoryJournal>> =
+        (0..3).map(|_| Arc::new(InMemoryJournal::new())).collect();
+    let stores: Vec<Arc<InMemoryDataStore>> =
+        (0..3).map(|_| Arc::new(InMemoryDataStore::new())).collect();
+    let config = NodeConfig {
+        compaction_margin: Duration::from_millis(50),
+        anti_entropy_interval: Duration::from_millis(10),
+        // Every compaction reaches the journal: the floor a node restarts
+        // from is the one it reached.
+        truncate_interval: Duration::ZERO,
+        ..NodeConfig::default()
+    };
+    let open = |id: NodeId| {
+        let node = Node::new(
+            id,
+            Arc::new(StaticTopology::new(id, ids.clone())) as Arc<dyn Topology>,
+            Arc::new(HybridLogicalClock::new(id)),
+            Arc::new(net.sink(id)),
+            Arc::clone(&stores[id.0 as usize]) as Arc<dyn DataStore>,
+            Arc::clone(&journals[id.0 as usize]) as Arc<dyn Journal>,
+        )
+        .with_config(config);
+        let task = node.start(net.register(id));
+        (node, task)
+    };
+    let (mut nodes, mut tasks): (Vec<Node>, Vec<tokio::task::JoinHandle<()>>) =
+        ids.iter().map(|&id| open(id)).unzip();
+
+    for v in 1..=3 {
+        nodes[0].write(vec![event("acc", v)]).await.unwrap();
+    }
+    for store in &stores {
+        await_version(store, "acc", 3).await;
+    }
+    // Past the margin, every report covers the three writes. Sweeping by
+    // hand: a few rounds prove every node's coverage and compact. Then,
+    // the reports having moved on by the margin, nodes 1 and 2 sweep
+    // first and compact below node 0's older report; node 0, sweeping
+    // last, compacts below their fresh ones. Each journal keeps the floor
+    // its node reached — node 0's above node 1's, and no higher than what
+    // node 1 reported.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    for _ in 0..4 {
+        for node in &nodes {
+            node.sweep().await;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    nodes[1].sweep().await;
+    nodes[2].sweep().await;
+    nodes[0].sweep().await;
+    assert!(
+        nodes.iter().all(|node| node.metrics().compactions > 0),
+        "every node compacted before the restart"
+    );
+
+    // The whole group stops, then every node reopens over its files.
+    for (node, task) in nodes.drain(..).zip(tasks.drain(..)) {
+        node.retire().await;
+        task.abort();
+    }
+    for &id in &ids {
+        let (node, task) = open(id);
+        node.recover_state().await.unwrap();
+        nodes.push(node);
+        tasks.push(task);
+    }
+    // Each asked the others to confirm its journal as it started, before
+    // they all listened: the sweep asks again (#339).
+    for node in &nodes {
+        node.sweep().await;
+    }
+    for node in &nodes {
+        await_confirmed(node).await;
+    }
+
+    // Node 1's first anti-entropy round asks node 0, whose floor is above
+    // node 1's own: above the coverage node 1 has proven since it reopened
+    // (nothing yet), not above what it vouched for before.
+    nodes[1].sweep().await;
+    let metrics = nodes[1].metrics();
+    assert_eq!(
+        metrics.sync_contact_truncated, 0,
+        "a healthy whole-group restart was taken for a divergence"
+    );
+    assert!(!nodes[1].rejoin_required());
 }
 
 /// Waits until `node`, restarted over a journal that holds something, is
