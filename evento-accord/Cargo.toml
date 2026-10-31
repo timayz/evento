@@ -28,6 +28,7 @@ bytes = "1"
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 evento-fjall = { path = "../evento-fjall" }
+evento-turso = { path = "../evento-turso", features = ["accord"] }
 rand = { workspace = true }
 rcgen = "0.14"
 criterion = "0.8"

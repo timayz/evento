@@ -6,5 +6,6 @@
 #![allow(dead_code)]
 
 pub mod executor;
+pub mod inline;
 pub mod journal;
 pub mod store;
