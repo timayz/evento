@@ -140,6 +140,48 @@ impl Cluster {
 
 /// A test event appending `version` to aggregate `aggregate_id`. The routing
 /// key is unset, so the aggregate id is the Accord key.
+/// In a healthy cluster a report trails the sync coverage proving it by
+/// about an anti-entropy round: no clamp worth counting (#452). Only a
+/// report held back by more than the compaction margin — a node that has
+/// not re-proven its window since it started, restarted or healed — counts
+/// as `watermark_clamps`, so the counter means what the runbook says.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_report_trailing_its_coverage_within_the_margin_is_not_a_clamp() {
+    let config = NodeConfig {
+        recovery_interval: Duration::from_millis(10),
+        anti_entropy_interval: Duration::from_millis(20),
+        compaction_margin: Duration::from_millis(200),
+        ..NodeConfig::default()
+    };
+    let cluster = Cluster::start_with(3, config);
+    let _sweeps: Vec<_> = cluster.nodes.iter().map(|n| n.start_recovery()).collect();
+    for v in 1..=3 {
+        cluster.nodes[0]
+            .write(vec![event("acc", v, "Bumped")])
+            .await
+            .unwrap();
+    }
+    cluster.await_applied(&[0, 1, 2], 3).await;
+    // Coverage is proven within a few rounds; past the margin the reports
+    // settle into their steady state.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let before: Vec<u64> = cluster
+        .nodes
+        .iter()
+        .map(|n| n.metrics().watermark_clamps)
+        .collect();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let after: Vec<u64> = cluster
+        .nodes
+        .iter()
+        .map(|n| n.metrics().watermark_clamps)
+        .collect();
+    assert_eq!(
+        before, after,
+        "steady-state reports, trailing their coverage within the margin, counted as clamps"
+    );
+}
+
 fn event(aggregate_id: &str, version: u16, name: &str) -> Event {
     Event {
         aggregate_type: "test/Account".into(),

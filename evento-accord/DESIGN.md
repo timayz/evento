@@ -231,7 +231,15 @@ control plane, everything else is Accord.
   PreAccept / Accept / Commit / BeginRecovery / BeginRecoveryOk; each replica keeps it
   with the command (`Replica.routes`, `Journal::save_route`, record kind `Route`,
   dropped with the command). A **routed** recovery asks every replica of every route
-  shard and waits (up to `collect_timeout`) until each shard is accounted for. A
+  shard and waits (up to `collect_timeout`) until each shard is accounted for — and
+  so does an unrouted one since #452, for a slow quorum of its own shard and of its
+  keys' shards — asking the replicas yet to answer again every `recovery_interval`
+  under the same ballot, so a heal is used at once — then `fast_timeout` more for
+  the rest: at `fast_timeout` alone it decided nothing on a cluster whose replicas
+  flush slower than that, each attempt leaving a higher promise behind, which then
+  refused the live coordinator for nothing (its PreAccept and Accept now end once
+  the `Nack`s put the quorum out of reach, and `settle` first waits for the
+  recovery that outbid it to land its decision, then takes over). A
   replica that never witnessed the txn is handed none of its part on that first
   round (the coordinator holds its own shard's at most): it journals a promise
   (`Journal::save_promise`, record kind `Promise` — the blind promise is no longer
@@ -842,7 +850,9 @@ backend (sql/fjall). Phases, in order:
   covered` then intersects every commit quorum (fast quorums meet every majority),
   so every committed transaction below the report is provably held. Until a healed
   or restarted replica re-proves coverage it reports `MIN`, holding cluster
-  compaction back (`accord_watermark_clamps_total` counts this), which keeps the
+  compaction back (`accord_watermark_clamps_total` counts this: a report held back
+  by more than the margin, or by no coverage at all — not one trailing its coverage
+  by the anti-entropy round every report trails it by, #452), which keeps the
   missing commands exportable and truncating always safe (regression:
   `partitioned_minority_cannot_unblock_compaction_and_diverge`). **Durable
   reports** (#331): a peer may compact past what a report vouches for, and ship it
@@ -1622,6 +1632,24 @@ backend (sql/fjall). Phases, in order:
         (`a_never_commit_proof_split_across_shards_refuses_the_late_replicas`,
         `a_split_proof_needs_a_shard_that_rules_out_each_half`; the seed is
         pinned, `a_never_commit_proof_split_across_shards_is_settled`).
+        Writes stalled for minutes after a whole-group restart of a three-node
+        SQLite cluster (#452, found load-testing timada): the disks stalled
+        under the restart, and the protocol amplified it. A replica flushes
+        its vote before it answers; past `recovery_timeout` the peers' sweeps
+        took the live writes over; an unrouted recovery's first round waited
+        `fast_timeout` for reports and gave up with none ("unknown to
+        recovery quorum", once a sweep, each attempt leaving a higher promise
+        on the replicas that answered late); and the coordinator, its Accept
+        refused for that ballot, ignored the Nacks and waited out
+        `collect_timeout`. The first round now waits for a slow quorum of
+        answers (`a_recovery_waits_for_the_reports_of_a_slow_quorum`), a
+        refused round ends at once
+        (`a_write_refused_for_a_higher_ballot_settles_without_waiting_out_the_collect_timeout`),
+        the truncation tripwire counts what the node vouched for — its
+        durable fence — not only the coverage a restart starts over
+        (`a_whole_group_restart_raises_no_truncation_alarm`), and a report
+        trailing its coverage by an anti-entropy round is no clamp
+        (`a_report_trailing_its_coverage_within_the_margin_is_not_a_clamp`).
   - [ ] **Real-cluster soak + chaos** over days (kills, partitions, clock skew,
         disk pressure, slow disks/links) on actual hardware — zero production
         mileage today.

@@ -148,9 +148,12 @@ async fn a_committed_write_is_always_durable_on_a_quorum() {
 
     // Attempt a write. With the durability gate, nodes 0 and 1 withhold their acks
     // (they could not persist), so the coordinator cannot reach a durable quorum and
-    // the write must NOT report a durable commit.
+    // the write must NOT report a durable commit. It gives up a phase at a time,
+    // each at `collect_timeout`: the PreAccept, then the recovery that settles the
+    // write — whose first round waits for a quorum of answers too (#452) — and the
+    // wait for an outcome decided elsewhere.
     let result = tokio::time::timeout(
-        Duration::from_secs(3),
+        Duration::from_secs(10),
         cluster.nodes[0].write(vec![event("acc", 2, "Deposited")]),
     )
     .await

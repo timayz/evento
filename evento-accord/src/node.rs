@@ -356,6 +356,72 @@ impl std::fmt::Display for JournalRolledBack {
 
 impl std::error::Error for JournalRolledBack {}
 
+/// A round of a write's coordination a replica refused for a higher ballot
+/// (`Nack`): a recovery took the write over (#452). `settle` tells it apart
+/// to wait for that recovery's decision before it starts one of its own.
+#[derive(Debug, Clone, Copy)]
+struct Outbid(Ballot);
+
+impl std::fmt::Display for Outbid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "refused for a higher ballot {:?}: a recovery took the write over",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for Outbid {}
+
+/// A replica's answer to a coordinator's PreAccept or Accept: its vote, or a
+/// `Nack` naming the higher ballot it promised (see [`Outbid`]).
+enum Vote<T> {
+    Ok(T),
+    Nack(Ballot),
+}
+
+/// Whether `shard`'s quorum is out of a round's reach: with `nacked` refusals
+/// before this collection and those in `got`, fewer replicas are left to
+/// answer than the quorum needs beyond the votes in `got`.
+fn quorum_lost<T>(shard: &ShardPlan, got: &[(NodeId, Vote<T>)], nacked: usize) -> bool {
+    let refused = nacked
+        + got
+            .iter()
+            .filter(|(_, v)| matches!(v, Vote::Nack(_)))
+            .count();
+    refused + shard.slow_q > shard.replicas.len()
+}
+
+/// Splits a collection of votes into the votes per shard, the refusals per
+/// shard, and the highest ballot a refusal named.
+#[allow(clippy::type_complexity)]
+fn split_votes<T>(
+    votes: HashMap<ShardId, Vec<(NodeId, Vote<T>)>>,
+) -> (
+    HashMap<ShardId, Vec<(NodeId, T)>>,
+    HashMap<ShardId, usize>,
+    Option<Ballot>,
+) {
+    let mut oks: HashMap<ShardId, Vec<(NodeId, T)>> = HashMap::new();
+    let mut nacked: HashMap<ShardId, usize> = HashMap::new();
+    let mut outbid: Option<Ballot> = None;
+    for (shard, items) in votes {
+        let bucket = oks.entry(shard).or_default();
+        let refused = nacked.entry(shard).or_default();
+        for (from, vote) in items {
+            match vote {
+                Vote::Ok(item) => bucket.push((from, item)),
+                Vote::Nack(promised) => {
+                    *refused += 1;
+                    outbid = Some(outbid.map_or(promised, |b: Ballot| b.max(promised)));
+                }
+            }
+        }
+    }
+    (oks, nacked, outbid)
+}
+
 /// A node's liveness signal ([`Node::sweep_pressure`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SweepPressure {
@@ -3215,13 +3281,30 @@ impl Node {
 
         let mine = match self.proven_coverage(shard_peers) {
             Some(coverage) if coverage < local => {
-                self.metrics.record_watermark_clamp();
-                tracing::debug!(
-                    node = self.id.0,
-                    ?local,
-                    ?coverage,
-                    "watermark report clamped by sync coverage"
-                );
+                // In a healthy cluster a report trails the coverage proving
+                // it by about an anti-entropy round: no clamp worth
+                // counting. One held back by more than the margin — or by
+                // no coverage at all, proven since this node started,
+                // restarted or healed — is (#452).
+                let margin = self.settings.compaction_margin.as_micros() as u64;
+                if coverage == Timestamp::MIN
+                    || local.micros.saturating_sub(coverage.micros) > margin
+                {
+                    self.metrics.record_watermark_clamp();
+                    tracing::debug!(
+                        node = self.id.0,
+                        ?local,
+                        ?coverage,
+                        "watermark report clamped by sync coverage"
+                    );
+                } else {
+                    tracing::trace!(
+                        node = self.id.0,
+                        ?local,
+                        ?coverage,
+                        "watermark report trails its sync coverage"
+                    );
+                }
                 coverage
             }
             _ => local,
@@ -5419,26 +5502,43 @@ impl Node {
         // Stop as soon as each shard's **electorate** has returned a fast quorum
         // (the latency win: a coordinator co-located with the electorate need not
         // wait for remote, non-electorate replicas), or at the fast-path timeout.
-        let electorate_responders = |p: &ShardPlan, got: &[(NodeId, (Timestamp, Vec<TxnId>))]| {
-            got.iter()
-                .filter(|(from, _)| p.electorate.contains(from))
-                .count()
+        // A replica that promised a higher ballot — a recovery took the
+        // transaction over, as a peer's sweep does past `recovery_timeout` —
+        // votes at this one no more (`Nack`). The round goes on while the
+        // replicas yet to answer can still make the quorum: a quorum that
+        // accepts at the transaction's ballot commits it, whatever one
+        // replica promised. Once they cannot, it ends at once (`Outbid`), and
+        // the write is settled by that recovery, or by this node's own
+        // (`settle`), instead of waiting out `collect_timeout` for a quorum
+        // that will not come (#452).
+        let votes_of = |m: Message| match m {
+            Message::PreAcceptOk {
+                execute_at, deps, ..
+            } => Some(Vote::Ok((execute_at, deps))),
+            Message::Nack { promised, .. } => Some(Vote::Nack(promised)),
+            _ => None,
         };
-        let mut pre = self
+        let first = self
             .collect_by_shard_tagged(
                 rx,
                 plans,
-                |p, got| electorate_responders(p, got) >= p.fast_q,
+                |p, got| {
+                    got.iter()
+                        .filter(|(from, v)| matches!(v, Vote::Ok(_)) && p.electorate.contains(from))
+                        .count()
+                        >= p.fast_q
+                        || quorum_lost(p, got, 0)
+                },
                 Self::after(self.settings.fast_timeout),
                 HashSet::new(),
-                |m| match m {
-                    Message::PreAcceptOk {
-                        execute_at, deps, ..
-                    } => Some((execute_at, deps)),
-                    _ => None,
-                },
+                votes_of,
             )
             .await;
+        // A voter of the first round is not counted again: a duplicated
+        // reply would otherwise complete the quorum with fewer distinct
+        // replicas than it takes.
+        let voted: HashSet<NodeId> = first.values().flatten().map(|(from, _)| *from).collect();
+        let (mut pre, mut nacked, mut outbid) = split_votes(first);
         // The fast-path window may close before a slow quorum has witnessed the
         // txn (e.g. cold connections at startup, where the first handshake
         // outlasts `fast_timeout`). Keep collecting up to the slow-path budget
@@ -5448,34 +5548,37 @@ impl Node {
                 .iter()
                 .map(|p| (p.shard, p.slow_q.saturating_sub(pre[&p.shard].len())))
                 .collect();
-            // A voter of the first round is not counted again: a duplicated
-            // reply would otherwise complete the quorum with fewer distinct
-            // replicas than it takes.
-            let voted: HashSet<NodeId> = pre.values().flatten().map(|(from, _)| *from).collect();
             let more = self
                 .collect_by_shard_tagged(
                     rx,
                     plans,
-                    |p, got| got.len() >= remaining[&p.shard],
+                    |p, got| {
+                        got.iter().filter(|(_, v)| matches!(v, Vote::Ok(_))).count()
+                            >= remaining[&p.shard]
+                            || quorum_lost(p, got, nacked[&p.shard])
+                    },
                     Self::after(self.settings.collect_timeout),
                     voted,
-                    |m| match m {
-                        Message::PreAcceptOk {
-                            execute_at, deps, ..
-                        } => Some((execute_at, deps)),
-                        _ => None,
-                    },
+                    votes_of,
                 )
                 .await;
+            let (more, more_nacked, more_outbid) = split_votes(more);
             for (shard, mut items) in more {
                 if let Some(bucket) = pre.get_mut(&shard) {
                     bucket.append(&mut items);
                 }
             }
+            for (shard, n) in more_nacked {
+                *nacked.entry(shard).or_default() += n;
+            }
+            outbid = outbid.or(more_outbid);
         }
         for plan in plans {
             if pre[&plan.shard].len() < plan.slow_q {
                 self.deregister(txn);
+                if let Some(promised) = outbid {
+                    return Err(Outbid(promised).into());
+                }
                 anyhow::bail!("preaccept quorum not reached for shard {}", plan.shard);
             }
         }
@@ -5541,28 +5644,37 @@ impl Node {
                 .await;
             }
             let acks = self
-                .collect_by_shard(
+                .collect_by_shard_tagged(
                     rx,
                     plans,
-                    |p| p.slow_q,
+                    |p, got| {
+                        got.iter().filter(|(_, v)| matches!(v, Vote::Ok(_))).count() >= p.slow_q
+                            || quorum_lost(p, got, 0)
+                    },
                     Self::after(self.settings.collect_timeout),
+                    HashSet::new(),
                     |m| match m {
                         Message::AcceptOk { ballot, deps, .. } if ballot == Ballot(t0) => {
-                            Some(deps)
+                            Some(Vote::Ok(deps))
                         }
+                        Message::Nack { promised, .. } => Some(Vote::Nack(promised)),
                         _ => None,
                     },
                 )
                 .await;
+            let (acks, _, outbid) = split_votes(acks);
             for plan in plans {
                 if acks[&plan.shard].len() < plan.slow_q {
                     self.deregister(txn);
+                    if let Some(promised) = outbid {
+                        return Err(Outbid(promised).into());
+                    }
                     anyhow::bail!("accept quorum not reached for shard {}", plan.shard);
                 }
             }
             for (shard, deps_lists) in acks {
                 if let Some(set) = shard_deps.get_mut(&shard) {
-                    for deps in deps_lists {
+                    for (_, deps) in deps_lists {
                         set.extend(deps);
                     }
                 }
@@ -5819,6 +5931,26 @@ impl Node {
         self.deregister(txn);
         if let Some(conflict) = self.local_outcome(txn) {
             return Ok(CommitOutcome { txn, conflict });
+        }
+        // Refused for a higher ballot: a recovery holds the write and
+        // decides it. Where this node is a replica of the write's shard, the
+        // decision lands here as that recovery commits and applies it — wait
+        // for it first, up to `collect_timeout`, rather than start a second
+        // recovery racing the first: under load, that race was itself load
+        // (#452). A write this node holds nothing of is recovered at once.
+        if failure.downcast_ref::<Outbid>().is_some() && self.command_status(txn).is_some() {
+            let deadline = Self::after(self.settings.collect_timeout);
+            let mut outcome = None;
+            self.applied
+                .wait_until(deadline, || {
+                    outcome = self.local_outcome(txn);
+                    outcome.is_some()
+                })
+                .await;
+            if let Some(conflict) = outcome {
+                tracing::debug!(node = self.id.0, ?txn, error = %failure, "write settled by the recovery that outbid it");
+                return Ok(CommitOutcome { txn, conflict });
+            }
         }
         match self
             .recover_with(
@@ -6395,15 +6527,31 @@ impl Node {
     ) -> anyhow::Result<CommitOutcome> {
         // A transaction this node is actively coordinating must not be
         // recovered by the same node: `register` would replace the live
-        // coordination's response channel and starve it.
-        if txn.0.node == self.id
-            && self
+        // coordination's response channel and starve it. Nor is a recovery
+        // of it already in flight here cut short that way — a sweep's, met
+        // by one asked for meanwhile (`settle`, or by hand), the likelier
+        // since a first round waits for a quorum of answers (#452): this one
+        // waits for it, up to `collect_timeout`, and takes its outcome.
+        let in_flight = Self::after(self.settings.collect_timeout);
+        loop {
+            if let Some(conflict) = self.local_outcome(txn) {
+                return Ok(CommitOutcome { txn, conflict });
+            }
+            if !self
                 .pending
                 .lock()
                 .expect("pending poisoned")
                 .contains_key(&txn)
-        {
-            anyhow::bail!("transaction {txn:?} is locally in flight; not recovering it");
+            {
+                break;
+            }
+            if txn.0.node == self.id {
+                anyhow::bail!("transaction {txn:?} is locally in flight; not recovering it");
+            }
+            if Instant::now() >= in_flight {
+                anyhow::bail!("a recovery of {txn:?} is in flight here; not starting another");
+            }
+            tokio::time::sleep(self.settings.fast_timeout).await;
         }
 
         // Planned, counted and decided under the layout the transaction was
@@ -6507,15 +6655,15 @@ impl Node {
         )
         .await;
 
-        // Gather what every reachable replica knows within a short window,
-        // tagged with the responder so deps can be grouped by shard.
-        let mut resp = Self::collect_tagged(
-            rx,
-            all_nodes.len(),
-            Self::after(self.settings.fast_timeout),
-            |m| Self::recover_report(m, ballot),
-        )
-        .await;
+        // Gather what the replicas know, tagged with the responder so deps
+        // can be grouped by shard: the reports of a slow quorum of every
+        // shard the keys held here touch, up to `collect_timeout` — a
+        // replica flushes its promise before it answers, which a loaded
+        // disk or a long link puts past `fast_timeout` — then whoever else
+        // answers within a fast-path window more (#452).
+        let mut resp = self
+            .collect_first_reports(rx, layout, txn, keys, events, ballot)
+            .await;
         if let Some(promised) = Self::nack_in(&resp) {
             return Ok(Attempt::Retry(promised));
         }
@@ -7213,6 +7361,118 @@ impl Node {
                 Ok(None) | Err(_) => break,
             }
         }
+        resp
+    }
+
+    /// The first round's reports of an unrouted recovery (#452): collected
+    /// until a slow quorum of every shard that `keys` — what this node holds
+    /// of the transaction — touch has answered, with a report, a refusal or
+    /// a Nack, for at most `collect_timeout`; then for `fast_timeout` more
+    /// while other replicas are still to answer, a surer decision with every
+    /// report — like a routed recovery's
+    /// ([`collect_route_reports`](Self::collect_route_reports)). A round
+    /// that ended at `fast_timeout` with whatever had arrived decided
+    /// nothing on a cluster whose replicas take longer than that to flush a
+    /// promise before they answer, and every attempt left a higher promise
+    /// on the replicas that answered late, which then refused the original
+    /// coordinator's rounds for nothing.
+    async fn collect_first_reports(
+        &self,
+        rx: &mut mpsc::UnboundedReceiver<(NodeId, Message)>,
+        layout: &Layout,
+        txn: TxnId,
+        keys: &[Key],
+        events: &[Event],
+        ballot: Ballot,
+    ) -> Vec<(NodeId, RecoverResp)> {
+        // The shards to hear from: those of the keys this node holds of the
+        // transaction — none, when the reports are to reveal them — and its
+        // own, which holds the transaction since this node does.
+        let mut quorums: Vec<(Vec<NodeId>, usize)> = Self::plan(layout, keys, events)
+            .0
+            .into_iter()
+            .map(|plan| (plan.replicas, plan.slow_q))
+            .collect();
+        if let Some(shard) = layout.node_shard(self.id) {
+            let replicas = layout.replicas_of(shard).to_vec();
+            if !quorums.iter().any(|(nodes, _)| *nodes == replicas) {
+                quorums.push((replicas, layout.slow_quorum_of(shard)));
+            }
+        }
+        let nodes = layout.nodes().len();
+        let quorum = |resp: &[(NodeId, RecoverResp)]| {
+            quorums.iter().all(|(replicas, slow_q)| {
+                resp.iter()
+                    .filter(|(from, _)| replicas.contains(from))
+                    .count()
+                    >= *slow_q
+            })
+        };
+        let mut resp: Vec<(NodeId, RecoverResp)> = Vec::new();
+        // One report per responder (see `collect_tagged`).
+        let mut seen: HashSet<NodeId> = HashSet::new();
+        let mut quorum_heard = quorum(&resp);
+        let mut deadline = Self::after(if quorum_heard {
+            self.settings.fast_timeout
+        } else {
+            self.settings.collect_timeout
+        });
+        // The replicas yet to answer are asked again every
+        // `recovery_interval`, under the same ballot (a repeat is answered
+        // alike, and counted once): a question lost to a partition is not
+        // waited out, and a heal meanwhile is used at once — the cadence
+        // the sweep used to retry at, without a new ballot and a new
+        // promise each time.
+        let again_every = self.settings.recovery_interval;
+        let mut again_at = Instant::now() + again_every;
+        while seen.len() < nodes && Self::nack_in(&resp).is_none() {
+            match tokio::time::timeout_at(deadline.min(again_at), rx.recv()).await {
+                Ok(Some((from, message))) => {
+                    if let Some(report) = Self::recover_report(message, ballot) {
+                        if seen.insert(from) {
+                            resp.push((from, report));
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    let silent: Vec<NodeId> = layout
+                        .nodes()
+                        .into_iter()
+                        .filter(|node| !seen.contains(node))
+                        .collect();
+                    self.broadcast(
+                        &silent,
+                        Message::BeginRecovery {
+                            txn,
+                            ballot,
+                            epoch: layout.epoch(),
+                            keys: keys.to_vec(),
+                            events: events.to_vec(),
+                            round: RecoveryRound::Ask,
+                        },
+                    )
+                    .await;
+                    again_at = Instant::now() + again_every;
+                }
+            }
+            if !quorum_heard && quorum(&resp) {
+                quorum_heard = true;
+                deadline = Self::after(self.settings.fast_timeout);
+            }
+        }
+        tracing::trace!(
+            node = self.id.0,
+            ?ballot,
+            shards = quorums.len(),
+            answered = seen.len(),
+            of = nodes,
+            quorum_heard,
+            "first recovery round collected"
+        );
         resp
     }
 
@@ -8799,25 +9059,33 @@ impl Node {
             self.record_sync_coverage(contact, coverage);
         }
         // Tripwire: an anti-entropy contact that already truncated above what
-        // this node has applied can no longer ship the window in between —
+        // this node holds for sure can no longer ship the window in between —
         // compaction outran repair, the divergence the coverage clamp exists
-        // to prevent (or an operator compacted manually). A bootstrapping
-        // joiner is legitimately below the contact's floor: the snapshot
-        // covers it.
+        // to prevent (or an operator compacted manually). What this node
+        // holds for sure: its proven coverage, and — whatever that is, since
+        // it starts over at a restart — everything below its durable vote
+        // fence, which covers every report it ever made: a peer compacts no
+        // further than the reports it heard, so after a whole-group restart
+        // a contact's floor above this node's own is no alarm (#452). A
+        // bootstrapping joiner is legitimately below the contact's floor:
+        // the snapshot covers it.
         if !want_snapshot {
-            let (applied, floor) = {
+            let (applied, floor, fence) = {
                 let replica = self.replica.lock().expect("replica poisoned");
                 (
                     replica.applied_through(self.margin_cutoff()),
                     replica.redundant_before(),
+                    replica.durable_fence(),
                 )
             };
             let shard_peers = self.shard_peers();
             let vouched = match self.proven_coverage(&shard_peers) {
                 Some(coverage) => coverage.min(applied),
                 None => applied,
-            };
+            }
+            .max(fence);
             if watermark > vouched.max(floor) {
+                self.metrics.record_sync_contact_truncated();
                 tracing::warn!(
                     node = self.id.0,
                     contact = contact.0,
