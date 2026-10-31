@@ -291,9 +291,12 @@ refuses anything else before a vote, and a node never installs it.
   restores the metadata-log/acceptor state and redundancy watermark. Then
   `start()`/`start_recovery()`. Build a `DynamicTopology` as at the first start, with
   the same start epoch and layout: the metadata log the journal holds brings it to the
-  epoch the node had installed, a transition in progress included. Built at the
-  installed epoch instead, the node restores that epoch's layout but no transition in
-  progress: it copies nothing for it, and the change never installs (#446). In-flight
+  epoch the node had installed, a transition in progress included. Built at a later
+  epoch, over the layout decided for it, the node replays the journal's entries at and
+  below that epoch too (#455), and comes back the same: the transition in progress at
+  that epoch under the fence it journaled, the point the live layout became live at,
+  the ended fences and the activations' floors. Built over another layout than the one
+  decided for that epoch, it warns and keeps the built one. In-flight
   transactions resume via the sweep, and anti-entropy catches the node up. A replayed transaction the store neither holds
   nor can take — it lost the write (§8), or misses an earlier one the journal never
   recorded — is handed back decided but un-applied and applied again once what

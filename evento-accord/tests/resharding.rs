@@ -117,6 +117,44 @@ fn spawn_node_over_cfg(
     }
 }
 
+/// A node restarted over `store` and `journal`, its `DynamicTopology` built
+/// at `epoch` over `shards` — as its host builds it — and recovered from the
+/// journal before it serves.
+async fn restart_node_at(
+    id: NodeId,
+    epoch: u64,
+    shards: Vec<Vec<NodeId>>,
+    net: &Arc<InMemoryNetwork>,
+    store: Arc<InMemoryDataStore>,
+    journal: Arc<InMemoryJournal>,
+    config: NodeConfig,
+) -> TestNode {
+    let clock = Arc::new(HybridLogicalClock::new(id));
+    let sink: Arc<dyn MessageSink> = Arc::new(net.sink(id));
+    let topology = Arc::new(DynamicTopology::new(id, epoch, shards));
+    let node = Node::new(
+        id,
+        topology.clone() as Arc<dyn Topology>,
+        clock,
+        sink,
+        Arc::clone(&store) as Arc<dyn DataStore>,
+        Arc::clone(&journal) as Arc<dyn Journal>,
+    )
+    .with_config(config);
+    let inbox = net.register(id);
+    node.recover_state()
+        .await
+        .expect("recovers from its journal");
+    let tasks = vec![node.start(inbox), node.start_recovery()];
+    TestNode {
+        node,
+        store,
+        journal,
+        topology,
+        tasks,
+    }
+}
+
 fn ids(nodes: &[u64]) -> Vec<NodeId> {
     nodes.iter().copied().map(NodeId).collect()
 }
@@ -965,4 +1003,107 @@ async fn a_replica_still_joining_copies_once_it_joined() {
         .await
         .unwrap();
     assert!(stale.conflict, "the joined versions are enforced");
+}
+
+/// A node whose host builds its `DynamicTopology` at the epoch it had
+/// installed, with a layout transition in progress at that epoch, comes
+/// back with the transition (#455): the journal's entries at and below the
+/// build epoch are replayed, so it holds the transition under the fence it
+/// journaled, copies the slots the transition gives it, and the change
+/// installs. Before, those entries were history only: the node had the
+/// transition's layout but no transition, copied nothing, and the change
+/// waited for its copy for good.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_node_built_at_a_transitions_epoch_restores_the_transition() {
+    let net = InMemoryNetwork::new();
+    let before = vec![ids(&[0, 1, 2]), ids(&[3, 4, 5])];
+    let map = ShardMap::even(before.clone());
+    let left = id_in_shard(&map, 0, "left");
+    let right = id_in_shard(&map, 1, "right");
+    let mut nodes: Vec<TestNode> = (0..6)
+        .map(|id| spawn_node_cfg(NodeId(id), before.clone(), &net, quick()))
+        .collect();
+    for (id, version) in [(&left, 1), (&right, 1), (&right, 2)] {
+        nodes[0]
+            .node
+            .write(vec![event(id, version, "Bumped")])
+            .await
+            .unwrap();
+    }
+    await_versions(&nodes[5].store, &right, &[1, 2]).await;
+
+    // The two shards merge. With nodes 4 and 5 down, the second shard never
+    // drains (no slow quorum of its replicas reports a fence), so the merge
+    // stays a transition in progress, and node 0 — a gainer of its slots —
+    // installs the transition and journals its fence, copying nothing yet.
+    nodes[4].stop();
+    nodes[5].stop();
+    let merged = vec![ids(&[0, 1, 2, 3, 4, 5])];
+    let proposer = nodes[1].node.clone();
+    let proposed = merged.clone();
+    let change = tokio::spawn(async move { proposer.change_topology(1, proposed).await });
+    await_epoch(&nodes[0].topology, 1).await;
+    let mut fences = Vec::new();
+    for _ in 0..2_000 {
+        fences = nodes[0].journal.load_fences().await.unwrap();
+        if !fences.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(fences.len(), 1, "node 0 journaled the transition's fence");
+    assert_eq!(nodes[0].topology.epoch(), 1, "the merge waits");
+
+    // Node 0 restarts, its topology built at the epoch it had installed over
+    // the transition's live layout.
+    nodes[0].stop();
+    let store = Arc::clone(&nodes[0].store);
+    let journal = Arc::clone(&nodes[0].journal);
+    let restarted =
+        restart_node_at(NodeId(0), 1, before.clone(), &net, store, journal, quick()).await;
+    assert_eq!(restarted.topology.epoch(), 1);
+    assert_eq!(
+        restarted.journal.load_fences().await.unwrap(),
+        fences,
+        "the fence comes back at the point it was journaled at, not recomputed"
+    );
+    nodes[0] = restarted;
+
+    // Nodes 4 and 5 come back, as at their first start: the second shard
+    // drains, node 0 copies the slots it gains, and the merge installs.
+    for i in [4usize, 5] {
+        let store = Arc::clone(&nodes[i].store);
+        let journal = Arc::clone(&nodes[i].journal);
+        nodes[i] = restart_node_at(
+            NodeId(i as u64),
+            0,
+            before.clone(),
+            &net,
+            store,
+            journal,
+            quick(),
+        )
+        .await;
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(30), change).await;
+    for n in &nodes {
+        await_epoch(&n.topology, 2).await;
+    }
+    assert_eq!(nodes[0].topology.layout().shards(), merged.as_slice());
+    await_versions(&nodes[0].store, &right, &[1, 2]).await;
+    let fresh = nodes[0]
+        .node
+        .write(vec![event(&right, 3, "Bumped")])
+        .await
+        .unwrap();
+    assert!(!fresh.conflict);
+    for n in [1usize, 3, 4] {
+        await_versions(&nodes[n].store, &right, &[1, 2, 3]).await;
+    }
+    let stale = nodes[0]
+        .node
+        .write(vec![event(&right, 2, "Again")])
+        .await
+        .unwrap();
+    assert!(stale.conflict, "the copied versions are enforced");
 }
