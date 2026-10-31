@@ -18,8 +18,10 @@ use evento_core::{
 };
 
 use crate::query::{
-    self, apply_filters, EventTable, MetaTable, SnapshotTable, SubscriberTable, EVENT_COLUMNS,
+    self, apply_filters, EventRow, EventTable, MetaTable, SnapshotTable, SubscriberTable,
+    EVENT_COLUMNS,
 };
+use crate::Reader;
 
 /// The `meta` key of the monotonic commit clock.
 const LAST_STAMP_KEY: &str = "last_stamp";
@@ -165,7 +167,7 @@ impl Turso {
                 .and_where(Expr::col(MetaTable::K).eq(LAST_STAMP_KEY))
                 .to_owned(),
         );
-        let last_stamp = match query::fetch_optional(&write, q).await? {
+        let last_stamp = match query::fetch_optional_prepared(&write, q).await? {
             Some(row) => {
                 let bytes = query::blob(&row, 0)?;
                 let bytes: [u8; 8] = bytes
@@ -204,9 +206,18 @@ impl Turso {
         self.last_stamp.load(Ordering::Acquire)
     }
 
+    /// A connection for reads of your own — a read model's queries through
+    /// [`Reader`], [`fetch_all`](crate::fetch_all) and friends. Cheap:
+    /// connections share the database's pager. Writes of your own may use it
+    /// too, serialized by you; the store's writes go through its own
+    /// connection.
+    pub fn connect(&self) -> anyhow::Result<turso::Connection> {
+        Ok(self.db.connect()?)
+    }
+
     /// A connection for a read.
     fn reader(&self) -> anyhow::Result<turso::Connection> {
-        Ok(self.db.connect()?)
+        self.connect()
     }
 
     /// The clock's time in whole seconds (for `created_at` / `updated_at`).
@@ -266,7 +277,9 @@ impl Turso {
 
         let tx = write.transaction().await.map_err(unknown)?;
         for q in statements {
-            query::execute(&tx, q).await.map_err(insert_error)?;
+            query::execute_prepared(&tx, q)
+                .await
+                .map_err(insert_error)?;
         }
         if let Some(stamp) = stamp {
             let q = query::prepare(
@@ -281,7 +294,7 @@ impl Turso {
                     )
                     .to_owned(),
             );
-            query::execute(&tx, q).await.map_err(unknown)?;
+            query::execute_prepared(&tx, q).await.map_err(unknown)?;
         }
         tx.commit().await.map_err(unknown)?;
 
@@ -322,7 +335,7 @@ impl Executor for Turso {
         args: Args,
         to_micros: Option<u64>,
     ) -> anyhow::Result<ReadResult<Event>> {
-        let page = {
+        let reader = {
             let mut statement = Query::select()
                 .columns(EVENT_COLUMNS)
                 .from(EventTable::Table)
@@ -349,10 +362,15 @@ impl Executor for Turso {
                             .and(Expr::col(EventTable::TimestampSubsec).lt(subsec_bound))),
                 );
             }
-            query::page(statement, &args)?
+            let mut reader = Reader::new(statement);
+            reader.args(args);
+            reader
         };
 
-        query::read_page(&self.reader()?, page).await
+        Ok(reader
+            .execute::<EventRow>(&self.reader()?)
+            .await?
+            .map(|row| row.0))
     }
 
     async fn latest_timestamp(
@@ -374,7 +392,7 @@ impl Executor for Turso {
             );
             query::prepare(&statement)
         };
-        let row = query::fetch_optional(&self.reader()?, q).await?;
+        let row = query::fetch_optional_prepared(&self.reader()?, q).await?;
         let ts = match row {
             Some(row) => query::opt_int(&row, 0)?,
             None => None,
@@ -397,7 +415,7 @@ impl Executor for Turso {
                 .and_where(Expr::col(EventTable::Tenant).eq(tenant))
                 .to_owned(),
         );
-        let row = query::fetch_optional(&self.reader()?, q).await?;
+        let row = query::fetch_optional_prepared(&self.reader()?, q).await?;
         let last = match row {
             Some(row) => query::opt_int(&row, 0)?,
             None => None,
@@ -427,7 +445,7 @@ impl Executor for Turso {
                 .limit(1)
                 .to_owned(),
         );
-        match query::fetch_optional(&self.reader()?, q).await? {
+        match query::fetch_optional_prepared(&self.reader()?, q).await? {
             Some(row) => Ok(Some(query::opt_text(&row, 0)?)),
             None => Ok(None),
         }
@@ -505,7 +523,7 @@ impl Executor for Turso {
                 .limit(1)
                 .to_owned(),
         );
-        match query::fetch_optional(&self.reader()?, q).await? {
+        match query::fetch_optional_prepared(&self.reader()?, q).await? {
             Some(row) => Ok(query::opt_text(&row, 0)?.map(query::cursor_value)),
             None => Ok(None),
         }
@@ -534,7 +552,7 @@ impl Executor for Turso {
         );
         // A missing row (an operator deleted the subscriber to stop it) means
         // "not running", not an error.
-        let Some(row) = query::fetch_optional(&self.reader()?, q).await? else {
+        let Some(row) = query::fetch_optional_prepared(&self.reader()?, q).await? else {
             return Ok(SubscriberStatus::default());
         };
         let id = query::text(&row, 0)?;
@@ -572,7 +590,7 @@ impl Executor for Turso {
                 )
                 .to_owned(),
         );
-        query::execute(&*self.write.lock().await, q).await?;
+        query::execute_prepared(&*self.write.lock().await, q).await?;
         Ok(())
     }
 
@@ -602,7 +620,7 @@ impl Executor for Turso {
         );
         // Zero matched rows means the fenced update was a no-op: the key is
         // owned by another worker, disabled, or gone.
-        let affected = query::execute(&*self.write.lock().await, q).await?;
+        let affected = query::execute_prepared(&*self.write.lock().await, q).await?;
         Ok(affected > 0)
     }
 
@@ -627,7 +645,7 @@ impl Executor for Turso {
                 .limit(1)
                 .to_owned(),
         );
-        match query::fetch_optional(&self.reader()?, q).await? {
+        match query::fetch_optional_prepared(&self.reader()?, q).await? {
             Some(row) => Ok(Some((
                 query::blob(&row, 0)?,
                 query::cursor_value(query::text(&row, 1)?),
@@ -687,7 +705,7 @@ impl Executor for Turso {
                 )
                 .to_owned(),
         );
-        query::execute(&*self.write.lock().await, q).await?;
+        query::execute_prepared(&*self.write.lock().await, q).await?;
         Ok(())
     }
 
@@ -707,7 +725,7 @@ impl Executor for Turso {
                 .and_where(Expr::col(SnapshotTable::Id).eq(id))
                 .to_owned(),
         );
-        query::execute(&*self.write.lock().await, q).await?;
+        query::execute_prepared(&*self.write.lock().await, q).await?;
         Ok(())
     }
 
@@ -725,7 +743,7 @@ impl Executor for Turso {
                 .and_where(Expr::col(EventTable::AggregatorId).eq(aggregate_id))
                 .to_owned(),
         );
-        query::execute(&*self.write.lock().await, q).await?;
+        query::execute_prepared(&*self.write.lock().await, q).await?;
         Ok(())
     }
 }

@@ -6,10 +6,13 @@ use syn::{
 };
 
 /// Parsed arguments for
-/// `#[evento::projection(cursor = <Type>, id = <field>, name = "...", Derive1, Derive2, ...)]`
+/// `#[evento::projection(cursor = <Type>, id = <field>, name = "...", backend = <sql|turso>, Derive1, Derive2, ...)]`
 struct ProjectionCursorArgs {
     /// Cursor field type; defaults to `String`.
     cursor: Option<Type>,
+    /// The backend a `Cursor` derive in the list binds to; forwarded as a
+    /// struct-level `#[cursor(backend = ...)]`.
+    backend: Option<Ident>,
     /// Field holding the aggregate id; when set, `ProjectionAggregate` is
     /// implemented too.
     id: Option<Ident>,
@@ -23,6 +26,7 @@ impl Parse for ProjectionCursorArgs {
     fn parse(input: ParseStream) -> Result<Self> {
         let mut args = Self {
             cursor: None,
+            backend: None,
             id: None,
             name: None,
             derives: vec![],
@@ -34,6 +38,16 @@ impl Parse for ProjectionCursorArgs {
                 input.parse::<Token![=]>()?;
                 match key.to_string().as_str() {
                     "cursor" if args.cursor.is_none() => args.cursor = Some(input.parse()?),
+                    "backend" if args.backend.is_none() => {
+                        let backend: Ident = input.parse()?;
+                        if backend != "sql" && backend != "turso" {
+                            return Err(Error::new(
+                                backend.span(),
+                                "unknown backend; expected `backend = sql` or `backend = turso`",
+                            ));
+                        }
+                        args.backend = Some(backend);
+                    }
                     "id" if args.id.is_none() => args.id = Some(input.parse()?),
                     "name" if args.name.is_none() => {
                         let lit: LitStr = input.parse().map_err(|e| {
@@ -56,13 +70,13 @@ impl Parse for ProjectionCursorArgs {
                         }
                         args.name = Some(lit);
                     }
-                    "cursor" | "id" | "name" => {
+                    "cursor" | "backend" | "id" | "name" => {
                         return Err(Error::new(key.span(), format!("duplicate `{key}` option")));
                     }
                     _ => {
                         return Err(Error::new(
                             key.span(),
-                            "unknown option; expected `cursor = <Type>`, `id = <field>`, `name = \"...\"`, or derive paths",
+                            "unknown option; expected `cursor = <Type>`, `backend = <sql|turso>`, `id = <field>`, `name = \"...\"`, or derive paths",
                         ));
                     }
                 }
@@ -246,8 +260,27 @@ pub fn projection_cursor_impl(attr: TokenStream, input: &DeriveInput) -> Result<
         }
     });
 
+    // `backend = turso` reaches the `Cursor` derive as its struct-level
+    // helper attribute — only when that derive is in the list, since the
+    // attribute is otherwise unknown.
+    let derives_cursor = existing_derives
+        .iter()
+        .chain(custom_derives.iter())
+        .any(|path| path.segments.last().is_some_and(|s| s.ident == "Cursor"));
+    let backend_attr = match &args.backend {
+        Some(backend) if derives_cursor => Some(quote! { #[cursor(backend = #backend)] }),
+        Some(backend) => {
+            return Err(Error::new(
+                backend.span(),
+                "`backend` only applies to a `Cursor` derive; add `Cursor` to the derive list",
+            ));
+        }
+        None => None,
+    };
+
     Ok(quote! {
         #[derive(Default, Clone, #(#existing_derives,)* #(#custom_derives),*)]
+        #backend_attr
         #(#other_attrs)*
         #vis struct #struct_name #generics {
             #(#existing_fields,)*

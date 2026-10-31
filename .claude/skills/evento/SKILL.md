@@ -61,7 +61,21 @@ let executor = evento::Turso::open("./events.db").await?;
 
 // Tests/simulations: an in-memory database, gone when the last clone drops.
 let executor = evento::Turso::in_memory().await?;
+
+// Your own migrations share the database under your app name
+// (evento's are the app "evento"):
+const APP: evento::turso::migrate::Migrations = evento::turso::migrate::Migrations::new(
+    "my-app", &[evento::turso::migrate::Migration::up("001_views", "CREATE TABLE ...")]);
+let mut conn = executor.connect()?;
+APP.to_latest(&mut conn).await.map_err(|(_, e)| e)?;
 ```
+
+Read models on Turso mirror the SQL ones: `#[evento::projection(backend = turso,
+evento::turso::FromRow, Cursor, Debug)]` derives the row decoding (`#[turso(default)]`
+for a non-column field; `evento::turso::Text<T>` for an enum stored as text) and the
+`#[cursor(by_name, Col::X, n)]` wrappers; `evento::turso::Reader::new(select).args(args)
+.execute::<ViewByName>(&conn)` pages them; `evento::turso::{execute, fetch_all,
+fetch_optional, fetch_one}` run sea-query statements on a `conn = executor.connect()?`.
 
 ### Remote (client/server split) and executor combinators
 

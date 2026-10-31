@@ -1,15 +1,16 @@
-//! sea-query → Turso glue: statements are built with sea-query's SQLite
-//! dialect, their bound values converted to [`turso::Value`]s, and rows read
-//! back by column position.
+//! Running sea-query statements on Turso: statements are built with
+//! sea-query's SQLite dialect, their bound values converted to
+//! [`turso::Value`]s, and rows read back through [`FromRow`].
 
 use sea_query::{Cond, Expr, ExprTrait, Iden, SelectStatement, SqliteQueryBuilder, Values};
-use turso::{Connection, Row};
-use ulid::Ulid;
+use turso::Connection;
 
 use evento_core::{
-    cursor::{Args, Cursor, Edge, PageInfo, ReadResult, Value},
-    Event, EventFilter, RoutingKey, TenantFilter,
+    cursor::{Cursor, Value},
+    Event, EventCursor, EventFilter, RoutingKey, TenantFilter,
 };
+
+use crate::{Bind, FromRow, Row};
 
 /// Column identifiers for the `event` table.
 #[derive(Iden, Clone, Copy)]
@@ -109,7 +110,7 @@ pub(crate) struct Prepared {
 }
 
 /// Renders `statement` for SQLite.
-pub(crate) fn prepare<S: SqlStatement>(statement: &S) -> Prepared {
+pub(crate) fn prepare<S: Statement + ?Sized>(statement: &S) -> Prepared {
     let (sql, values) = statement.build_sqlite();
     Prepared {
         sql,
@@ -117,30 +118,32 @@ pub(crate) fn prepare<S: SqlStatement>(statement: &S) -> Prepared {
     }
 }
 
-/// The sea-query statement kinds this crate renders.
-pub(crate) trait SqlStatement {
+/// A sea-query statement [`execute`], [`fetch_all`] and the other helpers run:
+/// select, insert, update or delete.
+pub trait Statement {
+    /// Renders the statement in SQLite's dialect, with its bound values.
     fn build_sqlite(&self) -> (String, Values);
 }
 
-impl SqlStatement for sea_query::SelectStatement {
+impl Statement for sea_query::SelectStatement {
     fn build_sqlite(&self) -> (String, Values) {
         self.build(SqliteQueryBuilder)
     }
 }
 
-impl SqlStatement for sea_query::InsertStatement {
+impl Statement for sea_query::InsertStatement {
     fn build_sqlite(&self) -> (String, Values) {
         self.build(SqliteQueryBuilder)
     }
 }
 
-impl SqlStatement for sea_query::UpdateStatement {
+impl Statement for sea_query::UpdateStatement {
     fn build_sqlite(&self) -> (String, Values) {
         self.build(SqliteQueryBuilder)
     }
 }
 
-impl SqlStatement for sea_query::DeleteStatement {
+impl Statement for sea_query::DeleteStatement {
     fn build_sqlite(&self) -> (String, Values) {
         self.build(SqliteQueryBuilder)
     }
@@ -180,40 +183,119 @@ fn param(value: sea_query::Value) -> turso::Value {
     }
 }
 
-/// Runs a statement that returns no rows; the number of rows affected.
-pub(crate) async fn execute(conn: &Connection, query: Prepared) -> turso::Result<u64> {
+/// Runs a rendered statement that returns no rows; the rows affected.
+pub(crate) async fn execute_prepared(conn: &Connection, query: Prepared) -> turso::Result<u64> {
     conn.execute(query.sql, turso::params_from_iter(query.params))
         .await
 }
 
-/// Every row a statement returns.
-pub(crate) async fn fetch_all(conn: &Connection, query: Prepared) -> turso::Result<Vec<Row>> {
+/// Every row a rendered statement returns, with the column names.
+pub(crate) async fn fetch_rows(
+    conn: &Connection,
+    query: Prepared,
+) -> turso::Result<(Vec<String>, Vec<turso::Row>)> {
     let mut rows = conn
         .query(query.sql, turso::params_from_iter(query.params))
         .await?;
+    let columns = rows.column_names();
     let mut out = Vec::new();
     while let Some(row) = rows.next().await? {
         out.push(row);
     }
-    Ok(out)
+    Ok((columns, out))
 }
 
-/// The first row a statement returns, if any (the rest are drained so the
-/// statement runs to completion).
-pub(crate) async fn fetch_optional(
+/// Every row a rendered statement returns, decoded.
+pub(crate) async fn fetch_prepared<O: FromRow>(
     conn: &Connection,
     query: Prepared,
-) -> turso::Result<Option<Row>> {
-    Ok(fetch_all(conn, query).await?.into_iter().next())
+) -> anyhow::Result<Vec<O>> {
+    let (columns, rows) = fetch_rows(conn, query).await?;
+    rows.iter()
+        .map(|row| O::from_row(&Row::new(&columns, row)))
+        .collect()
+}
+
+/// Runs a statement that returns no rows — an insert, update or delete —
+/// on `conn`; the number of rows affected.
+///
+/// ```rust,no_run
+/// # use sea_query::{Expr, ExprTrait, Query};
+/// # use evento_turso::{Turso, SubscriberTable};
+/// # async fn run(store: Turso) -> anyhow::Result<()> {
+/// let conn = store.connect()?;
+/// let deleted = evento_turso::execute(
+///     &conn,
+///     &Query::delete()
+///         .from_table(SubscriberTable::Table)
+///         .and_where(Expr::col(SubscriberTable::Key).eq("orders.report"))
+///         .to_owned(),
+/// )
+/// .await?;
+/// # let _ = deleted;
+/// # Ok(())
+/// # }
+/// ```
+pub async fn execute<S: Statement + ?Sized>(
+    conn: &Connection,
+    statement: &S,
+) -> anyhow::Result<u64> {
+    let prepared = prepare(statement);
+    Ok(execute_prepared(conn, prepared).await?)
+}
+
+/// Every row `statement` returns on `conn`, decoded as `O`.
+pub async fn fetch_all<O: FromRow, S: Statement + ?Sized>(
+    conn: &Connection,
+    statement: &S,
+) -> anyhow::Result<Vec<O>> {
+    let prepared = prepare(statement);
+    fetch_prepared(conn, prepared).await
+}
+
+/// The first row `statement` returns on `conn`, decoded as `O`, if any (the
+/// rest are drained so the statement runs to completion).
+pub async fn fetch_optional<O: FromRow, S: Statement + ?Sized>(
+    conn: &Connection,
+    statement: &S,
+) -> anyhow::Result<Option<O>> {
+    Ok(fetch_all(conn, statement).await?.into_iter().next())
+}
+
+/// The one row `statement` returns on `conn`, decoded as `O`; an error when
+/// there is none.
+pub async fn fetch_one<O: FromRow, S: Statement + ?Sized>(
+    conn: &Connection,
+    statement: &S,
+) -> anyhow::Result<O> {
+    fetch_optional(conn, statement)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("the query returned no row"))
+}
+
+/// Every row a rendered statement returns, without the column names.
+pub(crate) async fn fetch_rows_only(
+    conn: &Connection,
+    query: Prepared,
+) -> turso::Result<Vec<turso::Row>> {
+    Ok(fetch_rows(conn, query).await?.1)
+}
+
+/// The first row a rendered statement returns, if any.
+pub(crate) async fn fetch_optional_prepared(
+    conn: &Connection,
+    query: Prepared,
+) -> turso::Result<Option<turso::Row>> {
+    Ok(fetch_rows(conn, query).await?.1.into_iter().next())
 }
 
 /// Column `i` of `row` as text.
-pub(crate) fn text(row: &Row, i: usize) -> anyhow::Result<String> {
+pub(crate) fn text(row: &turso::Row, i: usize) -> anyhow::Result<String> {
     opt_text(row, i)?.ok_or_else(|| anyhow::anyhow!("column {i}: unexpected NULL"))
 }
 
 /// Column `i` of `row` as optional text.
-pub(crate) fn opt_text(row: &Row, i: usize) -> anyhow::Result<Option<String>> {
+pub(crate) fn opt_text(row: &turso::Row, i: usize) -> anyhow::Result<Option<String>> {
     match row.get_value(i)? {
         turso::Value::Null => Ok(None),
         turso::Value::Text(s) => Ok(Some(s)),
@@ -222,12 +304,12 @@ pub(crate) fn opt_text(row: &Row, i: usize) -> anyhow::Result<Option<String>> {
 }
 
 /// Column `i` of `row` as an integer.
-pub(crate) fn int(row: &Row, i: usize) -> anyhow::Result<i64> {
+pub(crate) fn int(row: &turso::Row, i: usize) -> anyhow::Result<i64> {
     opt_int(row, i)?.ok_or_else(|| anyhow::anyhow!("column {i}: unexpected NULL"))
 }
 
 /// Column `i` of `row` as an optional integer.
-pub(crate) fn opt_int(row: &Row, i: usize) -> anyhow::Result<Option<i64>> {
+pub(crate) fn opt_int(row: &turso::Row, i: usize) -> anyhow::Result<Option<i64>> {
     match row.get_value(i)? {
         turso::Value::Null => Ok(None),
         turso::Value::Integer(v) => Ok(Some(v)),
@@ -236,14 +318,14 @@ pub(crate) fn opt_int(row: &Row, i: usize) -> anyhow::Result<Option<i64>> {
 }
 
 /// Column `i` of `row` as a blob.
-pub(crate) fn blob(row: &Row, i: usize) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn blob(row: &turso::Row, i: usize) -> anyhow::Result<Vec<u8>> {
     match row.get_value(i)? {
         turso::Value::Blob(v) => Ok(v),
         other => anyhow::bail!("column {i}: expected blob, got {other:?}"),
     }
 }
 
-/// The event columns [`decode_event`] expects, in order.
+/// The event columns an [`EventRow`] reads, in order.
 pub(crate) const EVENT_COLUMNS: [EventTable; 11] = [
     EventTable::Id,
     EventTable::Name,
@@ -258,30 +340,64 @@ pub(crate) const EVENT_COLUMNS: [EventTable; 11] = [
     EventTable::TimestampSubsec,
 ];
 
-/// An event row selected as [`EVENT_COLUMNS`]. Checked narrowing: an
-/// out-of-range column (negative timestamp, version above `u16::MAX`) is a
-/// decode error, not silent wraparound.
-pub(crate) fn decode_event(row: &Row) -> anyhow::Result<Event> {
-    let version = int(row, 4)?;
-    let timestamp = int(row, 9)?;
-    let timestamp_subsec = int(row, 10)?;
-    let metadata = blob(row, 6)?;
-    Ok(Event {
-        id: Ulid::from_string(&text(row, 0)?)?,
-        name: text(row, 1)?,
-        aggregate_type: text(row, 2)?,
-        aggregate_id: text(row, 3)?,
-        version: u16::try_from(version)
-            .map_err(|_| anyhow::anyhow!("version {version} out of range"))?,
-        data: blob(row, 5)?,
-        metadata: bitcode::decode(&metadata)?,
-        routing_key: opt_text(row, 7)?,
-        tenant: text(row, 8)?,
-        timestamp: u64::try_from(timestamp)
-            .map_err(|_| anyhow::anyhow!("timestamp {timestamp} out of range"))?,
-        timestamp_subsec: u32::try_from(timestamp_subsec)
-            .map_err(|_| anyhow::anyhow!("timestamp_subsec {timestamp_subsec} out of range"))?,
-    })
+/// An event row of the `event` table: [`FromRow`] over [`EVENT_COLUMNS`],
+/// paged by `timestamp, timestamp_subsec, version, id` — what the executor's
+/// `read` runs through the [`Reader`](crate::Reader).
+pub(crate) struct EventRow(pub(crate) Event);
+
+impl FromRow for EventRow {
+    fn from_row(row: &Row<'_>) -> anyhow::Result<Self> {
+        let metadata: Vec<u8> = row.get("metadata")?;
+        Ok(EventRow(Event {
+            id: row.get("id")?,
+            name: row.get("name")?,
+            aggregate_type: row.get("aggregator_type")?,
+            aggregate_id: row.get("aggregator_id")?,
+            // Checked narrowing: a version above `u16::MAX` or a negative
+            // timestamp is a decode error, not silent wraparound.
+            version: row.get("version")?,
+            data: row.get("data")?,
+            metadata: bitcode::decode(&metadata)?,
+            routing_key: row.get("routing_key")?,
+            // A select without the column reads as the default tenant.
+            tenant: row.try_get("tenant")?.unwrap_or_default(),
+            timestamp: row.get("timestamp")?,
+            timestamp_subsec: row.get("timestamp_subsec")?,
+        }))
+    }
+}
+
+impl Cursor for EventRow {
+    type T = EventCursor;
+
+    fn serialize(&self) -> Self::T {
+        self.0.serialize()
+    }
+}
+
+impl Bind for EventRow {
+    type T = EventTable;
+    type I = [EventTable; 4];
+    type V = [Expr; 4];
+    type Cursor = Self;
+
+    fn columns() -> Self::I {
+        [
+            EventTable::Timestamp,
+            EventTable::TimestampSubsec,
+            EventTable::Version,
+            EventTable::Id,
+        ]
+    }
+
+    fn values(cursor: EventCursor) -> Self::V {
+        [
+            cursor.t.into(),
+            cursor.s.into(),
+            cursor.v.into(),
+            cursor.i.into(),
+        ]
+    }
 }
 
 /// Adds the aggregator, routing-key and tenant filters to `statement`.
@@ -326,121 +442,6 @@ pub(crate) fn apply_filters(
     if let TenantFilter::Only(tenant) = tenant {
         statement.and_where(Expr::col(EventTable::Tenant).eq(tenant));
     }
-}
-
-/// The cursor columns, in sort order: `timestamp, timestamp_subsec, version, id`.
-const CURSOR_COLUMNS: [EventTable; 4] = [
-    EventTable::Timestamp,
-    EventTable::TimestampSubsec,
-    EventTable::Version,
-    EventTable::Id,
-];
-
-/// One keyset page of events, ready to run (see [`page`]).
-pub(crate) struct Page {
-    query: Prepared,
-    limit: u16,
-    backward: bool,
-}
-
-/// Turns `statement` (a select of [`EVENT_COLUMNS`] with its filters) into one
-/// keyset page: the cursor predicate, `ORDER BY` the cursor columns, and
-/// `LIMIT page + 1` to probe for more.
-pub(crate) fn page(mut statement: SelectStatement, args: &Args) -> anyhow::Result<Page> {
-    let (limit, cursor) = args.get_info();
-    let backward = args.is_backward();
-
-    if let Some(cursor) = cursor.as_ref() {
-        let cursor = Event::deserialize_cursor(cursor)?;
-        let values: [Expr; 4] = [
-            cursor.t.into(),
-            cursor.s.into(),
-            cursor.v.into(),
-            cursor.i.into(),
-        ];
-        // Nested from the last column out: `t > ? OR (t = ? AND (s > ? OR
-        // (s = ? AND (v > ? OR (v = ? AND id > ?)))))`, `<` when descending.
-        let mut expr = None::<Expr>;
-        for (col, value) in CURSOR_COLUMNS.iter().rev().zip(values.into_iter().rev()) {
-            let current = if backward {
-                Expr::col(*col).lt(value.clone())
-            } else {
-                Expr::col(*col).gt(value.clone())
-            };
-            expr = Some(match expr {
-                None => current,
-                Some(prev) => current.or(Expr::col(*col).eq(value).and(prev)),
-            });
-        }
-        if let Some(expr) = expr {
-            statement.and_where(expr);
-        }
-    }
-
-    let order = if backward {
-        sea_query::Order::Desc
-    } else {
-        sea_query::Order::Asc
-    };
-    for col in CURSOR_COLUMNS {
-        statement.order_by(col, order.clone());
-    }
-    statement.limit(u64::from(limit) + 1);
-
-    Ok(Page {
-        query: prepare(&statement),
-        limit,
-        backward,
-    })
-}
-
-/// Runs a [`page`]. Matches `evento_core::cursor::Reader` byte for byte: the
-/// edges of a backward page are reversed into ascending order, both boundary
-/// cursors are set, and only the paging direction's "more" flag is computed
-/// (the other stays `false`).
-pub(crate) async fn read_page(conn: &Connection, page: Page) -> anyhow::Result<ReadResult<Event>> {
-    let Page {
-        query,
-        limit,
-        backward,
-    } = page;
-    let mut rows = fetch_all(conn, query).await?;
-    let has_more = rows.len() > usize::from(limit);
-    if has_more {
-        rows.pop();
-    }
-
-    let mut edges = Vec::with_capacity(rows.len());
-    for row in &rows {
-        let node = decode_event(row)?;
-        edges.push(Edge {
-            cursor: node.serialize_cursor()?,
-            node,
-        });
-    }
-    if backward {
-        edges.reverse();
-    }
-
-    let start_cursor = edges.first().map(|e| e.cursor.clone());
-    let end_cursor = edges.last().map(|e| e.cursor.clone());
-    let page_info = if backward {
-        PageInfo {
-            has_previous_page: has_more,
-            has_next_page: false,
-            start_cursor,
-            end_cursor,
-        }
-    } else {
-        PageInfo {
-            has_previous_page: false,
-            has_next_page: has_more,
-            start_cursor,
-            end_cursor,
-        }
-    };
-
-    Ok(ReadResult { edges, page_info })
 }
 
 /// A cursor's opaque string, as stored in `TEXT` columns.
