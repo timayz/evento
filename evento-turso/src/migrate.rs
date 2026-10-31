@@ -1,28 +1,41 @@
-//! Schema migrations tracked in the database's `PRAGMA user_version`.
+//! Schema migrations, recorded per **app** in the database.
 //!
-//! A vendored copy of [turso-migrate](https://github.com/maun/turso-migrate)
-//! 0.1.2 by Manuel Adameit (MIT OR Apache-2.0; see `LICENSE-turso-migrate`),
-//! kept API-compatible so the crate can be swapped back in once it depends on
-//! a current `turso`. Vendored because turso-migrate pins `turso = "0.4"`,
-//! which Cargo cannot unify with the `turso` this crate uses.
+//! Derived from [turso-migrate](https://github.com/maun/turso-migrate) 0.1.2
+//! by Manuel Adameit (MIT OR Apache-2.0; see `LICENSE-turso-migrate`), with
+//! one change: where turso-migrate counts applied migrations in the
+//! database's `PRAGMA user_version`, this runner records each applied
+//! migration by name under an app namespace, in the table
+//! `_evento_turso_migrations`. Several independent lists — evento's schema
+//! under [`"evento"`](crate::MIGRATIONS), the accord journal's under
+//! `"evento-accord"`, and an application's own — then share one database
+//! without stepping on each other, as `sqlx_migrator`'s apps do.
 //!
-//! Migrations are applied in definition order, each in its own transaction,
-//! and the count applied so far is the database's `user_version`: no
-//! migrations table. Never modify a migration once it has been applied
-//! somewhere — append a new one.
+//! Migrations are applied in definition order, each in its own transaction
+//! together with its record. Never modify or reorder a migration once it has
+//! been applied somewhere — append a new one; a list whose names no longer
+//! match what the database recorded is refused.
 //!
 //! ```rust
 //! use evento_turso::migrate::{Migration, Migrations};
 //!
-//! const MIGRATIONS: Migrations = Migrations::new(&[
-//!     Migration::up("001", "CREATE TABLE friend(name TEXT NOT NULL);"),
-//!     evento_turso::up_file!("../migrations/0001_init.sql"),
-//! ]);
+//! // The application's own migrations, next to evento's in the same database.
+//! const APP_MIGRATIONS: Migrations = Migrations::new(
+//!     "my-app",
+//!     &[
+//!         Migration::up("001_friends", "CREATE TABLE friend(name TEXT NOT NULL);"),
+//!         evento_turso::up_fn!("002_seed", seed),
+//!     ],
+//! );
+//!
+//! async fn seed(conn: &turso::Connection) -> turso::Result<()> {
+//!     conn.execute("INSERT INTO friend (name) VALUES ('Alice')", ()).await?;
+//!     Ok(())
+//! }
 //!
 //! # async fn run() -> anyhow::Result<()> {
-//! let db = turso::Builder::new_local(":memory:").build().await?;
-//! let mut conn = db.connect()?;
-//! let applied = MIGRATIONS.to_latest(&mut conn).await.map_err(|(_, err)| err)?;
+//! let store = evento_turso::Turso::in_memory().await?; // applied evento's list
+//! let mut conn = store.database().connect()?;
+//! let applied = APP_MIGRATIONS.to_latest(&mut conn).await.map_err(|(_, err)| err)?;
 //! # let _ = applied;
 //! # Ok(())
 //! # }
@@ -34,6 +47,9 @@ use std::pin::Pin;
 use thiserror::Error;
 use turso::{Connection, Error};
 
+/// The table every app's applied migrations are recorded in.
+pub const MIGRATIONS_TABLE: &str = "_evento_turso_migrations";
+
 /// The future a function migration returns.
 pub type MigrationFuture<'a> = Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>>;
 
@@ -43,11 +59,31 @@ pub enum MigrationError {
     /// The database rejected a statement or a transaction.
     #[error("Turso error: {0}")]
     Turso(#[from] Error),
-    /// The database's `user_version` is negative or above the number of
-    /// migrations known here: it was migrated by a newer schema (or with a
-    /// feature this build lacks, see [`MIGRATIONS`](crate::MIGRATIONS)).
-    #[error("Database has user_version {0}, but it must be between 0 and {1}")]
-    InvalidUserVersion(i32, usize),
+    /// The database records more migrations for the app than the list
+    /// knows: it was migrated by a newer schema.
+    #[error("app {app}: database has {applied} migrations applied, but only {known} are known")]
+    Unknown {
+        /// The app namespace.
+        app: String,
+        /// How many migrations the database records for it.
+        applied: usize,
+        /// How many the list holds.
+        known: usize,
+    },
+    /// The migration recorded at a position is not the one the list holds
+    /// there: a migration was modified, renamed or reordered after it was
+    /// applied.
+    #[error("app {app}: migration {position} is recorded as {recorded:?}, but the list has {expected:?}")]
+    Mismatch {
+        /// The app namespace.
+        app: String,
+        /// The position in the list, from 1.
+        position: usize,
+        /// The name the database recorded.
+        recorded: String,
+        /// The name the list holds.
+        expected: String,
+    },
 }
 
 /// One migration step: a SQL script or an async Rust function.
@@ -55,14 +91,14 @@ pub enum MigrationError {
 pub enum Migration<'a> {
     /// A SQL script, run with `execute_batch`.
     Sql {
-        /// A name for logs.
+        /// The name recorded once applied; unique within its app.
         name: &'a str,
         /// The script.
         sql: &'a str,
     },
     /// A Rust function run inside the migration's transaction.
     Fn {
-        /// A name for logs.
+        /// The name recorded once applied; unique within its app.
         name: &'a str,
         /// The function.
         f: fn(&Connection) -> MigrationFuture<'_>,
@@ -90,7 +126,8 @@ impl<'a> Migration<'a> {
 }
 
 /// A migration from a SQL file, embedded with `include_str!` (the path is
-/// relative to the file invoking the macro, as for `include_str!`).
+/// relative to the file invoking the macro, as for `include_str!`); its name
+/// is the path.
 #[macro_export]
 macro_rules! up_file {
     ($path:literal) => {
@@ -109,19 +146,25 @@ macro_rules! up_fn {
     }};
 }
 
-/// An ordered list of migrations.
+/// An app's ordered list of migrations.
 pub struct Migrations<'a> {
+    app: &'a str,
     migrations: &'a [Migration<'a>],
 }
 
 impl<'a> Migrations<'a> {
-    /// Over `migrations`, in the order they apply.
-    pub const fn new(migrations: &'a [Migration<'a>]) -> Self {
-        Self { migrations }
+    /// The migrations of `app`, in the order they apply. The app name is the
+    /// namespace their records live under: pick one per list and keep it.
+    pub const fn new(app: &'a str, migrations: &'a [Migration<'a>]) -> Self {
+        Self { app, migrations }
     }
 
-    /// How many migrations the list holds: the `user_version` of a database
-    /// at the latest schema.
+    /// The app namespace.
+    pub const fn app(&self) -> &'a str {
+        self.app
+    }
+
+    /// How many migrations the list holds.
     pub const fn len(&self) -> usize {
         self.migrations.len()
     }
@@ -131,34 +174,59 @@ impl<'a> Migrations<'a> {
         self.migrations.is_empty()
     }
 
-    /// Applies every migration the database has not seen, each in its own
-    /// transaction that also advances `user_version`; returns how many were
-    /// applied. On an error, the tuple carries how many succeeded before it.
+    /// The names the database records as applied for this app, in order.
+    pub async fn applied(&self, conn: &Connection) -> Result<Vec<String>, Error> {
+        ensure_table(conn).await?;
+        let mut rows = conn
+            .query(
+                format!("SELECT name FROM {MIGRATIONS_TABLE} WHERE app = ? ORDER BY position ASC"),
+                [self.app],
+            )
+            .await?;
+        let mut names = Vec::new();
+        while let Some(row) = rows.next().await? {
+            names.push(row.get::<String>(0)?);
+        }
+        Ok(names)
+    }
+
+    /// Applies every migration the database has not recorded for this app,
+    /// each in its own transaction together with its record; returns how
+    /// many were applied. On an error, the tuple carries how many succeeded
+    /// before it. Refuses a database that records migrations the list does
+    /// not know, or under other names.
     pub async fn to_latest(&self, conn: &mut Connection) -> Result<usize, (usize, MigrationError)> {
-        let current_version = match get_user_version(conn).await {
-            Ok(v) => v,
+        let applied = match self.applied(conn).await {
+            Ok(applied) => applied,
             Err(e) => return Err((0, e.into())),
         };
-        let target_version = self.migrations.len() as i32;
-        if current_version == target_version {
-            return Ok(0);
-        }
-        if current_version < 0 || current_version > target_version {
+        if applied.len() > self.migrations.len() {
             return Err((
                 0,
-                MigrationError::InvalidUserVersion(current_version, self.migrations.len()),
+                MigrationError::Unknown {
+                    app: self.app.to_string(),
+                    applied: applied.len(),
+                    known: self.migrations.len(),
+                },
             ));
+        }
+        for (i, (recorded, migration)) in applied.iter().zip(self.migrations).enumerate() {
+            if recorded != migration.name() {
+                return Err((
+                    0,
+                    MigrationError::Mismatch {
+                        app: self.app.to_string(),
+                        position: i + 1,
+                        recorded: recorded.clone(),
+                        expected: migration.name().to_string(),
+                    },
+                ));
+            }
         }
 
         let mut applied_count = 0;
-        for (i, migration) in self
-            .migrations
-            .iter()
-            .enumerate()
-            .skip(current_version as usize)
-        {
-            let version = (i + 1) as i32;
-            #[cfg(feature = "tracing")]
+        for (i, migration) in self.migrations.iter().enumerate().skip(applied.len()) {
+            let position = (i + 1) as i64;
             let name = migration.name();
 
             let tx = match conn.transaction().await {
@@ -172,24 +240,24 @@ impl<'a> Migrations<'a> {
             };
             if let Err(e) = result {
                 #[cfg(feature = "tracing")]
-                tracing::error!(error = ?e, migration = %name, "migration failed");
+                tracing::error!(error = ?e, app = %self.app, migration = %name, "migration failed");
                 return Err((applied_count, e.into()));
             }
 
-            if let Err(e) = set_user_version(&tx, version).await {
+            if let Err(e) = record(&tx, self.app, position, name).await {
                 #[cfg(feature = "tracing")]
-                tracing::error!(error = ?e, migration = %name, "failed to update user_version");
+                tracing::error!(error = ?e, app = %self.app, migration = %name, "failed to record the migration");
                 return Err((applied_count, e.into()));
             }
 
             if let Err(e) = tx.commit().await {
                 #[cfg(feature = "tracing")]
-                tracing::error!(error = ?e, migration = %name, "failed to commit");
+                tracing::error!(error = ?e, app = %self.app, migration = %name, "failed to commit");
                 return Err((applied_count, e.into()));
             }
 
             #[cfg(feature = "tracing")]
-            tracing::debug!(migration = %name, "migration applied");
+            tracing::debug!(app = %self.app, migration = %name, "migration applied");
             applied_count += 1;
         }
 
@@ -209,18 +277,33 @@ impl<'a> Migrations<'a> {
     }
 }
 
-/// The database's `PRAGMA user_version`.
-pub async fn get_user_version(conn: &Connection) -> Result<i32, Error> {
-    let version = std::sync::Mutex::new(Ok(0));
-    conn.pragma_query("user_version", |row| {
-        *version.lock().expect("user_version poisoned") = row.get::<i32>(0);
-        Ok(())
-    })
-    .await?;
-    version.into_inner().expect("user_version poisoned")
+/// Creates the records table if absent.
+async fn ensure_table(conn: &Connection) -> Result<(), Error> {
+    conn.execute_batch(&format!(
+        "CREATE TABLE IF NOT EXISTS {MIGRATIONS_TABLE} (
+            app TEXT NOT NULL,
+            position INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            applied_at INTEGER NOT NULL,
+            PRIMARY KEY (app, position)
+        )"
+    ))
+    .await
 }
 
-async fn set_user_version(conn: &Connection, version: i32) -> Result<(), Error> {
-    conn.pragma_update("user_version", version).await?;
+/// Records `name` as `app`'s migration at `position`, on `conn` (the
+/// migration's transaction).
+async fn record(conn: &Connection, app: &str, position: i64, name: &str) -> Result<(), Error> {
+    let applied_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    conn.execute(
+        format!(
+            "INSERT INTO {MIGRATIONS_TABLE} (app, position, name, applied_at) VALUES (?, ?, ?, ?)"
+        ),
+        (app, position, name, applied_at),
+    )
+    .await?;
     Ok(())
 }

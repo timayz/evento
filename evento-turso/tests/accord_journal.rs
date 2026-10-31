@@ -631,7 +631,7 @@ async fn rejoin_bounds_round_trip() {
 #[tokio::test]
 async fn shares_a_database_with_the_store() {
     let store = Turso::in_memory().await.unwrap();
-    let journal = TursoJournal::new(store.database().clone()).unwrap();
+    let journal = TursoJournal::new(store.database().clone()).await.unwrap();
     round_trip(&journal).await;
     use evento_core::Executor;
     store

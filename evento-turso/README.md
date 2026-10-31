@@ -34,18 +34,37 @@ are totally ordered without a stability watermark. The clock is injectable
 
 ## Migrations
 
-The schema lives in [`migrations/`](migrations) and is tracked in the database's
-`PRAGMA user_version` by the `evento_turso::migrate` module, a vendored copy of
-[turso-migrate](https://github.com/maun/turso-migrate) (see
-[`LICENSE-turso-migrate`](LICENSE-turso-migrate)). `Turso::open` applies the pending
-migrations; `evento_turso::MIGRATIONS.to_latest(&mut conn)` applies them by hand.
+The schema lives in [`migrations/`](migrations). The `evento_turso::migrate` runner,
+derived from [turso-migrate](https://github.com/maun/turso-migrate) (see
+[`LICENSE-turso-migrate`](LICENSE-turso-migrate)), records each applied migration by
+name under an **app** namespace in the table `_evento_turso_migrations`, so several
+lists share one database: evento's schema is the app `evento`, the accord journal's
+is `evento-accord`, and your application's own migrations run under a name of yours.
+`Turso::open` applies evento's pending migrations; your list runs next to it:
+
+```rust,no_run
+use evento_turso::migrate::{Migration, Migrations};
+
+const APP_MIGRATIONS: Migrations = Migrations::new(
+    "my-app",
+    &[Migration::up("001_friends", "CREATE TABLE friend(name TEXT NOT NULL);")],
+);
+
+# async fn run() -> anyhow::Result<()> {
+let store = evento_turso::Turso::open("./events.db").await?;
+let mut conn = store.database().connect()?;
+APP_MIGRATIONS.to_latest(&mut conn).await.map_err(|(_, err)| err)?;
+# Ok(())
+# }
+```
 
 ## Accord journal
 
 With the `accord` feature the crate also provides `TursoJournal`, the
 [evento-accord](../evento-accord) consensus journal on Turso — in the same database
-as the events (`TursoJournal::new(store.database().clone())`) or in one of its own
-(`TursoJournal::open(path)`). The migrations then include the journal's tables.
+as the events (`TursoJournal::new(store.database().clone()).await`) or in one of its
+own (`TursoJournal::open(path)`); its constructors apply the journal's own
+migrations (`ACCORD_MIGRATIONS`, app `evento-accord`).
 
 ## Learn more
 
