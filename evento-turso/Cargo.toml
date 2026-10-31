@@ -44,10 +44,18 @@ rw = ["evento-core/rw"]
 macro = ["dep:evento-macro"]
 accord = ["dep:evento-accord"]
 tracing = ["dep:tracing"]
+# Turso's full-text search (tantivy-backed `CREATE INDEX … USING fts(..)`,
+# `MATCH`, `fts_match`, `fts_score`); every database this crate opens then has
+# Turso's index-method support switched on.
+fts = ["turso/fts"]
 
 [[test]]
 name = "accord_journal"
 required-features = ["accord"]
+
+[[test]]
+name = "fts"
+required-features = ["fts"]
 
 [lints]
 workspace = true
