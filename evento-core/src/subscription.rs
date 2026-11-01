@@ -1038,7 +1038,9 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                 // `start` worker, for its whole life) had handled so far. The
                 // lines are emitted in its scope, not with it as `parent:`, so
                 // that under an `info` filter, where this span is disabled,
-                // they still nest under `process` and keep `subscription`.
+                // they still nest under `process` and keep `subscription`. The
+                // ERROR lines repeat the three fields themselves, so a failure
+                // names its event at any filter level.
                 let span = tracing::debug_span!(
                     "event",
                     aggregate_type = event.node.aggregate_type.as_str(),
@@ -1072,7 +1074,15 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                         // Strict mode with continue_on_error: skip the poison
                         // event (acknowledged below) instead of re-reading and
                         // re-failing the same batch forever.
-                        span.in_scope(|| tracing::error!(key = key, "no handler, skipping event"));
+                        span.in_scope(|| {
+                            tracing::error!(
+                                key = key,
+                                aggregate_type = event.node.aggregate_type,
+                                aggregate_id = event.node.aggregate_id,
+                                event = event.node.name,
+                                "no handler, skipping event"
+                            )
+                        });
                         None
                     }
                     None => None,
@@ -1092,7 +1102,14 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                     if let Err(err) = result {
                         if !self.continue_on_error {
                             span.in_scope(|| {
-                                tracing::error!(error = %err, key = self.resolved_key(), "failed")
+                                tracing::error!(
+                                    error = %err,
+                                    key = self.resolved_key(),
+                                    aggregate_type = event.node.aggregate_type,
+                                    aggregate_id = event.node.aggregate_id,
+                                    event = event.node.name,
+                                    "failed"
+                                )
                             });
                             // Persist the successfully processed prefix before
                             // surfacing the error, so a retry resumes at the
@@ -1110,7 +1127,15 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                         // continue_on_error: log and acknowledge so the
                         // subscription makes progress past the failing event
                         // rather than retrying it forever.
-                        span.in_scope(|| tracing::error!(error = %err, "failed, skipping event"));
+                        span.in_scope(|| {
+                            tracing::error!(
+                                error = %err,
+                                aggregate_type = event.node.aggregate_type,
+                                aggregate_id = event.node.aggregate_id,
+                                event = event.node.name,
+                                "failed, skipping event"
+                            )
+                        });
                     } else {
                         span.in_scope(|| tracing::debug!("completed"));
                     }
@@ -2505,16 +2530,21 @@ mod tests {
 
     /// Handles `test/Thing`'s `Happened` by logging a line, the way a real
     /// handler's store or index would, so the test sees what a line emitted
-    /// from inside a handler carries.
-    struct LogsALine;
+    /// from inside a handler carries. Fails the aggregate named in `failing`.
+    struct LogsALine {
+        failing: Option<&'static str>,
+    }
 
     impl Handler<History> for LogsALine {
         fn handle<'a>(
             &'a self,
             _context: &'a Context<'a, History>,
-            _event: &'a Event,
+            event: &'a Event,
         ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>> {
-            Box::pin(async {
+            Box::pin(async move {
+                if self.failing == Some(event.aggregate_id.as_str()) {
+                    anyhow::bail!("boom");
+                }
                 tracing::info!("handled");
                 Ok(())
             })
@@ -2553,6 +2583,15 @@ mod tests {
     /// Runs one ephemeral pass over `count` events with [`LogsALine`] under a
     /// `fmt` subscriber filtering at `level`, and returns everything it wrote.
     async fn logged_pass_over(count: usize, level: tracing::Level) -> String {
+        logged_pass(count, level, LogsALine { failing: None }, false).await
+    }
+
+    async fn logged_pass(
+        count: usize,
+        level: tracing::Level,
+        handler: LogsALine,
+        continue_on_error: bool,
+    ) -> String {
         let captured = Captured::default();
         let writer = captured.clone();
         let subscriber = tracing_subscriber::fmt()
@@ -2562,14 +2601,43 @@ mod tests {
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        SubscriptionBuilder::<History>::new("logs")
+        let mut builder = SubscriptionBuilder::<History>::new("logs")
             .ephemeral()
             .no_retry()
-            .handler(LogsALine)
-            .run_once(&History::of(count))
-            .await
-            .unwrap();
+            .handler(handler);
+        if continue_on_error {
+            builder = builder.continue_on_error();
+        }
+        builder.run_once(&History::of(count)).await.unwrap();
         captured.text()
+    }
+
+    /// A handler failure is reported at ERROR with the event's identity on the
+    /// line itself, so under an `info` filter, where the DEBUG event span is
+    /// gone, the line still says which event failed.
+    #[tokio::test]
+    async fn under_an_info_filter_a_failure_still_names_its_event() {
+        let handler = LogsALine {
+            failing: Some("thing-1"),
+        };
+        let text = logged_pass(3, tracing::Level::INFO, handler, true).await;
+        let failed: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains("skipping event"))
+            .collect();
+        assert_eq!(failed.len(), 1, "{text}");
+        let line = failed[0];
+        assert!(line.contains("ERROR"), "{line}");
+        assert!(line.contains("process{subscription=\"logs\"}"), "{line}");
+        assert!(line.contains("aggregate_type=\"test/Thing\""), "{line}");
+        assert!(line.contains("aggregate_id=\"thing-1\""), "{line}");
+        assert!(line.contains("event=\"Happened\""), "{line}");
+        assert!(line.contains("error=boom"), "{line}");
+        assert_eq!(
+            text.lines().filter(|l| l.contains("handled")).count(),
+            2,
+            "the other two events were handled:\n{text}"
+        );
     }
 
     /// The event span is DEBUG, so an `info` filter drops it: a line emitted
