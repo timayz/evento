@@ -1580,6 +1580,29 @@ impl Replica {
         }
     }
 
+    /// Whether this replica is reading `txn`'s version condition right now:
+    /// handed out by [`next_read`](Self::next_read) and not yet answered.
+    /// Its coordinator waits for the answer rather than time it out (#475).
+    pub fn read_in_flight(&self, txn: TxnId) -> bool {
+        matches!(self.commands.get(&txn), Some(cmd) if cmd.status == Status::Reading)
+            && !self.read_results.contains_key(&txn)
+    }
+
+    /// Whether `txn` is decided, un-applied and ready — the applier's next
+    /// pick, or the one it is enacting (see [`applying`](Self::applying)).
+    pub fn apply_ready(&self, txn: TxnId) -> bool {
+        matches!(
+            self.commands.get(&txn),
+            Some(cmd) if cmd.decision.is_some() && cmd.status != Status::Applied
+        ) && (self.applying.contains(&txn) || self.is_ready(txn))
+    }
+
+    /// Whether `txn`'s apply is in flight: handed out by
+    /// [`next_apply`](Self::next_apply) and neither marked nor handed back.
+    pub fn applying(&self, txn: TxnId) -> bool {
+        self.applying.contains(&txn)
+    }
+
     /// Records the coordinator's commit/abort decision for `txn` (from Apply).
     /// Does not apply it — [`next_apply`](Replica::next_apply) enacts it once the
     /// dependencies clear, so a replica that was behind still converges.

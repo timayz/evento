@@ -86,7 +86,9 @@ pub struct NodeConfig {
     pub truncate_interval: Duration,
     /// Most messages the inbox loop stages before forcing a group-commit flush.
     /// Caps the latency a deferred reply waits for its batch's fsync and the memory
-    /// held for the batch's pending sends.
+    /// held for the batch's pending sends. (The applies the batch decides run on
+    /// the applier, not in the batch: no reply waits for a write to the data
+    /// store, see [`Node::start`].)
     pub max_journal_batch: usize,
     /// Suspicion threshold for the phi-accrual failure detector: a coordinator
     /// whose φ exceeds this is presumed dead and its stalled transactions are
@@ -865,6 +867,16 @@ impl Drop for Coordinating<'_> {
     }
 }
 
+/// A task aborted when this is dropped: the applier, which lives and dies
+/// with the inbox loop that owns it (see [`Node::start`]).
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// The result of a coordinated (or recovered) write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommitOutcome {
@@ -1528,6 +1540,11 @@ pub struct Node {
     /// anti-entropy import). Waiters (`read_barrier`, read-your-writes) wait
     /// on it instead of polling the replica lock every millisecond.
     applied: Arc<Signal>,
+    /// Wakes the applier (see [`start`](Self::start)): a decision was
+    /// recorded, a transaction committed or invalidated, or the sweep asks
+    /// for a retry — a decided, ready transaction may be waiting to be
+    /// enacted. A wake while it works is kept (one permit), so none is lost.
+    applier: Arc<Notify>,
     /// Bumped whenever an absent peer is counted again (see
     /// [`screen_absent`](Self::screen_absent)): a join waits on it for its
     /// contact's proof ([`await_reinstated`](Self::await_reinstated)).
@@ -1615,6 +1632,7 @@ impl Node {
             peer_marks: Arc::new(Mutex::new(PeerMarks::default())),
             rolled_back: Arc::new(tokio::sync::watch::channel(false).0),
             applied: Arc::new(Signal::default()),
+            applier: Arc::new(Notify::new()),
             reinstated: Arc::new(Signal::default()),
             last_anti_entropy: Arc::new(Mutex::new(None)),
             metrics: Arc::new(Metrics::new()),
@@ -2052,7 +2070,10 @@ impl Node {
         self.id
     }
 
-    /// Spawns the inbox loop that drives this node until the network closes.
+    /// Spawns the inbox loop that drives this node until the network closes,
+    /// and the **applier** beside it, which enacts the decisions the inbox
+    /// records (each a write to the data store, an fsync) and stops with it:
+    /// aborting the returned handle aborts both.
     ///
     /// **Group commit:** each iteration drains up to
     /// [`max_journal_batch`](NodeConfig::max_journal_batch) already-
@@ -2060,9 +2081,21 @@ impl Node {
     /// **once** for the whole batch, then performs the deferred (durability-gated)
     /// sends. Under load a burst of consensus messages costs a single fsync; with
     /// one message in flight it behaves exactly as a per-message sync.
+    ///
+    /// **Applies off the inbox (#475):** the inbox loop only stages, reads
+    /// version conditions and answers; the applier applies, one decided,
+    /// ready transaction at a time, and acknowledges each once its record is
+    /// flushed. A store whose fsyncs stall thus delays its own
+    /// acknowledgements alone — never the votes and reads of the batch
+    /// behind it, which a coordinator's deadline would otherwise expire on.
     pub fn start(&self, mut inbox: mpsc::Receiver<Envelope>) -> JoinHandle<()> {
         let node = self.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let applier = AbortOnDrop(tokio::spawn(node.clone().run_applier(Arc::clone(&stop))));
         tokio::spawn(async move {
+            // Aborted with this task; stopped, and waited for, when the
+            // inbox closes.
+            let mut applier = applier;
             // An open over a journal that holds something asks the other
             // nodes to confirm it at once (#339); the sweep asks again.
             if !node.confirmed() {
@@ -2097,7 +2130,64 @@ impl Node {
                     );
                 }
             }
+            stop.store(true, Ordering::Release);
+            node.applier.notify_one();
+            let _ = (&mut applier.0).await;
         })
+    }
+
+    /// The applier loop (see [`start`](Self::start)): enacts the decided,
+    /// ready transactions one at a time, flushing the journal and sending
+    /// each one's acknowledgement before the next, so an acknowledgement
+    /// never waits behind another transaction's write to the store. Sleeps
+    /// until woken (`applier`) once nothing is ready, or once an apply the
+    /// store failed is to be retried by the next drive (the sweep's, or a
+    /// message's). Runs until `stop` is set and it is woken.
+    async fn run_applier(self, stop: Arc<AtomicBool>) {
+        loop {
+            match self.apply_next().await {
+                Some(sends) => {
+                    // As `handle`: an acknowledgement is only sent once the
+                    // record behind it is durable; withheld, it is the loss
+                    // recovery already tolerates.
+                    if self.journal.flush().await.is_ok() {
+                        self.metrics.record_flush();
+                        for (to, message) in sends {
+                            self.send(to, message).await;
+                        }
+                    } else {
+                        tracing::warn!(
+                            node = self.id.0,
+                            "journal flush failed; withholding durability-gated sends"
+                        );
+                    }
+                }
+                None => {
+                    if stop.load(Ordering::Acquire) {
+                        return;
+                    }
+                    self.applier.notified().await;
+                }
+            }
+        }
+    }
+
+    /// Wakes the applier: a transaction may be ready to enact.
+    fn wake_applier(&self) {
+        self.applier.notify_one();
+    }
+
+    /// Whether this node executes what it holds — the states in which its
+    /// inbox handles consensus messages (see [`handle_staged`](Self::handle_staged))
+    /// and its sweep drives. A node whose journal was rolled back or is not
+    /// confirmed yet (#339), one told to rejoin, or one still joining applies
+    /// nothing: a join needs the store empty until its snapshot is in, and
+    /// enacts what its restored journal holds decided once it is.
+    fn executes(&self) -> bool {
+        !self.rolled_back()
+            && self.confirmed()
+            && !self.rejoin_required()
+            && self.bootstrapped.load(Ordering::Acquire)
     }
 
     /// Spawns the automatic-recovery sweep: periodically takes over any
@@ -2992,14 +3082,16 @@ impl Node {
         }
     }
 
-    /// Retries local execution the inbox loop left behind: an apply or a read
-    /// the data store failed is only attempted again by the next drive, and a
-    /// quiet group may receive no message to trigger one. Like
-    /// [`handle`](Self::handle), the acknowledgements wait for the journal.
+    /// Retries local execution the inbox loop and the applier left behind: an
+    /// apply or a read the data store failed is only attempted again by the
+    /// next drive, and a quiet group may receive no message to trigger one.
+    /// The applier is woken for the applies; the reads run here and, like
+    /// [`handle`](Self::handle), their answers wait for the journal.
     /// (`next_apply`/`next_read` reserve what they hand out, so this cannot
-    /// race the inbox loop into executing anything twice.)
+    /// race the inbox loop or the applier into executing anything twice.)
     async fn redrive(&self) {
-        let sends = self.drive_staged().await;
+        self.wake_applier();
+        let sends = self.drive_reads().await;
         if sends.is_empty() {
             return;
         }
@@ -3933,7 +4025,9 @@ impl Node {
     /// and returns the peer sends to perform once the batch is durable (the caller
     /// flushes the journal first). Local-channel responses and state changes run
     /// inline; only durability-gated peer sends are deferred so a reply is never
-    /// observable before the decision behind it is durable.
+    /// observable before the decision behind it is durable. A decision it
+    /// records is enacted by the applier, not here (see [`start`](Self::start)):
+    /// nothing this handles writes to the data store.
     async fn handle_staged(&self, env: Envelope) -> Vec<(NodeId, Message)> {
         self.metrics.record_message();
         // Every inbound message is a liveness heartbeat from its sender.
@@ -4282,22 +4376,25 @@ impl Node {
                 match (applied, read) {
                     (Some(conflict), _) => {
                         if durable {
-                            out.push((reply_to, Message::ReadOk { txn, ok: !conflict }));
+                            self.answer(&mut out, reply_to, Message::ReadOk { txn, ok: !conflict });
                         }
                     }
                     (None, Some(ok)) => {
                         if durable {
-                            out.push((reply_to, Message::ReadOk { txn, ok }));
+                            self.answer(&mut out, reply_to, Message::ReadOk { txn, ok });
                         }
-                        out.extend(self.drive_staged().await);
+                        out.extend(self.drive_reads().await);
                     }
-                    (None, None) => out.extend(self.drive_staged().await),
+                    (None, None) => out.extend(self.drive_reads().await),
                 }
+                // Committed before its decision arrived, or recommitted by a
+                // recovery: it may be ready to enact.
+                self.wake_applier();
             }
             Message::Apply { txn, commit } => {
                 // Record the decision (idempotent) and acknowledge if it was
-                // already applied; `drive` enacts it now if ready, or later once
-                // dependencies clear (so a lagging replica still converges).
+                // already applied; the applier enacts it now if ready, or later
+                // once dependencies clear (so a lagging replica still converges).
                 let already_applied = {
                     let mut replica = self.replica.lock().expect("replica poisoned");
                     let already = replica.applied_result(txn).is_some();
@@ -4315,7 +4412,7 @@ impl Node {
                         .unwrap_or(from);
                     out.push((reply_to, Message::Applied { txn }));
                 } else {
-                    out.extend(self.drive_staged().await);
+                    self.wake_applier();
                 }
             }
             // The legacy recovery request (no keys/events): answered as before,
@@ -4486,7 +4583,8 @@ impl Node {
                     // No reply rides on it; the next stage of `txn` retries.
                     self.journal_stage(txn).await;
                     // Its dependents may be free to execute now.
-                    out.extend(self.drive_staged().await);
+                    out.extend(self.drive_reads().await);
+                    self.wake_applier();
                 }
             }
             // Anti-entropy: a peer asks for the applied commands it lacks.
@@ -5221,107 +5319,130 @@ impl Node {
         out
     }
 
-    /// Drives execution in execution-timestamp order: applies any transaction
-    /// whose decision is known and whose dependencies are satisfied, otherwise
-    /// reads (and holds the slot for) the next ready undecided transaction. Re-run
-    /// after any Commit or Apply, since either can unblock more work. Stages its
-    /// journal writes and returns the (durability-gated) acks to send once the
-    /// caller has flushed.
-    async fn drive_staged(&self) -> Vec<(NodeId, Message)> {
+    /// Enacts the next decided, ready transaction, in execution-timestamp
+    /// order, then reads (and holds the slot for) every undecided transaction
+    /// it freed. The applier's step (see [`start`](Self::start)): `None` when
+    /// nothing is ready, or when the store failed the apply — it stays
+    /// decided and un-applied, for the next drive (a message's, or the
+    /// sweep's) to retry. Stages its journal writes and returns the
+    /// (durability-gated) acknowledgements to send once the caller has
+    /// flushed; one for this node's own coordination is answered at once
+    /// (see [`answer`](Self::answer)).
+    async fn apply_next(&self) -> Option<Vec<(NodeId, Message)>> {
+        if !self.executes() {
+            return None;
+        }
+        let mut out: Vec<(NodeId, Message)> = Vec::new();
+        let mut apply = self
+            .replica
+            .lock()
+            .expect("replica poisoned")
+            .next_apply()?;
+        // Journaled first (#331): from the mark below on, a report may
+        // count it as applied, and a restart that lost its record would
+        // bring it back committed, its decision lost with it —
+        // undecidable once its peers compacted it. Staged ahead of the
+        // store, which keeps the store and the mark adjacent: a record
+        // ahead of a failed apply is replayed into the store on a
+        // restart, as any applied record is, and staged again by the
+        // retry meanwhile.
+        let applied = self
+            .replica
+            .lock()
+            .expect("replica poisoned")
+            .snapshot(apply.txn)
+            .map(|mut state| {
+                state.status = Status::Applied;
+                state.applied_conflict = Some(!apply.commit);
+                state
+            });
+        let staged = match applied {
+            Some(state) => match self.journal.stage(&state).await {
+                Ok(()) => true,
+                Err(err) => {
+                    tracing::warn!(
+                        node = self.id.0,
+                        txn = ?apply.txn,
+                        %err,
+                        "cannot stage a transaction's state; withholding its reply"
+                    );
+                    false
+                }
+            },
+            None => true,
+        };
+        // The events carry their writer's provisional stamps; the
+        // store gets the agreed ones (see `stamp_events`). The journal
+        // keeps the provisional ones — every apply re-derives the same.
+        // Only the keys this node owns now land in the store: a key a
+        // layout change took from it was dropped, and stays dropped.
+        apply.events = self.owned_now(apply.events);
+        stamp_events(apply.execute_at, &mut apply.events);
+        if let Err(err) = self
+            .datastore
+            .apply(apply.txn, apply.execute_at, apply.events, apply.commit)
+            .await
+        {
+            // Never mark (or acknowledge) what the store did not take:
+            // `Applied` is the promise that the effect is visible, and
+            // anti-entropy never ships an applied command again. Hand
+            // the transaction back and stop; the next drive (a message,
+            // or the sweep) retries it.
+            self.replica
+                .lock()
+                .expect("replica poisoned")
+                .release_apply(apply.txn);
+            self.metrics.record_execution_failure();
+            if self.store_behind(&err) {
+                tracing::error!(
+                    node = self.id.0,
+                    txn = ?apply.txn,
+                    %err,
+                    "the store is behind this node's journal; this node must rejoin \
+                     the group from a snapshot"
+                );
+            } else {
+                tracing::warn!(
+                    node = self.id.0,
+                    txn = ?apply.txn,
+                    %err,
+                    "cannot apply a decided transaction; retrying"
+                );
+            }
+            return None;
+        }
+        self.replica
+            .lock()
+            .expect("replica poisoned")
+            .mark_applied(apply.txn, !apply.commit);
+        // Wake read barriers / read-your-writes waiters instead of
+        // letting them poll the replica lock.
+        self.applied.bump();
+        // An apply the journal did not take is not acknowledged; a
+        // restart re-applies it (idempotently) from its commit.
+        if staged {
+            self.answer(
+                &mut out,
+                apply.reply_to,
+                Message::Applied { txn: apply.txn },
+            );
+        }
+        // What it freed is read now, not at the next message.
+        out.extend(self.drive_reads().await);
+        Some(out)
+    }
+
+    /// Reads (and holds the slot for) every committed, undecided transaction
+    /// whose dependencies are satisfied, lowest order first, and answers its
+    /// version condition to whoever drives its commit. Run after any Commit,
+    /// since it can make a transaction ready, and after every apply. Returns
+    /// the (durability-gated) answers to send once the caller has flushed;
+    /// one for this node's own coordination is answered at once (see
+    /// [`answer`](Self::answer)). Costs reads of the store only: the applies
+    /// are the applier's (see [`start`](Self::start)).
+    async fn drive_reads(&self) -> Vec<(NodeId, Message)> {
         let mut out: Vec<(NodeId, Message)> = Vec::new();
         loop {
-            // Prefer enacting a decided, ready transaction.
-            let apply = self.replica.lock().expect("replica poisoned").next_apply();
-            if let Some(mut apply) = apply {
-                // Journaled first (#331): from the mark below on, a report may
-                // count it as applied, and a restart that lost its record would
-                // bring it back committed, its decision lost with it —
-                // undecidable once its peers compacted it. Staged ahead of the
-                // store, which keeps the store and the mark adjacent: a record
-                // ahead of a failed apply is replayed into the store on a
-                // restart, as any applied record is, and staged again by the
-                // retry meanwhile.
-                let applied = self
-                    .replica
-                    .lock()
-                    .expect("replica poisoned")
-                    .snapshot(apply.txn)
-                    .map(|mut state| {
-                        state.status = Status::Applied;
-                        state.applied_conflict = Some(!apply.commit);
-                        state
-                    });
-                let staged = match applied {
-                    Some(state) => match self.journal.stage(&state).await {
-                        Ok(()) => true,
-                        Err(err) => {
-                            tracing::warn!(
-                                node = self.id.0,
-                                txn = ?apply.txn,
-                                %err,
-                                "cannot stage a transaction's state; withholding its reply"
-                            );
-                            false
-                        }
-                    },
-                    None => true,
-                };
-                // The events carry their writer's provisional stamps; the
-                // store gets the agreed ones (see `stamp_events`). The journal
-                // keeps the provisional ones — every apply re-derives the same.
-                // Only the keys this node owns now land in the store: a key a
-                // layout change took from it was dropped, and stays dropped.
-                apply.events = self.owned_now(apply.events);
-                stamp_events(apply.execute_at, &mut apply.events);
-                if let Err(err) = self
-                    .datastore
-                    .apply(apply.txn, apply.execute_at, apply.events, apply.commit)
-                    .await
-                {
-                    // Never mark (or acknowledge) what the store did not take:
-                    // `Applied` is the promise that the effect is visible, and
-                    // anti-entropy never ships an applied command again. Hand
-                    // the transaction back and stop; the next drive (a message,
-                    // or the sweep) retries it.
-                    self.replica
-                        .lock()
-                        .expect("replica poisoned")
-                        .release_apply(apply.txn);
-                    self.metrics.record_execution_failure();
-                    if self.store_behind(&err) {
-                        tracing::error!(
-                            node = self.id.0,
-                            txn = ?apply.txn,
-                            %err,
-                            "the store is behind this node's journal; this node must rejoin \
-                             the group from a snapshot"
-                        );
-                    } else {
-                        tracing::warn!(
-                            node = self.id.0,
-                            txn = ?apply.txn,
-                            %err,
-                            "cannot apply a decided transaction; retrying"
-                        );
-                    }
-                    break;
-                }
-                self.replica
-                    .lock()
-                    .expect("replica poisoned")
-                    .mark_applied(apply.txn, !apply.commit);
-                // Wake read barriers / read-your-writes waiters instead of
-                // letting them poll the replica lock.
-                self.applied.bump();
-                // An apply the journal did not take is not acknowledged; a
-                // restart re-applies it (idempotently) from its commit.
-                if staged {
-                    out.push((apply.reply_to, Message::Applied { txn: apply.txn }));
-                }
-                continue;
-            }
-
-            // Otherwise read the next ready, undecided transaction.
             let read = self.replica.lock().expect("replica poisoned").next_read();
             let Some(read) = read else { break };
             let ok = match self.read_condition(&read.events).await {
@@ -5351,9 +5472,39 @@ impl Node {
                 replica.record_read(read.txn, ok);
                 replica.reply_to(read.txn).unwrap_or(read.reply_to)
             };
-            out.push((reply_to, Message::ReadOk { txn: read.txn, ok }));
+            self.answer(&mut out, reply_to, Message::ReadOk { txn: read.txn, ok });
         }
         out
+    }
+
+    /// Queues `message`, this replica's answer to the coordination `to`
+    /// drives, among the sends `out` that go once the batch is durable — or,
+    /// `to` being this node, hands it to that coordination **now** (#475).
+    /// Through the inbox it would wait for the batch's flush, and before
+    /// #475 for the batch's applies, while the coordination's deadline ran:
+    /// a node alone in its group then timed its own reads out and recovered
+    /// what nobody had refused. What it answers needs no flush first: a read
+    /// result is re-derived by any recovery, and an apply is in the store
+    /// before it is acknowledged; the record that goes with either is
+    /// flushed by the batch all the same.
+    fn answer(&self, out: &mut Vec<(NodeId, Message)>, to: NodeId, message: Message) {
+        if to != self.id {
+            out.push((to, message));
+            return;
+        }
+        let Some(txn) = message.txn() else {
+            out.push((to, message));
+            return;
+        };
+        let tx = self
+            .pending
+            .lock()
+            .expect("pending poisoned")
+            .get(&txn)
+            .cloned();
+        if let Some(tx) = tx {
+            let _ = tx.send((self.id, message));
+        }
     }
 
     /// Whether every owned event extends its aggregate (version strictly greater
@@ -6019,44 +6170,66 @@ impl Node {
             let mut here = applied.iter().filter(|n| p.replicas.contains(n)).peekable();
             here.peek().is_none() || here.any(|n| got.iter().any(|(from, _)| from == n))
         };
-        let deadline = Self::after(self.settings.collect_timeout);
-        let collect = self.collect_by_shard_tagged(
-            rx,
-            &read_plans,
-            |p, got| got.len() >= p.slow_q && heard_applied(p, got),
-            deadline,
-            HashSet::new(),
-            |m| match m {
-                Message::ReadOk { ok, .. } => Some(ok),
-                _ => None,
-            },
-        );
-        let decided_here = self
-            .applied
-            .wait_until(deadline, || self.local_outcome(txn).is_some());
-        let held_back = async {
-            match driver {
-                Driver::Sweep => self.stalled_dependency_by(txn, deadline).await,
-                Driver::Coordinator | Driver::Recovery => None,
+        let read_quorum =
+            |p: &ShardPlan, got: &[(NodeId, bool)]| got.len() >= p.slow_q && heard_applied(p, got);
+        let mut reads: HashMap<ShardId, Vec<(NodeId, bool)>> =
+            read_plans.iter().map(|p| (p.shard, Vec::new())).collect();
+        loop {
+            let deadline = Self::after(self.settings.collect_timeout);
+            let heard: HashSet<NodeId> = reads.values().flatten().map(|(from, _)| *from).collect();
+            let collect = Self::collect_into(
+                rx,
+                &read_plans,
+                read_quorum,
+                deadline,
+                heard,
+                |m| match m {
+                    Message::ReadOk { ok, .. } => Some(ok),
+                    _ => None,
+                },
+                &mut reads,
+            );
+            let decided_here = self
+                .applied
+                .wait_until(deadline, || self.local_outcome(txn).is_some());
+            let held_back = async {
+                match driver {
+                    Driver::Sweep => self.stalled_dependency_by(txn, deadline).await,
+                    Driver::Coordinator | Driver::Recovery => None,
+                }
+            };
+            // Biased: a replay runs the branches in one order.
+            tokio::select! {
+                biased;
+                () = collect => {}
+                true = decided_here => {
+                    let conflict = self.local_outcome(txn).expect("applied here").conflict;
+                    // Again, for a replica the decision's Apply missed.
+                    self.broadcast(&union, Message::Apply { txn, commit: !conflict }).await;
+                    return Ok(conflict);
+                }
+                Some(dep) = held_back => return Err(ReadWaitsOn(dep).into()),
             }
-        };
-        // Biased: a replay runs the branches in one order.
-        let reads = tokio::select! {
-            biased;
-            reads = collect => reads,
-            true = decided_here => {
-                let conflict = self.local_outcome(txn).expect("applied here").conflict;
-                // Again, for a replica the decision's Apply missed.
-                self.broadcast(&union, Message::Apply { txn, commit: !conflict }).await;
-                return Ok(conflict);
+            let Some(short) = read_plans
+                .iter()
+                .find(|p| !read_quorum(p, &reads[&p.shard]))
+            else {
+                break;
+            };
+            // Short of this node's own read, which its store is reading now:
+            // waited for, however long the store takes, not timed out (#475).
+            // A recovery would ask the same replica, which reads no
+            // transaction twice, and wait on the same read.
+            if self.own_read_in_flight(txn, &read_plans, &reads) {
+                self.metrics.record_own_store_wait();
+                tracing::debug!(
+                    node = self.id.0,
+                    ?txn,
+                    "the read quorum waits on this node's store"
+                );
+                continue;
             }
-            Some(dep) = held_back => return Err(ReadWaitsOn(dep).into()),
-        };
-        for plan in &read_plans {
-            let got = &reads[&plan.shard];
-            if got.len() < plan.slow_q || !heard_applied(plan, got) {
-                anyhow::bail!("read quorum not reached for shard {}", plan.shard);
-            }
+            anyhow::bail!("read quorum not reached for shard {}", short.shard);
         }
         // A replica that applied the transaction answers with its decision,
         // which is final: adopt it. ANDing it with the fresh reads would let
@@ -6085,36 +6258,59 @@ impl Node {
 
         // Apply: enact the decision and wait for a slow quorum per shard.
         self.broadcast(&union, Message::Apply { txn, commit }).await;
-        let deadline = Self::after(self.settings.collect_timeout);
-        let collect = self.collect_by_shard(
-            rx,
-            plans,
-            |p| p.slow_q,
-            deadline,
-            |m| match m {
-                Message::Applied { .. } => Some(()),
-                _ => None,
-            },
-        );
-        let applied_here = async {
-            match driver {
-                Driver::Recovery | Driver::Sweep => {
-                    self.applied
-                        .wait_until(deadline, || self.local_outcome(txn).is_some())
-                        .await
+        let mut acks: HashMap<ShardId, Vec<(NodeId, ())>> =
+            plans.iter().map(|p| (p.shard, Vec::new())).collect();
+        // The applied generation at each round's start: its store is taking
+        // applies while it moves (see `own_apply_in_progress`).
+        let mut generation = self.applied.generation();
+        loop {
+            let deadline = Self::after(self.settings.collect_timeout);
+            let heard: HashSet<NodeId> = acks.values().flatten().map(|(from, _)| *from).collect();
+            let collect = Self::collect_into(
+                rx,
+                plans,
+                |p, got| got.len() >= p.slow_q,
+                deadline,
+                heard,
+                |m| match m {
+                    Message::Applied { .. } => Some(()),
+                    _ => None,
+                },
+                &mut acks,
+            );
+            let applied_here = async {
+                match driver {
+                    Driver::Recovery | Driver::Sweep => {
+                        self.applied
+                            .wait_until(deadline, || self.local_outcome(txn).is_some())
+                            .await
+                    }
+                    Driver::Coordinator => false,
                 }
-                Driver::Coordinator => false,
+            };
+            tokio::select! {
+                biased;
+                () = collect => {}
+                true = applied_here => return Ok(!commit),
             }
-        };
-        let acks = tokio::select! {
-            biased;
-            acks = collect => acks,
-            true = applied_here => return Ok(!commit),
-        };
-        for plan in plans {
-            if acks[&plan.shard].len() < plan.slow_q {
-                anyhow::bail!("apply quorum not reached for shard {}", plan.shard);
+            let Some(short) = plans.iter().find(|p| acks[&p.shard].len() < p.slow_q) else {
+                break;
+            };
+            // Short of this node's own acknowledgement, while its store is
+            // enacting the transaction, or the ones ahead of it: waited for,
+            // not timed out (#475) — a recovery would wait on the same apply.
+            let progressed = self.applied.generation() > generation;
+            generation = self.applied.generation();
+            if self.own_apply_in_progress(txn, plans, &acks, progressed) {
+                self.metrics.record_own_store_wait();
+                tracing::debug!(
+                    node = self.id.0,
+                    ?txn,
+                    "the apply quorum waits on this node's store"
+                );
+                continue;
             }
+            anyhow::bail!("apply quorum not reached for shard {}", short.shard);
         }
 
         // Read-your-writes: if this coordinator is itself a replica, wait for its
@@ -6133,6 +6329,55 @@ impl Node {
         }
 
         Ok(!commit)
+    }
+
+    /// Whether a read quorum short of this node's own answer waits on a read
+    /// this node's store is performing right now (#475): this node is a
+    /// planned replica yet to answer, and its replica holds `txn` reading,
+    /// unanswered. Not a read it has yet to start — one waiting on a
+    /// dependency, or one the store failed, which the next drive retries:
+    /// those a recovery may unblock, and the deadline stands.
+    fn own_read_in_flight(
+        &self,
+        txn: TxnId,
+        plans: &[ShardPlan],
+        reads: &HashMap<ShardId, Vec<(NodeId, bool)>>,
+    ) -> bool {
+        let Some(plan) = plans.iter().find(|p| p.replicas.contains(&self.id)) else {
+            return false;
+        };
+        if reads[&plan.shard].iter().any(|(from, _)| *from == self.id) {
+            return false;
+        }
+        self.replica
+            .lock()
+            .expect("replica poisoned")
+            .read_in_flight(txn)
+    }
+
+    /// Whether an apply quorum short of this node's own acknowledgement
+    /// waits on this node's applier (#475): this node is a planned replica
+    /// yet to acknowledge, and its replica holds `txn` decided, ready and
+    /// un-applied — being enacted now, or queued behind applies the store is
+    /// taking (`progressed`: the applied generation moved during the round).
+    /// A store that takes nothing moves no generation, and the deadline
+    /// stands: the write fails as it did, rather than hang on a store that
+    /// is down.
+    fn own_apply_in_progress(
+        &self,
+        txn: TxnId,
+        plans: &[ShardPlan],
+        acks: &HashMap<ShardId, Vec<(NodeId, ())>>,
+        progressed: bool,
+    ) -> bool {
+        let Some(plan) = plans.iter().find(|p| p.replicas.contains(&self.id)) else {
+            return false;
+        };
+        if acks[&plan.shard].iter().any(|(from, _)| *from == self.id) {
+            return false;
+        }
+        let replica = self.replica.lock().expect("replica poisoned");
+        replica.apply_ready(txn) && (replica.applying(txn) || progressed)
     }
 
     /// Commits `txn` on each shard with its own dependency set and its own
@@ -6230,6 +6475,7 @@ impl Node {
             .await
         {
             Ok(outcome) => {
+                self.metrics.record_write_settled();
                 tracing::debug!(node = self.id.0, ?txn, error = %failure, "write settled by recovery");
                 return Ok(outcome);
             }
@@ -9769,6 +10015,8 @@ impl Node {
             for env in buffered {
                 Box::pin(self.handle(env)).await;
             }
+            // Serving now: what it holds decided is enacted.
+            self.wake_applier();
         }
         true
     }
@@ -11872,13 +12120,29 @@ impl Node {
         plans: &[ShardPlan],
         done: impl Fn(&ShardPlan, &[(NodeId, T)]) -> bool,
         deadline: Instant,
-        mut seen: HashSet<NodeId>,
-        mut extract: impl FnMut(Message) -> Option<T>,
+        seen: HashSet<NodeId>,
+        extract: impl FnMut(Message) -> Option<T>,
     ) -> HashMap<ShardId, Vec<(NodeId, T)>> {
         let mut got: HashMap<ShardId, Vec<(NodeId, T)>> =
             plans.iter().map(|p| (p.shard, Vec::new())).collect();
-        // One vote per responder (see `collect_tagged`).
+        Self::collect_into(rx, plans, done, deadline, seen, extract, &mut got).await;
+        got
+    }
 
+    /// [`collect_by_shard_tagged`](Self::collect_by_shard_tagged) into `got`,
+    /// a bucket per planned shard the caller keeps across rounds: a phase
+    /// that waits on past its deadline (#475) carries what it heard over,
+    /// and `seen` — the responders counted so far — keeps a duplicate out.
+    async fn collect_into<T>(
+        rx: &mut mpsc::UnboundedReceiver<(NodeId, Message)>,
+        plans: &[ShardPlan],
+        done: impl Fn(&ShardPlan, &[(NodeId, T)]) -> bool,
+        deadline: Instant,
+        mut seen: HashSet<NodeId>,
+        mut extract: impl FnMut(Message) -> Option<T>,
+        got: &mut HashMap<ShardId, Vec<(NodeId, T)>>,
+    ) {
+        // One vote per responder (see `collect_tagged`).
         loop {
             if plans.iter().all(|p| done(p, &got[&p.shard])) {
                 break;
@@ -11898,7 +12162,6 @@ impl Node {
                 Ok(None) | Err(_) => break,
             }
         }
-        got
     }
 
     /// The shard `node` was planned in, if any: replies are counted for the
@@ -12585,7 +12848,8 @@ mod tests {
         assert_eq!(journal.routes.load(Ordering::SeqCst), 1, "staged on retry");
     }
 
-    /// An apply whose stage failed is enacted but not acknowledged.
+    /// An apply whose stage failed is enacted but not acknowledged. (The
+    /// inbox handler records the decision; the applier enacts it, #475.)
     #[tokio::test]
     async fn stage_failure_withholds_the_applied_ack() {
         let journal = Arc::new(StageFailJournal::default());
@@ -12625,12 +12889,81 @@ mod tests {
             .await;
         assert!(
             out.is_empty(),
-            "an unstaged apply is not acknowledged: {out:?}"
+            "the handler records the decision; the applier enacts it: {out:?}"
+        );
+        assert_eq!(
+            node.replica.lock().unwrap().applied_result(txn),
+            None,
+            "nothing is applied on the inbox loop"
+        );
+        let sends = node
+            .apply_next()
+            .await
+            .expect("a decided, ready transaction to enact");
+        assert!(
+            sends.is_empty(),
+            "an unstaged apply is not acknowledged: {sends:?}"
         );
         assert_eq!(
             node.replica.lock().unwrap().applied_result(txn),
             Some(false),
             "the apply itself took effect"
+        );
+        assert!(node.apply_next().await.is_none(), "nothing else is ready");
+    }
+
+    /// A replica's answers to a coordination of its own node reach it at
+    /// once, not with the batch's durability-gated sends (#475): the read of
+    /// its own Commit, and the acknowledgement of its own Apply, land on the
+    /// coordination's channel while the handler's sends hold nothing for it.
+    #[tokio::test]
+    async fn own_coordination_is_answered_directly() {
+        let journal = Arc::new(StageFailJournal::default());
+        let node = stage_fail_node(&journal);
+        let own = node.id;
+        let Message::PreAccept {
+            txn, keys, events, ..
+        } = preaccept(0)
+        else {
+            unreachable!()
+        };
+        let mut rx = node.register(txn);
+        let out = node
+            .handle_staged(Envelope {
+                from: own,
+                message: Message::Commit {
+                    epoch: 0,
+                    txn,
+                    execute_at: txn.0,
+                    deps: Vec::new(),
+                    keys,
+                    events,
+                    reply_to: own,
+                },
+            })
+            .await;
+        assert!(out.is_empty(), "nothing waits for the flush: {out:?}");
+        assert!(
+            matches!(rx.try_recv(), Ok((from, Message::ReadOk { ok: true, .. })) if from == own),
+            "the own read is answered at once"
+        );
+
+        let out = node
+            .handle_staged(Envelope {
+                from: own,
+                message: Message::Apply { txn, commit: true },
+            })
+            .await;
+        assert!(out.is_empty(), "{out:?}");
+        let sends = node.apply_next().await.expect("ready to enact");
+        assert!(sends.is_empty(), "nothing waits for the flush: {sends:?}");
+        assert!(
+            matches!(rx.try_recv(), Ok((from, Message::Applied { .. })) if from == own),
+            "the own apply is acknowledged at once"
+        );
+        assert_eq!(
+            node.replica.lock().unwrap().applied_result(txn),
+            Some(false)
         );
     }
 

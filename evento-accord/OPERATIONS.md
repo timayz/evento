@@ -74,12 +74,12 @@ timeouts for geo/WAN** deployments.
 | Field | Default | Raise when / meaning |
 |-------|---------|----------------------|
 | `fast_timeout` | 50 ms | Wait for the fast-path quorum before falling back to slow path. Keep ≳ one cross-region RTT for WAN. Also how much longer a recovery's first round waits for the replicas still to answer once a slow quorum has (§7). |
-| `collect_timeout` | 5 s | Cap on the later phases (Accept/Read/Apply) and on a recovery's first round, which waits for the answers of a slow quorum (#452). Only bounds a genuinely stuck phase: a round whose quorum the refusals for a higher ballot put out of reach ends at once (§7, a coordinator overtaken). |
+| `collect_timeout` | 5 s | Cap on the later phases (Accept/Read/Apply) and on a recovery's first round, which waits for the answers of a slow quorum (#452). Only bounds a genuinely stuck phase: a round whose quorum the refusals for a higher ballot put out of reach ends at once (§7, a coordinator overtaken), and one short of this node's own answer alone, while its store is still reading or enacting the transaction, waits on past it (`own_store_waits`, #475): a recovery would wait on the same store. |
 | `recovery_interval` | 100 ms | How often the recovery/anti-entropy/compaction sweep runs. |
 | `recovery_timeout` | 300 ms | A txn unapplied this long is presumed stalled and recovered. Keep well above normal write latency — the journal's fsync tail included: a replica flushes its vote before it answers, so on a disk whose fsync stalls the peers' sweeps take live writes over (§8, write latency), each a round of recovery on top of the stall. |
 | `anti_entropy_interval` | 250 ms | Pace of the anti-entropy rounds (one peer per round, in turn; while each page of what the node misses brings something in, a round pulls the next from it, up to 16 pages and for one interval). Each round also proves the window a node holds, which both its compaction report and its subscriptions wait for: subscriptions trail the present by about `compaction_margin` plus `(slow quorum − 1)` rounds. Keep it well below `compaction_margin`. |
 | `compaction_margin` | 1 s | Lag on the redundancy watermark, and the original coordinator's **deadline**: a node never votes for a coordinator's PreAccept, or its Accept at the transaction's own ballot, for a transaction it never witnessed whose `t0` is older than its clock less this margin (`votes_late`), and tells the coordinator so, which settles the write at once — recovered, and invalidated unless enough replicas hold it after all (`Invalidated`, a `WriteError::Unavailable` through `AccordExecutor`: nothing was written, retry). A node's own replica is never late for a write the node is still coordinating: alone in its group, its inbox is the message delay, and its vouches never pass a write it coordinates (#466). A recovery past the deadline asks such a node twice: first, it answers that it is late; then the recovery asks it to refuse the transaction for good, when that proves it never committed — one only a minority holds, which the recovery then invalidates — or to vote, when the replies show it may have committed (a replica that accepted it lost its journal, §7). It votes unless the transaction is below its **vote fence**, what it vouched for (§5, `votes_fenced`), so one a slow quorum of its shard held unapplied all along is still decided, however late (#337). A multi-shard transaction a shard never saw is invalidated only past the deadline too, where that shard's replicas can be refused for good (#377): within it they only promise the ballot and wait to be handed its part. Keep it ≥ `recovery_timeout` + 2 × the clock-skew bound + worst-case message delay, so a coordinator's messages and a recovery of a transaction still in flight land inside it. |
-| `max_journal_batch` | 128 | Messages drained per group-commit fsync (latency vs. fsync amortization). |
+| `max_journal_batch` | 128 | Messages drained per group-commit fsync (latency vs. fsync amortization). The applies a batch decides run on the node's applier task, not in the batch: no reply waits for a write to the data store (#475). |
 | `phi_threshold` | 8.0 | Phi-accrual suspicion level; higher tolerates more latency variance before suspecting a coordinator. |
 | `acceptable_pause` | 500 ms | How long a live peer may go quiet beyond its usual heartbeat interval (scheduler stall, slow fsync, loaded host) before suspicion starts to rise. |
 | `linearizable_reads` | false | Opt-in linearizable reads (§9) — one consensus round per read. |
@@ -160,6 +160,8 @@ Serve it on an HTTP endpoint (see `bank-axum-accord`'s `/metrics`). Counters:
 | `command_pages` | command pages this node served to joining peers: a joiner pulls the contact's un-compacted applied commands one page at a time, before its snapshot pages. |
 | `joins_partial` | joins of this node that failed after a page was installed: the store holds a prefix no contact can complete, and must be emptied before the next join (§7). Steady > 0 = a contact that cannot read its backend, or a link losing pages faster than the per-page retries cover. |
 | `execution_failures` | data-store applies and commit-condition reads that failed. The transaction is neither marked applied nor acknowledged, and is retried on the next drive (a message, or the sweep). Occasional = transient lock contention; **sustained** = this replica's store cannot take writes (full disk, broken connection), so it falls behind until it can. |
+| `own_store_waits` | phases of a write this node coordinated that waited on past `collect_timeout` because the quorum lacked only this node's own answer, and its store was still reading the version condition or enacting the transaction (or the decided ones ahead of it). The write completes in the store's time, and no recovery is started for it (#475). A rising count = this node's store has reads or fsyncs outlasting `collect_timeout` (§8, write latency); look at the disk. |
+| `writes_settled` | writes this node coordinated whose coordination failed a phase — a quorum short at the deadline, a refusal for a higher ballot — and were settled by this node's own recovery (`write settled by recovery` at debug). Each took at least a `collect_timeout`, or a round of recovery, longer than it should; a healthy cluster settles none. |
 
 **Health/readiness.**
 - *Liveness:* a simple `200` while the process is up (`bank-axum-accord`'s `/health`).
@@ -650,7 +652,12 @@ through `AccordExecutor`) — split it into several writes.
   it, and the store's applies. A disk whose fsync stalls stalls every write with
   it; past `recovery_timeout` the peers' sweeps take the stalled writes over, each
   a round of recovery on top of the stall — correct, and what the 3–10 s writes
-  of #452 were. Keep the journal on a disk whose fsync tail stays under
+  of #452 were. The store's applies run on an applier task of their own (#475):
+  a stalled fsync of the store delays that apply's acknowledgement, not the
+  votes and reads of the batch behind it, and a node whose own store is the slow
+  one waits for it rather than time its own writes out (`own_store_waits`) — a
+  node alone in its group commits in its store's time, never in
+  `collect_timeout`. Keep the journal on a disk whose fsync tail stays under
   `recovery_timeout`, away from what else restarts or rebuilds beside it; measure
   (`journal_flushes` against the write rate, and the backend's own statement
   timings). `synchronous = NORMAL` on SQLite cuts the fsyncs but lets a power loss

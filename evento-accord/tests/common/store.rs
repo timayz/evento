@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use evento_accord::{DataStore, InMemoryDataStore, SnapshotPage, Timestamp, TxnId};
@@ -65,6 +66,11 @@ pub struct FaultStore {
     pub version_failing: AtomicBool,
     /// Fails every query (`DataStore::read`), as a forwarded read runs one.
     pub read_failing: AtomicBool,
+    /// How long an apply takes (in the runtime's time): a store whose fsync
+    /// stalls.
+    apply_delay: Mutex<Duration>,
+    /// How long a version read takes (in the runtime's time).
+    version_delay: Mutex<Duration>,
     /// Seeded apply failures: the generator and the probability.
     faults: Mutex<Option<(StdRng, f64)>>,
     /// Where each apply's outcome is recorded, if anywhere.
@@ -93,8 +99,27 @@ impl FaultStore {
             lose_next_apply: AtomicBool::new(false),
             version_failing: AtomicBool::new(false),
             read_failing: AtomicBool::new(false),
+            apply_delay: Mutex::new(Duration::ZERO),
+            version_delay: Mutex::new(Duration::ZERO),
             faults: Mutex::new(None),
             outcomes: None,
+        }
+    }
+
+    /// Makes every apply take `delay`, as a store whose fsync stalls.
+    pub fn set_apply_delay(&self, delay: Duration) {
+        *self.apply_delay.lock().unwrap() = delay;
+    }
+
+    /// Makes every version read take `delay`.
+    pub fn set_version_delay(&self, delay: Duration) {
+        *self.version_delay.lock().unwrap() = delay;
+    }
+
+    async fn delay(delay: &Mutex<Duration>) {
+        let delay = *delay.lock().unwrap();
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
         }
     }
 
@@ -147,6 +172,7 @@ impl DataStore for FaultStore {
         if self.version_failing.load(Ordering::SeqCst) {
             anyhow::bail!("simulated read failure");
         }
+        Self::delay(&self.version_delay).await;
         self.inner
             .version(tenant, aggregate_type, aggregate_id)
             .await
@@ -171,6 +197,7 @@ impl DataStore for FaultStore {
         if self.lose_next_apply.swap(false, Ordering::SeqCst) {
             return Ok(());
         }
+        Self::delay(&self.apply_delay).await;
         let recorded = self.outcomes.as_ref().map(|_| events.clone());
         self.inner.apply(txn, execute_at, events, commit).await?;
         if let (Some(outcomes), Some(events)) = (&self.outcomes, recorded) {

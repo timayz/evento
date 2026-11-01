@@ -55,6 +55,19 @@ pub struct Metrics {
     /// installed: the store holds a prefix no contact can complete, so it
     /// must be emptied before the next join.
     pub joins_partial: AtomicU64,
+    /// Phases of a coordination this node drove that waited on past
+    /// `collect_timeout` because the quorum was short of this node's own
+    /// answer, and its own store was still working the transaction: reading
+    /// its version condition, or enacting it (or the decided transactions
+    /// ahead of it). The write completes in the store's time instead of
+    /// falling to a recovery that would wait on the same store (#475). A
+    /// rising count means a store whose reads or fsyncs outlast the timeout.
+    pub own_store_waits: AtomicU64,
+    /// Writes this node coordinated whose coordination failed a phase — a
+    /// quorum short at the deadline, a refusal — and that were settled by
+    /// this node's own recovery of them. Each is a write that took at least
+    /// a `collect_timeout`, or a round of recovery, longer than it should.
+    pub writes_settled: AtomicU64,
     /// Decided-transaction applies and commit-condition reads the data store
     /// failed. The transaction is neither marked nor acknowledged; it is
     /// retried on the next drive, so a persistent count means a store that
@@ -363,6 +376,18 @@ impl Metrics {
         self.execution_failures.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records a phase that waited on past its deadline for this node's own
+    /// store (#475).
+    pub fn record_own_store_wait(&self) {
+        self.own_store_waits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a write whose failed coordination this node's own recovery
+    /// settled.
+    pub fn record_write_settled(&self) {
+        self.writes_settled.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// A consistent-enough point-in-time view of all counters.
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
@@ -382,6 +407,8 @@ impl Metrics {
             snapshot_pages: self.snapshot_pages.load(Ordering::Relaxed),
             joins_partial: self.joins_partial.load(Ordering::Relaxed),
             execution_failures: self.execution_failures.load(Ordering::Relaxed),
+            own_store_waits: self.own_store_waits.load(Ordering::Relaxed),
+            writes_settled: self.writes_settled.load(Ordering::Relaxed),
             command_pages: self.command_pages.load(Ordering::Relaxed),
             votes_fenced: self.votes_fenced.load(Ordering::Relaxed),
             votes_late: self.votes_late.load(Ordering::Relaxed),
@@ -431,6 +458,8 @@ pub struct MetricsSnapshot {
     pub snapshot_pages: u64,
     pub joins_partial: u64,
     pub execution_failures: u64,
+    pub own_store_waits: u64,
+    pub writes_settled: u64,
     pub command_pages: u64,
     pub votes_fenced: u64,
     pub votes_late: u64,
@@ -462,7 +491,7 @@ impl MetricsSnapshot {
     /// source of truth for both [`to_prometheus`](Self::to_prometheus) and
     /// [`to_prometheus_labeled`](Self::to_prometheus_labeled); add a counter here and
     /// both renderings pick it up.
-    fn counters(&self) -> [(&'static str, &'static str, u64); 40] {
+    fn counters(&self) -> [(&'static str, &'static str, u64); 42] {
         [
             (
                 "accord_writes_committed_total",
@@ -543,6 +572,16 @@ impl MetricsSnapshot {
                 "accord_execution_failures_total",
                 "Decided-transaction applies and commit-condition reads the data store failed (retried, never acknowledged).",
                 self.execution_failures,
+            ),
+            (
+                "accord_own_store_waits_total",
+                "Coordination phases that waited on past collect_timeout for this node's own store, still reading or enacting the transaction.",
+                self.own_store_waits,
+            ),
+            (
+                "accord_writes_settled_total",
+                "Coordinated writes whose failed coordination this node's own recovery settled.",
+                self.writes_settled,
             ),
             (
                 "accord_command_pages_total",
