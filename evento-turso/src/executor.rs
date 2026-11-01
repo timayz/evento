@@ -177,6 +177,17 @@ impl Turso {
         builder
     }
 
+    /// [`builder`](Self::builder) for a database in [`WriteMode::Concurrent`]:
+    /// Turso's MVCC checkpoints run passively, alongside the transactions,
+    /// instead of stopping the world — with a stop-the-world checkpoint every
+    /// transaction that starts meanwhile, reads included, fails with `Busy`,
+    /// and under twenty writers the checkpoint itself keeps finding the
+    /// database busy. The concurrent constructors use it; so should a
+    /// database you build yourself to open in concurrent mode.
+    pub fn concurrent_builder(path: &str) -> turso::Builder {
+        Self::builder(path).experimental_mvcc_passive_checkpoint(true)
+    }
+
     /// Opens (creating if absent) the database at `path` and applies the
     /// pending [`MIGRATIONS`](crate::MIGRATIONS). The database stays in the
     /// mode it is in: Turso's default for a new file ([`WriteMode::Serial`]),
@@ -190,7 +201,9 @@ impl Turso {
     /// ([`WriteMode::Concurrent`], see [`enable_concurrent_writes`](crate::enable_concurrent_writes))
     /// and applies the pending [`MIGRATIONS`](crate::MIGRATIONS).
     pub async fn open_concurrent(path: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let db = Self::builder(path_str(path.as_ref())?).build().await?;
+        let db = Self::concurrent_builder(path_str(path.as_ref())?)
+            .build()
+            .await?;
         write::enable_concurrent_writes(&db).await?;
         Self::migrated(db).await
     }
@@ -207,7 +220,7 @@ impl Turso {
     /// [`in_memory`](Self::in_memory) for several writers
     /// ([`WriteMode::Concurrent`]).
     pub async fn in_memory_concurrent() -> anyhow::Result<Self> {
-        let db = Self::builder(":memory:").build().await?;
+        let db = Self::concurrent_builder(":memory:").build().await?;
         write::enable_concurrent_writes(&db).await?;
         Self::migrated(db).await
     }

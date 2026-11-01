@@ -141,7 +141,10 @@ store
 # }
 ```
 
-`store.write_mode()` tells which mode the database is in (`WriteMode::Serial` or
+A concurrent database is built with `Turso::concurrent_builder(path)` (what the
+constructors use): Turso's MVCC checkpoints then run passively, alongside the
+transactions, instead of stopping the world and answering every transaction that starts
+meanwhile with `Busy`. `store.write_mode()` tells which mode the database is in (`WriteMode::Serial` or
 `WriteMode::Concurrent`); `evento_turso::transaction(&mut conn, mode, &env, body)` is
 the same loop on a connection of yours, and `is_retryable(&err)` the test it applies
 (`Busy`, a stale snapshot, a write-write conflict). DDL (`CREATE TABLE`, `CREATE INDEX`)
