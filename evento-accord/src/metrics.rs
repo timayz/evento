@@ -142,6 +142,10 @@ pub struct Metrics {
     /// Pre-seeds a change this node drove did not wait out: the change went
     /// on, the fenced copy bringing the rest.
     pub preseeds_timed_out: AtomicU64,
+    /// Copies the layout moved on under (#469): a pre-seed for an epoch
+    /// another change took, or a fenced copy for a transition replaced. What
+    /// they brought in for slots this node does not own was dropped.
+    pub copies_voided: AtomicU64,
     /// Copied events stamped below this node's stable point when they
     /// landed: history its subscriptions already read past and will not see
     /// (#374).
@@ -318,6 +322,11 @@ impl Metrics {
         self.preseeds_timed_out.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records a copy the layout moved on under.
+    pub fn record_copy_voided(&self) {
+        self.copies_voided.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Records `events` copied below this node's stable point.
     pub fn record_copied_below_stable(&self, events: usize) {
         self.copied_below_stable
@@ -384,6 +393,7 @@ impl Metrics {
             preseed_passes: self.preseed_passes.load(Ordering::Relaxed),
             preseed_events: self.preseed_events.load(Ordering::Relaxed),
             preseeds_timed_out: self.preseeds_timed_out.load(Ordering::Relaxed),
+            copies_voided: self.copies_voided.load(Ordering::Relaxed),
             copied_below_stable: self.copied_below_stable.load(Ordering::Relaxed),
         }
     }
@@ -431,6 +441,7 @@ pub struct MetricsSnapshot {
     pub preseed_passes: u64,
     pub preseed_events: u64,
     pub preseeds_timed_out: u64,
+    pub copies_voided: u64,
     pub copied_below_stable: u64,
 }
 
@@ -439,7 +450,7 @@ impl MetricsSnapshot {
     /// source of truth for both [`to_prometheus`](Self::to_prometheus) and
     /// [`to_prometheus_labeled`](Self::to_prometheus_labeled); add a counter here and
     /// both renderings pick it up.
-    fn counters(&self) -> [(&'static str, &'static str, u64); 38] {
+    fn counters(&self) -> [(&'static str, &'static str, u64); 39] {
         [
             (
                 "accord_writes_committed_total",
@@ -625,6 +636,11 @@ impl MetricsSnapshot {
                 "accord_preseeds_timed_out_total",
                 "Pre-seeds a change this node drove did not wait out.",
                 self.preseeds_timed_out,
+            ),
+            (
+                "accord_copies_voided_total",
+                "Copies the layout moved on under; what they brought in for slots this node does not own was dropped.",
+                self.copies_voided,
             ),
             (
                 "accord_copied_below_stable_total",

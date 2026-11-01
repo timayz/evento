@@ -919,6 +919,108 @@ async fn a_pre_seed_for_a_change_that_never_came_expires() {
     await_versions(&nodes[6].store, &left, &[1]).await;
 }
 
+/// A pre-seed that outlives the change before it leaves nothing behind
+/// (#469). Node 2 pre-seeds a merge it proposes while the transition that
+/// replaces node 0 is in progress, and its sources do not answer until that
+/// transition's layout installs — at the epoch the merge was for. The page
+/// that then arrives is not installed, and the slot it would have brought
+/// in, which node 2 does not own (and whose drop at the new epoch has run
+/// already), is not in its store. Before, the page landed and stayed: the
+/// re-sharding swarm found a member of the final layout holding a slot it
+/// never owned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_pre_seed_that_outlives_the_change_before_it_leaves_nothing_behind() {
+    let net = InMemoryNetwork::new();
+    let before = vec![ids(&[0, 1, 2]), ids(&[3, 4, 5])];
+    let map = ShardMap::even(before.clone());
+    let left = id_in_shard(&map, 0, "left");
+    let right = id_in_shard(&map, 1, "right");
+    // A source that does not answer is retried for three rounds: long enough
+    // for the transition to drain and install meanwhile.
+    let config = NodeConfig {
+        collect_timeout: Duration::from_secs(1),
+        ..quick()
+    };
+    let nodes: Vec<TestNode> = (0..7)
+        .map(|id| spawn_node_cfg(NodeId(id), before.clone(), &net, config))
+        .collect();
+    nodes[6].node.begin_join();
+    for (id, version) in [(&left, 1), (&right, 1)] {
+        nodes[0]
+            .node
+            .write(vec![event(id, version, "Bumped")])
+            .await
+            .unwrap();
+    }
+
+    // Node 6 replaces node 0: a transition, draining.
+    let replaced = vec![ids(&[6, 1, 2]), ids(&[3, 4, 5])];
+    let driver = nodes[1].node.clone();
+    let to = replaced.clone();
+    let change = tokio::spawn(async move { driver.change_topology(1, to).await });
+    await_epoch(&nodes[2].topology, 1).await;
+
+    // Node 2 proposes a merge for the next epoch meanwhile, and pre-seeds
+    // the second shard's slots first — but no source answers it until the
+    // transition's layout is installed on it.
+    let topology = Arc::clone(&nodes[2].topology);
+    let stalled: LinkFilter = Arc::new(move |from, _, message| {
+        from == NodeId(2)
+            && matches!(message, Message::RangePageRequest { .. })
+            && topology.epoch() < 2
+    });
+    net.set_link_filter(Some(stalled));
+    let proposer = nodes[2].node.clone();
+    let merge =
+        tokio::spawn(async move { proposer.change_topology(2, vec![ids(&[0, 1, 2])]).await });
+
+    let installed = tokio::time::timeout(Duration::from_secs(30), change)
+        .await
+        .expect("the change ends in bounded time")
+        .expect("the driver runs")
+        .expect("the change installs");
+    assert_eq!(
+        installed, replaced,
+        "the transition's activation took epoch 2"
+    );
+    await_epoch(&nodes[2].topology, 2).await;
+
+    // The pre-seed's source answers now; the pre-seed ends with the epoch
+    // it was for taken, installing nothing (or, before the fix, its page).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while nodes[2].node.metrics().copies_voided == 0
+        && versions_of(&nodes[2].store, &right).is_empty()
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the pre-seed never ended: {:?}",
+            nodes[2].node.metrics()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    merge.abort();
+    let _ = merge.await;
+    net.set_link_filter(None);
+    assert_eq!(
+        nodes[2].node.metrics().preseed_passes,
+        0,
+        "no pass completed: the first page found the layout moved on"
+    );
+    assert!(
+        versions_of(&nodes[2].store, &right).is_empty(),
+        "node 2 holds a slot it does not own: {:?}",
+        versions_of(&nodes[2].store, &right)
+    );
+    assert_eq!(
+        versions_of(&nodes[2].store, &left),
+        vec![1],
+        "its own slots stay"
+    );
+    for i in [3, 4, 5] {
+        assert_eq!(versions_of(&nodes[i].store, &right), vec![1]);
+    }
+}
+
 /// A replica added at once whose join failed partway is still joining when
 /// a change gives its shard more slots (#446). It copies nothing until it
 /// joins: a copy would fill the store its join needs empty, and a copy that

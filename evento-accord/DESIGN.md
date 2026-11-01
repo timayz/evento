@@ -530,6 +530,18 @@ control plane, everything else is Accord.
   fenced copy never interleave (`copying`). The record format moved to 12:
   `RangePageRequest` gained `since`.
 
+  A copy's pages land only under the epoch it began under (#469). The slots a
+  change takes from a node are dropped once, as the layout installs, and a
+  page landing after that stayed: a pre-seed stalled on a source it could not
+  reach (a partition, a stale proposer's own) outlived the activation of the
+  transition before it, which took the epoch it pre-seeded for, and the
+  re-sharding oracle found the node holding a slot it does not own. Now a
+  copy that finds the layout moved on ends (`LayoutMovedOn`), and unless the
+  entry decided for the new epoch is the transition to the very map it copies
+  for — a pre-seed the change caught up with, a fenced copy the change
+  repeated — drops what it brought in for the slots the node does not own
+  (`void_copy`, `accord_copies_voided_total`); the record stays at "dropped".
+
   **Backfilling subscriptions after a copy (#374; open).** A copy keeps the
   events' original stamps — they must: the stamp is the subscription cursor,
   the same on every replica, and the stability watermark is computed from

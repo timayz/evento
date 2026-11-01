@@ -241,7 +241,10 @@ refuses anything else before a vote, and a node never installs it.
   the fence brings only what landed since, from the sources' stable point on. A
   gainer that does not answer in time does not hold the change back: the fenced copy
   brings its slots whole. Watch `accord_preseed_events_total` against
-  `accord_range_copy_events_total`.
+  `accord_range_copy_events_total`. A pre-seed for an epoch another change took
+  — the activation of a transition in progress, usually — ends, and what it
+  brought in is dropped (`accord_copies_voided_total`); the change, if it is
+  proposed again, pre-seeds again.
 - **Subscriptions on a node that gains slots.** The copied events keep their
   original stamps, and a subscription reads forward from a stamp cursor: one on the
   gainer that already read past those stamps never sees the gained history (writes
