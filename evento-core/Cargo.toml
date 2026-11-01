@@ -34,6 +34,7 @@ futures-util = { workspace = true, optional = true }
 [dev-dependencies]
 rand.workspace = true
 evento.workspace = true
+tracing-subscriber.workspace = true
 
 [features]
 default = ["macro"]
