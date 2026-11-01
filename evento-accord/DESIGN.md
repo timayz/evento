@@ -1733,8 +1733,11 @@ backend (sql/fjall). Phases, in order:
         lockstep with `commands`. **~10–15× throughput** on the 64-deep burst and
         ~10× lower write latency, validated against the benchmark; the simulation
         (incl. bit-reproducibility — the `BTreeSet` order is deterministic) and all
-        67 tests still pass. (Thread-level parallelization of the single inbox loop
-        remains a further, now far less urgent, lever.)
+        67 tests still pass. (The applies have since left the inbox loop for an
+        applier task of their own, #475: a reply never waits behind a write to the
+        store, and a coordinator short of only its own replica's answer waits for
+        its store rather than time the phase out. Thread-level parallelization of
+        the inbox loop itself remains a further, now far less urgent, lever.)
   - [x] **Fast-path electorate** (deferred from Phase C) — region-favouring
         single-round-trip commits, now implemented and validated. A shard's
         **electorate** is a cluster-agreed subset of its replicas (the same for

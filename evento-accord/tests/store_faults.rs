@@ -313,3 +313,77 @@ async fn a_requester_that_cannot_decode_the_failure_still_fails_the_read() {
         "a failed read came back as a page: {result:?}"
     );
 }
+
+/// A node alone in its group, over a store whose applies stall, commits a
+/// burst in the store's time and recovers nothing (#475). The applies run on
+/// the applier, so no reply queues behind them; and a coordinator short of
+/// its own acknowledgement while its store is still enacting the queue waits
+/// for it rather than time the phase out at `collect_timeout` and recover a
+/// write nobody refused.
+#[tokio::test(start_paused = true)]
+async fn a_node_alone_commits_a_stalled_burst_without_recovering() {
+    const WRITES: u32 = 20;
+    let delay = Duration::from_millis(400);
+    let config = NodeConfig::default();
+    let cluster = start(1, config);
+    cluster.stores[0].set_apply_delay(delay);
+    let node = cluster.nodes[0].clone();
+
+    let started = tokio::time::Instant::now();
+    let mut writes = tokio::task::JoinSet::new();
+    for i in 0..WRITES {
+        let node = node.clone();
+        writes.spawn(async move { node.write(vec![event(&format!("acc-{i}"), 1)]).await });
+    }
+    while let Some(outcome) = writes.join_next().await {
+        let outcome = outcome
+            .expect("writer panicked")
+            .expect("the write committed");
+        assert!(!outcome.conflict);
+    }
+    let elapsed = started.elapsed();
+    // The applies are serial, so the burst takes the store's time — and
+    // nothing waited a `collect_timeout` on top of it.
+    assert!(elapsed >= delay * WRITES, "{elapsed:?}");
+    assert!(
+        elapsed < delay * WRITES + config.collect_timeout,
+        "the burst waited past the store's time: {elapsed:?}"
+    );
+    let metrics = node.metrics();
+    assert_eq!(metrics.writes_settled, 0, "a write fell to recovery");
+    assert_eq!(metrics.recoveries, 0);
+    assert_eq!(metrics.writes_committed, u64::from(WRITES));
+    assert!(
+        metrics.own_store_waits > 0,
+        "the tail of the burst outlasted collect_timeout and waited on the store"
+    );
+    assert_eq!(cluster.stores[0].applied().len(), WRITES as usize);
+}
+
+/// A read a node's own store is still working is waited for, past
+/// `collect_timeout`, rather than timed out and recovered: a recovery would
+/// ask the same replica, which reads no transaction twice (#475).
+#[tokio::test(start_paused = true)]
+async fn a_node_alone_waits_for_a_read_its_store_is_still_working() {
+    let config = NodeConfig::default();
+    let read = config.collect_timeout + Duration::from_secs(2);
+    let cluster = start(1, config);
+    cluster.stores[0].set_version_delay(read);
+
+    let started = tokio::time::Instant::now();
+    let outcome = cluster.nodes[0]
+        .write(vec![event("acc", 1)])
+        .await
+        .expect("the write committed");
+    assert!(!outcome.conflict);
+    let elapsed = started.elapsed();
+    assert!(elapsed >= read, "{elapsed:?}");
+    assert!(
+        elapsed < read + config.collect_timeout,
+        "the write waited past the read: {elapsed:?}"
+    );
+    let metrics = cluster.nodes[0].metrics();
+    assert_eq!(metrics.writes_settled, 0, "the write fell to recovery");
+    assert!(metrics.own_store_waits > 0);
+    assert_eq!(cluster.stores[0].applied().len(), 1);
+}
