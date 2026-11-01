@@ -14,9 +14,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use evento_accord::{
-    DataStore, DynamicTopology, HybridLogicalClock, InMemoryDataStore, InMemoryJournal,
-    InMemoryNetwork, Journal, Key, LinkFilter, Message, MessageSink, Node, NodeConfig, NodeId,
-    ShardMap, Topology,
+    CopyPhase, CopyState, DataStore, DynamicTopology, HybridLogicalClock, InMemoryDataStore,
+    InMemoryJournal, InMemoryNetwork, Journal, Key, LinkFilter, Message, MessageSink, Node,
+    NodeConfig, NodeId, ShardMap, Topology,
 };
 use evento_core::cursor::Args;
 use evento_core::{Event, EventFilter, TenantFilter};
@@ -1019,6 +1019,154 @@ async fn a_pre_seed_that_outlives_the_change_before_it_leaves_nothing_behind() {
     for i in [3, 4, 5] {
         assert_eq!(versions_of(&nodes[i].store, &right), vec![1]);
     }
+}
+
+/// A node gaining slots in a transition in progress declines a pre-seed
+/// (#471). Node 6 replaces node 0 and copies the first shard under the
+/// fence, reporting it; while the transition drains, node 3 proposes a merge
+/// that would keep node 6 on those slots. Judged against the live layout,
+/// under which node 6 owns nothing, the pre-seed counted them gained again
+/// and dropped what the fenced copy brought in — and its sources do not
+/// answer here, so nothing refilled them before the transition activated
+/// over an emptied store. Now node 6 answers at once, copying nothing, and
+/// its copy stands, in its store and in its journal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_gainer_in_a_transition_in_progress_declines_a_pre_seed() {
+    let net = InMemoryNetwork::new();
+    let before = vec![ids(&[0, 1, 2]), ids(&[3, 4, 5])];
+    let map = ShardMap::even(before.clone());
+    let left = id_in_shard(&map, 0, "left");
+    let right = id_in_shard(&map, 1, "right");
+    let nodes: Vec<TestNode> = (0..7)
+        .map(|id| spawn_node_cfg(NodeId(id), before.clone(), &net, quick()))
+        .collect();
+    nodes[6].node.begin_join();
+    for (id, version) in [(&left, 1), (&right, 1)] {
+        nodes[0]
+            .node
+            .write(vec![event(id, version, "Bumped")])
+            .await
+            .unwrap();
+    }
+
+    // Node 6 replaces node 0: a transition. It drains, but does not
+    // activate: node 1 keeps the first shard, and its reports reach nobody
+    // — nor does the activation it would propose itself, going by its own.
+    let stalled: LinkFilter = Arc::new(|from, _, message| {
+        from == NodeId(1)
+            && matches!(
+                message,
+                Message::Watermark { .. } | Message::ConfigPrepare { .. }
+            )
+    });
+    net.set_link_filter(Some(stalled));
+    let replaced = vec![ids(&[6, 1, 2]), ids(&[3, 4, 5])];
+    let driver = nodes[2].node.clone();
+    let to = replaced.clone();
+    let change = tokio::spawn(async move { driver.change_topology(1, to).await });
+    // Node 6 copies the first shard under the fence, through node 0 or 2,
+    // and journals the copy complete.
+    await_versions(&nodes[6].store, &left, &[1]).await;
+    let copied = |state: &Option<CopyState>| {
+        matches!(
+            state,
+            Some(CopyState {
+                since: 1,
+                phase: CopyPhase::Copied,
+                ..
+            })
+        )
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !copied(&nodes[6].journal.load_copy_state().await.unwrap()) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "node 6 never journaled its copy complete: {:?}",
+            nodes[6].journal.load_copy_state().await.unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        nodes[6].topology.epoch(),
+        1,
+        "the transition is in progress"
+    );
+
+    // Node 3 proposes a merge for the next epoch meanwhile, which keeps node
+    // 6 on the first shard's slots and gives it the second's. Its proposal
+    // never gets through — the transition's activation takes epoch 2 — and
+    // no source answers a page node 6 would ask for.
+    let proposing: LinkFilter = Arc::new(|from, _, message| {
+        (from == NodeId(1)
+            && matches!(
+                message,
+                Message::Watermark { .. } | Message::ConfigPrepare { .. }
+            ))
+            || (from == NodeId(3) && matches!(message, Message::ConfigPrepare { .. }))
+            || (from == NodeId(6) && matches!(message, Message::RangePageRequest { .. }))
+    });
+    net.set_link_filter(Some(proposing));
+    let proposer = nodes[3].node.clone();
+    let merge =
+        tokio::spawn(async move { proposer.change_topology(2, vec![ids(&[6, 1, 2])]).await });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while nodes[6].node.metrics().preseeds_declined == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "node 6 never declined the pre-seed: {:?}, {:?}",
+            nodes[6].node.metrics(),
+            versions_of(&nodes[6].store, &left)
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        versions_of(&nodes[6].store, &left),
+        vec![1],
+        "the copy under the fence stands"
+    );
+    assert_eq!(nodes[6].node.metrics().streams_dropped, 0);
+    assert!(
+        copied(&nodes[6].journal.load_copy_state().await.unwrap()),
+        "the copy's record stands: {:?}",
+        nodes[6].journal.load_copy_state().await.unwrap()
+    );
+
+    // Node 1's reports get through: the transition activates at epoch 2.
+    let activating: LinkFilter = Arc::new(|from, _, message| {
+        (from == NodeId(3) && matches!(message, Message::ConfigPrepare { .. }))
+            || (from == NodeId(6) && matches!(message, Message::RangePageRequest { .. }))
+    });
+    net.set_link_filter(Some(activating));
+    change.abort();
+    let _ = change.await;
+    let installed = tokio::time::timeout(
+        Duration::from_secs(30),
+        nodes[2].node.change_topology(1, replaced.clone()),
+    )
+    .await
+    .expect("the change ends in bounded time")
+    .expect("the change installs");
+    assert_eq!(
+        installed, replaced,
+        "the transition's activation took epoch 2"
+    );
+    merge.abort();
+    let _ = merge.await;
+    net.set_link_filter(None);
+    await_epoch(&nodes[6].topology, 2).await;
+    assert_eq!(versions_of(&nodes[6].store, &left), vec![1]);
+    assert!(
+        copied(&nodes[6].journal.load_copy_state().await.unwrap()),
+        "the copy's record stands after the activation: {:?}",
+        nodes[6].journal.load_copy_state().await.unwrap()
+    );
+    assert_eq!(nodes[6].node.metrics().preseeds_declined, 1);
+    let fresh = nodes[6]
+        .node
+        .write(vec![event(&left, 2, "Bumped")])
+        .await
+        .unwrap();
+    assert!(!fresh.conflict, "the copied version is enforced");
 }
 
 /// A replica added at once whose join failed partway is still joining when

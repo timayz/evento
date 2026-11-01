@@ -244,7 +244,10 @@ refuses anything else before a vote, and a node never installs it.
   `accord_range_copy_events_total`. A pre-seed for an epoch another change took
   — the activation of a transition in progress, usually — ends, and what it
   brought in is dropped (`accord_copies_voided_total`); the change, if it is
-  proposed again, pre-seeds again.
+  proposed again, pre-seeds again. A node that gains slots in a transition in
+  progress declines a pre-seed for a change proposed meanwhile
+  (`accord_preseeds_declined_total`): it keeps what it copied for the
+  transition, and the change, if it wins, copies its slots under the fence.
 - **Subscriptions on a node that gains slots.** The copied events keep their
   original stamps, and a subscription reads forward from a stamp cursor: one on the
   gainer that already read past those stamps never sees the gained history (writes

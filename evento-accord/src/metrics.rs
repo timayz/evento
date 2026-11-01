@@ -142,6 +142,11 @@ pub struct Metrics {
     /// Pre-seeds a change this node drove did not wait out: the change went
     /// on, the fenced copy bringing the rest.
     pub preseeds_timed_out: AtomicU64,
+    /// Pre-seeds this node declined (#471): asked while it gains slots in a
+    /// transition in progress, which its fenced copy for that transition
+    /// brings (or brought, and reported). The change's fenced copy brings
+    /// its slots whole.
+    pub preseeds_declined: AtomicU64,
     /// Copies the layout moved on under (#469): a pre-seed for an epoch
     /// another change took, or a fenced copy for a transition replaced. What
     /// they brought in for slots this node does not own was dropped.
@@ -322,6 +327,11 @@ impl Metrics {
         self.preseeds_timed_out.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records a pre-seed this node declined.
+    pub fn record_preseed_declined(&self) {
+        self.preseeds_declined.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Records a copy the layout moved on under.
     pub fn record_copy_voided(&self) {
         self.copies_voided.fetch_add(1, Ordering::Relaxed);
@@ -393,6 +403,7 @@ impl Metrics {
             preseed_passes: self.preseed_passes.load(Ordering::Relaxed),
             preseed_events: self.preseed_events.load(Ordering::Relaxed),
             preseeds_timed_out: self.preseeds_timed_out.load(Ordering::Relaxed),
+            preseeds_declined: self.preseeds_declined.load(Ordering::Relaxed),
             copies_voided: self.copies_voided.load(Ordering::Relaxed),
             copied_below_stable: self.copied_below_stable.load(Ordering::Relaxed),
         }
@@ -441,6 +452,7 @@ pub struct MetricsSnapshot {
     pub preseed_passes: u64,
     pub preseed_events: u64,
     pub preseeds_timed_out: u64,
+    pub preseeds_declined: u64,
     pub copies_voided: u64,
     pub copied_below_stable: u64,
 }
@@ -450,7 +462,7 @@ impl MetricsSnapshot {
     /// source of truth for both [`to_prometheus`](Self::to_prometheus) and
     /// [`to_prometheus_labeled`](Self::to_prometheus_labeled); add a counter here and
     /// both renderings pick it up.
-    fn counters(&self) -> [(&'static str, &'static str, u64); 39] {
+    fn counters(&self) -> [(&'static str, &'static str, u64); 40] {
         [
             (
                 "accord_writes_committed_total",
@@ -636,6 +648,11 @@ impl MetricsSnapshot {
                 "accord_preseeds_timed_out_total",
                 "Pre-seeds a change this node drove did not wait out.",
                 self.preseeds_timed_out,
+            ),
+            (
+                "accord_preseeds_declined_total",
+                "Pre-seeds this node declined while it gains slots in a transition in progress.",
+                self.preseeds_declined,
             ),
             (
                 "accord_copies_voided_total",
