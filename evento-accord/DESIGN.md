@@ -912,11 +912,23 @@ backend (sql/fjall). Phases, in order:
   quorum may hold, and fences the rest. The original coordinator is held to a
   deadline instead: its PreAccept, and its Accept at `Ballot(t0)`, get no vote
   from a replica that does not hold the transaction past the clock less
-  `compaction_margin` (`Replica::late`, `accord_votes_late_total`). No
-  coordinator's message outlives the margin, and a replica that voted on its
-  coordinator's word did so while its applied-through still lay below the
-  transaction — so its gossip shows it holding it. Past that deadline, and
-  below no fence, a replica settles a recovery in **two rounds**
+  `compaction_margin` (`Replica::late`, `accord_votes_late_total`), and are
+  answered `Late` at that ballot, so the coordinator settles the write as
+  soon as its quorum is out of reach rather than after `collect_timeout`
+  (#466). No coordinator's message outlives the margin, and a replica that
+  voted on its coordinator's word did so while its applied-through still lay
+  below the transaction — so its gossip shows it holding it. A node's own
+  replica is the exception, for a write the node is still coordinating
+  (`Sender::OwnCoordinator`): nothing the node vouches for — its reports and
+  the applied-through it gossips, the coverage it exports, its stable point,
+  the vote fence raised to them — passes a write it coordinates
+  (`Node::vouch_cutoff`, the id minted under the same lock), so its own vote,
+  however late, contradicts none of them, while a node alone in its group,
+  whose inbox is the message delay, would otherwise refuse every write slower
+  than the margin (a burst of applies to a store whose fsyncs stall for a
+  second; `a_nodes_own_write_outlives_the_margin_and_still_commits`). Past
+  that deadline, and below no fence, a replica settles a recovery in **two
+  rounds**
   (`RecoveryRound`): to the first it answers `Late`, promising the ballot, and
   neither votes nor refuses. The recovery, which sees every reply, then asks
   it to **refuse** the transaction for good if that proves it never committed
@@ -934,7 +946,11 @@ backend (sql/fjall). Phases, in order:
   decided with the late votes
   (`a_recovery_has_late_replicas_refuse_what_too_few_hold`,
   `a_recovery_asks_no_late_vote_for_what_may_not_have_committed`,
-  `a_refusal_for_good_outlives_a_restart`). A coordinator's
+  `a_refusal_for_good_outlives_a_restart`). An invalidated write comes back
+  as `CommitOutcome::invalidated` — `WriteError::Unavailable` with the
+  `Invalidated` cause through `AccordExecutor`, never a version conflict: it
+  never committed, nothing was written, no condition was judged, and a retry
+  minted anew is sound (#466). A coordinator's
   messages, and recoveries of a transaction still in flight, land within the
   margin (OPERATIONS: margin ≥ `recovery_timeout` + 2 × skew + delay). Past it, a
   transaction only a minority holds can no longer gather a quorum, and a recovery

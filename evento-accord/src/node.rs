@@ -41,7 +41,7 @@ use crate::message::{
 };
 use crate::metrics::{Metrics, MetricsSnapshot};
 use crate::reconfig::{self, Fence, Floor, Transition};
-use crate::replica::{Refusal, Replica, RoutedRecovery};
+use crate::replica::{Refusal, Replica, RoutedRecovery, Sender};
 use crate::transport::Envelope;
 
 /// Tunable timing/sizing parameters for a [`Node`]. [`Default`] reproduces the
@@ -375,52 +375,92 @@ impl std::fmt::Display for Outbid {
 
 impl std::error::Error for Outbid {}
 
-/// A replica's answer to a coordinator's PreAccept or Accept: its vote, or a
-/// `Nack` naming the higher ballot it promised (see [`Outbid`]).
+/// A write a recovery **invalidated** (#466): too few replicas held it for
+/// it ever to commit — its coordinator's PreAccept outlived the compaction
+/// margin on them, say — so nothing was written, anywhere, and no replica
+/// will ever apply it. Not a version conflict: the write itself was sound,
+/// and a retry, minted anew, is too. [`AccordExecutor`](crate::AccordExecutor)
+/// answers it as `WriteError::Unavailable`, this as the cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Invalidated {
+    /// The transaction that never committed.
+    pub txn: TxnId,
+}
+
+impl std::fmt::Display for Invalidated {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the write {:?} was invalidated: too few replicas held it in time, nothing was \
+             written, and a retry is sound",
+            self.txn
+        )
+    }
+}
+
+impl std::error::Error for Invalidated {}
+
+/// A replica's answer to a coordinator's PreAccept or Accept: its vote, a
+/// `Nack` naming the higher ballot it promised (see [`Outbid`]), or that the
+/// message outlived the coordinator's deadline (`Late`, see
+/// [`Replica::late`]) — a refusal that promises nothing, but votes no more
+/// than a `Nack` does.
 enum Vote<T> {
     Ok(T),
     Nack(Ballot),
+    Late,
 }
 
-/// Whether `shard`'s quorum is out of a round's reach: with `nacked` refusals
-/// before this collection and those in `got`, fewer replicas are left to
-/// answer than the quorum needs beyond the votes in `got`.
-fn quorum_lost<T>(shard: &ShardPlan, got: &[(NodeId, Vote<T>)], nacked: usize) -> bool {
-    let refused = nacked
+/// Whether `shard`'s quorum is out of a round's reach: with `refused`
+/// refusals before this collection and those in `got`, fewer replicas are
+/// left to answer than the quorum needs beyond the votes in `got`.
+fn quorum_lost<T>(shard: &ShardPlan, got: &[(NodeId, Vote<T>)], refused: usize) -> bool {
+    let refused = refused
         + got
             .iter()
-            .filter(|(_, v)| matches!(v, Vote::Nack(_)))
+            .filter(|(_, v)| !matches!(v, Vote::Ok(_)))
             .count();
     refused + shard.slow_q > shard.replicas.len()
 }
 
-/// Splits a collection of votes into the votes per shard, the refusals per
-/// shard, and the highest ballot a refusal named.
-#[allow(clippy::type_complexity)]
-fn split_votes<T>(
-    votes: HashMap<ShardId, Vec<(NodeId, Vote<T>)>>,
-) -> (
-    HashMap<ShardId, Vec<(NodeId, T)>>,
-    HashMap<ShardId, usize>,
-    Option<Ballot>,
-) {
+/// A collection of votes, split: the votes per shard, the refusals per shard
+/// (`Nack`s and `Late`s), the highest ballot a `Nack` named, and how many
+/// replicas answered `Late`.
+struct Votes<T> {
+    oks: HashMap<ShardId, Vec<(NodeId, T)>>,
+    refused: HashMap<ShardId, usize>,
+    outbid: Option<Ballot>,
+    late: usize,
+}
+
+fn split_votes<T>(votes: HashMap<ShardId, Vec<(NodeId, Vote<T>)>>) -> Votes<T> {
     let mut oks: HashMap<ShardId, Vec<(NodeId, T)>> = HashMap::new();
-    let mut nacked: HashMap<ShardId, usize> = HashMap::new();
+    let mut refused: HashMap<ShardId, usize> = HashMap::new();
     let mut outbid: Option<Ballot> = None;
+    let mut late = 0;
     for (shard, items) in votes {
         let bucket = oks.entry(shard).or_default();
-        let refused = nacked.entry(shard).or_default();
+        let shard_refused = refused.entry(shard).or_default();
         for (from, vote) in items {
             match vote {
                 Vote::Ok(item) => bucket.push((from, item)),
                 Vote::Nack(promised) => {
-                    *refused += 1;
+                    *shard_refused += 1;
                     outbid = Some(outbid.map_or(promised, |b: Ballot| b.max(promised)));
+                }
+                Vote::Late => {
+                    *shard_refused += 1;
+                    late += 1;
                 }
             }
         }
     }
-    (oks, nacked, outbid)
+    Votes {
+        oks,
+        refused,
+        outbid,
+        late,
+    }
 }
 
 /// A node's liveness signal ([`Node::sweep_pressure`]).
@@ -803,11 +843,36 @@ impl Drop for Coordinating<'_> {
 /// The result of a coordinated (or recovered) write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommitOutcome {
-    /// The committed transaction's id.
+    /// The transaction's id.
     pub txn: TxnId,
-    /// Whether the write was aborted by the optimistic-version condition
-    /// (evento's `InvalidOriginalVersion`) — atomically, across all shards.
+    /// Whether the write was aborted — atomically, across all shards: by the
+    /// optimistic-version condition (evento's `InvalidOriginalVersion`), or
+    /// invalidated by a recovery (`invalidated`).
     pub conflict: bool,
+    /// Whether a recovery invalidated the write (see [`Invalidated`]): it
+    /// never committed, nothing was written, and no version condition was
+    /// judged — a retry at a fresh `t0` is sound. Implies `conflict`.
+    pub invalidated: bool,
+}
+
+impl CommitOutcome {
+    /// A committed write, or one the version condition aborted.
+    fn decided(txn: TxnId, conflict: bool) -> Self {
+        CommitOutcome {
+            txn,
+            conflict,
+            invalidated: false,
+        }
+    }
+
+    /// A write a recovery invalidated.
+    fn invalidated(txn: TxnId) -> Self {
+        CommitOutcome {
+            txn,
+            conflict: true,
+            invalidated: true,
+        }
+    }
 }
 
 /// The replica set and quorum sizes for one shard a transaction touches.
@@ -1759,7 +1824,7 @@ impl Node {
     pub fn stable_micros(&self) -> u64 {
         let shard_peers = self.shard_peers();
         let alone = self.topology.nodes() == [self.id];
-        let cutoff = self.margin_cutoff();
+        let cutoff = self.vouch_cutoff();
         let replica = self.replica.lock().expect("replica poisoned");
         let bound = self.stable_locked(&replica, cutoff, &shard_peers);
         // Read under the same lock as the store's bound: a fence raised past
@@ -1823,6 +1888,49 @@ impl Node {
         }
     }
 
+    /// Whose PreAccept or Accept `from` sent for `txn` (see
+    /// [`Sender`]): this node's own, for a write it is still coordinating,
+    /// is not held to the coordinator's deadline (#466). One it no longer
+    /// coordinates — a caller that gave up, a message replayed — is a
+    /// peer's as far as the deadline goes.
+    fn sender_of(&self, from: NodeId, txn: TxnId) -> Sender {
+        if from == self.id
+            && txn.0.node == self.id
+            && self
+                .coordinating
+                .lock()
+                .expect("coordinating poisoned")
+                .contains(&txn)
+        {
+            Sender::OwnCoordinator
+        } else {
+            Sender::Peer
+        }
+    }
+
+    /// The newest point this node may vouch for: the
+    /// [`margin_cutoff`](Self::margin_cutoff), never past a write it is
+    /// still coordinating. Its own PreAccept for that write may still be in
+    /// its inbox — behind a batch of applies to a slow store, say — and its
+    /// replica votes for it however late ([`Sender::OwnCoordinator`]), so
+    /// until the write ends nothing this node vouches for passes it: not
+    /// the applied-through it gossips and the floor drawn from it, not the
+    /// coverage it exports, not its stable point, not the vote fence raised
+    /// to those (#466). Takes the coordinating lock; never held while the
+    /// replica lock is taken, so it may be read under it.
+    fn vouch_cutoff(&self) -> Timestamp {
+        let cutoff = self.margin_cutoff();
+        match self
+            .coordinating
+            .lock()
+            .expect("coordinating poisoned")
+            .first()
+        {
+            Some(oldest) if oldest.0 < cutoff => oldest.0,
+            _ => cutoff,
+        }
+    }
+
     /// The applied-through each peer last gossiped (see
     /// [`Message::Watermark`]'s `applied`), under the live layout.
     fn gossiped_applied(&self) -> HashMap<NodeId, Timestamp> {
@@ -1878,7 +1986,7 @@ impl Node {
         shard_peers: &[NodeId],
         gossiped: &HashMap<NodeId, Timestamp>,
     ) -> Timestamp {
-        let own = replica.applied_through(self.margin_cutoff());
+        let own = replica.applied_through(self.vouch_cutoff());
         own.min(self.applied_floor(own, shard_peers, gossiped))
     }
 
@@ -3273,7 +3381,7 @@ impl Node {
     /// ([`vouch_durably`](Self::vouch_durably)) before the report leaves.
     fn report(&self, shard_peers: &[NodeId]) -> (Timestamp, Timestamp) {
         let gossiped = self.gossiped_applied();
-        let cutoff = self.margin_cutoff();
+        let cutoff = self.vouch_cutoff();
         let mut replica = self.replica.lock().expect("replica poisoned");
         let applied = replica.applied_through(cutoff);
         let vouched = self.vouch_locked(&replica, shard_peers);
@@ -3309,9 +3417,13 @@ impl Node {
     /// join-proof and coordinating locks under the replica lock — none of
     /// them is ever held while the replica lock is taken.
     fn vouch_locked(&self, replica: &Replica, shard_peers: &[NodeId]) -> Timestamp {
-        let local = replica.applied_through(self.margin_cutoff());
+        let local = replica.applied_through(self.vouch_cutoff());
 
-        let mine = match self.proven_coverage(shard_peers) {
+        // Never past a transaction this node is still coordinating (the
+        // cutoff `local` was drawn from): if its coordination fails, the
+        // node recovers it to learn the outcome, and that needs every
+        // replica to still hold it.
+        match self.proven_coverage(shard_peers) {
             Some(coverage) if coverage < local => {
                 // In a healthy cluster a report trails the coverage proving
                 // it by about an anti-entropy round: no clamp worth
@@ -3340,18 +3452,6 @@ impl Node {
                 coverage
             }
             _ => local,
-        };
-        // Never past a transaction this node is still coordinating: if its
-        // coordination fails, the node recovers it to learn the outcome, and
-        // that needs every replica to still hold it.
-        match self
-            .coordinating
-            .lock()
-            .expect("coordinating poisoned")
-            .first()
-        {
-            Some(oldest) if oldest.0 < mine => oldest.0,
-            _ => mine,
         }
     }
 
@@ -3998,6 +4098,7 @@ impl Node {
                     return out;
                 }
                 let events = self.owned_events(&layout, events);
+                let sender = self.sender_of(from, txn);
                 let vote = {
                     let mut replica = self.replica.lock().expect("replica poisoned");
                     if self
@@ -4010,7 +4111,7 @@ impl Node {
                     // under: a vote decided here comes after it, or before
                     // it was cut.
                     replica.set_coordinator_cutoff(self.coordinator_cutoff());
-                    replica.preaccept(txn, epoch, keys, events)
+                    replica.preaccept_from(txn, epoch, keys, events, sender)
                 };
                 match vote {
                     Ok((execute_at, deps)) => {
@@ -4034,7 +4135,19 @@ impl Node {
                     }
                     Err(Refusal::Compacted) => {}
                     Err(Refusal::Fenced) => self.metrics.record_vote_fenced(),
-                    Err(Refusal::Late) => self.metrics.record_vote_late(),
+                    // Past the deadline, never witnessed: nothing recorded,
+                    // and the coordinator told so, to settle its write at
+                    // once instead of after `collect_timeout` (#466).
+                    Err(Refusal::Late) => {
+                        self.metrics.record_vote_late();
+                        out.push((
+                            from,
+                            Message::Late {
+                                txn,
+                                ballot: Ballot(txn.0),
+                            },
+                        ));
+                    }
                 }
             }
             Message::Accept {
@@ -4059,6 +4172,7 @@ impl Node {
                 if self.not_a_replica_of(txn, carried, &keys) {
                     return out;
                 }
+                let sender = self.sender_of(from, txn);
                 let reply = {
                     let mut replica = self.replica.lock().expect("replica poisoned");
                     if self
@@ -4071,7 +4185,7 @@ impl Node {
                     // deadline; a recovery's, which decided to commit, to the
                     // vote fence alone.
                     replica.set_coordinator_cutoff(self.coordinator_cutoff());
-                    replica.accept(txn, ballot, epoch, execute_at, deps, keys)
+                    replica.accept_from(txn, ballot, epoch, execute_at, deps, keys, sender)
                 };
                 if reply == Err(Refusal::Compacted) {
                     return out;
@@ -4082,6 +4196,7 @@ impl Node {
                 }
                 if reply == Err(Refusal::Late) {
                     self.metrics.record_vote_late();
+                    out.push((from, Message::Late { txn, ballot }));
                     return out;
                 }
                 let route_kept = reply.is_err() || self.keep_route(txn, route.as_deref()).await;
@@ -5403,11 +5518,7 @@ impl Node {
         // One layout for the whole coordination: an epoch installed meanwhile
         // changes neither the replicas it counts nor those it recovers through.
         let layout = self.topology.layout();
-        let txn = TxnId(self.mint().await?);
-        self.coordinating
-            .lock()
-            .expect("coordinating poisoned")
-            .insert(txn);
+        let txn = self.mint_write().await?;
         // Released however this ends — returned, or dropped mid-flight by a
         // caller that gave up (a hung-up client, a timeout): left behind, the
         // entry would pin this node's watermark report, and the response
@@ -5566,7 +5677,7 @@ impl Node {
             )
             .await?;
         self.deregister(txn);
-        Ok((CommitOutcome { txn, conflict }, all_fast))
+        Ok((CommitOutcome::decided(txn, conflict), all_fast))
     }
 
     /// PreAccept → (Accept): agrees `txn`'s execution timestamp and per-shard
@@ -5615,6 +5726,7 @@ impl Node {
                 execute_at, deps, ..
             } => Some(Vote::Ok((execute_at, deps))),
             Message::Nack { promised, .. } => Some(Vote::Nack(promised)),
+            Message::Late { ballot, .. } if ballot == Ballot(t0) => Some(Vote::Late),
             _ => None,
         };
         let first = self
@@ -5637,7 +5749,12 @@ impl Node {
         // reply would otherwise complete the quorum with fewer distinct
         // replicas than it takes.
         let voted: HashSet<NodeId> = first.values().flatten().map(|(from, _)| *from).collect();
-        let (mut pre, mut nacked, mut outbid) = split_votes(first);
+        let Votes {
+            oks: mut pre,
+            refused: mut nacked,
+            mut outbid,
+            mut late,
+        } = split_votes(first);
         // The fast-path window may close before a slow quorum has witnessed the
         // txn (e.g. cold connections at startup, where the first handshake
         // outlasts `fast_timeout`). Keep collecting up to the slow-path budget
@@ -5661,22 +5778,34 @@ impl Node {
                     votes_of,
                 )
                 .await;
-            let (more, more_nacked, more_outbid) = split_votes(more);
-            for (shard, mut items) in more {
+            let more = split_votes(more);
+            for (shard, mut items) in more.oks {
                 if let Some(bucket) = pre.get_mut(&shard) {
                     bucket.append(&mut items);
                 }
             }
-            for (shard, n) in more_nacked {
+            for (shard, n) in more.refused {
                 *nacked.entry(shard).or_default() += n;
             }
-            outbid = outbid.or(more_outbid);
+            outbid = outbid.or(more.outbid);
+            late += more.late;
         }
         for plan in plans {
             if pre[&plan.shard].len() < plan.slow_q {
                 self.deregister(txn);
                 if let Some(promised) = outbid {
                     return Err(Outbid(promised).into());
+                }
+                // Refused as late by replicas that never witnessed it: the
+                // write is settled now — recovered, and invalidated unless
+                // enough replicas hold it after all — not after a
+                // `collect_timeout` of silence (#466).
+                if late > 0 {
+                    anyhow::bail!(
+                        "preaccept quorum not reached for shard {}: {late} replicas answered \
+                         past the coordinator's deadline",
+                        plan.shard
+                    );
                 }
                 anyhow::bail!("preaccept quorum not reached for shard {}", plan.shard);
             }
@@ -5757,16 +5886,29 @@ impl Node {
                             Some(Vote::Ok(deps))
                         }
                         Message::Nack { promised, .. } => Some(Vote::Nack(promised)),
+                        Message::Late { ballot, .. } if ballot == Ballot(t0) => Some(Vote::Late),
                         _ => None,
                     },
                 )
                 .await;
-            let (acks, _, outbid) = split_votes(acks);
+            let Votes {
+                oks: acks,
+                outbid,
+                late,
+                ..
+            } = split_votes(acks);
             for plan in plans {
                 if acks[&plan.shard].len() < plan.slow_q {
                     self.deregister(txn);
                     if let Some(promised) = outbid {
                         return Err(Outbid(promised).into());
+                    }
+                    if late > 0 {
+                        anyhow::bail!(
+                            "accept quorum not reached for shard {}: {late} replicas answered \
+                             past the coordinator's deadline",
+                            plan.shard
+                        );
                     }
                     anyhow::bail!("accept quorum not reached for shard {}", plan.shard);
                 }
@@ -5878,7 +6020,7 @@ impl Node {
             biased;
             reads = collect => reads,
             true = decided_here => {
-                let conflict = self.local_outcome(txn).expect("applied here");
+                let conflict = self.local_outcome(txn).expect("applied here").conflict;
                 // Again, for a replica the decision's Apply missed.
                 self.broadcast(&union, Message::Apply { txn, commit: !conflict }).await;
                 return Ok(conflict);
@@ -6028,8 +6170,8 @@ impl Node {
         events: &[Event],
     ) -> anyhow::Result<CommitOutcome> {
         self.deregister(txn);
-        if let Some(conflict) = self.local_outcome(txn) {
-            return Ok(CommitOutcome { txn, conflict });
+        if let Some(outcome) = self.local_outcome(txn) {
+            return Ok(outcome);
         }
         // Refused for a higher ballot: a recovery holds the write and
         // decides it. Where this node is a replica of the write's shard, the
@@ -6046,9 +6188,9 @@ impl Node {
                     outcome.is_some()
                 })
                 .await;
-            if let Some(conflict) = outcome {
+            if let Some(outcome) = outcome {
                 tracing::debug!(node = self.id.0, ?txn, error = %failure, "write settled by the recovery that outbid it");
-                return Ok(CommitOutcome { txn, conflict });
+                return Ok(outcome);
             }
         }
         match self
@@ -6079,20 +6221,23 @@ impl Node {
             })
             .await;
         match outcome {
-            Some(conflict) => {
+            Some(outcome) => {
                 tracing::debug!(node = self.id.0, ?txn, error = %failure, "write settled by another node");
-                Ok(CommitOutcome { txn, conflict })
+                Ok(outcome)
             }
             None => Err(failure),
         }
     }
 
-    /// The outcome of `txn` if this node has applied it: `Some(conflict)`.
-    fn local_outcome(&self, txn: TxnId) -> Option<bool> {
-        self.replica
-            .lock()
-            .expect("replica poisoned")
-            .applied_result(txn)
+    /// The outcome of `txn` if this node has applied it.
+    fn local_outcome(&self, txn: TxnId) -> Option<CommitOutcome> {
+        let replica = self.replica.lock().expect("replica poisoned");
+        let conflict = replica.applied_result(txn)?;
+        Some(if replica.applied_invalidated(txn) {
+            CommitOutcome::invalidated(txn)
+        } else {
+            CommitOutcome::decided(txn, conflict)
+        })
     }
 
     /// Recovers `txn`: takes it over under a fresh ballot and drives it to an
@@ -6633,8 +6778,8 @@ impl Node {
         // waits for it, up to `collect_timeout`, and takes its outcome.
         let in_flight = Self::after(self.settings.collect_timeout);
         loop {
-            if let Some(conflict) = self.local_outcome(txn) {
-                return Ok(CommitOutcome { txn, conflict });
+            if let Some(outcome) = self.local_outcome(txn) {
+                return Ok(outcome);
             }
             if !self
                 .pending
@@ -6687,7 +6832,9 @@ impl Node {
             // and never recover it.
             self.deregister(txn);
             let what = match &attempt {
-                Ok(Attempt::Done(o)) => format!("done conflict={}", o.conflict),
+                Ok(Attempt::Done(o)) => {
+                    format!("done conflict={} invalidated={}", o.conflict, o.invalidated)
+                }
                 Ok(Attempt::Retry(p)) => format!("retry promised={p:?}"),
                 Ok(Attempt::Route(_)) => "route".to_string(),
                 Err(e) => format!("err {e:#}"),
@@ -6810,9 +6957,14 @@ impl Node {
                 },
             )
             .await;
-            let again =
-                Self::collect_asked(rx, &blind, Self::after(self.settings.fast_timeout), ballot)
-                    .await;
+            let again = Self::collect_asked(
+                rx,
+                &blind,
+                Self::after(self.settings.fast_timeout),
+                ballot,
+                RecoveryRound::Ask,
+            )
+            .await;
             if let Some(promised) = Self::nack_in(&again) {
                 return Ok(Attempt::Retry(promised));
             }
@@ -6847,10 +6999,7 @@ impl Node {
                 "invalidating a transaction its replicas' vote fences rule out"
             );
             self.broadcast(&union, Message::Invalidate { txn }).await;
-            return Ok(Attempt::Done(CommitOutcome {
-                txn,
-                conflict: true,
-            }));
+            return Ok(Attempt::Done(CommitOutcome::invalidated(txn)));
         }
         if let Some(contact) = self.stranded_below(txn, &plans, &resp) {
             tracing::error!(
@@ -6878,10 +7027,7 @@ impl Node {
         // any replica that missed its Invalidate, rather than retry for ever.
         if known.iter().any(|(_, f)| f.invalidated()) {
             self.broadcast(&union, Message::Invalidate { txn }).await;
-            return Ok(Attempt::Done(CommitOutcome {
-                txn,
-                conflict: true,
-            }));
+            return Ok(Attempt::Done(CommitOutcome::invalidated(txn)));
         }
 
         // Recovery-quorum gate: the decision must rest on a slow quorum of
@@ -7013,7 +7159,7 @@ impl Node {
         } else {
             self.settings.fast_timeout
         };
-        let again = Self::collect_asked(rx, &late, Self::after(window), ballot).await;
+        let again = Self::collect_asked(rx, &late, Self::after(window), ballot, round).await;
         if let Some(promised) = Self::nack_in(&again) {
             return Some(promised);
         }
@@ -7021,23 +7167,32 @@ impl Node {
         None
     }
 
-    /// Collects the reports answering `ballot` until every node in `asked`
-    /// answered, or `deadline` passed: one per responder, a straggler's to
-    /// an earlier round of the same attempt included (the first round may
-    /// have ended before it answered; counting it as an answer to this one
-    /// would leave the answer asked for unread).
+    /// Collects the reports answering `ballot` in `round` until every node
+    /// in `asked` answered, or `deadline` passed: one per responder, a
+    /// straggler's to an earlier round of the same attempt included (the
+    /// first round may have ended before it answered). Except, in a settle
+    /// round (`Refuse`, `Vote`), a `Late`: a replica answers that to a first
+    /// round alone, so it is a straggler's — a first round re-asks replicas
+    /// silent for a `recovery_interval`, and a link slower than that gets
+    /// two answers — and counting it as the answer asked for would end the
+    /// round on it, the refusal or vote still in flight unread (#466).
     async fn collect_asked(
         rx: &mut mpsc::UnboundedReceiver<(NodeId, Message)>,
         asked: &[NodeId],
         deadline: Instant,
         ballot: Ballot,
+        round: RecoveryRound,
     ) -> Vec<(NodeId, RecoverResp)> {
+        let settling = matches!(round, RecoveryRound::Refuse | RecoveryRound::Vote);
         let mut out: Vec<(NodeId, RecoverResp)> = Vec::new();
         let mut pending: HashSet<NodeId> = asked.iter().copied().collect();
         while !pending.is_empty() {
             match tokio::time::timeout_at(deadline, rx.recv()).await {
                 Ok(Some((from, message))) => {
                     if let Some(report) = Self::recover_report(message, ballot) {
+                        if settling && matches!(report, RecoverResp::Late) {
+                            continue;
+                        }
                         if out.iter().all(|(n, _)| *n != from) {
                             pending.remove(&from);
                             out.push((from, report));
@@ -7353,6 +7508,7 @@ impl Node {
                     &promised,
                     Self::after(self.settings.collect_timeout),
                     ballot,
+                    RecoveryRound::Ask,
                 )
                 .await;
                 if let Some(promised) = Self::nack_in(&again) {
@@ -7396,10 +7552,7 @@ impl Node {
                     "invalidating a transaction its route's replicas rule out"
                 );
                 self.broadcast(&targets, Message::Invalidate { txn }).await;
-                return Ok(Attempt::Done(CommitOutcome {
-                    txn,
-                    conflict: true,
-                }));
+                return Ok(Attempt::Done(CommitOutcome::invalidated(txn)));
             }
             Verdict::Recover(planned) => planned,
         };
@@ -7939,7 +8092,7 @@ impl Node {
                 rx, layout, plans, route, txn, execute_at, shard_deps, &applied, driver,
             )
             .await?;
-        Ok(Attempt::Done(CommitOutcome { txn, conflict }))
+        Ok(Attempt::Done(CommitOutcome::decided(txn, conflict)))
     }
 
     /// Runs only PreAccept and returns the transaction id, modelling a
@@ -9177,7 +9330,7 @@ impl Node {
             let (applied, floor, fence) = {
                 let replica = self.replica.lock().expect("replica poisoned");
                 (
-                    replica.applied_through(self.margin_cutoff()),
+                    replica.applied_through(self.vouch_cutoff()),
                     replica.redundant_before(),
                     replica.durable_fence(),
                 )
@@ -11199,6 +11352,38 @@ impl Node {
         let stamp = self.clock.now();
         self.bound_clock_past(stamp.micros).await?;
         Ok(stamp)
+    }
+
+    /// [`mint`](Self::mint)s a write's id and enters it in `coordinating`,
+    /// both under the coordinating lock: no report, coverage or stable point
+    /// read in between can pass it (see [`vouch_cutoff`](Self::vouch_cutoff))
+    /// — the clock bound the id waits for may take a while on a slow disk.
+    /// Left in `coordinating` on success, for the caller's [`Coordinating`]
+    /// guard; removed on failure.
+    async fn mint_write(&self) -> anyhow::Result<TxnId> {
+        if self.retired.load(Ordering::Acquire) {
+            return Err(NodeClosed.into());
+        }
+        let floor = self
+            .replica
+            .lock()
+            .expect("replica poisoned")
+            .redundant_before();
+        self.clock.restore(floor);
+        let txn = {
+            let mut coordinating = self.coordinating.lock().expect("coordinating poisoned");
+            let txn = TxnId(self.clock.now());
+            coordinating.insert(txn);
+            txn
+        };
+        if let Err(err) = self.bound_clock_past(txn.0.micros).await {
+            self.coordinating
+                .lock()
+                .expect("coordinating poisoned")
+                .remove(&txn);
+            return Err(err);
+        }
+        Ok(txn)
     }
 
     /// Persists a clock bound past `reading` (microseconds), unless one is

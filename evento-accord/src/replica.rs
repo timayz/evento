@@ -281,8 +281,26 @@ pub enum Refusal {
     Fenced,
     /// The original coordinator's message for a transaction not held here
     /// outlived the compaction margin (see [`Replica::late`]): nothing is
-    /// recorded, and nothing answered.
+    /// recorded, and the coordinator is told so ([`Message::Late`] at
+    /// `Ballot(t0)`), so it settles the write at once.
     Late,
+}
+
+/// Whose PreAccept, or Accept at `Ballot(t0)`, a replica handles: the
+/// original coordinator's deadline (see [`Replica::late`]) holds a peer's,
+/// not the replica's own node's for a write that node is still coordinating
+/// (#466). The deadline keeps a coordinator's message from landing after a
+/// recovery judged the transaction on the replicas' silence; the node's own
+/// vouches — its reports, the coverage it exports, its stable point — never
+/// pass a write it is coordinating, so its own vote, however late, contradicts
+/// none of them, and a node alone in its group could otherwise refuse every
+/// write slower than the margin (its own inbox is the message delay).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sender {
+    /// Another node's coordinator: held to the deadline.
+    Peer,
+    /// This replica's own node, coordinating the write still: not held to it.
+    OwnCoordinator,
 }
 
 /// What a replica answers a routed recovery (`Message::Routed` around a
@@ -621,6 +639,20 @@ impl Replica {
         keys: Vec<Key>,
         events: Vec<Event>,
     ) -> Result<(Timestamp, Vec<TxnId>), Refusal> {
+        self.preaccept_from(txn, epoch, keys, events, Sender::Peer)
+    }
+
+    /// [`preaccept`](Self::preaccept), from `sender`: the node's own
+    /// PreAccept for a write it is still coordinating is not held to the
+    /// deadline (see [`Sender`]).
+    pub fn preaccept_from(
+        &mut self,
+        txn: TxnId,
+        epoch: u64,
+        keys: Vec<Key>,
+        events: Vec<Event>,
+        sender: Sender,
+    ) -> Result<(Timestamp, Vec<TxnId>), Refusal> {
         if self.compacted(txn) {
             return Err(Refusal::Compacted);
         }
@@ -633,7 +665,7 @@ impl Replica {
         if self.fenced(txn) {
             return Err(Refusal::Fenced);
         }
-        if self.late(txn) {
+        if sender == Sender::Peer && self.late(txn) {
             return Err(Refusal::Late);
         }
         Ok(self.witness(txn, epoch, Ballot(txn.0), keys, events))
@@ -811,6 +843,23 @@ impl Replica {
         deps: Vec<TxnId>,
         keys: Vec<Key>,
     ) -> Result<Vec<TxnId>, Refusal> {
+        self.accept_from(txn, ballot, epoch, execute_at, deps, keys, Sender::Peer)
+    }
+
+    /// [`accept`](Self::accept), from `sender`: the node's own Accept at
+    /// `Ballot(t0)` for a write it is still coordinating is not held to the
+    /// deadline (see [`Sender`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn accept_from(
+        &mut self,
+        txn: TxnId,
+        ballot: Ballot,
+        epoch: u64,
+        execute_at: Timestamp,
+        deps: Vec<TxnId>,
+        keys: Vec<Key>,
+        sender: Sender,
+    ) -> Result<Vec<TxnId>, Refusal> {
         if self.compacted(txn) {
             return Err(Refusal::Compacted);
         }
@@ -845,9 +894,10 @@ impl Replica {
             if self.fenced(txn) {
                 return Err(Refusal::Fenced);
             }
-            // The original coordinator's own Accept is held to its deadline;
-            // a recovery's, at a higher ballot, to the vote fence alone.
-            if ballot == Ballot(txn.0) && self.late(txn) {
+            // The original coordinator's own Accept is held to its deadline
+            // (unless it is this node's: see `Sender`); a recovery's, at a
+            // higher ballot, to the vote fence alone.
+            if ballot == Ballot(txn.0) && sender == Sender::Peer && self.late(txn) {
                 return Err(Refusal::Late);
             }
             self.unknown_promises.remove(&txn);
@@ -961,6 +1011,19 @@ impl Replica {
             Some(cmd) if cmd.status == Status::Applied => cmd.applied_conflict,
             Some(_) => None,
             None => self.decisions.get(&txn).map(|record| record.conflict),
+        }
+    }
+
+    /// Whether `txn` was [invalidated](Self::invalidate) here — applied as
+    /// an abort a recovery decided, not one the version condition did: it
+    /// never committed, and nothing was written (#466).
+    pub fn applied_invalidated(&self, txn: TxnId) -> bool {
+        match self.commands.get(&txn) {
+            Some(cmd) => cmd.invalidated(),
+            None => self
+                .decisions
+                .get(&txn)
+                .is_some_and(|record| record.execute_at == crate::message::INVALIDATED_AT),
         }
     }
 
@@ -2657,6 +2720,73 @@ mod tests {
 
         replica.compact(txn(30).0);
         assert!(replica.unknown_promises.is_empty());
+    }
+
+    /// A node's own PreAccept, or Accept at `Ballot(t0)`, for a write it is
+    /// still coordinating is not held to the coordinator's deadline (#466):
+    /// alone in its group, its inbox is the message delay, and its vouches
+    /// never pass a write it coordinates. A peer's is; and a promise to a
+    /// recovery outbids the node's own all the same.
+    #[test]
+    fn the_nodes_own_coordinator_is_not_held_to_the_deadline() {
+        let mut replica = Replica::new();
+        let key = Key("k".into());
+        replica.set_coordinator_cutoff(txn(40).0);
+
+        let peer = txn(20);
+        assert_eq!(
+            replica.preaccept(peer, 0, vec![key.clone()], vec![event("k", 1)]),
+            Err(Refusal::Late)
+        );
+        assert_eq!(replica.status(peer), None);
+        let own = txn(21);
+        replica
+            .preaccept_from(
+                own,
+                0,
+                vec![key.clone()],
+                vec![event("k", 1)],
+                Sender::OwnCoordinator,
+            )
+            .expect("its own vote");
+        assert_eq!(replica.status(own), Some(Status::PreAccepted));
+
+        let peer = txn(22);
+        assert_eq!(
+            replica.accept(peer, Ballot(peer.0), 0, peer.0, vec![], vec![key.clone()]),
+            Err(Refusal::Late)
+        );
+        let own = txn(23);
+        replica
+            .accept_from(
+                own,
+                Ballot(own.0),
+                0,
+                own.0,
+                vec![],
+                vec![key.clone()],
+                Sender::OwnCoordinator,
+            )
+            .expect("its own vote");
+        assert_eq!(replica.status(own), Some(Status::Accepted));
+
+        // Promised to a recovery first: refused, own or not.
+        let own = txn(24);
+        let b = ballot(50, 1);
+        replica
+            .recover_round(own, b, 0, vec![], vec![], RecoveryRound::Ask, false)
+            .expect("promised");
+        assert_eq!(replica.unknown_promise(own), Some(b));
+        assert_eq!(
+            replica.preaccept_from(
+                own,
+                0,
+                vec![key.clone()],
+                vec![event("k", 1)],
+                Sender::OwnCoordinator
+            ),
+            Err(Refusal::Promised(b))
+        );
     }
 
     /// A dependency only a lost journal held is learned with keyless rounds

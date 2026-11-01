@@ -43,8 +43,8 @@ use crate::api::{
 use crate::clock::{Timestamp, TxnId};
 use crate::message::Key;
 use crate::node::{
-    BacklogAtCap, Joining, JournalRolledBack, Node, NodeClosed, OpenUnconfirmed, RejoinRequired,
-    TopologyChanging,
+    BacklogAtCap, Invalidated, Joining, JournalRolledBack, Node, NodeClosed, OpenUnconfirmed,
+    RejoinRequired, TopologyChanging,
 };
 
 /// Most events one backend read returns for the scans behind
@@ -508,7 +508,15 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
                 WriteError::Unknown(err)
             }
         })?;
-        if outcome.conflict {
+        // A write a recovery invalidated never committed: nothing was
+        // written and no version was judged, so it is no conflict the
+        // caller could resolve by reloading — a transient refusal, with
+        // the typed cause, like the ones above (#466).
+        if outcome.invalidated {
+            Err(WriteError::Unavailable(
+                Invalidated { txn: outcome.txn }.into(),
+            ))
+        } else if outcome.conflict {
             Err(WriteError::InvalidOriginalVersion)
         } else {
             Ok(())

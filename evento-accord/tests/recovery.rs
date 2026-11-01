@@ -1661,10 +1661,11 @@ async fn a_replica_vouches_no_coverage_past_a_write_a_slow_quorum_holds() {
 
 /// T's coordinator, slower than the compaction margin, gets no vote from
 /// node 0, which never saw T: no coordinator's message outlives the margin.
-/// A recovery's first round gets no vote either — node 0 says it is late,
-/// and neither votes nor refuses — but nodes 1 and 2 hold T unapplied, so
-/// node 0 never vouched past it, and a recovery that asks it to vote gets
-/// that vote (#337).
+/// It is told so (`Late` at T's own ballot), so it settles T at once rather
+/// than after `collect_timeout` (#466). A recovery's first round gets no
+/// vote either — node 0 says it is late, and neither votes nor refuses — but
+/// nodes 1 and 2 hold T unapplied, so node 0 never vouched past it, and a
+/// recovery that asks it to vote gets that vote (#337).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_late_coordinator_gets_no_vote_where_a_recovery_does() {
     let mut f = Vouching::start(
@@ -1685,11 +1686,18 @@ async fn a_late_coordinator_gets_no_vote_where_a_recovery_does() {
         },
     )
     .await;
-    let answer = tokio::time::timeout(Duration::from_millis(300), f.coordinator.recv()).await;
-    assert!(
-        answer.is_err(),
-        "a PreAccept older than the margin got an answer: {answer:?}"
-    );
+    loop {
+        match next(&mut f.coordinator).await {
+            Message::Late { txn: t, ballot } if t == txn => {
+                assert_eq!(ballot, Ballot(txn.0), "late at T's own ballot");
+                break;
+            }
+            Message::PreAcceptOk { txn: t, .. } if t == txn => {
+                panic!("a PreAccept older than the margin got a vote")
+            }
+            _ => {}
+        }
+    }
     assert_eq!(f.node.metrics().votes_late, 1);
 
     let ballot = recovery_ballot(txn);

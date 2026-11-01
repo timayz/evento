@@ -14,9 +14,22 @@ use evento_core::{cursor::Args, Event, EventFilter, Executor, WriteError};
 use evento_fjall::Fjall;
 use ulid::Ulid;
 
+/// A tracing subscriber over `RUST_LOG`, to debug a test; nothing without it.
+fn init_tracing() {
+    if std::env::var_os("RUST_LOG").is_none() {
+        return;
+    }
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
 /// A single-shard cluster of fjall-backed `AccordExecutor`s.
 struct ExecCluster {
     execs: Vec<AccordExecutor<Fjall>>,
+    /// The network between the nodes, for faults.
+    net: Arc<InMemoryNetwork>,
     _loops: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -41,6 +54,7 @@ impl ExecCluster {
     }
 
     fn start_configured(n: u64, config: NodeConfig) -> Self {
+        init_tracing();
         let ids: Vec<NodeId> = (0..n).map(NodeId).collect();
         let net = InMemoryNetwork::new();
 
@@ -64,6 +78,7 @@ impl ExecCluster {
 
         ExecCluster {
             execs,
+            net,
             _loops: loops,
         }
     }
@@ -324,6 +339,60 @@ async fn a_backlog_at_its_cap_is_a_transient_refusal() {
         other => panic!("expected Unavailable, got {other:?}"),
     }
     assert!(err.to_string().contains("not taking writes right now"));
+}
+
+/// A write a recovery invalidated — its PreAccept reached the other
+/// replicas past the compaction margin, so too few held it for it ever to
+/// commit — never committed: nothing was written, and no version condition
+/// was judged. It is a transient refusal, `WriteError::Unavailable` with the
+/// typed `Invalidated` cause, never a version conflict the caller would
+/// reload the aggregate over (#466). The next write commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_invalidated_write_is_a_transient_refusal_not_a_conflict() {
+    use evento_accord::Invalidated;
+
+    // A short margin under a fast-path timeout the delayed messages still
+    // fit: the recovery that settles the write collects its late replicas'
+    // refusals for `fast_timeout`, as any recovery round does.
+    let margin = Duration::from_millis(50);
+    let cluster = ExecCluster::start_configured(
+        3,
+        NodeConfig {
+            compaction_margin: margin,
+            fast_timeout: Duration::from_millis(300),
+            ..Default::default()
+        },
+    );
+    // Node 0's messages reach its peers past the margin; theirs are prompt.
+    cluster.net.set_latency(NodeId(0), NodeId(1), margin * 3);
+    cluster.net.set_latency(NodeId(0), NodeId(2), margin * 3);
+
+    let err = cluster.execs[0]
+        .write(vec![event("acc", 1, "Opened")])
+        .await
+        .expect_err("a write too few replicas held in time is refused");
+    match &err {
+        WriteError::Unavailable(cause) => {
+            cause
+                .downcast_ref::<Invalidated>()
+                .expect("the cause is the typed invalidation");
+        }
+        other => panic!("expected Unavailable, got {other:?}"),
+    }
+    assert!(err.to_string().contains("invalidated"));
+    assert!(
+        cluster.read_all(0, "acc").await.is_empty(),
+        "an invalidated write left events behind"
+    );
+
+    cluster.net.clear_latency();
+    cluster.execs[0]
+        .write(vec![event("acc", 1, "Opened")])
+        .await
+        .expect("the write at a fresh id commits");
+    for node in 0..3 {
+        assert_eq!(cluster.await_read(node, "acc", 1).await.len(), 1);
+    }
 }
 
 /// A retired node mints nothing more, so the executor over it refuses writes
