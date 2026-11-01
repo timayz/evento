@@ -542,6 +542,20 @@ control plane, everything else is Accord.
   repeated — drops what it brought in for the slots the node does not own
   (`void_copy`, `accord_copies_voided_total`); the record stays at "dropped".
 
+  A node gaining slots in a transition in progress declines a pre-seed
+  (#471, `accord_preseeds_declined_total`). A pre-seed judges "gained" against
+  the live layout, which under a transition is the old one: a node the
+  transition gives slots, which a change proposed meanwhile would also give
+  it, counted them gained again, and the pre-seed's drop took what its fenced
+  copy had brought in — reported `Copied` or not — and refilled them from
+  passes that do not wait for the shard's drain point, then journaled its own
+  record over the one that keeps a restart from dropping a reported copy
+  again. If the transition then activated (the usual outcome, #469), the node
+  owned the slots over a store an event applied late at a source may be
+  missing from, with `copied` standing. Now it answers at once, copying
+  nothing: a pre-seed is an optimisation, and the change, if it wins the
+  epoch, drops and copies its slots under its own fence.
+
   **Backfilling subscriptions after a copy (#374; open).** A copy keeps the
   events' original stamps — they must: the stamp is the subscription cursor,
   the same on every replica, and the stability watermark is computed from

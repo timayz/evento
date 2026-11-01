@@ -9940,6 +9940,16 @@ impl Node {
     /// it, a change that won the epoch — and what landed goes, as the slot
     /// drop at the new epoch, run already or not, would have it
     /// ([`void_copy`](Self::void_copy)).
+    ///
+    /// A node gaining slots in the transition in progress pre-seeds nothing
+    /// (#471): "gained" is judged against the live layout, under which it
+    /// does not own the slots that transition gives it yet, so the drop
+    /// would take them — copied under the fence and reported, or being
+    /// copied — and the record journaled for the pre-seed would replace the
+    /// one that keeps a restart from dropping a reported copy again. The
+    /// change, if it wins the epoch, drops and copies its slots under its
+    /// own fence ([`copy_gained_slots`](Self::copy_gained_slots)): a
+    /// pre-seed is an optimisation, a reported copy is never dropped.
     async fn preseed(&self, map: ShardMap) {
         let _copying = self.copying.lock().await;
         let live = self.topology.layout();
@@ -9962,6 +9972,18 @@ impl Node {
                 node = self.id.0,
                 since,
                 "a replica still joining pre-seeds nothing: its join first"
+            );
+            return;
+        }
+        // Not while gaining slots in the transition in progress (#471): the
+        // drop would take what its fenced copy brought in. Answered as done;
+        // the change's fenced copy brings every slot it gives this node.
+        if self.gaining_in_transition(&live) {
+            self.metrics.record_preseed_declined();
+            tracing::info!(
+                node = self.id.0,
+                since,
+                "a pre-seed is declined while this node gains slots in a transition in progress"
             );
             return;
         }
@@ -10077,6 +10099,21 @@ impl Node {
     /// transition reaches this node within a round or two of that.
     fn preseed_grace(&self) -> Duration {
         self.settings.preseed_timeout + 2 * self.settings.collect_timeout
+    }
+
+    /// Whether this node gains slots in the transition in progress under
+    /// `live`: the entry decided for `live`'s epoch is a transition that
+    /// gives it some. Read from the metadata log, which holds the entry
+    /// before it installs (`apply_log` has the layout up before the
+    /// transition is), rather than from `reconfig.transition`.
+    fn gaining_in_transition(&self, live: &Layout) -> bool {
+        match self.committed_entry(live.epoch()) {
+            Some(ConfigEntry::Transition { pending, since, .. }) => {
+                let pending = Layout::from_map(since, pending);
+                !reconfig::gained_slots(live, &pending, self.id).is_empty()
+            }
+            _ => false,
+        }
     }
 
     /// Whether the entry decided for `epoch` is the transition to `map`: a
