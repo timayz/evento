@@ -182,7 +182,7 @@ impl TursoJournal {
     /// [`Turso`](crate::Turso) store (`TursoJournal::new(store.database().clone())`)
     /// or one of its own.
     pub async fn new(db: turso::Database) -> anyhow::Result<Self> {
-        let mut write = db.connect()?;
+        let mut write = crate::executor::connect(&db)?;
         crate::ACCORD_MIGRATIONS
             .to_latest(&mut write)
             .await
@@ -220,7 +220,7 @@ impl TursoJournal {
 
     /// [`in_memory`](Self::in_memory) in [`WriteMode::Concurrent`].
     pub async fn in_memory_concurrent() -> anyhow::Result<Self> {
-        let db = crate::Turso::concurrent_builder(":memory:").build().await?;
+        let db = crate::Turso::builder(":memory:").build().await?;
         write::enable_concurrent_writes(&db).await?;
         Self::new(db).await
     }
@@ -264,7 +264,7 @@ impl TursoJournal {
     }
 
     fn reader(&self) -> anyhow::Result<turso::Connection> {
-        Ok(self.db.connect()?)
+        crate::executor::connect(&self.db)
     }
 
     /// Stages `value` as the `accord_meta` row `key`, one `truncate` keeps,

@@ -193,13 +193,40 @@ pub(crate) async fn execute_prepared(conn: &Connection, query: &Prepared) -> tur
     .await
 }
 
-/// Every row a rendered statement returns, with the column names.
+/// How many times a read finding the database locked is run again.
+const READ_ATTEMPTS: u32 = 200;
+
+/// Every row a rendered statement returns, with the column names. A read
+/// that finds the database locked — an MVCC checkpoint stopping the world
+/// for a moment — is run again after a short pause, up to [`READ_ATTEMPTS`].
 pub(crate) async fn fetch_rows(
     conn: &Connection,
     query: Prepared,
 ) -> turso::Result<(Vec<String>, Vec<turso::Row>)> {
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match fetch_rows_once(conn, &query).await {
+            Err(turso::Error::Busy(_)) if attempt < READ_ATTEMPTS => {
+                tokio::time::sleep(std::time::Duration::from_millis(u64::from(Ord::min(
+                    attempt, 20,
+                ))))
+                .await;
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
+async fn fetch_rows_once(
+    conn: &Connection,
+    query: &Prepared,
+) -> turso::Result<(Vec<String>, Vec<turso::Row>)> {
     let mut rows = conn
-        .query(query.sql, turso::params_from_iter(query.params))
+        .query(
+            &query.sql,
+            turso::params_from_iter(query.params.iter().cloned()),
+        )
         .await?;
     let columns = rows.column_names();
     let mut out = Vec::new();

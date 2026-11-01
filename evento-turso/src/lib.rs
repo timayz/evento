@@ -57,7 +57,7 @@ mod accord_journal;
 
 #[cfg(feature = "accord")]
 pub use accord_journal::TursoJournal;
-pub use executor::{Clock, Turso};
+pub use executor::{Clock, Turso, BUSY_TIMEOUT};
 pub use query::{
     execute, fetch_all, fetch_one, fetch_optional, EventTable, MetaTable, SnapshotTable, Statement,
     SubscriberTable,
