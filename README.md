@@ -628,7 +628,12 @@ let executor = evento::Turso::open("./events.db").await?;
 
 // Tests and simulations: an in-memory database, gone with its last clone.
 let ephemeral = evento::Turso::in_memory().await?;
-# let _ = (executor, ephemeral);
+
+// Several writers in one database (your read models, the accord journal next to
+// the events): Turso's MVCC mode, every write a `BEGIN CONCURRENT` transaction
+// retried on conflict; your own writes go through `store.transaction(..)`.
+let shared = evento::Turso::open_concurrent("./app.db").await?;
+# let _ = (executor, ephemeral, shared);
 # Ok(())
 # }
 ```

@@ -65,6 +65,27 @@ pub trait FromRow: Sized {
     fn from_row(row: &Row<'_>) -> anyhow::Result<Self>;
 }
 
+/// Tuples read their columns by position: `(String, i64)` is the first two
+/// columns of the select, whatever their names — a query without a struct of
+/// its own, as `sqlx::query_as::<_, (String, i64)>` reads.
+macro_rules! tuple_from_row {
+    ($($idx:tt: $ty:ident),+) => {
+        impl<$($ty: FromValue),+> FromRow for ($($ty,)+) {
+            fn from_row(row: &Row<'_>) -> anyhow::Result<Self> {
+                Ok(($(row.get_index::<$ty>($idx)?,)+))
+            }
+        }
+    };
+}
+tuple_from_row!(0: A);
+tuple_from_row!(0: A, 1: B);
+tuple_from_row!(0: A, 1: B, 2: C);
+tuple_from_row!(0: A, 1: B, 2: C, 3: D);
+tuple_from_row!(0: A, 1: B, 2: C, 3: D, 4: E);
+tuple_from_row!(0: A, 1: B, 2: C, 3: D, 4: E, 5: F);
+tuple_from_row!(0: A, 1: B, 2: C, 3: D, 4: E, 5: F, 6: G);
+tuple_from_row!(0: A, 1: B, 2: C, 3: D, 4: E, 5: F, 6: G, 7: H);
+
 /// A column value converted to a Rust type.
 pub trait FromValue: Sized {
     /// Converts `value`.

@@ -647,6 +647,69 @@ async fn shares_a_database_with_the_store() {
     );
 }
 
+/// The journal in MVCC mode: every scenario holds with `BEGIN CONCURRENT`
+/// transactions.
+#[tokio::test]
+async fn concurrent_journal_round_trips_and_truncates() {
+    let journal = TursoJournal::in_memory_concurrent().await.unwrap();
+    assert_eq!(journal.write_mode(), evento_turso::WriteMode::Concurrent);
+    round_trip(&journal).await;
+    group_commit(&TursoJournal::in_memory_concurrent().await.unwrap()).await;
+    truncate(&TursoJournal::in_memory_concurrent().await.unwrap()).await;
+    flush_dedupes_restaged_txn(&TursoJournal::in_memory_concurrent().await.unwrap()).await;
+    routes_and_promises(&TursoJournal::in_memory_concurrent().await.unwrap()).await;
+    truncate_races_flush(&TursoJournal::in_memory_concurrent().await.unwrap()).await;
+}
+
+/// A journal in the same MVCC database as a concurrent store, both writing
+/// at once from separate tasks: the journal takes the store's mode, and
+/// neither writer gets `Busy`.
+#[tokio::test]
+async fn shares_a_concurrent_database_with_the_store() {
+    let store = Turso::in_memory_concurrent().await.unwrap();
+    let journal = std::sync::Arc::new(TursoJournal::new(store.database().clone()).await.unwrap());
+    assert_eq!(journal.write_mode(), evento_turso::WriteMode::Concurrent);
+
+    let writing = {
+        let store = store.clone();
+        tokio::spawn(async move {
+            use evento_core::Executor;
+            for version in 1..=100u16 {
+                store
+                    .write(vec![command(u64::from(version), version).events.remove(0)])
+                    .await
+                    .unwrap();
+            }
+        })
+    };
+    let journaling = {
+        let journal = std::sync::Arc::clone(&journal);
+        tokio::spawn(async move {
+            for i in 1..=100u64 {
+                journal.stage(&command(i * 10, 1)).await.unwrap();
+                if i % 4 == 0 {
+                    journal.flush().await.unwrap();
+                }
+                journal.save_clock_bound(i).await.unwrap();
+            }
+            journal.flush().await.unwrap();
+        })
+    };
+    writing.await.unwrap();
+    journaling.await.unwrap();
+
+    use evento_core::Executor;
+    assert_eq!(
+        store
+            .latest_version(String::new(), "test/Account".into(), "acc".into())
+            .await
+            .unwrap(),
+        100
+    );
+    assert_eq!(journal.load_all().await.unwrap().len(), 100);
+    assert_eq!(journal.load_clock_bound().await.unwrap(), Some(100));
+}
+
 /// Genuine durability: a file-backed journal survives a full close/reopen.
 #[tokio::test]
 async fn journal_survives_close_and_reopen() {

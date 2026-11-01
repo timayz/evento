@@ -718,7 +718,8 @@ pub fn derive_cursor(input: TokenStream) -> TokenStream {
 ///
 /// Re-exported as `evento::turso::FromRow`, next to the trait of that name.
 /// A field marked `#[turso(default)]` takes its `Default` when the select
-/// does not include its column (a flag set by handlers, not stored).
+/// does not include its column (a flag set by handlers, not stored);
+/// `#[turso(rename = "column")]` reads another column than the field's name.
 ///
 /// ```rust,ignore
 /// #[evento::projection(backend = turso, evento::turso::FromRow, Cursor, Debug)]
@@ -728,6 +729,8 @@ pub fn derive_cursor(input: TokenStream) -> TokenStream {
 ///     #[cursor(by_name, UserAdmin::Email, 2)]
 ///     pub email: String,
 ///     pub role: evento::turso::Text<Role>,
+///     #[turso(rename = "total_recipes_count")]
+///     pub recipes: i64,
 ///     #[turso(default)]
 ///     pub deleted: bool,
 /// }

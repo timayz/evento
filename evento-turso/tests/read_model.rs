@@ -253,6 +253,46 @@ async fn a_row_decodes_through_the_derive() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A row read by position into a tuple, and a struct whose field names
+/// differ from the columns.
+#[tokio::test]
+async fn tuples_and_renamed_fields_decode() -> anyhow::Result<()> {
+    let (_store, conn) = seeded().await?;
+
+    let statement = Query::select()
+        .columns([UserAdmin::Email, UserAdmin::TotalRecipesCount])
+        .from(UserAdmin::Table)
+        .and_where(Expr::col(UserAdmin::Id).eq("u3"))
+        .to_owned();
+    let (email, recipes): (String, i64) = turso::fetch_one(&conn, &statement).await?;
+    assert_eq!(email, "mia@example.com");
+    assert_eq!(recipes, 40);
+    let count: (i64,) = turso::fetch_one(
+        &conn,
+        &Query::select()
+            .expr(sea_query::Func::count(Expr::col(UserAdmin::Id)))
+            .from(UserAdmin::Table)
+            .to_owned(),
+    )
+    .await?;
+    assert_eq!(count.0, 6);
+
+    #[derive(turso::FromRow, Debug)]
+    struct Renamed {
+        #[turso(rename = "email")]
+        address: String,
+        #[turso(rename = "total_recipes_count")]
+        recipes: i64,
+        #[turso(default)]
+        seen: bool,
+    }
+    let renamed: Renamed = turso::fetch_one(&conn, &statement).await?;
+    assert_eq!(renamed.address, "mia@example.com");
+    assert_eq!(renamed.recipes, 40);
+    assert!(!renamed.seen);
+    Ok(())
+}
+
 #[tokio::test]
 async fn pages_by_name_forward_and_backward() -> anyhow::Result<()> {
     let (_store, conn) = seeded().await?;
