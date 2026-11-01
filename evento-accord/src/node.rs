@@ -512,6 +512,31 @@ impl std::fmt::Display for PartialSnapshot {
 
 impl std::error::Error for PartialSnapshot {}
 
+/// A copy's page would land under another epoch than the copy began under
+/// (#469): the layout moved on, and the copy ends. A pre-seed stalled on a
+/// source it could not reach outlived the activation of the transition
+/// before it, and the page it then installed stayed — the slot drop at that
+/// epoch had run already.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LayoutMovedOn {
+    /// The installed epoch the copy began under.
+    began: u64,
+    /// The installed epoch now.
+    now: u64,
+}
+
+impl std::fmt::Display for LayoutMovedOn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the layout moved on under a copy: begun at epoch {}, now at {}",
+            self.began, self.now
+        )
+    }
+}
+
+impl std::error::Error for LayoutMovedOn {}
+
 /// [`Node::recover_state`] refused to open the node: its journal holds
 /// nothing, yet it cannot be a fresh replica. Either its data store holds
 /// events (`join_pending: false`) — the journal that went with them was lost
@@ -9643,6 +9668,7 @@ impl Node {
         // Not while a pre-seed is still copying: it ends, and the copy below
         // resumes where it did.
         let _copying = self.copying.lock().await;
+        let under = self.topology.layout().epoch();
         let resume = {
             let reconfig = self.reconfig.lock().expect("reconfig poisoned");
             match reconfig.copy_state.as_ref().map(|state| &state.phase) {
@@ -9664,6 +9690,10 @@ impl Node {
             .into_iter()
             .collect();
         gained.sort_unstable();
+        let all_gained: Vec<u16> = gained
+            .iter()
+            .flat_map(|(_, slots)| slots.iter().map(|&slot| slot as u16))
+            .collect();
         for (source, slots) in gained {
             let Some(point) = reconfig::shard_drain_point(&live, source, since, &fences) else {
                 return false;
@@ -9678,8 +9708,17 @@ impl Node {
                 return false;
             };
             let slots: Vec<u16> = slots.into_iter().map(|slot| slot as u16).collect();
-            let copied = match self.copy_slots(contact, &slots, resume, TxnId(point)).await {
+            let copied = match self
+                .copy_slots(contact, &slots, resume, TxnId(point), under)
+                .await
+            {
                 Ok(copied) => copied,
+                Err(err) if err.is::<LayoutMovedOn>() => {
+                    // The transition was replaced, or repeated at a later
+                    // epoch: the next sweep copies for what stands now.
+                    self.void_copy(since, &pending.map(), &all_gained).await;
+                    return false;
+                }
                 Err(err) => {
                     tracing::debug!(node = self.id.0, contact = contact.0, %err, "cannot copy a range yet");
                     return false;
@@ -9782,12 +9821,20 @@ impl Node {
     /// of what it holds ([`not_held`](Self::not_held)), under the synthetic
     /// id `txn`. Returns how many events landed, and the contact's stable
     /// point as it stood before the first page.
+    ///
+    /// A page lands only while the installed epoch is still `under`, the one
+    /// the copy began under: the layout moved on, the copy ends with
+    /// [`LayoutMovedOn`] (#469). What the node holds for a slot is judged
+    /// by the installed layout, and the slots a change took from it are
+    /// dropped once, as the layout installs ([`gc_lost_slots`](Self::gc_lost_slots)):
+    /// a page landing after that would stay.
     async fn copy_slots(
         &self,
         contact: NodeId,
         slots: &[u16],
         since: Option<u64>,
         txn: TxnId,
+        under: u64,
     ) -> anyhow::Result<CopyOutcome> {
         let mut after: Option<Value> = None;
         let mut outcome = CopyOutcome::default();
@@ -9812,6 +9859,10 @@ impl Node {
                 } => (events, next, stable),
                 other => anyhow::bail!("not a range page: {other:?}"),
             };
+            let now = self.topology.layout().epoch();
+            if now != under {
+                return Err(LayoutMovedOn { began: under, now }.into());
+            }
             if first {
                 outcome.stable = stable;
                 first = false;
@@ -9881,9 +9932,18 @@ impl Node {
     /// already. Journaled as [`CopyPhase::Preseeded`] with the point the
     /// fenced copy resumes from. A source that fails is skipped: the fenced
     /// copy brings whatever is left.
+    ///
+    /// A pre-seed runs under the live layout's epoch, and ends when the
+    /// layout moves on (#469): the epoch it pre-seeded for is taken. By the
+    /// transition to this very map, and the fenced copy resumes from what
+    /// landed; by anything else — the activation of the transition before
+    /// it, a change that won the epoch — and what landed goes, as the slot
+    /// drop at the new epoch, run already or not, would have it
+    /// ([`void_copy`](Self::void_copy)).
     async fn preseed(&self, map: ShardMap) {
         let _copying = self.copying.lock().await;
         let live = self.topology.layout();
+        let under = live.epoch();
         let since = live.epoch() + 1;
         let pending = Layout::from_map(since, map.clone());
         let mut gained: Vec<(usize, Vec<u16>)> = reconfig::gained_slots(&live, &pending, self.id)
@@ -9924,7 +9984,10 @@ impl Node {
         }
         let txn = TxnId(Timestamp::MIN);
         let mut resume: Option<u64> = None;
-        for pass in 1..=PRESEED_PASSES {
+        // Whether every source answered every pass; a pre-seed left short
+        // is not journaled, and the fenced copy starts over.
+        let mut answered = true;
+        'passes: for pass in 1..=PRESEED_PASSES {
             let mut pass_outcome = CopyOutcome::default();
             for (source, slots) in &gained {
                 let contacts: Vec<NodeId> = live
@@ -9935,12 +9998,13 @@ impl Node {
                     .collect();
                 let mut done = false;
                 for contact in contacts {
-                    match self.copy_slots(contact, slots, resume, txn).await {
+                    match self.copy_slots(contact, slots, resume, txn, under).await {
                         Ok(outcome) => {
                             pass_outcome.add(outcome);
                             done = true;
                             break;
                         }
+                        Err(err) if err.is::<LayoutMovedOn>() => break 'passes,
                         Err(err) => {
                             tracing::debug!(node = self.id.0, contact = contact.0, %err, "a pre-seed source failed");
                         }
@@ -9952,7 +10016,8 @@ impl Node {
                         source,
                         "no source answered a pre-seed; the fenced copy brings the rest"
                     );
-                    return;
+                    answered = false;
+                    break 'passes;
                 }
             }
             let copied = pass_outcome.events;
@@ -9978,6 +10043,20 @@ impl Node {
                 break;
             }
         }
+        // The layout moved on meanwhile (#469): the pre-seed stands only
+        // for the transition to this very map, which resumes from it.
+        let now = self.topology.layout().epoch();
+        if now != under && !self.change_stands(now, &map) {
+            let slots: Vec<u16> = gained
+                .iter()
+                .flat_map(|(_, slots)| slots.iter().copied())
+                .collect();
+            self.void_copy(since, &map, &slots).await;
+            return;
+        }
+        if !answered {
+            return;
+        }
         let state = CopyState {
             since,
             map,
@@ -9998,6 +10077,61 @@ impl Node {
     /// transition reaches this node within a round or two of that.
     fn preseed_grace(&self) -> Duration {
         self.settings.preseed_timeout + 2 * self.settings.collect_timeout
+    }
+
+    /// Whether the entry decided for `epoch` is the transition to `map`: a
+    /// copy for that change — a pre-seed, or one under the fence that the
+    /// change repeated at `epoch` — still stands once `epoch` installs. Read
+    /// from the metadata log, which holds the entry before it installs:
+    /// the layout is up before the transition is (`apply_log`).
+    fn change_stands(&self, epoch: u64, map: &ShardMap) -> bool {
+        matches!(
+            self.committed_entry(epoch),
+            Some(ConfigEntry::Transition { pending, .. }) if pending == *map
+        )
+    }
+
+    /// Drops what a copy for the change to `map`, first decided at `since`,
+    /// brought in for `slots` once the layout moved on past it (#469): the
+    /// slots this node does not own under the installed layout. The copy's
+    /// record stays at "dropped" (what it is); a change that gives this node
+    /// those slots copies them under its own fence.
+    async fn void_copy(&self, since: u64, map: &ShardMap, slots: &[u16]) {
+        let layout = self.topology.layout();
+        let stale: Vec<u16> = slots
+            .iter()
+            .copied()
+            .filter(|&slot| {
+                !layout
+                    .replicas_of(layout.slots()[slot as usize] as usize)
+                    .contains(&self.id)
+            })
+            .collect();
+        self.metrics.record_copy_voided();
+        let dropped = match self.datastore.drop_slots(&stale).await {
+            Ok(dropped) => dropped,
+            Err(err) => {
+                tracing::warn!(
+                    node = self.id.0,
+                    since,
+                    %err,
+                    "cannot drop what a copy brought in before the layout moved on"
+                );
+                return;
+            }
+        };
+        if dropped > 0 {
+            self.metrics.record_streams_dropped(dropped);
+        }
+        tracing::info!(
+            node = self.id.0,
+            since,
+            epoch = layout.epoch(),
+            shards = map.shards.len(),
+            slots = stale.len(),
+            streams = dropped,
+            "the layout moved on under a copy; dropped what it brought in"
+        );
     }
 
     /// Asks every node the change from `live` to `next` gives slots to copy

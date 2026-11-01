@@ -57,7 +57,9 @@
 //! environment overrides it ([`sim_seeds`], #319):
 //! - `SIM_SEED=<n>` replays seed `n`;
 //! - `SIM_SEEDS=<count>` runs that many fresh seeds, and
-//!   `SIM_DURATION=<secs>` fresh seeds for that long.
+//!   `SIM_DURATION=<secs>` fresh seeds for that long, from a base drawn from
+//!   OS entropy — or from `SIM_SEED_BASE=<n>`, for the same fresh seeds on
+//!   two builds.
 //!
 //! A failing seed prints the one line that replays it; with `RUST_LOG` set
 //! (`RUST_LOG=evento_accord=debug`), the replay traces the nodes
@@ -3925,7 +3927,8 @@ async fn membership_churn_is_bit_reproducible() {
 /// - `SIM_SEED=<n>` replays seed `n` alone;
 /// - `SIM_SEEDS=<count>` runs that many fresh seeds, and `SIM_DURATION=<secs>`
 ///   fresh seeds for that long (wall-clock), from a base drawn from OS entropy
-///   and printed;
+///   and printed — or from `SIM_SEED_BASE=<n>`, so two builds run the same
+///   fresh seeds (a census comparing a change against its base);
 /// - otherwise `default`, the fixed range CI runs.
 ///
 /// Each seed comes with a [`Replay`] guard: should the test fail while the
@@ -3934,7 +3937,7 @@ fn sim_seeds(test: &'static str, default: Range<u64>) -> impl Iterator<Item = (u
     let seeds: Box<dyn Iterator<Item = u64>> = match env_u64("SIM_SEED") {
         Some(seed) => Box::new(std::iter::once(seed)),
         None if env_u64("SIM_SEEDS").is_some() || env_u64("SIM_DURATION").is_some() => {
-            let base: u64 = rand::random();
+            let base: u64 = env_u64("SIM_SEED_BASE").unwrap_or_else(rand::random);
             eprintln!("{test}: fresh seeds from {base}");
             let count = env_u64("SIM_SEEDS").unwrap_or(u64::MAX);
             let deadline = env_u64("SIM_DURATION")
