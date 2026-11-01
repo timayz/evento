@@ -1030,13 +1030,16 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                     return Ok(ProcessOutcome::ShutdownRequested);
                 }
 
-                // One span per event, entered for the handler call and the
+                // One DEBUG span per event, entered for the handler call and the
                 // lines about it, rather than `record`ing the event onto the
                 // pass-long `process` span: `tracing_subscriber::fmt` appends
                 // every `record` to a span's formatted fields, so recording
                 // there made each log line carry every event the pass (or a
-                // `start` worker, for its whole life) had handled so far.
-                let span = tracing::info_span!(
+                // `start` worker, for its whole life) had handled so far. The
+                // lines are emitted in its scope, not with it as `parent:`, so
+                // that under an `info` filter, where this span is disabled,
+                // they still nest under `process` and keep `subscription`.
+                let span = tracing::debug_span!(
                     "event",
                     aggregate_type = event.node.aggregate_type.as_str(),
                     aggregate_id = event.node.aggregate_id.as_str(),
@@ -1069,7 +1072,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                         // Strict mode with continue_on_error: skip the poison
                         // event (acknowledged below) instead of re-reading and
                         // re-failing the same batch forever.
-                        tracing::error!(parent: &span, key = key, "no handler, skipping event");
+                        span.in_scope(|| tracing::error!(key = key, "no handler, skipping event"));
                         None
                     }
                     None => None,
@@ -1088,12 +1091,9 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                     .await;
                     if let Err(err) = result {
                         if !self.continue_on_error {
-                            tracing::error!(
-                                parent: &span,
-                                error = %err,
-                                key = self.resolved_key(),
-                                "failed"
-                            );
+                            span.in_scope(|| {
+                                tracing::error!(error = %err, key = self.resolved_key(), "failed")
+                            });
                             // Persist the successfully processed prefix before
                             // surfacing the error, so a retry resumes at the
                             // failing event instead of re-running the chunk.
@@ -1110,9 +1110,9 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                         // continue_on_error: log and acknowledge so the
                         // subscription makes progress past the failing event
                         // rather than retrying it forever.
-                        tracing::error!(parent: &span, error = %err, "failed, skipping event");
+                        span.in_scope(|| tracing::error!(error = %err, "failed, skipping event"));
                     } else {
-                        tracing::debug!(parent: &span, "completed");
+                        span.in_scope(|| tracing::debug!("completed"));
                     }
                 }
 
@@ -2550,6 +2550,42 @@ mod tests {
         }
     }
 
+    /// Runs one ephemeral pass over `count` events with [`LogsALine`] under a
+    /// `fmt` subscriber filtering at `level`, and returns everything it wrote.
+    async fn logged_pass_over(count: usize, level: tracing::Level) -> String {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(level)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        SubscriptionBuilder::<History>::new("logs")
+            .ephemeral()
+            .no_retry()
+            .handler(LogsALine)
+            .run_once(&History::of(count))
+            .await
+            .unwrap();
+        captured.text()
+    }
+
+    /// The event span is DEBUG, so an `info` filter drops it: a line emitted
+    /// inside the handler names no event, but still nests under the pass and
+    /// carries the subscription, rather than becoming a root event.
+    #[tokio::test]
+    async fn under_an_info_filter_a_line_keeps_the_subscription_and_names_no_event() {
+        let text = logged_pass_over(3, tracing::Level::INFO).await;
+        let handled: Vec<&str> = text.lines().filter(|l| l.contains("handled")).collect();
+        assert_eq!(handled.len(), 3, "{text}");
+        for line in handled {
+            assert!(line.contains("process{subscription=\"logs\"}"), "{line}");
+            assert!(!line.contains("aggregate_id="), "{line}");
+        }
+    }
+
     /// The event being handled is a span of its own, not fields `record`ed
     /// onto the pass-long `process` span: `fmt` appends every `record` to a
     /// span's rendered fields, so the old shape made each line emitted inside
@@ -2558,25 +2594,7 @@ mod tests {
     /// event it names is the one being handled.
     #[tokio::test]
     async fn a_log_line_inside_the_pass_names_only_its_own_event() {
-        let captured = Captured::default();
-        let writer = captured.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::DEBUG)
-            .with_ansi(false)
-            .with_writer(move || writer.clone())
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-
-        let history = History::of(40);
-        SubscriptionBuilder::<History>::new("logs")
-            .ephemeral()
-            .no_retry()
-            .handler(LogsALine)
-            .run_once(&history)
-            .await
-            .unwrap();
-
-        let text = captured.text();
+        let text = logged_pass_over(40, tracing::Level::DEBUG).await;
         let handled: Vec<&str> = text.lines().filter(|l| l.contains("handled")).collect();
         assert_eq!(handled.len(), 40, "one line per handled event:\n{text}");
         let mut named = std::collections::BTreeSet::new();
