@@ -1,6 +1,6 @@
 [package]
 name = "evento-turso"
-version = "2.0.0-alpha.37"
+version = "2.0.0-alpha.38"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -19,8 +19,8 @@ rustdoc-args = ["--cfg", "docsrs"]
 ignored = ["evento"]
 
 [dependencies]
-evento-core = { path = "../evento-core", version = "2.0.0-alpha.37" }
-evento-macro = { path = "../evento-macro", version = "2.0.0-alpha.37", optional = true }
+evento-core = { path = "../evento-core", version = "2.0.0-alpha.38" }
+evento-macro = { path = "../evento-macro", version = "2.0.0-alpha.38", optional = true }
 anyhow.workspace = true
 async-trait.workspace = true
 bitcode.workspace = true
@@ -31,7 +31,7 @@ sea-query = { workspace = true, features = ["backend-sqlite", "thread-safe"] }
 turso.workspace = true
 tempfile = "3.27"
 tracing = { workspace = true, optional = true }
-evento-accord = { path = "../evento-accord", version = "2.0.0-alpha.37", optional = true }
+evento-accord = { path = "../evento-accord", version = "2.0.0-alpha.38", optional = true }
 
 [dev-dependencies]
 evento-test = { path = "../evento-test" }

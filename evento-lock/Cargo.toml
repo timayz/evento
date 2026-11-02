@@ -1,6 +1,6 @@
 [package]
 name = "evento-lock"
-version = "2.0.0-alpha.37"
+version = "2.0.0-alpha.38"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
