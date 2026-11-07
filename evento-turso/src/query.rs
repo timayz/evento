@@ -2,14 +2,12 @@
 //! sea-query's SQLite dialect, their bound values converted to
 //! [`turso::Value`]s, and rows read back through [`FromRow`].
 
-use std::collections::{BTreeMap, BTreeSet};
-
 use sea_query::{Cond, Expr, ExprTrait, Iden, SqliteQueryBuilder, Values};
 use turso::Connection;
 
 use evento_core::{
     cursor::{Cursor, Value},
-    Event, EventCursor, EventFilter, RoutingKey, TenantFilter,
+    Event, EventCursor, EventFilter, FilterArm, RoutingKey, TenantFilter,
 };
 
 use crate::{Bind, FromRow, Row};
@@ -462,15 +460,13 @@ impl Bind for EventRow {
 /// AND name = ?) OR (…)` only seeks on what every arm shares (the type, at
 /// best), then reads every row of it — a subscription's pass costs time
 /// proportional to the store, whatever its cursor (#478). So when the filters
-/// split into pairwise disjoint arms, each gets a condition of its own —
-/// `type = ? [AND id = ?] [AND name = ? | name IN (…)]` — for the caller to
-/// read as a `UNION ALL`, one index seek per arm. The arms: one per `(type,
-/// id)` for the filters naming an aggregate (its stream is short and the
-/// `(type, id, tenant, …)` index serves it whole), one per `(type, name)` or
-/// `(type)` for the others (served by `idx_event_type_name_cursor` and
-/// `idx_event_type_cursor`). Filters that could match the same event — a type
-/// and one of its names, an aggregate and its type — fall back to the single
-/// `OR` condition, so no event is returned twice.
+/// split into pairwise disjoint arms ([`EventFilter::arms`]), each gets a
+/// condition of its own — `type = ? [AND id = ?] [AND name = ? | name IN (…)]`
+/// — for the caller to read as a `UNION ALL`, one index seek per arm: the
+/// `(type, id, tenant, …)` index serves a stream, `idx_event_type_name_cursor`
+/// a `(type, name)` arm and `idx_event_type_cursor` a `(type)` one. Filters
+/// that could match the same event fall back to the single `OR` condition, so
+/// no event is returned twice.
 ///
 /// `aggregators` is `None` for every aggregate; an empty slice matches nothing
 /// (sea-query renders an empty `Cond::any()` as `FALSE`). The routing key and
@@ -500,10 +496,10 @@ pub(crate) fn filter_conditions(
     let Some(aggregators) = aggregators else {
         return vec![scope(Cond::all())];
     };
-    match arms(aggregators) {
+    match EventFilter::arms(aggregators) {
         Some(arms) if !arms.is_empty() => arms
-            .into_iter()
-            .map(|arm| scope(Cond::all().add(arm.condition())))
+            .iter()
+            .map(|arm| scope(Cond::all().add(arm_condition(arm))))
             .collect(),
         _ => {
             let mut any = Cond::any();
@@ -524,85 +520,24 @@ pub(crate) fn filter_conditions(
     }
 }
 
-/// One seek of a filtered read: the events of `aggregate_type`, of the
-/// aggregate `aggregate_id` when set, named one of `names` — or any name when
-/// `None`.
-#[derive(Debug, PartialEq, Eq)]
-struct Arm<'a> {
-    aggregate_type: &'a str,
-    aggregate_id: Option<&'a str>,
-    names: Option<BTreeSet<&'a str>>,
-}
-
-impl Arm<'_> {
-    fn condition(&self) -> Cond {
-        let mut cond =
-            Cond::all().add(Expr::col(EventTable::AggregatorType).eq(self.aggregate_type));
-        if let Some(id) = self.aggregate_id {
-            cond = cond.add(Expr::col(EventTable::AggregatorId).eq(id));
-        }
-        match &self.names {
-            None => {}
-            Some(names) if names.len() == 1 => {
-                let name = *names.iter().next().expect("one name");
-                cond = cond.add(Expr::col(EventTable::Name).eq(name));
-            }
-            Some(names) => {
-                cond = cond.add(Expr::col(EventTable::Name).is_in(names.iter().copied()));
-            }
-        }
-        cond
+/// The condition of one arm: `type = ? [AND id = ?] [AND name = ? | name IN
+/// (…)]`.
+fn arm_condition(arm: &FilterArm<'_>) -> Cond {
+    let mut cond = Cond::all().add(Expr::col(EventTable::AggregatorType).eq(arm.aggregate_type));
+    if let Some(id) = arm.aggregate_id {
+        cond = cond.add(Expr::col(EventTable::AggregatorId).eq(id));
     }
-
-    /// Whether an event could match both arms.
-    fn overlaps(&self, other: &Self) -> bool {
-        let ids = match (self.aggregate_id, other.aggregate_id) {
-            (Some(a), Some(b)) => a == b,
-            _ => true,
-        };
-        let names = match (&self.names, &other.names) {
-            (Some(a), Some(b)) => !a.is_disjoint(b),
-            _ => true,
-        };
-        self.aggregate_type == other.aggregate_type && ids && names
-    }
-}
-
-/// Groups `filters` into the arms of [`filter_conditions`], in a fixed order
-/// so the same filters render the same SQL; `None` when two arms overlap.
-fn arms(filters: &[EventFilter]) -> Option<Vec<Arm<'_>>> {
-    // Keyed by `(type, id, name)`, the name only for the filters without an
-    // aggregate id: the ones naming an aggregate merge into one arm per
-    // stream, with `name IN (…)`.
-    let mut grouped: BTreeMap<(&str, Option<&str>, Option<&str>), Arm<'_>> = BTreeMap::new();
-    for filter in filters {
-        let aggregate_id = filter.aggregate_id.as_deref();
-        let name = filter.name.as_deref();
-        let key = (
-            filter.aggregate_type.as_str(),
-            aggregate_id,
-            aggregate_id.is_none().then_some(name).flatten(),
-        );
-        let arm = grouped.entry(key).or_insert_with(|| Arm {
-            aggregate_type: &filter.aggregate_type,
-            aggregate_id,
-            names: Some(BTreeSet::new()),
-        });
-        match (name, &mut arm.names) {
-            // A filter without a name takes every name of the stream.
-            (None, names) => *names = None,
-            (Some(name), Some(names)) => {
-                names.insert(name);
-            }
-            (Some(_), None) => {}
+    match &arm.names {
+        None => {}
+        Some(names) if names.len() == 1 => {
+            let name = *names.iter().next().expect("one name");
+            cond = cond.add(Expr::col(EventTable::Name).eq(name));
+        }
+        Some(names) => {
+            cond = cond.add(Expr::col(EventTable::Name).is_in(names.iter().copied()));
         }
     }
-    let arms: Vec<Arm<'_>> = grouped.into_values().collect();
-    let disjoint = arms
-        .iter()
-        .enumerate()
-        .all(|(i, arm)| arms[i + 1..].iter().all(|other| !arm.overlaps(other)));
-    disjoint.then_some(arms)
+    cond
 }
 
 /// A cursor's opaque string, as stored in `TEXT` columns.
@@ -618,95 +553,6 @@ pub(crate) fn cursor_value(text: String) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn arm<'a>(
-        aggregate_type: &'a str,
-        aggregate_id: Option<&'a str>,
-        names: Option<&[&'a str]>,
-    ) -> Arm<'a> {
-        Arm {
-            aggregate_type,
-            aggregate_id,
-            names: names.map(|names| names.iter().copied().collect()),
-        }
-    }
-
-    #[test]
-    fn a_subscription_gets_one_arm_per_handled_event() {
-        let filters = [
-            EventFilter::by_event_raw("Page", "Edited"),
-            EventFilter::by_event_raw("Page", "Created"),
-            EventFilter::by_event_raw("Comment", "Posted"),
-            // Handlers often collapse to the same filter.
-            EventFilter::by_event_raw("Page", "Edited"),
-        ];
-        assert_eq!(
-            arms(&filters),
-            Some(vec![
-                arm("Comment", None, Some(&["Posted"])),
-                arm("Page", None, Some(&["Created"])),
-                arm("Page", None, Some(&["Edited"])),
-            ])
-        );
-    }
-
-    #[test]
-    fn a_projection_load_gets_one_arm_per_stream() {
-        let filters = [
-            EventFilter::exact_raw("Page", "p1", "Edited"),
-            EventFilter::exact_raw("Page", "p1", "Created"),
-            EventFilter::exact_raw("Comment", "c1", "Posted"),
-        ];
-        assert_eq!(
-            arms(&filters),
-            Some(vec![
-                arm("Comment", Some("c1"), Some(&["Posted"])),
-                arm("Page", Some("p1"), Some(&["Created", "Edited"])),
-            ])
-        );
-        // A filter without a name takes the whole stream.
-        let filters = [
-            EventFilter::exact_raw("Page", "p1", "Edited"),
-            EventFilter::by_id_raw("Page", "p1"),
-        ];
-        assert_eq!(arms(&filters), Some(vec![arm("Page", Some("p1"), None)]));
-    }
-
-    #[test]
-    fn overlapping_filters_have_no_arms() {
-        // A type and one of its names.
-        assert_eq!(
-            arms(&[
-                EventFilter::by_type_raw("Page"),
-                EventFilter::by_event_raw("Page", "Edited"),
-            ]),
-            None
-        );
-        // An aggregate and its type's name.
-        assert_eq!(
-            arms(&[
-                EventFilter::exact_raw("Page", "p1", "Edited"),
-                EventFilter::by_event_raw("Page", "Edited"),
-            ]),
-            None
-        );
-        // An aggregate and its type.
-        assert_eq!(
-            arms(&[
-                EventFilter::by_id_raw("Page", "p1"),
-                EventFilter::by_type_raw("Page"),
-            ]),
-            None
-        );
-        // Two aggregates of a type, two names of a type: disjoint.
-        assert!(arms(&[
-            EventFilter::by_id_raw("Page", "p1"),
-            EventFilter::by_id_raw("Page", "p2"),
-            EventFilter::by_event_raw("Comment", "Posted"),
-            EventFilter::by_event_raw("Comment", "Deleted"),
-        ])
-        .is_some());
-    }
 
     #[test]
     fn no_filter_is_one_condition_and_no_filters_match_nothing() {

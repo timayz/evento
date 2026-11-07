@@ -575,6 +575,30 @@ async fn sqlite_m0008_round_trip() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn sqlite_m0009_round_trip() -> anyhow::Result<()> {
+    let pool = create_sqlite_pool("m0009_round_trip").await?;
+    pool::m0009_round_trip(pool).await
+}
+
+#[tokio::test]
+async fn sqlite_several_filters_page_like_every_event() -> anyhow::Result<()> {
+    let pool = create_sqlite_pool("several_filters_page_like_every_event").await?;
+    pool::several_filters_page_like_every_event(pool).await
+}
+
+#[tokio::test]
+async fn sqlite_a_subset_of_arms_pages_in_order_without_duplicates() -> anyhow::Result<()> {
+    let pool = create_sqlite_pool("a_subset_of_arms_pages_in_order_without_duplicates").await?;
+    pool::a_subset_of_arms_pages_in_order_without_duplicates(pool).await
+}
+
+#[tokio::test]
+async fn sqlite_latest_timestamp_is_the_greatest_arm() -> anyhow::Result<()> {
+    let pool = create_sqlite_pool("latest_timestamp_is_the_greatest_arm").await?;
+    pool::latest_timestamp_is_the_greatest_arm(pool).await
+}
+
+#[tokio::test]
 async fn sqlite_tenant_streams_are_isolated() -> anyhow::Result<()> {
     let executor = create_sqlite_executor("tenant_streams_are_isolated").await?;
     evento_test::tenant_streams_are_isolated(&executor).await

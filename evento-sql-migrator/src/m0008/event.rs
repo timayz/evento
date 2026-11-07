@@ -4,7 +4,7 @@ use sea_query::{ColumnDef, Index, Table};
 
 use evento_sql::Event;
 
-use super::{Backend, Step};
+use crate::step::{step_operation, Backend, Step};
 
 /// Adds `event.tenant VARCHAR(255) NOT NULL DEFAULT ''`: every existing row
 /// lands in the default tenant.

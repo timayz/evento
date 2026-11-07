@@ -7,14 +7,15 @@ use std::{
 };
 
 use sea_query::{
-    Cond, Expr, ExprTrait, Func, Iden, IntoColumnRef, OnConflict, Query, SelectStatement,
+    Alias, Asterisk, Cond, Expr, ExprTrait, Func, Iden, IntoColumnRef, OnConflict, Query,
+    SelectStatement, UnionType,
 };
 use sqlx::{Database, Pool};
 use ulid::Ulid;
 
 use evento_core::{
     cursor::{self, Args, Cursor, Edge, PageInfo, ReadResult, Value},
-    EventFilter, Executor, SubscriberStatus, TenantFilter, WriteError,
+    EventFilter, Executor, FilterArm, RoutingKey, SubscriberStatus, TenantFilter, WriteError,
 };
 
 use crate::dialect::{build_sqlx, unsupported};
@@ -325,47 +326,180 @@ impl<DB: Database> Sql<DB> {
     }
 }
 
-/// Adds the aggregator, routing-key and tenant filters to `statement`.
+/// The `WHERE` conditions of a filtered read, one per seek.
+///
+/// A single `WHERE (type = ? AND name = ?) OR (…)` is read by every planner
+/// as one scan of what the arms share — the type at best, the whole table
+/// when the types differ — so a subscription's pass cost time proportional to
+/// the store, whatever its cursor (#478). So when the filters split into
+/// pairwise disjoint arms ([`EventFilter::arms`]), each gets a condition of its
+/// own — `type = ? [AND id = ?] [AND name = ? | name IN (…)]` — for the caller
+/// to read as a `UNION ALL`, one index seek per arm: the `(type, id, tenant,
+/// …)` index serves a stream, `idx_event_type_name_cursor` a `(type, name)`
+/// arm and `idx_event_type_cursor` a `(type)` one. Filters that could match
+/// the same event fall back to the single `OR` condition, so no event is
+/// returned twice.
 ///
 /// Shared by [`Executor::read`] and [`Executor::latest_timestamp`], so a
 /// subscription's reads and its lag `MAX(timestamp)` always cover the same
 /// rows. `aggregators` is `None` for every aggregate; an empty slice matches
-/// nothing (sea-query renders an empty `Cond::any()` as `FALSE`).
-fn apply_filters(
-    statement: &mut SelectStatement,
+/// nothing (sea-query renders an empty `Cond::any()` as `FALSE`). The routing
+/// key and the tenant go on every condition.
+fn filter_conditions(
     aggregators: Option<&[EventFilter]>,
-    routing_key: Option<&evento_core::RoutingKey>,
+    routing_key: Option<&RoutingKey>,
     tenant: &TenantFilter,
-) {
-    if let Some(aggregators) = aggregators {
-        let mut cond = Cond::any();
-        for aggregator in aggregators {
-            let mut aggregator_cond = Cond::all()
-                .add(Expr::col(Event::AggregatorType).eq(aggregator.aggregate_type.clone()));
-            if let Some(id) = &aggregator.aggregate_id {
-                aggregator_cond =
-                    aggregator_cond.add(Expr::col(Event::AggregatorId).eq(id.clone()));
+) -> Vec<Cond> {
+    let scope = |mut cond: Cond| {
+        match routing_key {
+            Some(RoutingKey::Value(Some(key))) => {
+                cond = cond.add(Expr::col(Event::RoutingKey).eq(key));
             }
-            if let Some(name) = &aggregator.name {
-                aggregator_cond = aggregator_cond.add(Expr::col(Event::Name).eq(name.clone()));
+            Some(RoutingKey::Value(None)) => {
+                cond = cond.add(Expr::col(Event::RoutingKey).is_null());
             }
-            cond = cond.add(aggregator_cond);
+            Some(RoutingKey::All) | None => {}
         }
-        statement.and_where(cond.into());
-    }
+        if let TenantFilter::Only(tenant) = tenant {
+            cond = cond.add(Expr::col(Event::Tenant).eq(tenant));
+        }
+        cond
+    };
 
-    match routing_key {
-        Some(evento_core::RoutingKey::Value(Some(key))) => {
-            statement.and_where(Expr::col(Event::RoutingKey).eq(key));
+    let Some(aggregators) = aggregators else {
+        return vec![scope(Cond::all())];
+    };
+    match EventFilter::arms(aggregators) {
+        Some(arms) if !arms.is_empty() => arms
+            .iter()
+            .map(|arm| scope(Cond::all().add(arm_condition(arm))))
+            .collect(),
+        _ => {
+            let mut any = Cond::any();
+            for aggregator in aggregators {
+                let mut cond = Cond::all()
+                    .add(Expr::col(Event::AggregatorType).eq(aggregator.aggregate_type.clone()));
+                if let Some(id) = &aggregator.aggregate_id {
+                    cond = cond.add(Expr::col(Event::AggregatorId).eq(id.clone()));
+                }
+                if let Some(name) = &aggregator.name {
+                    cond = cond.add(Expr::col(Event::Name).eq(name.clone()));
+                }
+                any = any.add(cond);
+            }
+            vec![scope(Cond::all().add(any))]
         }
-        Some(evento_core::RoutingKey::Value(None)) => {
-            statement.and_where(Expr::col(Event::RoutingKey).is_null());
-        }
-        Some(evento_core::RoutingKey::All) | None => {}
     }
+}
 
-    if let TenantFilter::Only(tenant) = tenant {
-        statement.and_where(Expr::col(Event::Tenant).eq(tenant));
+/// The condition of one arm: `type = ? [AND id = ?] [AND name = ? | name IN
+/// (…)]`.
+fn arm_condition(arm: &FilterArm<'_>) -> Cond {
+    let mut cond = Cond::all().add(Expr::col(Event::AggregatorType).eq(arm.aggregate_type));
+    if let Some(id) = arm.aggregate_id {
+        cond = cond.add(Expr::col(Event::AggregatorId).eq(id));
+    }
+    match &arm.names {
+        None => {}
+        Some(names) if names.len() == 1 => {
+            let name = *names.iter().next().expect("one name");
+            cond = cond.add(Expr::col(Event::Name).eq(name));
+        }
+        Some(names) => {
+            cond = cond.add(Expr::col(Event::Name).is_in(names.iter().copied()));
+        }
+    }
+    cond
+}
+
+/// The reader of [`Executor::read`]: one `SELECT … FROM event WHERE cond` per
+/// condition of [`filter_conditions`], the stamp bound `to_micros` on each.
+fn read_reader(
+    aggregators: Option<&[EventFilter]>,
+    routing_key: Option<&RoutingKey>,
+    tenant: &TenantFilter,
+    to_micros: Option<u64>,
+) -> Reader {
+    let statements = filter_conditions(aggregators, routing_key, tenant)
+        .into_iter()
+        .map(|cond| {
+            let mut statement = Query::select()
+                .columns([
+                    Event::Id,
+                    Event::Name,
+                    Event::AggregatorType,
+                    Event::AggregatorId,
+                    Event::Version,
+                    Event::Data,
+                    Event::Metadata,
+                    Event::RoutingKey,
+                    Event::Tenant,
+                    Event::Timestamp,
+                    Event::TimestampSubsec,
+                ])
+                .from(Event::Table)
+                .cond_where(cond)
+                .to_owned();
+
+            if let Some(bound) = to_micros {
+                // Exclusive bound on the event stamp (`ts` seconds +
+                // `subsec` milliseconds): stamp < bound ⇔
+                // ts < bound_secs, or ts = bound_secs and
+                // subsec·1000 < bound_rem_micros — the latter rewritten as
+                // an integer comparison (subsec < ceil(rem / 1000)). The
+                // leading `timestamp <=` term is the half the planners take
+                // as an index bound (PostgreSQL reads the `OR` as a filter).
+                let secs = (bound / 1_000_000) as i64;
+                let subsec_bound = ((bound % 1_000_000).div_ceil(1_000)) as i64;
+                statement.and_where(
+                    Expr::col(Event::Timestamp).lte(secs).and(
+                        Expr::col(Event::Timestamp)
+                            .lt(secs)
+                            .or(Expr::col(Event::Timestamp)
+                                .eq(secs)
+                                .and(Expr::col(Event::TimestampSubsec).lt(subsec_bound))),
+                    ),
+                );
+            }
+            statement
+        })
+        .collect();
+    Reader::arms(statements)
+}
+
+/// The statement of [`Executor::latest_timestamp`]: `MAX(timestamp)` under the
+/// condition of [`filter_conditions`] — or, over several, the greatest of one
+/// `MAX` per arm, each a seek to the arm's last index entry; the aggregate
+/// `MAX` ignores the `NULL` of an arm without rows.
+fn latest_timestamp_statement(
+    aggregators: Option<&[EventFilter]>,
+    routing_key: Option<&RoutingKey>,
+    tenant: &TenantFilter,
+) -> SelectStatement {
+    let latest = Alias::new("latest");
+    let mut arms = filter_conditions(aggregators, routing_key, tenant)
+        .into_iter()
+        .map(|cond| {
+            Query::select()
+                .expr_as(Func::max(Expr::col(Event::Timestamp)), latest.clone())
+                .from(Event::Table)
+                .cond_where(cond)
+                .to_owned()
+        });
+    let first = arms.next().expect("a read has a condition");
+    match arms.next() {
+        None => first,
+        Some(second) => {
+            let mut union = first;
+            union.union(UnionType::All, second);
+            for arm in arms {
+                union.union(UnionType::All, arm);
+            }
+            Query::select()
+                .expr(Func::max(Expr::col(latest)))
+                .from_subquery(union, Alias::new("arms"))
+                .to_owned()
+        }
     }
 }
 
@@ -391,52 +525,16 @@ where
         args: Args,
         to_micros: Option<u64>,
     ) -> anyhow::Result<ReadResult<evento_core::Event>> {
-        let mut statement = Query::select()
-            .columns([
-                Event::Id,
-                Event::Name,
-                Event::AggregatorType,
-                Event::AggregatorId,
-                Event::Version,
-                Event::Data,
-                Event::Metadata,
-                Event::RoutingKey,
-                Event::Tenant,
-                Event::Timestamp,
-                Event::TimestampSubsec,
-            ])
-            .from(Event::Table)
-            .to_owned();
-        apply_filters(
-            &mut statement,
+        Ok(read_reader(
             aggregators.as_deref(),
             routing_key.as_ref(),
             &tenant,
-        );
-
-        if let Some(bound) = to_micros {
-            // Exclusive bound on the event stamp (`ts` seconds +
-            // `subsec` milliseconds): stamp < bound ⇔
-            // ts < bound_secs, or ts = bound_secs and
-            // subsec·1000 < bound_rem_micros — the latter rewritten as
-            // an integer comparison (subsec < ceil(rem / 1000)). The
-            // leading `timestamp <` term keeps the predicate sargable.
-            let secs = (bound / 1_000_000) as i64;
-            let subsec_bound = ((bound % 1_000_000).div_ceil(1_000)) as i64;
-            statement.and_where(
-                Expr::col(Event::Timestamp)
-                    .lt(secs)
-                    .or(Expr::col(Event::Timestamp)
-                        .eq(secs)
-                        .and(Expr::col(Event::TimestampSubsec).lt(subsec_bound))),
-            );
-        }
-
-        Ok(Reader::new(statement)
-            .args(args)
-            .execute::<_, SqlEvent, _>(&self.pool)
-            .await?
-            .map(|e| e.0))
+            to_micros,
+        )
+        .args(args)
+        .execute::<_, SqlEvent, _>(&self.pool)
+        .await?
+        .map(|e| e.0))
     }
 
     async fn latest_timestamp(
@@ -445,17 +543,8 @@ where
         routing_key: Option<evento_core::RoutingKey>,
         tenant: TenantFilter,
     ) -> anyhow::Result<u64> {
-        let mut statement = Query::select()
-            .expr(Func::max(Expr::col(Event::Timestamp)))
-            .from(Event::Table)
-            .to_owned();
-        apply_filters(
-            &mut statement,
-            aggregators.as_deref(),
-            routing_key.as_ref(),
-            &tenant,
-        );
-
+        let statement =
+            latest_timestamp_statement(aggregators.as_deref(), routing_key.as_ref(), &tenant);
         let (sql, values) = build_sqlx::<DB, _>(&statement);
 
         let (ts,): (Option<i64>,) =
@@ -1095,8 +1184,18 @@ impl<D: Database> From<Pool<D>> for Sql<D> {
 ///
 /// `Reader` implements `Deref` and `DerefMut` to the underlying `SelectStatement`,
 /// allowing direct access to sea-query builder methods.
+///
+/// # The keyset predicate
+///
+/// A page after a cursor is bounded by `a >= ? AND (a > ? OR (a = ? AND …))`:
+/// the nested `OR` is the exact bound, and the redundant leading `a >= ?` on
+/// the first sort column is the half a planner takes as an index range —
+/// PostgreSQL reads the `OR` alone as a filter over every row of the
+/// equality prefix.
 pub struct Reader {
-    statement: SelectStatement,
+    /// The base statements: one for a plain read, several for
+    /// [`arms`](Self::arms).
+    statements: Vec<SelectStatement>,
     args: Args,
     order: cursor::Order,
 }
@@ -1104,8 +1203,21 @@ pub struct Reader {
 impl Reader {
     /// Creates a new reader from a sea-query select statement.
     pub fn new(statement: SelectStatement) -> Self {
+        Self::arms(vec![statement])
+    }
+
+    /// A reader over several base statements, paged as one: each arm is
+    /// paged on its own (the keyset predicate, the order and the limit), and
+    /// the `UNION ALL` of the arms is paged again. The top rows of the union
+    /// of each arm's top rows are the top rows of the whole, so the page is
+    /// the one a single `OR` of the arms would give — but each arm is an index
+    /// seek where the planners scan the `OR` (see `filter_conditions`). The
+    /// arms must be disjoint, or a row is returned twice. [`Deref`] gives the
+    /// first arm.
+    pub(crate) fn arms(statements: Vec<SelectStatement>) -> Self {
+        debug_assert!(!statements.is_empty(), "a reader needs a statement");
         Self {
-            statement,
+            statements,
             args: Args::default(),
             order: cursor::Order::Asc,
         }
@@ -1181,16 +1293,13 @@ impl Reader {
         O: Cursor,
         O: Send + Unpin,
         O: Bind<Cursor = O>,
-        <<O as Bind>::I as IntoIterator>::IntoIter: DoubleEndedIterator,
-        <<O as Bind>::V as IntoIterator>::IntoIter: DoubleEndedIterator,
         sea_query_sqlx::SqlxValues: sqlx::IntoArguments<DB>,
     {
         // The keyset predicate, the ORDER BY and the LIMIT go on a copy: the
         // stored statement stays the caller's base query, so the same reader
         // can be executed again (a retry, the next page, the other direction)
         // without stacking a second cursor bound on the first.
-        let mut statement = self.statement.clone();
-        let limit = self.build_reader::<O, O>(&mut statement)?;
+        let (statement, limit) = self.prepared::<O, O>()?;
 
         let (sql, values) = build_sqlx::<DB, _>(&statement);
 
@@ -1240,83 +1349,111 @@ impl Reader {
         Ok(ReadResult { edges, page_info })
     }
 
-    /// Adds the keyset predicate, the ORDER BY and the LIMIT (+1 probe row)
-    /// for the configured args to `statement`; returns the page size.
-    fn build_reader<O: Cursor, B: Bind<Cursor = O>>(
+    /// The statement a read runs — the keyset predicate, the ORDER BY and the
+    /// LIMIT (+1 probe row) on every arm, the arms united and paged again —
+    /// with the page size.
+    pub(crate) fn prepared<O: Cursor, B: Bind<Cursor = O>>(
         &self,
-        statement: &mut SelectStatement,
-    ) -> Result<u16, cursor::CursorError>
+    ) -> Result<(SelectStatement, u16), cursor::CursorError>
     where
         B::T: Clone,
-        <<B as Bind>::I as IntoIterator>::IntoIter: DoubleEndedIterator,
-        <<B as Bind>::V as IntoIterator>::IntoIter: DoubleEndedIterator,
     {
         let (limit, cursor) = self.args.get_info();
+        let keyset = match cursor.as_ref() {
+            Some(cursor) => self.keyset::<O, B>(cursor)?,
+            None => None,
+        };
 
-        if let Some(cursor) = cursor.as_ref() {
-            self.build_reader_where::<O, B>(statement, cursor)?;
-        }
-
-        self.build_reader_order::<B>(statement);
-        statement.limit(limit as u64 + 1);
-
-        Ok(limit)
+        let mut arms = self.statements.iter().cloned().map(|mut arm| {
+            if let Some(keyset) = &keyset {
+                arm.and_where(keyset.clone());
+            }
+            self.page::<B>(&mut arm, limit);
+            arm
+        });
+        let first = arms.next().expect("a reader has a statement");
+        let statement = match arms.next() {
+            None => first,
+            Some(second) => {
+                // No dialect takes an ORDER BY on a bare compound member, so
+                // each arm is wrapped: `SELECT * FROM (arm) UNION ALL SELECT *
+                // FROM (arm) …`, then the union is paged from a subquery.
+                let wrap = |arm: SelectStatement| {
+                    Query::select()
+                        .column(Asterisk)
+                        .from_subquery(arm, Alias::new("arm"))
+                        .to_owned()
+                };
+                let mut union = wrap(first);
+                union.union(UnionType::All, wrap(second));
+                for arm in arms {
+                    union.union(UnionType::All, wrap(arm));
+                }
+                let mut statement = Query::select()
+                    .column(Asterisk)
+                    .from_subquery(union, Alias::new("arms"))
+                    .to_owned();
+                self.page::<B>(&mut statement, limit);
+                statement
+            }
+        };
+        Ok((statement, limit))
     }
 
-    fn build_reader_where<O, B>(
-        &self,
-        statement: &mut SelectStatement,
-        cursor: &Value,
-    ) -> Result<(), cursor::CursorError>
+    /// The keyset predicate for `cursor`: nested from the last column out,
+    /// `a > ? OR (a = ? AND (b > ? OR (b = ? AND c > ?)))` (`<` when
+    /// descending), led by `a >= ?` (`<=`) when there is more than one
+    /// column — the sargable half the planners seek on. `None` when the
+    /// `Bind` declares no columns: such a cursor constrains nothing.
+    fn keyset<O, B>(&self, cursor: &Value) -> Result<Option<Expr>, cursor::CursorError>
     where
         O: Cursor,
         B: Bind<Cursor = O>,
         B::T: Clone,
-        <<B as Bind>::I as IntoIterator>::IntoIter: DoubleEndedIterator,
-        <<B as Bind>::V as IntoIterator>::IntoIter: DoubleEndedIterator,
     {
         let is_order_desc = self.is_order_desc();
         let cursor = O::deserialize_cursor(cursor)?;
-        let columns = B::columns().into_iter().rev();
-        let values = B::values(cursor).into_iter().rev();
+        let columns: Vec<B::T> = B::columns().into_iter().collect();
+        let values: Vec<Expr> = B::values(cursor).into_iter().collect();
 
         let mut expr = None::<Expr>;
-        for (col, value) in columns.zip(values) {
-            let current_expr = if is_order_desc {
+        for (col, value) in columns.iter().cloned().zip(values.iter().cloned()).rev() {
+            let current = if is_order_desc {
                 Expr::col(col.clone()).lt(value.clone())
             } else {
                 Expr::col(col.clone()).gt(value.clone())
             };
-
-            let Some(ref prev_expr) = expr else {
-                expr = Some(current_expr.clone());
-                continue;
-            };
-
-            expr = Some(current_expr.or(Expr::col(col).eq(value).and(prev_expr.clone())));
+            expr = Some(match expr {
+                None => current,
+                Some(prev) => current.or(Expr::col(col).eq(value).and(prev)),
+            });
         }
-
-        // `expr` is only `None` when a `Bind` impl declares zero columns; such
-        // a cursor cannot constrain anything, so leave the query unfiltered
-        // rather than panicking on a public-trait misuse.
-        if let Some(expr) = expr {
-            statement.and_where(expr);
+        let Some(expr) = expr else {
+            return Ok(None);
+        };
+        if columns.len() < 2 {
+            return Ok(Some(expr));
         }
-
-        Ok(())
+        let (col, value) = (columns[0].clone(), values[0].clone());
+        let bound = if is_order_desc {
+            Expr::col(col).lte(value)
+        } else {
+            Expr::col(col).gte(value)
+        };
+        Ok(Some(bound.and(expr)))
     }
 
-    fn build_reader_order<O: Bind>(&self, statement: &mut SelectStatement) {
+    /// Adds the ORDER BY and the LIMIT (+1 probe row) to `statement`.
+    fn page<B: Bind>(&self, statement: &mut SelectStatement, limit: u16) {
         let order = if self.is_order_desc() {
             sea_query::Order::Desc
         } else {
             sea_query::Order::Asc
         };
-
-        let columns = O::columns();
-        for col in columns {
+        for col in B::columns() {
             statement.order_by(col, order.clone());
         }
+        statement.limit(u64::from(limit) + 1);
     }
 
     fn is_order_desc(&self) -> bool {
@@ -1331,13 +1468,13 @@ impl Deref for Reader {
     type Target = SelectStatement;
 
     fn deref(&self) -> &Self::Target {
-        &self.statement
+        &self.statements[0]
     }
 }
 
 impl DerefMut for Reader {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.statement
+        &mut self.statements[0]
     }
 }
 
@@ -1507,5 +1644,262 @@ where
             timestamp_subsec,
             metadata,
         }))
+    }
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+mod tests {
+    //! The plans of the read shapes, on SQLite: every one is an index seek,
+    //! with no scan of the type and no `MULTI-INDEX OR` (#478).
+
+    use sqlx::sqlite::SqlitePoolOptions;
+    use sqlx_migrator::{Migrate, Plan};
+
+    use super::*;
+
+    fn event(
+        aggregate_type: &str,
+        aggregate_id: &str,
+        name: &str,
+        version: u16,
+    ) -> evento_core::Event {
+        evento_core::Event {
+            id: Ulid::generate(),
+            aggregate_type: aggregate_type.into(),
+            aggregate_id: aggregate_id.into(),
+            name: name.into(),
+            version,
+            ..Default::default()
+        }
+    }
+
+    /// An in-memory store at the crate schema, holding three events of two
+    /// types.
+    async fn store() -> anyhow::Result<Sqlite> {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await?;
+        let mut conn = pool.acquire().await?;
+        evento::sql_migrator::new::<sqlx::Sqlite>()?
+            .run(&mut *conn, &Plan::apply_all())
+            .await?;
+        drop(conn);
+        let store = Sqlite::from(pool);
+        store
+            .write(vec![
+                event("demo/Page", "p1", "Created", 1),
+                event("demo/Page", "p1", "Edited", 2),
+                event("demo/Comment", "c1", "Posted", 1),
+            ])
+            .await?;
+        Ok(store)
+    }
+
+    /// The cursor of the first event.
+    async fn head(store: &Sqlite) -> anyhow::Result<Value> {
+        let page = store
+            .read(
+                None,
+                Some(RoutingKey::All),
+                TenantFilter::All,
+                Args::forward(1, None),
+                None,
+            )
+            .await?;
+        Ok(page.page_info.end_cursor.expect("an event"))
+    }
+
+    /// The `EXPLAIN QUERY PLAN` lines of `statement`.
+    async fn plan(store: &Sqlite, statement: &SelectStatement) -> anyhow::Result<Vec<String>> {
+        let (sql, values) = build_sqlx::<sqlx::Sqlite, _>(statement);
+        let explain = format!("EXPLAIN QUERY PLAN {sql}");
+        let rows: Vec<(i64, i64, i64, String)> =
+            sqlx::query_as_with(sqlx::AssertSqlSafe(explain.as_str()), values)
+                .fetch_all(&store.pool)
+                .await?;
+        Ok(rows.into_iter().map(|row| row.3).collect())
+    }
+
+    /// The statement and plan of a read of `filters` after `cursor`.
+    async fn read_plan(
+        store: &Sqlite,
+        filters: &[EventFilter],
+        tenant: &TenantFilter,
+        cursor: Option<Value>,
+    ) -> anyhow::Result<(String, Vec<String>)> {
+        let mut reader = read_reader(Some(filters), Some(&RoutingKey::All), tenant, None);
+        reader.forward(100, cursor);
+        let (statement, _) = reader.prepared::<SqlEvent, SqlEvent>()?;
+        let (sql, _) = build_sqlx::<sqlx::Sqlite, _>(&statement);
+        Ok((sql, plan(store, &statement).await?))
+    }
+
+    fn count(plan: &[String], needle: &str) -> usize {
+        plan.iter().filter(|line| line.contains(needle)).count()
+    }
+
+    fn assert_no_scan(plan: &[String]) {
+        assert_eq!(count(plan, "SCAN event"), 0, "{plan:#?}");
+        assert_eq!(count(plan, "MULTI-INDEX OR"), 0, "{plan:#?}");
+    }
+
+    #[tokio::test]
+    async fn a_read_by_event_seeks_the_name_then_the_cursor() -> anyhow::Result<()> {
+        let store = store().await?;
+        let cursor = head(&store).await?;
+        let (sql, plan) = read_plan(
+            &store,
+            &[EventFilter::by_event_raw("demo/Page", "Edited")],
+            &TenantFilter::All,
+            Some(cursor),
+        )
+        .await?;
+        assert!(!sql.contains("UNION"), "{sql}");
+        assert_eq!(
+            plan,
+            vec![
+                "SEARCH event USING INDEX idx_event_type_name_cursor (aggregator_type=? AND name=? AND timestamp>?)"
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_read_by_type_seeks_the_cursor() -> anyhow::Result<()> {
+        let store = store().await?;
+        let cursor = head(&store).await?;
+        let (_, plan) = read_plan(
+            &store,
+            &[EventFilter::by_type_raw("demo/Page")],
+            &TenantFilter::All,
+            Some(cursor),
+        )
+        .await?;
+        assert_eq!(
+            plan,
+            vec!["SEARCH event USING INDEX idx_event_type_cursor (aggregator_type=? AND timestamp>?)"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_read_over_several_arms_seeks_each() -> anyhow::Result<()> {
+        let store = store().await?;
+        let cursor = head(&store).await?;
+        let filters = [
+            EventFilter::by_event_raw("demo/Page", "Edited"),
+            EventFilter::by_event_raw("demo/Comment", "Posted"),
+        ];
+        let (sql, plan) = read_plan(&store, &filters, &TenantFilter::All, Some(cursor)).await?;
+        assert_eq!(sql.matches("UNION ALL").count(), 1, "{sql}");
+        assert_no_scan(&plan);
+        assert_eq!(
+            count(
+                &plan,
+                "SEARCH event USING INDEX idx_event_type_name_cursor (aggregator_type=? AND name=? AND timestamp>?)"
+            ),
+            2,
+            "{plan:#?}"
+        );
+        // The arms are merged in order; each arm's sorter is over its own
+        // page (at most `limit + 1` rows), not the arm.
+        assert_eq!(count(&plan, "MERGE (UNION ALL)"), 1, "{plan:#?}");
+
+        // Without a cursor, the seek is on the name alone.
+        let (_, plan) = read_plan(&store, &filters, &TenantFilter::All, None).await?;
+        assert_no_scan(&plan);
+        assert_eq!(
+            count(
+                &plan,
+                "SEARCH event USING INDEX idx_event_type_name_cursor (aggregator_type=? AND name=?)"
+            ),
+            2,
+            "{plan:#?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_projection_load_seeks_its_stream_once() -> anyhow::Result<()> {
+        let store = store().await?;
+        let filters = [
+            EventFilter::exact_raw("demo/Page", "p1", "Created"),
+            EventFilter::exact_raw("demo/Page", "p1", "Edited"),
+        ];
+        // A load names its tenant.
+        let tenant = TenantFilter::Only("".into());
+        let (sql, plan) = read_plan(&store, &filters, &tenant, None).await?;
+        assert!(!sql.contains("UNION"), "{sql}");
+        assert!(sql.contains(" IN ("), "{sql}");
+        assert_eq!(
+            plan,
+            vec![
+                "SEARCH event USING INDEX idx_event_type_id_tenant_cursor (aggregator_type=? AND aggregator_id=? AND tenant=?)"
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn overlapping_filters_read_as_one_or() -> anyhow::Result<()> {
+        let store = store().await?;
+        let filters: Arc<[EventFilter]> = vec![
+            EventFilter::by_type_raw("demo/Page"),
+            EventFilter::by_event_raw("demo/Page", "Edited"),
+        ]
+        .into();
+        let (sql, _) = read_plan(&store, &filters, &TenantFilter::All, None).await?;
+        assert!(!sql.contains("UNION"), "{sql}");
+        assert!(sql.contains(" OR "), "{sql}");
+        // Each event once.
+        let page = store
+            .read(
+                Some(filters),
+                Some(RoutingKey::All),
+                TenantFilter::All,
+                Args::forward(10, None),
+                None,
+            )
+            .await?;
+        let names: Vec<&str> = page.edges.iter().map(|e| e.node.name.as_str()).collect();
+        assert_eq!(names, ["Created", "Edited"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn latest_timestamp_seeks_each_arm() -> anyhow::Result<()> {
+        let store = store().await?;
+        let filters: Arc<[EventFilter]> = vec![
+            EventFilter::by_event_raw("demo/Page", "Edited"),
+            EventFilter::by_event_raw("demo/Comment", "Posted"),
+            // Never written: an arm without rows, whose `MAX` is `NULL`.
+            EventFilter::by_event_raw("demo/Page", "Deleted"),
+        ]
+        .into();
+        let statement =
+            latest_timestamp_statement(Some(&filters), Some(&RoutingKey::All), &TenantFilter::All);
+        let (sql, _) = build_sqlx::<sqlx::Sqlite, _>(&statement);
+        assert_eq!(sql.matches("UNION ALL").count(), 2, "{sql}");
+        let plan = plan(&store, &statement).await?;
+        assert_no_scan(&plan);
+        assert_eq!(
+            count(
+                &plan,
+                "SEARCH event USING COVERING INDEX idx_event_type_name_cursor (aggregator_type=? AND name=?)"
+            ),
+            3,
+            "{plan:#?}"
+        );
+
+        let latest = store
+            .latest_timestamp(Some(filters), Some(RoutingKey::All), TenantFilter::All)
+            .await?;
+        let every = store
+            .latest_timestamp(None, Some(RoutingKey::All), TenantFilter::All)
+            .await?;
+        assert!(latest > 0);
+        assert_eq!(latest, every);
+        Ok(())
     }
 }
