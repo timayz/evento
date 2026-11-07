@@ -8,9 +8,13 @@
 //!
 //! ## Why durable journal + `recover_state`
 //!
-//! Unlike the bank demo (in-memory journal), this node uses `FjallJournal` and
-//! calls `Node::recover_state()` on boot, so a Jepsen process kill/restart
-//! genuinely exercises restart recovery — a stale commit must never resurrect.
+//! This node keeps its `FjallJournal` in a directory of its own, apart from
+//! the store, and wires the node by hand rather than through `Cluster::builder`
+//! (which colocates the journal with the store): the Jepsen nemesis loses or
+//! rolls back the journal directory without touching the store, and the other
+//! way round. It calls `Node::recover_state()` on boot, so a Jepsen process
+//! kill/restart genuinely exercises restart recovery — a stale commit must
+//! never resurrect.
 //!
 //! ## Config (env)
 //!
