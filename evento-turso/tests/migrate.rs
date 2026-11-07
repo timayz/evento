@@ -174,6 +174,30 @@ async fn the_crate_schema_applies_to_a_fresh_database() {
             .await
             .unwrap_or_else(|err| panic!("table {table} missing: {err}"));
     }
+    // The event indexes, the later migrations' included (the primary key's
+    // autoindex aside).
+    let mut rows = conn
+        .query(
+            "SELECT name FROM sqlite_schema WHERE type = 'index' AND tbl_name = 'event' AND name LIKE 'idx_%' ORDER BY name",
+            (),
+        )
+        .await
+        .unwrap();
+    let mut indexes = Vec::new();
+    while let Some(row) = rows.next().await.unwrap() {
+        indexes.push(row.get_value(0).unwrap().as_text().unwrap().to_owned());
+    }
+    assert_eq!(
+        indexes,
+        [
+            "idx_event_type_cursor",
+            "idx_event_type_id_tenant_cursor",
+            "idx_event_type_id_tenant_version",
+            "idx_event_type_name_cursor",
+            "idx_event_type_routing_cursor",
+            "idx_event_type_tenant_cursor",
+        ]
+    );
 }
 
 #[cfg(feature = "accord")]

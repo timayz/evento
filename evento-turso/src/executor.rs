@@ -8,7 +8,7 @@ use std::{
     },
 };
 
-use sea_query::{Expr, ExprTrait, Func, OnConflict, Query};
+use sea_query::{Alias, Expr, ExprTrait, Func, OnConflict, Query, SelectStatement, UnionType};
 use tokio::sync::{watch, Mutex};
 use ulid::Ulid;
 
@@ -18,8 +18,8 @@ use evento_core::{
 };
 
 use crate::query::{
-    self, apply_filters, EventRow, EventTable, MetaTable, Prepared, SnapshotTable, SubscriberTable,
-    EVENT_COLUMNS,
+    self, filter_conditions, EventRow, EventTable, MetaTable, Prepared, SnapshotTable,
+    SubscriberTable, EVENT_COLUMNS,
 };
 use crate::write::{self, Body, WriteMode};
 use crate::Reader;
@@ -493,27 +493,23 @@ fn insert_error(err: turso::Error) -> WriteError {
     }
 }
 
-#[async_trait::async_trait]
-impl Executor for Turso {
-    async fn read(
-        &self,
-        aggregators: Option<Arc<[EventFilter]>>,
-        routing_key: Option<RoutingKey>,
-        tenant: TenantFilter,
-        args: Args,
-        to_micros: Option<u64>,
-    ) -> anyhow::Result<ReadResult<Event>> {
-        let reader = {
+/// The reader of a filtered read: one arm per condition of
+/// [`filter_conditions`], each the event columns under its condition and the
+/// exclusive `to_micros` bound — see [`Reader::arms`].
+fn read_reader(
+    aggregators: Option<&[EventFilter]>,
+    routing_key: Option<&RoutingKey>,
+    tenant: &TenantFilter,
+    to_micros: Option<u64>,
+) -> Reader {
+    let arms = filter_conditions(aggregators, routing_key, tenant)
+        .into_iter()
+        .map(|cond| {
             let mut statement = Query::select()
                 .columns(EVENT_COLUMNS)
                 .from(EventTable::Table)
+                .cond_where(cond)
                 .to_owned();
-            apply_filters(
-                &mut statement,
-                aggregators.as_deref(),
-                routing_key.as_ref(),
-                &tenant,
-            );
             if let Some(bound) = to_micros {
                 // Exclusive bound on the event stamp (`ts` seconds + `subsec`
                 // milliseconds): stamp < bound ⇔ ts < bound_secs, or ts =
@@ -530,11 +526,62 @@ impl Executor for Turso {
                             .and(Expr::col(EventTable::TimestampSubsec).lt(subsec_bound))),
                 );
             }
-            let mut reader = Reader::new(statement);
-            reader.args(args);
-            reader
-        };
+            statement
+        })
+        .collect();
+    Reader::arms(arms)
+}
 
+/// The `MAX(timestamp)` of the events under the filters: one `MAX` per arm of
+/// [`filter_conditions`] (each an index seek), the greatest of them when
+/// there are several — `MAX` over a `UNION ALL` of the arms, which ignores
+/// the `NULL` of an arm without events.
+fn latest_timestamp_statement(
+    aggregators: Option<&[EventFilter]>,
+    routing_key: Option<&RoutingKey>,
+    tenant: &TenantFilter,
+) -> SelectStatement {
+    let latest = Alias::new("latest");
+    let mut arms = filter_conditions(aggregators, routing_key, tenant)
+        .into_iter()
+        .map(|cond| {
+            Query::select()
+                .expr_as(Func::max(Expr::col(EventTable::Timestamp)), latest.clone())
+                .from(EventTable::Table)
+                .cond_where(cond)
+                .to_owned()
+        });
+    let mut first = arms.next().expect("filter_conditions yields a condition");
+    let Some(second) = arms.next() else {
+        return first;
+    };
+    first.union(UnionType::All, second);
+    for arm in arms {
+        first.union(UnionType::All, arm);
+    }
+    Query::select()
+        .expr(Func::max(Expr::col(latest)))
+        .from_subquery(first, Alias::new("arms"))
+        .to_owned()
+}
+
+#[async_trait::async_trait]
+impl Executor for Turso {
+    async fn read(
+        &self,
+        aggregators: Option<Arc<[EventFilter]>>,
+        routing_key: Option<RoutingKey>,
+        tenant: TenantFilter,
+        args: Args,
+        to_micros: Option<u64>,
+    ) -> anyhow::Result<ReadResult<Event>> {
+        let mut reader = read_reader(
+            aggregators.as_deref(),
+            routing_key.as_ref(),
+            &tenant,
+            to_micros,
+        );
+        reader.args(args);
         Ok(reader
             .execute::<EventRow>(&self.reader()?)
             .await?
@@ -547,19 +594,11 @@ impl Executor for Turso {
         routing_key: Option<RoutingKey>,
         tenant: TenantFilter,
     ) -> anyhow::Result<u64> {
-        let q = {
-            let mut statement = Query::select()
-                .expr(Func::max(Expr::col(EventTable::Timestamp)))
-                .from(EventTable::Table)
-                .to_owned();
-            apply_filters(
-                &mut statement,
-                aggregators.as_deref(),
-                routing_key.as_ref(),
-                &tenant,
-            );
-            query::prepare(&statement)
-        };
+        let q = query::prepare(&latest_timestamp_statement(
+            aggregators.as_deref(),
+            routing_key.as_ref(),
+            &tenant,
+        ));
         let row = query::fetch_optional_prepared(&self.reader()?, q).await?;
         let ts = match row {
             Some(row) => query::opt_int(&row, 0)?,
@@ -938,5 +977,243 @@ impl From<Turso> for evento_core::Evento {
 impl From<&Turso> for evento_core::Evento {
     fn from(value: &Turso) -> Self {
         evento_core::Evento::new(value.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! What Turso's planner does with the statements a subscription runs:
+    //! every read and every `MAX(timestamp)` is an index seek, whatever the
+    //! filters and the cursor (#478).
+
+    use super::*;
+
+    /// A store holding a few events of two types; the cursor of the last one.
+    async fn store() -> anyhow::Result<(Turso, Value)> {
+        let store = Turso::in_memory().await?;
+        for (aggregate_type, name, id) in [
+            ("demo/Page", "Created", "p1"),
+            ("demo/Comment", "Posted", "c1"),
+            ("demo/Page", "Edited", "p1"),
+        ] {
+            store
+                .write(vec![Event {
+                    id: Ulid::generate(),
+                    aggregate_type: aggregate_type.into(),
+                    aggregate_id: id.into(),
+                    name: name.into(),
+                    version: if name == "Edited" { 2 } else { 1 },
+                    ..Default::default()
+                }])
+                .await?;
+        }
+        let head = store
+            .read(
+                None,
+                Some(RoutingKey::All),
+                TenantFilter::All,
+                Args::backward(1, None),
+                None,
+            )
+            .await?;
+        let cursor = head.edges.first().expect("an event").cursor.clone();
+        Ok((store, cursor))
+    }
+
+    async fn read_plan(
+        store: &Turso,
+        filters: &[EventFilter],
+        cursor: Option<Value>,
+    ) -> anyhow::Result<(String, Vec<String>)> {
+        let mut reader = read_reader(
+            Some(filters),
+            Some(&RoutingKey::All),
+            &TenantFilter::All,
+            None,
+        );
+        reader.args(Args::forward(300, cursor));
+        let (prepared, _) = reader.prepared::<EventRow>()?;
+        let plan = prepared.explain(&store.connect()?).await?;
+        Ok((prepared.sql().to_owned(), plan))
+    }
+
+    fn count(plan: &[String], step: &str) -> usize {
+        plan.iter().filter(|line| line.contains(step)).count()
+    }
+
+    fn assert_no_scan(plan: &[String]) {
+        for line in plan {
+            assert!(
+                !line.contains("SORTER")
+                    && !line.contains("MULTI-INDEX OR")
+                    && !line.starts_with("SCAN event"),
+                "not a seek: {line:?} in {plan:#?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_read_by_event_seeks_the_name_then_the_cursor() -> anyhow::Result<()> {
+        let (store, cursor) = store().await?;
+        let (_, plan) = read_plan(
+            &store,
+            &[EventFilter::by_event_raw("demo/Page", "Edited")],
+            Some(cursor),
+        )
+        .await?;
+        assert_eq!(
+            count(
+                &plan,
+                "idx_event_type_name_cursor (aggregator_type=? AND name=? AND timestamp>=?)"
+            ),
+            1,
+            "{plan:#?}"
+        );
+        assert_no_scan(&plan);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_read_by_type_seeks_the_cursor() -> anyhow::Result<()> {
+        let (store, cursor) = store().await?;
+        let (_, plan) = read_plan(
+            &store,
+            &[EventFilter::by_type_raw("demo/Page")],
+            Some(cursor),
+        )
+        .await?;
+        assert_eq!(
+            count(
+                &plan,
+                "idx_event_type_cursor (aggregator_type=? AND timestamp>=?)"
+            ),
+            1,
+            "{plan:#?}"
+        );
+        assert_no_scan(&plan);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_read_over_several_arms_seeks_each() -> anyhow::Result<()> {
+        let (store, cursor) = store().await?;
+        let filters = [
+            EventFilter::by_event_raw("demo/Page", "Edited"),
+            EventFilter::by_event_raw("demo/Page", "Created"),
+            EventFilter::by_event_raw("demo/Comment", "Posted"),
+        ];
+        let (sql, plan) = read_plan(&store, &filters, Some(cursor)).await?;
+        assert_eq!(sql.matches("UNION ALL").count(), 2, "{sql}");
+        assert_eq!(
+            count(
+                &plan,
+                "idx_event_type_name_cursor (aggregator_type=? AND name=? AND timestamp>=?)"
+            ),
+            3,
+            "{plan:#?}"
+        );
+        assert_eq!(count(&plan, "MULTI-INDEX OR"), 0, "{plan:#?}");
+        // The arms' top rows are sorted again: the one sort of the page.
+        assert_eq!(count(&plan, "SORTER"), 1, "{plan:#?}");
+
+        // Without a cursor (a subscription that never matched an event),
+        // every arm still seeks its name.
+        let (_, plan) = read_plan(&store, &filters, None).await?;
+        assert_eq!(
+            count(
+                &plan,
+                "idx_event_type_name_cursor (aggregator_type=? AND name=?)"
+            ),
+            3,
+            "{plan:#?}"
+        );
+        assert_eq!(count(&plan, "MULTI-INDEX OR"), 0, "{plan:#?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_projection_load_seeks_its_stream_once() -> anyhow::Result<()> {
+        let (store, _) = store().await?;
+        let filters = [
+            EventFilter::exact_raw("demo/Page", "p1", "Created"),
+            EventFilter::exact_raw("demo/Page", "p1", "Edited"),
+        ];
+        let mut reader = read_reader(
+            Some(&filters),
+            Some(&RoutingKey::All),
+            &TenantFilter::Only("".into()),
+            None,
+        );
+        reader.args(Args::forward(300, None));
+        let (prepared, _) = reader.prepared::<EventRow>()?;
+        assert!(!prepared.sql().contains("UNION"), "{}", prepared.sql());
+        let plan = prepared.explain(&store.connect()?).await?;
+        assert_eq!(
+            count(&plan, "idx_event_type_id_tenant_cursor (aggregator_type=? AND aggregator_id=? AND tenant=?)"),
+            1,
+            "{plan:#?}"
+        );
+        assert_no_scan(&plan);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn overlapping_filters_read_as_one_or() -> anyhow::Result<()> {
+        let (store, _) = store().await?;
+        let filters = [
+            EventFilter::by_type_raw("demo/Page"),
+            EventFilter::by_event_raw("demo/Page", "Edited"),
+        ];
+        let (sql, _) = read_plan(&store, &filters, None).await?;
+        assert!(!sql.contains("UNION"), "{sql}");
+        assert!(sql.contains(" OR "), "{sql}");
+        // Every event once.
+        let page = store
+            .read(
+                Some(filters.to_vec().into()),
+                Some(RoutingKey::All),
+                TenantFilter::All,
+                Args::forward(10, None),
+                None,
+            )
+            .await?;
+        assert_eq!(page.edges.len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn latest_timestamp_seeks_each_arm() -> anyhow::Result<()> {
+        let (store, _) = store().await?;
+        let filters = [
+            EventFilter::by_event_raw("demo/Page", "Edited"),
+            EventFilter::by_event_raw("demo/Comment", "Posted"),
+            // An arm without events contributes a NULL that MAX ignores.
+            EventFilter::by_event_raw("demo/Page", "Deleted"),
+        ];
+        let statement =
+            latest_timestamp_statement(Some(&filters), Some(&RoutingKey::All), &TenantFilter::All);
+        let prepared = query::prepare(&statement);
+        let plan = prepared.explain(&store.connect()?).await?;
+        assert_eq!(
+            count(
+                &plan,
+                "COVERING INDEX idx_event_type_name_cursor (aggregator_type=? AND name=?)"
+            ),
+            3,
+            "{plan:#?}"
+        );
+        let latest = store
+            .latest_timestamp(
+                Some(filters.to_vec().into()),
+                Some(RoutingKey::All),
+                TenantFilter::All,
+            )
+            .await?;
+        let all = store
+            .latest_timestamp(None, Some(RoutingKey::All), TenantFilter::All)
+            .await?;
+        assert_eq!(latest, all);
+        assert!(latest > 0);
+        Ok(())
     }
 }
