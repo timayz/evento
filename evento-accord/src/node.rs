@@ -5167,6 +5167,7 @@ impl Node {
             // read as "no such events".
             Message::ReadForward {
                 id,
+                key,
                 aggregators,
                 routing_key,
                 tenant,
@@ -5190,9 +5191,7 @@ impl Node {
                 // dropped (or is about to be). A requester behind on the
                 // layout gets a failure, not a page that reads as "no such
                 // events".
-                let filters: Option<Arc<[EventFilter]>> = aggregators.as_deref().map(Arc::from);
-                let routed = crate::executor::target_key(&filters, &routing_key, &tenant);
-                if let Some(key) = routed.filter(|key| !self.topology.owns(self.id, key)) {
+                if !self.topology.owns(self.id, &key) {
                     let epoch = self.topology.epoch();
                     tracing::debug!(
                         node = self.id.0,
@@ -11281,6 +11280,12 @@ impl Node {
         self.topology.owns(self.id, key)
     }
 
+    /// Whether the current layout has more than one shard — i.e. whether a
+    /// key can be one this node does not own.
+    pub fn sharded(&self) -> bool {
+        self.topology.layout().shards().len() > 1
+    }
+
     /// A replica that owns `key`, to forward a read to. Prefers another node but
     /// falls back to self.
     pub fn an_owner_of(&self, key: &Key) -> Option<NodeId> {
@@ -11298,9 +11303,11 @@ impl Node {
 
     /// Forwards a read to `to` (an owner of the queried range) and returns its
     /// result.
+    #[allow(clippy::too_many_arguments)]
     pub async fn forward_read(
         &self,
         to: NodeId,
+        key: Key,
         aggregators: Option<Arc<[EventFilter]>>,
         routing_key: Option<RoutingKey>,
         tenant: TenantFilter,
@@ -11317,6 +11324,7 @@ impl Node {
             to,
             Message::ReadForward {
                 id,
+                key,
                 aggregators: aggregators.map(|a| a.to_vec()),
                 routing_key,
                 tenant,

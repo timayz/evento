@@ -10,7 +10,7 @@ use evento_accord::{
     AccordExecutor, DataStore, ExecutorDataStore, HybridLogicalClock, InMemoryJournal,
     InMemoryNetwork, Journal, MessageSink, Node, NodeConfig, NodeId, StaticTopology,
 };
-use evento_core::{cursor::Args, Event, EventFilter, Executor, WriteError};
+use evento_core::{cursor::Args, Event, EventFilter, Evento, Executor, WriteError};
 use evento_fjall::Fjall;
 use ulid::Ulid;
 
@@ -25,9 +25,10 @@ fn init_tracing() {
         .try_init();
 }
 
-/// A single-shard cluster of fjall-backed `AccordExecutor`s.
-struct ExecCluster {
-    execs: Vec<AccordExecutor<Fjall>>,
+/// A single-shard cluster of fjall-backed `AccordExecutor`s — each node's
+/// local backend is `E`, a `Fjall` or a wrapper over one.
+struct ExecCluster<E: Executor + Clone = Fjall> {
+    execs: Vec<AccordExecutor<E>>,
     /// The network between the nodes, for faults.
     net: Arc<InMemoryNetwork>,
     _loops: Vec<tokio::task::JoinHandle<()>>,
@@ -54,6 +55,29 @@ impl ExecCluster {
     }
 
     fn start_configured(n: u64, config: NodeConfig) -> Self {
+        Self::start_wrapped(n, config, |fjall| fjall)
+    }
+}
+
+impl ExecCluster<Evento> {
+    /// A **linearizable** cluster whose nodes all create new streams under the
+    /// default routing `key` — set on the backend each node wraps, so the
+    /// node sees it.
+    fn start_routed(n: u64, key: &str) -> Self {
+        let key = key.to_owned();
+        Self::start_wrapped(
+            n,
+            NodeConfig {
+                linearizable_reads: true,
+                ..Default::default()
+            },
+            move |fjall| Evento::new(fjall).default_routing_key(key.clone()),
+        )
+    }
+}
+
+impl<E: Executor + Clone> ExecCluster<E> {
+    fn start_wrapped(n: u64, config: NodeConfig, wrap: impl Fn(Fjall) -> E) -> Self {
         init_tracing();
         let ids: Vec<NodeId> = (0..n).map(NodeId).collect();
         let net = InMemoryNetwork::new();
@@ -73,7 +97,7 @@ impl ExecCluster {
             let node = Node::new(id, topology, clock, sink, datastore, journal).with_config(config);
 
             loops.push(node.start(inbox));
-            execs.push(AccordExecutor::new(node, fjall));
+            execs.push(AccordExecutor::new(node, wrap(fjall)));
         }
 
         ExecCluster {
@@ -85,9 +109,19 @@ impl ExecCluster {
 
     /// Reads all events for an aggregate from one node's executor.
     async fn read_all(&self, node: usize, id: &str) -> Vec<Event> {
+        self.read_types(node, id, &["test/Account"]).await
+    }
+
+    /// Reads all events of aggregate `id` under each of `types`, as a
+    /// projection load with co-keyed aggregates does: by id, no routing key.
+    async fn read_types(&self, node: usize, id: &str, types: &[&str]) -> Vec<Event> {
+        let filters = types
+            .iter()
+            .map(|t| EventFilter::by_id_raw(*t, id))
+            .collect::<Arc<[EventFilter]>>();
         let result = self.execs[node]
             .read(
-                Some([EventFilter::by_id_raw("test/Account", id)].into()),
+                Some(filters),
                 None,
                 evento_core::TenantFilter::Only(String::new()),
                 Args::forward(50, None),
@@ -189,6 +223,131 @@ async fn linearizable_read_observes_a_write_from_another_node() {
         "a linearizable read must observe a write that completed before it began"
     );
     assert_eq!(events[0].version, 1);
+}
+
+/// [`event`] written under a routing key: its writes conflict on that key, not
+/// on its id, as the commit builder stamps a stream created with one.
+fn routed(aggregate_id: &str, version: u16, name: &str, key: &str) -> Event {
+    Event {
+        routing_key: Some(key.to_owned()),
+        ..event(aggregate_id, version, name)
+    }
+}
+
+/// [`routed`], under another aggregate type.
+fn routed_as(aggregate_type: &str, id: &str, version: u16, name: &str, key: &str) -> Event {
+    Event {
+        aggregate_type: aggregate_type.to_owned(),
+        ..routed(id, version, name, key)
+    }
+}
+
+/// Node 1 hears from node 0 late: a write node 0 coordinates commits on
+/// nodes 0 and 2 and reaches node 1 only after a read there begins. A read
+/// barrier on the right key waits for it; one on the wrong key waits on
+/// nothing and serves the stale store.
+fn delay_from_0_to_1<E: Executor + Clone>(cluster: &ExecCluster<E>) {
+    cluster
+        .net
+        .set_latency(NodeId(0), NodeId(1), Duration::from_millis(300));
+}
+
+/// A routed aggregate's writes conflict on its routing key, not its id. A
+/// linearizable read of it **by id** — how a projection loads a write model —
+/// must fence that key: before the fix for #477 the barrier fenced the bare
+/// id, waited on nothing, and served a stale store as linearizable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn linearizable_read_of_a_routed_aggregate_fences_its_routing_key() {
+    let cluster = ExecCluster::start_linearizable(3);
+
+    // The stream exists on every node before the race: the reader resolves
+    // its routing key from its own store.
+    cluster.execs[0]
+        .write(vec![routed("r", 1, "Opened", "eu")])
+        .await
+        .unwrap();
+    cluster.await_read(1, "r", 1).await;
+
+    delay_from_0_to_1(&cluster);
+    cluster.execs[0]
+        .write(vec![routed("r", 2, "Deposited", "eu")])
+        .await
+        .unwrap();
+
+    let events = cluster.read_all(1, "r").await;
+    assert_eq!(
+        events.iter().map(|e| e.version).collect::<Vec<_>>(),
+        [1, 2],
+        "a linearizable read by id of a routed aggregate must observe a write that completed before it began"
+    );
+}
+
+/// A stream a node has not seen yet is pinned where that node would create
+/// it: under its backend's default routing key. Nodes sharing a default thus
+/// fence each other's brand-new streams — the create-then-read-elsewhere case.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn linearizable_read_of_an_unseen_stream_fences_the_default_routing_key() {
+    let cluster = ExecCluster::start_routed(3, "eu");
+
+    delay_from_0_to_1(&cluster);
+    cluster.execs[0]
+        .write(vec![routed("n", 1, "Opened", "eu")])
+        .await
+        .unwrap();
+
+    let events = cluster.read_all(1, "n").await;
+    assert_eq!(
+        events.len(),
+        1,
+        "a linearizable read of a stream created under the shared default must observe it"
+    );
+}
+
+/// A projection load with co-keyed aggregates reads several types under one
+/// id. Each is its own stream with its own routing key: every key is fenced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn linearizable_read_of_co_keyed_streams_fences_every_routing_key() {
+    let cluster = ExecCluster::start_linearizable(3);
+
+    cluster.execs[0]
+        .write(vec![routed("c", 1, "Opened", "eu")])
+        .await
+        .unwrap();
+    cluster.execs[0]
+        .write(vec![routed_as("test/Card", "c", 1, "Issued", "us")])
+        .await
+        .unwrap();
+    for _ in 0..1000 {
+        if cluster
+            .read_types(1, "c", &["test/Account", "test/Card"])
+            .await
+            .len()
+            == 2
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    delay_from_0_to_1(&cluster);
+    // One write to each stream: a reader fencing only one key misses the other.
+    cluster.execs[0]
+        .write(vec![routed("c", 2, "Deposited", "eu")])
+        .await
+        .unwrap();
+    cluster.execs[0]
+        .write(vec![routed_as("test/Card", "c", 2, "Blocked", "us")])
+        .await
+        .unwrap();
+
+    let events = cluster
+        .read_types(1, "c", &["test/Account", "test/Card"])
+        .await;
+    assert_eq!(
+        events.len(),
+        4,
+        "a linearizable co-keyed read must observe every write that completed before it began"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

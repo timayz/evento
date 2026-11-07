@@ -385,10 +385,14 @@ pub enum Message {
     /// them, installing each now-contiguous epoch. May be empty.
     MetadataEntries { entries: Vec<(u64, ConfigEntry)> },
     /// A node → an owner of the queried key range: serve this read locally.
-    /// `to_micros` forwards the exclusive stamp bound (see
-    /// `evento_core::Executor::read`).
+    /// `key` is the key the requester routed by — resolved from the stream
+    /// when the query names an aggregate by id (see
+    /// `AccordExecutor::conflict_keys`), so the owner checks ownership of the
+    /// key the writes actually took, not of the bare id. `to_micros` forwards
+    /// the exclusive stamp bound (see `evento_core::Executor::read`).
     ReadForward {
         id: u64,
+        key: Key,
         aggregators: Option<Vec<EventFilter>>,
         routing_key: Option<RoutingKey>,
         tenant: TenantFilter,

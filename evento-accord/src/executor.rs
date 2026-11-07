@@ -34,6 +34,7 @@ use evento_core::{
     cursor::{Args, ReadResult, Value},
     Event, EventFilter, Executor, RoutingKey, TenantFilter, WriteError,
 };
+use futures_util::future::try_join_all;
 use ulid::Ulid;
 
 use crate::api::{
@@ -57,41 +58,60 @@ const SNAPSHOT_PAGE_SIZE: u16 = 4096;
 /// an aggregate back from its newest event.
 const HOLDS_PAGE_SIZE: u16 = 64;
 
-/// The single key a read targets, if it can be pinned to one shard: an explicit
-/// routing key, or a query for one aggregate by id — however many filters spell
-/// it out (a projection load issues one filter per handled event type, all for
-/// the same id) — in the one tenant it reads ([`Key::in_tenant`]). Broad scans
-/// (several aggregate ids, by event type alone, or every tenant) return `None`
-/// and are served locally.
-///
-/// **Caveat:** the write side derives the shard key from `routing_key` falling
-/// back to the aggregate id ([`Key::of`]). A by-id pin is therefore only
-/// correct for aggregates written **without** a routing key; a read of a
-/// *routed* aggregate must pass its routing key too, or the pin lands on the
-/// wrong key — a forwarded read goes to the wrong shard, and a read barrier
-/// fences the wrong conflict set.
-pub(crate) fn target_key(
-    aggregators: &Option<Arc<[EventFilter]>>,
+/// What a read is pinned to, when it can be pinned to one shard (see
+/// [`target`]).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Target<'a> {
+    /// An explicit routing key, in its tenant: the key its writes conflict on.
+    Routed(Key),
+    /// One aggregate by id, in one tenant, under the distinct aggregate types
+    /// the filters name (a projection load with co-keyed aggregates reads
+    /// several types under one id). Its conflict key is **not** the id: the
+    /// write side keys a stream by its routing key when it has one
+    /// ([`Key::of`]), which only a lookup of the stream tells — see
+    /// [`AccordExecutor::conflict_keys`].
+    Aggregate {
+        tenant: &'a str,
+        id: &'a str,
+        types: Vec<&'a str>,
+    },
+}
+
+/// The target a read can be pinned to, if any: an explicit routing key, or a
+/// query for one aggregate by id — however many filters spell it out (a
+/// projection load issues one filter per handled event type, all for the same
+/// id) — in the one tenant it reads ([`Key::in_tenant`]). Broad scans (several
+/// aggregate ids, by event type alone, or every tenant) return `None` and are
+/// served locally.
+pub(crate) fn target<'a>(
+    aggregators: &'a Option<Arc<[EventFilter]>>,
     routing_key: &Option<RoutingKey>,
-    tenant: &TenantFilter,
-) -> Option<Key> {
+    tenant: &'a TenantFilter,
+) -> Option<Target<'a>> {
     // A key belongs to one tenant: a read of every tenant spans many.
     let TenantFilter::Only(tenant) = tenant else {
         return None;
     };
     if let Some(RoutingKey::Value(Some(key))) = routing_key {
-        return Some(Key::in_tenant(tenant, key));
+        return Some(Target::Routed(Key::in_tenant(tenant, key)));
     }
     let filters = aggregators.as_deref()?;
     let (first, rest) = filters.split_first()?;
     let id = first.aggregate_id.as_deref()?;
-    rest.iter()
-        .all(|f| f.aggregate_id.as_deref() == Some(id))
-        .then(|| Key::in_tenant(tenant, id))
+    if !rest.iter().all(|f| f.aggregate_id.as_deref() == Some(id)) {
+        return None;
+    }
+    let mut types = Vec::with_capacity(1);
+    for f in filters {
+        if !types.contains(&f.aggregate_type.as_str()) {
+            types.push(f.aggregate_type.as_str());
+        }
+    }
+    Some(Target::Aggregate { tenant, id, types })
 }
 
 #[cfg(test)]
-mod target_key_tests {
+mod target_tests {
     use super::*;
 
     fn default_tenant() -> TenantFilter {
@@ -106,12 +126,20 @@ mod target_key_tests {
         }
     }
 
+    fn aggregate<'a>(tenant: &'a str, id: &'a str, types: &[&'a str]) -> Option<Target<'a>> {
+        Some(Target::Aggregate {
+            tenant,
+            id,
+            types: types.to_vec(),
+        })
+    }
+
     #[test]
     fn pins_one_aggregate_however_many_filters_name_it() {
         let one: Arc<[EventFilter]> = Arc::from(vec![filter(Some("a"), None)]);
         assert_eq!(
-            target_key(&Some(one), &None, &default_tenant()),
-            Some(Key("a".into()))
+            target(&Some(one), &None, &default_tenant()),
+            aggregate("", "a", &["t/A"])
         );
         // A projection load: one filter per handled event, same id.
         let many: Arc<[EventFilter]> = Arc::from(vec![
@@ -120,24 +148,43 @@ mod target_key_tests {
             filter(Some("a"), None),
         ]);
         assert_eq!(
-            target_key(&Some(many), &None, &default_tenant()),
-            Some(Key("a".into()))
+            target(&Some(many), &None, &default_tenant()),
+            aggregate("", "a", &["t/A"])
+        );
+    }
+
+    /// A load with co-keyed aggregates reads several types under one id: each
+    /// is its own stream, with its own routing key to look up.
+    #[test]
+    fn a_co_keyed_load_names_every_type_once() {
+        let co_keyed: Arc<[EventFilter]> = Arc::from(vec![
+            filter(Some("a"), Some("Opened")),
+            EventFilter {
+                aggregate_type: "t/B".into(),
+                aggregate_id: Some("a".into()),
+                name: None,
+            },
+            filter(Some("a"), Some("Deposited")),
+        ]);
+        assert_eq!(
+            target(&Some(co_keyed), &None, &default_tenant()),
+            aggregate("", "a", &["t/A", "t/B"])
         );
     }
 
     #[test]
     fn broad_scans_are_not_pinned() {
         let by_type: Arc<[EventFilter]> = Arc::from(vec![filter(None, Some("Opened"))]);
-        assert_eq!(target_key(&Some(by_type), &None, &default_tenant()), None);
+        assert_eq!(target(&Some(by_type), &None, &default_tenant()), None);
         let two_ids: Arc<[EventFilter]> =
             Arc::from(vec![filter(Some("a"), None), filter(Some("b"), None)]);
-        assert_eq!(target_key(&Some(two_ids), &None, &default_tenant()), None);
+        assert_eq!(target(&Some(two_ids), &None, &default_tenant()), None);
         let mixed: Arc<[EventFilter]> =
             Arc::from(vec![filter(Some("a"), None), filter(None, Some("Opened"))]);
-        assert_eq!(target_key(&Some(mixed), &None, &default_tenant()), None);
+        assert_eq!(target(&Some(mixed), &None, &default_tenant()), None);
         let empty: Arc<[EventFilter]> = Arc::from(Vec::<EventFilter>::new());
-        assert_eq!(target_key(&Some(empty), &None, &default_tenant()), None);
-        assert_eq!(target_key(&None, &None, &default_tenant()), None);
+        assert_eq!(target(&Some(empty), &None, &default_tenant()), None);
+        assert_eq!(target(&None, &None, &default_tenant()), None);
     }
 
     #[test]
@@ -145,12 +192,12 @@ mod target_key_tests {
         let two_ids: Arc<[EventFilter]> =
             Arc::from(vec![filter(Some("a"), None), filter(Some("b"), None)]);
         assert_eq!(
-            target_key(
+            target(
                 &Some(two_ids),
                 &Some(RoutingKey::Value(Some("region".into()))),
                 &default_tenant(),
             ),
-            Some(Key("region".into()))
+            Some(Target::Routed(Key("region".into())))
         );
     }
 
@@ -160,21 +207,20 @@ mod target_key_tests {
     fn a_tenant_read_pins_the_key_in_its_tenant() {
         let one: Arc<[EventFilter]> = Arc::from(vec![filter(Some("a"), None)]);
         let acme = TenantFilter::Only("acme".to_owned());
-        let pinned = target_key(&Some(one.clone()), &None, &acme);
+        assert_eq!(
+            target(&Some(one.clone()), &None, &acme),
+            aggregate("acme", "a", &["t/A"])
+        );
+        assert_eq!(target(&Some(one), &None, &TenantFilter::All), None);
         let written = Key::of(&Event {
             aggregate_id: "a".into(),
+            routing_key: Some("r".into()),
             tenant: "acme".into(),
             ..Default::default()
         });
-        assert_eq!(pinned, Some(written.clone()));
-        assert_ne!(
-            Some(written),
-            target_key(&Some(one.clone()), &None, &default_tenant())
-        );
-        assert_eq!(target_key(&Some(one), &None, &TenantFilter::All), None);
         assert_eq!(
-            target_key(&None, &Some(RoutingKey::Value(Some("r".into()))), &acme),
-            Some(Key::in_tenant("acme", "r"))
+            target(&None, &Some(RoutingKey::Value(Some("r".into()))), &acme),
+            Some(Target::Routed(written))
         );
     }
 }
@@ -475,6 +521,47 @@ impl<E: Executor + Clone> AccordExecutor<E> {
     pub fn node(&self) -> &Node {
         &self.node
     }
+
+    /// The keys a read of aggregate `id` conflicts on, as the write side
+    /// derives them ([`Key::of`]): each stream's routing key when it has one,
+    /// else its id, in `tenant`. One lookup per stream, in the local backend
+    /// (the stream's first event carries the key every later event inherits).
+    ///
+    /// A stream this node has not seen yet — brand new, or written elsewhere
+    /// and not applied here — is pinned where **this node would create it**:
+    /// under the local backend's default routing key, else its id. Nodes
+    /// sharing a default thus fence each other's new streams (set the default
+    /// on the backend the node wraps so it can see it). A new stream created
+    /// under *another* node's default is the one case a by-id read cannot
+    /// resolve: its reader must pass the routing key.
+    async fn conflict_keys(
+        &self,
+        tenant: &str,
+        id: &str,
+        types: &[&str],
+    ) -> anyhow::Result<Vec<Key>> {
+        let mut keys = Vec::with_capacity(types.len());
+        for aggregate_type in types {
+            let stream = self
+                .local
+                .stream_routing_key(
+                    tenant.to_owned(),
+                    (*aggregate_type).to_owned(),
+                    id.to_owned(),
+                )
+                .await?;
+            let base = match stream {
+                Some(Some(routing_key)) => routing_key,
+                Some(None) => id.to_owned(),
+                None => self.local.default_routing_key().unwrap_or(id).to_owned(),
+            };
+            let key = Key::in_tenant(tenant, &base);
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+        Ok(keys)
+    }
 }
 
 #[async_trait]
@@ -549,26 +636,62 @@ impl<E: Executor + Clone> Executor for AccordExecutor<E> {
         args: Args,
         to_micros: Option<u64>,
     ) -> anyhow::Result<ReadResult<Event>> {
-        // A single-shard read for a key this node does not own is forwarded to an
+        // A single-key read for a key this node does not own is forwarded to an
         // owner. Everything else (owned keys, and broad scans that can't be pinned
         // to one shard) is served from the local backend.
-        if let Some(key) = target_key(&aggregators, &routing_key, &tenant) {
-            if self.node.owns_key(&key) {
-                // Linearizable reads: fence the local backend with a read barrier
-                // (a read-only consensus round) so it reflects every write that
-                // committed before this read began, then serve locally. Off by
-                // default — reads stay local-only (serializable, not linearizable).
-                if self.node.linearizable_reads() {
-                    self.node.read_barrier(key).await?;
-                }
-            } else if let Some(owner) = self.node.an_owner_of(&key) {
-                // NOTE: a forwarded (non-owned, multi-shard) read is not yet
-                // linearized — the owner would need to barrier before serving.
-                return self
-                    .node
-                    .forward_read(owner, aggregators, routing_key, tenant, args, to_micros)
-                    .await;
+        let keys = match target(&aggregators, &routing_key, &tenant) {
+            None => Vec::new(),
+            Some(Target::Routed(key)) => vec![key],
+            // The key only matters where it decides something: a barrier, or
+            // which shard owns it. A single-shard node without linearizable
+            // reads owns every key and fences none, so it skips the lookup.
+            Some(Target::Aggregate { tenant, id, types })
+                if self.node.linearizable_reads() || self.node.sharded() =>
+            {
+                self.conflict_keys(tenant, id, &types).await?
             }
+            Some(Target::Aggregate { .. }) => Vec::new(),
+        };
+        match keys.as_slice() {
+            [] => {}
+            [key] => {
+                if self.node.owns_key(key) {
+                    // Linearizable reads: fence the local backend with a read barrier
+                    // (a read-only consensus round) so it reflects every write that
+                    // committed before this read began, then serve locally. Off by
+                    // default — reads stay local-only (serializable, not linearizable).
+                    if self.node.linearizable_reads() {
+                        self.node.read_barrier(key.clone()).await?;
+                    }
+                } else if let Some(owner) = self.node.an_owner_of(key) {
+                    // NOTE: a forwarded (non-owned, multi-shard) read is not yet
+                    // linearized — the owner would need to barrier before serving.
+                    return self
+                        .node
+                        .forward_read(
+                            owner,
+                            key.clone(),
+                            aggregators,
+                            routing_key,
+                            tenant,
+                            args,
+                            to_micros,
+                        )
+                        .await;
+                }
+            }
+            // Co-keyed streams under several routing keys: fence each one this
+            // node owns. No single owner serves them all, so a key this node
+            // does not own is read locally, like a broad scan.
+            keys if self.node.linearizable_reads() => {
+                try_join_all(
+                    keys.iter()
+                        .filter(|key| self.node.owns_key(key))
+                        .map(|key| self.node.read_barrier(key.clone())),
+                )
+                .await?;
+            }
+            _ => {}
         }
         self.local
             .read(aggregators, routing_key, tenant, args, to_micros)

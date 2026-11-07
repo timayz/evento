@@ -1284,6 +1284,7 @@ async fn a_joining_node_refuses_a_forwarded_read_until_it_has_joined() {
         .node
         .forward_read(
             NodeId(3),
+            evento_accord::Key("acc".into()),
             None,
             None,
             evento_core::TenantFilter::All,
@@ -1305,6 +1306,7 @@ async fn a_joining_node_refuses_a_forwarded_read_until_it_has_joined() {
         .node
         .forward_read(
             NodeId(3),
+            evento_accord::Key("acc".into()),
             None,
             None,
             evento_core::TenantFilter::All,
@@ -1369,6 +1371,7 @@ async fn a_node_told_to_rejoin_refuses_a_forwarded_read_at_once() {
         .node
         .forward_read(
             NodeId(2),
+            evento_accord::Key("acc".into()),
             None,
             None,
             evento_core::TenantFilter::All,

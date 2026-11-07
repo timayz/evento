@@ -751,6 +751,15 @@ quorum-preserving partition). Cost: one consensus round per read. Leave it off w
 serializable-but-possibly-stale reads are acceptable; turn it on for read-your-writes /
 real-time guarantees across nodes.
 
+The barrier fences the key the aggregate's **writes** conflict on: its routing key when
+the stream has one, else its id. A read by id (a projection load) looks that key up in
+the local store first. A stream the node has not seen yet is fenced where that node
+would create it — under the default routing key of the backend it wraps — so set the
+default on the wrapped backend (`AccordExecutor::new(node, Evento::new(store)
+.default_routing_key(..))`), not around the `AccordExecutor`, for nodes sharing a
+default to see each other's brand-new streams. A stream just created under *another*
+node's default is the one read a by-id load cannot fence: pass its routing key.
+
 ---
 
 ## 10. Pre-production checklist
