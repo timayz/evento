@@ -13,8 +13,18 @@
 //!
 //! # What a deployer touches
 //!
-//! The crate root holds everything one process needs to run one node of a
-//! cluster, and nothing else:
+//! One node, from its settings: [`Cluster::builder`] over a local store that
+//! is a [`ClusterBackend`] (`Turso`, `Sql`, `Fjall` under their `cluster`
+//! feature), with the `[cluster]` section of the configuration as
+//! [`Settings`] — or none, for a node alone. It binds the transport, derives
+//! the [`NodeConfig`], opens the journal colocated with the store, recovers
+//! the node or copies the store from a peer when it is marked for one, runs
+//! the inbox loop and the recovery sweep, and marks the store when the node
+//! must come back by copying it (told to rejoin, journal rolled back).
+//! [`Cluster::health`] is what a status page shows; see [`host`].
+//!
+//! Underneath, the crate root holds everything one process needs to run one
+//! node of a cluster by hand, and nothing else:
 //!
 //! - [`ClusterExecutor`] — the drop-in [`Executor`] — over an
 //!   [`ExecutorDataStore`] wrapping the local backend;
@@ -62,6 +72,7 @@ pub mod clock;
 pub mod executor;
 pub mod failure_detector;
 pub mod format;
+pub mod host;
 pub mod message;
 pub mod metrics;
 pub mod node;
@@ -78,6 +89,7 @@ pub use api::{
 pub use backend::ClusterBackend;
 pub use clock::{Clock, HybridLogicalClock, NodeId, MAX_SKEW_MICROS};
 pub use executor::{ClusterExecutor, ExecutorDataStore};
+pub use host::{Cluster, NodeHealth, PeerState, Settings};
 pub use metrics::{Metrics, MetricsSnapshot};
 pub use node::{
     BacklogAtCap, CommandTooLarge, CommitOutcome, FenceNotCovered, Invalidated, Joining,

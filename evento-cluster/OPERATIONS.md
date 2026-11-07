@@ -32,8 +32,36 @@ Worked, copy-pasteable deployments live in the examples:
 
 ## 2. Bootstrapping a cluster
 
-Each node needs: its `NodeId`, the membership, a transport bound to its address, a
-durable journal, and a local event store. Minimal shape (see
+**From settings.** `Cluster::builder` opens one node from the `[cluster]` section of
+the deployment's configuration (`evento_cluster::Settings`: `node_id`, `peers`,
+optional `listen`, `absent_after_secs`, `write_backlog`, `linearizable_reads`) over a
+local store that implements `ClusterBackend` (`Turso`, `Sql`, `Fjall` under their
+`cluster` feature); without a section it runs a node alone over the in-memory
+transport, so one binary serves both deployments:
+
+```rust
+let (cluster, executor) = Cluster::builder(store)   // Turso / Sql / Fjall
+    .settings(config.cluster)                        // Option<Settings>
+    .state_dir(&config.data_dir)                     // the rejoin mark lives here
+    .open()
+    .await?;
+// `executor`: a ClusterExecutor, the drop-in evento::Executor.
+// `cluster.health()`: this node for a status page; `cluster.shutdown()`: stop.
+```
+
+The host does what the rest of this section and §7 describe: the transport, the
+`NodeConfig` (linearizable reads and the absence limit only with peers), the journal
+colocated with the store, `recover_state` — or, when the store is marked for a copy,
+`empty_for_join` and the join through the other nodes — the inbox loop and the sweep,
+and the watch on `rejoin_signal` / `rolled_back_signal` that marks the store
+(`<state_dir>/rejoin`) and tells the operator to restart the node. A node told to
+rejoin, a rolled-back journal, a lost store (`Cluster::mark_for_rejoin`) or a lost
+journal (the open marks it itself) all come back the same way: restart. `Builder::node_config`
+adjusts the derived `NodeConfig`; `Builder::before_copy` runs what the application
+derives from the events (read models next to them) once the store was emptied.
+
+**By hand.** Each node needs: its `NodeId`, the membership, a transport bound to its
+address, a durable journal, and a local event store. Minimal shape (see
 `examples/bank-axum-cluster/src/main.rs::build_cluster_node`):
 
 ```rust
@@ -409,7 +437,10 @@ refuses anything else before a vote, and a node never installs it.
   never applied were compacted meanwhile, every message it sends is answered with
   `Message::Rejoin` instead: it logs an error, drops every message, refuses writes
   (`RejoinRequired`; `WriteError::Unavailable` through `ClusterExecutor`) and stays
-  like that until its host rejoins it. Watch `Node::rejoin_signal()` (or poll
+  like that until its host rejoins it. A node opened through `Cluster::builder` does
+  the rest itself: it marks its store (`<state_dir>/rejoin`, keep the journal), logs
+  that the node must be restarted, and its next open copies the store from a peer.
+  By hand: watch `Node::rejoin_signal()` (or poll
   `rejoin_required()`); when it turns `true`, `retire()` the node, abort **and await**
   its inbox loop and recovery task (the handles `start` and `start_recovery`
   returned), so nothing touches its store or journal any more, discard its event
@@ -559,7 +590,10 @@ refuses anything else before a vote, and a node never installs it.
   mark a peer saw, the node is told so (`RolledBack`) and stops taking part:
   `Node::rolled_back()` and `rolled_back_signal()` turn on, writes fail with
   `JournalRolledBack`, and `cluster_journals_rolled_back_total` counts it. **Retire it,
-  delete its journal and its store**, and bring it back as above (lost journal).
+  delete its journal and its store**, and bring it back as above (lost journal). A
+  node opened through `Cluster::builder` marks its store for that
+  (`<state_dir>/rejoin`, `discard-journal`) and logs that it must be restarted; the
+  next open discards the journal, empties the store and joins.
   - **Another journal under the node's id** is caught the same way, at its first
     report (#453): a node started plainly over an empty journal and store takes
     itself for a fresh replica and asks nobody, but its mark names a journal its
@@ -592,7 +626,10 @@ refuses anything else before a vote, and a node never installs it.
 
 A node that rejoins, or comes back with a lost store or journal, is built over its
 kept (or empty) journal and an **empty** event store, and opened by joining instead
-of `recover_state`:
+of `recover_state`. `Cluster::builder` does this whenever the store is marked
+(`RejoinMark`: by the host itself, or by `Cluster::mark_for_rejoin` for a lost
+store), emptying the store through `ClusterBackend::empty_for_join` first; the mark
+stays when the copy fails, so the next open tries again. By hand:
 
 ```rust,ignore
 let node = Node::new(id, topology, clock, sink, store, journal).with_config(config);

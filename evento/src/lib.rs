@@ -222,9 +222,10 @@ pub use evento_remote::Address as RemoteAddress;
 #[cfg(feature = "lock")]
 pub use evento_lock as lock;
 
-/// Clustered executor (requires `cluster` feature): node, topology, transports,
-/// clock, metrics, and the journal and data-store traits — what one process
-/// needs to run one node. The protocol's own types (transaction ids, command
+/// Clustered executor (requires `cluster` feature): `Cluster::builder` opens
+/// one node from its `Settings` over a `Turso`/`Sql`/`Fjall` store; underneath,
+/// the node, topology, transports, clock, metrics, and the journal and
+/// data-store traits — what one process needs to run one node. The protocol's own types (transaction ids, command
 /// state, wire messages, the records a journal persists) live under
 /// `cluster::protocol`; the journals the local backends implement live next to
 /// their executor: `fjall::FjallJournal`, `sql::SqlJournal`, `turso::TursoJournal`.
