@@ -101,12 +101,12 @@ use evento_core::{
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 use ulid::Ulid;
 
-/// A fjall-backed [`evento_accord::Journal`] (the Accord consensus log), behind the
-/// optional `accord` feature.
-#[cfg(feature = "accord")]
-mod accord_journal;
-#[cfg(feature = "accord")]
-pub use accord_journal::FjallJournal;
+/// A fjall-backed [`evento_cluster::Journal`] (the Accord consensus log), behind the
+/// optional `cluster` feature.
+#[cfg(feature = "cluster")]
+mod cluster_journal;
+#[cfg(feature = "cluster")]
+pub use cluster_journal::FjallJournal;
 
 /// Subscriber state stored in the database.
 #[derive(Debug, Clone, bitcode::Encode, bitcode::Decode)]
@@ -469,7 +469,7 @@ impl Fjall {
         if index_version != INDEX_VERSION {
             // Drop stale/partial index keyspaces before re-indexing. Only our
             // own named keyspaces — the database may be shared (e.g. with a
-            // `FjallJournal`'s `accord_*` keyspaces), so never wipe by
+            // `FjallJournal`'s `cluster_*` keyspaces), so never wipe by
             // discovery.
             for name in REBUILT_KEYSPACES {
                 if db.keyspace_exists(name) {

@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = true
-description = "Turso (in-process, async SQLite) executor and accord journal for the evento event sourcing library"
+description = "Turso (in-process, async SQLite) executor and cluster journal for the evento event sourcing library"
 documentation = "https://docs.rs/evento-turso"
 readme = "README.md"
 keywords.workspace = true
@@ -31,7 +31,7 @@ sea-query = { workspace = true, features = ["backend-sqlite", "thread-safe"] }
 turso.workspace = true
 tempfile = "3.27"
 tracing = { workspace = true, optional = true }
-evento-accord = { path = "../evento-accord", version = "2.0.0-alpha.38", optional = true }
+evento-cluster = { path = "../evento-cluster", version = "2.0.0-alpha.38", optional = true }
 
 [dev-dependencies]
 evento-test = { path = "../evento-test" }
@@ -42,13 +42,13 @@ tempfile = "3.27"
 default = ["rw", "macro"]
 rw = ["evento-core/rw"]
 macro = ["dep:evento-macro"]
-accord = ["dep:evento-accord"]
+cluster = ["dep:evento-cluster"]
 tracing = ["dep:tracing"]
 fts = ["turso/fts"]
 
 [[test]]
-name = "accord_journal"
-required-features = ["accord"]
+name = "cluster_journal"
+required-features = ["cluster"]
 
 [[test]]
 name = "fts"

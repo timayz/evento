@@ -2,7 +2,7 @@
 //! convention URL, `mysql://root:root@localhost:3306`). Each scenario runs in its own
 //! database for isolation. Gated by the `mysql` feature.
 
-use evento_accord::Journal;
+use evento_cluster::Journal;
 use evento_sql::SqlJournal;
 use sqlx::migrate::MigrateDatabase;
 use sqlx::{MySql, MySqlPool};
@@ -30,39 +30,39 @@ async fn fresh_with_pool(name: &str) -> (SqlJournal<MySql>, MySqlPool) {
 
 #[tokio::test]
 async fn round_trips_commands_metadata_and_acceptors() {
-    sql_support::round_trip(&fresh("accord_my_round_trip").await).await;
+    sql_support::round_trip(&fresh("cluster_my_round_trip").await).await;
 }
 
 #[tokio::test]
 async fn group_commit_batches_staged_writes() {
-    sql_support::group_commit(&fresh("accord_my_group_commit").await).await;
+    sql_support::group_commit(&fresh("cluster_my_group_commit").await).await;
 }
 
 #[tokio::test]
 async fn truncate_drops_below_the_watermark() {
-    sql_support::truncate(&fresh("accord_my_truncate").await).await;
+    sql_support::truncate(&fresh("cluster_my_truncate").await).await;
 }
 
 #[tokio::test]
 async fn flush_dedupes_restaged_txn() {
-    sql_support::flush_dedupes_restaged_txn(&fresh("accord_my_flush_dedupe").await).await;
+    sql_support::flush_dedupes_restaged_txn(&fresh("cluster_my_flush_dedupe").await).await;
 }
 
 #[tokio::test]
 async fn metadata_batch_append() {
-    sql_support::metadata_batch_append(&fresh("accord_my_meta_batch").await).await;
+    sql_support::metadata_batch_append(&fresh("cluster_my_meta_batch").await).await;
 }
 
 #[tokio::test]
 async fn routes_and_promises() {
-    sql_support::routes_and_promises(&fresh("accord_my_routes").await).await;
+    sql_support::routes_and_promises(&fresh("cluster_my_routes").await).await;
 }
 
 #[tokio::test]
 async fn failed_truncate_keeps_staged() {
-    let (journal, pool) = fresh_with_pool("accord_my_failed_truncate").await;
+    let (journal, pool) = fresh_with_pool("cluster_my_failed_truncate").await;
     sql_support::failed_truncate_keeps_staged(&journal, async {
-        sqlx::query("DROP TABLE accord_meta")
+        sqlx::query("DROP TABLE cluster_meta")
             .execute(&pool)
             .await
             .unwrap();
@@ -72,42 +72,42 @@ async fn failed_truncate_keeps_staged() {
 
 #[tokio::test]
 async fn truncate_races_flush() {
-    sql_support::truncate_races_flush(&fresh("accord_my_truncate_race").await).await;
+    sql_support::truncate_races_flush(&fresh("cluster_my_truncate_race").await).await;
 }
 
 #[tokio::test]
 async fn clock_bound() {
-    sql_support::clock_bound(&fresh("accord_my_clock_bound").await).await;
+    sql_support::clock_bound(&fresh("cluster_my_clock_bound").await).await;
 }
 
 #[tokio::test]
 async fn amnesia_fence() {
-    sql_support::amnesia_fence(&fresh("accord_my_amnesia_fence").await).await;
+    sql_support::amnesia_fence(&fresh("cluster_my_amnesia_fence").await).await;
 }
 
 #[tokio::test]
 async fn fences() {
-    sql_support::fences(&fresh("accord_my_fences").await).await;
+    sql_support::fences(&fresh("cluster_my_fences").await).await;
 }
 
 #[tokio::test]
 async fn vote_fence() {
-    sql_support::vote_fence(&fresh("accord_my_vote_fence").await).await;
+    sql_support::vote_fence(&fresh("cluster_my_vote_fence").await).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn copy_state_and_slot_gc() {
-    sql_support::copy_state_and_slot_gc(&fresh("accord_my_copy_state").await).await;
+    sql_support::copy_state_and_slot_gc(&fresh("cluster_my_copy_state").await).await;
 }
 
 #[tokio::test]
 async fn peer_marks() {
-    sql_support::peer_marks(&fresh("accord_my_peer_marks").await).await;
+    sql_support::peer_marks(&fresh("cluster_my_peer_marks").await).await;
 }
 
 #[tokio::test]
 async fn survives_reconnect() {
-    let name = "accord_my_reconnect";
+    let name = "cluster_my_reconnect";
     let b = command(200, 2);
     {
         let journal = fresh(name).await;

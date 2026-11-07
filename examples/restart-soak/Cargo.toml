@@ -5,7 +5,7 @@ edition.workspace = true
 publish = false
 
 [dependencies]
-evento = { workspace = true, features = ["sqlite", "accord"] }
+evento = { workspace = true, features = ["sqlite", "cluster"] }
 sqlx = { workspace = true, features = ["runtime-tokio", "sqlite"] }
 tokio.workspace = true
 ulid.workspace = true

@@ -1,6 +1,6 @@
 name: Nightly
 
-# Swarm testing of evento-accord's deterministic simulator (#319): fresh
+# Swarm testing of evento-cluster's deterministic simulator (#319): fresh
 # random seeds, each drawing its own cluster, faults, store, workload and
 # NodeConfig, for a fixed time — then the re-sharding swarm (#288), whose
 # seeds move the layout through replacements, additions, removals, splits,
@@ -43,7 +43,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build the simulator
-        run: cargo test -p evento-accord --release --test simulation --no-run
+        run: cargo test -p evento-cluster --release --test simulation --no-run
 
       - name: Swarm
         id: swarm
@@ -52,7 +52,7 @@ jobs:
           SIM_PLANT_FAILURE: ${{ inputs.plant_failure }}
         run: |
           set -o pipefail
-          cargo test -p evento-accord --release --test simulation swarm \
+          cargo test -p evento-cluster --release --test simulation swarm \
             -- --exact --ignored --nocapture 2>&1 | tee swarm.log
 
       - name: Re-sharding swarm
@@ -61,7 +61,7 @@ jobs:
           SIM_DURATION: ${{ inputs.reshard_duration || '900' }}
         run: |
           set -o pipefail
-          cargo test -p evento-accord --release --test simulation reshard_swarm \
+          cargo test -p evento-cluster --release --test simulation reshard_swarm \
             -- --exact --ignored --nocapture 2>&1 | tee -a swarm.log
 
       - name: Report the failing seed
@@ -70,7 +70,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          title="accord: nightly simulation failure"
+          title="cluster: nightly simulation failure"
           replay=$(grep -m1 '^replay: ' swarm.log | sed 's/^replay: //' || true)
           config=$(grep -m1 '^swarm config: \|^reshard seed ' swarm.log || true)
           {

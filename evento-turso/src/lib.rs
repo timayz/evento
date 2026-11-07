@@ -8,9 +8,9 @@
 //! - [`MIGRATIONS`] / [`migrate`] — the schema, applied by [`Turso::open`] or
 //!   by hand, recorded per app so an application's own migrations can share
 //!   the database.
-//! - [`TursoJournal`] (feature `accord`) — the accord consensus journal, in the
+//! - [`TursoJournal`] (feature `cluster`) — the cluster consensus journal, in the
 //!   same database as the events or in one of its own, with its own
-//!   [`ACCORD_MIGRATIONS`].
+//!   [`CLUSTER_MIGRATIONS`].
 //! - [`Reader`], [`Bind`], [`FromRow`], [`execute`] / [`fetch_all`] — your own
 //!   read models in the same database, with sea-query statements and keyset
 //!   pagination, as `evento_sql::Reader` offers on sqlx.
@@ -36,7 +36,7 @@
 //!   `fts_score(cols…, ?)` (every column of the index, then the query) to
 //!   filter and rank. Databases this crate opens then have Turso's
 //!   index-method support switched on (see [`Turso::builder`]).
-//! - `accord` — [`TursoJournal`] and [`ACCORD_MIGRATIONS`].
+//! - `cluster` — [`TursoJournal`] and [`CLUSTER_MIGRATIONS`].
 //! - `tracing` — logs from the migration runner.
 
 #![forbid(unsafe_code)]
@@ -52,11 +52,11 @@ mod reader;
 mod row;
 pub mod write;
 
-#[cfg(feature = "accord")]
-mod accord_journal;
+#[cfg(feature = "cluster")]
+mod cluster_journal;
 
-#[cfg(feature = "accord")]
-pub use accord_journal::TursoJournal;
+#[cfg(feature = "cluster")]
+pub use cluster_journal::TursoJournal;
 pub use executor::{Clock, Turso, BUSY_TIMEOUT};
 pub use query::{
     execute, fetch_all, fetch_one, fetch_optional, EventTable, MetaTable, SnapshotTable, Statement,
@@ -86,9 +86,9 @@ const INIT: Migration<'static> = up_file!("../migrations/0001_init.sql");
 const EVENT_TYPE_NAME_CURSOR: Migration<'static> =
     up_file!("../migrations/0003_event_type_name_cursor.sql");
 
-/// The accord journal's tables (feature `accord`).
-#[cfg(feature = "accord")]
-const ACCORD: Migration<'static> = up_file!("../migrations/0002_accord.sql");
+/// The cluster journal's tables (feature `cluster`).
+#[cfg(feature = "cluster")]
+const CLUSTER: Migration<'static> = up_file!("../migrations/0002_cluster.sql");
 
 /// The event store's schema migrations, under the app name `evento`;
 /// [`Turso::open`] applies the pending ones. Each applied migration is
@@ -97,9 +97,9 @@ const ACCORD: Migration<'static> = up_file!("../migrations/0002_accord.sql");
 pub const MIGRATIONS: Migrations<'static> =
     Migrations::new("evento", &[INIT, EVENT_TYPE_NAME_CURSOR]);
 
-/// The accord journal's schema migrations, under the app name
-/// `evento-accord`; every [`TursoJournal`] constructor applies the pending
+/// The cluster journal's schema migrations, under the app name
+/// `evento-cluster`; every [`TursoJournal`] constructor applies the pending
 /// ones. Independent of [`MIGRATIONS`], so a journal can live in the store's
 /// database or in one of its own.
-#[cfg(feature = "accord")]
-pub const ACCORD_MIGRATIONS: Migrations<'static> = Migrations::new("evento-accord", &[ACCORD]);
+#[cfg(feature = "cluster")]
+pub const CLUSTER_MIGRATIONS: Migrations<'static> = Migrations::new("evento-cluster", &[CLUSTER]);

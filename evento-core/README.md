@@ -14,7 +14,7 @@ evento = { version = "2.0.0-alpha.27", features = ["sqlite"] }
 ```
 
 Storage backends live in their own crates: `evento-sql` (SQLite/MySQL/PostgreSQL),
-`evento-fjall` (embedded), `evento-remote` (client/server TCP), and `evento-accord`
+`evento-fjall` (embedded), `evento-remote` (client/server TCP), and `evento-cluster`
 (consensus-replicated).
 
 ## Learn more

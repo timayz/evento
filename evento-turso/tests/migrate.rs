@@ -200,23 +200,23 @@ async fn the_crate_schema_applies_to_a_fresh_database() {
     );
 }
 
-#[cfg(feature = "accord")]
+#[cfg(feature = "cluster")]
 #[tokio::test]
 async fn the_journal_schema_applies_next_to_the_store_schema() {
     let store = evento_turso::Turso::in_memory().await.unwrap();
     let mut conn = store.database().connect().unwrap();
     assert_eq!(
-        evento_turso::ACCORD_MIGRATIONS
+        evento_turso::CLUSTER_MIGRATIONS
             .to_latest(&mut conn)
             .await
             .unwrap(),
         1
     );
     for table in [
-        "accord_commands",
-        "accord_meta",
-        "accord_metadata_log",
-        "accord_acceptors",
+        "cluster_commands",
+        "cluster_meta",
+        "cluster_metadata_log",
+        "cluster_acceptors",
     ] {
         conn.execute(&format!("SELECT * FROM {table} LIMIT 0"), ())
             .await

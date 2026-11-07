@@ -1,0 +1,1360 @@
+//! M4 — moving keys between shards (#288, #360). A change that adds a shard,
+//! or moves a replica to another shard, is a layout transition: the keys it
+//! moves drain under the old layout, every node gaining slots copies their
+//! events from a replica of the shard that held them, and only then does the
+//! new layout go live. The slot table moves only the slots the change needs.
+//! A node drops the slots a change takes from it once the change installs,
+//! and drops what it still holds for a slot a change gives it before copying
+//! it — so a change may give a node back slots it replicated before (#372).
+//! The nodes a change gives slots copy them before the change is decided,
+//! while writes still flow, so the copy under the fence brings only the tail
+//! (#373).
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use evento_cluster::{
+    CopyPhase, CopyState, DataStore, DynamicTopology, HybridLogicalClock, InMemoryDataStore,
+    InMemoryJournal, InMemoryNetwork, Journal, Key, LinkFilter, Message, MessageSink, Node,
+    NodeConfig, NodeId, ShardMap, Topology,
+};
+use evento_core::cursor::Args;
+use evento_core::{Event, EventFilter, TenantFilter};
+
+struct TestNode {
+    node: Node,
+    store: Arc<InMemoryDataStore>,
+    journal: Arc<InMemoryJournal>,
+    topology: Arc<DynamicTopology>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl TestNode {
+    /// Stops the node's tasks, as a crash would, keeping its store and
+    /// journal for a restart.
+    fn stop(&self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
+/// A node over `shards` at epoch 0, running the recovery sweep the drain and
+/// the copies are driven by.
+fn spawn_node(id: NodeId, shards: Vec<Vec<NodeId>>, net: &Arc<InMemoryNetwork>) -> TestNode {
+    spawn_node_cfg(id, shards, net, NodeConfig::default())
+}
+
+/// [`spawn_node`] with `config`.
+fn spawn_node_cfg(
+    id: NodeId,
+    shards: Vec<Vec<NodeId>>,
+    net: &Arc<InMemoryNetwork>,
+    config: NodeConfig,
+) -> TestNode {
+    spawn_node_over_cfg(
+        id,
+        shards,
+        net,
+        Arc::new(InMemoryDataStore::new()),
+        Arc::new(InMemoryJournal::new()),
+        config,
+    )
+}
+
+/// The settings the pre-seed tests run with: short rounds, so a change whose
+/// Paxos round is cut off gives up quickly.
+fn quick() -> NodeConfig {
+    NodeConfig {
+        collect_timeout: Duration::from_millis(500),
+        preseed_timeout: Duration::from_secs(5),
+        ..NodeConfig::default()
+    }
+}
+
+/// A node over `shards` at epoch 0, over `store` and `journal` — a restart,
+/// when they held a node before. Not recovered: call `recover_state` before
+/// `start_tasks` when the journal holds something.
+fn spawn_node_over(
+    id: NodeId,
+    shards: Vec<Vec<NodeId>>,
+    net: &Arc<InMemoryNetwork>,
+    store: Arc<InMemoryDataStore>,
+    journal: Arc<InMemoryJournal>,
+) -> TestNode {
+    spawn_node_over_cfg(id, shards, net, store, journal, NodeConfig::default())
+}
+
+/// [`spawn_node_over`] with `config`.
+fn spawn_node_over_cfg(
+    id: NodeId,
+    shards: Vec<Vec<NodeId>>,
+    net: &Arc<InMemoryNetwork>,
+    store: Arc<InMemoryDataStore>,
+    journal: Arc<InMemoryJournal>,
+    config: NodeConfig,
+) -> TestNode {
+    let clock = Arc::new(HybridLogicalClock::new(id));
+    let sink: Arc<dyn MessageSink> = Arc::new(net.sink(id));
+    let topology = Arc::new(DynamicTopology::new(id, 0, shards));
+    let node = Node::new(
+        id,
+        topology.clone() as Arc<dyn Topology>,
+        clock,
+        sink,
+        Arc::clone(&store) as Arc<dyn DataStore>,
+        Arc::clone(&journal) as Arc<dyn Journal>,
+    )
+    .with_config(config);
+    let inbox = net.register(id);
+    let tasks = vec![node.start(inbox), node.start_recovery()];
+    TestNode {
+        node,
+        store,
+        journal,
+        topology,
+        tasks,
+    }
+}
+
+/// A node restarted over `store` and `journal`, its `DynamicTopology` built
+/// at `epoch` over `shards` — as its host builds it — and recovered from the
+/// journal before it serves.
+async fn restart_node_at(
+    id: NodeId,
+    epoch: u64,
+    shards: Vec<Vec<NodeId>>,
+    net: &Arc<InMemoryNetwork>,
+    store: Arc<InMemoryDataStore>,
+    journal: Arc<InMemoryJournal>,
+    config: NodeConfig,
+) -> TestNode {
+    let clock = Arc::new(HybridLogicalClock::new(id));
+    let sink: Arc<dyn MessageSink> = Arc::new(net.sink(id));
+    let topology = Arc::new(DynamicTopology::new(id, epoch, shards));
+    let node = Node::new(
+        id,
+        topology.clone() as Arc<dyn Topology>,
+        clock,
+        sink,
+        Arc::clone(&store) as Arc<dyn DataStore>,
+        Arc::clone(&journal) as Arc<dyn Journal>,
+    )
+    .with_config(config);
+    let inbox = net.register(id);
+    node.recover_state()
+        .await
+        .expect("recovers from its journal");
+    let tasks = vec![node.start(inbox), node.start_recovery()];
+    TestNode {
+        node,
+        store,
+        journal,
+        topology,
+        tasks,
+    }
+}
+
+fn ids(nodes: &[u64]) -> Vec<NodeId> {
+    nodes.iter().copied().map(NodeId).collect()
+}
+
+fn event(aggregate_id: &str, version: u16, name: &str) -> Event {
+    Event {
+        id: ulid::Ulid::generate(),
+        aggregate_type: "test/Account".into(),
+        aggregate_id: aggregate_id.into(),
+        version,
+        name: name.into(),
+        ..Default::default()
+    }
+}
+
+/// The versions `store` holds for `aggregate_id`, ascending.
+fn versions_of(store: &InMemoryDataStore, aggregate_id: &str) -> Vec<u16> {
+    let mut versions: Vec<u16> = store
+        .committed_events()
+        .into_iter()
+        .filter(|((_, _, id, _), _)| id == aggregate_id)
+        .map(|((_, _, _, version), _)| version)
+        .collect();
+    versions.sort_unstable();
+    versions
+}
+
+async fn await_versions(store: &InMemoryDataStore, aggregate_id: &str, versions: &[u16]) {
+    for _ in 0..2_000 {
+        if versions_of(store, aggregate_id) == versions {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!(
+        "{aggregate_id}: {:?}, not {versions:?}",
+        versions_of(store, aggregate_id)
+    );
+}
+
+async fn await_epoch(topology: &DynamicTopology, epoch: u64) {
+    for _ in 0..2_000 {
+        if topology.epoch() >= epoch {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("topology did not reach epoch {epoch}");
+}
+
+/// An aggregate id whose key is in `shard` under `map`.
+fn id_in_shard(map: &ShardMap, shard: usize, prefix: &str) -> String {
+    let probe = evento_cluster::Layout::from_map(0, map.clone());
+    for i in 0..100_000 {
+        let id = format!("{prefix}-{i}");
+        if probe.shard_of(&Key(id.clone())) == shard {
+            return id;
+        }
+    }
+    panic!("no id found for shard {shard}");
+}
+
+/// A single shard splits in two. The new shard's nodes copy only the slots
+/// they gain during the transition — a key that stays is not copied — and a
+/// moved key's writes then go to its new replicas, with its versions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_key_range_moves_to_a_new_shard() {
+    let net = InMemoryNetwork::new();
+    let abc = ids(&[0, 1, 2]);
+    let def = ids(&[3, 4, 5]);
+    let split = ShardMap::even(vec![abc.clone()]).rebalanced(vec![abc.clone(), def.clone()]);
+    let stay = id_in_shard(&split, 0, "stay");
+    let moved = id_in_shard(&split, 1, "move");
+
+    let founders: Vec<TestNode> = abc
+        .iter()
+        .map(|&id| spawn_node(id, vec![abc.clone()], &net))
+        .collect();
+    founders[0]
+        .node
+        .write(vec![event(&stay, 1, "Opened")])
+        .await
+        .unwrap();
+    founders[0]
+        .node
+        .write(vec![event(&moved, 1, "Opened")])
+        .await
+        .unwrap();
+
+    let newcomers: Vec<TestNode> = def
+        .iter()
+        .map(|&id| spawn_node(id, vec![abc.clone()], &net))
+        .collect();
+    for n in &newcomers {
+        n.node.begin_join();
+    }
+
+    let installed = tokio::time::timeout(
+        Duration::from_secs(30),
+        founders[0]
+            .node
+            .change_topology(1, vec![abc.clone(), def.clone()]),
+    )
+    .await
+    .expect("the change ends in bounded time")
+    .expect("the split installs");
+    assert_eq!(installed, vec![abc.clone(), def.clone()]);
+    assert_eq!(
+        founders[0].topology.epoch(),
+        2,
+        "a transition, then the split"
+    );
+    for n in founders.iter().chain(&newcomers) {
+        await_epoch(&n.topology, 2).await;
+    }
+
+    // Each new node copied the moved key, not the one that stayed; a join
+    // has nothing left to do.
+    for n in &newcomers {
+        assert_eq!(versions_of(&n.store, &moved), vec![1]);
+        assert!(
+            versions_of(&n.store, &stay).is_empty(),
+            "the stayed key moved"
+        );
+        assert_eq!(n.node.join(NodeId(3)).await.unwrap(), 0);
+    }
+
+    // A write to the moved key now goes to the new shard.
+    let outcome = newcomers[0]
+        .node
+        .write(vec![event(&moved, 2, "Deposited")])
+        .await
+        .unwrap();
+    assert!(!outcome.conflict);
+    for n in &newcomers {
+        await_versions(&n.store, &moved, &[1, 2]).await;
+    }
+    // The stayed key still works on the original shard.
+    let stayed = founders[0]
+        .node
+        .write(vec![event(&stay, 2, "Deposited")])
+        .await
+        .unwrap();
+    assert!(!stayed.conflict);
+    // The moved key's version state came with it.
+    let stale = newcomers[1]
+        .node
+        .write(vec![event(&moved, 2, "Again")])
+        .await
+        .unwrap();
+    assert!(stale.conflict, "the moved key's version state followed it");
+
+    // A write on the moved key orders after every moved one: its events
+    // stamp past them (the activation's clock floor).
+    await_versions(&newcomers[2].store, &moved, &[1, 2]).await;
+    let events = DataStore::snapshot(newcomers[2].store.as_ref())
+        .await
+        .unwrap();
+    let stamp = |version: u16| {
+        events
+            .iter()
+            .find(|e| e.aggregate_id == moved && e.version == version)
+            .map(|e| (e.timestamp, e.timestamp_subsec))
+            .unwrap()
+    };
+    assert!(stamp(2) > stamp(1));
+}
+
+/// Two shards split into three: the new shard takes a third of the slots,
+/// from both old shards, and copies them from each; nothing else moves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn two_shards_split_into_three_move_only_their_slots() {
+    let net = InMemoryNetwork::new();
+    let before = vec![ids(&[0, 1, 2]), ids(&[3, 4, 5])];
+    let after = vec![ids(&[0, 1, 2]), ids(&[3, 4, 5]), ids(&[6, 7, 8])];
+    let old = ShardMap::even(before.clone());
+    let new = old.rebalanced(after.clone());
+    let probe = |map: &ShardMap, id: &str| {
+        evento_cluster::Layout::from_map(0, map.clone()).shard_of(&Key(id.to_owned()))
+    };
+    // A key staying in each old shard, and one moving from each.
+    let mut keys: Vec<(String, usize, usize)> = Vec::new();
+    for i in 0..10_000 {
+        let id = format!("acc-{i}");
+        let (from, to) = (probe(&old, &id), probe(&new, &id));
+        if !keys.iter().any(|(_, f, t)| (*f, *t) == (from, to)) {
+            keys.push((id, from, to));
+        }
+        if keys.len() == 4 {
+            break;
+        }
+    }
+    assert_eq!(keys.len(), 4, "{keys:?}");
+
+    let nodes: Vec<TestNode> = (0..9)
+        .map(|id| spawn_node(NodeId(id), before.clone(), &net))
+        .collect();
+    for n in &nodes[6..] {
+        n.node.begin_join();
+    }
+    for (id, _, _) in &keys {
+        nodes[0]
+            .node
+            .write(vec![event(id, 1, "Opened")])
+            .await
+            .unwrap();
+    }
+    let installed = tokio::time::timeout(
+        Duration::from_secs(30),
+        nodes[0].node.change_topology(1, after.clone()),
+    )
+    .await
+    .expect("the change ends in bounded time")
+    .expect("the split installs");
+    assert_eq!(installed, after);
+    for n in &nodes {
+        await_epoch(&n.topology, 2).await;
+    }
+    for (id, from, to) in &keys {
+        for n in &nodes[6..] {
+            let held = versions_of(&n.store, id);
+            if *to == 2 {
+                assert_eq!(
+                    held,
+                    vec![1],
+                    "{id} moved from shard {from} to the new shard"
+                );
+            } else {
+                assert!(held.is_empty(), "{id} stayed in shard {from}");
+            }
+        }
+        let outcome = nodes[0]
+            .node
+            .write(vec![event(id, 2, "Bumped")])
+            .await
+            .unwrap();
+        assert!(!outcome.conflict, "{id}: its versions came with it");
+    }
+}
+
+/// An existing member moves to the other shard: it copies that shard's keys
+/// during the transition, while still serving its own until the change goes
+/// live, and enforces the versions it copied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn an_existing_member_gains_a_range_with_its_versions() {
+    let net = InMemoryNetwork::new();
+    let before = vec![ids(&[0, 1, 2]), ids(&[3, 4, 5])];
+    let map = ShardMap::even(before.clone());
+    let left = id_in_shard(&map, 0, "left");
+    let right = id_in_shard(&map, 1, "right");
+    let nodes: Vec<TestNode> = (0..7)
+        .map(|id| spawn_node(NodeId(id), before.clone(), &net))
+        .collect();
+    nodes[6].node.begin_join();
+    for (id, version) in [(&left, 1), (&right, 1), (&right, 2)] {
+        nodes[0]
+            .node
+            .write(vec![event(id, version, "Bumped")])
+            .await
+            .unwrap();
+    }
+
+    // Node 2 moves to the second shard, replacing 5; node 6 takes its place.
+    let after = vec![ids(&[0, 1, 6]), ids(&[3, 4, 2])];
+    let installed = tokio::time::timeout(
+        Duration::from_secs(30),
+        nodes[0].node.change_topology(1, after.clone()),
+    )
+    .await
+    .expect("the change ends in bounded time")
+    .expect("the change installs");
+    assert_eq!(installed, after);
+    await_epoch(&nodes[2].topology, 2).await;
+    assert!(nodes[2].node.owns_key(&Key(right.clone())));
+    assert!(!nodes[2].node.owns_key(&Key(left.clone())));
+    await_versions(&nodes[2].store, &right, &[1, 2]).await;
+    await_versions(&nodes[6].store, &left, &[1]).await;
+    // The slot node 2 left goes from its store once the change installed.
+    await_versions(&nodes[2].store, &left, &[]).await;
+
+    let stale = nodes[2]
+        .node
+        .write(vec![event(&right, 2, "Again")])
+        .await
+        .unwrap();
+    assert!(stale.conflict, "the copied versions are enforced");
+    let fresh = nodes[2]
+        .node
+        .write(vec![event(&right, 3, "Bumped")])
+        .await
+        .unwrap();
+    assert!(!fresh.conflict);
+    for n in [3usize, 4, 2] {
+        await_versions(&nodes[n].store, &right, &[1, 2, 3]).await;
+    }
+}
+
+/// A node gets back a slot it replicated before (#372): what it still held
+/// for the slot was dropped when the change that took it installed, and it
+/// drops whatever is left before copying, so the copy brings the slot's
+/// whole history — the writes from after it left included — and the
+/// versions it enforces are the slot's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_node_regains_its_slots() {
+    let net = InMemoryNetwork::new();
+    let before = vec![ids(&[0, 1, 2]), ids(&[3, 4, 5])];
+    let map = ShardMap::even(before.clone());
+    let left = id_in_shard(&map, 0, "left");
+    let right = id_in_shard(&map, 1, "right");
+    let nodes: Vec<TestNode> = (0..7)
+        .map(|id| spawn_node(NodeId(id), before.clone(), &net))
+        .collect();
+    nodes[6].node.begin_join();
+    for (id, version) in [(&left, 1), (&right, 1)] {
+        nodes[0]
+            .node
+            .write(vec![event(id, version, "Bumped")])
+            .await
+            .unwrap();
+    }
+
+    // Node 2 moves to the second shard, replacing 5; node 6 takes its place.
+    let moved = vec![ids(&[0, 1, 6]), ids(&[3, 4, 2])];
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        nodes[0].node.change_topology(1, moved),
+    )
+    .await
+    .expect("the change ends in bounded time")
+    .expect("node 2 moves");
+    await_epoch(&nodes[2].topology, 2).await;
+    await_versions(&nodes[2].store, &right, &[1]).await;
+    await_versions(&nodes[2].store, &left, &[]).await;
+    // The slot moves on without node 2.
+    nodes[0]
+        .node
+        .write(vec![event(&left, 2, "Bumped")])
+        .await
+        .unwrap();
+    await_versions(&nodes[6].store, &left, &[1, 2]).await;
+
+    // Node 2 comes back to the first shard, and node 6 goes to the second.
+    let back = vec![ids(&[0, 1, 2]), ids(&[3, 4, 6])];
+    let installed = tokio::time::timeout(
+        Duration::from_secs(30),
+        nodes[0].node.change_topology(3, back.clone()),
+    )
+    .await
+    .expect("the change ends in bounded time")
+    .expect("node 2 regains shard 0's slots");
+    assert_eq!(installed, back);
+    await_epoch(&nodes[2].topology, 4).await;
+    assert!(nodes[2].node.owns_key(&Key(left.clone())));
+    await_versions(&nodes[2].store, &left, &[1, 2]).await;
+    await_versions(&nodes[2].store, &right, &[]).await;
+    await_versions(&nodes[6].store, &right, &[1]).await;
+    await_versions(&nodes[6].store, &left, &[]).await;
+
+    let stale = nodes[2]
+        .node
+        .write(vec![event(&left, 2, "Again")])
+        .await
+        .unwrap();
+    assert!(stale.conflict, "the regained versions are enforced");
+    let fresh = nodes[2]
+        .node
+        .write(vec![event(&left, 3, "Bumped")])
+        .await
+        .unwrap();
+    assert!(!fresh.conflict);
+    for n in [0usize, 1, 2] {
+        await_versions(&nodes[n].store, &left, &[1, 2, 3]).await;
+    }
+}
+
+/// A read forwarded to a node for a key a change took from it fails, rather
+/// than answering from a store that dropped the key (an empty page would
+/// read as "no such events").
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_forwarded_read_of_a_key_this_node_lost_fails() {
+    let net = InMemoryNetwork::new();
+    let before = vec![ids(&[0, 1, 2]), ids(&[3, 4, 5])];
+    let map = ShardMap::even(before.clone());
+    let left = id_in_shard(&map, 0, "left");
+    let nodes: Vec<TestNode> = (0..7)
+        .map(|id| spawn_node(NodeId(id), before.clone(), &net))
+        .collect();
+    nodes[6].node.begin_join();
+    nodes[0]
+        .node
+        .write(vec![event(&left, 1, "Bumped")])
+        .await
+        .unwrap();
+    let moved = vec![ids(&[0, 1, 6]), ids(&[3, 4, 2])];
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        nodes[0].node.change_topology(1, moved),
+    )
+    .await
+    .expect("the change ends in bounded time")
+    .expect("node 2 moves");
+    await_epoch(&nodes[2].topology, 2).await;
+    await_versions(&nodes[2].store, &left, &[]).await;
+
+    let mut reader = net.register(NodeId(9));
+    let forward = |id| Message::ReadForward {
+        id,
+        key: Key::in_tenant("", &left),
+        aggregators: Some(vec![EventFilter::by_id_raw("test/Account", left.clone())]),
+        routing_key: None,
+        tenant: TenantFilter::Only(String::new()),
+        args: Args::forward(10, None),
+        to_micros: None,
+    };
+    for (to, id) in [(2u64, 1u64), (0, 2)] {
+        net.sink(NodeId(9))
+            .send(NodeId(to), forward(id))
+            .await
+            .unwrap();
+    }
+    let mut replies = Vec::new();
+    for _ in 0..2 {
+        let env = tokio::time::timeout(Duration::from_secs(5), reader.recv())
+            .await
+            .expect("a reply comes")
+            .expect("the network is up");
+        replies.push((env.from, env.message));
+    }
+    replies.sort_by_key(|(from, _)| from.0);
+    assert!(
+        matches!(&replies[0], (NodeId(0), Message::ReadReply { id: 2, .. })),
+        "an owner answers the read: {:?}",
+        replies[0]
+    );
+    match &replies[1] {
+        (NodeId(2), Message::ReadFailed { id: 1, reason }) => {
+            assert!(reason.contains("not an owner"), "{reason}");
+        }
+        other => panic!("node 2 should refuse the read: {other:?}"),
+    }
+}
+
+/// A node restarted over its journal after a change took a slot from it does
+/// not replay the slot's writes into its store: the journal still holds them
+/// applied, the store dropped them, and only the keys the node owns under
+/// the layout it restored land in the store again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_restarted_loser_does_not_replay_dropped_slots() {
+    let net = InMemoryNetwork::new();
+    let before = vec![ids(&[0, 1, 2]), ids(&[3, 4, 5])];
+    let map = ShardMap::even(before.clone());
+    let left = id_in_shard(&map, 0, "left");
+    let right = id_in_shard(&map, 1, "right");
+    let mut nodes: Vec<TestNode> = (0..7)
+        .map(|id| spawn_node(NodeId(id), before.clone(), &net))
+        .collect();
+    nodes[6].node.begin_join();
+    for (id, version) in [(&left, 1), (&right, 1)] {
+        nodes[0]
+            .node
+            .write(vec![event(id, version, "Bumped")])
+            .await
+            .unwrap();
+    }
+    await_versions(&nodes[2].store, &left, &[1]).await;
+    let moved = vec![ids(&[0, 1, 6]), ids(&[3, 4, 2])];
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        nodes[0].node.change_topology(1, moved),
+    )
+    .await
+    .expect("the change ends in bounded time")
+    .expect("node 2 moves");
+    await_epoch(&nodes[2].topology, 2).await;
+    await_versions(&nodes[2].store, &right, &[1]).await;
+    await_versions(&nodes[2].store, &left, &[]).await;
+    for _ in 0..2_000 {
+        if nodes[2].journal.load_slot_gc().await.unwrap() == Some(2) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        nodes[2].journal.load_slot_gc().await.unwrap(),
+        Some(2),
+        "the drop is journaled with the epoch it ran for"
+    );
+
+    // Node 2 restarts over its store and journal.
+    nodes[2].stop();
+    let store = Arc::clone(&nodes[2].store);
+    let journal = Arc::clone(&nodes[2].journal);
+    let restarted = spawn_node_over(NodeId(2), before.clone(), &net, store, journal);
+    for task in &restarted.tasks {
+        task.abort();
+    }
+    restarted.node.recover_state().await.expect("recovers");
+    assert_eq!(restarted.topology.epoch(), 2, "the layout comes back");
+    assert_eq!(
+        versions_of(&restarted.store, &left),
+        Vec::<u16>::new(),
+        "the dropped slot stays dropped after the replay"
+    );
+    assert_eq!(versions_of(&restarted.store, &right), vec![1]);
+    nodes[2] = restarted;
+}
+
+/// A join goes through a replica of the joiner's own shard only (#360): a
+/// contact in another shard holds none of what it must copy, and its floor
+/// is its own shard's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_join_through_another_shards_replica_is_refused() {
+    let net = InMemoryNetwork::new();
+    let before = vec![ids(&[0, 1, 2]), ids(&[3, 4, 5])];
+    let nodes: Vec<TestNode> = (0..7)
+        .map(|id| spawn_node(NodeId(id), before.clone(), &net))
+        .collect();
+    nodes[6].node.begin_join();
+    // One replica added to the first shard installs at once, and node 6
+    // joins after it.
+    nodes[0]
+        .node
+        .change_topology(1, vec![ids(&[0, 1, 2, 6]), ids(&[3, 4, 5])])
+        .await
+        .unwrap();
+    await_epoch(&nodes[6].topology, 1).await;
+    let err = nodes[6]
+        .node
+        .join(NodeId(3))
+        .await
+        .expect_err("node 3 is in the other shard");
+    assert!(err.to_string().contains("no replica"), "{err:#}");
+    nodes[6]
+        .node
+        .join(NodeId(0))
+        .await
+        .expect("joins through its shard");
+}
+
+/// A node a change gives slots copies them before the change is decided
+/// (#373): while the driver's Paxos round is cut off, the gainers already
+/// hold the moved keys' events and no epoch has moved; once the change goes
+/// through, the copy under the fence has nothing left to bring.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_gainer_pre_seeds_before_the_change_is_decided() {
+    let net = InMemoryNetwork::new();
+    let before = vec![ids(&[0, 1, 2]), ids(&[3, 4, 5])];
+    let map = ShardMap::even(before.clone());
+    let left = id_in_shard(&map, 0, "left");
+    let right = id_in_shard(&map, 1, "right");
+    let nodes: Vec<TestNode> = (0..7)
+        .map(|id| spawn_node_cfg(NodeId(id), before.clone(), &net, quick()))
+        .collect();
+    nodes[6].node.begin_join();
+    for (id, version) in [(&left, 1), (&right, 1), (&right, 2)] {
+        nodes[0]
+            .node
+            .write(vec![event(id, version, "Bumped")])
+            .await
+            .unwrap();
+    }
+
+    // Nothing the driver proposes gets through: the change is not decided.
+    let no_paxos: LinkFilter = Arc::new(|from, _, message| {
+        from == NodeId(0) && matches!(message, Message::ConfigPrepare { .. })
+    });
+    net.set_link_filter(Some(no_paxos));
+    let moved = vec![ids(&[0, 1, 6]), ids(&[3, 4, 2])];
+    let driver = nodes[0].node.clone();
+    let to = moved.clone();
+    let change = tokio::spawn(async move { driver.change_topology(1, to).await });
+    // Node 2 (moving to the second shard) and node 6 (replacing it) hold the
+    // slots they would gain, with no epoch decided.
+    await_versions(&nodes[2].store, &right, &[1, 2]).await;
+    await_versions(&nodes[6].store, &left, &[1]).await;
+    assert_eq!(nodes[0].topology.epoch(), 0, "nothing decided yet");
+    assert_eq!(nodes[2].topology.epoch(), 0);
+    assert!(nodes[2].node.metrics().preseed_passes >= 1);
+    assert_eq!(nodes[2].node.metrics().preseed_events, 2);
+    assert_eq!(nodes[6].node.metrics().preseed_events, 1);
+
+    net.set_link_filter(None);
+    let installed = match tokio::time::timeout(Duration::from_secs(30), change).await {
+        Ok(Ok(Ok(installed))) => installed,
+        // The cut-off round gave up: proposed again, the pre-seed is done.
+        _ => tokio::time::timeout(
+            Duration::from_secs(30),
+            nodes[0].node.change_topology(1, moved.clone()),
+        )
+        .await
+        .expect("the change ends in bounded time")
+        .expect("the change installs"),
+    };
+    assert_eq!(installed, moved);
+    await_epoch(&nodes[2].topology, 2).await;
+    await_versions(&nodes[2].store, &right, &[1, 2]).await;
+    assert_eq!(
+        nodes[2].node.metrics().range_copy_events,
+        0,
+        "the copy under the fence had nothing left to bring"
+    );
+    assert_eq!(nodes[6].node.metrics().range_copy_events, 0);
+    let fresh = nodes[2]
+        .node
+        .write(vec![event(&right, 3, "Bumped")])
+        .await
+        .unwrap();
+    assert!(!fresh.conflict, "the pre-seeded versions are enforced");
+}
+
+/// A pre-seed for a change that never goes through leaves events for slots
+/// the node does not own; the next activation drops them (#373).
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_pre_seed_that_never_becomes_owner_is_dropped_at_the_next_activation() {
+    let net = InMemoryNetwork::new();
+    let before = vec![ids(&[0, 1, 2]), ids(&[3, 4, 5])];
+    let map = ShardMap::even(before.clone());
+    let left = id_in_shard(&map, 0, "left");
+    let right = id_in_shard(&map, 1, "right");
+    let nodes: Vec<TestNode> = (0..7)
+        .map(|id| spawn_node_cfg(NodeId(id), before.clone(), &net, quick()))
+        .collect();
+    nodes[6].node.begin_join();
+    for (id, version) in [(&left, 1), (&right, 1)] {
+        nodes[0]
+            .node
+            .write(vec![event(id, version, "Bumped")])
+            .await
+            .unwrap();
+    }
+    let no_paxos: LinkFilter = Arc::new(|from, _, message| {
+        from == NodeId(0) && matches!(message, Message::ConfigPrepare { .. })
+    });
+    net.set_link_filter(Some(no_paxos));
+    // Node 6 would replace node 2 in the first shard: it pre-seeds `left`.
+    let driver = nodes[0].node.clone();
+    let change = tokio::spawn(async move {
+        driver
+            .change_topology(1, vec![ids(&[0, 1, 6]), ids(&[3, 4, 2])])
+            .await
+    });
+    await_versions(&nodes[6].store, &left, &[1]).await;
+    // The change never goes through: the driver gives up.
+    change.abort();
+    let _ = change.await;
+    net.set_link_filter(None);
+
+    // Another change puts node 6 in the second shard instead.
+    let other = vec![ids(&[0, 1, 2]), ids(&[3, 4, 6])];
+    let installed = tokio::time::timeout(
+        Duration::from_secs(30),
+        nodes[0].node.change_topology(1, other.clone()),
+    )
+    .await
+    .expect("the change ends in bounded time")
+    .expect("the change installs");
+    assert_eq!(installed, other);
+    await_epoch(&nodes[6].topology, 2).await;
+    await_versions(&nodes[6].store, &right, &[1]).await;
+    await_versions(&nodes[6].store, &left, &[]).await;
+}
+
+/// A gainer that does not answer the pre-seed in time does not hold the
+/// change back: it is proposed anyway, and the copy under the fence brings
+/// the slots (#373).
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_pre_seed_timeout_does_not_block_the_change() {
+    let net = InMemoryNetwork::new();
+    let before = vec![ids(&[0, 1, 2]), ids(&[3, 4, 5])];
+    let map = ShardMap::even(before.clone());
+    let right = id_in_shard(&map, 1, "right");
+    let config = NodeConfig {
+        preseed_timeout: Duration::from_millis(500),
+        ..quick()
+    };
+    let nodes: Vec<TestNode> = (0..7)
+        .map(|id| spawn_node_cfg(NodeId(id), before.clone(), &net, config))
+        .collect();
+    nodes[6].node.begin_join();
+    for version in [1, 2] {
+        nodes[0]
+            .node
+            .write(vec![event(&right, version, "Bumped")])
+            .await
+            .unwrap();
+    }
+    // No pre-seed reaches the gainers.
+    let no_preseed: LinkFilter =
+        Arc::new(|_, _, message| matches!(message, Message::Preseed { .. }));
+    net.set_link_filter(Some(no_preseed));
+    let moved = vec![ids(&[0, 1, 6]), ids(&[3, 4, 2])];
+    let installed = tokio::time::timeout(
+        Duration::from_secs(30),
+        nodes[0].node.change_topology(1, moved.clone()),
+    )
+    .await
+    .expect("the change ends in bounded time")
+    .expect("the change installs");
+    assert_eq!(installed, moved);
+    assert_eq!(nodes[0].node.metrics().preseeds_timed_out, 2);
+    await_epoch(&nodes[2].topology, 2).await;
+    await_versions(&nodes[2].store, &right, &[1, 2]).await;
+    assert_eq!(nodes[2].node.metrics().preseed_passes, 0);
+    assert_eq!(
+        nodes[2].node.metrics().range_copy_events,
+        2,
+        "the copy under the fence brought the slots"
+    );
+}
+
+/// A pre-seed for a change that is not decided in time expires (#373): the
+/// slots it brought in, which the node does not own, go like any other, and
+/// the record stands at "dropped", so the change — should it come after all
+/// — copies under the fence without dropping again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_pre_seed_for_a_change_that_never_came_expires() {
+    let net = InMemoryNetwork::new();
+    let before = vec![ids(&[0, 1, 2]), ids(&[3, 4, 5])];
+    let map = ShardMap::even(before.clone());
+    let left = id_in_shard(&map, 0, "left");
+    let config = NodeConfig {
+        preseed_timeout: Duration::from_secs(1),
+        ..quick()
+    };
+    let nodes: Vec<TestNode> = (0..7)
+        .map(|id| spawn_node_cfg(NodeId(id), before.clone(), &net, config))
+        .collect();
+    nodes[6].node.begin_join();
+    nodes[0]
+        .node
+        .write(vec![event(&left, 1, "Bumped")])
+        .await
+        .unwrap();
+    let no_paxos: LinkFilter = Arc::new(|from, _, message| {
+        from == NodeId(0) && matches!(message, Message::ConfigPrepare { .. })
+    });
+    net.set_link_filter(Some(no_paxos));
+    let driver = nodes[0].node.clone();
+    let change = tokio::spawn(async move {
+        driver
+            .change_topology(1, vec![ids(&[0, 1, 6]), ids(&[3, 4, 2])])
+            .await
+    });
+    await_versions(&nodes[6].store, &left, &[1]).await;
+    change.abort();
+    let _ = change.await;
+    // The grace is the pre-seed wait plus two rounds: 2 s here.
+    await_versions(&nodes[6].store, &left, &[]).await;
+    assert_eq!(nodes[6].topology.epoch(), 0, "no change came");
+
+    // The change comes after all: copied under the fence, whole.
+    net.set_link_filter(None);
+    let moved = vec![ids(&[0, 1, 6]), ids(&[3, 4, 2])];
+    let installed = tokio::time::timeout(
+        Duration::from_secs(30),
+        nodes[0].node.change_topology(1, moved.clone()),
+    )
+    .await
+    .expect("the change ends in bounded time")
+    .expect("the change installs");
+    assert_eq!(installed, moved);
+    await_epoch(&nodes[6].topology, 2).await;
+    await_versions(&nodes[6].store, &left, &[1]).await;
+}
+
+/// A pre-seed that outlives the change before it leaves nothing behind
+/// (#469). Node 2 pre-seeds a merge it proposes while the transition that
+/// replaces node 0 is in progress, and its sources do not answer until that
+/// transition's layout installs — at the epoch the merge was for. The page
+/// that then arrives is not installed, and the slot it would have brought
+/// in, which node 2 does not own (and whose drop at the new epoch has run
+/// already), is not in its store. Before, the page landed and stayed: the
+/// re-sharding swarm found a member of the final layout holding a slot it
+/// never owned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_pre_seed_that_outlives_the_change_before_it_leaves_nothing_behind() {
+    let net = InMemoryNetwork::new();
+    let before = vec![ids(&[0, 1, 2]), ids(&[3, 4, 5])];
+    let map = ShardMap::even(before.clone());
+    let left = id_in_shard(&map, 0, "left");
+    let right = id_in_shard(&map, 1, "right");
+    // A source that does not answer is retried for three rounds: long enough
+    // for the transition to drain and install meanwhile.
+    let config = NodeConfig {
+        collect_timeout: Duration::from_secs(1),
+        ..quick()
+    };
+    let nodes: Vec<TestNode> = (0..7)
+        .map(|id| spawn_node_cfg(NodeId(id), before.clone(), &net, config))
+        .collect();
+    nodes[6].node.begin_join();
+    for (id, version) in [(&left, 1), (&right, 1)] {
+        nodes[0]
+            .node
+            .write(vec![event(id, version, "Bumped")])
+            .await
+            .unwrap();
+    }
+
+    // Node 6 replaces node 0: a transition, draining.
+    let replaced = vec![ids(&[6, 1, 2]), ids(&[3, 4, 5])];
+    let driver = nodes[1].node.clone();
+    let to = replaced.clone();
+    let change = tokio::spawn(async move { driver.change_topology(1, to).await });
+    await_epoch(&nodes[2].topology, 1).await;
+
+    // Node 2 proposes a merge for the next epoch meanwhile, and pre-seeds
+    // the second shard's slots first — but no source answers it until the
+    // transition's layout is installed on it.
+    let topology = Arc::clone(&nodes[2].topology);
+    let stalled: LinkFilter = Arc::new(move |from, _, message| {
+        from == NodeId(2)
+            && matches!(message, Message::RangePageRequest { .. })
+            && topology.epoch() < 2
+    });
+    net.set_link_filter(Some(stalled));
+    let proposer = nodes[2].node.clone();
+    let merge =
+        tokio::spawn(async move { proposer.change_topology(2, vec![ids(&[0, 1, 2])]).await });
+
+    let installed = tokio::time::timeout(Duration::from_secs(30), change)
+        .await
+        .expect("the change ends in bounded time")
+        .expect("the driver runs")
+        .expect("the change installs");
+    assert_eq!(
+        installed, replaced,
+        "the transition's activation took epoch 2"
+    );
+    await_epoch(&nodes[2].topology, 2).await;
+
+    // The pre-seed's source answers now; the pre-seed ends with the epoch
+    // it was for taken, installing nothing (or, before the fix, its page).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while nodes[2].node.metrics().copies_voided == 0
+        && versions_of(&nodes[2].store, &right).is_empty()
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the pre-seed never ended: {:?}",
+            nodes[2].node.metrics()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    merge.abort();
+    let _ = merge.await;
+    net.set_link_filter(None);
+    assert_eq!(
+        nodes[2].node.metrics().preseed_passes,
+        0,
+        "no pass completed: the first page found the layout moved on"
+    );
+    assert!(
+        versions_of(&nodes[2].store, &right).is_empty(),
+        "node 2 holds a slot it does not own: {:?}",
+        versions_of(&nodes[2].store, &right)
+    );
+    assert_eq!(
+        versions_of(&nodes[2].store, &left),
+        vec![1],
+        "its own slots stay"
+    );
+    for i in [3, 4, 5] {
+        assert_eq!(versions_of(&nodes[i].store, &right), vec![1]);
+    }
+}
+
+/// A node gaining slots in a transition in progress declines a pre-seed
+/// (#471). Node 6 replaces node 0 and copies the first shard under the
+/// fence, reporting it; while the transition drains, node 3 proposes a merge
+/// that would keep node 6 on those slots. Judged against the live layout,
+/// under which node 6 owns nothing, the pre-seed counted them gained again
+/// and dropped what the fenced copy brought in — and its sources do not
+/// answer here, so nothing refilled them before the transition activated
+/// over an emptied store. Now node 6 answers at once, copying nothing, and
+/// its copy stands, in its store and in its journal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_gainer_in_a_transition_in_progress_declines_a_pre_seed() {
+    let net = InMemoryNetwork::new();
+    let before = vec![ids(&[0, 1, 2]), ids(&[3, 4, 5])];
+    let map = ShardMap::even(before.clone());
+    let left = id_in_shard(&map, 0, "left");
+    let right = id_in_shard(&map, 1, "right");
+    let nodes: Vec<TestNode> = (0..7)
+        .map(|id| spawn_node_cfg(NodeId(id), before.clone(), &net, quick()))
+        .collect();
+    nodes[6].node.begin_join();
+    for (id, version) in [(&left, 1), (&right, 1)] {
+        nodes[0]
+            .node
+            .write(vec![event(id, version, "Bumped")])
+            .await
+            .unwrap();
+    }
+
+    // Node 6 replaces node 0: a transition. It drains, but does not
+    // activate: node 1 keeps the first shard, and its reports reach nobody
+    // — nor does the activation it would propose itself, going by its own.
+    let stalled: LinkFilter = Arc::new(|from, _, message| {
+        from == NodeId(1)
+            && matches!(
+                message,
+                Message::Watermark { .. } | Message::ConfigPrepare { .. }
+            )
+    });
+    net.set_link_filter(Some(stalled));
+    let replaced = vec![ids(&[6, 1, 2]), ids(&[3, 4, 5])];
+    let driver = nodes[2].node.clone();
+    let to = replaced.clone();
+    let change = tokio::spawn(async move { driver.change_topology(1, to).await });
+    // Node 6 copies the first shard under the fence, through node 0 or 2,
+    // and journals the copy complete.
+    await_versions(&nodes[6].store, &left, &[1]).await;
+    let copied = |state: &Option<CopyState>| {
+        matches!(
+            state,
+            Some(CopyState {
+                since: 1,
+                phase: CopyPhase::Copied,
+                ..
+            })
+        )
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !copied(&nodes[6].journal.load_copy_state().await.unwrap()) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "node 6 never journaled its copy complete: {:?}",
+            nodes[6].journal.load_copy_state().await.unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        nodes[6].topology.epoch(),
+        1,
+        "the transition is in progress"
+    );
+
+    // Node 3 proposes a merge for the next epoch meanwhile, which keeps node
+    // 6 on the first shard's slots and gives it the second's. Its proposal
+    // never gets through — the transition's activation takes epoch 2 — and
+    // no source answers a page node 6 would ask for.
+    let proposing: LinkFilter = Arc::new(|from, _, message| {
+        (from == NodeId(1)
+            && matches!(
+                message,
+                Message::Watermark { .. } | Message::ConfigPrepare { .. }
+            ))
+            || (from == NodeId(3) && matches!(message, Message::ConfigPrepare { .. }))
+            || (from == NodeId(6) && matches!(message, Message::RangePageRequest { .. }))
+    });
+    net.set_link_filter(Some(proposing));
+    let proposer = nodes[3].node.clone();
+    let merge =
+        tokio::spawn(async move { proposer.change_topology(2, vec![ids(&[6, 1, 2])]).await });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while nodes[6].node.metrics().preseeds_declined == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "node 6 never declined the pre-seed: {:?}, {:?}",
+            nodes[6].node.metrics(),
+            versions_of(&nodes[6].store, &left)
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        versions_of(&nodes[6].store, &left),
+        vec![1],
+        "the copy under the fence stands"
+    );
+    assert_eq!(nodes[6].node.metrics().streams_dropped, 0);
+    assert!(
+        copied(&nodes[6].journal.load_copy_state().await.unwrap()),
+        "the copy's record stands: {:?}",
+        nodes[6].journal.load_copy_state().await.unwrap()
+    );
+
+    // Node 1's reports get through: the transition activates at epoch 2.
+    let activating: LinkFilter = Arc::new(|from, _, message| {
+        (from == NodeId(3) && matches!(message, Message::ConfigPrepare { .. }))
+            || (from == NodeId(6) && matches!(message, Message::RangePageRequest { .. }))
+    });
+    net.set_link_filter(Some(activating));
+    change.abort();
+    let _ = change.await;
+    let installed = tokio::time::timeout(
+        Duration::from_secs(30),
+        nodes[2].node.change_topology(1, replaced.clone()),
+    )
+    .await
+    .expect("the change ends in bounded time")
+    .expect("the change installs");
+    assert_eq!(
+        installed, replaced,
+        "the transition's activation took epoch 2"
+    );
+    merge.abort();
+    let _ = merge.await;
+    net.set_link_filter(None);
+    await_epoch(&nodes[6].topology, 2).await;
+    assert_eq!(versions_of(&nodes[6].store, &left), vec![1]);
+    assert!(
+        copied(&nodes[6].journal.load_copy_state().await.unwrap()),
+        "the copy's record stands after the activation: {:?}",
+        nodes[6].journal.load_copy_state().await.unwrap()
+    );
+    assert_eq!(nodes[6].node.metrics().preseeds_declined, 1);
+    let fresh = nodes[6]
+        .node
+        .write(vec![event(&left, 2, "Bumped")])
+        .await
+        .unwrap();
+    assert!(!fresh.conflict, "the copied version is enforced");
+}
+
+/// A replica added at once whose join failed partway is still joining when
+/// a change gives its shard more slots (#446). It copies nothing until it
+/// joins: a copy would fill the store its join needs empty, and a copy that
+/// ended its join left it without the part of its own shard the join had not
+/// brought. The change waits for its join, then its copy, and the node then
+/// holds both the slots it joined for and the ones it gained.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_replica_still_joining_copies_once_it_joined() {
+    let net = InMemoryNetwork::new();
+    let before = vec![ids(&[0, 1, 2]), ids(&[3, 4, 5])];
+    let map = ShardMap::even(before.clone());
+    let left = id_in_shard(&map, 0, "left");
+    let right = id_in_shard(&map, 1, "right");
+    let nodes: Vec<TestNode> = (0..7)
+        .map(|id| spawn_node_cfg(NodeId(id), before.clone(), &net, quick()))
+        .collect();
+    nodes[6].node.begin_join();
+    for (id, version) in [(&left, 1), (&left, 2), (&right, 1)] {
+        nodes[0]
+            .node
+            .write(vec![event(id, version, "Bumped")])
+            .await
+            .unwrap();
+    }
+
+    // Node 6 is added to the first shard at once. Its join is still to come:
+    // one that failed partway left it joining, over an emptied store.
+    let added = vec![ids(&[0, 1, 2, 6]), ids(&[3, 4, 5])];
+    let installed = tokio::time::timeout(
+        Duration::from_secs(30),
+        nodes[0].node.change_topology(1, added.clone()),
+    )
+    .await
+    .expect("the addition ends in bounded time")
+    .expect("the addition installs");
+    assert_eq!(installed, added);
+    assert!(nodes[6].node.is_joining());
+
+    // The second shard merges into the first: node 6 gains its slots.
+    let merged = vec![ids(&[0, 1, 2, 6, 3, 4, 5])];
+    let proposer = nodes[0].node.clone();
+    let proposed = merged.clone();
+    let change = tokio::spawn(async move { proposer.change_topology(2, proposed).await });
+    await_epoch(&nodes[0].topology, 2).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        nodes[6].node.is_joining(),
+        "a copy must not end a join that is not done"
+    );
+    assert!(
+        nodes[6].store.committed_events().is_empty(),
+        "a replica still joining copies nothing: its join needs an empty store"
+    );
+    assert_eq!(
+        nodes[0].topology.epoch(),
+        2,
+        "the change waits for node 6's join"
+    );
+
+    // Joined, node 6 copies what it gains, and the change installs — by the
+    // proposer, or by the sweep once the proposer gave up waiting.
+    nodes[6].node.join(NodeId(0)).await.expect("node 6 joins");
+    assert!(!nodes[6].node.is_joining());
+    let _ = tokio::time::timeout(Duration::from_secs(30), change).await;
+    for n in &nodes {
+        await_epoch(&n.topology, 3).await;
+    }
+    assert_eq!(nodes[6].topology.layout().shards(), merged.as_slice());
+    await_versions(&nodes[6].store, &left, &[1, 2]).await;
+    await_versions(&nodes[6].store, &right, &[1]).await;
+
+    let fresh = nodes[6]
+        .node
+        .write(vec![event(&right, 2, "Bumped")])
+        .await
+        .unwrap();
+    assert!(!fresh.conflict);
+    await_versions(&nodes[0].store, &right, &[1, 2]).await;
+    let stale = nodes[6]
+        .node
+        .write(vec![event(&left, 2, "Again")])
+        .await
+        .unwrap();
+    assert!(stale.conflict, "the joined versions are enforced");
+}
+
+/// A node whose host builds its `DynamicTopology` at the epoch it had
+/// installed, with a layout transition in progress at that epoch, comes
+/// back with the transition (#455): the journal's entries at and below the
+/// build epoch are replayed, so it holds the transition under the fence it
+/// journaled, copies the slots the transition gives it, and the change
+/// installs. Before, those entries were history only: the node had the
+/// transition's layout but no transition, copied nothing, and the change
+/// waited for its copy for good.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_node_built_at_a_transitions_epoch_restores_the_transition() {
+    let net = InMemoryNetwork::new();
+    let before = vec![ids(&[0, 1, 2]), ids(&[3, 4, 5])];
+    let map = ShardMap::even(before.clone());
+    let left = id_in_shard(&map, 0, "left");
+    let right = id_in_shard(&map, 1, "right");
+    let mut nodes: Vec<TestNode> = (0..6)
+        .map(|id| spawn_node_cfg(NodeId(id), before.clone(), &net, quick()))
+        .collect();
+    for (id, version) in [(&left, 1), (&right, 1), (&right, 2)] {
+        nodes[0]
+            .node
+            .write(vec![event(id, version, "Bumped")])
+            .await
+            .unwrap();
+    }
+    await_versions(&nodes[5].store, &right, &[1, 2]).await;
+
+    // The two shards merge. With nodes 4 and 5 down, the second shard never
+    // drains (no slow quorum of its replicas reports a fence), so the merge
+    // stays a transition in progress, and node 0 — a gainer of its slots —
+    // installs the transition and journals its fence, copying nothing yet.
+    nodes[4].stop();
+    nodes[5].stop();
+    let merged = vec![ids(&[0, 1, 2, 3, 4, 5])];
+    let proposer = nodes[1].node.clone();
+    let proposed = merged.clone();
+    let change = tokio::spawn(async move { proposer.change_topology(1, proposed).await });
+    await_epoch(&nodes[0].topology, 1).await;
+    let mut fences = Vec::new();
+    for _ in 0..2_000 {
+        fences = nodes[0].journal.load_fences().await.unwrap();
+        if !fences.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(fences.len(), 1, "node 0 journaled the transition's fence");
+    assert_eq!(nodes[0].topology.epoch(), 1, "the merge waits");
+
+    // Node 0 restarts, its topology built at the epoch it had installed over
+    // the transition's live layout.
+    nodes[0].stop();
+    let store = Arc::clone(&nodes[0].store);
+    let journal = Arc::clone(&nodes[0].journal);
+    let restarted =
+        restart_node_at(NodeId(0), 1, before.clone(), &net, store, journal, quick()).await;
+    assert_eq!(restarted.topology.epoch(), 1);
+    assert_eq!(
+        restarted.journal.load_fences().await.unwrap(),
+        fences,
+        "the fence comes back at the point it was journaled at, not recomputed"
+    );
+    nodes[0] = restarted;
+
+    // Nodes 4 and 5 come back, as at their first start: the second shard
+    // drains, node 0 copies the slots it gains, and the merge installs.
+    for i in [4usize, 5] {
+        let store = Arc::clone(&nodes[i].store);
+        let journal = Arc::clone(&nodes[i].journal);
+        nodes[i] = restart_node_at(
+            NodeId(i as u64),
+            0,
+            before.clone(),
+            &net,
+            store,
+            journal,
+            quick(),
+        )
+        .await;
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(30), change).await;
+    for n in &nodes {
+        await_epoch(&n.topology, 2).await;
+    }
+    assert_eq!(nodes[0].topology.layout().shards(), merged.as_slice());
+    await_versions(&nodes[0].store, &right, &[1, 2]).await;
+    let fresh = nodes[0]
+        .node
+        .write(vec![event(&right, 3, "Bumped")])
+        .await
+        .unwrap();
+    assert!(!fresh.conflict);
+    for n in [1usize, 3, 4] {
+        await_versions(&nodes[n].store, &right, &[1, 2, 3]).await;
+    }
+    let stale = nodes[0]
+        .node
+        .write(vec![event(&right, 2, "Again")])
+        .await
+        .unwrap();
+    assert!(stale.conflict, "the copied versions are enforced");
+}

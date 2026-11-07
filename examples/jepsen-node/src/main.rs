@@ -1,9 +1,9 @@
-//! A generic evento-accord node for the Jepsen harness.
+//! A generic evento-cluster node for the Jepsen harness.
 //!
 //! One process = one Accord replica over real TCP, backed by a durable Fjall
 //! event store and a durable `FjallJournal` consensus log, exposing a small,
 //! domain-free HTTP API that the Clojure/Jepsen client drives. It is the
-//! generic-API sibling of `examples/bank-axum-accord`: the cluster wiring is the
+//! generic-API sibling of `examples/bank-axum-cluster`: the cluster wiring is the
 //! same, but instead of bank endpoints it speaks an Elle list-append protocol.
 //!
 //! ## Why durable journal + `recover_state`
@@ -69,8 +69,8 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use evento::accord::{
-    serve, AccordExecutor, DataStore, ExecutorDataStore, HybridLogicalClock, Journal,
+use evento::cluster::{
+    serve, ClusterExecutor, DataStore, ExecutorDataStore, HybridLogicalClock, Journal,
     JournalRolledBack, LostJournal, MessageSink, Node, NodeConfig, NodeId, PartialSnapshot,
     StaticTopology, TcpTransport, Topology,
 };
@@ -85,7 +85,7 @@ use ulid::Ulid;
 const AGGREGATE_TYPE: &str = "jepsen/Reg";
 const EVENT_NAME: &str = "Appended";
 
-type Exec = AccordExecutor<Fjall>;
+type Exec = ClusterExecutor<Fjall>;
 
 /// The exit code that has the launcher run the binary again (`EX_TEMPFAIL`).
 const EX_TEMPFAIL: i32 = 75;
@@ -191,7 +191,7 @@ async fn main() -> anyhow::Result<()> {
     .with_config(config);
 
     let state = AppState {
-        executor: Arc::new(AccordExecutor::new(node.clone(), local)),
+        executor: Arc::new(ClusterExecutor::new(node.clone(), local)),
         ready: Arc::new(AtomicBool::new(false)),
     };
     let app = Router::new()

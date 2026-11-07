@@ -34,7 +34,7 @@ Events are committed with `synchronous = FULL`; subscription cursors and snapsho
 through a second connection with `synchronous = NORMAL` (a power cut may lose the last
 of them: a subscription then takes a few events again, a snapshot is rebuilt), so the
 acknowledgement every subscription makes per event costs no fsync.
-Other writers of the same database (your read models, the accord journal) need the
+Other writers of the same database (your read models, the cluster journal) need the
 store opened in [concurrent mode](#concurrent-writes-several-writers-one-database).
 
 ## Migrations
@@ -43,8 +43,8 @@ The schema lives in [`migrations/`](migrations). The `evento_turso::migrate` run
 derived from [turso-migrate](https://github.com/maun/turso-migrate) (see
 [`LICENSE-turso-migrate`](LICENSE-turso-migrate)), records each applied migration by
 name under an **app** namespace in the table `_evento_turso_migrations`, so several
-lists share one database: evento's schema is the app `evento`, the accord journal's
-is `evento-accord`, and your application's own migrations run under a name of yours.
+lists share one database: evento's schema is the app `evento`, the cluster journal's
+is `evento-cluster`, and your application's own migrations run under a name of yours.
 `Turso::open` applies evento's pending migrations; your list runs next to it:
 
 ```rust,no_run
@@ -110,7 +110,7 @@ yourself goes through `Turso::builder(path)` to get the same.
 
 A `Turso` opened with `open` is the one writer of its file: Turso's default journal
 (WAL) gives a second connection that writes at the same time `Busy` at once. When the
-application's own tables (read models written by subscriptions) and the accord journal
+application's own tables (read models written by subscriptions) and the cluster journal
 live in the same database as the events, open the store with `open_concurrent` (or
 `in_memory_concurrent` / `temporary_concurrent` in tests): the database is switched to
 Turso's MVCC mode (`PRAGMA journal_mode = 'mvcc'`, recorded in the file, so a later
@@ -154,11 +154,11 @@ why migrations run before the writers start.
 
 ## Accord journal
 
-With the `accord` feature the crate also provides `TursoJournal`, the
-[evento-accord](../evento-accord) consensus journal on Turso — in the same database
+With the `cluster` feature the crate also provides `TursoJournal`, the
+[evento-cluster](../evento-cluster) consensus journal on Turso — in the same database
 as the events (`TursoJournal::new(store.database().clone()).await`) or in one of its
 own (`TursoJournal::open(path)`); its constructors apply the journal's own
-migrations (`ACCORD_MIGRATIONS`, app `evento-accord`). The journal writes in the mode
+migrations (`CLUSTER_MIGRATIONS`, app `evento-cluster`). The journal writes in the mode
 its database is in: concurrent transactions next to a store opened with
 `open_concurrent`, plain ones otherwise.
 

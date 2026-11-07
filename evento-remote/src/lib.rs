@@ -61,7 +61,7 @@
 //!
 //! **TLS.** [`serve_tls`] / [`serve_tls_with`] complete a rustls handshake
 //! on each connection (the operator supplies the `TlsAcceptor`), and
-//! [`ClientBuilder::tls`] the matching connector, mirroring `evento-accord`'s
+//! [`ClientBuilder::tls`] the matching connector, mirroring `evento-cluster`'s
 //! `serve`/`serve_tls` split. Plain TCP stays for trusted networks: a token
 //! then travels in clear text.
 

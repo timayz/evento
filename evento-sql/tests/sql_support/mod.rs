@@ -3,7 +3,7 @@
 //! (A subdir module, so cargo does not compile it as its own test binary.)
 #![allow(dead_code)]
 
-use evento_accord::{
+use evento_cluster::{
     AcceptorRecord, AmnesiaFence, Ballot, CommandState, ConfigEntry, CopyPhase, CopyState,
     DecisionRecord, DurableMark, FenceRecord, Journal, Key, NodeId, ShardMap, Status, Timestamp,
     TxnId,
@@ -257,7 +257,7 @@ where
     );
 }
 
-/// A truncation that fails (here: `accord_meta` is gone, so the watermark
+/// A truncation that fails (here: `cluster_meta` is gone, so the watermark
 /// upsert errors and the transaction rolls back) leaves the staged commands
 /// below its bound for the next flush — nothing was deleted, so nothing may
 /// be forgotten.
@@ -283,7 +283,7 @@ pub async fn failed_truncate_keeps_staged<DB>(
         .await
         .expect_err("the watermark upsert has no table to go to");
 
-    // Commands only, so the flush does not need `accord_meta`.
+    // Commands only, so the flush does not need `cluster_meta`.
     journal.flush().await.unwrap();
     let mut all = journal.load_all().await.unwrap();
     all.sort_by_key(|state| state.txn);
