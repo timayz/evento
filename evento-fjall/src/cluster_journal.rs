@@ -31,10 +31,11 @@ use async_trait::async_trait;
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 
 use evento_cluster::format::{decode_tagged, encode_tagged, RecordKind};
-use evento_cluster::{
+use evento_cluster::protocol::{
     AcceptorRecord, AmnesiaFence, Ballot, CommandState, ConfigEntry, CopyState, DecisionRecord,
-    DurableMark, FenceRecord, Journal, Key, NodeId, Timestamp, TxnId,
+    DurableMark, FenceRecord, Key, Timestamp, TxnId,
 };
+use evento_cluster::{Journal, NodeId};
 
 /// Key under which the truncation watermark is stored in the `meta` keyspace.
 const WATERMARK_KEY: &[u8] = b"redundant_before";
@@ -669,7 +670,7 @@ impl Journal for FjallJournal {
 mod tests {
     use std::time::Duration;
 
-    use evento_cluster::Status;
+    use evento_cluster::protocol::Status;
     use evento_core::Event;
 
     use super::*;

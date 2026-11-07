@@ -15,9 +15,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::store::FaultStore;
+use evento_cluster::protocol::{Message, Status};
 use evento_cluster::{
-    DataStore, HybridLogicalClock, InMemoryJournal, InMemoryNetwork, Journal, Message, MessageSink,
-    Node, NodeConfig, NodeId, StaticTopology, Status,
+    DataStore, HybridLogicalClock, InMemoryJournal, InMemoryNetwork, Journal, MessageSink, Node,
+    NodeConfig, NodeId, StaticTopology,
 };
 use evento_core::cursor::Args;
 use evento_core::Event;
@@ -250,7 +251,7 @@ async fn a_forwarded_read_the_store_failed_is_an_error() {
     let result = cluster.nodes[0]
         .forward_read(
             NodeId(1),
-            evento_cluster::Key("acc".into()),
+            evento_cluster::protocol::Key("acc".into()),
             None,
             None,
             evento_core::TenantFilter::All,
@@ -271,7 +272,7 @@ async fn a_forwarded_read_the_store_failed_is_an_error() {
     cluster.nodes[0]
         .forward_read(
             NodeId(1),
-            evento_cluster::Key("acc".into()),
+            evento_cluster::protocol::Key("acc".into()),
             None,
             None,
             evento_core::TenantFilter::All,
@@ -303,7 +304,7 @@ async fn a_requester_that_cannot_decode_the_failure_still_fails_the_read() {
     let result = cluster.nodes[0]
         .forward_read(
             NodeId(1),
-            evento_cluster::Key("acc".into()),
+            evento_cluster::protocol::Key("acc".into()),
             None,
             None,
             evento_core::TenantFilter::All,

@@ -4,7 +4,8 @@
 
 use std::path::Path;
 
-use evento_cluster::{Ballot, Journal, Key, NodeId, TxnId};
+use evento_cluster::protocol::{Ballot, Key, TxnId};
+use evento_cluster::{Journal, NodeId};
 use evento_sql::SqlJournal;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Sqlite, SqlitePool};
@@ -223,7 +224,7 @@ async fn clock_bound_survives_close_and_reopen() {
 async fn amnesia_fence_survives_close_and_reopen() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("journal.db");
-    let fence = evento_cluster::AmnesiaFence {
+    let fence = evento_cluster::protocol::AmnesiaFence {
         fence_micros: 1_234,
         joined: true,
         votes_restored: true,

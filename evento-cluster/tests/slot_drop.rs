@@ -6,7 +6,8 @@
 mod common;
 
 use common::executor::SimExecutor;
-use evento_cluster::{slot_of, DataStore, ExecutorDataStore, Key, NodeId, Timestamp, TxnId};
+use evento_cluster::protocol::{Key, Timestamp, TxnId};
+use evento_cluster::{slot_of, DataStore, ExecutorDataStore, NodeId};
 use evento_core::Event;
 
 fn event(id: &str, version: u16) -> Event {

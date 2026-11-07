@@ -18,9 +18,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use evento_cluster::protocol::{Key, Timestamp, TxnId};
 use evento_cluster::{
     DataStore, HybridLogicalClock, InMemoryDataStore, InMemoryJournal, InMemoryNetwork, Journal,
-    Key, MessageSink, Node, NodeConfig, NodeId, StaticTopology, Timestamp, TxnId,
+    MessageSink, Node, NodeConfig, NodeId, StaticTopology,
 };
 use evento_core::Event;
 

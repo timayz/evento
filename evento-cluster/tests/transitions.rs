@@ -7,10 +7,11 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use evento_cluster::protocol::{Message, Status, Timestamp, TxnId};
+use evento_cluster::transport::LinkFilter;
 use evento_cluster::{
     DataStore, DynamicTopology, HybridLogicalClock, InMemoryDataStore, InMemoryJournal,
-    InMemoryNetwork, Journal, LinkFilter, Message, MessageSink, Node, NodeConfig, NodeId, Status,
-    Timestamp, Topology, TopologyChanging, TxnId,
+    InMemoryNetwork, Journal, MessageSink, Node, NodeConfig, NodeId, Topology, TopologyChanging,
 };
 use evento_core::Event;
 
@@ -291,7 +292,7 @@ async fn a_change_back_to_the_live_layout_cancels_a_transition() {
     assert!(
         matches!(
             decided,
-            evento_cluster::ConfigEntry::Transition { since: 1, .. }
+            evento_cluster::protocol::ConfigEntry::Transition { since: 1, .. }
         ),
         "{decided:?}"
     );
@@ -599,7 +600,7 @@ async fn a_dependency_planned_under_an_epoch_the_learner_lacks_is_not_invalidate
                 txn: write,
                 execute_at: write.0,
                 deps: vec![txn],
-                keys: vec![evento_cluster::Key::of(&second)],
+                keys: vec![evento_cluster::protocol::Key::of(&second)],
                 events: vec![second.clone()],
                 reply_to: OUTSIDE,
             },

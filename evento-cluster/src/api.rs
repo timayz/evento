@@ -1215,7 +1215,7 @@ pub fn cursor_at(micros: u64) -> Value {
 }
 
 /// The approximate size of `event` on the wire inside a
-/// [`Message`](crate::Message): what a snapshot page's byte budget counts.
+/// [`Message`]: what a snapshot page's byte budget counts.
 /// The fixed fields (id, version, timestamps, length prefixes) plus the
 /// strings, the data and the bitcode-encoded metadata.
 pub fn snapshot_event_size(event: &Event) -> usize {

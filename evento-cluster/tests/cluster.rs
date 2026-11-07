@@ -6,9 +6,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use evento_cluster::protocol::{AppliedEntry, Status, TxnId};
 use evento_cluster::{
-    AppliedEntry, DataStore, HybridLogicalClock, InMemoryDataStore, InMemoryJournal,
-    InMemoryNetwork, Journal, MessageSink, Node, NodeConfig, NodeId, StaticTopology, Status, TxnId,
+    DataStore, HybridLogicalClock, InMemoryDataStore, InMemoryJournal, InMemoryNetwork, Journal,
+    MessageSink, Node, NodeConfig, NodeId, StaticTopology,
 };
 use evento_core::Event;
 

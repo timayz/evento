@@ -8,7 +8,8 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use evento_cluster::{Message, MessageSink, NodeId, TcpTransport, Timestamp, TxnId};
+use evento_cluster::protocol::{Message, Timestamp, TxnId};
+use evento_cluster::{MessageSink, NodeId, TcpTransport};
 use evento_core::Event;
 use futures_util::StreamExt;
 use tokio::net::TcpListener;

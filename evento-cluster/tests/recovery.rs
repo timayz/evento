@@ -5,11 +5,13 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use evento_cluster::protocol::{
+    Ballot, DurableMark, Key, Message, RecoveryRound, Status, Timestamp, TxnId,
+};
+use evento_cluster::transport::{Envelope, InMemorySink};
 use evento_cluster::{
-    Ballot, Clock, DataStore, DurableMark, Envelope, HybridLogicalClock, InMemoryDataStore,
-    InMemoryJournal, InMemoryNetwork, InMemorySink, Journal, Key, Message, MessageSink, Node,
-    NodeConfig, NodeId, RecoveryRound, ShardedTopology, StaticTopology, Status, Timestamp,
-    Topology, TxnId,
+    Clock, DataStore, HybridLogicalClock, InMemoryDataStore, InMemoryJournal, InMemoryNetwork,
+    Journal, MessageSink, Node, NodeConfig, NodeId, ShardedTopology, StaticTopology, Topology,
 };
 use evento_core::Event;
 use tokio::sync::mpsc;
@@ -2088,11 +2090,14 @@ struct FenceRefusingJournal {
 
 #[async_trait::async_trait]
 impl Journal for FenceRefusingJournal {
-    async fn record(&self, state: &evento_cluster::CommandState) -> anyhow::Result<()> {
+    async fn record(&self, state: &evento_cluster::protocol::CommandState) -> anyhow::Result<()> {
         self.inner.record(state).await
     }
 
-    async fn load(&self, txn: TxnId) -> anyhow::Result<Option<evento_cluster::CommandState>> {
+    async fn load(
+        &self,
+        txn: TxnId,
+    ) -> anyhow::Result<Option<evento_cluster::protocol::CommandState>> {
         self.inner.load(txn).await
     }
 

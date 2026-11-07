@@ -29,8 +29,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use evento::cluster::protocol::Key;
 use evento::cluster::{
-    serve, DataStore, ExecutorDataStore, HybridLogicalClock, Journal, Key, MessageSink, Node,
+    serve, DataStore, ExecutorDataStore, HybridLogicalClock, Journal, MessageSink, Node,
     NodeConfig, NodeId, StaticTopology, TcpTransport, Topology,
 };
 use evento::migrator::{Migrate, Plan};
@@ -69,24 +70,24 @@ struct TimedJournal<J> {
 
 #[async_trait::async_trait]
 impl<J: Journal> Journal for TimedJournal<J> {
-    async fn record(&self, state: &evento::cluster::CommandState) -> anyhow::Result<()> {
+    async fn record(&self, state: &evento::cluster::protocol::CommandState) -> anyhow::Result<()> {
         timed!(self.node, "journal.record", self.inner.record(state))
     }
-    async fn stage(&self, state: &evento::cluster::CommandState) -> anyhow::Result<()> {
+    async fn stage(&self, state: &evento::cluster::protocol::CommandState) -> anyhow::Result<()> {
         timed!(self.node, "journal.stage", self.inner.stage(state))
     }
     async fn flush(&self) -> anyhow::Result<()> {
         timed!(self.node, "journal.flush", self.inner.flush())
     }
-    async fn truncate(&self, before: evento::cluster::Timestamp) -> anyhow::Result<()> {
+    async fn truncate(&self, before: evento::cluster::protocol::Timestamp) -> anyhow::Result<()> {
         timed!(self.node, "journal.truncate", self.inner.truncate(before))
     }
-    async fn load_watermark(&self) -> anyhow::Result<Option<evento::cluster::Timestamp>> {
+    async fn load_watermark(&self) -> anyhow::Result<Option<evento::cluster::protocol::Timestamp>> {
         self.inner.load_watermark().await
     }
     async fn save_rejoin_bounds(
         &self,
-        bounds: &[(NodeId, evento::cluster::Timestamp)],
+        bounds: &[(NodeId, evento::cluster::protocol::Timestamp)],
     ) -> anyhow::Result<()> {
         timed!(
             self.node,
@@ -96,23 +97,29 @@ impl<J: Journal> Journal for TimedJournal<J> {
     }
     async fn load_rejoin_bounds(
         &self,
-    ) -> anyhow::Result<Vec<(NodeId, evento::cluster::Timestamp)>> {
+    ) -> anyhow::Result<Vec<(NodeId, evento::cluster::protocol::Timestamp)>> {
         self.inner.load_rejoin_bounds().await
     }
-    async fn save_route(&self, txn: evento::cluster::TxnId, route: &[Key]) -> anyhow::Result<()> {
+    async fn save_route(
+        &self,
+        txn: evento::cluster::protocol::TxnId,
+        route: &[Key],
+    ) -> anyhow::Result<()> {
         timed!(
             self.node,
             "journal.save_route",
             self.inner.save_route(txn, route)
         )
     }
-    async fn load_routes(&self) -> anyhow::Result<Vec<(evento::cluster::TxnId, Vec<Key>)>> {
+    async fn load_routes(
+        &self,
+    ) -> anyhow::Result<Vec<(evento::cluster::protocol::TxnId, Vec<Key>)>> {
         self.inner.load_routes().await
     }
     async fn save_promise(
         &self,
-        txn: evento::cluster::TxnId,
-        ballot: evento::cluster::Ballot,
+        txn: evento::cluster::protocol::TxnId,
+        ballot: evento::cluster::protocol::Ballot,
     ) -> anyhow::Result<()> {
         timed!(
             self.node,
@@ -122,20 +129,33 @@ impl<J: Journal> Journal for TimedJournal<J> {
     }
     async fn load_promises(
         &self,
-    ) -> anyhow::Result<Vec<(evento::cluster::TxnId, evento::cluster::Ballot)>> {
+    ) -> anyhow::Result<
+        Vec<(
+            evento::cluster::protocol::TxnId,
+            evento::cluster::protocol::Ballot,
+        )>,
+    > {
         self.inner.load_promises().await
     }
-    async fn save_decision(&self, record: &evento::cluster::DecisionRecord) -> anyhow::Result<()> {
+    async fn save_decision(
+        &self,
+        record: &evento::cluster::protocol::DecisionRecord,
+    ) -> anyhow::Result<()> {
         timed!(
             self.node,
             "journal.save_decision",
             self.inner.save_decision(record)
         )
     }
-    async fn load_decisions(&self) -> anyhow::Result<Vec<evento::cluster::DecisionRecord>> {
+    async fn load_decisions(
+        &self,
+    ) -> anyhow::Result<Vec<evento::cluster::protocol::DecisionRecord>> {
         self.inner.load_decisions().await
     }
-    async fn drop_decisions(&self, txns: &[evento::cluster::TxnId]) -> anyhow::Result<()> {
+    async fn drop_decisions(
+        &self,
+        txns: &[evento::cluster::protocol::TxnId],
+    ) -> anyhow::Result<()> {
         timed!(
             self.node,
             "journal.drop_decisions",
@@ -158,19 +178,24 @@ impl<J: Journal> Journal for TimedJournal<J> {
     async fn load_born(&self) -> anyhow::Result<Option<u64>> {
         self.inner.load_born().await
     }
-    async fn save_vote_fence(&self, fence: evento::cluster::Timestamp) -> anyhow::Result<()> {
+    async fn save_vote_fence(
+        &self,
+        fence: evento::cluster::protocol::Timestamp,
+    ) -> anyhow::Result<()> {
         timed!(
             self.node,
             "journal.save_vote_fence",
             self.inner.save_vote_fence(fence)
         )
     }
-    async fn load_vote_fence(&self) -> anyhow::Result<Option<evento::cluster::Timestamp>> {
+    async fn load_vote_fence(
+        &self,
+    ) -> anyhow::Result<Option<evento::cluster::protocol::Timestamp>> {
         self.inner.load_vote_fence().await
     }
     async fn save_peer_marks(
         &self,
-        marks: &[(NodeId, evento::cluster::DurableMark)],
+        marks: &[(NodeId, evento::cluster::protocol::DurableMark)],
     ) -> anyhow::Result<()> {
         timed!(
             self.node,
@@ -178,17 +203,24 @@ impl<J: Journal> Journal for TimedJournal<J> {
             self.inner.save_peer_marks(marks)
         )
     }
-    async fn load_peer_marks(&self) -> anyhow::Result<Vec<(NodeId, evento::cluster::DurableMark)>> {
+    async fn load_peer_marks(
+        &self,
+    ) -> anyhow::Result<Vec<(NodeId, evento::cluster::protocol::DurableMark)>> {
         self.inner.load_peer_marks().await
     }
-    async fn save_copy_state(&self, state: &evento::cluster::CopyState) -> anyhow::Result<()> {
+    async fn save_copy_state(
+        &self,
+        state: &evento::cluster::protocol::CopyState,
+    ) -> anyhow::Result<()> {
         timed!(
             self.node,
             "journal.save_copy_state",
             self.inner.save_copy_state(state)
         )
     }
-    async fn load_copy_state(&self) -> anyhow::Result<Option<evento::cluster::CopyState>> {
+    async fn load_copy_state(
+        &self,
+    ) -> anyhow::Result<Option<evento::cluster::protocol::CopyState>> {
         self.inner.load_copy_state().await
     }
     async fn save_slot_gc(&self, epoch: u64) -> anyhow::Result<()> {
@@ -203,7 +235,7 @@ impl<J: Journal> Journal for TimedJournal<J> {
     }
     async fn save_amnesia_fence(
         &self,
-        fence: &evento::cluster::AmnesiaFence,
+        fence: &evento::cluster::protocol::AmnesiaFence,
     ) -> anyhow::Result<()> {
         timed!(
             self.node,
@@ -211,22 +243,24 @@ impl<J: Journal> Journal for TimedJournal<J> {
             self.inner.save_amnesia_fence(fence)
         )
     }
-    async fn load_amnesia_fence(&self) -> anyhow::Result<Option<evento::cluster::AmnesiaFence>> {
+    async fn load_amnesia_fence(
+        &self,
+    ) -> anyhow::Result<Option<evento::cluster::protocol::AmnesiaFence>> {
         self.inner.load_amnesia_fence().await
     }
     async fn load(
         &self,
-        txn: evento::cluster::TxnId,
-    ) -> anyhow::Result<Option<evento::cluster::CommandState>> {
+        txn: evento::cluster::protocol::TxnId,
+    ) -> anyhow::Result<Option<evento::cluster::protocol::CommandState>> {
         timed!(self.node, "journal.load", self.inner.load(txn))
     }
-    async fn load_all(&self) -> anyhow::Result<Vec<evento::cluster::CommandState>> {
+    async fn load_all(&self) -> anyhow::Result<Vec<evento::cluster::protocol::CommandState>> {
         self.inner.load_all().await
     }
     async fn append_metadata(
         &self,
         epoch: u64,
-        entry: &evento::cluster::ConfigEntry,
+        entry: &evento::cluster::protocol::ConfigEntry,
     ) -> anyhow::Result<()> {
         timed!(
             self.node,
@@ -236,7 +270,7 @@ impl<J: Journal> Journal for TimedJournal<J> {
     }
     async fn append_metadata_batch(
         &self,
-        entries: &[(u64, evento::cluster::ConfigEntry)],
+        entries: &[(u64, evento::cluster::protocol::ConfigEntry)],
     ) -> anyhow::Result<()> {
         timed!(
             self.node,
@@ -244,23 +278,28 @@ impl<J: Journal> Journal for TimedJournal<J> {
             self.inner.append_metadata_batch(entries)
         )
     }
-    async fn load_metadata(&self) -> anyhow::Result<Vec<(u64, evento::cluster::ConfigEntry)>> {
+    async fn load_metadata(
+        &self,
+    ) -> anyhow::Result<Vec<(u64, evento::cluster::protocol::ConfigEntry)>> {
         self.inner.load_metadata().await
     }
-    async fn save_fences(&self, fences: &[evento::cluster::FenceRecord]) -> anyhow::Result<()> {
+    async fn save_fences(
+        &self,
+        fences: &[evento::cluster::protocol::FenceRecord],
+    ) -> anyhow::Result<()> {
         timed!(
             self.node,
             "journal.save_fences",
             self.inner.save_fences(fences)
         )
     }
-    async fn load_fences(&self) -> anyhow::Result<Vec<evento::cluster::FenceRecord>> {
+    async fn load_fences(&self) -> anyhow::Result<Vec<evento::cluster::protocol::FenceRecord>> {
         self.inner.load_fences().await
     }
     async fn record_acceptor(
         &self,
         epoch: u64,
-        state: &evento::cluster::AcceptorRecord,
+        state: &evento::cluster::protocol::AcceptorRecord,
     ) -> anyhow::Result<()> {
         timed!(
             self.node,
@@ -268,7 +307,9 @@ impl<J: Journal> Journal for TimedJournal<J> {
             self.inner.record_acceptor(epoch, state)
         )
     }
-    async fn load_acceptors(&self) -> anyhow::Result<Vec<(u64, evento::cluster::AcceptorRecord)>> {
+    async fn load_acceptors(
+        &self,
+    ) -> anyhow::Result<Vec<(u64, evento::cluster::protocol::AcceptorRecord)>> {
         self.inner.load_acceptors().await
     }
 }
@@ -294,8 +335,8 @@ impl<S: DataStore> DataStore for TimedStore<S> {
     }
     async fn apply(
         &self,
-        txn: evento::cluster::TxnId,
-        execute_at: evento::cluster::Timestamp,
+        txn: evento::cluster::protocol::TxnId,
+        execute_at: evento::cluster::protocol::Timestamp,
         events: Vec<Event>,
         commit: bool,
     ) -> anyhow::Result<()> {
@@ -328,7 +369,7 @@ impl<S: DataStore> DataStore for TimedStore<S> {
         after: Option<evento::cursor::Value>,
         max_events: u16,
         max_bytes: usize,
-    ) -> anyhow::Result<evento::cluster::SnapshotPage> {
+    ) -> anyhow::Result<evento::cluster::protocol::SnapshotPage> {
         timed!(
             self.node,
             "store.snapshot_page",
@@ -341,7 +382,7 @@ impl<S: DataStore> DataStore for TimedStore<S> {
         since: Option<u64>,
         max_events: u16,
         max_bytes: usize,
-    ) -> anyhow::Result<evento::cluster::SnapshotPage> {
+    ) -> anyhow::Result<evento::cluster::protocol::SnapshotPage> {
         timed!(
             self.node,
             "store.snapshot_page_since",
@@ -361,13 +402,17 @@ struct TimedSink<S> {
 
 #[async_trait::async_trait]
 impl<S: MessageSink> MessageSink for TimedSink<S> {
-    async fn send(&self, to: NodeId, message: evento::cluster::Message) -> anyhow::Result<()> {
+    async fn send(
+        &self,
+        to: NodeId,
+        message: evento::cluster::protocol::Message,
+    ) -> anyhow::Result<()> {
         timed!(self.node, "sink.send", self.inner.send(to, message))
     }
     async fn broadcast(
         &self,
         nodes: &[NodeId],
-        message: evento::cluster::Message,
+        message: evento::cluster::protocol::Message,
     ) -> anyhow::Result<()> {
         timed!(
             self.node,

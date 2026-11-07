@@ -6,10 +6,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use evento_cluster::protocol::{Ballot, Key, Message, Status, Timestamp, TxnId};
+use evento_cluster::transport::{Envelope, InMemorySink};
 use evento_cluster::{
-    Ballot, DataStore, Envelope, HybridLogicalClock, InMemoryDataStore, InMemoryJournal,
-    InMemoryNetwork, InMemorySink, Journal, Key, Message, MessageSink, Node, NodeConfig, NodeId,
-    StaticTopology, Status, Timestamp, TxnId,
+    DataStore, HybridLogicalClock, InMemoryDataStore, InMemoryJournal, InMemoryNetwork, Journal,
+    MessageSink, Node, NodeConfig, NodeId, StaticTopology,
 };
 use evento_core::Event;
 use tokio::sync::mpsc;

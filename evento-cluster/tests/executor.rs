@@ -717,7 +717,7 @@ async fn data_store_paginates_beyond_one_page() {
 /// chained through `next` until the whole store has crossed exactly once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn snapshot_page_walks_the_backend_by_events_and_bytes() {
-    use evento_cluster::snapshot_event_size;
+    use evento_cluster::protocol::snapshot_event_size;
 
     let fjall = Fjall::temporary().unwrap();
     let count: u16 = 5000;
@@ -792,8 +792,8 @@ fn stamped(version: u16) -> Event {
     }
 }
 
-fn txn(n: u64) -> evento_cluster::TxnId {
-    evento_cluster::TxnId(evento_cluster::Timestamp {
+fn txn(n: u64) -> evento_cluster::protocol::TxnId {
+    evento_cluster::protocol::TxnId(evento_cluster::protocol::Timestamp {
         micros: n,
         logical: 0,
         node: evento_cluster::NodeId(0),

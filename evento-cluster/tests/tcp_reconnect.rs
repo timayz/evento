@@ -7,7 +7,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use evento_cluster::{Message, MessageSink, NodeId, TcpTransport, Timestamp, TxnId};
+use evento_cluster::protocol::{Message, Timestamp, TxnId};
+use evento_cluster::{MessageSink, NodeId, TcpTransport};
 use futures_util::StreamExt;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;

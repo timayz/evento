@@ -88,11 +88,12 @@ use common::executor::SimExecutor;
 use common::inline::block_inline;
 use common::journal::{FaultJournal, JournalFaults};
 use common::store::{FaultStore, Outcomes};
+use evento_cluster::protocol::{Key, Message, Status, Timestamp, TxnId};
+use evento_cluster::transport::{LinkFilter, MessageFaults, TraceEntry};
 use evento_cluster::{
     DataStore, DynamicTopology, ExecutorDataStore, HybridLogicalClock, InMemoryDataStore,
-    InMemoryJournal, InMemoryNetwork, Journal, Key, Layout, LinkFilter, Message, MessageFaults,
-    MessageSink, Node, NodeConfig, NodeId, PartialSnapshot, StaticTopology, Status, Timestamp,
-    Topology, TraceEntry, TxnId, MAX_SKEW_MICROS, SLOTS,
+    InMemoryJournal, InMemoryNetwork, Journal, Layout, MessageSink, Node, NodeConfig, NodeId,
+    PartialSnapshot, StaticTopology, Topology, MAX_SKEW_MICROS, SLOTS,
 };
 use evento_core::cursor::Args;
 use evento_core::metadata::Metadata;
@@ -2729,7 +2730,7 @@ async fn a_recovery_decides_what_only_an_amnesiac_and_one_replica_accepted() {
     let written = event("acc", 1, ORPHAN_SEQ);
     let key = Key(written.aggregate_id.clone());
     async fn replies(
-        inbox: &mut tokio::sync::mpsc::Receiver<evento_cluster::Envelope>,
+        inbox: &mut tokio::sync::mpsc::Receiver<evento_cluster::transport::Envelope>,
         want: usize,
     ) {
         for got in 0..want {
@@ -2764,7 +2765,7 @@ async fn a_recovery_decides_what_only_an_amnesiac_and_one_replica_accepted() {
                 Message::Accept {
                     epoch: 0,
                     txn,
-                    ballot: evento_cluster::Ballot(txn.0),
+                    ballot: evento_cluster::protocol::Ballot(txn.0),
                     execute_at: txn.0,
                     deps: Vec::new(),
                     keys: vec![key.clone()],
@@ -5093,8 +5094,8 @@ impl DataStore for SlowStore {
 
     async fn apply(
         &self,
-        txn: evento_cluster::TxnId,
-        execute_at: evento_cluster::Timestamp,
+        txn: evento_cluster::protocol::TxnId,
+        execute_at: evento_cluster::protocol::Timestamp,
         events: Vec<Event>,
         commit: bool,
     ) -> anyhow::Result<()> {
@@ -5130,7 +5131,7 @@ impl DataStore for SlowStore {
         after: Option<evento_core::cursor::Value>,
         max_events: u16,
         max_bytes: usize,
-    ) -> anyhow::Result<evento_cluster::SnapshotPage> {
+    ) -> anyhow::Result<evento_cluster::protocol::SnapshotPage> {
         self.inner.snapshot_page(after, max_events, max_bytes).await
     }
 }

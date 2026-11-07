@@ -41,10 +41,11 @@ use async_trait::async_trait;
 use sea_query::{Expr, ExprTrait, Iden, OnConflict, Query};
 
 use evento_cluster::format::{decode_tagged, encode_tagged, RecordKind};
-use evento_cluster::{
+use evento_cluster::protocol::{
     AcceptorRecord, AmnesiaFence, Ballot, CommandState, ConfigEntry, CopyState, DecisionRecord,
-    DurableMark, FenceRecord, Journal, Key, NodeId, Timestamp, TxnId,
+    DurableMark, FenceRecord, Key, Timestamp, TxnId,
 };
+use evento_cluster::{Journal, NodeId};
 
 use crate::query::{self, Prepared};
 use crate::write::{self, WriteMode};

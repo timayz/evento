@@ -35,10 +35,11 @@ use async_trait::async_trait;
 
 use crate::dialect::{build_ddl, build_sqlx};
 use evento_cluster::format::{decode_tagged, encode_tagged, RecordKind};
-use evento_cluster::{
+use evento_cluster::protocol::{
     AcceptorRecord, AmnesiaFence, Ballot, CommandState, ConfigEntry, CopyState, DecisionRecord,
-    DurableMark, FenceRecord, Journal, Key, NodeId, Timestamp, TxnId,
+    DurableMark, FenceRecord, Key, Timestamp, TxnId,
 };
+use evento_cluster::{Journal, NodeId};
 
 /// `k` value under which the truncation watermark is stored in `cluster_meta`.
 const WATERMARK_KEY: &str = "redundant_before";

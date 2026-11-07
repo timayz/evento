@@ -16,10 +16,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use evento_cluster::protocol::{AppliedEntry, Message};
+use evento_cluster::transport::LinkFilter;
 use evento_cluster::{
-    AppliedEntry, DataStore, DynamicTopology, HybridLogicalClock, InMemoryDataStore,
-    InMemoryJournal, InMemoryNetwork, Journal, LinkFilter, Message, MessageSink, Node, NodeConfig,
-    NodeId, RegionId, Topology,
+    DataStore, DynamicTopology, HybridLogicalClock, InMemoryDataStore, InMemoryJournal,
+    InMemoryNetwork, Journal, MessageSink, Node, NodeConfig, NodeId, RegionId, Topology,
 };
 use evento_core::Event;
 
@@ -216,7 +217,7 @@ async fn a_joining_node_bootstraps_and_then_participates() {
 /// state from the contact's data-store snapshot rather than command replay.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_joining_node_bootstraps_from_a_compacted_contact() {
-    use evento_cluster::Timestamp;
+    use evento_cluster::protocol::Timestamp;
 
     let net = InMemoryNetwork::new();
     let abc = vec![NodeId(0), NodeId(1), NodeId(2)];
@@ -294,7 +295,7 @@ async fn a_joining_node_bootstraps_from_a_compacted_contact() {
 /// lands, and ends up identical to the contact — then takes part in writes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_joining_node_bootstraps_page_by_page() {
-    use evento_cluster::Timestamp;
+    use evento_cluster::protocol::Timestamp;
 
     let net = InMemoryNetwork::new();
     let abc = vec![NodeId(0), NodeId(1), NodeId(2)];
@@ -389,11 +390,11 @@ async fn a_join_refuses_a_non_empty_store() {
     // is its store.
     let abcd = vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3)];
     let d = spawn_node(NodeId(3), 0, vec![abcd], &net);
-    let stale = evento_cluster::TxnId(evento_cluster::Timestamp::MIN);
+    let stale = evento_cluster::protocol::TxnId(evento_cluster::protocol::Timestamp::MIN);
     d.store
         .apply(
             stale,
-            evento_cluster::Timestamp::MIN,
+            evento_cluster::protocol::Timestamp::MIN,
             vec![event("old", 1, "Opened")],
             true,
         )
@@ -642,7 +643,7 @@ async fn a_config_change_survives_a_coordinator_crash() {
     let decided = nodes[1].node.recover_topology(1).await.unwrap();
     assert_eq!(
         decided,
-        evento_cluster::ConfigEntry::active(vec![abcd.clone()]),
+        evento_cluster::protocol::ConfigEntry::active(vec![abcd.clone()]),
         "the accepted layout is recovered"
     );
 
@@ -693,7 +694,7 @@ async fn concurrent_recovery_of_one_epoch_converges() {
             .expect("recovery converges, not duels to failure");
         assert_eq!(
             decided,
-            evento_cluster::ConfigEntry::active(vec![abcdef.clone()]),
+            evento_cluster::protocol::ConfigEntry::active(vec![abcdef.clone()]),
             "all recover the same layout"
         );
     }
@@ -1091,7 +1092,7 @@ async fn a_duplicated_config_promise_never_completes_a_quorum() {
     // delivered twice, the other three stay silent: with node 0's own, that is
     // two distinct acceptors — not the majority of five an epoch's decision
     // must rest on.
-    use evento_cluster::Message;
+    use evento_cluster::protocol::Message;
     let net = InMemoryNetwork::new();
     let members: Vec<NodeId> = (0..5).map(NodeId).collect();
     let inbox = net.register(NodeId(0));
@@ -1123,7 +1124,9 @@ async fn a_duplicated_config_promise_never_completes_a_quorum() {
                     Message::ConfigPrepare { epoch, ballot } => Message::ConfigPromise {
                         epoch,
                         ballot,
-                        accepted_ballot: evento_cluster::Ballot(evento_cluster::Timestamp::MIN),
+                        accepted_ballot: evento_cluster::protocol::Ballot(
+                            evento_cluster::protocol::Timestamp::MIN,
+                        ),
                         accepted_entry: None,
                     },
                     Message::ConfigAccept { epoch, ballot, .. } => {
@@ -1203,7 +1206,7 @@ async fn an_invalid_layout_is_refused_and_the_cluster_keeps_serving() {
 /// epoch, so it would shut out the epoch's real layout for good.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_commit_of_an_invalid_layout_is_neither_installed_nor_persisted() {
-    use evento_cluster::Message;
+    use evento_cluster::protocol::Message;
 
     let net = InMemoryNetwork::new();
     let abc = vec![NodeId(0), NodeId(1), NodeId(2)];
@@ -1218,7 +1221,7 @@ async fn a_commit_of_an_invalid_layout_is_neither_installed_nor_persisted() {
             NodeId(0),
             Message::ConfigCommit {
                 epoch: 1,
-                entry: evento_cluster::ConfigEntry::active(vec![]),
+                entry: evento_cluster::protocol::ConfigEntry::active(vec![]),
             },
         )
         .await
@@ -1248,7 +1251,7 @@ async fn a_commit_of_an_invalid_layout_is_neither_installed_nor_persisted() {
             NodeId(0),
             Message::ConfigCommit {
                 epoch: 1,
-                entry: evento_cluster::ConfigEntry::active(vec![abc.clone()]),
+                entry: evento_cluster::protocol::ConfigEntry::active(vec![abc.clone()]),
             },
         )
         .await
@@ -1284,7 +1287,7 @@ async fn a_joining_node_refuses_a_forwarded_read_until_it_has_joined() {
         .node
         .forward_read(
             NodeId(3),
-            evento_cluster::Key("acc".into()),
+            evento_cluster::protocol::Key("acc".into()),
             None,
             None,
             evento_core::TenantFilter::All,
@@ -1306,7 +1309,7 @@ async fn a_joining_node_refuses_a_forwarded_read_until_it_has_joined() {
         .node
         .forward_read(
             NodeId(3),
-            evento_cluster::Key("acc".into()),
+            evento_cluster::protocol::Key("acc".into()),
             None,
             None,
             evento_core::TenantFilter::All,
@@ -1322,7 +1325,7 @@ async fn a_joining_node_refuses_a_forwarded_read_until_it_has_joined() {
 /// waiting out `collect_timeout`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_node_told_to_rejoin_refuses_a_forwarded_read_at_once() {
-    use evento_cluster::{Message, Timestamp};
+    use evento_cluster::protocol::{Message, Timestamp};
     use evento_core::cursor::Args;
 
     let net = InMemoryNetwork::new();
@@ -1371,7 +1374,7 @@ async fn a_node_told_to_rejoin_refuses_a_forwarded_read_at_once() {
         .node
         .forward_read(
             NodeId(2),
-            evento_cluster::Key("acc".into()),
+            evento_cluster::protocol::Key("acc".into()),
             None,
             None,
             evento_core::TenantFilter::All,
@@ -1393,7 +1396,7 @@ async fn a_node_told_to_rejoin_refuses_a_forwarded_read_at_once() {
 /// for a quorum fails; once it has joined, it counts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_joining_node_does_not_count_toward_a_read_barrier() {
-    use evento_cluster::Key;
+    use evento_cluster::protocol::Key;
 
     let net = InMemoryNetwork::new();
     let abc = vec![NodeId(0), NodeId(1), NodeId(2)];
@@ -1453,7 +1456,7 @@ async fn coverage_of(
     net: &Arc<InMemoryNetwork>,
     node: NodeId,
     peer: NodeId,
-) -> evento_cluster::Timestamp {
+) -> evento_cluster::protocol::Timestamp {
     sync_reply(net, node, peer, Duration::from_secs(5))
         .await
         .expect("no anti-entropy reply")
@@ -1465,9 +1468,9 @@ async fn sync_reply(
     node: NodeId,
     peer: NodeId,
     wait: Duration,
-) -> Option<evento_cluster::Timestamp> {
+) -> Option<evento_cluster::protocol::Timestamp> {
     const PROBE: u64 = u64::MAX;
-    let reply: Arc<std::sync::Mutex<Option<evento_cluster::Timestamp>>> = Arc::default();
+    let reply: Arc<std::sync::Mutex<Option<evento_cluster::protocol::Timestamp>>> = Arc::default();
     let seen = Arc::clone(&reply);
     net.set_link_filter(Some(Arc::new(move |from, to, message| match message {
         Message::SyncData {
@@ -1486,7 +1489,7 @@ async fn sync_reply(
             Message::SyncRequest {
                 id: PROBE,
                 known: evento_cluster::message::SyncKnown {
-                    since: evento_cluster::Timestamp::MIN,
+                    since: evento_cluster::protocol::Timestamp::MIN,
                     txns: Vec::new(),
                 },
             },
@@ -1616,7 +1619,7 @@ async fn a_joined_node_vouches_for_no_more_than_its_join_proved() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_joiner_with_a_lagging_clock_mints_above_the_floor() {
     use evento_cluster::clock::system_micros;
-    use evento_cluster::Timestamp;
+    use evento_cluster::protocol::Timestamp;
 
     let net = InMemoryNetwork::new();
     let abc = vec![NodeId(0), NodeId(1), NodeId(2)];

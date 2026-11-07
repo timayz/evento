@@ -5,9 +5,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use evento_cluster::protocol::Key;
 use evento_cluster::{
     DataStore, HybridLogicalClock, InMemoryDataStore, InMemoryJournal, InMemoryNetwork, Journal,
-    Key, MessageSink, Node, NodeConfig, NodeId, StaticTopology,
+    MessageSink, Node, NodeConfig, NodeId, StaticTopology,
 };
 use evento_core::Event;
 

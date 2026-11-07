@@ -9,10 +9,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use evento_cluster::protocol::{Key, Status, Timestamp};
 use evento_cluster::{
     DataStore, HybridLogicalClock, InMemoryDataStore, InMemoryJournal, InMemoryNetwork, Journal,
-    Key, Node, NodeConfig, NodeId, ShardedTopology, StaticTopology, Status, Timestamp, Topology,
-    MAX_SKEW_MICROS,
+    Node, NodeConfig, NodeId, ShardedTopology, StaticTopology, Topology, MAX_SKEW_MICROS,
 };
 use evento_core::Event;
 

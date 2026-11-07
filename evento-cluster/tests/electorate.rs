@@ -10,9 +10,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use evento_cluster::protocol::AppliedEntry;
 use evento_cluster::{
-    AppliedEntry, DataStore, HybridLogicalClock, InMemoryDataStore, InMemoryJournal,
-    InMemoryNetwork, Journal, MessageSink, Node, NodeId, StaticTopology,
+    DataStore, HybridLogicalClock, InMemoryDataStore, InMemoryJournal, InMemoryNetwork, Journal,
+    MessageSink, Node, NodeId, StaticTopology,
 };
 use evento_core::Event;
 

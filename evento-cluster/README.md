@@ -44,6 +44,13 @@ The protocol depends only on the `api` traits; each has an in-memory
 implementation for the test harness and a production one (framed TCP, static
 membership, a Fjall/SQL-backed store).
 
+The crate root exposes what a deployer touches: `ClusterExecutor`, `Node` /
+`NodeConfig`, the topology types, the transports, the clock, metrics, and the
+`Journal` / `DataStore` traits. The protocol's own vocabulary — `TxnId`,
+`Ballot`, `Timestamp`, `CommandState`, `Message`, the records a journal
+persists — lives under `evento_cluster::protocol`, for journal implementors
+and test harnesses.
+
 ## Also supported
 
 - **Elastic membership** — epoch-versioned topology; nodes join (bootstrapping

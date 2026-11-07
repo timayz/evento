@@ -12,10 +12,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use evento_cluster::protocol::{Message, Timestamp, TxnId};
 use evento_cluster::{
     serve_tls_verified, DataStore, HybridLogicalClock, InMemoryDataStore, InMemoryJournal, Journal,
-    Message, MessageSink, Node, NodeId, PeerCerts, StaticTopology, TcpTransport, Timestamp,
-    TlsClient, TxnId,
+    MessageSink, Node, NodeId, PeerCerts, StaticTopology, TcpTransport, TlsClient,
 };
 use evento_core::Event;
 use tokio::net::TcpListener;

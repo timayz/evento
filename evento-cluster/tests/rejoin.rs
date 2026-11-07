@@ -9,10 +9,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use evento_cluster::clock::system_micros;
+use evento_cluster::protocol::{Ballot, Key, Message, RecoveryRound, Status, Timestamp, TxnId};
+use evento_cluster::transport::Envelope;
 use evento_cluster::{
-    Ballot, Clock, DataStore, Envelope, HybridLogicalClock, InMemoryDataStore, InMemoryJournal,
-    InMemoryNetwork, Journal, Key, Message, MessageSink, Node, NodeConfig, NodeId, RecoveryRound,
-    StaticTopology, Status, Timestamp, TxnId,
+    Clock, DataStore, HybridLogicalClock, InMemoryDataStore, InMemoryJournal, InMemoryNetwork,
+    Journal, MessageSink, Node, NodeConfig, NodeId, StaticTopology,
 };
 use evento_core::Event;
 use tokio::sync::mpsc;
@@ -355,7 +356,9 @@ async fn a_rejoined_acceptor_keeps_its_config_promise() {
         Message::ConfigAccept {
             epoch: 1,
             ballot: ballot(1),
-            entry: evento_cluster::ConfigEntry::active(vec![(0..3).map(NodeId).collect()]),
+            entry: evento_cluster::protocol::ConfigEntry::active(vec![(0..3)
+                .map(NodeId)
+                .collect()]),
         },
     )
     .await;
