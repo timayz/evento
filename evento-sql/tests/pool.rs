@@ -1,8 +1,10 @@
+use std::sync::Arc;
+
 use evento::{
-    cursor::{Args, Order, ReadResult},
-    sql::Reader,
-    sql_migrator::{InitMigration, M0002, M0003, M0004, M0005, M0006, M0007, M0008},
-    Event,
+    cursor::{Args, Order, ReadResult, Value},
+    sql::{Reader, Sql},
+    sql_migrator::{InitMigration, M0002, M0003, M0004, M0005, M0006, M0007, M0008, M0009},
+    Event, EventFilter, Executor, RoutingKey, TenantFilter,
 };
 use evento_test::assert_read_result;
 use sea_query::{MysqlQueryBuilder, PostgresQueryBuilder, Query, SqliteQueryBuilder};
@@ -289,6 +291,7 @@ where
     M0006: sqlx_migrator::Migration<DB>,
     M0007: sqlx_migrator::Migration<DB>,
     M0008: sqlx_migrator::Migration<DB>,
+    M0009: sqlx_migrator::Migration<DB>,
     sqlx_migrator::Migrator<DB>: sqlx_migrator::migrator::DatabaseOperation<DB>,
 {
     install_default_drivers();
@@ -410,6 +413,7 @@ where
     M0006: sqlx_migrator::Migration<DB>,
     M0007: sqlx_migrator::Migration<DB>,
     M0008: sqlx_migrator::Migration<DB>,
+    M0009: sqlx_migrator::Migration<DB>,
     sqlx_migrator::Migrator<DB>: sqlx_migrator::migrator::DatabaseOperation<DB>,
 {
     execute(&pool, event_row("kept", None)).await?;
@@ -445,5 +449,301 @@ where
         "the refused revert changed nothing"
     );
 
+    Ok(())
+}
+
+/// The `idx_*` indexes of the `event` table, by name.
+async fn event_indexes<DB>(pool: &Pool<DB>) -> anyhow::Result<Vec<String>>
+where
+    DB: Database,
+    for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
+    sea_query_sqlx::SqlxValues: sqlx::IntoArguments<DB>,
+    String: for<'r> sqlx::Decode<'r, DB> + sqlx::Type<DB>,
+    usize: sqlx::ColumnIndex<DB::Row>,
+{
+    let sql = match DB::NAME {
+        "SQLite" => {
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'event' \
+             AND name LIKE 'idx_%' ORDER BY name"
+        }
+        "MySQL" => {
+            "SELECT DISTINCT index_name FROM information_schema.statistics \
+             WHERE table_schema = DATABASE() AND table_name = 'event' \
+             AND index_name LIKE 'idx_%' ORDER BY index_name"
+        }
+        "PostgreSQL" => {
+            "SELECT indexname FROM pg_indexes WHERE tablename = 'event' \
+             AND indexname LIKE 'idx_%' ORDER BY indexname"
+        }
+        name => panic!("'{name}' not supported, consider using SQLite, PostgreSQL or MySQL"),
+    };
+    let values = sea_query_sqlx::SqlxValues(sea_query::Values(vec![]));
+    let rows: Vec<(String,)> = sqlx::query_as_with::<DB, (String,), _>(sql, values)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows.into_iter().map(|(name,)| name).collect())
+}
+
+/// The fresh schema has the seven `event` indexes, `m0009` reverts to six and
+/// re-applies to seven.
+pub async fn m0009_round_trip<DB>(pool: Pool<DB>) -> anyhow::Result<()>
+where
+    DB: Database,
+    for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
+    sea_query_sqlx::SqlxValues: sqlx::IntoArguments<DB>,
+    String: for<'r> sqlx::Decode<'r, DB> + sqlx::Type<DB>,
+    usize: sqlx::ColumnIndex<DB::Row>,
+    InitMigration: sqlx_migrator::Migration<DB>,
+    M0002: sqlx_migrator::Migration<DB>,
+    M0003: sqlx_migrator::Migration<DB>,
+    M0004: sqlx_migrator::Migration<DB>,
+    M0005: sqlx_migrator::Migration<DB>,
+    M0006: sqlx_migrator::Migration<DB>,
+    M0007: sqlx_migrator::Migration<DB>,
+    M0008: sqlx_migrator::Migration<DB>,
+    M0009: sqlx_migrator::Migration<DB>,
+    sqlx_migrator::Migrator<DB>: sqlx_migrator::migrator::DatabaseOperation<DB>,
+{
+    let all = [
+        "idx_event_routing_key_type",
+        "idx_event_type_cursor",
+        "idx_event_type_id_tenant_cursor",
+        "idx_event_type_id_tenant_version",
+        "idx_event_type_name_cursor",
+        "idx_event_type_routing_cursor",
+        "idx_event_type_tenant_cursor",
+    ];
+    assert_eq!(event_indexes(&pool).await?, all);
+
+    let migrator = evento::sql_migrator::new::<DB>()?;
+    let mut conn = pool.acquire().await?;
+    migrator
+        .run(&mut *conn, &Plan::revert_name("main", Some("m0009")))
+        .await?;
+    let without: Vec<&str> = all
+        .iter()
+        .copied()
+        .filter(|name| *name != "idx_event_type_name_cursor")
+        .collect();
+    assert_eq!(event_indexes(&pool).await?, without);
+
+    migrator.run(&mut *conn, &Plan::apply_all()).await?;
+    assert_eq!(event_indexes(&pool).await?, all);
+    Ok(())
+}
+
+/// Writes the events of three types, interleaved: `Page` (`Created`/`Edited`),
+/// `Comment` (`Posted`), `Tag` (`Added`) — 160 events — then stamps every
+/// `Created`/`Posted` at `T` and every `Edited`/`Added` at `T + 1`, so the
+/// arms have distinct latest seconds whatever the commit clock did.
+async fn seed_arms<DB>(pool: &Pool<DB>) -> anyhow::Result<Sql<DB>>
+where
+    DB: Database,
+    for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
+    sea_query_sqlx::SqlxValues: sqlx::IntoArguments<DB>,
+    Sql<DB>: Executor,
+{
+    use evento::sql::Event as EventTable;
+    use sea_query::{Expr, ExprTrait};
+
+    let store = Sql::<DB>::from(pool.clone());
+    let event = |aggregate_type: &str, aggregate_id: String, name: &str, version: u16| Event {
+        id: ulid::Ulid::generate(),
+        aggregate_type: aggregate_type.into(),
+        aggregate_id,
+        name: name.into(),
+        version,
+        ..Default::default()
+    };
+    for i in 0..40u16 {
+        store
+            .write(vec![
+                event("demo/Page", format!("p{i}"), "Created", 1),
+                event("demo/Comment", format!("c{i}"), "Posted", 1),
+            ])
+            .await?;
+        store
+            .write(vec![
+                event("demo/Page", format!("p{i}"), "Edited", 2),
+                event("demo/Tag", format!("t{i}"), "Added", 1),
+            ])
+            .await?;
+    }
+    for (names, at) in [
+        (["Created", "Posted"], SEED_AT),
+        (["Edited", "Added"], SEED_AT + 1),
+    ] {
+        execute(
+            pool,
+            Query::update()
+                .table(EventTable::Table)
+                .value(EventTable::Timestamp, at)
+                .and_where(Expr::col(EventTable::Name).is_in(names))
+                .to_owned(),
+        )
+        .await?;
+    }
+    Ok(store)
+}
+
+/// The second the first events of [`seed_arms`] are stamped at.
+const SEED_AT: i64 = 1_700_000_000;
+
+/// Every page of `filters` in `direction`, as event ids in page order.
+async fn pages<E: Executor>(
+    store: &E,
+    filters: Option<Arc<[EventFilter]>>,
+    size: u16,
+    backward: bool,
+) -> anyhow::Result<Vec<Vec<String>>> {
+    let mut pages = Vec::new();
+    let mut cursor: Option<Value> = None;
+    loop {
+        let args = if backward {
+            Args::backward(size, cursor.clone())
+        } else {
+            Args::forward(size, cursor.clone())
+        };
+        let page = store
+            .read(
+                filters.clone(),
+                Some(RoutingKey::All),
+                TenantFilter::All,
+                args,
+                None,
+            )
+            .await?;
+        if page.edges.is_empty() {
+            break;
+        }
+        pages.push(page.edges.iter().map(|e| e.node.id.to_string()).collect());
+        let (more, next) = if backward {
+            (
+                page.page_info.has_previous_page,
+                page.page_info.start_cursor,
+            )
+        } else {
+            (page.page_info.has_next_page, page.page_info.end_cursor)
+        };
+        if !more {
+            break;
+        }
+        cursor = next;
+        assert!(pages.len() < 1000, "runaway paging");
+    }
+    Ok(pages)
+}
+
+/// A read over several filters is paged as the `UNION ALL` of one seek per
+/// filter (#478): the pages are the ones a single `OR` of the filters gives,
+/// forward and backward.
+pub async fn several_filters_page_like_every_event<DB>(pool: Pool<DB>) -> anyhow::Result<()>
+where
+    DB: Database,
+    for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
+    sea_query_sqlx::SqlxValues: sqlx::IntoArguments<DB>,
+    Sql<DB>: Executor,
+{
+    let store = seed_arms(&pool).await?;
+    // Three arms of three types: together they are every event.
+    let arms: Arc<[EventFilter]> = vec![
+        EventFilter::by_event_raw("demo/Page", "Created"),
+        EventFilter::by_event_raw("demo/Page", "Edited"),
+        EventFilter::by_event_raw("demo/Comment", "Posted"),
+        EventFilter::by_type_raw("demo/Tag"),
+    ]
+    .into();
+    for size in [1u16, 3, 7, 160, 500] {
+        for backward in [false, true] {
+            let expected = pages(&store, None, size, backward).await?;
+            let actual = pages(&store, Some(arms.clone()), size, backward).await?;
+            assert_eq!(actual, expected, "size {size} backward {backward}");
+            assert_eq!(actual.concat().len(), 160);
+        }
+    }
+    Ok(())
+}
+
+/// A subset of arms, one of them empty, pages in store order without
+/// duplicates, both ways.
+pub async fn a_subset_of_arms_pages_in_order_without_duplicates<DB>(
+    pool: Pool<DB>,
+) -> anyhow::Result<()>
+where
+    DB: Database,
+    for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
+    sea_query_sqlx::SqlxValues: sqlx::IntoArguments<DB>,
+    Sql<DB>: Executor,
+{
+    let store = seed_arms(&pool).await?;
+    let arms: Arc<[EventFilter]> = vec![
+        EventFilter::by_event_raw("demo/Page", "Edited"),
+        EventFilter::by_event_raw("demo/Comment", "Posted"),
+        // Never written: an arm without rows.
+        EventFilter::by_event_raw("demo/Page", "Deleted"),
+    ]
+    .into();
+    let all: Vec<String> = pages(&store, None, 500, false).await?.concat();
+    let ids: Vec<String> = pages(&store, Some(arms.clone()), 5, false).await?.concat();
+    assert_eq!(ids.len(), 80);
+    // In store order, each once.
+    let expected: Vec<String> = all.iter().filter(|id| ids.contains(id)).cloned().collect();
+    assert_eq!(ids, expected);
+    let mut sorted = ids.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted.len(), 80);
+
+    // Backward pages — last page first, each in store order — give the same
+    // events.
+    let mut back = pages(&store, Some(arms), 5, true).await?;
+    back.reverse();
+    assert_eq!(back.concat(), ids);
+    Ok(())
+}
+
+/// `latest_timestamp` over several filters is the greatest arm, and 0 when
+/// no arm has events.
+pub async fn latest_timestamp_is_the_greatest_arm<DB>(pool: Pool<DB>) -> anyhow::Result<()>
+where
+    DB: Database,
+    for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
+    sea_query_sqlx::SqlxValues: sqlx::IntoArguments<DB>,
+    Sql<DB>: Executor,
+{
+    let store = seed_arms(&pool).await?;
+    let latest = |filters: Vec<EventFilter>| {
+        let store = &store;
+        async move {
+            store
+                .latest_timestamp(
+                    Some(filters.into()),
+                    Some(RoutingKey::All),
+                    TenantFilter::All,
+                )
+                .await
+        }
+    };
+    let created = latest(vec![EventFilter::by_event_raw("demo/Page", "Created")]).await?;
+    let tag = latest(vec![EventFilter::by_type_raw("demo/Tag")]).await?;
+    assert_eq!(created, SEED_AT as u64);
+    assert_eq!(tag, created + 1);
+    assert_eq!(
+        latest(vec![
+            EventFilter::by_event_raw("demo/Page", "Created"),
+            EventFilter::by_type_raw("demo/Tag"),
+            EventFilter::by_event_raw("demo/Page", "Deleted"),
+        ])
+        .await?,
+        tag
+    );
+    assert_eq!(
+        latest(vec![
+            EventFilter::by_event_raw("demo/Page", "Deleted"),
+            EventFilter::by_event_raw("demo/Comment", "Removed"),
+        ])
+        .await?,
+        0
+    );
     Ok(())
 }

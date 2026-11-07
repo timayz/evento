@@ -66,6 +66,8 @@
 //! - [`M0008`] - Adds the tenant: `event.tenant` joins the stream's identity (unique
 //!   `(type, id, tenant, version)`) and gets a `(type, tenant, …cursor)` index, and
 //!   `snapshot` is keyed by `(tenant, type, projection, id)` (snapshots discarded)
+//! - [`M0009`] - Adds `idx_event_type_name_cursor`, so a subscription's reads by event
+//!   name and its lag `MAX(timestamp)` seek instead of scanning the type
 //!
 //! # Database Schema
 //!
@@ -131,6 +133,8 @@ mod m0005;
 mod m0006;
 mod m0007;
 mod m0008;
+mod m0009;
+mod step;
 
 #[cfg(feature = "accord")]
 pub use accord::AccordMigration;
@@ -142,6 +146,7 @@ pub use m0005::M0005;
 pub use m0006::M0006;
 pub use m0007::M0007;
 pub use m0008::M0008;
+pub use m0009::M0009;
 
 /// Creates a new [`Migrator`] instance with all Evento migrations registered.
 ///
@@ -188,6 +193,7 @@ where
     M0006: sqlx_migrator::Migration<DB>,
     M0007: sqlx_migrator::Migration<DB>,
     M0008: sqlx_migrator::Migration<DB>,
+    M0009: sqlx_migrator::Migration<DB>,
 {
     let mut migrator = Migrator::default();
     migrator.add_migration(Box::new(InitMigration))?;
@@ -198,6 +204,7 @@ where
     migrator.add_migration(Box::new(M0006))?;
     migrator.add_migration(Box::new(M0007))?;
     migrator.add_migration(Box::new(M0008))?;
+    migrator.add_migration(Box::new(M0009))?;
     Ok(migrator)
 }
 
@@ -244,6 +251,7 @@ where
     M0006: sqlx_migrator::Migration<DB>,
     M0007: sqlx_migrator::Migration<DB>,
     M0008: sqlx_migrator::Migration<DB>,
+    M0009: sqlx_migrator::Migration<DB>,
     AccordMigration: sqlx_migrator::Migration<DB>,
 {
     let mut migrator = Migrator::default();
@@ -255,6 +263,7 @@ where
     migrator.add_migration(Box::new(M0006))?;
     migrator.add_migration(Box::new(M0007))?;
     migrator.add_migration(Box::new(M0008))?;
+    migrator.add_migration(Box::new(M0009))?;
     // The optional evento-accord consensus-journal tables.
     migrator.add_migration(Box::new(AccordMigration))?;
     Ok(migrator)

@@ -10,7 +10,7 @@ use sea_query::{ColumnDef, Expr, Index, Table, TableCreateStatement};
 
 use evento_sql::Snapshot;
 
-use super::{Backend, Step};
+use crate::step::{step_operation, Backend, Step};
 
 /// The `snapshot` table, with or without the tenant (the `m0007` shape).
 fn create_statement(with_tenant: bool) -> TableCreateStatement {
