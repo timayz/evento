@@ -17,6 +17,12 @@ anyhow.workspace = true
 once_cell.workspace = true
 bitcode.workspace = true
 tokio.workspace = true
+evento-cluster = { path = "../evento-cluster", version = "2.0.0-alpha.38", optional = true }
+
+[features]
+# The `cluster_backend` scenario, for a backend that implements
+# `evento_cluster::ClusterBackend` under its own `cluster` feature.
+cluster = ["dep:evento-cluster"]
 
 [lints]
 workspace = true

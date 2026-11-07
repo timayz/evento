@@ -53,6 +53,8 @@ mod row;
 pub mod write;
 
 #[cfg(feature = "cluster")]
+mod cluster_backend;
+#[cfg(feature = "cluster")]
 mod cluster_journal;
 
 #[cfg(feature = "cluster")]

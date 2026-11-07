@@ -144,7 +144,9 @@ let executor = evento::Sidecar::from((client, local));        // events: client;
 - **Cluster (consensus-replicated, alpha):** the `cluster` feature (`evento::cluster`)
   replicates writes leaderlessly with any local backend serving reads, whose
   consensus journal it also enables (`evento::fjall::FjallJournal`, `evento::sql::SqlJournal`,
-  `evento::turso::TursoJournal`); one process runs one node of one cluster
+  `evento::turso::TursoJournal`; each backend then implements
+  `evento::cluster::ClusterBackend`: `open_journal`, `empty_for_join`, `discard_journal`);
+  one process runs one node of one cluster
   (`examples/bank-axum-cluster/`, `evento-cluster/OPERATIONS.md`). A deployer
   touches only the crate root; the protocol's types (`TxnId`, `CommandState`,
   `Message`, the journal records) sit under `evento::cluster::protocol`.

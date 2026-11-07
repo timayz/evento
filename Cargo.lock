@@ -1598,6 +1598,7 @@ dependencies = [
  "bank",
  "bitcode",
  "evento",
+ "evento-cluster",
  "once_cell",
  "rand 0.10.3",
  "tokio",

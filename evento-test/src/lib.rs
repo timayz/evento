@@ -5563,3 +5563,135 @@ pub async fn delete_stream<E: Executor + Clone>(executor: &E) -> anyhow::Result<
 
     Ok(())
 }
+
+/// Scenario (`cluster` feature): the backend is a
+/// [`ClusterBackend`](evento_cluster::ClusterBackend). Its journal opens over
+/// the same database and keeps what it records; emptying the store for a
+/// join removes the events, the snapshots and the subscription cursors and
+/// nothing of the journal; discarding the journal removes its commands and
+/// its clock bound. Both are idempotent and leave a store that takes writes
+/// again.
+#[cfg(feature = "cluster")]
+pub async fn cluster_backend<E: evento_cluster::ClusterBackend>(
+    executor: &E,
+) -> anyhow::Result<()> {
+    use evento_cluster::protocol::{Ballot, CommandState, Key, Status, Timestamp, TxnId};
+    use evento_cluster::NodeId;
+
+    let agg_type = "evento/ClusterBackend";
+    let event = |id: &str| Event {
+        id: Ulid::generate(),
+        aggregate_id: id.to_owned(),
+        aggregate_type: agg_type.to_owned(),
+        version: 1,
+        name: "Opened".to_owned(),
+        routing_key: None,
+        tenant: String::new(),
+        data: vec![],
+        metadata: Default::default(),
+        timestamp: 0,
+        timestamp_subsec: 0,
+    };
+    let read = |id: &str| {
+        executor.read(
+            Some([EventFilter::by_id_raw(agg_type, id)].into()),
+            None,
+            TenantFilter::All,
+            Args::forward(10, None),
+            None,
+        )
+    };
+    let snapshot = || {
+        executor.get_snapshot(
+            String::new(),
+            agg_type.to_owned(),
+            "view".to_owned(),
+            "0".to_owned(),
+            "kept".to_owned(),
+        )
+    };
+
+    // The journal opens over the store's database and holds what it records.
+    let journal = executor.open_journal().await?;
+    let txn = TxnId(Timestamp {
+        micros: 1_000,
+        logical: 0,
+        node: NodeId(0),
+    });
+    journal
+        .record(&CommandState {
+            epoch: 0,
+            txn,
+            status: Status::Applied,
+            promised: Ballot(txn.0),
+            accepted: Ballot(txn.0),
+            execute_at: txn.0,
+            deps: vec![],
+            keys: vec![Key("kept".into())],
+            events: vec![event("kept")],
+            reply_to: NodeId(0),
+            decision: Some(true),
+            applied_conflict: Some(false),
+        })
+        .await?;
+    journal.save_clock_bound(5_000).await?;
+    assert_eq!(journal.load_all().await?.len(), 1);
+    // Opening it again is harmless (a `migrate` before a `serve`).
+    let again = executor.open_journal().await?;
+    assert_eq!(again.load_all().await?.len(), 1);
+
+    // What a store holds: events, a snapshot, a subscription cursor.
+    executor.write(vec![event("kept")]).await?;
+    executor
+        .save_snapshot(
+            String::new(),
+            agg_type.to_owned(),
+            "view".to_owned(),
+            "0".to_owned(),
+            "kept".to_owned(),
+            vec![1, 2, 3],
+            cursor::Value(String::new()),
+        )
+        .await?;
+    let key = format!("cluster-backend-{}", Ulid::generate());
+    let worker = Ulid::generate();
+    executor.upsert_subscriber(key.clone(), worker).await?;
+    executor
+        .acknowledge(key.clone(), worker, cursor::Value("1".to_owned()), 0)
+        .await?;
+    assert_eq!(read("kept").await?.edges.len(), 1);
+    assert!(snapshot().await?.is_some());
+    assert!(executor.get_subscriber_cursor(key.clone()).await?.is_some());
+
+    // Emptied for a join: the store forgets, the journal does not.
+    executor.empty_for_join().await?;
+    assert!(read("kept").await?.edges.is_empty(), "the events go");
+    assert!(snapshot().await?.is_none(), "the snapshots go");
+    assert!(
+        executor.get_subscriber_cursor(key.clone()).await?.is_none(),
+        "the subscription cursors go"
+    );
+    assert_eq!(journal.load_all().await?.len(), 1, "the journal stays");
+    assert_eq!(journal.load_clock_bound().await?, Some(5_000));
+    executor.empty_for_join().await?;
+
+    // The store takes writes again, at version 1: the copied events arrive
+    // through `replicate`, verbatim.
+    executor.replicate(vec![event("kept")]).await?;
+    assert_eq!(read("kept").await?.edges.len(), 1);
+
+    // The journal discarded: nothing of it is left, and it still opens.
+    executor.discard_journal().await?;
+    assert!(journal.load_all().await?.is_empty(), "the commands go");
+    assert_eq!(
+        journal.load_clock_bound().await?,
+        None,
+        "the clock bound goes"
+    );
+    executor.discard_journal().await?;
+    let fresh = executor.open_journal().await?;
+    assert!(fresh.load_all().await?.is_empty());
+    assert_eq!(read("kept").await?.edges.len(), 1, "the events stay");
+
+    Ok(())
+}

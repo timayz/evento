@@ -163,6 +163,12 @@ impl FjallJournal {
 }
 
 impl FjallJournal {
+    /// The journal's keyspaces, for a host that discards the journal
+    /// (`ClusterBackend::discard_journal`).
+    pub(crate) fn keyspaces(&self) -> Vec<Keyspace> {
+        vec![self.commands.clone(), self.meta.clone()]
+    }
+
     /// Inserts a per-transaction `meta` record without an fsync — durable at
     /// the next `flush`, like a staged command.
     async fn stage_meta(&self, key: Vec<u8>, value: Vec<u8>) -> anyhow::Result<()> {

@@ -50,7 +50,13 @@ let executor = ClusterExecutor::new(node, fjall);                // drop-in even
 
 - **Durable journal is required for production.** `InMemoryJournal` (used by the demos)
   loses consensus state on restart. Use `evento_fjall::FjallJournal` (`evento-fjall`'s
-  `cluster` feature) or `evento_sql::SqlJournal` (`evento-sql`'s `cluster` feature).
+  `cluster` feature), `evento_sql::SqlJournal` (`evento-sql`'s) or
+  `evento_turso::TursoJournal` (`evento-turso`'s). Each of those backends also
+  implements `ClusterBackend` under that feature: `open_journal` opens the journal
+  **colocated** with the store (same file or database), `empty_for_join` empties the
+  store and keeps the journal (§7, [opening a node by joining](#opening-a-node-by-joining)),
+  `discard_journal` drops the journal too (§7, a rolled-back journal). A host built on
+  the trait never names a backend's tables.
 - **App code is unchanged:** `ClusterExecutor` is a drop-in `evento_core::Executor`, so
   `evento::create()/append()`, reads, subscriptions, and snapshots work as usual.
   An event's stored `timestamp`/`timestamp_subsec` is its transaction's agreed
@@ -441,11 +447,12 @@ refuses anything else before a vote, and a node never installs it.
   not. The journal keeps the node's votes, recovery promises, config-Paxos
   promises and clock bound, so the rejoined node never votes against them. When
   the store and journal share a database (one SQLite file through `evento-sql`, or
-  Fjall through `FjallJournal::from_database`), empty only the event store — with
-  `evento-sql`, its `event`, `snapshot` and `subscriber` tables; the `cluster_*`
-  tables are the journal. Kept in files of their own (the events in one SQLite
-  file, the journal through `SqlJournal` in another), the store goes with its file
-  and the journal stays. Contacts are tried in order; one
+  Fjall through `FjallJournal::from_database`), empty only the event store:
+  `ClusterBackend::empty_for_join` does exactly that on every local backend (with
+  `evento-sql`, its `event`, `snapshot` and `subscriber` tables go; the `cluster_*`
+  tables are the journal, and stay). Kept in files of their own (the events in one
+  SQLite file, the journal through `SqlJournal` in another), the store goes with its
+  file and the journal stays. Contacts are tried in order; one
   that is itself joining does not answer. Join only over an empty store (`join`
   refuses otherwise): a page that overlaps existing events is skipped whole as an
   idempotent re-apply, which would leave a gap. For the same reason a join that

@@ -160,7 +160,10 @@ as the events (`TursoJournal::new(store.database().clone()).await`) or in one of
 own (`TursoJournal::open(path)`); its constructors apply the journal's own
 migrations (`CLUSTER_MIGRATIONS`, app `evento-cluster`). The journal writes in the mode
 its database is in: concurrent transactions next to a store opened with
-`open_concurrent`, plain ones otherwise.
+`open_concurrent`, plain ones otherwise. `Turso` also implements
+`evento_cluster::ClusterBackend` (`open_journal` over its own database,
+`empty_for_join` deleting `event`/`snapshot`/`subscriber` in one transaction,
+`discard_journal` deleting the `cluster_*` tables).
 
 ## Learn more
 

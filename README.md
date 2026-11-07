@@ -707,7 +707,9 @@ backend (Fjall/SQL/Turso) serving reads. Enable the `cluster` feature on `evento
 exposes the cluster as `evento::cluster` (the protocol's own types sit under
 `evento::cluster::protocol`) and turns on the consensus journal of every
 enabled local backend (`evento::fjall::FjallJournal`, `evento::sql::SqlJournal`,
-`evento::turso::TursoJournal`). See its [README](evento-cluster/README.md),
+`evento::turso::TursoJournal`), each of which then implements
+`evento::cluster::ClusterBackend`: the journal colocated with the store, and the store
+emptied for a join. See its [README](evento-cluster/README.md),
 [DESIGN.md](evento-cluster/DESIGN.md), and [OPERATIONS.md](evento-cluster/OPERATIONS.md),
 plus the [`bank-axum-cluster`](examples/bank-axum-cluster) 3-node demo.
 

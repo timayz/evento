@@ -30,7 +30,9 @@
 //! - the [`Journal`] and [`DataStore`] traits a backend implements, with the
 //!   [`InMemoryJournal`] / [`InMemoryDataStore`] stand-ins. The journals the
 //!   local backends ship live next to their executor (`FjallJournal`,
-//!   `SqlJournal`, `TursoJournal`).
+//!   `SqlJournal`, `TursoJournal`), and each backend implements
+//!   [`ClusterBackend`] under its `cluster` feature: the journal colocated
+//!   with the store, and the store emptied for a join.
 //!
 //! # The protocol
 //!
@@ -55,6 +57,7 @@
 //! in-process implementation for testing and a production implementation.
 
 pub mod api;
+pub mod backend;
 pub mod clock;
 pub mod executor;
 pub mod failure_detector;
@@ -72,6 +75,7 @@ pub use api::{
     slot_of, validate_layout, DataStore, DynamicTopology, Journal, Layout, MessageSink, RegionId,
     ShardId, ShardMap, ShardedTopology, StaticTopology, Topology, SLOTS,
 };
+pub use backend::ClusterBackend;
 pub use clock::{Clock, HybridLogicalClock, NodeId, MAX_SKEW_MICROS};
 pub use executor::{ClusterExecutor, ExecutorDataStore};
 pub use metrics::{Metrics, MetricsSnapshot};
