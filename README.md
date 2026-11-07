@@ -23,7 +23,7 @@ One `Executor` trait, many backends:
 | Fjall (embedded LSM-tree) | `fjall` | [evento-fjall](evento-fjall) | no external server; `Fjall::temporary()` for tests |
 | Turso (embedded SQL, pure Rust) | `turso` | [evento-turso](evento-turso) | SQLite's schema in-process and async, no sqlx; `Turso::in_memory()` for tests |
 | Remote (client/server TCP) | `remote` | [evento-remote](evento-remote) | serve any executor over framed TCP |
-| Accord (consensus, alpha) | `accord` | [evento-accord](evento-accord) | leaderless replicated store, strictly serializable ([design](evento-accord/DESIGN.md)); journals on Fjall/SQL/Turso |
+| Cluster (replicated, alpha) | `cluster` | [evento-cluster](evento-cluster) | leaderless replicated store over Accord consensus, strictly serializable ([design](evento-cluster/DESIGN.md)); journals on Fjall/SQL/Turso |
 
 ## Installation
 
@@ -629,7 +629,7 @@ let executor = evento::Turso::open("./events.db").await?;
 // Tests and simulations: an in-memory database, gone with its last clone.
 let ephemeral = evento::Turso::in_memory().await?;
 
-// Several writers in one database (your read models, the accord journal next to
+// Several writers in one database (your read models, the cluster journal next to
 // the events): Turso's MVCC mode, every write a `BEGIN CONCURRENT` transaction
 // retried on conflict; your own writes go through `store.transaction(..)`.
 let shared = evento::Turso::open_concurrent("./app.db").await?;
@@ -699,16 +699,16 @@ let executor = evento::Evento::new(evento::Sidecar::from((client, local)));
 # }
 ```
 
-### Accord (replicated, alpha)
+### Cluster (replicated, alpha)
 
-[evento-accord](evento-accord) replicates writes through the Accord consensus protocol
+[evento-cluster](evento-cluster) replicates writes through the Accord consensus protocol
 (Cassandra CEP-15): leaderless, strictly serializable, highly available, with any local
-backend (Fjall/SQL/Turso) serving reads. Enable the `accord` feature on `evento`: it
-exposes the protocol as `evento::accord` and turns on the consensus journal of every
+backend (Fjall/SQL/Turso) serving reads. Enable the `cluster` feature on `evento`: it
+exposes the protocol as `evento::cluster` and turns on the consensus journal of every
 enabled local backend (`evento::fjall::FjallJournal`, `evento::sql::SqlJournal`,
-`evento::turso::TursoJournal`). See its [README](evento-accord/README.md),
-[DESIGN.md](evento-accord/DESIGN.md), and [OPERATIONS.md](evento-accord/OPERATIONS.md),
-plus the [`bank-axum-accord`](examples/bank-axum-accord) 3-node demo.
+`evento::turso::TursoJournal`). See its [README](evento-cluster/README.md),
+[DESIGN.md](evento-cluster/DESIGN.md), and [OPERATIONS.md](evento-cluster/OPERATIONS.md),
+plus the [`bank-axum-cluster`](examples/bank-axum-cluster) 3-node demo.
 
 ## Core API at a glance
 
@@ -762,9 +762,9 @@ Full macro reference: [evento-macro/README.md](evento-macro/README.md).
 | [evento-sql](evento-sql) | SQLite/MySQL/PostgreSQL executor (sqlx) |
 | [evento-sql-migrator](evento-sql-migrator) | Schema migrations for the SQL backend |
 | [evento-fjall](evento-fjall) | Embedded LSM-tree executor |
-| [evento-turso](evento-turso) | Embedded SQL executor on Turso, with migrations and the accord journal |
+| [evento-turso](evento-turso) | Embedded SQL executor on Turso, with migrations and the cluster journal |
 | [evento-remote](evento-remote) | Client/server executor over framed TCP |
-| [evento-accord](evento-accord) | Accord consensus replicated executor (alpha) |
+| [evento-cluster](evento-cluster) | Replicated executor over Accord consensus (alpha) |
 | [evento-lock](evento-lock) | `events.lock`: test that persisted shapes only grow |
 
 ## Examples
@@ -776,7 +776,7 @@ Complete working examples in [`examples/`](examples):
 - [`bank-axum-sqlite`](examples/bank-axum-sqlite) - Axum + SQLite + migrations: `cargo run -p bank-axum-sqlite`
 - [`bank-axum-fjall`](examples/bank-axum-fjall) - Axum + embedded Fjall, plus a live SSE feed per account: `cargo run -p bank-axum-fjall`
 - [`bank-axum-remote`](examples/bank-axum-remote) - Two-process client/server split: `cargo run -p bank-axum-remote -- store` then `cargo run -p bank-axum-remote`
-- [`bank-axum-accord`](examples/bank-axum-accord) - 1- or 3-node Accord cluster: `make accord` or `make accord.cluster`
+- [`bank-axum-cluster`](examples/bank-axum-cluster) - 1- or 3-node Accord cluster: `make cluster` or `make cluster.all`
 
 ## License
 

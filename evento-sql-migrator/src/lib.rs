@@ -123,8 +123,8 @@
 
 use sqlx_migrator::{Info, Migrator};
 
-#[cfg(feature = "accord")]
-mod accord;
+#[cfg(feature = "cluster")]
+mod cluster;
 mod m0001;
 mod m0002;
 mod m0003;
@@ -136,8 +136,8 @@ mod m0008;
 mod m0009;
 mod step;
 
-#[cfg(feature = "accord")]
-pub use accord::AccordMigration;
+#[cfg(feature = "cluster")]
+pub use cluster::ClusterMigration;
 pub use m0001::InitMigration;
 pub use m0002::M0002;
 pub use m0003::M0003;
@@ -179,10 +179,10 @@ pub use m0009::M0009;
 /// # Errors
 ///
 /// Returns an error if migration registration fails.
-// Two definitions: the `accord` build adds the consensus-journal migration (and its
-// extra trait bound); the default build is unchanged — so the `AccordMigration` bound
+// Two definitions: the `cluster` build adds the consensus-journal migration (and its
+// extra trait bound); the default build is unchanged — so the `ClusterMigration` bound
 // never leaks onto callers (e.g. evento-sql's generic test harness) that don't opt in.
-#[cfg(not(feature = "accord"))]
+#[cfg(not(feature = "cluster"))]
 pub fn new<DB: sqlx::Database>() -> Result<Migrator<DB>, sqlx_migrator::Error>
 where
     InitMigration: sqlx_migrator::Migration<DB>,
@@ -210,9 +210,9 @@ where
 
 /// Creates a new [`Migrator`] instance with all Evento migrations registered.
 ///
-/// This is the `accord` variant: identical to the default build, plus the
-/// consensus-journal migration ([`AccordMigration`]) required by
-/// `evento-accord`'s SQL journal.
+/// This is the `cluster` variant: identical to the default build, plus the
+/// consensus-journal migration ([`ClusterMigration`]) required by
+/// `evento-cluster`'s SQL journal.
 ///
 /// # Example
 ///
@@ -240,7 +240,7 @@ where
 /// # Errors
 ///
 /// Returns an error if migration registration fails.
-#[cfg(feature = "accord")]
+#[cfg(feature = "cluster")]
 pub fn new<DB: sqlx::Database>() -> Result<Migrator<DB>, sqlx_migrator::Error>
 where
     InitMigration: sqlx_migrator::Migration<DB>,
@@ -252,7 +252,7 @@ where
     M0007: sqlx_migrator::Migration<DB>,
     M0008: sqlx_migrator::Migration<DB>,
     M0009: sqlx_migrator::Migration<DB>,
-    AccordMigration: sqlx_migrator::Migration<DB>,
+    ClusterMigration: sqlx_migrator::Migration<DB>,
 {
     let mut migrator = Migrator::default();
     migrator.add_migration(Box::new(InitMigration))?;
@@ -264,7 +264,7 @@ where
     migrator.add_migration(Box::new(M0007))?;
     migrator.add_migration(Box::new(M0008))?;
     migrator.add_migration(Box::new(M0009))?;
-    // The optional evento-accord consensus-journal tables.
-    migrator.add_migration(Box::new(AccordMigration))?;
+    // The optional evento-cluster consensus-journal tables.
+    migrator.add_migration(Box::new(ClusterMigration))?;
     Ok(migrator)
 }

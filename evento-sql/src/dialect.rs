@@ -28,7 +28,7 @@ pub(crate) fn build_sqlx<DB: Database, S: SqlxBinder>(
 }
 
 /// Renders a (value-free) schema statement for `DB`'s dialect.
-#[cfg(feature = "accord")]
+#[cfg(feature = "cluster")]
 pub(crate) fn build_ddl<DB: Database>(statement: &sea_query::TableCreateStatement) -> String {
     match DB::NAME {
         #[cfg(feature = "sqlite")]

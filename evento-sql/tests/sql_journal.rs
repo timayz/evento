@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use evento_accord::{Ballot, Journal, Key, NodeId, TxnId};
+use evento_cluster::{Ballot, Journal, Key, NodeId, TxnId};
 use evento_sql::SqlJournal;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Sqlite, SqlitePool};
@@ -79,7 +79,7 @@ async fn routes_and_promises() {
 async fn failed_truncate_keeps_staged() {
     let (journal, pool) = memory_with_pool().await;
     sql_support::failed_truncate_keeps_staged(&journal, async {
-        sqlx::query("DROP TABLE accord_meta")
+        sqlx::query("DROP TABLE cluster_meta")
             .execute(&pool)
             .await
             .unwrap();
@@ -129,7 +129,7 @@ async fn peer_marks() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn survives_close_and_reopen() {
     let temp = tempfile::Builder::new()
-        .prefix("accord_sql_reopen")
+        .prefix("cluster_sql_reopen")
         .tempfile()
         .unwrap();
 
@@ -223,7 +223,7 @@ async fn clock_bound_survives_close_and_reopen() {
 async fn amnesia_fence_survives_close_and_reopen() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("journal.db");
-    let fence = evento_accord::AmnesiaFence {
+    let fence = evento_cluster::AmnesiaFence {
         fence_micros: 1_234,
         joined: true,
         votes_restored: true,

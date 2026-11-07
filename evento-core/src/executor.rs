@@ -323,7 +323,7 @@ pub struct SubscriberStatus {
 /// (`read`, `latest_timestamp`), and managing subscription state
 /// (`upsert_subscriber`, `acknowledge`, `subscriber_status`). Backends include
 /// `evento_sql::Sql` (SQLite/MySQL/PostgreSQL), `evento_fjall::Fjall`
-/// (embedded), `evento_remote::Client` (TCP), and `evento_accord`
+/// (embedded), `evento_remote::Client` (TCP), and `evento_cluster`
 /// (consensus-replicated).
 #[async_trait::async_trait]
 pub trait Executor: Send + Sync + 'static {

@@ -40,7 +40,7 @@ pub enum WriteMode {
     /// Turso's MVCC: writers on separate connections run as
     /// `BEGIN CONCURRENT` transactions and only collide on the rows they
     /// both change, which [`transaction`] retries. For a store that shares
-    /// its database with the application's own tables and the accord
+    /// its database with the application's own tables and the cluster
     /// journal.
     Concurrent,
 }

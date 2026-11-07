@@ -1,0 +1,809 @@
+//! Lightweight runtime counters for observability.
+//!
+//! A [`Metrics`] holds per-node event counts as plain atomics — cheap to bump on
+//! the hot path. Read a point-in-time view with [`Metrics::snapshot`] (e.g. to
+//! export to a metrics backend, or to assert behaviour in tests). Paired with the
+//! `tracing` events the node emits at the same decision points.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Per-node event counters.
+#[derive(Default)]
+pub struct Metrics {
+    /// Writes this node coordinated that committed.
+    pub writes_committed: AtomicU64,
+    /// Writes this node coordinated that lost the optimistic-version condition.
+    pub writes_conflicted: AtomicU64,
+    /// Coordinated writes decided on the one-round-trip fast path.
+    pub fast_path: AtomicU64,
+    /// Coordinated writes that fell back to the slow (Accept) path.
+    pub slow_path: AtomicU64,
+    /// Stalled transactions this node took over via the recovery sweep.
+    pub recoveries: AtomicU64,
+    /// Compaction rounds that advanced the redundancy watermark.
+    pub compactions: AtomicU64,
+    /// Watermark reports held back below the local applied-through point by
+    /// sync coverage: by more than the compaction margin, or by no coverage
+    /// proven at all — e.g. after a partition heal or restart, until
+    /// anti-entropy re-covers the window. A report trailing its coverage by
+    /// an anti-entropy round, as every report in a healthy cluster does, is
+    /// not counted (#452).
+    pub watermark_clamps: AtomicU64,
+    /// Group-commit journal flushes performed.
+    pub journal_flushes: AtomicU64,
+    /// Anti-entropy contacts found truncated above what this node vouched
+    /// for: the window in between can no longer be shipped to it, so it
+    /// cannot be repaired by anti-entropy (compaction outran repair, a
+    /// journal was rolled back unnoticed, or an operator compacted by
+    /// hand). Counted, not acted on: a replica that copied its slots under
+    /// a layout change is in that position legitimately (#453).
+    pub sync_contact_truncated: AtomicU64,
+    /// Inbound messages handled.
+    pub messages_handled: AtomicU64,
+    /// Outbound messages shed because a peer's queue was full (backpressure).
+    pub messages_shed: AtomicU64,
+    /// Same-shard peers this node stopped waiting for because they were silent
+    /// past `NodeConfig::peer_absence_limit` (compaction then proceeds without
+    /// them).
+    pub peers_absent: AtomicU64,
+    /// Times a peer told this node to rejoin the group from a snapshot: it had
+    /// been absent while transactions it never applied were compacted.
+    pub rejoins_required: AtomicU64,
+    /// Snapshot pages this node served to joining peers.
+    pub snapshot_pages: AtomicU64,
+    /// Joins of this node that failed after part of the snapshot was
+    /// installed: the store holds a prefix no contact can complete, so it
+    /// must be emptied before the next join.
+    pub joins_partial: AtomicU64,
+    /// Phases of a coordination this node drove that waited on past
+    /// `collect_timeout` because the quorum was short of this node's own
+    /// answer, and its own store was still working the transaction: reading
+    /// its version condition, or enacting it (or the decided transactions
+    /// ahead of it). The write completes in the store's time instead of
+    /// falling to a recovery that would wait on the same store (#475). A
+    /// rising count means a store whose reads or fsyncs outlast the timeout.
+    pub own_store_waits: AtomicU64,
+    /// Writes this node coordinated whose coordination failed a phase — a
+    /// quorum short at the deadline, a refusal — and that were settled by
+    /// this node's own recovery of them. Each is a write that took at least
+    /// a `collect_timeout`, or a round of recovery, longer than it should.
+    pub writes_settled: AtomicU64,
+    /// Decided-transaction applies and commit-condition reads the data store
+    /// failed. The transaction is neither marked nor acknowledged; it is
+    /// retried on the next drive, so a persistent count means a store that
+    /// cannot take writes.
+    pub execution_failures: AtomicU64,
+    /// Command pages this node served to joining peers: the applied commands
+    /// a join imports into its conflict graph, a page budget at a time.
+    pub command_pages: AtomicU64,
+    /// Votes refused below the vote fence: a PreAccept, an Accept or a
+    /// recovery's pre-accept of a transaction this node never witnessed,
+    /// below what it vouched for — a watermark report, sync coverage, a
+    /// join's vouch, its stable point — or could vouch for now (#337).
+    pub votes_fenced: AtomicU64,
+    /// Votes refused to an original coordinator past its deadline: its
+    /// PreAccept, or its Accept at the transaction's own ballot, for a
+    /// transaction this node never witnessed, older than its compaction
+    /// margin. A steady rate means coordinators slower than the margin.
+    pub votes_late: AtomicU64,
+    /// Decisions learned from peers for transactions this node never
+    /// witnessed, but a command committed here waits on (#330).
+    pub dependencies_learned: AtomicU64,
+    /// Times this node opened joining over an empty journal and set an
+    /// amnesia fence: it lost the journal it voted with (#312).
+    pub amnesia_fences: AtomicU64,
+    /// Joins over a lost journal that found no contact vouching past the
+    /// fence ([`FenceNotCovered`](crate::FenceNotCovered)): nothing was
+    /// installed. A count that keeps rising means a transaction below the
+    /// fence no replica can decide any more (see OPERATIONS §7).
+    pub amnesia_joins_refused: AtomicU64,
+    /// Times a peer found this node's journal rolled back to an older copy
+    /// (#339), or found it reporting from another journal than the one it
+    /// ran under — a fresh journal under a known node id (#453): the node
+    /// stops taking part until its host opens it again over an empty
+    /// journal and store, joining.
+    pub journals_rolled_back: AtomicU64,
+    /// Votes refused for a transaction whose `t0` lies more than two clock
+    /// skews past this node's clock: its coordinator's clock runs beyond the
+    /// skew bound.
+    pub votes_future_dated: AtomicU64,
+    /// Config-Paxos promises and accepts this node withheld because it lost
+    /// a journal under this node id: it abstains from config Paxos until it
+    /// restored its votes from the other acceptors (#338).
+    pub config_votes_withheld: AtomicU64,
+    /// Times this node, having lost a journal, read a majority of the other
+    /// acceptors' state and voted in config Paxos again (#338): once per
+    /// loss.
+    pub config_votes_restored: AtomicU64,
+    /// PreAccepts and read probes refused because the coordinator planned
+    /// them under an older layout and a key they touch changed replicas
+    /// since: it planned before it installed the change (it retries under
+    /// the new layout).
+    pub votes_retired: AtomicU64,
+    /// Messages about a transaction planned under an epoch this node has not
+    /// installed yet: left unanswered while it fetches the metadata it is
+    /// missing from the sender.
+    pub messages_future_epoch: AtomicU64,
+    /// Invalidations of a dependency no replica holds put off (#447): a
+    /// config-Paxos read showed an epoch above the installed one accepted,
+    /// so the dependency may have been planned under a larger layout than
+    /// the refusals were counted against, or too few acceptors answered the
+    /// read. Retried by the next sweep, once the epoch is installed here.
+    pub orphan_judgments_deferred: AtomicU64,
+    /// Votes a layout change refused: for a transaction this node never
+    /// witnessed, on a key a transition moves, above this node's fence point
+    /// — or planned under the new layout below its activation's clock floor.
+    pub votes_change_fenced: AtomicU64,
+    /// Writes this node refused to coordinate because a key they touch is
+    /// moving ([`TopologyChanging`](crate::TopologyChanging)).
+    pub writes_topology_changing: AtomicU64,
+    /// Streams dropped from the store: the slots a layout change took from
+    /// this node, or gave it and that it held stale events for (#372).
+    pub streams_dropped: AtomicU64,
+    /// Applies that left events out of the store, their keys no longer this
+    /// node's under the installed layout (a late apply, an import from a peer
+    /// behind on the layout, or a restart's replay of a dropped slot).
+    pub applies_not_owned: AtomicU64,
+    /// Events a range copy under the write fence installed: what the slots a
+    /// change gave this node held, less what a pre-seed brought first (#373).
+    pub range_copy_events: AtomicU64,
+    /// Pre-seed passes this node ran: copies of the slots a change would
+    /// give it, before the change was decided (#373).
+    pub preseed_passes: AtomicU64,
+    /// Events the pre-seed passes installed.
+    pub preseed_events: AtomicU64,
+    /// Pre-seeds a change this node drove did not wait out: the change went
+    /// on, the fenced copy bringing the rest.
+    pub preseeds_timed_out: AtomicU64,
+    /// Pre-seeds this node declined (#471): asked while it gains slots in a
+    /// transition in progress, which its fenced copy for that transition
+    /// brings (or brought, and reported). The change's fenced copy brings
+    /// its slots whole.
+    pub preseeds_declined: AtomicU64,
+    /// Copies the layout moved on under (#469): a pre-seed for an epoch
+    /// another change took, or a fenced copy for a transition replaced. What
+    /// they brought in for slots this node does not own was dropped.
+    pub copies_voided: AtomicU64,
+    /// Copied events stamped below this node's stable point when they
+    /// landed: history its subscriptions already read past and will not see
+    /// (#374).
+    pub copied_below_stable: AtomicU64,
+}
+
+impl Metrics {
+    /// Creates a zeroed metrics set.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records a coordinated write's outcome: committed vs conflicted, and whether
+    /// it took the fast path.
+    pub fn record_outcome(&self, conflict: bool, fast: bool) {
+        if conflict {
+            self.writes_conflicted.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.writes_committed.fetch_add(1, Ordering::Relaxed);
+        }
+        let path = if fast {
+            &self.fast_path
+        } else {
+            &self.slow_path
+        };
+        path.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records that a silent peer is no longer waited for.
+    pub fn record_peer_absent(&self) {
+        self.peers_absent.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records that a peer told this node to rejoin.
+    pub fn record_rejoin_required(&self) {
+        self.rejoins_required.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records that the recovery sweep took over a stalled transaction.
+    pub fn record_recovery(&self) {
+        self.recoveries.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a compaction round that advanced the watermark.
+    pub fn record_compaction(&self) {
+        self.compactions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a watermark report clamped by missing sync coverage.
+    pub fn record_watermark_clamp(&self) {
+        self.watermark_clamps.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a group-commit journal flush.
+    pub fn record_flush(&self) {
+        self.journal_flushes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records an anti-entropy contact found truncated above what this node
+    /// vouched for.
+    pub fn record_sync_contact_truncated(&self) {
+        self.sync_contact_truncated.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records one inbound message handled.
+    pub fn record_message(&self) {
+        self.messages_handled.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records one outbound message shed because the peer's queue was full.
+    pub fn record_shed(&self) {
+        self.messages_shed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records one snapshot page served to a joining peer.
+    pub fn record_snapshot_page(&self) {
+        self.snapshot_pages.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records one command page served to a joining peer.
+    pub fn record_command_page(&self) {
+        self.command_pages.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a vote refused below the vote fence.
+    pub fn record_vote_fenced(&self) {
+        self.votes_fenced.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a vote refused to an original coordinator past its deadline.
+    pub fn record_vote_late(&self) {
+        self.votes_late.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a decision learned for a dependency never witnessed here.
+    pub fn record_dependency_learned(&self) {
+        self.dependencies_learned.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records an amnesia fence set over a lost journal.
+    pub fn record_amnesia_fence(&self) {
+        self.amnesia_fences.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a journal a peer found rolled back.
+    pub fn record_journal_rolled_back(&self) {
+        self.journals_rolled_back.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a join over a lost journal that no contact vouched for.
+    pub fn record_amnesia_join_refused(&self) {
+        self.amnesia_joins_refused.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a vote refused for a transaction dated past the skew bound.
+    pub fn record_vote_future_dated(&self) {
+        self.votes_future_dated.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a PreAccept or read probe refused for a layout retired since.
+    pub fn record_vote_retired(&self) {
+        self.votes_retired.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a message left unanswered for a future epoch.
+    pub fn record_message_future_epoch(&self) {
+        self.messages_future_epoch.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records an orphan dependency's invalidation put off for a newer
+    /// epoch, or for too few acceptors answering.
+    pub fn record_orphan_judgment_deferred(&self) {
+        self.orphan_judgments_deferred
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a vote a layout change refused.
+    pub fn record_vote_change_fenced(&self) {
+        self.votes_change_fenced.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a write refused while a key it touches moves.
+    pub fn record_write_topology_changing(&self) {
+        self.writes_topology_changing
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records `streams` dropped from the store.
+    pub fn record_streams_dropped(&self, streams: usize) {
+        self.streams_dropped
+            .fetch_add(streams as u64, Ordering::Relaxed);
+    }
+
+    /// Records an apply that left events of keys this node no longer owns out.
+    pub fn record_applies_not_owned(&self) {
+        self.applies_not_owned.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records `events` a range copy under the fence installed.
+    pub fn record_range_copy_events(&self, events: usize) {
+        self.range_copy_events
+            .fetch_add(events as u64, Ordering::Relaxed);
+    }
+
+    /// Records a pre-seed pass that installed `events`.
+    pub fn record_preseed_pass(&self, events: usize) {
+        self.preseed_passes.fetch_add(1, Ordering::Relaxed);
+        self.preseed_events
+            .fetch_add(events as u64, Ordering::Relaxed);
+    }
+
+    /// Records a pre-seed a change did not wait out.
+    pub fn record_preseed_timed_out(&self) {
+        self.preseeds_timed_out.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a pre-seed this node declined.
+    pub fn record_preseed_declined(&self) {
+        self.preseeds_declined.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a copy the layout moved on under.
+    pub fn record_copy_voided(&self) {
+        self.copies_voided.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records `events` copied below this node's stable point.
+    pub fn record_copied_below_stable(&self, events: usize) {
+        self.copied_below_stable
+            .fetch_add(events as u64, Ordering::Relaxed);
+    }
+
+    /// Records a config-Paxos vote withheld after a lost journal.
+    pub fn record_config_vote_withheld(&self) {
+        self.config_votes_withheld.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records this node's config votes restored after a lost journal.
+    pub fn record_config_votes_restored(&self) {
+        self.config_votes_restored.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a join that failed after part of the snapshot was installed.
+    pub fn record_join_partial(&self) {
+        self.joins_partial.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a data-store apply or commit-condition read that failed.
+    pub fn record_execution_failure(&self) {
+        self.execution_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a phase that waited on past its deadline for this node's own
+    /// store (#475).
+    pub fn record_own_store_wait(&self) {
+        self.own_store_waits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a write whose failed coordination this node's own recovery
+    /// settled.
+    pub fn record_write_settled(&self) {
+        self.writes_settled.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A consistent-enough point-in-time view of all counters.
+    pub fn snapshot(&self) -> MetricsSnapshot {
+        MetricsSnapshot {
+            writes_committed: self.writes_committed.load(Ordering::Relaxed),
+            writes_conflicted: self.writes_conflicted.load(Ordering::Relaxed),
+            fast_path: self.fast_path.load(Ordering::Relaxed),
+            slow_path: self.slow_path.load(Ordering::Relaxed),
+            recoveries: self.recoveries.load(Ordering::Relaxed),
+            compactions: self.compactions.load(Ordering::Relaxed),
+            watermark_clamps: self.watermark_clamps.load(Ordering::Relaxed),
+            journal_flushes: self.journal_flushes.load(Ordering::Relaxed),
+            sync_contact_truncated: self.sync_contact_truncated.load(Ordering::Relaxed),
+            messages_handled: self.messages_handled.load(Ordering::Relaxed),
+            messages_shed: self.messages_shed.load(Ordering::Relaxed),
+            peers_absent: self.peers_absent.load(Ordering::Relaxed),
+            rejoins_required: self.rejoins_required.load(Ordering::Relaxed),
+            snapshot_pages: self.snapshot_pages.load(Ordering::Relaxed),
+            joins_partial: self.joins_partial.load(Ordering::Relaxed),
+            execution_failures: self.execution_failures.load(Ordering::Relaxed),
+            own_store_waits: self.own_store_waits.load(Ordering::Relaxed),
+            writes_settled: self.writes_settled.load(Ordering::Relaxed),
+            command_pages: self.command_pages.load(Ordering::Relaxed),
+            votes_fenced: self.votes_fenced.load(Ordering::Relaxed),
+            votes_late: self.votes_late.load(Ordering::Relaxed),
+            dependencies_learned: self.dependencies_learned.load(Ordering::Relaxed),
+            amnesia_fences: self.amnesia_fences.load(Ordering::Relaxed),
+            amnesia_joins_refused: self.amnesia_joins_refused.load(Ordering::Relaxed),
+            journals_rolled_back: self.journals_rolled_back.load(Ordering::Relaxed),
+            votes_future_dated: self.votes_future_dated.load(Ordering::Relaxed),
+            config_votes_withheld: self.config_votes_withheld.load(Ordering::Relaxed),
+            config_votes_restored: self.config_votes_restored.load(Ordering::Relaxed),
+            votes_retired: self.votes_retired.load(Ordering::Relaxed),
+            messages_future_epoch: self.messages_future_epoch.load(Ordering::Relaxed),
+            orphan_judgments_deferred: self.orphan_judgments_deferred.load(Ordering::Relaxed),
+            votes_change_fenced: self.votes_change_fenced.load(Ordering::Relaxed),
+            writes_topology_changing: self.writes_topology_changing.load(Ordering::Relaxed),
+            streams_dropped: self.streams_dropped.load(Ordering::Relaxed),
+            applies_not_owned: self.applies_not_owned.load(Ordering::Relaxed),
+            range_copy_events: self.range_copy_events.load(Ordering::Relaxed),
+            preseed_passes: self.preseed_passes.load(Ordering::Relaxed),
+            preseed_events: self.preseed_events.load(Ordering::Relaxed),
+            preseeds_timed_out: self.preseeds_timed_out.load(Ordering::Relaxed),
+            preseeds_declined: self.preseeds_declined.load(Ordering::Relaxed),
+            copies_voided: self.copies_voided.load(Ordering::Relaxed),
+            copied_below_stable: self.copied_below_stable.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// An immutable point-in-time view of [`Metrics`], field-for-field; see the
+/// counter docs there.
+#[allow(missing_docs)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MetricsSnapshot {
+    pub writes_committed: u64,
+    pub writes_conflicted: u64,
+    pub fast_path: u64,
+    pub slow_path: u64,
+    pub recoveries: u64,
+    pub compactions: u64,
+    pub watermark_clamps: u64,
+    pub journal_flushes: u64,
+    pub sync_contact_truncated: u64,
+    pub messages_handled: u64,
+    pub messages_shed: u64,
+    pub peers_absent: u64,
+    pub rejoins_required: u64,
+    pub snapshot_pages: u64,
+    pub joins_partial: u64,
+    pub execution_failures: u64,
+    pub own_store_waits: u64,
+    pub writes_settled: u64,
+    pub command_pages: u64,
+    pub votes_fenced: u64,
+    pub votes_late: u64,
+    pub dependencies_learned: u64,
+    pub amnesia_fences: u64,
+    pub amnesia_joins_refused: u64,
+    pub journals_rolled_back: u64,
+    pub votes_future_dated: u64,
+    pub config_votes_withheld: u64,
+    pub config_votes_restored: u64,
+    pub votes_retired: u64,
+    pub messages_future_epoch: u64,
+    pub orphan_judgments_deferred: u64,
+    pub votes_change_fenced: u64,
+    pub writes_topology_changing: u64,
+    pub streams_dropped: u64,
+    pub applies_not_owned: u64,
+    pub range_copy_events: u64,
+    pub preseed_passes: u64,
+    pub preseed_events: u64,
+    pub preseeds_timed_out: u64,
+    pub preseeds_declined: u64,
+    pub copies_voided: u64,
+    pub copied_below_stable: u64,
+}
+
+impl MetricsSnapshot {
+    /// The counters, each as `(prometheus name, help text, value)`. The single
+    /// source of truth for both [`to_prometheus`](Self::to_prometheus) and
+    /// [`to_prometheus_labeled`](Self::to_prometheus_labeled); add a counter here and
+    /// both renderings pick it up.
+    fn counters(&self) -> [(&'static str, &'static str, u64); 42] {
+        [
+            (
+                "cluster_writes_committed_total",
+                "Writes this node coordinated that committed.",
+                self.writes_committed,
+            ),
+            (
+                "cluster_writes_conflicted_total",
+                "Writes this node coordinated that lost the optimistic-version condition.",
+                self.writes_conflicted,
+            ),
+            (
+                "cluster_fast_path_total",
+                "Coordinated writes decided on the one-round-trip fast path.",
+                self.fast_path,
+            ),
+            (
+                "cluster_slow_path_total",
+                "Coordinated writes that fell back to the slow (Accept) path.",
+                self.slow_path,
+            ),
+            (
+                "cluster_recoveries_total",
+                "Stalled transactions this node took over via the recovery sweep.",
+                self.recoveries,
+            ),
+            (
+                "cluster_compactions_total",
+                "Compaction rounds that advanced the redundancy watermark.",
+                self.compactions,
+            ),
+            (
+                "cluster_watermark_clamps_total",
+                "Watermark reports held back by missing sync coverage: by more than the compaction margin, or by none proven at all.",
+                self.watermark_clamps,
+            ),
+            (
+                "cluster_journal_flushes_total",
+                "Group-commit journal flushes performed.",
+                self.journal_flushes,
+            ),
+            (
+                "cluster_sync_contact_truncated_total",
+                "Anti-entropy contacts found truncated above what this node vouched for.",
+                self.sync_contact_truncated,
+            ),
+            (
+                "cluster_messages_handled_total",
+                "Inbound messages handled.",
+                self.messages_handled,
+            ),
+            (
+                "cluster_messages_shed_total",
+                "Outbound messages shed because a peer's queue was full.",
+                self.messages_shed,
+            ),
+            (
+                "cluster_peers_absent_total",
+                "Silent shard peers this node stopped waiting for (compaction proceeds without them).",
+                self.peers_absent,
+            ),
+            (
+                "cluster_rejoins_required_total",
+                "Times a peer told this node to rejoin the group from a snapshot.",
+                self.rejoins_required,
+            ),
+            (
+                "cluster_snapshot_pages_total",
+                "Snapshot pages served to joining peers.",
+                self.snapshot_pages,
+            ),
+            (
+                "cluster_joins_partial_total",
+                "Joins that failed after part of the snapshot was installed (empty the store before retrying).",
+                self.joins_partial,
+            ),
+            (
+                "cluster_execution_failures_total",
+                "Decided-transaction applies and commit-condition reads the data store failed (retried, never acknowledged).",
+                self.execution_failures,
+            ),
+            (
+                "cluster_own_store_waits_total",
+                "Coordination phases that waited on past collect_timeout for this node's own store, still reading or enacting the transaction.",
+                self.own_store_waits,
+            ),
+            (
+                "cluster_writes_settled_total",
+                "Coordinated writes whose failed coordination this node's own recovery settled.",
+                self.writes_settled,
+            ),
+            (
+                "cluster_command_pages_total",
+                "Command pages served to joining peers.",
+                self.command_pages,
+            ),
+            (
+                "cluster_votes_fenced_total",
+                "Votes refused for transactions never witnessed here, below what this node vouched for.",
+                self.votes_fenced,
+            ),
+            (
+                "cluster_votes_late_total",
+                "Votes refused to original coordinators older than the compaction margin, for transactions never witnessed here.",
+                self.votes_late,
+            ),
+            (
+                "cluster_dependencies_learned_total",
+                "Decisions learned from peers for dependencies never witnessed here.",
+                self.dependencies_learned,
+            ),
+            (
+                "cluster_amnesia_fences_total",
+                "Times this node opened joining over an empty journal and set an amnesia fence.",
+                self.amnesia_fences,
+            ),
+            (
+                "cluster_amnesia_joins_refused_total",
+                "Joins over a lost journal that no contact vouched past the fence (nothing installed).",
+                self.amnesia_joins_refused,
+            ),
+            (
+                "cluster_journals_rolled_back_total",
+                "Times a peer found this node's journal rolled back to an older copy.",
+                self.journals_rolled_back,
+            ),
+            (
+                "cluster_votes_future_dated_total",
+                "Votes refused for transactions dated more than two clock skews past this node's clock.",
+                self.votes_future_dated,
+            ),
+            (
+                "cluster_config_votes_withheld_total",
+                "Config-Paxos votes withheld by a node that lost a journal under its node id.",
+                self.config_votes_withheld,
+            ),
+            (
+                "cluster_config_votes_restored_total",
+                "Times a node that lost a journal read the other acceptors' state and voted in config Paxos again.",
+                self.config_votes_restored,
+            ),
+            (
+                "cluster_votes_retired_total",
+                "PreAccepts and read probes refused: planned under a layout whose keys changed replicas since.",
+                self.votes_retired,
+            ),
+            (
+                "cluster_messages_future_epoch_total",
+                "Messages about a transaction planned under an epoch not installed here yet (metadata fetched).",
+                self.messages_future_epoch,
+            ),
+            (
+                "cluster_orphan_judgments_deferred_total",
+                "Invalidations of a dependency no replica holds put off: an epoch above the installed one was accepted, or too few acceptors answered.",
+                self.orphan_judgments_deferred,
+            ),
+            (
+                "cluster_votes_change_fenced_total",
+                "Votes a layout change refused: never witnessed, on a moved key, past the fence (or below the floor).",
+                self.votes_change_fenced,
+            ),
+            (
+                "cluster_writes_topology_changing_total",
+                "Writes refused while a key they touch moves to other replicas.",
+                self.writes_topology_changing,
+            ),
+            (
+                "cluster_streams_dropped_total",
+                "Streams dropped from the store: slots a layout change took from this node, or gave it back.",
+                self.streams_dropped,
+            ),
+            (
+                "cluster_applies_not_owned_total",
+                "Applies that left events out of the store, their keys no longer this node's.",
+                self.applies_not_owned,
+            ),
+            (
+                "cluster_range_copy_events_total",
+                "Events a range copy under the write fence installed.",
+                self.range_copy_events,
+            ),
+            (
+                "cluster_preseed_passes_total",
+                "Pre-seed passes: copies of the slots a change would give this node, before it was decided.",
+                self.preseed_passes,
+            ),
+            (
+                "cluster_preseed_events_total",
+                "Events the pre-seed passes installed.",
+                self.preseed_events,
+            ),
+            (
+                "cluster_preseeds_timed_out_total",
+                "Pre-seeds a change this node drove did not wait out.",
+                self.preseeds_timed_out,
+            ),
+            (
+                "cluster_preseeds_declined_total",
+                "Pre-seeds this node declined while it gains slots in a transition in progress.",
+                self.preseeds_declined,
+            ),
+            (
+                "cluster_copies_voided_total",
+                "Copies the layout moved on under; what they brought in for slots this node does not own was dropped.",
+                self.copies_voided,
+            ),
+            (
+                "cluster_copied_below_stable_total",
+                "Copied events stamped below this node's stable point: history its subscriptions will not see.",
+                self.copied_below_stable,
+            ),
+        ]
+    }
+
+    /// Renders the counters in Prometheus text exposition format (no labels).
+    ///
+    /// Hand-rolled — every counter becomes a `# HELP` / `# TYPE … counter` /
+    /// `name value` stanza. This keeps the crate dependency-free; the operator wires
+    /// the actual `/metrics` HTTP endpoint and serves this string.
+    pub fn to_prometheus(&self) -> String {
+        self.to_prometheus_labeled(&[])
+    }
+
+    /// Like [`to_prometheus`](Self::to_prometheus) but attaches `labels` (e.g. the
+    /// node id) to every metric, so a multi-node scrape can disambiguate series:
+    ///
+    /// ```rust,no_run
+    /// # use std::sync::Arc;
+    /// # use evento_cluster::{
+    /// #     HybridLogicalClock, InMemoryDataStore, InMemoryJournal, InMemoryNetwork, Node,
+    /// #     NodeId, StaticTopology,
+    /// # };
+    /// # let node_id = NodeId(0);
+    /// # let net = InMemoryNetwork::new();
+    /// # let node = Node::new(
+    /// #     node_id,
+    /// #     Arc::new(StaticTopology::new(node_id, vec![node_id])),
+    /// #     Arc::new(HybridLogicalClock::new(node_id)),
+    /// #     Arc::new(net.sink(node_id)),
+    /// #     Arc::new(InMemoryDataStore::new()),
+    /// #     Arc::new(InMemoryJournal::new()),
+    /// # );
+    /// let text = node.metrics().to_prometheus_labeled(&[("node", &node_id.0.to_string())]);
+    /// ```
+    pub fn to_prometheus_labeled(&self, labels: &[(&str, &str)]) -> String {
+        let label_set = if labels.is_empty() {
+            String::new()
+        } else {
+            let inner = labels
+                .iter()
+                .map(|(k, v)| format!("{k}=\"{}\"", escape_label(v)))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{inner}}}")
+        };
+
+        let mut out = String::new();
+        for (name, help, value) in self.counters() {
+            out.push_str(&format!("# HELP {name} {help}\n"));
+            out.push_str(&format!("# TYPE {name} counter\n"));
+            out.push_str(&format!("{name}{label_set} {value}\n"));
+        }
+        out
+    }
+}
+
+/// Escapes a Prometheus label value (`\`, `"`, and newlines), per the exposition
+/// format spec.
+fn escape_label(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn record_shed_increments_and_appears_in_snapshot() {
+        let m = Metrics::new();
+        assert_eq!(m.snapshot().messages_shed, 0);
+        m.record_shed();
+        m.record_shed();
+        assert_eq!(m.snapshot().messages_shed, 2);
+    }
+
+    #[test]
+    fn prometheus_renders_help_type_and_value_lines() {
+        let snap = MetricsSnapshot {
+            writes_committed: 7,
+            messages_shed: 3,
+            ..Default::default()
+        };
+        let text = snap.to_prometheus();
+        assert!(text.contains("# HELP cluster_writes_committed_total"));
+        assert!(text.contains("# TYPE cluster_writes_committed_total counter"));
+        assert!(text.contains("\ncluster_writes_committed_total 7\n"));
+        assert!(text.contains("\ncluster_messages_shed_total 3\n"));
+        // Every counter renders three lines (HELP, TYPE, sample).
+        assert_eq!(text.lines().count(), snap.counters().len() * 3);
+    }
+
+    #[test]
+    fn prometheus_labels_are_attached_and_escaped() {
+        let snap = MetricsSnapshot {
+            writes_committed: 1,
+            ..Default::default()
+        };
+        let text = snap.to_prometheus_labeled(&[("node", "n\"1")]);
+        // Label set follows the metric name, with the quote escaped.
+        assert!(text.contains("cluster_writes_committed_total{node=\"n\\\"1\"} 1\n"));
+    }
+}

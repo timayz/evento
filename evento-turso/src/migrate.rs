@@ -6,8 +6,8 @@
 //! database's `PRAGMA user_version`, this runner records each applied
 //! migration by name under an app namespace, in the table
 //! `_evento_turso_migrations`. Several independent lists — evento's schema
-//! under [`"evento"`](crate::MIGRATIONS), the accord journal's under
-//! `"evento-accord"`, and an application's own — then share one database
+//! under [`"evento"`](crate::MIGRATIONS), the cluster journal's under
+//! `"evento-cluster"`, and an application's own — then share one database
 //! without stepping on each other, as `sqlx_migrator`'s apps do.
 //!
 //! Migrations are applied in definition order, each in its own transaction

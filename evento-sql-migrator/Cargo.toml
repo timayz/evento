@@ -30,7 +30,7 @@ default = ["sqlite", "mysql", "postgres"]
 sqlite = ["evento-sql/sqlite", "sea-query/backend-sqlite", "sqlx/sqlite", "sqlx_migrator/sqlite"]
 mysql = ["evento-sql/mysql", "sea-query/backend-mysql", "sqlx/mysql", "sqlx/migrate", "sqlx_migrator/mysql"]
 postgres = ["evento-sql/postgres", "sea-query/backend-postgres", "sqlx/postgres", "sqlx/migrate", "sqlx_migrator/postgres"]
-accord = []
+cluster = []
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

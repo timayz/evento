@@ -1,0 +1,165 @@
+//! The single create/drop operation for the four cluster-journal tables.
+
+use sea_query::{ColumnDef, Table, TableCreateStatement, TableDropStatement};
+
+use super::{ClusterAcceptors, ClusterCommands, ClusterMeta, ClusterMetadataLog};
+
+pub struct Operation;
+
+/// `CREATE TABLE` statements for the four tables. Types are chosen to be portable
+/// across SQLite/MySQL/PostgreSQL: the `txn` key is `VARBINARY(20)` (a BLOB primary
+/// key is invalid on MySQL) — the 20-byte order-preserving `(micros, logical, node)`
+/// pack `SqlJournal` writes — and the `meta` key is `VARCHAR(64)`. **Must match
+/// `evento_sql::SqlJournal::migrate`.**
+fn up_statements() -> Vec<TableCreateStatement> {
+    vec![
+        Table::create()
+            .table(ClusterCommands::Table)
+            .if_not_exists()
+            .col(
+                ColumnDef::new(ClusterCommands::Txn)
+                    .var_binary(20)
+                    .not_null()
+                    .primary_key(),
+            )
+            .col(ColumnDef::new(ClusterCommands::Data).blob().not_null())
+            .to_owned(),
+        Table::create()
+            .table(ClusterMeta::Table)
+            .if_not_exists()
+            .col(
+                ColumnDef::new(ClusterMeta::K)
+                    .string_len(64)
+                    .not_null()
+                    .primary_key(),
+            )
+            .col(ColumnDef::new(ClusterMeta::V).blob().not_null())
+            .to_owned(),
+        Table::create()
+            .table(ClusterMetadataLog::Table)
+            .if_not_exists()
+            .col(
+                ColumnDef::new(ClusterMetadataLog::Epoch)
+                    .big_integer()
+                    .not_null()
+                    .primary_key(),
+            )
+            .col(ColumnDef::new(ClusterMetadataLog::Layout).blob().not_null())
+            .to_owned(),
+        Table::create()
+            .table(ClusterAcceptors::Table)
+            .if_not_exists()
+            .col(
+                ColumnDef::new(ClusterAcceptors::Epoch)
+                    .big_integer()
+                    .not_null()
+                    .primary_key(),
+            )
+            .col(ColumnDef::new(ClusterAcceptors::State).blob().not_null())
+            .to_owned(),
+    ]
+}
+
+fn down_statements() -> Vec<TableDropStatement> {
+    // `if_exists` keeps the revert runnable after a partial apply on MySQL,
+    // whose DDL is non-transactional.
+    vec![
+        Table::drop()
+            .table(ClusterCommands::Table)
+            .if_exists()
+            .to_owned(),
+        Table::drop()
+            .table(ClusterMeta::Table)
+            .if_exists()
+            .to_owned(),
+        Table::drop()
+            .table(ClusterMetadataLog::Table)
+            .if_exists()
+            .to_owned(),
+        Table::drop()
+            .table(ClusterAcceptors::Table)
+            .if_exists()
+            .to_owned(),
+    ]
+}
+
+#[cfg(feature = "sqlite")]
+#[async_trait::async_trait]
+impl sqlx_migrator::Operation<sqlx::Sqlite> for Operation {
+    async fn up(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+    ) -> Result<(), sqlx_migrator::Error> {
+        for statement in up_statements() {
+            let sql = statement.to_string(sea_query::SqliteQueryBuilder);
+            sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+                .execute(&mut *connection)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn down(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+    ) -> Result<(), sqlx_migrator::Error> {
+        for statement in down_statements() {
+            let sql = statement.to_string(sea_query::SqliteQueryBuilder);
+            sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+                .execute(&mut *connection)
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "mysql")]
+#[async_trait::async_trait]
+impl sqlx_migrator::Operation<sqlx::MySql> for Operation {
+    async fn up(&self, connection: &mut sqlx::MySqlConnection) -> Result<(), sqlx_migrator::Error> {
+        for statement in up_statements() {
+            let sql = statement.to_string(sea_query::MysqlQueryBuilder);
+            sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+                .execute(&mut *connection)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn down(
+        &self,
+        connection: &mut sqlx::MySqlConnection,
+    ) -> Result<(), sqlx_migrator::Error> {
+        for statement in down_statements() {
+            let sql = statement.to_string(sea_query::MysqlQueryBuilder);
+            sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+                .execute(&mut *connection)
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "postgres")]
+#[async_trait::async_trait]
+impl sqlx_migrator::Operation<sqlx::Postgres> for Operation {
+    async fn up(&self, connection: &mut sqlx::PgConnection) -> Result<(), sqlx_migrator::Error> {
+        for statement in up_statements() {
+            let sql = statement.to_string(sea_query::PostgresQueryBuilder);
+            sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+                .execute(&mut *connection)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn down(&self, connection: &mut sqlx::PgConnection) -> Result<(), sqlx_migrator::Error> {
+        for statement in down_statements() {
+            let sql = statement.to_string(sea_query::PostgresQueryBuilder);
+            sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+                .execute(&mut *connection)
+                .await?;
+        }
+        Ok(())
+    }
+}

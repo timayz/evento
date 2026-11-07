@@ -4,8 +4,8 @@
 //! by the bitcode encoding of a [`ClientFrame`] or [`ServerFrame`]. bitcode is
 //! positional and not self-describing, so the header is what turns a schema or
 //! dialect mismatch into a loud error instead of garbage. The magic (`Er`) is
-//! distinct from evento-accord's (`Ac`), so pointing a remote client at an
-//! accord port fails immediately.
+//! distinct from evento-cluster's (`Ac`), so pointing a remote client at an
+//! cluster port fails immediately.
 
 use evento_core::cursor::{Args, PageInfo, Value};
 use evento_core::{Event, EventFilter, RoutingKey, TenantFilter, WriteError};
@@ -342,7 +342,7 @@ impl From<WireWriteError> for WriteError {
     }
 }
 
-// NOTE: keep in sync with evento-accord/src/message.rs `mod wire_events`.
+// NOTE: keep in sync with evento-cluster/src/message.rs `mod wire_events`.
 /// Serde bridge for `Vec<Event>`. evento's [`Event`] is not itself
 /// (de)serializable, so it is mirrored field-for-field by [`WireEvent`], whose
 /// only non-trivial field is the bitcode-encoded

@@ -14,7 +14,7 @@ description: >-
 Evento stores state changes as immutable events and folds them into read models.
 Backends: SQLite / PostgreSQL / MySQL (via `sqlx`), embedded Fjall, embedded Turso
 (SQLite's schema in a pure-Rust async engine, `turso`), a remote client/server
-executor (`remote`), and a consensus-replicated executor (`evento-accord`, alpha). Events are serialized with `bitcode`.
+executor (`remote`), and a consensus-replicated executor (`evento-cluster`, alpha). Events are serialized with `bitcode`.
 
 ## Setup
 
@@ -70,7 +70,7 @@ let mut conn = executor.connect()?;
 APP.to_latest(&mut conn).await.map_err(|(_, e)| e)?;
 ```
 
-Several writers in one database (the store, its accord journal, your read models) need
+Several writers in one database (the store, its cluster journal, your read models) need
 the store opened in concurrent mode — `evento::Turso::open_concurrent(path)` /
 `in_memory_concurrent()` — which puts the file in Turso's MVCC mode (recorded in it; a
 later plain `open` finds it, `store.write_mode()` tells). The store's and journal's writes
@@ -141,11 +141,11 @@ let executor = evento::Sidecar::from((client, local));        // events: client;
 - `Rw::from((read_exec, write_exec))` splits reads from writes (CQRS with two databases).
 - `evento::Evento::new(exec)` type-erases any executor (`Arc<Box<dyn Executor>>`) —
   use it when a struct must hold "some executor" without a generic parameter.
-- **Accord (consensus-replicated, alpha):** the `accord` feature (`evento::accord`)
+- **Cluster (consensus-replicated, alpha):** the `cluster` feature (`evento::cluster`)
   replicates writes leaderlessly with any local backend serving reads, whose
   consensus journal it also enables (`evento::fjall::FjallJournal`, `evento::sql::SqlJournal`,
   `evento::turso::TursoJournal`); one process runs one node of one cluster
-  (`examples/bank-axum-accord/`, `evento-accord/OPERATIONS.md`).
+  (`examples/bank-axum-cluster/`, `evento-cluster/OPERATIONS.md`).
 
 ## 1. Define aggregates & events
 
@@ -473,8 +473,8 @@ Canonical, compiling usage lives in this repo:
   (one per snapshot mode), co-keyed `Owner` aggregate.
 - `examples/bank-axum-sqlite/` and `examples/bank-axum-fjall/` — web wiring,
   migrations, projection subscriptions; `bank-axum-remote/` (client/server split)
-  and `bank-axum-accord/` (consensus cluster).
-- `evento-remote/README.md` — resolver, `Hello` token, TLS; `evento-accord/OPERATIONS.md`.
+  and `bank-axum-cluster/` (consensus cluster).
+- `evento-remote/README.md` — resolver, `Hello` token, TLS; `evento-cluster/OPERATIONS.md`.
 - `evento-macro/README.md` — full macro reference (all options).
 - `evento-test/src/lib.rs` — the behavioral contract suite (load, routing isolation,
   snapshots, optimistic locking, multi-aggregate, full command lifecycle).

@@ -425,7 +425,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "bank-axum-accord"
+name = "bank-axum-cluster"
 version = "2.0.0-alpha.38"
 dependencies = [
  "anyhow",
@@ -1428,7 +1428,7 @@ version = "2.0.0-alpha.38"
 dependencies = [
  "anyhow",
  "bitcode",
- "evento-accord",
+ "evento-cluster",
  "evento-core",
  "evento-fjall",
  "evento-lock",
@@ -1445,7 +1445,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "evento-accord"
+name = "evento-cluster"
 version = "2.0.0-alpha.38"
 dependencies = [
  "anyhow",
@@ -1499,7 +1499,7 @@ dependencies = [
  "async-trait",
  "bitcode",
  "evento",
- "evento-accord",
+ "evento-cluster",
  "evento-core",
  "evento-test",
  "fjall",
@@ -1565,7 +1565,7 @@ dependencies = [
  "async-trait",
  "bitcode",
  "evento",
- "evento-accord",
+ "evento-cluster",
  "evento-core",
  "evento-test",
  "sea-query",
@@ -1612,7 +1612,7 @@ dependencies = [
  "async-trait",
  "bitcode",
  "evento",
- "evento-accord",
+ "evento-cluster",
  "evento-core",
  "evento-macro",
  "evento-test",

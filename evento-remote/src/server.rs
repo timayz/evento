@@ -6,7 +6,7 @@
 //! one-executor case (an open server, every connection gets the same store);
 //! [`serve_with`] takes the resolver that a host authenticating credentials
 //! and multiplexing stores needs. The `_tls` variants complete a rustls
-//! handshake first, mirroring `evento-accord`'s `serve`/`serve_tls` split.
+//! handshake first, mirroring `evento-cluster`'s `serve`/`serve_tls` split.
 //!
 //! Requests on one connection are handled **concurrently** (spawn per
 //! request) — multiple application tasks share one client connection, and a
