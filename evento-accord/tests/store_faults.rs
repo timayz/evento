@@ -250,6 +250,7 @@ async fn a_forwarded_read_the_store_failed_is_an_error() {
     let result = cluster.nodes[0]
         .forward_read(
             NodeId(1),
+            evento_accord::Key("acc".into()),
             None,
             None,
             evento_core::TenantFilter::All,
@@ -270,6 +271,7 @@ async fn a_forwarded_read_the_store_failed_is_an_error() {
     cluster.nodes[0]
         .forward_read(
             NodeId(1),
+            evento_accord::Key("acc".into()),
             None,
             None,
             evento_core::TenantFilter::All,
@@ -301,6 +303,7 @@ async fn a_requester_that_cannot_decode_the_failure_still_fails_the_read() {
     let result = cluster.nodes[0]
         .forward_read(
             NodeId(1),
+            evento_accord::Key("acc".into()),
             None,
             None,
             evento_core::TenantFilter::All,

@@ -84,10 +84,11 @@ pub const MAGIC: [u8; 2] = *b"Ac";
 /// peers (`RecordKind::PeerMarks`). 11: the amnesia fence records whether
 /// the replica restored its config votes, and an acceptor that lost its
 /// journal reads the others' state back (`Message::ConfigRead`,
-/// `Message::ConfigReadReply`). No reader for older versions: evento-accord
+/// `Message::ConfigReadReply`). 14: `Message::ReadForward` carries the key
+/// the requester routed by. No reader for older versions: evento-accord
 /// has not been released, so a journal of one is wiped and the node
 /// re-bootstrapped.
-pub const FORMAT_VERSION: u8 = 13;
+pub const FORMAT_VERSION: u8 = 14;
 
 /// Length of the fixed header: `MAGIC (2) + version (1) + kind (1)`.
 const HEADER_LEN: usize = 4;

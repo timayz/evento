@@ -562,6 +562,7 @@ async fn a_forwarded_read_of_a_key_this_node_lost_fails() {
     let mut reader = net.register(NodeId(9));
     let forward = |id| Message::ReadForward {
         id,
+        key: Key::in_tenant("", &left),
         aggregators: Some(vec![EventFilter::by_id_raw("test/Account", left.clone())]),
         routing_key: None,
         tenant: TenantFilter::Only(String::new()),
