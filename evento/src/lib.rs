@@ -222,10 +222,12 @@ pub use evento_remote::Address as RemoteAddress;
 #[cfg(feature = "lock")]
 pub use evento_lock as lock;
 
-/// Accord consensus protocol: node, transports, journal and data-store traits
-/// (requires `cluster` feature). The journals the local backends implement live
-/// next to their executor: `fjall::FjallJournal`, `sql::SqlJournal`,
-/// `turso::TursoJournal`.
+/// Clustered executor (requires `cluster` feature): node, topology, transports,
+/// clock, metrics, and the journal and data-store traits — what one process
+/// needs to run one node. The protocol's own types (transaction ids, command
+/// state, wire messages, the records a journal persists) live under
+/// `cluster::protocol`; the journals the local backends implement live next to
+/// their executor: `fjall::FjallJournal`, `sql::SqlJournal`, `turso::TursoJournal`.
 #[cfg(feature = "cluster")]
 pub use evento_cluster as cluster;
 

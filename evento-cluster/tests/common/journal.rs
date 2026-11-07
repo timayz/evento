@@ -6,10 +6,11 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use evento_cluster::{
+use evento_cluster::protocol::{
     AcceptorRecord, AmnesiaFence, Ballot, CommandState, ConfigEntry, CopyState, DecisionRecord,
-    DurableMark, FenceRecord, InMemoryJournal, Journal, Key, NodeId, Timestamp, TxnId,
+    DurableMark, FenceRecord, Key, Timestamp, TxnId,
 };
+use evento_cluster::{InMemoryJournal, Journal, NodeId};
 use evento_turso::TursoJournal;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};

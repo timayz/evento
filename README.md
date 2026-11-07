@@ -704,7 +704,8 @@ let executor = evento::Evento::new(evento::Sidecar::from((client, local)));
 [evento-cluster](evento-cluster) replicates writes through the Accord consensus protocol
 (Cassandra CEP-15): leaderless, strictly serializable, highly available, with any local
 backend (Fjall/SQL/Turso) serving reads. Enable the `cluster` feature on `evento`: it
-exposes the protocol as `evento::cluster` and turns on the consensus journal of every
+exposes the cluster as `evento::cluster` (the protocol's own types sit under
+`evento::cluster::protocol`) and turns on the consensus journal of every
 enabled local backend (`evento::fjall::FjallJournal`, `evento::sql::SqlJournal`,
 `evento::turso::TursoJournal`). See its [README](evento-cluster/README.md),
 [DESIGN.md](evento-cluster/DESIGN.md), and [OPERATIONS.md](evento-cluster/OPERATIONS.md),

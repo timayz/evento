@@ -21,12 +21,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use evento_cluster::clock::system_micros;
+use evento_cluster::protocol::{
+    AcceptorRecord, AmnesiaFence, Ballot, DurableMark, Key, Message, RecoveryRound, Status,
+    Timestamp, TxnId,
+};
+use evento_cluster::transport::Envelope;
 use evento_cluster::{
-    AcceptorRecord, AmnesiaFence, Ballot, Clock, DataStore, DurableMark, DynamicTopology, Envelope,
-    FenceNotCovered, HybridLogicalClock, InMemoryDataStore, InMemoryJournal, InMemoryNetwork,
-    Joining, Journal, JournalRolledBack, Key, LostJournal, Message, MessageSink, Node, NodeConfig,
-    NodeId, OpenUnconfirmed, RecoveryRound, ShardedTopology, StaticTopology, Status, Timestamp,
-    Topology, TxnId,
+    Clock, DataStore, DynamicTopology, FenceNotCovered, HybridLogicalClock, InMemoryDataStore,
+    InMemoryJournal, InMemoryNetwork, Joining, Journal, JournalRolledBack, LostJournal,
+    MessageSink, Node, NodeConfig, NodeId, OpenUnconfirmed, ShardedTopology, StaticTopology,
+    Topology,
 };
 use evento_core::Event;
 use tokio::sync::mpsc;
@@ -963,11 +967,14 @@ struct ForgetfulJournal(InMemoryJournal);
 
 #[async_trait::async_trait]
 impl Journal for ForgetfulJournal {
-    async fn record(&self, state: &evento_cluster::CommandState) -> anyhow::Result<()> {
+    async fn record(&self, state: &evento_cluster::protocol::CommandState) -> anyhow::Result<()> {
         self.0.record(state).await
     }
 
-    async fn load(&self, txn: TxnId) -> anyhow::Result<Option<evento_cluster::CommandState>> {
+    async fn load(
+        &self,
+        txn: TxnId,
+    ) -> anyhow::Result<Option<evento_cluster::protocol::CommandState>> {
         self.0.load(txn).await
     }
 }

@@ -6,7 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use evento_cluster::{DataStore, InMemoryDataStore, SnapshotPage, Timestamp, TxnId};
+use evento_cluster::protocol::{SnapshotPage, Timestamp, TxnId};
+use evento_cluster::{DataStore, InMemoryDataStore};
 use evento_core::cursor::{Args, ReadResult, Value};
 use evento_core::{Event, EventFilter, RoutingKey};
 use rand::rngs::StdRng;

@@ -8,9 +8,10 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
+use evento_cluster::protocol::TxnId;
 use evento_cluster::{
     serve, DataStore, HybridLogicalClock, InMemoryDataStore, InMemoryJournal, Journal, MessageSink,
-    Node, NodeConfig, NodeId, StaticTopology, TcpTransport, TxnId,
+    Node, NodeConfig, NodeId, StaticTopology, TcpTransport,
 };
 use evento_core::Event;
 use tokio::net::TcpListener;

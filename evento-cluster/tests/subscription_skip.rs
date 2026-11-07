@@ -34,9 +34,10 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use evento_cluster::protocol::Message;
 use evento_cluster::{
     ClusterExecutor, DataStore, ExecutorDataStore, HybridLogicalClock, InMemoryJournal,
-    InMemoryNetwork, Journal, Message, MessageSink, Node, NodeConfig, NodeId, StaticTopology,
+    InMemoryNetwork, Journal, MessageSink, Node, NodeConfig, NodeId, StaticTopology,
 };
 use evento_core::cursor::Args;
 use evento_core::subscription::{Context, Handler, SubscriptionBuilder};

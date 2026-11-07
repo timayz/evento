@@ -9,9 +9,10 @@
 
 use std::sync::Arc;
 
+use evento_cluster::protocol::{Message, Timestamp};
 use evento_cluster::{
     DataStore, HybridLogicalClock, InMemoryDataStore, InMemoryJournal, InMemoryNetwork, Journal,
-    Message, MessageSink, Node, NodeId, StaticTopology, Timestamp,
+    MessageSink, Node, NodeId, StaticTopology,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

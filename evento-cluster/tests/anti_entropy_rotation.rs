@@ -8,10 +8,10 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use evento_cluster::protocol::{Message, Timestamp};
 use evento_cluster::{
     DataStore, HybridLogicalClock, InMemoryDataStore, InMemoryJournal, InMemoryNetwork, Journal,
-    Message, MessageSink, Node, NodeConfig, NodeId, ShardedTopology, StaticTopology, Timestamp,
-    Topology,
+    MessageSink, Node, NodeConfig, NodeId, ShardedTopology, StaticTopology, Topology,
 };
 
 /// Runs four anti-entropy rounds on node 0 under `topology`, with every other

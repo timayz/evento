@@ -12249,7 +12249,7 @@ mod tests {
     use crate::message::{CommandState, Key, Message, Status};
     use crate::store::{InMemoryDataStore, InMemoryJournal};
     use crate::transport::InMemoryNetwork;
-    use crate::{api::MessageSink, Envelope, StaticTopology};
+    use crate::{api::MessageSink, transport::Envelope, StaticTopology};
     use tokio::time::Duration;
 
     use super::{Node, NodeConfig, RecoverFields, RecoverResp};

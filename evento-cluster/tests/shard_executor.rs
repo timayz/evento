@@ -7,9 +7,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use evento_cluster::protocol::Key;
 use evento_cluster::{
     ClusterExecutor, DataStore, DynamicTopology, ExecutorDataStore, HybridLogicalClock,
-    InMemoryJournal, InMemoryNetwork, Journal, Key, MessageSink, Node, NodeId, Topology,
+    InMemoryJournal, InMemoryNetwork, Journal, MessageSink, Node, NodeId, Topology,
 };
 use evento_core::{cursor::Args, Event, EventFilter, Executor};
 use evento_fjall::Fjall;

@@ -4,11 +4,11 @@
 
 #![cfg(feature = "cluster")]
 
-use evento_cluster::{
+use evento_cluster::protocol::{
     AcceptorRecord, AmnesiaFence, Ballot, CommandState, ConfigEntry, CopyPhase, CopyState,
-    DecisionRecord, DurableMark, FenceRecord, Journal, Key, NodeId, ShardMap, Status, Timestamp,
-    TxnId,
+    DecisionRecord, DurableMark, FenceRecord, Key, Status, Timestamp, TxnId,
 };
+use evento_cluster::{Journal, NodeId, ShardMap};
 use evento_core::Event;
 use evento_fjall::FjallJournal;
 

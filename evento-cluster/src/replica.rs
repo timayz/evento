@@ -197,7 +197,7 @@ impl Default for Replica {
 }
 
 /// The approximate size of `cmd` on the wire inside a
-/// [`Message`](crate::Message): its events ([`snapshot_event_size`]) plus
+/// [`Message`](crate::message::Message): its events ([`snapshot_event_size`]) plus
 /// its keys, its dependencies and the fixed fields (ids, ballots,
 /// timestamps, status). What an anti-entropy reply's and a command page's
 /// byte budget counts.
@@ -281,8 +281,9 @@ pub enum Refusal {
     Fenced,
     /// The original coordinator's message for a transaction not held here
     /// outlived the compaction margin (see [`Replica::late`]): nothing is
-    /// recorded, and the coordinator is told so ([`Message::Late`] at
-    /// `Ballot(t0)`), so it settles the write at once.
+    /// recorded, and the coordinator is told so
+    /// ([`Message::Late`](crate::message::Message::Late) at `Ballot(t0)`), so it
+    /// settles the write at once.
     Late,
 }
 

@@ -16,9 +16,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use common::journal::FaultJournal;
+use evento_cluster::protocol::{Timestamp, TxnId};
 use evento_cluster::{
     DataStore, DynamicTopology, HybridLogicalClock, InMemoryDataStore, InMemoryNetwork, Journal,
-    MessageSink, Node, NodeConfig, NodeId, StaticTopology, Timestamp, Topology, TxnId,
+    MessageSink, Node, NodeConfig, NodeId, StaticTopology, Topology,
 };
 use evento_core::Event;
 

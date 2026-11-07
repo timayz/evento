@@ -8,9 +8,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use evento_cluster::protocol::Key;
 use evento_cluster::{
-    DataStore, HybridLogicalClock, InMemoryDataStore, InMemoryJournal, Journal, Key, MessageSink,
-    Node, NodeId, ShardedTopology, Topology,
+    DataStore, HybridLogicalClock, InMemoryDataStore, InMemoryJournal, Journal, MessageSink, Node,
+    NodeId, ShardedTopology, Topology,
 };
 use evento_core::Event;
 
