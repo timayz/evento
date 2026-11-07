@@ -81,6 +81,11 @@ pub type RwTurso = evento_core::Rw<Turso, Turso>;
 /// The event store schema: `event`, `snapshot`, `subscriber` and `meta`.
 const INIT: Migration<'static> = up_file!("../migrations/0001_init.sql");
 
+/// `idx_event_type_name_cursor`: a subscription's reads by event name seek
+/// instead of scanning the type.
+const EVENT_TYPE_NAME_CURSOR: Migration<'static> =
+    up_file!("../migrations/0003_event_type_name_cursor.sql");
+
 /// The accord journal's tables (feature `accord`).
 #[cfg(feature = "accord")]
 const ACCORD: Migration<'static> = up_file!("../migrations/0002_accord.sql");
@@ -89,7 +94,8 @@ const ACCORD: Migration<'static> = up_file!("../migrations/0002_accord.sql");
 /// [`Turso::open`] applies the pending ones. Each applied migration is
 /// recorded in [`migrate::MIGRATIONS_TABLE`], so an application's own
 /// [`Migrations`] (under its own name) can share the database.
-pub const MIGRATIONS: Migrations<'static> = Migrations::new("evento", &[INIT]);
+pub const MIGRATIONS: Migrations<'static> =
+    Migrations::new("evento", &[INIT, EVENT_TYPE_NAME_CURSOR]);
 
 /// The accord journal's schema migrations, under the app name
 /// `evento-accord`; every [`TursoJournal`] constructor applies the pending
