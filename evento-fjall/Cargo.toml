@@ -37,7 +37,7 @@ evento.workspace = true
 [features]
 default = ["rw"]
 rw = ["evento-core/rw"]
-cluster = ["dep:evento-cluster"]
+cluster = ["dep:evento-cluster", "evento-test/cluster"]
 
 [lints]
 workspace = true

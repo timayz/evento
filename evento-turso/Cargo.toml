@@ -42,12 +42,16 @@ tempfile = "3.27"
 default = ["rw", "macro"]
 rw = ["evento-core/rw"]
 macro = ["dep:evento-macro"]
-cluster = ["dep:evento-cluster"]
+cluster = ["dep:evento-cluster", "evento-test/cluster"]
 tracing = ["dep:tracing"]
 fts = ["turso/fts"]
 
 [[test]]
 name = "cluster_journal"
+required-features = ["cluster"]
+
+[[test]]
+name = "cluster_backend"
 required-features = ["cluster"]
 
 [[test]]

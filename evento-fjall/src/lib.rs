@@ -104,6 +104,8 @@ use ulid::Ulid;
 /// A fjall-backed [`evento_cluster::Journal`] (the Accord consensus log), behind the
 /// optional `cluster` feature.
 #[cfg(feature = "cluster")]
+mod cluster_backend;
+#[cfg(feature = "cluster")]
 mod cluster_journal;
 #[cfg(feature = "cluster")]
 pub use cluster_journal::FjallJournal;

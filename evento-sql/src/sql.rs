@@ -250,7 +250,7 @@ pub type RwSqlite = evento_core::Rw<Sqlite, Sqlite>;
 /// replica via `Rw`); subscription end-to-end latency grows by roughly the
 /// margin.
 pub struct Sql<DB: Database> {
-    pool: Pool<DB>,
+    pub(crate) pool: Pool<DB>,
     write_watch: tokio::sync::watch::Sender<u64>,
     stable_margin: Duration,
     /// Last DB-server clock sample: (when it was taken locally, DB `now()` in

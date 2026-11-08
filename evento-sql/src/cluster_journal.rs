@@ -74,28 +74,28 @@ const PROMISE_PREFIX: &str = "promise/";
 const DECISION_PREFIX: &str = "decision/";
 
 #[derive(Iden)]
-enum ClusterCommands {
+pub(crate) enum ClusterCommands {
     Table,
     Txn,
     Data,
 }
 
 #[derive(Iden)]
-enum ClusterMeta {
+pub(crate) enum ClusterMeta {
     Table,
     K,
     V,
 }
 
 #[derive(Iden)]
-enum ClusterMetadataLog {
+pub(crate) enum ClusterMetadataLog {
     Table,
     Epoch,
     Layout,
 }
 
 #[derive(Iden)]
-enum ClusterAcceptors {
+pub(crate) enum ClusterAcceptors {
     Table,
     Epoch,
     State,
