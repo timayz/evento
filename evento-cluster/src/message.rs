@@ -18,19 +18,34 @@ use serde::{Deserialize, Serialize};
 use crate::api::{AcceptorRecord, ConfigEntry, DurableMark, FenceRecord, ShardMap};
 use crate::clock::{Ballot, NodeId, Timestamp, TxnId};
 
-/// Sharding / ownership unit. Derived from an event's routing key (falling back
-/// to its aggregate id), in its tenant, this is what the
-/// [`Topology`](crate::api::Topology) maps to a replica set. Two transactions
-/// *conflict* when they share a key.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// Conflict unit and shard unit, in one string. Derived from an event: its
+/// tenant, its routing key (falling back to its aggregate id), and — when it
+/// has a routing key — its aggregate id. Two transactions *conflict* when they
+/// share a key: two writes of one aggregate do, two aggregates under one
+/// routing key do **not**. The key's **shard prefix** (everything before the
+/// aggregate id, see [`shard_prefix`](Key::shard_prefix)) is what the
+/// [`Topology`](crate::api::Topology) maps to a replica set, so a routing
+/// key's streams land in one shard and move together on a re-sharding.
+///
+/// A key with no aggregate id (a bare routing key, [`in_tenant`](Key::in_tenant))
+/// is the whole routing key's: a read fenced on it waits on every write under
+/// that routing key ([`Replica::read_probe`](crate::replica::Replica::read_probe)).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Key(pub String);
 
 /// Separates a tenant from the routing key or aggregate id in a [`Key`].
 const TENANT_SEPARATOR: char = '\u{1f}';
 
+/// Separates a routing key from the aggregate id under it in a [`Key`]. It
+/// sorts right below [`TENANT_SEPARATOR`], so the keys under one routing key
+/// are exactly the range from `prefix␞` up to `prefix␟`
+/// ([`under`](Key::under)).
+const AGGREGATE_SEPARATOR: char = '\u{1e}';
+
 impl Key {
-    /// The key a write touches: its routing key, or the aggregate id when no
-    /// routing key is set — in the event's tenant (see [`in_tenant`](Key::in_tenant)).
+    /// The key a write touches: its routing key and its aggregate id, or the
+    /// aggregate id alone when no routing key is set — in the event's tenant
+    /// (see [`of_stream`](Key::of_stream)).
     pub fn of(event: &Event) -> Self {
         Key(Self::str_of(event).into_owned())
     }
@@ -38,18 +53,46 @@ impl Key {
     /// [`of`](Key::of), borrowed whenever it can be — for hashing/grouping hot
     /// paths that only need to compare or bucket by the key string.
     pub fn str_of(event: &Event) -> Cow<'_, str> {
-        Self::str_in(
+        Self::str_of_stream(
             &event.tenant,
-            event.routing_key.as_deref().unwrap_or(&event.aggregate_id),
+            event.routing_key.as_deref(),
+            &event.aggregate_id,
         )
     }
 
-    /// The key of `base` (a routing key or an aggregate id) in `tenant`. The
-    /// default tenant's keys are the bare `base`, as before tenants existed;
-    /// another tenant's carry it in front, so the same aggregate id in two
-    /// tenants is two keys — two transactions that do not conflict. (A
-    /// tenant and an id that spell the same key only add a false conflict:
-    /// over-ordering, never a missed one.)
+    /// The key of the stream `aggregate_id` under `routing_key` (none: the
+    /// stream is keyed by its id alone) in `tenant` — as [`of`](Key::of)
+    /// derives it from the stream's events.
+    pub fn of_stream(tenant: &str, routing_key: Option<&str>, aggregate_id: &str) -> Self {
+        Key(Self::str_of_stream(tenant, routing_key, aggregate_id).into_owned())
+    }
+
+    /// [`of_stream`](Key::of_stream), borrowed in the default tenant when the
+    /// stream has no routing key.
+    fn str_of_stream<'a>(
+        tenant: &str,
+        routing_key: Option<&str>,
+        aggregate_id: &'a str,
+    ) -> Cow<'a, str> {
+        match routing_key {
+            None => Self::str_in(tenant, aggregate_id),
+            Some(routing_key) => {
+                let mut key = Self::str_in(tenant, routing_key).into_owned();
+                key.push(AGGREGATE_SEPARATOR);
+                key.push_str(aggregate_id);
+                Cow::Owned(key)
+            }
+        }
+    }
+
+    /// The key of `base` alone (a routing key, or the id of a stream without
+    /// one) in `tenant`: a key with no aggregate id, whose shard is the
+    /// routing key's and which fences every stream under it. The default
+    /// tenant's keys are the bare `base`, as before tenants existed; another
+    /// tenant's carry it in front, so the same aggregate id in two tenants is
+    /// two keys — two transactions that do not conflict. (A tenant and an id
+    /// that spell the same key only add a false conflict: over-ordering,
+    /// never a missed one.)
     pub fn in_tenant(tenant: &str, base: &str) -> Self {
         Key(Self::str_in(tenant, base).into_owned())
     }
@@ -61,6 +104,40 @@ impl Key {
         } else {
             Cow::Owned(format!("{tenant}{TENANT_SEPARATOR}{base}"))
         }
+    }
+
+    /// The part of the key its shard is chosen by: the tenant and routing key
+    /// (or the id of a stream without one), without the aggregate id. Every
+    /// key under one routing key shares it.
+    pub fn shard_prefix(&self) -> &str {
+        match self.0.find(AGGREGATE_SEPARATOR) {
+            Some(at) => &self.0[..at],
+            None => &self.0,
+        }
+    }
+
+    /// Whether this key is a shard prefix alone — a bare routing key, or the
+    /// id of a stream without one — rather than one stream's key.
+    pub fn is_prefix(&self) -> bool {
+        !self.0.contains(AGGREGATE_SEPARATOR)
+    }
+
+    /// The range of keys under a prefix key: every stream's key whose routing
+    /// key is `self` (none when `self` is itself a stream's key). The bounds
+    /// are the prefix followed by the aggregate separator and by the next
+    /// character after it, so exactly the strings that start with
+    /// `prefix␞` fall inside.
+    pub(crate) fn under(&self) -> Option<std::ops::Range<Key>> {
+        if !self.is_prefix() {
+            return None;
+        }
+        let mut from = String::with_capacity(self.0.len() + AGGREGATE_SEPARATOR.len_utf8());
+        from.push_str(&self.0);
+        from.push(AGGREGATE_SEPARATOR);
+        let mut to = String::with_capacity(self.0.len() + TENANT_SEPARATOR.len_utf8());
+        to.push_str(&self.0);
+        to.push(TENANT_SEPARATOR);
+        Some(Key(from)..Key(to))
     }
 }
 
@@ -840,7 +917,11 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(Key::of(&event("", None)), Key("acc".into()));
-        assert_eq!(Key::of(&event("", Some("eu"))), Key("eu".into()));
+        assert_eq!(
+            Key::of(&event("", Some("eu"))),
+            Key("eu\u{1e}acc".into()),
+            "a routed stream's key names its routing key and its aggregate"
+        );
         assert!(matches!(
             Key::str_of(&event("", None)),
             Cow::Borrowed("acc")
@@ -851,7 +932,48 @@ mod tests {
         assert_ne!(a, b);
         assert_ne!(a, Key("acc".into()));
         assert_eq!(a, Key::in_tenant("a", "acc"));
-        assert_eq!(Key::of(&event("a", Some("eu"))), Key::in_tenant("a", "eu"));
+        let routed = Key::of(&event("a", Some("eu")));
+        assert_eq!(routed, Key::of_stream("a", Some("eu"), "acc"));
+        assert_eq!(routed, Key("a\u{1f}eu\u{1e}acc".into()));
+        assert_eq!(routed.shard_prefix(), Key::in_tenant("a", "eu").0);
+    }
+
+    /// A key's shard prefix is its tenant and routing key: every stream under
+    /// one routing key shares it, and the bare routing key is its own prefix
+    /// (#483). The keys under a prefix are exactly the range `under` spans.
+    #[test]
+    fn a_key_is_sharded_by_its_routing_key_and_conflicts_by_its_aggregate() {
+        let eu_cart = Key::of_stream("", Some("eu"), "cart");
+        let eu_order = Key::of_stream("", Some("eu"), "order");
+        let us_cart = Key::of_stream("", Some("us"), "cart");
+        let eu = Key::in_tenant("", "eu");
+        assert_ne!(eu_cart, eu_order);
+        assert_eq!(eu_cart.shard_prefix(), "eu");
+        assert_eq!(eu_order.shard_prefix(), "eu");
+        assert_eq!(eu.shard_prefix(), "eu");
+        assert!(eu.is_prefix());
+        assert!(!eu_cart.is_prefix());
+        assert_eq!(eu_cart.under(), None);
+
+        let under = eu.under().expect("a prefix spans a range");
+        assert!(under.contains(&eu_cart));
+        assert!(under.contains(&eu_order));
+        assert!(!under.contains(&us_cart));
+        assert!(
+            !under.contains(&eu),
+            "the prefix itself is looked up exactly"
+        );
+        // A routing key that extends this one is another region.
+        assert!(!under.contains(&Key::of_stream("", Some("eu-west"), "cart")));
+        // A stream keyed by the bare id "eu" is not a routed stream under it.
+        assert!(!under.contains(&Key::of_stream("", None, "eu")));
+        // The same aggregate id in two tenants: two keys, under two prefixes.
+        let acme = Key::of_stream("acme", Some("eu"), "cart");
+        assert!(!under.contains(&acme));
+        assert!(Key::in_tenant("acme", "eu")
+            .under()
+            .unwrap()
+            .contains(&acme));
     }
 
     /// The snapshot variants cross the wire with their cursor and events

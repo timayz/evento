@@ -85,10 +85,12 @@ pub const MAGIC: [u8; 2] = *b"Ac";
 /// the replica restored its config votes, and an acceptor that lost its
 /// journal reads the others' state back (`Message::ConfigRead`,
 /// `Message::ConfigReadReply`). 14: `Message::ReadForward` carries the key
-/// the requester routed by. No reader for older versions: evento-cluster
-/// has not been released, so a journal of one is wiped and the node
-/// re-bootstrapped.
-pub const FORMAT_VERSION: u8 = 14;
+/// the requester routed by. 15: a key conflicts per aggregate and shards
+/// per routing key (`tenant ␟ routing-key ␞ aggregate-id`, #483), so the
+/// keys of every journaled command and wire message changed shape. No
+/// reader for older versions: evento-cluster has not been released, so a
+/// journal of one is wiped and the node re-bootstrapped.
+pub const FORMAT_VERSION: u8 = 15;
 
 /// Length of the fixed header: `MAGIC (2) + version (1) + kind (1)`.
 const HEADER_LEN: usize = 4;

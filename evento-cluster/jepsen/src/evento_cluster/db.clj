@@ -54,6 +54,7 @@
                     "export HTTP_PORT=" http-port "\n"
                     "export DATA_DIR=" data-dir "\n"
                     "export LINEARIZABLE_READS=" (if (:linearizable-reads test) "1" "0") "\n"
+                    "export ROUTING_KEY='" (or (:routing-key test) "") "'\n"
                     ;; 75 (EX_TEMPFAIL): the node comes back joining.
                     "while true; do\n"
                     "  " binary "\n"

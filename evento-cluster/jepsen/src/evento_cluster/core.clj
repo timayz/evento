@@ -185,6 +185,11 @@
    [nil "--linearizable-reads"
     "Enable evento-cluster read barriers (linearizable reads; needed for strict-serializable)."
     :default false]
+   [nil "--routing-key KEY"
+    "Write every Elle key under this one routing key (one region): the nodes
+    share it as their default, so the keys share a shard and conflict per
+    aggregate, not per region (#483). Default: keys routed by their own id."
+    :default nil]
    [nil "--partition-targets TARGETS"
     "Comma-separated partition shapes: one,majority,majorities-ring. `one` keeps a
     quorum live (so linearizable reads stay available); the default can strand
@@ -235,7 +240,8 @@
            opts
            {:name      (str "evento-cluster-"
                             (if (seq faults) (str/join "+" (sort (map name faults))) "healthy")
-                            (when (:linearizable-reads opts) "-linreads"))
+                            (when (:linearizable-reads opts) "-linreads")
+                            (when (:routing-key opts) "-routed"))
             :os        os/noop
             :db        db
             :client    (ec-client/client)

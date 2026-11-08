@@ -608,7 +608,7 @@ impl Sim {
     /// The replicas of `agg`'s shard: the nodes a read of it goes to.
     fn owners(&self, agg: &str) -> Vec<usize> {
         self.layout
-            .replicas(&Key(agg.to_string()))
+            .replicas(&key_of(agg))
             .iter()
             .map(|id| id.0 as usize)
             .collect()
@@ -638,8 +638,13 @@ impl Sim {
             if found.iter().all(|aggs| aggs.len() == count) {
                 break;
             }
+            assert!(
+                i < 100_000,
+                "no {count} aggregates per shard among 100k names (routed: every \
+                 region hashes to the same shards)"
+            );
             let agg = format!("a{i}");
-            let shard = self.layout.shard_of(&Key(agg.clone()));
+            let shard = self.layout.shard_of(&key_of(&agg));
             if found[shard].len() < count {
                 found[shard].push(agg);
             }
@@ -932,6 +937,7 @@ fn event(aggregate_id: &str, version: u16, seq: u64) -> Event {
         timestamp: 1,
         timestamp_subsec: seq as u32,
         metadata,
+        routing_key: region_of(aggregate_id),
         ..Default::default()
     }
 }
@@ -986,6 +992,43 @@ thread_local! {
     /// Whether reads fence with a read barrier: off, they read the node's
     /// store as it stands, which the read oracle must catch.
     static READ_BARRIER: Cell<bool> = const { Cell::new(true) };
+    /// Whether the workload writes under routing keys (#483): each aggregate
+    /// under its region's, so the aggregates of one region share a shard and
+    /// move together on a re-sharding, while their writes conflict per
+    /// aggregate. Off, a stream is keyed by its id alone.
+    static ROUTED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// How many regions a routed workload spreads its aggregates over: fewer
+/// than the aggregates of a single-shard workload, so some share one.
+const REGIONS: usize = 3;
+
+/// The routing key `agg` is written under: its region's when the workload is
+/// routed ([`ROUTED`]), none otherwise. Aggregates are named `<letter><n>`;
+/// the region is `n` modulo [`REGIONS`].
+fn region_of(agg: &str) -> Option<String> {
+    if !ROUTED.with(Cell::get) {
+        return None;
+    }
+    let n: usize = agg
+        .trim_start_matches(|c: char| c.is_ascii_alphabetic())
+        .parse()
+        .unwrap_or(0);
+    Some(format!("region{}", n % REGIONS))
+}
+
+/// The key `agg`'s writes conflict on and its reads fence: its id under its
+/// region's routing key when routed, its id alone otherwise.
+fn key_of(agg: &str) -> Key {
+    Key::of_stream("", region_of(agg).as_deref(), agg)
+}
+
+/// Runs `f` with the workload routed ([`ROUTED`]), restoring the flag after.
+async fn routed<T>(f: impl Future<Output = T>) -> T {
+    ROUTED.with(|r| r.set(true));
+    let out = f.await;
+    ROUTED.with(|r| r.set(false));
+    out
 }
 
 /// What a workload's clients record: each write's outcome, for the write
@@ -1070,7 +1113,7 @@ impl Clients {
         let start = self.now();
         let (node, store) = live.get(i);
         if READ_BARRIER.with(Cell::get) {
-            let barrier = node.read_barrier(Key(agg.to_string()));
+            let barrier = node.read_barrier(key_of(agg));
             if !matches!(
                 tokio::time::timeout(READ_TIMEOUT, barrier).await,
                 Ok(Ok(()))
@@ -1889,7 +1932,7 @@ async fn assert_live(sim: &mut Sim, acked: &BTreeMap<String, u16>) -> Result<(),
             let deadline = tokio::time::Instant::now() + serve;
             let (mut attempt, mut before) = (0, None);
             loop {
-                let barrier = sim.nodes[i].read_barrier(Key(agg.clone()));
+                let barrier = sim.nodes[i].read_barrier(key_of(agg));
                 let left = deadline.saturating_duration_since(tokio::time::Instant::now());
                 let failed = match tokio::time::timeout(left, barrier).await {
                     Ok(Ok(())) => break,
@@ -2304,7 +2347,7 @@ async fn run_sharded_amnesia(seed: u64, faults: Faults) -> Adversarial {
     let aggs = sim.aggs_per_shard(AGGS_PER_SHARD);
     let shard_of: Vec<usize> = aggs
         .iter()
-        .map(|agg| sim.layout.shard_of(&Key(agg.clone())))
+        .map(|agg| sim.layout.shard_of(&key_of(agg)))
         .collect();
     // Each aggregate's version guesses come from its shard's first replica,
     // which never loses its journal.
@@ -2728,7 +2771,7 @@ async fn a_recovery_decides_what_only_an_amnesiac_and_one_replica_accepted() {
         node: ORPHAN_COORDINATOR,
     });
     let written = event("acc", 1, ORPHAN_SEQ);
-    let key = Key(written.aggregate_id.clone());
+    let key = Key::of(&written);
     async fn replies(
         inbox: &mut tokio::sync::mpsc::Receiver<evento_cluster::transport::Envelope>,
         want: usize,
@@ -5823,7 +5866,7 @@ async fn orphan_vote(
             Message::PreAccept {
                 epoch: 0,
                 txn,
-                keys: vec![Key(event.aggregate_id.clone())],
+                keys: vec![Key::of(&event)],
                 events: vec![event],
             },
         )
@@ -6842,7 +6885,7 @@ async fn reshard_violation(
     let member = layout[0][0].0 as usize;
     let acked = acked_versions(history);
     for (agg, &max) in &acked {
-        let key = Key(agg.clone());
+        let key = key_of(agg);
         let mut probe = sim.dynamic[member].layout();
         let mut owners = probe.replicas(&key).to_vec();
         let mut last = String::new();
@@ -6979,6 +7022,47 @@ async fn resharding_keeps_every_write() {
             "seed {seed} ({shape:?}): {run:?}"
         );
     }
+}
+
+/// Routed workloads (#483): every aggregate is written under its region's
+/// routing key, so a region's aggregates share a shard and move together on a
+/// re-sharding, while their writes conflict per aggregate and a read fences a
+/// stream's full key. The write and read oracles, convergence and liveness
+/// hold as for id-keyed workloads: under message faults and restarts, two
+/// shards losing journals, and a re-sharding under faults.
+#[tokio::test(start_paused = true)]
+async fn routed_workloads_keep_every_oracle() {
+    routed(async {
+        for (seed, _replay) in sim_seeds("routed_workloads_keep_every_oracle", 0..4) {
+            let aggs = agg_names(4);
+            let regions: BTreeSet<String> = aggs.iter().filter_map(|a| region_of(a)).collect();
+            assert_eq!(
+                regions.len(),
+                REGIONS,
+                "the workload spans its regions, some shared"
+            );
+            assert!(
+                aggs.iter().all(|a| !key_of(a).is_prefix()),
+                "a routed aggregate's key names its region and itself"
+            );
+
+            let result = run_with_restarts(seed, Faults::ALL, StoreKind::Executor).await;
+            let reads = result.assert_ok(&format!("routed restarts seed {seed}"));
+            assert!(reads > 0, "seed {seed}: no routed read returned");
+
+            let result = run_sharded_amnesia(seed, Faults::ALL).await;
+            result.assert_ok(&format!("routed sharded amnesia seed {seed}"));
+
+            let shape = ReshardConfig::from_seed(seed);
+            let run = run_reshard(seed, &shape).await;
+            assert!(
+                run.safety.is_none() && run.liveness.is_none(),
+                "routed reshard seed {seed} ({shape:?}): {run:?}"
+            );
+            assert!(run.acked > 0, "routed reshard seed {seed}: no write acked");
+        }
+    })
+    .await;
 }
 
 /// A re-sharding run is bit-reproducible: two runs of a seed take the same
@@ -7250,7 +7334,7 @@ async fn coverage_counts_only_under_one_live_layout() {
     .await;
     let moved = (0..)
         .map(|i| format!("m{i}"))
-        .find(|agg| sim.dynamic[0].layout().shard_of(&Key(agg.clone())) == 1)
+        .find(|agg| sim.dynamic[0].layout().shard_of(&key_of(agg)) == 1)
         .expect("a key of shard 1");
     // Node 2 hears of no epoch past the transition, nor decides one.
     let late = |message: &Message| match message {

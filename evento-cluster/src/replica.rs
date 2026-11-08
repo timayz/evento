@@ -54,7 +54,9 @@ pub struct Replica {
     /// Every transaction this replica knows about.
     commands: HashMap<TxnId, CommandState>,
     /// Index from key to the transactions touching it, for conflict lookup.
-    by_key: HashMap<Key, BTreeSet<TxnId>>,
+    /// Ordered, so the keys under one routing key are a range
+    /// ([`Key::under`]) a read of the whole routing key can walk.
+    by_key: BTreeMap<Key, BTreeSet<TxnId>>,
     /// Execution queue: the `(execute_at, txn)` of every command awaiting
     /// execution — status [`Committed`](Status::Committed) or
     /// [`Reading`](Status::Reading), i.e. final order known but not yet applied.
@@ -172,7 +174,7 @@ impl Default for Replica {
     fn default() -> Self {
         Self {
             commands: HashMap::new(),
-            by_key: HashMap::new(),
+            by_key: BTreeMap::new(),
             pending: BTreeSet::new(),
             runnable: BTreeSet::new(),
             blocked: HashMap::new(),
@@ -368,15 +370,40 @@ impl Replica {
     fn conflicts(&self, keys: &[Key], self_txn: TxnId) -> Vec<TxnId> {
         let mut out = BTreeSet::new();
         for key in keys {
-            if let Some(txns) = self.by_key.get(key) {
-                for &txn in txns {
-                    if txn != self_txn {
-                        out.insert(txn);
-                    }
+            Self::collect_conflicts(self.by_key.get(key), self_txn, &mut out);
+        }
+        out.into_iter().collect()
+    }
+
+    /// [`conflicts`](Self::conflicts) as a read sees them: a key that is a
+    /// routing key alone ([`Key::is_prefix`]) also conflicts with every
+    /// stream's key under it, so a read fenced on the routing key waits on
+    /// every write of the region. A write never carries such a key for a
+    /// routed stream (its keys name their aggregates), so the write side
+    /// stays exact.
+    fn read_conflicts(&self, keys: &[Key], self_txn: TxnId) -> Vec<TxnId> {
+        let mut out = BTreeSet::new();
+        for key in keys {
+            Self::collect_conflicts(self.by_key.get(key), self_txn, &mut out);
+            if let Some(under) = key.under() {
+                for txns in self.by_key.range(under).map(|(_, txns)| txns) {
+                    Self::collect_conflicts(Some(txns), self_txn, &mut out);
                 }
             }
         }
         out.into_iter().collect()
+    }
+
+    fn collect_conflicts(
+        txns: Option<&BTreeSet<TxnId>>,
+        self_txn: TxnId,
+        out: &mut BTreeSet<TxnId>,
+    ) {
+        for &txn in txns.into_iter().flatten() {
+            if txn != self_txn {
+                out.insert(txn);
+            }
+        }
     }
 
     /// Smallest timestamp owned by `node` that is strictly greater than `t`.
@@ -559,7 +586,7 @@ impl Replica {
     ///
     /// [`preaccept`]: Self::preaccept
     pub fn read_probe(&self, txn: TxnId, keys: &[Key]) -> (Timestamp, Vec<TxnId>) {
-        let conflicts = self.conflicts(keys, txn);
+        let conflicts = self.read_conflicts(keys, txn);
 
         let mut execute_at = txn.0;
         for &c in &conflicts {
@@ -2059,6 +2086,7 @@ impl Replica {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::slot_of;
     use crate::clock::{NodeId, Timestamp};
 
     fn txn(micros: u64) -> TxnId {
@@ -2491,6 +2519,73 @@ mod tests {
             vec![a],
             "the Accept-only transaction must be a dependency"
         );
+    }
+
+    /// Two aggregates under one routing key share a shard, not a conflict
+    /// (#483): neither write witnesses the other, so each takes the fast path
+    /// and a stall of one holds up nothing but its own stream. A write of the
+    /// same aggregate still conflicts, and a read fenced on the routing key
+    /// alone — a scan of the region — waits on every write under it.
+    #[test]
+    fn aggregates_under_one_routing_key_do_not_conflict() {
+        let routed = |id: &str, version: u16| Event {
+            routing_key: Some("eu".into()),
+            ..event(id, version)
+        };
+        let mut replica = Replica::new();
+        let cart = Key::of(&routed("cart", 1));
+        let order = Key::of(&routed("order", 1));
+        assert_ne!(cart, order);
+        assert_eq!(slot_of(&cart), slot_of(&order));
+        assert_eq!(slot_of(&cart), slot_of(&Key("eu".into())));
+
+        let a = txn(10);
+        let b = txn(20);
+        let c = txn(30);
+        let (at_a, deps_a) = replica
+            .preaccept(a, 0, vec![cart.clone()], vec![routed("cart", 1)])
+            .unwrap();
+        let (at_b, deps_b) = replica
+            .preaccept(b, 0, vec![order.clone()], vec![routed("order", 1)])
+            .unwrap();
+        assert_eq!(
+            (at_a, deps_a),
+            (a.0, vec![]),
+            "a cart write waits on nothing"
+        );
+        assert_eq!(
+            (at_b, deps_b),
+            (b.0, vec![]),
+            "an order write does not witness the cart's: another aggregate"
+        );
+        let (_, deps_c) = replica
+            .preaccept(c, 0, vec![cart.clone()], vec![routed("cart", 2)])
+            .unwrap();
+        assert_eq!(
+            deps_c,
+            vec![a],
+            "the same cart's next write witnesses the first"
+        );
+
+        // A read of one aggregate sees its writes alone; a read of the region
+        // sees them all; a stream keyed by the bare id "eu" is not under it.
+        let probe = txn(40);
+        let (_, deps) = replica.read_probe(probe, std::slice::from_ref(&order));
+        assert_eq!(deps, vec![b]);
+        let (_, deps) = replica.read_probe(probe, &[Key("eu".into())]);
+        assert_eq!(deps, vec![a, b, c]);
+        let bare = txn(35);
+        replica
+            .preaccept(bare, 0, vec![Key("eu".into())], vec![event("eu", 1)])
+            .unwrap();
+        let (_, deps) = replica.read_probe(probe, &[Key("eu".into())]);
+        assert_eq!(
+            deps,
+            vec![a, b, c, bare],
+            "the bare key is the region's too"
+        );
+        let (_, deps) = replica.read_probe(probe, std::slice::from_ref(&cart));
+        assert_eq!(deps, vec![a, c], "a stream's key conflicts exactly");
     }
 
     /// Same repair via Commit: a keyless entry (created by a keyless Accept

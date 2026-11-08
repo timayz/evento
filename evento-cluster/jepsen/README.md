@@ -124,6 +124,7 @@ TIME_LIMIT=600 ./run.sh                     # longer
 ./run.sh --faults partition                 # just one fault ("" for none)
 ./run.sh --faults partition,kill,pause,journal  # add lost and rolled-back journals
 ./run.sh --linearizable-reads               # enable read barriers (linearizable reads)
+./run.sh --linearizable-reads --routing-key eu  # every key in one region: one shard, conflicts per aggregate (#483)
 ./run.sh --concurrency 20                   # any extra arg passes through to lein run test
 ```
 
