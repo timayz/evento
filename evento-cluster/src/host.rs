@@ -248,7 +248,7 @@ impl RejoinMark {
 }
 
 /// Another node, as this one sees it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerState {
     /// Its id.
     pub id: NodeId,
@@ -257,6 +257,19 @@ pub struct PeerState {
     pub silent_for: Duration,
     /// Whether this node stopped waiting for it ([`Settings::absent_after_secs`]).
     pub given_up: bool,
+    /// What it last said about itself ([`Builder::label`]), if anything was
+    /// heard from it.
+    pub label: Option<String>,
+}
+
+/// A node heard from lately, as [`Cluster::live`] lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveNode {
+    /// Its id.
+    pub id: NodeId,
+    /// What it says about itself ([`Builder::label`]): this node's own label,
+    /// or the one a peer last reported.
+    pub label: Option<String>,
 }
 
 /// This node, for a status page and the log.
@@ -302,6 +315,7 @@ pub struct Builder<E: ClusterBackend> {
     settings: Option<Settings>,
     state_dir: Option<PathBuf>,
     config: Option<Box<dyn FnOnce(NodeConfig) -> NodeConfig + Send>>,
+    label: Option<String>,
     journal: Option<Arc<dyn Journal>>,
     before_copy: Option<Hook>,
 }
@@ -318,6 +332,15 @@ impl<E: ClusterBackend> Builder<E> {
     /// ([`RejoinMark`]). Required with peers; a node alone needs none.
     pub fn state_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.state_dir = Some(dir.into());
+        self
+    }
+
+    /// A short word the node tells its peers about itself with its gossip,
+    /// for the application: which region it serves, say. Opaque to the
+    /// cluster; what the peers last heard is read back through
+    /// [`Cluster::live`] and [`PeerState::label`].
+    pub fn label(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
         self
     }
 
@@ -360,6 +383,7 @@ impl<E: ClusterBackend> Builder<E> {
             settings,
             state_dir,
             config,
+            label,
             journal,
             before_copy,
         } = self;
@@ -459,7 +483,8 @@ impl<E: ClusterBackend> Builder<E> {
             Arc::new(ExecutorDataStore::new(store.clone())) as Arc<dyn DataStore>,
             journal,
         )
-        .with_config(node_config);
+        .with_config(node_config)
+        .with_label(label);
 
         // Past here an error ends every task started so far, the listener's
         // first: the next open binds the same address.
@@ -563,6 +588,7 @@ impl Cluster {
             settings: None,
             state_dir: None,
             config: None,
+            label: None,
             journal: None,
             before_copy: None,
         }
@@ -601,25 +627,40 @@ impl Cluster {
         Ok(())
     }
 
-    /// This node's place among the nodes heard from within `within` (it
-    /// counts itself), and how many they are: `(index, of)`. What work
-    /// spread over the nodes goes by, so a node that stops is covered for
-    /// once it has been silent that long. Idle nodes gossip many times a
-    /// second.
-    pub fn live_nodes(&self, within: Duration) -> (u64, u64) {
+    /// The nodes heard from within `within`, this one included, by id, each
+    /// with what it says about itself ([`Builder::label`]). What work spread
+    /// over the nodes goes by, so a node that stops is covered for once it
+    /// has been silent that long. Idle nodes gossip many times a second.
+    pub fn live(&self, within: Duration) -> Vec<LiveNode> {
         let me = self.node.id();
         let absent = self.node.absent_peers();
-        let mut index = 0;
-        let mut of = 0;
-        for &id in &self.ids {
-            if id == me {
-                index = of;
-                of += 1;
-            } else if self.node.silent_for(id) < within && !absent.contains(&id) {
-                of += 1;
-            }
-        }
-        (index, of)
+        self.ids
+            .iter()
+            .filter_map(|&id| {
+                if id == me {
+                    Some(LiveNode {
+                        id,
+                        label: self.node.label().map(str::to_owned),
+                    })
+                } else if self.node.silent_for(id) < within && !absent.contains(&id) {
+                    Some(LiveNode {
+                        id,
+                        label: self.node.peer_label(id).map(|label| label.to_string()),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// This node's place among the nodes heard from within `within`
+    /// ([`live`](Self::live)), and how many they are: `(index, of)`.
+    pub fn live_nodes(&self, within: Duration) -> (u64, u64) {
+        let me = self.node.id();
+        let live = self.live(within);
+        let index = live.iter().position(|node| node.id == me).unwrap_or(0);
+        (index as u64, live.len() as u64)
     }
 
     /// This node, as a status page shows it.
@@ -638,6 +679,7 @@ impl Cluster {
                     id,
                     silent_for: self.node.silent_for(id),
                     given_up: absent.contains(&id),
+                    label: self.node.peer_label(id).map(|label| label.to_string()),
                 })
                 .collect(),
             confirmed: self.node.confirmed(),

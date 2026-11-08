@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use evento_cluster::host::{RejoinMark, Settings};
-use evento_cluster::{Cluster, ClusterExecutor, NodeConfig, NodeId};
+use evento_cluster::{Cluster, ClusterExecutor, LiveNode, NodeConfig, NodeId};
 use evento_core::{cursor::Args, Event, EventFilter, Executor, TenantFilter};
 use evento_fjall::Fjall;
 
@@ -84,6 +84,8 @@ impl Member {
                 compaction_margin: Duration::from_millis(300),
                 ..config
             })
+            // What each node says about itself.
+            .label(format!("member-{id}"))
             .open()
             .await?;
         Ok(Self { cluster, executor })
@@ -172,6 +174,34 @@ async fn a_write_on_one_node_is_read_on_another() {
         nodes[1].cluster.live_nodes(Duration::from_secs(5)) == (1, 3)
     })
     .await;
+    // Each node's label reaches the others with its watermark reports: a
+    // peer is heard from (any message) before it has reported.
+    let labels = |live: Vec<LiveNode>| -> Vec<(u64, Option<String>)> {
+        live.into_iter()
+            .map(|node| (node.id.0, node.label))
+            .collect()
+    };
+    let all_labelled = [
+        (0, Some("member-0".to_owned())),
+        (1, Some("member-1".to_owned())),
+        (2, Some("member-2".to_owned())),
+    ];
+    eventually("every node's label is heard", || async {
+        labels(nodes[1].cluster.live(Duration::from_secs(5))) == all_labelled
+    })
+    .await;
+    let health = nodes[1].cluster.health();
+    assert_eq!(
+        health
+            .peers
+            .iter()
+            .map(|peer| (peer.id.0, peer.label.clone()))
+            .collect::<Vec<_>>(),
+        [
+            (0, Some("member-0".to_owned())),
+            (2, Some("member-2".to_owned()))
+        ]
+    );
 
     for node in nodes {
         node.cluster.shutdown().await;
@@ -314,6 +344,13 @@ async fn a_node_alone_runs_without_settings() {
     assert!(health.peers.is_empty());
     assert!(health.serving(), "{health:?}");
     assert_eq!(cluster.live_nodes(Duration::from_secs(1)), (0, 1));
+    assert_eq!(
+        cluster.live(Duration::from_secs(1)),
+        [LiveNode {
+            id: NodeId(0),
+            label: None
+        }]
+    );
     assert!(
         !cluster.node().linearizable_reads(),
         "alone, no read barrier"

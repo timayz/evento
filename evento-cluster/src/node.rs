@@ -1465,6 +1465,12 @@ pub struct Node {
     /// Latest `applied_through` gossiped by each shard peer (and self); the
     /// recovery sweep compacts below the per-shard minimum of these.
     peer_watermarks: Arc<Mutex<PeerReports>>,
+    /// What this node tells its peers about itself with each watermark
+    /// report ([`with_label`](Node::with_label)).
+    label: Option<Arc<str>>,
+    /// The latest label each peer reported ([`Message::Watermark`]'s
+    /// `label`); a peer reporting none is dropped from here.
+    peer_labels: Arc<Mutex<HashMap<NodeId, Arc<str>>>>,
     /// What the journal has been asked to truncate: the sweep calls
     /// [`compact`](Node::compact) continuously, and a journal's `truncate` is
     /// a write transaction (an fsync, and on SQLite the writer lock) even when
@@ -1615,6 +1621,8 @@ impl Node {
             snapshot_pending: Arc::new(Mutex::new(HashMap::new())),
             copying: Arc::new(tokio::sync::Mutex::new(())),
             peer_watermarks: Arc::new(Mutex::new(PeerReports::default())),
+            label: None,
+            peer_labels: Arc::new(Mutex::new(HashMap::new())),
             journal_mark: Arc::new(Mutex::new(JournalMark::default())),
             sync_coverage: Arc::new(Mutex::new((start_epoch, HashMap::new()))),
             join_proof: Arc::new(Mutex::new(None)),
@@ -1651,6 +1659,34 @@ impl Node {
     /// This node's timing/sizing configuration.
     pub fn config(&self) -> NodeConfig {
         self.settings
+    }
+
+    /// Tells the peers `label` about this node with every watermark report:
+    /// a short word for the application, which region the node serves, say.
+    /// Opaque to the cluster. Call before [`start`](Node::start).
+    pub fn with_label(mut self, label: Option<String>) -> Self {
+        self.label = label.map(Arc::from);
+        self
+    }
+
+    /// What this node tells its peers about itself.
+    pub fn label(&self) -> Option<&str> {
+        self.label.as_deref()
+    }
+
+    /// The label `peer` last reported, if it reports one; `None` for a peer
+    /// never heard from. For the application.
+    pub fn peer_label(&self, peer: NodeId) -> Option<Arc<str>> {
+        self.peer_labels
+            .lock()
+            .expect("labels poisoned")
+            .get(&peer)
+            .cloned()
+    }
+
+    /// This node's label as a report carries it.
+    fn label_report(&self) -> Option<String> {
+        self.label.as_deref().map(str::to_owned)
     }
 
     /// This node's amnesia fence, if it came back over a lost journal under
@@ -3411,6 +3447,7 @@ impl Node {
                 fenced,
                 copied,
                 live_since,
+                label: self.label_report(),
             },
         )
         .await;
@@ -3710,6 +3747,7 @@ impl Node {
                     fenced: self.reportable_fence(),
                     copied: self.copied_report(),
                     live_since: self.live_since(),
+                    label: self.label_report(),
                 },
             )
             .await;
@@ -4886,6 +4924,7 @@ impl Node {
                 fenced,
                 copied,
                 live_since,
+                label,
             } => {
                 // What the sender's journal holds, which it must hold again
                 // when it reopens (#339) — and which journal that is: a
@@ -4927,6 +4966,17 @@ impl Node {
                     .lock()
                     .expect("join holds poisoned")
                     .remove(&from);
+                {
+                    let mut labels = self.peer_labels.lock().expect("labels poisoned");
+                    match label {
+                        Some(label) => {
+                            labels.insert(from, Arc::from(label));
+                        }
+                        None => {
+                            labels.remove(&from);
+                        }
+                    }
+                }
                 // Counted under this node's live layout only: one made under
                 // another vouches for other keys — a gainer's, before the
                 // activation, for none.
@@ -8563,6 +8613,7 @@ impl Node {
                     fenced: self.reportable_fence(),
                     copied: self.copied_report(),
                     live_since,
+                    label: self.label_report(),
                 },
             )
             .await;
@@ -9365,6 +9416,7 @@ impl Node {
                             fenced: None,
                             copied: None,
                             live_since: self.live_since(),
+                            label: self.label_report(),
                         },
                     )
                     .await;
@@ -13275,6 +13327,7 @@ mod tests {
             fenced: None,
             copied: None,
             live_since: 0,
+            label: None,
         };
         let micros_of = |m: Message| match m {
             Message::Watermark {

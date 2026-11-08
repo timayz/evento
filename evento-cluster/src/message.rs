@@ -374,6 +374,10 @@ pub enum Message {
         /// `applied_through` vouches for the sender's keys under it: a node
         /// under another live layout counts it for nothing.
         live_since: u64,
+        /// What the sender's host says about it ([`Node::label`]), for the
+        /// application: which region it serves, say. Opaque to the cluster,
+        /// which only keeps the latest from each peer.
+        label: Option<String>,
     },
     /// Existing replica → joining node (or anti-entropy requester): the
     /// committed state to import.
