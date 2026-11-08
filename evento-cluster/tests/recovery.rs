@@ -1556,6 +1556,7 @@ impl Vouching {
                     fenced: None,
                     copied: None,
                     live_since: 0,
+                    label: None,
                 },
             )
             .await;

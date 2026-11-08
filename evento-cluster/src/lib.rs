@@ -89,7 +89,7 @@ pub use api::{
 pub use backend::ClusterBackend;
 pub use clock::{Clock, HybridLogicalClock, NodeId, MAX_SKEW_MICROS};
 pub use executor::{ClusterExecutor, ExecutorDataStore};
-pub use host::{Cluster, NodeHealth, PeerState, Settings};
+pub use host::{Cluster, LiveNode, NodeHealth, PeerState, Settings};
 pub use metrics::{Metrics, MetricsSnapshot};
 pub use node::{
     BacklogAtCap, CommandTooLarge, CommitOutcome, FenceNotCovered, Invalidated, Joining,

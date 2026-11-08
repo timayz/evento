@@ -790,6 +790,11 @@ through `ClusterExecutor`) — split it into several writes.
   other, so a region took the slow path for everything and one stalled transaction
   held up the region. A node of format 15 refuses journals and frames of format 14:
   wipe and re-bootstrap, as for format 2.
+- **A node's label** (record format 16): each watermark report carries the word the
+  host gave its node (`Cluster::builder(..).label(..)`, `Node::with_label`), which
+  region it serves, say; every node keeps the latest from each peer
+  (`PeerState::label`, `Cluster::live`). Opaque to the cluster. A node of format 16
+  refuses journals and frames of format 15: wipe and re-bootstrap, as for format 2.
 
 ---
 
