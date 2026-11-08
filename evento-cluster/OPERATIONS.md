@@ -9,7 +9,7 @@ This is the *ops* companion to [`DESIGN.md`](./DESIGN.md) (which covers the prot
 > the path for prototypes, demos, and controlled/low-stakes deployments.
 
 Worked, copy-pasteable deployments live in the examples:
-- `examples/bank-axum-cluster` — a node over TCP (single-node or a 3-node localhost
+- `examples/bank-axum-cluster` — a node opened from its settings through `Cluster::builder` (single-node or a 3-node localhost
   cluster), with `/metrics` and `/health` endpoints.
 - `examples/jepsen-node` — a node over real TCP with a durable `FjallJournal`.
 
@@ -62,7 +62,8 @@ derives from the events (read models next to them) once the store was emptied.
 
 **By hand.** Each node needs: its `NodeId`, the membership, a transport bound to its
 address, a durable journal, and a local event store. Minimal shape (see
-`examples/bank-axum-cluster/src/main.rs::build_cluster_node`):
+`examples/jepsen-node/src/main.rs`, which keeps its journal and store in separate
+directories for the Jepsen nemesis to lose or roll back one without the other):
 
 ```rust
 let topology = Arc::new(StaticTopology::new(id, all_ids));      // fixed membership
@@ -76,8 +77,8 @@ node.start_recovery();       // periodic recovery + anti-entropy + compaction sw
 let executor = ClusterExecutor::new(node, fjall);                // drop-in evento::Executor
 ```
 
-- **Durable journal is required for production.** `InMemoryJournal` (used by the demos)
-  loses consensus state on restart. Use `evento_fjall::FjallJournal` (`evento-fjall`'s
+- **Durable journal is required for production.** `InMemoryJournal` (for tests, and
+  `Builder::journal` in a demo) loses consensus state on restart. Use `evento_fjall::FjallJournal` (`evento-fjall`'s
   `cluster` feature), `evento_sql::SqlJournal` (`evento-sql`'s) or
   `evento_turso::TursoJournal` (`evento-turso`'s). Each of those backends also
   implements `ClusterBackend` under that feature: `open_journal` opens the journal

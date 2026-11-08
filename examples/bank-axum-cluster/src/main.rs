@@ -1,6 +1,10 @@
 //! Bank web app on the **Accord consensus** executor (`evento-cluster`): writes
 //! are replicated through the cluster (strictly serializable, leaderless);
-//! reads and subscriptions are served from each node's local Fjall store.
+//! reads and subscriptions are served from each node's local Fjall store. The
+//! node is opened from its settings alone (`Cluster::builder`): the same code
+//! runs a node alone and a node of a cluster, and a node that falls behind or
+//! loses its store copies it back from a peer at its next start (see
+//! `OPERATIONS.md` §2 and §7).
 //!
 //! Run standalone (single node, in-memory transport, no ports):
 //!
@@ -29,7 +33,6 @@
 //! the cluster keeps serving — the other bank examples, which are single
 //! processes with nothing to fail over to, exit instead.
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -45,13 +48,9 @@ use bank::{
     account_details, AccountDetailsView, AccountType, Command, DepositMoney, OpenAccount,
     ReceiveMoney, TransferMoney, WithdrawMoney,
 };
-use evento::cluster::{
-    serve, ClusterExecutor, DataStore, ExecutorDataStore, HybridLogicalClock, InMemoryJournal,
-    InMemoryNetwork, Journal, MessageSink, Node, NodeId, StaticTopology, TcpTransport, Topology,
-};
+use evento::cluster::{Cluster, ClusterExecutor, Settings};
 use evento::Fjall;
 use serde::Deserialize;
-use tokio::sync::mpsc;
 use ulid::Ulid;
 
 /// Accord membership for the demo cluster: 3 nodes on localhost by default
@@ -70,68 +69,11 @@ type Executor = ClusterExecutor<Fjall>;
 #[derive(Clone)]
 struct AppState {
     executor: Arc<Executor>,
+    /// This node, as the host runs it: its health for `/health`.
+    cluster: Arc<Cluster>,
     /// The projection worker behind `/health`. Held as an `Arc` because the
     /// handler only observes it — `Subscription::stop_reason` takes `&self`.
     subscription: Arc<evento::subscription::Subscription>,
-}
-
-/// Builds a **single-node** Accord cluster over `local` (a Fjall event store),
-/// talking to itself over the in-memory transport. Used when no `NODE_ID` is set
-/// — runs standalone with no ports to coordinate.
-fn build_single_node(local: Fjall) -> Executor {
-    let id = NodeId(0);
-    let net = InMemoryNetwork::new();
-    let inbox = net.register(id);
-
-    let node = Node::new(
-        id,
-        Arc::new(StaticTopology::new(id, vec![id])) as Arc<dyn Topology>,
-        Arc::new(HybridLogicalClock::new(id)),
-        Arc::new(net.sink(id)) as Arc<dyn MessageSink>,
-        Arc::new(ExecutorDataStore::new(local.clone())) as Arc<dyn DataStore>,
-        Arc::new(InMemoryJournal::new()) as Arc<dyn Journal>,
-    );
-    node.start(inbox);
-    node.start_recovery();
-
-    ClusterExecutor::new(node, local)
-}
-
-/// Builds one node of a **multi-node** Accord cluster over real TCP. Each node
-/// runs in its own process with its own `local` store; they reach each other via
-/// `peers` (which includes this node). Writes are coordinated across the cluster
-/// and committed once a quorum agrees; reads are served from this node's store.
-async fn build_cluster_node(
-    id: NodeId,
-    listen: SocketAddr,
-    peers: HashMap<NodeId, SocketAddr>,
-    local: Fjall,
-) -> anyhow::Result<Executor> {
-    let ids: Vec<NodeId> = {
-        let mut ids: Vec<NodeId> = peers.keys().copied().collect();
-        ids.sort();
-        ids
-    };
-
-    // Inbound: accept peer connections, decode frames, feed this node's inbox.
-    let listener = tokio::net::TcpListener::bind(listen).await?;
-    let (inbox_tx, inbox_rx) = mpsc::channel(1024);
-    serve(listener, inbox_tx);
-
-    let node = Node::new(
-        id,
-        Arc::new(StaticTopology::new(id, ids)) as Arc<dyn Topology>,
-        Arc::new(HybridLogicalClock::new(id)),
-        // Outbound: lazily connects to each peer over TCP (swap for `with_tls`
-        // + `serve_tls` to encrypt and mutually authenticate inter-node traffic).
-        Arc::new(TcpTransport::new(id, peers)) as Arc<dyn MessageSink>,
-        Arc::new(ExecutorDataStore::new(local.clone())) as Arc<dyn DataStore>,
-        Arc::new(InMemoryJournal::new()) as Arc<dyn Journal>,
-    );
-    node.start(inbox_rx);
-    node.start_recovery();
-
-    Ok(ClusterExecutor::new(node, local))
 }
 
 #[tokio::main]
@@ -166,38 +108,48 @@ async fn main() -> anyhow::Result<()> {
     let label = node_id
         .map(|n| n.to_string())
         .unwrap_or_else(|| "single".into());
-    // A *persistent* store path (not a temp dir), so events — and therefore
-    // accounts — survive a restart. Point this at real durable storage in
-    // production; here it's a stable directory under the system temp dir.
-    let store_path = std::env::temp_dir().join(format!("bank-axum-cluster-{label}"));
-    std::fs::create_dir_all(&store_path)?;
-    println!("Fjall store: {}", store_path.display());
-    let local = Fjall::open(&store_path)?;
+    // A *persistent* data directory (not a temp dir), so events — and
+    // therefore accounts — survive a restart. Point this at real durable
+    // storage in production; here it's a stable directory under the system
+    // temp dir. The store (with its consensus journal inside) is one
+    // sub-directory; the host keeps its rejoin mark next to it.
+    let data_dir = std::env::temp_dir().join(format!("bank-axum-cluster-{label}"));
+    std::fs::create_dir_all(&data_dir)?;
+    println!("Data directory: {}", data_dir.display());
+    let local = Fjall::open(data_dir.join("store"))?;
 
-    let (executor, web_port) = match node_id {
+    // The `[cluster]` section a deployment would read from its configuration
+    // file: here from the environment. `None` runs a node alone.
+    let settings = match node_id {
         Some(id) => {
             assert!(id < cluster_size, "NODE_ID must be 0..{cluster_size}");
-            let peers: HashMap<NodeId, SocketAddr> = (0..cluster_size)
+            let peers: Vec<SocketAddr> = (0..cluster_size)
                 .map(|n| {
-                    let addr = format!("127.0.0.1:{}", CLUSTER_BASE_PORT + n as u16)
+                    format!("127.0.0.1:{}", CLUSTER_BASE_PORT + n as u16)
                         .parse()
-                        .unwrap();
-                    (NodeId(n), addr)
+                        .unwrap()
                 })
                 .collect();
-            let listen = peers[&NodeId(id)];
-            println!("Cluster node {id} listening on {listen} ({cluster_size}-node cluster)");
-            let executor = build_cluster_node(NodeId(id), listen, peers, local).await?;
-            (executor, WEB_BASE_PORT + id as u16)
+            println!(
+                "Cluster node {id} listening on {} ({cluster_size}-node cluster)",
+                peers[id as usize]
+            );
+            Some(Settings::new(id, peers))
         }
         None => {
             println!(
                 "single-node mode — set NODE_ID=0..{} for a TCP cluster",
                 cluster_size - 1
             );
-            (build_single_node(local), WEB_BASE_PORT)
+            None
         }
     };
+    let web_port = WEB_BASE_PORT + node_id.unwrap_or(0) as u16;
+    let (cluster, executor) = Cluster::builder(local)
+        .settings(settings)
+        .state_dir(&data_dir)
+        .open()
+        .await?;
 
     // Rebuild this node's read model from the event log and then keep it current.
     // The cache (`AccountDetailsView::snapshot_rows()`) is in-memory, so it must be re-projected
@@ -216,6 +168,7 @@ async fn main() -> anyhow::Result<()> {
 
     let state = AppState {
         executor: Arc::new(executor),
+        cluster: cluster.clone(),
         subscription: subscription.clone(),
     };
 
@@ -257,6 +210,7 @@ async fn main() -> anyhow::Result<()> {
     // `stop` is the `&self` half of `shutdown`, for a handle shared behind an
     // `Arc` like this one.
     subscription.stop();
+    cluster.shutdown().await;
 
     Ok(())
 }
@@ -312,11 +266,24 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body)
 }
 
-/// Liveness probe: 200 while the process is up *and* its projection worker is
-/// still running. A dead worker means this node keeps answering reads from a
-/// read model that has stopped updating — up, but not healthy. Readiness (is
-/// this node caught up?) is derived from `/metrics` — see OPERATIONS.md.
+/// Liveness probe: 200 while the process is up, the node takes writes *and*
+/// its projection worker is still running. A node that fell behind or whose
+/// journal rolled back refuses writes until it is restarted (the host marked
+/// its store for a copy, see OPERATIONS.md §7); a dead worker means this node
+/// keeps answering reads from a read model that has stopped updating — up,
+/// but not healthy. Readiness (is this node caught up?) is derived from
+/// `/metrics` — see OPERATIONS.md.
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
+    let node = state.cluster.health();
+    if !node.serving() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "node not serving (confirmed: {}, rejoin required: {}, rolled back: {}, copy pending: {}): restart it",
+                node.confirmed, node.rejoin_required, node.rolled_back, node.copy_pending
+            ),
+        );
+    }
     match state.subscription.stop_reason() {
         None => (StatusCode::OK, "ok".to_owned()),
         Some(reason) => (
