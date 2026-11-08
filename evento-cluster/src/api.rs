@@ -172,15 +172,17 @@ pub trait Topology: Send + Sync + 'static {
 }
 
 /// How many slots the key space is cut into: a key's slot is a stable hash
-/// of it modulo `SLOTS`, and a layout's slot table names each slot's shard
-/// ([`ShardMap`]). A change that adds or removes shards moves whole slots,
-/// as few as it can.
+/// of its shard prefix modulo `SLOTS`, and a layout's slot table names each
+/// slot's shard ([`ShardMap`]). A change that adds or removes shards moves
+/// whole slots, as few as it can.
 pub const SLOTS: usize = 4096;
 
-/// The slot of `key`: a stable hash of it modulo [`SLOTS`].
+/// The slot of `key`: a stable hash of its shard prefix (its tenant and
+/// routing key, [`Key::shard_prefix`]) modulo [`SLOTS`] — so every stream
+/// under one routing key is in one slot, and a bare routing key is in it too.
 pub fn slot_of(key: &Key) -> usize {
     // Stable across nodes AND toolchains (unlike DefaultHasher).
-    (stable_hash(key.0.as_bytes()) % SLOTS as u64) as usize
+    (stable_hash(key.shard_prefix().as_bytes()) % SLOTS as u64) as usize
 }
 
 /// A shard layout as config Paxos decides it: each shard's replica set, and

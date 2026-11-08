@@ -79,7 +79,7 @@ use evento::cluster::{
     StaticTopology, TcpTransport, Topology,
 };
 use evento::fjall::FjallJournal;
-use evento::{Event, Executor, Fjall, WriteError};
+use evento::{Event, Evento, Executor, Fjall, WriteError};
 use serde_json::{json, Value as JsonValue};
 use tokio::sync::mpsc;
 use ulid::Ulid;
@@ -89,7 +89,10 @@ use ulid::Ulid;
 const AGGREGATE_TYPE: &str = "jepsen/Reg";
 const EVENT_NAME: &str = "Appended";
 
-type Exec = ClusterExecutor<Fjall>;
+/// The cluster executor over the node's Fjall store, wrapped so a default
+/// routing key (`ROUTING_KEY`) is the node's: a read by id of a stream the
+/// node has not seen yet is fenced where the node would create it.
+type Exec = ClusterExecutor<Evento>;
 
 /// The exit code that has the launcher run the binary again (`EX_TEMPFAIL`).
 const EX_TEMPFAIL: i32 = 75;
@@ -99,6 +102,10 @@ struct AppState {
     executor: Arc<Exec>,
     /// Set once the node is open and, if it came back joining, joined.
     ready: Arc<AtomicBool>,
+    /// The routing key every append is written under (`ROUTING_KEY`), if
+    /// any: one region for every Elle key, so they share a shard and
+    /// conflict per aggregate (#483). None: each key is routed by its id.
+    routing_key: Option<String>,
 }
 
 impl AppState {
@@ -194,9 +201,20 @@ async fn main() -> anyhow::Result<()> {
     )
     .with_config(config);
 
+    // ROUTING_KEY=<key> writes every Elle key under one routing key, the
+    // node's default too, so a by-id read of a stream created elsewhere is
+    // fenced under it.
+    let routing_key = std::env::var("ROUTING_KEY")
+        .ok()
+        .filter(|key| !key.is_empty());
+    let mut local = Evento::new(local);
+    if let Some(key) = &routing_key {
+        local = local.default_routing_key(key.clone());
+    }
     let state = AppState {
         executor: Arc::new(ClusterExecutor::new(node.clone(), local)),
         ready: Arc::new(AtomicBool::new(false)),
+        routing_key,
     };
     let app = Router::new()
         .route("/health", get(health))
@@ -386,6 +404,7 @@ async fn txn(State(state): State<AppState>, Json(body): Json<JsonValue>) -> Resp
             &key,
             version,
             value.expect("append needs a value"),
+            state.routing_key.clone(),
         ));
     }
 
@@ -457,8 +476,9 @@ async fn read_values(exec: &Exec, key: &str) -> anyhow::Result<Vec<i64>> {
         .collect()
 }
 
-/// Builds one append event: value stored as its decimal string in `data`.
-fn append_event(key: &str, version: u16, value: i64) -> Event {
+/// Builds one append event: value stored as its decimal string in `data`,
+/// under `routing_key` when the run writes every key in one region.
+fn append_event(key: &str, version: u16, value: i64, routing_key: Option<String>) -> Event {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
@@ -471,6 +491,7 @@ fn append_event(key: &str, version: u16, value: i64) -> Event {
         data: value.to_string().into_bytes(),
         timestamp: now.as_secs(),
         timestamp_subsec: now.subsec_millis(),
+        routing_key,
         ..Default::default()
     }
 }

@@ -62,12 +62,15 @@ const HOLDS_PAGE_SIZE: u16 = 64;
 /// [`target`]).
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Target<'a> {
-    /// An explicit routing key, in its tenant: the key its writes conflict on.
-    Routed(Key),
+    /// An explicit routing key, in its tenant: the keys to fence, all in that
+    /// routing key's shard. One per aggregate id the filters name
+    /// ([`Key::of_stream`]), or the bare routing key when they name none — a
+    /// scan of the region, fenced on every write under it.
+    Routed(Vec<Key>),
     /// One aggregate by id, in one tenant, under the distinct aggregate types
     /// the filters name (a projection load with co-keyed aggregates reads
     /// several types under one id). Its conflict key is **not** the id: the
-    /// write side keys a stream by its routing key when it has one
+    /// write side keys a stream by its routing key and its id when it has one
     /// ([`Key::of`]), which only a lookup of the stream tells — see
     /// [`ClusterExecutor::conflict_keys`].
     Aggregate {
@@ -77,12 +80,13 @@ pub(crate) enum Target<'a> {
     },
 }
 
-/// The target a read can be pinned to, if any: an explicit routing key, or a
+/// The target a read can be pinned to, if any: an explicit routing key (with
+/// the aggregate ids its filters name, if every filter names one), or a
 /// query for one aggregate by id — however many filters spell it out (a
 /// projection load issues one filter per handled event type, all for the same
 /// id) — in the one tenant it reads ([`Key::in_tenant`]). Broad scans (several
-/// aggregate ids, by event type alone, or every tenant) return `None` and are
-/// served locally.
+/// aggregate ids without a routing key, by event type alone, or every tenant)
+/// return `None` and are served locally.
 pub(crate) fn target<'a>(
     aggregators: &'a Option<Arc<[EventFilter]>>,
     routing_key: &Option<RoutingKey>,
@@ -93,7 +97,25 @@ pub(crate) fn target<'a>(
         return None;
     };
     if let Some(RoutingKey::Value(Some(key))) = routing_key {
-        return Some(Target::Routed(Key::in_tenant(tenant, key)));
+        let ids: Option<Vec<&str>> = aggregators
+            .as_deref()
+            .filter(|filters| !filters.is_empty())
+            .and_then(|filters| filters.iter().map(|f| f.aggregate_id.as_deref()).collect());
+        let keys = match ids {
+            // Named streams under the routing key: fence each one, not the region.
+            Some(ids) => {
+                let mut keys = Vec::with_capacity(ids.len());
+                for id in ids {
+                    let key = Key::of_stream(tenant, Some(key), id);
+                    if !keys.contains(&key) {
+                        keys.push(key);
+                    }
+                }
+                keys
+            }
+            None => vec![Key::in_tenant(tenant, key)],
+        };
+        return Some(Target::Routed(keys));
     }
     let filters = aggregators.as_deref()?;
     let (first, rest) = filters.split_first()?;
@@ -197,7 +219,28 @@ mod target_tests {
                 &Some(RoutingKey::Value(Some("region".into()))),
                 &default_tenant(),
             ),
-            Some(Target::Routed(Key("region".into())))
+            Some(Target::Routed(vec![
+                Key::of_stream("", Some("region"), "a"),
+                Key::of_stream("", Some("region"), "b"),
+            ]))
+        );
+        // No aggregate named: the region itself is the key.
+        assert_eq!(
+            target(
+                &None,
+                &Some(RoutingKey::Value(Some("region".into()))),
+                &default_tenant(),
+            ),
+            Some(Target::Routed(vec![Key("region".into())]))
+        );
+        let by_type: Arc<[EventFilter]> = Arc::from(vec![filter(None, Some("Opened"))]);
+        assert_eq!(
+            target(
+                &Some(by_type),
+                &Some(RoutingKey::Value(Some("region".into()))),
+                &default_tenant(),
+            ),
+            Some(Target::Routed(vec![Key("region".into())]))
         );
     }
 
@@ -211,7 +254,7 @@ mod target_tests {
             target(&Some(one.clone()), &None, &acme),
             aggregate("acme", "a", &["t/A"])
         );
-        assert_eq!(target(&Some(one), &None, &TenantFilter::All), None);
+        assert_eq!(target(&Some(one.clone()), &None, &TenantFilter::All), None);
         let written = Key::of(&Event {
             aggregate_id: "a".into(),
             routing_key: Some("r".into()),
@@ -219,9 +262,20 @@ mod target_tests {
             ..Default::default()
         });
         assert_eq!(
-            target(&None, &Some(RoutingKey::Value(Some("r".into()))), &acme),
-            Some(Target::Routed(written))
+            target(
+                &Some(one),
+                &Some(RoutingKey::Value(Some("r".into()))),
+                &acme
+            ),
+            Some(Target::Routed(vec![written.clone()]))
         );
+        let region = Key::in_tenant("acme", "r");
+        assert_eq!(
+            target(&None, &Some(RoutingKey::Value(Some("r".into()))), &acme),
+            Some(Target::Routed(vec![region.clone()]))
+        );
+        assert!(region.under().unwrap().contains(&written));
+        assert_eq!(slot_of(&region), slot_of(&written));
     }
 }
 
@@ -523,9 +577,10 @@ impl<E: Executor + Clone> ClusterExecutor<E> {
     }
 
     /// The keys a read of aggregate `id` conflicts on, as the write side
-    /// derives them ([`Key::of`]): each stream's routing key when it has one,
-    /// else its id, in `tenant`. One lookup per stream, in the local backend
-    /// (the stream's first event carries the key every later event inherits).
+    /// derives them ([`Key::of`]): each stream's routing key and its id when
+    /// it has one, else its id alone, in `tenant`. One lookup per stream, in
+    /// the local backend (the stream's first event carries the routing key
+    /// every later event inherits).
     ///
     /// A stream this node has not seen yet — brand new, or written elsewhere
     /// and not applied here — is pinned where **this node would create it**:
@@ -550,12 +605,11 @@ impl<E: Executor + Clone> ClusterExecutor<E> {
                     id.to_owned(),
                 )
                 .await?;
-            let base = match stream {
-                Some(Some(routing_key)) => routing_key,
-                Some(None) => id.to_owned(),
-                None => self.local.default_routing_key().unwrap_or(id).to_owned(),
+            let routing_key = match &stream {
+                Some(routing_key) => routing_key.as_deref(),
+                None => self.local.default_routing_key(),
             };
-            let key = Key::in_tenant(tenant, &base);
+            let key = Key::of_stream(tenant, routing_key, id);
             if !keys.contains(&key) {
                 keys.push(key);
             }
@@ -636,32 +690,37 @@ impl<E: Executor + Clone> Executor for ClusterExecutor<E> {
         args: Args,
         to_micros: Option<u64>,
     ) -> anyhow::Result<ReadResult<Event>> {
-        // A single-key read for a key this node does not own is forwarded to an
+        // A read pinned to one shard this node is not in is forwarded to an
         // owner. Everything else (owned keys, and broad scans that can't be pinned
         // to one shard) is served from the local backend.
-        let keys = match target(&aggregators, &routing_key, &tenant) {
-            None => Vec::new(),
-            Some(Target::Routed(key)) => vec![key],
+        let (keys, one_shard) = match target(&aggregators, &routing_key, &tenant) {
+            None => (Vec::new(), false),
+            // A routed read's keys all live in the routing key's shard.
+            Some(Target::Routed(keys)) => (keys, true),
             // The key only matters where it decides something: a barrier, or
             // which shard owns it. A single-shard node without linearizable
             // reads owns every key and fences none, so it skips the lookup.
             Some(Target::Aggregate { tenant, id, types })
                 if self.node.linearizable_reads() || self.node.sharded() =>
             {
-                self.conflict_keys(tenant, id, &types).await?
+                let keys = self.conflict_keys(tenant, id, &types).await?;
+                let one_shard = keys.len() == 1;
+                (keys, one_shard)
             }
-            Some(Target::Aggregate { .. }) => Vec::new(),
+            Some(Target::Aggregate { .. }) => (Vec::new(), false),
         };
-        match keys.as_slice() {
-            [] => {}
-            [key] => {
+        match keys.first() {
+            None => {}
+            Some(key) if one_shard => {
                 if self.node.owns_key(key) {
                     // Linearizable reads: fence the local backend with a read barrier
-                    // (a read-only consensus round) so it reflects every write that
-                    // committed before this read began, then serve locally. Off by
-                    // default — reads stay local-only (serializable, not linearizable).
+                    // (a read-only consensus round per key) so it reflects every
+                    // write that committed before this read began, then serve
+                    // locally. Off by default — reads stay local-only
+                    // (serializable, not linearizable).
                     if self.node.linearizable_reads() {
-                        self.node.read_barrier(key.clone()).await?;
+                        try_join_all(keys.iter().map(|key| self.node.read_barrier(key.clone())))
+                            .await?;
                     }
                 } else if let Some(owner) = self.node.an_owner_of(key) {
                     // NOTE: a forwarded (non-owned, multi-shard) read is not yet
@@ -683,7 +742,7 @@ impl<E: Executor + Clone> Executor for ClusterExecutor<E> {
             // Co-keyed streams under several routing keys: fence each one this
             // node owns. No single owner serves them all, so a key this node
             // does not own is read locally, like a broad scan.
-            keys if self.node.linearizable_reads() => {
+            Some(_) if self.node.linearizable_reads() => {
                 try_join_all(
                     keys.iter()
                         .filter(|key| self.node.owns_key(key))
@@ -691,7 +750,7 @@ impl<E: Executor + Clone> Executor for ClusterExecutor<E> {
                 )
                 .await?;
             }
-            _ => {}
+            Some(_) => {}
         }
         self.local
             .read(aggregators, routing_key, tenant, args, to_micros)

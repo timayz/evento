@@ -782,6 +782,14 @@ through `ClusterExecutor`) — split it into several writes.
   over a journal that holds something asks the others to confirm it (`Opened`,
   answered `OpenedOk` or `RolledBack`). A node of format 10 refuses journals and
   frames of format 9: wipe and re-bootstrap, as for format 2.
+- **Conflicts per aggregate, shards per routing key** (record format 15, #483): a
+  key is `tenant ␟ routing-key ␞ aggregate-id` (the id alone for a stream without
+  a routing key). Two writes conflict only when they touch the same aggregate; a
+  region's streams still share a slot, so they stay in one shard and move together
+  on a re-sharding. Before, every write under a routing key conflicted with every
+  other, so a region took the slow path for everything and one stalled transaction
+  held up the region. A node of format 15 refuses journals and frames of format 14:
+  wipe and re-bootstrap, as for format 2.
 
 ---
 
@@ -796,14 +804,18 @@ quorum-preserving partition). Cost: one consensus round per read. Leave it off w
 serializable-but-possibly-stale reads are acceptable; turn it on for read-your-writes /
 real-time guarantees across nodes.
 
-The barrier fences the key the aggregate's **writes** conflict on: its routing key when
-the stream has one, else its id. A read by id (a projection load) looks that key up in
-the local store first. A stream the node has not seen yet is fenced where that node
-would create it — under the default routing key of the backend it wraps — so set the
-default on the wrapped backend (`ClusterExecutor::new(node, Evento::new(store)
-.default_routing_key(..))`), not around the `ClusterExecutor`, for nodes sharing a
-default to see each other's brand-new streams. A stream just created under *another*
-node's default is the one read a by-id load cannot fence: pass its routing key.
+The barrier fences the key the aggregate's **writes** conflict on: its routing key and
+its id when the stream has one, else its id alone (#483: two streams under one routing
+key share a shard, not a conflict). A read by id (a projection load) looks the stream's
+routing key up in the local store first. A stream the node has not seen yet is fenced
+where that node would create it — under the default routing key of the backend it
+wraps — so set the default on the wrapped backend (`ClusterExecutor::new(node,
+Evento::new(store).default_routing_key(..))`), not around the `ClusterExecutor`, for
+nodes sharing a default to see each other's brand-new streams. A stream just created
+under *another* node's default is the one read a by-id load cannot fence: pass its
+routing key. A read with an explicit routing key fences each aggregate id its filters
+name under it, or — a scan of the region, no id named — the routing key itself, which
+waits on every write under it.
 
 ---
 
