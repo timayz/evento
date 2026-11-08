@@ -379,6 +379,12 @@ The handle is how you find out: `stopped()` resolves with a
 is the non-blocking peek, and `stop()` signals a worker held behind an `Arc`. Combined with
 the subscriber above, a broken handler is visible in minute one instead of hour two.
 
+An event whose payload does not decode as the handled event is not a handler error: the
+handler never ran, and no retry will decode the bytes. By default it is logged with its id,
+type, name and tenant, acknowledged and skipped, so one bad row (on a shared store, any
+tenant's writer can append one under a handled type and name) does not stop the
+subscription for every tenant. `.on_undecodable(Undecodable::Stop)` makes it stop instead.
+
 `.data(v)` stores `v` under its own type; a handler reads it back with
 `ctx.extract::<T>()`, or `ctx.try_extract::<T>()?` to get an error instead of a panic
 when it was never registered. Extraction clones, so the type should be `Clone` and cheap
@@ -739,6 +745,7 @@ plus the [`bank-axum-cluster`](examples/bank-axum-cluster) 3-node demo.
 | Fail on unhandled events | `.strict()` |
 | One tenant's events only (shared store) | `.tenant("")` / `.tenant(t)` |
 | Keep going after a handler error | `.continue_on_error()` |
+| Stop on a payload that does not decode (default: skip it) | `.on_undecodable(Undecodable::Stop)` |
 | Notice a stopped subscription | `subscription.stopped().await` → `StopReason` |
 | Live bridge (SSE/WebSocket) | `.live(exec)` = `.ephemeral().start_from_latest().start(exec)` |
 | Skip history on a new subscription | `.start_from_latest()` |

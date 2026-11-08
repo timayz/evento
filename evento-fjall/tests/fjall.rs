@@ -337,6 +337,12 @@ async fn fjall_tenant_filtered_subscription() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn fjall_undecodable_event_is_skipped() -> anyhow::Result<()> {
+    let executor = Fjall::temporary()?;
+    evento_test::undecodable_event_is_skipped(&executor).await
+}
+
+#[tokio::test]
 async fn fjall_tenant_projection_subscription() -> anyhow::Result<()> {
     let executor = Fjall::temporary()?;
     evento_test::tenant_projection_subscription(&executor).await

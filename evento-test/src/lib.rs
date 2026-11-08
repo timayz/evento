@@ -5132,6 +5132,57 @@ pub async fn tenant_filtered_subscription<E: Executor + Clone>(executor: &E) -> 
     Ok(())
 }
 
+/// Scenario: an event whose payload does not decode is poison, not a failure.
+///
+/// Guards issue #485: on a shared store, a writer confined to its own tenant
+/// can append an event of a handled aggregate type and name with bytes that
+/// do not decode. The handler never runs on it and no retry would decode it,
+/// so by default the pass logs it, acknowledges it and goes on — for every
+/// tenant, instead of stopping on every node and again after each restart.
+/// `.on_undecodable(Undecodable::Stop)` makes it the handler's error, typed.
+pub async fn undecodable_event_is_skipped<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
+    use evento::subscription::Undecodable;
+
+    let id = Ulid::generate().to_string();
+    open_in(executor, "", &id, 1).await?;
+    let mut poison = raw_opened(&id, "poison-tenant");
+    poison.data = vec![0xFF, 0xFF, 0xFF];
+    executor.write(vec![poison]).await?;
+    open_in(executor, "after", &id, 2).await?;
+
+    // Default: skipped, and the events on either side are delivered.
+    let skip = format!("undecodable-skip-{id}");
+    tenant_seen::subscription(&skip).run_once(executor).await?;
+    assert_eq!(tenant_seen::take(&skip, &id), ["", "after"]);
+
+    // Acknowledged: a second pass does not meet it again.
+    open_in(executor, "later", &id, 3).await?;
+    tenant_seen::subscription(&skip).run_once(executor).await?;
+    assert_eq!(tenant_seen::take(&skip, &id), ["later"]);
+
+    // Stop: the pass fails on it with the decode error, naming the event, and
+    // what came before it was acknowledged.
+    let stop = format!("undecodable-stop-{id}");
+    let err = tenant_seen::subscription(&stop)
+        .on_undecodable(Undecodable::Stop)
+        .run_once(executor)
+        .await
+        .expect_err("a payload that does not decode must stop the pass");
+    let decode = err
+        .downcast_ref::<evento::DecodeError>()
+        .unwrap_or_else(|| panic!("expected a DecodeError, got {err:#}"));
+    assert_eq!(decode.aggregate_id, id);
+    assert_eq!(decode.tenant, "poison-tenant");
+    assert_eq!(decode.name, "AccountOpened");
+    let delivered = tenant_seen::take(&stop, &id);
+    assert!(
+        !delivered.iter().any(|t| t == "after" || t == "later"),
+        "nothing past the poison event is delivered: {delivered:?}"
+    );
+
+    Ok(())
+}
+
 /// Scenario: a projection subscription loads each event's aggregate in the
 /// event's own tenant — the same id in two tenants projects to two rows — and
 /// the snapshots it persists stay in their tenant.

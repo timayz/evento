@@ -34,13 +34,11 @@ impl Alias {
             return Ok(Cow::Borrowed(event));
         }
 
+        // A `DecodeError` of the stored event under the upcast's context, so
+        // a subscription pass reads it as that event's poison payload.
         let data = (self.upcast)(&event.data).map_err(|e| {
-            anyhow::anyhow!(
-                "failed to upcast `{}` to `{}` (event {}): {e}",
-                self.from,
-                self.to,
-                event.id
-            )
+            anyhow::Error::new(crate::metadata::DecodeError::new(event, e))
+                .context(format!("failed to upcast `{}` to `{}`", self.from, self.to))
         })?;
         tracing::debug!(from = self.from, to = self.to, "upcast event");
 
