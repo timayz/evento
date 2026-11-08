@@ -17,6 +17,11 @@ see [`examples/bank-axum-cluster`](../examples/bank-axum-cluster) for a runnable
 
 ## What works
 
+- **`Cluster`** — one node from its settings: `Cluster::builder(store).settings(..)
+  .state_dir(..).open()` over a `Turso`/`Sql`/`Fjall` store, with the `[cluster]`
+  section of a configuration file as `Settings` (`node_id`, `peers`, …) or none for
+  a node alone. Transport, `NodeConfig`, colocated journal, recover-or-copy, the
+  signals that end a node's part, `health()` for a status page.
 - **`ClusterExecutor`** — a drop-in `evento_core::Executor`. Writes are
   coordinated through the cluster (replicated, strictly serializable); reads,
   subscriptions, and snapshots are served from a local evento backend

@@ -27,10 +27,11 @@ bytes = "1"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
-evento-fjall = { path = "../evento-fjall" }
+evento-fjall = { path = "../evento-fjall", features = ["cluster"] }
 evento-turso = { path = "../evento-turso", features = ["cluster"] }
 rand = { workspace = true }
 rcgen = "0.14"
+serde_json.workspace = true
 criterion = "0.8"
 tracing-subscriber = { workspace = true }
 

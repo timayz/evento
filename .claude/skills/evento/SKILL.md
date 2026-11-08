@@ -146,8 +146,13 @@ let executor = evento::Sidecar::from((client, local));        // events: client;
   consensus journal it also enables (`evento::fjall::FjallJournal`, `evento::sql::SqlJournal`,
   `evento::turso::TursoJournal`; each backend then implements
   `evento::cluster::ClusterBackend`: `open_journal`, `empty_for_join`, `discard_journal`);
-  one process runs one node of one cluster
-  (`examples/bank-axum-cluster/`, `evento-cluster/OPERATIONS.md`). A deployer
+  one process runs one node of one cluster, opened from its settings:
+  `evento::cluster::Cluster::builder(store).settings(Some(settings)).state_dir(dir).open().await?`
+  → `(Arc<Cluster>, ClusterExecutor<_>)`; `Settings` deserializes a `[cluster]` section
+  (`node_id`, `peers`, `listen?`, `absent_after_secs`, `write_backlog`, `linearizable_reads?`),
+  `None` = a node alone; `cluster.health()`, `until_confirmed`, `live_nodes`, `shutdown`;
+  `Cluster::mark_for_rejoin(dir)` for a lost store
+  (`examples/bank-axum-cluster/`, `evento-cluster/OPERATIONS.md` §2). A deployer
   touches only the crate root; the protocol's types (`TxnId`, `CommandState`,
   `Message`, the journal records) sit under `evento::cluster::protocol`.
 
