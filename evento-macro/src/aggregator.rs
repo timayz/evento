@@ -455,6 +455,7 @@ pub fn aggregator(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStre
                         #event_names => bitcode::decode::<#variant_idents>(&event.data)
                             .map(Self::#variant_idents)
                             .map_err(|source| evento::FromEventError::Decode {
+                                id: event.id,
                                 name: event.name.clone(),
                                 source,
                             }),

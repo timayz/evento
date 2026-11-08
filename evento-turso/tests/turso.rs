@@ -354,6 +354,12 @@ async fn turso_tenant_filtered_subscription() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn turso_undecodable_event_is_skipped() -> anyhow::Result<()> {
+    let executor = Turso::in_memory().await?;
+    evento_test::undecodable_event_is_skipped(&executor).await
+}
+
+#[tokio::test]
 async fn turso_tenant_projection_subscription() -> anyhow::Result<()> {
     let executor = Turso::in_memory().await?;
     evento_test::tenant_projection_subscription(&executor).await

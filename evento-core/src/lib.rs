@@ -173,6 +173,7 @@ pub use evento_macro::*;
 
 pub use aggregator::*;
 pub use executor::*;
+pub use metadata::DecodeError;
 pub use reader::*;
 pub use subscription::RoutingKey;
 

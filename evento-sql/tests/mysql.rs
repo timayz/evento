@@ -420,6 +420,12 @@ async fn mysql_tenant_filtered_subscription() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn mysql_undecodable_event_is_skipped() -> anyhow::Result<()> {
+    let executor = create_mysql_executor("undecodable_event_is_skipped").await?;
+    evento_test::undecodable_event_is_skipped(&executor).await
+}
+
+#[tokio::test]
 async fn mysql_tenant_projection_subscription() -> anyhow::Result<()> {
     let executor = create_mysql_executor("tenant_projection_subscription").await?;
     evento_test::tenant_projection_subscription(&executor).await

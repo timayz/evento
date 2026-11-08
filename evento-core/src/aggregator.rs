@@ -193,8 +193,15 @@ pub enum FromEventError {
     },
 
     /// The stored payload did not decode into the variant's schema.
-    #[error("failed to decode event `{name}`: {source}")]
+    ///
+    /// A subscription pass reads this like a
+    /// [`DecodeError`](crate::metadata::DecodeError) of the event it is
+    /// delivering: the event is poison, not the handler at fault (see
+    /// [`on_undecodable`](crate::subscription::SubscriptionBuilder::on_undecodable)).
+    #[error("failed to decode event `{name}` (id {id}): {source}")]
     Decode {
+        /// Id of the event whose payload failed to decode.
+        id: Ulid,
         /// The stored event name whose payload failed to decode.
         name: String,
         /// The underlying bitcode failure.

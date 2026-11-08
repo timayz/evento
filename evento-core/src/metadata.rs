@@ -211,11 +211,57 @@ impl<'a, D> TryFrom<&'a crate::Event> for Event<'a, D>
 where
     D: bitcode::DecodeOwned,
 {
-    type Error = bitcode::Error;
+    type Error = DecodeError;
 
     fn try_from(value: &'a crate::Event) -> Result<Self, Self::Error> {
-        let data = bitcode::decode::<D>(&value.data)?;
+        let data = bitcode::decode::<D>(&value.data).map_err(|e| DecodeError::new(value, e))?;
         Ok(Event { data, event: value })
+    }
+}
+
+/// A stored payload that does not decode as the event type a handler expects.
+///
+/// Returned by the conversion behind `#[evento::subscription]` and
+/// `#[evento::projection]` handlers, which decode before the handler body
+/// runs, and by a failed upcast of an older event. It names the event, so a
+/// log line can be traced back to the row.
+///
+/// A subscription pass tells it apart from a handler's own error: the
+/// handler never ran, and no retry will decode the bytes, so by default the
+/// event is logged, acknowledged and skipped (see
+/// [`SubscriptionBuilder::on_undecodable`](crate::subscription::SubscriptionBuilder::on_undecodable)).
+#[derive(Debug, Error)]
+#[error(
+    "failed to decode event `{name}` of `{aggregate_type}` {aggregate_id} \
+     (id {id}, tenant {tenant:?}): {source}"
+)]
+pub struct DecodeError {
+    /// Id of the event whose payload did not decode.
+    pub id: Ulid,
+    /// Aggregate type recorded on the stored event.
+    pub aggregate_type: String,
+    /// Aggregate id recorded on the stored event.
+    pub aggregate_id: String,
+    /// Stored event name.
+    pub name: String,
+    /// Tenant of the stored event; `""` is the default tenant.
+    pub tenant: String,
+    /// The underlying bitcode failure.
+    #[source]
+    pub source: bitcode::Error,
+}
+
+impl DecodeError {
+    /// The failure `source` of decoding `event`'s payload.
+    pub fn new(event: &crate::Event, source: bitcode::Error) -> Self {
+        Self {
+            id: event.id,
+            aggregate_type: event.aggregate_type.clone(),
+            aggregate_id: event.aggregate_id.clone(),
+            name: event.name.clone(),
+            tenant: event.tenant.clone(),
+            source,
+        }
     }
 }
 

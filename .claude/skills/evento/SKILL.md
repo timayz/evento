@@ -389,6 +389,8 @@ sub.shutdown().await?;
   (retries exhausted, no `.continue_on_error()`), or `Panicked`. Await it to notice a
   dead subscription instead of discovering a stale read model later.
 - `.strict()` fails on an unhandled event; `.continue_on_error()` keeps going after a handler error.
+- A payload that does not decode as the handled event is poison, not a handler error: logged,
+  acknowledged and skipped by default; `.on_undecodable(Undecodable::Stop)` stops on it instead.
 - **Live bridge (SSE, WebSocket, fanout):** `.live(exec)` is the whole shape in one call —
   `.ephemeral().start_from_latest().start(exec)`. `.ephemeral()` keeps the cursor in memory — no
   subscriber row, no fence, no acknowledge, reads only — and `.start_from_latest()` begins at

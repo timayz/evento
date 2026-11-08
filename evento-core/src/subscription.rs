@@ -27,6 +27,16 @@
 //! So supervise the handle: [`Subscription::stopped`] resolves with the
 //! [`StopReason`], and [`Subscription::is_finished`] is the non-blocking check.
 //!
+//! A payload that does not decode as the handled event is not a handler
+//! error: the handler never ran, and no retry will decode the bytes. Such an
+//! event is poison — on a shared store, any writer confined to its own tenant
+//! can append one under a handled aggregate type and event name — and a
+//! subscription that stopped on it would stop for every tenant, on every
+//! node, and again after each restart. So by default it is logged with its
+//! id, type, name and tenant, acknowledged and skipped;
+//! [`on_undecodable`](SubscriptionBuilder::on_undecodable) makes it stop the
+//! subscription like a handler error instead.
+//!
 //! # Starting position
 //!
 //! A subscription resumes from its stored cursor, and a key that has never
@@ -152,7 +162,7 @@ use crate::{
     context,
     cursor::{Args, Value},
     upcast::Aliases,
-    Aggregate, AggregateEvent, EventFilter, Executor, TenantFilter,
+    Aggregate, AggregateEvent, DecodeError, EventFilter, Executor, FromEventError, TenantFilter,
 };
 
 /// Default bound on how long a shutdown waits for the pass in flight.
@@ -337,6 +347,20 @@ pub trait Handler<E: Executor>: Sync + Send {
     fn event_name(&self) -> &'static str;
 }
 
+/// Whether `err` is the payload of `event` failing to decode: poison, not a
+/// failure of the handler. Only the delivered event counts — a handler that
+/// loads another stream and meets a bad payload there has failed on a good
+/// event, which must not be skipped.
+fn is_undecodable(err: &anyhow::Error, event: &crate::Event) -> bool {
+    if let Some(decode) = err.downcast_ref::<DecodeError>() {
+        return decode.id == event.id;
+    }
+    matches!(
+        err.downcast_ref::<FromEventError>(),
+        Some(FromEventError::Decode { id, .. }) if *id == event.id
+    )
+}
+
 /// Builder for creating event subscriptions.
 ///
 /// Created with [`SubscriptionBuilder::new`], this builder configures
@@ -385,6 +409,8 @@ pub struct SubscriptionBuilder<E: Executor> {
     poll_interval: Duration,
     chunk_size: u16,
     continue_on_error: bool,
+    /// What to do with an event whose payload does not decode.
+    undecodable: Undecodable,
     retry: Option<u8>,
     /// How long `shutdown` waits for the in-flight pass before abandoning
     /// it; `None` waits for as long as the pass takes.
@@ -436,6 +462,21 @@ enum CursorRead {
     LostOwnership,
 }
 
+/// What a subscription does with an event whose payload does not decode as
+/// the handled event (see [`SubscriptionBuilder::on_undecodable`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Undecodable {
+    /// Log the event with its id, type, name and tenant, acknowledge it and go
+    /// on. The default: the bytes will not decode on a retry either.
+    #[default]
+    Skip,
+    /// Treat it as a handler error: without
+    /// [`continue_on_error`](SubscriptionBuilder::continue_on_error) the pass
+    /// fails, is retried, and the subscription stops with
+    /// [`StopReason::Failed`].
+    Stop,
+}
+
 /// What a single `process` pass concluded, beyond a hard error.
 enum ProcessOutcome {
     /// Everything currently available was processed (or nothing was pending).
@@ -471,6 +512,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             shutdown_grace: Some(DEFAULT_SHUTDOWN_GRACE),
             chunk_size: 300,
             continue_on_error: false,
+            undecodable: Undecodable::Skip,
             routing_key: None,
             tenant: TenantFilter::All,
             prefix_key: None,
@@ -594,6 +636,30 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
     /// [`StopReason::Failed`].
     pub fn continue_on_error(mut self) -> Self {
         self.continue_on_error = true;
+
+        self
+    }
+
+    /// What to do with an event whose payload does not decode as the handled
+    /// event.
+    ///
+    /// The `#[evento::subscription]` and `#[evento::projection]` handlers
+    /// decode before their body runs, and a failed upcast of an older event
+    /// decodes too; such a failure is a [`DecodeError`] of the event being
+    /// delivered (or a [`FromEventError::Decode`] of it, from a
+    /// `#[evento::subscription_all]` handler's own `decode()`), and the pass
+    /// tells it apart from the handler's own errors.
+    ///
+    /// Default is [`Undecodable::Skip`]: the event is logged at `error`, with
+    /// its id, aggregate type, name and tenant, acknowledged and skipped. A
+    /// handler error is retried because it may be transient; a payload that
+    /// does not decode will not decode next time either, and on a shared
+    /// store one such event, written by a writer confined to its own tenant,
+    /// would otherwise stop the subscription for every tenant, on every node,
+    /// and again after each restart. [`Undecodable::Stop`] treats it as a
+    /// handler error instead.
+    pub fn on_undecodable(mut self, v: Undecodable) -> Self {
+        self.undecodable = v;
 
         self
     }
@@ -1127,7 +1193,25 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                     .instrument(span.clone())
                     .await;
                     if let Err(err) = result {
-                        if !self.continue_on_error {
+                        if self.undecodable == Undecodable::Skip
+                            && is_undecodable(&err, &event.node)
+                        {
+                            // Poison, not a failure: the handler did not run,
+                            // and a retry would not decode the bytes either.
+                            // Acknowledged below like a handled event.
+                            span.in_scope(|| {
+                                tracing::error!(
+                                    error = %err,
+                                    key = self.resolved_key(),
+                                    event_id = %event.node.id,
+                                    aggregate_type = event.node.aggregate_type,
+                                    aggregate_id = event.node.aggregate_id,
+                                    event = event.node.name,
+                                    tenant = event.node.tenant,
+                                    "undecodable payload, skipping event"
+                                )
+                            });
+                        } else if !self.continue_on_error {
                             span.in_scope(|| {
                                 tracing::error!(
                                     error = %err,
@@ -1150,19 +1234,20 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                             )
                             .await?;
                             return Err(err);
+                        } else {
+                            // continue_on_error: log and acknowledge so the
+                            // subscription makes progress past the failing
+                            // event rather than retrying it forever.
+                            span.in_scope(|| {
+                                tracing::error!(
+                                    error = %err,
+                                    aggregate_type = event.node.aggregate_type,
+                                    aggregate_id = event.node.aggregate_id,
+                                    event = event.node.name,
+                                    "failed, skipping event"
+                                )
+                            });
                         }
-                        // continue_on_error: log and acknowledge so the
-                        // subscription makes progress past the failing event
-                        // rather than retrying it forever.
-                        span.in_scope(|| {
-                            tracing::error!(
-                                error = %err,
-                                aggregate_type = event.node.aggregate_type,
-                                aggregate_id = event.node.aggregate_id,
-                                event = event.node.name,
-                                "failed, skipping event"
-                            )
-                        });
                     } else {
                         span.in_scope(|| tracing::debug!("completed"));
                     }
@@ -2083,7 +2168,10 @@ mod tests {
         CursorStore, Handler, Ordering, StopReason, SubscriptionBuilder, Value,
     };
     use crate::cursor::{Args, ReadResult};
-    use crate::{Event, EventFilter, Executor, RoutingKey, TenantFilter, WriteError};
+    use crate::{
+        DecodeError, Event, EventFilter, Executor, FromEventError, RoutingKey, TenantFilter,
+        WriteError,
+    };
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::atomic::AtomicUsize;
@@ -2450,6 +2538,52 @@ mod tests {
         assert!(failed.is_failure());
         assert!(failed.error().is_some());
         assert!(StopReason::Shutdown.error().is_none());
+    }
+
+    /// A bitcode failure, from bytes no payload decodes as.
+    fn bitcode_failure() -> bitcode::Error {
+        bitcode::decode::<String>(&[0xFF, 0xFF, 0xFF]).expect_err("not a bitcode string")
+    }
+
+    #[test]
+    fn a_decode_error_of_the_delivered_event_is_undecodable() {
+        let event = Event {
+            id: Ulid::generate(),
+            name: "Opened".to_owned(),
+            ..Default::default()
+        };
+        let other = Event {
+            id: Ulid::generate(),
+            ..event.clone()
+        };
+
+        let typed = anyhow::Error::new(DecodeError::new(&event, bitcode_failure()));
+        assert!(super::is_undecodable(&typed, &event));
+        assert!(
+            !super::is_undecodable(&typed, &other),
+            "another event's bad payload is this handler's failure, not this event's"
+        );
+
+        // Through a context layer, as a failed upcast reports it.
+        let upcast = anyhow::Error::new(DecodeError::new(&event, bitcode_failure()))
+            .context("failed to upcast `Opened` to `OpenedV2`");
+        assert!(super::is_undecodable(&upcast, &event));
+
+        // A `subscription_all` handler's own `decode()`.
+        let enum_decode = anyhow::Error::new(FromEventError::Decode {
+            id: event.id,
+            name: event.name.clone(),
+            source: bitcode_failure(),
+        });
+        assert!(super::is_undecodable(&enum_decode, &event));
+        assert!(!super::is_undecodable(&enum_decode, &other));
+
+        let unknown = anyhow::Error::new(FromEventError::UnknownEvent {
+            aggregate_type: "Account",
+            name: event.name.clone(),
+        });
+        assert!(!super::is_undecodable(&unknown, &event));
+        assert!(!super::is_undecodable(&anyhow::anyhow!("boom"), &event));
     }
 
     /// A store holding a fixed, pre-written history, so a pass can be run over
