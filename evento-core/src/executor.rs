@@ -828,10 +828,18 @@ impl Executor for Evento {
 
 impl Evento {
     /// Creates a new type-erased executor wrapper.
+    ///
+    /// The wrapper starts with the inner executor's
+    /// [`default_routing_key`](Executor::default_routing_key), so wrapping an
+    /// executor that already carries one (a remote client told its key by the
+    /// server's Hello, a node pinned to its region) keeps writes and
+    /// subscription cursors under that key. [`Evento::default_routing_key`]
+    /// overrides it.
     pub fn new<E: Executor>(executor: E) -> Self {
+        let default_routing_key = executor.default_routing_key().map(str::to_owned);
         Self {
             inner: Arc::new(Box::new(executor)),
-            default_routing_key: None,
+            default_routing_key,
         }
     }
 
@@ -840,7 +848,8 @@ impl Evento {
     ///
     /// Per-event/per-aggregate routing keys still take precedence on writes.
     /// Subscriptions inherit this key only when the user has not called
-    /// `.routing_key()` or `.any_routing_key()`.
+    /// `.routing_key()` or `.any_routing_key()`. It replaces the key inherited
+    /// from the inner executor by [`Evento::new`].
     pub fn default_routing_key(mut self, key: impl Into<String>) -> Self {
         self.default_routing_key = Some(key.into());
         self
@@ -1394,6 +1403,36 @@ mod group_tests {
                 .delete_snapshot(tenant, aggregate_type, projection, id)
                 .await
         }
+    }
+
+    /// Issue #497: `Evento::new` used to start from `None`, so wrapping an
+    /// executor that already carried a default key (a remote client told its
+    /// key by Hello) wrote new aggregates with no key and scoped subscription
+    /// cursors without the prefix.
+    #[test]
+    fn new_inherits_the_inner_default_routing_key() {
+        let region = Evento::new(MemoryStore::default()).default_routing_key("eu-west");
+        assert_eq!(Executor::default_routing_key(&region), Some("eu-west"));
+
+        let wrapped = Evento::new(region.clone());
+        assert_eq!(
+            Executor::default_routing_key(&wrapped),
+            Some("eu-west"),
+            "wrapping keeps the inner executor's default routing key"
+        );
+
+        let twice = Evento::new(wrapped);
+        assert_eq!(Executor::default_routing_key(&twice), Some("eu-west"));
+
+        let overridden = Evento::new(region).default_routing_key("us-east");
+        assert_eq!(
+            Executor::default_routing_key(&overridden),
+            Some("us-east"),
+            "an explicit key on the wrapper still wins over the inherited one"
+        );
+
+        let bare = Evento::new(MemoryStore::default());
+        assert_eq!(Executor::default_routing_key(&bare), None);
     }
 
     fn event(id: &str, version: u16) -> Event {
