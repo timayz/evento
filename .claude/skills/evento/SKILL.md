@@ -373,6 +373,7 @@ async fn notify_deposit<E: Executor>(
 let sub = SubscriptionBuilder::<evento::Sqlite>::new("notifier") // unique key = cursor scope
     .handler(notify_deposit())
     .routing_key("accounts")   // .any_routing_key() for every key; default = only NULL routing key
+    .tenant("")                // one tenant's events only; default = every tenant
     .chunk_size(100)
     .retry(5)                  // exponential backoff; .no_retry() to disable
     .shutdown_grace(Duration::from_secs(10)) // bound on waiting for the pass in flight (default 30s); .no_shutdown_grace() waits forever

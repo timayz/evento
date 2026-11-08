@@ -548,6 +548,12 @@ async fn remote_tenant_subscriptions() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn remote_tenant_filtered_subscription() -> anyhow::Result<()> {
+    let server = setup().await?;
+    evento_test::tenant_filtered_subscription(&server.client).await
+}
+
+#[tokio::test]
 async fn remote_tenant_projection_subscription() -> anyhow::Result<()> {
     let server = setup().await?;
     evento_test::tenant_projection_subscription(&server.client).await

@@ -737,6 +737,7 @@ plus the [`bank-axum-cluster`](examples/bank-axum-cluster) 3-node demo.
 | One-shot processing | `SubscriptionBuilder::new(key)...run_once(exec)` |
 | Keep a projection updated | `projection.subscription(key).start(exec)` |
 | Fail on unhandled events | `.strict()` |
+| One tenant's events only (shared store) | `.tenant("")` / `.tenant(t)` |
 | Keep going after a handler error | `.continue_on_error()` |
 | Notice a stopped subscription | `subscription.stopped().await` → `StopReason` |
 | Live bridge (SSE/WebSocket) | `.live(exec)` = `.ephemeral().start_from_latest().start(exec)` |
