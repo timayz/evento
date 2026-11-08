@@ -5086,6 +5086,52 @@ pub async fn tenant_subscriptions<E: Executor + Clone>(executor: &E) -> anyhow::
     Ok(())
 }
 
+/// Scenario: a subscription that names a tenant reads that tenant alone.
+///
+/// The same aggregate type and event name appended by another tenant's writer
+/// never reaches its handlers, so a handler needs no `event.tenant` check of
+/// its own; and its cursor advances only over what it reads, so a later event
+/// of its tenant is delivered while later events of other tenants stay out.
+pub async fn tenant_filtered_subscription<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
+    let id = Ulid::generate().to_string();
+    open_in(executor, "", &id, 1).await?;
+    open_in(executor, "flt-a", &id, 2).await?;
+    open_in(executor, "flt-b", &id, 3).await?;
+
+    // The default tenant, named: a platform subscription over a shared store.
+    let platform = format!("tenant-platform-{id}");
+    tenant_seen::subscription(&platform)
+        .tenant("")
+        .run_once(executor)
+        .await?;
+    assert_eq!(tenant_seen::take(&platform, &id), [""]);
+
+    // One tenant among three.
+    let only_a = format!("tenant-only-a-{id}");
+    tenant_seen::subscription(&only_a)
+        .tenant("flt-a")
+        .run_once(executor)
+        .await?;
+    assert_eq!(tenant_seen::take(&only_a, &id), ["flt-a"]);
+
+    // The cursor moved past what it delivered: a second pass redelivers
+    // nothing, and of the new events only the tenant's own is delivered.
+    let later = format!("{id}-later");
+    open_in(executor, "flt-b", &later, 4).await?;
+    open_in(executor, "", &later, 5).await?;
+    open_in(executor, "flt-a", &later, 6).await?;
+    tenant_seen::subscription(&only_a)
+        .tenant("flt-a")
+        .run_once(executor)
+        .await?;
+    assert_eq!(
+        tenant_seen::take_all(&only_a),
+        [("flt-a".to_owned(), later.clone())]
+    );
+
+    Ok(())
+}
+
 /// Scenario: a projection subscription loads each event's aggregate in the
 /// event's own tenant — the same id in two tenants projects to two rows — and
 /// the snapshots it persists stay in their tenant.
@@ -5279,15 +5325,18 @@ mod tenant_seen {
 
     /// Drains the tenants `key` saw for aggregate `id`, sorted.
     pub fn take(key: &str, id: &str) -> Vec<String> {
-        let mut seen: Vec<String> = SEEN
-            .write()
-            .unwrap()
-            .remove(key)
-            .unwrap_or_default()
+        let mut seen: Vec<String> = take_all(key)
             .into_iter()
             .filter(|(_, aggregate_id)| aggregate_id == id)
             .map(|(tenant, _)| tenant)
             .collect();
+        seen.sort();
+        seen
+    }
+
+    /// Drains everything `key` saw, as `(tenant, aggregate id)`, sorted.
+    pub fn take_all(key: &str) -> Vec<Delivered> {
+        let mut seen = SEEN.write().unwrap().remove(key).unwrap_or_default();
         seen.sort();
         seen
     }

@@ -348,6 +348,12 @@ async fn turso_tenant_subscriptions() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn turso_tenant_filtered_subscription() -> anyhow::Result<()> {
+    let executor = Turso::in_memory().await?;
+    evento_test::tenant_filtered_subscription(&executor).await
+}
+
+#[tokio::test]
 async fn turso_tenant_projection_subscription() -> anyhow::Result<()> {
     let executor = Turso::in_memory().await?;
     evento_test::tenant_projection_subscription(&executor).await

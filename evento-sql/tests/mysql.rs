@@ -414,6 +414,12 @@ async fn mysql_tenant_subscriptions() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn mysql_tenant_filtered_subscription() -> anyhow::Result<()> {
+    let executor = create_mysql_executor("tenant_filtered_subscription").await?;
+    evento_test::tenant_filtered_subscription(&executor).await
+}
+
+#[tokio::test]
 async fn mysql_tenant_projection_subscription() -> anyhow::Result<()> {
     let executor = create_mysql_executor("tenant_projection_subscription").await?;
     evento_test::tenant_projection_subscription(&executor).await

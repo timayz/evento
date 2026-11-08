@@ -343,7 +343,8 @@ pub trait Handler<E: Executor>: Sync + Send {
 /// a continuous event processing subscription with retry logic,
 /// routing key filtering, and graceful shutdown support.
 ///
-/// A subscription processes the events of every tenant. Each event carries
+/// A subscription processes the events of every tenant unless
+/// [`tenant`](SubscriptionBuilder::tenant) names one. Each event carries
 /// its [`tenant`](crate::Event::tenant), and a handler that loads or writes
 /// does so in that tenant (`.tenant(&event.tenant)` on the builder).
 ///
@@ -373,6 +374,9 @@ pub struct SubscriptionBuilder<E: Executor> {
     aliases: Aliases,
     context: context::RwContext,
     routing_key: Option<RoutingKey>,
+    /// Which tenants the pass reads; every tenant unless
+    /// [`tenant`](Self::tenant) named one.
+    tenant: TenantFilter,
     prefix_key: Option<String>,
     /// The storage key with its routing-key prefix applied — computed once
     /// in `resolve_routing_key` so the hot paths never re-format it.
@@ -468,6 +472,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             chunk_size: 300,
             continue_on_error: false,
             routing_key: None,
+            tenant: TenantFilter::All,
             prefix_key: None,
             aggregators: Default::default(),
             shutdown_rx: None,
@@ -827,6 +832,28 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
         self
     }
 
+    /// Filters events by tenant.
+    ///
+    /// Only the events of this tenant are read and delivered; `""` names the
+    /// default tenant. By default a subscription processes the events of every
+    /// tenant.
+    ///
+    /// On a store shared by many tenants, a subscription over aggregates that
+    /// live in one tenant (a platform's own aggregates, in the default tenant)
+    /// names it here: the pass then visits only that tenant's rows, and an
+    /// event another tenant's writer appended under the same aggregate type
+    /// and event name never reaches the handlers, so they need no
+    /// `event.tenant` check of their own.
+    ///
+    /// The cursor key is not derived from the tenant: one subscription key is
+    /// one filter, and changing the filter of an existing key resumes from
+    /// the cursor it already holds.
+    pub fn tenant(mut self, v: impl Into<String>) -> Self {
+        self.tenant = TenantFilter::Only(v.into());
+
+        self
+    }
+
     /// Sets the maximum number of retries on failure.
     ///
     /// Uses exponential backoff. Default is 30.
@@ -968,7 +995,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                 .read(
                     Some(aggregators.clone()),
                     Some(self.effective_routing_key()),
-                    TenantFilter::All,
+                    self.tenant.clone(),
                     Args::forward(self.chunk_size, cursor.clone()),
                     stable,
                 )
@@ -1274,7 +1301,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             .latest_timestamp(
                 Some(aggregators.clone()),
                 Some(self.effective_routing_key()),
-                TenantFilter::All,
+                self.tenant.clone(),
             )
             .await?;
         *self.latest_ts_cache.lock().expect("latest_ts poisoned") = Some((Instant::now(), v));
@@ -1302,7 +1329,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             .read(
                 Some(aggregators.clone()),
                 Some(self.effective_routing_key()),
-                TenantFilter::All,
+                self.tenant.clone(),
                 Args::forward(1, after),
                 None,
             )
@@ -1363,7 +1390,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             .read(
                 Some(aggregators.clone()),
                 Some(self.effective_routing_key()),
-                TenantFilter::All,
+                self.tenant.clone(),
                 Args::backward(1, None),
                 stable,
             )
@@ -1751,7 +1778,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             .latest_timestamp(
                 Some(read_aggregators.clone()),
                 Some(self.effective_routing_key()),
-                TenantFilter::All,
+                self.tenant.clone(),
             )
             .await?
             .saturating_add(1)
