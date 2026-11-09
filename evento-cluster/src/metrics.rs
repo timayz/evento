@@ -164,6 +164,12 @@ pub struct Metrics {
     /// another change took, or a fenced copy for a transition replaced. What
     /// they brought in for slots this node does not own was dropped.
     pub copies_voided: AtomicU64,
+    /// Un-applied commands this node forgot at a layout install (#500): its
+    /// votes, and decisions not applied yet, on keys the change took from
+    /// it — settled at the keys' new replicas by the change's drain, or
+    /// never to commit. Kept, one no other replica held would have pinned
+    /// this node's applied-through for good.
+    pub votes_forgotten: AtomicU64,
     /// Copied events stamped below this node's stable point when they
     /// landed: history its subscriptions already read past and will not see
     /// (#374).
@@ -345,6 +351,12 @@ impl Metrics {
         self.preseeds_declined.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records `votes` un-applied commands forgotten at a layout install.
+    pub fn record_votes_forgotten(&self, votes: usize) {
+        self.votes_forgotten
+            .fetch_add(votes as u64, Ordering::Relaxed);
+    }
+
     /// Records a copy the layout moved on under.
     pub fn record_copy_voided(&self) {
         self.copies_voided.fetch_add(1, Ordering::Relaxed);
@@ -432,6 +444,7 @@ impl Metrics {
             preseeds_timed_out: self.preseeds_timed_out.load(Ordering::Relaxed),
             preseeds_declined: self.preseeds_declined.load(Ordering::Relaxed),
             copies_voided: self.copies_voided.load(Ordering::Relaxed),
+            votes_forgotten: self.votes_forgotten.load(Ordering::Relaxed),
             copied_below_stable: self.copied_below_stable.load(Ordering::Relaxed),
         }
     }
@@ -483,6 +496,7 @@ pub struct MetricsSnapshot {
     pub preseeds_timed_out: u64,
     pub preseeds_declined: u64,
     pub copies_voided: u64,
+    pub votes_forgotten: u64,
     pub copied_below_stable: u64,
 }
 
@@ -491,7 +505,7 @@ impl MetricsSnapshot {
     /// source of truth for both [`to_prometheus`](Self::to_prometheus) and
     /// [`to_prometheus_labeled`](Self::to_prometheus_labeled); add a counter here and
     /// both renderings pick it up.
-    fn counters(&self) -> [(&'static str, &'static str, u64); 42] {
+    fn counters(&self) -> [(&'static str, &'static str, u64); 43] {
         [
             (
                 "cluster_writes_committed_total",
@@ -697,6 +711,11 @@ impl MetricsSnapshot {
                 "cluster_copies_voided_total",
                 "Copies the layout moved on under; what they brought in for slots this node does not own was dropped.",
                 self.copies_voided,
+            ),
+            (
+                "cluster_votes_forgotten_total",
+                "Un-applied commands forgotten at a layout install: votes on keys the change took from this node.",
+                self.votes_forgotten,
             ),
             (
                 "cluster_copied_below_stable_total",

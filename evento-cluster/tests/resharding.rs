@@ -1171,6 +1171,164 @@ async fn a_gainer_in_a_transition_in_progress_declines_a_pre_seed() {
     assert!(!fresh.conflict, "the copied version is enforced");
 }
 
+/// Waits until `topology` has `shards` installed.
+async fn await_layout(topology: &DynamicTopology, shards: &[Vec<NodeId>]) {
+    for _ in 0..12_000 {
+        if topology.layout().shards() == shards {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!(
+        "topology did not install {shards:?}: at {:?}",
+        topology.layout().shards()
+    );
+}
+
+/// The setting of the stranded-vote tests (#500): node 5, cut off from every
+/// replica, coordinates a write on a key of each shard that reaches nobody,
+/// and holds its own pre-accept of it. The first shard compacts past the
+/// write, never having seen it; the second never hears of it (node 5 stays
+/// cut off from it). Healed with the first shard alone, node 5 recovers the
+/// write for ever undecided: the first shard answers from below its
+/// watermark, the second not at all. Then a change moves node 5 to the first
+/// shard (node 6 takes its place), which installs at epoch 2 — and takes the
+/// key node 5 voted on from it. Returns the network, the nodes and the
+/// layout installed.
+async fn strand_a_vote_on_a_moved_key() -> (Arc<InMemoryNetwork>, Vec<TestNode>, Vec<Vec<NodeId>>) {
+    let net = InMemoryNetwork::new();
+    let before = vec![ids(&[0, 1, 2]), ids(&[3, 4, 5])];
+    let map = ShardMap::even(before.clone());
+    let left = id_in_shard(&map, 0, "left");
+    let right = id_in_shard(&map, 1, "right");
+    let nodes: Vec<TestNode> = (0..7)
+        .map(|id| spawn_node_cfg(NodeId(id), before.clone(), &net, quick()))
+        .collect();
+    nodes[6].node.begin_join();
+
+    for other in 0..5u64 {
+        net.partition(NodeId(5), NodeId(other));
+    }
+    let stranded = tokio::time::timeout(
+        Duration::from_secs(30),
+        nodes[5]
+            .node
+            .write(vec![event(&left, 1, "Bumped"), event(&right, 1, "Bumped")]),
+    )
+    .await;
+    assert!(
+        !matches!(stranded, Ok(Ok(_))),
+        "a write that reaches no replica cannot commit: {stranded:?}"
+    );
+    // The first shard's watermark passes the write: a compaction round made
+    // two margins after it lies above its `t0`.
+    let margin = NodeConfig::default().compaction_margin;
+    tokio::time::sleep(2 * margin).await;
+    let rounds: Vec<u64> = (0..3)
+        .map(|i| nodes[i].node.metrics().compactions)
+        .collect();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while (0..3).any(|i| nodes[i].node.metrics().compactions == rounds[i]) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the first shard never compacted past the stranded write"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    for other in 0..3u64 {
+        net.heal_partition(NodeId(5), NodeId(other));
+    }
+
+    // The change installs within the driver's budget, or the sweep
+    // completes it (the drain takes about a compaction margin).
+    let moved = vec![ids(&[0, 1, 2, 5]), ids(&[3, 4, 6])];
+    let change = tokio::time::timeout(
+        Duration::from_secs(60),
+        nodes[0].node.change_topology(1, moved.clone()),
+    )
+    .await
+    .expect("the change ends in bounded time");
+    if let Ok(installed) = change {
+        assert_eq!(installed, moved);
+    }
+    await_layout(&nodes[0].topology, &moved).await;
+    await_layout(&nodes[5].topology, &moved).await;
+    (net, nodes, moved)
+}
+
+/// A node moved to another shard still held its pre-accept of a write on a
+/// key it no longer owns, which no recovery could decide (#500): its
+/// applied-through never passed it, so a later change that waited for its
+/// report never installed, and every write on the keys that change moved was
+/// refused for good. The activation that takes the key from the node forgets
+/// the vote: the change's drain settled the write, if it ever committed, at
+/// the key's new replicas.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_vote_on_a_key_a_change_took_is_forgotten_at_the_activation() {
+    let (_net, nodes, _moved) = strand_a_vote_on_a_moved_key().await;
+    assert_eq!(
+        nodes[5].node.metrics().votes_forgotten,
+        1,
+        "the vote on the moved key goes with the activation: {:?}",
+        nodes[5].node.metrics()
+    );
+
+    // A change that waits for node 5's report: it keeps the first shard's
+    // slots while node 2 leaves. Pinned at the stranded write, the report
+    // would never pass the drain point.
+    let shrunk = vec![ids(&[0, 1, 5]), ids(&[3, 4, 6])];
+    let change = tokio::time::timeout(
+        Duration::from_secs(60),
+        nodes[0].node.change_topology(3, shrunk.clone()),
+    )
+    .await
+    .expect("the change ends in bounded time");
+    if let Ok(installed) = change {
+        assert_eq!(installed, shrunk);
+    }
+    await_layout(&nodes[0].topology, &shrunk).await;
+    await_layout(&nodes[5].topology, &shrunk).await;
+}
+
+/// The journal replays the vote at a restart; the node forgets it again
+/// under the layout it has installed (#500).
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_vote_on_a_key_a_change_took_is_forgotten_again_after_a_restart() {
+    let (net, mut nodes, moved) = strand_a_vote_on_a_moved_key().await;
+    assert_eq!(nodes[5].node.metrics().votes_forgotten, 1);
+    nodes[5].stop();
+    let restarted = restart_node_at(
+        NodeId(5),
+        2,
+        moved.clone(),
+        &net,
+        Arc::clone(&nodes[5].store),
+        Arc::clone(&nodes[5].journal),
+        quick(),
+    )
+    .await;
+    assert_eq!(
+        restarted.node.metrics().votes_forgotten,
+        1,
+        "the replayed vote goes again at the restart: {:?}",
+        restarted.node.metrics()
+    );
+    nodes[5] = restarted;
+
+    let shrunk = vec![ids(&[0, 1, 5]), ids(&[3, 4, 6])];
+    let change = tokio::time::timeout(
+        Duration::from_secs(60),
+        nodes[0].node.change_topology(3, shrunk.clone()),
+    )
+    .await
+    .expect("the change ends in bounded time");
+    if let Ok(installed) = change {
+        assert_eq!(installed, shrunk);
+    }
+    await_layout(&nodes[0].topology, &shrunk).await;
+    await_layout(&nodes[5].topology, &shrunk).await;
+}
+
 /// A replica added at once whose join failed partway is still joining when
 /// a change gives its shard more slots (#446). It copies nothing until it
 /// joins: a copy would fill the store its join needs empty, and a copy that

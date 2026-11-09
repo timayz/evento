@@ -1321,6 +1321,9 @@ impl Reconfig {
 #[must_use]
 struct Installed {
     invalidated: Vec<TxnId>,
+    /// The un-applied commands an activation forgot: votes on keys the
+    /// change took from this node (see [`Replica::forget_unowned`]).
+    forgotten: usize,
 }
 
 /// A [`SyncData`](Message::SyncData) payload handed to an in-flight sync: the
@@ -2546,6 +2549,15 @@ impl Node {
         let mut installed = Installed::default();
         self.replay_log(&mut installed);
         installed.invalidated.extend(self.apply_log().invalidated);
+        // The journal replays every command it holds, the votes on keys a
+        // change took from this node among them (their records go with
+        // the truncation, once the watermark they no longer pin passes
+        // them): forgotten again, under the layout installed (#500).
+        {
+            let layout = self.topology.layout();
+            let mut replica = self.replica.lock().expect("replica poisoned");
+            installed.forgotten += self.forget_lost_votes(&mut replica, &layout);
+        }
         self.persist_installed(installed).await;
         // The marks this node saw from its peers, which it answers their
         // opens from (#339).
@@ -10556,6 +10568,31 @@ impl Node {
         Ok(kept)
     }
 
+    /// Forgets the un-applied commands this node holds on keys it owns none
+    /// of under `layout`, the one it installed ([`Replica::forget_unowned`]):
+    /// its votes on the keys a change took from it, which the change's
+    /// drain settled before its layout installed. Kept, one no other
+    /// replica holds — a write this node coordinated cut off from its
+    /// replicas, say — pins its applied-through for good: once the shards
+    /// compacted past it, no recovery decides it, and every report this
+    /// node makes stays below it, holding back compaction and the next
+    /// change that waits for the report (#500). Returns how many it forgot.
+    fn forget_lost_votes(&self, replica: &mut Replica, layout: &Layout) -> usize {
+        let forgotten = replica.forget_unowned(|key| layout.owns(self.id, key));
+        if forgotten.is_empty() {
+            return 0;
+        }
+        self.metrics.record_votes_forgotten(forgotten.len());
+        tracing::info!(
+            node = self.id.0,
+            epoch = layout.epoch(),
+            forgotten = forgotten.len(),
+            oldest = ?forgotten.iter().min(),
+            "forgot the votes this node held on keys a change took from it"
+        );
+        forgotten.len()
+    }
+
     /// Drops from the store the slots this node does not own under the
     /// layout it has installed — the slots a layout change took from it, or
     /// gave it and then went back on — once, per installed epoch, and
@@ -11171,6 +11208,10 @@ impl Node {
                         epoch,
                         since,
                         ?cap,
+                        live = ?transition.live.shards(),
+                        pending = ?transition.pending.shards(),
+                        gainers = ?transition.gainers,
+                        keepers = ?transition.keepers,
                         "fenced the keys a layout transition moves"
                     );
                     reconfig
@@ -11212,12 +11253,18 @@ impl Node {
                         installed.invalidated.push(txn);
                     }
                 }
+                // What this node still holds un-applied on the keys the
+                // change took from it is settled elsewhere, or never
+                // commits: forgotten, or it would pin this node's
+                // applied-through for good (#500).
+                installed.forgotten += self.forget_lost_votes(&mut replica, &live);
                 tracing::info!(
                     node = self.id.0,
                     epoch,
                     since = transition.since,
                     point = ?drained.point,
                     invalidated = installed.invalidated.len(),
+                    forgotten = installed.forgotten,
                     "installed the layout a transition drained for"
                 );
             }
@@ -11234,6 +11281,8 @@ impl Node {
             if self.journal.flush().await.is_ok() {
                 self.metrics.record_flush();
             }
+        }
+        if !installed.invalidated.is_empty() || installed.forgotten > 0 {
             self.applied.bump();
         }
         self.persist_fences().await;
