@@ -5874,6 +5874,38 @@ async fn orphan_vote(
     txn
 }
 
+/// [`orphan_vote`] for a write spanning shards (#502): node `to` pre-accepts
+/// `event`, its shard's part, under `route`, and the coordinator vanishes.
+async fn orphan_routed_vote(
+    net: &Arc<InMemoryNetwork>,
+    base: tokio::time::Instant,
+    to: usize,
+    event: Event,
+    route: Vec<Key>,
+) -> TxnId {
+    let txn = TxnId(Timestamp {
+        micros: (tokio::time::Instant::now() - base).as_micros() as u64,
+        logical: 0,
+        node: ORPHAN_COORDINATOR,
+    });
+    let _ = net
+        .sink(ORPHAN_COORDINATOR)
+        .send(
+            NodeId(to as u64),
+            Message::Routed {
+                route,
+                inner: Box::new(Message::PreAccept {
+                    epoch: 0,
+                    txn,
+                    keys: vec![Key::of(&event)],
+                    events: vec![event],
+                }),
+            },
+        )
+        .await;
+    txn
+}
+
 /// The minority nodes go silent past [`ABSENCE_LIMIT`] while the majority
 /// keeps writing — crashed, or cut one way so they still hear the others —
 /// and come back. Their peers give them up and compact past them, so a
@@ -6201,6 +6233,67 @@ async fn a_lone_holder_stranded_below_its_peers_compaction_rejoins() {
     sim.rejoin(2, contact, config).await;
     assert_eq!(sim.nodes[2].command_status(txn), None);
     await_compacted(&sim, &[0, 1, 2], "after the rejoin").await;
+    for (i, store) in sim.stores.iter().enumerate() {
+        assert!(store.committed_events().is_empty(), "replica {i} applied T");
+    }
+}
+
+/// [`a_lone_holder_stranded_below_its_peers_compaction_rejoins`] for a write
+/// spanning two shards (#502). Node 5 lone-holds `T`, a write on an aggregate
+/// of each shard, pre-accepted under its route, and goes silent. Its shard
+/// gives it up and compacts past `T`; the other shard never heard of `T`,
+/// and compacts past it too. Back, node 5 recovers `T` by its route: every
+/// replica answers "compacted", which proves nothing — the routed recovery
+/// ended `Undecided` on every sweep, for ever, where the unrouted one had
+/// the holder rejoin (the shape of #500's seed `18125332801240935781`). No
+/// shard can gather a quorum of votes again, so node 5 is told to rejoin
+/// through a replica of its own shard, and the rejoin forgets `T`.
+#[tokio::test(start_paused = true)]
+async fn a_lone_holder_of_a_routed_write_stranded_below_both_shards_rejoins() {
+    let config = NodeConfig {
+        compaction_margin: Duration::from_millis(300),
+        peer_absence_limit: Some(Duration::from_millis(500)),
+        collect_timeout: Duration::from_millis(200),
+        ..NodeConfig::default()
+    };
+    let mut sim = Sim::build_with(SimOptions {
+        dynamic: true,
+        layout: Some(two_shards()),
+        config,
+        ..SimOptions::new(6)
+    })
+    .await;
+    let _coordinator = sim.net.register(ORPHAN_COORDINATOR);
+    let aggs = sim.aggs_per_shard(1);
+    let route = vec![key_of(&aggs[0]), key_of(&aggs[1])];
+    assert_eq!(sim.layout.shard_of(&route[1]), 1, "node 5's shard's part");
+    let txn = orphan_routed_vote(&sim.net, sim.base, 5, event(&aggs[1], 1, 1), route).await;
+    for _ in 0..100 {
+        if sim.nodes[5].command_status(txn) == Some(Status::PreAccepted) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(sim.nodes[5].command_status(txn), Some(Status::PreAccepted));
+
+    sim.net.crash(NodeId(5));
+    await_absent(&sim, 3, &[NodeId(5)]).await;
+    await_absent(&sim, 4, &[NodeId(5)]).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    sim.net.heal(NodeId(5));
+
+    await_rejoin_required(&sim.nodes[5]).await;
+    let contact = sim.nodes[5]
+        .rejoin_contact()
+        .expect("the peer it rejoins through");
+    assert!(
+        [NodeId(3), NodeId(4)].contains(&contact),
+        "a replica of its own shard, which a join goes through: {contact:?}"
+    );
+    sim.rejoin(5, contact, config).await;
+    assert_eq!(sim.nodes[5].command_status(txn), None);
+    assert!(!sim.nodes[5].rejoin_required());
+    await_compacted(&sim, &[0, 1, 2, 3, 4, 5], "after the rejoin").await;
     for (i, store) in sim.stores.iter().enumerate() {
         assert!(store.committed_events().is_empty(), "replica {i} applied T");
     }
