@@ -492,7 +492,17 @@ control plane, everything else is Accord.
   on the layout, or the journal's own applied tail can bring no fragment of a
   dropped slot back. The transaction is still marked applied (its status is what
   the watermark and the barriers go by), and every committed write on a moved
-  key is applied at the new owners before the layout installs. A forwarded read
+  key is applied at the new owners before the layout installs. With the slots go
+  the un-applied commands the node held on their keys (`Replica::forget_unowned`,
+  at the activation and again after a restart replayed them from the journal;
+  `cluster_votes_forgotten_total`): the drain settled them — one that committed is
+  applied at every keeper and copied to every gainer, one that did not can no
+  longer commit, above every keeper's vote fence — so a vote or a decision kept
+  for one guards nothing, as at a rejoin (`forget_below`). Kept, a vote no other
+  replica holds (a write the node coordinated cut off from its replicas) pinned
+  its applied-through for good: no recovery decides it once its shards compacted
+  past it, and the next change that waited for the node's report never installed
+  (#500). A forwarded read
   of a key the node no longer owns fails (`ReadFailed`) instead of answering
   from the dropped slot. The copy's state is journaled (`CopyState`): the drop
   once done — so a copy interrupted by a failed page or a restart resumes over

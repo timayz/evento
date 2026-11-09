@@ -1894,23 +1894,7 @@ impl Replica {
             .filter(|txn| txn.0 < before)
             .collect();
         for txn in &drop {
-            let Some(cmd) = self.commands.remove(txn) else {
-                continue;
-            };
-            if awaiting_execution(cmd.status) {
-                self.leave_queue(cmd.execute_at, *txn);
-            }
-            for key in &cmd.keys {
-                if let Some(set) = self.by_key.get_mut(key) {
-                    set.remove(txn);
-                    if set.is_empty() {
-                        self.by_key.remove(key);
-                    }
-                }
-            }
-            self.read_results.remove(txn);
-            self.applying.remove(txn);
-            self.reindex_unapplied(*txn);
+            self.forget(*txn);
         }
         self.unknown_promises.retain(|txn, _| txn.0 >= before);
         self.routes.retain(|txn, _| txn.0 >= before);
@@ -1919,6 +1903,63 @@ impl Replica {
         for txn in drop {
             self.wake(txn);
         }
+    }
+
+    /// Forgets the un-applied commands held here whose keys this replica
+    /// owns none of (`owns`): its votes, and the decisions not applied yet,
+    /// on keys a layout change took from it (#500). Sound once the change
+    /// installed: the change drained first, so a write on a moved key that
+    /// committed is applied at every replica that kept the key (and copied
+    /// to every one that gained it), and one that did not can no longer
+    /// commit — the keepers' vote fences lie above it. A vote or a decision
+    /// kept for it guards nothing, as at a rejoin
+    /// ([`forget_below`](Self::forget_below)); kept, an undecided one no
+    /// other replica holds pins this replica's applied-through for good,
+    /// since no recovery decides it once its shards compacted past it. What
+    /// waited on a forgotten command is woken. Returns the forgotten
+    /// transactions, oldest first.
+    pub fn forget_unowned(&mut self, owns: impl Fn(&Key) -> bool) -> Vec<TxnId> {
+        let mut drop: Vec<TxnId> = self
+            .commands
+            .values()
+            .filter(|cmd| {
+                cmd.status != Status::Applied && !cmd.keys.is_empty() && !cmd.keys.iter().any(&owns)
+            })
+            .map(|cmd| cmd.txn)
+            .collect();
+        drop.sort_unstable();
+        for txn in &drop {
+            self.forget(*txn);
+            self.routes.remove(txn);
+        }
+        for txn in &drop {
+            self.wake(*txn);
+        }
+        drop
+    }
+
+    /// Drops `txn` from the consensus state held here: its command, its
+    /// place in the execution queue, its key index entries, its read result
+    /// and its apply in progress. Its waiters are not woken: the caller does,
+    /// once every command it drops is gone.
+    fn forget(&mut self, txn: TxnId) {
+        let Some(cmd) = self.commands.remove(&txn) else {
+            return;
+        };
+        if awaiting_execution(cmd.status) {
+            self.leave_queue(cmd.execute_at, txn);
+        }
+        for key in &cmd.keys {
+            if let Some(set) = self.by_key.get_mut(key) {
+                set.remove(&txn);
+                if set.is_empty() {
+                    self.by_key.remove(key);
+                }
+            }
+        }
+        self.read_results.remove(&txn);
+        self.applying.remove(&txn);
+        self.reindex_unapplied(txn);
     }
 
     /// The current redundancy watermark (see the field docs).

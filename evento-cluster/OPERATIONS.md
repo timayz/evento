@@ -258,7 +258,10 @@ refuses anything else before a vote, and a node never installs it.
   (a merge after a split, a replica moved back). A node restarted over its journal
   drops again what it had not finished dropping, and replays no write of a slot it
   lost into its store (`cluster_applies_not_owned_total` counts the applies that left
-  such events out). A node that gains slots copies their events with their original
+  such events out). With a slot it lost go the votes the node still held on its keys
+  for writes that never completed (`cluster_votes_forgotten_total`): kept, one would
+  pin the node's watermark report for good, and with it the next change that waits
+  for that report. A node that gains slots copies their events with their original
   stamps: its own subscriptions do not see them if they already read past those
   stamps (below).
 - **What a change does with writes in flight.** Every transaction is voted on and
