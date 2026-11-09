@@ -1005,12 +1005,21 @@ backend (sql/fjall). Phases, in order:
   drops the transaction, and the snapshot carries its effect if it had one. A
   holder that holds it committed and decided is not stale, as a replay its
   store refused leaves it (#351): the decision its peers applied before they
-  compacted it is here, and only the apply is left. A peer
+  compacted it is here, and only the apply is left. A multi-shard
+  transaction, recovered by its route, strands its holder only once **every**
+  route shard is in that state (`Node::stranded_below_route`, #502): one shard
+  compacted past it beside another whose slow quorum reports it uncommitted
+  proves it never committed (rule 4 of the routed verdict), so a shard whose
+  replicas are merely silent is waited for — and the routed recovery hears
+  every route replica out before it judges, where its verdict alone settles on
+  the first report from below a shard's watermark. The contact is a replica of
+  the holder's own shard, the only kind a join goes through. A peer
   that never held what it compacted past sets no rejoin bound, so this is how a
   holder the others gave up and compacted past gets back
   (`a_lone_holder_cannot_commit_what_a_peer_compacted_past`,
   `a_lone_holder_cut_off_from_a_compacted_peer_cannot_commit`,
   `a_lone_holder_stranded_below_its_peers_compaction_rejoins`,
+  `a_lone_holder_of_a_routed_write_stranded_below_both_shards_rejoins`,
   `a_vote_fence_outlives_a_restart_with_a_clock_stepped_back`,
   `a_replica_vouches_no_coverage_past_a_write_a_slow_quorum_holds`,
   `a_late_coordinator_gets_no_vote_where_a_recovery_does`,

@@ -7334,15 +7334,7 @@ impl Node {
             return Ok(Attempt::Done(CommitOutcome::invalidated(txn)));
         }
         if let Some(contact) = self.stranded_below(txn, &plans, &resp) {
-            tracing::error!(
-                node = self.id.0,
-                peer = contact.0,
-                ?txn,
-                "holding a transaction a peer compacted past, which no recovery can decide; \
-                 this node must rejoin the group from a snapshot"
-            );
-            self.require_rejoin(contact);
-            anyhow::bail!("{txn:?} lies below a peer's compaction: this node must rejoin");
+            return Err(self.stranded(txn, contact));
         }
         let known: Vec<(NodeId, RecoverFields)> = resp
             .into_iter()
@@ -7716,38 +7708,108 @@ impl Node {
     /// the decision of a dependency it never witnessed recovers it from a
     /// report its holder sent before the decision reached this node, which
     /// may have applied it since (#449).
+    ///
+    /// An unrouted recovery needs a slow quorum of every shard it plans, so
+    /// one shard stranded ([`shard_stranded`](Self::shard_stranded)) strands
+    /// the transaction. A routed one has
+    /// [`stranded_below_route`](Self::stranded_below_route).
     fn stranded_below(
         &self,
         txn: TxnId,
         plans: &[ShardPlan],
         resp: &[(NodeId, RecoverResp)],
     ) -> Option<NodeId> {
+        if !self.holds_undecided(txn, resp) {
+            return None;
+        }
+        plans
+            .iter()
+            .find_map(|plan| Self::shard_stranded(plan, resp))
+    }
+
+    /// [`stranded_below`](Self::stranded_below) for a routed recovery (#502).
+    /// Its verdict needs no quorum of every shard: a shard that compacted
+    /// past the transaction, beside another whose slow quorum reports it
+    /// below `Committed`, proves it never committed
+    /// ([`route_verdict`](Self::route_verdict), rule 4). So one shard
+    /// stranded leaves the others to decide it once their replicas answer,
+    /// and only with every route shard stranded is nothing left to hear:
+    /// held here undecided, it would be recovered on every sweep for ever,
+    /// `Undecided` each time, pinning this node's watermark. The contact is a
+    /// replica of this node's own shard that compacted past it, where there
+    /// is one — the only kind a [`join`](Self::join) goes through — else the
+    /// first found.
+    fn stranded_below_route(
+        &self,
+        txn: TxnId,
+        shards: &[ShardPlan],
+        resp: &[(NodeId, RecoverResp)],
+    ) -> Option<NodeId> {
+        if !self.holds_undecided(txn, resp) {
+            return None;
+        }
+        let contacts: Vec<(&ShardPlan, NodeId)> = shards
+            .iter()
+            .map(|shard| Self::shard_stranded(shard, resp).map(|contact| (shard, contact)))
+            .collect::<Option<_>>()?;
+        contacts
+            .iter()
+            .find(|(shard, _)| shard.replicas.contains(&self.id))
+            .or(contacts.first())
+            .map(|(_, contact)| *contact)
+    }
+
+    /// Whether `resp` holds this node's own report of `txn`, which this node
+    /// holds neither decided nor applied (see
+    /// [`stranded_below`](Self::stranded_below)).
+    fn holds_undecided(&self, txn: TxnId, resp: &[(NodeId, RecoverResp)]) -> bool {
         let held = resp
             .iter()
             .any(|(from, r)| *from == self.id && matches!(r, RecoverResp::Ok(f) if f.known));
-        let replica = self.replica.lock().expect("replica poisoned");
-        if !held || replica.decided(txn) || replica.status(txn) == Some(Status::Applied) {
-            return None;
+        if !held {
+            return false;
         }
-        drop(replica);
-        plans.iter().find_map(|plan| {
-            let (mut fenced, mut compacted) = (0, None::<(usize, NodeId)>);
-            for (from, report) in resp {
-                if !plan.replicas.contains(from) {
-                    continue;
-                }
-                match report {
-                    RecoverResp::NotWitnessed { redundant: false } => fenced += 1,
-                    RecoverResp::NotWitnessed { redundant: true } => {
-                        let (count, first) = compacted.unwrap_or((0, *from));
-                        compacted = Some((count + 1, first));
-                    }
-                    _ => {}
-                }
+        let replica = self.replica.lock().expect("replica poisoned");
+        !replica.decided(txn) && replica.status(txn) != Some(Status::Applied)
+    }
+
+    /// Whether fewer than a slow quorum of `plan`'s replicas could still vote
+    /// for the transaction — the others compacted past it ("redundant") or
+    /// fenced it — one of them having compacted past it: that one, to rejoin
+    /// through.
+    fn shard_stranded(plan: &ShardPlan, resp: &[(NodeId, RecoverResp)]) -> Option<NodeId> {
+        let (mut fenced, mut compacted) = (0, None::<(usize, NodeId)>);
+        for (from, report) in resp {
+            if !plan.replicas.contains(from) {
+                continue;
             }
-            let (redundant, contact) = compacted?;
-            (plan.replicas.len() - fenced - redundant < plan.slow_q).then_some(contact)
-        })
+            match report {
+                RecoverResp::NotWitnessed { redundant: false } => fenced += 1,
+                RecoverResp::NotWitnessed { redundant: true } => {
+                    let (count, first) = compacted.unwrap_or((0, *from));
+                    compacted = Some((count + 1, first));
+                }
+                _ => {}
+            }
+        }
+        let (redundant, contact) = compacted?;
+        (plan.replicas.len() - fenced - redundant < plan.slow_q).then_some(contact)
+    }
+
+    /// Ends a recovery of `txn`, which this node holds undecided below
+    /// `contact`'s compaction ([`stranded_below`](Self::stranded_below)):
+    /// tells this node's host to rejoin it through `contact`, and gives the
+    /// error the attempt fails with.
+    fn stranded(&self, txn: TxnId, contact: NodeId) -> anyhow::Error {
+        tracing::error!(
+            node = self.id.0,
+            peer = contact.0,
+            ?txn,
+            "holding a transaction a peer compacted past, which no recovery can decide; \
+             this node must rejoin the group from a snapshot"
+        );
+        self.require_rejoin(contact);
+        anyhow::anyhow!("{txn:?} lies below a peer's compaction: this node must rejoin")
     }
 
     /// One recovery attempt for a multi-shard transaction, by its `route`.
@@ -7764,7 +7826,10 @@ impl Node {
     /// recover it as usual over the route's shards. What it leaves undecided
     /// once the late replicas settled, their vote fences may rule out
     /// ([`never_commits`](Self::never_commits)), as for an unrouted recovery
-    /// (#386).
+    /// (#386); and what they leave undecided with every route shard compacted
+    /// past it strands this node, which must rejoin
+    /// ([`stranded_below_route`](Self::stranded_below_route), #502), as for
+    /// an unrouted one (#310).
     #[allow(clippy::too_many_arguments)]
     async fn recover_routed(
         &self,
@@ -7799,6 +7864,30 @@ impl Node {
         }
         let mut verdict = self.route_verdict(&shards, &resp);
         if matches!(verdict, Verdict::Undecided(_)) {
+            // The reports stopped at the first from below a shard's
+            // watermark, which settles that shard's verdict — not who else
+            // of it answered, nor whether anyone of it could still vote
+            // (#502). Hear the rest out, for a fast-path window: their
+            // answers are in flight, or in, already.
+            let unheard: Vec<NodeId> = targets
+                .iter()
+                .copied()
+                .filter(|node| resp.iter().all(|(from, _)| from != node))
+                .collect();
+            if !unheard.is_empty() {
+                let rest = Self::collect_asked(
+                    rx,
+                    &unheard,
+                    Self::after(self.settings.fast_timeout),
+                    ballot,
+                    RecoveryRound::Ask,
+                )
+                .await;
+                if let Some(promised) = Self::nack_in(&rest) {
+                    return Ok(Attempt::Retry(promised));
+                }
+                Self::merge_reports(&mut resp, rest);
+            }
             // Too few holders of some shard answered. The replicas that
             // never witnessed it were handed none of its part — this node
             // holds its own shard's at most — so they promised the ballot
@@ -7873,6 +7962,15 @@ impl Node {
         // commit — the refusal `settle_late` asked for on that very proof.
         if matches!(verdict, Verdict::Undecided(_)) && self.never_commits(&shards, &resp, false) {
             verdict = Verdict::Invalidate;
+        }
+        // Still undecided, every route shard compacted past it so far that
+        // none gathers a quorum of votes again (#502): held here undecided,
+        // it would stay so on every sweep. This node is stale and must
+        // rejoin, as after an unrouted recovery (#310).
+        if matches!(verdict, Verdict::Undecided(_)) {
+            if let Some(contact) = self.stranded_below_route(txn, &shards, &resp) {
+                return Err(self.stranded(txn, contact));
+            }
         }
 
         let planned = match verdict {
@@ -12658,6 +12756,106 @@ mod tests {
             None,
             "applied here, it is not"
         );
+    }
+
+    /// A routed transaction strands its holder only once every route shard
+    /// compacted past it (#502): one shard stranded leaves another's quorum
+    /// to invalidate it (`route_verdict`, rule 4), so its silent replicas are
+    /// waited for. The contact is a replica of the holder's own shard.
+    #[test]
+    fn a_routed_transaction_strands_its_holder_below_every_shard() {
+        use super::{RecoverFields, RecoverResp};
+        use crate::clock::Ballot;
+
+        let id = NodeId(3);
+        let topology = Arc::new(crate::api::DynamicTopology::new(
+            id,
+            0,
+            vec![(0..3).map(NodeId).collect(), (3..6).map(NodeId).collect()],
+        ));
+        let net = InMemoryNetwork::new();
+        let node = Node::new(
+            id,
+            Arc::clone(&topology) as Arc<dyn Topology>,
+            Arc::new(HybridLogicalClock::new(id)),
+            Arc::new(net.sink(id)) as Arc<dyn MessageSink>,
+            Arc::new(InMemoryDataStore::new()) as Arc<dyn DataStore>,
+            Arc::new(InMemoryJournal::new()) as Arc<dyn Journal>,
+        );
+        let key_in = |shard: usize| {
+            (0..100_000)
+                .map(|i| Key(format!("acc{i}")))
+                .find(|key| topology.shard_of(key) == shard)
+                .expect("a key per shard")
+        };
+        let route = [key_in(0), key_in(1)];
+        let (shards, _) = Node::plan(&topology.layout(), &route, &[]);
+        assert_eq!(shards.len(), 2, "the route spans both shards");
+        let txn = TxnId(Timestamp {
+            micros: 10,
+            logical: 0,
+            node: NodeId(9),
+        });
+        let own = RecoverFields {
+            epoch: 0,
+            known: true,
+            status: Status::PreAccepted,
+            accepted: Ballot(txn.0),
+            execute_at: txn.0,
+            deps: Vec::new(),
+            superseding_rejects: false,
+            wait: false,
+            keys: Vec::new(),
+            events: Vec::new(),
+            route: Some(route.to_vec()),
+        };
+        let compacted = || RecoverResp::NotWitnessed { redundant: true };
+        let fenced = || RecoverResp::NotWitnessed { redundant: false };
+        // The other shard, compacted past it in full, with `own_shard`.
+        let with = |own_shard: Vec<(NodeId, RecoverResp)>| {
+            let mut resp = vec![
+                (NodeId(0), compacted()),
+                (NodeId(1), compacted()),
+                (NodeId(2), compacted()),
+            ];
+            resp.extend(own_shard);
+            resp
+        };
+
+        // Its own shard's other replicas silent: they may still vote, and
+        // with the other shard compacted past it, their quorum would
+        // invalidate it. Not stranded — though an unrouted recovery, which
+        // needs every shard's quorum, would be.
+        let silent = with(vec![(id, RecoverResp::Ok(own.clone()))]);
+        assert_eq!(node.stranded_below_route(txn, &shards, &silent), None);
+        assert_eq!(node.stranded_below(txn, &shards, &silent), Some(NodeId(0)));
+
+        // Both compacted past it: stranded, through one of its own shard.
+        let both = with(vec![
+            (id, RecoverResp::Ok(own.clone())),
+            (NodeId(4), compacted()),
+            (NodeId(5), compacted()),
+        ]);
+        assert_eq!(
+            node.stranded_below_route(txn, &shards, &both),
+            Some(NodeId(4)),
+            "the contact is a replica of this node's shard, not the first compacted"
+        );
+
+        // One compacted past it and one fenced: too few left to vote.
+        let mixed = with(vec![
+            (id, RecoverResp::Ok(own.clone())),
+            (NodeId(4), fenced()),
+            (NodeId(5), compacted()),
+        ]);
+        assert_eq!(
+            node.stranded_below_route(txn, &shards, &mixed),
+            Some(NodeId(5))
+        );
+
+        // Not held here: a node recovering a dependency is never stranded.
+        let unheld = with(vec![(NodeId(4), compacted()), (NodeId(5), compacted())]);
+        assert_eq!(node.stranded_below_route(txn, &shards, &unheld), None);
     }
 
     /// A replica that never saw PreAccept indexes the transaction from the
