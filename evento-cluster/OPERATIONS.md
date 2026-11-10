@@ -810,7 +810,18 @@ it probes a quorum for the deps a read would witness and waits for them to apply
 before serving — making reads linearizable (Jepsen-validated strict-serializable under a
 quorum-preserving partition). Cost: one consensus round per read. Leave it off where
 serializable-but-possibly-stale reads are acceptable; turn it on for read-your-writes /
-real-time guarantees across nodes.
+real-time guarantees across nodes. The `Cluster` host turns it on wherever there are
+peers (`Settings::linearizable_reads` unset).
+
+The setting is the node's default; each **handle** picks for itself.
+`ClusterExecutor::local_reads()` is a handle over the same node and backend whose reads
+of one aggregate skip the barrier, and `linearizable_reads()` one whose reads fence
+whatever the node's default; both are cheap (the node and backend are shared) and write
+through the cluster like the original. Keep the barrier for the paths that read the
+aggregate they just wrote, whichever node answers; serve everything else — streams the
+application caches or version-checks, and subscription handlers' loads (a handler reads
+streams that are by construction behind the event it is handling) — through a
+`local_reads()` handle, by building the subscription over it.
 
 The barrier fences the key the aggregate's **writes** conflict on: its routing key and
 its id when the stream has one, else its id alone (#483: two streams under one routing

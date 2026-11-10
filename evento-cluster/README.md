@@ -25,7 +25,10 @@ see [`examples/bank-axum-cluster`](../examples/bank-axum-cluster) for a runnable
 - **`ClusterExecutor`** — a drop-in `evento_core::Executor`. Writes are
   coordinated through the cluster (replicated, strictly serializable); reads,
   subscriptions, and snapshots are served from a local evento backend
-  (`Fjall`/`Sql`) kept current by applying committed transactions.
+  (`Fjall`/`Sql`) kept current by applying committed transactions. A read of
+  one aggregate is linearizable (one consensus round) when the node says so;
+  `local_reads()` / `linearizable_reads()` give a handle over the same node
+  that reads the other way, per call or per subscription.
 - **Multi-shard, atomic transactions** — keys partition across disjoint shards,
   each with its own replica set and quorum. A write spanning aggregates commits
   all-or-nothing via a Read → Apply phase split (the basis for cross-aggregate

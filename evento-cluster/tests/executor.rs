@@ -374,6 +374,107 @@ async fn linearizable_reads_store_nothing() {
     }
 }
 
+/// Reads aggregate `id` through `exec`, as [`ExecCluster::read_all`] does
+/// through a node's own handle.
+async fn read_through<E: Executor + Clone>(
+    exec: &ClusterExecutor<E>,
+    id: &str,
+) -> anyhow::Result<Vec<Event>> {
+    let filters = Arc::from([EventFilter::by_id_raw("test/Account", id)]);
+    let result = exec
+        .read(
+            Some(filters),
+            None,
+            evento_core::TenantFilter::Only(String::new()),
+            Args::forward(50, None),
+            None,
+        )
+        .await?;
+    Ok(result.edges.into_iter().map(|e| e.node).collect())
+}
+
+/// A cluster whose nodes serve linearizable reads and give a barrier up fast,
+/// so a read whose quorum is away fails within the test (#506).
+fn start_linearizable_impatient(n: u64, linearizable_reads: bool) -> ExecCluster {
+    ExecCluster::start_configured(
+        n,
+        NodeConfig {
+            linearizable_reads,
+            collect_timeout: Duration::from_millis(300),
+            ..Default::default()
+        },
+    )
+}
+
+/// On a node whose reads are linearizable, a handle made by `local_reads`
+/// serves one aggregate from the local backend with no read barrier (#506).
+/// With the peers unreachable a barrier cannot reach a quorum, so which handle
+/// fenced shows in whether the read came back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_local_reads_handle_skips_the_barrier() {
+    let cluster = start_linearizable_impatient(3, true);
+    cluster.execs[0]
+        .write(vec![event("h", 1, "Opened")])
+        .await
+        .unwrap();
+
+    assert!(cluster.execs[0].linearizable());
+    let local = cluster.execs[0].local_reads();
+    assert!(!local.linearizable());
+    let fenced = local.linearizable_reads();
+    assert!(fenced.linearizable());
+
+    // The peers go away: no barrier can reach a slow quorum any more.
+    cluster.net.crash(NodeId(1));
+    cluster.net.crash(NodeId(2));
+
+    // The node's own handle fences, and its read is unavailable rather than stale.
+    assert!(
+        read_through(&cluster.execs[0], "h").await.is_err(),
+        "the node's handle must still fence its reads"
+    );
+    // The local handle serves what the node holds, with no round.
+    let events = read_through(&local, "h").await.unwrap();
+    assert_eq!(events.len(), 1, "a local read serves the local backend");
+    assert_eq!(events[0].version, 1);
+    // A handle made linearizable again fences again.
+    assert!(
+        read_through(&fenced, "h").await.is_err(),
+        "a linearizable_reads handle must fence"
+    );
+    // Writes go through the cluster whatever the handle: none can commit alone.
+    let write = local.write(vec![event("h", 2, "Debited")]).await;
+    assert!(
+        write.is_err(),
+        "a local-reads handle still writes through the cluster: {write:?}"
+    );
+}
+
+/// On a node that reads locally by default, a handle made by
+/// `linearizable_reads` fences its reads of one aggregate (#506).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_linearizable_reads_handle_fences_on_a_local_node() {
+    let cluster = start_linearizable_impatient(3, false);
+    cluster.execs[0]
+        .write(vec![event("l", 1, "Opened")])
+        .await
+        .unwrap();
+
+    assert!(!cluster.execs[0].linearizable());
+    let fenced = cluster.execs[0].linearizable_reads();
+    assert!(fenced.linearizable());
+
+    cluster.net.crash(NodeId(1));
+    cluster.net.crash(NodeId(2));
+
+    let events = read_through(&cluster.execs[0], "l").await.unwrap();
+    assert_eq!(events.len(), 1, "the node's handle reads locally");
+    assert!(
+        read_through(&fenced, "l").await.is_err(),
+        "the linearizable handle must fence, and fail without a quorum"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn enforces_optimistic_concurrency_across_the_cluster() {
     let cluster = ExecCluster::start(3);

@@ -565,19 +565,76 @@ impl<E: Executor> DataStore for ExecutorDataStore<E> {
 pub struct ClusterExecutor<E: Executor + Clone> {
     node: Node,
     local: E,
+    /// Whether this handle's reads of one aggregate wait behind a read
+    /// barrier ([`Node::read_barrier`]). The node's
+    /// [`linearizable_reads`](crate::NodeConfig::linearizable_reads) at
+    /// [`new`](Self::new); [`local_reads`](Self::local_reads) and
+    /// [`linearizable_reads`](Self::linearizable_reads) give a handle with
+    /// it set either way.
+    linearizable: bool,
 }
 
 impl<E: Executor + Clone> ClusterExecutor<E> {
     /// Builds an executor over `node` (for coordinating writes) and `local`
     /// (the backend serving reads — the same instance the node's
-    /// [`ExecutorDataStore`] applies to).
+    /// [`ExecutorDataStore`] applies to). Its reads of one aggregate are
+    /// linearizable when the node's
+    /// [`linearizable_reads`](crate::NodeConfig::linearizable_reads) is on.
     pub fn new(node: Node, local: E) -> Self {
-        Self { node, local }
+        let linearizable = node.linearizable_reads();
+        Self {
+            node,
+            local,
+            linearizable,
+        }
     }
 
     /// The underlying node, e.g. to run recovery.
     pub fn node(&self) -> &Node {
         &self.node
+    }
+
+    /// Whether this handle's reads of one aggregate wait behind a read
+    /// barrier, so they reflect every write that committed before they began.
+    pub fn linearizable(&self) -> bool {
+        self.linearizable
+    }
+
+    /// A handle over the same node and backend whose reads of one aggregate
+    /// are served from the local backend as they are, with no read barrier:
+    /// serializable, possibly behind a write another node just committed.
+    ///
+    /// For the reads that need no linearizability on a node that has
+    /// [`linearizable_reads`](crate::NodeConfig::linearizable_reads) on: a stream
+    /// the application caches or version-checks anyway, or a subscription
+    /// handler's loads — a handler reads streams that are, by construction,
+    /// behind the event it is handling, so a subscription built over this
+    /// handle pays no consensus round per `load`. Keep the barrier where a
+    /// page reads the aggregate it just wrote, whichever node answers.
+    ///
+    /// Cheap: the node and backend are shared, so a handle can be made per
+    /// call. Writes are unchanged — they go through the cluster either way.
+    pub fn local_reads(&self) -> Self {
+        Self {
+            node: self.node.clone(),
+            local: self.local.clone(),
+            linearizable: false,
+        }
+    }
+
+    /// A handle over the same node and backend whose reads of one aggregate
+    /// wait behind a read barrier (one consensus round per key, see
+    /// [`Node::read_barrier`]), whatever the node's
+    /// [`linearizable_reads`](crate::NodeConfig::linearizable_reads) says: the
+    /// opposite of [`local_reads`](Self::local_reads), for the few reads that
+    /// must see every committed write on a node that reads locally by
+    /// default.
+    pub fn linearizable_reads(&self) -> Self {
+        Self {
+            node: self.node.clone(),
+            local: self.local.clone(),
+            linearizable: true,
+        }
     }
 
     /// The keys a read of aggregate `id` conflicts on, as the write side
@@ -702,10 +759,10 @@ impl<E: Executor + Clone> Executor for ClusterExecutor<E> {
             // A routed read's keys all live in the routing key's shard.
             Some(Target::Routed(keys)) => (keys, true),
             // The key only matters where it decides something: a barrier, or
-            // which shard owns it. A single-shard node without linearizable
-            // reads owns every key and fences none, so it skips the lookup.
+            // which shard owns it. A single-shard node whose handle reads
+            // locally owns every key and fences none, so it skips the lookup.
             Some(Target::Aggregate { tenant, id, types })
-                if self.node.linearizable_reads() || self.node.sharded() =>
+                if self.linearizable || self.node.sharded() =>
             {
                 let keys = self.conflict_keys(tenant, id, &types).await?;
                 let one_shard = keys.len() == 1;
@@ -720,9 +777,12 @@ impl<E: Executor + Clone> Executor for ClusterExecutor<E> {
                     // Linearizable reads: fence the local backend with a read barrier
                     // (a read-only consensus round per key) so it reflects every
                     // write that committed before this read began, then serve
-                    // locally. Off by default — reads stay local-only
-                    // (serializable, not linearizable).
-                    if self.node.linearizable_reads() {
+                    // locally. Per handle: the node's `linearizable_reads`
+                    // (on with peers under the `Cluster` host), unless the
+                    // handle was made by `local_reads`/`linearizable_reads`.
+                    // Without it reads stay local-only (serializable, not
+                    // linearizable).
+                    if self.linearizable {
                         try_join_all(keys.iter().map(|key| self.node.read_barrier(key.clone())))
                             .await?;
                     }
@@ -746,7 +806,7 @@ impl<E: Executor + Clone> Executor for ClusterExecutor<E> {
             // Co-keyed streams under several routing keys: fence each one this
             // node owns. No single owner serves them all, so a key this node
             // does not own is read locally, like a broad scan.
-            Some(_) if self.node.linearizable_reads() => {
+            Some(_) if self.linearizable => {
                 try_join_all(
                     keys.iter()
                         .filter(|key| self.node.owns_key(key))

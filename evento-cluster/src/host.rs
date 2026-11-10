@@ -19,8 +19,10 @@
 //!     .open()
 //!     .await?;
 //! // `executor` is a `ClusterExecutor<_>`, a drop-in `evento::Executor`;
-//! // `cluster.health()` is what a status page shows; `cluster.shutdown()`
-//! // ends the node.
+//! // `executor.local_reads()` is one over the same node whose reads of an
+//! // aggregate skip the consensus round, for subscriptions and the reads
+//! // that need no read-your-writes; `cluster.health()` is what a status
+//! // page shows; `cluster.shutdown()` ends the node.
 //! ```
 
 use std::collections::{HashMap, HashSet};
@@ -88,7 +90,11 @@ pub struct Settings {
     /// Whether a read of one aggregate waits for the writes a quorum already
     /// committed ([`NodeConfig::linearizable_reads`]; one consensus round
     /// per read). Unset, it is on with peers and off for a node alone, which
-    /// applies its own writes before the commit returns.
+    /// applies its own writes before the commit returns. The node's default
+    /// for the executor [`open`](Builder::open) returns; a read that needs
+    /// the other goes through a handle made by
+    /// [`ClusterExecutor::local_reads`] or
+    /// [`ClusterExecutor::linearizable_reads`].
     #[serde(default)]
     pub linearizable_reads: Option<bool>,
 }
@@ -377,6 +383,11 @@ impl<E: ClusterBackend> Builder<E> {
 
     /// Opens the node and starts it. See [`Cluster`] for what happens when
     /// the store is marked for a copy.
+    ///
+    /// The executor's reads of one aggregate are linearizable as the
+    /// settings say ([`Settings::linearizable_reads`]: on with peers);
+    /// [`ClusterExecutor::local_reads`] gives a handle over the same node
+    /// that reads locally.
     pub async fn open(self) -> anyhow::Result<(Arc<Cluster>, ClusterExecutor<E>)> {
         let Self {
             store,

@@ -151,6 +151,10 @@ let executor = evento::Sidecar::from((client, local));        // events: client;
   → `(Arc<Cluster>, ClusterExecutor<_>)`; `Settings` deserializes a `[cluster]` section
   (`node_id`, `peers`, `listen?`, `absent_after_secs`, `write_backlog`, `linearizable_reads?`),
   `None` = a node alone; `cluster.health()`, `until_confirmed`, `live_nodes`, `shutdown`;
+  with peers a read of one aggregate costs a consensus round (`linearizable_reads` on by
+  default): `executor.local_reads()` is a cheap handle over the same node that skips it —
+  build subscriptions over it and use it for reads that need no read-your-writes;
+  `executor.linearizable_reads()` is the opposite;
   `Cluster::mark_for_rejoin(dir)` for a lost store
   (`examples/bank-axum-cluster/`, `evento-cluster/OPERATIONS.md` §2). A deployer
   touches only the crate root; the protocol's types (`TxnId`, `CommandState`,
