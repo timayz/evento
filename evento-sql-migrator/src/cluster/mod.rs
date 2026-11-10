@@ -49,13 +49,15 @@ pub(crate) enum ClusterAcceptors {
 
 /// Creates the evento-cluster consensus-journal tables. Independent of the event
 /// schema (no migration dependencies), so it can run on a database that holds only
-/// the consensus state.
+/// the consensus state. It is its own `cluster` app: the event schema is app `main`,
+/// and sqlx_migrator refuses an app with two heads, which a parentless migration
+/// in `main` would be.
 pub struct ClusterMigration;
 
 #[cfg(feature = "sqlite")]
 sqlx_migrator::sqlite_migration!(
     ClusterMigration,
-    "main",
+    "cluster",
     "cluster_journal",
     vec_box![],
     vec_box![tables::Operation]
@@ -64,7 +66,7 @@ sqlx_migrator::sqlite_migration!(
 #[cfg(feature = "mysql")]
 sqlx_migrator::mysql_migration!(
     ClusterMigration,
-    "main",
+    "cluster",
     "cluster_journal",
     vec_box![],
     vec_box![tables::Operation]
@@ -73,7 +75,7 @@ sqlx_migrator::mysql_migration!(
 #[cfg(feature = "postgres")]
 sqlx_migrator::postgres_migration!(
     ClusterMigration,
-    "main",
+    "cluster",
     "cluster_journal",
     vec_box![],
     vec_box![tables::Operation]

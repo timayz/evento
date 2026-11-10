@@ -5,7 +5,7 @@
 
 use sqlx::migrate::MigrateDatabase;
 use sqlx::{MySql, MySqlPool};
-use sqlx_migrator::{Migrate, Plan};
+use sqlx_migrator::Plan;
 
 const DB: &str = "cluster_migrator_my";
 const URL: &str = "mysql://root:root@localhost:3306/cluster_migrator_my";

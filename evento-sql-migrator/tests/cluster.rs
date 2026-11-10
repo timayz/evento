@@ -5,7 +5,7 @@
 
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::Sqlite;
-use sqlx_migrator::{Migrate, Plan};
+use sqlx_migrator::Plan;
 
 const TABLES: [&str; 4] = [
     "cluster_commands",

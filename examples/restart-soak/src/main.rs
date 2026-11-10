@@ -34,7 +34,7 @@ use evento::cluster::{
     serve, DataStore, ExecutorDataStore, HybridLogicalClock, Journal, MessageSink, Node,
     NodeConfig, NodeId, StaticTopology, TcpTransport, Topology,
 };
-use evento::migrator::{Migrate, Plan};
+use evento::migrator::Plan;
 use evento::sql::{RwSqlite, Sql, SqlJournal};
 use evento::Event;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};

@@ -647,7 +647,7 @@ let shared = evento::Turso::open_concurrent("./app.db").await?;
 ### SQLite (or PostgreSQL/MySQL) with migrations
 
 ```rust,no_run
-use evento::migrator::{Migrate, Plan};
+use evento::migrator::Plan;
 use sqlx::sqlite::SqlitePoolOptions;
 
 # async fn run() -> anyhow::Result<()> {

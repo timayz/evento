@@ -173,7 +173,7 @@ pub use evento_sql_migrator as sql_migrator;
 /// Database migration plan and execution utilities.
 #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
 pub mod migrator {
-    pub use sqlx_migrator::{Migrate, Plan};
+    pub use sqlx_migrator::Plan;
 }
 
 /// MySQL executor type alias.
