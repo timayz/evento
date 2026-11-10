@@ -88,6 +88,10 @@ const INIT: Migration<'static> = up_file!("../migrations/0001_init.sql");
 const EVENT_TYPE_NAME_CURSOR: Migration<'static> =
     up_file!("../migrations/0003_event_type_name_cursor.sql");
 
+/// `idx_event_cursor`: an unfiltered read of the whole log (the cluster's join
+/// copy) seeks its cursor instead of scanning and sorting the table.
+const EVENT_CURSOR: Migration<'static> = up_file!("../migrations/0004_event_cursor.sql");
+
 /// The cluster journal's tables (feature `cluster`).
 #[cfg(feature = "cluster")]
 const CLUSTER: Migration<'static> = up_file!("../migrations/0002_cluster.sql");
@@ -97,7 +101,7 @@ const CLUSTER: Migration<'static> = up_file!("../migrations/0002_cluster.sql");
 /// recorded in [`migrate::MIGRATIONS_TABLE`], so an application's own
 /// [`Migrations`] (under its own name) can share the database.
 pub const MIGRATIONS: Migrations<'static> =
-    Migrations::new("evento", &[INIT, EVENT_TYPE_NAME_CURSOR]);
+    Migrations::new("evento", &[INIT, EVENT_TYPE_NAME_CURSOR, EVENT_CURSOR]);
 
 /// The cluster journal's schema migrations, under the app name
 /// `evento-cluster`; every [`TursoJournal`] constructor applies the pending

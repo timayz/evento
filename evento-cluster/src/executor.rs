@@ -471,6 +471,10 @@ impl<E: Executor> DataStore for ExecutorDataStore<E> {
         // One backend read in the store's own cursor order, trimmed to the byte
         // budget: the cursor of the last event kept is where the next page
         // starts, so a trimmed remainder is simply read again next time.
+        //
+        // The read has no filters, so it must have an index led by the
+        // cursor to seek — `idx_event_cursor` in the SQL and Turso schemas
+        // — or every page scans and sorts the table (#505).
         let result = self
             .local
             .read(

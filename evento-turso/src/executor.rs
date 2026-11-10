@@ -1131,6 +1131,34 @@ mod tests {
         Ok(())
     }
 
+    /// The join copy (`evento-cluster`'s `snapshot_page`) reads the whole log
+    /// — no filters, every routing key, every tenant — in cursor order, a
+    /// page at a time. Without an index led by the cursor each page scanned
+    /// and sorted the table (#505); `idx_event_cursor` seeks it.
+    #[tokio::test]
+    async fn an_unfiltered_read_seeks_the_cursor() -> anyhow::Result<()> {
+        let (store, cursor) = store().await?;
+        let unfiltered = |after: Option<Value>| {
+            let mut reader = read_reader(None, None, &TenantFilter::All, None);
+            reader.args(Args::forward(300, after));
+            let (prepared, _) = reader.prepared::<EventRow>()?;
+            assert!(!prepared.sql().contains("UNION"), "{}", prepared.sql());
+            anyhow::Ok(prepared)
+        };
+        // A later page: a seek to the cursor, the rows in index order.
+        let plan = unfiltered(Some(cursor))?.explain(&store.connect()?).await?;
+        assert_eq!(
+            count(&plan, "idx_event_cursor (timestamp>=?)"),
+            1,
+            "{plan:#?}"
+        );
+        assert_no_scan(&plan);
+        // The first page: the index walked from its start, no sort.
+        let plan = unfiltered(None)?.explain(&store.connect()?).await?;
+        assert_eq!(plan, ["SCAN event USING INDEX idx_event_cursor"]);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn a_projection_load_seeks_its_stream_once() -> anyhow::Result<()> {
         let (store, _) = store().await?;
