@@ -29,7 +29,7 @@ use bank::{
     account_details, AccountDetailsView, AccountType, BankAccountError, Command, DepositMoney,
     OpenAccount, TransferMoney, WithdrawMoney,
 };
-use evento::migrator::{Migrate, Plan};
+use evento::migrator::Plan;
 use evento::sql::Sql;
 use serde::Deserialize;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};

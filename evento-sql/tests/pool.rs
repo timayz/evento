@@ -10,7 +10,7 @@ use evento_test::assert_read_result;
 use sea_query::{MysqlQueryBuilder, PostgresQueryBuilder, Query, SqliteQueryBuilder};
 use sea_query_sqlx::SqlxBinder;
 use sqlx::{any::install_default_drivers, migrate::MigrateDatabase, Any, Database, Pool};
-use sqlx_migrator::{Migrate, Plan};
+use sqlx_migrator::Plan;
 
 pub async fn forward_asc<DB>(pool: Pool<DB>) -> anyhow::Result<()>
 where
@@ -293,7 +293,8 @@ where
     M0008: sqlx_migrator::Migration<DB>,
     M0009: sqlx_migrator::Migration<DB>,
     M0010: sqlx_migrator::Migration<DB>,
-    sqlx_migrator::Migrator<DB>: sqlx_migrator::migrator::DatabaseOperation<DB>,
+    DB: sqlx_migrator::migrator::SupportedDatabase,
+    sqlx_migrator::Migrator<DB>: Default,
 {
     install_default_drivers();
 
@@ -416,7 +417,8 @@ where
     M0008: sqlx_migrator::Migration<DB>,
     M0009: sqlx_migrator::Migration<DB>,
     M0010: sqlx_migrator::Migration<DB>,
-    sqlx_migrator::Migrator<DB>: sqlx_migrator::migrator::DatabaseOperation<DB>,
+    DB: sqlx_migrator::migrator::SupportedDatabase,
+    sqlx_migrator::Migrator<DB>: Default,
 {
     execute(&pool, event_row("kept", None)).await?;
 
@@ -505,7 +507,8 @@ where
     M0008: sqlx_migrator::Migration<DB>,
     M0009: sqlx_migrator::Migration<DB>,
     M0010: sqlx_migrator::Migration<DB>,
-    sqlx_migrator::Migrator<DB>: sqlx_migrator::migrator::DatabaseOperation<DB>,
+    DB: sqlx_migrator::migrator::SupportedDatabase,
+    sqlx_migrator::Migrator<DB>: Default,
 {
     let all = [
         "idx_event_cursor",

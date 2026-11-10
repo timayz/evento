@@ -17,7 +17,7 @@ Run all migrations before creating the executor (the snippet needs a database fe
 enabled, e.g. `sqlite`):
 
 ```rust,no_run
-use sqlx_migrator::{Migrate, Plan};
+use sqlx_migrator::Plan;
 
 # #[cfg(feature = "sqlite")]
 # async fn run(pool: sqlx::SqlitePool) -> anyhow::Result<()> {

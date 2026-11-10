@@ -24,7 +24,7 @@
 //! instance configured with all Evento migrations.
 //!
 //! ```rust,no_run
-//! use sqlx_migrator::{Migrate, Plan};
+//! use sqlx_migrator::Plan;
 //!
 //! # async fn run(pool: sqlx::SqlitePool) -> Result<(), Box<dyn std::error::Error>> {
 //! // Acquire a database connection
@@ -123,7 +123,8 @@
 //! | `created_at` | TIMESTAMP | Creation timestamp |
 //! | `updated_at` | TIMESTAMP | Last update timestamp |
 
-use sqlx_migrator::{Info, Migrator};
+use sqlx_migrator::migrator::SupportedDatabase;
+use sqlx_migrator::Migrator;
 
 #[cfg(feature = "cluster")]
 mod cluster;
@@ -160,7 +161,7 @@ pub use m0010::M0010;
 /// # Example
 ///
 /// ```rust,no_run
-/// use sqlx_migrator::{Migrate, Plan};
+/// use sqlx_migrator::Plan;
 ///
 /// # async fn run(
 /// #     conn: &mut sqlx::pool::PoolConnection<sqlx::MySql>,
@@ -187,8 +188,9 @@ pub use m0010::M0010;
 // extra trait bound); the default build is unchanged — so the `ClusterMigration` bound
 // never leaks onto callers (e.g. evento-sql's generic test harness) that don't opt in.
 #[cfg(not(feature = "cluster"))]
-pub fn new<DB: sqlx::Database>() -> Result<Migrator<DB>, sqlx_migrator::Error>
+pub fn new<DB: SupportedDatabase>() -> Result<Migrator<DB>, sqlx_migrator::Error>
 where
+    Migrator<DB>: Default,
     InitMigration: sqlx_migrator::Migration<DB>,
     M0002: sqlx_migrator::Migration<DB>,
     M0003: sqlx_migrator::Migration<DB>,
@@ -223,7 +225,7 @@ where
 /// # Example
 ///
 /// ```rust,no_run
-/// use sqlx_migrator::{Migrate, Plan};
+/// use sqlx_migrator::Plan;
 ///
 /// # async fn run(
 /// #     conn: &mut sqlx::pool::PoolConnection<sqlx::MySql>,
@@ -247,8 +249,9 @@ where
 ///
 /// Returns an error if migration registration fails.
 #[cfg(feature = "cluster")]
-pub fn new<DB: sqlx::Database>() -> Result<Migrator<DB>, sqlx_migrator::Error>
+pub fn new<DB: SupportedDatabase>() -> Result<Migrator<DB>, sqlx_migrator::Error>
 where
+    Migrator<DB>: Default,
     InitMigration: sqlx_migrator::Migration<DB>,
     M0002: sqlx_migrator::Migration<DB>,
     M0003: sqlx_migrator::Migration<DB>,

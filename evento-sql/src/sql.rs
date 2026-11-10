@@ -1653,7 +1653,7 @@ mod tests {
     //! with no scan of the type and no `MULTI-INDEX OR` (#478).
 
     use sqlx::sqlite::SqlitePoolOptions;
-    use sqlx_migrator::{Migrate, Plan};
+    use sqlx_migrator::Plan;
 
     use super::*;
 

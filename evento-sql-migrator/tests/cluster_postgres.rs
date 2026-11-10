@@ -5,7 +5,7 @@
 
 use sqlx::migrate::MigrateDatabase;
 use sqlx::{PgPool, Postgres};
-use sqlx_migrator::{Migrate, Plan};
+use sqlx_migrator::Plan;
 
 const URL: &str = "postgres://postgres:postgres@localhost:5432/cluster_migrator_pg";
 
