@@ -3,7 +3,7 @@ use std::sync::Arc;
 use evento::{
     cursor::{Args, Order, ReadResult, Value},
     sql::{Reader, Sql},
-    sql_migrator::{InitMigration, M0002, M0003, M0004, M0005, M0006, M0007, M0008, M0009},
+    sql_migrator::{InitMigration, M0002, M0003, M0004, M0005, M0006, M0007, M0008, M0009, M0010},
     Event, EventFilter, Executor, RoutingKey, TenantFilter,
 };
 use evento_test::assert_read_result;
@@ -292,6 +292,7 @@ where
     M0007: sqlx_migrator::Migration<DB>,
     M0008: sqlx_migrator::Migration<DB>,
     M0009: sqlx_migrator::Migration<DB>,
+    M0010: sqlx_migrator::Migration<DB>,
     sqlx_migrator::Migrator<DB>: sqlx_migrator::migrator::DatabaseOperation<DB>,
 {
     install_default_drivers();
@@ -414,6 +415,7 @@ where
     M0007: sqlx_migrator::Migration<DB>,
     M0008: sqlx_migrator::Migration<DB>,
     M0009: sqlx_migrator::Migration<DB>,
+    M0010: sqlx_migrator::Migration<DB>,
     sqlx_migrator::Migrator<DB>: sqlx_migrator::migrator::DatabaseOperation<DB>,
 {
     execute(&pool, event_row("kept", None)).await?;
@@ -484,8 +486,8 @@ where
     Ok(rows.into_iter().map(|(name,)| name).collect())
 }
 
-/// The fresh schema has the seven `event` indexes, `m0009` reverts to six and
-/// re-applies to seven.
+/// The fresh schema has the eight `event` indexes; reverting `m0010` then
+/// `m0009` takes one away each, and re-applying restores both.
 pub async fn m0009_round_trip<DB>(pool: Pool<DB>) -> anyhow::Result<()>
 where
     DB: Database,
@@ -502,9 +504,11 @@ where
     M0007: sqlx_migrator::Migration<DB>,
     M0008: sqlx_migrator::Migration<DB>,
     M0009: sqlx_migrator::Migration<DB>,
+    M0010: sqlx_migrator::Migration<DB>,
     sqlx_migrator::Migrator<DB>: sqlx_migrator::migrator::DatabaseOperation<DB>,
 {
     let all = [
+        "idx_event_cursor",
         "idx_event_routing_key_type",
         "idx_event_type_cursor",
         "idx_event_type_id_tenant_cursor",
@@ -518,14 +522,23 @@ where
     let migrator = evento::sql_migrator::new::<DB>()?;
     let mut conn = pool.acquire().await?;
     migrator
+        .run(&mut *conn, &Plan::revert_name("main", Some("m0010")))
+        .await?;
+    let without_cursor: Vec<&str> = all
+        .iter()
+        .copied()
+        .filter(|name| *name != "idx_event_cursor")
+        .collect();
+    assert_eq!(event_indexes(&pool).await?, without_cursor);
+    migrator
         .run(&mut *conn, &Plan::revert_name("main", Some("m0009")))
         .await?;
-    let without: Vec<&str> = all
+    let without_both: Vec<&str> = without_cursor
         .iter()
         .copied()
         .filter(|name| *name != "idx_event_type_name_cursor")
         .collect();
-    assert_eq!(event_indexes(&pool).await?, without);
+    assert_eq!(event_indexes(&pool).await?, without_both);
 
     migrator.run(&mut *conn, &Plan::apply_all()).await?;
     assert_eq!(event_indexes(&pool).await?, all);

@@ -68,6 +68,8 @@
 //!   `snapshot` is keyed by `(tenant, type, projection, id)` (snapshots discarded)
 //! - [`M0009`] - Adds `idx_event_type_name_cursor`, so a subscription's reads by event
 //!   name and its lag `MAX(timestamp)` seek instead of scanning the type
+//! - [`M0010`] - Adds `idx_event_cursor`, so an unfiltered read of the whole log (the
+//!   cluster's join copy) seeks its cursor instead of scanning and sorting the table
 //!
 //! # Database Schema
 //!
@@ -134,6 +136,7 @@ mod m0006;
 mod m0007;
 mod m0008;
 mod m0009;
+mod m0010;
 mod step;
 
 #[cfg(feature = "cluster")]
@@ -147,6 +150,7 @@ pub use m0006::M0006;
 pub use m0007::M0007;
 pub use m0008::M0008;
 pub use m0009::M0009;
+pub use m0010::M0010;
 
 /// Creates a new [`Migrator`] instance with all Evento migrations registered.
 ///
@@ -194,6 +198,7 @@ where
     M0007: sqlx_migrator::Migration<DB>,
     M0008: sqlx_migrator::Migration<DB>,
     M0009: sqlx_migrator::Migration<DB>,
+    M0010: sqlx_migrator::Migration<DB>,
 {
     let mut migrator = Migrator::default();
     migrator.add_migration(Box::new(InitMigration))?;
@@ -205,6 +210,7 @@ where
     migrator.add_migration(Box::new(M0007))?;
     migrator.add_migration(Box::new(M0008))?;
     migrator.add_migration(Box::new(M0009))?;
+    migrator.add_migration(Box::new(M0010))?;
     Ok(migrator)
 }
 
@@ -252,6 +258,7 @@ where
     M0007: sqlx_migrator::Migration<DB>,
     M0008: sqlx_migrator::Migration<DB>,
     M0009: sqlx_migrator::Migration<DB>,
+    M0010: sqlx_migrator::Migration<DB>,
     ClusterMigration: sqlx_migrator::Migration<DB>,
 {
     let mut migrator = Migrator::default();
@@ -264,6 +271,7 @@ where
     migrator.add_migration(Box::new(M0007))?;
     migrator.add_migration(Box::new(M0008))?;
     migrator.add_migration(Box::new(M0009))?;
+    migrator.add_migration(Box::new(M0010))?;
     // The optional evento-cluster consensus-journal tables.
     migrator.add_migration(Box::new(ClusterMigration))?;
     Ok(migrator)

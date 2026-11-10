@@ -190,6 +190,7 @@ async fn the_crate_schema_applies_to_a_fresh_database() {
     assert_eq!(
         indexes,
         [
+            "idx_event_cursor",
             "idx_event_type_cursor",
             "idx_event_type_id_tenant_cursor",
             "idx_event_type_id_tenant_version",

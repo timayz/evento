@@ -1783,6 +1783,32 @@ mod tests {
         Ok(())
     }
 
+    /// The join copy (`evento-cluster`'s `snapshot_page`) reads the whole log
+    /// — no filters, every routing key, every tenant — in cursor order, a
+    /// page at a time. Without an index led by the cursor each page scanned
+    /// and sorted the table (#505); `idx_event_cursor` seeks it.
+    #[tokio::test]
+    async fn an_unfiltered_read_seeks_the_cursor() -> anyhow::Result<()> {
+        let store = store().await?;
+        let cursor = head(&store).await?;
+        let mut reader = read_reader(None, None, &TenantFilter::All, None);
+        reader.forward(100, Some(cursor));
+        let (statement, _) = reader.prepared::<SqlEvent, SqlEvent>()?;
+        assert_eq!(
+            plan(&store, &statement).await?,
+            vec!["SEARCH event USING INDEX idx_event_cursor (timestamp>?)"]
+        );
+
+        let mut reader = read_reader(None, None, &TenantFilter::All, None);
+        reader.forward(100, None);
+        let (statement, _) = reader.prepared::<SqlEvent, SqlEvent>()?;
+        assert_eq!(
+            plan(&store, &statement).await?,
+            vec!["SCAN event USING INDEX idx_event_cursor"]
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn a_read_over_several_arms_seeks_each() -> anyhow::Result<()> {
         let store = store().await?;
