@@ -385,6 +385,20 @@ type, name and tenant, acknowledged and skipped, so one bad row (on a shared sto
 tenant's writer can append one under a handled type and name) does not stop the
 subscription for every tenant. `.on_undecodable(Undecodable::Stop)` makes it stop instead.
 
+Stopping is right when the store is at fault and wrong for an error about one event: a
+subscription serving many tenants would hold all of them back for one order a provider
+refuses. `.dead_letter()` retries such an event on its own (`.retry(n)`, with back-off),
+then records it — id, type, name, tenant, error, attempts — as a
+[`DeadLetter`](https://docs.rs/evento/latest/evento/struct.DeadLetter.html) beside the
+cursor, acknowledges it and goes on. `.fault(|err| ...)` lets you say an error is the
+store's (`Fault::Store`: fail the pass, never dead-letter) or the event's own
+(`Fault::Event`: dead-letter at once). `executor.dead_letters(key, limit)` and
+`dead_letter_count(key)` list and count them, and
+`SubscriptionBuilder::redeliver(&executor, &letter)` runs one through its handler again,
+removing it on success. The SQL, Turso and Fjall stores keep them (SQL: migration `M0011`);
+on a cluster they are per node, like cursors; a bare remote client does not keep them — put
+it behind a `Sidecar`.
+
 `.data(v)` stores `v` under its own type; a handler reads it back with
 `ctx.extract::<T>()`, or `ctx.try_extract::<T>()?` to get an error instead of a panic
 when it was never registered. Extraction clones, so the type should be `Clone` and cheap
@@ -745,6 +759,8 @@ plus the [`bank-axum-cluster`](examples/bank-axum-cluster) 3-node demo.
 | Fail on unhandled events | `.strict()` |
 | One tenant's events only (shared store) | `.tenant("")` / `.tenant(t)` |
 | Keep going after a handler error | `.continue_on_error()` |
+| Record an event that keeps failing and go on | `.retry(n).dead_letter()` (+ `.fault(..)`) |
+| List / retry the events given up on | `exec.dead_letters(key, limit)` / `builder.redeliver(exec, &letter)` |
 | Stop on a payload that does not decode (default: skip it) | `.on_undecodable(Undecodable::Stop)` |
 | Notice a stopped subscription | `subscription.stopped().await` → `StopReason` |
 | Live bridge (SSE/WebSocket) | `.live(exec)` = `.ephemeral().start_from_latest().start(exec)` |

@@ -27,6 +27,14 @@
 //! So supervise the handle: [`Subscription::stopped`] resolves with the
 //! [`StopReason`], and [`Subscription::is_finished`] is the non-blocking check.
 //!
+//! Stopping is right when the store is at fault, and wrong for an error about
+//! one event: a subscription serving many tenants would hold all of them back
+//! for one order a provider refuses.
+//! [`dead_letter`](SubscriptionBuilder::dead_letter) retries such an event on
+//! its own, then records it as a [`DeadLetter`](crate::DeadLetter) and goes
+//! on; [`Executor::dead_letters`] lists them and
+//! [`redeliver`](SubscriptionBuilder::redeliver) runs one again.
+//!
 //! A payload that does not decode as the handled event is not a handler
 //! error: the handler never ran, and no retry will decode the bytes. Such an
 //! event is poison — on a shared store, any writer confined to its own tenant
@@ -140,7 +148,7 @@
 //! # }
 //! ```
 
-use backon::{ExponentialBuilder, Retryable};
+use backon::{BackoffBuilder, ExponentialBuilder, Retryable};
 use std::{
     collections::HashMap,
     future::Future,
@@ -161,8 +169,9 @@ use ulid::Ulid;
 use crate::{
     context,
     cursor::{Args, Value},
-    upcast::Aliases,
-    Aggregate, AggregateEvent, DecodeError, EventFilter, Executor, FromEventError, TenantFilter,
+    upcast::{Alias, Aliases},
+    Aggregate, AggregateEvent, DeadLetter, DecodeError, EventFilter, Executor, FromEventError,
+    TenantFilter, MAX_DEAD_LETTER_ERROR_LEN,
 };
 
 /// Default bound on how long a shutdown waits for the pass in flight.
@@ -411,6 +420,13 @@ pub struct SubscriptionBuilder<E: Executor> {
     continue_on_error: bool,
     /// What to do with an event whose payload does not decode.
     undecodable: Undecodable,
+    /// Whether an event still failing after its retries is recorded and
+    /// passed over instead of failing the pass (see
+    /// [`dead_letter`](Self::dead_letter)).
+    dead_letter: bool,
+    /// The host's word on whose failure an error is (see
+    /// [`fault`](Self::fault)).
+    fault: Option<FaultFn>,
     retry: Option<u8>,
     /// How long `shutdown` waits for the in-flight pass before abandoning
     /// it; `None` waits for as long as the pass takes.
@@ -477,6 +493,36 @@ pub enum Undecodable {
     Stop,
 }
 
+/// Whose failure a handler's error is, as the host tells a dead-lettering
+/// subscription (see [`SubscriptionBuilder::fault`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fault {
+    /// The store's, or anything else no event is to blame for (a write
+    /// refused as unavailable, a read that failed): the pass fails as it
+    /// does without [`dead_letter`](SubscriptionBuilder::dead_letter), and
+    /// the event is never dead-lettered for it.
+    Store,
+    /// The event's own, and permanent (a domain error on one order, a 4xx
+    /// from a provider): dead-lettered at once, without the retries.
+    Event,
+}
+
+/// See [`SubscriptionBuilder::fault`].
+type FaultFn = Box<dyn Fn(&anyhow::Error) -> Option<Fault> + Send + Sync>;
+
+/// How a handler's error on an event is treated by the pass.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Failure {
+    /// The event's payload does not decode, and such an event is skipped.
+    Poison,
+    /// [`Fault::Store`], in dead-letter mode.
+    Store,
+    /// [`Fault::Event`], in dead-letter mode.
+    Event,
+    /// Anything else.
+    Unclassified,
+}
+
 /// What a single `process` pass concluded, beyond a hard error.
 enum ProcessOutcome {
     /// Everything currently available was processed (or nothing was pending).
@@ -513,6 +559,8 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             chunk_size: 300,
             continue_on_error: false,
             undecodable: Undecodable::Skip,
+            dead_letter: false,
+            fault: None,
             routing_key: None,
             tenant: TenantFilter::All,
             prefix_key: None,
@@ -660,6 +708,107 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
     /// handler error instead.
     pub fn on_undecodable(mut self, v: Undecodable) -> Self {
         self.undecodable = v;
+
+        self
+    }
+
+    /// Records an event that still fails after its retries and goes on,
+    /// instead of stopping the worker.
+    ///
+    /// By default a handler error fails the pass, the pass is retried
+    /// ([`retry`](Self::retry)), and the worker stops with
+    /// [`StopReason::Failed`]. That is right when nothing else would progress
+    /// either — the store is unreachable — and wrong for an error about one
+    /// event: the cursor is shared by everything the subscription serves, so
+    /// one order a provider refuses holds back every other tenant's until
+    /// someone steps in. [`continue_on_error`](Self::continue_on_error) is
+    /// the other extreme: skipped on the first failure, with nothing kept but
+    /// a log line.
+    ///
+    /// With this mode, a handler error on an event is retried on that event,
+    /// with the back-off of a retried pass, `retry` times; what came before
+    /// the event is acknowledged first. If the last attempt fails too, the
+    /// event is recorded as a [`DeadLetter`] — its id, type, name, tenant,
+    /// the error and the number of attempts — through
+    /// [`Executor::save_dead_letter`], logged at `error`, acknowledged, and
+    /// the pass goes on with the next event. Each event has its own retries:
+    /// several failing in a row are each given up on in turn, and none stops
+    /// the worker.
+    ///
+    /// [`fault`](Self::fault) lets the host say that an error is the store's
+    /// (never dead-lettered) or the event's own (dead-lettered at once). An
+    /// event whose payload does not decode is recorded too, with zero
+    /// attempts, when it is skipped ([`on_undecodable`](Self::on_undecodable)).
+    ///
+    /// Errors that are not a handler's — a read, an acknowledge, the dead
+    /// letter's own write — still fail the pass. With
+    /// [`no_retry`](Self::no_retry) an event is given up on at its first
+    /// failure. For a handler's errors this mode replaces
+    /// `continue_on_error`.
+    ///
+    /// The operator's side is on the executor: [`Executor::dead_letters`] and
+    /// [`Executor::dead_letter_count`] list and count them, and
+    /// [`redeliver`](Self::redeliver) runs one through the handlers again.
+    /// What a dead letter means for the domain (an order marked as failed)
+    /// stays the handler's to write, before it returns the error.
+    ///
+    /// The executor must keep dead letters, or [`start`](Self::start) and
+    /// [`run_once`](Self::run_once) fail before anything is processed; an
+    /// [`ephemeral`](Self::ephemeral) subscription, which writes nothing,
+    /// cannot use the mode.
+    ///
+    /// ```rust,no_run
+    /// # use evento::{Executor, metadata::Event};
+    /// # use evento::subscription::{Context, Fault, SubscriptionBuilder};
+    /// # #[evento::aggregate]
+    /// # pub enum Order { OrderPaid { amount: i64 } }
+    /// # #[derive(Debug, thiserror::Error)]
+    /// # #[error("refused")]
+    /// # struct Refused;
+    /// # #[evento::subscription]
+    /// # async fn invoice<E: Executor>(
+    /// #     context: &Context<'_, E>,
+    /// #     event: Event<OrderPaid>,
+    /// # ) -> anyhow::Result<()> { Ok(()) }
+    /// # async fn run<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
+    /// let subscription = SubscriptionBuilder::new("invoicing")
+    ///     .handler(invoice())
+    ///     .retry(5)
+    ///     .dead_letter()
+    ///     .fault(|err| {
+    ///         if err.is::<evento::WriteError>() {
+    ///             Some(Fault::Store)
+    ///         } else if err.is::<Refused>() {
+    ///             Some(Fault::Event)
+    ///         } else {
+    ///             None
+    ///         }
+    ///     })
+    ///     .start(executor)
+    ///     .await?;
+    /// # subscription.shutdown().await?;
+    /// # Ok(()) }
+    /// ```
+    pub fn dead_letter(mut self) -> Self {
+        self.dead_letter = true;
+
+        self
+    }
+
+    /// Tells a [dead-lettering](Self::dead_letter) subscription whose
+    /// failure a handler's error is.
+    ///
+    /// Called with each error a handler returns: [`Fault::Store`] fails the
+    /// pass and never dead-letters the event, [`Fault::Event`] dead-letters
+    /// it without the retries, and `None` leaves the default — the retries,
+    /// then the dead letter. Without this, every error is `None`.
+    ///
+    /// Has no effect without [`dead_letter`](Self::dead_letter).
+    pub fn fault(
+        mut self,
+        f: impl Fn(&anyhow::Error) -> Option<Fault> + Send + Sync + 'static,
+    ) -> Self {
+        self.fault = Some(Box::new(f));
 
         self
     }
@@ -1145,18 +1294,8 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                 // event's handler (so consumers migrate one at a time), which
                 // takes precedence over a `subscription_all` catch-all for the
                 // same aggregate type; the catch-all key is only built on a miss.
-                let key = format!("{}_{}", event.node.aggregate_type, event.node.name);
-                let alias = match self.handlers.contains_key(&key) {
-                    true => None,
-                    false => self.aliases.get(&key),
-                };
-                let handler = match self
-                    .handlers
-                    .get(alias.map_or(&key, |alias| &alias.target_key))
-                    .or_else(|| {
-                        self.handlers
-                            .get(&format!("{}_all", event.node.aggregate_type))
-                    }) {
+                let (key, alias, handler) = self.route(&event.node);
+                let handler = match handler {
                     Some(handler) => Some(handler),
                     None if !self.safety_disabled && !self.continue_on_error => {
                         self.flush_ack(executor, id, aggregators, &mut pending_ack, &mut since_ack)
@@ -1182,23 +1321,25 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                 };
 
                 if let Some(handler) = handler {
-                    // A failed upcast is handled like a failed handler.
-                    let result = async {
-                        match alias.map(|alias| alias.apply(&event.node)) {
-                            Some(Ok(upcast)) => handler.handle(&context, &upcast).await,
-                            Some(Err(err)) => Err(err),
-                            None => handler.handle(&context, &event.node).await,
-                        }
-                    }
-                    .instrument(span.clone())
-                    .await;
-                    if let Err(err) = result {
-                        if self.undecodable == Undecodable::Skip
-                            && is_undecodable(&err, &event.node)
-                        {
-                            // Poison, not a failure: the handler did not run,
-                            // and a retry would not decode the bytes either.
-                            // Acknowledged below like a handled event.
+                    let mut result = self
+                        .deliver(handler, alias, &context, &event.node)
+                        .instrument(span.clone())
+                        .await;
+                    let mut attempts = 1u32;
+
+                    // Dead-letter mode retries the event where it stands, so
+                    // each event has the whole of `retry` to itself: retrying
+                    // the pass instead would have a second failing event
+                    // inherit what the first left of the budget.
+                    if self.dead_letter {
+                        let mut delays = self.retry_delays();
+                        while let Err(err) = &result {
+                            if self.classify(err, &event.node) != Failure::Unclassified {
+                                break;
+                            }
+                            let Some(delay) = delays.next() else {
+                                break;
+                            };
                             span.in_scope(|| {
                                 tracing::error!(
                                     error = %err,
@@ -1207,46 +1348,166 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                                     aggregate_type = event.node.aggregate_type,
                                     aggregate_id = event.node.aggregate_id,
                                     event = event.node.name,
-                                    tenant = event.node.tenant,
-                                    "undecodable payload, skipping event"
+                                    attempt = attempts,
+                                    duration = ?delay,
+                                    "failed, retrying the event"
                                 )
                             });
-                        } else if !self.continue_on_error {
-                            span.in_scope(|| {
-                                tracing::error!(
-                                    error = %err,
+                            // What came before is acknowledged first: the
+                            // back-off can span minutes, and a worker stopped
+                            // or replaced during it resumes at this event.
+                            if !self
+                                .flush_ack(
+                                    executor,
+                                    id,
+                                    aggregators,
+                                    &mut pending_ack,
+                                    &mut since_ack,
+                                )
+                                .await?
+                            {
+                                return Ok(ProcessOutcome::LostOwnership);
+                            }
+                            if self.backoff(delay).await {
+                                tracing::info!(
                                     key = self.resolved_key(),
-                                    aggregate_type = event.node.aggregate_type,
-                                    aggregate_id = event.node.aggregate_id,
-                                    event = event.node.name,
-                                    "failed"
+                                    "Subscription received shutdown signal, stopping gracefully"
+                                );
+                                return Ok(ProcessOutcome::ShutdownRequested);
+                            }
+                            // The handler stopped the subscription and then
+                            // failed: the event is not acknowledged, and
+                            // nothing more is delivered.
+                            if self.stop_flag.load(Ordering::Relaxed) {
+                                return Ok(ProcessOutcome::StoppedByHandler);
+                            }
+                            // Another worker may have claimed the key during
+                            // the back-off, and will meet the event itself.
+                            if let CursorRead::LostOwnership =
+                                self.current_cursor(executor, id).await?
+                            {
+                                return Ok(ProcessOutcome::LostOwnership);
+                            }
+                            result = self
+                                .deliver(handler, alias, &context, &event.node)
+                                .instrument(span.clone())
+                                .await;
+                            attempts += 1;
+                        }
+                    }
+
+                    if let Err(err) = result {
+                        match self.classify(&err, &event.node) {
+                            Failure::Poison => {
+                                // Poison, not a failure: the handler did not
+                                // run, and a retry would not decode the bytes
+                                // either. Acknowledged below like a handled
+                                // event.
+                                span.in_scope(|| {
+                                    tracing::error!(
+                                        error = %err,
+                                        key = self.resolved_key(),
+                                        event_id = %event.node.id,
+                                        aggregate_type = event.node.aggregate_type,
+                                        aggregate_id = event.node.aggregate_id,
+                                        event = event.node.name,
+                                        tenant = event.node.tenant,
+                                        "undecodable payload, skipping event"
+                                    )
+                                });
+                                // Listed with the events given up on, so an
+                                // operator has one place to look.
+                                if self.dead_letter {
+                                    if let Err(store) =
+                                        self.save_dead_letter(executor, &event.node, &err, 0).await
+                                    {
+                                        self.flush_ack(
+                                            executor,
+                                            id,
+                                            aggregators,
+                                            &mut pending_ack,
+                                            &mut since_ack,
+                                        )
+                                        .await?;
+                                        return Err(store);
+                                    }
+                                }
+                            }
+                            Failure::Event | Failure::Unclassified if self.dead_letter => {
+                                // Given up on: recorded, then acknowledged
+                                // below like a handled event. The row is
+                                // written first, so a crash in between
+                                // redelivers the event instead of losing it.
+                                if let Err(store) = self
+                                    .save_dead_letter(executor, &event.node, &err, attempts)
+                                    .await
+                                {
+                                    self.flush_ack(
+                                        executor,
+                                        id,
+                                        aggregators,
+                                        &mut pending_ack,
+                                        &mut since_ack,
+                                    )
+                                    .await?;
+                                    return Err(store);
+                                }
+                                span.in_scope(|| {
+                                    tracing::error!(
+                                        error = %err,
+                                        key = self.resolved_key(),
+                                        event_id = %event.node.id,
+                                        aggregate_type = event.node.aggregate_type,
+                                        aggregate_id = event.node.aggregate_id,
+                                        event = event.node.name,
+                                        tenant = event.node.tenant,
+                                        attempts,
+                                        "failed, dead-lettering event"
+                                    )
+                                });
+                            }
+                            // A store fault is never the event's: it fails the
+                            // pass whatever `continue_on_error` says.
+                            failure if failure == Failure::Store || !self.continue_on_error => {
+                                span.in_scope(|| {
+                                    tracing::error!(
+                                        error = %err,
+                                        key = self.resolved_key(),
+                                        aggregate_type = event.node.aggregate_type,
+                                        aggregate_id = event.node.aggregate_id,
+                                        event = event.node.name,
+                                        "failed"
+                                    )
+                                });
+                                // Persist the successfully processed prefix
+                                // before surfacing the error, so a retry
+                                // resumes at the failing event instead of
+                                // re-running the chunk.
+                                self.flush_ack(
+                                    executor,
+                                    id,
+                                    aggregators,
+                                    &mut pending_ack,
+                                    &mut since_ack,
                                 )
-                            });
-                            // Persist the successfully processed prefix before
-                            // surfacing the error, so a retry resumes at the
-                            // failing event instead of re-running the chunk.
-                            self.flush_ack(
-                                executor,
-                                id,
-                                aggregators,
-                                &mut pending_ack,
-                                &mut since_ack,
-                            )
-                            .await?;
-                            return Err(err);
-                        } else {
-                            // continue_on_error: log and acknowledge so the
-                            // subscription makes progress past the failing
-                            // event rather than retrying it forever.
-                            span.in_scope(|| {
-                                tracing::error!(
-                                    error = %err,
-                                    aggregate_type = event.node.aggregate_type,
-                                    aggregate_id = event.node.aggregate_id,
-                                    event = event.node.name,
-                                    "failed, skipping event"
-                                )
-                            });
+                                .await?;
+                                return Err(err);
+                            }
+                            _ => {
+                                // continue_on_error: log and acknowledge so
+                                // the subscription makes progress past the
+                                // failing event rather than retrying it
+                                // forever.
+                                span.in_scope(|| {
+                                    tracing::error!(
+                                        error = %err,
+                                        aggregate_type = event.node.aggregate_type,
+                                        aggregate_id = event.node.aggregate_id,
+                                        event = event.node.name,
+                                        "failed, skipping event"
+                                    )
+                                });
+                            }
                         }
                     } else {
                         span.in_scope(|| tracing::debug!("completed"));
@@ -1296,6 +1557,151 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                     .await;
             }
         }
+    }
+
+    /// The handler of `event`, with the upcast that leads to it when the
+    /// event is an older one, and the handler-map key of the event itself.
+    ///
+    /// A specific handler takes precedence over an upcast to a newer event's
+    /// handler (so consumers migrate one at a time), which takes precedence
+    /// over a `subscription_all` catch-all for the same aggregate type; the
+    /// catch-all key is only built on a miss.
+    fn route(&self, event: &crate::Event) -> (String, Option<&Alias>, Option<&dyn Handler<E>>) {
+        let key = format!("{}_{}", event.aggregate_type, event.name);
+        let alias = match self.handlers.contains_key(&key) {
+            true => None,
+            false => self.aliases.get(&key),
+        };
+        let handler = self
+            .handlers
+            .get(alias.map_or(&key, |alias| &alias.target_key))
+            .or_else(|| self.handlers.get(&format!("{}_all", event.aggregate_type)))
+            .map(|handler| handler.as_ref());
+        (key, alias, handler)
+    }
+
+    /// Runs `handler` on `event`, upcast first when it came through `alias`.
+    /// A failed upcast is handled like a failed handler.
+    async fn deliver(
+        &self,
+        handler: &dyn Handler<E>,
+        alias: Option<&Alias>,
+        context: &Context<'_, E>,
+        event: &crate::Event,
+    ) -> anyhow::Result<()> {
+        match alias.map(|alias| alias.apply(event)) {
+            Some(Ok(upcast)) => handler.handle(context, &upcast).await,
+            Some(Err(err)) => Err(err),
+            None => handler.handle(context, event).await,
+        }
+    }
+
+    /// Whose failure `err`, returned for `event`, is.
+    fn classify(&self, err: &anyhow::Error, event: &crate::Event) -> Failure {
+        if self.undecodable == Undecodable::Skip && is_undecodable(err, event) {
+            return Failure::Poison;
+        }
+        if !self.dead_letter {
+            return Failure::Unclassified;
+        }
+        match self.fault.as_ref().and_then(|fault| fault(err)) {
+            Some(Fault::Store) => Failure::Store,
+            Some(Fault::Event) => Failure::Event,
+            None => Failure::Unclassified,
+        }
+    }
+
+    /// The delays between the attempts on one event in dead-letter mode: the
+    /// back-off of a retried pass, [`retry`](Self::retry) of them.
+    fn retry_delays(&self) -> impl Iterator<Item = Duration> {
+        ExponentialBuilder::default()
+            .with_jitter()
+            .with_max_times(self.retry.map_or(0, usize::from))
+            .build()
+    }
+
+    /// Waits out `delay` between two attempts on an event. `true` when a
+    /// shutdown was requested meanwhile — a dropped handle included, as in
+    /// the per-event check.
+    async fn backoff(&self, delay: Duration) -> bool {
+        match self.shutdown_rx.clone() {
+            Some(mut rx) => tokio::select! {
+                _ = tokio::time::sleep(delay) => false,
+                _ = rx.wait_for(|stop| *stop) => true,
+            },
+            None => {
+                tokio::time::sleep(delay).await;
+                false
+            }
+        }
+    }
+
+    /// Records `event` as given up on after `attempts` runs of its handler.
+    async fn save_dead_letter(
+        &self,
+        executor: &E,
+        event: &crate::Event,
+        err: &anyhow::Error,
+        attempts: u32,
+    ) -> anyhow::Result<()> {
+        // `{:#}` keeps the whole `anyhow` context chain on one line.
+        let mut error = format!("{err:#}");
+        if error.len() > MAX_DEAD_LETTER_ERROR_LEN {
+            let mut end = MAX_DEAD_LETTER_ERROR_LEN;
+            while !error.is_char_boundary(end) {
+                end -= 1;
+            }
+            error.truncate(end);
+        }
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+
+        executor
+            .save_dead_letter(DeadLetter {
+                subscription: self.resolved_key().to_owned(),
+                event_id: event.id,
+                aggregate_type: event.aggregate_type.clone(),
+                aggregate_id: event.aggregate_id.clone(),
+                name: event.name.clone(),
+                tenant: event.tenant.clone(),
+                routing_key: event.routing_key.clone(),
+                version: event.version,
+                error,
+                attempts,
+                timestamp,
+            })
+            .await
+            .map_err(|err| {
+                err.context(format!(
+                    "failed to record the dead letter of event {}",
+                    event.id
+                ))
+            })
+    }
+
+    /// Fails a dead-lettering subscription that could not record a dead
+    /// letter, before it processes anything: on its first poisoned event it
+    /// would otherwise stop like a subscription without the mode.
+    async fn check_dead_letters(&self, executor: &E) -> anyhow::Result<()> {
+        if !self.dead_letter {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            !self.cursor_store.is_ephemeral(),
+            "subscription {} is ephemeral and writes nothing to the store: it cannot dead-letter",
+            self.resolved_key()
+        );
+        executor
+            .dead_letter_count(self.resolved_key().to_owned())
+            .await
+            .map_err(|err| {
+                err.context(format!(
+                    "subscription {} cannot dead-letter on this executor",
+                    self.resolved_key()
+                ))
+            })?;
+        Ok(())
     }
 
     /// Where the next read starts, and whether this worker still owns the
@@ -1579,6 +1985,8 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
         // a panic, an abort, or a runtime shutdown.
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(None::<StopReason>);
 
+        self.check_dead_letters(&executor).await?;
+
         // An ephemeral subscription claims nothing: no row, no fence.
         if !self.cursor_store.is_ephemeral() {
             executor
@@ -1845,6 +2253,8 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
         tracing::Span::current().record("subscription", self.resolved_key());
         let id = Ulid::generate();
 
+        self.check_dead_letters(executor).await?;
+
         // An ephemeral subscription claims nothing: no row, no fence.
         if !self.cursor_store.is_ephemeral() {
             executor
@@ -1925,6 +2335,81 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                 }
             }
         }
+    }
+
+    /// Runs the event of a dead letter through its handler again, once, and
+    /// removes the dead letter when the handler succeeds.
+    ///
+    /// For an operator who fixed what the event failed on: build the
+    /// subscription as the worker does — same key, handlers and data — and
+    /// hand it a row of [`Executor::dead_letters`]. The event is read back
+    /// from its stream and delivered like any other, upcast included, outside
+    /// the subscription's cursor: the running worker is not disturbed, and
+    /// needs no restart. When the handler fails again its error is returned
+    /// and the dead letter stays as it was.
+    ///
+    /// Delivery was at-least-once already, and this is one more: the handler
+    /// may have gone part of the way on an earlier attempt.
+    pub async fn redeliver(&mut self, executor: &E, letter: &DeadLetter) -> anyhow::Result<()> {
+        self.resolve_routing_key(executor);
+        anyhow::ensure!(
+            letter.subscription == self.resolved_key(),
+            "the dead letter of event {} belongs to subscription {}, not {}",
+            letter.event_id,
+            letter.subscription,
+            self.resolved_key()
+        );
+
+        // A stream is read by its cursor, so the event is looked for a page
+        // at a time: a stream holds 65535 events at most.
+        const PAGE_SIZE: u16 = 4096;
+        let filters: Arc<[EventFilter]> = Arc::from([EventFilter::by_id_raw(
+            letter.aggregate_type.as_str(),
+            letter.aggregate_id.as_str(),
+        )]);
+        let mut after = None;
+        let event = loop {
+            let page = executor
+                .read(
+                    Some(filters.clone()),
+                    None,
+                    TenantFilter::Only(letter.tenant.clone()),
+                    Args::forward(PAGE_SIZE, after),
+                    None,
+                )
+                .await?;
+            let more = page.page_info.has_next_page;
+            after = page.page_info.end_cursor;
+            if let Some(edge) = page
+                .edges
+                .into_iter()
+                .find(|edge| edge.node.id == letter.event_id)
+            {
+                break edge.node;
+            }
+            anyhow::ensure!(
+                more && after.is_some(),
+                "event {} of {} {} is no longer in the store",
+                letter.event_id,
+                letter.aggregate_type,
+                letter.aggregate_id
+            );
+        };
+
+        let (key, alias, handler) = self.route(&event);
+        let Some(handler) = handler else {
+            anyhow::bail!("no handler s={} k={key}", self.resolved_key())
+        };
+        let context = Context {
+            context: self.context.clone(),
+            executor,
+            stop: &self.stop_flag,
+        };
+        self.deliver(handler, alias, &context, &event).await?;
+
+        executor
+            .delete_dead_letter(letter.subscription.clone(), letter.event_id)
+            .await
     }
 }
 
@@ -2165,12 +2650,12 @@ impl<E: Executor, EV: AggregateEvent + Send + Sync> Handler<E> for SkipHandler<E
 mod tests {
     use super::{
         await_stop_reason, context, peek_stop_reason, shutdown_requested, AtomicBool, Context,
-        CursorStore, Handler, Ordering, StopReason, SubscriptionBuilder, Value,
+        CursorStore, Fault, Handler, Ordering, StopReason, SubscriptionBuilder, Value,
     };
     use crate::cursor::{Args, ReadResult};
     use crate::{
-        DecodeError, Event, EventFilter, Executor, FromEventError, RoutingKey, TenantFilter,
-        WriteError,
+        DeadLetter, DecodeError, Event, EventFilter, Executor, FromEventError, RoutingKey,
+        TenantFilter, WriteError,
     };
     use std::future::Future;
     use std::pin::Pin;
@@ -2741,6 +3226,14 @@ mod tests {
         }
     }
 
+    /// Keeps the tests that read a pass's log lines apart from the tests that
+    /// run a pass under no subscriber. While a single subscriber is alive,
+    /// `tracing` asks the calling thread's dispatcher whether a callsite is
+    /// of interest when it registers: a pass on another thread, which has
+    /// none, would register the pass's spans as never enabled, and the lines
+    /// captured here would lose them.
+    static PASS_LOGS: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
     /// Runs one ephemeral pass over `count` events with [`LogsALine`] under a
     /// `fmt` subscriber filtering at `level`, and returns everything it wrote.
     async fn logged_pass_over(count: usize, level: tracing::Level) -> String {
@@ -2753,6 +3246,7 @@ mod tests {
         handler: LogsALine,
         continue_on_error: bool,
     ) -> String {
+        let _alone = PASS_LOGS.write().await;
         let captured = Captured::default();
         let writer = captured.clone();
         let subscriber = tracing_subscriber::fmt()
@@ -2845,5 +3339,490 @@ mod tests {
         for line in text.lines().filter(|l| l.contains("completed")) {
             assert_eq!(line.matches("aggregate_id=").count(), 1, "{line}");
         }
+    }
+
+    /// A store with a history, one subscriber cursor and the dead letters, so
+    /// a persisted pass can be run without a backend.
+    #[derive(Clone)]
+    struct Ledger(Arc<LedgerInner>);
+
+    struct LedgerInner {
+        events: Vec<Event>,
+        cursor: Mutex<Option<Value>>,
+        dead_letters: Mutex<Vec<DeadLetter>>,
+    }
+
+    impl Ledger {
+        /// `count` events of `test/Thing`, `thing-0` first.
+        fn of(count: usize) -> Self {
+            Self(Arc::new(LedgerInner {
+                events: (0..count)
+                    .map(|i| Event {
+                        id: Ulid::generate(),
+                        aggregate_id: format!("thing-{i}"),
+                        aggregate_type: "test/Thing".to_owned(),
+                        version: 1,
+                        name: "Happened".to_owned(),
+                        tenant: "acme".to_owned(),
+                        timestamp: 1 + i as u64,
+                        ..Event::default()
+                    })
+                    .collect(),
+                cursor: Mutex::new(None),
+                dead_letters: Mutex::new(Vec::new()),
+            }))
+        }
+
+        fn letters(&self) -> Vec<DeadLetter> {
+            self.0.dead_letters.lock().unwrap().clone()
+        }
+
+        /// Whether the cursor is past every event.
+        async fn drained(&self) -> bool {
+            let after = self.0.cursor.lock().unwrap().clone();
+            self.read(None, None, TenantFilter::All, Args::forward(1, after), None)
+                .await
+                .unwrap()
+                .edges
+                .is_empty()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Executor for Ledger {
+        async fn write(&self, _events: Vec<Event>) -> Result<(), WriteError> {
+            unreachable!()
+        }
+        async fn get_subscriber_cursor(&self, _key: String) -> anyhow::Result<Option<Value>> {
+            Ok(self.0.cursor.lock().unwrap().clone())
+        }
+        async fn is_subscriber_running(
+            &self,
+            _key: String,
+            _worker_id: Ulid,
+        ) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        async fn upsert_subscriber(&self, _key: String, _worker_id: Ulid) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn acknowledge(
+            &self,
+            _key: String,
+            _worker_id: Ulid,
+            cursor: Value,
+            _lag: u64,
+        ) -> anyhow::Result<bool> {
+            *self.0.cursor.lock().unwrap() = Some(cursor);
+            Ok(true)
+        }
+        async fn read(
+            &self,
+            aggregators: Option<Arc<[EventFilter]>>,
+            _routing_key: Option<RoutingKey>,
+            _tenant: TenantFilter,
+            args: Args,
+            _to_micros: Option<u64>,
+        ) -> anyhow::Result<ReadResult<Event>> {
+            let events = self
+                .0
+                .events
+                .iter()
+                .filter(|event| {
+                    aggregators.as_ref().is_none_or(|filters| {
+                        filters.iter().any(|f| {
+                            f.aggregate_type == event.aggregate_type
+                                && f.aggregate_id
+                                    .as_ref()
+                                    .is_none_or(|id| *id == event.aggregate_id)
+                        })
+                    })
+                })
+                .cloned()
+                .collect();
+            Ok(crate::cursor::Reader::new(events).args(args).execute()?)
+        }
+        async fn latest_timestamp(
+            &self,
+            _aggregators: Option<Arc<[EventFilter]>>,
+            _routing_key: Option<RoutingKey>,
+            _tenant: TenantFilter,
+        ) -> anyhow::Result<u64> {
+            Ok(self.0.events.iter().map(|e| e.timestamp).max().unwrap_or(0))
+        }
+        async fn get_snapshot(
+            &self,
+            _tenant: String,
+            _aggregate_type: String,
+            _projection: String,
+            _aggregate_revision: String,
+            _id: String,
+        ) -> anyhow::Result<Option<(Vec<u8>, Value)>> {
+            unreachable!()
+        }
+        async fn save_snapshot(
+            &self,
+            _tenant: String,
+            _aggregate_type: String,
+            _projection: String,
+            _aggregate_revision: String,
+            _id: String,
+            _data: Vec<u8>,
+            _cursor: Value,
+        ) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        async fn delete_snapshot(
+            &self,
+            _tenant: String,
+            _aggregate_type: String,
+            _projection: String,
+            _id: String,
+        ) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        async fn save_dead_letter(&self, letter: DeadLetter) -> anyhow::Result<()> {
+            let mut letters = self.0.dead_letters.lock().unwrap();
+            letters.retain(|l| {
+                (&l.subscription, l.event_id) != (&letter.subscription, letter.event_id)
+            });
+            letters.push(letter);
+            Ok(())
+        }
+        async fn dead_letters(&self, key: String, limit: u16) -> anyhow::Result<Vec<DeadLetter>> {
+            let letters = self.0.dead_letters.lock().unwrap();
+            Ok(letters
+                .iter()
+                .filter(|l| l.subscription == key)
+                .take(limit.into())
+                .cloned()
+                .collect())
+        }
+        async fn dead_letter_count(&self, key: String) -> anyhow::Result<u64> {
+            let letters = self.0.dead_letters.lock().unwrap();
+            Ok(letters.iter().filter(|l| l.subscription == key).count() as u64)
+        }
+        async fn delete_dead_letter(&self, key: String, event_id: Ulid) -> anyhow::Result<()> {
+            let mut letters = self.0.dead_letters.lock().unwrap();
+            letters.retain(|l| (&l.subscription, l.event_id) != (&key, event_id));
+            Ok(())
+        }
+    }
+
+    /// Held by a test that runs a pass under no subscriber (see
+    /// [`PASS_LOGS`]).
+    async fn unlogged() -> tokio::sync::RwLockReadGuard<'static, ()> {
+        PASS_LOGS.read().await
+    }
+
+    /// The error a [`Flaky`] handler fails with.
+    #[derive(Debug, thiserror::Error)]
+    #[error("provider refused {0}")]
+    struct Refused(String);
+
+    /// Handles `test/Thing`'s `Happened`, failing each aggregate of `failing`
+    /// for its first so-many runs, and counting the runs of each.
+    #[derive(Clone, Default)]
+    struct Flaky {
+        failing: Arc<Mutex<std::collections::HashMap<&'static str, u32>>>,
+        runs: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Flaky {
+        /// `id` fails its first `times` runs.
+        fn failing(self, id: &'static str, times: u32) -> Self {
+            self.failing.lock().unwrap().insert(id, times);
+            self
+        }
+
+        fn runs_of(&self, id: &str) -> usize {
+            self.runs
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| *r == id)
+                .count()
+        }
+
+        fn builder(&self, key: &str) -> SubscriptionBuilder<Ledger> {
+            SubscriptionBuilder::new(key).handler(self.clone())
+        }
+    }
+
+    impl Handler<Ledger> for Flaky {
+        fn handle<'a>(
+            &'a self,
+            _context: &'a Context<'a, Ledger>,
+            event: &'a Event,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>> {
+            Box::pin(async move {
+                self.runs.lock().unwrap().push(event.aggregate_id.clone());
+                let mut failing = self.failing.lock().unwrap();
+                if let Some(left) = failing.get_mut(event.aggregate_id.as_str()) {
+                    if *left > 0 {
+                        *left -= 1;
+                        return Err(Refused(event.aggregate_id.clone()).into());
+                    }
+                }
+                Ok(())
+            })
+        }
+
+        fn aggregate_type(&self) -> &'static str {
+            "test/Thing"
+        }
+
+        fn event_name(&self) -> &'static str {
+            "Happened"
+        }
+    }
+
+    /// Issue #509: after its retries the event is recorded and passed, and
+    /// the events behind it are handled instead of waiting on it.
+    #[tokio::test(start_paused = true)]
+    async fn an_event_failing_after_its_retries_is_dead_lettered_and_passed() {
+        let _unlogged = unlogged().await;
+        let store = Ledger::of(3);
+        let handler = Flaky::default().failing("thing-1", u32::MAX);
+        handler
+            .builder("sagas")
+            .retry(2)
+            .dead_letter()
+            .run_once(&store)
+            .await
+            .expect("the pass goes on past the event");
+
+        assert_eq!(handler.runs_of("thing-1"), 3, "one run and two retries");
+        assert_eq!(handler.runs_of("thing-0"), 1);
+        assert_eq!(handler.runs_of("thing-2"), 1, "the event behind it ran");
+        assert!(store.drained().await, "the event was acknowledged");
+
+        let letters = store.letters();
+        assert_eq!(letters.len(), 1);
+        let letter = &letters[0];
+        let event = &store.0.events[1];
+        assert_eq!(letter.subscription, "sagas");
+        assert_eq!(letter.event_id, event.id);
+        assert_eq!(letter.aggregate_type, "test/Thing");
+        assert_eq!(letter.aggregate_id, "thing-1");
+        assert_eq!(letter.name, "Happened");
+        assert_eq!(letter.tenant, "acme");
+        assert_eq!(letter.version, 1);
+        assert_eq!(letter.attempts, 3);
+        assert_eq!(letter.error, "provider refused thing-1");
+        assert_eq!(
+            store.dead_letter_count("sagas".to_owned()).await.unwrap(),
+            1
+        );
+    }
+
+    /// Each event has the retries to itself: two failing in a row are both
+    /// given up on, where a retried pass would have stopped on the second
+    /// with what the first left of the budget.
+    #[tokio::test(start_paused = true)]
+    async fn events_failing_in_a_row_each_get_their_retries() {
+        let _unlogged = unlogged().await;
+        let store = Ledger::of(4);
+        let handler = Flaky::default()
+            .failing("thing-1", u32::MAX)
+            .failing("thing-2", u32::MAX);
+        handler
+            .builder("sagas")
+            .retry(2)
+            .dead_letter()
+            .run_once(&store)
+            .await
+            .unwrap();
+
+        assert_eq!(handler.runs_of("thing-1"), 3);
+        assert_eq!(handler.runs_of("thing-2"), 3);
+        assert_eq!(handler.runs_of("thing-3"), 1);
+        assert_eq!(store.letters().len(), 2);
+        assert!(store.drained().await);
+    }
+
+    /// A fault that passes within the retries leaves no dead letter.
+    #[tokio::test(start_paused = true)]
+    async fn an_event_that_succeeds_on_a_retry_is_not_dead_lettered() {
+        let _unlogged = unlogged().await;
+        let store = Ledger::of(2);
+        let handler = Flaky::default().failing("thing-0", 2);
+        handler
+            .builder("sagas")
+            .retry(2)
+            .dead_letter()
+            .run_once(&store)
+            .await
+            .unwrap();
+
+        assert_eq!(handler.runs_of("thing-0"), 3);
+        assert!(store.letters().is_empty());
+        assert!(store.drained().await);
+    }
+
+    /// `Fault::Event`: the error is the event's own, so the retries are
+    /// skipped. `Fault::Store`: no event is to blame, so the pass fails as it
+    /// does without the mode and nothing is recorded or acknowledged.
+    #[tokio::test(start_paused = true)]
+    async fn the_fault_hook_short_circuits_the_retries() {
+        let _unlogged = unlogged().await;
+        let store = Ledger::of(2);
+        let handler = Flaky::default().failing("thing-0", u32::MAX);
+        handler
+            .builder("sagas")
+            .retry(5)
+            .dead_letter()
+            .fault(|err| err.is::<Refused>().then_some(Fault::Event))
+            .run_once(&store)
+            .await
+            .unwrap();
+        assert_eq!(handler.runs_of("thing-0"), 1, "no retry");
+        assert_eq!(store.letters()[0].attempts, 1);
+        assert!(store.drained().await);
+
+        let store = Ledger::of(2);
+        let handler = Flaky::default().failing("thing-0", u32::MAX);
+        let err = handler
+            .builder("sagas")
+            .no_retry()
+            .dead_letter()
+            .fault(|_| Some(Fault::Store))
+            // The store's fault fails the pass whatever this says.
+            .continue_on_error()
+            .run_once(&store)
+            .await
+            .expect_err("a store fault fails the pass");
+        assert!(err.is::<Refused>(), "{err:#}");
+        assert!(store.letters().is_empty(), "never dead-lettered");
+        assert!(!store.drained().await, "the event is not acknowledged");
+        assert_eq!(handler.runs_of("thing-1"), 0);
+    }
+
+    /// Without retries the first failure gives the event up.
+    #[tokio::test]
+    async fn without_retries_the_first_failure_is_dead_lettered() {
+        let _unlogged = unlogged().await;
+        let store = Ledger::of(1);
+        let handler = Flaky::default().failing("thing-0", u32::MAX);
+        handler
+            .builder("sagas")
+            .no_retry()
+            .dead_letter()
+            .run_once(&store)
+            .await
+            .unwrap();
+        assert_eq!(handler.runs_of("thing-0"), 1);
+        assert_eq!(store.letters()[0].attempts, 1);
+    }
+
+    /// A shutdown during the back-off stops the worker at the failing event:
+    /// not acknowledged, not dead-lettered, and reported as a shutdown.
+    #[tokio::test(start_paused = true)]
+    async fn a_shutdown_during_the_back_off_leaves_the_event_in_place() {
+        let _unlogged = unlogged().await;
+        let store = Ledger::of(2);
+        let handler = Flaky::default().failing("thing-1", u32::MAX);
+        let subscription = handler
+            .builder("sagas")
+            .retry(30)
+            .dead_letter()
+            .start(&store)
+            .await
+            .unwrap();
+        while handler.runs_of("thing-1") < 2 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        subscription.stop();
+        let reason = subscription.stopped().await;
+        assert!(matches!(reason, StopReason::Shutdown), "{reason}");
+        assert!(store.letters().is_empty());
+        assert!(!store.drained().await, "the failing event is still ahead");
+        let after = store.0.cursor.lock().unwrap().clone();
+        assert!(after.is_some(), "the event before it was acknowledged");
+    }
+
+    /// Redelivery runs the one event again: a failure leaves the dead letter,
+    /// a success removes it.
+    #[tokio::test(start_paused = true)]
+    async fn redeliver_runs_the_event_again_and_removes_the_dead_letter() {
+        let _unlogged = unlogged().await;
+        let store = Ledger::of(3);
+        // One run in the pass, one in the first redelivery.
+        let handler = Flaky::default().failing("thing-1", 2);
+        handler
+            .builder("sagas")
+            .no_retry()
+            .dead_letter()
+            .run_once(&store)
+            .await
+            .unwrap();
+        let letters = store.dead_letters("sagas".to_owned(), 10).await.unwrap();
+        assert_eq!(letters.len(), 1);
+
+        let err = handler
+            .builder("sagas")
+            .redeliver(&store, &letters[0])
+            .await
+            .expect_err("the handler still fails");
+        assert!(err.is::<Refused>(), "{err:#}");
+        assert_eq!(store.letters().len(), 1, "the dead letter stays");
+
+        handler
+            .builder("sagas")
+            .redeliver(&store, &letters[0])
+            .await
+            .expect("the handler succeeds now");
+        assert!(store.letters().is_empty());
+        assert_eq!(handler.runs_of("thing-1"), 3);
+        assert_eq!(handler.runs_of("thing-0"), 1, "no other event ran again");
+
+        // Another subscription's dead letter is refused.
+        let err = handler
+            .builder("other")
+            .redeliver(&store, &letters[0])
+            .await
+            .expect_err("not this subscription's");
+        assert!(err.to_string().contains("belongs to subscription sagas"));
+    }
+
+    /// The mode is refused up front where it could not record anything: an
+    /// ephemeral subscription, and an executor that keeps no dead letters.
+    #[tokio::test]
+    async fn dead_lettering_is_refused_where_nothing_can_be_recorded() {
+        let _unlogged = unlogged().await;
+        let err = Flaky::default()
+            .builder("sagas")
+            .ephemeral()
+            .dead_letter()
+            .run_once(&Ledger::of(1))
+            .await
+            .expect_err("an ephemeral subscription writes nothing");
+        assert!(err.to_string().contains("ephemeral"), "{err:#}");
+
+        let err = SubscriptionBuilder::<History>::new("sagas")
+            .dead_letter()
+            .run_once(&History::of(1))
+            .await
+            .expect_err("History keeps no dead letters");
+        assert!(
+            format!("{err:#}").contains("dead letters are not supported"),
+            "{err:#}"
+        );
+    }
+
+    /// A long error chain is cut at a character boundary.
+    #[tokio::test]
+    async fn a_dead_letter_error_is_truncated() {
+        let store = Ledger::of(1);
+        let builder = SubscriptionBuilder::<Ledger>::new("sagas");
+        let err = anyhow::anyhow!("é".repeat(super::MAX_DEAD_LETTER_ERROR_LEN));
+        builder
+            .save_dead_letter(&store, &store.0.events[0], &err, 1)
+            .await
+            .unwrap();
+        let error = &store.letters()[0].error;
+        assert!(error.len() <= super::MAX_DEAD_LETTER_ERROR_LEN);
+        assert!(error.len() >= super::MAX_DEAD_LETTER_ERROR_LEN - 1);
+        assert!(error.chars().all(|c| c == 'é'));
     }
 }

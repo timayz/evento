@@ -5189,6 +5189,193 @@ pub async fn undecodable_event_is_skipped<E: Executor + Clone>(executor: &E) -> 
     Ok(())
 }
 
+/// The subscription of [`dead_letters`]: records the accounts it is
+/// delivered, and fails the ones of tenant `refused` for as long as its key
+/// is refusing.
+mod saga {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::RwLock;
+
+    use bank::aggregator::AccountOpened;
+    use evento::{
+        metadata::Event,
+        subscription::{Context, SubscriptionBuilder},
+        Executor,
+    };
+    use once_cell::sync::Lazy;
+
+    /// Subscription keys whose handler refuses the tenant `refused`.
+    static REFUSING: Lazy<RwLock<HashSet<String>>> = Lazy::new(Default::default);
+
+    /// Subscription key -> the tenants it handled, in order.
+    static HANDLED: Lazy<RwLock<HashMap<String, Vec<String>>>> = Lazy::new(Default::default);
+
+    /// A dead-lettering subscription under `key`, without retries.
+    pub fn subscription<E: Executor>(key: &str) -> SubscriptionBuilder<E> {
+        SubscriptionBuilder::new(key)
+            .data(Key(key.to_owned()))
+            .handler(on_opened())
+            .no_retry()
+            .dead_letter()
+    }
+
+    /// Whether `key`'s handler refuses the tenant `refused`.
+    pub fn refuse(key: &str, refusing: bool) {
+        let mut keys = REFUSING.write().unwrap();
+        match refusing {
+            true => keys.insert(key.to_owned()),
+            false => keys.remove(key),
+        };
+    }
+
+    /// Drains the tenants `key` handled, in order.
+    pub fn take(key: &str) -> Vec<String> {
+        HANDLED.write().unwrap().remove(key).unwrap_or_default()
+    }
+
+    #[derive(Clone)]
+    struct Key(String);
+
+    #[evento::subscription]
+    async fn on_opened<E: Executor>(
+        context: &Context<'_, E>,
+        event: Event<AccountOpened>,
+    ) -> anyhow::Result<()> {
+        let Key(key) = context.extract();
+        if event.tenant == "refused" && REFUSING.read().unwrap().contains(&key) {
+            anyhow::bail!("the provider refused account {}", event.aggregate_id);
+        }
+        HANDLED
+            .write()
+            .unwrap()
+            .entry(key)
+            .or_default()
+            .push(event.tenant.clone());
+        Ok(())
+    }
+}
+
+/// Scenario: a dead-lettering subscription records the event its handler
+/// keeps failing on and goes on, and the record can be listed, redelivered
+/// and removed.
+///
+/// Guards issue #509: a subscription's cursor serves every tenant, so one
+/// event a handler cannot get past — an order a provider refuses — held back
+/// every event behind it until someone stepped in. With `.dead_letter()` the
+/// event is recorded beside the cursor, with its error, and acknowledged; an
+/// event whose payload does not decode is recorded with it. The retries
+/// themselves are `evento-core`'s to test; this is what a backend stores.
+pub async fn dead_letters<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
+    let id = Ulid::generate().to_string();
+    let key = format!("dead-letters-{id}");
+    // The storage key: behind the executor's default routing key, if any.
+    let stored = match executor.default_routing_key() {
+        Some(prefix) => format!("{prefix}.{key}"),
+        None => key.clone(),
+    };
+    // Four streams at version 1, spaced so they are read — and their ids
+    // ordered — as written.
+    let apart = || tokio::time::sleep(std::time::Duration::from_millis(2));
+    open_in(executor, "", &id, 1).await?;
+    apart().await;
+    let mut poison = raw_opened(&id, "poison");
+    poison.data = vec![0xFF, 0xFF, 0xFF];
+    let poison_id = poison.id;
+    executor.write(vec![poison]).await?;
+    apart().await;
+    open_in(executor, "refused", &id, 2).await?;
+    apart().await;
+    open_in(executor, "after", &id, 3).await?;
+
+    assert_eq!(executor.dead_letter_count(stored.clone()).await?, 0);
+    assert!(executor.dead_letters(stored.clone(), 10).await?.is_empty());
+
+    // The pass gives up on two events and handles the ones around them.
+    saga::refuse(&key, true);
+    saga::subscription(&key).run_once(executor).await?;
+    assert_eq!(saga::take(&key), ["", "after"]);
+
+    let letters = executor.dead_letters(stored.clone(), 10).await?;
+    assert_eq!(letters.len(), 2, "{letters:?}");
+    assert_eq!(executor.dead_letter_count(stored.clone()).await?, 2);
+    let (undecodable, refused) = (&letters[0], &letters[1]);
+    assert_eq!(undecodable.event_id, poison_id, "in event-id order");
+    assert_eq!(undecodable.tenant, "poison");
+    assert_eq!(undecodable.attempts, 0, "the handler never ran");
+    assert_eq!(refused.subscription, stored);
+    assert_eq!(refused.aggregate_type, "bank/BankAccount");
+    assert_eq!(refused.aggregate_id, id);
+    assert_eq!(refused.name, "AccountOpened");
+    assert_eq!(refused.tenant, "refused");
+    assert_eq!(refused.routing_key, None);
+    assert_eq!(refused.version, 1);
+    assert_eq!(refused.attempts, 1);
+    assert_eq!(refused.error, format!("the provider refused account {id}"));
+    assert!(refused.timestamp > 0);
+    assert_eq!(
+        executor.dead_letters(stored.clone(), 1).await?,
+        letters[..1]
+    );
+
+    // Both were acknowledged: a second pass meets neither again.
+    open_in(executor, "later", &id, 4).await?;
+    saga::subscription(&key).run_once(executor).await?;
+    assert_eq!(saga::take(&key), ["later"]);
+    assert_eq!(executor.dead_letter_count(stored.clone()).await?, 2);
+
+    // Another subscription's dead letters are its own.
+    assert_eq!(
+        executor
+            .dead_letter_count(format!("{stored}-other"))
+            .await?,
+        0
+    );
+
+    // Recording the same event again keeps one row, with what was learnt.
+    executor
+        .save_dead_letter(evento::DeadLetter {
+            error: "refused again".to_owned(),
+            attempts: 7,
+            timestamp: refused.timestamp + 60,
+            ..refused.clone()
+        })
+        .await?;
+    let again = executor.dead_letters(stored.clone(), 10).await?;
+    assert_eq!(again.len(), 2);
+    assert_eq!(again[1].error, "refused again");
+    assert_eq!(again[1].attempts, 7);
+    assert_eq!(again[1].timestamp, refused.timestamp + 60);
+
+    // Redelivered while the handler still fails: its error, and the row stays.
+    let err = saga::subscription(&key)
+        .redeliver(executor, refused)
+        .await
+        .expect_err("the handler still refuses");
+    assert!(err.to_string().contains("refused account"), "{err:#}");
+    assert_eq!(executor.dead_letter_count(stored.clone()).await?, 2);
+
+    // Fixed: the one event runs again, in its tenant, and the row goes.
+    saga::refuse(&key, false);
+    saga::subscription(&key)
+        .redeliver(executor, refused)
+        .await?;
+    assert_eq!(saga::take(&key), ["refused"]);
+    let left = executor.dead_letters(stored.clone(), 10).await?;
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].event_id, poison_id);
+
+    // Dismissed by hand; removing it twice is not an error.
+    executor
+        .delete_dead_letter(stored.clone(), poison_id)
+        .await?;
+    executor
+        .delete_dead_letter(stored.clone(), poison_id)
+        .await?;
+    assert_eq!(executor.dead_letter_count(stored).await?, 0);
+
+    Ok(())
+}
+
 /// Scenario: a projection subscription loads each event's aggregate in the
 /// event's own tenant — the same id in two tenants projects to two rows — and
 /// the snapshots it persists stay in their tenant.
@@ -5746,7 +5933,8 @@ pub async fn cluster_backend<E: evento_cluster::ClusterBackend>(
     let again = executor.open_journal().await?;
     assert_eq!(again.load_all().await?.len(), 1);
 
-    // What a store holds: events, a snapshot, a subscription cursor.
+    // What a store holds: events, a snapshot, a subscription cursor and a
+    // dead letter.
     executor.write(vec![event("kept")]).await?;
     executor
         .save_snapshot(
@@ -5765,9 +5953,25 @@ pub async fn cluster_backend<E: evento_cluster::ClusterBackend>(
     executor
         .acknowledge(key.clone(), worker, cursor::Value("1".to_owned()), 0)
         .await?;
+    executor
+        .save_dead_letter(evento::DeadLetter {
+            subscription: key.clone(),
+            event_id: Ulid::generate(),
+            aggregate_type: agg_type.to_owned(),
+            aggregate_id: "kept".to_owned(),
+            name: "Opened".to_owned(),
+            tenant: String::new(),
+            routing_key: None,
+            version: 1,
+            error: "refused".to_owned(),
+            attempts: 1,
+            timestamp: 1,
+        })
+        .await?;
     assert_eq!(read("kept").await?.edges.len(), 1);
     assert!(snapshot().await?.is_some());
     assert!(executor.get_subscriber_cursor(key.clone()).await?.is_some());
+    assert_eq!(executor.dead_letter_count(key.clone()).await?, 1);
 
     // Emptied for a join: the store forgets, the journal does not.
     executor.empty_for_join().await?;
@@ -5776,6 +5980,11 @@ pub async fn cluster_backend<E: evento_cluster::ClusterBackend>(
     assert!(
         executor.get_subscriber_cursor(key.clone()).await?.is_none(),
         "the subscription cursors go"
+    );
+    assert_eq!(
+        executor.dead_letter_count(key.clone()).await?,
+        0,
+        "the dead letters go with the cursors"
     );
     assert_eq!(journal.load_all().await?.len(), 1, "the journal stays");
     assert_eq!(journal.load_clock_bound().await?, Some(5_000));

@@ -50,6 +50,8 @@
 //! - `agg_index` - Aggregate version index: `enc(type, id, tenant) + {version
 //!   BE}` -> `ULID` (a stream is identified by its tenant, type and id)
 //! - `subscribers` - Subscription state: `{key}` -> `SubscriberState`
+//! - `dead_letters` - Events a subscription gave up on:
+//!   `enc(subscription) + event id` -> `StoredDeadLetter`
 //! - `tenant_snapshots` - Projection snapshots:
 //!   `enc(tenant, type, projection, id)` -> `StoredSnapshot`
 //! - `meta` - Store metadata: the monotonic commit clock (`last_stamp`) and the
@@ -119,6 +121,21 @@ struct SubscriberState {
     /// Kill switch: a disabled subscription reports "not running" to its
     /// worker, mirroring the SQL backend's `enabled` column.
     enabled: bool,
+}
+
+/// What a dead letter's value holds; its key holds the subscription and the
+/// event id.
+#[derive(Debug, Clone, bitcode::Encode, bitcode::Decode)]
+struct StoredDeadLetter {
+    aggregate_type: String,
+    aggregate_id: String,
+    name: String,
+    tenant: String,
+    routing_key: Option<String>,
+    version: u16,
+    error: String,
+    attempts: u32,
+    timestamp: u64,
 }
 
 /// Snapshot record stored in the database.
@@ -268,6 +285,9 @@ pub struct Fjall {
     cursor_routing: Keyspace,
     subscribers: Keyspace,
     snapshots: Keyspace,
+    /// The events subscriptions gave up on: `enc(subscription) + event id`
+    /// -> `StoredDeadLetter`.
+    dead_letters: Keyspace,
     meta: Keyspace,
     /// Serializes the read-validate-write critical section of `write` (so
     /// concurrent appends cannot both pass the optimistic version check) and
@@ -359,6 +379,7 @@ impl Clone for Fjall {
             cursor_routing: self.cursor_routing.clone(),
             subscribers: self.subscribers.clone(),
             snapshots: self.snapshots.clone(),
+            dead_letters: self.dead_letters.clone(),
             meta: self.meta.clone(),
             write_lock: self.write_lock.clone(),
             last_stamp: self.last_stamp.clone(),
@@ -507,6 +528,7 @@ impl Fjall {
             cursor_routing: db.keyspace("cursor_routing", KeyspaceCreateOptions::default)?,
             subscribers: db.keyspace("subscribers", KeyspaceCreateOptions::default)?,
             snapshots: db.keyspace(SNAPSHOTS_KEYSPACE, KeyspaceCreateOptions::default)?,
+            dead_letters: db.keyspace("dead_letters", KeyspaceCreateOptions::default)?,
             meta,
             write_lock: Arc::new(Mutex::new(())),
             last_stamp: Arc::new(std::sync::atomic::AtomicU64::new(last_stamp)),
@@ -912,6 +934,20 @@ impl Fjall {
         batch.commit()?;
         self.db.persist(self.write_persist_mode)?;
         Ok(())
+    }
+
+    /// Builds the prefix of a subscription's dead letters: `enc(subscription)`.
+    /// A dead letter's key is the prefix followed by the event id, so a
+    /// prefix scan lists them in event-id order.
+    fn dead_letter_prefix(subscription: &str) -> Vec<u8> {
+        Self::encode_components(&[subscription.as_bytes()])
+    }
+
+    /// Builds a dead letter's key: `enc(subscription) + event id`.
+    fn dead_letter_key(subscription: &str, event_id: Ulid) -> Vec<u8> {
+        let mut key = Self::dead_letter_prefix(subscription);
+        key.extend_from_slice(&event_id.to_bytes());
+        key
     }
 
     /// Builds the snapshot key: `enc(tenant, type, projection, id)`.
@@ -1786,6 +1822,99 @@ impl Executor for Fjall {
 
         tokio::task::spawn_blocking(move || {
             executor.delete_stream_blocking(&tenant, &aggregate_type, &aggregate_id)
+        })
+        .await?
+    }
+
+    async fn save_dead_letter(&self, letter: evento_core::DeadLetter) -> anyhow::Result<()> {
+        let executor = self.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let key = Fjall::dead_letter_key(&letter.subscription, letter.event_id);
+            let stored = StoredDeadLetter {
+                aggregate_type: letter.aggregate_type,
+                aggregate_id: letter.aggregate_id,
+                name: letter.name,
+                tenant: letter.tenant,
+                routing_key: letter.routing_key,
+                version: letter.version,
+                error: letter.error,
+                attempts: letter.attempts,
+                timestamp: letter.timestamp,
+            };
+
+            // Journaled ahead of the acknowledge that passes the event, like
+            // it unsynced: a crash that loses this loses that acknowledge
+            // too, and the event is delivered again.
+            executor
+                .dead_letters
+                .insert(key, bitcode::encode(&stored))?;
+            Ok(())
+        })
+        .await?
+    }
+
+    async fn dead_letters(
+        &self,
+        key: String,
+        limit: u16,
+    ) -> anyhow::Result<Vec<evento_core::DeadLetter>> {
+        let executor = self.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let prefix = Fjall::dead_letter_prefix(&key);
+            let mut letters = Vec::new();
+            for guard in executor.dead_letters.prefix(&prefix).take(limit.into()) {
+                let (stored_key, bytes) = guard.into_inner()?;
+                let event_id: [u8; 16] = stored_key.as_ref()[prefix.len()..]
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("malformed dead letter key"))?;
+                let stored: StoredDeadLetter = bitcode::decode(bytes.as_ref())
+                    .map_err(|e| anyhow::anyhow!("Failed to deserialize dead letter: {}", e))?;
+                letters.push(evento_core::DeadLetter {
+                    subscription: key.clone(),
+                    event_id: Ulid::from_bytes(event_id),
+                    aggregate_type: stored.aggregate_type,
+                    aggregate_id: stored.aggregate_id,
+                    name: stored.name,
+                    tenant: stored.tenant,
+                    routing_key: stored.routing_key,
+                    version: stored.version,
+                    error: stored.error,
+                    attempts: stored.attempts,
+                    timestamp: stored.timestamp,
+                });
+            }
+            Ok(letters)
+        })
+        .await?
+    }
+
+    async fn dead_letter_count(&self, key: String) -> anyhow::Result<u64> {
+        let executor = self.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let mut count = 0u64;
+            for guard in executor
+                .dead_letters
+                .prefix(Fjall::dead_letter_prefix(&key))
+            {
+                guard.key()?;
+                count += 1;
+            }
+            Ok(count)
+        })
+        .await?
+    }
+
+    async fn delete_dead_letter(&self, key: String, event_id: Ulid) -> anyhow::Result<()> {
+        let executor = self.clone();
+
+        tokio::task::spawn_blocking(move || {
+            executor
+                .dead_letters
+                .remove(Fjall::dead_letter_key(&key, event_id))?;
+            Ok(())
         })
         .await?
     }

@@ -559,6 +559,25 @@ async fn remote_undecodable_event_is_skipped() -> anyhow::Result<()> {
     evento_test::undecodable_event_is_skipped(&server.client).await
 }
 
+/// Dead letters do not cross the wire: a subscription that asks for them
+/// over a bare client is refused before it processes anything, instead of
+/// stopping on its first poisoned event. Behind a `Sidecar` they are kept in
+/// the local store, with the cursor (see `tests/sidecar.rs`).
+#[tokio::test]
+async fn remote_dead_lettering_is_refused_up_front() -> anyhow::Result<()> {
+    let server = setup().await?;
+    let err = evento::subscription::SubscriptionBuilder::<Client>::new("remote-dead-letters")
+        .dead_letter()
+        .run_once(&server.client)
+        .await
+        .expect_err("a remote client keeps no dead letters");
+    assert!(
+        format!("{err:#}").contains("dead letters are not supported"),
+        "{err:#}"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn remote_tenant_projection_subscription() -> anyhow::Result<()> {
     let server = setup().await?;

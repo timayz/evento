@@ -360,6 +360,12 @@ async fn turso_undecodable_event_is_skipped() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn turso_dead_letters() -> anyhow::Result<()> {
+    let executor = Turso::in_memory().await?;
+    evento_test::dead_letters(&executor).await
+}
+
+#[tokio::test]
 async fn turso_tenant_projection_subscription() -> anyhow::Result<()> {
     let executor = Turso::in_memory().await?;
     evento_test::tenant_projection_subscription(&executor).await

@@ -160,6 +160,39 @@ pub enum Subscriber {
     UpdatedAt,
 }
 
+/// Column identifiers for the `dead_letter` table.
+///
+/// Used with sea-query for type-safe SQL query construction. The table backs
+/// the events a subscription gave up on ([`Executor::save_dead_letter`] and
+/// the methods beside it); its primary key is `(subscriber, event_id)`.
+#[derive(Iden)]
+pub enum DeadLetter {
+    /// The table name: `dead_letter`
+    Table,
+    /// Storage key of the subscription that gave the event up
+    Subscriber,
+    /// Event ID (ULID)
+    EventId,
+    /// The event's aggregate type
+    AggregatorType,
+    /// The event's aggregate ID
+    AggregatorId,
+    /// The event's name
+    Name,
+    /// The tenant of the event's stream
+    Tenant,
+    /// The event's routing key
+    RoutingKey,
+    /// The event's version in its stream
+    Version,
+    /// The last error
+    Error,
+    /// How many times the handler ran on the event
+    Attempts,
+    /// When the event was given up on, in seconds
+    Timestamp,
+}
+
 /// Type alias for MySQL executor.
 ///
 /// Equivalent to `Sql<sqlx::MySql>`.
@@ -984,6 +1017,167 @@ where
             .and_where(Expr::col(Event::Tenant).eq(Expr::value(tenant)))
             .and_where(Expr::col(Event::AggregatorType).eq(Expr::value(aggregate_type)))
             .and_where(Expr::col(Event::AggregatorId).eq(Expr::value(aggregate_id)))
+            .to_owned();
+
+        let (sql, values) = build_sqlx::<DB, _>(&statement);
+
+        sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
+
+    async fn save_dead_letter(&self, letter: evento_core::DeadLetter) -> anyhow::Result<()> {
+        let statement = Query::insert()
+            .into_table(DeadLetter::Table)
+            .columns([
+                DeadLetter::Subscriber,
+                DeadLetter::EventId,
+                DeadLetter::AggregatorType,
+                DeadLetter::AggregatorId,
+                DeadLetter::Name,
+                DeadLetter::Tenant,
+                DeadLetter::RoutingKey,
+                DeadLetter::Version,
+                DeadLetter::Error,
+                DeadLetter::Attempts,
+                DeadLetter::Timestamp,
+            ])
+            .values_panic([
+                letter.subscription.into(),
+                letter.event_id.to_string().into(),
+                letter.aggregate_type.into(),
+                letter.aggregate_id.into(),
+                letter.name.into(),
+                letter.tenant.into(),
+                letter.routing_key.into(),
+                i64::from(letter.version).into(),
+                letter.error.into(),
+                i64::from(letter.attempts).into(),
+                i64::try_from(letter.timestamp)?.into(),
+            ])
+            // The event is the same; what was learnt since replaces the rest.
+            .on_conflict(
+                OnConflict::columns([DeadLetter::Subscriber, DeadLetter::EventId])
+                    .update_columns([
+                        DeadLetter::Error,
+                        DeadLetter::Attempts,
+                        DeadLetter::Timestamp,
+                    ])
+                    .to_owned(),
+            )
+            .to_owned();
+
+        let (sql, values) = build_sqlx::<DB, _>(&statement);
+
+        sqlx::query_with::<DB, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
+
+    async fn dead_letters(
+        &self,
+        key: String,
+        limit: u16,
+    ) -> anyhow::Result<Vec<evento_core::DeadLetter>> {
+        let statement = Query::select()
+            .columns([
+                DeadLetter::Subscriber,
+                DeadLetter::EventId,
+                DeadLetter::AggregatorType,
+                DeadLetter::AggregatorId,
+                DeadLetter::Name,
+                DeadLetter::Tenant,
+                DeadLetter::RoutingKey,
+                DeadLetter::Version,
+                DeadLetter::Error,
+                DeadLetter::Attempts,
+                DeadLetter::Timestamp,
+            ])
+            .from(DeadLetter::Table)
+            .and_where(Expr::col(DeadLetter::Subscriber).eq(Expr::value(key)))
+            // In event-id order: ULIDs, so the oldest event first.
+            .order_by(DeadLetter::EventId, sea_query::Order::Asc)
+            .limit(limit.into())
+            .to_owned();
+
+        let (sql, values) = build_sqlx::<DB, _>(&statement);
+
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            i64,
+            String,
+            i64,
+            i64,
+        )> = sqlx::query_as_with::<DB, _, _>(sqlx::AssertSqlSafe(sql.as_str()), values)
+            .fetch_all(&self.pool)
+            .await?;
+
+        rows.into_iter()
+            .map(
+                |(
+                    subscription,
+                    event_id,
+                    aggregate_type,
+                    aggregate_id,
+                    name,
+                    tenant,
+                    routing_key,
+                    version,
+                    error,
+                    attempts,
+                    timestamp,
+                )| {
+                    Ok(evento_core::DeadLetter {
+                        subscription,
+                        event_id: Ulid::from_string(&event_id)?,
+                        aggregate_type,
+                        aggregate_id,
+                        name,
+                        tenant,
+                        routing_key,
+                        version: u16::try_from(version)?,
+                        error,
+                        attempts: u32::try_from(attempts)?,
+                        timestamp: u64::try_from(timestamp)?,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    async fn dead_letter_count(&self, key: String) -> anyhow::Result<u64> {
+        let statement = Query::select()
+            .expr(Expr::col(DeadLetter::EventId).count())
+            .from(DeadLetter::Table)
+            .and_where(Expr::col(DeadLetter::Subscriber).eq(Expr::value(key)))
+            .to_owned();
+
+        let (sql, values) = build_sqlx::<DB, _>(&statement);
+
+        let (count,): (i64,) =
+            sqlx::query_as_with::<DB, (i64,), _>(sqlx::AssertSqlSafe(sql.as_str()), values)
+                .fetch_one(&self.pool)
+                .await?;
+
+        Ok(u64::try_from(count)?)
+    }
+
+    async fn delete_dead_letter(&self, key: String, event_id: Ulid) -> anyhow::Result<()> {
+        let statement = Query::delete()
+            .from_table(DeadLetter::Table)
+            .and_where(Expr::col(DeadLetter::Subscriber).eq(Expr::value(key)))
+            .and_where(Expr::col(DeadLetter::EventId).eq(Expr::value(event_id.to_string())))
             .to_owned();
 
         let (sql, values) = build_sqlx::<DB, _>(&statement);

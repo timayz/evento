@@ -61,8 +61,8 @@ mod cluster_journal;
 pub use cluster_journal::TursoJournal;
 pub use executor::{Clock, Turso, BUSY_TIMEOUT};
 pub use query::{
-    execute, fetch_all, fetch_one, fetch_optional, EventTable, MetaTable, SnapshotTable, Statement,
-    SubscriberTable,
+    execute, fetch_all, fetch_one, fetch_optional, DeadLetterTable, EventTable, MetaTable,
+    SnapshotTable, Statement, SubscriberTable,
 };
 pub use reader::{Bind, Reader};
 pub use row::{FromRow, FromValue, Row, Text};
@@ -80,7 +80,8 @@ use migrate::{Migration, Migrations};
 #[cfg(feature = "rw")]
 pub type RwTurso = evento_core::Rw<Turso, Turso>;
 
-/// The event store schema: `event`, `snapshot`, `subscriber` and `meta`.
+/// The event store schema: `event`, `snapshot`, `subscriber` and `meta`
+/// (`dead_letter` comes with [`DEAD_LETTER`]).
 const INIT: Migration<'static> = up_file!("../migrations/0001_init.sql");
 
 /// `idx_event_type_name_cursor`: a subscription's reads by event name seek
@@ -92,6 +93,9 @@ const EVENT_TYPE_NAME_CURSOR: Migration<'static> =
 /// copy) seeks its cursor instead of scanning and sorting the table.
 const EVENT_CURSOR: Migration<'static> = up_file!("../migrations/0004_event_cursor.sql");
 
+/// `dead_letter`: the events a subscription gave up on.
+const DEAD_LETTER: Migration<'static> = up_file!("../migrations/0005_dead_letter.sql");
+
 /// The cluster journal's tables (feature `cluster`).
 #[cfg(feature = "cluster")]
 const CLUSTER: Migration<'static> = up_file!("../migrations/0002_cluster.sql");
@@ -100,8 +104,10 @@ const CLUSTER: Migration<'static> = up_file!("../migrations/0002_cluster.sql");
 /// [`Turso::open`] applies the pending ones. Each applied migration is
 /// recorded in [`migrate::MIGRATIONS_TABLE`], so an application's own
 /// [`Migrations`] (under its own name) can share the database.
-pub const MIGRATIONS: Migrations<'static> =
-    Migrations::new("evento", &[INIT, EVENT_TYPE_NAME_CURSOR, EVENT_CURSOR]);
+pub const MIGRATIONS: Migrations<'static> = Migrations::new(
+    "evento",
+    &[INIT, EVENT_TYPE_NAME_CURSOR, EVENT_CURSOR, DEAD_LETTER],
+);
 
 /// The cluster journal's schema migrations, under the app name
 /// `evento-cluster`; every [`TursoJournal`] constructor applies the pending
