@@ -5144,10 +5144,16 @@ pub async fn undecodable_event_is_skipped<E: Executor + Clone>(executor: &E) -> 
     use evento::subscription::Undecodable;
 
     let id = Ulid::generate().to_string();
+    // Three streams, each at version 1: within one millisecond of the store's
+    // clock they would be read in the order of their random ids, so the
+    // writes are spaced for the poison event to sit between the two others.
+    let apart = || tokio::time::sleep(std::time::Duration::from_millis(2));
     open_in(executor, "", &id, 1).await?;
+    apart().await;
     let mut poison = raw_opened(&id, "poison-tenant");
     poison.data = vec![0xFF, 0xFF, 0xFF];
     executor.write(vec![poison]).await?;
+    apart().await;
     open_in(executor, "after", &id, 2).await?;
 
     // Default: skipped, and the events on either side are delivered.
