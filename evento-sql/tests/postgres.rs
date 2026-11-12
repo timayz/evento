@@ -1,3 +1,6 @@
+//! The shared executor scenarios and the SQL ones over Postgres; needs
+//! `make up`.
+
 use evento::sql::Sql;
 use sqlx::PgPool;
 

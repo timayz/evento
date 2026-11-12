@@ -790,12 +790,6 @@ impl Sim {
         }
     }
 
-    /// Restarts node `i` with `config`, over a fresh store (see
-    /// [`restart_as`](Self::restart_as)).
-    async fn restart_with(&mut self, i: usize, config: NodeConfig) {
-        self.restart_as(i, config, Restart::EmptyStore).await;
-    }
-
     /// Restarts node `i`: aborts its loops (dropping in-memory state, and
     /// whatever its journal had staged but not flushed), rebuilds a fresh
     /// [`Node`] with `config` over the durable journal and a data store as

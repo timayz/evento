@@ -1,3 +1,6 @@
+//! The macro expansions that must compile, and the errors of those that
+//! must not.
+
 #[test]
 fn ui() {
     let t = trybuild::TestCases::new();

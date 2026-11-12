@@ -1482,7 +1482,6 @@ dependencies = [
  "evento-macro",
  "futures-util",
  "hex",
- "rand 0.10.3",
  "serde",
  "sha3",
  "thiserror",

@@ -1,3 +1,6 @@
+//! The shared executor scenarios and the SQL ones over SQLite, on one pool
+//! and on a read/write pair.
+
 use evento::sql::{RwSqlite, Sql};
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},

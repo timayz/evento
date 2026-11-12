@@ -1,3 +1,9 @@
+//! The scenarios the dialect suites share, each over a pool of its own
+//! database, and the pool they migrate.
+//!
+//! Each suite compiles this module on its own and uses part of it.
+#![allow(dead_code)]
+
 use std::sync::Arc;
 
 use evento::{
