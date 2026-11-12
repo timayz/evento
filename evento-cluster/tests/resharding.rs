@@ -1253,6 +1253,17 @@ async fn strand_a_vote_on_a_moved_key() -> (Arc<InMemoryNetwork>, Vec<TestNode>,
     }
     await_layout(&nodes[0].topology, &moved).await;
     await_layout(&nodes[5].topology, &moved).await;
+    // The topology shows the layout before the activation, which takes the
+    // replica lock, forgets the vote.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while nodes[5].node.metrics().votes_forgotten == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the activation never forgot the vote on the moved key: {:?}",
+            nodes[5].node.metrics()
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     (net, nodes, moved)
 }
 
