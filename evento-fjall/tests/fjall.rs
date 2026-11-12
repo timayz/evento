@@ -1,3 +1,5 @@
+//! The shared executor scenarios over a temporary Fjall keyspace.
+
 use evento_fjall::Fjall;
 
 #[tokio::test]

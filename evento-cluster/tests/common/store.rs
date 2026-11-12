@@ -189,7 +189,7 @@ impl DataStore for FaultStore {
         if self.apply_failing.load(Ordering::SeqCst)
             || self
                 .applies_to_fail
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                 .is_ok()
             || self.seeded_failure()
         {

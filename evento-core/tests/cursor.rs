@@ -1,9 +1,10 @@
+//! The in-memory cursor `Reader`: paging forward and backward, in both
+//! orders, checked against the edges the arguments select.
+
 use evento_core::{
-    cursor::{self, Args, Bind, Cursor, Edge, Order, PageInfo, ReadResult, Reader},
+    cursor::{Args, Bind, Cursor, Edge, PageInfo, Reader},
     Event,
 };
-use rand::{seq::IndexedRandom, RngExt};
-use std::collections::HashMap;
 use ulid::Ulid;
 
 #[test]
@@ -560,86 +561,6 @@ fn display_expected_assert(events: &[Event], edges: &[Edge<Event>]) {
             edge.node.timestamp
         );
     }
-}
-
-pub fn assert_read_result(
-    args: Args,
-    order: Order,
-    data: Vec<Event>,
-    result: ReadResult<Event>,
-) -> anyhow::Result<()> {
-    let data = cursor::Reader::new(data)
-        .args(args)
-        .order(order)
-        .execute()?;
-
-    assert_eq!(result.page_info, data.page_info);
-    assert_eq!(result.edges, data.edges);
-
-    Ok(())
-}
-
-pub fn get_data() -> Vec<Event> {
-    let aggregator_ids = [
-        Ulid::generate().to_string(),
-        Ulid::generate().to_string(),
-        Ulid::generate().to_string(),
-        Ulid::generate().to_string(),
-        Ulid::generate().to_string(),
-    ];
-
-    let aggregator_types = ["evento/Calcul", "evento/MyCalcul"];
-
-    let routing_keys = [
-        Some("us-east-1".to_owned()),
-        Some("eu-west-3".to_owned()),
-        None,
-    ];
-
-    let timestamps: Vec<u16> = vec![rand::random(), rand::random(), rand::random()];
-    let mut versions: HashMap<String, u16> = HashMap::new();
-    let mut data = vec![];
-
-    for _ in 0..10 {
-        let mut rng = rand::rng();
-        let aggregate_id = aggregator_ids
-            .choose(&mut rng)
-            .cloned()
-            .unwrap_or_else(|| Ulid::generate().to_string());
-
-        let routing_key = routing_keys.choose(&mut rng).cloned().unwrap_or(None);
-        let aggregate_type = aggregator_types
-            .choose(&mut rng)
-            .cloned()
-            .unwrap_or("Calcul");
-        let version = versions.entry(aggregate_id.to_owned()).or_default();
-        let timestamp = if rng.random_range(0..100) < 20 {
-            timestamps.choose(&mut rng).cloned()
-        } else {
-            None
-        }
-        .unwrap_or_else(|| rng.random()) as u64;
-
-        let event = Event {
-            id: Ulid::generate(),
-            name: "MessageSent".to_owned(),
-            aggregate_id,
-            aggregate_type: aggregate_type.to_owned(),
-            version: *version,
-            routing_key,
-            tenant: String::new(),
-            timestamp: timestamp as u64,
-            timestamp_subsec: 0,
-            data: Default::default(),
-            metadata: Default::default(),
-        };
-
-        data.push(event);
-
-        *version += 1;
-    }
-
-    data
 }
 
 /// Regression: when the number of matching rows equals `limit + 1`, the reader
