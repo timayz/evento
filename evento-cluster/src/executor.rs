@@ -946,4 +946,27 @@ impl<E: Executor + Clone> Executor for ClusterExecutor<E> {
             .delete_stream(tenant, aggregate_type, aggregate_id)
             .await
     }
+
+    // Dead letters live with the cursor they belong to, on this node's own
+    // store and not replicated: another node following the same key meets
+    // the event itself.
+    async fn save_dead_letter(&self, letter: evento_core::DeadLetter) -> anyhow::Result<()> {
+        self.local.save_dead_letter(letter).await
+    }
+
+    async fn dead_letters(
+        &self,
+        key: String,
+        limit: u16,
+    ) -> anyhow::Result<Vec<evento_core::DeadLetter>> {
+        self.local.dead_letters(key, limit).await
+    }
+
+    async fn dead_letter_count(&self, key: String) -> anyhow::Result<u64> {
+        self.local.dead_letter_count(key).await
+    }
+
+    async fn delete_dead_letter(&self, key: String, event_id: Ulid) -> anyhow::Result<()> {
+        self.local.delete_dead_letter(key, event_id).await
+    }
 }

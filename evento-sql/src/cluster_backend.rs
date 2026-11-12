@@ -14,7 +14,7 @@ use crate::cluster_journal::{
     ClusterAcceptors, ClusterCommands, ClusterMeta, ClusterMetadataLog, SqlJournal,
 };
 use crate::dialect::build_sqlx;
-use crate::sql::{Event, RowsAffected, Snapshot, Sql, SqlEvent, Subscriber};
+use crate::sql::{DeadLetter, Event, RowsAffected, Snapshot, Sql, SqlEvent, Subscriber};
 
 /// The table names, taken before any await: a `dyn Iden` is not `Sync`.
 fn names(tables: &[&dyn Iden]) -> Vec<String> {
@@ -69,6 +69,9 @@ where
             &Event::Table,
             &Snapshot::Table,
             &Subscriber::Table,
+            // With the cursors: the subscriptions start over, and give up
+            // again on what they must.
+            &DeadLetter::Table,
         ]))
         .await
     }

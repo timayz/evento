@@ -22,9 +22,9 @@ const JOURNAL_TABLES: [&str; 4] = [
     "cluster_acceptors",
 ];
 
-/// What a join empties: the events, the snapshots and the subscription
-/// cursors. `meta` (the commit clock) stays.
-const STORE_TABLES: [&str; 3] = ["event", "snapshot", "subscriber"];
+/// What a join empties: the events, the snapshots, the subscription cursors
+/// and, with them, the dead letters. `meta` (the commit clock) stays.
+const STORE_TABLES: [&str; 4] = ["event", "snapshot", "subscriber", "dead_letter"];
 
 fn delete_all(table: impl Iden + 'static) -> Prepared {
     query::prepare(&Query::delete().from_table(table).to_owned())

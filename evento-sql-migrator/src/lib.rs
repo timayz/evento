@@ -70,6 +70,7 @@
 //!   name and its lag `MAX(timestamp)` seek instead of scanning the type
 //! - [`M0010`] - Adds `idx_event_cursor`, so an unfiltered read of the whole log (the
 //!   cluster's join copy) seeks its cursor instead of scanning and sorting the table
+//! - [`M0011`] - Adds the `dead_letter` table: the events a subscription gave up on
 //!
 //! # Database Schema
 //!
@@ -122,6 +123,24 @@
 //! | `enabled` | BOOLEAN | Whether subscription is active |
 //! | `created_at` | TIMESTAMP | Creation timestamp |
 //! | `updated_at` | TIMESTAMP | Last update timestamp |
+//!
+//! ## Dead Letter Table
+//!
+//! The events a subscription gave up on; primary key `(subscriber, event_id)`:
+//!
+//! | Column | Type | Description |
+//! |--------|------|-------------|
+//! | `subscriber` | VARCHAR(255) | Storage key of the subscription |
+//! | `event_id` | VARCHAR(26) | Event ID (ULID format) |
+//! | `aggregator_type` | VARCHAR(255) | The event's aggregate root type |
+//! | `aggregator_id` | VARCHAR(255) | The event's aggregate root instance ID |
+//! | `name` | VARCHAR(255) | The event's type name |
+//! | `tenant` | VARCHAR(255) | Tenant of the event's stream |
+//! | `routing_key` | VARCHAR(255) | The event's routing key |
+//! | `version` | BIGINT | The event's sequence number |
+//! | `error` | TEXT | The last error |
+//! | `attempts` | BIGINT | How many times the handler ran on the event |
+//! | `timestamp` | BIGINT | When it was given up on (seconds) |
 
 use sqlx_migrator::migrator::SupportedDatabase;
 use sqlx_migrator::Migrator;
@@ -138,6 +157,7 @@ mod m0007;
 mod m0008;
 mod m0009;
 mod m0010;
+mod m0011;
 mod step;
 
 #[cfg(feature = "cluster")]
@@ -152,6 +172,7 @@ pub use m0007::M0007;
 pub use m0008::M0008;
 pub use m0009::M0009;
 pub use m0010::M0010;
+pub use m0011::M0011;
 
 /// Creates a new [`Migrator`] instance with all Evento migrations registered.
 ///
@@ -201,6 +222,7 @@ where
     M0008: sqlx_migrator::Migration<DB>,
     M0009: sqlx_migrator::Migration<DB>,
     M0010: sqlx_migrator::Migration<DB>,
+    M0011: sqlx_migrator::Migration<DB>,
 {
     let mut migrator = Migrator::default();
     migrator.add_migration(Box::new(InitMigration))?;
@@ -213,6 +235,7 @@ where
     migrator.add_migration(Box::new(M0008))?;
     migrator.add_migration(Box::new(M0009))?;
     migrator.add_migration(Box::new(M0010))?;
+    migrator.add_migration(Box::new(M0011))?;
     Ok(migrator)
 }
 
@@ -262,6 +285,7 @@ where
     M0008: sqlx_migrator::Migration<DB>,
     M0009: sqlx_migrator::Migration<DB>,
     M0010: sqlx_migrator::Migration<DB>,
+    M0011: sqlx_migrator::Migration<DB>,
     ClusterMigration: sqlx_migrator::Migration<DB>,
 {
     let mut migrator = Migrator::default();
@@ -275,6 +299,7 @@ where
     migrator.add_migration(Box::new(M0008))?;
     migrator.add_migration(Box::new(M0009))?;
     migrator.add_migration(Box::new(M0010))?;
+    migrator.add_migration(Box::new(M0011))?;
     // The optional evento-cluster consensus-journal tables.
     migrator.add_migration(Box::new(ClusterMigration))?;
     Ok(migrator)

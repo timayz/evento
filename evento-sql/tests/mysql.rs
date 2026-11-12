@@ -426,6 +426,12 @@ async fn mysql_undecodable_event_is_skipped() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn mysql_dead_letters() -> anyhow::Result<()> {
+    let executor = create_mysql_executor("dead_letters").await?;
+    evento_test::dead_letters(&executor).await
+}
+
+#[tokio::test]
 async fn mysql_tenant_projection_subscription() -> anyhow::Result<()> {
     let executor = create_mysql_executor("tenant_projection_subscription").await?;
     evento_test::tenant_projection_subscription(&executor).await

@@ -90,6 +90,37 @@ pub enum SubscriberTable {
     UpdatedAt,
 }
 
+/// Column identifiers for the `dead_letter` table: the events a subscription
+/// gave up on, one row per `(subscriber, event_id)`.
+#[derive(Iden, Clone, Copy)]
+pub enum DeadLetterTable {
+    /// The table name: `dead_letter`
+    #[iden = "dead_letter"]
+    Table,
+    /// Storage key of the subscription that gave the event up
+    Subscriber,
+    /// Event ID (ULID)
+    EventId,
+    /// The event's aggregate type
+    AggregatorType,
+    /// The event's aggregate ID
+    AggregatorId,
+    /// The event's name
+    Name,
+    /// The tenant of the event's stream
+    Tenant,
+    /// The event's routing key
+    RoutingKey,
+    /// The event's version in its stream
+    Version,
+    /// The last error
+    Error,
+    /// How many times the handler ran on the event
+    Attempts,
+    /// When the event was given up on (unix seconds)
+    Timestamp,
+}
+
 /// Column identifiers for the `meta` table.
 #[derive(Iden, Clone, Copy)]
 pub enum MetaTable {

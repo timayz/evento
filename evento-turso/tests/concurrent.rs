@@ -323,6 +323,11 @@ async fn concurrent_tenant_snapshots_are_isolated() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn concurrent_dead_letters() -> anyhow::Result<()> {
+    evento_test::dead_letters(&Turso::in_memory_concurrent().await?).await
+}
+
+#[tokio::test]
 async fn concurrent_delete_stream() -> anyhow::Result<()> {
     evento_test::delete_stream(&Turso::in_memory_concurrent().await?).await
 }

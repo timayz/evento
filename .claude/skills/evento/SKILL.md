@@ -393,6 +393,13 @@ sub.shutdown().await?;
   (retries exhausted, no `.continue_on_error()`), or `Panicked`. Await it to notice a
   dead subscription instead of discovering a stale read model later.
 - `.strict()` fails on an unhandled event; `.continue_on_error()` keeps going after a handler error.
+- `.dead_letter()` (with `.retry(n)`) is the saga mode between the two: a handler error is retried
+  on that event with back-off, then the event is recorded as a `DeadLetter` beside the cursor,
+  acknowledged, and the pass goes on. `.fault(|err| Some(Fault::Store | Fault::Event))` classifies
+  an error as the store's (fail the pass) or the event's own (dead-letter at once).
+  `exec.dead_letters(key, limit)` / `dead_letter_count(key)` list them (key = storage key, i.e.
+  `{routing_key}.{key}` under a default routing key); `builder.redeliver(exec, &letter)` re-runs one.
+  Not on an ephemeral subscription, nor over a bare remote client (use a `Sidecar`).
 - A payload that does not decode as the handled event is poison, not a handler error: logged,
   acknowledged and skipped by default; `.on_undecodable(Undecodable::Stop)` stops on it instead.
 - **Live bridge (SSE, WebSocket, fanout):** `.live(exec)` is the whole shape in one call —

@@ -1,7 +1,7 @@
 //! [`Fjall`] as a [`ClusterBackend`]: its consensus journal is a
 //! [`FjallJournal`] inside the same database (fjall locks a database per
 //! directory, so the two cannot be opened apart), and emptying the store for
-//! a join clears the event, index, cursor and snapshot keyspaces while the
+//! a join clears the event, index, cursor, snapshot and dead-letter keyspaces while the
 //! `cluster_*` keyspaces stay.
 
 use std::sync::Arc;
@@ -48,6 +48,8 @@ impl ClusterBackend for Fjall {
                 self.cursor_routing.clone(),
                 self.subscribers.clone(),
                 self.snapshots.clone(),
+                // With the cursors: the subscriptions start over.
+                self.dead_letters.clone(),
             ],
         )
         .await

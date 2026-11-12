@@ -317,6 +317,47 @@ pub struct SubscriberStatus {
     pub cursor: Option<Value>,
 }
 
+/// Longest [`DeadLetter::error`] a subscription records, in bytes: the text is
+/// cut at a character boundary below it. An error chain can carry a provider's
+/// whole response body; the row is for an operator's list, the full text is in
+/// the log line written with it.
+pub const MAX_DEAD_LETTER_ERROR_LEN: usize = 2000;
+
+/// An event a subscription gave up on and went past (see
+/// [`SubscriptionBuilder::dead_letter`](crate::subscription::SubscriptionBuilder::dead_letter)).
+///
+/// One row per `(subscription, event_id)`. It names the event instead of
+/// holding it: the event stays in its stream, where
+/// [`SubscriptionBuilder::redeliver`](crate::subscription::SubscriptionBuilder::redeliver)
+/// reads it back.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DeadLetter {
+    /// The subscription's storage key (its key behind its routing-key prefix).
+    pub subscription: String,
+    /// The event given up on.
+    pub event_id: Ulid,
+    /// The event's aggregate type.
+    pub aggregate_type: String,
+    /// The event's aggregate id.
+    pub aggregate_id: String,
+    /// The event's name.
+    pub name: String,
+    /// The tenant of the event's stream (`""` = default tenant).
+    pub tenant: String,
+    /// The routing key of the event.
+    pub routing_key: Option<String>,
+    /// The event's version in its stream.
+    pub version: u16,
+    /// The last error, as its `anyhow` chain on one line, cut at
+    /// [`MAX_DEAD_LETTER_ERROR_LEN`].
+    pub error: String,
+    /// How many times the handler ran on the event before it was given up
+    /// on; 0 for a payload that did not decode (the handler never ran).
+    pub attempts: u32,
+    /// When it was given up on, in seconds since the Unix epoch.
+    pub timestamp: u64,
+}
+
 /// Core trait for event storage backends.
 ///
 /// Implementations handle persisting events (`write`/`replicate`), querying
@@ -628,6 +669,47 @@ pub trait Executor: Send + Sync + 'static {
         let _ = (tenant, aggregate_type, aggregate_id);
         anyhow::bail!("delete_stream is not supported by this executor")
     }
+
+    /// Records an event a subscription gave up on, replacing the row the
+    /// same `(subscription, event_id)` already has: an event given up on
+    /// again — a crash before its acknowledge, a failed redelivery recorded
+    /// by the host — keeps one row.
+    ///
+    /// Dead letters are bookkeeping of the store that holds the
+    /// subscription's cursor, like the cursor itself: per node on a
+    /// replicated backend, where another node following the same key meets
+    /// the event on its own.
+    ///
+    /// The default refuses, as the three methods below do; backends that own
+    /// their storage (SQL, Turso, Fjall) implement them.
+    async fn save_dead_letter(&self, letter: DeadLetter) -> anyhow::Result<()> {
+        let _ = letter;
+        anyhow::bail!("dead letters are not supported by this executor")
+    }
+
+    /// The dead letters of subscription `key` (its storage key), `limit` at
+    /// most, in the order of their event ids: ULIDs, so the oldest event
+    /// first.
+    async fn dead_letters(&self, key: String, limit: u16) -> anyhow::Result<Vec<DeadLetter>> {
+        let _ = (key, limit);
+        anyhow::bail!("dead letters are not supported by this executor")
+    }
+
+    /// How many dead letters subscription `key` holds.
+    async fn dead_letter_count(&self, key: String) -> anyhow::Result<u64> {
+        let _ = key;
+        anyhow::bail!("dead letters are not supported by this executor")
+    }
+
+    /// Removes the dead letter of `(key, event_id)`: the event was
+    /// redelivered, or an operator dismissed it.
+    ///
+    /// Idempotent: removing a dead letter that does not exist is not an
+    /// error.
+    async fn delete_dead_letter(&self, key: String, event_id: Ulid) -> anyhow::Result<()> {
+        let _ = (key, event_id);
+        anyhow::bail!("dead letters are not supported by this executor")
+    }
 }
 
 /// Type-erased wrapper around any [`Executor`] implementation.
@@ -823,6 +905,22 @@ impl Executor for Evento {
         self.inner
             .delete_stream(tenant, aggregate_type, aggregate_id)
             .await
+    }
+
+    async fn save_dead_letter(&self, letter: DeadLetter) -> anyhow::Result<()> {
+        self.inner.save_dead_letter(letter).await
+    }
+
+    async fn dead_letters(&self, key: String, limit: u16) -> anyhow::Result<Vec<DeadLetter>> {
+        self.inner.dead_letters(key, limit).await
+    }
+
+    async fn dead_letter_count(&self, key: String) -> anyhow::Result<u64> {
+        self.inner.dead_letter_count(key).await
+    }
+
+    async fn delete_dead_letter(&self, key: String, event_id: Ulid) -> anyhow::Result<()> {
+        self.inner.delete_dead_letter(key, event_id).await
     }
 }
 
@@ -1089,6 +1187,23 @@ impl Executor for EventoGroup {
             .await
             .into_iter()
             .collect()
+    }
+
+    // With the subscriber state, on the first executor.
+    async fn save_dead_letter(&self, letter: DeadLetter) -> anyhow::Result<()> {
+        self.first().save_dead_letter(letter).await
+    }
+
+    async fn dead_letters(&self, key: String, limit: u16) -> anyhow::Result<Vec<DeadLetter>> {
+        self.first().dead_letters(key, limit).await
+    }
+
+    async fn dead_letter_count(&self, key: String) -> anyhow::Result<u64> {
+        self.first().dead_letter_count(key).await
+    }
+
+    async fn delete_dead_letter(&self, key: String, event_id: Ulid) -> anyhow::Result<()> {
+        self.first().delete_dead_letter(key, event_id).await
     }
 }
 
@@ -1705,6 +1820,23 @@ impl<R: Executor, W: Executor> Executor for Rw<R, W> {
             .delete_stream(tenant, aggregate_type, aggregate_id)
             .await
     }
+
+    // As the subscriber state: listed from `r`, written to `w`.
+    async fn save_dead_letter(&self, letter: DeadLetter) -> anyhow::Result<()> {
+        self.w.save_dead_letter(letter).await
+    }
+
+    async fn dead_letters(&self, key: String, limit: u16) -> anyhow::Result<Vec<DeadLetter>> {
+        self.r.dead_letters(key, limit).await
+    }
+
+    async fn dead_letter_count(&self, key: String) -> anyhow::Result<u64> {
+        self.r.dead_letter_count(key).await
+    }
+
+    async fn delete_dead_letter(&self, key: String, event_id: Ulid) -> anyhow::Result<()> {
+        self.w.delete_dead_letter(key, event_id).await
+    }
 }
 
 #[cfg(feature = "rw")]
@@ -1937,6 +2069,23 @@ impl<E: Executor, L: Executor> Executor for Sidecar<E, L> {
         self.events
             .delete_stream(tenant, aggregate_type, aggregate_id)
             .await
+    }
+
+    // Bookkeeping of the subscription, so with its cursor in `local`.
+    async fn save_dead_letter(&self, letter: DeadLetter) -> anyhow::Result<()> {
+        self.local.save_dead_letter(letter).await
+    }
+
+    async fn dead_letters(&self, key: String, limit: u16) -> anyhow::Result<Vec<DeadLetter>> {
+        self.local.dead_letters(key, limit).await
+    }
+
+    async fn dead_letter_count(&self, key: String) -> anyhow::Result<u64> {
+        self.local.dead_letter_count(key).await
+    }
+
+    async fn delete_dead_letter(&self, key: String, event_id: Ulid) -> anyhow::Result<()> {
+        self.local.delete_dead_letter(key, event_id).await
     }
 }
 

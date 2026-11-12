@@ -63,6 +63,7 @@ conformance!(
     subscription_shutdown_acknowledges_in_flight,
     subscription_start_from_latest,
     snapshot_projection_scope,
+    dead_letters,
 );
 
 /// The accounts opened, as seen by one test's subscription. One per test —

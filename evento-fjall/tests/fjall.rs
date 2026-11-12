@@ -343,6 +343,12 @@ async fn fjall_undecodable_event_is_skipped() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn fjall_dead_letters() -> anyhow::Result<()> {
+    let executor = Fjall::temporary()?;
+    evento_test::dead_letters(&executor).await
+}
+
+#[tokio::test]
 async fn fjall_tenant_projection_subscription() -> anyhow::Result<()> {
     let executor = Fjall::temporary()?;
     evento_test::tenant_projection_subscription(&executor).await

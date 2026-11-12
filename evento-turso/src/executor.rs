@@ -18,8 +18,8 @@ use evento_core::{
 };
 
 use crate::query::{
-    self, filter_conditions, EventRow, EventTable, MetaTable, Prepared, SnapshotTable,
-    SubscriberTable, EVENT_COLUMNS,
+    self, filter_conditions, DeadLetterTable, EventRow, EventTable, MetaTable, Prepared,
+    SnapshotTable, SubscriberTable, EVENT_COLUMNS,
 };
 use crate::write::{self, Body, WriteMode};
 use crate::Reader;
@@ -951,6 +951,129 @@ impl Executor for Turso {
                 .to_owned(),
         );
         self.write_one(Durability::Durable, q).await?;
+        Ok(())
+    }
+
+    async fn save_dead_letter(&self, letter: evento_core::DeadLetter) -> anyhow::Result<()> {
+        let q = query::prepare(
+            &Query::insert()
+                .into_table(DeadLetterTable::Table)
+                .columns([
+                    DeadLetterTable::Subscriber,
+                    DeadLetterTable::EventId,
+                    DeadLetterTable::AggregatorType,
+                    DeadLetterTable::AggregatorId,
+                    DeadLetterTable::Name,
+                    DeadLetterTable::Tenant,
+                    DeadLetterTable::RoutingKey,
+                    DeadLetterTable::Version,
+                    DeadLetterTable::Error,
+                    DeadLetterTable::Attempts,
+                    DeadLetterTable::Timestamp,
+                ])
+                .values_panic([
+                    letter.subscription.into(),
+                    letter.event_id.to_string().into(),
+                    letter.aggregate_type.into(),
+                    letter.aggregate_id.into(),
+                    letter.name.into(),
+                    letter.tenant.into(),
+                    letter.routing_key.into(),
+                    i64::from(letter.version).into(),
+                    letter.error.into(),
+                    i64::from(letter.attempts).into(),
+                    i64::try_from(letter.timestamp)?.into(),
+                ])
+                // The event is the same; what was learnt since replaces the
+                // rest.
+                .on_conflict(
+                    OnConflict::columns([DeadLetterTable::Subscriber, DeadLetterTable::EventId])
+                        .update_columns([
+                            DeadLetterTable::Error,
+                            DeadLetterTable::Attempts,
+                            DeadLetterTable::Timestamp,
+                        ])
+                        .to_owned(),
+                )
+                .to_owned(),
+        );
+        // On the cursors' connection, ahead of the acknowledge that passes
+        // the event: a crash that loses this row loses that acknowledge too,
+        // and the event is delivered again.
+        self.write_one(Durability::Relaxed, q).await?;
+        Ok(())
+    }
+
+    async fn dead_letters(
+        &self,
+        key: String,
+        limit: u16,
+    ) -> anyhow::Result<Vec<evento_core::DeadLetter>> {
+        let q = query::prepare(
+            &Query::select()
+                .columns([
+                    DeadLetterTable::Subscriber,
+                    DeadLetterTable::EventId,
+                    DeadLetterTable::AggregatorType,
+                    DeadLetterTable::AggregatorId,
+                    DeadLetterTable::Name,
+                    DeadLetterTable::Tenant,
+                    DeadLetterTable::RoutingKey,
+                    DeadLetterTable::Version,
+                    DeadLetterTable::Error,
+                    DeadLetterTable::Attempts,
+                    DeadLetterTable::Timestamp,
+                ])
+                .from(DeadLetterTable::Table)
+                .and_where(Expr::col(DeadLetterTable::Subscriber).eq(key))
+                // In event-id order: ULIDs, so the oldest event first.
+                .order_by(DeadLetterTable::EventId, sea_query::Order::Asc)
+                .limit(limit.into())
+                .to_owned(),
+        );
+        query::fetch_rows_only(&self.reader()?, q)
+            .await?
+            .iter()
+            .map(|row| {
+                Ok(evento_core::DeadLetter {
+                    subscription: query::text(row, 0)?,
+                    event_id: Ulid::from_string(&query::text(row, 1)?)?,
+                    aggregate_type: query::text(row, 2)?,
+                    aggregate_id: query::text(row, 3)?,
+                    name: query::text(row, 4)?,
+                    tenant: query::text(row, 5)?,
+                    routing_key: query::opt_text(row, 6)?,
+                    version: u16::try_from(query::int(row, 7)?)?,
+                    error: query::text(row, 8)?,
+                    attempts: u32::try_from(query::int(row, 9)?)?,
+                    timestamp: u64::try_from(query::int(row, 10)?)?,
+                })
+            })
+            .collect()
+    }
+
+    async fn dead_letter_count(&self, key: String) -> anyhow::Result<u64> {
+        let q = query::prepare(
+            &Query::select()
+                .expr(Expr::col(DeadLetterTable::EventId).count())
+                .from(DeadLetterTable::Table)
+                .and_where(Expr::col(DeadLetterTable::Subscriber).eq(key))
+                .to_owned(),
+        );
+        let row = query::fetch_optional_prepared(&self.reader()?, q).await?;
+        let count = row.map_or(Ok(0), |row| query::int(&row, 0))?;
+        Ok(u64::try_from(count)?)
+    }
+
+    async fn delete_dead_letter(&self, key: String, event_id: Ulid) -> anyhow::Result<()> {
+        let q = query::prepare(
+            &Query::delete()
+                .from_table(DeadLetterTable::Table)
+                .and_where(Expr::col(DeadLetterTable::Subscriber).eq(key))
+                .and_where(Expr::col(DeadLetterTable::EventId).eq(event_id.to_string()))
+                .to_owned(),
+        );
+        self.write_one(Durability::Relaxed, q).await?;
         Ok(())
     }
 }

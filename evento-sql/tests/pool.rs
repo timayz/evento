@@ -3,7 +3,9 @@ use std::sync::Arc;
 use evento::{
     cursor::{Args, Order, ReadResult, Value},
     sql::{Reader, Sql},
-    sql_migrator::{InitMigration, M0002, M0003, M0004, M0005, M0006, M0007, M0008, M0009, M0010},
+    sql_migrator::{
+        InitMigration, M0002, M0003, M0004, M0005, M0006, M0007, M0008, M0009, M0010, M0011,
+    },
     Event, EventFilter, Executor, RoutingKey, TenantFilter,
 };
 use evento_test::assert_read_result;
@@ -293,6 +295,7 @@ where
     M0008: sqlx_migrator::Migration<DB>,
     M0009: sqlx_migrator::Migration<DB>,
     M0010: sqlx_migrator::Migration<DB>,
+    M0011: sqlx_migrator::Migration<DB>,
     DB: sqlx_migrator::migrator::SupportedDatabase,
     sqlx_migrator::Migrator<DB>: Default,
 {
@@ -417,6 +420,7 @@ where
     M0008: sqlx_migrator::Migration<DB>,
     M0009: sqlx_migrator::Migration<DB>,
     M0010: sqlx_migrator::Migration<DB>,
+    M0011: sqlx_migrator::Migration<DB>,
     DB: sqlx_migrator::migrator::SupportedDatabase,
     sqlx_migrator::Migrator<DB>: Default,
 {
@@ -507,6 +511,7 @@ where
     M0008: sqlx_migrator::Migration<DB>,
     M0009: sqlx_migrator::Migration<DB>,
     M0010: sqlx_migrator::Migration<DB>,
+    M0011: sqlx_migrator::Migration<DB>,
     DB: sqlx_migrator::migrator::SupportedDatabase,
     sqlx_migrator::Migrator<DB>: Default,
 {
