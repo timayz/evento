@@ -1549,6 +1549,7 @@ dependencies = [
  "evento-fjall",
  "evento-test",
  "futures-util",
+ "rand 0.10.3",
  "rcgen",
  "serde",
  "tokio",

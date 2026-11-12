@@ -20,6 +20,7 @@ tokio.workspace = true
 futures-util = { workspace = true, features = ["sink"] }
 serde.workspace = true
 ulid.workspace = true
+rand.workspace = true
 bitcode = { workspace = true, features = ["serde"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 tokio-rustls = "0.26"

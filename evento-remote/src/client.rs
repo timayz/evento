@@ -4,7 +4,10 @@
 //! by one actor: it multiplexes requests dispatched to it over its TCP stream,
 //! demultiplexes replies by correlation id, and keeps the connection alive
 //! with capped exponential backoff (eager reconnect — the push channel must
-//! stay alive even while the client is idle-subscribed). Requests are
+//! stay alive even while the client is idle-subscribed). The delay between
+//! two attempts is drawn at random below the backoff, so the clients a server
+//! restart dropped together do not come back together
+//! ([`ClientBuilder::reconnect_backoff`]). Requests are
 //! round-robined across connections; pushed [`ServerFrame::Notify`] frames
 //! feed a local `write_watch` channel (from the first connection only — the
 //! watch is level-triggered, duplicates from every connection add nothing).
@@ -107,6 +110,26 @@ struct Dial {
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const RECONNECT_MIN: Duration = Duration::from_millis(100);
 const RECONNECT_MAX: Duration = Duration::from_secs(5);
+
+/// The reconnect schedule: the bound on the delay starts at `min` and doubles
+/// up to `max` with every failed attempt. The delay itself is drawn uniformly
+/// in `[0, bound]` (full jitter): a fixed schedule would bring every client
+/// that lost its connection at the same instant back at the same instants.
+#[derive(Clone, Copy)]
+struct Backoff {
+    min: Duration,
+    max: Duration,
+}
+
+impl Backoff {
+    /// The delay before the next attempt, drawn below `bound`, which then
+    /// doubles.
+    fn next_delay(&self, bound: &mut Duration) -> Duration {
+        let delay = bound.mul_f64(rand::random_range(0.0..=1.0));
+        *bound = bound.saturating_mul(2).min(self.max);
+        delay
+    }
+}
 /// Correlation id of the per-connection `Hello` exchange; regular ids start at 1.
 const HELLO_ID: u64 = 0;
 /// Capacity of each connection's outbound request queue.
@@ -155,6 +178,7 @@ pub struct ClientBuilder {
     dial: Dial,
     request_timeout: Duration,
     connections: usize,
+    backoff: Backoff,
 }
 
 impl ClientBuilder {
@@ -193,6 +217,21 @@ impl ClientBuilder {
         self
     }
 
+    /// Bounds of the delay between two reconnect attempts (default 100ms and
+    /// 5s; `max` is raised to `min` when below it). The bound starts at `min`
+    /// and doubles up to `max` with every failed attempt; each delay is drawn
+    /// at random in `[0, bound]`, so clients dropped together spread out
+    /// instead of redialling in step. Raise both when many clients share one
+    /// server: the wider the bound, the thinner the wave of `Hello`s a
+    /// restarted server takes.
+    pub fn reconnect_backoff(mut self, min: Duration, max: Duration) -> Self {
+        self.backoff = Backoff {
+            min,
+            max: max.max(min),
+        };
+        self
+    }
+
     /// Connects and performs the `Hello` exchange on every pooled connection.
     /// Fails fast when the server is unreachable or refuses the credential
     /// (the error then carries the [`Rejection`]); after that each connection
@@ -220,6 +259,7 @@ impl ClientBuilder {
                     watch_tx: (lane == 0).then(|| Arc::clone(&watch_tx)),
                     stable: Arc::clone(&stable),
                     request_timeout: self.request_timeout,
+                    backoff: self.backoff,
                 }
                 .run(framed),
             );
@@ -247,7 +287,7 @@ impl Client {
     }
 
     /// Starts building a client for `addr` (token, TLS, request timeout,
-    /// connection count). A host name in `addr` is looked up on every
+    /// connection count, reconnect backoff). A host name in `addr` is looked up on every
     /// connection attempt, not once here.
     pub fn builder(addr: impl Into<Address>) -> ClientBuilder {
         ClientBuilder {
@@ -258,6 +298,10 @@ impl Client {
             },
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             connections: 1,
+            backoff: Backoff {
+                min: RECONNECT_MIN,
+                max: RECONNECT_MAX,
+            },
         }
     }
 
@@ -565,6 +609,7 @@ struct Actor {
     watch_tx: Option<Arc<watch::Sender<u64>>>,
     stable: Stable,
     request_timeout: Duration,
+    backoff: Backoff,
 }
 
 impl Actor {
@@ -661,10 +706,10 @@ impl Actor {
         }
     }
 
-    /// Reconnects with capped exponential backoff. `None` when every client
-    /// clone has been dropped (nothing left to serve).
+    /// Reconnects with capped, jittered exponential backoff. `None` when every
+    /// client clone has been dropped (nothing left to serve).
     async fn reconnect(&mut self) -> Option<Framed<ClientStream, LengthDelimitedCodec>> {
-        let mut backoff = RECONNECT_MIN;
+        let mut bound = self.backoff.min;
         loop {
             if self.req_rx.is_closed() {
                 return None;
@@ -684,8 +729,7 @@ impl Actor {
                     } else {
                         tracing::debug!(?err, addr = %self.dial.addr, "reconnect failed, backing off");
                     }
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(RECONNECT_MAX);
+                    tokio::time::sleep(self.backoff.next_delay(&mut bound)).await;
                 }
             }
         }
@@ -772,4 +816,48 @@ async fn connect_and_hello(
     .map_err(|_| anyhow::anyhow!("hello timed out after {timeout:?}"))??;
 
     Ok((framed, hello))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_reconnect_delay_stays_below_a_doubling_bound() {
+        let backoff = Backoff {
+            min: Duration::from_millis(100),
+            max: Duration::from_secs(5),
+        };
+        let mut bound = backoff.min;
+        let mut bounds = Vec::new();
+        for _ in 0..8 {
+            let before = bound;
+            assert!(backoff.next_delay(&mut bound) <= before);
+            bounds.push(before.as_millis());
+        }
+        assert_eq!(bounds, [100, 200, 400, 800, 1600, 3200, 5000, 5000]);
+    }
+
+    #[test]
+    fn two_clients_do_not_share_a_reconnect_schedule() {
+        let backoff = Backoff {
+            min: Duration::from_secs(5),
+            max: Duration::from_secs(5),
+        };
+        let schedule = || {
+            let mut bound = backoff.min;
+            (0..16)
+                .map(|_| backoff.next_delay(&mut bound))
+                .collect::<Vec<_>>()
+        };
+        assert_ne!(schedule(), schedule());
+    }
+
+    #[test]
+    fn a_reconnect_maximum_below_the_minimum_is_raised_to_it() {
+        let builder = Client::builder("127.0.0.1:1")
+            .reconnect_backoff(Duration::from_secs(2), Duration::from_secs(1));
+        assert_eq!(builder.backoff.min, Duration::from_secs(2));
+        assert_eq!(builder.backoff.max, Duration::from_secs(2));
+    }
 }
