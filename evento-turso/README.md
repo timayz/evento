@@ -162,7 +162,8 @@ migrations (`CLUSTER_MIGRATIONS`, app `evento-cluster`). The journal writes in t
 its database is in: concurrent transactions next to a store opened with
 `open_concurrent`, plain ones otherwise. `Turso` also implements
 `evento_cluster::ClusterBackend` (`open_journal` over its own database,
-`empty_for_join` deleting `event`/`snapshot`/`subscriber` in one transaction,
+`empty_for_join` dropping `event`/`snapshot`/`subscriber` and creating them again in
+one transaction — a schema change per table rather than a delete per row —,
 `discard_journal` deleting the `cluster_*` tables).
 
 ## Learn more
