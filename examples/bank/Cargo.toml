@@ -8,3 +8,6 @@ publish = false
 evento.workspace = true
 bitcode.workspace = true
 anyhow.workspace = true
+
+# The examples keep out of the workspace lints (missing_docs).
+[lints]

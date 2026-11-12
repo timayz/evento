@@ -1,0 +1,6 @@
+# turso_core 0.8.3 does not compile with the `fts` feature on Rust 1.100
+# (`Vec::new_in` now resolves to the standard library's). Fixed upstream in
+# 0.9.0; drop this file once the workspace is on a release that has the fix.
+[toolchain]
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]
