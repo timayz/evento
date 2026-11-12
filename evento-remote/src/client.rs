@@ -4,8 +4,8 @@
 //! by one actor: it multiplexes requests dispatched to it over its TCP stream,
 //! demultiplexes replies by correlation id, and keeps the connection alive
 //! with capped exponential backoff (eager reconnect — the push channel must
-//! stay alive even while the client is idle-subscribed). The delay between
-//! two attempts is drawn at random below the backoff, so the clients a server
+//! stay alive even while the client is idle-subscribed). The delay before
+//! each attempt is drawn at random below the backoff, so the clients a server
 //! restart dropped together do not come back together
 //! ([`ClientBuilder::reconnect_backoff`]). Requests are
 //! round-robined across connections; pushed [`ServerFrame::Notify`] frames
@@ -123,7 +123,7 @@ struct Backoff {
 
 impl Backoff {
     /// The delay before the next attempt, drawn below `bound`, which then
-    /// doubles.
+    /// doubles. The first attempt is delayed like the others.
     fn next_delay(&self, bound: &mut Duration) -> Duration {
         let delay = bound.mul_f64(rand::random_range(0.0..=1.0));
         *bound = bound.saturating_mul(2).min(self.max);
@@ -217,11 +217,11 @@ impl ClientBuilder {
         self
     }
 
-    /// Bounds of the delay between two reconnect attempts (default 100ms and
-    /// 5s; `max` is raised to `min` when below it). The bound starts at `min`
-    /// and doubles up to `max` with every failed attempt; each delay is drawn
-    /// at random in `[0, bound]`, so clients dropped together spread out
-    /// instead of redialling in step. Raise both when many clients share one
+    /// Bounds of the delay before a reconnect attempt (default 100ms and 5s;
+    /// `max` is raised to `min` when below it). The bound starts at `min`
+    /// and doubles up to `max` with every failed attempt; each delay, the one
+    /// before the first attempt included, is drawn at random in `[0, bound]`,
+    /// so clients dropped together spread out instead of redialling in step. Raise both when many clients share one
     /// server: the wider the bound, the thinner the wave of `Hello`s a
     /// restarted server takes.
     pub fn reconnect_backoff(mut self, min: Duration, max: Duration) -> Self {
@@ -711,6 +711,10 @@ impl Actor {
     async fn reconnect(&mut self) -> Option<Framed<ClientStream, LengthDelimitedCodec>> {
         let mut bound = self.backoff.min;
         loop {
+            // The first attempt waits too: where a load balancer moved the
+            // name, it succeeds, and every client dropped with this one would
+            // otherwise say `Hello` to the new node at the same instant.
+            tokio::time::sleep(self.backoff.next_delay(&mut bound)).await;
             if self.req_rx.is_closed() {
                 return None;
             }
@@ -729,7 +733,6 @@ impl Actor {
                     } else {
                         tracing::debug!(?err, addr = %self.dial.addr, "reconnect failed, backing off");
                     }
-                    tokio::time::sleep(self.backoff.next_delay(&mut bound)).await;
                 }
             }
         }

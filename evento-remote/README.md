@@ -35,7 +35,7 @@ Writes through the server are pushed to every connected client, so client-side
 subscriptions wake with the same low latency as a local `write_watch`.
 
 A client that loses its connection redials on its own, with an exponential backoff
-whose every delay is drawn at random, so the clients a server restart dropped
+whose every delay, the first included, is drawn at random, so the clients a server restart dropped
 together come back spread out. `ClientBuilder::reconnect_backoff(min, max)` sets
 the bounds (100 ms and 5 s by default); stretch them when many clients share one
 server.
