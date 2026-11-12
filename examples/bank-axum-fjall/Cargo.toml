@@ -16,3 +16,6 @@ ulid.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+# The examples keep out of the workspace lints (missing_docs).
+[lints]
