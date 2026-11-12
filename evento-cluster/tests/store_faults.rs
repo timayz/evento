@@ -108,15 +108,20 @@ async fn an_apply_the_store_failed_is_retried_not_marked_applied() {
     assert_ne!(cluster.nodes[2].command_status(txn), Some(Status::Applied));
     assert!(cluster.stores[2].applied().is_empty());
 
-    // Once the store takes writes again, the next sweep applies it.
+    // Once the store takes writes again, the next sweep applies it. The
+    // sweep wakes the applier and runs an anti-entropy round, and both may
+    // write it: an import does not wait for a local apply in flight, the
+    // second write being idempotent in a store. So the store may log it
+    // twice, and nothing else.
     cluster.stores[2]
         .apply_failing
         .store(false, Ordering::SeqCst);
     cluster.nodes[2].sweep().await;
     assert!(
-        eventually(|| cluster.stores[2].applied() == vec![txn]).await,
+        eventually(|| cluster.stores[2].applied().contains(&txn)).await,
         "the decided transaction was never re-applied"
     );
+    assert!(cluster.stores[2].applied().iter().all(|&t| t == txn));
     assert_eq!(cluster.nodes[2].command_status(txn), Some(Status::Applied));
 }
 
