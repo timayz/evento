@@ -58,6 +58,10 @@ const SNAPSHOT_PAGE_SIZE: u16 = 4096;
 /// an aggregate back from its newest event.
 const HOLDS_PAGE_SIZE: u16 = 64;
 
+/// How many transactions [`ClusterExecutor::write`] coordinates for one
+/// write, in all, while recoveries invalidate them ([`Invalidated`]).
+const WRITE_ATTEMPTS: usize = 3;
+
 /// What a read is pinned to, when it can be pinned to one shard (see
 /// [`target`]).
 #[derive(Debug, PartialEq, Eq)]
@@ -689,39 +693,54 @@ impl<E: Executor + Clone> Executor for ClusterExecutor<E> {
         if events.is_empty() {
             return Err(WriteError::MissingData);
         }
-        // A refusal that clears on its own (the backlog cap, a rejoin in
-        // progress, a node still joining, one retired until its host reopens
-        // it, a key moving to other replicas, an open its peers have not
-        // confirmed yet, a journal rolled back until its host reopens the
-        // node) is `Unavailable`,
-        // so a caller can tell a transient condition from a failure and keep
-        // the typed cause.
-        let outcome = self.node.write(events).await.map_err(|err| {
-            if err.is::<BacklogAtCap>()
-                || err.is::<RejoinRequired>()
-                || err.is::<Joining>()
-                || err.is::<NodeClosed>()
-                || err.is::<TopologyChanging>()
-                || err.is::<OpenUnconfirmed>()
-                || err.is::<JournalRolledBack>()
-            {
-                WriteError::Unavailable(err)
-            } else {
-                WriteError::Unknown(err)
+        let mut attempt = 1;
+        loop {
+            // A refusal that clears on its own (the backlog cap, a rejoin in
+            // progress, a node still joining, one retired until its host
+            // reopens it, a key moving to other replicas, an open its peers
+            // have not confirmed yet, a journal rolled back until its host
+            // reopens the node) is `Unavailable`, so a caller can tell a
+            // transient condition from a failure and keep the typed cause.
+            let outcome = self.node.write_events(&events).await.map_err(|err| {
+                if err.is::<BacklogAtCap>()
+                    || err.is::<RejoinRequired>()
+                    || err.is::<Joining>()
+                    || err.is::<NodeClosed>()
+                    || err.is::<TopologyChanging>()
+                    || err.is::<OpenUnconfirmed>()
+                    || err.is::<JournalRolledBack>()
+                {
+                    WriteError::Unavailable(err)
+                } else {
+                    WriteError::Unknown(err)
+                }
+            })?;
+            if !outcome.invalidated {
+                return if outcome.conflict {
+                    Err(WriteError::InvalidOriginalVersion)
+                } else {
+                    Ok(())
+                };
             }
-        })?;
-        // A write a recovery invalidated never committed: nothing was
-        // written and no version was judged, so it is no conflict the
-        // caller could resolve by reloading — a transient refusal, with
-        // the typed cause, like the ones above (#466).
-        if outcome.invalidated {
-            Err(WriteError::Unavailable(
-                Invalidated { txn: outcome.txn }.into(),
-            ))
-        } else if outcome.conflict {
-            Err(WriteError::InvalidOriginalVersion)
-        } else {
-            Ok(())
+            // A write a recovery invalidated never committed: nothing was
+            // written and no version was judged (#466). Written again, as a
+            // fresh transaction, it is decided as if it came now — committed,
+            // or a version conflict if the stream moved meanwhile — so the
+            // caller need not tell this refusal from the others (#521).
+            // Still invalidated after the last attempt, it is a transient
+            // refusal, with the typed cause, like the ones above.
+            if attempt == WRITE_ATTEMPTS {
+                return Err(WriteError::Unavailable(
+                    Invalidated { txn: outcome.txn }.into(),
+                ));
+            }
+            tracing::debug!(
+                node = self.node.id().0,
+                txn = ?outcome.txn,
+                attempt,
+                "write invalidated by a recovery; writing it again"
+            );
+            attempt += 1;
         }
     }
 
