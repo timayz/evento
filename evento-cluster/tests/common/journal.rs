@@ -109,6 +109,8 @@ pub struct FaultJournal {
     metadata_failing: AtomicBool,
     /// While set, persisting the clock bound fails.
     clock_bound_failing: AtomicBool,
+    /// While `true`, persisting the clock bound waits.
+    clock_bound_held: tokio::sync::watch::Sender<bool>,
 }
 
 impl Default for FaultJournal {
@@ -160,6 +162,7 @@ impl FaultJournal {
             accept_failing: AtomicBool::new(false),
             metadata_failing: AtomicBool::new(false),
             clock_bound_failing: AtomicBool::new(false),
+            clock_bound_held: tokio::sync::watch::Sender::new(false),
         }
     }
 
@@ -185,6 +188,11 @@ impl FaultJournal {
 
     pub fn set_clock_bound_failing(&self, v: bool) {
         self.clock_bound_failing.store(v, Ordering::SeqCst);
+    }
+
+    /// While held, a clock-bound save waits, as on a stalled disk.
+    pub fn hold_clock_bound(&self, v: bool) {
+        self.clock_bound_held.send_replace(v);
     }
 
     /// Makes every flush take `delay` of (virtual) time, as an fsync does,
@@ -389,6 +397,11 @@ impl Journal for FaultJournal {
         self.durable.journal().load_acceptors().await
     }
     async fn save_clock_bound(&self, micros: u64) -> anyhow::Result<()> {
+        let _ = self
+            .clock_bound_held
+            .subscribe()
+            .wait_for(|held| !held)
+            .await;
         if self.clock_bound_failing.load(Ordering::SeqCst) || self.draw(|f| f.metadata) {
             anyhow::bail!("simulated clock-bound write failure");
         }
