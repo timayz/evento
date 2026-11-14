@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use evento_cluster::protocol::{Ballot, Key, Message, Status, Timestamp, TxnId};
+use evento_cluster::protocol::{Ballot, Condition, Key, Message, Status, Timestamp, TxnId};
 use evento_cluster::transport::{Envelope, InMemorySink};
 use evento_cluster::{
     DataStore, HybridLogicalClock, InMemoryDataStore, InMemoryJournal, InMemoryNetwork, Journal,
@@ -218,9 +218,10 @@ fn scripted(
                     });
                 }
                 Message::Commit { txn, .. } => replies.push(match peers {
-                    Peers::ApplyElsewhere | Peers::NackBelowBallotFirst => {
-                        Message::ReadOk { txn, ok: true }
-                    }
+                    Peers::ApplyElsewhere | Peers::NackBelowBallotFirst => Message::ReadOk {
+                        txn,
+                        condition: Condition::Holds,
+                    },
                     // The other node decided, from the reads it got.
                     Peers::ReadElsewhere => Message::Apply { txn, commit: true },
                 }),
@@ -377,7 +378,10 @@ fn taken_over(
                     keys,
                     events,
                 }),
-                Message::Commit { txn, .. } => Some(Message::ReadOk { txn, ok: true }),
+                Message::Commit { txn, .. } => Some(Message::ReadOk {
+                    txn,
+                    condition: Condition::Holds,
+                }),
                 _ => None,
             };
             if let Some(reply) = reply {

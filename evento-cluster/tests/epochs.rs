@@ -5,7 +5,9 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use evento_cluster::protocol::{Ballot, ConfigEntry, Key, Message, Status, Timestamp, TxnId};
+use evento_cluster::protocol::{
+    Ballot, Condition, ConfigEntry, Key, Message, Status, Timestamp, TxnId,
+};
 use evento_cluster::transport::{Envelope, InMemorySink};
 use evento_cluster::{
     Clock, DataStore, DynamicTopology, HybridLogicalClock, InMemoryDataStore, InMemoryJournal,
@@ -100,7 +102,10 @@ impl Peer {
                         ballot,
                         deps: Vec::new(),
                     }),
-                    Message::Commit { txn, .. } => Some(Message::ReadOk { txn, ok: true }),
+                    Message::Commit { txn, .. } => Some(Message::ReadOk {
+                        txn,
+                        condition: Condition::Holds,
+                    }),
                     Message::Apply { txn, .. } => Some(Message::Applied { txn }),
                     _ => None,
                 };

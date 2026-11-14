@@ -512,6 +512,53 @@ async fn enforces_optimistic_concurrency_across_the_cluster() {
     }
 }
 
+/// A write whose version skips ahead of its stream is a version conflict, as
+/// on a bare backend (#523). Committed, every replica would refuse its apply
+/// (`StoreBehind`) and ask for a rejoin that brings the same transaction
+/// back: the group would take no write again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_version_that_skips_ahead_is_a_conflict_and_poisons_no_replica() {
+    let cluster = ExecCluster::start(3);
+    cluster.execs[0]
+        .write(vec![event("acc", 1, "Opened")])
+        .await
+        .unwrap();
+    cluster.await_read(1, "acc", 1).await;
+
+    // Past the stream's next version.
+    let skipped = cluster.execs[0]
+        .write(vec![event("acc", 3, "Debited")])
+        .await;
+    assert!(
+        matches!(skipped, Err(WriteError::InvalidOriginalVersion)),
+        "{skipped:?}"
+    );
+    // The next version, then a hole within the transaction.
+    let holed = cluster.execs[1]
+        .write(vec![event("acc", 2, "Debited"), event("acc", 4, "Debited")])
+        .await;
+    assert!(
+        matches!(holed, Err(WriteError::InvalidOriginalVersion)),
+        "{holed:?}"
+    );
+
+    // The stream, and the group, take the next version as before.
+    cluster.execs[1]
+        .write(vec![event("acc", 2, "Debited")])
+        .await
+        .expect("the next version commits");
+    for node in 0..3 {
+        let events = cluster.await_read(node, "acc", 2).await;
+        assert_eq!(
+            events.iter().map(|e| e.version).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        let node = cluster.execs[node].node();
+        assert!(!node.rejoin_required(), "a replica was told to rejoin");
+        assert_eq!(node.metrics().execution_failures, 0);
+    }
+}
+
 /// Two hosts' skewed clocks cannot reverse an aggregate's versions: the
 /// stamps an event carries in are the writing host's provisional ones, and
 /// every replica re-stamps it from its transaction's agreed `execute_at`. So

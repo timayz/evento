@@ -132,6 +132,6 @@ pub mod protocol {
     };
     pub use crate::clock::{Ballot, Timestamp, TxnId};
     pub use crate::failure_detector::FailureDetector;
-    pub use crate::message::{CommandState, Key, Message, RecoveryRound, Status};
+    pub use crate::message::{CommandState, Condition, Key, Message, RecoveryRound, Status};
     pub use crate::store::AppliedEntry;
 }

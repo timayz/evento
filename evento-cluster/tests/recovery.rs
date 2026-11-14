@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use evento_cluster::protocol::{
-    Ballot, DurableMark, Key, Message, RecoveryRound, Status, Timestamp, TxnId,
+    Ballot, Condition, DurableMark, Key, Message, RecoveryRound, Status, Timestamp, TxnId,
 };
 use evento_cluster::transport::{Envelope, InMemorySink};
 use evento_cluster::{
@@ -91,9 +91,10 @@ impl Scripted {
                         ballot,
                         deps: Vec::new(),
                     }),
-                    Message::Commit { txn, .. } if cooperate => {
-                        Some(Message::ReadOk { txn, ok: true })
-                    }
+                    Message::Commit { txn, .. } if cooperate => Some(Message::ReadOk {
+                        txn,
+                        condition: Condition::Holds,
+                    }),
                     Message::Apply { txn, .. } if cooperate => Some(Message::Applied { txn }),
                     _ => None,
                 };
@@ -1436,9 +1437,17 @@ async fn a_replica_reads_its_own_forgotten_write_as_holding() {
         .await
         .unwrap();
     loop {
-        if let Message::ReadOk { txn: read, ok } = next(&mut coordinator).await {
+        if let Message::ReadOk {
+            txn: read,
+            condition,
+        } = next(&mut coordinator).await
+        {
             if read == txn {
-                assert!(ok, "the replica read its own write as a conflict");
+                assert_eq!(
+                    condition,
+                    Condition::Holds,
+                    "the replica read its own write as a conflict"
+                );
                 break;
             }
         }
