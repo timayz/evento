@@ -284,7 +284,7 @@ pub type RwSqlite = evento_core::Rw<Sqlite, Sqlite>;
 /// margin.
 pub struct Sql<DB: Database> {
     pub(crate) pool: Pool<DB>,
-    write_watch: tokio::sync::watch::Sender<u64>,
+    write_watch: evento_core::WriteSignal,
     stable_margin: Duration,
     /// Last DB-server clock sample: (when it was taken locally, DB `now()` in
     /// microseconds). Shared across clones so one re-sample per TTL serves
@@ -798,11 +798,12 @@ where
             seen.insert(stream, event.version);
         }
 
+        let wake = self.write_watch.prepare(&events);
         self.insert_events(events, true).await?;
 
-        // Wake any in-process subscriptions immediately instead of waiting for
-        // their next poll tick.
-        self.write_watch.send_modify(|v| *v += 1);
+        // Wake the in-process subscriptions that follow these events
+        // immediately instead of waiting for their next poll tick.
+        wake.fire();
 
         Ok(())
     }
@@ -814,14 +815,22 @@ where
 
         // Replication layers own ordering and versioning: persist the caller's
         // timestamps verbatim and skip the contiguity pre-check.
+        let wake = self.write_watch.prepare(&events);
         self.insert_events(events, false).await?;
-        self.write_watch.send_modify(|v| *v += 1);
+        wake.fire();
 
         Ok(())
     }
 
     fn write_watch(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
         Some(self.write_watch.subscribe())
+    }
+
+    fn write_watch_for(
+        &self,
+        interest: &evento_core::WriteInterest,
+    ) -> Option<tokio::sync::watch::Receiver<u64>> {
+        Some(self.write_watch.subscribe_to(interest.clone()))
     }
 
     async fn stable_timestamp(&self) -> anyhow::Result<Option<u64>> {
@@ -1325,7 +1334,7 @@ impl<D: Database> From<Pool<D>> for Sql<D> {
     fn from(value: Pool<D>) -> Self {
         Self {
             pool: value,
-            write_watch: tokio::sync::watch::channel(0).0,
+            write_watch: evento_core::WriteSignal::new(),
             stable_margin: DEFAULT_STABLE_MARGIN,
             clock_sample: Arc::new(Mutex::new(None)),
         }

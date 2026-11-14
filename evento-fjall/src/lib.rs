@@ -308,7 +308,7 @@ pub struct Fjall {
     /// Notifies in-process subscriptions after each successful `write` so they
     /// wake immediately instead of waiting for their next poll tick. Carries a
     /// monotonically increasing write generation.
-    write_tx: tokio::sync::watch::Sender<u64>,
+    write_tx: evento_core::WriteSignal,
     /// Owns the directory of a [`temporary`](Self::temporary) store, so it is
     /// removed once the last clone of this executor is gone (`None` for a store
     /// opened at a caller-chosen path).
@@ -533,7 +533,7 @@ impl Fjall {
             write_lock: Arc::new(Mutex::new(())),
             last_stamp: Arc::new(std::sync::atomic::AtomicU64::new(last_stamp)),
             write_persist_mode: PersistMode::SyncAll,
-            write_tx: tokio::sync::watch::channel(0).0,
+            write_tx: evento_core::WriteSignal::new(),
             temp_dir: None,
             db,
         };
@@ -1462,14 +1462,15 @@ impl Executor for Fjall {
             return Ok(());
         }
         let executor = self.clone();
+        let wake = self.write_tx.prepare(&events);
 
         tokio::task::spawn_blocking(move || executor.write_events(events, true))
             .await
             .map_err(|e| WriteError::Unknown(e.into()))??;
 
-        // Wake any in-process subscriptions immediately instead of waiting for
-        // their next poll tick.
-        self.write_tx.send_modify(|v| *v += 1);
+        // Wake the in-process subscriptions that follow these events
+        // immediately instead of waiting for their next poll tick.
+        wake.fire();
 
         Ok(())
     }
@@ -1479,19 +1480,27 @@ impl Executor for Fjall {
             return Ok(());
         }
         let executor = self.clone();
+        let wake = self.write_tx.prepare(&events);
 
         // Replication layers own ordering: persist caller timestamps verbatim.
         tokio::task::spawn_blocking(move || executor.write_events(events, false))
             .await
             .map_err(|e| WriteError::Unknown(e.into()))??;
 
-        self.write_tx.send_modify(|v| *v += 1);
+        wake.fire();
 
         Ok(())
     }
 
     fn write_watch(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
         Some(self.write_tx.subscribe())
+    }
+
+    fn write_watch_for(
+        &self,
+        interest: &evento_core::WriteInterest,
+    ) -> Option<tokio::sync::watch::Receiver<u64>> {
+        Some(self.write_tx.subscribe_to(interest.clone()))
     }
 
     async fn read(

@@ -417,6 +417,25 @@ pub trait Executor: Send + Sync + 'static {
         None
     }
 
+    /// Like [`write_watch`](Self::write_watch), for a watcher that reads with
+    /// a filter: the receiver is notified only by the writes that hold an
+    /// event `interest` matches.
+    ///
+    /// A subscription watches through this, so that on a store with many
+    /// subscriptions a write wakes the ones that follow it and no other. The
+    /// default hands out the unfiltered [`write_watch`](Self::write_watch),
+    /// which is always correct: a watcher woken for a write it does not
+    /// follow reads nothing. Backends that keep a
+    /// [`WriteSignal`](crate::WriteSignal) override it, and a wrapper
+    /// forwards it to the executor its writes land on.
+    fn write_watch_for(
+        &self,
+        interest: &crate::WriteInterest,
+    ) -> Option<tokio::sync::watch::Receiver<u64>> {
+        let _ = interest;
+        self.write_watch()
+    }
+
     /// An exclusive upper bound, in microseconds since the Unix epoch, on the
     /// event timestamps a subscription may safely process — or `None` for no
     /// bound (the default).
@@ -766,6 +785,13 @@ impl Executor for Evento {
         self.inner.write_watch()
     }
 
+    fn write_watch_for(
+        &self,
+        interest: &crate::WriteInterest,
+    ) -> Option<tokio::sync::watch::Receiver<u64>> {
+        self.inner.write_watch_for(interest)
+    }
+
     async fn stable_timestamp(&self) -> anyhow::Result<Option<u64>> {
         self.inner.stable_timestamp().await
     }
@@ -1010,6 +1036,13 @@ impl Executor for EventoGroup {
 
     fn write_watch(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
         self.first().write_watch()
+    }
+
+    fn write_watch_for(
+        &self,
+        interest: &crate::WriteInterest,
+    ) -> Option<tokio::sync::watch::Receiver<u64>> {
+        self.first().write_watch_for(interest)
     }
 
     async fn stable_timestamp(&self) -> anyhow::Result<Option<u64>> {
@@ -1677,6 +1710,13 @@ impl<R: Executor, W: Executor> Executor for Rw<R, W> {
         self.w.write_watch()
     }
 
+    fn write_watch_for(
+        &self,
+        interest: &crate::WriteInterest,
+    ) -> Option<tokio::sync::watch::Receiver<u64>> {
+        self.w.write_watch_for(interest)
+    }
+
     async fn stable_timestamp(&self) -> anyhow::Result<Option<u64>> {
         // The watermark gates what a subscription reads, and reads come from
         // `r`. With a genuine read replica the backend's margin must also
@@ -1925,6 +1965,13 @@ impl<E: Executor, L: Executor> Executor for Sidecar<E, L> {
         // Writes land on `events`; a remote client forwards the server's
         // notifications through this channel.
         self.events.write_watch()
+    }
+
+    fn write_watch_for(
+        &self,
+        interest: &crate::WriteInterest,
+    ) -> Option<tokio::sync::watch::Receiver<u64>> {
+        self.events.write_watch_for(interest)
     }
 
     async fn stable_timestamp(&self) -> anyhow::Result<Option<u64>> {
