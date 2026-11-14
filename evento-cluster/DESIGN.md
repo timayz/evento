@@ -815,7 +815,21 @@ backend (sql/fjall). Phases, in order:
   **a write reported committed is durable on a quorum** — is guarded by a storage-fault
   test (`tests/journal_faults.rs`): with a `FaultJournal` failing fsync on a quorum, a
   write must fail to commit rather than ack non-durably (the test fails on the pre-fix
-  code, durable on only 1 node). ✅ **Snapshots + compaction + log truncation** (bounds both the
+  code, durable on only 1 node). ✅ **No sync nothing waits on (#530):** a batch
+  that leaves no durability-gated send is not flushed at once — its records stay
+  staged for the next flush something waits on, or the lazy flusher's
+  (`NodeConfig::lazy_flush`, 50 ms). A node answers its own coordination's `ReadOk`
+  and `Applied` without the journal (#475), so past its vote a write it coordinates
+  leaves nothing to send: it costs the journal one fsync, not one per phase. Staged
+  records lost to a crash are a batch lost before its flush, which the protocol
+  already recovers from (the vote is durable; the store holds the events; the
+  restart recovers the transaction and re-applies it idempotently). And the
+  **applier takes the transactions ready together in one write of the store**
+  (`DataStore::apply_all`, up to `max_apply_batch`): none depends on another, so
+  the writes of concurrent writers share the store's fsync as they share the
+  journal's; a batch the store refuses (a re-apply, a store behind) is applied
+  one at a time. On a Turso file store a node alone went from 4.2 to 2.2 fsyncs
+  per write with one writer, and from 3.1 to 0.24 with twenty. ✅ **Snapshots + compaction + log truncation** (bounds both the
   journal and the in-memory `Replica.commands`/`by_key`, previously unbounded —
   the blocker for long-running deployments). A **redundancy watermark** (mirroring
   Accord's `redundantBefore`): below it every replica has applied everything, so

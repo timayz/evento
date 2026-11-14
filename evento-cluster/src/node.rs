@@ -30,7 +30,7 @@ use tokio::time::{Duration, Instant};
 
 use crate::api::{
     floor_millis, slot_of, snapshot_event_size, stamp_events, stamp_micros, validate_layout,
-    AcceptorRecord, AmnesiaFence, ConfigEntry, CopyPhase, CopyState, DataStore, Drained,
+    AcceptorRecord, AmnesiaFence, ConfigEntry, CopyPhase, CopyState, DataStore, Decided, Drained,
     DurableMark, FenceRecord, Journal, Layout, MessageSink, ShardId, ShardMap, StoreBehind,
     Topology, SLOTS,
 };
@@ -41,7 +41,7 @@ use crate::message::{
 };
 use crate::metrics::{Metrics, MetricsSnapshot};
 use crate::reconfig::{self, Fence, Floor, Transition};
-use crate::replica::{Refusal, Replica, RoutedRecovery, Sender};
+use crate::replica::{ApplyReady, Refusal, Replica, RoutedRecovery, Sender};
 use crate::transport::Envelope;
 
 /// Tunable timing/sizing parameters for a [`Node`]. [`Default`] reproduces the
@@ -90,6 +90,18 @@ pub struct NodeConfig {
     /// the applier, not in the batch: no reply waits for a write to the data
     /// store, see [`Node::start`].)
     pub max_journal_batch: usize,
+    /// Most decided transactions the applier enacts in one write to the data
+    /// store ([`DataStore::apply_all`]): the ones ready together, none
+    /// depending on another. Concurrent writes then share the store's fsync
+    /// as they share the journal's (#530). `1` applies one at a time.
+    pub max_apply_batch: usize,
+    /// How long journal records nothing waits on may stay staged before they
+    /// are flushed on their own (#530). A batch of messages, or of applies,
+    /// that leaves nothing to send — this node's own coordination is
+    /// answered without the journal, see [`Node::start`] — is not flushed at
+    /// once: its records ride the next flush something does wait on, or this
+    /// one. Zero flushes every batch, as before #530.
+    pub lazy_flush: Duration,
     /// Suspicion threshold for the phi-accrual failure detector: a coordinator
     /// whose φ exceeds this is presumed dead and its stalled transactions are
     /// recovered (adaptively, ahead of `recovery_timeout`). Higher tolerates more
@@ -181,6 +193,8 @@ impl Default for NodeConfig {
             compaction_margin: Duration::from_secs(1),
             truncate_interval: Duration::from_secs(5),
             max_journal_batch: 128,
+            max_apply_batch: 128,
+            lazy_flush: Duration::from_millis(50),
             phi_threshold: 8.0,
             acceptable_pause: Duration::from_millis(500),
             linearizable_reads: false,
@@ -869,9 +883,24 @@ impl Drop for Coordinating<'_> {
     }
 }
 
-/// A task aborted when this is dropped: the applier, which lives and dies
-/// with the inbox loop that owns it (see [`Node::start`]).
+/// A task aborted when this is dropped: the applier and the lazy flusher,
+/// which live and die with the inbox loop that owns them (see
+/// [`Node::start`]).
 struct AbortOnDrop(JoinHandle<()>);
+
+/// The journal flushes put off (see [`NodeConfig::lazy_flush`]): how many
+/// batches left their records staged, and how many of those a flush has
+/// covered since.
+#[derive(Default)]
+struct LazyFlush {
+    /// Batches whose flush was put off, ever.
+    deferred: AtomicU64,
+    /// The `deferred` count read before the latest successful flush began:
+    /// everything staged by those batches is durable.
+    flushed: AtomicU64,
+    /// Wakes the lazy flusher: a flush was put off.
+    wake: Notify,
+}
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
@@ -1556,6 +1585,8 @@ pub struct Node {
     /// for a retry — a decided, ready transaction may be waiting to be
     /// enacted. A wake while it works is kept (one permit), so none is lost.
     applier: Arc<Notify>,
+    /// The journal flushes put off (see [`NodeConfig::lazy_flush`]).
+    lazy: Arc<LazyFlush>,
     /// Bumped whenever an absent peer is counted again (see
     /// [`screen_absent`](Self::screen_absent)): a join waits on it for its
     /// contact's proof ([`await_reinstated`](Self::await_reinstated)).
@@ -1646,6 +1677,7 @@ impl Node {
             rolled_back: Arc::new(tokio::sync::watch::channel(false).0),
             applied: Arc::new(Signal::default()),
             applier: Arc::new(Notify::new()),
+            lazy: Arc::new(LazyFlush::default()),
             reinstated: Arc::new(Signal::default()),
             last_anti_entropy: Arc::new(Mutex::new(None)),
             metrics: Arc::new(Metrics::new()),
@@ -2124,19 +2156,28 @@ impl Node {
     /// one message in flight it behaves exactly as a per-message sync.
     ///
     /// **Applies off the inbox (#475):** the inbox loop only stages, reads
-    /// version conditions and answers; the applier applies, one decided,
-    /// ready transaction at a time, and acknowledges each once its record is
-    /// flushed. A store whose fsyncs stall thus delays its own
-    /// acknowledgements alone — never the votes and reads of the batch
-    /// behind it, which a coordinator's deadline would otherwise expire on.
+    /// version conditions and answers; the applier applies the decided,
+    /// ready transactions, up to
+    /// [`max_apply_batch`](NodeConfig::max_apply_batch) in one write to the
+    /// store, and acknowledges them once their records are flushed. A store
+    /// whose fsyncs stall thus delays its own acknowledgements alone — never
+    /// the votes and reads of the batch behind it, which a coordinator's
+    /// deadline would otherwise expire on.
+    ///
+    /// **No flush nothing waits on (#530):** a batch that leaves nothing to
+    /// send is not flushed at once (see [`release`](Self::release)); the
+    /// lazy flusher, a third task that stops with the other two, flushes
+    /// what stayed staged within [`lazy_flush`](NodeConfig::lazy_flush).
     pub fn start(&self, mut inbox: mpsc::Receiver<Envelope>) -> JoinHandle<()> {
         let node = self.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let applier = AbortOnDrop(tokio::spawn(node.clone().run_applier(Arc::clone(&stop))));
+        let flusher = AbortOnDrop(tokio::spawn(node.clone().run_lazy_flusher()));
         tokio::spawn(async move {
             // Aborted with this task; stopped, and waited for, when the
             // inbox closes.
             let mut applier = applier;
+            let _flusher = flusher;
             // An open over a journal that holds something asks the other
             // nodes to confirm it at once (#339); the sweep asks again.
             if !node.confirmed() {
@@ -2154,55 +2195,102 @@ impl Node {
                         Err(_) => break,
                     }
                 }
-                // Only release the batch's durability-gated replies once the fsync
-                // succeeds. If the flush fails (e.g. a disk error), withhold them —
-                // a node that could not persist must not ack a decision as durable.
-                // Dropping the replies is exactly the message loss quorums/recovery
-                // already tolerate, so the cluster makes progress via durable peers.
-                if node.journal.flush().await.is_ok() {
-                    node.metrics.record_flush();
-                    for (to, message) in sends {
-                        node.send(to, message).await;
-                    }
-                } else {
-                    tracing::warn!(
-                        node = node.id.0,
-                        "journal flush failed; withholding durability-gated sends"
-                    );
-                }
+                node.release(sends).await;
             }
             stop.store(true, Ordering::Release);
             node.applier.notify_one();
             let _ = (&mut applier.0).await;
+            // What a put-off flush left staged does not wait for a restart
+            // to be lost.
+            node.flush_journal().await;
         })
     }
 
+    /// Ends a batch of handled messages, or of applies: flushes the journal,
+    /// then performs the batch's durability-gated `sends`.
+    ///
+    /// The sends are only released once the fsync succeeds. If the flush
+    /// fails (e.g. a disk error), they are withheld — a node that could not
+    /// persist must not ack a decision as durable. Dropping the replies is
+    /// exactly the message loss quorums/recovery already tolerate, so the
+    /// cluster makes progress via durable peers.
+    ///
+    /// **With nothing to send, nothing waits on the flush, and it is put
+    /// off** (#530): the batch's records stay staged for the next flush
+    /// something does wait on, or the lazy flusher's. That is the batch of a
+    /// node's own coordination past its vote — its `ReadOk` and `Applied`
+    /// are answered without the journal (see [`answer`](Self::answer)) — so
+    /// a write a node coordinates costs its journal one fsync, the vote's,
+    /// not one per phase. Losing staged records to a crash is losing a batch
+    /// before its flush, which could always happen: no reply left the node
+    /// on their account, and a restart recovers the transactions from what
+    /// the journal does hold, as it does one whose apply it forgot (#309).
+    async fn release(&self, sends: Vec<(NodeId, Message)>) {
+        if sends.is_empty() && !self.settings.lazy_flush.is_zero() {
+            self.lazy.deferred.fetch_add(1, Ordering::AcqRel);
+            self.lazy.wake.notify_one();
+            return;
+        }
+        if self.flush_journal().await {
+            for (to, message) in sends {
+                self.send(to, message).await;
+            }
+        } else {
+            tracing::warn!(
+                node = self.id.0,
+                "journal flush failed; withholding durability-gated sends"
+            );
+        }
+    }
+
+    /// Flushes the journal: whether everything staged before the call is
+    /// durable.
+    async fn flush_journal(&self) -> bool {
+        // Read first: the flush covers what the batches counted so far
+        // staged, not what one counted during it does.
+        let deferred = self.lazy.deferred.load(Ordering::Acquire);
+        if self.journal.flush().await.is_err() {
+            return false;
+        }
+        self.metrics.record_flush();
+        self.lazy.flushed.fetch_max(deferred, Ordering::AcqRel);
+        true
+    }
+
+    /// The lazy flusher (see [`start`](Self::start)): once a flush was put
+    /// off, flushes within [`lazy_flush`](NodeConfig::lazy_flush) whatever no
+    /// other flush has covered meanwhile. A flush that fails is left to the
+    /// next one: the records stay staged.
+    async fn run_lazy_flusher(self) {
+        loop {
+            self.lazy.wake.notified().await;
+            tokio::time::sleep(self.settings.lazy_flush).await;
+            let pending = self.lazy.deferred.load(Ordering::Acquire)
+                > self.lazy.flushed.load(Ordering::Acquire);
+            if pending && !self.flush_journal().await {
+                tracing::warn!(
+                    node = self.id.0,
+                    "journal flush failed; the staged records wait for the next one"
+                );
+            }
+        }
+    }
+
     /// The applier loop (see [`start`](Self::start)): enacts the decided,
-    /// ready transactions one at a time, flushing the journal and sending
-    /// each one's acknowledgement before the next, so an acknowledgement
-    /// never waits behind another transaction's write to the store. Sleeps
+    /// ready transactions a batch at a time, flushing the journal and
+    /// sending the batch's acknowledgements before the next, so an
+    /// acknowledgement never waits behind a later batch's write to the
+    /// store. Sleeps
     /// until woken (`applier`) once nothing is ready, or once an apply the
     /// store failed is to be retried by the next drive (the sweep's, or a
     /// message's). Runs until `stop` is set and it is woken.
     async fn run_applier(self, stop: Arc<AtomicBool>) {
         loop {
             match self.apply_next().await {
-                Some(sends) => {
-                    // As `handle`: an acknowledgement is only sent once the
-                    // record behind it is durable; withheld, it is the loss
-                    // recovery already tolerates.
-                    if self.journal.flush().await.is_ok() {
-                        self.metrics.record_flush();
-                        for (to, message) in sends {
-                            self.send(to, message).await;
-                        }
-                    } else {
-                        tracing::warn!(
-                            node = self.id.0,
-                            "journal flush failed; withholding durability-gated sends"
-                        );
-                    }
-                }
+                // As `handle`: an acknowledgement is only sent once the
+                // record behind it is durable; withheld, it is the loss
+                // recovery already tolerates.
+                Some(sends) => self.release(sends).await,
                 None => {
                     if stop.load(Ordering::Acquire) {
                         return;
@@ -5387,117 +5475,212 @@ impl Node {
         out
     }
 
-    /// Enacts the next decided, ready transaction, in execution-timestamp
-    /// order, then reads (and holds the slot for) every undecided transaction
-    /// it freed. The applier's step (see [`start`](Self::start)): `None` when
-    /// nothing is ready, or when the store failed the apply — it stays
-    /// decided and un-applied, for the next drive (a message's, or the
-    /// sweep's) to retry. Stages its journal writes and returns the
-    /// (durability-gated) acknowledgements to send once the caller has
-    /// flushed; one for this node's own coordination is answered at once
-    /// (see [`answer`](Self::answer)).
+    /// Enacts the decided, ready transactions — up to
+    /// [`max_apply_batch`](NodeConfig::max_apply_batch) of them, in
+    /// execution-timestamp order — then reads (and holds the slot for) every
+    /// undecided transaction they freed. The applier's step (see
+    /// [`start`](Self::start)): `None` when nothing is ready, or when the
+    /// store failed the first apply — it stays decided and un-applied, for
+    /// the next drive (a message's, or the sweep's) to retry. Stages its
+    /// journal writes and returns the (durability-gated) acknowledgements to
+    /// send once the caller has flushed; one for this node's own
+    /// coordination is answered at once (see [`answer`](Self::answer)).
+    ///
+    /// The transactions ready together depend on none of each other (a
+    /// dependent is ready only once what it waits on is marked applied), so
+    /// the store takes them in one write where it can
+    /// ([`DataStore::apply_all`]): the writes of concurrent writers then
+    /// cost one fsync of the store between them, not one each (#530). Where
+    /// it cannot — it has no such write, or one of them is not the plain
+    /// next step of its streams — they are applied one at a time, as before.
     async fn apply_next(&self) -> Option<Vec<(NodeId, Message)>> {
         if !self.executes() {
             return None;
         }
+        let ready: Vec<ApplyReady> = {
+            let mut replica = self.replica.lock().expect("replica poisoned");
+            std::iter::from_fn(|| replica.next_apply())
+                .take(self.settings.max_apply_batch.max(1))
+                .collect()
+        };
+        if ready.is_empty() {
+            return None;
+        }
         let mut out: Vec<(NodeId, Message)> = Vec::new();
-        let mut apply = self
-            .replica
-            .lock()
-            .expect("replica poisoned")
-            .next_apply()?;
-        // Journaled first (#331): from the mark below on, a report may
-        // count it as applied, and a restart that lost its record would
-        // bring it back committed, its decision lost with it —
-        // undecidable once its peers compacted it. Staged ahead of the
-        // store, which keeps the store and the mark adjacent: a record
-        // ahead of a failed apply is replayed into the store on a
-        // restart, as any applied record is, and staged again by the
-        // retry meanwhile.
-        let applied = self
-            .replica
-            .lock()
-            .expect("replica poisoned")
-            .snapshot(apply.txn)
-            .map(|mut state| {
-                state.status = Status::Applied;
-                state.applied_conflict = Some(!apply.commit);
-                state
+        // What is left of each once its events moved to the store's batch.
+        struct Taken {
+            txn: TxnId,
+            commit: bool,
+            reply_to: NodeId,
+            staged: bool,
+        }
+        let mut taken: Vec<Taken> = Vec::with_capacity(ready.len());
+        let mut batch: Vec<Decided> = Vec::with_capacity(ready.len());
+        for mut apply in ready {
+            // Journaled first (#331): from the mark below on, a report may
+            // count it as applied, and a restart that lost its record would
+            // bring it back committed, its decision lost with it —
+            // undecidable once its peers compacted it. Staged ahead of the
+            // store, which keeps the store and the mark adjacent: a record
+            // ahead of a failed apply is replayed into the store on a
+            // restart, as any applied record is, and staged again by the
+            // retry meanwhile.
+            let applied = self
+                .replica
+                .lock()
+                .expect("replica poisoned")
+                .snapshot(apply.txn)
+                .map(|mut state| {
+                    state.status = Status::Applied;
+                    state.applied_conflict = Some(!apply.commit);
+                    state
+                });
+            let staged = match applied {
+                Some(state) => match self.journal.stage(&state).await {
+                    Ok(()) => true,
+                    Err(err) => {
+                        tracing::warn!(
+                            node = self.id.0,
+                            txn = ?apply.txn,
+                            %err,
+                            "cannot stage a transaction's state; withholding its reply"
+                        );
+                        false
+                    }
+                },
+                None => true,
+            };
+            // The events carry their writer's provisional stamps; the
+            // store gets the agreed ones (see `stamp_events`). The journal
+            // keeps the provisional ones — every apply re-derives the same.
+            // Only the keys this node owns now land in the store: a key a
+            // layout change took from it was dropped, and stays dropped.
+            apply.events = self.owned_now(apply.events);
+            stamp_events(apply.execute_at, &mut apply.events);
+            taken.push(Taken {
+                txn: apply.txn,
+                commit: apply.commit,
+                reply_to: apply.reply_to,
+                staged,
             });
-        let staged = match applied {
-            Some(state) => match self.journal.stage(&state).await {
-                Ok(()) => true,
+            batch.push(Decided {
+                txn: apply.txn,
+                execute_at: apply.execute_at,
+                events: apply.events,
+                commit: apply.commit,
+            });
+        }
+
+        // In one write, where the store has one and takes them all.
+        let together = batch.len() > 1
+            && match self.datastore.apply_all(&batch).await {
+                Ok(together) => together,
                 Err(err) => {
-                    tracing::warn!(
+                    tracing::debug!(
                         node = self.id.0,
-                        txn = ?apply.txn,
+                        transactions = batch.len(),
                         %err,
-                        "cannot stage a transaction's state; withholding its reply"
+                        "the store did not take the batch in one write; applying one at a time"
                     );
                     false
                 }
-            },
-            None => true,
-        };
-        // The events carry their writer's provisional stamps; the
-        // store gets the agreed ones (see `stamp_events`). The journal
-        // keeps the provisional ones — every apply re-derives the same.
-        // Only the keys this node owns now land in the store: a key a
-        // layout change took from it was dropped, and stays dropped.
-        apply.events = self.owned_now(apply.events);
-        stamp_events(apply.execute_at, &mut apply.events);
-        if let Err(err) = self
-            .datastore
-            .apply(apply.txn, apply.execute_at, apply.events, apply.commit)
-            .await
-        {
-            // Never mark (or acknowledge) what the store did not take:
-            // `Applied` is the promise that the effect is visible, and
-            // anti-entropy never ships an applied command again. Hand
-            // the transaction back and stop; the next drive (a message,
-            // or the sweep) retries it.
-            self.replica
-                .lock()
-                .expect("replica poisoned")
-                .release_apply(apply.txn);
-            self.metrics.record_execution_failure();
-            if self.store_behind(&err) {
-                tracing::error!(
-                    node = self.id.0,
-                    txn = ?apply.txn,
-                    %err,
-                    "the store is behind this node's journal; this node must rejoin \
-                     the group from a snapshot"
-                );
-            } else {
-                tracing::warn!(
-                    node = self.id.0,
-                    txn = ?apply.txn,
-                    %err,
-                    "cannot apply a decided transaction; retrying"
+            };
+        let mut applied = 0;
+        if together {
+            applied = taken.len();
+            self.metrics.record_applies_batched(applied);
+            for apply in &taken {
+                self.applied_here(
+                    &mut out,
+                    apply.txn,
+                    apply.commit,
+                    apply.reply_to,
+                    apply.staged,
                 );
             }
+        } else {
+            for (apply, decided) in taken.iter().zip(batch) {
+                if let Err(err) = self
+                    .datastore
+                    .apply(
+                        decided.txn,
+                        decided.execute_at,
+                        decided.events,
+                        decided.commit,
+                    )
+                    .await
+                {
+                    self.metrics.record_execution_failure();
+                    if self.store_behind(&err) {
+                        tracing::error!(
+                            node = self.id.0,
+                            txn = ?apply.txn,
+                            %err,
+                            "the store is behind this node's journal; this node must rejoin \
+                             the group from a snapshot"
+                        );
+                    } else {
+                        tracing::warn!(
+                            node = self.id.0,
+                            txn = ?apply.txn,
+                            %err,
+                            "cannot apply a decided transaction; retrying"
+                        );
+                    }
+                    break;
+                }
+                applied += 1;
+                self.applied_here(
+                    &mut out,
+                    apply.txn,
+                    apply.commit,
+                    apply.reply_to,
+                    apply.staged,
+                );
+            }
+        }
+        if applied < taken.len() {
+            // Never mark (or acknowledge) what the store did not take:
+            // `Applied` is the promise that the effect is visible, and
+            // anti-entropy never ships an applied command again. Hand the
+            // failed transaction back, and the ones behind it; the next
+            // drive (a message, or the sweep) retries them.
+            let mut replica = self.replica.lock().expect("replica poisoned");
+            for apply in &taken[applied..] {
+                replica.release_apply(apply.txn);
+            }
+        }
+        if applied == 0 {
             return None;
         }
+        // What they freed is read now, not at the next message.
+        out.extend(self.drive_reads().await);
+        Some(out)
+    }
+
+    /// Marks `txn`, which the store just took, applied, and queues its
+    /// acknowledgement to `reply_to` among `out` (see
+    /// [`apply_next`](Self::apply_next)).
+    fn applied_here(
+        &self,
+        out: &mut Vec<(NodeId, Message)>,
+        txn: TxnId,
+        commit: bool,
+        reply_to: NodeId,
+        staged: bool,
+    ) {
         self.replica
             .lock()
             .expect("replica poisoned")
-            .mark_applied(apply.txn, !apply.commit);
+            .mark_applied(txn, !commit);
         // Wake read barriers / read-your-writes waiters instead of
         // letting them poll the replica lock.
         self.applied.bump();
         // An apply the journal did not take is not acknowledged; a
         // restart re-applies it (idempotently) from its commit.
         if staged {
-            self.answer(
-                &mut out,
-                apply.reply_to,
-                Message::Applied { txn: apply.txn },
-            );
+            self.answer(out, reply_to, Message::Applied { txn });
         }
-        // What it freed is read now, not at the next message.
-        out.extend(self.drive_reads().await);
-        Some(out)
     }
 
     /// Reads (and holds the slot for) every committed, undecided transaction
@@ -14762,5 +14945,253 @@ mod tests {
         let merged = Node::merge_acceptors([z.as_slice()]);
         assert_eq!(merged[&1].promised, ballot(20, 2));
         assert!(Node::merge_acceptors(std::iter::empty()).is_empty());
+    }
+
+    /// A node alone in its group, started over `journal` and `store`.
+    fn alone(
+        journal: Arc<dyn Journal>,
+        store: Arc<dyn DataStore>,
+        config: NodeConfig,
+    ) -> (Node, Arc<InMemoryNetwork>, tokio::task::JoinHandle<()>) {
+        let id = NodeId(0);
+        let net = InMemoryNetwork::new();
+        let inbox = net.register(id);
+        let node = Node::new(
+            id,
+            Arc::new(StaticTopology::new(id, vec![id])) as Arc<dyn Topology>,
+            Arc::new(HybridLogicalClock::new(id)),
+            Arc::new(net.sink(id)) as Arc<dyn MessageSink>,
+            store,
+            journal,
+        )
+        .with_config(config);
+        let inbox_loop = node.start(inbox);
+        (node, net, inbox_loop)
+    }
+
+    /// The first event of the stream `id`.
+    fn opened(id: &str) -> Event {
+        Event {
+            id: ulid::Ulid::generate(),
+            aggregate_type: "test/Account".into(),
+            aggregate_id: id.into(),
+            version: 1,
+            name: "Opened".into(),
+            ..Default::default()
+        }
+    }
+
+    /// Issue #530: a write a node coordinates costs its journal one flush,
+    /// its vote's. The batches behind it — its commit, its decision, its
+    /// apply — leave nothing to send (the node answers its own coordination
+    /// without the journal), so nothing waits on their flush.
+    #[tokio::test(start_paused = true)]
+    async fn a_write_a_node_coordinates_alone_costs_its_journal_one_flush() {
+        let journal = Arc::new(CountingJournal::default());
+        let (node, _net, _loop) = alone(
+            Arc::clone(&journal) as Arc<dyn Journal>,
+            Arc::new(InMemoryDataStore::new()),
+            NodeConfig {
+                lazy_flush: Duration::from_secs(3600),
+                ..NodeConfig::default()
+            },
+        );
+        node.write(vec![opened("a")]).await.unwrap();
+
+        let before = journal.flushes.load(Ordering::SeqCst);
+        let staged = journal.stages.load(Ordering::SeqCst);
+        node.write(vec![opened("b")]).await.unwrap();
+        assert!(
+            journal.stages.load(Ordering::SeqCst) - staged > 1,
+            "the write staged a record per state"
+        );
+        assert_eq!(
+            journal.flushes.load(Ordering::SeqCst) - before,
+            1,
+            "only the vote waits on the journal"
+        );
+    }
+
+    /// Issue #530: what a put-off flush left staged is flushed within
+    /// `lazy_flush`, once, and a node with nothing staged flushes nothing.
+    #[tokio::test(start_paused = true)]
+    async fn records_nothing_waits_on_are_flushed_within_the_lazy_window() {
+        let journal = Arc::new(CountingJournal::default());
+        let config = NodeConfig::default();
+        let (node, _net, _loop) = alone(
+            Arc::clone(&journal) as Arc<dyn Journal>,
+            Arc::new(InMemoryDataStore::new()),
+            config,
+        );
+        node.write(vec![opened("a")]).await.unwrap();
+        tokio::time::sleep(config.lazy_flush * 2).await;
+
+        let before = journal.flushes.load(Ordering::SeqCst);
+        node.write(vec![opened("b")]).await.unwrap();
+        assert_eq!(journal.flushes.load(Ordering::SeqCst) - before, 1);
+        tokio::time::sleep(config.lazy_flush + Duration::from_millis(1)).await;
+        assert_eq!(
+            journal.flushes.load(Ordering::SeqCst) - before,
+            2,
+            "the lazy flusher flushed what the write left staged"
+        );
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert_eq!(
+            journal.flushes.load(Ordering::SeqCst) - before,
+            2,
+            "nothing was put off since"
+        );
+    }
+
+    /// With `lazy_flush` at zero every batch is flushed, as before #530.
+    #[tokio::test(start_paused = true)]
+    async fn without_a_lazy_window_every_batch_is_flushed() {
+        let journal = Arc::new(CountingJournal::default());
+        let (node, _net, _loop) = alone(
+            Arc::clone(&journal) as Arc<dyn Journal>,
+            Arc::new(InMemoryDataStore::new()),
+            NodeConfig {
+                lazy_flush: Duration::ZERO,
+                ..NodeConfig::default()
+            },
+        );
+        node.write(vec![opened("a")]).await.unwrap();
+        let before = journal.flushes.load(Ordering::SeqCst);
+        node.write(vec![opened("b")]).await.unwrap();
+        assert!(journal.flushes.load(Ordering::SeqCst) - before > 1);
+    }
+
+    /// A store that takes a batch in one write, each write a stall of
+    /// [`BatchStore::WRITE`], and counts its writes.
+    #[derive(Default)]
+    struct BatchStore {
+        inner: InMemoryDataStore,
+        /// The size of each batch taken in one write.
+        batches: std::sync::Mutex<Vec<usize>>,
+        /// Transactions applied one at a time.
+        singles: AtomicUsize,
+        /// Refuses every batch.
+        refusing: AtomicBool,
+    }
+
+    impl BatchStore {
+        const WRITE: Duration = Duration::from_millis(10);
+
+        fn writes(&self) -> usize {
+            self.batches.lock().unwrap().len() + self.singles.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl DataStore for BatchStore {
+        async fn version(
+            &self,
+            tenant: &str,
+            aggregate_type: &str,
+            aggregate_id: &str,
+        ) -> anyhow::Result<u16> {
+            self.inner
+                .version(tenant, aggregate_type, aggregate_id)
+                .await
+        }
+        async fn apply(
+            &self,
+            txn: TxnId,
+            execute_at: Timestamp,
+            events: Vec<Event>,
+            commit: bool,
+        ) -> anyhow::Result<()> {
+            tokio::time::sleep(Self::WRITE).await;
+            self.singles.fetch_add(1, Ordering::SeqCst);
+            self.inner.apply(txn, execute_at, events, commit).await
+        }
+        async fn apply_all(&self, batch: &[crate::Decided]) -> anyhow::Result<bool> {
+            anyhow::ensure!(
+                !self.refusing.load(Ordering::SeqCst),
+                "not the next step of its streams"
+            );
+            tokio::time::sleep(Self::WRITE).await;
+            for decided in batch {
+                self.inner
+                    .apply(
+                        decided.txn,
+                        decided.execute_at,
+                        decided.events.clone(),
+                        decided.commit,
+                    )
+                    .await?;
+            }
+            self.batches.lock().unwrap().push(batch.len());
+            Ok(true)
+        }
+    }
+
+    /// Writes `count` streams at once on `node`; every one commits.
+    async fn burst(node: &Node, count: usize) {
+        let mut writes = tokio::task::JoinSet::new();
+        for i in 0..count {
+            let node = node.clone();
+            writes.spawn(async move { node.write(vec![opened(&format!("acc-{i}"))]).await });
+        }
+        while let Some(outcome) = writes.join_next().await {
+            let outcome = outcome.expect("writer panicked").expect("committed");
+            assert!(!outcome.conflict);
+        }
+    }
+
+    /// Issue #530: the writes decided while the store takes one are applied
+    /// in one write of the store, not one each.
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_writes_are_applied_in_one_write_of_the_store() {
+        const WRITES: usize = 20;
+        let store = Arc::new(BatchStore::default());
+        let (node, _net, _loop) = alone(
+            Arc::new(InMemoryJournal::new()),
+            Arc::clone(&store) as Arc<dyn DataStore>,
+            NodeConfig::default(),
+        );
+        burst(&node, WRITES).await;
+
+        assert_eq!(store.inner.applied_log().len(), WRITES);
+        let batched: usize = store.batches.lock().unwrap().iter().sum();
+        assert!(
+            store.writes() <= 3,
+            "{WRITES} writes cost the store {} writes",
+            store.writes()
+        );
+        assert_eq!(batched + store.singles.load(Ordering::SeqCst), WRITES);
+        assert_eq!(node.metrics().applies_batched, batched as u64);
+        assert_eq!(node.metrics().writes_committed, WRITES as u64);
+    }
+
+    /// A batch the store refuses is applied one transaction at a time, and
+    /// a cap of one never asks for a batch.
+    #[tokio::test(start_paused = true)]
+    async fn a_batch_the_store_refuses_is_applied_one_at_a_time() {
+        const WRITES: usize = 8;
+        let store = Arc::new(BatchStore::default());
+        store.refusing.store(true, Ordering::SeqCst);
+        let (node, _net, _loop) = alone(
+            Arc::new(InMemoryJournal::new()),
+            Arc::clone(&store) as Arc<dyn DataStore>,
+            NodeConfig::default(),
+        );
+        burst(&node, WRITES).await;
+        assert_eq!(store.inner.applied_log().len(), WRITES);
+        assert_eq!(store.singles.load(Ordering::SeqCst), WRITES);
+        assert_eq!(node.metrics().applies_batched, 0);
+
+        let store = Arc::new(BatchStore::default());
+        let (node, _net, _loop) = alone(
+            Arc::new(InMemoryJournal::new()),
+            Arc::clone(&store) as Arc<dyn DataStore>,
+            NodeConfig {
+                max_apply_batch: 1,
+                ..NodeConfig::default()
+            },
+        );
+        burst(&node, WRITES).await;
+        assert_eq!(store.singles.load(Ordering::SeqCst), WRITES);
+        assert!(store.batches.lock().unwrap().is_empty());
     }
 }

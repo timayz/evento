@@ -6063,5 +6063,57 @@ pub async fn cluster_backend<E: evento_cluster::ClusterBackend>(
     assert!(fresh.load_all().await?.is_empty());
     assert_eq!(read("kept").await?.edges.len(), 1, "the events stay");
 
+    // Decided transactions that are ready together go in one write (#530):
+    // all of them, or none.
+    use evento_cluster::DataStore as _;
+    let store = evento_cluster::ExecutorDataStore::new(executor.clone());
+    let decided = |micros: u64, events: Vec<Event>, commit: bool| {
+        let at = Timestamp {
+            micros,
+            logical: 0,
+            node: NodeId(0),
+        };
+        evento_cluster::Decided {
+            txn: TxnId(at),
+            execute_at: at,
+            events,
+            commit,
+        }
+    };
+    let next = |id: &str, version: u16| Event {
+        version,
+        ..event(id)
+    };
+    let batch = [
+        decided(2_000, vec![next("batch-a", 1), next("batch-a", 2)], true),
+        decided(3_000, vec![next("batch-b", 1)], true),
+        decided(4_000, vec![next("batch-c", 1)], false),
+    ];
+    assert!(store.apply_all(&batch).await?, "the store takes the batch");
+    assert_eq!(read("batch-a").await?.edges.len(), 2);
+    assert_eq!(read("batch-b").await?.edges.len(), 1);
+    assert!(
+        read("batch-c").await?.edges.is_empty(),
+        "an abort writes nothing"
+    );
+    // One of them applied before: the batch is refused whole, for `apply`
+    // to take one at a time.
+    let again = [
+        decided(5_000, vec![next("batch-d", 1)], true),
+        batch[1].clone(),
+    ];
+    assert!(store.apply_all(&again).await.is_err());
+    assert!(
+        read("batch-d").await?.edges.is_empty(),
+        "nothing of a refused batch is written"
+    );
+    // And so is one that skips a version.
+    let gap = [
+        decided(6_000, vec![next("batch-d", 1)], true),
+        decided(7_000, vec![next("batch-b", 3)], true),
+    ];
+    assert!(store.apply_all(&gap).await.is_err());
+    assert!(read("batch-d").await?.edges.is_empty());
+
     Ok(())
 }

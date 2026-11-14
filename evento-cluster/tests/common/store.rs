@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use evento_cluster::protocol::{SnapshotPage, Timestamp, TxnId};
-use evento_cluster::{DataStore, InMemoryDataStore};
+use evento_cluster::{DataStore, Decided, InMemoryDataStore};
 use evento_core::cursor::{Args, ReadResult, Value};
 use evento_core::{Event, EventFilter, RoutingKey};
 use rand::rngs::StdRng;
@@ -205,6 +205,28 @@ impl DataStore for FaultStore {
             outcomes.record(txn, &events, commit);
         }
         Ok(())
+    }
+
+    /// In one write when no apply fault is set: a fault is drawn, or
+    /// counted, per transaction, so with one set they go one at a time.
+    async fn apply_all(&self, batch: &[Decided]) -> anyhow::Result<bool> {
+        if self.apply_failing.load(Ordering::SeqCst)
+            || self.applies_to_fail.load(Ordering::SeqCst) > 0
+            || self.lose_next_apply.load(Ordering::SeqCst)
+            || self.faults.lock().unwrap().is_some()
+        {
+            return Ok(false);
+        }
+        Self::delay(&self.apply_delay).await;
+        if !self.inner.apply_all(batch).await? {
+            return Ok(false);
+        }
+        if let Some(outcomes) = &self.outcomes {
+            for decided in batch {
+                outcomes.record(decided.txn, &decided.events, decided.commit);
+            }
+        }
+        Ok(true)
     }
 
     async fn drop_slots(&self, slots: &[u16]) -> anyhow::Result<usize> {

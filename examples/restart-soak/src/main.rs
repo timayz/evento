@@ -346,6 +346,9 @@ impl<S: DataStore> DataStore for TimedStore<S> {
             self.inner.apply(txn, execute_at, events, commit)
         )
     }
+    async fn apply_all(&self, batch: &[evento::cluster::Decided]) -> anyhow::Result<bool> {
+        timed!(self.node, "store.apply_all", self.inner.apply_all(batch))
+    }
     async fn holds(&self, events: &[Event]) -> anyhow::Result<bool> {
         timed!(self.node, "store.holds", self.inner.holds(events))
     }
