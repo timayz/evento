@@ -649,6 +649,10 @@ pub async fn subscribe<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> 
 /// explain a fast pickup — if the handler runs well under that, it is the
 /// `write_watch` signal waking the loop. A regression to pure polling would make
 /// this take ~5s and time out.
+///
+/// The latency is counted from the moment the write returns: that is when the
+/// signal fires, and the write itself can take longer than the bound on a
+/// loaded machine (issue #534).
 /// Scenario: writes wake a subscription without waiting out the poll interval.
 pub async fn subscribe_low_latency<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
     use std::time::{Duration, Instant};
@@ -658,34 +662,49 @@ pub async fn subscribe_low_latency<E: Executor + Clone>(executor: &E) -> anyhow:
         .start(executor)
         .await?;
 
-    // Let the subscription reach its idle wait (first tick drains any backlog).
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
     let cmd = bank::Command(executor.clone());
-    let started = Instant::now();
-    let account_id = cmd
-        .open_account(OpenAccount {
-            owner_id: "owner_lowlat".to_owned(),
+    let open = |owner: &str| {
+        cmd.open_account(OpenAccount {
+            owner_id: owner.to_owned(),
             owner_name: "Low Latency".to_owned(),
             account_type: AccountType::Checking,
             currency: "USD".to_owned(),
             initial_balance: 100,
         })
-        .await?;
+    };
+    // How long after `since` the handler has processed `account_id`'s event.
+    let seen = |account_id: String, since: Instant, within: Duration| async move {
+        loop {
+            if simple::ROWS.read().unwrap().contains_key(&account_id) {
+                break Some(since.elapsed());
+            }
+            if since.elapsed() >= within {
+                break None;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    };
 
-    // Poll the projection until the handler has processed the new event.
-    let elapsed = loop {
-        if simple::ROWS.read().unwrap().contains_key(&account_id) {
-            break started.elapsed();
-        }
-        if started.elapsed() >= Duration::from_secs(2) {
-            subscription.shutdown().await.ok();
-            anyhow::bail!(
-                "event not processed within 2s despite a 5s poll interval: \
-                 write signal did not wake the subscription"
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(2)).await;
+    // A first event, waited for: once it is handled the worker has used up
+    // the poll tick it starts with, so nothing but the write signal can
+    // deliver the next one before the 5s are out.
+    let warm_up = open("owner_lowlat_warm_up").await?;
+    if seen(warm_up, Instant::now(), Duration::from_secs(10))
+        .await
+        .is_none()
+    {
+        subscription.shutdown().await.ok();
+        anyhow::bail!("the first event was not processed within 10s");
+    }
+
+    let account_id = open("owner_lowlat").await?;
+    let Some(elapsed) = seen(account_id.clone(), Instant::now(), Duration::from_secs(2)).await
+    else {
+        subscription.shutdown().await.ok();
+        anyhow::bail!(
+            "event not processed within 2s despite a 5s poll interval: \
+             write signal did not wake the subscription"
+        );
     };
 
     // Far below the 5s poll interval — proves the wakeup came from the signal.
