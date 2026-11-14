@@ -34,7 +34,7 @@ use evento_core::Event;
 
 use crate::api::{floor_millis, snapshot_event_size, DecisionRecord};
 use crate::clock::{Ballot, NodeId, Timestamp, TxnId};
-use crate::message::{CommandState, Key, RecoveryRound, Status};
+use crate::message::{CommandState, Condition, Key, RecoveryRound, Status};
 
 /// The promise of a replica that refused a transaction it never witnessed
 /// for good, when a recovery asked it to (see [`RecoveryRound::Refuse`]):
@@ -132,7 +132,7 @@ pub struct Replica {
     /// the command holds its slot. In memory only — a restart turns `Reading`
     /// back into `Committed` (see [`restore`](Replica::restore)), which reads
     /// again.
-    read_results: HashMap<TxnId, bool>,
+    read_results: HashMap<TxnId, Condition>,
     /// Ballots promised to a recovery for transactions this replica never
     /// witnessed. A replica answering such a recovery "unknown" still fences
     /// the original coordinator: a PreAccept or Accept below the promise is
@@ -1592,16 +1592,16 @@ impl Replica {
     /// [`next_read`](Replica::next_read). Ignored unless the command is still
     /// [`Reading`](Status::Reading) (an anti-entropy import may have applied it
     /// meanwhile).
-    pub fn record_read(&mut self, txn: TxnId, ok: bool) {
+    pub fn record_read(&mut self, txn: TxnId, condition: Condition) {
         if matches!(self.commands.get(&txn), Some(cmd) if cmd.status == Status::Reading) {
-            self.read_results.insert(txn, ok);
+            self.read_results.insert(txn, condition);
         }
     }
 
     /// The recorded read result of a command that is still
     /// [`Reading`](Status::Reading): what this replica answers whoever drives
     /// the commit, even one that took the transaction over after the read.
-    pub fn read_result(&self, txn: TxnId) -> Option<bool> {
+    pub fn read_result(&self, txn: TxnId) -> Option<Condition> {
         match self.commands.get(&txn) {
             Some(cmd) if cmd.status == Status::Reading => self.read_results.get(&txn).copied(),
             _ => None,
@@ -3461,12 +3461,12 @@ mod tests {
         assert_eq!(replica.read_result(a), None, "not read yet");
 
         assert_eq!(replica.next_read().expect("ready to read").txn, a);
-        replica.record_read(a, true);
+        replica.record_read(a, Condition::Holds);
         assert!(
             replica.next_read().is_none(),
             "a held slot is not read again"
         );
-        assert_eq!(replica.read_result(a), Some(true));
+        assert_eq!(replica.read_result(a), Some(Condition::Holds));
 
         replica.record_decision(a, true);
         assert_eq!(replica.next_apply().expect("decided").txn, a);

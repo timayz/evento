@@ -22,8 +22,8 @@ use std::time::Duration;
 
 use evento_cluster::clock::system_micros;
 use evento_cluster::protocol::{
-    AcceptorRecord, AmnesiaFence, Ballot, DurableMark, Key, Message, RecoveryRound, Status,
-    Timestamp, TxnId,
+    AcceptorRecord, AmnesiaFence, Ballot, Condition, DurableMark, Key, Message, RecoveryRound,
+    Status, Timestamp, TxnId,
 };
 use evento_cluster::transport::Envelope;
 use evento_cluster::{
@@ -1435,8 +1435,8 @@ async fn an_amnesiac_never_lets_a_recovery_drop_what_may_have_committed() {
     .await;
     loop {
         match next_within(&mut c.coordinator, Duration::from_secs(5)).await {
-            Some(Message::ReadOk { ok, .. }) => {
-                assert!(ok, "acc is at version 0");
+            Some(Message::ReadOk { condition, .. }) => {
+                assert_eq!(condition, Condition::Holds, "acc is at version 0");
                 break;
             }
             Some(_) => continue,

@@ -310,7 +310,11 @@ control plane, everything else is Accord.
   by responder shard). Execution is split into **Read → Apply** so a write
   spanning aggregates commits **atomically**: every shard reads its owned keys'
   version condition (`ReadOk`), the coordinator commits only if all hold, then
-  all shards `Apply` (append) or all abort. A replica reads/applies only its
+  all shards `Apply` (append) or all abort. A read is three-way (`Condition`):
+  a version that skips ahead of its stream is a **gap**, and aborts like a
+  conflict when every replica heard of a shard read one (#523); a gap beside a
+  read that holds is that replica's store behind its journal (#453), so the
+  write commits and the replica's apply stops it. A replica reads/applies only its
   owned events; crucially, its execution **barrier is per-shard** — computed from
   its local conflict graph over owned keys, *not* the coordinator's global
   dependency union (which references shards it never witnessed). `Status::Reading`

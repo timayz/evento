@@ -7,7 +7,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use evento_cluster::protocol::{Message, Status, Timestamp, TxnId};
+use evento_cluster::protocol::{Condition, Message, Status, Timestamp, TxnId};
 use evento_cluster::transport::LinkFilter;
 use evento_cluster::{
     DataStore, DynamicTopology, HybridLogicalClock, InMemoryDataStore, InMemoryJournal,
@@ -631,7 +631,9 @@ async fn a_dependency_planned_under_an_epoch_the_learner_lacks_is_not_invalidate
     let read = async {
         loop {
             match outside_inbox.recv().await.map(|envelope| envelope.message) {
-                Some(Message::ReadOk { txn, ok }) if txn == write => return ok,
+                Some(Message::ReadOk { txn, condition }) if txn == write => {
+                    return condition == Condition::Holds
+                }
                 Some(_) => {}
                 None => panic!("the outside inbox closed"),
             }

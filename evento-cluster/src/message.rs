@@ -167,6 +167,24 @@ pub enum Status {
     Applied,
 }
 
+/// What a replica read of a transaction's version condition on the keys it
+/// owns, at the transaction's place in their serial order (see
+/// [`Message::ReadOk`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Condition {
+    /// Every event is the next version of its stream — or the store already
+    /// holds these very events, the transaction applied here before.
+    Holds,
+    /// The store holds another event at one of the versions: the stream
+    /// moved since the writer read it.
+    Conflict,
+    /// A version skips ahead of its stream, as this store holds it: the
+    /// write would leave a hole (#523) — or this store is behind its
+    /// journal (#453), which the replica cannot tell from here. The
+    /// coordinator can: a peer whose read holds has the versions in between.
+    Gap,
+}
+
 /// A replica's knowledge of one transaction — the unit the
 /// [`Journal`](crate::api::Journal) persists and recovery replays, and that a
 /// joining node imports during bootstrap.
@@ -302,9 +320,10 @@ pub enum Message {
         reply_to: NodeId,
     },
     /// Replica → coordinator: this replica read its owned keys at the execution
-    /// timestamp; `ok` is whether their version condition holds. The coordinator
-    /// commits only if every touched shard reports `ok`.
-    ReadOk { txn: TxnId, ok: bool },
+    /// timestamp; `condition` is what it read of their version condition. The
+    /// coordinator commits only if no replica read a conflict, and no shard
+    /// read a gap on every replica it heard (see [`Condition`]).
+    ReadOk { txn: TxnId, condition: Condition },
     /// Coordinator → replicas: the atomic decision. `commit` true appends the
     /// events; false aborts the conditional write as a no-op.
     Apply { txn: TxnId, commit: bool },

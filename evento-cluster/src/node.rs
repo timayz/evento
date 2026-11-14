@@ -37,7 +37,7 @@ use crate::api::{
 use crate::clock::{Ballot, Clock, HybridLogicalClock, NodeId, Timestamp, TxnId};
 use crate::failure_detector::FailureDetector;
 use crate::message::{
-    CommandState, Key, Message, RecoveryRound, Status, SyncKnown, INVALIDATED_AT,
+    CommandState, Condition, Key, Message, RecoveryRound, Status, SyncKnown, INVALIDATED_AT,
 };
 use crate::metrics::{Metrics, MetricsSnapshot};
 use crate::reconfig::{self, Fence, Floor, Transition};
@@ -4428,12 +4428,17 @@ impl Node {
                 match (applied, read) {
                     (Some(conflict), _) => {
                         if durable {
-                            self.answer(&mut out, reply_to, Message::ReadOk { txn, ok: !conflict });
+                            let condition = if conflict {
+                                Condition::Conflict
+                            } else {
+                                Condition::Holds
+                            };
+                            self.answer(&mut out, reply_to, Message::ReadOk { txn, condition });
                         }
                     }
-                    (None, Some(ok)) => {
+                    (None, Some(condition)) => {
                         if durable {
-                            self.answer(&mut out, reply_to, Message::ReadOk { txn, ok });
+                            self.answer(&mut out, reply_to, Message::ReadOk { txn, condition });
                         }
                         out.extend(self.drive_reads().await);
                     }
@@ -5508,8 +5513,8 @@ impl Node {
         loop {
             let read = self.replica.lock().expect("replica poisoned").next_read();
             let Some(read) = read else { break };
-            let ok = match self.read_condition(&read.events).await {
-                Ok(ok) => ok,
+            let condition = match self.read_condition(&read.events).await {
+                Ok(condition) => condition,
                 Err(err) => {
                     // A read that failed says nothing about the condition:
                     // answer nothing, and read it again on the next drive.
@@ -5532,10 +5537,17 @@ impl Node {
             // read was in flight.
             let reply_to = {
                 let mut replica = self.replica.lock().expect("replica poisoned");
-                replica.record_read(read.txn, ok);
+                replica.record_read(read.txn, condition);
                 replica.reply_to(read.txn).unwrap_or(read.reply_to)
             };
-            self.answer(&mut out, reply_to, Message::ReadOk { txn: read.txn, ok });
+            self.answer(
+                &mut out,
+                reply_to,
+                Message::ReadOk {
+                    txn: read.txn,
+                    condition,
+                },
+            );
         }
         out
     }
@@ -5570,26 +5582,56 @@ impl Node {
         }
     }
 
-    /// Whether every owned event extends its aggregate (version strictly greater
-    /// than what is stored) — this node's part of the atomic commit condition.
-    /// An error is not a vote either way.
-    async fn read_condition(&self, owned_events: &[Event]) -> anyhow::Result<bool> {
+    /// Whether every owned event is the next version of its aggregate, as
+    /// this node's store holds it — this node's part of the atomic commit
+    /// condition. A version at or below the stored one is a conflict; one
+    /// that skips ahead, of the store or of the event before it in the
+    /// transaction, is a gap (#523): the apply would refuse it
+    /// ([`StoreBehind`]), on every replica if the write is at fault. An
+    /// error is not a vote either way.
+    async fn read_condition(&self, owned_events: &[Event]) -> anyhow::Result<Condition> {
+        // The version each stream reached earlier in this transaction: one
+        // store read per stream.
+        let mut seen: HashMap<(&str, &str, &str), u16> = HashMap::new();
+        let mut gap = false;
         for event in owned_events {
-            let current = self
-                .datastore
-                .version(&event.tenant, &event.aggregate_type, &event.aggregate_id)
-                .await?;
-            if event.version <= current {
-                // Its own events already in place, the transaction was
-                // applied here before — and forgotten: its journal record
-                // lost across a restart, or applied by an import, which is
-                // not journaled. Its condition held then; reading its own
-                // write as a conflict would vote to abort a decided commit
-                // (#309).
-                return self.datastore.holds(owned_events).await;
-            }
+            let stream = (
+                event.tenant.as_str(),
+                event.aggregate_type.as_str(),
+                event.aggregate_id.as_str(),
+            );
+            let last = match seen.get(&stream) {
+                Some(last) => *last,
+                None => {
+                    let current = self
+                        .datastore
+                        .version(&event.tenant, &event.aggregate_type, &event.aggregate_id)
+                        .await?;
+                    if event.version <= current {
+                        // Its own events already in place, the transaction was
+                        // applied here before — and forgotten: its journal record
+                        // lost across a restart, or applied by an import, which is
+                        // not journaled. Its condition held then; reading its own
+                        // write as a conflict would vote to abort a decided commit
+                        // (#309).
+                        return Ok(if self.datastore.holds(owned_events).await? {
+                            Condition::Holds
+                        } else {
+                            Condition::Conflict
+                        });
+                    }
+                    current
+                }
+            };
+            // A conflict on a later stream still outranks it: read them all.
+            gap |= event.version != last.saturating_add(1);
+            seen.insert(stream, event.version);
         }
-        Ok(true)
+        Ok(if gap {
+            Condition::Gap
+        } else {
+            Condition::Holds
+        })
     }
 
     /// Stages the current durable state of `txn` to the journal — durable once the
@@ -6245,13 +6287,14 @@ impl Node {
 
         // Read: a slow quorum per shard reports its version condition —
         // including one of the shard's applied replicas, if it has any.
-        let heard_applied = |p: &ShardPlan, got: &[(NodeId, bool)]| {
+        let heard_applied = |p: &ShardPlan, got: &[(NodeId, Condition)]| {
             let mut here = applied.iter().filter(|n| p.replicas.contains(n)).peekable();
             here.peek().is_none() || here.any(|n| got.iter().any(|(from, _)| from == n))
         };
-        let read_quorum =
-            |p: &ShardPlan, got: &[(NodeId, bool)]| got.len() >= p.slow_q && heard_applied(p, got);
-        let mut reads: HashMap<ShardId, Vec<(NodeId, bool)>> =
+        let read_quorum = |p: &ShardPlan, got: &[(NodeId, Condition)]| {
+            got.len() >= p.slow_q && heard_applied(p, got)
+        };
+        let mut reads: HashMap<ShardId, Vec<(NodeId, Condition)>> =
             read_plans.iter().map(|p| (p.shard, Vec::new())).collect();
         loop {
             let deadline = Self::after(self.settings.collect_timeout);
@@ -6263,7 +6306,7 @@ impl Node {
                 deadline,
                 heard,
                 |m| match m {
-                    Message::ReadOk { ok, .. } => Some(ok),
+                    Message::ReadOk { condition, .. } => Some(condition),
                     _ => None,
                 },
                 &mut reads,
@@ -6322,7 +6365,7 @@ impl Node {
             .values()
             .flatten()
             .filter(|(from, _)| applied.contains(from))
-            .map(|(_, ok)| *ok)
+            .map(|(_, condition)| *condition == Condition::Holds)
             .collect();
         let commit = match decided.first() {
             Some(&decision) => {
@@ -6332,7 +6375,32 @@ impl Node {
                 );
                 decision
             }
-            None => reads.values().flatten().all(|(_, ok)| *ok),
+            None => {
+                let conflict = reads
+                    .values()
+                    .flatten()
+                    .any(|(_, condition)| *condition == Condition::Conflict);
+                // A version that skips ahead of its stream aborts like a
+                // conflict, when every replica heard of a shard read it so:
+                // committed, each of them would refuse the apply and have to
+                // rejoin, for good (#523). A gap beside a read that holds is
+                // that replica's store behind its journal (#453), not the
+                // write: it commits, and the replica's apply stops it. Voted
+                // down on one gap, a valid write would abort for as long as
+                // that replica is in the read quorum, and its store never
+                // reach the apply that tells it to rejoin.
+                let gap = reads
+                    .values()
+                    .any(|got| !got.is_empty() && got.iter().all(|(_, c)| *c == Condition::Gap));
+                if gap && !conflict {
+                    tracing::debug!(
+                        node = self.id.0,
+                        ?txn,
+                        "aborting a write whose version skips ahead of its stream"
+                    );
+                }
+                !conflict && !gap
+            }
         };
 
         // Apply: enact the decision and wait for a slow quorum per shard.
@@ -6420,7 +6488,7 @@ impl Node {
         &self,
         txn: TxnId,
         plans: &[ShardPlan],
-        reads: &HashMap<ShardId, Vec<(NodeId, bool)>>,
+        reads: &HashMap<ShardId, Vec<(NodeId, Condition)>>,
     ) -> bool {
         let Some(plan) = plans.iter().find(|p| p.replicas.contains(&self.id)) else {
             return false;
@@ -12458,7 +12526,7 @@ mod tests {
         ConfigEntry, DataStore, Drained, FenceRecord, Journal, ShardMap, ShardedTopology, Topology,
     };
     use crate::clock::{HybridLogicalClock, NodeId, Timestamp, TxnId};
-    use crate::message::{CommandState, Key, Message, Status};
+    use crate::message::{CommandState, Condition, Key, Message, Status};
     use crate::store::{InMemoryDataStore, InMemoryJournal};
     use crate::transport::InMemoryNetwork;
     use crate::{api::MessageSink, transport::Envelope, StaticTopology};
@@ -13196,7 +13264,16 @@ mod tests {
             })
             .await;
         assert!(
-            matches!(out.as_slice(), [(_, Message::ReadOk { ok: true, .. })]),
+            matches!(
+                out.as_slice(),
+                [(
+                    _,
+                    Message::ReadOk {
+                        condition: Condition::Holds,
+                        ..
+                    }
+                )]
+            ),
             "the commit is read: {out:?}"
         );
 
@@ -13264,7 +13341,7 @@ mod tests {
             .await;
         assert!(out.is_empty(), "nothing waits for the flush: {out:?}");
         assert!(
-            matches!(rx.try_recv(), Ok((from, Message::ReadOk { ok: true, .. })) if from == own),
+            matches!(rx.try_recv(), Ok((from, Message::ReadOk { condition: Condition::Holds, .. })) if from == own),
             "the own read is answered at once"
         );
 
@@ -14196,8 +14273,13 @@ mod tests {
             })
             .await;
         assert!(
-            out.iter()
-                .any(|(_, m)| matches!(m, Message::ReadOk { ok: true, .. })),
+            out.iter().any(|(_, m)| matches!(
+                m,
+                Message::ReadOk {
+                    condition: Condition::Holds,
+                    ..
+                }
+            )),
             "{out:?}"
         );
         assert!(node.command_status(committed) >= Some(Status::Committed));

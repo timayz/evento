@@ -89,10 +89,12 @@ pub const MAGIC: [u8; 2] = *b"Ac";
 /// per routing key (`tenant ␟ routing-key ␞ aggregate-id`, #483), so the
 /// keys of every journaled command and wire message changed shape. 16:
 /// `Message::Watermark` carries the sender's label (`Node::label`), a word
-/// for the application. No reader for older versions: evento-cluster has
+/// for the application. 17: `Message::ReadOk` carries what the replica read
+/// (`Condition`), a version gap apart from a conflict (#523). No reader
+/// for older versions: evento-cluster has
 /// not been released, so a journal of one is wiped and the node
 /// re-bootstrapped.
-pub const FORMAT_VERSION: u8 = 16;
+pub const FORMAT_VERSION: u8 = 17;
 
 /// Length of the fixed header: `MAGIC (2) + version (1) + kind (1)`.
 const HEADER_LEN: usize = 4;
