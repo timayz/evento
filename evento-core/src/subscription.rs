@@ -1037,6 +1037,24 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
         self
     }
 
+    /// Filters on the events written with *no* routing key.
+    ///
+    /// What a builder left alone does on an executor without a default
+    /// routing key; this says it on one that has a default, which it
+    /// overrides. A stream keeps the key it was created with, even none, so
+    /// an application that gave its executor a default key later follows the
+    /// streams created before with this.
+    ///
+    /// The cursor is stored under the subscription's bare key, without a
+    /// routing-key prefix: the row a builder left alone used on an executor
+    /// without a default, so the subscription goes on from where that one
+    /// stopped.
+    pub fn no_routing_key(mut self) -> Self {
+        self.routing_key = Some(RoutingKey::Value(None));
+
+        self
+    }
+
     /// Processes events with any routing key, instead of filtering by one.
     ///
     /// The counterpart to [`routing_key`](Self::routing_key). Overrides any

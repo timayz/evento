@@ -1002,6 +1002,61 @@ pub async fn subscribe_default_routing_key<E: Executor + Clone>(
         );
     }
 
+    // (5) `.no_routing_key()` follows the events written without a key, which
+    // the executor default hides from a builder left alone. The account is
+    // opened through the bare executor, as a stream created before the
+    // default was set would have been.
+    let keyless_account_id = bank::Command(executor.clone())
+        .open_account(OpenAccount {
+            owner_id: "owner_keyless".to_owned(),
+            owner_name: "Keyless User".to_owned(),
+            account_type: AccountType::Checking,
+            currency: "USD".to_owned(),
+            initial_balance: 3000,
+        })
+        .await?;
+    assert_eq!(last_routing_key(&evento, &keyless_account_id).await?, None);
+    simple_explicit::ROWS
+        .write()
+        .unwrap()
+        .remove(&other_account_id);
+
+    simple::subscription().no_retry().run_once(&evento).await?;
+    assert!(
+        !simple::ROWS
+            .read()
+            .unwrap()
+            .contains_key(&keyless_account_id),
+        "the inherited subscription follows the default key, not the keyless events"
+    );
+
+    simple_explicit::subscription("simple_keyless")
+        .no_routing_key()
+        .no_retry()
+        .run_once(&evento)
+        .await?;
+
+    {
+        let rows = simple_explicit::ROWS.read().unwrap();
+        assert!(
+            rows.contains_key(&keyless_account_id),
+            "the keyless account should be processed when the subscription asks for no routing key"
+        );
+        assert!(
+            !rows.contains_key(&default_account_id) && !rows.contains_key(&other_account_id),
+            "accounts written under a key should NOT be processed by a no-routing-key subscription"
+        );
+    }
+    // Its cursor sits under the bare key: the row of a builder left alone on
+    // an executor without a default.
+    assert!(
+        evento
+            .get_subscriber_cursor("simple_keyless".to_owned())
+            .await?
+            .is_some(),
+        "a no-routing-key subscription stores its cursor without a prefix"
+    );
+
     Ok(())
 }
 
