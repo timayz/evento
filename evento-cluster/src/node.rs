@@ -5777,9 +5777,14 @@ impl Node {
                 .await
                 .map(|outcome| (outcome, false)),
         }?;
-        self.metrics.record_outcome(outcome.conflict, all_fast);
+        // A write a recovery invalidated was decided neither way, so it is
+        // counted apart: no commit, no version conflict, on neither path.
+        // Counted as a conflict, each attempt the executor writes again
+        // would read as contention on its aggregate (#521).
         if outcome.invalidated {
             self.metrics.record_write_invalidated();
+        } else {
+            self.metrics.record_outcome(outcome.conflict, all_fast);
         }
         tracing::debug!(
             node = self.id.0,

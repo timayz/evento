@@ -658,6 +658,9 @@ async fn an_invalidated_write_is_written_again() {
     let metrics = cluster.execs[0].node().metrics();
     assert!(metrics.writes_invalidated >= 1, "{metrics:?}");
     assert_eq!(metrics.writes_committed, 1, "{metrics:?}");
+    // An invalidated attempt counts apart: no conflict, on neither path.
+    assert_eq!(metrics.writes_conflicted, 0, "{metrics:?}");
+    assert_eq!(metrics.fast_path + metrics.slow_path, 1, "{metrics:?}");
     for node in 0..3 {
         let events = cluster.await_read(node, "acc", 1).await;
         assert_eq!(events.len(), 1, "node {node} holds the write once");
@@ -706,6 +709,12 @@ async fn a_write_invalidated_at_every_attempt_is_a_transient_refusal() {
         metrics.writes_invalidated, 3,
         "one invalidation per attempt: {metrics:?}"
     );
+    assert_eq!(
+        (metrics.writes_committed, metrics.writes_conflicted),
+        (0, 0),
+        "an invalidated write is neither committed nor conflicted: {metrics:?}"
+    );
+    assert_eq!(metrics.fast_path + metrics.slow_path, 0, "{metrics:?}");
     assert!(
         cluster.read_all(0, "acc").await.is_empty(),
         "an invalidated write left events behind"

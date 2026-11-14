@@ -70,9 +70,11 @@ pub struct Metrics {
     pub writes_settled: AtomicU64,
     /// Writes this node coordinated that a recovery invalidated (#466): too
     /// few replicas held them in time for them ever to commit, so nothing was
-    /// written. Counted in `writes_conflicted` too. The executor writes each
-    /// again as a fresh transaction, up to three attempts in all (#521): a
-    /// caller is refused only when each of its write's attempts counts here.
+    /// written and no version condition was judged. Counted here alone: not
+    /// in `writes_committed` or `writes_conflicted`, nor on either path. The
+    /// executor writes each again as a fresh transaction, up to three
+    /// attempts in all (#521): a caller gets the `Invalidated` refusal only
+    /// when each of its write's attempts counts here.
     pub writes_invalidated: AtomicU64,
     /// Decided-transaction applies and commit-condition reads the data store
     /// failed. The transaction is neither marked nor acknowledged; it is
@@ -189,7 +191,8 @@ impl Metrics {
     }
 
     /// Records a coordinated write's outcome: committed vs conflicted, and whether
-    /// it took the fast path.
+    /// it took the fast path. A write a recovery invalidated has neither outcome
+    /// (see [`record_write_invalidated`](Self::record_write_invalidated)).
     pub fn record_outcome(&self, conflict: bool, fast: bool) {
         if conflict {
             self.writes_conflicted.fetch_add(1, Ordering::Relaxed);
@@ -612,7 +615,7 @@ impl MetricsSnapshot {
             ),
             (
                 "cluster_writes_invalidated_total",
-                "Coordinated writes a recovery invalidated, too few replicas holding them in time; the executor writes them again.",
+                "Coordinated writes a recovery invalidated, too few replicas holding them in time; nothing was written.",
                 self.writes_invalidated,
             ),
             (

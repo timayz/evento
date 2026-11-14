@@ -170,7 +170,7 @@ Serve it on an HTTP endpoint (see `bank-axum-cluster`'s `/metrics`). Counters:
 
 | `cluster_*_total` | Watch for |
 |------------------|-----------|
-| `writes_committed` / `writes_conflicted` | throughput; a high conflict ratio = contention on the same aggregate/version. |
+| `writes_committed` / `writes_conflicted` | throughput; a high conflict ratio = contention on the same aggregate/version. A write a recovery invalidated counts as neither (`writes_invalidated`). |
 | `fast_path` / `slow_path` | a rising `slow_path` share = conflicts or an electorate that can't form a local fast quorum (check placement/latency). |
 | `recoveries` | should be ~0 in a healthy cluster; sustained > 0 = a coordinator is flapping/dead. |
 | `compactions` | should advance over time; **flat** = compaction stalled (a partitioned/behind peer holds the watermark) → backlog grows toward `max_commands`. |
@@ -196,7 +196,7 @@ Serve it on an HTTP endpoint (see `bank-axum-cluster`'s `/metrics`). Counters:
 | `joins_partial` | joins of this node that failed after a page was installed: the store holds a prefix no contact can complete, and must be emptied before the next join (§7). Steady > 0 = a contact that cannot read its backend, or a link losing pages faster than the per-page retries cover. |
 | `execution_failures` | data-store applies and commit-condition reads that failed. The transaction is neither marked applied nor acknowledged, and is retried on the next drive (a message, or the sweep). Occasional = transient lock contention; **sustained** = this replica's store cannot take writes (full disk, broken connection), so it falls behind until it can. |
 | `own_store_waits` | phases of a write this node coordinated that waited on past `collect_timeout` because the quorum lacked only this node's own answer, and its store was still reading the version condition or enacting the transaction (or the decided ones ahead of it). The write completes in the store's time, and no recovery is started for it (#475). A rising count = this node's store has reads or fsyncs outlasting `collect_timeout` (§8, write latency); look at the disk. |
-| `writes_invalidated` | writes this node coordinated that a recovery invalidated: too few replicas held them in time for them ever to commit (`votes_late` on the replicas), so nothing was written (#466). Counted in `writes_conflicted` too. `ClusterExecutor` writes each again as a fresh transaction, up to three attempts in all (#521), so the caller sees a refusal only when all three were invalidated. Each took a recovery longer than it should; a steady rate means coordinators, or replicas' inboxes, slower than `compaction_margin` (§8, write latency). |
+| `writes_invalidated` | writes this node coordinated that a recovery invalidated: too few replicas held them in time for them ever to commit — they reached the replicas late (`votes_late` on the replicas) or below a vote fence (`votes_fenced`), or never reached them — so nothing was written (#466). Counted here alone: not in `writes_committed` or `writes_conflicted`, nor on either path. `ClusterExecutor` writes each again as a fresh transaction, up to three attempts in all (#521), so the caller gets `WriteError::Unavailable` with the `Invalidated` cause only when all three were invalidated. Each took a recovery longer than it should; a steady rate means coordinators, or replicas' inboxes, slower than `compaction_margin` (§8, write latency). |
 | `writes_settled` | writes this node coordinated whose coordination failed a phase — a quorum short at the deadline, a refusal for a higher ballot — and were settled by this node's own recovery (`write settled by recovery` at debug). Each took at least a `collect_timeout`, or a round of recovery, longer than it should; a healthy cluster settles none. |
 
 **Health/readiness.**
@@ -404,8 +404,9 @@ refuses anything else before a vote, and a node never installs it.
   transaction (#337, #377). If a slow quorum of some shard never witnessed the
   transaction (its coordinator died mid-broadcast), it never committed: past the
   deadline, the recovery has that shard's replicas refuse it for good and
-  **invalidates** it — every replica records it aborted, and the write reports a
-  conflict. Fewer refusals do the same beside a replica of that shard that lost
+  **invalidates** it — every replica records it aborted, and a write still
+  waiting on it comes back invalidated (`Invalidated`), never as a version
+  conflict (#466): `ClusterExecutor` writes it again (#521). Fewer refusals do the same beside a replica of that shard that lost
   its journal and a holder that never accepted the transaction: no quorum could
   have committed it, and none can ever vote for it (#386). A recovery that cannot hear a slow quorum of every route shard decides
   nothing and the sweep retries — a multi-shard transaction whose coordinator died
