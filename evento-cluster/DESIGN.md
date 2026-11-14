@@ -983,10 +983,14 @@ backend (sql/fjall). Phases, in order:
   (`a_recovery_has_late_replicas_refuse_what_too_few_hold`,
   `a_recovery_asks_no_late_vote_for_what_may_not_have_committed`,
   `a_refusal_for_good_outlives_a_restart`). An invalidated write comes back
-  as `CommitOutcome::invalidated` — `WriteError::Unavailable` with the
-  `Invalidated` cause through `ClusterExecutor`, never a version conflict: it
-  never committed, nothing was written, no condition was judged, and a retry
-  minted anew is sound (#466). A coordinator's
+  as `CommitOutcome::invalidated`, never a version conflict: it never
+  committed, nothing was written, no condition was judged, and a retry
+  minted anew is sound (#466). `ClusterExecutor` makes it, up to three
+  attempts in all, each a fresh transaction decided as if it came now —
+  committed, or a version conflict if the stream moved meanwhile — and
+  answers `WriteError::Unavailable` with the `Invalidated` cause only when
+  the last is invalidated too (#521,
+  `an_invalidated_write_is_written_again`). A coordinator's
   messages, and recoveries of a transaction still in flight, land within the
   margin (OPERATIONS: margin ≥ `recovery_timeout` + 2 × skew + delay). Past it, a
   transaction only a minority holds can no longer gather a quorum, and a recovery

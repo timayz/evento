@@ -68,6 +68,14 @@ pub struct Metrics {
     /// this node's own recovery of them. Each is a write that took at least
     /// a `collect_timeout`, or a round of recovery, longer than it should.
     pub writes_settled: AtomicU64,
+    /// Writes this node coordinated that a recovery invalidated (#466): too
+    /// few replicas held them in time for them ever to commit, so nothing was
+    /// written and no version condition was judged. Counted here alone: not
+    /// in `writes_committed` or `writes_conflicted`, nor on either path. The
+    /// executor writes each again as a fresh transaction, up to three
+    /// attempts in all (#521): a caller gets the `Invalidated` refusal only
+    /// when each of its write's attempts counts here.
+    pub writes_invalidated: AtomicU64,
     /// Decided-transaction applies and commit-condition reads the data store
     /// failed. The transaction is neither marked nor acknowledged; it is
     /// retried on the next drive, so a persistent count means a store that
@@ -183,7 +191,8 @@ impl Metrics {
     }
 
     /// Records a coordinated write's outcome: committed vs conflicted, and whether
-    /// it took the fast path.
+    /// it took the fast path. A write a recovery invalidated has neither outcome
+    /// (see [`record_write_invalidated`](Self::record_write_invalidated)).
     pub fn record_outcome(&self, conflict: bool, fast: bool) {
         if conflict {
             self.writes_conflicted.fetch_add(1, Ordering::Relaxed);
@@ -400,6 +409,11 @@ impl Metrics {
         self.writes_settled.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records a write a recovery invalidated.
+    pub fn record_write_invalidated(&self) {
+        self.writes_invalidated.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// A consistent-enough point-in-time view of all counters.
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
@@ -421,6 +435,7 @@ impl Metrics {
             execution_failures: self.execution_failures.load(Ordering::Relaxed),
             own_store_waits: self.own_store_waits.load(Ordering::Relaxed),
             writes_settled: self.writes_settled.load(Ordering::Relaxed),
+            writes_invalidated: self.writes_invalidated.load(Ordering::Relaxed),
             command_pages: self.command_pages.load(Ordering::Relaxed),
             votes_fenced: self.votes_fenced.load(Ordering::Relaxed),
             votes_late: self.votes_late.load(Ordering::Relaxed),
@@ -473,6 +488,7 @@ pub struct MetricsSnapshot {
     pub execution_failures: u64,
     pub own_store_waits: u64,
     pub writes_settled: u64,
+    pub writes_invalidated: u64,
     pub command_pages: u64,
     pub votes_fenced: u64,
     pub votes_late: u64,
@@ -505,7 +521,7 @@ impl MetricsSnapshot {
     /// source of truth for both [`to_prometheus`](Self::to_prometheus) and
     /// [`to_prometheus_labeled`](Self::to_prometheus_labeled); add a counter here and
     /// both renderings pick it up.
-    fn counters(&self) -> [(&'static str, &'static str, u64); 43] {
+    fn counters(&self) -> [(&'static str, &'static str, u64); 44] {
         [
             (
                 "cluster_writes_committed_total",
@@ -596,6 +612,11 @@ impl MetricsSnapshot {
                 "cluster_writes_settled_total",
                 "Coordinated writes whose failed coordination this node's own recovery settled.",
                 self.writes_settled,
+            ),
+            (
+                "cluster_writes_invalidated_total",
+                "Coordinated writes a recovery invalidated, too few replicas holding them in time; nothing was written.",
+                self.writes_invalidated,
             ),
             (
                 "cluster_command_pages_total",

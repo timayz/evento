@@ -604,11 +604,75 @@ async fn a_backlog_at_its_cap_is_a_transient_refusal() {
 /// A write a recovery invalidated — its PreAccept reached the other
 /// replicas past the compaction margin, so too few held it for it ever to
 /// commit — never committed: nothing was written, and no version condition
-/// was judged. It is a transient refusal, `WriteError::Unavailable` with the
-/// typed `Invalidated` cause, never a version conflict the caller would
-/// reload the aggregate over (#466). The next write commits.
+/// was judged. The executor writes it again, as a fresh transaction, and the
+/// caller sees it committed, once (#521): it need not tell this refusal from
+/// a paused store to retry it itself.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_invalidated_write_is_a_transient_refusal_not_a_conflict() {
+async fn an_invalidated_write_is_written_again() {
+    use evento_cluster::protocol::{Message, TxnId};
+
+    // A short margin under a fast-path timeout the delayed messages still
+    // fit: the recovery that settles the write collects its late replicas'
+    // refusals for `fast_timeout`, as any recovery round does.
+    let margin = Duration::from_millis(50);
+    let cluster = ExecCluster::start_configured(
+        3,
+        NodeConfig {
+            compaction_margin: margin,
+            fast_timeout: Duration::from_millis(300),
+            ..Default::default()
+        },
+    );
+    // Node 0's messages reach its peers past the margin until it sends a
+    // PreAccept for a second transaction: the filter, which runs before the
+    // link's latency is read, lifts the latency for that message and every
+    // one after it.
+    cluster.net.set_latency(NodeId(0), NodeId(1), margin * 3);
+    cluster.net.set_latency(NodeId(0), NodeId(2), margin * 3);
+    let first: Arc<std::sync::Mutex<Option<TxnId>>> = Arc::default();
+    let net = Arc::downgrade(&cluster.net);
+    cluster
+        .net
+        .set_link_filter(Some(Arc::new(move |from, _to, message| {
+            if let (NodeId(0), Message::PreAccept { txn, .. }) = (from, message) {
+                let mut first = first.lock().unwrap();
+                match *first {
+                    None => *first = Some(*txn),
+                    Some(seen) if seen != *txn => {
+                        if let Some(net) = net.upgrade() {
+                            net.clear_latency();
+                        }
+                    }
+                    Some(_) => {}
+                }
+            }
+            false
+        })));
+
+    cluster.execs[0]
+        .write(vec![event("acc", 1, "Opened")])
+        .await
+        .expect("the invalidated write commits as a fresh transaction");
+    // One invalidation, unless a stall past the margin made the retry late
+    // too: the third attempt commits then.
+    let metrics = cluster.execs[0].node().metrics();
+    assert!(metrics.writes_invalidated >= 1, "{metrics:?}");
+    assert_eq!(metrics.writes_committed, 1, "{metrics:?}");
+    // An invalidated attempt counts apart: no conflict, on neither path.
+    assert_eq!(metrics.writes_conflicted, 0, "{metrics:?}");
+    assert_eq!(metrics.fast_path + metrics.slow_path, 1, "{metrics:?}");
+    for node in 0..3 {
+        let events = cluster.await_read(node, "acc", 1).await;
+        assert_eq!(events.len(), 1, "node {node} holds the write once");
+    }
+}
+
+/// A write a recovery invalidated at each of the executor's attempts is a
+/// transient refusal, `WriteError::Unavailable` with the typed `Invalidated`
+/// cause, never a version conflict the caller would reload the aggregate
+/// over (#466). Nothing was written; the next write commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_invalidated_at_every_attempt_is_a_transient_refusal() {
     use evento_cluster::Invalidated;
 
     // A short margin under a fast-path timeout the delayed messages still
@@ -630,7 +694,7 @@ async fn an_invalidated_write_is_a_transient_refusal_not_a_conflict() {
     let err = cluster.execs[0]
         .write(vec![event("acc", 1, "Opened")])
         .await
-        .expect_err("a write too few replicas held in time is refused");
+        .expect_err("a write too few replicas held in time, three times over, is refused");
     match &err {
         WriteError::Unavailable(cause) => {
             cause
@@ -640,6 +704,17 @@ async fn an_invalidated_write_is_a_transient_refusal_not_a_conflict() {
         other => panic!("expected Unavailable, got {other:?}"),
     }
     assert!(err.to_string().contains("invalidated"));
+    let metrics = cluster.execs[0].node().metrics();
+    assert_eq!(
+        metrics.writes_invalidated, 3,
+        "one invalidation per attempt: {metrics:?}"
+    );
+    assert_eq!(
+        (metrics.writes_committed, metrics.writes_conflicted),
+        (0, 0),
+        "an invalidated write is neither committed nor conflicted: {metrics:?}"
+    );
+    assert_eq!(metrics.fast_path + metrics.slow_path, 0, "{metrics:?}");
     assert!(
         cluster.read_all(0, "acc").await.is_empty(),
         "an invalidated write left events behind"

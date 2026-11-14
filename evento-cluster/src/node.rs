@@ -382,7 +382,9 @@ impl std::error::Error for Outbid {}
 /// margin on them, say — so nothing was written, anywhere, and no replica
 /// will ever apply it. Not a version conflict: the write itself was sound,
 /// and a retry, minted anew, is too. [`ClusterExecutor`](crate::ClusterExecutor)
-/// answers it as `WriteError::Unavailable`, this as the cause.
+/// writes it again as a fresh transaction (#521); only a write each of
+/// whose attempts was invalidated comes back from it as
+/// `WriteError::Unavailable`, this as the cause.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Invalidated {
     /// The transaction that never committed.
@@ -5691,6 +5693,13 @@ impl Node {
     /// Coordinates appending `events` as one strictly-serializable, atomic
     /// transaction across every shard it touches.
     pub async fn write(&self, events: Vec<Event>) -> anyhow::Result<CommitOutcome> {
+        self.write_events(&events).await
+    }
+
+    /// [`write`](Self::write) over borrowed events: the executor keeps them
+    /// to write again, as a fresh transaction, a write a recovery
+    /// invalidated (#521).
+    pub(crate) async fn write_events(&self, events: &[Event]) -> anyhow::Result<CommitOutcome> {
         // Backpressure: if the un-compacted backlog is already at the cap (e.g.
         // compaction stalled under a sustained partition), refuse new load rather
         // than grow `Replica.commands` without bound. We shed *new writes* only —
@@ -5745,7 +5754,7 @@ impl Node {
             .into());
         }
 
-        let keys = Self::keys_of(&events);
+        let keys = Self::keys_of(events);
         // A key moving to other replicas takes no new write until its
         // transition installed the layout it moves to (see `reconfig`).
         if let Some(since) = self.moving(&keys) {
@@ -5761,18 +5770,27 @@ impl Node {
         // entry would pin this node's watermark report, and the response
         // channel would hide the transaction from its own recovery sweep.
         let _coordinating = Coordinating { node: self, txn };
-        let (outcome, all_fast) = match self.coordinate(&layout, txn, &keys, &events).await {
+        let (outcome, all_fast) = match self.coordinate(&layout, txn, &keys, events).await {
             Ok(done) => Ok(done),
             Err(err) => self
-                .settle(txn, err, layout.epoch(), &keys, &events)
+                .settle(txn, err, layout.epoch(), &keys, events)
                 .await
                 .map(|outcome| (outcome, false)),
         }?;
-        self.metrics.record_outcome(outcome.conflict, all_fast);
+        // A write a recovery invalidated was decided neither way, so it is
+        // counted apart: no commit, no version conflict, on neither path.
+        // Counted as a conflict, each attempt the executor writes again
+        // would read as contention on its aggregate (#521).
+        if outcome.invalidated {
+            self.metrics.record_write_invalidated();
+        } else {
+            self.metrics.record_outcome(outcome.conflict, all_fast);
+        }
         tracing::debug!(
             node = self.id.0,
             txn = ?outcome.txn,
             conflict = outcome.conflict,
+            invalidated = outcome.invalidated,
             fast_path = all_fast,
             "write complete"
         );
