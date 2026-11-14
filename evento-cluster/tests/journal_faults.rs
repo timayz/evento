@@ -465,3 +465,46 @@ async fn a_write_whose_id_cannot_be_covered_fails_before_it_is_sent() {
         .unwrap()
         .is_some());
 }
+
+/// A write dropped while its id waits for the clock bound ends its
+/// coordination (#524). Left in `coordinating`, the id would cap everything
+/// the node vouches for until it restarts: its stable point, and with it
+/// the shard's compaction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_dropped_while_its_id_waits_for_the_clock_bound_is_let_go() {
+    let cluster = start(3);
+    // Held past the bound the sweep persisted at start, so the write's id
+    // needs a new one.
+    cluster.journals[0].hold_clock_bound(true);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let dropped = tokio::time::timeout(
+        Duration::from_millis(300),
+        cluster.nodes[0].write(vec![event("acc", 1, "Opened")]),
+    )
+    .await;
+    assert!(
+        dropped.is_err(),
+        "the write did not wait for its clock bound"
+    );
+    let mark = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as u64;
+
+    cluster.journals[0].hold_clock_bound(false);
+    cluster.nodes[0]
+        .write(vec![event("acc", 1, "Opened")])
+        .await
+        .expect("commits once the bound is persisted");
+    for _ in 0..500 {
+        if cluster.nodes[0].stable_micros() > mark {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!(
+        "the stable point stays at the dropped write: {} micros before it was dropped",
+        mark - cluster.nodes[0].stable_micros()
+    );
+}

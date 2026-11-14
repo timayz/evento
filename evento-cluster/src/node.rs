@@ -5764,12 +5764,12 @@ impl Node {
         // One layout for the whole coordination: an epoch installed meanwhile
         // changes neither the replicas it counts nor those it recovers through.
         let layout = self.topology.layout();
-        let txn = self.mint_write().await?;
         // Released however this ends — returned, or dropped mid-flight by a
         // caller that gave up (a hung-up client, a timeout): left behind, the
         // entry would pin this node's watermark report, and the response
         // channel would hide the transaction from its own recovery sweep.
-        let _coordinating = Coordinating { node: self, txn };
+        let coordinating = self.mint_write().await?;
+        let txn = coordinating.txn;
         let (outcome, all_fast) = match self.coordinate(&layout, txn, &keys, events).await {
             Ok(done) => Ok(done),
             Err(err) => self
@@ -12002,9 +12002,10 @@ impl Node {
     /// both under the coordinating lock: no report, coverage or stable point
     /// read in between can pass it (see [`vouch_cutoff`](Self::vouch_cutoff))
     /// — the clock bound the id waits for may take a while on a slow disk.
-    /// Left in `coordinating` on success, for the caller's [`Coordinating`]
-    /// guard; removed on failure.
-    async fn mint_write(&self) -> anyhow::Result<TxnId> {
+    /// The id is the returned guard's from the moment it is entered, so it
+    /// leaves `coordinating` however this ends: the bound not persisted, or
+    /// the write dropped while waiting for it (#524).
+    async fn mint_write(&self) -> anyhow::Result<Coordinating<'_>> {
         if self.retired.load(Ordering::Acquire) {
             return Err(NodeClosed.into());
         }
@@ -12014,20 +12015,14 @@ impl Node {
             .expect("replica poisoned")
             .redundant_before();
         self.clock.restore(floor);
-        let txn = {
+        let coordinating = {
             let mut coordinating = self.coordinating.lock().expect("coordinating poisoned");
             let txn = TxnId(self.clock.now());
             coordinating.insert(txn);
-            txn
+            Coordinating { node: self, txn }
         };
-        if let Err(err) = self.bound_clock_past(txn.0.micros).await {
-            self.coordinating
-                .lock()
-                .expect("coordinating poisoned")
-                .remove(&txn);
-            return Err(err);
-        }
-        Ok(txn)
+        self.bound_clock_past(coordinating.txn.0.micros).await?;
+        Ok(coordinating)
     }
 
     /// Persists a clock bound past `reading` (microseconds), unless one is
