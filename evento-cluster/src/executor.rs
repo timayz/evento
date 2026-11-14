@@ -752,6 +752,13 @@ impl<E: Executor + Clone> Executor for ClusterExecutor<E> {
         self.local.write_watch()
     }
 
+    fn write_watch_for(
+        &self,
+        interest: &evento_core::WriteInterest,
+    ) -> Option<tokio::sync::watch::Receiver<u64>> {
+        self.local.write_watch_for(interest)
+    }
+
     async fn stable_timestamp(&self) -> anyhow::Result<Option<u64>> {
         // Gate subscriptions by the node's stability watermark. Events are
         // stamped from their transaction's `execute_at`, but a replica learns

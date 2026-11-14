@@ -15,6 +15,7 @@ use ulid::Ulid;
 use evento_core::{
     cursor::{Args, ReadResult, Value},
     Event, EventFilter, Executor, RoutingKey, SubscriberStatus, TenantFilter, WriteError,
+    WriteInterest, WriteSignal,
 };
 
 use crate::query::{
@@ -134,8 +135,8 @@ pub struct Turso {
     /// `write`, persisted under [`LAST_STAMP_KEY`] with each stamped batch.
     last_stamp: Arc<AtomicU64>,
     clock: Clock,
-    /// Bumped after every in-process write (`write_watch`); clones share it.
-    write_watch: watch::Sender<u64>,
+    /// Fired after every in-process write (`write_watch`); clones share it.
+    write_watch: WriteSignal,
     /// Connections [`transaction`](Self::transaction) ran on, kept for the
     /// next: a connection's first `BEGIN CONCURRENT` costs milliseconds
     /// (Turso sets its MVCC state up), the next ones microseconds.
@@ -284,7 +285,7 @@ impl Turso {
             relaxed: Arc::new(Mutex::new(relaxed)),
             last_stamp: Arc::new(AtomicU64::new(last_stamp)),
             clock: Arc::new(system_millis),
-            write_watch: watch::channel(0).0,
+            write_watch: WriteSignal::new(),
             app: Arc::new(std::sync::Mutex::new(Vec::new())),
             _temp: None,
         })
@@ -698,11 +699,12 @@ impl Executor for Turso {
             seen.insert(stream, event.version);
         }
 
+        let wake = self.write_watch.prepare(&events);
         self.insert_events(events, true).await?;
 
-        // Wake any in-process subscriptions immediately instead of waiting
-        // for their next poll tick.
-        self.write_watch.send_modify(|v| *v += 1);
+        // Wake the in-process subscriptions that follow these events
+        // immediately instead of waiting for their next poll tick.
+        wake.fire();
         Ok(())
     }
 
@@ -712,13 +714,18 @@ impl Executor for Turso {
         }
         // Replication layers own ordering and versioning: persist the
         // caller's timestamps verbatim and skip the contiguity pre-check.
+        let wake = self.write_watch.prepare(&events);
         self.insert_events(events, false).await?;
-        self.write_watch.send_modify(|v| *v += 1);
+        wake.fire();
         Ok(())
     }
 
     fn write_watch(&self) -> Option<watch::Receiver<u64>> {
         Some(self.write_watch.subscribe())
+    }
+
+    fn write_watch_for(&self, interest: &WriteInterest) -> Option<watch::Receiver<u64>> {
+        Some(self.write_watch.subscribe_to(interest.clone()))
     }
 
     async fn get_subscriber_cursor(&self, key: String) -> anyhow::Result<Option<Value>> {

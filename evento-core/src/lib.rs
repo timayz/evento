@@ -167,6 +167,7 @@ pub mod projection;
 mod reader;
 pub mod subscription;
 mod upcast;
+mod write_watch;
 
 #[cfg(feature = "macro")]
 pub use evento_macro::*;
@@ -176,6 +177,7 @@ pub use executor::*;
 pub use metadata::DecodeError;
 pub use reader::*;
 pub use subscription::RoutingKey;
+pub use write_watch::*;
 
 use std::fmt::Debug;
 use ulid::Ulid;

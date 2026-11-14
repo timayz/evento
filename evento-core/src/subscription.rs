@@ -416,6 +416,9 @@ pub struct SubscriptionBuilder<E: Executor> {
     resolved_key: String,
     delay: Option<Duration>,
     poll_interval: Duration,
+    /// The least time between the end of a pass and the start of the next
+    /// (see [`coalesce`](Self::coalesce)).
+    coalesce: Duration,
     chunk_size: u16,
     continue_on_error: bool,
     /// What to do with an event whose payload does not decode.
@@ -554,6 +557,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             context: Default::default(),
             delay: None,
             poll_interval: Duration::from_millis(250),
+            coalesce: Duration::ZERO,
             retry: Some(30),
             shutdown_grace: Some(DEFAULT_SHUTDOWN_GRACE),
             chunk_size: 300,
@@ -1017,12 +1021,33 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
     /// available.
     ///
     /// When the executor supports [`write_watch`](crate::Executor::write_watch)
-    /// (the default backends do), an in-process write wakes the subscription
-    /// immediately and this interval only bounds latency for writes the signal
-    /// cannot observe — cross-process writers or custom executors. Backlogs are
-    /// drained at full speed regardless of this value. Default is 250ms.
+    /// (the default backends do), an in-process write of an event this
+    /// subscription follows wakes it immediately and this interval only
+    /// bounds latency for writes the signal cannot observe — cross-process
+    /// writers or custom executors. Backlogs are drained at full speed
+    /// regardless of this value. Default is 250ms.
     pub fn poll_interval(mut self, v: Duration) -> Self {
         self.poll_interval = v;
+
+        self
+    }
+
+    /// Makes the worker wait `v` after a pass before it starts the next one,
+    /// so the writes of a burst are handled by one pass instead of one each.
+    ///
+    /// A pass costs a cursor read and an event read whatever it finds, and
+    /// under a steady stream of writes a subscription runs one per write.
+    /// With a window of 20 to 50 ms it runs at most one per window, each
+    /// handling everything written meanwhile. The price is latency: an event
+    /// written within `v` of the previous pass waits for the rest of the
+    /// window. A write that finds the subscription idle for longer is handled
+    /// at once, as without it.
+    ///
+    /// Default is zero: every wake starts a pass. A backlog is drained at
+    /// full speed whatever the value, since one pass reads chunk after chunk
+    /// until it has caught up.
+    pub fn coalesce(mut self, v: Duration) -> Self {
+        self.coalesce = v;
 
         self
     }
@@ -2020,7 +2045,13 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
         self.seed_latest_cursor(&executor, &id, &read_aggregators)
             .await?;
 
-        let mut write_watch = executor.write_watch();
+        // Watched with the filter the passes read with: a write that holds
+        // no event of this subscription does not wake it.
+        let mut write_watch = executor.write_watch_for(&crate::WriteInterest {
+            filters: Some(read_aggregators.clone()),
+            routing_key: Some(self.effective_routing_key()),
+            tenant: self.tenant.clone(),
+        });
 
         let task_handle = tokio::spawn(async move {
             let start = self
@@ -2034,11 +2065,23 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             // loop sooner.
             let mut interval = interval_at(start, self.poll_interval);
             let mut gated: Option<Duration> = None;
+            // When the last pass ended, for `coalesce`.
+            let mut last_pass: Option<Instant> = None;
 
             // Every exit from this loop names a `StopReason`, so the worker can
             // never die without saying why: adding a new terminal path is a
             // compile error until it does.
             let reason = loop {
+                // The rest of the `coalesce` window is waited out first: the
+                // writes landing in it stay pending on the signal and are
+                // handled by the one pass that follows.
+                if let Some(ended) = last_pass.filter(|_| !self.coalesce.is_zero()) {
+                    tokio::select! {
+                        _ = tokio::time::sleep_until(ended + self.coalesce) => {}
+                        _ = shutdown_rx.changed() => break StopReason::Shutdown,
+                    }
+                }
+
                 // Wake on whichever comes first: an in-process write (when the
                 // executor exposes a signal), the fallback poll tick, or a
                 // shutdown signal. Selecting on shutdown here keeps shutdown
@@ -2160,6 +2203,8 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                         (res, true)
                     }
                 };
+
+                last_pass = Some(Instant::now());
 
                 if let Err(err) = &result {
                     tracing::error!(error = %err, "Failed to process event");
@@ -3368,6 +3413,9 @@ mod tests {
         events: Vec<Event>,
         cursor: Mutex<Option<Value>>,
         dead_letters: Mutex<Vec<DeadLetter>>,
+        /// Fired by a test in place of a write (see [`Ledger::wrote`]).
+        signal: crate::WriteSignal,
+        reads: AtomicUsize,
     }
 
     impl Ledger {
@@ -3388,7 +3436,24 @@ mod tests {
                     .collect(),
                 cursor: Mutex::new(None),
                 dead_letters: Mutex::new(Vec::new()),
+                signal: crate::WriteSignal::new(),
+                reads: AtomicUsize::new(0),
             }))
+        }
+
+        /// Signals a write of one `name` event of `aggregate_type`, as a
+        /// backend does once it committed one.
+        fn wrote(&self, aggregate_type: &str, name: &str) {
+            let event = Event {
+                aggregate_type: aggregate_type.to_owned(),
+                name: name.to_owned(),
+                ..Event::default()
+            };
+            self.0.signal.prepare(&[event]).fire();
+        }
+
+        fn reads(&self) -> usize {
+            self.0.reads.load(Ordering::SeqCst)
         }
 
         fn letters(&self) -> Vec<DeadLetter> {
@@ -3410,6 +3475,15 @@ mod tests {
     impl Executor for Ledger {
         async fn write(&self, _events: Vec<Event>) -> Result<(), WriteError> {
             unreachable!()
+        }
+        fn write_watch(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+            Some(self.0.signal.subscribe())
+        }
+        fn write_watch_for(
+            &self,
+            interest: &crate::WriteInterest,
+        ) -> Option<tokio::sync::watch::Receiver<u64>> {
+            Some(self.0.signal.subscribe_to(interest.clone()))
         }
         async fn get_subscriber_cursor(&self, _key: String) -> anyhow::Result<Option<Value>> {
             Ok(self.0.cursor.lock().unwrap().clone())
@@ -3442,6 +3516,7 @@ mod tests {
             args: Args,
             _to_micros: Option<u64>,
         ) -> anyhow::Result<ReadResult<Event>> {
+            self.0.reads.fetch_add(1, Ordering::SeqCst);
             let events = self
                 .0
                 .events
@@ -3842,5 +3917,67 @@ mod tests {
         assert!(error.len() <= super::MAX_DEAD_LETTER_ERROR_LEN);
         assert!(error.len() >= super::MAX_DEAD_LETTER_ERROR_LEN - 1);
         assert!(error.chars().all(|c| c == 'é'));
+    }
+
+    /// Issue #531: a write wakes the subscriptions that follow one of its
+    /// events, and no other.
+    #[tokio::test(start_paused = true)]
+    async fn a_write_the_subscription_does_not_follow_starts_no_pass() {
+        let _unlogged = unlogged().await;
+        let store = Ledger::of(0);
+        let subscription = Flaky::default()
+            .builder("sagas")
+            .poll_interval(Duration::from_secs(3600))
+            .start(&store)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(store.reads(), 1, "the pass of the start");
+
+        store.wrote("test/Other", "Happened");
+        store.wrote("test/Thing", "Renamed");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(store.reads(), 1, "neither write holds a followed event");
+
+        store.wrote("test/Thing", "Happened");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(store.reads(), 2, "a followed event starts a pass");
+
+        subscription.shutdown().await.unwrap();
+    }
+
+    /// Issue #531: with a `coalesce` window the writes of a burst are
+    /// handled by one pass, and a write after a quiet time by one at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_burst_of_writes_within_the_coalesce_window_is_one_pass() {
+        let _unlogged = unlogged().await;
+        let store = Ledger::of(0);
+        let subscription = Flaky::default()
+            .builder("sagas")
+            .poll_interval(Duration::from_secs(3600))
+            .coalesce(Duration::from_millis(50))
+            .start(&store)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(store.reads(), 1, "the pass of the start");
+
+        for _ in 0..5 {
+            store.wrote("test/Thing", "Happened");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(store.reads(), 1, "the window is not over");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(store.reads(), 2, "one pass for the five writes");
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(store.reads(), 2);
+        store.wrote("test/Thing", "Happened");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(store.reads(), 3, "an idle subscription is woken at once");
+
+        // The window does not hold a shutdown back.
+        store.wrote("test/Thing", "Happened");
+        subscription.shutdown().await.unwrap();
     }
 }

@@ -16,12 +16,13 @@
 //!
 //! Writes are pushed to each connection as [`ServerFrame::Notify`]: from its
 //! executor's own `write_watch` when it has one, otherwise from a server-wide
-//! channel bumped after each successful `write` handled by any connection
+//! signal fired after each successful `write` handled by any connection
 //! (still low-latency for writes through this server; writers bypassing it
 //! are covered by the client's poll-interval fallback, the same caveat every
 //! `write_watch` backend documents). A connection without a `write_watch`
 //! may thus be woken by a write to another executor; the watch is
-//! level-triggered, so a spurious wakeup costs one empty poll.
+//! level-triggered, so a spurious wakeup costs one empty poll. A connection
+//! serving a tenant is notified of that tenant's writes alone.
 //!
 //! A session may serve one tenant ([`Session::tenant`]): every request on the
 //! connection then acts in that tenant, whatever tenant it names, and the
@@ -33,7 +34,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use evento_core::{Executor, TenantError, TenantFilter};
+use evento_core::{Executor, TenantError, TenantFilter, WriteInterest, WriteSignal};
 use futures_util::stream::SplitStream;
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -233,7 +234,7 @@ fn start<R: Resolver>(
 ) -> ServerHandle {
     let (shutdown_tx, mut shutdown) = watch::channel(false);
     // Wakes the connections whose executor has no `write_watch` of its own.
-    let (bump_tx, _) = watch::channel(0u64);
+    let bump = WriteSignal::new();
     let resolver = Arc::new(resolver);
 
     let accept_task = tokio::spawn(async move {
@@ -247,7 +248,7 @@ fn start<R: Resolver>(
                             peer,
                             Arc::clone(&resolver),
                             tls.clone(),
-                            bump_tx.clone(),
+                            bump.clone(),
                             shutdown.clone(),
                         ));
                     }
@@ -275,7 +276,7 @@ async fn accept<R: Resolver>(
     peer: SocketAddr,
     resolver: Arc<R>,
     tls: Option<TlsAcceptor>,
-    bump_tx: watch::Sender<u64>,
+    bump: WriteSignal,
     shutdown: watch::Receiver<bool>,
 ) {
     let stream = match tls {
@@ -294,7 +295,7 @@ async fn accept<R: Resolver>(
             }
         }
     };
-    connection(stream, peer, resolver, bump_tx, shutdown).await;
+    connection(stream, peer, resolver, bump, shutdown).await;
 }
 
 type Inbound = SplitStream<Framed<ServerStream, LengthDelimitedCodec>>;
@@ -347,7 +348,7 @@ async fn connection<R: Resolver>(
     stream: ServerStream,
     peer: SocketAddr,
     resolver: Arc<R>,
-    bump_tx: watch::Sender<u64>,
+    bump: WriteSignal,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let framed = Framed::new(stream, codec());
@@ -426,12 +427,19 @@ async fn connection<R: Resolver>(
     }
 
     // A backend with its own write_watch covers writes from every process
-    // sharing the store; forward it. Otherwise the Write handlers bump the
-    // server-wide channel (see `handle`).
+    // sharing the store; forward it. Otherwise the Write handlers fire the
+    // server-wide signal (see `handle`). A connection serving a tenant
+    // watches that tenant's writes alone: on a store shared by many tenants
+    // it is not sent a frame, and its subscriptions do not run a pass, for
+    // every write of every other tenant.
     let bump_on_write = executor.write_watch().is_none();
-    let mut notify_rx = executor
-        .write_watch()
-        .unwrap_or_else(|| bump_tx.subscribe());
+    let interest = tenant.as_deref().map(WriteInterest::tenant);
+    let mut notify_rx = match &interest {
+        Some(interest) => executor
+            .write_watch_for(interest)
+            .unwrap_or_else(|| bump.subscribe_to(interest.clone())),
+        None => executor.write_watch().unwrap_or_else(|| bump.subscribe()),
+    };
     let notifier = {
         let out_tx = out_tx.clone();
         let executor = executor.clone();
@@ -504,14 +512,10 @@ async fn connection<R: Resolver>(
         let executor = executor.clone();
         let tenant = tenant.clone();
         let out_tx = out_tx.clone();
-        let bump_tx = bump_tx.clone();
+        let bump = bump_on_write.then(|| bump.clone());
         tokio::spawn(async move {
             let _permit = permit;
-            let is_write = matches!(request, Request::Write { .. } | Request::Replicate { .. });
-            let response = handle(&executor, tenant.as_deref(), request).await;
-            if bump_on_write && is_write && matches!(response, Response::Write(Ok(()))) {
-                bump_tx.send_modify(|g| *g += 1);
-            }
+            let response = handle(&executor, tenant.as_deref(), request, bump.as_ref()).await;
             let frame = ServerFrame::Response {
                 id,
                 response,
@@ -592,16 +596,34 @@ fn present(response: &mut Response) {
 }
 
 /// Serves one request with the session's executor, in the session's tenant
-/// when it serves one (see [`confine`] and [`present`]).
-async fn handle<E: Executor>(executor: &E, tenant: Option<&str>, mut request: Request) -> Response {
-    let Some(tenant) = tenant else {
-        return dispatch(executor, request).await;
-    };
-    if let Some(refusal) = confine(&mut request, tenant) {
-        return refusal;
+/// when it serves one (see [`confine`] and [`present`]). A write that went
+/// through fires `bump`, the server-wide signal of the executors that have
+/// no `write_watch` of their own.
+async fn handle<E: Executor>(
+    executor: &E,
+    tenant: Option<&str>,
+    mut request: Request,
+    bump: Option<&WriteSignal>,
+) -> Response {
+    if let Some(tenant) = tenant {
+        if let Some(refusal) = confine(&mut request, tenant) {
+            return refusal;
+        }
     }
+    // Picked once the events carry the tenant they are written in.
+    let wake = match (&request, bump) {
+        (Request::Write { events } | Request::Replicate { events }, Some(bump)) => {
+            Some(bump.prepare(events))
+        }
+        _ => None,
+    };
     let mut response = dispatch(executor, request).await;
-    present(&mut response);
+    if let (Some(wake), Response::Write(Ok(()))) = (wake, &response) {
+        wake.fire();
+    }
+    if tenant.is_some() {
+        present(&mut response);
+    }
     response
 }
 

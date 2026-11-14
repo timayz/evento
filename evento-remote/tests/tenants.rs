@@ -305,3 +305,33 @@ async fn a_sidecar_follows_only_its_tenant() {
         .unwrap()
         .is_none());
 }
+
+/// Issue #531: a connection serving a tenant is notified of that tenant's
+/// writes, not of every write to the shared store.
+#[tokio::test]
+async fn a_tenant_connection_is_notified_of_its_own_writes_only() {
+    let store = Fjall::temporary().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = serve_with(listener, ByTenant(store.clone()));
+
+    let acme = connect(addr, "acme").await;
+    let globex = connect(addr, "globex").await;
+    let mut notified = acme.write_watch().unwrap();
+    notified.borrow_and_update();
+
+    // Another tenant's client, and the host itself in a third tenant.
+    globex.write(vec![event("a", 1, "")]).await.unwrap();
+    store.write(vec![event("a", 1, "initech")]).await.unwrap();
+    let woken = tokio::time::timeout(std::time::Duration::from_millis(300), notified.changed());
+    assert!(woken.await.is_err(), "no write was in acme");
+
+    globex.write(vec![event("a", 2, "")]).await.unwrap();
+    acme.write(vec![event("a", 1, "")]).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), notified.changed())
+        .await
+        .expect("acme's own write is notified")
+        .unwrap();
+
+    server.shutdown().await;
+}
