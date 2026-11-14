@@ -26,7 +26,7 @@
 //! so a node's local backend holds the whole log and serves complete reads.
 //! Routing reads to owning shards in a multi-shard cluster is a later layer.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -38,8 +38,8 @@ use futures_util::future::try_join_all;
 use ulid::Ulid;
 
 use crate::api::{
-    cursor_at, same_event, slot_of, snapshot_event_size, DataStore, SnapshotPage, StoreBehind,
-    SLOTS,
+    cursor_at, same_event, slot_of, snapshot_event_size, DataStore, Decided, SnapshotPage,
+    StoreBehind, SLOTS,
 };
 use crate::clock::{Timestamp, TxnId};
 use crate::message::Key;
@@ -387,6 +387,46 @@ impl<E: Executor> DataStore for ExecutorDataStore<E> {
             }
             Err(err) => Err(err.into()),
         }
+    }
+
+    async fn apply_all(&self, batch: &[Decided]) -> anyhow::Result<bool> {
+        // Only the plain case goes in one write: every event the next
+        // version of its stream. Anything else — an idempotent re-apply, a
+        // store that is behind — is `apply`'s to judge, one transaction at
+        // a time.
+        let mut next: HashMap<(&str, &str, &str), u16> = HashMap::new();
+        let mut events = Vec::new();
+        for decided in batch.iter().filter(|decided| decided.commit) {
+            for event in &decided.events {
+                let stream = (
+                    event.tenant.as_str(),
+                    event.aggregate_type.as_str(),
+                    event.aggregate_id.as_str(),
+                );
+                let expected = match next.get(&stream) {
+                    Some(expected) => *expected,
+                    None => self
+                        .version(&event.tenant, &event.aggregate_type, &event.aggregate_id)
+                        .await?
+                        .saturating_add(1),
+                };
+                anyhow::ensure!(
+                    event.version == expected,
+                    "{:?} is not the next step of {}/{}: version {}, expected {expected}",
+                    decided.txn,
+                    event.aggregate_type,
+                    event.aggregate_id,
+                    event.version
+                );
+                next.insert(stream, expected.saturating_add(1));
+            }
+            events.extend(decided.events.iter().cloned());
+        }
+        if !events.is_empty() {
+            // One atomic write of the backend: all the transactions, or none.
+            self.local.replicate(events).await?;
+        }
+        Ok(true)
     }
 
     async fn holds(&self, events: &[Event]) -> anyhow::Result<bool> {

@@ -83,8 +83,8 @@ pub mod tcp;
 pub mod transport;
 
 pub use api::{
-    slot_of, validate_layout, DataStore, DynamicTopology, Journal, Layout, MessageSink, RegionId,
-    ShardId, ShardMap, ShardedTopology, StaticTopology, Topology, SLOTS,
+    slot_of, validate_layout, DataStore, Decided, DynamicTopology, Journal, Layout, MessageSink,
+    RegionId, ShardId, ShardMap, ShardedTopology, StaticTopology, Topology, SLOTS,
 };
 pub use backend::ClusterBackend;
 pub use clock::{Clock, HybridLogicalClock, NodeId, MAX_SKEW_MICROS};

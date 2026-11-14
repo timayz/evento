@@ -994,6 +994,20 @@ impl std::fmt::Display for StoreBehind {
 
 impl std::error::Error for StoreBehind {}
 
+/// A decided transaction as a [`DataStore`] enacts it: the arguments of
+/// [`DataStore::apply`], for [`DataStore::apply_all`].
+#[derive(Debug, Clone)]
+pub struct Decided {
+    /// The transaction.
+    pub txn: TxnId,
+    /// Its execution timestamp.
+    pub execute_at: Timestamp,
+    /// This replica's owned events, stamped from `execute_at`.
+    pub events: Vec<Event>,
+    /// The decision: commit (append the events) or abort (a no-op).
+    pub commit: bool,
+}
+
 /// Applied state — the materialised event store on a replica. Backed by an
 /// existing evento backend (`Fjall` / `Sql`). This is where committed
 /// transactions land in execution-timestamp order and where reads,
@@ -1030,6 +1044,22 @@ pub trait DataStore: Send + Sync + 'static {
         events: Vec<Event>,
         commit: bool,
     ) -> anyhow::Result<()>;
+
+    /// Applies several decided transactions in one write to the store — one
+    /// commit, one fsync, where [`apply`](DataStore::apply) costs one each
+    /// (#530) — **all or none**. The node hands it the transactions that
+    /// are ready together, none depending on another, in execution order,
+    /// their events stamped as for [`apply`](DataStore::apply).
+    ///
+    /// `Ok(false)` (the default) when the store has no such write: nothing
+    /// was applied, and the node applies them one at a time. An error says
+    /// the same, whatever its cause — a transaction of the batch that is not
+    /// the plain next step of its streams (a re-apply, a store that is
+    /// behind) included: the node goes on one at a time, and
+    /// [`apply`](DataStore::apply) tells which transaction it was, and why.
+    async fn apply_all(&self, _batch: &[Decided]) -> anyhow::Result<bool> {
+        Ok(false)
+    }
 
     /// Whether this store already holds every event of `events`: each
     /// aggregate's event at that version is that very event: the same id,

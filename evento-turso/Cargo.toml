@@ -55,6 +55,10 @@ name = "cluster_backend"
 required-features = ["cluster"]
 
 [[test]]
+name = "cluster_writes"
+required-features = ["cluster"]
+
+[[test]]
 name = "fts"
 required-features = ["fts"]
 

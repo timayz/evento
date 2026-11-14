@@ -31,6 +31,8 @@ pub struct Metrics {
     pub watermark_clamps: AtomicU64,
     /// Group-commit journal flushes performed.
     pub journal_flushes: AtomicU64,
+    /// Transactions the data store took in a write shared with others.
+    pub applies_batched: AtomicU64,
     /// Anti-entropy contacts found truncated above what this node vouched
     /// for: the window in between can no longer be shipped to it, so it
     /// cannot be repaired by anti-entropy (compaction outran repair, a
@@ -237,6 +239,12 @@ impl Metrics {
         self.journal_flushes.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records `count` transactions the data store took in one write.
+    pub fn record_applies_batched(&self, count: usize) {
+        self.applies_batched
+            .fetch_add(count as u64, Ordering::Relaxed);
+    }
+
     /// Records an anti-entropy contact found truncated above what this node
     /// vouched for.
     pub fn record_sync_contact_truncated(&self) {
@@ -425,6 +433,7 @@ impl Metrics {
             compactions: self.compactions.load(Ordering::Relaxed),
             watermark_clamps: self.watermark_clamps.load(Ordering::Relaxed),
             journal_flushes: self.journal_flushes.load(Ordering::Relaxed),
+            applies_batched: self.applies_batched.load(Ordering::Relaxed),
             sync_contact_truncated: self.sync_contact_truncated.load(Ordering::Relaxed),
             messages_handled: self.messages_handled.load(Ordering::Relaxed),
             messages_shed: self.messages_shed.load(Ordering::Relaxed),
@@ -478,6 +487,7 @@ pub struct MetricsSnapshot {
     pub compactions: u64,
     pub watermark_clamps: u64,
     pub journal_flushes: u64,
+    pub applies_batched: u64,
     pub sync_contact_truncated: u64,
     pub messages_handled: u64,
     pub messages_shed: u64,
@@ -521,7 +531,7 @@ impl MetricsSnapshot {
     /// source of truth for both [`to_prometheus`](Self::to_prometheus) and
     /// [`to_prometheus_labeled`](Self::to_prometheus_labeled); add a counter here and
     /// both renderings pick it up.
-    fn counters(&self) -> [(&'static str, &'static str, u64); 44] {
+    fn counters(&self) -> [(&'static str, &'static str, u64); 45] {
         [
             (
                 "cluster_writes_committed_total",
@@ -562,6 +572,11 @@ impl MetricsSnapshot {
                 "cluster_journal_flushes_total",
                 "Group-commit journal flushes performed.",
                 self.journal_flushes,
+            ),
+            (
+                "cluster_applies_batched_total",
+                "Transactions the data store took in a write shared with others.",
+                self.applies_batched,
             ),
             (
                 "cluster_sync_contact_truncated_total",

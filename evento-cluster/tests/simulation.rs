@@ -4116,6 +4116,14 @@ impl SwarmConfig {
             peer_absence_limit,
             ..NodeConfig::default()
         };
+        // Drawn apart (#530), so the shapes of the seeds found before these
+        // two settings existed stand as they were.
+        let mut later = StdRng::seed_from_u64(seed ^ SWARM_SALT ^ 0x530);
+        let config = NodeConfig {
+            max_apply_batch: [1, 4, 128][later.random_range(0..3)],
+            lazy_flush: Duration::from_millis([0, 5, 50, 500][later.random_range(0..4)]),
+            ..config
+        };
         SwarmConfig {
             n,
             crash: rng.random_bool(0.5),
