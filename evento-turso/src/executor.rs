@@ -51,6 +51,20 @@ const APP_CONNECTIONS: usize = 16;
 /// run again after a pause that is slept (issue #536).
 pub const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// How much a store in [`WriteMode::Concurrent`] lets Turso's logical log
+/// grow, in bytes, before a commit checkpoints it into the database file
+/// (see [`Turso::checkpoint_every`]): 256 KiB, where Turso's own default is
+/// about 4 MB.
+///
+/// A checkpoint stops the world: until it ends no transaction begins, a
+/// read included, and it lasts in proportion to the log it moves — about
+/// 170 ms a megabyte, some 20 ms more on a file (issue #544). Under a burst
+/// of writes the store is closed for the same share of the time whatever
+/// the threshold; what the threshold sets is how long at once. At Turso's
+/// default that is 0.7 s every 7,000 events or so; at this one, 40 to 70 ms
+/// every 450.
+pub const CHECKPOINT_BYTES: u64 = 256 * 1024;
+
 /// Which write connection a statement goes through.
 #[derive(Clone, Copy)]
 enum Durability {
@@ -266,6 +280,12 @@ impl Turso {
     pub async fn from_database(db: turso::Database) -> anyhow::Result<Self> {
         let write = connect(&db)?;
         let mode = write::write_mode_of(&write).await?;
+        if mode == WriteMode::Concurrent {
+            // Not recorded in the file: set at every open.
+            write
+                .pragma_update("mvcc_checkpoint_threshold", CHECKPOINT_BYTES as i64)
+                .await?;
+        }
         let relaxed = connect(&db)?;
         relaxed.pragma_update("synchronous", "NORMAL").await?;
         let q = query::prepare(
@@ -316,6 +336,50 @@ impl Turso {
     /// and what the application's should (see [`transaction`](Self::transaction)).
     pub fn write_mode(&self) -> WriteMode {
         self.mode
+    }
+
+    /// Sets how much the logical log of a store in
+    /// [`WriteMode::Concurrent`] grows before a commit checkpoints it:
+    /// `bytes` of log ([`CHECKPOINT_BYTES`] unless set), or never by itself
+    /// with `None`. For the database, whichever handle sets it; not recorded
+    /// in the file, so set it again after each open.
+    ///
+    /// A checkpoint stops the world for about 170 ms a megabyte of log, so a
+    /// lower threshold makes the waits shorter and more frequent, a higher
+    /// one rarer and longer, and neither changes their sum. A larger log
+    /// also keeps more row versions in memory and takes longer to replay at
+    /// the next open (about 50 ms a megabyte). With `None` the log is only
+    /// checkpointed by [`checkpoint`](Self::checkpoint): for a store that
+    /// cannot afford a wait under load and has a quiet hour to pay it in.
+    ///
+    /// An error on a store in [`WriteMode::Serial`], which has no such log.
+    pub async fn checkpoint_every(&self, bytes: Option<u64>) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.mode == WriteMode::Concurrent,
+            "only a store in concurrent mode checkpoints a logical log"
+        );
+        let threshold = match bytes {
+            Some(bytes) => i64::try_from(bytes).unwrap_or(i64::MAX),
+            None => -1,
+        };
+        self.write
+            .lock()
+            .await
+            .pragma_update("mvcc_checkpoint_threshold", threshold)
+            .await?;
+        Ok(())
+    }
+
+    /// Checkpoints the database now: what was written since the last
+    /// checkpoint moves into the database file. In
+    /// [`WriteMode::Concurrent`] nothing else begins until it ends (see
+    /// [`checkpoint_every`](Self::checkpoint_every)); run again by the
+    /// caller if the database is busy.
+    pub async fn checkpoint(&self) -> anyhow::Result<()> {
+        let conn = self.write.lock().await;
+        let mut rows = conn.query("PRAGMA wal_checkpoint(TRUNCATE)", ()).await?;
+        while rows.next().await?.is_some() {}
+        Ok(())
     }
 
     /// Runs `body` over `env` as one transaction of the application's own,
@@ -1166,6 +1230,54 @@ mod tests {
     }
 
     use super::*;
+
+    /// The checkpoint threshold of `store`'s database, in bytes.
+    async fn checkpoint_threshold(store: &Turso) -> anyhow::Result<i64> {
+        let conn = store.connect()?;
+        let mut rows = conn.query("PRAGMA mvcc_checkpoint_threshold", ()).await?;
+        let row = rows.next().await?.expect("the pragma returns a row");
+        Ok(row.get::<i64>(0)?)
+    }
+
+    /// Issue #544: a checkpoint stops the world for as long as its log is
+    /// large, so a concurrent store keeps the log short, at every open, and
+    /// lets the application choose otherwise.
+    #[tokio::test]
+    async fn a_concurrent_store_checkpoints_a_short_log() -> anyhow::Result<()> {
+        let store = Turso::temporary_concurrent().await?;
+        assert_eq!(checkpoint_threshold(&store).await?, CHECKPOINT_BYTES as i64);
+        store.checkpoint_every(Some(1 << 20)).await?;
+        assert_eq!(checkpoint_threshold(&store).await?, 1 << 20);
+        store.checkpoint_every(None).await?;
+        assert_eq!(checkpoint_threshold(&store).await?, -1);
+
+        // Never by itself: the events stay in the log until asked.
+        let event = |id: &str| Event {
+            id: ulid::Ulid::generate(),
+            aggregate_type: "demo/Page".into(),
+            aggregate_id: id.into(),
+            version: 1,
+            name: "Created".into(),
+            ..Default::default()
+        };
+        store.write(vec![event("p1")]).await?;
+        store.checkpoint().await?;
+        store.write(vec![event("p2")]).await?;
+        let read = store
+            .read(
+                Some([EventFilter::by_type_raw("demo/Page")].into()),
+                None,
+                TenantFilter::All,
+                Args::forward(10, None),
+                None,
+            )
+            .await?;
+        assert_eq!(read.edges.len(), 2, "a checkpoint loses nothing");
+
+        let serial = Turso::in_memory().await?;
+        assert!(serial.checkpoint_every(None).await.is_err());
+        Ok(())
+    }
 
     /// A store holding a few events of two types; the cursor of the last one.
     async fn store() -> anyhow::Result<(Turso, Value)> {

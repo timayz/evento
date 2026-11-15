@@ -148,7 +148,49 @@ first let Turso retry for `BUSY_TIMEOUT` (50 ms); its read connections do not, b
 Turso polls through that wait with a thread kept busy and a store under writes
 checkpoints often. Take the connections you only read with from
 `store.connect_read()`: `Reader` and the `fetch_*` helpers retry a `Busy` read the
-same way. `store.write_mode()` tells
+same way.
+
+How long that moment lasts is set by how much there is to checkpoint: about 170 ms
+for each megabyte of Turso's logical log, some 20 ms more on a file, with every
+transaction waiting meanwhile. A store in MVCC mode therefore keeps the log short:
+it checkpoints every 256 KiB (`CHECKPOINT_BYTES`; Turso's own default is about 4 MB),
+which under a burst of writes is a wait of 40 to 70 ms every 450 events or so where
+Turso's default gives 0.7 s every 7,000. The share of the time the store is closed is
+the same either way; so is the time the writes take.
+`store.checkpoint_every(Some(bytes))` sets another threshold and
+`store.checkpoint_every(None)` leaves the log to `store.checkpoint()`, for a store
+that has a quiet hour to pay the wait in (a log left to grow keeps its row versions
+in memory and is replayed at the next open, about 50 ms a megabyte). Neither is
+recorded in the file: set it after each open.
+
+Turso has a checkpoint that does not stop the world, behind an experimental flag. On
+the measurement of issue #544 it removed the waits altogether (the longest read took
+5 ms on a file where the default's took 750 ms), and this crate's tests pass with it;
+it is still Turso's experiment, so the store does not switch it on. To try it, build
+the database yourself:
+
+```rust,no_run
+# async fn run() -> anyhow::Result<()> {
+use evento_turso::{enable_concurrent_writes, Turso, MIGRATIONS};
+
+let db = Turso::builder("./events.db")
+    .experimental_mvcc_passive_checkpoint(true)
+    .build()
+    .await?;
+enable_concurrent_writes(&db).await?;
+let mut conn = db.connect()?;
+MIGRATIONS
+    .to_latest(&mut conn)
+    .await
+    .map_err(|(applied, err)| anyhow::anyhow!("after {applied} migrations: {err}"))?;
+let store = Turso::from_database(db).await?;
+# let _ = store;
+# Ok(())
+# }
+```
+
+`cargo test -p evento-turso --test concurrent sizing_mvcc -- --ignored --nocapture`
+prints the measurement for your disk. `store.write_mode()` tells
 which mode the database is in (`WriteMode::Serial` or
 `WriteMode::Concurrent`); `evento_turso::transaction(&mut conn, mode, &env, body)` is
 the same loop on a connection of yours, and `is_retryable(&err)` the test it applies
