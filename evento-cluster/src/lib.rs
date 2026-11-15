@@ -92,9 +92,10 @@ pub use executor::{ClusterExecutor, ExecutorDataStore};
 pub use host::{Cluster, LiveNode, NodeHealth, PeerState, Settings};
 pub use metrics::{Metrics, MetricsSnapshot};
 pub use node::{
-    BacklogAtCap, CommandTooLarge, CommitOutcome, FenceNotCovered, Invalidated, Joining,
-    JournalRolledBack, LostJournal, Node, NodeClosed, NodeConfig, OpenUnconfirmed, PartialSnapshot,
-    RejoinRequired, SweepPressure, TopologyChanging, MAX_COMMAND_BYTES,
+    BacklogAtCap, CommandTooLarge, CommitOutcome, FenceNotCovered, Foundation, FoundedApart,
+    Invalidated, Joining, JournalRolledBack, LostJournal, Node, NodeClosed, NodeConfig,
+    OpenUnconfirmed, PartialSnapshot, RejoinRequired, SweepPressure, TopologyChanging,
+    MAX_COMMAND_BYTES,
 };
 pub use store::{InMemoryDataStore, InMemoryJournal};
 pub use tcp::{serve, serve_tls, serve_tls_verified, PeerCerts, TcpTransport, TlsClient};

@@ -113,6 +113,10 @@ pub struct Metrics {
     /// stops taking part until its host opens it again over an empty
     /// journal and store, joining.
     pub journals_rolled_back: AtomicU64,
+    /// Times this node found itself of another group than enough of its
+    /// peers that the rest cannot make a quorum (#541): its store is not
+    /// the one their group was founded over. It stops taking part.
+    pub founded_apart: AtomicU64,
     /// Votes refused for a transaction whose `t0` lies more than two clock
     /// skews past this node's clock: its coordinator's clock runs beyond the
     /// skew bound.
@@ -291,6 +295,11 @@ impl Metrics {
         self.amnesia_fences.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records this node found of another group than its peers.
+    pub fn record_founded_apart(&self) {
+        self.founded_apart.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Records a journal a peer found rolled back.
     pub fn record_journal_rolled_back(&self) {
         self.journals_rolled_back.fetch_add(1, Ordering::Relaxed);
@@ -452,6 +461,7 @@ impl Metrics {
             amnesia_fences: self.amnesia_fences.load(Ordering::Relaxed),
             amnesia_joins_refused: self.amnesia_joins_refused.load(Ordering::Relaxed),
             journals_rolled_back: self.journals_rolled_back.load(Ordering::Relaxed),
+            founded_apart: self.founded_apart.load(Ordering::Relaxed),
             votes_future_dated: self.votes_future_dated.load(Ordering::Relaxed),
             config_votes_withheld: self.config_votes_withheld.load(Ordering::Relaxed),
             config_votes_restored: self.config_votes_restored.load(Ordering::Relaxed),
@@ -506,6 +516,7 @@ pub struct MetricsSnapshot {
     pub amnesia_fences: u64,
     pub amnesia_joins_refused: u64,
     pub journals_rolled_back: u64,
+    pub founded_apart: u64,
     pub votes_future_dated: u64,
     pub config_votes_withheld: u64,
     pub config_votes_restored: u64,
@@ -531,7 +542,7 @@ impl MetricsSnapshot {
     /// source of truth for both [`to_prometheus`](Self::to_prometheus) and
     /// [`to_prometheus_labeled`](Self::to_prometheus_labeled); add a counter here and
     /// both renderings pick it up.
-    fn counters(&self) -> [(&'static str, &'static str, u64); 45] {
+    fn counters(&self) -> [(&'static str, &'static str, u64); 46] {
         [
             (
                 "cluster_writes_committed_total",
@@ -667,6 +678,11 @@ impl MetricsSnapshot {
                 "cluster_journals_rolled_back_total",
                 "Times a peer found this node's journal rolled back to an older copy.",
                 self.journals_rolled_back,
+            ),
+            (
+                "cluster_founded_apart_total",
+                "Times this node found itself of another group than its peers: founded over another store.",
+                self.founded_apart,
             ),
             (
                 "cluster_votes_future_dated_total",

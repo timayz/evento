@@ -10,7 +10,10 @@
 //! copy — empties it and opens it by joining, runs the inbox loop and the
 //! recovery sweep, and watches the signals that end a node's part in the
 //! cluster (told to rejoin, journal rolled back), marking the store for a
-//! copy at the next start and saying so in the log.
+//! copy at the next start and saying so in the log. A store marked as the
+//! one a new group begins with ([`Cluster::mark_for_founding`]) is opened
+//! over an empty journal instead: how a group comes back from one node's
+//! store, copied while it served.
 //!
 //! ```rust,ignore
 //! let (cluster, executor) = Cluster::builder(store)
@@ -253,6 +256,43 @@ impl RejoinMark {
     }
 }
 
+/// The mark that the store under a state directory is what a **new group**
+/// begins with (`<state_dir>/found`, [`Cluster::mark_for_founding`]): the
+/// next open discards the journal that came with the store and founds the
+/// group over it ([`Node::found_over_store`]). Left on every node of the
+/// group, each over the same copy.
+struct FoundMark;
+
+impl FoundMark {
+    const FILE: &'static str = "found";
+
+    fn path(state_dir: &Path) -> PathBuf {
+        state_dir.join(Self::FILE)
+    }
+
+    fn present(state_dir: &Path) -> anyhow::Result<bool> {
+        let path = Self::path(state_dir);
+        path.try_exists()
+            .with_context(|| format!("cannot read {}", path.display()))
+    }
+
+    fn write(state_dir: &Path) -> anyhow::Result<PathBuf> {
+        std::fs::create_dir_all(state_dir)
+            .with_context(|| format!("cannot create {}", state_dir.display()))?;
+        let path = Self::path(state_dir);
+        std::fs::write(&path, "").with_context(|| format!("cannot write {}", path.display()))?;
+        Ok(path)
+    }
+
+    fn clear(state_dir: &Path) -> anyhow::Result<()> {
+        match std::fs::remove_file(Self::path(state_dir)) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err.into()),
+        }
+    }
+}
+
 /// Another node, as this one sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerState {
@@ -299,16 +339,27 @@ pub struct NodeHealth {
     /// The journal is an older copy of itself: the node refuses writes
     /// until it copies the store and the journal back (restart it).
     pub rolled_back: bool,
+    /// This node is of another group than its peers: its store is not the
+    /// one their group was founded over ([`Cluster::mark_for_founding`]).
+    /// It refuses writes until it is founded again over the group's store,
+    /// or copies it back ([`RejoinMark::DiscardJournal`]).
+    pub founded_apart: bool,
     /// Whether the store is marked for a copy at the next start.
     pub copy_pending: bool,
     /// Whether this start copied the store from a peer.
     pub joined_at_start: bool,
+    /// Whether this start founded a group over the store.
+    pub founded_at_start: bool,
 }
 
 impl NodeHealth {
     /// Whether the node takes writes: confirmed, and nothing ended its part.
     pub fn serving(&self) -> bool {
-        self.confirmed && !self.rejoin_required && !self.rolled_back && !self.copy_pending
+        self.confirmed
+            && !self.rejoin_required
+            && !self.rolled_back
+            && !self.founded_apart
+            && !self.copy_pending
     }
 }
 
@@ -431,6 +482,17 @@ impl<E: ClusterBackend> Builder<E> {
             Some(dir) => RejoinMark::read(dir)?,
             None => None,
         };
+        let found = match &state_dir {
+            Some(dir) => FoundMark::present(dir)?,
+            None => false,
+        };
+        if let (Some(mark), true, Some(dir)) = (mark, found, state_dir.as_deref()) {
+            anyhow::bail!(
+                "{} asks for a copy of the store ({mark:?}) and {} for a group founded over it: remove one of them",
+                RejoinMark::path(dir).display(),
+                FoundMark::path(dir).display()
+            );
+        }
         if let (Some(mark), false) = (mark, has_peers) {
             let dir = state_dir.as_deref().unwrap_or(Path::new("."));
             anyhow::bail!(
@@ -446,6 +508,15 @@ impl<E: ClusterBackend> Builder<E> {
                 .await
                 .context("cannot open the consensus journal")?,
         };
+        if found {
+            // The journal that came with the store is its source's: no node
+            // of the new group cast those votes.
+            tracing::warn!("a new group is to be founded over the store");
+            store
+                .discard_journal()
+                .await
+                .context("cannot discard the journal that came with the store")?;
+        }
         if let Some(mark) = mark {
             tracing::warn!(?mark, "the store is to be copied from a peer");
             if mark == RejoinMark::DiscardJournal {
@@ -517,6 +588,23 @@ impl<E: ClusterBackend> Builder<E> {
                 tracing::warn!(%err, "cannot remove the rejoin mark");
             }
             tracing::info!("store copied from a peer");
+        } else if found {
+            match node.found_over_store().await {
+                Ok(foundation) => tracing::info!(
+                    group = foundation.group,
+                    events = foundation.events,
+                    "group founded over the store"
+                ),
+                Err(err) => {
+                    abort_all(tasks).await;
+                    return Err(err.context("cannot found a group over the store"));
+                }
+            }
+            // The group is in the journal: from here on an open is plain.
+            if let Some(Err(err)) = state_dir.as_deref().map(FoundMark::clear) {
+                tracing::warn!(%err, "cannot remove the founding mark");
+            }
+            tasks.push(node.start(inbox));
         } else {
             match node.recover_state().await {
                 Ok(()) => {}
@@ -562,6 +650,7 @@ impl<E: ClusterBackend> Builder<E> {
             ids,
             tasks: Mutex::new(tasks),
             joined: mark.is_some(),
+            founded: found,
             copy_pending,
         });
         Ok((cluster, executor))
@@ -588,6 +677,7 @@ pub struct Cluster {
     /// The inbox loop, the recovery sweep, the listener and the signal watch.
     tasks: Mutex<Vec<JoinHandle<()>>>,
     joined: bool,
+    founded: bool,
     copy_pending: Arc<AtomicBool>,
 }
 
@@ -610,6 +700,26 @@ impl Cluster {
     /// that the others gave up on. Run with the node stopped.
     pub fn mark_for_rejoin(state_dir: impl AsRef<Path>) -> anyhow::Result<PathBuf> {
         RejoinMark::KeepJournal.write(state_dir.as_ref())
+    }
+
+    /// Marks the store under `state_dir` as what a **new group** begins
+    /// with: the next open discards the journal that came with it and
+    /// founds the group over its events
+    /// ([`Node::found_over_store`]). For bringing a group back from **one
+    /// node's store**, copied while the group served (a `VACUUM INTO` of a
+    /// Turso or SQLite store, say): stop every node, put the same copy
+    /// under each, mark each, start them. The nodes take no part until a
+    /// majority of them opened over the same events; one founded over
+    /// another copy, or left out, is refused ([`NodeHealth::founded_apart`])
+    /// rather than left to diverge. Subscriptions go on from the cursors
+    /// the copy holds. The mark is removed once the group is founded.
+    ///
+    /// What the nodes of the old group agreed on after the copy was taken
+    /// is gone, as with any backup. A node of the old group that comes back
+    /// later over its own files is refused the same way: mark it for a copy
+    /// with its journal discarded ([`RejoinMark::DiscardJournal`]).
+    pub fn mark_for_founding(state_dir: impl AsRef<Path>) -> anyhow::Result<PathBuf> {
+        FoundMark::write(state_dir.as_ref())
     }
 
     /// The node itself, for what the host does not cover.
@@ -696,8 +806,10 @@ impl Cluster {
             confirmed: self.node.confirmed(),
             rejoin_required: self.node.rejoin_required(),
             rolled_back: self.node.rolled_back(),
+            founded_apart: self.node.founded_apart(),
             copy_pending: self.copy_pending.load(Ordering::Acquire),
             joined_at_start: self.joined,
+            founded_at_start: self.founded,
         }
     }
 
@@ -830,8 +942,21 @@ fn watch_signals(
     tokio::spawn(async move {
         let mut rejoin = node.rejoin_signal();
         let mut rolled_back = node.rolled_back_signal();
+        let mut apart = node.founded_apart_signal();
         loop {
             let mark = tokio::select! {
+                changed = apart.changed() => {
+                    if changed.is_err() { return; }
+                    if *apart.borrow() {
+                        // Not marked for a copy: when no majority was founded
+                        // alike, a copy would empty the stores the group is
+                        // to begin with.
+                        tracing::error!(
+                            "this node is of another group than its peers and refuses writes: its store is not the one their group was founded over. Put the group's store back and mark it (`Cluster::mark_for_founding`), or mark it for a copy with its journal discarded (`RejoinMark::DiscardJournal`), then restart it"
+                        );
+                    }
+                    continue;
+                }
                 changed = rejoin.changed() => {
                     if changed.is_err() { return; }
                     if !*rejoin.borrow() { continue; }

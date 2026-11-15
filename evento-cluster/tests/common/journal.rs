@@ -416,6 +416,12 @@ impl Journal for FaultJournal {
     async fn load_born(&self) -> anyhow::Result<Option<u64>> {
         self.durable.journal().load_born().await
     }
+    async fn save_foundation(&self, group: u64) -> anyhow::Result<()> {
+        self.durable.journal().save_foundation(group).await
+    }
+    async fn load_foundation(&self) -> anyhow::Result<Option<u64>> {
+        self.durable.journal().load_foundation().await
+    }
     async fn save_vote_fence(&self, fence: Timestamp) -> anyhow::Result<()> {
         self.stage_write(Staged::VoteFence(fence));
         Ok(())

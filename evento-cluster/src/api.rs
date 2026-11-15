@@ -585,6 +585,13 @@ pub struct DurableMark {
     /// opened (see [`Journal::save_born`]), or 0 for a journal that keeps
     /// none. Two journals of one node id are told apart by it (#453).
     pub born: u64,
+    /// The group the replica belongs to: the digest of the store the group
+    /// was founded over ([`Journal::save_foundation`], #541), 0 for a group
+    /// that began empty. `None` while the replica does not know it yet: it
+    /// lost its journal, or is new, and has not copied a contact's state.
+    /// Two replicas that both know their group and differ are of two
+    /// groups ([`foreign_to`](Self::foreign_to)).
+    pub group: Option<u64>,
 }
 
 impl Default for DurableMark {
@@ -595,11 +602,20 @@ impl Default for DurableMark {
             clock_bound: 0,
             vote_fence: Timestamp::MIN,
             born: 0,
+            group: Some(0),
         }
     }
 }
 
 impl DurableMark {
+    /// Whether this mark and `other` come from replicas of two groups: both
+    /// know their group, and they differ (#541). One was founded over a
+    /// store the other was not, so their stores hold different histories
+    /// and neither may count the other's votes.
+    pub fn foreign_to(&self, other: &DurableMark) -> bool {
+        matches!((self.group, other.group), (Some(mine), Some(theirs)) if mine != theirs)
+    }
+
     /// Whether a journal holding this mark lost nothing a peer saw of it as
     /// `seen`: it is of a later life, or of the same life, the same journal
     /// ([`same_journal`](Self::same_journal)) and at or above it in both
@@ -641,6 +657,7 @@ impl DurableMark {
                 } else {
                     self.born
                 },
+                group: self.group.or(other.group),
             },
         }
     }
@@ -800,6 +817,25 @@ pub trait Journal: Send + Sync + 'static {
 
     /// The persisted clock bound, if any. The default returns none.
     async fn load_clock_bound(&self) -> anyhow::Result<Option<u64>> {
+        Ok(None)
+    }
+
+    /// Durably persists the **group** this replica belongs to (#541): the
+    /// digest of the store its group was founded over
+    /// ([`Node::found_over_store`](crate::Node::found_over_store)), or the
+    /// group of the contact a replica that lost its journal copied its
+    /// state from. Durable by the time it returns, written once per journal
+    /// and kept across [`truncate`](Journal::truncate). The default is a
+    /// no-op: the node reads it back before relying on it, so a journal
+    /// that cannot keep it cannot found a group.
+    async fn save_foundation(&self, group: u64) -> anyhow::Result<()> {
+        let _ = group;
+        Ok(())
+    }
+
+    /// The persisted group, if any (see
+    /// [`save_foundation`](Self::save_foundation)). The default returns none.
+    async fn load_foundation(&self) -> anyhow::Result<Option<u64>> {
         Ok(None)
     }
 
@@ -1739,6 +1775,7 @@ mod tests {
             clock_bound,
             vote_fence: at(fence),
             born: 0,
+            group: Some(0),
         };
         let seen = mark(0, 500, 300);
         assert!(seen.covers(&seen));

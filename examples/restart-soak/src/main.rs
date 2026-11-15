@@ -178,6 +178,16 @@ impl<J: Journal> Journal for TimedJournal<J> {
     async fn load_born(&self) -> anyhow::Result<Option<u64>> {
         self.inner.load_born().await
     }
+    async fn save_foundation(&self, group: u64) -> anyhow::Result<()> {
+        timed!(
+            self.node,
+            "journal.save_foundation",
+            self.inner.save_foundation(group)
+        )
+    }
+    async fn load_foundation(&self) -> anyhow::Result<Option<u64>> {
+        self.inner.load_foundation().await
+    }
     async fn save_vote_fence(
         &self,
         fence: evento::cluster::protocol::Timestamp,

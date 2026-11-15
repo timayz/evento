@@ -451,8 +451,11 @@ where
     assert_eq!(journal.load_clock_bound().await.unwrap(), None);
     journal.save_clock_bound(400).await.unwrap();
     journal.save_clock_bound(900).await.unwrap();
+    assert_eq!(journal.load_foundation().await.unwrap(), None);
+    journal.save_foundation(91).await.unwrap();
     journal.truncate(timestamp(1_000, 0)).await.unwrap();
     assert_eq!(journal.load_clock_bound().await.unwrap(), Some(900));
+    assert_eq!(journal.load_foundation().await.unwrap(), Some(91));
 }
 
 /// The amnesia fence round-trips, keeps the last value written (a join marks
@@ -610,6 +613,7 @@ where
         clock_bound,
         vote_fence: timestamp(clock_bound / 2, 0),
         born: 0,
+        group: Some(0),
     };
     assert!(journal.load_peer_marks().await.unwrap().is_empty());
     journal

@@ -56,7 +56,10 @@ colocated with the store, `recover_state` — or, when the store is marked for a
 and the watch on `rejoin_signal` / `rolled_back_signal` that marks the store
 (`<state_dir>/rejoin`) and tells the operator to restart the node. A node told to
 rejoin, a rolled-back journal, a lost store (`Cluster::mark_for_rejoin`) or a lost
-journal (the open marks it itself) all come back the same way: restart. `Builder::node_config`
+journal (the open marks it itself) all come back the same way: restart. A store
+marked as the one a new group begins with (`Cluster::mark_for_founding`,
+`<state_dir>/found`) is opened through `Node::found_over_store` instead, the journal
+that came with it discarded (§8, a group brought back from one node's store). `Builder::node_config`
 adjusts the derived `NodeConfig`; `Builder::before_copy` runs what the application
 derives from the events (read models next to them) once the store was emptied.
 
@@ -190,6 +193,7 @@ Serve it on an HTTP endpoint (see `bank-axum-cluster`'s `/metrics`). Counters:
 | `votes_future_dated` | votes refused for a transaction dated more than two clock skews past this node's clock: its coordinator's clock runs beyond the skew bound (§3). Any count = a clock out of bounds; fix its time source. |
 | `amnesia_fences` | times this node opened joining over an empty journal and fenced itself (§7, lost journal). |
 | `amnesia_joins_refused` | joins over a lost journal that found no contact vouching past the fence (`FenceNotCovered`, nothing installed). A few while the contact's report catches up; **steadily rising** = a transaction below the fence no replica can decide any more (§7). |
+| `founded_apart` | times this node found itself of another group than enough of its peers that the rest cannot make a quorum: its store is not the one their group was founded over (§8, #541). Any count = the node stopped: found it again over the group's store, or delete its journal and store and open it joining. |
 | `journals_rolled_back` | times a peer found this node's journal rolled back to an older copy at its open, or found it reporting from another journal than the one it ran under — a fresh journal under a known node id (§7, #453). Any count = the node stopped: delete its journal and store, and open it joining. |
 | `config_votes_withheld` | config-Paxos promises and accepts this node withheld: it lost a journal under its node id, and abstains from config Paxos until it restored its votes (§7). **Still rising** long after its join = it cannot hear a majority of the voting acceptors (a partition, or too many acceptors lost their journals at once). |
 | `config_votes_restored` | times this node, back over a lost journal, read a majority of the other acceptors' state and voted in config Paxos again (§7). One per loss. |
@@ -737,12 +741,68 @@ through `ClusterExecutor`) — split it into several writes.
   Delete it instead, and bring the node back over an empty journal by joining (§7,
   lost journal). **The one copy that may be restored is a cold copy of the whole
   group**: every node's store and journal copied while every node is stopped, and
-  all of them put back before any node starts (a load test starting over from one
+  all of them put back before any node starts — or one node's store alone, as a new
+  group (below) — (a load test starting over from one
   state, #452). It is the group as it was at the stop — a whole-group restart (§7)
   — and what it forgets, every node forgets alike; a node that ran on after the
   copy and is then put back alone, or a copy of some nodes only, is the rolled-back
   journal above. The journal is bounded by
   compaction; the event store grows with history.
+- **A group brought back from one node's store** (#541): a copy of **one** node's
+  store taken while the group served — Turso's or SQLite's `VACUUM INTO`, which gives
+  one file holding the events, the cursors and the `cluster_*` tables as they stood
+  at one moment — restores nowhere as it is: its journal is that node's alone. It is
+  what a **new group** begins with instead. Stop every node, put the same copy under
+  each, mark each (`Cluster::mark_for_founding(state_dir)`, the file
+  `<state_dir>/found`) and start them. Each node discards the journal that came with
+  the copy, reads the whole store, journals a digest of its events as its **group**
+  (`Journal::save_foundation`; the `cluster_meta` row / Fjall `meta` key `foundation`,
+  no migration), and starts its clock above the newest event; the mark is removed.
+  By hand: `discard_journal`, then `Node::found_over_store()` in place of
+  `recover_state()`, once. What follows is a group like any other, and its next opens
+  are plain. Subscriptions go on from the cursors the copy holds; what the application
+  derives from the events and keeps elsewhere is rebuilt or restored with them.
+  - **What is lost** is what any backup loses: every write the old group
+    acknowledged after the copy was taken.
+  - **Every node opens over the same events, or does not serve.** A founded node
+    takes no part until a slow quorum of its shard, itself included, opened over the
+    same group (the open handshake of §7, `Node::confirmed()`); two of three are
+    enough, and the third may be founded later, or come back by joining. Every
+    watermark report and every open carries its sender's group (`DurableMark::group`:
+    the digest, 0 for a group that began empty). A node of another group — founded
+    over another copy, left out of the restore, or still running for the old group —
+    is told so (`Message::FoundedApart`) and counted for nothing: no vote of the open
+    handshake, no report, and none of the marks it holds against the old nodes'
+    ids stops a founded one. Once the nodes of its own group can no longer make a slow
+    quorum of its shard, a node stops: `Node::founded_apart()` and
+    `founded_apart_signal()` turn on, it drops every message, writes fail with
+    `FoundedApart` (`WriteError::Unavailable` through `ClusterExecutor`),
+    `NodeHealth::founded_apart` shows it and `cluster_founded_apart_total` counts it.
+    So of three nodes founded over two copies, the two alike serve and the third
+    stops; over three different copies, all three stop.
+  - **A node founded apart, or left out**, comes back one of two ways: stopped, the
+    group's copy put under it and marked for founding again; or its journal and its
+    store discarded and the store copied from the group (`<state_dir>/rejoin` holding
+    `discard-journal`, §7, lost journal). The host does neither by itself: when no
+    majority was founded alike, a copy would empty the stores the group is to begin
+    with. A node that joins takes its contact's group with the state it copies
+    (`Message::JoinProof`), journaled before anything is installed; one whose kept
+    journal names another group copies nothing (keep-journal is for a node of the
+    group).
+  - **Stop the old group first.** A node founded while a majority of the old group
+    still runs is the one of another group, and stops; nothing is lost, start it
+    again once the others are founded.
+  - **Refused:** a journal that holds anything (a group is founded once; the next
+    restore discards the journal again, which the mark does); a layout of several
+    shards (a node's store holds its own shards alone); a store whose newest event
+    is dated past the node's clock by more than the skew bound (check the clock: a
+    write is dated above every stored one); a journal that cannot keep the group
+    (`Journal::save_foundation` on its default). A node alone founds its group and
+    serves at once.
+  - **What the digest is:** each event's id, stream, version and stamp, hashed and
+    summed, with their count — the same on every node whatever order its backend
+    pages in. Two stores holding the same events under those names are one group; it
+    is no checksum of the payloads. Reading it costs one pass over the store.
 - **SQL backend:** run the schema via `evento-sql-migrator` with its `cluster` feature
   (the `cluster_commands/meta/metadata_log/acceptors` tables), alongside your event
   schema — one migrator for both.
@@ -797,6 +857,10 @@ through `ClusterExecutor`) — split it into several writes.
   other, so a region took the slow path for everything and one stalled transaction
   held up the region. A node of format 15 refuses journals and frames of format 14:
   wipe and re-bootstrap, as for format 2.
+- **A group's identity** (record format 18, #541): a durable mark names its
+  replica's group, a join's vouch carries the contact's, a replica of another group
+  is answered `FoundedApart`, and the journal keeps the group. A node of format 18
+  refuses journals and frames of format 17: wipe and re-bootstrap, as for format 2.
 - **A node's label** (record format 16): each watermark report carries the word the
   host gave its node (`Cluster::builder(..).label(..)`, `Node::with_label`), which
   region it serves, say; every node keeps the latest from each peer

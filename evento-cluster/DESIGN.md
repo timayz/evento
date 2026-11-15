@@ -1197,7 +1197,27 @@ scenario on a cluster of one). ✅ **Snapshots + compaction + log truncation** (
   the wall clock. A report from another journal than the one seen under that id
   is answered `RolledBack` like an open below the mark — a node started plainly
   over an empty journal asks nobody at its open — while a late report of the
-  same journal, reordered behind a newer one, is merely not counted. Each node keeps the highest mark it saw from each peer,
+  same journal, reordered behind a newer one, is merely not counted. And the
+  **group** (`group`, #541): the digest of the store the replica's group was
+  founded over (`Node::found_over_store`, `Journal::save_foundation`), 0 for a
+  group that began empty, unknown to a node that joins over a journal holding none
+  until it takes its contact's with the vouch (`Message::JoinProof`). One node's
+  store, copied while its group served, cannot be restored: under its own node it
+  is a rolled-back journal, under every node three nodes share one node's votes,
+  and beside emptied peers two acceptors of three lost their journals at once. It
+  founds a new group instead — the same events under every node, each over an
+  empty journal and told so. Nothing the old group voted binds the new one: its
+  history is the store, as below a compaction floor, and its consensus starts
+  from nothing, the clock above the newest stored event. What the protocol must
+  keep out is a replica whose store is another history: its apply-time version
+  checks would decide a write otherwise than its peers'. So two replicas that
+  both know their group and differ count nothing of each other — the open
+  handshake first, which a founded node passes only with a slow quorum of its own
+  group, then every report, the screen coming before the identity check so that a
+  straggler of the old group, holding marks of the old journals under the
+  founders' ids, cannot have them stopped as rolled back. The side that can no
+  longer make a quorum of its shard stops (`founded_apart`); with no majority
+  founded alike, every node does. Each node keeps the highest mark it saw from each peer,
   journaled with its reports (`Journal::save_peer_marks`). A node opened over a
   journal that holds something, in a group of more than one node, asks every other
   node to confirm it (`Message::Opened`): until a slow quorum of its shard, itself
