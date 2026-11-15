@@ -275,6 +275,9 @@ pub struct InMemoryJournal {
     /// The persisted journal identity (see [`Journal::save_born`]) — kept
     /// across `truncate`.
     born: Mutex<Option<u64>>,
+    /// The persisted group (see [`Journal::save_foundation`]) — kept across
+    /// `truncate`.
+    foundation: Mutex<Option<u64>>,
 }
 
 impl InMemoryJournal {
@@ -307,6 +310,7 @@ impl InMemoryJournal {
             copy_state: copy(&self.copy_state),
             slot_gc: copy(&self.slot_gc),
             born: copy(&self.born),
+            foundation: copy(&self.foundation),
         }
     }
 }
@@ -386,6 +390,15 @@ impl Journal for InMemoryJournal {
 
     async fn load_born(&self) -> anyhow::Result<Option<u64>> {
         Ok(*self.born.lock().expect("journal poisoned"))
+    }
+
+    async fn save_foundation(&self, group: u64) -> anyhow::Result<()> {
+        *self.foundation.lock().expect("journal poisoned") = Some(group);
+        Ok(())
+    }
+
+    async fn load_foundation(&self) -> anyhow::Result<Option<u64>> {
+        Ok(*self.foundation.lock().expect("journal poisoned"))
     }
 
     async fn save_vote_fence(&self, fence: Timestamp) -> anyhow::Result<()> {
@@ -679,6 +692,7 @@ mod tests {
             clock_bound,
             vote_fence: Timestamp::MIN,
             born: 0,
+            group: Some(0),
         };
         journal
             .save_peer_marks(&[(NodeId(1), mark(400))])

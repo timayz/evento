@@ -44,8 +44,8 @@ use crate::api::{
 use crate::clock::{Timestamp, TxnId};
 use crate::message::Key;
 use crate::node::{
-    BacklogAtCap, Invalidated, Joining, JournalRolledBack, Node, NodeClosed, OpenUnconfirmed,
-    RejoinRequired, TopologyChanging,
+    BacklogAtCap, FoundedApart, Invalidated, Joining, JournalRolledBack, Node, NodeClosed,
+    OpenUnconfirmed, RejoinRequired, TopologyChanging,
 };
 
 /// Most events one backend read returns for the scans behind
@@ -749,6 +749,7 @@ impl<E: Executor + Clone> Executor for ClusterExecutor<E> {
                     || err.is::<TopologyChanging>()
                     || err.is::<OpenUnconfirmed>()
                     || err.is::<JournalRolledBack>()
+                    || err.is::<FoundedApart>()
                 {
                     WriteError::Unavailable(err)
                 } else {

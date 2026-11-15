@@ -29,10 +29,10 @@ use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant};
 
 use crate::api::{
-    floor_millis, slot_of, snapshot_event_size, stamp_events, stamp_micros, validate_layout,
-    AcceptorRecord, AmnesiaFence, ConfigEntry, CopyPhase, CopyState, DataStore, Decided, Drained,
-    DurableMark, FenceRecord, Journal, Layout, MessageSink, ShardId, ShardMap, StoreBehind,
-    Topology, SLOTS,
+    floor_millis, slot_of, snapshot_event_size, stable_hash_extend, stamp_events, stamp_micros,
+    validate_layout, AcceptorRecord, AmnesiaFence, ConfigEntry, CopyPhase, CopyState, DataStore,
+    Decided, Drained, DurableMark, FenceRecord, Journal, Layout, MessageSink, ShardId, ShardMap,
+    StoreBehind, Topology, SLOTS, STABLE_HASH_SEED,
 };
 use crate::clock::{Ballot, Clock, HybridLogicalClock, NodeId, Timestamp, TxnId};
 use crate::failure_detector::FailureDetector;
@@ -372,6 +372,65 @@ impl std::fmt::Display for JournalRolledBack {
 }
 
 impl std::error::Error for JournalRolledBack {}
+
+/// [`Node::write`] refused a new write: this node is of another group than
+/// enough of its peers that the rest cannot make a quorum of its shard
+/// (#541, [`Node::founded_apart`]) — its store is not the one their group
+/// was founded over ([`Node::found_over_store`]), or theirs is not the one
+/// its own was. The node takes no part any more; its host founds it again
+/// over the group's store, or opens it over an empty journal and store,
+/// joining. Returned through `anyhow`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FoundedApart;
+
+impl std::fmt::Display for FoundedApart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "this node is of another group than its peers: it was not founded over their store;              found it again over the group's store, or open it over an empty journal and store, joining",
+        )
+    }
+}
+
+impl std::error::Error for FoundedApart {}
+
+/// What [`Node::found_over_store`] founded the node's group over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Foundation {
+    /// The group: a digest of the store, the same on every node founded
+    /// over the same events ([`DurableMark::group`]).
+    pub group: u64,
+    /// The events the store held.
+    pub events: u64,
+}
+
+/// One event's part in the digest a group is founded under
+/// ([`Node::found_over_store`]): what names it — its id, its place in its
+/// stream and its stamp — hashed the same on every node and toolchain. The
+/// parts are summed, so the order a store pages its events in is no part
+/// of the digest.
+fn event_digest(event: &Event) -> u64 {
+    let mut hash = stable_hash_extend(STABLE_HASH_SEED, &event.id.to_bytes());
+    for part in [&event.tenant, &event.aggregate_type, &event.aggregate_id] {
+        hash = stable_hash_extend(hash, part.as_bytes());
+        hash = stable_hash_extend(hash, &[0x1f]);
+    }
+    hash = stable_hash_extend(hash, &event.version.to_le_bytes());
+    stable_hash_extend(hash, &stamp_micros(event).to_le_bytes())
+}
+
+/// How a node opens over its journal (see `Node::restore_journal`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Open {
+    /// Over its journal and its store, as a restart
+    /// ([`Node::recover_state`]).
+    Plain,
+    /// Over its journal and an empty store, to copy a contact's
+    /// ([`Node::recover_state_for_join`]).
+    Joining,
+    /// Over an empty journal and a store that holds a group's events, as a
+    /// replica of a new group ([`Node::found_over_store`]).
+    Founding,
+}
 
 /// A round of a write's coordination a replica refused for a higher ballot
 /// (`Nack`): a recovery took the write over (#452). `settle` tells it apart
@@ -1576,6 +1635,23 @@ pub struct Node {
     /// True once a peer found this node's journal rolled back (#339, see
     /// [`rolled_back`](Self::rolled_back)).
     rolled_back: Arc<tokio::sync::watch::Sender<bool>>,
+    /// The group this node belongs to ([`DurableMark::group`], #541): the
+    /// digest of the store it was founded over, 0 for a group that began
+    /// empty, `None` while a joining node has yet to take its contact's.
+    group: Arc<Mutex<Option<u64>>>,
+    /// Whether the journal holds `group` ([`Journal::save_foundation`]). A
+    /// group it does not hold is the default, which a node that joins
+    /// gives up for its contact's (see [`begin_join`](Self::begin_join)).
+    group_kept: Arc<AtomicBool>,
+    /// The peers found to be of another group (#541), until they show this
+    /// node's.
+    foreign: Arc<Mutex<HashSet<NodeId>>>,
+    /// The events the store held when this open founded a group over it
+    /// (see [`found_over_store`](Self::found_over_store)).
+    founded_events: Arc<AtomicU64>,
+    /// True once so many peers are of another group that the rest cannot
+    /// make a quorum (#541, see [`founded_apart`](Self::founded_apart)).
+    apart: Arc<tokio::sync::watch::Sender<bool>>,
     /// Bumped whenever local applied state advances (an apply or an
     /// anti-entropy import). Waiters (`read_barrier`, read-your-writes) wait
     /// on it instead of polling the replica lock every millisecond.
@@ -1675,6 +1751,11 @@ impl Node {
             opening: Arc::new(Mutex::new(None)),
             peer_marks: Arc::new(Mutex::new(PeerMarks::default())),
             rolled_back: Arc::new(tokio::sync::watch::channel(false).0),
+            group: Arc::new(Mutex::new(Some(0))),
+            group_kept: Arc::new(AtomicBool::new(false)),
+            foreign: Arc::new(Mutex::new(HashSet::new())),
+            founded_events: Arc::new(AtomicU64::new(0)),
+            apart: Arc::new(tokio::sync::watch::channel(false).0),
             applied: Arc::new(Signal::default()),
             applier: Arc::new(Notify::new()),
             lazy: Arc::new(LazyFlush::default()),
@@ -1854,6 +1935,39 @@ impl Node {
         self.rolled_back.subscribe()
     }
 
+    /// Whether this node found itself of another group than its peers
+    /// (#541): enough of them that the rest cannot make a quorum of its
+    /// shard showed a [`DurableMark::group`] other than its own, in their
+    /// reports or in their answers to its own
+    /// ([`Message::FoundedApart`]). Its store is not the one their group
+    /// was founded over ([`found_over_store`](Self::found_over_store)) —
+    /// it was left out of a restore, or handed another copy. It drops
+    /// every message and refuses writes from then on ([`FoundedApart`]).
+    /// The host founds it again over the group's store, or discards its
+    /// journal and its event store and opens it by joining.
+    pub fn founded_apart(&self) -> bool {
+        *self.apart.borrow()
+    }
+
+    /// A watch that turns `true` when [`founded_apart`](Self::founded_apart)
+    /// does.
+    pub fn founded_apart_signal(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.apart.subscribe()
+    }
+
+    /// The group this node belongs to ([`DurableMark::group`]): the digest
+    /// of the store it was founded over, 0 for a group that began empty,
+    /// `None` while it joins and has not taken its contact's yet.
+    pub fn group(&self) -> Option<u64> {
+        *self.group.lock().expect("group poisoned")
+    }
+
+    /// Whether this node stopped taking part for good: its journal was
+    /// rolled back (#339), or it is of another group than its peers (#541).
+    fn halted(&self) -> bool {
+        self.rolled_back() || self.founded_apart()
+    }
+
     /// Whether this node takes part. One opened over a journal that holds
     /// something, in a group of more than one node, first asks every other
     /// node whether the journal is at or above the [`DurableMark`] it last
@@ -1896,6 +2010,7 @@ impl Node {
                 .expect("replica poisoned")
                 .durable_fence(),
             born: self.born.load(Ordering::Acquire),
+            group: self.group(),
         }
     }
 
@@ -2313,7 +2428,7 @@ impl Node {
     /// nothing: a join needs the store empty until its snapshot is in, and
     /// enacts what its restored journal holds decided once it is.
     fn executes(&self) -> bool {
-        !self.rolled_back()
+        !self.halted()
             && self.confirmed()
             && !self.rejoin_required()
             && self.bootstrapped.load(Ordering::Acquire)
@@ -2375,7 +2490,47 @@ impl Node {
     /// what the node applied. A node whose join after a lost journal never
     /// completed is refused too (`LostJournal { join_pending: true }`).
     pub async fn recover_state(&self) -> anyhow::Result<()> {
-        let commands = self.restore_journal(false).await?;
+        self.replay_into_store(Open::Plain).await
+    }
+
+    /// Opens this node as a replica of a **new group, founded over the
+    /// store it holds** (#541): the events of another group's node, copied
+    /// while that group served or after it was lost, put under every node
+    /// of this one. Call it in place of
+    /// [`recover_state`](Self::recover_state), once, on every node, each
+    /// over the same copy and an **empty journal** — anything else is
+    /// refused: the copy's own journal is its source's, and no node of the
+    /// new group cast those votes.
+    ///
+    /// The node reads the whole store, journals a digest of it as its
+    /// **group** ([`DurableMark::group`]), and starts its clock above the
+    /// newest event the store holds. The journal is new: no mark of the old
+    /// group applies to it. In a group of more than one node it then takes
+    /// no part until a slow quorum of its shard, itself included, opened
+    /// over the same group ([`confirmed`](Self::confirmed)): a node founded
+    /// over another copy, one left out of the restore, and one still
+    /// running for the old group are of another group, and are told so
+    /// ([`founded_apart`](Self::founded_apart)) rather than left to
+    /// diverge. The following opens are plain.
+    ///
+    /// Only for a group of one shard that every node replicates: under
+    /// several, a node's store holds its own shards alone. Refused too
+    /// when the store holds an event dated past this node's clock by more
+    /// than the skew bound (check the clock), or when the journal cannot
+    /// keep the group ([`Journal::save_foundation`]).
+    pub async fn found_over_store(&self) -> anyhow::Result<Foundation> {
+        self.replay_into_store(Open::Founding).await?;
+        Ok(Foundation {
+            group: self.group().unwrap_or(0),
+            events: self.founded_events.load(Ordering::Acquire),
+        })
+    }
+
+    /// [`recover_state`](Self::recover_state) and
+    /// [`found_over_store`](Self::found_over_store): the journal restored,
+    /// then what it holds applied replayed into the store.
+    async fn replay_into_store(&self, open: Open) -> anyhow::Result<()> {
+        let commands = self.restore_journal(open).await?;
         // Replay the retained (post-truncation) applied tail into the data store.
         // The truncated prefix is not in the journal; a durable data store already
         // holds it, and re-applying the tail is idempotent. The events are
@@ -2448,16 +2603,19 @@ impl Node {
     /// any more — and it abstains from config Paxos until it restored its
     /// votes (#338). It begins the join itself.
     pub async fn recover_state_for_join(&self) -> anyhow::Result<()> {
-        self.restore_journal(true).await.map(|_| ())
+        self.restore_journal(Open::Joining).await.map(|_| ())
     }
 
     /// Restores the replica and the control plane from the journal, for
     /// [`recover_state`](Self::recover_state) and
     /// [`recover_state_for_join`](Self::recover_state_for_join). Returns the
-    /// journaled commands in execution order. `joining`: the data store was
+    /// journaled commands in execution order. Joining, the data store was
     /// discarded, so a transaction applied as a commit is restored decided
-    /// but un-applied.
-    async fn restore_journal(&self, joining: bool) -> anyhow::Result<Vec<CommandState>> {
+    /// but un-applied. Founding, the journal must hold nothing, and the
+    /// store is what the group begins with.
+    async fn restore_journal(&self, open: Open) -> anyhow::Result<Vec<CommandState>> {
+        let joining = open == Open::Joining;
+        let founding = open == Open::Founding;
         let watermark = self.journal.load_watermark().await?;
         let mut commands = self.journal.load_all().await?;
         commands.sort_by_key(|cmd| (cmd.execute_at, cmd.txn));
@@ -2514,6 +2672,17 @@ impl Node {
             }
         };
         self.born.store(born, Ordering::Release);
+        anyhow::ensure!(
+            pristine || !founding,
+            "a group is founded only over an empty journal, and this one holds what a node \
+             voted, promised or minted: discard it first (`ClusterBackend::discard_journal`)"
+        );
+        // The group the journal holds (#541); one that holds none is of a
+        // group that began empty, until a join says otherwise.
+        let foundation = self.journal.load_foundation().await?;
+        *self.group.lock().expect("group poisoned") = Some(foundation.unwrap_or(0));
+        self.group_kept
+            .store(foundation.is_some(), Ordering::Release);
         // The vote fence comes back where the journal left it (#337). A
         // journal that keeps none restarts it at the clock bound less the
         // margin, where the fence stood before it was journaled: the bound is
@@ -2538,6 +2707,10 @@ impl Node {
             }
             Some(fence) => Some(fence),
             None if pristine && joining => Some(self.set_amnesia_fence().await?),
+            None if founding => {
+                self.found().await?;
+                None
+            }
             None if pristine => {
                 self.open_over_an_empty_journal().await?;
                 None
@@ -2660,8 +2833,10 @@ impl Node {
         }
         // An open over a journal that holds something waits for the other
         // nodes to confirm the journal is no older copy of itself (#339).
-        if !pristine && self.topology.nodes().len() > 1 {
-            if clock_bound.is_some() {
+        // So does one that founds a group over its store (#541): its peers
+        // confirm they opened over the same one.
+        if (!pristine || founding) && self.topology.nodes().len() > 1 {
+            if clock_bound.is_some() || founding {
                 *self.opening.lock().expect("opening poisoned") = Some(Opening {
                     mark: self.durable_mark(),
                     since: Instant::now(),
@@ -2976,7 +3151,8 @@ impl Node {
     async fn recovery_sweep(&self) {
         // A node whose journal was rolled back takes no part (#339); one whose
         // journal is not confirmed yet asks again, and does nothing else.
-        if self.rolled_back() {
+        // Nor does one of another group than its peers (#541).
+        if self.halted() {
             return;
         }
         if !self.confirmed() {
@@ -4007,11 +4183,129 @@ impl Node {
         );
     }
 
+    /// Holds `mark`, which `from` opened or reported with, against this
+    /// node's group (#541). Of another group, `from` is told so
+    /// ([`Message::FoundedApart`]) and nothing of the message is counted;
+    /// of this one, or of none it knows yet, it is no stranger (any more).
+    fn screen_group(&self, from: NodeId, mark: &DurableMark) -> Option<Message> {
+        let mine = self.group();
+        match (mine, mark.group) {
+            (Some(mine), Some(theirs)) if mine != theirs => {
+                self.note_foreign(from, theirs);
+                Some(Message::FoundedApart {
+                    mark: *mark,
+                    group: Some(mine),
+                })
+            }
+            _ => {
+                self.foreign.lock().expect("foreign poisoned").remove(&from);
+                None
+            }
+        }
+    }
+
+    /// `from`, of `group`, refused this node's open or report under `mark`
+    /// as another group's (#541). Heard only about the open this node asked
+    /// to confirm, or the journal and the group it runs under now: an
+    /// answer to an earlier open of its id is not for this one.
+    fn on_founded_apart(&self, from: NodeId, mark: DurableMark, group: Option<u64>) {
+        let opened = self
+            .opening
+            .lock()
+            .expect("opening poisoned")
+            .as_ref()
+            .map(|opening| opening.mark);
+        let mine = self.durable_mark();
+        if opened != Some(mark) && (mark.born != mine.born || mark.group != mine.group) {
+            return;
+        }
+        if let (Some(ours), Some(theirs)) = (mark.group, group) {
+            if ours != theirs {
+                self.note_foreign(from, theirs);
+            }
+        }
+    }
+
+    /// Records `peer` as a replica of another group, `theirs` (#541). Once
+    /// the replicas of this node's shard that are not cannot make a slow
+    /// quorum, this node is the one founded apart — or one of too few
+    /// founded alike — and stops taking part (see
+    /// [`founded_apart`](Self::founded_apart)).
+    fn note_foreign(&self, peer: NodeId, theirs: u64) {
+        let outnumbered = {
+            let mut foreign = self.foreign.lock().expect("foreign poisoned");
+            if foreign.insert(peer) {
+                tracing::error!(
+                    node = self.id.0,
+                    peer = peer.0,
+                    group = ?self.group(),
+                    theirs,
+                    "a peer is of another group: one of the two was founded over a store \
+                     the other was not. Neither counts the other"
+                );
+            }
+            let layout = self.topology.layout();
+            match layout.node_shard(self.id) {
+                Some(shard) => {
+                    let alike = layout
+                        .replicas_of(shard)
+                        .iter()
+                        .filter(|node| !foreign.contains(node))
+                        .count();
+                    alike < layout.slow_quorum_of(shard)
+                }
+                None => foreign.len() * 2 >= self.topology.nodes().len(),
+            }
+        };
+        if !outnumbered || self.apart.send_replace(true) {
+            return;
+        }
+        self.metrics.record_founded_apart();
+        tracing::error!(
+            node = self.id.0,
+            group = ?self.group(),
+            "too many peers are of another group for the rest to make a quorum: this node \
+             was not founded over their store. It takes no part any more; found it again \
+             over the group's store, or open it over an empty journal and store, joining"
+        );
+    }
+
+    /// Takes the group of the contact this node joins through (#541), which
+    /// came with its vouch ([`Message::JoinProof`]): a node that knows none
+    /// — it lost its journal, or is new — belongs to the group whose state
+    /// it copies, journaled before the vouch counts (so does one that
+    /// copied its slots from the group's replicas under a layout change,
+    /// from their reports). `false` when the
+    /// contact is of another group than the one this node's journal holds,
+    /// or the group cannot be journaled: the vouch is not taken.
+    async fn take_group(&self, contact: NodeId, group: u64) -> bool {
+        match self.group() {
+            Some(mine) if mine == group => true,
+            Some(_) => {
+                self.note_foreign(contact, group);
+                false
+            }
+            None => {
+                if let Err(err) = self.journal.save_foundation(group).await {
+                    tracing::warn!(
+                        node = self.id.0,
+                        %err,
+                        "cannot journal the group of the contact this node joins through"
+                    );
+                    return false;
+                }
+                *self.group.lock().expect("group poisoned") = Some(group);
+                self.group_kept.store(true, Ordering::Release);
+                true
+            }
+        }
+    }
+
     /// Asks every other node to confirm this node's open (#339), unless it
     /// is confirmed already — or now is (see [`confirmed`](Self::confirmed)).
     async fn ask_to_confirm(&self) {
         self.confirm_if_due().await;
-        if self.confirmed() || self.rolled_back() {
+        if self.confirmed() || self.halted() {
             return;
         }
         let Some(mark) = self
@@ -4036,7 +4330,7 @@ impl Node {
     /// [`confirmed`](Self::confirmed)), and handles what it buffered
     /// meanwhile — unless it still joins, whose join does.
     async fn confirm_if_due(&self) {
-        if self.confirmed() || self.rolled_back() {
+        if self.confirmed() || self.halted() {
             return;
         }
         let due = self
@@ -4070,8 +4364,10 @@ impl Node {
     /// Whether `opening` is confirmed: a slow quorum of this node's shard,
     /// itself included, confirmed it, and every other node did or
     /// `collect_timeout` passed — time for one that saw a higher mark to
-    /// say so.
+    /// say so. A node of another group (#541) answered, and confirms
+    /// nothing.
     fn open_confirmed(&self, opening: &Opening) -> bool {
+        let foreign = self.foreign.lock().expect("foreign poisoned").clone();
         let layout = self.topology.layout();
         let quorum = layout.node_shard(self.id).is_none_or(|shard| {
             let confirmed = layout
@@ -4083,11 +4379,11 @@ impl Node {
         });
         quorum
             && (opening.since.elapsed() >= self.settings.collect_timeout
-                || self
-                    .topology
-                    .nodes()
-                    .iter()
-                    .all(|&node| node == self.id || opening.confirmed_by.contains(&node)))
+                || self.topology.nodes().iter().all(|&node| {
+                    node == self.id
+                        || opening.confirmed_by.contains(&node)
+                        || foreign.contains(&node)
+                }))
     }
 
     /// Waits, for at most [`NodeConfig::amnesia_join_timeout`], until this
@@ -4097,6 +4393,9 @@ impl Node {
         loop {
             if self.rolled_back() {
                 return Err(JournalRolledBack.into());
+            }
+            if self.founded_apart() {
+                return Err(FoundedApart.into());
             }
             if self.confirmed() {
                 return Ok(());
@@ -4175,17 +4474,29 @@ impl Node {
 
         // Its journal rolled back to an older copy (#339): this node takes no
         // part any more. A forwarded read is still refused out loud.
-        if self.rolled_back() {
+        // Nor does a node of another group than its peers (#541).
+        if self.halted() {
             if let Message::ReadForward { id, .. } = env.message {
                 return vec![(
                     env.from,
                     Message::ReadFailed {
                         id,
-                        reason: "the owner's journal was rolled back".into(),
+                        reason: if self.rolled_back() {
+                            "the owner's journal was rolled back".into()
+                        } else {
+                            "the owner is of another group".into()
+                        },
                     },
                 )];
             }
             return Vec::new();
+        }
+        // A replica of another group (#541) is told so, and nothing of its
+        // open or its report is counted: its store holds another history.
+        if let Message::Opened { mark } | Message::Watermark { mark, .. } = &env.message {
+            if let Some(reply) = self.screen_group(env.from, mark) {
+                return vec![(env.from, reply)];
+            }
         }
         // The open handshake (#339) is answered and heard whatever else this
         // node is doing.
@@ -4197,6 +4508,11 @@ impl Node {
             }
             Message::RolledBack { mark, seen } => {
                 self.on_rolled_back(env.from, mark, seen);
+                return Vec::new();
+            }
+            Message::FoundedApart { mark, group } => {
+                self.on_founded_apart(env.from, mark, group);
+                self.confirm_if_due().await;
                 return Vec::new();
             }
             _ => {}
@@ -4814,7 +5130,15 @@ impl Node {
                         commands: Vec::new(),
                     },
                 ));
-                out.push((from, Message::JoinProof { id, epoch, vouched }));
+                out.push((
+                    from,
+                    Message::JoinProof {
+                        id,
+                        epoch,
+                        vouched,
+                        group: self.group().unwrap_or(0),
+                    },
+                ));
             }
             // A joiner whose install spaces out its page requests: keep the
             // hold on this node's report alive.
@@ -5014,14 +5338,28 @@ impl Node {
                     let _ = tx.send((watermark, coverage, live_since, commands));
                 }
             }
-            Message::JoinProof { id, epoch, vouched } => {
-                if let Some(slot) = self
+            Message::JoinProof {
+                id,
+                epoch,
+                vouched,
+                group,
+            } => {
+                let awaited = self
                     .proof_pending
                     .lock()
                     .expect("proof poisoned")
-                    .get_mut(&id)
-                {
-                    *slot = Some((epoch, vouched));
+                    .contains_key(&id);
+                // The contact's group first (#541): a vouch from another
+                // group vouches for another history.
+                if awaited && self.take_group(from, group).await {
+                    if let Some(slot) = self
+                        .proof_pending
+                        .lock()
+                        .expect("proof poisoned")
+                        .get_mut(&id)
+                    {
+                        *slot = Some((epoch, vouched));
+                    }
                 }
             }
             Message::Watermark {
@@ -5935,6 +6273,9 @@ impl Node {
         }
         if self.rolled_back() {
             return Err(JournalRolledBack.into());
+        }
+        if self.founded_apart() {
+            return Err(FoundedApart.into());
         }
         if !self.confirmed() {
             return Err(OpenUnconfirmed.into());
@@ -8870,8 +9211,15 @@ impl Node {
     /// Marks this node as joining: until [`join`](Node::join) completes,
     /// consensus messages are buffered rather than processed. Call this before
     /// the epoch that adds this node is installed, so nothing is lost in the gap.
+    ///
+    /// A node whose journal holds no group ([`DurableMark::group`]) knows
+    /// none from here on: it takes its contact's with the state it copies
+    /// (#541).
     pub fn begin_join(&self) {
         self.bootstrapped.store(false, Ordering::Release);
+        if !self.group_kept.load(Ordering::Acquire) {
+            *self.group.lock().expect("group poisoned") = None;
+        }
     }
 
     /// Bootstraps this (joining) node from `contact`: fetches its committed state,
@@ -9754,6 +10102,18 @@ impl Node {
             let ((mut watermark, coverage, live_since, mut commands), slot) =
                 self.fetch_join_header(contact, timeout).await?;
             proof_slot = Some(slot);
+            // Its vouch came with its group (#541): nothing is copied from
+            // a contact of another one.
+            if self
+                .foreign
+                .lock()
+                .expect("foreign poisoned")
+                .contains(&contact)
+            {
+                return Err(anyhow::Error::new(FoundedApart).context(format!(
+                    "{contact:?} is of another group than this node's journal"
+                )));
+            }
             // Then the applied commands, page by page, before any snapshot
             // page: every command listed has its events in a page fetched
             // after it. The contact may compact between pages; the highest
@@ -10437,6 +10797,18 @@ impl Node {
         // is gained (a replica still joining returned above): it serves, and
         // what it buffered meanwhile is handled.
         if !self.bootstrapped.load(Ordering::Acquire) && self.pending_fence().is_none() {
+            // It copied from the group's replicas rather than joined through
+            // one: its group is theirs (#541), as their reports name it.
+            let theirs = self
+                .peer_marks
+                .lock()
+                .expect("peer marks poisoned")
+                .by_node
+                .values()
+                .find_map(|mark| mark.group);
+            if let (None, Some(theirs)) = (self.group(), theirs) {
+                self.take_group(self.id, theirs).await;
+            }
             let buffered = {
                 let mut buffer = self.join_buffer.lock().expect("buffer poisoned");
                 self.bootstrapped.store(true, Ordering::Release);
@@ -12289,6 +12661,9 @@ impl Node {
         if self.rolled_back() {
             return Err(JournalRolledBack.into());
         }
+        if self.founded_apart() {
+            return Err(FoundedApart.into());
+        }
         if !self.confirmed() {
             return Err(OpenUnconfirmed.into());
         }
@@ -12510,6 +12885,78 @@ impl Node {
             "the journal is empty but the store is not: a single-node cluster reopens over its store"
         );
         self.floor_clock_after_loss().await
+    }
+
+    /// Founds this node's group over the store it holds (see
+    /// [`found_over_store`](Self::found_over_store)): reads every event,
+    /// journals the digest of them all as the group, and floors the clock
+    /// past the newest — which leaves the clock bound in the journal, so it
+    /// is never empty again.
+    async fn found(&self) -> anyhow::Result<()> {
+        let layout = self.topology.layout();
+        anyhow::ensure!(
+            layout.shards().len() == 1 && layout.node_shard(self.id).is_some(),
+            "a group is founded over a store only when every node replicates its one shard: \
+             under several, a node's store holds its own shards alone"
+        );
+        let mut events = 0u64;
+        let mut sum = 0u64;
+        let mut newest = 0u64;
+        let mut after = None;
+        loop {
+            let page = self
+                .datastore
+                .snapshot_page(
+                    after.take(),
+                    self.settings.snapshot_page_events,
+                    self.settings.snapshot_page_bytes,
+                )
+                .await
+                .context("cannot read the store to found a group over it")?;
+            for event in &page.events {
+                events += 1;
+                sum = sum.wrapping_add(event_digest(event));
+                newest = newest.max(stamp_micros(event));
+            }
+            match page.next {
+                Some(next) => after = Some(next),
+                None => break,
+            }
+        }
+        // A new write is dated above every stored one: the clock is floored
+        // a skew past the wall clock, and nothing stored may lie beyond.
+        let ahead = self
+            .clock
+            .physical_micros()
+            .saturating_add(self.clock.max_skew_micros());
+        anyhow::ensure!(
+            newest <= ahead,
+            "the store holds an event dated {newest} µs, past this node's clock and its skew \
+             bound ({ahead} µs): check the clock before founding a group over it"
+        );
+        // Never 0, the group of one that began empty.
+        let mut digest = stable_hash_extend(STABLE_HASH_SEED, &sum.to_le_bytes());
+        digest = stable_hash_extend(digest, &events.to_le_bytes()).max(1);
+        self.journal
+            .save_foundation(digest)
+            .await
+            .context("cannot journal the group")?;
+        anyhow::ensure!(
+            self.journal.load_foundation().await? == Some(digest),
+            "this journal cannot keep a group (Journal::save_foundation): \
+             no group can be founded over a store with it"
+        );
+        *self.group.lock().expect("group poisoned") = Some(digest);
+        self.group_kept.store(true, Ordering::Release);
+        self.founded_events.store(events, Ordering::Release);
+        self.floor_clock_after_loss().await?;
+        tracing::warn!(
+            node = self.id.0,
+            group = digest,
+            events,
+            "founded a group over the store"
+        );
+        Ok(())
     }
 
     /// Floors the clock past every id a node that lost its journal can have

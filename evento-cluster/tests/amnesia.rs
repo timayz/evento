@@ -397,6 +397,7 @@ impl Cluster {
                 .unwrap()
                 .unwrap_or(Timestamp::MIN),
             born: 0,
+            group: Some(0),
         };
         for version in 1..=3 {
             self.nodes[A as usize]

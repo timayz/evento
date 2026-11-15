@@ -579,10 +579,15 @@ pub enum Message {
     /// replicas needs, and peers that gave it up keep telling it to rejoin. It
     /// follows the header on the same link, so it is in by the time the joiner
     /// installs the snapshot; an anti-entropy `SyncData` has no vouch to carry.
+    ///
+    /// `group` is the group the contact belongs to (#541): a joiner that
+    /// does not know its own — it lost its journal, or is new — takes it
+    /// with the state it copies.
     JoinProof {
         id: u64,
         epoch: u64,
         vouched: Timestamp,
+        group: u64,
     },
     /// `inner` — a `PreAccept`, `Accept`, `Commit`, `BeginRecovery` or
     /// `BeginRecoveryOk` — for a transaction whose `route` (its **full** key
@@ -717,6 +722,15 @@ pub enum Message {
         mark: DurableMark,
         seen: DurableMark,
     },
+    /// Peer → a replica whose [open](Message::Opened) or watermark report
+    /// carried `mark`, of another group than the peer's own, `group`
+    /// (#541): one of the two was founded over a store the other was not.
+    /// Neither counts the other. A replica told so by enough peers that
+    /// those left cannot make a quorum of its shard stops taking part.
+    FoundedApart {
+        mark: DurableMark,
+        group: Option<u64>,
+    },
     /// The node driving a layout change → a node the change gives slots,
     /// before the change is decided (#373): copy the slots `map` gives you
     /// now, while writes still flow, so the copy under the fence has only
@@ -827,6 +841,7 @@ impl Message {
             | Message::Opened { .. }
             | Message::OpenedOk { .. }
             | Message::RolledBack { .. }
+            | Message::FoundedApart { .. }
             | Message::Preseed { .. }
             | Message::Preseeded { .. }
             | Message::RangePage { .. } => None,
@@ -1248,6 +1263,7 @@ mod tests {
             id: 9,
             epoch: 4,
             vouched,
+            group: 7,
         };
         let bytes = encode_tagged(RecordKind::WireFrame, &proof).unwrap();
         match decode_tagged(RecordKind::WireFrame, &bytes).unwrap() {
@@ -1255,7 +1271,8 @@ mod tests {
                 id,
                 epoch,
                 vouched: back,
-            } => assert_eq!((id, epoch, back), (9, 4, vouched)),
+                group,
+            } => assert_eq!((id, epoch, back, group), (9, 4, vouched, 7)),
             other => panic!("variant changed on the wire: {other:?}"),
         }
     }
@@ -1334,11 +1351,13 @@ mod tests {
             clock_bound: 7,
             vote_fence: ballot.0,
             born: 0,
+            group: Some(9),
         };
         for message in [
             Message::Opened { mark },
             Message::OpenedOk { mark },
             Message::RolledBack { mark, seen: mark },
+            Message::FoundedApart { mark, group: None },
         ] {
             assert_eq!(message.txn(), None);
             let bytes = encode_tagged(RecordKind::WireFrame, &message).unwrap();
@@ -1402,6 +1421,7 @@ mod tests {
             id: 1,
             epoch: 0,
             vouched: Timestamp::MIN,
+            group: 0,
         };
         let header_request = Message::JoinHeaderRequest { id: 1 };
         let command_request = Message::CommandPageRequest { id: 1, after: None };

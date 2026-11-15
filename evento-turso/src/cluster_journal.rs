@@ -58,6 +58,8 @@ const REJOIN_BOUNDS_KEY: &str = "rejoin_above";
 const CLOCK_BOUND_KEY: &str = "clock_bound";
 /// `cluster_meta` key of the journal's identity (`Journal::save_born`).
 const BORN_KEY: &str = "born";
+/// `cluster_meta` key of the group (`Journal::save_foundation`).
+const FOUNDATION_KEY: &str = "foundation";
 /// `k` value under which the replica's amnesia fence is stored in
 /// `cluster_meta`. Untouched by `truncate`.
 const AMNESIA_FENCE_KEY: &str = "amnesia_fence";
@@ -569,6 +571,18 @@ impl Journal for TursoJournal {
     async fn load_born(&self) -> anyhow::Result<Option<u64>> {
         match self.load_meta(BORN_KEY).await? {
             Some(bytes) => Ok(Some(decode_tagged(RecordKind::Born, &bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn save_foundation(&self, group: u64) -> anyhow::Result<()> {
+        let value = encode_tagged(RecordKind::Foundation, &group)?;
+        self.save_meta(FOUNDATION_KEY, &value).await
+    }
+
+    async fn load_foundation(&self) -> anyhow::Result<Option<u64>> {
+        match self.load_meta(FOUNDATION_KEY).await? {
+            Some(bytes) => Ok(Some(decode_tagged(RecordKind::Foundation, &bytes)?)),
             None => Ok(None),
         }
     }

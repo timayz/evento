@@ -329,6 +329,99 @@ async fn a_lost_journal_marks_the_store_and_the_next_open_copies_it() {
     }
 }
 
+/// Copies the directory `from` to `to`, replacing it.
+fn copy_dir(from: &Path, to: &Path) {
+    let _ = std::fs::remove_dir_all(to);
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+/// The group is lost but for a copy of one node's store, its journal
+/// inside. Put under every node and marked, it founds a new group (#541):
+/// the nodes discard the copy's journal, confirm one another over the same
+/// events and serve them, and the next open is plain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_group_comes_back_from_one_nodes_store_once_marked() {
+    let root = temp_root("found");
+    let addrs = free_addrs().await;
+    let nodes = open_all(&root, &addrs, 0).await;
+    nodes[0]
+        .executor
+        .write(vec![event("acc", 1), event("acc", 2)])
+        .await
+        .unwrap();
+    nodes[1]
+        .await_count("acc", 2, "node 1 holds the writes")
+        .await;
+    for node in &nodes {
+        node.cluster.shutdown().await;
+    }
+    drop(nodes);
+
+    // One node's store is all that is kept, and goes under every node.
+    let backup = root.join("backup");
+    copy_dir(&Member::dir(&root, 1).join("store"), &backup);
+    for id in 0..3 {
+        copy_dir(&backup, &Member::dir(&root, id).join("store"));
+    }
+    // Unmarked, it is three nodes under one node's journal: nothing a group
+    // may run on. Marked, a new group begins with it.
+    let marks: Vec<PathBuf> = (0..3)
+        .map(|id| Cluster::mark_for_founding(Member::dir(&root, id)).unwrap())
+        .collect();
+    let nodes = open_all(&root, &addrs, 0).await;
+    for (node, mark) in nodes.iter().zip(&marks) {
+        let health = node.cluster.health();
+        assert!(health.founded_at_start && health.serving(), "{health:?}");
+        assert!(!mark.exists(), "the mark outlived the founding");
+        assert_eq!(node.count("acc").await, 2, "the copied events are served");
+    }
+    nodes[2]
+        .executor
+        .write(vec![event("acc", 3)])
+        .await
+        .expect("the founded group writes after the copied events");
+    nodes[0]
+        .await_count("acc", 3, "node 0 reads the founded group's write")
+        .await;
+    for node in &nodes {
+        node.cluster.shutdown().await;
+    }
+    drop(nodes);
+
+    let nodes = open_all(&root, &addrs, 0).await;
+    for node in &nodes {
+        let health = node.cluster.health();
+        assert!(!health.founded_at_start && health.serving(), "{health:?}");
+        assert_eq!(node.count("acc").await, 3);
+    }
+    for node in &nodes {
+        node.cluster.shutdown().await;
+    }
+}
+
+/// A store cannot be both copied from a peer and what a group begins with.
+#[tokio::test]
+async fn a_store_marked_for_a_copy_and_for_founding_does_not_open() {
+    let root = temp_root("both-marks");
+    let addrs = free_addrs().await;
+    Cluster::mark_for_rejoin(Member::dir(&root, 0)).unwrap();
+    Cluster::mark_for_founding(Member::dir(&root, 0)).unwrap();
+    let err = Member::try_open(&root, 0, &addrs, 0)
+        .await
+        .err()
+        .expect("two marks that contradict each other");
+    assert!(err.to_string().contains("remove one of them"), "{err:#}");
+}
+
 #[tokio::test]
 async fn a_node_alone_runs_without_settings() {
     let root = temp_root("alone");

@@ -496,6 +496,7 @@ async fn peer_marks(journal: &TursoJournal) {
         clock_bound,
         vote_fence: timestamp(clock_bound / 2, 0),
         born: 0,
+        group: Some(0),
     };
     assert!(journal.load_peer_marks().await.unwrap().is_empty());
     journal
@@ -624,6 +625,9 @@ async fn rejoin_bounds_round_trip() {
     assert_eq!(journal.load_born().await.unwrap(), None);
     journal.save_born(77).await.unwrap();
     assert_eq!(journal.load_born().await.unwrap(), Some(77));
+    assert_eq!(journal.load_foundation().await.unwrap(), None);
+    journal.save_foundation(91).await.unwrap();
+    assert_eq!(journal.load_foundation().await.unwrap(), Some(91));
 }
 
 /// A journal in the **same** database as a `Turso` store: both schemas live

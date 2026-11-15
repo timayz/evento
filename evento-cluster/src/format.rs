@@ -90,11 +90,15 @@ pub const MAGIC: [u8; 2] = *b"Ac";
 /// keys of every journaled command and wire message changed shape. 16:
 /// `Message::Watermark` carries the sender's label (`Node::label`), a word
 /// for the application. 17: `Message::ReadOk` carries what the replica read
-/// (`Condition`), a version gap apart from a conflict (#523). No reader
+/// (`Condition`), a version gap apart from a conflict (#523). 18: a durable
+/// mark names its replica's group (`DurableMark::group`), a contact's
+/// `Message::JoinProof` carries it for the joiner, a replica of another
+/// group is told so (`Message::FoundedApart`), and the journal keeps the
+/// group (`RecordKind::Foundation`, #541). No reader
 /// for older versions: evento-cluster has
 /// not been released, so a journal of one is wiped and the node
 /// re-bootstrapped.
-pub const FORMAT_VERSION: u8 = 17;
+pub const FORMAT_VERSION: u8 = 18;
 
 /// Length of the fixed header: `MAGIC (2) + version (1) + kind (1)`.
 const HEADER_LEN: usize = 4;
@@ -159,6 +163,9 @@ pub enum RecordKind {
     /// The journal's identity (`Journal::save_born`): the microseconds at
     /// which it was first opened, as a `u64`.
     Born = 18,
+    /// The group the replica belongs to (`Journal::save_foundation`): the
+    /// digest of the store the group was founded over, as a `u64`.
+    Foundation = 19,
 }
 
 impl RecordKind {
@@ -181,6 +188,7 @@ impl RecordKind {
             16 => Some(Self::CopyState),
             17 => Some(Self::SlotGc),
             18 => Some(Self::Born),
+            19 => Some(Self::Foundation),
             _ => None,
         }
     }
@@ -258,6 +266,8 @@ mod tests {
             RecordKind::PeerMarks,
             RecordKind::CopyState,
             RecordKind::SlotGc,
+            RecordKind::Born,
+            RecordKind::Foundation,
         ] {
             let value = (42u64, "hello".to_string());
             let bytes = encode_tagged(kind, &value).unwrap();
