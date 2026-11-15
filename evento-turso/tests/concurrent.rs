@@ -515,3 +515,234 @@ async fn a_failing_body_rolls_back_once() -> anyhow::Result<()> {
 async fn sizing_idle_subscriptions() -> anyhow::Result<()> {
     evento_test::sizing_idle_subscriptions(&Turso::in_memory_concurrent().await?).await
 }
+
+/// One store of the [`sizing_mvcc_checkpoints`] measurement.
+struct Sized {
+    name: String,
+    /// `PRAGMA mvcc_checkpoint_threshold`, when not the store's default
+    /// (`CHECKPOINT_BYTES`).
+    threshold: Option<i64>,
+    /// Turso's experimental passive checkpoint.
+    passive: bool,
+}
+
+impl Sized {
+    /// `default`, a threshold in bytes (`-1`: no automatic checkpoint), or
+    /// either after `passive:`.
+    fn parse(spec: &str) -> Self {
+        let (passive, threshold) = match spec.strip_prefix("passive") {
+            Some(rest) => (true, rest.trim_start_matches(':')),
+            None => (false, spec),
+        };
+        Self {
+            name: spec.to_owned(),
+            threshold: threshold.parse().ok(),
+            passive,
+        }
+    }
+}
+
+/// A migrated MVCC store at `path` as `sized` describes it.
+async fn sized_store(path: &str, sized: &Sized) -> anyhow::Result<Turso> {
+    let db = Turso::builder(path)
+        .experimental_mvcc_passive_checkpoint(sized.passive)
+        .build()
+        .await?;
+    evento_turso::enable_concurrent_writes(&db).await?;
+    let mut conn = db.connect()?;
+    evento_turso::MIGRATIONS
+        .to_latest(&mut conn)
+        .await
+        .map_err(|(applied, err)| anyhow::anyhow!("migration failed after {applied}: {err}"))?;
+    let store = Turso::from_database(db).await?;
+    if let Some(threshold) = sized.threshold {
+        store
+            .checkpoint_every(u64::try_from(threshold).ok())
+            .await?;
+    }
+    Ok(store)
+}
+
+/// Not a test: what Turso's MVCC checkpoints cost a store under writes
+/// (#544). `SIZING_WRITERS` writers (default 20) write `SIZING_EVENTS`
+/// single-event streams (default 20,000) while `SIZING_READERS` readers
+/// (default 8) each read one stream every 20 ms and a probe asks, every
+/// half millisecond, whether a transaction can begin. Printed for each
+/// store: the time the writes took, what a read waited, and the spans the
+/// probe found the store closed for — the checkpoints, counted and timed —
+/// on an in-memory store and on a file. `SIZING_STORES` lists the stores
+/// (`default` for the store's own threshold, a checkpoint threshold in
+/// bytes — 4120000 is Turso's —, `-1` for no automatic checkpoint, and
+/// `passive`, alone or before `:` and a threshold, for Turso's experimental
+/// passive checkpoint) and `SIZING_ON` where (`memory`, `file`).
+/// `cargo test -p evento-turso --test concurrent sizing_mvcc -- --ignored --nocapture`
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a measurement, not a test"]
+async fn sizing_mvcc_checkpoints() -> anyhow::Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    use evento_core::cursor::Args;
+    use evento_core::{EventFilter, TenantFilter};
+
+    fn setting(name: &str, default: usize) -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    }
+    fn millis(d: Duration) -> f64 {
+        d.as_secs_f64() * 1000.0
+    }
+    let (writers, events, readers) = (
+        setting("SIZING_WRITERS", 20),
+        setting("SIZING_EVENTS", 20_000),
+        setting("SIZING_READERS", 8),
+    );
+    let stores: Vec<Sized> = std::env::var("SIZING_STORES")
+        .unwrap_or_else(|_| "default,4120000,1048576,-1,passive".to_owned())
+        .split(',')
+        .map(Sized::parse)
+        .collect();
+    let on = std::env::var("SIZING_ON").unwrap_or_else(|_| "memory,file".to_owned());
+    for on_file in [false, true] {
+        if !on.contains(if on_file { "file" } else { "memory" }) {
+            continue;
+        }
+        for sized in &stores {
+            let dir = tempfile::Builder::new()
+                .prefix("evento-sizing-")
+                .tempdir()?;
+            let path = if on_file {
+                dir.path().join("events.db").to_str().unwrap().to_owned()
+            } else {
+                ":memory:".to_owned()
+            };
+            let store = sized_store(&path, sized).await?;
+            store.write(vec![bump(1)]).await?;
+
+            let done = Arc::new(AtomicBool::new(false));
+            let mut reading = Vec::new();
+            for _ in 0..readers {
+                let (store, done) = (store.clone(), done.clone());
+                reading.push(tokio::spawn(async move {
+                    let mut waits = Vec::new();
+                    while !done.load(Ordering::Acquire) {
+                        let started = Instant::now();
+                        store
+                            .read(
+                                Some([EventFilter::by_id_raw("test/Account", "acc")].into()),
+                                None,
+                                TenantFilter::All,
+                                Args::forward(10, None),
+                                None,
+                            )
+                            .await
+                            .expect("read");
+                        waits.push(started.elapsed());
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    waits
+                }));
+            }
+            // The spans in which no transaction can begin.
+            let probing = {
+                let (conn, done) = (store.connect_read()?, done.clone());
+                tokio::spawn(async move {
+                    let mut closed: Vec<Duration> = Vec::new();
+                    let mut since: Option<Instant> = None;
+                    while !done.load(Ordering::Acquire) {
+                        let busy = match conn.query("SELECT 1 FROM event LIMIT 1", ()).await {
+                            Ok(mut rows) => matches!(rows.next().await, Err(turso::Error::Busy(_))),
+                            Err(turso::Error::Busy(_)) => true,
+                            Err(err) => panic!("probe: {err}"),
+                        };
+                        match (busy, since) {
+                            (true, None) => since = Some(Instant::now()),
+                            (false, Some(at)) => {
+                                closed.push(at.elapsed());
+                                since = None;
+                            }
+                            _ => {}
+                        }
+                        tokio::time::sleep(Duration::from_micros(500)).await;
+                    }
+                    closed
+                })
+            };
+
+            let started = Instant::now();
+            let mut writing = Vec::new();
+            for writer in 0..writers {
+                let store = store.clone();
+                writing.push(tokio::spawn(async move {
+                    for n in 0..events / writers {
+                        let event = Event {
+                            id: ulid::Ulid::generate(),
+                            aggregate_type: "sizing/Order".into(),
+                            aggregate_id: format!("{writer}-{n}"),
+                            version: 1,
+                            name: "Placed".into(),
+                            ..Default::default()
+                        };
+                        store.write(vec![event]).await.expect("write");
+                    }
+                }));
+            }
+            for task in writing {
+                task.await?;
+            }
+            let wrote = started.elapsed();
+            done.store(true, Ordering::Release);
+            let mut waits = Vec::new();
+            for task in reading {
+                waits.extend(task.await?);
+            }
+            waits.sort();
+            let closed = probing.await?;
+
+            let mean = waits.iter().sum::<Duration>() / waits.len().max(1) as u32;
+            let p99 = waits[(waits.len() * 99 / 100).min(waits.len() - 1)];
+            let slow = waits
+                .iter()
+                .filter(|w| **w > Duration::from_millis(5))
+                .count();
+            let shut: Duration = closed.iter().sum();
+            let mut line = format!(
+                "{:<9} {:<26} writes {:>6.2?} | read mean {:>7.2} ms p99 {:>7.2} max {:>7.2}, {:>3}% over 5 ms | closed {:>3} times, {:>5.0} ms in all ({:>2.0}% of the run), longest {:>6.1} ms",
+                if on_file { "file" } else { "in-memory" },
+                sized.name,
+                wrote,
+                millis(mean),
+                millis(p99),
+                millis(*waits.last().unwrap()),
+                slow * 100 / waits.len(),
+                closed.len(),
+                millis(shut),
+                shut.as_secs_f64() * 100.0 / wrote.as_secs_f64(),
+                millis(closed.iter().max().copied().unwrap_or_default()),
+            );
+            if on_file {
+                // What the store left on disk, and what opening it again costs.
+                drop(store);
+                let mut sizes = Vec::new();
+                for entry in std::fs::read_dir(dir.path())? {
+                    let entry = entry?;
+                    sizes.push(format!(
+                        "{} {:.1} MB",
+                        entry.file_name().to_string_lossy(),
+                        entry.metadata()?.len() as f64 / 1e6
+                    ));
+                }
+                sizes.sort();
+                let started = Instant::now();
+                let reopened = sized_store(&path, sized).await?;
+                let opened = started.elapsed();
+                drop(reopened);
+                line.push_str(&format!(" | reopen {opened:.2?} | {}", sizes.join(", ")));
+            }
+            println!("{line}");
+        }
+    }
+    Ok(())
+}

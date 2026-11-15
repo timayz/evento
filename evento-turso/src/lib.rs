@@ -59,7 +59,7 @@ mod cluster_journal;
 
 #[cfg(feature = "cluster")]
 pub use cluster_journal::TursoJournal;
-pub use executor::{Clock, Turso, BUSY_TIMEOUT};
+pub use executor::{Clock, Turso, BUSY_TIMEOUT, CHECKPOINT_BYTES};
 pub use query::{
     execute, fetch_all, fetch_one, fetch_optional, DeadLetterTable, EventTable, MetaTable,
     SnapshotTable, Statement, SubscriberTable,
