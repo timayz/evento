@@ -655,3 +655,14 @@ async fn sqlite_delete_stream() -> anyhow::Result<()> {
 
     evento_test::delete_stream(&executor).await
 }
+
+/// Not a test: what idle subscriptions cost the store under writes (#536).
+/// `SIZING_WRITERS=1 cargo test -p evento-sql --test sqlite sizing -- --ignored --nocapture`
+/// (the test pool has no busy timeout: a second writer finds the database
+/// locked).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a measurement, not a test"]
+async fn sizing_idle_subscriptions() -> anyhow::Result<()> {
+    let pool = create_sqlite_pool("sizing_idle_subscriptions").await?;
+    evento_test::sizing_idle_subscriptions(&Sql::<sqlx::Sqlite>::from(pool)).await
+}

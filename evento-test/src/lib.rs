@@ -728,6 +728,111 @@ pub async fn subscribe_low_latency<E: Executor + Clone>(executor: &E) -> anyhow:
     Ok(())
 }
 
+/// Not a scenario: prints what `SIZING_SUBSCRIPTIONS` subscriptions (default
+/// 47) that follow nothing written cost a store while `SIZING_WRITERS`
+/// writers (default 20) write `SIZING_EVENTS` single-event streams between
+/// them (default 20,000) — the processor the writes take with the
+/// subscriptions polling every `SIZING_POLL_MS` (default 250), against the
+/// same writes without them (issue #536). Run it from a multi-threaded test.
+pub async fn sizing_idle_subscriptions<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
+    use std::time::{Duration, Instant};
+
+    fn setting(name: &str, default: usize) -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    }
+    /// The processor time of the process so far (user and system).
+    fn processor() -> Duration {
+        let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+        let fields: Vec<&str> = stat
+            .rsplit(')')
+            .next()
+            .unwrap_or_default()
+            .split_whitespace()
+            .collect();
+        let ticks = |n: usize| {
+            fields
+                .get(n)
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0)
+        };
+        // Clock ticks, 100 a second on Linux.
+        Duration::from_millis((ticks(11) + ticks(12)) * 10)
+    }
+    async fn write<E: Executor + Clone>(executor: &E, run: &str, writers: usize, events: usize) {
+        let mut tasks = Vec::new();
+        for writer in 0..writers {
+            let executor = executor.clone();
+            let run = run.to_owned();
+            tasks.push(tokio::spawn(async move {
+                for n in 0..events / writers {
+                    let event = evento::Event {
+                        id: ulid::Ulid::generate(),
+                        aggregate_id: format!("{run}-{writer}-{n}"),
+                        aggregate_type: "sizing/Order".to_owned(),
+                        version: 1,
+                        name: "Placed".to_owned(),
+                        ..Default::default()
+                    };
+                    executor.write(vec![event]).await.expect("write");
+                }
+            }));
+        }
+        for task in tasks {
+            task.await.expect("writer panicked");
+        }
+    }
+
+    let (writers, events) = (
+        setting("SIZING_WRITERS", 20),
+        setting("SIZING_EVENTS", 20_000),
+    );
+    let subscriptions = setting("SIZING_SUBSCRIPTIONS", 47);
+    let poll = Duration::from_millis(setting("SIZING_POLL_MS", 250) as u64);
+
+    // The writes get dearer as the store grows, so the polled run is set
+    // against the mean of a run before it and a run after it.
+    let (started, before) = (Instant::now(), processor());
+    write(executor, "before", writers, events).await;
+    let (mut alone, mut alone_processor) = (started.elapsed(), processor() - before);
+
+    let mut running = Vec::new();
+    for n in 0..subscriptions {
+        running.push(
+            simple_explicit::subscription(format!("sizing-idle-{n}"))
+                .poll_interval(poll)
+                .start(executor)
+                .await?,
+        );
+    }
+    let (started, before) = (Instant::now(), processor());
+    write(executor, "polled", writers, events).await;
+    let (polled, polled_processor) = (started.elapsed(), processor() - before);
+    for subscription in running {
+        subscription.shutdown().await.ok();
+    }
+
+    let (started, before) = (Instant::now(), processor());
+    write(executor, "after", writers, events).await;
+    alone = (alone + started.elapsed()) / 2;
+    alone_processor = (alone_processor + (processor() - before)) / 2;
+
+    let polls = polled.as_secs_f64() / poll.as_secs_f64() * subscriptions as f64;
+    println!(
+        "{events} writes by {writers} writers: {alone:.2?} ({alone_processor:.2?} of processor) \
+         alone, {polled:.2?} ({polled_processor:.2?}) with {subscriptions} idle subscriptions \
+         polling every {poll:?}: {:.2} ms of processor a poll",
+        polled_processor
+            .saturating_sub(alone_processor)
+            .as_secs_f64()
+            * 1000.0
+            / polls.max(1.0),
+    );
+    Ok(())
+}
+
 /// Scenario: a subscription only receives events matching its routing key.
 pub async fn subscribe_routing_key<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
     let cmd = bank::Command(executor.clone());

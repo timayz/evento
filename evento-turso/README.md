@@ -85,7 +85,7 @@ pub struct AdminView {
     pub deleted: bool,             // not a column
 }
 
-let conn = store.connect()?;
+let conn = store.connect_read()?;
 let page = Reader::new(statement)
     .args(args)
     .execute::<AdminViewByName>(&conn)
@@ -142,9 +142,13 @@ store
 ```
 
 An MVCC checkpoint stops the world for a moment, and a transaction that starts
-meanwhile — a read included — finds the database locked: the store's connections let
-Turso retry for `BUSY_TIMEOUT` (50 ms) and the store runs a read or a write that still
-comes back `Busy` again itself, in short pauses. `store.write_mode()` tells
+meanwhile — a read included — finds the database locked: the store runs a read or a
+write that comes back `Busy` again itself, in short pauses. Its write connections
+first let Turso retry for `BUSY_TIMEOUT` (50 ms); its read connections do not, because
+Turso polls through that wait with a thread kept busy and a store under writes
+checkpoints often. Take the connections you only read with from
+`store.connect_read()`: `Reader` and the `fetch_*` helpers retry a `Busy` read the
+same way. `store.write_mode()` tells
 which mode the database is in (`WriteMode::Serial` or
 `WriteMode::Concurrent`); `evento_turso::transaction(&mut conn, mode, &env, body)` is
 the same loop on a connection of yours, and `is_retryable(&err)` the test it applies

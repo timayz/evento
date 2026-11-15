@@ -247,21 +247,28 @@ pub(crate) async fn execute_prepared(conn: &Connection, query: &Prepared) -> tur
     .await
 }
 
-/// How many times a read finding the database locked is run again.
-const READ_ATTEMPTS: u32 = 200;
+/// How long a read that keeps finding the database locked is run again
+/// before its `Busy` is returned.
+const READ_PATIENCE: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Every row a rendered statement returns, with the column names. A read
 /// that finds the database locked — an MVCC checkpoint stopping the world
-/// for a moment — is run again after a short pause, up to [`READ_ATTEMPTS`].
+/// for a moment — is run again after a short pause, for [`READ_PATIENCE`].
+///
+/// The pause is slept here, not waited out inside Turso, whose wait keeps
+/// the thread busy (see [`BUSY_TIMEOUT`](crate::BUSY_TIMEOUT)); the patience
+/// is counted in time so that it is the same on a connection that waits on a
+/// lock and on one that does not.
 pub(crate) async fn fetch_rows(
     conn: &Connection,
     query: Prepared,
 ) -> turso::Result<(Vec<String>, Vec<turso::Row>)> {
-    let mut attempt = 0;
+    let started = std::time::Instant::now();
+    let mut attempt = 0u32;
     loop {
         attempt += 1;
         match fetch_rows_once(conn, &query).await {
-            Err(turso::Error::Busy(_)) if attempt < READ_ATTEMPTS => {
+            Err(turso::Error::Busy(_)) if started.elapsed() < READ_PATIENCE => {
                 tokio::time::sleep(std::time::Duration::from_millis(u64::from(Ord::min(
                     attempt, 20,
                 ))))

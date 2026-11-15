@@ -373,3 +373,11 @@ async fn fjall_delete_stream() -> anyhow::Result<()> {
     let executor = Fjall::temporary()?;
     evento_test::delete_stream(&executor).await
 }
+
+/// Not a test: what idle subscriptions cost the store under writes (#536).
+/// `cargo test -p evento-fjall --test fjall sizing -- --ignored --nocapture`
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a measurement, not a test"]
+async fn sizing_idle_subscriptions() -> anyhow::Result<()> {
+    evento_test::sizing_idle_subscriptions(&Fjall::temporary()?).await
+}

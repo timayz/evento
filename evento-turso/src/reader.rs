@@ -33,7 +33,7 @@ use crate::{query, FromRow};
 ///     .from(EventTable::Table)
 ///     .to_owned();
 ///
-/// let conn = store.connect()?;
+/// let conn = store.connect_read()?;
 /// let page = Reader::new(statement)
 ///     .forward(10, None)
 ///     .execute::<Row>(&conn)
