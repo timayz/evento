@@ -265,7 +265,7 @@ impl TursoJournal {
     }
 
     fn reader(&self) -> anyhow::Result<turso::Connection> {
-        crate::executor::connect(&self.db)
+        crate::executor::connect_read(&self.db)
     }
 
     /// Stages `value` as the `cluster_meta` row `key`, one `truncate` keeps,

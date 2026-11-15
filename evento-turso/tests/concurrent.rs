@@ -507,3 +507,11 @@ async fn a_failing_body_rolls_back_once() -> anyhow::Result<()> {
     assert_eq!(counter(&store).await?, 2);
     Ok(())
 }
+
+/// Not a test: what idle subscriptions cost a store in MVCC mode under
+/// writes (#536). `cargo test -p evento-turso --test concurrent sizing -- --ignored --nocapture`
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a measurement, not a test"]
+async fn sizing_idle_subscriptions() -> anyhow::Result<()> {
+    evento_test::sizing_idle_subscriptions(&Turso::in_memory_concurrent().await?).await
+}

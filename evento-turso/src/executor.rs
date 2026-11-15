@@ -35,12 +35,20 @@ const INSERT_CHUNK: usize = 1000;
 /// How many connections [`Turso::transaction`] keeps for the next calls.
 const APP_CONNECTIONS: usize = 16;
 
-/// How long a connection of the store lets Turso retry a statement that
-/// finds the database locked before it reports `Busy`: Turso waits in growing
-/// pauses (1, 2, 4 … ms) up to this, enough for the moment an MVCC checkpoint
-/// stops the world; what is locked longer comes back as `Busy` and is retried
-/// by the store itself ([`transaction`](crate::transaction) for writes,
-/// [`query`](crate::query) for reads), whose pauses stay short.
+/// How long a write connection of the store, and a connection from
+/// [`Turso::connect`], lets Turso retry a statement that finds the database
+/// locked before it reports `Busy`: enough for two of the store's own
+/// connections to take turns; what is locked longer comes back as `Busy` and
+/// is retried by the store itself ([`transaction`](crate::transaction)),
+/// whose pauses stay short.
+///
+/// Turso does not sleep through that wait: the statement is polled again and
+/// again until the lock is gone or the time is up, a worker thread busy all
+/// the while. The connections the store reads with
+/// ([`Turso::connect_read`]) therefore do not wait at all: a read that finds
+/// the database locked (an MVCC checkpoint stops the world for a moment, and
+/// a store under writes checkpoints often) comes back `Busy` at once and is
+/// run again after a pause that is slept (issue #536).
 pub const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Which write connection a statement goes through.
@@ -350,14 +358,25 @@ impl Turso {
     /// [`Reader`], [`fetch_all`](crate::fetch_all) and friends. Cheap:
     /// connections share the database's pager. Writes of your own may use it
     /// too, serialized by you; the store's writes go through its own
-    /// connection. Waits [`BUSY_TIMEOUT`] on a lock.
+    /// connection. Waits [`BUSY_TIMEOUT`] on a lock; for a connection that
+    /// only reads, prefer [`connect_read`](Self::connect_read).
     pub fn connect(&self) -> anyhow::Result<turso::Connection> {
         connect(&self.db)
     }
 
+    /// A connection for reads only, through [`Reader`],
+    /// [`fetch_all`](crate::fetch_all) and friends: what the store itself
+    /// reads with. It does not wait on a lock inside Turso (see
+    /// [`BUSY_TIMEOUT`]): a statement that finds the database locked returns
+    /// `Busy` at once, which those helpers answer by running it again after
+    /// a pause. A statement run on it directly has to do the same.
+    pub fn connect_read(&self) -> anyhow::Result<turso::Connection> {
+        connect_read(&self.db)
+    }
+
     /// A connection for a read.
     fn reader(&self) -> anyhow::Result<turso::Connection> {
-        self.connect()
+        self.connect_read()
     }
 
     /// The clock's time in whole seconds (for `created_at` / `updated_at`).
@@ -1092,6 +1111,14 @@ pub(crate) fn connect(db: &turso::Database) -> anyhow::Result<turso::Connection>
     Ok(conn)
 }
 
+/// A connection to `db` for reads retried by [`query`](crate::query): it
+/// does not wait on a lock.
+pub(crate) fn connect_read(db: &turso::Database) -> anyhow::Result<turso::Connection> {
+    let conn = db.connect()?;
+    conn.busy_timeout(std::time::Duration::ZERO)?;
+    Ok(conn)
+}
+
 /// `path` as the string Turso's builder takes.
 fn path_str(path: &Path) -> anyhow::Result<&str> {
     path.to_str()
@@ -1115,6 +1142,28 @@ mod tests {
     //! What Turso's planner does with the statements a subscription runs:
     //! every read and every `MAX(timestamp)` is an index seek, whatever the
     //! filters and the cursor (#478).
+
+    /// The busy timeout `conn` waits on a lock, in milliseconds.
+    async fn busy_timeout(conn: &turso::Connection) -> anyhow::Result<i64> {
+        let mut rows = conn.query("PRAGMA busy_timeout", ()).await?;
+        let row = rows.next().await?.expect("the pragma returns a row");
+        Ok(row.get::<i64>(0)?)
+    }
+
+    /// Issue #536: Turso polls through a busy timeout with the thread kept
+    /// busy, so the connections the store reads with do not wait on a lock;
+    /// their reads are run again by `query::fetch_rows`, which sleeps.
+    #[tokio::test]
+    async fn a_read_connection_does_not_wait_on_a_lock() -> anyhow::Result<()> {
+        let store = Turso::in_memory_concurrent().await?;
+        assert_eq!(busy_timeout(&store.reader()?).await?, 0);
+        assert_eq!(busy_timeout(&store.connect_read()?).await?, 0);
+        assert_eq!(
+            busy_timeout(&store.connect()?).await?,
+            BUSY_TIMEOUT.as_millis() as i64
+        );
+        Ok(())
+    }
 
     use super::*;
 

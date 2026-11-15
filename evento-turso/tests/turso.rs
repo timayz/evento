@@ -487,3 +487,11 @@ async fn evento_turso_tenant_streams_are_isolated() -> anyhow::Result<()> {
     let executor: evento::Evento = Turso::in_memory().await?.into();
     evento_test::tenant_streams_are_isolated(&executor).await
 }
+
+/// Not a test: what idle subscriptions cost a serial store under writes
+/// (#536). `cargo test -p evento-turso --test turso sizing -- --ignored --nocapture`
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a measurement, not a test"]
+async fn sizing_idle_subscriptions() -> anyhow::Result<()> {
+    evento_test::sizing_idle_subscriptions(&Turso::in_memory().await?).await
+}
