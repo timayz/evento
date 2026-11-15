@@ -14,21 +14,25 @@
 //! head-of-line-block unrelated reads; correlation ids make out-of-order
 //! replies safe.
 //!
-//! Writes are pushed to each connection as [`ServerFrame::Notify`]: from its
-//! executor's own `write_watch` when it has one, otherwise from a server-wide
-//! signal fired after each successful `write` handled by any connection
-//! (still low-latency for writes through this server; writers bypassing it
-//! are covered by the client's poll-interval fallback, the same caveat every
-//! `write_watch` backend documents). A connection without a `write_watch`
-//! may thus be woken by a write to another executor; the watch is
-//! level-triggered, so a spurious wakeup costs one empty poll. A connection
-//! serving a tenant is notified of that tenant's writes alone.
+//! A connection is told of the writes its client watches for, and of no
+//! other: the client registers each watch with the filter its reads use
+//! ([`ClientFrame::Watch`]), and a [`ServerFrame::Notify`] names the watches a
+//! write wakes. A watch is fed from the executor's own `write_watch_for` when
+//! it has a write signal, otherwise from a server-wide signal fired after
+//! each successful `write` handled by any connection (still low-latency for
+//! writes through this server; writers bypassing it are covered by the
+//! client's poll-interval fallback, the same caveat every `write_watch`
+//! backend documents). A connection without a write signal may thus be woken
+//! by a write to another executor; the watch is level-triggered, so a
+//! spurious wakeup costs one empty poll. On a connection serving a tenant a
+//! watch follows that tenant's writes alone.
 //!
 //! A session may serve one tenant ([`Session::tenant`]): every request on the
 //! connection then acts in that tenant, whatever tenant it names, and the
 //! requests that would reach past it are refused.
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,7 +43,7 @@ use futures_util::stream::SplitStream;
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
-use tokio::task::JoinHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 use tokio_rustls::TlsAcceptor;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tokio_util::either::Either;
@@ -58,6 +62,16 @@ const OUT_CAPACITY: usize = 1024;
 /// cap a client pipelining arbitrarily many large frames could spawn unbounded
 /// tasks; at the cap the read loop stops pulling frames (TCP backpressure).
 const MAX_INFLIGHT_PER_CONNECTION: usize = 256;
+
+/// Maximum watches a connection may hold, each a task and a receiver on the
+/// executor's write signal. Past it a watch is not registered and its
+/// watcher is left to its poll interval.
+const MAX_WATCHES_PER_CONNECTION: usize = 65_536;
+
+/// Capacity of the queue between a connection's watches and the task that
+/// names them in a [`ServerFrame::Notify`]. A watch that finds it full waits:
+/// the writes that land meanwhile are covered by the one notify that follows.
+const WOKEN_CAPACITY: usize = 1024;
 
 /// A dialer that never completes the TLS handshake, or never sends `Hello`,
 /// must not pin a task forever.
@@ -323,7 +337,7 @@ async fn hello_phase(inbound: &mut Inbound, peer: SocketAddr) -> Option<(u64, Op
             id,
             request: Request::Hello { token },
         } => Some((id, token.map(|t| t.0))),
-        ClientFrame::Request { .. } => {
+        _ => {
             tracing::debug!(%peer, "first frame is not hello, closing connection");
             None
         }
@@ -426,20 +440,15 @@ async fn connection<R: Resolver>(
         return;
     }
 
-    // A backend with its own write_watch covers writes from every process
-    // sharing the store; forward it. Otherwise the Write handlers fire the
-    // server-wide signal (see `handle`). A connection serving a tenant
-    // watches that tenant's writes alone: on a store shared by many tenants
-    // it is not sent a frame, and its subscriptions do not run a pass, for
-    // every write of every other tenant.
+    // A backend with its own write signal covers writes from every process
+    // sharing the store; the watches are fed from it. Otherwise the Write
+    // handlers fire the server-wide signal (see `handle`).
     let bump_on_write = executor.write_watch().is_none();
-    let interest = tenant.as_deref().map(WriteInterest::tenant);
-    let mut notify_rx = match &interest {
-        Some(interest) => executor
-            .write_watch_for(interest)
-            .unwrap_or_else(|| bump.subscribe_to(interest.clone())),
-        None => executor.write_watch().unwrap_or_else(|| bump.subscribe()),
-    };
+    // The watches of the connection, by the client's id: each a task that
+    // queues its id when a write it follows lands. The notifier turns what
+    // is queued into one frame.
+    let mut watches: HashMap<u64, AbortHandle> = HashMap::new();
+    let (woken_tx, mut woken_rx) = mpsc::channel::<u64>(WOKEN_CAPACITY);
     let notifier = {
         let out_tx = out_tx.clone();
         let executor = executor.clone();
@@ -447,15 +456,20 @@ async fn connection<R: Resolver>(
         tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    changed = notify_rx.changed() => {
-                        if changed.is_err() {
-                            break;
+                    woken = woken_rx.recv() => {
+                        let Some(watch) = woken else { break };
+                        // One write often wakes several watches: name them
+                        // together.
+                        let mut woken = vec![watch];
+                        while let Ok(watch) = woken_rx.try_recv() {
+                            if !woken.contains(&watch) {
+                                woken.push(watch);
+                            }
                         }
-                        let generation = *notify_rx.borrow_and_update();
                         let stable_timestamp =
                             executor.stable_timestamp().await.ok().flatten();
                         let frame = ServerFrame::Notify {
-                            generation,
+                            watches: woken,
                             stable_timestamp,
                         };
                         if out_tx.send(frame).await.is_err() {
@@ -488,7 +502,62 @@ async fn connection<R: Resolver>(
                 break;
             }
         };
-        let ClientFrame::Request { id, request } = frame;
+        let (id, request) = match frame {
+            ClientFrame::Request { id, request } => (id, request),
+            ClientFrame::Watch {
+                watch,
+                filters,
+                routing_key,
+                tenant: named,
+            } => {
+                let interest = WriteInterest {
+                    filters: filters.map(Arc::from),
+                    routing_key,
+                    // A session serving a tenant watches that tenant's
+                    // writes, whatever tenant the watch names (see `confine`).
+                    tenant: match &tenant {
+                        Some(tenant) => TenantFilter::Only(tenant.to_string()),
+                        None => named,
+                    },
+                };
+                // An id registered twice is the client's mistake; the later
+                // filter replaces the earlier.
+                if let Some(replaced) = watches.remove(&watch) {
+                    replaced.abort();
+                }
+                if watches.len() >= MAX_WATCHES_PER_CONNECTION {
+                    tracing::warn!(
+                        %peer,
+                        max = MAX_WATCHES_PER_CONNECTION,
+                        "too many watches on one connection: the watch is not registered \
+                         and its subscription is left to its poll interval"
+                    );
+                    continue;
+                }
+                let mut rx = executor
+                    .write_watch_for(&interest)
+                    .unwrap_or_else(|| bump.subscribe_to(interest));
+                let woken_tx = woken_tx.clone();
+                let task = tokio::spawn(async move {
+                    // Named once before any write: the watcher reads what
+                    // was written before the watch was in place.
+                    while woken_tx.send(watch).await.is_ok() {
+                        if rx.changed().await.is_err() {
+                            break;
+                        }
+                        rx.borrow_and_update();
+                    }
+                });
+                watches.insert(watch, task.abort_handle());
+                continue;
+            }
+            ClientFrame::Unwatch { watch } => {
+                if let Some(dropped) = watches.remove(&watch) {
+                    dropped.abort();
+                }
+                continue;
+            }
+        };
 
         // A repeated hello is answered from the established session, never
         // resolved again.
@@ -526,6 +595,9 @@ async fn connection<R: Resolver>(
     }
 
     notifier.abort();
+    for (_, watch) in watches {
+        watch.abort();
+    }
     drop(out_tx);
     let _ = writer.await;
 }
@@ -934,5 +1006,131 @@ mod tests {
             }),
             Some(Response::Acknowledge(Err(_)))
         ));
+    }
+}
+
+#[cfg(test)]
+mod watch_tests {
+    use super::*;
+    use evento_core::{Event, EventFilter, RoutingKey};
+
+    type Wire = Framed<TcpStream, LengthDelimitedCodec>;
+
+    async fn send(wire: &mut Wire, frame: ClientFrame) {
+        let bytes = encode_tagged(RecordKind::ClientFrame, &frame).unwrap();
+        wire.send(Bytes::from(bytes)).await.unwrap();
+    }
+
+    async fn next(wire: &mut Wire) -> ServerFrame {
+        let bytes = tokio::time::timeout(Duration::from_secs(5), wire.next())
+            .await
+            .expect("a frame within 5s")
+            .expect("the connection is open")
+            .unwrap();
+        crate::wire::decode_tagged(RecordKind::ServerFrame, &bytes).unwrap()
+    }
+
+    /// The watches of the next `Notify`; a response met on the way is skipped.
+    async fn notified(wire: &mut Wire) -> Vec<u64> {
+        loop {
+            if let ServerFrame::Notify { mut watches, .. } = next(wire).await {
+                watches.sort_unstable();
+                return watches;
+            }
+        }
+    }
+
+    /// A `Hello` and its reply: the frames sent before it have been taken in
+    /// by then, the read loop handles them in order.
+    async fn settle(wire: &mut Wire, id: u64) {
+        send(
+            wire,
+            ClientFrame::Request {
+                id,
+                request: Request::Hello { token: None },
+            },
+        )
+        .await;
+        loop {
+            if let ServerFrame::Response { id: answered, .. } = next(wire).await {
+                if answered == id {
+                    return;
+                }
+            }
+        }
+    }
+
+    fn watch(watch: u64, aggregate_type: &str) -> ClientFrame {
+        ClientFrame::Watch {
+            watch,
+            filters: Some(vec![EventFilter::by_type_raw(aggregate_type)]),
+            routing_key: Some(RoutingKey::Value(None)),
+            tenant: TenantFilter::All,
+        }
+    }
+
+    fn event(aggregate_type: &str, id: &str) -> Event {
+        Event {
+            id: ulid::Ulid::generate(),
+            aggregate_type: aggregate_type.to_owned(),
+            aggregate_id: id.to_owned(),
+            version: 1,
+            name: "Probed".to_owned(),
+            ..Default::default()
+        }
+    }
+
+    /// Issue #535: a `Notify` names the watches a write wakes, a connection
+    /// that watches nothing is sent none, and a watch dropped with `Unwatch`
+    /// is no longer named.
+    #[tokio::test]
+    async fn a_notify_names_the_watches_a_write_wakes() {
+        let store = evento_fjall::Fjall::temporary().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _server = serve(listener, store.clone());
+        let mut wire = Framed::new(TcpStream::connect(addr).await.unwrap(), codec());
+        settle(&mut wire, 0).await;
+
+        // Nothing is watched yet: the write is answered by nothing.
+        store
+            .write(vec![event("test/Account", "a0")])
+            .await
+            .unwrap();
+        let quiet = tokio::time::timeout(Duration::from_millis(300), wire.next()).await;
+        assert!(
+            quiet.is_err(),
+            "a connection that watches nothing is sent nothing"
+        );
+
+        // A watch is named once as it is registered.
+        send(&mut wire, watch(1, "test/Account")).await;
+        assert_eq!(notified(&mut wire).await, [1]);
+        send(&mut wire, watch(2, "test/Account")).await;
+        assert_eq!(notified(&mut wire).await, [2]);
+        send(&mut wire, watch(3, "test/Card")).await;
+        assert_eq!(notified(&mut wire).await, [3]);
+
+        store
+            .write(vec![event("test/Account", "a1")])
+            .await
+            .unwrap();
+        let mut woken = notified(&mut wire).await;
+        if woken.len() < 2 {
+            // The two watches were queued either side of the notifier's wake.
+            woken.extend(notified(&mut wire).await);
+            woken.sort_unstable();
+        }
+        assert_eq!(woken, [1, 2]);
+
+        send(&mut wire, ClientFrame::Unwatch { watch: 2 }).await;
+        settle(&mut wire, 1).await;
+        store
+            .write(vec![event("test/Account", "a2")])
+            .await
+            .unwrap();
+        assert_eq!(notified(&mut wire).await, [1]);
+        store.write(vec![event("test/Card", "c1")]).await.unwrap();
+        assert_eq!(notified(&mut wire).await, [3]);
     }
 }

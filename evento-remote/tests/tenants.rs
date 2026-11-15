@@ -318,7 +318,11 @@ async fn a_tenant_connection_is_notified_of_its_own_writes_only() {
     let acme = connect(addr, "acme").await;
     let globex = connect(addr, "globex").await;
     let mut notified = acme.write_watch().unwrap();
-    notified.borrow_and_update();
+    // The server names a watch once as it registers it.
+    tokio::time::timeout(std::time::Duration::from_secs(5), notified.changed())
+        .await
+        .expect("a watch is woken once when registered")
+        .unwrap();
 
     // Another tenant's client, and the host itself in a third tenant.
     globex.write(vec![event("a", 1, "")]).await.unwrap();

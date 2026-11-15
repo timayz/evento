@@ -26,7 +26,10 @@ pub const MAGIC: [u8; 2] = *b"Er";
 /// connection; the server requires `Hello` as the first frame.
 /// v5: tenants — events carry their tenant, every scan request a
 /// `TenantFilter`, and every identity and snapshot request a tenant.
-pub const FORMAT_VERSION: u8 = 5;
+/// v6: write interests — the client registers what it watches with `Watch`
+/// and `Unwatch`, and `Notify` names the watches it wakes instead of being
+/// pushed for every write.
+pub const FORMAT_VERSION: u8 = 6;
 
 /// Length of the fixed header: `MAGIC (2) + version (1) + kind (1)`.
 const HEADER_LEN: usize = 4;
@@ -92,10 +95,29 @@ pub fn decode_tagged<T: DeserializeOwned>(expected: RecordKind, bytes: &[u8]) ->
     Ok(bitcode::deserialize(&bytes[HEADER_LEN..])?)
 }
 
-/// A client → server frame: a request with a per-connection correlation id.
+/// A client → server frame: a request with a per-connection correlation id,
+/// or what the client watches the writes for. The watch frames get no reply.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ClientFrame {
-    Request { id: u64, request: Request },
+    Request {
+        id: u64,
+        request: Request,
+    },
+    /// Registers a watch: the server pushes a [`ServerFrame::Notify`] naming
+    /// `watch` at once, then after each write that holds an event a read
+    /// with this filter returns (see
+    /// [`WriteInterest`](evento_core::WriteInterest)). `watch` is the
+    /// client's choice, unique on the connection.
+    Watch {
+        watch: u64,
+        filters: Option<Vec<EventFilter>>,
+        routing_key: Option<RoutingKey>,
+        tenant: TenantFilter,
+    },
+    /// Drops a watch; unknown ids are ignored.
+    Unwatch {
+        watch: u64,
+    },
 }
 
 /// A server → client frame: either a correlated reply or an unsolicited write
@@ -110,10 +132,12 @@ pub enum ServerFrame {
         response: Response,
         stable_timestamp: Option<u64>,
     },
-    /// Pushed after each server-side write; wakes client-side subscriptions
-    /// without waiting for their poll interval.
+    /// Pushed when a watch is registered and after each server-side write
+    /// one of the connection's watches follows; wakes the client-side
+    /// subscriptions behind `watches` without waiting for their poll
+    /// interval.
     Notify {
-        generation: u64,
+        watches: Vec<u64>,
         stable_timestamp: Option<u64>,
     },
 }
@@ -503,6 +527,48 @@ mod tests {
         };
         assert_eq!(id, 9);
         assert_eq!(events, vec![event]);
+    }
+
+    #[test]
+    fn watch_round_trip() {
+        let frame = ClientFrame::Watch {
+            watch: 3,
+            filters: Some(vec![EventFilter::by_event_raw("account", "opened")]),
+            routing_key: Some(RoutingKey::Value(Some("eu".to_owned()))),
+            tenant: TenantFilter::Only("acme".to_owned()),
+        };
+        let bytes = encode_tagged(RecordKind::ClientFrame, &frame).unwrap();
+        let back: ClientFrame = decode_tagged(RecordKind::ClientFrame, &bytes).unwrap();
+        let ClientFrame::Watch {
+            watch,
+            filters,
+            routing_key,
+            tenant,
+        } = back
+        else {
+            panic!("wrong frame");
+        };
+        assert_eq!(watch, 3);
+        assert_eq!(
+            filters,
+            Some(vec![EventFilter::by_event_raw("account", "opened")])
+        );
+        assert!(matches!(
+            routing_key,
+            Some(RoutingKey::Value(Some(key))) if key == "eu"
+        ));
+        assert_eq!(tenant, TenantFilter::Only("acme".to_owned()));
+
+        let frame = ServerFrame::Notify {
+            watches: vec![3, 7],
+            stable_timestamp: Some(9),
+        };
+        let bytes = encode_tagged(RecordKind::ServerFrame, &frame).unwrap();
+        let back: ServerFrame = decode_tagged(RecordKind::ServerFrame, &bytes).unwrap();
+        assert!(matches!(
+            back,
+            ServerFrame::Notify { watches, stable_timestamp: Some(9) } if watches == [3, 7]
+        ));
     }
 
     #[test]

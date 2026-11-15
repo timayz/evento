@@ -8,9 +8,15 @@
 //! each attempt is drawn at random below the backoff, so the clients a server
 //! restart dropped together do not come back together
 //! ([`ClientBuilder::reconnect_backoff`]). Requests are
-//! round-robined across connections; pushed [`ServerFrame::Notify`] frames
-//! feed a local `write_watch` channel (from the first connection only — the
-//! watch is level-triggered, duplicates from every connection add nothing).
+//! round-robined across connections.
+//!
+//! **Write wakes.** A watcher ([`Executor::write_watch_for`], what a
+//! subscription waits on) registers its filter with the server, on the first
+//! connection, and is woken by the pushed [`ServerFrame::Notify`] frames that
+//! name it: the writes that hold an event it would read, and no other. The
+//! server also names a watch when it registers it, so a watcher is woken once
+//! at the start and once after every reconnect, and reads what it could have
+//! missed.
 //!
 //! **At-most-once semantics.** A request in flight when the connection drops
 //! fails at the caller, but may still have executed on the server — a retried
@@ -35,7 +41,9 @@ use std::time::Duration;
 use anyhow::Context as _;
 use bytes::Bytes;
 use evento_core::cursor::{Args, ReadResult, Value};
-use evento_core::{Event, EventFilter, Executor, RoutingKey, TenantFilter, WriteError};
+use evento_core::{
+    Event, EventFilter, Executor, RoutingKey, TenantFilter, WriteError, WriteInterest,
+};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -153,6 +161,29 @@ fn codec() -> LengthDelimitedCodec {
 /// it, and the actor owns its own pending map — no shared lock.
 type Dispatch = (u64, Request, oneshot::Sender<Response>);
 
+/// What a watcher asks of the connection that carries the watches.
+enum WatchCommand {
+    /// Register `interest` under `watch` and wake `tx` when the server names
+    /// it.
+    Add {
+        watch: u64,
+        interest: WriteInterest,
+        tx: watch::Sender<u64>,
+    },
+    /// The last receiver of `watch` is gone.
+    Remove { watch: u64 },
+}
+
+/// The [`ClientFrame::Watch`] that registers `interest` under `watch`.
+fn watch_frame(watch: u64, interest: &WriteInterest) -> ClientFrame {
+    ClientFrame::Watch {
+        watch,
+        filters: interest.filters.as_deref().map(<[EventFilter]>::to_vec),
+        routing_key: interest.routing_key.clone(),
+        tenant: interest.tenant.clone(),
+    }
+}
+
 /// A remote [`Executor`]: forwards every call to a [`serve`](crate::serve)d
 /// executor over TCP. Cheap to clone; all clones share the connection pool.
 #[derive(Clone)]
@@ -165,7 +196,14 @@ struct Inner {
     lanes: Vec<mpsc::Sender<Dispatch>>,
     round_robin: AtomicUsize,
     next_id: AtomicU64,
-    watch_tx: Arc<watch::Sender<u64>>,
+    /// The watches, handed to the first connection's actor.
+    watches: mpsc::UnboundedSender<WatchCommand>,
+    next_watch: AtomicU64,
+    /// The channel of the unfiltered [`write_watch`](Executor::write_watch),
+    /// registered with the server by its first caller and kept from then on.
+    watch_all: std::sync::OnceLock<watch::Sender<u64>>,
+    /// Where the tasks that wait for a watcher to go away are spawned.
+    runtime: tokio::runtime::Handle,
     /// Fixed at server executor construction; snapshotted once from the first
     /// connection's `Hello` (it is borrowed as `&str`, so it must stay fixed).
     default_routing_key: Option<String>,
@@ -238,8 +276,8 @@ impl ClientBuilder {
     /// is kept alive with automatic reconnect.
     pub async fn connect(self) -> anyhow::Result<Client> {
         let stable: Stable = Arc::new(AtomicU64::new(0));
-        let (watch_tx, _) = watch::channel(0u64);
-        let watch_tx = Arc::new(watch_tx);
+        let (watches, watch_rx) = mpsc::unbounded_channel();
+        let mut watch_rx = Some(watch_rx);
 
         let mut lanes = Vec::with_capacity(self.connections);
         let mut default_routing_key = None;
@@ -254,9 +292,11 @@ impl ClientBuilder {
                 Actor {
                     dial: self.dial.clone(),
                     req_rx,
-                    // One forwarder is enough: the watch is a level-triggered
-                    // wakeup, and every connection receives the same notifies.
-                    watch_tx: (lane == 0).then(|| Arc::clone(&watch_tx)),
+                    // One connection carries the watches: a watch is a
+                    // level-triggered wakeup, registering it on every
+                    // connection would add nothing.
+                    watch_rx: if lane == 0 { watch_rx.take() } else { None },
+                    watches: HashMap::new(),
                     stable: Arc::clone(&stable),
                     request_timeout: self.request_timeout,
                     backoff: self.backoff,
@@ -271,7 +311,10 @@ impl ClientBuilder {
                 lanes,
                 round_robin: AtomicUsize::new(0),
                 next_id: AtomicU64::new(HELLO_ID + 1),
-                watch_tx,
+                watches,
+                next_watch: AtomicU64::new(0),
+                watch_all: std::sync::OnceLock::new(),
+                runtime: tokio::runtime::Handle::current(),
                 default_routing_key,
                 stable,
                 request_timeout: self.request_timeout,
@@ -329,6 +372,23 @@ impl Client {
     }
 }
 
+impl Inner {
+    /// Registers `interest` with the server: the id of the watch and the
+    /// sender of the channel its notifies wake.
+    fn watch(&self, interest: WriteInterest) -> (u64, watch::Sender<u64>) {
+        let (tx, _) = watch::channel(0u64);
+        let watch = self.next_watch.fetch_add(1, Ordering::Relaxed);
+        // A closed channel means the actor is gone, and with it every
+        // connection: nothing would wake the watcher anyway.
+        let _ = self.watches.send(WatchCommand::Add {
+            watch,
+            interest,
+            tx: tx.clone(),
+        });
+        (watch, tx)
+    }
+}
+
 fn protocol_err(what: &str) -> anyhow::Error {
     anyhow::anyhow!("remote protocol error: unexpected response to {what}")
 }
@@ -340,7 +400,29 @@ impl Executor for Client {
     }
 
     fn write_watch(&self) -> Option<watch::Receiver<u64>> {
-        Some(self.inner.watch_tx.subscribe())
+        let all = self.inner.watch_all.get_or_init(|| {
+            self.inner
+                .watch(WriteInterest {
+                    filters: None,
+                    routing_key: None,
+                    tenant: TenantFilter::All,
+                })
+                .1
+        });
+        Some(all.subscribe())
+    }
+
+    fn write_watch_for(&self, interest: &WriteInterest) -> Option<watch::Receiver<u64>> {
+        let (watch, tx) = self.inner.watch(interest.clone());
+        let rx = tx.subscribe();
+        // The server keeps a watch until it is told to drop it: say so once
+        // the last receiver is gone.
+        let watches = self.inner.watches.clone();
+        self.inner.runtime.spawn(async move {
+            tx.closed().await;
+            let _ = watches.send(WatchCommand::Remove { watch });
+        });
+        Some(rx)
     }
 
     async fn stable_timestamp(&self) -> anyhow::Result<Option<u64>> {
@@ -599,14 +681,18 @@ impl Executor for Client {
 
 /// Owns one framed connection of the pool: sends dispatched requests,
 /// demultiplexes replies via its **own** pending map (the reply channel
-/// arrives with each request, so there is no shared lock), optionally feeds
-/// pushed notifications into the watch channel, reconnects with capped
-/// exponential backoff. Exits when every [`Client`] clone is dropped.
+/// arrives with each request, so there is no shared lock), on the first
+/// connection registers the watches and wakes the ones a pushed notification
+/// names, reconnects with capped exponential backoff. Exits when every
+/// [`Client`] clone is dropped.
 struct Actor {
     dial: Dial,
     req_rx: mpsc::Receiver<Dispatch>,
-    /// `Some` on the notify-forwarding connection only.
-    watch_tx: Option<Arc<watch::Sender<u64>>>,
+    /// `Some` on the connection that carries the watches only.
+    watch_rx: Option<mpsc::UnboundedReceiver<WatchCommand>>,
+    /// The watches registered through this connection, by id. They outlive
+    /// a connection: each is registered again on the next one.
+    watches: HashMap<u64, (WriteInterest, watch::Sender<u64>)>,
     stable: Stable,
     request_timeout: Duration,
     backoff: Backoff,
@@ -654,41 +740,80 @@ impl Actor {
                     }
                 }
             });
-            loop {
-                tokio::select! {
-                    item = self.req_rx.recv() => {
-                        let Some((id, request, reply_tx)) = item else { break };
-                        let frame = ClientFrame::Request { id, request };
-                        let Ok(bytes) = encode_tagged(RecordKind::ClientFrame, &frame) else {
-                            continue; // dropping reply_tx fails the caller
-                        };
-                        pending.insert(id, reply_tx);
-                        if out_tx.send(Bytes::from(bytes)).await.is_err() {
-                            pending.remove(&id);
-                            break;
-                        }
+            // The server knows the watches of a connection, not of a client:
+            // a new connection is told all of them again. It names each one
+            // as it registers it, which wakes the watchers for whatever was
+            // written while there was no connection.
+            'connected: {
+                for (watch, (interest, _)) in &self.watches {
+                    let Ok(bytes) =
+                        encode_tagged(RecordKind::ClientFrame, &watch_frame(*watch, interest))
+                    else {
+                        continue;
+                    };
+                    if out_tx.send(Bytes::from(bytes)).await.is_err() {
+                        break 'connected;
                     }
-                    item = inbound.next() => {
-                        let Some(Ok(bytes)) = item else { break };
-                        match decode_tagged::<ServerFrame>(RecordKind::ServerFrame, &bytes) {
-                            Ok(ServerFrame::Response { id, response, stable_timestamp }) => {
-                                self.update_stable(stable_timestamp);
-                                // An unknown id is a reply to a request that
-                                // already timed out (its caller is gone — the
-                                // send below just fails harmlessly).
-                                if let Some(tx) = pending.remove(&id) {
-                                    let _ = tx.send(response);
+                }
+                loop {
+                    tokio::select! {
+                        command = next_watch_command(&mut self.watch_rx) => {
+                            let frame = match command {
+                                WatchCommand::Add { watch, interest, tx } => {
+                                    let frame = watch_frame(watch, &interest);
+                                    self.watches.insert(watch, (interest, tx));
+                                    frame
                                 }
-                            }
-                            Ok(ServerFrame::Notify { stable_timestamp, .. }) => {
-                                self.update_stable(stable_timestamp);
-                                if let Some(watch_tx) = &self.watch_tx {
-                                    watch_tx.send_modify(|g| *g += 1);
+                                WatchCommand::Remove { watch } => {
+                                    self.watches.remove(&watch);
+                                    ClientFrame::Unwatch { watch }
                                 }
-                            }
-                            Err(err) => {
-                                tracing::debug!(?err, "undecodable frame, reconnecting");
+                            };
+                            let Ok(bytes) = encode_tagged(RecordKind::ClientFrame, &frame) else {
+                                continue;
+                            };
+                            if out_tx.send(Bytes::from(bytes)).await.is_err() {
                                 break;
+                            }
+                        }
+                        item = self.req_rx.recv() => {
+                            let Some((id, request, reply_tx)) = item else { break };
+                            let frame = ClientFrame::Request { id, request };
+                            let Ok(bytes) = encode_tagged(RecordKind::ClientFrame, &frame) else {
+                                continue; // dropping reply_tx fails the caller
+                            };
+                            pending.insert(id, reply_tx);
+                            if out_tx.send(Bytes::from(bytes)).await.is_err() {
+                                pending.remove(&id);
+                                break;
+                            }
+                        }
+                        item = inbound.next() => {
+                            let Some(Ok(bytes)) = item else { break };
+                            match decode_tagged::<ServerFrame>(RecordKind::ServerFrame, &bytes) {
+                                Ok(ServerFrame::Response { id, response, stable_timestamp }) => {
+                                    self.update_stable(stable_timestamp);
+                                    // An unknown id is a reply to a request that
+                                    // already timed out (its caller is gone — the
+                                    // send below just fails harmlessly).
+                                    if let Some(tx) = pending.remove(&id) {
+                                        let _ = tx.send(response);
+                                    }
+                                }
+                                Ok(ServerFrame::Notify { watches, stable_timestamp }) => {
+                                    self.update_stable(stable_timestamp);
+                                    for watch in watches {
+                                        // An unknown id is a watch dropped while
+                                        // its notify was on the way.
+                                        if let Some((_, tx)) = self.watches.get(&watch) {
+                                            tx.send_modify(|g| *g += 1);
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    tracing::debug!(?err, "undecodable frame, reconnecting");
+                                    break;
+                                }
                             }
                         }
                     }
@@ -743,6 +868,21 @@ impl Actor {
             self.stable.fetch_max(v, Ordering::AcqRel);
         }
     }
+}
+
+/// The next watch command; never resolves on a connection that carries no
+/// watches, or once every [`Client`] clone is gone (the request queue closing
+/// is what ends the actor).
+async fn next_watch_command(
+    rx: &mut Option<mpsc::UnboundedReceiver<WatchCommand>>,
+) -> WatchCommand {
+    if let Some(commands) = rx {
+        if let Some(command) = commands.recv().await {
+            return command;
+        }
+        *rx = None;
+    }
+    std::future::pending().await
 }
 
 /// Establishes one connection (TLS handshake included) and performs the
@@ -824,6 +964,82 @@ async fn connect_and_hello(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #535: a watcher's filter is sent to the server, and the server
+    /// is told once its last receiver is gone. The unfiltered watch is
+    /// registered by its first caller only.
+    #[tokio::test]
+    async fn a_watch_is_registered_and_dropped_with_its_receivers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut wire = Framed::new(stream, codec());
+            let mut seen = Vec::new();
+            while seen.len() < 4 {
+                let bytes = wire.next().await.unwrap().unwrap();
+                match decode_tagged::<ClientFrame>(RecordKind::ClientFrame, &bytes).unwrap() {
+                    ClientFrame::Request { id, .. } => {
+                        let reply = ServerFrame::Response {
+                            id,
+                            response: Response::Hello(Ok(HelloOk {
+                                default_routing_key: None,
+                            })),
+                            stable_timestamp: None,
+                        };
+                        let bytes = encode_tagged(RecordKind::ServerFrame, &reply).unwrap();
+                        wire.send(Bytes::from(bytes)).await.unwrap();
+                    }
+                    frame => seen.push(frame),
+                }
+            }
+            seen
+        });
+
+        let client = Client::connect(addr).await.unwrap();
+        let interest = WriteInterest {
+            filters: Some([EventFilter::by_type_raw("test/Account")].into()),
+            routing_key: Some(RoutingKey::Value(None)),
+            tenant: TenantFilter::All,
+        };
+        let accounts = client.write_watch_for(&interest).unwrap();
+        let clone = accounts.clone();
+        let all = client.write_watch().unwrap();
+        let all_again = client.write_watch().unwrap();
+        drop(accounts);
+        let cards = client
+            .write_watch_for(&WriteInterest {
+                filters: Some([EventFilter::by_type_raw("test/Card")].into()),
+                ..interest
+            })
+            .unwrap();
+        drop(clone);
+
+        let seen = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("four watch frames within 5s")
+            .unwrap();
+        let [ClientFrame::Watch {
+            watch: accounts,
+            filters: Some(filters),
+            routing_key: Some(RoutingKey::Value(None)),
+            tenant: TenantFilter::All,
+        }, ClientFrame::Watch {
+            watch: unfiltered,
+            filters: None,
+            routing_key: None,
+            tenant: TenantFilter::All,
+        }, ClientFrame::Watch {
+            watch: cards_id, ..
+        }, ClientFrame::Unwatch { watch: dropped }] = &seen[..]
+        else {
+            panic!("unexpected frames: {seen:?}");
+        };
+        assert_eq!(filters, &[EventFilter::by_type_raw("test/Account")]);
+        assert_eq!(dropped, accounts);
+        assert!(accounts != unfiltered && unfiltered != cards_id && accounts != cards_id);
+        drop((all, all_again, cards));
+    }
 
     #[test]
     fn the_reconnect_delay_stays_below_a_doubling_bound() {

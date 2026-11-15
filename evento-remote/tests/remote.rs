@@ -595,3 +595,141 @@ async fn remote_tenant_snapshots_are_isolated() -> anyhow::Result<()> {
     let server = setup().await?;
     evento_test::tenant_snapshots_are_isolated(&server.client).await
 }
+
+/// An event of the stream `id` of `aggregate_type`, first of its stream.
+fn watched_event(aggregate_type: &str, id: &str, routing_key: Option<&str>) -> evento_core::Event {
+    evento_core::Event {
+        id: ulid::Ulid::generate(),
+        aggregate_type: aggregate_type.to_owned(),
+        aggregate_id: id.to_owned(),
+        version: 1,
+        name: "Probed".to_owned(),
+        routing_key: routing_key.map(str::to_owned),
+        ..Default::default()
+    }
+}
+
+/// What a subscription that follows `aggregate_type`, written without a
+/// routing key, watches with.
+fn interest_in(aggregate_type: &str) -> evento_core::WriteInterest {
+    evento_core::WriteInterest {
+        filters: Some([evento_core::EventFilter::by_type_raw(aggregate_type)].into()),
+        routing_key: Some(evento_core::RoutingKey::Value(None)),
+        tenant: evento_core::TenantFilter::All,
+    }
+}
+
+/// Whether `watch` is woken within `within`.
+async fn woken(watch: &mut tokio::sync::watch::Receiver<u64>, within: std::time::Duration) -> bool {
+    let woken = tokio::time::timeout(within, watch.changed()).await.is_ok();
+    watch.borrow_and_update();
+    woken
+}
+
+const SOON: std::time::Duration = std::time::Duration::from_secs(5);
+const QUIET: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Issue #535: a client's watch is woken by the writes its filter reads, not
+/// by every write of the store — whether the write came through this client,
+/// another one, or the served executor itself.
+#[tokio::test]
+async fn a_watch_is_woken_by_the_writes_it_follows_only() -> anyhow::Result<()> {
+    let fjall = evento_fjall::Fjall::temporary()?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let _handle = serve(listener, fjall.clone());
+    let client = Client::connect(addr).await?;
+    let other = Client::connect(addr).await?;
+
+    let mut accounts = client
+        .write_watch_for(&interest_in("test/Account"))
+        .unwrap();
+    let mut cards = client.write_watch_for(&interest_in("test/Card")).unwrap();
+    // Each watch is woken once as the server registers it.
+    assert!(woken(&mut accounts, SOON).await);
+    assert!(woken(&mut cards, SOON).await);
+
+    client
+        .write(vec![watched_event("test/Order", "o1", None)])
+        .await?;
+    other
+        .write(vec![watched_event("test/Card", "c1", None)])
+        .await?;
+    // An account, but under a routing key the watch does not read.
+    fjall
+        .write(vec![watched_event("test/Account", "a1", Some("eu"))])
+        .await?;
+    assert!(woken(&mut cards, SOON).await);
+    assert!(
+        !woken(&mut accounts, QUIET).await,
+        "no write held an event the accounts watch reads"
+    );
+
+    fjall
+        .write(vec![watched_event("test/Account", "a2", None)])
+        .await?;
+    assert!(woken(&mut accounts, SOON).await);
+    assert!(!woken(&mut cards, QUIET).await);
+
+    // The unfiltered watch still sees every write.
+    let mut all = client.write_watch().unwrap();
+    assert!(woken(&mut all, SOON).await);
+    other
+        .write(vec![watched_event("test/Order", "o2", None)])
+        .await?;
+    assert!(woken(&mut all, SOON).await);
+    assert!(!woken(&mut accounts, QUIET).await);
+    Ok(())
+}
+
+/// The server knows the watches of a connection: after a reconnect the client
+/// registers them again, and each is woken once for what was written while
+/// there was no connection.
+#[tokio::test]
+async fn a_watch_survives_a_reconnect() -> anyhow::Result<()> {
+    let fjall = evento_fjall::Fjall::temporary()?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let handle = serve(listener, fjall.clone());
+    let client = Client::builder(addr)
+        .reconnect_backoff(
+            std::time::Duration::from_millis(10),
+            std::time::Duration::from_millis(50),
+        )
+        .connect()
+        .await?;
+
+    let mut accounts = client
+        .write_watch_for(&interest_in("test/Account"))
+        .unwrap();
+    assert!(woken(&mut accounts, SOON).await);
+
+    handle.shutdown().await;
+    // Written while the client has no connection.
+    fjall
+        .write(vec![watched_event("test/Account", "a1", None)])
+        .await?;
+    // Registered while the client has no connection.
+    let mut cards = client.write_watch_for(&interest_in("test/Card")).unwrap();
+    assert!(!woken(&mut accounts, QUIET).await);
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let _handle = serve(listener, fjall.clone());
+    assert!(
+        woken(&mut accounts, SOON).await,
+        "a watch is woken once the connection is back"
+    );
+    assert!(woken(&mut cards, SOON).await);
+
+    // And they follow the writes again.
+    fjall
+        .write(vec![watched_event("test/Account", "a2", None)])
+        .await?;
+    assert!(woken(&mut accounts, SOON).await);
+    assert!(!woken(&mut cards, QUIET).await);
+    fjall
+        .write(vec![watched_event("test/Card", "c1", None)])
+        .await?;
+    assert!(woken(&mut cards, SOON).await);
+    Ok(())
+}

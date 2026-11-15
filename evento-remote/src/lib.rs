@@ -22,9 +22,10 @@
 //! # }
 //! ```
 //!
-//! Writes through the server bump a notification channel that is pushed to
-//! every connected client, so client-side subscriptions wake with the same low
-//! latency as a local `write_watch`. The server's `stable_timestamp` watermark
+//! A client-side subscription registers what it follows with the server and
+//! is pushed a notification for the writes that hold an event it would read,
+//! so it wakes with the same low latency as over a local `write_watch_for`,
+//! and a write wakes no subscription that does not follow it. The server's `stable_timestamp` watermark
 //! piggybacks on every frame, so fronting a replicated backend (Accord) keeps
 //! subscription safety intact.
 //!
@@ -47,10 +48,9 @@
 //! back in the default tenant, as from a store of its own, and a tenant
 //! application following the store through a `Sidecar` (evento-core's `rw`
 //! feature) keeps its subscriptions' cursors and its snapshots in its own
-//! store. What a
-//! session still shares: the write notifications every client is pushed, which
-//! carry a store-wide counter — a client sees when, and how often, the store is
-//! written, never what.
+//! store. The write notifications follow the session too: a client serving a
+//! tenant is told of that tenant's writes, never of when or how often the
+//! rest of the store is written.
 //!
 //! **Addresses.** A client names its server by an [`Address`]: an IP and port,
 //! or a `host:port` looked up again on every connection attempt, so a
