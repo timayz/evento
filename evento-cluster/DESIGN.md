@@ -829,7 +829,15 @@ backend (sql/fjall). Phases, in order:
   the writes of concurrent writers share the store's fsync as they share the
   journal's; a batch the store refuses (a re-apply, a store behind) is applied
   one at a time. On a Turso file store a node alone went from 4.2 to 2.2 fsyncs
-  per write with one writer, and from 3.1 to 0.24 with twenty. ✅ **Snapshots + compaction + log truncation** (bounds both the
+  per write with one writer, and from 3.1 to 0.24 with twenty. **The vote's fsync
+stays, on a node alone too (#537):** its vote is the whole quorum and nobody else
+could decide otherwise, but the vote is also the first durable record that carries
+the write's events, and the journal, not the store, is what an acknowledged write
+comes back from — a store rebuilt from the journal, or one that lost the tail it had
+not persisted, is filled again by the restart's recovery. Answering the own vote
+without the flush loses acknowledged writes on both
+(`a_node_alone_keeps_what_it_acknowledged_across_restarts`, the simulator's restart
+scenario on a cluster of one). ✅ **Snapshots + compaction + log truncation** (bounds both the
   journal and the in-memory `Replica.commands`/`by_key`, previously unbounded —
   the blocker for long-running deployments). A **redundancy watermark** (mirroring
   Accord's `redundantBefore`): below it every replica has applied everything, so

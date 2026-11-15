@@ -2174,6 +2174,131 @@ async fn safety_holds_under_restarts() {
     }
 }
 
+/// The restart scenario on a cluster of one node (#537): the node is every
+/// quorum, so nobody holds a transaction but itself, and whatever it
+/// acknowledged has to come back from its own journal and store. It is torn
+/// down mid-workload and rebuilt, again and again; every restart loses what
+/// its journal had staged and not flushed, and its store comes back as
+/// [`restart_modes`](run_with_restarts) says — empty (rebuilt from the
+/// journal), as it was, or less its unpersisted tail.
+///
+/// The oracle that bites here is liveness' second step: after the last
+/// restart the store holds every version a write was acknowledged for.
+async fn run_alone_with_restarts(seed: u64, faults: Faults, store: StoreKind) -> Adversarial {
+    const AGGS: usize = 4;
+    const WRITERS: usize = 5;
+    const WRITES_EACH: usize = 12;
+
+    let mut sim = Sim::build_with(SimOptions {
+        store,
+        ..SimOptions::new(1)
+    })
+    .await;
+    faults.arm(&mut sim, seed);
+    let clients = Clients::new(&sim);
+
+    let mut rng = StdRng::seed_from_u64(seed);
+    let writer_plans: Vec<Vec<usize>> = (0..WRITERS)
+        .map(|_| {
+            (0..WRITES_EACH)
+                .map(|_| rng.random_range(0..AGGS))
+                .collect()
+        })
+        .collect();
+    let restart_plan: Vec<u64> = (0..8).map(|_| rng.random_range(10..40)).collect();
+    let mut modes = StdRng::seed_from_u64(seed ^ RESTART_SALT);
+    let restart_modes: Vec<Restart> = restart_plan
+        .iter()
+        .map(|_| match (faults.storage.is_some(), store) {
+            (_, StoreKind::Memory) => Restart::EmptyStore,
+            (false, StoreKind::Executor) | (_, StoreKind::Turso) => Restart::KeepStore,
+            (true, StoreKind::Executor) => {
+                [Restart::KeepStore, Restart::KeepStoreLoseTail][modes.random_range(0..2)]
+            }
+        })
+        .collect();
+
+    let ids = Arc::new(AtomicU64::new(1));
+    let mut writers = Vec::new();
+    for plan in writer_plans {
+        let live = sim.live.clone();
+        let clients = clients.clone();
+        let ids = Arc::clone(&ids);
+        writers.push(tokio::spawn(async move {
+            for agg_idx in plan {
+                let agg = format!("a{agg_idx}");
+                // The node and its store as they are now: a restart swaps
+                // both.
+                let (node, store) = live.get(0);
+                let version = store.version(AGG_TYPE, &agg).await.unwrap_or(0) + 1;
+                let seq = ids.fetch_add(1, Ordering::Relaxed);
+                clients
+                    .write(&node, &agg, version, seq, Duration::from_secs(2))
+                    .await;
+            }
+        }));
+    }
+    writers.extend(spawn_readers(&sim, &clients, seed, &agg_names(AGGS)));
+
+    for (delay, mode) in restart_plan.into_iter().zip(restart_modes) {
+        tokio::time::sleep(Duration::from_millis(delay)).await;
+        sim.restart_as(0, sim.config, mode).await;
+    }
+    for w in writers {
+        let _ = w.await;
+    }
+
+    sim.net.clear_message_faults();
+    sim.clear_storage_faults();
+    let converged = converge(&sim.stores).await;
+
+    let records = clients.history.lock().unwrap().clone();
+    let safety = safety_violation(&sim, &records);
+    let liveness = assert_live(&mut sim, &acked_versions(&records)).await.err();
+    let converged_sim = liveness.is_none().then_some(&sim);
+    let safety = safety.or_else(|| read_violation(&clients, converged_sim));
+    let reads = clients.ops.lock().unwrap().reads.len();
+    Adversarial {
+        safety,
+        converged,
+        liveness,
+        reads,
+        trace: sim.trace(),
+    }
+}
+
+/// Issue #537: a node alone keeps what it acknowledged across restarts, on
+/// every store — one rebuilt from the journal, one that survives, possibly
+/// ahead of the journal, and one that comes back behind it — with storage
+/// that works and with storage that fails.
+#[tokio::test(start_paused = true)]
+async fn a_node_alone_keeps_what_it_acknowledged_across_restarts() {
+    for faults in [Faults::default(), Faults::STORAGE] {
+        for store in [StoreKind::Memory, StoreKind::Executor, StoreKind::Turso] {
+            let label = format!(
+                "{store:?}{}",
+                if faults.storage.is_some() {
+                    " +storage"
+                } else {
+                    ""
+                }
+            );
+            for (seed, _replay) in sim_seeds(
+                "a_node_alone_keeps_what_it_acknowledged_across_restarts",
+                0..20,
+            ) {
+                let result = run_alone_with_restarts(seed, faults, store).await;
+                if let Some(v) = result.safety {
+                    panic!("SAFETY VIOLATION (alone, {label}) at seed {seed}: {v}");
+                }
+                if let Some(stall) = result.liveness {
+                    panic!("seed {seed} (alone, {label}): {stall}");
+                }
+            }
+        }
+    }
+}
+
 /// A replica that lost its journal comes back under its own node id (#312):
 /// while writers and readers run, a node loses its journal and its store — a
 /// dead disk — and is reopened joining, one node at a time. Fenced, it takes
