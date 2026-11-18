@@ -1440,6 +1440,18 @@ impl Replica {
         self.commands.get(&txn).map(|cmd| cmd.reply_to)
     }
 
+    /// The node driving `txn`'s commit, if this replica holds `txn` committed
+    /// and yet to apply: the one that waits for this replica's
+    /// acknowledgement of the apply.
+    pub fn awaited_by(&self, txn: TxnId) -> Option<NodeId> {
+        match self.commands.get(&txn) {
+            Some(cmd) if cmd.status >= Status::Committed && cmd.status != Status::Applied => {
+                Some(cmd.reply_to)
+            }
+            _ => None,
+        }
+    }
+
     /// What this replica's conflicts reveal about whether `txn` could have
     /// committed on the fast path at its `t0`: `(rejects, wait)`.
     ///
