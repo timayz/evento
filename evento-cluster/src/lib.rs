@@ -98,7 +98,7 @@ pub use node::{
     MAX_COMMAND_BYTES,
 };
 pub use store::{InMemoryDataStore, InMemoryJournal};
-pub use tcp::{serve, serve_tls, serve_tls_verified, PeerCerts, TcpTransport, TlsClient};
+pub use tcp::{serve, serve_tls, serve_tls_verified, PeerAddr, PeerCerts, TcpTransport, TlsClient};
 pub use transport::InMemoryNetwork;
 
 /// The protocol-level types: what a [`Journal`] or [`DataStore`] implementor,

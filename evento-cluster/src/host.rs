@@ -46,7 +46,7 @@ use crate::backend::ClusterBackend;
 use crate::clock::{HybridLogicalClock, NodeId};
 use crate::executor::{ClusterExecutor, ExecutorDataStore};
 use crate::node::{LostJournal, Node, NodeConfig, PartialSnapshot};
-use crate::tcp::{serve, TcpTransport};
+use crate::tcp::{serve, PeerAddr, TcpTransport};
 use crate::transport::{Envelope, InMemoryNetwork};
 use crate::{DataStore, Journal, MessageSink, StaticTopology, Topology};
 
@@ -66,15 +66,31 @@ const INBOX_FRAMES: usize = 1024;
 /// absent_after_secs = 3600         # optional; 0 never gives a node up
 /// write_backlog = 100000           # optional
 /// ```
+///
+/// A peer is `ip:port` or `host:port`. A name is resolved each time the
+/// peer is dialled, so a node that comes back at another address under the
+/// same name (a StatefulSet pod) is found again, and a name that does not
+/// resolve yet does not keep this node from starting. A node named in
+/// `peers` by host must set `listen`:
+///
+/// ```toml
+/// [cluster]
+/// node_id = 1
+/// peers = ["app-0.app:7000", "app-1.app:7000", "app-2.app:7000"]
+/// listen = "0.0.0.0:7000"
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
     /// This node's index into `peers`.
     pub node_id: u64,
     /// Every node's consensus address, this one included: `NodeId(i)` is
-    /// `peers[i]`. One address is a cluster of one node over TCP.
-    pub peers: Vec<SocketAddr>,
+    /// `peers[i]`. One address is a cluster of one node over TCP. Each is
+    /// `ip:port` or `host:port` ([`PeerAddr`]); a name is resolved at each
+    /// dial, not at start-up.
+    pub peers: Vec<PeerAddr>,
     /// The address to bind for inbound consensus traffic. Defaults to
-    /// `peers[node_id]`; set it to `0.0.0.0:<port>` in a container.
+    /// `peers[node_id]` when that is an address, and is required when it is
+    /// a name; set it to `0.0.0.0:<port>` in a container.
     #[serde(default)]
     pub listen: Option<SocketAddr>,
     /// A node not heard from for this long is no longer waited for: the
@@ -112,10 +128,11 @@ fn default_write_backlog() -> usize {
 
 impl Settings {
     /// A cluster of `peers` seen from node `node_id`, with the defaults.
-    pub fn new(node_id: u64, peers: Vec<SocketAddr>) -> Self {
+    /// Each peer is a `SocketAddr` or a [`PeerAddr`].
+    pub fn new(node_id: u64, peers: impl IntoIterator<Item = impl Into<PeerAddr>>) -> Self {
         Self {
             node_id,
-            peers,
+            peers: peers.into_iter().map(Into::into).collect(),
             listen: None,
             absent_after_secs: default_absent_after_secs(),
             write_backlog: default_write_backlog(),
@@ -124,7 +141,7 @@ impl Settings {
     }
 
     /// Refuses settings no node can run on: no peers, a `node_id` outside
-    /// `peers`, a `write_backlog` of zero.
+    /// `peers`, a `write_backlog` of zero, no address to bind.
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             !self.peers.is_empty(),
@@ -140,6 +157,7 @@ impl Settings {
             self.write_backlog > 0,
             "cluster.write_backlog must be greater than 0"
         );
+        self.listen_addr()?;
         Ok(())
     }
 
@@ -158,10 +176,27 @@ impl Settings {
         self.peers.len() > 1
     }
 
-    /// The address this node binds.
-    pub fn listen_addr(&self) -> SocketAddr {
-        self.listen
-            .unwrap_or_else(|| self.peers[self.node_id as usize])
+    /// The address this node binds: `listen`, or its own entry in `peers`
+    /// when that is an address. An error when it is a name and `listen` is
+    /// unset (a name is dialled, not bound), or when `node_id` is outside
+    /// `peers`.
+    pub fn listen_addr(&self) -> anyhow::Result<SocketAddr> {
+        if let Some(listen) = self.listen {
+            return Ok(listen);
+        }
+        let own = self.peers.get(self.node_id as usize).with_context(|| {
+            format!(
+                "cluster.node_id {} is out of range for {} peers",
+                self.node_id,
+                self.peers.len()
+            )
+        })?;
+        own.as_socket().with_context(|| {
+            format!(
+                "cluster.listen must be set: this node's entry in cluster.peers ({own}) is a name, not an address to bind (e.g. listen = \"0.0.0.0:{}\")",
+                own.port()
+            )
+        })
     }
 
     /// `absent_after_secs` as a duration; `None` for 0.
@@ -460,12 +495,12 @@ impl<E: ClusterBackend> Builder<E> {
             Some(settings) => {
                 let id = settings.id();
                 let ids = settings.ids();
-                let peers: HashMap<NodeId, SocketAddr> = ids
+                let peers: HashMap<NodeId, PeerAddr> = ids
                     .iter()
                     .copied()
-                    .zip(settings.peers.iter().copied())
+                    .zip(settings.peers.iter().cloned())
                     .collect();
-                let listen = settings.listen_addr();
+                let listen = settings.listen_addr()?;
                 let listener = tokio::net::TcpListener::bind(listen)
                     .await
                     .with_context(|| format!("cannot bind the consensus listener on {listen}"))?;
@@ -539,7 +574,7 @@ impl<E: ClusterBackend> Builder<E> {
         let mut node_config = settings
             .as_ref()
             .map(Settings::node_config)
-            .unwrap_or_else(|| Settings::new(0, Vec::new()).node_config());
+            .unwrap_or_else(|| Settings::new(0, Vec::<PeerAddr>::new()).node_config());
         if let Some(adjust) = config {
             node_config = adjust(node_config);
         }

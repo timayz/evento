@@ -612,8 +612,8 @@ control plane, everything else is Accord.
   cluster-wide optimistic concurrency through the standard evento API;
   `tests/shard_executor.rs` proves read routing on a 2-shard cluster.
 - **Transport — framed TCP.** ✅ `tcp.rs`: `TcpTransport` (`MessageSink`) + `serve`
-  over real sockets, static `NodeId → SocketAddr` membership, bitcode wire
-  encoding. `tests/tcp_cluster.rs` runs a 3-node cluster over localhost TCP
+  over real sockets, static `NodeId → PeerAddr` membership (an address, or a
+  name resolved at each dial), bitcode wire encoding. `tests/tcp_cluster.rs` runs a 3-node cluster over localhost TCP
   proving replication + conflict resolution end-to-end.
 - **Throughout — deterministic simulation harness** (cf. Accord's
   `accord-maelstrom` + burn tests). Strongly recommended even though production

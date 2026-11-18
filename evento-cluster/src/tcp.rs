@@ -8,8 +8,10 @@
 //! what the consensus layer assumes, since quorums and recovery tolerate loss.
 //!
 //! Membership is static: construct a [`TcpTransport`] with a fixed
-//! `NodeId → SocketAddr` map. Inbound frames are decoded and forwarded to a
-//! node's inbox by [`serve`].
+//! `NodeId → PeerAddr` map. A peer is an address or a `host:port` name
+//! ([`PeerAddr`]); a name is resolved at each dial, so a peer that comes back
+//! at another address is found again. Inbound frames are decoded and forwarded
+//! to a node's inbox by [`serve`].
 //!
 //! **Mutual TLS (optional).** Build with [`TcpTransport::with_tls`] and serve with
 //! [`serve_tls`] to encrypt and authenticate inter-node traffic: every connection
@@ -107,6 +109,113 @@ impl TlsClient {
     }
 }
 
+/// Where a peer is dialled: a socket address, or a `host:port` name.
+///
+/// A name is resolved **at each dial**, not once at start-up: a peer that
+/// comes back at another address (a pod rescheduled under the same name) is
+/// reached again without restarting the others, and a name that does not
+/// resolve yet is a peer that cannot be reached for now, redialled like a
+/// refused connection.
+///
+/// Parses from and serializes as the string a configuration file holds:
+///
+/// ```
+/// use evento_cluster::PeerAddr;
+///
+/// let ip: PeerAddr = "10.0.0.1:7000".parse().unwrap();
+/// assert!(matches!(ip, PeerAddr::Socket(_)));
+/// let name: PeerAddr = "node-1.cluster.internal:7000".parse().unwrap();
+/// assert_eq!(name.to_string(), "node-1.cluster.internal:7000");
+/// assert!("node-1.cluster.internal".parse::<PeerAddr>().is_err());
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PeerAddr {
+    /// An IP address and a port, dialled as given.
+    Socket(SocketAddr),
+    /// A host name and a port, resolved at each dial.
+    Host {
+        /// The name to resolve.
+        host: String,
+        /// The port.
+        port: u16,
+    },
+}
+
+impl PeerAddr {
+    /// The socket address, when this is one; `None` for a name.
+    pub fn as_socket(&self) -> Option<SocketAddr> {
+        match self {
+            Self::Socket(addr) => Some(*addr),
+            Self::Host { .. } => None,
+        }
+    }
+
+    /// The port.
+    pub fn port(&self) -> u16 {
+        match self {
+            Self::Socket(addr) => addr.port(),
+            Self::Host { port, .. } => *port,
+        }
+    }
+}
+
+impl From<SocketAddr> for PeerAddr {
+    fn from(addr: SocketAddr) -> Self {
+        Self::Socket(addr)
+    }
+}
+
+impl std::fmt::Display for PeerAddr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Socket(addr) => addr.fmt(f),
+            Self::Host { host, port } => write!(f, "{host}:{port}"),
+        }
+    }
+}
+
+impl std::str::FromStr for PeerAddr {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Ok(addr) = s.parse::<SocketAddr>() {
+            return Ok(Self::Socket(addr));
+        }
+        let (host, port) = s
+            .rsplit_once(':')
+            .ok_or_else(|| anyhow::anyhow!("{s:?} is not `host:port` or `ip:port`"))?;
+        // What is left with a colon or a bracket is an IPv6 address written
+        // wrong, not a name.
+        anyhow::ensure!(
+            !host.is_empty()
+                && !host
+                    .contains(|c: char| c.is_whitespace() || matches!(c, ':' | '[' | ']' | '/')),
+            "{s:?} is not `host:port` or `ip:port`"
+        );
+        let port = port
+            .parse()
+            .map_err(|_| anyhow::anyhow!("{s:?} has no valid port after the last `:`"))?;
+        Ok(Self::Host {
+            host: host.to_owned(),
+            port,
+        })
+    }
+}
+
+impl Serialize for PeerAddr {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for PeerAddr {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 /// A wire frame: the originating node plus the message. The sender id travels in
 /// the frame so the receiver can reply without a separate handshake.
 #[derive(Serialize, Deserialize)]
@@ -177,7 +286,7 @@ const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(1);
 /// writer queue per peer.
 struct PeerLinks {
     from: NodeId,
-    peers: Arc<HashMap<NodeId, SocketAddr>>,
+    peers: Arc<HashMap<NodeId, PeerAddr>>,
     /// Per-peer outbound queues (bounded); each backed by a lazily-spawned
     /// writer. Carries pre-encoded frames (`Bytes`), so a broadcast encodes
     /// once and every peer's queue shares the same buffer.
@@ -192,10 +301,15 @@ struct PeerLinks {
 }
 
 impl PeerLinks {
-    fn new(from: NodeId, peers: HashMap<NodeId, SocketAddr>, tls: Option<TlsClient>) -> Self {
+    fn new<A: Into<PeerAddr>>(
+        from: NodeId,
+        peers: HashMap<NodeId, A>,
+        tls: Option<TlsClient>,
+    ) -> Self {
+        let peers = peers.into_iter().map(|(id, addr)| (id, addr.into()));
         Self {
             from,
-            peers: Arc::new(peers),
+            peers: Arc::new(peers.collect()),
             senders: Mutex::new(HashMap::new()),
             tls,
             metrics: Arc::new(Metrics::new()),
@@ -210,7 +324,7 @@ impl PeerLinks {
         if let Some(tx) = senders.get(&to) {
             return Some(tx.clone());
         }
-        let addr = *self.peers.get(&to)?;
+        let addr = self.peers.get(&to)?.clone();
         let (tx, rx) = mpsc::channel(self.queue_capacity);
         tokio::spawn(peer_writer(to, addr, rx, self.tls.clone()));
         senders.insert(to, tx.clone());
@@ -263,8 +377,9 @@ pub struct TcpTransport {
 }
 
 impl TcpTransport {
-    /// Builds a plaintext transport for `from` that can reach the nodes in `peers`.
-    pub fn new(from: NodeId, peers: HashMap<NodeId, SocketAddr>) -> Self {
+    /// Builds a plaintext transport for `from` that can reach the nodes in
+    /// `peers`, each a `SocketAddr` or a [`PeerAddr`].
+    pub fn new<A: Into<PeerAddr>>(from: NodeId, peers: HashMap<NodeId, A>) -> Self {
         Self {
             links: PeerLinks::new(from, peers, None),
         }
@@ -272,7 +387,11 @@ impl TcpTransport {
 
     /// Builds a transport whose outbound connections use mutual TLS (`tls`), for
     /// an untrusted network. Pair with [`serve_tls`] on the inbound side.
-    pub fn with_tls(from: NodeId, peers: HashMap<NodeId, SocketAddr>, tls: TlsClient) -> Self {
+    pub fn with_tls<A: Into<PeerAddr>>(
+        from: NodeId,
+        peers: HashMap<NodeId, A>,
+        tls: TlsClient,
+    ) -> Self {
         Self {
             links: PeerLinks::new(from, peers, Some(tls)),
         }
@@ -290,7 +409,7 @@ impl TcpTransport {
     /// #     NodeId, StaticTopology, TcpTransport,
     /// # };
     /// # let id = NodeId(0);
-    /// # let peers = HashMap::new();
+    /// # let peers: HashMap<NodeId, std::net::SocketAddr> = HashMap::new();
     /// # let net = InMemoryNetwork::new();
     /// # let node = Node::new(
     /// #     id,
@@ -339,9 +458,9 @@ impl MessageSink for TcpTransport {
 }
 
 /// Establishes one outbound connection to `addr`, wrapping it in client TLS when
-/// configured, within [`CONNECT_TIMEOUT`]. `None` on a connect/handshake
-/// failure or timeout.
-async fn connect(to: NodeId, addr: SocketAddr, tls: &Option<TlsClient>) -> Option<ClientStream> {
+/// configured, within [`CONNECT_TIMEOUT`]. `None` on a resolution, connect or
+/// handshake failure, or a timeout.
+async fn connect(to: NodeId, addr: &PeerAddr, tls: &Option<TlsClient>) -> Option<ClientStream> {
     match tokio::time::timeout(CONNECT_TIMEOUT, dial(to, addr, tls)).await {
         Ok(Ok(stream)) => Some(stream),
         Ok(Err(err)) => {
@@ -358,10 +477,15 @@ async fn connect(to: NodeId, addr: SocketAddr, tls: &Option<TlsClient>) -> Optio
 /// The unbounded dial behind [`connect`].
 async fn dial(
     to: NodeId,
-    addr: SocketAddr,
+    addr: &PeerAddr,
     tls: &Option<TlsClient>,
 ) -> std::io::Result<ClientStream> {
-    let stream = TcpStream::connect(addr).await?;
+    let stream = match addr {
+        PeerAddr::Socket(addr) => TcpStream::connect(addr).await?,
+        // Resolved here, at each dial, and every address it resolves to is
+        // tried: the peer may have come back at another one.
+        PeerAddr::Host { host, port } => TcpStream::connect((host.as_str(), *port)).await?,
+    };
     let _ = stream.set_nodelay(true);
     match tls {
         None => Ok(Either::Left(stream)),
@@ -399,6 +523,10 @@ async fn dial(
 /// batch whose peer cannot be reached at all (connect fails) is dropped; loss is
 /// tolerated by quorums and recovery.
 ///
+/// A peer named by host is resolved at each dial, so the redial after a
+/// failure finds a peer that came back at another address; a name that does
+/// not resolve is a failed dial like any other.
+///
 /// Nothing here waits on the network unbounded: a dial gives up after
 /// [`CONNECT_TIMEOUT`] and a batch write after [`WRITE_TIMEOUT`] (which counts
 /// as a failed write), and after a failed dial the peer is not redialled until
@@ -407,7 +535,7 @@ async fn dial(
 /// partition heals, shedding every frame meant for it.
 async fn peer_writer(
     to: NodeId,
-    addr: SocketAddr,
+    addr: PeerAddr,
     mut rx: mpsc::Receiver<Bytes>,
     tls: Option<TlsClient>,
 ) {
@@ -429,7 +557,7 @@ async fn peer_writer(
                     // Still backing off: drop the batch, dial on a later one.
                     break;
                 }
-                let Some(stream) = connect(to, addr, &tls).await else {
+                let Some(stream) = connect(to, &addr, &tls).await else {
                     // Unreachable right now: drop the batch, redial after the
                     // backoff.
                     retry_at = Some(Instant::now() + backoff);
@@ -635,11 +763,41 @@ mod tests {
     /// the connection down with the batch around it): it is shed and counted.
     #[test]
     fn an_oversized_frame_is_shed_not_queued() {
-        let links = PeerLinks::new(NodeId(0), HashMap::new(), None);
+        let links = PeerLinks::new(NodeId(0), HashMap::<NodeId, PeerAddr>::new(), None);
         links.enqueue(NodeId(1), Bytes::from_static(b"small"));
         assert_eq!(links.metrics.snapshot().messages_shed, 0);
         links.enqueue(NodeId(1), Bytes::from(vec![0u8; MAX_FRAME_LENGTH + 1]));
         assert_eq!(links.metrics.snapshot().messages_shed, 1);
+    }
+
+    #[test]
+    fn a_peer_address_parses_as_an_address_or_a_name() {
+        let ip: PeerAddr = "10.0.0.1:7000".parse().unwrap();
+        assert_eq!(ip, PeerAddr::Socket("10.0.0.1:7000".parse().unwrap()));
+        let v6: PeerAddr = "[::1]:7000".parse().unwrap();
+        assert_eq!(v6.as_socket(), Some("[::1]:7000".parse().unwrap()));
+        let name: PeerAddr = "timada-1.timada:7000".parse().unwrap();
+        assert_eq!(
+            name,
+            PeerAddr::Host {
+                host: "timada-1.timada".into(),
+                port: 7000
+            }
+        );
+        assert_eq!(name.as_socket(), None);
+        assert_eq!(name.port(), 7000);
+        assert_eq!(name.to_string(), "timada-1.timada:7000");
+
+        for bad in [
+            "timada-1",
+            ":7000",
+            "timada-1:",
+            "timada-1:port",
+            "::1:7000",
+            "a b:7000",
+        ] {
+            assert!(bad.parse::<PeerAddr>().is_err(), "{bad}");
+        }
     }
 
     #[test]
