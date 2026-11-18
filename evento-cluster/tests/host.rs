@@ -2,8 +2,8 @@
 //! from [`Settings`] alone, each over a Fjall store with its journal inside.
 //! A write on one node is read on another; a node away longer than its
 //! peers wait for it is told so, marks its store, and copies it back at its
-//! next open; a node alone runs without settings; the settings and the mark
-//! round-trip.
+//! next open; a node alone runs without settings; peers named by host are
+//! resolved when dialled; the settings and the mark round-trip.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use evento_cluster::host::{RejoinMark, Settings};
-use evento_cluster::{Cluster, ClusterExecutor, LiveNode, NodeConfig, NodeId};
+use evento_cluster::{Cluster, ClusterExecutor, LiveNode, NodeConfig, NodeId, PeerAddr};
 use evento_core::{cursor::Args, Event, EventFilter, Executor, TenantFilter};
 use evento_fjall::Fjall;
 
@@ -473,6 +473,96 @@ async fn a_node_with_peers_needs_a_state_dir() {
     assert!(err.to_string().contains("state directory"), "{err}");
 }
 
+/// Peers named by host, as on a platform where a node keeps its name and not
+/// its address: a name is resolved when the peer is dialled, and one that
+/// does not resolve (the third node's, which is not up) is a peer away, not
+/// a start-up failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peers_named_by_host_are_resolved_when_dialled() {
+    let root = temp_root("named");
+    let addrs = free_addrs().await;
+    let peers: Vec<PeerAddr> = vec![
+        format!("localhost:{}", addrs[0].port()).parse().unwrap(),
+        format!("localhost:{}", addrs[1].port()).parse().unwrap(),
+        "node-2.invalid:7000".parse().unwrap(),
+    ];
+    let open = |id: u64| {
+        let dir = Member::dir(&root, id);
+        let settings = Settings {
+            listen: Some(addrs[id as usize]),
+            absent_after_secs: 0,
+            ..Settings::new(id, peers.clone())
+        };
+        async move {
+            std::fs::create_dir_all(&dir).unwrap();
+            let (cluster, executor) = Cluster::builder(Fjall::open(dir.join("store")).unwrap())
+                .settings(Some(settings))
+                .state_dir(&dir)
+                .open()
+                .await
+                .unwrap();
+            Member { cluster, executor }
+        }
+    };
+    let (a, b) = tokio::join!(open(0), open(1));
+    for member in [&a, &b] {
+        member
+            .cluster
+            .until_confirmed(Duration::from_secs(30))
+            .await
+            .unwrap();
+    }
+
+    a.executor.write(vec![event("acc", 1)]).await.unwrap();
+    b.await_count("acc", 1, "node 1 reads node 0's write").await;
+    b.executor.write(vec![event("acc", 2)]).await.unwrap();
+    a.await_count("acc", 2, "node 0 reads node 1's write").await;
+
+    for member in [a, b] {
+        member.cluster.shutdown().await;
+    }
+}
+
+#[test]
+fn settings_name_a_peer_by_host_and_then_need_listen() {
+    let named = r#"{"node_id": 1, "peers": ["app-0.app:7000", "app-1.app:7000", "10.0.0.3:7000"]}"#;
+    let settings: Settings = serde_json::from_str(named).unwrap();
+    assert_eq!(
+        settings.peers[1],
+        PeerAddr::Host {
+            host: "app-1.app".into(),
+            port: 7000
+        }
+    );
+    assert_eq!(
+        serde_json::to_value(&settings).unwrap()["peers"],
+        serde_json::json!(["app-0.app:7000", "app-1.app:7000", "10.0.0.3:7000"])
+    );
+
+    // Its own entry is a name: nothing to bind.
+    let err = settings.validate().unwrap_err().to_string();
+    assert!(err.contains("cluster.listen must be set"), "{err}");
+    assert!(err.contains("app-1.app:7000"), "{err}");
+
+    let mut listening = settings.clone();
+    listening.listen = Some("0.0.0.0:7000".parse().unwrap());
+    listening.validate().unwrap();
+    assert_eq!(
+        listening.listen_addr().unwrap(),
+        "0.0.0.0:7000".parse().unwrap()
+    );
+
+    // The node whose entry is an address still binds it.
+    let mut by_address = settings;
+    by_address.node_id = 2;
+    by_address.validate().unwrap();
+
+    let err = serde_json::from_str::<Settings>(r#"{"node_id": 0, "peers": ["app-0.app"]}"#)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("host:port"), "{err}");
+}
+
 #[test]
 fn settings_deserialize_with_defaults_and_validate() {
     let settings: Settings = serde_json::from_str(
@@ -481,7 +571,10 @@ fn settings_deserialize_with_defaults_and_validate() {
     .unwrap();
     assert_eq!(settings.node_id, 1);
     assert_eq!(settings.listen, None);
-    assert_eq!(settings.listen_addr(), "10.0.0.2:7000".parse().unwrap());
+    assert_eq!(
+        settings.listen_addr().unwrap(),
+        "10.0.0.2:7000".parse().unwrap()
+    );
     assert_eq!(settings.absent_after(), Some(Duration::from_secs(3600)));
     assert_eq!(settings.write_backlog, 100_000);
     assert_eq!(settings.ids(), vec![NodeId(0), NodeId(1), NodeId(2)]);
@@ -495,7 +588,7 @@ fn settings_deserialize_with_defaults_and_validate() {
     assert_eq!(config.peer_absence_limit, Some(Duration::from_secs(3600)));
     assert_eq!(config.max_commands, 100_000);
 
-    let alone = Settings::new(0, vec!["10.0.0.1:7000".parse().unwrap()]);
+    let alone = Settings::new(0, ["10.0.0.1:7000".parse::<SocketAddr>().unwrap()]);
     let config = alone.node_config();
     assert!(
         !config.linearizable_reads,
