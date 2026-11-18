@@ -790,6 +790,21 @@ impl Sim {
         }
     }
 
+    /// Stops node `i` before another is opened under its id over the same
+    /// journal: aborts its loops and retires it, as its host does and as a
+    /// crash does to its whole process. A client still holding it — one
+    /// whose write was in flight — raises the journal's clock bound no more:
+    /// saved from the stopped node's own, older view, it would lower the
+    /// bound the node opened since already reported, which the next open
+    /// then falls short of — a journal found rolled back that never was
+    /// (#550).
+    async fn halt(&self, i: usize) {
+        for t in &self.tasks[i] {
+            t.abort();
+        }
+        self.nodes[i].retire().await;
+    }
+
     /// Restarts node `i`: aborts its loops (dropping in-memory state, and
     /// whatever its journal had staged but not flushed), rebuilds a fresh
     /// [`Node`] with `config` over the durable journal and a data store as
@@ -800,9 +815,7 @@ impl Sim {
             self.dynamic.is_empty(),
             "a restart over a dynamic topology is not modelled"
         );
-        for t in &self.tasks[i] {
-            t.abort();
-        }
+        self.halt(i).await;
         self.journals[i].crash();
         // Nothing durable survived: the node never voted, reported or minted
         // (each makes its journal durable first), so it starts afresh — a
@@ -4850,9 +4863,7 @@ impl Sim {
     /// start ([`rebuild_topology`](Self::rebuild_topology)); one that lost
     /// its journal ([`lose_journal`](Self::lose_journal)) starts over.
     async fn reopen_joining(&mut self, i: usize) -> Result<(), String> {
-        for t in &self.tasks[i] {
-            t.abort();
-        }
+        self.halt(i).await;
         let id = self.ids[i];
         self.rebuild_topology(i);
         let inbox = self.net.register(id);
@@ -4911,9 +4922,7 @@ impl Sim {
         backend: Arc<dyn DataStore>,
         store: SimStore,
     ) -> anyhow::Result<()> {
-        for t in &self.tasks[i] {
-            t.abort();
-        }
+        self.halt(i).await;
         let id = self.ids[i];
         self.rebuild_topology(i);
         let inbox = self.net.register(id);
