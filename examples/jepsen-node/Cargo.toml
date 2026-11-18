@@ -1,6 +1,6 @@
 [package]
 name = "jepsen-node"
-version = "2.0.0-alpha.38"
+version = "2.0.0-alpha.39"
 edition = "2021"
 publish = false
 
@@ -18,5 +18,4 @@ anyhow.workspace = true
 tracing = { workspace = true }
 tracing-subscriber.workspace = true
 
-# The examples keep out of the workspace lints (missing_docs).
 [lints]

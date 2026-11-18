@@ -1,6 +1,6 @@
 [package]
 name = "bank"
-version = "2.0.0-alpha.38"
+version = "2.0.0-alpha.39"
 edition = "2024"
 publish = false
 
@@ -9,5 +9,4 @@ evento.workspace = true
 bitcode.workspace = true
 anyhow.workspace = true
 
-# The examples keep out of the workspace lints (missing_docs).
 [lints]

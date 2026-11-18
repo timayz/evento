@@ -1,6 +1,6 @@
 [package]
 name = "quickstart"
-version = "2.0.0-alpha.38"
+version = "2.0.0-alpha.39"
 edition.workspace = true
 publish = false
 
@@ -14,5 +14,4 @@ tracing-subscriber.workspace = true
 bitcode.workspace = true
 tokio.workspace = true
 
-# The examples keep out of the workspace lints (missing_docs).
 [lints]
