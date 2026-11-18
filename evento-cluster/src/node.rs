@@ -10227,6 +10227,9 @@ impl Node {
             self.clock.restore(minted);
         }
         let installed = self.installed_epoch();
+        // The acknowledgements of what this round applied ahead of the
+        // applier (see below), sent once the round's records are flushed.
+        let mut acks: Vec<(NodeId, Message)> = Vec::new();
         for cmd in commands {
             if !cmd.keys.iter().any(|k| self.topology.owns(self.id, k)) {
                 continue;
@@ -10318,14 +10321,29 @@ impl Node {
                     break;
                 }
             }
-            let inserted = self
-                .replica
-                .lock()
-                .expect("replica poisoned")
-                .import_applied(cmd);
+            let (inserted, awaited_by) = {
+                let mut replica = self.replica.lock().expect("replica poisoned");
+                let awaited_by = replica.awaited_by(txn);
+                (replica.import_applied(cmd), awaited_by)
+            };
             if inserted {
                 imported.commands += 1;
+                // Held committed here, its apply still to come: the import
+                // was that apply, and the applier, which acknowledges what it
+                // enacts, will not find it any more. Whoever drives its
+                // commit is told all the same, or a coordinator two of whose
+                // three replicas imported it waits out `collect_timeout` for
+                // acknowledgements nobody sends (#549).
+                if let Some(reply_to) = awaited_by {
+                    self.answer(&mut acks, reply_to, Message::Applied { txn });
+                }
             }
+        }
+        // As the applier's: an acknowledgement leaves once the record behind
+        // it is durable. Those of a round that stopped short go too — what
+        // it imported is applied.
+        if !acks.is_empty() {
+            self.release(acks).await;
         }
 
         // A bootstrapping node adopts the contact's (cluster-agreed) redundancy
