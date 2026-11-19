@@ -76,9 +76,9 @@ use evento::Cursor;
 
 #[evento::projection(backend = turso, turso::FromRow, Cursor, Debug)]
 pub struct AdminView {
-    #[cursor(by_name, UserAdmin::Id, 1)]
+    #[cursor(by_name(UserAdmin::Id, 1))]
     pub id: String,
-    #[cursor(by_name, UserAdmin::Email, 2)]
+    #[cursor(by_name(UserAdmin::Email, 2))]
     pub email: String,
     pub role: Text<Role>,          // an enum stored as text
     #[turso(default)]

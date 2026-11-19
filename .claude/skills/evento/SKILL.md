@@ -85,7 +85,7 @@ Read models on Turso mirror the SQL ones: `#[evento::projection(backend = turso,
 evento::turso::FromRow, Cursor, Debug)]` derives the row decoding (`#[turso(default)]`
 for a non-column field, `#[turso(rename = "col")]` for another column name; tuples such as
 `(String, i64)` decode by position; `evento::turso::Text<T>` for an enum stored as text) and the
-`#[cursor(by_name, Col::X, n)]` wrappers; `evento::turso::Reader::new(select).args(args)
+`#[cursor(by_name(Col::X, n))]` wrappers; `evento::turso::Reader::new(select).args(args)
 .execute::<ViewByName>(&conn)` pages them; `evento::turso::{execute, fetch_all,
 fetch_optional, fetch_one}` run sea-query statements on a `conn = executor.connect()?`.
 Full-text search needs the `turso-fts` feature: it is an index, not an FTS5 table —

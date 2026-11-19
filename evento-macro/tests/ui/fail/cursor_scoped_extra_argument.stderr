@@ -1,0 +1,5 @@
+error: expected `name(Column::Variant, order)`
+  --> tests/ui/fail/cursor_scoped_extra_argument.rs:11:41
+   |
+11 |     #[cursor(by_name(ContactAdmin::Id, 1, 2))]
+   |                                         ^
