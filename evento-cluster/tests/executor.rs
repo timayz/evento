@@ -1060,3 +1060,70 @@ async fn a_version_conflict_is_a_duplicate_only_if_the_events_are_stored() {
     apply(4, &v4).await.expect("the gap filled, it applies");
     assert!(store.holds(&[v3, v4]).await.unwrap());
 }
+
+/// A cluster whose node `i` creates new streams under the default routing
+/// key `keys[i]`, with linearizable reads that give a barrier up fast.
+fn start_routed_apart(keys: &[&str]) -> ExecCluster<Evento> {
+    let keys: Vec<String> = keys.iter().map(|key| (*key).to_owned()).collect();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let n = keys.len() as u64;
+    ExecCluster::start_wrapped(
+        n,
+        NodeConfig {
+            linearizable_reads: true,
+            collect_timeout: Duration::from_secs(2),
+            ..Default::default()
+        },
+        move |fjall| {
+            let node = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Evento::new(fjall).default_routing_key(keys[node].clone())
+        },
+    )
+}
+
+/// A stream is one stream whatever routing key a write names it under: two
+/// nodes that create it at once, each under its own default routing key,
+/// conflict, so one creates it and the others are told the version is taken.
+/// Before the fix for #563 the writes shared no key, every one committed, and
+/// all but the first could be applied nowhere: the stream was unreadable
+/// behind a barrier from then on, and the stores could differ.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_stream_created_at_once_under_several_routing_keys_is_created_once() {
+    let keys = ["a", "b", "c"];
+    let cluster = start_routed_apart(&keys);
+
+    for round in 0..20 {
+        let id = format!("s-{round}");
+        let writes = keys.iter().enumerate().map(|(node, key)| {
+            let exec = cluster.execs[node].clone();
+            let created = routed(&id, 1, "Opened", key);
+            async move { (created.id, exec.write(vec![created]).await) }
+        });
+        let outcomes = futures_util::future::join_all(writes).await;
+
+        let mut created = Vec::new();
+        for (event, outcome) in outcomes {
+            match outcome {
+                Ok(()) => created.push(event),
+                Err(WriteError::InvalidOriginalVersion) => {}
+                Err(err) => panic!("round {round}: a creation failed otherwise: {err}"),
+            }
+        }
+        assert_eq!(
+            created.len(),
+            1,
+            "round {round}: one writer creates the stream, the others are refused"
+        );
+
+        // Behind a barrier, on every node — under that node's own default
+        // key, the stream being new to it or not.
+        for node in 0..keys.len() {
+            let events = cluster.read_all(node, &id).await;
+            assert_eq!(
+                events.iter().map(|e| e.id).collect::<Vec<_>>(),
+                created,
+                "round {round}: node {node} reads the one creation"
+            );
+        }
+    }
+}

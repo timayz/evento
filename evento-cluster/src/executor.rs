@@ -689,11 +689,13 @@ impl<E: Executor + Clone> ClusterExecutor<E> {
     ///
     /// A stream this node has not seen yet — brand new, or written elsewhere
     /// and not applied here — is pinned where **this node would create it**:
-    /// under the local backend's default routing key, else its id. Nodes
-    /// sharing a default thus fence each other's new streams (set the default
-    /// on the backend the node wraps so it can see it). A new stream created
-    /// under *another* node's default is the one case a by-id read cannot
-    /// resolve: its reader must pass the routing key.
+    /// under the local backend's default routing key, else its id (set the
+    /// default on the backend the node wraps so it can see it). The fence
+    /// holds wherever the stream was created in this node's shard: keys
+    /// conflict by the stream they name, whatever routing key they name it
+    /// under ([`Key::stream`], #563). A new stream created under a routing
+    /// key of *another shard* is the one case a by-id read cannot resolve:
+    /// its reader must pass the routing key.
     async fn conflict_keys(
         &self,
         tenant: &str,
