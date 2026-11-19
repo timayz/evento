@@ -1004,6 +1004,11 @@ thread_local! {
     /// move together on a re-sharding, while their writes conflict per
     /// aggregate. Off, a stream is keyed by its id alone.
     static ROUTED: Cell<bool> = const { Cell::new(false) };
+    /// Whether each write goes under its writer's own routing key (#563): as
+    /// nodes with a default routing key each do for a stream they see none
+    /// of yet. One stream is then named under as many keys as it has
+    /// writers, and they must conflict all the same.
+    static APART: Cell<bool> = const { Cell::new(false) };
 }
 
 /// How many regions a routed workload spreads its aggregates over: fewer
@@ -1035,6 +1040,15 @@ async fn routed<T>(f: impl Future<Output = T>) -> T {
     ROUTED.with(|r| r.set(true));
     let out = f.await;
     ROUTED.with(|r| r.set(false));
+    out
+}
+
+/// Runs `f` with every write under its writer's own routing key
+/// ([`APART`]), restoring the flag after.
+async fn apart<T>(f: impl Future<Output = T>) -> T {
+    APART.with(|a| a.set(true));
+    let out = f.await;
+    APART.with(|a| a.set(false));
     out
 }
 
@@ -1086,9 +1100,16 @@ impl Clients {
                 );
             }
         }
+        let apart = APART.with(Cell::get);
         let events = writes
             .iter()
-            .map(|(agg, version, seq)| event(agg, *version, *seq))
+            .map(|(agg, version, seq)| {
+                let mut event = event(agg, *version, *seq);
+                if apart {
+                    event.routing_key = Some(format!("writer{}", node.id().0));
+                }
+                event
+            })
             .collect();
         let write = node.write(events);
         if let Ok(Ok(outcome)) = tokio::time::timeout(timeout, write).await {
@@ -7289,6 +7310,25 @@ async fn routed_workloads_keep_every_oracle() {
                 "routed reshard seed {seed} ({shape:?}): {run:?}"
             );
             assert!(run.acked > 0, "routed reshard seed {seed}: no write acked");
+        }
+    })
+    .await;
+}
+
+/// One stream under several routing keys (#563): every write goes under its
+/// writer's own, as nodes with a default routing key each create a stream
+/// they hold nothing of. The writes of a stream conflict all the same — one
+/// commit a version, every store alike, reads behind a barrier on the bare
+/// id seeing them — under message faults and restarts. Single shard: two
+/// routing keys of two shards are two streams.
+#[tokio::test(start_paused = true)]
+async fn one_stream_under_each_writers_routing_key_keeps_every_oracle() {
+    apart(async {
+        let test = "one_stream_under_each_writers_routing_key_keeps_every_oracle";
+        for (seed, _replay) in sim_seeds(test, 0..8) {
+            let result = run_with_restarts(seed, Faults::ALL, StoreKind::Executor).await;
+            let reads = result.assert_ok(&format!("writers apart seed {seed}"));
+            assert!(reads > 0, "seed {seed}: no read returned");
         }
     })
     .await;

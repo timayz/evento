@@ -96,11 +96,13 @@ pub const MAGIC: [u8; 2] = *b"Ac";
 /// group is told so (`Message::FoundedApart`), and the journal keeps the
 /// group (`RecordKind::Foundation`, #541). 19: `Message::Watermark` carries
 /// the routing keys the sender's subscriptions follow (`Node::serves`,
-/// #562). No reader
+/// #562). 20: keys conflict by the stream they name, whatever their routing
+/// key (`Key::stream`, #563): nodes that disagree on what conflicts must
+/// not vote on one transaction. No reader
 /// for older versions: evento-cluster has
 /// not been released, so a journal of one is wiped and the node
 /// re-bootstrapped.
-pub const FORMAT_VERSION: u8 = 19;
+pub const FORMAT_VERSION: u8 = 20;
 
 /// Length of the fixed header: `MAGIC (2) + version (1) + kind (1)`.
 const HEADER_LEN: usize = 4;

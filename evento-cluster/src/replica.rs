@@ -57,6 +57,10 @@ pub struct Replica {
     /// Ordered, so the keys under one routing key are a range
     /// ([`Key::under`]) a read of the whole routing key can walk.
     by_key: BTreeMap<Key, BTreeSet<TxnId>>,
+    /// Index from stream ([`Key::stream`]: a key without its routing key) to
+    /// the transactions touching it. What a key conflicts by: one stream
+    /// written under two routing keys is still one stream (#563).
+    by_stream: HashMap<String, BTreeSet<TxnId>>,
     /// Execution queue: the `(execute_at, txn)` of every command awaiting
     /// execution — status [`Committed`](Status::Committed) or
     /// [`Reading`](Status::Reading), i.e. final order known but not yet applied.
@@ -175,6 +179,7 @@ impl Default for Replica {
         Self {
             commands: HashMap::new(),
             by_key: BTreeMap::new(),
+            by_stream: HashMap::new(),
             pending: BTreeSet::new(),
             runnable: BTreeSet::new(),
             blocked: HashMap::new(),
@@ -365,12 +370,19 @@ impl Replica {
         Self::default()
     }
 
-    /// Conflicting transactions: those sharing at least one key with `keys`,
-    /// excluding `self_txn`.
+    /// Conflicting transactions: those touching the stream of one of `keys`
+    /// ([`Key::stream`]), excluding `self_txn`. By the stream, not the key:
+    /// a stream's routing key is only known once the stream exists, so two
+    /// writers that create it at once may each name it under another one —
+    /// two keys, and one stream both would take version 1 of (#563).
     fn conflicts(&self, keys: &[Key], self_txn: TxnId) -> Vec<TxnId> {
         let mut out = BTreeSet::new();
         for key in keys {
-            Self::collect_conflicts(self.by_key.get(key), self_txn, &mut out);
+            Self::collect_conflicts(
+                self.by_stream.get(key.stream().as_ref()),
+                self_txn,
+                &mut out,
+            );
         }
         out.into_iter().collect()
     }
@@ -380,11 +392,15 @@ impl Replica {
     /// stream's key under it, so a read fenced on the routing key waits on
     /// every write of the region. A write never carries such a key for a
     /// routed stream (its keys name their aggregates), so the write side
-    /// stays exact.
+    /// needs no range.
     fn read_conflicts(&self, keys: &[Key], self_txn: TxnId) -> Vec<TxnId> {
         let mut out = BTreeSet::new();
         for key in keys {
-            Self::collect_conflicts(self.by_key.get(key), self_txn, &mut out);
+            Self::collect_conflicts(
+                self.by_stream.get(key.stream().as_ref()),
+                self_txn,
+                &mut out,
+            );
             if let Some(under) = key.under() {
                 for txns in self.by_key.range(under).map(|(_, txns)| txns) {
                     Self::collect_conflicts(Some(txns), self_txn, &mut out);
@@ -392,6 +408,35 @@ impl Replica {
             }
         }
         out.into_iter().collect()
+    }
+
+    /// Enters `txn` in the conflict indexes under `key`.
+    fn index(&mut self, key: &Key, txn: TxnId) {
+        self.by_key.entry(key.clone()).or_default().insert(txn);
+        self.by_stream
+            .entry(key.stream().into_owned())
+            .or_default()
+            .insert(txn);
+    }
+
+    /// Takes `txn`, a command leaving with `keys`, out of the conflict
+    /// indexes.
+    fn unindex(&mut self, keys: &[Key], txn: TxnId) {
+        for key in keys {
+            if let Some(set) = self.by_key.get_mut(key) {
+                set.remove(&txn);
+                if set.is_empty() {
+                    self.by_key.remove(key);
+                }
+            }
+            let stream = key.stream();
+            if let Some(set) = self.by_stream.get_mut(stream.as_ref()) {
+                set.remove(&txn);
+                if set.is_empty() {
+                    self.by_stream.remove(stream.as_ref());
+                }
+            }
+        }
     }
 
     fn collect_conflicts(
@@ -440,7 +485,9 @@ impl Replica {
             if !cmd.keys.contains(key) {
                 cmd.keys.push(key.clone());
             }
-            self.by_key.entry(key.clone()).or_default().insert(txn);
+        }
+        for key in keys {
+            self.index(key, txn);
         }
     }
 
@@ -455,7 +502,7 @@ impl Replica {
             }
         }
         for key in &cmd.keys {
-            self.by_key.entry(key.clone()).or_default().insert(cmd.txn);
+            self.index(key, cmd.txn);
         }
         if awaiting_execution(cmd.status) {
             self.enter_queue(cmd.execute_at, cmd.txn);
@@ -1961,14 +2008,7 @@ impl Replica {
         if awaiting_execution(cmd.status) {
             self.leave_queue(cmd.execute_at, txn);
         }
-        for key in &cmd.keys {
-            if let Some(set) = self.by_key.get_mut(key) {
-                set.remove(&txn);
-                if set.is_empty() {
-                    self.by_key.remove(key);
-                }
-            }
-        }
+        self.unindex(&cmd.keys, txn);
         self.read_results.remove(&txn);
         self.applying.remove(&txn);
         self.reindex_unapplied(txn);
@@ -2009,7 +2049,9 @@ impl Replica {
 
     /// The keys of the oldest command here known to be waiting on `dep`
     /// (see `blocked`), if one is. A dependency is scoped to a replica's
-    /// part of the command that waits on it, so `dep` touches one of them.
+    /// part of the command that waits on it, so `dep` touches the stream of
+    /// one of them — under that key or, for a stream created under two
+    /// routing keys at once, another of this replica's shard (#563).
     pub fn keys_waiting_on(&self, dep: TxnId) -> Option<Vec<Key>> {
         let waiter = self.waiters.get(&dep)?.iter().min()?;
         self.commands.get(waiter).map(|cmd| cmd.keys.clone())
@@ -2108,14 +2150,7 @@ impl Replica {
                     );
                     self.unsaved_decisions.insert(*txn);
                 }
-                for key in &cmd.keys {
-                    if let Some(set) = self.by_key.get_mut(key) {
-                        set.remove(txn);
-                        if set.is_empty() {
-                            self.by_key.remove(key);
-                        }
-                    }
-                }
+                self.unindex(&cmd.keys, *txn);
             }
             self.reindex_unapplied(*txn);
         }
@@ -2639,6 +2674,54 @@ mod tests {
         );
         let (_, deps) = replica.read_probe(probe, std::slice::from_ref(&cart));
         assert_eq!(deps, vec![a, c], "a stream's key conflicts exactly");
+    }
+
+    /// One stream named under two routing keys is one stream (#563): two
+    /// writers creating it at once, each under its own default, witness each
+    /// other, as does one that names it under no routing key — and a read of
+    /// it under any of them. The index empties with the commands.
+    #[test]
+    fn one_stream_under_two_routing_keys_conflicts() {
+        let under = |key: Option<&str>| Event {
+            routing_key: key.map(str::to_owned),
+            ..event("cart", 1)
+        };
+        let mut replica = Replica::new();
+        let eu = Key::of(&under(Some("eu")));
+        let us = Key::of(&under(Some("us")));
+        let plain = Key::of(&under(None));
+        let other = Key::of_stream("", Some("us"), "order");
+
+        let (a, b, c, d) = (txn(10), txn(20), txn(30), txn(40));
+        replica
+            .preaccept(a, 0, vec![eu.clone()], vec![under(Some("eu"))])
+            .unwrap();
+        let (_, deps) = replica
+            .preaccept(b, 0, vec![us.clone()], vec![under(Some("us"))])
+            .unwrap();
+        assert_eq!(deps, vec![a], "the same stream, under another routing key");
+        let (_, deps) = replica
+            .preaccept(c, 0, vec![plain.clone()], vec![under(None)])
+            .unwrap();
+        assert_eq!(deps, vec![a, b], "and under none");
+        let (_, deps) = replica
+            .preaccept(d, 0, vec![other.clone()], vec![event("order", 1)])
+            .unwrap();
+        assert_eq!(deps, vec![], "another stream of the routing key");
+
+        let probe = txn(50);
+        for key in [&eu, &us, &plain, &Key::of_stream("", Some("ap"), "cart")] {
+            let (_, deps) = replica.read_probe(probe, std::slice::from_ref(key));
+            assert_eq!(deps, vec![a, b, c], "a read of the stream under {key:?}");
+        }
+        let (_, deps) = replica.read_probe(probe, &[Key("us".into())]);
+        assert_eq!(deps, vec![b, d], "a read of the region sees its keys alone");
+
+        for txn in [a, b, c, d] {
+            replica.forget(txn);
+        }
+        assert!(replica.by_key.is_empty());
+        assert!(replica.by_stream.is_empty());
     }
 
     /// Same repair via Commit: a keyless entry (created by a keyless Accept

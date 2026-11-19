@@ -20,9 +20,10 @@ use crate::clock::{Ballot, NodeId, Timestamp, TxnId};
 
 /// Conflict unit and shard unit, in one string. Derived from an event: its
 /// tenant, its routing key (falling back to its aggregate id), and — when it
-/// has a routing key — its aggregate id. Two transactions *conflict* when they
-/// share a key: two writes of one aggregate do, two aggregates under one
-/// routing key do **not**. The key's **shard prefix** (everything before the
+/// has a routing key — its aggregate id. Two transactions *conflict* when
+/// their keys name one stream ([`stream`](Key::stream)): two writes of one
+/// aggregate do, under whatever routing key each names it (#563); two
+/// aggregates under one routing key do **not**. The key's **shard prefix** (everything before the
 /// aggregate id, see [`shard_prefix`](Key::shard_prefix)) is what the
 /// [`Topology`](crate::api::Topology) maps to a replica set, so a routing
 /// key's streams land in one shard and move together on a re-sharding.
@@ -120,6 +121,28 @@ impl Key {
     /// id of a stream without one — rather than one stream's key.
     pub fn is_prefix(&self) -> bool {
         !self.0.contains(AGGREGATE_SEPARATOR)
+    }
+
+    /// The stream the key names, whatever routing key it names it under: its
+    /// tenant and aggregate id (the key itself when it has no routing key).
+    /// What two keys conflict by
+    /// ([`Replica::conflicts`](crate::replica::Replica)): a stream's routing
+    /// key is fixed by its first event, so until that one is applied two
+    /// writers can each create the stream under another routing key (#563).
+    /// A bare routing key reads as the stream of that id — a false conflict
+    /// at most, as for a tenant and an id that spell one key.
+    pub fn stream(&self) -> Cow<'_, str> {
+        let Some(at) = self.0.find(AGGREGATE_SEPARATOR) else {
+            return Cow::Borrowed(&self.0);
+        };
+        let id = &self.0[at + AGGREGATE_SEPARATOR.len_utf8()..];
+        match self.0[..at].find(TENANT_SEPARATOR) {
+            Some(tenant) => Cow::Owned(format!(
+                "{}{id}",
+                &self.0[..tenant + TENANT_SEPARATOR.len_utf8()]
+            )),
+            None => Cow::Borrowed(id),
+        }
     }
 
     /// The range of keys under a prefix key: every stream's key whose routing
@@ -980,6 +1003,28 @@ mod tests {
         assert_eq!(routed, Key::of_stream("a", Some("eu"), "acc"));
         assert_eq!(routed, Key("a\u{1f}eu\u{1e}acc".into()));
         assert_eq!(routed.shard_prefix(), Key::in_tenant("a", "eu").0);
+    }
+
+    /// A key names its stream whatever its routing key: what keys conflict
+    /// by, so one stream created under two routing keys is one (#563).
+    #[test]
+    fn a_key_names_its_stream_under_any_routing_key() {
+        let plain = Key::of_stream("", None, "cart");
+        assert!(matches!(plain.stream(), Cow::Borrowed("cart")));
+        assert!(matches!(
+            Key::of_stream("", Some("eu"), "cart").stream(),
+            Cow::Borrowed("cart")
+        ));
+        assert_eq!(Key::of_stream("", Some("us"), "cart").stream(), "cart");
+        assert_eq!(Key::of_stream("", Some("eu"), "order").stream(), "order");
+
+        // In its tenant: the same id in two tenants is two streams.
+        let acme = Key::of_stream("acme", None, "cart");
+        assert_eq!(acme.stream(), acme.0);
+        assert_eq!(Key::of_stream("acme", Some("eu"), "cart").stream(), acme.0);
+        assert_eq!(Key::of_stream("acme", Some("us"), "cart").stream(), acme.0);
+        assert_ne!(Key::of_stream("other", Some("eu"), "cart").stream(), acme.0);
+        assert_ne!(acme.stream(), plain.stream());
     }
 
     /// A key's shard prefix is its tenant and routing key: every stream under
