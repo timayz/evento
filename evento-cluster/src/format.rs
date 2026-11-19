@@ -94,11 +94,13 @@ pub const MAGIC: [u8; 2] = *b"Ac";
 /// mark names its replica's group (`DurableMark::group`), a contact's
 /// `Message::JoinProof` carries it for the joiner, a replica of another
 /// group is told so (`Message::FoundedApart`), and the journal keeps the
-/// group (`RecordKind::Foundation`, #541). No reader
+/// group (`RecordKind::Foundation`, #541). 19: `Message::Watermark` carries
+/// the routing keys the sender's subscriptions follow (`Node::serves`,
+/// #562). No reader
 /// for older versions: evento-cluster has
 /// not been released, so a journal of one is wiped and the node
 /// re-bootstrapped.
-pub const FORMAT_VERSION: u8 = 18;
+pub const FORMAT_VERSION: u8 = 19;
 
 /// Length of the fixed header: `MAGIC (2) + version (1) + kind (1)`.
 const HEADER_LEN: usize = 4;

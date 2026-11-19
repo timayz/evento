@@ -78,6 +78,7 @@ pub mod metrics;
 pub mod node;
 mod reconfig;
 pub mod replica;
+pub mod share;
 pub mod store;
 pub mod tcp;
 pub mod transport;
@@ -97,6 +98,7 @@ pub use node::{
     OpenUnconfirmed, PartialSnapshot, RejoinRequired, SweepPressure, TopologyChanging,
     MAX_COMMAND_BYTES,
 };
+pub use share::{shard_of, Share};
 pub use store::{InMemoryDataStore, InMemoryJournal};
 pub use tcp::{serve, serve_tls, serve_tls_verified, PeerAddr, PeerCerts, TcpTransport, TlsClient};
 pub use transport::InMemoryNetwork;

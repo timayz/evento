@@ -63,6 +63,20 @@ that came with it discarded (§8, a group brought back from one node's store). `
 adjusts the derived `NodeConfig`; `Builder::before_copy` runs what the application
 derives from the events (read models next to them) once the store was emptied.
 
+**Work shared among the nodes.** Every node holds every event, but a deployment may
+give each node a routing key of its own (`default_routing_key`), so its subscriptions
+follow what that node created. The node tells its peers which keys it follows with
+its gossip: `Builder::serves(keys)` (left alone, the store's default routing key, or
+the events written without one), `Builder::serves_no_key()` for the events without a
+key besides. `Cluster::live(within)` lists the nodes heard from lately with what each
+said (`LiveNode::serves(key)`); `Cluster::share(within)` is this node's place among
+them and `Cluster::share_serving(key, within)` its place among those that follow one
+key, as a `Share { index, of }` whose `owns(id)` hashes a work id the same on every
+node and in every build (FNV-1a, `shard_of`). None of it goes through consensus: two
+nodes that disagree for a moment on who is up do one piece twice or leave it for the
+next look, so the work bears that (a claim written through the cluster, a handler
+that may run twice).
+
 **By hand.** Each node needs: its `NodeId`, the membership, a transport bound to its
 address, a durable journal, and a local event store. Minimal shape (see
 `examples/jepsen-node/src/main.rs`, which keeps its journal and store in separate
@@ -861,6 +875,11 @@ through `ClusterExecutor`) — split it into several writes.
   replica's group, a join's vouch carries the contact's, a replica of another group
   is answered `FoundedApart`, and the journal keeps the group. A node of format 18
   refuses journals and frames of format 17: wipe and re-bootstrap, as for format 2.
+- **The keys a node serves** (record format 19, #562): each watermark report
+  carries the routing keys the sender's subscriptions follow
+  (`Cluster::builder(..).serves(..)`, `Node::with_serves`); every node keeps the
+  latest from each peer (`LiveNode::keys`, `PeerState::keys`). A node of format 19
+  refuses journals and frames of format 18: wipe and re-bootstrap, as for format 2.
 - **A node's label** (record format 16): each watermark report carries the word the
   host gave its node (`Cluster::builder(..).label(..)`, `Node::with_label`), which
   region it serves, say; every node keeps the latest from each peer

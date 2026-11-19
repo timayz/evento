@@ -46,6 +46,7 @@ use crate::backend::ClusterBackend;
 use crate::clock::{HybridLogicalClock, NodeId};
 use crate::executor::{ClusterExecutor, ExecutorDataStore};
 use crate::node::{LostJournal, Node, NodeConfig, PartialSnapshot};
+use crate::share::Share;
 use crate::tcp::{serve, PeerAddr, TcpTransport};
 use crate::transport::{Envelope, InMemoryNetwork};
 use crate::{DataStore, Journal, MessageSink, StaticTopology, Topology};
@@ -341,6 +342,10 @@ pub struct PeerState {
     /// What it last said about itself ([`Builder::label`]), if anything was
     /// heard from it.
     pub label: Option<String>,
+    /// The routing keys it last said its subscriptions follow
+    /// ([`Builder::serves`]), `None` among them for the events written
+    /// without one; `None` until it said.
+    pub keys: Option<Vec<Option<String>>>,
 }
 
 /// A node heard from lately, as [`Cluster::live`] lists it.
@@ -351,6 +356,22 @@ pub struct LiveNode {
     /// What it says about itself ([`Builder::label`]): this node's own label,
     /// or the one a peer last reported.
     pub label: Option<String>,
+    /// The routing keys its subscriptions follow ([`Builder::serves`]),
+    /// `None` among them for the events written without one. `None` for a
+    /// peer heard from that has not said yet: it reports a moment after its
+    /// first message.
+    pub keys: Option<Vec<Option<String>>>,
+}
+
+impl LiveNode {
+    /// Whether this node's subscriptions follow the events written under
+    /// `key` (`None`: without one). `false` for a node that has not said
+    /// what it serves yet.
+    pub fn serves(&self, key: Option<&str>) -> bool {
+        self.keys
+            .as_deref()
+            .is_some_and(|keys| keys.iter().any(|served| served.as_deref() == key))
+    }
 }
 
 /// This node, for a status page and the log.
@@ -408,6 +429,8 @@ pub struct Builder<E: ClusterBackend> {
     state_dir: Option<PathBuf>,
     config: Option<Box<dyn FnOnce(NodeConfig) -> NodeConfig + Send>>,
     label: Option<String>,
+    serves: Option<Vec<String>>,
+    serves_no_key: bool,
     journal: Option<Arc<dyn Journal>>,
     before_copy: Option<Hook>,
 }
@@ -433,6 +456,31 @@ impl<E: ClusterBackend> Builder<E> {
     /// [`Cluster::live`] and [`PeerState::label`].
     pub fn label(mut self, label: impl Into<String>) -> Self {
         self.label = Some(label.into());
+        self
+    }
+
+    /// The routing keys whose events this node's subscriptions follow, which
+    /// it tells its peers with its gossip: its own
+    /// ([`Executor::default_routing_key`](evento_core::Executor::default_routing_key))
+    /// first, then those it follows besides. Left alone, the node says the
+    /// store's default routing key, or that it follows the events written
+    /// without one when the store has none; a deployment that sets the
+    /// default on a wrapper around the executor
+    /// ([`Evento::default_routing_key`](evento_core::Evento::default_routing_key))
+    /// names it here.
+    ///
+    /// The cluster routes nothing by it, and every node holds every event
+    /// whatever it says. It is what work shared out by key goes by
+    /// ([`Cluster::share_serving`], [`LiveNode::serves`]).
+    pub fn serves<K: Into<String>>(mut self, keys: impl IntoIterator<Item = K>) -> Self {
+        self.serves = Some(keys.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Says that this node's subscriptions follow the events written without
+    /// a routing key too, besides the keys of [`serves`](Self::serves).
+    pub fn serves_no_key(mut self) -> Self {
+        self.serves_no_key = true;
         self
     }
 
@@ -481,9 +529,18 @@ impl<E: ClusterBackend> Builder<E> {
             state_dir,
             config,
             label,
+            serves,
+            serves_no_key,
             journal,
             before_copy,
         } = self;
+        let mut keys: Vec<Option<String>> = match serves {
+            Some(keys) => keys.into_iter().map(Some).collect(),
+            None => vec![store.default_routing_key().map(str::to_owned)],
+        };
+        if serves_no_key && !keys.contains(&None) {
+            keys.push(None);
+        }
         if let Some(settings) = &settings {
             settings.validate()?;
         }
@@ -601,7 +658,8 @@ impl<E: ClusterBackend> Builder<E> {
             journal,
         )
         .with_config(node_config)
-        .with_label(label);
+        .with_label(label)
+        .with_serves(Some(keys));
 
         // Past here an error ends every task started so far, the listener's
         // first: the next open binds the same address.
@@ -725,6 +783,8 @@ impl Cluster {
             state_dir: None,
             config: None,
             label: None,
+            serves: None,
+            serves_no_key: false,
             journal: None,
             before_copy: None,
         }
@@ -784,9 +844,10 @@ impl Cluster {
     }
 
     /// The nodes heard from within `within`, this one included, by id, each
-    /// with what it says about itself ([`Builder::label`]). What work spread
-    /// over the nodes goes by, so a node that stops is covered for once it
-    /// has been silent that long. Idle nodes gossip many times a second.
+    /// with what it says about itself ([`Builder::label`],
+    /// [`Builder::serves`]). What work spread over the nodes goes by, so a
+    /// node that stops is covered for once it has been silent that long.
+    /// Idle nodes gossip many times a second.
     pub fn live(&self, within: Duration) -> Vec<LiveNode> {
         let me = self.node.id();
         let absent = self.node.absent_peers();
@@ -797,11 +858,13 @@ impl Cluster {
                     Some(LiveNode {
                         id,
                         label: self.node.label().map(str::to_owned),
+                        keys: self.node.serves().map(<[_]>::to_vec),
                     })
                 } else if self.node.silent_for(id) < within && !absent.contains(&id) {
                     Some(LiveNode {
                         id,
                         label: self.node.peer_label(id).map(|label| label.to_string()),
+                        keys: self.node.peer_serves(id).map(|keys| keys.to_vec()),
                     })
                 } else {
                     None
@@ -813,10 +876,24 @@ impl Cluster {
     /// This node's place among the nodes heard from within `within`
     /// ([`live`](Self::live)), and how many they are: `(index, of)`.
     pub fn live_nodes(&self, within: Duration) -> (u64, u64) {
-        let me = self.node.id();
-        let live = self.live(within);
-        let index = live.iter().position(|node| node.id == me).unwrap_or(0);
-        (index as u64, live.len() as u64)
+        let share = self.share(within);
+        (share.index, share.of)
+    }
+
+    /// This node's part of the work spread over the nodes heard from within
+    /// `within` ([`live`](Self::live)): the work every node can do, whatever
+    /// it serves.
+    pub fn share(&self, within: Duration) -> Share {
+        Share::among(self.node.id(), &self.live(within))
+    }
+
+    /// This node's part of the work spread over the nodes heard from within
+    /// `within` whose subscriptions follow the events written under `key`
+    /// (`None`: without one): the work a subscription is told about, which
+    /// must fall to a node that sees its event. This node always counts, so
+    /// it owns its part of what it alone saw.
+    pub fn share_serving(&self, key: Option<&str>, within: Duration) -> Share {
+        Share::among_serving(self.node.id(), &self.live(within), key)
     }
 
     /// This node, as a status page shows it.
@@ -836,6 +913,7 @@ impl Cluster {
                     silent_for: self.node.silent_for(id),
                     given_up: absent.contains(&id),
                     label: self.node.peer_label(id).map(|label| label.to_string()),
+                    keys: self.node.peer_serves(id).map(|keys| keys.to_vec()),
                 })
                 .collect(),
             confirmed: self.node.confirmed(),

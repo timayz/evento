@@ -397,6 +397,12 @@ pub enum Message {
         /// application: which region it serves, say. Opaque to the cluster,
         /// which only keeps the latest from each peer.
         label: Option<String>,
+        /// The routing keys whose events the sender's subscriptions follow
+        /// ([`Node::serves`]); `None` among them stands for the events
+        /// written without one. Not what the sender replicates: every node
+        /// holds every key of its shards. Kept as the latest from each peer,
+        /// for the work an application shares out by key.
+        serves: Option<Vec<Option<String>>>,
     },
     /// Existing replica → joining node (or anti-entropy requester): the
     /// committed state to import.
