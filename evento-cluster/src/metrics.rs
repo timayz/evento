@@ -188,6 +188,15 @@ pub struct Metrics {
     /// landed: history its subscriptions already read past and will not see
     /// (#374).
     pub copied_below_stable: AtomicU64,
+    /// Routing keys without a node this node took on
+    /// ([`Cluster::cover`](crate::Cluster::cover), #562): it started their
+    /// subscriptions.
+    pub cover_takes: AtomicU64,
+    /// Routing keys this node let go of after taking them on: a node that
+    /// serves the key was heard from again, the share moved it to another
+    /// node, or one of its subscriptions stopped on its own. The takes less
+    /// these are the keys this node covers for now.
+    pub cover_hand_backs: AtomicU64,
 }
 
 impl Metrics {
@@ -394,6 +403,16 @@ impl Metrics {
             .fetch_add(events as u64, Ordering::Relaxed);
     }
 
+    /// Records a routing key without a node taken on.
+    pub fn record_cover_take(&self) {
+        self.cover_takes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a routing key let go of after it was taken on.
+    pub fn record_cover_hand_back(&self) {
+        self.cover_hand_backs.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Records a config-Paxos vote withheld after a lost journal.
     pub fn record_config_vote_withheld(&self) {
         self.config_votes_withheld.fetch_add(1, Ordering::Relaxed);
@@ -480,6 +499,8 @@ impl Metrics {
             copies_voided: self.copies_voided.load(Ordering::Relaxed),
             votes_forgotten: self.votes_forgotten.load(Ordering::Relaxed),
             copied_below_stable: self.copied_below_stable.load(Ordering::Relaxed),
+            cover_takes: self.cover_takes.load(Ordering::Relaxed),
+            cover_hand_backs: self.cover_hand_backs.load(Ordering::Relaxed),
         }
     }
 }
@@ -535,6 +556,10 @@ pub struct MetricsSnapshot {
     pub copies_voided: u64,
     pub votes_forgotten: u64,
     pub copied_below_stable: u64,
+    /// See [`Metrics::cover_takes`].
+    pub cover_takes: u64,
+    /// See [`Metrics::cover_hand_backs`].
+    pub cover_hand_backs: u64,
 }
 
 impl MetricsSnapshot {
@@ -542,7 +567,7 @@ impl MetricsSnapshot {
     /// source of truth for both [`to_prometheus`](Self::to_prometheus) and
     /// [`to_prometheus_labeled`](Self::to_prometheus_labeled); add a counter here and
     /// both renderings pick it up.
-    fn counters(&self) -> [(&'static str, &'static str, u64); 46] {
+    fn counters(&self) -> [(&'static str, &'static str, u64); 48] {
         [
             (
                 "cluster_writes_committed_total",
@@ -773,6 +798,16 @@ impl MetricsSnapshot {
                 "cluster_copied_below_stable_total",
                 "Copied events stamped below this node's stable point: history its subscriptions will not see.",
                 self.copied_below_stable,
+            ),
+            (
+                "cluster_cover_takes_total",
+                "Routing keys without a node whose subscriptions this node took on.",
+                self.cover_takes,
+            ),
+            (
+                "cluster_cover_hand_backs_total",
+                "Routing keys this node let go of after taking them on; the takes less these are covered now.",
+                self.cover_hand_backs,
             ),
         ]
     }
