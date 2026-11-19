@@ -77,6 +77,17 @@ nodes that disagree for a moment on who is up do one piece twice or leave it for
 next look, so the work bears that (a claim written through the cluster, a handler
 that may run twice).
 
+Gossip tells only what the nodes up say: a node that starts while another is away, or
+that copied its store after the other left, never heard that node's key. The keys
+the nodes serve are therefore also kept in the store (`evento_cluster::keys`):
+`keys::record(&executor, key)` writes a key through the cluster as a one-event stream
+of the type `evento-cluster/RoutingKey` (default tenant, no routing key; a key
+already there loses its version check, so nodes saying theirs side by side need no
+retry), and `keys::known(&executor)` reads the list from the node's own copy. The
+list is replicated, copied to a joining node and kept by a backup like any other
+event. A subscription sees these events only if it asks for their type; an export of
+the whole event table does.
+
 **By hand.** Each node needs: its `NodeId`, the membership, a transport bound to its
 address, a durable journal, and a local event store. Minimal shape (see
 `examples/jepsen-node/src/main.rs`, which keeps its journal and store in separate
