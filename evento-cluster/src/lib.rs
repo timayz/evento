@@ -69,6 +69,7 @@
 pub mod api;
 pub mod backend;
 pub mod clock;
+pub mod cover;
 pub mod executor;
 pub mod failure_detector;
 pub mod format;
@@ -90,6 +91,7 @@ pub use api::{
 };
 pub use backend::ClusterBackend;
 pub use clock::{Clock, HybridLogicalClock, NodeId, MAX_SKEW_MICROS};
+pub use cover::{Cover, CoveredKey, Covering};
 pub use executor::{ClusterExecutor, ExecutorDataStore};
 pub use host::{Cluster, LiveNode, NodeHealth, PeerState, Settings};
 pub use metrics::{Metrics, MetricsSnapshot};

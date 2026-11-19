@@ -24,6 +24,8 @@ see [`examples/bank-axum-cluster`](../examples/bank-axum-cluster) for a runnable
   signals that end a node's part, `health()` for a status page. Each node says
   which routing keys its subscriptions follow (`serves`), and `share` /
   `share_serving` give its place among the nodes up for the work they split.
+  `cluster.cover(executor)` has the nodes up run the subscriptions of a routing
+  key whose node is away, and hand them back when it returns.
 - **`ClusterExecutor`** — a drop-in `evento_core::Executor`. Writes are
   coordinated through the cluster (replicated, strictly serializable); reads,
   subscriptions, and snapshots are served from a local evento backend

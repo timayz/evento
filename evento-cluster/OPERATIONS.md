@@ -88,6 +88,48 @@ list is replicated, copied to a joining node and kept by a backup like any other
 event. A subscription sees these events only if it asks for their type; an export of
 the whole event table does.
 
+**The key of a node that is away.** With a key per node, the events a node created
+wait for it while it is down, and for ever once it is removed: a stream keeps the key
+it was created with. `Cluster::cover` has the nodes up take such a key on:
+
+```rust
+let covering = cluster
+    .cover(executor.local_reads())            // what the subscriptions run on
+    .after(Duration::from_secs(60))           // a key this long without a node
+    .every(Duration::from_secs(10))           // how often the node looks
+    .subscription("payments", |_key| payments())
+    .subscription("mails", |_key| mails())
+    .start();
+// `covering.covered()`: the keys covered now, for a status page.
+// `covering.shutdown().await` before `cluster.shutdown()`.
+```
+
+Each node writes the keys it serves onto the list above and, every `every`, takes
+the keys on it that no node heard from within `after` serves: they are shared out
+among the nodes up that serve a key (`Share::owns` of the key), so each goes to one.
+That node starts a copy of every subscription it was given, filtered on the key
+(`routing_key(key)`, applied by the cover), and stops them once a node that serves the
+key is heard from again or the share moved the key. A key whose node never returns
+is covered like any other and moves when the nodes up change. The events written
+without a key are not covered for, a node that serves no key takes none on, and
+nothing is taken on or handed back while a node heard from has not said what it
+serves yet.
+
+What it asks of the application:
+
+- **Handlers that bear two nodes at once.** Who is up is what each node heard, not
+  something agreed: two nodes that take each other for gone both take a key on, and
+  a node that returns overlaps with its cover until that one's next look. Nothing
+  fences them.
+- **Handlers that bear the key's history again.** A subscription's cursor is local
+  to its node: the first time a node takes a key on, each subscription goes through
+  that key's events from the start, under its own cursor (`<key>.<subscription>`);
+  the next time it goes on from there.
+- **An `after` above the silences between nodes that are up.** A node reports once
+  its journal is flushed, so two idle nodes on a loaded disk may hear nothing from
+  each other for seconds. Keep `after` well above that, and above a restart for an
+  update: tens of seconds.
+
 **By hand.** Each node needs: its `NodeId`, the membership, a transport bound to its
 address, a durable journal, and a local event store. Minimal shape (see
 `examples/jepsen-node/src/main.rs`, which keeps its journal and store in separate
@@ -225,6 +267,7 @@ Serve it on an HTTP endpoint (see `bank-axum-cluster`'s `/metrics`). Counters:
 | `snapshot_pages` | snapshot pages this node served to joining peers; a joiner pulls one per `snapshot_page_events` / `snapshot_page_bytes` of the contact's store. |
 | `command_pages` | command pages this node served to joining peers: a joiner pulls the contact's un-compacted applied commands one page at a time, before its snapshot pages. |
 | `joins_partial` | joins of this node that failed after a page was installed: the store holds a prefix no contact can complete, and must be emptied before the next join (§7). Steady > 0 = a contact that cannot read its backend, or a link losing pages faster than the per-page retries cover. |
+| `cover_takes` / `cover_hand_backs` | routing keys without a node this node took on (`Cluster::cover`, §2), and those it let go of: a node serving the key was heard from again, the share moved it, or one of its subscriptions stopped on its own. The difference is what the node covers for now (`Covering::covered`). A take per node stopped is expected; **both rising together** = nodes taking each other for gone and back (`after` too short for the silences between them), or a covered subscription that keeps failing (see the log). |
 | `execution_failures` | data-store applies and commit-condition reads that failed. The transaction is neither marked applied nor acknowledged, and is retried on the next drive (a message, or the sweep). Occasional = transient lock contention; **sustained** = this replica's store cannot take writes (full disk, broken connection), so it falls behind until it can. |
 | `own_store_waits` | phases of a write this node coordinated that waited on past `collect_timeout` because the quorum lacked only this node's own answer, and its store was still reading the version condition or enacting the transaction (or the decided ones ahead of it). The write completes in the store's time, and no recovery is started for it (#475). A rising count = this node's store has reads or fsyncs outlasting `collect_timeout` (§8, write latency); look at the disk. |
 | `writes_invalidated` | writes this node coordinated that a recovery invalidated: too few replicas held them in time for them ever to commit — they reached the replicas late (`votes_late` on the replicas) or below a vote fence (`votes_fenced`), or never reached them — so nothing was written (#466). Counted here alone: not in `writes_committed` or `writes_conflicted`, nor on either path. `ClusterExecutor` writes each again as a fresh transaction, up to three attempts in all (#521), so the caller gets `WriteError::Unavailable` with the `Invalidated` cause only when all three were invalidated. Each took a recovery longer than it should; a steady rate means coordinators, or replicas' inboxes, slower than `compaction_margin` (§8, write latency). |
