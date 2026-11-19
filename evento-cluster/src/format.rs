@@ -98,11 +98,12 @@ pub const MAGIC: [u8; 2] = *b"Ac";
 /// the routing keys the sender's subscriptions follow (`Node::serves`,
 /// #562). 20: keys conflict by the stream they name, whatever their routing
 /// key (`Key::stream`, #563): nodes that disagree on what conflicts must
-/// not vote on one transaction. No reader
+/// not vote on one transaction. 21: `Message::Cursors`, how far the
+/// subscriptions run for routing keys got (#566). No reader
 /// for older versions: evento-cluster has
 /// not been released, so a journal of one is wiped and the node
 /// re-bootstrapped.
-pub const FORMAT_VERSION: u8 = 20;
+pub const FORMAT_VERSION: u8 = 21;
 
 /// Length of the fixed header: `MAGIC (2) + version (1) + kind (1)`.
 const HEADER_LEN: usize = 4;

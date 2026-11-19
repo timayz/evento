@@ -689,6 +689,16 @@ pub enum Message {
     /// only refreshes a live hold, never re-creates a lapsed one. A contact
     /// predating this variant sheds it, and its hold lapses as before.
     JoinKeepalive,
+    /// Node → every node, every look of its cover
+    /// ([`Cluster::cover`](crate::Cluster::cover), #566): how far the
+    /// subscriptions run for routing keys got, as far as the sender knows,
+    /// by the name a subscription's cursor is kept under
+    /// (`<key>.<subscription>`). The cursors it read from its own store and
+    /// those it was told, so a node hears of a subscription from whichever
+    /// node is up. The receiver keeps the furthest of each: nothing is
+    /// agreed, and a node that takes a key on starts from what it heard
+    /// last.
+    Cursors { cursors: Vec<(String, Value)> },
     /// Replica → recovery coordinator, answering a `BeginRecovery` (routed
     /// or not) while it joins over a lost journal (#312), for a transaction
     /// below its amnesia fence: it holds nothing of it, may have voted for
@@ -867,6 +877,7 @@ impl Message {
             | Message::CommandPageRequest { .. }
             | Message::CommandPage { .. }
             | Message::JoinKeepalive
+            | Message::Cursors { .. }
             | Message::Opened { .. }
             | Message::OpenedOk { .. }
             | Message::RolledBack { .. }
@@ -1210,6 +1221,25 @@ mod tests {
         match decode_tagged(RecordKind::WireFrame, &bytes).unwrap() {
             Message::ReadFailed { id, reason } => {
                 assert_eq!((id, reason.as_str()), (9, "disk full"))
+            }
+            other => panic!("variant changed on the wire: {other:?}"),
+        }
+    }
+
+    /// The cursors a node shares cross the wire and belong to no transaction.
+    #[test]
+    fn cursors_round_trip_tagged() {
+        let message = Message::Cursors {
+            cursors: vec![("eu.orders".into(), crate::api::cursor_at(1_000_000))],
+        };
+        assert_eq!(message.txn(), None);
+        let bytes = encode_tagged(RecordKind::WireFrame, &message).unwrap();
+        match decode_tagged(RecordKind::WireFrame, &bytes).unwrap() {
+            Message::Cursors { cursors } => {
+                assert_eq!(
+                    cursors,
+                    [("eu.orders".into(), crate::api::cursor_at(1_000_000))]
+                );
             }
             other => panic!("variant changed on the wire: {other:?}"),
         }

@@ -1487,6 +1487,15 @@ fn read_failure(err: &anyhow::Error) -> String {
 /// anti-entropy round cannot steal each other's data.
 type SyncInbox = Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<SyncPayload>>>>;
 
+/// Where a subscription's cursor stands in the store's order: the stamp,
+/// version and id of the event it names. `None` for a value that is no
+/// event's cursor.
+fn cursor_place(cursor: &Value) -> Option<(u64, u32, u16, String)> {
+    use evento_core::cursor::Cursor as _;
+    let at = Event::deserialize_cursor(cursor).ok()?;
+    Some((at.t, at.s, at.v, at.i))
+}
+
 /// The routing keys a node's subscriptions follow; `None` among them stands
 /// for the events written without one.
 type ServedKeys = Arc<[Option<String>]>;
@@ -1587,6 +1596,11 @@ pub struct Node {
     /// The latest keys each peer reported it serves ([`Message::Watermark`]'s
     /// `serves`); a peer reporting none is dropped from here.
     peer_serves: Arc<Mutex<HashMap<NodeId, ServedKeys>>>,
+    /// How far the subscriptions run for routing keys got, by the name each
+    /// keeps its cursor under: the furthest this node read from its own
+    /// store or was told ([`Message::Cursors`], #566). In memory: learnt
+    /// again from the nodes up after a restart.
+    shared_cursors: Arc<Mutex<BTreeMap<String, Value>>>,
     /// What the journal has been asked to truncate: the sweep calls
     /// [`compact`](Node::compact) continuously, and a journal's `truncate` is
     /// a write transaction (an fsync, and on SQLite the writer lock) even when
@@ -1760,6 +1774,7 @@ impl Node {
             peer_labels: Arc::new(Mutex::new(HashMap::new())),
             serves: None,
             peer_serves: Arc::new(Mutex::new(HashMap::new())),
+            shared_cursors: Arc::new(Mutex::new(BTreeMap::new())),
             journal_mark: Arc::new(Mutex::new(JournalMark::default())),
             sync_coverage: Arc::new(Mutex::new((start_epoch, HashMap::new()))),
             join_proof: Arc::new(Mutex::new(None)),
@@ -1856,6 +1871,58 @@ impl Node {
             .expect("served keys poisoned")
             .get(&peer)
             .cloned()
+    }
+
+    /// How far the subscription that keeps its cursor under `name` got, as
+    /// far as this node knows: the furthest cursor it noted
+    /// ([`note_cursors`](Node::note_cursors)) or a peer shared.
+    pub fn shared_cursor(&self, name: &str) -> Option<Value> {
+        self.shared_cursors
+            .lock()
+            .expect("shared cursors poisoned")
+            .get(name)
+            .cloned()
+    }
+
+    /// Notes how far subscriptions got, each by the name it keeps its
+    /// cursor under: kept where further than what this node knew, and told
+    /// to the peers at the next [`share_cursors`](Node::share_cursors). A
+    /// cursor that does not decode as an event's is left out.
+    pub fn note_cursors(&self, cursors: impl IntoIterator<Item = (String, Value)>) {
+        let mut known = self.shared_cursors.lock().expect("shared cursors poisoned");
+        for (name, cursor) in cursors {
+            let Some(place) = cursor_place(&cursor) else {
+                continue;
+            };
+            match known.get(&name).and_then(cursor_place) {
+                Some(held) if held >= place => {}
+                _ => {
+                    known.insert(name, cursor);
+                }
+            }
+        }
+    }
+
+    /// Tells every other node the cursors this node knows
+    /// ([`Message::Cursors`]): nothing is sent while it knows none.
+    pub async fn share_cursors(&self) {
+        let cursors: Vec<(String, Value)> = self
+            .shared_cursors
+            .lock()
+            .expect("shared cursors poisoned")
+            .iter()
+            .map(|(name, cursor)| (name.clone(), cursor.clone()))
+            .collect();
+        if cursors.is_empty() {
+            return;
+        }
+        let peers: Vec<NodeId> = self
+            .topology
+            .nodes()
+            .into_iter()
+            .filter(|&node| node != self.id)
+            .collect();
+        self.broadcast(&peers, Message::Cursors { cursors }).await;
     }
 
     /// The keys this node serves as a report carries them.
@@ -4143,6 +4210,7 @@ impl Node {
                 | Message::CommandPageRequest { .. }
                 | Message::CommandPage { .. }
                 | Message::JoinKeepalive
+                | Message::Cursors { .. }
                 | Message::Watermark { .. }
                 | Message::ConfigPrepare { .. }
                 | Message::ConfigPromise { .. }
@@ -5201,6 +5269,7 @@ impl Node {
             // A joiner whose install spaces out its page requests: keep the
             // hold on this node's report alive.
             Message::JoinKeepalive => self.refresh_join_hold(from),
+            Message::Cursors { cursors } => self.note_cursors(cursors),
             Message::CommandPageRequest { id, after } => {
                 if !self.bootstrapped.load(Ordering::Acquire) {
                     return out;
