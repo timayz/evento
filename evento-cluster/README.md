@@ -21,7 +21,9 @@ see [`examples/bank-axum-cluster`](../examples/bank-axum-cluster) for a runnable
   .state_dir(..).open()` over a `Turso`/`Sql`/`Fjall` store, with the `[cluster]`
   section of a configuration file as `Settings` (`node_id`, `peers`, …) or none for
   a node alone. Transport, `NodeConfig`, colocated journal, recover-or-copy, the
-  signals that end a node's part, `health()` for a status page.
+  signals that end a node's part, `health()` for a status page. Each node says
+  which routing keys its subscriptions follow (`serves`), and `share` /
+  `share_serving` give its place among the nodes up for the work they split.
 - **`ClusterExecutor`** — a drop-in `evento_core::Executor`. Writes are
   coordinated through the cluster (replicated, strictly serializable); reads,
   subscriptions, and snapshots are served from a local evento backend

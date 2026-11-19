@@ -792,7 +792,7 @@ enum Screen {
     /// Reinstated by this message; the bounds changed if `persist`.
     Reinstated { persist: bool },
     /// Still behind: answer this instead.
-    Reply(Message),
+    Reply(Box<Message>),
 }
 
 /// The [`Message::JoinProof`] slot of an in-flight join, dropped from
@@ -1475,6 +1475,10 @@ fn read_failure(err: &anyhow::Error) -> String {
 /// anti-entropy round cannot steal each other's data.
 type SyncInbox = Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<SyncPayload>>>>;
 
+/// The routing keys a node's subscriptions follow; `None` among them stands
+/// for the events written without one.
+type ServedKeys = Arc<[Option<String>]>;
+
 /// A cluster node. Cheap to clone — all state is shared behind `Arc`.
 #[derive(Clone)]
 pub struct Node {
@@ -1564,6 +1568,13 @@ pub struct Node {
     /// The latest label each peer reported ([`Message::Watermark`]'s
     /// `label`); a peer reporting none is dropped from here.
     peer_labels: Arc<Mutex<HashMap<NodeId, Arc<str>>>>,
+    /// The routing keys whose events this node's subscriptions follow
+    /// ([`with_serves`](Node::with_serves)), told with each watermark
+    /// report.
+    serves: Option<ServedKeys>,
+    /// The latest keys each peer reported it serves ([`Message::Watermark`]'s
+    /// `serves`); a peer reporting none is dropped from here.
+    peer_serves: Arc<Mutex<HashMap<NodeId, ServedKeys>>>,
     /// What the journal has been asked to truncate: the sweep calls
     /// [`compact`](Node::compact) continuously, and a journal's `truncate` is
     /// a write transaction (an fsync, and on SQLite the writer lock) even when
@@ -1735,6 +1746,8 @@ impl Node {
             peer_watermarks: Arc::new(Mutex::new(PeerReports::default())),
             label: None,
             peer_labels: Arc::new(Mutex::new(HashMap::new())),
+            serves: None,
+            peer_serves: Arc::new(Mutex::new(HashMap::new())),
             journal_mark: Arc::new(Mutex::new(JournalMark::default())),
             sync_coverage: Arc::new(Mutex::new((start_epoch, HashMap::new()))),
             join_proof: Arc::new(Mutex::new(None)),
@@ -1805,6 +1818,37 @@ impl Node {
     /// This node's label as a report carries it.
     fn label_report(&self) -> Option<String> {
         self.label.as_deref().map(str::to_owned)
+    }
+
+    /// Tells the peers, with every watermark report, the routing keys whose
+    /// events this node's subscriptions follow; `None` among them stands for
+    /// the events written without one. The cluster routes nothing by it: it
+    /// is what work shared out by key goes by
+    /// ([`Share::among_serving`](crate::Share::among_serving)), and what tells
+    /// a key no node up follows. Call before [`start`](Node::start).
+    pub fn with_serves(mut self, keys: Option<Vec<Option<String>>>) -> Self {
+        self.serves = keys.map(Arc::from);
+        self
+    }
+
+    /// The routing keys this node tells its peers it serves.
+    pub fn serves(&self) -> Option<&[Option<String>]> {
+        self.serves.as_deref()
+    }
+
+    /// The routing keys `peer` last reported it serves, if it reports any;
+    /// `None` for a peer never heard from.
+    pub fn peer_serves(&self, peer: NodeId) -> Option<Arc<[Option<String>]>> {
+        self.peer_serves
+            .lock()
+            .expect("served keys poisoned")
+            .get(&peer)
+            .cloned()
+    }
+
+    /// The keys this node serves as a report carries them.
+    fn serves_report(&self) -> Option<Vec<Option<String>>> {
+        self.serves.as_deref().map(<[_]>::to_vec)
     }
 
     /// This node's amnesia fence, if it came back over a lost journal under
@@ -3726,6 +3770,7 @@ impl Node {
                 copied,
                 live_since,
                 label: self.label_report(),
+                serves: self.serves_report(),
             },
         )
         .await;
@@ -3980,7 +4025,7 @@ impl Node {
             _ => state.rejoin_above,
         };
         match behind {
-            Some(above) => Screen::Reply(Message::Rejoin { above }),
+            Some(above) => Screen::Reply(Box::new(Message::Rejoin { above })),
             None => {
                 let persist = state.rejoin_above.is_some();
                 absent.remove(&from);
@@ -4026,6 +4071,7 @@ impl Node {
                     copied: self.copied_report(),
                     live_since: self.live_since(),
                     label: self.label_report(),
+                    serves: self.serves_report(),
                 },
             )
             .await;
@@ -4583,7 +4629,7 @@ impl Node {
                     self.save_rejoin_bounds(&bounds).await;
                 }
             }
-            Screen::Reply(reply) => return vec![(env.from, reply)],
+            Screen::Reply(reply) => return vec![(env.from, *reply)],
         }
 
         // While bootstrapping, buffer consensus messages for replay after the
@@ -5370,6 +5416,7 @@ impl Node {
                 copied,
                 live_since,
                 label,
+                serves,
             } => {
                 // What the sender's journal holds, which it must hold again
                 // when it reopens (#339) — and which journal that is: a
@@ -5419,6 +5466,17 @@ impl Node {
                         }
                         None => {
                             labels.remove(&from);
+                        }
+                    }
+                }
+                {
+                    let mut served = self.peer_serves.lock().expect("served keys poisoned");
+                    match serves {
+                        Some(keys) => {
+                            served.insert(from, Arc::from(keys));
+                        }
+                        None => {
+                            served.remove(&from);
                         }
                     }
                 }
@@ -9341,6 +9399,7 @@ impl Node {
                     copied: self.copied_report(),
                     live_since,
                     label: self.label_report(),
+                    serves: self.serves_report(),
                 },
             )
             .await;
@@ -10156,6 +10215,7 @@ impl Node {
                             copied: None,
                             live_since: self.live_since(),
                             label: self.label_report(),
+                            serves: self.serves_report(),
                         },
                     )
                     .await;
@@ -14313,6 +14373,7 @@ mod tests {
             copied: None,
             live_since: 0,
             label: None,
+            serves: None,
         };
         let micros_of = |m: Message| match m {
             Message::Watermark {

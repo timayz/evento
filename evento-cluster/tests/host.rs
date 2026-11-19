@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use evento_cluster::host::{RejoinMark, Settings};
-use evento_cluster::{Cluster, ClusterExecutor, LiveNode, NodeConfig, NodeId, PeerAddr};
+use evento_cluster::{Cluster, ClusterExecutor, LiveNode, NodeConfig, NodeId, PeerAddr, Share};
 use evento_core::{cursor::Args, Event, EventFilter, Executor, TenantFilter};
 use evento_fjall::Fjall;
 
@@ -86,6 +86,11 @@ impl Member {
             })
             // What each node says about itself.
             .label(format!("member-{id}"))
+            // Each follows a key of its own; node 2 node 1's too.
+            .serves(match id {
+                2 => vec!["key-2".to_owned(), "key-1".to_owned()],
+                id => vec![format!("key-{id}")],
+            })
             .open()
             .await?;
         Ok(Self { cluster, executor })
@@ -201,6 +206,40 @@ async fn a_write_on_one_node_is_read_on_another() {
             (0, Some("member-0".to_owned())),
             (2, Some("member-2".to_owned()))
         ]
+    );
+
+    // And the keys each follows, which work shared out by key goes by.
+    // Within a minute: two nodes up may hear nothing from each other for
+    // seconds while the tests share a disk.
+    let within = Duration::from_secs(60);
+    eventually("every node's keys are heard by every node", || async {
+        nodes.iter().all(|node| {
+            let live = node.cluster.live(within);
+            live.len() == 3 && live.iter().all(|node| node.keys.is_some())
+        })
+    })
+    .await;
+    let live = nodes[1].cluster.live(within);
+    assert!(live[0].serves(Some("key-0")) && !live[0].serves(Some("key-1")));
+    assert!(live[2].serves(Some("key-2")) && live[2].serves(Some("key-1")));
+    assert!(!live[2].serves(None));
+    assert_eq!(
+        nodes[1].cluster.share_serving(Some("key-1"), within),
+        Share { index: 0, of: 2 }
+    );
+    assert_eq!(
+        nodes[2].cluster.share_serving(Some("key-1"), within),
+        Share { index: 1, of: 2 }
+    );
+    // A node counts itself among the nodes of a key it does not follow.
+    assert_eq!(
+        nodes[1].cluster.share_serving(Some("key-0"), within),
+        Share { index: 1, of: 2 }
+    );
+    assert_eq!(nodes[1].cluster.share(within), Share { index: 1, of: 3 });
+    assert_eq!(
+        nodes[1].cluster.health().peers[1].keys,
+        Some(vec![Some("key-2".to_owned()), Some("key-1".to_owned())])
     );
 
     for node in nodes {
@@ -441,8 +480,15 @@ async fn a_node_alone_runs_without_settings() {
         cluster.live(Duration::from_secs(1)),
         [LiveNode {
             id: NodeId(0),
-            label: None
+            label: None,
+            // A store without a default routing key: the node follows the
+            // events written without one.
+            keys: Some(vec![None]),
         }]
+    );
+    assert_eq!(
+        cluster.share_serving(None, Duration::from_secs(1)),
+        Share::ALONE
     );
     assert!(
         !cluster.node().linearizable_reads(),
