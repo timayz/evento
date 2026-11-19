@@ -5,12 +5,14 @@
 //! next open; a node alone runs without settings; peers named by host are
 //! resolved when dialled; the settings and the mark round-trip.
 
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use evento_cluster::host::{RejoinMark, Settings};
+use evento_cluster::keys;
 use evento_cluster::{Cluster, ClusterExecutor, LiveNode, NodeConfig, NodeId, PeerAddr, Share};
 use evento_core::{cursor::Args, Event, EventFilter, Executor, TenantFilter};
 use evento_fjall::Fjall;
@@ -241,6 +243,50 @@ async fn a_write_on_one_node_is_read_on_another() {
         nodes[1].cluster.health().peers[1].keys,
         Some(vec![Some("key-2".to_owned()), Some("key-1".to_owned())])
     );
+
+    for node in nodes {
+        node.cluster.shutdown().await;
+    }
+}
+
+/// Each node writes the keys it serves into the store, so a node that never
+/// heard another say its key still finds it there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_keys_the_nodes_serve_are_kept_in_the_store() {
+    let root = temp_root("keys");
+    let addrs = free_addrs().await;
+    let nodes = open_all(&root, &addrs, 0).await;
+
+    // Side by side, as nodes that start together say theirs: one write of
+    // a key lands, whichever, and the other finds it there.
+    let (first, second, other) = tokio::join!(
+        keys::record(&nodes[0].executor, "eu"),
+        keys::record(&nodes[1].executor, "eu"),
+        keys::record(&nodes[1].executor, "us"),
+    );
+    assert!(first.unwrap() ^ second.unwrap(), "one of the two said eu");
+    assert!(other.unwrap());
+    assert!(!keys::record(&nodes[2].executor, "us").await.unwrap());
+
+    let all: BTreeSet<String> = ["eu", "us"].map(str::to_owned).into();
+    for node in &nodes {
+        // From the node's own copy, whatever handle reads it.
+        eventually("every node reads the keys", || async {
+            keys::known(&node.executor.local_reads()).await.unwrap() == all
+        })
+        .await;
+        assert_eq!(keys::known(&node.executor).await.unwrap(), all);
+    }
+    // The list is of its own type: the streams of the application are not
+    // on it, and it is not among theirs.
+    nodes[0]
+        .executor
+        .write(vec![event("acc", 1)])
+        .await
+        .unwrap();
+    nodes[0].await_count("acc", 1, "the write is read").await;
+    assert_eq!(keys::known(&nodes[0].executor).await.unwrap(), all);
+    assert_eq!(nodes[0].count("eu").await, 0);
 
     for node in nodes {
         node.cluster.shutdown().await;
