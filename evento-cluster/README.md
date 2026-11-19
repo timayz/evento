@@ -25,7 +25,8 @@ see [`examples/bank-axum-cluster`](../examples/bank-axum-cluster) for a runnable
   which routing keys its subscriptions follow (`serves`), and `share` /
   `share_serving` give its place among the nodes up for the work they split.
   `cluster.cover(executor)` has the nodes up run the subscriptions of a routing
-  key whose node is away, and hand them back when it returns.
+  key whose node is away, and hand them back when it returns; a lease per key,
+  taken through the cluster, keeps them on one node at a time.
 - **`ClusterExecutor`** — a drop-in `evento_core::Executor`. Writes are
   coordinated through the cluster (replicated, strictly serializable); reads,
   subscriptions, and snapshots are served from a local evento backend

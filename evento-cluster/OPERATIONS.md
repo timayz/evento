@@ -97,37 +97,73 @@ let covering = cluster
     .cover(executor.local_reads())            // what the subscriptions run on
     .after(Duration::from_secs(60))           // a key this long without a node
     .every(Duration::from_secs(10))           // how often the node looks
+    .lease(Duration::from_secs(30))           // how long a holder is in its right
+    .own_keys()                               // the node's own keys run from here too
     .subscription("payments", |_key| payments())
     .subscription("mails", |_key| mails())
     .start();
-// `covering.covered()`: the keys covered now, for a status page.
+// `covering.covered()`: the keys run now, for a status page.
 // `covering.shutdown().await` before `cluster.shutdown()`.
 ```
 
-Each node writes the keys it serves onto the list above and, every `every`, takes
+Each node writes the keys it serves onto the list above and, every `every`, looks for
 the keys on it that no node heard from within `after` serves: they are shared out
-among the nodes up that serve a key (`Share::owns` of the key), so each goes to one.
-That node starts a copy of every subscription it was given, filtered on the key
-(`routing_key(key)`, applied by the cover), and stops them once a node that serves the
-key is heard from again or the share moved the key. A key whose node never returns
-is covered like any other and moves when the nodes up change. The events written
-without a key are not covered for, a node that serves no key takes none on, and
-nothing is taken on or handed back while a node heard from has not said what it
-serves yet.
+among the nodes up that serve a key (`Share::owns` of the key), so each falls to one.
+That node takes the key's **lease** and starts a copy of every subscription it was
+given, filtered on the key (`routing_key(key)`, applied by the cover). It stops them
+once a node that serves the key is heard from again, or another node took the lease.
+The events written without a key are not covered for, a node that serves no key takes
+none on, and nothing is taken on or handed back while a node heard from has not said
+what it serves yet.
+
+**The lease: one node at a time.** Who is up is what each node heard, not something
+agreed, so two nodes can each decide a key is theirs. What they agree on is the
+key's lease (`evento_cluster::lease`): one stream per key, of the type
+`evento-cluster/Lease`, under the key as its id and its routing key. Each event is a
+term and names the node that took the key; taking it is a write through the cluster,
+which one node wins (#565).
+
+- Every `every` the holder asks the cluster whether the lease is still its own — a
+  read barrier, answered only through a majority, with nothing written. Told yes, it
+  is in its right for `lease` from the moment it asked. Told another node took the
+  key, it stops. Not answered by then (it is cut off, or the cluster is that slow),
+  it stops until it is answered again (`cover_lapses`).
+- A node that takes the lease from another waits `lease` before it starts: the time
+  the node before it may still think itself in its right. A key that had a holder
+  therefore changes hands in `after` + `lease`; one never taken is started at once.
+- A lease stays with its holder while that node is up and may run the key. The share
+  only says who takes a lease that is free: a key covered for does not move when the
+  nodes up change, and its node being away is the one thing that makes it move.
+- Keep `lease` at a few `every`s (a holder that misses one answer is not out of time
+  yet), and the same on every node. A stream holds 65 535 versions: as many terms per
+  key.
+
+**A node's own keys.** With `own_keys()` the keys a node serves go through the same
+lease: the cover runs the subscriptions on them too, and the application starts none
+on them itself. A node that returns takes its key back and starts once the node that
+covered for it is done, `lease` later; of several nodes that serve one key, one runs
+its subscriptions at a time. Without it a node's own subscriptions start as soon as
+the node is up, and overlap with its cover until that one hears the node again. Set
+it on every node, or on none.
 
 What it asks of the application:
 
-- **Handlers that bear two nodes at once.** Who is up is what each node heard, not
-  something agreed: two nodes that take each other for gone both take a key on, and
-  a node that returns overlaps with its cover until that one's next look. Nothing
-  fences them.
+- **Handlers that bear the event in hand when the lease is lost.** A subscription is
+  stopped between two events: the handler running when its node's time is up runs to
+  its end, however long that takes. What it writes through the cluster then is not
+  fenced by the lease, and what it does outside the store (a mail sent, a call made)
+  cannot be. The lease counts on the nodes' clocks running at the same pace, as any
+  lease does.
 - **Handlers that bear the key's history again.** A subscription's cursor is local
   to its node: the first time a node takes a key on, each subscription goes through
   that key's events from the start, under its own cursor (`<key>.<subscription>`);
   the next time it goes on from there.
 - **An `after` above the silences between nodes that are up.** A node reports once
   its journal is flushed, so two idle nodes on a loaded disk may hear nothing from
-  each other for seconds. Keep `after` well above that, and above a restart for an
+  each other for seconds. Under `after` a key is taken from a node that is up, which
+  stops and, when it runs its own keys from the cover, takes it back: no event is
+  handled by two nodes at once, but each such round costs two `lease`s without the
+  key's subscriptions. Keep `after` well above that, and above a restart for an
   update: tens of seconds.
 
 **By hand.** Each node needs: its `NodeId`, the membership, a transport bound to its
@@ -268,7 +304,7 @@ Serve it on an HTTP endpoint (see `bank-axum-cluster`'s `/metrics`). Counters:
 | `snapshot_pages` | snapshot pages this node served to joining peers; a joiner pulls one per `snapshot_page_events` / `snapshot_page_bytes` of the contact's store. |
 | `command_pages` | command pages this node served to joining peers: a joiner pulls the contact's un-compacted applied commands one page at a time, before its snapshot pages. |
 | `joins_partial` | joins of this node that failed after a page was installed: the store holds a prefix no contact can complete, and must be emptied before the next join (§7). Steady > 0 = a contact that cannot read its backend, or a link losing pages faster than the per-page retries cover. |
-| `cover_takes` / `cover_hand_backs` | routing keys without a node this node took on (`Cluster::cover`, §2), and those it let go of: a node serving the key was heard from again, the share moved it, or one of its subscriptions stopped on its own. The difference is what the node covers for now (`Covering::covered`). A take per node stopped is expected; **both rising together** = nodes taking each other for gone and back (`after` too short for the silences between them), or a covered subscription that keeps failing (see the log). |
+| `cover_takes` / `cover_hand_backs` / `cover_lapses` | routing keys whose subscriptions this node started (`Cluster::cover`, §2: a key without a node, or its own with `own_keys`), and those it stopped: a node serving the key was heard from again, another node took the key's lease, the lease was not confirmed in time, or one of the subscriptions stopped on its own. Takes less hand-backs is what the node runs now (`Covering::covered`). A take per node stopped is expected; **both rising together** = nodes taking each other for gone and back (`after` too short for the silences between them), or a subscription that keeps failing (see the log). `cover_lapses` counts the hand-backs made because the cluster did not confirm a lease within `lease`: a node cut off from the majority, or a `lease` too short for the cluster's read latency. |
 | `execution_failures` | data-store applies and commit-condition reads that failed. The transaction is neither marked applied nor acknowledged, and is retried on the next drive (a message, or the sweep). Occasional = transient lock contention; **sustained** = this replica's store cannot take writes (full disk, broken connection), so it falls behind until it can. |
 | `own_store_waits` | phases of a write this node coordinated that waited on past `collect_timeout` because the quorum lacked only this node's own answer, and its store was still reading the version condition or enacting the transaction (or the decided ones ahead of it). The write completes in the store's time, and no recovery is started for it (#475). A rising count = this node's store has reads or fsyncs outlasting `collect_timeout` (§8, write latency); look at the disk. |
 | `writes_invalidated` | writes this node coordinated that a recovery invalidated: too few replicas held them in time for them ever to commit — they reached the replicas late (`votes_late` on the replicas) or below a vote fence (`votes_fenced`), or never reached them — so nothing was written (#466). Counted here alone: not in `writes_committed` or `writes_conflicted`, nor on either path. `ClusterExecutor` writes each again as a fresh transaction, up to three attempts in all (#521), so the caller gets `WriteError::Unavailable` with the `Invalidated` cause only when all three were invalidated. Each took a recovery longer than it should; a steady rate means coordinators, or replicas' inboxes, slower than `compaction_margin` (§8, write latency). |

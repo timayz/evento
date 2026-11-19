@@ -76,6 +76,7 @@ pub mod failure_detector;
 pub mod format;
 pub mod host;
 pub mod keys;
+pub mod lease;
 pub mod message;
 pub mod metrics;
 pub mod node;
