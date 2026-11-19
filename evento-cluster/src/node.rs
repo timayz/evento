@@ -34,6 +34,7 @@ use crate::api::{
     Decided, Drained, DurableMark, FenceRecord, Journal, Layout, MessageSink, ShardId, ShardMap,
     StoreBehind, Topology, SLOTS, STABLE_HASH_SEED,
 };
+use crate::claim::with_claims;
 use crate::clock::{Ballot, Clock, HybridLogicalClock, NodeId, Timestamp, TxnId};
 use crate::failure_detector::FailureDetector;
 use crate::message::{
@@ -180,6 +181,16 @@ pub struct NodeConfig {
     /// the pre-seed only shortens the pause, the fenced copy brings whatever
     /// is left. Default 10 s; raise it for a large range.
     pub preseed_timeout: Duration,
+    /// Makes every write that creates a stream also write the stream's
+    /// **claim** (see [`claim`](crate::claim)), so a stream is created once
+    /// whatever routing key each of its creators names it under — routing
+    /// keys of two shards included, which otherwise each end with a stream
+    /// of that id (#570). Costs one more event per stream created, and a
+    /// second shard in the transaction when the routing key's shard is not
+    /// the id's. Set it the same on every node, and before the cluster has a
+    /// second shard: a stream created without a claim is not covered.
+    /// Default `false`.
+    pub stream_claims: bool,
 }
 
 impl Default for NodeConfig {
@@ -206,6 +217,7 @@ impl Default for NodeConfig {
             fence_invalidation: true,
             amnesia_join_timeout: Duration::from_secs(30),
             preseed_timeout: Duration::from_secs(10),
+            stream_claims: false,
         }
     }
 }
@@ -6347,6 +6359,15 @@ impl Node {
         if self.is_joining() {
             return Err(Joining.into());
         }
+        // The claim of every stream the write creates goes in the same
+        // transaction: committed together, or not at all (#570).
+        let claimed;
+        let events = if self.settings.stream_claims {
+            claimed = with_claims(events);
+            claimed.as_slice()
+        } else {
+            events
+        };
         // A command is the unit no page can split: one over the cap could
         // never be repaired onto a replica that missed it.
         let bytes: usize = events.iter().map(snapshot_event_size).sum();

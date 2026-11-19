@@ -197,6 +197,7 @@ timeouts for geo/WAN** deployments.
 | `config_defer_step` | 100 ms | Control-plane anti-dueling delay for concurrent reconfigurations. |
 | `fence_invalidation` | true | Lets a recovery invalidate a transaction one replica compacted past while the others fenced it or hold it uncommitted. Sound only when every replica fences its votes: during a rolling upgrade from a build without the vote fence, set it `false` until the last node is upgraded. |
 | `amnesia_join_timeout` | 30 s | How long a node joining over a lost journal waits for its contact's watermark report to pass its amnesia fence before the join gives up with `FenceNotCovered` (§7, lost journal). Allow `compaction_margin` + three clock skews + a few anti-entropy rounds. |
+| `stream_claims` | false | Makes every write that creates a stream also write the stream's **claim**: one more event, of the type `evento-cluster/Claim:<hash of the stream's type>`, under the stream's id and no routing key. Two creations of one stream under routing keys of two shards then meet in the shard of the stream's id, and the second gets a version conflict; without it each shard ends with a stream of that id (#570). Costs one event per stream created, and a second shard in the transaction when the routing key's shard is not the id's. Set it on every node, before the cluster has a second shard: a stream created without a claim is not covered. |
 
 Clock-skew tolerance is on the clock: `HybridLogicalClock::with_max_skew(..)` (default
 `MAX_SKEW_MICROS`); keep `recovery_timeout`/`compaction_margin` above it. The node
@@ -976,6 +977,16 @@ under *another* node's default is the one read a by-id load cannot fence: pass i
 routing key. A read with an explicit routing key fences each aggregate id its filters
 name under it, or — a scan of the region, no id named — the routing key itself, which
 waits on every write under it.
+
+A stream's shard is its routing key's, so two nodes that create one stream at once
+under routing keys of **two shards** each commit: the stream then exists once in each
+shard, with another first event, and a uniqueness claim made with
+`original_version(0)` does not hold across shards (#570). Name such a stream under one
+routing key everywhere (or none), or set `NodeConfig::stream_claims`: a creation then
+also writes the stream's claim in the shard of its id, the same for every creator, and
+the second creation gets a version conflict. Claims are events of the cluster's own
+(`evento-cluster/Claim:…`): no subscription reads them, a read of the whole event table
+does.
 
 ---
 

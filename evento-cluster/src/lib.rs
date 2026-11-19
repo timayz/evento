@@ -68,6 +68,7 @@
 
 pub mod api;
 pub mod backend;
+pub mod claim;
 pub mod clock;
 pub mod cover;
 pub mod executor;
