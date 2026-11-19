@@ -97,7 +97,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::clock::{system_micros, NodeId, MAX_SKEW_MICROS};
+use crate::clock::{system_micros, NodeId};
 use crate::host::{Cluster, LiveNode};
 use crate::keys;
 use crate::lease;
@@ -451,14 +451,16 @@ impl<E: Executor + Clone> Keeping<E> {
         let (term, start_at) = match held {
             // Taken by this node before: by this process, which let the key
             // go since, or by one before a restart, which may have been
-            // waiting for the holder before it when it stopped. What is
-            // left of that wait is waited, by the stamp of the term.
+            // waiting for the holder before it when it stopped. A term
+            // taken lately is waited for in full: its stamp is when it was
+            // asked for, and the holder before it was in its right until
+            // the term was agreed, some time later.
             Some(lease) if lease.holder == me => {
-                let waited = system_micros().saturating_sub(lease.taken_at);
+                let age = Duration::from_micros(system_micros().saturating_sub(lease.taken_at));
                 let wait = match lease.term {
                     1 => Duration::ZERO,
-                    _ => (self.lease + Duration::from_micros(MAX_SKEW_MICROS))
-                        .saturating_sub(Duration::from_micros(waited)),
+                    _ if age >= self.lease * 2 => Duration::ZERO,
+                    _ => self.lease,
                 };
                 (lease.term, now + wait)
             }
