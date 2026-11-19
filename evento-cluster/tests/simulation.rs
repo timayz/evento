@@ -327,7 +327,8 @@ impl SimStore {
         let mut events: Vec<(u16, u64)> = self
             .committed_events()
             .into_iter()
-            .filter(|((_, _, id, _), _)| id == agg)
+            // The stream's own events: its claim shares its id (#570).
+            .filter(|((_, kind, id, _), _)| kind == AGG_TYPE && id == agg)
             .map(|((_, _, _, version), event)| (version, u128::from(event) as u64))
             .collect();
         events.sort_unstable();
@@ -1050,6 +1051,47 @@ async fn apart<T>(f: impl Future<Output = T>) -> T {
     let out = f.await;
     APART.with(|a| a.set(false));
     out
+}
+
+/// The routing key `agg` was created under, as `store` holds the stream:
+/// its first event's. `None` for a stream the store holds nothing of, or
+/// one created without a routing key.
+async fn created_under(store: &SimStore, agg: &str) -> Option<String> {
+    let events = store.data_store().snapshot().await.ok()?;
+    events
+        .into_iter()
+        .find(|e| e.aggregate_type == AGG_TYPE && e.aggregate_id == agg && e.version == 1)
+        .and_then(|e| e.routing_key)
+}
+
+/// The event a client of `node` writes `agg` at `version` with, as an
+/// application over a node with a default routing key does ([`APART`]): a
+/// stream the node's store holds goes on under the routing key it was
+/// created under, one it holds nothing of is created under the node's own.
+/// Unlike [`Clients::write_events`], which names every write after its
+/// writer: over several shards that would send a later version to a shard
+/// that holds nothing of the stream.
+async fn client_event(node: &Node, store: &SimStore, agg: &str, version: u16, seq: u64) -> Event {
+    let mut event = event(agg, version, seq);
+    if APART.with(Cell::get) {
+        let own = format!("writer{}", node.id().0);
+        event.routing_key = Some(created_under(store, agg).await.unwrap_or(own));
+    }
+    event
+}
+
+/// The key of `agg` as the cluster holds it: [`key_of`], or — writers apart
+/// ([`APART`]) — its id under the routing key it was created under, read
+/// from whichever store holds its first event.
+async fn held_key_of(sim: &Sim, agg: &str) -> Key {
+    if APART.with(Cell::get) {
+        for store in &sim.stores {
+            if let Some(routing_key) = created_under(store, agg).await {
+                return Key::of_stream("", Some(&routing_key), agg);
+            }
+        }
+    }
+    key_of(agg)
 }
 
 /// What a workload's clients record: each write's outcome, for the write
@@ -7005,7 +7047,8 @@ async fn run_reshard(seed: u64, shape: &ReshardConfig) -> ReshardRun {
                 let mut versions = Vec::new();
                 for agg in &targets {
                     let version = version_of(&store, agg).await + 1;
-                    events.push(event(agg, version, seq.fetch_add(1, Ordering::Relaxed)));
+                    let seq = seq.fetch_add(1, Ordering::Relaxed);
+                    events.push(client_event(&node, &store, agg, version, seq).await);
                     versions.push((agg.clone(), version));
                 }
                 if let Ok(Ok(outcome)) =
@@ -7135,7 +7178,7 @@ async fn reshard_violation(
     let member = layout[0][0].0 as usize;
     let acked = acked_versions(history);
     for (agg, &max) in &acked {
-        let key = key_of(agg);
+        let key = held_key_of(sim, agg).await;
         let mut probe = sim.dynamic[member].layout();
         let mut owners = probe.replicas(&key).to_vec();
         let mut last = String::new();
@@ -7194,7 +7237,10 @@ async fn reshard_violation(
                 Ok(events) => events,
                 Err(err) => return Some(format!("{owner:?}'s store: {err:#}")),
             };
-            let mut mine: Vec<&Event> = events.iter().filter(|e| &e.aggregate_id == agg).collect();
+            let mut mine: Vec<&Event> = events
+                .iter()
+                .filter(|e| e.aggregate_type == AGG_TYPE && &e.aggregate_id == agg)
+                .collect();
             mine.sort_by_key(|e| e.version);
             for (i, e) in mine.iter().enumerate() {
                 if e.version as usize != i + 1 {
@@ -7230,16 +7276,9 @@ async fn reshard_live(sim: &Sim, layout: &[Vec<NodeId>], aggs: usize) -> Result<
             let at = members[(attempt as usize + i) % members.len()].0 as usize;
             let (node, store) = sim.live.get(at);
             let version = version_of(&store, &agg).await + 1;
-            match tokio::time::timeout(
-                Duration::from_secs(3),
-                node.write(vec![event(
-                    &agg,
-                    version,
-                    3_000_000 + 100 * i as u64 + attempt,
-                )]),
-            )
-            .await
-            {
+            let seq = 3_000_000 + 100 * i as u64 + attempt;
+            let event = client_event(&node, &store, &agg, version, seq).await;
+            match tokio::time::timeout(Duration::from_secs(3), node.write(vec![event])).await {
                 Ok(Ok(_)) => {
                     wrote = true;
                     break;
@@ -7330,6 +7369,56 @@ async fn one_stream_under_each_writers_routing_key_keeps_every_oracle() {
             let reads = result.assert_ok(&format!("writers apart seed {seed}"));
             assert!(reads > 0, "seed {seed}: no read returned");
         }
+    })
+    .await;
+}
+
+/// A re-sharding run's shape with two shards to start from, writers apart
+/// ([`APART`]) and streams claimed or not.
+fn claims_shape(seed: u64, stream_claims: bool) -> ReshardConfig {
+    let mut shape = ReshardConfig::from_seed(seed);
+    shape.shards = 2;
+    shape.config.stream_claims = stream_claims;
+    shape
+}
+
+/// One stream created under routing keys of two shards (#570): each node
+/// creates a stream it holds nothing of under its own routing key, over two
+/// shards, so a stream's creators name it under keys of both. With claims
+/// ([`NodeConfig::stream_claims`]) it is created once all the same — one
+/// first event, in one shard, one creation acknowledged — while the layout
+/// changes under it: the slot of a stream's routing key and the slot of its
+/// claim move apart, and a creation in flight spans both.
+#[tokio::test(start_paused = true)]
+async fn one_stream_under_routing_keys_of_two_shards_is_created_once() {
+    apart(async {
+        let test = "one_stream_under_routing_keys_of_two_shards_is_created_once";
+        for (seed, _replay) in sim_seeds(test, 0..8) {
+            let shape = claims_shape(seed, true);
+            let run = run_reshard(seed, &shape).await;
+            assert!(
+                run.safety.is_none() && run.liveness.is_none(),
+                "claims seed {seed} ({shape:?}): {run:?}"
+            );
+            assert!(run.acked > 0, "claims seed {seed}: no write acked");
+        }
+    })
+    .await;
+}
+
+/// Without claims the oracles catch it: over these seeds some stream ends
+/// with a first event in each shard, or two clients are told they created
+/// it. What the test above would miss if its workload never raced.
+#[tokio::test(start_paused = true)]
+async fn the_oracles_catch_a_stream_created_in_two_shards() {
+    apart(async {
+        let mut caught = 0;
+        for seed in 0..8 {
+            let run = run_reshard(seed, &claims_shape(seed, false)).await;
+            caught += usize::from(run.safety.is_some());
+        }
+        eprintln!("without claims: {caught} of 8 seeds created a stream in two shards");
+        assert!(caught > 0, "no seed created a stream in two shards");
     })
     .await;
 }
