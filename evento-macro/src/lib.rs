@@ -704,6 +704,32 @@ pub fn subscription_all(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// - `AdminViewCursor` struct with shortened field names
 /// - `impl evento::cursor::Cursor for AdminView`
 /// - `impl evento::sql::Bind for AdminView`
+///
+/// # Named cursors
+///
+/// A struct paged in more than one order names each cursor:
+/// `#[cursor(name(Column::Variant, order))]`. Each name generates a wrapper
+/// (`AdminViewByName` for `by_name`) that derefs to the struct, decodes as it
+/// does, and carries that cursor's `Cursor` and `Bind` impls. A field takes one
+/// attribute per cursor it is part of:
+///
+/// ```rust,ignore
+/// #[derive(FromRow, Cursor)]
+/// pub struct AdminView {
+///     #[cursor(by_name(ContactAdmin::Id, 1))]
+///     #[cursor(by_recently_joined(ContactAdmin::Id, 1))]
+///     pub id: String,
+///     #[cursor(by_name(ContactAdmin::Name, 2))]
+///     pub name: String,
+///     #[cursor(by_recently_joined(ContactAdmin::CreatedAt, 2))]
+///     pub created_at: u64,
+/// }
+/// ```
+///
+/// The flat spelling `#[cursor(name, Column::Variant, order)]` is still read.
+/// Prefer the scoped one: from Rust 1.100, `clippy::duplicated_attributes`
+/// reports a flat column that two cursors of one field share, although each
+/// attribute declares a different cursor.
 #[proc_macro_derive(Cursor, attributes(cursor))]
 pub fn derive_cursor(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -724,9 +750,9 @@ pub fn derive_cursor(input: TokenStream) -> TokenStream {
 /// ```rust,ignore
 /// #[evento::projection(backend = turso, evento::turso::FromRow, Cursor, Debug)]
 /// pub struct AdminView {
-///     #[cursor(by_name, UserAdmin::Id, 1)]
+///     #[cursor(by_name(UserAdmin::Id, 1))]
 ///     pub id: String,
-///     #[cursor(by_name, UserAdmin::Email, 2)]
+///     #[cursor(by_name(UserAdmin::Email, 2))]
 ///     pub email: String,
 ///     pub role: evento::turso::Text<Role>,
 ///     #[turso(rename = "total_recipes_count")]

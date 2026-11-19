@@ -79,16 +79,18 @@ const MIGRATIONS: Migrations = Migrations::new(
 
 #[evento::projection(backend = turso, turso::FromRow, Cursor, Debug)]
 pub struct AdminView {
-    #[cursor(by_recently_joined, UserAdmin::Id, 1)]
-    #[cursor(by_name, UserAdmin::Id, 1)]
+    #[cursor(by_recently_joined(UserAdmin::Id, 1))]
+    #[cursor(by_name(UserAdmin::Id, 1))]
+    // The flat spelling still reads; clippy reports it once two cursors of
+    // one field share a column written that way.
     #[cursor(by_most_recipes, UserAdmin::Id, 1)]
     pub id: String,
-    #[cursor(by_name, UserAdmin::Email, 2)]
+    #[cursor(by_name(UserAdmin::Email, 2))]
     pub email: String,
     pub role: Text<Role>,
     #[cursor(by_most_recipes, UserAdmin::TotalRecipesCount, 2)]
     pub total_recipes_count: i64,
-    #[cursor(by_recently_joined, UserAdmin::CreatedAt, 2)]
+    #[cursor(by_recently_joined(UserAdmin::CreatedAt, 2))]
     pub created_at: u64,
     /// Not a column: set by a handler so the next snapshot removes the row.
     #[turso(default)]

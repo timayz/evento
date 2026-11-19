@@ -48,9 +48,9 @@ const MIGRATIONS: Migrations = Migrations::new(
 
 #[evento::projection(backend = turso, turso::FromRow, Cursor, Debug)]
 pub struct AdminView {
-    #[cursor(by_name, UserAdmin::Id, 1)]
+    #[cursor(by_name(UserAdmin::Id, 1))]
     pub id: String,
-    #[cursor(by_name, UserAdmin::Email, 2)]
+    #[cursor(by_name(UserAdmin::Email, 2))]
     pub email: String,
     pub full_name: String,
 }

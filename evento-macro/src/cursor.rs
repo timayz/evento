@@ -48,8 +48,11 @@ fn parse_backend_attr(attr: &syn::Attribute) -> Result<Option<Backend>> {
 }
 
 /// Parse the #[cursor(...)] attribute
-/// Supports two formats:
-/// - Named: #[cursor(name, Column::Variant, order)]
+/// Supports three formats:
+/// - Named: #[cursor(name(Column::Variant, order))]
+/// - Named, flat: #[cursor(name, Column::Variant, order)] - the older spelling;
+///   clippy's `duplicated_attributes` reads its arguments as a set of flags, and
+///   reports a column that two cursors of one field share
 /// - Unnamed: #[cursor(Column::Variant, order)] - uses "cursor" as default name
 ///   Returns (cursor_name, column_path, order)
 fn parse_cursor_attr(attr: &syn::Attribute) -> Result<Option<(String, syn::Path, usize)>> {
@@ -86,8 +89,23 @@ fn parse_cursor_attr(attr: &syn::Attribute) -> Result<Option<(String, syn::Path,
 
             // Use "cursor" as default name for unnamed format
             Ok(("cursor".to_string(), path, order))
+        } else if input.peek(syn::token::Paren) {
+            // Named format: name(Column::Variant, order)
+            let name = first_ident.to_string();
+
+            let content;
+            syn::parenthesized!(content in input);
+            let path: syn::Path = content.parse()?;
+            content.parse::<syn::Token![,]>()?;
+            let lit: syn::LitInt = content.parse()?;
+            let order: usize = lit.base10_parse()?;
+            if !content.is_empty() {
+                return Err(content.error("expected `name(Column::Variant, order)`"));
+            }
+
+            Ok((name, path, order))
         } else {
-            // Named format: name, Column::Variant, order
+            // Flat named format: name, Column::Variant, order
             let name = first_ident.to_string();
 
             input.parse::<syn::Token![,]>()?;
@@ -472,7 +490,7 @@ pub fn cursor_impl(input: &DeriveInput) -> Result<TokenStream> {
     if cursor_groups.is_empty() {
         return Err(syn::Error::new_spanned(
             struct_name,
-            "No fields marked with #[cursor] attribute. Add #[cursor(name, Column::Variant, order)] to at least one field.",
+            "No fields marked with #[cursor] attribute. Add #[cursor(name(Column::Variant, order))] to at least one field.",
         ));
     }
 
