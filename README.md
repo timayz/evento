@@ -399,6 +399,16 @@ removing it on success. The SQL, Turso and Fjall stores keep them (SQL: migratio
 on a cluster they are per node, like cursors; a bare remote client does not keep them — put
 it behind a `Sidecar`.
 
+`.supervised()` has the worker deal with the failures that are not one event's — the store
+away, a handler that cannot work for a while, a handler that panics. Instead of stopping
+with `Failed` after its retries, it waits and goes on from its cursor, at the event that
+failed. The wait starts at one second and doubles up to five minutes while it fails again
+soon after (`.restart_backoff(min, max)`), and `subscription.state()` says how it stands: a
+[`State`](https://docs.rs/evento/latest/evento/subscription/enum.State.html) of `Running`,
+`Restarting { error, since, attempts }` — one run of trouble however many restarts it
+takes — or `Stopped(reason)`. It still stops on a shutdown (which cuts the wait short),
+when a handler asks, and when another worker takes its key.
+
 `subscription.lag().await?` says how far behind a subscription is, now: a
 [`Lag`](https://docs.rs/evento/latest/evento/subscription/struct.Lag.html) with `behind`
 (the seconds between the event its cursor is at and the newest event it follows) and
@@ -773,6 +783,8 @@ plus the [`bank-axum-cluster`](examples/bank-axum-cluster) 3-node demo.
 | List / retry the events given up on | `exec.dead_letters(key, limit)` / `builder.redeliver(exec, &letter)` |
 | Stop on a payload that does not decode (default: skip it) | `.on_undecodable(Undecodable::Stop)` |
 | Notice a stopped subscription | `subscription.stopped().await` → `StopReason` |
+| Keep a subscription going after a failure | `.supervised()` (+ `.restart_backoff(min, max)`) |
+| How a subscription stands (status page) | `subscription.state()` → `State::{Running, Restarting, Stopped}` |
 | How far behind a subscription is, now | `subscription.lag().await?` / `builder.lag(exec).await?` → `Lag` |
 | Live bridge (SSE/WebSocket) | `.live(exec)` = `.ephemeral().start_from_latest().start(exec)` |
 | Skip history on a new subscription | `.start_from_latest()` |

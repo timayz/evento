@@ -710,6 +710,7 @@ impl<E: Executor, P: Snapshot<E> + Default + 'static> Projection<E, P> {
             routing_key: None,
             chunk_size: 300,
             retry: Some(30),
+            restart: None,
             shutdown_grace: None,
             delay: None,
             continue_on_error: false,
@@ -998,6 +999,7 @@ pub struct ProjectionSubscription<E: Executor, P: Default + 'static> {
     routing_key: Option<RoutingKey>,
     chunk_size: u16,
     retry: Option<u8>,
+    restart: Option<(Duration, Duration)>,
     shutdown_grace: Option<Option<Duration>>,
     delay: Option<Duration>,
     continue_on_error: bool,
@@ -1040,6 +1042,23 @@ where
     /// Disables retries.
     pub fn no_retry(mut self) -> Self {
         self.retry = None;
+        self
+    }
+
+    /// Keeps the worker going after a pass that failed past its retries, and
+    /// after a handler's panic: it goes on from its cursor after a growing
+    /// delay, and [`Subscription::state`] says how it stands. See
+    /// [`SubscriptionBuilder::supervised`].
+    pub fn supervised(mut self) -> Self {
+        self.restart
+            .get_or_insert(subscription::DEFAULT_RESTART_BACKOFF);
+        self
+    }
+
+    /// [`supervised`](Self::supervised), with the first delay and the most
+    /// it grows to; see [`SubscriptionBuilder::restart_backoff`].
+    pub fn restart_backoff(mut self, min: Duration, max: Duration) -> Self {
+        self.restart = Some((min, max));
         self
     }
 
@@ -1102,6 +1121,7 @@ where
             routing_key,
             chunk_size,
             retry,
+            restart,
             shutdown_grace,
             delay,
             continue_on_error,
@@ -1150,6 +1170,9 @@ where
             Some(n) => builder.retry(n),
             None => builder.no_retry(),
         };
+        if let Some((min, max)) = restart {
+            builder = builder.restart_backoff(min, max);
+        }
         builder = match shutdown_grace {
             Some(Some(grace)) => builder.shutdown_grace(grace),
             Some(None) => builder.no_shutdown_grace(),
