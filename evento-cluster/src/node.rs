@@ -112,10 +112,11 @@ pub struct NodeConfig {
     pub max_apply_batch: usize,
     /// How long journal records nothing waits on may stay staged before they
     /// are flushed on their own (#530). A batch of messages, or of applies,
-    /// that leaves nothing to send — this node's own coordination is
-    /// answered without the journal, see [`Node::start`] — is not flushed at
-    /// once: its records ride the next flush something does wait on, or this
-    /// one. Zero flushes every batch, as before #530.
+    /// that leaves nothing to send that waits on the journal — a `ReadOk`
+    /// and an `Applied` do not (#561), and this node's own coordination is
+    /// answered directly, see [`Node::start`] — is not flushed at once: its
+    /// records ride the next flush something does wait on, or this one.
+    /// Zero flushes every batch, as before #530.
     pub lazy_flush: Duration,
     /// Suspicion threshold for the phi-accrual failure detector: a coordinator
     /// whose φ exceeds this is presumed dead and its stalled transactions are
@@ -2509,13 +2510,14 @@ impl Node {
     /// version conditions and answers; the applier applies the decided,
     /// ready transactions, up to
     /// [`max_apply_batch`](NodeConfig::max_apply_batch) in one write to the
-    /// store, and acknowledges them once their records are flushed. A store
+    /// store, and acknowledges them once the store took them (#561). A store
     /// whose fsyncs stall thus delays its own acknowledgements alone — never
     /// the votes and reads of the batch behind it, which a coordinator's
     /// deadline would otherwise expire on.
     ///
     /// **No flush nothing waits on (#530):** a batch that leaves nothing to
-    /// send is not flushed at once (see [`release`](Self::release)); the
+    /// send that waits on the journal — past a vote, every batch of a write
+    /// (#561) — is not flushed at once (see [`release`](Self::release)); the
     /// lazy flusher, a third task that stops with the other two, flushes
     /// what stayed staged within [`lazy_flush`](NodeConfig::lazy_flush).
     pub fn start(&self, mut inbox: mpsc::Receiver<Envelope>) -> JoinHandle<()> {
@@ -2556,8 +2558,9 @@ impl Node {
         })
     }
 
-    /// Ends a batch of handled messages, or of applies: flushes the journal,
-    /// then performs the batch's durability-gated `sends`.
+    /// Ends a batch of handled messages, or of applies: performs the `sends`
+    /// no flush guards ([`waits_for_flush`](Self::waits_for_flush)), flushes
+    /// the journal, then performs the batch's durability-gated `sends`.
     ///
     /// The sends are only released once the fsync succeeds. If the flush
     /// fails (e.g. a disk error), they are withheld — a node that could not
@@ -2565,17 +2568,26 @@ impl Node {
     /// exactly the message loss quorums/recovery already tolerate, so the
     /// cluster makes progress via durable peers.
     ///
-    /// **With nothing to send, nothing waits on the flush, and it is put
-    /// off** (#530): the batch's records stay staged for the next flush
-    /// something does wait on, or the lazy flusher's. That is the batch of a
-    /// node's own coordination past its vote — its `ReadOk` and `Applied`
-    /// are answered without the journal (see [`answer`](Self::answer)) — so
-    /// a write a node coordinates costs its journal one fsync, the vote's,
-    /// not one per phase. Losing staged records to a crash is losing a batch
+    /// **With nothing to send that waits on it, the flush is put off**
+    /// (#530): the batch's records stay staged for the next flush something
+    /// does wait on, or the lazy flusher's. That is every batch of a write
+    /// past its vote — a `ReadOk` and an `Applied` leave without the journal
+    /// ([`waits_for_flush`](Self::waits_for_flush), #561; the node's own
+    /// coordination is handed them directly, see [`answer`](Self::answer))
+    /// — so a write costs a replica's journal one fsync, the vote's, not
+    /// one per phase. Losing staged records to a crash is losing a batch
     /// before its flush, which could always happen: no reply left the node
     /// on their account, and a restart recovers the transactions from what
     /// the journal does hold, as it does one whose apply it forgot (#309).
     async fn release(&self, sends: Vec<(NodeId, Message)>) {
+        // What no flush guards leaves first (#561), ahead of the sync the
+        // rest of the batch waits on.
+        let (sends, free): (Vec<_>, Vec<_>) = sends
+            .into_iter()
+            .partition(|(_, message)| Self::waits_for_flush(message));
+        for (to, message) in free {
+            self.send(to, message).await;
+        }
         if sends.is_empty() && !self.settings.lazy_flush.is_zero() {
             self.lazy.deferred.fetch_add(1, Ordering::AcqRel);
             self.lazy.wake.notify_one();
@@ -2591,6 +2603,32 @@ impl Node {
                 "journal flush failed; withholding durability-gated sends"
             );
         }
+    }
+
+    /// Whether `message`, a reply of this replica, leaves only once the
+    /// record staged behind it is durable. Every reply does but two (#561),
+    /// whose reader relies on nothing the journal holds:
+    ///
+    /// - **`ReadOk`**, the answer to a `Commit`. The record behind it is the
+    ///   commit, which a quorum of durable votes already determines: a
+    ///   replica that forgets it across a restart holds its vote again, as
+    ///   one the `Commit` never reached, and is committed again by a
+    ///   recovery or by what its peers applied. The read result was never
+    ///   durable — a restart reads again ([`Replica::restore`]) — and reads
+    ///   the same, the order of execution being the votes'.
+    /// - **`Applied`**, sent once the data store took the transaction. It
+    ///   says the effect is in the store, which persists an apply before it
+    ///   returns; the applied record behind it is what a *report* counts
+    ///   (#331), and a report flushes the journal before it leaves
+    ///   ([`vouch_durably`](Self::vouch_durably), or its batch's flush). A restart that
+    ///   lost the record applies again, over a store that
+    ///   [holds](DataStore::holds) the events already.
+    ///
+    /// The node's own coordination was answered so since #475; a peer's now
+    /// is too. A vote, an accept and a promise to a recovery wait as
+    /// before: they are what the rest is re-derived from.
+    fn waits_for_flush(message: &Message) -> bool {
+        !matches!(message, Message::ReadOk { .. } | Message::Applied { .. })
     }
 
     /// Flushes the journal: whether everything staged before the call is
@@ -2642,19 +2680,17 @@ impl Node {
     }
 
     /// The applier loop (see [`start`](Self::start)): enacts the decided,
-    /// ready transactions a batch at a time, flushing the journal and
-    /// sending the batch's acknowledgements before the next, so an
-    /// acknowledgement never waits behind a later batch's write to the
-    /// store. Sleeps
+    /// ready transactions a batch at a time, sending the batch's
+    /// acknowledgements before the next, so an acknowledgement never waits
+    /// behind a later batch's write to the store. Sleeps
     /// until woken (`applier`) once nothing is ready, or once an apply the
     /// store failed is to be retried by the next drive (the sweep's, or a
     /// message's). Runs until `stop` is set and it is woken.
     async fn run_applier(self, stop: Arc<AtomicBool>) {
         loop {
             match self.apply_next().await {
-                // As `handle`: an acknowledgement is only sent once the
-                // record behind it is durable; withheld, it is the loss
-                // recovery already tolerates.
+                // An acknowledgement leaves once the store took the
+                // transaction; what a freed read answers goes with it.
                 Some(sends) => self.release(sends).await,
                 None => {
                     if stop.load(Ordering::Acquire) {
@@ -3717,25 +3753,14 @@ impl Node {
     /// apply or a read the data store failed is only attempted again by the
     /// next drive, and a quiet group may receive no message to trigger one.
     /// The applier is woken for the applies; the reads run here and, like
-    /// [`handle`](Self::handle), their answers wait for the journal.
+    /// the applier's, their answers go through [`release`](Self::release).
     /// (`next_apply`/`next_read` reserve what they hand out, so this cannot
     /// race the inbox loop or the applier into executing anything twice.)
     async fn redrive(&self) {
         self.wake_applier();
         let sends = self.drive_reads().await;
-        if sends.is_empty() {
-            return;
-        }
-        if self.sync_journal().await.is_ok() {
-            self.metrics.record_flush();
-            for (to, message) in sends {
-                self.send(to, message).await;
-            }
-        } else {
-            tracing::warn!(
-                node = self.id.0,
-                "journal flush failed; withholding durability-gated sends"
-            );
+        if !sends.is_empty() {
+            self.release(sends).await;
         }
     }
 
@@ -6153,8 +6178,8 @@ impl Node {
     /// [`start`](Self::start)): `None` when nothing is ready, or when the
     /// store failed the first apply — it stays decided and un-applied, for
     /// the next drive (a message's, or the sweep's) to retry. Stages its
-    /// journal writes and returns the (durability-gated) acknowledgements to
-    /// send once the caller has flushed; one for this node's own
+    /// journal writes and returns the acknowledgements for the caller to
+    /// [`release`](Self::release); one for this node's own
     /// coordination is answered at once (see [`answer`](Self::answer)).
     ///
     /// The transactions ready together depend on none of each other (a
@@ -6368,7 +6393,7 @@ impl Node {
     /// whose dependencies are satisfied, lowest order first, and answers its
     /// version condition to whoever drives its commit. Run after any Commit,
     /// since it can make a transaction ready, and after every apply. Returns
-    /// the (durability-gated) answers to send once the caller has flushed;
+    /// the answers for the caller to [`release`](Self::release);
     /// one for this node's own coordination is answered at once (see
     /// [`answer`](Self::answer)). Costs reads of the store only: the applies
     /// are the applier's (see [`start`](Self::start)).
@@ -6417,15 +6442,16 @@ impl Node {
     }
 
     /// Queues `message`, this replica's answer to the coordination `to`
-    /// drives, among the sends `out` that go once the batch is durable — or,
-    /// `to` being this node, hands it to that coordination **now** (#475).
-    /// Through the inbox it would wait for the batch's flush, and before
-    /// #475 for the batch's applies, while the coordination's deadline ran:
-    /// a node alone in its group then timed its own reads out and recovered
-    /// what nobody had refused. What it answers needs no flush first: a read
-    /// result is re-derived by any recovery, and an apply is in the store
-    /// before it is acknowledged; the record that goes with either is
-    /// flushed by the batch all the same.
+    /// drives, among the sends `out` of the batch — or, `to` being this
+    /// node, hands it to that coordination **now** (#475). Through the inbox
+    /// it would wait for the batch, and before #475 for the batch's applies,
+    /// while the coordination's deadline ran: a node alone in its group then
+    /// timed its own reads out and recovered what nobody had refused. What
+    /// it answers needs no flush first, for a peer either (#561, see
+    /// [`waits_for_flush`](Self::waits_for_flush)): a read result is
+    /// re-derived by any recovery, and an apply is in the store before it is
+    /// acknowledged; the record that goes with either is flushed with the
+    /// next batch that waits on the journal, or by the lazy flusher.
     fn answer(&self, out: &mut Vec<(NodeId, Message)>, to: NodeId, message: Message) {
         if to != self.id {
             out.push((to, message));
@@ -10693,8 +10719,8 @@ impl Node {
                 }
             }
         }
-        // As the applier's: an acknowledgement leaves once the record behind
-        // it is durable. Those of a round that stopped short go too — what
+        // As the applier's: an acknowledgement leaves once the store took
+        // the transaction. Those of a round that stopped short go too — what
         // it imported is applied.
         if !acks.is_empty() {
             self.release(acks).await;
@@ -14369,6 +14395,92 @@ mod tests {
             node.replica.lock().unwrap().applied_result(txn),
             Some(false)
         );
+    }
+
+    /// Issue #561: a write costs the journal of a replica that does not
+    /// coordinate it one flush, its vote's, as it does the coordinator's
+    /// (#530). The answer to its `Commit` and the acknowledgement of its
+    /// apply leave without one: nothing their reader relies on is in the
+    /// record behind them, which the lazy flusher flushes.
+    #[tokio::test(start_paused = true)]
+    async fn a_write_costs_a_peers_journal_one_flush() {
+        let node_id = NodeId(0);
+        let coord = NodeId(9);
+        let ids = vec![node_id, NodeId(1), coord];
+        let net = InMemoryNetwork::new();
+        let inbox = net.register(node_id);
+        let mut coord_inbox = net.register(coord);
+        let journal = Arc::new(CountingJournal::default());
+        let config = NodeConfig::default();
+        let node = Node::new(
+            node_id,
+            Arc::new(StaticTopology::new(node_id, ids)) as Arc<dyn Topology>,
+            Arc::new(HybridLogicalClock::new(node_id)),
+            Arc::new(net.sink(node_id)) as Arc<dyn MessageSink>,
+            Arc::new(InMemoryDataStore::new()) as Arc<dyn DataStore>,
+            Arc::clone(&journal) as Arc<dyn Journal>,
+        )
+        .with_config(config);
+        let _loop = node.start(inbox);
+        let flushes = || journal.flushes.load(Ordering::SeqCst);
+        let sink = net.sink(coord);
+        let Message::PreAccept {
+            txn, keys, events, ..
+        } = preaccept(0)
+        else {
+            unreachable!()
+        };
+
+        sink.send(
+            node_id,
+            Message::PreAccept {
+                epoch: 0,
+                txn,
+                keys: keys.clone(),
+                events: events.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let vote = coord_inbox.recv().await.expect("a vote");
+        assert!(matches!(vote.message, Message::PreAcceptOk { .. }));
+        assert_eq!(flushes(), 1, "the vote waits on the journal");
+
+        sink.send(
+            node_id,
+            Message::Commit {
+                epoch: 0,
+                txn,
+                execute_at: txn.0,
+                deps: Vec::new(),
+                keys,
+                events,
+                reply_to: coord,
+            },
+        )
+        .await
+        .unwrap();
+        let read = coord_inbox.recv().await.expect("a read");
+        assert!(matches!(
+            read.message,
+            Message::ReadOk {
+                condition: Condition::Holds,
+                ..
+            }
+        ));
+        sink.send(node_id, Message::Apply { txn, commit: true })
+            .await
+            .unwrap();
+        let applied = coord_inbox.recv().await.expect("an acknowledgement");
+        assert!(matches!(applied.message, Message::Applied { .. }));
+        assert_eq!(
+            flushes(),
+            1,
+            "the read and the acknowledgement left without a flush"
+        );
+
+        tokio::time::sleep(config.lazy_flush + Duration::from_millis(1)).await;
+        assert_eq!(flushes(), 2, "the lazy flusher flushed their records");
     }
 
     /// A custom [`NodeConfig`] is honoured end to end: a small group-commit batch

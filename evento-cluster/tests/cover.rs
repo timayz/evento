@@ -83,7 +83,19 @@ impl<E: Executor> Handler<E> for Recorder {
     }
 }
 
+/// A tracing subscriber over `RUST_LOG`, to debug a test; nothing without it.
+fn init_tracing() {
+    if std::env::var_os("RUST_LOG").is_none() {
+        return;
+    }
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
 fn temp_root(test: &str) -> PathBuf {
+    init_tracing();
     let dir = std::env::temp_dir().join(format!("evento-cover-{}-{test}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
