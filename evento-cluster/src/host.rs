@@ -44,6 +44,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::api::ConfigEntry;
 use crate::backend::ClusterBackend;
 use crate::clock::{HybridLogicalClock, NodeId};
 use crate::executor::{ClusterExecutor, ExecutorDataStore};
@@ -299,12 +300,19 @@ pub enum RejoinMark {
     /// an older copy of itself ([`JournalRolledBack`](crate::JournalRolledBack)).
     /// The node comes back under the amnesia fence, as over a lost journal.
     DiscardJournal,
+    /// The node is new to the cluster, over a store and a journal that held
+    /// nothing: it copies the store once a member added it
+    /// ([`Cluster::add_node`], [`Cluster::replace_node`]). Left by the host
+    /// at the node's first open and until its copy is done; an open that
+    /// finds the copy done in the journal removes it and empties nothing.
+    New,
 }
 
 impl RejoinMark {
     const FILE: &'static str = "rejoin";
     const KEEP: &'static str = "keep-journal";
     const DISCARD: &'static str = "discard-journal";
+    const NEW: &'static str = "new";
 
     /// The mark's file under `state_dir`.
     pub fn path(state_dir: &Path) -> PathBuf {
@@ -324,28 +332,37 @@ impl RejoinMark {
             // An empty mark, left by an older host or by hand: keep the journal.
             "" | Self::KEEP => Ok(Some(Self::KeepJournal)),
             Self::DISCARD => Ok(Some(Self::DiscardJournal)),
+            Self::NEW => Ok(Some(Self::New)),
             other => anyhow::bail!(
-                "{} holds {other:?}; expected {:?} or {:?}",
+                "{} holds {other:?}; expected {:?}, {:?} or {:?}",
                 path.display(),
                 Self::KEEP,
-                Self::DISCARD
+                Self::DISCARD,
+                Self::NEW
             ),
         }
     }
 
     /// Leaves the mark under `state_dir` (creating the directory), so the
     /// next open copies the store from a peer. A stronger mark is never
-    /// weakened: a `DiscardJournal` stays when `KeepJournal` is written over it.
+    /// weakened: a `DiscardJournal` stays when `KeepJournal` is written over
+    /// it, and either stays when `New` is.
     pub fn write(self, state_dir: &Path) -> anyhow::Result<PathBuf> {
         std::fs::create_dir_all(state_dir)
             .with_context(|| format!("cannot create {}", state_dir.display()))?;
         let path = Self::path(state_dir);
-        if self == Self::KeepJournal && Self::read(state_dir)? == Some(Self::DiscardJournal) {
+        let strength = |mark: Self| match mark {
+            Self::New => 0,
+            Self::KeepJournal => 1,
+            Self::DiscardJournal => 2,
+        };
+        if Self::read(state_dir)?.is_some_and(|held| strength(held) > strength(self)) {
             return Ok(path);
         }
         let text = match self {
             Self::KeepJournal => Self::KEEP,
             Self::DiscardJournal => Self::DISCARD,
+            Self::New => Self::NEW,
         };
         std::fs::write(&path, text).with_context(|| format!("cannot write {}", path.display()))?;
         Ok(path)
@@ -452,6 +469,36 @@ pub struct Members {
     pub epoch: u64,
     /// The nodes that count, by id: a majority of them decides.
     pub nodes: Vec<NodeId>,
+    /// The change of members decided and not done yet, if any: `nodes`
+    /// stand until it is.
+    pub change: Option<Change>,
+}
+
+/// A change of members the cluster decided and has not done yet
+/// ([`Cluster::remove_node`], [`Cluster::replace_node`]): the members stay
+/// what they were while the writes in flight when it was decided are
+/// finished and the node it brings in copies the store. The nodes carry it
+/// through among themselves, whoever asked for it and whoever is restarted
+/// meanwhile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Change {
+    /// The members once it is done.
+    pub to: Vec<NodeId>,
+    /// What it still waits for; empty a moment before it is done.
+    pub waits_for: Vec<Wait>,
+}
+
+/// What a [`Change`] waits for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wait {
+    /// The writes in flight when the change was decided are not known to
+    /// be finished yet: a matter of seconds while a majority of the members
+    /// is up.
+    Drain,
+    /// This node, which the change brings in, has not copied the store
+    /// yet: it is to be started, or still copying.
+    Copy(NodeId),
 }
 
 /// This node, for a status page and the log.
@@ -467,6 +514,11 @@ pub struct NodeHealth {
     pub backlog: (usize, usize),
     /// The other nodes, as this one sees them.
     pub peers: Vec<PeerState>,
+    /// Whether this node is a member of the cluster as it stands. `false`
+    /// once it was removed ([`Cluster::remove_node`],
+    /// [`Cluster::replace_node`]): it takes no part any more, and is to be
+    /// stopped.
+    pub member: bool,
     /// With peers, whether they confirmed the journal is current; alone,
     /// always. Until then the node refuses writes.
     pub confirmed: bool,
@@ -490,9 +542,11 @@ pub struct NodeHealth {
 }
 
 impl NodeHealth {
-    /// Whether the node takes writes: confirmed, and nothing ended its part.
+    /// Whether the node takes writes: a member, confirmed, and nothing ended
+    /// its part.
     pub fn serving(&self) -> bool {
-        self.confirmed
+        self.member
+            && self.confirmed
             && !self.rejoin_required
             && !self.rolled_back
             && !self.founded_apart
@@ -673,7 +727,13 @@ impl<E: ClusterBackend> Builder<E> {
             Some((_, entry)) => entry.live().shards.iter().flatten().copied().collect(),
             None => founders.clone(),
         };
-        let member = members.contains(&id);
+        // A node a change in progress brings in is of the cluster too.
+        let coming = matches!(
+            decided.last(),
+            Some((_, ConfigEntry::Transition { pending, .. }))
+                if pending.shards.iter().flatten().any(|&node| node == id)
+        );
+        let member = members.contains(&id) || coming;
         let has_peers = ids.len() > 1 || members.len() > 1;
 
         let mut mark = match &state_dir {
@@ -699,6 +759,24 @@ impl<E: ClusterBackend> Builder<E> {
             );
         }
 
+        if let (Some(RejoinMark::New), Some(dir)) = (mark, state_dir.as_deref()) {
+            // The copy a new node came in by is done once its journal says
+            // it joined past the fence it opened under: the store is whole,
+            // and this open is any member's.
+            let joined = journal
+                .load_amnesia_fence()
+                .await
+                .context("cannot read the journal's fence")?
+                .is_some_and(|fence| fence.joined);
+            if joined {
+                RejoinMark::clear(dir)?;
+                mark = None;
+                tracing::info!(
+                    node = id.0,
+                    "the copy this node came in by was done: nothing is copied again"
+                );
+            }
+        }
         if !member && found {
             anyhow::bail!(
                 "node {} is none of the {} nodes the cluster is founded with (`cluster.founders`): a group is founded over a store by those, and this node is added to it afterwards (`Cluster::add_node`)",
@@ -733,8 +811,8 @@ impl<E: ClusterBackend> Builder<E> {
                 "a node new to a cluster needs a state directory (`Builder::state_dir`) for its rejoin mark",
             )?;
             // Marked first: a restart before the copy is done copies again.
-            RejoinMark::KeepJournal.write(dir)?;
-            mark = Some(RejoinMark::KeepJournal);
+            RejoinMark::New.write(dir)?;
+            mark = Some(RejoinMark::New);
             tracing::info!(
                 node = id.0,
                 "this node is new to the cluster: it copies the store once a member added it"
@@ -919,6 +997,7 @@ impl<E: ClusterBackend> Builder<E> {
             state_dir.clone(),
             copy_pending.clone(),
         ));
+        tasks.push(watch_members(id, topology.clone()));
 
         let executor = ClusterExecutor::new(node.clone(), store);
         if let Some(transport) = &transport {
@@ -1032,14 +1111,27 @@ impl Cluster {
     }
 
     /// The members the cluster agreed on, as this node holds them: the
-    /// layout it was founded with ([`Settings::peers`]), then every change
-    /// decided since, which the journal keeps. A node that was away learns
-    /// the changes it missed a moment after it is back.
+    /// nodes it was founded with ([`Settings::founders`]), then every change
+    /// decided since, which the journal keeps, and the change in progress
+    /// with what it waits for. A node that was away learns the changes it
+    /// missed a moment after it is back.
     pub fn members(&self) -> Members {
         let layout = self.topology.layout();
+        let change = self.node.change_in_progress().map(|change| {
+            let mut waits_for = Vec::new();
+            if !change.drained {
+                waits_for.push(Wait::Drain);
+            }
+            waits_for.extend(change.copying.into_iter().map(Wait::Copy));
+            Change {
+                to: change.to.concat(),
+                waits_for,
+            }
+        });
         Members {
             epoch: layout.epoch(),
             nodes: layout.nodes(),
+            change,
         }
     }
 
@@ -1068,21 +1160,102 @@ impl Cluster {
         node: NodeId,
         addr: impl Into<PeerAddr>,
     ) -> anyhow::Result<Members> {
-        self.reach(node, addr.into()).await?;
+        let to = |members: &[NodeId]| {
+            let mut members = members.to_vec();
+            if !members.contains(&node) {
+                members.push(node);
+            }
+            members
+        };
         let members = self
-            .change(|members| {
-                let mut members = members.to_vec();
-                if !members.contains(&node) {
-                    members.push(node);
-                }
-                members
-            })
+            .change_reaching(node, addr.into(), to)
             .await
             .with_context(|| format!("cannot add node {} to the cluster", node.0))?;
         tracing::info!(
             node = node.0,
             epoch = members.epoch,
             "node added to the cluster"
+        );
+        Ok(members)
+    }
+
+    /// Removes `node` from the cluster: once the change is done it counts
+    /// no more, and a majority is one of the members that stay. Called on
+    /// any member, the node itself included, whether the node runs or is
+    /// gone for good. Returns the members as this node then holds them:
+    /// [`Members::change`] says whether the change is still in progress.
+    ///
+    /// The change is decided at once and done a few seconds later, when
+    /// the writes in flight are finished; meanwhile writes are refused
+    /// ([`WriteError::Unavailable`](evento_core::WriteError::Unavailable))
+    /// and tried again by the caller. A majority of the members as they
+    /// were must be up to decide it, and to finish it: of three nodes with
+    /// one dead, both others. The call returns once it is done, or after
+    /// half a minute with the change left to the nodes.
+    ///
+    /// A node that was removed and still runs takes no part
+    /// ([`NodeHealth::member`]) and is to be stopped; it does not open
+    /// again over its files. Said twice, the removal is done once.
+    pub async fn remove_node(&self, node: NodeId) -> anyhow::Result<Members> {
+        let members = self
+            .change(|members| {
+                members
+                    .iter()
+                    .copied()
+                    .filter(|&member| member != node)
+                    .collect()
+            })
+            .await
+            .with_context(|| format!("cannot remove node {} from the cluster", node.0))?;
+        tracing::info!(
+            node = node.0,
+            epoch = members.epoch,
+            in_progress = members.change.is_some(),
+            "node removed from the cluster"
+        );
+        Ok(members)
+    }
+
+    /// Replaces `node` by `with`, reached at `addr`, in one change: the
+    /// cluster keeps as many members, and at no moment counts one more or
+    /// one less. For a node that is gone for good, or one to be moved to
+    /// another machine under another id. Called on any member that stays.
+    ///
+    /// `with` is a new node, started as one [`add_node`](Self::add_node)
+    /// adds, before or after this call: it copies the store while the
+    /// change is in progress, and the change is done once it has
+    /// ([`Wait::Copy`]). Writes are refused meanwhile, as for a removal:
+    /// start the new node first where that matters. The call returns once
+    /// the change is done, or after half a minute with the change left to
+    /// the nodes ([`Members::change`]). Said twice, it is done once.
+    pub async fn replace_node(
+        &self,
+        node: NodeId,
+        with: NodeId,
+        addr: impl Into<PeerAddr>,
+    ) -> anyhow::Result<Members> {
+        anyhow::ensure!(node != with, "node {} cannot replace itself", node.0);
+        let to = |members: &[NodeId]| {
+            let mut members: Vec<NodeId> = members
+                .iter()
+                .copied()
+                .filter(|&member| member != node)
+                .collect();
+            if !members.contains(&with) {
+                members.push(with);
+            }
+            members
+        };
+        let members = self
+            .change_reaching(with, addr.into(), to)
+            .await
+            .with_context(|| format!("cannot replace node {} by node {}", node.0, with.0))?;
+        tracing::info!(
+            node = node.0,
+            with = with.0,
+            epoch = members.epoch,
+            in_progress = members.change.is_some(),
+            "node replaced in the cluster"
         );
         Ok(members)
     }
@@ -1100,6 +1273,58 @@ impl Cluster {
         Ok(())
     }
 
+    /// The members `to` makes of those that stand, to be proposed; `None`
+    /// when they are that already. An error on a node that is no member, or
+    /// while a change to other members is in progress.
+    fn target(
+        &self,
+        to: &impl Fn(&[NodeId]) -> Vec<NodeId>,
+    ) -> anyhow::Result<Option<Vec<NodeId>>> {
+        let me = self.node.id();
+        let layout = self.topology.layout();
+        anyhow::ensure!(
+            layout.shards().len() == 1,
+            "the cluster has {} shards: its members are changed shard by shard (`Node::change_topology`)",
+            layout.shards().len()
+        );
+        anyhow::ensure!(
+            layout.contains(me),
+            "node {} is no member of the cluster: ask a member",
+            me.0
+        );
+        let live = layout.nodes();
+        let target = to(&live);
+        anyhow::ensure!(!target.is_empty(), "a cluster keeps at least one node");
+        match self.node.change_in_progress() {
+            // The change asked for, decided already: carried through.
+            Some(change) if same_nodes(&change.to.concat(), &target) => Ok(Some(target)),
+            Some(change) => {
+                let to: Vec<u64> = change.to.concat().iter().map(|node| node.0).collect();
+                anyhow::bail!(
+                    "another change of members is in progress, to {to:?}: ask again once it is done"
+                )
+            }
+            None if same_nodes(&live, &target) => Ok(None),
+            None => Ok(Some(target)),
+        }
+    }
+
+    /// [`change`](Self::change) for a change that brings `node` in: where
+    /// it is reached is kept first, unless there is nothing to change, or
+    /// another change is in progress, when no write is taken.
+    async fn change_reaching(
+        &self,
+        node: NodeId,
+        addr: PeerAddr,
+        to: impl Fn(&[NodeId]) -> Vec<NodeId>,
+    ) -> anyhow::Result<Members> {
+        if self.target(&to)?.is_none() {
+            return Ok(self.members());
+        }
+        self.reach(node, addr).await?;
+        self.change(to).await
+    }
+
     /// Changes the members to what `to` makes of them, through the
     /// cluster: decided once whoever asks, and carried through by the nodes
     /// themselves if this one stops meanwhile. Returns once the change is
@@ -1108,32 +1333,9 @@ impl Cluster {
         let me = self.node.id();
         let mut refused = None;
         for _ in 0..CHANGE_ATTEMPTS {
-            let layout = self.topology.layout();
-            anyhow::ensure!(
-                layout.shards().len() == 1,
-                "the cluster has {} shards: its members are changed shard by shard (`Node::change_topology`)",
-                layout.shards().len()
-            );
-            anyhow::ensure!(
-                layout.contains(me),
-                "node {} is no member of the cluster: ask a member",
-                me.0
-            );
-            let live = layout.nodes();
-            let target = to(&live);
-            anyhow::ensure!(!target.is_empty(), "a cluster keeps at least one node");
-            match self.node.change_in_progress() {
-                // The change asked for, decided already: carried through.
-                Some(change) if same_nodes(&change.to.concat(), &target) => {}
-                Some(change) => {
-                    anyhow::bail!(
-                    "another change of members is in progress, to {:?}: ask again once it is done",
-                    change.to.concat().iter().map(|node| node.0).collect::<Vec<_>>()
-                )
-                }
-                None if same_nodes(&live, &target) => return Ok(self.members()),
-                None => {}
-            }
+            let Some(target) = self.target(&to)? else {
+                return Ok(self.members());
+            };
             let epoch = self.node.epoch() + 1;
             let err = match self.node.change_topology(epoch, vec![target.clone()]).await {
                 Ok(_) => return Ok(self.members()),
@@ -1243,7 +1445,8 @@ impl Cluster {
             nodes: members.len(),
             backlog: (self.node.command_count(), self.node.config().max_commands),
             peers: members
-                .into_iter()
+                .iter()
+                .copied()
                 .filter(|&id| id != me)
                 .map(|id| PeerState {
                     id,
@@ -1253,6 +1456,7 @@ impl Cluster {
                     keys: self.node.peer_serves(id).map(|keys| keys.to_vec()),
                 })
                 .collect(),
+            member: self.topology.layout().contains(me),
             confirmed: self.node.confirmed(),
             rejoin_required: self.node.rejoin_required(),
             rolled_back: self.node.rolled_back(),
@@ -1417,6 +1621,42 @@ async fn join_through(node: &Node, contacts: &[NodeId]) -> anyhow::Result<()> {
     outcome
 }
 
+/// Says in the log each change of the members this node installs, and that
+/// the node was removed when one leaves it out.
+fn watch_members(me: NodeId, topology: Arc<dyn Topology>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut seen = topology.layout();
+        loop {
+            tokio::time::sleep(ADDRESS_LOOK).await;
+            let layout = topology.layout();
+            if layout.epoch() == seen.epoch() {
+                continue;
+            }
+            if same_nodes(&layout.nodes(), &seen.nodes()) {
+                // A step of a change: the members stand.
+                seen = layout;
+                continue;
+            }
+            let members: Vec<u64> = layout.nodes().iter().map(|node| node.0).collect();
+            if seen.contains(me) && !layout.contains(me) {
+                tracing::error!(
+                    node = me.0,
+                    epoch = layout.epoch(),
+                    ?members,
+                    "this node was removed from the cluster and takes no part any more: stop it"
+                );
+            } else {
+                tracing::info!(
+                    epoch = layout.epoch(),
+                    ?members,
+                    "the members of the cluster changed"
+                );
+            }
+            seen = layout;
+        }
+    })
+}
+
 /// Keeps the links in line with where the cluster says its nodes are
 /// reached ([`addresses`]): a node added since this one started is in no
 /// settings of its own. The settings stand for the `named` nodes they
@@ -1499,6 +1739,8 @@ fn watch_signals(
                 RejoinMark::DiscardJournal => {
                     "this node's journal is an older copy of itself and the node refuses writes"
                 }
+                // Never left by a signal: a new node's own open leaves it.
+                RejoinMark::New => "this node is new to the cluster",
             };
             match state_dir.as_deref().map(|dir| mark.write(dir)) {
                 Some(Ok(path)) => tracing::error!(
