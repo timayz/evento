@@ -1322,7 +1322,11 @@ scenario on a cluster of one). ✅ **Snapshots + compaction + log truncation** (
   vs slow path, recoveries, compactions, journal flushes, messages handled —
   exposed via `Node::metrics()` (a `MetricsSnapshot`) for export to a backend,
   alongside `tracing` debug events at the same decision points (write outcome,
-  recovery takeover, compaction). A sim test asserts the counters track real
+  recovery takeover, compaction). Two histograms beside the counters time what
+  the node waits on its disk for (#559): each journal flush
+  (`cluster_journal_flush_seconds`) and each write of the applier to the store
+  (`cluster_store_apply_seconds`), so that a disk whose syncs stall reads as
+  one, not as the recoveries and slow paths that follow from it. A sim test asserts the counters track real
   activity (clean commits, a raced conflict, transport/journal traffic).
   ✅ **Performance baseline:** a criterion benchmark (`benches/throughput.rs`,
   `cargo bench`) measures (a) conflict-free write **latency** and (b) **concurrent

@@ -305,7 +305,7 @@ Serve it on an HTTP endpoint (see `bank-axum-cluster`'s `/metrics`). Counters:
 | `compactions` | should advance over time; **flat** = compaction stalled (a partitioned/behind peer holds the watermark) → backlog grows toward `max_commands`. |
 | `watermark_clamps` | reports held back by sync coverage: by more than `compaction_margin`, or by no coverage proven at all — > 0 while a node re-proves its window (post partition-heal/restart — compaction waits for anti-entropy to repair it); **sustained** growth = coverage never accrues (anti-entropy rounds failing) and compaction stays stalled. A report trailing its coverage by an anti-entropy round, as every report in a healthy cluster does, is not counted (#452). |
 | `sync_contact_truncated` | anti-entropy contacts found truncated above what this node vouched for (its proven coverage, and everything below its durable vote fence): the window in between can no longer be shipped to it, and anti-entropy cannot repair it — compaction outran repair, a journal was rolled back unnoticed (§7), or an operator compacted by hand. Counted and logged, not acted on (#453): under a layout change a replica that copied its slots is in that position legitimately — it holds everything below the contact's floor while its fence, raised by its own reports alone, lies below it. A gap that is real surfaces at the next apply on the aggregate (`StoreBehind`, below), which does ask for a rejoin. Outside a layout change, any count = look at the node. Never after a healthy restart, whole-group restarts included: what a node vouched for is in its journal, and a peer compacts no further than the reports it heard (#452). |
-| `journal_flushes` | group-commit activity; **0 while writing** = the journal can't fsync (see §8). |
+| `journal_flushes` | group-commit activity; **0 while writing** = the journal can't fsync (see §8). How long they take is `cluster_journal_flush_seconds`, below. |
 | `messages_handled` | liveness/traffic. |
 | `messages_shed` | inbound backpressure drops; sustained > 0 = a node is overloaded or a peer is flooding. |
 | `peers_absent` | shard peers this node stopped waiting for (`peer_absence_limit`); each is a node that was silent for that long. |
@@ -330,6 +330,18 @@ Serve it on an HTTP endpoint (see `bank-axum-cluster`'s `/metrics`). Counters:
 | `own_store_waits` | phases of a write this node coordinated that waited on past `collect_timeout` because the quorum lacked only this node's own answer, and its store was still reading the version condition or enacting the transaction (or the decided ones ahead of it). The write completes in the store's time, and no recovery is started for it (#475). A rising count = this node's store has reads or fsyncs outlasting `collect_timeout` (§8, write latency); look at the disk. |
 | `writes_invalidated` | writes this node coordinated that a recovery invalidated: too few replicas held them in time for them ever to commit — they reached the replicas late (`votes_late` on the replicas) or below a vote fence (`votes_fenced`), or never reached them — so nothing was written (#466). Counted here alone: not in `writes_committed` or `writes_conflicted`, nor on either path. `ClusterExecutor` writes each again as a fresh transaction, up to three attempts in all (#521), so the caller gets `WriteError::Unavailable` with the `Invalidated` cause only when all three were invalidated. Each took a recovery longer than it should; a steady rate means coordinators, or replicas' inboxes, slower than `compaction_margin` (§8, write latency). |
 | `writes_settled` | writes this node coordinated whose coordination failed a phase — a quorum short at the deadline, a refusal for a higher ballot — and were settled by this node's own recovery (`write settled by recovery` at debug). Each took at least a `collect_timeout`, or a round of recovery, longer than it should; a healthy cluster settles none. |
+
+Histograms, in seconds (#559), with buckets from 1 ms to 10 s
+(`evento_cluster::HISTOGRAM_BOUNDS`); in a `MetricsSnapshot` each is a
+`HistogramSnapshot` (`count`, `sum()`, `over(bound)`):
+
+| `cluster_*_seconds` | Watch for |
+|---------------------|-----------|
+| `journal_flush` | the time of each journal flush, the lazy flusher's and the failed ones included: one sync of the journal's file where something was staged (a flush with nothing staged counts near zero). Every vote and acknowledgement waits on one. On a healthy disk the flushes stay within a few milliseconds; **flushes of 100 ms and more** = the disk stalls, and every write on the node waits that much at each step (§8, write latency). Look here first when writes stop for a second or two while `recoveries` and `slow_path` move: both follow a slow disk (#558), and every node whose journal is on that disk shows the same episodes. |
+| `store_apply` | the time of each write of the applier to the data store: a batch taken in one write (`applies_batched`) or one transaction, the applies the store failed included. One commit of the store. Where the journal is in the store's database (Turso, SQL) it is the same disk, and the same stalls, as `journal_flush`; slow applies **alone** = the store itself (a checkpoint, lock contention, its own disk). |
+
+As PromQL, the share of flushes over 100 ms:
+`1 - rate(cluster_journal_flush_seconds_bucket{le="0.1"}[1m]) / rate(cluster_journal_flush_seconds_count[1m])`.
 
 **Health/readiness.**
 - *Liveness:* a simple `200` while the process is up (`bank-axum-cluster`'s `/health`).
@@ -841,8 +853,8 @@ through `ClusterExecutor`) — split it into several writes.
   node alone in its group commits in its store's time, never in
   `collect_timeout`. Keep the journal on a disk whose fsync tail stays under
   `recovery_timeout`, away from what else restarts or rebuilds beside it; measure
-  (`journal_flushes` against the write rate, and the backend's own statement
-  timings). `synchronous = NORMAL` on SQLite cuts the fsyncs but lets a power loss
+  (`cluster_journal_flush_seconds` and `cluster_store_apply_seconds`, §5, and
+  `journal_flushes` against the write rate). `synchronous = NORMAL` on SQLite cuts the fsyncs but lets a power loss
   take acknowledged writes back (a crash of the process alone does not): weigh it
   against `f` — the group acknowledges a write once `f + 1` journals hold it.
 - **The event store must persist an apply before it returns:** evento-fjall's

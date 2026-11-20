@@ -1,11 +1,93 @@
 //! Lightweight runtime counters for observability.
 //!
 //! A [`Metrics`] holds per-node event counts as plain atomics — cheap to bump on
-//! the hot path. Read a point-in-time view with [`Metrics::snapshot`] (e.g. to
+//! the hot path — and the time of the node's writes to its disk as
+//! [`Histogram`]s. Read a point-in-time view with [`Metrics::snapshot`] (e.g. to
 //! export to a metrics backend, or to assert behaviour in tests). Paired with the
 //! `tracing` events the node emits at the same decision points.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+/// The upper bounds of a [`Histogram`]'s buckets, in seconds: from 1 ms, a
+/// sync on a fast disk, to 10 s. A longer observation counts in the total
+/// alone (Prometheus' `+Inf` bucket).
+pub const HISTOGRAM_BOUNDS: [f64; 13] = [
+    0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
+
+/// The time of one kind of operation, counted by bucket
+/// ([`HISTOGRAM_BOUNDS`]): plain atomics, as the counters are.
+#[derive(Default)]
+pub struct Histogram {
+    /// Observations per bucket, each in the first bucket that holds it (not
+    /// cumulative; the snapshot's rendering adds them up).
+    buckets: [AtomicU64; HISTOGRAM_BOUNDS.len()],
+    count: AtomicU64,
+    sum_nanos: AtomicU64,
+}
+
+impl Histogram {
+    /// Records one operation that took `elapsed`.
+    pub fn observe(&self, elapsed: Duration) {
+        let seconds = elapsed.as_secs_f64();
+        if let Some(bucket) = HISTOGRAM_BOUNDS.iter().position(|bound| seconds <= *bound) {
+            self.buckets[bucket].fetch_add(1, Ordering::Relaxed);
+        }
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.sum_nanos.fetch_add(
+            u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// A consistent-enough point-in-time view.
+    pub fn snapshot(&self) -> HistogramSnapshot {
+        let mut buckets = [0; HISTOGRAM_BOUNDS.len()];
+        for (into, bucket) in buckets.iter_mut().zip(&self.buckets) {
+            *into = bucket.load(Ordering::Relaxed);
+        }
+        HistogramSnapshot {
+            buckets,
+            count: self.count.load(Ordering::Relaxed),
+            sum_nanos: self.sum_nanos.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// An immutable point-in-time view of a [`Histogram`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HistogramSnapshot {
+    /// Observations per bucket of [`HISTOGRAM_BOUNDS`], each counted in the
+    /// first bucket that holds it. One past the last bound is in `count`
+    /// alone.
+    pub buckets: [u64; HISTOGRAM_BOUNDS.len()],
+    /// Observations in all.
+    pub count: u64,
+    /// The observations' total time, in nanoseconds.
+    pub sum_nanos: u64,
+}
+
+impl HistogramSnapshot {
+    /// The observations' total time.
+    pub fn sum(&self) -> Duration {
+        Duration::from_nanos(self.sum_nanos)
+    }
+
+    /// How many observations took more than `bound`, one of
+    /// [`HISTOGRAM_BOUNDS`] as a duration (another is rounded down to the
+    /// bound below it): the count an alert on slow syncs reads.
+    pub fn over(&self, bound: Duration) -> u64 {
+        let seconds = bound.as_secs_f64();
+        let within: u64 = HISTOGRAM_BOUNDS
+            .iter()
+            .zip(&self.buckets)
+            .filter(|(upper, _)| **upper <= seconds)
+            .map(|(_, count)| count)
+            .sum();
+        self.count.saturating_sub(within)
+    }
+}
 
 /// Per-node event counters.
 #[derive(Default)]
@@ -31,8 +113,19 @@ pub struct Metrics {
     pub watermark_clamps: AtomicU64,
     /// Group-commit journal flushes performed.
     pub journal_flushes: AtomicU64,
+    /// The time of each journal flush, the lazy flusher's and the failed
+    /// ones included (#559): a sync of the journal's file where something
+    /// was staged. Every vote and acknowledgement this node sends waits on
+    /// one, so flushes of 100 ms and more are writes that take that much
+    /// longer — a slow disk, on every node that shares it.
+    pub journal_flush_seconds: Histogram,
     /// Transactions the data store took in a write shared with others.
     pub applies_batched: AtomicU64,
+    /// The time of each write of the applier to the data store (#559): a
+    /// batch the store took in one write, or one transaction applied alone,
+    /// the applies the store failed included. One commit of the store each,
+    /// on its own disk's sync.
+    pub store_apply_seconds: Histogram,
     /// Anti-entropy contacts found truncated above what this node vouched
     /// for: the window in between can no longer be shipped to it, so it
     /// cannot be repaired by anti-entropy (compaction outran repair, a
@@ -263,6 +356,17 @@ impl Metrics {
     /// Records a group-commit journal flush.
     pub fn record_flush(&self) {
         self.journal_flushes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a journal flush that took `elapsed`, whether or not it
+    /// succeeded.
+    pub fn record_flush_time(&self, elapsed: Duration) {
+        self.journal_flush_seconds.observe(elapsed);
+    }
+
+    /// Records a write of the applier to the data store that took `elapsed`.
+    pub fn record_store_apply_time(&self, elapsed: Duration) {
+        self.store_apply_seconds.observe(elapsed);
     }
 
     /// Records `count` transactions the data store took in one write.
@@ -526,6 +630,8 @@ impl Metrics {
             cover_hand_backs: self.cover_hand_backs.load(Ordering::Relaxed),
             cover_lapses: self.cover_lapses.load(Ordering::Relaxed),
             cover_cursors_moved: self.cover_cursors_moved.load(Ordering::Relaxed),
+            journal_flush_seconds: self.journal_flush_seconds.snapshot(),
+            store_apply_seconds: self.store_apply_seconds.snapshot(),
         }
     }
 }
@@ -589,6 +695,10 @@ pub struct MetricsSnapshot {
     pub cover_lapses: u64,
     /// See [`Metrics::cover_cursors_moved`].
     pub cover_cursors_moved: u64,
+    /// See [`Metrics::journal_flush_seconds`].
+    pub journal_flush_seconds: HistogramSnapshot,
+    /// See [`Metrics::store_apply_seconds`].
+    pub store_apply_seconds: HistogramSnapshot,
 }
 
 impl MetricsSnapshot {
@@ -851,10 +961,29 @@ impl MetricsSnapshot {
         ]
     }
 
-    /// Renders the counters in Prometheus text exposition format (no labels).
+    /// The histograms, each as `(prometheus name, help text, value)`; as
+    /// [`counters`](Self::counters), the single source of both renderings.
+    fn histograms(&self) -> [(&'static str, &'static str, HistogramSnapshot); 2] {
+        [
+            (
+                "cluster_journal_flush_seconds",
+                "Time of each journal flush; every vote and acknowledgement waits on one.",
+                self.journal_flush_seconds,
+            ),
+            (
+                "cluster_store_apply_seconds",
+                "Time of each write of the applier to the data store: a batch in one write, or one transaction.",
+                self.store_apply_seconds,
+            ),
+        ]
+    }
+
+    /// Renders the metrics in Prometheus text exposition format (no labels).
     ///
     /// Hand-rolled — every counter becomes a `# HELP` / `# TYPE … counter` /
-    /// `name value` stanza. This keeps the crate dependency-free; the operator wires
+    /// `name value` stanza, every histogram a `# TYPE … histogram` one with
+    /// its cumulative `_bucket{le="…"}` lines, its `_sum` (seconds) and its
+    /// `_count`. This keeps the crate dependency-free; the operator wires
     /// the actual `/metrics` HTTP endpoint and serves this string.
     pub fn to_prometheus(&self) -> String {
         self.to_prometheus_labeled(&[])
@@ -882,14 +1011,14 @@ impl MetricsSnapshot {
     /// let text = node.metrics().to_prometheus_labeled(&[("node", &node_id.0.to_string())]);
     /// ```
     pub fn to_prometheus_labeled(&self, labels: &[(&str, &str)]) -> String {
+        let inner = labels
+            .iter()
+            .map(|(k, v)| format!("{k}=\"{}\"", escape_label(v)))
+            .collect::<Vec<_>>()
+            .join(",");
         let label_set = if labels.is_empty() {
             String::new()
         } else {
-            let inner = labels
-                .iter()
-                .map(|(k, v)| format!("{k}=\"{}\"", escape_label(v)))
-                .collect::<Vec<_>>()
-                .join(",");
             format!("{{{inner}}}")
         };
 
@@ -898,6 +1027,32 @@ impl MetricsSnapshot {
             out.push_str(&format!("# HELP {name} {help}\n"));
             out.push_str(&format!("# TYPE {name} counter\n"));
             out.push_str(&format!("{name}{label_set} {value}\n"));
+        }
+        // A bucket's `le` comes after the caller's labels.
+        let le_prefix = if labels.is_empty() {
+            String::new()
+        } else {
+            format!("{inner},")
+        };
+        for (name, help, histogram) in self.histograms() {
+            out.push_str(&format!("# HELP {name} {help}\n"));
+            out.push_str(&format!("# TYPE {name} histogram\n"));
+            let mut cumulative = 0;
+            for (bound, count) in HISTOGRAM_BOUNDS.iter().zip(histogram.buckets) {
+                cumulative += count;
+                out.push_str(&format!(
+                    "{name}_bucket{{{le_prefix}le=\"{bound}\"}} {cumulative}\n"
+                ));
+            }
+            out.push_str(&format!(
+                "{name}_bucket{{{le_prefix}le=\"+Inf\"}} {}\n",
+                histogram.count
+            ));
+            out.push_str(&format!(
+                "{name}_sum{label_set} {}\n",
+                histogram.sum().as_secs_f64()
+            ));
+            out.push_str(&format!("{name}_count{label_set} {}\n", histogram.count));
         }
         out
     }
@@ -937,8 +1092,58 @@ mod tests {
         assert!(text.contains("# TYPE cluster_writes_committed_total counter"));
         assert!(text.contains("\ncluster_writes_committed_total 7\n"));
         assert!(text.contains("\ncluster_messages_shed_total 3\n"));
-        // Every counter renders three lines (HELP, TYPE, sample).
-        assert_eq!(text.lines().count(), snap.counters().len() * 3);
+        // Every counter renders three lines (HELP, TYPE, sample); every
+        // histogram HELP, TYPE, a line per bucket, `+Inf`, the sum and the
+        // count.
+        assert_eq!(
+            text.lines().count(),
+            snap.counters().len() * 3 + snap.histograms().len() * (HISTOGRAM_BOUNDS.len() + 5)
+        );
+    }
+
+    #[test]
+    fn histogram_counts_each_observation_in_its_bucket() {
+        let h = Histogram::default();
+        h.observe(Duration::from_micros(300));
+        h.observe(Duration::from_millis(1));
+        h.observe(Duration::from_millis(4));
+        h.observe(Duration::from_millis(165));
+        h.observe(Duration::from_secs(30));
+        let snap = h.snapshot();
+        assert_eq!(snap.count, 5);
+        assert_eq!(snap.sum(), Duration::from_micros(30_170_300));
+        // 1 ms is within the 1 ms bucket: the bounds are inclusive.
+        assert_eq!(snap.buckets[0], 2);
+        assert_eq!(snap.buckets[2], 1, "4 ms is within 5 ms");
+        assert_eq!(snap.buckets[7], 1, "165 ms is within 250 ms");
+        assert_eq!(snap.buckets.iter().sum::<u64>(), 4, "30 s is past them all");
+        assert_eq!(snap.over(Duration::from_millis(100)), 2);
+        assert_eq!(snap.over(Duration::from_secs(10)), 1);
+    }
+
+    #[test]
+    fn prometheus_renders_a_histogram_cumulative_with_its_sum_and_count() {
+        let m = Metrics::new();
+        m.record_flush_time(Duration::from_millis(4));
+        m.record_flush_time(Duration::from_millis(165));
+        m.record_flush_time(Duration::from_secs(30));
+        let text = m.snapshot().to_prometheus();
+        assert!(text.contains("# TYPE cluster_journal_flush_seconds histogram\n"));
+        assert!(text.contains("\ncluster_journal_flush_seconds_bucket{le=\"0.0025\"} 0\n"));
+        assert!(text.contains("\ncluster_journal_flush_seconds_bucket{le=\"0.005\"} 1\n"));
+        assert!(text.contains("\ncluster_journal_flush_seconds_bucket{le=\"0.1\"} 1\n"));
+        assert!(text.contains("\ncluster_journal_flush_seconds_bucket{le=\"0.25\"} 2\n"));
+        assert!(text.contains("\ncluster_journal_flush_seconds_bucket{le=\"10\"} 2\n"));
+        assert!(text.contains("\ncluster_journal_flush_seconds_bucket{le=\"+Inf\"} 3\n"));
+        assert!(text.contains("\ncluster_journal_flush_seconds_sum 30.169\n"));
+        assert!(text.contains("\ncluster_journal_flush_seconds_count 3\n"));
+        assert!(text.contains("\ncluster_store_apply_seconds_count 0\n"));
+
+        let labeled = m.snapshot().to_prometheus_labeled(&[("node", "1")]);
+        assert!(
+            labeled.contains("\ncluster_journal_flush_seconds_bucket{node=\"1\",le=\"0.25\"} 2\n")
+        );
+        assert!(labeled.contains("\ncluster_journal_flush_seconds_count{node=\"1\"} 3\n"));
     }
 
     #[test]
