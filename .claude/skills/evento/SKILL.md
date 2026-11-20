@@ -393,6 +393,13 @@ sub.shutdown().await?;
   `StoppedByHandler`, `LostOwnership` (another worker claimed the key), `Failed(err)`
   (retries exhausted, no `.continue_on_error()`), or `Panicked`. Await it to notice a
   dead subscription instead of discovering a stale read model later.
+- `.supervised()` replaces a hand-written supervisor: after a pass that failed past `.retry(n)`
+  (or a handler panic) the worker does not stop with `Failed`; it waits (1 s doubling to 5 min,
+  `.restart_backoff(min, max)`) and goes on from its cursor at the failing event. `sub.state()` →
+  `State::Running | Restarting { error, since, attempts } | Stopped(reason)`; consecutive
+  failures are one run (`since` kept, `attempts` counting) until the worker went on for `max`
+  without failing. Shutdown, `ctx.stop()` and `LostOwnership` still stop it. Also on
+  `ProjectionSubscription`. Pair with `.dead_letter()` when one event can be the trouble.
 - `sub.lag().await?` → `Lag { behind, pending_since }`, asked of the store now with the
   subscription's own filters: `behind` = seconds from the cursor's event to the newest event it
   follows, `pending_since` = when the oldest unacknowledged one was written (`.waiting()` = its

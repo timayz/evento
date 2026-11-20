@@ -9,6 +9,7 @@
 //! - [`SubscriptionBuilder`] - Builds and configures event subscriptions
 //! - [`Subscription`] - Handle to a running subscription
 //! - [`StopReason`] - Why a subscription's worker stopped
+//! - [`State`] - How a subscription's worker stands: running, restarting, stopped
 //! - [`Lag`] - How far a subscription is behind the events it follows
 //! - [`Handler`] - Trait for event handlers
 //! - [`Context`] - Handler context with executor access
@@ -27,6 +28,13 @@
 //!
 //! So supervise the handle: [`Subscription::stopped`] resolves with the
 //! [`StopReason`], and [`Subscription::is_finished`] is the non-blocking check.
+//!
+//! Or have the worker supervise itself:
+//! [`supervised`](SubscriptionBuilder::supervised) keeps it going after a
+//! pass that failed past its retries, and after a handler's panic. It goes
+//! on from its cursor after a delay that grows while it keeps failing, and
+//! [`Subscription::state`] says how it stands meanwhile — running, restarting
+//! (the error, since when, how many tries) or stopped.
 //!
 //! Stopping is right when the store is at fault, and wrong for an error about
 //! one event: a subscription serving many tenants would hold all of them back
@@ -185,6 +193,11 @@ use crate::{
     Aggregate, AggregateEvent, DeadLetter, DecodeError, EventFilter, Executor, FromEventError,
     TenantFilter, MAX_DEAD_LETTER_ERROR_LEN,
 };
+
+/// The delay before the first restart of a supervised worker, and the most it
+/// grows to (see [`SubscriptionBuilder::supervised`]).
+pub(crate) const DEFAULT_RESTART_BACKOFF: (Duration, Duration) =
+    (Duration::from_secs(1), Duration::from_secs(5 * 60));
 
 /// Default bound on how long a shutdown waits for the pass in flight.
 const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
@@ -443,6 +456,10 @@ pub struct SubscriptionBuilder<E: Executor> {
     /// [`fault`](Self::fault)).
     fault: Option<FaultFn>,
     retry: Option<u8>,
+    /// The least and the most delay before a worker whose pass failed past
+    /// its retries goes on; `None` stops it there (see
+    /// [`supervised`](Self::supervised)).
+    restart: Option<(Duration, Duration)>,
     /// How long `shutdown` waits for the in-flight pass before abandoning
     /// it; `None` waits for as long as the pass takes.
     shutdown_grace: Option<Duration>,
@@ -687,6 +704,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             poll_interval: Duration::from_millis(250),
             coalesce: Duration::ZERO,
             retry: Some(30),
+            restart: None,
             shutdown_grace: Some(DEFAULT_SHUTDOWN_GRACE),
             chunk_size: 300,
             continue_on_error: false,
@@ -2173,6 +2191,81 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
         self
     }
 
+    /// Keeps the worker of [`start`](Self::start) going after a failure
+    /// that would stop it for good.
+    ///
+    /// A pass that still fails after its [`retry`](Self::retry) ends an
+    /// unsupervised worker with [`StopReason::Failed`], and what it feeds
+    /// goes stale until something starts it again. Supervised, the worker
+    /// waits and goes on from its cursor — at the event that failed, a
+    /// cursor being acknowledged only past the handlers that ran:
+    ///
+    /// - the wait is one second at first and doubles up to five minutes
+    ///   while the worker fails again soon after
+    ///   ([`restart_backoff`](Self::restart_backoff) sets both);
+    /// - [`Subscription::state`] says how it stands meanwhile:
+    ///   [`State::Restarting`] with the error, since when and how many
+    ///   restarts so far, back to [`State::Running`] once a pass went
+    ///   through;
+    /// - failures that follow one another are one run of trouble — an event
+    ///   still poison after ten restarts is one `since` and `attempts: 10`,
+    ///   not ten incidents. The run, and the delay it grew, are forgotten
+    ///   once the worker went on for the longest delay without failing;
+    /// - a panic in a handler is such a failure too, instead of the end of
+    ///   the worker ([`StopReason::Panicked`]), under
+    ///   [`continue_on_error`](Self::continue_on_error) as well. The pass
+    ///   is lost with it, so the events it handled since its last
+    ///   acknowledge ([`ack_every`](Self::ack_every)) are delivered again;
+    /// - [`Subscription::shutdown`] cuts the wait short, and waits for the
+    ///   event in hand as it does on any worker.
+    ///
+    /// The worker still stops when it is told to, when a handler asks
+    /// ([`Context::stop`]) and when another worker takes its key over
+    /// ([`StopReason::LostOwnership`]): none of these is a failure.
+    ///
+    /// This is for the failures that are not one event's — the store away, a
+    /// handler that cannot work for a while. An event that is the trouble
+    /// itself is better taken out of the way where
+    /// [`dead_letter`](Self::dead_letter) is set, or it holds every event
+    /// behind it for as long as it fails. [`run_once`](Self::run_once) is
+    /// not supervised: it returns its error.
+    ///
+    /// ```rust,no_run
+    /// # use evento::subscription::{State, SubscriptionBuilder};
+    /// # async fn run<E: evento::Executor + Clone>(executor: &E) -> anyhow::Result<()> {
+    /// let subscription = SubscriptionBuilder::new("mails")
+    ///     .supervised()
+    ///     .start(executor)
+    ///     .await?;
+    ///
+    /// // On a status page, or a health check:
+    /// match subscription.state() {
+    ///     State::Running => {}
+    ///     State::Restarting { error, since, attempts } => {
+    ///         tracing::warn!(%error, since, attempts, "mails are held up");
+    ///     }
+    ///     State::Stopped(reason) => tracing::error!(%reason, "mails stopped"),
+    ///     _ => {}
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn supervised(mut self) -> Self {
+        self.restart.get_or_insert(DEFAULT_RESTART_BACKOFF);
+
+        self
+    }
+
+    /// [`supervised`](Self::supervised), with the delay before the first
+    /// restart of a run of trouble and the most it doubles up to. Defaults
+    /// are one second and five minutes. `max` is also how long the worker
+    /// has to go on without failing for the run to be forgotten.
+    pub fn restart_backoff(mut self, min: Duration, max: Duration) -> Self {
+        self.restart = Some((min, max.max(min)));
+
+        self
+    }
+
     /// Sets how long [`Subscription::shutdown`] waits for the pass in flight
     /// before abandoning it. Default is 30 seconds.
     ///
@@ -2232,6 +2325,9 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
         // received a value means the task died without recording one —
         // a panic, an abort, or a runtime shutdown.
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(None::<StopReason>);
+        // How a supervised worker stands while it runs: `Running`, or
+        // `Restarting` from a pass that failed until one goes through.
+        let (state_tx, state_rx) = tokio::sync::watch::channel(State::Running);
 
         self.check_dead_letters(&executor).await?;
 
@@ -2273,6 +2369,9 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             let mut gated: Option<Duration> = None;
             // When the last pass ended, for `coalesce`.
             let mut last_pass: Option<Instant> = None;
+            // The run of trouble of a supervised worker: failures that
+            // follow one another before a restart held up.
+            let mut trouble = Trouble::default();
 
             // Every exit from this loop names a `StopReason`, so the worker can
             // never die without saying why: adding a new terminal path is a
@@ -2300,7 +2399,11 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                 // advances on its own — no write signal will fire for them — so
                 // after a `Gated` pass, re-check on a short cadence instead of
                 // waiting out the full poll interval.
-                if let Some(wait) = gated {
+                //
+                // A worker that waited to go on after a failure waited
+                // enough: its pass starts at once.
+                if std::mem::take(&mut trouble.resuming) {
+                } else if let Some(wait) = gated {
                     tokio::select! {
                         _ = tokio::time::sleep(wait) => {}
                         _ = shutdown_rx.changed() => break StopReason::Shutdown,
@@ -2336,6 +2439,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                 // attempts against a store that is already failing.
                 let sleep_rx = shutdown_rx.clone();
                 let when_rx = shutdown_rx.clone();
+                let pass_started = Instant::now();
                 let process_fut = async {
                     match self.retry {
                         Some(retry) => {
@@ -2368,6 +2472,9 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                     }
                 };
                 tokio::pin!(process_fut);
+                // A panic of a handler comes back as a value: a supervised
+                // worker goes on from it like from any failed pass.
+                let mut process_fut = CatchPanic(process_fut);
 
                 // A shutdown that lands mid-pass must not drop the pass: the
                 // handlers that already ran in it have a cursor pending in
@@ -2412,6 +2519,20 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
 
                 last_pass = Some(Instant::now());
 
+                let (result, panicked) = match result {
+                    Ok(result) => (result, false),
+                    // Unsupervised, the panic ends the worker as it always
+                    // did, and the handle reports `Panicked`.
+                    Err(panic) if self.restart.is_none() => std::panic::resume_unwind(panic),
+                    Err(panic) => (
+                        Err(anyhow::anyhow!(
+                            "a handler panicked: {}",
+                            panic_message(panic.as_ref())
+                        )),
+                        true,
+                    ),
+                };
+
                 if let Err(err) = &result {
                     tracing::error!(error = %err, "Failed to process event");
                 }
@@ -2426,12 +2547,50 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                     {
                         break StopReason::Shutdown
                     }
-                    Ok(ProcessOutcome::Drained) => gated = None,
-                    Ok(ProcessOutcome::Gated { wait }) => gated = Some(wait),
+                    Ok(outcome @ (ProcessOutcome::Drained | ProcessOutcome::Gated { .. })) => {
+                        gated = match outcome {
+                            ProcessOutcome::Gated { wait } => Some(wait),
+                            _ => None,
+                        };
+                        // The pass went through: whatever held the worker
+                        // up is past.
+                        if !state_tx.borrow().is_running() {
+                            tracing::info!(
+                                key = self.resolved_key(),
+                                attempts = trouble.attempts,
+                                "Subscription is running again"
+                            );
+                            state_tx.send_replace(State::Running);
+                        }
+                    }
                     Ok(ProcessOutcome::ShutdownRequested) => break StopReason::Shutdown,
                     Ok(ProcessOutcome::LostOwnership) => break StopReason::LostOwnership,
                     Ok(ProcessOutcome::StoppedByHandler) => break StopReason::StoppedByHandler,
-                    Err(err) if !self.continue_on_error => break StopReason::Failed(Arc::new(err)),
+                    Err(err) if !self.continue_on_error || panicked => {
+                        let Some((min, max)) = self.restart else {
+                            break StopReason::Failed(Arc::new(err));
+                        };
+                        let error = Arc::new(err);
+                        let delay = trouble.failed(pass_started, min, max);
+                        tracing::error!(
+                            key = self.resolved_key(),
+                            error = %format!("{error:#}"),
+                            attempts = trouble.attempts,
+                            delay = ?delay,
+                            "Subscription failed: it goes on from its cursor after the delay"
+                        );
+                        state_tx.send_replace(State::Restarting {
+                            error,
+                            since: trouble.since,
+                            attempts: trouble.attempts,
+                        });
+                        tokio::select! {
+                            _ = tokio::time::sleep(delay) => {}
+                            _ = shutdown_rx.changed() => break StopReason::Shutdown,
+                        }
+                        trouble.resumed();
+                        gated = None;
+                    }
                     Err(_) => {}
                 }
             };
@@ -2460,6 +2619,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             task_handle,
             shutdown_tx,
             stop_rx,
+            state_rx,
             lag,
         })
     }
@@ -2683,6 +2843,129 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
     }
 }
 
+/// How a [`Subscription`]'s worker stands ([`Subscription::state`]).
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum State {
+    /// The worker handles the events it follows as they come.
+    Running,
+    /// A pass failed past its retries and the worker, being
+    /// [`supervised`](SubscriptionBuilder::supervised), goes on from its
+    /// cursor after a delay. It stays so until a pass goes through: while it
+    /// waits, and while the pass that follows is still failing.
+    Restarting {
+        /// The failure of the last pass.
+        error: Arc<anyhow::Error>,
+        /// When the first failure of this run of trouble happened (Unix
+        /// seconds): failures that follow one another, before the worker
+        /// went on for long enough without one, are one run.
+        since: u64,
+        /// How many restarts this run of trouble took so far, the one being
+        /// waited for included.
+        attempts: u32,
+    },
+    /// The worker ended and handles nothing any more.
+    Stopped(StopReason),
+}
+
+impl State {
+    /// Whether the worker handles events as they come: neither held up nor
+    /// stopped.
+    pub fn is_running(&self) -> bool {
+        matches!(self, State::Running)
+    }
+}
+
+impl std::fmt::Display for State {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            State::Running => f.write_str("running"),
+            State::Restarting {
+                error, attempts, ..
+            } => write!(f, "restarting (attempt {attempts}): {error:#}"),
+            State::Stopped(reason) => write!(f, "stopped: {reason}"),
+        }
+    }
+}
+
+/// The run of trouble of a supervised worker: the failures that follow one
+/// another, and the delay they grew.
+#[derive(Default)]
+struct Trouble {
+    /// When the first failure of the run happened (Unix seconds).
+    since: u64,
+    /// The restarts of the run so far.
+    attempts: u32,
+    /// The delay before the next restart of the run.
+    delay: Duration,
+    /// When the worker last went on after a failure.
+    resumed_at: Option<Instant>,
+    /// Set from the end of a delay to the start of the pass that follows.
+    resuming: bool,
+}
+
+impl Trouble {
+    /// Counts the failure of a pass started at `pass_started`, and returns
+    /// the delay before the worker goes on.
+    ///
+    /// The failure belongs to the run in progress unless the worker went on
+    /// for `max` without failing: measured up to the start of the pass, a
+    /// pass that fails after minutes of retries having held up for none of
+    /// them.
+    fn failed(&mut self, pass_started: Instant, min: Duration, max: Duration) -> Duration {
+        let held_up = self
+            .resumed_at
+            .is_none_or(|at| pass_started.saturating_duration_since(at) >= max);
+        if held_up {
+            self.since = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            self.attempts = 0;
+            self.delay = min;
+        }
+        self.attempts += 1;
+        let delay = self.delay;
+        self.delay = (delay * 2).min(max);
+        delay
+    }
+
+    /// The delay is over and the worker goes on.
+    fn resumed(&mut self) {
+        self.resumed_at = Some(Instant::now());
+        self.resuming = true;
+    }
+}
+
+/// Polls a pass and hands a panic back as a value instead of unwinding
+/// through the worker.
+struct CatchPanic<'a, F>(Pin<&'a mut F>);
+
+impl<F: Future> Future for CatchPanic<'_, F> {
+    type Output = std::thread::Result<F::Output>;
+
+    fn poll(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let pass = self.0.as_mut();
+        // The pass is not polled again once it panicked, so what it left
+        // half-done is only ever dropped.
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pass.poll(cx))) {
+            Ok(poll) => poll.map(Ok),
+            Err(panic) => std::task::Poll::Ready(Err(panic)),
+        }
+    }
+}
+
+/// What a panic said, when it said it in words.
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
+    panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("no message")
+}
+
 /// Why a [`Subscription`]'s worker stopped.
 ///
 /// The worker records this as it exits. Read it without blocking through
@@ -2707,10 +2990,14 @@ pub enum StopReason {
     LostOwnership,
     /// A pass failed after exhausting [`retry`](SubscriptionBuilder::retry),
     /// and the subscription was not built with
-    /// [`continue_on_error`](SubscriptionBuilder::continue_on_error).
+    /// [`continue_on_error`](SubscriptionBuilder::continue_on_error). Never
+    /// the end of a [`supervised`](SubscriptionBuilder::supervised) worker,
+    /// which goes on from its cursor instead.
     Failed(Arc<anyhow::Error>),
     /// The worker ended without recording a reason: it panicked, was aborted,
-    /// or the runtime shut down under it.
+    /// or the runtime shut down under it. A
+    /// [`supervised`](SubscriptionBuilder::supervised) worker goes on from a
+    /// handler's panic.
     Panicked,
 }
 
@@ -2780,6 +3067,7 @@ pub struct Subscription {
     task_handle: tokio::task::JoinHandle<()>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     stop_rx: tokio::sync::watch::Receiver<Option<StopReason>>,
+    state_rx: tokio::sync::watch::Receiver<State>,
     lag: LagProbe,
 }
 
@@ -2823,6 +3111,19 @@ impl Subscription {
     /// A non-blocking snapshot; [`stopped`](Self::stopped) waits for it.
     pub fn stop_reason(&self) -> Option<StopReason> {
         peek_stop_reason(&self.stop_rx)
+    }
+
+    /// How the worker stands: running, held up by a failure it goes on from
+    /// ([`supervised`](SubscriptionBuilder::supervised) only), or stopped.
+    ///
+    /// A non-blocking snapshot, for a status page or a health check. It
+    /// does not see a handler that never returns — that worker is running;
+    /// [`lag`](Self::lag) does.
+    pub fn state(&self) -> State {
+        match self.stop_reason() {
+            Some(reason) => State::Stopped(reason),
+            None => self.state_rx.borrow().clone(),
+        }
     }
 
     /// How far the subscription is behind the newest event it follows, now.
@@ -2945,7 +3246,7 @@ impl<E: Executor, EV: AggregateEvent + Send + Sync> Handler<E> for SkipHandler<E
 mod tests {
     use super::{
         await_stop_reason, context, peek_stop_reason, shutdown_requested, AtomicBool, Context,
-        CursorStore, Fault, Handler, Lag, Ordering, StopReason, SubscriptionBuilder, Value,
+        CursorStore, Fault, Handler, Lag, Ordering, State, StopReason, SubscriptionBuilder, Value,
     };
     use crate::cursor::{Args, ReadResult};
     use crate::{
@@ -3663,6 +3964,8 @@ mod tests {
         /// Fired by a test in place of a write (see [`Ledger::wrote`]).
         signal: crate::WriteSignal,
         reads: AtomicUsize,
+        /// While set, every read fails (see [`Ledger::away`]).
+        away: AtomicBool,
     }
 
     impl Ledger {
@@ -3685,6 +3988,7 @@ mod tests {
                 dead_letters: Mutex::new(Vec::new()),
                 signal: crate::WriteSignal::new(),
                 reads: AtomicUsize::new(0),
+                away: AtomicBool::new(false),
             }))
         }
 
@@ -3701,6 +4005,11 @@ mod tests {
 
         fn reads(&self) -> usize {
             self.0.reads.load(Ordering::SeqCst)
+        }
+
+        /// Takes the store away, or brings it back: away, its reads fail.
+        fn away(&self, away: bool) {
+            self.0.away.store(away, Ordering::SeqCst);
         }
 
         fn letters(&self) -> Vec<DeadLetter> {
@@ -3781,6 +4090,7 @@ mod tests {
             _to_micros: Option<u64>,
         ) -> anyhow::Result<ReadResult<Event>> {
             self.0.reads.fetch_add(1, Ordering::SeqCst);
+            anyhow::ensure!(!self.0.away.load(Ordering::SeqCst), "the store is away");
             let events = self.matching(aggregators.as_deref()).cloned().collect();
             Ok(crate::cursor::Reader::new(events).args(args).execute()?)
         }
@@ -4287,6 +4597,7 @@ mod tests {
             dead_letters: Mutex::new(Vec::new()),
             signal: crate::WriteSignal::new(),
             reads: AtomicUsize::new(0),
+            away: AtomicBool::new(false),
         }));
         let mut builder = Flaky::default().builder("sagas");
 
@@ -4394,5 +4705,283 @@ mod tests {
         );
 
         subscription.shutdown().await.unwrap();
+    }
+
+    /// Lets the worker run up to its next wait.
+    async fn settle() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    /// The tries of the run of trouble `state` shows, `None` when running.
+    fn attempts(state: &State) -> Option<u32> {
+        match state {
+            State::Running => None,
+            State::Restarting { attempts, .. } => Some(*attempts),
+            State::Stopped(reason) => panic!("stopped: {reason}"),
+        }
+    }
+
+    /// Issue #583: a pass that fails past its retries ends an unsupervised
+    /// worker. Supervised, it goes on at the event that failed: nothing is
+    /// skipped, nothing handled twice, and the state says it meanwhile.
+    #[tokio::test(start_paused = true)]
+    async fn a_supervised_worker_goes_on_at_the_event_that_failed() {
+        let _unlogged = unlogged().await;
+        let store = Ledger::of(3);
+        let handler = Flaky::default().failing("thing-1", 1);
+        let subscription = handler
+            .builder("sagas")
+            .no_retry()
+            .supervised()
+            .start(&store)
+            .await
+            .unwrap();
+        assert!(subscription.state().is_running());
+
+        settle().await;
+        let State::Restarting {
+            error,
+            since,
+            attempts,
+        } = subscription.state()
+        else {
+            panic!("{}", subscription.state())
+        };
+        assert_eq!(error.to_string(), "provider refused thing-1");
+        assert!(since > 0);
+        assert_eq!(attempts, 1);
+        assert!(subscription.stop_reason().is_none(), "it did not stop");
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(subscription.state().is_running());
+        assert!(store.drained().await);
+        assert_eq!(handler.runs_of("thing-0"), 1);
+        assert_eq!(handler.runs_of("thing-1"), 2);
+        assert_eq!(handler.runs_of("thing-2"), 1);
+
+        subscription.stop();
+        subscription.stopped().await;
+        assert!(matches!(
+            subscription.state(),
+            State::Stopped(StopReason::Shutdown)
+        ));
+    }
+
+    /// Issue #583: an event still poison after a restart is the same run of
+    /// trouble, waited for longer each time, not a new one at each restart.
+    #[tokio::test(start_paused = true)]
+    async fn a_worker_failing_again_at_once_waits_longer_and_counts_on() {
+        let _unlogged = unlogged().await;
+        let store = Ledger::of(1);
+        let handler = Flaky::default().failing("thing-0", 3);
+        let subscription = handler
+            .builder("sagas")
+            .no_retry()
+            .supervised()
+            .start(&store)
+            .await
+            .unwrap();
+
+        // Fails at 0 s, 1 s and 3 s; passes at 7 s.
+        settle().await;
+        assert_eq!(attempts(&subscription.state()), Some(1));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(attempts(&subscription.state()), Some(2));
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(attempts(&subscription.state()), Some(2), "2 s, not 1 s");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(attempts(&subscription.state()), Some(3));
+        tokio::time::sleep(Duration::from_millis(3500)).await;
+        assert_eq!(attempts(&subscription.state()), Some(3), "4 s");
+        assert_eq!(handler.runs_of("thing-0"), 3);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(subscription.state().is_running());
+        assert_eq!(handler.runs_of("thing-0"), 4);
+        assert!(store.drained().await);
+
+        subscription.shutdown().await.unwrap();
+    }
+
+    /// Issue #583: trouble that comes back soon after a restart counts on,
+    /// with the delay it grew; once the worker went on for the longest
+    /// delay without failing, the next failure is a new run.
+    #[tokio::test(start_paused = true)]
+    async fn a_run_of_trouble_is_forgotten_once_a_restart_held_up() {
+        let _unlogged = unlogged().await;
+        let store = Ledger::of(0);
+        let subscription = Flaky::default()
+            .builder("sagas")
+            .no_retry()
+            .restart_backoff(Duration::from_secs(1), Duration::from_secs(8))
+            .poll_interval(Duration::from_millis(100))
+            .start(&store)
+            .await
+            .unwrap();
+        settle().await;
+        assert!(subscription.state().is_running());
+
+        // The store goes away for a moment: one restart, and it runs again.
+        store.away(true);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(attempts(&subscription.state()), Some(1));
+        store.away(false);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(subscription.state().is_running());
+
+        // Away again two seconds later: the same run, and 2 s to wait.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        store.away(true);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(attempts(&subscription.state()), Some(2));
+        store.away(false);
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(attempts(&subscription.state()), Some(2), "still waiting");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(subscription.state().is_running());
+
+        // Away after more than the longest delay: a run of its own.
+        tokio::time::sleep(Duration::from_secs(9)).await;
+        store.away(true);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(attempts(&subscription.state()), Some(1));
+        store.away(false);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(subscription.state().is_running());
+
+        subscription.shutdown().await.unwrap();
+    }
+
+    /// Handles `test/Thing`'s `Happened`, panicking the first time it meets
+    /// `on`.
+    struct Panicky {
+        on: &'static str,
+        panicked: AtomicBool,
+        handled: Arc<AtomicUsize>,
+    }
+
+    impl Handler<Ledger> for Panicky {
+        fn handle<'a>(
+            &'a self,
+            _context: &'a Context<'a, Ledger>,
+            event: &'a Event,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>> {
+            Box::pin(async move {
+                if event.aggregate_id == self.on && !self.panicked.swap(true, Ordering::SeqCst) {
+                    panic!("cannot deal with {}", event.aggregate_id);
+                }
+                self.handled.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+
+        fn aggregate_type(&self) -> &'static str {
+            "test/Thing"
+        }
+
+        fn event_name(&self) -> &'static str {
+            "Happened"
+        }
+    }
+
+    fn panicky(handled: &Arc<AtomicUsize>) -> SubscriptionBuilder<Ledger> {
+        SubscriptionBuilder::new("sagas").handler(Panicky {
+            on: "thing-1",
+            panicked: AtomicBool::new(false),
+            handled: handled.clone(),
+        })
+    }
+
+    /// Issue #583: a handler's panic ends an unsupervised worker with
+    /// nothing recorded. Supervised, it is a failure like another, and the
+    /// worker goes on at the event — under `continue_on_error` as well,
+    /// which would otherwise meet the event again at every poll.
+    #[tokio::test(start_paused = true)]
+    async fn a_supervised_worker_goes_on_from_a_panic() {
+        let _unlogged = unlogged().await;
+        for continue_on_error in [false, true] {
+            let store = Ledger::of(3);
+            let handled = Arc::new(AtomicUsize::new(0));
+            let mut builder = panicky(&handled).ack_every(1).supervised();
+            if continue_on_error {
+                builder = builder.continue_on_error();
+            }
+            let subscription = builder.start(&store).await.unwrap();
+
+            settle().await;
+            let State::Restarting { error, .. } = subscription.state() else {
+                panic!("{}", subscription.state())
+            };
+            assert_eq!(
+                error.to_string(),
+                "a handler panicked: cannot deal with thing-1"
+            );
+
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert!(subscription.state().is_running());
+            assert!(store.drained().await);
+            assert_eq!(handled.load(Ordering::SeqCst), 3);
+
+            subscription.shutdown().await.unwrap();
+        }
+    }
+
+    /// Unsupervised, a panic is what it was: the end of the worker.
+    #[tokio::test(start_paused = true)]
+    async fn an_unsupervised_worker_still_ends_on_a_panic() {
+        let _unlogged = unlogged().await;
+        let store = Ledger::of(3);
+        let handled = Arc::new(AtomicUsize::new(0));
+        let subscription = panicky(&handled).start(&store).await.unwrap();
+
+        assert!(matches!(subscription.stopped().await, StopReason::Panicked));
+        assert!(matches!(
+            subscription.state(),
+            State::Stopped(StopReason::Panicked)
+        ));
+    }
+
+    /// Issue #583: a stop does not wait out the delay of a restart.
+    #[tokio::test(start_paused = true)]
+    async fn a_shutdown_while_waiting_to_go_on_is_prompt() {
+        let _unlogged = unlogged().await;
+        let store = Ledger::of(1);
+        let handler = Flaky::default().failing("thing-0", u32::MAX);
+        let subscription = handler
+            .builder("sagas")
+            .no_retry()
+            .restart_backoff(Duration::from_secs(3600), Duration::from_secs(3600))
+            .start(&store)
+            .await
+            .unwrap();
+        settle().await;
+        assert_eq!(attempts(&subscription.state()), Some(1));
+
+        let asked = tokio::time::Instant::now();
+        subscription.stop();
+        assert!(matches!(subscription.stopped().await, StopReason::Shutdown));
+        assert!(asked.elapsed() < Duration::from_secs(1));
+        assert_eq!(handler.runs_of("thing-0"), 1, "no further try");
+    }
+
+    /// Unsupervised, a pass that fails past its retries is what it was: the
+    /// end of the worker, and the state says why.
+    #[tokio::test(start_paused = true)]
+    async fn an_unsupervised_worker_still_stops_on_a_failure() {
+        let _unlogged = unlogged().await;
+        let store = Ledger::of(1);
+        let handler = Flaky::default().failing("thing-0", u32::MAX);
+        let subscription = handler
+            .builder("sagas")
+            .no_retry()
+            .start(&store)
+            .await
+            .unwrap();
+
+        let reason = subscription.stopped().await;
+        assert!(matches!(reason, StopReason::Failed(_)), "{reason}");
+        assert_eq!(
+            subscription.state().to_string(),
+            "stopped: failed: provider refused thing-0"
+        );
     }
 }
