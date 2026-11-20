@@ -95,3 +95,40 @@ async fn a_write_on_a_stale_connection_is_retried_over_a_fresh_one() {
     );
     peer.abort();
 }
+
+/// A peer the transport was not built with is reached once it is told where
+/// it is, and at its new address once it moved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_peer_added_or_moved_while_the_transport_runs_is_reached() {
+    let transport = Arc::new(TcpTransport::new(
+        NodeId(0),
+        HashMap::<NodeId, std::net::SocketAddr>::new(),
+    ));
+    // Unknown: the frame goes nowhere, and nothing fails.
+    transport.send(NodeId(1), applied(1)).await.unwrap();
+    assert_eq!(transport.peer(NodeId(1)), None);
+
+    let mut peers = Vec::new();
+    // Held to the end: a peer closes its connection when its handle goes.
+    let mut closes = Vec::new();
+    for at in 0..2 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (frames_tx, mut frames) = mpsc::unbounded_channel();
+        let (close_tx, close_rx) = mpsc::channel(1);
+        closes.push(close_tx);
+        peers.push(tokio::spawn(raw_peer(listener, frames_tx, close_rx)));
+
+        assert!(transport.set_peer(NodeId(1), addr), "news");
+        assert!(!transport.set_peer(NodeId(1), addr), "said already");
+        assert_eq!(transport.peer(NodeId(1)), Some(addr.into()));
+        transport.send(NodeId(1), applied(2 + at)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), frames.recv())
+            .await
+            .expect("the frame reaches the peer where it now is")
+            .unwrap();
+    }
+    for peer in peers {
+        peer.abort();
+    }
+}

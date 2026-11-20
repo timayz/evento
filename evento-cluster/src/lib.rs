@@ -66,6 +66,7 @@
 //! The protocol depends only on the [`api`] traits, each with a deterministic
 //! in-process implementation for testing and a production implementation.
 
+pub mod addresses;
 pub mod api;
 pub mod backend;
 pub mod claim;
