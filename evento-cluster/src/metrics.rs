@@ -102,6 +102,11 @@ pub struct Metrics {
     pub slow_path: AtomicU64,
     /// Stalled transactions this node took over via the recovery sweep.
     pub recoveries: AtomicU64,
+    /// Transactions past `recovery_timeout` the sweep left to their
+    /// coordinator instead of recovering them, this node's own journal
+    /// flushes being slow (#560): each a recovery that would have decided
+    /// nothing its coordinator did not. Counted once per transaction.
+    pub recoveries_held: AtomicU64,
     /// Compaction rounds that advanced the redundancy watermark.
     pub compactions: AtomicU64,
     /// Watermark reports held back below the local applied-through point by
@@ -341,6 +346,12 @@ impl Metrics {
     /// Records that the recovery sweep took over a stalled transaction.
     pub fn record_recovery(&self) {
         self.recoveries.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a transaction past `recovery_timeout` left to its
+    /// coordinator.
+    pub fn record_recovery_held(&self) {
+        self.recoveries_held.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Records a compaction round that advanced the watermark.
@@ -585,6 +596,7 @@ impl Metrics {
             fast_path: self.fast_path.load(Ordering::Relaxed),
             slow_path: self.slow_path.load(Ordering::Relaxed),
             recoveries: self.recoveries.load(Ordering::Relaxed),
+            recoveries_held: self.recoveries_held.load(Ordering::Relaxed),
             compactions: self.compactions.load(Ordering::Relaxed),
             watermark_clamps: self.watermark_clamps.load(Ordering::Relaxed),
             journal_flushes: self.journal_flushes.load(Ordering::Relaxed),
@@ -646,6 +658,7 @@ pub struct MetricsSnapshot {
     pub fast_path: u64,
     pub slow_path: u64,
     pub recoveries: u64,
+    pub recoveries_held: u64,
     pub compactions: u64,
     pub watermark_clamps: u64,
     pub journal_flushes: u64,
@@ -706,7 +719,7 @@ impl MetricsSnapshot {
     /// source of truth for both [`to_prometheus`](Self::to_prometheus) and
     /// [`to_prometheus_labeled`](Self::to_prometheus_labeled); add a counter here and
     /// both renderings pick it up.
-    fn counters(&self) -> [(&'static str, &'static str, u64); 50] {
+    fn counters(&self) -> [(&'static str, &'static str, u64); 51] {
         [
             (
                 "cluster_writes_committed_total",
@@ -732,6 +745,11 @@ impl MetricsSnapshot {
                 "cluster_recoveries_total",
                 "Stalled transactions this node took over via the recovery sweep.",
                 self.recoveries,
+            ),
+            (
+                "cluster_recoveries_held_total",
+                "Transactions past recovery_timeout left to their coordinator: this node's own journal flushes were slow.",
+                self.recoveries_held,
             ),
             (
                 "cluster_compactions_total",
