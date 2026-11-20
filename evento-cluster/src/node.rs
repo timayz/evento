@@ -5216,7 +5216,7 @@ impl Node {
                         .expect("replica poisoned")
                         .reply_to(txn)
                         .unwrap_or(from);
-                    out.push((reply_to, Message::Applied { txn }));
+                    self.acknowledge(&mut out, txn, reply_to);
                 } else {
                     self.wake_applier();
                 }
@@ -6385,7 +6385,23 @@ impl Node {
         // An apply the journal did not take is not acknowledged; a
         // restart re-applies it (idempotently) from its commit.
         if staged {
-            self.answer(out, reply_to, Message::Applied { txn });
+            self.acknowledge(out, txn, reply_to);
+        }
+    }
+
+    /// Queues this replica's acknowledgement of `txn`'s apply among `out`:
+    /// to `reply_to`, the node that committed it here last, and to its
+    /// coordinator as well where that is another node — a recovery took the
+    /// write over, as a peer's sweep does past `recovery_timeout`. The
+    /// coordinator may be alive and in its apply round still (it was only
+    /// slow): sent to the recovery alone, the acknowledgements left it short
+    /// of its quorum until `collect_timeout`, its caller waiting on a write
+    /// already applied (#582). One that is gone, or done, drops the message.
+    fn acknowledge(&self, out: &mut Vec<(NodeId, Message)>, txn: TxnId, reply_to: NodeId) {
+        self.answer(out, reply_to, Message::Applied { txn });
+        let coordinator = txn.0.node;
+        if coordinator != reply_to {
+            self.answer(out, coordinator, Message::Applied { txn });
         }
     }
 
@@ -7139,9 +7155,11 @@ impl Node {
     ///
     /// A replica answers the reads and the apply to whoever committed the
     /// transaction last: a coordinator a recovery took over from, or one of
-    /// two recoveries racing, may hear none of them. So the reads are waited
-    /// for only until this node applies the transaction — another driver
-    /// decided it then, final — and, for a recovery, the acks too. A sweep
+    /// two recoveries racing, may hear none of the reads. So the reads are
+    /// waited for only until this node applies the transaction — another
+    /// driver decided it then, final — and, for a recovery, the acks too.
+    /// The coordinator hears the acks whoever committed last
+    /// ([`acknowledge`](Self::acknowledge)), and waits for its quorum. A sweep
     /// recovery stops waiting as well once this replica holds the read back on
     /// a stalled transaction (see [`Driver::Sweep`]).
     #[allow(clippy::too_many_arguments)]
@@ -10715,7 +10733,7 @@ impl Node {
                 // three replicas imported it waits out `collect_timeout` for
                 // acknowledgements nobody sends (#549).
                 if let Some(reply_to) = awaited_by {
-                    self.answer(&mut acks, reply_to, Message::Applied { txn });
+                    self.acknowledge(&mut acks, txn, reply_to);
                 }
             }
         }
@@ -14386,7 +14404,12 @@ mod tests {
             .await;
         assert!(out.is_empty(), "{out:?}");
         let sends = node.apply_next().await.expect("ready to enact");
-        assert!(sends.is_empty(), "nothing waits for the flush: {sends:?}");
+        // The write is another node's, committed here in this node's name,
+        // as a recovery does: its coordinator is told too (#582).
+        assert!(
+            matches!(&sends[..], [(to, Message::Applied { .. })] if *to == txn.0.node),
+            "only the write's coordinator is sent anything: {sends:?}"
+        );
         assert!(
             matches!(rx.try_recv(), Ok((from, Message::Applied { .. })) if from == own),
             "the own apply is acknowledged at once"

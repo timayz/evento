@@ -696,8 +696,13 @@ async fn recovery_preaccepts_at_replicas_that_never_saw_the_transaction() {
         .send(NodeId(1), preaccept)
         .await
         .unwrap();
+    // The replicas told the write's coordinator of the apply too (#582).
+    let mut answer = next(&mut coordinator).await;
+    while matches!(answer, Message::Applied { .. }) {
+        answer = next(&mut coordinator).await;
+    }
     assert!(
-        matches!(next(&mut coordinator).await, Message::Nack { .. }),
+        matches!(answer, Message::Nack { .. }),
         "the original coordinator can no longer gather a vote at node 1"
     );
 }

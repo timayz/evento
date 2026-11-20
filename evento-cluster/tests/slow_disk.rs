@@ -229,7 +229,9 @@ fn without_patience() -> NodeConfig {
 /// On a disk that stalls for two seconds, the writes in flight outlast
 /// `recovery_timeout` with their coordinators alive. Their peers' sweeps
 /// leave them alone: no recovery runs, every write commits, and none takes
-/// longer than without the patience.
+/// much longer than the stall. Nor does one without the patience, since a
+/// write a peer recovered is acknowledged to its coordinator too (#582):
+/// before, the coordinator of each waited out `collect_timeout`.
 #[tokio::test(start_paused = true)]
 async fn writes_slowed_by_the_disk_are_left_to_their_coordinators() {
     init_tracing();
@@ -253,12 +255,13 @@ async fn writes_slowed_by_the_disk_are_left_to_their_coordinators() {
         patient.posts,
         hasty.posts
     );
-    assert!(
-        patient.percentile(100) <= hasty.percentile(100),
-        "the longest post took {:?} with the patience, {:?} without",
-        patient.percentile(100),
-        hasty.percentile(100)
-    );
+    for (cost, patience) in [(&patient, "with"), (&hasty, "without")] {
+        assert!(
+            cost.percentile(100) < stall + Duration::from_secs(1),
+            "the longest post took {:?} {patience} the patience, over a stall of {stall:?}",
+            cost.percentile(100),
+        );
+    }
 }
 
 /// On a disk that never stalls nothing is held back, whatever the patience:
