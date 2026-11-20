@@ -370,7 +370,9 @@ async fn a_holder_stops_once_the_lease_is_another_node_s_or_is_not_confirmed() {
 
     // The other node takes the lease, as it would had it not heard from the
     // first for a while: the first stops at its next question, and the
-    // other starts once the first is out of time.
+    // other starts once the first is out of time — counted from when the
+    // term was asked for, which on a slow disk is well before it is taken.
+    let took = std::time::Instant::now();
     let taken = lease::take(
         &nodes[other].executor,
         "key-1",
@@ -381,7 +383,6 @@ async fn a_holder_stops_once_the_lease_is_another_node_s_or_is_not_confirmed() {
     .unwrap()
     .unwrap();
     assert_eq!(taken.term, 2);
-    let took = std::time::Instant::now();
     eventually("the first holder stops", || async {
         nodes[by].covered().is_empty()
     })

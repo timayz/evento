@@ -107,6 +107,10 @@ pub struct Metrics {
     /// flushes being slow (#560): each a recovery that would have decided
     /// nothing its coordinator did not. Counted once per transaction.
     pub recoveries_held: AtomicU64,
+    /// Recoveries that asked the replicas past a transaction's deadline to
+    /// vote for it because every replica not heard from was suspected
+    /// (#584): a write its coordinator alone held, decided with a node down.
+    pub late_votes_asked: AtomicU64,
     /// Compaction rounds that advanced the redundancy watermark.
     pub compactions: AtomicU64,
     /// Watermark reports held back below the local applied-through point by
@@ -354,6 +358,12 @@ impl Metrics {
         self.recoveries_held.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records a recovery that asked the late replicas to vote, the ones
+    /// not heard from being suspected.
+    pub fn record_late_votes_asked(&self) {
+        self.late_votes_asked.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Records a compaction round that advanced the watermark.
     pub fn record_compaction(&self) {
         self.compactions.fetch_add(1, Ordering::Relaxed);
@@ -597,6 +607,7 @@ impl Metrics {
             slow_path: self.slow_path.load(Ordering::Relaxed),
             recoveries: self.recoveries.load(Ordering::Relaxed),
             recoveries_held: self.recoveries_held.load(Ordering::Relaxed),
+            late_votes_asked: self.late_votes_asked.load(Ordering::Relaxed),
             compactions: self.compactions.load(Ordering::Relaxed),
             watermark_clamps: self.watermark_clamps.load(Ordering::Relaxed),
             journal_flushes: self.journal_flushes.load(Ordering::Relaxed),
@@ -659,6 +670,7 @@ pub struct MetricsSnapshot {
     pub slow_path: u64,
     pub recoveries: u64,
     pub recoveries_held: u64,
+    pub late_votes_asked: u64,
     pub compactions: u64,
     pub watermark_clamps: u64,
     pub journal_flushes: u64,
@@ -719,7 +731,7 @@ impl MetricsSnapshot {
     /// source of truth for both [`to_prometheus`](Self::to_prometheus) and
     /// [`to_prometheus_labeled`](Self::to_prometheus_labeled); add a counter here and
     /// both renderings pick it up.
-    fn counters(&self) -> [(&'static str, &'static str, u64); 51] {
+    fn counters(&self) -> [(&'static str, &'static str, u64); 52] {
         [
             (
                 "cluster_writes_committed_total",
@@ -750,6 +762,11 @@ impl MetricsSnapshot {
                 "cluster_recoveries_held_total",
                 "Transactions past recovery_timeout left to their coordinator: this node's own journal flushes were slow.",
                 self.recoveries_held,
+            ),
+            (
+                "cluster_late_votes_asked_total",
+                "Recoveries that asked the replicas past a transaction's deadline to vote: every replica not heard from was suspected.",
+                self.late_votes_asked,
             ),
             (
                 "cluster_compactions_total",
