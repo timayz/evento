@@ -1329,6 +1329,10 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
     ///
     /// For what manages a subscription's cursor from outside: reading how
     /// far it got, or placing it before the subscription starts.
+    ///
+    /// On an executor that has not learned its default routing key yet
+    /// ([`Executor::resolve_default_routing_key`]) this names the cursor
+    /// without it, and keeps doing so: ask the executor first.
     pub fn storage_key(&mut self, executor: &E) -> Option<String> {
         if self.cursor_store.is_ephemeral() {
             return None;
@@ -1346,7 +1350,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
     /// what says which events it follows. A running one answers from its
     /// handle ([`Subscription::lag`]).
     pub async fn lag(&mut self, executor: &E) -> anyhow::Result<Lag> {
-        self.resolve_routing_key(executor);
+        self.settle_routing_key(executor).await?;
         let cursor = match &self.cursor_store {
             CursorStore::Local(cell) => cell.lock().expect("local cursor poisoned").clone(),
             CursorStore::Persisted => {
@@ -1429,6 +1433,40 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             Some(p) => format!("{p}.{}", self.key),
             None => self.key.clone(),
         };
+    }
+
+    /// [`resolve_routing_key`](Self::resolve_routing_key), once the executor
+    /// knows its default: one that has not learned it yet fails here, and
+    /// nothing is resolved under a key it does not have.
+    async fn settle_routing_key(&mut self, executor: &E) -> anyhow::Result<()> {
+        executor.resolve_default_routing_key().await?;
+        self.resolve_routing_key(executor);
+        Ok(())
+    }
+
+    /// What a worker does before its first pass: resolves its routing key,
+    /// claims the subscription in the store and seeds its cursor. Returns
+    /// the filters its passes read with. It can be done again after a
+    /// failure part of the way.
+    async fn claim(&mut self, executor: &E, id: &Ulid) -> anyhow::Result<Arc<[EventFilter]>> {
+        self.settle_routing_key(executor).await?;
+        self.check_dead_letters(executor).await?;
+
+        // An ephemeral subscription claims nothing: no row, no fence.
+        if !self.cursor_store.is_ephemeral() {
+            executor
+                .upsert_subscriber(self.resolved_key().to_owned(), id.to_owned())
+                .await?;
+        }
+
+        // Seeded under the fence claimed just above and before the worker
+        // can read anything, which makes "after `start()` returns, history
+        // will not be replayed" observable rather than eventual.
+        let read_aggregators = self.read_aggregators();
+        self.seed_latest_cursor(executor, id, &read_aggregators)
+            .await?;
+
+        Ok(read_aggregators)
     }
 
     fn effective_routing_key(&self) -> RoutingKey {
@@ -2216,6 +2254,12 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
     ///   [`continue_on_error`](Self::continue_on_error) as well. The pass
     ///   is lost with it, so the events it handled since its last
     ///   acknowledge ([`ack_every`](Self::ack_every)) are delivered again;
+    /// - a store that cannot be reached when the worker starts is such a
+    ///   failure as well, where it is an error of an unsupervised
+    ///   [`start`](Self::start): the worker starts, claims the subscription
+    ///   once the store answers and handles its first event then. This is
+    ///   what a subscription started on a remote client built before its
+    ///   server answered needs. [`Subscription::lag`] fails until then;
     /// - [`Subscription::shutdown`] cuts the wait short, and waits for the
     ///   event in hand as it does on any worker.
     ///
@@ -2307,13 +2351,16 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
     /// [`continue_on_error`](Self::continue_on_error), or another worker taking
     /// over the key — and the returned handle is the only way to find out:
     /// see [`Subscription::stopped`] and [`StopReason`].
+    ///
+    /// Before it returns the subscription is claimed in the store and its
+    /// cursor seeded, and a store that cannot be reached fails it — unless
+    /// the worker is [`supervised`](Self::supervised), which starts all the
+    /// same and claims once the store answers.
     #[tracing::instrument(skip_all, fields(subscription = Empty))]
     pub async fn start(mut self, executor: &E) -> anyhow::Result<Subscription>
     where
         E: Clone,
     {
-        self.resolve_routing_key(executor);
-        tracing::Span::current().record("subscription", self.resolved_key());
         let executor = executor.clone();
         let id = Ulid::generate();
         let subscription_id = id;
@@ -2329,31 +2376,58 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
         // `Restarting` from a pass that failed until one goes through.
         let (state_tx, state_rx) = tokio::sync::watch::channel(State::Running);
 
-        self.check_dead_letters(&executor).await?;
+        // No store has a say in this one: it fails a supervised start too.
+        anyhow::ensure!(
+            !(self.dead_letter && self.cursor_store.is_ephemeral()),
+            "subscription {} is ephemeral and writes nothing to the store: it cannot dead-letter",
+            self.key
+        );
 
-        // An ephemeral subscription claims nothing: no row, no fence.
-        if !self.cursor_store.is_ephemeral() {
-            executor
-                .upsert_subscriber(self.resolved_key().to_owned(), id.to_owned())
-                .await?;
+        // Claimed before the spawn, so that the worker of a `start` that
+        // returned holds the subscription and has seeded its cursor. Where
+        // the store cannot be reached a supervised worker starts all the
+        // same: the failure is its first, and it claims once the store
+        // answers, before its first pass.
+        let mut unclaimed = None;
+        let mut claimed = match self.claim(&executor, &id).await {
+            Ok(read_aggregators) => Some(read_aggregators),
+            Err(err) if self.restart.is_none() => return Err(err),
+            Err(err) => {
+                unclaimed = Some(err);
+                None
+            }
+        };
+        tracing::Span::current().record("subscription", self.resolved_key());
+
+        // What follows a claim: the write signal the worker wakes on and
+        // the question `Subscription::lag` asks, both by the routing key
+        // the claim resolved.
+        let follow = |builder: &Self, executor: &E, read_aggregators: &Arc<[EventFilter]>| {
+            // Watched with the filter the passes read with: a write that
+            // holds no event of this subscription does not wake it.
+            let write_watch = executor.write_watch_for(&crate::WriteInterest {
+                filters: Some(read_aggregators.clone()),
+                routing_key: Some(builder.effective_routing_key()),
+                tenant: builder.tenant.clone(),
+            });
+            (write_watch, builder.lag_probe(executor, read_aggregators))
+        };
+        let lag_probe = Arc::new(std::sync::OnceLock::new());
+        let mut write_watch = None;
+        if let Some(read_aggregators) = &claimed {
+            let (watch, probe) = follow(&self, &executor, read_aggregators);
+            write_watch = watch;
+            let _ = lag_probe.set(probe);
         }
-
-        // Hoisted above the spawn so the seed below runs under the fence
-        // claimed just above and before the worker can read anything, which
-        // makes "after `start()` returns, history will not be replayed"
-        // observable rather than eventual.
-        let read_aggregators = self.read_aggregators();
-        self.seed_latest_cursor(&executor, &id, &read_aggregators)
-            .await?;
-
-        // Watched with the filter the passes read with: a write that holds
-        // no event of this subscription does not wake it.
-        let mut write_watch = executor.write_watch_for(&crate::WriteInterest {
-            filters: Some(read_aggregators.clone()),
-            routing_key: Some(self.effective_routing_key()),
-            tenant: self.tenant.clone(),
-        });
-        let lag = self.lag_probe(&executor, &read_aggregators);
+        let lag = LagProbe(Arc::new({
+            let lag_probe = lag_probe.clone();
+            move || match lag_probe.get() {
+                Some(LagProbe(probe)) => probe(),
+                None => Box::pin(async {
+                    anyhow::bail!("the subscription has not reached its store yet")
+                }),
+            }
+        }));
 
         let task_handle = tokio::spawn(async move {
             let start = self
@@ -2402,7 +2476,10 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                 //
                 // A worker that waited to go on after a failure waited
                 // enough: its pass starts at once.
-                if std::mem::take(&mut trouble.resuming) {
+                //
+                // Neither does a worker whose claim failed in `start`: that
+                // failure is counted first.
+                if std::mem::take(&mut trouble.resuming) || unclaimed.is_some() {
                 } else if let Some(wait) = gated {
                     tokio::select! {
                         _ = tokio::time::sleep(wait) => {}
@@ -2440,7 +2517,32 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                 let sleep_rx = shutdown_rx.clone();
                 let when_rx = shutdown_rx.clone();
                 let pass_started = Instant::now();
+
+                // A worker started while its store was away claims here,
+                // and its pass follows at once. A claim that fails is the
+                // failure of the pass.
+                let mut unclaimed = unclaimed.take();
+                if claimed.is_none() && unclaimed.is_none() {
+                    let claim = tokio::select! {
+                        claim = self.claim(&executor, &id) => claim,
+                        _ = shutdown_rx.changed() => break StopReason::Shutdown,
+                    };
+                    match claim {
+                        Ok(read_aggregators) => {
+                            let (watch, probe) = follow(&self, &executor, &read_aggregators);
+                            write_watch = watch;
+                            let _ = lag_probe.set(probe);
+                            claimed = Some(read_aggregators);
+                        }
+                        Err(err) => unclaimed = Some(err),
+                    }
+                }
+                let read_aggregators = claimed.clone().unwrap_or_default();
+
                 let process_fut = async {
+                    if let Some(err) = unclaimed {
+                        return Err(err);
+                    }
                     match self.retry {
                         Some(retry) => {
                             (|| async { self.process(&executor, &id, &read_aggregators).await })
@@ -2566,7 +2668,9 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
                     Ok(ProcessOutcome::ShutdownRequested) => break StopReason::Shutdown,
                     Ok(ProcessOutcome::LostOwnership) => break StopReason::LostOwnership,
                     Ok(ProcessOutcome::StoppedByHandler) => break StopReason::StoppedByHandler,
-                    Err(err) if !self.continue_on_error || panicked => {
+                    // A worker that could not claim has no event to go
+                    // past: `continue_on_error` does not apply.
+                    Err(err) if !self.continue_on_error || panicked || claimed.is_none() => {
                         let Some((min, max)) = self.restart else {
                             break StopReason::Failed(Arc::new(err));
                         };
@@ -2679,22 +2783,9 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
     /// single pass without retries.
     #[tracing::instrument(skip_all, fields(subscription = Empty))]
     pub async fn run_once(&mut self, executor: &E) -> anyhow::Result<()> {
-        self.resolve_routing_key(executor);
-        tracing::Span::current().record("subscription", self.resolved_key());
         let id = Ulid::generate();
-
-        self.check_dead_letters(executor).await?;
-
-        // An ephemeral subscription claims nothing: no row, no fence.
-        if !self.cursor_store.is_ephemeral() {
-            executor
-                .upsert_subscriber(self.resolved_key().to_owned(), id.to_owned())
-                .await?;
-        }
-
-        let read_aggregators = self.read_aggregators();
-        self.seed_latest_cursor(executor, &id, &read_aggregators)
-            .await?;
+        let read_aggregators = self.claim(executor, &id).await?;
+        tracing::Span::current().record("subscription", self.resolved_key());
 
         // Exclusive upper bound (µs) covering every event committed before
         // entry: `latest_timestamp` has whole-second resolution, so cover the
@@ -2781,7 +2872,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
     /// Delivery was at-least-once already, and this is one more: the handler
     /// may have gone part of the way on an earlier attempt.
     pub async fn redeliver(&mut self, executor: &E, letter: &DeadLetter) -> anyhow::Result<()> {
-        self.resolve_routing_key(executor);
+        self.settle_routing_key(executor).await?;
         anyhow::ensure!(
             letter.subscription == self.resolved_key(),
             "the dead letter of event {} belongs to subscription {}, not {}",
@@ -3966,6 +4057,9 @@ mod tests {
         reads: AtomicUsize,
         /// While set, every read fails (see [`Ledger::away`]).
         away: AtomicBool,
+        /// While set, the default routing key is not known (see
+        /// [`Ledger::unreached`]).
+        unreached: AtomicBool,
     }
 
     impl Ledger {
@@ -3989,6 +4083,7 @@ mod tests {
                 signal: crate::WriteSignal::new(),
                 reads: AtomicUsize::new(0),
                 away: AtomicBool::new(false),
+                unreached: AtomicBool::new(false),
             }))
         }
 
@@ -4010,6 +4105,13 @@ mod tests {
         /// Takes the store away, or brings it back: away, its reads fail.
         fn away(&self, away: bool) {
             self.0.away.store(away, Ordering::SeqCst);
+        }
+
+        /// Makes the store one that was never reached, as a remote client
+        /// built before its server answered: it does not know its default
+        /// routing key, `eu` once it does.
+        fn unreached(&self, unreached: bool) {
+            self.0.unreached.store(unreached, Ordering::SeqCst);
         }
 
         fn letters(&self) -> Vec<DeadLetter> {
@@ -4046,6 +4148,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Executor for Ledger {
+        async fn resolve_default_routing_key(&self) -> anyhow::Result<Option<String>> {
+            anyhow::ensure!(
+                !self.0.unreached.load(Ordering::SeqCst),
+                "the store has not answered yet"
+            );
+            Ok(None)
+        }
         async fn write(&self, _events: Vec<Event>) -> Result<(), WriteError> {
             unreachable!()
         }
@@ -4598,6 +4707,7 @@ mod tests {
             signal: crate::WriteSignal::new(),
             reads: AtomicUsize::new(0),
             away: AtomicBool::new(false),
+            unreached: AtomicBool::new(false),
         }));
         let mut builder = Flaky::default().builder("sagas");
 
@@ -4765,6 +4875,51 @@ mod tests {
             subscription.state(),
             State::Stopped(StopReason::Shutdown)
         ));
+    }
+
+    /// Issue #600: a store that was never reached fails the start of a
+    /// worker. Supervised, the worker starts all the same, says so, and
+    /// handles its first event once the store answers.
+    #[tokio::test(start_paused = true)]
+    async fn a_supervised_worker_starts_before_its_store_answers() {
+        let _unlogged = unlogged().await;
+        let store = Ledger::of(2);
+        store.unreached(true);
+        let handler = Flaky::default();
+        let Err(err) = handler.builder("sagas").no_retry().start(&store).await else {
+            panic!("an unsupervised worker does not start")
+        };
+        assert_eq!(err.to_string(), "the store has not answered yet");
+
+        let subscription = handler
+            .builder("sagas")
+            .no_retry()
+            .continue_on_error()
+            .supervised()
+            .start(&store)
+            .await
+            .unwrap();
+        settle().await;
+        let State::Restarting { error, .. } = subscription.state() else {
+            panic!("{}", subscription.state())
+        };
+        assert_eq!(error.to_string(), "the store has not answered yet");
+        assert_eq!(attempts(&subscription.state()), Some(1));
+        subscription.lag().await.expect_err("nothing to ask yet");
+        assert_eq!(store.reads(), 0);
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(attempts(&subscription.state()), Some(2), "still away");
+
+        store.unreached(false);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(subscription.state().is_running());
+        assert!(store.drained().await);
+        assert_eq!(handler.runs_of("thing-0"), 1);
+        assert_eq!(handler.runs_of("thing-1"), 1);
+        assert_eq!(subscription.lag().await.unwrap(), Lag::default());
+
+        subscription.shutdown().await.unwrap();
     }
 
     /// Issue #583: an event still poison after a restart is the same run of

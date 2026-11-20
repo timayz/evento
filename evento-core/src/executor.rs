@@ -381,6 +381,24 @@ pub trait Executor: Send + Sync + 'static {
         None
     }
 
+    /// The [`default_routing_key`](Self::default_routing_key), from an
+    /// executor that may not know it yet.
+    ///
+    /// Most backends hold their key from construction and answer it here as
+    /// they do there. One that learns it from elsewhere — a remote client
+    /// built before its server answered — fails here until it has, where
+    /// [`default_routing_key`](Self::default_routing_key) can only say
+    /// `None`: a new aggregate would be written, or a subscription's cursor
+    /// named, under no key instead of the store's. Once this answered, the
+    /// key is fixed and both say the same.
+    ///
+    /// What keys by the default asks here first: `WriteBuilder::commit` for a
+    /// new aggregate, a subscription before it resolves its routing key. An
+    /// executor wrapping another forwards it.
+    async fn resolve_default_routing_key(&self) -> anyhow::Result<Option<String>> {
+        Ok(self.default_routing_key().map(str::to_owned))
+    }
+
     /// Persists events atomically.
     ///
     /// Backends that own event ordering (SQL, Fjall) re-stamp
@@ -750,6 +768,8 @@ pub trait Executor: Send + Sync + 'static {
 /// ```
 pub struct Evento {
     inner: Arc<Box<dyn Executor>>,
+    /// Set by [`Evento::default_routing_key`]; the inner executor's is used
+    /// otherwise.
     default_routing_key: Option<String>,
 }
 
@@ -765,7 +785,19 @@ impl Clone for Evento {
 #[async_trait::async_trait]
 impl Executor for Evento {
     fn default_routing_key(&self) -> Option<&str> {
-        self.default_routing_key.as_deref()
+        // Asked of the inner executor each time, not kept from `new`: a
+        // remote client built before its server answered learns its key
+        // later.
+        self.default_routing_key
+            .as_deref()
+            .or_else(|| self.inner.default_routing_key())
+    }
+
+    async fn resolve_default_routing_key(&self) -> anyhow::Result<Option<String>> {
+        match &self.default_routing_key {
+            Some(key) => Ok(Some(key.clone())),
+            None => self.inner.resolve_default_routing_key().await,
+        }
     }
 
     async fn write(&self, events: Vec<Event>) -> Result<(), WriteError> {
@@ -953,17 +985,16 @@ impl Executor for Evento {
 impl Evento {
     /// Creates a new type-erased executor wrapper.
     ///
-    /// The wrapper starts with the inner executor's
+    /// The wrapper answers with the inner executor's
     /// [`default_routing_key`](Executor::default_routing_key), so wrapping an
     /// executor that already carries one (a remote client told its key by the
     /// server's Hello, a node pinned to its region) keeps writes and
     /// subscription cursors under that key. [`Evento::default_routing_key`]
     /// overrides it.
     pub fn new<E: Executor>(executor: E) -> Self {
-        let default_routing_key = executor.default_routing_key().map(str::to_owned);
         Self {
             inner: Arc::new(Box::new(executor)),
-            default_routing_key,
+            default_routing_key: None,
         }
     }
 
@@ -1024,6 +1055,10 @@ impl EventoGroup {
 impl Executor for EventoGroup {
     fn default_routing_key(&self) -> Option<&str> {
         self.first().default_routing_key()
+    }
+
+    async fn resolve_default_routing_key(&self) -> anyhow::Result<Option<String>> {
+        self.first().resolve_default_routing_key().await
     }
 
     async fn write(&self, events: Vec<Event>) -> Result<(), WriteError> {
@@ -1695,6 +1730,10 @@ impl<R: Executor, W: Executor> Executor for Rw<R, W> {
         self.w.default_routing_key()
     }
 
+    async fn resolve_default_routing_key(&self) -> anyhow::Result<Option<String>> {
+        self.w.resolve_default_routing_key().await
+    }
+
     async fn write(&self, events: Vec<Event>) -> Result<(), WriteError> {
         self.w.write(events).await
     }
@@ -1951,6 +1990,10 @@ impl<E: Executor, L: Executor> Executor for Sidecar<E, L> {
         // The events' key: it scopes new aggregates and prefixes the cursor
         // keys, so a local store following two event stores keeps them apart.
         self.events.default_routing_key()
+    }
+
+    async fn resolve_default_routing_key(&self) -> anyhow::Result<Option<String>> {
+        self.events.resolve_default_routing_key().await
     }
 
     async fn write(&self, events: Vec<Event>) -> Result<(), WriteError> {

@@ -111,6 +111,14 @@ let client = evento::RemoteClient::connect("127.0.0.1:4321").await?;
   on every (re)connect, so a client behind a load balancer or DNS failover follows
   it. The server clamps a bounded `read` to its own `stable_timestamp`, so a
   client that reconnects to a lagging node never skips events.
+- **Store away at startup:** `connect()` fails when the server does not answer.
+  `RemoteClient::builder(addr).connect_lazy()` gives the client at once and connects
+  in the background: calls fail with `evento::remote::NotConnected` until the first
+  `Hello` (which also brings the default routing key), a refused token is final
+  (`ClientState::Refused`, calls fail with `Rejection::Unauthorized`), `client.state()`
+  → `Connecting { error, since } | Connected | Refused`, `client.connected().await`
+  waits. Start subscriptions on it `.supervised()`: an unsupervised `start` fails while
+  the store is away, a supervised one starts and handles its first event when it comes.
 - **Tenants / authentication:** implement `evento::remote::Resolver`.
   Every connection opens with a `Hello { token, peer }` (client side:
   `RemoteClient::builder(addr).token("…").connect().await?`); `resolve` answers

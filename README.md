@@ -723,6 +723,12 @@ The address may be a host name (`"store.example.com:4321"`): it is looked up
 again on every reconnect, so a client behind a load balancer or a DNS failover
 follows it to whichever node answers.
 
+An application that must open while the store is away builds its client with
+`RemoteClient::builder(addr).connect_lazy()` instead of `connect`: the client
+exists at once and connects in the background, its calls fail as not connected
+until the server answers, `state()` says how it stands, and a `supervised()`
+subscription started on it handles its first event when the server comes.
+
 A client that runs subscriptions of its own (a replica of a web app following
 the shared store) keeps its cursors and snapshots in a store it owns with
 `Sidecar`: several replicas never fence each other out of one subscription key,
