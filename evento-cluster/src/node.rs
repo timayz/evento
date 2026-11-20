@@ -2487,16 +2487,23 @@ impl Node {
         // Read first: the flush covers what the batches counted so far
         // staged, not what one counted during it does.
         let deferred = self.lazy.deferred.load(Ordering::Acquire);
-        let started = Instant::now();
-        let flushed = self.journal.flush().await;
-        // A flush that fails after seconds is a disk to look at as well.
-        self.metrics.record_flush_time(started.elapsed());
-        if flushed.is_err() {
+        if self.sync_journal().await.is_err() {
             return false;
         }
         self.metrics.record_flush();
         self.lazy.flushed.fetch_max(deferred, Ordering::AcqRel);
         true
+    }
+
+    /// [`Journal::flush`], timed (#559): every flush of this node's journal
+    /// goes through here, a batch's, the lazy flusher's and the sweep's
+    /// alike. One that fails after seconds is a disk to look at as well, so
+    /// it is timed too.
+    async fn sync_journal(&self) -> anyhow::Result<()> {
+        let started = Instant::now();
+        let flushed = self.journal.flush().await;
+        self.metrics.record_flush_time(started.elapsed());
+        flushed
     }
 
     /// The lazy flusher (see [`start`](Self::start)): once a flush was put
@@ -3065,7 +3072,7 @@ impl Node {
                 return false;
             }
         }
-        if let Err(err) = self.journal.flush().await {
+        if let Err(err) = self.sync_journal().await {
             tracing::warn!(
                 node = self.id.0,
                 %err,
@@ -3536,7 +3543,7 @@ impl Node {
         if sends.is_empty() {
             return;
         }
-        if self.journal.flush().await.is_ok() {
+        if self.sync_journal().await.is_ok() {
             self.metrics.record_flush();
             for (to, message) in sends {
                 self.send(to, message).await;
@@ -4577,7 +4584,7 @@ impl Node {
     async fn handle(&self, env: Envelope) {
         let sends = self.handle_staged(env).await;
         // Withhold the durability-gated sends if the fsync failed (see `start`).
-        if self.journal.flush().await.is_ok() {
+        if self.sync_journal().await.is_ok() {
             self.metrics.record_flush();
             for (to, message) in sends {
                 self.send(to, message).await;
@@ -9732,7 +9739,7 @@ impl Node {
             votes_restored: true,
             ..fence
         };
-        if let Err(err) = self.journal.flush().await {
+        if let Err(err) = self.sync_journal().await {
             tracing::warn!(node = self.id.0, %err, "cannot flush the journal before recording the restored config votes");
             return false;
         }
@@ -9930,7 +9937,7 @@ impl Node {
         let Some(fence) = fence else {
             return Ok(());
         };
-        self.journal.flush().await?;
+        self.sync_journal().await?;
         self.metrics.record_flush();
         self.journal
             .save_amnesia_fence(&fence)
@@ -10965,7 +10972,7 @@ impl Node {
             tracing::warn!(node = self.id.0, since, %err, "cannot journal a finished copy; not reporting it");
             return false;
         }
-        if let Err(err) = self.journal.flush().await {
+        if let Err(err) = self.sync_journal().await {
             tracing::warn!(node = self.id.0, since, %err, "cannot flush a finished copy; not reporting it");
             return false;
         }
@@ -12199,7 +12206,7 @@ impl Node {
             for txn in &installed.invalidated {
                 self.journal_stage(*txn).await;
             }
-            if self.journal.flush().await.is_ok() {
+            if self.sync_journal().await.is_ok() {
                 self.metrics.record_flush();
             }
         }
@@ -12897,7 +12904,7 @@ impl Node {
         let Some(fence) = self.stage_vote_fence().await else {
             return false;
         };
-        match self.journal.flush().await {
+        match self.sync_journal().await {
             Ok(()) => {
                 self.metrics.record_flush();
                 self.replica
