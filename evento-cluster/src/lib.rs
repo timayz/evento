@@ -95,7 +95,7 @@ pub use backend::ClusterBackend;
 pub use clock::{Clock, HybridLogicalClock, NodeId, MAX_SKEW_MICROS};
 pub use cover::{Cover, CoveredKey, CoveredSubscription, Covering};
 pub use executor::{ClusterExecutor, ExecutorDataStore};
-pub use host::{Cluster, LiveNode, NodeHealth, PeerState, Settings};
+pub use host::{Cluster, LiveNode, Members, NodeHealth, PeerState, Settings};
 pub use metrics::{Histogram, HistogramSnapshot, Metrics, MetricsSnapshot, HISTOGRAM_BOUNDS};
 pub use node::{
     BacklogAtCap, CommandTooLarge, CommitOutcome, FenceNotCovered, Foundation, FoundedApart,
