@@ -106,6 +106,11 @@ cluster.node1:
 cluster.node2:
 	NODE_ID=2 cargo run -p bank-axum-cluster
 
+# A fourth node, new to the cluster: it waits until a member adds it
+# (curl -d id=3 http://127.0.0.1:3000/cluster/add), then copies the store.
+cluster.node3:
+	NODE_ID=3 cargo run -p bank-axum-cluster
+
 # Run the whole 3-node cluster at once (each node in its own process).
 cluster.all:
 	$(MAKE) cluster.node0 cluster.node1 cluster.node2 -j3
