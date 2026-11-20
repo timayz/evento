@@ -177,6 +177,10 @@ async fn a_write_on_one_node_is_read_on_another() {
     assert!(health.serving(), "{health:?}");
     assert!(!health.joined_at_start);
     assert!(health.peers.iter().all(|peer| !peer.given_up));
+    // The members are the layout the cluster was founded with.
+    let members = nodes[0].cluster.members();
+    assert_eq!(members.epoch, 0);
+    assert_eq!(members.nodes, [NodeId(0), NodeId(1), NodeId(2)]);
     eventually("every node is heard from", || async {
         nodes[1].cluster.live_nodes(Duration::from_secs(5)) == (1, 3)
     })

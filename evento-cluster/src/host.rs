@@ -49,13 +49,15 @@ use crate::node::{LostJournal, Node, NodeConfig, PartialSnapshot};
 use crate::share::Share;
 use crate::tcp::{serve, PeerAddr, TcpTransport};
 use crate::transport::{Envelope, InMemoryNetwork};
-use crate::{DataStore, Journal, MessageSink, StaticTopology, Topology};
+use crate::{DataStore, DynamicTopology, Journal, MessageSink, Topology};
 
 /// Frames waiting for the node's inbox loop, from the TCP listener.
 const INBOX_FRAMES: usize = 1024;
 
-/// The `[cluster]` section of a deployment's configuration: the membership
-/// and the few knobs an operator sets. Everything else in [`NodeConfig`]
+/// The `[cluster]` section of a deployment's configuration: the nodes the
+/// cluster is founded with, where they are reached, and the few knobs an
+/// operator sets. The members themselves are what the cluster agreed on
+/// since ([`Cluster::members`]), kept in each node's journal. Everything else in [`NodeConfig`]
 /// keeps its default, which a [`Builder::node_config`] hook can still
 /// change.
 ///
@@ -374,12 +376,24 @@ impl LiveNode {
     }
 }
 
+/// The members of the cluster, as [`Cluster::members`] reads them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Members {
+    /// How many times the members changed since the cluster was founded,
+    /// counting each step of a change.
+    pub epoch: u64,
+    /// The nodes that count, by id: a majority of them decides.
+    pub nodes: Vec<NodeId>,
+}
+
 /// This node, for a status page and the log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeHealth {
     /// This node's id.
     pub id: NodeId,
-    /// Nodes in the cluster, this one included.
+    /// Nodes in the cluster as it stands ([`Cluster::members`]), this one
+    /// included.
     pub nodes: usize,
     /// The finished writes kept for nodes that are away, and the most that
     /// may be kept before refusing new ones.
@@ -649,9 +663,13 @@ impl<E: ClusterBackend> Builder<E> {
                 (Arc::new(TcpTransport::new(id, peers)), inbox_rx)
             }
         };
+        // The members are what the cluster agreed on, which the journal
+        // keeps: `ids` is the layout it was founded with, and every layout
+        // decided since is installed over it when the journal is restored.
+        let topology: Arc<dyn Topology> = Arc::new(DynamicTopology::new(id, 0, vec![ids.clone()]));
         let node = Node::new(
             id,
-            Arc::new(StaticTopology::new(id, ids.clone())) as Arc<dyn Topology>,
+            topology.clone(),
             Arc::new(HybridLogicalClock::new(id)),
             sink,
             Arc::new(ExecutorDataStore::new(store.clone())) as Arc<dyn DataStore>,
@@ -671,7 +689,16 @@ impl<E: ClusterBackend> Builder<E> {
             }
             node.begin_join();
             tasks.push(node.start(inbox));
-            if let Err(err) = join_through(&node, &contacts_of(&ids, id)).await {
+            // The members the journal knows first, then whoever else the
+            // settings name: over a discarded journal the layout is still
+            // the founders', some of whom may have left.
+            let mut known = topology.nodes();
+            for &id in &ids {
+                if !known.contains(&id) {
+                    known.push(id);
+                }
+            }
+            if let Err(err) = join_through(&node, &contacts_of(&known, id)).await {
                 abort_all(tasks).await;
                 return Err(
                     err.context("cannot copy the store from a peer; the next start tries again")
@@ -740,7 +767,7 @@ impl<E: ClusterBackend> Builder<E> {
         let executor = ClusterExecutor::new(node.clone(), store);
         let cluster = Arc::new(Cluster {
             node,
-            ids,
+            topology,
             tasks: Mutex::new(tasks),
             joined: mark.is_some(),
             founded: found,
@@ -766,7 +793,8 @@ impl<E: ClusterBackend> Builder<E> {
 /// lost. Either way the operator restarts the node; nothing else.
 pub struct Cluster {
     node: Node,
-    ids: Vec<NodeId>,
+    /// The layouts the cluster agreed on, as this node installed them.
+    topology: Arc<dyn Topology>,
     /// The inbox loop, the recovery sweep, the listener and the signal watch.
     tasks: Mutex<Vec<JoinHandle<()>>>,
     joined: bool,
@@ -827,6 +855,18 @@ impl Cluster {
         self.node.id()
     }
 
+    /// The members the cluster agreed on, as this node holds them: the
+    /// layout it was founded with ([`Settings::peers`]), then every change
+    /// decided since, which the journal keeps. A node that was away learns
+    /// the changes it missed a moment after it is back.
+    pub fn members(&self) -> Members {
+        let layout = self.topology.layout();
+        Members {
+            epoch: layout.epoch(),
+            nodes: layout.nodes(),
+        }
+    }
+
     /// Waits, up to `limit`, until this node takes part: a node opened over
     /// a journal that holds something refuses writes until its peers confirm
     /// the journal is current. A command that writes as soon as it opens
@@ -851,9 +891,10 @@ impl Cluster {
     pub fn live(&self, within: Duration) -> Vec<LiveNode> {
         let me = self.node.id();
         let absent = self.node.absent_peers();
-        self.ids
-            .iter()
-            .filter_map(|&id| {
+        self.topology
+            .nodes()
+            .into_iter()
+            .filter_map(|id| {
                 if id == me {
                     Some(LiveNode {
                         id,
@@ -900,15 +941,15 @@ impl Cluster {
     pub fn health(&self) -> NodeHealth {
         let absent = self.node.absent_peers();
         let me = self.node.id();
+        let members = self.topology.nodes();
         NodeHealth {
             id: me,
-            nodes: self.ids.len(),
+            nodes: members.len(),
             backlog: (self.node.command_count(), self.node.config().max_commands),
-            peers: self
-                .ids
-                .iter()
-                .filter(|&&id| id != me)
-                .map(|&id| PeerState {
+            peers: members
+                .into_iter()
+                .filter(|&id| id != me)
+                .map(|id| PeerState {
                     id,
                     silent_for: self.node.silent_for(id),
                     given_up: absent.contains(&id),
