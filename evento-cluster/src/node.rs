@@ -2487,7 +2487,11 @@ impl Node {
         // Read first: the flush covers what the batches counted so far
         // staged, not what one counted during it does.
         let deferred = self.lazy.deferred.load(Ordering::Acquire);
-        if self.journal.flush().await.is_err() {
+        let started = Instant::now();
+        let flushed = self.journal.flush().await;
+        // A flush that fails after seconds is a disk to look at as well.
+        self.metrics.record_flush_time(started.elapsed());
+        if flushed.is_err() {
             return false;
         }
         self.metrics.record_flush();
@@ -6048,10 +6052,18 @@ impl Node {
             });
         }
 
-        // In one write, where the store has one and takes them all.
+        // In one write, where the store has one and takes them all. Timed
+        // (#559) when it took them: a store with no such write, or one that
+        // refuses the batch, wrote nothing.
+        let started = Instant::now();
         let together = batch.len() > 1
             && match self.datastore.apply_all(&batch).await {
-                Ok(together) => together,
+                Ok(together) => {
+                    if together {
+                        self.metrics.record_store_apply_time(started.elapsed());
+                    }
+                    together
+                }
                 Err(err) => {
                     tracing::debug!(
                         node = self.id.0,
@@ -6077,7 +6089,8 @@ impl Node {
             }
         } else {
             for (apply, decided) in taken.iter().zip(batch) {
-                if let Err(err) = self
+                let started = Instant::now();
+                let stored = self
                     .datastore
                     .apply(
                         decided.txn,
@@ -6085,8 +6098,9 @@ impl Node {
                         decided.events,
                         decided.commit,
                     )
-                    .await
-                {
+                    .await;
+                self.metrics.record_store_apply_time(started.elapsed());
+                if let Err(err) = stored {
                     self.metrics.record_execution_failure();
                     if self.store_behind(&err) {
                         tracing::error!(
@@ -13351,6 +13365,8 @@ mod tests {
         inner: InMemoryJournal,
         stages: AtomicUsize,
         flushes: AtomicUsize,
+        /// How long each flush takes: a disk's sync.
+        sync: Duration,
     }
 
     #[async_trait]
@@ -13365,6 +13381,9 @@ mod tests {
         }
         async fn flush(&self) -> anyhow::Result<()> {
             self.flushes.fetch_add(1, Ordering::SeqCst);
+            if !self.sync.is_zero() {
+                tokio::time::sleep(self.sync).await;
+            }
             Ok(())
         }
         async fn load(&self, txn: TxnId) -> anyhow::Result<Option<CommandState>> {
@@ -15809,5 +15828,84 @@ mod tests {
         burst(&node, WRITES).await;
         assert_eq!(store.singles.load(Ordering::SeqCst), WRITES);
         assert!(store.batches.lock().unwrap().is_empty());
+    }
+
+    /// Issue #559: a disk whose syncs take 165 ms reads as such in the
+    /// node's metrics — every flush of its journal timed, the lazy
+    /// flusher's included, none taken for fast.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_journal_flush_shows_in_the_flush_time() {
+        const SYNC: Duration = Duration::from_millis(165);
+        let journal = Arc::new(CountingJournal {
+            sync: SYNC,
+            ..CountingJournal::default()
+        });
+        let config = NodeConfig::default();
+        let (node, _net, _loop) = alone(
+            Arc::clone(&journal) as Arc<dyn Journal>,
+            Arc::new(InMemoryDataStore::new()),
+            config,
+        );
+        node.write(vec![opened("a")]).await.unwrap();
+        tokio::time::sleep(config.lazy_flush + SYNC * 2).await;
+
+        let flushes = journal.flushes.load(Ordering::SeqCst) as u64;
+        let times = node.metrics().journal_flush_seconds;
+        assert!(flushes >= 2, "the vote's flush and the lazy flusher's");
+        assert_eq!(times.count, flushes);
+        assert_eq!(times.sum(), SYNC * flushes as u32);
+        assert_eq!(times.over(Duration::from_millis(100)), flushes);
+        assert_eq!(times.over(Duration::from_millis(250)), 0);
+    }
+
+    /// Issue #559: a journal that fails its flush after a wait is timed as
+    /// one that succeeds: the count of flushes done stays at zero, the time
+    /// does not.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_journal_flush_is_timed_too() {
+        let (node, _net, _loop) = alone(
+            Arc::new(FlakyJournal::default()),
+            Arc::new(InMemoryDataStore::new()),
+            NodeConfig::default(),
+        );
+        assert!(!node.flush_journal().await);
+        let metrics = node.metrics();
+        assert_eq!(metrics.journal_flushes, 0);
+        assert_eq!(metrics.journal_flush_seconds.count, 1);
+    }
+
+    /// Issue #559: each write of the applier to the store is timed once — a
+    /// batch the store takes in one write as one, the applies of a batch it
+    /// refuses each as one.
+    #[tokio::test(start_paused = true)]
+    async fn the_store_write_time_counts_a_batch_once_and_single_applies_each() {
+        const WRITES: usize = 8;
+        let store = Arc::new(BatchStore::default());
+        let (node, _net, _loop) = alone(
+            Arc::new(InMemoryJournal::new()),
+            Arc::clone(&store) as Arc<dyn DataStore>,
+            NodeConfig::default(),
+        );
+        burst(&node, WRITES).await;
+        let times = node.metrics().store_apply_seconds;
+        assert_eq!(times.count, store.writes() as u64);
+        assert!(store.writes() < WRITES, "some were taken together");
+        assert_eq!(times.sum(), BatchStore::WRITE * store.writes() as u32);
+        assert_eq!(times.over(Duration::from_millis(5)), store.writes() as u64);
+
+        let store = Arc::new(BatchStore::default());
+        store.refusing.store(true, Ordering::SeqCst);
+        let (node, _net, _loop) = alone(
+            Arc::new(InMemoryJournal::new()),
+            Arc::clone(&store) as Arc<dyn DataStore>,
+            NodeConfig::default(),
+        );
+        burst(&node, WRITES).await;
+        let times = node.metrics().store_apply_seconds;
+        assert_eq!(
+            times.count, WRITES as u64,
+            "the refused batches wrote nothing"
+        );
+        assert_eq!(times.sum(), BatchStore::WRITE * WRITES as u32);
     }
 }

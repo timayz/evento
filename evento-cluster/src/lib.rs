@@ -96,7 +96,7 @@ pub use clock::{Clock, HybridLogicalClock, NodeId, MAX_SKEW_MICROS};
 pub use cover::{Cover, CoveredKey, Covering};
 pub use executor::{ClusterExecutor, ExecutorDataStore};
 pub use host::{Cluster, LiveNode, NodeHealth, PeerState, Settings};
-pub use metrics::{Metrics, MetricsSnapshot};
+pub use metrics::{Histogram, HistogramSnapshot, Metrics, MetricsSnapshot, HISTOGRAM_BOUNDS};
 pub use node::{
     BacklogAtCap, CommandTooLarge, CommitOutcome, FenceNotCovered, Foundation, FoundedApart,
     Invalidated, Joining, JournalRolledBack, LostJournal, Node, NodeClosed, NodeConfig,

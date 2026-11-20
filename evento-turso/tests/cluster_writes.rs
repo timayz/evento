@@ -4,7 +4,7 @@
 #![cfg(feature = "cluster")]
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use evento_cluster::{Cluster, ClusterExecutor};
 use evento_core::cursor::Args;
@@ -113,6 +113,23 @@ async fn sizing() -> anyhow::Result<()> {
         written / elapsed.as_secs_f64(),
         (after.journal_flushes - before.journal_flushes) as f64 / written,
     );
+    // The disk's part (#559), the warm-up included.
+    for (what, times) in [
+        ("journal flushes", after.journal_flush_seconds),
+        ("store writes", after.store_apply_seconds),
+    ] {
+        println!(
+            "{} {what}: mean {:.2?}, {} over 10 ms, {} over 100 ms, {} over 1 s",
+            times.count,
+            times
+                .sum()
+                .checked_div(times.count as u32)
+                .unwrap_or_default(),
+            times.over(Duration::from_millis(10)),
+            times.over(Duration::from_millis(100)),
+            times.over(Duration::from_secs(1)),
+        );
+    }
     cluster.shutdown().await;
     Ok(())
 }
