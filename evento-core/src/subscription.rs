@@ -9,6 +9,7 @@
 //! - [`SubscriptionBuilder`] - Builds and configures event subscriptions
 //! - [`Subscription`] - Handle to a running subscription
 //! - [`StopReason`] - Why a subscription's worker stopped
+//! - [`Lag`] - How far a subscription is behind the events it follows
 //! - [`Handler`] - Trait for event handlers
 //! - [`Context`] - Handler context with executor access
 //! - [`RoutingKey`] - Filter for event routing
@@ -44,6 +45,17 @@
 //! id, type, name and tenant, acknowledged and skipped;
 //! [`on_undecodable`](SubscriptionBuilder::on_undecodable) makes it stop the
 //! subscription like a handler error instead.
+//!
+//! # How far behind
+//!
+//! Each acknowledgement records how far the event handled was behind the
+//! newest, and between two of them nothing does: a subscription whose handler
+//! never returns keeps the small figure it last wrote, and so does one that
+//! stopped. Telling from outside, by the age of the store's newest event, is
+//! wrong whenever that event is not one the subscription follows — most of
+//! the time, for most subscriptions. [`Subscription::lag`] asks the store
+//! with the subscription's own filters, at any moment, and
+//! [`SubscriptionBuilder::lag`] answers for one that does not run here.
 //!
 //! # Starting position
 //!
@@ -168,7 +180,7 @@ use ulid::Ulid;
 
 use crate::{
     context,
-    cursor::{Args, Value},
+    cursor::{Args, Cursor, Value},
     upcast::{Alias, Aliases},
     Aggregate, AggregateEvent, DeadLetter, DecodeError, EventFilter, Executor, FromEventError,
     TenantFilter, MAX_DEAD_LETTER_ERROR_LEN,
@@ -461,8 +473,9 @@ enum CursorStore {
     Persisted,
     /// This worker's memory, for a live bridge that owns nothing and resumes
     /// nothing (see [`SubscriptionBuilder::ephemeral`]). No row, no fence, and
-    /// no write to the store at all.
-    Local(Mutex<Option<Value>>),
+    /// no write to the store at all. Shared with the handle, which reads
+    /// it to say how far behind the worker is ([`Subscription::lag`]).
+    Local(Arc<Mutex<Option<Value>>>),
 }
 
 impl CursorStore {
@@ -524,6 +537,121 @@ enum Failure {
     Event,
     /// Anything else.
     Unclassified,
+}
+
+/// How far a subscription is behind the events it follows, at the time of
+/// asking ([`Subscription::lag`], [`SubscriptionBuilder::lag`]).
+///
+/// Found from the store, with the filters the subscription reads with: an
+/// event it does not follow never counts, however new, and no acknowledgement
+/// has to happen for the figures to move. The default is a subscription whose
+/// cursor is at the newest event it follows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Lag {
+    /// The seconds between the event the cursor is at and the newest event
+    /// followed, as each acknowledgement records them: how much of the
+    /// history is left to go through. `0` at the newest event — and, the
+    /// timestamps being whole seconds, when what is left was written within
+    /// the second of the cursor's event.
+    pub behind: u64,
+    /// When the oldest event followed and not acknowledged yet was written
+    /// (Unix seconds); `None` when there is none. An event stays here while
+    /// its handler runs, so one that never returns shows as a time that
+    /// only gets older ([`waiting`](Self::waiting)).
+    pub pending_since: Option<u64>,
+}
+
+impl Lag {
+    /// Whether the cursor is at the newest event followed.
+    pub fn is_caught_up(&self) -> bool {
+        self.pending_since.is_none()
+    }
+
+    /// For how long the oldest event not acknowledged yet has been there;
+    /// zero when there is none. Small on a subscription that keeps up, and
+    /// growing on one that stopped or whose handler does not return, where
+    /// [`behind`](Self::behind) stays as it was until something else is
+    /// written.
+    pub fn waiting(&self) -> Duration {
+        let Some(since) = self.pending_since else {
+            return Duration::ZERO;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        Duration::from_secs(now.saturating_sub(since))
+    }
+}
+
+/// What tells one subscription's read from another's, and so what its
+/// [`Lag`] is found from.
+#[derive(Clone)]
+struct Followed {
+    filters: Arc<[EventFilter]>,
+    routing_key: RoutingKey,
+    tenant: TenantFilter,
+}
+
+impl Followed {
+    /// How far `cursor` is behind the newest of these events in `executor`.
+    async fn lag<E: Executor>(&self, executor: &E, cursor: Option<Value>) -> anyhow::Result<Lag> {
+        // Not bounded by the stability watermark: an event the worker may
+        // not read yet is one it has not handled all the same.
+        let next = executor
+            .read(
+                Some(self.filters.clone()),
+                Some(self.routing_key.clone()),
+                self.tenant.clone(),
+                Args::forward(1, cursor.clone()),
+                None,
+            )
+            .await?;
+        let Some(next) = next.edges.first() else {
+            return Ok(Lag::default());
+        };
+        // The newest event is read like the oldest, and not asked of
+        // `latest_timestamp`: a backend may answer that one with the newest
+        // event of the store, which bounds the lag an acknowledgement
+        // records from above and would here be the very figure that has a
+        // quiet subscription look behind.
+        let newest = executor
+            .read(
+                Some(self.filters.clone()),
+                Some(self.routing_key.clone()),
+                self.tenant.clone(),
+                Args::backward(1, None),
+                None,
+            )
+            .await?;
+        let newest = newest
+            .edges
+            .first()
+            .map_or(next.node.timestamp, |edge| edge.node.timestamp);
+        // A subscription that never acknowledged is behind by all there is.
+        let at = match &cursor {
+            Some(cursor) => crate::Event::deserialize_cursor(cursor)?.t,
+            None => next.node.timestamp,
+        };
+
+        Ok(Lag {
+            behind: newest.saturating_sub(at),
+            pending_since: Some(next.node.timestamp),
+        })
+    }
+}
+
+/// Asks the store how far behind a running worker is (see
+/// [`Subscription::lag`]): the handle is not generic over the executor, so
+/// the question is kept as a closure over it.
+#[derive(Clone)]
+struct LagProbe(Arc<dyn Fn() -> LagFuture + Send + Sync>);
+
+type LagFuture = Pin<Box<dyn Future<Output = anyhow::Result<Lag>> + Send>>;
+
+impl std::fmt::Debug for LagProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LagProbe")
+    }
 }
 
 /// What a single `process` pass concluded, beyond a hard error.
@@ -921,7 +1049,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
     /// a projection's cursor and its snapshots have to agree across restarts,
     /// and an in-memory cursor would make every boot re-fold from zero.
     pub fn ephemeral(mut self) -> Self {
-        self.cursor_store = CursorStore::Local(Mutex::new(None));
+        self.cursor_store = CursorStore::Local(Arc::new(Mutex::new(None)));
 
         self
     }
@@ -1189,6 +1317,67 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
         }
         self.resolve_routing_key(executor);
         Some(self.resolved_key.clone())
+    }
+
+    /// How far this subscription is behind the newest event it follows in
+    /// `executor`'s store, now: from the cursor kept there under its key, or
+    /// from its own for an [`ephemeral`](Self::ephemeral) one.
+    ///
+    /// For a subscription that does not run here — one that stopped, or that
+    /// another process runs: build it as its worker does, the handlers being
+    /// what says which events it follows. A running one answers from its
+    /// handle ([`Subscription::lag`]).
+    pub async fn lag(&mut self, executor: &E) -> anyhow::Result<Lag> {
+        self.resolve_routing_key(executor);
+        let cursor = match &self.cursor_store {
+            CursorStore::Local(cell) => cell.lock().expect("local cursor poisoned").clone(),
+            CursorStore::Persisted => {
+                executor
+                    .get_subscriber_cursor(self.resolved_key().to_owned())
+                    .await?
+            }
+        };
+        self.followed(&self.read_aggregators())
+            .lag(executor, cursor)
+            .await
+    }
+
+    /// What this subscription reads, `filters` being its
+    /// [`read_aggregators`](Self::read_aggregators).
+    fn followed(&self, filters: &Arc<[EventFilter]>) -> Followed {
+        Followed {
+            filters: filters.clone(),
+            routing_key: self.effective_routing_key(),
+            tenant: self.tenant.clone(),
+        }
+    }
+
+    /// The question [`Subscription::lag`] asks, kept for the handle before
+    /// the worker takes the builder.
+    fn lag_probe(&self, executor: &E, filters: &Arc<[EventFilter]>) -> LagProbe
+    where
+        E: Clone,
+    {
+        let followed = self.followed(filters);
+        let executor = executor.clone();
+        let key = self.resolved_key().to_owned();
+        let local = match &self.cursor_store {
+            CursorStore::Local(cell) => Some(cell.clone()),
+            CursorStore::Persisted => None,
+        };
+        LagProbe(Arc::new(move || {
+            let followed = followed.clone();
+            let executor = executor.clone();
+            let key = key.clone();
+            let local = local.clone();
+            Box::pin(async move {
+                let cursor = match local {
+                    Some(cell) => cell.lock().expect("local cursor poisoned").clone(),
+                    None => executor.get_subscriber_cursor(key).await?,
+                };
+                followed.lag(&executor, cursor).await
+            })
+        }))
     }
 
     /// Resolves an unset routing key from the executor's default and captures
@@ -2068,6 +2257,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             routing_key: Some(self.effective_routing_key()),
             tenant: self.tenant.clone(),
         });
+        let lag = self.lag_probe(&executor, &read_aggregators);
 
         let task_handle = tokio::spawn(async move {
             let start = self
@@ -2270,6 +2460,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             task_handle,
             shutdown_tx,
             stop_rx,
+            lag,
         })
     }
 
@@ -2589,6 +2780,7 @@ pub struct Subscription {
     task_handle: tokio::task::JoinHandle<()>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     stop_rx: tokio::sync::watch::Receiver<Option<StopReason>>,
+    lag: LagProbe,
 }
 
 impl Subscription {
@@ -2631,6 +2823,30 @@ impl Subscription {
     /// A non-blocking snapshot; [`stopped`](Self::stopped) waits for it.
     pub fn stop_reason(&self) -> Option<StopReason> {
         peek_stop_reason(&self.stop_rx)
+    }
+
+    /// How far the subscription is behind the newest event it follows, now.
+    ///
+    /// Asked of the store each time, so it says the truth between two
+    /// acknowledgements too, where the lag an acknowledgement records keeps
+    /// the last figure written: while a handler does not return, and after
+    /// the worker stopped. Its cursor and two reads of one event each: meant
+    /// for a status page or a health check, not for a hot path.
+    ///
+    /// ```rust,no_run
+    /// # use std::time::Duration;
+    /// # use evento::subscription::SubscriptionBuilder;
+    /// # async fn run<E: evento::Executor + Clone>(executor: &E) -> anyhow::Result<()> {
+    /// # let subscription = SubscriptionBuilder::new("my-subscription").start(executor).await?;
+    /// let lag = subscription.lag().await?;
+    /// if lag.waiting() > Duration::from_secs(60) {
+    ///     tracing::warn!(behind = lag.behind, "an event has been waiting for a minute");
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn lag(&self) -> anyhow::Result<Lag> {
+        (self.lag.0)().await
     }
 
     /// Waits until the worker stops, and reports why.
@@ -2729,7 +2945,7 @@ impl<E: Executor, EV: AggregateEvent + Send + Sync> Handler<E> for SkipHandler<E
 mod tests {
     use super::{
         await_stop_reason, context, peek_stop_reason, shutdown_requested, AtomicBool, Context,
-        CursorStore, Fault, Handler, Ordering, StopReason, SubscriptionBuilder, Value,
+        CursorStore, Fault, Handler, Lag, Ordering, StopReason, SubscriptionBuilder, Value,
     };
     use crate::cursor::{Args, ReadResult};
     use crate::{
@@ -3036,7 +3252,7 @@ mod tests {
     /// when a failed pass is retried.
     #[test]
     fn the_local_cursor_round_trips() {
-        let store = CursorStore::Local(Mutex::new(None));
+        let store = CursorStore::Local(Arc::new(Mutex::new(None)));
         assert!(store.is_ephemeral());
 
         let CursorStore::Local(cell) = &store else {
@@ -3491,6 +3707,23 @@ mod tests {
             self.0.dead_letters.lock().unwrap().clone()
         }
 
+        /// The events `filters` let through, by type and id.
+        fn matching<'a>(
+            &'a self,
+            filters: Option<&'a [EventFilter]>,
+        ) -> impl Iterator<Item = &'a Event> {
+            self.0.events.iter().filter(move |event| {
+                filters.is_none_or(|filters| {
+                    filters.iter().any(|f| {
+                        f.aggregate_type == event.aggregate_type
+                            && f.aggregate_id
+                                .as_ref()
+                                .is_none_or(|id| *id == event.aggregate_id)
+                    })
+                })
+            })
+        }
+
         /// Whether the cursor is past every event.
         async fn drained(&self) -> bool {
             let after = self.0.cursor.lock().unwrap().clone();
@@ -3548,31 +3781,20 @@ mod tests {
             _to_micros: Option<u64>,
         ) -> anyhow::Result<ReadResult<Event>> {
             self.0.reads.fetch_add(1, Ordering::SeqCst);
-            let events = self
-                .0
-                .events
-                .iter()
-                .filter(|event| {
-                    aggregators.as_ref().is_none_or(|filters| {
-                        filters.iter().any(|f| {
-                            f.aggregate_type == event.aggregate_type
-                                && f.aggregate_id
-                                    .as_ref()
-                                    .is_none_or(|id| *id == event.aggregate_id)
-                        })
-                    })
-                })
-                .cloned()
-                .collect();
+            let events = self.matching(aggregators.as_deref()).cloned().collect();
             Ok(crate::cursor::Reader::new(events).args(args).execute()?)
         }
         async fn latest_timestamp(
             &self,
-            _aggregators: Option<Arc<[EventFilter]>>,
+            aggregators: Option<Arc<[EventFilter]>>,
             _routing_key: Option<RoutingKey>,
             _tenant: TenantFilter,
         ) -> anyhow::Result<u64> {
-            Ok(self.0.events.iter().map(|e| e.timestamp).max().unwrap_or(0))
+            Ok(self
+                .matching(aggregators.as_deref())
+                .map(|e| e.timestamp)
+                .max()
+                .unwrap_or(0))
         }
         async fn get_snapshot(
             &self,
@@ -4009,6 +4231,168 @@ mod tests {
 
         // The window does not hold a shutdown back.
         store.wrote("test/Thing", "Happened");
+        subscription.shutdown().await.unwrap();
+    }
+
+    /// Handles `test/Thing`'s `Happened` and never returns from `on`.
+    struct Stuck {
+        on: &'static str,
+        entered: Arc<tokio::sync::Notify>,
+    }
+
+    impl Handler<Ledger> for Stuck {
+        fn handle<'a>(
+            &'a self,
+            _context: &'a Context<'a, Ledger>,
+            event: &'a Event,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>> {
+            Box::pin(async move {
+                if event.aggregate_id == self.on {
+                    self.entered.notify_one();
+                    std::future::pending::<()>().await;
+                }
+                Ok(())
+            })
+        }
+
+        fn aggregate_type(&self) -> &'static str {
+            "test/Thing"
+        }
+
+        fn event_name(&self) -> &'static str {
+            "Happened"
+        }
+    }
+
+    /// Issue #583: the newest event of the store is not one the subscription
+    /// follows, most of the time. It must not count: a subscription at the
+    /// newest event it follows is not behind.
+    #[tokio::test]
+    async fn an_event_the_subscription_does_not_follow_puts_it_behind_nothing() {
+        let _unlogged = unlogged().await;
+        let store = Ledger::of(2);
+        let mut events = store.0.events.clone();
+        events.push(Event {
+            id: Ulid::generate(),
+            aggregate_id: "other-0".to_owned(),
+            aggregate_type: "test/Other".to_owned(),
+            version: 1,
+            name: "Happened".to_owned(),
+            timestamp: 5_000,
+            ..Event::default()
+        });
+        let store = Ledger(Arc::new(LedgerInner {
+            events,
+            cursor: Mutex::new(None),
+            dead_letters: Mutex::new(Vec::new()),
+            signal: crate::WriteSignal::new(),
+            reads: AtomicUsize::new(0),
+        }));
+        let mut builder = Flaky::default().builder("sagas");
+
+        let lag = builder.lag(&store).await.unwrap();
+        assert_eq!(
+            lag,
+            Lag {
+                behind: 1,
+                pending_since: Some(1)
+            },
+            "nothing acknowledged: behind by the two events it follows"
+        );
+
+        builder.run_once(&store).await.unwrap();
+        let lag = builder.lag(&store).await.unwrap();
+        assert_eq!(lag, Lag::default());
+        assert!(lag.is_caught_up());
+        assert_eq!(lag.waiting(), Duration::ZERO);
+    }
+
+    /// Issue #583: a handler that never returns acknowledges nothing, so the
+    /// lag of the last acknowledgement stays small for good. Asked of the
+    /// handle, the event in hand shows as waiting.
+    #[tokio::test(start_paused = true)]
+    async fn the_handle_says_how_far_behind_a_stuck_handler_is() {
+        let _unlogged = unlogged().await;
+        let store = Ledger::of(4);
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let subscription = SubscriptionBuilder::new("sagas")
+            .handler(Stuck {
+                on: "thing-1",
+                entered: entered.clone(),
+            })
+            .ack_every(1)
+            .shutdown_grace(Duration::from_millis(10))
+            .start(&store)
+            .await
+            .unwrap();
+        entered.notified().await;
+
+        let lag = subscription.lag().await.unwrap();
+        assert_eq!(
+            lag,
+            Lag {
+                behind: 3,
+                pending_since: Some(2)
+            },
+            "the cursor is at thing-0 (1 s), thing-1 (2 s) waits, the newest is at 4 s"
+        );
+        assert!(!lag.is_caught_up());
+        assert!(lag.waiting() > Duration::from_secs(3600), "written in 1970");
+
+        subscription.shutdown().await.unwrap();
+    }
+
+    /// Issue #583: a subscription that stopped says nothing any more; built
+    /// again, it is asked how far behind it was left.
+    #[tokio::test]
+    async fn a_stopped_subscription_is_asked_from_its_builder() {
+        let _unlogged = unlogged().await;
+        let store = Ledger::of(3);
+        let handler = Flaky::default().failing("thing-1", 1);
+        let mut builder = handler.builder("sagas").no_retry();
+        builder.run_once(&store).await.expect_err("thing-1 fails");
+
+        assert_eq!(
+            builder.lag(&store).await.unwrap(),
+            Lag {
+                behind: 2,
+                pending_since: Some(2)
+            }
+        );
+
+        builder.run_once(&store).await.unwrap();
+        assert_eq!(builder.lag(&store).await.unwrap(), Lag::default());
+    }
+
+    /// An ephemeral subscription keeps its cursor to itself, and its handle
+    /// reads it there.
+    #[tokio::test(start_paused = true)]
+    async fn an_ephemeral_subscription_is_asked_from_its_own_cursor() {
+        let _unlogged = unlogged().await;
+        let store = Ledger::of(3);
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let subscription = SubscriptionBuilder::new("bridge")
+            .handler(Stuck {
+                on: "thing-2",
+                entered: entered.clone(),
+            })
+            .ack_every(1)
+            .ephemeral()
+            .shutdown_grace(Duration::from_millis(10))
+            .start(&store)
+            .await
+            .unwrap();
+        entered.notified().await;
+
+        assert!(store.0.cursor.lock().unwrap().is_none(), "nothing stored");
+        assert_eq!(
+            subscription.lag().await.unwrap(),
+            Lag {
+                behind: 1,
+                pending_since: Some(3)
+            }
+        );
+
         subscription.shutdown().await.unwrap();
     }
 }

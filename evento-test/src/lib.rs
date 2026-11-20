@@ -5398,6 +5398,14 @@ mod saga {
             .dead_letter()
     }
 
+    /// A subscription under `key` that stops at the event it fails on.
+    pub fn stopping<E: Executor>(key: &str) -> SubscriptionBuilder<E> {
+        SubscriptionBuilder::new(key)
+            .data(Key(key.to_owned()))
+            .handler(on_opened())
+            .no_retry()
+    }
+
     /// Whether `key`'s handler refuses the tenant `refused`.
     pub fn refuse(key: &str, refusing: bool) {
         let mut keys = REFUSING.write().unwrap();
@@ -5551,6 +5559,69 @@ pub async fn dead_letters<E: Executor + Clone>(executor: &E) -> anyhow::Result<(
         .delete_dead_letter(stored.clone(), poison_id)
         .await?;
     assert_eq!(executor.dead_letter_count(stored).await?, 0);
+
+    Ok(())
+}
+
+/// Scenario: a subscription is asked how far behind it is, and the store
+/// answers by the events it follows.
+///
+/// Guards issue #583: the lag an acknowledgement records says nothing between
+/// two of them, and the age of the store's newest event says nothing either —
+/// it is seldom an event the subscription follows. Asked of the store with
+/// the subscription's filters, a subscription held at an event shows that
+/// event waiting, and one at the newest event it follows shows nothing,
+/// whatever else was written since.
+pub async fn subscription_lag<E: Executor + Clone>(executor: &E) -> anyhow::Result<()> {
+    let id = Ulid::generate().to_string();
+    let key = format!("lag-{id}");
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+    };
+    let started = now();
+
+    let mut subscription = saga::stopping::<E>(&key);
+    assert_eq!(
+        subscription.lag(executor).await?,
+        evento::subscription::Lag::default(),
+        "nothing to follow yet"
+    );
+
+    open_in(executor, "", &id, 1).await?;
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    open_in(executor, "refused", &id, 2).await?;
+
+    // Never acknowledged: the first event waits.
+    let lag = subscription.lag(executor).await?;
+    assert!(!lag.is_caught_up());
+    let since = lag.pending_since.expect("an event waits");
+    assert!((started..=now()).contains(&since), "{lag:?}");
+
+    // Held at the second event: that one waits, and goes on waiting.
+    saga::refuse(&key, true);
+    subscription
+        .run_once(executor)
+        .await
+        .expect_err("the handler refuses the second event");
+    assert_eq!(saga::take(&key), [""]);
+    let held = subscription.lag(executor).await?;
+    assert!(!held.is_caught_up());
+    assert!(held.pending_since >= lag.pending_since, "{held:?}");
+
+    // An event it does not follow, written later, changes nothing.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    deposit_in(executor, "", &id, 1, 10).await?;
+    assert_eq!(subscription.lag(executor).await?, held);
+
+    // Past the event: at the newest it follows, though not at the newest.
+    saga::refuse(&key, false);
+    subscription.run_once(executor).await?;
+    assert_eq!(saga::take(&key), ["refused"]);
+    let lag = subscription.lag(executor).await?;
+    assert_eq!(lag, evento::subscription::Lag::default());
+    assert_eq!(lag.waiting(), std::time::Duration::ZERO);
 
     Ok(())
 }

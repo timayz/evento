@@ -436,6 +436,12 @@ async fn postgres_dead_letters() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn postgres_subscription_lag() -> anyhow::Result<()> {
+    let executor = create_postgres_executor("subscription_lag").await?;
+    evento_test::subscription_lag(&executor).await
+}
+
+#[tokio::test]
 async fn postgres_tenant_projection_subscription() -> anyhow::Result<()> {
     let executor = create_postgres_executor("tenant_projection_subscription").await?;
     evento_test::tenant_projection_subscription(&executor).await

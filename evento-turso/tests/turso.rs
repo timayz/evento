@@ -366,6 +366,12 @@ async fn turso_dead_letters() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn turso_subscription_lag() -> anyhow::Result<()> {
+    let executor = Turso::in_memory().await?;
+    evento_test::subscription_lag(&executor).await
+}
+
+#[tokio::test]
 async fn turso_tenant_projection_subscription() -> anyhow::Result<()> {
     let executor = Turso::in_memory().await?;
     evento_test::tenant_projection_subscription(&executor).await

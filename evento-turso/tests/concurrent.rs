@@ -328,6 +328,11 @@ async fn concurrent_dead_letters() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn concurrent_subscription_lag() -> anyhow::Result<()> {
+    evento_test::subscription_lag(&Turso::in_memory_concurrent().await?).await
+}
+
+#[tokio::test]
 async fn concurrent_delete_stream() -> anyhow::Result<()> {
     evento_test::delete_stream(&Turso::in_memory_concurrent().await?).await
 }
