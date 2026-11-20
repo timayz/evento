@@ -65,6 +65,18 @@ fn spawn_node_cfg(
 
 /// The settings the pre-seed tests run with: short rounds, so a change whose
 /// Paxos round is cut off gives up quickly.
+/// A tracing subscriber over `RUST_LOG`, to look into a run; nothing
+/// without it.
+fn init_tracing() {
+    if std::env::var_os("RUST_LOG").is_none() {
+        return;
+    }
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
 fn quick() -> NodeConfig {
     NodeConfig {
         collect_timeout: Duration::from_millis(500),
@@ -194,6 +206,22 @@ async fn await_versions(store: &InMemoryDataStore, aggregate_id: &str, versions:
         "{aggregate_id}: {:?}, not {versions:?}",
         versions_of(store, aggregate_id)
     );
+}
+
+/// Waits until every node of `replicas` holds `versions` of `aggregate_id`.
+/// A write is acknowledged once a quorum applied it, so the replica a gainer
+/// copies from may be the one still to apply; a pre-seed takes what its
+/// source holds and leaves the rest to the copy under the fence. A test that
+/// counts what a pre-seed brought waits for every source first.
+async fn await_versions_on(
+    nodes: &[TestNode],
+    replicas: std::ops::Range<usize>,
+    aggregate_id: &str,
+    versions: &[u16],
+) {
+    for replica in replicas {
+        await_versions(&nodes[replica].store, aggregate_id, versions).await;
+    }
 }
 
 async fn await_epoch(topology: &DynamicTopology, epoch: u64) {
@@ -718,6 +746,8 @@ async fn a_gainer_pre_seeds_before_the_change_is_decided() {
             .unwrap();
     }
 
+    await_versions_on(&nodes, 0..3, &left, &[1]).await;
+    await_versions_on(&nodes, 3..6, &right, &[1, 2]).await;
     // Nothing the driver proposes gets through: the change is not decided.
     let no_paxos: LinkFilter = Arc::new(|from, _, message| {
         from == NodeId(0) && matches!(message, Message::ConfigPrepare { .. })
@@ -786,6 +816,8 @@ async fn a_pre_seed_that_never_becomes_owner_is_dropped_at_the_next_activation()
             .await
             .unwrap();
     }
+    await_versions_on(&nodes, 0..3, &left, &[1]).await;
+    await_versions_on(&nodes, 3..6, &right, &[1]).await;
     let no_paxos: LinkFilter = Arc::new(|from, _, message| {
         from == NodeId(0) && matches!(message, Message::ConfigPrepare { .. })
     });
@@ -889,6 +921,7 @@ async fn a_pre_seed_for_a_change_that_never_came_expires() {
         .write(vec![event(&left, 1, "Bumped")])
         .await
         .unwrap();
+    await_versions_on(&nodes, 0..3, &left, &[1]).await;
     let no_paxos: LinkFilter = Arc::new(|from, _, message| {
         from == NodeId(0) && matches!(message, Message::ConfigPrepare { .. })
     });
@@ -1171,18 +1204,46 @@ async fn a_gainer_in_a_transition_in_progress_declines_a_pre_seed() {
     assert!(!fresh.conflict, "the copied version is enforced");
 }
 
-/// Waits until `topology` has `shards` installed.
-async fn await_layout(topology: &DynamicTopology, shards: &[Vec<NodeId>]) {
-    for _ in 0..12_000 {
-        if topology.layout().shards() == shards {
-            return;
+/// Waits until nodes 0 and 5 have `shards` installed, the outcome of the
+/// change `change` returned. A change that returns an error past its
+/// decision is completed by the sweeps; one that failed before it is not, and
+/// neither is one whose drain never ends. Which of them a run that never
+/// installs met is told by what each node holds, printed with the failure:
+/// the epoch (the transition's, once decided), and whether anything is
+/// left un-applied.
+async fn await_change(
+    nodes: &[TestNode],
+    shards: &[Vec<NodeId>],
+    change: &anyhow::Result<Vec<Vec<NodeId>>>,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while [0, 5]
+        .iter()
+        .any(|&node| nodes[node].topology.layout().shards() != shards)
+    {
+        if tokio::time::Instant::now() >= deadline {
+            let held: Vec<String> = nodes
+                .iter()
+                .map(|n| {
+                    format!(
+                        "node {}: epoch {}, at {:?}, {} commands, busy {}, stable {}, {:?}",
+                        n.node.id().0,
+                        n.topology.epoch(),
+                        n.topology.layout().shards(),
+                        n.node.command_count(),
+                        n.node.sweep_pressure().busy,
+                        n.node.stable_micros(),
+                        n.node.metrics(),
+                    )
+                })
+                .collect();
+            panic!(
+                "the layout {shards:?} was never installed; the change returned {change:?}\n{}",
+                held.join("\n")
+            );
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    panic!(
-        "topology did not install {shards:?}: at {:?}",
-        topology.layout().shards()
-    );
 }
 
 /// The setting of the stranded-vote tests (#500): node 5, cut off from every
@@ -1248,11 +1309,10 @@ async fn strand_a_vote_on_a_moved_key() -> (Arc<InMemoryNetwork>, Vec<TestNode>,
     )
     .await
     .expect("the change ends in bounded time");
-    if let Ok(installed) = change {
-        assert_eq!(installed, moved);
+    if let Ok(installed) = &change {
+        assert_eq!(*installed, moved);
     }
-    await_layout(&nodes[0].topology, &moved).await;
-    await_layout(&nodes[5].topology, &moved).await;
+    await_change(&nodes, &moved, &change).await;
     // The topology shows the layout before the activation, which takes the
     // replica lock, forgets the vote.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
@@ -1276,6 +1336,7 @@ async fn strand_a_vote_on_a_moved_key() -> (Arc<InMemoryNetwork>, Vec<TestNode>,
 /// the key's new replicas.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn a_vote_on_a_key_a_change_took_is_forgotten_at_the_activation() {
+    init_tracing();
     let (_net, nodes, _moved) = strand_a_vote_on_a_moved_key().await;
     assert_eq!(
         nodes[5].node.metrics().votes_forgotten,
@@ -1294,17 +1355,17 @@ async fn a_vote_on_a_key_a_change_took_is_forgotten_at_the_activation() {
     )
     .await
     .expect("the change ends in bounded time");
-    if let Ok(installed) = change {
-        assert_eq!(installed, shrunk);
+    if let Ok(installed) = &change {
+        assert_eq!(*installed, shrunk);
     }
-    await_layout(&nodes[0].topology, &shrunk).await;
-    await_layout(&nodes[5].topology, &shrunk).await;
+    await_change(&nodes, &shrunk, &change).await;
 }
 
 /// The journal replays the vote at a restart; the node forgets it again
 /// under the layout it has installed (#500).
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn a_vote_on_a_key_a_change_took_is_forgotten_again_after_a_restart() {
+    init_tracing();
     let (net, mut nodes, moved) = strand_a_vote_on_a_moved_key().await;
     assert_eq!(nodes[5].node.metrics().votes_forgotten, 1);
     nodes[5].stop();
@@ -1333,11 +1394,10 @@ async fn a_vote_on_a_key_a_change_took_is_forgotten_again_after_a_restart() {
     )
     .await
     .expect("the change ends in bounded time");
-    if let Ok(installed) = change {
-        assert_eq!(installed, shrunk);
+    if let Ok(installed) = &change {
+        assert_eq!(*installed, shrunk);
     }
-    await_layout(&nodes[0].topology, &shrunk).await;
-    await_layout(&nodes[5].topology, &shrunk).await;
+    await_change(&nodes, &shrunk, &change).await;
 }
 
 /// A replica added at once whose join failed partway is still joining when
