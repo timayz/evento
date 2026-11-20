@@ -34,7 +34,8 @@ Worked, copy-pasteable deployments live in the examples:
 
 **From settings.** `Cluster::builder` opens one node from the `[cluster]` section of
 the deployment's configuration (`evento_cluster::Settings`: `node_id`, `peers`,
-optional `listen`, `absent_after_secs`, `write_backlog`, `linearizable_reads`) over a
+optional `founders`, `listen`, `absent_after_secs`, `write_backlog`,
+`linearizable_reads`) over a
 local store that implements `ClusterBackend` (`Turso`, `Sql`, `Fjall` under their
 `cluster` feature); without a section it runs a node alone over the in-memory
 transport, so one binary serves both deployments:
@@ -62,6 +63,73 @@ marked as the one a new group begins with (`Cluster::mark_for_founding`,
 that came with it discarded (§8, a group brought back from one node's store). `Builder::node_config`
 adjusts the derived `NodeConfig`; `Builder::before_copy` runs what the application
 derives from the events (read models next to them) once the store was emptied.
+
+**Changing the members.** `peers` says where the nodes are reached; who counts is
+what the cluster agreed on: the first `founders` of `peers` (all of them, unset),
+then every change decided since, kept in each node's journal and read with
+`cluster.members()`. A cluster that is to grow sets `founders` on every node, from
+the start and for good (a cluster founded with three nodes says 3 however many it
+has now), and changes its members with three calls, each made **once, on any
+member**, none of which restarts a node:
+
+```rust
+cluster.add_node(NodeId(3), "10.0.0.4:7000".parse::<PeerAddr>()?).await?;
+cluster.remove_node(NodeId(1)).await?;
+cluster.replace_node(NodeId(2), NodeId(4), "10.0.0.5:7000".parse::<PeerAddr>()?).await?;
+```
+
+- **The new node** is a process started with its own `node_id`, past the founders,
+  its own address at that place in `peers`, and the members' before it, over an
+  **empty** store and state directory. Its `open()` finds it is no member, marks the
+  store (`<state_dir>/rejoin` holding `new`), waits for a member to add it — saying so
+  in the log every 30 s — copies the store from a member, and returns once it serves.
+  It founds nothing, whether it starts before the call or after it; restarted while
+  it waits or copies, it waits and copies again. The application starts its listeners
+  and subscriptions after `open()` returns, so a readiness probe never takes a node
+  that is still copying.
+- **Addresses.** The address given to the call is written into the store
+  (`evento_cluster::addresses`, one stream per node of type
+  `evento-cluster/Address`), and every member dials the node there within a second,
+  and after a restart onto settings that do not name it. The settings stand for the
+  nodes they name: a node that moves has its peers restarted onto another `peers`, or is said
+  again with `addresses::record` when no settings name it. Ids are places in `peers`,
+  so a node that left keeps its entry.
+- **Adding** installs at once: the members go on writing, and from that moment a
+  majority counts the new node — three of four, with the fourth still copying. Add a
+  node when it is about to start, not long before.
+- **Removing and replacing** take a transition (§6): decided at once, done a few
+  seconds later for a removal, and once the new node copied the store for a
+  replacement. **Writes are refused meanwhile** (`WriteError::Unavailable`) and tried
+  again by the caller; reads are answered, linearizable ones included: start a replacement node *before* asking for the change, and
+  the whole takes seconds. A majority of the members as they were must be up
+  throughout: of three nodes with one dead, both others. The call returns once the
+  change is done, or after six `collect_timeout`s (30 s) with the change left to the
+  nodes; `members().change` then says what it waits for (`Wait::Drain`,
+  `Wait::Copy(node)`) on every member, across restarts of any of them.
+- **Work shared among the nodes** (`live`, `share`, the cover below) counts a node
+  once it is heard from: one added and yet to start is in no count, and one still
+  copying has not said what it serves, so the cover takes nothing on and hands
+  nothing back until it has.
+- **Said twice**, by one member or two, a change is made once. While one is in
+  progress a change to other members is refused: ask again once it is done.
+- **A removed node** that still runs takes no part: `health().member` is false,
+  `serving()` with it, and the log says to stop it. It does not open again over its
+  files (nothing is emptied on the word of a `node_id`); to bring that machine back,
+  start it as a new node, under an id never used, over an empty directory.
+- **One shard.** The host founds and keeps a cluster of one shard, every node
+  holding every event. A cluster cut into shards is changed through
+  `Node::change_topology` (§6).
+- **Founded with one node.** A node opened with one address in `peers` reads its
+  own writes without a consensus round, and waits for no peer. Once it has members
+  besides itself its next start reads through the quorum like any node with peers;
+  until that restart it keeps reading locally. Set `linearizable_reads = true`, and
+  give it a state directory, from the start on a cluster that begins with one node
+  and is to grow.
+
+What stays with the application: starting the new process and giving it its address,
+calling `add_node` once, keeping its balancer off the node until `open()` returned,
+and whatever it keeps per node besides the events. `examples/bank-axum-cluster`
+shows the three calls behind `/cluster/*` routes.
 
 **Work shared among the nodes.** Every node holds every event, but a deployment may
 give each node a routing key of its own (`default_routing_key`), so its subscriptions
@@ -368,6 +436,11 @@ Suggested alerts: `recoveries` rate > 0 for several minutes; `compactions` flat 
 ---
 
 ## 6. Scaling (membership & re-sharding)
+
+A node opened through `Cluster::builder` changes its members with
+`Cluster::add_node`, `remove_node` and `replace_node` (§2, "Changing the members"),
+which run the sequences below; what follows is the node's own interface, and what a
+change does underneath.
 
 Requires `DynamicTopology`. Membership changes are decided by a durable, replicated
 metadata log (config-Paxos); concurrent reconfigurations converge without a leader

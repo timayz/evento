@@ -311,6 +311,16 @@ async fn a_node_added_first_and_twice_joins_when_it_starts() {
     })
     .await;
 
+    // Work shared among the nodes heard from goes to the three that run:
+    // the node that has yet to start is in no one's count, once it has
+    // been silent for as long as the count looks back.
+    eventually("the node that has yet to start is in no count", || async {
+        let live = nodes[0].cluster.live(Duration::from_secs(3));
+        live.iter().map(|node| node.id).collect::<Vec<_>>() == ids(&[0, 1, 2])
+            && nodes[0].cluster.share(Duration::from_secs(3)).of == 3
+    })
+    .await;
+
     let restarted = nodes.remove(1);
     restarted.cluster.shutdown().await;
     drop(restarted);
@@ -332,6 +342,12 @@ async fn a_node_added_first_and_twice_joins_when_it_starts() {
         node.await_count("acc", 3, "every founder reads the new node's write")
             .await;
     }
+    // Joined, it takes its part of the work, having said what it serves.
+    eventually("the new node is in every count", || async {
+        let live = nodes[0].cluster.live(Duration::from_secs(5));
+        live.len() == 4 && live.iter().all(|node| node.keys.is_some())
+    })
+    .await;
 
     // Restarted in its turn, it opens as any member does: no copy.
     added.cluster.shutdown().await;
@@ -519,6 +535,31 @@ async fn a_dead_node_is_replaced_by_a_new_one() {
         change.waits_for.contains(&Wait::Copy(NodeId(3))),
         "{change:?}"
     );
+
+    // Meanwhile the store takes no write, and says so; what it holds is
+    // read, through the quorum too.
+    let refused = nodes[0]
+        .executor
+        .write(vec![event("acc", 4)])
+        .await
+        .expect_err("no write while the members change");
+    assert!(
+        matches!(refused, evento_core::WriteError::Unavailable(_)),
+        "{refused:?}"
+    );
+    let read = nodes[0]
+        .executor
+        .read(
+            Some([EventFilter::by_id_raw(AGG, "acc")].into()),
+            None,
+            TenantFilter::All,
+            Args::forward(100, None),
+            None,
+        )
+        .await
+        .expect("a linearizable read is answered while the members change");
+    assert_eq!(read.edges.len(), 3);
+    assert_eq!(nodes[0].count("acc").await, 3);
 
     // A member restarted in the middle holds the change from its journal.
     nodes.remove(1).stop().await;

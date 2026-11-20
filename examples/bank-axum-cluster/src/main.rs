@@ -26,6 +26,18 @@
 //! make cluster.all
 //! ```
 //!
+//! The cluster grows and shrinks while it runs (`OPERATIONS.md` §6): a node
+//! whose `NODE_ID` is past `CLUSTER_SIZE` is new, and waits until a member
+//! adds it, then copies the store and serves.
+//!
+//! ```text
+//! NODE_ID=3 cargo run -p bank-axum-cluster  # or: make cluster.node3 — waits
+//! curl -d id=3 http://127.0.0.1:3000/cluster/add          # on any member
+//! curl http://127.0.0.1:3000/cluster                      # the members
+//! curl -d id=3 http://127.0.0.1:3000/cluster/remove
+//! curl -d 'id=2&with=4' http://127.0.0.1:3000/cluster/replace
+//! ```
+//!
 //! A subscription stops on the first handler error unless
 //! `.continue_on_error()` is set, and a stopped projection worker means this
 //! node keeps answering reads from a read model that no longer updates. `/health`
@@ -48,13 +60,14 @@ use bank::{
     account_details, AccountDetailsView, AccountType, Command, DepositMoney, OpenAccount,
     ReceiveMoney, TransferMoney, WithdrawMoney,
 };
-use evento::cluster::{Cluster, ClusterExecutor, Settings};
+use evento::cluster::{Cluster, ClusterExecutor, Members, NodeId, Settings};
 use evento::Fjall;
 use serde::Deserialize;
 use ulid::Ulid;
 
-/// Accord membership for the demo cluster: 3 nodes on localhost by default
-/// (override with `CLUSTER_SIZE`). With `N = 2f+1` this tolerates
+/// The nodes the demo cluster is founded with: 3 on localhost by default
+/// (override with `CLUSTER_SIZE`); a node past them is added while the
+/// cluster runs. With `N = 2f+1` this tolerates
 /// `(N-1)/2` nodes down (writes need a majority quorum).
 const DEFAULT_CLUSTER_SIZE: u64 = 3;
 const CLUSTER_BASE_PORT: u16 = 7000;
@@ -122,19 +135,21 @@ async fn main() -> anyhow::Result<()> {
     // file: here from the environment. `None` runs a node alone.
     let settings = match node_id {
         Some(id) => {
-            assert!(id < cluster_size, "NODE_ID must be 0..{cluster_size}");
-            let peers: Vec<SocketAddr> = (0..cluster_size)
-                .map(|n| {
-                    format!("127.0.0.1:{}", CLUSTER_BASE_PORT + n as u16)
-                        .parse()
-                        .unwrap()
-                })
-                .collect();
+            // Every node lists the founders, and itself when it is not one:
+            // such a node is new, and joins once a member adds it
+            // (`POST /cluster/add`) instead of founding a cluster.
+            let peers: Vec<SocketAddr> = (0..cluster_size.max(id + 1)).map(node_addr).collect();
             println!(
-                "Cluster node {id} listening on {} ({cluster_size}-node cluster)",
+                "Cluster node {id} listening on {} (cluster founded with {cluster_size} nodes)",
                 peers[id as usize]
             );
-            Some(Settings::new(id, peers))
+            if id >= cluster_size {
+                println!("New node: waiting for `curl -d id={id} http://127.0.0.1:{WEB_BASE_PORT}/cluster/add`");
+            }
+            Some(Settings {
+                founders: Some(cluster_size),
+                ..Settings::new(id, peers)
+            })
         }
         None => {
             println!(
@@ -183,6 +198,12 @@ async fn main() -> anyhow::Result<()> {
         // Ops endpoints (see OPERATIONS.md): Prometheus scrape target + liveness.
         .route("/metrics", get(metrics))
         .route("/health", get(health))
+        // The members, and the calls that change them: an operator's, behind
+        // whatever guards the application's own administration.
+        .route("/cluster", get(members))
+        .route("/cluster/add", post(add_node))
+        .route("/cluster/remove", post(remove_node))
+        .route("/cluster/replace", post(replace_node))
         .with_state(state);
 
     let web_addr = format!("127.0.0.1:{web_port}");
@@ -279,8 +300,8 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             format!(
-                "node not serving (confirmed: {}, rejoin required: {}, rolled back: {}, copy pending: {}): restart it",
-                node.confirmed, node.rejoin_required, node.rolled_back, node.copy_pending
+                "node not serving (member: {}, confirmed: {}, rejoin required: {}, rolled back: {}, copy pending: {}): restart it, or stop it if it was removed",
+                node.member, node.confirmed, node.rejoin_required, node.rolled_back, node.copy_pending
             ),
         );
     }
@@ -291,6 +312,85 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
             format!("projection subscription stopped: {reason}"),
         ),
     }
+}
+
+/// Where node `id` of the demo listens for the other nodes.
+fn node_addr(id: u64) -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], CLUSTER_BASE_PORT + id as u16))
+}
+
+/// The members as a line of text: who counts, and the change in progress
+/// with what it waits for.
+fn describe(members: &Members) -> String {
+    let ids = |nodes: &[NodeId]| nodes.iter().map(|node| node.0).collect::<Vec<_>>();
+    match &members.change {
+        None => format!(
+            "epoch {}: members {:?}\n",
+            members.epoch,
+            ids(&members.nodes)
+        ),
+        Some(change) => format!(
+            "epoch {}: members {:?}, changing to {:?} (waits for {:?})\n",
+            members.epoch,
+            ids(&members.nodes),
+            ids(&change.to),
+            change.waits_for
+        ),
+    }
+}
+
+fn changed(outcome: anyhow::Result<Members>) -> (StatusCode, String) {
+    match outcome {
+        Ok(members) => (StatusCode::OK, describe(&members)),
+        Err(err) => (StatusCode::CONFLICT, format!("{err:#}\n")),
+    }
+}
+
+async fn members(State(state): State<AppState>) -> impl IntoResponse {
+    describe(&state.cluster.members())
+}
+
+#[derive(Deserialize)]
+struct NodeForm {
+    id: u64,
+}
+
+#[derive(Deserialize)]
+struct ReplaceForm {
+    id: u64,
+    with: u64,
+}
+
+/// Adds a node, started (or about to be) with that `NODE_ID`. Called on any
+/// member, once.
+async fn add_node(State(state): State<AppState>, Form(form): Form<NodeForm>) -> impl IntoResponse {
+    changed(
+        state
+            .cluster
+            .add_node(NodeId(form.id), node_addr(form.id))
+            .await,
+    )
+}
+
+/// Removes a node, running or gone for good.
+async fn remove_node(
+    State(state): State<AppState>,
+    Form(form): Form<NodeForm>,
+) -> impl IntoResponse {
+    changed(state.cluster.remove_node(NodeId(form.id)).await)
+}
+
+/// Replaces a node by a new one, in one change.
+async fn replace_node(
+    State(state): State<AppState>,
+    Form(form): Form<ReplaceForm>,
+) -> impl IntoResponse {
+    changed(
+        state
+            .cluster
+            .replace_node(NodeId(form.id), NodeId(form.with), node_addr(form.with))
+            .await,
+    )
 }
 
 async fn list_accounts() -> Response {
