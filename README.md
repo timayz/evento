@@ -399,6 +399,16 @@ removing it on success. The SQL, Turso and Fjall stores keep them (SQL: migratio
 on a cluster they are per node, like cursors; a bare remote client does not keep them — put
 it behind a `Sidecar`.
 
+`subscription.lag().await?` says how far behind a subscription is, now: a
+[`Lag`](https://docs.rs/evento/latest/evento/subscription/struct.Lag.html) with `behind`
+(the seconds between the event its cursor is at and the newest event it follows) and
+`pending_since` (when the oldest event it has not acknowledged was written; `waiting()` is
+its age). The store is asked with the subscription's own filters, so an event it does not
+follow never counts, and nothing has to be acknowledged for the answer to move: a handler
+that never returns shows as an event waiting longer and longer. For a subscription that
+stopped, or that another process runs, `builder.lag(&executor)` answers the same from the
+stored cursor.
+
 `.data(v)` stores `v` under its own type; a handler reads it back with
 `ctx.extract::<T>()`, or `ctx.try_extract::<T>()?` to get an error instead of a panic
 when it was never registered. Extraction clones, so the type should be `Clone` and cheap
@@ -763,6 +773,7 @@ plus the [`bank-axum-cluster`](examples/bank-axum-cluster) 3-node demo.
 | List / retry the events given up on | `exec.dead_letters(key, limit)` / `builder.redeliver(exec, &letter)` |
 | Stop on a payload that does not decode (default: skip it) | `.on_undecodable(Undecodable::Stop)` |
 | Notice a stopped subscription | `subscription.stopped().await` → `StopReason` |
+| How far behind a subscription is, now | `subscription.lag().await?` / `builder.lag(exec).await?` → `Lag` |
 | Live bridge (SSE/WebSocket) | `.live(exec)` = `.ephemeral().start_from_latest().start(exec)` |
 | Skip history on a new subscription | `.start_from_latest()` |
 | Stop a subscription from inside a handler | `ctx.stop()` |

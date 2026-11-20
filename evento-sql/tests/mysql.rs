@@ -435,6 +435,12 @@ async fn mysql_dead_letters() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn mysql_subscription_lag() -> anyhow::Result<()> {
+    let executor = create_mysql_executor("subscription_lag").await?;
+    evento_test::subscription_lag(&executor).await
+}
+
+#[tokio::test]
 async fn mysql_tenant_projection_subscription() -> anyhow::Result<()> {
     let executor = create_mysql_executor("tenant_projection_subscription").await?;
     evento_test::tenant_projection_subscription(&executor).await

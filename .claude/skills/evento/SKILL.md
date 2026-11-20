@@ -393,6 +393,12 @@ sub.shutdown().await?;
   `StoppedByHandler`, `LostOwnership` (another worker claimed the key), `Failed(err)`
   (retries exhausted, no `.continue_on_error()`), or `Panicked`. Await it to notice a
   dead subscription instead of discovering a stale read model later.
+- `sub.lag().await?` → `Lag { behind, pending_since }`, asked of the store now with the
+  subscription's own filters: `behind` = seconds from the cursor's event to the newest event it
+  follows, `pending_since` = when the oldest unacknowledged one was written (`.waiting()` = its
+  age, `.is_caught_up()`). An event it does not follow never counts, and a handler that never
+  returns shows as `waiting()` growing. `builder.lag(exec)` answers for one not running here.
+  Use it for health checks instead of comparing a cursor with the store's newest event.
 - `.strict()` fails on an unhandled event; `.continue_on_error()` keeps going after a handler error.
 - `.dead_letter()` (with `.retry(n)`) is the saga mode between the two: a handler error is retried
   on that event with back-off, then the event is recorded as a `DeadLetter` beside the cursor,
