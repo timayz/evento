@@ -731,6 +731,10 @@ impl<E: Executor + Clone> Executor for ClusterExecutor<E> {
         self.local.default_routing_key()
     }
 
+    async fn resolve_default_routing_key(&self) -> anyhow::Result<Option<String>> {
+        self.local.resolve_default_routing_key().await
+    }
+
     async fn write(&self, events: Vec<Event>) -> Result<(), WriteError> {
         if events.is_empty() {
             return Err(WriteError::MissingData);

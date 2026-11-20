@@ -40,6 +40,19 @@ together come back spread out. `ClientBuilder::reconnect_backoff(min, max)` sets
 the bounds (100 ms and 5 s by default); stretch them when many clients share one
 server.
 
+`Client::connect` fails when the server does not answer. An application that must
+open while its store is away builds its client with
+`Client::builder(addr).connect_lazy()`: the client exists at once and connects in
+the background on the same schedule. Until the server answers its calls fail at
+once with `NotConnected`, and the default routing key, which the server's `Hello`
+brings, is not known (`Executor::resolve_default_routing_key` fails too, so
+nothing is written or named under no key). A subscription started `supervised()`
+on such a client starts, and handles its first event when the server comes. A
+credential the server refuses before it ever accepted it is final: the client
+stops dialling and its calls fail with `Rejection::Unauthorized`. `Client::state()`
+says how it stands (connecting with the last error and since when, connected,
+refused) and `Client::connected()` waits.
+
 A host authenticating its clients implements `Resolver`: every connection opens
 with a `Hello` carrying the client's token (`Client::builder(addr).token(..)`), and
 the resolver answers with the `Session` to serve it — the executor, a guard kept

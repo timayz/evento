@@ -10,6 +10,20 @@
 //! ([`ClientBuilder::reconnect_backoff`]). Requests are
 //! round-robined across connections.
 //!
+//! **Before the server answers.** [`ClientBuilder::connect`] returns once
+//! every connection said `Hello`, and fails when the server does not answer.
+//! [`ClientBuilder::connect_lazy`] gives the client at once and connects in
+//! the background, on the reconnect schedule: for an application that must
+//! open while its store is away. Until the first `Hello` is answered every
+//! call fails with [`NotConnected`] instead of waiting — a failure a
+//! subscription's retries, and a supervised one's restarts, go on from — and
+//! the default routing key, which that `Hello` brings, is not known:
+//! [`Executor::resolve_default_routing_key`] fails the same way, so nothing
+//! is written or named under no key meanwhile. A credential the server
+//! refuses before it ever accepted it is final: the client stops dialling
+//! and every call fails with [`Rejection::Unauthorized`]. [`Client::state`]
+//! says which of these it is.
+//!
 //! **Write wakes.** A watcher ([`Executor::write_watch_for`], what a
 //! subscription waits on) registers its filter with the server, on the first
 //! connection, and is woken by the pushed [`ServerFrame::Notify`] frames that
@@ -35,8 +49,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
 use bytes::Bytes;
@@ -157,6 +171,136 @@ fn codec() -> LengthDelimitedCodec {
         .new_codec()
 }
 
+/// How a [`Client`] stands with its server ([`Client::state`]).
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum ClientState {
+    /// A connection of the pool is not up: the client has not reached the
+    /// server yet, or lost a connection and dials again.
+    Connecting {
+        /// Why the last attempt failed; `None` while none has. A refusal of
+        /// the server is found in it as a [`Rejection`]
+        /// (`error.downcast_ref::<Rejection>()`).
+        error: Option<Arc<anyhow::Error>>,
+        /// Since when (Unix seconds).
+        since: u64,
+    },
+    /// Every connection of the pool is up.
+    Connected,
+    /// The server refused the credential before it ever accepted it
+    /// ([`Rejection::Unauthorized`]). This is final: the client dials no
+    /// more, and every call fails with the rejection.
+    Refused,
+}
+
+impl ClientState {
+    /// Whether every connection of the pool is up.
+    pub fn is_connected(&self) -> bool {
+        matches!(self, ClientState::Connected)
+    }
+}
+
+impl fmt::Display for ClientState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ClientState::Connecting { error: None, .. } => f.write_str("connecting"),
+            ClientState::Connecting {
+                error: Some(error), ..
+            } => write!(f, "connecting: {error:#}"),
+            ClientState::Connected => f.write_str("connected"),
+            ClientState::Refused => f.write_str("refused"),
+        }
+    }
+}
+
+/// The failure of a call made on a [`Client`] whose server has not answered
+/// yet ([`ClientBuilder::connect_lazy`]): nothing was sent. Found in the
+/// error of the call (`err.downcast_ref::<NotConnected>()`).
+#[derive(Clone, Debug)]
+pub struct NotConnected {
+    /// Why the last connection attempt failed; `None` while none has.
+    pub error: Option<Arc<anyhow::Error>>,
+}
+
+impl fmt::Display for NotConnected {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("the server has not answered yet")?;
+        match &self.error {
+            Some(error) => write!(f, ": {error:#}"),
+            None => Ok(()),
+        }
+    }
+}
+
+impl std::error::Error for NotConnected {}
+
+/// How the connections of the pool stand, as their actors report it.
+#[derive(Clone)]
+struct Status {
+    /// The connections that are up.
+    up: usize,
+    /// Since when one is not (Unix seconds).
+    since: u64,
+    /// Why the last attempt failed, until every connection is up again.
+    error: Option<Arc<anyhow::Error>>,
+    /// The server refused the credential before it ever accepted it.
+    refused: bool,
+}
+
+/// What the client and the actors of its connections share.
+struct Link {
+    /// The size of the pool.
+    lanes: usize,
+    status: watch::Sender<Status>,
+    /// Fixed at server executor construction; kept from the first `Hello`
+    /// answered and never replaced (it is borrowed as `&str`, so it must
+    /// stay fixed). Unset until then.
+    default_routing_key: OnceLock<Option<String>>,
+}
+
+impl Link {
+    fn state(&self) -> ClientState {
+        let status = self.status.borrow();
+        if status.refused {
+            ClientState::Refused
+        } else if status.up == self.lanes {
+            ClientState::Connected
+        } else {
+            ClientState::Connecting {
+                error: status.error.clone(),
+                since: status.since,
+            }
+        }
+    }
+
+    /// Fails while no `Hello` was ever answered: there is no connection to
+    /// send on, and no routing key to key by.
+    fn check(&self) -> anyhow::Result<()> {
+        let status = self.status.borrow();
+        if status.refused {
+            return Err(refused());
+        }
+        if self.default_routing_key.get().is_none() {
+            return Err(anyhow::Error::new(NotConnected {
+                error: status.error.clone(),
+            }));
+        }
+        Ok(())
+    }
+}
+
+/// The error of a call on a client whose credential was refused, shaped like
+/// the one [`ClientBuilder::connect`] returns.
+fn refused() -> anyhow::Error {
+    anyhow::Error::new(Rejection::Unauthorized).context("the server refused the connection")
+}
+
+fn unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 /// A request dispatched to a connection actor: the reply channel travels with
 /// it, and the actor owns its own pending map — no shared lock.
 type Dispatch = (u64, Request, oneshot::Sender<Response>);
@@ -204,9 +348,7 @@ struct Inner {
     watch_all: std::sync::OnceLock<watch::Sender<u64>>,
     /// Where the tasks that wait for a watcher to go away are spawned.
     runtime: tokio::runtime::Handle,
-    /// Fixed at server executor construction; snapshotted once from the first
-    /// connection's `Hello` (it is borrowed as `&str`, so it must stay fixed).
-    default_routing_key: Option<String>,
+    link: Arc<Link>,
     stable: Stable,
     request_timeout: Duration,
 }
@@ -276,17 +418,102 @@ impl ClientBuilder {
     /// is kept alive with automatic reconnect.
     pub async fn connect(self) -> anyhow::Result<Client> {
         let stable: Stable = Arc::new(AtomicU64::new(0));
+        let mut connections = Vec::with_capacity(self.connections);
+        let default_routing_key = OnceLock::new();
+        for _ in 0..self.connections {
+            let (framed, hello) =
+                connect_and_hello(&self.dial, &stable, self.request_timeout).await?;
+            default_routing_key.get_or_init(|| hello.default_routing_key);
+            connections.push(Some(framed));
+        }
+        Ok(self.spawn(stable, default_routing_key, connections))
+    }
+
+    /// Gives the client at once and connects in the background: for an
+    /// application that must open while its store is away.
+    ///
+    /// Each connection of the pool is dialled until the server answers, the
+    /// first attempt at once and the following ones on the schedule of a
+    /// reconnect ([`reconnect_backoff`](Self::reconnect_backoff)). Until the
+    /// first `Hello` is answered:
+    ///
+    /// - every call fails with [`NotConnected`], at once and with nothing
+    ///   sent: a write returns to its caller, a subscription's pass fails
+    ///   and its retries go on from there;
+    /// - the default routing key is not known, the server's `Hello` being
+    ///   what brings it. [`Executor::default_routing_key`] says `None` and
+    ///   [`Executor::resolve_default_routing_key`], which a write of a new
+    ///   aggregate and a subscription ask first, fails with
+    ///   [`NotConnected`]. Once learned the key stays fixed, as on a client
+    ///   that connected first;
+    /// - a credential the server refuses ([`Rejection::Unauthorized`]) is
+    ///   final: the client stops dialling, [`Client::state`] says
+    ///   [`ClientState::Refused`] and every call fails with the rejection.
+    ///   Any other failure — the server unreachable, or answering
+    ///   [`Rejection::Unavailable`] — is tried again for as long as the
+    ///   client lives.
+    ///
+    /// A subscription started on such a client fails its `start` while the
+    /// server is away, unless it is `supervised()`: that one starts, and
+    /// handles its first event once the server answers.
+    ///
+    /// [`Client::state`] says how the client stands and
+    /// [`Client::connected`] waits for the server.
+    ///
+    /// ```rust,no_run
+    /// # async fn run() -> anyhow::Result<()> {
+    /// use evento_remote::{Client, ClientState};
+    ///
+    /// let client = Client::builder("store.example.com:4321")
+    ///     .token("api-key")
+    ///     .connect_lazy();
+    ///
+    /// // On a status page, next to the subscriptions' own states:
+    /// match client.state() {
+    ///     ClientState::Connected => {}
+    ///     ClientState::Connecting { error, since } => {
+    ///         tracing::warn!(?error, since, "the store is away");
+    ///     }
+    ///     ClientState::Refused => anyhow::bail!("the store refuses this key"),
+    ///     _ => {}
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Outside a Tokio runtime: the connections are tasks of the one it is
+    /// called in.
+    pub fn connect_lazy(self) -> Client {
+        let connections = (0..self.connections).map(|_| None).collect();
+        self.spawn(Arc::new(AtomicU64::new(0)), OnceLock::new(), connections)
+    }
+
+    /// Spawns the actor of each connection — the ones in `connections` that
+    /// are up already, the others to be dialled — and hands out the client.
+    fn spawn(
+        self,
+        stable: Stable,
+        default_routing_key: OnceLock<Option<String>>,
+        connections: Vec<Option<Framed<ClientStream, LengthDelimitedCodec>>>,
+    ) -> Client {
+        let (status, _) = watch::channel(Status {
+            up: connections.iter().flatten().count(),
+            since: unix_seconds(),
+            error: None,
+            refused: false,
+        });
+        let link = Arc::new(Link {
+            lanes: connections.len(),
+            status,
+            default_routing_key,
+        });
         let (watches, watch_rx) = mpsc::unbounded_channel();
         let mut watch_rx = Some(watch_rx);
 
-        let mut lanes = Vec::with_capacity(self.connections);
-        let mut default_routing_key = None;
-        for lane in 0..self.connections {
-            let (framed, hello) =
-                connect_and_hello(&self.dial, &stable, self.request_timeout).await?;
-            if lane == 0 {
-                default_routing_key = hello.default_routing_key;
-            }
+        let mut lanes = Vec::with_capacity(connections.len());
+        for (lane, connection) in connections.into_iter().enumerate() {
             let (req_tx, req_rx) = mpsc::channel(REQ_CAPACITY);
             tokio::spawn(
                 Actor {
@@ -297,16 +524,17 @@ impl ClientBuilder {
                     // connection would add nothing.
                     watch_rx: if lane == 0 { watch_rx.take() } else { None },
                     watches: HashMap::new(),
+                    link: Arc::clone(&link),
                     stable: Arc::clone(&stable),
                     request_timeout: self.request_timeout,
                     backoff: self.backoff,
                 }
-                .run(framed),
+                .run(connection),
             );
             lanes.push(req_tx);
         }
 
-        Ok(Client {
+        Client {
             inner: Arc::new(Inner {
                 lanes,
                 round_robin: AtomicUsize::new(0),
@@ -315,11 +543,11 @@ impl ClientBuilder {
                 next_watch: AtomicU64::new(0),
                 watch_all: std::sync::OnceLock::new(),
                 runtime: tokio::runtime::Handle::current(),
-                default_routing_key,
+                link,
                 stable,
                 request_timeout: self.request_timeout,
             }),
-        })
+        }
     }
 }
 
@@ -348,7 +576,36 @@ impl Client {
         }
     }
 
+    /// How the client stands with its server: connecting (the last error,
+    /// since when), connected, or refused for good.
+    ///
+    /// A non-blocking snapshot, for a status page or a health check;
+    /// [`connected`](Self::connected) waits.
+    pub fn state(&self) -> ClientState {
+        self.inner.link.state()
+    }
+
+    /// Waits until every connection of the pool is up. Fails once the
+    /// server refused the credential for good ([`ClientState::Refused`]),
+    /// the error carrying the [`Rejection`]; any other failure is waited
+    /// through. Returns at once on a client that is connected.
+    pub async fn connected(&self) -> anyhow::Result<()> {
+        let link = &self.inner.link;
+        let mut status = link.status.subscribe();
+        let status = status
+            .wait_for(|status| status.refused || status.up == link.lanes)
+            .await
+            .map_err(|_| anyhow::anyhow!("remote executor connection is closed"))?;
+        if status.refused {
+            return Err(refused());
+        }
+        Ok(())
+    }
+
     async fn request(&self, request: Request) -> anyhow::Result<Response> {
+        // A client that never reached its server has nothing to wait for on
+        // a connection: the call fails now.
+        self.inner.link.check()?;
         // Ids only need uniqueness per connection (they are per-connection on
         // the wire); a global counter is a superset of that.
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
@@ -396,7 +653,12 @@ fn protocol_err(what: &str) -> anyhow::Error {
 #[async_trait::async_trait]
 impl Executor for Client {
     fn default_routing_key(&self) -> Option<&str> {
-        self.inner.default_routing_key.as_deref()
+        self.inner.link.default_routing_key.get()?.as_deref()
+    }
+
+    async fn resolve_default_routing_key(&self) -> anyhow::Result<Option<String>> {
+        self.inner.link.check()?;
+        Ok(self.default_routing_key().map(str::to_owned))
     }
 
     fn write_watch(&self) -> Option<watch::Receiver<u64>> {
@@ -693,14 +955,20 @@ struct Actor {
     /// The watches registered through this connection, by id. They outlive
     /// a connection: each is registered again on the next one.
     watches: HashMap<u64, (WriteInterest, watch::Sender<u64>)>,
+    link: Arc<Link>,
     stable: Stable,
     request_timeout: Duration,
     backoff: Backoff,
 }
 
 impl Actor {
-    async fn run(mut self, initial: Framed<ClientStream, LengthDelimitedCodec>) {
-        let mut conn = Some(initial);
+    /// `initial` is the connection when it is up already; without one the
+    /// actor dials first, at once.
+    async fn run(mut self, initial: Option<Framed<ClientStream, LengthDelimitedCodec>>) {
+        // The delay before an attempt spreads the clients a server dropped
+        // together; a client that never connected was dropped with no one.
+        let mut at_once = initial.is_none();
+        let mut conn = initial;
         // In-flight requests on the current connection. Cleared (failing the
         // callers) on disconnect: a possibly-executed request must never be
         // replayed on the next connection — the caller may retry it under a
@@ -711,9 +979,9 @@ impl Actor {
         loop {
             let framed = match conn.take() {
                 Some(framed) => framed,
-                None => match self.reconnect().await {
+                None => match self.reconnect(std::mem::take(&mut at_once)).await {
                     Some(framed) => framed,
-                    None => return, // all clients dropped
+                    None => return, // all clients dropped, or refused
                 },
             };
             let (mut sink, mut inbound) = framed.split();
@@ -825,39 +1093,80 @@ impl Actor {
             drop(out_tx);
             let _ = writer.await;
             pending.clear();
+            self.link.status.send_modify(|status| {
+                if status.up == self.link.lanes {
+                    status.since = unix_seconds();
+                }
+                status.up -= 1;
+            });
             if self.req_rx.is_closed() {
                 return;
             }
         }
     }
 
-    /// Reconnects with capped, jittered exponential backoff. `None` when every
-    /// client clone has been dropped (nothing left to serve).
-    async fn reconnect(&mut self) -> Option<Framed<ClientStream, LengthDelimitedCodec>> {
+    /// Connects with capped, jittered exponential backoff, the first attempt
+    /// without a delay when `at_once`. `None` when every client clone has
+    /// been dropped (nothing left to serve), or when the server refused a
+    /// credential it never accepted.
+    async fn reconnect(
+        &mut self,
+        mut at_once: bool,
+    ) -> Option<Framed<ClientStream, LengthDelimitedCodec>> {
         let mut bound = self.backoff.min;
         loop {
-            // The first attempt waits too: where a load balancer moved the
-            // name, it succeeds, and every client dropped with this one would
-            // otherwise say `Hello` to the new node at the same instant.
-            tokio::time::sleep(self.backoff.next_delay(&mut bound)).await;
-            if self.req_rx.is_closed() {
+            // The first attempt of a reconnect waits too: where a load
+            // balancer moved the name, it succeeds, and every client dropped
+            // with this one would otherwise say `Hello` to the new node at
+            // the same instant.
+            if !std::mem::take(&mut at_once) {
+                tokio::time::sleep(self.backoff.next_delay(&mut bound)).await;
+            }
+            // Refused on another connection of the pool: the credential is
+            // the same on this one.
+            if self.req_rx.is_closed() || self.link.status.borrow().refused {
                 return None;
             }
             match connect_and_hello(&self.dial, &self.stable, self.request_timeout).await {
-                // The routing key from a re-Hello is ignored: it is fixed at
-                // server construction, and the cached one must stay stable for
-                // the lifetime of this Client (it is borrowed as &str).
-                Ok((framed, _)) => return Some(framed),
+                Ok((framed, hello)) => {
+                    // The routing key of the first `Hello` answered is kept
+                    // and the one of every other ignored: it is fixed at
+                    // server construction, and the cached one must stay
+                    // stable for the lifetime of this Client (it is borrowed
+                    // as &str). Set before the status says so: what waits for
+                    // the connection finds the key.
+                    self.link
+                        .default_routing_key
+                        .get_or_init(|| hello.default_routing_key);
+                    self.link.status.send_modify(|status| {
+                        status.up += 1;
+                        if status.up == self.link.lanes {
+                            status.error = None;
+                        }
+                    });
+                    return Some(framed);
+                }
                 Err(err) => {
                     // A refusal is the server's decision (the credential was
                     // revoked, the store is down), worth more than a debug
-                    // line; it is retried like any failure, the resolver may
-                    // accept again.
-                    if let Some(rejection) = err.downcast_ref::<Rejection>() {
-                        tracing::warn!(%rejection, addr = %self.dial.addr, "the server refused the reconnect, backing off");
+                    // line.
+                    let rejection = err.downcast_ref::<Rejection>();
+                    if let Some(rejection) = rejection {
+                        tracing::warn!(%rejection, addr = %self.dial.addr, "the server refused the connection");
                     } else {
-                        tracing::debug!(?err, addr = %self.dial.addr, "reconnect failed, backing off");
+                        tracing::debug!(?err, addr = %self.dial.addr, "connection failed, backing off");
                     }
+                    // A credential the server never accepted will never do:
+                    // the client stops here. One it accepted before is tried
+                    // again like any failure, the resolver may accept again.
+                    let never_accepted = self.link.default_routing_key.get().is_none();
+                    if rejection == Some(&Rejection::Unauthorized) && never_accepted {
+                        self.link.status.send_modify(|status| status.refused = true);
+                        return None;
+                    }
+                    self.link
+                        .status
+                        .send_modify(|status| status.error = Some(Arc::new(err)));
                 }
             }
         }

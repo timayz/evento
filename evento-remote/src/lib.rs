@@ -22,6 +22,14 @@
 //! # }
 //! ```
 //!
+//! [`Client::connect`] fails when the server does not answer. An application
+//! that must open while its store is away builds its client with
+//! [`ClientBuilder::connect_lazy`] instead: the client exists at once and
+//! connects in the background, its calls fail with [`NotConnected`] until the
+//! server answers, a `supervised()` subscription started on it handles its
+//! first event when it does, and [`Client::state`] says how it stands —
+//! connecting, connected, or refused for good.
+//!
 //! A client-side subscription registers what it follows with the server and
 //! is pushed a notification for the writes that hold an event it would read,
 //! so it wakes with the same low latency as over a local `write_watch_for`,
@@ -69,7 +77,7 @@ mod client;
 mod server;
 mod wire;
 
-pub use client::{Address, Client, ClientBuilder};
+pub use client::{Address, Client, ClientBuilder, ClientState, NotConnected};
 pub use server::{
     serve, serve_tls, serve_tls_with, serve_with, Hello, Resolver, ServerHandle, Session,
 };

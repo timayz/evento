@@ -496,10 +496,15 @@ impl WriteBuilder {
         };
         let routing_key = match existing_key {
             Some(key) => key,
-            None => self
-                .routing_key
-                .to_owned()
-                .or_else(|| executor.default_routing_key().map(str::to_owned)),
+            None => match self.routing_key.to_owned() {
+                Some(key) => Some(key),
+                // Asked, not read: an executor that has not learned its key
+                // yet fails the write instead of keying it by none.
+                None => executor
+                    .resolve_default_routing_key()
+                    .await
+                    .map_err(WriteError::Unknown)?,
+            },
         };
 
         let mut events = vec![];
