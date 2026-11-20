@@ -70,6 +70,20 @@ pub struct NodeConfig {
     /// A transaction unapplied this long is presumed stalled and recovered. Well
     /// above normal write latency so healthy in-flight writes are never disturbed.
     pub recovery_timeout: Duration,
+    /// How long a transaction is left to a coordinator this node does not
+    /// suspect, instead of [`recovery_timeout`](Self::recovery_timeout),
+    /// while this node's own journal flushes are slow (#560): one that took
+    /// a quarter of `recovery_timeout` or more ended within the last
+    /// `recovery_timeout`, or has been in flight that long. A write costs a
+    /// replica several flushes one behind the other, so on such a disk a
+    /// healthy write outlasts `recovery_timeout`, and a recovery of it
+    /// decides nothing its coordinator would not: it adds its own flushes
+    /// to the disk that is the bottleneck. A coordinator the failure
+    /// detector suspects is recovered at once all the same, and a node's
+    /// own abandoned transactions at `recovery_timeout`. At or below
+    /// `recovery_timeout` (zero, say) the sweep goes by `recovery_timeout`
+    /// alone, as before #560. Default 5 s.
+    pub recovery_patience: Duration,
     /// How far behind the present a node's reported redundancy point lags, so a
     /// not-yet-propagated commit is never skipped when state below the watermark is
     /// compacted away. Keep it above the clock-skew bound and propagation latency.
@@ -201,6 +215,7 @@ impl Default for NodeConfig {
             recovery_interval: Duration::from_millis(100),
             anti_entropy_interval: Duration::from_millis(250),
             recovery_timeout: Duration::from_millis(300),
+            recovery_patience: Duration::from_secs(5),
             compaction_margin: Duration::from_secs(1),
             truncate_interval: Duration::from_secs(5),
             max_journal_batch: 128,
@@ -959,6 +974,99 @@ impl Drop for Coordinating<'_> {
 /// [`Node::start`]).
 struct AbortOnDrop(JoinHandle<()>);
 
+/// The share of [`NodeConfig::recovery_timeout`] a journal flush takes to
+/// count as slow (#560): a write costs a replica about four flushes one
+/// behind the other (its vote, its commit, its apply, the applied record),
+/// so at a quarter each the write alone takes the timeout.
+const SLOW_FLUSH_SHARE: u32 = 4;
+
+/// How this node's journal flushes go (#560): the evidence the sweep reads
+/// before it takes a transaction for stalled on the clock alone (see
+/// [`NodeConfig::recovery_patience`]).
+#[derive(Default)]
+struct FlushPace {
+    inner: Mutex<Pace>,
+}
+
+#[derive(Default)]
+struct Pace {
+    /// When each flush in flight began.
+    in_flight: Vec<Instant>,
+    /// When the latest flush that took the slow share or more ended.
+    slow_at: Option<Instant>,
+    /// The newest transaction the sweep left to its coordinator: each is
+    /// counted once, the sweep going through them oldest first.
+    held_through: Option<TxnId>,
+}
+
+/// A flush in flight (see [`FlushPace::begin`]): ended when dropped, so a
+/// flush whose caller went away does not read as one that never returns.
+struct FlushInFlight<'a> {
+    pace: &'a FlushPace,
+    started: Instant,
+    slow: Duration,
+}
+
+impl FlushPace {
+    /// A flush begins; one that takes `slow` or more is a slow one.
+    fn begin(&self, slow: Duration) -> FlushInFlight<'_> {
+        let started = Instant::now();
+        self.inner
+            .lock()
+            .expect("flush pace poisoned")
+            .in_flight
+            .push(started);
+        FlushInFlight {
+            pace: self,
+            started,
+            slow,
+        }
+    }
+
+    /// Whether the journal's flushes are slow now: one in flight began
+    /// `slow` ago or more, or one that took as much ended within `window`.
+    fn slow(&self, slow: Duration, window: Duration) -> bool {
+        let now = Instant::now();
+        let pace = self.inner.lock().expect("flush pace poisoned");
+        pace.in_flight
+            .iter()
+            .any(|started| now.saturating_duration_since(*started) >= slow)
+            || pace
+                .slow_at
+                .is_some_and(|at| now.saturating_duration_since(at) <= window)
+    }
+
+    /// Whether `txn` is left to its coordinator for the first time.
+    fn hold(&self, txn: TxnId) -> bool {
+        let mut pace = self.inner.lock().expect("flush pace poisoned");
+        if pace.held_through.is_some_and(|held| txn <= held) {
+            return false;
+        }
+        pace.held_through = Some(txn);
+        true
+    }
+}
+
+impl FlushInFlight<'_> {
+    /// How long the flush has taken.
+    fn elapsed(&self) -> Duration {
+        self.started.elapsed()
+    }
+}
+
+impl Drop for FlushInFlight<'_> {
+    fn drop(&mut self) {
+        let now = Instant::now();
+        let mut pace = self.pace.inner.lock().expect("flush pace poisoned");
+        if let Some(i) = pace.in_flight.iter().position(|s| *s == self.started) {
+            pace.in_flight.swap_remove(i);
+        }
+        if now.saturating_duration_since(self.started) >= self.slow {
+            pace.slow_at = Some(now);
+        }
+    }
+}
+
 /// The journal flushes put off (see [`NodeConfig::lazy_flush`]): how many
 /// batches left their records staged, and how many of those a flush has
 /// covered since.
@@ -1700,6 +1808,9 @@ pub struct Node {
     applier: Arc<Notify>,
     /// The journal flushes put off (see [`NodeConfig::lazy_flush`]).
     lazy: Arc<LazyFlush>,
+    /// How the journal's flushes go: slow ones hold the sweep's recoveries
+    /// back (#560).
+    flush_pace: Arc<FlushPace>,
     /// Bumped whenever an absent peer is counted again (see
     /// [`screen_absent`](Self::screen_absent)): a join waits on it for its
     /// contact's proof ([`await_reinstated`](Self::await_reinstated)).
@@ -1799,6 +1910,7 @@ impl Node {
             applied: Arc::new(Signal::default()),
             applier: Arc::new(Notify::new()),
             lazy: Arc::new(LazyFlush::default()),
+            flush_pace: Arc::new(FlushPace::default()),
             reinstated: Arc::new(Signal::default()),
             last_anti_entropy: Arc::new(Mutex::new(None)),
             metrics: Arc::new(Metrics::new()),
@@ -2500,9 +2612,13 @@ impl Node {
     /// alike. One that fails after seconds is a disk to look at as well, so
     /// it is timed too.
     async fn sync_journal(&self) -> anyhow::Result<()> {
-        let started = Instant::now();
+        // In flight from here, for the sweep to see a flush that does not
+        // return (#560).
+        let flush = self
+            .flush_pace
+            .begin(self.settings.recovery_timeout / SLOW_FLUSH_SHARE);
         let flushed = self.journal.flush().await;
-        self.metrics.record_flush_time(started.elapsed());
+        self.metrics.record_flush_time(flush.elapsed());
         flushed
     }
 
@@ -3394,19 +3510,86 @@ impl Node {
     /// Never one this node holds [decided](Replica::decided), such as a
     /// replayed write its store refused (#351): only its apply is left,
     /// which the redrive retries on every sweep, and a recovery decides
-    /// nothing more.
+    /// nothing more. Nor, short of
+    /// [`recovery_patience`](NodeConfig::recovery_patience), one that is
+    /// only as slow as this node's disk
+    /// ([`left_to_its_coordinator`](Self::left_to_its_coordinator)).
     fn stalled(&self, txn: TxnId, timeout: Timestamp) -> bool {
         if self.replica.lock().expect("replica poisoned").decided(txn) {
             return false;
         }
         let coordinator = txn.0.node;
-        txn.0 < timeout
-            || (coordinator != self.id
-                && self.failure_detector.suspect(
-                    coordinator,
-                    self.settings.phi_threshold,
-                    self.settings.acceptable_pause,
-                ))
+        if coordinator != self.id
+            && self.failure_detector.suspect(
+                coordinator,
+                self.settings.phi_threshold,
+                self.settings.acceptable_pause,
+            )
+        {
+            return true;
+        }
+        txn.0 < timeout && !self.left_to_its_coordinator(txn, timeout)
+    }
+
+    /// Whether `txn`, past `timeout` (`recovery_timeout` ago), is left to
+    /// its coordinator all the same (#560): the clock alone does not tell a
+    /// coordinator that is gone from one waiting on its journal's flushes,
+    /// and where this node's own flushes are slow (see [`FlushPace`]) the
+    /// second is the likelier — the nodes of a group share a kind of disk,
+    /// if not the disk. Taking the write over would decide nothing its
+    /// coordinator does not, and stage records of its own on the disk that
+    /// is the bottleneck, one recovery outbidding another where two nodes
+    /// do.
+    ///
+    /// Only while the evidence holds, up to
+    /// [`recovery_patience`](NodeConfig::recovery_patience), and only for
+    /// another node's transaction, whose coordinator was heard from since it
+    /// began and is not suspected (see [`stalled`](Self::stalled)): a
+    /// coordinator that crashed is recovered when the failure detector says
+    /// so, or at the patience's end; one that is alive and gave its write up
+    /// (its caller went away) recovers it itself at `recovery_timeout`, a
+    /// node having no patience with its own.
+    fn left_to_its_coordinator(&self, txn: TxnId, timeout: Timestamp) -> bool {
+        let coordinator = txn.0.node;
+        let timeout_after = self.settings.recovery_timeout;
+        let extra = self
+            .settings
+            .recovery_patience
+            .saturating_sub(timeout_after);
+        if extra.is_zero() || coordinator == self.id {
+            return false;
+        }
+        let patience = Timestamp {
+            micros: timeout.micros.saturating_sub(extra.as_micros() as u64),
+            ..timeout
+        };
+        if txn.0 < patience {
+            return false;
+        }
+        // Heard from since the write began, by this node's clock: `timeout`
+        // is `recovery_timeout` before now.
+        let age =
+            Duration::from_micros(timeout.micros.saturating_sub(txn.0.micros)) + timeout_after;
+        let heard = self
+            .failure_detector
+            .last_heard(coordinator)
+            .is_some_and(|heard| heard.elapsed() <= age);
+        if !heard
+            || !self
+                .flush_pace
+                .slow(timeout_after / SLOW_FLUSH_SHARE, timeout_after)
+        {
+            return false;
+        }
+        if self.flush_pace.hold(txn) {
+            self.metrics.record_recovery_held();
+            tracing::debug!(
+                node = self.id.0,
+                ?txn,
+                "leaving a slow transaction to its coordinator: this node's journal flushes are slow"
+            );
+        }
+        true
     }
 
     /// Recovers `txn`, a transaction the sweep found stalled, and first what

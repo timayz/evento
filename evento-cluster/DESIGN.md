@@ -1289,7 +1289,21 @@ scenario on a cluster of one). ✅ **Snapshots + compaction + log truncation** (
   stalled transaction once its coordinator's φ exceeds `NodeConfig.phi_threshold`
   — adapting to a link's real latency — with the fixed `recovery_timeout` kept as
   a liveness fallback (so the change is purely additive: never slower than before,
-  and at the default config the fallback still dominates). Unit tests pin the φ
+  and at the default config the fallback still dominates). The fallback has
+  patience where the clock alone misleads (#560): while a node's own journal
+  flushes are slow — one took a quarter of `recovery_timeout` or more — a
+  healthy write outlasts the timeout on the same kind of disk, so its sweep
+  leaves another node's transaction to a coordinator it heard from and does
+  not suspect, up to `recovery_patience` (5 s). A recovery of such a write
+  decides nothing, stages records on the disk that is the bottleneck, and two
+  of them outbid each other. In the model of `tests/slow_disk.rs` (the
+  workload of #558 over journals that stall 2 s in 8) the patient sweeps
+  recover nothing and the longest post is the stall, 2.2 s; without the
+  patience a few writes a peer's sweep recovered keep their live coordinator
+  waiting about a `collect_timeout` more, posts of 6 to 12 s. A node has no patience with its own abandoned
+  transactions, and the detector's suspicion overrides it, so a coordinator
+  that is gone is still recovered in bounded time
+  (`safety_and_liveness_hold_on_a_stalling_disk`). Unit tests pin the φ
   math and that a silenced peer is suspected while a regular one is not; sim tests
   prove that with the fixed timeout disabled the detector alone recovers a crashed
   coordinator's stalled transaction, and that a healthy cluster recovers nothing.

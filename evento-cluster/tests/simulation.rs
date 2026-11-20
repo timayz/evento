@@ -3141,6 +3141,55 @@ async fn safety_holds_under_restarts_and_storage_faults() {
     }
 }
 
+/// A disk whose syncs stall, and nothing else wrong with the storage: every
+/// journal fsync takes 120 ms, over a third of the default
+/// `recovery_timeout`, so every node's sweep finds its own flushes slow and
+/// leaves the writes past the timeout to their coordinators, up to
+/// `recovery_patience` (#560).
+const STALLING_DISK: Faults = Faults {
+    messages: None,
+    one_way: false,
+    storage: Some(StorageFaults {
+        journal: JournalFaults {
+            flush: 0.0,
+            truncate: 0.0,
+            metadata: 0.0,
+        },
+        apply: 0.0,
+        fsync: Duration::from_millis(120),
+        persist: 1.0,
+    }),
+};
+
+/// Issue #560: the sweeps' patience with slow writes while their own journal
+/// flushes are slow costs neither safety nor liveness where coordinators do
+/// go away — crashed for good, cut off by a partition, or restarted over a
+/// journal that lost its unflushed tail.
+#[tokio::test(start_paused = true)]
+async fn safety_and_liveness_hold_on_a_stalling_disk() {
+    for (seed, _replay) in sim_seeds("safety_and_liveness_hold_on_a_stalling_disk", 0..10) {
+        for (scenario, result) in [
+            ("crashes", run_adversarial(seed, STALLING_DISK).await),
+            ("partitions", run_partition(seed, None, STALLING_DISK).await),
+            (
+                "restarts",
+                run_with_restarts(seed, STALLING_DISK, StoreKind::Memory).await,
+            ),
+        ] {
+            if let Some(v) = result.safety {
+                panic!("SAFETY VIOLATION (stalling disk, {scenario}) at seed {seed}: {v}");
+            }
+            assert!(
+                result.converged,
+                "seed {seed}: cluster failed to converge on a stalling disk ({scenario})"
+            );
+            if let Some(stall) = result.liveness {
+                panic!("seed {seed} ({scenario}): {stall}");
+            }
+        }
+    }
+}
+
 /// The read oracle bites, and a violation replays from its seed (#318). With
 /// the read barrier off, a read takes the node's store as it stands: a node
 /// that lags behind lossy links, or a partition, serves a stale read.
