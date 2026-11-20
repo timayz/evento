@@ -94,8 +94,11 @@ pub async fn record<E: Executor>(
         };
         match executor.write(vec![event]).await {
             Ok(()) => return Ok(true),
-            // Another node wrote the stream meanwhile: read what it said.
-            Err(WriteError::InvalidOriginalVersion) => continue,
+            // Another node wrote the stream meanwhile: read what it said,
+            // once a copy that trails had the time to apply it.
+            Err(WriteError::InvalidOriginalVersion) => {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
             Err(err) => {
                 return Err(err)
                     .with_context(|| format!("cannot record where node {} is reached", node.0))

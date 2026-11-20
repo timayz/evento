@@ -677,6 +677,47 @@ impl std::fmt::Display for LostJournal {
 
 impl std::error::Error for LostJournal {}
 
+/// [`Node::join`] gave up waiting to be a replica: no layout this node
+/// installed, nor any its contact holds, has it in a shard. The change that
+/// adds it ([`Node::change_topology`]) is still to be decided, or the node
+/// was dropped. Nothing was copied: the join is tried again as it is.
+/// Returned through `anyhow`; downcast to tell it apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotAMember {
+    /// The node that is no replica.
+    pub node: NodeId,
+    /// The newest epoch it installed.
+    pub epoch: u64,
+}
+
+impl std::fmt::Display for NotAMember {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:?} is no replica under epoch {}: join once a layout that adds it is installed",
+            self.node, self.epoch
+        )
+    }
+}
+
+impl std::error::Error for NotAMember {}
+
+/// A layout change decided and not installed yet, as
+/// [`Node::change_in_progress`] reads it on one node: the writes in flight
+/// on the keys it moves drain, and the nodes it gives slots copy them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeInProgress {
+    /// The epoch the change was first decided at.
+    pub since: u64,
+    /// The layout it installs, shard by shard.
+    pub to: Vec<Vec<NodeId>>,
+    /// The nodes it gives slots that have not said they copied them.
+    pub copying: Vec<NodeId>,
+    /// Whether the writes in flight when it was decided are known to have
+    /// drained: a majority of each shard said how far it voted.
+    pub drained: bool,
+}
+
 /// [`Node::join`] over a lost journal found no contact vouching for
 /// everything the node may have forgotten (#312): within
 /// [`NodeConfig::amnesia_join_timeout`], the contact's watermark report never
@@ -10114,12 +10155,13 @@ impl Node {
             if let Some(shard) = layout.node_shard(self.id) {
                 return Ok((layout, shard));
             }
-            anyhow::ensure!(
-                self.topology.dynamic() && Instant::now() < deadline,
-                "{:?} is no replica under epoch {}: join once a layout that adds it is installed",
-                self.id,
-                layout.epoch()
-            );
+            if !self.topology.dynamic() || Instant::now() >= deadline {
+                return Err(NotAMember {
+                    node: self.id,
+                    epoch: layout.epoch(),
+                }
+                .into());
+            }
             self.send(
                 contact,
                 Message::MetadataFetch {
@@ -11054,6 +11096,39 @@ impl Node {
             }
             _ => TransitionOutcome::Replaced,
         }
+    }
+
+    /// The layout change this node holds decided and not installed yet, if
+    /// any, and what it still waits for. What a status page shows; the
+    /// recovery sweep carries the change through.
+    pub fn change_in_progress(&self) -> Option<ChangeInProgress> {
+        let reconfig = self.reconfig.lock().expect("reconfig poisoned");
+        let transition = reconfig.transition.as_ref()?;
+        let since = transition.since;
+        let copying = transition
+            .gainers
+            .iter()
+            .copied()
+            .filter(|node| {
+                if *node == self.id {
+                    reconfig.copied != Some(since)
+                } else {
+                    reconfig.copies.get(node) != Some(&since)
+                }
+            })
+            .collect();
+        Some(ChangeInProgress {
+            since,
+            to: transition.pending.shards().to_vec(),
+            copying,
+            drained: reconfig::drain_point(transition, &reconfig.reported).is_some(),
+        })
+    }
+
+    /// The newest epoch this node installed: the next change is for the one
+    /// after it ([`change_topology`](Self::change_topology)).
+    pub fn epoch(&self) -> u64 {
+        self.installed_epoch()
     }
 
     /// The drain point of the transition first decided at `since`, once it is

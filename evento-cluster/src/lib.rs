@@ -99,10 +99,10 @@ pub use executor::{ClusterExecutor, ExecutorDataStore};
 pub use host::{Cluster, LiveNode, Members, NodeHealth, PeerState, Settings};
 pub use metrics::{Histogram, HistogramSnapshot, Metrics, MetricsSnapshot, HISTOGRAM_BOUNDS};
 pub use node::{
-    BacklogAtCap, CommandTooLarge, CommitOutcome, FenceNotCovered, Foundation, FoundedApart,
-    Invalidated, Joining, JournalRolledBack, LostJournal, Node, NodeClosed, NodeConfig,
-    OpenUnconfirmed, PartialSnapshot, RejoinRequired, SweepPressure, TopologyChanging,
-    MAX_COMMAND_BYTES,
+    BacklogAtCap, ChangeInProgress, CommandTooLarge, CommitOutcome, FenceNotCovered, Foundation,
+    FoundedApart, Invalidated, Joining, JournalRolledBack, LostJournal, Node, NodeClosed,
+    NodeConfig, NotAMember, OpenUnconfirmed, PartialSnapshot, RejoinRequired, SweepPressure,
+    TopologyChanging, MAX_COMMAND_BYTES,
 };
 pub use share::{shard_of, Share};
 pub use store::{InMemoryDataStore, InMemoryJournal};

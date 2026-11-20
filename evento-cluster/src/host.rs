@@ -38,7 +38,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context;
-use evento_core::Evento;
+use evento_core::cursor::Args;
+use evento_core::{Evento, TenantFilter};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -46,7 +47,7 @@ use tokio::task::JoinHandle;
 use crate::backend::ClusterBackend;
 use crate::clock::{HybridLogicalClock, NodeId};
 use crate::executor::{ClusterExecutor, ExecutorDataStore};
-use crate::node::{LostJournal, Node, NodeConfig, PartialSnapshot};
+use crate::node::{LostJournal, Node, NodeConfig, NotAMember, PartialSnapshot};
 use crate::share::Share;
 use crate::tcp::{serve, PeerAddr, TcpTransport};
 use crate::transport::{Envelope, InMemoryNetwork};
@@ -58,6 +59,15 @@ const INBOX_FRAMES: usize = 1024;
 /// How often a node reads where the nodes added since it started are
 /// reached ([`addresses`]).
 const ADDRESS_LOOK: Duration = Duration::from_secs(1);
+
+/// How long a node new to the cluster waits before it asks again whether a
+/// member added it, and how often it says in the log that it waits.
+const WAIT_LOOK: Duration = Duration::from_millis(500);
+const WAIT_SAID: Duration = Duration::from_secs(30);
+
+/// Times a change of members is proposed again when another change, decided
+/// meanwhile, took its epoch.
+const CHANGE_ATTEMPTS: usize = 4;
 
 /// The `[cluster]` section of a deployment's configuration: the nodes the
 /// cluster is founded with, where they are reached, and the few knobs an
@@ -73,6 +83,19 @@ const ADDRESS_LOOK: Duration = Duration::from_secs(1);
 /// listen = "0.0.0.0:7000"          # optional; defaults to peers[node_id]
 /// absent_after_secs = 3600         # optional; 0 never gives a node up
 /// write_backlog = 100000           # optional
+/// ```
+///
+/// A cluster that is to grow says how many of `peers` it was founded with,
+/// and keeps saying it: the nodes listed after them are added to the
+/// running cluster ([`Cluster::add_node`]), and a new node that finds itself
+/// among those joins, and copies the store, instead of founding a cluster
+/// of its own.
+///
+/// ```toml
+/// [cluster]
+/// node_id = 3
+/// founders = 3
+/// peers = ["10.0.0.1:7000", "10.0.0.2:7000", "10.0.0.3:7000", "10.0.0.4:7000"]
 /// ```
 ///
 /// A peer is `ip:port` or `host:port`. A name is resolved each time the
@@ -95,7 +118,20 @@ pub struct Settings {
     /// `peers[i]`. One address is a cluster of one node over TCP. Each is
     /// `ip:port` or `host:port` ([`PeerAddr`]); a name is resolved at each
     /// dial, not at start-up.
+    ///
+    /// Where the nodes are reached, not who counts: the members are the
+    /// first [`founders`](Self::founders) of them, then what the cluster
+    /// agreed on since ([`Cluster::members`]). A node that left keeps its
+    /// place in the list, so the ids after it stay what they are.
     pub peers: Vec<PeerAddr>,
+    /// How many of `peers`, the first ones, the cluster is founded with;
+    /// unset, all of them. A node listed after them is no member until one
+    /// adds it ([`Cluster::add_node`]): opened over an empty store, it waits
+    /// for that, then copies the store, and founds nothing. The same on
+    /// every node, and for as long as the cluster lives: a cluster founded
+    /// with three nodes says 3 however many it has now.
+    #[serde(default)]
+    pub founders: Option<u64>,
     /// The address to bind for inbound consensus traffic. Defaults to
     /// `peers[node_id]` when that is an address, and is required when it is
     /// a name; set it to `0.0.0.0:<port>` in a container.
@@ -141,6 +177,7 @@ impl Settings {
         Self {
             node_id,
             peers: peers.into_iter().map(Into::into).collect(),
+            founders: None,
             listen: None,
             absent_after_secs: default_absent_after_secs(),
             write_backlog: default_write_backlog(),
@@ -149,7 +186,8 @@ impl Settings {
     }
 
     /// Refuses settings no node can run on: no peers, a `node_id` outside
-    /// `peers`, a `write_backlog` of zero, no address to bind.
+    /// `peers`, `founders` of none or of more than `peers`, a
+    /// `write_backlog` of zero, no address to bind.
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             !self.peers.is_empty(),
@@ -161,6 +199,13 @@ impl Settings {
             self.node_id,
             self.peers.len()
         );
+        if let Some(founders) = self.founders {
+            anyhow::ensure!(
+                founders >= 1 && founders as usize <= self.peers.len(),
+                "cluster.founders {founders} must be between 1 and the {} peers",
+                self.peers.len()
+            );
+        }
         anyhow::ensure!(
             self.write_backlog > 0,
             "cluster.write_backlog must be greater than 0"
@@ -177,6 +222,17 @@ impl Settings {
     /// Every node's id, in `peers` order.
     pub fn ids(&self) -> Vec<NodeId> {
         (0..self.peers.len() as u64).map(NodeId).collect()
+    }
+
+    /// The nodes the cluster is founded with: the first
+    /// [`founders`](Self::founders) of `peers`.
+    pub fn founder_ids(&self) -> Vec<NodeId> {
+        let founders = self
+            .founders
+            .map_or(self.peers.len(), |founders| founders as usize);
+        (0..founders.min(self.peers.len()) as u64)
+            .map(NodeId)
+            .collect()
     }
 
     /// Whether this node has peers.
@@ -216,8 +272,14 @@ impl Settings {
     /// linearizable reads and the absence limit only where there are peers
     /// to read from or wait for.
     pub fn node_config(&self) -> NodeConfig {
+        self.node_config_among(self.has_peers())
+    }
+
+    /// [`node_config`](Self::node_config) for a node that `has_peers` or
+    /// not, whatever `peers` lists: a cluster founded with one node and
+    /// grown since has members its first node's settings do not name.
+    fn node_config_among(&self, has_peers: bool) -> NodeConfig {
         let defaults = NodeConfig::default();
-        let has_peers = self.has_peers();
         NodeConfig {
             linearizable_reads: self.linearizable_reads.unwrap_or(has_peers),
             peer_absence_limit: if has_peers { self.absent_after() } else { None },
@@ -563,10 +625,16 @@ impl<E: ClusterBackend> Builder<E> {
         if let Some(settings) = &settings {
             settings.validate()?;
         }
-        let (id, ids, peers, listener) = match &settings {
+        let (id, ids, founders, peers, listener) = match &settings {
             None => {
                 tracing::info!("single node");
-                (NodeId(0), vec![NodeId(0)], HashMap::new(), None)
+                (
+                    NodeId(0),
+                    vec![NodeId(0)],
+                    vec![NodeId(0)],
+                    HashMap::new(),
+                    None,
+                )
             }
             Some(settings) => {
                 let id = settings.id();
@@ -581,15 +649,34 @@ impl<E: ClusterBackend> Builder<E> {
                     .await
                     .with_context(|| format!("cannot bind the consensus listener on {listen}"))?;
                 tracing::info!(node = id.0, %listen, nodes = ids.len(), "cluster node");
-                (id, ids, peers, Some(listener))
+                (id, ids, settings.founder_ids(), peers, Some(listener))
             }
         };
-        let has_peers = ids.len() > 1;
-        if has_peers && state_dir.is_none() {
+        if ids.len() > 1 && state_dir.is_none() {
             anyhow::bail!("a node with peers needs a state directory (`Builder::state_dir`) for its rejoin mark");
         }
 
-        let mark = match &state_dir {
+        let journal = match journal {
+            Some(journal) => journal,
+            None => store
+                .open_journal()
+                .await
+                .context("cannot open the consensus journal")?,
+        };
+        // The members as the journal holds them: the layout the cluster last
+        // agreed on, or the founders' while it agreed on none.
+        let decided = journal
+            .load_metadata()
+            .await
+            .context("cannot read the layouts the journal holds")?;
+        let members: Vec<NodeId> = match decided.last() {
+            Some((_, entry)) => entry.live().shards.iter().flatten().copied().collect(),
+            None => founders.clone(),
+        };
+        let member = members.contains(&id);
+        let has_peers = ids.len() > 1 || members.len() > 1;
+
+        let mut mark = match &state_dir {
             Some(dir) => RejoinMark::read(dir)?,
             None => None,
         };
@@ -612,13 +699,47 @@ impl<E: ClusterBackend> Builder<E> {
             );
         }
 
-        let journal = match journal {
-            Some(journal) => journal,
-            None => store
-                .open_journal()
+        if !member && found {
+            anyhow::bail!(
+                "node {} is none of the {} nodes the cluster is founded with (`cluster.founders`): a group is founded over a store by those, and this node is added to it afterwards (`Cluster::add_node`)",
+                id.0,
+                founders.len()
+            );
+        }
+        if !member && mark.is_none() {
+            // New to the cluster: it comes in by copying the store, once a
+            // member adds it, and founds nothing. Only over a journal and a
+            // store that hold nothing: anything else is a node that was
+            // removed, or another node's files.
+            let pristine = decided.is_empty()
+                && journal
+                    .load_born()
+                    .await
+                    .context("cannot read the journal's identity")?
+                    .is_none();
+            let empty = store
+                .read(None, None, TenantFilter::All, Args::forward(1, None), None)
                 .await
-                .context("cannot open the consensus journal")?,
-        };
+                .context("cannot read the store")?
+                .edges
+                .is_empty();
+            anyhow::ensure!(
+                pristine && empty,
+                "node {} is no member of the cluster its journal holds (members: {:?}): it was removed, or `cluster.node_id` is another node's. To bring it back as a new node, mark its store for a copy with its journal discarded (`RejoinMark::DiscardJournal`), start it, and add it on a member (`Cluster::add_node`)",
+                id.0,
+                members.iter().map(|node| node.0).collect::<Vec<_>>()
+            );
+            let dir = state_dir.as_deref().context(
+                "a node new to a cluster needs a state directory (`Builder::state_dir`) for its rejoin mark",
+            )?;
+            // Marked first: a restart before the copy is done copies again.
+            RejoinMark::KeepJournal.write(dir)?;
+            mark = Some(RejoinMark::KeepJournal);
+            tracing::info!(
+                node = id.0,
+                "this node is new to the cluster: it copies the store once a member added it"
+            );
+        }
         if found {
             // The journal that came with the store is its source's: no node
             // of the new group cast those votes.
@@ -649,13 +770,13 @@ impl<E: ClusterBackend> Builder<E> {
 
         let mut node_config = settings
             .as_ref()
-            .map(Settings::node_config)
+            .map(|settings| settings.node_config_among(has_peers))
             .unwrap_or_else(|| Settings::new(0, Vec::<PeerAddr>::new()).node_config());
         if let Some(adjust) = config {
             node_config = adjust(node_config);
         }
 
-        let mut tasks = Vec::new();
+        let mut tasks = Tasks::default();
         let named = peers.len();
         let mut transport = None;
         let (sink, inbox): (Arc<dyn MessageSink>, mpsc::Receiver<Envelope>) = match listener {
@@ -673,9 +794,10 @@ impl<E: ClusterBackend> Builder<E> {
             }
         };
         // The members are what the cluster agreed on, which the journal
-        // keeps: `ids` is the layout it was founded with, and every layout
+        // keeps: the founders are the layout it began with, and every layout
         // decided since is installed over it when the journal is restored.
-        let topology: Arc<dyn Topology> = Arc::new(DynamicTopology::new(id, 0, vec![ids.clone()]));
+        let topology: Arc<dyn Topology> =
+            Arc::new(DynamicTopology::new(id, 0, vec![founders.clone()]));
         let node = Node::new(
             id,
             topology.clone(),
@@ -693,11 +815,14 @@ impl<E: ClusterBackend> Builder<E> {
         let copy_pending = Arc::new(AtomicBool::new(false));
         if mark.is_some() {
             if let Err(err) = node.recover_state_for_join().await {
-                abort_all(tasks).await;
+                abort_all(tasks.take()).await;
                 return Err(err.context("cannot recover the journal before copying the store"));
             }
             node.begin_join();
             tasks.push(node.start(inbox));
+            // The sweep too: it fetches the layouts decided meanwhile, and
+            // copies the slots a change in progress gives this node.
+            tasks.push(node.start_recovery());
             // The members the journal knows first, then whoever else the
             // settings name: over a discarded journal the layout is still
             // the founders', some of whom may have left.
@@ -707,8 +832,28 @@ impl<E: ClusterBackend> Builder<E> {
                     known.push(id);
                 }
             }
-            if let Err(err) = join_through(&node, &contacts_of(&known, id)).await {
-                abort_all(tasks).await;
+            let contacts = contacts_of(&known, id);
+            let mut waited = None;
+            loop {
+                let err = match join_through(&node, &contacts).await {
+                    Ok(()) => break,
+                    Err(err) => err,
+                };
+                // No member yet: nothing was copied, and the join is asked
+                // again as it is, for as long as it takes a member to add
+                // this node.
+                if err.is::<NotAMember>() {
+                    if waited.is_none_or(|at: tokio::time::Instant| at.elapsed() >= WAIT_SAID) {
+                        waited = Some(tokio::time::Instant::now());
+                        tracing::warn!(
+                            node = id.0,
+                            "this node is no member of the cluster yet: add it on a member (`Cluster::add_node`); it copies the store then"
+                        );
+                    }
+                    tokio::time::sleep(WAIT_LOOK).await;
+                    continue;
+                }
+                abort_all(tasks.take()).await;
                 return Err(
                     err.context("cannot copy the store from a peer; the next start tries again")
                 );
@@ -725,7 +870,7 @@ impl<E: ClusterBackend> Builder<E> {
                     "group founded over the store"
                 ),
                 Err(err) => {
-                    abort_all(tasks).await;
+                    abort_all(tasks.take()).await;
                     return Err(err.context("cannot found a group over the store"));
                 }
             }
@@ -738,7 +883,7 @@ impl<E: ClusterBackend> Builder<E> {
             match node.recover_state().await {
                 Ok(()) => {}
                 Err(err) if err.chain().any(|cause| cause.is::<LostJournal>()) => {
-                    abort_all(tasks).await;
+                    abort_all(tasks.take()).await;
                     // The journal holds nothing and the store holds events: the
                     // node forgot what it voted and must come back by joining.
                     // The mark is left now, so the next start does.
@@ -760,13 +905,15 @@ impl<E: ClusterBackend> Builder<E> {
                     });
                 }
                 Err(err) => {
-                    abort_all(tasks).await;
+                    abort_all(tasks.take()).await;
                     return Err(err);
                 }
             }
             tasks.push(node.start(inbox));
         }
-        tasks.push(node.start_recovery());
+        if mark.is_none() {
+            tasks.push(node.start_recovery());
+        }
         tasks.push(watch_signals(
             node.clone(),
             state_dir.clone(),
@@ -786,7 +933,11 @@ impl<E: ClusterBackend> Builder<E> {
             node,
             topology,
             transport,
-            tasks: Mutex::new(tasks),
+            // Read from this node's own copy: an address is said again, not
+            // refused, when the read trails or no barrier can be had.
+            executor: Evento::new(executor.local_reads()),
+            named,
+            tasks: Mutex::new(tasks.take()),
             joined: mark.is_some(),
             founded: found,
             copy_pending,
@@ -815,6 +966,11 @@ pub struct Cluster {
     topology: Arc<dyn Topology>,
     /// The links to the other nodes; `None` for a node alone, in memory.
     transport: Option<Arc<TcpTransport>>,
+    /// The store, through the cluster: where the addresses of the nodes
+    /// added since are written.
+    executor: Evento,
+    /// How many nodes the settings name, whose addresses they stand for.
+    named: usize,
     /// The inbox loop, the recovery sweep, the listener and the signal watch.
     tasks: Mutex<Vec<JoinHandle<()>>>,
     joined: bool,
@@ -885,6 +1041,118 @@ impl Cluster {
             epoch: layout.epoch(),
             nodes: layout.nodes(),
         }
+    }
+
+    /// Adds `node`, reached at `addr`, to the cluster: from here on it
+    /// counts, and a majority is one of the members with it. Called on any
+    /// member, once; the members agree on it among themselves, and none is
+    /// restarted. Returns the members as this node then holds them.
+    ///
+    /// The new node is a process started with its own id in
+    /// [`Settings::node_id`], past the [`founders`](Settings::founders),
+    /// over an empty store, before or after this call: its
+    /// [`open`](Builder::open) waits to be added, copies the store from a
+    /// member, and returns once it serves. Until then the cluster runs one
+    /// node short of what it counts: add a node when it is about to start,
+    /// not long before. `addr` is where the members dial it, kept in the
+    /// store ([`addresses`]); the node itself reaches the members through
+    /// its own [`Settings::peers`].
+    ///
+    /// Said twice, by one member or two, it is done once: a node that is a
+    /// member already is left as it is. While another change of members is
+    /// in progress ([`remove_node`](Self::remove_node),
+    /// [`replace_node`](Self::replace_node)) this one is refused: it is
+    /// asked again once that one is done.
+    pub async fn add_node(
+        &self,
+        node: NodeId,
+        addr: impl Into<PeerAddr>,
+    ) -> anyhow::Result<Members> {
+        self.reach(node, addr.into()).await?;
+        let members = self
+            .change(|members| {
+                let mut members = members.to_vec();
+                if !members.contains(&node) {
+                    members.push(node);
+                }
+                members
+            })
+            .await
+            .with_context(|| format!("cannot add node {} to the cluster", node.0))?;
+        tracing::info!(
+            node = node.0,
+            epoch = members.epoch,
+            "node added to the cluster"
+        );
+        Ok(members)
+    }
+
+    /// Keeps where `node` is reached in the store, for every member, and
+    /// dials it there from now on unless this node's settings name it.
+    async fn reach(&self, node: NodeId, addr: PeerAddr) -> anyhow::Result<()> {
+        let transport = self.transport.as_ref().context(
+            "a node opened without settings talks to itself in memory: open it with `Settings` to change its members",
+        )?;
+        addresses::record(&self.executor, node, &addr).await?;
+        if node != self.node.id() && (node.0 as usize) >= self.named {
+            transport.set_peer(node, addr);
+        }
+        Ok(())
+    }
+
+    /// Changes the members to what `to` makes of them, through the
+    /// cluster: decided once whoever asks, and carried through by the nodes
+    /// themselves if this one stops meanwhile. Returns once the change is
+    /// decided, installed or still draining.
+    async fn change(&self, to: impl Fn(&[NodeId]) -> Vec<NodeId>) -> anyhow::Result<Members> {
+        let me = self.node.id();
+        let mut refused = None;
+        for _ in 0..CHANGE_ATTEMPTS {
+            let layout = self.topology.layout();
+            anyhow::ensure!(
+                layout.shards().len() == 1,
+                "the cluster has {} shards: its members are changed shard by shard (`Node::change_topology`)",
+                layout.shards().len()
+            );
+            anyhow::ensure!(
+                layout.contains(me),
+                "node {} is no member of the cluster: ask a member",
+                me.0
+            );
+            let live = layout.nodes();
+            let target = to(&live);
+            anyhow::ensure!(!target.is_empty(), "a cluster keeps at least one node");
+            match self.node.change_in_progress() {
+                // The change asked for, decided already: carried through.
+                Some(change) if same_nodes(&change.to.concat(), &target) => {}
+                Some(change) => {
+                    anyhow::bail!(
+                    "another change of members is in progress, to {:?}: ask again once it is done",
+                    change.to.concat().iter().map(|node| node.0).collect::<Vec<_>>()
+                )
+                }
+                None if same_nodes(&live, &target) => return Ok(self.members()),
+                None => {}
+            }
+            let epoch = self.node.epoch() + 1;
+            let err = match self.node.change_topology(epoch, vec![target.clone()]).await {
+                Ok(_) => return Ok(self.members()),
+                Err(err) => err,
+            };
+            // Decided, and still draining: the nodes carry it through.
+            let draining = self
+                .node
+                .change_in_progress()
+                .is_some_and(|change| same_nodes(&change.to.concat(), &target));
+            if draining || same_nodes(&self.topology.nodes(), &target) {
+                return Ok(self.members());
+            }
+            // Another change may have taken the epoch: looked at again.
+            tracing::debug!(node = me.0, epoch, %err, "change of members not decided");
+            refused = Some(err);
+            tokio::time::sleep(WAIT_LOOK).await;
+        }
+        Err(refused.unwrap_or_else(|| anyhow::anyhow!("the change of members was not decided")))
     }
 
     /// Where this node dials `node`: its entry in [`Settings::peers`], or,
@@ -1064,6 +1332,39 @@ impl Cluster {
     }
 }
 
+/// The tasks of a node being opened. An open that is dropped before it
+/// returns — one waiting to be added to the cluster, given up by the
+/// application — ends them, the listener's first: the next open binds the
+/// same address.
+#[derive(Default)]
+struct Tasks(Vec<JoinHandle<()>>);
+
+impl Tasks {
+    fn push(&mut self, task: JoinHandle<()>) {
+        self.0.push(task);
+    }
+
+    /// The tasks, for whoever ends them from here on.
+    fn take(&mut self) -> Vec<JoinHandle<()>> {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl Drop for Tasks {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
+}
+
+/// Whether `a` and `b` are the same nodes, in whatever order.
+fn same_nodes(a: &[NodeId], b: &[NodeId]) -> bool {
+    let (a, b): (HashSet<NodeId>, HashSet<NodeId>) =
+        (a.iter().copied().collect(), b.iter().copied().collect());
+    a == b
+}
+
 /// Ends `tasks` and waits for them to be gone.
 async fn abort_all(tasks: Vec<JoinHandle<()>>) {
     for task in &tasks {
@@ -1106,6 +1407,8 @@ async fn join_through(node: &Node, contacts: &[NodeId]) -> anyhow::Result<()> {
         match &outcome {
             Ok(()) => break,
             Err(err) if err.is::<PartialSnapshot>() => break,
+            // Asked again shortly: said once by the caller, not per contact.
+            Err(err) if err.is::<NotAMember>() => {}
             Err(err) => {
                 tracing::warn!(contact = contact.0, %err, "cannot copy the store from this node");
             }
