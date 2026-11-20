@@ -8395,7 +8395,9 @@ impl Node {
     /// does unless it vouched past it. Otherwise what the replicas not heard
     /// from hold decides it, and a next attempt hears them: the late ones
     /// are asked nothing, so a write too few replicas hold is not committed
-    /// on their votes. The promise a Nack names, if one came back (see
+    /// on their votes — unless no next attempt hears them either
+    /// ([`left_to_the_late`](Self::left_to_the_late)): then the late ones
+    /// vote. The promise a Nack names, if one came back (see
     /// [`ask_late`](Self::ask_late)).
     #[allow(clippy::too_many_arguments)]
     async fn settle_late(
@@ -8417,11 +8419,49 @@ impl Node {
             RecoveryRound::Refuse
         } else if self.may_have_committed(plans, resp) {
             RecoveryRound::Vote
+        } else if self.left_to_the_late(plans, resp) {
+            self.metrics.record_late_votes_asked();
+            RecoveryRound::Vote
         } else {
             return None;
         };
         self.ask_late(rx, layout, txn, ballot, round, keys, events, resp, route)
             .await
+    }
+
+    /// Whether the votes of the replicas past the deadline are all that can
+    /// decide `txn` for now (#584): every replica not heard from is one the
+    /// failure detector suspects, and in every shard the replicas that hold
+    /// it and the late ones make a slow quorum. With a node down, a write
+    /// that reached its other peers past their deadline — its coordinator's
+    /// disk stalled between minting it and sending it — is held by its
+    /// coordinator alone: nothing proves it never committed, the node that
+    /// is down may hold it, and waiting to hear that node left the write,
+    /// and every write behind it on its keys, undecided until it was back.
+    /// A late replica's vote is sound whenever it is cast (it refuses once
+    /// it vouched past the transaction); only a replica still to be heard
+    /// is a reason to wait for it.
+    fn left_to_the_late(&self, plans: &[ShardPlan], resp: &[(NodeId, RecoverResp)]) -> bool {
+        plans.iter().all(|plan| {
+            let mut voters = 0;
+            for node in &plan.replicas {
+                match resp.iter().find(|(from, _)| from == node) {
+                    Some((_, RecoverResp::Ok(f))) if f.known => voters += 1,
+                    Some((_, RecoverResp::Late)) => voters += 1,
+                    Some(_) => {}
+                    None => {
+                        if !self.failure_detector.suspect(
+                            *node,
+                            self.settings.phi_threshold,
+                            self.settings.acceptable_pause,
+                        ) {
+                            return false;
+                        }
+                    }
+                }
+            }
+            voters >= plan.slow_q
+        })
     }
 
     /// Asks the replicas that answered [`Late`](RecoverResp::Late) for

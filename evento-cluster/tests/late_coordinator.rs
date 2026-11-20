@@ -214,3 +214,81 @@ async fn a_coordinator_refused_late_settles_its_write_at_once() {
             .expect("every replica applies the committed write");
     }
 }
+
+/// With a node down, a write that reaches the one peer left past its
+/// deadline is held by its coordinator alone (#584): the peer neither voted
+/// for it nor refused it, the node that is down may hold it, so nothing
+/// proves it never committed — and waiting to hear that node left the write
+/// undecided until it was back, with every write behind it on its stream.
+/// Once the failure detector suspects the node, the late peer is asked to
+/// vote, and the write commits on the two replicas that are up.
+#[tokio::test(start_paused = true)]
+async fn a_late_write_commits_on_the_late_replicas_vote_while_a_node_is_down() {
+    init_tracing();
+    let net = InMemoryNetwork::new();
+    let base = tokio::time::Instant::now();
+    let ids = [NodeId(0), NodeId(1), NodeId(2)];
+    let mut nodes = Vec::new();
+    let mut stores = Vec::new();
+    let mut tasks = Vec::new();
+    for id in ids {
+        let (node, store) = node(&net, id, &ids, base);
+        tasks.push(node.start(net.register(id)));
+        tasks.push(node.start_recovery());
+        nodes.push(node);
+        stores.push(store);
+    }
+    // The failure detectors learn the sweeps' rhythm; then node 1 goes
+    // down, for long enough to be suspected.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    net.crash(NodeId(1));
+    tokio::time::sleep(Duration::from_secs(30)).await;
+
+    // Node 0's messages reach node 2 past the margin.
+    net.set_latency(NodeId(0), NodeId(2), MARGIN * 2);
+    let started = tokio::time::Instant::now();
+    let outcome = nodes[0]
+        .write(vec![event("acc", 1)])
+        .await
+        .expect("the write settles");
+    let took = started.elapsed();
+    assert!(
+        !outcome.invalidated && !outcome.conflict,
+        "the write did not commit: {outcome:?}"
+    );
+    // The coordinator waits `collect_timeout` for the vote of the node that
+    // is down, which alone could still make its quorum; the recovery that
+    // settles the write then takes a few message delays.
+    assert!(
+        took < config().collect_timeout + Duration::from_secs(2),
+        "the write took {took:?}: no recovery decided it"
+    );
+    assert_eq!(nodes[2].metrics().votes_late, 1);
+    assert!(nodes[0].metrics().late_votes_asked >= 1);
+    let committed = outcome.txn;
+    for store in [&stores[0], &stores[2]] {
+        let applied = async {
+            while !store
+                .applied_log()
+                .iter()
+                .any(|entry| entry.txn == committed && !entry.conflict)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(2), applied)
+            .await
+            .expect("both replicas that are up apply the write");
+    }
+
+    // The stream goes on: the next write is behind nothing undecided.
+    net.clear_latency();
+    let outcome = nodes[0]
+        .write(vec![event("acc", 2)])
+        .await
+        .expect("the next write commits");
+    assert!(!outcome.conflict && !outcome.invalidated, "{outcome:?}");
+    for task in tasks {
+        task.abort();
+    }
+}
