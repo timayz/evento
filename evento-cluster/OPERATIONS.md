@@ -146,6 +146,27 @@ its subscriptions at a time. Without it a node's own subscriptions start as soon
 the node is up, and overlap with its cover until that one hears the node again. Set
 it on every node, or on none.
 
+**Where a node goes on from.** A subscription's cursor is kept in the store of the
+node that runs it, under `<key>.<subscription>`. The nodes tell each other how far
+these got (#566): every `every`, a node reads the cursors of the keys it serves and of
+those it runs, and sends every other node the furthest it knows of each
+(`Message::Cursors`) — its own and those it was told, so a node hears of a key from
+whichever node is up. A node that stops a key's subscriptions says where they stopped
+at once. Before it starts a key's subscriptions, a node moves each cursor forward to
+the furthest it heard of (`cover_cursors_moved`), so it does not go through the key's
+history. Nothing is agreed, and nothing is written but the node's own cursor.
+
+- What a node heard is in memory: after a restart it learns again from the nodes up
+  within an `every`. A node that heard nothing goes on from its own cursor, from the
+  key's first event when it has none — as when every node restarted at once and the
+  key falls to one that never ran it.
+- A node that copied its store (a join) starts the keys it takes on from what it
+  heard, like any other.
+- The subscriptions an application starts itself on its own keys are read and told
+  too, when it gives them to the cover under the same names: their cover goes on from
+  where they stopped. The way back needs `own_keys()`: an application that starts
+  them itself does so from the node's own cursor, over what its cover handled.
+
 What it asks of the application:
 
 - **Handlers that bear the event in hand when the lease is lost.** A subscription is
@@ -154,10 +175,9 @@ What it asks of the application:
   fenced by the lease, and what it does outside the store (a mail sent, a call made)
   cannot be. The lease counts on the nodes' clocks running at the same pace, as any
   lease does.
-- **Handlers that bear the key's history again.** A subscription's cursor is local
-  to its node: the first time a node takes a key on, each subscription goes through
-  that key's events from the start, under its own cursor (`<key>.<subscription>`);
-  the next time it goes on from there.
+- **Handlers that bear an event twice at a change of hands.** A node goes on from
+  the last cursor it heard of (below), which trails the node before it by what that
+  one handled since: up to an `every` of events when that node died.
 - **An `after` above the silences between nodes that are up.** A node reports once
   its journal is flushed, so two idle nodes on a loaded disk may hear nothing from
   each other for seconds. Under `after` a key is taken from a node that is up, which
@@ -305,6 +325,7 @@ Serve it on an HTTP endpoint (see `bank-axum-cluster`'s `/metrics`). Counters:
 | `command_pages` | command pages this node served to joining peers: a joiner pulls the contact's un-compacted applied commands one page at a time, before its snapshot pages. |
 | `joins_partial` | joins of this node that failed after a page was installed: the store holds a prefix no contact can complete, and must be emptied before the next join (§7). Steady > 0 = a contact that cannot read its backend, or a link losing pages faster than the per-page retries cover. |
 | `cover_takes` / `cover_hand_backs` / `cover_lapses` | routing keys whose subscriptions this node started (`Cluster::cover`, §2: a key without a node, or its own with `own_keys`), and those it stopped: a node serving the key was heard from again, another node took the key's lease, the lease was not confirmed in time, or one of the subscriptions stopped on its own. Takes less hand-backs is what the node runs now (`Covering::covered`). A take per node stopped is expected; **both rising together** = nodes taking each other for gone and back (`after` too short for the silences between them), or a subscription that keeps failing (see the log). `cover_lapses` counts the hand-backs made because the cluster did not confirm a lease within `lease`: a node cut off from the majority, or a `lease` too short for the cluster's read latency. |
+| `cover_cursors_moved` | subscriptions this node started for a routing key from a cursor another node told it, instead of its own (#566). One per subscription at each change of hands is expected; **none while keys change hands** = the nodes do not hear each other's cursors, and each take goes through the key's history. |
 | `execution_failures` | data-store applies and commit-condition reads that failed. The transaction is neither marked applied nor acknowledged, and is retried on the next drive (a message, or the sweep). Occasional = transient lock contention; **sustained** = this replica's store cannot take writes (full disk, broken connection), so it falls behind until it can. |
 | `own_store_waits` | phases of a write this node coordinated that waited on past `collect_timeout` because the quorum lacked only this node's own answer, and its store was still reading the version condition or enacting the transaction (or the decided ones ahead of it). The write completes in the store's time, and no recovery is started for it (#475). A rising count = this node's store has reads or fsyncs outlasting `collect_timeout` (§8, write latency); look at the disk. |
 | `writes_invalidated` | writes this node coordinated that a recovery invalidated: too few replicas held them in time for them ever to commit — they reached the replicas late (`votes_late` on the replicas) or below a vote fence (`votes_fenced`), or never reached them — so nothing was written (#466). Counted here alone: not in `writes_committed` or `writes_conflicted`, nor on either path. `ClusterExecutor` writes each again as a fresh transaction, up to three attempts in all (#521), so the caller gets `WriteError::Unavailable` with the `Invalidated` cause only when all three were invalidated. Each took a recovery longer than it should; a steady rate means coordinators, or replicas' inboxes, slower than `compaction_margin` (§8, write latency). |

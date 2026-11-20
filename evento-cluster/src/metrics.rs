@@ -205,6 +205,11 @@ pub struct Metrics {
     /// majority, or the cluster was that slow. Each is counted among the
     /// hand-backs too.
     pub cover_lapses: AtomicU64,
+    /// Subscriptions this node started, for a routing key, from a cursor
+    /// another node told it instead of its own
+    /// ([`Cluster::cover`](crate::Cluster::cover), #566): it went on from
+    /// where that node stopped.
+    pub cover_cursors_moved: AtomicU64,
 }
 
 impl Metrics {
@@ -421,6 +426,11 @@ impl Metrics {
         self.cover_hand_backs.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records a subscription started from a cursor another node told.
+    pub fn record_cover_cursor_moved(&self) {
+        self.cover_cursors_moved.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Records a routing key's lease not confirmed in time.
     pub fn record_cover_lapse(&self) {
         self.cover_lapses.fetch_add(1, Ordering::Relaxed);
@@ -515,6 +525,7 @@ impl Metrics {
             cover_takes: self.cover_takes.load(Ordering::Relaxed),
             cover_hand_backs: self.cover_hand_backs.load(Ordering::Relaxed),
             cover_lapses: self.cover_lapses.load(Ordering::Relaxed),
+            cover_cursors_moved: self.cover_cursors_moved.load(Ordering::Relaxed),
         }
     }
 }
@@ -576,6 +587,8 @@ pub struct MetricsSnapshot {
     pub cover_hand_backs: u64,
     /// See [`Metrics::cover_lapses`].
     pub cover_lapses: u64,
+    /// See [`Metrics::cover_cursors_moved`].
+    pub cover_cursors_moved: u64,
 }
 
 impl MetricsSnapshot {
@@ -583,7 +596,7 @@ impl MetricsSnapshot {
     /// source of truth for both [`to_prometheus`](Self::to_prometheus) and
     /// [`to_prometheus_labeled`](Self::to_prometheus_labeled); add a counter here and
     /// both renderings pick it up.
-    fn counters(&self) -> [(&'static str, &'static str, u64); 49] {
+    fn counters(&self) -> [(&'static str, &'static str, u64); 50] {
         [
             (
                 "cluster_writes_committed_total",
@@ -829,6 +842,11 @@ impl MetricsSnapshot {
                 "cluster_cover_lapses_total",
                 "Times a routing key's subscriptions stopped because its lease was not confirmed in time.",
                 self.cover_lapses,
+            ),
+            (
+                "cluster_cover_cursors_moved_total",
+                "Subscriptions started for a routing key from a cursor another node told, instead of this node's own.",
+                self.cover_cursors_moved,
             ),
         ]
     }

@@ -1175,6 +1175,22 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
         &self.resolved_key
     }
 
+    /// The name this subscription's cursor is kept under in `executor`'s
+    /// store: its key behind its routing-key prefix, as
+    /// [`Executor::get_subscriber_cursor`] takes it. `None` for an
+    /// [`ephemeral`](Self::ephemeral) subscription, which keeps no cursor
+    /// there.
+    ///
+    /// For what manages a subscription's cursor from outside: reading how
+    /// far it got, or placing it before the subscription starts.
+    pub fn storage_key(&mut self, executor: &E) -> Option<String> {
+        if self.cursor_store.is_ephemeral() {
+            return None;
+        }
+        self.resolve_routing_key(executor);
+        Some(self.resolved_key.clone())
+    }
+
     /// Resolves an unset routing key from the executor's default and captures
     /// the default as a storage-key prefix.
     ///
@@ -3038,6 +3054,21 @@ mod tests {
     #[test]
     fn a_persisted_store_is_not_ephemeral() {
         assert!(!CursorStore::Persisted.is_ephemeral());
+    }
+
+    /// The name a cursor is kept under is the subscription's key behind its
+    /// routing key; an ephemeral subscription keeps none.
+    #[test]
+    fn the_storage_key_is_the_key_behind_its_routing_key() {
+        let executor = FailingReads::new();
+        let mut plain = SubscriptionBuilder::<FailingReads>::new("orders");
+        assert_eq!(plain.storage_key(&executor).as_deref(), Some("orders"));
+        let mut routed = SubscriptionBuilder::<FailingReads>::new("orders").routing_key("eu");
+        assert_eq!(routed.storage_key(&executor).as_deref(), Some("eu.orders"));
+        let mut ephemeral = SubscriptionBuilder::<FailingReads>::new("orders")
+            .routing_key("eu")
+            .ephemeral();
+        assert_eq!(ephemeral.storage_key(&executor), None);
     }
 
     /// `Context::stop` is the only writer, and `process` reads the same flag.

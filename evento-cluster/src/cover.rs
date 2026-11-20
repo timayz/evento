@@ -67,14 +67,37 @@
 //! mail sent, a call made) cannot be. The lease also counts on the nodes'
 //! clocks running at the same pace, as any lease does.
 //!
-//! **Being run again over the key's history.** A subscription's cursor is
-//! local to the node that runs it. The first time a node takes a key on,
-//! each subscription goes through that key's events from the start, under a
-//! cursor of its own (the one a subscription with
-//! [`routing_key`](SubscriptionBuilder::routing_key) set to the key has on
-//! that node); the next time it goes on from there. `after` is best kept
-//! longer than a node takes to restart for an update, so a restart is not
-//! covered for.
+//! **Events handled twice at a change of hands.** See below: a node goes
+//! on from the last cursor it heard of, which trails the node before it by
+//! what that one handled since.
+//!
+//! # Where a node goes on from
+//!
+//! A subscription's cursor is kept in the store of the node that runs it,
+//! under `<key>.<subscription>`: the one a subscription with
+//! [`routing_key`](SubscriptionBuilder::routing_key) set to the key has
+//! there. So that a node taking a key on does not go through the key's
+//! history, the nodes tell each other how far these subscriptions got
+//! (#566). Every look a node reads the cursors of the keys it serves and of
+//! those it runs, and sends every other node the furthest it knows of each
+//! ([`Node::share_cursors`](crate::Node::share_cursors)): its own and those
+//! it was told, so a node hears of a key from whichever node is up. A node
+//! that stops a key's subscriptions says where they stopped at once.
+//!
+//! Before it starts a key's subscriptions, a node moves each cursor forward
+//! to the furthest it heard of. Nothing is agreed here, and what the node
+//! before it handled since its last word is handled again: up to an
+//! [`every`](Cover::every) of events when that node died, none when it
+//! stopped in order and its last word arrived. What a node heard is kept in
+//! memory: after a restart it learns again from the nodes up, and a node
+//! that heard nothing goes on from its own cursor, from the key's first
+//! event when it has none.
+//!
+//! This holds for the subscriptions an application starts on its own keys
+//! too, when it gives them to the cover under the same names: their cursors
+//! are read and told like the others. A node that returns goes on from what
+//! its cover handled only with [`own_keys`](Cover::own_keys), though: an
+//! application that starts them itself does so from the node's own cursor.
 //!
 //! # Which keys, which nodes
 //!
@@ -91,8 +114,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use evento_core::cursor::{Cursor as _, Value};
 use evento_core::subscription::{Subscription, SubscriptionBuilder};
-use evento_core::Executor;
+use evento_core::{Event, Executor};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -105,6 +129,28 @@ use crate::share::Share;
 
 /// Builds one subscription for the key it is given.
 type Make<E> = Arc<dyn Fn(&str) -> SubscriptionBuilder<E> + Send + Sync>;
+
+/// A subscription run on a key.
+struct Running {
+    /// The name it was given ([`Cover::subscription`]).
+    name: String,
+    subscription: Subscription,
+}
+
+/// Whether `cursor` stands further in the store's order than `than`: the
+/// stamp, version and id of the event each names. `false` for a value that
+/// is no event's cursor.
+fn further(cursor: &Value, than: Option<&Value>) -> bool {
+    let place = |cursor: &Value| {
+        let at = Event::deserialize_cursor(cursor).ok()?;
+        Some((at.t, at.s, at.v, at.i))
+    };
+    match (place(cursor), than.and_then(place)) {
+        (Some(cursor), Some(than)) => cursor > than,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
 
 /// The keys whose subscriptions run now, as [`Covering::covered`] shows
 /// them.
@@ -344,6 +390,20 @@ impl<E: Executor + Clone> Cover<E> {
                     "the routing keys without a node were not looked for"
                 );
             }
+            // How far the subscriptions of this node's keys and of those it
+            // runs got, and what it was told of the others.
+            let keys: Vec<String> = looking
+                .served
+                .iter()
+                .chain(keepers.keys())
+                .cloned()
+                .collect();
+            if let Err(err) = keeping.tell_cursors(&keys).await {
+                tracing::warn!(
+                    error = %format!("{err:#}"),
+                    "the cursors of the subscriptions run for routing keys were not read"
+                );
+            }
         }
         for (_, keeper) in keepers {
             keeper.release().await;
@@ -502,7 +562,7 @@ impl<E: Executor + Clone> Keeping<E> {
         let me = self.cluster.id();
         let node = self.cluster.node();
         let metrics = node.metrics_handle();
-        let mut running: Vec<(String, Subscription)> = Vec::new();
+        let mut running: Vec<Running> = Vec::new();
         // Until when this node is in its right.
         let mut valid_until: Option<Instant> = None;
         loop {
@@ -511,7 +571,7 @@ impl<E: Executor + Clone> Keeping<E> {
             // the next look.
             if let Some((name, reason)) = running
                 .iter()
-                .find_map(|(name, sub)| Some((name, sub.stop_reason()?)))
+                .find_map(|run| Some((&run.name, run.subscription.stop_reason()?)))
             {
                 tracing::error!(%key, subscription = %name, %reason, "a subscription run under the lease of a routing key stopped on its own");
                 break;
@@ -588,13 +648,24 @@ impl<E: Executor + Clone> Keeping<E> {
         self.let_go(&key, running).await;
     }
 
-    /// Starts every subscription on `key`'s events. All of them or none: a
-    /// start that failed stops those before it.
-    async fn take_on(&self, key: &str) -> anyhow::Result<Vec<(String, Subscription)>> {
+    /// Starts every subscription on `key`'s events, each from the furthest
+    /// cursor this node heard of. All of them or none: a start that failed
+    /// stops those before it.
+    async fn take_on(&self, key: &str) -> anyhow::Result<Vec<Running>> {
         let mut started = Vec::with_capacity(self.subscriptions.len());
         for (name, make) in &self.subscriptions {
-            match make(key).routing_key(key).start(&self.executor).await {
-                Ok(subscription) => started.push((name.clone(), subscription)),
+            let mut builder = make(key).routing_key(key);
+            let start = async {
+                if let Some(storage) = builder.storage_key(&self.executor) {
+                    self.go_on_from_the_furthest(storage).await?;
+                }
+                builder.start(&self.executor).await
+            };
+            match start.await {
+                Ok(subscription) => started.push(Running {
+                    name: name.clone(),
+                    subscription,
+                }),
                 Err(err) => {
                     stop(started).await;
                     return Err(err.context(format!("cannot start {name} for {key}")));
@@ -604,23 +675,89 @@ impl<E: Executor + Clone> Keeping<E> {
         Ok(started)
     }
 
-    fn show(&self, key: &str, own: bool, subscriptions: &[(String, Subscription)]) {
+    /// Moves the cursor kept under `storage` in this node's store forward
+    /// to the furthest this node heard of, if that is further: the
+    /// subscription about to start goes on from where another node stopped.
+    async fn go_on_from_the_furthest(&self, storage: String) -> anyhow::Result<()> {
+        let Some(heard) = self.cluster.node().shared_cursor(&storage) else {
+            return Ok(());
+        };
+        let held = self.executor.get_subscriber_cursor(storage.clone()).await?;
+        if !further(&heard, held.as_ref()) {
+            return Ok(());
+        }
+        // Written as a worker of its own, which the subscription replaces
+        // when it starts: no subscription runs under this name here now.
+        let worker = ulid::Ulid::generate();
+        self.executor
+            .upsert_subscriber(storage.clone(), worker)
+            .await?;
+        self.executor
+            .acknowledge(storage.clone(), worker, heard, 0)
+            .await?;
+        tracing::info!(subscription = %storage, "a subscription goes on from where another node stopped");
+        self.cluster
+            .node()
+            .metrics_handle()
+            .record_cover_cursor_moved();
+        Ok(())
+    }
+
+    /// The names the cursors of `key`'s subscriptions are kept under.
+    fn storage_keys(&self, key: &str) -> Vec<String> {
+        self.subscriptions
+            .iter()
+            .filter_map(|(_, make)| make(key).routing_key(key).storage_key(&self.executor))
+            .collect()
+    }
+
+    /// Notes how far the subscriptions of `keys` got in this node's store.
+    async fn note_cursors(&self, keys: &[String]) -> anyhow::Result<()> {
+        let mut cursors = Vec::new();
+        for key in keys {
+            for storage in self.storage_keys(key) {
+                if let Some(cursor) = self.executor.get_subscriber_cursor(storage.clone()).await? {
+                    cursors.push((storage, cursor));
+                }
+            }
+        }
+        self.cluster.node().note_cursors(cursors);
+        Ok(())
+    }
+
+    /// Notes how far the subscriptions of `keys` got, and tells the other
+    /// nodes every cursor this node knows.
+    async fn tell_cursors(&self, keys: &[String]) -> anyhow::Result<()> {
+        let noted = self.note_cursors(keys).await;
+        self.cluster.node().share_cursors().await;
+        noted
+    }
+
+    fn show(&self, key: &str, own: bool, subscriptions: &[Running]) {
         self.shown.lock().expect("covered keys poisoned").insert(
             key.to_owned(),
             CoveredKey {
                 key: key.to_owned(),
                 own,
-                subscriptions: subscriptions.iter().map(|(name, _)| name.clone()).collect(),
+                subscriptions: subscriptions.iter().map(|run| run.name.clone()).collect(),
             },
         );
     }
 
-    /// Stops the subscriptions run on `key`, if any.
-    async fn let_go(&self, key: &str, running: Vec<(String, Subscription)>) {
+    /// Stops the subscriptions run on `key`, if any, and tells the other
+    /// nodes where they stopped.
+    async fn let_go(&self, key: &str, running: Vec<Running>) {
         if running.is_empty() {
             return;
         }
         stop(running).await;
+        if let Err(err) = self.tell_cursors(&[key.to_owned()]).await {
+            tracing::warn!(
+                %key,
+                error = %format!("{err:#}"),
+                "where the subscriptions of a routing key stopped was not read"
+            );
+        }
         self.shown
             .lock()
             .expect("covered keys poisoned")
@@ -634,12 +771,12 @@ impl<E: Executor + Clone> Keeping<E> {
 
 /// Stops `subscriptions` and waits for each to be done with the event it
 /// was handling.
-async fn stop(subscriptions: Vec<(String, Subscription)>) {
-    for (_, subscription) in &subscriptions {
-        subscription.stop();
+async fn stop(subscriptions: Vec<Running>) {
+    for run in &subscriptions {
+        run.subscription.stop();
     }
-    for (_, subscription) in subscriptions {
-        let _ = subscription.shutdown().await;
+    for run in subscriptions {
+        let _ = run.subscription.shutdown().await;
     }
 }
 
@@ -814,5 +951,20 @@ mod tests {
         }
         assert_eq!(preferred(&[], "a"), None);
         assert_eq!(preferred(&ids(&[7]), "a"), Some(NodeId(7)));
+    }
+
+    /// A cursor is further than another by the place of its event in the
+    /// store's order, and than none at all; a value that is no event's
+    /// cursor is further than nothing.
+    #[test]
+    fn a_cursor_is_further_by_the_place_of_its_event() {
+        let at = crate::api::cursor_at;
+        assert!(further(&at(2_000_000), Some(&at(1_000_000))));
+        assert!(!further(&at(1_000_000), Some(&at(2_000_000))));
+        assert!(!further(&at(1_000_000), Some(&at(1_000_000))));
+        assert!(further(&at(1_000_000), None));
+        let junk = Value("not a cursor".into());
+        assert!(!further(&junk, None));
+        assert!(further(&at(1_000_000), Some(&junk)));
     }
 }

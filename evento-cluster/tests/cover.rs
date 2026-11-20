@@ -414,7 +414,8 @@ async fn a_holder_stops_once_the_lease_is_another_node_s_or_is_not_confirmed() {
 
 /// Nodes that run their own keys from the cover: a node that returns takes
 /// its key back from the node that covered for it, and what is written then
-/// is handled by it alone.
+/// is handled by it alone. Each goes on from where the other stopped (#566):
+/// no event of the key is handled twice.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_node_that_returns_takes_its_own_key_back() {
     let root = temp_root("own");
@@ -453,6 +454,11 @@ async fn a_node_that_returns_takes_its_own_key_back() {
         _ => 1,
     };
     assert_eq!(nodes[by].covered().len(), 2);
+    // It went on from where node 1 stopped, not from the key's first event.
+    for node in &nodes {
+        assert_eq!(node.handled(&handled, "before"), 0);
+    }
+    assert_eq!(nodes[by].cluster.node().metrics().cover_cursors_moved, 1);
     assert!(nodes[by]
         .covering
         .covered()
@@ -485,6 +491,18 @@ async fn a_node_that_returns_takes_its_own_key_back() {
     for node in &nodes {
         assert_eq!(node.handled(&handled, "after"), 0);
     }
+    // And node 1 went on from where its cover stopped: every event of the
+    // key was handled once, whichever node ran it then.
+    assert_eq!(n1.handled(&handled, "during"), 0);
+    assert_eq!(n1.cluster.node().metrics().cover_cursors_moved, 1);
+    let mut all: Vec<String> = handled
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, stream)| stream.clone())
+        .collect();
+    all.sort();
+    assert_eq!(all, ["after", "before", "during"]);
 
     n1.shutdown().await;
     for node in nodes {
