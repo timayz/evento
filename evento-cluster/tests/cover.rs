@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use evento_cluster::host::Settings;
 use evento_cluster::{keys, lease, Cluster, ClusterExecutor, Covering, NodeConfig};
-use evento_core::subscription::{Context, Handler, SubscriptionBuilder};
+use evento_core::subscription::{Context, Handler, State, SubscriptionBuilder};
 use evento_core::{Event, Executor, WriteError};
 use evento_fjall::Fjall;
 
@@ -571,5 +571,117 @@ async fn a_node_alone_takes_on_a_key_left_on_the_list() {
     );
 
     covering.shutdown().await;
+    cluster.shutdown().await;
+}
+
+/// Fails the first `left` events it is given, then records like
+/// [`Recorder`].
+struct Refusing {
+    left: Arc<Mutex<u32>>,
+    handled: Handled,
+}
+
+impl<E: Executor> Handler<E> for Refusing {
+    fn handle<'a>(
+        &'a self,
+        _context: &'a Context<'a, E>,
+        event: &'a Event,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            {
+                let mut left = self.left.lock().unwrap();
+                if *left > 0 {
+                    *left -= 1;
+                    anyhow::bail!("the provider is away");
+                }
+            }
+            self.handled
+                .lock()
+                .unwrap()
+                .push((0, event.aggregate_id.clone()));
+            Ok(())
+        })
+    }
+
+    fn aggregate_type(&self) -> &'static str {
+        AGG
+    }
+
+    fn event_name(&self) -> &'static str {
+        "Placed"
+    }
+}
+
+/// Issue #583: a subscription the cover runs that fails took its key down
+/// with it, with nothing to read about it. Supervised, it goes on by
+/// itself, its key stays, and the cover says how it stands and how far
+/// behind it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_supervised_subscription_keeps_its_key_and_says_how_it_stands() {
+    let root = temp_root("supervised");
+    let store = Fjall::open(root.join("store")).unwrap();
+    let (cluster, executor) = Cluster::builder(store)
+        .serves(["here"])
+        .open()
+        .await
+        .unwrap();
+    assert!(keys::record(&executor, "gone").await.unwrap());
+    executor.write(vec![event("left", "gone")]).await.unwrap();
+
+    let handled: Handled = Arc::default();
+    let recorded = handled.clone();
+    // Two failures: the second restart is a second and a half away, long
+    // enough to be seen held up.
+    let left = Arc::new(Mutex::new(2));
+    let refusals = left.clone();
+    let covering = cluster
+        .cover(executor.clone())
+        .every(EVERY)
+        .subscription("orders", move |_key| {
+            SubscriptionBuilder::new("orders")
+                .handler(Refusing {
+                    left: refusals.clone(),
+                    handled: recorded.clone(),
+                })
+                .no_retry()
+                .restart_backoff(Duration::from_millis(500), Duration::from_secs(60))
+        })
+        .start();
+
+    eventually("the subscription is seen held up a second time", || async {
+        covering
+            .subscriptions()
+            .iter()
+            .any(|run| matches!(run.state(), State::Restarting { attempts: 2, .. }))
+    })
+    .await;
+    let run = covering.subscriptions().remove(0);
+    assert_eq!((run.key.as_str(), run.name.as_str()), ("gone", "orders"));
+    let State::Restarting { error, since, .. } = run.state() else {
+        panic!("{}", run.state())
+    };
+    assert_eq!(error.to_string(), "the provider is away");
+    assert!(since > 0);
+    let lag = run.lag().await.unwrap();
+    assert!(!lag.is_caught_up(), "the event waits: {lag:?}");
+
+    eventually("the event is handled", || async {
+        !handled.lock().unwrap().is_empty()
+    })
+    .await;
+    eventually("the subscription runs again, behind nothing", || async {
+        let run = covering.subscriptions().remove(0);
+        run.state().is_running() && run.lag().await.unwrap().is_caught_up()
+    })
+    .await;
+    assert_eq!(*handled.lock().unwrap(), [(0, "left".to_owned())]);
+    assert_eq!(*left.lock().unwrap(), 0);
+    assert_eq!(covering.covered().len(), 1);
+
+    covering.shutdown().await;
+    assert!(
+        matches!(run.state(), State::Stopped(_)),
+        "a handle kept shows its subscription stopped"
+    );
     cluster.shutdown().await;
 }

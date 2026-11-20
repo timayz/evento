@@ -23,12 +23,24 @@
 //!     .every(Duration::from_secs(10))
 //!     .lease(Duration::from_secs(30))
 //!     .own_keys()
-//!     .subscription("payments", |_key| payments())
-//!     .subscription("mails", |_key| mails())
+//!     .subscription("payments", |_key| payments().supervised())
+//!     .subscription("mails", |_key| mails().supervised())
 //!     .start();
-//! // `covering.covered()` is what a status page shows;
-//! // `covering.shutdown().await` before `cluster.shutdown()`.
+//! // `covering.covered()` and `covering.subscriptions()` are what a status
+//! // page shows; `covering.shutdown().await` before `cluster.shutdown()`.
 //! ```
+//!
+//! # A subscription that fails
+//!
+//! A subscription that stops on its own — a pass failed past its retries —
+//! leaves its key half run: the key is let go, and kept again at the next
+//! look, with nothing that grows between two tries and nothing to read
+//! about them. Build the subscriptions
+//! [`supervised`](SubscriptionBuilder::supervised) and each goes on by
+//! itself from the event that failed, after a delay that grows, while the
+//! key stays where it is; [`Covering::subscriptions`] then says which one is
+//! held up, by what and since when ([`CoveredSubscription::state`]), and how
+//! far behind each is ([`CoveredSubscription::lag`]).
 //!
 //! # One node at a time
 //!
@@ -115,7 +127,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use evento_core::cursor::{Cursor as _, Value};
-use evento_core::subscription::{Subscription, SubscriptionBuilder};
+use evento_core::subscription::{Lag, State, Subscription, SubscriptionBuilder};
 use evento_core::{Event, Executor};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -131,10 +143,36 @@ use crate::share::Share;
 type Make<E> = Arc<dyn Fn(&str) -> SubscriptionBuilder<E> + Send + Sync>;
 
 /// A subscription run on a key.
-struct Running {
+type Running = CoveredSubscription;
+
+/// A subscription this node runs on a routing key, as
+/// [`Covering::subscriptions`] shows it: which it is, and how it stands
+/// now.
+///
+/// A look at one moment: the key may have been handed back since, and its
+/// subscription then shows as stopped. Ask the cover again rather than keep
+/// one.
+#[derive(Debug, Clone)]
+pub struct CoveredSubscription {
+    /// The routing key it runs on.
+    pub key: String,
     /// The name it was given ([`Cover::subscription`]).
-    name: String,
-    subscription: Subscription,
+    pub name: String,
+    subscription: Arc<Subscription>,
+}
+
+impl CoveredSubscription {
+    /// How its worker stands: running, held up by a failure it goes on
+    /// from, or stopped ([`Subscription::state`]).
+    pub fn state(&self) -> State {
+        self.subscription.state()
+    }
+
+    /// How far it is behind the newest event it follows, now
+    /// ([`Subscription::lag`]).
+    pub async fn lag(&self) -> anyhow::Result<Lag> {
+        self.subscription.lag().await
+    }
 }
 
 /// Whether `cursor` stands further in the store's order than `than`: the
@@ -154,7 +192,14 @@ fn further(cursor: &Value, than: Option<&Value>) -> bool {
 
 /// The keys whose subscriptions run now, as [`Covering::covered`] shows
 /// them.
-type Shown = Arc<Mutex<BTreeMap<String, CoveredKey>>>;
+type Shown = Arc<Mutex<BTreeMap<String, Held>>>;
+
+/// A key whose subscriptions run now.
+struct Held {
+    /// Whether this node serves the key.
+    own: bool,
+    subscriptions: Vec<Running>,
+}
 
 /// The nodes of `live` (the nodes heard from, by id) that may run `key`'s
 /// subscriptions. While a node of `live` serves the key: the nodes that
@@ -663,8 +708,9 @@ impl<E: Executor + Clone> Keeping<E> {
             };
             match start.await {
                 Ok(subscription) => started.push(Running {
+                    key: key.to_owned(),
                     name: name.clone(),
-                    subscription,
+                    subscription: Arc::new(subscription),
                 }),
                 Err(err) => {
                     stop(started).await;
@@ -736,10 +782,9 @@ impl<E: Executor + Clone> Keeping<E> {
     fn show(&self, key: &str, own: bool, subscriptions: &[Running]) {
         self.shown.lock().expect("covered keys poisoned").insert(
             key.to_owned(),
-            CoveredKey {
-                key: key.to_owned(),
+            Held {
                 own,
-                subscriptions: subscriptions.iter().map(|run| run.name.clone()).collect(),
+                subscriptions: subscriptions.to_vec(),
             },
         );
     }
@@ -775,8 +820,10 @@ async fn stop(subscriptions: Vec<Running>) {
     for run in &subscriptions {
         run.subscription.stop();
     }
+    // The handles are shared with what a status page was shown, so the
+    // workers are waited for by their word rather than joined.
     for run in subscriptions {
-        let _ = run.subscription.shutdown().await;
+        run.subscription.stopped().await;
     }
 }
 
@@ -795,8 +842,36 @@ impl Covering {
         self.covered
             .lock()
             .expect("covered keys poisoned")
+            .iter()
+            .map(|(key, held)| CoveredKey {
+                key: key.clone(),
+                own: held.own,
+                subscriptions: held
+                    .subscriptions
+                    .iter()
+                    .map(|run| run.name.clone())
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// The subscriptions this node runs now on those keys, each with how it
+    /// stands ([`CoveredSubscription::state`]) and how far behind it is
+    /// ([`CoveredSubscription::lag`]): what a status page shows of them,
+    /// and a health check reads.
+    ///
+    /// A subscription that stopped on its own takes its key down with it:
+    /// the key is let go and kept again at the next look, from the event
+    /// that failed, as often as it fails. One built
+    /// [`supervised`](SubscriptionBuilder::supervised) goes on by itself
+    /// instead, after a delay that grows, the key staying with this node
+    /// and its state saying since when it is held up.
+    pub fn subscriptions(&self) -> Vec<CoveredSubscription> {
+        self.covered
+            .lock()
+            .expect("covered keys poisoned")
             .values()
-            .cloned()
+            .flat_map(|held| held.subscriptions.iter().cloned())
             .collect()
     }
 
