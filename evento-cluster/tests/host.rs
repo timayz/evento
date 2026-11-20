@@ -796,6 +796,16 @@ fn the_rejoin_mark_round_trips_and_never_weakens() {
     RejoinMark::clear(&dir).unwrap();
     assert_eq!(RejoinMark::read(&dir).unwrap(), None);
     RejoinMark::clear(&dir).unwrap();
+    // A new node's mark gives way to either, and takes the place of none.
+    RejoinMark::New.write(&dir).unwrap();
+    assert_eq!(RejoinMark::read(&dir).unwrap(), Some(RejoinMark::New));
+    RejoinMark::KeepJournal.write(&dir).unwrap();
+    RejoinMark::New.write(&dir).unwrap();
+    assert_eq!(
+        RejoinMark::read(&dir).unwrap(),
+        Some(RejoinMark::KeepJournal)
+    );
+    RejoinMark::clear(&dir).unwrap();
     // An empty file, left by hand, keeps the journal.
     std::fs::write(RejoinMark::path(&dir), b"").unwrap();
     assert_eq!(

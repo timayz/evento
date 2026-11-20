@@ -2,7 +2,8 @@
 //! over real TCP, each over a Fjall store, founded from [`Settings`]. A
 //! node added by one call on a member copies the store at its first open
 //! and counts, whether it starts before the call or after it, and whoever
-//! is restarted meanwhile; it founds nothing.
+//! is restarted meanwhile; it founds nothing. A node is removed, or
+//! replaced by a new one, by one call too, a dead one included.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -10,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use evento_cluster::host::{RejoinMark, Settings};
-use evento_cluster::{Cluster, ClusterExecutor, NodeConfig, NodeId, PeerAddr};
+use evento_cluster::{Cluster, ClusterExecutor, NodeConfig, NodeId, PeerAddr, Wait};
 use evento_core::{cursor::Args, Event, EventFilter, Executor, TenantFilter};
 use evento_fjall::Fjall;
 
@@ -66,7 +67,19 @@ impl Member {
     /// `peers` its settings name: a founder's name the founders alone, as
     /// they did when the cluster began.
     async fn open(root: &Path, id: u64, peers: &[SocketAddr]) -> Self {
-        Self::try_open(root, id, peers).await.unwrap()
+        // A node opened again right after it stopped may find its address
+        // still held for a moment.
+        let mut tries = 0;
+        loop {
+            match Self::try_open(root, id, peers).await {
+                Ok(member) => return member,
+                Err(err) if tries < 20 && format!("{err:#}").contains("cannot bind") => {
+                    tries += 1;
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                Err(err) => panic!("node {id} does not open: {err:#}"),
+            }
+        }
     }
 
     async fn try_open(root: &Path, id: u64, peers: &[SocketAddr]) -> anyhow::Result<Self> {
@@ -83,6 +96,9 @@ impl Member {
             .state_dir(&dir)
             .node_config(|config| NodeConfig {
                 compaction_margin: Duration::from_millis(300),
+                // A call that changes the members waits six of these for
+                // the change to be done before it leaves it to the nodes.
+                collect_timeout: Duration::from_secs(2),
                 ..config
             })
             .open()
@@ -127,13 +143,20 @@ impl Member {
         eventually(what, || async { self.count(id).await == expected }).await;
     }
 
+    /// Waits until this node holds `nodes` as the members, no change in
+    /// progress.
     async fn await_members(&self, nodes: &[u64], what: &str) {
         eventually(what, || async {
-            let mut members = self.cluster.members().nodes;
-            members.sort();
-            members == ids(nodes)
+            let members = self.cluster.members();
+            let mut held = members.nodes;
+            held.sort();
+            held == ids(nodes) && members.change.is_none()
         })
         .await;
+    }
+
+    async fn stop(self) {
+        self.cluster.shutdown().await;
     }
 }
 
@@ -187,7 +210,7 @@ async fn a_node_started_first_waits_to_be_added_then_copies_the_store() {
     // Marked for a copy before anything else: a restart meanwhile copies
     // too.
     eventually("the new node marks its store", || async {
-        RejoinMark::read(&Member::dir(&root, 3)).unwrap() == Some(RejoinMark::KeepJournal)
+        RejoinMark::read(&Member::dir(&root, 3)).unwrap() == Some(RejoinMark::New)
     })
     .await;
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -404,6 +427,216 @@ async fn a_node_that_is_no_member_over_a_store_that_holds_events_does_not_open()
         .await
         .unwrap();
     assert_eq!(kept.edges.len(), 1, "nothing was emptied");
+}
+
+/// A node that runs is removed by one call: the two that stay go on, the
+/// node says it is no member, and does not open again over its files.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_is_removed_and_the_others_go_on() {
+    let root = temp_root("removed");
+    let addrs = free_addrs(3).await;
+    let mut nodes = found(&root, &addrs).await;
+    nodes[0].write("acc", 1).await;
+    assert!(nodes[2].cluster.health().member);
+
+    let members = nodes[0].cluster.remove_node(NodeId(2)).await.unwrap();
+    assert!(
+        members.change.is_none(),
+        "done within the call: {members:?}"
+    );
+    assert_eq!(members.nodes, ids(&[0, 1]));
+    for node in &nodes[..2] {
+        node.await_members(&[0, 1], "the two that stay hold the members")
+            .await;
+    }
+    // Said again, by the other member: done once.
+    let again = nodes[1].cluster.remove_node(NodeId(2)).await.unwrap();
+    assert_eq!((again.epoch, &again.nodes), (members.epoch, &members.nodes));
+
+    nodes[1].write("acc", 2).await;
+    nodes[0]
+        .await_count("acc", 2, "the two that stay decide")
+        .await;
+
+    let removed = nodes.remove(2);
+    eventually("the removed node says it is no member", || async {
+        let health = removed.cluster.health();
+        !health.member && !health.serving()
+    })
+    .await;
+    removed.stop().await;
+    let err = Member::try_open(&root, 2, &addrs)
+        .await
+        .err()
+        .expect("a removed node does not open over its files");
+    assert!(format!("{err:#}").contains("is no member"), "{err:#}");
+
+    // A member restarted holds the two members, and the two decide.
+    let restarted = nodes.remove(0);
+    restarted.stop().await;
+    let restarted = Member::open(&root, 0, &addrs).await;
+    restarted
+        .await_members(&[0, 1], "the journal holds the members")
+        .await;
+    restarted.write("acc", 3).await;
+    nodes[0]
+        .await_count("acc", 3, "the other reads the restarted node's write")
+        .await;
+
+    restarted.stop().await;
+    for node in nodes {
+        node.stop().await;
+    }
+}
+
+/// A node gone for good is replaced by a new one, in one change, asked for
+/// before the new node starts. The change stays in progress, saying what
+/// it waits for, through a member's restart and the call made again; no
+/// other change is taken meanwhile. The new node starts, copies the store,
+/// and the change is done; restarted, it opens as any member.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dead_node_is_replaced_by_a_new_one() {
+    let root = temp_root("replaced-dead");
+    let addrs = free_addrs(5).await;
+    let mut nodes = found(&root, &addrs).await;
+    for version in 1..=3 {
+        nodes[0].write("acc", version).await;
+    }
+    nodes[2]
+        .await_count("acc", 3, "node 2 holds the writes")
+        .await;
+    nodes.remove(2).stop().await;
+
+    let members = nodes[0]
+        .cluster
+        .replace_node(NodeId(2), NodeId(3), addrs[3])
+        .await
+        .unwrap();
+    assert_eq!(members.nodes, ids(&[0, 1, 2]), "until the change is done");
+    let change = members.change.expect("the new node has yet to start");
+    assert_eq!(change.to, ids(&[0, 1, 3]));
+    assert!(
+        change.waits_for.contains(&Wait::Copy(NodeId(3))),
+        "{change:?}"
+    );
+
+    // A member restarted in the middle holds the change from its journal.
+    nodes.remove(1).stop().await;
+    let restarted = Member::open(&root, 1, &addrs[..FOUNDERS]).await;
+    eventually("the restarted member holds the change", || async {
+        restarted
+            .cluster
+            .members()
+            .change
+            .is_some_and(|change| change.to == ids(&[0, 1, 3]))
+    })
+    .await;
+    // Asked again, on the other member: the same change, carried on.
+    let again = restarted
+        .cluster
+        .replace_node(NodeId(2), NodeId(3), addrs[3])
+        .await
+        .unwrap();
+    assert_eq!(again.change.map(|change| change.to), Some(ids(&[0, 1, 3])));
+    // Another change waits its turn.
+    let err = restarted
+        .cluster
+        .add_node(NodeId(4), addrs[4])
+        .await
+        .expect_err("one change at a time");
+    assert!(
+        format!("{err:#}").contains("another change of members is in progress"),
+        "{err:#}"
+    );
+    nodes.push(restarted);
+
+    let added = Member::open(&root, 3, &addrs).await;
+    assert!(added.cluster.health().joined_at_start);
+    for node in nodes.iter().chain([&added]) {
+        node.await_members(&[0, 1, 3], "the change is done on every node")
+            .await;
+    }
+    assert_eq!(added.count("acc").await, 3, "the store was copied");
+    added.write("acc", 4).await;
+    nodes[0]
+        .await_count("acc", 4, "a founder reads the new node's write")
+        .await;
+
+    // The new node restarted opens as any member: nothing is copied again,
+    // had it stopped before its mark was removed too.
+    added.stop().await;
+    RejoinMark::New.write(&Member::dir(&root, 3)).unwrap();
+    let added = Member::open(&root, 3, &addrs).await;
+    assert!(!added.cluster.health().joined_at_start);
+    assert_eq!(RejoinMark::read(&Member::dir(&root, 3)).unwrap(), None);
+    assert_eq!(added.count("acc").await, 4, "nothing was emptied");
+    added
+        .await_members(&[0, 1, 3], "its journal holds the members")
+        .await;
+    nodes[1].write("acc", 5).await;
+    added
+        .await_count("acc", 5, "the new node reads a founder's write")
+        .await;
+
+    added.stop().await;
+    for node in nodes {
+        node.stop().await;
+    }
+}
+
+/// A node that runs is replaced by a new one started first: the new node
+/// copies the store while the change is in progress, and the node it
+/// replaces says it is no member once it is done.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_running_node_is_replaced_by_a_new_one_started_first() {
+    let root = temp_root("replaced-running");
+    let addrs = free_addrs(4).await;
+    let mut nodes = found(&root, &addrs).await;
+    nodes[0].write("acc", 1).await;
+
+    let opening = {
+        let (root, addrs) = (root.clone(), addrs.clone());
+        tokio::spawn(async move { Member::open(&root, 3, &addrs).await })
+    };
+    eventually("the new node marks its store", || async {
+        RejoinMark::read(&Member::dir(&root, 3)).unwrap() == Some(RejoinMark::New)
+    })
+    .await;
+
+    let members = nodes[1]
+        .cluster
+        .replace_node(NodeId(2), NodeId(3), addrs[3])
+        .await
+        .unwrap();
+    assert!(
+        members.change.is_none(),
+        "done within the call: {members:?}"
+    );
+    let added = tokio::time::timeout(Duration::from_secs(120), opening)
+        .await
+        .expect("the new node opens")
+        .unwrap();
+    let replaced = nodes.remove(2);
+    for node in nodes.iter().chain([&added]) {
+        node.await_members(&[0, 1, 3], "the change is done on every node")
+            .await;
+    }
+    eventually("the replaced node says it is no member", || async {
+        !replaced.cluster.health().member
+    })
+    .await;
+    replaced.stop().await;
+
+    assert_eq!(added.count("acc").await, 1);
+    added.write("acc", 2).await;
+    nodes[0]
+        .await_count("acc", 2, "a founder reads the new node's write")
+        .await;
+
+    added.stop().await;
+    for node in nodes {
+        node.stop().await;
+    }
 }
 
 #[test]

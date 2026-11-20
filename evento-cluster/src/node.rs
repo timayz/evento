@@ -2958,6 +2958,27 @@ impl Node {
         let vote_fence = self.journal.load_vote_fence().await?;
         let peer_marks = self.journal.load_peer_marks().await?;
         let copy_state = self.journal.load_copy_state().await?;
+        // Joining, the store was discarded, and with it whatever a copy of
+        // gained slots had brought in: the journal must not hold that copy
+        // started, let alone complete — the slots would be reported, and
+        // never copied again (#589). Recorded as the copy of no transition
+        // (none is decided at epoch 0), so the next one drops and copies
+        // whole, after a plain restart too.
+        let copy_state = match copy_state {
+            Some(state) if joining && state.since != 0 => {
+                let none = CopyState {
+                    since: 0,
+                    phase: CopyPhase::Dropped,
+                    ..state
+                };
+                self.journal
+                    .save_copy_state(&none)
+                    .await
+                    .map_err(|err| err.context("cannot forget a copy the emptied store lost"))?;
+                Some(none)
+            }
+            other => other,
+        };
         let slot_gc = self.journal.load_slot_gc().await?;
         // Nothing durable at all: the node never voted, promised, reported
         // or minted anything under this journal — a new member's, or a
@@ -11319,6 +11340,22 @@ impl Node {
             return false;
         }
         self.metrics.record_flush();
+        // A new node opened over an empty journal is fenced until a contact
+        // vouches past everything it may have forgotten (#312). A node the
+        // live layout does not hold has nothing to forget that still counts:
+        // a replica leaves a layout by a transition, which drained every
+        // write it had voted on, and it votes on none before this one
+        // installs. Its copy of the drained slots is its join past the
+        // fence (#589): without it the copy was never reported, the
+        // activation waited for the copy, and the node's join for the
+        // activation. Recorded before the copy counts here, so a failure
+        // leaves both to the next sweep.
+        if !self.bootstrapped.load(Ordering::Acquire) && self.pending_fence().is_some() {
+            if let Err(err) = self.mark_joined().await {
+                tracing::warn!(node = self.id.0, since, %err, "cannot record a copy as the join past the amnesia fence; not reporting it");
+                return false;
+            }
+        }
         {
             let mut reconfig = self.reconfig.lock().expect("reconfig poisoned");
             reconfig.copy_state = Some(state);
@@ -11327,7 +11364,7 @@ impl Node {
         // A new node opened joining holds its slots now — every slot it owns
         // is gained (a replica still joining returned above): it serves, and
         // what it buffered meanwhile is handled.
-        if !self.bootstrapped.load(Ordering::Acquire) && self.pending_fence().is_none() {
+        if !self.bootstrapped.load(Ordering::Acquire) {
             // It copied from the group's replicas rather than joined through
             // one: its group is theirs (#541), as their reports name it.
             let theirs = self
